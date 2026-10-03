@@ -530,7 +530,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-09-15: 63 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-02: 68 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -775,6 +775,15 @@ jobs:
           # NEITHER the -rf list nor the FAILURES block, so -rf alone leaves
           # the collection-time breakages -- the ones hardest to read off a
           # truncated log -- named nowhere.
+          # Falsifier for a claim this workflow's dormancy guard rests on:
+          # the fleet-door behavioural test needs a TERM to attach a tmux
+          # client, and is believed to have skipped on CI because runners set
+          # none. That was INFERRED, never measured -- the per-step `env:`
+          # echo above is what the step DECLARES, not the process
+          # environment (PATH and HOME are absent from it too). One line
+          # settles it in the log instead of leaving the next reader to
+          # re-derive it.
+          echo "TERM=[${TERM-UNSET}]"
           pytest -rfE --durations=25 \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
@@ -904,4 +913,227 @@ jobs:
         # The base is deliberately NOT re-derived from the merged tree: this is
         # a FLOOR, so a lagging base is conservative and can only under-catch,
         # never go falsely red.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23298
+        #
+        # UNION with the wrapper-arity lock's raise (its own measurement): its
+        # new suite collects 35 (`--collect-only -q` on the merged tree) and adds
+        # 3 environment-gated skips, not 2 — the first count of this was wrong
+        # by one and turned CI red, which is the trap this block already warns
+        # about twice above. MEASURED on the runner rather than reasoned about,
+        # by diffing the skip SETS of two junit reports (main 8a465c7b1 vs this
+        # branch): main skips 99, this branch skips 102, and the difference is
+        # exactly these three parametrisations of the arity lock —
+        #
+        #   test_every_listed_option_documents_a_required_value[doas]
+        #   test_every_listed_option_documents_a_required_value[time]
+        #   test_every_listed_option_documents_a_required_value[uvx]
+        #
+        # TWO wrappers are absent from the runner, not one (`doas` and `uvx`),
+        # and `time` is excluded because bash's keyword and /usr/bin/time are
+        # different programs sharing a basename. All three skips are BY DESIGN:
+        # the lock declines to grade a table against a tool it cannot run, since
+        # a table written from memory about an uninstalled tool is the thing it
+        # exists to prevent.
+        #
+        # Count on the RUNNER, never the dev box: which wrappers are installed
+        # differs between them, so a local "N skipped" is the wrong denominator
+        # for this line. That is how the off-by-one got in.
+        #
+        # So ceiling 99 -> 102.
+        #
+        # The FLOOR moves too, 23333 -> 23338, and it is the same
+        # counted-before-the-last-edit trap one axis over. The floor was set at
+        # +35 when this file collected 35 cases; a review round that hardened
+        # the lock added three more and it was not re-counted (Codex P2, round
+        # 4). MEASURED by collection, not by grepping for a def:
+        #   pytest tests/test_hooks/test_wrapper_option_arity.py --collect-only -q
+        #   -> 40 tests collected
+        # The file is new on this branch, so all 40 are new cases and the floor
+        # is 23298 + 40. At +35 five of them could stop collecting while the
+        # guard stayed green — the exact-fit invariant this block claims,
+        # quietly forfeited.
+        #
+        # Counted at 38 first, then re-counted at 40 after the ambiguity
+        # abstention added its two guard-the-guard tests. That is the FOURTH
+        # time this line has been set before the last test-adding edit, which
+        # is why the instruction above is shouted. Re-count LAST, after the
+        # final edit, never while writing it.
+        #
+        # 23338 -> 23342, the FIFTH move: round 5 replaced the print-only
+        # abstention with an allowlist and four guard-the-guard cases.
+        # Re-counted after the LAST edit, not before it:
+        #   pytest tests/test_hooks/test_wrapper_option_arity.py --collect-only -q
+        #   -> 44 tests collected
+        # so the floor is 23298 + 44. The ceiling does NOT move: the allowlist
+        # changes which entries are graded, never which tools are skipped, and
+        # the file still skips exactly the same two here.
+        #
+        # This is also the first time the shouted instruction above WORKED. The
+        # line was written at 43, then verify-RED showed the caller's assertion
+        # was unwired and the fix for that added a 44th case. Re-counting last
+        # caught it before the commit instead of in round 6. The habit is cheap;
+        # the four prior instances each cost a review round.
+        #
+        # UNION with this PR's own +77 collected tests (no new skips):
+        # floor 23342 -> 23419, ceiling holds at 102.
+        #
+        # 76 was wrong, and it is the SIXTH instance of the trap this block
+        # already shouts about, one axis over: the number came from collecting
+        # the two test files this PR touches, when the floor moves by the DELTA.
+        # test_panel_layout_neutralisation.py already existed and its 12 cases
+        # were already inside 23342, so counting them again added them twice.
+        # MEASURED, three collections rather than one:
+        #   test_dashboard_css_isolation.py        (new)     -> 77
+        #   test_panel_layout_neutralisation.py    (branch)  -> 12
+        #   test_panel_layout_neutralisation.py    (main)    -> 12   delta 0
+        # so the delta is 77 and the floor is 23342 + 77.
+        #
+        # 77 and not 64: the review round that found the double-count also
+        # found five layout leaks in the watched set, and answering those added
+        # thirteen cases. Note 23419 is ONE ABOVE the original wrong 23418 —
+        # a coincidence, arrived at from a different direction, and exactly the
+        # kind of near-miss that would let the next reader conclude the first
+        # number was basically fine.
+        #
+        # "Re-count LAST" is not sufficient on its own: both wrong counts were
+        # taken last. The missing half is WHAT to count — a changed file
+        # contributes its delta against main, never its total — and the count
+        # is only final once the last test-adding edit is in, which on this
+        # branch was two rounds after the line was first written.
+        #
+        # UNION with this branch's new test file: the blocked-task-resume
+        # work adds tests/test_autonomy/test_blocked_task_resume.py, which
+        # does not exist on main at all, so its delta is its FULL collected
+        # count, not the increment of the last edit that touched it.
+        # MEASURED on this branch, collected last:
+        #   pytest tests/test_autonomy/test_blocked_task_resume.py --collect-only -q
+        #   -> 19 tests collected
+        # so the floor is 23419 + 19 = 23438. The ceiling does not move:
+        # the file adds no skips.
+        #
+        # The previous resolution of this same conflict said '+2' and set
+        # 23344. That is the SEVENTH instance of the trap, from the third
+        # direction: the 2 was the delta of the claim-sweep edit against an
+        # EARLIER STATE OF THIS BRANCH, not against main. A floor that is
+        # too low still passes CI -- it just stops catching the 17 tests it
+        # was supposed to notice going missing, which is why nothing failed
+        # and nobody looked.
+        #
+        # UNION with this branch: the fleet-door probe fix adds
+        # tests/test_scripts/test_lobby_door_silent_probe.py, which does not
+        # exist on main, so its delta is its FULL collected count -- not the
+        # increment of the last edit that touched it.
+        #   pytest tests/test_scripts/test_lobby_door_silent_probe.py \
+        #     --collect-only -q  -> 2 tests collected
+        # so the floor is 23438 + 2 = 23440. The other test file this branch
+        # touches repairs an assertion inside an existing test: 20 test
+        # functions on main, 20 here, no delta.
+        #
+        # The CEILING does not move, and the reason is worth recording because
+        # the first attempt at this line moved it to 103 on a wrong diagnosis.
+        # That run did show 103 skips, and the extra one WAS this file -- but
+        # not from its @skipif, which had evaluated false because the runner
+        # has both tmux and script(1). The behavioural test ran, failed to
+        # attach a client for want of a TERM the runner does not set, and
+        # skipped at runtime through its own vacuity guard. Raising the
+        # ceiling would have recorded that dormancy as intended and left the
+        # only test that exercises the fix BEHAVIOURALLY never executing on
+        # CI (the static companion still binds it, and does run there). The
+        # test now sets TERM itself, so it SHOULD run and the count SHOULD
+        # stay at 102 -- a prediction, not a measurement: the run that would
+        # confirm it has not happened. If it is 103 again, read the skip
+        # message, which now carries the attach failure's own words.
+        #
+        # UNION with this branch: the slot-door probe fix adds
+        # tests/test_scripts/test_cc_slot_silent_probe.py, which does not exist
+        # on main, so its delta is its FULL collected count.
+        #   pytest tests/test_scripts/test_cc_slot_silent_probe.py \
+        #     --collect-only -q  -> 3 tests collected
+        # so the floor is 23440 + 3 = 23443. (The third arrived in review: a
+        # filtered query that ERRORS must not read as "absent".)
+        #
+        # The CEILING stays at 102 on the SAME UNCONFIRMED PREDICTION as the
+        # paragraph above -- now covering two behavioural tests rather than one,
+        # so the exposure doubled. Both are @skipif-ed on tmux/script(1), which
+        # the runners have; both then attach a real client and take a RUNTIME
+        # skip if that fails, which is the path #2298 mistook for a skipif.
+        # This branch replaces that test's fixed 2s wait with a 30s poll, which
+        # removes the load-sensitivity but does not turn the prediction into a
+        # measurement. If the run reports 103 or 104, read each skip's own
+        # message before touching this number: raising it to green can CERTIFY
+        # a dormant test, and the ceiling cannot say WHICH test skipped.
+        #
+        # UNION with this branch: tests/test_scripts/test_lobby_picker.py does
+        # not exist on main, so its delta is its FULL collected count.
+        #   pytest tests/test_scripts/test_lobby_picker.py --collect-only -q
+        #     -> 32 tests collected
+        # and test_generate_ssh_config.py goes 20 -> 21 (the two tests that
+        # pinned an exact command SPELLING became two property tests, so that
+        # part is count-neutral; the +1 is a new cell for the space-in-path
+        # case). So the floor is 23443 + 30 + 1 = 23474.
+        #
+        # The CEILING stays at 102, and this branch does not lean on the
+        # prediction the paragraph above flags. test_lobby_picker.py carries NO
+        # skipif and attaches no client: it drives the real picker over a pipe
+        # with a fake tmux on PATH, so there is no runner capability it can miss
+        # and no runtime-skip path to lose a coin-flip on.
+        #
+        # The update success-records branch adds one test file that does not
+        # exist on main (its delta is its FULL count) and grows one other:
+        #   pytest tests/test_scripts/test_update_success_records.py --collect-only -q
+        #     -> 10 tests collected
+        #   test_update_tier2_baseline.py goes 5 -> 8 (unreadable history, no
+        #   history table, and no interpreter for the reader are each a new case).
+        # test_update_rollback_recovery.py is edited count-neutrally (8 == 8).
+        # So that floor is 23476 + 13 = 23489.
+        #
+        # The deploy-checkout lib branch adds three test files that do not exist on
+        # main, so each delta is its FULL collected count, and edits seven others
+        # count-neutrally (each re-measured, branch == main):
+        #   pytest tests/test_scripts/test_deploy_checkout.py --collect-only -q
+        #     -> 36 tests collected
+        #   pytest tests/test_scripts/test_update_activation.py --collect-only -q
+        #     -> 28 tests collected
+        #   pytest tests/test_scripts/test_update_checkout_moved.py --collect-only -q
+        #     -> 29 tests collected
+        # Its delta is 36 + 28 + 29 = 93 on top of the floor above, so the floor
+        # is 23489 + 93 = 23582. No new test carries a skipif, so the ceiling
+        # does not move.
+        #
+        # UNION with the deploy-guidance PR (#2101): it changes one existing test
+        # file, tests/test_hooks/test_bash_timeout_guidance.py, which collects 3
+        # tests on main and 27 here, so its DELTA is +24 (measured against main,
+        # after the last test-adding edit, not against an earlier state of the
+        # branch). Its one new skipif needs jq, which ubuntu-latest ships, so the
+        # ceiling does not move. Floor: 23582 + 24 = 23606.
+        #
+        # UNION with the entity apply-rails PR (#1729). Measured against main's
+        # versions with --collect-only, after the last test-adding edit:
+        #   test_entity_adjudication.py         50 -> 62   (+12)
+        #   test_entity_apply_rails.py           new -> 24  (+24)
+        #   test_entity_adjudication_config.py  13 -> 15   (+2)
+        #   test_migration_0065_...             14 -> 14   (0)
+        # The branch's own earlier comment claimed +4 (Codex P2 on #1729);
+        # superseded by this count. No new skips, so the ceiling holds.
+        # Floor: 23606 + 38 = 23644.
+        #
+        # UNION with the rollback PR (#2679 / #2722), counted the same way:
+        #   test_update_checkout_moved.py   29 -> 79   (+50: the checkout-based
+        #     rollback, its index-flag, index, ignored-path, submodule and hook
+        #     cases, and the database decision)
+        #   test_deploy_checkout.py         36 -> 51   (+15: changes hidden behind
+        #     assume-unchanged / skip-worktree, a listing over a pipe buffer, and
+        #     the refusal hint)
+        # Floor: 23644 + 65 = 23709.
+        # GitNexus routine refresh: focused edited files collect 123 -> 135
+        # tests (+4 runner, +5 launcher, +3 indexer); no added skips.
+        # Routing generations: 143 collected across the four new generation files.
+        # Floor 23721 + 143 = 23864; skip ceiling remains 102.
+        # #2735 stacked-PR contract: test_ci_triggers.py 0 -> 5 (+5: main-only
+        # PR trigger, no edited type, push/schedule/dispatch unchanged,
+        # cc-pin merge-base, and the origin/main line allowlist); no added
+        # skips. Floor: 23864 + 5 = 23869.
+        # Shared Serena adds 284 cases; main floor is 24153.
+        # Human-reference integrity: 32 initial +49 first repair +11 atomic
+        # publication =92 cases across three branch-new files, no added skips.
+        # Floor: 24153 +92 =24245; skip ceiling remains 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24245

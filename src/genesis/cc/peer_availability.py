@@ -575,6 +575,15 @@ def is_provider_refusal(exc: BaseException) -> bool:
         return False
 
 
+def mentions_mcp(exc: BaseException) -> bool:
+    """Public entry to the MCP-evidence test, shared with ``transient_retry``.
+
+    One definition, so "did this come from an MCP tool?" cannot drift between
+    the peer-availability record and the overload retry. Never raises.
+    """
+    return _mentions_mcp(exc)
+
+
 def _mentions_mcp(exc: BaseException) -> bool:
     """True if *exc* carries any sign of having come from an MCP tool.
 

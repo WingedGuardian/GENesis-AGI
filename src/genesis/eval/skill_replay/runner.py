@@ -18,8 +18,6 @@ and its arm-isolation helpers.
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import fcntl
 import logging
 import shutil
 import uuid
@@ -38,6 +36,7 @@ from genesis.eval.skill_replay.types import (
     SkillReplayReport,
 )
 from genesis.eval.skill_replay.verdict import compute_verdict
+from genesis.util.run_lock import acquire_run_lock, release_run_lock
 
 logger = logging.getLogger(__name__)
 
@@ -52,22 +51,15 @@ class SkillReplayBusyError(RuntimeError):
 
 def _acquire_lock():
     """Non-blocking skill-replay lock — separate from the bench lock so a replay
-    and a bench run never starve each other."""
-    lock_path = Path.home() / "tmp" / ".skill_replay.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(lock_path, "w")  # noqa: SIM115 — held for the run
+    and a bench run never starve each other (``~/.genesis/locks/skill_replay.lock``)."""
     try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return acquire_run_lock("skill_replay.lock", legacy_name=".skill_replay.lock")
     except BlockingIOError as e:
-        fh.close()
         raise SkillReplayBusyError("another skill-replay run is already in progress") from e
-    return fh
 
 
-def _release_lock(fh) -> None:
-    with contextlib.suppress(Exception):
-        fcntl.flock(fh, fcntl.LOCK_UN)
-        fh.close()
+def _release_lock(lock) -> None:
+    release_run_lock(lock)
 
 
 def _build_judge_router(judge_provider: str | None):

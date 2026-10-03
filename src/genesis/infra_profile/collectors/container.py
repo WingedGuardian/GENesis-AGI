@@ -436,6 +436,15 @@ def _keepconf_on_route_link(etc_root: Path, network_file: str | None) -> bool:
     return _keepconf_effective_in_dir(etc_root / "systemd/network" / f"{Path(network_file).name}.d")
 
 
+def _loaded(load_state: str | None) -> bool | None:
+    """systemd LoadState → True (loaded), False (not-found), None (unknown)."""
+    if load_state == "loaded":
+        return True
+    if load_state == "not-found":
+        return False
+    return None
+
+
 def _read_watchdog_state(run_root: Path) -> dict | None:
     """Parse the network watchdog's /run telemetry (last_check / last_heal /
     last_trigger / heal_count / last_action). Returns None when absent or
@@ -811,6 +820,28 @@ async def collect_network(
     facts["network_watchdog_enabled"] = (
         await _run_cmd("systemctl", "is-enabled", "genesis-network-watchdog.timer")
     ) == "enabled"
+    # Effective Tailscale watchdog unit-file state: the timer's, or the
+    # service's when masked, since a masked service cannot run ("enabled",
+    # "masked" = an operator's off switch, "disabled", "" = not installed;
+    # None = unknown). Its /run file is deliberately not read here: this
+    # section reaches an LLM prompt, and that file is event data for the
+    # awareness tick
+    # (resilience/tailscale_watchdog_events.py). tailscaled_loaded gates the
+    # posture rule: without tailscaled there is nothing to watch.
+    facts["tailscaled_loaded"] = _loaded(
+        await _run_cmd("systemctl", "show", "tailscaled.service", "-p", "LoadState", "--value")
+    )
+    timer_state = await _run_cmd(
+        "systemctl", "show", "genesis-tailscale-watchdog.timer", "-p", "UnitFileState", "--value"
+    )
+    service_state = await _run_cmd(
+        "systemctl", "show", "genesis-tailscale-watchdog.service", "-p", "UnitFileState", "--value"
+    )
+    facts["tailscale_watchdog_unit_state"] = (
+        service_state
+        if isinstance(service_state, str) and service_state.startswith("masked")
+        else timer_state
+    )
 
     # Watchdog heal telemetry is volatile (heal_count/timestamps move), so it is
     # a METRIC — never hashed. Absent file → key omitted (no drift churn).

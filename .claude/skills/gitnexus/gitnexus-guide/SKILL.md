@@ -15,7 +15,7 @@ For any task involving code understanding, debugging, impact analysis, or refact
 2. **Match your task to a skill below** and **read that skill file**
 3. **Follow the skill's workflow and checklist**
 
-> If step 1 warns the index is stale, run `npx gitnexus analyze` in the terminal first.
+> If step 1 warns the index is stale, refresh through `scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` only from the main checkout; in a linked worktree, use Serena for live branch truth.
 
 ## Skills
 

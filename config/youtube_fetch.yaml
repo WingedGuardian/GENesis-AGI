@@ -1,0 +1,23 @@
+# YouTube fetch (yt-dlp) — certificate verification for YouTube requests.
+#
+# Used by the YouTube processor behind the genesis `web_fetch` MCP tool and by
+# knowledge ingestion. Every yt-dlp call is YouTube-only (`--use-extractors
+# youtube`) and carries no credentials of Genesis's own.
+#
+# tls:
+#   verify         — always verify certificates; a certificate error fails the fetch.
+#   auto_fallback  — (default) verify; on a certificate-verification error ONLY,
+#                    retry that call once without verification. Every fallback is
+#                    logged at WARNING and reported in the result
+#                    (`tls_verified: false`). The unverified retry ignores yt-dlp
+#                    config files and cookies, so no configured credentials ride it.
+#   off            — never verify (same credential stripping as the fallback).
+#
+# An invalid value degrades to `verify`. Read fresh per fetch; no restart needed.
+tls: auto_fallback
+
+# audio_max_minutes: KNOWLEDGE INGESTION only (the web_fetch route never
+# transcribes audio). A video with no captions is transcribed from its audio only
+# if it is at most this many minutes long (0 = never). The length comes from the
+# metadata, before anything is downloaded; unknown length is treated as too long.
+audio_max_minutes: 120

@@ -149,6 +149,22 @@ systemctl --user start genesis-backup.service   # fire one run now
 cat ~/.genesis/backup_status.json               # expect "success":true
 ```
 
+The status file is also the machine-readable proof used by `scripts/update.sh`.
+Each run records a unique `run_id`, `db_integrity_status`,
+`sqlite_backup_verified`, `failure_class`, and `failure_stage`. An update aborts
+before pulling code or running migrations unless that exact run proves a healthy
+source and a round-trip-verified SQLite artifact. Failures outside SQLite (for
+example Qdrant, GitHub push, or an off-site target) do not invalidate that
+artifact, so the update may continue, but it prints an untruncated
+`BACKUP FAILED — UPDATE CONTINUING IN DEGRADED MODE` banner and records
+`backup:<failure_stage>` in update history.
+
+If SQLite is corrupt, backup preserves the last-known-good artifacts, writes
+`~/.genesis/db_quarantine.json`, and stops both long-lived database writers.
+New canonical read/write connections and the watchdog honor that quarantine.
+Install a verified replacement with `scripts/restore.sh --database-only`; a
+healthy replacement inode clears the stale quarantine automatically.
+
 Or manage it from the dashboard **Backup** tab (Settings → Backup): the schedule
 toggle + interval (every 3h / 6h / 12h / daily), a **Run Now** button, and both
 destinations (GitHub Tier-1 and the off-site Tier-2) with live health. The tab
@@ -173,6 +189,8 @@ snapshot a database that a restore is mid-way through rebuilding:
   run — it logs `SKIPPED: backup-restore lock held …` to the journal and exits
   cleanly. The next scheduled run backs up normally. (The dashboard's Backup
   status keeps showing the prior run until then.)
+- An **update-triggered backup** never treats lock contention as a successful
+  skip. It writes a `lock_busy` failure for that run and the update aborts.
 - A **restore** that finds the lock held (a backup is running) **waits** up to
   `GENESIS_RESTORE_LOCK_WAIT` seconds (default **300**), then aborts naming the
   holder. A first full off-site backup can take longer than 300s, so for an

@@ -14,6 +14,7 @@ stubbed so the run is deterministic and offline.
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,9 @@ def backup_env(tmp_path):
     (gd / "data").mkdir(parents=True)
     (home / ".genesis").mkdir(parents=True)
     (home / ".gnupg").mkdir(mode=0o700)
+    (gd / ".venv" / "bin").mkdir(parents=True)
+    (gd / ".venv" / "bin" / "python").symlink_to(Path(sys.executable))
+    (gd / "src").symlink_to(_BACKUP.parents[1] / "src", target_is_directory=True)
     subprocess.run(
         ["sqlite3", str(gd / "data" / "genesis.db"), "CREATE TABLE t(x); INSERT INTO t VALUES(1);"],
         check=True,

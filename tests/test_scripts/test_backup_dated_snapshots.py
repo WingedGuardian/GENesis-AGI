@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,9 @@ def backup_env(tmp_path):
     home = tmp_path / "home"
     gd = home / "genesis"
     (gd / "data").mkdir(parents=True)
+    (gd / ".venv" / "bin").mkdir(parents=True)
+    (gd / ".venv" / "bin" / "python").symlink_to(Path(sys.executable))
+    (gd / "src").symlink_to(_BACKUP.parents[1] / "src", target_is_directory=True)
     (home / ".genesis").mkdir(parents=True)
     (home / ".gnupg").mkdir(mode=0o700)
     subprocess.run(

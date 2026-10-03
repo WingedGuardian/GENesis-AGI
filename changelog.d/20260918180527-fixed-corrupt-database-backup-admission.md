@@ -1,0 +1,1 @@
+- **Updates no longer proceed without a verified SQLite recovery point.** Genesis now quarantines a stably corrupt database, preserves last-known-good backups, aborts updates for database-risk backup failures, and loudly records non-database backup degradation even when an update can safely continue.

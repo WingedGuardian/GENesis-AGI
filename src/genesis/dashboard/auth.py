@@ -10,6 +10,7 @@ hmac.compare_digest (constant-time, no timing attacks).
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import logging
 import os
 import secrets
@@ -20,6 +21,7 @@ from urllib.parse import urlsplit
 from flask import jsonify, redirect, request, session
 
 from genesis.dashboard._blueprint import blueprint
+from genesis.env import bearer_matches, bearer_token
 
 logger = logging.getLogger(__name__)
 
@@ -122,13 +124,52 @@ def get_or_create_internal_api_token() -> str:
 # share so a new ``/v1/*`` surface cannot quietly ship without one.
 
 
-def check_bearer_token(surface: str) -> tuple[str, int] | None:
+def _presented_bearer_bytes(auth_header: str) -> bytes:
+    """The credential after ``Bearer `` as the bytes the client actually sent.
+
+    WSGI (PEP 3333) hands header values over latin-1-decoded, one character per
+    received byte, so encoding back to latin-1 recovers those bytes exactly.
+    Configured tokens are ASCII, so any non-ASCII byte here simply fails to match.
+    A value that is not latin-1 cannot come from a WSGI server; it is encoded as
+    UTF-8, which cannot match an ASCII token either.
+    """
+    value = auth_header[7:]
+    try:
+        return value.encode("latin-1")
+    except UnicodeEncodeError:
+        return value.encode("utf-8", "surrogateescape")
+
+
+def presented_bearer_is(name: str) -> bool:
+    """Whether the request's bearer credential equals the configured ``name`` token.
+
+    For callers that have ALREADY authorized the request with
+    ``check_bearer_token`` and need to know which accepted token it used — the
+    desk route logs a migration notice when a client still sends the broad one.
+    An unconfigured token never matches, including an empty credential.
+    """
+    configured = bearer_token(name)
+    auth_header = request.headers.get("Authorization", "")
+    if not configured or not auth_header.startswith("Bearer "):
+        return False
+    return bearer_matches(_presented_bearer_bytes(auth_header), configured)
+
+
+def check_bearer_token(
+    surface: str, *, accept: tuple[str, ...] = ("GENESIS_MCP_HTTP_TOKEN",),
+) -> tuple[str, int] | None:
     """Validate a machine caller's ``Authorization: Bearer`` header.
 
     Returns ``(error message, http status)`` on refusal, or ``None`` when the
     caller is authorized.
 
-    Fail-closed: with no ``GENESIS_MCP_HTTP_TOKEN`` configured the surface
+    ``accept`` names the token variables this surface honours, and nothing
+    else is ever honoured — that is the scope. The default is the broad token.
+    The desk route passes ``("GENESIS_DESK_TOKEN", "GENESIS_MCP_HTTP_TOKEN")``
+    so a desktop client can hold a credential that opens ONLY the desk route
+    (#2442), while the broad token keeps working there during the transition.
+
+    Fail-closed: with none of the accepted tokens configured the surface
     answers 503 rather than opening. These endpoints reach real authority —
     CC invocation, memory writes, the voice graduation write — so
     open-by-default is not acceptable even on a trusted overlay network.
@@ -136,11 +177,17 @@ def check_bearer_token(surface: str) -> tuple[str, int] | None:
     ``surface`` names the caller in the 503 text only, so an operator who hits
     a disabled endpoint learns which one to configure.
     """
-    # .strip() matches get_dashboard_password() — a quoted "   " in secrets.env
-    # otherwise reads as a configured token that a blank credential satisfies.
-    token = os.environ.get("GENESIS_MCP_HTTP_TOKEN", "").strip()
-    if not token:
-        return (f"{surface} disabled: GENESIS_MCP_HTTP_TOKEN not configured", 503)
+    # A bare string is the missing-comma tuple — ("GENESIS_DESK_TOKEN") — and
+    # iterating it reads SINGLE-CHARACTER env names, so any ambient one-letter
+    # variable would authenticate. Refuse it rather than fail open.
+    if isinstance(accept, str) or not accept:
+        raise ValueError("check_bearer_token needs a non-empty tuple of token names")
+    # Only CONFIGURED values are candidates. An unconfigured token reads as "",
+    # and compare_digest(b"", b"") is True — so comparing against every NAME
+    # would let "Bearer " through whenever an accepted token is unset.
+    candidates = [v for v in (bearer_token(name) for name in accept) if v]
+    if not candidates:
+        return (f"{surface} disabled: {' or '.join(accept)} not configured", 503)
 
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
@@ -149,19 +196,92 @@ def check_bearer_token(surface: str) -> tuple[str, int] | None:
     # Compare BYTES: compare_digest refuses non-ASCII str operands, and WSGI
     # decodes headers as latin-1 — so a header carrying any high byte raised
     # TypeError and surfaced as a 500 with a stack trace per request. Still
-    # fail-closed, but a spammable 500 where a 401 belongs.
-    presented = auth_header[7:].encode("utf-8", "surrogateescape")
-    if not hmac.compare_digest(presented, token.encode("utf-8", "surrogateescape")):
+    # fail-closed, but a spammable 500 where a 401 belongs. Every candidate is
+    # compared (no short-circuit), so timing does not reveal which one matched.
+    presented = _presented_bearer_bytes(auth_header)
+    matched = False
+    for token in candidates:
+        matched |= bearer_matches(presented, token)
+    if not matched:
         return ("Invalid bearer token", 401)
 
     return None
 
 
 def is_authenticated() -> bool:
-    """Check if current request has a valid session."""
+    """Check if current request has a valid session.
+
+    Returns ``True`` when no password is configured — "auth disabled". That is
+    correct for a GATE (``if not is_authenticated(): 401``): an install that
+    chose not to set a password is not refused its own dashboard.
+
+    It is WRONG for a disclosure decision. See ``has_verified_credential``.
+    """
     if not get_dashboard_password():
         return True  # Auth disabled
     return session.get("authenticated") is True
+
+
+def has_verified_credential() -> bool:
+    """Did this request PROVE who it is? Never true without a password set.
+
+    The distinction from ``is_authenticated`` is the whole point, and the two
+    are not interchangeable:
+
+    * ``is_authenticated`` answers *"may this request proceed?"* and opens up
+      when no password is configured, so an unconfigured install keeps working.
+    * ``has_verified_credential`` answers *"has this caller demonstrated it is
+      the operator?"* — and with no password configured, nothing can, because
+      there is no credential to present.
+
+    Use this for any decision that REVEALS something rather than admitting
+    someone. Gating disclosure on ``is_authenticated`` inverts it: the flag
+    that chooses redact-vs-reveal flips to REVEAL on exactly the installs that
+    have no credential, so a passwordless box serves its secrets to whoever can
+    reach it. That was live on three sites — the provider-key values and two
+    backup-config routes — and is what this predicate exists to prevent.
+
+    Deliberately session-only: it does NOT accept the internal bearer token.
+    All three current callers are the dashboard's own browser front-end, so no
+    machine caller needs it, and a process holding that 0600 token can already
+    read the same values straight out of the environment — accepting it here
+    would widen the surface while buying nothing.
+
+    NO ROTATION-EVICTION, and the reason is worth keeping because two reviewers
+    asked for it and an earlier revision of this file shipped it. The idea was
+    to bind the session to a keyed tag of the password it was issued against, so
+    rotating the password evicted stale cookies from the disclosure path. It was
+    removed because it is DOMINATED, not because it was expensive: a session
+    carrying a stale tag still satisfies ``is_authenticated``, which is what
+    gates ``routes/terminal.py`` (a bash PTY, so ``cat secrets.env``) and
+    ``routes/references.py`` ``/reveal`` (plaintext credentials, per its own
+    docstring). Rotation would therefore have evicted the holder from ONE
+    credential surface while leaving a shell and a reveal route open — a
+    defence whose absence is not the exposure it appears to be.
+
+    The sharpest leg is not either of those, though, and it is worth stating
+    because it settles the question without depending on the terminal or the
+    reveal route existing at all: with a password configured this predicate and
+    ``is_authenticated`` are the SAME expression, so a stale-tag cookie also
+    satisfied the API mutation gate. Same-origin is decided from a request
+    header a non-browser client sets for itself, so the holder could simply
+    write a NEW dashboard password through the secrets route and then log in
+    cleanly. Rotation-eviction of the READ path was defeated by the WRITE path
+    in one request — not merely dominated, circumventable.
+
+    The harvested-session hazard it was aimed at is addressed at the login route
+    below, which mints nothing when no password is configured — but that guard is
+    PROSPECTIVE, and the distinction matters enough to state rather than imply. A
+    cookie issued by an older revision, on an install that then set a password,
+    still satisfies this predicate. It is not chased here because it is dominated
+    by the same reasoning: that cookie already owns the terminal PTY and the
+    reveal route, so evicting it from value disclosure alone buys nothing. The
+    defence that would actually close it is a session epoch — rotating the Flask
+    signing key, or versioning sessions when the password changes — which evicts
+    every surface at once rather than one. That is a separate change and is not
+    made here.
+    """
+    return bool(get_dashboard_password()) and session.get("authenticated") is True
 
 
 def check_password(input_password: str) -> bool:
@@ -323,7 +443,9 @@ def check_api_mutation_auth():
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         expected = get_or_create_internal_api_token()
-        if expected and hmac.compare_digest(auth_header[7:], expected):
+        # Bytes, as in check_bearer_token: compare_digest raises on non-ASCII
+        # str, which turned a bad credential into a 500 (#2467).
+        if expected and bearer_matches(_presented_bearer_bytes(auth_header), expected):
             return None
 
     # Trusted browser session (session cookie). A cookie is NOT proof of
@@ -336,6 +458,98 @@ def check_api_mutation_auth():
         return jsonify({"error": "cross-origin request refused"}), 403
 
     return jsonify({"error": "authentication required"}), 401
+
+
+# ── App-level /api/genesis network-scope gate ─────────────────────────
+#
+# The mutation gate above leaves every READ open, and /api/genesis/* reads serve
+# stored memory, knowledge, session-transcript and observation content -- which
+# is where any secret a user ever pasted into a conversation ends up. Rather than
+# list the content routes (a denylist the next route would miss), every
+# /api/genesis/* route is refused unless the TCP peer is on a trusted network,
+# and only the routes a host-side supervisor probes from outside stay open.
+#
+# ``request.remote_addr`` is the TCP peer: the standalone host installs no
+# proxy-header middleware, so a forwarded-for header cannot claim a trusted
+# address. That is NOT verifiable for a host that mounts these blueprints on an
+# app it does not own (the Agent Zero adapter): if that app trusts forwarded
+# headers, a spoofed loopback address passes this gate. A reverse proxy that
+# forwards from 127.0.0.1 (e.g. a path-scoped tailnet serve) likewise inherits
+# loopback trust for whatever paths IT exposes -- scope the proxy, not this gate.
+#
+# Both Genesis-owned prefixes are covered: the tool API (/api/t/) returns the
+# same recall content, and its own auth is the mutation gate, which is a no-op
+# when no dashboard password is set.
+
+_NETWORK_SCOPE_OFF = ("off", "0", "false", "no")
+
+# Loopback (local processes, SSH tunnels) and the Tailscale address ranges.
+_DEFAULT_TRUSTED_NETWORKS = ("127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48")
+# Always trusted, even when an operator override replaces the list above, so a
+# bad override can never lock the install out of its own API.
+_LOOPBACK_NETWORKS = (ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("::1/128"))
+
+# Exact (method, path) pairs reachable from ANY network: what the host-side
+# supervisor actually calls -- its liveness, heartbeat and pause-state READS and
+# its dialogue POST. Method-scoped on purpose: POST /pause (the kill switch) is
+# not something an outside caller needs.
+_OPEN_FROM_ANY_NETWORK = frozenset({
+    ("GET", "/api/genesis/health"),
+    ("GET", "/api/genesis/heartbeat"),
+    ("GET", "/api/genesis/pause"),
+    ("POST", "/api/genesis/guardian-dialogue"),
+})
+
+
+def _trusted_networks() -> tuple:
+    """Trusted networks: the override env var REPLACES the default; loopback always."""
+    raw = os.environ.get("GENESIS_DASHBOARD_TRUSTED_NETWORKS")
+    entries = _DEFAULT_TRUSTED_NETWORKS if raw is None else raw.split(",")
+    nets = list(_LOOPBACK_NETWORKS)
+    for entry in entries:
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            # Skipped, not widened: an unparseable entry narrows access.
+            logger.warning("GENESIS_DASHBOARD_TRUSTED_NETWORKS: ignoring invalid entry")
+    return tuple(nets)
+
+
+def _peer_is_trusted(addr: str | None) -> bool:
+    if not addr:
+        return False
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return any(ip.version == net.version and ip in net for net in _trusted_networks())
+
+
+def check_api_network_scope():
+    """App-level gate: refuse Genesis-owned API routes to untrusted peers.
+
+    Covers ``_GENESIS_API_PREFIXES`` (``/api/genesis/`` and the tool API
+    ``/api/t/``). Independent of the dashboard password -- it holds with auth
+    disabled. Open: any path outside those prefixes, the exact supervisor
+    (method, path) pairs in ``_OPEN_FROM_ANY_NETWORK``, and everything when
+    ``GENESIS_DASHBOARD_NETWORK_SCOPE=off``. Everything else from an untrusted or
+    unknown peer gets 403.
+    """
+    if os.environ.get("GENESIS_DASHBOARD_NETWORK_SCOPE", "on").strip().lower() in _NETWORK_SCOPE_OFF:
+        return None
+    path = request.path
+    if not path.startswith(_GENESIS_API_PREFIXES):
+        return None
+    if (request.method, path) in _OPEN_FROM_ANY_NETWORK:
+        return None
+    if _peer_is_trusted(request.remote_addr):
+        return None
+    return jsonify({"error": "not available from this network"}), 403
 
 
 def apply_api_mutation_gate(app) -> None:
@@ -351,6 +565,8 @@ def apply_api_mutation_gate(app) -> None:
     if getattr(app, "_genesis_api_mutation_gate_applied", False):
         return
     get_or_create_internal_api_token()  # mint once (0600) before the gate needs it
+    # Network scope first: a refused peer never reaches the auth checks.
+    app.before_request(check_api_network_scope)
     app.before_request(check_api_mutation_auth)
     app._genesis_api_mutation_gate_applied = True
 
@@ -381,6 +597,18 @@ def auth_login():
 
     if not password:
         return jsonify({"error": "Password required"}), 400
+
+    # Mint NOTHING when there is no credential to check against. ``check_password``
+    # returns True in that state ("auth disabled"), so without this guard any POST
+    # to this route received a permanent 30-day session on a passwordless install —
+    # and that cookie outlived the configuration change, so an operator who later
+    # set a password inherited a session an attacker had already harvested. That
+    # defeats the exact remediation this file recommends, which is why the check
+    # is here and not only at the disclosure sites.
+    pw = get_dashboard_password()
+    if not pw:
+        logger.info("Dashboard login attempted from %s while auth is disabled", ip)
+        return jsonify({"status": "auth_disabled"})
 
     if check_password(password):
         session.permanent = True
@@ -496,11 +724,19 @@ _LOGIN_HTML = """<!DOCTYPE html>
           credentials: 'same-origin',
           body: JSON.stringify({password: pw}),
         });
-        if (resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        if (resp.ok && body.status === 'auth_disabled') {
+          // 200, but NOTHING was minted: there is no password to check
+          // against. Redirecting here told the operator they were logged in
+          // while the session that gates the protected views did not exist,
+          // so values stayed hidden with no explanation.
+          err.textContent = 'No dashboard password is configured, so there is '
+            + 'nothing to log in to. Set one in Secrets to enable the '
+            + 'protected views.';
+        } else if (resp.ok) {
           window.location.href = '/genesis';
         } else {
-          const d = await resp.json().catch(() => ({}));
-          err.textContent = d.error || 'Login failed';
+          err.textContent = body.error || 'Login failed';
           document.getElementById('pw').select();
         }
       } catch (ex) {

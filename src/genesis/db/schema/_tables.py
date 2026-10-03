@@ -518,8 +518,11 @@ TABLES = {
             id             TEXT PRIMARY KEY,
             file_path      TEXT NOT NULL,
             content_hash   TEXT NOT NULL,
+            -- superseded = a parked row whose snapshot a newer drop replaced
+            -- (not a failure; error_message keeps the reason for audit).
             status         TEXT NOT NULL DEFAULT 'pending' CHECK (
-                status IN ('pending', 'processing', 'completed', 'failed')
+                status IN ('pending', 'processing', 'completed', 'failed',
+                           'superseded')
             ),
             batch_id       TEXT,
             response_path  TEXT,
@@ -1861,7 +1864,13 @@ TABLES = {
             -- human sets approved_at. NULL = unreviewed; the apply path filters
             -- on approved_at IS NOT NULL so no merge is ever auto-applied.
             approved_at  TEXT,
-            approved_by  TEXT
+            approved_by  TEXT,
+            -- Adjudication-policy version (MW-3 PR-2b): which prompt policy
+            -- produced this verdict. NULL = judged under the pre-Option-1
+            -- sub-item-vs-parent prompt; such 'distinct' verdicts are excluded
+            -- from settled_pair_keys so the sweep re-opens them under the
+            -- same-referent policy. Stamped by record_verdict on every write.
+            policy       TEXT
         )
     """,
     # Reversibility journal (PR-1): a pre-delete snapshot of the loser's identity
@@ -2056,7 +2065,11 @@ TABLES = {
             closed_reason TEXT,
             closed_at     TEXT,
             evidence      TEXT,
-            created_at    TEXT NOT NULL
+            created_at    TEXT NOT NULL,
+            verdict           TEXT,
+            attempt_count     INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at   TEXT,
+            last_attempt_note TEXT
         )
     """,
     # ── WS-2 sensor fabric (M9/M10) ──────────────────────────────────────

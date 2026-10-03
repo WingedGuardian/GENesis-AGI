@@ -1,6 +1,6 @@
 """Invariants on the SHIPPED routing config (config/model_routing.yaml).
 
-Guards the 2026-08 NIM repoint (after NVIDIA NIM EOL'd deepseek-v4-pro (HTTP 410)
+Guards the 2026-08 and 2026-10 NIM repoints (after NVIDIA NIM EOL'd deepseek-v4-pro (HTTP 410)
 and made kimi-k2.6 404-for-account): no re-introduction of those dead NIM model
 slugs, every call-site keeps a non-NIM fallback (NIM's free tier churns silently),
 the adversarial `_challenge` sites stay model-independent from their base, and the
@@ -15,10 +15,11 @@ from genesis.routing.config import load_config
 
 # NIM model slugs this repoint removed because they are dead for our account —
 # deepseek-v4-pro (HTTP 410 EOL) and kimi-k2.6 (404-for-account), both verified by
-# live probe 2026-08-19. A regression that repoints a NIM provider back to either
-# silently reopens the free->paid fallback leak this PR closed.
+# live probe 2026-08-19. V4 Flash 0731 retired in September (verified October 1).
+# Reintroducing a retired slug forces otherwise-free calls onto paid fallbacks.
 _DEAD_NIM_SLUGS = {
     "deepseek-ai/deepseek-v4-pro",
+    "deepseek-ai/deepseek-v4-flash-0731",  # HTTP 410 EOL, verified 2026-10-01
     "moonshotai/kimi-k2.6",
 }
 
@@ -96,8 +97,8 @@ def test_default_judge_chain_has_no_duplicates_and_mirrors_config():
         "offline judge chain drifted from the runtime judge call site"
     )
     # the known-down-primary lever reorders without duplicating
-    led = default_judge_chain("openrouter-deepseek-v4-flash")
-    assert led[0] == "openrouter-deepseek-v4-flash"
+    led = default_judge_chain("openrouter-deepseek-flash")
+    assert led[0] == "openrouter-deepseek-flash"
     assert len(led) == len(set(led)), f"duplicate after reorder: {led}"
 
 
@@ -110,3 +111,43 @@ def test_judge_stays_deepseek_family():
         assert "deepseek" in model, (
             f"judge uses non-deepseek provider {p} ({model}) — breaks the eval baseline"
         )
+
+
+# Current-generation Claude models reject sampling parameters, and routed call sites
+# pass `temperature`. litellm's `drop_params` only drops what its own model table
+# says a model rejects, and the pinned litellm predates these models, so a lane that
+# routes to one must name the parameters itself. Derived from the live provider set,
+# so a lane added or bumped later is checked without editing this test.
+_SAMPLING_PARAMS = {"temperature", "top_p", "top_k"}
+
+
+def _is_current_gen_claude(model_id: str) -> bool:
+    import re
+
+    # Opus 4.7 and 4.8 already reject sampling parameters; so does every
+    # 5-generation-or-later Sonnet, Opus, Fable and Mythos model.
+    return bool(
+        re.search(r"claude-(sonnet|opus|fable|mythos)-([5-9]|\d{2,})", model_id)
+        or re.search(r"claude-opus-4[.-][78](?!\d)", model_id)
+    )
+
+
+def test_current_gen_claude_lanes_drop_sampling_params():
+    cfg = _cfg()
+    lanes = {n: p for n, p in cfg.providers.items() if _is_current_gen_claude(p.model_id)}
+    assert lanes, "no current-generation Claude lane found — the derivation matched nothing"
+    for name, p in lanes.items():
+        dropped = set((p.params or {}).get("additional_drop_params") or [])
+        missing = _SAMPLING_PARAMS - dropped
+        assert not missing, f"{name} ({p.model_id}) must drop {sorted(missing)}"
+
+
+def test_older_claude_is_not_misclassified_as_current_gen():
+    assert not _is_current_gen_claude("anthropic/claude-sonnet-4.6")
+    assert not _is_current_gen_claude("anthropic/claude-haiku-4.5")
+    assert _is_current_gen_claude("anthropic/claude-sonnet-5.5")
+    assert _is_current_gen_claude("anthropic/claude-opus-5")
+    assert _is_current_gen_claude("anthropic/claude-opus-4.7")
+    assert _is_current_gen_claude("anthropic/claude-opus-4-8")
+    assert _is_current_gen_claude("anthropic/claude-mythos-5.1")
+    assert not _is_current_gen_claude("anthropic/claude-opus-4.6")

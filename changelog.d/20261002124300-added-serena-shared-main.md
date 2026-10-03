@@ -1,0 +1,1 @@
+- Added opt-in shared Serena services for the main checkout, reducing duplicate language-server memory across concurrent clients while keeping linked worktrees isolated.

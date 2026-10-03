@@ -76,6 +76,11 @@ gated on values they can't know.
    only cross-links; a closing keyword makes GitHub close the issue automatically
    when the PR merges — and closing only fires on a merge to the **default branch**.
 
+   **Stacked PRs are not supported yet.** Open each PR against `main` only
+   after the PR it builds on has merged. A PR based on another branch gets no
+   CI, and the merge gate blocks a non-`main` base. GitHub's native stacked
+   PRs are pending a separate decision.
+
 PRs without a prior issue or discussion may be closed if the change wasn't
 discussed first. All PRs require a maintainer review before merging.
 

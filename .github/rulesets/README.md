@@ -99,6 +99,14 @@ analysis-service latency, which is a different argument for the same conclusion;
 the remaining `CI` jobs are worth keeping green but a stall in one should not
 hold the repository.
 
+`genesis-merge-gate` (the `merge-gate` workflow, issue #1670) is likewise
+deliberately absent from this list for now: it runs the local merge gate's
+`--check-pr` report as an advisory check while its false-block rate is
+measured. The promotion criteria and ordering constraints are documented in
+`.github/workflows/merge-gate.yml`; it enters `required_status_checks` only
+through its own reviewed commit to `checks.json`, alongside the `--admin`
+decoupling that makes a no-bypass required check possible at all.
+
 ## Squash only, in two places on purpose
 
 `allowed_merge_methods` is a parameter of the `pull_request` rule, which lives

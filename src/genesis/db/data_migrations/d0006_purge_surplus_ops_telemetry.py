@@ -47,6 +47,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 
+from genesis.db.connection import connect_sqlite_rw
 from genesis.db.data_migrations._util import commit_in_batches
 from genesis.env import genesis_db_path
 from genesis.qdrant.collections import delete_point, get_client
@@ -168,7 +169,7 @@ def migrate() -> dict:
             conn.execute("DELETE FROM pending_embeddings WHERE memory_id = ?", (qdrant_id,))
             conn.execute("DELETE FROM entity_mentions WHERE memory_id = ?", (qdrant_id,))
 
-    db = sqlite3.connect(genesis_db_path(), timeout=30.0)
+    db = connect_sqlite_rw(genesis_db_path(), timeout=30.0)
     try:
         purged = commit_in_batches(db, deletable, _purge_sqlite)
     finally:

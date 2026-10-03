@@ -14,8 +14,11 @@ from pathlib import Path
 
 from flask import jsonify, request
 
+from genesis.cc.child_env import pin_dispatched_env
 from genesis.dashboard._blueprint import blueprint
+from genesis.db.connection import connect_sqlite_rw
 from genesis.env import update_in_progress
+from genesis.observability.deploy_record import row_facts
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +58,20 @@ def _git_result(*args: str, timeout: int = 10) -> tuple[str | None, str]:
 
 
 def _query_db(sql: str, params: tuple = ()) -> list[dict]:
-    """Run a read-only query against genesis.db. Returns list of row dicts."""
+    """Run a read-only query against genesis.db. Returns list of row dicts.
+
+    Read-only by intent but NOT by mode: this opens read-write (no
+    ``mode=ro``), so despite the name it can checkpoint a stale ``-wal`` into
+    the main file on close. The write helper directly below already refuses a
+    quarantined database via ``connect_sqlite_rw``; this one consults the same
+    admission check so the route does not leave a read-write handle open on a
+    database the write path is refusing.
+    """
     if not _DB_PATH.is_file():
+        return []
+    from genesis.db.admission import database_is_fenced
+
+    if database_is_fenced(_DB_PATH):
         return []
     try:
         conn = sqlite3.connect(str(_DB_PATH), timeout=5)
@@ -74,7 +89,7 @@ def _execute_db(sql: str, params: tuple = ()) -> bool:
         return False
     conn = None
     try:
-        conn = sqlite3.connect(str(_DB_PATH), timeout=5)
+        conn = connect_sqlite_rw(_DB_PATH, timeout=5)
         conn.execute(sql, params)
         conn.commit()
         return True
@@ -131,11 +146,19 @@ def update_status():
     last_update = None
     hist_rows = _query_db(
         "SELECT old_tag, new_tag, old_commit, new_commit, status, "
-        "failure_reason, started_at, completed_at "
-        "FROM update_history ORDER BY started_at DESC LIMIT 1"
+        "failure_reason, degraded_subsystems, started_at, completed_at "
+        "FROM update_history ORDER BY datetime(started_at) DESC LIMIT 1"
     )
     if hist_rows:
         last_update = hist_rows[0]
+        # Facts derive from the STORED row, before the failed/rolled_back→
+        # success reconciliation below — a reconciled row keeps
+        # server_restarted=None rather than making a claim it never earned.
+        last_update.update(
+            row_facts(
+                last_update.get("status"), last_update.get("degraded_subsystems"),
+            ).as_dict()
+        )
 
     # Reconcile: if update_history says rolled_back/failed but the target
     # commit actually landed in HEAD, the update succeeded despite the
@@ -572,6 +595,7 @@ def _spawn_detached_cc(
         stderr=subprocess.STDOUT,
         start_new_session=True,
         cwd=str(_GENESIS_ROOT),
+        env=pin_dispatched_env(dict(os.environ)),
     )
     log_fh.close()  # child inherited the fd
     return proc
@@ -616,8 +640,11 @@ def spawn_cc(prompt, model, effort=None):
         if effort:
             cmd += ["--effort", effort]
         cmd.append("--dangerously-skip-permissions")
+        # Mirrors genesis.cc.child_env.pin_dispatched_env (this script avoids
+        # genesis imports): function hooks stay off in dispatched sessions.
+        env = {{**os.environ, "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "0"}}
         proc = subprocess.Popen(
-            cmd, start_new_session=True, cwd=str(GENESIS_ROOT),
+            cmd, start_new_session=True, cwd=str(GENESIS_ROOT), env=env,
         )
         PID_FILE.write_text(str(proc.pid))
         log.info("CC %s started (pid %d)", model, proc.pid)

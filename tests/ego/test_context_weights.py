@@ -254,6 +254,7 @@ class TestCompactionWeightThreading:
         await engine.assemble_context(
             context_builder=mock_builder,
             context_weights={"goals": "light", "capabilities": "skip"},
+            ego_source="user_ego_cycle",
         )
 
         mock_builder.build.assert_called_once_with(
@@ -278,6 +279,7 @@ class TestCompactionWeightThreading:
         # Try to skip always-sections — compaction should upgrade them
         await engine.assemble_context(
             context_builder=mock_builder,
+            ego_source="user_ego_cycle",
             context_weights={
                 "user_model": "skip",
                 "output_contract": "light",
@@ -304,7 +306,9 @@ class TestCompactionWeightThreading:
         mock_builder = AsyncMock()
         mock_builder.build.return_value = "mock context"
 
-        await engine.assemble_context(context_builder=mock_builder)
+        await engine.assemble_context(
+            context_builder=mock_builder, ego_source="user_ego_cycle",
+        )
         mock_builder.build.assert_called_once_with(
             context_weights=None, focus_id=None,
         )

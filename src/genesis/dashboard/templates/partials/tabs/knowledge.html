@@ -218,7 +218,7 @@
         </div>
         <div style="flex: 1; min-width: 100px; background: var(--color-background); border-radius: 6px; padding: .75rem; text-align: center;">
           <div style="font-size: 1.4rem; font-weight: 700;" x-text="$store.genesisDashboard.knowledgeStats?.qdrant_vectors ?? '—'"></div>
-          <div style="font-size: .75rem; color: var(--color-text-secondary);">Qdrant Vectors</div>
+          <div style="font-size: .75rem; color: var(--color-text-secondary);" title="Collection-wide point count — not scoped to the knowledge partition shown by Total Units.">Qdrant Vectors (all)</div>
         </div>
         <div style="flex: 1; min-width: 100px; background: var(--color-background); border-radius: 6px; padding: .75rem; text-align: center;">
           <div style="font-size: 1.4rem; font-weight: 700;" x-text="Object.keys($store.genesisDashboard.knowledgeStats?.by_domain ?? {}).length"></div>

@@ -45,8 +45,8 @@ WHAT IS DELIBERATELY ABSENT. No `authorizes_commit`, no `resets_streak`, no
 the user's answer back and honoured it. That gate is gone -- nothing reads an answer now
 -- and a field with no consumer declares behaviour the system does not have.
 
-SCOPE: the CAP tier only. Neither the round-2 mode-switch tier nor the final-round
-terminal is here; `ask_gate_menu.py` explains why each is excluded and enforces both.
+SCOPE: the local CAP tier only. The round-2 mode-switch is excluded, and the
+GitHub-backed four-head approval is rendered by the gated action itself.
 """
 
 from __future__ import annotations

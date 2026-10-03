@@ -14,10 +14,13 @@ import ast
 import importlib.util
 import json
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -55,6 +58,33 @@ def _runner(responses: dict[str, subprocess.CompletedProcess[str]], calls: list 
         raise AssertionError(f"unexpected command: {joined}")
 
     return run
+
+
+#: A SYNTHETIC fingerprint list. Never this install's real one: a test fixture
+#: is tracked, public, and permanent, so real hostnames or subnets in it are the
+#: leak the scanner exists to prevent.
+_SYNTHETIC_FINGERPRINTS = "# synthetic test fingerprints\nexample-fixture-host\n"
+
+
+@pytest.fixture(autouse=True)
+def synthetic_fingerprints(tmp_path_factory, monkeypatch):
+    """Point the privacy scan at a fingerprint file that EXISTS.
+
+    ``scan_prose`` fails CLOSED when the fingerprint list is missing — correct,
+    because an issue is a terminal egress surface with no CI backstop. But
+    ``~/.genesis/release-fingerprints.txt`` is written by bootstrap, and a
+    GitHub runner has no such file, so without this every test that reaches the
+    scan would fail on CI while passing on a developer box.
+
+    MEASURED 2026-09-16 when the scan was wired in: 13 of 60 tests in this
+    module passed locally and failed under an empty HOME. The env var is
+    inherited, so this covers the subprocess tests as well as the in-process
+    ones. ``test_a_missing_fingerprint_file_refuses`` opts out to pin the
+    fail-closed direction itself.
+    """
+    path = tmp_path_factory.mktemp("fingerprints") / "release-fingerprints.txt"
+    path.write_text(_SYNTHETIC_FINGERPRINTS, encoding="utf-8")
+    monkeypatch.setenv("GENESIS_RELEASE_FINGERPRINTS", str(path))
 
 
 # --- round 3: the permission check resolved the FORK and reported ADMIN -------
@@ -638,10 +668,13 @@ def test_indeterminate_only_when_the_reconciling_lookup_also_fails():
 def test_lock_directory_failure_refuses_rather_than_using_a_tmpdir_fallback(monkeypatch):
     """A TMPDIR-dependent fallback is not a lock: CC sets TMPDIR, a shell does not."""
 
-
     monkeypatch.setattr(fti, "Path", _PathWithFailingMkdir)
-    with pytest.raises(fti.Refused, match="TMPDIR-dependent fallback"):
+    with pytest.raises(fti.Refused, match="TMPDIR-dependent fallback") as excinfo:
         fti._lock_path("Org/Repo")
+    msg = str(excinfo.value)
+    assert "read-only file system" not in msg, "raw exception text must not leak into refusal"
+    assert str(Path.home()) not in msg, "home directory must not leak into refusal"
+    assert "(OSError)" in msg, "exception class name should be rendered instead"
 
 
 def test_no_tempfile_fallback_remains_in_the_source():
@@ -1145,3 +1178,771 @@ class TestSigtermHandlerIsScoped:
         assert rc == 0
         assert seen, "the runner was never called, so nothing was observed"
         assert all(h is fti._sigterm_as_interrupt for h in seen)
+# --- the privacy scan: an issue is a terminal egress surface -----------------
+#
+# CI's leak detector reads PR diffs and PR bodies. NOTHING reads issue bodies,
+# so until this scan existed the only thing between a draft and a permanent
+# public post was the author remembering. These pin the three properties that
+# make it a gate rather than a gesture: it blocks, it blocks BEFORE any network
+# call, and it cannot be satisfied by an install that cannot actually scan.
+
+
+def _scan_runner(calls: list):
+    """A runner that answers the lookups but records everything it is asked."""
+    return _runner(
+        {
+            "isFork": _proc(
+                json.dumps({"isFork": False, "nameWithOwner": "Org/Repo", "parent": None})
+            ),
+            "viewerPermission": _proc(json.dumps({"viewerPermission": "WRITE"})),
+            # Newline-delimited JSON OBJECTS, one per issue. An empty body
+            # means "no issues" — a JSON array here is a DIFFERENT shape and
+            # crashes the reader.
+            "gh api": _proc(""),
+            "issue create": _proc("https://github.com/Org/Repo/issues/1"),
+        },
+        calls,
+    )
+
+
+def _file(tmp_path, title: str, body: str) -> tuple[str, str]:
+    t, b = tmp_path / "title.txt", tmp_path / "body.md"
+    t.write_text(title, encoding="utf-8")
+    b.write_text(body, encoding="utf-8")
+    return str(t), str(b)
+
+
+def _main(t, b, run):
+    return fti.main(
+        [
+            "--title-file",
+            t,
+            "--body-file",
+            b,
+            "--area",
+            "area:other",
+            "--difficulty",
+            "help wanted",
+        ],
+        run,
+    )
+
+
+def test_acceptance_a_home_path_in_the_body_is_refused_with_no_network_call(tmp_path, capsys):
+    """THE ACCEPTANCE BAR. A /home/<user> path is the portability class that
+    leaks an operator's account name, and it must never reach the tracker.
+
+    The zero-call assertion is the half that matters most: refusing AFTER
+    resolving the tracker would still be a refusal, but it would spend API
+    calls learning where not to post and would leave the draft one bug away
+    from a real create. The scan runs before anything leaves the machine.
+    """
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Repro: run it from /home/someoperator/genesis.")
+    rc = _main(t, b, _scan_runner(calls))
+    assert rc == 2, "a home path must REFUSE, and a refusal means nothing was posted"
+    err = capsys.readouterr().err
+    assert "privacy scan BLOCKED" in err
+    assert calls == [], f"the scan must precede every subprocess call, got {calls}"
+
+
+def test_a_clean_body_still_files(tmp_path, capsys):
+    """The control. Without it the test above cannot distinguish a working
+    scanner from one that refuses everything -- which is exactly the state this
+    change exists to fix, so it is not a hypothetical failure mode."""
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "A plain technical description, no private data.")
+    rc = _main(t, b, _scan_runner(calls))
+    assert rc == 0, capsys.readouterr().err
+    assert any("issue create" in " ".join(c) for c in calls)
+
+
+def test_a_missing_fingerprint_file_refuses_rather_than_filing(tmp_path, capsys, monkeypatch):
+    """Fail-CLOSED, pinned rather than inherited.
+
+    Opts out of the autouse fixture by pointing at a path that does not exist.
+    An install whose fingerprint list was never generated cannot scan, and an
+    unscannable issue is not filed -- the direction scan_prose chose because
+    prose egress has no CI backstop to catch what it misses.
+    """
+    monkeypatch.setenv("GENESIS_RELEASE_FINGERPRINTS", str(tmp_path / "absent.txt"))
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Entirely innocuous text.")
+    rc = _main(t, b, _scan_runner(calls))
+    assert rc == 2
+    # WHICH floor refused matters: on an interpreter where detect-secrets is
+    # also unreachable this would pass for the wrong reason and pin nothing
+    # about the fingerprint floor.
+    assert "fingerprint" in capsys.readouterr().err.lower()
+    assert calls == []
+# --- what gh POSTS is the snapshot, not the caller's file --------------------
+#
+# Codex P1: checking the draft and then letting gh reopen the path cannot
+# deliver "the posted bytes were scanned" — the window ends inside another
+# process. These replace two earlier tests that asserted a REFUSAL on edit;
+# under the snapshot an edit is simply irrelevant, which is the stronger
+# guarantee and needs the stronger assertion.
+
+
+def _body_file_arg(calls: list) -> str:
+    for c in calls:
+        if "issue" in c and "create" in c:
+            return c[c.index("--body-file") + 1]
+    raise AssertionError(f"no create call recorded: {calls}")
+
+
+def test_gh_is_handed_a_snapshot_not_the_callers_path(tmp_path, capsys):
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Clean technical text.")
+    rc = _main(t, b, _scan_runner(calls))
+    assert rc == 0, capsys.readouterr().err
+    posted = _body_file_arg(calls)
+    assert posted != b, "gh was handed the caller's mutable path"
+    assert "issue-body-" in posted
+
+
+def test_an_edit_after_the_scan_cannot_change_what_is_posted(tmp_path, capsys):
+    """The bytes gh reads are the bytes that passed the scan.
+
+    The draft is rewritten mid-run with content the scan would have BLOCKED.
+    Under the old shape gh reopened that path; here it reads a snapshot taken
+    after the scan passed, so the edit reaches nothing.
+    """
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Clean at scan time.")
+    inner = _scan_runner(calls)
+    tampered = "Now mentions /home/someoperator/secrets"
+
+    seen: dict = {}
+
+    def run(argv):
+        # Land the write once the tracker lookup starts — after the scan and
+        # after the snapshot, i.e. inside the window that used to be open.
+        if "isFork" in " ".join(argv):
+            Path(b).write_text(tampered, encoding="utf-8")
+        if "issue" in argv and "create" in argv:
+            # Read it HERE: the snapshot is removed in a finally, so reading
+            # after _main returns finds nothing (which is itself correct).
+            seen["bytes"] = Path(argv[argv.index("--body-file") + 1]).read_bytes()
+        return inner(argv)
+
+    rc = _main(t, b, run)
+    assert rc == 0, capsys.readouterr().err
+    posted_bytes = seen["bytes"]
+    assert b"Clean at scan time." in posted_bytes
+    assert tampered.encode() not in posted_bytes, "gh would have posted unscanned text"
+    # Guard-the-guard: the tamper really happened, or this asserts nothing.
+    assert Path(b).read_text() == tampered
+
+
+def test_the_snapshot_is_private_and_removed_afterwards(tmp_path, capsys):
+    """It holds a copy of the body, so it must not be readable by others and
+    must not outlive the run."""
+    calls: list = []
+    seen: dict = {}
+    t, b = _file(tmp_path, "A real title", "Clean technical text.")
+    inner = _scan_runner(calls)
+
+    def run(argv):
+        if "issue" in argv and "create" in argv:
+            path = Path(argv[argv.index("--body-file") + 1])
+            seen["file_mode"] = path.stat().st_mode & 0o777
+            seen["dir_mode"] = path.parent.stat().st_mode & 0o777
+            seen["dir"] = path.parent
+        return inner(argv)
+
+    assert _main(t, b, run) == 0, capsys.readouterr().err
+    assert seen["dir_mode"] == 0o700, f"snapshot dir is {oct(seen['dir_mode'])}"
+    assert seen["file_mode"] == 0o600, f"snapshot file is {oct(seen['file_mode'])}"
+    assert not seen["dir"].exists(), "the snapshot outlived the run"
+
+
+def test_the_snapshot_is_removed_when_the_post_fails(tmp_path, capsys):
+    """Cleanup is in a finally, so a refusal must not leave the body on disk."""
+    calls: list = []
+    seen: dict = {}
+    t, b = _file(tmp_path, "A real title", "Clean technical text.")
+
+    def run(argv):
+        calls.append(list(argv))
+        joined = " ".join(argv)
+        if "isFork" in joined:
+            return _proc(json.dumps({"isFork": False, "nameWithOwner": "Org/Repo", "parent": None}))
+        if "viewerPermission" in joined:
+            return _proc(json.dumps({"viewerPermission": "WRITE"}))
+        if "gh api" in joined:
+            # Fail the duplicate lookup: a Refused AFTER the snapshot exists.
+            return _proc(returncode=1, stderr="network down")
+        raise AssertionError(joined)
+
+    # Capture the directory by listing ~/tmp before and after.
+    parent = Path.home() / "tmp"
+    before = {p.name for p in parent.glob("issue-body-*")} if parent.exists() else set()
+    rc = _main(t, b, run)
+    after = {p.name for p in parent.glob("issue-body-*")} if parent.exists() else set()
+    assert rc == 2, capsys.readouterr().err
+    assert after == before, f"a refusal left snapshots behind: {after - before}"
+    seen.clear()
+
+
+# --- a refusal must not reproduce what it blocked ----------------------------
+
+
+def test_a_refusal_does_not_echo_the_matched_text(tmp_path, capsys):
+    """Codex P1. sanitize stores the first 120 chars of the offending LINE in
+    `detail`, and the email scanner puts the address in `message`.
+
+    A refusal goes to stderr, which lands in scrollback, session transcripts
+    and CI logs — so echoing the match takes a value successfully blocked from
+    a public tracker and writes it somewhere durable instead. The leak moved
+    one surface over rather than stopped.
+    """
+    calls: list = []
+    secret = "/home/someoperator/genesis/very-distinctive-path-fragment"
+    t, b = _file(tmp_path, "A real title", f"Repro: run it from {secret} and see.")
+    rc = _main(t, b, _scan_runner(calls))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "privacy scan BLOCKED" in err
+    assert "very-distinctive-path-fragment" not in err, "the refusal reproduced the match"
+    assert secret not in err
+    # It must still be ACTIONABLE: name the rule and where, just not the value.
+    assert "content withheld" in err
+    assert "portability" in err.lower()
+
+
+def test_an_infrastructure_refusal_still_explains_itself(tmp_path, capsys, monkeypatch):
+    """The withholding is scoped to CONTENT findings.
+
+    A scanner-state failure carries no scanned text and is exactly what an
+    operator needs spelled out, because it is about the environment rather than
+    the draft. Suppressing it too would make the gate unactionable.
+    """
+    monkeypatch.setenv("GENESIS_RELEASE_FINGERPRINTS", str(tmp_path / "absent.txt"))
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Entirely innocuous text.")
+    rc = _main(t, b, _scan_runner(calls))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "fingerprint file not found" in err.lower()
+    assert "content withheld" not in err
+# --- the snapshot's creation is all-or-nothing -------------------------------
+
+
+def test_a_failed_snapshot_write_leaves_nothing_behind(tmp_path, monkeypatch):
+    """The caller learns the directory's name only from a successful RETURN, so
+    anything that fails after the mkdir must clean up before propagating — or
+    a copy of the body sits under ~/tmp with nothing knowing to remove it.
+    """
+    parent = Path.home() / "tmp"
+    before = {p.name for p in parent.glob("issue-body-*")} if parent.exists() else set()
+
+    def boom(*a, **k):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(fti.os, "write", boom)
+    with pytest.raises(OSError):
+        fti._snapshot(b"a body")
+    after = {p.name for p in parent.glob("issue-body-*")} if parent.exists() else set()
+    assert after == before, f"a failed snapshot leaked: {after - before}"
+
+
+def test_a_snapshot_interrupted_mid_write_leaves_nothing_behind(tmp_path, monkeypatch):
+    """BaseException, not Exception: a SIGINT between the mkdir and the write is
+    exactly when the leftover matters, and KeyboardInterrupt is not an
+    Exception, so an `except Exception` would not have caught it."""
+    parent = Path.home() / "tmp"
+    before = {p.name for p in parent.glob("issue-body-*")} if parent.exists() else set()
+
+    def interrupt(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(fti.os, "write", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        fti._snapshot(b"a body")
+    after = {p.name for p in parent.glob("issue-body-*")} if parent.exists() else set()
+    assert after == before, f"an interrupted snapshot leaked: {after - before}"
+
+
+def test_the_snapshot_is_never_world_readable_even_briefly(tmp_path):
+    """Created 0600 by os.open, not written-then-chmod'd.
+
+    A write-then-chmod leaves the body readable for the width of that window.
+    The 0700 directory makes it unreachable to other users, but the file mode
+    is the thing under test and defence in depth is the point of a 0600 here.
+    """
+    d, path = fti._snapshot(b"sensitive body")
+    try:
+        assert Path(path).stat().st_mode & 0o777 == 0o600
+        assert Path(d).stat().st_mode & 0o777 == 0o700
+        assert Path(path).read_bytes() == b"sensitive body"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# --- a refusal never carries an exception's text -----------------------------
+
+
+def test_a_staging_failure_names_the_type_not_the_path(tmp_path, capsys, monkeypatch):
+    """An OSError from os.mkdir/os.open carries the FILENAME, which is under the
+    operator's home — the same class of value the refusal machinery exists to
+    keep out of stderr. I removed `f.detail` from refusals for that reason and
+    then reintroduced the leak here, one function away.
+    """
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Clean technical text.")
+
+    def boom(data):
+        raise OSError(28, "No space left on device", "/home/someoperator/tmp/issue-body-x")
+
+    monkeypatch.setattr(fti, "_snapshot", boom)
+    rc = _main(t, b, _scan_runner(calls))
+    err = capsys.readouterr().err
+    assert rc == 2, "nothing was posted, so this is a refusal (exit 2), not exit 1"
+    assert "OSError" in err
+    assert "/home/someoperator" not in err, "the refusal leaked the path"
+    assert "No space left" not in err
+
+
+def test_an_unreadable_draft_names_the_type_not_the_path(tmp_path, capsys):
+    """Same class, pre-existing, in a block this change rewrites. The draft path
+    is caller-supplied and routinely under a home directory."""
+    calls: list = []
+    t = tmp_path / "title.txt"
+    t.write_text("A real title", encoding="utf-8")
+    missing = "/home/someoperator/drafts/absent-body.md"
+    rc = _main(str(t), missing, _scan_runner(calls))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "/home/someoperator" not in err, "the refusal leaked the draft path"
+    assert "FileNotFoundError" in err
+
+
+# The allowlist of interpolations that provably cannot carry a filesystem path.
+# Each entry is an AST SHAPE, not a variable name, because a name says nothing
+# about what it holds. Anything not matching one of these must have its whole
+# message routed through `_redact_home`.
+#
+# Adding to this list is a decision someone can argue with in review. Adding a
+# new unwrapped interpolation without touching it is not possible, which is the
+# entire difference between this and the denylist it replaces.
+# ── the emitter guard ────────────────────────────────────────────────────────
+#
+# WHY THE GUARD POINTS HERE AND NOT AT `Refused(...)`.
+#
+# The first version of this change guarded the CONSTRUCTORS: every interpolation
+# inside a `Refused()` message had to be provably path-free or the message had
+# to be wrapped. An adversarial audit measured what that covered, and the answer
+# was thirteen of eighteen leak shapes ACCEPTED — `"x: " + str(exc)`,
+# `"%s" % proc.stderr`, `"{}".format(exc.filename)`, a message built on the line
+# before, a keyword argument, an aliased or dotted constructor. Every one of
+# those is a different way to build a string, and there is no end to them.
+#
+# Worse, two live leaks reached stderr without constructing a `Refused` at all:
+# the generic `ERROR: {exc}` handler (reproduced: an unreadable lock file put an
+# absolute home path on stderr, the same path #2152 had just hardened one line
+# earlier), and the `gh issue create` TIMEOUT cause, whose `TimeoutExpired`
+# renders the whole argv including a `--body-file` path under the home.
+#
+# So the guard was pointed at the other end. Strings are produced in an OPEN
+# set of ways and consumed by a CLOSED set of five `print` calls. Redaction now
+# happens at those five, and this checks that it stays that way. A new refusal
+# written next year in a spelling nobody anticipated is covered, because it has
+# to come out of one of these.
+
+
+def _emitter_offenders(source: str) -> list[tuple[int, str]]:
+    """Every `print(...)` whose first argument is neither a plain constant nor
+    routed through `_redact_home(...)`.
+
+    THE ONE AND ONLY implementation of this check. An earlier version had the
+    test call a near-copy of its own loop, which meant the copy proved the
+    predicate worked while nothing proved the real guard USED it — replacing
+    the guard's verdict with `pass` left twelve tests green. Both the
+    real-module assertion and the synthetic cases below call this function, so
+    there is nothing to drift.
+
+    SCOPE, stated rather than implied, because an enumeration that looks total
+    and is not is how the first version of this guard went wrong. It matches
+    `print(...)` BY NAME. It would not see `sys.stdout.write(...)`, an aliased
+    or rebound `print`, `os.write(1, ...)`, or a subprocess inheriting stdout.
+    MEASURED against the module today: five `print` calls and no other path to
+    a user-visible stream -- the one `os.write` is a temp-file descriptor for
+    the scanned body, not an output stream. Treat this as the spellings checked
+    so far, not a closed set; the denominator cell below is what notices if the
+    walk stops finding them.
+    """
+    offenders: list[tuple[int, str]] = []
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "print"):
+            continue
+        if not node.args:
+            continue
+        first = node.args[0]
+        if isinstance(first, ast.Constant):
+            continue
+        if (
+            isinstance(first, ast.Call)
+            and isinstance(first.func, ast.Name)
+            and first.func.id == "_redact_home"
+        ):
+            continue
+        offenders.append((node.lineno, ast.unparse(first)[:90]))
+    return offenders
+
+
+def test_every_emitter_routes_through_the_redactor():
+    """The closed set, checked against the real module."""
+    src = _SCRIPT.read_text(encoding="utf-8")
+    offenders = _emitter_offenders(src)
+    assert not offenders, (
+        "print() reaches a user-visible stream without redaction:\n"
+        + "\n".join(f"  line {ln}: {expr}" for ln, expr in offenders)
+        + "\n\nWrap the argument in _redact_home(...). It is idempotent, so "
+        "wrapping something already redacted upstream is harmless."
+    )
+
+
+def test_the_emitter_guard_has_a_denominator():
+    """A derived set can be a SUBSET and pass forever. If the walk breaks,
+    `offenders` is empty for the wrong reason and the cell above goes quiet."""
+    src = _SCRIPT.read_text(encoding="utf-8")
+    prints = [
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "print"
+    ]
+    assert len(prints) >= 5, (
+        f"only {len(prints)} print() calls found — the extraction is broken, so "
+        "an empty offender list proves nothing"
+    )
+
+
+def test_the_emitter_guard_rejects_what_it_should():
+    """The VERDICT, not just the predicate.
+
+    Every case is a spelling the replaced constructor-guard accepted. If any of
+    these returns no offender, the polarity has inverted back.
+    """
+    cases = {
+        "bare exception": 'print(f"failed: {exc}")',
+        "concatenation": 'print("failed: " + str(exc))',
+        "percent format": 'print("failed: %s" % proc.stderr)',
+        "str.format": 'print("at {}".format(exc.filename))',
+        "a name built earlier": 'msg = f"at {p}"\nprint(msg)',
+        "stderr stream": 'print(f"at {p}", file=sys.stderr)',
+        "a method call": 'print(f"at {path.resolve()}")',
+    }
+    missed = [label for label, src in cases.items() if not _emitter_offenders(src)]
+    assert not missed, f"the guard admitted an unredacted emitter: {missed}"
+
+
+def test_the_emitter_guard_admits_what_it_should():
+    """A guard that rejects everything is a broken parser, and it would pass
+    the cell above for the wrong reason."""
+    cases = {
+        "wrapped": 'print(_redact_home(f"failed: {exc}"))',
+        "wrapped to stderr": 'print(_redact_home(msg), file=sys.stderr)',
+        "a plain constant": 'print("nothing to see")',
+        "no arguments": "print()",
+    }
+    wrongly = {label: _emitter_offenders(src) for label, src in cases.items() if _emitter_offenders(src)}
+    assert not wrongly, f"the guard rejected a safe emitter: {wrongly}"
+
+
+def test_neutering_the_guards_verdict_is_caught():
+    """The failure that made the previous guard worthless, pinned.
+
+    Its verdict was never exercised: the test asserted on an accumulator the
+    real loop never wrote to, so replacing `offenders.append(...)` with `pass`
+    left every guard cell green. Here the rejection cells call the SAME
+    function the real-module cell calls, so a verdict that stops recording
+    fails them — which is what this asserts, on the function itself.
+    """
+    assert _emitter_offenders('print(f"{exc}")'), "the verdict must record an offender"
+    assert not _emitter_offenders('print("plain")'), "and must not invent one"
+
+
+def test_the_redactor_replaces_the_home_prefix_and_keeps_the_rest():
+    """The substitution is the point: dropping the path would lose the
+    diagnostic, which is why these sites were not fixed the way #2152 was."""
+    home = str(Path.home())
+    text = f"open {home}/tmp/draft.md: not a directory"
+    out = fti._redact_home(text)
+    assert home not in out, out
+    assert out == "open ~/tmp/draft.md: not a directory", out
+
+
+def test_the_redactor_leaves_a_root_home_alone(monkeypatch):
+    """A home of `/` would otherwise turn every absolute path into nonsense,
+    and such an install has no account name in it to protect."""
+    monkeypatch.setattr(fti.Path, "home", staticmethod(lambda: Path("/")))
+    text = "open /etc/hosts: permission denied"
+    assert fti._redact_home(text) == text
+
+
+def test_the_redactor_never_raises_when_home_is_unresolvable(monkeypatch):
+    """A refusal must not fail while trying to make itself safe."""
+
+    def boom():
+        raise RuntimeError("could not resolve home")
+
+    monkeypatch.setattr(fti.Path, "home", staticmethod(boom))
+    assert fti._redact_home("some text") == "some text"
+
+
+def test_the_redactor_does_not_eat_a_different_account_or_a_url():
+    """Anchored substitution, bound.
+
+    MEASURED with a bare `str.replace` and a home of `/home/jay`:
+    `cannot read /home/jayson/keys/id_rsa` became `cannot read ~son/keys/...`.
+    That half-destroys ANOTHER account's name and names a file that does not
+    exist — worse than the leak, in the one direction that costs a debugging
+    round. A URL containing the same characters was mangled identically.
+    """
+    real = str(Path.home())
+    cases = [
+        (f"cannot read {real}son/keys/id_rsa", f"{real}son", "a sibling account"),
+        (f"see https://example.invalid{real}/docs/x", f"{real}/docs", "a url"),
+        (f"open /var{real}/tmp/b.md failed", f"/var{real}", "a different mount"),
+    ]
+    for text, must_survive, label in cases:
+        out = fti._redact_home(text)
+        assert must_survive in out, f"{label}: substitution was not anchored — {out}"
+    # ...and the real thing is still redacted, or the cell above passes by
+    # simply doing nothing.
+    assert fti._redact_home(f"open {real}/tmp/b.md failed") == "open ~/tmp/b.md failed"
+    assert fti._redact_home(f"open {real} failed") == "open ~ failed"
+
+
+def test_the_redactor_handles_a_path_ending_a_sentence():
+    """`gh` writes diagnostics as sentences.
+
+    The first anchored version required a separator or end-of-string after the
+    home, so `failed to read <home>.` kept the period out of the boundary and
+    the account name went into the refusal unredacted. Terminal punctuation
+    ends a token too — but only when whitespace or the end follows it, or
+    `<home>.config` (a different directory) would be rewritten.
+    """
+    real = str(Path.home())
+    for text in (f"failed to read {real}.", f"see {real}. Next", f"under {real}!", f"q {real}?"):
+        out = fti._redact_home(text)
+        assert real not in out, f"a path ending a sentence leaked: {out}"
+        assert "~" in out, out
+    # The control that stops the boundary from being widened into a bug.
+    for text in (f"dir {real}.config/x", f"sib {real}son/keys"):
+        assert fti._redact_home(text) == text, f"a different directory was rewritten: {text}"
+
+
+def test_the_boundary_tradeoff_is_asymmetric_on_purpose():
+    """Almost every byte is legal in a POSIX path, so nothing in the text can
+    prove where one ends. Erring one way MANGLES a valid diagnostic; erring the
+    other LEAKS the account name. Leaking is worse, so ambiguity resolves toward
+    redaction — and both halves of that choice are pinned here, because a later
+    reader will otherwise "fix" one side and silently break the other.
+
+    MEASURED: an earlier boundary treated `:`, `;`, `,`, `'`, `"` and `)` as
+    always-terminating, and rewrote six of twelve near-miss shapes — `<home>:2`
+    became `~:2`, naming a path that does not exist.
+    """
+    real = str(Path.home())
+    # Punctuation that occurs INSIDE real directory names terminates only when
+    # whitespace or the end follows it.
+    for text in (f"read {real}:2 failed", f"read {real};x failed", f"read {real},v failed"):
+        assert fti._redact_home(text) == text, f"a real sibling was rewritten: {text}"
+    # Quote and paren always terminate — ACCEPTED as the lossy side, because
+    # diagnostics quote paths and requiring whitespace after the quote would
+    # miss that and leak.
+    for text in (f"open '{real}': denied", f'q "{real}" x', f"see ({real})"):
+        out = fti._redact_home(text)
+        assert real not in out, f"a quoted path leaked: {out}"
+
+
+def test_the_emitter_guard_rejects_a_call_that_is_not_the_redactor():
+    """The guard admits a wrapped emitter by the wrapper's NAME. A cell that
+    only ever wraps with `_redact_home` cannot tell that from admitting any
+    call at all."""
+    assert _emitter_offenders('print(scrub(f"at {p}"))'), (
+        "only _redact_home may satisfy the guard"
+    )
+    assert _emitter_offenders('print(str(exc))'), "a bare conversion is not redaction"
+    assert not _emitter_offenders('print(_redact_home(f"at {p}"))')
+
+
+def test_the_redactor_is_idempotent():
+    """`cause` reaches `_reconcile_uncertain_create` already redacted from the
+    create path and is redacted again on the way out. That is only safe if a
+    second pass is a no-op -- a normalising helper applied twice is exactly the
+    shape that bites."""
+    home = str(Path.home())
+    once = fti._redact_home(f"open {home}/a/b.md failed")
+    assert fti._redact_home(once) == once, once
+
+
+def test_an_import_error_naming_a_module_file_is_redacted():
+    """MEASURED, and it corrects the note that exempted this site as carrying
+    only "a module name": an ImportError of the `cannot import name X from Y`
+    form renders the module's absolute __file__."""
+    home = str(Path.home())
+    text = (
+        "cannot import name 'scan_prose' from 'genesis.contribution.sanitize' "
+        f"({home}/genesis/src/genesis/contribution/sanitize.py)"
+    )
+    out = fti._redact_home(text)
+    assert home not in out, out
+    assert "~/genesis/src" in out, out
+
+
+def test_a_gh_failure_does_not_write_a_home_path_to_the_refusal():
+    """End to end through the real `_gh_json`, with the shape `gh` actually
+    produces: a config-load error naming an absolute path under the home."""
+    home = str(Path.home())
+
+    def run(argv):
+        return _proc(
+            returncode=1,
+            stderr=f"failed to load config: open {home}/.config/gh/config.yml: not a directory",
+        )
+
+    with pytest.raises(fti.Refused) as excinfo:
+        fti._gh_json(run, ["gh", "repo", "view", "--json", "nameWithOwner"])
+    msg = str(excinfo.value)
+    assert home not in msg, f"the refusal leaked the home path: {msg}"
+    assert "~/.config/gh/config.yml" in msg, f"the diagnostic was lost: {msg}"
+
+
+def test_a_failed_create_does_not_echo_the_draft_path_from_the_home():
+    """`create_issue` puts the caller-supplied --body-file into argv, and `gh`
+    echoes it back on failure. The draft routinely lives under the home."""
+    home = str(Path.home())
+    body_path = f"{home}/tmp/drafts/body.md"
+
+    def run(argv):
+        joined = " ".join(argv)
+        if "issue create" in joined:
+            return _proc(returncode=1, stderr=f"could not read {body_path}")
+        # The duplicate check reads NDJSON, one object per line -- an empty
+        # listing is no lines at all, not "[]".
+        return _proc(stdout="")
+
+    with pytest.raises((fti.Refused, fti.Indeterminate)) as excinfo:
+        fti.create_issue("Org/Repo", "a title", body_path, ["area:other"], run)
+    msg = str(excinfo.value)
+    assert home not in msg, f"the refusal leaked the draft path: {msg}"
+
+
+# --- the sentinel contract, which nothing bound ------------------------------
+#
+# _INFRASTRUCTURE_DETAILS is a cross-MODULE string contract: the sentinels are
+# minted in src/genesis/contribution/sanitize.py and consumed here by string
+# equality. Renaming one on either side silently kills BOTH the message
+# pass-through and the interpreter hint together, and the operator with the
+# wrong interpreter is then told their draft contains a secret. This is the
+# whole replacement for the cut venv re-exec, and it had no test at all.
+
+
+def test_every_infrastructure_sentinel_is_still_minted_by_sanitize():
+    """ALLOWLIST polarity against the producer, derived not copied.
+
+    Asserts each sentinel this module keys on still appears as a `detail=`
+    value in sanitize.py. A rename there fails HERE, rather than degrading a
+    refusal into an unactionable one in production.
+    """
+    src = (
+        Path(__file__).resolve().parents[2] / "src" / "genesis" / "contribution" / "sanitize.py"
+    ).read_text(encoding="utf-8")
+    minted = set(re.findall(r'detail="([a-z_]+)"', src))
+    missing = fti._INFRASTRUCTURE_DETAILS - minted
+    assert not missing, (
+        f"sentinel(s) {sorted(missing)} are no longer minted by sanitize.py — "
+        "the message pass-through and the interpreter hint both go dead silently"
+    )
+
+
+@pytest.mark.parametrize("sentinel", sorted(fti._INFRASTRUCTURE_DETAILS))
+def test_each_infrastructure_sentinel_renders_its_message(sentinel):
+    """The whole point of the allowlist: these carry no scanned text, so their
+    message is what an operator needs. One case per sentinel, so adding one
+    without a rendering decision is visible."""
+    f = SimpleNamespace(
+        kind=SimpleNamespace(value="secret"),
+        message="a message the operator needs",
+        detail=sentinel,
+        scanner="detect-secrets",
+        line=1,
+    )
+    out = fti._describe_finding(f, "body")
+    assert "a message the operator needs" in out
+    assert "content withheld" not in out
+
+
+def test_a_content_finding_never_renders_its_message():
+    """The complement, and the security half. Any detail NOT in the allowlist
+    is treated as scanned text."""
+    f = SimpleNamespace(
+        kind=SimpleNamespace(value="portability"),
+        message="Portability hit: absolute /home/<user>/genesis path",
+        detail="Repro: run it from /home/someoperator/genesis",
+        scanner="portability",
+        line=3,
+    )
+    out = fti._describe_finding(f, "body")
+    assert "someoperator" not in out
+    assert "content withheld" in out
+    assert "in the body line 3" in out
+
+
+def test_the_interpreter_hint_keys_on_the_sentinel_not_the_wording():
+    """Keyed on `missing_binary`, so rewording sanitize's message cannot drop
+    the hint — the failure mode that made the earlier wording-based check
+    fragile."""
+    reworded = SimpleNamespace(
+        kind=SimpleNamespace(value="secret"),
+        message="completely different wording that omits the usual phrase",
+        detail="missing_binary",
+        scanner="detect-secrets",
+        line=1,
+    )
+    assert ".venv/bin/python" in fti._interpreter_hint([reworded])
+    other = SimpleNamespace(
+        kind=SimpleNamespace(value="portability"),
+        message="x",
+        detail="something else",
+        scanner="portability",
+        line=1,
+    )
+    assert fti._interpreter_hint([other]) == ""
+
+
+# --- the locator has to be right, because it is all that is left -------------
+
+
+def test_the_reported_line_is_native_to_the_field(tmp_path, capsys):
+    """Content is withheld by design, so the FIELD and the LINE carry the whole
+    actionability load — and they were wrong.
+
+    Concatenating title and body put the title on line 1 and shifted every body
+    line by one, so a hit on body line 3 was reported as line 4. The author
+    opens the draft, reads a clean line, and edits the wrong text. Scanning each
+    field separately makes the number native to the field it names.
+    """
+    calls: list = []
+    body = "line one is clean\nline two is clean\nRepro: /home/someoperator/genesis here"
+    t, b = _file(tmp_path, "A clean title", body)
+    rc = _main(t, b, _scan_runner(calls))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "in the body line 3" in err, err
+    assert "line 4" not in err
+
+
+def test_a_title_finding_is_named_as_the_title(tmp_path, capsys):
+    """The other half of the same fix: a hit in the title says so, rather than
+    sending the author to line 1 of the body."""
+    calls: list = []
+    t, b = _file(tmp_path, "Broken on /home/someoperator/genesis", "A clean body.")
+    rc = _main(t, b, _scan_runner(calls))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "in the title" in err, err

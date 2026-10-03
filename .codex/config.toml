@@ -1,0 +1,55 @@
+# Codex is an external Genesis MCP client. This initial surface is deliberately
+# read-oriented; expand it only after a separately reviewed capability decision.
+# The launcher strips Genesis/Claude session identity before starting a server.
+
+[mcp_servers.genesis-health]
+command = "python3"
+args = ["scripts/codex_external_mcp.py", "--server", "health"]
+cwd = "."
+startup_timeout_sec = 30
+enabled_tools = [
+  "health_status",
+  "bootstrap_manifest",
+  "subsystem_heartbeats",
+  "job_health",
+  "provider_activity",
+]
+# NOT here: `health_errors` and `health_alerts`. Both are real tools, but in the
+# STANDALONE server this config starts they cannot honour the schemas they
+# advertise. `StandaloneHealthDataService` leaves `_dead_letter`, `_breakers`
+# and `_routing_config` as None, so `health_errors` skips both its pending
+# dead-letter query and its open-circuit-breaker loop; and its reconstructed
+# call-site states are only active/idle/stale/unknown, so `health_alerts` can
+# never reach the down/degraded branches that report a provider outage.
+#
+# A tool that silently omits the failures it promises to report is worse than an
+# absent one: absence is visible, and a clean answer from a blind tool is read
+# as "no failures". The floor for this surface is that a tool means what its
+# schema says. Restoring them means wiring those three sources into the
+# standalone service, not re-adding these lines.
+# NOT here: `infrastructure_profile`. An allowlist grants the TOOL, not its
+# ARGUMENTS, and `refresh=true` persists profile files, emits DB drift
+# observations and renders shared documents — so admitting it would put the one
+# write in an otherwise entirely read-only surface, and the tool's own
+# empty-state hint ("pass refresh=true") actively invites that call. The value
+# here is that this list is auditable by inspection. Restoring machine-facts
+# visibility means splitting the tool into a read-only view plus a separate
+# refresh, not re-adding this line.
+default_tools_approval_mode = "approve"
+
+[mcp_servers.genesis-memory]
+command = "python3"
+args = ["scripts/codex_external_mcp.py", "--server", "memory"]
+cwd = "."
+startup_timeout_sec = 30
+enabled_tools = [
+  "memory_recall",
+  "memory_expand",
+  "memory_core_facts",
+  "memory_stats",
+  "knowledge_recall",
+  "knowledge_status",
+  "procedure_recall",
+  "observation_query",
+]
+default_tools_approval_mode = "approve"

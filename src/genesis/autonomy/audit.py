@@ -197,14 +197,21 @@ class PostExecutionAuditor:
                             continue
                         # LIMITATION: this only sees file mutations made via the
                         # Write/Edit tools, so a session that changes files via
-                        # Bash (sed -i, redirects, cp/mv) is invisible to the
-                        # protected-path audit below. Currently safe: every
-                        # background profile blocks Bash+Edit except `steward`,
-                        # whose Bash is hard-locked to the `gh` binary by
-                        # scripts/bash_safety_hook.sh (no redirect/pipe/chain),
-                        # so it cannot write files. REVISIT if any profile or
-                        # overlay grants file-writing Bash (see follow-up:
-                        # add Bash file-target coverage to _parse_transcript).
+                        # Bash is invisible to the protected-path audit below.
+                        #
+                        # THIS IS A REAL GAP, and the argument that used to sit
+                        # here was wrong. It read: `steward`'s Bash is locked to
+                        # the `gh` binary, "so it cannot write files". The
+                        # allowlist does bound WHICH binary runs, and it is
+                        # enforced now, which it was not when that comment was
+                        # written. But the permitted binary is itself a
+                        # general-purpose file writer and an authenticated API
+                        # client, so a FIRST-TOKEN allowlist does not make the
+                        # session unable to write files, and any writes it makes
+                        # are invisible to this audit.
+                        #
+                        # Do not restore a safety argument on this line without
+                        # a mechanism that bounds the SUBCOMMAND, not the binary.
                         if block.get("name") not in ("Write", "Edit"):
                             continue
                         fp = block.get("input", {}).get("file_path", "")

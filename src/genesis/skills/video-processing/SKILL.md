@@ -1,6 +1,7 @@
 ---
 name: video-processing
 description: Download, transcribe, analyze, and clip video content — vertical shorts, captions, thumbnails
+keywords: [ffmpeg, clip, clips, shorts, thumbnail, thumbnails, transcode]
 consumer: cc_background_task
 phase: 7
 skill_type: uplift
