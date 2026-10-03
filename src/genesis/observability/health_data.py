@@ -590,6 +590,9 @@ class HealthDataService:
             return {}
         return {
             name: {
+                "configured": r.configured,
+                "probe_supported": r.probe_supported,
+                "can_affect_breaker": r.can_affect_breaker,
                 "reachable": r.reachable,
                 "model_available": r.model_available,
                 "latency_ms": r.latency_ms,

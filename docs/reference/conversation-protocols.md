@@ -116,5 +116,9 @@ explorations, brainstorming, thinking out loud.
 
 `ego_decision(action="supersede", …)` only when the user explicitly revokes an
 earlier ruling; `ego_decision(action="list")` before recording a possible
-duplicate. When unsure whether something is a ruling or a preference, ask — one
-short question beats a wrong artifact.
+duplicate. `record` reaffirms only a repeat of the same ruling (including one
+captured from a rejected proposal, whose provenance note it ignores); otherwise it
+records the new ruling and returns the other active rulings under that tag as
+`related` (`related_total` counts all of them) — if the user's new ruling
+replaces one, supersede that id. When unsure whether something is a ruling or
+a preference, ask — one short question beats a wrong artifact.

@@ -343,9 +343,15 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 33b49a105 2026-09-26
+verified: b0867170e 2026-10-02
 ```
 
+- **Replay-unsafe CC outcomes do not enter full-tools recovery, failover or
+  durable parking.** Stream truncation and overloads with known-work or MCP
+  evidence share this boundary; provider diagnosis remains available as a
+  cause. Missing/unusable overload turn counts remain retryable by explicit
+  policy, not proof of pre-work failure. See `cc/exceptions.py`,
+  `cc/transient_retry.py` and `docs/reference/inbox-replay-safety.md`.
 - **NO dispatch profile grants Bash** (`cc/direct_session.py`,
   `_PROFILE_BASH_ALLOWLIST` is `{}`). `steward` was the only one — Bash restricted
   to `gh`, for upstream-PR stewardship — and it was REMOVED 2026-09-26 having never
@@ -1044,7 +1050,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: 640c4f2e3 2026-09-18
+verified: b0867170e 2026-10-02
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1100,6 +1106,12 @@ verified: 640c4f2e3 2026-09-18
   complete outstanding work is re-derived from the current source and completed
   baseline, so a crash during multi-row creation cannot silently lose the
   never-created tail or leave pending rows suppressing the file forever.
+  Replay-unsafe batches persist a hold independent of the retry cap; readable
+  held blocks are excluded from future deltas without becoming completed
+  baseline content, while unreadable holds block their source file. The
+  operator-only per-item release requires explicit replay acknowledgement and
+  an unchanged source, then returns through normal approval/claim handling.
+  Recovery procedure and limits: `docs/reference/inbox-replay-safety.md`.
 - **recon/**: scheduled intelligence jobs (release watch, model intelligence
   Sun 8am, models.md synthesis Sun 10am, GitHub discovery, skill-security scan
   via external NVIDIA SkillSpector). Emits findings for triage
@@ -2563,9 +2575,15 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers, decisions]
-verified: 1ff7c3e3c 2026-10-02
+verified: b0867170e8e3 2026-10-02
 ```
 
+- **Provider health evidence**: NVIDIA's `/v1/models` catalog is supported
+  but observational only; success, failure and probe exceptions do not mutate
+  its breakers. Probe support, credential presence and breaker authority are
+  serialized separately. Unsupported configured targets retain breaker-based
+  display instead of a false missing-key status. Listing membership does not
+  establish completion entitlement, credential validity or remaining quota.
 - **October 2026 model refresh**: the stable NVIDIA DeepSeek alias selects
   V4.1 Flash after the old Flash endpoint returned HTTP 410. Eight ordinary
   Pro chain references and both Fusion panels use MiMo V2.6 Pro; the novelty
@@ -2769,7 +2787,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
-verified: f24c15e9 2026-09-05
+verified: b0867170e 2026-10-02
 ```
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
@@ -2814,6 +2832,11 @@ verified: f24c15e9 2026-09-05
   helper: `sync-hooks.sh` installs it beside `emit_bugfix_audit.py`, because
   the git hook runs the installed copy out of `$GIT_COMMON_DIR/hooks` where a
   sibling import is the only one that resolves.
+  The guarded async factory also accepts `existing_only=True` for recovery
+  writers: encoded `mode=rw` refuses a missing database without dropping either
+  pre/post-open quarantine check. Inbox hold release uses this opt-in; ordinary
+  callers retain create-capable behavior. It is not a replacement/maintenance
+  fence and does not pin a database inode across inspection and release.
   Two AST-locked boundaries rather than conventional ones:
   `test_db/test_connection_admission_lock.py` pins the open-time connect set
   (a NEW factory fails until classified — it exists because a hand enumeration
@@ -3102,7 +3125,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 2ac29c19 2026-09-14
+verified: 5e8dc977 2026-10-01
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -3137,6 +3160,12 @@ verified: 2ac29c19 2026-09-14
   `update.sh` restores AGENTS.md to HEAD before its merge — saving any local
   edits under `~/.genesis/premerge-backups/` first — so the block must live in
   the commit).
+  Codex's local CLI also has a budget-only shell action hook in
+  `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the
+  existing commit/request budget decisions, denies approval-required or unknown
+  evidence, and returns control to the user without native approval or Genesis
+  lifecycle registration. It does not enforce the future reflection gates or
+  cover arbitrary indirect execution. See `docs/reference/codex-review-stop.md`.
   Codex has a separate external-client adapter in `.codex/config.toml`: it
   starts the existing standalone health and memory MCP servers through a
   launcher that scrubs inherited Genesis session identity, provenance,
@@ -3327,12 +3356,23 @@ verified: b67423bd 2026-10-03
 - **Open questions** (`mcp/health/open_question_tools.py`: `open_question_raise`,
   `_resolve`, `_block`, `_list`) — never gated by the board mode, because they
   write only local rows. A target id prefix must resolve uniquely against its
-  own table. A question and all its blocks are written in one SAVEPOINT, so
-  every target is validated first and none land unless all do. A close is
-  guarded on the observed status, so a second answer never overwrites the
-  first. Card targets and stored repo names are lowercased, because GitHub
-  names are case-insensitive. A test pins that the module has no GitHub or
-  subprocess path. `open_question_list` is on the reflection read allowlist.
+  own table. Every target is validated first. Every WRITE (raise, resolve,
+  block add/remove) runs on a connection the tool owns, never the server's
+  shared one, because the health MCP middleware rolls the shared connection
+  back after any failed tool call and could discard or split a write already
+  reported saved. A raise is one `BEGIN IMMEDIATE` transaction (the question
+  and all its blocks, or nothing). A lost lock race retries the whole unit and
+  reports "nothing was changed" if it never wins. A close is guarded on the
+  observed status, so a second answer never overwrites the first, and a closed
+  question's edges are history (not removable). Resolving and removing a block
+  are owner authority: in `_UNIVERSAL_DISALLOW` for every background profile
+  (overlay profiles included) and refused server-side for a dispatched,
+  unsupervised session (`guard_human_gate`). Listing is denied on the
+  external-ingesting profiles, and raising on the untrusted-inbound perimeter.
+  `open_question_list` pages (50 default, 200 max, `next_offset`). Card targets
+  and stored repo names are lowercased, because GitHub names are
+  case-insensitive. A test pins that the module has no GitHub or subprocess
+  path. `open_question_list` is on the reflection read allowlist.
   **A block is enforced at promotion** (`board_promote` refuses a blocked
   record) and is advisory everywhere else. The morning report's ground-truth
   section counts unverified questions

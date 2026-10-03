@@ -1525,22 +1525,65 @@ async def list_active_decisions(
     return [dict(r) for r in await cursor.fetchall()], total
 
 
-async def find_active_decision(
+#: Cap for stored decision content — rulings are constraints, not essays.
+DECISION_CONTENT_MAX = 500
+
+#: Provenance the rejection hook appends when no standing rule was distilled.
+REJECTION_PROVENANCE = " (rejected proposal:"
+
+
+def decision_text_key(text: str) -> str:
+    """Comparison key for decision content: whitespace-collapsed, casefolded."""
+    return " ".join(text.split()).casefold()
+
+
+def decision_matches_ruling(row: dict, ruling: str) -> bool:
+    """True when the stored decision ``row`` records ``ruling`` (``[tag] text``).
+
+    The one matcher for both entry points. The rejection hook may append
+    ``REJECTION_PROVENANCE`` and a snippet, and both paths truncate to
+    ``DECISION_CONTENT_MAX``, which can cut the ruling or part of the marker.
+    Only a row captured from a proposal (``source_proposal_id`` set) can carry
+    that marker, so a manual ruling that merely contains the text never
+    matches its own prefix.
+    """
+    content = row["content"]
+    stored = decision_text_key(content)
+    want = decision_text_key(ruling[:DECISION_CONTENT_MAX])
+    if stored == want:
+        return True
+    if not row.get("source_proposal_id") or not stored.startswith(want):
+        return False
+    tail = stored[len(want) :]
+    if tail.startswith(REJECTION_PROVENANCE):
+        return True
+    # Truncation cut the marker itself, leaving only its first characters.
+    return len(content) >= DECISION_CONTENT_MAX and REJECTION_PROVENANCE.startswith(tail)
+
+
+async def find_tagged_decisions(
     db: aiosqlite.Connection,
     *,
-    prefix: str,
+    tag: str,
     ego_target: str = "user_ego",
-) -> dict | None:
-    """Active decision whose content starts with the ``[type/category]``
-    dedup prefix, or None."""
+) -> list[dict]:
+    """Active decisions whose content begins with the literal ``tag``, most
+    recently affirmed first (the order ``list_active_decisions`` uses).
+
+    Literal prefix compare (not LIKE): ``_`` and ``%`` in a tag match only
+    themselves, and the closing ``]`` keeps ``[a/b]`` from matching ``[a/b/goal:x]``.
+    The tag compare ignores ASCII case only (SQLite's built-in ``lower``);
+    generated tags are ASCII. The ruling text after it is casefolded in full by
+    ``decision_text_key``.
+    """
     cursor = await db.execute(
         "SELECT * FROM ego_directives "
         "WHERE status = 'active' AND kind = 'decision' AND ego_target = ? "
-        "AND content LIKE ? ORDER BY created_at DESC LIMIT 1",
-        (ego_target, prefix + "%"),
+        "AND lower(substr(content, 1, ?)) = lower(?) "
+        "ORDER BY COALESCE(last_reaffirmed_at, created_at) DESC",
+        (ego_target, len(tag), tag),
     )
-    row = await cursor.fetchone()
-    return dict(row) if row else None
+    return [dict(r) for r in await cursor.fetchall()]
 
 
 async def reaffirm_decision(db: aiosqlite.Connection, decision_id: str) -> bool:

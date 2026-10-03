@@ -20,8 +20,20 @@ FOLLOW = "9876fedc" + "1" * 24
 FOLLOW_TWIN = "9876fedc" + "2" * 24  # shares an 8-hex prefix with FOLLOW
 
 
+@pytest.fixture(autouse=True)
+def _attended_session(monkeypatch):
+    """Run as an owner-attended session whatever the developer's shell says
+    (a dispatched session's markers would refuse every owner-authority call).
+    Tests of the refusal set the markers themselves."""
+    monkeypatch.delenv("GENESIS_CC_SESSION", raising=False)
+    monkeypatch.delenv("GENESIS_SESSION_SUPERVISED", raising=False)
+
+
 @pytest.fixture
-async def db(tmp_path):
+async def db(tmp_path, monkeypatch):
+    # raise writes on a connection of its own, opened from genesis_db_path():
+    # point that at this test's file so the write and these reads see one DB.
+    monkeypatch.setattr("genesis.env.genesis_db_path", lambda: tmp_path / "genesis.db")
     async with aiosqlite.connect(str(tmp_path / "genesis.db")) as conn:
         await MIG.up(conn)
         # The tools only ever read these tables' ids — minimal stand-ins keep the
@@ -51,6 +63,105 @@ async def test_raise_with_blocks_resolves_prefixes(db):
     assert out["status"] == "ok"
     targets = {(b["target_kind"], b["target_id"]) for b in out["question"]["blocks"]}
     assert targets == {("ledger", LEDGER), ("follow_up", FOLLOW), ("card", "owner/repo#12")}
+
+
+async def _raise(db, **kw):
+    args = dict(question="q", context="", blocks=[], raised_by="", now=NOW)
+    args.update(kw)
+    return await oq._impl_open_question_raise(db, **args)
+
+
+async def _shared_writes(db, call):
+    """Run ``call()`` and return every write or commit it sent through the
+    shared connection ``db`` (reads are fine there; writes are not)."""
+    real_execute, real_commit = db.execute, db.commit
+    seen: list[str] = []
+
+    def recording(sql, *args):
+        seen.append(sql)
+        return real_execute(sql, *args)
+
+    async def recording_commit():
+        seen.append("COMMIT")
+        await real_commit()
+
+    db.execute, db.commit = recording, recording_commit
+    try:
+        out = await call()
+    finally:
+        db.execute, db.commit = real_execute, real_commit
+    return out, [s for s in seen if s == "COMMIT" or not s.lstrip().upper().startswith("SELECT")]
+
+
+@pytest.mark.parametrize("op", ["raise", "resolve", "block_add", "block_remove"])
+async def test_no_write_goes_through_the_shared_connection(db, op):
+    """Every open-question write runs on a connection the tool owns: the shared
+    one only answers read-only validation, so another tool's commit or rollback
+    on it (the middleware rolls it back after any failed call) can neither split
+    a raise from its blocks nor discard a write already reported saved."""
+    qid = (await _raise(db))["question"]["id"]
+    calls = {
+        "raise": lambda: _raise(db, blocks=[f"follow_up:{FOLLOW}"]),
+        "resolve": lambda: oq._impl_open_question_resolve(
+            db, question_id=qid, resolution="settled", status="resolved", now=NOW
+        ),
+        "block_add": lambda: oq._impl_open_question_block(
+            db, question_id=qid, target=f"ledger:{LEDGER}", remove=False, now=NOW
+        ),
+        "block_remove": lambda: oq._impl_open_question_block(
+            db, question_id=qid, target=f"ledger:{LEDGER}", remove=True, now=NOW
+        ),
+    }
+    if op == "block_remove":
+        await calls["block_add"]()
+    out, writes = await _shared_writes(db, calls[op])
+    assert out["status"] == "ok", out
+    assert writes == [], f"the shared connection carried writes: {writes}"
+
+
+async def test_a_lost_lock_race_is_retried_as_a_whole_unit(db, monkeypatch):
+    """A lock lost while opening the owned write is retried; the raise lands
+    exactly once."""
+    import contextlib
+    import sqlite3
+
+    from genesis.db import connection
+
+    real = connection.get_raw_db
+    failures = {"left": 2}
+
+    @contextlib.asynccontextmanager
+    async def flaky(path):
+        if failures["left"]:
+            failures["left"] -= 1
+            raise sqlite3.OperationalError("database is locked")
+        async with real(path) as conn:
+            yield conn
+
+    monkeypatch.setattr(connection, "get_raw_db", flaky)
+    monkeypatch.setattr(connection, "_WRITE_RETRY_DELAYS", (0, 0, 0))
+    out = await _raise(db, blocks=[f"follow_up:{FOLLOW}"])
+    assert out["status"] == "ok" and failures["left"] == 0
+    assert await _count(db, "open_questions") == 1
+    assert await _count(db, "open_question_blocks") == 1
+
+
+async def test_a_lock_lost_on_every_retry_is_reported_and_writes_nothing(db, monkeypatch):
+    import contextlib
+    import sqlite3
+
+    from genesis.db import connection
+
+    @contextlib.asynccontextmanager
+    async def always_locked(path):
+        raise sqlite3.OperationalError("database is locked")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(connection, "get_raw_db", always_locked)
+    monkeypatch.setattr(connection, "_WRITE_RETRY_DELAYS", (0, 0, 0))
+    out = await _raise(db)
+    assert out["status"] == "error" and "nothing was changed" in out["message"]
+    assert await _count(db, "open_questions") == 0
 
 
 @pytest.mark.parametrize(
@@ -153,7 +264,59 @@ async def test_list_pages_with_total(db):
             db, question=f"q{i}", context="", blocks=[], raised_by="", now=NOW
         )
     page = await oq._impl_open_question_list(db, status="unverified", target="", limit=2)
-    assert page["listed"] == 2 and page["total"] == 3
+    assert page["listed"] == 2 and page["total"] == 3 and page["next_offset"] == 2
+    rest = await oq._impl_open_question_list(db, status="unverified", target="", limit=2, offset=2)
+    assert rest["listed"] == 1 and rest["next_offset"] is None
+
+
+async def test_list_default_page_is_bounded_and_the_cap_enforced(db):
+    for i in range(oq.DEFAULT_PAGE + 3):
+        await oq._impl_open_question_raise(
+            db, question=f"q{i}", context="", blocks=[], raised_by="", now=NOW
+        )
+    page = await oq._impl_open_question_list(db, status="unverified", target="", limit=None)
+    assert page["listed"] == oq.DEFAULT_PAGE and page["total"] == oq.DEFAULT_PAGE + 3
+    assert page["next_offset"] == oq.DEFAULT_PAGE
+    too_big = await oq._impl_open_question_list(
+        db, status="unverified", target="", limit=oq.MAX_PAGE + 1
+    )
+    assert too_big["status"] == "error"
+
+
+async def test_dispatched_session_cannot_resolve_or_unblock(db, monkeypatch):
+    raised = await oq._impl_open_question_raise(
+        db, question="q", context="", blocks=[f"follow_up:{FOLLOW}"], raised_by="", now=NOW
+    )
+    qid = raised["question"]["id"]
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.delenv("GENESIS_SESSION_SUPERVISED", raising=False)
+    res = await oq._impl_open_question_resolve(
+        db, question_id=qid, resolution="x", status="resolved", now=NOW
+    )
+    assert res["status"] == "error" and "owner's call" in res["message"]
+    unb = await oq._impl_open_question_block(
+        db, question_id=qid, target=f"follow_up:{FOLLOW}", remove=True, now=NOW
+    )
+    assert unb["status"] == "error" and "owner's call" in unb["message"]
+    # raising (parking a fork) stays allowed for a dispatched session
+    again = await oq._impl_open_question_raise(
+        db, question="q2", context="", blocks=[], raised_by="", now=NOW
+    )
+    assert again["status"] == "ok"
+
+
+async def test_removing_an_edge_of_a_closed_question_is_an_error(db):
+    raised = await oq._impl_open_question_raise(
+        db, question="q", context="", blocks=["ledger:1234abcd"], raised_by="", now=NOW
+    )
+    qid = raised["question"]["id"]
+    await oq._impl_open_question_resolve(
+        db, question_id=qid, resolution="done", status="resolved", now=NOW
+    )
+    out = await oq._impl_open_question_block(
+        db, question_id=qid, target="ledger:1234abcd", remove=True, now=NOW
+    )
+    assert out["status"] == "error" and "history" in out["message"]
 
 
 async def test_unavailable_before_migration_and_without_db(tmp_path):

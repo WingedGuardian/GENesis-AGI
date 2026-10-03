@@ -1123,6 +1123,7 @@ async def test_ground_truth_counts_open_questions_and_never_renders_their_text(
     never the question text (free prose a session wrote)."""
     from genesis.db.crud import board
 
+    await db.commit()  # create_all_tables leaves a transaction open; a raise owns its own
     await board.raise_question(
         db, question="PRIVATE-QUESTION-TEXT about something", now="2026-09-01T00:00:00+00:00"
     )
@@ -1150,6 +1151,21 @@ async def test_ground_truth_open_questions_zero_and_unmigrated(
         gen_bare = MorningReportGenerator(mock_health, bare, mock_drafter)
         section = await gen_bare._ground_truth_section()
     assert "- Open questions awaiting your decision: unavailable (store not migrated)" in section
+
+
+async def test_ground_truth_open_questions_read_failure_is_said_not_silent(
+    db, mock_health, mock_drafter, monkeypatch
+):
+    """A failed read must not look like zero questions: this line is the only
+    push surface for parked owner decisions."""
+    from genesis.db.crud import board
+
+    async def boom(_db):
+        raise RuntimeError("disk I/O error")
+
+    monkeypatch.setattr(board, "question_summary", boom)
+    section = await MorningReportGenerator(mock_health, db, mock_drafter)._ground_truth_section()
+    assert "- Open questions awaiting your decision: unavailable (read failed)" in section
 
 
 async def test_the_stranded_line_SURVIVES_the_whole_store_part_failing(
