@@ -77,6 +77,20 @@ the scripts that keep the wipers off `live` (and what they source first), or thi
 engine, never goes live before it merges; nor does a branch that carries a
 `Deploy-rebuild:` commit (it was cut from `live`).
 
+WHAT THIS DEFENDS AGAINST (and what it does not): the job is to run unmerged
+code on THIS install's own server before its PR merges, and to keep that from
+going wrong by ACCIDENT — a rebuild that moves the checkout half-way, a drop
+that leaves code running the manifest no longer names, a candidate whose file
+happens to collide with a module the engine imports. It is NOT a sandbox and
+does not defend against a deliberately hostile candidate: a live candidate's
+code already runs as this user, in the server and in every venv python, so it
+could rewrite the manifest or the git hooks directly, and no check inside the
+engine can stop that. Isolation here (the entry's `python3 -I -S`, the sys.path
+strip, `scrub_env`) exists so candidate code does not run inside the engine BY
+ACCIDENT through an inherited variable or a name collision, not to withstand an
+attacker. "A candidate could get its code to run" is in scope only as an
+accident to make unlikely; against intent it is out of scope by construction.
+
 The reflog of `live` is kept through `git gc` and `git reflog expire --all`
 (gc.refs/heads/live.reflogExpire[Unreachable] = never). It is NOT kept through
 an explicit `git reflog expire --expire=now`, which overrides the configuration
@@ -87,13 +101,11 @@ changes nothing), 2 usage. The entry adds 200: update.lock still held after the
 wait.
 """
 
-from __future__ import annotations
-
-import os
+import os  # noqa: E402  (os and sys are preloaded by the interpreter; see below)
 import sys
 
 # The engine runs from the checkout it judges, and on `live` that checkout holds
-# candidate code. `python3 scripts/deploy_candidates.py` puts scripts/ on
+# unmerged candidate code. `python3 scripts/deploy_candidates.py` puts scripts/ on
 # sys.path, and ANY entry there is consulted for every module name nothing else
 # answers: a candidate adding scripts/argparse.py shadows a module that exists,
 # and scripts/msvcrt.py or scripts/nt.py answers a lookup the standard library
@@ -102,9 +114,19 @@ import sys
 # taken off sys.path entirely (compared through realpath: CPython resolves a
 # symlinked script directory in sys.path[0] but not in __file__), before
 # anything else is imported, and the engine's four sibling modules are loaded by
-# a finder that answers only their names, from this directory. (os and sys are
-# loaded by the interpreter before any script runs, so nothing shadows them.)
-# The shell entry also sets PYTHONSAFEPATH, which never adds scripts/ at all.
+# a finder that answers only their names, from this directory.
+#
+# This file has NO `from __future__ import annotations`, deliberately: a future
+# import is the first statement a module runs, before the strip below, and on a
+# bare `python3 scripts/deploy_candidates.py` it imports scripts/__future__.py if
+# the live checkout holds one (MEASURED, CPython 3.12). os and sys are already
+# loaded by the interpreter before any script runs, so neither can be shadowed,
+# which is why the strip can come before every other import. The engine targets
+# 3.12, where the annotation syntax it uses (`X | None`, `list[str]`) evaluates
+# at runtime without deferral; its sibling modules keep their future import, as
+# they load only after the strip. The shell entry also runs python3 -I -S, which
+# never adds scripts/ at all and reads neither PYTHONPATH nor a venv .pth (see
+# scripts/deploy_candidates); this strip is the backstop for a bare run.
 _SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 sys.path[:] = [p for p in sys.path if os.path.realpath(p or os.curdir) != _SCRIPT_DIR]
 
@@ -643,14 +665,50 @@ class Engine(Repo):
                 )
 
     def cmd_status(self) -> int:
-        data = self.store.load()
+        try:
+            data = self.store.load()
+            manifest_error = None
+        except Refusal as exc:  # malformed, unreadable, or another repository's
+            data, manifest_error = None, str(exc)
         branch = self.current_branch()
         head = self.resolve("HEAD")
         base = self.resolve(BASE_REF)
+        serving_sha, serving_why = self.serving()
+        served = serving_sha[:12] if serving_sha else f"unknown ({serving_why})"
         out(
             f"checkout: {branch or 'detached'} at {head[:12] if head else '?'}; "
+            f"server booted from {served}; "
             f"origin/main (last fetched) {base[:12] if base else '?'}"
         )
+        if branch == LIVE_BRANCH and head and head != self.resolve(LIVE_REF):
+            out("  WARNING: HEAD is not the tip of `live`.")
+        # What RUNS, read from `live` itself and NOT the manifest: a
+        # `drop --no-rebuild`, or a hand edit, leaves a candidate merged into
+        # `live` that the manifest no longer lists. Named even when the manifest
+        # is missing or malformed, so a manifest problem never hides live code.
+        # The "running" claim is tied to the server's booted commit — never
+        # asserted from the ref alone, which says nothing about what booted.
+        listed = {c["branch"] for c in data["candidates"]} if data else set()
+        live_merged: dict[str, str] = {}
+        if base and self.resolve(LIVE_REF):
+            try:
+                _, now_live = self.live_set(base, data)
+                live_merged = dict(now_live)
+            except Refusal as exc:
+                out(f"  WARNING: cannot read what `live` holds: {exc}")
+        for b, h in live_merged.items():
+            if b in listed:
+                continue
+            running = bool(serving_sha) and self.is_ancestor(h, serving_sha)
+            tail = (
+                " and the server booted a commit that contains it, so it runs until the next rebuild"
+                if running
+                else " (the server booted from another commit; the next rebuild removes it from `live`)"
+            )
+            out(f"{b}  merged into `live` at {h[:12]}, not in the manifest{tail}.")
+        if manifest_error is not None:
+            out(f"The deploy manifest cannot be read: {manifest_error}")
+            return 0
         if data is None:
             out(f"No deploy manifest ({self.store.path}): nothing is meant to be live.")
             return 0
@@ -675,15 +733,6 @@ class Engine(Repo):
                 "`live` holds commits that are neither a rebuild merge nor a candidate's: "
                 + ", ".join(c[:12] for c in foreign)
             )
-        live_merged: dict[str, str] = {}
-        if self.resolve(LIVE_REF):
-            try:
-                _, now_live = self.live_set(base, data)
-                live_merged = dict(now_live)
-            except Refusal as exc:
-                out(f"  WARNING: cannot read what `live` holds: {exc}")
-            if branch == LIVE_BRANCH and head != self.resolve(LIVE_REF):
-                out("  WARNING: HEAD is not the tip of `live`.")
         if not data["candidates"]:
             if refusals:
                 out(

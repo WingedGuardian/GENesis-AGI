@@ -10,6 +10,7 @@ import fcntl
 import os
 import re
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -32,6 +33,63 @@ def _two_live(w: World, dc):
     w.write_manifest([w.entry("feat/a"), w.entry("feat/b")])
     assert w.run(dc, "rebuild") == 0
     return hb
+
+
+def test_status_names_live_code_the_manifest_no_longer_lists(dc, dc_ready, capsys):
+    """`drop --no-rebuild` leaves the code merged into `live` on purpose. status
+    names it whether candidates remain or none do, and the 'still running' claim
+    is tied to what the server BOOTED, never asserted from the ref: when the
+    server booted a commit that contains the dropped candidate it says it runs;
+    when it booted something else (here origin/main, before the candidate), it
+    says so instead of claiming a run it cannot prove."""
+    w = dc_ready
+    _two_live(w, dc)
+    # The server booted the live tip, which contains both candidates.
+    w.serving_sha = w.rev("refs/heads/live")
+    assert w.run(dc, "drop", "feat/a", "--no-rebuild") == 0
+    capsys.readouterr()
+    assert w.run(dc, "status") == 0
+    out = capsys.readouterr().out
+    assert "feat/a  merged into `live` at" in out, out
+    assert "not in the manifest and the server booted a commit that contains it" in out, out
+    # Now model a server that booted origin/main (the candidate is NOT running).
+    w.serving_sha = w.rev("refs/remotes/origin/main")
+    assert w.run(dc, "drop", "feat/b", "--no-rebuild") == 0
+    capsys.readouterr()
+    assert w.run(dc, "status") == 0
+    out = capsys.readouterr().out
+    assert "feat/a  merged into `live` at" in out, out
+    assert "feat/b  merged into `live` at" in out, out
+    assert "the server booted from another commit" in out, out
+    assert "lists no candidates" in out
+
+
+def test_status_names_live_code_with_no_manifest(dc, dc_ready, capsys):
+    """A manifest problem must never hide live code. With the manifest deleted,
+    status still reads `live` and names every candidate merged into it, so the
+    drift is visible rather than masked by an early 'nothing is meant to be live'."""
+    w = dc_ready
+    _two_live(w, dc)
+    w.manifest_path.unlink()
+    capsys.readouterr()
+    assert w.run(dc, "status") == 0
+    out = capsys.readouterr().out
+    assert "feat/a  merged into `live` at" in out, out
+    assert "feat/b  merged into `live` at" in out, out
+    assert "No deploy manifest" in out
+
+
+def test_status_names_live_code_with_a_malformed_manifest(dc, dc_ready, capsys):
+    """Same, when the manifest is present but unreadable: status reports the
+    manifest problem AND names the live code, never one at the cost of the other."""
+    w = dc_ready
+    _two_live(w, dc)
+    w.manifest_path.write_text("{not json")
+    capsys.readouterr()
+    assert w.run(dc, "status") == 0
+    cap = capsys.readouterr()
+    assert "feat/a  merged into `live` at" in cap.out, cap.out
+    assert "cannot be read" in cap.out, cap.out
 
 
 def test_drop_removes_the_candidate_from_live(dc, dc_ready, capsys):
@@ -357,6 +415,28 @@ def test_every_lib_the_refusing_scripts_source_before_their_check_is_refused(dc)
         assert sourced, script
         for lib in sourced:
             assert dc.gate.path_refusal(f"scripts/{lib}"), f"{script} sources scripts/{lib} first"
+        # A file read with `cat` before the check is code too: deploy_code_only.sh
+        # runs serving_commit.py's text inside `status`, which returns before its
+        # branch check and which readiness runs.
+        for lib in re.findall(r'\$\(cat "\$[A-Z_]+/(lib/[^"]+)"\)', text[:check]):
+            assert dc.gate.path_refusal(f"scripts/{lib}"), f"{script} reads scripts/{lib} first"
+
+
+def test_child_processes_never_inherit_python_import_settings(dc):
+    """git hooks, gh and deploy_code_only.sh status run with the checkout's code
+    in reach: a PYTHON* variable from the caller (PYTHONPATH, PYTHONSTARTUP,
+    PYTHONHOME) must not reach them."""
+    env = {"PATH": "/usr/bin", "PYTHONPATH": "/x", "PYTHONSTARTUP": "/y", "PYTHONHOME": "/z"}
+    assert dc.core.scrub_env(env) == {"PATH": "/usr/bin"}
+
+
+def test_every_python_the_status_path_runs_is_isolated():
+    """readiness runs `deploy_code_only.sh status`, from the checkout `live` is
+    on. Its python must not import from an inherited PYTHONPATH or a venv .pth
+    (site would then import a candidate's sitecustomize)."""
+    text = (SCRIPTS / "lib" / "deploy_status.sh").read_text()
+    calls = re.findall(r"\bpython3\b[^\n]*", text)
+    assert calls and all(c.startswith("python3 -I -S ") for c in calls), calls
 
 
 def test_the_engine_is_inert_in_this_repository_until_pr_c_lands(dc):
@@ -447,21 +527,85 @@ def test_drop_list_and_status_work_from_a_plain_shell(dc, dc_ready):
     assert not (w.home / ".genesis" / "update_in_progress.pid").exists()
 
 
+@pytest.mark.parametrize("route", ["PYTHONPATH", "venv .pth"])
+def test_an_inherited_python_path_cannot_run_candidate_code_in_the_engine(
+    dc, dc_ready, tmp_path, route
+):
+    """Keeping scripts/ off sys.path is not enough: an inherited PYTHONPATH, or a
+    venv whose editable-install .pth points into the checkout's src/ (this
+    install's own venv has one), puts the candidate's src/ on sys.path too. The
+    control runs the engine as the entry used to (PYTHONSAFEPATH=1 python3) and
+    must reach candidate code; the entry must not."""
+    w = dc_ready
+    sentinel = tmp_path / "candidate-code-ran"
+    shadow = f"open({str(sentinel)!r}, 'w').write('ran')\n"
+    names = ("sitecustomize", "argparse", "nt", "msvcrt", "_winapi")
+    w.candidate("feat/evil", {f"src/{n}.py": shadow for n in names})
+    w.write_manifest([w.entry("feat/evil")])
+    assert w.run(dc, "rebuild") == 0
+    assert (w.root / "src" / "nt.py").exists()  # it is live
+    w.install_engine()
+    if route == "PYTHONPATH":
+        extra = [f"PYTHONPATH={w.root / 'src'}"]
+    else:
+        venv = tmp_path / "venv"
+        subprocess.run(["/usr/bin/python3", "-m", "venv", "--without-pip", str(venv)], check=True)
+        site = subprocess.run(
+            [str(venv / "bin" / "python3"), "-c", "import site; print(site.getsitepackages()[0])"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        (Path(site) / "__editable__.candidate.pth").write_text(f"{w.root / 'src'}\n")
+        extra = [f"PATH={venv / 'bin'}:/usr/bin:/bin"]
+    control = subprocess.run(
+        [
+            "env",
+            "-i",
+            f"HOME={w.home}",
+            "GIT_CONFIG_NOSYSTEM=1",
+            *extra,
+            "PYTHONSAFEPATH=1",
+            "/bin/bash",
+            "-c",
+            f"python3 {w.root / 'scripts' / 'deploy_candidates.py'} list",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert sentinel.exists(), "control: this route does not reach candidate code\n" + control.stderr
+    sentinel.unlink()
+    res = w.plain_shell("list", extra_env=extra)
+    assert res.returncode == 0 and "feat/evil" in res.stdout, res.stdout + res.stderr
+    res = w.plain_shell("drop", "feat/evil", extra_env=extra)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert not sentinel.exists()
+    assert w.live_merges() == []
+
+
 def test_a_live_candidate_cannot_shadow_the_engines_imports(dc, dc_ready, tmp_path):
     """The engine runs from the checkout it judges. A live candidate that adds
     scripts/argparse.py (any standard-library name) must not run inside the
     engine: `drop`, the repair path, still removes it. Checked through the
-    entry (python3 -P) and through a bare `python3 scripts/deploy_candidates.py`,
-    which puts scripts/ first on sys.path unless the engine takes it off."""
+    entry (python3 -I -S) and through a bare `python3 scripts/deploy_candidates.py`,
+    which puts scripts/ first on sys.path unless the engine takes it off.
+
+    scripts/__future__.py is the route that caught the earlier design: a
+    `from __future__ import annotations` is the first statement a module runs,
+    BEFORE the sys.path strip, so on a bare run it imported the candidate's
+    scripts/__future__.py. This file carries no future import for that reason, so
+    the strip is the first thing that runs and nothing below scripts/ is read."""
     w = dc_ready
     sentinel = tmp_path / "candidate-code-ran"
     shadow = f"open({str(sentinel)!r}, 'w').write('ran')\nraise SystemExit(0)\n"
     # argparse/json exist in the standard library; msvcrt and nt do not exist on
     # Linux, but the standard library LOOKS them up on every run (subprocess and
-    # ntpath), so any sys.path entry holding them answers the lookup.
+    # ntpath), so any sys.path entry holding them answers the lookup. __future__
+    # is imported before the strip in a module that carries a future import.
     w.candidate(
         "feat/evil",
         {
+            "scripts/__future__.py": shadow,
             "scripts/argparse.py": shadow,
             "scripts/json.py": shadow,
             "scripts/msvcrt.py": shadow,

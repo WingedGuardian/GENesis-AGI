@@ -331,6 +331,75 @@ def test_an_untracked_file_inside_a_directory_that_becomes_a_file_refuses_first(
     assert w.git(w.root, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
 
 
+def test_a_rebuild_whose_tree_changed_moves_even_with_the_same_merges(dc, dc_ready, capsys):
+    """Same base, same heads, same order, but a different tree: a repository-local
+    merge driver changed how two candidates merge. The checkout must follow the
+    tree the rebuild computed, not keep the old one because the merges match."""
+    w = dc_ready
+    w.advance_main({"f.txt": "base\n"})
+    w.git(w.root, "pull", "-q", "--ff-only")
+    w.serving_sha = w.rev("HEAD")
+    w.candidate("feat/a", {"f.txt": "A\n"})
+    w.candidate("feat/b", {"f.txt": "B\n"})
+    (w.root / ".git" / "info" / "attributes").write_text("f.txt merge=pick\n")
+    w.git(w.root, "config", "merge.pick.driver", "true")  # keeps ours (A)
+    w.write_manifest([w.entry("feat/a"), w.entry("feat/b")])
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    assert [b for b, _ in w.live_merges()] == ["feat/a", "feat/b"]
+    assert (w.root / "f.txt").read_text() == "A\n"
+    w.git(w.root, "config", "merge.pick.driver", "cp %B %A")  # now takes theirs (B)
+    capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    assert (w.root / "f.txt").read_text() == "B\n"
+
+
+def test_a_switch_that_fails_partway_says_what_changed(dc, dc_ready, capsys):
+    """git can rewrite part of the working tree and then fail (a required smudge
+    filter exiting non-zero: MEASURED, git 2.43), leaving HEAD where it was. The
+    refusal must name what changed, never claim nothing moved."""
+    w = dc_ready
+    w.candidate(
+        "feat/a", {"b.txt": None, ".gitattributes": "*.bin filter=bad\n", "z.bin": "data\n"}
+    )
+    w.write_manifest([w.entry("feat/a")])
+    w.git(w.root, "config", "filter.bad.smudge", "false")
+    w.git(w.root, "config", "filter.bad.required", "true")
+    assert w.run(dc, "rebuild") == 1
+    err = capsys.readouterr().err
+    assert "failed partway" in err and ".gitattributes" in err, err
+    assert "nothing moved" not in err, err
+    assert w.git(w.root, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
+
+
+def test_a_partial_switch_is_seen_even_in_an_untracked_dir_or_an_ignored_file(dc, dc_ready, capsys):
+    """The holes a plain `--porcelain` status leaves: a file written inside an
+    ALREADY-untracked directory (git collapses the dir to one line, so the new
+    file inside is invisible), an IGNORED file git wrote, and a
+    `status.showUntrackedFiles=no` config. The before/after status uses
+    `-uall --ignored` (and the flag overrides the config), so the partial move
+    is named rather than reported as 'nothing moved'."""
+    w = dc_ready
+    w.candidate("feat/a", {"newdir/a.txt": "y\n", "keep.log": "L\n", "zz.bin": "data\n"})
+    w.write_manifest([w.entry("feat/a")])
+    # newdir is untracked BEFORE the move; keep.log is ignored; untracked files
+    # are hidden from a plain status by config — all three would mask the move.
+    (w.root / "newdir").mkdir()
+    (w.root / "newdir" / "x.untracked").write_text("x\n")
+    (w.root / ".git" / "info").mkdir(exist_ok=True)
+    (w.root / ".git" / "info" / "exclude").write_text("*.log\n")
+    (w.root / ".git" / "info" / "attributes").write_text("*.bin filter=bad\n")
+    w.git(w.root, "config", "status.showUntrackedFiles", "no")
+    w.git(w.root, "config", "filter.bad.smudge", "false")
+    w.git(w.root, "config", "filter.bad.required", "true")
+    assert w.run(dc, "rebuild") == 1
+    err = capsys.readouterr().err
+    wrote = [p for p in ("newdir/a.txt", "keep.log") if (w.root / p).exists()]
+    assert wrote, "the scenario did not produce a partial write"
+    assert "failed partway" in err, err
+    assert "nothing moved" not in err, err
+    assert any(p in err for p in wrote), err
+
+
 def test_a_large_untracked_tree_in_the_way_is_named_by_count(dc, dc_ready, capsys):
     """An ignored tree the size of node_modules would otherwise print every
     file: the refusal names ten and counts the rest."""

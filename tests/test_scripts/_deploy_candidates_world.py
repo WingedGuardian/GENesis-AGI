@@ -302,10 +302,13 @@ class World:
             SCRIPTS / "lib" / "deploy_marker.sh", self.root / "scripts" / "lib" / "deploy_marker.sh"
         )
 
-    def plain_shell(self, *argv: str) -> subprocess.CompletedProcess:
+    def plain_shell(
+        self, *argv: str, extra_env: list[str] | None = None
+    ) -> subprocess.CompletedProcess:
         """`env -i`: no PATH, no venv, no Claude Code environment. HOME is the only
-        variable, so nothing can reach the real install."""
-        env = ["HOME=" + str(self.home), "GIT_CONFIG_NOSYSTEM=1"]
+        variable, so nothing can reach the real install. ``extra_env`` adds
+        "NAME=value" entries, for a test of what an inherited variable can do."""
+        env = ["HOME=" + str(self.home), "GIT_CONFIG_NOSYSTEM=1", *(extra_env or [])]
         return subprocess.run(
             [
                 "env",

@@ -99,11 +99,15 @@ _BLANK = re.compile(r"[ \t\r]*")  # the pre-push hook's blank(): /^[ \t\r]*$/
 
 
 def scrub_env(env: Mapping[str, str]) -> dict[str, str]:
-    """The caller's environment without what could redirect git or gh."""
+    """The caller's environment without what could redirect git or gh, or point
+    a child's python at the checkout's code (PYTHONPATH, PYTHONSTARTUP and the
+    rest: git hooks and `deploy_code_only.sh status` run python from it)."""
     return {
         k: v
         for k, v in env.items()
-        if not (k.startswith("GIT_") and k not in _GIT_ENV_KEEP) and k not in _GH_ENV_DROP
+        if not (k.startswith("GIT_") and k not in _GIT_ENV_KEEP)
+        and k not in _GH_ENV_DROP
+        and not k.startswith("PYTHON")
     }
 
 
@@ -111,8 +115,10 @@ def _dec(data: bytes) -> str:
     return data.decode("utf-8", "surrogateescape")
 
 
-# Used in annotations only (strings under `from __future__ import annotations`).
-GhRunner = "Callable[[list[str], str, Mapping[str, str]], tuple[int, str, str]]"
+# A real runtime alias, not a string: deploy_candidates.py has no
+# `from __future__ import annotations` (so its strip can run first), so its
+# `GhRunner | None` is evaluated when main() is defined.
+GhRunner = Callable[[list[str], str, Mapping[str, str]], tuple[int, str, str]]
 
 
 class Refusal(Exception):
@@ -268,6 +274,7 @@ class Repo:
         self.lock_path = Path(genesis_home) / "locks" / "update.lock"
         self.update_state = self.home / ".genesis" / "update_state.json"
         self._pr_cache: dict[int, tuple[dict | None, str]] = {}
+        self._serving_cache: tuple[str | None, str] | None = None
 
     # ── git ──────────────────────────────────────────────────────────────
     def git(
@@ -584,4 +591,10 @@ class Repo:
         return result
 
     def serving(self) -> tuple[str | None, str]:
-        return self._serving(self.root)
+        # Cached for the life of this engine instance (one command): `status`
+        # reads it for its own line AND through readiness_failures, and the read
+        # spawns `deploy_code_only.sh status`. One subprocess, and both readers
+        # see the same booted commit (no race between two reads).
+        if self._serving_cache is None:
+            self._serving_cache = self._serving(self.root)
+        return self._serving_cache

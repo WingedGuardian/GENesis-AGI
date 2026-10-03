@@ -69,8 +69,14 @@ case "$WAIT_S" in
     ''|*[!0-9]*) die "the lock wait must be a whole number of seconds (got: $WAIT_S)" ;;
 esac
 
+# The engine runs from the checkout `live` is on, which holds candidate code, so
+# python3 is isolated: -I ignores PYTHON* variables and the user site and never
+# adds the script's directory to sys.path; -S skips `site`, so no venv .pth (an
+# editable install points one at src/) and no sitecustomize is read. The engine
+# is standard-library only.
+PY_ISOLATED=(python3 -I -S)
 if [ -z "$needs_lock" ]; then
-    PYTHONSAFEPATH=1 exec python3 "$_SELF_DIR/deploy_candidates.py" "${args[@]}"
+    exec "${PY_ISOLATED[@]}" "$_SELF_DIR/deploy_candidates.py" "${args[@]}"
 fi
 
 mkdir -p "$(dirname "$LOCK_FILE")"
@@ -96,5 +102,5 @@ if [ -n "$needs_marker" ]; then
 fi
 
 rc=0
-DEPLOY_CANDIDATES_LOCK_FD="$_UPDATE_LOCK_FD" PYTHONSAFEPATH=1 python3 "$_SELF_DIR/deploy_candidates.py" "${args[@]}" || rc=$?
+DEPLOY_CANDIDATES_LOCK_FD="$_UPDATE_LOCK_FD" "${PY_ISOLATED[@]}" "$_SELF_DIR/deploy_candidates.py" "${args[@]}" || rc=$?
 exit "$rc"

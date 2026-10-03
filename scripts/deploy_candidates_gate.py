@@ -110,6 +110,10 @@ REFUSAL_FILES = (
     "scripts/lib/alert_queue.sh",
     "scripts/lib/deploy_status.sh",
     "scripts/lib/live_system_guard.sh",
+    # Read with `cat` before the branch check and run as python later: the
+    # serving read runs inside `deploy_code_only.sh status`, which readiness runs.
+    "scripts/lib/serving_commit.py",
+    "scripts/lib/manifest_delta.py",
     "src/genesis/dashboard/routes/updates.py",
     # PR C's file: readiness reads it from the server's base, and it will hold
     # bootstrap's crash-recovery branch guard.

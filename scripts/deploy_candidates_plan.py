@@ -184,6 +184,29 @@ def move_blockers(repo: Repo, tip: str) -> list[str]:
     return blockers
 
 
+def _worktree_status(repo: Repo, paths: list[str] | None = None) -> set[str]:
+    """Every path git would report under ``paths``, for comparing the working
+    tree before and after a move: tracked changes, EACH untracked file (`-uall`,
+    never a directory collapsed to one line — git writes a file inside an
+    already-untracked directory and that must still show as changed), and
+    ignored files (`--ignored` — a partial checkout can write one the move's
+    smudge filter then chokes on). `-z` so a path with a newline is one record.
+    A git failure raises (check defaults True) rather than reading as an empty
+    tree, which would turn a partial move into 'nothing moved'.
+
+    ``paths`` scopes the scan to the move's own files (the diff HEAD..tip): a
+    partial checkout only touches those, so scoping there catches every partial
+    write while NOT enumerating an ignored tree the move never touches (a
+    repository's own `.venv` is tens of thousands of `--ignored` entries). An
+    empty list would mean "all paths" to git, so it falls back to the whole
+    tree — a move with no paths never reaches the switch anyway."""
+    args = ["status", "--porcelain", "--no-renames", "-uall", "--ignored", "-z"]
+    if paths:
+        args += ["--", *paths]
+    text = repo.git(*args).stdout
+    return {r for r in text.split("\0") if r}
+
+
 def _untracked_at(repo: Repo, path: str) -> list[str]:
     """The untracked or ignored files at ``path``, or under it (none: []).
     (`ls-files --others` without --exclude-standard lists ignored files too;
@@ -225,7 +248,15 @@ def move_checkout(repo: Repo, plan: Plan, branch: str | None) -> Move:
     cur_tip = repo.resolve(LIVE_REF)
     files_moved = False
     at = plan.tip
-    if branch == LIVE_BRANCH and cur_tip and live_base == plan.base and live_merged == plan.merged:
+    if (
+        branch == LIVE_BRANCH
+        and cur_tip
+        and live_base == plan.base
+        and live_merged == plan.merged
+        # The same merges can still give another tree (a repository-local merge
+        # driver changed: MEASURED, git 2.43), so the tree decides, not the list.
+        and repo.tree(cur_tip) == repo.tree(plan.tip)
+    ):
         at = cur_tip  # nothing moves: `live` stays where it is
         out(f"  checkout: unchanged ({cur_tip[:12]}): same origin/main, same candidate heads.")
     elif branch == LIVE_BRANCH and cur_tip and repo.tree(cur_tip) == repo.tree(plan.tip):
@@ -245,6 +276,22 @@ def move_checkout(repo: Repo, plan: Plan, branch: str | None) -> Move:
         # ONE checkout. --no-overwrite-ignore: git otherwise overwrites an
         # ignored file in the way without asking (MEASURED, git 2.43); with it,
         # as with an untracked one, git refuses and changes nothing.
+        # The files the switch will write are diff(HEAD, tip); a partial write
+        # is within them, so the before/after comparison is scoped there (see
+        # _worktree_status). HEAD unresolvable (unborn/detached) → whole tree.
+        cur_head = repo.resolve("HEAD")
+        move_paths = (
+            [
+                p
+                for p in repo.git(
+                    "diff", "--no-renames", "--name-only", "-z", cur_head, plan.tip
+                ).stdout.split("\0")
+                if p
+            ]
+            if cur_head
+            else None
+        )
+        before = _worktree_status(repo, move_paths)
         p = repo.git("switch", "--no-overwrite-ignore", "-C", LIVE_BRANCH, plan.tip, check=False)
         if p.returncode != 0:
             # git returns a post-checkout hook's status AFTER the checkout has
@@ -252,6 +299,22 @@ def move_checkout(repo: Repo, plan: Plan, branch: str | None) -> Move:
             head_ref = repo.git("symbolic-ref", "-q", "HEAD", check=False).stdout.strip()
             moved = head_ref == LIVE_REF and repo.resolve("HEAD") == plan.tip
             if not moved:
+                # HEAD unmoved is not "nothing changed": git can rewrite part of
+                # the working tree and then fail (a required smudge filter, a
+                # write error; MEASURED, git 2.43). Compare, never infer.
+                changed = sorted({rec[3:] for rec in before ^ _worktree_status(repo, move_paths)})
+                if changed:
+                    more = f"\n  … and {len(changed) - 20} more" if len(changed) > 20 else ""
+                    raise Refusal(
+                        f"git failed partway through moving the checkout to {plan.tip[:12]}: HEAD "
+                        f"is still {head_ref or 'detached'}, but these paths changed:\n"
+                        + "\n".join("  " + c for c in changed[:20])
+                        + more
+                        + "\nThe working tree mixes two trees; nothing was restarted. Put the tracked "
+                        "ones back (git restore --source=HEAD --staged --worktree -- <path>), delete "
+                        "the new untracked ones, fix the cause below, then retry:\n"
+                        + p.stderr.strip()
+                    )
                 raise Refusal(
                     f"git refused to move the checkout to {plan.tip[:12]}; nothing moved:\n{p.stderr.strip()}"
                 )
