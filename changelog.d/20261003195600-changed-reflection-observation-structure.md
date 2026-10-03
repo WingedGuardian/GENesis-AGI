@@ -1,0 +1,1 @@
+- Deep and Strategic reflection prompts now ask observations to explain the finding, evidence, significance and next step in four short lines, while keeping the existing JSON output fields.
