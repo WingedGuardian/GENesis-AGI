@@ -14,7 +14,9 @@ caller's SDK import/environment policy; use the CLI for this offline guarantee.
 
 The public tests exercise synthetic references and mocked HTTP. They are not
 human approval or evidence that MiMo is qualified. Real accuracy and whether the
-complete protocol fits the owner's $5 ceiling remain unmeasured.
+complete protocol fits the owner's $5 target remain unmeasured. The full request
+schedule must be estimated before spending; the manifest freezes an explicit
+campaign ceiling, defaulting to $5, even when a higher ceiling is authorized.
 
 ## Prepare and inspect
 
@@ -47,6 +49,7 @@ The JSON spec contains:
 | Key | Contract |
 | --- | --- |
 | `provider` | `openrouter-mimo` only; defaults to this alias. The shipped config resolves the model identity. |
+| `ceiling_usd` | Positive decimal string or integer; defaults to `"5"`. Freeze an authorized cap after estimating the complete schedule. |
 | `cases` | A nonempty list with unique `id` and `contract` values from the registry, `j9_relevance`, or `procedure_novelty`. |
 | `parameters` | Intended production parameters for `judge`, `relevance`, and `novelty`. These are frozen for subsequent promotion. |
 | `reference_approval` | A separately supplied independent approval artifact, bound to `corpus_hash`. |
@@ -78,6 +81,10 @@ so the actual rendered candidate order can be mapped unambiguously to procedure
 IDs. Optional `deprecated` and `quarantined` candidate flags exercise exclusion.
 Every case must reach one cross-type judgment; a reference target outside the
 actual selected candidates makes preparation incomplete.
+Preparation also replays deterministic DISTINCT and valid redundant-target controls
+through both actual storage paths, in current and hypothetical promoted arms.
+These controls validate the fixture's storage prerequisites without assigning a
+reference label. A skipped or quality-gated fixture cannot enter the paid schedule.
 
 Each parameter set requires a positive integer `max_tokens`. Rubric calls require
 `temperature: 0.0`; relevance also requires `max_tokens: 150`. The provider policy
@@ -144,7 +151,8 @@ journal unchanged. Network failures retain reservations and report incomplete.
 
 One exclusive writer holds the campaign lock. Each reservation is appended and
 fsynced before dispatch. Settled charges plus unresolved reservations plus the
-next reservation must not exceed $5, across contracts and process restarts.
+next reservation must not exceed the frozen campaign ceiling, across contracts
+and process restarts. Reopening a campaign cannot raise that ceiling.
 Decimal arithmetic is used throughout. There is exactly one delegate attempt,
 zero client retries, no provider/model fallback and no nonzero chain rotation.
 
@@ -169,6 +177,11 @@ reconciled by GET. A crash after settlement can recover scoring without sending
 the completion again, without credentials or unexpired prices. Local scoring still
 requires matching source/configuration and valid references; it runs before new
 request checks. Missing credentials cannot reserve money for a new request.
+Paid dispatch uses the frozen rendered request directly. Production contract and
+storage replay happen offline against the retained answer. Malformed model
+judgments are permanent qualification errors; local replay or storage failures
+leave the paid answer and charge unscored, so recovery can score them without
+another completion. Local failures keep the result incomplete.
 A torn journal, conflicting manifest, duplicated generation
 ID, unexpected charge or charge exceeding a reservation stops the campaign and
 reports incomplete. Reservations with no known generation ID remain unresolved;
@@ -196,8 +209,8 @@ each class, at least 80% agreement overall and per class, zero qualifying errors
 and three passing repetitions. Novelty requires at least 300 DISTINCT and 100
 redundant questions, zero false or wrong-target suppression, at least 80%
 correct-target detection, zero qualifying errors, and three passing repetitions.
-Coverage is never silently reduced to fit the budget. A complete bound over $5
-reports its shortfall before any completion.
+Coverage is never silently reduced to fit the budget. A complete bound over the
+frozen ceiling reports its shortfall before any completion.
 
 The raw novelty candidate verdict is captured before the production allowlist.
 Recorded responses are replayed through `_store_judged_procedure` and

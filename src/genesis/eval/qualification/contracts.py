@@ -30,6 +30,14 @@ RELEVANCE = "j9_relevance"
 NOVELTY = "procedure_novelty"
 
 
+class MalformedJudgment(Incomplete):
+    """A saved model response is invalid, rather than local replay failing."""
+
+    def __init__(self, message: str, *, error: str = "MalformedJudgment"):
+        super().__init__(message)
+        self.error = error
+
+
 def versions() -> dict[str, str]:
     return {
         **{r.name: r.version for r in list_rubrics()},
@@ -141,12 +149,15 @@ def valid_embedding_number(value):
         return False
 
 
-def validate_raw_score(content, key, *, rubric=False):
-    parsed = load_json(_extract_json(content) if rubric else content, decimal_numbers=True)
+def validate_raw_score(content, key, *, rubric=False, error="MalformedJudgment"):
+    try:
+        parsed = load_json(_extract_json(content) if rubric else content, decimal_numbers=True)
+    except ValueError as exc:
+        raise MalformedJudgment("invalid raw judge JSON", error=error) from exc
     value = parsed.get(key) if isinstance(parsed, dict) else None
     # Range comparison safely rejects enormous integers before any float conversion.
     if type(value) not in (int, Decimal) or not 0 <= value <= 1:
-        raise Incomplete("invalid raw judge score")
+        raise MalformedJudgment("invalid raw judge score", error=error)
 
 
 def coverage(cases: list[dict], *, names=None) -> list[str]:
@@ -316,14 +327,17 @@ def candidate_mapping(case, messages):
 
 def raw_target(content, mapping):
     match = extractor._JSON_BLOCK_RE.search(content or "")
-    parsed = load_json(match.group(1) if match else content)
+    try:
+        parsed = load_json(match.group(1) if match else content)
+    except ValueError as exc:
+        raise MalformedJudgment("invalid raw novelty JSON") from exc
     if not isinstance(parsed, dict) or "redundant_with" not in parsed:
-        raise Incomplete("missing raw novelty verdict")
+        raise MalformedJudgment("missing raw novelty verdict")
     target = parsed["redundant_with"]
     if target is None:
         return None
     if type(target) is not int or not 1 <= target <= len(mapping):
-        raise Incomplete("invalid novelty target")
+        raise MalformedJudgment("invalid novelty target")
     return mapping[target - 1]
 
 
@@ -334,8 +348,12 @@ class StorageReplay(Recorder):
 
     async def route_call(self, call_site_id, messages, **kwargs):
         if call_site_id == extractor._NOVELTY_CALL_SITE:
-            if messages != self.task["messages"]:
-                raise Incomplete("storage replay changed candidate order or prompt")
+            if (
+                call_site_id != self.task["call_site"]
+                or messages != self.task["messages"]
+                or kwargs != self.task["kwargs"]
+            ):
+                raise Incomplete("storage replay changed the frozen request")
             return await super().route_call(call_site_id, messages, **kwargs)
         # Offline extraction/scoping stubs; no model calls beyond the captured verdict.
         if call_site_id == "38_procedure_extraction":
@@ -400,8 +418,8 @@ async def replay_storage(case, task, content, sandbox, provider, model):
     return {"prediction": target, "error": None, "storage": outcomes}
 
 
-async def render(case, sandbox):
-    recorder = Recorder()
+async def render(case, sandbox, *, provider="openrouter-mimo", model="xiaomi/mimo-v2.6-pro"):
+    recorder = Recorder(provider=provider, model=model)
     await exercise(case, recorder, sandbox)
     if len(recorder.calls) != 1:
         raise Incomplete("case must reach exactly one real contract request")
@@ -414,4 +432,10 @@ async def render(case, sandbox):
             and case["expected_target"] not in call["candidate_ids"]
         ):
             raise Incomplete("reference target not in rendered candidate selection")
+        # Establish fixture mechanics before any paid attempt. These controls
+        # are not reference labels or evidence of a model's judgment quality.
+        for target in (None, 1):
+            await replay_storage(
+                case, call, json.dumps({"redundant_with": target}), sandbox, provider, model
+            )
     return call

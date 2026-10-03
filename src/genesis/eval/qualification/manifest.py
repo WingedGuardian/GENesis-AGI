@@ -21,7 +21,7 @@ from genesis.eval.qualification.contracts import (
     versions,
 )
 from genesis.eval.qualification.evidence import (
-    CEILING,
+    DEFAULT_CEILING,
     Incomplete,
     currency_sum,
     digest,
@@ -216,11 +216,12 @@ def validate_manifest(manifest: dict):
         raise Incomplete("manifest must be a JSON object")
     if (
         manifest.get("format") != "genesis.qualification.v1"
-        or manifest.get("ceiling_usd") != "5"
         or manifest.get("provider") != "openrouter-mimo"
         or manifest.get("endpoint") != ENDPOINT
     ):
         raise Incomplete("invalid campaign identity")
+    if money(manifest.get("ceiling_usd")) <= 0:
+        raise Incomplete("campaign ceiling must be positive")
     for key in ("parameters", "provider_config", "source", "libraries"):
         if not isinstance(manifest.get(key), dict):
             raise Incomplete("invalid frozen object field")
@@ -339,14 +340,18 @@ def frozen_issues(manifest: dict) -> list[str]:
         total = currency_sum(charges)
         if money(manifest["maximum_campaign_usd"]) != total:
             raise Incomplete("campaign cost bound mismatch")
-        if total > CEILING:
-            issues.append(f"complete protocol maximum ${total} exceeds $5 by ${total - CEILING}")
+        ceiling = money(manifest["ceiling_usd"])
+        if total > ceiling:
+            issues.append(f"complete protocol maximum ${total} exceeds ${ceiling} by ${total - ceiling}")
     return sorted(set(issues))
 
 
 async def prepare(spec: dict, *, temp_root: Path, root=ROOT) -> dict:
     if not isinstance(spec, dict):
         raise Incomplete("spec must be a JSON object")
+    ceiling = money(spec.get("ceiling_usd", DEFAULT_CEILING))
+    if ceiling <= 0:
+        raise Incomplete("campaign ceiling must be positive")
     cases = spec.get("cases")
     validate_cases(cases)
     provider = spec.get("provider", "openrouter-mimo")
@@ -373,7 +378,7 @@ async def prepare(spec: dict, *, temp_root: Path, root=ROOT) -> dict:
     questions = set()
     async with Sandbox(temp_root) as sandbox:
         for index, case in enumerate(cases):
-            call = await render(case, sandbox)
+            call = await render(case, sandbox, provider=provider, model=cfg.model_id)
             marker = (case["contract"], call["prompt_hash"])
             if marker in questions:
                 raise Incomplete("duplicate rendered contract question")
@@ -408,11 +413,11 @@ async def prepare(spec: dict, *, temp_root: Path, root=ROOT) -> dict:
         if all(t["maximum_usd"] is not None for t in schedule.values())
         else None
     )
-    if total is not None and total > CEILING:
-        issues.append(f"complete protocol maximum ${total} exceeds $5 by ${total - CEILING}")
+    if total is not None and total > ceiling:
+        issues.append(f"complete protocol maximum ${total} exceeds ${ceiling} by ${total - ceiling}")
     return {
         "format": "genesis.qualification.v1",
-        "ceiling_usd": "5",
+        "ceiling_usd": str(ceiling),
         "source": source_identity(root),
         "libraries": {name: version(name) for name in ("litellm", "httpx")},
         "contracts": versions(),

@@ -2323,7 +2323,7 @@ verified: 04b6c6614 2026-10-03
   `python -m genesis.eval.qualification`). It freezes contract/corpus/prompt and
   parameter identities, observes the existing delegate's serialized requests and
   provider responses, and reserves verified maximum charges in a private journal
-  before dispatch under a $5 campaign ceiling. Three repetitions exercise all six
+  before dispatch under a frozen campaign ceiling (default $5). Three repetitions exercise all six
   registered rubrics, J9 relevance, and cross-type novelty with both disposable
   storage paths. Synthetic tests establish transport/accounting/storage integration;
   they do not qualify MiMo or prove real retrieval/extraction quality. Independent

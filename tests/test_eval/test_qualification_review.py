@@ -360,7 +360,7 @@ async def test_malformed_score_keeps_charge_and_records_error(frozen, tmp_path, 
             await runner.score_record(journal, key, sandbox)
         record = journal.attempts[key]
         assert record["charge"] == "0.01"
-        assert record["score"]["error"] == "Incomplete"
+        assert record["score"]["error"] == "MalformedJudgment"
         assert record["score"]["agreement"] is False
         contract = runner.report(journal)["contracts"][name]
         assert contract["repetitions"][0]["errors"] == 1
@@ -467,7 +467,7 @@ async def test_initial_execution_contains_settled_parser_errors(
         assert len(dispatched) == 1 and len(journal.attempts) == 1
         record = journal.attempts[key]
         assert record["charge"] == "0.01"
-        assert record["score"]["error"] == "Incomplete"
+        assert record["score"]["error"] == "MalformedJudgment"
         assert record["score"]["agreement"] is False
         assert runner.report(journal)["contracts"][name]["repetitions"][0]["errors"] == 1
 

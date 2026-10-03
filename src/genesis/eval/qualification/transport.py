@@ -48,13 +48,16 @@ def check_callback_isolation():
 
 def safe_text(value: str) -> str:
     """Do not persist credentials if an error/response echoes an environment key."""
-    for key, secret in os.environ.items():
-        if (
-            secret
-            and len(secret) >= 8
-            and any(word in key.upper() for word in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
-        ):
-            value = value.replace(secret, "[REDACTED]")
+    secrets = {
+        secret
+        for key, secret in os.environ.items()
+        if secret
+        and len(secret) >= 8
+        and any(word in key.upper() for word in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
+    }
+    # Match the whole longest credential before its prefix can destroy the match.
+    for secret in sorted(secrets, key=len, reverse=True):
+        value = value.replace(secret, "[REDACTED]")
     return value
 
 
@@ -230,12 +233,10 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
                 if isinstance(usage, dict)
                 else None
             )
-            choices = raw.get("choices") or []
-            content = (
-                choices[0].get("message", {}).get("content")
-                if choices and isinstance(choices[0], dict)
-                else None
-            )
+            choices = raw.get("choices")
+            choice = choices[0] if isinstance(choices, list) and choices else None
+            message = choice.get("message") if isinstance(choice, dict) else None
+            content = message.get("content") if isinstance(message, dict) else None
             self.observed = safe_evidence(
                 {
                     "attempt": self.attempt,

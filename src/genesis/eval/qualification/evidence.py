@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-CEILING = Decimal("5")
+DEFAULT_CEILING = Decimal("5")
 
 
 class Incomplete(ValueError):
@@ -185,8 +185,8 @@ class Journal:
         if not isinstance(data, dict):
             raise Incomplete("invalid journal payload")
         if kind == "manifest":
-            if self.events or data.get("ceiling_usd") != "5":
-                raise Incomplete("conflicting manifest or ceiling")
+            if self.events:
+                raise Incomplete("conflicting manifest")
             from genesis.eval.qualification.manifest import validate_manifest
 
             validate_manifest(data)
@@ -206,7 +206,7 @@ class Journal:
                     or reservation <= 0
                 ):
                     raise Incomplete("unverified reservation")
-                if currency_sum((self.committed, reservation)) > CEILING:
+                if currency_sum((self.committed, reservation)) > money(self.manifest["ceiling_usd"]):
                     raise Incomplete("insufficient campaign funds")
                 self.attempts[key] = dict(data)
             else:

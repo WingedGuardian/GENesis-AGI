@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from collections import Counter
+from copy import deepcopy
 from pathlib import Path
 
 from genesis.eval.qualification.contracts import (
     NOVELTY,
+    MalformedJudgment,
     Sandbox,
     exercise,
     replay_storage,
+    validate_raw_score,
 )
 from genesis.eval.qualification.evidence import Incomplete, currency_sum
 from genesis.eval.qualification.manifest import frozen_issues, preflight, pricing_issues, routing
@@ -29,7 +32,7 @@ async def score_record(journal, key, sandbox):
     content = record["observation"]["content"]
     try:
         if not isinstance(content, str):
-            raise Incomplete("missing response content")
+            raise MalformedJudgment("missing response content")
         if task["contract"] == NOVELTY:
             result = await replay_storage(
                 case,
@@ -44,12 +47,23 @@ async def score_record(journal, key, sandbox):
                 content, provider=journal.manifest["provider"], model=record["observation"]["model"]
             )
             result = await exercise(case, router, sandbox)
-            if len(router.calls) != 1 or router.calls[0]["messages"] != task["messages"]:
-                raise Incomplete("scoring replay changed the frozen prompt")
+            if len(router.calls) != 1 or router.calls[0] != {
+                name: task[name] for name in ("call_site", "messages", "kwargs")
+            }:
+                raise Incomplete("scoring replay changed the frozen request")
+        if result.get("error") == "judge_parse_fail":
+            validate_raw_score(content, "score", rubric=True, error=result["error"])
+            raise Incomplete("production judge rejected a valid saved response")
+        if result.get("error"):
+            raise Incomplete("production scoring replay failed")
         expected = case["expected_target"] if task["contract"] == NOVELTY else case["user_passed"]
         result["agreement"] = result["prediction"] == expected and not result.get("error")
+    except MalformedJudgment as exc:
+        result = {"agreement": False, "error": exc.error, "prediction": None}
     except Exception as exc:
-        result = {"agreement": False, "error": type(exc).__name__, "prediction": None}
+        # Local replay can be retried with the already-paid answer. Do not seal
+        # a filesystem/database/parity failure as an immutable model judgment.
+        raise Incomplete("local scoring failed; paid answer retained unscored") from exc
     journal.append("score", attempt=key, **result)
 
 
@@ -86,17 +100,11 @@ async def execute_attempt(journal, key, config, sandbox, *, transport=None):
         raise Incomplete("; ".join(issues))
     journal.append("reserve", attempt=key, reservation=task["maximum_usd"])
     router = QualificationRouter(journal, key, config, transport=transport)
-    case = journal.manifest["cases"][task["case_index"]]
-    # Production parsers may absorb errors. The ledger independently
-    # verifies settlement even when the contract fails open.
-    try:
-        await exercise(case, router, sandbox)
-    except Exception as exc:
-        record = journal.attempts[key]
-        if not router.called or "charge" not in record:
-            raise  # Ambiguous transport/billing failure retains the reservation.
-        if "failure" not in record:
-            journal.append("failure", attempt=key, error=type(exc).__name__)
+    # Rendering and storage controls were compiled before reservation. Dispatch
+    # only that frozen request; production parsing/storage is offline scoring.
+    await router.route_call(
+        task["call_site"], deepcopy(task["messages"]), **deepcopy(task["kwargs"])
+    )
     if not router.called or "charge" not in journal.attempts[key]:
         raise Incomplete("attempt did not settle; reservation retained")
     await score_record(journal, key, sandbox)
@@ -218,7 +226,7 @@ def report(journal) -> dict:
         "settled_usd": str(charge),
         "unresolved_attempts": unresolved,
         "committed_usd": str(journal.committed),
-        "ceiling_usd": "5",
+        "ceiling_usd": manifest["ceiling_usd"],
         "maximum_campaign_usd": manifest["maximum_campaign_usd"],
         "model_id": manifest["model_id"],
         "source": manifest["source"],
