@@ -9626,6 +9626,17 @@ _MAIN_REVERTS_LIST_MAX = 10
 #: rest stay findings: unknown is never resolved toward clean.
 _MAIN_REVERTS_HISTORY_LOOKUPS = 20
 
+#: Wall-clock budget for the row's per-commit fan-out and history lookups (the
+#: commit-list and changed-file reads before them carry their own single-call
+#: timeouts). Report mode arms no merge deadline, so
+#: without this a degraded API could hold `--check-pr` for one 15 s timeout per
+#: commit read (about 10 minutes at the 250-commit cap). MEASURED 2026-10-03: one
+#: `commits/<sha>` read took 0.57 s (10 sequential reads on this repo), so the
+#: largest PR the cap admits (249 own commits over 6 workers, ~42 reads each)
+#: needs about 24 s, plus up to 20 history lookups of similar cost. 90 s is about
+#: 2.5x that healthy maximum; past it the row reports COULD-NOT-CHECK.
+_MAIN_REVERTS_BUDGET_S = 90.0
+
 
 def _pr_commit_list(pr_num: str, repo: str | None = None) -> tuple[list[tuple[str, int]] | None, str]:
     """``([(sha, parent_count), ...], "")`` for the PR's commits, or ``(None, reason)``.
@@ -9647,7 +9658,9 @@ def _pr_commit_list(pr_num: str, repo: str | None = None) -> tuple[list[tuple[st
                 [
                     "gh",
                     "api",
-                    f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/commits",
+                    # per_page in the PATH: `-f` would send a POST body field
+                    # and flip the method (see review_budget._PAGE_SIZE).
+                    f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/commits?per_page=100",
                     "--paginate",
                     "--jq",
                     ".[] | {sha: .sha, parents: (.parents | length)}",
@@ -9715,7 +9728,11 @@ def _commit_touched_files(sha: str, repo: str | None = None) -> tuple[set[str] |
                     f"repos/{repo or ':owner/:repo'}/commits/{sha}",
                     "--paginate",
                     "--jq",
-                    ".files[]? | {filename: .filename, previous_filename: .previous_filename}",
+                    # A page with no `files` array is a degraded response, not
+                    # "this commit touched nothing": emit a sentinel the parser
+                    # below refuses, so the row fails toward COULD-NOT-CHECK.
+                    'if (.files | type) == "array" then (.files[] | {filename: .filename, '
+                    'previous_filename: .previous_filename}) else {"__no_files__": true} end',
                 ],
                 capture_output=True,
                 text=True,
@@ -9740,6 +9757,8 @@ def _commit_touched_files(sha: str, repo: str | None = None) -> tuple[set[str] |
         )
     paths: set[str] = set()
     for obj in rows:
+        if isinstance(obj, dict) and obj.get("__no_files__"):
+            return None, f"commit {short}'s response carried no file list"
         name = obj.get("filename") if isinstance(obj, dict) else None
         if not isinstance(name, str) or not name:
             return None, f"commit {short}'s file list was malformed"
@@ -9862,18 +9881,34 @@ def _check_main_reverts(pr_num: str, repo: str | None = None) -> tuple[str, str]
             "the PR's changed-file list could not be read (gh error, or GitHub's "
             "3000-file cap on pulls/N/files)"
         )
+    deadline = time.monotonic() + _MAIN_REVERTS_BUDGET_S
+    over_budget = (
+        f"reading the PR's history took longer than the "
+        f"{int(_MAIN_REVERTS_BUDGET_S)} s budget for this row"
+    )
     own = [sha for sha, parents in commits if parents <= 1]
     touched: set[str] = set()
     if own:
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import TimeoutError as _FuturesTimeout
 
-        # One read per commit; run them side by side so a long branch stays quick.
-        with ThreadPoolExecutor(max_workers=min(6, len(own))) as pool:
-            results = list(pool.map(lambda sha: _commit_touched_files(sha, repo), own))
-        for paths, reason in results:
-            if paths is None:
-                return MAIN_REVERTS_UNCHECKED, reason
-            touched |= paths
+        # One read per commit, side by side. The first failure returns at once
+        # and the whole fan-out shares one deadline; queued reads are cancelled
+        # rather than waited for (shutdown(wait=False)), so a degraded API costs
+        # at most the budget plus one in-flight subprocess timeout.
+        pool = ThreadPoolExecutor(max_workers=min(6, len(own)))
+        try:
+            futures = [pool.submit(_commit_touched_files, sha, repo) for sha in own]
+            try:
+                for fut in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
+                    paths, reason = fut.result()
+                    if paths is None:
+                        return MAIN_REVERTS_UNCHECKED, reason
+                    touched |= paths
+            except _FuturesTimeout:
+                return MAIN_REVERTS_UNCHECKED, over_budget
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
     uncovered = sorted(set(diff_files) - touched)
 
     # Refinement: an uncovered file the PR ADDS that main never held is not a
@@ -9886,6 +9921,10 @@ def _check_main_reverts(pr_num: str, repo: str | None = None) -> tuple[str, str]
         base_sha = _pr_base_sha(pr_num, repo=repo)
         if base_sha:
             for path in added[:_MAIN_REVERTS_HISTORY_LOOKUPS]:
+                # Out of budget here would otherwise leave an unchecked added
+                # file counted as a revert; say we could not check instead.
+                if time.monotonic() >= deadline:
+                    return MAIN_REVERTS_UNCHECKED, over_budget
                 if _path_in_base_history(path, base_sha, repo) is False:
                     new_in_merge.append(path)
     not_reverts = set(new_in_merge)

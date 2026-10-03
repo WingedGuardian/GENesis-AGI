@@ -343,3 +343,91 @@ class TestReportRow:
         out = capsys.readouterr().out
         assert _row(out).startswith("main-reverts   : could not check — "), out
         assert "verdict" in out and rc == 0
+
+
+class TestBoundedFanOut:
+    """The row runs on the interactive report path, which arms no merge deadline.
+    A degraded API must cost at most the row's budget, never one timeout per
+    commit, and a failed read must not wait for the rest of the fan-out."""
+
+    def _slow_reads(self, monkeypatch, *, delay: float, fail_first: bool = False):
+        import time as _time
+
+        first = OWN_A
+
+        def _read(sha, repo=None):
+            if fail_first and sha == first:
+                return None, "commit aaaa's file list could not be read (gh error)"
+            _time.sleep(delay)
+            return {"src/own.py"}, ""
+
+        monkeypatch.setattr(gpg, "_commit_touched_files", _read)
+
+    def test_over_budget_fan_out_is_could_not_check_and_returns_promptly(self, monkeypatch):
+        import time as _time
+
+        own = [f"{i:040x}" for i in range(1, 13)]
+        _seed(
+            monkeypatch,
+            commits=_commits(*[(s, 1) for s in own], (MERGE, 2)),
+            files=_files("src/own.py"),
+            commit_files="{}",
+        )
+        self._slow_reads(monkeypatch, delay=2.0)
+        monkeypatch.setattr(gpg, "_MAIN_REVERTS_BUDGET_S", 0.05)
+        start = _time.monotonic()
+        state, msg = gpg._check_main_reverts("100", REPO)
+        elapsed = _time.monotonic() - start
+        assert state == gpg.MAIN_REVERTS_UNCHECKED, msg
+        assert "budget" in msg
+        # 12 reads x 2 s over 6 workers would take >= 4 s if every read were awaited.
+        assert elapsed < 1.5, elapsed
+
+    def test_first_failed_read_returns_without_waiting_for_the_rest(self, monkeypatch):
+        import time as _time
+
+        own = [OWN_A] + [f"{i:040x}" for i in range(1, 12)]
+        _seed(
+            monkeypatch,
+            commits=_commits(*[(s, 1) for s in own], (MERGE, 2)),
+            files=_files("src/own.py"),
+            commit_files="{}",
+        )
+        self._slow_reads(monkeypatch, delay=2.0, fail_first=True)
+        start = _time.monotonic()
+        state, msg = gpg._check_main_reverts("100", REPO)
+        elapsed = _time.monotonic() - start
+        assert state == gpg.MAIN_REVERTS_UNCHECKED, msg
+        assert "could not be read" in msg
+        assert elapsed < 1.5, elapsed
+
+    def test_out_of_budget_before_history_lookups_is_could_not_check(self, monkeypatch):
+        """An added uncovered file whose history was never looked up must not be
+        counted as a revert just because the budget ran out first."""
+        _seed(
+            monkeypatch,
+            commits=_commits((MERGE, 2)),
+            files=_files("changelog.d/new.md", statuses={"changelog.d/new.md": "added"}),
+            commit_files="{}",
+        )
+        monkeypatch.setenv("_TEST_GH_BASE_OID", "d" * 40)
+        monkeypatch.setenv("_TEST_GH_PATH_ON_BASE", json.dumps({"changelog.d/new.md": False}))
+        monkeypatch.setattr(gpg, "_MAIN_REVERTS_BUDGET_S", 0.0)
+        state, msg = gpg._check_main_reverts("100", REPO)
+        assert state == gpg.MAIN_REVERTS_UNCHECKED, msg
+        assert "budget" in msg
+
+
+class TestDegradedCommitResponse:
+    def test_commit_response_without_a_file_list_is_could_not_check(self, monkeypatch):
+        """A commit page with no `files` array is a degraded read, not a commit that
+        touched nothing (which would shrink coverage and over-report)."""
+        _seed(
+            monkeypatch,
+            commits=_commits((OWN_A, 1), (MERGE, 2)),
+            files=_files("src/own.py"),
+            commit_files=json.dumps({OWN_A: [{"__no_files__": True}]}),
+        )
+        state, msg = gpg._check_main_reverts("100", REPO)
+        assert state == gpg.MAIN_REVERTS_UNCHECKED, msg
+        assert "no file list" in msg
