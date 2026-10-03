@@ -668,8 +668,8 @@ def _isolate_user_config_dir(tmp_path):
     # Vector 2: neutralize the repo-relative sibling fallback.
     _orig_resolve = _config_overlay._resolve_overlay_path
 
-    def _sandboxed_resolve(base_path):
-        result = _orig_resolve(base_path)
+    def _sandboxed_resolve(base_path, *, strict=False):
+        result = _orig_resolve(base_path, strict=strict)
         try:
             resolved = result.resolve()
         except OSError:  # pragma: no cover - defensive (symlink loops)

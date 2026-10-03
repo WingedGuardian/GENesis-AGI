@@ -1,0 +1,1 @@
+- Added foreground `gmodel` routes for Kimi K3 and MiMo V2.6 Pro, with subscription, direct API and OpenRouter choices, automatic credential-based selection, configurable context windows, and checks for conflicting launch settings.

@@ -343,9 +343,15 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: b0867170e 2026-10-02
+verified: c723c00ec 2026-10-03
 ```
 
+- **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`):
+  Kimi K3 and MiMo V2.6 Pro select subscription, native API or OpenRouter from
+  the isolated `gmodel.models` catalog. Auto recomputes at launch/resume; provider
+  errors never switch billing routes. Strict config loading and read-only settings
+  preflight prevent silent routing overrides. Published endpoints remain unverified
+  until live acceptance; these entries never join the automated failover roster.
 - **Replay-unsafe CC outcomes do not enter full-tools recovery, failover or
   durable parking.** Stream truncation and overloads with known-work or MCP
   evidence share this boundary; provider diagnosis remains available as a
