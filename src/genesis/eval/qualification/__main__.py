@@ -26,10 +26,19 @@ def parser():
                 required=True,
                 help="explicit disk-backed disposable SQLite directory",
             )
+    comparison = commands.add_parser(
+        "compare", help="offline paired report of two existing campaigns"
+    )
+    comparison.add_argument("campaign", type=Path)
+    comparison.add_argument("other_campaign", type=Path)
     return result
 
 
 async def run(args):
+    if args.command == "compare":
+        from genesis.eval.qualification.comparison import compare_paths
+
+        return compare_paths(args.campaign, args.other_campaign)
     from genesis.eval.qualification.manifest import preflight, prepare
     from genesis.eval.qualification.runner import execute, report
     from genesis.eval.qualification.transport import reconcile, safe_text

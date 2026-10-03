@@ -32,6 +32,10 @@ from genesis.eval.qualification.transport import ENDPOINT
 from genesis.routing.config import load_config_from_string
 
 ROOT = Path(__file__).resolve().parents[4]
+SUPPORTED_CANDIDATES = {
+    "openrouter-mimo": "xiaomi/mimo-v2.6-pro",
+    "openrouter-deepseek-flash": "deepseek/deepseek-v4.1-flash",
+}
 SOURCE_FILES = (
     "src/genesis/eval/scorers.py",
     "src/genesis/eval/calibration.py",
@@ -82,6 +86,21 @@ def routing(root=ROOT):
     return load_config_from_string(
         (root / "config/model_routing.yaml").read_text(), check_api_keys=False
     )
+
+
+def candidate_config(provider, config):
+    """Bind a new qualification candidate to its exact shipped provider identity."""
+    if not isinstance(provider, str) or provider not in SUPPORTED_CANDIDATES:
+        raise Incomplete("unsupported qualification candidate")
+    cfg = config.providers.get(provider)
+    if cfg is None or (
+        cfg.name != provider
+        or cfg.provider_type != "openrouter"
+        or cfg.model_id != SUPPORTED_CANDIDATES[provider]
+        or cfg.base_url not in (None, ENDPOINT)
+    ):
+        raise Incomplete("unexpected qualification candidate configuration")
+    return cfg
 
 
 def validate_numeric_parameters(body: dict):
@@ -216,10 +235,20 @@ def validate_manifest(manifest: dict):
         raise Incomplete("manifest must be a JSON object")
     if (
         manifest.get("format") != "genesis.qualification.v1"
-        or manifest.get("provider") != "openrouter-mimo"
+        or not isinstance(manifest.get("provider"), str)
+        or manifest["provider"] not in SUPPORTED_CANDIDATES
         or manifest.get("endpoint") != ENDPOINT
     ):
         raise Incomplete("invalid campaign identity")
+    model = manifest.get("model_id")
+    # Earlier MiMo v1 campaigns accepted the xiaomi/mimo-* family. Preserve
+    # frozen historical reports; prepare and live preflight enforce exact IDs.
+    if not isinstance(model, str) or (
+        not model.startswith("xiaomi/mimo-")
+        if manifest["provider"] == "openrouter-mimo"
+        else model != SUPPORTED_CANDIDATES[manifest["provider"]]
+    ):
+        raise Incomplete("invalid frozen qualification candidate identity")
     if money(manifest.get("ceiling_usd")) <= 0:
         raise Incomplete("campaign ceiling must be positive")
     for key in ("parameters", "provider_config", "source", "libraries"):
@@ -342,7 +371,9 @@ def frozen_issues(manifest: dict) -> list[str]:
             raise Incomplete("campaign cost bound mismatch")
         ceiling = money(manifest["ceiling_usd"])
         if total > ceiling:
-            issues.append(f"complete protocol maximum ${total} exceeds ${ceiling} by ${total - ceiling}")
+            issues.append(
+                f"complete protocol maximum ${total} exceeds ${ceiling} by ${total - ceiling}"
+            )
     return sorted(set(issues))
 
 
@@ -355,16 +386,8 @@ async def prepare(spec: dict, *, temp_root: Path, root=ROOT) -> dict:
     cases = spec.get("cases")
     validate_cases(cases)
     provider = spec.get("provider", "openrouter-mimo")
-    if provider != "openrouter-mimo":
-        raise Incomplete("this campaign authorizes MiMo only; DeepSeek spend is zero")
     config = routing(root)
-    cfg = config.providers[provider]
-    if (
-        cfg.provider_type != "openrouter"
-        or not cfg.model_id.startswith("xiaomi/mimo-")
-        or cfg.base_url not in (None, ENDPOINT)
-    ):
-        raise Incomplete("unexpected MiMo provider identity")
+    cfg = candidate_config(provider, config)
     parameters = spec.get("parameters", {})
     pricing = spec.get("pricing", {})
     if not isinstance(parameters, dict) or not isinstance(pricing, dict):
@@ -414,7 +437,9 @@ async def prepare(spec: dict, *, temp_root: Path, root=ROOT) -> dict:
         else None
     )
     if total is not None and total > ceiling:
-        issues.append(f"complete protocol maximum ${total} exceeds ${ceiling} by ${total - ceiling}")
+        issues.append(
+            f"complete protocol maximum ${total} exceeds ${ceiling} by ${total - ceiling}"
+        )
     return {
         "format": "genesis.qualification.v1",
         "ceiling_usd": str(ceiling),
@@ -439,6 +464,9 @@ async def prepare(spec: dict, *, temp_root: Path, root=ROOT) -> dict:
 
 def preflight(manifest: dict, *, root=ROOT, check_expiry=True) -> list[str]:
     issues = frozen_issues(manifest)
+    cfg = candidate_config(manifest["provider"], routing(root))
+    if manifest["model_id"] != cfg.model_id:
+        raise Incomplete("unsupported qualification candidate identity for execution")
     validate_cases(manifest["cases"])
     if manifest["contracts"] != versions():
         issues.append("contract inventory changed; prepare a new campaign")
@@ -454,6 +482,6 @@ def preflight(manifest: dict, *, root=ROOT, check_expiry=True) -> list[str]:
     )
     if manifest["libraries"] != {name: version(name) for name in ("litellm", "httpx")}:
         issues.append("transport library version changed")
-    if manifest["provider_config"] != asdict(routing(root).providers[manifest["provider"]]):
+    if manifest["provider_config"] != asdict(cfg):
         issues.append("provider configuration changed")
     return sorted(set(issues))

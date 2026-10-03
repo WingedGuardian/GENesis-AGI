@@ -1,11 +1,12 @@
-# Isolated MiMo qualification
+# Isolated model qualification
 
 `python -m genesis.eval.qualification` is a standalone evidence runner. It does
 not change routing, benchmark arms, production databases or model allowlists.
-The CLI's `prepare`, `dry-run` and `report` commands are offline and need no
+The CLI's `prepare`, `dry-run`, `report` and `compare` commands are offline and need no
 credentials. Only `execute` submits completions. `reconcile` uses authenticated
 GET requests for already observed OpenRouter generation IDs; it never resends a
-completion. DeepSeek spend is zero. No live Fusion run or comparison is included.
+completion. MiMo Pro is the default candidate; DeepSeek V4.1 Flash requires an
+explicit candidate alias. No command changes production routing or runs live Fusion.
 
 The CLI pins LiteLLM's bundled model map before importing the SDK, avoiding its
 default import-time public HTTP lookup. Verified pricing and observed provider
@@ -13,7 +14,7 @@ billing govern campaign accounting. Direct Python library imports retain their
 caller's SDK import/environment policy; use the CLI for this offline guarantee.
 
 The public tests exercise synthetic references and mocked HTTP. They are not
-human approval or evidence that MiMo is qualified. Real accuracy and whether the
+human approval or evidence that either model is qualified. Real accuracy and whether the
 complete protocol fits the owner's $5 target remain unmeasured. The full request
 schedule must be estimated before spending; the manifest freezes an explicit
 campaign ceiling, defaulting to $5, even when a higher ceiling is authorized.
@@ -48,7 +49,7 @@ The JSON spec contains:
 
 | Key | Contract |
 | --- | --- |
-| `provider` | `openrouter-mimo` only; defaults to this alias. The shipped config resolves the model identity. |
+| `provider` | Defaults to `openrouter-mimo` (`xiaomi/mimo-v2.6-pro`); explicit `openrouter-deepseek-flash` selects `deepseek/deepseek-v4.1-flash`. Both require the exact shipped OpenRouter model identity. Other aliases and model substitutions are rejected before rendering or execution. |
 | `ceiling_usd` | Positive decimal string or integer; defaults to `"5"`. Freeze an authorized cap after estimating the complete schedule. |
 | `cases` | A nonempty list with unique `id` and `contract` values from the registry, `j9_relevance`, or `procedure_novelty`. |
 | `parameters` | Intended production parameters for `judge`, `relevance`, and `novelty`. These are frozen for subsequent promotion. |
@@ -226,6 +227,48 @@ routing change for each passing route, using the exact frozen parameters and
 rollback tests followed by review and E2E. This tooling performs no promotion.
 The model-validation skill should be created after exercising the real approved
 qualification/promotion workflow, rather than claiming the synthetic runs prove it.
+
+## Compare MiMo Pro and V4.1 Flash
+
+Prepare two separate campaigns from the same approved corpus and source files,
+using the explicit provider alias for each. Freeze independently verified pricing,
+upstream policy, effective parameters and an authorized ceiling in each manifest.
+Each full campaign still requires at least 750 cases and 2,250 requests across
+three repetitions. Estimate the **combined** complete maximum before spending;
+the owner's $5 target is not a shared counter across two journals.
+
+Run each campaign deliberately with `execute`. There is no command that executes
+both models automatically. To compare existing evidence without credentials:
+
+```bash
+python -m genesis.eval.qualification compare \
+  ~/private/mimo-campaign ~/private/flash-campaign
+```
+
+`compare` requires two existing journals, holds both exclusive locks while reading,
+and leaves the evidence unchanged. It rejects missing or aliased inputs. Cases,
+labels, approval artifacts, contract versions, source file hashes, libraries and
+the ordered request schedule must match. Every task field except its effective
+parameters, delegate parameters and maximum charge must match, including ordered
+novelty candidate IDs. Different inputs report incomplete instead of comparing a
+smaller intersection. Historical source commits may differ if all frozen source
+file hashes match; live execution still requires its original source identity.
+
+The report embeds both model reports and their parameters and prices. For each
+contract and repetition it counts scheduled and scored pairs, valid prediction
+matches, disagreements and correctness against the references. Failed, malformed
+or missing answers never become matching predictions. Valid DISTINCT novelty
+answers can match as `null`. Route eligibility remains separate for each model.
+The overall status is incomplete if either campaign is incomplete or pairing is
+confounded, otherwise fail if either fails, otherwise pass. No winner is selected.
+
+Combined financial fields sum known settlements, retained commitments, unresolved
+reservations and individual frozen ceilings with exact currency arithmetic. The
+maximum is `null` if either verified bound is unavailable. The summed ceilings
+disclose the two campaigns' limits; they do not authorize spending. Missing billing
+remains an unresolved liability in the embedded model report. Historical MiMo v1
+evidence remains readable, but new preparation, execution and comparison require
+the exact currently supported candidate identities.
 
 ## Current handoff
 
