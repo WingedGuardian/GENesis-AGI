@@ -384,7 +384,7 @@ falkordb_redis_install() {
 
     if ! sudo -n true 2>/dev/null; then
         echo "  Skipped: sudo unavailable non-interactively. To provision the graph engine's server:"
-        echo "           sudo bash -c 'source scripts/lib/falkordb_install.sh && falkordb_redis_install'"
+        echo "           sudo bash -c 'GENESIS_FALKORDB_PROVISION=1; source scripts/lib/falkordb_install.sh && falkordb_redis_install'"
         return 0
     fi
 

@@ -18,6 +18,7 @@ a healthy system; 15s tolerates heavy load while still releasing the lock.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import logging
 import os
@@ -922,6 +923,14 @@ async def collect_systemd() -> SectionResult:
     there. Neither box will grow a user manager between refreshes, so `[]` is
     the true answer for both and raising would error the section permanently.
     Only a systemctl backed by a reachable bus, which then fails, raises.
+
+    The listing asks for ALL unit files and filters to `genesis-*` here, never
+    via a systemctl pattern argument. MEASURED (systemd 255):
+    `list-unit-files 'genesis-*'` exits 1 when no unit file matches, which is an
+    answer -- a fresh install or a CI runner with a user manager and no Genesis
+    units -- and `strict=True` would read it as a failure and error the section
+    permanently. Unpatterned it exits 0 on a reachable manager (measured, same
+    systemd), so a nonzero exit is left meaning only what `strict` assumes.
     """
     facts: dict = {}
     metrics: dict = {}
@@ -931,7 +940,6 @@ async def collect_systemd() -> SectionResult:
             "systemctl",
             "--user",
             "list-unit-files",
-            "genesis-*",
             "--no-legend",
             "--plain",
             strict=True,
@@ -944,7 +952,7 @@ async def collect_systemd() -> SectionResult:
     if listing:
         for line in listing.splitlines():
             fields = line.split()
-            if len(fields) >= 2:
+            if len(fields) >= 2 and fnmatch.fnmatchcase(fields[0], "genesis-*"):
                 units.append({"unit": fields[0], "enabled": fields[1]})
     units.sort(key=lambda u: u["unit"])
     facts["units"] = units

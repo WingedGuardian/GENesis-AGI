@@ -792,6 +792,83 @@ async def test_no_user_bus_reports_an_empty_unit_list_rather_than_erroring(
     assert result.facts["units"] == []
 
 
+def _systemctl_255(listing: bytes):
+    """A `systemctl` stub with systemd 255's real pattern semantics.
+
+    MEASURED (systemd 255): `systemctl --user list-unit-files 'x-*'` exits 1
+    when NO unit file matches the pattern, and exits 0 when it is given no
+    pattern at all. A nonzero exit there is an ANSWER ("no such units"), not a
+    failure -- the exact class `_run_cmd(strict=True)` is documented as not
+    valid for. `list-units` with a pattern exits 0 on no match.
+    """
+
+    async def _spawn(*argv, **_k):
+        args = [a for a in argv if not a.startswith("-")]
+        if len(args) >= 2 and args[1] == "list-unit-files":
+            patterns = args[2:]
+            lines = listing.decode().splitlines()
+            if patterns:
+                import fnmatch
+
+                lines = [
+                    ln for ln in lines
+                    if any(fnmatch.fnmatchcase(ln.split()[0], p) for p in patterns)
+                ]
+                if not lines:
+                    return _StubProc(returncode=1)
+            return _StubProc(stdout="\n".join(lines).encode())
+        return _StubProc(stdout=b"")
+
+    return _spawn
+
+
+async def test_a_bus_backed_box_with_no_genesis_units_reports_an_empty_list(
+    monkeypatch, tmp_path
+):
+    """A user manager with ZERO genesis-* units is a fresh install or a CI
+    runner, and `[]` is the true answer there -- not a failed probe.
+
+    The patterned listing exits 1 on no match, so passing the pattern to
+    systemctl turned this healthy box into a permanently errored section (and
+    raised straight out of the collector in CI's live smoke test).
+    """
+    _stub_cmd(monkeypatch, _StubProc(), bus=True, tmp_path=tmp_path)
+    monkeypatch.setattr(
+        _container.asyncio,
+        "create_subprocess_exec",
+        _systemctl_255(b"dbus.service static -\nssh-agent.service enabled enabled\n"),
+    )
+
+    result = await collect_systemd()
+
+    assert result.status == STATUS_OK
+    assert result.facts["units"] == []
+
+
+async def test_the_unit_listing_keeps_only_genesis_units(monkeypatch, tmp_path):
+    """Filtering moved from systemctl's pattern to the collector, so the
+    collector must still drop every non-genesis unit file it is handed."""
+    _stub_cmd(monkeypatch, _StubProc(), bus=True, tmp_path=tmp_path)
+    monkeypatch.setattr(
+        _container.asyncio,
+        "create_subprocess_exec",
+        _systemctl_255(
+            b"dbus.service static -\n"
+            b"genesis-server.service enabled enabled\n"
+            b"genesis-backup.timer disabled enabled\n"
+            b"not-genesis-x.service enabled enabled\n"
+        ),
+    )
+
+    result = await collect_systemd()
+
+    assert result.status == STATUS_OK
+    assert result.facts["units"] == [
+        {"unit": "genesis-backup.timer", "enabled": "disabled"},
+        {"unit": "genesis-server.service", "enabled": "enabled"},
+    ]
+
+
 async def test_run_cmd_survives_a_spawn_that_raises_before_there_is_a_process(
     monkeypatch, tmp_path
 ):

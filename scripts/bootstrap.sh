@@ -1210,7 +1210,6 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
                        -e "s|__AZ_ROOT__|$_az_root_esc|g" \
                        -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
                        -e "s|__REDIS_SERVER__|$_redis_bin_esc|g" \
-
                        "$template")
         if [[ -f "$target" ]]; then
             current=$(cat "$target")

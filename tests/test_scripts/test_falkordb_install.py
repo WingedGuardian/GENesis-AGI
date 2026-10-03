@@ -9,6 +9,7 @@ wiring live in test_falkordb_module.py.
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 from tests.test_scripts.falkordb_stubs import REPO_ROOT, _apt_log, _run, _stage
@@ -253,6 +254,37 @@ def test_no_passwordless_sudo_skips_with_remediation(tmp_path):
     # The skip must TEACH the manual path, per the lib contract.
     assert "falkordb_redis_install" in result.stdout
     assert not Path(env["FALKORDB_APT_LIST"]).exists()
+
+
+def test_the_sudo_remediation_carries_its_own_consent(tmp_path):
+    """The printed command must WORK when run, not merely be printed.
+
+    sudo resets the environment and HOME, so neither the caller's
+    GENESIS_FALKORDB_PROVISION=1 nor their genesis.yaml reaches the elevated
+    shell. A command that re-sources the lib without stating consent inside it
+    lands on the opt-in skip and provisions nothing.
+    """
+    env = _stage(tmp_path)
+    env["SUDO_N_RC"] = "1"
+    result = _run("falkordb_redis_install", env)
+    line = next(ln for ln in result.stdout.splitlines() if "sudo bash -c '" in ln)
+    body = line.split("sudo bash -c '", 1)[1].rsplit("'", 1)[0]
+
+    # The elevated shell: no inherited consent, passwordless sudo available.
+    elevated = {k: v for k, v in env.items() if k != "GENESIS_FALKORDB_PROVISION"}
+    elevated["SUDO_N_RC"] = "0"
+    rerun = subprocess.run(
+        ["bash", "-c", body],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=elevated,
+    )
+
+    assert rerun.returncode == 0, rerun.stderr
+    assert "opt-in" not in rerun.stdout, rerun.stdout
+    assert "apt-get install" in _apt_log(env)
 
 
 def test_fresh_box_adds_repo_installs_and_stands_down_system_redis(tmp_path):
