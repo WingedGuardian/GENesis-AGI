@@ -631,7 +631,50 @@ _INFRA_POSTURE_DETAIL = {
         "persists across many quiet windows. To close it immediately, a deliberate "
         "container restart runs the apply in the guaranteed-quiet boot window"
     ),
+    "falkordb_socket_missing": (
+        "the graph engine's unit (genesis-falkordb) is ACTIVE but its unix socket "
+        "is absent, so every reader will fail to connect while systemd reports the "
+        "service healthy. The unit is Type=notify, so it reached readiness with the "
+        "socket open — something removed it afterwards (usually the data dir "
+        "~/.genesis/falkordb). `systemctl --user restart genesis-falkordb` "
+        "recreates it, or `systemctl --user disable --now genesis-falkordb` stands "
+        "it down — nothing depends on the engine yet, so standing it down is safe"
+    ),
+    "falkordb_unit_failed": (
+        "the graph engine's unit (genesis-falkordb) is ENABLED but FAILED: it never "
+        "signalled readiness, so the start limiter gave up and no reader can "
+        "connect. Usually the module failed to load — check "
+        "`journalctl --user -u genesis-falkordb -n 30` for a load error (a module "
+        "without the execute bit, or a redis older than 8.0.0, both refuse at "
+        "startup; a redis built without systemd support never signals ready). "
+        "Re-run scripts/bootstrap.sh to re-provision, then "
+        "`systemctl --user reset-failed genesis-falkordb` and start it again, or "
+        "`systemctl --user disable --now genesis-falkordb` to stand it down — "
+        "nothing depends on the engine yet, so standing it down is safe"
+    ),
 }
+
+# UnitFileState values that mean an operator ARMED the graph engine. Anything
+# else (absent, disabled, static, masked) is the deliberate opt-out default.
+_FALKORDB_ARMED_STATES = frozenset({"enabled", "enabled-runtime"})
+
+
+def _falkordb_could_alert(section: dict) -> bool:
+    """Whether this falkordb section's state could feed a posture rule.
+
+    Mirrors the two falkordb rules in _infra_missing_protections: an ACTIVE
+    unit (the socket rule) or an ARMED one (the failed rule). The collector
+    always records the unit name and socket path, so non-empty facts alone do
+    not mean an engine that was ever in play.
+    """
+    facts = section.get("facts")
+    metrics = section.get("metrics")
+    facts = facts if isinstance(facts, dict) else {}
+    metrics = metrics if isinstance(metrics, dict) else {}
+    return (
+        facts.get("unit_enabled") in _FALKORDB_ARMED_STATES
+        or metrics.get("unit_active_state") == "active"
+    )
 
 
 def _infra_profile_age_days(profile: dict) -> float | None:
@@ -668,6 +711,17 @@ def _infra_missing_protections(profile: dict) -> list[str]:
             return {}
         facts = section.get("facts")
         return facts if isinstance(facts, dict) else {}
+
+    def _metrics(plane: str) -> dict:
+        # Same status gate as _facts: a not-ok section RETAINS its previous
+        # values, and asserting posture from stale readings is the defect that
+        # gate exists to prevent. Metrics (not facts) because volatile states
+        # must not be hashed — see infra_profile/types.py.
+        section = sections.get(plane)
+        if not isinstance(section, dict) or section.get("status") != "ok":
+            return {}
+        metrics = section.get("metrics")
+        return metrics if isinstance(metrics, dict) else {}
 
     def _explicit_zero(value: object) -> bool:
         # bool is an int subclass (False == 0), so a malformed bool fact must
@@ -747,10 +801,45 @@ def _infra_missing_protections(profile: dict) -> list[str]:
             missing.append("cc_tmp_apply_blocked_on_cc")
         else:
             missing.append("cc_tmp_shared_fs")
+    # Graph engine. An absent, disabled or stopped unit is the deliberate
+    # default (nothing reads the engine yet), so it stays silent — alerting
+    # there would fire on every install that has simply not adopted it. Two
+    # states are wrong. Active-without-a-socket: systemd reports the service
+    # healthy while every reader would fail to connect. Armed-and-failed: the
+    # unit is Type=notify, so a module that will not load (or a redis that
+    # never signals readiness) never reaches `active` at all — it cycles
+    # through the start limiter into `failed`, and only the enablement fact
+    # tells that apart from an operator who simply never armed it. Explicit
+    # values only, per this function's contract.
+    falkordb = _metrics("falkordb")
+    falkordb_state = falkordb.get("unit_active_state")
+    if falkordb_state == "active" and falkordb.get("socket_present") is False:
+        missing.append("falkordb_socket_missing")
+    elif (
+        falkordb_state == "failed"
+        and _facts("falkordb").get("unit_enabled") in _FALKORDB_ARMED_STATES
+    ):
+        missing.append("falkordb_unit_failed")
     return sorted(missing)
 
 
-_POSTURE_PLANES = ("memory", "host_system", "host_virt", "network", "storage")
+_POSTURE_PLANES = (
+    "memory",
+    "host_system",
+    "host_virt",
+    "network",
+    "storage",
+    # The falkordb rules' only inputs come from this section. Without it here, a
+    # collector failure (which RETAINS stale values under status=error) would
+    # make the rules fall silent AND leave `unverifiable` empty — resolving an
+    # open engine alert while the engine is still broken and unobservable.
+    "falkordb",
+)
+
+# Planes whose retained facts are non-empty even when they could never have fed
+# a rule. For these, "retained facts" is not evidence of a prior posture, so the
+# hold applies only when the retained state could actually have alerted.
+_POSTURE_PLANE_RELEVANT = {"falkordb": _falkordb_could_alert}
 
 
 def _infra_unverifiable_planes(profile: dict) -> list[str]:
@@ -758,7 +847,9 @@ def _infra_unverifiable_planes(profile: dict) -> list[str]:
     retained (stale) facts — we previously knew something there and currently
     cannot verify it, so an all-clear must be held. A not-ok section with
     EMPTY facts (e.g. host planes on a guardian-less install, permanently
-    "unavailable") never contributed a rule and blocks nothing."""
+    "unavailable") never contributed a rule and blocks nothing; neither does
+    a plane whose retained state its relevance check rules out (an unarmed
+    graph engine)."""
     sections = profile.get("sections") or {}
     unverifiable: list[str] = []
     for plane in _POSTURE_PLANES:
@@ -768,6 +859,7 @@ def _infra_unverifiable_planes(profile: dict) -> list[str]:
             and section.get("status") != "ok"
             and isinstance(section.get("facts"), dict)
             and section.get("facts")
+            and _POSTURE_PLANE_RELEVANT.get(plane, lambda _s: True)(section)
         ):
             unverifiable.append(plane)
     return unverifiable

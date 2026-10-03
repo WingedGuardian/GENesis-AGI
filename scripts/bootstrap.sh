@@ -1125,6 +1125,22 @@ else
 fi
 echo
 
+# --- Graph engine (FalkorDB) provisioning ---
+# Same guarded-source contract as the resilience libs. Server side ONLY: this
+# installs a redis-server new enough to load the module plus the module itself,
+# and stops there. The unit rendered below is left DISABLED and nothing in
+# Genesis reads the engine yet, so a box where this skips entirely is fully
+# functional — the memory graph keeps using its in-process NetworkX projection.
+echo "--- Graph engine (optional) ---"
+if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
+    # shellcheck source=lib/falkordb_install.sh
+    source "$SCRIPT_DIR/lib/falkordb_install.sh"
+    falkordb_provision
+else
+    echo "  WARNING: lib/falkordb_install.sh missing — skipping graph-engine provisioning"
+fi
+echo
+
 # --- Systemd service sync ---
 echo "--- Syncing systemd service files ---"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
@@ -1162,32 +1178,38 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
+        # Escape every replacement for the `s|...|...|` grammar (`\`, `&`, `|`)
+        # the same way install.sh's renderer does: a `&` in $HOME or a `|` in an
+        # overridden FALKORDB_VERSION would corrupt the expression or make sed
+        # fail outright, and a failing render aborts bootstrap — the UPDATE
+        # path — under set -e.
+        _sed_repl_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+        _home_esc=$(_sed_repl_esc "$HOME")
+        _venv_esc=$(_sed_repl_esc "$GENESIS_ROOT/.venv")
+        _repo_esc=$(_sed_repl_esc "$GENESIS_ROOT")
+        _ccbin_esc=$(_sed_repl_esc "$CC_BIN_DIR")
         # Every token any template uses must appear here, and `sed` will NOT
         # tell you when one is missing — an unknown `__TOKEN__` passes through
         # verbatim into a unit that then installs and enables reporting success.
         # __AZ_ROOT__ is the instance that proves it: install.sh gained the
         # expression, this loop never did, and agent-zero.service rendered here
         # with a literal `WorkingDirectory=__AZ_ROOT__` (MEASURED on a live
-        # install) while the venv path one line below it came out correct.
-        # Default matches install.sh and scripts/vendor_assets.sh.
-        # Parity with install.sh is pinned by
+        # install). Parity with install.sh is pinned by
         # tests/test_scripts/test_systemd_template_placeholders.py.
-        #
-        # ESCAPED, unlike the four above it, and the asymmetry is deliberate:
-        # AZ_ROOT is the only one an OPERATOR supplies (an env var), while the
-        # others are computed here. MEASURED what unescaped does — `&` is sed's
-        # whole-match backreference, so AZ_ROOT=/tmp/R&D renders
-        # `WorkingDirectory=/tmp/R__AZ_ROOT__D`, putting the literal token BACK
-        # into the unit this line exists to fix; and a `|` makes sed exit 1,
-        # which under this script's `set -euo pipefail` aborts the whole render
-        # loop with units half-written. install.sh escapes all five via
-        # _sed_repl_esc; this matches it rather than widening the gap.
-        _az_root_esc=$(printf '%s' "${AZ_ROOT:-$HOME/agent-zero}" | sed -e 's/[\\&|]/\\&/g')
-        rendered=$(sed -e "s|__HOME__|$HOME|g" \
-                       -e "s|__VENV__|$GENESIS_ROOT/.venv|g" \
-                       -e "s|__REPO_DIR__|$GENESIS_ROOT|g" \
-                       -e "s|__CC_BIN_DIR__|$CC_BIN_DIR|g" \
+        _az_root_esc=$(_sed_repl_esc "${AZ_ROOT:-$HOME/agent-zero}")
+        # FALKORDB_VERSION is set by lib/falkordb_install.sh, sourced just above (the
+        # source of truth for the pin); the literal fallback keeps the render
+        # working when that lib is absent, in which case the unit is inert
+        # anyway because no module was installed.
+        _falkordb_ver_esc=$(_sed_repl_esc "${FALKORDB_VERSION:-4.20.4}")
+        _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)")
+        rendered=$(sed -e "s|__HOME__|$_home_esc|g" \
+                       -e "s|__VENV__|$_venv_esc|g" \
+                       -e "s|__REPO_DIR__|$_repo_esc|g" \
+                       -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
                        -e "s|__AZ_ROOT__|$_az_root_esc|g" \
+                       -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
+                       -e "s|__REDIS_SERVER__|$_redis_bin_esc|g" \
                        "$template")
         if [[ -f "$target" ]]; then
             current=$(cat "$target")
