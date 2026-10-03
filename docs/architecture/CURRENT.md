@@ -3305,9 +3305,12 @@ verified: b67423bd 2026-10-03
   `GENESIS_BOARD_DISABLED=1`). An invalid value degrades to `propose_only`:
   reads stay on and writes stay off. `writes_allowed()` is the one predicate a
   GitHub writer checks. `live` is OVERLAY-ONLY: the settings validator rejects
-  it (the `marketing_outreach` precedent), so no session can arm public-repo
-  writes for itself. The master `enabled` fails closed unless it is the literal
-  `true`.
+  it (the `marketing_outreach` precedent), and it rejects `enabled: true`
+  too (that would re-arm a live overlay the owner paused), so a session can
+  only turn the board down, never arm it. The master `enabled` fails closed
+  unless it is the literal `true`. Nothing reads the lever yet: board
+  promotion is its first consumer (`GROUNDWORK(board-promotion)` tags mark the
+  entry points waiting on it).
 - **Open questions** (`mcp/health/open_question_tools.py`: `open_question_raise`,
   `_resolve`, `_block`, `_list`) — never gated by the board mode, because they
   write only local rows. A target id prefix must resolve uniquely against its
@@ -3315,9 +3318,11 @@ verified: b67423bd 2026-10-03
   block add/remove) runs on a connection the tool owns, never the server's
   shared one, because the health MCP middleware rolls the shared connection
   back after any failed tool call and could discard or split a write already
-  reported saved. A raise is one `BEGIN IMMEDIATE` transaction (the question
-  and all its blocks, or nothing). A lost lock race retries the whole unit and
-  reports "nothing was changed" if it never wins. A close is guarded on the
+  reported saved. Each write is one `BEGIN IMMEDIATE` transaction (a raise:
+  the question and all its blocks, or nothing). Only taking the lock is
+  retried, so a write is never repeated; a lock reported after a durable WAL
+  commit counts as committed; the read-back runs after the commit and a failed
+  one is reported as "saved, not read back". A close is guarded on the
   observed status, so a second answer never overwrites the first, and a closed
   question's edges are history (not removable). Resolving and removing a block
   are owner authority: in `_UNIVERSAL_DISALLOW` for every background profile

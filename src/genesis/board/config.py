@@ -86,6 +86,8 @@ def load_config() -> dict[str, Any]:
     return merged
 
 
+# GROUNDWORK(board-promotion): read by board_promote and the promotion drain (branch
+# feat/board-promotion); nothing reads the lever until then.
 def effective_mode() -> str:
     """The mode every board consumer must run under — read live.
 
@@ -110,6 +112,7 @@ def effective_mode() -> str:
     return mode
 
 
+# GROUNDWORK(board-reconciler): the predicate every GitHub writer will check.
 def writes_allowed() -> bool:
     """True only in ``live`` — the single predicate a GitHub writer checks."""
     return effective_mode() == "live"

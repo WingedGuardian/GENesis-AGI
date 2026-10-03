@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sqlite3
 from datetime import UTC, datetime
 
 from genesis.mcp.health import mcp
@@ -80,43 +81,30 @@ async def _parse_target(db, raw: str) -> tuple[tuple[str, str] | None, str | Non
     return (kind, full), None
 
 
-class _Busy(Exception):
-    """The write lost the database lock on every retry; nothing was written."""
-
-
-async def _owned(db, unit):
-    """Run ``unit(own)`` on a connection this call OWNS and return its result.
+async def _owned(db, write, read):
+    """Run ``write(own)`` then ``read(own, result)`` on a connection this call
+    OWNS (the same file as the shared one); return ``(result, read_result)``.
 
     Every open-question WRITE goes through here, never through the server's
-    shared connection: that one serialises single statements but not a unit of
-    them, and the health MCP middleware rolls it back after any failed tool call
-    — so a write there could be discarded after this tool reported it saved, or
-    (for a raise) split from its blocks. The owned connection opens the same
-    file as the shared one. A lost lock race is retried as a WHOLE unit on a
-    fresh connection, on the shared connection's retry schedule; each unit is
-    all-or-nothing (a failed commit leaves nothing), so a retry never doubles a
-    write.
+    shared connection (``board_crud._write_unit`` says why). The write is one
+    transaction in which only taking the lock is retried, so a write is never
+    repeated. The read-back runs AFTER the commit and is never retried: if it
+    fails, ``read_result`` is None and the caller reports the write as done but
+    unread, never as a failed write.
     """
-    import asyncio
-    import sqlite3
-
-    from genesis.db.connection import _WRITE_RETRY_DELAYS, _is_lock_error, get_raw_db
+    from genesis.db.connection import get_raw_db
     from genesis.env import genesis_db_path
 
-    path = getattr(db, "_db_path", None) or genesis_db_path()
-    for delay in (*_WRITE_RETRY_DELAYS, None):
+    async with get_raw_db(getattr(db, "_db_path", None) or genesis_db_path()) as own:
+        result = await write(own)
         try:
-            async with get_raw_db(path) as own:
-                return await unit(own)
-        except sqlite3.OperationalError as exc:
-            if not _is_lock_error(exc):
-                raise
-            if delay is None:
-                raise _Busy(str(exc)) from exc
-            await asyncio.sleep(delay)
-    raise AssertionError("unreachable")
+            return result, await read(own, result)
+        except sqlite3.OperationalError:
+            logger.warning("open-question write committed; read-back failed", exc_info=True)
+            return result, None
 
 
+_UNREAD = "saved, but reading it back failed; open_question_list shows it"
 _BUSY = "database busy (lock lost on every retry); nothing was changed — try again"
 
 
@@ -147,8 +135,8 @@ async def _impl_open_question_raise(
             return _err(error)  # validate EVERY target before writing anything
         parsed.append(target)
 
-    async def unit(own):
-        qid = await board_crud.raise_question(
+    async def write(own):
+        return await board_crud.raise_question(
             own,
             question=question,
             context=context or None,
@@ -156,14 +144,15 @@ async def _impl_open_question_raise(
             now=now,
             blocks=parsed,
         )
-        return await board_crud.get_question(own, qid)
 
     try:
-        saved = await _owned(db, unit)
-    except _Busy:
+        qid, saved = await _owned(db, write, board_crud.get_question)
+    except board_crud.WriteBusy:
         return _err(_BUSY)
     except ValueError as exc:
         return _err(str(exc))
+    if saved is None:
+        return {"status": "ok", "question_id": qid, "note": _UNREAD}
     return {"status": "ok", "question": saved}
 
 
@@ -178,20 +167,26 @@ async def _impl_open_question_resolve(
     if error:
         return _err(error)
 
-    async def unit(own):
-        changed = await board_crud.close_question(
+    async def write(own):
+        return await board_crud.close_question(
             own, question_id=qid, status=status, resolution=resolution, now=now
         )
-        return changed, await board_crud.get_question(own, qid)
+
+    async def read(own, _changed):
+        return await board_crud.get_question(own, qid)
 
     try:
-        changed, question = await _owned(db, unit)
+        changed, question = await _owned(db, write, read)
     except PermissionError as exc:  # DispatchGateRefused: owner authority
         return _err(f"refused: resolving an open question is the owner's call ({exc})")
-    except _Busy:
+    except board_crud.WriteBusy:
         return _err(_BUSY)
     except ValueError as exc:
         return _err(str(exc))
+    if question is None:
+        if not changed:
+            return _err(f"question {qid} was not changed (already closed?); {_UNREAD}")
+        return {"status": "ok", "changed": True, "question_id": qid, "note": _UNREAD}
     if not changed:
         return _err(f"question {qid} is already {question['status']}; it was not changed")
     return {"status": "ok", "question": question}
@@ -212,29 +207,35 @@ async def _impl_open_question_block(
         return _err(error)
     kind, target_id = parsed
 
-    async def unit(own):
+    async def write(own):
         if remove:
-            changed = await board_crud.remove_block(
+            return await board_crud.remove_block(
                 own, question_id=qid, target_kind=kind, target_id=target_id
             )
-        else:
-            changed = await board_crud.add_block(
-                own, question_id=qid, target_kind=kind, target_id=target_id, now=now
-            )
-        return changed, await board_crud.get_question(own, qid)
+        return await board_crud.add_block(
+            own, question_id=qid, target_kind=kind, target_id=target_id, now=now
+        )
+
+    async def read(own, _changed):
+        return await board_crud.get_question(own, qid)
 
     try:
-        changed, question = await _owned(db, unit)
+        changed, question = await _owned(db, write, read)
     except PermissionError as exc:  # DispatchGateRefused: unblocking is owner authority
         return _err(f"refused: removing a block is the owner's call ({exc})")
-    except _Busy:
+    except board_crud.WriteBusy:
         return _err(_BUSY)
     except ValueError as exc:
         return _err(str(exc))
-    if remove and not changed and question["status"] != "unverified":
-        return _err(
-            f"question {qid} is {question['status']}; its edges are history and are not removed"
-        )
+    if question is None:
+        return {"status": "ok", "changed": changed, "question_id": qid, "note": _UNREAD}
+    if not changed and question["status"] != "unverified":
+        # Closed between the check and the write: both directions say so.
+        if remove:
+            return _err(
+                f"question {qid} is {question['status']}; its edges are history and are not removed"
+            )
+        return _err(f"question {qid} is {question['status']}; only an unverified question can block")
     return {"status": "ok", "changed": changed, "question": question}
 
 
