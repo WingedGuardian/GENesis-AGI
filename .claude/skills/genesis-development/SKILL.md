@@ -47,6 +47,20 @@ different SESSION TYPES, not two phases of one session's life** (user decision,
   **`closing-session`** skill; load it instead when the job is "get the open PRs
   merged".
 
+### PR readiness and mode
+
+**Finish the work and clear blockers to entering review BEFORE opening a PR.**
+Complete the implementation, required local review, and verification required
+before publication. If unfinished work or an unresolved prerequisite prevents
+normal review from proceeding, keep the change local, resolve the blocker, and
+then open its PR. A draft PR is not a place to park incomplete or blocked work.
+
+**Open ready work as a normal, non-draft PR.** Do not pass `--draft` unless the
+user explicitly requests a draft. CI and external review that run after opening,
+and verification explicitly required after merge, remain their normal gates;
+waiting for those is not a reason to use draft mode. Distinguish a blocker to
+entering review from a check that review or merge will subsequently require.
+
 The handoff between them is **the PR itself** — a durable artifact that survives
 compaction and session death, so nothing has to be remembered across the
 boundary. It also satisfies the `reviewer ≠ implementer, fresh context` contract
