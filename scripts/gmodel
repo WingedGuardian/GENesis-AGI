@@ -4,6 +4,7 @@
     gmodel                 list the roster (models, default, key status)
     gmodel <name>          launch `claude` on <name>
     gmodel <name> …args    pass extra args straight through to `claude`
+    gmodel <name> --route auto|subscription|api|openrouter …args
     gmodel --print-env <n> show the env `claude` would get, then exit (no launch)
 
 <name> is either:
@@ -13,6 +14,14 @@
     ~/.genesis/config/cc_roster.local.yaml (a peer runs on that provider's
     native Anthropic endpoint + its API key). The shipped
     config/cc_roster.yaml declares no peers; it documents the fields.
+
+Kimi K3 / MiMo V2.6 Pro have foreground-only route catalogs in cc_roster.yaml.
+Auto prefers subscription, then direct API, then OpenRouter. Set the default in
+~/.genesis/config/cc_roster.local.yaml under gmodel.models.<name>.route.
+Keys must be provisioned for the selected product; presence does not prove quota
+or entitlement. Kimi subscription requires personal interactive use; MiMo Token
+Plans are for coding-tool use. 1M K3 subscription requires an eligible tier.
+Use -- to end launcher options when a prompt contains literal flags.
 
 Anthropic always runs on Max (native OAuth — `ANTHROPIC_API_KEY` is dropped so a
 stray key can't silently switch you to per-token billing). A session is pinned to
@@ -55,7 +64,7 @@ _REEXEC_SENTINEL = "GENESIS_GMODEL_REEXEC"
 _IN_VENV = Path(sys.prefix).resolve() == (_REPO_ROOT / ".venv").resolve()
 if _VENV_PYTHON.is_file() and not _IN_VENV and not os.environ.get(_REEXEC_SENTINEL):
     os.environ[_REEXEC_SENTINEL] = "1"
-    os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]])
+    os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]])  # noqa: S606
 
 # Source checkout fallback (pip -e installs also satisfy the import directly).
 sys.path.insert(0, str(_REPO_ROOT / "src"))
@@ -82,14 +91,19 @@ if _SECRETS.is_file():
             file=sys.stderr,
         )
 
-from genesis.cc import roster  # noqa: E402
+from genesis.cc import gmodel_routes, gmodel_settings, roster  # noqa: E402
 
 #: Native Claude tiers — resolved to `claude --model <tier>` on Max, not the roster.
 _CLAUDE_TIERS = {"opus", "sonnet", "haiku", "default"}
 
 
 def _list_models() -> int:
-    r = roster.load_roster()
+    try:
+        r = roster.load_roster(strict=True)
+        foreground = gmodel_routes.catalog(r)
+    except roster.RosterError as exc:
+        print(f"gmodel: {exc}", file=sys.stderr)
+        return 1
     default = roster.active_model(r)
     models = r.get("models") or {}
     if not models:
@@ -115,6 +129,20 @@ def _list_models() -> int:
             key_ok = bool(entry and entry.auth_env and os.environ.get(entry.auth_env))
             tags.append("key ✓" if key_ok else f"key ✗ ({entry.auth_env if entry else '?'})")
         print(f"    {name:<14} {'  ·  '.join(tags)}")
+    if foreground:
+        print("\n  foreground billing routes (key presence is not live validation):")
+        for name, model in foreground.items():
+            print(f"    {name} (preference: {model.get('route', 'auto')})")
+            for kind, raw in (model.get("routes") or {}).items():
+                if not isinstance(raw, dict):
+                    print(f"      {kind}: invalid configuration")
+                    continue
+                key_name = raw.get("auth_env", "?")
+                key_ok = bool(os.environ.get(key_name, "").strip()) if isinstance(key_name, str) else False
+                key_status = "key ✓" if key_ok else "key ✗"
+                endpoint = raw.get("anthropic_base_url") or "account-console endpoint required"
+                # Listing is a preview, not a provider reachability or entitlement check.
+                print(f"      {kind}: {key_status} ({key_name}) · {endpoint}")
     print(f"\nDefault: {default}. Plain `claude` always runs native Max.")
     return 0
 
@@ -175,13 +203,37 @@ def main(argv: list[str]) -> int:
 
     name, *passthrough = argv
     try:
-        overrides, tier_args = _resolve(name)
+        route, passthrough = gmodel_settings.extract_route(passthrough)
+        flags = gmodel_settings.launch_flags(passthrough)
+        headless = bool(flags & {"-p", "--print", "--bg", "--background"})
+        interactive = not headless and (print_env or (sys.stdin.isatty() and sys.stdout.isatty()))
+        selected = gmodel_routes.resolve_route(name, route=route, interactive=interactive)
+        if selected:
+            overrides, tier_args = {}, []
+            env = _build_child_env({}, name)
+            # A user may intentionally use a conventional Anthropic credential
+            # variable as auth_env; recover only the selected product's value.
+            env[selected.auth_env] = os.environ[selected.auth_env]
+            env = gmodel_routes.apply_route_env(env, selected)
+            gmodel_settings.validate_settings(passthrough, env)
+        else:
+            if route is not None:
+                raise roster.RosterError("--route is supported only for foreground catalog models")
+            overrides, tier_args = _resolve(name)
+            env = _build_child_env(overrides, name)
     except roster.RosterError as exc:
         print(f"gmodel: {exc}", file=sys.stderr)
         print("Run `gmodel` (no args) to list models; tiers: opus/sonnet/haiku.", file=sys.stderr)
         return 1
 
-    env = _build_child_env(overrides, name)
+    if selected:
+        target = selected.anthropic_base_url
+        notice = (f"{name} · route={selected.route} · {target} · key={selected.auth_env} "
+                  f"· model={selected.model_id} · context={selected.context_tokens} (configured, unverified)")
+        print(f"gmodel: {notice}", file=sys.stderr)
+        if flags & {"--resume", "-r", "--continue", "-c", "--from-pr"}:
+            print("gmodel: Auto is resolved again on resume; the endpoint may differ from the original. "
+                  "Use --fork-session when changing providers; transcript compatibility is unverified.", file=sys.stderr)
 
     if print_env:
         # Pure diagnostic — never launches, so it must NOT require `claude` on PATH
@@ -190,12 +242,14 @@ def main(argv: list[str]) -> int:
             "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL",
             "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_API_KEY", "GENESIS_ROSTER_MODEL",
         ):
-            if k == "ANTHROPIC_AUTH_TOKEN":
+            if k in {"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"}:
                 print(f"{k}={'<set>' if env.get(k) else '<unset>'}")
             else:
                 print(f"{k}={env.get(k, '<unset>')}")
-        target = overrides["anthropic_base_url"] if overrides else "native Claude (Max)"
-        print(f"# would exec: claude {' '.join(tier_args + passthrough)}  → {target}")
+        target = selected.anthropic_base_url if selected else (overrides["anthropic_base_url"] if overrides else "native Claude (Max)")
+        # Passthrough may include credentials in --settings or private prompts.
+        args_summary = f" <{len(passthrough)} Claude arguments>" if passthrough else ""
+        print(f"# would exec: claude {' '.join(tier_args)}{args_summary}  → {target}")
         return 0
 
     claude = shutil.which("claude")
@@ -203,13 +257,13 @@ def main(argv: list[str]) -> int:
         print("gmodel: `claude` not found on PATH.", file=sys.stderr)
         return 127
 
-    if overrides:
+    if not selected and overrides:
         print(f"gmodel: launching claude on {name} ({overrides['anthropic_base_url']})", file=sys.stderr)
-    else:
+    elif not selected:
         label = name if name in _CLAUDE_TIERS else "native Claude"
         print(f"gmodel: launching {label} (Max)", file=sys.stderr)
 
-    os.execve(claude, [claude, *tier_args, *passthrough], env)
+    os.execve(claude, [claude, *tier_args, *passthrough], env)  # noqa: S606
     return 0  # unreachable (execve replaces the process)
 
 
