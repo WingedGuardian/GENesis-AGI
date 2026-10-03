@@ -50,7 +50,7 @@ if [ -z "${HOME:-}" ]; then
 fi
 
 GENESIS_HOME="${GENESIS_HOME:-$HOME/.genesis}"
-REPO_DIR="${GENESIS_REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+REPO_DIR="${GENESIS_REPO_DIR:-$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 VENV_PY="$REPO_DIR/.venv/bin/python"
 LOCK_DIR="$GENESIS_HOME/locks"
 

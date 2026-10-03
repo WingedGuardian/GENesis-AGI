@@ -33,6 +33,7 @@ def _format_error(error: Exception) -> str:
     from genesis.cc.exceptions import (
         CCError,
         CCMCPError,
+        CCOverloadedError,
         CCProcessError,
         CCQuotaExhaustedError,
         CCRateLimitError,
@@ -44,6 +45,10 @@ def _format_error(error: Exception) -> str:
         return "Genesis is taking too long — try a simpler request or try again later."
     if isinstance(error, CCQuotaExhaustedError):
         return "CC usage limit reached — operating in contingency mode."
+    # Before the rate-limit branch: an overload is a subclass of it, but the
+    # provider is out of capacity, not the user over a limit.
+    if isinstance(error, CCOverloadedError):
+        return "The model provider is overloaded right now — please try again in a few minutes."
     if isinstance(error, CCRateLimitError):
         return f"Rate limit reached — please wait a moment. ({error})"
     if isinstance(error, CCMCPError):

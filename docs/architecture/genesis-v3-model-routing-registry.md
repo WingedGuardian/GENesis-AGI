@@ -410,6 +410,21 @@ Runtime provider probes and dashboard health snapshots use the router's current
 config and breaker bindings. A probe started before reload is discarded rather
 than changing replacement health; reload invalidates cached routing health.
 
+Probe support, credential configuration and breaker authority are separate
+evidence. The health API's provider results expose `configured`,
+`probe_supported` and `can_affect_breaker` alongside the existing reachability,
+model-listing, latency and error fields. Unsupported probing does not imply a
+missing key or outage: a configured chain entry omits `probe_status`, records
+`probe_reason: unsupported_probe`, and retains the established breaker-based
+display. Actual missing credentials retain `not_configured/no_api_key`.
+
+NVIDIA's public `/v1/models` catalog is supported but observational only
+(`can_affect_breaker: false`), for both successful and failed observations.
+Its listing cannot validate credentials, prove callable completion access or
+clear held health state. Other supported providers retain their existing
+probe-synchronization policy. No routing chain, model default, daily usage,
+failure provenance or breaker-restoration policy changes with this distinction.
+
 Verification uses local HTTP responses and mocked provider completions with the production delegate and
 disposable SQLite/JSON state. `tests/test_routing/test_routing_generation.py` covers
 reload/restart identity, suspension at budget/rate/retry/completion, late callbacks,
