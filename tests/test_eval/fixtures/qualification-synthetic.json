@@ -1,0 +1,195 @@
+{
+  "cases": [
+    {
+      "contract": "bench_task_success",
+      "id": "bench_task_success",
+      "actual": "Synthetic observation with specific evidence",
+      "expected": "Synthetic expected response",
+      "user_passed": true,
+      "scorer_config": {
+        "rubric_name": "bench_task_success",
+        "task_prompt": "Synthetic context"
+      },
+      "reference_provenance": {
+        "label_source": "human",
+        "reviewer": "synthetic-labeler",
+        "rubric_version": "1.0.0"
+      }
+    },
+    {
+      "contract": "memory_recall_grounding",
+      "id": "memory_recall_grounding",
+      "actual": "Synthetic observation with specific evidence",
+      "expected": "Synthetic expected response",
+      "user_passed": true,
+      "scorer_config": {
+        "rubric_name": "memory_recall_grounding",
+        "query": "Synthetic context"
+      },
+      "reference_provenance": {
+        "label_source": "human",
+        "reviewer": "synthetic-labeler",
+        "rubric_version": "1.1.0"
+      }
+    },
+    {
+      "contract": "memory_recall_grounding_runtime",
+      "id": "memory_recall_grounding_runtime",
+      "actual": "Synthetic observation with specific evidence",
+      "expected": "Synthetic expected response",
+      "user_passed": true,
+      "scorer_config": {
+        "rubric_name": "memory_recall_grounding_runtime",
+        "query": "Synthetic context"
+      },
+      "reference_provenance": {
+        "label_source": "human",
+        "reviewer": "synthetic-labeler",
+        "rubric_version": "1.0.0"
+      }
+    },
+    {
+      "contract": "output_quality",
+      "id": "output_quality",
+      "actual": "Synthetic observation with specific evidence",
+      "expected": "Synthetic expected response",
+      "user_passed": true,
+      "scorer_config": {
+        "rubric_name": "output_quality"
+      },
+      "reference_provenance": {
+        "label_source": "human",
+        "reviewer": "synthetic-labeler",
+        "rubric_version": "1.0.0"
+      }
+    },
+    {
+      "contract": "reflection_quality",
+      "id": "reflection_quality",
+      "actual": "Synthetic observation with specific evidence",
+      "expected": "Synthetic expected response",
+      "user_passed": true,
+      "scorer_config": {
+        "rubric_name": "reflection_quality",
+        "session_context": "Synthetic context"
+      },
+      "reference_provenance": {
+        "label_source": "human",
+        "reviewer": "synthetic-labeler",
+        "rubric_version": "1.0.0"
+      }
+    },
+    {
+      "contract": "skill_edit_regression",
+      "id": "skill_edit_regression",
+      "actual": "Synthetic observation with specific evidence",
+      "expected": "Synthetic expected response",
+      "user_passed": true,
+      "scorer_config": {
+        "rubric_name": "skill_edit_regression",
+        "removed_content": "Synthetic context",
+        "change_size": "Synthetic context",
+        "edit_rationale": "Synthetic context"
+      },
+      "reference_provenance": {
+        "label_source": "human",
+        "reviewer": "synthetic-labeler",
+        "rubric_version": "1.0.0"
+      }
+    },
+    {
+      "contract": "j9_relevance",
+      "id": "relevance",
+      "query": "Synthetic query",
+      "memory_content": "Synthetic memory",
+      "user_passed": true,
+      "reference_provenance": {
+        "label_source": "human",
+        "reviewer": "synthetic-labeler",
+        "rubric_version": "1"
+      }
+    },
+    {
+      "contract": "procedure_novelty",
+      "id": "novelty",
+      "expected_target": "candidate-b",
+      "new": {
+        "task_type": "new-task",
+        "principle": "Synthetic new playbook",
+        "steps": [
+          "Run synthetic command"
+        ],
+        "embedding": [
+          1,
+          0
+        ]
+      },
+      "existing": [
+        {
+          "id": "candidate-a",
+          "task_type": "task-a",
+          "principle": "Synthetic weaker match",
+          "steps": [
+            "Do A"
+          ],
+          "embedding": [
+            0.7,
+            0.7
+          ]
+        },
+        {
+          "id": "candidate-b",
+          "task_type": "task-b",
+          "principle": "Synthetic stronger match",
+          "steps": [
+            "Do B"
+          ],
+          "embedding": [
+            1,
+            0
+          ]
+        }
+      ],
+      "reference_provenance": {
+        "label_source": "human",
+        "reviewer": "synthetic-labeler",
+        "rubric_version": "source-hashed-v1"
+      }
+    }
+  ],
+  "parameters": {
+    "judge": {
+      "max_tokens": 400,
+      "temperature": 0.0,
+      "provider": {
+        "only": [
+          "Synthetic"
+        ],
+        "allow_fallbacks": false,
+        "require_parameters": true
+      }
+    },
+    "relevance": {
+      "max_tokens": 150,
+      "temperature": 0.0,
+      "provider": {
+        "only": [
+          "Synthetic"
+        ],
+        "allow_fallbacks": false,
+        "require_parameters": true
+      }
+    },
+    "novelty": {
+      "max_tokens": 300,
+      "provider": {
+        "only": [
+          "Synthetic"
+        ],
+        "allow_fallbacks": false,
+        "require_parameters": true
+      }
+    }
+  },
+  "fixture_notice": "SYNTHETIC: no human approval, no verified pricing, no authorization to execute"
+}

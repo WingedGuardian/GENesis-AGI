@@ -2316,8 +2316,19 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 788dd9a9 2026-09-06
+verified: 04b6c6614 2026-10-03
 ```
+
+- **Model qualification has an isolated offline CLI** (`eval/qualification`,
+  `python -m genesis.eval.qualification`). It freezes contract/corpus/prompt and
+  parameter identities, observes the existing delegate's serialized requests and
+  provider responses, and reserves verified maximum charges in a private journal
+  before dispatch under a $5 campaign ceiling. Three repetitions exercise all six
+  registered rubrics, J9 relevance, and cross-type novelty with both disposable
+  storage paths. Synthetic tests establish transport/accounting/storage integration;
+  they do not qualify MiMo or prove real retrieval/extraction quality. Independent
+  labels, approved pricing bounds, paid qualification and route-specific promotion
+  remain separate prerequisites. See `docs/reference/model-qualification.md`.
 
 - **The graders are TOLD the response status; they must never infer it.** The
   triage/outcome/delta graders each judge an `InteractionSummary`, and the
