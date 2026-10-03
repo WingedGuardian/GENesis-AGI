@@ -540,6 +540,23 @@ def test_entity_adjudication_writes_cannot_be_re_enabled_via_tool_exceptions(pro
     assert tool in inv.disallowed_tools
 
 
+@pytest.mark.parametrize("profile", list(PROFILES))
+@pytest.mark.parametrize(
+    "tool",
+    ["mcp__genesis-health__open_question_resolve", "mcp__genesis-health__open_question_block"],
+)
+def test_open_question_authority_cannot_be_re_enabled_via_tool_exceptions(profile, tool):
+    """Answering the owner's open question, or unblocking work, is owner
+    authority on every profile — a per-request tool_exception must not re-grant
+    it, exactly as for the entity-adjudication gate above."""
+    runner = _make_runner()
+    req = DirectSessionRequest(
+        prompt="t", profile=profile, model=CCModel.SONNET, tool_exceptions=(tool,)
+    )
+    inv = runner._build_invocation(req, "test-session")
+    assert tool in inv.disallowed_tools
+
+
 _MARKETING_LIST = "mcp__genesis-outreach__marketing_prospects_list"
 
 
@@ -1216,3 +1233,43 @@ def test_no_background_profile_can_read_or_cancel_the_pending_queue():
         "background profile(s) can reach the pending-queue controls: "
         f"{gaps}. Add _NO_OUTREACH_QUEUE_CONTROL to each."
     )
+
+
+# --- open questions: owner authority everywhere, reads off external profiles ---
+
+
+def test_open_question_tool_scope_by_profile_origin():
+    """Derived from the classification, not a hand list: EVERY shipped profile
+    denies the owner-authority tools (resolve / block); every external-ingesting
+    profile also denies the private-text read; the untrusted-inbound perimeter
+    also denies raising one (attacker text in the owner's queue)."""
+    from genesis.cc.direct_session import _PROFILE_ORIGIN
+
+    authority = {"mcp__genesis-health__open_question_resolve", "mcp__genesis-health__open_question_block"}
+    reads = {"mcp__genesis-health__open_question_list"}
+    raise_ = {"mcp__genesis-health__open_question_raise"}
+    perimeter = {"community-responder", "mail"}
+    gaps = {}
+    for name in _SHIPPED_PROFILE_NAMES:
+        denied = set(PROFILES[name])
+        want = set(authority)
+        if _PROFILE_ORIGIN.get(name) == "external_untrusted":
+            want |= reads
+        if name in perimeter:
+            want |= reads | raise_
+        if missing := want - denied:
+            gaps[name] = sorted(missing)
+    assert not gaps, f"profile(s) can reach open-question tools they must not: {gaps}"
+    assert "mcp__genesis-health__open_question_raise" not in PROFILES["research"], (
+        "a working background session may still park a fork"
+    )
+
+
+def test_open_question_authority_is_universal_so_overlay_profiles_inherit_it():
+    """Install-local overlay profiles build their deny list from
+    universal_disallow; the shipped-profile check above cannot see them, so the
+    authority tools must live in the universal list itself."""
+    from genesis.cc.direct_session import _UNIVERSAL_DISALLOW
+
+    authority = {"mcp__genesis-health__open_question_resolve", "mcp__genesis-health__open_question_block"}
+    assert authority <= set(_UNIVERSAL_DISALLOW)

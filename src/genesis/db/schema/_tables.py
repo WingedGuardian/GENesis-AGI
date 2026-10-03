@@ -2376,6 +2376,70 @@ TABLES = {
         UNIQUE(class, branch)
     )
     """,
+    # ── Work board stores (Projects v2 front end) ────────────────────────
+    # Card <-> private-source pointers with the promotion audit, the local-only
+    # open-question graph, and the board's append-only event log. GitHub owns
+    # cards/columns/dependencies; nothing here mirrors them. New-Store
+    # justification + retention: migration 20261003010926_board_stores. DDL
+    # byte-identical to that migration (parity pinned by
+    # tests/test_db/test_board_crud.py).
+    "board_links": """
+    CREATE TABLE IF NOT EXISTS board_links (
+        id               TEXT PRIMARY KEY,
+        source_kind      TEXT NOT NULL CHECK (source_kind IN ('ledger','follow_up')),
+        source_id        TEXT NOT NULL,
+        repo             TEXT NOT NULL,
+        issue_number     INTEGER NOT NULL,
+        project_item_id  TEXT,
+        adopted          INTEGER NOT NULL DEFAULT 0 CHECK (adopted IN (0,1)),
+        promoted_by      TEXT NOT NULL,
+        approval_id      TEXT,
+        scan_receipt     TEXT NOT NULL,
+        body_sha256      TEXT NOT NULL,
+        created_at       TEXT NOT NULL,
+        updated_at       TEXT NOT NULL,
+        UNIQUE(source_kind, source_id),
+        UNIQUE(repo, issue_number)
+    )
+    """,
+    "open_questions": """
+    CREATE TABLE IF NOT EXISTS open_questions (
+        id          TEXT PRIMARY KEY,
+        question    TEXT NOT NULL,
+        context     TEXT,
+        status      TEXT NOT NULL DEFAULT 'unverified'
+                      CHECK (status IN ('unverified','resolved','dropped')),
+        resolution  TEXT,
+        raised_by   TEXT,
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL,
+        closed_at   TEXT
+    )
+    """,
+    "open_question_blocks": """
+    CREATE TABLE IF NOT EXISTS open_question_blocks (
+        question_id  TEXT NOT NULL,
+        target_kind  TEXT NOT NULL CHECK (target_kind IN ('ledger','follow_up','card')),
+        target_id    TEXT NOT NULL,
+        created_at   TEXT NOT NULL,
+        PRIMARY KEY (question_id, target_kind, target_id)
+    )
+    """,
+    "board_events": """
+    CREATE TABLE IF NOT EXISTS board_events (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        event                TEXT NOT NULL,
+        repo                 TEXT,
+        issue_number         INTEGER,
+        project_item_id      TEXT,
+        attempt              INTEGER,
+        worker               TEXT,
+        reason               TEXT,
+        observed_change_key  TEXT,
+        detail               TEXT,
+        created_at           TEXT NOT NULL
+    )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -2742,6 +2806,18 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_zero_drop_findings_status ON zero_drop_findings(status)",
     "CREATE INDEX IF NOT EXISTS idx_zero_drop_findings_last_seen "
     "ON zero_drop_findings(last_seen_at)",
+    # Work board — open-question scans and target edges, the observed-change
+    # dedup (partial UNIQUE), and per-card / age scans of the event log
+    # (board_links needs none: its UNIQUE constraints index both lookups).
+    # Identical to migration 20261003010926.
+    "CREATE INDEX IF NOT EXISTS idx_open_questions_status ON open_questions(status, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_oq_blocks_target "
+    "ON open_question_blocks(target_kind, target_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_board_events_change "
+    "ON board_events(event, observed_change_key) WHERE observed_change_key IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_board_events_issue "
+    "ON board_events(repo, issue_number, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_board_events_created ON board_events(created_at)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────
