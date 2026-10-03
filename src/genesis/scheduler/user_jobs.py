@@ -7,6 +7,13 @@ the prompt with the configured profile/model/effort.
 The scheduler loads all active jobs from the DB on start and registers
 them as APScheduler CronTrigger jobs. Jobs can be added, paused,
 resumed, and run immediately at runtime.
+
+The DB is the shared channel between the server process (which owns this
+scheduler) and the standalone MCP server process (which shares only the
+DB). Mutations made in either process land in ``user_jobs``, and a
+periodic reconcile pass converges APScheduler onto it: new active jobs
+get registered, changed crons re-registered, deleted/paused/disabled
+jobs removed, and ``run_requested_at`` stamps dispatched then cleared.
 """
 
 from __future__ import annotations
@@ -22,6 +29,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# How often the scheduler reconciles APScheduler against the user_jobs
+# table. This is the only path by which mutations made in a process that
+# has no scheduler (the standalone MCP server) take effect, so it also
+# bounds worst-case latency for a DB-written run_now request.
+_RECONCILE_INTERVAL_S = 15
+_RECONCILE_JOB_ID = "user_job:__reconcile__"
+_JOB_PREFIX = "user_job:"
+
 
 class UserJobScheduler:
     """Owns an APScheduler instance for user-defined cron jobs."""
@@ -35,6 +50,10 @@ class UserJobScheduler:
         self._db = db
         self._event_bus = event_bus
         self._scheduler = None  # AsyncIOScheduler, created in start()
+        # job_id -> cron_expression currently registered, so _reconcile
+        # can spot a cron change made in another process without asking
+        # APScheduler to render its trigger back into crontab form.
+        self._registered_crons: dict[str, str] = {}
 
     @property
     def is_running(self) -> bool:
@@ -52,8 +71,63 @@ class UserJobScheduler:
         for job in jobs:
             self._register_job(job)
 
+        self._scheduler.add_job(
+            self._reconcile,
+            "interval",
+            seconds=_RECONCILE_INTERVAL_S,
+            id=_RECONCILE_JOB_ID,
+            max_instances=1,
+        )
         self._scheduler.start()
         logger.info("User job scheduler started with %d active job(s)", len(jobs))
+
+    async def _reconcile(self) -> None:
+        """Converge APScheduler onto the user_jobs table.
+
+        Mutations can arrive from a process that shares the DB but not
+        this scheduler — the standalone MCP server is exactly that — so
+        polling the table is the only way those mutations take effect
+        here. Three duties, in order: drop registrations for jobs that
+        are gone or no longer active, register (or re-register on cron
+        change) the ones that should be live, then consume any
+        ``run_requested_at`` stamps.
+        """
+        if not self._scheduler:
+            return
+        from genesis.db.crud import user_jobs as crud
+
+        jobs = await crud.list_jobs(self._db)
+        by_id = {j["id"]: j for j in jobs}
+
+        for ap_job in self._scheduler.get_jobs():
+            if not ap_job.id.startswith(_JOB_PREFIX) or ap_job.id == _RECONCILE_JOB_ID:
+                continue
+            job_id = ap_job.id[len(_JOB_PREFIX):]
+            job = by_id.get(job_id)
+            if (
+                job is None
+                or job.get("status") != "active"
+                or self._registered_crons.get(job_id) != job.get("cron_expression")
+            ):
+                self._unregister_job(job_id)
+
+        for job in jobs:
+            if job.get("status") != "active":
+                continue
+            if job["id"] not in self._registered_crons:
+                self._register_job(job)
+
+        for job in jobs:
+            if not job.get("run_requested_at"):
+                continue
+            # Clear BEFORE dispatching: a dispatch slower than the
+            # reconcile interval must not refire, and clearing first is
+            # also the ordering that makes a request stamped mid-dispatch
+            # count as a fresh one.
+            await crud.clear_run_request(self._db, job["id"])
+            if job.get("status") == "disabled":
+                continue
+            await self._dispatch_job(job["id"])
 
     async def stop(self) -> None:
         """Shut down the APScheduler."""
@@ -81,12 +155,13 @@ class UserJobScheduler:
             self._scheduler.add_job(
                 self._dispatch_job,
                 trigger,
-                id=f"user_job:{job_id}",
+                id=f"{_JOB_PREFIX}{job_id}",
                 args=(job_id,),
                 max_instances=1,
                 misfire_grace_time=300,
                 replace_existing=True,
             )
+            self._registered_crons[job_id] = cron_expr
             logger.info(
                 "Registered user job %s '%s' (cron=%s)",
                 job_id[:8], job.get("title", ""), cron_expr,
@@ -98,9 +173,10 @@ class UserJobScheduler:
 
     def _unregister_job(self, job_id: str) -> None:
         """Remove a job from APScheduler."""
+        self._registered_crons.pop(job_id, None)
         if not self._scheduler:
             return
-        ap_id = f"user_job:{job_id}"
+        ap_id = f"{_JOB_PREFIX}{job_id}"
         with contextlib.suppress(Exception):
             self._scheduler.remove_job(ap_id)
 

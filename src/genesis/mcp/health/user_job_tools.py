@@ -49,8 +49,6 @@ async def user_job_create(
     """
     if _db is None:
         return {"error": "Database not initialized"}
-    if _scheduler is None:
-        return {"error": "User job scheduler not initialized"}
 
     # Validate inputs before persisting. Use the live profile registry
     # (VALID_PROFILES, incl. any install-local overlay profiles) rather than a
@@ -89,8 +87,10 @@ async def user_job_create(
             effort=effort,
         )
 
-        # Register with APScheduler
-        await _scheduler.add_job(job_id)
+        # Register immediately when this process owns the scheduler;
+        # otherwise the server's reconcile loop picks the new row up.
+        if _scheduler is not None:
+            await _scheduler.add_job(job_id)
 
         return {
             "success": True,
@@ -152,30 +152,57 @@ async def user_job_control(
         job_id: The job ID to control
         action: One of: pause, resume, run_now, delete
     """
-    if _scheduler is None:
-        return {"error": "User job scheduler not initialized"}
+    if _db is None:
+        return {"error": "Database not initialized"}
 
     valid_actions = ("pause", "resume", "run_now", "delete")
     if action not in valid_actions:
         return {"error": f"Invalid action '{action}'. Must be one of: {', '.join(valid_actions)}"}
 
+    from genesis.db.crud import user_jobs as crud
+
     try:
+        job = await crud.get_job(_db, job_id)
+        if not job:
+            return {"error": f"Job {job_id} not found"}
+
         if action == "pause":
-            ok = await _scheduler.pause_job(job_id)
+            if _scheduler is not None:
+                ok = await _scheduler.pause_job(job_id)
+            else:
+                ok = await crud.update_job(_db, job_id, status="paused")
             return {"success": ok, "action": "paused", "job_id": job_id}
         elif action == "resume":
-            ok = await _scheduler.resume_job(job_id)
+            if _scheduler is not None:
+                ok = await _scheduler.resume_job(job_id)
+            else:
+                ok = await crud.update_job(_db, job_id, status="active")
             return {"success": ok, "action": "resumed", "job_id": job_id}
         elif action == "run_now":
-            session_id = await _scheduler.run_now(job_id)
+            if _scheduler is not None:
+                session_id = await _scheduler.run_now(job_id)
+                return {
+                    "success": session_id is not None,
+                    "action": "dispatched",
+                    "job_id": job_id,
+                    "session_id": session_id,
+                }
+            # No scheduler in this process (standalone MCP): stamp the
+            # request; the server's scheduler reconcile loop dispatches
+            # and clears it within _RECONCILE_INTERVAL_S.
+            ok = await crud.request_run(_db, job_id)
             return {
-                "success": session_id is not None,
-                "action": "dispatched",
+                "success": ok,
+                "action": "queued",
                 "job_id": job_id,
-                "session_id": session_id,
+                "detail": "Run requested; the server scheduler dispatches "
+                "queued runs on its next reconcile tick.",
             }
         elif action == "delete":
-            ok = await _scheduler.remove_job(job_id)
+            if _scheduler is not None:
+                ok = await _scheduler.remove_job(job_id)
+            else:
+                ok = await crud.delete_job(_db, job_id)
             return {"success": ok, "action": "deleted", "job_id": job_id}
     except Exception as exc:
         logger.error("User job control failed: %s", exc, exc_info=True)
@@ -199,6 +226,13 @@ async def user_job_history(
         return {"error": "Database not initialized"}
 
     from genesis.db.crud import user_jobs as crud
+
+    # Bound the client-supplied limit — an unbounded LIMIT is a memory/
+    # latency lever on the whole run-history table.
+    try:
+        limit = max(1, min(int(limit), 100))
+    except (TypeError, ValueError):
+        limit = 10
 
     try:
         job = await crud.get_job(_db, job_id)
