@@ -29,6 +29,111 @@ async def frozen(tmp_path_factory):
 CREDENTIALS = ("API_KEY_OPENROUTER", "OPENROUTER_API_KEY", "OPENROUTER_API_TOKEN")
 
 
+@pytest.mark.parametrize(
+    ("key", "invalid"),
+    [
+        *[
+            (key, value)
+            for key in ("temperature", "top_p")
+            for value in (
+                False,
+                True,
+                None,
+                "0",
+                [],
+                {},
+                float("nan"),
+                float("inf"),
+                -0.01,
+                10**400,
+            )
+        ],
+        ("temperature", 2.01),
+        ("top_p", 1.01),
+        *[("seed", value) for value in (False, True, None, "1", 1.0, [], {})],
+        *[("max_tokens", value) for value in (False, True, None, "150", 150.0, 0, -1)],
+        *[("reasoning", {"max_tokens": value}) for value in (False, True, None, "1", 1.0, -1, [])],
+        ("reasoning", False),
+        ("reasoning", []),
+    ],
+)
+def test_invalid_numeric_parameters_rejected_before_effective_configuration(key, invalid):
+    body = synthetic_spec()["parameters"]["novelty"]
+    body[key] = invalid
+    with pytest.raises(Incomplete):
+        manifest.effective(body, {"kwargs": {}}, None)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"temperature": 0},
+        {"temperature": 0.0},
+        {"temperature": 2},
+        {"temperature": 2.0},
+        {"top_p": 0},
+        {"top_p": 0.0},
+        {"top_p": 1},
+        {"top_p": 1.0},
+        {"seed": 0},
+        {"seed": -1},
+        {"seed": 2**64},
+        {"reasoning": {"max_tokens": 0}},
+        {"reasoning": {"max_tokens": 2000}},
+    ],
+)
+def test_documented_numeric_boundaries_preserved(extra):
+    body = {**synthetic_spec()["parameters"]["novelty"], **extra}
+    wire, _ = manifest.effective(body, {"kwargs": {}}, None)
+    for key, value in extra.items():
+        assert wire[key] == value
+        assert type(wire[key]) is type(value)
+
+
+@pytest.mark.parametrize("route", ["judge", "relevance", "novelty"])
+@pytest.mark.parametrize("key", ["temperature", "top_p", "seed"])
+def test_boolean_numeric_spec_cli_zero_requests_and_no_campaign(tmp_path, capsys, route, key):
+    spec = synthetic_spec()
+    spec["parameters"][route][key] = False
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(spec))
+    with patch.object(httpx.AsyncClient, "send", side_effect=AssertionError("HTTP")):
+        assert (
+            main(
+                [
+                    "prepare",
+                    str(tmp_path / "campaign"),
+                    "--spec",
+                    str(path),
+                    "--temp-root",
+                    str(tmp_path / "scratch"),
+                ]
+            )
+            == 2
+        )
+    assert json.loads(capsys.readouterr().out)["status"] == "incomplete"
+    assert not (tmp_path / "campaign").exists()
+
+
+@pytest.mark.parametrize("route", ["judge", "relevance", "novelty"])
+@pytest.mark.parametrize("key", ["temperature", "top_p", "seed"])
+async def test_invalid_frozen_parameters_stop_execution_before_reservation(
+    frozen, tmp_path, route, key
+):
+    data = priced(frozen)
+    data["parameters"][route][key] = False
+    data["pricing"]["parameters_hash"] = digest(data["parameters"])
+    with Journal(tmp_path / "campaign") as journal:
+        journal.initialize(data)
+        with (
+            patch.object(httpx.AsyncClient, "send", side_effect=AssertionError("HTTP")),
+            pytest.raises(Incomplete, match="invalid numeric|invalid integer"),
+        ):
+            await runner.execute(journal, temp_root=tmp_path / "scratch")
+        assert not journal.attempts
+        assert journal.committed == 0
+
+
 @pytest.mark.parametrize("invalid", [None, [], 1, "value", True])
 def test_invalid_spec_root_cli_incomplete(tmp_path, capsys, invalid):
     spec = tmp_path / "spec.json"
@@ -407,3 +512,36 @@ async def test_malformed_reconciliation_stays_incomplete_and_never_resends(
     assert "charge" not in result["attempts"][key]
     with Journal(campaign) as journal:
         assert "charge" not in journal.attempts[key]
+
+
+async def test_sandbox_admission_failure_is_incomplete_before_requests(tmp_path):
+    from genesis.db.integrity import DatabaseIntegrityError
+
+    with (
+        patch(
+            "genesis.db.admission.assert_admitted",
+            side_effect=DatabaseIntegrityError("synthetic refusal"),
+        ),
+        patch.object(transport.LiteLLMDelegate, "call") as submit,
+    ):
+        with pytest.raises(Incomplete, match="SQLite admission"):
+            await manifest.prepare(synthetic_spec(), temp_root=tmp_path / "scratch")
+        submit.assert_not_called()
+    assert list((tmp_path / "scratch").iterdir()) == []
+
+
+async def test_sandbox_case_admission_failure_keeps_template_isolated(tmp_path):
+    from genesis.db.integrity import DatabaseIntegrityError
+
+    case = synthetic_spec()["cases"][-1]
+    async with contracts.Sandbox(tmp_path / "scratch") as sandbox:
+        with (
+            patch(
+                "genesis.db.admission.assert_admitted",
+                side_effect=DatabaseIntegrityError("synthetic refusal"),
+            ),
+            pytest.raises(Incomplete, match="SQLite admission"),
+        ):
+            await sandbox.database(case)
+        assert sandbox.template.exists()
+    assert list((tmp_path / "scratch").iterdir()) == []

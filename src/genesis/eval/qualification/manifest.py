@@ -43,6 +43,9 @@ SOURCE_FILES = (
     "src/genesis/learning/procedural/scoping.py",
     "src/genesis/learning/procedural/validation_gate.py",
     "src/genesis/db/crud/procedural.py",
+    "src/genesis/db/connection.py",
+    "src/genesis/db/admission.py",
+    "src/genesis/db/integrity.py",
     "src/genesis/routing/litellm_delegate.py",
     "config/model_routing.yaml",
 )
@@ -76,14 +79,37 @@ def routing(root=ROOT):
     )
 
 
+def validate_numeric_parameters(body: dict):
+    """Validate JSON numbers before Python equality can alias booleans.
+
+    OpenRouter's parameter reference defines temperature in [0, 2], top_p in
+    [0, 1], positive integer max_tokens and integer seed (no documented bound):
+    https://openrouter.ai/docs/api_reference/parameters
+    """
+    if type(body.get("max_tokens")) is not int or body["max_tokens"] <= 0:
+        raise Incomplete("explicit output cap required")
+    for key, maximum in (("temperature", 2), ("top_p", 1)):
+        if key in body and (type(body[key]) not in (int, float) or not 0 <= body[key] <= maximum):
+            raise Incomplete(f"invalid numeric parameter: {key}")
+    if "seed" in body and type(body["seed"]) is not int:
+        raise Incomplete("invalid integer parameter: seed")
+    if "reasoning" in body:
+        reasoning = body["reasoning"]
+        if not isinstance(reasoning, dict):
+            raise Incomplete("reasoning must be a JSON object")
+        if "max_tokens" in reasoning and (
+            type(reasoning["max_tokens"]) is not int or reasoning["max_tokens"] < 0
+        ):
+            raise Incomplete("invalid integer parameter: reasoning.max_tokens")
+
+
 def effective(parameters: dict, call: dict, provider_params: dict | None):
     if not isinstance(parameters, dict):
         raise Incomplete("missing intended production parameters")
     body = dict(parameters)
     if set(body) - {"temperature", "max_tokens", "top_p", "seed", "reasoning", "provider"}:
         raise Incomplete("unsupported parameters or model fallback")
-    if type(body.get("max_tokens")) is not int or body["max_tokens"] <= 0:
-        raise Incomplete("explicit output cap required")
+    validate_numeric_parameters(body)
     policy = body.get("provider", {})
     if (
         not isinstance(policy, dict)

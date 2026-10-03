@@ -82,6 +82,10 @@ requires exactly one `provider.only` entry, `provider.allow_fallbacks: false` an
 and `reasoning`. Unfrozen provider defaults are rejected. LiteLLM's automatic
 OpenRouter `usage: {include: true}` field is also frozen. The serialized request
 must match this body exactly before it can leave the process.
+Numeric parameters reject booleans, strings and nulls before any reservation:
+`temperature` accepts finite numbers in [0, 2], `top_p` in [0, 1], and `seed`
+requires an integer. A supplied `reasoning` value must be an object; its optional
+`max_tokens` requires a nonnegative integer.
 
 The reference approval is an object with `approved: true`, `independent: true`,
 `corpus_hash`, a nonblank `reviewer` different from the case labelers, and an

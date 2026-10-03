@@ -13,7 +13,9 @@ from unittest.mock import patch
 
 import aiosqlite
 
+from genesis.db.connection import connect_aiosqlite_rw
 from genesis.db.crud import procedural
+from genesis.db.integrity import DatabaseIntegrityError
 from genesis.db.schema import create_all_tables
 from genesis.eval.calibration import _validate_references
 from genesis.eval.j9_batch import _RELEVANCE_PROMPT_VERSION, J9EvalBatchExecutor
@@ -176,8 +178,14 @@ class Sandbox:
         self.root.mkdir(parents=True, exist_ok=True)
         self.directory = tempfile.TemporaryDirectory(prefix="qualification-", dir=self.root)
         self.template = Path(self.directory.name) / "template.sqlite"
-        async with aiosqlite.connect(self.template) as db:
-            await create_all_tables(db)
+        try:
+            async with connect_aiosqlite_rw(self.template) as db:
+                await create_all_tables(db)
+        except BaseException as exc:
+            self.directory.cleanup()
+            if isinstance(exc, DatabaseIntegrityError):
+                raise Incomplete("disposable SQLite admission failed") from exc
+            raise
         return self
 
     async def __aexit__(self, *args):
@@ -186,7 +194,10 @@ class Sandbox:
     async def database(self, case):
         path = Path(self.directory.name) / "case.sqlite"
         shutil.copyfile(self.template, path)
-        db = await aiosqlite.connect(path)
+        try:
+            db = await connect_aiosqlite_rw(path, existing_only=True)
+        except DatabaseIntegrityError as exc:
+            raise Incomplete("disposable SQLite admission failed") from exc
         db.row_factory = aiosqlite.Row
         try:
             for index, row in enumerate(case["existing"]):
