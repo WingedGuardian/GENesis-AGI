@@ -63,4 +63,5 @@ def user_bus_present() -> bool:
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
     if not runtime_dir:
         return False
-    return Path(runtime_dir, "bus").exists()
+    # is_socket, not exists: a stray file named `bus` is no user manager.
+    return Path(runtime_dir, "bus").is_socket()

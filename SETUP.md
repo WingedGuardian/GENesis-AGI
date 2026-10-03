@@ -91,6 +91,10 @@ graph_engine:
   provision: true
 ```
 
+That value is read the way Genesis reads the rest of the file: any YAML
+true (`true`, `True`, `yes`) consents; a quoted `"true"`, or a file that
+does not parse, does not.
+
 `GENESIS_FALKORDB_PROVISION_DISABLED=1` disables the whole thing, module
 included. The engine module itself is fetched either way — it is one file under
 `~/.genesis/deps` and changes nothing about your system.

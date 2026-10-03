@@ -12,6 +12,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from tests.test_scripts.falkordb_stubs import REPO_ROOT, _apt_log, _run, _stage
 
 # --- the operator's machine is not ours to change -------------------------
@@ -96,130 +98,74 @@ def test_system_provisioning_is_opt_in(tmp_path):
     assert "apt-get" not in _apt_log(env), "apt invoked without consent"
 
 
-def test_local_config_can_grant_consent(tmp_path):
-    """An operator should not have to export an env var on every update."""
+# Consent is read the way Genesis reads its own config: yaml.safe_load, then a
+# real boolean true at graph_engine.provision. Each row is (config body,
+# consents). YAML 1.1 (what safe_load implements) spells true as true/yes/on
+# in three cases each, so `yes` IS consent -- the gate means exactly what the
+# loader means, never a second dialect of it.
+_CONSENT_CASES = (
+    ("memory:\n  wing: x\ngraph_engine:\n  provision: true\n", True),
+    ("graph_engine:\n  provision: True\n", True),
+    ("graph_engine:\n  provision: TRUE\n", True),
+    ("graph_engine:\n  provision: yes\n", True),
+    ("graph_engine:\n  provision: true  # opted in\n", True),
+    # Not the first key, and after a nested block.
+    ("graph_engine:\n  backends:\n    experimental: true\n  provision: true\n", True),
+    # Duplicate keys and blocks are legal; the LAST one wins.
+    ("graph_engine:\n  provision: false\n  provision: true\n", True),
+    ("graph_engine:\n  provision: true\n  provision: false\n", False),
+    ("graph_engine:\n  provision: true\ngraph_engine:\n  backend: x\n", False),
+    # Tabs cannot indent YAML: the loader rejects the whole file.
+    ("graph_engine:\n\tprovision: true\n", False),
+    ("graph_engine:\n  provision: true\n: [unclosed\n", False),
+    # Not a boolean.
+    ("graph_engine:\n  provision: 'true'\n", False),
+    ("graph_engine:\n  provision: true#x\n", False),
+    ("graph_engine:\n  provision: 1\n", False),
+    ("graph_engine:\n  provision: false\n", False),
+    # Not the documented key path.
+    ("graph_engine:\n  other: true\n", False),
+    ("other_block:\n  provision: true\n", False),
+    ("graph_engine:\n  backends:\n    experimental:\n      provision: true\n", False),
+    ("unrelated:\n  graph_engine:\n    provision: true\n", False),
+    ("graph_engine:\n  # provision: true\n", False),
+    # Not a mapping at the root, or at the section.
+    ("- graph_engine:\n    provision: true\n", False),
+    ("graph_engine: true\n", False),
+    ("", False),
+)
+
+
+@pytest.mark.parametrize(("body", "consents"), _CONSENT_CASES)
+def test_config_consent_is_what_the_yaml_loader_reads(tmp_path, body, consents):
+    """An operator should not have to export an env var on every update, and
+    a config Genesis itself would read differently must never authorise a
+    third-party apt repo."""
     env = _stage(tmp_path)
     del env["GENESIS_FALKORDB_PROVISION"]
-    Path(env["FALKORDB_LOCAL_CONFIG"]).write_text(
-        "memory:\n  wing: x\ngraph_engine:\n  provision: true\n"
-    )
+    Path(env["FALKORDB_LOCAL_CONFIG"]).write_text(body)
     result = _run("falkordb_redis_install", env)
 
     assert result.returncode == 0, result.stderr
-    assert Path(env["FALKORDB_APT_LIST"]).exists(), result.stdout
+    assert Path(env["FALKORDB_APT_LIST"]).exists() == consents, (body, result.stdout)
+    assert ("opt-in" in result.stdout) != consents, result.stdout
 
 
-def test_a_false_config_value_is_not_consent(tmp_path):
-    """The fail direction: anything not plainly true reads as no."""
+def test_an_unreadable_config_says_why_it_is_not_consent(tmp_path):
+    """A parse failure or a missing venv must be SAID, not read as a quiet no."""
     env = _stage(tmp_path)
     del env["GENESIS_FALKORDB_PROVISION"]
-    for body in (
-        "graph_engine:\n  provision: false\n",
-        "graph_engine:\n  other: true\n",
-        "other_block:\n  provision: true\n",   # provision, but not ours
-        "",
-    ):
-        Path(env["FALKORDB_LOCAL_CONFIG"]).write_text(body)
-        result = _run("falkordb_redis_install", env)
-        assert result.returncode == 0, result.stderr
-        assert "opt-in" in result.stdout, f"treated as consent: {body!r}"
-        assert not Path(env["FALKORDB_APT_LIST"]).exists(), f"provisioned on: {body!r}"
-
-
-def test_consent_is_read_only_at_the_documented_key_path(tmp_path):
-    """`provision: true` consents only as a DIRECT child of a TOP-LEVEL `graph_engine:`.
-
-    That is the one key path SETUP.md and the skip message name. This gate
-    authorises putting a third-party apt repo on someone's machine, so it must
-    read consent only where consent was written -- a matcher that accepts any
-    nested `provision: true` turns an unrelated sub-block into permission for a
-    system change the operator never agreed to.
-    """
-    env = _stage(tmp_path)
-    del env["GENESIS_FALKORDB_PROVISION"]
-    not_consent = (
-        # Nested UNDER graph_engine -- `graph_engine.provision` is itself unset.
-        "graph_engine:\n  backends:\n    experimental:\n      provision: true\n",
-        # `graph_engine` nested under something else is a different key path.
-        "unrelated:\n  graph_engine:\n    provision: true\n",
-        # A commented-out value is a decision NOT taken.
-        "graph_engine:\n  # provision: true\n",
-    )
-    for body in not_consent:
-        Path(env["FALKORDB_LOCAL_CONFIG"]).write_text(body)
-        result = _run("falkordb_redis_install", env)
-        assert result.returncode == 0, result.stderr
-        assert "opt-in" in result.stdout, f"treated as consent: {body!r}"
-        assert not Path(env["FALKORDB_APT_LIST"]).exists(), f"provisioned on: {body!r}"
-
-
-def test_consent_still_reads_when_it_is_not_the_first_key(tmp_path):
-    """The narrowing must not become an under-read.
-
-    An operator who writes other graph_engine settings -- including a nested
-    block -- before `provision:` has still consented. Without this the fix for
-    the over-read above could silently blind the gate instead of scoping it.
-    """
-    env = _stage(tmp_path)
-    del env["GENESIS_FALKORDB_PROVISION"]
-    Path(env["FALKORDB_LOCAL_CONFIG"]).write_text(
-        "graph_engine:\n"
-        "  backends:\n"
-        "    experimental: true\n"
-        "  provision: true\n"
-        "memory:\n"
-        "  wing: x\n"
-    )
+    config = Path(env["FALKORDB_LOCAL_CONFIG"])
+    config.write_text("graph_engine:\n\tprovision: true\n")
     result = _run("falkordb_redis_install", env)
+    assert "could not be parsed" in result.stdout, result.stdout
 
+    config.write_text("graph_engine:\n  provision: true\n")
+    env["FALKORDB_PYTHON"] = str(tmp_path / "no-venv" / "python")
+    result = _run("falkordb_redis_install", env)
     assert result.returncode == 0, result.stderr
-    assert Path(env["FALKORDB_APT_LIST"]).exists(), result.stdout
-
-
-def test_a_later_false_overrides_an_earlier_true(tmp_path):
-    """Duplicate keys are legal YAML and PyYAML keeps the LAST one.
-
-    `provision: true` followed by `provision: false` is a withdrawal, not
-    consent — a matcher that OR-accumulates (any true anywhere grants) would
-    add an apt repo to a box whose operator changed their mind.
-    """
-    env = _stage(tmp_path)
-    del env["GENESIS_FALKORDB_PROVISION"]
-    for body, consents in (
-        ("graph_engine:\n  provision: true\n  provision: false\n", False),
-        ("graph_engine:\n  provision: false\n  provision: true\n", True),
-    ):
-        Path(env["FALKORDB_LOCAL_CONFIG"]).write_text(body)
-        result = _run("falkordb_redis_install", env)
-        assert result.returncode == 0, result.stderr
-        assert Path(env["FALKORDB_APT_LIST"]).exists() == consents, (
-            f"last-key-wins not honoured: {body!r}"
-        )
-        Path(env["FALKORDB_APT_LIST"]).unlink(missing_ok=True)
-
-
-def test_a_repeated_graph_engine_block_restarts_consent(tmp_path):
-    """Duplicate TOP-LEVEL mappings are legal YAML; PyYAML keeps the LAST.
-
-    An earlier block's `provision: true` must not survive into a file whose
-    effective `graph_engine` mapping never consented — the gate must disagree
-    with a withdrawn decision, not with itself.
-    """
-    env = _stage(tmp_path)
-    del env["GENESIS_FALKORDB_PROVISION"]
-    for body, consents in (
-        # Earlier block consents; the LAST mapping (what PyYAML loads) does not.
-        ("graph_engine:\n  provision: true\ngraph_engine:\n  backend: x\n", False),
-        # Earlier block silent; the effective mapping consents.
-        ("graph_engine:\n  backend: x\ngraph_engine:\n  provision: true\n", True),
-    ):
-        Path(env["FALKORDB_LOCAL_CONFIG"]).write_text(body)
-        result = _run("falkordb_redis_install", env)
-        assert result.returncode == 0, result.stderr
-        assert Path(env["FALKORDB_APT_LIST"]).exists() == consents, (
-            f"last-block-wins not honoured: {body!r}"
-        )
-        Path(env["FALKORDB_APT_LIST"]).unlink(missing_ok=True)
+    assert "no venv Python" in result.stdout, result.stdout
+    assert not Path(env["FALKORDB_APT_LIST"]).exists()
 
 
 def test_kill_switch_stops_everything_including_the_module(tmp_path):
@@ -509,26 +455,99 @@ def test_an_unserved_distro_writes_no_apt_source(tmp_path):
     assert not Path(env["FALKORDB_APT_LIST"]).exists()
 
 
-def test_a_failed_apt_update_refuses_a_below_floor_candidate(tmp_path):
-    """A stale index can only offer the distro's 7.x, which the module refuses.
+def test_a_failed_apt_update_stops_and_leaves_the_box_as_it_was(tmp_path):
+    """A source that cannot update is removed, and the run STOPS there.
 
-    Installing it anyway would put a database daemon on the box that cannot
-    run the engine it was installed for — so a failed `apt-get update` gates
-    the install on a verified candidate >= the floor.
+    Even with a usable candidate still offered from a cached index, going on to
+    install would re-create the removed list through the provenance stamp and
+    leave the package with no update source. apt consults every list on every
+    operation, so a broken suite left behind would also fail unrelated runs.
     """
     env = _stage(tmp_path)
-    env["APT_RC"] = "1"           # every apt-get call fails
-    env["APT_CANDIDATE"] = "6:7.0.15-1"  # what a stale index offers on noble
+    env["APT_RC"] = "1"  # every apt-get call fails; the candidate is 8.x
     result = _run("falkordb_redis_install", env)
 
     assert result.returncode == 0, result.stderr
     assert "update failed" in result.stdout
-    # A source that cannot update must not be LEFT: apt consults every list on
-    # every operation, so a broken suite would fail unrelated apt runs too.
-    assert not Path(env["FALKORDB_APT_LIST"]).exists(), "broken source left enabled"
-    assert "below" in result.stdout and "floor" in result.stdout
-    assert "apt-get update" in _apt_log(env)
-    assert "apt-get install" not in _apt_log(env), "installed an unusable redis"
+    assert not Path(env["FALKORDB_APT_LIST"]).exists(), "source left or re-created"
+    assert not Path(env["FALKORDB_APT_KEYRING"]).exists(), "keyring this run added left"
+    assert "apt-get install" not in _apt_log(env), "installed after a failed update"
+
+
+def test_a_keyring_this_run_did_not_create_is_never_touched(tmp_path):
+    """An operator-managed keyring at our path is theirs: not overwritten, not
+    removed, and no source of ours is pointed at it."""
+    env = _stage(tmp_path)
+    keyring = Path(env["FALKORDB_APT_KEYRING"])
+    keyring.write_text("operator keyring")
+    result = _run("falkordb_redis_install", env)
+
+    assert result.returncode == 0, result.stderr
+    assert keyring.read_text() == "operator keyring"
+    assert not Path(env["FALKORDB_APT_LIST"]).exists()
+    assert "apt-get" not in _apt_log(env)
+
+
+def test_every_failure_after_the_repo_add_removes_what_this_run_added(tmp_path):
+    """Leave the machine as it was found: list, keyring, and a keyring
+    directory this run had to create all go when the run cannot finish."""
+    for name, extra in (
+        ("list write fails", {"tee": "#!/bin/bash\nexit 1\n"}),
+        ("update fails", {"APT_RC": "1"}),
+        ("candidate below floor", {"APT_CANDIDATE": "8.0~rc1-1rl1"}),
+    ):
+        case = tmp_path / name.replace(" ", "-")
+        case.mkdir()
+        env = _stage(case)
+        env["FALKORDB_APT_KEYRING"] = str(case / "keyrings" / "redis.gpg")
+        for key, value in extra.items():
+            if key == "tee":
+                stub = Path(env["PATH"].split(":")[0]) / "tee"
+                stub.write_text(value)
+                stub.chmod(0o755)
+            else:
+                env[key] = value
+        result = _run("falkordb_redis_install", env)
+        assert result.returncode == 0, (name, result.stderr)
+        assert not Path(env["FALKORDB_APT_LIST"]).exists(), name
+        assert not (case / "keyrings").exists(), (name, result.stdout)
+        assert "apt-get install" not in _apt_log(env), name
+
+
+def test_a_failed_install_keeps_the_source_it_may_have_installed_from(tmp_path):
+    """Once install has run, a package from the source may be on the box in
+    some state; removing the source would cut it off from updates."""
+    env = _stage(tmp_path)
+    env["APT_INSTALL_RC"] = "100"
+    result = _run("falkordb_redis_install", env)
+
+    assert result.returncode == 0, result.stderr
+    assert "install failed" in result.stdout
+    assert Path(env["FALKORDB_APT_LIST"]).exists()
+
+
+@pytest.mark.parametrize(
+    ("candidate", "installs"),
+    (
+        ("6:8.0.4-1rl1~noble1", True),
+        ("8.0.0", True),
+        ("10.0.0-1", True),
+        ("8.0~rc1-1rl1", False),  # a prerelease sorts BELOW 8.0.0
+        ("6:8.0~rc1-1rl1", False),
+        ("5:7.0.15-1build2", False),  # an epoch must not lift 7.x over the floor
+        ("(none)", False),  # no candidate at all
+    ),
+)
+def test_the_floor_compares_the_whole_version(tmp_path, candidate, installs):
+    env = _stage(tmp_path)
+    Path(env["FALKORDB_APT_LIST"]).write_text(
+        "deb [signed-by=x] https://packages.redis.io/deb noble main\n"
+    )
+    env["APT_CANDIDATE"] = candidate
+    result = _run("falkordb_redis_install", env)
+
+    assert result.returncode == 0, result.stderr
+    assert ("apt-get install" in _apt_log(env)) == installs, result.stdout
 
 
 def test_a_later_run_with_a_stale_index_still_refuses_the_install(tmp_path):

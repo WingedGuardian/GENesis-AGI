@@ -14,11 +14,12 @@ from pathlib import Path
 import pytest
 
 from genesis.awareness import loop as _loop
-from genesis.infra_profile.collectors import CONTAINER_COLLECTORS, falkordb_facts
+from genesis.infra_profile.collectors import CONTAINER_COLLECTORS, _probe, falkordb_facts
 from genesis.infra_profile.collectors.falkordb_facts import (
     _installed_versions,
     collect_falkordb,
 )
+from tests.test_infra_profile._unix_socket import bind_unix_socket
 
 
 def _run(monkeypatch, home: Path):
@@ -74,6 +75,31 @@ def test_the_posture_rule_reads_the_keys_this_collector_emits(monkeypatch, tmp_p
     assert "falkordb_socket_missing" in _loop._infra_missing_protections(
         {"sections": {"falkordb": section}}
     )
+
+
+def test_only_a_unix_socket_counts_as_the_socket(monkeypatch, tmp_path):
+    """A regular file or directory left at the socket path refuses every client
+    exactly as an absent socket does, so it must not silence the posture rule."""
+    sock = tmp_path / ".genesis" / "falkordb" / "falkordb.sock"
+    sock.parent.mkdir(parents=True)
+    sock.write_text("")
+    assert _run(monkeypatch, tmp_path).metrics["socket_present"] is False
+    sock.unlink()
+    sock.mkdir()
+    assert _run(monkeypatch, tmp_path).metrics["socket_present"] is False
+    sock.rmdir()
+    bind_unix_socket(sock)
+    assert _run(monkeypatch, tmp_path).metrics["socket_present"] is True
+
+
+def test_only_a_unix_socket_counts_as_a_user_bus(monkeypatch, tmp_path):
+    """Same rule for the bus probe: a stray file named `bus` is no user manager."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    (tmp_path / "bus").write_text("")
+    assert _probe.user_bus_present() is False
+    (tmp_path / "bus").unlink()
+    bind_unix_socket(tmp_path / "bus")
+    assert _probe.user_bus_present() is True
 
 
 def test_a_version_dir_without_a_module_is_not_installed(tmp_path):
@@ -168,7 +194,7 @@ def _with_unit(
     runtime_dir = home / "run"
     runtime_dir.mkdir(parents=True, exist_ok=True)
     if bus:
-        (runtime_dir / "bus").touch()
+        bind_unix_socket(runtime_dir / "bus")
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
 
     async def _spawn(*_a, **_k):

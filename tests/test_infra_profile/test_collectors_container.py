@@ -24,6 +24,7 @@ from genesis.infra_profile.collectors.container import (
     collect_systemd,
 )
 from genesis.infra_profile.types import STATUS_OK
+from tests.test_infra_profile._unix_socket import bind_unix_socket
 
 
 @pytest.fixture
@@ -710,7 +711,7 @@ def _stub_cmd(monkeypatch, proc, *, present=True, bus=True, tmp_path=None):
     runtime_dir = (tmp_path or Path(tempfile.mkdtemp())) / "run"
     runtime_dir.mkdir(parents=True, exist_ok=True)
     if bus:
-        (runtime_dir / "bus").touch()
+        bind_unix_socket(runtime_dir / "bus")
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
     return proc
 

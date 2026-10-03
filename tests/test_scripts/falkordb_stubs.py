@@ -10,6 +10,7 @@ pointed at a local ``file://`` tree, so no test reaches the network.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -26,8 +27,11 @@ _SUDO_STUB = """#!/bin/bash
 if [ "$1" = "-n" ] && [ "$2" = "true" ]; then exit "${SUDO_N_RC:-0}"; fi
 exec "$@"
 """
-# dpkg -s <pkg> rc: 0 = installed, 1 = not.
+# dpkg -s <pkg> rc: 0 = installed, 1 = not. Version arithmetic is delegated
+# to the REAL dpkg: the floor check is only as good as dpkg's ordering, so a
+# stub that answered it would test nothing.
 _DPKG_STUB = """#!/bin/bash
+case "$1" in --compare-versions|--validate-version) exec /usr/bin/dpkg "$@" ;; esac
 if [ "$1" = "-s" ]; then exit "${DPKG_S_RC:-1}"; fi
 exit 0
 """
@@ -49,9 +53,13 @@ exit 0
 """
 _APT_STUB = """#!/bin/bash
 echo "apt-get $*" >> "$APT_LOG"
-if [ "$1" = "install" ] && [ "${APT_RC:-0}" = "0" ]; then
-    mkdir -p "$FALKORDB_DPKG_INFO"
-    printf 'pkg-files\n' > "$FALKORDB_DPKG_INFO/redis-server.list"
+if [ "$1" = "install" ]; then
+    rc="${APT_INSTALL_RC:-${APT_RC:-0}}"
+    if [ "$rc" = "0" ]; then
+        mkdir -p "$FALKORDB_DPKG_INFO"
+        printf 'pkg-files\n' > "$FALKORDB_DPKG_INFO/redis-server.list"
+    fi
+    exit "$rc"
 fi
 exit "${APT_RC:-0}"
 """
@@ -130,6 +138,9 @@ def _stage(tmp_path: Path) -> dict:
         # same way an operator has to. The consent tests below override this.
         "GENESIS_FALKORDB_PROVISION": "1",
         "FALKORDB_LOCAL_CONFIG": str(tmp_path / "genesis.yaml"),
+        # The lib reads that config with the venv's Python; under test that is
+        # the interpreter running the suite, which has PyYAML.
+        "FALKORDB_PYTHON": sys.executable,
     }
 
 

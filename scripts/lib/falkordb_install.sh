@@ -56,51 +56,44 @@ FALKORDB_PROVISION_OPT_IN="${GENESIS_FALKORDB_PROVISION:-}"
 FALKORDB_PROVISION_DISABLED="${GENESIS_FALKORDB_PROVISION_DISABLED:-}"
 FALKORDB_LOCAL_CONFIG="${FALKORDB_LOCAL_CONFIG:-$HOME/.genesis/config/genesis.yaml}"
 
-# _falkordb_opted_in — env first, then `provision: true` as a DIRECT child of
-# a TOP-LEVEL `graph_engine:` in the local config. Deliberately a narrow grep
-# rather than a YAML parse (no parser in a shell fragment), and the fail
-# direction is right: anything it cannot read plainly reads as "no". The KEY
-# PATH is exact on purpose — `graph_engine:` at column 0, `provision:` at the
-# first child's indent — because this gate authorises a system change and a
-# nested `provision:` for something else must never stand in for it.
+# The venv's interpreter, which bootstrap creates before this step runs. The
+# lib's own path locates it, because install locations vary.
+FALKORDB_PYTHON="${FALKORDB_PYTHON:-$(dirname "${BASH_SOURCE[0]}")/../../.venv/bin/python}"
+
+# _falkordb_opted_in — env first, then graph_engine.provision in the local
+# config, read the way Genesis reads that file (yaml.safe_load, as env.py
+# does) so the gate can never disagree with the loader. Consent is a YAML
+# boolean true and nothing else; under the YAML 1.1 rules safe_load applies
+# that includes `yes` and `on` in any of their three cases. A missing key, a
+# string, a non-mapping, a parse error, or no venv to parse with all read as
+# "no" — and the last two say so.
 _falkordb_opted_in() {
+    local rc
     [ "$FALKORDB_PROVISION_OPT_IN" = "1" ] && return 0
     [ -r "$FALKORDB_LOCAL_CONFIG" ] || return 1
-    awk '
-        function indent_of(line) { match(line, /^[ \t]*/); return RLENGTH }
-        # A REPEATED top-level mapping restarts consent too: PyYAML keeps the
-        # LAST duplicate `graph_engine:` block, so a true from an earlier block
-        # must not survive into a file whose effective mapping says otherwise.
-        /^graph_engine[[:space:]]*:/ { in_block = 1; child_indent = -1; found = 0; next }
-        # Any other column-0 key closes the block; graph_engine is top-level,
-        # so the parent indent is always 0 and needs no tracking.
-        /^[^[:space:]#]/ { in_block = 0 }
-        # Skipped BEFORE the indent is captured: a comment must never define
-        # what "direct child" means, or `# provision: true` would set the depth
-        # that a deeper real key then matches.
-        in_block && /^[[:space:]]*($|#)/ { next }
-        in_block {
-            ci = indent_of($0)
-            if (child_indent < 0) child_indent = ci
-            # Match the provision KEY first, then judge its value: a duplicate
-            # key is legal YAML and PyYAML keeps the LAST one, so `true` then
-            # `false` is a withdrawal, not consent. found is overwritten on
-            # every provision line, never OR-accumulated.
-            if (ci == child_indent &&
-                $0 ~ /^[[:space:]]*provision[[:space:]]*:/) {
-                # A trailing comment is still consent -- an operator who
-                # annotates their own config has not withdrawn it. The
-                # SPACE before `#` is required, not decoration. YAML only
-                # starts a comment after a space, so `true#x` is the STRING
-                # "true#x" and must not read as consent; and a TAB there makes
-                # the whole file unparseable to PyYAML (measured), so matching
-                # space-only leaves that case an under-read rather than
-                # granting consent off a config Genesis itself cannot load.
-                found = ($0 ~ /^[[:space:]]*provision[[:space:]]*:[[:space:]]*(true|yes|on)( +#.*)?[[:space:]]*$/)
-            }
-        }
-        END { exit(found ? 0 : 1) }
-    ' "$FALKORDB_LOCAL_CONFIG" 2>/dev/null
+    if [ ! -x "$FALKORDB_PYTHON" ]; then
+        echo "  NOTE: no venv Python at $FALKORDB_PYTHON to read $FALKORDB_LOCAL_CONFIG —"
+        echo "        graph_engine.provision is treated as not set."
+        return 1
+    fi
+    rc=0
+    "$FALKORDB_PYTHON" - "$FALKORDB_LOCAL_CONFIG" <<'PY' 2>/dev/null || rc=$?
+import sys
+try:
+    import yaml
+    with open(sys.argv[1]) as fh:
+        cfg = yaml.safe_load(fh)
+except Exception:
+    sys.exit(2)
+section = cfg.get("graph_engine") if isinstance(cfg, dict) else None
+value = section.get("provision") if isinstance(section, dict) else None
+sys.exit(0 if isinstance(value, bool) and value else 1)
+PY
+    if [ "$rc" -eq 2 ]; then
+        echo "  NOTE: $FALKORDB_LOCAL_CONFIG could not be parsed as YAML —"
+        echo "        graph_engine.provision is treated as not set."
+    fi
+    [ "$rc" -eq 0 ]
 }
 # Provenance, in two pieces. The COMPLETION marker says the stand-down
 # verified; the INSTALL claim is a stamp line appended to the apt list file
@@ -348,6 +341,25 @@ falkordb_module_install() {
     return 0
 }
 
+# _falkordb_meets_floor <upstream-version> — rc 0 only for a valid Debian
+# version at or above the floor. dpkg does the ordering, so a prerelease such
+# as `8.0~rc1` sorts below 8.0.0. Validation comes first because dpkg compares
+# a malformed version (apt's `(none)`) as GREATER than any valid one.
+_falkordb_meets_floor() {
+    dpkg --validate-version "$1" >/dev/null 2>&1 \
+        && dpkg --compare-versions "$1" ge "$FALKORDB_MIN_REDIS" 2>/dev/null
+}
+
+# _falkordb_repo_undo — remove what the repo-add block wrote. Called only from
+# that block's clean-slate path (or right after it), so the list and keyring
+# are this run's; the directory goes only if this run created it.
+_falkordb_repo_undo() {
+    sudo rm -f "$FALKORDB_APT_LIST" "$FALKORDB_APT_KEYRING" 2>/dev/null || true
+    if [ "${_falkordb_made_keydir:-0}" = "1" ]; then
+        sudo rmdir "$(dirname "$FALKORDB_APT_KEYRING")" 2>/dev/null || true
+    fi
+}
+
 # falkordb_redis_install — provide a redis-server new enough to load the module.
 #
 # Ubuntu/Debian stable ship 7.x, below the module's hard 8.0.0 floor, so this
@@ -360,7 +372,7 @@ falkordb_module_install() {
 # next unrelated `apt upgrade`, which is a worse thing to do to someone's
 # machine than declining to provision.
 falkordb_redis_install() {
-    local codename rc keytmp stamp
+    local codename rc keytmp stamp added_repo
     if ! _falkordb_opted_in; then
         echo "  Skipped: graph-engine server not provisioned (opt-in)."
         echo "           It adds the upstream redis apt repo and installs redis-server >= $FALKORDB_MIN_REDIS."
@@ -468,12 +480,22 @@ falkordb_redis_install() {
         return 0
     fi
 
+    # The repo is added only onto a clean slate — no list AND no keyring at our
+    # paths — so everything this block writes is this run's, and every failure
+    # before an install has been attempted removes it again (_falkordb_repo_undo):
+    # the machine is left as it was found. A keyring already there belongs to
+    # someone else and is neither overwritten nor removed.
+    added_repo=0
     if [ ! -f "$FALKORDB_APT_LIST" ]; then
+        if [ -e "$FALKORDB_APT_KEYRING" ]; then
+            echo "  Skipped: $FALKORDB_APT_KEYRING already exists and is not ours —"
+            echo "           leaving it and the apt sources alone. See SETUP.md to add the repo by hand."
+            return 0
+        fi
         if ! command -v curl >/dev/null 2>&1 || ! command -v gpg >/dev/null 2>&1; then
             echo "  Skipped: curl and gpg are both required to add the redis apt repo."
             return 0
         fi
-        sudo mkdir -p "$(dirname "$FALKORDB_APT_KEYRING")" 2>/dev/null || true
         # Deliberately NOT `curl | gpg`: after a pipeline `$?` is the LAST
         # component's status, so a failed download followed by a "successful"
         # dearmor of nothing would install an empty keyring and report success.
@@ -490,40 +512,49 @@ falkordb_redis_install() {
             echo "  WARNING: could not download the redis signing key (rc=$rc) — repo NOT added."
             return 0
         fi
+        # The first system change. Recorded so the undo removes the directory
+        # only when this run created it.
+        _falkordb_made_keydir=0
+        if [ ! -d "$(dirname "$FALKORDB_APT_KEYRING")" ]; then
+            sudo mkdir -p "$(dirname "$FALKORDB_APT_KEYRING")" 2>/dev/null && _falkordb_made_keydir=1
+        fi
         rc=0
         sudo gpg --yes --dearmor -o "$FALKORDB_APT_KEYRING" "$keytmp" 2>/dev/null || rc=$?
         rm -f "$keytmp" 2>/dev/null || true
         if [ "$rc" -ne 0 ]; then
+            _falkordb_repo_undo
             echo "  WARNING: could not install the redis signing key (rc=$rc) — repo NOT added."
             return 0
         fi
-        printf 'deb [signed-by=%s] %s %s main\n' \
-            "$FALKORDB_APT_KEYRING" "$FALKORDB_REPO_URL" "$codename" \
-            | sudo tee "$FALKORDB_APT_LIST" >/dev/null 2>&1 || {
-                echo "  WARNING: could not write $FALKORDB_APT_LIST — repo NOT added."
-                return 0
-            }
+        rc=0
+        printf 'deb [signed-by=%s] %s %s main\n' "$FALKORDB_APT_KEYRING" "$FALKORDB_REPO_URL" "$codename" \
+            | sudo tee "$FALKORDB_APT_LIST" >/dev/null 2>&1 || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            _falkordb_repo_undo
+            echo "  WARNING: could not write $FALKORDB_APT_LIST — repo NOT added."
+            return 0
+        fi
         echo "  Added: redis apt repo ($codename)"
         rc=0
         sudo apt-get update -qq >/dev/null 2>&1 || rc=$?
         if [ "$rc" -ne 0 ]; then
             # A source that cannot update is worse than no source: apt consults
-            # every list on EVERY operation, so a broken suite we leave behind
-            # fails the operator's unrelated apt runs too. Remove only what
-            # this run created — both were written above, unconditionally.
-            sudo rm -f "$FALKORDB_APT_LIST" "$FALKORDB_APT_KEYRING" 2>/dev/null || true
+            # every list on EVERY operation. And STOP here — a cached candidate
+            # may still look installable, but installing would leave a package
+            # whose source was just removed.
+            _falkordb_repo_undo
             echo "  WARNING: apt-get update failed (rc=$rc) — removed the redis apt"
-            echo "           source this run added so it cannot break later apt runs."
+            echo "           source this run added; nothing installed."
+            return 0
         fi
+        added_repo=1
     fi
 
     # The candidate is verified immediately before EVERY install, not just when
-    # this run added the repo: a failed `apt-get update` above — or a re-run
-    # where the list file already exists and no update ran at all — leaves a
-    # stale index whose only offer is the distro's 7.x, which the module
-    # refuses to load on. Installing it anyway would put a database daemon on
-    # the box that cannot run the engine it was installed for.
-    local candidate major
+    # this run added the repo: a re-run where the list file already exists runs
+    # no update at all, and a stale index's only offer is the distro's 7.x,
+    # which the module refuses to load on.
+    local candidate
     rc=0
     # `|| rc=$?`: a bare assignment carries the pipeline's status, and this lib
     # is sourced under `set -euo pipefail` — an apt-cache failure would abort
@@ -531,21 +562,28 @@ falkordb_redis_install() {
     candidate="$(apt-cache policy redis-server 2>/dev/null \
         | awk '/Candidate:/ {print $2}')" || rc=$?
     if [ "$rc" -ne 0 ]; then
+        [ "$added_repo" -eq 0 ] || _falkordb_repo_undo
         echo "  Skipped: could not ask apt which redis-server it would install (rc=$rc)."
         echo "           The graph engine needs >= $FALKORDB_MIN_REDIS; unverifiable means not installed."
         return 0
     fi
-    major="${candidate#*:}"   # strip any epoch
-    major="${major%%.*}"
-    case "$major" in
-        ''|*[!0-9]*|[0-7])
-            echo "  Skipped: apt would install redis-server '${candidate:-unknown}', below the"
-            echo "           $FALKORDB_MIN_REDIS floor the module enforces. Re-run after"
-            echo "           'sudo apt-get update' succeeds."
-            return 0
-            ;;
-    esac
+    # The epoch is stripped: it is packaging, not the redis version, and would
+    # lift a `5:7.0.15` over a floor that has none.
+    if ! _falkordb_meets_floor "${candidate#*:}"; then
+        echo "  Skipped: apt would install redis-server '${candidate:-unknown}', below the"
+        echo "           $FALKORDB_MIN_REDIS floor the module enforces — nothing installed."
+        if [ "$added_repo" -eq 1 ]; then
+            _falkordb_repo_undo
+            echo "           Removed the redis apt source this run added."
+        else
+            echo "           Re-run after 'sudo apt-get update' succeeds."
+        fi
+        return 0
+    fi
 
+    # From here on the source stays even if the install fails: a package from
+    # it may now be on the box in some state, and removing the source would cut
+    # that package off from its updates.
     rc=0
     sudo apt-get install -y -qq redis-server >/dev/null 2>&1 || rc=$?
     if [ "$rc" -ne 0 ]; then

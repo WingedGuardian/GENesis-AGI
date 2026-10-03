@@ -9,7 +9,10 @@
     # or, persistently, graph_engine.provision: true in ~/.genesis/config/genesis.yaml
     ```
 
-  Without that, bootstrap prints one line saying how to enable it and moves on.
+  The config value is read the way Genesis reads the rest of that file, so
+  any YAML true (`true`, `True`, `yes`) consents, while a quoted `"true"` or
+  a file that does not parse does not. Without consent, bootstrap prints one
+  line saying how to enable it and moves on.
   `GENESIS_FALKORDB_PROVISION_DISABLED=1` turns the whole thing off. The engine
   module itself (one file under `~/.genesis/deps`, no system change) is fetched
   either way, so arming the engine later is a single command.
@@ -33,7 +36,9 @@
   adding the repo would upgrade your Redis on your next unrelated `apt upgrade`,
   which is not ours to do; you get printed instructions instead. No passwordless
   sudo, an unsupported architecture, an unrecognised distro, or a failed download
-  each skip with a note and let bootstrap continue. The module is verified
+  each skip with a note and let bootstrap continue. A run that fails before
+  installing removes the apt source and signing key it added, and a signing
+  key already at that path is never overwritten or removed. The module is verified
   against a pinned digest, because upstream publishes no checksums of its own,
   and re-verified on every run; it is installed first, so a module that does not
   verify leaves no apt repo or daemon behind. The armed service can write only

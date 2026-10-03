@@ -146,7 +146,9 @@ async def collect_falkordb() -> SectionResult:
         deps_root, data_dir, unit_path = _paths()
         versions = await asyncio.to_thread(_installed_versions, deps_root)
         socket_path = data_dir / "falkordb.sock"
-        socket_present = await asyncio.to_thread(socket_path.exists)
+        # The file TYPE, not mere presence: a regular file or directory left at
+        # this path refuses every client exactly as an absent socket does.
+        socket_present = await asyncio.to_thread(socket_path.is_socket)
         unit_present = await asyncio.to_thread(unit_path.is_file)
 
         active, enabled = await _unit_states() if unit_present else (None, None)
