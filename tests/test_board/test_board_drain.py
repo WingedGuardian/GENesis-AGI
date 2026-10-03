@@ -104,6 +104,21 @@ async def test_human_approved_board_row_posts_and_links(db, monkeypatch):
     assert (await ar.get_by_id(db, out["request_id"]))["consumed_at"] is not None
 
 
+async def test_on_the_servers_shared_connection_the_link_is_still_written(db, monkeypatch):
+    """Production hands the drain the server's SerializedConnection, which the
+    board writers refuse; the link and its event must go through a connection
+    the drain owns, on the same file, and land."""
+    from genesis.db.connection import SerializedConnection
+
+    monkeypatch.setattr(ciw, "_run_gh", FakeGh())
+    shared = SerializedConnection(db)
+    await _promote(shared)
+    assert await ciw.drain_pending_issue_posts(_RT(shared)) == 1
+    link = await board_crud.get_link_by_source(db, source_kind="follow_up", source_id=FOLLOW)
+    assert link is not None and link["issue_number"] == 77
+    assert (await board_crud.list_events(db, event="promotion"))["total"] == 1
+
+
 @pytest.mark.parametrize("resolver", ["genesis:contributor-worklog", "system", None, "mystery-bot"])
 async def test_non_human_resolver_is_refused_never_posted(db, monkeypatch, resolver):
     gh = FakeGh()

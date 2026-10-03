@@ -5,7 +5,8 @@
 # settings_update("board", {...}) or a hand edit takes effect at the next
 # reconcile tick or promotion (no restart).
 #
-# Master switch: false forces `off` everywhere.
+# Master switch: false forces `off` everywhere. settings_update may set it
+# false but never true: re-enabling is an owner edit of the overlay.
 enabled: true
 
 # Mode: off | propose_only | live

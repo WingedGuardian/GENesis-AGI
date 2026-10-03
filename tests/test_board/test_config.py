@@ -132,6 +132,13 @@ def test_validator_rejects_live_so_no_session_can_arm_writes():
     assert errors and "board.local.yaml" in errors[0]
 
 
+def test_validator_rejects_enabled_true_so_no_session_re_arms_a_paused_board():
+    """An owner can pause a `mode: live` overlay with `enabled: false`; a session
+    re-enabling it would re-arm the writes. A session may only turn it down."""
+    errors = _validate_board({"enabled": True})
+    assert errors and "board.local.yaml" in errors[0]
+
+
 def test_owner_overlay_still_arms_live(config_dirs):
     """Rejecting `live` in the validator must not make it unreachable: the
     owner's overlay edit is the sanctioned route and still takes effect."""

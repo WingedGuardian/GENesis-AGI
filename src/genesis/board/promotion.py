@@ -173,13 +173,14 @@ async def propose(
 
     blocking = await board_crud.blocking_questions(db, target_kind=kind, target_id=source_id)
     if blocking:
-        await board_crud.append_event(
-            db,
-            event="promotion_refused",
-            now=now or datetime.now(UTC).isoformat(),
-            reason="blocked by open question(s)",
-            detail={"source": source_ref, "questions": [q["id"] for q in blocking]},
-        )
+        async with board_crud.owned_connection(db) as own:
+            await board_crud.append_event(
+                own,
+                event="promotion_refused",
+                now=now or datetime.now(UTC).isoformat(),
+                reason="blocked by open question(s)",
+                detail={"source": source_ref, "questions": [q["id"] for q in blocking]},
+            )
         return {
             "status": "refused",
             "reason": "an unverified open question blocks this record; resolve it first",
@@ -220,13 +221,14 @@ async def propose(
     scan = scan_prose(scan_input)
     if not scan.ok:
         refusal = _scan_refusal(scan)
-        await board_crud.append_event(
-            db,
-            event="promotion_refused",
-            now=now or datetime.now(UTC).isoformat(),
-            reason="privacy scan",
-            detail={"source": source_ref, "findings": refusal["findings"]},
-        )
+        async with board_crud.owned_connection(db) as own:
+            await board_crud.append_event(
+                own,
+                event="promotion_refused",
+                now=now or datetime.now(UTC).isoformat(),
+                reason="privacy scan",
+                detail={"source": source_ref, "findings": refusal["findings"]},
+            )
         return refusal
 
     owner, name = github_user(), github_public_repo()

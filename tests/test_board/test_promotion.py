@@ -113,6 +113,17 @@ async def test_an_open_question_block_refuses_promotion_then_releases(db):
     assert (await _propose(db))["status"] == "held"
 
 
+async def test_a_refusal_on_the_servers_shared_connection_is_still_logged(db):
+    """board_promote runs on the server's SerializedConnection, which the board
+    writers refuse; the refusal event goes through an owned connection."""
+    from genesis.db.connection import SerializedConnection
+
+    await board_crud.raise_question(db, question="which?", now=NOW, blocks=[("follow_up", FOLLOW)])
+    out = await _propose(SerializedConnection(db))
+    assert out["status"] == "refused"
+    assert (await board_crud.list_events(db, event="promotion_refused"))["total"] == 1
+
+
 async def test_duplicates_are_refused(db):
     assert (await _propose(db))["status"] == "held"
     again = await _propose(db, title="Different title")

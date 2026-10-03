@@ -310,5 +310,7 @@ what, and the morning report counts unverified questions so a parked one is
 never invisible. Close with
 `open_question_resolve` and say what settled it — an assumption is not an
 answer. Resolving, and removing a block, are the OWNER's call: a dispatched
-session is refused both, so it parks the question and leaves it. The store is
+session is refused both, so it parks the question and leaves it. Background
+sessions attach blocks when they raise (`blocks=`); `open_question_block` as a
+whole is withheld from them, because the same tool also removes blocks. The store is
 LOCAL ONLY; nothing here reaches GitHub.

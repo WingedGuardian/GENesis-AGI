@@ -117,6 +117,7 @@ def effective_mode() -> str:
     return mode
 
 
+# GROUNDWORK(board-reconciler): the predicate every GitHub writer will check.
 def writes_allowed() -> bool:
     """True only in ``live`` — the single predicate a GitHub writer checks."""
     return effective_mode() == "live"

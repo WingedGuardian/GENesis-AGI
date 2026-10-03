@@ -20,8 +20,10 @@ Conventions shared with the other CRUD modules:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
+import sqlite3
 import uuid
 from datetime import datetime, timedelta
 
@@ -184,30 +186,32 @@ async def record_link(
         raise ValueError("now is required")
 
     link_id = uuid.uuid4().hex
-    await db.execute(
-        "INSERT INTO board_links (id, source_kind, source_id, repo, issue_number, "
-        "project_item_id, adopted, promoted_by, approval_id, scan_receipt, body_sha256, "
-        "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT DO NOTHING",
-        (
-            link_id,
-            source_kind,
-            source_id,
-            repo,
-            issue_number,
-            project_item_id,
-            1 if adopted else 0,
-            promoted_by,
-            approval_id,
-            json.dumps(scan_receipt, sort_keys=True),
-            body_sha256,
-            now,
-            now,
-        ),
-    )
-    await db.commit()
-    by_source = await get_link_by_source(db, source_kind=source_kind, source_id=source_id)
-    by_issue = await get_link_by_issue(db, repo=repo, issue_number=issue_number)
+    async with _write_unit(db, "record_link"):
+        await db.execute(
+            "INSERT INTO board_links (id, source_kind, source_id, repo, issue_number, "
+            "project_item_id, adopted, promoted_by, approval_id, scan_receipt, body_sha256, "
+            "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT DO NOTHING",
+            (
+                link_id,
+                source_kind,
+                source_id,
+                repo,
+                issue_number,
+                project_item_id,
+                1 if adopted else 0,
+                promoted_by,
+                approval_id,
+                json.dumps(scan_receipt, sort_keys=True),
+                body_sha256,
+                now,
+                now,
+            ),
+        )
+        by_source = await get_link_by_source(db, source_kind=source_kind, source_id=source_id)
+        by_issue = await get_link_by_issue(db, repo=repo, issue_number=issue_number)
+    if by_source is None and by_issue is None:
+        raise RuntimeError(f"board link {source_kind}:{source_id} did not persist")
     if by_source is None or by_issue is None or by_source["id"] != by_issue["id"]:
         held = by_source or by_issue
         raise ValueError(
@@ -249,24 +253,125 @@ async def get_link_by_issue(
     return _link_row(await _one(cur))
 
 
+# GROUNDWORK(board-reconciler): the reconciler records the card once it adds the
+# issue to the project (the board PR after promotion).
 async def set_project_item(
     db: aiosqlite.Connection, *, link_id: str, project_item_id: str, now: str
 ) -> bool:
     """Record the project item once the issue has been added to the board."""
-    cur = await db.execute(
-        "UPDATE board_links SET project_item_id = ?, updated_at = ? WHERE id = ?",
-        (project_item_id, now, link_id),
-    )
-    await db.commit()
+    async with _write_unit(db, "set_project_item"):
+        cur = await db.execute(
+            "UPDATE board_links SET project_item_id = ?, updated_at = ? WHERE id = ?",
+            (project_item_id, now, link_id),
+        )
     return cur.rowcount == 1
 
 
+# GROUNDWORK(board-reconciler): coverage numerator for the board status read.
 async def count_links(db: aiosqlite.Connection) -> int:
     cur = await db.execute("SELECT COUNT(*) FROM board_links")
     return (await cur.fetchone())[0]
 
 
 # ─── open questions ─────────────────────────────────────────────────────────
+
+
+class WriteBusy(Exception):
+    """The write lock was lost on every attempt; NOTHING was written."""
+
+
+async def _begin_immediate(db: aiosqlite.Connection, what: str) -> None:
+    """Take the write lock before writing anything, retrying a lost lock race on
+    the shared connection's schedule. This is the ONLY retried step: until it
+    succeeds nothing has been written, so a retry can never repeat a write."""
+    import asyncio
+    import random
+
+    from genesis.db.connection import (
+        _JITTER_HIGH,
+        _JITTER_LOW,
+        _WRITE_RETRY_DELAYS,
+        SerializedConnection,
+        _is_lock_error,
+    )
+
+    if isinstance(db, SerializedConnection):
+        raise TypeError(f"{what} needs a connection it owns (get_raw_db), not the shared one")
+    if db.in_transaction:
+        raise ValueError(f"{what} needs an idle connection; commit or roll back first")
+    for delay in (*_WRITE_RETRY_DELAYS, None):
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            return
+        except sqlite3.OperationalError as exc:
+            if not _is_lock_error(exc):
+                raise
+            if delay is None:
+                raise WriteBusy(str(exc)) from exc
+            await asyncio.sleep(delay * random.uniform(_JITTER_LOW, _JITTER_HIGH))
+
+
+async def _commit(db: aiosqlite.Connection) -> None:
+    """Commit. A LOCK error that leaves the connection OUT of its transaction
+    is treated as committed: ``db/connection.py`` (``_retry_locked``) documents
+    such a case (WAL's post-commit autocheckpoint losing the race after the
+    frame is durable); whether SQLite can report it is not measured here, so
+    this is a defensive reading. It is safe either way: a lock error that
+    leaves no transaction open cannot mean the write was rolled back. Any other
+    failure leaves the transaction open, and the caller rolls it back."""
+    from genesis.db.connection import _is_lock_error
+
+    try:
+        await db.commit()
+    except sqlite3.OperationalError as exc:
+        if _is_lock_error(exc) and not db.in_transaction:
+            return
+        raise
+
+
+@contextlib.asynccontextmanager
+async def owned_connection(db: aiosqlite.Connection):
+    """A fresh connection the caller owns, on the SAME database file as ``db``
+    (read from ``db``'s own ``PRAGMA database_list``, so it can never open a
+    different database than the one the caller validated against). The board
+    writers need it: they refuse the server's shared connection (see
+    :func:`_write_unit`). An in-memory database has no file to share, so it is
+    refused."""
+    from genesis.db.connection import get_raw_db
+
+    cur = await db.execute("PRAGMA database_list")
+    path = next((row[2] for row in await cur.fetchall() if row[1] == "main"), "")
+    if not path:
+        raise ValueError("an in-memory database has no file for a second connection")
+    async with get_raw_db(path) as own:
+        yield own
+
+
+@contextlib.asynccontextmanager
+async def _write_unit(db: aiosqlite.Connection, what: str):
+    """One board-store write (every writer in this module uses it) as ONE
+    transaction on a connection the caller
+    OWNS (``get_raw_db``), never the server's shared ``SerializedConnection``:
+    that one serialises single statements but not a unit of them, and the
+    health MCP middleware rolls it back after any failed tool call, so another
+    call's commit or rollback could land between this unit's statements, split
+    a question from its blocks, or discard a write already reported saved. The
+    shared connection is refused outright. All or nothing: any exception in the
+    body (CancelledError included) rolls back; only taking the lock is retried.
+
+    One window remains, and it is aiosqlite's, not this unit's: a cancellation
+    that lands while COMMIT is queued cancels only the WAIT, so the write is
+    saved while the caller sees CancelledError (measured, aiosqlite 0.22.1).
+    A raise has no idempotency key, so a caller that retries after a cancel
+    can raise the same question twice."""
+    await _begin_immediate(db, what)
+    try:
+        yield
+        await _commit(db)
+    except BaseException:
+        if db.in_transaction:
+            await db.rollback()
+        raise
 
 
 async def raise_question(
@@ -281,25 +386,8 @@ async def raise_question(
     """Record a new unverified question, and the ``(kind, target_id)`` edges it
     blocks, in ONE transaction; returns its id. Every target is validated before
     anything is written, so a question can never land with only some of its
-    blocks (which would under-block promotion).
-
-    ``db`` must be a connection the CALLER OWNS (``get_raw_db``), with no
-    transaction open (refused: the ``BEGIN`` would fail), never the server's shared
-    ``SerializedConnection``: that one serialises single
-    statements but holds no lock across several, so another call's
-    ``commit()`` or ``rollback()`` (the health MCP middleware rolls the shared
-    connection back after any failed tool) could land between this function's
-    inserts and save a question without its blocks, or discard one already
-    reported saved. The shared connection is refused outright rather than
-    trusted to be idle."""
-    from genesis.db.connection import SerializedConnection
-
-    if isinstance(db, SerializedConnection):
-        raise TypeError(
-            "raise_question needs a connection it owns (get_raw_db), not the shared one"
-        )
-    if db.in_transaction:
-        raise ValueError("raise_question needs an idle connection; commit or roll back first")
+    blocks (which would under-block promotion). ``db`` must be an idle
+    connection the caller owns (see :func:`_write_unit`)."""
     question = (question or "").strip()
     if not question:
         raise ValueError("question is required")
@@ -312,8 +400,7 @@ async def raise_question(
         raise ValueError(f"{len(blocks)} blocks in one raise; the limit is {MAX_BLOCKS}")
     edges = sorted({(kind, normalize_target(kind, tid)) for kind, tid in (blocks or [])})
     qid = uuid.uuid4().hex
-    await db.execute("BEGIN IMMEDIATE")
-    try:
+    async with _write_unit(db, "raise_question"):
         await db.execute(
             "INSERT INTO open_questions (id, question, context, status, raised_by, "
             "created_at, updated_at) VALUES (?,?,?,'unverified',?,?,?)",
@@ -325,12 +412,6 @@ async def raise_question(
                 "created_at) VALUES (?,?,?,?)",
                 (qid, kind, tid, now),
             )
-        await db.commit()
-    except BaseException:
-        # CancelledError included: it skips `except Exception`, and an owned
-        # transaction left open would hold the write lock until the close.
-        await db.rollback()
-        raise
     return qid
 
 
@@ -366,12 +447,12 @@ async def close_question(
     if not resolution:
         raise ValueError("resolution is required: say what settled it")
     _check_len("resolution", resolution, MAX_RESOLUTION_CHARS)
-    cur = await db.execute(
-        "UPDATE open_questions SET status = ?, resolution = ?, updated_at = ?, closed_at = ? "
-        "WHERE id = ? AND status = 'unverified'",
-        (status, resolution, now, now, question_id),
-    )
-    await db.commit()
+    async with _write_unit(db, "close_question"):
+        cur = await db.execute(
+            "UPDATE open_questions SET status = ?, resolution = ?, updated_at = ?, closed_at = ? "
+            "WHERE id = ? AND status = 'unverified'",
+            (status, resolution, now, now, question_id),
+        )
     return cur.rowcount == 1
 
 
@@ -396,13 +477,13 @@ async def add_block(
         raise ValueError(
             f"question {question_id} is {q['status']}; only an unverified question can block"
         )
-    cur = await db.execute(
-        "INSERT INTO open_question_blocks (question_id, target_kind, target_id, created_at) "
-        "SELECT ?,?,?,? WHERE EXISTS (SELECT 1 FROM open_questions "
-        "WHERE id = ? AND status = 'unverified') ON CONFLICT DO NOTHING",
-        (question_id, target_kind, target_id, now, question_id),
-    )
-    await db.commit()
+    async with _write_unit(db, "add_block"):
+        cur = await db.execute(
+            "INSERT INTO open_question_blocks (question_id, target_kind, target_id, created_at) "
+            "SELECT ?,?,?,? WHERE EXISTS (SELECT 1 FROM open_questions "
+            "WHERE id = ? AND status = 'unverified') ON CONFLICT DO NOTHING",
+            (question_id, target_kind, target_id, now, question_id),
+        )
     return cur.rowcount == 1
 
 
@@ -417,12 +498,13 @@ async def remove_block(
 
     guard_human_gate("open_question_unblock")
     target_id = normalize_target(target_kind, target_id)
-    cur = await db.execute(
-        "DELETE FROM open_question_blocks WHERE question_id = ? AND target_kind = ? AND target_id = ? "
-        "AND EXISTS (SELECT 1 FROM open_questions WHERE id = ? AND status = 'unverified')",
-        (question_id, target_kind, target_id, question_id),
-    )
-    await db.commit()
+    async with _write_unit(db, "remove_block"):
+        cur = await db.execute(
+            "DELETE FROM open_question_blocks WHERE question_id = ? AND target_kind = ? "
+            "AND target_id = ? "
+            "AND EXISTS (SELECT 1 FROM open_questions WHERE id = ? AND status = 'unverified')",
+            (question_id, target_kind, target_id, question_id),
+        )
     return cur.rowcount == 1
 
 
@@ -560,28 +642,30 @@ async def append_event(
             raise ValueError(
                 f"detail is {len(detail_json.encode())} bytes; the limit is {MAX_DETAIL_BYTES}"
             )
-    cur = await db.execute(
-        "INSERT INTO board_events (event, repo, issue_number, project_item_id, attempt, "
-        "worker, reason, observed_change_key, detail, created_at) VALUES (?,?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT (event, observed_change_key) WHERE observed_change_key IS NOT NULL "
-        "DO NOTHING",
-        (
-            event,
-            repo,
-            issue_number,
-            project_item_id,
-            attempt,
-            worker,
-            reason,
-            observed_change_key,
-            detail_json,
-            now,
-        ),
-    )
-    await db.commit()
+    async with _write_unit(db, "append_event"):
+        cur = await db.execute(
+            "INSERT INTO board_events (event, repo, issue_number, project_item_id, attempt, "
+            "worker, reason, observed_change_key, detail, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT (event, observed_change_key) WHERE observed_change_key IS NOT NULL "
+            "DO NOTHING",
+            (
+                event,
+                repo,
+                issue_number,
+                project_item_id,
+                attempt,
+                worker,
+                reason,
+                observed_change_key,
+                detail_json,
+                now,
+            ),
+        )
     return cur.lastrowid if cur.rowcount == 1 else None
 
 
+# GROUNDWORK(board-reconciler): the board status read lists events.
 async def list_events(
     db: aiosqlite.Connection,
     *,
@@ -641,13 +725,15 @@ async def prune(
     doomed = (
         "SELECT id FROM open_questions WHERE status IN ('resolved','dropped') AND closed_at < ?"
     )
-    cur = await db.execute(
-        f"DELETE FROM open_question_blocks WHERE question_id IN ({doomed})", (q_cutoff,)
-    )
-    blocks = cur.rowcount
-    cur = await db.execute(f"DELETE FROM open_questions WHERE id IN ({doomed})", (q_cutoff,))
-    questions = cur.rowcount
-    cur = await db.execute("DELETE FROM board_events WHERE created_at < ?", (e_cutoff,))
-    events = cur.rowcount
-    await db.commit()
+    async with _write_unit(db, "prune"):
+        cur = await db.execute(
+            f"DELETE FROM open_question_blocks WHERE question_id IN ({doomed})", (q_cutoff,)
+        )
+        blocks = cur.rowcount
+        cur = await db.execute(
+            f"DELETE FROM open_questions WHERE id IN ({doomed})", (q_cutoff,)
+        )
+        questions = cur.rowcount
+        cur = await db.execute("DELETE FROM board_events WHERE created_at < ?", (e_cutoff,))
+        events = cur.rowcount
     return {"questions": questions, "question_blocks": blocks, "events": events}

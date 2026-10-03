@@ -281,28 +281,38 @@ async def _link_board(
             except (TypeError, ValueError):
                 context = {}
         receipt = context.get("scan_receipt") or {"ok": True, "note": "receipt not recorded"}
-        link = await board_crud.record_link(
-            rt_db,
-            source_kind=kind,
-            source_id=source_id,
-            repo=row["repo"],
-            issue_number=issue_number,
-            promoted_by=(approval or {}).get("resolved_by") or "unknown",
-            scan_receipt=receipt,
-            body_sha256=hashlib.sha256(row["body"].encode()).hexdigest(),
-            now=now,
-            adopted=adopted,
-            approval_id=row["request_id"],
-        )
-        await board_crud.append_event(
-            rt_db,
-            event="promotion",
-            now=now,
-            repo=row["repo"],
-            issue_number=issue_number,
-            worker="genesis",
-            detail={"link_id": link["id"], "adopted": adopted},
-        )
+        # On a connection this drain owns: the board writers refuse the shared
+        # one, where another caller's commit or rollback could land mid-write.
+        async with board_crud.owned_connection(rt_db) as own:
+            link = await board_crud.record_link(
+                own,
+                source_kind=kind,
+                source_id=source_id,
+                repo=row["repo"],
+                issue_number=issue_number,
+                promoted_by=(approval or {}).get("resolved_by") or "unknown",
+                scan_receipt=receipt,
+                body_sha256=hashlib.sha256(row["body"].encode()).hexdigest(),
+                now=now,
+                adopted=adopted,
+                approval_id=row["request_id"],
+            )
+            try:
+                await board_crud.append_event(
+                    own,
+                    event="promotion",
+                    now=now,
+                    repo=row["repo"],
+                    issue_number=issue_number,
+                    worker="genesis",
+                    detail={"link_id": link["id"], "adopted": adopted},
+                )
+            except Exception:
+                # The pointer is written, which is what the re-link pass checks;
+                # the event is the audit line, so its loss is logged, not retried.
+                logger.error(
+                    "promotion event for linked row %s not recorded", row.get("id"), exc_info=True
+                )
         return True
     except Exception:
         logger.error(

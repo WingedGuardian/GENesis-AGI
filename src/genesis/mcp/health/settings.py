@@ -183,8 +183,10 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "promotions write, and is armed ONLY by an owner edit of "
             "~/.genesis/config/board.local.yaml (settings_update rejects it). "
             "Invalid mode degrades to propose_only. Kill "
-            "switch GENESIS_BOARD_DISABLED=1. Read live per call — takes effect "
-            "immediately, no restart."
+            "switch GENESIS_BOARD_DISABLED=1. A session may set enabled false or "
+            "mode off/propose_only, never live or enabled true (owner edits). "
+            "Read live per call by board promotion (board_promote and the drain), "
+            "so a change takes effect at the next promotion — no restart."
         ),
         config_filename="board.yaml",
         readonly=False,
@@ -1662,6 +1664,14 @@ def _validate_board(changes: dict) -> list[str]:
         elif key == "enabled":
             if not isinstance(value, bool):
                 errors.append("'enabled' must be a boolean")
+            elif value:
+                # Only an owner re-enables: `enabled: true` here would re-arm a
+                # `mode: live` overlay the owner paused with `enabled: false`.
+                errors.append(
+                    "'enabled: true' cannot be set through settings_update — "
+                    "re-enabling the board is an owner edit of "
+                    "~/.genesis/config/board.local.yaml"
+                )
         elif key in ("project_owner", "project_number"):
             # WHICH board the reconciler writes to is overlay-only, like `live`:
             # a session that could repoint it could send Genesis's card writes

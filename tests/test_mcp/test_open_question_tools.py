@@ -90,7 +90,8 @@ async def _shared_writes(db, call):
         out = await call()
     finally:
         db.execute, db.commit = real_execute, real_commit
-    return out, [s for s in seen if s == "COMMIT" or not s.lstrip().upper().startswith("SELECT")]
+    reads = ("SELECT", "PRAGMA DATABASE_LIST")  # the owned connection's file lookup
+    return out, [s for s in seen if s == "COMMIT" or not s.lstrip().upper().startswith(reads)]
 
 
 @pytest.mark.parametrize("op", ["raise", "resolve", "block_add", "block_remove"])
@@ -119,49 +120,32 @@ async def test_no_write_goes_through_the_shared_connection(db, op):
     assert writes == [], f"the shared connection carried writes: {writes}"
 
 
-async def test_a_lost_lock_race_is_retried_as_a_whole_unit(db, monkeypatch):
-    """A lock lost while opening the owned write is retried; the raise lands
-    exactly once."""
-    import contextlib
+async def test_a_failed_read_back_never_repeats_or_hides_the_write(db, monkeypatch):
+    """The read-back runs after the commit and is never retried: a failing read
+    reports the question saved-but-unread, and it is saved exactly once."""
     import sqlite3
 
-    from genesis.db import connection
+    from genesis.db.crud import board as board_crud
 
-    real = connection.get_raw_db
-    failures = {"left": 2}
+    async def locked_read(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
 
-    @contextlib.asynccontextmanager
-    async def flaky(path):
-        if failures["left"]:
-            failures["left"] -= 1
-            raise sqlite3.OperationalError("database is locked")
-        async with real(path) as conn:
-            yield conn
-
-    monkeypatch.setattr(connection, "get_raw_db", flaky)
-    monkeypatch.setattr(connection, "_WRITE_RETRY_DELAYS", (0, 0, 0))
+    monkeypatch.setattr(board_crud, "get_question", locked_read)
     out = await _raise(db, blocks=[f"follow_up:{FOLLOW}"])
-    assert out["status"] == "ok" and failures["left"] == 0
+    assert out["status"] == "ok" and out["question_id"] and "reading it back failed" in out["note"]
     assert await _count(db, "open_questions") == 1
     assert await _count(db, "open_question_blocks") == 1
 
 
-async def test_a_lock_lost_on_every_retry_is_reported_and_writes_nothing(db, monkeypatch):
-    import contextlib
-    import sqlite3
+async def test_a_lost_write_lock_is_reported_as_nothing_changed(db, monkeypatch):
+    from genesis.db.crud import board as board_crud
 
-    from genesis.db import connection
+    async def busy(*_a, **_k):
+        raise board_crud.WriteBusy("database is locked")
 
-    @contextlib.asynccontextmanager
-    async def always_locked(path):
-        raise sqlite3.OperationalError("database is locked")
-        yield  # pragma: no cover
-
-    monkeypatch.setattr(connection, "get_raw_db", always_locked)
-    monkeypatch.setattr(connection, "_WRITE_RETRY_DELAYS", (0, 0, 0))
+    monkeypatch.setattr(board_crud, "raise_question", busy)
     out = await _raise(db)
     assert out["status"] == "error" and "nothing was changed" in out["message"]
-    assert await _count(db, "open_questions") == 0
 
 
 @pytest.mark.parametrize(

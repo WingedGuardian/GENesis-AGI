@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import re
+import sqlite3
 
 import aiosqlite
 import pytest
@@ -100,6 +101,41 @@ async def _link(db, **over):
     )
     kw.update(over)
     return await board.record_link(db, **kw)
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        lambda c: _link(c),
+        lambda c: board.set_project_item(c, link_id="x", project_item_id="PVTI_1", now=NOW),
+        lambda c: board.append_event(c, event="drag", now=NOW),
+        lambda c: board.prune(c, now=NOW),
+        lambda c: board.raise_question(c, question="q", now=NOW),
+    ],
+    ids=["record_link", "set_project_item", "append_event", "prune", "raise_question"],
+)
+async def test_every_board_writer_refuses_the_shared_connection(db, write):
+    """The shared connection can have another call's commit or rollback land
+    between a write and its commit, so EVERY writer here needs a connection its
+    caller owns, not just the open-question ones."""
+    from genesis.db.connection import SerializedConnection
+
+    with pytest.raises(TypeError, match="owns"):
+        await write(SerializedConnection(db))
+    assert not db.in_transaction
+
+
+async def test_a_link_write_that_did_not_persist_is_said_plainly(db, monkeypatch):
+    """If both keys read back empty, the pointer was not written: say so, never
+    a TypeError from the conflict message and never a silent success."""
+
+    async def nothing(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(board, "get_link_by_source", nothing)
+    monkeypatch.setattr(board, "get_link_by_issue", nothing)
+    with pytest.raises(RuntimeError, match="did not persist"):
+        await _link(db)
 
 
 async def test_record_link_round_trips(db):
@@ -334,6 +370,119 @@ async def test_raise_refuses_the_shared_serialized_connection(db):
 
     with pytest.raises(TypeError, match="owns"):
         await board.raise_question(SerializedConnection(db), question="q", now=NOW)
+    assert (await board.list_questions(db, status=None))["total"] == 0
+
+
+# ── the retry boundary: only taking the write lock is ever retried ──────────
+
+
+def _locked():
+    return sqlite3.OperationalError("database is locked")
+
+
+@pytest.fixture
+def no_backoff(monkeypatch):
+    from genesis.db import connection
+
+    monkeypatch.setattr(connection, "_WRITE_RETRY_DELAYS", (0, 0, 0))
+
+
+async def test_a_lost_lock_race_on_begin_is_retried_and_writes_once(db, no_backoff):
+    real_execute = db.execute
+    begins = {"n": 0}
+
+    def flaky(sql, *args):
+        if sql == "BEGIN IMMEDIATE":
+            begins["n"] += 1
+            if begins["n"] <= 2:
+                raise _locked()
+        return real_execute(sql, *args)
+
+    db.execute = flaky
+    try:
+        await board.raise_question(db, question="q", now=NOW, blocks=[("follow_up", SRC)])
+    finally:
+        db.execute = real_execute
+    assert begins["n"] == 3
+    assert (await board.list_questions(db, status=None))["total"] == 1
+
+
+async def test_a_lock_lost_on_every_begin_is_writebusy_and_writes_nothing(db, no_backoff):
+    real_execute = db.execute
+
+    def always_locked(sql, *args):
+        if sql == "BEGIN IMMEDIATE":
+            raise _locked()
+        return real_execute(sql, *args)
+
+    db.execute = always_locked
+    try:
+        with pytest.raises(board.WriteBusy):
+            await board.raise_question(db, question="q", now=NOW)
+    finally:
+        db.execute = real_execute
+    assert (await board.list_questions(db, status=None))["total"] == 0
+
+
+async def test_a_lock_after_the_lock_is_taken_is_never_retried(db, no_backoff):
+    """Once BEGIN IMMEDIATE succeeded, statements have run: a failure there
+    rolls the unit back and propagates — retrying could repeat a write."""
+    real_execute = db.execute
+    begins = {"n": 0}
+
+    def flaky(sql, *args):
+        if sql == "BEGIN IMMEDIATE":
+            begins["n"] += 1
+        if sql.startswith("INSERT INTO open_question_blocks"):
+            raise _locked()
+        return real_execute(sql, *args)
+
+    db.execute = flaky
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            await board.raise_question(db, question="q", now=NOW, blocks=[("follow_up", SRC)])
+    finally:
+        db.execute = real_execute
+    assert begins["n"] == 1 and not db.in_transaction
+    assert (await board.list_questions(db, status=None))["total"] == 0
+
+
+async def test_a_lock_error_after_a_durable_commit_counts_as_committed(db, no_backoff):
+    """WAL's post-commit autocheckpoint can report a lock after the commit has
+    landed (the connection is then out of its transaction): that is success,
+    never a retry and never a reported failure."""
+    real_commit = db.commit
+
+    async def committed_then_locked():
+        await real_commit()
+        raise _locked()
+
+    db.commit = committed_then_locked
+    try:
+        qid = await board.raise_question(db, question="q", now=NOW)
+        assert await board.close_question(
+            db, question_id=qid, status="resolved", resolution="r", now=NOW
+        )
+    finally:
+        db.commit = real_commit
+    q = await board.get_question(db, qid)
+    assert q["status"] == "resolved"
+    assert (await board.list_questions(db, status=None))["total"] == 1
+
+
+async def test_a_commit_lock_with_the_transaction_open_rolls_back(db, no_backoff):
+    real_commit = db.commit
+
+    async def locked_commit():
+        raise _locked()
+
+    db.commit = locked_commit
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            await board.raise_question(db, question="q", now=NOW, blocks=[("follow_up", SRC)])
+    finally:
+        db.commit = real_commit
+    assert not db.in_transaction
     assert (await board.list_questions(db, status=None))["total"] == 0
 
 
@@ -629,3 +778,16 @@ async def test_prune_counts_real_deletions_and_spares_open_work(db):
 async def test_prune_rejects_non_positive_windows(db):
     with pytest.raises(ValueError):
         await board.prune(db, now=NOW, question_days=0)
+
+
+async def test_owned_connection_opens_the_same_file_and_refuses_memory(db):
+    """The owned connection is resolved from the caller's own connection, so a
+    board write can never land in a different database than the one the caller
+    validated against; an in-memory database has no file to share."""
+    async with board.owned_connection(db) as own:
+        await board.append_event(own, event="drag", now=NOW)
+    assert (await board.list_events(db))["total"] == 1
+    async with aiosqlite.connect(":memory:") as mem:
+        with pytest.raises(ValueError, match="in-memory"):
+            async with board.owned_connection(mem):
+                pass
