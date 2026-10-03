@@ -1,4 +1,36 @@
-"""Knowledge base browser routes — search, recent, detail, delete, stats."""
+"""Knowledge base browser routes — search, recent, detail, delete, stats.
+
+**These routes serve the knowledge base, NOT the reference store.** Both live in
+``knowledge_units``; the reference store is the ``project_type='reference'``
+partition and it holds stored credentials, network facts and account details in
+each row's ``body``.
+
+``references.py`` owns that partition and renders it behind value-free
+summaries, kind masking and an explicit reveal step — and it already scopes
+ITSELF to it, passing ``project_type=REFERENCE_PROJECT`` on every query and
+refusing a non-reference row outright in ``references_detail``. The partition
+was one-sided: nothing here refused the reference rows, so these routes were a
+second, uncontrolled door onto the same values. ``_EXCLUDED_PROJECT`` closes
+THIS module's half.
+
+**That is one door, not the class, and this docstring previously said
+otherwise.** The same body is written to more than one store by a single call:
+``memory/knowledge_ingest.ingest_knowledge_unit`` upserts into
+``knowledge_units`` AND calls ``store.store(content, ...)``, which for the
+reference store lands the identical text in the episodic memory store. The
+routes under ``/api/genesis/memory/`` recall from that store without a
+partition predicate. So scoping the queries here does not make the values
+unreachable — it makes them unreachable THROUGH HERE. That gap is tracked
+separately and is not closed by this module.
+
+Two further limits, so nothing here is read as a general guarantee. The
+exclusion names the reference store specifically, so a FUTURE secret-bearing
+partition is not covered and must be added — these routes select by ``*`` and
+will return whatever columns a new store puts in a row. And the exclusion is
+OPT-IN at each call site rather than enforced by the store, so a new reader of
+``search_fts``/``stats`` is unscoped by default; that is the shape that
+produced this defect in the first place.
+"""
 
 from __future__ import annotations
 
@@ -7,8 +39,14 @@ import logging
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
+from genesis.memory.reference_ops import REFERENCE_PROJECT
 
 logger = logging.getLogger(__name__)
+
+# The partition these routes must never serve. Imported rather than spelled
+# again so the two halves of the split cannot drift apart: `references.py`
+# selects exactly this value, and everything here refuses it.
+_EXCLUDED_PROJECT = REFERENCE_PROJECT
 
 
 @blueprint.route("/api/genesis/knowledge/search")
@@ -37,9 +75,25 @@ async def knowledge_search():
     project = request.args.get("project") or None
     limit = max(1, min(request.args.get("limit", 20, type=int), 100))
 
+    # A caller-supplied `project` must not be able to SELECT the excluded
+    # partition — `?project=reference` was the shortest path to the whole
+    # reference store. Refusing beats silently returning nothing: the caller
+    # asked for a store this endpoint does not serve, and `references.py` is
+    # where it lives.
+    if project == _EXCLUDED_PROJECT:
+        return jsonify({
+            "error": f"project '{_EXCLUDED_PROJECT}' is not served here",
+            "use": "/api/genesis/references/search",
+        }), 400
+
     try:
         results = await knowledge.search_fts(
-            rt.db, query, project=project, domain=domain, limit=limit,
+            rt.db,
+            query,
+            project=project,
+            exclude_project=_EXCLUDED_PROJECT,
+            domain=domain,
+            limit=limit,
         )
         return jsonify({
             "results": results,
@@ -70,14 +124,25 @@ async def knowledge_recent():
     offset = max(0, request.args.get("offset", 0, type=int))
 
     try:
+        # NULL-SAFE exclusion. `project_type != ?` evaluates to NULL — and so
+        # is not TRUE — for a row that declares no project_type, which would
+        # drop every untyped row from the listing. The clause must remove one
+        # partition, not everything that failed to name one.
+        _not_excluded = "WHERE (project_type IS NULL OR project_type != ?)"
         cursor = await rt.db.execute(
-            "SELECT * FROM knowledge_units ORDER BY ingested_at DESC LIMIT ? OFFSET ?",
-            (limit, offset),
+            f"SELECT * FROM knowledge_units {_not_excluded}"
+            " ORDER BY ingested_at DESC LIMIT ? OFFSET ?",
+            (_EXCLUDED_PROJECT, limit, offset),
         )
         rows = await cursor.fetchall()
         columns = [desc[0] for desc in cursor.description]
 
-        cursor_total = await rt.db.execute("SELECT COUNT(*) FROM knowledge_units")
+        # The total must count the SAME set the rows come from, or paging walks
+        # off the end of a list shorter than it was told to expect.
+        cursor_total = await rt.db.execute(
+            f"SELECT COUNT(*) FROM knowledge_units {_not_excluded}",
+            (_EXCLUDED_PROJECT,),
+        )
         total = (await cursor_total.fetchone())[0]
 
         return jsonify({
@@ -103,7 +168,10 @@ async def knowledge_detail(unit_id: str):
 
     try:
         unit = await knowledge.get(rt.db, unit_id)
-        if unit is None:
+        # The mirror of ``references_detail``, which refuses a row that is NOT
+        # in the reference partition. 404 rather than 403: whether a given id
+        # exists in the other store is itself not this endpoint's to disclose.
+        if unit is None or unit.get("project_type") == _EXCLUDED_PROJECT:
             return jsonify({"error": "Unit not found"}), 404
         return jsonify({"unit": unit})
     except Exception:
@@ -125,6 +193,12 @@ async def knowledge_delete(unit_id: str):
     try:
         # Get Qdrant ID before deleting from SQLite
         unit = await knowledge.get(rt.db, unit_id)
+        # Refused for the same reason the read is: this endpoint does not serve
+        # the reference partition, and that cuts both ways. Without it the
+        # knowledge browser can DESTROY a stored credential it is not allowed
+        # to show — and on a passwordless install, unauthenticated.
+        if unit is not None and unit.get("project_type") == _EXCLUDED_PROJECT:
+            return jsonify({"error": "Unit not found"}), 404
         qdrant_id = unit.get("qdrant_id") if unit else None
 
         deleted = await knowledge.delete(rt.db, unit_id)
@@ -183,7 +257,9 @@ async def knowledge_stats():
         return jsonify({"error": "Not bootstrapped"}), 503
 
     try:
-        stats = await knowledge.stats(rt.db)
+        # Scoped to the same partition the listings serve, so the count the
+        # Knowledge tab shows matches what browsing it can actually reach.
+        stats = await knowledge.stats(rt.db, exclude_project=_EXCLUDED_PROJECT)
 
         qdrant_count = None
         try:

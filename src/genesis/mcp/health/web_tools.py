@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from datetime import UTC
 
@@ -22,6 +23,18 @@ from genesis.security import ContentSanitizer, ContentSource
 from genesis.security.sanitizer import strip_boundary_markers
 
 logger = logging.getLogger(__name__)
+
+
+def with_scheme(url: str) -> str:
+    """``url`` stripped, with ``https://`` added when it has no http(s) scheme.
+
+    The scheme check ignores case (``HTTPS://x`` already has one). Every
+    web_fetch path normalizes through this, so the URL a route checks is the
+    URL that is fetched.
+    """
+    url = (url or "").strip()
+    return url if re.match(r"https?://", url, re.IGNORECASE) else "https://" + url
+
 _SANITIZER = ContentSanitizer()
 
 # Lazy singletons — avoids import-time overhead for Playwright/httpx
@@ -326,9 +339,7 @@ async def _impl_web_fetch(
     if not url or not url.strip():
         return {"error": "url is required"}
 
-    url = url.strip()
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
+    url = with_scheme(url)
 
     start = time.monotonic()
     fetcher = _get_fetcher()
@@ -428,10 +439,7 @@ async def _impl_web_fetch_multi(
 
     clean_urls = []
     for u in urls[:10]:
-        u = u.strip()
-        if not u.startswith(("http://", "https://")):
-            u = "https://" + u
-        clean_urls.append(u)
+        clean_urls.append(with_scheme(u))
 
     start = time.monotonic()
     try:
@@ -683,6 +691,8 @@ async def web_fetch(
     nothing, a single URL is fetched as usual and `youtube_error` says why.
     In a `urls` batch a video's entry is replaced by its transcript result;
     a miss keeps the batch's page entry.
+    LinkedIn post: the page, plus `video_transcript` from its video's
+    captions (no audio); `video_error` when they can't be read.
 
     Every string in the result comes back inside `<external-content>` markers,
     whatever backend fetched it (page text, titles, URLs, language tags, error
@@ -760,7 +770,9 @@ _KNOWN_FIELDS = frozenset({
     "author", "backend_tried", "backend_used", "caption", "content", "cost_usd",
     "description", "error", "errors", "fallback_used", "final_url", "image_links",
     "key", "kind", "language", "latency_ms", "links", "provenance", "results",
-    "status_code", "text", "title", "tls_verified", "truncated", "url", "youtube_error",
+    "status_code", "text", "title", "tls_verified", "truncated", "url", "video_caption",
+    "video_error", "video_tls_verified", "video_transcript", "video_transcript_truncated",
+    "youtube_error",
 })
 
 
@@ -768,14 +780,16 @@ async def _web_fetch_unwrapped(url: str, urls: list[str] | None, backend: str, m
     from genesis.mcp.health.youtube_route import fetch_youtube
 
     if urls:
+        from genesis.knowledge.processors.linkedin import is_linkedin_post_url
         from genesis.knowledge.processors.youtube import is_youtube_video_url
 
         urls = urls[:10]
         # The spelling _impl_web_fetch_multi sends and its backend echoes back,
         # so the video overlay can match entries by URL.
-        normalized = [u.strip() if u.strip().startswith(("http://", "https://"))
-                      else "https://" + u.strip() for u in urls]
-        if backend != "auto" or not any(is_youtube_video_url(u) for u in normalized):
+        normalized = [with_scheme(u) for u in urls]
+        if backend != "auto" or not any(
+            is_youtube_video_url(u) or is_linkedin_post_url(u) for u in normalized
+        ):
             return await _impl_web_fetch_multi(urls, max_chars)
         return await _overlay_video_batch(urls, normalized, max_chars)
     if backend == "auto":
@@ -784,7 +798,31 @@ async def _web_fetch_unwrapped(url: str, urls: list[str] | None, backend: str, m
             return yt
         if yt_error is not None:
             return {**await _impl_web_fetch(url, backend, max_chars), "youtube_error": yt_error}
+        from genesis.knowledge.processors.linkedin import is_linkedin_post_url
+
+        post_url = with_scheme(url)
+        if is_linkedin_post_url(post_url):
+            return await _linkedin_post(post_url, max_chars)
     return await _impl_web_fetch(url, backend, max_chars)
+
+
+async def _linkedin_post(url: str, max_chars: int) -> dict:
+    """A LinkedIn post: the ordinary page fetch, plus its video's captions.
+
+    Both run at once. The page result is returned unchanged; the video's
+    fields (``video_transcript`` … or ``video_error``) sit beside it. Never audio.
+    """
+    from genesis.mcp.health.linkedin_route import fetch_linkedin_captions
+
+    async def captions() -> dict:
+        try:
+            return await fetch_linkedin_captions(url, max_chars)
+        except Exception as exc:  # the page must survive a failed caption lookup
+            logger.warning("LinkedIn caption lookup failed for %s", url, exc_info=True)
+            return {"video_error": f"{type(exc).__name__}: {exc}"}
+
+    page, video = await asyncio.gather(_impl_web_fetch(url, "auto", max_chars), captions())
+    return {**page, **video}
 
 
 async def _overlay_video_batch(urls: list[str], normalized: list[str], max_chars: int) -> dict:
@@ -801,11 +839,14 @@ async def _overlay_video_batch(urls: list[str], normalized: list[str], max_chars
     position (a backend that drops a URL must not shift the rest), and a URL
     with no page entry becomes an ``errors`` row, the batch path's own shape.
     """
+    from genesis.knowledge.processors.linkedin import is_linkedin_post_url
     from genesis.knowledge.processors.youtube import is_youtube_video_url
+    from genesis.mcp.health.linkedin_route import fetch_linkedin_captions
     from genesis.mcp.health.youtube_route import fetch_youtube
 
     start = time.monotonic()
     video_idx = [i for i, u in enumerate(normalized) if is_youtube_video_url(u)]
+    post_idx = [i for i, u in enumerate(normalized) if is_linkedin_post_url(u)]
 
     async def page_batch() -> dict:
         try:
@@ -821,8 +862,20 @@ async def _overlay_video_batch(urls: list[str], normalized: list[str], max_chars
             logger.warning("web_fetch video overlay failed for %s", u, exc_info=True)
             return None, f"{type(exc).__name__}: {exc}"
 
-    page, *videos = await asyncio.gather(page_batch(), *(video(normalized[i]) for i in video_idx))
-    video_by_idx = dict(zip(video_idx, videos, strict=True))
+    async def post(u: str) -> dict:
+        try:
+            return await fetch_linkedin_captions(u, max_chars)
+        except Exception as exc:  # a caption lookup must not sink the batch
+            logger.warning("web_fetch LinkedIn overlay failed for %s", u, exc_info=True)
+            return {"video_error": f"{type(exc).__name__}: {exc}"}
+
+    page, *rest = await asyncio.gather(
+        page_batch(),
+        *(video(normalized[i]) for i in video_idx),
+        *(post(normalized[i]) for i in post_idx),
+    )
+    video_by_idx = dict(zip(video_idx, rest[:len(video_idx)], strict=True))
+    post_by_idx = dict(zip(post_idx, rest[len(video_idx):], strict=True))
 
     pages: dict[str, list[dict]] = {}
     for item in page.get("results") or []:
@@ -840,11 +893,16 @@ async def _overlay_video_batch(urls: list[str], normalized: list[str], max_chars
         if yt is not None:
             results.append(yt)
             continue
+        video = post_by_idx.get(i, {})
         if page_entry is not None:
+            page_entry = {**page_entry, **video}
             results.append({**page_entry, "youtube_error": yt_error} if yt_error else page_entry)
             continue
+        # No page: the error row keeps the page failure, and a post's video
+        # fields ride on it, so neither is lost.
         error = (page_errors[u].pop(0) if page_errors.get(u)
                  else {"url": u, "error": batch_error or "no batch entry matched this URL"})
+        error = {**error, **video}
         errors.append({**error, "youtube_error": yt_error} if yt_error else error)
     # An entry echoed under a spelling no input matched is still the backend's
     # page: return it rather than drop it.

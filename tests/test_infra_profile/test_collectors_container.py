@@ -412,8 +412,10 @@ def _fake_run_cmd(
     admin_state="configured",
     network_file="/run/systemd/network/10-netplan-eth0.network",
     watchdog_enabled=True,
+    watchdog_timer_state=None,
+    watchdog_service_state=None,
 ):
-    """Fake _run_cmd covering the three commands collect_network shells out to."""
+    """Fake _run_cmd covering the commands collect_network shells out to."""
 
     async def _fake(*argv, **_kw):
         if argv and argv[0] == "ip" and "route" in argv:
@@ -426,6 +428,12 @@ def _fake_run_cmd(
         if argv and argv[0] == "systemctl" and "is-enabled" in argv:
             # real _run_cmd returns None on non-zero rc (disabled/masked/absent)
             return "enabled" if watchdog_enabled else None
+        if argv and argv[0] == "systemctl" and "show" in argv:
+            unit = argv[2]
+            return {
+                "genesis-tailscale-watchdog.timer": watchdog_timer_state,
+                "genesis-tailscale-watchdog.service": watchdog_service_state,
+            }.get(unit)
         return None  # ip -j addr etc. → harmless None
 
     return _fake
@@ -461,6 +469,45 @@ async def test_collect_network_suppresses_when_networkmanager(tmp_path, monkeypa
     result = await collect_network(etc_root=tmp_path)
     assert result.facts["networkd_manages_default_route"] is False
     assert result.facts["networkd_default_route_keepconfig"] is False
+
+
+@pytest.mark.parametrize(
+    ("timer_state", "service_state", "expected"),
+    [
+        ("", "masked", "masked"),
+        ("", "masked-runtime", "masked-runtime"),
+        ("enabled", "static", "enabled"),
+        ("", None, ""),
+        (None, "masked", "masked"),
+        ("disabled", "static", "disabled"),
+    ],
+)
+async def test_collect_network_reports_effective_tailscale_watchdog_state(
+    tmp_path, monkeypatch, timer_state, service_state, expected
+):
+    monkeypatch.setattr(
+        _container,
+        "_run_cmd",
+        _fake_run_cmd(
+            watchdog_timer_state=timer_state,
+            watchdog_service_state=service_state,
+        ),
+    )
+    result = await collect_network(etc_root=tmp_path)
+    assert result.facts["tailscale_watchdog_unit_state"] == expected
+    assert set(result.facts) == {
+        "interfaces",
+        "tailscale",
+        "nameservers",
+        "default_route_dev",
+        "networkd_keep_configuration",
+        "network_watchdog_installed",
+        "networkd_manages_default_route",
+        "networkd_default_route_keepconfig",
+        "network_watchdog_enabled",
+        "tailscaled_loaded",
+        "tailscale_watchdog_unit_state",
+    }
 
 
 # ── cc-tmp isolation (blast-radius split) ──────────────────────────────────

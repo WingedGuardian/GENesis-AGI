@@ -84,7 +84,9 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -236,6 +238,24 @@ def _run_git(repo_root: Path, args: list[str], *, timeout: int) -> str | None:
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
     return result.stdout if result.returncode == 0 else None
+
+
+def _run_git_rc(cwd: Path, args: list[str], *, timeout: int) -> tuple[int | None, str]:
+    """`_run_git` that keeps the exit status: ``(returncode, stdout)``.
+
+    ``returncode`` is None when git could not be run or did not finish. For the
+    probes whose answer has THREE states: `rev-parse --verify -q` exits 1 when the
+    ref or object is absent and 128 when the repository itself cannot be read
+    (MEASURED, git 2.43), so only a 1 proves absence.
+    """
+    try:
+        result = subprocess.run(
+            ["git", *args], capture_output=True, text=True, errors="surrogateescape",
+            cwd=str(cwd), timeout=timeout, env=_git_env(),
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None, ""
+    return result.returncode, result.stdout
 
 
 def _run_git_bytes(repo_root: Path, args: list[str], *, timeout: float) -> bytes | None:
@@ -1348,9 +1368,8 @@ def _compress_entry(trash_path: Path, meta: dict) -> Path | None:
     _fsync_path(TRASH_DIR)
 
     with contextlib.suppress(OSError):
-        meta_path = _sidecar_meta_path(trash_path)
-        meta_path.write_text(json.dumps(meta, indent=2))
-        os.chmod(meta_path, _PRIVATE_FILE_MODE)
+        _atomic_write_text(_sidecar_meta_path(trash_path), json.dumps(meta, indent=2),
+                           mode=_PRIVATE_FILE_MODE)
 
     try:
         shutil.rmtree(str(trash_path))
@@ -1373,14 +1392,56 @@ def _compress_entry(trash_path: Path, meta: dict) -> Path | None:
     return archive
 
 
+def _atomic_write_text(
+    path: Path, text: str, *, mode: int | None = None, tmp_dir: Path | None = None,
+) -> None:
+    """Write ``text`` to ``path`` so a reader finds the old file or the new one,
+    never a truncated one. Raises OSError; the temp file never outlives the call.
+
+    A plain `write_text` truncates first and writes second, so a failure between
+    the two (a full disk is enough) leaves an empty or partial file where a good
+    one was. Here the text goes to a temp file and `os.replace` swaps it in.
+
+    * The temp name carries the pid: `replace` is atomic, but a SHARED temp path
+      is not, since two writers would interleave inside it.
+    * ``mode`` applies from creation (default: the umask's, as `write_text`). A
+      stale temp is removed first and the new one is opened O_EXCL | O_NOFOLLOW,
+      so nothing already at the temp name (a symlink, a hard link) is written
+      through. `os.replace` replaces a symlink at ``path`` itself and never writes
+      through it.
+    * ``tmp_dir`` puts the temp elsewhere on the same filesystem: the archive's
+      own metadata is rewritten from the trash root, so no temp can ever be
+      packed into the archive beside it.
+
+    Not fsynced: the guarantee holds when the process dies mid-write, not across
+    a power loss.
+    """
+    tmp = (tmp_dir or path.parent) / f".{path.name}.{os.getpid()}.tmp"
+    try:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        fd = os.open(
+            str(tmp),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o666 if mode is None else mode,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
 def _write_board_cache(results: list[dict]) -> None:
     """Publish the classification for readers on a latency budget.
 
-    Written atomically (temp file + replace) because the readers are a
-    session-start hook and a web request: a half-written file would be parsed by
-    whoever looked next, and a board that reads as "no worktrees" is
-    indistinguishable from a clean tree. Best-effort — failing to publish must
-    never abort a reap.
+    Written atomically because the readers are a session-start hook and a web
+    request: a half-written file would be parsed by whoever looked next, and a
+    board that reads as "no worktrees" is indistinguishable from a clean tree.
+    The dashboard's refresh endpoint makes concurrent writers ordinary, which is
+    why the temp name is per process. Best-effort — failing to publish must never
+    abort a reap.
     """
     payload = {
         "generated_at": datetime.now(UTC).isoformat(),
@@ -1388,17 +1449,7 @@ def _write_board_cache(results: list[dict]) -> None:
     }
     try:
         BOARD_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        # The temp name carries the pid: `replace` is atomic, but a SHARED temp
-        # path is not — two writers interleave inside it and the loser publishes a
-        # half-written document under the winner's name. The dashboard's refresh
-        # endpoint made concurrent writers ordinary rather than theoretical.
-        tmp = BOARD_CACHE.with_name(f"{BOARD_CACHE.name}.{os.getpid()}.tmp")
-        try:
-            tmp.write_text(json.dumps(payload, indent=2))
-            tmp.replace(BOARD_CACHE)
-        finally:
-            with contextlib.suppress(OSError):
-                tmp.unlink()
+        _atomic_write_text(BOARD_CACHE, json.dumps(payload, indent=2))
     except OSError as e:
         # STDERR. This is the THIRD instance of one class on this branch, so it
         # is fixed as a class rather than a spot: under `--report-json` stdout is
@@ -1485,6 +1536,22 @@ def _secret_shaped_files(worktree_path: Path) -> list[str]:
     except OSError:
         return found
     return found
+
+
+_ASIDE_META_PREFIX = ".trash_meta.json.from-worktree-"
+
+
+def _free_aside_name(directory: Path) -> str | None:
+    """The first free ``.trash_meta.json.from-worktree-N`` in ``directory``, or None.
+
+    LEXISTS, not exists(): a dangling symlink is a real entry that `exists()`
+    reports as absent, and renaming onto it would replace it.
+    """
+    for n in range(1, 1000):
+        name = f"{_ASIDE_META_PREFIX}{n}"
+        if not os.path.lexists(directory / name):
+            return name
+    return None
 
 
 def _trash_name_taken_excluding_claim(trash_path: Path) -> bool:
@@ -1749,13 +1816,30 @@ def _trash_worktree(
             # value here is a wrong answer for as long as the archive lasts.
             "had_uncommitted_changes": _has_uncommitted_changes(str(wt_path)),
             "had_tracked_patch": bool(patch_text),
+            # Where the worktree's OWN `.trash_meta.json` will be set aside, so
+            # recovery can give it its name back: None when it has none. Chosen
+            # NOW and recorded in the first write, the only metadata write whose
+            # failure stops the reap, so the record never depends on a later
+            # write that could fail after the tree has moved.
+            "preserved_meta": (
+                _free_aside_name(wt_path)
+                if os.path.lexists(wt_path / ".trash_meta.json") else None
+            ),
             "secret_files": _secret_shaped_files(wt_path),
         }
         # Both the patch and the commit list above are captured BEFORE the move:
         # once the directory leaves its registered path, `git diff` and
         # `git log main..<ref>` no longer resolve against it.
         staging_meta = TRASH_DIR / f".{trash_path.name}.meta.staging"
-        staging_meta.write_text(json.dumps(meta, indent=2))
+        try:
+            _atomic_write_text(staging_meta, json.dumps(meta, indent=2),
+                               mode=_PRIVATE_FILE_MODE)
+        except OSError:
+            # Nothing has moved, so give the claimed name back: left in place, the
+            # empty directory would read as a trash entry with no metadata.
+            with contextlib.suppress(OSError):
+                trash_path.rmdir()
+            raise
 
         if meta["secret_files"]:
             # S9: an archived credential lives as long as the archive does (30
@@ -1804,25 +1888,39 @@ def _trash_worktree(
         # resolves the link), so the collision check missed it entirely and
         # `rename` then replaced the user's entry. `os.path.lexists` asks about
         # the entry, which is the question being asked here.
+        # The aside name was chosen and recorded before the move. The worktree can
+        # still change in the moments between that check and the move, so the
+        # record is corrected (atomically, best-effort) only when what is on disk
+        # now differs from it; the ordinary case writes nothing more.
         final_meta = trash_path / ".trash_meta.json"
+        recorded = meta["preserved_meta"]
+
+        def _rerecord(aside: str | None) -> None:
+            meta["preserved_meta"] = aside
+            try:
+                _atomic_write_text(staging_meta, json.dumps(meta, indent=2),
+                                   mode=_PRIVATE_FILE_MODE)
+            except OSError as e:
+                _log(f"  WARN {trash_path.name}: could not correct the record of where its "
+                     f"own .trash_meta.json went ({e}); recovery may misname it")
+
         if os.path.lexists(final_meta):
-            preserved = None
-            for n in range(1, 1000):
-                candidate = trash_path / f".trash_meta.json.from-worktree-{n}"
-                if not os.path.lexists(candidate):
-                    preserved = candidate
-                    break
+            aside = recorded
+            if aside is None or os.path.lexists(trash_path / aside):
+                aside = _free_aside_name(trash_path)
             renamed = False
-            if preserved is not None:
+            if aside is not None:
                 try:
-                    final_meta.rename(preserved)
+                    final_meta.rename(trash_path / aside)
                     renamed = True
                 except OSError as e:
                     _log(f"  WARN {trash_path.name}: could not move its own "
                          f".trash_meta.json aside ({e})")
+            if (aside if renamed else None) != recorded:
+                _rerecord(aside if renamed else None)
             if renamed:
                 _log(f"  NOTE {trash_path.name} contained its own .trash_meta.json — "
-                     f"kept as {preserved.name} so it survives in the archive")
+                     f"kept as {aside} so it survives in the archive")
             else:
                 # SAY WHAT ACTUALLY HAPPENS. An earlier version of this branch
                 # refused to take the name when preservation failed, on the
@@ -1838,8 +1936,18 @@ def _trash_worktree(
                 # cannot be done, which is a larger change than this one.
                 _log(f"  WARN {trash_path.name} contains a .trash_meta.json that could "
                      "not be preserved; it is being REPLACED")
+        elif recorded is not None:
+            _rerecord(None)  # it went away before the move: nothing was set aside
         staging_meta.rename(final_meta)
 
+        # The name the snapshot was actually written under, or None when none was.
+        # Recorded so recovery can name THAT file. Inferring it from the suffix
+        # sequence is wrong whenever the worktree's own files leave a gap (only
+        # `.dirty.patch.archived-2` present: the reaper takes `.dirty.patch`), and
+        # recovery calls the file it names safe to delete. Set in the final
+        # rewrite below; the staging copy never carries it, so an archive whose
+        # final rewrite failed reads as unrecorded, not as "no snapshot".
+        written_patch: str | None = None
         if patch_text:
             # N1: the success log used to sit INSIDE the suppress, so a failed
             # write produced no output at all while the tombstone still recorded
@@ -1895,9 +2003,11 @@ def _trash_worktree(
                     )
                     with os.fdopen(fd, "wb") as fh:
                         fh.write(patch_text)
+                    written_patch = target.name
                     _log(f"  saved uncommitted tracked changes → {trash_path}/{target.name}")
                 except OSError as e:
                     _log(f"  WARN could not save {target.name} for {trash_path.name}: {e}")
+        meta["patch_file"] = written_patch
 
         # THE REGISTRATION IS LEFT IN PLACE, DELIBERATELY.
         #
@@ -1967,9 +2077,16 @@ def _trash_worktree(
         fresh = _run_git(repo_root, ["-C", str(trash_path), "rev-parse", "HEAD"], timeout=15)
         if fresh and fresh.strip():
             meta["head"] = meta["commit"] = fresh.strip()
-        with contextlib.suppress(OSError):
-            final_meta.write_text(json.dumps(meta, indent=2))
-            os.chmod(final_meta, _PRIVATE_FILE_MODE)
+        # Atomic, so a failed rewrite leaves the staging copy (complete, with the
+        # classification-time sha) rather than a truncated file that recovery
+        # could not parse. The temp sits in the trash root, never inside the tree
+        # about to be archived.
+        try:
+            _atomic_write_text(final_meta, json.dumps(meta, indent=2),
+                               mode=_PRIVATE_FILE_MODE, tmp_dir=TRASH_DIR)
+        except OSError as e:
+            _log(f"  WARN {trash_path.name}: could not record the fresh HEAD in its "
+                 f"metadata ({e}); it keeps the classification-time commit")
 
         ref_label = f"branch={branch}" if branch else f"detached {wt.get('head', '')[:8]}"
 
@@ -2014,16 +2131,26 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
     who missed the flag with no second signal that nothing happened (#2188).
 
     The pre-flight refusals (missing metadata, incomplete metadata, an occupied
-    destination) are reported exactly as a real run would report them, so the
-    preview cannot promise a recovery the real run would refuse.
+    destination, a registration another archive owns or that cannot be read) are
+    reported exactly as a real run would report them, so the preview cannot
+    promise a recovery the real run would refuse.
+
+    It also says WHICH recovery a real run takes: a REATTACH when the archived
+    tree's registration survives (probed with the same read-only checks), and
+    otherwise the recreate, which for an archive that held uncommitted changes
+    does NOT restore them and exits 2.
     """
     candidates: list[str] = []
+    # Every entry at the tree's root, directories included: what a reattach,
+    # which places the whole tree, will find there.
+    root_entries: set[str] = set()
     if stored.is_dir():
         meta_path = stored / ".trash_meta.json"
         if not meta_path.exists():
             print(f"No .trash_meta.json in {stored}", file=sys.stderr)
             return False
         meta = json.loads(meta_path.read_text())
+        pointer = _read_git_pointer(stored / ".git")
         # Same walk `_restore_from_dir` uses: symlinks and files only, `.git`
         # and every `.trash_meta.json` basename excluded.
         for item in stored.rglob("*"):
@@ -2032,10 +2159,8 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
                 continue
             if item.is_symlink() or item.is_file():
                 candidates.append(rel.as_posix())
-        consume_note = (
-            "WOULD CONSUME the trash entry "
-            "(directory form; recovery moves its contents back)"
-        )
+        root_entries = {p.name for p in stored.iterdir()}
+        consume_note = f"Trash entry would be KEPT at {stored}"
     else:
         try:
             with tarfile.open(stored, "r:gz") as tf:
@@ -2056,10 +2181,24 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
                     print(f"No .trash_meta.json in {stored}", file=sys.stderr)
                     return False
                 meta = json.loads(tf.extractfile(meta_member).read())
+                # The archived `.git` pointer, read in memory like the metadata,
+                # so the preview can ask whether a real run would REATTACH.
+                git_member = next(
+                    (m for m in members
+                     if len(PurePosixPath(m.name).parts) == 2
+                     and PurePosixPath(m.name).name == ".git"),
+                    None,
+                )
+                if git_member is None or not git_member.isfile():
+                    pointer = ("absent", None)
+                else:
+                    pointer = ("ok", tf.extractfile(git_member).read().decode(
+                        "utf-8", "surrogateescape"))
                 for m in members:
                     parts = PurePosixPath(m.name).parts
                     if len(parts) < 2:
                         continue  # the root dir member itself
+                    root_entries.add(parts[1])
                     rel = PurePosixPath(*parts[1:])
                     if ".git" in rel.parts or rel.name == ".trash_meta.json":
                         continue
@@ -2073,6 +2212,13 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
             "(recovery copies; it does not consume)"
         )
 
+    # The tree's ROOT names, which `_aside_meta_problem` judges the worktree's own
+    # `.trash_meta.json` from, as each real run will find them on disk. A reattach
+    # places the whole tree, so it is every root entry (`root_entries`): a
+    # worktree's own `.trash_meta.json` can be a DIRECTORY, set aside as one. A
+    # recreate copies files and symlinks only, so a root directory comes back only
+    # when something inside it is copied: the first component of each candidate.
+    copied_root_names = {c.split("/", 1)[0] for c in candidates}
     original_path = meta.get("original_path", "")
     branch = meta.get("branch", "")
     commit = meta.get("commit", "")
@@ -2080,9 +2226,71 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
     if not original_path or (not branch and not commit):
         print(f"Incomplete metadata in {stored}", file=sys.stderr)
         return False
-    if Path(original_path).exists():
+    # LEXISTS: a dangling symlink at the path is a real entry the real run cannot
+    # place over, and `exists()` reports it absent.
+    if os.path.lexists(original_path):
         print(f"Original path already exists: {original_path}", file=sys.stderr)
         return False
+
+    # WHICH RECOVERY a real run takes, asked with the same read-only checks it
+    # makes, in the same order: the registration's owner, then whether the
+    # archived tree still has a registration to go back under.
+    read, lock = _registration_lock(original_path, repo_root)
+    if not read:
+        print(f"Could not read the worktree registrations to check who owns "
+              f"{original_path}; a real run would stop here with nothing changed.",
+              file=sys.stderr)
+        return False
+    holder = _archive_entry_from_reason(lock.rstrip("\n")) if lock is not None else None
+    owned = holder is not None and holder == _entry_name(stored)
+    if holder is not None and not owned:
+        print(f"{original_path} is registered to another archive, {holder}; a real run "
+              f"would refuse to recover {stored} there, with nothing changed.",
+              file=sys.stderr)
+        return False
+    p_state, p_text = pointer
+    target, admin = (_registration_for_pointer(p_text, original_path, repo_root)
+                     if p_state == "ok" else (p_state, None))
+    if target == "unknown":
+        print(f"Could not tell whether {original_path} still has the registration it was "
+              "archived under; a real run would stop here with nothing changed.",
+              file=sys.stderr)
+        return False
+    lost_edits = meta.get("had_uncommitted_changes") is not False
+    if target == "ok" and admin is not None:
+        # The SAME read-only step the real reattach takes before it places the tree.
+        plan = _reattach_plan(meta, admin, repo_root, original_path, owned=owned)
+        if plan["abort"]:
+            print(f"Could not check the registration of {original_path}: {plan['abort']}; "
+                  "a real run would stop here with nothing changed.", file=sys.stderr)
+            return False
+        _log(f"WOULD REATTACH {original_path} to its preserved registration")
+        problems = list(plan["problems"])
+        aside = _aside_meta_problem(meta, root_entries, name_taken=False)
+        if aside:
+            problems.append(aside)
+        for problem in problems:
+            _log(f"  a real run would report: {problem}")
+        if problems:
+            _log("  and exit 2")
+        else:
+            _log(f"  checked: {plan['checked']} (the index is the registration's own, "
+                 "not verified against the archive)")
+        if lost_edits and meta.get("had_tracked_patch") is not False:
+            # The same rule the real run names it by: a recorded name is named only
+            # when that file is in the tree, a recorded None names nothing.
+            recorded = meta.get("patch_file", _UNRECORDED)
+            if isinstance(recorded, str) and recorded in root_entries:
+                _log(f"  the reaper's snapshot {recorded} inside it would be left in place "
+                     "and named")
+            elif recorded is _UNRECORDED or not (recorded is None or isinstance(recorded, str)):
+                _log("  any snapshot the reaper wrote into it (a .dirty.patch file) would be "
+                     "left in place and named")
+        _log("  failures after the tree is placed (a reaper file that cannot be removed, "
+             "an unlock that fails) cannot be previewed")
+        _log("WOULD MOVE the trash entry into place (it becomes the worktree)"
+             if stored.is_dir() else consume_note)
+        return True
 
     # A stored branch name does not mean the branch still EXISTS — the reaper's
     # callers routinely `git branch -D` right after archiving, and a real run
@@ -2182,12 +2390,12 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
         if ls is not None and ls.returncode == 0:
             tracked, link_paths, gitlinks = set(), set(), set()
             for entry in ls.stdout.split(b"\0"):
-                meta, _, name = entry.partition(b"\t")
+                info, _, name = entry.partition(b"\t")
                 if not name:
                     continue
                 p = name.decode("utf-8", "surrogateescape")
                 tracked.add(p)
-                mode = meta.split(b" ", 1)[0]
+                mode = info.split(b" ", 1)[0]
                 if mode == b"120000":
                     link_paths.add(p)
                 elif mode == b"160000":
@@ -2282,11 +2490,15 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
     _log(f"WOULD RECOVER {original_path} ({ref_note})")
     if ref_state == "missing":
         # An unresolvable ref is more than an uncertain count: BOTH worktree-add
-        # attempts in `_restore_from_dir` would fail, and recovery would end as
-        # a plain-directory move. Preview that, not a checkout that can't happen.
-        _log("  the recorded ref no longer resolves — a real run would fall "
-             "back to a PLAIN DIRECTORY move (no usable worktree checkout)")
-        _log(f"WOULD RESTORE up to {len(candidates)} file(s) from {stored}")
+        # attempts in `_restore_from_dir` would fail, and recovery would end by
+        # COPYING the whole tree into a plain directory. Preview that, not a
+        # checkout that can't happen. That copy carries tracked edits too, so the
+        # lost-edits note below does not apply; the run still exits 2.
+        _log("  the recorded ref no longer resolves — a real run would COPY the files "
+             "into a PLAIN DIRECTORY (no usable worktree checkout) and exit 2")
+        _log(f"WOULD COPY {len(candidates)} file(s) from {stored}")
+        _log(consume_note)
+        return True
     elif ref_state == "unknown":
         _log("  could not verify whether the recorded ref still resolves")
         _log(f"WOULD RESTORE up to {len(candidates)} file(s) from {stored}")
@@ -2317,11 +2529,26 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
                 f"{collisions[0]}) — a real recovery RAISES on mkdir there and "
                 "aborts partway"
             )
+    if lost_edits:
+        _log(f"  {_dirty_clause(meta)} and it has no registration to reattach to, so any "
+             "uncommitted edits to tracked files and the staged state would NOT be "
+             "restored; the run would exit 2")
+    aside = _aside_meta_problem(
+        meta, copied_root_names,
+        name_taken=tree is not None and ".trash_meta.json" in tree[0])
+    if aside:
+        _log(f"  a real run would report: {aside}")
+        _log("  and exit 2")
+    elif isinstance(meta.get("preserved_meta"), str):
+        _log(f"  the worktree's own .trash_meta.json, kept as {meta['preserved_meta']}, "
+             "would be given its name back")
     _log(consume_note)
     return True
 
 
-def _recover(name: str, repo_root: Path, *, dry_run: bool = False) -> bool:
+def _recover(
+    name: str, repo_root: Path, report: dict | None = None, *, dry_run: bool = False,
+) -> bool:
     """Resolve a trash entry by name prefix and restore it.
 
     A stored entry is either a directory or a ``.tar.gz``. Archives are extracted
@@ -2329,15 +2556,21 @@ def _recover(name: str, repo_root: Path, *, dry_run: bool = False) -> bool:
     takes — the restore logic carries hard-won symlink-safety invariants, and
     forking it for archives would be the obvious way to lose one of them.
 
-    An ARCHIVE is kept after a successful recovery — the restore is a copy, and
-    the archive stays as the durable record. A LEGACY plain-directory entry is
-    consumed instead: `_restore_from_dir` moves its contents back and removes the
-    entry, because for those the trash directory IS the only copy and leaving a
-    duplicate would double the disk for no benefit.
+    An ARCHIVE is kept after a recovery — the restore is a copy, and the archive
+    stays as the durable record. A plain-directory entry (compression failed when
+    it was archived) is kept too, except by a reattach, which moves it into place
+    because it becomes the worktree. Recovery deletes no trash entry: whether the
+    recovered worktree is complete is a judgement for the reader, and the entry
+    is what they would need if it is not.
 
     Under ``dry_run`` the entry is only resolved and described (see
     `_describe_recovery`): no extraction, no ``git worktree add``, no moves —
     the same "show, don't do" contract the reap path honours (#2188).
+
+    ``report`` collects what the caller cannot read from the return value:
+    ``report["incomplete"]`` is set when a worktree came back but not as it was
+    archived (uncommitted edits not restored, a moved branch, a registration
+    this archive did not hold), and ``main`` exits 2 on it.
     """
     if not TRASH_DIR.exists():
         print(f"No trash directory found at {TRASH_DIR}", file=sys.stderr)
@@ -2350,10 +2583,14 @@ def _recover(name: str, repo_root: Path, *, dry_run: bool = False) -> bool:
             print("Another lifecycle run (trash expiry or a recovery) is in progress; "
                   "retry in a moment.", file=sys.stderr)
             return False
-        return _recover_locked(name, repo_root, dry_run=dry_run)
+        return _recover_locked(name, repo_root, report, dry_run=dry_run)
 
 
-def _recover_locked(name: str, repo_root: Path, *, dry_run: bool = False) -> bool:
+def _recover_locked(
+    name: str, repo_root: Path, report: dict | None = None, *, dry_run: bool = False,
+) -> bool:
+    if report is None:
+        report = {}
     matches = [
         stored for stored, _ in _iter_trash_entries() if stored.name.startswith(name)
     ]
@@ -2385,7 +2622,7 @@ def _recover_locked(name: str, repo_root: Path, *, dry_run: bool = False) -> boo
         # run's. Everything below this line writes.
         return _describe_recovery(stored, repo_root)
     if stored.is_dir():
-        return _restore_from_dir(stored, repo_root)
+        return _restore_from_dir(stored, repo_root, report, stored=stored)
 
     # BOUNDED scratch name. Prepending `.extract-` to the full archive filename
     # can exceed the 255-byte component limit that ext4 and most Linux
@@ -2437,7 +2674,7 @@ def _recover_locked(name: str, repo_root: Path, *, dry_run: bool = False) -> boo
             print(f"Unexpected archive layout in {stored}: {inner}", file=sys.stderr)
             return False
 
-        ok = _restore_from_dir(inner[0], repo_root)
+        ok = _restore_from_dir(inner[0], repo_root, report, stored=stored)
         if ok:
             print(f"Archive kept at {stored} (recovery copies; it does not consume)")
         return ok
@@ -2445,19 +2682,46 @@ def _recover_locked(name: str, repo_root: Path, *, dry_run: bool = False) -> boo
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
-    """Recreate a worktree from an UNPACKED trash directory.
+def _restore_from_dir(
+    trash_path: Path, repo_root: Path, report: dict | None = None, *,
+    stored: Path | None = None,
+) -> bool:
+    """Put a worktree back from an UNPACKED trash directory.
 
-    Recovery contract: recreates the worktree at its recorded ref (the branch, or
-    for a detached HEAD its commit) and restores untracked files that were in the
-    trash. It does NOT reconstruct the full dirty working state — uncommitted
-    tracked modifications, deletions, mode-only changes, and the staged/unstaged
-    split are not reapplied. This is intentional: the reaper only trashes worktrees
-    already merged into main, so committed content is always recoverable from main,
-    and overlaying arbitrary dirty state risks writing through checked-out symlinks.
-    (Full working-state recovery would require preserving the git admin dir at trash
-    time via ``git worktree move`` instead of ``shutil.move`` + ``git worktree prune``.)
+    Recovery contract, in order of preference:
+
+    1. REATTACH. Archiving keeps the worktree's registration (locked, as the
+       history anchor), and with it the worktree's own index. When that
+       registration still belongs to this archive, the archived tree is moved
+       back under it (`_reattach`): its files as archived, under the index the
+       registration kept. What was checked is reported, and any problem found
+       (see `_reattach_plan`) makes the recovery INCOMPLETE.
+
+    2. RECREATE, when the registration is gone. The worktree is recreated at its
+       recorded ref (the branch, or for a detached HEAD its commit) and the
+       untracked files in the trash are copied back (copy-only-missing). This
+       does NOT bring back uncommitted changes to tracked files or the staged
+       state: overlaying them file by file risks writing through checked-out
+       symlinks. The reaper archives dirty worktrees (any dirty worktree waits
+       the unmerged window, then is archived), so when the archive recorded
+       uncommitted changes the recovery is reported INCOMPLETE (``main`` exits 2)
+       and the kept entry is named.
+
+    3. PLAIN DIRECTORY, when neither the branch nor the commit can be checked
+       out: the files are COPIED to the path and the run is INCOMPLETE.
+
+    Only a reattach moves the trash entry (it becomes the worktree). Every other
+    path leaves it where it is.
+
+    ``stored`` is the entry as it sits in the trash (the ``.tar.gz`` for an
+    archive), named in messages instead of the scratch extraction.
     """
+    if report is None:
+        report = {}
+    # Where the archive really lives. For a tarball, `trash_path` is a scratch
+    # extraction that `_recover` deletes on the way out, so naming it in a message
+    # sent the user to a path that no longer exists.
+    where = stored or trash_path
     meta_path = trash_path / ".trash_meta.json"
 
     if not meta_path.exists():
@@ -2476,10 +2740,66 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
         print(f"Incomplete metadata in {meta_path}", file=sys.stderr)
         return False
 
-    # Check if original path is already occupied
-    if Path(original_path).exists():
+    # Check if original path is already occupied. LEXISTS: a dangling symlink is a
+    # real entry that `exists()` reports absent, and placing over it fails.
+    if os.path.lexists(original_path):
         print(f"Original path already exists: {original_path}", file=sys.stderr)
         return False
+
+    # ANOTHER GENERATION OWNS THIS PATH. When a path is archived, recovered and
+    # archived again, both archives name the same registration, and its `gitdir`
+    # points back at the same path. So the older archive passed every path check
+    # and came back under the NEWER archive's index, reported as exact, with the
+    # newer archive's history anchor removed. MEASURED. The lock reason names the
+    # archive that owns the registration, so read it; and refuse outright rather
+    # than recreate, because the recreate's `unlock` + `worktree add --force`
+    # would destroy that other archive's registration.
+    read, lock = _registration_lock(original_path, repo_root)
+    if not read:
+        print(f"Could not read the worktree registrations to check who owns "
+              f"{original_path}. Nothing was changed; the archive is intact at {where}. "
+              "Retry --recover.", file=sys.stderr)
+        return False
+    # Parsed with the same helper expiry uses, so both agree on what "ours" is.
+    holder = _archive_entry_from_reason(lock.rstrip("\n")) if lock is not None else None
+    # Held by THIS archive: only then is the registration's index the one archived.
+    # A successful recovery unlocks it while the archive is kept, so a second
+    # recovery of the same archive finds it unlocked, its index possibly a later
+    # session's (MEASURED: a staged file absent from the tree, reported exact).
+    owned = holder is not None and holder == trash_path.name
+    if holder is not None and not owned:
+        print(f"{original_path} is registered to another archive, {holder}; recovering "
+              f"{where} here would replace that archive's index and remove its history "
+              f"anchor. Nothing was changed. Recover {holder} instead, or recover this "
+              "one to a different path by hand.", file=sys.stderr)
+        return False
+
+    # REATTACH FIRST. Archiving keeps the worktree's registration (locked, as the
+    # history anchor), and with it the worktree's own INDEX. Moving the archived
+    # directory back under that registration brings back what no patch can carry —
+    # the staged and unstaged split, intent-to-add and skip-worktree bits, modes,
+    # untracked files — as far as that index is still the archived one, which
+    # `_reattach_plan` checks the evidence for. Recreating with `git worktree add --force`
+    # instead REPLACES that registration and its index, destroying the one
+    # complete copy of the staged state. The recreate below is kept for archives
+    # whose registration is gone.
+    state, admin = _reattach_target(trash_path, original_path, repo_root)
+    if state == "unknown":
+        print(f"Could not tell whether {original_path} still has the registration it was "
+              "archived under: its `.git` pointer or the registration's files could not "
+              f"be read, or git did not answer. Nothing was changed; the archive is intact "
+              f"at {where}. If the cause was transient, retry --recover; otherwise check "
+              f"that the archived `.git` file and the registration under the repository's "
+              "`worktrees/` directory are readable.", file=sys.stderr)
+        return False
+    if admin is not None:
+        outcome = _reattach(trash_path, meta, repo_root, original_path, admin, report, where,
+                            owned=owned)
+        if outcome == "done":
+            return True
+        if outcome in ("stuck", "abort"):
+            return False
+        # "fallback": the tree is back where it was; recreate it below.
 
     # RELEASE THIS ONE REGISTRATION, and only this one.
     #
@@ -2507,15 +2827,19 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
         `git worktree prune` or `git gc` away from being removed, and the
         archive's commits become collectable with the tarball still sitting in
         the trash. Every failure path below therefore restores it before
-        returning, and the reason says why it is back.
+        returning, and the reason says why it is back. The answer is CHECKED: a
+        re-lock that failed silently left exactly that exposure with no trace.
         """
-        _run_git(
-            repo_root,
-            ["worktree", "lock", "--reason",
-             _archive_lock_reason(trash_path.name, recovery_failed=True),
-             original_path],
-            timeout=15,
-        )
+        reason = _archive_lock_reason(trash_path.name, recovery_failed=True)
+        if _run_git(
+            repo_root, ["worktree", "lock", "--reason", reason, original_path], timeout=15,
+        ) is None:
+            report["incomplete"] = True
+            print(f"Could not re-lock the registration of {original_path}: the archive's "
+                  "history anchor is UNLOCKED, so a `git worktree prune` or `git gc` can "
+                  "remove it and let the archived commits be collected. Lock it again: "
+                  f"git worktree lock --reason {_shell_word(reason)} "
+                  f"{_shell_word(original_path)}", file=sys.stderr)
 
     # Recreate the worktree: detached at its commit, or checked out on its branch.
     if detached or not branch:
@@ -2559,7 +2883,7 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
             print(
                 f"Branch {branch!r} no longer exists; recreated as a DETACHED "
                 f"worktree at {commit[:8]}. To restore the branch name: "
-                f"git -C {original_path} switch -c {branch}",
+                f"git -C {_shell_word(original_path)} switch -c {_shell_word(branch)}",
                 file=sys.stderr,
             )
             result = retry
@@ -2620,16 +2944,36 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
                 _relock()
                 return False
 
-        print(f"Moving trash contents back to {original_path}...", file=sys.stderr)
+        # COPIED, never moved. A move consumed a plain trash entry, and its
+        # metadata can be wrong about what the tree held (it is sampled before the
+        # move), so this copy cannot be trusted to be the only one needed. The
+        # entry stays where it is, and the run is INCOMPLETE: a plain directory
+        # with no usable checkout is not the worktree that was archived.
+        print(f"Copying the trash contents to {original_path}...", file=sys.stderr)
         try:
-            shutil.move(str(trash_path), original_path)
-            print(f"Recovered to {original_path} (as plain directory, not git worktree)")
-            return True
-        except (OSError, shutil.Error) as e:
-            print(f"Failed to move: {e}", file=sys.stderr)
-            # The archive is still in the trash and still needs its anchor.
+            shutil.copytree(str(trash_path), original_path, symlinks=True)
+        except FileExistsError as e:
+            print(f"Failed to copy: {e}", file=sys.stderr)
             _relock()
             return False
+        except (OSError, shutil.Error) as e:
+            print(f"Failed to copy: {e}", file=sys.stderr)
+            # The copy made this directory; the trash entry still holds everything.
+            shutil.rmtree(original_path, ignore_errors=True)
+            _relock()
+            return False
+        dest = Path(original_path)
+        reaper_meta = dest / ".trash_meta.json"
+        with contextlib.suppress(OSError):
+            if reaper_meta.is_file() and not reaper_meta.is_symlink():
+                reaper_meta.unlink()
+        _restore_preserved_meta(dest, meta)
+        report["incomplete"] = True
+        print(f"Recovered to {original_path} as a PLAIN DIRECTORY, not a git worktree: "
+              "neither its branch nor its commit could be checked out, so its `.git` "
+              f"pointer leads nowhere. The trash entry is kept at {where}.",
+              file=sys.stderr)
+        return True
 
     # Restore UNTRACKED files/symlinks that were in the trash but not recreated by
     # the fresh checkout (copy-only-missing). Reconstructing the full dirty state
@@ -2667,19 +3011,663 @@ def _restore_from_dir(trash_path: Path, repo_root: Path) -> bool:
             shutil.copy2(str(item), str(target))
         trash_files.add(str(rel))
 
-    # Clean up trash entry
-    shutil.rmtree(str(trash_path))
+    # The worktree's own `.trash_meta.json`, if archiving set one aside, came back
+    # under its aside name with the other untracked files; give it its name back.
+    if not _restore_preserved_meta(Path(original_path), meta):
+        report["incomplete"] = True
 
+    # Did the archive hold uncommitted changes? Anything but a recorded False
+    # counts: an older archive without the field may have held them too.
+    lost_edits = meta.get("had_uncommitted_changes") is not False
+
+    # NOTHING IS DELETED. For an archive `trash_path` is a scratch extraction that
+    # `_recover` removes, and the tarball is kept. A plain-directory entry used to
+    # be removed here whenever the metadata said it held no uncommitted changes,
+    # but that flag is sampled BEFORE the move, so an edit made after it went
+    # with the entry, and with the entry gone it was gone too. The recreated
+    # checkout does not carry such an edit, so the entry is kept.
     ref_label = f"branch: {branch}" if branch else f"detached at {commit[:8]}"
     print(f"Recovered to {original_path} ({ref_label})")
     if trash_files:
         print(f"Restored {len(trash_files)} untracked file(s) from trash")
-    print(
-        "Note: committed state restored at the ref plus untracked files; uncommitted "
-        "tracked edits, deletions, mode changes, and staged state are NOT reapplied "
-        "(committed content is always recoverable from main).",
-        file=sys.stderr,
+    if trash_path.parent == TRASH_DIR:
+        print(f"The trash entry is kept at {trash_path}; delete it once you have checked "
+              "the worktree.")
+    if lost_edits:
+        # INCOMPLETE, and said so, rather than the exit-0 note this used to print
+        # on the premise that the reaper only archives work already in main. The
+        # unmerged lane archives dirty work routinely. No recipe: the archive is
+        # named, and what to do with the edits is the reader's call.
+        report["incomplete"] = True
+        clause = _dirty_clause(meta)
+        print(
+            f"{clause[0].upper()}{clause[1:]}, and its registration is gone, so nothing "
+            f"could be reattached: {original_path} was recreated at its recorded ref "
+            "with its untracked files, and any uncommitted edits to tracked files, and "
+            "the staged state, were NOT restored. Whatever it held is still in the "
+            f"archive, kept at {where}.",
+            file=sys.stderr,
+        )
+        copied = sorted(
+            (Path(original_path) / rel for rel in trash_files
+             if "/" not in rel and _REAPER_PATCH_NAME.match(rel)),
+            key=_patch_order,
+        )
+        if meta.get("had_tracked_patch") is not False:
+            _name_reaper_patches(
+                copied, "it came back as an untracked file and is NOT applied",
+                file=sys.stderr, recorded=meta.get("patch_file", _UNRECORDED))
+    return True
+
+
+def _shell_word(text: str) -> str:
+    """``text`` as ONE bash word naming exactly the same bytes.
+
+    A filename that is not valid UTF-8 arrives here with surrogate escapes. Printed
+    as-is it raises on a strict UTF-8 stream; printed lossily the command would name
+    a different file. Bash's ``$'…'`` form with ``\\xHH`` escapes carries the exact
+    bytes in plain ASCII.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        raw = os.fsencode(text)
+        body = "".join(
+            chr(b) if 32 <= b < 127 and chr(b) not in "'\\" else f"\\x{b:02x}" for b in raw
+        )
+        return f"$'{body}'"
+    return shlex.quote(text)
+
+
+def _reattach_target(
+    trash_path: Path, original_path: str, repo_root: Path,
+) -> tuple[str, Path | None]:
+    """Whether the archived tree still has a registration to go back under.
+
+    Returns ``("ok", admin)`` when every check holds: the tree's ``.git`` is a regular
+    FILE naming an admin directory; that directory sits under this repository's own
+    ``worktrees/`` and has a HEAD; and its ``gitdir`` points back at
+    ``original_path`` (which makes it THIS tree's registration rather than one a later
+    ``git worktree add`` reused). ``("absent", None)`` when a check is answered and
+    fails, so recreating is right. ``("unknown", None)`` when a check could not be
+    answered at all: an unreadable file, git not answering, an admin directory with
+    its HEAD or ``gitdir`` missing. The recreate REPLACES the registration and with it
+    the only complete copy of the staged state, so an unanswered question must never
+    be read as "absent". Files are decoded with surrogateescape: git writes a path
+    byte for byte, and a strict decode of a non-UTF-8 name read as "unreadable".
+
+    Read-only, so `_describe_recovery` asks the same question a real run does.
+    """
+    state, text = _read_git_pointer(trash_path / ".git")
+    if state != "ok":
+        return state, None
+    return _registration_for_pointer(text, original_path, repo_root)
+
+
+def _read_git_pointer(dotgit: Path) -> tuple[str, str | None]:
+    """``("ok", text)`` for a regular ``.git`` FILE, ``("absent", None)`` when there
+    is none (or it is a symlink or a directory), ``("unknown", None)`` when it
+    could not be examined.
+
+    The stat calls are inside the ``try`` on purpose: on Python 3.12
+    ``Path.is_file()`` swallows only ENOENT-like errors and RAISES PermissionError,
+    which escaped as a traceback; read as "no file" it would have sent recovery to
+    the recreate.
+    """
+    try:
+        if dotgit.is_symlink() or not dotgit.is_file():
+            return "absent", None
+        return "ok", dotgit.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return "unknown", None
+
+
+def _registration_for_pointer(
+    text: str, original_path: str, repo_root: Path,
+) -> tuple[str, Path | None]:
+    """The rest of `_reattach_target`, given the archived ``.git`` file's text."""
+    text = text.strip()
+    if not text.startswith("gitdir:"):
+        return "absent", None
+    raw = text[len("gitdir:"):].strip()
+    admin = Path(raw) if os.path.isabs(raw) else Path(original_path) / raw
+    common = _run_git(repo_root, ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                      timeout=15)
+    if not common or not common.strip():
+        return "unknown", None
+    admin = Path(os.path.realpath(admin))
+    if admin.parent != Path(os.path.realpath(Path(common.strip()) / "worktrees")):
+        return "absent", None
+    try:
+        if not admin.is_dir():
+            return "absent", None
+        if not (admin / "HEAD").is_file():
+            return "unknown", None
+        pointed = (admin / "gitdir").read_text(
+            encoding="utf-8", errors="surrogateescape").strip()
+    except OSError:
+        return "unknown", None
+    back = Path(pointed) if os.path.isabs(pointed) else admin / pointed
+    if os.path.realpath(back) != os.path.realpath(Path(original_path) / ".git"):
+        return "absent", None
+    return "ok", admin
+
+
+def _place_tree(src: Path, dest: Path) -> bool:
+    """Put the tree at ``src`` at ``dest``; True when it was MOVED, False when COPIED.
+
+    A rename when both sit on one filesystem. Across filesystems a move is a copy
+    followed by deleting the source, and `shutil.move` does both: when that delete
+    failed part way (a read-only directory is enough), the source was left PARTIAL
+    while the only complete copy was the one at ``dest``, which the caller then
+    removed as a failed copy. MEASURED: files lost everywhere and the entry left
+    unrecoverable. So across filesystems this COPIES and never touches the source.
+    A copy that fails is removed before the error propagates, so no caller can
+    mistake a partial copy for the tree.
+    """
+    try:
+        os.rename(src, dest)
+        return True
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+    # CREATE THE DESTINATION FIRST, so a directory someone else made after the
+    # caller's existence check raises here, before anything of theirs could be
+    # removed as "our partial copy".
+    os.mkdir(dest)
+    try:
+        shutil.copytree(src, dest, symlinks=True, dirs_exist_ok=True)
+    except BaseException:
+        shutil.rmtree(dest, ignore_errors=True)  # made by this call; the source is intact
+        raise
+    return False
+
+
+def _unplace_tree(dest: Path, src: Path, moved: bool) -> bool:
+    """Undo `_place_tree`; True when ``src`` holds the tree again and ``dest`` is gone."""
+    if moved:
+        try:
+            os.rename(dest, src)
+        except OSError:
+            return False
+        return True
+    # A copy the source still duplicates, so removing it loses nothing.
+    shutil.rmtree(dest, ignore_errors=True)
+    return not os.path.lexists(dest)
+
+
+def _registration_lock(original_path: str, repo_root: Path) -> tuple[bool, str | None]:
+    """``(read, reason)`` for the registration of ``original_path``.
+
+    Read from the admin directories themselves, the way `_reattach_target` finds
+    them: the registration is the one whose ``gitdir`` points back at
+    ``original_path/.git``. ``reason`` is None when there is no such registration
+    or it is not locked; ``read`` is False when the question could not be
+    answered.
+
+    AN UNREADABLE ``gitdir`` MAKES THE WHOLE ANSWER UNKNOWN. It may be the very
+    registration being asked about, so skipping it answered "no registration, no
+    lock", and the caller then went ahead against what could be another archive's
+    anchor. Only an admin entry with NO ``gitdir`` at all (a stray file, or a
+    directory git itself would prune) is skipped; if it is this tree's own
+    registration, `_reattach_target` finds that file missing and answers unknown.
+
+    Deliberately not `_read_lock_file`, which returns None on ANY read error: an
+    unreadable ``locked`` file must not read as "not locked".
+    """
+    common = _run_git(repo_root, ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                      timeout=15)
+    if not common or not common.strip():
+        return False, None
+    want = os.path.realpath(Path(original_path) / ".git")
+    try:
+        admins = list((Path(common.strip()) / "worktrees").iterdir())
+    except FileNotFoundError:
+        return True, None
+    except OSError:
+        return False, None
+    for admin in admins:
+        try:
+            pointed = (admin / "gitdir").read_text(
+                encoding="utf-8", errors="surrogateescape").strip()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            return False, None
+        back = pointed if os.path.isabs(pointed) else str(admin / pointed)
+        if os.path.realpath(back) != want:
+            continue
+        try:
+            return True, (admin / "locked").read_text(
+                encoding="utf-8", errors="surrogateescape")
+        except FileNotFoundError:
+            return True, None
+        except OSError:
+            return False, None
+    return True, None
+
+
+def _dirty_clause(meta: dict) -> str:
+    """What the archive's own metadata says about uncommitted changes, for a run that
+    treats it as possibly dirty (anything but a recorded False).
+
+    A recorded True is stated as a fact. Anything else is NOT: archives made before
+    the flag was recorded carry metadata without it, and their sidecars may hold a
+    value filled in later by a method the archive does not record, which recovery
+    does not read. Saying "held" there claims what nobody checked.
+    """
+    if meta.get("had_uncommitted_changes") is True:
+        return "the archive held uncommitted changes"
+    return ("the archive does not record whether it held uncommitted changes (it was "
+            "made before that was recorded)")
+
+
+def _aside_meta_problem(meta: dict, root_names: set[str], *, name_taken: bool) -> str | None:
+    """What giving the worktree's own ``.trash_meta.json`` its name back will hit.
+
+    Judged from the names at the tree's ROOT alone, so the dry run can ask it of
+    the archive's file list and the real run of the placed tree. None means
+    nothing to report: either nothing was set aside, or the recorded file is there
+    and its real name is free. ``name_taken``: something already holds
+    ``.trash_meta.json`` (in a recreate, a tracked file the checkout wrote).
+    """
+    if "preserved_meta" not in meta:
+        aside = sorted(n for n in root_names if n.startswith(_ASIDE_META_PREFIX))
+        if aside:
+            return (f"{', '.join(aside)}: set aside at archive time under a name the "
+                    "archive did not record. One of them is probably this worktree's own "
+                    ".trash_meta.json; rename it back once checked.")
+        return None
+    preserved = meta["preserved_meta"]
+    if preserved is None:
+        return None
+    if (not isinstance(preserved, str) or not preserved.startswith(_ASIDE_META_PREFIX)
+            or "/" in preserved):
+        return (f"The archive's record of where this worktree's own .trash_meta.json went "
+                f"is not a name it could have written ({preserved!r}); nothing is renamed.")
+    if preserved not in root_names:
+        return (f"The archive records that this worktree's own .trash_meta.json was kept "
+                f"as {preserved}, but there is no such file.")
+    if name_taken:
+        return (f"{preserved} is this worktree's own .trash_meta.json, set aside at archive "
+                "time; it is not renamed back because something already holds that name.")
+    return None
+
+
+def _restore_preserved_meta(dest: Path, meta: dict) -> bool:
+    """Give the worktree its own ``.trash_meta.json`` back under its real name.
+
+    Archiving renames a worktree's own file of that name aside, so the reaper's can
+    take the name; this is the reverse, for the reattach and the recreate alike.
+    The record has three states, and each means one thing:
+
+    * key ABSENT — an archive from before the name was recorded. A file under an
+      aside name is probably the worktree's own, but which one cannot be told, so
+      it is named, not renamed, and the recovery is incomplete;
+    * ``None`` — the worktree had no such file, so nothing was set aside and no
+      file is looked at (a worktree's own file that merely LOOKS like an aside
+      name is its own, and is left alone);
+    * a name — that file is renamed back. It being absent, or the real name being
+      taken, is reported and makes the recovery incomplete.
+
+    False when the recovery should be reported incomplete. The verdict comes from
+    `_aside_meta_problem`, which the dry run asks of the archive's file list, so
+    the preview and the real run cannot disagree about it.
+    """
+    meta_file = dest / ".trash_meta.json"
+    try:
+        names = set(os.listdir(dest))
+    except OSError:
+        names = set()
+    problem = _aside_meta_problem(meta, names, name_taken=os.path.lexists(meta_file))
+    if problem:
+        print(f"NOTE: {problem} (in {dest})", file=sys.stderr)
+        return False
+    preserved = meta.get("preserved_meta")
+    if not isinstance(preserved, str):
+        return True
+    try:
+        (dest / preserved).rename(meta_file)
+    except OSError as e:
+        print(f"Could not give {dest / preserved} back its name .trash_meta.json ({e}); "
+              "it is the worktree's own file, set aside at archive time.", file=sys.stderr)
+        return False
+    return True
+
+
+def _reattach_plan(
+    meta: dict, admin: Path, repo_root: Path, original_path: str, *, owned: bool,
+) -> dict:
+    """What a reattach under ``admin`` would find, asked WITHOUT placing the tree.
+
+    One read-only step shared by `_describe_recovery` and `_reattach`, so the
+    preview and the real run report the same verdicts from the same checks. A
+    reattach never claims the result is "exact": it reports what it checked.
+
+    Returns ``{"abort": str | None, "problems": [str], "checked": str}``.
+    ``abort`` is set when a check could not be ANSWERED (git did not answer about
+    HEAD, or the index could not be examined); a real run then stops with nothing
+    changed. Each entry in ``problems`` is a fact a real run reports and exits 2
+    on. ``checked`` says what was verified when there are no problems.
+
+    * HEAD is asked of the registration itself (``git --git-dir=<admin>``) as
+      ``HEAD^{commit}``. MEASURED, git 2.43: `rev-parse --verify -q` exits 0 when
+      it resolves, 1 when the ref or the commit is absent, 128 when the directory
+      cannot be read as a repository; only 1 is read as absent. The ``^{commit}``
+      is load-bearing: a detached HEAD naming a MISSING object passes a bare
+      ``HEAD`` with exit 0 and echoes the sha back.
+    * The index is the registration's own file, ``<admin>/index`` (what
+      `rev-parse --git-path index` names for a linked worktree, MEASURED). It is
+      checked for PRESENCE only. A missing index is reported, never rewritten:
+      the files are as archived, but `git status` will compare them against an
+      empty index. Its CONTENT is not verified against the archive, and the
+      success line says so.
+
+    Every problem is complete sentences ending in a full stop; a command the
+    reader may run follows on its own indented line, so nothing is ever glued to
+    it when it is printed.
+    """
+    problems: list[str] = []
+    rc, out = _run_git_rc(repo_root, [f"--git-dir={admin}", "rev-parse", "--verify", "-q",
+                                      "HEAD^{commit}"], timeout=15)
+    if rc is None or rc not in (0, 1):
+        return {"abort": "git could not say what the registration's HEAD names",
+                "problems": [], "checked": ""}
+    try:
+        st = os.lstat(admin / "index")
+        index = "present" if stat.S_ISREG(st.st_mode) else "unknown"
+    except FileNotFoundError:
+        index = "missing"
+    except OSError:
+        index = "unknown"
+    if index == "unknown":
+        return {"abort": "the registration's index could not be examined",
+                "problems": [], "checked": ""}
+
+    commit = meta.get("commit", "")
+    if not owned:
+        problems.append(
+            f"The registration of {original_path} is not held by this archive (it is "
+            "unlocked, or locked by someone else), so its index may be a later "
+            "session's rather than the archived one; check `git status` before relying "
+            "on the staged changes.")
+    if index == "missing":
+        problems.append(
+            "The registration's index is missing, so `git status` will show every "
+            "tracked file as deleted and the files as untracked; the files themselves "
+            "are as archived. It was not rewritten.")
+    if rc == 0:
+        head = out.strip()
+        if not commit:
+            problems.append(
+                f"The archive recorded no commit, so HEAD ({head[:8]}) could not be "
+                "compared with it.")
+        elif head != commit:
+            problems.append(
+                f"The branch has MOVED since archiving (was {commit[:8]}, now "
+                f"{head[:8]}): `git status` shows the difference between the two as "
+                "changes here, and a commit now would record it as this tree's own "
+                "work, undoing the branch's move. Rebase or merge the archived work first.")
+    else:
+        problems.append(_absent_head_problem(meta, admin, repo_root, original_path))
+    return {"abort": None, "problems": problems,
+            "checked": "this archive holds the lock, HEAD is the recorded commit, the "
+                       "index is present"}
+
+
+def _absent_head_problem(
+    meta: dict, admin: Path, repo_root: Path, original_path: str,
+) -> str:
+    """Name an unresolvable HEAD, and the commit it should point at.
+
+    Nothing is changed: HEAD is left naming what it names, and when the commit
+    still exists the command that recreates the branch is printed, on its own
+    line, for the reader to run, not run here. Whether the commit exists has three
+    answers, and only an exit 1 from `rev-parse --verify -q` proves it gone.
+    """
+    commit = meta.get("commit", "")
+    try:
+        head_text = (admin / "HEAD").read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        head_text = ""
+    ref = head_text.strip()
+    branch = ref[len("ref: refs/heads/"):] if ref.startswith("ref: refs/heads/") else ""
+    what = (f"HEAD names branch {branch!r}, which no longer exists" if branch
+            else "HEAD does not resolve to a commit")
+    if not commit:
+        return f"{what}, and the archive recorded no commit to point it at."
+    rc, _ = _run_git_rc(repo_root, ["rev-parse", "--verify", "-q", f"{commit}^{{commit}}"],
+                        timeout=15)
+    if rc == 1:
+        return (f"{what}, and its commit {commit[:8]} no longer exists in this repository "
+                "(gc has collected it). The files and the index are back with no commit "
+                f"under them; recover {commit[:8]} from a clone or a remote that still has "
+                "it before committing here.")
+    if rc != 0:
+        return (f"{what}; whether its commit {commit[:8]} still exists could not be "
+                "checked.")
+    if branch:
+        return (f"{what}. Its commit {commit[:8]} still exists; this recreates the branch "
+                "at it:\n"
+                f"    git -C {_shell_word(original_path)} branch {_shell_word(branch)} {commit}")
+    # `update-ref`, never `checkout`: this moves HEAD alone, leaving the archived
+    # files and index exactly as they came back.
+    return (f"{what}. The recorded commit {commit[:8]} still exists; this points HEAD at "
+            "it:\n"
+            f"    git -C {_shell_word(original_path)} update-ref --no-deref HEAD {commit}")
+
+
+def _reattach(
+    trash_path: Path, meta: dict, repo_root: Path, original_path: str, admin: Path,
+    report: dict, where: Path, *, owned: bool,
+) -> str:
+    """Move the archived tree back under its registration.
+
+    Returns ``done``; ``fallback`` when git answered that the registration is NOT
+    this tree's, so recreating is right; ``abort`` when the tree could not be placed
+    or git could not be asked, so nothing is recreated (the recreate replaces the
+    registration, and with it the only complete copy of the staged state, so it is
+    reserved for a registration PROVEN unusable); ``stuck`` when the tree could be
+    moved neither in nor back. Only ``done`` removes anything, and only the
+    reaper's own metadata file. The reaper's ``.dirty.patch`` snapshot, which
+    archiving wrote INTO the tree, is left where it is and named.
+
+    It NEVER CLAIMS THE RESULT IS EXACT. `_reattach_plan` runs first, before the
+    tree is placed, and is the same step the dry run takes: an unanswered check
+    stops here with nothing changed, and every problem it names is reported and
+    makes the run exit 2. With none, the run says what it checked. Nothing here
+    changes HEAD or the index: a branch deleted since archiving is reported with
+    the command that recreates it, not recreated.
+
+    THE LOCK IS RELEASED ONLY AFTER THE BINDING VERIFIES, and only when this
+    archive owns it. The lock is what keeps the archived commits reachable, and
+    `_archive_entry_from_reason` is how expiry and the zero-drop sweep recognise
+    it, so every failure path returns with the archive-time lock untouched rather
+    than re-locking under wording those readers might not parse.
+    """
+    plan = _reattach_plan(meta, admin, repo_root, original_path, owned=owned)
+    if plan["abort"]:
+        print(f"Could not check the registration of {original_path}: {plan['abort']}. "
+              f"Nothing was changed; the archive is intact at {where}. Retry --recover.",
+              file=sys.stderr)
+        return "abort"
+    dest = Path(original_path)
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        moved = _place_tree(trash_path, dest)
+    except (OSError, shutil.Error) as e:
+        # Raised before anything is written: a rename onto an occupied path, or onto
+        # a non-directory there (ENOTDIR, e.g. a symlink that appeared meanwhile).
+        if isinstance(e, OSError) and e.errno in (errno.EEXIST, errno.ENOTEMPTY,
+                                                  errno.ENOTDIR):
+            print(f"Something else now occupies {dest}, so the archived tree was not "
+                  f"placed. Nothing was changed; the archive is intact at {where}.",
+                  file=sys.stderr)
+            return "abort"
+        if os.path.lexists(dest):
+            print(f"Could not place the archived tree ({e}), and part of a copy remains at "
+                  f"{dest}. The archive is intact at {where}; remove {dest} and retry.",
+                  file=sys.stderr)
+            report["incomplete"] = True
+            return "stuck"
+        print(f"Could not place the archived tree ({e}). Nothing was changed; the archive "
+              f"is intact at {where}. Retry --recover once the cause is fixed.",
+              file=sys.stderr)
+        return "abort"
+
+    # VERIFY THE BINDING, and nothing else. `git status` was the check once: it walks
+    # the whole tree, so on a slow disk it timed out and a healthy reattach went to
+    # the recreate, destroying the index (MEASURED); and it decoded names strictly,
+    # so a raw non-UTF-8 name raised after the move (MEASURED). What proves the
+    # tree is back under its own registration is that git resolves it to that
+    # admin directory. Timeout: this reads two small files; 15 s is generous.
+    git_dir = _run_git(dest, ["rev-parse", "--absolute-git-dir"], timeout=15)
+    if git_dir is None or os.path.realpath(git_dir.strip()) != os.path.realpath(admin):
+        # Nothing was unlocked yet, so the archive-time anchor is still in place.
+        if not _unplace_tree(dest, trash_path, moved):
+            print(f"THE PLACED TREE AT {dest} DID NOT VERIFY and could not be taken back "
+                  f"out. The archive is intact at {where}; remove or inspect {dest} by hand "
+                  "before retrying.", file=sys.stderr)
+            report["incomplete"] = True
+            return "stuck"
+        if git_dir is None:
+            print("git could not be asked whether the archived tree belongs to its "
+                  f"registration. Nothing was changed; the archive is intact at {where}. "
+                  "Retry --recover.", file=sys.stderr)
+            return "abort"
+        print("The archived tree does not belong to its registration any more; recreating "
+              "the worktree at its recorded ref instead.", file=sys.stderr)
+        return "fallback"
+
+    # The tree is bound to its registration, so the archive's anchor can go —
+    # but only a lock THIS archive holds. A lock someone else took is theirs, and
+    # an unlocked registration has nothing to release. The answer is checked: a
+    # worktree left locked under the reaper's reason reads as an archive anchor to
+    # expiry and to the zero-drop sweep, which is not what a recovered tree is.
+    unlock_failed = owned and _run_git(
+        repo_root, ["worktree", "unlock", original_path], timeout=10) is None
+
+    # The reaper's metadata goes; the worktree's own files stay.
+    leftovers = []
+    meta_file = dest / ".trash_meta.json"
+    if meta_file.is_file() and not meta_file.is_symlink():
+        try:
+            meta_file.unlink()
+        except OSError:
+            leftovers.append(meta_file)
+    if not _restore_preserved_meta(dest, meta):
+        report["incomplete"] = True
+    if not moved and trash_path.parent == TRASH_DIR:
+        print(f"The trash entry was COPIED, not moved (it is on another filesystem), and "
+              f"is kept at {trash_path}. Delete it once you have checked the worktree.",
+              file=sys.stderr)
+
+    report["mode"] = "reattached"
+    print(f"Reattached {original_path} to its preserved registration.")
+    if leftovers:
+        # The tree is not as archived while the reaper's own files remain in it.
+        report["incomplete"] = True
+        print("Could not remove the reaper's own file(s) from the tree: "
+              + ", ".join(str(x) for x in leftovers), file=sys.stderr)
+    if unlock_failed:
+        report["incomplete"] = True
+        print(f"Could not unlock the registration of {original_path}: it is still locked "
+              "as this archive's history anchor, so trash expiry and the stranded-work "
+              "sweep still treat it as an archive. Unlock it once checked: git worktree "
+              f"unlock {_shell_word(original_path)}", file=sys.stderr)
+    if meta.get("had_tracked_patch") is not False:
+        _name_reaper_patches(
+            _untracked_reaper_patches(dest),
+            "the tree already holds those edits, so it is safe to delete once checked",
+            file=sys.stdout, recorded=meta.get("patch_file", _UNRECORDED),
+        )
+    for problem in plan["problems"]:
+        report["incomplete"] = True
+        print(f"NOTE: {problem}", file=sys.stderr)
+    # Said LAST, and only when nothing above found a problem. It states what was
+    # checked and what was not; it never says "exact".
+    if not report.get("incomplete"):
+        print(f"Checked: {plan['checked']}. The index is the registration's own and was "
+              "not verified against the archive.")
+    return "done"
+
+
+# The names `_trash_worktree` gives its snapshot of the tracked edits: the first
+# free one of `.dirty.patch`, `.dirty.patch.archived-1`, `-2`, … at the tree's root.
+_REAPER_PATCH_NAME = re.compile(r"\.dirty\.patch(?:\.archived-([0-9]+))?\Z")
+
+
+def _patch_order(path: Path) -> int:
+    m = _REAPER_PATCH_NAME.match(path.name)
+    return int(m.group(1)) if m and m.group(1) else 0
+
+
+def _untracked_reaper_patches(tree: Path) -> list[Path]:
+    """Root files named like the reaper's snapshot and UNTRACKED in ``tree``.
+
+    Identified by name and untrackedness only — nothing records which name the
+    reaper used, and this never deletes anything, so the result only has to be
+    honest about what it cannot tell apart (see `_name_reaper_patches`). When git
+    cannot say what is tracked, nothing is claimed.
+    """
+    try:
+        found = sorted(
+            (p for p in tree.iterdir()
+             if _REAPER_PATCH_NAME.match(p.name) and not p.is_symlink() and p.is_file()),
+            key=_patch_order,
+        )
+    except OSError:
+        return []
+    if not found:
+        return []
+    tracked = _run_git(
+        tree, ["--literal-pathspecs", "ls-files", "-z", "--", *(p.name for p in found)],
+        timeout=30,
     )
+    if tracked is None:
+        return []
+    listed = set(tracked.split("\0"))
+    return [p for p in found if p.name not in listed]
+
+
+# `patch_file` missing from the metadata: an archive from before the name was
+# recorded, or one whose final metadata rewrite failed. Distinct from None, which
+# is a RECORD that no snapshot was written.
+_UNRECORDED = object()
+
+
+def _name_reaper_patches(paths: list[Path], tail: str, *, file,
+                         recorded: object = _UNRECORDED) -> bool:
+    """Say which file is the reaper's snapshot of the edits. True when one was named.
+
+    ``recorded`` is the archive's ``patch_file``: the name the snapshot was written
+    under, or None when none was. When the archive records it, exactly that file
+    is named and nothing else. When it does not, the reaper's file cannot be told
+    from the worktree's own by name: it takes the first FREE name in the sequence,
+    so a gap in the worktree's own names puts it below them, not last. Several
+    candidates are therefore listed without saying which one it is.
+    """
+    if recorded is None or isinstance(recorded, str):
+        match = [p for p in paths if p.name == recorded]
+        if not match:
+            return False
+        print(f"{match[0]} is the reaper's snapshot of the uncommitted edits, written at "
+              f"archive time; {tail}.", file=file)
+        return True
+    if not paths:
+        return False
+    if len(paths) == 1:
+        # Hedged, not asserted: the archive records that a snapshot was MADE, not
+        # that its write succeeded, so a lone candidate can be a file the worktree
+        # already had under that name.
+        print(f"{paths[0]} is the reaper's snapshot of the uncommitted edits, written at "
+              f"archive time, unless this worktree already had a file by that name; "
+              f"{tail}.", file=file)
+        return True
+    print("One of these is the reaper's snapshot of the uncommitted edits, written at "
+          "archive time: " + ", ".join(str(p) for p in paths) + f"; whichever it is, "
+          f"{tail}. This archive does not record which one it wrote, and the others are "
+          "the worktree's own files, so check each one before deleting any.", file=file)
     return True
 
 
@@ -3428,7 +4416,9 @@ def main() -> int:
     # locale, as the timer runs — RAISED on the first such line and ended the run
     # (MEASURED, run as the timer runs it). Escape what cannot be encoded. The
     # metadata this script writes goes through `json.dumps`, which escapes it
-    # already.
+    # already. `--recover` needs it as much as the scan: a raise there landed
+    # AFTER the tree had moved and before the checks that report an incomplete
+    # result. Commands meant to be pasted are quoted separately.
     for stream in (sys.stdout, sys.stderr):
         with contextlib.suppress(AttributeError, ValueError):
             stream.reconfigure(errors="backslashreplace")
@@ -3462,7 +4452,16 @@ def main() -> int:
         # ("Show what would happen without doing it") is taught by the reap path
         # ("WOULD TRASH ..."), so silently dropping it here would perform a full
         # real recovery — thousands of files — under a no-op flag.
-        return 0 if _recover(args.recover, repo_root, dry_run=args.dry_run) else 1
+        #
+        # 2 when the worktree came back but not as it was archived (uncommitted
+        # edits not restored, a moved branch, a registration this archive did not
+        # hold), so a script or a dispatched session cannot read a partial
+        # recovery as success. A dry run only SAYS it would exit 2; the preview
+        # itself succeeded, so it exits 0.
+        report: dict = {}
+        if not _recover(args.recover, repo_root, report, dry_run=args.dry_run):
+            return 1
+        return 2 if report.get("incomplete") else 0
 
     if args.report_json:
         try:

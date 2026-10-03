@@ -71,7 +71,7 @@ def test_b5_serena_register_runs_from_repo_root():
     code = _code(BOOTSTRAP)
     # `-s project` is cwd-keyed; the register must be wrapped in a cd-subshell so
     # it always writes .mcp.json to the repo, never the caller's cwd.
-    assert '( cd "$GENESIS_ROOT" && _register_mcp "serena" "project"' in code
+    assert '( cd "$GENESIS_ROOT" && _register_serena "$GENESIS_ROOT"' in code
 
 
 # ── B6: timezone validated, but only when enumerable ────────────────

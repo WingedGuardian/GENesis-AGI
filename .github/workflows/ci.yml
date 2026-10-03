@@ -504,7 +504,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-09-29: 66 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-02: 68 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -1098,4 +1098,16 @@ jobs:
         #     assume-unchanged / skip-worktree, a listing over a pipe buffer, and
         #     the refusal hint)
         # Floor: 23644 + 65 = 23709.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23709
+        # GitNexus routine refresh: focused edited files collect 123 -> 135
+        # tests (+4 runner, +5 launcher, +3 indexer); no added skips.
+        # Routing generations: 143 collected across the four new generation files.
+        # Floor 23721 + 143 = 23864; skip ceiling remains 102.
+        # #2735 stacked-PR contract: test_ci_triggers.py 0 -> 5 (+5: main-only
+        # PR trigger, no edited type, push/schedule/dispatch unchanged,
+        # cc-pin merge-base, and the origin/main line allowlist); no added
+        # skips. Floor: 23864 + 5 = 23869.
+        # Shared Serena adds 284 cases; main floor is 24153.
+        # Human-reference integrity: 32 initial +49 first repair +11 atomic
+        # publication =92 cases across three branch-new files, no added skips.
+        # Floor: 24153 +92 =24245; skip ceiling remains 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24245

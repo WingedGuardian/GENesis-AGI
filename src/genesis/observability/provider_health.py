@@ -84,8 +84,11 @@ class ProviderHealthChecker:
         *,
         breakers: CircuitBreakerRegistry | None = None,
         ttl_s: float = 300.0,
+        routing_snapshot=None,
     ) -> None:
         self._config = routing_config
+        self._routing_snapshot = routing_snapshot
+        self._probed_config = routing_config
         self._breakers = breakers
         self._results: dict[str, ProviderProbeResult] = {}
         self._ttl_s = ttl_s
@@ -94,10 +97,14 @@ class ProviderHealthChecker:
     @property
     def results(self) -> dict[str, ProviderProbeResult]:
         """Current cached probe results (frozen, safe to share)."""
+        if self._routing_snapshot and self._routing_snapshot()[0] is not self._probed_config:
+            return {}
         return dict(self._results)
 
     def is_stale(self) -> bool:
         """True if cache is older than TTL."""
+        if self._routing_snapshot and self._routing_snapshot()[0] is not self._probed_config:
+            return True
         return (time.monotonic() - self._last_probe_at) > self._ttl_s
 
     async def probe_all(self) -> dict[str, ProviderProbeResult]:
@@ -106,9 +113,15 @@ class ProviderHealthChecker:
         Deduplicates by provider_type — only one probe per type, then
         distributes the result to all providers of that type.
         """
+        if self._routing_snapshot:
+            config, bindings = self._routing_snapshot()
+        else:
+            config = self._config
+            bindings = {n: self._breakers.get(n) for n in config.providers} if self._breakers else {}
+        results = {}
         # Group providers by type
         type_to_providers: dict[str, list[ProviderConfig]] = {}
-        for cfg in self._config.providers.values():
+        for cfg in config.providers.values():
             if not cfg.enabled:
                 continue
             type_to_providers.setdefault(cfg.provider_type, []).append(cfg)
@@ -137,7 +150,7 @@ class ProviderHealthChecker:
                 model_ok = base_result.model_available
                 if base_result.reachable and base_result._models:
                     model_ok = cfg.model_id in base_result._models
-                self._results[cfg.name] = ProviderProbeResult(
+                results[cfg.name] = ProviderProbeResult(
                     provider_name=cfg.name,
                     reachable=base_result.reachable,
                     configured=base_result.configured,
@@ -147,11 +160,15 @@ class ProviderHealthChecker:
                     checked_at=base_result.checked_at,
                 )
 
+        if self._routing_snapshot and self._routing_snapshot()[0] is not config:
+            return self.results  # stale probe cannot publish or change current health
+        self._sync_to_breakers(results, bindings)
+        self._results = results
+        self._probed_config = config
         self._last_probe_at = time.monotonic()
-        self._sync_to_breakers()
-        return dict(self._results)
+        return self.results
 
-    def _sync_to_breakers(self) -> None:
+    def _sync_to_breakers(self, results=None, bindings=None) -> None:
         """Push probe findings to circuit breakers.
 
         Unreachable or rate-limited providers get tripped to HALF_OPEN
@@ -162,12 +179,14 @@ class ProviderHealthChecker:
         """
         if not self._breakers:
             return
-        for name, result in self._results.items():
+        results = self._results if results is None else results
+        get_breaker = self._breakers.get if bindings is None else bindings.__getitem__
+        for name, result in results.items():
             if not result.configured:
                 continue  # No API key — don't trip CB for missing config
             if not result.reachable or result.error == "rate limited":
                 try:
-                    cb = self._breakers.get(name)
+                    cb = get_breaker(name)
                     cb.probe_suspect()
                 except (KeyError, OSError):
                     logger.debug("CB sync failed for probed provider %s", name, exc_info=True)
@@ -181,7 +200,7 @@ class ProviderHealthChecker:
                 # probe_success_threshold), and a falsely-healed provider re-trips on its
                 # next real failure.
                 try:
-                    self._breakers.get(name).record_probe_success()
+                    get_breaker(name).record_probe_success()
                 except (KeyError, OSError):
                     logger.debug("CB heal sync failed for probed provider %s", name, exc_info=True)
                 except Exception:

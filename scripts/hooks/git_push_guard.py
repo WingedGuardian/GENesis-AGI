@@ -155,6 +155,23 @@ except Exception as _approval_exc:  # noqa: BLE001 — missing new helper must b
         pass
     os._exit(2)
 
+# The install-local ask policy (`hooks.asks.push_publish`). SOFT, and the fallback
+# is the prompt: a missing or older policy module means "nothing declared", which
+# is the public default, so version skew costs an extra prompt, never a silence.
+try:
+    from hook_ask_policy import ask_suppressed as _ask_suppressed  # noqa: E402
+    from hook_ask_policy import drain_notes as _drain_ask_notes  # noqa: E402
+    from hook_ask_policy import suppressed_reason as _suppressed_reason  # noqa: E402
+except Exception:  # noqa: BLE001 — skew falls back to ASKING.
+    def _ask_suppressed(key: str) -> bool:  # type: ignore[misc]
+        return False
+
+    def _drain_ask_notes() -> str:  # type: ignore[misc]
+        return ""
+
+    def _suppressed_reason(key: str, detail: str = "") -> str:  # type: ignore[misc]
+        return ""
+
 # The primary reviewer, the known review formats and the per-reviewer severity
 # parsers live in a stdlib sibling so every gate reads the SAME definitions, and
 # so the round counter can read findings with the same code this gate scores them
@@ -5403,40 +5420,45 @@ _CODEX_SUMMARY_ROW_RE = re.compile(
 #: finding linking `/blob/<full sha>/…`) and left NO review object, while its summary
 #: row still read Completed. So "no review object" alone does not mean "clean".
 _CODEX_FINDINGS_COMMENT_RE = re.compile(r"!\[P\d Badge\]|💡 Codex Review")
-#: pulls/N/commits stops at 250. Landing on it cannot prove the list is complete, so
-#: a short sha resolved against it could be ambiguous with a commit it never saw.
-_PR_COMMITS_CEILING = 250
-
-
-def _pr_commit_shas(pr_num: str, repo: str | None = None) -> list[str] | None:
-    """Every commit of the PR (full lowercase oids), or None when unreadable or at the
-    endpoint's 250-commit ceiling. Tests inject ``_TEST_GH_PR_COMMITS`` (one sha per
-    line; empty = no commits). Read only on the would-block path."""
-    raw = os.environ.get("_TEST_GH_PR_COMMITS")
-    if raw is None:
+def _commit_at_prefix(short: str, repo: str | None = None) -> str | None:
+    """The full lowercase oid GitHub resolves ``short`` to across the WHOLE repository
+    (``GET repos/{o}/{r}/commits/{short}``), or None. MEASURED 2026-10-01: an id shared
+    by two objects (commit+commit or commit+blob), an unknown id and one under 7 hex
+    all answer 422 "No commit found", so None covers ambiguity, absence, any error,
+    timeout and malformed output alike. Tests inject ``_TEST_GH_COMMIT_AT_PREFIX``: a
+    JSON object {short: full_sha_or_null}; empty, unparseable or a missing key is None."""
+    if not isinstance(short, str) or not re.fullmatch(r"[0-9a-fA-F]{7,40}", short):
+        return None
+    raw = os.environ.get("_TEST_GH_COMMIT_AT_PREFIX")
+    if raw is not None:
         try:
-            result = subprocess.run(
+            payload = json.loads(raw)
+            result = payload.get(short) if isinstance(payload, dict) else None
+        except Exception:
+            return None
+        if not isinstance(result, str):
+            return None
+        result = result.strip().lower()
+    else:
+        try:
+            response = subprocess.run(
                 [
                     "gh",
                     "api",
-                    f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/commits?per_page=100",
-                    "--paginate",
+                    f"repos/{repo or ':owner/:repo'}/commits/{short}",
                     "--jq",
-                    ".[].sha",
+                    ".sha",
                 ],
                 capture_output=True,
                 text=True,
-                timeout=_gh_timeout(8),
+                timeout=_gh_timeout(6),
             )
-            if result.returncode != 0:
+            if response.returncode != 0:
                 return None
-            raw = result.stdout
+            result = response.stdout.strip().lower()
         except Exception:
             return None
-    shas = [line.strip().lower() for line in (raw or "").splitlines() if line.strip()]
-    if len(shas) >= _PR_COMMITS_CEILING or not all(re.fullmatch(r"[0-9a-f]{40}", s) for s in shas):
-        return None
-    return shas
+    return result if re.fullmatch(r"[0-9a-f]{40}", result) else None
 
 
 def _codex_clean_signal_at_head(
@@ -5452,26 +5474,30 @@ def _codex_clean_signal_at_head(
     only when ALL hold:
 
     - the comment is authored by the configured Codex login with ``type == "Bot"``;
-    - its id resolves UNIQUELY, against THIS PR's own commit list, to a commit EQUAL
-      to ``head`` — a second PR commit sharing the prefix makes it ambiguous and it
-      does not count, and a commit outside the PR cannot resolve at all;
+    - its abbreviated id resolves repo-wide to exactly ``head``; a 422 (ambiguous or
+      unknown) refuses it. Matching the head implies the commit is the PR's;
     - NO Codex review object exists at ``head`` in any state (dismissed included),
       and NO Codex issue comment on the PR carries findings — Codex usually files
       findings as a review object, but MEASURED on 2 of 339 PRs it posted them as a
       `💡` issue comment with no review object while the summary read Completed;
-    - the comment is unedited or edited only by Codex (an edit keeps the original
-      author, so the author proves nothing about the body);
-    - the PR's history has never moved under it: no force-push, no base change,
-      no base force-push, no head-branch restore. Each can drop the reviewed commit
-      from the PR's commit list while a commit sharing its prefix (a short id is
-      cheap to grind) stays, and the prefix would then resolve uniquely to it.
-      GraphQL names only a force-push's old TIP, not what it dropped under it, so
-      the dropped commit cannot be put back into the list. MEASURED 2026-09-30:
-      4 of 73 open PRs carry such an event (one base change, three restores) and
-      fall back to needing a Codex review object; none carries a force-push.
-      Residual, stated: a reviewed commit that reaches the BASE branch by another
-      route also leaves the list, with no event here; exploiting that needs a
-      deliberately ground prefix collision as well.
+    - no non-Codex edit or deleted edit revision exists on any Codex comment;
+    - the PR's history beneath the signal has not moved: no head force-push,
+      head-branch deletion or restore, or base change. A base change stays a veto
+      because the signal names the head, not the base Codex reviewed against;
+      retargeting changes the effective diff without moving the head. A base
+      force-push stays retired: merging requires the default base
+      (``_check_base_is_default``), whose ruleset forbids force-push and deletion,
+      so a force-pushed non-default base can reach a merge only through a base
+      change, which vetoes. MEASURED 2026-10-01: all 541 commits dropped by 191
+      force-pushes (PR #65 to #2309) still resolve repo-wide by 7-hex id; the
+      oldest is from 2026-04-17. Dropped head commits are therefore not the
+      binding risk. A deleted comment leaves no trace in the API.
+
+    Residual, stated: a branch or tag named exactly after the short id takes priority
+    in GitHub's lookup (it uses git's name-guessing rules; measured:
+    ``pull/2720/head`` and ``main`` resolve). Creating one needs push rights to the
+    base repo, whose sole collaborator is the owner, and no hex-named ref exists.
+    Fork authors cannot create base-repo refs.
 
     Anything unreadable is None: the gate then blocks exactly as before. When a
     clean signal WAS seen and refused, ``why`` (if given) receives ``signal`` (what
@@ -5481,7 +5507,7 @@ def _codex_clean_signal_at_head(
     """
     note = why if why is not None else {}
     primary = _primary_reviewer_login()
-    if _review_budget is None or primary is None:
+    if primary is None:
         return None
     evidence = _codex_signal_evidence(pr_num, repo=repo)
     if evidence is None:
@@ -5490,20 +5516,21 @@ def _codex_clean_signal_at_head(
     codex = primary.removesuffix("[bot]")  # GraphQL names an App by its slug
     candidates: list[tuple[str, str]] = []
     findings = False
+    foreign: tuple[str, str] | None = None
     for c in evidence["comments"]:
         if c["login"] != codex or c["type"] != "Bot":
             continue
         body = c["body"]
         summary = _CODEX_SUMMARY_MARKER in body
+        if c["foreign_edit"]:
+            if foreign is None:
+                foreign = ("summary" if summary else "comment", c["foreign_edit"])
+            continue
         # Findings delivered as an issue comment veto the signal, at ANY commit: no
         # gate scores that channel yet, so a clean signal on a later head must not
         # walk past findings filed there on an earlier one (2 of 339 PRs, measured).
         if not summary and _CODEX_FINDINGS_COMMENT_RE.search(body):
             findings = True
-            continue
-        # An edit keeps the original author, so only an unedited comment, or one Codex
-        # itself edited (it rewrites its summary in place), speaks for Codex.
-        if c["editor"] not in (None, codex):
             continue
         if _CODEX_CLEAN_COMMENT_RE.search(body):
             m = _CODEX_REVIEWED_COMMIT_RE.search(body)
@@ -5512,6 +5539,14 @@ def _codex_clean_signal_at_head(
         if summary:
             for m in _CODEX_SUMMARY_ROW_RE.finditer(body):
                 candidates.append(("summary", m.group(2).lower()))
+    if foreign:
+        kind, desc = foreign
+        note["signal"] = f"{kind} by Codex"
+        note["reason"] = (
+            f"it was {desc}, an account other than Codex, so it no longer speaks for Codex"
+        )
+        note["permanent"] = True
+        return None
     if not candidates:
         return None  # nothing clean was said; there is nothing to explain
     kind, short = candidates[-1]
@@ -5522,8 +5557,9 @@ def _codex_clean_signal_at_head(
         return None
     if evidence["history_moved"]:
         note["reason"] = (
-            "this PR's history moved (a force-push, base change, base force-push or "
-            "branch restore), so a short id can no longer be bound to the head"
+            "this PR's history moved (a head force-push, a head-branch deletion or "
+            "restore, or a base change), so a clean signal no longer binds to what "
+            "Codex reviewed"
         )
         note["permanent"] = True
         return None
@@ -5534,18 +5570,18 @@ def _codex_clean_signal_at_head(
     if any((r.get("commit_id") or "").lower() == head for r in reviews):
         note["reason"] = "a Codex review object (dismissed or pending) sits at the head"
         return None
-    commits = _pr_commit_shas(pr_num, repo=repo)
-    if not commits:
-        note["reason"] = "this PR's commit list could not be read in full"
-        return None
-    for kind, short in candidates:
-        resolved, error = _review_budget._resolve_sha(short, commits)
-        if not error and resolved == head:
+    looked_up: set[str] = set()
+    for kind, short in reversed(candidates):
+        # A prefix of anything but the head cannot resolve to the head: no call needed.
+        if not head.startswith(short) or short in looked_up:
+            continue
+        looked_up.add(short)
+        if _commit_at_prefix(short, repo=repo) == head:
             note.clear()
             return kind
     note["reason"] = (
-        "its abbreviated id does not resolve uniquely to the head among this PR's "
-        "commits (it names an older commit, or is ambiguous)"
+        "its abbreviated id does not resolve uniquely to the head across this "
+        "repository (it names an older commit, is ambiguous, or could not be looked up)"
     )
     return None
 
@@ -5553,24 +5589,39 @@ def _codex_clean_signal_at_head(
 _CODEX_SIGNAL_QUERY = (
     "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, "
     "name: $name) { pullRequest(number: $number) { comments(last: 100) { totalCount "
-    "nodes { body author { login __typename } editor { login } } } "
-    "timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT, BASE_REF_CHANGED_EVENT, "
-    "BASE_REF_FORCE_PUSHED_EVENT, HEAD_REF_RESTORED_EVENT], first: 1) { filteredCount "
+    "nodes { body author { login __typename } editor { login } "
+    "userContentEdits(first: 50) { totalCount nodes { editor { login } deletedAt } } } } "
+    "timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT, HEAD_REF_DELETED_EVENT, "
+    "HEAD_REF_RESTORED_EVENT, BASE_REF_CHANGED_EVENT], first: 1) { filteredCount "
     "nodes { __typename } } } } }"
 )
 
 
 def _codex_signal_evidence(pr_num: str, repo: str | None = None) -> dict | None:
     """``{"comments": [...], "history_moved": bool}`` for the clean-signal check, or
-    None when unreadable. ONE GraphQL read, because a comment's ``editor`` exists only
-    there (REST keeps the ORIGINAL author on an edited comment, so the author says
-    nothing about the body). History moved when the type-filtered timeline has ANY
-    node. Two readings must agree, or the read is refused: the documented one (the
-    ``itemTypes`` filter on ``nodes``) and ``filteredCount``, whose schema text does
-    not say it honours ``itemTypes`` though it MEASURABLY does. Never ``totalCount``:
-    on a filtered connection it counts the WHOLE timeline (MEASURED 2026-09-30:
-    #2619 totalCount 7, filteredCount 0; #65 12 vs 1, matching its one REST
-    timeline force-push). More than 100 comments is None (fail closed).
+    None when unreadable. ONE GraphQL read, because a comment's ``editor`` and
+    ``userContentEdits`` exist only there (REST keeps the ORIGINAL author on an edited
+    comment, so the author says nothing about the body). Edit-history completeness
+    is required only for Codex Bot comments; unrelated comments' edit data is ignored.
+    History moved includes head force-push, head-branch delete/restore, and
+    ``BASE_REF_CHANGED_EVENT``. A base change stays a veto because a clean signal
+    names the head, not the base it was reviewed against; retargeting changes the
+    effective diff without moving the head. A base force-push is retired: merging
+    requires the default base (``_check_base_is_default``), whose ruleset forbids
+    force-push and deletion, so a force-pushed non-default base can reach a merge
+    only through a base change, which vetoes. Delete and restore stay because
+    recreating the head branch can replace history without a force-push event.
+    MEASURED 2026-10-01: 541 of 541 commits dropped by 191 force-pushes (PR #65 to
+    #2309) still resolve repo-wide by 7-hex id; the oldest is from 2026-04-17, so
+    dropped head commits are not the binding risk.
+
+    History moved when the type-filtered timeline has ANY node. Two readings must
+    agree, or the read is refused: the documented one (the ``itemTypes`` filter on
+    ``nodes``) and ``filteredCount``, whose schema text does not say it honours
+    ``itemTypes`` though it MEASURABLY does. Never ``totalCount``: on a filtered
+    connection it counts the WHOLE timeline (MEASURED 2026-09-30: #2619 totalCount
+    7, filteredCount 0; #65 12 vs 1, matching its one REST timeline force-push).
+    More than 100 comments is None (fail closed).
     Tests inject ``_TEST_GH_CODEX_SIGNAL`` (the raw GraphQL response).
     """
     raw = os.environ.get("_TEST_GH_CODEX_SIGNAL")
@@ -5602,16 +5653,52 @@ def _codex_signal_evidence(pr_num: str, repo: str | None = None) -> dict | None:
         comments = pr["comments"]
         if comments["totalCount"] > len(comments["nodes"]):
             return None
+        primary = _primary_reviewer_login()
+        if primary is None:
+            return None
+        codex = primary.removesuffix("[bot]")
         rows = []
         for node in comments["nodes"]:
             author = node.get("author") or {}
             editor = node.get("editor") or {}
+            foreign_edit = None
+            if author.get("login") == codex and author.get("__typename") == "Bot":
+                edits = node.get("userContentEdits")
+                if not isinstance(edits, dict):
+                    return None
+                edit_nodes = edits.get("nodes")
+                edit_count = edits.get("totalCount")
+                if (
+                    not isinstance(edit_nodes, list)
+                    or type(edit_count) is not int
+                    or edit_count > len(edit_nodes)
+                ):
+                    return None
+                current_editor = editor.get("login")
+                if current_editor is not None and current_editor != codex:
+                    foreign_edit = f"edited by {current_editor}"
+                else:
+                    for edit in edit_nodes:
+                        edit_editor = (edit.get("editor") or {}).get("login")
+                        if edit.get("deletedAt"):
+                            foreign_edit = (
+                                "had an edit revision deleted "
+                                f"(edit by {edit_editor or 'an unknown account'})"
+                            )
+                            break
+                    if foreign_edit is None:
+                        for edit in edit_nodes:
+                            edit_editor = (edit.get("editor") or {}).get("login")
+                            if edit_editor != codex:
+                                foreign_edit = f"edited by {edit_editor or 'an unknown account'}"
+                                break
             rows.append(
                 {
                     "login": author.get("login"),
                     "type": author.get("__typename"),
                     "editor": editor.get("login"),
                     "body": node.get("body") or "",
+                    "foreign_edit": foreign_edit,
                 }
             )
         timeline = pr["timelineItems"]
@@ -6946,20 +7033,20 @@ def _check_codex_reviewed_head_core(
     _bind_pr_files_cache_head(head)
     reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
     if reviewed == head:
+        _FRESHNESS_PASS.update(head=head, reason="current")
         return False, "", head
     # Codex posts no review object when it finds nothing; its word on a clean head is
     # a comment naming an abbreviated id. That counts only when the id resolves
-    # UNIQUELY within this PR's own commits to the head and no Codex review object
+    # repo-wide to exactly the head and no Codex review object
     # sits at the head (#2418; the resolution is what answers #2487's objection that
     # a prefix alone binds nothing). The merge stays bound to this head.
     refused: dict = {}
     clean_kind = _codex_clean_signal_at_head(pr_num, head, repo=repo, why=refused)
     if clean_kind:
-        _FRESHNESS_PASS["reason"] = f"clean signal at head: {clean_kind}"
-        _FRESHNESS_PASS["head"] = head
+        _FRESHNESS_PASS.update(head=head, reason=f"clean signal at head: {clean_kind}")
         print(
             f"NOTE: PR #{pr_num} — Codex's clean {clean_kind} names head {head[:12]} "
-            f"(its abbreviated id resolves uniquely to the head among the PR's commits, "
+            f"(its abbreviated id resolves repo-wide to exactly the head, "
             f"and nothing Codex filed says otherwise) — accepted as a current review.",
             file=sys.stderr,
         )
@@ -7032,6 +7119,10 @@ def _check_codex_reviewed_head_core(
                     f"git log {reviewed[:12]}..{head[:12]} --oneline",
                     file=sys.stderr,
                 )
+                _FRESHNESS_PASS.update(
+                    head=head,
+                    reason=f"STALE review of {reviewed[:12]}, base-advance delta inline",
+                )
                 return False, "", head
             # The unreviewed delta is provably review-trivial — allow, but still
             # bind the merge to THIS head (TOCTOU): the triviality claim is about
@@ -7041,6 +7132,9 @@ def _check_codex_reviewed_head_core(
                 f"{head[:12]}), but the delta since is review-trivial — allowing. "
                 f"Inspect: git log {reviewed[:12]}..{head[:12]} --oneline",
                 file=sys.stderr,
+            )
+            _FRESHNESS_PASS.update(
+                head=head, reason=f"STALE review of {reviewed[:12]}, delta since is trivial"
             )
             return False, "", head
         delta_note = (
@@ -10531,18 +10625,27 @@ def _effective_push_remote(seg, cur: str | None, cwd: str | None = None) -> str 
     republish + config checks MUST target this remote, not the fetch/upstream
     remote — otherwise a triangular fork workflow (pull from origin, push to fork)
     checks the wrong remote and can silently allow a first push to the fork.
+
+    ``branch.<cur>.remote`` is read from CONFIG, not via ``@{upstream}``: the
+    upstream expression fails when the remote-tracking ref is missing (never
+    fetched, or pruned after the remote branch was deleted), and git still pushes
+    to ``branch.<cur>.remote`` then. Answering "origin" there sent the republish
+    and scope checks to a remote the push never reaches. A config read error, or
+    a ``.`` (the local repository) value, returns None — callers treat an
+    unresolved remote as "ask".
     """
     argv = getattr(seg, "argv", None) or []
     if _push_repo_flag(argv) or _push_named_remote(argv):
         return _resolve_push_remote(seg, cwd=cwd)  # explicit --repo / positional wins
     base = ["git"] + (["-C", cwd] if cwd else [])
-    if cur:
-        got = _git_config_get(base, f"branch.{cur}.pushRemote")
-        if got and got[0] == 0 and got[1]:
-            return got[1]
-    got = _git_config_get(base, "remote.pushDefault")
-    if got and got[0] == 0 and got[1]:
-        return got[1]
+    keys = ([f"branch.{cur}.pushRemote"] if cur else []) + ["remote.pushDefault"]
+    keys += [f"branch.{cur}.remote"] if cur else []
+    for key in keys:
+        got = _git_config_get(base, key)
+        if got is None:
+            return None  # unreadable config → unresolved → the caller asks
+        if got[0] == 0 and got[1]:
+            return None if got[1] == "." else got[1]
     return _resolve_push_remote(seg, cwd=cwd) or "origin"
 
 
@@ -10843,6 +10946,260 @@ def _base_repo_identity(cwd: str | None = None) -> tuple[str, str, str] | None:
         return branch, slug.split("/", 1)[0], url
     except Exception:
         return None
+
+
+#: The ONLY spelling of a destination the ``push_publish`` switch accepts:
+#: ``https://github.com/<owner>/<repo>`` with an optional ``.git`` and trailing
+#: slash — nothing else (no userinfo, no port, no extra path, and never the ssh or
+#: scp forms, whose transport is a program this hook cannot vouch for). An
+#: ALLOWLIST: two audit rounds found ways to reroute ssh and http transports that
+#: a denylist of config keys missed. Stricter than ``_repo_identity_from_url`` on
+#: purpose — that one keeps the LAST two path parts.
+_GH_HTTPS_URL = re.compile(
+    r"https://github\.com/(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)"
+    r"/(?P<repo>[A-Za-z0-9._-]+?)(?:\.git)?/?"
+)
+
+
+def _strict_github_slug(url: str) -> str | None:
+    """``owner/repo`` (lower-cased) when ``url`` is exactly the github.com https
+    form in ``_GH_HTTPS_URL``, else None. Matched on the RAW value: a URL with
+    leading or trailing whitespace is not that form, so it never qualifies."""
+    m = _GH_HTTPS_URL.fullmatch(url)
+    return f"{m.group('owner')}/{m.group('repo')}".lower() if m else None
+
+
+def _all_urls_are_public_repo(urls: set[str]) -> bool:
+    """Whether ``urls`` is NON-EMPTY and EVERY member names the configured public
+    repo exactly. An undeterminable public repo, an empty set, or one URL that is
+    not an exact match → False (keep the prompt)."""
+    canonical = _canonical_public_repo()
+    if not canonical or not urls:
+        return False
+    want = canonical.strip().lower()
+    return all(_strict_github_slug(u) == want for u in urls)
+
+
+def _no_url_rewrite_rules(cwd: str | None) -> bool:
+    """True only when NO ``url.<base>.insteadOf``/``pushInsteadOf`` rule is set.
+
+    Needed for a RAW-URL destination: no remote section exists for ``git remote
+    get-url`` to expand, so the URL as typed is only the real destination when
+    nothing can rewrite it. A read error counts as "a rule may exist"."""
+    base = ["git"] + (["-C", cwd] if cwd else [])
+    got = _run_git_lines(base + ["config", "--get-regexp", r"^url\..*insteadof$"])
+    return got is not None and got[0] == 1
+
+
+def _push_publish_scope_holds(push_remote, segs, push_seg, cmd, cwd, branch=None) -> bool:
+    """Whether a FIRST push of the current branch may go unprompted under
+    ``hooks.asks.push_publish: off`` — i.e. every place it can land is the public
+    repo and nothing else in the command can change that.
+
+    Reached only from the first-publish ask of a push that already passed
+    ``_push_targets_current_branch`` (allowlisted flags, no env/wrapper prefix, no
+    ``-c``, and ``_push_config_is_simple``: one URL, push URL == fetch URL, no push
+    refspec / mirror / receivepack / followTags / submodule recursion). On top of
+    that:
+      * the destination's push URLs come from ``git remote get-url --push``, which
+        applies ``insteadOf``/``pushInsteadOf``; a raw-URL destination has no remote
+        to expand, so it qualifies only when no rewrite rule exists at all;
+      * every URL must be an EXACT public-repo match (``_all_urls_are_public_repo``);
+      * the command is exactly ONE plain ``git push`` (``_is_single_plain_push``)
+        — no other segment at all, since any neighbour can change the push after
+        this check (a ``cd``, a hook, an fsmonitor, a clean filter);
+      * a live probe confirms the branch is absent on the destination.
+    Anything else returns False and the prompt stands."""
+    if not push_remote:
+        return False
+    if not _is_single_plain_push(segs, push_seg, cmd):
+        return False
+    named = _raw_remote_push_urls(push_remote, cwd)
+    if named is None:
+        return False
+    if named:
+        urls = named
+    elif _looks_like_url(push_remote) and _no_url_rewrite_rules(cwd):
+        urls = {push_remote}
+    else:
+        return False
+    if not _all_urls_are_public_repo(urls):
+        return False
+    if not _transport_is_plain(push_remote if named else None, cwd):
+        return False
+    # LAST, because it is the one network call: the caller reached here because
+    # `_push_is_republish` said "not confirmed present", which is ALSO its answer
+    # to an ls-remote error or timeout. Silencing on that would let an
+    # already-public branch with no open PR skip the no-open-PR check.
+    return len(urls) == 1 and _remote_branch_definitely_absent(next(iter(urls)), branch, cwd)
+
+
+#: Characters that make a command anything other than ONE simple command:
+#: separators and control operators (``;``, ``&``, ``|``, newlines), redirections
+#: and here-docs (``<``, ``>``), subshells, groups and substitutions (``(``,
+#: ``)``, ``{``, ``}``, ``$``, backtick), and the backslash (escapes and line
+#: continuations), plus the glob characters ``*``, ``?`` and ``[``: a branch name
+#: cannot contain them, but a remote name written straight into config can, so a
+#: glob could expand to a different word than the one judged. Inside quotes they
+#: would be harmless, but a quoted ``;`` in a first push is not worth modelling:
+#: the command simply keeps its prompt.
+_SINGLE_PUSH_FORBIDDEN = frozenset(";&|<>(){}$`\\\n\r*?[")
+
+
+def _is_single_plain_push(segs, push_seg, cmd: str) -> bool:
+    """Whether the WHOLE command is exactly one top-level ``git push …``.
+
+    The ``push_publish`` suppression judges the repository the hook payload's
+    cwd names, before anything runs. Anything else in the command can change
+    what the push does after that judgement — a ``cd`` (through ``CDPATH``, in a
+    pipeline, in the background), a ``git status`` that runs ``core.fsmonitor``,
+    a ``git add`` that runs a clean filter, a ``git commit`` whose hook rewrites
+    the push URL or switches branch, a ``-C`` through a symlink. Two audit rounds
+    found members of that class faster than a neighbour allowlist could absorb
+    them, so the rule is structural: one segment, which is the push itself; no
+    shell metacharacter anywhere; the text re-tokenizes to exactly its argv
+    (no assignment prefix, no wrapper); and ``push`` immediately follows ``git``
+    (no global option at all: ``-C``, ``-c``, ``--git-dir``, ``--work-tree``,
+    ``--namespace``, ``--config-env``, …). Applies to the suppression only; the
+    re-push allow keeps ``_push_compound_is_inert``."""
+    if len(segs) != 1 or segs[0] is not push_seg:
+        return False
+    if getattr(push_seg, "depth", 0):
+        return False
+    if any(c in _SINGLE_PUSH_FORBIDDEN for c in cmd):
+        return False
+    if not _push_seg_has_no_prefix(push_seg):
+        return False
+    try:
+        words = shlex.split(cmd, comments=True)
+    except ValueError:
+        return False
+    argv = list(getattr(push_seg, "argv", None) or [])
+    return words == argv and len(words) >= 2 and words[0] == "git" and words[1] == "push"
+
+
+def _remote_branch_definitely_absent(url: str, branch: str | None, cwd: str | None) -> bool:
+    """True ONLY when ``git ls-remote --exit-code`` against ``url`` answers that
+    ``refs/heads/<branch>`` does not exist (exit 2). A hit, any other exit code,
+    a timeout or any error is False, so the caller asks. Same shared deadline as
+    ``_remote_branch_sha``, plus two things that probe does not need:
+
+    * ``http.followRedirects=false`` — a renamed or moved repository answers with
+      a redirect; following it would vouch for a DIFFERENT repository than the
+      URL the push names, so a redirect fails the probe (non-2) and the prompt
+      stands;
+    * no interactive prompt (``GIT_TERMINAL_PROMPT=0``, empty ``GIT_ASKPASS``/
+      ``SSH_ASKPASS``) — a credential prompt would otherwise hang the hook until
+      its timeout."""
+    if not branch:
+        return False
+    try:
+        args = ["git", "-c", "http.followRedirects=false"] + (["-C", cwd] if cwd else [])
+        args += ["ls-remote", "--exit-code", "--heads", url, f"refs/heads/{branch}"]
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "", "SSH_ASKPASS": ""}
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=_gh_timeout(10.0), env=env
+        )
+    except Exception:
+        return False
+    return result.returncode == 2
+
+
+def _raw_remote_push_urls(name: str, cwd: str | None) -> set[str] | None:
+    """A remote's push URLs exactly as git prints them — only the line break is
+    removed, never surrounding whitespace, so a URL configured with a stray space
+    cannot be normalised into an exact match. Empty set: not a configured remote
+    (git exits 2). None: any other failure."""
+    try:
+        r = subprocess.run(
+            ["git"] + (["-C", cwd] if cwd else []) + ["remote", "get-url", "--push", "--all", name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if r.returncode == 2:
+        return set()
+    if r.returncode != 0:
+        return None
+    lines = r.stdout.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return set(lines) if lines and all(lines) else None
+
+
+#: Environment variables that can move or weaken an https push (proxies, TLS
+#: trust, ssh/proxy programs, injected git config). Any of them set in the
+#: HOOK's environment keeps the ask. Residue, stated rather than hidden: the
+#: hook does NOT see the environment the push runs in. The Bash tool's shell is
+#: initialised from the user's profile and hooks are not, so a variable exported
+#: only in a shell profile is invisible here. A per-command ``VAR=…`` prefix is
+#: refused separately (``_push_seg_has_no_prefix`` / ``_push_compound_is_inert``).
+_TRANSPORT_ENV = (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
+    "GIT_SSL_NO_VERIFY", "GIT_SSL_CAINFO", "GIT_SSL_CAPATH", "GIT_SSL_CERT", "GIT_SSL_KEY",
+    "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "GIT_PROXY_COMMAND", "GIT_SSH", "GIT_SSH_COMMAND",
+    "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+)
+
+
+def _transport_is_plain(remote: str | None, cwd: str | None) -> bool:
+    """Whether an https push to github.com goes out with stock transport.
+
+    ALLOWLIST posture for the http layer: ANY ``http.*`` key in the config git
+    reads for this repository (proxy, sslVerify, curloptResolve, per-URL
+    sections, extra headers …) keeps the ask, as does an unreadable config. On
+    top: ``remote.<r>.proxy`` (an http proxy outside ``http.*``) and
+    ``remote.<r>.vcs`` (hands the push to a remote helper whatever the URL), and
+    any of ``_TRANSPORT_ENV`` set in the hook's environment. ssh-only and
+    git://-only keys (``core.sshCommand``, ``core.gitProxy``) are not checked:
+    only the https form qualifies. Applied only by the ``push_publish``
+    suppression; the re-push allow is unchanged."""
+    if any(os.environ.get(v) for v in _TRANSPORT_ENV):
+        return False
+    base = ["git"] + (["-C", cwd] if cwd else [])
+    got = _run_git_lines(base + ["config", "--get-regexp", r"^http\."])
+    if got is None or got[0] != 1:
+        return False  # 0 = some http.* key is set; anything else = unreadable
+    if remote:
+        for key in (f"remote.{remote}.vcs", f"remote.{remote}.proxy"):
+            got = _git_config_get(base, key, all_values=True)
+            if got is None or (got[0] == 0 and got[1]):
+                return False
+    return True
+
+
+def _publish_ask_text(reason: str, publish_off: bool) -> str:
+    """The first-publish ask, plus why ``push_publish: off`` did not silence it
+    and any NOTE the policy raised (Claude Code drops an exit-0 hook's stderr, so
+    the prompt is the only place a misconfigured key can be reported)."""
+    if publish_off:
+        reason += (
+            "\n\nhooks.asks.push_publish is off, but this command did not qualify: "
+            "it is silenced only when EVERY destination resolves exactly to the "
+            "configured public repo and nothing else in the command can change that."
+        )
+    notes = _drain_ask_notes()
+    return f"{reason}\n\n{notes}" if notes else reason
+
+
+def _emit_context_only(note: str) -> int:
+    """Emit NO permission decision — only ``additionalContext`` — and return 0.
+
+    The house shape for a silenced ask (``needs_user.decide`` with an
+    ``ask_key``): this hook stops objecting and approves nothing, so Claude
+    Code's own permission settings and the other hooks still decide the command.
+    An ``allow`` here would approve every other step of a compound command."""
+    payload = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": note}}
+    try:
+        from hook_output import print_json_bounded
+
+        print_json_bounded(payload, text_keys=("hookSpecificOutput.additionalContext",))
+    except Exception:  # noqa: BLE001 — the note must be delivered regardless
+        print(json.dumps(payload))
+    return 0
 
 
 def _ask(reason: str) -> int:
@@ -11342,6 +11699,10 @@ def _run_merge_and_push_gates() -> int:
         # invocation before the hard-blocks run, so `git push <republish> && git
         # commit --no-verify` would sail through. Set the reason here; emit at the tail.
         push_allow_reason: str | None = None
+        # A first-publish prompt this install silenced (`hooks.asks.push_publish:
+        # off`, public-repo destinations only). Emitted at the tail as NO decision
+        # plus a context note, and only if nothing else set an ask or a block.
+        publish_note: str | None = None
 
         # ── git push (any branch) ──────────────────────────────────
         # Interactive → the user approves in a dialog only they can satisfy.
@@ -11481,10 +11842,31 @@ def _run_merge_and_push_gates() -> int:
                             f"its first push); only the first push of a branch/PR prompts."
                         )
                     else:
-                        ask_reason = (
-                            f"git push needs your approval before publishing externally "
-                            f"(target: {branch or 'default'})."
-                        )
+                        # FIRST publication of `cur`. The install may silence this
+                        # one prompt (owner ruling 2026-10-01) — policy read first
+                        # so a misconfigured key announces itself on every such
+                        # ask, scope checked only when the key is off.
+                        publish_off = _ask_suppressed("push_publish")
+                        if publish_off and _push_publish_scope_holds(
+                            push_remote, segs, push_segs[0], cmd, pcwd, branch=cur
+                        ):
+                            publish_note = _suppressed_reason(
+                                "push_publish",
+                                f"first push of '{cur}' to the configured public repo "
+                                f"({_canonical_public_repo()}).",
+                            )
+                            # The note is the only channel on this path, so any
+                            # policy NOTE (an unknown key, say) rides it — the
+                            # same shape as needs_user.decide.
+                            notes = _drain_ask_notes()
+                            if notes:
+                                publish_note = f"{publish_note}\n\n{notes}"
+                        else:
+                            ask_reason = _publish_ask_text(
+                                f"git push needs your approval before publishing "
+                                f"externally (target: {branch or 'default'}).",
+                                publish_off,
+                            )
                     # A RE-PUSH earns its silence by having been approved at
                     # first publication — but a public branch with NO OPEN PR is
                     # outside CI and the leak-detector (ci.yml triggers on
@@ -12318,6 +12700,13 @@ def _run_merge_and_push_gates() -> int:
         if ask_reason is not None:
             return _ask(ask_reason)
 
+        # A first-publish prompt this install silenced — NO decision, only a
+        # context note. After every block and every ask above (an ask from any
+        # other arm wins), and BEFORE the create `_allow` below, which would
+        # otherwise approve the command on this hook's behalf.
+        if publish_note is not None:
+            return _emit_context_only(publish_note)
+
         # A first-push-only re-push auto-allow — emitted ONLY here, after every
         # hard-block has had its chance to return 2, so a compound
         # `git push <republish> && git commit --no-verify` still hard-blocks.
@@ -12721,39 +13110,33 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         _print_gate_detail(msg)
     else:
         print(f"e2e-plan       : {msg.splitlines()[0]}")
+    _FRESHNESS_PASS.clear()
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
     if blocked:
         label = "BLOCK — " + msg.splitlines()[0]
         label += _substitute_available_note(pr_num, repo=repo)
     else:
-        # Distinguish a genuinely-current review from a stale-but-trivial-delta
-        # allow — both return the same tuple, but the report must NOT assert
-        # "current" when Codex reviewed an older SHA (Codex P2, #1373). Re-derive
-        # the reviewed SHA vs HEAD for an honest label (structured-stdout consumers
-        # read this, not the stderr NOTE).
-        _reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
-        _head = _pr_head_sha(pr_num, repo=repo)
-        _head_l = _head.strip().lower() if _head else None
-        # Only for the head it vouched for: a push landing between the gate and this
-        # re-read must not inherit the old head's pass reason.
+        # The label comes from the gate's own record for the head it verified. A
+        # later head move is stated below, not used to relabel that verified pass.
+        _vh = verified_head.strip().lower() if verified_head else None
         _pass_reason = (
             _FRESHNESS_PASS.get("reason")
-            if _head_l is not None and _FRESHNESS_PASS.get("head") == _head_l
+            if _vh and _FRESHNESS_PASS.get("head") == _vh
             else None
         )
-        if _head_l is not None and _reviewed == _head_l:
-            label = "ok (current)"
-        elif _pass_reason:
-            label = f"ok ({_pass_reason})"
-        elif _reviewed is None or _head is None:
-            # A transiently-failed re-read must NOT read as "current" (Codex P2
-            # #1373): the enforcement gate already passed, but the report must not
-            # ASSERT the head was reviewed when it could not confirm it.
-            label = "ok (freshness label unverified — re-read failed)"
-        elif _reviewed != _head_l:
-            label = f"ok (STALE review of {_reviewed[:12]}, delta since is trivial)"
+        if not _pass_reason:
+            label = "ok (freshness label unverified — pass reason not recorded)"
         else:
-            label = "ok (current)"
+            label = f"ok ({_pass_reason})"
+            _now = _pr_head_sha(pr_num, repo=repo)
+            _now_l = _now.strip().lower() if _now else None
+            if _now_l is None:
+                label += f"; verified at {_vh[:12]}, the current head could not be re-read"
+            elif _now_l != _vh:
+                label += (
+                    f"; HEAD MOVED to {_now_l[:12]} after the gate verified {_vh[:12]} — "
+                    f"merge-with stays bound to {_vh[:12]}, so GitHub will refuse it"
+                )
     print(f"codex-at-head  : {label}")
     if blocked:
         # The tail is the ONLY remediation text this gate gives: "@codex review then

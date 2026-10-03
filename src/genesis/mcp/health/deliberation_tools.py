@@ -85,8 +85,8 @@ async def deliberate(
                 prompt size — a real multi-paragraph prompt on the frontier panel runs several minutes
                 (budget: env GENESIS_DELIBERATE_TIMEOUT_S, default 1000s).
       preset:   "" = mode default (synthesis→budget, analysis→strong); "strong" = frontier panel
-                (opus/gpt/gemini/grok/deepseek/kimi, gpt judge); "budget" = mid-tier panel
-                (deepseek/gpt-mini/grok/qwen/kimi/gemini-flash, sonnet judge — cheaper/faster).
+                (opus/gpt/gemini/grok/mimo/kimi, gpt judge); "budget" = mid-tier panel
+                (mimo/gpt-mini/grok/qwen/kimi/gemini-flash, sonnet judge — cheaper/faster).
 
     Returns {answer, consensus, dissent[], blind_spots[], confidence, per_model[], backend_used,
     preset_used, cost_usd, cost_known, latency_s, error}. On failure, answer is null and error is set

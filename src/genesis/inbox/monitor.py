@@ -1336,6 +1336,7 @@ class InboxMonitor:
             max_retries=self._config.max_retries,
         )
         drop_id = str(uuid.uuid4())
+        pending_start = len(pending_items)
         for idx, batch in enumerate(batches):
             # Runtime content stays plain, while the durable column carries a
             # versioned item array. Legacy single-newline storage destroyed the
@@ -1347,7 +1348,7 @@ class InboxMonitor:
             )
             if idx < len(reusable):
                 row_id = str(reusable[idx]["id"])
-                await inbox_items.reuse_as_pending(
+                reused = await inbox_items.reuse_as_pending(
                     self._db,
                     row_id,
                     drop_id=drop_id,
@@ -1355,6 +1356,15 @@ class InboxMonitor:
                     content_hash=content_hash,
                     created_at=now_iso,
                 )
+                if not reused:
+                    # Eligibility changed since selection (for example, a
+                    # concurrent attempt put the row on a replay hold).
+                    # Positional reuse does not bind old item identities to
+                    # new batches. Discard this WHOLE stale drop, including
+                    # earlier siblings; the next scan recovers durable pending
+                    # rows and re-derives a delta excluding the new hold.
+                    del pending_items[pending_start:]
+                    return
             else:
                 row_id = str(uuid.uuid4())
                 await inbox_items.create(
@@ -1415,6 +1425,15 @@ class InboxMonitor:
         except ValueError:
             effort = EffortLevel.MEDIUM
         await self._record_prompt_version(system_prompt)
+
+        opaque_holds = set(await inbox_items.get_opaque_replay_hold_files(self._db))
+        for file_path in opaque_holds:
+            self._alert_parked(
+                file_path, reason="replay_unsafe_storage",
+                detail="A replay-held batch has unreadable item boundaries. Repair it before dispatch.",
+            )
+        resume_items = [item for item in resume_items if item.file_path not in opaque_holds]
+        pending_items = [item for item in pending_items if item.file_path not in opaque_holds]
 
         batches_dispatched = 0
 
@@ -1975,6 +1994,7 @@ class InboxMonitor:
         labels: list[str] | None = None,
         texts: list[str] | None = None,
         legacy: bool = False,
+        occurrence: str | None = None,
     ) -> None:
         """Record that part of a file stopped being evaluated; sent at scan end.
 
@@ -1990,6 +2010,9 @@ class InboxMonitor:
         if buf is None:  # called outside check_once (tests, direct calls)
             self._park_buffer = buf = {}
         entry = buf.setdefault((file_path, reason), {"detail": detail, "items": {}})
+        if occurrence is not None:
+            occurrences = entry.setdefault("occurrences", set())
+            occurrences.add(occurrence)
         if item_id is not None:
             entry["items"][item_id] = (
                 {"texts": texts, "legacy": legacy} if texts else (labels or ["an item"])
@@ -2080,11 +2103,18 @@ class InboxMonitor:
                         f"{entry['detail']}\n\n" + "\n".join(shown) + "\n\nNothing will "
                         f"retry these automatically. To re-run one, edit its line in {name}."
                     )
+                    if reason.startswith("replay_unsafe"):
+                        body = (
+                            f"{entry['detail']}\n\n" + "\n".join(shown)
+                            + "\n\nInspect with scripts/inbox_replay_hold.py --item ID; "
+                            "release requires --release --acknowledge-replay. "
+                            "Batch IDs: " + ", ".join(sorted(items)[:10])
+                        )
                 else:
                     title = f"Inbox parked {name}"
                     body = entry["detail"]
                 digest = hashlib.sha256(
-                    "\n".join(sorted(items)).encode()
+                    "\n".join([*sorted(items), *sorted(entry.get("occurrences", []))]).encode()
                 ).hexdigest()[:12]
                 root = alert_queue_root()
                 key = f"inbox:parked:{file_path}:{reason}:{digest}"

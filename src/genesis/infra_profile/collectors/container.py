@@ -868,17 +868,27 @@ async def collect_network(
     facts["network_watchdog_enabled"] = (
         await _run_cmd("systemctl", "is-enabled", "genesis-network-watchdog.timer")
     ) == "enabled"
-    # The Tailscale watchdog's unit-file state only ("enabled", "masked" = an
-    # operator's off switch, "disabled", "" = not installed; None = unknown).
-    # Its /run file is deliberately not read here: this section reaches an LLM
-    # prompt, and that file is event data for the awareness tick
+    # Effective Tailscale watchdog unit-file state: the timer's, or the
+    # service's when masked, since a masked service cannot run ("enabled",
+    # "masked" = an operator's off switch, "disabled", "" = not installed;
+    # None = unknown). Its /run file is deliberately not read here: this
+    # section reaches an LLM prompt, and that file is event data for the
+    # awareness tick
     # (resilience/tailscale_watchdog_events.py). tailscaled_loaded gates the
     # posture rule: without tailscaled there is nothing to watch.
     facts["tailscaled_loaded"] = _loaded(
         await _run_cmd("systemctl", "show", "tailscaled.service", "-p", "LoadState", "--value")
     )
-    facts["tailscale_watchdog_unit_state"] = await _run_cmd(
+    timer_state = await _run_cmd(
         "systemctl", "show", "genesis-tailscale-watchdog.timer", "-p", "UnitFileState", "--value"
+    )
+    service_state = await _run_cmd(
+        "systemctl", "show", "genesis-tailscale-watchdog.service", "-p", "UnitFileState", "--value"
+    )
+    facts["tailscale_watchdog_unit_state"] = (
+        service_state
+        if isinstance(service_state, str) and service_state.startswith("masked")
+        else timer_state
     )
 
     # Watchdog heal telemetry is volatile (heal_count/timestamps move), so it is
