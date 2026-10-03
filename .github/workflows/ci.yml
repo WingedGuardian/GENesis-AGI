@@ -1145,4 +1145,9 @@ jobs:
         # Mutation-sweep harness (#1851): tests/test_scripts/test_mutation_sweep.py
         # is branch-new and collects 88 (`pytest --collect-only`), no skips.
         # Floor: 24332 + 88 = 24420; skip ceiling remains 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24420
+        # Its summary-grammar fix replaces the two substring tables (13 cases)
+        # with exact-keyword parser/verdict tables and a strict-xfail end-to-end
+        # case (25 + 29 + 20 + 1 = 75): the file collects 150
+        # (`pytest --collect-only -q`, 88 - 13 + 75 = 150),
+        # no skips. Floor: 24420 + 62 = 24482; skip ceiling remains 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24482

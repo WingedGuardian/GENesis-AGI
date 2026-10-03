@@ -43,7 +43,10 @@ WHAT A SWEEP GUARANTEES, per case:
   4. The test command produced a RESULT LINE. No line means the run never
      happened -- a lock, a guard, a timeout -- and "all mutations survived" from
      a sweep that never ran is the confident false negative this class is famous
-     for. It is an ABORT, never a survival.
+     for. It is an ABORT, never a survival. The line is read by ONE grammar
+     (`parse_pytest_summary`), by exact outcome keyword, and a baseline counts
+     as green only when the target PASSED -- never xfailed, xpassed, skipped
+     or deselected.
   5. The file is restored, and the restore is VERIFIED against the baseline.
      The mutation write and the restore share one `try/finally`, because the
      expected outcome of a good case is a NONZERO exit and a trailing restore is
@@ -81,6 +84,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -283,39 +287,166 @@ def _child_env(extra: dict[str, str] | None) -> dict[str, str]:
     return env
 
 
-def _has_result_line(stdout: str) -> bool:
-    """Did pytest actually report on the target?
+#: READING PYTEST'S SUMMARY. Every verdict this module reaches about a test run
+#: goes through `parse_pytest_summary` and nothing else. The reader it replaced
+#: classified the summary by SUBSTRING, and that one generator produced two
+#: review findings: a case-sensitive "error" let "1 Error" through, and
+#: "1 xfailed" CONTAINS "failed" -- so a strict-xfail target baselined as a
+#: result, the mutation made it pass, pytest reported the strict XPASS as
+#: "1 failed", and the sweep scored BIT on a test that never passed. A grammar
+#: closes the class; a longer word list would not.
+#:
+#: The grammar is pytest's own, READ from `_pytest/terminal.py` (pytest 9.0.3):
+#: `summary_stats` joins the parts with ", " and appends
+#: " in {format_session_duration}" ("0.12s", or "75.00s (0:01:15)" past a
+#: minute); `_build_normal_summary_stats_line` renders each part as
+#: "%d %s" % pluralize(count, key) over KNOWN_TYPES plus any plugin's own key,
+#: or the single part "no tests ran"; `pluralize` changes exactly two keys,
+#: error -> errors and warnings -> warning/warnings. At verbosity >= 0 the line
+#: is centred in "=" separators; with --color=yes it carries SGR codes; at -qq
+#: (verbosity < -1) `summary_stats` returns before writing it at all.
+_ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
+_PART = r"\d+ [a-z]+(?: [a-z]+)*"
+_SUMMARY_LINE = re.compile(
+    r"(?:=+ )?"
+    rf"(?P<body>no tests ran|{_PART}(?:, {_PART})*)"
+    r" in \d+(?:\.\d+)?s(?: \([^()]+\))?"
+    r"(?: =+)?"
+)
+#: pytest's two pluralised keys, folded back to one name each.
+_KEY_ALIASES = {"errors": "error", "warning": "warnings"}
+#: Keys that ride along with a verdict without changing it: a sibling the
+#: selection excluded, a warning, a subtest that passed.
+_INCIDENTAL = frozenset({"deselected", "warnings", "subtests passed"})
 
-    A SKIPPED/deselected line FOR THE CASE'S OWN TARGET means nothing ran and is
-    treated as no result. A bare 'no tests ran' likewise.
+
+def parse_pytest_summary(stdout: str) -> dict[str, int] | None:
+    """The outcome counts from pytest's FINAL summary line, by exact keyword.
+
+    Returns ``{}`` for "no tests ran" -- readable, and empty -- and None when no
+    line in ``stdout`` is a whole summary line. None is never scored: every
+    caller ABORTS on it. The last matching line wins, because the summary is the
+    last thing pytest writes and a run prints plenty above it (a short-summary
+    "FAILED t.py::x - ..." line, an "ERROR <nodeid>" report) that must not be
+    read as one. A line must match the grammar end to end: "1 Error in 0.2s" is
+    not a line pytest can write, so it is unreadable rather than a near miss. A
+    repeated key is refused the same way -- pytest renders each key once.
     """
-    tail = stdout.strip().splitlines()
-    if not tail:
-        return False
-    for line in reversed(tail):
-        # A REAL OUTCOME beats a sibling deselection. "1 failed, 1 deselected"
-        # means the target ran and failed -- MEASURED, the previous rule read it
-        # as "no result" and turned a genuinely-caught mutation into an ABORT.
-        # Only a line with NO outcome at all ("2 deselected", "no tests ran")
-        # means nothing ran. The earlier test covered the `passed` variant and
-        # not the `failed` one, which is why this survived.
-        # An ERROR outcome is NOT a result, whatever the exit code. A fixture
-        # setup failure exits 1 with "1 error", and a teardown failure produces
-        # "1 passed, 1 error" -- both previously read as a result, so rc=1 scored
-        # BIT while the named test body never ran. That is the exact import/setup
-        # class the exit-code check was added to exclude, surviving one layer in
-        # because it arrives as rc=1 rather than rc=2.
-        # Case-insensitive throughout: an `ERROR <nodeid>` line is the same
-        # non-result as "1 error", and the old case-sensitive check let it fall
-        # through to a fallback that returned True for it.
-        low = line.lower()
-        if "error" in low:
-            return False
-        if "passed" in low or "failed" in low:
-            return True
-        if "no tests ran" in low or "deselected" in low:
-            return False
-    return False
+    for raw in reversed(_ANSI_SGR.sub("", stdout).splitlines()):
+        m = _SUMMARY_LINE.fullmatch(raw.strip())
+        if not m:
+            continue
+        if m["body"] == "no tests ran":
+            return {}
+        counts: dict[str, int] = {}
+        for part in m["body"].split(", "):
+            n, key = part.split(" ", 1)
+            key = _KEY_ALIASES.get(key, key)
+            if key in counts:
+                return None
+            counts[key] = int(n)
+        return counts
+    return None
+
+
+def _render_counts(counts: dict[str, int]) -> str:
+    return ", ".join(f"{n} {k}" for k, n in counts.items()) or "no tests ran"
+
+
+def baseline_problem(test: str, returncode: int, stdout: str) -> str | None:
+    """None when the baseline run proves the TARGET PASSED; otherwise why not.
+
+    Valid ONLY as "N passed" (N >= 1) with exit 0, plus incidental parts
+    (deselected siblings, warnings, passing subtests). Everything else refuses:
+
+      unreadable summary               -> refused, never scored
+      any `failed` or `error`          -> RED (a strict XPASS is reported as
+                                          `failed`, so it lands here too)
+      xfailed / xpassed / skipped, or
+      a plugin's own key               -> refused, naming the outcome
+      nothing passed (no tests ran,
+      only deselected)                 -> refused, naming the summary
+      exit code other than 0           -> refused: code and summary disagree
+
+    This gate is where a strict xfail MUST be stopped: once a mutation makes it
+    pass, pytest reports "1 failed" with exit 1, which no later reading can tell
+    apart from a caught mutation.
+    """
+    counts = parse_pytest_summary(stdout)
+    if counts is None:
+        return (f"baseline run of {test} produced no readable pytest summary "
+                f"line (exit {returncode}) -- it cannot be established as green")
+    shown = _render_counts(counts)
+    if counts.get("failed") or counts.get("error"):
+        return (f"baseline is RED: {test} already fails before any mutation "
+                f"({shown}), so every 'BIT' from it would be meaningless")
+    other = {k: n for k, n in counts.items()
+             if k != "passed" and k not in _INCIDENTAL}
+    if other:
+        return (f"baseline of {test} did not PASS its target ({shown}): "
+                f"{_render_counts(other)} is not a green baseline. A strict "
+                "xfail that a mutation makes pass is reported as `failed`, and a "
+                "skipped target never runs, so either would score a BIT or a "
+                "SURVIVED that means nothing")
+    if not counts.get("passed"):
+        return (f"baseline of {test} ran nothing ({shown}, exit {returncode}) "
+                "-- a target that did not run cannot be established as green")
+    if returncode != 0:
+        return (f"baseline of {test}: exit {returncode} disagrees with the "
+                f"summary ({shown}) -- neither alone establishes a green run")
+    return None
+
+
+def mutation_verdict(returncode: int, stdout: str) -> tuple[str, str]:
+    """(outcome, detail) for one mutated run of a target whose baseline PASSED.
+
+    THE EXIT CODE AND THE SUMMARY MUST AGREE. pytest's codes are an enumerated
+    contract (pytest.ExitCode): 0 OK, 1 TESTS_FAILED, 2 INTERRUPTED,
+    3 INTERNAL_ERROR, 4 USAGE_ERROR, 5 NO_TESTS_COLLECTED; only 0 and 1 mean the
+    tests ran. MEASURED, a live false GREEN: a mutation that COMPILES but raises
+    at import time gives rc=2 with "1 error in 0.26s", which the old
+    has-a-result-line-and-rc!=0 rule called BIT. `destructive_command_guard.py`
+    carries a module-level re.compile, so that is reachable from the shipped gate.
+
+      exit not 0/1                     -> ABORTED
+      unreadable summary               -> ABORTED, never scored
+      any `error` (setup, teardown)    -> ABORTED: the body may never have run
+      xfailed / xpassed / skipped, or
+      a plugin's own key               -> ABORTED, naming it: the baseline had
+                                          none, so the mutation changed WHICH
+                                          tests ran, not how they judged it
+      nothing passed or failed         -> ABORTED
+      exit 1 and >= 1 failed           -> BIT
+      exit 0, 0 failed, >= 1 passed    -> SURVIVED
+      anything else                    -> ABORTED: code and summary disagree
+    """
+    if returncode not in (0, 1):
+        return ABORTED, (f"pytest exit {returncode}: the run did not happen "
+                         "(collection error, usage error, or nothing collected)")
+    counts = parse_pytest_summary(stdout)
+    if counts is None:
+        return ABORTED, ("no readable pytest summary line -- the run did not "
+                         "happen (lock, guard, collection error?)")
+    shown = _render_counts(counts)
+    if counts.get("error"):
+        return ABORTED, (f"{shown}: an error is not a result -- a setup, "
+                         "teardown or collection failure, and the test body may "
+                         "never have run")
+    other = {k: n for k, n in counts.items()
+             if k not in ("passed", "failed") and k not in _INCIDENTAL}
+    if other:
+        return ABORTED, (f"{shown}: {_render_counts(other)} is not a verdict on "
+                         "the target -- its baseline had none, so the mutation "
+                         "changed which tests ran")
+    failed, passed = counts.get("failed", 0), counts.get("passed", 0)
+    if not failed and not passed:
+        return ABORTED, f"{shown}: nothing passed or failed -- the run did not happen"
+    if returncode == 1 and failed:
+        return BIT, ""
+    if returncode == 0 and not failed:
+        return SURVIVED, ""
+    return ABORTED, (f"exit {returncode} disagrees with the summary ({shown}) -- "
+                     "neither alone is a verdict")
 
 
 def _validate(case: Case, text: str) -> str | None:
@@ -626,30 +757,11 @@ def _run_target(case: Case, *, cwd: Path, python: str,
         )
     except subprocess.TimeoutExpired:
         return Result(case, ABORTED, f"test timed out after {timeout}s")
-    out = proc.stdout + proc.stderr
-    # THE EXIT CODE IS THE VERDICT, not the stdout text. pytest's codes are
-    # an enumerated contract (pytest.ExitCode): 0 OK, 1 TESTS_FAILED,
-    # 2 INTERRUPTED, 3 INTERNAL_ERROR, 4 USAGE_ERROR, 5 NO_TESTS_COLLECTED.
-    # ONLY 0 and 1 mean the tests actually ran.
-    #
-    # MEASURED, and this was a live false GREEN: a mutation that COMPILES but
-    # raises at import time (an invalid module-level `re.compile`, a deleted
-    # constant another line references, a changed decorator argument) gives
-    # rc=2 with "1 error in 0.26s" on stdout. The old rule -- has a result
-    # line AND rc != 0 -- read that as BIT while the test never ran.
-    # `compile()` closes the SyntaxError door only, so the docstring's claim
-    # to have closed this class was false until the exit code became the
-    # verdict. `destructive_command_guard.py` carries a module-level
-    # re.compile, so this is reachable from the shipped gate.
-    if proc.returncode not in (0, 1):
-        return Result(case, ABORTED,
-                      f"pytest exit {proc.returncode}: the run did not "
-                      "happen (collection error, usage error, or nothing "
-                      "collected)", out)
-    if not _has_result_line(proc.stdout):
-        return Result(case, ABORTED, "no pytest result line -- the run did "
-                      "not happen (lock, guard, collection error?)", out)
-    return Result(case, BIT if proc.returncode == 1 else SURVIVED, "", out)
+    # The exit code AND the summary decide, together, in `mutation_verdict` --
+    # the one place a mutated run is classified. Only stdout is parsed: pytest
+    # writes its summary there, and stderr belongs to whatever else ran.
+    outcome, detail = mutation_verdict(proc.returncode, proc.stdout)
+    return Result(case, outcome, detail, proc.stdout + proc.stderr)
 
 
 def _restore(target: Path, baseline: Path, wrote: _Fingerprint | None, *,
@@ -725,11 +837,9 @@ def assert_green_baseline(
             # mutated at this point, so this is purely a reporting fix.
             return (f"baseline run of {test} timed out after {timeout}s -- it "
                     "cannot be established as green, so no mutation is trustworthy")
-        if not _has_result_line(proc.stdout):
-            return f"baseline run of {test} produced no result line"
-        if proc.returncode != 0:
-            return (f"baseline is RED: {test} already fails before any mutation, "
-                    "so every 'BIT' from it would be meaningless")
+        problem = baseline_problem(test, proc.returncode, proc.stdout)
+        if problem:
+            return problem
     return None
 
 

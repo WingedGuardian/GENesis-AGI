@@ -232,30 +232,208 @@ def test_aborts_are_not_counted_as_clean(project):
     assert not result.clean
 
 
-@pytest.mark.parametrize("stdout,expected", [
-    ("1 failed, 2 passed in 3.0s", True),
-    ("2 passed in 1.0s", True),
-    ("no tests ran in 0.01s", False),
-    ("", False),
-    ("   ", False),
-    ("1 deselected in 0.1s", False),
-    ("1 passed, 1 deselected in 0.02s", True),
-    # A REAL OUTCOME beats a sibling deselection. MEASURED: the old rule read
-    # this as "no result", turning a genuinely-caught mutation into an ABORT.
-    # The table covered the `passed` variant and not the `failed` one, which is
-    # exactly how it survived.
-    ("1 failed, 1 deselected in 0.1s", True),
-    ("2 deselected in 0.1s", False),
-    # AN ERROR IS NOT A RESULT, and this row previously asserted True --
-    # encoding the bug. A fixture setup failure exits 1 with "1 error", which
-    # passed the exit-code check (rc in (0,1)) and then read as a result, so the
-    # case scored BIT while the test body never ran. A teardown failure produces
-    # both words at once.
-    ("1 error in 0.24s", False),
-    ("1 passed, 1 error in 0.3s", False),
+# --------------------------------------------------------------------------
+# READING PYTEST'S SUMMARY. One parser, exact outcome keywords, no substrings.
+#
+# Every string below is REAL pytest 9.0.3 output (`-q --no-header -p
+# no:cacheprovider`, the harness's own flags), captured from a probe file with
+# one test per outcome, unless the row says otherwise. Two earlier findings on
+# this parser were the same defect wearing different words: "1 xfailed"
+# CONTAINS "failed", "1 xpassed" CONTAINS "passed", and "1 Error" escaped a
+# case-sensitive "error". The generator was substring matching, so the fix is
+# a grammar, and the tables pin the grammar rather than a list of words.
+# --------------------------------------------------------------------------
+
+_COLOUR_PASSED = "\x1b[32m\x1b[32m\x1b[1m1 passed\x1b[0m\x1b[32m in 0.01s\x1b[0m\x1b[0m"
+
+
+class _Ran:
+    """A finished pytest child, as `subprocess.run` hands it back."""
+
+    def __init__(self, rc: int, stdout: str):
+        self.returncode = rc
+        self.stdout = stdout
+        self.stderr = ""
+
+
+@pytest.mark.parametrize("stdout,counts", [
+    ("1 passed in 0.01s", {"passed": 1}),
+    ("1 failed in 0.05s", {"failed": 1}),
+    ("1 xfailed in 0.05s", {"xfailed": 1}),
+    ("1 xpassed in 0.01s", {"xpassed": 1}),
+    ("1 skipped in 0.01s", {"skipped": 1}),
+    ("1 error in 0.05s", {"error": 1}),
+    # pytest pluralises exactly two keys (`_pytest/terminal.py::pluralize`).
+    ("2 errors in 0.05s", {"error": 2}),
+    ("1 passed, 1 warning in 0.01s", {"passed": 1, "warnings": 1}),
+    ("1 passed, 2 warnings in 0.01s", {"passed": 1, "warnings": 2}),
+    ("1 passed, 1 error in 0.05s", {"passed": 1, "error": 1}),
+    ("9 deselected in 0.01s", {"deselected": 9}),
+    ("2 failed, 1 passed, 4 deselected, 1 xfailed, 1 xpassed in 0.07s",
+     {"failed": 2, "passed": 1, "deselected": 4, "xfailed": 1, "xpassed": 1}),
+    ("1 passed, 2 subtests passed in 0.01s", {"passed": 1, "subtests passed": 2}),
+    # A plugin's own status key (pytest-rerunfailures' `rerun`) is READ, under
+    # its own name, so a verdict can refuse it rather than never seeing it.
+    ("1 failed, 1 rerun in 0.05s", {"failed": 1, "rerun": 1}),
+    ("no tests ran in 0.01s", {}),
+    # Default verbosity wraps the line in separators; --color=yes adds SGR codes.
+    ("=" * 30 + " 1 passed in 0.01s " + "=" * 31, {"passed": 1}),
+    (_COLOUR_PASSED, {"passed": 1}),
+    # Over a minute, `format_session_duration` appends the timedelta.
+    ("1 failed in 75.00s (0:01:15)", {"failed": 1}),
+    # The FINAL summary wins over everything a run prints above it.
+    ("F\n=== short test summary info ===\nFAILED t.py::test_a - assert False\n"
+     "1 failed in 0.05s\n", {"failed": 1}),
+    # Unreadable: no summary at all, a near miss pytest never writes, an ERROR
+    # report line, and the -qq form, which prints no summary line at all.
+    ("", None),
+    ("   \n  ", None),
+    ("1 Error in 0.2s", None),
+    ("ERROR test_guard.py::test_blocks_danger - RuntimeError: boom", None),
+    (".                                                                        [100%]",
+     None),
+    ("1 passed", None),
 ])
-def test_the_result_line_detector(stdout, expected):
-    assert ms._has_result_line(stdout) is expected
+def test_the_summary_parser_reads_exact_outcome_keywords(stdout, counts):
+    parsed = ms.parse_pytest_summary(stdout)
+    if counts is None:
+        assert parsed is None
+    else:
+        assert parsed is not None and dict(parsed) == counts
+
+
+# The MUTATION run: (exit code, real summary) -> verdict. The baseline gate has
+# already proved the target PASSED, so anything other than plain passed/failed
+# here means the run was not a clean verdict on the target -- an ABORT, never a
+# score. `detail` must name what was refused.
+@pytest.mark.parametrize("rc,stdout,outcome,detail", [
+    (1, "1 failed in 0.05s", ms.BIT, ""),
+    (0, "1 passed in 0.01s", ms.SURVIVED, ""),
+    (1, "1 failed, 2 passed in 3.00s", ms.BIT, ""),
+    (0, "2 passed in 1.00s", ms.SURVIVED, ""),
+    (0, "1 passed, 1 warning in 0.01s", ms.SURVIVED, ""),
+    (1, "1 failed, 2 warnings in 0.10s", ms.BIT, ""),
+    # A REAL OUTCOME beats a sibling deselection (the old table's lesson, kept).
+    (1, "1 failed, 1 deselected in 0.10s", ms.BIT, ""),
+    (0, "1 passed, 1 deselected in 0.02s", ms.SURVIVED, ""),
+    (0, "1 passed, 2 subtests passed in 0.01s", ms.SURVIVED, ""),
+    (1, "=" * 30 + " 1 failed in 0.05s " + "=" * 30, ms.BIT, ""),
+    (0, _COLOUR_PASSED, ms.SURVIVED, ""),
+    (1, "1 failed in 75.00s (0:01:15)", ms.BIT, ""),
+    # AN ERROR IS NOT A RESULT: setup failure, teardown failure, several.
+    (1, "1 error in 0.05s", ms.ABORTED, "error"),
+    (1, "1 passed, 1 error in 0.05s", ms.ABORTED, "error"),
+    (1, "1 failed, 2 errors in 0.05s", ms.ABORTED, "error"),
+    # xfailed CONTAINS "failed" and xpassed CONTAINS "passed": the defect class.
+    (0, "1 xfailed in 0.05s", ms.ABORTED, "xfailed"),
+    (1, "1 failed, 1 xfailed in 0.05s", ms.ABORTED, "xfailed"),
+    (0, "1 xpassed in 0.01s", ms.ABORTED, "xpassed"),
+    (0, "1 passed, 1 xpassed in 0.01s", ms.ABORTED, "xpassed"),
+    # A skip that appears only under mutation is the mutation switching the
+    # test off, not the test judging it.
+    (0, "1 skipped in 0.01s", ms.ABORTED, "skipped"),
+    (0, "1 passed, 1 skipped in 0.01s", ms.ABORTED, "skipped"),
+    (1, "1 failed, 1 rerun in 0.05s", ms.ABORTED, "rerun"),
+    # Nothing ran.
+    (0, "no tests ran in 0.01s", ms.ABORTED, "nothing passed or failed"),
+    (0, "2 deselected in 0.01s", ms.ABORTED, "deselected"),
+    # The exit code and the summary must AGREE; either alone is not a verdict.
+    (0, "1 failed in 0.05s", ms.ABORTED, "disagrees"),
+    (1, "1 passed in 0.01s", ms.ABORTED, "disagrees"),
+    # Unreadable is never scored.
+    (1, "1 Error in 0.2s", ms.ABORTED, "no readable pytest summary"),
+    (1, "ERROR test_guard.py::test_blocks_danger - RuntimeError: boom", ms.ABORTED,
+     "no readable pytest summary"),
+    (1, "", ms.ABORTED, "no readable pytest summary"),
+])
+def test_the_mutation_run_verdict_table(project, monkeypatch, rc, stdout, outcome,
+                                        detail):
+    monkeypatch.setattr(ms.subprocess, "run", lambda *a, **k: _Ran(rc, stdout))
+    result = _sweep(project, [_case(project)]).results[0]
+    assert result.outcome == outcome, result.detail
+    assert detail in result.detail
+
+
+# The BASELINE: (exit code, real summary) -> None (green) or a refusal naming
+# the outcome. Valid ONLY when the target PASSED; a sibling deselection, a
+# warning and a passing subtest ride along without changing that.
+@pytest.mark.parametrize("rc,stdout,problem", [
+    (0, "1 passed in 0.01s", None),
+    (0, "1 passed, 1 warning in 0.01s", None),
+    (0, "1 passed, 3 deselected in 0.01s", None),
+    (0, "1 passed, 2 subtests passed in 0.01s", None),
+    (0, "=" * 30 + " 1 passed in 0.01s " + "=" * 31, None),
+    (0, _COLOUR_PASSED, None),
+    # THE FINDING. A strict xfail baselines as "1 xfailed" rc=0; the mutation
+    # then makes it pass, pytest reports the strict XPASS as "1 failed" rc=1,
+    # and that scored BIT although the baseline never passed.
+    (0, "1 xfailed in 0.05s", "xfailed"),
+    (0, "1 passed, 1 xfailed in 0.05s", "xfailed"),
+    (0, "1 xpassed in 0.01s", "xpassed"),
+    (0, "1 skipped in 0.01s", "skipped"),
+    (0, "1 passed, 1 skipped in 0.01s", "skipped"),
+    (5, "9 deselected in 0.01s", "deselected"),
+    (4, "no tests ran in 0.01s", "no tests ran"),
+    (1, "1 failed in 0.05s", "baseline is RED"),
+    # A strict XPASS at baseline is reported as `failed` -- RED, correctly.
+    (1, "1 failed in 0.01s", "baseline is RED"),
+    (1, "1 error in 0.05s", "baseline is RED"),
+    (1, "1 passed, 1 error in 0.05s", "baseline is RED"),
+    (1, "1 passed in 0.01s", "disagrees"),
+    (0, "1 Error in 0.2s", "no readable pytest summary"),
+    (0, "", "no readable pytest summary"),
+])
+def test_the_baseline_verdict_table(project, monkeypatch, rc, stdout, problem):
+    monkeypatch.setattr(ms, "_baseline_run", lambda *a, **k: _Ran(rc, stdout))
+    got = ms.assert_green_baseline([_case(project)], cwd=project,
+                                   python=sys.executable, env=None, timeout=1)
+    if problem is None:
+        assert got is None
+    else:
+        assert got is not None and problem in got, got
+
+
+def test_a_strict_xfail_target_ABORTS_the_sweep_rather_than_scoring_BIT(
+    project, tmp_path,
+):
+    """End to end, through the CLI the CI gate runs: the reviewer's repro.
+
+    The target is a strict xfail pinning a known bug. Its baseline is
+    "1 xfailed" (rc 0). A mutation that FIXES the bug makes the body pass,
+    pytest reports the strict XPASS as "1 failed" (rc 1), and the substring
+    parser scored that BIT and exited 0 -- `1 bit, 0 SURVIVED, 0 ABORTED` --
+    although the target never passed at baseline.
+    """
+    (project / "test_known_bug.py").write_text(
+        textwrap.dedent(
+            """
+            import pytest
+            import guard
+            @pytest.mark.xfail(strict=True, reason="pins a known bug")
+            def test_known_bug():
+                assert guard.is_allowed("danger-x") is True
+            """
+        ).strip() + "\n",
+        encoding="utf-8",
+    )
+    before = (project / "guard.py").read_bytes()
+    manifest = tmp_path / "m.json"
+    manifest.write_text(
+        '{"cases": [{"label": "l", "path": "guard.py", '
+        '"anchor": "if name.startswith(\\"danger\\"):", "replacement": "if False:", '
+        '"validator": "python", '
+        '"test": "test_known_bug.py::test_known_bug", "why": "w"}]}',
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(_MOD), str(manifest), "--repo", str(project)],
+        capture_output=True, text=True, timeout=180,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert "1 bit" not in proc.stdout, out
+    assert "xfailed" in out, out
+    assert (project / "guard.py").read_bytes() == before
 
 
 # --------------------------------------------------------------------------
@@ -487,10 +665,16 @@ def test_a_mutation_that_breaks_import_ABORTS_rather_than_reading_as_BIT(project
                                          (2, ms.ABORTED), (3, ms.ABORTED),
                                          (4, ms.ABORTED), (5, ms.ABORTED)])
 def test_only_pytest_exit_0_and_1_mean_the_tests_ran(project, monkeypatch, rc, expected):
-    """pytest's exit codes are an enumerated contract; stdout text is not."""
+    """pytest's exit codes are an enumerated contract; stdout text is not.
+
+    The summary is the one pytest WRITES for each code (rc=1 "1 failed", every
+    other code "1 passed"), because the verdict now also requires the summary to
+    AGREE with the code. The old fixed "1 failed, 0 passed" was a line pytest
+    never emits (it prints no zero counts), and under rc=0 it is a disagreement.
+    """
     class Fake:
         returncode = rc
-        stdout = "1 failed, 0 passed in 0.1s"
+        stdout = "1 failed in 0.10s" if rc == 1 else "1 passed in 0.10s"
         stderr = ""
 
     monkeypatch.setattr(ms.subprocess, "run", lambda *a, **k: Fake())
@@ -1071,14 +1255,6 @@ def test_a_manifest_path_through_a_symlinked_directory_may_not_escape(tmp_path):
 # --------------------------------------------------------------------------
 # RESULT CLASSIFICATION AND POLICY.
 # --------------------------------------------------------------------------
-
-@pytest.mark.parametrize("stdout", [
-    "ERROR test_guard.py::test_blocks_danger - RuntimeError: boom",
-    "1 Error in 0.2s",
-])
-def test_an_error_line_in_any_case_is_not_a_result(stdout):
-    assert ms._has_result_line(stdout) is False
-
 
 def test_the_per_case_timeout_defaults_to_the_house_floor():
     """The repo's timeout floor is 7200s; 900s turned a legitimately slow test
