@@ -3231,6 +3231,70 @@ verified: 4cc75d50 2026-08-05
   is now live (manual dismissals, PR-2c); its diagnose/fix/promotion verdict
   points remain groundwork.
 
+## 15. Work board — Projects v2 front end and open questions
+
+The work board lives on a GitHub Projects v2 board: GitHub owns the cards,
+columns, positions and dependencies (native `blockedBy` / sub-issues), and
+Genesis mirrors none of them. Genesis keeps three local stores and the glue
+around them. **What exists today:** the stores, the `board` mode lever, and the
+open-question tools. The Projects v2 adapter, promotion onto the board and the
+reconciler are follow-on work. Nothing writes to GitHub yet, and the shipped
+mode is `off`.
+
+```yaml subsystem-map
+entry: work-board
+modules: [board]
+verified: b67423bd 2026-10-03
+```
+
+- **Stores** (`db/crud/board.py`; New-Store justification and retention in
+  migration `20261003010926_board_stores`):
+  - `board_links` — private ledger row / follow-up -> public issue, written
+    only once the issue exists, with the promotion audit (who approved it, the
+    privacy-scan receipt, the hash of the body that was scanned);
+  - `open_questions` + `open_question_blocks` — local-only owner decisions
+    and the work each one blocks (an edge, not a list entry);
+  - `board_events` — the append-only event log.
+  Each vocabulary is enforced in the CRUD module; `board_events.event` has no
+  CHECK because SQLite cannot alter one. A partial UNIQUE index on
+  `(event, observed_change_key)` dedups a re-read GitHub change.
+- **Mode lever** `board/config.py` (`off | propose_only | live`, re-read per
+  call; overlay `~/.genesis/config/board.local.yaml`; kill switch
+  `GENESIS_BOARD_DISABLED=1`). An invalid value degrades to `propose_only`:
+  reads stay on and writes stay off. `writes_allowed()` is the one predicate a
+  GitHub writer checks. `live` is OVERLAY-ONLY: the settings validator rejects
+  it (the `marketing_outreach` precedent), so no session can arm public-repo
+  writes for itself. The master `enabled` fails closed unless it is the literal
+  `true`.
+- **Open questions** (`mcp/health/open_question_tools.py`: `open_question_raise`,
+  `_resolve`, `_block`, `_list`) — never gated by the board mode, because they
+  write only local rows. A target id prefix must resolve uniquely against its
+  own table. A question and all its blocks are written in one SAVEPOINT, so
+  every target is validated first and none land unless all do. A close is
+  guarded on the observed status, so a second answer never overwrites the
+  first. Card targets and stored repo names are lowercased, because GitHub
+  names are case-insensitive. A test pins that the module has no GitHub or
+  subprocess path. `open_question_list` is on the reflection read allowlist.
+  **A block is ADVISORY today:** nothing refuses on one until board promotion
+  lands. The morning report's ground-truth section counts unverified questions
+  (count and oldest age only, never the text); that line is the push surface
+  that keeps a parked question from being a silent drop.
+- **Retention:** `scripts/prune_board.py` on the disk-hygiene timer prunes
+  closed questions (and their edges) after 90 d and events after 180 d.
+  Unverified questions and promotion pointers are never pruned.
+- **Do not:** write any card, column or status into a local table (the spec
+  allows exactly these three stores), or make Genesis move a card into
+  In Progress (only a human starts work).
+- **Measured facts the follow-on PRs depend on** (2026-10-03, private sandbox
+  project):
+  - on this account, issue timelines carry NO `ProjectV2ItemStatusChangedEvent`,
+    for UI drags or API writes alike. Change detection therefore keys on the
+    Status value's `updatedAt`, which is why the event log stores an
+    `observed_change_key`;
+  - a new user project gets a default workflow, "Pull request linked to issue",
+    that sets Status to In Progress on its own, and setup must delete it;
+  - project reads lag writes briefly.
+
 ---
 
 *Maintenance: run `python scripts/check_subsystem_map.py` from the repo root;

@@ -532,6 +532,31 @@ class MorningReportGenerator:
             logger.warning("Ground truth: observation count failed", exc_info=True)
 
         try:
+            # Open questions are owner decisions a session PARKED instead of
+            # asking mid-flow. This line is what keeps a parked question from
+            # being a silent drop: no other surface pushes them to the owner.
+            # COUNTS ONLY, like every line here — question text is free prose a
+            # session wrote, and a count cannot leak.
+            from genesis.db.crud import board as board_crud
+
+            if not await board_crud.tables_available(self._db):
+                lines.append(
+                    "- Open questions awaiting your decision: unavailable (store not migrated)"
+                )
+            else:
+                oq = await board_crud.question_summary(self._db)
+                age = ""
+                if oq["unverified"] and oq["oldest_created_at"]:
+                    oldest = datetime.fromisoformat(oq["oldest_created_at"])
+                    if oldest.tzinfo is None:
+                        oldest = oldest.replace(tzinfo=UTC)
+                    days = max(0, (datetime.now(UTC) - oldest).days)
+                    age = f" (oldest {days}d)"
+                lines.append(f"- Open questions awaiting your decision: {oq['unverified']}{age}")
+        except Exception:
+            logger.warning("Ground truth: open-question count failed", exc_info=True)
+
+        try:
             # Reads the SHARED assembler rather than re-deriving the counts, so
             # this line and the Zero-Drop dashboard tab cannot answer the same
             # question with two different numbers. An earlier version computed
