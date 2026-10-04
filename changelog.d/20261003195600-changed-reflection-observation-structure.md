@@ -1,1 +1,1 @@
-- Deep and Strategic reflection prompts now ask observations to explain the finding, evidence, significance and next step in four short lines, while keeping the existing JSON output fields.
+- Deep and Strategic reflection prompts now ask observations to explain the finding, evidence, significance and next step in four short lines, while keeping the existing JSON output fields. The reflection topic message shows each observation's finding and next step in whole lines, instead of cutting every observation at 300 characters.
