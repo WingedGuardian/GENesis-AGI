@@ -10251,6 +10251,95 @@ _PUSH_SAFE_GLOBAL_VALUE_FLAGS = frozenset({"-C"})
 _PUSH_SAFE_GLOBAL_FLAGS = frozenset({"-P", "--no-pager"})
 
 
+def _push_arg_stream(argv: list[str]) -> list[tuple[str, str]]:
+    """A ``git push`` argv as a stream of classified tokens — the ONE scanner
+    every push-argument consumer reduces, so the value-taking rules are written
+    exactly once:
+
+    * ``-o`` / ``--push-option`` / ``--repo`` / ``--receive-pack`` / ``--exec``
+      take a value — ``--flag value`` (next token) or ``--flag=value`` (glued);
+    * a ``o`` letter inside a short bundle takes the rest of the token as its
+      value (``-oci.skip``), or the NEXT token when it ends the bundle
+      (``-uo ci.skip``) — the case a token-wise skip misreads as a positional;
+    * global options before ``push`` consume their own value tokens
+      (``_GIT_GLOBAL_VALUE_FLAGS``), so e.g. a ``-c +k=v`` value is never read
+      as a ``+refspec``;
+    * ``--`` ends option parsing: later tokens are positional, though ``+``
+      still marks a force refspec (that is refspec syntax, not an option).
+
+    Returns ``(kind, text)`` pairs:
+      ``("global", tok)``    — a global option token before ``push``;
+      ``("globalval", tok)`` — a value-taking global option (its value token is
+                              consumed, not yielded);
+      ``("long", tok)``      — a ``--flag`` token (a glued ``=value`` stays
+                              inside ``tok``);
+      ``("optval", text)``   — the separate-token value of a long value-flag;
+      ``("short", ch)``      — one flag letter of a short bundle;
+      ``("oval", text)``     — a ``-o`` push-option value (glued or next token);
+      ``("plus", tok)``      — a ``+<refspec>`` force shorthand;
+      ``("pos", tok)``       — a bare positional.
+
+    Empty when argv is not a ``git push``. argv is quote-stripped from
+    ``shell_parse``, so a quoted ``'-f'`` still classifies as a short bundle.
+    """
+    out: list[tuple[str, str]] = []
+    i = 1  # skip argv[0] == "git"
+    # Global options first: value-taking ones consume the next token.
+    while i < len(argv):
+        t = argv[i]
+        if t in _GIT_GLOBAL_VALUE_FLAGS:
+            out.append(("globalval", t))
+            i += 2
+            continue
+        if t.startswith("-"):
+            out.append(("global", t))
+            i += 1
+            continue
+        break
+    if i >= len(argv) or argv[i] != "push":
+        return []
+    i += 1
+    end_opts = False
+    while i < len(argv):
+        t = argv[i]
+        if end_opts:
+            out.append(("plus" if t.startswith("+") else "pos", t))
+            i += 1
+            continue
+        if t == "--":
+            end_opts = True
+            i += 1
+            continue
+        if t.startswith("--"):
+            out.append(("long", t))
+            i += 1
+            if "=" not in t and t in _PUSH_VALUE_FLAGS and i < len(argv):
+                out.append(("optval", argv[i]))
+                i += 1
+            continue
+        if t.startswith("+"):
+            out.append(("plus", t))
+            i += 1
+            continue
+        if t.startswith("-") and len(t) > 1:
+            i += 1
+            letters = t[1:]
+            for pos, ch in enumerate(letters):
+                if ch == "o":  # -o takes a value: rest of token, else next
+                    glued = letters[pos + 1 :]
+                    if glued:
+                        out.append(("oval", glued))
+                    elif i < len(argv):
+                        out.append(("oval", argv[i]))
+                        i += 1
+                    break
+                out.append(("short", ch))
+            continue
+        out.append(("pos", t))
+        i += 1
+    return out
+
+
 def _push_is_force(argv: list[str]) -> bool:
     """Whether a parsed ``git push`` argv performs a force push.
 
@@ -10259,68 +10348,36 @@ def _push_is_force(argv: list[str]) -> bool:
     positional) does not. Catches both the flag forms — ``--force`` /
     ``--force-with-lease`` / ``--force-if-includes`` / ``--mirror`` / ``-f`` /
     bundled ``-uf`` — and the ``+<refspec>`` shorthand (``git push origin +main``),
-    which git treats as ``--force`` for that ref. A short cluster stops at
-    ``o`` and the value token of ``-o`` / ``--push-option`` / ``--repo`` /
-    ``--exec`` / ``--receive-pack`` is skipped, so a push-option value that
-    starts with ``+`` or contains ``f`` (e.g. ``-oci.skip``) is not mistaken
-    for a force.
+    which git treats as ``--force`` for that ref. ``_push_arg_stream`` consumes
+    every option's value (including ``-o`` ending a bundle and ``-c`` before
+    ``push``), so a value that starts with ``+`` or spells ``-f`` (e.g.
+    ``-oci.skip``, ``-o -f``, ``git -c +k=v push``) is never mistaken for a force.
     """
-    i = 1  # skip argv[0] == "git"
-    while i < len(argv):
-        tok = argv[i]
-        if tok in _PUSH_VALUE_FLAGS:
-            i += 2  # skip the flag and its value token
-            continue
-        if tok == "--force" or tok.startswith("--force-"):
-            return True
-        if tok == "--mirror":
+    for kind, text in _push_arg_stream(argv):
+        if kind == "long" and (
+            text == "--force" or text.startswith("--force-") or text == "--mirror"
+        ):
             # --mirror force-updates EVERY ref and deletes remote refs that are
             # absent locally — an unconditional destructive push, never a plain
             # one, so it must hard-block rather than reach an approvable prompt.
             return True
-        if tok.startswith("+"):
+        if kind == "short" and text == "f":
+            return True
+        if kind == "plus":
             return True  # +<refspec> is git shorthand for --force on that ref
-        if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1:
-            for ch in tok[1:]:
-                if ch == "o":  # -oVALUE glued push-option — rest is its value
-                    break
-                if ch == "f":
-                    return True
-        i += 1
     return False
 
 
 def _push_named_remote(argv: list[str]) -> str | None:
     """The remote named on a ``git push <remote> …``, else None.
 
-    argv is quote-stripped from ``shell_parse``. Skips git global options (and
-    their values), the ``push`` token, and push flags/values; the first bare
-    positional after that is the remote. A ``+<refspec>`` positional is NOT a
-    remote (it is a force refspec) and is skipped.
+    The first ``pos`` entry of ``_push_arg_stream``: option values (including a
+    ``-o`` that ends a bundle) and ``+<refspec>`` force shorthands are not
+    positionals, so ``git push -uo ci.skip origin HEAD`` answers ``origin``.
     """
-    i = 1  # skip argv[0] == "git"
-    # advance past git global options to the `push` token
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break
-    if i >= len(argv) or argv[i] != "push":
-        return None
-    i += 1
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-") or t.startswith("+"):
-            i += 1
-            continue
-        return t  # first bare positional after `push` is the remote
+    for kind, text in _push_arg_stream(argv):
+        if kind == "pos":
+            return text
     return None
 
 
@@ -10330,55 +10387,31 @@ def _push_repo_flag(argv: list[str]) -> str | None:
     ``git push --repo <dest>`` overrides both the positional remote and the
     branch upstream as the push DESTINATION (P1-C), so it must win when deciding
     what a force push actually targets. The value may be a remote name OR a URL.
+    Read through ``_push_arg_stream`` so a ``--repo`` that is merely ANOTHER
+    option's value (``git push -o --repo …``) does not count.
     """
-    i = 0
-    while i < len(argv):
-        t = argv[i]
-        if t == "--repo" and i + 1 < len(argv):
-            return argv[i + 1]
-        if t.startswith("--repo="):
-            return t.split("=", 1)[1]
-        i += 1
+    want_val = False
+    for kind, text in _push_arg_stream(argv):
+        if want_val:
+            return text if kind == "optval" else None
+        if kind == "long" and text == "--repo":
+            want_val = True
+        elif kind == "long" and text.startswith("--repo="):
+            return text.split("=", 1)[1]
     return None
 
 
 def _push_positionals(argv) -> list[str]:
     """The bare positional args of a ``git push`` (``[remote, refspec, ...]``).
 
-    Parsed from a quote-stripped argv, mirroring ``_push_named_remote``: git global
-    options/values, the ``push`` token, and push flags/values are all skipped —
-    including no-value flags (``-u`` / ``--set-upstream`` / ``--force-with-lease``)
-    which take NO separate token, and value flags (``_PUSH_VALUE_FLAGS``:
-    ``-o`` / ``--push-option`` / ``--repo`` / ``--receive-pack`` / ``--exec``) which
-    take one. A ``+<refspec>`` (force) positional is excluded. Empty if not a push.
+    The ``pos`` entries of ``_push_arg_stream``: git global options/values, the
+    ``push`` token, and push flags/values are all skipped — including no-value
+    flags (``-u`` / ``--set-upstream`` / ``--force-with-lease``), value flags
+    (``_PUSH_VALUE_FLAGS``: ``-o`` / ``--push-option`` / ``--repo`` /
+    ``--receive-pack`` / ``--exec``, with ``-o``'s bundled spellings covered),
+    and ``+<refspec>`` force positionals. Empty if not a push.
     """
-    argv = argv or []
-    i = 1  # skip argv[0] == "git"
-    # advance past git global options (and their values) to the `push` token
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break
-    if i >= len(argv) or argv[i] != "push":
-        return []
-    i += 1
-    out: list[str] = []
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-") or t.startswith("+"):
-            i += 1
-            continue
-        out.append(t)
-        i += 1
-    return out
+    return [text for kind, text in _push_arg_stream(argv or []) if kind == "pos"]
 
 
 # push.default modes that push the CURRENT branch to a SAME-NAMED remote ref (or
@@ -10642,43 +10675,16 @@ def _push_is_dry_run(seg) -> bool:
     Reads only the PUSH's own options, and skips each value-taking flag's
     value: ``git push -o --dry-run origin HEAD`` sends ``--dry-run`` to the
     server as a push-option and performs a REAL push (git-push(1): ``-o``
-    takes the next argument). The same walk as ``_push_positionals`` — global
-    options and their values, then ``_PUSH_VALUE_FLAGS`` values — so a value
-    is never read as the flag. ``--`` ends option parsing.
+    takes the next argument). Read through ``_push_arg_stream`` — the same
+    value rules as every other consumer — so a value is never read as the
+    flag, and a ``-n`` after ``--`` is a positional, not the flag.
     """
     argv = getattr(seg, "argv", None) or []
-    i = 1  # skip argv[0] == "git"
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break
-    if i >= len(argv) or argv[i] != "push":
-        return False
-    i += 1
-    while i < len(argv):
-        t = argv[i]
-        if t == "--":
-            return False
-        if t in _PUSH_VALUE_FLAGS:
-            i += 2  # the value token is data, never the dry-run flag
-            continue
-        if t == "--dry-run":
+    for kind, text in _push_arg_stream(argv):
+        if kind == "long" and text == "--dry-run":
             return True
-        if t.startswith("-") and not t.startswith("--") and len(t) > 1:
-            letters = t[1:]
-            for pos, ch in enumerate(letters):
-                if ch == "o":
-                    if pos == len(letters) - 1:
-                        i += 1  # `-uo VALUE`: the NEXT token is the value
-                    break  # `-oVALUE`: the rest of this token is the value
-                if ch == "n":
-                    return True
-        i += 1
+        if kind == "short" and text == "n":
+            return True
     return False
 
 
@@ -10708,67 +10714,36 @@ def _push_ref_positionals(argv: list[str]) -> list[str] | None:
     before this), ``--exec-path`` (where git finds the programs it runs),
     ``--namespace``, ``--git-dir`` / ``--work-tree``, and anything unknown.
     """
-    # Advance past git global options to the `push` token — allowlisted.
-    i = 1
+    positionals: list[str] = []
     dash_c = 0
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_SAFE_GLOBAL_VALUE_FLAGS:
+    for kind, text in _push_arg_stream(argv):
+        if kind == "globalval":
             # git applies repeated -C cumulatively; the caller resolves only
             # the first, so a second one would make it probe the wrong repo.
+            if text not in _PUSH_SAFE_GLOBAL_VALUE_FLAGS:
+                return None  # -c / --config-env / --git-dir / unknown
             dash_c += 1
             if dash_c > 1:
                 return None
-            i += 2
-            continue
-        if t in _PUSH_SAFE_GLOBAL_FLAGS:
-            i += 1
-            continue
-        if t.startswith("-"):
-            return None  # -c / --config-env / --exec-path / --git-dir / unknown
-        break
-    if i >= len(argv) or argv[i] != "push":
-        return None
-    i += 1
-    positionals: list[str] = []
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_SAFE_VALUE_FLAGS:
-            i += 2  # ref-neutral value flag: skip the flag and its value token
-            continue
-        if t.startswith("--"):
-            base = t.split("=", 1)[0]
-            if "=" in t and base in _PUSH_SAFE_VALUE_FLAGS:
-                i += 1  # --push-option=value etc.
-                continue
-            if "=" not in t and base in _PUSH_SAFE_LONG_FLAGS:
-                i += 1
+        elif kind == "global":
+            if text not in _PUSH_SAFE_GLOBAL_FLAGS:
+                return None
+        elif kind == "long":
+            base = text.split("=", 1)[0]
+            if base in _PUSH_SAFE_VALUE_FLAGS:
+                continue  # -o/--push-option; a separate value arrives as optval
+            if "=" not in text and base in _PUSH_SAFE_LONG_FLAGS:
                 continue
             return None  # unknown/broadening long flag (or a =form of a no-value flag)
-        if t.startswith("+"):
+        elif kind == "optval" or kind == "oval":
+            continue  # the value of a value-flag the flag check already passed
+        elif kind == "short":
+            if text not in _PUSH_SAFE_SHORT_LETTERS:
+                return None  # f/d/unknown letters change the ref set
+        elif kind == "plus":
             return None  # +<refspec> force shorthand
-        if t.startswith("-") and len(t) > 1:
-            # Short single/bundle — every letter must be ref-neutral. An `o` starts a
-            # glued push-option value, so the rest of the token is that value; an
-            # `o` that ENDS the bundle (`-uo VALUE`) takes the NEXT token instead,
-            # exactly as `_push_is_dry_run` reads it.
-            safe = True
-            letters = t[1:]
-            skip = 1
-            for pos, ch in enumerate(letters):
-                if ch == "o":
-                    if pos == len(letters) - 1:
-                        skip = 2
-                    break
-                if ch not in _PUSH_SAFE_SHORT_LETTERS:
-                    safe = False
-                    break
-            if not safe:
-                return None
-            i += skip
-            continue
-        positionals.append(t)
-        i += 1
+        else:  # pos
+            positionals.append(text)
     return positionals
 
 

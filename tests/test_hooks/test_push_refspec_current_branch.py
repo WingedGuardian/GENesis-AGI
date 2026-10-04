@@ -248,6 +248,71 @@ def test_dry_run_detection_skips_option_values(command: str, dry: bool) -> None:
     assert gpg._push_is_dry_run(_parsed_push_seg(command)) is dry
 
 
+# ─── one scanner for every consumer: a bundled -o value is never a positional ──
+
+
+@pytest.mark.parametrize(
+    ("command", "remote", "positionals", "why"),
+    [
+        ("git push -uo ci.skip origin HEAD", "origin", ["origin", "HEAD"], "the defect"),
+        ("git push -u origin HEAD", "origin", ["origin", "HEAD"], "control: no bundle"),
+        ("git push -oci.skip origin HEAD", "origin", ["origin", "HEAD"], "glued value"),
+        ("git push -o ci.skip origin HEAD", "origin", ["origin", "HEAD"], "separate value"),
+        ("git push --push-option ci.skip origin HEAD", "origin", ["origin", "HEAD"], "long form"),
+        ("git push --push-option=ci.skip origin HEAD", "origin", ["origin", "HEAD"], "glued long"),
+        ("git push -fo x origin HEAD", "origin", ["origin", "HEAD"], "-f + -o value in one bundle"),
+        ("git push origin +HEAD:refs/heads/feat/x", "origin", ["origin"], "+refspec is not a remote"),
+    ],
+)
+def test_an_option_value_is_never_a_remote_or_refspec(
+    command: str, remote: str, positionals: list[str], why: str
+) -> None:
+    argv = getattr(_parsed_push_seg(command), "argv", None) or []
+    assert gpg._push_named_remote(argv) == remote, why
+    assert gpg._push_positionals(argv) == positionals, why
+
+
+@pytest.mark.parametrize(
+    ("command", "force", "why"),
+    [
+        ("git push -o +ci.skip origin HEAD", False, "the -o value is data, not a refspec"),
+        ("git push -o -f origin HEAD", False, "same — a value that spells -f"),
+        ("git push -o --force origin HEAD", False, "same — the long flag spelled as a value"),
+        ("git push -uo -f origin HEAD", False, "a bundle-ending -o takes the NEXT token as value"),
+        ("git push -uo +x origin HEAD", False, "same — a + leading value is not a force refspec"),
+        ("git push -oci.skip origin HEAD", False, "glued value, no force letter"),
+        ("git push -of origin HEAD", False, "-of glues 'f' AS the -o value"),
+        ("git push --push-option=-f origin HEAD", False, "glued long value"),
+        ("git -c +k=v push origin HEAD", False, "a -c value is data even before push"),
+        ("git push -f origin HEAD", True, "control: a real force flag"),
+        ("git push -fo x origin HEAD", True, "control: -f inside the bundle"),
+        ("git push origin +HEAD", True, "control: +refspec"),
+        ("git push --force-with-lease origin HEAD", True, "control: long force form"),
+        ("git push --mirror origin", True, "control: mirror is unconditional force"),
+    ],
+)
+def test_an_option_value_is_never_a_force(command: str, force: bool, why: str) -> None:
+    argv = getattr(_parsed_push_seg(command), "argv", None) or []
+    assert gpg._push_is_force(argv) is force, why
+
+
+@pytest.mark.parametrize(
+    ("command", "repo", "why"),
+    [
+        ("git push --repo dest origin", "dest", "control: the real flag"),
+        ("git push --repo=dest", "dest", "control: the glued form"),
+        ("git push -o --repo origin HEAD", None, "-o's value is data, not the flag"),
+        ("git push --push-option=--repo origin", None, "same, glued long form"),
+        ("git push origin HEAD", None, "no --repo at all"),
+    ],
+)
+def test_a_repo_spelling_inside_an_option_value_is_not_a_repo_flag(
+    command: str, repo: str | None, why: str
+) -> None:
+    argv = getattr(_parsed_push_seg(command), "argv", None) or []
+    assert gpg._push_repo_flag(argv) == repo, why
+
+
 # ─── end to end through main(): the hygiene checks now run for HEAD ──────────
 
 
@@ -345,6 +410,24 @@ def test_a_repush_with_an_open_pr_rides_its_first_approval(
 ) -> None:
     """The existing re-push relaxation, now reached by the prescribed spelling."""
     decision, reason = _run(monkeypatch, tmp_path, capsys, command, republish=True, open_prs=1)
+    assert decision == "allow"
+    assert "re-push to 'feat/x'" in reason
+
+
+def test_a_bundled_push_option_repushes_like_the_plain_spelling(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The user-visible defect: ``-uo`` hid ``origin`` behind -o's value, so the
+    remote resolved to ``ci.skip`` and an eligible re-push asked again instead
+    of riding its first approval."""
+    decision, reason = _run(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        "git push -uo ci.skip origin HEAD",
+        republish=True,
+        open_prs=1,
+    )
     assert decision == "allow"
     assert "re-push to 'feat/x'" in reason
 
