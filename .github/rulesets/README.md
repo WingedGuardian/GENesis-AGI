@@ -99,6 +99,16 @@ analysis-service latency, which is a different argument for the same conclusion;
 the remaining `CI` jobs are worth keeping green but a stall in one should not
 hold the repository.
 
+`branch-leak-scan` (the `Branch leak scan` workflow) is also absent on
+purpose. It runs the same steps as `leak-detector` — both call
+`scripts/ci/leak_scan.sh` — on every push to every non-main branch, so a branch
+with no PR is still scanned. A rule on `main` has nothing to require from it:
+`leak-detector` already covers every pull request, and the branch job is named
+differently precisely so a push to a PR's branch never puts a second
+`leak-detector` check on the same head commit. A red `branch-leak-scan` on a
+PR's head still blocks the local merge gate, which reads every check in the
+rollup.
+
 `genesis-merge-gate` (the `merge-gate` workflow, issue #1670) is likewise
 deliberately absent from this list for now: it runs the local merge gate's
 `--check-pr` report as an advisory check while its false-block rate is

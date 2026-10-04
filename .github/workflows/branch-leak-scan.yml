@@ -1,0 +1,91 @@
+name: Branch leak scan
+
+# The leak scan on EVERY push to EVERY non-main branch, so no branch is public
+# without being checked — whether or not it has a PR, and whichever client
+# pushed it. `ci.yml` runs only on pull requests to main and pushes to main, so
+# before this workflow a branch pushed with no PR was published unscanned.
+#
+# The scan itself is NOT defined here: every step calls scripts/ci/leak_scan.sh,
+# the same script ci.yml's required `leak-detector` job calls, so the two
+# cannot drift. Only the leak scan runs here — never the test suite.
+#
+# The job is deliberately NOT named `leak-detector`. That name is a required
+# status check (.github/rulesets/checks.json, matched by check name alone), and
+# the merge gate's leaks relief is pinned to the (leak-detector, CI) pair. A
+# second check of that name on a PR's head commit — which a push to the PR's
+# branch produces — would be ambiguous with the real one.
+#
+# Tag pushes do not trigger it: "If you define only tags/tags-ignore or only
+# branches/branches-ignore, the workflow won't run for events affecting the
+# undefined Git ref" (GitHub workflow-syntax reference, consulted 2026-10-04).
+
+on:
+  push:
+    branches-ignore: [main]
+
+# One in-flight run per branch, as in ci.yml. Cancelling is safe here because
+# every run scans the WHOLE branch (merge-base with main..HEAD), not just the
+# newest push, so the next run covers whatever a cancelled one had not reached.
+concurrency:
+  group: branch-leak-scan-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  branch-leak-scan:
+    # Deleting a branch also fires `push`, with the run's SHA reverted to the
+    # default branch (GitHub "Events that trigger workflows", push event) —
+    # there is no branch content left to scan, so skip it.
+    if: github.event.deleted != true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history: the private-pattern scan diffs the branch against its
+          # merge-base with origin/main.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: bash scripts/ci/leak_scan.sh install
+
+      - name: Secret scan (detect-secrets)
+        run: bash scripts/ci/leak_scan.sh detect-secrets
+
+      - name: Leak scan (gitleaks)
+        run: bash scripts/ci/leak_scan.sh gitleaks
+
+      - name: Class scan (advisory — non-gating)
+        run: bash scripts/ci/leak_scan.sh class
+
+      - name: Email scan
+        run: bash scripts/ci/leak_scan.sh email
+
+      - name: Binary/data artifact scan
+        run: bash scripts/ci/leak_scan.sh binary
+
+      - name: Private-pattern exact scan (hard gate)
+        # GENESIS_PRIVATE_PATTERNS is an ordinary repository Actions secret, and
+        # push events in this repository receive repository secrets. A push from
+        # a fork runs in the FORK's own repository, never here, so there is no
+        # fork case for this event; the repository check below also skips the
+        # step on every other install, which has no such secret. Dependabot
+        # pushes its own branches here and receives Dependabot secrets, not
+        # Actions secrets, so it is skipped exactly as in ci.yml. An empty
+        # secret on the canonical repository fails loud (exit 3), never green.
+        if: >-
+          github.repository == 'WingedGuardian/GENesis-AGI' &&
+          github.actor != 'dependabot[bot]'
+        env:
+          PRIV: ${{ secrets.GENESIS_PRIVATE_PATTERNS }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.sha }}
+          # Scan every commit on the branch that main lacks:
+          # merge-base(origin/main, HEAD)..HEAD. See leak_scan_added_lines.py.
+          LEAK_SCAN_RANGE: branch
+        run: bash scripts/ci/leak_scan.sh private

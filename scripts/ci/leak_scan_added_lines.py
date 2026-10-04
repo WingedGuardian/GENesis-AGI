@@ -26,6 +26,11 @@ Why this exists (the fail-BLOCK the former inline range hit):
   in ``merge-base..HEAD``; the deliberate add-then-remove-within-a-PR detection is
   preserved (all PR-own commits stay in range; ``--no-merges`` walks each).
 
+Branch pushes (``LEAK_SCAN_RANGE=branch``, set only by
+``.github/workflows/branch-leak-scan.yml``) use the same merge-base anchor, so
+every non-main branch is scanned the moment it is pushed, PR or not. A push to
+main keeps ``before..after``.
+
 CONTRACT:
   stdout  the added ('^+') lines across the range's non-merge commit patches
           (kept verbatim, INCLUDING '+++ b/path' headers — repo-relative paths
@@ -80,18 +85,58 @@ def _commit_exists(ref: str, cwd: str | None = None) -> bool:
     return bool(ref) and _git(["cat-file", "-e", f"{ref}^{{commit}}"], cwd).returncode == 0
 
 
+def _branch_range(cwd: str | None = None) -> tuple[str, str]:
+    """Scan spec for a push to a NON-main branch: every commit main lacks.
+
+    ``merge-base(origin/main, HEAD)..HEAD`` — the same anchor the pull_request
+    path uses, so a branch is scanned identically whether or not it has a PR.
+    Deliberately NOT ``before..after``: that scans only the newest push, so a
+    run cancelled by a later push (one run per branch) would leave the
+    cancelled push's commits unscanned, and a new branch (``before`` all
+    zeros) would fall back to its tip commit alone. Scanning the whole branch
+    each run is idempotent, so any later run covers what an earlier one missed.
+
+    A branch with NO common ancestor with main (an orphan branch) carries no
+    main history at all, so every commit on it is branch-authored and the scan
+    covers its entire history. Any other failure (no origin/main, a git error)
+    raises :class:`RangeError` — fail closed, never empty.
+    """
+    _git(["fetch", "--no-tags", "--quiet", "origin", "main"], cwd)
+    if not _commit_exists("origin/main", cwd):
+        raise RangeError(
+            "branch push: origin/main does not resolve — cannot bound the scan "
+            "to the branch's own commits"
+        )
+    mb = _git(["merge-base", "origin/main", "HEAD"], cwd)
+    base = mb.stdout.strip()
+    if mb.returncode == 0 and base:
+        return ("range", f"{base}..HEAD")
+    # `git merge-base` exits 1 with no output when the two share no ancestor.
+    if mb.returncode == 1 and not base and _commit_exists("HEAD", cwd):
+        return ("range", "HEAD")
+    raise RangeError(f"branch push: merge-base(origin/main, HEAD) failed (rc={mb.returncode})")
+
+
 def resolve_scan_spec(
     event_name: str,
     push_before: str,
     head_sha: str,
     cwd: str | None = None,
+    *,
+    branch_push: bool = False,
 ) -> tuple[str, str]:
     """Return the scan spec as ``(kind, value)``.
 
     ``("range", "A..B")`` → scan ``git log -p --no-merges A..B``.
+    ``("range", "HEAD")`` → scan every commit reachable from HEAD (orphan branch).
     ``("show", "<sha>")`` → scan a single commit's patch (new branch fallback).
+    ``branch_push`` (set by the branch-leak-scan workflow via
+    ``LEAK_SCAN_RANGE=branch``) selects :func:`_branch_range` for a push.
     Raises :class:`RangeError` when the range cannot be resolved (fail closed).
     """
+    if branch_push and event_name == "push":
+        return _branch_range(cwd)
+
     if event_name == "pull_request":
         # Anchor on live main via merge-base — robust for BOTH the synthetic
         # merge ref (mergeable PR) and the PR head (unmergeable, incl. a
@@ -156,8 +201,24 @@ def main(argv: list[str] | None = None) -> int:
     event_name = os.environ.get("EVENT_NAME", "")
     push_before = os.environ.get("PUSH_BEFORE", "")
     head_sha = os.environ.get("HEAD_SHA", "")
+    scope = os.environ.get("LEAK_SCAN_RANGE", "")
+    if scope not in ("", "branch"):
+        # A typo here must not silently fall back to the narrower push range.
+        print(
+            f"::error::LEAK_SCAN_RANGE={scope!r} is not recognised (expected 'branch' "
+            "or unset). Failing closed.",
+            file=sys.stderr,
+        )
+        return EXIT_UNRESOLVABLE
+    if scope == "branch" and event_name != "push":
+        print(
+            f"::error::LEAK_SCAN_RANGE=branch requires EVENT_NAME=push, got "
+            f"{event_name!r}. Failing closed.",
+            file=sys.stderr,
+        )
+        return EXIT_UNRESOLVABLE
     try:
-        spec = resolve_scan_spec(event_name, push_before, head_sha)
+        spec = resolve_scan_spec(event_name, push_before, head_sha, branch_push=scope == "branch")
         out = added_lines(spec)
     except RangeError as exc:
         print(

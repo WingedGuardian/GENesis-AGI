@@ -263,6 +263,165 @@ def test_new_branch_unknown_before_shows_tip(tmp_path: Path):
     assert PR_ADDED in lsa.added_lines(spec, cwd=str(repo))
 
 
+# --- Branch pushes (LEAK_SCAN_RANGE=branch, branch-leak-scan.yml) -------------
+
+
+def _branch_repo(tmp_path: Path, n_commits: int = 3) -> dict:
+    """main: A ─ B(-leak added then removed) ─ D;  branch: A ─ E1..En (each adds a token).
+
+    The branch's FIRST commit carries PR_ADDED, so a tip-only scan misses it.
+    """
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    a = _commit(repo, "base.txt", "hello\n", "A")
+    _commit(repo, "leak.txt", f"{MAIN_SECRET}\n", "B main adds")
+    _rm_commit(repo, "leak.txt", "C main removes")
+    d = _commit(repo, "main2.txt", "maindata\n", "D")
+    _set_origin_main(repo, d)
+    _git(repo, "checkout", "-q", "-b", "feature", a)
+    _commit(repo, "first.txt", f"{PR_ADDED}\n", "E1 first branch commit")
+    for i in range(2, n_commits + 1):
+        _commit(repo, f"f{i}.txt", f"benign {i}\n", f"E{i}")
+    return {"repo": repo, "A": a, "D": d, "tip": _git(repo, "rev-parse", "HEAD")}
+
+
+def test_branch_push_scans_every_branch_commit_not_just_tip(tmp_path: Path):
+    """A new branch (before = zeros) with several commits: the old push path
+    scanned the tip only and missed the first commit's token (control), the
+    branch path scans merge-base..HEAD and catches it, without re-flagging
+    main's own added-then-removed value."""
+    r = _branch_repo(tmp_path)
+    repo = str(r["repo"])
+    zeros = "0" * 40
+    control = lsa.added_lines(lsa.resolve_scan_spec("push", zeros, r["tip"], cwd=repo), cwd=repo)
+    assert PR_ADDED not in control  # control: tip-only scan is blind to commit 1
+    spec = lsa.resolve_scan_spec("push", zeros, r["tip"], cwd=repo, branch_push=True)
+    assert spec == ("range", f"{r['A']}..HEAD")
+    out = lsa.added_lines(spec, cwd=repo)
+    assert PR_ADDED in out
+    assert MAIN_SECRET not in out
+
+
+def test_branch_push_ignores_push_before(tmp_path: Path):
+    """A known `before` must NOT narrow the branch scan (a cancelled earlier
+    run would otherwise leave its commits unscanned)."""
+    r = _branch_repo(tmp_path)
+    repo = str(r["repo"])
+    before = _git(r["repo"], "rev-parse", "HEAD~1")
+    spec = lsa.resolve_scan_spec("push", before, r["tip"], cwd=repo, branch_push=True)
+    assert spec == ("range", f"{r['A']}..HEAD")
+    assert PR_ADDED in lsa.added_lines(spec, cwd=repo)
+
+
+def test_branch_push_branch_at_main_is_empty_not_error(tmp_path: Path):
+    """A branch created at main's tip with no commits of its own resolves to an
+    empty range — nothing was authored, so nothing to scan."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    d = _commit(repo, "base.txt", "hello\n", "A")
+    _set_origin_main(repo, d)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    spec = lsa.resolve_scan_spec("push", "0" * 40, d, cwd=str(repo), branch_push=True)
+    assert spec == ("range", f"{d}..HEAD")
+    assert lsa.added_lines(spec, cwd=str(repo)) == ""
+
+
+def test_branch_push_orphan_branch_scans_full_history(tmp_path: Path):
+    """No common ancestor with main: every commit is branch-authored."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    d = _commit(repo, "base.txt", "hello\n", "A")
+    _set_origin_main(repo, d)
+    _git(repo, "checkout", "-q", "--orphan", "orphan")
+    _git(repo, "rm", "-rq", "--cached", ".")
+    (repo / "base.txt").unlink()
+    _commit(repo, "o1.txt", f"{PR_ADDED}\n", "O1")
+    _commit(repo, "o2.txt", "benign\n", "O2")
+    spec = lsa.resolve_scan_spec("push", "0" * 40, "", cwd=str(repo), branch_push=True)
+    assert spec == ("range", "HEAD")
+    out = lsa.added_lines(spec, cwd=str(repo))
+    assert PR_ADDED in out
+
+
+def test_branch_push_without_origin_main_fails_closed(tmp_path: Path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _commit(repo, "pr.txt", f"{PR_ADDED}\n", "A")  # no origin/main ref
+    with pytest.raises(lsa.RangeError):
+        lsa.resolve_scan_spec("push", "0" * 40, "", cwd=str(repo), branch_push=True)
+
+
+def test_branch_flag_without_push_event_is_ignored_by_resolver(tmp_path: Path):
+    """branch_push only applies to push events; a PR keeps its own path."""
+    r = _branch_repo(tmp_path)
+    spec = lsa.resolve_scan_spec("pull_request", "", "", cwd=str(r["repo"]), branch_push=True)
+    assert spec == ("range", f"{r['A']}..HEAD")
+
+
+@pytest.mark.parametrize(
+    ("scope", "event"),
+    [("branches", "push"), ("BRANCH", "push"), ("branch", "pull_request"), ("branch", "")],
+)
+def test_main_rejects_bad_scope_fail_closed(monkeypatch, capsys, scope, event):
+    """An unrecognised LEAK_SCAN_RANGE, or `branch` on a non-push event, must
+    fail closed rather than silently fall back to a narrower range."""
+    called = []
+    monkeypatch.setattr(lsa, "resolve_scan_spec", lambda *a, **k: called.append(1))
+    monkeypatch.setenv("LEAK_SCAN_RANGE", scope)
+    monkeypatch.setenv("EVENT_NAME", event)
+    assert lsa.main([]) == lsa.EXIT_UNRESOLVABLE
+    assert "Failing closed" in capsys.readouterr().err
+    assert not called
+
+
+def test_main_passes_branch_scope(monkeypatch):
+    seen = {}
+
+    def _spy(event_name, push_before, head_sha, cwd=None, *, branch_push=False):
+        seen["branch_push"] = branch_push
+        return ("show", "HEAD")
+
+    monkeypatch.setattr(lsa, "resolve_scan_spec", _spy)
+    monkeypatch.setattr(lsa, "added_lines", lambda spec, cwd=None: "")
+    monkeypatch.setenv("LEAK_SCAN_RANGE", "branch")
+    monkeypatch.setenv("EVENT_NAME", "push")
+    assert lsa.main([]) == lsa.EXIT_OK
+    assert seen == {"branch_push": True}
+
+
+def test_e2e_branch_push_leak_in_first_commit_blocks(tmp_path: Path):
+    """The real two-script pipeline, as branch-leak-scan.yml runs it."""
+    import os
+    import sys
+
+    r = _branch_repo(tmp_path)
+    pf = tmp_path / "patterns.txt"
+    pf.write_text("PRADDED_TOKEN_[a-z0-9]+\n", encoding="utf-8")
+    env = {
+        **os.environ,
+        "EVENT_NAME": "push",
+        "LEAK_SCAN_RANGE": "branch",
+        "PUSH_BEFORE": "0" * 40,
+        "HEAD_SHA": r["tip"],
+        "HOME": str(r["repo"]),
+    }
+    p1 = subprocess.run(
+        [sys.executable, str(_MODULE_PATH)], cwd=r["repo"], env=env, capture_output=True, text=True
+    )
+    assert p1.returncode == 0, p1.stderr
+    p2 = subprocess.run(
+        [sys.executable, str(_PPS_PATH), "--patterns", str(pf)],
+        input=p1.stdout,
+        capture_output=True,
+        text=True,
+    )
+    assert p2.returncode == 1  # EXIT_LEAK
+
+
 def test_main_maps_range_error_to_fail_closed(monkeypatch, capsys):
     def _boom(*a, **k):
         raise lsa.RangeError("simulated unresolvable")
