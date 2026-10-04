@@ -288,9 +288,9 @@ scripts are, and a long closing session outlives them. OBSERVED 2026-10-03: the
 working from the copy it loaded at the start, proposed opening a draft PR, which
 that rule forbids. Before any open, send-back, round or merge decision, run
 `git fetch origin main` and then
-`git log <sha-you-loaded-at>..origin/main -- .claude/skills/`. If that lists
-anything, re-read the changed sections from
-`git show origin/main:.claude/skills/<skill>/SKILL.md`, not from the loaded copy.
+`git log <sha-you-loaded-at>..origin/main -- .claude/skills/ .claude/docs/ CLAUDE.md`.
+If that lists anything, re-read the changed sections from
+`git show origin/main:<path>`, not from the loaded copy.
 
 ### 1. Read the status — one command, no substitutes
 
@@ -382,7 +382,11 @@ session's own read of the diff. The subagent reads every added line, the title,
 the body and the commit messages, for BOTH kinds of leak:
 
 - literal identifiers, for which it is given `~/.genesis/release-fingerprints.txt`;
-- inferential personal context (CLAUDE.md, "Public-Artifact Privacy").
+- inferential personal context: anything that ties the change to a real
+  person's life, directly or by inference. That covers names, places,
+  household, schedule, the devices at home, and the languages spoken there. It
+  is the same class CLAUDE.md, "Where deferred work goes", says to scrub from
+  an issue, applied to every public surface.
 
 If it finds anything, fix it and re-run. Never post a passing marker over a
 finding. Otherwise post the marker from the owner account, in the grammar
