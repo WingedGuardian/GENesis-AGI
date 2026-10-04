@@ -356,17 +356,20 @@ def test_a_rebuild_whose_tree_changed_moves_even_with_the_same_merges(dc, dc_rea
 def test_a_switch_that_fails_partway_says_what_changed(dc, dc_ready, capsys):
     """git can rewrite part of the working tree and then fail (a required smudge
     filter exiting non-zero: MEASURED, git 2.43), leaving HEAD where it was. The
-    refusal must name what changed, never claim nothing moved."""
+    refusal must name what changed, never claim nothing moved. The filter is set
+    in .git/info/attributes (repo-local), NOT a candidate .gitattributes, which
+    admission refuses (a candidate's attributes could transform protected files)."""
     w = dc_ready
-    w.candidate(
-        "feat/a", {"b.txt": None, ".gitattributes": "*.bin filter=bad\n", "z.bin": "data\n"}
-    )
+    w.candidate("feat/a", {"b.txt": None, "z.bin": "data\n"})
     w.write_manifest([w.entry("feat/a")])
+    (w.root / ".git" / "info").mkdir(exist_ok=True)
+    (w.root / ".git" / "info" / "attributes").write_text("*.bin filter=bad\n")
     w.git(w.root, "config", "filter.bad.smudge", "false")
     w.git(w.root, "config", "filter.bad.required", "true")
     assert w.run(dc, "rebuild") == 1
     err = capsys.readouterr().err
-    assert "failed partway" in err and ".gitattributes" in err, err
+    assert "failed partway" in err, err
+    assert "z.bin" in err or "b.txt" in err, err  # a path the move touched
     assert "nothing moved" not in err, err
     assert w.git(w.root, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
 
@@ -625,6 +628,29 @@ def test_admission_is_checked_again_at_rebuild(dc, dc_ready, capsys):
     assert w.run(dc, "rebuild") == 0
     assert re.search(r"EXCLUDED: feat/h .*admission: .*hook", capsys.readouterr().out)
     assert w.live_merges() == [("feat/b", hb)]
+
+
+def test_a_candidate_changing_gitattributes_is_refused(dc, dc_ready, capsys):
+    """A candidate's .gitattributes transforms how git writes files on the
+    working-tree switch to `live` (a broad `* text eol=crlf` rewrites a protected
+    hook's shebang to CRLF, unexecutable), so admission refuses it like a hook
+    change. The off-tree merge uses --attr-source=base and is unaffected; the
+    checkout switch is not."""
+    w = dc_ready
+    w.candidate("feat/attr", {".gitattributes": "* text eol=crlf\n"})
+    hb = w.candidate("feat/b", {"y.txt": "y\n"})
+    w.write_manifest([w.entry("feat/attr"), w.entry("feat/b")])
+    assert w.run(dc, "rebuild") == 0
+    assert re.search(r"EXCLUDED: feat/attr .*\.gitattributes", capsys.readouterr().out)
+    assert w.live_merges() == [("feat/b", hb)]
+
+
+def test_path_refusal_covers_gitattributes_at_any_depth(dc):
+    """Root and nested .gitattributes both transform files on checkout."""
+    assert dc.gate.path_refusal(".gitattributes") is not None
+    assert dc.gate.path_refusal("scripts/hooks/.gitattributes") is not None
+    assert dc.gate.path_refusal("src/genesis/.gitattributes") is not None
+    assert dc.gate.path_refusal("src/genesis/app.py") is None  # ordinary file unaffected
 
 
 # ── an unknown never moves `live` ─────────────────────────────────────────────

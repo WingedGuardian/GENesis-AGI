@@ -77,16 +77,21 @@ def test_a_graft_cannot_change_which_candidates_share_commits(dc, dc_ready, caps
 
 
 def test_a_candidates_gitattributes_never_decides_how_others_merge(dc, dc_ready, capsys):
-    """Once `live` holds a candidate's `.gitattributes` with merge=union, a
-    rebuild FROM `live` read it from the index and concatenated two candidates
-    that conflict, a result nobody reviewed and GitHub would refuse."""
+    """A candidate's `.gitattributes` with merge=union must never make the engine
+    concatenate two conflicting candidates. Two layers stop it: admission refuses
+    the candidate that carries the `.gitattributes` at all (its rules could also
+    transform protected files on the switch), and build_plan's merges read
+    attributes with `--attr-source=base`, never from the checkout's index. So the
+    union rule never reaches a merge, and feat/q conflicts with feat/p normally."""
     w = dc_ready
     w.candidate("feat/k", {".gitattributes": "a.txt merge=union\n"})
     w.candidate("feat/p", {"a.txt": "a1\nP\na3\n"})
     w.candidate("feat/q", {"a.txt": "a1\nQ\na3\n"})
     w.write_manifest([w.entry("feat/k"), w.entry("feat/p"), w.entry("feat/q")])
     assert w.run(dc, "rebuild") == 0
-    assert "EXCLUDED: feat/q" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/k" in out and ".gitattributes" in out, out  # admission refuses it
+    assert "EXCLUDED: feat/q" in out, out  # conflict, not union-merged
     w.advance_main({"m.txt": "moved\n"})  # forces a new plan, built from `live`
     assert w.run(dc, "rebuild") == 0
     out = capsys.readouterr().out
@@ -487,3 +492,22 @@ def test_a_post_move_warning_names_the_commit_live_is_actually_at(
     assert f"WARNING: `live` is at {tip[:12]}, but keeping the reflog" in out
     assert f"WARNING: `live` is at {tip[:12]}, but fast-forwarding local main" in out
     assert out.count("WARNING: `live` is at") == out.count(f"WARNING: `live` is at {tip[:12]}")
+
+
+def test_the_head_reflog_is_kept_not_only_the_live_ref(dc, dc_ready):
+    """The serving-commit reader reads `$GIT_DIR/logs/HEAD`, a different log from
+    `live`'s. A `gc.<pattern>.reflogExpire` matches only refs under that pattern,
+    so HEAD needs the UNPATTERNED default at `never` or a long-lived server loses
+    the boot entry and readiness refuses. `ensure_reflog_kept` sets both the
+    live-ref pattern and the default."""
+    w = dc_ready
+    w.candidate("feat/a", {"x.txt": "x\n"})
+    w.write_manifest([w.entry("feat/a")])
+    assert w.run(dc, "rebuild") == 0
+    for key in ("gc.reflogExpire", "gc.reflogExpireUnreachable"):
+        assert w.git(w.root, "config", "--get", key).stdout.strip() == "never", key
+    # And the live-ref pattern is still set (both logs kept).
+    assert (
+        w.git(w.root, "config", "--get", "gc.refs/heads/live.reflogExpire").stdout.strip()
+        == "never"
+    )

@@ -272,6 +272,14 @@ def path_refusal(path: str) -> str | None:
         return f"changes a git or Claude Code hook ({path}); hooks go live only after they merge"
     if path in REFUSAL_FILES or path.startswith(ENGINE_PREFIX):
         return f"changes what keeps the wipers and this engine safe on `live` ({path})"
+    if path == ".gitattributes" or path.endswith("/.gitattributes"):
+        # A .gitattributes rule (eol/text/filter/ident) transforms how git writes
+        # files on the working-tree switch to `live`, so a broad `* text eol=crlf`
+        # could rewrite a protected hook's bytes (CRLF shebang -> unexecutable)
+        # even though the hook path itself is refused. The off-tree merge uses
+        # --attr-source=base and is unaffected; the checkout switch is not, so the
+        # candidate is kept off `live` until it merges.
+        return f"changes a .gitattributes ({path}); its rules transform files on checkout, reaching protected paths"
     return None
 
 

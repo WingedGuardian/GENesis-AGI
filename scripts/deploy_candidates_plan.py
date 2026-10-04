@@ -216,9 +216,19 @@ def _untracked_at(repo: Repo, path: str) -> list[str]:
 
 
 def ensure_reflog_kept(repo: Repo) -> None:
+    # The live-ref pattern keeps `live`'s own reflog; the unpatterned keys keep
+    # HEAD's, which is a different log (`$GIT_DIR/logs/HEAD`) and the one the
+    # serving-commit reader reads (deploy_status.sh) to find the booted commit.
+    # A `gc.<pattern>.reflogExpire` matches only refs under that pattern, so HEAD
+    # would otherwise keep git's 90d/30d defaults and a long-lived server could
+    # lose the boot entry, making readiness refuse. With the default at `never`
+    # the reader's `gc.reflogExpireUnreachable` resolves to the 0 cutoff, which
+    # it treats as "never expired" (MEASURED, git 2.43).
     for key in (
         "gc.refs/heads/live.reflogExpire",
         "gc.refs/heads/live.reflogExpireUnreachable",
+        "gc.reflogExpire",
+        "gc.reflogExpireUnreachable",
     ):
         if repo.git("config", "--get", key, check=False).stdout.strip() != "never":
             repo.git("config", key, "never")

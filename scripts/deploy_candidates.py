@@ -91,10 +91,13 @@ ACCIDENT through an inherited variable or a name collision, not to withstand an
 attacker. "A candidate could get its code to run" is in scope only as an
 accident to make unlikely; against intent it is out of scope by construction.
 
-The reflog of `live` is kept through `git gc` and `git reflog expire --all`
-(gc.refs/heads/live.reflogExpire[Unreachable] = never). It is NOT kept through
-an explicit `git reflog expire --expire=now`, which overrides the configuration
-(MEASURED, git 2.43).
+The reflog of `live`, AND of HEAD (the log the serving-commit reader reads), is
+kept through `git gc` and `git reflog expire --all`: the live ref by
+gc.refs/heads/live.reflogExpire[Unreachable] = never, HEAD by the unpatterned
+gc.reflogExpire[Unreachable] = never (a patterned setting matches only refs under
+that pattern, so HEAD needs the default). Neither is kept through an explicit
+`git reflog expire --expire=now`, which overrides the configuration (MEASURED,
+git 2.43).
 
 Exit codes: 0 done, 1 refused or failed (the message says which; a refusal
 changes nothing), 2 usage. The entry adds 200: update.lock still held after the
