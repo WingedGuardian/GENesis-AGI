@@ -3922,9 +3922,24 @@ So: post the finding, flag it, leave it open, and let the reviving session
 decide — including deciding to retire it in favour of a successor, which is that
 session's call to make and to justify.
 
-The same holds for a superseded PR: name the successor in a comment and leave it
-open. If you believe a PR should be retired and nobody is picking it up, that is
-a question for the user, not a judgment call for the review station.
+**A superseded PR is the one exception (standing owner rule, 2026-10-04).** The
+closing session may retire it when all three hold:
+
+1. **The owner authorized the supersession**: the decision to replace this
+   approach with another is the owner's, on record, not a reviewer's inference.
+2. **The successor PR is open**, or already merged, so the work has a live home.
+3. **It is superseded completely, in every part.** Walk the old PR's files one by
+   one against the successor and current `main`, and decide each as covered (name
+   the `file:line` that now does it) or moot (say why it no longer applies). One
+   part neither covered nor moot keeps the PR open, with a comment naming that
+   part.
+
+The closing comment carries that per-file mapping and names the successor, so the
+reasoning stays addressable after the close. Short of all three, name the
+successor in a comment and leave the PR open.
+
+If you believe any other PR should be retired and nobody is picking it up, that
+is a question for the user, not a judgment call for the review station.
 
 ### Keep the PR the PR — adjacent findings become issues (standing user rule, 2026-09-09)
 
@@ -4045,10 +4060,12 @@ finding is "too good" is not, which is why the action does not depend on it.
 path and it will measure that tree with complete confidence. Put the head SHA in
 the dispatch prompt and ask it to verify the match first.
 
-**When a PR IS superseded: name the successor in a comment and LEAVE IT OPEN.**
-Closing it is retiring, which is not the review station's call — see *Never
-RETIRE a PR you are not the one reviving* above. Do not "rebase and revive" it
-either; that is how the same change lands twice.
+**When a PR IS superseded: name the successor in a comment.** Leave it open
+unless all three conditions of the superseded-PR exception in *Never RETIRE a PR
+you are not the one reviving* above hold: owner-authorized supersession, the
+successor open or merged, and a per-file check showing it superseded in every
+part. Do not "rebase and revive" it either; that is how the same change lands
+twice.
 
 ## Pre-Merge Gate
 
