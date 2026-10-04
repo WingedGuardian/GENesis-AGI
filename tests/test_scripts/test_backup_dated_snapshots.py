@@ -97,7 +97,29 @@ def backup_env(tmp_path):
         'for a in "$@"; do [ "$a" = "-w" ] && { printf "404"; exit 0; }; done\n'
         "exit 1\n",
     )
-    return {"home": home, "gd": gd, "bind": bind, "smb_log": smb_log, "tmp": tmp_path}
+    # systemctl stub: backup.sh and restore.sh call `systemctl --user` (restore stops
+    # genesis-server before a SQLite restore). The real one, reached through an
+    # inherited session bus, stopped a LIVE server on every run of the round-trip
+    # test. Log every call and report every unit inactive.
+    systemctl_log = tmp_path / "systemctl.log"
+    _make_stub(
+        bind / "systemctl",
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{systemctl_log}"\n'
+        "exit 3\n",
+    )
+    return {
+        "home": home,
+        "gd": gd,
+        "bind": bind,
+        "smb_log": smb_log,
+        "systemctl_log": systemctl_log,
+        "tmp": tmp_path,
+    }
+
+
+# Never let a sandboxed script reach the real user manager.
+_SESSION_BUS_VARS = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
 
 
 def _run(backup_env):
@@ -112,7 +134,7 @@ def _run(backup_env):
         GENESIS_BACKUP_NAS_PASS="p",
         PATH=f"{backup_env['bind']}:{os.environ['PATH']}",
     )
-    for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_FORUM_CHAT_ID"):
+    for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_FORUM_CHAT_ID", *_SESSION_BUS_VARS):
         env.pop(k, None)
     proc = subprocess.run(
         ["bash", str(_BACKUP)], env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL
@@ -167,6 +189,7 @@ def _run_local(backup_env, offsite_root: Path, extra_env: dict | None = None):
         "TELEGRAM_FORUM_CHAT_ID",
         "GENESIS_BACKUP_EXTRA_DIRS",
         "GENESIS_BACKUP_EXTRA_EXCLUDES",
+        *_SESSION_BUS_VARS,
     ):
         env.pop(k, None)
     env.update(extra_env or {})
@@ -541,7 +564,7 @@ def test_extra_round_trip_real_backup_into_real_restore_keeps_links(backup_env, 
     (fresh / "tmp").mkdir()
     (fresh / ".gnupg").mkdir(mode=0o700)
     env = {
-        **os.environ,
+        **{k: v for k, v in os.environ.items() if k not in _SESSION_BUS_VARS},
         "HOME": str(fresh),
         "GENESIS_DIR": str(fresh / "genesis"),
         "GENESIS_BACKUP_TMPDIR": str(fresh / "tmp"),
@@ -567,6 +590,10 @@ def test_extra_round_trip_real_backup_into_real_restore_keeps_links(backup_env, 
     assert (t / "current" / "v.parquet").read_bytes() == b"PAR1-v"
     status = json.loads((fresh / ".genesis" / "restore_status.json").read_text())
     assert status["extra_restored"] == 1, status
+    # The SQLite section's server quiesce went through the stub, never the real unit.
+    calls = backup_env["systemctl_log"].read_text()
+    assert "is-active --quiet genesis-server" in calls, calls
+    assert "stop genesis-server" not in calls, calls
 
 
 def test_extra_dirs_symlinked_home_still_archives(backup_env, tmp_path):
