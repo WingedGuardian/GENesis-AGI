@@ -314,3 +314,39 @@ def test_the_reminder_names_both_asks_and_stays_under_the_cap():
 
     assert "CONFIDENCE" in hook.REMINDER and "DUE DILIGENCE" in hook.REMINDER
     assert len(_run(_payload()).stdout) < ho.HOOK_STDOUT_CAP
+
+
+# --------------------------------------------------------------------------
+# THE CHECKLIST POINTER.
+# --------------------------------------------------------------------------
+
+_SKILL = _WORKTREE / ".claude" / "skills" / "genesis-development" / "SKILL.md"
+
+
+@pytest.mark.parametrize("tool", ["EnterPlanMode", "ExitPlanMode"])
+def test_both_moments_name_the_checklist_items_and_point_at_it(tool):
+    """Asserted on the EMITTED text, not on the constant: the pointer could be
+    dropped from REMINDER with the drift test below still green."""
+    text = _emitted(_run(_payload(tool=tool)))["additionalContext"]
+    assert "For a development plan presented for approval" in text
+    assert "free read" in text
+    assert "genesis-architect plan review" in text
+    assert "yours to decide" in text
+    assert "beyond scratch state" in text, "item 1 counts scratch-only probes"
+    assert "not a /task plan" in text, "task-executor plans keep their own contract"
+    assert f'"{hook.CHECKLIST_HEADING}"' in text
+    assert f'"{hook.REVIEW_HEADING}"' in text
+
+
+@pytest.mark.parametrize("name", ["CHECKLIST_HEADING", "REVIEW_HEADING"])
+def test_each_section_the_reminder_names_still_exists(name):
+    """A renamed section would leave every plan pointed at nothing, silently."""
+    heading = getattr(hook, name)
+    headings = [
+        line for line in _SKILL.read_text(encoding="utf-8").splitlines()
+        if line.startswith("### ")
+    ]
+    assert any(h[4:].startswith(heading) for h in headings), (
+        f"SKILL.md has no '### {heading}' section; update {name} in the hook "
+        "to match"
+    )

@@ -125,8 +125,10 @@ Item 5's carve-outs stay the owner's however small they look:
 ## What this does not do
 
 Nothing checks a plan against this list. It is written by hand, and a plan that
-skips it fails silently until a review or the owner catches it. Pointing the
-advisory plan reminder's text at the SKILL.md checklist is a separate change.
+skips it fails silently until a review or the owner catches it. The advisory
+plan reminder (`scripts/hooks/plan_confidence_reminder.py`) restates items 1
+and 5 and the Architecture Review rule at plan time, and points at both SKILL.md
+sections; it still checks nothing.
 
 Whether the rule changes behaviour is measured by re-counting the sessions in
 which the checklist prompt still had to be pasted: user-typed messages only,
