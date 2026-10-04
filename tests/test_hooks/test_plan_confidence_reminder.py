@@ -340,13 +340,19 @@ def test_both_moments_name_the_checklist_items_and_point_at_it(tool):
 
 @pytest.mark.parametrize("name", ["CHECKLIST_HEADING", "REVIEW_HEADING"])
 def test_each_section_the_reminder_names_still_exists(name):
-    """A renamed section would leave every plan pointed at nothing, silently."""
+    """A renamed section would leave every plan pointed at nothing, silently.
+
+    The title must match exactly, optionally followed by a parenthesized note
+    such as "(standing owner rule, ...)". A bare prefix match would accept a
+    rename to "Architecture Reviews" while the reminder still quoted the old
+    title."""
     heading = getattr(hook, name)
-    headings = [
-        line for line in _SKILL.read_text(encoding="utf-8").splitlines()
+    titles = [
+        line[4:].rstrip()
+        for line in _SKILL.read_text(encoding="utf-8").splitlines()
         if line.startswith("### ")
     ]
-    assert any(h[4:].startswith(heading) for h in headings), (
+    assert any(t == heading or t.startswith(heading + " (") for t in titles), (
         f"SKILL.md has no '### {heading}' section; update {name} in the hook "
         "to match"
     )

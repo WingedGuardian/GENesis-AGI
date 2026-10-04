@@ -153,8 +153,9 @@ REVIEW_HEADING = "Architecture Review"
 #: The verbiage. Names BOTH asks, because the reminder exists to replace a
 #: sentence that always named both. The second block paraphrases checklist items
 #: 1 and 5 and the Architecture Review rule, then points at both sections for the
-#: rest. Only the pointers are checked by a test; the three paraphrases are not,
-#: so change them whenever those SKILL.md rules change.
+#: rest. Tests check that both headings exist and pin key phrases of each
+#: paraphrase in the emitted text; nothing compares the paraphrases with
+#: SKILL.md, so update the text and its test when those rules change.
 REMINDER = (
     "State your CONFIDENCE and your DUE DILIGENCE.\n"
     "  - Confidence per item, as a percentage with the rationale, and what "
