@@ -190,6 +190,27 @@ def test_the_note_states_the_limit_it_cannot_see():
     assert "silence is not evidence" in note
 
 
+def test_the_note_states_the_superseded_pr_exception():
+    """The skill lets the closing session retire a wholly superseded PR under three
+    conditions (owner ruling, 2026-10-04). A note saying superseded PRs always stay
+    open would contradict the rule it exists to surface."""
+    note = _note(_run("gh pr close 1"))
+    assert "owner authorized the supersession" in note
+    assert "successor PR is open or merged" in note
+    assert "covered or moot" in note
+    assert "also stays open" not in note
+    skill = (
+        Path(__file__).resolve().parents[2]
+        / ".claude"
+        / "skills"
+        / "genesis-development"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "**A superseded PR is the one exception" in skill, (
+        "the skill no longer states the exception this note describes"
+    )
+
+
 def test_it_names_every_distinct_close_in_a_compound():
     """A reader deciding whether to proceed needs to know the command closes two
     things by two routes, not that it closes something."""

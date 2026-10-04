@@ -6,8 +6,10 @@ WHAT GAP THIS FILLS
 There IS a rule. `genesis-development/SKILL.md` carries a 30-line standing user
 rule, "Never RETIRE a PR you are not the one reviving": a reviewer session
 retires nothing, a premise-wrong PR gets `needs-architecture-session` and stays
-OPEN, a superseded one gets a comment naming its successor and also stays open,
-and retiring belongs to the session taking up the revival.
+OPEN, and retiring belongs to the session taking up the revival. A superseded PR
+gets a comment naming its successor; since 2026-10-04 the closing session may
+retire it when the owner authorized the supersession, the successor is open or
+merged, and a per-file check shows it superseded in every part.
 
 **Nothing enforces or surfaces it.** MEASURED against `origin/main`: no hook
 mentions PR closure at all except one line in the push guard, and that one is a
@@ -327,11 +329,14 @@ def _advisory(reasons: list[str], closes: int) -> str:
         "at the premise gets the `needs-architecture-session` label carrying the "
         "evidence, and STAYS OPEN — retiring belongs to the session that takes "
         "up its revival. A superseded PR gets a comment naming its successor and "
-        "also stays open. If you believe one should be retired and nobody is "
+        "stays open, UNLESS all three hold: the owner authorized the "
+        "supersession, the successor PR is open or merged, and a per-file check "
+        "shows every part covered or moot (that mapping goes in the closing "
+        "comment). If you believe any other PR should be retired and nobody is "
         "picking it up, that is a question for the user.\n"
-        "So: if you are the reviving session, or the user asked for this close "
-        "by name, proceed. Otherwise say what you are about to close and why, "
-        "and let them answer.\n"
+        "So: if you are the reviving session, the user asked for this close by "
+        "name, or the superseded-PR conditions hold, proceed. Otherwise say what "
+        "you are about to close and why, and let them answer.\n"
         f"{_LIMIT}"
     )
 
@@ -350,7 +355,8 @@ def _unreadable_note(blind) -> str:
     return (
         f"NOTE: this command {blind.cause}, so I could not check whether it closes a "
         "pull request; it mentions a close. If it does: closing a PR is the user's "
-        "decision unless you are the session reviving it (genesis-development, "
+        "decision unless you are the session reviving it, or it is a wholly "
+        "superseded PR meeting that rule's conditions (genesis-development, "
         "'Never RETIRE a PR you are not the one reviving'). For the specific check: "
         f"{blind.hint}."
     )
