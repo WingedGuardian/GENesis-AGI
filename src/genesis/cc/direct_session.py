@@ -24,7 +24,6 @@ import contextlib
 import json
 import logging
 import shutil
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -309,11 +308,19 @@ _NO_MARKETING_SEND = [
     "mcp__genesis-outreach__marketing_prospects_list",
 ]
 
-# The venv Python interpreter running genesis-server. Exposed to profile
-# overlays (see _load_profile_overlays) so a locally-defined Bash profile can
-# allowlist exactly this path and run `<this> -m <module>`. Using
-# sys.executable keeps it install-agnostic (no hard-coded home path).
-_VENV_PYTHON = sys.executable
+# WITHDRAWN 2026-09-26: `_VENV_PYTHON` / `ProfileOverlayContext.venv_python`.
+# It existed so a locally-defined Bash profile could allowlist the venv
+# interpreter and run `<this> -m <module>`. That route no longer launches:
+# `invoker._required_hardening` refuses any allowlist entry that is in neither
+# `_BINARY_HARDENING` nor `_NEEDS_NO_HARDENING`, and `basename(sys.executable)`
+# is in neither — MEASURED, it raises out of `_build_env` on every dispatch.
+#
+# The refusal is CORRECT and is not the thing to change: an interpreter is an
+# arbitrary-program primitive (`python -c`), so no environment pin confines it.
+# What was wrong was leaving a comment here telling the next author to use a
+# route that raises. Reviving it needs a real `_BINARY_HARDENING` entry
+# (`-E`/`-s` plus `PYTHONSTARTUP`/`PYTHONPATH`/`PYTHONHOME`), each escape
+# MEASURED rather than reasoned about — not a field on this context.
 
 PROFILES: dict[str, list[str]] = {
     "observe": (
@@ -371,6 +378,7 @@ PROFILES: dict[str, list[str]] = {
     # the coverage test in tests/test_cc/test_direct_session_profiles.py are
     # where it has to be classified.
     #
+
     # ── Community responder profile ─────────────────────────────
     # Reactive community responder: reads a community's channels and replies
     # via the discord-bot MCP server. MCP config loads discord-bot + health +
@@ -617,7 +625,6 @@ class ProfileOverlayContext:
     no_recon_writes: list[str]
     no_web_tools: list[str]
     no_marketing_send: list[str]
-    venv_python: str
 
     def add_profile(
         self,
@@ -668,7 +675,6 @@ def _load_profile_overlays() -> None:
         no_recon_writes=_NO_RECON_WRITES,
         no_web_tools=_NO_WEB_TOOLS,
         no_marketing_send=_NO_MARKETING_SEND,
-        venv_python=_VENV_PYTHON,
     )
     try:
         profile_overlay.register(ctx)

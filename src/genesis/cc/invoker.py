@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
@@ -391,6 +393,48 @@ _ALLOWLIST_GUARD_SCRIPT = "hooks/bash_allowlist_guard.sh"
 # has no cleanup surface and no concurrent-writer problem.
 _SEALED_GH_CONFIG_DIR = Path.home() / ".genesis" / "gh-sealed"
 
+# EVERY environment variable gh reads as a CREDENTIAL. Enumerated from
+# `gh help environment` (gh 2.100.0, consulted 2026-09-26), NOT from recall:
+#
+#   "`GH_TOKEN`, `GITHUB_TOKEN` (in order of precedence): an authentication
+#    token that will be used when ..."
+#   "`GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN` (in order of precedence):
+#    an authentication token that will be used when a command targets a GitHub
+#    Enterprise Server host."
+#
+# The first version of this pinned `GH_TOKEN` ALONE, which was a denylist of one
+# wearing the grammar of a fix. MEASURED: with `GH_TOKEN=""` and
+# `GITHUB_TOKEN=<value>`, `gh auth token` returns the fallback — so the pin was
+# bypassed by the variable one line below it in gh's own documentation.
+#
+# ENFORCEMENT IS NOT HERE. `_assert_no_gh_credentials` checks these at the launch
+# gate, for every invocation. Do not move the check into a per-binary hardening:
+# that is where it started, and it made an every-session claim depend on an
+# invocation shape almost nothing uses.
+#
+# The lesson is narrow and worth keeping: `_gh_hardening` already enumerates gh's
+# PROGRAM routes from this same document, and says so proudly. The token half was
+# then hand-picked from memory. Read the doc for BOTH halves, or the discipline is
+# decoration. If a future gh release adds a credential variable, add it here and
+# cite the release — a name recalled without a citation is how this broke.
+#
+# EMPTY, NOT POPPED, and the tradeoff is stated because the reasons cut both
+# ways. Empty is what gh reads as unset (MEASURED), and a present-and-empty key
+# is something the launch gate can VERIFY — a popped key is indistinguishable
+# from one that was never set, so `_assert_no_gh_credentials` would have nothing
+# to assert. The cost: for a NON-gh reader of these names, empty is still SET,
+# which yields an empty-credential 401 rather than a clean unauthenticated path.
+# No in-repo consumer exists today — MEASURED 2026-09-26, every reference in
+# `src/` and `scripts/` is in this file, and the only other uses are CI
+# workflows, which do not run in a dispatched session's environment. Revisit if
+# a library reading `GITHUB_TOKEN` is ever added to a dispatch path.
+_GH_CREDENTIAL_ENV = (
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+)
+
 # gh reads `config.yml` for aliases, pager and editor. Synthesised rather than
 # copied: the session needs a file to exist (gh writes one on migration
 # otherwise, which a read-only directory would turn into a hard failure), and
@@ -398,7 +442,87 @@ _SEALED_GH_CONFIG_DIR = Path.home() / ".genesis" / "gh-sealed"
 _SEALED_GH_CONFIG_YML = 'version: "1"\npager: cat\naliases: {}\n'
 
 
-def _sealed_gh_config_dir() -> str | None:
+#: How deep the purge will recurse before refusing. The seal is a FLAT set of
+#: files by construction, so any nesting at all is planted; 32 is far past
+#: anything legitimate and far short of Python's frame limit. Unbounded recursion
+#: raised RecursionError out of ``_sealed_gh_config_dir``'s documented
+#: "returns None" contract — MEASURED on a 1200-deep planted tree, it escaped into
+#: the caller AND left the seal at 0700, which is its only write protection.
+_MAX_SEAL_PURGE_DEPTH = 32
+
+
+def _purge_dir_entries(dir_fd: int, label: Path, depth: int = 0) -> None:
+    """Empty a directory through its DESCRIPTOR, never through its path.
+
+    Every removal is relative to ``dir_fd``, so nothing here can be redirected by
+    replacing a component of the path after the caller opened it. Subdirectories
+    recurse the same way: opened with ``O_DIRECTORY | O_NOFOLLOW`` relative to
+    their parent's descriptor, so a symlinked subdirectory raises rather than
+    being followed, and is then unlinked as the link it is.
+
+    ``shutil.rmtree`` is deliberately not used. It walks by PATH, which is the
+    property that made the previous version write through planted links, and its
+    ``dir_fd``-based hardening is not available on every platform this runs on.
+
+    ``label`` is for logging only — it is the path the descriptor was opened
+    from, which may no longer resolve there, and it is never used to address
+    anything.
+
+    DEPTH IS BOUNDED. A deep planted tree previously raised RecursionError, which
+    is not an OSError, so it escaped ``_sealed_gh_config_dir``'s except clause and
+    its documented "answers None" contract — and left the seal at 0700 on the way
+    out. Refusing with OSError keeps the failure inside the contract.
+    """
+    # NOT SELF-HEALING, and that is deliberate rather than overlooked. Refusing
+    # leaves the planted tree in place, so every later call refuses too and the
+    # seal stays unusable until somebody removes it by hand. The alternative is
+    # recursing without limit through a structure an attacker chose the depth of.
+    # The message therefore says what to do, because an operator reading a log is
+    # the recovery path.
+    if depth > _MAX_SEAL_PURGE_DEPTH:
+        raise OSError(
+            f"gh seal at {label} nests deeper than {_MAX_SEAL_PURGE_DEPTH} levels; "
+            f"refusing to recurse further. A seal is a flat set of files, so this "
+            f"was planted, and dispatches needing it will keep failing until the "
+            f"directory is removed by hand."
+        )
+    for entry in os.scandir(dir_fd):
+        st = os.lstat(entry.name, dir_fd=dir_fd)
+        if stat.S_ISDIR(st.st_mode):
+            # A real subdirectory. The seal is a flat set of files by
+            # construction, so its whole purpose since the extension finding is
+            # that `<seal>/gh/extensions` does not exist.
+            sub_fd = os.open(
+                entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd
+            )
+            try:
+                os.fchmod(sub_fd, 0o700)
+                _purge_dir_entries(sub_fd, label / entry.name, depth + 1)
+            finally:
+                os.close(sub_fd)
+            os.rmdir(entry.name, dir_fd=dir_fd)
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            logger.warning(
+                "removing a symlink named %r from the gh seal at %s; a seal entry "
+                "is a real file by construction, so this was planted",
+                entry.name,
+                label,
+            )
+        elif st.st_nlink != 1:
+            # Not fatal — we are deleting it — but the only way this arises is a
+            # deliberately planted second name, so it is worth one line.
+            logger.warning(
+                "removing %r from the gh seal at %s: st_nlink=%d, so a name "
+                "outside the seal shares this inode",
+                entry.name,
+                label,
+                st.st_nlink,
+            )
+        os.unlink(entry.name, dir_fd=dir_fd)
+
+
+def _sealed_gh_config_dir(*, wait_for_lock: bool = True) -> str | None:
     """A read-only ``GH_CONFIG_DIR`` that keeps ``gh`` from spawning a shell.
 
     THE PROBLEM. ``gh`` can be told to run arbitrary commands through its own
@@ -413,14 +537,42 @@ def _sealed_gh_config_dir() -> str | None:
     THE FIX. Point the session at a directory gh cannot write: an unwritable
     ``config.yml`` means ``gh alias set`` and ``gh config set`` fail, and the
     synthesised contents pin the pager to ``cat`` so the pager route is closed
-    even before that. MEASURED: auth still resolves, ordinary ``gh`` commands
-    including live API calls still work, and both write paths return non-zero.
+    even before that. MEASURED: both write paths (``gh alias set``,
+    ``gh config set``) return non-zero.
 
-    ``hosts.yml`` IS copied, because it is where the credential lives and gh
-    has no other way to find it. The copy is 0400 inside a 0500 directory owned
-    by this user — the same reachability as the original, which is 0600 in the
-    user's own home — so this moves a secret, it does not widen who can read
-    one. Say that plainly rather than leaving it implied.
+    DO NOT expect gh to be otherwise transparent under this seal. An earlier
+    version of this paragraph said "auth still resolves, ordinary ``gh`` commands
+    including live API calls still work" — MEASURED in the era when the seal
+    copied a credential, and falsified by removing it. gh cannot authenticate
+    from this seal at all, which is deliberate rather than a side effect: a
+    public read exits 4 ("please run gh auth login"), so the capability is
+    non-functional and not merely write-limited.
+
+    NO CREDENTIAL IS COPIED, and that is deliberate. The seal is synthesised
+    end to end, so ``gh`` reading it holds no credential — MEASURED:
+    ``gh auth status`` against this seal reports "not logged into any GitHub
+    hosts", against a control that authenticates. That is a claim about ``gh``
+    and NOT about the session: what a session can reach is decided by its tool
+    scope, and the operator's own gh config stays on disk. See
+    ``_assert_no_gh_credentials`` for the environment half.
+
+    Until 2026-09-25 this copied ``hosts.yml``, because that is where gh finds
+    the token. The argument was that the copy moves a secret rather than widening
+    who can read it, which is true and was the wrong question: it handed a
+    session that can be talked into running one ``gh`` command a credential with
+    MEASURED scopes ``delete_repo``, ``gist``, ``read:org``, ``repo``,
+    ``workflow`` ON THE INSTALL WHERE THAT WAS MEASURED — the scope list is a
+    property of one operator's ``gh auth login``, not of this code; what is
+    general is that whatever the operator holds, the session held too. A profile
+    whose whole point is that it reads EXTERNAL pull requests should not hold a
+    token that can delete repositories.
+
+    THERE IS NO ARMING PATH YET, and this comment deliberately does not pretend
+    otherwise. Removing the credential removes a capability the ``steward``
+    profile's own prompt still asks for (comment / reopen / close), which is
+    survivable only because that profile has never run — MEASURED: 0 rows in
+    ``cc_sessions`` for it. A deliberate operator grant is the follow-up work,
+    not something this change quietly provides.
 
     Returns the directory, or ``None`` when it cannot be prepared. The caller
     REFUSES TO LAUNCH on that; it is not a degraded mode, because the fallback
@@ -438,27 +590,27 @@ def _sealed_gh_config_dir() -> str | None:
     """
     target = _SEALED_GH_CONFIG_DIR
     try:
-        # gh's OWN precedence, from `gh help environment`: GH_CONFIG_DIR, then
-        # $XDG_CONFIG_HOME/gh, then ~/.config/gh. Implementing only the first
-        # and last builds a valid-LOOKING seal with no credential in it on any
-        # install that sets XDG_CONFIG_HOME — the session then launches
-        # unauthenticated and every gh call fails, which reads as a broken
-        # steward rather than as a missed config path.
-        _xdg = os.environ.get("XDG_CONFIG_HOME")
-        source = Path(
-            os.environ.get("GH_CONFIG_DIR")
-            or (Path(_xdg) / "gh" if _xdg else Path.home() / ".config" / "gh")
-        )
-        hosts = source / "hosts.yml"
-        desired = {
-            "config.yml": _SEALED_GH_CONFIG_YML,
-            # Absent when gh was never authenticated. Seal anyway: an
-            # unauthenticated session is no reason to leave the alias route
-            # open. Read INSIDE the try — an unreadable or non-UTF-8 hosts.yml
-            # would otherwise raise straight out of _build_env, past the
-            # fallback this function documents.
-            **({"hosts.yml": hosts.read_text(encoding="utf-8")} if hosts.is_file() else {}),
-        }
+        # ONE synthesised file, and nothing read from the operator's own gh
+        # config. There is therefore no source directory to resolve: the
+        # GH_CONFIG_DIR / $XDG_CONFIG_HOME/gh / ~/.config/gh precedence chain
+        # that used to live here existed only to locate `hosts.yml`, and went
+        # with the copy.
+        #
+        # `hosts.yml` is no longer in `desired`, so `_seal_matches` reports a
+        # mismatch on a seal that still holds one and the stale sweep below
+        # unlinks the copied token. DO NOT read that as the migration.
+        #
+        # THIS FUNCTION HAS TWO CALLERS, and the difference decides how urgently
+        # everything below matters. `_gh_hardening` reaches it only for an
+        # invocation declaring a Bash allowlist, and no such dispatch has ever run
+        # on this install (MEASURED: 0 rows) — that is the DORMANT caller.
+        # `reconcile_gh_seal()` reaches it at EVERY server start, which is what
+        # actually heals an install that ran the copying version, and what makes
+        # the link and race routes below live rather than theoretical. An earlier
+        # draft of this comment called `_gh_hardening` the only caller while
+        # naming the second one three lines later; that reading is what made a
+        # boot-time destructive path look like dead code.
+        desired = {"config.yml": _SEALED_GH_CONFIG_YML}
         if _seal_matches(target, desired):
             return str(target)
         # REWRITES ARE SERIALISED. The seal is one shared directory, and the
@@ -469,36 +621,259 @@ def _sealed_gh_config_dir() -> str | None:
         # caller refuses a launch that should have succeeded.
         target.parent.mkdir(parents=True, exist_ok=True)
         lock_path = target.parent / f"{target.name}.lock"
-        with open(lock_path, "w", encoding="utf-8") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        # O_NOFOLLOW, AND NOT TRUNCATING. The lock lives in the seal's PARENT and
+        # was opened `"w"` — which both follows a symlink and truncates what it
+        # lands on, BEFORE any check on the seal itself. MEASURED: with
+        # `<seal>.lock` symlinked at an unrelated file, that file was truncated
+        # to zero bytes while the seal reconciled normally, so nothing reported a
+        # problem. This is the same class as the symlinked-seal routes below and
+        # a DIFFERENT spelling: the three checks added for those all run later
+        # than this line, so none of them covered it.
+        #
+        # O_NOFOLLOW raises ELOOP when the final component is a link, which is
+        # the refusal we want; O_CREAT|O_RDWR without O_TRUNC means an existing
+        # real lock file is reused rather than emptied, and flock needs no
+        # content. LIMIT, stated because O_NOFOLLOW does not imply it: only the
+        # FINAL component is guarded. A symlinked ANCESTOR still resolves — that
+        # is a broader compromise than this function can bound, and closing it
+        # needs openat2/RESOLVE_NO_SYMLINKS rather than a flag here.
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            lock_file = os.fdopen(lock_fd, "r+", encoding="utf-8")
+        except Exception:
+            # `fdopen` TAKES OWNERSHIP of the descriptor only once it succeeds.
+            # Without this the fd leaks on failure, and this function runs at
+            # every server start, so a repeating failure would exhaust the
+            # process table's descriptors rather than just failing.
+            os.close(lock_fd)
+            raise
+        with lock_file as lock:
+            # `wait_for_lock=False` is the boot path (`reconcile_gh_seal`): a
+            # lock held by a stuck process must not hang server startup before
+            # secrets and the database initialise. LOCK_NB raises
+            # BlockingIOError, an OSError, which the handler below turns into a
+            # logged None, and the next boot retries.
+            fcntl.flock(lock, fcntl.LOCK_EX if wait_for_lock else fcntl.LOCK_EX | fcntl.LOCK_NB)
             # Re-check under the lock: the writer we queued behind may have
             # already produced exactly what we want.
             if _seal_matches(target, desired):
                 return str(target)
-            target.mkdir(parents=True, exist_ok=True)
-            target.chmod(0o700)
-            for stale in target.iterdir():
-                if stale.is_file() and stale.name in desired:
-                    continue
-                # DIRECTORIES TOO. The seal's whole job since the extension
-                # finding is that `<seal>/gh/extensions` does not exist — a
-                # sweep that only unlinks FILES leaves exactly the subtree the
-                # seal exists to prevent, and then locks it in at 0500.
-                if stale.is_dir() and not stale.is_symlink():
-                    shutil.rmtree(stale)
-                else:
-                    stale.unlink()
-            for name, body in desired.items():
-                path = target / name
-                path.touch(mode=0o600, exist_ok=True)
-                path.chmod(0o600)
-                path.write_text(body, encoding="utf-8")
-                path.chmod(0o400)
-            target.chmod(0o500)
+            # EVERY OPERATION BELOW GOES THROUGH A PINNED DIRECTORY
+            # DESCRIPTOR, never through the path again. Four path-level checks
+            # used to stand here — one per link trick somebody had thought of —
+            # and each round of review found the next spelling they missed:
+            #
+            #   * a SYMLINKED seal directory: `chmod`/`iterdir`/`rmtree` follow
+            #     it, so the rewrite emptied somebody else's directory and left
+            #     it at 0500 (MEASURED).
+            #   * a SYMLINK named `config.yml`: `is_file()` follows it and the
+            #     name is in `desired`, so the sweep KEPT it and the write landed
+            #     on its target (MEASURED).
+            #   * the LOCK FILE, one directory up, opened in a truncating mode
+            #     before any of those checks ran (MEASURED, fixed above).
+            #   * a HARDLINK named `config.yml`: `is_symlink()` is False,
+            #     `is_file()` is True, the name is in `desired` — so the sweep
+            #     kept it and the write landed on the other name's inode. Worse,
+            #     `_seal_matches` had no `st_nlink` check, so a hardlink holding
+            #     the right bytes at 0400 reported the seal CLEAN while a
+            #     writable name outside it owned gh's `config.yml`. MEASURED: an
+            #     alias was written through that name and read back from inside
+            #     the seal, which is the escape this whole mechanism exists to
+            #     close. The 0500 directory mode is the seal's only write
+            #     protection, and a second link is a way around it.
+            #
+            # Enumerating link tricks was the wrong shape. `O_DIRECTORY |
+            # O_NOFOLLOW` refuses a symlinked directory by CONSTRUCTION (ELOOP,
+            # caught below), and the descriptor then pins that inode for the rest
+            # of the rewrite — so a swap between the check and the write has
+            # nothing to act on, which also closes the time-of-check window the
+            # path-level version had. `O_EXCL | O_NOFOLLOW` on each created file
+            # guarantees a brand-new inode at `st_nlink == 1`, so no pre-planted
+            # link of either kind can be written through.
+            #
+            # The seal may not exist yet, and `os.open(..., O_DIRECTORY)` cannot
+            # create it. `os.mkdir` rather than `Path.mkdir(exist_ok=True)`: on
+            # an existing entry mkdir raises EEXIST whatever that entry IS, and
+            # the O_NOFOLLOW open below then refuses a symlinked one. `exist_ok`
+            # would have accepted it silently, which is the shape of the first
+            # bug in this list.
+            with contextlib.suppress(FileExistsError):
+                os.mkdir(target, 0o700)
+            dir_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                # THE MODE IS RESTORED WHATEVER HAPPENS. The rewrite opens the
+                # seal at 0700 to work inside it, and 0500 is the only write
+                # protection it has. Without this `finally`, any failure in
+                # between — a refused purge, a planted name, a write error —
+                # returned None while LEAVING THE SEAL WRITABLE. MEASURED on a
+                # 1200-deep planted tree: the seal was left at 0700. Wrong
+                # CONTENTS after a failure are self-correcting, because
+                # `_seal_matches` refuses them and the next call rewrites; being
+                # WRITABLE is not.
+                try:
+                    os.fchmod(dir_fd, 0o700)
+                    # EVERYTHING GOES, including a file whose name is in
+                    # `desired`. The old code kept a matching entry to avoid
+                    # churn, and that `continue` is what two of the earlier
+                    # defects were made of: it is the branch that preserves a
+                    # planted link. Nothing is kept now, so there is nothing to
+                    # vouch for — and it costs nothing, because `_seal_matches`
+                    # already returned early when the whole seal was correct, so
+                    # reaching here means something was wrong.
+                    _purge_dir_entries(dir_fd, target)
+                    for name, body in desired.items():
+                        # O_EXCL: the purge above removed every name, so a name
+                        # that exists NOW was created between the two, and
+                        # refusing is right. O_NOFOLLOW is belt-and-braces with
+                        # O_EXCL.
+                        fd = os.open(
+                            name,
+                            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                            0o600,
+                            dir_fd=dir_fd,
+                        )
+                        try:
+                            # WRITE IN A LOOP. `os.write` may write FEWER bytes
+                            # than it was given and reports that only in its
+                            # return value, which the first version of this
+                            # discarded — the `write_text` it replaced looped
+                            # internally, so the rewrite INTRODUCED this gap
+                            # rather than inheriting it. Unlikely at 36 bytes on a
+                            # regular file, and silent when it happens: a
+                            # truncated `config.yml` can lose the `pager: cat`
+                            # line, re-opening the pager route.
+                            payload = body.encode("utf-8")
+                            written = 0
+                            while written < len(payload):
+                                n = os.write(fd, payload[written:])
+                                if n <= 0:  # pragma: no cover - defensive
+                                    raise OSError(
+                                        f"short write to the gh seal's {name!r}: "
+                                        f"{written} of {len(payload)} bytes"
+                                    )
+                                written += n
+                            os.fchmod(fd, 0o400)
+                        finally:
+                            os.close(fd)
+                finally:
+                    # Best effort, and deliberately swallowing: on the failure
+                    # path we are already carrying the real error, and failing to
+                    # re-seal must not replace it with a less informative one. On
+                    # the success path this IS the chmod that seals it.
+                    with contextlib.suppress(OSError):
+                        os.fchmod(dir_fd, 0o500)
+                # VERIFY WHAT WAS PRODUCED, under the lock, before reporting
+                # success. The rewrite was previously write-only: an entry planted
+                # between the last create and the final chmod ended up INSIDE the
+                # finished 0500 seal and this function returned the path as though
+                # it were clean (MEASURED with an extension subtree).
+                # `_seal_matches` would catch it — one dispatch later, i.e. after
+                # the session it should have stopped had already run. Checking here
+                # costs one lstat per entry and makes a success return mean what
+                # every caller already reads it as.
+                if not _seal_matches(target, desired):
+                    logger.error(
+                        "gh seal at %s does not match its intended contents "
+                        "immediately after being written; refusing the launch "
+                        "rather than reporting a seal that was not achieved",
+                        target,
+                    )
+                    return None
+            finally:
+                os.close(dir_fd)
         return str(target)
     except (OSError, UnicodeError):
         logger.warning("Could not prepare the sealed gh config at %s", target, exc_info=True)
         return None
+
+
+def reconcile_gh_seal() -> None:
+    """Bring an EXISTING sealed gh config back to its credential-free shape.
+
+    WHY THIS EXISTS, and why it is not merely tidy. Removing the credential copy
+    relies on the stale sweep inside ``_sealed_gh_config_dir``, which runs only
+    when that function is called — and its OTHER caller is ``_gh_hardening``,
+    reachable only for an invocation that declares a Bash allowlist. Exactly one
+    shipped profile declares one, it has never been dispatched, and a companion
+    change removes it; so without this, an install that already ran the copying
+    version would keep the operator's token in the seal INDEFINITELY, while the
+    change that removed the copy claims installs "heal themselves with no
+    migration step". That claim is only true with a sweep keyed on nothing but its
+    own existence, which is this.
+
+    AND THIS FUNCTION IS WHY THAT SWEEP IS A BOOT-TIME PATH. Calling it here turns
+    machinery that had effectively never executed into something that runs on
+    every start, which is the whole reason the link, hardlink, file-type and race
+    routes in ``_sealed_gh_config_dir`` were worth closing rather than noting.
+
+    Deliberately a NO-OP when no seal directory exists. This must not CREATE one:
+    the seal is machinery for a capability most installs never use, and building
+    it unprompted would put a directory on every box to solve a problem only some
+    have.
+
+    NEVER RAISES, and that is now enforced by an outer guard rather than argued
+    from which calls can fail. The earlier version reasoned that
+    ``_sealed_gh_config_dir`` catches OSError/UnicodeError itself — true, and it
+    missed that this function does its OWN filesystem work first: ``is_dir``,
+    ``is_symlink`` and an eager ``os.readlink`` in a log argument, the last of
+    which raises if the link is removed between the check and the read. It held
+    only because the startup caller wraps it in ``except Exception``, which is not
+    the reason the docstring gave. A blanket try here means the guarantee does not
+    depend on anyone re-deriving that list after the next edit.
+
+    The caller is a startup path where a failure must not block boot — an
+    unhealed seal is the status quo, not a regression.
+    """
+    try:
+        if not _SEALED_GH_CONFIG_DIR.is_dir():
+            # A non-directory HERE is not always "no seal yet". `is_dir()` is also
+            # False for a symlink pointing at a FILE, and for a file or FIFO left
+            # under that name — all of which are planted, not absent. Saying
+            # nothing would make a deliberate obstruction indistinguishable from
+            # the ordinary case of an install that has never dispatched.
+            if _SEALED_GH_CONFIG_DIR.exists() or _SEALED_GH_CONFIG_DIR.is_symlink():
+                logger.error(
+                    "gh seal path %s exists but is NOT a directory; not "
+                    "reconciling. A seal is a directory by construction, so this "
+                    "was planted. Nothing was modified.",
+                    _SEALED_GH_CONFIG_DIR,
+                )
+            return
+        # A SYMLINKED SEAL IS NOT RECONCILED, IT IS REPORTED. `is_dir()` follows
+        # the link, so without this the startup path would hand
+        # `_sealed_gh_config_dir` a directory belonging to something else. That
+        # function refuses too (its `O_NOFOLLOW` open cannot do otherwise), but
+        # this check keeps the refusal cheap and the log specific: this runs on
+        # EVERY boot, and converting a dormant sweep into a boot-time one is
+        # exactly what made these routes worth closing.
+        if _SEALED_GH_CONFIG_DIR.is_symlink():
+            # Read the target defensively: it is only for the log, and the link
+            # can be gone by now. Losing the target must not lose the WARNING.
+            try:
+                points_at: object = os.readlink(_SEALED_GH_CONFIG_DIR)
+            except OSError:
+                points_at = "<unreadable>"
+            logger.error(
+                "gh seal at %s is a SYMLINK (-> %s) — not reconciling. A seal is "
+                "a real directory by construction, so this was planted; nothing "
+                "was modified.",
+                _SEALED_GH_CONFIG_DIR,
+                points_at,
+            )
+            return
+        if _sealed_gh_config_dir(wait_for_lock=False) is None:
+            logger.warning(
+                "gh seal at %s could not be reconciled; if it holds a copied "
+                "credential from an older version, that copy is still present",
+                _SEALED_GH_CONFIG_DIR,
+            )
+    except Exception:
+        logger.warning(
+            "gh seal reconciliation at %s failed; an existing seal may still "
+            "hold a credential copied by an older version",
+            _SEALED_GH_CONFIG_DIR,
+            exc_info=True,
+        )
 
 
 def _seal_matches(target: Path, desired: dict[str, str]) -> bool:
@@ -528,20 +903,152 @@ def _seal_matches(target: Path, desired: dict[str, str]) -> bool:
     matching.
     """
     try:
-        if not target.is_dir() or target.stat().st_mode & 0o777 != 0o500:
-            return False
-        entries = list(target.iterdir())
-        if any(p.is_dir() and not p.is_symlink() for p in entries):
-            return False
-        present = {p.name: p for p in entries if p.is_file()}
-        if set(present) != set(desired):
-            return False
-        return all(
-            path.stat().st_mode & 0o777 == 0o400
-            and path.read_text(encoding="utf-8") == desired[name]
-            for name, path in present.items()
-        )
+        # EVERY ANSWER COMES FROM AN OPEN DESCRIPTOR, never from a path restated
+        # between the check and the read. Two defects drove this shape, and the
+        # second is why the first fix was not enough.
+        #
+        # FILE TYPE IS AN ALLOWLIST. This began as a denylist — reject symlinks,
+        # then also directories — and each review round found the next type
+        # nobody had listed. The fifth was a FIFO: not a symlink, not a
+        # directory, and `is_file()` is ALSO False for it, so it was dropped from
+        # the comparison set entirely, `set(present)` still equalled
+        # `set(desired)`, and this reported the seal CLEAN. MEASURED: it survived
+        # both the boot reconciliation and the dispatch rewrite unlogged, and gh
+        # then read the planted name THROUGH the pipe and adopted the account in
+        # it. So an entry must be a REGULAR FILE and every other type is a
+        # non-match by construction — the same correction made to the binary
+        # hardening in this change.
+        #
+        # AND THE CHECK MUST NOT BE ANSWERED FROM A CACHED STAT. The first
+        # version of the allowlist took one `lstat` per path and then read the
+        # CONTENT with a fresh `read_text()` by path — so the type gate described
+        # one inode and the read reached whatever the name pointed at by then.
+        # MEASURED with a racing writer: 1 false-CLEAN verdict in 509,533 trials,
+        # where a clean verdict was only reachable by following a link the type
+        # gate had rejected. One hit is one escape, because a True here returns
+        # without rewriting and gh then reads through the planted link.
+        #
+        # `O_NOFOLLOW` makes the type gate part of the OPEN — a symlink raises
+        # rather than resolving — and `fstat` on the resulting descriptor
+        # describes exactly the inode the bytes come from. `O_NONBLOCK` is what
+        # keeps a FIFO from hanging: `read_text` on one with no writer blocks
+        # INDEFINITELY (MEASURED), which would wedge this function on every
+        # dispatch and, since the reconciliation calls it, every boot.
+        #
+        # ORDER IS DELIBERATE: type, then link count, then mode, then bytes. An
+        # earlier test of this believed it was exercising the type gate while the
+        # MODE gate was rejecting its fixture first — three of its four arms were
+        # vacuous. Cheapest-and-most-fundamental first also means a planted entry
+        # is rejected before anything reads it.
+        #
+        # WHICH GATE CATCHES WHAT, measured rather than argued — this comment has
+        # been wrong in BOTH directions, and each time the error was reasoning
+        # where a five-line probe was available.
+        #
+        # It first claimed the type test was redundant: "a FIFO reads as b'' under
+        # O_NONBLOCK so the content compare rejects it anyway". True of an EMPTY
+        # pipe, generalised without testing a full one. A pipe holds data with no
+        # writer attached — hold a reader open, write the seal constant, close the
+        # write end, and a descriptor read returns those 36 bytes. In the code as
+        # it stood then, only the type test refused that.
+        #
+        # It then claimed the type test was therefore the SOLE gate. Also wrong,
+        # because the size gate further down landed in the same round: MEASURED, a
+        # loaded FIFO reports st_size == 0, and so do a socket and a directory. In
+        # the shipped ORDER this test runs FIRST, so it is what actually refuses a
+        # pipe — but REMOVE it and the size gate refuses the same fixture, so
+        # deleting this line alone changes no outcome. (An earlier version of this
+        # comment said the size gate fires "before" the type test. It does not; it
+        # is below. The shadowing conclusion was right and the ordering word was
+        # wrong, which is its own small lesson about writing down a sequence
+        # without reading it.)
+        #
+        # So the two SHADOW each other, and neither can be shown load-bearing by
+        # deleting it alone — which is why their sweep arms are deliberately
+        # COMBINED. Both stay: this one refuses before any read, and it is what
+        # still holds if `desired` ever carries an entry whose length is not
+        # fixed, which would make the size gate stop discriminating.
+        #
+        # The neighbouring judgement about this function's own `O_NOFOLLOW` on the
+        # DIRECTORY does stand: following a link to a VALID seal yields a correct
+        # answer, and gh reaches the same place by following the same link. The
+        # refusal that carries weight is in the REWRITE's open.
+        dir_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if os.fstat(dir_fd).st_mode & 0o777 != 0o500:
+                return False
+            names = os.listdir(dir_fd)
+            if set(names) != set(desired):
+                return False
+            for name in names:
+                fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=dir_fd,
+                )
+                try:
+                    fst = os.fstat(fd)
+                    if not stat.S_ISREG(fst.st_mode):
+                        return False
+                    # st_nlink == 1: NO SECOND NAME FOR THIS INODE. A HARDLINK
+                    # holding the right bytes at 0400 otherwise reported this
+                    # seal CLEAN while a WRITABLE name outside it owned gh's
+                    # `config.yml` — MEASURED, an alias was written through that
+                    # outside name and read back from inside the seal, which is
+                    # the escape this whole mechanism exists to close. The 0500
+                    # directory mode is the seal's only write protection and a
+                    # second link goes around it, invisibly to any content or
+                    # mode check.
+                    if fst.st_nlink != 1:
+                        return False
+                    if fst.st_mode & 0o777 != 0o400:
+                        return False
+                    # SIZE GATE, and it is a denial-of-service fix rather than an
+                    # optimisation. The read had no bound, so a planted
+                    # `config.yml` of arbitrary size was read into memory in full
+                    # before the comparison rejected it. MEASURED: 64 MiB sparse
+                    # cost 0.33s and +192 MiB RSS — about 3x the file, linear, and
+                    # a multi-GiB plant is free to create with `truncate`. This
+                    # function runs from `reconcile_gh_seal` at bootstrap step
+                    # ONE, synchronously, before secrets and DB init, and the read
+                    # happens before the purge — so it is not self-healing either.
+                    #
+                    # It is also strictly MORE correct than reading first: a size
+                    # that differs from the expected bytes is a content mismatch by
+                    # definition, so there is nothing to learn from the contents.
+                    #
+                    # THE READ CEILING IS THE LOAD-BEARING HALF, though, and calling
+                    # it belt-and-braces was wrong. MEASURED by mutation: removing
+                    # this size gate ALONE does not restore the denial, because
+                    # `remaining` still caps the read at `len(expected) + 1`. Only
+                    # removing both reinstates it. What the size gate adds is
+                    # avoiding the read entirely, and rejecting every non-regular
+                    # type — all of which report st_size 0.
+                    expected = desired[name].encode("utf-8")
+                    if fst.st_size != len(expected):
+                        return False
+                    chunks: list[bytes] = []
+                    remaining = len(expected) + 1
+                    while remaining > 0:
+                        chunk = os.read(fd, remaining)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    if b"".join(chunks) != expected:
+                        return False
+                finally:
+                    os.close(fd)
+            return True
+        finally:
+            os.close(dir_fd)
     except (OSError, UnicodeError):
+        # `UnicodeError` is unreachable for the `desired` this module ships, since
+        # the only encode here is of its own constant and the comparison is on
+        # BYTES (it used to decode what it read, which is where the clause came
+        # from). Kept because `desired` is a PARAMETER: a future caller passing
+        # text that cannot encode would otherwise raise out of a function whose
+        # contract is to answer False. Retained deliberately, not inherited.
         return False
 
 
@@ -573,6 +1080,20 @@ def _gh_hardening() -> dict[str, str] | None:
     the guard refuses a command whose first token is an environment assignment
     — but gh executes them from INHERITED environment, so they are pinned
     rather than argued about.
+
+    CREDENTIALS ARE NOT PINNED HERE, and that is deliberate — the absence is
+    asserted by a test. They were briefly in this dict, which scoped an
+    every-session claim to the one invocation shape that declares a Bash
+    allowlist; they now live in ``_assert_no_gh_credentials``, called
+    unconditionally at the launch gate. What follows is about PROGRAM routes
+    only. ``_build_env`` starts from an unfiltered ``dict(os.environ)``, and
+    gh resolves ``GH_TOKEN`` AHEAD of ``hosts.yml`` — MEASURED: a bogus
+    ``GH_TOKEN`` returns 401 against a perfectly good ``hosts.yml``. So an
+    operator who exports ``GH_TOKEN`` in their own shell would have it inherited
+    by the child and beat the credential-free seal entirely. MEASURED: gh reads
+    an EMPTY value as UNSET. The set and its citation live at
+    ``_GH_CREDENTIAL_ENV``; the enforcement lives at
+    ``_assert_no_gh_credentials``. Neither belongs in this function.
 
     MEASURED inert, and therefore deliberately NOT pinned: ``GH_PATH``. It
     tells gh where its own binary is, for extension callbacks. With a planted
@@ -615,6 +1136,58 @@ def _unconfinable_binary_message(binary: str) -> str:
     )
 
 
+def _assert_no_gh_credentials(env: dict[str, str]) -> None:
+    """Raise unless every documented gh credential variable is empty.
+
+    UNCONDITIONAL, and that is the whole point. This used to live inside
+    ``_gh_hardening``'s returned dict, which meant it was only ever checked for an
+    invocation whose ``bash_allowlist`` was non-empty — ``_launch_env`` gates the
+    binary check on exactly that. ON THIS BRANCH exactly one shipped profile
+    declares an allowlist — ``steward``, for ``gh`` — and it has never been
+    dispatched (MEASURED: 0 rows). A companion change removes it, after which the
+    gated branch can never be taken at all. Either way the pin was SET by the
+    builder and ENFORCED only for a dispatch shape that has never occurred, so an
+    ``env_overrides`` credential won silently on every session that has ever run.
+    Stated in that order deliberately: an earlier draft of this paragraph wrote
+    the post-companion state in the PRESENT tense, which told a reader that a live
+    code path was dead.
+
+    Separated rather than left in the hardening dict because the two are different
+    claims with different scopes. "This binary cannot be reconfigured to run a
+    program" is about one allowlisted binary. "No dispatched session carries a
+    GitHub credential" is about every session, allowlisted or not, and gh is not
+    the only thing that would read these variables.
+
+    It also removes a live hazard: the credential keys were splatted LAST into
+    ``_gh_hardening``'s literal, so adding a name to ``_GH_CREDENTIAL_ENV`` that
+    collided with a hardening key — ``GH_CONFIG_DIR`` is the obvious one — would
+    have silently overwritten the seal pin with ``""`` and passed every check,
+    because ``_assert_hardening_present`` recomputes the same wrong dict.
+    """
+    # ABSENT and NON-EMPTY are both violations, and both must stay violations:
+    # a key deleted between the builder and the gate is exactly as unverified as
+    # one restored. They are reported SEPARATELY because the remedies differ and
+    # the old single message sent a reader looking for a value that is not there.
+    missing = sorted(v for v in _GH_CREDENTIAL_ENV if v not in env)
+    nonempty = sorted(v for v in _GH_CREDENTIAL_ENV if v in env and env[v] != "")
+    wrong = missing + nonempty
+    if wrong:
+        detail = []
+        if nonempty:
+            detail.append(f"arrived NON-EMPTY: {', '.join(nonempty)}")
+        if missing:
+            detail.append(f"ABSENT from the environment: {', '.join(missing)}")
+        raise RuntimeError(
+            f"Refusing to launch: {'; '.join(detail)}. Every one of "
+            f"{', '.join(_GH_CREDENTIAL_ENV)} must be present and empty in a "
+            f"dispatched session's environment — gh resolves these as credentials "
+            f"ahead of its config file, so a value here is the operator's GitHub "
+            f"identity, and an absent key is one this gate cannot vouch for. If a "
+            f"value came from `env_overrides`, that is not a supported way to arm "
+            f"a session."
+        )
+
+
 def _assert_hardening_present(env: dict[str, str], bash_allowlist: tuple[str, ...]) -> None:
     """Raise unless every allowlisted binary's confinement is in ``env``.
 
@@ -630,12 +1203,13 @@ def _assert_hardening_present(env: dict[str, str], bash_allowlist: tuple[str, ..
     key, and a recompute also notices a seal that changed underneath us.
     """
     for binary in bash_allowlist:
-        hardening = _BINARY_HARDENING.get(binary)
-        if hardening is None:
-            continue
-        required = hardening()
+        # ONE decision point, shared with the loop that applies it — see
+        # `_required_hardening`. It raises for an unreviewed or unpreparable
+        # binary, and returns None only for one deliberately classified as
+        # needing no pins.
+        required = _required_hardening(binary)
         if required is None:
-            raise RuntimeError(_unconfinable_binary_message(binary))
+            continue
         wrong = sorted(k for k, v in required.items() if env.get(k) != v)
         if wrong:
             raise RuntimeError(_unhardened_env_message(binary, wrong))
@@ -657,6 +1231,159 @@ def _unhardened_env_message(binary: str, wrong: list[str]) -> str:
 #: means "this binary cannot be confined right now", and the invoker refuses to
 #: launch rather than launching it unconfined.
 _BINARY_HARDENING: dict[str, Callable[[], dict[str, str] | None]] = {"gh": _gh_hardening}
+
+
+# Binaries deliberately judged to need NO hardening. An allowlist entry whose
+# canonical name is in neither this set nor `_BINARY_HARDENING` is REFUSED.
+#
+# The polarity is the point. A bare `dict.get(...)` + skip is a DENYLIST wearing
+# allowlist grammar: it silently permits every binary nobody has thought about.
+# `git` is the concrete case, and the next entry anyone adds for PR work:
+# `git -c core.pager=…`, `-c alias.x='!sh'`, `core.sshCommand`, or a writable
+# `~/.gitconfig` all make it run a program of its own accord, exactly like gh —
+# so skipping it would hand out an unsealed escape with no warning. It refuses
+# until someone writes its hardening.
+#
+# Each entry here is a JUDGEMENT, made once, in writing. Add one only after
+# checking BOTH halves:
+#
+#   (a) it cannot be told to run another program — through config, an alias, a
+#       pager, an editor, a plugin, or an environment variable; and
+#   (b) it cannot read a caller-chosen FILE or dump this process's environment.
+#
+# (b) is the half that was missing when this set was introduced, and it is the
+# one that matters for a credential: `_build_env` hands every child a copy of
+# this process's environment, which by then carries the secrets loaded at
+# startup. A binary that spawns nothing can still print all of them. An entry
+# satisfying (a) but not (b) is not wrong to allowlist — it is a TOOL-SCOPE
+# decision for the profile that allowlists it, which no environment pin can
+# make — but it must be recorded here rather than implied to be harmless.
+_NEEDS_NO_HARDENING: frozenset[str] = frozenset(
+    {
+        # (a) HOLDS: pure stdin/stdout JSON filter — no config file, no plugin
+        # mechanism, nothing in `jq --help` that execs.
+        #
+        # (b) DOES NOT HOLD, stated rather than implied. MEASURED on jq-1.7:
+        # `jq -n '$ENV.X'` prints an environment variable, and
+        # `jq -Rn --rawfile x <path> '$x'` prints any readable file (`--slurpfile`
+        # and `-f` likewise). So a profile allowlisting jq is NOT
+        # credential-confined, and nothing in this module can make it so. It
+        # stays here because the set answers "must the invoker refuse to launch
+        # this?", and for a binary that spawns nothing the answer is no.
+        "jq",
+    }
+)
+
+
+def _canonical_binary(entry: str) -> str:
+    """An allowlist entry reduced to the name the hardening map is keyed on.
+
+    ``basename`` earns its place and ``strip`` does not, and the difference is
+    worth recording because an earlier version of this comment claimed both.
+    MEASURED against the shipped predicate, varying the ALLOWLIST ENTRY:
+
+    * entry ``/usr/bin/gh`` + command ``/usr/bin/gh …`` -> rc=0, PERMITTED, while
+      a bare ``dict.get`` on that entry misses. That is a real unsealed launch,
+      and ``basename`` is what closes it.
+    * entry ``"gh "`` or ``" gh"`` -> rc=2 for EVERY command. The guard takes the
+      first token with ``awk '{print $1}'``, which can never yield a token
+      containing whitespace, so such an entry permits nothing at all. ``strip``
+      therefore closes no hole; it is normalisation so that a typo'd config and a
+      corrected one agree, and it is not load-bearing.
+
+    CASE IS NOT FOLDED. On a case-sensitive filesystem ``GH`` is a different
+    binary, and folding would apply gh's seal to whatever ``GH`` actually is.
+
+    IT ALSO WIDENS, and that is the cost of the hole it closes. Any entry whose
+    base name is ``gh`` resolves to gh's hardening — including
+    ``/tmp/anything/gh``, which is not gh. The guard permits only the literal
+    entry as the first token, so allowlisting such a path is already a decision to
+    run THAT binary; what this function adds is that the binary then launches with
+    gh's seal applied and ``_assert_hardening_present`` satisfied, i.e. stamped
+    confined when nothing about it was reviewed. Narrowing to absolute paths was
+    considered and rejected: it would re-open the measured ``/usr/bin/gh`` hole,
+    which is a real spelling an operator uses, against a case that requires
+    someone to allowlist an attacker-chosen path deliberately. A subcommand-level
+    allowlist is what would make either claim precise.
+    """
+    return os.path.basename(entry.strip())
+
+
+def _required_hardening(entry: str) -> dict[str, str] | None:
+    """The env an allowlisted binary must launch with, or ``None`` if it needs none.
+
+    ONE decision point for both call sites — the loop that APPLIES the hardening
+    and ``_assert_hardening_present`` which VERIFIES it. If they disagreed, a
+    session would launch with pins nobody checked, or be refused over pins that
+    were applied.
+
+    Raises rather than returning for the two failure modes, because both are
+    refusals and neither is a degraded mode:
+
+    * an UNREVIEWED binary (in neither table) — see ``_NEEDS_NO_HARDENING``;
+    * a binary whose hardening exists but could not be PREPARED, where the
+      fallback is the operator's own writable config.
+    """
+    canonical = _canonical_binary(entry)
+    if canonical in _NEEDS_NO_HARDENING:
+        return None
+    hardening = _BINARY_HARDENING.get(canonical)
+    if hardening is None:
+        raise RuntimeError(_unreviewed_binary_message(entry, canonical))
+    required = hardening()
+    if required is None:
+        raise RuntimeError(_unconfinable_binary_message(entry))
+    return required
+
+
+def _settings_env_pins(bash_allowlist: tuple[str, ...]) -> dict[str, str]:
+    """The env a dispatched session's ``--settings`` layer pins.
+
+    The same values the launch env carries: every credential variable in
+    ``_GH_CREDENTIAL_ENV`` empty, for every session, plus the confinement env of
+    each allowlisted binary from ``_required_hardening``. Pinned a second time
+    because Claude Code applies settings ``env`` after launch: without this a
+    user or project settings file could restore a credential, or point
+    ``GH_CONFIG_DIR`` back at the operator's own config, after
+    ``_assert_no_gh_credentials`` and ``_assert_hardening_present`` passed.
+    Managed (administrator) settings still outrank ``--settings``; they are the
+    operator's own policy and out of scope here.
+
+    A binary whose hardening cannot be prepared RAISES here, refusing the
+    launch. Swallowing it would write a settings file without the seal pins,
+    and a transient failure that clears before ``_build_env`` runs would then
+    pass every launch check while user or project settings reopen the
+    operator's gh config.
+
+    ``GENESIS_BASH_ALLOWLIST`` is pinned too, with exactly the value
+    ``_build_env`` exports: the PreToolUse guard reads it, so a settings file
+    that emptied or widened it would switch the guard off after every launch
+    check had passed.
+
+    Does filesystem work and may block on the seal lock when an allowlisted
+    binary needs hardening, so async callers run it in a worker thread.
+    """
+    pins = {var: "" for var in _GH_CREDENTIAL_ENV}
+    if bash_allowlist:
+        pins["GENESIS_BASH_ALLOWLIST"] = ",".join(bash_allowlist)
+    for entry in bash_allowlist:
+        required = _required_hardening(entry)
+        if required:
+            pins.update(required)
+    return pins
+
+
+def _unreviewed_binary_message(entry: str, canonical: str) -> str:
+    """Refusal text for an allowlist entry nobody has classified."""
+    return (
+        f"Refusing to launch: this invocation allows {entry!r} (canonical name "
+        f"{canonical!r}), which appears in neither _BINARY_HARDENING nor "
+        f"_NEEDS_NO_HARDENING — so nothing is recorded about whether it can be "
+        f"told to run other programs. Many binaries can: `git` alone does it "
+        f"through `-c core.pager`, `-c alias.*`, `core.sshCommand` and a writable "
+        f"~/.gitconfig. Classify {canonical!r} in one of those two tables — which "
+        f"means deciding, in writing, rather than defaulting."
+    )
 
 
 def _allowlist_guard_argv() -> list[str] | None:
@@ -915,10 +1642,14 @@ async def _emit_invocation_failed_event(
         logger.debug("cc.invocation_failed event emit failed", exc_info=True)
 
 
-def cc_span_settings_path() -> str | None:
+def cc_span_settings_path(env_pins: dict[str, str] | None = None) -> str | None:
     """Generate (idempotently) the minimal CC settings file injected into every
     dispatched session, and return its absolute path — or ``None`` if the
     launcher is unavailable.
+
+    ``env_pins`` adds a settings ``env`` block (see ``_settings_env_pins``) and
+    writes it to a sibling file named for its content; without it the legacy
+    hooks-only file is written, unchanged.
 
     (The name is historical: the span hook was this file's first tenant. It now
     carries the small set of hooks a dispatch cannot otherwise receive.)
@@ -970,67 +1701,79 @@ def cc_span_settings_path() -> str | None:
     if guard_argv is None:  # pragma: no cover - same existence test as above
         return None
 
-    desired = json.dumps(
-        {
-            "hooks": {
-                "PreToolUse": [
-                    {
-                        # ANCHORED, and measured rather than assumed: a matcher
-                        # is a REGEX (probed on CC 2.1.246 — a hook registered
-                        # as "^Bash$" fires on a Bash call), so a bare "Bash"
-                        # also matches "BashOutput". That tool carries no
-                        # .tool_input.command, so under an allowlist it would
-                        # hit this guard's fail-closed leg and be refused with a
-                        # message about a command it never had. The ~15 hooks in
-                        # .claude/settings.json using a bare "Bash" do not show
-                        # this because they all fail OPEN on an unreadable
-                        # payload.
-                        "matcher": "^Bash$",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                # Built from the same helper the pre-launch
-                                # binding check uses, so the command that is
-                                # registered and the command that is verified
-                                # cannot drift. shlex.join quotes it: an install
-                                # root containing a space would otherwise
-                                # produce a command CC's shell cannot resolve —
-                                # exit 127, which is non-blocking, i.e. a
-                                # permit.
-                                "command": shlex.join(guard_argv),
-                                # Generous by ~300x against the guard's real cost
-                                # (an env test, one jq, one awk — well under a
-                                # tenth of a second), because the failure
-                                # direction is asymmetric: a PreToolUse hook that
-                                # exceeds its declared timeout is killed and the
-                                # call PROCEEDS, so a tight bound on a
-                                # containment hook converts it into a silent
-                                # permit. Bounded rather than omitted so a hook
-                                # that somehow hangs cannot stall the session
-                                # indefinitely.
-                                "timeout": 30,
-                            },
-                        ],
-                    },
-                ],
-                "PostToolUse": [
-                    {
-                        "matcher": ".*",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": f"{genesis_hook} hooks/cc_span_hook.py",
-                                "timeout": 500,
-                            },
-                        ],
-                    },
-                ],
-            },
+    payload: dict[str, object] = {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    # ANCHORED, and measured rather than assumed: a matcher
+                    # is a REGEX (probed on CC 2.1.246 — a hook registered
+                    # as "^Bash$" fires on a Bash call), so a bare "Bash"
+                    # also matches "BashOutput". That tool carries no
+                    # .tool_input.command, so under an allowlist it would
+                    # hit this guard's fail-closed leg and be refused with a
+                    # message about a command it never had. The ~15 hooks in
+                    # .claude/settings.json using a bare "Bash" do not show
+                    # this because they all fail OPEN on an unreadable
+                    # payload.
+                    "matcher": "^Bash$",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            # Built from the same helper the pre-launch
+                            # binding check uses, so the command that is
+                            # registered and the command that is verified
+                            # cannot drift. shlex.join quotes it: an install
+                            # root containing a space would otherwise
+                            # produce a command CC's shell cannot resolve —
+                            # exit 127, which is non-blocking, i.e. a
+                            # permit.
+                            "command": shlex.join(guard_argv),
+                            # Generous by ~300x against the guard's real cost
+                            # (an env test, one jq, one awk — well under a
+                            # tenth of a second), because the failure
+                            # direction is asymmetric: a PreToolUse hook that
+                            # exceeds its declared timeout is killed and the
+                            # call PROCEEDS, so a tight bound on a
+                            # containment hook converts it into a silent
+                            # permit. Bounded rather than omitted so a hook
+                            # that somehow hangs cannot stall the session
+                            # indefinitely.
+                            "timeout": 30,
+                        },
+                    ],
+                },
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": ".*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f"{genesis_hook} hooks/cc_span_hook.py",
+                            "timeout": 500,
+                        },
+                    ],
+                },
+            ],
         },
-        indent=2,
-    )
-
+    }
     path = _CC_SPAN_SETTINGS_PATH
+    if env_pins:
+        # Settings `env` is applied AFTER launch and outranks every lower
+        # settings level and the inherited environment, so this is the layer
+        # that decides what the session's tools see. MEASURED on CC 2.1.280: a
+        # project `.claude/settings.local.json` that plants GH_TOKEN reaches
+        # Bash (length 18) when the launcher only cleared the launch env; with
+        # the same key pinned to "" here, Bash sees length 0, also when the
+        # variable is exported in the inherited environment. Per-content file
+        # name: the content is constant for a given pin set, so concurrent
+        # writers agree, and a process on older code — which rewrites the
+        # legacy path with its own hooks-only payload — never touches it.
+        payload["env"] = dict(sorted(env_pins.items()))
+        digest = hashlib.sha256(json.dumps(payload["env"]).encode()).hexdigest()[:12]
+        path = path.with_name(f"{path.stem}-{digest}{path.suffix}")
+    desired = json.dumps(payload, indent=2)
+
     try:
         if path.exists() and path.read_text(encoding="utf-8") == desired:
             return str(path)
@@ -1283,7 +2026,9 @@ class CCInvoker:
                 f"drop the bash_allowlist and confine the profile another way."
             )
 
-    async def verify_allowlist_enforceable(self, inv: CCInvocation) -> None:
+    async def verify_allowlist_enforceable(
+        self, inv: CCInvocation, *, settings_pins: dict[str, str] | None = None
+    ) -> None:
         """The EXPENSIVE half of the allowlist check, kept off the event loop.
 
         ``_build_args`` stays synchronous — the tests call it directly, and the
@@ -1306,12 +2051,21 @@ class CCInvoker:
         """
         if not inv.bash_allowlist:
             return
-        await asyncio.to_thread(self._verify_allowlist_enforceable_blocking, inv)
+        await asyncio.to_thread(self._verify_allowlist_enforceable_blocking, inv, settings_pins)
 
-    def _verify_allowlist_enforceable_blocking(self, inv: CCInvocation) -> None:
-        """Body of :meth:`verify_allowlist_enforceable`; runs in a worker thread."""
+    def _verify_allowlist_enforceable_blocking(
+        self, inv: CCInvocation, settings_pins: dict[str, str] | None = None
+    ) -> None:
+        """Body of :meth:`verify_allowlist_enforceable`; runs in a worker thread.
+
+        ``settings_pins`` are the pins the spawn path already handed to
+        ``_build_args``. Reusing them makes the settings file checked here the
+        file that launches: recomputing could land on a different, hash-named
+        file if seal preparation failed on one of the two calls.
+        """
         allowlist = ",".join(inv.bash_allowlist)
-        span_settings = cc_span_settings_path()
+        pins = settings_pins if settings_pins is not None else _settings_env_pins(tuple(inv.bash_allowlist))
+        span_settings = cc_span_settings_path(pins)
         if span_settings is None:
             raise RuntimeError(
                 f"Refusing to launch: this invocation restricts Bash to "
@@ -1463,7 +2217,9 @@ class CCInvoker:
                 f"refusing on its behalf."
             )
 
-    def _build_args(self, inv: CCInvocation) -> list[str]:
+    def _build_args(
+        self, inv: CCInvocation, *, settings_pins: dict[str, str] | None = None
+    ) -> list[str]:
         args = [self._claude_path, "-p"]
         # Roster routing: when model_id_override is set, model selection comes
         # entirely from ANTHROPIC_MODEL (set in _build_env). A --model flag here
@@ -1516,9 +2272,24 @@ class CCInvoker:
         # repo, so CC never loads the repo's .claude/settings.json; --settings
         # injects just these hooks and CC merges them with the user's settings.
         # Both no-op unless their env var is set. See cc_span_settings_path.
-        span_settings = cc_span_settings_path()
+        # The same file pins the session's credential and confinement env at the
+        # settings level, which outranks user and project settings: see
+        # _settings_env_pins.
+        # The async run paths compute the pins in a worker thread (the seal
+        # preparation behind them can block on a lock) and pass them in.
+        pins = settings_pins if settings_pins is not None else _settings_env_pins(tuple(inv.bash_allowlist))
+        span_settings = cc_span_settings_path(pins)
         if span_settings:
             args += ["--settings", span_settings]
+        else:
+            # No settings FILE (launcher absent, ~/.genesis unwritable): the hooks
+            # cannot be registered, but the env pins still must not be lost — a
+            # session launched without them lets a user or project settings file
+            # restore a credential. Pass them inline (`--settings` takes JSON as
+            # well as a path; the precedence probe used exactly this form). A
+            # Bash-restricted profile is still refused just below, because its
+            # guard is one of the hooks that could not be registered.
+            args += ["--settings", json.dumps({"env": dict(sorted(pins.items()))})]
         self._refuse_unenforceable_allowlist(inv, span_settings)
         if inv.skip_permissions:
             args.append("--dangerously-skip-permissions")
@@ -1544,6 +2315,69 @@ class CCInvoker:
         env = dict(os.environ)
         env.pop("CLAUDECODE", None)
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        # NO DISPATCHED SESSION INHERITS A GITHUB CREDENTIAL FROM OUR OWN
+        # ENVIRONMENT. Pinned for EVERY invocation, not only gh-allowlisted
+        # ones: `bash_allowlist=` is set at exactly one call site in the tree,
+        # so every other dispatch takes the `()` default and skips the whole
+        # hardening block below — while `dict(os.environ)` above copies
+        # everything this process holds. MEASURED: gh reads an empty GH_TOKEN as
+        # UNSET, so this neutralises an inherited token without inventing one.
+        # ENFORCED by `_assert_no_gh_credentials` at the launch gate, which runs for
+        # EVERY invocation — not by the per-binary hardening, which only runs for
+        # one that declares a Bash allowlist. An earlier draft put the pin in
+        # `_gh_hardening`'s dict and this comment told the next author to "teach
+        # `_gh_hardening` the value" to arm a session; that is now exactly wrong,
+        # because the unconditional check would refuse any non-empty value it
+        # produced. There is no arming path, and adding one means changing the
+        # check, deliberately, not feeding it a value from elsewhere.
+        #
+        # ALL FOUR, from the enumeration at `_GH_CREDENTIAL_ENV`. Pinning
+        # `GH_TOKEN` alone was the first version and was bypassed by
+        # `GITHUB_TOKEN`, which gh documents on the very same line.
+        for _cred_var in _GH_CREDENTIAL_ENV:
+            env[_cred_var] = ""
+        #
+        # AND THE PINS ABOVE CLOSE THE ENV ROUTE ONLY — read this before adding a
+        # stronger claim on top of it. MEASURED: with no GH_CONFIG_DIR pin, a
+        # session with every credential variable empty is STILL FULLY
+        # AUTHENTICATED, because gh falls back to `hosts.yml` on disk. The
+        # deciding variable for de-authenticating gh is GH_CONFIG_DIR, and this
+        # function does NOT pin it outside the allowlisted path.
+        #
+        # THE CLAIM THIS SUPPORTS IS ABOUT gh, NOT ABOUT THE SESSION, and the
+        # difference is the whole finding. Even where gh cannot authenticate, the
+        # session may still hold the operator's token: tool scope decides that,
+        # not the environment. The `steward` profile denies `Write` but permitted
+        # `Read`/`Glob`/`Grep` and runs with `skip_permissions=True`, so
+        # attacker-authored PR content could read `~/.config/gh/hosts.yml`
+        # directly and exfiltrate through its allowed `outreach_send` — a path no
+        # env pin touches. That is closed in the profile's own tool scope, not
+        # here. Say "gh holds no credential", never "the session is
+        # unauthenticated".
+        #
+        # That was deliberately NOT done here, and the reasons are worth keeping
+        # so the next attempt starts further along. Keying it on
+        # `origin == external_untrusted` looks tight and is not: MEASURED, that
+        # origin is produced for SIX dispatch profiles via `_PROFILE_ORIGIN`
+        # (campaign, community-responder, interact, mail, research, steward) and
+        # for every non-owner-attended CONVERSATION channel via
+        # `session_origin_for_channel` — dashboard, web, WhatsApp, voice, agent,
+        # OpenClaw, mail, and any unknown channel, which fails closed to it. A
+        # pin there would also have pointed `XDG_DATA_HOME`, a process-global
+        # base directory, at a read-only tree for ordinary dashboard sessions.
+        #
+        # And pinning the SEAL specifically is a fail-OPEN on exactly the
+        # installs that need it. REPRODUCED: with a pre-heal seal still holding
+        # a copied `hosts.yml`, a rewrite that fails before the stale sweep
+        # (unwritable parent, so the lock file cannot be opened) returns None —
+        # and a fallback that pins the seal path anyway points the session AT
+        # the credential rather than away from it.
+        #
+        # So the remaining exposure is the ON-DISK route for sessions that have
+        # Bash and no allowlist, and the honest fix is denying Bash on the one
+        # path that processes external content, not an env pin: unrestricted
+        # Bash can read the operator's config file whatever GH_CONFIG_DIR says,
+        # so a pin would remove AMBIENT authentication and never confinement.
         # Signal to SessionStart hooks that this is a Genesis-dispatched session.
         # The genesis_session_context.py hook skips identity injection when set,
         # preventing double injection (identity is in the system prompt arg).
@@ -1664,7 +2498,7 @@ class CCInvoker:
         # in Linux/tmux.  No-op on CC <2.1.132; required post-migration.
         env["CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"] = "1"
         # Restrict Bash to an allowlist of command binaries for scoped profiles
-        # (e.g. "steward" → gh only). scripts/bash_safety_hook.sh reads this and
+        # (a profile scoped to one binary). scripts/bash_safety_hook.sh reads this and
         # blocks any non-allowlisted command. Absent → no restriction (the var
         # must not leak from the parent, so pop when the field is empty).
         required_hardening: dict[str, dict[str, str]] = {}
@@ -1676,16 +2510,15 @@ class CCInvoker:
             # unrestricted shell while every token is still the allowed one.
             # Each entry that needs it gets its hardening applied here.
             for binary in inv.bash_allowlist:
-                hardening = _BINARY_HARDENING.get(binary)
-                if hardening is None:
-                    continue
-                applied = hardening()
+                # ONE decision point, shared with `_assert_hardening_present`, so
+                # the env we APPLY and the env it VERIFIES cannot diverge. It
+                # raises for an unreviewed binary and for one whose hardening
+                # could not be prepared — the latter FAILS CLOSED because
+                # launching anyway would put the session against the operator's
+                # writable configuration, the exact escape the hardening removes.
+                applied = _required_hardening(binary)
                 if applied is None:
-                    # FAIL CLOSED. Skipping the update would launch the session
-                    # against the operator's writable configuration — the very
-                    # escape this hardening exists to remove, and an outcome
-                    # strictly worse than not launching at all.
-                    raise RuntimeError(_unconfinable_binary_message(binary))
+                    continue
                 required_hardening[binary] = applied
                 env.update(applied)
         else:
@@ -1723,6 +2556,10 @@ class CCInvoker:
         after the builder goes through here, so the dict that was checked is
         the dict that launches.
         """
+        # UNCONDITIONAL: every dispatched session, allowlisted or not. See
+        # `_assert_no_gh_credentials` — gating this on the allowlist is what made
+        # the pin decorative once no profile declared one.
+        _assert_no_gh_credentials(env)
         if inv.bash_allowlist:
             _assert_hardening_present(env, tuple(inv.bash_allowlist))
         # Re-applied here, after every merge (env_overrides, the login fallback),
@@ -2065,9 +2902,12 @@ class CCInvoker:
         return env
 
     async def _run_inner(self, invocation: CCInvocation) -> CCOutput:
-        args = self._build_args(invocation)
+        # Off the event loop: the pins may prepare the gh seal (filesystem
+        # work behind a blocking lock) for a Bash-restricted profile.
+        pins = await asyncio.to_thread(_settings_env_pins, tuple(invocation.bash_allowlist))
+        args = self._build_args(invocation, settings_pins=pins)
         # Off the event loop: settings read, seal write, two probes.
-        await self.verify_allowlist_enforceable(invocation)
+        await self.verify_allowlist_enforceable(invocation, settings_pins=pins)
         env = self._build_env(invocation)
         env = await self._apply_login_fallback(env, invocation)
         env = self._launch_env(env, invocation)
@@ -2282,9 +3122,12 @@ class CCInvoker:
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
     ) -> CCOutput:
         """Run CC with stream-json output, calling on_event for each line."""
-        args = self._build_args(invocation)
+        # Off the event loop: the pins may prepare the gh seal (filesystem
+        # work behind a blocking lock) for a Bash-restricted profile.
+        pins = await asyncio.to_thread(_settings_env_pins, tuple(invocation.bash_allowlist))
+        args = self._build_args(invocation, settings_pins=pins)
         # Off the event loop: settings read, seal write, two probes.
-        await self.verify_allowlist_enforceable(invocation)
+        await self.verify_allowlist_enforceable(invocation, settings_pins=pins)
         # Override output format to stream-json (requires --verbose with -p).
         # Target the --output-format value by its flag, not a bare args.index("json")
         # scan — other args (e.g. --settings .../cc-span-settings.json) can contain

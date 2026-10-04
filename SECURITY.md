@@ -156,7 +156,11 @@ isolation is still load-bearing for you — it is:
   changes a credential — but login and logout do establish and tear down an
   authenticated session, and they run ungated by design, because a login that
   required prior authentication could never succeed.
-- It can be disabled outright with `GENESIS_DASHBOARD_API_AUTH=off`.
+- It can be disabled outright with `GENESIS_DASHBOARD_API_AUTH=off`. That also
+  reopens the file browser's write, create, rename, delete and upload routes to
+  an anonymous caller, inside the browser's allowed roots, which include the
+  Genesis source tree and `~/.claude`. The file browser's reads stay behind
+  login whatever the switch says.
 - It covers state-changing HTTP requests under the API prefixes, and nothing
   else. The interactive terminal runs over a WebSocket and the noVNC console
   over its own port; neither is behind this gate, so for those the control is
