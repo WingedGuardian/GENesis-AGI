@@ -132,6 +132,23 @@ def test_a_force_shorthand_refspec_never_reaches_the_colon_rule() -> None:
     assert gpg._push_targets_current_branch(seg, "feat/x", "origin", cwd=None) is False
 
 
+def test_a_non_push_argv_is_not_a_bare_push(monkeypatch) -> None:
+    """The ``None`` sentinel: a non-push argv must refuse, not read as bare push.
+
+    ``_push_arg_stream`` yields an EMPTY stream for both ``git status`` and a
+    bare ``git push``; the ``None``/``[]`` distinction is what keeps the empty
+    positional list from passing the allowlist for a segment that never pushes.
+    """
+    monkeypatch.setattr(gpg, "_push_config_is_simple", lambda *a, **k: True)
+    # Bare `git push` is the legitimate empty stream — this row must NOT change.
+    assert gpg._push_ref_positionals(["git", "push"]) == []
+    for argv in (["git", "status"], ["git", "-P", "merge"], ["git"]):
+        assert gpg._push_ref_positionals(argv) is None, argv
+    segs, _blind = gpg.analyze_checked("git status")
+    seg = next(s for s in segs if s.exe == "git")
+    assert gpg._push_targets_current_branch(seg, "feat/x", "origin", cwd=None) is False
+
+
 @pytest.mark.parametrize(
     ("command", "targets_cur"),
     [

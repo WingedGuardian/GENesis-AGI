@@ -10279,8 +10279,11 @@ def _push_arg_stream(argv: list[str]) -> list[tuple[str, str]]:
       ``("plus", tok)``      — a ``+<refspec>`` force shorthand;
       ``("pos", tok)``       — a bare positional.
 
-    Empty when argv is not a ``git push``. argv is quote-stripped from
-    ``shell_parse``, so a quoted ``'-f'`` still classifies as a short bundle.
+    ``None`` when argv is not a ``git push`` — distinct from a BARE
+    ``git push``, which yields the empty list. Consumers that treat an
+    empty stream as "plain push" rely on that distinction to keep refusing
+    non-push argv. argv is quote-stripped from ``shell_parse``, so a quoted
+    ``'-f'`` still classifies as a short bundle.
     """
     out: list[tuple[str, str]] = []
     i = 1  # skip argv[0] == "git"
@@ -10297,7 +10300,7 @@ def _push_arg_stream(argv: list[str]) -> list[tuple[str, str]]:
             continue
         break
     if i >= len(argv) or argv[i] != "push":
-        return []
+        return None
     i += 1
     end_opts = False
     while i < len(argv):
@@ -10353,7 +10356,7 @@ def _push_is_force(argv: list[str]) -> bool:
     ``push``), so a value that starts with ``+`` or spells ``-f`` (e.g.
     ``-oci.skip``, ``-o -f``, ``git -c +k=v push``) is never mistaken for a force.
     """
-    for kind, text in _push_arg_stream(argv):
+    for kind, text in _push_arg_stream(argv) or ():
         if kind == "long" and (
             text == "--force" or text.startswith("--force-") or text == "--mirror"
         ):
@@ -10375,7 +10378,7 @@ def _push_named_remote(argv: list[str]) -> str | None:
     ``-o`` that ends a bundle) and ``+<refspec>`` force shorthands are not
     positionals, so ``git push -uo ci.skip origin HEAD`` answers ``origin``.
     """
-    for kind, text in _push_arg_stream(argv):
+    for kind, text in _push_arg_stream(argv) or ():
         if kind == "pos":
             return text
     return None
@@ -10391,7 +10394,7 @@ def _push_repo_flag(argv: list[str]) -> str | None:
     option's value (``git push -o --repo …``) does not count.
     """
     want_val = False
-    for kind, text in _push_arg_stream(argv):
+    for kind, text in _push_arg_stream(argv) or ():
         if want_val:
             return text if kind == "optval" else None
         if kind == "long" and text == "--repo":
@@ -10411,7 +10414,7 @@ def _push_positionals(argv) -> list[str]:
     ``--receive-pack`` / ``--exec``, with ``-o``'s bundled spellings covered),
     and ``+<refspec>`` force positionals. Empty if not a push.
     """
-    return [text for kind, text in _push_arg_stream(argv or []) if kind == "pos"]
+    return [text for kind, text in _push_arg_stream(argv or []) or () if kind == "pos"]
 
 
 # push.default modes that push the CURRENT branch to a SAME-NAMED remote ref (or
@@ -10680,7 +10683,7 @@ def _push_is_dry_run(seg) -> bool:
     flag, and a ``-n`` after ``--`` is a positional, not the flag.
     """
     argv = getattr(seg, "argv", None) or []
-    for kind, text in _push_arg_stream(argv):
+    for kind, text in _push_arg_stream(argv) or ():
         if kind == "long" and text == "--dry-run":
             return True
         if kind == "short" and text == "n":
@@ -10716,7 +10719,10 @@ def _push_ref_positionals(argv: list[str]) -> list[str] | None:
     """
     positionals: list[str] = []
     dash_c = 0
-    for kind, text in _push_arg_stream(argv):
+    stream = _push_arg_stream(argv)
+    if stream is None:
+        return None  # not a `git push` — the bare-push `[]` does not apply
+    for kind, text in stream:
         if kind == "globalval":
             # git applies repeated -C cumulatively; the caller resolves only
             # the first, so a second one would make it probe the wrong repo.
