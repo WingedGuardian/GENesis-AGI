@@ -45,6 +45,18 @@ FALKORDB_REPO_URL="${FALKORDB_REPO_URL:-https://packages.redis.io/deb}"
 FALKORDB_RELEASE_BASE="${FALKORDB_RELEASE_BASE:-https://github.com/FalkorDB/FalkorDB/releases/download}"
 FALKORDB_OS_RELEASE="${FALKORDB_OS_RELEASE:-/etc/os-release}"
 
+# Pin the repository signing key: the full fingerprint of the ONE primary key
+# the downloaded file must hold before it is installed as an apt keyring
+# (rsa4096, "Redis (Package Signing)", created 2021-07-21). Deliberately NOT a
+# test seam — an environment that could override the pin would make it advice.
+# Provenance, stated honestly: Redis's own apt documentation publishes no
+# fingerprint. This is the key packages.redis.io/gpg served on 2026-10-03,
+# cross-checked against independent third-party pins of the same repository:
+# Canonical's charmed-redis-rock and harbor-rocks (rockcraft.yaml `key-id`)
+# and voxpupuli puppet-redis (manifests/init.pp `apt_key_id`). A rotated
+# upstream key makes provisioning refuse until this value is updated.
+FALKORDB_REDIS_KEY_FPR="54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C"
+
 # CONSENT, as distinct from capability. The system half adds a THIRD-PARTY
 # APT REPO and installs a daemon, and update.sh re-runs bootstrap.sh on every
 # update — so it is OPT-IN: GENESIS_FALKORDB_PROVISION=1, or
@@ -360,6 +372,53 @@ _falkordb_repo_undo() {
     fi
 }
 
+# _falkordb_signing_key_ok <keyfile> — rc 0 only when the file holds exactly
+# one primary key and its fingerprint is FALKORDB_REDIS_KEY_FPR. On refusal it
+# prints why. It reads the machine-readable colon listing, never gpg's
+# human-formatted output, and takes the `fpr` record that immediately follows
+# the `pub` record — a key's subkeys carry `fpr` records of their own. A
+# throwaway GNUPGHOME keeps the listing from creating or touching anyone's
+# keyring; nothing here changes the system.
+_falkordb_signing_key_ok() {
+    local keyfile="$1" gnupg_home listing rc parsed n fpr
+    gnupg_home="$(mktemp -d 2>/dev/null || printf '')"
+    if [ -z "$gnupg_home" ]; then
+        echo "  WARNING: could not create a temp dir to check the signing key — repo NOT added."
+        return 1
+    fi
+    rc=0
+    listing="$(GNUPGHOME="$gnupg_home" gpg --batch --no-autostart --show-keys --with-colons "$keyfile" 2>/dev/null)" || rc=$?
+    rm -rf "$gnupg_home" 2>/dev/null || true
+    if [ "$rc" -ne 0 ]; then
+        echo "  WARNING: gpg could not read the downloaded signing key (rc=$rc) — repo NOT added."
+        echo "           Either the download is not a key, or gpg predates 2.2.8 (no --show-keys)."
+        return 1
+    fi
+    rc=0
+    parsed="$(printf '%s\n' "$listing" | awk -F: '
+        $1 == "pub" || $1 == "sec" { n++; want = 1; next }
+        want && $1 == "fpr" { if (n == 1) f = $10; want = 0; next }
+        { want = 0 }
+        END { printf "%d %s", n, f }')" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "  WARNING: could not parse the signing key listing (rc=$rc) — repo NOT added."
+        return 1
+    fi
+    n="${parsed%% *}"
+    fpr="${parsed#* }"
+    if [ "$n" != "1" ]; then
+        echo "  WARNING: the downloaded signing key file holds $n keys, expected exactly 1 — repo NOT added."
+        return 1
+    fi
+    if [ "$fpr" != "$FALKORDB_REDIS_KEY_FPR" ]; then
+        echo "  WARNING: the downloaded signing key's fingerprint (${fpr:-none}) does not match"
+        echo "           the pinned $FALKORDB_REDIS_KEY_FPR — repo NOT added."
+        echo "           If Redis rotated its key, verify the new one and update the pin."
+        return 1
+    fi
+    return 0
+}
+
 # falkordb_redis_install — provide a redis-server new enough to load the module.
 #
 # Ubuntu/Debian stable ship 7.x, below the module's hard 8.0.0 floor, so this
@@ -510,6 +569,12 @@ falkordb_redis_install() {
         if [ "$rc" -ne 0 ] || [ ! -s "$keytmp" ]; then
             rm -f "$keytmp" 2>/dev/null || true
             echo "  WARNING: could not download the redis signing key (rc=$rc) — repo NOT added."
+            return 0
+        fi
+        # Pin the repository signing key, BEFORE anything is written: a key
+        # that is not the pinned one never becomes a keyring.
+        if ! _falkordb_signing_key_ok "$keytmp"; then
+            rm -f "$keytmp" 2>/dev/null || true
             return 0
         fi
         # The first system change. Recorded so the undo removes the directory

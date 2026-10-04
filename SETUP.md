@@ -116,8 +116,9 @@ next unrelated `apt upgrade`. Genesis will not make that decision for you. If
 you want the engine on such a box, do it yourself:
 
 ```bash
-curl -fsSL https://packages.redis.io/gpg | sudo gpg --yes --dearmor \
-    -o /etc/apt/keyrings/redis-archive-keyring.gpg
+curl -fsSL https://packages.redis.io/gpg -o redis.gpg
+gpg --show-keys redis.gpg   # must list ONE key: 54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C
+sudo gpg --yes --dearmor -o /etc/apt/keyrings/redis-archive-keyring.gpg redis.gpg
 echo "deb [signed-by=/etc/apt/keyrings/redis-archive-keyring.gpg]" \
     "https://packages.redis.io/deb $(. /etc/os-release && echo "$VERSION_CODENAME") main" \
     | sudo tee /etc/apt/sources.list.d/redis.list

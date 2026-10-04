@@ -73,8 +73,24 @@ if [ "$1" = "policy" ]; then
 fi
 exit 0
 """
+# --show-keys --with-colons: the colon listing real gpg prints for the served
+# key — pub, its fpr, a uid, and a subkey with an fpr OF ITS OWN, so a parser
+# that takes the wrong fpr record fails. GPG_KEY_FPRS (space-separated primary
+# fingerprints) defaults to the pin; GPG_SHOW_RC fails the listing outright.
 _GPG_STUB = """#!/bin/bash
 echo "gpg $*" >> "$APT_LOG"
+case " $* " in
+*" --show-keys "*)
+    if [ "${GPG_SHOW_RC:-0}" != "0" ]; then exit "$GPG_SHOW_RC"; fi
+    for f in ${GPG_KEY_FPRS-54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C}; do
+        printf 'pub:-:4096:1:%s:1626861115:::-:::scESC::::::23::0:\\n' "${f: -16}"
+        printf 'fpr:::::::::%s:\\n' "$f"
+        printf 'uid:-::::1626861115::X::Redis (Package Signing)::::::::::0:\\n'
+        printf 'sub:-:4096:1:3EC92F655F459FA5:1626861115::::::e::::::23:\\n'
+        printf 'fpr:::::::::48263292D8DFBB86A26755E63EC92F655F459FA5:\\n'
+    done
+    exit 0 ;;
+esac
 # --dearmor -o <path> <infile>: create the keyring so the caller's checks pass.
 prev=""
 for a in "$@"; do
