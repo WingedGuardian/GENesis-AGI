@@ -102,7 +102,11 @@ is never abandoned in that state.
 CI and external review that run after opening, and verification explicitly
 required after merge, remain their normal gates; waiting for those is not a
 reason to use draft mode. Distinguish a blocker to entering review from a check
-that review or merge will subsequently require.
+that review or merge will subsequently require. Open review findings, and a
+dependency on another open PR named in the body, are of the second kind. A PR
+sent BACK for rework or for an architecture decision is of the first kind,
+because review stops until the rework lands (closing-session, "Sending a PR
+back").
 
 ### Wiring Discipline
 
@@ -3240,7 +3244,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   If you ARE the session with the user present, hold the conversation now. With
   no user to ask, the action is: comment on the PR naming WHICH trigger fired and
   the evidence for it, apply the `needs-architecture-session` label (create it if
-  the repo lacks it — labels are per-repo and forks do not inherit them), open a
+  the repo lacks it — labels are per-repo and forks do not inherit them), move
+  the PR to draft (`gh pr ready <N> --undo`; see "PR readiness and mode"), open a
   `ready` follow-up naming the PR and the decision it awaits — the label is a
   GitHub annotation nothing drains, so the row is the intake — and move on to the
   next PR. Expect it to be uncommon: the owner's estimate, explicitly unmeasured,

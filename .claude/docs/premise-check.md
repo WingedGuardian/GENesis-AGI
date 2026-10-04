@@ -136,8 +136,8 @@ anything — a reviewer session retires nothing.
 is HIGH.** The repo already has a route for a change that is wrong at the premise
 or structurally superseded, and it is NOT "hand it to a builder": it is a
 foreground ARCHITECTURE conversation with the user, and where no user is present,
-the `needs-architecture-session` label plus a `ready` follow-up naming the PR and
-the decision it awaits. See the genesis-development skill, "Some PRs are not a
+the `needs-architecture-session` label, the PR moved to draft, and a `ready`
+follow-up naming the PR and the decision it awaits. See the genesis-development skill, "Some PRs are not a
 review problem". This check produces the EVIDENCE for that conversation; it does
 not invent a parallel path around it, and a session that reads "hand back" as
 "dispatch a builder and move on" has skipped the decision the label exists to

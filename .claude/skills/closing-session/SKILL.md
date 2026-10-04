@@ -156,6 +156,27 @@ collision visible; it does not prevent one. So the standing rule still governs:
 every other worktree is an active session until shown otherwise, the PR is not
 yours to work if it is live, and you never `git worktree remove` it.
 
+**If the build worktree was archived by the reaper** (its
+`git worktree list --porcelain` entry reads `locked archived by the reaper -> …`),
+do not unlock it, and do not `git worktree add --force` its branch. Any OTHER
+lock reason means someone holds it: an ownership claim, a `claude agent …` lock,
+or a manual hold by the operator. Then the PR is not yours to work, as above.
+
+For a reaper archive, start from the PR branch on GitHub, not from the archive's
+`--recover`, because the archive can hold commits that were never pushed:
+`git worktree add -b <unique-local> .worktrees/<dir> --track origin/<pr-branch>`.
+The tracking is load-bearing. The commit gate finds the PR through
+`gh pr status`, and an untracked branch reads as "no open PR", so no review
+budget applies. Push with an explicit refspec (`git push origin
+<unique-local>:<pr-branch>`), and expect the push guard to ask for approval
+every time: its re-push relaxation covers only a push to a same-named branch.
+
+The LOCAL streak starts from zero under the new worktree's key and cannot be
+back-filled, because re-marking the same staged diff is a no-op
+(`scripts/review_state.py`, `bump_review_round`). So take round counts from
+`scripts/review_budget.py`, which reads them from GitHub and is unaffected, and
+record each NEW defect-bearing external round at its fix commit (step 3).
+
 ### The constraint this session type is measured against
 
 > **Closing rate must exceed opening rate.** Otherwise the open-PR queue grows
@@ -194,7 +215,7 @@ wins.
 
 ### 0. Freshness first — before reading anything else
 
-Two distinct staleness traps, both measured on this repo, both silent:
+Three distinct staleness traps, each seen on this repo, all silent:
 
 **(a) Your TREE is stale, so the code you test is not the code that exists.**
 MEASURED 2026-09-02: the main worktree sat at one commit from 09-01 13:40 to
@@ -260,6 +281,16 @@ this section exists to prevent.
 
 *"Verify against actual code" needs the companion clause "verify against actual
 CURRENT code."*
+
+**(c) Your RULES are stale.** These skills are versioned on main like the
+scripts are, and a long closing session outlives them. OBSERVED 2026-10-03: the
+"PR readiness and mode" rule (#2822) merged mid-session, and the session, still
+working from the copy it loaded at the start, proposed opening a draft PR, which
+that rule forbids. Before any open, send-back, round or merge decision, run
+`git fetch origin main` and then
+`git log <sha-you-loaded-at>..origin/main -- .claude/skills/`. If that lists
+anything, re-read the changed sections from
+`git show origin/main:.claude/skills/<skill>/SKILL.md`, not from the loaded copy.
 
 ### 1. Read the status — one command, no substitutes
 
@@ -328,7 +359,7 @@ GitHub failure by retargeting a PR that was fine.
 | `codex-at-head` | `ok (clean signal at head: comment\|summary)` | A **PASS**: the clean signal's abbreviated id resolves repo-wide through `commits/{short}` to exactly the head; a 422 for an ambiguous or unknown id refuses it. A matching head is the PR's commit. No Codex review object at head or Codex findings comment may contradict it, and any non-Codex edit or deleted edit revision on any Codex Bot comment permanently refuses the signal (the editor is named when available); unrelated comments' edit data is ignored. History veto covers head force-push, head-branch delete or restore, and base changes. A base change stays a veto because the signal names the head, not the base Codex reviewed against; retargeting changes the effective diff without moving the head. A base force-push is retired: merging requires the default base, whose ruleset forbids force-push and deletion, so a force-pushed non-default base can reach a merge only through a base change, which vetoes. The 541 commits dropped by 191 force-pushes still resolve repo-wide by 7-hex id, so dropped head commits are not the binding risk. A branch/tag named exactly after the short id can shadow GitHub lookup, but creating one needs base-repo push rights (held only by the owner), and no hex-named ref exists. A deleted comment leaves no API trace. The report uses the gate's own pass record, and merge-with stays bound to the verified head. |
 | `codex-at-head` | `BLOCK` with a `NOTE: Codex's clean <comment\|summary> naming commit … was read but not accepted` line | Codex's clean signal was seen but did not qualify; the note says why. If it also says a finding-free re-review **cannot clear this block** (the PR's history moved, or a Codex findings comment sits on it), do not re-request Codex expecting a clean pass. Either way: if another reviewer's review exists at the exact head, ask the owner and merge with `# substitute-review`. |
 | `codex-at-head` | `BLOCK — … — substitute available: <reviewer> reviewed this head` | Codex has not covered the head, but another reviewer has (any GitHub App reviewer except the PR's own workflow bot and CodeQL). Ask the owner in conversation first; with their yes, merge with `# substitute-review`, which records it. The gate keeps the base check and the head binding and refuses in a dispatched session. Asking is not optional, and the gate cannot check that you did, so the obligation is yours. |
-| `scheduled-claude` | `BLOCK` | The scheduled review never ran, or ran on an older head. Read the detail lines — they name WHICH cause, and the summary's `present: none` clause has been misread as "nothing was posted" when the marker was in the thread all along. |
+| `scheduled-claude` | `BLOCK` | The scheduled review never ran, or ran on an older head. Read the detail lines — they name WHICH cause, and the summary's `present: none` clause has been misread as "nothing was posted" when the marker was in the thread all along. If no `leaks` marker covers the current head and carried-forward relief does not apply, see "When the scheduled leaks review has not run" below. |
 | `scheduled-claude` | `n/a (scoped to the public repo only)` | Neither pass nor block — the gate does not apply to this repo. |
 | `scheduled-claude` | `ok (<kind> carried from <anc>, <check> green at head)` | A pass on a CARRIED-FORWARD review. It is not a review made at head; do not describe it as one. |
 | `review-body` / `inline-findings` | `BLOCK` | Unresolved findings → step 3. |
@@ -338,6 +369,32 @@ GitHub failure by retargeting a PR that was fine.
 A blocking gate prints its diagnosis on the lines BELOW its summary — which
 finding, which pattern, which cause, and usually the remedy. Read them; they are
 the actionable part, and the summary alone is not enough to act on.
+
+**When the scheduled leaks review has not run.** There are two leaks layers.
+The programmatic one matches patterns: the pre-push privacy scan on every push
+from a session, and CI's `leak-detector` on every PR head. The scheduled `leaks`
+review is the second layer, an LLM read that catches INFERENTIAL leaks no pattern
+can. Its routine is often rate-limited and does not always run. When it has not
+covered the current head, **fall back to doing it ourselves**: a reviewed PR
+beats an unreviewed one (owner, 2026-10-03). Dispatch the scan to a
+**fresh-context subagent** (for example `genesis-security-reviewer`), never the
+session's own read of the diff. The subagent reads every added line, the title,
+the body and the commit messages, for BOTH kinds of leak:
+
+- literal identifiers, for which it is given `~/.genesis/release-fingerprints.txt`;
+- inferential personal context (CLAUDE.md, "Public-Artifact Privacy").
+
+If it finds anything, fix it and re-run. Never post a passing marker over a
+finding. Otherwise post the marker from the owner account, in the grammar
+genesis-development gives ("requires every scheduled Claude review at the
+current head"). Its body states:
+
+- how many lines were examined;
+- each class checked, with its result;
+- that a session ran it as the fallback, not the routine.
+
+End it with the verdict line. Prefer a session that did not author the PR, and
+when the authoring session runs the fallback, say so in the marker comment.
 
 **Then read the review comments themselves.** `--check-pr` gives you the verdict
 and the finding TITLES (truncated at 120 characters, first line only) — never a
@@ -394,6 +451,20 @@ stop blocks commits whatever the round count, and the round
 budget gates review requests and fix commits whatever the streak. Neither
 overrides the other; only the budget's rounds are numbered as rounds.
 
+**Bring a premise check to every escalation.** Before putting any of these to
+the owner, run the premise check (a fresh-context agent following
+`.claude/docs/premise-check.md`) and present its verdict with the question:
+
+- a terminal or past-terminal decision: budget round 4 on the ordinary lane, or
+  round 2 on the gate-surface lane;
+- the streak's cap-3 stop.
+
+An option list on its own gives the owner nothing to decide with. And record
+every defect-bearing external round with
+`python3 scripts/review_state.py mark --source external --defects`, run from the
+PR's worktree when its fix is staged. The streak's stops fire only on rounds that
+were recorded, and a past round cannot be recorded later.
+
 Full mechanics for all three — class enumeration, the two-tier machine gate,
 what counts as a round — are in `genesis-development`. Do not re-derive them.
 
@@ -406,6 +477,31 @@ Present: what it does, what the review found, what you changed, and the exact
 merge command the report printed. Then stop. This is the most important property
 this session type has, and the one most worth protecting: a closing session that
 merges on its own initiative is worse than no closing session.
+
+### 5. Sending a PR back
+
+A PR goes back for one of these reasons, each with its own label:
+
+- **The owner decides a terminal round is rework** → `needs-rework`.
+- **The premise check returns BROKEN, or a design question goes to an
+  architecture session** → `needs-architecture-session`
+  (`.claude/docs/premise-check.md`).
+
+**Sending it back is four steps, done together:**
+
+1. **Comment** on the PR with the evidence: findings by class, the premise
+   verdict, what carries over, and what the rework is.
+2. **Label** it as above.
+3. **Move it to draft** (`gh pr ready <N> --undo`). This is a blocker that
+   appeared after the PR opened, which is exactly what draft mode is for
+   (genesis-development, "PR readiness and mode"). A sent-back PR left in regular
+   mode still sorts into the queue as a merge candidate.
+4. **Open a `ready` follow-up** naming the PR and the rework. Nothing drains the
+   label; the row is the intake.
+
+Leave it OPEN; retiring is not this session's call (genesis-development, "Never
+RETIRE a PR you are not the one reviving"). The session that completes the
+rework marks it ready (`gh pr ready <N>`) and requests review.
 
 ---
 
@@ -441,6 +537,14 @@ creates them (PR2 builds on PR1's schema).
 So: before proposing a merge, check whether the PR's diff assumes something in
 another open PR, and say so in the approval request. This is manual today. Do
 not assume the absence of a recorded dependency means there is none.
+
+**When the owner splits a PR**, the split-off half opens as a REGULAR PR against
+main, never with `--draft`. Opening it is the owner's call, not this session's,
+because a closing session does not open new work on its own. Stacked PRs are not
+supported here, so it targets main and its diff includes the parent's changes
+until the parent merges. Findings on those inherited lines belong to the parent
+PR. Its body names the PR it depends on and the open findings it carries over
+(genesis-development, "PR readiness and mode", for why neither blocks opening).
 
 ## Working the queue
 
