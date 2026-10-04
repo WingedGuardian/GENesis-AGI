@@ -290,6 +290,10 @@ def _run(
     empty.write_text("")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(empty))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    # No declared public repo: these rows pin the re-push relaxation, not the
+    # public-repo rules, and the install's own genesis.yaml must not move a row
+    # (an unresolvable `cd` is refused outright when a public repo is declared).
+    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "")
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
     monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: republish)
     monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())

@@ -41,7 +41,10 @@ plain ``git push`` (e.g. ``git push -u origin HEAD``): no other step of any kind
 (no ``cd``, no ``git status``/``add``/``commit`` before it, no ``;``/``&&``/
 ``|``/``&``/newline), no redirection, no subshell, no global option between
 ``git`` and ``push`` (``-C``, ``-c``, ``--git-dir``…), no ``VAR=…`` prefix and no
-wrapper. A chained command still asks — run the first push as its own command.
+wrapper — or that same plain push followed by ``&&`` and one ready ``gh pr
+create`` (the guard's ``_push_then_pr_create``). Any other chained command still
+asks. On the public repo a first push that is NOT that chained form is denied
+outright, whatever this key says, so there the chained form is the one silenced.
 It must also be true that:
 
 * the remote git will really push to (pushRemote > pushDefault >

@@ -3372,8 +3372,7 @@ git add <files>                                   # STAGE FIRST — mark hashes 
 python3 scripts/review_state.py mark              # INTERNAL genesis-architect audit — plain mark, never counts
 git commit -F <msg-file>                          # bare, not piped (see below)
 # (a non-Anthropic cross-model round would instead be: mark --source external --defects|--clean)
-git push                                          # approve the dialog on a branch's first push
-gh pr create ...
+git push -u origin HEAD && gh pr create --title "..." --body-file <file>   # first push: ONE command (approve the dialog)
 gh pr comment <N> --body "@codex review"          # after EVERY subsequent push
 python3 scripts/hooks/git_push_guard.py --check-pr <N>
 gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --check-pr
@@ -3431,8 +3430,9 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   `push_publish` (owner ruling 2026-10-01), same no-decision-plus-note shape.
   It silences only the first push of the CURRENT branch, and only when the
   whole command is exactly one plain `git push` (e.g. `git push -u origin
-  HEAD`) — a chained command still asks, so run the first push as its own
-  command. The remote git really pushes to must resolve (rewrites applied) to
+  HEAD`), or that push followed by `&&` and one ready `gh pr create` — and on
+  the public repo only the chained form exists, because of the rule below.
+  Any other compound still asks. The remote git really pushes to must resolve (rewrites applied) to
   exactly `https://github.com/<public repo>` — ssh/scp forms always ask — with
   simple push config, no `http.*` config, no proxy/TLS/ssh/config env var in
   the hook's environment, and a live probe confirming the branch is absent
@@ -3442,6 +3442,64 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   without a TTY aborts rather than pushing. Force pushes, other destinations,
   close-then-push, the no-open-PR block, round-cap asks and the dispatched deny
   are untouched, and any doubt about the destination keeps the prompt.
+- **A FIRST push to the configured public repo must open its PR in the same
+  command — otherwise it is DENIED, whatever `push_publish` says.** The
+  re-push no-open-PR block only catches a branch on its NEXT push, so a session
+  that stopped after one push left the branch public, PR-less, outside CI and
+  the leak scan. The one accepted shape is
+  `git push -u origin HEAD && gh pr create --title "..." --body-file <file>`:
+  one plain `git push` (no `cd`, `git -C`, prefix or earlier step), `&&`, and
+  one ready `gh pr create` using only title/body/body-file/fill/
+  no-maintainer-edit options — never `--draft`/`-d`, `--web`, `--dry-run`,
+  `--head`, `--repo` or `--base`, and no `--label`/`--assignee`/`--reviewer`/
+  `--milestone`/`--project` (gh resolves those names before creating the PR
+  and fails the whole create on one it cannot resolve, after the push; add
+  them with `gh pr edit` once the PR exists) — with
+  no `$`, backtick or backslash in its text. The create must be one gh accepts
+  with no terminal (MEASURED, gh 2.101): a non-empty title AND a body
+  (`--body`, or `--body-file` naming an existing file in the push's directory,
+  never `-`), OR exactly one of `--fill`/`-f`, `--fill-first`,
+  `--fill-verbose`; a lone `--title` fails after the push and does not
+  qualify. A `git config branch.<cur>.gh-merge-base` naming anything but the
+  default branch disqualifies it too (it retargets the PR off CI). `||`, `;`,
+  `&`, a newline, or a `#` before the `&&` all deny. Work not ready for a PR
+  stays committed locally, unpushed.
+  **Every other push SHAPE is covered as well**, not only the current-branch
+  spelling: another branch (`git push -u origin feat/y`), a refspec
+  (`HEAD:refs/heads/other`, `HEAD:feat/y`), several refs, `--all`, a push from
+  a default-branch checkout, a raw public URL. On the public repo such a push is
+  DENIED when it would create a branch the remote lacks — read from one
+  `git ls-remote --heads` of the destination — and also when the guard cannot
+  tell. "Cannot tell" is reserved for what changes WHICH refs go or WHERE:
+  `--repo`, `--prune`, `--stdin`, a submodule-pushing `--recurse-submodules`,
+  an abbreviated or unknown option, a git global option other than `-C` (once)
+  and the pager/lock switches, a `git -c`/`--config-env` setting in the
+  `remote`/`push`/`url`/`branch`/`include`/`includeIf`/`submodule` sections,
+  `remote.<r>.mirror=true`, a remapping push config, a ref that is not exactly
+  one local branch or tag, an unreadable remote branch list. Ref-neutral
+  options (`--no-verify`, `--signed`, `--recurse-submodules=check`,
+  `--receive-pack`, `git -c core.sshCommand=…`, …) are skipped and the rule
+  above applies to the branches named. A push whose DIRECTORY the guard cannot
+  resolve (`cd "$VAR" && git push …`, `cd -`, `--git-dir`) is DENIED on an
+  install with a public repo unless its argv names a literal URL or path that
+  is provably another repository; the message says to run it from the checkout
+  or with `git -C <literal path>`. It keeps its ask when
+  every branch it names is already on the remote (a re-push), when it creates
+  no branch (a tag, `--tags`, a deletion), or when it creates only the current
+  branch and is the chained form above. Scope is the same predicate as the
+  re-push block (`_no_pr_block_applies`): another destination, or no declared
+  public repo, keeps the old behaviour; a dry run publishes nothing and is not
+  denied, and after a dry-run push a chained create keeps its own
+  would-publish probe. Residue: `_push_is_republish` reads an ls-remote
+  FAILURE as "absent", so a current-branch re-push during a network failure,
+  with no local allowlist record, can be denied as a first push; an
+  `insteadOf` rule in an unresolvable checkout's own config could rewrite a
+  literal non-public URL onto the public repo; and a create can still fail at
+  RUN time for reasons argv does not show (auth, network; and, inferred rather
+  than measured, no commits for `--fill`), leaving the branch public with no PR
+  until the next push — which the re-push block then refuses. So the rule makes
+  a PR-less public branch the outcome of a failed create, never of a command
+  that was built without one.
 - **Ack sigils bind per-guard, and mostly to the LAST pipeline segment.**
   `git commit ... | tail  # audit-ack` puts the ack on `tail`. Run the commit
   bare. Some guards accept a sigil on any segment, others only on the offending
