@@ -230,19 +230,21 @@ own `TASK_INTAKE.md` section contract instead):
    red-team of the root cause and consequences; regression markers; and the
    test plan (targeted tests midway and at the end, CI for the full suite, a
    functional check of the built thing, "Verify BEFORE the PR" below, and the
-   `E2E:` line after merge).
-4. **A revised plan's body opens with "Changed in this revision"** (after any
-   YAML frontmatter, which stays on line 1): what changed, and why.
+   `E2E:` line for post-merge verification).
+4. **A revised plan opens with a "Changed in this revision" section** right
+   after its title (YAML frontmatter stays on line 1, and the title stays the
+   first heading): what changed, and why.
 5. **Ask the owner about intent, priorities and trade-offs. Decide measured
    technical edge cases yourself** and state the call; the owner overrides at
    approval. Design principles and standing axioms, approval and sovereignty
    gates, irreversible or outward-facing actions, and anything user-visible
    still go to the owner.
 
-Effort stays proportional to stakes, and that decides which questions are
-material. On the material ones, this bar is higher than CLAUDE.md's
-investigate-below-90% floor. Detail, the evidence behind the rule, and how it
-fits the rules it ties together: `references/due-diligence.md`.
+A question is material when its answer could change the plan; stakes set how
+deep to go on each one, never whether it is asked. On the material ones, this
+bar is higher than CLAUDE.md's investigate-below-90% floor. Detail, the
+evidence behind the rule, and how it fits the rules it ties together:
+`references/due-diligence.md`.
 
 ### Architecture Review
 
