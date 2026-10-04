@@ -384,6 +384,15 @@ _KEEP_BLANK_BODIES = [
     ("a\n<!--\nx\n-->\nb", "a\nb"),
     ("a\n<!-- c -->\n\nb", "a\n\nb"),
     ("a\n<!-- open\n\nstill\nb", "a"),
+    # CommonMark 0.31.2 "Characters and lines": blank = empty or only U+0020 /
+    # U+0009, and CR / CRLF are line endings, so these are boundaries...
+    ("a\n \t \nb", "a\n\nb"),
+    ("a\r\n\r\nb", "a\n\nb"),
+    # ...and these are not: other Unicode whitespace leaves no boundary.
+    ("a\n \nb", "a\nb"),
+    ("a\n\x0c\nb", "a\nb"),
+    ("a\n\x0b\nb", "a\nb"),
+    ("a\n \nb", "a\nb"),
 ]
 
 

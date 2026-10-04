@@ -373,7 +373,10 @@ def readable_body(body: str, *, keep_blank: bool = False) -> str:
         # keep_blank keeps it — but only the raw line is tested: a line emptied
         # by comment removal renders as nothing, and a blank inside an open
         # comment is hidden like any other commented text.
-        if keep_blank and not in_comment and not line.strip():
+        # Blank per CommonMark 0.31.2 ("Characters and lines"): empty, or only
+        # U+0020 spaces and U+0009 tabs. Not str.strip(), which would also call
+        # NBSP, form feed, vertical tab or U+2028 blank and invent a boundary.
+        if keep_blank and not in_comment and not line.strip(" \t"):
             visible.append("")
             continue
 
