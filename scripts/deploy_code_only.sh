@@ -305,7 +305,7 @@ _cleanup() {
     fi
     local _resets_note=""
     if [ -n "${_RESET_NOTE:-}" ]; then
-        _resets_note=" Reset to HEAD for the merge, their local edits backed up under ~/.genesis/premerge-backups:$_RESET_NOTE."
+        _resets_note=" Reset to HEAD for the merge, their local edits dropped (they regenerate):$_RESET_NOTE."
     fi
     if [ "$rc" -ne 0 ] && [ -z "$_ALERTED" ] && [ "$_PHASE" != "checks" ]; then
         local _sha
@@ -638,15 +638,14 @@ _pull() {
     fi
     # An excused file the range also changes is reset to HEAD so the merge can
     # take upstream's copy. Both regenerate (the code-intel indexer rewrites
-    # AGENTS.md, the server the trigger cache), but regeneration is not the edit:
-    # each reset is backed up first under ~/.genesis/premerge-backups, the same
-    # save update.sh makes (genesis_ephemeral_*, in the shared lib). A file whose
-    # backup fails is left in place — the merge then refuses over it rather than
-    # dropping the edit unsaved — and each actual reset is NAMED, here, in a
-    # refusal's message and in the exit alert, so none passes silently.
+    # AGENTS.md, the server the trigger cache), so this script keeps no copy: each
+    # reset is NAMED instead, here, in a refusal's message and in the exit alert,
+    # so none passes silently. (update.sh differs: it backs such edits up under
+    # ~/.genesis/premerge-backups before its merge.)
     _reset=()
-    for _f in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
-        if genesis_ephemeral_is_dirty "$GENESIS_ROOT" "$_f" \
+    for _f in AGENTS.md config/procedure_triggers.yaml; do
+        if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$_f" >/dev/null 2>&1 \
+            && ! git -C "$GENESIS_ROOT" diff --quiet HEAD -- "$_f" 2>/dev/null \
             && [ -n "$(_range_changed "$_f")" ]; then
             _reset+=("$_f")
         fi
@@ -662,11 +661,7 @@ _pull() {
     _status_before="$(_status_outside_resets)" || _status_before="unreadable before"
     _PHASE="merging"
     for _f in "${_reset[@]}"; do
-        if ! genesis_ephemeral_backup "$GENESIS_ROOT" "$_f" "$EPHEMERAL_BACKUP_ROOT"; then
-            echo "  WARNING: could not back up local edits to $_f under $EPHEMERAL_BACKUP_ROOT — left in place; the merge may refuse over it."
-            continue
-        fi
-        echo "  Resetting $_f to HEAD for the merge: its local edit is backed up at $EPHEMERAL_BACKUP_ROOT/$_f."
+        echo "  Resetting $_f to HEAD for the merge: its local edit is dropped (it regenerates)."
         git -C "$GENESIS_ROOT" checkout HEAD -- "$_f"
         _RESET_NOTE="$_RESET_NOTE $_f"
     done
@@ -693,7 +688,7 @@ _pull() {
                 systemctl --user start genesis-server {_UPDATE_LOCK_FD}>&- && _STOPPED=""
             fi
             [ -n "$_STOPPED" ] || _PHASE="checks"
-            die "git refused the fast-forward to $_upstream (see above) — nothing merged.${_RESET_NOTE:+ Reset to HEAD for it, their local edits backed up under ~/.genesis/premerge-backups:$_RESET_NOTE.}"
+            die "git refused the fast-forward to $_upstream (see above) — nothing merged.${_RESET_NOTE:+ Reset to HEAD for it, their local edits dropped (they regenerate):$_RESET_NOTE.}"
         fi
         exit 1
     fi

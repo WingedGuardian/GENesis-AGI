@@ -118,7 +118,7 @@ def _rollback_guard(
         + (
             ""
             if real_backup
-            else "genesis_ephemeral_backup_before_reset() { echo BACKUP-BEFORE-RESET; }\n"
+            else "_ephemeral_backup_before_reset() { echo BACKUP-BEFORE-RESET; }\n"
         )
         + extra
         + "guard() {\n"
@@ -952,7 +952,7 @@ def test_the_rollback_checks_then_switches_back():
     refresh, then the checkout."""
     code = _code(_block("rollback-code-guard"))
     order = [
-        'genesis_ephemeral_backup_before_reset "$GENESIS_ROOT" "$EPHEMERAL_BACKUP_ROOT"',
+        '_ephemeral_backup_before_reset "$EPHEMERAL_BACKUP_ROOT"',
         'diff-tree -r --raw --no-renames --no-abbrev HEAD "$ROLLBACK_TAG"',
         '_ephemeral_clear_before_reset "$EPHEMERAL_BACKUP_ROOT"',
         "update-index -q --refresh",

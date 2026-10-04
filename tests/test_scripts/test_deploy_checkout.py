@@ -602,15 +602,7 @@ def test_update_sh_scans_for_collisions_before_the_stop():
 def test_lib_functions_return_and_never_exit():
     """update.sh's EXIT trap was hardened against an exit from inside a sourced
     lib function; the lib must leave exiting to its callers, and print no
-    refusal of its own. The one reporter, genesis_ephemeral_backup_before_reset,
-    tells the operator what a reset its caller already chose is about to drop —
-    output that was update.sh's own before the move — so its lines are exempt;
-    every other function stays a silent predicate."""
+    refusal of its own."""
     code = "\n".join(_code_lines(LIB))
     assert not re.search(r"\bexit\b", code), "deploy_checkout.sh must return, never exit"
-    reporter = re.search(
-        r"genesis_ephemeral_backup_before_reset\(\) \{(.*?)\n\}", code, re.DOTALL
-    )
-    assert reporter, "genesis_ephemeral_backup_before_reset must exist in the lib"
-    quiet = code[: reporter.start()] + code[reporter.end() :]
-    assert not re.search(r"\becho\b", quiet.replace("echo /nonexistent", "")), quiet
+    assert not re.search(r"\becho\b", code.replace("echo /nonexistent", "")), code

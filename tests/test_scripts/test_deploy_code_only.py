@@ -654,41 +654,6 @@ def test_a_locally_deleted_excused_file_does_not_block_the_merge(station):
     assert not _alerts(station)
 
 
-def test_a_reset_excused_files_edits_are_backed_up_first(station):
-    """Devin, #2629: an excused file the range also changes is reset for the
-    merge, and "it regenerates" is not the edit — the run backs it up under
-    ~/.genesis/premerge-backups first, the same save update.sh makes."""
-    (station["root"] / "AGENTS.md").write_text("local edits to keep\n")
-    tip = _advance_upstream(station, "upstream stats", {"AGENTS.md": "new stats\n"})
-    r = _run(station)
-    assert r.returncode == 0, r.stderr
-    assert _git(station["root"], "rev-parse", "HEAD") == tip
-    assert (station["root"] / "AGENTS.md").read_text() == "new stats\n"
-    runs = list((station["home"] / ".genesis" / "premerge-backups").iterdir())
-    assert len(runs) == 1, runs
-    saved = runs[0] / "AGENTS.md"
-    assert (saved / "current").read_text() == "local edits to keep\n"
-    assert (saved / "worktree.patch").exists() and (saved / "index.patch").exists()
-
-
-def test_a_backup_the_reset_cannot_make_keeps_the_edit_and_refuses(station):
-    """A failed backup leaves the edit in place: the merge then refuses over it
-    rather than dropping it unsaved — the same fall-back as update.sh."""
-    root = station["root"]
-    (root / "AGENTS.md").write_text("local edits to keep\n")
-    (station["home"] / ".genesis" / "premerge-backups").write_text(
-        "a file where the directory must go\n"
-    )
-    head = _git(root, "rev-parse", "HEAD")
-    tip = _advance_upstream(station, "upstream stats", {"AGENTS.md": "new stats\n"})
-    r = _run(station)
-    assert r.returncode == 1, (r.stdout, r.stderr)
-    assert "could not back up local edits to AGENTS.md" in r.stdout
-    assert "git refused the fast-forward" in r.stderr and "nothing merged" in r.stderr
-    assert (root / "AGENTS.md").read_text() == "local edits to keep\n"
-    assert _git(root, "rev-parse", "HEAD") == head != tip
-
-
 def test_a_run_killed_after_the_resets_names_them_in_the_alert(station):
     """A run stopped between the resets and the merge (its transient unit stopped,
     say) leaves the excused files reset: the exit alert must name them."""

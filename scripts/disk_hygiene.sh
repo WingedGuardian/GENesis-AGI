@@ -472,11 +472,10 @@ main() {
             || echo "reconcile ghost-export prune exited $?"
     fi
 
-    echo "--- deploy-paths ephemeral-file backup retention prune (>45d) ---"
-    # update.sh, deploy_code_only.sh and bootstrap.sh's crash recovery save local
-    # edits to the tracked ephemeral files they discard before a merge or reset
-    # (AGENTS.md, config/procedure_triggers.yaml) under one directory per run.
-    # Written once and never touched again, so a directory's mtime is its age.
+    echo "--- update.sh ephemeral-file backup retention prune (>45d) ---"
+    # update.sh saves local edits to the tracked ephemeral files it discards before
+    # its merge (AGENTS.md, config/procedure_triggers.yaml) under one directory per
+    # run. Written once and never touched again, so a directory's mtime is its age.
     # Same guarded removal as every other recursive deleter (remove_tree_one_fs,
     # which spares a tree that is or holds a mount), over the CANONICAL root.
     if ! _pmb_root="$(cd -P -- "$HOME/.genesis/premerge-backups" 2>/dev/null && pwd -P)"; then

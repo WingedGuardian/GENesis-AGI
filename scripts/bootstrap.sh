@@ -66,38 +66,14 @@ if [ -f "$UPDATE_STATE" ]; then
         # Read rollback tag from state file
         ROLLBACK_TAG=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('rollback_tag',''))" 2>/dev/null || echo "")
 
-# BEGIN crash-recovery-reset (extracted by tests/test_scripts/test_bootstrap_guards.py)
-        # The resets below discard local edits to the ephemeral files wholesale
-        # (update.sh's non-forced checkout would refuse over them; this recovery
-        # cannot afford to). Save them first — the same save update.sh's rollback
-        # and deploy_code_only.sh's reset make (genesis_ephemeral_*, shared lib).
-        # update_state.json names no backup dir from the crashed run, so this
-        # save lands in a fresh run directory of its own. When a save cannot be
-        # made the reset is REFUSED instead: a recovery left undone is
-        # recoverable, a lost edit is not.
-        # shellcheck source=lib/deploy_marker.sh
-        . "$SCRIPT_DIR/lib/deploy_marker.sh"
-        # shellcheck source=lib/deploy_checkout.sh
-        . "$SCRIPT_DIR/lib/deploy_checkout.sh"
-        if genesis_ephemeral_backup_before_reset "$GENESIS_ROOT" "$EPHEMERAL_BACKUP_ROOT"; then
-            if [ -n "$ROLLBACK_TAG" ] && git -C "$GENESIS_ROOT" rev-parse "$ROLLBACK_TAG" >/dev/null 2>&1; then
-                echo "  Rolling back to $ROLLBACK_TAG..."
-                git -C "$GENESIS_ROOT" reset --hard "$ROLLBACK_TAG" 2>&1 || true
-                echo "  Rollback complete."
-            else
-                echo "  No rollback tag found — resetting to HEAD."
-                git -C "$GENESIS_ROOT" reset --hard HEAD 2>&1 || true
-            fi
+        if [ -n "$ROLLBACK_TAG" ] && git -C "$GENESIS_ROOT" rev-parse "$ROLLBACK_TAG" >/dev/null 2>&1; then
+            echo "  Rolling back to $ROLLBACK_TAG..."
+            git -C "$GENESIS_ROOT" reset --hard "$ROLLBACK_TAG" 2>&1 || true
+            echo "  Rollback complete."
         else
-            # Continuing would install the crashed tree and mark setup complete
-            # over an unrecovered update; stop instead — the state file and the
-            # unsaved edit are kept, so the next bootstrap retries the save.
-            echo "  Refusing the recovery reset: an ephemeral edit could not be backed up (above)."
-            echo "  The tree is left as the crashed update left it — fix the backup failure and"
-            echo "  rerun bootstrap. update_state.json is kept, so the next run retries."
-            exit 1
+            echo "  No rollback tag found — resetting to HEAD."
+            git -C "$GENESIS_ROOT" reset --hard HEAD 2>&1 || true
         fi
-# END crash-recovery-reset
 
         # Record crash recovery
         echo "  Recording crash recovery in update_history..."
