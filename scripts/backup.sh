@@ -26,6 +26,12 @@
 #                                up to the same NAS, or their GFS prunes delete
 #                                each other's snapshots. Read symmetrically by
 #                                restore.sh to locate the source snapshot dir.
+#   GENESIS_BACKUP_EXTRA_DIRS  — ':'-separated directories under $HOME (`~/` ok) to
+#                                keep as encrypted, off-site-only tar archives
+#                                (§6f). Unset = none. Restored by restore.sh §4c.
+#   GENESIS_BACKUP_EXTRA_EXCLUDES — ':'-separated names excluded at any depth from
+#                                those archives, on top of the built-in rebuildable
+#                                caches (.venv, node_modules, __pycache__, …).
 set -euo pipefail
 umask 077
 
@@ -138,7 +144,7 @@ _write_status() {
     if [ "${_T2_STATUS:-}" = "ok" ]; then _offsite_confirmed=true; fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 
@@ -178,6 +184,7 @@ _on_exit() {
     # N2: the credential-bearing plaintext SQL dump must not outlive the script
     # if it died mid-section (before its inline rm).
     rm -f "${_SQL_TMP:-}" "${_SQL_ARTIFACT_TMP:-}" "${_SQL_VERIFY_TMP:-}" 2>/dev/null || true
+    rm -f "${_EXTRA_TAR_TMP:-}" 2>/dev/null || true  # §6f plaintext tar of a listed directory
     if [ -n "${_VERIFY_DB:-}" ]; then
         rm -f "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm" 2>/dev/null || true
     fi
@@ -718,6 +725,154 @@ if [ -d "$_EVAL_DIR" ]; then
     fi
 fi
 
+# --- 6f. Opt-in extra directories (encrypted, Tier 2 / off-site only) ---
+# GENESIS_BACKUP_EXTRA_DIRS lists ':'-separated directories UNDER $HOME (a leading
+# `~/` is expanded) that this install wants kept — install-local data no other
+# section knows about. Each becomes ONE encrypted tar, extra/<name>.tar.gpg, so a
+# nested tree survives the single-level off-site listing restore.sh reads back.
+# Members are stored relative to $HOME and restore writes them back there.
+# extra/ is gitignored like transcripts/: off-site only, never the git tier.
+# Rebuildable caches are excluded by NAME at any depth (MEASURED, GNU tar 1.35:
+# `--exclude=.venv` drops a/.venv and a/sub/.venv but keeps a/keep.venvx), plus
+# GENESIS_BACKUP_EXTRA_EXCLUDES. `--exclude-vcs-ignores` is NOT used: measured on
+# the same tar, it kept a `.venv/` the directory's .gitignore excluded.
+# A bad entry is skipped LOUDLY and never fails the backup; a missing directory
+# keeps its last archive; an archive for a directory no longer listed is removed.
+_EXTRA_COUNT=0
+_EXTRA_SKIPPED=0
+mkdir -p extra
+# Purge plaintext scraps and partial archives from an interrupted run.
+find extra -maxdepth 1 -type f ! -name '*.tar.gpg' -delete 2>/dev/null || true
+_extra_wanted=()
+_EXTRA_TAR_TMP=""
+_EXTRA_UPLOAD_FAILED=0
+if [ -n "${GENESIS_BACKUP_EXTRA_DIRS:-}" ]; then
+    # Compare RESOLVED paths: a symlinked or slash-terminated $HOME must not reject every entry.
+    _home_real="$(realpath -- "$HOME")"
+    _bdir_real="$(realpath -m -- "$BACKUP_DIR")"
+    _btmp_real="$(realpath -m -- "$GENESIS_BIG_TMP")"
+    _EXTRA_DEFAULT_EXCLUDES=(.venv venv node_modules __pycache__ .pytest_cache .ruff_cache .mypy_cache .tox)
+    _extra_ex_args=()
+    for _x in "${_EXTRA_DEFAULT_EXCLUDES[@]}"; do _extra_ex_args+=("--exclude=$_x"); done
+    IFS=':' read -r -a _extra_user_ex <<< "${GENESIS_BACKUP_EXTRA_EXCLUDES:-}"
+    for _x in "${_extra_user_ex[@]+"${_extra_user_ex[@]}"}"; do
+        [ -n "$_x" ] && _extra_ex_args+=("--exclude=$_x")
+    done
+    IFS=':' read -r -a _extra_dirs <<< "$GENESIS_BACKUP_EXTRA_DIRS"
+    for _d in "${_extra_dirs[@]+"${_extra_dirs[@]}"}"; do
+        [ -n "$_d" ] || continue
+        # The quoted "~" patterns match the literal `~` TEXT a config value carries,
+        # which is then expanded here by hand — not a tilde the shell should expand.
+        # shellcheck disable=SC2088
+        case "$_d" in
+            "~") _d="$HOME" ;;
+            "~/"*) _d="$HOME/${_d#\~/}" ;;
+        esac
+        case "$_d" in
+            /*) ;;
+            *)
+                # A relative entry would resolve against this script's cwd (the backups repo).
+                log "WARNING: extra dir skipped (must be an absolute path or start with ~/): $_d"
+                _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+                continue
+                ;;
+        esac
+        _abs="$(realpath -m -- "$_d")"
+        case "$_abs" in
+            "$_home_real"/?*) ;;
+            *)
+                log "WARNING: extra dir skipped (must be a directory under \$HOME, not \$HOME itself): $_d"
+                _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+                continue
+                ;;
+        esac
+        case "$_abs/" in
+            "$_bdir_real"/* | "$_btmp_real"/*)
+                log "WARNING: extra dir skipped (inside the backups repo or the backup temp dir): $_d"
+                _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+                continue
+                ;;
+        esac
+        case "$_bdir_real/" in
+            "$_abs"/*)
+                log "WARNING: extra dir skipped (contains the backups repo; it would archive its own archives): $_d"
+                _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+                continue
+                ;;
+        esac
+        _rel="${_abs#"$_home_real"/}"
+        _name="$(printf '%s' "$_rel" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)-$(printf '%s' "$_rel" | sha1sum | cut -c1-8).tar.gpg"
+        _extra_wanted+=("$_name")
+        if [ ! -d "$_abs" ]; then
+            log "WARNING: extra dir skipped (missing; keeping its last archive): ~/$_rel"
+            _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+            continue
+        fi
+        _ex_hit=""
+        IFS='/' read -r -a _rel_parts <<< "$_rel"
+        for _part in "${_rel_parts[@]}"; do
+            for _x in "${_extra_ex_args[@]}"; do [ "--exclude=$_part" = "$_x" ] && _ex_hit="$_part"; done
+        done
+        if [ -n "$_ex_hit" ]; then
+            log "WARNING: extra dir skipped (its path contains the excluded name '$_ex_hit'; the archive would be empty): ~/$_rel"
+            _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+            continue
+        fi
+        if ! $_ENCRYPT_READY; then
+            log "WARNING: extra dir skipped (GENESIS_BACKUP_PASSPHRASE not set — refusing plaintext): ~/$_rel"
+            _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+            continue
+        fi
+        _tar_tmp="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.tar)"
+        _EXTRA_TAR_TMP="$_tar_tmp"
+        _tar_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err)"
+        _gpg_tmp="extra/.${_name}.partial.$$"
+        _tar_rc=0
+        # --hard-dereference: a hard link is stored as file content, so restore never
+        # meets a hard-link member. Symlinks are kept as links; restore accepts the
+        # ones that stay inside the restored tree.
+        tar -C "$_home_real" --hard-dereference "${_extra_ex_args[@]}" -cf "$_tar_tmp" -- "$_rel" 2>"$_tar_err" || _tar_rc=$?
+        # GNU tar exit 1 = some files changed while being read: the archive is written,
+        # but a file that was changing may be torn. 2+ = fatal: keep the last good archive.
+        if [ "$_tar_rc" -ge 2 ]; then
+            log "WARNING: extra dir skipped (tar failed rc=$_tar_rc; keeping its last archive): ~/$_rel: $(head -3 "$_tar_err" | tr '\n' ' ')"
+            rm -f "$_tar_tmp" "$_tar_err"
+            _EXTRA_TAR_TMP=""
+            _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+            continue
+        fi
+        [ "$_tar_rc" -eq 1 ] && log "NOTE: ~/$_rel changed while archiving; a file that was changing may be torn: $(head -3 "$_tar_err" | tr '\n' ' ')"
+        rm -f "$_tar_err"
+        if encrypt_file "$_tar_tmp" "$_gpg_tmp" && mv -f "$_gpg_tmp" "extra/$_name"; then
+            _EXTRA_COUNT=$((_EXTRA_COUNT + 1))
+        else
+            log "WARNING: extra dir skipped (encryption failed; keeping its last archive): ~/$_rel"
+            rm -f "$_gpg_tmp"
+            _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+        fi
+        rm -f "$_tar_tmp"
+        _EXTRA_TAR_TMP=""
+    done
+    log "Extra dirs: $_EXTRA_COUNT archived, $_EXTRA_SKIPPED skipped"
+fi
+# Drop archives for directories removed from a NON-EMPTY list. An unset or empty
+# variable deletes nothing: a parse slip or a missing variable must not destroy the
+# last good archives (security review W2). To retire them, delete extra/ by hand.
+if [ -z "${GENESIS_BACKUP_EXTRA_DIRS:-}" ]; then
+    _extra_orphans="$(find extra -maxdepth 1 -type f -name '*.tar.gpg' 2>/dev/null | wc -l)"
+    [ "$_extra_orphans" -gt 0 ] && log "NOTE: GENESIS_BACKUP_EXTRA_DIRS is unset; keeping $_extra_orphans existing extra archive(s)"
+fi
+while [ -n "${GENESIS_BACKUP_EXTRA_DIRS:-}" ] && IFS= read -r -d '' _f; do
+    _keep=false
+    for _w in "${_extra_wanted[@]+"${_extra_wanted[@]}"}"; do
+        [ "$(basename "$_f")" = "$_w" ] && _keep=true
+    done
+    if ! $_keep; then
+        rm -f "$_f"
+        log "Extra dirs: removed archive for a directory no longer listed: $(basename "$_f")"
+    fi
+done < <(find extra -maxdepth 1 -type f -name '*.tar.gpg' -print0 2>/dev/null)
+
 # --- 6d. Hook audit stores (Tier 1) ---
 # The merge gate's override records: which merges bypassed which gate, and on what
 # stated grounds. One small file per flush, own-user-only, and SELF-CONTAINED —
@@ -1042,6 +1197,23 @@ else
         done < <(find eval -type f -name '*.gpg' -print0 2>/dev/null)
     fi
 
+    # Upload opt-in extra-dir archives (§6f). Flat by construction — one file
+    # per directory — so restore's single-level off-site pull reads them back.
+    if find extra -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2>/dev/null | grep -q .; then
+        backend_mkdir "${_T2_DIR}/extra"
+        while IFS= read -r -d '' f; do
+            fname="$(basename "$f")"
+            if backend_put "$f" "${_T2_DIR}/extra/${fname}"; then
+                log "  off-site: uploaded extra/${fname}"
+            else
+                # Opt-in payload: reported on its own (status extra_upload_failed) and NOT
+                # allowed to withhold the core snapshot's COMPLETE marker.
+                log "WARNING: off-site upload failed for extra/${fname} (core snapshot unaffected)"
+                _EXTRA_UPLOAD_FAILED=$((_EXTRA_UPLOAD_FAILED + 1))
+            fi
+        done < <(find extra -maxdepth 1 -type f -name '*.tar.gpg' -print0 2>/dev/null)
+    fi
+
     backend_mkdir "${_T2_DIR}/config_overrides"
     while IFS= read -r -d '' f; do
         fname=$(basename "$f")
@@ -1154,7 +1326,7 @@ backend_cleanup
 
 # --- Ensure .gitignore excludes Tier 2 files ---
 # Tier 1 (git): memory/, config_overrides/, secrets/, infrastructure/, audit/
-# Tier 2 (off-site): data/, transcripts/
+# Tier 2 (off-site): data/, transcripts/, extra/
 if ! grep -q '^data/$' .gitignore 2>/dev/null; then
     cat >> .gitignore << 'GITIGNORE'
 # Tier 2 files — backed up off-site, not GitHub
@@ -1162,6 +1334,14 @@ data/
 transcripts/
 GITIGNORE
     log "Added Tier 2 exclusions to .gitignore"
+fi
+# extra/ (§6f) joined Tier 2 after the block above shipped: an existing install
+# already has that block, so it would never receive this line from it.
+if ! grep -qx 'extra/' .gitignore 2>/dev/null; then
+    # Keep the appended line on its own even if the file lacks a final newline.
+    if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then printf '\n' >> .gitignore; fi
+    printf 'extra/\n' >> .gitignore
+    log "Added extra/ to the Tier 2 .gitignore exclusions"
 fi
 
 # --- Commit and push (Tier 1 only) ---

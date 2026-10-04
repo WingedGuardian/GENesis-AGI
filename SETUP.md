@@ -137,6 +137,25 @@ GENESIS_BACKUP_NAS_HOST=this-machine-label
 ```
 (`restore.sh` reads the same variable to find the source snapshot dir.)
 
+**Extra directories (optional).** To keep install-local data no other backup
+section knows about, list directories under your home directory, separated by
+`:`:
+```
+GENESIS_BACKUP_EXTRA_DIRS=~/.genesis/analytics:~/.genesis/tools/my-tool
+GENESIS_BACKUP_EXTRA_EXCLUDES=derived:scratch
+```
+Each directory becomes one encrypted archive, `extra/<name>.tar.gpg`. It goes to
+the off-site tier only, never the git tier. Rebuildable caches (`.venv`,
+`node_modules`, `__pycache__`, …) are always excluded, and
+`GENESIS_BACKUP_EXTRA_EXCLUDES` adds more names, matched at any depth. An entry
+outside your home directory, or one that is missing, is skipped with a warning
+and never fails the backup; a missing directory keeps its last archive. Removing
+an entry from the list deletes its archive; unsetting the variable deletes nothing.
+`restore.sh` puts the files back under your home directory. It refuses, member by
+member, anything that uses `..`, a link pointing outside the tree, a special file,
+or a destination reached through an existing symlink that leads outside your home
+directory. Each refusal is recorded; the rest restores.
+
 Bootstrap installs the timer's unit files but does **not** enable them —
 scheduling a backup that silently leaves your database local-only would give a
 false sense of safety. Once `GENESIS_BACKUP_REPO` and

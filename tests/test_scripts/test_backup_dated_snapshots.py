@@ -146,7 +146,7 @@ def test_snapshot_dir_is_created(backup_env):
         assert sub in blob, f"snapshot subdir '{sub}' not created:\n{blob}"
 
 
-def _run_local(backup_env, offsite_root: Path):
+def _run_local(backup_env, offsite_root: Path, extra_env: dict | None = None):
     """Run backup.sh through the `local` Tier-2 backend (no smbclient stub)."""
     env = dict(os.environ)
     env.update(
@@ -164,8 +164,11 @@ def _run_local(backup_env, offsite_root: Path):
         "GENESIS_BACKUP_NAS_PASS",
         "TELEGRAM_BOT_TOKEN",
         "TELEGRAM_FORUM_CHAT_ID",
+        "GENESIS_BACKUP_EXTRA_DIRS",
+        "GENESIS_BACKUP_EXTRA_EXCLUDES",
     ):
         env.pop(k, None)
+    env.update(extra_env or {})
     return subprocess.run(
         ["bash", str(_BACKUP)], env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL
     )
@@ -343,3 +346,236 @@ def test_gfs_prune_keeps_buckets_never_latest_or_incomplete_or_transcripts(backu
     # every retained snapshot keeps its transcripts/.
     for s in complete_remaining:
         assert (host_dir / s / "transcripts").is_dir(), f"{s} lost its transcripts/"
+
+
+# ── opt-in extra directories (GENESIS_BACKUP_EXTRA_DIRS) ──────────────────────
+
+
+def _list_extra_archive(path: Path, home: Path) -> list[str]:
+    """Decrypt an extra-dir archive and return its member names."""
+    gpg = subprocess.run(
+        ["gpg", "--batch", "--quiet", "--passphrase", "testpass", "-d", str(path)],
+        env={**os.environ, "GNUPGHOME": str(home / ".gnupg")},
+        check=True,
+        capture_output=True,
+    )
+    tar = subprocess.run(["tar", "-tf", "-"], input=gpg.stdout, check=True, capture_output=True)
+    return [m.rstrip("/") for m in tar.stdout.decode().splitlines()]
+
+
+def _seed_extra_dir(home: Path) -> Path:
+    d = home / "work" / "store"
+    (d / "sub").mkdir(parents=True)
+    (d / "a.parquet").write_bytes(b"PAR1-data")
+    (d / "sub" / "b.txt").write_text("keep me\n")
+    (d / ".venv" / "lib").mkdir(parents=True)  # rebuildable: excluded by default
+    (d / ".venv" / "lib" / "big.so").write_bytes(b"x" * 64)
+    (d / "sub" / "__pycache__").mkdir()
+    (d / "sub" / "__pycache__" / "m.pyc").write_bytes(b"x")
+    (d / "scratch").mkdir()
+    (d / "scratch" / "tmp.bin").write_bytes(b"x")
+    return d
+
+
+def _repo(backup_env) -> Path:
+    return backup_env["home"] / "backups" / "genesis-backups"
+
+
+def test_extra_dirs_archived_encrypted_offsite_only_with_default_excludes(backup_env, tmp_path):
+    home = backup_env["home"]
+    _seed_extra_dir(home)
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(
+        backup_env,
+        offsite,
+        {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store", "GENESIS_BACKUP_EXTRA_EXCLUDES": "scratch"},
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    archives = sorted((_repo(backup_env) / "extra").glob("*.tar.gpg"))
+    assert len(archives) == 1, archives
+    members = _list_extra_archive(archives[0], home)
+    assert "work/store/a.parquet" in members and "work/store/sub/b.txt" in members
+    assert not any(".venv" in m or "__pycache__" in m or "scratch" in m for m in members), members
+    # No plaintext staging left behind, and never committed to the git (Tier-1) repo.
+    assert not [
+        p for p in (_repo(backup_env) / "extra").iterdir() if not p.name.endswith(".tar.gpg")
+    ]
+    assert "extra/" in (_repo(backup_env) / ".gitignore").read_text().splitlines()
+    tracked = subprocess.run(
+        ["git", "ls-files", "extra"], cwd=_repo(backup_env), capture_output=True, text=True
+    )
+    assert tracked.stdout.strip() == ""
+    # Off-site snapshot carries it.
+    snap = next(
+        d for d in next((offsite / "Genesis").iterdir()).iterdir() if _STAMP_RE.fullmatch(d.name)
+    )
+    assert (snap / "extra" / archives[0].name).is_file()
+    status = json.loads((home / ".genesis" / "backup_status.json").read_text())
+    assert status["extra_dirs"] == 1 and status["extra_dirs_skipped"] == 0, status
+
+
+def test_extra_dirs_unsetting_the_variable_keeps_existing_archives(backup_env, tmp_path):
+    """An unset variable (a parse slip, a missing env) must not delete the last good
+    archives (security review W2); removing an entry from a non-empty list does."""
+    _seed_extra_dir(backup_env["home"])
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    assert (
+        _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store"}).returncode
+        == 0
+    )
+    before = {p.name for p in (_repo(backup_env) / "extra").glob("*.tar.gpg")}
+    assert len(before) == 1
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert {p.name for p in (_repo(backup_env) / "extra").glob("*.tar.gpg")} == before
+    assert "keeping 1 existing extra archive" in proc.stdout, proc.stdout[-1500:]
+
+
+def test_extra_dirs_unset_is_a_noop(backup_env, tmp_path):
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert (
+        not list((_repo(backup_env) / "extra").glob("*.gpg"))
+        if (_repo(backup_env) / "extra").exists()
+        else True
+    )
+    status = json.loads((backup_env["home"] / ".genesis" / "backup_status.json").read_text())
+    assert status["extra_dirs"] == 0 and status["extra_dirs_skipped"] == 0, status
+
+
+@pytest.mark.parametrize("entry", ["/etc", "~", "~/does/not/exist", "~/work/../../outside"])
+def test_extra_dirs_refuses_outside_home_missing_or_home_itself(backup_env, tmp_path, entry):
+    (backup_env["home"] / "work").mkdir(exist_ok=True)
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": entry})
+    assert proc.returncode == 0, (
+        f"{proc.stdout}\n{proc.stderr}"
+    )  # a bad entry never fails the backup
+    assert "extra dir skipped" in proc.stdout, proc.stdout
+    assert not list((_repo(backup_env) / "extra").glob("*.gpg"))
+    status = json.loads((backup_env["home"] / ".genesis" / "backup_status.json").read_text())
+    assert status["extra_dirs"] == 0 and status["extra_dirs_skipped"] == 1, status
+
+
+def test_extra_dirs_missing_dir_keeps_last_archive_and_unlisted_archive_is_dropped(
+    backup_env, tmp_path
+):
+    home = backup_env["home"]
+    d = _seed_extra_dir(home)
+    other = home / "work" / "other"
+    other.mkdir()
+    (other / "f").write_text("x")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    env = {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store:~/work/other"}
+    assert _run_local(backup_env, offsite, env).returncode == 0
+    names = {p.name for p in (_repo(backup_env) / "extra").glob("*.tar.gpg")}
+    assert len(names) == 2
+    store_archive = next(n for n in names if "store" in n)
+    # store vanishes temporarily: its last good archive must survive.
+    d.rename(home / "work" / "store.moved")
+    # other is dropped from the list: its archive is removed.
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store"})
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert {p.name for p in (_repo(backup_env) / "extra").glob("*.tar.gpg")} == {store_archive}
+
+
+_RESTORE = _BACKUP.parent / "restore.sh"
+
+
+def test_extra_round_trip_real_backup_into_real_restore_keeps_links(backup_env, tmp_path):
+    """Producer -> consumer: what backup.sh writes, restore.sh must restore, incl. an
+    in-tree relative symlink and a hard link (deep-review B1)."""
+    home = backup_env["home"]
+    d = home / "work" / "tool"
+    (d / "snap1").mkdir(parents=True)
+    (d / "snap1" / "v.parquet").write_bytes(b"PAR1-v")
+    (d / "current").symlink_to("snap1")
+    (d / "a.txt").write_text("alpha\n")
+    os.link(d / "a.txt", d / "a-hardlink.txt")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/tool"})
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    fresh = tmp_path / "fresh"
+    (fresh / "genesis" / "data").mkdir(parents=True)
+    (fresh / ".genesis").mkdir()
+    (fresh / "tmp").mkdir()
+    (fresh / ".gnupg").mkdir(mode=0o700)
+    env = {
+        **os.environ,
+        "HOME": str(fresh),
+        "GENESIS_DIR": str(fresh / "genesis"),
+        "GENESIS_BACKUP_TMPDIR": str(fresh / "tmp"),
+        "GENESIS_BACKUP_TIER2_BACKEND": "none",
+        "QDRANT_URL": "http://127.0.0.1:1",
+        "GENESIS_BACKUP_PASSPHRASE": "testpass",
+        "GNUPGHOME": str(fresh / ".gnupg"),
+        "PATH": f"{backup_env['bind']}:{os.environ['PATH']}",
+    }
+    r = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(_repo(backup_env)), "--force"],
+        env=env,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert "extra archive refused" not in r.stdout, r.stdout
+    t = fresh / "work" / "tool"
+    assert (t / "a.txt").read_text() == "alpha\n" and (
+        t / "a-hardlink.txt"
+    ).read_text() == "alpha\n"
+    assert (t / "current").is_symlink() and os.readlink(t / "current") == "snap1"
+    assert (t / "current" / "v.parquet").read_bytes() == b"PAR1-v"
+    status = json.loads((fresh / ".genesis" / "restore_status.json").read_text())
+    assert status["extra_restored"] == 1, status
+
+
+def test_extra_dirs_symlinked_home_still_archives(backup_env, tmp_path):
+    """A symlinked $HOME must not reject every entry (deep-review S1)."""
+    _seed_extra_dir(backup_env["home"])
+    link_home = tmp_path / "homelink"
+    link_home.symlink_to(backup_env["home"])
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(
+        backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store", "HOME": str(link_home)}
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    status = json.loads((backup_env["home"] / ".genesis" / "backup_status.json").read_text())
+    assert status["extra_dirs"] == 1 and status["extra_dirs_skipped"] == 0, (
+        status,
+        proc.stdout[-1500:],
+    )
+
+
+@pytest.mark.parametrize(
+    "entry,reason",
+    [
+        ("work/store", "must be an absolute path"),  # relative: would resolve against the repo
+        ("~/backups", "contains the backups repo"),  # archives its own archives
+        ("~/backups/genesis-backups/memory", "inside the backups repo"),
+        ("~/work/venv", "excluded name"),  # would archive nothing
+    ],
+)
+def test_extra_dirs_refuses_risky_entries_with_a_reason(backup_env, tmp_path, entry, reason):
+    home = backup_env["home"]
+    _seed_extra_dir(home)
+    (home / "work" / "venv").mkdir(parents=True, exist_ok=True)
+    (home / "work" / "venv" / "f").write_text("x")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(
+        backup_env,
+        offsite,
+        {"GENESIS_BACKUP_EXTRA_DIRS": entry, "GENESIS_BACKUP_EXTRA_EXCLUDES": "venv"},
+    )
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "extra dir skipped" in proc.stdout and reason in proc.stdout, proc.stdout[-1500:]
+    assert not list((_repo(backup_env) / "extra").glob("*.gpg"))

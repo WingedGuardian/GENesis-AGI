@@ -78,6 +78,7 @@ _QDRANT_RESTORED=0
 _TRANSCRIPT_RESTORED=0
 _MEMORY_RESTORED=0
 _EVAL_RESTORED=0
+_EXTRA_RESTORED=0
 _CCMEM_RESTORED=false
 _OVERLAYS_RESTORED=0
 _SECRETS_RESTORED=false
@@ -92,7 +93,7 @@ _write_status() {
     _failures_json=$(printf '%s\n' "${_FAILURES[@]:-}" | python3 -c "import json,sys; print(json.dumps([l for l in sys.stdin.read().splitlines() if l]))")
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"dry_run":$DRY_RUN,"sqlite_restored":$_SQLITE_RESTORED,"qdrant_restored":$_QDRANT_RESTORED,"transcripts_restored":$_TRANSCRIPT_RESTORED,"memory_restored":$_MEMORY_RESTORED,"eval_restored":$_EVAL_RESTORED,"cc_memory_restored":$_CCMEM_RESTORED,"overlays_restored":$_OVERLAYS_RESTORED,"secrets_restored":$_SECRETS_RESTORED,"duration_s":$_duration,"failures":$_failures_json}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"dry_run":$DRY_RUN,"sqlite_restored":$_SQLITE_RESTORED,"qdrant_restored":$_QDRANT_RESTORED,"transcripts_restored":$_TRANSCRIPT_RESTORED,"memory_restored":$_MEMORY_RESTORED,"eval_restored":$_EVAL_RESTORED,"extra_restored":$_EXTRA_RESTORED,"cc_memory_restored":$_CCMEM_RESTORED,"overlays_restored":$_OVERLAYS_RESTORED,"secrets_restored":$_SECRETS_RESTORED,"duration_s":$_duration,"failures":$_failures_json}
 STATUSEOF
 }
 # ── Deploy-in-progress marker ────────────────────────────────────────
@@ -115,7 +116,8 @@ _SQL_TMP=""
 _QDRANT_TMP=""
 _DB_STAGE=""
 _cleanup_plaintext() {
-    rm -f "${_SQL_TMP:-}" "${_QDRANT_TMP:-}" 2>/dev/null || true
+    rm -f "${_SQL_TMP:-}" "${_QDRANT_TMP:-}" "${_XT_TAR:-}" 2>/dev/null || true
+    [ -n "${_XT_STAGE:-}" ] && rm -rf "$_XT_STAGE" 2>/dev/null || true  # §4c plaintext staging
     if [ -n "${_DB_STAGE:-}" ]; then
         rm -f "$_DB_STAGE" "$_DB_STAGE-journal" "$_DB_STAGE-wal" "$_DB_STAGE-shm" 2>/dev/null || true
     fi
@@ -461,6 +463,16 @@ _pull_from_offsite() {
             fi
         done < <(backend_list "$snap/$_sub" 2>/dev/null | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u)
     done
+    # opt-in extra-directory archives (backup.sh §6f) — flat by construction,
+    # one <name>.tar.gpg per directory, so one single-level listing pulls them all.
+    while read -r fname; do
+        mkdir -p "$BACKUP_DIR/extra"
+        if backend_get "$snap/extra/$fname" "$BACKUP_DIR/extra/$fname"; then
+            log "  off-site: pulled extra/$fname"
+        else
+            warn "off-site: failed to pull extra/$fname from snapshot $latest"
+        fi
+    done < <(backend_list "$snap/extra" 2>/dev/null | grep -oE '[A-Za-z0-9._-]+\.tar\.gpg' | sort -u)
     # creds — Tier-1 git normally carries these; a no-git box needs them from the
     # snapshot too (restore §8 reads $BACKUP_DIR/creds). backend_list is
     # single-level, so iterate creds/ and creds/ssh/ separately; the .gpg filter
@@ -501,6 +513,8 @@ _backup_has_payload() {
     _dir_has_file "$d/transcripts" && return 0
     _dir_has_file "$d/memory" && return 0
     _dir_has_file "$d/eval" && return 0
+    # §4c restores these; matched to what §4c reads (`*.tar.gpg`), not any file.
+    find "$d/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2>/dev/null | grep -q . && return 0
     _dir_has_file "$d/creds" && return 0
     # §6d restores this store, so it is a restorable payload and must be counted
     # here or a backup whose ONLY surviving payload is the audit trail dies at the
@@ -542,7 +556,7 @@ _has_encrypted=false
 for candidate in "$BACKUP_DIR"/data/genesis.sql.gpg "$BACKUP_DIR"/secrets/secrets.env.gpg; do
     [ -f "$candidate" ] && _has_encrypted=true
 done
-if find "$BACKUP_DIR"/transcripts "$BACKUP_DIR"/memory "$BACKUP_DIR"/data/qdrant -name '*.gpg' -print -quit 2>/dev/null | grep -q .; then
+if find "$BACKUP_DIR"/transcripts "$BACKUP_DIR"/memory "$BACKUP_DIR"/data/qdrant "$BACKUP_DIR"/extra -name '*.gpg' -print -quit 2>/dev/null | grep -q .; then
     _has_encrypted=true
 fi
 if $_has_encrypted && [ -z "$_BACKUP_PASSPHRASE" ]; then
@@ -1203,6 +1217,120 @@ if [ -d "$BACKUP_DIR/eval" ]; then
     log "Eval golden sets: $_EVAL_RESTORED restored"
 else
     log "Eval golden sets: no backup directory"
+fi
+
+# ── 4c. Opt-in extra directories (backup.sh §6f) ─────────────────────
+# Each extra/<name>.tar.gpg holds one directory, members stored relative to
+# $HOME. Members are extracted into a staging dir under $HOME through the stdlib
+# tarfile `data` filter, which refuses absolute paths, `..` escapes, links that
+# point outside the tree and special files member by member (each refusal is a
+# recorded failure; the rest restores). Files and in-tree symlinks are then moved
+# into place one by one, so a reader never sees a half-written file.
+log "--- Extra directories ---"
+if find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2>/dev/null | grep -q .; then
+    while IFS= read -r -d '' src; do
+        name="$(basename "$src")"
+        if $DRY_RUN; then
+            log "Extra: would restore archive $name (members under \$HOME)"
+            _EXTRA_RESTORED=$(( _EXTRA_RESTORED + 1 ))
+            continue
+        fi
+        _XT_TAR="$(mktemp -p "$GENESIS_BIG_TMP" extra-restore.XXXXXX.tar)"
+        if ! decrypt_file "$src" "$_XT_TAR"; then
+            warn "extra decrypt failed: $name"
+            rm -f "$_XT_TAR"
+            _XT_TAR=""
+            continue
+        fi
+        _XT_STAGE="$(mktemp -d -p "$HOME" .genesis-restore-extra.XXXXXX)"
+        # Extraction uses the stdlib tarfile `data` filter (PEP 706) rather than parsing
+        # `tar -tv` output: it refuses absolute paths, `..` escapes, links pointing
+        # outside the tree and special files PER MEMBER, and keeps everything else,
+        # including symlinks inside the tree. Refused members are named in the warning.
+        _xt_rc=0
+        _xt_out="$(python3 - "$_XT_TAR" "$_XT_STAGE" 2>&1 <<'PY'
+import sys
+import tarfile
+
+if not hasattr(tarfile, "data_filter"):
+    print("FATAL tarfile.data_filter unavailable (Python too old)")
+    sys.exit(3)
+refused = 0
+
+
+def keep(member, dest):
+    global refused
+    try:
+        return tarfile.data_filter(member, dest)
+    except tarfile.FilterError as e:
+        refused += 1
+        print(f"refused member {member.name!r}: {type(e).__name__}")
+        return None
+
+
+with tarfile.open(sys.argv[1]) as tf:
+    tf.extractall(sys.argv[2], filter=keep)
+sys.exit(4 if refused else 0)
+PY
+)" || _xt_rc=$?
+        if [ "$_xt_rc" -ne 0 ] && [ "$_xt_rc" -ne 4 ]; then
+            warn "extra archive refused (could not be extracted safely, rc=$_xt_rc): $name: $(printf '%s' "$_xt_out" | head -c 300)"
+            rm -rf "$_XT_STAGE" "$_XT_TAR"
+            _XT_STAGE=""
+            _XT_TAR=""
+            continue
+        fi
+        if [ "$_xt_rc" -eq 4 ]; then
+            warn "extra archive refused members (unsafe), the rest restored: $name: $(printf '%s' "$_xt_out" | head -c 300)"
+        fi
+        _xt_skipped=0
+        _xt_escaped=0
+        _xt_home_real="$(realpath -- "$HOME")"
+        # Move files AND in-tree symlinks into place one by one (a rename within one
+        # filesystem is atomic; across mounts mv copies). A pre-existing symlink in a
+        # destination's PARENT path could redirect the write outside $HOME, so each
+        # parent is re-resolved and a member whose real parent leaves the real $HOME
+        # is refused (security review: CRITICAL, reproduced).
+        while IFS= read -r -d '' f; do
+            rel="${f#"$_XT_STAGE"/}"
+            dst="$HOME/$rel"
+            _xt_parent_real="$(realpath -m -- "$(dirname "$dst")")"
+            case "$_xt_parent_real/" in
+                "$_xt_home_real"/*) ;;
+                *)
+                    _xt_escaped=$(( _xt_escaped + 1 ))
+                    continue
+                    ;;
+            esac
+            # Keep a newer live copy unless --force; compares the entries themselves
+            # (stat without -L), so symlink members get the same rule as files.
+            if { [ -e "$dst" ] || [ -L "$dst" ]; } && ! $FORCE \
+                && [ "$(stat -c %Y -- "$dst" 2>/dev/null || echo 0)" -gt "$(stat -c %Y -- "$f" 2>/dev/null || echo 0)" ]; then
+                continue
+            fi
+            if [ -d "$dst" ] && [ ! -L "$dst" ]; then
+                _xt_skipped=$(( _xt_skipped + 1 ))
+                continue
+            fi
+            if ! mkdir -p "$(dirname "$dst")" 2>/dev/null || ! mv -fT "$f" "$dst" 2>/dev/null; then
+                _xt_skipped=$(( _xt_skipped + 1 ))
+            fi
+        done < <(find "$_XT_STAGE" \( -type f -o -type l \) -print0)
+        rm -rf "$_XT_STAGE" "$_XT_TAR"
+        _XT_STAGE=""
+        _XT_TAR=""
+        if [ "$_xt_escaped" -gt 0 ]; then
+            warn "extra archive refused $_xt_escaped member(s) of $name: an existing symlink in the destination path leads outside \$HOME"
+        fi
+        if [ "$_xt_skipped" -gt 0 ]; then
+            warn "extra archive $name: $_xt_skipped file(s) could not be placed (a directory or file is in the way)"
+        fi
+        _EXTRA_RESTORED=$(( _EXTRA_RESTORED + 1 ))
+        log "Extra: restored $name"
+    done < <(find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print0 2>/dev/null)
+    log "Extra directories: $_EXTRA_RESTORED archive(s) restored"
+else
+    log "Extra directories: none in backup"
 fi
 
 # ── 5. In-repo CC memory backup ──────────────────────────────────────

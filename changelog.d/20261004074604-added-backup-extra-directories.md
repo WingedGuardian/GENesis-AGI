@@ -1,0 +1,1 @@
+- **Backups can now include extra directories you choose.** Set `GENESIS_BACKUP_EXTRA_DIRS` to directories under your home directory (separated by `:`); each is kept as an encrypted archive in the off-site backup tier, with rebuildable caches such as `.venv` left out, and `restore.sh` puts the files back. See SETUP.md, "Extra directories".

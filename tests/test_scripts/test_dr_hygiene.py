@@ -264,3 +264,201 @@ def test_n5_force_with_payload_succeeds(restore_sandbox):
     # SF7: decrypted secrets are 0600 (no world/group bits), written under umask 077.
     mode = stat.S_IMODE(secrets_out.stat().st_mode)
     assert mode & 0o077 == 0, oct(mode)
+
+
+# ── §4c opt-in extra directories (backup.sh §6f) ─────────────────────
+
+
+def _seed_extra_archive(sb, name: str, members: dict, *, symlinks: dict | None = None):
+    """Write backup/extra/<name>.tar.gpg holding ``members`` (path -> bytes) and
+    optional ``symlinks`` (path -> target), member paths stored verbatim."""
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for path, data in members.items():
+            info = tarfile.TarInfo(path)
+            info.size = len(data)
+            info.mtime = 1_700_000_000
+            tf.addfile(info, io.BytesIO(data))
+        for path, target in (symlinks or {}).items():
+            info = tarfile.TarInfo(path)
+            info.type = tarfile.SYMTYPE
+            info.linkname = target
+            tf.addfile(info)
+    (sb["backup"] / "extra").mkdir(exist_ok=True)
+    plain = sb["tmp"] / f"{name}.tar"
+    plain.write_bytes(buf.getvalue())
+    subprocess.run(
+        [
+            "gpg",
+            "--batch",
+            "--yes",
+            "--passphrase",
+            _TEST_PASSPHRASE,
+            "--symmetric",
+            "--cipher-algo",
+            "AES256",
+            "-o",
+            str(sb["backup"] / "extra" / f"{name}.tar.gpg"),
+            str(plain),
+        ],
+        env={**sb["env"], "GNUPGHOME": str(sb["home"] / ".gnupg")},
+        check=True,
+        capture_output=True,
+    )
+
+
+def _restore_extra(sb, *extra_args):
+    return subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(sb["backup"]), "--force", *extra_args],
+        env={
+            **sb["env"],
+            "GENESIS_BACKUP_PASSPHRASE": _TEST_PASSPHRASE,
+            "GNUPGHOME": str(sb["home"] / ".gnupg"),
+        },
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def test_extra_archive_restores_under_home_and_is_a_payload(restore_sandbox):
+    """An extra/ archive alone passes the N5 guard and lands under $HOME with no staging left."""
+    sb = restore_sandbox
+    _seed_extra_archive(
+        sb,
+        "work_store-abcd1234",
+        {"work/store/a.parquet": b"PAR1", "work/store/sub/b.txt": b"keep\n"},
+    )
+    proc = _restore_extra(sb)
+    assert proc.returncode == 0, proc.stdout
+    assert (sb["home"] / "work" / "store" / "a.parquet").read_bytes() == b"PAR1"
+    assert (sb["home"] / "work" / "store" / "sub" / "b.txt").read_text() == "keep\n"
+    assert not list(sb["home"].glob(".genesis-restore-extra.*")), "staging dir left behind"
+    status = json.loads((sb["home"] / ".genesis" / "restore_status.json").read_text())
+    assert status["extra_restored"] == 1 and status["success"] is True, status
+
+
+@pytest.mark.parametrize(
+    "members,symlinks,refused",
+    [
+        ({"../escape.txt": b"x", "work/ok.txt": b"ok"}, None, True),
+        ({"work/../../escape.txt": b"x", "work/ok.txt": b"ok"}, None, True),
+        ({"work/ok.txt": b"ok"}, {"work/link": "/etc/passwd"}, True),  # absolute link target
+        ({"work/ok.txt": b"ok"}, {"work/link": "../../outside"}, True),  # link escaping the tree
+        ({"work/ok.txt": b"ok"}, {"work/rel": "ok.txt"}, False),  # in-tree link: restored
+    ],
+)
+def test_extra_restore_refuses_unsafe_members_and_keeps_the_rest(
+    restore_sandbox, members, symlinks, refused
+):
+    """Refusal is per member (stdlib tarfile `data` filter): an unsafe member is
+    never written, a refusal is recorded, and every safe member still restores."""
+    sb = restore_sandbox
+    _seed_extra_archive(sb, "bad-00000000", members, symlinks=symlinks)
+    _seed_extra_archive(sb, "good-11111111", {"good/f.txt": b"fine"})
+    proc = _restore_extra(sb)
+    assert (sb["home"] / "good" / "f.txt").read_text() == "fine"
+    assert (sb["home"] / "work" / "ok.txt").read_text() == "ok"
+    for outside in (
+        sb["tmp"] / "escape.txt",
+        sb["home"].parent / "escape.txt",
+        sb["tmp"] / "outside",
+    ):
+        assert not outside.exists(), outside
+    link = sb["home"] / "work" / "link"
+    assert not link.is_symlink(), "an unsafe link must not be planted"
+    status = json.loads((sb["home"] / ".genesis" / "restore_status.json").read_text())
+    if refused:
+        assert "extra archive refused" in proc.stdout, proc.stdout
+        assert any("extra archive refused" in f for f in status["failures"]), status
+    else:
+        rel = sb["home"] / "work" / "rel"
+        assert rel.is_symlink() and os.readlink(rel) == "ok.txt" and rel.read_text() == "ok"
+        assert not any("extra archive" in f for f in status["failures"]), status
+
+
+def test_extra_absolute_member_is_contained_under_home(restore_sandbox):
+    """The data filter strips a leading '/', so an absolute member lands INSIDE
+    the restore tree (under $HOME), never at the absolute path."""
+    sb = restore_sandbox
+    _seed_extra_archive(sb, "abs-33333333", {"/abs-escape-probe/f.txt": b"x"})
+    _restore_extra(sb)
+    assert not os.path.exists("/abs-escape-probe")
+    assert (sb["home"] / "abs-escape-probe" / "f.txt").read_bytes() == b"x"
+
+
+@pytest.mark.parametrize("link_first", [True, False])
+def test_unsafe_member_in_a_long_listing_is_still_refused(restore_sandbox, link_first):
+    """A listing far larger than a pipe buffer, with the unsafe member first or
+    last: it is refused in both positions while the 3,000 safe files restore.
+    (Kept from an earlier `tar -tv | grep -q` design, where an early-exiting grep
+    under pipefail could SIGPIPE the writer and read as 'nothing unsafe'.)"""
+    import io
+    import tarfile
+
+    sb = restore_sandbox
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        link = tarfile.TarInfo("work/big/aa-link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/etc/passwd"
+        if link_first:
+            tf.addfile(link)
+        for i in range(3000):
+            info = tarfile.TarInfo(f"work/big/f{i:05d}.txt")
+            tf.addfile(info, io.BytesIO(b""))
+        if not link_first:
+            tf.addfile(link)
+    (sb["backup"] / "extra").mkdir(exist_ok=True)
+    plain = sb["tmp"] / "big.tar"
+    plain.write_bytes(buf.getvalue())
+    subprocess.run(
+        [
+            "gpg",
+            "--batch",
+            "--yes",
+            "--passphrase",
+            _TEST_PASSPHRASE,
+            "--symmetric",
+            "--cipher-algo",
+            "AES256",
+            "-o",
+            str(sb["backup"] / "extra" / "big-22222222.tar.gpg"),
+            str(plain),
+        ],
+        env={**sb["env"], "GNUPGHOME": str(sb["home"] / ".gnupg")},
+        check=True,
+        capture_output=True,
+    )
+    proc = _restore_extra(sb)
+    assert "extra archive refused" in proc.stdout, proc.stdout[-2000:]
+    assert not (sb["home"] / "work" / "big" / "aa-link").is_symlink()
+    assert len(list((sb["home"] / "work" / "big").iterdir())) == 3000
+
+
+def test_extra_restore_never_writes_through_a_symlink_leading_outside_home(restore_sandbox):
+    """A pre-existing symlink in a destination's parent path must not redirect the
+    write outside $HOME (security review CRITICAL, reproduced before the fix)."""
+    sb = restore_sandbox
+    outside = sb["tmp"] / "outside-target"
+    outside.mkdir()
+    (sb["home"] / "work").symlink_to(outside)
+    _seed_extra_archive(sb, "work-44444444", {"work/evil.txt": b"redirected", "safe/ok.txt": b"ok"})
+    proc = _restore_extra(sb)
+    assert not (outside / "evil.txt").exists(), "write escaped $HOME through a symlink"
+    assert (sb["home"] / "safe" / "ok.txt").read_text() == "ok"
+    assert "leads outside" in proc.stdout, proc.stdout[-1500:]
+    status = json.loads((sb["home"] / ".genesis" / "restore_status.json").read_text())
+    assert any("leads outside" in f for f in status["failures"]), status
+
+
+def test_extra_dry_run_writes_nothing(restore_sandbox):
+    sb = restore_sandbox
+    _seed_extra_archive(sb, "work_store-abcd1234", {"work/store/a.parquet": b"PAR1"})
+    proc = _restore_extra(sb, "--dry-run")
+    assert proc.returncode == 0, proc.stdout
+    assert "would restore" in proc.stdout
+    assert not (sb["home"] / "work").exists()
