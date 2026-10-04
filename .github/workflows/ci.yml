@@ -1118,8 +1118,6 @@ jobs:
         #   test_collectors_container.py           51 -> 62   (+11)
         #   test_systemd_template_placeholders.py  11 -> 13   (+2)
         #   test_collectors_falkordb.py           new -> 19   (+19)
-        #   test_falkordb_install.py              new -> 58   (+58)
-        #   test_falkordb_module.py               new -> 24   (+24)
-        #   test_falkordb_key_pin.py              new -> 7    (+7)
-        # No added skips. Floor: 24332 + 131 = 24463; skip ceiling remains 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24463
+        #   test_falkordb_module.py               new -> 27   (+27)
+        # No added skips. Floor: 24332 + 69 = 24401; skip ceiling remains 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24401

@@ -1,9 +1,8 @@
 """Artifact-integrity and unit-wiring tests for falkordb_install.sh.
 
-See falkordb_stubs.py for the harness. Split out of test_falkordb_install.py
-at the repo's line cap: that file covers consent and system provisioning;
-this one covers the downloaded module (pinned digest, execute bit, no half
-files) and the systemd unit's render wiring in bootstrap.sh.
+See falkordb_stubs.py for the harness. Covers the downloaded module (pinned
+digest, execute bit, no half files), the kill switch, and the systemd unit's
+render wiring and quoting.
 """
 
 from __future__ import annotations
@@ -17,33 +16,11 @@ from tests.test_scripts.falkordb_stubs import (
     PINNED_SHA,
     REPO_ROOT,
     UNIT_TEMPLATE,
-    _apt_log,
     _run,
     _stage,
 )
 
 # --- the artifact must be what we tested ----------------------------------
-
-
-def test_the_module_half_needs_no_consent(tmp_path):
-    """It writes one file under ~/.genesis and changes nothing about the system.
-
-    Keeping it automatic means arming the engine later is one command rather
-    than a re-provision, and it costs an unwilling operator disk space only.
-    """
-    env = _stage(tmp_path)
-    del env["GENESIS_FALKORDB_PROVISION"]
-    artifact = tmp_path / "release" / "v4.20.4" / "falkordb-x64.so"
-    real_sha = subprocess.run(
-        ["sha256sum", str(artifact)], capture_output=True, text=True, check=True
-    ).stdout.split()[0]
-
-    result = _run(
-        f'_falkordb_expected_sha() {{ printf "{real_sha}"; }}; falkordb_module_install',
-        env,
-    )
-    assert result.returncode == 0, result.stderr
-    assert (Path(env["FALKORDB_DEPS_DIR"]) / "4.20.4" / "falkordb.so").is_file()
 
 
 def test_a_pinned_version_refuses_to_install_when_it_cannot_be_verified(tmp_path):
@@ -165,7 +142,7 @@ def test_chmod_failure_reports_not_installed_and_retries(tmp_path):
     # The stub must really chmod on the success path — it shadows /usr/bin/chmod
     # for the whole run, so a no-op success would leave the file unexecutable.
     chmod_stub.write_text(
-        '#!/bin/bash\n'
+        "#!/bin/bash\n"
         'if [ "${CHMOD_RC:-0}" != "0" ]; then exit "$CHMOD_RC"; fi\n'
         'exec /usr/bin/chmod "$@"\n'
     )
@@ -250,25 +227,35 @@ def test_a_cached_mismatch_that_cannot_be_refetched_is_removed(tmp_path):
     assert not target.exists(), "left a module that fails its digest in place"
 
 
-def test_a_module_that_fails_verification_changes_nothing_on_the_system(tmp_path):
-    """The module is the reason redis is wanted, so it goes first: a failed
-    download or digest leaves no apt repo and no daemon behind."""
-    env = _stage(tmp_path)  # fake artifact => fails the real pin
-    result = _run("falkordb_provision", env)
-
-    assert result.returncode == 0, result.stderr
-    assert "checksum MISMATCH" in result.stdout
-    assert not Path(env["FALKORDB_APT_LIST"]).exists(), "repo added for a dead engine"
-    assert "apt-get" not in _apt_log(env), "apt ran before the module verified"
-
-
-def test_a_verified_module_still_provisions_redis(tmp_path):
+def test_provision_installs_the_verified_module(tmp_path):
     env = _stage(tmp_path)
     result = _run(_pin_the_fake(tmp_path) + "falkordb_provision", env)
 
     assert result.returncode == 0, result.stderr
     assert (Path(env["FALKORDB_DEPS_DIR"]) / "4.20.4" / "falkordb.so").is_file()
-    assert "apt-get install" in _apt_log(env), result.stdout
+
+
+def test_an_unpinned_architecture_installs_nothing(tmp_path):
+    """Only x64 is pinned: an arm64 box must refuse, not fetch unverified bytes."""
+    env = _stage(tmp_path)
+    uname = Path(env["PATH"].split(":")[0]) / "uname"
+    uname.write_text("#!/bin/bash\nprintf 'aarch64\\n'\n")
+    uname.chmod(0o755)
+
+    result = _run("falkordb_provision", env)
+    assert result.returncode == 0, result.stderr
+    assert "no pinned checksum" in result.stdout
+    assert not (Path(env["FALKORDB_DEPS_DIR"]) / "4.20.4").exists()
+
+
+def test_kill_switch_stops_everything_including_the_module(tmp_path):
+    env = _stage(tmp_path)
+    env["GENESIS_FALKORDB_PROVISION_DISABLED"] = "1"
+    result = _run(_pin_the_fake(tmp_path) + "falkordb_provision", env)
+
+    assert result.returncode == 0, result.stderr
+    assert "DISABLED" in result.stdout
+    assert not (Path(env["FALKORDB_DEPS_DIR"]) / "4.20.4" / "falkordb.so").exists()
 
 
 # --- wiring ----------------------------------------------------------------
@@ -389,7 +376,7 @@ def test_exec_start_is_rendered_not_hardcoded():
     is resolved at render time instead, the same way the version pin is.
     """
     unit = UNIT_TEMPLATE.read_text()
-    assert "ExecStart=__REDIS_SERVER__" in unit, "ExecStart is not rendered"
+    assert 'ExecStart="__REDIS_SERVER__"' in unit, "ExecStart is not rendered"
     assert "/usr/bin/redis-server" not in _exec_argv(unit), (
         "a hardcoded interpreter path is back in ExecStart"
     )
@@ -402,7 +389,7 @@ def test_exec_start_is_rendered_not_hardcoded():
     # out sed line mentioning the token would also pass a bare `in` check.
     # The value goes through _sed_repl_esc first — `|`/`&` in a resolved path
     # would otherwise corrupt the expression or fail the render under set -e.
-    assert "_redis_bin_esc=$(_sed_repl_esc \"$(_falkordb_redis_server_bin" in bootstrap, (
+    assert '_redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin' in bootstrap, (
         "render loop does not substitute the resolved path"
     )
     assert "s|__REDIS_SERVER__|$_redis_bin_esc|g" in bootstrap, (
@@ -464,8 +451,8 @@ def test_the_server_waits_for_the_engine_but_does_not_require_it():
     # DISABLED unit named in another unit's Wants= is started anyway —
     # enablement gates only what default.target pulls in. bootstrap renders the
     # engine unit on EVERY install but arms it on none, so any of these would
-    # start it on a box that declined provisioning, where there is no
-    # redis >= 8.0.0 and it restart-loops to `failed`.
+    # start it on a box with no redis >= 8.0.0, where it restart-loops to
+    # `failed`.
     for line in text.splitlines():
         if line.startswith(("Wants=", "Requires=", "Requisite=", "BindsTo=", "PartOf=")):
             assert "genesis-falkordb" not in line, (
@@ -483,12 +470,12 @@ def test_unit_write_scope_is_narrow():
     lines = UNIT_TEMPLATE.read_text().splitlines()
     assert "ProtectHome=read-only" in lines, "strict alone leaves the home writable"
     rw = [ln for ln in lines if ln.startswith("ReadWritePaths=")]
-    assert rw == ["ReadWritePaths=%h/.genesis/falkordb"], rw
+    assert rw == ['ReadWritePaths="%h/.genesis/falkordb"'], rw
     # The data dir must exist before the sandbox is built (a missing
     # ReadWritePaths entry fails namespace setup), and a sandboxed mkdir could
     # not create it under a read-only home — so the mkdir runs unsandboxed.
     pre = [ln for ln in lines if ln.startswith("ExecStartPre=")]
-    assert pre == ["ExecStartPre=+/bin/mkdir -p __HOME__/.genesis/falkordb"], pre
+    assert pre == ['ExecStartPre=+/bin/mkdir -p "%h/.genesis/falkordb"'], pre
 
 
 def test_bootstrap_does_not_arm_the_engine():
@@ -502,3 +489,140 @@ def test_bootstrap_does_not_arm_the_engine():
     text = BOOTSTRAP.read_text()
     enabling = [ln for ln in text.splitlines() if "systemctl --user enable" in ln]
     assert not any("falkordb" in ln for ln in enabling), enabling
+
+
+# --- systemd quoting -------------------------------------------------------
+#
+# systemd.service(5) "Command Lines": each command line is unquoted using the
+# "Quoting" rules of systemd.syntax(7) — unquoted whitespace separates items,
+# "..." wraps a whole item, C-style escapes apply — and "%" specifiers are
+# expanded (systemd.unit(5); "%%" is a literal percent). ReadWritePaths= takes
+# a space-separated list under the same quoting. MEASURED with
+# `systemd-analyze --user verify` (systemd 255): specifiers expand per item
+# AFTER the split, so a spaced %h stays one item; an unquoted literal path
+# with a space splits into two.
+
+_C_ESCAPES = {"\\": "\\", '"': '"', "'": "'", "n": "\n", "t": "\t"}
+
+
+def _systemd_words(value: str, home: str) -> list[str]:
+    """Split a directive value into items the way systemd does, then expand
+    %h and %% per item — the order measured above."""
+    words: list[str] = []
+    cur: list[str] = []
+    quote = None
+    started = False
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        if ch == "\\" and i + 1 < len(value):
+            cur.append(_C_ESCAPES.get(value[i + 1], value[i + 1]))
+            started = True
+            i += 2
+            continue
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                cur.append(ch)
+        elif ch in "\"'" and not cur:
+            quote = ch
+            started = True
+        elif ch.isspace():
+            if started:
+                words.append("".join(cur))
+            cur, started = [], False
+        else:
+            cur.append(ch)
+            started = True
+        i += 1
+    if started:
+        words.append("".join(cur))
+    return [w.replace("%%", "\0").replace("%h", home).replace("\0", "%") for w in words]
+
+
+def _directive(unit: str, key: str) -> str:
+    """One directive's value, joined across trailing-backslash continuations."""
+    lines = unit.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith(f"{key}="))
+    parts = [lines[start][len(key) + 1 :]]
+    i = start
+    while parts[-1].rstrip().endswith("\\"):
+        parts[-1] = parts[-1].rstrip()[:-1]
+        i += 1
+        parts.append(lines[i])
+    return " ".join(parts)
+
+
+def _render(home: str, redis_word: str) -> str:
+    """The template as both renderers substitute it (sed escaping is pinned
+    separately by test_systemd_template_placeholders.py). __HOME__ is
+    substituted too, so a path that goes back to a rendered home is caught."""
+    return (
+        UNIT_TEMPLATE.read_text()
+        .replace("__HOME__", home)
+        .replace("__REDIS_SERVER__", redis_word)
+        .replace("__FALKORDB_VERSION__", "4.20.4")
+    )
+
+
+def _resolve(path_env: str, tmp_path) -> str:
+    return subprocess.run(
+        ["bash", "-c", f'set -u; source "{LIB}"; _falkordb_redis_server_bin'],
+        capture_output=True,
+        text=True,
+        env={"PATH": path_env, "HOME": str(tmp_path)},
+    ).stdout
+
+
+def test_home_paths_survive_a_home_with_spaces():
+    """A spaced $HOME must reach redis and mkdir as ONE argument each."""
+    home = "/home/op with space"
+    unit = _render(home, "/usr/bin/redis-server")
+    data = f"{home}/.genesis/falkordb"
+
+    assert _systemd_words(_directive(unit, "ExecStartPre"), home) == [
+        "+/bin/mkdir",
+        "-p",
+        data,
+    ]
+    argv = _systemd_words(_directive(unit, "ExecStart"), home)
+    for flag, want in (
+        ("--unixsocket", f"{data}/falkordb.sock"),
+        ("--dir", data),
+        ("--loadmodule", f"{home}/.genesis/deps/falkordb/4.20.4/falkordb.so"),
+    ):
+        assert argv[argv.index(flag) + 1] == want, (flag, argv)
+    assert _systemd_words(_directive(unit, "ReadWritePaths"), home) == [data]
+
+
+def test_a_resolved_interpreter_path_with_spaces_and_percent_survives(tmp_path):
+    """The rendered ExecStart executable must be the resolved path, whole.
+
+    Unquoted, systemd splits it at the space; undoubled, a `%` is read as a
+    specifier (MEASURED: `p%c` became `p/<unit name>`).
+    """
+    bin_dir = tmp_path / "redis 100% bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "redis-server"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+
+    word = _resolve(f"{bin_dir}:/usr/bin:/bin", tmp_path)
+    argv = _systemd_words(_directive(_render("/home/op", word), "ExecStart"), "/home/op")
+    assert argv[0] == str(stub), (word, argv[:2])
+
+
+def test_an_interpreter_path_systemd_refuses_is_never_rendered(tmp_path):
+    """systemd rejects an executable containing `"` or `\\` as a FATAL unit
+    error ("Executable name contains special characters"), quoted or not —
+    MEASURED with systemd-analyze verify. Such a path is skipped like a
+    relative one."""
+    for name in ('quote"dir', "back\\slash"):
+        bin_dir = tmp_path / name
+        bin_dir.mkdir()
+        stub = bin_dir / "redis-server"
+        stub.write_text("#!/bin/sh\nexit 0\n")
+        stub.chmod(0o755)
+        word = _resolve(f"{bin_dir}:/usr/bin:/bin", tmp_path)
+        assert word.startswith("/") and '"' not in word and "\\" not in word, word

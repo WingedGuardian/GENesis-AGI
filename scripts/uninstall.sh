@@ -614,14 +614,6 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             skip "qdrant binary"
         fi
 
-        # The FalkorDB module lives under ~/.genesis/deps and is removed with
-        # that tree above. redis-server is NOT removed: it is an apt package
-        # other software on the box may depend on, and on a machine where it
-        # predated Genesis we never installed it in the first place. Same for
-        # the upstream apt repo. Say so rather than leaving it a silent
-        # omission — an operator who wants them gone needs to know they remain.
-        skip "redis-server package + apt repo (left in place deliberately)"
-
         # Clean Claude Code config (NOT Claude Code itself or ~/.claude/ global)
         for f in .claude/settings.json .claude/settings.local.json .mcp.json; do
             [ -e "$HOME/genesis/$f" ] && safe_remove "$HOME/genesis/$f" "CC config: $f"

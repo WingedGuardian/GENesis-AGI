@@ -1,16 +1,17 @@
 [Unit]
 Description=Genesis FalkorDB — graph engine for the memory graph (socket-only)
 # The memory graph's engine (issue #1641): SQLite stays the system of record,
-# this holds a DERIVED, rebuildable index. Nothing consumes it yet — the client
-# and the config that can select it arrive in a later slice — so this unit is
-# rendered by bootstrap but NOT auto-enabled, the same posture as
+# this holds a DERIVED, rebuildable index. The memory graph reads it only when
+# config/graphstore.yaml selects `mode: falkordb` (default: networkx), so this
+# unit is rendered by bootstrap but NOT auto-enabled, the same posture as
 # genesis-code-intel-freeze. Arm it deliberately:
 #   systemctl --user enable --now genesis-falkordb
 #   systemctl --user disable --now genesis-falkordb
 #
-# Provisioned by scripts/lib/falkordb_install.sh: redis-server >= 8.0.0 from the
-# official upstream apt repo (Ubuntu/Debian stable ship 7.x, which the module
-# refuses to load on) plus the released module under ~/.genesis/deps.
+# scripts/lib/falkordb_install.sh fetches the released module under
+# ~/.genesis/deps. redis-server >= 8.0.0 is an operator step (SETUP.md): the
+# module refuses to load on the 7.x that Ubuntu/Debian stable ship.
+#
 # StartLimit* live in [Unit], NOT [Service]: systemd ignores
 # StartLimitIntervalSec there (it accepts StartLimitBurst as a legacy alias, so
 # the misplacement is HALF-silent and leaves burst counting against the 10s
@@ -55,13 +56,19 @@ TimeoutStartSec=20
 # `+` runs this one command outside the sandbox below: ReadWritePaths names
 # the data dir itself, a missing ReadWritePaths entry fails namespace setup,
 # and under ProtectHome=read-only a sandboxed mkdir could not create it.
-ExecStartPre=+/bin/mkdir -p __HOME__/.genesis/falkordb
-ExecStart=__REDIS_SERVER__ \
+#
+# Paths are quoted items built on %h, never a rendered $HOME: systemd splits
+# unquoted whitespace into separate arguments (systemd.service(5) "Command
+# Lines", systemd.syntax(7) "Quoting"), and %h is expanded per item, so a home
+# with a space stays one argument. __REDIS_SERVER__ arrives escaped for these
+# quotes by _falkordb_redis_server_bin.
+ExecStartPre=+/bin/mkdir -p "%h/.genesis/falkordb"
+ExecStart="__REDIS_SERVER__" \
     --port 0 \
-    --unixsocket __HOME__/.genesis/falkordb/falkordb.sock \
+    --unixsocket "%h/.genesis/falkordb/falkordb.sock" \
     --unixsocketperm 700 \
-    --dir __HOME__/.genesis/falkordb \
-    --loadmodule __HOME__/.genesis/deps/falkordb/__FALKORDB_VERSION__/falkordb.so \
+    --dir "%h/.genesis/falkordb" \
+    --loadmodule "%h/.genesis/deps/falkordb/__FALKORDB_VERSION__/falkordb.so" \
     --save "" \
     --appendonly no \
     --maxmemory 512mb \
@@ -90,8 +97,18 @@ ProtectSystem=strict
 # CONFIG SET dir writes wherever dir points, and the module is native code.
 # So the home is read-only and the data dir is the one writable path. The
 # module under ~/.genesis/deps only needs to be READ.
+#
+# BEST-EFFORT under a user manager: since systemd 254 these filesystem
+# directives imply PrivateUsers=yes in a user unit (systemd NEWS, 254), so
+# they need unprivileged user namespaces, and where those are denied (common
+# in unprivileged containers) systemd skips them and the unit runs
+# unsandboxed (issue #2824). PrivateUsers=yes is deliberately NOT set: on 254+
+# it adds nothing the implicit form does not, and an EXPLICIT request is one
+# systemd may refuse to run without (its executor has a fatal "Failed to set up
+# user namespacing" path beside the implicit form's "..., ignoring"), turning a
+# host without user namespaces from unsandboxed into a unit that never starts.
 ProtectHome=read-only
-ReadWritePaths=%h/.genesis/falkordb
+ReadWritePaths="%h/.genesis/falkordb"
 RestrictAddressFamilies=AF_UNIX
 PrivateTmp=yes
 ProtectKernelTunables=yes

@@ -1126,10 +1126,10 @@ fi
 echo
 
 # --- Graph engine (FalkorDB) provisioning ---
-# Same guarded-source contract as the resilience libs. Server side ONLY: this
-# installs a redis-server new enough to load the module plus the module itself,
-# and stops there. The unit rendered below is left DISABLED and nothing in
-# Genesis reads the engine yet, so a box where this skips entirely is fully
+# Same guarded-source contract as the resilience libs. Fetches and verifies the
+# engine MODULE under ~/.genesis/deps and stops there — no system change; the
+# redis-server that loads it is an operator step (SETUP.md). The unit rendered
+# below is left DISABLED, so a box where this skips entirely is fully
 # functional — the memory graph keeps using its in-process NetworkX projection.
 echo "--- Graph engine (optional) ---"
 if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
