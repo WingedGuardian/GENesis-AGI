@@ -42,6 +42,7 @@
 #
 # Env overrides:
 #   CODE_INTEL_INDEX_MEMORY_MAX   legacy override for both tools
+#   CODE_INTEL_CBM_WORKER_BINARY  opt-in absolute pinned v0.11 worker executable
 #   CODE_INTEL_CBM_MEMORY_MAX     default 4G     (requested CBM batch ceiling)
 #   CODE_INTEL_GITNEXUS_MEMORY_MAX default 8G    (measured GitNexus rebuild)
 #   CODE_INTEL_FILE_CACHE_RESERVE_BYTES default 2G (clean cache kept outside job)
@@ -117,7 +118,7 @@ case "$_CODE_INTEL_ENTRYPOINT" in
     */*)
         _code_intel_entry_dir="${_CODE_INTEL_ENTRYPOINT%/*}"
         _code_intel_entry_base="${_CODE_INTEL_ENTRYPOINT##*/}"
-        _code_intel_entry_dir="$(cd -P -- "$_code_intel_entry_dir" 2>/dev/null && pwd)" \
+        _code_intel_entry_dir="$(unset CDPATH; cd -P -- "$_code_intel_entry_dir" 2>/dev/null && pwd)" \
             || { printf '%s\n' "code-intel: cannot resolve entrypoint path" >&2; exit 1; }
         _CODE_INTEL_ENTRYPOINT="$_code_intel_entry_dir/$_code_intel_entry_base"
         ;;
@@ -578,7 +579,7 @@ esac
 
 # Physical path (-P): the single-flight lock is keyed on this, and a symlinked
 # spelling of the same repo must not get a second lock (= second concurrent index).
-REPO_PATH="$(cd "$REPO_PATH" && pwd -P)"
+REPO_PATH="$(unset CDPATH; cd "$REPO_PATH" && pwd -P)"
 
 # ── 1. Worktree skip ────────────────────────────────────────────────────
 # In a linked worktree, <root>/.git is a FILE (gitdir pointer), not a dir.
@@ -795,7 +796,7 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
     elif [ -e "$CBM_DISABLE_FILE" ]; then
         _log "codebase-memory-mcp disabled by $CBM_DISABLE_FILE — skipped"
         MISSING="${MISSING}cbm "
-    elif command -v codebase-memory-mcp >/dev/null 2>&1; then
+    elif [ -n "${CODE_INTEL_CBM_WORKER_BINARY:-}" ] || command -v codebase-memory-mcp >/dev/null 2>&1; then
         CBM_MEM_REFUSE=""
         _cbm_want_b="$(_genesis_mem_bytes "$CBM_MEM_MAX")"
         if [ -n "$GENESIS_CBM_ENV_REFUSE" ]; then
@@ -824,9 +825,13 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
                 _log "SKIP cbm: cannot create admission outcome marker"
                 MISSING="${MISSING:+$MISSING }cbm"
             else
+                _cbm_command=(codebase-memory-mcp cli index_repository)
+                if [ -n "${CODE_INTEL_CBM_WORKER_BINARY:-}" ]; then
+                    _cbm_command=(/usr/bin/python3 -I "${_CODE_INTEL_ENTRYPOINT%/*}/code_intel_cbm_worker.py")
+                fi
                 if MEM_MAX="$CBM_MEM_MAX" CODE_INTEL_CHILD_ADMIT_CAP_BYTES="$_cbm_want_b" \
                     CODE_INTEL_CHILD_REFUSAL_MARKER="$_cbm_refusal_marker" \
-                    _run_with_watchdog cbm codebase-memory-mcp cli index_repository \
+                    _run_with_watchdog cbm "${_cbm_command[@]}" \
                     --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE"; then
                     CBM_RAN=1
                 else

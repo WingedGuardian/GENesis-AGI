@@ -298,6 +298,10 @@ async def call_sites(
                 if not probe.configured:
                     entry["probe_status"] = "not_configured"
                     entry["probe_reason"] = "no_api_key"
+                elif not probe.probe_supported:
+                    # No observation: preserve the existing CB fallback. An
+                    # invented status would count as unavailable in the UI.
+                    entry["probe_reason"] = "unsupported_probe"
                 elif not probe.reachable:
                     entry["probe_status"] = "unreachable"
                 elif probe.error == "rate limited":

@@ -1,9 +1,9 @@
 """Provider health probes — periodic /v1/models endpoint checks.
 
-Probes each unique LLM provider's models-listing endpoint to confirm
-reachability, API key validity, and model availability. All probes are
-free (no tokens consumed). Results feed into call_sites snapshot to
-replace circuit-breaker-default "healthy" with confirmed status.
+Probes each unique LLM provider's models-listing endpoint for reachability
+and catalog membership. A listing does not prove credential validity or
+completion entitlement. No completion tokens are consumed. Results feed
+the call_sites snapshot; unsupported probes retain breaker-based display.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ _PROVIDER_URLS: dict[str, str] = {
     "deepseek": "https://api.deepseek.com/v1/models",
     "openai": "https://api.openai.com/v1/models",
     "xai": "https://api.x.ai/v1/models",
+    "nvidia_nim": "https://integrate.api.nvidia.com/v1/models",
 }
 
 
@@ -63,12 +64,14 @@ class ProviderProbeResult:
 
     provider_name: str
     reachable: bool
-    configured: bool = True  # False when no API key / probe URL found
+    configured: bool = True  # Required credentials are present, not validated.
     model_available: bool | None = None  # None = couldn't verify
     latency_ms: float = 0.0
     error: str | None = None
     checked_at: str = ""
     _models: frozenset[str] = field(default_factory=frozenset, repr=False)
+    probe_supported: bool = True
+    can_affect_breaker: bool = True
 
 
 class ProviderHealthChecker:
@@ -141,6 +144,9 @@ class ProviderHealthChecker:
                     reachable=False,
                     error=str(raw)[:120],
                     checked_at=datetime.now(UTC).isoformat(),
+                    probe_supported=(
+                        self._resolve_endpoint(type_to_providers[ptype][0]) is not None
+                    ),
                 )
             else:
                 base_result = raw
@@ -158,6 +164,14 @@ class ProviderHealthChecker:
                     latency_ms=base_result.latency_ms,
                     error=base_result.error,
                     checked_at=base_result.checked_at,
+                    probe_supported=base_result.probe_supported,
+                    # Derive NVIDIA authority from the captured config even
+                    # when gather produced an exception with default flags.
+                    can_affect_breaker=(
+                        base_result.can_affect_breaker
+                        and base_result.probe_supported
+                        and ptype != "nvidia_nim"
+                    ),
                 )
 
         if self._routing_snapshot and self._routing_snapshot()[0] is not config:
@@ -182,8 +196,8 @@ class ProviderHealthChecker:
         results = self._results if results is None else results
         get_breaker = self._breakers.get if bindings is None else bindings.__getitem__
         for name, result in results.items():
-            if not result.configured:
-                continue  # No API key — don't trip CB for missing config
+            if not result.configured or not result.probe_supported or not result.can_affect_breaker:
+                continue  # Missing config / unsupported / observational evidence.
             if not result.reachable or result.error == "rate limited":
                 try:
                     cb = get_breaker(name)
@@ -209,13 +223,18 @@ class ProviderHealthChecker:
     async def _probe_one(self, cfg: ProviderConfig) -> ProviderProbeResult:
         """Probe a single provider's models endpoint."""
         url = self._resolve_url(cfg)
+        can_affect_breaker = cfg.provider_type != "nvidia_nim"
         if not url:
+            supported = self._resolve_endpoint(cfg) is not None
+            configured = cfg.provider_type == "ollama" or bool(_resolve_api_key(cfg.provider_type))
             return ProviderProbeResult(
                 provider_name=cfg.name,
                 reachable=False,
-                configured=False,
-                error="no API key configured",
+                configured=configured,
+                error="unsupported probe target" if configured else "no API key configured",
                 checked_at=datetime.now(UTC).isoformat(),
+                probe_supported=supported,
+                can_affect_breaker=supported and can_affect_breaker,
             )
 
         headers = self._resolve_headers(cfg)
@@ -237,6 +256,7 @@ class ProviderHealthChecker:
                         latency_ms=round(latency, 1),
                         checked_at=datetime.now(UTC).isoformat(),
                         _models=frozenset(models),
+                        can_affect_breaker=can_affect_breaker,
                     )
                 if resp.status == 429:
                     return ProviderProbeResult(
@@ -245,6 +265,7 @@ class ProviderHealthChecker:
                         error="rate limited",
                         latency_ms=round(latency, 1),
                         checked_at=datetime.now(UTC).isoformat(),
+                        can_affect_breaker=can_affect_breaker,
                     )
                 return ProviderProbeResult(
                     provider_name=cfg.name,
@@ -252,6 +273,7 @@ class ProviderHealthChecker:
                     error=f"HTTP {resp.status} from {safe_url}",
                     latency_ms=round(latency, 1),
                     checked_at=datetime.now(UTC).isoformat(),
+                    can_affect_breaker=can_affect_breaker,
                 )
         except (aiohttp.ClientError, TimeoutError, OSError) as exc:
             latency = (time.monotonic() - start) * 1000
@@ -261,10 +283,11 @@ class ProviderHealthChecker:
                 error=f"{type(exc).__name__}: {safe_url}",
                 latency_ms=round(latency, 1),
                 checked_at=datetime.now(UTC).isoformat(),
+                can_affect_breaker=can_affect_breaker,
             )
 
-    def _resolve_url(self, cfg: ProviderConfig) -> str | None:
-        """Get the probe URL for a provider."""
+    def _resolve_endpoint(self, cfg: ProviderConfig) -> str | None:
+        """Resolve probe support independently of credential presence."""
         ptype = cfg.provider_type
 
         # Ollama has a different endpoint
@@ -276,22 +299,22 @@ class ProviderHealthChecker:
 
         # Providers with explicit base_url in config
         if cfg.base_url:
-            if ptype != "ollama" and not _resolve_api_key(ptype):
-                return None  # no API key configured, skip probe
             return f"{cfg.base_url.rstrip('/')}/models"
 
-        # Google uses query-param auth
-        if ptype == "google":
-            key = _resolve_api_key(ptype)
-            if not key:
-                return None
-            base = _PROVIDER_URLS["google"]
-            return f"{base}?key={key}"
+        return _PROVIDER_URLS.get(ptype)
 
-        # LiteLLM-managed providers — need API key to be worthwhile
-        url = _PROVIDER_URLS.get(ptype)
-        if url and not _resolve_api_key(ptype):
-            return None  # no key configured, skip
+    def _resolve_url(self, cfg: ProviderConfig) -> str | None:
+        """Get a supported probe URL when its required credentials exist."""
+        url = self._resolve_endpoint(cfg)
+        if not url or cfg.provider_type == "ollama":
+            return url
+        key = _resolve_api_key(cfg.provider_type)
+        if not key:
+            return None
+
+        # Google uses query-param auth
+        if cfg.provider_type == "google" and not cfg.base_url:
+            return f"{url}?key={key}"
         return url
 
     def _resolve_headers(self, cfg: ProviderConfig) -> dict[str, str]:

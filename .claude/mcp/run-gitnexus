@@ -6,7 +6,7 @@
 
 set -u
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GENESIS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PIN_FILE="$GENESIS_ROOT/scripts/lib/gitnexus_version.sh"
 

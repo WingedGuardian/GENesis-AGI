@@ -222,6 +222,34 @@ def is_authenticated() -> bool:
     return session.get("authenticated") is True
 
 
+def has_internal_bearer() -> bool:
+    """Is this request carrying the valid internal API bearer token?
+
+    Extracted rather than re-implemented at each gate: ``check_api_mutation_auth``
+    performs the same check inline, and two gates disagreeing about who counts as
+    a trusted machine caller is precisely the defect this exists to prevent — a
+    caller the mutation gate blesses being refused by a sibling gate on the same
+    request.
+
+    CSRF-immune by construction, which is why the mutation gate checks it FIRST
+    and origin-independently: an attacker in a browser cannot read a 0600 file to
+    forge the header. Never true when no token can be produced.
+    """
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        return False
+    expected = get_or_create_internal_api_token()
+    if not expected:
+        return False
+    # Compare BYTES, exactly as ``check_bearer_token`` above already does.
+    # ``compare_digest`` REFUSES non-ASCII str operands, and WSGI decodes
+    # headers as latin-1 — so any high byte in the header raised TypeError and
+    # surfaced as a 500 with a stack trace. Still fail-closed, but a spammable
+    # 500 where a 401 belongs, on the widest surface in the app.
+    presented = header[7:].encode("utf-8", "surrogateescape")
+    return hmac.compare_digest(presented, expected.encode("utf-8", "surrogateescape"))
+
+
 def has_verified_credential() -> bool:
     """Did this request PROVE who it is? Never true without a password set.
 
@@ -348,6 +376,15 @@ def _check_auth():
 # unsetting the dashboard password, if an unforeseen machine caller breaks.
 _API_AUTH_OFF = ("off", "0", "false", "no")
 
+
+def api_mutation_auth_disabled() -> bool:
+    """Has the operator switched the /api mutation gate off (``GENESIS_DASHBOARD_API_AUTH``)?
+
+    One reading for every gate that guards a mutation, so the escape hatch
+    reopens the same requests everywhere it is honoured.
+    """
+    return os.environ.get("GENESIS_DASHBOARD_API_AUTH", "on").strip().lower() in _API_AUTH_OFF
+
 # Genesis-OWNED API route prefixes the gate protects. Scoped deliberately: in Agent
 # Zero hosting mode the gate is installed on AZ's host-owned Flask app, so a broad
 # "/api/" match would also reject AZ's OWN native /api/* routes. Every Genesis
@@ -426,7 +463,7 @@ def check_api_mutation_auth():
     """
     if not get_dashboard_password():
         return None
-    if os.environ.get("GENESIS_DASHBOARD_API_AUTH", "on").strip().lower() in _API_AUTH_OFF:
+    if api_mutation_auth_disabled():
         return None
 
     path = request.path
@@ -440,13 +477,8 @@ def check_api_mutation_auth():
     # Trusted machine caller (internal bearer token) — CSRF-immune (an attacker
     # cannot read the 0600 token file), so it is checked FIRST and is
     # origin-independent.
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        expected = get_or_create_internal_api_token()
-        # Bytes, as in check_bearer_token: compare_digest raises on non-ASCII
-        # str, which turned a bad credential into a 500 (#2467).
-        if expected and bearer_matches(_presented_bearer_bytes(auth_header), expected):
-            return None
+    if has_internal_bearer():
+        return None
 
     # Trusted browser session (session cookie). A cookie is NOT proof of
     # same-origin intent (``SameSite=Lax`` still attaches it on a same-site sibling

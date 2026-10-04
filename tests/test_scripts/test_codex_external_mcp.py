@@ -151,7 +151,7 @@ def test_project_config_exposes_only_the_read_oriented_pilot_tools() -> None:
     root = Path(__file__).resolve().parents[2]
     config = tomllib.loads((root / ".codex" / "config.toml").read_text())
 
-    # No top-level keys at all. `mcp_optional_startup_grace_ms` was set here and
+    # Only supported top-level keys. `mcp_optional_startup_grace_ms` was set here and
     # is now GONE: it is not a recognised Codex configuration field — a 0.144
     # run under `--strict-config` refuses to start on it, and the 0.125 CLI
     # installed on this box has no `--strict-config` to refuse with — so it
@@ -159,7 +159,9 @@ def test_project_config_exposes_only_the_read_oriented_pilot_tools() -> None:
     # knob is per-server `startup_timeout_sec`, asserted below. Pinning the
     # ABSENCE keeps an unrecognised field from drifting back in as a plausible
     # fix for a startup race.
-    assert not [k for k in config if k != "mcp_servers"], (
+    # The local CLI review-budget adapter adds the documented hooks table; it
+    # does not expand the MCP tool surface. Unknown keys remain forbidden.
+    assert not [k for k in config if k not in {"mcp_servers", "hooks"}], (
         "an unrecognised top-level key can refuse to start a strict Codex run"
     )
 

@@ -1110,4 +1110,6 @@ jobs:
         # Human-reference integrity: 32 initial +49 first repair +11 atomic
         # publication =92 cases across three branch-new files, no added skips.
         # Floor: 24153 +92 =24245; skip ceiling remains 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24245
+        # NVIDIA provider health: new test_provider_health_probes.py collects
+        # 87 tests (0 -> 87); no added skips. Floor: 24245 + 87 = 24332.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24332
