@@ -177,3 +177,97 @@ async def test_find_projects_by_title_reads_every_page_and_skips_closed():
         },
     )
     assert [p["number"] for p in await pv.find_projects_by_title("me", "B", runner=run)] == [2]
+
+
+# ─── reconciler reads ───────────────────────────────────────────────────────
+
+
+async def test_repo_open_counts_reports_both_totals():
+    run = _runner(
+        {
+            "data": {
+                "repository": {
+                    "issues": {"totalCount": 662},
+                    "pullRequests": {"totalCount": 44},
+                }
+            }
+        }
+    )
+    assert await pv.repo_open_counts("o", "r", runner=run) == {"issues": 662, "pull_requests": 44}
+    assert run.calls[0]["variables"] == {"o": "o", "n": "r"}
+
+
+async def test_repo_open_counts_raises_for_a_missing_repo():
+    with pytest.raises(pv.ProjectsError):
+        await pv.repo_open_counts("o", "r", runner=_runner({"data": {"repository": None}}))
+
+
+def _card_node(**over):
+    node = {
+        "__typename": "Issue",
+        "number": 1,
+        "state": "OPEN",
+        "projectItems": {
+            "totalCount": 1,
+            "nodes": [
+                {
+                    "project": {"number": 2, "owner": {"login": "o"}},
+                    "status": {"name": "In Review", "updatedAt": "2026-10-04T05:12:52Z"},
+                }
+            ],
+        },
+        "blockedBy": {
+            "totalCount": 1,
+            "nodes": [{"number": 2, "state": "OPEN", "repository": {"nameWithOwner": "o/r"}}],
+        },
+    }
+    node.update(over)
+    return {"data": {"repository": {"issueOrPullRequest": node}}}
+
+
+async def test_card_for_issue_shape():
+    card = await pv.card_for_issue("o", "r", 1, runner=_runner(_card_node()))
+    assert card["kind"] == "Issue" and card["state"] == "OPEN"
+    assert card["cards"] == [
+        {
+            "project_owner": "o",
+            "project_number": 2,
+            "status": "In Review",
+            "status_updated_at": "2026-10-04T05:12:52Z",
+        }
+    ]
+    assert card["cards_truncated"] is False
+    assert card["blocked_by"] == [{"number": 2, "state": "OPEN", "repo": "o/r"}]
+    assert card["blocked_by_total"] == 1 and card["blockers_truncated"] is False
+
+
+async def test_card_for_issue_flags_truncated_lists_rather_than_hiding_them():
+    node = _card_node(
+        blockedBy={
+            "totalCount": 25,
+            "nodes": [
+                {"number": i, "state": "OPEN", "repository": {"nameWithOwner": "o/r"}}
+                for i in range(20)
+            ],
+        },
+        projectItems={"totalCount": 11, "nodes": [{"project": {"number": 2}, "status": None}] * 10},
+    )
+    card = await pv.card_for_issue("o", "r", 1, runner=_runner(node))
+    assert card["blocked_by_total"] == 25 and card["blockers_truncated"] is True
+    assert card["cards_truncated"] is True
+    assert card["cards"][0]["status"] is None
+
+
+async def test_card_for_a_pull_request_has_no_blockers_field():
+    node = _card_node(__typename="PullRequest")
+    node["data"]["repository"]["issueOrPullRequest"].pop("blockedBy")
+    card = await pv.card_for_issue("o", "r", 1, runner=_runner(node))
+    assert card["kind"] == "PullRequest"
+    assert card["blocked_by"] == [] and card["blocked_by_total"] == 0
+
+
+async def test_card_for_issue_raises_when_the_number_does_not_exist():
+    with pytest.raises(pv.ProjectsError):
+        await pv.card_for_issue(
+            "o", "r", 9, runner=_runner({"data": {"repository": {"issueOrPullRequest": None}}})
+        )
