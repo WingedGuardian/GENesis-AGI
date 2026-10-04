@@ -41,6 +41,7 @@
 # tell "lock held / host-frozen — keep the marker" apart from a real success).
 #
 # Env overrides:
+#   CODE_INTEL_WORKLOAD_SLICE     default 0; 1 requires genesis-workload.slice
 #   CODE_INTEL_INDEX_MEMORY_MAX   legacy override for both tools
 #   CODE_INTEL_CBM_WORKER_BINARY  opt-in absolute pinned v0.11 worker executable
 #   CODE_INTEL_CBM_MEMORY_MAX     default 4G     (requested CBM batch ceiling)
@@ -72,6 +73,17 @@ if [ "${1:-}" = "--exec-indexer-with-oom-adj" ]; then
         printf '%s\n' \
             "code-intel: CODE_INTEL_INDEX_OOM_SCORE_ADJ requires 1000; refusing unsafe batch workload" >&2
         exit 125
+    fi
+    if [ "${CODE_INTEL_CHILD_REQUIRE_WORKLOAD_SLICE:-0}" = "1" ]; then
+        if [ ! -x /usr/bin/python3 ] \
+            || ! /usr/bin/python3 -I "${BASH_SOURCE[0]%/*}/code_intel_cbm_admission.py" \
+                --verify-workload-boundary "${CODE_INTEL_CHILD_SCOPE_UNIT:-}"; then
+            if [ -n "${CODE_INTEL_CHILD_REFUSAL_MARKER:-}" ]; then
+                printf '%s\n' refused > "$CODE_INTEL_CHILD_REFUSAL_MARKER" 2>/dev/null || true
+            fi
+            printf '%s\n' "code-intel: refusing batch without proven workload routing" >&2
+            exit 125
+        fi
     fi
     if [ -n "${CODE_INTEL_CHILD_CAP_BYTES:-}" ]; then
         if [ ! -x /usr/bin/python3 ] \
@@ -109,6 +121,15 @@ if [ "${1:-}" = "--exec-indexer-with-oom-adj" ]; then
             "code-intel: cannot establish oom_score_adj=1000 (read back '${_oom_adj_actual:-unavailable}'); refusing batch workload" >&2
         exit 125
     fi
+    # Opt-in routing starts with a refusal marker. Only a validated child may
+    # clear it, so manager failures before child startup cannot charge a job.
+    if [ "${CODE_INTEL_CHILD_REQUIRE_WORKLOAD_SLICE:-0}" = "1" ] \
+        && [ -n "${CODE_INTEL_CHILD_REFUSAL_MARKER:-}" ]; then
+        if ! { : > "$CODE_INTEL_CHILD_REFUSAL_MARKER"; } 2>/dev/null; then
+            printf '%s\n' "code-intel: cannot acknowledge validated workload startup" >&2
+            exit 125
+        fi
+    fi
     exec "$@"
 fi
 
@@ -140,6 +161,11 @@ fi
 REPO_PATH="${1:-}"
 TOOLS="${2:-both}"
 MODE="${3:-${CODE_INTEL_INDEX_MODE:-fast}}"
+WORKLOAD_SLICE="${CODE_INTEL_WORKLOAD_SLICE:-0}"
+case "$WORKLOAD_SLICE" in 0|1) ;; *)
+    printf '%s\n' "code-intel: CODE_INTEL_WORKLOAD_SLICE must be 0 or 1" >&2
+    exit 125 ;;
+esac
 
 _LEGACY_MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-}"
 # Four GiB is the provisional batch ceiling. The bounded child checks actual
@@ -621,6 +647,7 @@ _CBM_SCOPE_OK=0
 _probe_scope() {
     local -a slice_args=()
     [ "$2" = "cbm" ] && slice_args=(--slice-inherit)
+    [ "$WORKLOAD_SLICE" = "1" ] && slice_args=(--slice=genesis-workload.slice)
     /usr/bin/systemd-run --user --scope "${slice_args[@]}" --quiet \
         -p "MemoryMax=$1" -p "MemorySwapMax=0" \
         -p "IOWeight=${IO_WEIGHT}" -p "CPUQuota=${CPU_QUOTA}" \
@@ -639,6 +666,7 @@ _run_capped() {
     if [ "$_SCOPE_OK" = "1" ]; then
         local -a slice_args=()
         [ "${_CI_SCOPE_INHERIT:-0}" = "1" ] && slice_args=(--slice-inherit)
+        [ "$WORKLOAD_SLICE" = "1" ] && slice_args=(--slice=genesis-workload.slice)
         # _CI_SCOPE_UNIT (set by _run_with_watchdog) gives the scope a
         # deterministic name so the watchdog can freeze/thaw/stop it by unit.
         /usr/bin/systemd-run --user --scope "${slice_args[@]}" --quiet \
@@ -647,6 +675,7 @@ _run_capped() {
             -p "IOWeight=${IO_WEIGHT}" -p "CPUQuota=${CPU_QUOTA}" \
             --description "code-intel index: $REPO_PATH" \
             -- /usr/bin/env \
+                "CODE_INTEL_CHILD_REQUIRE_WORKLOAD_SLICE=$WORKLOAD_SLICE" \
                 "CODE_INTEL_CHILD_CAP_BYTES=${CODE_INTEL_CHILD_ADMIT_CAP_BYTES:-}" \
                 "CODE_INTEL_CHILD_RESERVE_BYTES=$CODE_INTEL_SIBLING_RESERVE_BYTES" \
                 "CODE_INTEL_CHILD_SCOPE_UNIT=${_CI_SCOPE_UNIT:-}" \
@@ -744,6 +773,13 @@ _run_with_watchdog() {
     local scope_inherit=0
     [ "$label" = "cbm" ] && _SCOPE_OK="$_CBM_SCOPE_OK"
     [ "$label" = "cbm" ] && scope_inherit=1
+    if [ "$WORKLOAD_SLICE" = "1" ] && [ "$_SCOPE_OK" != "1" ]; then
+        if [ -n "${CODE_INTEL_CHILD_REFUSAL_MARKER:-}" ]; then
+            printf '%s\n' refused > "$CODE_INTEL_CHILD_REFUSAL_MARKER" 2>/dev/null || true
+        fi
+        _log "refusing $label: requested workload routing is unavailable"
+        return 125
+    fi
     if [ "$_SCOPE_OK" = "1" ]; then
         local unit; unit="code-intel-$(printf '%s' "$REPO_PATH" | sha1sum | cut -c1-12)-${label}-$$"
         _CI_SCOPE_UNIT="$unit" _CI_SCOPE_INHERIT="$scope_inherit" _run_capped "$@" &
@@ -821,6 +857,12 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
             # .codebase-memory/graph.db.zst artifact so a wiped cache restores from it
             # instead of a full 0->100 re-index.
             _cbm_refusal_marker="$(mktemp "$LOCK_DIR/cbm-admission.XXXXXXXX" 2>/dev/null)"
+            if [ -n "$_cbm_refusal_marker" ] && [ "$WORKLOAD_SLICE" = "1" ]; then
+                if ! printf '%s\n' refused > "$_cbm_refusal_marker"; then
+                    rm -f "$_cbm_refusal_marker"
+                    _cbm_refusal_marker=""
+                fi
+            fi
             if [ -z "$_cbm_refusal_marker" ]; then
                 _log "SKIP cbm: cannot create admission outcome marker"
                 MISSING="${MISSING:+$MISSING }cbm"
@@ -879,6 +921,26 @@ if [ "$TOOLS" = "gitnexus" ] || [ "$TOOLS" = "both" ]; then
             _log "SKIP gitnexus: $GITNEXUS_MEM_REFUSE"
             _log "      raise CODE_INTEL_GITNEXUS_MEMORY_MAX / lower CODE_INTEL_SIBLING_RESERVE_BYTES to override"
             MISSING="${MISSING:+$MISSING }gitnexus"
+        elif [ "$WORKLOAD_SLICE" = "1" ]; then
+            _gn_refusal_marker="$(mktemp "$LOCK_DIR/gn-routing.XXXXXXXX" 2>/dev/null)"
+            if [ -z "$_gn_refusal_marker" ] \
+                || ! printf '%s\n' refused > "$_gn_refusal_marker"; then
+                [ -n "$_gn_refusal_marker" ] && rm -f "$_gn_refusal_marker"
+                _log "SKIP gitnexus: cannot create routing outcome marker"
+                MISSING="${MISSING:+$MISSING }gitnexus"
+            else
+                _gn_previous_rc="$RC"
+                ( cd "$REPO_PATH" && MEM_MAX="$GITNEXUS_MEM_MAX" \
+                    CODE_INTEL_CHILD_REFUSAL_MARKER="$_gn_refusal_marker" \
+                    _run_with_watchdog gitnexus "$_GN" analyze ) \
+                    && GN_RAN=1 || _leg_failed
+                if [ -s "$_gn_refusal_marker" ]; then
+                    _log "SKIP gitnexus: workload routing refused before execution"
+                    MISSING="${MISSING:+$MISSING }gitnexus"
+                    RC="$_gn_previous_rc"
+                fi
+                rm -f "$_gn_refusal_marker"
+            fi
         else
             ( cd "$REPO_PATH" && MEM_MAX="$GITNEXUS_MEM_MAX" _run_with_watchdog gitnexus "$_GN" analyze ) \
                 && GN_RAN=1 || _leg_failed

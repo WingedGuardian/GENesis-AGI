@@ -1,0 +1,28 @@
+# Work board — Genesis's front end over a GitHub Projects v2 board.
+#
+# Every board consumer re-reads the merged config (this file +
+# ~/.genesis/config/board.local.yaml) on EVERY call, so a
+# settings_update("board", {...}) or a hand edit takes effect at the next
+# reconcile tick or promotion (no restart).
+#
+# Master switch: false forces `off` everywhere. settings_update may set it
+# false but never true: re-enabling is an owner edit of the overlay.
+enabled: true
+
+# Mode: off | propose_only | live
+#   off          — (default, shipped) the board does nothing: no reconcile, no
+#                  promotion. A fresh clone has no board until its owner sets
+#                  one up.
+#   propose_only — the board is READ: the reconciler reads the project and
+#                  computes state, promotion holds proposals for approval, but
+#                  nothing is written to GitHub.
+#   live         — the reconciler and approved promotions may write to GitHub.
+#                  OVERLAY-ONLY: settings_update() and the dashboard reject
+#                  `live`, so a model can never arm public-repo writes for
+#                  itself. The owner sets it in ~/.genesis/config/board.local.yaml.
+#
+# An INVALID mode degrades to propose_only (reads on, writes off) — never a
+# silent `live`. Kill switch (separate lever): GENESIS_BOARD_DISABLED=1 forces
+# `off` regardless of this file. The open-question tools are not gated by this
+# lever: they write only local rows.
+mode: "off"

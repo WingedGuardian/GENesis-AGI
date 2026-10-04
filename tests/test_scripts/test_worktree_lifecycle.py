@@ -24,6 +24,7 @@ import errno
 import importlib.util
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -3895,3 +3896,44 @@ def test_the_reattach_preview_names_the_snapshot_only_when_there_is_one(
     _recover_main(monkeypatch, reaper_repo.repo, tmp_path)
     said = "".join(capsys.readouterr())
     assert ("is the reaper's snapshot" in said) is written, said
+
+
+def _archive_unmerged(reaper_repo, tmp_path, monkeypatch, *, compress: bool = False) -> Path:
+    """Archive `wt_branch_merged` as it stands, on the unmerged lane (main() puts a
+    dirty worktree there); uncompressed by default so the entry can be edited."""
+    if not compress:
+        _disable_compression(monkeypatch)
+    trash = tmp_path / "trash"
+    trash.mkdir(exist_ok=True)
+    monkeypatch.setattr(wl, "TRASH_DIR", trash)
+    monkeypatch.setattr(wl, "LOG_DIR", trash / "logs")
+    wt = reaper_repo.wt_branch_merged
+    assert wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo,
+                              lane="unmerged") is True
+    return wt
+
+
+@pytest.mark.parametrize("compress", [True, False], ids=["archive", "directory"])
+def test_a_recreate_restores_a_nested_trash_meta_json(
+    reaper_repo, tmp_path, monkeypatch, capsys, compress,
+):
+    """#2776: only the reaper's own `.trash_meta.json` sits at the tree's root. A
+    worktree's file of that name in a subdirectory was skipped by the recreate
+    copy, and by both preview walks, at any depth."""
+    wt = reaper_repo.wt_branch_merged
+    (wt / "sub").mkdir()
+    (wt / "sub" / ".trash_meta.json").write_text("NESTED\n")
+    _archive_unmerged(reaper_repo, tmp_path, monkeypatch, compress=compress)
+    _drop_registration(reaper_repo.repo, wt)
+    capsys.readouterr()
+    assert _recover_main(monkeypatch, reaper_repo.repo, tmp_path, dry_run=True) == 0
+    preview = capsys.readouterr().out
+    # Exit 2: an untracked-only archive still reports possibly lost edits on a
+    # recreate (the safe over-report tracked in #2779); the file must come back.
+    assert _recover_main(monkeypatch, reaper_repo.repo, tmp_path) == 2
+    out = capsys.readouterr().out
+    assert (wt / "sub" / ".trash_meta.json").read_text() == "NESTED\n"
+    assert not (wt / ".trash_meta.json").exists(), "the reaper's own metadata stays out"
+    restored = re.search(r"Restored (\d+) untracked file", out)
+    previewed = re.search(r"WOULD RESTORE (\d+) untracked file", preview)
+    assert restored and previewed and restored.group(1) == previewed.group(1), (preview, out)

@@ -1173,7 +1173,7 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         CC_BIN_DIR="$CC_BIN_DIR:$_cc_prefix/bin"
     fi
 
-    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
+    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template "$SYSTEMD_TEMPLATE_DIR"/*.slice.template; do
         [[ -f "$template" ]] || continue
         svc_name=$(basename "$template" .template)
 

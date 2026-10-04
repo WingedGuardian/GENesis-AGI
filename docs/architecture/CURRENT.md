@@ -343,7 +343,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: b0867170e 2026-10-02
+verified: 691a10d44 2026-10-03
 ```
 
 - **Replay-unsafe CC outcomes do not enter full-tools recovery, failover or
@@ -3167,7 +3167,12 @@ verified: b0867170e 2026-10-02
   state) + `oomd_user_slice_kill` (config-plane scan of user.slice.d drop-ins,
   laid down by `scripts/lib/memory_resilience.sh` from install/bootstrap/update) and
   host-plane `swap_total_kb`, so the annotation layer flags unprotected
-  installs (see docs/reference/memory-resilience.md). Network-resilience
+  installs (see docs/reference/memory-resilience.md). Default-disabled
+  `CODE_INTEL_WORKLOAD_SLICE=1` routes only indexing batch scopes into the dormant
+  `genesis-workload.slice`; both launch paths verify actual scope membership before
+  execution and retain refusal outcomes. This does not replace broad OOM monitors
+  or certify core/recovery exclusion (see docs/reference/index-workload-routing.md).
+  Network-resilience
   invariants are first-class too: container `networkd_keep_configuration` +
   `network_watchdog_installed` (any-link/file-present facts for the annotation
   layer) alongside the posture check's *effective* variants
@@ -3354,6 +3359,89 @@ verified: 4cc75d50 2026-08-05
   no writer yet and the card/gate/dispatch flow is NOT built. `reflex_verdicts`
   is now live (manual dismissals, PR-2c); its diagnose/fix/promotion verdict
   points remain groundwork.
+
+## 15. Work board — Projects v2 front end and open questions
+
+The work board lives on a GitHub Projects v2 board: GitHub owns the cards,
+columns, positions and dependencies (native `blockedBy` / sub-issues), and
+Genesis mirrors none of them. Genesis keeps three local stores and the glue
+around them. **What exists today:** the stores, the `board` mode lever, and the
+open-question tools. The Projects v2 adapter, promotion onto the board and the
+reconciler are follow-on work. Nothing writes to GitHub yet, and the shipped
+mode is `off`.
+
+```yaml subsystem-map
+entry: work-board
+modules: [board]
+verified: b67423bd 2026-10-03
+```
+
+- **Stores** (`db/crud/board.py`; New-Store justification and retention in
+  migration `20261003010926_board_stores`):
+  - `board_links` — private ledger row / follow-up -> public issue, written
+    only once the issue exists, with the promotion audit (who approved it, the
+    privacy-scan receipt, the hash of the body that was scanned);
+  - `open_questions` + `open_question_blocks` — local-only owner decisions
+    and the work each one blocks (an edge, not a list entry);
+  - `board_events` — the append-only event log.
+  Each vocabulary is enforced in the CRUD module; `board_events.event` has no
+  CHECK because SQLite cannot alter one. A partial UNIQUE index on
+  `(event, observed_change_key)` dedups a re-read GitHub change.
+- **Mode lever** `board/config.py` (`off | propose_only | live`, re-read per
+  call; overlay `~/.genesis/config/board.local.yaml`; kill switch
+  `GENESIS_BOARD_DISABLED=1`). An invalid value degrades to `propose_only`:
+  reads stay on and writes stay off. `writes_allowed()` is the one predicate a
+  GitHub writer checks. `live` is OVERLAY-ONLY: the settings validator rejects
+  it (the `marketing_outreach` precedent), and it rejects `enabled: true`
+  too (that would re-arm a live overlay the owner paused), so a session can
+  only turn the board down, never arm it. The master `enabled` fails closed
+  unless it is the literal `true`. Nothing reads the lever yet: board
+  promotion is its first consumer (`GROUNDWORK(board-promotion)` tags mark the
+  entry points waiting on it).
+- **Open questions** (`mcp/health/open_question_tools.py`: `open_question_raise`,
+  `_resolve`, `_block`, `_list`) — never gated by the board mode, because they
+  write only local rows. A target id prefix must resolve uniquely against its
+  own table. Every target is validated first. Every WRITE (raise, resolve,
+  block add/remove) runs on a connection the tool owns, never the server's
+  shared one, because the health MCP middleware rolls the shared connection
+  back after any failed tool call and could discard or split a write already
+  reported saved. Each write is one `BEGIN IMMEDIATE` transaction (a raise:
+  the question and all its blocks, or nothing). Only taking the lock is
+  retried, so a write is never repeated; a lock reported after a durable WAL
+  commit counts as committed; the read-back runs after the commit and a failed
+  one is reported as "saved, not read back". A close is guarded on the
+  observed status, so a second answer never overwrites the first, and a closed
+  question's edges are history (not removable). Resolving and removing a block
+  are owner authority: in `_UNIVERSAL_DISALLOW` for every background profile
+  (overlay profiles included) and refused server-side for a dispatched,
+  unsupervised session (`guard_human_gate`). Listing is denied on the
+  external-ingesting profiles, and raising on the untrusted-inbound perimeter
+  and on read-only `observe`.
+  `open_question_list` pages (50 default, 200 max, `next_offset`), its
+  per-target blocker answer included. Removing an edge accepts a full id even
+  when the ledger row or follow-up behind it has since been purged. Card targets
+  and stored repo names are lowercased, because GitHub names are
+  case-insensitive. A test pins that the module has no GitHub or subprocess
+  path. `open_question_list` is on the reflection read allowlist.
+  **A block is ADVISORY today:** nothing refuses on one until board promotion
+  lands. The morning report's ground-truth section counts unverified questions
+  (count and oldest age only, never the text); that line is the push surface
+  that keeps a parked question from being a silent drop.
+- **Retention:** `scripts/prune_board.py` on the disk-hygiene timer prunes
+  closed questions (and their edges) after 90 d and events after 180 d.
+  Unverified questions and promotion pointers are never pruned.
+- **Do not:** write any card, column or status into a local table (the spec
+  allows exactly these three stores), or make Genesis move a card into
+  In Progress (only a human starts work).
+- **Measured facts the follow-on PRs depend on** (2026-10-03, private sandbox
+  project):
+  - on this account, issue timelines carry NO `ProjectV2ItemStatusChangedEvent`,
+    for UI drags or API writes alike. Change detection therefore keys on the
+    Status value's `updatedAt`, which is why the event log stores an
+    `observed_change_key`;
+  - a new user project gets a default workflow, "Pull request linked to issue",
+    that sets Status to In Progress on its own, and setup must delete it;
+  - project reads lag writes briefly.
 
 ---
 

@@ -995,7 +995,7 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         source "$SCRIPT_DIR/lib/falkordb_install.sh"
     fi
 
-    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
+    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template "$SYSTEMD_TEMPLATE_DIR"/*.slice.template; do
         [ -f "$template" ] || continue
         svc_name=$(basename "$template" .template)
 

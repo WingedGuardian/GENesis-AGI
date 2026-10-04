@@ -1,0 +1,7 @@
+[Unit]
+Description=Genesis explicitly owned indexing batches
+
+[Slice]
+MemoryAccounting=yes
+# Dormant preparation only; broad ancestor monitoring can still select jobs.
+ManagedOOMMemoryPressure=auto
