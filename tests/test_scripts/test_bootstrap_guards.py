@@ -730,7 +730,6 @@ def _crash_script(root: Path, home: Path, rollback_tag: str) -> str:
         f'HOME="{home}"\n'
         f'ROLLBACK_TAG="{rollback_tag}"\n'
         + _block(BOOTSTRAP, "crash-recovery-reset")
-        + 'echo "REFUSED=${_RECOVERY_RESET_REFUSED:-0}"\n'
     )
 
 
@@ -771,17 +770,16 @@ def test_crash_recovery_saves_an_ephemeral_edit_before_the_head_reset(tmp_path):
 
 
 def test_crash_recovery_refuses_the_reset_when_a_backup_cannot_be_made(tmp_path):
-    """An unwritable backup dir with an edited ephemeral file: the recovery
-    reset is REFUSED so the edit survives — a recovery left undone is
-    recoverable, a lost edit is not."""
+    """An unwritable backup dir with an edited ephemeral file: bootstrap stops
+    nonzero instead of resetting — the crashed tree is left as it was and the
+    edit survives, so the next run can retry the save."""
     root, home = _crash_repo(tmp_path)
     (root / "AGENTS.md").write_text("local edits nobody saved\n")
     (home / ".genesis").mkdir()
     (home / ".genesis" / "premerge-backups").write_text("a file where the dir must go\n")
     head = _git(root, "rev-parse", "HEAD")
     r = _crash_run(_crash_script(root, home, "pre-update-tag"), home)
-    assert r.returncode == 0, r.stderr
-    assert "REFUSED=1" in r.stdout, r.stdout
+    assert r.returncode != 0, "a refused recovery must stop bootstrap"
     assert _git(root, "rev-parse", "HEAD") == head, "a refused reset must not move HEAD"
     assert (root / "AGENTS.md").read_text() == "local edits nobody saved\n"
 
@@ -828,3 +826,27 @@ def test_a_flagged_files_backup_is_current_only_while_the_bytes_match(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "CHECK1=CURRENT" in r.stdout, r.stdout
     assert "CHECK2=STALE" in r.stdout, r.stdout
+
+
+def test_a_clean_flagged_file_under_line_ending_conversion_is_not_dirty(tmp_path):
+    """core.autocrlf normalizes a CRLF worktree file to LF in the blob; a raw
+    hash would call the clean file dirty and could block recovery for nothing.
+    The flagged check hashes through the file's clean filters instead."""
+    root, home = _crash_repo(tmp_path)
+    _git(root, "config", "core.autocrlf", "true")
+    _git(root, "update-index", "--assume-unchanged", "AGENTS.md")
+    (root / "AGENTS.md").write_bytes(b"upstream copy\r\n")
+    script = (
+        "set -euo pipefail\n"
+        f'GENESIS_ROOT="{root}"\n'
+        f'. "{REPO_ROOT / "scripts" / "lib" / "deploy_marker.sh"}"\n'
+        f'. "{REPO_ROOT / "scripts" / "lib" / "deploy_checkout.sh"}"\n'
+        'if genesis_ephemeral_is_dirty "$GENESIS_ROOT" AGENTS.md; then\n'
+        '  echo DIRTY\n'
+        "else\n"
+        "  echo CLEAN\n"
+        "fi\n"
+    )
+    r = _crash_run(script, home)
+    assert r.returncode == 0, r.stderr
+    assert "CLEAN" in r.stdout, r.stdout

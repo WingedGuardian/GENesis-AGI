@@ -243,7 +243,9 @@ genesis_ephemeral_is_dirty() {
     case "$(git -C "$root" ls-files -v -- "$p" 2>/dev/null | cut -d' ' -f1)" in
         [a-z]|S)
             [ -e "$root/$p" ] || return 1
-            [ "$(git -C "$root" hash-object "$root/$p" 2>/dev/null)" \
+            # --path applies the file's clean filters (line endings, ident),
+            # or a CRLF worktree would read dirty against its LF blob.
+            [ "$(git -C "$root" hash-object --path="$p" --stdin < "$root/$p" 2>/dev/null)" \
                 != "$(git -C "$root" rev-parse -q --verify "HEAD:$p" 2>/dev/null)" ] ;;
         *) return 1 ;;
     esac

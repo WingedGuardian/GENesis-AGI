@@ -89,17 +89,16 @@ if [ -f "$UPDATE_STATE" ]; then
                 git -C "$GENESIS_ROOT" reset --hard HEAD 2>&1 || true
             fi
         else
-            _RECOVERY_RESET_REFUSED=1
+            # Continuing would install the crashed tree and mark setup complete
+            # over an unrecovered update; stop instead — the state file and the
+            # unsaved edit are kept, so the next bootstrap retries the save.
             echo "  Refusing the recovery reset: an ephemeral edit could not be backed up (above)."
             echo "  The tree is left as the crashed update left it — fix the backup failure and"
             echo "  rerun bootstrap. update_state.json is kept, so the next run retries."
+            exit 1
         fi
 # END crash-recovery-reset
 
-        if [ -n "${_RECOVERY_RESET_REFUSED:-}" ]; then
-            echo "  Crash recovery stopped before the reset — nothing was rolled back or discarded."
-            echo ""
-        else
         # Record crash recovery
         echo "  Recording crash recovery in update_history..."
         DB_PATH="$GENESIS_ROOT/data/genesis.db"
@@ -131,7 +130,6 @@ except Exception as e:
         rm -f "$HOME/.genesis/update_in_progress.pid"
         echo "  Crash recovery complete. Continuing bootstrap with rolled-back code."
         echo ""
-        fi
     fi
 fi
 
