@@ -33,12 +33,13 @@ from urllib.parse import urlsplit
 
 from genesis.cc import roster
 from genesis.cc.types import VALID_MODEL_NAMES
+from genesis.util.atomic import atomic_write_text
 
 ROUTES = ("subscription", "api", "openrouter")
 #: What each route bills against. Auto prefers the routes in ROUTES order, so a
 #: per-token route is only ever reached after a subscription candidate was
 #: skipped — and the launcher must say why (see SelectedRoute.skipped).
-BILLING = {"subscription": "subscription quota", "api": "per-token", "openrouter": "per-token"}
+COST_BASIS = {"subscription": "subscription quota", "api": "per-token", "openrouter": "per-token"}
 PROVIDER_SELECTORS = (
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_MANTLE",
@@ -92,8 +93,8 @@ class SelectedRoute:
     skipped: tuple[str, ...] = ()
 
     @property
-    def billing(self) -> str:
-        return BILLING[self.route]
+    def cost_basis(self) -> str:
+        return COST_BASIS[self.route]
 
 
 def catalog(roster_data: dict) -> dict:
@@ -298,12 +299,10 @@ def write_route_settings(document: Mapping, directory: Path | None = None) -> Pa
                 and not stat.S_IMODE(existing.st_mode) & 0o077
                 and path.read_text(encoding="utf-8") == payload):
             return path
-        tmp = directory / f".{path.name}.{os.getpid()}.tmp"
-        tmp.unlink(missing_ok=True)
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-        os.replace(tmp, path)
+        # The shared helper: mkstemp creates the temp 0600 with O_EXCL (never
+        # through a link), it is fsynced, replaced atomically, and unlinked on
+        # any failure.
+        atomic_write_text(path, payload)
     except OSError:
         # No path to fall back to: launching without the pins is the unpinned
         # session this file exists to prevent.

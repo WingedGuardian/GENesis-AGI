@@ -246,7 +246,7 @@ def main(argv: list[str]) -> int:
 
     if selected:
         target = selected.anthropic_base_url
-        notice = (f"{name} · route={selected.route} ({selected.billing}) · {target} · key={selected.auth_env} "
+        notice = (f"{name} · route={selected.route} ({selected.cost_basis}) · {target} · key={selected.auth_env} "
                   f"· model={selected.model_id} · context={selected.context_tokens} (configured, unverified)")
         print(f"gmodel: {notice}", file=sys.stderr)
         if selected.skipped:
