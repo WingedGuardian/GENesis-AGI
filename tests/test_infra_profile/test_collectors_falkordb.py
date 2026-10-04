@@ -77,6 +77,48 @@ def test_the_posture_rule_reads_the_keys_this_collector_emits(monkeypatch, tmp_p
     )
 
 
+def test_the_collector_records_the_selected_graphstore_mode(monkeypatch, tmp_path):
+    """The lever is what makes reads depend on the engine, so the posture rule
+    needs it — and it must be the lever's OWN answer (effective_mode), the one
+    the read path uses, not a re-parse of the yaml."""
+    from genesis.memory import graphstore_config
+
+    monkeypatch.setattr(graphstore_config, "effective_mode", lambda: "falkordb")
+    assert _run(monkeypatch, tmp_path).facts["graphstore_mode"] == "falkordb"
+    monkeypatch.setattr(graphstore_config, "effective_mode", lambda: "networkx")
+    assert _run(monkeypatch, tmp_path).facts["graphstore_mode"] == "networkx"
+
+
+def test_a_raising_lever_degrades_the_section(monkeypatch, tmp_path):
+    """If effective_mode RAISES, there is no answer to record: a guess would flip
+    a hashed fact and could clear an armed engine's alert, so the section fails
+    and the previous facts are retained. (A corrupt config does NOT raise:
+    effective_mode absorbs it into networkx, which is what reads then use, and
+    that is what gets recorded.)"""
+    from genesis.memory import graphstore_config
+
+    def _boom():
+        raise RuntimeError("simulated")
+
+    monkeypatch.setattr(graphstore_config, "effective_mode", _boom)
+    assert _run(monkeypatch, tmp_path).status != "ok"
+
+
+def test_a_selected_engine_that_failed_reaches_the_rule(monkeypatch, tmp_path):
+    """Start-only (disabled) and failed, with the lever selecting the engine:
+    wire the REAL collector output into the REAL rule."""
+    from genesis.memory import graphstore_config
+
+    monkeypatch.setattr(graphstore_config, "effective_mode", lambda: "falkordb")
+    proc = _StubProc(stdout=b"failed\ndisabled\n", returncode=0)
+    _with_unit(monkeypatch, tmp_path, proc)
+    result = asyncio.run(collect_falkordb())
+    section = {"status": "ok", "facts": result.facts, "metrics": dict(result.metrics)}
+
+    found = _loop._infra_missing_protections({"sections": {"falkordb": section}})
+    assert "falkordb_unit_failed" in found
+
+
 def test_only_a_unix_socket_counts_as_the_socket(monkeypatch, tmp_path):
     """A regular file or directory left at the socket path refuses every client
     exactly as an absent socket does, so it must not silence the posture rule."""
@@ -96,10 +138,25 @@ def test_only_a_unix_socket_counts_as_a_user_bus(monkeypatch, tmp_path):
     """Same rule for the bus probe: a stray file named `bus` is no user manager."""
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     (tmp_path / "bus").write_text("")
-    assert _probe.user_bus_present() is False
+    assert _probe.user_manager_present() is False
     (tmp_path / "bus").unlink()
     bind_unix_socket(tmp_path / "bus")
-    assert _probe.user_bus_present() is True
+    assert _probe.user_manager_present() is True
+
+
+def test_the_manager_private_socket_counts_without_a_session_bus(monkeypatch, tmp_path):
+    """systemctl --user reaches the manager over `$XDG_RUNTIME_DIR/systemd/private`
+    FIRST and falls back to the session bus (systemd v255, src/shared/bus-util.c,
+    bus_connect_user_systemd). A headless box can have the first and not the
+    second, and that box has a user manager."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    private = tmp_path / "systemd" / "private"
+    private.parent.mkdir()
+    private.write_text("")
+    assert _probe.user_manager_present() is False, "a stray file is no manager"
+    private.unlink()
+    bind_unix_socket(private)
+    assert _probe.user_manager_present() is True
 
 
 def test_a_version_dir_without_a_module_is_not_installed(tmp_path):

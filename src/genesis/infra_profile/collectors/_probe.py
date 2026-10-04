@@ -52,16 +52,26 @@ async def reap(proc: asyncio.subprocess.Process | None) -> None:
         logger.debug("infra_profile: could not reap %s", proc, exc_info=True)
 
 
-def user_bus_present() -> bool:
-    """Is there a user D-Bus session for `systemctl --user` to talk to?
+def user_manager_present() -> bool:
+    """Is there a user manager for `systemctl --user` to talk to?
 
-    Structural, not transient: a box without one never grows a bus between
+    Structural, not transient: a box without one never grows one between
     refreshes, so its unanswerable probe is a standing property rather than a
-    failure to report. Probing the socket beats matching systemctl's stderr
+    failure to report. Probing the sockets beats matching systemctl's stderr
     text, which is not a stable interface.
+
+    Checks the manager's PRIVATE socket first, then the session bus — the order
+    `systemctl --user` itself connects in (systemd v255, src/shared/bus-util.c,
+    `bus_connect_user_systemd`: `$XDG_RUNTIME_DIR/systemd/private`, falling back
+    to the bus). The session bus alone is not proof either way: a headless box
+    can have the manager's socket and no bus, and treating that as "no user
+    manager" turned a transient systemctl failure into recorded facts.
     """
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
     if not runtime_dir:
         return False
-    # is_socket, not exists: a stray file named `bus` is no user manager.
-    return Path(runtime_dir, "bus").is_socket()
+    # is_socket, not exists: a stray file at either path is no user manager.
+    return (
+        Path(runtime_dir, "systemd", "private").is_socket()
+        or Path(runtime_dir, "bus").is_socket()
+    )

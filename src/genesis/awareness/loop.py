@@ -540,6 +540,22 @@ _last_memory_integrity_alert_at: float = 0.0
 _last_memory_integrity_key: str = ""
 
 
+# Shared by every graph-engine posture text. Standing the engine down while the
+# lever still selects it is not safe: with `mode: falkordb` every traversal read
+# depends on it (each recall degrades to NetworkX with a warning) and
+# `probe_falkordb` reports it DOWN. So the lever moves back first.
+_FALKORDB_STAND_DOWN = (
+    "To stand it down instead, first set graphstore `mode: networkx` "
+    "(settings_update(\"graphstore\", {\"mode\": \"networkx\"}), or "
+    "~/.genesis/config/graphstore.local.yaml) — while `mode: falkordb` is "
+    "selected, memory-graph reads depend on the engine, every recall falls back "
+    "to NetworkX with a warning, and the health probe reports it DOWN — then "
+    "`systemctl --user disable --now genesis-falkordb`. This alert reads the "
+    "infrastructure profile, refreshed at boot and daily, so after either fix "
+    "take a refresh (`infrastructure_profile(refresh=true)`) and it clears at "
+    "the next hourly posture check"
+)
+
 # Human-readable defect + remediation per rule slug (alert content).
 _INFRA_POSTURE_DETAIL = {
     "container_swap_disabled": (
@@ -637,44 +653,72 @@ _INFRA_POSTURE_DETAIL = {
         "service healthy. The unit is Type=notify, so it reached readiness with the "
         "socket open — something removed it afterwards (usually the data dir "
         "~/.genesis/falkordb). `systemctl --user restart genesis-falkordb` "
-        "recreates it, or `systemctl --user disable --now genesis-falkordb` stands "
-        "it down — nothing depends on the engine yet, so standing it down is safe"
+        "recreates it. " + _FALKORDB_STAND_DOWN
     ),
     "falkordb_unit_failed": (
-        "the graph engine's unit (genesis-falkordb) is ENABLED but FAILED: it never "
-        "signalled readiness, so the start limiter gave up and no reader can "
-        "connect. Usually the module failed to load — check "
-        "`journalctl --user -u genesis-falkordb -n 30` for a load error (a module "
-        "without the execute bit, or a redis older than 8.0.0, both refuse at "
-        "startup; a redis built without systemd support never signals ready). "
-        "Re-run scripts/bootstrap.sh to re-provision, then "
-        "`systemctl --user reset-failed genesis-falkordb` and start it again, or "
-        "`systemctl --user disable --now genesis-falkordb` to stand it down — "
-        "nothing depends on the engine yet, so standing it down is safe"
+        "the graph engine's unit (genesis-falkordb) is ARMED (enabled, or selected "
+        "by graphstore `mode: falkordb`) but FAILED: it never signalled readiness, "
+        "so the start limiter gave up and no reader can connect. Usually the module "
+        "failed to load — check `journalctl --user -u genesis-falkordb -n 30` for a "
+        "load error (a module without the execute bit, or a redis older than "
+        "8.0.0, both refuse at startup; a redis built without systemd support "
+        "never signals ready). Re-run scripts/bootstrap.sh to re-provision, then "
+        "`systemctl --user reset-failed genesis-falkordb` and start it again. "
+        + _FALKORDB_STAND_DOWN
+    ),
+    "falkordb_selected_not_running": (
+        "graphstore `mode: falkordb` selects the graph engine, but nothing is "
+        "serving it: its unit (genesis-falkordb) is stopped, or absent with no "
+        "socket. A unit that was only STARTED (the documented path) does not come "
+        "back after a reboot. `systemctl --user start genesis-falkordb` brings it "
+        "back; `systemctl --user enable genesis-falkordb` makes it survive the "
+        "next reboot. " + _FALKORDB_STAND_DOWN
     ),
 }
 
-# UnitFileState values that mean an operator ARMED the graph engine. Anything
-# else (absent, disabled, static, masked) is the deliberate opt-out default.
-_FALKORDB_ARMED_STATES = frozenset({"enabled", "enabled-runtime"})
+# UnitFileState values that mean an operator ENABLED the graph engine.
+_FALKORDB_ENABLED_STATES = frozenset({"enabled", "enabled-runtime"})
+
+# Unit states that mean nothing is serving the engine. The transitional ones
+# (activating, deactivating, reloading) are deliberately absent: the profile is a
+# point-in-time sample, and a restart it happened to catch is not a posture.
+_FALKORDB_STOPPED_STATES = frozenset({"inactive", "failed"})
+
+
+def _falkordb_selected(facts: dict) -> bool:
+    """Does the graphstore lever SELECT the engine (reads depend on it)?
+
+    The lever, not the unit's enablement, is what makes reads depend on the
+    engine. The repo's own guidance arms it START-only
+    (`systemctl --user start genesis-falkordb`, in config/graphstore.yaml and
+    the settings tool's refusal text), so a selected engine is often a DISABLED
+    unit, and keying "armed" on enablement alone left exactly that engine
+    without an alert when it failed.
+    """
+    return facts.get("graphstore_mode") == "falkordb"
+
+
+def _falkordb_armed(facts: dict) -> bool:
+    """Selected by the lever, or enabled by an operator — either is intent."""
+    return (
+        _falkordb_selected(facts)
+        or facts.get("unit_enabled") in _FALKORDB_ENABLED_STATES
+    )
 
 
 def _falkordb_could_alert(section: dict) -> bool:
     """Whether this falkordb section's state could feed a posture rule.
 
-    Mirrors the two falkordb rules in _infra_missing_protections: an ACTIVE
-    unit (the socket rule) or an ARMED one (the failed rule). The collector
-    always records the unit name and socket path, so non-empty facts alone do
-    not mean an engine that was ever in play.
+    Mirrors the falkordb rules in _infra_missing_protections: an ACTIVE unit
+    (the socket rule) or an ARMED one (the failed and not-running rules). The
+    collector always records the unit name and socket path, so non-empty facts
+    alone do not mean an engine that was ever in play.
     """
     facts = section.get("facts")
     metrics = section.get("metrics")
     facts = facts if isinstance(facts, dict) else {}
     metrics = metrics if isinstance(metrics, dict) else {}
-    return (
-        facts.get("unit_enabled") in _FALKORDB_ARMED_STATES
-        or metrics.get("unit_active_state") == "active"
-    )
+    return _falkordb_armed(facts) or metrics.get("unit_active_state") == "active"
 
 
 def _infra_profile_age_days(profile: dict) -> float | None:
@@ -801,25 +845,30 @@ def _infra_missing_protections(profile: dict) -> list[str]:
             missing.append("cc_tmp_apply_blocked_on_cc")
         else:
             missing.append("cc_tmp_shared_fs")
-    # Graph engine. An absent, disabled or stopped unit is the deliberate
-    # default (nothing reads the engine yet), so it stays silent — alerting
-    # there would fire on every install that has simply not adopted it. Two
-    # states are wrong. Active-without-a-socket: systemd reports the service
-    # healthy while every reader would fail to connect. Armed-and-failed: the
-    # unit is Type=notify, so a module that will not load (or a redis that
-    # never signals readiness) never reaches `active` at all — it cycles
-    # through the start limiter into `failed`, and only the enablement fact
-    # tells that apart from an operator who simply never armed it. Explicit
-    # values only, per this function's contract.
+    # Graph engine. An unselected, disabled or stopped engine is the deliberate
+    # default (reads use the in-process NetworkX projection), so it stays
+    # silent — alerting there would fire on every install that has simply not
+    # adopted it. Three states are wrong. Active-without-a-socket: systemd
+    # reports the service healthy while every reader would fail to connect.
+    # Armed-and-failed: the unit is Type=notify, so a module that will not load
+    # (or a redis that never signals readiness) never reaches `active` at all —
+    # it cycles through the start limiter into `failed`. Selected-and-not-
+    # running: the lever routes reads to an engine nothing is serving — the
+    # state a START-only unit is in after any reboot, which never reaches
+    # `failed` and which enablement cannot see. Explicit values only, per this
+    # function's contract.
     falkordb = _metrics("falkordb")
+    falkordb_facts = _facts("falkordb")
     falkordb_state = falkordb.get("unit_active_state")
     if falkordb_state == "active" and falkordb.get("socket_present") is False:
         missing.append("falkordb_socket_missing")
-    elif (
-        falkordb_state == "failed"
-        and _facts("falkordb").get("unit_enabled") in _FALKORDB_ARMED_STATES
-    ):
+    elif falkordb_state == "failed" and _falkordb_armed(falkordb_facts):
         missing.append("falkordb_unit_failed")
+    elif _falkordb_selected(falkordb_facts) and (
+        falkordb_state in _FALKORDB_STOPPED_STATES
+        or (falkordb_state is None and falkordb.get("socket_present") is False)
+    ):
+        missing.append("falkordb_selected_not_running")
     return sorted(missing)
 
 

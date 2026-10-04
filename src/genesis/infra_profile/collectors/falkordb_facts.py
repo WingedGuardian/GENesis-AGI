@@ -25,7 +25,7 @@ from pathlib import Path
 from genesis.infra_profile.collectors._probe import (
     ProbeFailed,
     reap,
-    user_bus_present,
+    user_manager_present,
 )
 from genesis.infra_profile.types import SectionResult
 
@@ -121,13 +121,13 @@ async def _unit_states() -> tuple[str | None, str | None]:
         # could not be asked at all.
         #
         # Split by WHY, the same way `shutil.which` above splits absent from
-        # failed. A box with no user manager has no bus to reach, will not
+        # failed. A box with no user manager has nothing to reach, will not
         # grow one on the next refresh, and answering "no unit state" for it
         # is a fact. Erroring the section instead would be permanent, and
         # would discard four facts we DID read off the filesystem
         # (unit_present, module_installed, module_versions, socket_path)
         # because one sub-probe of the same section was unanswerable.
-        if not user_bus_present():
+        if not user_manager_present():
             return (None, None)
         logger.warning(
             "infra_profile: systemctl show %s exited %s", _UNIT, proc.returncode
@@ -138,6 +138,21 @@ async def _unit_states() -> tuple[str | None, str | None]:
     active = lines[0].strip() if len(lines) > 0 else ""
     enabled = lines[1].strip() if len(lines) > 1 else ""
     return (active or None, enabled or None)
+
+
+def _graphstore_mode() -> str:
+    """The graphstore lever's own answer — the store reads actually use.
+
+    Recorded because the lever, not the unit's enablement, is what makes reads
+    depend on the engine: the documented arming path is START-only, so a unit
+    reads depend on is often disabled. `effective_mode()` already absorbs an
+    unreadable config into its networkx default (the answer the read path
+    acts on); anything it RAISES propagates and fails the section, so the
+    previous facts are retained rather than a guess being hashed.
+    """
+    from genesis.memory.graphstore_config import effective_mode
+
+    return effective_mode()
 
 
 async def collect_falkordb() -> SectionResult:
@@ -152,6 +167,7 @@ async def collect_falkordb() -> SectionResult:
         unit_present = await asyncio.to_thread(unit_path.is_file)
 
         active, enabled = await _unit_states() if unit_present else (None, None)
+        mode = await asyncio.to_thread(_graphstore_mode)
 
         # The facts/metrics split follows types.py's contract literally, because
         # facts are HASHED and a hash change costs a drift observation plus an
@@ -160,12 +176,14 @@ async def collect_falkordb() -> SectionResult:
         # exactly the "states" the contract names on the metrics side. Putting
         # them in facts would bill a model call for every engine restart.
         #
-        # `unit_enabled` stays a FACT: it changes only when someone deliberately
-        # runs enable/disable, which is slow-changing configuration.
+        # `unit_enabled` and `graphstore_mode` stay FACTS: each changes only when
+        # someone deliberately runs enable/disable or moves the lever, which is
+        # slow-changing configuration.
         facts = {
             "unit": _UNIT,
             "unit_present": unit_present,
             "unit_enabled": enabled,
+            "graphstore_mode": mode,
             "module_versions": versions,
             "module_installed": bool(versions),
             "socket_path": str(socket_path),

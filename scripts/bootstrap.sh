@@ -1138,6 +1138,8 @@ if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
     falkordb_provision
 else
     echo "  WARNING: lib/falkordb_install.sh missing — skipping graph-engine provisioning"
+    # Nothing could be verified, so an existing unit must not be re-rendered.
+    falkordb_unit_keep_existing() { [[ -f "$1" ]]; }
 fi
 echo
 
@@ -1178,6 +1180,24 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
+        # The graph engine's unit only advances to a module that is verified on
+        # disk. Provisioning above returns 0 when it skips or fails, so without
+        # this a failed or unpinned provision would point a working unit at a
+        # missing .so, breaking the engine at its next restart.
+        if [[ "$svc_name" == "genesis-falkordb.service" ]] \
+            && falkordb_unit_keep_existing "$target"; then
+            # Keeping the unit does not keep its module: provisioning removes (or,
+            # failing that, de-executes) a cached module it cannot authenticate,
+            # which may be the very file this unit loads. Say which one this is.
+            _kept_module="$(falkordb_unit_loaded_module "$target" 2>/dev/null || true)"
+            if [[ -n "$_kept_module" && ! -x "$_kept_module" ]]; then
+                echo "  WARNING: kept $svc_name, but the module it loads is missing or not executable ($_kept_module):"
+                echo "           the engine will not start until bootstrap verifies a module."
+            else
+                echo "  Kept: $svc_name (FalkorDB module ${FALKORDB_VERSION:-unknown} not verified on disk; unit not re-rendered)"
+            fi
+            continue
+        fi
         # Escape every replacement for the `s|...|...|` grammar (`\`, `&`, `|`)
         # the same way install.sh's renderer does: a `&` in $HOME or a `|` in an
         # overridden FALKORDB_VERSION would corrupt the expression or make sed

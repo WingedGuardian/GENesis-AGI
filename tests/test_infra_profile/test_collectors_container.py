@@ -692,7 +692,7 @@ def _stub_cmd(monkeypatch, proc, *, present=True, bus=True, tmp_path=None):
     """Pin every outside edge: the binary, the spawn, and the user bus.
 
     `bus` is not optional decoration. `collect_systemd` asks
-    `user_bus_present()` before deciding a failure is real, and that reads
+    `user_manager_present()` before deciding a failure is real, and that reads
     `XDG_RUNTIME_DIR` -- so a test that leaves it alone passes or fails
     according to whether the developer happens to have a user session. That is
     the same sandbox leak the spawn stub guards against, one layer down.

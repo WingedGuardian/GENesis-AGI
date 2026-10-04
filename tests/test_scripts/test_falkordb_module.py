@@ -7,8 +7,11 @@ render wiring and quoting.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from tests.test_scripts.falkordb_stubs import (
     BOOTSTRAP,
@@ -214,6 +217,59 @@ def test_a_cached_module_is_rehashed_not_trusted(tmp_path):
     assert target.stat().st_mode & 0o111
 
 
+def test_a_cached_module_that_cannot_be_hashed_is_removed(tmp_path):
+    """No digest tool means the cached bytes cannot be authenticated — and the
+    unit loads them as native code on its next start. Fail closed like the
+    mismatch branch: remove them, never leave them loadable."""
+    env = _stage(tmp_path)
+    no_sha = Path(env["PATH"].split(":")[0]) / "sha256sum"
+    no_sha.write_text("#!/bin/bash\nexit 127\n")
+    no_sha.chmod(0o755)
+    target = Path(env["FALKORDB_DEPS_DIR"]) / "4.20.4" / "falkordb.so"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"pretend-module")
+    target.chmod(0o755)
+
+    result = _run(_pin_the_fake(tmp_path) + "falkordb_module_install", env)
+    assert result.returncode == 0, result.stderr
+    assert "cannot verify" in result.stdout
+    assert not target.exists(), "left an unauthenticated module loadable"
+    assert "already present" not in result.stdout
+
+
+def test_an_unremovable_unverified_module_loses_its_execute_bit(tmp_path):
+    """When the bytes cannot be removed, make them unloadable: redis refuses a
+    module without the execute bit. Covers both unauthenticated branches."""
+
+    ran = 0
+    for case in ("no-digest-tool", "digest-mismatch"):
+        case_dir = tmp_path / case
+        case_dir.mkdir()
+        env = _stage(case_dir)
+        if case == "no-digest-tool":
+            no_sha = Path(env["PATH"].split(":")[0]) / "sha256sum"
+            no_sha.write_text("#!/bin/bash\nexit 127\n")
+            no_sha.chmod(0o755)
+        target = Path(env["FALKORDB_DEPS_DIR"]) / "4.20.4" / "falkordb.so"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"substituted")
+        target.chmod(0o755)
+        target.parent.chmod(0o555)  # rm fails; the file itself stays ours
+        try:
+            if os.access(target.parent, os.W_OK):
+                continue  # running as root: the fixture cannot block rm here
+            result = _run(_pin_the_fake(case_dir) + "falkordb_module_install", env)
+            assert result.returncode == 0, result.stderr
+            assert target.exists(), f"{case}: fixture did not block removal"
+            assert not target.stat().st_mode & 0o111, f"{case}: left loadable"
+            assert "execute bit cleared" in result.stdout, case
+            ran += 1
+        finally:
+            target.parent.chmod(0o755)
+    if ran == 0:
+        pytest.skip("running as root: a read-only directory cannot block rm")
+
+
 def test_a_cached_mismatch_that_cannot_be_refetched_is_removed(tmp_path):
     env = _stage(tmp_path)
     env["FALKORDB_RELEASE_BASE"] = f"file://{tmp_path / 'nonexistent'}"
@@ -272,6 +328,134 @@ def test_bootstrap_sources_the_lib_and_substitutes_the_version():
     assert "lib/falkordb_install.sh" in text
     assert "falkordb_provision" in text
     assert "__FALKORDB_VERSION__" in text
+
+
+_RENDER_LOOP_HEAD = '    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template'
+
+
+def _bootstrap_render_loop() -> str:
+    """bootstrap.sh's REAL unit render loop, sliced out verbatim.
+
+    Running the loop itself rather than asserting on its text: the defect is in
+    what the loop WRITES, and a text assertion would pass for a guard placed
+    after the write.
+    """
+    lines = BOOTSTRAP.read_text().splitlines()
+    starts = [i for i, line in enumerate(lines) if line.startswith(_RENDER_LOOP_HEAD)]
+    assert len(starts) == 1, f"expected one render loop, found {len(starts)}"
+    start = starts[0]
+    end = next(i for i in range(start + 1, len(lines)) if lines[i] == "    done")
+    return "\n".join(lines[start : end + 1])
+
+
+def _render_falkordb_unit(tmp_path, env, prefix: str = ""):
+    templates = tmp_path / "templates"
+    templates.mkdir(exist_ok=True)
+    (templates / UNIT_TEMPLATE.name).write_text(UNIT_TEMPLATE.read_text())
+    user_dir = tmp_path / "units"
+    user_dir.mkdir(exist_ok=True)
+    script = (
+        f'set -euo pipefail; source "{LIB}"; {prefix}\n'
+        f'SYSTEMD_TEMPLATE_DIR="{templates}"; SYSTEMD_USER_DIR="{user_dir}"\n'
+        f'GENESIS_ROOT="{tmp_path / "repo"}"; CC_BIN_DIR=/usr/local/bin\n'
+        "SERVICES_UPDATED=0\n" + _bootstrap_render_loop() + "\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=60, env=env
+    )
+    return result, user_dir / "genesis-falkordb.service"
+
+
+def test_an_unverified_module_never_rewrites_a_working_unit(tmp_path):
+    """A failed or unpinned provision must not point an existing unit at a
+    module that is not on disk: the running engine survives, and its next
+    restart loads nothing. The existing unit is not re-rendered."""
+    env = _stage(tmp_path)
+    (tmp_path / "units").mkdir()
+    unit = tmp_path / "units" / "genesis-falkordb.service"
+    unit.write_text("LAST-WORKING-UNIT\n")
+
+    result, unit = _render_falkordb_unit(tmp_path, env)
+    assert result.returncode == 0, result.stderr
+    assert unit.read_text() == "LAST-WORKING-UNIT\n", "rewrote onto a missing module"
+    assert "Kept: genesis-falkordb.service" in result.stdout
+
+
+def test_a_kept_unit_whose_module_is_gone_says_so(tmp_path):
+    """Keeping the unit does not keep its module: an unverifiable cached module
+    is removed, and a unit loading that path will not start. The render must
+    not tell the operator the unit is on a module it "already loads"."""
+    env = _stage(tmp_path)
+    original = (
+        'ExecStart="/usr/bin/redis-server" \\\n'
+        '    --loadmodule "%h/.genesis/deps/falkordb/4.20.4/falkordb.so" \\\n'
+    )
+    (tmp_path / "units").mkdir()
+    (tmp_path / "units" / "genesis-falkordb.service").write_text(original)
+
+    result, unit = _render_falkordb_unit(tmp_path, env)
+    assert result.returncode == 0, result.stderr
+    assert unit.read_text() == original, "the kept unit was rewritten"
+    assert "will not start" in result.stdout
+    assert "already loads" not in result.stdout
+
+
+def test_a_kept_unit_whose_module_exists_is_reported_kept(tmp_path):
+    env = _stage(tmp_path)
+    loaded = Path(env["HOME"]) / ".genesis" / "deps" / "falkordb" / "4.20.3" / "falkordb.so"
+    loaded.parent.mkdir(parents=True)
+    loaded.write_bytes(b"older-module")
+    loaded.chmod(0o755)
+    (tmp_path / "units").mkdir()
+    (tmp_path / "units" / "genesis-falkordb.service").write_text(
+        '    --loadmodule "%h/.genesis/deps/falkordb/4.20.3/falkordb.so" \\\n'
+    )
+
+    result, _unit = _render_falkordb_unit(tmp_path, env)
+    assert result.returncode == 0, result.stderr
+    assert "Kept: genesis-falkordb.service" in result.stdout
+    assert "will not start" not in result.stdout
+
+
+def test_a_kept_unit_whose_module_lost_its_execute_bit_says_so(tmp_path):
+    """An unauthenticated module that could not be removed is de-executed, so it
+    stays on disk and redis still refuses it: that is a unit that will not start,
+    not a plain "Kept"."""
+    env = _stage(tmp_path)
+    loaded = Path(env["HOME"]) / ".genesis" / "deps" / "falkordb" / "4.20.4" / "falkordb.so"
+    loaded.parent.mkdir(parents=True)
+    loaded.write_bytes(b"de-executed")
+    loaded.chmod(0o644)
+    (tmp_path / "units").mkdir()
+    (tmp_path / "units" / "genesis-falkordb.service").write_text(
+        '    --loadmodule "%h/.genesis/deps/falkordb/4.20.4/falkordb.so" \\\n'
+    )
+
+    result, _unit = _render_falkordb_unit(tmp_path, env)
+    assert result.returncode == 0, result.stderr
+    assert "will not start" in result.stdout
+
+
+def test_a_verified_module_advances_the_unit(tmp_path):
+    env = _stage(tmp_path)
+    module = Path(env["FALKORDB_DEPS_DIR"]) / "4.20.4" / "falkordb.so"
+    module.parent.mkdir(parents=True)
+    module.write_bytes(b"pretend-module")
+    module.chmod(0o755)
+    (tmp_path / "units").mkdir()
+    (tmp_path / "units" / "genesis-falkordb.service").write_text("LAST-WORKING-UNIT\n")
+
+    result, unit = _render_falkordb_unit(tmp_path, env, _pin_the_fake(tmp_path))
+    assert result.returncode == 0, result.stderr
+    assert "deps/falkordb/4.20.4/falkordb.so" in unit.read_text()
+
+
+def test_a_first_render_is_written_even_without_a_module(tmp_path):
+    """No unit to protect: render it (inert — nothing enables it)."""
+    env = _stage(tmp_path)
+    result, unit = _render_falkordb_unit(tmp_path, env)
+    assert result.returncode == 0, result.stderr
+    assert "deps/falkordb/4.20.4/falkordb.so" in unit.read_text()
 
 
 def _exec_argv(unit: str) -> str:

@@ -6,7 +6,9 @@
   write nothing in your home but its own data directory where the host allows
   user-unit sandboxing. Nothing on your system changes — the `redis-server`
   8.x the engine needs is a manual, opt-in step described in SETUP.md, "Graph
-  engine (FalkorDB)". Once you arm the unit, the infrastructure health check
-  alerts if it fails to start or loses its socket; an engine you never armed
-  stays silent. `GENESIS_FALKORDB_PROVISION_DISABLED=1` skips the module
-  download.
+  engine (FalkorDB)". Once you select it (graphstore `mode: falkordb`) or
+  enable its unit, the infrastructure health check alerts if it fails, stops
+  (a start-only unit after a reboot), or loses its socket; an engine you never
+  armed stays silent. A provision that cannot verify the module does not
+  re-render an existing unit onto it.
+  `GENESIS_FALKORDB_PROVISION_DISABLED=1` skips the module download.

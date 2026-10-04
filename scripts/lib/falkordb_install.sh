@@ -135,6 +135,60 @@ _falkordb_module_verified() {
     [ -n "$actual" ] && [ "$actual" = "$expected" ]
 }
 
+# _falkordb_discard <file> — remove a module we cannot authenticate. rc 0 only
+# when it is gone. When it cannot be removed (an unwritable directory), still
+# take the execute bit: redis refuses a module without it, so the bytes stop
+# being loadable even where they cannot be deleted.
+_falkordb_discard() {
+    if rm -f "$1" 2>/dev/null && [ ! -e "$1" ]; then
+        return 0
+    fi
+    chmod a-x "$1" 2>/dev/null || true
+    return 1
+}
+
+# _falkordb_discard_note <file> — what _falkordb_discard left behind, for the
+# warning: unloadable bytes, or bytes that are still loadable.
+_falkordb_discard_note() {
+    # The MODE bits, not `-x`: redis checks the file's execute bits, and `-x`
+    # answers whether THIS user may execute it.
+    if [ -n "$(find "$1" -maxdepth 0 -perm /111 2>/dev/null || true)" ]; then
+        printf 'it is STILL LOADABLE (execute bit could not be cleared).'
+    else
+        printf 'execute bit cleared so redis will not load it; NOT verified.'
+    fi
+}
+
+# falkordb_unit_loaded_module <rendered unit path> — the module path the unit's
+# --loadmodule names, with %h expanded to $HOME, or "" when it names none. The
+# unit is rendered from our own template, which quotes that one argument.
+falkordb_unit_loaded_module() {
+    local line path
+    line="$(grep -o -- '--loadmodule "[^"]*"' "$1" 2>/dev/null | head -n 1 || true)"
+    path="${line#--loadmodule \"}"
+    path="${path%\"}"
+    [ -n "$line" ] || return 0
+    case "$path" in "%h"/*) path="$HOME${path#%h}" ;; esac
+    printf '%s' "$path"
+}
+
+# falkordb_unit_keep_existing <rendered unit path> — rc 0 when the renderer must
+# leave an EXISTING unit alone: the module this render would point it at
+# ($FALKORDB_VERSION) is not verified on disk. Provisioning returns 0 by
+# contract when it skips or fails (unpinned override, failed download, no
+# digest tool), so rendering the requested version regardless would move a
+# working unit onto a missing .so: the running engine survives, and its next
+# restart or reboot loads nothing. rc 1 means render — the module is verified,
+# or there is no unit yet to protect (a first render is inert: nothing enables
+# it).
+falkordb_unit_keep_existing() {
+    [ -f "$1" ] || return 1
+    if _falkordb_module_verified; then
+        return 1
+    fi
+    return 0
+}
+
 # falkordb_module_install — fetch + verify the engine module. No sudo: it lands
 # under ~/.genesis/deps, the established home for downloaded dependencies.
 falkordb_module_install() {
@@ -163,14 +217,22 @@ falkordb_module_install() {
         # would otherwise be loaded as native code indefinitely.
         actual="$(_falkordb_sha256 "$target")"
         if [ -z "$actual" ]; then
+            # Fail closed, like the mismatch branch below: bytes we cannot
+            # authenticate are native code the unit would load on its next
+            # start. A fresh download could not be verified either, so stop.
+            if ! _falkordb_discard "$target"; then
+                echo "  WARNING: cannot verify the cached FalkorDB module (sha256sum unavailable)"
+                echo "           and could not remove $target — $(_falkordb_discard_note "$target")"
+                return 0
+            fi
             echo "  WARNING: cannot verify the cached FalkorDB module (sha256sum unavailable)"
-            echo "           — left in place but UNVERIFIED."
+            echo "           — removed; FalkorDB module NOT installed."
             return 0
         fi
         if [ "$actual" != "$expected" ]; then
-            if ! rm -f "$target" 2>/dev/null || [ -e "$target" ]; then
+            if ! _falkordb_discard "$target"; then
                 echo "  WARNING: cached $target fails the pinned digest and could not be"
-                echo "           removed — FalkorDB module NOT verified."
+                echo "           removed — $(_falkordb_discard_note "$target")"
                 return 0
             fi
             echo "  WARNING: cached FalkorDB module failed the pinned digest — removed; re-downloading."

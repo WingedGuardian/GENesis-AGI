@@ -32,7 +32,7 @@ from pathlib import Path
 from genesis.infra_profile.collectors._probe import (
     ProbeFailed,
     reap,
-    user_bus_present,
+    user_manager_present,
 )
 from genesis.infra_profile.types import SectionResult
 
@@ -922,7 +922,7 @@ async def collect_systemd() -> SectionResult:
     `systemctl --user list-unit-files` exits 1 with "Failed to connect to bus"
     there. Neither box will grow a user manager between refreshes, so `[]` is
     the true answer for both and raising would error the section permanently.
-    Only a systemctl backed by a reachable bus, which then fails, raises.
+    Only a systemctl backed by a reachable user manager, which then fails, raises.
 
     The listing asks for ALL unit files and filters to `genesis-*` here, never
     via a systemctl pattern argument. MEASURED (systemd 255):
@@ -945,7 +945,7 @@ async def collect_systemd() -> SectionResult:
             strict=True,
         )
     except ProbeFailed:
-        if user_bus_present():
+        if user_manager_present():
             raise
         listing = None
     units: list[dict] = []
