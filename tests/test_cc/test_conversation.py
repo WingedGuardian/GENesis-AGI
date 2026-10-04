@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from genesis.cc.conversation import ConversationLoop
-from genesis.cc.exceptions import CCProcessError, CCSessionError, CCTimeoutError
+from genesis.cc.exceptions import (
+    CCDeployInProgressError,
+    CCProcessError,
+    CCSessionError,
+    CCTimeoutError,
+)
 from genesis.cc.invoker import CCInvoker
 from genesis.cc.system_prompt import SystemPromptAssembler
 from genesis.cc.types import (
@@ -245,6 +250,48 @@ async def _setup_session_with_cc_sid(db, *, user_id="u1", cc_session_id="cc-stal
         source_tag="foreground",
     )
     await cc_sessions.update_cc_session_id(db, "resume-sess", cc_session_id=cc_session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_deploy_hold_preserves_resumed_session(
+    loop, mock_invoker, db, monkeypatch, streaming,
+):
+    await _setup_session_with_cc_sid(db)
+    deploy_error = CCDeployInProgressError("a deploy is still in progress")
+    loop._recover_stale_resume = AsyncMock()
+    loop._session_mgr.fail = AsyncMock()
+    failure_detections = []
+    monkeypatch.setattr(
+        loop,
+        "_fire_failure_detection",
+        lambda reason: failure_detections.append(reason),
+    )
+
+    if streaming:
+        mock_invoker.run_streaming = AsyncMock(side_effect=deploy_error)
+        result = await loop.handle_message_streaming(
+            "follow up",
+            user_id="u1",
+            channel=ChannelType.TERMINAL,
+            on_event=AsyncMock(),
+        )
+        mock_invoker.run_streaming.assert_awaited_once()
+    else:
+        mock_invoker.run = AsyncMock(side_effect=deploy_error)
+        result = await loop.handle_message(
+            "follow up",
+            user_id="u1",
+            channel=ChannelType.TERMINAL,
+        )
+        mock_invoker.run.assert_awaited_once()
+
+    assert result == "[Genesis is updating — try again in a minute]"
+    loop._recover_stale_resume.assert_not_awaited()
+    loop._session_mgr.fail.assert_not_awaited()
+    assert failure_detections == []
+    session = await cc_sessions.get_by_id(db, "resume-sess")
+    assert session["status"] == "active"
 
 
 @pytest.mark.asyncio

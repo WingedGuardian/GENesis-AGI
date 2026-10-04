@@ -10,7 +10,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from genesis.cc.exceptions import CCProcessError, CCStreamTruncatedError, CCTimeoutError
+from genesis.cc.exceptions import (
+    CCDeployInProgressError,
+    CCProcessError,
+    CCStreamTruncatedError,
+    CCTimeoutError,
+)
 from genesis.cc.invoker import CCInvoker
 from genesis.cc.types import (
     CCInvocation,
@@ -1052,7 +1057,10 @@ async def test_run_success(invoker):
     mock_proc.communicate = AsyncMock(return_value=(result_line.encode(), b""))
     mock_proc.returncode = 0
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+    with (
+        patch("genesis.cc.invoker.wait_for_deploy_clear", return_value=True),
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+    ):
         output = await invoker.run(CCInvocation(prompt="hello"))
     assert output.text == "Hello world"
     assert output.session_id == "sess-out-1"
@@ -1063,6 +1071,26 @@ async def test_run_success(invoker):
     assert output.exit_code == 0
     assert not output.is_error
     assert not output.via_proxy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["run", "run_streaming"])
+async def test_deploy_hold_refuses_spawn(invoker, method):
+    with (
+        patch("genesis.cc.invoker.wait_for_deploy_clear", return_value=False) as wait,
+        patch("asyncio.create_subprocess_exec") as spawn,
+        pytest.raises(CCDeployInProgressError),
+    ):
+        if method == "run":
+            await invoker.run(CCInvocation(prompt="hello"))
+        else:
+            await invoker.run_streaming(
+                CCInvocation(prompt="hello"),
+                on_event=AsyncMock(),
+            )
+
+    wait.assert_awaited_once_with()
+    spawn.assert_not_awaited()
 
 
 @pytest.mark.asyncio

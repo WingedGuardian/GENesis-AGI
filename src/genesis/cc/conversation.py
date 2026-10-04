@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 from genesis.cc import peer_availability, rate_limit_park, roster
 from genesis.cc.context_injector import ContextInjector
 from genesis.cc.exceptions import (
+    CCDeployInProgressError,
     CCError,
     CCMCPError,
     CCNetworkOfflineError,
@@ -596,6 +597,8 @@ class ConversationLoop:
                 self._fire_failure_detection("mcp_error")
                 server = f" ({e.server_name})" if e.server_name else ""
                 return f"[MCP error{server} — try again]"
+            except CCDeployInProgressError:
+                return "[Genesis is updating — try again in a minute]"
             except CCError as e:
                 self._fire_failure_detection("generic_error")
                 return f"[Genesis error: {e}]"
@@ -1010,6 +1013,8 @@ class ConversationLoop:
                 self._fire_failure_detection("mcp_error")
                 server = f" ({e.server_name})" if e.server_name else ""
                 return f"[MCP error{server} — try again]"
+            except CCDeployInProgressError:
+                return "[Genesis is updating — try again in a minute]"
             except CCError as e:
                 self._fire_failure_detection("generic_error")
                 return f"[Genesis error: {e}]"
@@ -1108,6 +1113,7 @@ class ConversationLoop:
             CCQuotaExhaustedError,
             CCTimeoutError,
             CCNetworkOfflineError,
+            CCDeployInProgressError,
         ):
             # Rate limits are account-wide, and a timeout is NOT a stale-resume
             # failure — retrying fresh won't help. A timeout retry just burns a
@@ -1162,6 +1168,7 @@ class ConversationLoop:
             CCQuotaExhaustedError,
             CCTimeoutError,
             CCNetworkOfflineError,
+            CCDeployInProgressError,
             CCReplayUnsafeError,
         ):
             # Account-wide (rate/quota) or a timeout — retrying fresh won't help;
@@ -1362,6 +1369,7 @@ class ConversationLoop:
             CCRateLimitError,
             CCQuotaExhaustedError,
             CCNetworkOfflineError,
+            CCDeployInProgressError,
             CCReplayUnsafeError,
         ):
             # Offline joins the fast-re-raise (same class as CAVEAT A): a dead
@@ -1605,6 +1613,12 @@ class ConversationLoop:
                         # would stack a SECOND answer on the first.
                         return ""
                     continue  # this peer is also down → try the next one
+                except CCDeployInProgressError as exc:
+                    logger.warning(
+                        "failover peer %s held because a deploy is in progress: %s",
+                        peer_name, exc,
+                    )
+                    return None
                 except CCReplayUnsafeError as unsafe:
                     if unsafe.__cause__ is not None:
                         await _record_peer(peer_availability.note_failure, peer_name, unsafe.__cause__)

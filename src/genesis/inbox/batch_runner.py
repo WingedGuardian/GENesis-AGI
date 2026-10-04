@@ -8,7 +8,12 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from genesis.cc.exceptions import CCNetworkOfflineError, CCOverloadedError, CCReplayUnsafeError
+from genesis.cc.exceptions import (
+    CCDeployInProgressError,
+    CCNetworkOfflineError,
+    CCOverloadedError,
+    CCReplayUnsafeError,
+)
 from genesis.cc.transient_retry import run_with_overload_retry
 from genesis.inbox.scanner import extract_urls as _extract_urls
 from genesis.inbox.url_coverage import (
@@ -188,13 +193,18 @@ async def run_one_batch(
             item_id=item.id, texts=[item.content], occurrence=f"{item.id}:{now_iso}",
         )
         return False
-    except (CCNetworkOfflineError, CCOverloadedError) as exc:
+    except (CCNetworkOfflineError, CCOverloadedError, CCDeployInProgressError) as exc:
         # #1766 (inbox leg): the network being down is not this item's
         # failure. Fail the row so the retry lane picks it up once
         # connectivity returns, but keep its retry budget — the default
         # failed-path increment turns a ~90-minute outage into permanently
         # parked items (3 retries x 30-minute scans).
-        reason = "provider overloaded" if isinstance(exc, CCOverloadedError) else "network offline"
+        if isinstance(exc, CCOverloadedError):
+            reason = "provider overloaded"
+        elif isinstance(exc, CCDeployInProgressError):
+            reason = "deploy in progress"
+        else:
+            reason = "network offline"
         err = f"CC invocation deferred, {reason}: {exc}"
         errors.append(err)
         logger.warning(err)

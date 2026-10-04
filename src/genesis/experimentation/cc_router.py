@@ -19,6 +19,7 @@ import logging
 import os
 
 from genesis.cc.child_env import pin_dispatched_env
+from genesis.cc.deploy_hold import wait_for_deploy_clear
 from genesis.cc.types import (
     SPAWN_TOOL_NAMES,
     VALID_EFFORT_NAMES,
@@ -110,6 +111,14 @@ class CCCliRouter:
 
         proc = None
         try:
+            if not await wait_for_deploy_clear():
+                return StandaloneRoutingResult(
+                    success=False,
+                    content=None,
+                    model_id=self._model,
+                    provider_used="cc-cli",
+                    error="a deploy is still in progress",
+                )
             proc = await asyncio.create_subprocess_exec(
                 *args,
                 stdin=asyncio.subprocess.PIPE,

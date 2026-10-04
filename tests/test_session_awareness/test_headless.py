@@ -116,6 +116,33 @@ async def test_spawn_failure_never_raises():
 
 
 @pytest.mark.asyncio
+async def test_deploy_hold_refuses_spawn(tmp_path, monkeypatch):
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "genesis"))
+
+    async def _hold():
+        return False
+
+    spawn_calls = []
+
+    async def _spawn(*args, **kwargs):
+        spawn_calls.append((args, kwargs))
+        raise AssertionError("subprocess must not be spawned during a deploy")
+
+    monkeypatch.setattr("genesis.session_awareness.headless.wait_for_deploy_clear", _hold)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+
+    result = await run_headless_json(
+        "judge",
+        model=MODEL,
+        timeout_s=1,
+    )
+
+    assert result["status"] == "failed"
+    assert "CCDeployInProgressError" in result["reason"]
+    assert spawn_calls == []
+
+
+@pytest.mark.asyncio
 async def test_timeout_group_kills_children(tmp_path):
     """A hung child that spawned its own grandchild: after the timeout BOTH
     must be gone (killpg with the pgid>1 guard, not a bare kill)."""

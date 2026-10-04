@@ -22,7 +22,9 @@ from pathlib import Path
 
 from genesis.cc import roster
 from genesis.cc.child_env import pin_dispatched_env
+from genesis.cc.deploy_hold import wait_for_deploy_clear
 from genesis.cc.exceptions import (
+    CCDeployInProgressError,
     CCError,
     CCMCPError,
     CCNetworkOfflineError,
@@ -2931,6 +2933,10 @@ class CCInvoker:
         reg_key: str | None = None
         try:
             scope_args = await _get_scope_args()
+            if not await wait_for_deploy_clear():
+                raise CCDeployInProgressError(
+                    "Claude spawn refused: a deploy is still in progress",
+                )
             proc = await asyncio.create_subprocess_exec(
                 *scope_args,
                 *args,
@@ -3157,6 +3163,10 @@ class CCInvoker:
 
         try:
             scope_args = await _get_scope_args()
+            if not await wait_for_deploy_clear():
+                raise CCDeployInProgressError(
+                    "Claude spawn refused: a deploy is still in progress",
+                )
             proc = await asyncio.create_subprocess_exec(
                 *scope_args,
                 *args,

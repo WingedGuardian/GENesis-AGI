@@ -56,6 +56,29 @@ async def test_route_call_success(monkeypatch):
     assert "--system-prompt" in args  # system message → --system-prompt
 
 
+async def test_route_call_refuses_spawn_during_deploy(monkeypatch):
+    async def hold():
+        return False
+
+    spawn_calls = []
+
+    async def fake_exec(*args, **kwargs):
+        spawn_calls.append((args, kwargs))
+        raise AssertionError("subprocess must not be spawned during a deploy")
+
+    monkeypatch.setattr("genesis.experimentation.cc_router.wait_for_deploy_clear", hold)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    result = await CCCliRouter("haiku").route_call(
+        "gen",
+        [{"role": "user", "content": "U"}],
+    )
+
+    assert result.success is False
+    assert "deploy" in (result.error or "").lower()
+    assert spawn_calls == []
+
+
 async def test_route_call_failure_nonzero_exit(monkeypatch):
     async def fake_exec(*a, **k):
         return _FakeProc(out=b"", err=b"kaboom", rc=1)

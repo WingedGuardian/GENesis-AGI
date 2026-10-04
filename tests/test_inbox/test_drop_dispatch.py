@@ -1489,6 +1489,31 @@ async def test_network_offline_does_not_burn_a_retry(
 
 
 @pytest.mark.asyncio
+async def test_deploy_hold_does_not_burn_a_retry(
+    db, inbox_dir, mock_invoker, mock_session_manager,
+):
+    from genesis.cc.exceptions import CCDeployInProgressError
+
+    mock_invoker.run.side_effect = CCDeployInProgressError("deploy in progress")
+    mon = _monitor_retries(db, inbox_dir, mock_invoker, mock_session_manager, max_retries=1)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/only-item-9f2k\n")
+
+    await mon.check_once()
+
+    rows = await (await db.execute(
+        "SELECT status, retry_count, error_message FROM inbox_items "
+        "WHERE file_path LIKE '%Genesis.md'"
+    )).fetchall()
+    assert len(rows) == 1 and rows[0]["retry_count"] == 0, [dict(r) for r in rows]
+    assert rows[0]["status"] == "failed"
+    assert "deploy in progress" in rows[0]["error_message"]
+    assert str(inbox_dir / "Genesis.md") in await inbox_items.get_retriable_failure_files(
+        db, max_retries=1,
+    )
+    assert [a for a in _queued_alerts() if a.get("source") == "inbox"] == []
+
+
+@pytest.mark.asyncio
 async def test_overload_is_retried_inside_the_approved_dispatch(
     db, inbox_dir, mock_invoker, mock_session_manager, tmp_path, monkeypatch,
 ):
