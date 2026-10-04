@@ -256,8 +256,7 @@ async def get_link_by_issue(
     return _link_row(await _one(cur))
 
 
-# GROUNDWORK(board-reconciler): the reconciler records the card once it adds the
-# issue to the project (the board PR after promotion).
+# The drain records the card once it puts a promoted issue on the project.
 async def set_project_item(
     db: aiosqlite.Connection, *, link_id: str, project_item_id: str, now: str
 ) -> bool:

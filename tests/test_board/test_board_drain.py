@@ -51,9 +51,59 @@ class FakeGh:
         return any(c[:2] == ["issue", "create"] for c in self.calls)
 
 
+class FakeProjects:
+    """The Projects v2 adapter, faked at its functions: one project with the
+    Status field, every write recorded."""
+
+    def __init__(self, *, prior_status=None, fail_add=False):
+        self.prior_status = prior_status
+        self.fail_add = fail_add
+        self.adds: list[tuple[str, str]] = []
+        self.status_writes: list[tuple[str, str]] = []
+
+    def install(self, monkeypatch):
+        from genesis.board import projects_v2 as pv
+
+        status = pv.Field("F_STATUS", "Status", "single_select", {"Proposed": "OPT_P"})
+
+        async def get_project(owner, number, *, runner=None):
+            return pv.Project("PROJ", number, "Board", False, {"Status": status})
+
+        async def issue_node_id(owner, name, number, *, runner=None):
+            return f"ISSUE_{number}"
+
+        async def add_item(project_id, content_id, *, runner=None):
+            if self.fail_add:
+                raise pv.ProjectsError("boom")
+            self.adds.append((project_id, content_id))
+            return f"ITEM_{content_id}"
+
+        async def item_status(item_id, *, runner=None):
+            return self.prior_status
+
+        async def set_single_select(project_id, item_id, field_id, option_id, *, runner=None):
+            self.status_writes.append((item_id, option_id))
+
+        for name, fn in {
+            "get_project": get_project,
+            "issue_node_id": issue_node_id,
+            "add_item": add_item,
+            "item_status": item_status,
+            "set_single_select": set_single_select,
+        }.items():
+            monkeypatch.setattr(pv, name, fn)
+        return self
+
+
 @pytest.fixture
-async def db(tmp_path, monkeypatch):
+def projects(monkeypatch):
+    return FakeProjects().install(monkeypatch)
+
+
+@pytest.fixture
+async def db(tmp_path, monkeypatch, projects):
     monkeypatch.setattr(board_config, "effective_mode", lambda: "live")
+    monkeypatch.setattr(board_config, "project_ref", lambda: ("owner", 1))
     monkeypatch.setattr(ciw, "effective_mode", lambda: "off")  # contributor lane paused
     monkeypatch.setattr("genesis.env.github_user", lambda: "owner")
     monkeypatch.setattr("genesis.env.github_public_repo", lambda: "repo")
@@ -324,6 +374,211 @@ async def test_a_question_raised_after_proposal_holds_the_post(db, monkeypatch):
     monkeypatch.setattr(ciw, "_run_gh", gh)
     out = await _promote(db)
     await board_crud.raise_question(db, question="wait", now=NOW, blocks=[("follow_up", FOLLOW)])
+    await ciw.drain_pending_issue_posts(_RT(db))
+    assert not gh.created()
+    assert (await _row(db, out["pending_id"]))["status"] == "held"
+
+
+# ─── round 1 (Codex at ea8329d76) ───────────────────────────────────────────
+
+
+async def test_a_posted_promotion_lands_on_the_board_as_proposed(db, monkeypatch, projects):
+    monkeypatch.setattr(ciw, "_run_gh", FakeGh())
+    await _promote(db)
+    await ciw.drain_pending_issue_posts(_RT(db))
+    assert projects.adds == [("PROJ", "ISSUE_77")]
+    assert projects.status_writes == [("ITEM_ISSUE_77", "OPT_P")]
+    link = await board_crud.get_link_by_source(db, source_kind="follow_up", source_id=FOLLOW)
+    assert link["project_item_id"] == "ITEM_ISSUE_77"
+    assert (await board_crud.list_events(db, event="status_write"))["total"] == 1
+
+
+async def test_a_card_that_already_has_a_status_keeps_its_column(db, monkeypatch, projects):
+    """Re-adding returns the existing item; Genesis never moves it out of the
+    column it is in."""
+    projects.prior_status = "Ready"
+    monkeypatch.setattr(ciw, "_run_gh", FakeGh())
+    await _promote(db)
+    await ciw.drain_pending_issue_posts(_RT(db))
+    assert projects.adds and projects.status_writes == []
+    link = await board_crud.get_link_by_source(db, source_kind="follow_up", source_id=FOLLOW)
+    assert link["project_item_id"] == "ITEM_ISSUE_77"
+    assert (await board_crud.list_events(db, event="status_write"))["total"] == 0
+
+
+async def test_a_failed_placement_keeps_the_link_and_is_retried_next_tick(
+    db, monkeypatch, projects
+):
+    projects.fail_add = True
+    monkeypatch.setattr(ciw, "_run_gh", FakeGh())
+    out = await _promote(db)
+    await ciw.drain_pending_issue_posts(_RT(db))
+    assert (await _row(db, out["pending_id"]))["status"] == "posted"
+    link = await board_crud.get_link_by_source(db, source_kind="follow_up", source_id=FOLLOW)
+    assert link is not None and link["project_item_id"] is None
+    projects.fail_add = False
+    await ciw.drain_pending_issue_posts(_RT(db))
+    link = await board_crud.get_link_by_source(db, source_kind="follow_up", source_id=FOLLOW)
+    assert link["project_item_id"] == "ITEM_ISSUE_77"
+
+
+async def test_unplaced_links_are_not_retried_outside_live(db, monkeypatch, projects):
+    projects.fail_add = True
+    monkeypatch.setattr(ciw, "_run_gh", FakeGh())
+    await _promote(db)
+    await ciw.drain_pending_issue_posts(_RT(db))
+    projects.fail_add = False
+    monkeypatch.setattr(board_config, "effective_mode", lambda: "propose_only")
+    assert await ciw._place_unplaced_links(db, NOW) == 0
+    assert projects.adds == []
+
+
+async def _contributor_row(db, *, row_id, status_after=None, source="follow_up"):
+    mgr = ApprovalManager(db=db)
+    rid = await mgr.request_approval(
+        action_type="contributor_issue_post",
+        action_class="irreversible",
+        description="d",
+        context="{}",
+    )
+    await pip.create(
+        db,
+        id=row_id,
+        request_id=rid,
+        repo=REPO,
+        title="Contributor version of the same work",
+        body="b",
+        source=source,
+        source_ref=FOLLOW,
+        cell_domain="github",
+        cell_verb="issue_create",
+        cell_risk_class="bulk",
+        held_at=NOW,
+        mode="live",
+    )
+    await mgr.resolve(rid, status="approved")
+    if status_after == "posted":
+        await pip.mark_posted(db, row_id, issue_number=5, issue_url="u", posted_at=NOW)
+
+
+async def test_a_board_hold_is_refused_when_the_contributor_lane_already_posted(db, monkeypatch):
+    """Both lanes' propose-time checks can pass concurrently; the drain, the
+    only poster, is where the second issue is stopped."""
+    gh = FakeGh()
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    out = await _promote(db)
+    await _contributor_row(db, row_id="c-row", status_after="posted")
+    await ciw.drain_pending_issue_posts(_RT(db))
+    assert not gh.created()
+    assert (await _row(db, out["pending_id"]))["status"] != "held"
+    assert (await _row(db, out["pending_id"]))["status"] != "posted"
+
+
+async def test_two_approved_holds_for_one_follow_up_post_exactly_once(db, monkeypatch):
+    """Board hold and contributor hold for the same follow-up, both approved:
+    whichever the drain reaches first posts, the other is refused."""
+    gh = FakeGh()
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    out = await _promote(db)
+    await _contributor_row(db, row_id="c-row")
+    monkeypatch.setattr(ciw, "effective_mode", lambda: "live")
+    await ciw.drain_pending_issue_posts(_RT(db))
+    assert len([c for c in gh.calls if c[:2] == ["issue", "create"]]) == 1
+    statuses = sorted(
+        [(await _row(db, out["pending_id"]))["status"], (await _row(db, "c-row"))["status"]]
+    )
+    assert statuses.count("posted") == 1 and "held" not in statuses
+
+
+async def test_a_question_raised_during_the_lookups_still_holds_the_post(db, monkeypatch):
+    """The marker lookups await GitHub; a question raised meanwhile must be
+    seen by the check made right before the create."""
+    gh = FakeGh()
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    out = await _promote(db)
+
+    async def lookup_then_question(repo, digest):
+        await board_crud.raise_question(
+            db, question="wait", now=NOW, blocks=[("follow_up", FOLLOW)]
+        )
+        return True, None
+
+    monkeypatch.setattr(ciw, "_find_issue_by_marker", lookup_then_question)
+    await ciw.drain_pending_issue_posts(_RT(db))
+    assert not gh.created()
+    assert (await _row(db, out["pending_id"]))["status"] == "held"
+
+
+async def test_an_unavailable_block_store_counts_as_blocked(db, monkeypatch):
+    async def no_tables(_db):
+        return False
+
+    monkeypatch.setattr(board_crud, "tables_available", no_tables)
+    row = {"id": "r", "source_ref": f"follow_up:{FOLLOW}"}
+    assert await ciw._board_blocked(db, row) is True
+
+
+@pytest.mark.parametrize("lookup", ["title", "marker"])
+async def test_an_exact_hit_in_a_full_search_page_is_used(monkeypatch, lookup):
+    """A full page cannot prove absence, but a hit inside it is conclusive."""
+    filler = [
+        {"number": i, "title": f"other {i}", "url": "u", "createdAt": NOW, "body": ""}
+        for i in range(ciw._SEARCH_PAGE - 1)
+    ]
+    hit = {
+        "number": 999,
+        "title": "Add X",
+        "url": "u",
+        "createdAt": NOW,
+        "body": "<!-- genesis-board:abc123abc123abc123abc123 -->",
+        "author": {"login": "owner"},
+    }
+    monkeypatch.setattr(ciw, "_run_gh", FakeGh(issues=[], search_issues=[*filler, hit]))
+    if lookup == "title":
+        ok, found = await ciw._find_open_issue_by_title(REPO, ciw.normalize_title("Add X"))
+    else:
+        ok, found = await ciw._find_issue_by_marker(REPO, "abc123abc123abc123abc123")
+    assert ok is True and found["number"] == 999
+
+
+async def test_a_codebase_row_carrying_the_follow_up_also_counts_as_posted(db, monkeypatch):
+    """A contributor row of ANY source may carry the follow-up id; the check
+    keys on that id, never on the source."""
+    gh = FakeGh()
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    out = await _promote(db)
+    await _contributor_row(db, row_id="c-row", status_after="posted", source="codebase")
+    await ciw.drain_pending_issue_posts(_RT(db))
+    assert not gh.created()
+    assert (await _row(db, out["pending_id"]))["status"] not in ("held", "posted")
+
+
+async def test_a_contributor_hold_is_refused_by_the_board_pointer_after_prune(db, monkeypatch):
+    """Posted board rows are pruned after 30 days; the board_links pointer is
+    what still says this follow-up is on the board."""
+    gh = FakeGh()
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    out = await _promote(db)
+    await _contributor_row(db, row_id="c-row")
+    await ciw.drain_pending_issue_posts(_RT(db))  # contributor lane off: board posts
+    await db.execute("DELETE FROM pending_issue_posts WHERE id = ?", (out["pending_id"],))
+    await db.commit()
+    monkeypatch.setattr(ciw, "effective_mode", lambda: "live")
+    gh.calls.clear()
+    await ciw.drain_pending_issue_posts(_RT(db))
+    assert not gh.created()
+    assert (await _row(db, "c-row"))["status"] not in ("held", "posted")
+
+
+async def test_a_failing_cross_lane_check_leaves_the_row_held(db, monkeypatch):
+    gh = FakeGh()
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    out = await _promote(db)
+
+    async def broken(_db, _row):
+        raise RuntimeError("db gone")
+
+    monkeypatch.setattr(ciw, "_other_lane_posted", broken)
     await ciw.drain_pending_issue_posts(_RT(db))
     assert not gh.created()
     assert (await _row(db, out["pending_id"]))["status"] == "held"

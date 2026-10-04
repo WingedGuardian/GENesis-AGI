@@ -60,6 +60,7 @@ DEFAULTS: dict[str, Any] = {
 }
 
 _LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+_REPO_NAME = re.compile(r"^[A-Za-z0-9._-]{1,100}$")  # GitHub repo-name charset
 
 
 def _base_path() -> Path:
@@ -131,8 +132,19 @@ def valid_project_number(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-# GROUNDWORK(board-reconciler): read by the board reconciler (the next board PR)
-# to find the project scripts/board_setup.py recorded.
+def tracker_repo() -> tuple[str, str] | None:
+    """``(owner, name)`` of the public tracker promotions post to and the board
+    links — the configured ``github.user`` / ``github.public_repo``, never the
+    checkout's own remote (on a fork clone that is the operator's fork). None
+    when either half is missing or malformed: callers refuse rather than guess."""
+    from genesis.env import github_public_repo, github_user
+
+    owner, name = github_user(), github_public_repo()
+    if not (valid_login(owner) and isinstance(name, str) and _REPO_NAME.match(name)):
+        return None
+    return owner, name
+
+
 def project_ref() -> tuple[str, int] | None:
     """``(owner_login, project_number)`` of the configured board, or None when
     setup has not run (or the overlay holds a malformed value, logged)."""

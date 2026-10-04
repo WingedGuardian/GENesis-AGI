@@ -9,8 +9,12 @@ the owner runs deliberately; nothing calls this script automatically.
 What it ensures, in order (every step is a no-op when already true):
 
 1. ONE open user project titled ``--title`` (default "Genesis Work Board"),
-   linked to this repo. Zero -> create (GitHub creates it PRIVATE); more than
-   one -> refuse, never guess which.
+   linked to the configured public tracker (``github.user`` /
+   ``github.public_repo`` — the repo promotions post to, never this checkout's
+   own remote, which on a fork clone is the operator's fork). Zero -> create
+   (GitHub creates it PRIVATE) and STOP: project reads lag writes by seconds
+   (MEASURED), so a freshly created project is checked by a re-run, never by
+   this one. More than one -> refuse, never guess which.
 2. Status options = Proposed / Ready / In Progress / In Review / Done, with every
    existing option re-sent with its id (no card loses its value). An option
    outside that list is dropped only when NO item uses it.
@@ -18,8 +22,9 @@ What it ensures, in order (every step is a no-op when already true):
    "Genesis note" text field.
 4. Workflows: deletes "Pull request linked to issue" (it sets In Progress by
    itself, and only a human may start work) and "Item added to project" (the
-   reconciler sets Proposed). Requires "Pull request merged" and "Item closed"
-   to exist and be enabled; GitHub offers NO API to create or enable a
+   drain sets Proposed on a promoted issue, the reconciler on every other
+   one). Requires "Pull request merged" and "Item closed" to exist and be
+   enabled; GitHub offers NO API to create or enable a
    workflow, so a missing one is reported with the UI step, and the exit code
    is non-zero.
 5. Views "Active" (``-status:Proposed``) and "Backlog" (``status:Proposed``).
@@ -33,7 +38,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -47,19 +51,13 @@ VIEWS = {"Active": "-status:Proposed", "Backlog": "status:Proposed"}
 
 
 def _repo_slug() -> str:
-    """The repo this checkout pushes to, resolved LIVE (never a configured slug)."""
-    out = subprocess.run(
-        ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
-        capture_output=True,
-        text=True,
-        cwd=REPO_DIR,
-        timeout=60,
-        check=False,
-    )
-    slug = out.stdout.strip()
-    if out.returncode != 0 or "/" not in slug:
-        raise SystemExit(f"could not resolve the repo via gh: {out.stderr.strip()[:200]}")
-    return slug
+    """The public tracker promotions post to (``board.config.tracker_repo``)."""
+    from genesis.board import config as board_config
+
+    tracker = board_config.tracker_repo()
+    if tracker is None:
+        raise SystemExit("no public tracker configured (github.user / github.public_repo)")
+    return "/".join(tracker)
 
 
 async def run(title: str, apply: bool, write_config: bool, allow_public: bool = False) -> int:
@@ -89,8 +87,11 @@ async def run(title: str, apply: bool, write_config: bool, allow_public: bool = 
         created = await pv.create_project(
             owner_id, title, await pv.repository_id(repo_owner, repo_name)
         )
-        number = created["number"]
-        say(f"created project #{number} (public={created['public']})")
+        say(
+            f"created project #{created['number']} (public={created['public']}). GitHub reads "
+            "lag writes: wait a minute, then re-run this command to finish setup and record the config (an immediate re-run may not see the new project yet)."
+        )
+        return 3
     else:
         number = found[0]["number"]
         say(f"project #{number} {title!r} exists")
@@ -131,7 +132,12 @@ async def run(title: str, apply: bool, write_config: bool, allow_public: bool = 
 
     # 3. Genesis fields.
     gen = proj.fields.get(pv.GENESIS_FIELD)
-    if gen is None:
+    if gen is not None and gen.kind != "single_select":
+        say(
+            f"PROBLEM: field {pv.GENESIS_FIELD!r} exists but is not single-select; rename or delete it"
+        )
+        problems += 1
+    elif gen is None:
         say(f"{act}create single-select field {pv.GENESIS_FIELD!r}")
         if apply:
             await pv.create_single_select_field(proj.id, pv.GENESIS_FIELD, pv.GENESIS_OPTIONS)

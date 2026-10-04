@@ -3378,19 +3378,29 @@ follow-on work. The shipped mode is `off`.
 - **`scripts/board_setup.py`** (dry run unless `--apply`; `--write-config` records
   `project_owner`/`project_number` in the user overlay, the only writer:
   `settings_update` rejects both keys, as it rejects `mode: live`):
-  - one project per title; with two it refuses;
+  - links the configured public tracker (`github.user`/`github.public_repo`,
+    the repo promotions post to), never the checkout's own remote;
+  - one project per title; with two it refuses; a run that CREATES the
+    project stops there and asks for a re-run, because project reads lag
+    writes (MEASURED), so nothing it just created is checked by the same run;
   - Status columns Proposed / Ready / In Progress / In Review / Done;
-  - the `Genesis` single-select and `Genesis note` text fields;
+  - the `Genesis` single-select (an existing field of another type is reported,
+    never mutated) and `Genesis note` text fields;
   - deletes the "Pull request linked to issue" and "Item added to project"
     default workflows;
   - requires "Pull request merged" and "Item closed" (there is no API to
     enable a workflow, so a missing one exits non-zero with the UI step);
   - creates the `Active` and `Backlog` views.
 - **Promotion** (`board/promotion.py`, MCP `board_promote`):
-  - **Refused when:** the board mode is off; the source does not resolve; an
-    UNVERIFIED open question blocks it (the one place a block is enforced);
-    it is already linked or pending; or the privacy scan finds something (the
-    reply names line and scanner only).
+  - **Refused when:** the board mode is off, or `live` with no project
+    configured; no public tracker is configured; the source does not resolve;
+    an UNVERIFIED open question blocks it (the one place a block is enforced);
+    it is already linked or pending; the privacy scan finds something (the
+    reply names line and scanner only); or a requested label does not exist
+    on the tracker (checked only after the scan passes, since the check sends
+    the label names to GitHub).
+  - **Approval** is per item on the dashboard (Comms) and counted in the
+    morning report, like the contributor lane; there is no Telegram prompt.
   - **The public body** carries an opaque marker, a salted hash of `kind:id`.
     The private id never appears. The marker itself is left out of the scan,
     because detect-secrets reads its hex as a secret (MEASURED).
@@ -3403,8 +3413,18 @@ follow-on work. The shipped mode is `off`.
   - dedup by marker (recent window + search, any state), adopting a marked
     issue only when this account authored it;
   - are exempt from the contributor daily cap;
+  - re-check open-question blocks immediately before the create (no GitHub
+    await in between); a block store that cannot be read counts as blocked;
   - write the `board_links` pointer and a `promotion` event once the issue
-    exists, with each tick re-linking any posted row a crash left unlinked.
+    exists, with each tick re-linking any posted row a crash left unlinked;
+  - put the issue on the configured project, writing Status=Proposed ONLY
+    when the item has no Status (a card the owner already moved keeps its
+    column), and record the item id; each tick retries any link without one.
+- Both lanes can each pass their propose-time duplicate check for one
+  follow-up when proposed concurrently; the drain (the only poster, one job,
+  rows in sequence) refuses a hold whose follow-up the OTHER lane already
+  posted. An exact hit inside a full search page counts as found; only "no
+  hit" needs a complete page.
 - `approve_all_pending` excludes board promotions, because a sweep's resolver is
   human and only the exclusion keeps them per-item.
 - The contributor lane's title dedup gained a search read beside its 200-issue

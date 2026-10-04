@@ -23,6 +23,7 @@ NOW = "2026-10-03T12:00:00+00:00"
 @pytest.fixture
 async def db(tmp_path, monkeypatch):
     monkeypatch.setattr(board_config, "effective_mode", lambda: "live")
+    monkeypatch.setattr(board_config, "project_ref", lambda: ("owner", 1))
     monkeypatch.setattr("genesis.env.github_user", lambda: "owner")
     monkeypatch.setattr("genesis.env.github_public_repo", lambda: "Repo")
     async with aiosqlite.connect(str(tmp_path / "g.db")) as conn:
@@ -238,3 +239,93 @@ async def test_scan_refusal_reports_line_and_scanner_only(db, monkeypatch):
 )
 async def test_bounds_are_refused(db, over):
     assert (await _propose(db, **over))["status"] == "error"
+
+
+# ─── round 1 (Codex at ea8329d76) ───────────────────────────────────────────
+
+
+async def test_live_with_no_project_configured_is_refused(db, monkeypatch):
+    """The drain would post an issue with no card to land on."""
+    monkeypatch.setattr(board_config, "project_ref", lambda: None)
+    out = await _propose(db)
+    assert out["status"] == "error" and "no project is configured" in out["reason"]
+    assert await _holds(db) == []
+
+
+async def test_propose_only_needs_no_project(db, monkeypatch):
+    monkeypatch.setattr(board_config, "effective_mode", lambda: "propose_only")
+    monkeypatch.setattr(board_config, "project_ref", lambda: None)
+    assert (await _propose(db))["status"] == "held"
+
+
+@pytest.mark.parametrize("user", ["", "not a login!"])
+async def test_no_resolvable_tracker_is_refused(db, monkeypatch, user):
+    monkeypatch.setattr("genesis.env.github_user", lambda: user)
+    out = await _propose(db)
+    assert out["status"] == "error" and "tracker" in out["reason"]
+    assert await _holds(db) == []
+
+
+def _labels_on_repo(monkeypatch, present, *, fail=False):
+    asked = []
+
+    def lookup(repo, name):
+        asked.append((repo, name))
+        if fail:
+            return 1, "HTTP 502: Bad Gateway"
+        return (0, "") if name in present else (1, "gh: Not Found (HTTP 404)")
+
+    monkeypatch.setattr(promotion, "_label_lookup", lookup)
+    return asked
+
+
+async def test_a_label_the_tracker_lacks_is_refused_before_the_hold(db, monkeypatch):
+    asked = _labels_on_repo(monkeypatch, {"enhancement"})
+    out = await _propose(db, labels=["enhancement", "no-such-label"])
+    assert out["status"] == "error" and "no-such-label" in out["reason"]
+    assert ("owner/repo", "no-such-label") in asked
+    assert await _holds(db) == []
+
+
+async def test_an_unverifiable_label_is_refused_not_assumed(db, monkeypatch):
+    _labels_on_repo(monkeypatch, set(), fail=True)
+    out = await _propose(db, labels=["enhancement"])
+    assert out["status"] == "error" and "could not verify" in out["reason"]
+
+
+async def test_existing_labels_are_held(db, monkeypatch):
+    _labels_on_repo(monkeypatch, {"enhancement"})
+    assert (await _propose(db, labels=["enhancement"]))["status"] == "held"
+
+
+async def test_labels_are_never_sent_to_github_before_the_scan_passes(db, monkeypatch):
+    asked = _labels_on_repo(monkeypatch, {"enhancement"})
+    monkeypatch.setattr(
+        "genesis.contribution.scan_prose",
+        lambda _text, **_k: SanitizerResult(ok=False, findings=[], scanners_run=["x"]),
+    )
+    out = await _propose(db, labels=["enhancement"])
+    assert out["status"] == "blocked"
+    assert asked == []
+
+
+async def test_a_codebase_contributor_hold_of_the_follow_up_blocks_promotion(db):
+    from genesis.db.crud import pending_issue_posts as pip
+
+    await pip.create(
+        db,
+        id="c-row",
+        request_id="r-1",
+        repo="owner/repo",
+        title="t",
+        body="b",
+        source="codebase",
+        source_ref=FOLLOW,
+        cell_domain="github",
+        cell_verb="issue_create",
+        cell_risk_class="bulk",
+        held_at=NOW,
+        mode="live",
+    )
+    out = await _propose(db)
+    assert out["status"] == "duplicate" and out["existing_id"] == "c-row"

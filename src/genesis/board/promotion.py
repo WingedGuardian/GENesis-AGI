@@ -9,18 +9,24 @@ Spec §3.3, human-only:
 4. issue created (idempotent: an opaque marker in the body is the dedup key);
 5. pointer row written (``board_links``) — by the drain, once the issue exists.
 
-The reconciler adds every open repo issue to the project (as Proposed), so this
-module never touches the project itself.
+This module never touches the project: once the issue exists the drain puts
+it on the configured board as Proposed (and the board reconciler adds every
+other open issue).
 
 What can refuse a promotion, and why each is a refusal rather than a warning:
 
-* board mode ``off`` (the lever);
+* board mode ``off`` (the lever), or ``live`` with no project configured
+  (the issue would post with no card to land on);
+* no resolvable public tracker (``github.user`` / ``github.public_repo``);
 * a source that does not resolve to exactly one ledger row / follow-up;
 * an UNVERIFIED open question blocking that source (spec §3.4 "hard at
   promotion") — the one place a block is enforced;
 * an existing pointer, or an active (held/posted) board hold, for the source;
 * a privacy-scan finding — reported as line number + scanner ONLY, never the
-  matched text, because this answer travels further than the local surfaces.
+  matched text, because this answer travels further than the local surfaces;
+* a label the tracker does not have (``gh issue create`` would fail on it after
+  approval, every tick) — checked only AFTER the scan passes, since the check
+  sends the label names to GitHub.
 
 A board hold is ALWAYS human-approved: unlike the contributor lane there is no
 self-approval posture, and the drain refuses a hold whose approval was not
@@ -32,9 +38,12 @@ hash of ``kind:id``, opaque to a reader.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import subprocess
+import urllib.parse
 import uuid
 from datetime import UTC, datetime
 
@@ -51,6 +60,39 @@ MAX_CRITERION_CHARS = 500
 MAX_LABELS = 10
 MAX_LABEL_CHARS = 50  # GitHub's own label-name limit
 _MARKER_SALT = "genesis-board-v1"
+_GH_TIMEOUT = 60  # same bound as the drain's gh calls: a hung gh never wedges a session's tool call
+
+
+def _label_lookup(repo: str, name: str) -> tuple[int, str]:
+    """``gh api`` for one label: ``(returncode, stderr)``. The test seam."""
+    out = subprocess.run(
+        ["gh", "api", f"repos/{repo}/labels/{urllib.parse.quote(name, safe='')}", "--silent"],
+        capture_output=True,
+        text=True,
+        timeout=_GH_TIMEOUT,
+        check=False,
+    )
+    return out.returncode, out.stderr
+
+
+async def _missing_labels(repo: str, labels: list[str]) -> list[str] | None:
+    """The labels *repo* does not have, or None when that cannot be established
+    (a lookup failed for a reason other than "not found")."""
+    missing = []
+    for name in labels:
+        try:
+            rc, err = await asyncio.to_thread(_label_lookup, repo, name)
+        except (OSError, subprocess.SubprocessError):
+            logger.warning("label lookup for %s failed", repo, exc_info=True)
+            return None
+        if rc == 0:
+            continue
+        if "404" in err or "Not Found" in err:
+            missing.append(name)
+        else:
+            logger.warning("label lookup for %s failed rc=%s: %s", repo, rc, err.strip()[:200])
+            return None
+    return missing
 
 
 def source_marker(kind: str, source_id: str) -> str:
@@ -132,11 +174,22 @@ async def propose(
     from genesis.contribution import scan_prose
     from genesis.db.crud import board as board_crud
     from genesis.db.crud import pending_issue_posts as pip
-    from genesis.env import github_public_repo, github_user
 
     mode = board_config.effective_mode()
     if mode == "off":
         return {"status": "disabled", "reason": "board mode is off"}
+    if mode == "live" and board_config.project_ref() is None:
+        return {
+            "status": "error",
+            "reason": "board is live but no project is configured; run "
+            "scripts/board_setup.py --apply --write-config first",
+        }
+    tracker = board_config.tracker_repo()
+    if tracker is None:
+        return {
+            "status": "error",
+            "reason": "no public tracker configured (github.user / github.public_repo)",
+        }
     if not await board_crud.tables_available(db):
         return {
             "status": "error",
@@ -195,11 +248,11 @@ async def propose(
             "issue": f"{existing['repo']}#{existing['issue_number']}",
         }
     # Either lane's live hold for this record blocks a second public issue: a
-    # board hold keys "kind:id"; a contributor-lane hold of a follow-up keys the
-    # bare follow-up id (source='follow_up').
+    # board hold keys "kind:id"; a contributor-lane hold keys the bare follow-up
+    # id in source_ref, whatever its source (a 'codebase' row may carry one).
     cur = await db.execute(
         "SELECT id, status FROM pending_issue_posts WHERE status IN ('held', 'posted') AND "
-        "((source = 'board' AND source_ref = ?) OR (source = 'follow_up' AND source_ref = ?))",
+        "((source = 'board' AND source_ref = ?) OR (source != 'board' AND source_ref = ?))",
         (source_ref, source_id if kind == "follow_up" else None),
     )
     active = await cur.fetchone()
@@ -231,8 +284,16 @@ async def propose(
             )
         return refusal
 
-    owner, name = github_user(), github_public_repo()
-    repo = (f"{owner}/{name}" if owner else name).lower()
+    repo = "/".join(tracker).lower()
+    if label_list:
+        missing = await _missing_labels(repo, label_list)
+        if missing is None:
+            return {"status": "error", "reason": f"could not verify the labels on {repo}; retry"}
+        if missing:
+            return {
+                "status": "error",
+                "reason": f"{repo} has no label(s) {missing}; create them or drop them",
+            }
     receipt = {
         "ok": True,
         "scanners_run": list(scan.scanners_run),

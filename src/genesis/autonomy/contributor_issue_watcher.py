@@ -24,9 +24,14 @@ Two lanes share this ONE drain (spec: one drain, dispatching on ``source``):
   self-approval is refused); is deduped by the opaque marker in its body, not
   by title, and adopts an existing marked issue only when the account itself
   authored it; is NOT subject to the contributor daily cap (each one was
-  approved individually); and, once its issue exists, writes the ``board_links``
-  pointer + a ``promotion`` event — re-tried every tick for a posted row whose
-  pointer a crash left unwritten.
+  approved individually); re-checks open-question blocks immediately before the
+  create; and, once its issue exists, writes the ``board_links`` pointer + a
+  ``promotion`` event and puts the issue on the configured project as Proposed
+  (only when it has no Status) — both re-tried every tick until recorded.
+
+Across lanes, a hold whose follow-up the OTHER lane already posted is refused at
+post time: both tools check each other when proposing, but only this one drain
+posts, so only here is the check free of a concurrent proposal.
 
 Public-repo dup-safety (stronger than the email pattern, because a duplicate
 public issue is more visible than a duplicate email):
@@ -183,7 +188,7 @@ async def _find_open_issue_by_title(repo: str, title_norm: str) -> tuple[bool, d
     quoted form found 2 of 2 — and quoting also stops title words being read as
     search qualifiers. A search that fills its page is NOT a complete answer, so
     a saturated read counts as unverified (the row waits) rather than as "no
-    match"."""
+    match" — though an exact hit inside a full page still counts."""
     fields = "number,title,url,createdAt"
     recent = await _gh_issue_list(repo, state="open", fields=fields, limit=200)
     if recent is None:
@@ -195,11 +200,15 @@ async def _find_open_issue_by_title(repo: str, title_norm: str) -> tuple[bool, d
     searched = await _gh_issue_list(
         repo, state="open", fields=fields, limit=_SEARCH_PAGE, search=f'"{phrase}" in:title'
     )
-    if searched is None or len(searched) >= _SEARCH_PAGE:
+    if searched is None:
         return False, None
+    # An exact hit is conclusive even on a full page; only "no hit" needs the
+    # page to be complete before it means absent.
     for issue in searched:
         if normalize_title(issue.get("title", "")) == title_norm:
             return True, issue
+    if len(searched) >= _SEARCH_PAGE:
+        return False, None
     return True, None
 
 
@@ -220,11 +229,13 @@ async def _find_issue_by_marker(repo: str, marker_digest: str) -> tuple[bool, di
     searched = await _gh_issue_list(
         repo, state="all", fields=fields, limit=_SEARCH_PAGE, search=f'"{marker_digest}" in:body'
     )
-    if searched is None or len(searched) >= _SEARCH_PAGE:
+    if searched is None:
         return False, None
-    for issue in searched:
+    for issue in searched:  # a hit is conclusive even on a full page
         if marker_digest in _MARKER_RE.findall(issue.get("body") or ""):
             return True, issue
+    if len(searched) >= _SEARCH_PAGE:
+        return False, None
     return True, None
 
 
@@ -313,12 +324,123 @@ async def _link_board(
                 logger.error(
                     "promotion event for linked row %s not recorded", row.get("id"), exc_info=True
                 )
-        return True
     except Exception:
         logger.error(
             "board link for posted row %s failed — retried next tick", row.get("id"), exc_info=True
         )
         return False
+    # The card is placed by the end-of-tick pass (_place_unplaced_links), which
+    # also retries one that failed: one mechanism, not two.
+    return True
+
+
+async def _place_on_board(rt_db, proj, link: dict, now: str) -> bool:
+    """Put one linked issue on *proj* (the configured project, already checked
+    to have a Status option ``Proposed``) and record its item id.
+
+    Status is written ONLY when the item has none, and only ever as Proposed:
+    re-adding an existing item returns it unchanged (MEASURED), so a card the
+    owner already moved keeps its column. The audit event is written BEFORE the
+    item id, so a failure between the two leaves the link unplaced and the
+    retry (which then reads Status as set) records no second event. Any failure
+    leaves ``project_item_id`` NULL for the next pass. Returns True once the
+    item id is recorded."""
+    from genesis.board import projects_v2 as pv
+    from genesis.db.crud import board as board_crud
+
+    status = proj.fields[pv.STATUS_FIELD]
+    try:
+        owner, _, name = link["repo"].partition("/")
+        content_id = await pv.issue_node_id(owner, name, int(link["issue_number"]))
+        if _board_mode() != "live":
+            return False
+        item_id = await pv.add_item(proj.id, content_id)
+        prior = await pv.item_status(item_id)
+        if prior is None:
+            await pv.set_single_select(proj.id, item_id, status.id, status.options["Proposed"])
+        async with board_crud.owned_connection(rt_db) as own:
+            if prior is None:
+                await board_crud.append_event(
+                    own,
+                    event="status_write",
+                    now=now,
+                    repo=link["repo"],
+                    issue_number=int(link["issue_number"]),
+                    project_item_id=item_id,
+                    worker="genesis",
+                    detail={"to": "Proposed", "from": None},
+                )
+            await board_crud.set_project_item(
+                own, link_id=link["id"], project_item_id=item_id, now=now
+            )
+        return True
+    except Exception:
+        logger.error(
+            "placing board link %s on the project failed — retried next tick",
+            link.get("id"),
+            exc_info=True,
+        )
+        return False
+
+
+async def _board_blocked(rt_db, row: dict) -> bool:
+    """True when an unverified open question blocks this board row's source —
+    or when that cannot be established (store missing, unparseable source):
+    a post that cannot be checked does not go out."""
+    from genesis.db.crud import board as board_crud
+
+    kind, _, source_id = (row.get("source_ref") or "").partition(":")
+    try:
+        if not await board_crud.tables_available(rt_db):
+            return True
+        return bool(
+            await board_crud.blocking_questions(rt_db, target_kind=kind, target_id=source_id)
+        )
+    except Exception:
+        logger.error("block check for board hold %s failed", row.get("id"), exc_info=True)
+        return True
+
+
+async def _other_lane_posted(rt_db, row: dict) -> bool:
+    """True when the OTHER lane already posted an issue for the same follow-up.
+
+    Both lanes' tools check each other at propose time, but two concurrent
+    proposals can each pass that check. Posting happens only here, in this one
+    drain job (max_instances=1, rows in sequence, each ``mark_posted`` committed
+    before the next row), so checking at post time is race-free across lanes.
+
+    Keyed on the follow-up id, never on ``source``: a contributor row of ANY
+    source may carry one in ``source_ref`` (a ``codebase`` row with
+    ``source_follow_up_id``). For a contributor row the board's durable
+    ``board_links`` pointer is read too, because posted board rows are pruned
+    after 30 days. Raises on a DB error; the caller leaves the row held."""
+    from genesis.db.crud import board as board_crud
+
+    if row.get("source") == BOARD_SOURCE:
+        kind, _, fid = (row.get("source_ref") or "").partition(":")
+        if kind != "follow_up" or not fid:
+            return False  # the contributor lane only carries follow-up ids
+        cur = await rt_db.execute(
+            "SELECT 1 FROM pending_issue_posts WHERE source != ? AND source_ref = ? "
+            "AND status = 'posted' AND id != ? LIMIT 1",
+            (BOARD_SOURCE, fid, row["id"]),
+        )
+        return await cur.fetchone() is not None
+    fid = row.get("source_ref")
+    if not fid:
+        return False
+    cur = await rt_db.execute(
+        "SELECT 1 FROM pending_issue_posts WHERE source = ? AND source_ref = ? "
+        "AND status = 'posted' AND id != ? LIMIT 1",
+        (BOARD_SOURCE, f"follow_up:{fid}", row["id"]),
+    )
+    if await cur.fetchone() is not None:
+        return True
+    if not await board_crud.tables_available(rt_db):
+        return False
+    return (
+        await board_crud.get_link_by_source(rt_db, source_kind="follow_up", source_id=fid)
+    ) is not None
 
 
 async def _reconcile_board_links(rt_db, now: str) -> int:
@@ -352,7 +474,48 @@ async def _reconcile_board_links(rt_db, now: str) -> int:
             now=now,
         ):
             written += 1
+    await _place_unplaced_links(rt_db, now)
     return written
+
+
+async def _place_unplaced_links(rt_db, now: str) -> int:
+    """Place every linked issue whose card is not recorded yet: links written
+    this tick, and any whose placement failed before (the project was
+    unreachable, or a crash fell between the issue and its card). The project
+    is read once per pass. Returns how many were placed."""
+    from genesis.board import projects_v2 as pv
+
+    if _board_mode() != "live":
+        return 0
+    ref = board_config.project_ref()
+    try:
+        cur = await rt_db.execute(
+            "SELECT id, repo, issue_number FROM board_links WHERE project_item_id IS NULL "
+            "ORDER BY created_at"
+        )
+        links = [{"id": r[0], "repo": r[1], "issue_number": r[2]} for r in await cur.fetchall()]
+    except Exception:
+        logger.error("unplaced board link query failed", exc_info=True)
+        return 0
+    if not links:
+        return 0
+    if ref is None:
+        logger.warning("%d board link(s) not placed: no project configured", len(links))
+        return 0
+    try:
+        proj = await pv.get_project(*ref)
+    except Exception:
+        logger.error("board project read failed — placement retried next tick", exc_info=True)
+        return 0
+    status = proj.fields.get(pv.STATUS_FIELD)
+    if status is None or status.kind != "single_select" or "Proposed" not in status.options:
+        logger.error("board project has no Status option 'Proposed' — run board_setup.py")
+        return 0
+    placed = 0
+    for link in links:
+        if await _place_on_board(rt_db, proj, link, now):
+            placed += 1
+    return placed
 
 
 async def _resolve_approved(
@@ -408,16 +571,9 @@ async def _resolve_approved(
         # Re-check open-question blocks at POST time: a question raised after the
         # proposal (spec §3.4 "hard at promotion") holds the row until it is
         # resolved, instead of posting work the owner has since questioned.
-        from genesis.db.crud import board as board_crud
-
-        kind, _, source_id = (row.get("source_ref") or "").partition(":")
-        try:
-            blocked = await board_crud.tables_available(rt_db) and bool(
-                await board_crud.blocking_questions(rt_db, target_kind=kind, target_id=source_id)
-            )
-        except ValueError:
-            blocked = True  # an unparseable source_ref never posts
-        if blocked:
+        # (Checked again immediately before the create, below: the lookups in
+        # between await GitHub for up to minutes.)
+        if await _board_blocked(rt_db, row):
             logger.info("Board hold %s is blocked by an open question — left held", row["id"])
             return False
         digests = _MARKER_RE.findall(body)
@@ -523,6 +679,24 @@ async def _resolve_approved(
     # the worst a mid-tick flip can leak is an in-flight create already past this point.
     if lever() != "live":
         logger.info("Issue hold %s deferred — lever no longer live at post time", row["id"])
+        return False
+    # Last local checks, with no await on GitHub between them and the create.
+    try:
+        other_posted = await _other_lane_posted(rt_db, row)
+    except Exception:
+        logger.error("cross-lane check for hold %s failed — left held", row["id"], exc_info=True)
+        return False
+    if other_posted:
+        # The other lane already posted this follow-up: a second public issue
+        # for one record is never right, so this hold ends here.
+        if await pip.mark_rejected(rt_db, row["id"], rejected_at=now, expired=True):
+            logger.error(
+                "Issue hold %s refused — the other lane already posted this follow-up", row["id"]
+            )
+            return True
+        return False
+    if is_board and await _board_blocked(rt_db, row):
+        logger.info("Board hold %s blocked by an open question at post time — held", row["id"])
         return False
 
     # Observe the egress, THEN post. mark_posted BEFORE mark_consumed so a crash

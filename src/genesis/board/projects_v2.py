@@ -396,11 +396,12 @@ async def set_view_filter(view_id: str, filter_: str, *, runner: Runner | None =
 
 
 # ─── item operations (the reconciler's surface) ─────────────────────────────
-# GROUNDWORK(board-reconciler): add_item / set_single_select / set_text /
-# list_items / issue_node_id are the board reconciler's GitHub surface (the next
-# board PR: it adds open repo issues as Proposed, makes the one bookkeeping move,
-# and projects the Genesis status). Verified live against a private sandbox
-# project; no runtime caller until that PR lands.
+# issue_node_id / add_item / item_status / set_single_select place a promoted
+# issue on the board (the drain, autonomy.contributor_issue_watcher).
+# GROUNDWORK(board-reconciler): set_text / list_items are the board
+# reconciler's read and Genesis-field surface (the next board PR: it adds every
+# open repo issue, makes the one bookkeeping move, and projects the Genesis
+# status). Verified live against a private sandbox project.
 
 
 async def add_item(project_id: str, content_id: str, *, runner: Runner | None = None) -> str:
@@ -413,6 +414,20 @@ async def add_item(project_id: str, content_id: str, *, runner: Runner | None = 
         runner=runner,
     )
     return data["addProjectV2ItemById"]["item"]["id"]
+
+
+async def item_status(item_id: str, *, runner: Runner | None = None) -> str | None:
+    """The item's current Status option name, or None when it has none. A
+    just-added item may not be readable yet (reads lag writes, MEASURED), which
+    also reads as None: for a new item that is the truth."""
+    data = await graphql(
+        "query($i: ID!) { node(id: $i) { ... on ProjectV2Item { status: fieldValueByName("
+        'name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } } }',
+        {"i": item_id},
+        runner=runner,
+    )
+    node = data.get("node") or {}
+    return (node.get("status") or {}).get("name")
 
 
 async def set_single_select(
