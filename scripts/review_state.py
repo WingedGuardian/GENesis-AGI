@@ -4,7 +4,6 @@
 Used by:
 - review_enforcement_prompt.py (UserPromptSubmit hook)
 - review_enforcement_commit.py (PreToolUse hook)
-- genesis_stop_hook.py (Stop hook)
 - Claude (after /review + code-reviewer agent complete)
 
 The marker file records a hash of ``git diff --cached --raw --no-abbrev -z`` (staged
@@ -249,7 +248,7 @@ _ROUND_DIR = Path.home() / ".genesis" / "review_rounds"
 # pending an explicit '# escalation-ack'. Mirrors the genesis-development SKILL.md
 # prose cap.
 ESCALATION_ROUND_CAP = 3
-# Standing authorization is measured from GitHub's distinct reviewed heads, not
+# Standing authorization is measured from GitHub-backed review rounds, not
 # from the local streak/lifetime store below.  Keep these constants here as the
 # compatibility import surface used by hook trees at different revisions.
 STANDING_REVIEWED_HEAD_LIMIT = 4

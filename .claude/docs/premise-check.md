@@ -7,6 +7,19 @@ another review round.
 Run it in two places: at **plan time**, when the shape is still free to change,
 and at **pre-push**, before an external reviewer spends a round on it.
 
+## At plan and issue time
+
+The plan-time half runs before work starts, on the plan or the issue itself.
+Every plan and every issue that specifies work answers five questions:
+
+1. Is every claim about outside behaviour (GitHub, git, a provider API) measured or cited, not asserted?
+2. Was the repo searched for existing code that already does this, with the result written down?
+3. Do the scope limits block the obvious shared code?
+4. Is the caller named and tracked (an issue), or is there a stated reason there is none?
+5. Does every number say how it was measured (what was counted, by which script)?
+
+The answers belong in the plan or issue body, not in a reviewer's first round.
+
 ## Why it exists
 
 Review rounds accumulate for two reasons that the round COUNT cannot tell apart.

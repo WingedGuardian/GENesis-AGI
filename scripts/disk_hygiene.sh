@@ -44,6 +44,9 @@
 #  14. Retention prune of ~/.genesis/output/guard-corpus.jsonl (>45d)
 #      (the guard replay corpus and any temp an interrupted rebuild left; it is
 #      regenerable, and it holds verbatim command lines — see prune_guard_corpus)
+#  15. Retention prune of the work board's local stores → scripts/prune_board.py
+#      (closed open-questions + their edges >90d, board events >180d; unverified
+#      questions and promotion pointers are never pruned)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -63,7 +66,7 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 VENV_PY="$REPO_DIR/.venv/bin/python"
@@ -387,6 +390,10 @@ main() {
     echo "--- contributor work-log terminal-row prune (>30d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_contributor_issue_posts.py" --days 30 \
         || echo "prune_contributor_issue_posts exited $?"
+
+    echo "--- work-board retention prune (closed questions >90d, events >180d) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/prune_board.py" --question-days 90 --event-days 180 \
+        || echo "prune_board exited $?"
 
     echo "--- ego proposal-revision audit retention prune (ego_reconcile config) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_proposal_revisions.py" \

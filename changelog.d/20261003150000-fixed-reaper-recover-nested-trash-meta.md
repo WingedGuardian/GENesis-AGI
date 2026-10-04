@@ -1,0 +1,2 @@
+- **`worktree_lifecycle.py --recover` restores a worktree's own `.trash_meta.json` in a subdirectory.**
+  When the registration is gone and recovery recreates the worktree, it copies the archive's untracked files back and skips the reaper's own metadata. It skipped every file of that name at any depth, so a worktree's file of the same name in a subdirectory was not restored, and `--dry-run` did not count it. Only the file at the tree's root is the reaper's; the rest are now copied back and counted.

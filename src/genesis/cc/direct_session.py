@@ -24,7 +24,6 @@ import contextlib
 import json
 import logging
 import shutil
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -137,6 +136,13 @@ _NO_ENTITY_ADJUDICATION_WRITE = [
     "mcp__genesis-memory__entity_adjudication_reject",
 ]
 
+# Answering an owner's open question, or removing a block from one, is owner
+# authority (see the open-question tiers below _UNIVERSAL_DISALLOW).
+_NO_OPEN_QUESTION_AUTHORITY = [
+    "mcp__genesis-health__open_question_resolve",
+    "mcp__genesis-health__open_question_block",
+]
+
 _UNIVERSAL_DISALLOW = [
     "Bash",
     "Edit",
@@ -175,6 +181,11 @@ _UNIVERSAL_DISALLOW = [
     # ones, so no background profile can usurp the human decision. The read-only
     # `entity_adjudication_list` stays reachable (surfacing proposals is safe).
     *_NO_ENTITY_ADJUDICATION_WRITE,
+    # ── Open-question owner authority ─────────────────────────────
+    # Resolving a parked owner question, or removing a block from one, is the
+    # owner's call. Universal for the same reason as the gate above: an
+    # install-local overlay profile built from universal_disallow inherits it.
+    *_NO_OPEN_QUESTION_AUTHORITY,
     # ── User-scoped MCP servers (defense-in-depth) ────────────────
     # strict_mcp_config (CCInvocation default True) already drops these by making
     # --mcp-config authoritative; deny them by name too so a site that opts out of
@@ -309,11 +320,35 @@ _NO_MARKETING_SEND = [
     "mcp__genesis-outreach__marketing_prospects_list",
 ]
 
-# The venv Python interpreter running genesis-server. Exposed to profile
-# overlays (see _load_profile_overlays) so a locally-defined Bash profile can
-# allowlist exactly this path and run `<this> -m <module>`. Using
-# sys.executable keeps it install-agnostic (no hard-coded home path).
-_VENV_PYTHON = sys.executable
+# Open questions are owner decisions a session parked. Three tiers, by what each
+# tool exposes:
+#   * resolving one, or removing a block, IS owner authority — in
+#     _UNIVERSAL_DISALLOW (so install-local overlay profiles inherit it), never
+#     re-enabled by a tool_exception (the entity-adjudication precedent), and
+#     refused server-side for any dispatched session by guard_human_gate;
+#   * listing them reads private question text — denied on every profile that
+#     ingests external content, where an injected instruction could relay it out
+#     through that profile's outbound channel;
+#   * raising one is legitimate work for a background session (it parks a fork
+#     rather than guessing), but NOT from the untrusted-inbound perimeter, where
+#     the "question" would be attacker-authored text landing in the owner's queue,
+#     and NOT from read-only `observe`, which writes nothing.
+_NO_OPEN_QUESTION_READS = ["mcp__genesis-health__open_question_list"]
+_NO_OPEN_QUESTION_RAISE = ["mcp__genesis-health__open_question_raise"]
+
+# WITHDRAWN 2026-09-26: `_VENV_PYTHON` / `ProfileOverlayContext.venv_python`.
+# It existed so a locally-defined Bash profile could allowlist the venv
+# interpreter and run `<this> -m <module>`. That route no longer launches:
+# `invoker._required_hardening` refuses any allowlist entry that is in neither
+# `_BINARY_HARDENING` nor `_NEEDS_NO_HARDENING`, and `basename(sys.executable)`
+# is in neither — MEASURED, it raises out of `_build_env` on every dispatch.
+#
+# The refusal is CORRECT and is not the thing to change: an interpreter is an
+# arbitrary-program primitive (`python -c`), so no environment pin confines it.
+# What was wrong was leaving a comment here telling the next author to use a
+# route that raises. Reviving it needs a real `_BINARY_HARDENING` entry
+# (`-E`/`-s` plus `PYTHONSTARTUP`/`PYTHONPATH`/`PYTHONHOME`), each escape
+# MEASURED rather than reasoned about — not a field on this context.
 
 PROFILES: dict[str, list[str]] = {
     "observe": (
@@ -327,18 +362,22 @@ PROFILES: dict[str, list[str]] = {
         + _NO_RECON_WRITES
         + _NO_MARKETING_SEND
         + _NO_OUTREACH_QUEUE_CONTROL
+        + _NO_OPEN_QUESTION_RAISE  # observe is read-only: no question rows either
     ),
     "interact": (
         _UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES + _NO_MARKETING_SEND
-        + _NO_OUTREACH_QUEUE_CONTROL
+        + _NO_OUTREACH_QUEUE_CONTROL + _NO_OPEN_QUESTION_READS
     ),
     "research": (
         _UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION + _NO_MARKETING_SEND
-        + _NO_OUTREACH_QUEUE_CONTROL
+        + _NO_OUTREACH_QUEUE_CONTROL + _NO_OPEN_QUESTION_READS
     ),
     # `campaign` is the ONLY profile that may call marketing_send — the intended
     # autonomous cold-marketing caller. Every other profile denies it above/below.
-    "campaign": (_UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION + _NO_OUTREACH_QUEUE_CONTROL),
+    "campaign": (
+        _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION + _NO_OUTREACH_QUEUE_CONTROL
+        + _NO_OPEN_QUESTION_READS
+    ),
     # NO PROFILE SHIPS WITH Bash. A `steward` profile did until 2026-09-26 — the
     # only one — for upstream-PR stewardship, with `GENESIS_BASH_ALLOWLIST`
     # restricting its first token to `gh`. It was removed rather than fixed, and
@@ -371,6 +410,7 @@ PROFILES: dict[str, list[str]] = {
     # the coverage test in tests/test_cc/test_direct_session_profiles.py are
     # where it has to be classified.
     #
+
     # ── Community responder profile ─────────────────────────────
     # Reactive community responder: reads a community's channels and replies
     # via the discord-bot MCP server. MCP config loads discord-bot + health +
@@ -395,6 +435,8 @@ PROFILES: dict[str, list[str]] = {
         + _NO_PROVISIONING
         + _NO_MARKETING_SEND
         + _NO_OUTREACH_QUEUE_CONTROL
+        + _NO_OPEN_QUESTION_READS
+        + _NO_OPEN_QUESTION_RAISE
     ),
     # ── Perimeter profile ────────────────────────────────────────
     # For sessions that process untrusted inbound content (email
@@ -415,6 +457,8 @@ PROFILES: dict[str, list[str]] = {
         + _NO_PROVISIONING
         + _NO_MARKETING_SEND
         + _NO_OUTREACH_QUEUE_CONTROL
+        + _NO_OPEN_QUESTION_READS
+        + _NO_OPEN_QUESTION_RAISE
     ),
 }
 
@@ -617,7 +661,11 @@ class ProfileOverlayContext:
     no_recon_writes: list[str]
     no_web_tools: list[str]
     no_marketing_send: list[str]
-    venv_python: str
+    # Defaulted so an existing overlay (and any caller building the context by
+    # keyword) keeps working; an overlay profile that ingests external content
+    # should add the reads/raise groups the way the built-in perimeter does.
+    no_open_question_reads: list[str] = field(default_factory=lambda: list(_NO_OPEN_QUESTION_READS))
+    no_open_question_raise: list[str] = field(default_factory=lambda: list(_NO_OPEN_QUESTION_RAISE))
 
     def add_profile(
         self,
@@ -668,7 +716,6 @@ def _load_profile_overlays() -> None:
         no_recon_writes=_NO_RECON_WRITES,
         no_web_tools=_NO_WEB_TOOLS,
         no_marketing_send=_NO_MARKETING_SEND,
-        venv_python=_VENV_PYTHON,
     )
     try:
         profile_overlay.register(ctx)
@@ -1631,6 +1678,9 @@ class DirectSessionRunner:
             # background session (that would let it self-approve the gate,
             # defeating the whole point of the universal deny above).
             exceptions -= set(_NO_ENTITY_ADJUDICATION_WRITE)
+            # And for answering the owner's open questions: resolve/unblock is
+            # owner authority on every profile, so no exception re-grants it.
+            exceptions -= set(_NO_OPEN_QUESTION_AUTHORITY)
             disallowed = [t for t in disallowed if t not in exceptions]
 
         # Give background sessions access to Genesis MCP servers. Profile
@@ -1650,7 +1700,13 @@ class DirectSessionRunner:
         # servers. Honor an EXPLICIT mcp_profile="full" (a deliberate, trusted
         # install-local overlay choice — build_mcp_config returns None there so CC uses
         # its full default config) by opting that dispatch OUT of strict: "full" must
-        # mean full. Every other profile stays strict, so a None returned for an
+        # mean full. "Full" is NOT the repo's .mcp.json: this dispatch runs in
+        # background_session_dir(), outside the repo, so CC resolves only the
+        # user-scope (~/.claude.json) servers, plugins and claude.ai connectors
+        # there. A profile that
+        # needs a Genesis server (discord-bot included) names an _MCP_PROFILES
+        # entry instead.
+        # Every other profile stays strict, so a None returned for an
         # unknown/failed profile fails CLOSED to zero servers (never a silent full-leak).
         strict_mcp = mcp_profile != "full"
 

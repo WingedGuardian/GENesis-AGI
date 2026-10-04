@@ -540,6 +540,23 @@ def test_entity_adjudication_writes_cannot_be_re_enabled_via_tool_exceptions(pro
     assert tool in inv.disallowed_tools
 
 
+@pytest.mark.parametrize("profile", list(PROFILES))
+@pytest.mark.parametrize(
+    "tool",
+    ["mcp__genesis-health__open_question_resolve", "mcp__genesis-health__open_question_block"],
+)
+def test_open_question_authority_cannot_be_re_enabled_via_tool_exceptions(profile, tool):
+    """Answering the owner's open question, or unblocking work, is owner
+    authority on every profile — a per-request tool_exception must not re-grant
+    it, exactly as for the entity-adjudication gate above."""
+    runner = _make_runner()
+    req = DirectSessionRequest(
+        prompt="t", profile=profile, model=CCModel.SONNET, tool_exceptions=(tool,)
+    )
+    inv = runner._build_invocation(req, "test-session")
+    assert tool in inv.disallowed_tools
+
+
 _MARKETING_LIST = "mcp__genesis-outreach__marketing_prospects_list"
 
 
@@ -873,7 +890,6 @@ def _make_ctx(added):
         no_recon_writes=ds._NO_RECON_WRITES,
         no_web_tools=ds._NO_WEB_TOOLS,
         no_marketing_send=ds._NO_MARKETING_SEND,
-        venv_python=ds._VENV_PYTHON,
     )
     real_add = ctx.add_profile
 
@@ -933,6 +949,43 @@ def test_overlay_add_profile_defaults(overlay_ctx):
     assert ds._PROFILE_SKILLS["ztest-profile"] == []
 
 
+def test_the_overlay_context_no_longer_advertises_an_interpreter_route():
+    """WITHDRAWN 2026-09-26, and this is the lock that keeps it withdrawn.
+
+    `ProfileOverlayContext` used to expose `venv_python` so a locally-defined
+    Bash profile could allowlist the venv interpreter and run a module through
+    it. That route stopped launching when `invoker._required_hardening` began
+    refusing any allowlist entry in neither `_BINARY_HARDENING` nor
+    `_NEEDS_NO_HARDENING` — MEASURED: `basename(sys.executable)` is in neither,
+    so it raises out of `_build_env` before a session starts.
+
+    The refusal is not the thing to relax. An interpreter runs arbitrary code
+    from its own command line (`python -c`), so no environment pin confines it,
+    and re-adding the field would restore an advertisement for a route that
+    raises. Reviving it properly means a real `_BINARY_HARDENING` entry, each
+    escape measured — which this test does not block, because such an entry
+    would make the second assertion pass on its own.
+    """
+    import dataclasses
+    import sys
+
+    import genesis.cc.invoker as inv_mod
+    from genesis.cc import direct_session as ds
+
+    fields = {f.name for f in dataclasses.fields(ds.ProfileOverlayContext)}
+    assert "venv_python" not in fields, (
+        "the overlay context advertises an interpreter route again; it must not, "
+        "unless invoker._required_hardening has gained a real entry for it"
+    )
+    assert not hasattr(ds, "_VENV_PYTHON"), "the withdrawn constant is back"
+
+    # And the reason, asserted rather than trusted: the interpreter genuinely is
+    # refused. If someone DOES write its hardening, this assertion is the one to
+    # update, and the field may come back with it.
+    with pytest.raises(RuntimeError, match="neither _BINARY_HARDENING"):
+        inv_mod._required_hardening(sys.executable)
+
+
 def test_overlay_cannot_override_builtin_profile(overlay_ctx):
     """An overlay may only ADD profiles, never silently redefine a shipped one."""
     with pytest.raises(ValueError, match="may not override"):
@@ -949,14 +1002,19 @@ def test_overlay_profile_flows_through_build_invocation(overlay_ctx, monkeypatch
         "ztest-profile",
         disallow=[t for t in ds._UNIVERSAL_DISALLOW if t != "Bash"],
         addendum="x",
-        bash_allowlist=(ds._VENV_PYTHON,),
+        # `jq` deliberately: the point of this test is that an overlay's
+        # bash_allowlist FLOWS THROUGH, and it should flow through with a value
+        # that can actually launch. It used to name the venv interpreter, which
+        # `invoker._required_hardening` now refuses — so the test stayed green
+        # over a route that raises before exec.
+        bash_allowlist=("jq",),
         mcp_profile="campaign",
     )
     monkeypatch.setattr(ds, "VALID_PROFILES", ds.VALID_PROFILES | {"ztest-profile"})
     runner = _make_runner()
     req = DirectSessionRequest(prompt="t", profile="ztest-profile", model=CCModel.SONNET)
     inv = runner._build_invocation(req, "test-session")
-    assert inv.bash_allowlist == (ds._VENV_PYTHON,)
+    assert inv.bash_allowlist == ("jq",)
     runner._config_builder.build_mcp_config.assert_called_with(profile="campaign")
 
 
@@ -1216,3 +1274,45 @@ def test_no_background_profile_can_read_or_cancel_the_pending_queue():
         "background profile(s) can reach the pending-queue controls: "
         f"{gaps}. Add _NO_OUTREACH_QUEUE_CONTROL to each."
     )
+
+
+# --- open questions: owner authority everywhere, reads off external profiles ---
+
+
+def test_open_question_tool_scope_by_profile_origin():
+    """Derived from the classification, not a hand list: EVERY shipped profile
+    denies the owner-authority tools (resolve / block); every external-ingesting
+    profile also denies the private-text read; the untrusted-inbound perimeter
+    also denies raising one (attacker text in the owner's queue)."""
+    from genesis.cc.direct_session import _PROFILE_ORIGIN
+
+    authority = {"mcp__genesis-health__open_question_resolve", "mcp__genesis-health__open_question_block"}
+    reads = {"mcp__genesis-health__open_question_list"}
+    raise_ = {"mcp__genesis-health__open_question_raise"}
+    perimeter = {"community-responder", "mail"}
+    gaps = {}
+    for name in _SHIPPED_PROFILE_NAMES:
+        denied = set(PROFILES[name])
+        want = set(authority)
+        if _PROFILE_ORIGIN.get(name) == "external_untrusted":
+            want |= reads
+        if name in perimeter:
+            want |= reads | raise_
+        if name == "observe":
+            want |= raise_  # read-only: it writes no question rows either
+        if missing := want - denied:
+            gaps[name] = sorted(missing)
+    assert not gaps, f"profile(s) can reach open-question tools they must not: {gaps}"
+    assert "mcp__genesis-health__open_question_raise" not in PROFILES["research"], (
+        "a working background session may still park a fork"
+    )
+
+
+def test_open_question_authority_is_universal_so_overlay_profiles_inherit_it():
+    """Install-local overlay profiles build their deny list from
+    universal_disallow; the shipped-profile check above cannot see them, so the
+    authority tools must live in the universal list itself."""
+    from genesis.cc.direct_session import _UNIVERSAL_DISALLOW
+
+    authority = {"mcp__genesis-health__open_question_resolve", "mcp__genesis-health__open_question_block"}
+    assert authority <= set(_UNIVERSAL_DISALLOW)

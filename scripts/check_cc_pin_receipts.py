@@ -171,6 +171,21 @@ _PLACEHOLDERS = frozenset(
 _COMMENT_OPEN, _COMMENT_CLOSE = "<!--", "-->"
 _FENCE_MARKS = ("```", "~~~")
 
+#: Markdown line endings ONLY: ``\n``, ``\r\n`` and ``\r`` (CommonMark 0.31.2,
+#: "Characters and lines"). ``str.splitlines()`` also splits on ``\x85``,
+#: ``\u2028``, ``\u2029`` and the other Unicode separators a rendered body does
+#: NOT break on — text joined by one of them read as a standalone line, so a
+#: declaration in the middle of a rendered line could satisfy the marker's
+#: line-start anchor.
+_LINE_ENDS = re.compile(r"\r\n|\r|\n")
+
+#: A fence marker RUN: three or more of one character. CommonMark's close rule
+#: is a run of the SAME character as the opener and AT LEAST as long — a
+#: four-backtick block does not end at a three-backtick line, so the
+#: documented example inside one read as visible text.
+_FENCE_RUN = re.compile(r"`{3,}|~{3,}")
+
+
 #: GitHub's PR-body limit. Bound the work regardless of the scanner's O(n).
 _MAX_BODY = 65_536
 
@@ -296,19 +311,27 @@ def _outside_comments(line: str, in_comment: bool) -> tuple[str, bool]:
     return "".join(out), in_comment
 
 
-def readable_body(body: str) -> str:
+def readable_body(body: str, *, keep_blank: bool = False) -> str:
     """The part of a PR body a human actually reads.
 
     Removes HTML comments and fenced code blocks. Both hide text from the
     rendered view (a comment) or mark it as documentation rather than assertion
     (a fence), and a receipt the reviewer cannot see defeats the only enforcement
     this check has — a human reading a claim someone chose to make.
+
+    ``keep_blank=True`` additionally emits every blank source line (empty or
+    whitespace-only) that is outside a fence and outside a comment as ``""``,
+    so a caller that parses paragraphs can see where they end — CommonMark
+    0.31.2 ("Blank lines", "List items"): a blank line separates paragraphs and
+    can end a list item. Lines still dropped: anything a fence hides (the fence
+    markers included), anything a comment hides, and a line left empty only by
+    comment removal — none of those is a rendered blank line.
     """
     visible: list[str] = []
     in_comment = False
     fence: str | None = None
 
-    for line in body[:_MAX_BODY].splitlines():
+    for line in _LINE_ENDS.split(body[:_MAX_BODY]):
         # A FENCED line is OPAQUE — checked before comment state is touched, and its
         # own text is never interpreted. Markdown treats `<!--` inside a fence as
         # literal characters, so letting it open a comment here made the scanner and
@@ -323,7 +346,16 @@ def readable_body(body: str) -> str:
         # there is no comment stripping to apply, and Markdown wants the marker at
         # the start of the line regardless.
         if fence is not None:
-            if line.strip().startswith(fence):
+            stripped_close = line.strip()
+            closer = _FENCE_RUN.match(stripped_close)
+            if (
+                closer
+                and closer.group(0)[0] == fence[0]
+                and len(closer.group(0)) >= len(fence)
+                # CommonMark allows NOTHING but spaces after a closing marker —
+                # ````python is an example's content line, not a closer.
+                and not stripped_close[closer.end() :].strip()
+            ):
                 fence = None
             continue
 
@@ -337,6 +369,17 @@ def readable_body(body: str) -> str:
         # refused a compliant PR and told the author the receipts were missing
         # while they were plainly there. MEASURED before the fix — both receipts
         # reported absent, with the identical text on its own lines accepted.
+        # A blank SOURCE line outside a comment renders as a paragraph break, so
+        # keep_blank keeps it — but only the raw line is tested: a line emptied
+        # by comment removal renders as nothing, and a blank inside an open
+        # comment is hidden like any other commented text.
+        # Blank per CommonMark 0.31.2 ("Characters and lines"): empty, or only
+        # U+0020 spaces and U+0009 tabs. Not str.strip(), which would also call
+        # NBSP, form feed, vertical tab or U+2028 blank and invent a boundary.
+        if keep_blank and not in_comment and not line.strip(" \t"):
+            visible.append("")
+            continue
+
         rendered, in_comment = _outside_comments(line, in_comment)
         stripped = rendered.strip()
 
@@ -345,7 +388,9 @@ def readable_body(body: str) -> str:
         # rendered-as-code while counting as visible. (The close is handled at the
         # top of the loop; this is the OPEN.)
         if stripped.startswith(_FENCE_MARKS):
-            fence = stripped[:3]
+            # Record the whole RUN, not three characters: the closer must be
+            # the same character at least as long as the opener.
+            fence = _FENCE_RUN.match(stripped).group(0)
             continue
 
         if stripped:

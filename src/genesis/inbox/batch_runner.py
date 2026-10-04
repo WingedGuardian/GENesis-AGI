@@ -8,7 +8,8 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from genesis.cc.exceptions import CCNetworkOfflineError
+from genesis.cc.exceptions import CCNetworkOfflineError, CCOverloadedError, CCReplayUnsafeError
+from genesis.cc.transient_retry import run_with_overload_retry
 from genesis.inbox.scanner import extract_urls as _extract_urls
 from genesis.inbox.url_coverage import (
     _coverage_url_label,
@@ -130,6 +131,13 @@ async def run_one_batch(
     from genesis.cc.types import SessionType
     from genesis.db.crud import inbox_items, message_queue
 
+    if item.file_path in await inbox_items.get_opaque_replay_hold_files(monitor._db):
+        monitor._alert_parked(
+            item.file_path, reason="replay_unsafe_storage",
+            detail="A replay-held batch has unreadable item boundaries. Repair it before dispatch.",
+        )
+        return False
+
     batch_id = str(uuid.uuid4())
     await inbox_items.set_batch(monitor._db, item.id, batch_id=batch_id)
     prompt = monitor._build_prompt([item])
@@ -161,14 +169,33 @@ async def run_one_batch(
         return False
 
     try:
-        output = await monitor._invoker.run(invocation)
-    except CCNetworkOfflineError as exc:
+        output = await run_with_overload_retry(monitor._invoker, invocation)
+    except CCReplayUnsafeError as exc:
+        err = f"{inbox_items.REPLAY_UNSAFE_PREFIX} CC work may already have run: {exc}"
+        errors.append(err)
+        logger.error("Inbox batch %s held to avoid replay", batch_id[:8])
+        await inbox_items.mark_failed_keeping_retries(
+            monitor._db, item.id, error_message=err, processed_at=now_iso,
+        )
+        # The replay barrier must survive independent session-bookkeeping failure.
+        try:
+            await monitor._session_manager.fail(session_id, reason=err)
+        except Exception:
+            logger.exception("Could not finalize session for held inbox batch %s", batch_id[:8])
+        monitor._alert_parked(
+            item.file_path, reason="replay_unsafe",
+            detail="Work may already have run. Inspect this batch before explicitly releasing it.",
+            item_id=item.id, texts=[item.content], occurrence=f"{item.id}:{now_iso}",
+        )
+        return False
+    except (CCNetworkOfflineError, CCOverloadedError) as exc:
         # #1766 (inbox leg): the network being down is not this item's
         # failure. Fail the row so the retry lane picks it up once
         # connectivity returns, but keep its retry budget — the default
         # failed-path increment turns a ~90-minute outage into permanently
         # parked items (3 retries x 30-minute scans).
-        err = f"CC invocation deferred, network offline: {exc}"
+        reason = "provider overloaded" if isinstance(exc, CCOverloadedError) else "network offline"
+        err = f"CC invocation deferred, {reason}: {exc}"
         errors.append(err)
         logger.warning(err)
         await monitor._session_manager.fail(session_id, reason=err)

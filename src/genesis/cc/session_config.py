@@ -55,7 +55,7 @@ _REFLECTION_READ_MCP: frozenset[str] = frozenset({
     "ego_goal_list", "experiment_status", "health_alerts", "health_errors", "health_status",
     "immunity_status", "inbox_digest", "infrastructure_profile", "j9_eval_status", "job_health",
     "loop_closure_status", "module_list", "provider_activity", "reflex_status",
-    "zero_drop_status",
+    "zero_drop_status", "open_question_list",
     "session_charter", "settings_get", "settings_list",
     "subsystem_heartbeats", "task_detail", "task_list", "update_history_recent",
     "follow_up_list", "web_fetch", "web_search",
@@ -132,8 +132,9 @@ def render_mcp_servers(
 ) -> dict:
     """Render ``config/mcp.json.template`` into an MCP-config dict.
 
-    Pure function: no cache, no file writes — the single owner of the
-    ``{{GENESIS_ROOT}}`` substitution contract. ``build_mcp_config`` layers
+    Pure function: no cache, no file writes — the runtime owner of the
+    ``{{GENESIS_ROOT}}`` substitution contract (``scripts/setup_claude_config.py``
+    keeps a stdlib copy for the install-time ``.mcp.json`` render). ``build_mcp_config`` layers
     its mtime cache on top; the eval bench calls this directly to inject
     per-run ``env`` blocks (a shared ``.generated/`` cache is wrong for
     per-run configs). ``servers=None`` keeps every server; otherwise filter
@@ -296,7 +297,15 @@ class SessionConfigBuilder:
         Profiles:
           - ``"none"``: no MCP servers (LIGHT reflection).
           - ``"reflection"``: health + memory only (DEEP/STRATEGIC).
-          - ``"full"``: all servers — returns *None* so CC uses its default config.
+          - ``"full"``: returns *None* so CC resolves its own default config
+            for the session's working directory. ``DirectSessionRunner``, the
+            only caller that honours ``"full"``, runs in
+            ``background_session_dir()``, outside the repo, so that is the
+            user-scope (``~/.claude.json``) servers, plugins and claude.ai
+            connectors, NOT the repo's
+            ``.mcp.json`` and none of the Genesis servers. No shipped profile
+            maps here; a profile that needs a Genesis server, ``discord-bot``
+            included, must name an ``_MCP_PROFILES`` entry.
 
         Returns a file path string or *None*.
         """

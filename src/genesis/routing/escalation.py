@@ -19,6 +19,7 @@ import uuid
 from datetime import UTC, datetime
 
 from genesis.observability.types import GenesisEvent, Severity, Subsystem
+from genesis.routing.provider_identity import valid_identity
 from genesis.util.tasks import tracked_task
 
 logger = logging.getLogger(__name__)
@@ -53,16 +54,42 @@ _NOTIFY_AFTER_S = 3600.0
 _EVIDENCE_SPAN_CAP_S = 14 * 24 * 3600
 
 
+def _incident_is_current(provider: str, incident: str | None, lookup, owner=None) -> bool:
+    """Absent bindings are stale; a live legacy None namespace is valid."""
+    if owner is not None:
+        return owner(provider, incident) is not None
+    if lookup is None:
+        return True
+    try:
+        return incident == lookup(provider)
+    except KeyError:
+        # A removed/renamed alias is not a live legacy incident. In particular,
+        # substituting None here would authorize an old legacy writer.
+        return False
+
+
 class ProviderEscalation:
     """Track per-provider failures and escalate to observations."""
 
-    def __init__(self, db, event_bus, *, clock=None):
+    def __init__(self, db, event_bus, *, clock=None, current_identity=None,
+                 current_incident_identity=None, incident_binding=None, incident_owner=None):
+        self._current_identity = current_identity
+        self._current_incident_identity = current_incident_identity
+        self._incident_binding = incident_binding
+        self._incident_owner = incident_owner
         self._db = db
         self._event_bus = event_bus
         self._clock = clock or (lambda: datetime.now(UTC))
         # Per-provider tracking state:
         # {name: {"trip_count": int, "first_trip_at": str, "escalated": bool}}
-        self._state: dict[str, dict] = {}
+        self._state: dict[str | tuple[str, str], dict] = {}
+
+    def _incident_is_current(self, provider: str, incident: str | None) -> bool:
+        return _incident_is_current(provider, incident, self._current_incident_identity, self._incident_owner)
+
+    @staticmethod
+    def _state_key(provider, incident):
+        return provider if incident is None else (provider, incident)
 
     def attach(self) -> None:
         """Subscribe to routing events on the event bus."""
@@ -75,9 +102,22 @@ class ProviderEscalation:
             return
 
         provider = event.details.get("provider", "unknown")
+        identity = event.details.get("health_identity")
+        if (identity is not None and self._current_identity is not None
+                and identity != self._current_identity(provider)):
+            return  # reload may happen while an earlier bus listener awaits
+        incident = event.details.get("incident_identity")
+        if self._incident_binding is not None:
+            anchor, current = self._incident_binding(provider)
+            if current != incident:
+                return
+            provider = anchor
+        if not self._incident_is_current(provider, incident):
+            return
         state = self._state.setdefault(
-            provider,
+            self._state_key(provider, incident),
             {
+                "incident_identity": incident,
                 "trip_count": 0,
                 "first_trip_at": None,
                 "escalated": False,
@@ -166,6 +206,23 @@ class ProviderEscalation:
         # anchor). The decision now lives in `sweep_due_notifications()`, driven
         # by the awareness tick and reading the durable row. See its docstring.
 
+    def record_retirement(self, provider: str, incident_identity: str | None) -> None:
+        """Retire obsolete evidence without asserting successful recovery."""
+        key = self._state_key(provider, incident_identity)
+        state = self._state.get(key)
+        if state is not None:
+            del self._state[key]
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        tracked_task(
+            self._resolve_observation(provider, incident_identity,
+                                      resolution_notes="auto-retired: identity replaced after proven model retirement"),
+            name=f"escalation-retire-{provider}", event_bus=self._event_bus,
+            subsystem=Subsystem.ROUTING,
+        )
+
     def record_recovery(self, provider: str) -> None:
         """Called when a provider recovers (breaker → CLOSED).
 
@@ -177,13 +234,18 @@ class ProviderEscalation:
         created before a restart still clears — mirrors the dead-letter
         resolve-on-drain pattern.
         """
-        if provider in self._state:
+        incident = (self._current_incident_identity(provider)
+                    if self._current_incident_identity is not None else None)
+        if self._incident_binding is not None:
+            provider, incident = self._incident_binding(provider)
+        key = self._state_key(provider, incident)
+        if key in self._state:
             logger.info(
                 "Provider '%s' recovered after %d trips — clearing escalation state",
                 provider,
-                self._state[provider].get("trip_count", 0),
+                self._state[key].get("trip_count", 0),
             )
-            del self._state[provider]
+            del self._state[key]
 
         # record_recovery() is called from the SYNC CircuitBreaker.record_success()
         # path. In production that runs inside the async routing call (a loop is
@@ -198,7 +260,7 @@ class ProviderEscalation:
             )
             return
         tracked_task(
-            self._resolve_observation(provider),
+            self._resolve_observation(provider, incident),
             name=f"escalation-resolve-{provider}",
             event_bus=self._event_bus,
             subsystem=Subsystem.ROUTING,
@@ -208,9 +270,13 @@ class ProviderEscalation:
         """Create a high-priority observation for a persistently failing provider."""
         from genesis.db.crud import observations
 
+        incident = state.get("incident_identity")
+        if not self._incident_is_current(provider, incident):
+            return
         content = json.dumps(
             {
                 "provider": provider,
+                "incident_identity": incident,
                 "trip_count": state["trip_count"],
                 "first_trip_at": state["first_trip_at"],
                 # Says what the trip record SHOWS. "N times since <date>" read as
@@ -228,9 +294,9 @@ class ProviderEscalation:
                 ),
             }
         )
-        # Hash on provider name — one unresolved observation per provider.
+        # One unresolved observation per provider incident; legacy hashes remain valid.
         # Shared helper so the resolve-on-recovery path computes the SAME hash.
-        content_hash = self._provider_content_hash(provider)
+        content_hash = self._provider_content_hash(provider, incident)
 
         try:
             obs_id = await observations.create(
@@ -254,6 +320,12 @@ class ProviderEscalation:
             # `skip_if_duplicate` found an unresolved one already there. BOTH
             # are "escalated"; only an EXCEPTION leaves it unwritten, and that
             # path deliberately does not set the flag so a later trip retries.
+            if not self._incident_is_current(provider, incident):
+                await self._resolve_observation(
+                    provider, incident,
+                    resolution_notes="auto-retired: provider binding or incident is no longer current",
+                )
+                return
             state["escalated"] = True
             if obs_id:
                 logger.warning(
@@ -275,7 +347,8 @@ class ProviderEscalation:
                 exc_info=True,
             )
 
-    async def _resolve_observation(self, provider: str) -> None:
+    async def _resolve_observation(self, provider: str, incident_identity: str | None = None,
+                                   *, resolution_notes: str | None = None) -> None:
         """Resolve the lingering provider_failure observation on recovery.
 
         Keyed on the deterministic per-provider content_hash, so only THIS
@@ -308,8 +381,8 @@ class ProviderEscalation:
         # as failing when it is not, and the next recovery clears it: visible.
         # Visible beats silent at identical cost.
         content_hashes = (
-            self._notify_content_hash(provider),
-            self._provider_content_hash(provider),
+            self._notify_content_hash(provider, incident_identity),
+            self._provider_content_hash(provider, incident_identity),
         )
         try:
             resolved = 0
@@ -319,7 +392,7 @@ class ProviderEscalation:
                     source="routing",
                     content_hash=content_hash,
                     resolved_at=self._clock().isoformat(),
-                    resolution_notes=(
+                    resolution_notes=resolution_notes or (
                         f"auto-resolved: provider '{provider}' recovered (circuit breaker closed)"
                     ),
                 )
@@ -367,13 +440,18 @@ class ProviderEscalation:
         await notify_provider_if_due(self._db, provider, clock=self._clock)
 
     @staticmethod
-    def _notify_content_hash(provider: str) -> str:
-        return hashlib.sha256(f"provider_dead_notify:{provider}".encode()).hexdigest()
+    def _incident_hash(prefix: str, provider: str, incident_identity: str | None) -> str:
+        suffix = f":{incident_identity}" if incident_identity is not None else ""
+        return hashlib.sha256(f"{prefix}:{provider}{suffix}".encode()).hexdigest()
 
     @staticmethod
-    def _provider_content_hash(provider: str) -> str:
-        """Deterministic per-provider hash — MUST match between create + resolve."""
-        return hashlib.sha256(f"provider_failure:{provider}".encode()).hexdigest()
+    def _notify_content_hash(provider: str, incident_identity: str | None = None) -> str:
+        return ProviderEscalation._incident_hash("provider_dead_notify", provider, incident_identity)
+
+    @staticmethod
+    def _provider_content_hash(provider: str, incident_identity: str | None = None) -> str:
+        """Incident hash shared by create, resolve and notification consumers."""
+        return ProviderEscalation._incident_hash("provider_failure", provider, incident_identity)
 
 
 async def notify_provider_if_due(
@@ -383,6 +461,9 @@ async def notify_provider_if_due(
     clock=None,
     priority: str = "critical",
     provider_still_failing=None,
+    incident_identity: str | None = None,
+    current_incident_identity=None,
+    incident_owner=None,
 ) -> bool:
     """Tell the user ONCE that a provider has been dead long enough to matter.
 
@@ -402,7 +483,7 @@ async def notify_provider_if_due(
     from genesis.db.crud import observations
 
     clock = clock or (lambda: datetime.now(UTC))
-    failure_hash = ProviderEscalation._provider_content_hash(provider)
+    failure_hash = ProviderEscalation._provider_content_hash(provider, incident_identity)
     try:
         # Hash-scoped read, NOT `query(resolved=False, limit=N)` + a Python
         # filter: that shape silently starves this provider once the TOTAL
@@ -490,7 +571,8 @@ async def notify_provider_if_due(
     # direction and a wrong page is the unrecoverable one.
     if provider_still_failing is not None:
         try:
-            if not provider_still_failing(provider):
+            live_provider = incident_owner(provider, incident_identity) if incident_owner is not None else provider
+            if live_provider is None or not provider_still_failing(live_provider):
                 logger.info(
                     "outage row for '%s' is past the floor but the breaker "
                     "reads recovered — stale row, not paging",
@@ -525,7 +607,7 @@ async def notify_provider_if_due(
             resolved=True,
             limit=_SWEEP_ROW_LIMIT,
         )
-        notify_hash = ProviderEscalation._notify_content_hash(provider)
+        notify_hash = ProviderEscalation._notify_content_hash(provider, incident_identity)
         for r in prior:
             if r.get("content_hash") != notify_hash:
                 continue
@@ -575,6 +657,8 @@ async def notify_provider_if_due(
         human = f"more than {_EVIDENCE_SPAN_CAP_S / 86400:.0f} days"
     else:
         human = f"{hours / 24:.1f} days" if hours >= 24 else f"{hours:.1f} hours"
+    if not _incident_is_current(provider, incident_identity, current_incident_identity, incident_owner):
+        return False
     try:
         obs_id = await observations.create(
             db,
@@ -584,6 +668,7 @@ async def notify_provider_if_due(
             content=json.dumps(
                 {
                     "provider": provider,
+                    "incident_identity": incident_identity,
                     "outage_started_at": started.isoformat(),
                     # "has been failing EVERY CALL for N days" was the false
                     # claim at the centre of this PR. Between two trips a week
@@ -604,7 +689,7 @@ async def notify_provider_if_due(
             priority=priority,
             category="system_health",
             created_at=clock().isoformat(),
-            content_hash=ProviderEscalation._notify_content_hash(provider),
+            content_hash=ProviderEscalation._notify_content_hash(provider, incident_identity),
             skip_if_duplicate=True,
         )
     except Exception:
@@ -613,6 +698,14 @@ async def notify_provider_if_due(
         )
         return False
 
+    if not _incident_is_current(provider, incident_identity, current_incident_identity, incident_owner):
+        await observations.resolve_by_content_hash(
+            db, source="routing",
+            content_hash=ProviderEscalation._notify_content_hash(provider, incident_identity),
+            resolved_at=clock().isoformat(),
+            resolution_notes="auto-retired: provider binding or incident is no longer current",
+        )
+        return False
     if obs_id:
         logger.warning(
             "Notified user: provider '%s' has been failing for %s", provider, human
@@ -633,7 +726,9 @@ _SWEEP_ROW_LIMIT = 200
 
 
 async def sweep_due_notifications(
-    db, *, clock=None, priority: str = "critical", provider_still_failing=None
+    db, *, clock=None, priority: str = "critical", provider_still_failing=None,
+    current_incident_identity=None,
+    incident_owner=None,
 ) -> int:
     """Notify for every provider whose unresolved outage has passed the floor.
 
@@ -689,7 +784,7 @@ async def sweep_due_notifications(
             _SWEEP_ROW_LIMIT,
         )
 
-    providers: set[str] = set()
+    providers: set[tuple[str, str | None]] = set()
     for row in rows:
         raw = row.get("content")
         try:
@@ -698,18 +793,29 @@ async def sweep_due_notifications(
             continue
         if isinstance(blob, dict):
             name = blob.get("provider")
-            if isinstance(name, str) and name:
-                providers.add(name)
+            incident = blob.get("incident_identity")
+            if isinstance(name, str) and name and (incident is None or valid_identity(incident)):
+                providers.add((name, incident))
 
     written = 0
-    for provider in sorted(providers):
+    for provider, saved_incident in sorted(providers, key=lambda pair: (pair[0], pair[1] or "")):
         try:
+            if incident_owner is not None:
+                incident = saved_incident
+                if incident_owner(provider, incident) is None:
+                    continue
+            else:
+                incident = (current_incident_identity(provider)
+                            if current_incident_identity is not None else None)
             if await notify_provider_if_due(
                 db,
                 provider,
                 clock=clock,
                 priority=priority,
                 provider_still_failing=provider_still_failing,
+                incident_identity=incident,
+                current_incident_identity=current_incident_identity,
+                incident_owner=incident_owner,
             ):
                 written += 1
         except Exception:

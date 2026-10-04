@@ -486,14 +486,10 @@ if ! command -v uv &>/dev/null; then
     [[ -n "$_uv_installer" ]] && rm -f "$_uv_installer"
     export PATH="$HOME/.local/bin:$PATH"
 fi
+# shellcheck source=lib/serena_install.sh
+. "$SCRIPT_DIR/lib/serena_install.sh"
 if command -v uv &>/dev/null; then
-    if ! command -v serena &>/dev/null; then
-        echo "  Serena not found — installing..."
-        uv tool install serena-agent 2>/dev/null || echo "  WARNING: Serena install failed (non-critical)"
-    else
-        echo "  Serena: upgrading..."
-        uv tool upgrade serena-agent 2>/dev/null || echo "  WARNING: Serena upgrade failed (non-critical)"
-    fi
+    _install_serena
 fi
 if command -v serena &>/dev/null; then
     echo "  Serena: $(serena --version 2>/dev/null || echo 'installed')"
@@ -788,11 +784,11 @@ if command -v codebase-memory-mcp &>/dev/null; then
         echo "  codebase-memory-mcp registered to the launcher; the kill switch is active, so it will refuse to start"
     fi
 fi
-if command -v serena &>/dev/null; then
+if _serena_registration_available; then
     # `-s project` writes .mcp.json keyed to the git-root of the CURRENT dir (no
     # flag overrides this), so register from the repo root regardless of the
     # caller's cwd — else bootstrap run from elsewhere writes to the wrong repo. B5.
-    ( cd "$GENESIS_ROOT" && _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$GENESIS_ROOT" )
+    ( cd "$GENESIS_ROOT" && _register_serena "$GENESIS_ROOT" )
 fi
 # grep-app (grep.app) — literal/regex code search over ~1M public GitHub repos.
 # Registered as `grep-app`, NOT the `grep` that grep.app's own docs use: a name
@@ -1161,7 +1157,7 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         CC_BIN_DIR="$CC_BIN_DIR:$_cc_prefix/bin"
     fi
 
-    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
+    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template "$SYSTEMD_TEMPLATE_DIR"/*.slice.template; do
         [[ -f "$template" ]] || continue
         svc_name=$(basename "$template" .template)
 
@@ -1214,6 +1210,19 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     systemctl --user daemon-reload 2>/dev/null || true
     if [[ "$SERVICES_UPDATED" = "1" ]]; then
         echo "  systemd daemon reloaded (units changed)"
+    fi
+
+    # A user manager stops at logout without lingering, taking every enabled
+    # timer with it — `Persistent=true` only replays the miss once the manager
+    # next starts, which for a daily watcher may be never. Mirror install.sh.
+    if command -v loginctl &>/dev/null; then
+        if ! loginctl show-user "$(whoami)" 2>/dev/null | grep -q "Linger=yes"; then
+            if loginctl enable-linger "$(whoami)" 2>/dev/null; then
+                echo "  + linger enabled for $(whoami)"
+            else
+                echo "  WARNING: could not enable linger (timers stop on logout)"
+            fi
+        fi
     fi
 
     # Enable + start every rendered timer (idempotent), EXCEPT timers that are a

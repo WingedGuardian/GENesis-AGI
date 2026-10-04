@@ -1,0 +1,1 @@
+- Global process discovery now records inspection candidates without terminating CLI or browser processes, including when legacy reaper arm flags are present. Explicitly owned jobs keep their existing cancellation behavior.

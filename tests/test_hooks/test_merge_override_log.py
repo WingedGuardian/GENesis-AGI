@@ -407,23 +407,31 @@ class TestWiredIntoTheMergePath:
         # docstrings claimed to exercise "a real merge". Mirrors the seam set in
         # test_merge_gate_characterization.py, which is network-free by design.
         # ONE JSON OBJECT PER LINE, per `_codex_reviews`' documented seam contract.
-        # ⚠ `rounds` does NOT reach the escalation gate's cap comparisons, though an
-        # earlier version of this comment claimed it was the only way to. MEASURED
-        # 2026-09-25: every record below carries the SAME `commit_id`, and
-        # `evaluate_evidence` dedupes reviewed heads by commit id, so any N yields
-        # count=1; and this helper omits the `_TEST_REVIEW_BUDGET_*` seams entirely,
-        # so `evaluate_pr` returns `status=unknown / reason=evidence_unknown /
-        # count=None` and no budget is computed at all. Tests here therefore exercise
-        # the evidence-unreadable DEGRADE path, not any cap. Issue #2378 repairs it;
-        # `tests/test_hooks/test_git_push_guard_escalation.py` is where the caps are
-        # actually covered (counts 0,2,3,4,5 observed, status ok).
+        # `rounds` is the REAL round count (#2378): one review per DISTINCT head,
+        # the last at HEAD so the merge path's freshness gate (which reads the
+        # same seam) still sees a review at head, plus the `_TEST_REVIEW_BUDGET_*`
+        # seams the evaluator reads, so `evaluate_pr` computes a budget instead of
+        # degrading to `unknown`. The records carry no timestamp, so they count
+        # under the pre-cutover rule: every head the primary reviewed.
+        heads = [f"{n:040x}" for n in range(1, rounds)] + [HEAD]
         monkeypatch.setenv(
             "_TEST_GH_CODEX_REVIEWS",
             "\n".join(
-                json.dumps({"login": "chatgpt-codex-connector[bot]", "commit_id": HEAD})
-                for _ in range(rounds)
+                json.dumps(
+                    {"login": "chatgpt-codex-connector[bot]", "commit_id": h, "state": "COMMENTED"}
+                )
+                for h in heads
             ),
         )
+        monkeypatch.setenv("_TEST_REVIEW_BUDGET_HEAD", HEAD)
+        # The review-request gate derives the repo with `gh repo view` unless
+        # pinned: unauthenticated (a CI runner) that read fails, `evaluate_pr` is
+        # never called, and the test silently measures the degrade path again.
+        monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "owner/repo")
+        monkeypatch.setenv(
+            "_TEST_REVIEW_BUDGET_COMMITS", "\n".join(json.dumps({"sha": h}) for h in heads)
+        )
+        monkeypatch.setenv("_TEST_REVIEW_BUDGET_FILES", json.dumps({"filename": "src/x.py"}))
         monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
         monkeypatch.setenv(
             "_TEST_GH_SCHEDULED_COMMENTS",
@@ -602,27 +610,11 @@ class TestWiredIntoTheMergePath:
         separate decision; this test pins the CURRENT answer (it does not), so a
         future change to it is deliberate rather than accidental.
 
-        ⚠ **This test does NOT reach the cap comparisons, and it never did.**
-        MEASURED 2026-09-25 by spying the shipped `evaluate_pr` during this very
-        test: five calls, every one `status=unknown / reason=evidence_unknown /
-        count=None`. `_drive` omits the `_TEST_REVIEW_BUDGET_*` seams the evaluator
-        reads (`review_budget.py:465,513,525`), so the budget is never computed and
-        the `ask` observed here is the evidence-unreadable DEGRADE, not a cap.
-        Its `rounds=` knob is inert twice over: the records it fabricates all carry
-        the same `commit_id`, and `evaluate_evidence` dedupes by head (N=1,3,5,7 all
-        yield `count=1`).
-
-        So what this test actually pins is narrower than an earlier version of this
-        docstring claimed, and worth keeping at that narrower scope: **the override
-        scan writes no row for these sigils**, including on the degraded path.
-        It does NOT pin the cap branches.
-
-        The cap comparisons ARE covered — by
-        `tests/test_hooks/test_git_push_guard_escalation.py`, which drives the real
-        budget with DISTINCT heads; counts 0, 2, 3, 4 and 5 were observed there,
-        with `status: ok`. Look there for a change to the cap tiers, and fix
-        `_drive`'s seams here before trusting this file for anything round-related
-        (issue filed).
+        It pins that **the override scan writes no row for these sigils**. The cap
+        branches themselves are pinned by
+        `test_the_review_request_reaches_the_real_cap_comparisons` below, which
+        drives the real budget through `_drive`'s seams (#2378), and by
+        `tests/test_hooks/test_git_push_guard_escalation.py`.
         """
         for cmd in (
             'git commit -m "wip"  # escalation-ack',
@@ -646,8 +638,36 @@ class TestWiredIntoTheMergePath:
         #     the SIGIL rather than on any count, so the first loop covers it too.
         #
         # What remains is the honest claim: the scan writes no row for an ack-class
-        # sigil on the review-request path. Repairing `_drive`'s seams so a test here
-        # CAN reach the cap comparisons is issue #2378.
+        # sigil on the review-request path.
+
+    def test_the_review_request_reaches_the_real_cap_comparisons(self, monkeypatch, log_dir):
+        """#2378: `_drive`'s `rounds` reaches the evaluator as a REAL count. Below
+        the ordinary limit a review request is allowed; at it, it asks. Spied
+        rather than inferred, so a degraded `unknown` (which also asks) cannot
+        pass this test, and a broken cap comparison flips the verdict."""
+        seen: list[tuple[object, ...]] = []
+        evaluate = _mod._review_budget.evaluate_pr
+        decide = _mod._check_codex_round_escalation
+
+        def spy_evaluate(*a, **k):
+            result = evaluate(*a, **k)
+            seen.append(("budget", result["status"], result["count"]))
+            return result
+
+        def spy_decide(*a, **k):
+            decision = decide(*a, **k)
+            seen.append(("decision", decision[0]))
+            return decision
+
+        monkeypatch.setattr(_mod._review_budget, "evaluate_pr", spy_evaluate)
+        monkeypatch.setattr(_mod, "_check_codex_round_escalation", spy_decide)
+        limit = _mod._review_budget.STANDING_REVIEWED_HEAD_LIMIT
+        for rounds, verdict in ((limit - 1, "allow"), (limit, "ask")):
+            seen.clear()
+            self._drive(monkeypatch, 'gh pr comment 5 --body "@codex review"', rounds=rounds)
+            assert ("budget", "ok", rounds) in seen, seen
+            assert ("decision", verdict) in seen, seen
+        assert _rows(log_dir) == []
 
     def test_no_sigil_writes_nothing(self, monkeypatch, log_dir):
         """Positive control's twin: an ordinary merge must not log."""

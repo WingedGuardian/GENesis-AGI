@@ -169,6 +169,214 @@ def test_score_skill_not_diluted_by_long_prompt():
     assert score >= _MIN_SCORE
 
 
+# --- Precision: name-token stoplist + vendor namespace gate ---
+
+
+def test_stoplisted_name_tokens_no_longer_score():
+    """'user' / 'genesis' are everyday words; a skill NAMED after one must not
+    fire on every prompt that uses the word (see the measurement cited at
+    _NAME_TOKEN_STOPLIST)."""
+    from skill_injection_hook import _score_skill
+
+    user_eval = {"name": "user_evaluate", "description": "", "keywords": []}
+    gvoice = {"name": "genesis-voice", "description": "", "keywords": []}
+    assert _score_skill(user_eval, ["user", "wants", "numbers"]) == 0.0
+    assert _score_skill(gvoice, ["genesis", "memory", "recall"]) == 0.0
+    # The distinctive half of each name still scores.
+    assert _score_skill(user_eval, ["evaluate"]) == 2.0
+    assert _score_skill(gvoice, ["voice"]) == 2.0
+
+
+def test_stoplisted_word_still_scores_as_explicit_keyword():
+    """The stoplist trims NAME tokens only; a declared keyword always scores."""
+    from skill_injection_hook import _NAME_TOKEN_STOPLIST, _score_skill
+
+    assert "browser" in _NAME_TOKEN_STOPLIST, "fixture needs a stoplisted word"
+    skill = {"name": "browser-automation", "description": "", "keywords": ["browser"]}
+    assert _score_skill(skill, ["browser"]) == 2.0
+    bare = {"name": "browser-automation", "description": "", "keywords": []}
+    assert _score_skill(bare, ["browser"]) == 0.0
+
+
+def test_stoplist_is_one_frozen_constant():
+    """One constant, not a scatter of per-skill exceptions."""
+    import skill_injection_hook as hook
+
+    assert isinstance(hook._NAME_TOKEN_STOPLIST, frozenset)
+    assert {"genesis", "user", "plan", "planning", "model"} <= hook._NAME_TOKEN_STOPLIST
+    stoplists = [
+        n for n in vars(hook) if "STOPLIST" in n.upper()
+    ]
+    assert stoplists == ["_NAME_TOKEN_STOPLIST"], stoplists
+
+
+def _lib_skill(library: Path, *parts: str) -> dict:
+    return {
+        "name": parts[-1],
+        "description": "",
+        "keywords": [],
+        "tier": 2,
+        "path": str(library.joinpath(*parts)),
+    }
+
+
+def test_vendor_gate_blocks_library_skill_without_vendor_token(tmp_path, monkeypatch):
+    """'planning the report' must not reach the AWS bundle's 'planning' skill,
+    and an un-stoplisted name word alone ('version checker', no vendor word)
+    must not reach a vendor skill either — the gate needs the vendor named."""
+    import skill_injection_hook as hook
+
+    monkeypatch.setattr(hook, "_SKILL_LIBRARY_DIR", tmp_path)
+    planning = _lib_skill(tmp_path, "aws", "sagemaker-ai", "skills", "planning")
+    checker = _lib_skill(tmp_path, "aws", "sagemaker-ai", "skills", "hyperpod-version-checker")
+    assert hook._score_skill(planning, hook._extract_keywords("planning the report")) == 0.0
+    assert hook._score_skill(checker, ["version", "checker"]) == 0.0
+
+
+def test_vendor_gate_allows_skill_when_vendor_alias_present(tmp_path, monkeypatch):
+    """'sagemaker model evaluation' names the vendor (alias), so the bundle's
+    model-evaluation skill scores on 'evaluation' ('model' is stoplisted)."""
+    import skill_injection_hook as hook
+
+    monkeypatch.setattr(hook, "_SKILL_LIBRARY_DIR", tmp_path)
+    skill = _lib_skill(tmp_path, "aws", "sagemaker-ai", "skills", "model-evaluation")
+    kws = hook._extract_keywords("sagemaker model evaluation")
+    assert hook._score_skill(skill, kws) >= hook._MIN_SCORE
+
+
+def test_vendor_gate_still_lets_aws_lambda_through(tmp_path, monkeypatch):
+    """The deliberate whole-word behaviour survives the gate: 'aws lambda'
+    names the vendor and both name tokens."""
+    import skill_injection_hook as hook
+
+    monkeypatch.setattr(hook, "_SKILL_LIBRARY_DIR", tmp_path)
+    skill = _lib_skill(tmp_path, "aws", "aws-serverless", "skills", "aws-lambda")
+    assert (
+        hook._score_skill(skill, hook._extract_keywords("aws lambda"), "aws lambda")
+        == 2.0
+    )
+
+
+def test_vendor_gate_derives_vendor_from_path_not_a_hardcoded_list(tmp_path, monkeypatch):
+    """An unknown bundle is gated by its own folder name, with no alias entry;
+    a skill sitting directly in the library and a repo skill are not gated."""
+    import skill_injection_hook as hook
+
+    monkeypatch.setattr(hook, "_SKILL_LIBRARY_DIR", tmp_path)
+    acme = _lib_skill(tmp_path, "acme-corp", "bundle", "skills", "widget-tuner")
+    assert hook._score_skill(acme, ["widget"]) == 0.0
+    assert (
+        hook._score_skill(acme, ["acme", "corp", "widget"], "acme corp widget-tuner")
+        == 2.0
+    )
+    top_level = _lib_skill(tmp_path, "widget-tuner")
+    assert hook._score_skill(top_level, ["widget"], "widget-tuner") == 2.0
+    grouped = _lib_skill(tmp_path, "writing", "widget-tuner")
+    assert hook._score_skill(grouped, ["widget"], "widget-tuner") == 2.0, "a grouping folder is not a vendor"
+    repo = {"name": "widget-tuner", "keywords": [], "path": "src/genesis/skills/widget-tuner"}
+    assert hook._score_skill(repo, ["widget"], "widget-tuner") == 2.0
+
+
+def test_open_vendor_gate_skips_the_stoplist(tmp_path, monkeypatch):
+    """A kept vendor skill whose whole name is stoplist words must still be
+    reachable once its vendor is named — otherwise gate + stoplist delete it."""
+    import skill_injection_hook as hook
+
+    monkeypatch.setattr(hook, "_SKILL_LIBRARY_DIR", tmp_path)
+    planning = _lib_skill(tmp_path, "aws", "sagemaker-ai", "skills", "planning")
+    deploy = _lib_skill(tmp_path, "aws", "deploy-on-aws", "skills", "deploy")
+    assert hook._score_skill(planning, hook._extract_keywords("sagemaker planning")) >= hook._MIN_SCORE
+    assert hook._score_skill(deploy, hook._extract_keywords("aws deploy my app")) >= hook._MIN_SCORE
+    assert hook._score_skill(planning, hook._extract_keywords("planning the report")) == 0.0
+
+
+def test_generic_words_do_not_open_the_vendor_gate(tmp_path, monkeypatch):
+    """An open gate skips the stoplist, so the gate must not open on an
+    everyday word: a Python 'lambda' is not a request for SageMaker skills."""
+    import skill_injection_hook as hook
+
+    monkeypatch.setattr(hook, "_SKILL_LIBRARY_DIR", tmp_path)
+    report = _lib_skill(tmp_path, "aws", "sagemaker-ai", "skills", "hyperpod-issue-report")
+    model_eval = _lib_skill(tmp_path, "aws", "sagemaker-ai", "skills", "model-evaluation")
+    kws = hook._extract_keywords("write a lambda that sorts the user report")
+    assert hook._score_skill(report, kws) == 0.0
+    kws = hook._extract_keywords("the amazon order model for this user issue")
+    assert hook._score_skill(model_eval, kws) == 0.0
+    assert hook._score_skill(report, kws) == 0.0
+
+
+def test_vendor_folder_words_are_tokenized_like_the_prompt(tmp_path, monkeypatch):
+    """The folder name goes through the prompt's own extractor: 'acme.io' opens
+    on 'acme', and a folder with no extractable word and no alias is ungated
+    rather than muted forever."""
+    import skill_injection_hook as hook
+
+    monkeypatch.setattr(hook, "_SKILL_LIBRARY_DIR", tmp_path)
+    dotted = _lib_skill(tmp_path, "acme.io", "bundle", "skills", "widget-tuner")
+    assert hook._score_skill(dotted, ["widget"]) == 0.0
+    assert (
+        hook._score_skill(dotted, hook._extract_keywords("acme.io widget"), "acme.io widget-tuner")
+        == 2.0
+    )
+    tiny = _lib_skill(tmp_path, "xy", "bundle", "skills", "widget-tuner")
+    assert hook._score_skill(tiny, ["widget"], "widget-tuner") == 2.0
+
+
+def test_malformed_catalog_path_does_not_raise(tmp_path, monkeypatch):
+    import skill_injection_hook as hook
+
+    monkeypatch.setattr(hook, "_SKILL_LIBRARY_DIR", tmp_path)
+    for bad in (7, ["a"], None, ""):
+        skill = {"name": "widget-tuner", "keywords": [], "path": bad}
+        assert hook._score_skill(skill, ["widget"], "widget-tuner") == 2.0
+
+
+def test_every_repo_skill_stays_reachable():
+    """No skill shipped in this repo may be left with zero scorable signals —
+    every name word stoplisted or too short, and no `keywords:`. (cc-update and
+    genesis-development were, until they declared keywords.)"""
+    import generate_skill_catalog as gen
+    import skill_injection_hook as hook
+
+    repo = Path(__file__).resolve().parents[2]
+    scanned = 0
+    unreachable = []
+    for tier, d in ((1, repo / ".claude" / "skills"), (2, repo / "src" / "genesis" / "skills")):
+        for skill in gen._scan_tier(d, tier, repo):
+            scanned += 1
+            words = skill["name"].lower().replace("-", " ").replace("_", " ").split()
+            # A word counts only if the prompt extractor can actually emit it.
+            usable = {w for w in words if hook._extract_keywords(w) == [w]}
+            usable -= hook._NAME_TOKEN_STOPLIST
+            kws = {
+                k.lower() for k in skill.get("keywords", [])
+                if hook._extract_keywords(k) == [k.lower()]
+            }
+            if not usable and not kws:
+                unreachable.append(skill["name"])
+    assert scanned >= 10, f"scanned only {scanned} skills; the enumeration is broken"
+    assert unreachable == []
+
+
+def test_main_vendor_skill_silent_without_vendor_word(tmp_path, monkeypatch, capsys):
+    """End to end, pinned on the GATE alone: 'version checker' is not a
+    stoplisted name word, so only the gate can keep this nudge silent."""
+    import skill_injection_hook as hook
+
+    monkeypatch.setattr(hook, "_SKILL_LIBRARY_DIR", tmp_path / "lib")
+    catalog_file = tmp_path / "skill_catalog.json"
+    _write_catalog(
+        catalog_file,
+        tier2=[
+            _lib_skill(tmp_path / "lib", "aws", "sagemaker-ai", "skills", "hyperpod-version-checker"),
+        ],
+    )
+    out = _run_main(monkeypatch, capsys, catalog_file, "run the version checker")
+    assert "[Skill]" not in out
+    out = _run_main(monkeypatch, capsys, catalog_file, "run the hyperpod version checker")
+    assert "hyperpod-version-checker" in out
+
+
 # --- main() end-to-end behavior (stdin -> nudge output) ---
 
 # 12 significant keywords, exactly one ("selenium") matching the skill below.
