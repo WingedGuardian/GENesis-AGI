@@ -42,6 +42,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import subprocess
 import urllib.parse
 import uuid
@@ -60,6 +61,13 @@ MAX_CRITERION_CHARS = 500
 MAX_LABELS = 10
 MAX_LABEL_CHARS = 50  # GitHub's own label-name limit
 _MARKER_SALT = "genesis-board-v1"
+#: The marker's exact shape. The drain requires exactly ONE per board body and
+#: imports this, so a draft that already carries one is refused at propose.
+MARKER_RE = re.compile(r"<!-- genesis-board:([0-9a-f]{24}) -->")
+#: Records past these states have nothing left to promote. A tabled follow-up
+#: is "never filed as an issue" by the house rule (CLAUDE.md, deferred work).
+_TERMINAL_FOLLOW_UP = ("completed", "failed")
+_TERMINAL_LEDGER = ("done", "absorbed", "dropped")
 _GH_TIMEOUT = 60  # same bound as the drain's gh calls: a hung gh never wedges a session's tool call
 
 
@@ -67,6 +75,18 @@ def _label_lookup(repo: str, name: str) -> tuple[int, str]:
     """``gh api`` for one label: ``(returncode, stderr)``. The test seam."""
     out = subprocess.run(
         ["gh", "api", f"repos/{repo}/labels/{urllib.parse.quote(name, safe='')}", "--silent"],
+        capture_output=True,
+        text=True,
+        timeout=_GH_TIMEOUT,
+        check=False,
+    )
+    return out.returncode, out.stderr
+
+
+def _repo_lookup(repo: str) -> tuple[int, str]:
+    """``gh api`` for the repo itself: ``(returncode, stderr)``. The test seam."""
+    out = subprocess.run(
+        ["gh", "api", f"repos/{repo}", "--silent"],
         capture_output=True,
         text=True,
         timeout=_GH_TIMEOUT,
@@ -91,6 +111,18 @@ async def _missing_labels(repo: str, labels: list[str]) -> list[str] | None:
             missing.append(name)
         else:
             logger.warning("label lookup for %s failed rc=%s: %s", repo, rc, err.strip()[:200])
+            return None
+    if missing:
+        # A 404 for the repo itself (missing, or invisible to the token) reads the
+        # same as a missing label; the repo answering 200 is what makes "missing
+        # label" true rather than a wrong diagnosis.
+        try:
+            rc, err = await asyncio.to_thread(_repo_lookup, repo)
+        except (OSError, subprocess.SubprocessError):
+            logger.warning("repo lookup for %s failed", repo, exc_info=True)
+            return None
+        if rc != 0:
+            logger.warning("repo %s not readable rc=%s: %s", repo, rc, err.strip()[:200])
             return None
     return missing
 
@@ -130,14 +162,40 @@ async def _resolve_source(db, raw: str) -> tuple[tuple[str, str] | None, str | N
     full = matches[0]
     # PASSTHROUGH (a full-length id) is not existence-checked by the resolver.
     cur = await db.execute(
-        "SELECT 1 FROM session_ledger WHERE id = ?"
+        "SELECT status, NULL FROM session_ledger WHERE id = ?"
         if kind == "ledger"
-        else "SELECT 1 FROM follow_ups WHERE id = ?",
+        else "SELECT status, kind FROM follow_ups WHERE id = ?",
         (full,),
     )
-    if await cur.fetchone() is None:
+    row = await cur.fetchone()
+    if row is None:
         return None, f"no {kind} with id {full!r}"
+    status, fu_kind = row[0], row[1]
+    if kind == "ledger" and status in _TERMINAL_LEDGER:
+        return None, f"ledger row is {status}; a closed record has nothing to promote"
+    if kind == "follow_up" and status in _TERMINAL_FOLLOW_UP:
+        return None, f"follow-up is {status}; a closed record has nothing to promote"
+    if kind == "follow_up" and fu_kind == "tabled":
+        return None, "a tabled follow-up is consciously not pursued and is never filed as an issue"
     return (kind, full), None
+
+
+async def _log_refusal(db, now: str | None, reason: str, detail: dict) -> None:
+    """Best-effort audit row for a refusal. The refusal itself is the answer the
+    session needs, so a failed write is logged and never replaces it."""
+    from genesis.db.crud import board as board_crud
+
+    try:
+        async with board_crud.owned_connection(db) as own:
+            await board_crud.append_event(
+                own,
+                event="promotion_refused",
+                now=now or datetime.now(UTC).isoformat(),
+                reason=reason,
+                detail=detail,
+            )
+    except Exception:
+        logger.error("promotion_refused event not recorded (%s)", reason, exc_info=True)
 
 
 def _scan_refusal(scan) -> dict:
@@ -217,6 +275,13 @@ async def propose(
             "status": "error",
             "reason": f"<= {MAX_LABELS} labels of <= {MAX_LABEL_CHARS} chars",
         }
+    if any(MARKER_RE.search(text) for text in (title, body, *criteria, *label_list)):
+        # The drain posts a board body only with exactly one marker (its own);
+        # a draft quoting one would be held forever after approval.
+        return {
+            "status": "error",
+            "reason": "the draft contains a board marker (<!-- genesis-board:... -->); remove it",
+        }
 
     resolved, error = await _resolve_source(db, source)
     if error:
@@ -226,14 +291,12 @@ async def propose(
 
     blocking = await board_crud.blocking_questions(db, target_kind=kind, target_id=source_id)
     if blocking:
-        async with board_crud.owned_connection(db) as own:
-            await board_crud.append_event(
-                own,
-                event="promotion_refused",
-                now=now or datetime.now(UTC).isoformat(),
-                reason="blocked by open question(s)",
-                detail={"source": source_ref, "questions": [q["id"] for q in blocking]},
-            )
+        await _log_refusal(
+            db,
+            now,
+            "blocked by open question(s)",
+            {"source": source_ref, "questions": [q["id"] for q in blocking]},
+        )
         return {
             "status": "refused",
             "reason": "an unverified open question blocks this record; resolve it first",
@@ -274,14 +337,9 @@ async def propose(
     scan = scan_prose(scan_input)
     if not scan.ok:
         refusal = _scan_refusal(scan)
-        async with board_crud.owned_connection(db) as own:
-            await board_crud.append_event(
-                own,
-                event="promotion_refused",
-                now=now or datetime.now(UTC).isoformat(),
-                reason="privacy scan",
-                detail={"source": source_ref, "findings": refusal["findings"]},
-            )
+        await _log_refusal(
+            db, now, "privacy scan", {"source": source_ref, "findings": refusal["findings"]}
+        )
         return refusal
 
     repo = "/".join(tracker).lower()
@@ -309,6 +367,11 @@ async def propose(
             "cell": [CELL_DOMAIN, CELL_VERB, CELL_RISK_CLASS],
         }
     )
+    # The hold is STAMPED with the mode (a propose_only hold stays dry-run even
+    # after a flip to live), and the label lookups above can take minutes, so
+    # the lever is re-read here rather than trusted from entry.
+    if board_config.effective_mode() != mode:
+        return {"status": "error", "reason": "the board mode changed while proposing; retry"}
     approval = ApprovalManager(db=db)
     request_id = await approval.request_approval(
         action_type=BOARD_PROMOTION_ACTION_TYPE,

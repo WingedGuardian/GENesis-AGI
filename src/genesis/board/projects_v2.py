@@ -386,6 +386,20 @@ async def create_view(project_id: str, name: str, *, runner: Runner | None = Non
     return data["createProjectV2View"]["projectV2View"]["id"]
 
 
+BOARD_LAYOUT = "BOARD_LAYOUT"  # ProjectV2ViewLayout value (MEASURED: reads back verbatim)
+
+
+async def set_view_layout(view_id: str, layout: str, *, runner: Runner | None = None) -> None:
+    """Set an existing view's layout (``UpdateProjectV2ViewInput.layout``, READ
+    by schema introspection 2026-10-04)."""
+    await graphql(
+        "mutation($v: ID!, $l: ProjectV2ViewLayout!) { updateProjectV2View(input: {viewId: $v,"
+        " layout: $l}) { projectV2View { id } } }",
+        {"v": view_id, "l": layout},
+        runner=runner,
+    )
+
+
 async def set_view_filter(view_id: str, filter_: str, *, runner: Runner | None = None) -> None:
     await graphql(
         "mutation($v: ID!, $f: String!) { updateProjectV2View(input: {viewId: $v, filter: $f})"
@@ -417,16 +431,21 @@ async def add_item(project_id: str, content_id: str, *, runner: Runner | None = 
 
 
 async def item_status(item_id: str, *, runner: Runner | None = None) -> str | None:
-    """The item's current Status option name, or None when it has none. A
-    just-added item may not be readable yet (reads lag writes, MEASURED), which
-    also reads as None: for a new item that is the truth."""
+    """The item's current Status option name, or None ONLY when the item was
+    read and has no Status. An item that cannot be read raises instead, so it
+    is never mistaken for an empty column and overwritten. (MEASURED
+    2026-10-04: an unresolvable id comes back as ``node: null`` with a
+    ``NOT_FOUND`` error, which :func:`graphql` already raises on; the check
+    here covers a null node without an error, and a node of another type.)"""
     data = await graphql(
         "query($i: ID!) { node(id: $i) { ... on ProjectV2Item { status: fieldValueByName("
         'name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } } }',
         {"i": item_id},
         runner=runner,
     )
-    node = data.get("node") or {}
+    node = data.get("node")
+    if not isinstance(node, dict) or "status" not in node:
+        raise ProjectsError(f"project item {item_id} could not be read")
     return (node.get("status") or {}).get("name")
 
 

@@ -51,7 +51,10 @@ async def test_variables_travel_in_the_payload_not_the_query():
     run = _runner({"data": {"viewer": {"login": "me", "id": "U1"}}})
     await pv.viewer(runner=run)
     assert run.calls[0]["variables"] == {}
-    await pv.repository_id("o", "r", runner=_runner({"data": {"repository": {"id": "R1"}}}))
+    run2 = _runner({"data": {"repository": {"id": "R1"}}})
+    await pv.repository_id("own3r", "rep0", runner=run2)
+    assert run2.calls[0]["variables"] == {"o": "own3r", "n": "rep0"}
+    assert "own3r" not in run2.calls[0]["query"] and "rep0" not in run2.calls[0]["query"]
 
 
 def _project_node(fields, total=None):
@@ -177,3 +180,25 @@ async def test_find_projects_by_title_reads_every_page_and_skips_closed():
         },
     )
     assert [p["number"] for p in await pv.find_projects_by_title("me", "B", runner=run)] == [2]
+
+
+# ─── round 2 ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("node", [None, {}, {"id": "x"}])
+async def test_an_unreadable_item_raises_rather_than_reading_as_no_status(node):
+    with pytest.raises(pv.ProjectsError):
+        await pv.item_status("I1", runner=_runner({"data": {"node": node}}))
+
+
+async def test_an_item_with_no_status_reads_as_none():
+    assert await pv.item_status("I1", runner=_runner({"data": {"node": {"status": None}}})) is None
+    run = _runner({"data": {"node": {"status": {"name": "Ready"}}}})
+    assert await pv.item_status("I1", runner=run) == "Ready"
+
+
+async def test_set_view_layout_sends_the_layout_as_a_variable():
+    run = _runner({"data": {"updateProjectV2View": {"projectV2View": {"id": "V1"}}}})
+    await pv.set_view_layout("V1", pv.BOARD_LAYOUT, runner=run)
+    assert run.calls[0]["variables"] == {"v": "V1", "l": "BOARD_LAYOUT"}
+    assert "layout: $l" in run.calls[0]["query"]

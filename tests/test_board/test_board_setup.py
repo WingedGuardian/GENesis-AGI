@@ -23,6 +23,7 @@ MUTATIONS = (
     "delete_workflow",
     "create_view",
     "set_view_filter",
+    "set_view_layout",
 )
 
 
@@ -89,7 +90,9 @@ async def test_dry_run_reports_every_change_and_mutates_nothing(fake_pv, monkeyp
         "would set Status options" in out
         and "would delete workflow 'Pull request linked to issue'" in out
     )
-    assert "would create view 'Active'" in out and "would record project_owner" in out
+    assert "would create view 'Active'" in out
+    # This project has problems (missing workflows), so it is never recorded.
+    assert "NOT recording the project" in out and "record project_owner" not in out
     assert "PROBLEM: workflow 'Pull request merged' is missing" in out
     assert code == 1, "a missing required workflow is a non-zero exit"
 
@@ -212,3 +215,105 @@ def test_the_board_links_the_configured_tracker_not_the_checkout(monkeypatch):
     monkeypatch.setattr(board_config, "tracker_repo", lambda: None)
     with pytest.raises(SystemExit):
         setup._repo_slug()
+
+
+# ─── round 2 ────────────────────────────────────────────────────────────────
+
+
+async def _one(*_a, **_k):
+    return [{"number": 1, "title": "Genesis Work Board"}]
+
+
+def _project_with(fields):
+    async def project(owner, number, **_k):
+        base = {
+            "Status": pv.Field(
+                "F1",
+                "Status",
+                "single_select",
+                {n: n for n in pv.STATUS_OPTIONS},
+                [
+                    {"id": n, "name": n, "color": "GRAY", "description": ""}
+                    for n in pv.STATUS_OPTIONS
+                ],
+            ),
+            "Genesis": pv.Field(
+                "F2",
+                "Genesis",
+                "single_select",
+                {n: n for n in pv.GENESIS_OPTIONS},
+                [
+                    {"id": n, "name": n, "color": "GRAY", "description": ""}
+                    for n in pv.GENESIS_OPTIONS
+                ],
+            ),
+            "Genesis note": pv.Field("F3", "Genesis note", "text"),
+        }
+        base.update(fields)
+        return pv.Project("P1", number, "Genesis Work Board", False, base)
+
+    return project
+
+
+async def test_a_wrongly_typed_genesis_note_is_a_problem(fake_pv, monkeypatch, capsys):
+    monkeypatch.setattr(pv, "find_projects_by_title", _one)
+    monkeypatch.setattr(
+        pv, "get_project", _project_with({"Genesis note": pv.Field("F3", "Genesis note", "other")})
+    )
+    assert await setup.run(setup.DEFAULT_TITLE, apply=True, write_config=False) == 1
+    assert "not a text field" in capsys.readouterr().out
+    assert "create_text_field" not in fake_pv
+
+
+async def test_an_existing_view_with_the_wrong_layout_is_fixed(fake_pv, monkeypatch, capsys):
+    async def views(_pid, **_k):
+        return [
+            {"id": "V1", "name": "Active", "filter": "-status:Proposed", "layout": "TABLE_LAYOUT"},
+            {"id": "V2", "name": "Backlog", "filter": "status:Proposed", "layout": "BOARD_LAYOUT"},
+        ]
+
+    monkeypatch.setattr(pv, "find_projects_by_title", _one)
+    monkeypatch.setattr(pv, "get_project", _project_with({}))
+    monkeypatch.setattr(pv, "list_views", views)
+    await setup.run(setup.DEFAULT_TITLE, apply=False, write_config=False)
+    out = capsys.readouterr().out
+    assert "would set view 'Active' layout 'TABLE_LAYOUT' -> 'BOARD_LAYOUT'" in out
+    assert "view 'Backlog' OK" in out
+    assert fake_pv == []  # a dry run mutates nothing
+    await setup.run(setup.DEFAULT_TITLE, apply=True, write_config=False)
+    assert fake_pv.count("set_view_layout") == 1
+
+
+async def test_config_is_not_recorded_while_setup_has_problems(
+    fake_pv, monkeypatch, tmp_path, capsys
+):
+    """A recorded project is what lets the board go live; one without a usable
+    Status column would post issues it can never place."""
+    monkeypatch.setattr(pv, "find_projects_by_title", _one)
+    monkeypatch.setattr(
+        pv, "get_project", _project_with({"Status": pv.Field("F1", "Status", "text")})
+    )
+    monkeypatch.setattr("genesis._config_overlay._user_config_dir", lambda: tmp_path)
+    assert await setup.run(setup.DEFAULT_TITLE, apply=True, write_config=True) == 1
+    assert "NOT recording the project" in capsys.readouterr().out
+    assert not (tmp_path / "board.local.yaml").exists()
+
+
+async def test_a_clean_project_would_be_recorded(fake_pv, monkeypatch, tmp_path, capsys):
+    async def workflows(_pid, **_k):
+        return [{"id": f"W{n}", "name": n, "enabled": True} for n in pv.WORKFLOWS_REQUIRED]
+
+    async def views(_pid, **_k):
+        return [
+            {"id": "V1", "name": n, "filter": f, "layout": pv.BOARD_LAYOUT}
+            for n, f in setup.VIEWS.items()
+        ]
+
+    monkeypatch.setattr(pv, "find_projects_by_title", _one)
+    monkeypatch.setattr(pv, "get_project", _project_with({}))
+    monkeypatch.setattr(pv, "list_workflows", workflows)
+    monkeypatch.setattr(pv, "list_views", views)
+    monkeypatch.setattr("genesis._config_overlay._user_config_dir", lambda: tmp_path)
+    assert await setup.run(setup.DEFAULT_TITLE, apply=False, write_config=True) == 0
+    assert "would record project_owner=owner project_number=1" in capsys.readouterr().out
+    assert fake_pv == []

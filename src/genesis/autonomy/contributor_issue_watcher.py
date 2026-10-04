@@ -70,13 +70,16 @@ from genesis.autonomy.contributor_worklog_config import (
     normalize_title,
 )
 from genesis.board import config as board_config
+
+# One definition of the marker's shape, shared with the proposer that refuses a
+# draft already carrying one.
+from genesis.board.promotion import MARKER_RE as _MARKER_RE
 from genesis.db.crud import approval_requests as approval_crud
 from genesis.db.crud import pending_issue_posts as pip
 
 logger = logging.getLogger(__name__)
 
 _ISSUE_NUM_RE = re.compile(r"/issues/(\d+)\b")
-_MARKER_RE = re.compile(r"<!-- genesis-board:([0-9a-f]{24}) -->")
 # GROUNDWORK(autonomous-distribution): the GitHub issue-create egress door. Every
 # autonomous external post routes through the shadow-gate (observe) before the gh
 # call; the capability cell is observe-only today (enforce stage later).
@@ -340,11 +343,14 @@ async def _place_on_board(rt_db, proj, link: dict, now: str) -> bool:
 
     Status is written ONLY when the item has none, and only ever as Proposed:
     re-adding an existing item returns it unchanged (MEASURED), so a card the
-    owner already moved keeps its column. The audit event is written BEFORE the
-    item id, so a failure between the two leaves the link unplaced and the
-    retry (which then reads Status as set) records no second event. Any failure
-    leaves ``project_item_id`` NULL for the next pass. Returns True once the
-    item id is recorded."""
+    owner already moved keeps its column. The lever is re-read immediately
+    before that write (the reads before it await GitHub).
+
+    The ``status_write`` event records the write Genesis REQUESTED, BEFORE the
+    request, keyed ``<item>:Proposed``: the unique index makes a retry a no-op,
+    so a failure anywhere after it can neither lose the audit line nor double
+    it. Any failure leaves ``project_item_id`` NULL for the next pass. Returns
+    True once the item id is recorded."""
     from genesis.board import projects_v2 as pv
     from genesis.db.crud import board as board_crud
 
@@ -355,11 +361,10 @@ async def _place_on_board(rt_db, proj, link: dict, now: str) -> bool:
         if _board_mode() != "live":
             return False
         item_id = await pv.add_item(proj.id, content_id)
-        prior = await pv.item_status(item_id)
-        if prior is None:
-            await pv.set_single_select(proj.id, item_id, status.id, status.options["Proposed"])
-        async with board_crud.owned_connection(rt_db) as own:
-            if prior is None:
+        if await pv.item_status(item_id) is None:
+            if _board_mode() != "live":
+                return False
+            async with board_crud.owned_connection(rt_db) as own:
                 await board_crud.append_event(
                     own,
                     event="status_write",
@@ -368,8 +373,11 @@ async def _place_on_board(rt_db, proj, link: dict, now: str) -> bool:
                     issue_number=int(link["issue_number"]),
                     project_item_id=item_id,
                     worker="genesis",
-                    detail={"to": "Proposed", "from": None},
+                    observed_change_key=f"{item_id}:Proposed",
+                    detail={"to": "Proposed", "from": None, "requested": True},
                 )
+            await pv.set_single_select(proj.id, item_id, status.id, status.options["Proposed"])
+        async with board_crud.owned_connection(rt_db) as own:
             await board_crud.set_project_item(
                 own, link_id=link["id"], project_item_id=item_id, now=now
             )
@@ -437,7 +445,9 @@ async def _other_lane_posted(rt_db, row: dict) -> bool:
     if await cur.fetchone() is not None:
         return True
     if not await board_crud.tables_available(rt_db):
-        return False
+        # Fail toward NOT posting, like _board_blocked: the caller leaves the row
+        # held. (Before the board migration no link can exist, so this is rare.)
+        raise RuntimeError("board tables not available")
     return (
         await board_crud.get_link_by_source(rt_db, source_kind="follow_up", source_id=fid)
     ) is not None
@@ -589,13 +599,20 @@ async def _resolve_approved(
             # else's issue is never trusted as ours.
             viewer = await _viewer_login()
             author = (existing.get("author") or {}).get("login")
-            if viewer is None or author != viewer:
+            if viewer is None:
+                logger.warning("Board hold %s: viewer lookup failed — retry next cycle", row["id"])
+                return False
+            if author != viewer:
+                # Permanent: another account's issue carries this record's marker,
+                # so it is never adopted and posting a second marked issue would
+                # leave two. Expire the hold rather than retrying it forever.
                 logger.error(
-                    "Board hold %s: marked issue #%s is not authored by this account — left held",
+                    "Board hold %s: marked issue #%s was written by another account — "
+                    "hold expired, nothing posted",
                     row["id"],
                     existing.get("number"),
                 )
-                return False
+                return await pip.mark_rejected(rt_db, row["id"], rejected_at=now, expired=True)
     else:
         ok, existing = await _find_open_issue_by_title(repo, normalize_title(title))
     if not ok:
@@ -697,6 +714,11 @@ async def _resolve_approved(
         return False
     if is_board and await _board_blocked(rt_db, row):
         logger.info("Board hold %s blocked by an open question at post time — held", row["id"])
+        return False
+    if is_board and board_config.project_ref() is None:
+        # Propose refuses live with no project; the config can be removed after
+        # approval, and posting then would leave an issue with no card.
+        logger.warning("Board hold %s: no project configured at post time — held", row["id"])
         return False
 
     # Observe the egress, THEN post. mark_posted BEFORE mark_consumed so a crash

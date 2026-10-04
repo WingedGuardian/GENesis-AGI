@@ -3384,21 +3384,29 @@ follow-on work. The shipped mode is `off`.
     project stops there and asks for a re-run, because project reads lag
     writes (MEASURED), so nothing it just created is checked by the same run;
   - Status columns Proposed / Ready / In Progress / In Review / Done;
-  - the `Genesis` single-select (an existing field of another type is reported,
-    never mutated) and `Genesis note` text fields;
+  - the `Genesis` single-select and `Genesis note` text fields (an existing
+    field of the wrong type is reported as a problem, never mutated);
   - deletes the "Pull request linked to issue" and "Item added to project"
     default workflows;
   - requires "Pull request merged" and "Item closed" (there is no API to
     enable a workflow, so a missing one exits non-zero with the UI step);
-  - creates the `Active` and `Backlog` views.
+  - creates the `Active` and `Backlog` views, and puts an existing one with the
+    wrong layout back on the board layout;
+  - records the project in the overlay ONLY when no problem was found, since
+    a recorded project is what lets the board go live.
 - **Promotion** (`board/promotion.py`, MCP `board_promote`):
   - **Refused when:** the board mode is off, or `live` with no project
-    configured; no public tracker is configured; the source does not resolve;
-    an UNVERIFIED open question blocks it (the one place a block is enforced);
-    it is already linked or pending; the privacy scan finds something (the
-    reply names line and scanner only); or a requested label does not exist
-    on the tracker (checked only after the scan passes, since the check sends
-    the label names to GitHub).
+    configured; no public tracker is configured; the source does not resolve,
+    or is closed (a completed/failed follow-up, a done/absorbed/dropped ledger
+    row) or tabled (never filed as an issue, by the house rule); an
+    UNVERIFIED open question blocks it (the one place a block is enforced);
+    it is already linked or pending; the draft already carries a board marker
+    (the drain posts a body only with exactly one, its own); the privacy scan
+    finds something (the reply names line and scanner only); a requested label
+    does not exist on the tracker (checked only after the scan passes, since
+    the check sends the label names to GitHub; a repo that cannot be read is
+    "could not verify", never "missing label"); or the mode changed while it
+    was proposing (the hold is stamped with the mode).
   - **Approval** is per item on the dashboard (Comms) and counted in the
     morning report, like the contributor lane; there is no Telegram prompt.
   - **The public body** carries an opaque marker, a salted hash of `kind:id`.
@@ -3413,17 +3421,28 @@ follow-on work. The shipped mode is `off`.
   - dedup by marker (recent window + search, any state), adopting a marked
     issue only when this account authored it;
   - are exempt from the contributor daily cap;
-  - re-check open-question blocks immediately before the create (no GitHub
-    await in between); a block store that cannot be read counts as blocked;
+  - re-check open-question blocks and a configured project immediately before
+    the create (no GitHub await in between); a block store that cannot be read
+    counts as blocked;
+  - expire (never post) a hold whose marked issue another account wrote; a
+    failed viewer lookup only defers it;
   - write the `board_links` pointer and a `promotion` event once the issue
     exists, with each tick re-linking any posted row a crash left unlinked;
   - put the issue on the configured project, writing Status=Proposed ONLY
-    when the item has no Status (a card the owner already moved keeps its
-    column), and record the item id; each tick retries any link without one.
+    when the item was read and has no Status (an unreadable item raises; a
+    card the owner already moved keeps its column), re-checking the lever
+    right before that write, and record the item id; each tick retries any
+    link without one. The `status_write` event is the write Genesis REQUESTED,
+    logged before the request and keyed `<item>:Proposed`, so a retry neither
+    loses nor doubles it.
 - Both lanes can each pass their propose-time duplicate check for one
   follow-up when proposed concurrently; the drain (the only poster, one job,
   rows in sequence) refuses a hold whose follow-up the OTHER lane already
-  posted. An exact hit inside a full search page counts as found; only "no
+  posted. That record survives: `pending_issue_posts.prune_terminal` keeps
+  every posted row naming a follow-up while the follow-up row exists (it
+  used to prune adopted rows and rows of resolved follow-ups at 30 days).
+  Holds that can never resolve (a create that keeps failing, a saturated
+  title search) are still log-only; the alert is #2850. An exact hit inside a full search page counts as found; only "no
   hit" needs a complete page.
 - `approve_all_pending` excludes board promotions, because a sweep's resolver is
   human and only the exclusion keeps them per-item.

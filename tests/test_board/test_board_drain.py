@@ -55,9 +55,11 @@ class FakeProjects:
     """The Projects v2 adapter, faked at its functions: one project with the
     Status field, every write recorded."""
 
-    def __init__(self, *, prior_status=None, fail_add=False):
+    def __init__(self, *, prior_status=None, fail_add=False, fail_set=False, after_add=None):
         self.prior_status = prior_status
         self.fail_add = fail_add
+        self.fail_set = fail_set
+        self.after_add = after_add
         self.adds: list[tuple[str, str]] = []
         self.status_writes: list[tuple[str, str]] = []
 
@@ -76,12 +78,16 @@ class FakeProjects:
             if self.fail_add:
                 raise pv.ProjectsError("boom")
             self.adds.append((project_id, content_id))
+            if self.after_add:
+                self.after_add()
             return f"ITEM_{content_id}"
 
         async def item_status(item_id, *, runner=None):
             return self.prior_status
 
         async def set_single_select(project_id, item_id, field_id, option_id, *, runner=None):
+            if self.fail_set:
+                raise pv.ProjectsError("set failed")
             self.status_writes.append((item_id, option_id))
 
         for name, fn in {
@@ -251,7 +257,8 @@ async def test_marked_issue_by_someone_else_is_never_adopted(db, monkeypatch):
     monkeypatch.setattr(ciw, "_run_gh", gh)
     await ciw.drain_pending_issue_posts(_RT(db))
     assert not gh.created()
-    assert (await _row(db, out["pending_id"]))["status"] == "held"
+    # Permanent: the hold expires instead of retrying (3 gh calls) every tick.
+    assert (await _row(db, out["pending_id"]))["status"] == "expired"
     assert (
         await board_crud.get_link_by_source(db, source_kind="follow_up", source_id=FOLLOW) is None
     )
@@ -282,15 +289,14 @@ async def test_a_posted_row_missing_its_link_is_relinked_next_tick(db, monkeypat
     async def fail_once(*_a, **_k):
         return False
 
-    monkeypatch.setattr(ciw, "_link_board", fail_once)
-    await ciw.drain_pending_issue_posts(_RT(db))
+    # Scoped to the first drain only: a bare monkeypatch.undo() would also strip
+    # the fixture's project fakes and send the second drain to real GitHub.
+    with monkeypatch.context() as m:
+        m.setattr(ciw, "_link_board", fail_once)
+        await ciw.drain_pending_issue_posts(_RT(db))
     assert (
         await board_crud.get_link_by_source(db, source_kind="follow_up", source_id=FOLLOW) is None
     )
-    monkeypatch.undo()
-    monkeypatch.setattr(board_config, "effective_mode", lambda: "live")
-    monkeypatch.setattr(ciw, "effective_mode", lambda: "off")
-    monkeypatch.setattr(ciw, "_run_gh", gh)
     await ciw.drain_pending_issue_posts(_RT(db))
     link = await board_crud.get_link_by_source(db, source_kind="follow_up", source_id=FOLLOW)
     assert link is not None and link["issue_number"] == 77
@@ -582,3 +588,75 @@ async def test_a_failing_cross_lane_check_leaves_the_row_held(db, monkeypatch):
     await ciw.drain_pending_issue_posts(_RT(db))
     assert not gh.created()
     assert (await _row(db, out["pending_id"]))["status"] == "held"
+
+
+# ─── round 2 (Codex at db70ffbd4 + class audit) ─────────────────────────────
+
+
+async def test_a_failed_viewer_lookup_is_transient_and_leaves_the_hold(db, monkeypatch):
+    out = await _promote(db)
+    body = (await _row(db, out["pending_id"]))["body"]
+    marked = {"number": 9, "url": "u", "createdAt": NOW, "body": body, "author": {"login": "x"}}
+    gh = FakeGh(search_issues=[marked], viewer=None)
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    await ciw.drain_pending_issue_posts(_RT(db))
+    assert not gh.created()
+    assert (await _row(db, out["pending_id"]))["status"] == "held"
+
+
+async def test_no_project_at_post_time_holds_the_board_row(db, monkeypatch):
+    out = await _promote(db)  # proposed while a project was configured
+    monkeypatch.setattr(board_config, "project_ref", lambda: None)
+    gh = FakeGh()
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    await ciw.drain_pending_issue_posts(_RT(db))
+    assert not gh.created()
+    assert (await _row(db, out["pending_id"]))["status"] == "held"
+
+
+async def test_an_unreadable_board_store_holds_a_contributor_row(db, monkeypatch):
+    """Fail toward not posting: the cross-lane check cannot read the board."""
+    await _contributor_row(db, row_id="c-row")
+    monkeypatch.setattr(ciw, "effective_mode", lambda: "live")
+
+    async def no_tables(_db):
+        return False
+
+    monkeypatch.setattr(board_crud, "tables_available", no_tables)
+    gh = FakeGh()
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    await ciw.drain_pending_issue_posts(_RT(db))
+    assert not gh.created()
+    assert (await _row(db, "c-row"))["status"] == "held"
+
+
+async def test_the_status_audit_survives_a_failed_status_write_and_is_not_doubled(
+    db, monkeypatch, projects
+):
+    """The requested write is recorded BEFORE the request, keyed, so a failure
+    after it neither loses the audit line nor doubles it on the retry."""
+    projects.fail_set = True
+    monkeypatch.setattr(ciw, "_run_gh", FakeGh())
+    await _promote(db)
+    await ciw.drain_pending_issue_posts(_RT(db))
+    link = await board_crud.get_link_by_source(db, source_kind="follow_up", source_id=FOLLOW)
+    assert link["project_item_id"] is None  # not placed: retried
+    assert (await board_crud.list_events(db, event="status_write"))["total"] == 1
+    projects.fail_set = False
+    await ciw.drain_pending_issue_posts(_RT(db))
+    link = await board_crud.get_link_by_source(db, source_kind="follow_up", source_id=FOLLOW)
+    assert link["project_item_id"] == "ITEM_ISSUE_77"
+    assert (await board_crud.list_events(db, event="status_write"))["total"] == 1
+
+
+async def test_a_lever_flip_mid_placement_writes_no_status(db, monkeypatch, projects):
+    monkeypatch.setattr(ciw, "_run_gh", FakeGh())
+    await _promote(db)
+    projects.after_add = lambda: monkeypatch.setattr(
+        board_config, "effective_mode", lambda: "propose_only"
+    )
+    await ciw.drain_pending_issue_posts(_RT(db))
+    assert projects.adds and projects.status_writes == []
+    link = await board_crud.get_link_by_source(db, source_kind="follow_up", source_id=FOLLOW)
+    assert link["project_item_id"] is None
+    assert (await board_crud.list_events(db, event="status_write"))["total"] == 0

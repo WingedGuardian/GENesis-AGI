@@ -303,22 +303,26 @@ async def prune_terminal(db: aiosqlite.Connection, *, older_than_days: int = 30,
     it (an issue can stay open past *older_than_days* before a close lands) would
     orphan the follow_up so it never resolves. "Open" mirrors the exact predicate
     the close-loop resolves against (``get_open_followups`` / ``absorb_followup``):
-    ``kind='follow_up' AND status IN ('pending', 'in_progress')``. A ``'posted'``
-    row with ``source_ref`` NULL (codebase) OR whose follow_up is resolved/tabled
-    stays prunable; non-posted terminal rows are always prunable. An ``adopted``
-    posted row is ALSO prunable on the normal schedule — it is excluded from
-    ``posted_index_for_repo``, so it can never resolve a follow_up and retaining it
-    past its age would only waste storage (the ``adopted = 0`` guard below)."""
+    ``kind='follow_up' AND status IN ('pending', 'in_progress')``.
+
+    Retention is WIDER than the close-loop needs: every ``posted`` row naming a
+    follow-up is kept while that follow-up row still exists — adopted rows and
+    resolved follow-ups included. It is the record that this follow-up already
+    has a public issue, and the work-board lane's cross-lane check
+    (``board.promotion`` at propose, the drain at post time) reads it; pruning
+    it after 30 days let a later promotion post a SECOND issue for the same
+    record. Bounded: a deleted follow-up can no longer be promoted, so its rows
+    go with it. The close-loop is unaffected — ``posted_index_for_repo`` still
+    filters to created, follow_up-sourced rows, and ``absorb_followup`` only
+    moves an open follow-up. Non-posted terminal rows, and posted rows with no
+    ``source_ref``, stay prunable on the normal schedule."""
     cutoff = _iso_days_before(now, older_than_days)
     cursor = await db.execute(
         "DELETE FROM pending_issue_posts "
         "WHERE status IN ('posted', 'rejected', 'expired', 'dry_run') "
         "AND COALESCE(posted_at, rejected_at, dry_run_at, held_at) < ? "
-        "AND NOT (status = 'posted' AND adopted = 0 AND source_ref IS NOT NULL AND EXISTS ("
-        "  SELECT 1 FROM follow_ups f "
-        "  WHERE f.id = pending_issue_posts.source_ref "
-        "  AND f.kind = 'follow_up' "
-        "  AND f.status IN ('pending', 'in_progress')"
+        "AND NOT (status = 'posted' AND source_ref IS NOT NULL AND EXISTS ("
+        "  SELECT 1 FROM follow_ups f WHERE f.id = pending_issue_posts.source_ref"
         "))",
         (cutoff,),
     )

@@ -152,7 +152,13 @@ async def run(title: str, apply: bool, write_config: bool, allow_public: bool = 
                 )
         else:
             say(f"{pv.GENESIS_FIELD!r} field OK")
-    if pv.GENESIS_NOTE_FIELD not in proj.fields:
+    note = proj.fields.get(pv.GENESIS_NOTE_FIELD)
+    if note is not None and note.kind != "text":
+        say(
+            f"PROBLEM: field {pv.GENESIS_NOTE_FIELD!r} exists but is not a text field; rename or delete it"
+        )
+        problems += 1
+    elif note is None:
         say(f"{act}create text field {pv.GENESIS_NOTE_FIELD!r}")
         if apply:
             await pv.create_text_field(proj.id, pv.GENESIS_NOTE_FIELD)
@@ -186,15 +192,27 @@ async def run(title: str, apply: bool, write_config: bool, allow_public: bool = 
             say(f"{act}create view {name!r} with filter {filt!r}")
             if apply:
                 await pv.set_view_filter(await pv.create_view(proj.id, name), filt)
-        elif view.get("filter") != filt:
-            say(f"{act}set view {name!r} filter {view.get('filter')!r} -> {filt!r}")
-            if apply:
-                await pv.set_view_filter(view["id"], filt)
         else:
-            say(f"view {name!r} OK")
+            ok = True
+            if view.get("layout") != pv.BOARD_LAYOUT:
+                ok = False
+                say(f"{act}set view {name!r} layout {view.get('layout')!r} -> {pv.BOARD_LAYOUT!r}")
+                if apply:
+                    await pv.set_view_layout(view["id"], pv.BOARD_LAYOUT)
+            if view.get("filter") != filt:
+                ok = False
+                say(f"{act}set view {name!r} filter {view.get('filter')!r} -> {filt!r}")
+                if apply:
+                    await pv.set_view_filter(view["id"], filt)
+            if ok:
+                say(f"view {name!r} OK")
 
-    # Config overlay.
-    if write_config:
+    # Config overlay: recorded only for a project with no outstanding problem,
+    # because a recorded project is what lets the board go live, and a board
+    # with (say) no Proposed column would post issues it can never place.
+    if write_config and problems:
+        say(f"NOT recording the project in the config overlay: {problems} problem(s) above")
+    elif write_config:
         import yaml
 
         from genesis._config_overlay import _user_config_dir

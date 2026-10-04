@@ -156,12 +156,14 @@ async def test_the_contributor_lane_refuses_a_follow_up_already_on_the_board(db,
         db,
         title="Other title",
         body="b",
-        labels=None,
-        repo="other/repo",
+        labels=["area:runtime", "good first issue"],  # the tracker requires both kinds
+        repo="owner/repo",
         source="follow_up",
         source_follow_up_id=FOLLOW,
     )
-    assert pending["status"] in ("duplicate", "held")  # other repo: dedup is repo-scoped
+    # A board hold for the same follow-up (source_ref "follow_up:<id>") blocks a
+    # contributor-lane post of it: the board_ref clause in the contributor tool.
+    assert pending["status"] == "duplicate"
     await board_crud.record_link(
         db,
         source_kind="follow_up",
@@ -266,7 +268,7 @@ async def test_no_resolvable_tracker_is_refused(db, monkeypatch, user):
     assert await _holds(db) == []
 
 
-def _labels_on_repo(monkeypatch, present, *, fail=False):
+def _labels_on_repo(monkeypatch, present, *, fail=False, repo_ok=True):
     asked = []
 
     def lookup(repo, name):
@@ -275,7 +277,12 @@ def _labels_on_repo(monkeypatch, present, *, fail=False):
             return 1, "HTTP 502: Bad Gateway"
         return (0, "") if name in present else (1, "gh: Not Found (HTTP 404)")
 
+    def repo_lookup(repo):
+        asked.append((repo, None))
+        return (0, "") if repo_ok else (1, "gh: Not Found (HTTP 404)")
+
     monkeypatch.setattr(promotion, "_label_lookup", lookup)
+    monkeypatch.setattr(promotion, "_repo_lookup", repo_lookup)
     return asked
 
 
@@ -329,3 +336,84 @@ async def test_a_codebase_contributor_hold_of_the_follow_up_blocks_promotion(db)
     )
     out = await _propose(db)
     assert out["status"] == "duplicate" and out["existing_id"] == "c-row"
+
+
+# ─── round 2 (Codex at db70ffbd4 + class audit) ─────────────────────────────
+
+
+async def test_a_label_404_on_a_missing_repo_is_not_reported_as_a_missing_label(db, monkeypatch):
+    _labels_on_repo(monkeypatch, set(), repo_ok=False)
+    out = await _propose(db, labels=["enhancement"])
+    assert out["status"] == "error" and "could not verify" in out["reason"]
+    assert await _holds(db) == []
+
+
+@pytest.mark.parametrize("where", ["title", "body", "criterion", "label"])
+async def test_a_draft_carrying_a_board_marker_is_refused(db, monkeypatch, where):
+    """The drain posts a board body only with exactly one marker, its own."""
+    _labels_on_repo(monkeypatch, {"x"})
+    marker = promotion.source_marker("follow_up", "f" * 32)
+    kw = {
+        "title": {"title": f"T {marker}"},
+        "body": {"body": f"see {marker}"},
+        "criterion": {"acceptance_criteria": [f"keep {marker}"]},
+        "label": {"labels": [marker]},  # 47 chars: within the 50-char label limit
+    }[where]
+    assert len(marker) <= promotion.MAX_LABEL_CHARS
+    out = await _propose(db, **kw)
+    assert out["status"] == "error" and "board marker" in out["reason"]
+    assert await _holds(db) == []
+
+
+@pytest.mark.parametrize(
+    ("table", "col", "value"),
+    [
+        ("follow_ups", "status", "completed"),
+        ("follow_ups", "status", "failed"),
+        ("follow_ups", "kind", "tabled"),
+    ],
+)
+async def test_a_closed_or_tabled_follow_up_is_not_promoted(db, table, col, value):
+    await db.execute(f"UPDATE {table} SET {col} = ? WHERE id = ?", (value, FOLLOW))
+    await db.commit()
+    out = await _propose(db)
+    assert out["status"] == "error"
+    assert await _holds(db) == []
+
+
+@pytest.mark.parametrize("status", ["done", "absorbed", "dropped"])
+async def test_a_closed_ledger_row_is_not_promoted(db, status):
+    await db.execute("UPDATE session_ledger SET status = ? WHERE id = ?", (status, LEDGER))
+    await db.commit()
+    out = await _propose(db, source=f"ledger:{LEDGER[:8]}")
+    assert out["status"] == "error" and status in out["reason"]
+
+
+@pytest.mark.parametrize("status", ["blocked", "scheduled", "in_progress"])
+async def test_an_open_follow_up_in_any_live_state_is_still_promotable(db, status):
+    await db.execute("UPDATE follow_ups SET status = ? WHERE id = ?", (status, FOLLOW))
+    await db.commit()
+    assert (await _propose(db))["status"] == "held"
+
+
+async def test_a_mode_change_while_proposing_is_refused_not_stamped(db, monkeypatch):
+    """The hold is stamped with the mode; a flip during the lookups must not
+    leave a hold stamped with the stale one."""
+    modes = iter(["live", "propose_only"])
+    monkeypatch.setattr(board_config, "effective_mode", lambda: next(modes))
+    out = await _propose(db)
+    assert out["status"] == "error" and "mode changed" in out["reason"]
+    assert await _holds(db) == []
+
+
+async def test_a_refusal_survives_a_failed_audit_write(db, monkeypatch):
+    """The refusal is the answer the session needs; losing its audit row must
+    not turn it into a raw tool error."""
+    await board_crud.raise_question(db, question="which?", now=NOW, blocks=[("follow_up", FOLLOW)])
+
+    def broken(_db):
+        raise board_crud.WriteBusy("locked")
+
+    monkeypatch.setattr(board_crud, "owned_connection", broken)
+    out = await _propose(db)
+    assert out["status"] == "refused"
