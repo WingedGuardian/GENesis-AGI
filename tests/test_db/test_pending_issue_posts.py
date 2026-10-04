@@ -212,7 +212,7 @@ class TestCrud:
         # row → max_held backpressure bypassed + duplicate proposals. The query
         # must be COLLATE NOCASE, matching posted_index_for_repo.
         await pip.create(db, **{**_ROW, "repo": "wingedguardian/genesis-agi"})
-        active = await pip.list_dedup_active(db, "WingedGuardian/GENesis-AGI")
+        active = await pip.list_dedup_active(db, "WingedGuardian/GENesis-AGI", now=_TS)
         assert [r["id"] for r in active] == ["p1"]
 
     @pytest.mark.asyncio

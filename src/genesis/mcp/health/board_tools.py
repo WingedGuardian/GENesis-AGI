@@ -42,8 +42,11 @@ async def board_promote(
 
     Refused when the board mode is off, when an unverified open question blocks
     the source (resolve it first), or when the source is already promoted or has
-    a promotion pending. Returns ``held`` / ``disabled`` / ``refused`` /
-    ``blocked`` / ``duplicate`` / ``error``.
+    a promotion pending. The same checks run again right before the issue is
+    created: an approved promotion whose record has since closed, or whose
+    label is gone, is ended unposted (propose it again once fixed). Returns
+    ``held`` / ``disabled`` / ``refused`` / ``blocked`` / ``duplicate`` /
+    ``error``.
     """
     from genesis.board import promotion
 

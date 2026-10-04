@@ -202,3 +202,47 @@ async def test_set_view_layout_sends_the_layout_as_a_variable():
     await pv.set_view_layout("V1", pv.BOARD_LAYOUT, runner=run)
     assert run.calls[0]["variables"] == {"v": "V1", "l": "BOARD_LAYOUT"}
     assert "layout: $l" in run.calls[0]["query"]
+
+
+# ─── round 3 ────────────────────────────────────────────────────────────────
+
+
+def _repos_page(names, *, has_next, cursor=None):
+    return {
+        "data": {
+            "node": {
+                "repositories": {
+                    "nodes": [{"nameWithOwner": n} for n in names],
+                    "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                }
+            }
+        }
+    }
+
+
+async def test_project_repositories_reads_every_page():
+    run = _runner(
+        _repos_page(["a/one"], has_next=True, cursor="C1"),
+        _repos_page(["b/two"], has_next=False),
+    )
+    assert await pv.project_repositories("P1", runner=run) == ["a/one", "b/two"]
+    assert run.calls[1]["variables"] == {"p": "P1", "c": "C1"}
+
+
+@pytest.mark.parametrize("node", [None, {}])
+async def test_an_unreadable_project_is_never_read_as_linked_to_nothing(node):
+    with pytest.raises(pv.ProjectsError):
+        await pv.project_repositories("P1", runner=_runner({"data": {"node": node}}))
+
+
+async def test_link_repository_sends_ids_as_variables():
+    run = _runner({"data": {"linkProjectV2ToRepository": {"repository": {"id": "R1"}}}})
+    await pv.link_repository("P1", "R1", runner=run)
+    assert run.calls[0]["variables"] == {"p": "P1", "r": "R1"}
+    assert "linkProjectV2ToRepository" in run.calls[0]["query"]
+
+
+async def test_get_project_reads_closed():
+    node = {**_project_node([]), "closed": True}
+    proj = await pv.get_project("me", 7, runner=_runner({"data": {"user": {"projectV2": node}}}))
+    assert proj.closed is True
