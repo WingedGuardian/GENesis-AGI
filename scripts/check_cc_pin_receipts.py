@@ -311,13 +311,21 @@ def _outside_comments(line: str, in_comment: bool) -> tuple[str, bool]:
     return "".join(out), in_comment
 
 
-def readable_body(body: str) -> str:
+def readable_body(body: str, *, keep_blank: bool = False) -> str:
     """The part of a PR body a human actually reads.
 
     Removes HTML comments and fenced code blocks. Both hide text from the
     rendered view (a comment) or mark it as documentation rather than assertion
     (a fence), and a receipt the reviewer cannot see defeats the only enforcement
     this check has — a human reading a claim someone chose to make.
+
+    ``keep_blank=True`` additionally emits every blank source line (empty or
+    whitespace-only) that is outside a fence and outside a comment as ``""``,
+    so a caller that parses paragraphs can see where they end — CommonMark
+    0.31.2 ("Blank lines", "List items"): a blank line separates paragraphs and
+    can end a list item. Lines still dropped: anything a fence hides (the fence
+    markers included), anything a comment hides, and a line left empty only by
+    comment removal — none of those is a rendered blank line.
     """
     visible: list[str] = []
     in_comment = False
@@ -361,6 +369,17 @@ def readable_body(body: str) -> str:
         # refused a compliant PR and told the author the receipts were missing
         # while they were plainly there. MEASURED before the fix — both receipts
         # reported absent, with the identical text on its own lines accepted.
+        # A blank SOURCE line outside a comment renders as a paragraph break, so
+        # keep_blank keeps it — but only the raw line is tested: a line emptied
+        # by comment removal renders as nothing, and a blank inside an open
+        # comment is hidden like any other commented text.
+        # Blank per CommonMark 0.31.2 ("Characters and lines"): empty, or only
+        # U+0020 spaces and U+0009 tabs. Not str.strip(), which would also call
+        # NBSP, form feed, vertical tab or U+2028 blank and invent a boundary.
+        if keep_blank and not in_comment and not line.strip(" \t"):
+            visible.append("")
+            continue
+
         rendered, in_comment = _outside_comments(line, in_comment)
         stripped = rendered.strip()
 
