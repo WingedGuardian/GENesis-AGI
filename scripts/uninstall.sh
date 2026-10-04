@@ -539,6 +539,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-code-intel.timer genesis-code-intel.service \
                     genesis-star-milestone.timer genesis-star-milestone.service \
                     genesis-serena-claude-code.service genesis-serena-codex.service \
+                    genesis-cbm-query.service genesis-cbm-query-clients.slice \
                     genesis-backup.timer genesis-backup.service \
                     genesis-server.service genesis-bridge.service \
                     qdrant.service; do
@@ -581,7 +582,8 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
 
         # Remove systemd unit files
         SYSTEMD_DIR="$HOME/.config/systemd/user"
-        for f in "$SYSTEMD_DIR"/genesis-*.service "$SYSTEMD_DIR"/genesis-*.timer "$SYSTEMD_DIR/qdrant.service"; do
+        for f in "$SYSTEMD_DIR"/genesis-*.service "$SYSTEMD_DIR"/genesis-*.timer \
+                 "$SYSTEMD_DIR"/genesis-cbm-*-clients.slice "$SYSTEMD_DIR/qdrant.service"; do
             [ -e "$f" ] && safe_remove "$f" "systemd/$(basename "$f")"
         done
         systemctl --user daemon-reload 2>/dev/null || true
@@ -644,6 +646,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                 systemctl --user stop genesis-code-intel.timer genesis-code-intel.service 2>/dev/null || true;
                 systemctl --user stop genesis-star-milestone.timer genesis-star-milestone.service 2>/dev/null || true;
                 systemctl --user stop genesis-serena-claude-code.service genesis-serena-codex.service 2>/dev/null || true;
+                systemctl --user stop genesis-cbm-query.service genesis-cbm-query-clients.slice 2>/dev/null || true;
                 systemctl --user stop genesis-backup.timer genesis-backup.service 2>/dev/null || true;
                 systemctl --user stop genesis-server.service genesis-bridge.service qdrant.service 2>/dev/null || true;
                 for u in genesis-server.service genesis-bridge.service \
@@ -655,6 +658,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-code-intel.timer genesis-code-intel.service \
                     genesis-star-milestone.timer genesis-star-milestone.service \
                     genesis-serena-claude-code.service genesis-serena-codex.service \
+                    genesis-cbm-query.service genesis-cbm-query-clients.slice \
                     genesis-backup.timer genesis-backup.service \
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service qdrant.service; do
                     systemctl --user disable \"\$u\" 2>/dev/null || true;
@@ -700,6 +704,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             container_exec "
                 rm -f ~/.config/systemd/user/genesis-*.service \
                       ~/.config/systemd/user/genesis-*.timer \
+                      ~/.config/systemd/user/genesis-cbm-*-clients.slice \
                       ~/.config/systemd/user/qdrant.service 2>/dev/null;
                 systemctl --user daemon-reload 2>/dev/null || true
             "

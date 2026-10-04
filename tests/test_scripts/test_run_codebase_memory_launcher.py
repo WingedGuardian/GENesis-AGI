@@ -304,7 +304,9 @@ def _launcher_env(**extra: str) -> dict[str, str]:
     return {
         "PATH": os.environ["PATH"],
         "HOME": os.environ["HOME"],
-        "CODEBASE_MEMORY_MCP_DISABLE_FILE": "/dev/null/not-disabled",
+        # A missing directory is a definite ENOENT. "/dev/null/x" is not: its
+        # parent is not a directory, and only ENOENT clears the sentinel.
+        "CODEBASE_MEMORY_MCP_DISABLE_FILE": "/genesis-test-no-such-dir/not-disabled",
         **{k: os.environ[k]
            for k in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
            if k in os.environ},
@@ -1190,3 +1192,17 @@ def test_missing_selection_library_refuses_raw_launch(tmp_path, monkeypatch):
     assert result.returncode != 0
     assert "cannot establish managed selection" in result.stderr
     assert not binary_log.exists()
+
+
+def test_dangling_disable_sentinel_is_armed(tmp_path):
+    """A dangling link (a lost incident sentinel target) never reads as absent."""
+    disable_file = tmp_path / "codebase-memory-mcp.disabled"
+    disable_file.symlink_to(tmp_path / "lost-target")
+    fakebin, _ = _fake_systemd_run(tmp_path)
+    res, blog = _run_launcher(
+        tmp_path, fakebin=fakebin,
+        env_extra={"CODEBASE_MEMORY_MCP_DISABLE_FILE": str(disable_file)},
+    )
+    assert res.returncode == 1
+    assert f"disabled by {disable_file}" in res.stderr
+    assert not blog.exists()

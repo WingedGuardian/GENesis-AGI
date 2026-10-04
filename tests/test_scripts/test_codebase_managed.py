@@ -144,7 +144,7 @@ def test_frontend_does_not_pull_backend_start(config, tmp_path, monkeypatch):
     monkeypatch.setattr(m, "require_enabled", lambda *a: None)
     monkeypatch.setattr(m, "verify_cache", lambda *a: None)
     monkeypatch.setattr(m, "check_backend", lambda *a: None)
-    monkeypatch.setattr(m, "verify_units", lambda *a: None)
+    monkeypatch.setattr(m, "verify_units", lambda *a, **k: None)
     captured = []
     monkeypatch.setattr(m.os, "execv", lambda _, args: captured.extend(args))
     m.launch(config, tmp_path / "settings")
@@ -188,7 +188,7 @@ def test_explicit_managed_paths_reject_unit_injection():
     assert m.quote_unit('/tmp/a%"$x') == '"/tmp/a%%\\"$x"'
 
 
-@pytest.mark.parametrize("conflict", ["dangling-settings", "loaded-unit"])
+@pytest.mark.parametrize("conflict", ["dangling-settings", "dangling-state", "loaded-unit"])
 def test_configure_preserves_foreign_artifacts_before_pin_or_state(tmp_path, monkeypatch, conflict):
     monkeypatch.setenv("HOME", str(tmp_path))
     main = tmp_path / "repo"
@@ -199,10 +199,17 @@ def test_configure_preserves_foreign_artifacts_before_pin_or_state(tmp_path, mon
     if conflict == "dangling-settings":
         path.symlink_to(foreign)
     state = tmp_path / "state"
+    if conflict == "dangling-state":  # e.g. a state link to a volume not yet mounted
+        state.symlink_to(foreign)
     monkeypatch.setattr(
         m, "verified_binary", lambda *a: pytest.fail("must preserve before opening binary")
     )
-    monkeypatch.setattr(m, "systemctl", lambda *a: "loaded")
+    # Only the loaded-unit case may refuse on the manager's evidence; the
+    # filesystem cases must refuse on their own.
+    free = {"ActiveState": "inactive", "ControlGroup": "", "LoadState": "not-found"}
+    monkeypatch.setattr(
+        m, "systemctl", lambda *a: "loaded" if conflict == "loaded-unit" else free[a[3]]
+    )
     args = argparse.Namespace(
         main=str(main),
         binary=str(tmp_path / "binary"),
@@ -213,6 +220,7 @@ def test_configure_preserves_foreign_artifacts_before_pin_or_state(tmp_path, mon
     with pytest.raises(ValueError, match="preserved"):
         m.configure(args, path)
     assert not foreign.exists() and not state.exists()
+    assert state.is_symlink() is (conflict == "dangling-state")
 
 
 @pytest.mark.parametrize("stop_fails", [False, True])
@@ -401,18 +409,6 @@ def test_disable_with_unverifiable_fragment_still_persists_disabled(tmp_path, co
         m.set_enabled(config, path, False)
     assert m.read_settings(path)["enabled"] is False
     assert not actions  # the unproven unit is never stopped by name
-
-
-def test_launch_against_older_template_names_repair(tmp_path, config, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    path = tmp_path / "settings.json"
-    directory = _write_units(config, path, tmp_path)
-    fragment = directory / m.backend(config)
-    fragment.write_text(_stale(fragment.read_text()))
-    monkeypatch.setattr(m, "systemctl", _manager({}, []))
-    monkeypatch.setattr(m.os, "execv", lambda *a: pytest.fail("must not launch"))
-    with pytest.raises(ValueError, match="repair-units"):
-        m.launch(config, path)
 
 
 def test_verify_units_compares_loaded_fragment_by_identity(tmp_path, config, monkeypatch):
@@ -850,3 +846,406 @@ def test_notfound_unit_with_live_ownership_is_preserved(monkeypatch, active, cgr
     values = {"LoadState": "not-found", "ActiveState": active, "ControlGroup": cgroup}
     monkeypatch.setattr(m, "systemctl", lambda *a: values[a[3]])
     assert m.unit_available("genesis-cbm-test.service") is available
+
+
+# ── round 4: fail-closed handling of filesystem, systemd and cgroup state ──
+
+
+def _sentinel_state(tmp_path: Path, state: str) -> Path:
+    base = tmp_path / "sentinel-home"
+    base.mkdir()
+    sentinel = base / "disabled"
+    if state == "file":
+        sentinel.write_text("incident")
+    elif state == "dangling-link":
+        sentinel.symlink_to(tmp_path / "missing-target")
+    elif state == "unsearchable-parent":
+        base.chmod(0o600)
+    elif state == "dangling-ancestor":  # e.g. a lost mount target
+        sentinel = base / "mount/disabled"
+        (base / "mount").symlink_to(tmp_path / "unmounted")
+    elif state == "file-ancestor":
+        (base / "plain").write_text("not a directory")
+        sentinel = base / "plain/disabled"
+    elif state == "missing-ancestor":  # still a definite ENOENT
+        sentinel = base / "absent/disabled"
+    return sentinel
+
+
+_SENTINEL_STATES = {
+    "absent": False,
+    "missing-ancestor": False,
+    "file": True,
+    "dangling-link": True,
+    "unsearchable-parent": True,
+    "dangling-ancestor": True,
+    "file-ancestor": True,
+}
+
+
+@pytest.mark.parametrize("state", sorted(_SENTINEL_STATES))
+def test_only_a_definitely_absent_sentinel_permits_execution(tmp_path, config, monkeypatch, state):
+    """Codex P1 4176698887: an unreadable or dangling sentinel is armed, never absent."""
+    sentinel = _sentinel_state(tmp_path, state)
+    config["sentinel"] = str(sentinel)
+    config["main"] = str(tmp_path.resolve())
+    try:
+        if state == "unsearchable-parent" and os.access(sentinel.parent, os.X_OK):
+            pytest.skip("running with privileges that ignore directory modes")
+        monkeypatch.setattr(m, "verify_cache", lambda *a: None)
+        if _SENTINEL_STATES[state]:
+            with pytest.raises(ValueError, match="disabled"):
+                m.batch_values(config, config["main"])
+        else:
+            monkeypatch.setattr(m, "verified_binary", lambda *a: contextlib.nullcontext())
+            assert m.batch_values(config, config["main"])[0] == config["binary"]
+    finally:
+        (tmp_path / "sentinel-home").chmod(0o700)
+
+
+@pytest.mark.parametrize("state", sorted(_SENTINEL_STATES))
+def test_shell_sentinel_check_matches_python(tmp_path, state):
+    """One rule in both languages (parity lock, not a verify-RED)."""
+    sentinel = _sentinel_state(tmp_path, state)
+    try:
+        if state == "unsearchable-parent" and os.access(sentinel.parent, os.X_OK):
+            pytest.skip("running with privileges that ignore directory modes")
+        result = _RUN(
+            ["bash", "-c", '. "$0" && codebase_managed_sentinel_armed "$1"', SELECTION_LIB,
+             str(sentinel)],
+            capture_output=True, text=True, timeout=30,
+        )
+        python = m.sentinel_armed(str(sentinel))
+    finally:
+        (tmp_path / "sentinel-home").chmod(0o700)
+    assert result.returncode in (0, 1), result.stderr
+    assert (result.returncode == 0) is python is _SENTINEL_STATES[state]
+
+
+def test_settings_symlink_refused_when_read(tmp_path, config):
+    """Codex 4176698871: a link to a valid copy is refused on read, as on write."""
+    real = tmp_path / "real.json"
+    real.write_text(json.dumps(config))
+    link = tmp_path / "settings.json"
+    link.symlink_to(real)
+    with pytest.raises(ValueError, match="symlink"):
+        m.read_settings(link)
+
+
+def test_settings_write_never_clobbers_a_concurrently_created_file(tmp_path, config):
+    """Codex 4176698875: the initial publish is no-clobber."""
+    path = tmp_path / "settings.json"
+    path.write_text("foreign")
+    with pytest.raises(OSError):
+        m.write_settings(path, config)
+    assert path.read_text() == "foreign"
+
+
+def test_configure_preserves_settings_created_during_configure(tmp_path, monkeypatch):
+    """The rollback must not delete a settings file another process created."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    main = (tmp_path / "repo").resolve()
+    (main / ".git").mkdir(parents=True)
+    monkeypatch.setattr(m, "SCRIPT", main / "scripts/codebase_managed.py", raising=False)
+    provider = tmp_path / "provider"
+    provider.write_bytes(b"accepted build")
+    path = tmp_path / ".genesis/config/codebase-managed.json"
+    monkeypatch.setattr(m, "verified_binary", lambda p: open(p, "rb"))  # noqa: SIM115
+    monkeypatch.setattr(m, "unit_available", lambda unit: True)
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0))
+    monkeypatch.setattr(m, "verify_cache", lambda config: None)
+
+    def manager(*args):
+        if args[0] == "daemon-reload" and not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("theirs")  # another actor wins after the absence check
+        return ""
+
+    monkeypatch.setattr(m, "systemctl", manager)
+    args = argparse.Namespace(
+        main=str(main), binary=str(provider), state=str(tmp_path / "state"),
+        sentinel=str(tmp_path / "disabled"), name="genesis-cbm-test",
+    )
+    with pytest.raises(OSError):
+        m.configure(args, path)
+    assert path.read_text() == "theirs"
+    assert not (tmp_path / "state").exists()
+
+
+def test_repair_refuses_fragment_replaced_after_verification(tmp_path, config, monkeypatch):
+    """Codex 4176698875: repair replaces only the inode it verified."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps(config))
+    directory = _write_units(config, path, tmp_path)
+    for name, body in m.render_units(config, path).items():
+        (directory / name).write_text(_stale(body))
+    fragment = directory / m.backend(config)
+    replacement = m.MARKER + m.CONFIG_LINE + str(path) + "\n[Service]\nExecStart=/bin/theirs\n"
+    slice_unit = config["name"] + "-clients.slice"
+
+    def fragment_path(unit):
+        if unit == slice_unit:  # the last verification: swap the backend after its check
+            staged = directory / "swap.tmp"
+            staged.write_text(replacement)
+            os.replace(staged, fragment)
+        return str(directory / unit)
+
+    values = {
+        "ActiveState": lambda unit: "inactive",
+        "ControlGroup": lambda unit: "",
+        "FragmentPath": fragment_path,
+    }
+    actions = []
+    monkeypatch.setattr(m, "systemctl", _manager(lambda u, n: values[n](u), actions))
+    with pytest.raises(ValueError, match="changed"):
+        m.repair_units(path)
+    assert fragment.read_text() == replacement
+    assert actions == []
+
+
+@pytest.mark.parametrize(
+    "fault", ["start-oserror", "start-error-write-fails", "start-error-write-and-stop-fail"]
+)
+def test_activation_rollback_attempts_each_step_and_keeps_start_error(
+    tmp_path, config, monkeypatch, capsys, fault
+):
+    """Codex 4176698876: reset and stop are independent; the start error surfaces."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".config/systemd/user").mkdir(parents=True)
+    path = tmp_path / "settings.json"
+    config["enabled"] = False
+    path.write_text(json.dumps(config))
+    monkeypatch.setattr(m, "verify_cache", lambda *a: None)
+    monkeypatch.setattr(m, "verify_units", lambda *a, **k: None)
+    monkeypatch.setattr(m, "verified_binary", lambda *a: contextlib.nullcontext())
+    real_write = m.write_settings
+    writes = []
+
+    def write_settings(target, value, *rest):
+        writes.append(value["enabled"])
+        if value["enabled"] is False and fault != "start-oserror":
+            raise OSError("settings filesystem is read-only")
+        return real_write(target, value, *rest)
+
+    monkeypatch.setattr(m, "write_settings", write_settings)
+    actions = []
+
+    def manager(*args):
+        actions.append(args)
+        if args[0] == "start":
+            if fault == "start-oserror":
+                raise PermissionError("systemctl became inaccessible")
+            raise subprocess.CalledProcessError(1, "start")
+        if args[0] == "stop" and fault == "start-error-write-and-stop-fail":
+            raise subprocess.CalledProcessError(2, "stop")
+        return ""
+
+    monkeypatch.setattr(m, "systemctl", manager)
+    expected = PermissionError if fault == "start-oserror" else subprocess.CalledProcessError
+    with pytest.raises(expected) as error:
+        m.set_enabled(config, path, True)
+    if expected is subprocess.CalledProcessError:
+        assert error.value.cmd == "start"
+    assert writes == [True, False]
+    assert actions == [
+        ("start", "genesis-cbm-query.service"),
+        ("stop", "genesis-cbm-query.service"),
+    ]
+    if fault == "start-oserror":
+        assert m.read_settings(path)["enabled"] is False
+    else:
+        assert "read-only" in capsys.readouterr().err
+
+
+def test_client_ancestors_must_admit_the_aggregate_budget(tmp_path, config, monkeypatch):
+    """Codex 4176698894: an ancestor below 2 GiB caps the whole client slice.
+
+    cgroup v2 limits may be over-committed: "the sum of the limits of children
+    can exceed the amount of resource available to the parent" (kernel
+    admin-guide cgroup-v2, Resource Distribution Models / Limits).
+    """
+    unit = config["name"] + "-client-" + "a" * 32 + ".service"
+    parent = tmp_path / "user.slice" / (config["name"] + "-clients.slice")
+    leaf = parent / unit
+    leaf.mkdir(parents=True)
+    for directory, cap in (
+        (tmp_path, "max"),
+        (tmp_path / "user.slice", str(m.GIB)),  # admits one client, not the aggregate
+        (parent, str(2 * m.GIB)),
+        (leaf, str(m.GIB // 4)),
+    ):
+        (directory / "memory.max").write_text(cap)
+        (directory / "memory.swap.max").write_text("0")
+    monkeypatch.setattr(m, "resolve_cgroup", lambda *a: (leaf, tmp_path, 2))
+    with pytest.raises(ValueError, match="ancestor"):
+        m.verify_boundary(config, "client", unit)
+
+
+@pytest.mark.parametrize("fault", ["old-template", "drop-in", "foreign"])
+def test_launch_tolerates_template_drift_but_not_foreign_units(tmp_path, config, monkeypatch, fault):
+    """A1: a template change must not take the MCP down; ownership still holds."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    path = tmp_path / "settings.json"
+    directory = _write_units(config, path, tmp_path)
+    fragment = directory / m.backend(config)
+    fragment.write_text(_stale(fragment.read_text()))
+    values = {
+        "FragmentPath": lambda unit: "/foreign/unit" if fault == "foreign" else str(directory / unit),
+        "DropInPaths": lambda unit: "/foreign/drop.conf" if fault == "drop-in" else "",
+        "NeedDaemonReload": lambda unit: "no",
+    }
+    monkeypatch.setattr(m, "systemctl", _manager(lambda u, n: values[n](u), []))
+    monkeypatch.setattr(m, "verify_cache", lambda *a: None)
+    monkeypatch.setattr(m, "check_backend", lambda *a: None)
+    launched = []
+    monkeypatch.setattr(m.os, "execv", lambda _, args: launched.append(args))
+    if fault == "old-template":
+        m.launch(config, path)
+        assert launched
+    else:
+        with pytest.raises(ValueError):
+            m.launch(config, path)
+        assert not launched
+
+
+def test_status_reports_template_drift(tmp_path, config, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps(config))
+    directory = _write_units(config, path, tmp_path)
+    fragment = directory / m.backend(config)
+    fragment.write_text(_stale(fragment.read_text()))
+    monkeypatch.setattr(m, "systemctl", lambda *a: "inactive")
+    monkeypatch.setattr(m.sys, "argv", ["codebase_managed.py", "--config", str(path), "status"])
+    assert m.main() == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["units"][m.backend(config)].startswith("drift")
+    assert report["units"][config["name"] + "-clients.slice"] == "current"
+
+
+def _remove(path: Path) -> int:
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(m.sys, "argv", ["codebase_managed.py", "--config", str(path), "remove"])
+        return m.main()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["none", "stale-build", "half-removed", "foreign", "settings-only", "units-still-loaded"],
+)
+def test_remove_retires_only_owned_units_and_the_settings(tmp_path, config, monkeypatch, fault):
+    """A2: after remove, selection derivation reports a never-configured install."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEBASE_MEMORY_MCP_MANAGED_CONFIG", raising=False)
+    path = m.config_path(str(tmp_path / ".genesis/config/codebase-managed.json"))
+    path.parent.mkdir(parents=True)
+    directory = _write_units(config, path, tmp_path)
+    if fault == "stale-build":  # settings from an older accepted build can still retire
+        config["build"] = "0" * 64
+    path.write_text(json.dumps(config))
+    slice_unit = config["name"] + "-clients.slice"
+    if fault == "foreign":
+        (directory / slice_unit).write_text("[Slice]\nMemoryMax=8G\n")
+    if fault == "half-removed":  # an earlier remove stopped before its second unlink
+        (directory / m.backend(config)).unlink()
+    if fault in ("settings-only", "units-still-loaded"):
+        for unit in m.render_units(config, path):
+            (directory / unit).unlink()
+    loaded = {
+        "FragmentPath": lambda unit: str(directory / unit),
+        "DropInPaths": lambda unit: "",
+        "NeedDaemonReload": lambda unit: "no",
+        "LoadState": lambda unit: "not-found",
+        "ActiveState": lambda unit: "active" if fault == "units-still-loaded" else "inactive",
+        "ControlGroup": lambda unit: "/owned" if fault == "units-still-loaded" else "",
+    }
+    actions = []
+    monkeypatch.setattr(m, "systemctl", _manager(lambda u, n: loaded[n](u), actions))
+    before = {p.name: p.read_text() for p in directory.glob("genesis-cbm-*")}
+    result = _remove(path)
+    if fault in ("none", "stale-build"):
+        assert result == 0
+        assert actions == [
+            ("disable", m.backend(config)),
+            ("stop", m.backend(config), slice_unit),
+            ("daemon-reload",),
+        ]
+    elif fault == "half-removed":
+        assert result == 0
+        assert actions == [("daemon-reload",), ("stop", slice_unit), ("daemon-reload",)]
+    elif fault == "settings-only":
+        assert result == 0 and actions == [("daemon-reload",)]
+    else:
+        assert result == 1
+        assert actions == ([("daemon-reload",)] if fault == "units-still-loaded" else [])
+        assert {p.name: p.read_text() for p in directory.glob("genesis-cbm-*")} == before
+        assert m.read_settings(path)["enabled"] is False  # the stop lever still landed
+        return
+    assert not any(directory.glob("genesis-cbm-*"))
+    assert not path.exists()
+    assert _selected(path, tmp_path) == 1
+
+
+def _uninstall_block(path: str) -> str:
+    source = (ROOT / "scripts/uninstall.sh").read_text()
+    if path == "direct":
+        helper = source[source.index("safe_disable_service() {") : source.index("# Run a command inside")]
+        start = source.index("        PRESSURE_UNIT=genesis-disk-hygiene-pressure")
+        return helper + source[start : source.index("        # Persistent= timers", start)]
+    helper = source[source.index("remove_serena_enablement() {") : source.index("# Run a command inside")]
+    helper += 'container_exec() { bash -c "$1"; }\n'
+    start = source.index('            container_exec "', source.index("# Stop all services (timers first"))
+    return helper + source[start : source.index('            ok "Stopped Genesis services"', start)]
+
+
+@pytest.mark.parametrize("path", ["direct", "host"])
+def test_uninstall_stops_and_disables_managed_codebase_units(tmp_path, path):
+    calls = tmp_path / "calls"
+    fake = tmp_path / "bin/systemctl"
+    fake.parent.mkdir()
+    fake.write_text(f'#!/bin/sh\necho "$*" >> "{calls}"\n')
+    fake.chmod(0o755)
+    _RUN(
+        ["bash", "-c", "DRY_RUN=false; ok() { :; }; skip() { :; };\n" + _uninstall_block(path)],
+        env=dict(os.environ, HOME=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path / "run"),
+                 PATH=f"{fake.parent}:{os.defpath}"),
+        check=True, capture_output=True, text=True, timeout=60,
+    )
+    recorded = [line.split() for line in calls.read_text().splitlines()]
+    for unit in ("genesis-cbm-query.service", "genesis-cbm-query-clients.slice"):
+        for operation in ("stop", "disable"):
+            assert any(args[:2] == ["--user", operation] and unit in args[2:] for args in recorded)
+
+
+@pytest.mark.parametrize("path", ["direct", "host"])
+def test_uninstall_deletes_managed_codebase_fragments(tmp_path, path):
+    """Default and custom unit names: no owned fragment survives to re-select."""
+    source = (ROOT / "scripts/uninstall.sh").read_text()
+    if path == "direct":
+        start = source.index("        # Remove systemd unit files\n        SYSTEMD_DIR")
+        end = source.index("\n", source.index("daemon-reload", start))
+        block = source[source.index("safe_remove() {") : source.index("# Stop and disable a systemd")]
+        block += source[start:end]
+    else:
+        start = source.index("            # Remove systemd unit files\n")
+        block = 'container_exec() { bash -c "$1"; }\n'
+        block += source[start : source.index('            ok "Removed systemd unit files"', start)]
+    fake = tmp_path / "bin/systemctl"
+    fake.parent.mkdir()
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o755)
+    directory = tmp_path / ".config/systemd/user"
+    directory.mkdir(parents=True)
+    names = [
+        "genesis-cbm-query.service", "genesis-cbm-query-clients.slice",
+        "genesis-cbm-other.service", "genesis-cbm-other-clients.slice",
+    ]
+    for name in names:
+        (directory / name).write_text(m.MARKER)
+    _RUN(
+        ["bash", "-c", "DRY_RUN=false; REMOVED=(); ok() { :; }; skip() { :; };\n" + block],
+        env=dict(os.environ, HOME=str(tmp_path), PATH=f"{fake.parent}:{os.defpath}"),
+        check=True, capture_output=True, text=True, timeout=60,
+    )
+    assert not [name for name in names if (directory / name).exists()]

@@ -2118,3 +2118,62 @@ def test_managed_batch_resolves_relative_repository_before_validation(tmp_path):
     assert receipt.read_text() == str(repo), result.stderr
     assert "MemoryMax=8G" in log.with_suffix(".systemd.log").read_text()
     assert allowed.read_text() == str(repo)  # physical spelling, not "alias"
+
+
+def _receipt_helper(tmp_path: Path, fakebin: Path) -> Path:
+    """Replace the private harness's managed helper with one that records a call."""
+    _test_entrypoint(tmp_path, fakebin)
+    helper = tmp_path / "codebase_managed.py"
+    helper.unlink()
+    receipt = tmp_path / "managed-state-read"
+    helper.write_text(
+        f"from pathlib import Path\nPath({str(receipt)!r}).write_text('read')\n"
+        f"print({str(fakebin / 'codebase-memory-mcp')!r})\n"
+        f"print({str(tmp_path)!r})\nprint({str(tmp_path)!r})\nprint('8G')\n"
+    )
+    return receipt
+
+
+@pytest.mark.parametrize("gate", ["index-disable", "cbm-sentinel"])
+def test_disable_gates_precede_any_managed_state_access(tmp_path, gate):
+    """Codex 4176698881: a disabled runner never touches managed state."""
+    repo = _make_repo(tmp_path)
+    fakebin, log = tmp_path / "bin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    receipt = _receipt_helper(tmp_path, fakebin)
+    env = {"CODEBASE_MEMORY_MCP_MANAGED_CONFIG": str(tmp_path / "m.json")}
+    if gate == "index-disable":
+        env["CODE_INTEL_INDEX_DISABLE"] = "1"
+    else:
+        sentinel = tmp_path / "codebase-memory-mcp.disabled"
+        sentinel.write_text("incident\n")
+        env["CODEBASE_MEMORY_MCP_DISABLE_FILE"] = str(sentinel)
+    result = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", env_extra=env)
+    assert result.returncode == (0 if gate == "index-disable" else 3), result.stdout
+    assert not receipt.exists()
+    assert not log.exists()
+
+
+@pytest.mark.parametrize("state", ["dangling-link", "unsearchable-parent"])
+def test_unreadable_cbm_sentinel_refuses_the_raw_leg(tmp_path, state):
+    """Only a definitely absent kill switch lets the cbm leg run."""
+    repo = _make_repo(tmp_path)
+    fakebin, log = tmp_path / "bin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    holder = tmp_path / "sentinel-dir"
+    holder.mkdir()
+    sentinel = holder / "codebase-memory-mcp.disabled"
+    if state == "dangling-link":
+        sentinel.symlink_to(tmp_path / "lost-target")
+    else:
+        holder.chmod(0o600)
+    try:
+        if state == "unsearchable-parent" and os.access(holder, os.X_OK):
+            pytest.skip("running with privileges that ignore directory modes")
+        result = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
+                            env_extra={"CODEBASE_MEMORY_MCP_DISABLE_FILE": str(sentinel)})
+    finally:
+        holder.chmod(0o700)
+    assert result.returncode == 3, result.stdout
+    assert f"disabled by {sentinel}" in result.stdout
+    assert not log.exists()

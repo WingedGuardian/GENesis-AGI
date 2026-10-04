@@ -4,12 +4,14 @@
 The settings route is fail closed once present. Configure does not remove the
 machine sentinel or start services. Internal ABI is pinned to the accepted build.
 Route selection is derived by scripts/lib/codebase_managed_selection.sh from the
-override, the settings path and the owned unit fragments rendered below.
+override, the settings path and the owned unit fragments rendered below; remove
+retires the route by deleting exactly those owned fragments and the settings.
 """
 
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
@@ -17,6 +19,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -65,24 +68,53 @@ def main_script(config: dict) -> Path:
     return Path(config["main"]) / "scripts/codebase_managed.py"
 
 
-def read_unit(fragment: Path) -> str:
-    with fragment.open(**UNIT_TEXT) as stream:
-        return stream.read()
+def read_file(path: Path) -> tuple[str, tuple[int, int]]:
+    """Text and (device, inode) of a regular file, never following a final link."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ValueError(f"managed symlink refused: {path}") from error
+        raise
+    with open(fd, **UNIT_TEXT) as stream:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"managed path is not a regular file: {path}")
+        return stream.read(), (info.st_dev, info.st_ino)
 
 
 def units_dir() -> Path:
     return Path.home() / ".config/systemd/user"
 
 
-def owned_fragment(fragment: Path, path: Path) -> bool:
-    if fragment.is_symlink() or not fragment.is_file():
-        return False
-    with fragment.open(**UNIT_TEXT) as stream:
-        return stream.readline() == MARKER and stream.readline() == CONFIG_LINE + str(path) + "\n"
+def owned_fragment(fragment: Path, path: Path) -> tuple[str, tuple[int, int]] | None:
+    """Text and identity of a regular generated fragment of this configuration."""
+    try:
+        text, identity = read_file(fragment)
+    except (FileNotFoundError, ValueError):
+        return None
+    return (text, identity) if text.startswith(MARKER + CONFIG_LINE + str(path) + "\n") else None
 
 
-def read_settings(path: Path) -> dict:
-    value = json.loads(path.read_text())
+def sentinel_armed(raw: str) -> bool:
+    """False only for a definitely absent sentinel (mirrored in the shell library).
+
+    Only ENOENT clears it, and only when no component above it is a broken link
+    (a lost mount target hides a sentinel that may still be there). A dangling
+    link at the sentinel itself, or any other lookup error, keeps it armed.
+    """
+    try:
+        os.lstat(raw)
+    except FileNotFoundError:
+        return any(os.path.lexists(p) and not os.path.exists(p) for p in Path(raw).parents)
+    except OSError:
+        return True
+    return True
+
+
+def load_settings(path: Path, *, require_build: bool = True) -> tuple[dict, tuple[int, int]]:
+    text, identity = read_file(path)
+    value = json.loads(text)
     if (
         not isinstance(value, dict)
         or type(value.get("version")) is not int
@@ -96,13 +128,19 @@ def read_settings(path: Path) -> dict:
         r"genesis-cbm-[a-z0-9]+(?:-[a-z0-9]+)*", value["name"]
     ):
         raise ValueError("invalid managed unit name")
-    if value.get("build") != BUILD:
+    # The pin gates running the executable. Disabling and retiring never run it,
+    # so settings written by an older accepted build can still be switched off.
+    if require_build and value.get("build") != BUILD:
         raise ValueError("unsupported managed build")
-    return value
+    return value, identity
+
+
+def read_settings(path: Path) -> dict:
+    return load_settings(path)[0]
 
 
 def require_enabled(config: dict) -> None:
-    if not config["enabled"] or Path(config["sentinel"]).exists():
+    if not config["enabled"] or sentinel_armed(config["sentinel"]):
         raise ValueError("managed Codebase is disabled")
 
 
@@ -244,10 +282,17 @@ def verify_boundary(config: dict, role: str, unit: str) -> None:
             raise ValueError("managed frontend aggregate cap unavailable")
         if (parent / "memory.swap.max").read_text().strip() != "0":
             raise ValueError("managed frontend aggregate swap cap unavailable")
+    # cgroup v2 limits may be over-committed: "the sum of the limits of children
+    # can exceed the amount of resource available to the parent" (kernel
+    # admin-guide cgroup-v2, Resource Distribution Models: Limits). So every
+    # ancestor must admit the whole 2 GiB budget: the service's own cap, or the
+    # client slice's aggregate, never just one 256 MiB client. The bound is per
+    # budget; the two budgets together (4 GiB) are not required of a shared
+    # ancestor.
     cursor = leaf.parent
     while cursor == root or root in cursor.parents:
         maximum = (cursor / "memory.max").read_text().strip()
-        if maximum != "max" and int(maximum) < expected:
+        if maximum != "max" and int(maximum) < 2 * GIB:
             raise ValueError("ancestor cap is smaller than managed requirement")
         if cursor == root:
             break
@@ -399,11 +444,11 @@ def configure(args: argparse.Namespace, path: Path) -> None:
     unit_dir.mkdir(parents=True, exist_ok=True)
     with (unit_dir / ".genesis-codebase-config.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if (
-            path.exists()
-            or path.is_symlink()
-            or state.exists()
-            or any((unit_dir / u).exists() or (unit_dir / u).is_symlink() for u in units)
+        # lexists: a dangling link is an existing artifact, never a free path
+        # (a --state link to an unmounted target would otherwise be created).
+        if any(
+            os.path.lexists(p)
+            for p in (path, absolute(args.state), state, *(unit_dir / u for u in units))
         ):
             raise ValueError("existing settings/state/unit preserved; choose a fresh staging state")
         if any(not unit_available(u) for u in units):
@@ -442,8 +487,11 @@ def configure(args: argparse.Namespace, path: Path) -> None:
                     stream.write(text)
             systemctl("daemon-reload")
             path.parent.mkdir(parents=True, exist_ok=True)
-            created.append(path)  # absent under the lock; rollback never removes a link
-            write_settings(path, config)  # commit point: settings exist only on success
+            # Commit point, no-clobber and last: a file another process put there
+            # meanwhile is neither replaced nor, since the path is never in
+            # `created`, removed by the rollback. Should the directory sync fail
+            # after the link, the published settings stay for `remove`.
+            write_settings(path, config)
         except BaseException:
             rollback_configure(created, unit_dir, state)
             raise
@@ -469,21 +517,31 @@ def rollback_configure(created: list[Path], unit_dir: Path, state: Path) -> None
             print(f"configure rollback daemon-reload failed: {error}", file=sys.stderr)
 
 
-def write_settings(path: Path, config: dict) -> None:
-    atomic_write(path, json.dumps(config, indent=2) + "\n")
+def write_settings(path: Path, config: dict, expected=None) -> tuple[int, int]:
+    return atomic_write(path, json.dumps(config, indent=2) + "\n", expected)
 
 
-def atomic_write(path: Path, text: str) -> None:
-    # Readers see one complete document; never follow/overwrite a symlink.
-    if path.is_symlink():
-        raise ValueError(f"managed symlink preserved: {path}")
+def atomic_write(path: Path, text: str, expected=None) -> tuple[int, int]:
+    """Publish one complete document and return its (device, inode).
+
+    With no ``expected`` identity the path must not exist: the link fails
+    rather than clobber a file created concurrently. Otherwise the path must
+    still be the inode that was verified. A symlink is never followed.
+    """
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex)
     try:
         with temporary.open("x", **UNIT_TEXT) as stream:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+            info = os.fstat(stream.fileno())
+        if expected is None:
+            os.link(temporary, path)
+        else:
+            current = os.lstat(path)
+            if stat.S_ISLNK(current.st_mode) or (current.st_dev, current.st_ino) != expected:
+                raise ValueError(f"{path} changed after it was verified; preserved")
+            os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory)
@@ -491,20 +549,33 @@ def atomic_write(path: Path, text: str) -> None:
             os.close(directory)
     finally:
         temporary.unlink(missing_ok=True)
+    return info.st_dev, info.st_ino
 
 
-def verify_units(config: dict, path: Path, *, exact: bool = True) -> None:
+def remove_verified(path: Path, identity: tuple[int, int]) -> None:
+    current = os.lstat(path)
+    if (current.st_dev, current.st_ino) != identity:
+        raise ValueError(f"{path} changed after it was verified; preserved")
+    path.unlink()
+
+
+def verify_units(config: dict, path: Path, *, exact: bool = True, only=None) -> dict:
     """Prove each generated unit is ours and is what the manager loaded.
 
-    ``exact`` additionally requires the current template. Stopping needs only
-    ownership; starting or launching against an older template does not.
+    ``exact`` additionally requires the current template, which only ``enable``
+    asks for. ``only`` limits the proof to those units. Returns each fragment's
+    verified (device, inode).
     """
     unit_dir = units_dir()
+    identities = {}
     for unit, expected in render_units(config, path).items():
+        if only is not None and unit not in only:
+            continue
         fragment = unit_dir / unit
-        if not owned_fragment(fragment, path):
+        owned = owned_fragment(fragment, path)
+        if not owned:
             raise ValueError(f"{unit} is not a generated fragment of this configuration")
-        if exact and read_unit(fragment) != expected:
+        if exact and owned[0] != expected:
             raise ValueError(
                 f"{unit} differs from this checkout's template; from the primary "
                 "checkout run `codebase_managed.py disable` then `codebase_managed.py repair-units`"
@@ -516,17 +587,37 @@ def verify_units(config: dict, path: Path, *, exact: bool = True) -> None:
             raise ValueError(f"{unit} has unverified drop-ins")
         if loaded["NeedDaemonReload"] != "no":
             raise ValueError(f"{unit} load is stale; run systemctl --user daemon-reload")
+        identities[unit] = owned[1]
+    return identities
+
+
+def template_drift(config: dict, path: Path) -> dict[str, str]:
+    """Per unit: current, drift or not owned. Reported by status, never fatal."""
+    report = {}
+    for unit, expected in render_units(config, path).items():
+        try:
+            owned = owned_fragment(units_dir() / unit, path)
+        except OSError as error:
+            report[unit] = f"unreadable: {error.strerror}"
+            continue
+        if not owned:
+            report[unit] = "not owned"
+        elif owned[0] == expected:
+            report[unit] = "current"
+        else:
+            report[unit] = "drift: enable refuses until disable, then repair-units"
+    return report
 
 
 def set_enabled(config: dict, path: Path, enabled: bool) -> None:
     with (units_dir() / ".genesis-codebase-config.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        config = read_settings(path)
+        config, identity = load_settings(path, require_build=enabled)
         if not enabled:
             # The operator's stop lever: persist first, so launch and batch
             # refuse even when the unit cannot be proven ours and is not stopped.
             config["enabled"] = False
-            write_settings(path, config)
+            write_settings(path, config, identity)
             try:
                 verify_units(config, path, exact=False)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
@@ -537,21 +628,26 @@ def set_enabled(config: dict, path: Path, enabled: bool) -> None:
             systemctl("stop", backend(config))
             return
         verify_units(config, path)
-        if Path(config["sentinel"]).exists():
+        if sentinel_armed(config["sentinel"]):
             raise ValueError("machine sentinel is armed; explicit supervised activation required")
         verify_cache(config)
         with verified_binary(Path(config["binary"])):
             pass
         config["enabled"] = True
-        write_settings(path, config)
+        identity = write_settings(path, config, identity)
         try:
             systemctl("start", backend(config))
-        except subprocess.SubprocessError:
+        except BaseException:
+            # Each rollback step is attempted whatever the other does, and the
+            # start failure is what the caller sees.
             config["enabled"] = False
-            write_settings(path, config)
+            try:
+                write_settings(path, config, identity)
+            except Exception as error:  # noqa: BLE001 - reported; start error wins
+                print(f"rollback could not persist enabled=false: {error}", file=sys.stderr)
             try:
                 systemctl("stop", backend(config))
-            except subprocess.SubprocessError as stop_error:
+            except Exception as stop_error:  # noqa: BLE001 - reported; start error wins
                 print(f"rollback stop failed: {stop_error}", file=sys.stderr)
             raise
 
@@ -572,22 +668,60 @@ def repair_units(path: Path) -> None:
         # does not clear; with no control group left it is as idle as inactive.
         if state["ActiveState"] not in ("inactive", "failed") or state["ControlGroup"]:
             raise ValueError(f"{backend(config)} must be inactive; run disable first")
+        owned = {}
         for unit in units:  # verify every fragment before rewriting any
             fragment = unit_dir / unit
-            if not owned_fragment(fragment, path):
+            owned[unit] = owned_fragment(fragment, path)
+            if not owned[unit]:
                 raise ValueError(f"{unit} is not a generated fragment of this configuration")
             if not same_file(show(unit, "FragmentPath")["FragmentPath"], fragment):
                 raise ValueError(f"{unit} loaded fragment is not the generated fragment")
         for unit, text in units.items():
-            if read_unit(unit_dir / unit) != text:
-                atomic_write(unit_dir / unit, text)
+            if owned[unit][0] != text:  # replaces only the inode verified above
+                atomic_write(unit_dir / unit, text, owned[unit][1])
         systemctl("daemon-reload")
     print("Units repaired; services not started")
 
 
+def remove(path: Path) -> None:
+    """Retire the managed route: owned units, then settings. State and sentinel stay.
+
+    Settings are disabled first, so launch and batch refuse whatever follows.
+    Nothing that cannot be proven this configuration's is stopped or deleted.
+    Re-runnable after an interruption: fragments already gone must belong to
+    units the manager no longer runs, and only the remaining ones are acted on.
+    """
+    unit_dir = units_dir()
+    with (unit_dir / ".genesis-codebase-config.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        config, identity = load_settings(path, require_build=False)
+        config["enabled"] = False
+        identity = write_settings(path, config, identity)
+        units = render_units(config, path)
+        present = [unit for unit in units if os.path.lexists(unit_dir / unit)]
+        if len(present) < len(units):
+            systemctl("daemon-reload")  # forget fragments deleted before this run
+            if not all(unit_available(unit) for unit in units if unit not in present):
+                raise ValueError("a managed unit whose fragment is gone is still loaded or running")
+        if present:
+            fragments = verify_units(config, path, exact=False, only=present)
+            if backend(config) in present:
+                systemctl("disable", backend(config))  # drops any boot enablement link
+            systemctl("stop", *present)
+            for unit, fragment_identity in fragments.items():
+                remove_verified(unit_dir / unit, fragment_identity)
+            systemctl("daemon-reload")
+        remove_verified(path, identity)
+    print(f"Managed route removed; state under {Path(config['cache']).parent} and sentinel kept")
+
+
 def launch(config: dict, path: Path) -> None:
     require_enabled(config)
-    verify_units(config, path)
+    # Ownership, loaded fragment, drop-ins and load freshness, not the exact
+    # template: a template change must not take every configured MCP down.
+    # The limits are proven live by check_backend here and verify_boundary in
+    # the client (memory.max, swap and cgroup membership).
+    verify_units(config, path, exact=False)
     verify_cache(config)
     check_backend(config)
     unit = config["name"] + "-client-" + uuid.uuid4().hex + ".service"
@@ -659,6 +793,7 @@ def main() -> int:
     commands.add_parser("disable")
     commands.add_parser("enable")
     commands.add_parser("repair-units")
+    commands.add_parser("remove")
     args = parser.parse_args()
     try:
         # An empty override means unset, exactly as the shell callers treat it.
@@ -673,6 +808,9 @@ def main() -> int:
             return 0
         if args.command == "repair-units":
             repair_units(path)
+            return 0
+        if args.command == "remove":
+            remove(path)
             return 0
         # Route selection happens in the shell callers. Every command reached
         # here was selected or explicit, so it requires readable settings.
@@ -695,6 +833,7 @@ def main() -> int:
                     dict(
                         settings=config,
                         service=systemctl("show", backend(config), "-p", "ActiveState", "--value"),
+                        units=template_drift(config, path),
                     ),
                     indent=2,
                 )

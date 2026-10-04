@@ -41,16 +41,14 @@ if [[ -z "$_disable_file" || "$_disable_file" != /* ]]; then
     printf 'run-codebase-memory: disable-state path must be absolute\n' >&2
     exit 1
 fi
-if [[ -e "$_disable_file" ]]; then
-    printf 'run-codebase-memory: disabled by %s\n' "$_disable_file" >&2
-    exit 1
-fi
 
 # Explicitly configured native lifecycle replaces per-session daemon bootstrap.
 # Selection is derived from the override, the settings path and the generated
 # unit fragments (scripts/lib/codebase_managed_selection.sh), so losing the
 # settings never revives the raw provider; only a never-configured install runs
-# raw. Sentinel remains the first gate. Nothing here writes to stdout.
+# raw. The sentinel is the first decision: only a definitely absent one (no
+# dangling link, no unsearchable parent) lets either route continue. Nothing
+# here writes to stdout.
 _managed_config="${CODEBASE_MEMORY_MCP_MANAGED_CONFIG:-${_user_home}/.genesis/config/codebase-managed.json}"
 _launcher_dir="${BASH_SOURCE[0]%/*}"
 [[ "$_launcher_dir" != "${BASH_SOURCE[0]}" ]] || _launcher_dir=.
@@ -59,6 +57,10 @@ _managed_lib="$_launcher_dir/../../scripts/lib/codebase_managed_selection.sh"
 _managed_rc=2
 # shellcheck source=scripts/lib/codebase_managed_selection.sh
 if [[ -r "$_managed_lib" ]] && . "$_managed_lib" >&2; then
+    if codebase_managed_sentinel_armed "$_disable_file"; then
+        printf 'run-codebase-memory: disabled by %s\n' "$_disable_file" >&2
+        exit 1
+    fi
     _managed_rc=0
     codebase_managed_selected "$_managed_config" "$_user_home" >&2 || _managed_rc=$?
 fi

@@ -1,2 +1,3 @@
 - Opt-in pinned native Codebase query service and capped analysis frontends, with explicit disabled configuration, native stale-endpoint recovery and authenticated readiness.
 - Managed batch settings route the existing queue through its contained worker with the measured 8 GiB zero-swap cap, retaining admission, cancellation and durable outcomes.
+- `codebase_managed.py remove` retires the managed route (owned units and settings; native cache kept), and uninstall now stops and removes the managed units.

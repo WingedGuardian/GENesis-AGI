@@ -6,7 +6,7 @@ The opt-in `scripts/codebase_managed.py` integration uses the accepted exact
 v0.11 portable executable. It reuses the worker adapter's executable digest and
 runs the verified inode. There is no custom broker or provider fork. Configure
 writes disabled settings and account-owned units; it never removes the machine
-sentinel or starts a service. Existing state, dangling settings links and loaded
+sentinel or starts a service. Existing state, dangling settings or state links and loaded
 or vendor units are preserved through refusal.
 
 Managed route selection keeps no state of its own. The launcher and the queued
@@ -20,10 +20,21 @@ mount, so losing selected settings refuses execution instead of restoring raw
 bootstrap. Owned fragments naming a different settings path, or evidence that
 cannot be read (an unreadable fragment, or a unit directory or parent that
 cannot be listed or searched), also refuse. Only an install with none of this runs the raw
-provider; removing the generated units is the way back to it. An empty override
+provider; `codebase_managed.py remove` is the way back to it. An empty override
 means unset everywhere. The settings path is recorded with its directory
-canonicalised and its final component literal, so a settings symlink is still
-refused rather than followed.
+canonicalised and its final component literal, and the settings are read and
+written without following a final symlink, so a settings symlink is refused
+rather than followed by every command (including `disable`'s write).
+
+The machine sentinel permits execution only when it is definitely absent: the
+lookup fails with ENOENT and no component above it is a broken link (a lost
+mount target). A dangling link at the sentinel, an unsearchable parent, a parent
+that is not a directory, or any other lookup error reads as armed. The launcher,
+the queued entrypoint and the Python lifecycle share this rule
+(`codebase_managed_sentinel_armed` in the selection library mirrors
+`codebase_managed.sentinel_armed`). The queued runner's pre-claim check,
+bootstrap and install still use a plain existence test (issue #2860); for them a
+dangling sentinel only costs a refused CBM leg, not an indexing run.
 
 Configure runs only from `scripts/codebase_managed.py` inside the configured
 primary checkout, because the units pin that script and linked worktrees are
@@ -33,22 +44,38 @@ manager, so the same command can be retried and nothing left behind selects the
 managed route. Rollback never removes a link or a directory another process put
 at those paths. Settings are written last.
 
-Starting and launching verify exact generated units, loaded fragments (compared
+Starting and launching verify owned generated units, loaded fragments (compared
 by file identity), no drop-ins and a current manager load, using one batched
-`systemctl show` per unit. `disable` is the operator's stop lever: it persists
+`systemctl show` per unit. Only `enable` also requires the current template.
+Launch accepts an older template on purpose: a template change in an update must
+not take the Codebase MCP down on every configured install, and the limits that
+matter are read live before any native process runs (`check_backend` reads the
+daemon's memory.max, swap cap and cgroup membership; `verify_boundary` reads the
+client's own, its aggregate slice's and every ancestor's). `status` reports each
+unit as `current`, `drift` or `not owned`, so a drifted template is visible
+without failing anything. `disable` is the operator's stop lever: it persists
 `enabled=false` first, so launch and batch refuse at once, and then stops the
 service only if the units are proven ours (marker, settings path, loaded
 fragment, no drop-ins). A unit that cannot be proven ours is reported and left
 running for manual inspection. Units always run the configured primary
 checkout's `scripts/codebase_managed.py` under `python3 -I`, whichever checkout
 rendered them, so the template does not depend on the caller. After a template
-change, launch and `enable` refuse with a message naming `repair-units`;
-`disable` still stops the owned service. `repair-units` runs only from the
+change, `enable` refuses with a message naming `repair-units`; launch continues
+and `disable` still stops the owned service. `repair-units` runs only from the
 primary checkout and only while the backend has no running processes
 (`inactive`, or `failed` with no control group, which `Restart=no` leaves after a
 crash and which `stop` does not clear). It rewrites only regular, owned
 fragments of this settings path whose loaded fragment is that same file, then
-reloads the manager. Ownership is byte-exact: a fragment rewritten with CRLF line
+reloads the manager. Each rewrite replaces only the inode it verified (device
+and inode compared immediately before the rename), and the first settings
+publish is a no-clobber link, so a file another process put at either path is
+refused rather than overwritten. A configure rollback never removes the settings
+path: it only ever existed if this run published it, which is the last step.
+
+If `start` fails during `enable`, for any reason including an `OSError` from
+`systemctl`, the rollback writes `enabled=false` and stops the unit as two
+independent attempts, reports whichever of them fails, and re-raises the original
+start error. Ownership is byte-exact: a fragment rewritten with CRLF line
 endings is foreign to both the shell and Python checks. If the settings directory
 later becomes a symlink, the recorded spelling no longer matches; the route stays
 selected and refuses, and the units must be removed and configured again.
@@ -65,7 +92,12 @@ unit parsing.
 
 The query daemon has a 2 GiB, zero-swap service. Analysis frontends each have a
 256 MiB, zero-swap transient service beneath a separate aggregate 2 GiB,
-zero-swap slice. Requisite/After verify the existing daemon without starting it;
+zero-swap slice. Every visible ancestor must admit the whole 2 GiB (the service
+cap, or the clients' aggregate), never just one 256 MiB client. The bound is per
+budget: an ancestor shared by both is not required to admit their 4 GiB sum. cgroup v2 limits
+can be over-committed, "the sum of the limits of children can exceed the amount
+of resource available to the parent" (kernel admin-guide `cgroup-v2`, Resource
+Distribution Models, Limits; docs.kernel.org, consulted 2026-10-04). Requisite/After verify the existing daemon without starting it;
 StopPropagatedFrom and control-group cleanup retire clients when it ends.
 Protocol recovery requires fresh client initialization. Native bootstrap may
 briefly attempt a replacement during a scheduler race; containment and eventual
@@ -83,8 +115,12 @@ analysis profile without `index_repository`. Missing, malformed or disabled
 managed settings refuse rather than falling back to raw execution. Installs
 that were never configured retain their existing launcher behavior.
 
-The existing queued entrypoint reads managed settings before cap selection and
-scope probing. It selects the verified worker adapter, shared canonical cache
+The existing queued entrypoint decides `CODE_INTEL_INDEX_DISABLE` and then the
+CBM kill switch before it touches any managed state, so a disabled runner never
+reads settings, the cache database or the executable on a stalled mount. It then
+derives selection and reads managed settings before cap selection and scope
+probing (the preflight lives in `codebase_managed_batch_env` in the selection
+library). It selects the verified worker adapter, shared canonical cache
 and native account namespace, and measured 8 GiB/zero-swap batch cap. Destination
 admission, sibling reserve, pressure watchdog, single-flight and durable attempt
 outcomes remain authoritative. Ordinary daemon-delegating CLI indexing is not
@@ -113,7 +149,29 @@ sentinel retirement, `enable` starts the owned query service:
 .venv/bin/python scripts/codebase_managed.py disable
 # After an update changes the unit template (backend inactive):
 .venv/bin/python scripts/codebase_managed.py repair-units
+# Retire the managed route and return to the raw provider:
+.venv/bin/python scripts/codebase_managed.py remove
 ```
+
+`remove` takes the configuration lock and persists `enabled=false` first. It then
+proves the units whose fragments remain are this configuration's (the same proof
+as `disable`), disables and stops them, deletes exactly those fragments after
+re-checking their identity, reloads the manager and deletes the settings. It can
+be re-run after an interruption: a unit whose fragment is already gone must be
+unknown to the manager after a reload (inactive, no control group), otherwise
+`remove` refuses. Like `disable`, it accepts settings written by an older
+accepted build, because neither runs the executable. A backend that crashed is
+left `failed` by `Restart=no`; run `systemctl --user reset-failed` on it before
+configuring again. The state directory
+(pinned executable and native cache) and the sentinel are kept. A fragment that
+cannot be proven ours is never stopped or deleted: `remove` refuses and leaves
+the settings disabled. If the settings themselves are lost, remove the units by
+hand after checking their two-line ownership header. With a non-empty
+`CODEBASE_MEMORY_MCP_MANAGED_CONFIG` the route stays selected until that override
+is unset. `scripts/uninstall.sh` stops and disables the default-named units
+(`genesis-cbm-query.service`, `genesis-cbm-query-clients.slice`) and deletes the
+generated fragments of any name (`genesis-cbm-*`). It does not remove the managed
+state directory.
 
 Activation still requires deployed merged wiring, a preserved last valid graph,
 queue state and pressure/OOM baselines, timer stopped before unblocking indexing,

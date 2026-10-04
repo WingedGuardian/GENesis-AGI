@@ -167,49 +167,48 @@ case "$WORKLOAD_SLICE" in 0|1) ;; *)
     exit 125 ;;
 esac
 
-# Load the explicit managed Codebase boundary BEFORE cap derivation/probing.
-# Fixed line fields are consumed without eval; invalid settings refuse only the
-# CBM leg so a requested GitNexus leg retains its normal outcome.
-_CBM_MANAGED_REFUSE=""
-_managed_config="${CODEBASE_MEMORY_MCP_MANAGED_CONFIG:-$HOME/.genesis/config/codebase-managed.json}"
-_managed_rc=1  # not selected unless the CBM leg derives otherwise
+if [ "${CODE_INTEL_INDEX_DISABLE:-0}" = "1" ]; then
+    printf '%s\n' "[code-intel-index] disabled via CODE_INTEL_INDEX_DISABLE — skipping"
+    exit 0
+fi
+
+# CBM gates, in order and before cap derivation or probing: the machine kill
+# switch, then managed route selection, then the managed settings. Nothing
+# reads managed state until the switch is known to be off, and each refusal
+# skips only the CBM leg, so a requested GitNexus leg keeps its outcome. The
+# kill-switch path resolves through the ONE shared site (cbm_disable_file.sh);
+# an unresolvable override refuses rather than reading as "not disabled".
+CBM_OFF=""
 if [ "$TOOLS" = cbm ] || [ "$TOOLS" = both ]; then
-    _managed_rc=2
-    _managed_lib="${_CODE_INTEL_ENTRYPOINT%/*}/codebase_managed_selection.sh"
+    _cbm_lib="${_CODE_INTEL_ENTRYPOINT%/*}"
+    CBM_DISABLE_FILE=""
+    # shellcheck source=cbm_disable_file.sh
+    if [ -r "$_cbm_lib/cbm_disable_file.sh" ] && . "$_cbm_lib/cbm_disable_file.sh" \
+        && declare -F genesis_cbm_disable_file >/dev/null; then
+        CBM_DISABLE_FILE="$(genesis_cbm_disable_file 2>/dev/null)" || CBM_DISABLE_FILE=""
+    fi
+    _managed_config="${CODEBASE_MEMORY_MCP_MANAGED_CONFIG:-$HOME/.genesis/config/codebase-managed.json}"
     # shellcheck source=scripts/lib/codebase_managed_selection.sh
-    if [ -r "$_managed_lib" ] && . "$_managed_lib"; then
+    if [ -z "$CBM_DISABLE_FILE" ]; then
+        CBM_OFF="cbm kill-switch path unresolvable — refusing cbm leg (fail closed)"
+    elif ! { [ -r "$_cbm_lib/codebase_managed_selection.sh" ] \
+        && . "$_cbm_lib/codebase_managed_selection.sh"; }; then
+        CBM_OFF="SKIP cbm: cannot establish managed selection"
+    elif codebase_managed_sentinel_armed "$CBM_DISABLE_FILE"; then
+        # Armed unless definitely absent: a dangling link or unsearchable parent
+        # cannot prove the incident sentinel is gone.
+        CBM_OFF="codebase-memory-mcp disabled by $CBM_DISABLE_FILE — skipped"
+    else
         _managed_rc=0
         codebase_managed_selected "$_managed_config" "$HOME" || _managed_rc=$?
-    fi
-    case "$_managed_rc" in
-        0|1) ;;
-        3) _CBM_MANAGED_REFUSE="managed units name another settings path" ;;
-        *) _CBM_MANAGED_REFUSE="cannot establish managed selection" ;;
-    esac
-fi
-if [ "$_managed_rc" -eq 0 ]; then
-    # One physical spelling for both the validation and the exported root.
-    _managed_repo=""
-    if [ -n "$REPO_PATH" ]; then
-        _managed_repo="$(unset CDPATH; cd -- "$REPO_PATH" 2>/dev/null && pwd -P)" || _managed_repo=""
-    fi
-    _managed_output=""
-    if [ -z "$_managed_repo" ]; then
-        _CBM_MANAGED_REFUSE="managed repository path unresolvable"
-    elif _managed_output="$(/usr/bin/python3 -I "${_CODE_INTEL_ENTRYPOINT%/*}/../codebase_managed.py" \
-        --config "$_managed_config" batch --repo "$_managed_repo")"; then
-        mapfile -t _managed_fields <<< "$_managed_output"
-        if [ "${#_managed_fields[@]}" -eq 4 ]; then
-            export CODE_INTEL_CBM_WORKER_BINARY="${_managed_fields[0]}"
-            export CBM_CACHE_DIR="${_managed_fields[1]}"
-            export CBM_RUNTIME_DIR="${_managed_fields[2]}"
-            export CBM_ALLOWED_ROOT="$_managed_repo"
-            export CODE_INTEL_CBM_MEMORY_MAX="${_managed_fields[3]}"
-        else
-            _CBM_MANAGED_REFUSE="malformed managed batch settings"
-        fi
-    else
-        _CBM_MANAGED_REFUSE="managed Codebase configuration refused"
+        case "$_managed_rc" in
+            0) codebase_managed_batch_env "$_managed_config" "$REPO_PATH" \
+                   "$_cbm_lib/../codebase_managed.py" \
+                   || CBM_OFF="SKIP cbm: $CODEBASE_MANAGED_REFUSE" ;;
+            1) ;;
+            3) CBM_OFF="SKIP cbm: managed units name another settings path" ;;
+            *) CBM_OFF="SKIP cbm: cannot establish managed selection" ;;
+        esac
     fi
 fi
 
@@ -522,7 +521,7 @@ fi
 
 # CBM-only. The workload charge is an operand of the minimum-bytes sum above,
 # so its refusal was captured before that sum was computed.
-GENESIS_CBM_ENV_REFUSE="$_CBM_MANAGED_REFUSE"
+GENESIS_CBM_ENV_REFUSE=""
 if [ -n "$_GENESIS_CHARGE_REFUSE" ]; then
     GENESIS_CBM_ENV_REFUSE="$_GENESIS_CHARGE_REFUSE"
 elif ! _genesis_uint_bounded "$CODE_INTEL_CBM_MIN_BYTES"; then
@@ -573,27 +572,6 @@ IO_WEIGHT="${CODE_INTEL_INDEX_IO_WEIGHT:-20}"
 CPU_QUOTA="${CODE_INTEL_INDEX_CPU_QUOTA:-200%}"
 PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"
 
-# The kill-switch path resolves through the ONE shared site (same override
-# semantics the launcher enforces). An override that is relative, or begins
-# with a ~/ that no HOME can expand, would make `-e` silently read as
-# "not disabled" — an UNRESOLVABLE path instead refuses the cbm leg below,
-# never indexing a tool the machine may have switched off.
-CBM_DISABLE_FILE=""
-CBM_DISABLE_UNRESOLVED=1
-# %/* not dirname(1): minimal-PATH invocations (stripped-env services) may not
-# have dirname, and a resolver that cannot be found fails the leg closed.
-_cbm_disable_lib="${BASH_SOURCE[0]%/*}/cbm_disable_file.sh"
-[ "$_cbm_disable_lib" = "${BASH_SOURCE[0]}/cbm_disable_file.sh" ] \
-    && _cbm_disable_lib="./cbm_disable_file.sh"
-if [ -r "$_cbm_disable_lib" ]; then
-    # shellcheck source=cbm_disable_file.sh
-    . "$_cbm_disable_lib"
-    if declare -F genesis_cbm_disable_file >/dev/null \
-        && CBM_DISABLE_FILE="$(genesis_cbm_disable_file 2>/dev/null)"; then
-        CBM_DISABLE_UNRESOLVED=""
-    fi
-fi
-
 _GITNEXUS_PIN_READY=0
 _gitnexus_pin_file="$(dirname "${BASH_SOURCE[0]}")/gitnexus_version.sh"
 if [ -r "$_gitnexus_pin_file" ]; then
@@ -632,11 +610,6 @@ _WD_BAD_SAMPLES="${CODE_INTEL_WATCHDOG_BAD_SAMPLES:-2}"   # consecutive bad samp
 _WD_CONT_PAUSE_MAX="${CODE_INTEL_WATCHDOG_CONT_PAUSE_MAX:-600}"  # kill if paused this long CONTINUOUSLY
 _WD_WALL_FAST="${CODE_INTEL_WATCHDOG_WALL_FAST:-3600}"    # wall cap for fast/moderate (s)
 _WD_WALL_FULL="${CODE_INTEL_WATCHDOG_WALL_FULL:-14400}"   # wall cap for full (s) — cbm can't resume
-
-if [ "${CODE_INTEL_INDEX_DISABLE:-0}" = "1" ]; then
-    _log "disabled via CODE_INTEL_INDEX_DISABLE — skipping"
-    exit 0
-fi
 
 if [ -z "$REPO_PATH" ] || [ ! -d "$REPO_PATH" ]; then
     _log "ERROR: repo path missing or not a directory: '$REPO_PATH'"
@@ -872,11 +845,8 @@ _leg_failed() {
 }
 
 if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
-    if [ -n "$CBM_DISABLE_UNRESOLVED" ]; then
-        _log "cbm kill-switch path unresolvable — refusing cbm leg (fail closed)"
-        MISSING="${MISSING}cbm "
-    elif [ -e "$CBM_DISABLE_FILE" ]; then
-        _log "codebase-memory-mcp disabled by $CBM_DISABLE_FILE — skipped"
+    if [ -n "$CBM_OFF" ]; then
+        _log "$CBM_OFF"
         MISSING="${MISSING}cbm "
     elif [ -n "${CODE_INTEL_CBM_WORKER_BINARY:-}" ] || command -v codebase-memory-mcp >/dev/null 2>&1; then
         CBM_MEM_REFUSE=""
