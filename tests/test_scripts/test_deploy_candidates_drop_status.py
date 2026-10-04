@@ -301,6 +301,7 @@ def test_adopt_is_not_a_command(dc, dc_ready, capsys):
         ({"scripts/deploy_code_only.sh": "x\n"}, "keeps the wipers"),
         ({"scripts/lib/guardian_pause.sh": "x\n"}, "keeps the wipers"),
         ({"scripts/lib/deploy_checkout.sh": "x\n"}, "keeps the wipers"),
+        ({"scripts/lib/deploy_recovery.sh": "x\n"}, "keeps the wipers"),
         ({"src/genesis/dashboard/routes/updates.py": "x\n"}, "keeps the wipers"),
         ({"scripts/deploy_candidates_gate.py": "x\n"}, "keeps the wipers"),
         ({"scripts/lib/deploy_live.sh": "x\n"}, "keeps the wipers"),

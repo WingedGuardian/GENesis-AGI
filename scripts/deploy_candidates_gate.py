@@ -105,6 +105,7 @@ REFUSAL_FILES = (
     "scripts/deploy_code_only.sh",
     "scripts/bootstrap.sh",
     "scripts/lib/deploy_checkout.sh",
+    "scripts/lib/deploy_recovery.sh",
     "scripts/lib/deploy_marker.sh",
     "scripts/lib/guardian_pause.sh",
     "scripts/lib/alert_queue.sh",
