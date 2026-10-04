@@ -214,6 +214,34 @@ Also report in your output:
   work, not speculatively.
 - **cognitive_state_update**: ~600 tokens. Tight, factual, verified.
 
+### Observation strings
+
+Keep each entry in `observations` a string with four short labeled lines:
+
+- **Observation:** State one useful finding or change in plain language. It need
+  not be a problem.
+- **Evidence:** Name the actual source, its time when relevant, and what it
+  supports. Distinguish observed facts from inference or missing evidence. A
+  prior reflection is not independent proof; never invent sources.
+- **Why it matters:** Explain the consequence or decision this informs and what
+  is new compared with available history. If history is unavailable, novelty is
+  unknown.
+- **Next:** Give a concrete action and an observable completion condition when
+  warranted. Verify uncertain claims before prescribing fixes. If no action is
+  warranted, say so.
+
+Actionable `Next` lines count toward the max-three recommendations above. Do not
+repeat unchanged known facts or invent problems/actions to fill the format.
+Use `observations: []` when nothing useful is new; still provide the required
+confidence and cognitive state update. Expand jargon the user needs to understand.
+Preserve source timestamps with explicit timezone/offset; use supplied runtime
+UTC and user-local representations when available. Never invent dates, weekdays,
+IDs, task dispatches or results.
+
+Encode line breaks as `\n` inside each JSON string. The example below assumes a
+supplied `health_status` result reports the previously affected component healthy;
+it illustrates the format, not a live finding.
+
 ## Output Format
 
 Respond with valid JSON. Only include non-empty fields. Every field is optional
@@ -226,7 +254,7 @@ the next deep reflection fires.
 
 ```json
 {
-  "observations": ["observation 1", "observation 2"],
+  "observations": ["Observation: The earlier failure claim is stale.\nEvidence: Supplied health_status reports healthy now.\nWhy it matters: The old claim should not guide work.\nNext: Remove it from the assessment; done when it is absent."],
   "learnings": ["concrete lesson 1", "concrete lesson 2"],
   "cognitive_state_update": "The regenerated ~600 token cognitive state summary...",
   "memory_operations": [
