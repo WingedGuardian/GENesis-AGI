@@ -127,6 +127,9 @@ _write_state() {
 {
     "phase": "$phase",
     "rollback_tag": "${ROLLBACK_TAG:-}",
+    "original_branch": "${ORIGINAL_BRANCH:-}",
+    "own_head": "${UPDATE_OWN_HEAD:-}",
+    "deploy_head": "${DEPLOY_HEAD:-}",
     "old_tag": "${OLD_TAG:-}",
     "old_commit": "${OLD_COMMIT:-}",
     "started_at": "$STARTED_AT",

@@ -30,20 +30,72 @@ echo "=== Genesis Bootstrap ==="
 echo "Genesis root: $GENESIS_ROOT"
 echo
 
-# ── Live-system guard — BEFORE anything mutating (incl. the crash-recovery
-# block below, whose git reset --hard is also unsafe on a live system).
+# ── Live-system guard — BEFORE anything mutating, including crash recovery.
 # update.sh opts out via GENESIS_BOOTSTRAP_ALLOW_LIVE=1; humans use --force.
 # shellcheck source=lib/live_system_guard.sh
 . "$SCRIPT_DIR/lib/live_system_guard.sh"
 bootstrap_refuse_if_server_live "$@" || exit 3
 
-# ── Crash recovery: check for interrupted update ─────────
+# shellcheck source=lib/deploy_marker.sh
+. "$SCRIPT_DIR/lib/deploy_marker.sh"
+# shellcheck source=lib/deploy_checkout.sh
+. "$SCRIPT_DIR/lib/deploy_checkout.sh"
+# shellcheck source=lib/deploy_recovery.sh
+. "$SCRIPT_DIR/lib/deploy_recovery.sh"
+
+# BEGIN crash-recovery
 UPDATE_STATE="$HOME/.genesis/update_state.json"
+_crash_recovery_refuse() {
+    local _reason="$1" _current_branch _current_head
+    _current_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+    _current_head="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null || true)"
+    echo "  REFUSE: $_reason." >&2
+    echo "  Current branch/HEAD: ${_current_branch:-<detached>} @ ${_current_head:-<unreadable>}; rollback tag: ${ROLLBACK_TAG:-<missing>} @ ${rb_commit:-<unresolved>}." >&2
+    echo "  Resolve the checkout, then re-run scripts/bootstrap.sh; or finish forward with scripts/update.sh --post-merge; or remove ~/.genesis/update_state.json once decided." >&2
+    exit 1
+}
+
 if [ -f "$UPDATE_STATE" ]; then
     echo "--- Detected interrupted update state file ---"
-    # Read phase and PID from state file
-    STATE_PHASE=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('phase','unknown'))" 2>/dev/null || echo "unknown")
-    STATE_PID=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('pid',0))" 2>/dev/null || echo "0")
+    ROLLBACK_TAG=""
+    rb_commit=""
+    if ! _state_fields="$(python3 - "$UPDATE_STATE" 2>/dev/null <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        state = json.load(f)
+    if not isinstance(state, dict):
+        raise ValueError("state is not an object")
+    def text_field(key, default=""):
+        value = state.get(key, default)
+        if not isinstance(value, str):
+            raise ValueError(f"{key} is not a string")
+        return value
+    pid = state.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        raise ValueError("pid is not an integer")
+    fields = [
+        text_field("phase", "unknown"),
+        str(pid),
+        text_field("rollback_tag"),
+        text_field("original_branch"),
+        text_field("own_head"),
+        text_field("deploy_head"),
+        "1" if "original_branch" in state else "0",
+    ]
+    if any(ord(char) < 0x20 for value in fields for char in value):
+        raise ValueError("control character in state field")
+    print("\x1f".join(fields))
+except Exception:
+    sys.exit(1)
+PY
+)"; then
+        _crash_recovery_refuse "update state is unreadable"
+    fi
+    IFS=$'\x1f' read -r STATE_PHASE STATE_PID ROLLBACK_TAG ORIGINAL_BRANCH OWN_HEAD DEPLOY_HEAD ORIGINAL_BRANCH_PRESENT \
+        <<< "$_state_fields"
 
     # Check if the update process is still alive. Bare `kill -0` ON PURPOSE, unlike
     # the marker readers (lib/deploy_marker.sh, genesis.env), which also reject a
@@ -56,23 +108,94 @@ if [ -f "$UPDATE_STATE" ]; then
         rm -f "$UPDATE_STATE"
     else
         echo "  Update CRASHED in phase '$STATE_PHASE' (pid $STATE_PID is dead)."
+        if [ -z "$ROLLBACK_TAG" ] || ! git -C "$GENESIS_ROOT" check-ref-format "refs/tags/$ROLLBACK_TAG" >/dev/null 2>&1; then
+            _crash_recovery_refuse "no valid rollback tag is recorded"
+        fi
+        rb_commit="$(git -C "$GENESIS_ROOT" rev-parse -q --verify "refs/tags/$ROLLBACK_TAG^{commit}" 2>/dev/null)" \
+            || _crash_recovery_refuse "rollback tag $ROLLBACK_TAG cannot be resolved to a commit"
 
-        # Abort any in-progress merge
-        if [ -f "$GENESIS_ROOT/.git/MERGE_HEAD" ]; then
+        if git -C "$GENESIS_ROOT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+            merge_abort_dir="$EPHEMERAL_BACKUP_ROOT/merge-abort"
+            if ! mkdir -p "$merge_abort_dir" \
+                || ! chmod 700 "$EPHEMERAL_BACKUP_ROOT" "$merge_abort_dir"; then
+                _crash_recovery_refuse "cannot create the merge-abort backup directory"
+            fi
+            unmerged_paths="$(mktemp "$merge_abort_dir/.unmerged.XXXXXX")" \
+                || _crash_recovery_refuse "cannot create a temporary unmerged-path list"
+            if ! git -C "$GENESIS_ROOT" diff --name-only --diff-filter=U -z > "$unmerged_paths"; then
+                rm -f "$unmerged_paths"
+                _crash_recovery_refuse "cannot list unmerged paths before aborting the merge"
+            fi
+            merge_copy_failure=""
+            merge_copy_count=0
+            while IFS= read -r -d '' merge_path; do
+                merge_parent="$(dirname -- "$merge_path")"
+                if ! mkdir -p "$merge_abort_dir/$merge_parent" \
+                    || ! cp -p -- "$GENESIS_ROOT/$merge_path" "$merge_abort_dir/$merge_path"; then
+                    merge_copy_failure="$merge_path"
+                    break
+                fi
+                merge_copy_count=$((merge_copy_count + 1))
+            done < "$unmerged_paths"
+            if ! rm -f "$unmerged_paths"; then
+                _crash_recovery_refuse "cannot remove the temporary unmerged-path list"
+            fi
+            if [ -n "$merge_copy_failure" ]; then
+                _crash_recovery_refuse "cannot save unmerged path $merge_copy_failure before aborting the merge"
+            fi
+            if [ "$merge_copy_count" -gt 0 ]; then
+                echo "  Saved $merge_copy_count unmerged file(s) to $merge_abort_dir before aborting the merge."
+            fi
             echo "  Aborting in-progress merge..."
-            git -C "$GENESIS_ROOT" merge --abort 2>/dev/null || true
+            if ! git -C "$GENESIS_ROOT" merge --abort 2>&1; then
+                _crash_recovery_refuse "git merge --abort refused; the merge and its edits are left in place"
+            fi
         fi
 
-        # Read rollback tag from state file
-        ROLLBACK_TAG=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('rollback_tag',''))" 2>/dev/null || echo "")
-
-        if [ -n "$ROLLBACK_TAG" ] && git -C "$GENESIS_ROOT" rev-parse "$ROLLBACK_TAG" >/dev/null 2>&1; then
-            echo "  Rolling back to $ROLLBACK_TAG..."
-            git -C "$GENESIS_ROOT" reset --hard "$ROLLBACK_TAG" 2>&1 || true
-            echo "  Rollback complete."
+        current_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+        if [ "$ORIGINAL_BRANCH_PRESENT" = "1" ]; then
+            [ -n "$ORIGINAL_BRANCH" ] || _crash_recovery_refuse "the recorded original branch is empty"
+            recovery_branch="$ORIGINAL_BRANCH"
         else
-            echo "  No rollback tag found — resetting to HEAD."
-            git -C "$GENESIS_ROOT" reset --hard HEAD 2>&1 || true
+            recovery_branch="$current_branch"
+        fi
+        if genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$recovery_branch"; then
+            dirty_paths=""
+            if ! dirty_paths="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")"; then
+                dirty_paths="(status unreadable)"
+            fi
+            if [ -n "$dirty_paths" ]; then
+                echo "  WARNING: tracked paths may be an interrupted merge's files or someone's edits; nothing was reset:"
+                printf '%s\n' "$dirty_paths" | sed 's/^/    /'
+            fi
+            echo "  The checkout is already at $ROLLBACK_TAG on $recovery_branch; nothing to undo."
+        elif [ "$ORIGINAL_BRANCH_PRESENT" != "1" ]; then
+            _crash_recovery_refuse "old-format update state and the checkout has moved from its rollback tag"
+        else
+            current_head="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" \
+                || _crash_recovery_refuse "current HEAD cannot be read"
+            own_update=false
+            if genesis_checkout_unmoved "$GENESIS_ROOT" "$OWN_HEAD" "$ORIGINAL_BRANCH"; then
+                own_update=true
+            elif [ -n "$DEPLOY_HEAD" ] && [ "$current_branch" = "$ORIGINAL_BRANCH" ]; then
+                if [ "$current_head" = "$DEPLOY_HEAD" ]; then
+                    own_update=true
+                else
+                    current_parents="$(git -C "$GENESIS_ROOT" rev-list --parents -n 1 "$current_head" 2>/dev/null)" \
+                        || _crash_recovery_refuse "cannot inspect current commit parents"
+                    current_parent_ids="${current_parents#* }"
+                    if [ "$current_parent_ids" = "$rb_commit $DEPLOY_HEAD" ]; then
+                        own_update=true
+                    fi
+                fi
+            fi
+            [ "$own_update" = true ] \
+                || _crash_recovery_refuse "the checkout moved; refusing to change code not owned by this update"
+            if ! genesis_rollback_checkout \
+                "$GENESIS_ROOT" "$ROLLBACK_TAG" "$ORIGINAL_BRANCH" "$EPHEMERAL_BACKUP_ROOT" "$rb_commit"; then
+                _crash_recovery_refuse "the non-forced rollback checkout was refused; code was left in place"
+            fi
+            echo "  Recovery checkout returned $ORIGINAL_BRANCH to $ROLLBACK_TAG."
         fi
 
         # Record crash recovery
@@ -104,10 +227,11 @@ except Exception as e:
 
         rm -f "$UPDATE_STATE"
         rm -f "$HOME/.genesis/update_in_progress.pid"
-        echo "  Crash recovery complete. Continuing bootstrap with rolled-back code."
+        echo "  Crash recovery complete. Continuing bootstrap."
         echo ""
     fi
 fi
+# END crash-recovery
 
 # --- Prerequisites ---
 echo "--- Checking and installing prerequisites ---"
