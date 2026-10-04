@@ -201,6 +201,21 @@ def _hermetic_rounds_row(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_main_reverts(monkeypatch):
+    """Pin the ``--check-pr`` ``main-reverts`` row's commit read for EVERY hook test.
+
+    The row reads ``pulls/N/commits`` first, so without this pin every test that
+    drives ``check_pr_report`` makes a live call (some as a subprocess, hence an
+    environment variable the children inherit). One NON-merge commit resolves the
+    row to ``n/a`` before any further read, so no other seam is consulted and no
+    existing verdict moves — the row is advisory and never counts toward one. Its
+    own behaviour is tested in tests/test_hooks/test_merge_gate_main_reverts.py,
+    which overrides this per case."""
+    monkeypatch.setenv("_TEST_GH_PR_COMMITS", '{"sha": "' + "0" * 40 + '", "parents": 1}')
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_base_advance(monkeypatch):
     """Hermetic defaults for the base-advance refinement of the freshness gate.
 
