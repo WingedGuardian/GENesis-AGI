@@ -24,17 +24,24 @@ or entitlement. Kimi subscription requires personal interactive use; MiMo Token
 Plans are for coding-tool use. 1M K3 subscription requires an eligible tier.
 Use -- to end launcher options when a prompt contains literal flags.
 
-A routed launch pins its endpoint, credential, model, context, effort and the
-compaction/thinking switches twice: in the environment and in an owner-only
+A routed launch pins its endpoint, credential, launch model, context, effort and
+the compaction/thinking switches twice: in the environment and in an owner-only
 settings file passed with --settings, which outranks user, project and local
 settings even when they change mid-session. Pass no --settings of your own.
 One exception: a maxEffortLevel cap in any settings file still lowers the
 effort (the lowest cap wins); gmodel warns when it finds one at launch.
 
+The endpoint and key hold for the whole session; the model holds only until
+/model. /model changes the model for that session against the SAME endpoint
+and key (aliases such as `opus` resolve to the route's model; a full Claude ID
+does not, and a Kimi or MiMo endpoint then rejects it). On the OpenRouter
+route, which also serves Claude model IDs per token, gmodel refuses /model
+with a PreModelSwitch hook (inert if hooks are disabled by disableAllHooks or a
+managed allowManagedHooksOnly). To change model or provider, relaunch.
+
 Anthropic always runs on Max (native OAuth — `ANTHROPIC_API_KEY` is dropped so a
 stray key can't silently switch you to per-token billing; a routed launch pins it
-empty). A session is pinned to one endpoint: to change model, relaunch. Plain
-`claude` is untouched (native Max).
+empty). Plain `claude` is untouched (native Max).
 """
 from __future__ import annotations
 

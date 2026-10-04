@@ -1,9 +1,11 @@
 """Foreground-only strict configuration, pin-file and CLI boundary regressions."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import stat
+import subprocess
 
 import pytest
 
@@ -218,16 +220,126 @@ def test_explicit_yaml_effort_accepts_only_matching_cli(effort):
                 gmodel_settings.validate_cli(["--effort", other], _selected(effort))
 
 
-def test_malformed_overlay_is_never_logged_before_strict_error(tmp_path, monkeypatch, caplog):
-    (tmp_path / "cc_roster.yaml").write_text("models: {}\ngmodel: {models: {}}\n")
+_BASE_WITH_CATALOG = """\
+models:
+  legacy-peer: {anthropic_base_url: "https://peer.invalid", auth_env: PEER_KEY, model_id: legacy-peer}
+gmodel:
+  models:
+    kimi-k3:
+      routes:
+        api: {anthropic_base_url: "https://example.invalid", auth_env: EXAMPLE_KEY, model_id: example}
+"""
+
+
+def _broken_overlay(tmp_path, monkeypatch):
+    (tmp_path / "cc_roster.yaml").write_text(_BASE_WITH_CATALOG)
     user_config = tmp_path / "user-config"
     user_config.mkdir()
     (user_config / "cc_roster.local.yaml").write_text("gmodel: [SYNTHETIC_SECRET\n")
     monkeypatch.setattr(roster, "_CONFIG_DIR", tmp_path)
     monkeypatch.setattr(_config_overlay, "_user_config_dir", lambda: user_config)
+
+
+def test_malformed_overlay_is_never_logged_before_strict_error(tmp_path, monkeypatch, caplog):
+    """A catalog member still loads strictly: a broken overlay must not silently
+    restore the shipped Auto preference, and the parser text never reaches a log."""
+    _broken_overlay(tmp_path, monkeypatch)
     with pytest.raises(roster.RosterError):
-        gmodel_routes.resolve_route("kimi-k3", environ={})
+        gmodel_routes.resolve_route("kimi-k3", environ={"EXAMPLE_KEY": "k"})
     assert "SYNTHETIC_SECRET" not in caplog.text
+
+
+@pytest.mark.parametrize("name", ["legacy-peer", "not-configured-anywhere"])
+def test_broken_overlay_leaves_flat_roster_names_on_their_lenient_path(name, tmp_path, monkeypatch, caplog):
+    """Codex 4176543937: strict loading applies only to foreground-catalog members.
+
+    A flat-roster peer (or any non-member) returns None so the launcher keeps the
+    lenient roster path it had before the catalog existed; the strict attempt
+    itself logs nothing.
+    """
+    _broken_overlay(tmp_path, monkeypatch)
+    assert gmodel_routes.resolve_route(name, environ={}) is None
+    assert "SYNTHETIC_SECRET" not in caplog.text
+
+
+@pytest.mark.parametrize("name", ["kimi-k3", "legacy-peer"])
+def test_broken_base_file_is_never_logged_and_falls_to_the_flat_path(name, tmp_path, monkeypatch, caplog):
+    """When the BASE file is unreadable, catalog membership cannot be known: the
+    selector returns None (the flat path reports the broken base) and its own
+    membership read logs no parser text."""
+    (tmp_path / "cc_roster.yaml").write_text("models: [SYNTHETIC_SECRET\n")
+    monkeypatch.setattr(roster, "_CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(_config_overlay, "_user_config_dir", lambda: tmp_path / "no-user-config")
+    assert gmodel_routes.resolve_route(name, environ={}) is None
+    assert "SYNTHETIC_SECRET" not in caplog.text
+
+
+def test_selection_validates_only_the_requested_catalog_entry():
+    """Codex 4176543940: a broken sibling cannot stop a valid route from launching."""
+    data = {"models": {"claude": {}}, "gmodel": {"models": {
+        "good": {"routes": {"api": {"anthropic_base_url": "https://example.invalid",
+                                    "auth_env": "EXAMPLE_KEY", "model_id": "example"}}},
+        "broken-sibling": {"route": "oops", "routes": {"api": {"auth_env": "not a name"}}},
+        "opus": {"routes": {}},  # a namespace clash on ANOTHER entry
+    }}}
+    selected = gmodel_routes.resolve_route("good", roster_data=data, environ={"EXAMPLE_KEY": "k"})
+    assert selected is not None and selected.model_id == "example"
+    # The listing path still validates the whole catalog.
+    with pytest.raises(roster.RosterError):
+        gmodel_routes.catalog(data)
+    with pytest.raises(roster.RosterError):
+        gmodel_routes.resolve_route("broken-sibling", roster_data=data, environ={"EXAMPLE_KEY": "k"})
+
+
+def test_selection_still_applies_the_namespace_rule_to_the_requested_entry():
+    data = {"models": {"claude": {}, "shared": {}}, "gmodel": {"models": {
+        "shared": {"routes": {"api": {"anthropic_base_url": "https://example.invalid",
+                                      "auth_env": "EXAMPLE_KEY", "model_id": "example"}}},
+    }}}
+    with pytest.raises(roster.RosterError, match="Ambiguous"):
+        gmodel_routes.resolve_route("shared", roster_data=data, environ={"EXAMPLE_KEY": "k"})
+
+
+def test_effort_is_forced_on_for_custom_model_ids_in_both_layers():
+    """Codex 4176543942: CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 in env AND --settings."""
+    env = gmodel_routes.apply_route_env({"EXAMPLE_KEY": "provider-key"}, _selected())
+    assert env["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] == "1"
+    document = gmodel_routes.route_settings(_selected(), env)
+    assert document["env"]["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] == "1"
+
+
+def _openrouter(model_id="vendor/example"):
+    return gmodel_routes.SelectedRoute("example", "openrouter", "https://openrouter.ai/api",
+                                       "EXAMPLE_KEY", model_id, 1048576)
+
+
+@pytest.mark.parametrize("kind", ["subscription", "api"])
+def test_model_switch_is_left_alone_off_openrouter(kind):
+    selected = dataclasses.replace(_selected(), route=kind)
+    env = gmodel_routes.apply_route_env({"EXAMPLE_KEY": "provider-key"}, selected)
+    assert "hooks" not in gmodel_routes.route_settings(selected, env)
+
+
+def test_openrouter_route_refuses_model_switches_with_its_own_hook():
+    """Codex 4176543944: on OpenRouter a /model switch to a Claude ID would bill an
+    Anthropic model per token on the same key, so the settings layer denies it.
+
+    Runs the generated command itself, with a real PreModelSwitch payload on stdin.
+    """
+    env = gmodel_routes.apply_route_env({"EXAMPLE_KEY": "provider-key"}, _openrouter())
+    document = gmodel_routes.route_settings(_openrouter(), env)
+    groups = document["hooks"]["PreModelSwitch"]
+    assert [list(group) for group in groups] == [["hooks"]]  # no matcher: every switch
+    (hook,) = groups[0]["hooks"]
+    assert hook["type"] == "command"
+    payload = json.dumps({"hook_event_name": "PreModelSwitch", "from_model": "vendor/example",
+                          "to_model": "claude-opus-4-6", "source": "command"})
+    result = subprocess.run(["sh", "-c", hook["command"]], input=payload, capture_output=True,
+                            text=True, timeout=60)
+    assert result.returncode == 2  # exit 2 blocks the switch (hooks reference)
+    assert "OpenRouter" in result.stderr and "relaunch" in result.stderr
+    assert "provider-key" not in hook["command"]
+
 
 
 @pytest.mark.parametrize("optional", sorted(gmodel_settings._OPTIONAL_OPTIONS))

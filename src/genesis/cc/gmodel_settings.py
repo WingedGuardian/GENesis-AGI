@@ -15,6 +15,29 @@ above or beside that layer, and only those are checked here:
   pinned environment, so a mismatching value would be silently ignored, which is
   refused rather than allowed to mislead.
 
+THE RULE FOR A MANAGED CHECK: refuse only what would make Claude Code SILENTLY
+run something other than what gmodel printed. That is a managed ``env`` value
+that contradicts a pin (endpoint, token, credentials, model slots, thinking and
+compaction switches, context, effort), ``alwaysThinkingEnabled: false`` (on a
+third-party endpoint Claude Code then omits ``thinking``, and Kimi serves K3
+without thinking from an older model), a ``maxEffortLevel`` cap below the
+route's effort, a ``fallbackModel`` or ``autoCompactEnabled: false`` that would
+change the model or compaction without a word, and a managed gateway sign-in
+(``forceLoginMethod: "gateway"`` / ``forceLoginGatewayUrl``): a signed-in
+gateway session outranks the bearer token (authentication docs,
+"Authentication precedence", read 2026-10-04).
+
+Conditions Claude Code itself refuses or announces at startup are left to it,
+because a copy here can only drift from its rules:
+
+* ``forceLoginMethod`` ``claudeai``/``console`` and ``forceLoginOrgUUID`` block
+  an ``ANTHROPIC_AUTH_TOKEN`` at startup (authentication docs, "Restrict login
+  to your organization").
+* A model outside ``availableModels``, or matched by ``deniedModels``, is
+  replaced at startup "with a warning naming both the requested and
+  substituted models" (model-config docs, "Restrict model selection"). How
+  those lists match a third-party ID is Claude Code's rule, not one to guess.
+
 Nothing here GATES on user, project or local settings: the pins make them
 irrelevant to the route, and reading them once could not stop a later reload.
 The one key the pins cannot override from those files is ``maxEffortLevel``
@@ -187,24 +210,11 @@ def _env_conflicts(key: str, value: object, pinned: str) -> bool:
         return not _is_off(value)
     if pinned == "":
         return str(value) != ""
+    if pinned == "1":
+        # Switches pinned ON (CLAUDE_CODE_ALWAYS_ENABLE_EFFORT,
+        # CLAUDE_CODE_SUBAGENT_MODEL_FORCE): any truthy spelling agrees.
+        return _is_off(value)
     return str(value) != pinned
-
-
-def _model_listed(entries: list, model_id: str) -> bool:
-    """Exact match only, with or without the `[1m]` context tag.
-
-    CC also matches family aliases and version prefixes for Claude IDs; how it
-    applies prefixes to a third-party ID is undocumented, so a prefix-only match
-    is treated as NOT listed and the launch is refused rather than guessed.
-    """
-    bare = model_id.replace("[1m]", "").replace("[1M]", "")
-    return any(isinstance(e, str) and e in (model_id, bare) for e in entries)
-
-
-def _model_denied(entries: list, model_id: str) -> bool:
-    """Conservative: a denied entry contained anywhere in the ID refuses the launch."""
-    bare = model_id.lower().replace("[1m]", "")
-    return any(isinstance(e, str) and e.strip() and e.strip().lower() in bare for e in entries)
 
 
 def _check_managed(document: object, source: str, selected: gmodel_routes.SelectedRoute,
@@ -217,13 +227,9 @@ def _check_managed(document: object, source: str, selected: gmodel_routes.Select
     for key in sorted(pins.keys() & settings_env.keys()):
         if _env_conflicts(key, settings_env[key], pins[key]):
             _conflict(source, f"env.{key}")
-    available = document.get("availableModels")
-    if available is not None and not (isinstance(available, list)
-                                      and _model_listed(available, selected.model_id)):
-        _conflict(source, "availableModels", " (the managed allowlist does not list this route's model ID)")
-    denied = document.get("deniedModels")
-    if isinstance(denied, list) and _model_denied(denied, selected.model_id):
-        _conflict(source, "deniedModels")
+    # availableModels / deniedModels and the non-gateway forceLogin* keys are
+    # deliberately absent: Claude Code refuses or announces them at startup
+    # (module docstring).
     if "fallbackModel" in document:
         chain = document["fallbackModel"]
         chain = chain if isinstance(chain, list) else [chain]
@@ -241,6 +247,8 @@ def _check_managed(document: object, source: str, selected: gmodel_routes.Select
     # A gateway sign-in outranks every credential variable, the bearer token
     # included, and these managed keys require it (Claude Code authentication
     # docs, "Authentication precedence"). The route would not be the one used.
+    # Only the gateway values: `claudeai`/`console` and forceLoginOrgUUID make
+    # Claude Code block the bearer token at startup, which it reports itself.
     if document.get("forceLoginMethod") == "gateway" or document.get("forceLoginGatewayUrl"):
         _conflict(source, "forceLoginMethod" if document.get("forceLoginMethod") == "gateway"
                   else "forceLoginGatewayUrl")

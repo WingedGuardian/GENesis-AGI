@@ -54,6 +54,8 @@ def test_managed_env_override_of_any_pin_refused_without_values(tmp_path, select
     ("CLAUDE_CODE_USE_BEDROCK", ""), ("CLAUDE_CODE_USE_BEDROCK", "0"),
     ("DISABLE_AUTO_COMPACT", "false"), ("MAX_THINKING_TOKENS", "32000"),
     ("ANTHROPIC_API_KEY", ""), ("ANTHROPIC_MODEL", "kimi-k3[1m]"),
+    # A switch pinned ON agrees with any truthy spelling.
+    ("CLAUDE_CODE_ALWAYS_ENABLE_EFFORT", "true"), ("CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "yes"),
 ])
 def test_managed_env_agreeing_with_pin_is_clean(tmp_path, selected, pins, key, value):
     managed(tmp_path, {"env": {key: value}})
@@ -66,10 +68,6 @@ def test_unrelated_managed_env_is_clean(tmp_path, selected, pins):
 
 
 @pytest.mark.parametrize("document,key", [
-    ({"availableModels": ["sonnet", "opus"]}, "availableModels"),
-    ({"availableModels": ["kimi-k"]}, "availableModels"),  # prefix-only: refused, not guessed
-    ({"availableModels": "kimi-k3"}, "availableModels"),
-    ({"deniedModels": ["kimi-k3"]}, "deniedModels"),
     ({"fallbackModel": ["claude-sonnet-5"]}, "fallbackModel"),
     ({"alwaysThinkingEnabled": False}, "alwaysThinkingEnabled"),
     ({"autoCompactEnabled": False}, "autoCompactEnabled"),
@@ -88,6 +86,15 @@ def test_managed_keys_above_the_settings_layer_refused(tmp_path, selected, pins,
 @pytest.mark.parametrize("document", [
     {"availableModels": ["kimi-k3[1m]"]}, {"availableModels": ["sonnet", "kimi-k3"]},
     {"deniedModels": ["claude-opus-5-5"]}, {"fallbackModel": ["kimi-k3[1m]"]},
+    # Codex 4176543946 / the preflight rule: Claude Code itself refuses these at
+    # startup (forceLogin*: authentication docs, "Restrict login to your
+    # organization") or replaces the model with a warning (availableModels /
+    # deniedModels: model-config docs, "Restrict model selection"), so gmodel
+    # leaves them to Claude Code instead of guessing its matching rules.
+    {"availableModels": ["sonnet", "opus"]}, {"availableModels": ["kimi-k"]},
+    {"availableModels": "kimi-k3"}, {"deniedModels": ["kimi-k3"]},
+    {"forceLoginMethod": "console"}, {"forceLoginOrgUUID": "00000000-0000-0000-0000-000000000000"},
+    {"forceLoginOrgUUID": ["00000000-0000-0000-0000-000000000000"]},
     {"maxEffortLevel": "max"}, {"alwaysThinkingEnabled": True},
     # A per-model entry replaces the file-wide cap for that model only.
     {"maxEffortLevel": "low", "modelSettings": {"kimi-k3[1m]": {"maxEffortLevel": "max"}}},

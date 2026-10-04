@@ -15,11 +15,14 @@ later edit can overturn. The ``--settings`` layer outranks local, project and
 user settings for every key it sets (settings docs, "Settings precedence"), and
 reloads keep that order, so pinning the route there holds for the whole session.
 Only managed settings outrank it; ``gmodel_settings`` checks those before launch.
+The MODEL is pinned at launch only: ``/model`` can still change it for the
+session, against the same endpoint and key (see ``route_settings``).
 This is the layer ``cc/invoker.py`` already uses for dispatched sessions
 (``_settings_env_pins``).
 """
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import json
@@ -72,6 +75,23 @@ FEATURE_SWITCH_PINS = {
 #: (Claude Code authentication docs, "Authentication precedence"); the empty
 #: pins remove the lower-ranked ones as well rather than relying on rank alone.
 EMPTY_CREDENTIAL_PINS = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS")
+#: The OpenRouter route's ``--settings`` hooks: refuse every requested model
+#: switch (``/model``, the picker, an SDK set_model). Exit 2 blocks the switch
+#: and shows stderr (hooks reference, PreModelSwitch, code.claude.com/docs/en/hooks).
+#: No matcher, so every target is refused: the alias slots already resolve to the
+#: route's model, so no switch on this route can usefully change anything.
+#: MEASURED on CC 2.1.280 (`-p "/model claude-opus-4-6"` against a local
+#: listener): without the hook the session switched; with it the switch was
+#: blocked. Two residuals, also measured or documented: Claude Code sends a
+#: one-token validation request for the requested model BEFORE the hook runs,
+#: and `disableAllHooks` (any settings file) or a managed `allowManagedHooksOnly`
+#: turns hooks off, so the refusal is then inert.
+OPENROUTER_MODEL_SWITCH_HOOKS = {"PreModelSwitch": [{"hooks": [{
+    "type": "command",
+    "command": ("echo 'gmodel: /model is refused on the OpenRouter route: OpenRouter also serves "
+                "Claude model IDs on this key and would bill them per token. To change model, "
+                "relaunch with gmodel.' >&2; exit 2"),
+}]}]}
 
 
 def settings_dir() -> Path:
@@ -97,19 +117,38 @@ class SelectedRoute:
         return COST_BASIS[self.route]
 
 
-def catalog(roster_data: dict) -> dict:
-    """Return the foreground catalog, validating its shape and name namespace."""
+def _catalog_models(roster_data: dict) -> dict:
     block = roster_data.get("gmodel", {})
     if not isinstance(block, dict) or not isinstance(block.get("models", {}), dict):
         raise roster.RosterError("gmodel.models must be a mapping")
-    models = block.get("models", {})
+    return block.get("models", {})
+
+
+def _is_member(roster_data: dict, name: str) -> bool:
+    block = roster_data.get("gmodel")
+    models = block.get("models") if isinstance(block, dict) else None
+    return isinstance(models, dict) and name in models
+
+
+def _validated_entry(roster_data: dict, name: str, model: object) -> dict[str, SelectedRoute]:
+    """Validate ONE catalog entry, including the namespace rule that applies to it."""
+    if not isinstance(name, str) or not name.strip() or not isinstance(model, dict):
+        raise roster.RosterError("gmodel model names must be strings with mapping definitions")
     legacy = roster_data.get("models", {})
+    if name in NATIVE_NAMES or (isinstance(legacy, dict) and name in legacy):
+        raise roster.RosterError(f"Ambiguous gmodel model name: {name}")
+    return _parsed_routes(name, model)
+
+
+def catalog(roster_data: dict) -> dict:
+    """Return the foreground catalog, validating EVERY entry (the listing path).
+
+    Selection (``resolve_route``) validates only the requested entry, so an
+    invalid sibling cannot stop a valid route from launching.
+    """
+    models = _catalog_models(roster_data)
     for name, model in models.items():
-        if not isinstance(name, str) or not name.strip() or not isinstance(model, dict):
-            raise roster.RosterError("gmodel model names must be strings with mapping definitions")
-        if name in NATIVE_NAMES or (isinstance(legacy, dict) and name in legacy):
-            raise roster.RosterError(f"Ambiguous gmodel model name: {name}")
-        _parsed_routes(name, model)
+        _validated_entry(roster_data, name, model)
     return models
 
 
@@ -180,20 +219,36 @@ def resolve_route(
         # Before any configuration load: the strict load below must never be
         # able to break a native launch (`gmodel opus` with a broken overlay).
         return None
-    data = roster_data if roster_data is not None else roster.load_roster(strict=True)
-    # Strict foreground validation must not disable an unrelated flat roster
-    # peer. Inspect membership before validating the catalog.
-    block = data.get("gmodel")
-    raw_models = block.get("models") if isinstance(block, dict) else None
-    if not isinstance(raw_models, dict) or name not in raw_models:
+    if roster_data is not None:
+        data = roster_data
+    else:
+        try:
+            data = roster.load_roster(strict=True)
+        except roster.RosterError:
+            # Strict loading binds only foreground-catalog members. Membership
+            # comes from the base file, which is what the lenient loader keeps
+            # when the overlay is broken: a member re-raises (a broken overlay
+            # must not silently restore the shipped Auto preference), anything
+            # else returns None and keeps the flat roster's lenient path. The
+            # base is read strictly, without the overlay, so this read logs no
+            # parser text. If the base itself is unreadable, membership cannot
+            # be known: return None, and the flat path reports the broken base.
+            try:
+                base = roster._load_yaml(roster._CONFIG_DIR / roster._ROSTER_FILE, strict=True)
+            except roster.RosterError:
+                return None
+            if _is_member(base, name):
+                raise
+            return None
+    if not _is_member(data, name):
         return None
-    models = catalog(data)
-    model = models[name]
+    model = _catalog_models(data)[name]
+    # Only the requested entry is validated; `catalog()` (the listing) checks all.
+    parsed = _validated_entry(data, name, model)
     preference = model.get("route", "auto")
     requested = route if route is not None else preference
     if requested not in ("auto", *ROUTES):
         raise roster.RosterError("--route must be auto, subscription, api or openrouter")
-    parsed = _parsed_routes(name, model)
     keys = os.environ if environ is None else environ
     candidates = ROUTES if requested == "auto" else (requested,)
     unavailable = []
@@ -232,6 +287,15 @@ def route_env_pins(selected: SelectedRoute, token: str) -> dict[str, str]:
     for variable in _CONTEXT_VARS:
         pins[variable] = str(selected.context_tokens)
     pins["CLAUDE_CODE_EFFORT_LEVEL"] = selected.effort
+    # Every catalog model ID is a custom spelling. Claude Code documents this
+    # switch as the one that sends effort "even when Claude Code does not
+    # recognize the model ID as effort-capable" (env-vars reference,
+    # code.claude.com/docs/en/env-vars, read 2026-10-04). MEASURED on CC 2.1.280
+    # against a local listener: `output_config.effort` was sent for k3,
+    # kimi-k3 and moonshotai/kimi-k3 with and without it, so today it changes
+    # nothing; it is pinned because it is the documented contract and that
+    # recognition logic is CC's to change between versions.
+    pins["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] = "1"
     pins.update(FEATURE_SWITCH_PINS)
     pins["GENESIS_ROSTER_MODEL"] = selected.name
     return pins
@@ -261,14 +325,29 @@ def route_settings(selected: SelectedRoute, pins: Mapping[str, str]) -> dict:
     applies, and it caps CLAUDE_CODE_EFFORT_LEVEL too (settings reference,
     ``maxEffortLevel``), so a cap in any settings file still lowers the effort.
     ``gmodel_settings.effort_cap_warnings`` reports one at launch.
+
+    NOT pinned either: the session model after launch. ``/model`` outranks
+    ``ANTHROPIC_MODEL`` and the ``model`` key (model-config docs, "Setting your
+    model"), and changes the model for the session against the SAME routed
+    endpoint and key. The alias slots all point at the route's model, so
+    ``/model opus`` stays on it; a full ID such as ``/model claude-opus-4-6``
+    does not. On Kimi or MiMo endpoints that fails as an unknown model. On
+    OpenRouter it would not: OpenRouter serves Claude model IDs on the same key
+    (its Claude Code guide configures only the base URL and token, and its
+    "Anthropic Skin" maps the model; openrouter.ai/docs, Claude Code guide, read
+    2026-10-04), so the switch would bill an Anthropic model per token. The
+    OpenRouter route therefore carries ``OPENROUTER_MODEL_SWITCH_HOOKS``.
     """
-    return {
+    document = {
         "env": dict(sorted(pins.items())),
         "model": selected.model_id,
         "fallbackModel": [selected.model_id],
         "alwaysThinkingEnabled": True,
         "autoCompactEnabled": True,
     }
+    if selected.route == "openrouter":
+        document["hooks"] = copy.deepcopy(OPENROUTER_MODEL_SWITCH_HOOKS)
+    return document
 
 
 def write_route_settings(document: Mapping, directory: Path | None = None) -> Path:

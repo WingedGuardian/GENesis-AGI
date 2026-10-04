@@ -355,8 +355,12 @@ verified: 6aae986bb 2026-10-04
   child environment AND an owner-only `--settings` file, which outranks user,
   project and local settings across mid-session reloads and `/cd` (except a
   `maxEffortLevel` cap, where the lowest file wins; the launcher warns); only
-  managed settings and conflicting CLI flags are checked before launch. Catalog loading
-  is strict, but native tiers never load it. Published endpoints remain
+  managed settings and conflicting CLI flags are checked before launch. The model
+  holds until `/model`, which keeps the endpoint and key; the OpenRouter route
+  refuses `/model` with a PreModelSwitch hook. Catalog loading is strict for
+  catalog members only, and selection validates only the requested entry;
+  native tiers never load the catalog, and a flat roster peer never fails on it
+  (a strict failure falls back to the lenient roster path). Published endpoints remain
   unverified until live acceptance; these entries never join the automated
   failover roster.
 - **Replay-unsafe CC outcomes do not enter full-tools recovery, failover or
