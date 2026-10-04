@@ -3190,7 +3190,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      **With no user to ask** (a dispatched session): do not merge and do not open round
      3 — comment on the PR naming the tripwire and the P1, apply the
      `needs-architecture-session` label, move it to draft (`gh pr ready <N> --undo`),
-     and open a `ready` follow-up, the same
+     and open a `ready` follow-up (a dispatched session's follow-up lands in the `tabled` lane; the intake gap is tracked in #2857), the same
      unattended route the architecture-session rule below uses.
   6. **After round 1 the diff SHRINKS in SCOPE, never grows.** Line count is not the
      measure — a floor fix under rule 4 may add lines and is mandatory. What may not
@@ -3248,7 +3248,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   the repo lacks it — labels are per-repo and forks do not inherit them), move
   the PR to draft (`gh pr ready <N> --undo`; see "PR readiness and mode"), open a
   `ready` follow-up naming the PR and the decision it awaits — the label is a
-  GitHub annotation nothing drains, so the row is the intake — and move on to the
+  GitHub annotation nothing drains, so the row is the intake (a dispatched session's follow-up lands in the `tabled` lane; the intake gap is tracked in #2857) — and move on to the
   next PR. Expect it to be uncommon: the owner's estimate, explicitly unmeasured,
   is on the order of 1 in 10 or fewer, so a session reaching for it often is
   mis-triaging. Worked example, PR #1605: main's shared settings writer had

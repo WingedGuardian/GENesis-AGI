@@ -149,8 +149,9 @@ carries NO trailer (heartbeat correctly skipped, `recent_files` caught it), and
 an idle one (neither fired). The middle case is why the filler is not optional:
 merging main into a branch strips the only signal the first two steps read.
 
-**None of this is a lock.** There is no lease or ownership record in the system
-today — this is evidence, read the same way the repo reads a peer's claim
+**None of this is a lock.** Session-claim locks exist (`scripts/hooks/worktree_claim.py`)
+but cover only Genesis sessions, and there is no lease or ownership record
+beyond them — this is evidence, read the same way the repo reads a peer's claim
 (`.claude/docs/concurrent-sessions.md`): a LEAD, not a fact. It makes a
 collision visible; it does not prevent one. So the standing rule still governs:
 every other worktree is an active session until shown otherwise, the PR is not
@@ -159,52 +160,31 @@ yours to work if it is live, and you never `git worktree remove` it.
 **If the build worktree was archived by the reaper** (its
 `git worktree list --porcelain` entry reads `locked archived by the reaper -> …`),
 do not unlock it, and do not `git worktree add --force` its branch. Any OTHER
-lock reason means someone holds it: an ownership claim, a `claude agent …` lock,
-or a manual hold by the operator. Then the PR is not yours to work, as above,
+lock reason means someone holds it, and the PR is not yours to work, as above,
 unless `python3 scripts/worktree_lifecycle.py --release-stale-claims` releases
-the claim as a dead session's.
+the claim as a dead session's. Re-read `git worktree list --porcelain`
+afterwards. If the entry is still locked, the PR is not yours.
 
-For a reaper archive, this is a foreground job: a dispatched session cannot push
-(the push guard denies it), so it should not start a recovery. First check
-whether the archive holds commits that were never pushed:
+For a reaper archive, restore it with
+`python3 scripts/worktree_lifecycle.py --recover '<entry>'` (the lock reason names
+the entry). It returns at its original path on its own branch, so the review
+counters, the branch `gh` resolves, and the push guard's re-push relaxation carry
+over. If `--recover` refuses or exits 2 (`incomplete`), stop and give the owner its
+output. Do not hand-build a replacement worktree (tracked in #2855).
 
-```bash
-git fetch origin <pr-branch>
-git rev-list --left-right --count origin/<pr-branch>...<pr-branch>
-```
-
-A non-zero right-hand count means unpushed work. Stop and surface it to the
-owner rather than discarding it. Otherwise restore the worktree with
-`python3 scripts/worktree_lifecycle.py --recover <entry>`, where the lock reason
-names the entry. It returns at its original path on its own branch, so the review
-counters, the branch name `gh` resolves, and the push guard's re-push relaxation
-all carry over (the protocol above: reuse the build session's worktree).
-
-Only if the recovery refuses, or reports `incomplete`, build a fresh worktree:
+After it exits 0, compare it with the PR head before working:
 
 ```bash
-git worktree add -b <unique-local> .worktrees/<dir> --track origin/<pr-branch>
-git -C .worktrees/<dir> config branch.<unique-local>.merge refs/pull/<N>/head
+git -C <path> fetch origin "pull/<N>/head"
+git -C <path> rev-list --left-right --count FETCH_HEAD...HEAD
 ```
 
-The second line is load-bearing. The commit gate finds the PR through
-`gh pr status`, and with `push.default` unset, as on this repo, a
-differently-named branch reads as "no open PR", so no review budget applies.
-MEASURED 2026-10-04 on gh 2.101.0, against an open PR, in a scratch clone:
+A non-zero right-hand count is the build session's unpushed work: stop and
+surface it to the owner. A non-zero left-hand count means the PR moved on:
+`git -C <path> merge --ff-only FETCH_HEAD`.
 
-- `--track` alone → no PR found;
-- with `branch.<local>.merge refs/pull/<N>/head` → the PR resolved.
-
-The key belongs to that branch and goes away with it. Do not add a remote or a
-push refspec: remotes live in the shared repository config. Push with
-`git push origin HEAD:refs/heads/<pr-branch>`, and expect the push guard to ask.
-For a PR from a fork, the branch is not on `origin`; use `gh pr checkout <N>`.
-
-The LOCAL streak starts from zero under the new worktree's key and cannot be
-back-filled, because re-marking the same staged diff is a no-op
-(`scripts/review_state.py`, `bump_review_round`). So take round counts from
-`scripts/review_budget.py`, which reads them from GitHub and is unaffected, and
-record each NEW defect-bearing external round at its fix commit (step 3).
+This is foreground work. A dispatched session cannot push, so it does not start
+a recovery; it skips the PR and names it in its report.
 
 ### The constraint this session type is measured against
 
@@ -402,47 +382,43 @@ A blocking gate prints its diagnosis on the lines BELOW its summary — which
 finding, which pattern, which cause, and usually the remedy. Read them; they are
 the actionable part, and the summary alone is not enough to act on.
 
-**When the scheduled leaks review has not run.** There are two leaks layers.
-The programmatic one matches patterns: the pre-push privacy scan on every push
-from a session, and CI's `leak-detector` on every PR head. The scheduled `leaks`
-review is the second layer, an LLM read that catches INFERENTIAL leaks no pattern
-can. Its routine is often rate-limited and does not always run. When it has not
-covered the current head, **fall back to doing it ourselves**: a reviewed PR
-beats an unreviewed one (owner, 2026-10-03). Dispatch the scan to a
-**fresh-context subagent** (for example `genesis-security-reviewer`), never the
-session's own read of the diff. The subagent scans the PR at the head the
-marker will name. Take both ids from `gh pr view <N> --json baseRefOid,headRefOid`
-and read:
+**When the scheduled leaks review has not run** at the current head, and
+carried-forward relief does not apply, run it as a fallback rather than leave the
+PR unreviewed (owner, 2026-10-03). The rules:
 
-- every added line;
-- the old and new path of every changed file
-  (`git diff --name-status -M <baseRefOid>...<headRefOid>`), which also lists
-  rename-only and binary changes that carry no added line;
-- binary and image contents, or list them in the marker as unread;
-- the head branch name, the title, the body and the commit messages.
+- **Who reads:** a fresh-context subagent (for example `genesis-security-reviewer`),
+  never your own read.
+- **What it reads:** the PR range from `gh pr view <N> --json baseRefOid,headRefOid`,
+  after fetching both (`git fetch origin "pull/<N>/head" main`).
+  - every added line;
+  - every old and new path (`git diff --name-status -M <base>...<head>`);
+  - binary contents, or an explicit unread list;
+  - the branch name, title, body and commit messages.
+- **What it checks:**
+  - literal identifiers, against `~/.genesis/release-fingerprints.txt`;
+  - inferential personal context: anything that ties the change to a real
+    person's life directly or by inference (household, schedule, places,
+    devices at home, languages spoken). It is the class CLAUDE.md, "Where
+    deferred work goes", scrubs from issues.
+- **A clean result is not enough on its own.** Before any marker is posted, a
+  SECOND independent fresh-context pass re-derives it (CLAUDE.md, Rules, "Verify
+  agent output").
+- **On any finding,** fix it and re-run. Never post a passing marker over one.
+- **Who posts:** only a session authenticated as the repo owner posts the marker;
+  otherwise give the owner the result, and do not post it. Prefer a session that
+  did not author the PR.
+- **What the marker says:**
+  - It uses the gate's grammar (genesis-development, "every scheduled Claude
+    review at the current head").
+  - Its `head=` is the `headRefOid` the scan read. Re-read `headRefOid` just
+    before posting, and re-run the scan if it changed.
+  - It states the lines examined, each class with its result, and that a session
+    ran it as the fallback.
+  - It ends with the explicit verdict line `VERDICT: PASS`. The gate's blocking
+    patterns ignore negation, so without that line a clean marker can be refused
+    on wording alone (genesis-development, the clean-verdict rule).
 
-It reads all of these for BOTH kinds of leak:
-
-- literal identifiers, for which it is given `~/.genesis/release-fingerprints.txt`;
-- inferential personal context: anything that ties the change to a real
-  person's life, directly or by inference. That covers names, places,
-  household, schedule, the devices at home, and the languages spoken there. It
-  is the same class CLAUDE.md, "Where deferred work goes", says to scrub from
-  an issue, applied to every public surface.
-
-If it finds anything, fix it and re-run. Never post a passing marker over a
-finding. Otherwise post the marker from the owner account; the gate counts no
-other author, so a session whose `gh` is not authenticated as the repo owner
-leaves this to the owner. Post it in the grammar
-genesis-development gives ("requires every scheduled Claude review at the
-current head"). Its body states:
-
-- how many lines were examined;
-- each class checked, with its result;
-- that a session ran it as the fallback, not the routine.
-
-End it with the verdict line. Prefer a session that did not author the PR, and
-when the authoring session runs the fallback, say so in the marker comment.
+A shared review spec for the routine and this fallback is tracked in #2856.
 
 **Then read the review comments themselves.** `--check-pr` gives you the verdict
 and the finding TITLES (truncated at 120 characters, first line only) — never a
@@ -528,42 +504,29 @@ merges on its own initiative is worse than no closing session.
 
 ### 5. Sending a PR back
 
-A PR goes back for one of these reasons, each with its own label:
+Two triggers, two labels:
 
-- **The owner decides a terminal round is rework** → `needs-rework`.
-- **The premise check returns BROKEN, or a design question goes to an
-  architecture session** → `needs-architecture-session`
-  (`.claude/docs/premise-check.md`).
+- **A BROKEN premise, or a design question** → `needs-architecture-session`.
+  This is the established disposition in genesis-development, "Some PRs are not
+  a review problem". Follow it there, owner-present and unattended alike; it
+  includes the draft step. Its unattended intake gap is tracked in #2857. If the
+  owner's architecture conversation decides to send the PR back, run steps 1-4
+  below with `needs-architecture-session`.
+- **The owner decides a terminal round is rework** → `needs-rework`. The owner is
+  present by definition, so this runs in the foreground:
+  1. Comment with the evidence: findings by class, what carries over, what the
+     rework is. The comment is public, so scrub it as you would an issue
+     (CLAUDE.md, "Where deferred work goes").
+  2. Apply `needs-rework`, creating it first if the repo lacks it
+     (`gh label create needs-rework --description "Sent back for rework"`).
+  3. Move the PR to draft (`gh pr ready <N> --undo`). If that fails, keep the
+     label and say so in a second comment.
+  4. Open a `ready` follow-up naming the PR and the rework; nothing drains the
+     label.
 
-With the owner present, a BROKEN verdict or a design question goes to the owner
-first. It becomes a foreground architecture conversation, and the PR is sent back
-only if that conversation decides to. The send-back runs at once only when no
-user is present (premise-check.md; genesis-development, "Some PRs are not a
-review problem").
-
-**Sending it back is four steps, done together:**
-
-1. **Comment** on the PR with the evidence: findings by class, the premise
-   verdict, what carries over, and what the rework is. The comment is public,
-   so scrub it as you would an issue (CLAUDE.md, "Where deferred work goes");
-   premise-check output can carry local paths.
-2. **Label** it as above. Labels are per-repository and a fork does not inherit
-   them, so create a missing one first
-   (`gh label create needs-rework --description "Sent back for rework"`).
-3. **Move it to draft** (`gh pr ready <N> --undo`). This is a blocker that
-   appeared after the PR opened, which is exactly what draft mode is for
-   (genesis-development, "PR readiness and mode"). A sent-back PR left in regular
-   mode still sorts into the queue as a merge candidate. If `--undo` fails
-   (on a private repo, draft PRs depend on the plan), keep the label and the
-   follow-up and say so in the comment.
-4. **Open a `ready` follow-up** naming the PR and the rework. Nothing drains the
-   label; the row is the intake.
-
-Leave it OPEN; retiring is not this session's call (genesis-development, "Never
-RETIRE a PR you are not the one reviving"). The session that completes the
-rework marks it ready (`gh pr ready <N>`), removes the send-back label
-(`gh pr edit <N> --remove-label <label>`), and requests review. The label is
-what tells a sent-back draft apart from a draft an automated opener created.
+Leave it OPEN (genesis-development, "Never RETIRE a PR you are not the one
+reviving"). The session that completes the rework marks it ready, removes the
+label, and requests review.
 
 ---
 
