@@ -73,8 +73,9 @@ existed), or a write to a live store. The usual free reads:
   mandatory pre-edit gate, and that holds; it is owed here only when the blast
   radius could change the plan;
 - a probe of the external behaviour the plan relies on, such as a CLI flag, an
-  API, or a renderer (`gh api markdown -f mode=gfm -f text=...` renders exactly
-  what GitHub shows);
+  API, or a renderer. `gh api markdown -f mode=gfm -f context=<owner>/<repo>
+  -f text=...` renders what GitHub shows in that repository; without `context`,
+  references like `#42` do not render as links;
 - a measurement over real data (merged PR bodies, live rows, transcripts),
   reported as `k/N` with the method, per the Acceptance Bar section.
 

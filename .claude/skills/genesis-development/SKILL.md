@@ -211,8 +211,9 @@ the feature is fully active or the user explicitly cancels it.
 **Get it right the first time. On everything that could change the plan, the
 bar is beyond reasonable doubt BEFORE building, not after review finds it.** A
 PR that comes out half-built because half its premises were never checked is
-the failure this rule exists to stop. The checklist, which every plan presented
-for approval answers:
+the failure this rule exists to stop. The checklist, which every development
+plan presented for approval answers (task-executor plans from `/task` keep their
+own `TASK_INTAKE.md` section contract instead):
 
 1. **Every free read is done.** A free read is anything this session can settle
    read-only, or by a probe that changes nothing beyond scratch state, using
@@ -230,7 +231,8 @@ for approval answers:
    test plan (targeted tests midway and at the end, CI for the full suite, a
    functional check of the built thing, "Verify BEFORE the PR" below, and the
    `E2E:` line after merge).
-4. **A revised plan opens with "Changed in this revision"**: what changed, and why.
+4. **A revised plan's body opens with "Changed in this revision"** (after any
+   YAML frontmatter, which stays on line 1): what changed, and why.
 5. **Ask the owner about intent, priorities and trade-offs. Decide measured
    technical edge cases yourself** and state the call; the owner overrides at
    approval. Design principles and standing axioms, approval and sovereignty
