@@ -968,6 +968,53 @@ def test_topic_summary_structured_fields():
     assert "Watch the embedding backlog." in msg
 
 
+def test_topic_summary_structured_observation_keeps_observation_and_next():
+    """The structured form shows its Observation and Next lines whole, even
+    when the full entry is longer than the old 300-character cut."""
+    from genesis.cc.reflection_bridge._output import format_topic_summary
+
+    entry = (
+        "Observation: The embedding backlog stopped draining after the 03:00 restart.\n"
+        "Evidence: " + "queue depth readings from the health snapshot, " * 6 + "\n"
+        "Why it matters: Recall quality falls as unembedded memories accumulate.\n"
+        "Next: Restart the embedding worker; done when queue depth reaches zero."
+    )
+    assert len(entry) > 300
+    msg = format_topic_summary(
+        Depth.DEEP, _cc_output(json.dumps({"observations": [entry]})),
+    )
+    assert "Observation: The embedding backlog stopped draining" in msg
+    assert "Next: Restart the embedding worker; done when queue depth reaches zero." in msg
+    assert "Evidence:" not in msg
+    assert "Why it matters:" not in msg
+
+
+def test_topic_observation_states_what_it_leaves_out():
+    from genesis.cc.reflection_bridge import _output
+
+    lines = [f"line {i} " + "x" * 300 for i in range(6)]
+    shown = _output._topic_observation("\n".join(lines))
+    assert shown.startswith("line 0 ")
+    assert "more lines in the stored observation" in shown
+    for kept in shown.splitlines()[:-1]:
+        assert kept in lines  # whole lines only, never cut mid-line
+
+
+def test_topic_observation_shortens_one_overlong_line_at_a_word():
+    from genesis.cc.reflection_bridge import _output
+
+    shown = _output._topic_observation("word " * 400)
+    assert shown.endswith("(line shortened; full text in the stored observation)")
+    assert len(shown) < 1300
+    assert "wor …" not in shown  # cut lands on a word boundary
+
+
+def test_topic_observation_plain_text_unchanged():
+    from genesis.cc.reflection_bridge import _output
+
+    assert _output._topic_observation("  a short finding  ") == "a short finding"
+
+
 def test_topic_summary_no_fields_one_liner():
     from genesis.cc.reflection_bridge._output import format_topic_summary
 

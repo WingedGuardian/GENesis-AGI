@@ -510,6 +510,47 @@ async def _store_reflection_summary(
             )
 
 
+#: Labelled lines a structured observation shows in the topic. Evidence and
+#: "Why it matters" stay in the stored observation.
+_TOPIC_OBS_LABELS = ("observation:", "next:")
+#: Soft size for one observation in the topic. Long topic messages are split
+#: by send_to_category, so this keeps the summary readable; it is not a limit.
+_TOPIC_OBS_MAX = 1200
+
+
+def _topic_observation(text: str) -> str:
+    """Select what one observation shows in the topic, in whole lines.
+
+    The structured form (Observation / Evidence / Why it matters / Next) shows
+    its Observation and Next lines. Other text shows as written. When the
+    selection is longer than ``_TOPIC_OBS_MAX``, whole leading lines are kept
+    and the omission is stated, never a cut at a character count; only a single
+    line longer than the budget on its own is shortened, at a word boundary,
+    and that is stated too.
+    """
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    labelled = [line for line in lines if line.lower().startswith(_TOPIC_OBS_LABELS)]
+    selected = labelled if any(
+        line.lower().startswith(_TOPIC_OBS_LABELS[0]) for line in labelled
+    ) else lines
+
+    shown: list[str] = []
+    used = 0
+    for line in selected:
+        if used + len(line) > _TOPIC_OBS_MAX:
+            break
+        shown.append(line)
+        used += len(line) + 1
+    if not shown:
+        head = selected[0][:_TOPIC_OBS_MAX].rsplit(" ", 1)[0]
+        return f"{head} … (line shortened; full text in the stored observation)"
+    if len(shown) < len(selected):
+        left = len(selected) - len(shown)
+        noun = "line" if left == 1 else "lines"
+        shown.append(f"… ({left} more {noun} in the stored observation)")
+    return "\n".join(shown)
+
+
 def format_topic_summary(depth, output, *, text: str | None = None) -> str:
     """Build the Telegram topic message from PARSED reflection fields only.
 
@@ -547,7 +588,7 @@ def format_topic_summary(depth, output, *, text: str | None = None) -> str:
         for entry in (obs if isinstance(obs, list) else [])[:3]:
             text = entry if isinstance(entry, str) else ""
             if text.strip():
-                obs_lines.append(f"• {_html.escape(text[:300])}")
+                obs_lines.append(f"• {_html.escape(_topic_observation(text))}")
         if obs_lines:
             parts.append("\n".join(obs_lines))
         focus = data.get("focus_next_week") or data.get("focus_next")
