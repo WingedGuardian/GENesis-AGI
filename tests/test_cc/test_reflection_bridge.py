@@ -995,7 +995,7 @@ def test_topic_observation_states_what_it_leaves_out():
     lines = [f"line {i} " + "x" * 300 for i in range(6)]
     shown = _output._topic_observation("\n".join(lines))
     assert shown.startswith("line 0 ")
-    assert "more lines in the stored observation" in shown
+    assert shown.endswith("more lines not shown)")
     for kept in shown.splitlines()[:-1]:
         assert kept in lines  # whole lines only, never cut mid-line
 
@@ -1004,9 +1004,48 @@ def test_topic_observation_shortens_one_overlong_line_at_a_word():
     from genesis.cc.reflection_bridge import _output
 
     shown = _output._topic_observation("word " * 400)
-    assert shown.endswith("(line shortened; full text in the stored observation)")
+    assert shown.endswith("(shortened)")
     assert len(shown) < 1300
     assert "wor …" not in shown  # cut lands on a word boundary
+
+
+def test_topic_observation_overlong_first_line_still_counts_the_rest():
+    from genesis.cc.reflection_bridge import _output
+
+    shown = _output._topic_observation("word " * 400 + "\nsecond line\nthird line")
+    first, last = shown.splitlines()[0], shown.splitlines()[-1]
+    assert first.endswith("(shortened)")
+    assert last == "… (2 more lines not shown)"
+
+
+def test_topic_observation_long_finding_keeps_next_step():
+    """A structured entry whose Observation line alone exceeds the budget still
+    shows its Next line."""
+    from genesis.cc.reflection_bridge import _output
+
+    entry = "Observation: " + "detail " * 300 + "\nEvidence: e\nNext: Do the thing."
+    shown = _output._topic_observation(entry)
+    assert shown.splitlines()[0].startswith("Observation: ")
+    assert shown.splitlines()[0].endswith("(shortened)")
+    assert shown.splitlines()[-1] == "Next: Do the thing."
+
+
+def test_topic_observation_partial_labels_keep_every_line():
+    """One label alone does not make an entry structured: unlabeled evidence or
+    an action line must not be discarded."""
+    from genesis.cc.reflection_bridge import _output
+
+    entry = "Observation: queue stalled\nseen in the health snapshot\nrestart the worker"
+    assert _output._topic_observation(entry) == entry
+
+
+def test_salvage_prompt_requests_four_line_observations():
+    from genesis.cc.reflection_bridge import _output
+
+    prompt = _output._SALVAGE_PROMPT
+    for label in ("Observation:", "Evidence:", "Why it matters:", "Next:"):
+        assert label in prompt
+    assert "not stated in the source" in prompt
 
 
 def test_topic_observation_plain_text_unchanged():

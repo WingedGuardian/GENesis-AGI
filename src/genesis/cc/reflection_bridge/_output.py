@@ -49,7 +49,12 @@ assessment).
 
 Required:
 - "observations": [string, ...]        (max 5 — the key discrete findings in \
-the prose; the reflection's concrete conclusions).
+the prose; the reflection's concrete conclusions). Write each as four short \
+labeled lines joined by \\n: "Observation:" the finding; "Evidence:" the source \
+the prose names for it; "Why it matters:" the consequence the prose gives; \
+"Next:" the action the prose proposes. When the prose does not give one of \
+these, say so on that line ("Evidence: not stated in the source", "Next: none \
+stated") rather than supplying it.
 - "cognitive_state_update": string — a tight, factual summary of the current \
 cognitive state / situation described in the prose.
 - "confidence": float 0.0–1.0 — a calibrated confidence in this reflection's \
@@ -510,44 +515,55 @@ async def _store_reflection_summary(
             )
 
 
-#: Labelled lines a structured observation shows in the topic. Evidence and
-#: "Why it matters" stay in the stored observation.
+#: The two labelled lines a structured observation shows in the topic. Both
+#: must be present for an entry to count as structured.
 _TOPIC_OBS_LABELS = ("observation:", "next:")
 #: Soft size for one observation in the topic. Long topic messages are split
 #: by send_to_category, so this keeps the summary readable; it is not a limit.
 _TOPIC_OBS_MAX = 1200
 
 
+def _shorten_line(line: str, limit: int) -> str:
+    """``line`` cut at the last word boundary within ``limit``, and marked."""
+    head = line[:limit].rsplit(" ", 1)[0] if " " in line[:limit] else line[:limit]
+    return f"{head} … (shortened)"
+
+
 def _topic_observation(text: str) -> str:
     """Select what one observation shows in the topic, in whole lines.
 
-    The structured form (Observation / Evidence / Why it matters / Next) shows
-    its Observation and Next lines. Other text shows as written. When the
-    selection is longer than ``_TOPIC_OBS_MAX``, whole leading lines are kept
-    and the omission is stated, never a cut at a character count; only a single
-    line longer than the budget on its own is shortened, at a word boundary,
-    and that is stated too.
+    A structured entry, one carrying BOTH an ``Observation:`` and a ``Next:``
+    line, shows those two lines; each gets half the budget, so a long finding
+    never pushes the next step out. Any other entry shows its lines in order
+    while they fit; a first line longer than the whole budget is shortened
+    rather than dropped. Every shortened line and every line left out is
+    stated, never silently cut.
     """
     lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
-    labelled = [line for line in lines if line.lower().startswith(_TOPIC_OBS_LABELS)]
-    selected = labelled if any(
-        line.lower().startswith(_TOPIC_OBS_LABELS[0]) for line in labelled
-    ) else lines
+    has = {
+        label: any(line.lower().startswith(label) for line in lines)
+        for label in _TOPIC_OBS_LABELS
+    }
+    if all(has.values()):
+        selected = [line for line in lines if line.lower().startswith(_TOPIC_OBS_LABELS)]
+        half = _TOPIC_OBS_MAX // 2
+        return "\n".join(
+            line if len(line) <= half else _shorten_line(line, half) for line in selected
+        )
 
     shown: list[str] = []
     used = 0
-    for line in selected:
+    for line in lines:
         if used + len(line) > _TOPIC_OBS_MAX:
+            if not shown:
+                shown.append(_shorten_line(line, _TOPIC_OBS_MAX))
             break
         shown.append(line)
         used += len(line) + 1
-    if not shown:
-        head = selected[0][:_TOPIC_OBS_MAX].rsplit(" ", 1)[0]
-        return f"{head} … (line shortened; full text in the stored observation)"
-    if len(shown) < len(selected):
-        left = len(selected) - len(shown)
+    left = len(lines) - len(shown)
+    if left:
         noun = "line" if left == 1 else "lines"
-        shown.append(f"… ({left} more {noun} in the stored observation)")
+        shown.append(f"… ({left} more {noun} not shown)")
     return "\n".join(shown)
 
 
