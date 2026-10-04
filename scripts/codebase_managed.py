@@ -371,7 +371,10 @@ def set_enabled(config: dict, path: Path, enabled: bool) -> None:
             if enabled:
                 config["enabled"] = False
                 write_settings(path, config)
-                systemctl("stop", backend(config))
+                try:
+                    systemctl("stop", backend(config))
+                except subprocess.SubprocessError as stop_error:
+                    print(f"rollback stop failed: {stop_error}", file=sys.stderr)
             raise
 
 

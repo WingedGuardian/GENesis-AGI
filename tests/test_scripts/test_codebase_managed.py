@@ -156,7 +156,10 @@ def test_configure_preserves_foreign_artifacts_before_pin_or_state(tmp_path, mon
     assert not foreign.exists() and not state.exists()
 
 
-def test_activation_start_failure_rolls_back_and_stops_owned_unit(tmp_path, config, monkeypatch):
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_activation_start_failure_rolls_back_and_stops_owned_unit(
+    tmp_path, config, monkeypatch, capsys, stop_fails
+):
     import contextlib
     import subprocess
 
@@ -173,11 +176,15 @@ def test_activation_start_failure_rolls_back_and_stops_owned_unit(tmp_path, conf
         actions.append(args)
         if args[0] == "start":
             raise subprocess.CalledProcessError(1, "start")
+        if stop_fails:
+            raise subprocess.CalledProcessError(2, "stop")
         return ""
 
     monkeypatch.setattr(m, "systemctl", manager)
-    with pytest.raises(subprocess.CalledProcessError):
+    with pytest.raises(subprocess.CalledProcessError) as error:
         m.set_enabled(config, path, True)
+    assert error.value.cmd == "start"
+    assert ("rollback stop failed" in capsys.readouterr().err) is stop_fails
     assert m.read_settings(path)["enabled"] is False
     assert actions == [
         ("start", "genesis-cbm-query.service"),
