@@ -36,6 +36,13 @@ _PERMANENT_TYPES: frozenset[str] = frozenset(
         "genesis_version_baseline",  # Single reference point, replaced on next version
         "cc_version_baseline",  # Single reference point, replaced on next version
         "execution_challenge",  # Task failure post-mortem — resolved manually
+        # A milestone crossing is a one-time historical fact, and the
+        # observation IS the wake-up for work parked behind that number.
+        # Under the 14-day default it would expire before anyone acted on
+        # it, which turns the watcher that wrote it into a no-op nobody
+        # notices — the exact silent-miss this whole mechanism exists to
+        # prevent. Permanent, and resolved by hand like the rows above.
+        "repo_milestone_reached",
     }
 )
 
@@ -200,10 +207,8 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "user_model_delta": timedelta(days=14),
     "capability_improvement": timedelta(days=14),
     "strategic_analysis": timedelta(days=14),
-    # process_reaper dry-run audit trail — the WOULD-KILL evidence an operator
-    # reviews before arming the reaper (set_operator_armed). Kept 14d (vs the 3d
-    # process_reaper_kill above) so a multi-day audit window survives, and made
-    # explicit here so it no longer logs the unknown-type warning every tick.
+    # Legacy process-discovery audit type. The global sweep is observation-only;
+    # this name is retained for historical consumers and a multi-day audit window.
     "process_reaper_would_kill": timedelta(days=14),
     # ── 30-day (intake signals, need processing time) ──────────────────
     "finding": timedelta(days=30),

@@ -207,10 +207,12 @@ def _load_sibling_readable_body():
     return None
 
 
-def _local_readable_body(body: str) -> str:
+def _local_readable_body(body: str, *, keep_blank: bool = False) -> str:
     """Line scanner: drop fenced blocks and HTML comments. Mirrors the sibling's
     rules (a fenced line is opaque and never interpreted; an unterminated opener
-    hides to the end, as CommonMark does)."""
+    hides to the end, as CommonMark does). With ``keep_blank=True`` a blank
+    source line outside both is emitted as ``""`` so a paragraph-aware caller
+    sees paragraph boundaries."""
     visible: list[str] = []
     in_comment = False
     fence: str | None = None
@@ -225,6 +227,15 @@ def _local_readable_body(body: str) -> str:
                 and not stripped_close[closer.end() :].strip()
             ):
                 fence = None
+            continue
+        # Same keep_blank rule as the sibling: only a RAW blank line outside a
+        # comment counts — a line emptied by comment removal, or blank inside an
+        # open comment, is still hidden.
+        # Blank per CommonMark 0.31.2 ("Characters and lines"): empty, or only
+        # U+0020 spaces and U+0009 tabs. Not str.strip(), which would also call
+        # NBSP, form feed, vertical tab or U+2028 blank and invent a boundary.
+        if keep_blank and not in_comment and not line.strip(" \t"):
+            visible.append("")
             continue
         out: list[str] = []
         rest = line
@@ -255,10 +266,12 @@ def _local_readable_body(body: str) -> str:
     return "\n".join(visible)
 
 
-def readable_body(body: str) -> str:
+def readable_body(body: str, *, keep_blank: bool = False) -> str:
     """The part of a PR body a human actually reads."""
     fn = _load_sibling_readable_body()
-    return fn(body[:_MAX_BODY]) if fn else _local_readable_body(body)
+    if fn:
+        return fn(body[:_MAX_BODY], keep_blank=keep_blank)
+    return _local_readable_body(body, keep_blank=keep_blank)
 
 
 def _reason_is_real(value: str) -> bool:

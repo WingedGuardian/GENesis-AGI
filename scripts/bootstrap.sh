@@ -1157,7 +1157,7 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         CC_BIN_DIR="$CC_BIN_DIR:$_cc_prefix/bin"
     fi
 
-    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
+    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template "$SYSTEMD_TEMPLATE_DIR"/*.slice.template; do
         [[ -f "$template" ]] || continue
         svc_name=$(basename "$template" .template)
 
@@ -1210,6 +1210,19 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     systemctl --user daemon-reload 2>/dev/null || true
     if [[ "$SERVICES_UPDATED" = "1" ]]; then
         echo "  systemd daemon reloaded (units changed)"
+    fi
+
+    # A user manager stops at logout without lingering, taking every enabled
+    # timer with it — `Persistent=true` only replays the miss once the manager
+    # next starts, which for a daily watcher may be never. Mirror install.sh.
+    if command -v loginctl &>/dev/null; then
+        if ! loginctl show-user "$(whoami)" 2>/dev/null | grep -q "Linger=yes"; then
+            if loginctl enable-linger "$(whoami)" 2>/dev/null; then
+                echo "  + linger enabled for $(whoami)"
+            else
+                echo "  WARNING: could not enable linger (timers stop on logout)"
+            fi
+        fi
     fi
 
     # Enable + start every rendered timer (idempotent), EXCEPT timers that are a

@@ -739,6 +739,123 @@ def test_scope_path_passes_all_properties(tmp_path):
     assert "codebase-memory-mcp ARGS:" in log.read_text()  # tool actually ran
 
 
+def _use_boundary_verifier(monkeypatch, verifier):
+    """Replace only the pinned interpreter in this test's disposable launcher."""
+    original = _test_entrypoint
+
+    def private_entry(root, bindir):
+        script = original(root, bindir)
+        script.write_text(script.read_text().replace("/usr/bin/python3", str(verifier)))
+        return script
+
+    monkeypatch.setitem(_run_entry.__globals__, "_test_entrypoint", private_entry)
+
+
+@pytest.mark.parametrize("tool", ["cbm", "gitnexus"])
+@pytest.mark.parametrize("boundary_ok", [True, False])
+def test_opt_in_routes_probe_and_batch_and_refuses_wrong_destination(tmp_path, monkeypatch, tool, boundary_ok):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    boundary_log = tmp_path / "boundary.log"
+    # Admission's real cgroup identity checks have separate synthetic-mount
+    # coverage. Only this private script copy replaces the pinned interpreter.
+    verifier = fakebin / "boundary-python"
+    _write_exec(verifier, '#!/bin/bash\n'
+                f'echo "$*" >> "{boundary_log}"\n'
+                f'exit {0 if boundary_ok else 125}\n')
+    _use_boundary_verifier(monkeypatch, verifier)
+    marker = tmp_path / "refusal"
+    res = _run_entry(tmp_path, _make_repo(tmp_path), tool,
+                     path=f"{fakebin}:{_SYSTEM_PATH}", env_extra={
+                         "CODE_INTEL_WORKLOAD_SLICE": "1",
+                         "CODE_INTEL_CHILD_REFUSAL_MARKER": str(marker),
+                     })
+    calls = log.with_suffix(".systemd.log").read_text().splitlines()
+    scope_calls = [line for line in calls if "--scope" in line]
+    assert len(scope_calls) >= 2
+    assert all("--slice=genesis-workload.slice" in line for line in scope_calls)
+    assert all("--slice-inherit" not in line for line in scope_calls)
+    assert "--verify-workload-boundary code-intel-" in boundary_log.read_text()
+    if boundary_ok:
+        assert res.returncode == 0, res.stderr
+        assert ("codebase-memory-mcp" if tool == "cbm" else tool) + " ARGS:" in log.read_text()
+        assert not marker.exists()
+    else:
+        assert res.returncode == 3  # durable refusal, not a charged indexing failure
+        assert not log.exists()
+        assert not marker.exists()  # each leg owns and cleans its internal marker
+
+
+def test_workload_routing_never_uses_no_manager_fallback(tmp_path):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, log.with_suffix(".systemd.log"), probe_ok=False)
+    res = _run_entry(tmp_path, _make_repo(tmp_path), "gitnexus",
+                     path=f"{fakebin}:{_SYSTEM_PATH}",
+                     env_extra={"CODE_INTEL_WORKLOAD_SLICE": "1"})
+    assert res.returncode == 3
+    assert "requested workload routing is unavailable" in res.stdout
+    assert not log.exists()
+
+
+@pytest.mark.parametrize("tool", ["cbm", "gitnexus"])
+def test_workload_manager_failure_after_probe_does_not_charge_index_attempt(tmp_path, tool):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    manager = fakebin / "systemd-run"
+    source = manager.read_text()
+    manager.write_text(source.replace('unit=""; cap="";',
+                                      '[[ "$*" == *--unit=* ]] && exit 1\nunit=""; cap="";', 1))
+    result = _run_entry(tmp_path, _make_repo(tmp_path), tool,
+                        path=f"{fakebin}:{_SYSTEM_PATH}",
+                        env_extra={"CODE_INTEL_WORKLOAD_SLICE": "1"})
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert not log.exists()
+
+
+@pytest.mark.parametrize("cbm_fails,refused_tool,expected", [
+    (False, "cbm", 5), (False, "gitnexus", 4),
+    (True, "gitnexus", 111), (True, "none", 5),
+])
+def test_workload_refusal_preserves_other_leg_outcome(tmp_path, monkeypatch, cbm_fails, refused_tool, expected):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    if cbm_fails:
+        tool = fakebin / "codebase-memory-mcp"
+        tool.write_text(tool.read_text() + "exit 111\n")
+    verifier = fakebin / "boundary-python"
+    _write_exec(verifier, '#!/bin/bash\n'
+                f'[[ "$*" == *-{refused_tool}-* ]] && exit 125\nexit 0\n')
+    _use_boundary_verifier(monkeypatch, verifier)
+    result = _run_entry(tmp_path, _make_repo(tmp_path), "both",
+                        path=f"{fakebin}:{_SYSTEM_PATH}",
+                        env_extra={"CODE_INTEL_WORKLOAD_SLICE": "1"})
+    assert result.returncode == expected, result.stdout + result.stderr
+
+
+def test_workload_raw_indexer_refusal_code_is_still_a_failure(tmp_path, monkeypatch):
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    tool = fakebin / "gitnexus"
+    tool.write_text(tool.read_text() + "exit 125\n")
+    verifier = fakebin / "boundary-python"
+    _write_exec(verifier, '#!/bin/bash\nexit 0\n')
+    _use_boundary_verifier(monkeypatch, verifier)
+    result = _run_entry(tmp_path, _make_repo(tmp_path), "gitnexus",
+                        path=f"{fakebin}:{_SYSTEM_PATH}",
+                        env_extra={"CODE_INTEL_WORKLOAD_SLICE": "1"})
+    assert result.returncode == 125
+    assert "gitnexus ARGS:" in log.read_text()
+
+
+@pytest.mark.parametrize("value", ["true", "yes", "genesis-workload.slice", "2"])
+def test_workload_routing_rejects_invalid_switch(tmp_path, value):
+    res = _run_entry(tmp_path, path=_SYSTEM_PATH,
+                     env_extra={"CODE_INTEL_WORKLOAD_SLICE": value})
+    assert res.returncode == 125
+    assert "must be 0 or 1" in res.stderr
+
+
 def test_gitnexus_scope_uses_measured_8g_cap(tmp_path):
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
     slog = tmp_path / "systemd-run.log"
@@ -913,6 +1030,7 @@ def test_watchdog_full_mode_uses_longer_wall_cap(tmp_path):
 
 _ALLOWED = {
     Path("scripts/lib/code_intel_index.sh"),
+    Path("scripts/lib/code_intel_cbm_worker.py"),  # scope-verified stock worker companion
     Path("scripts/code_intel_runner.sh"),  # the sole entrypoint caller (queue consumer)
     Path("tests/test_scripts/test_code_intel_index.py"),
 }

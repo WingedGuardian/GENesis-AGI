@@ -95,7 +95,9 @@ _read_serving() {
         1) cutoff=$(( $(date +%s) - 30 * 86400 )) ;;
         *) cutoff="" ;;
     esac
-    out="$(python3 -c "$_SERVING_COMMIT_PY" --held "$_git_dir/logs/HEAD" "$boot" \
+    # -I -S: the checkout this runs from can hold unmerged code (`live`), and a
+    # PYTHONPATH or a venv .pth into its src/ would otherwise import from it.
+    out="$(python3 -I -S -c "$_SERVING_COMMIT_PY" --held "$_git_dir/logs/HEAD" "$boot" \
         "$(_git_ro rev-parse HEAD)" "$cutoff" 2>/dev/null)" || rc=$?
     if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
         SERVING="${out%%$'\n'*}"

@@ -343,7 +343,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: c723c00ec 2026-10-03
+verified: 691a10d44 2026-10-03
 ```
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`):
@@ -358,6 +358,88 @@ verified: c723c00ec 2026-10-03
   cause. Missing/unusable overload turn counts remain retryable by explicit
   policy, not proof of pre-work failure. See `cc/exceptions.py`,
   `cc/transient_retry.py` and `docs/reference/inbox-replay-safety.md`.
+
+- **`gh` holds NO GitHub credential in any dispatched session — the SESSION may
+  still reach one** (`cc/invoker.py` `_sealed_gh_config_dir` / `_gh_hardening` /
+  `_build_env` / `_assert_no_gh_credentials`). The headline is split that way
+  deliberately; see the SCOPE paragraph below, which used to contradict it. The
+  sealed `GH_CONFIG_DIR` used to carry a copy of the operator's `hosts.yml`, so
+  every gh-allowlisted dispatch ran with the operator's own scopes (install-
+  specific; on the box where this was measured, `delete_repo` among them). The
+  copy is gone and ALL FOUR of gh's documented credential variables are pinned
+  empty for EVERY dispatch (`_GH_CREDENTIAL_ENV`, enumerated from
+  `gh help environment`: `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`,
+  `GITHUB_ENTERPRISE_TOKEN`) — they outrank `hosts.yml`, so an inherited value
+  would beat the seal. Pinning `GH_TOKEN` ALONE was the first version and was
+  bypassed: MEASURED, `GITHUB_TOKEN` wins over an empty `GH_TOKEN`, and gh
+  documents the pair on one line.
+  **Pinned again at the settings level**: Claude Code applies settings `env`
+  AFTER launch, so a user or project settings file could otherwise restore a
+  credential or `GH_CONFIG_DIR`. Every dispatch passes `--settings` carrying the
+  same pins (`_settings_env_pins`, written by `cc_span_settings_path` to a file
+  named by a hash of the pins). MEASURED on CC 2.1.280: `--settings` env beats
+  both project settings env and the inherited environment.
+  **Enforced by `_assert_no_gh_credentials` at the launch gate, UNCONDITIONALLY** —
+  not by `_assert_hardening_present`, which `_launch_env` calls only for an
+  invocation declaring a Bash allowlist. The credentials were briefly inside the
+  per-binary hardening, which made an every-session claim depend on an invocation
+  shape that, once no profile declares an allowlist, never occurs: the pin was
+  written by the builder and verified by nothing.
+  **"`gh` holds no credential" is the claim; "the session is unauthenticated" is
+  NOT** — tool scope decides the second, and a profile permitting `Read` with an
+  outbound tool can still reach a credential FILE, which no env pin touches.
+  **The allowlist entry is classified in one of three states** — hardened,
+  deliberately needing none (`jq`), or unreviewed and REFUSED. A raw lookup plus a
+  skip was a denylist in allowlist clothing: `git` would have been permitted
+  unsealed, and `git -c core.pager=…` / `-c alias.x='!sh'` runs a program of its
+  own accord exactly as gh does. MEASURED on the shipped guard, varying the ENTRY:
+  `/usr/bin/gh` is permitted (rc=0) while a raw lookup misses — a real unsealed
+  launch, which `basename` closes; `"gh "` is refused for every command (rc=2),
+  because the guard's first-token split cannot emit whitespace, so stripping it is
+  normalisation and closes nothing.
+  **`reconcile_gh_seal()` runs at startup**, from the unconditional credential
+  self-heal, because the seal's own stale sweep is reachable only from an
+  allowlisted dispatch — so once no profile declares one, an install that ran the
+  copying version would keep the token forever. The sweep still runs on an
+  allowlisted launch and is what keeps the seal correct afterwards (VERIFIED on a
+  live seal, `['config.yml','hosts.yml']` → `['config.yml']`) — it is maintenance,
+  not the migration.
+  **The rewrite addresses the seal by DESCRIPTOR, not by path**, and that is a
+  consequence of making the sweep live: four path-level link checks were added one
+  per review round and each round found the next spelling — a symlinked seal
+  directory; a symlink named `config.yml`; the lock file one directory up, opened
+  in a truncating mode BEFORE any of those checks ran; a HARDLINK, which
+  `is_symlink()` cannot see and which satisfies every name, mode and content test
+  because it IS the same inode; and a FIFO, which is none of the types the
+  denylist named and which `is_file()` also rejects, so it was dropped from the
+  comparison set entirely and the seal read as CLEAN. Two of those are worth
+  spelling out. The hardlink made `_seal_matches` report CLEAN while a writable
+  name outside the seal owned gh's `config.yml` — MEASURED, an alias was written
+  through that name and read back from inside the seal, reopening the escape the
+  seal exists to close; a 0500 directory is the only write protection and a second
+  link goes around it. The FIFO was read THROUGH by gh, which adopted the account
+  in it, and under a name in `desired` it would have HUNG the check itself, since
+  reading a pipe with no writer blocks indefinitely.
+
+  A sixth defect was not a file type but a TIME-OF-CHECK gap: the first version of
+  the type allowlist inspected each name once and then re-read the content by name,
+  so the gate described one inode and the bytes came from whatever the name pointed
+  at by then (MEASURED by review: one false-CLEAN in ~500k trials against a racing
+  writer). Every gate is now answered from one open descriptor per entry —
+  `O_NOFOLLOW` so a link raises instead of resolving, `O_NONBLOCK` so a pipe cannot
+  block, `fstat` on that descriptor, and the bytes read from it.
+  So the seal is opened once with `O_DIRECTORY|O_NOFOLLOW`, every chmod, scan,
+  unlink and create runs against that descriptor, each file is created
+  `O_EXCL|O_NOFOLLOW` (a fresh inode at `st_nlink == 1`), nothing is kept, and
+  `_seal_matches` checks `st_nlink` too — because it is what decides whether the
+  rewrite happens at all. LIMIT: a symlinked ANCESTOR still resolves; that needs
+  `openat2`/`RESOLVE_NO_SYMLINKS`, and it is stated in the code rather than implied.
+  **SCOPE — do not over-read it:** `GH_CONFIG_DIR` is pinned only on the
+  allowlisted path, so a session with `Bash` and no declared allowlist still
+  reaches the credential on disk (MEASURED: an empty `GH_TOKEN` alone does not
+  de-authenticate). Widening that pin by origin was measured wrong twice over and
+  is documented in `.claude/docs/background-sessions.md`; the remedy is denying
+  `Bash`, not an env pin.
 - **NO dispatch profile grants Bash** (`cc/direct_session.py`,
   `_PROFILE_BASH_ALLOWLIST` is `{}`). `steward` was the only one — Bash restricted
   to `gh`, for upstream-PR stewardship — and it was REMOVED 2026-09-26 having never
@@ -3091,7 +3173,12 @@ verified: b0867170e 2026-10-02
   state) + `oomd_user_slice_kill` (config-plane scan of user.slice.d drop-ins,
   laid down by `scripts/lib/memory_resilience.sh` from install/bootstrap/update) and
   host-plane `swap_total_kb`, so the annotation layer flags unprotected
-  installs (see docs/reference/memory-resilience.md). Network-resilience
+  installs (see docs/reference/memory-resilience.md). Default-disabled
+  `CODE_INTEL_WORKLOAD_SLICE=1` routes only indexing batch scopes into the dormant
+  `genesis-workload.slice`; both launch paths verify actual scope membership before
+  execution and retain refusal outcomes. This does not replace broad OOM monitors
+  or certify core/recovery exclusion (see docs/reference/index-workload-routing.md).
+  Network-resilience
   invariants are first-class too: container `networkd_keep_configuration` +
   `network_watchdog_installed` (any-link/file-present facts for the annotation
   layer) alongside the posture check's *effective* variants
@@ -3278,6 +3365,89 @@ verified: 4cc75d50 2026-08-05
   no writer yet and the card/gate/dispatch flow is NOT built. `reflex_verdicts`
   is now live (manual dismissals, PR-2c); its diagnose/fix/promotion verdict
   points remain groundwork.
+
+## 15. Work board — Projects v2 front end and open questions
+
+The work board lives on a GitHub Projects v2 board: GitHub owns the cards,
+columns, positions and dependencies (native `blockedBy` / sub-issues), and
+Genesis mirrors none of them. Genesis keeps three local stores and the glue
+around them. **What exists today:** the stores, the `board` mode lever, and the
+open-question tools. The Projects v2 adapter, promotion onto the board and the
+reconciler are follow-on work. Nothing writes to GitHub yet, and the shipped
+mode is `off`.
+
+```yaml subsystem-map
+entry: work-board
+modules: [board]
+verified: b67423bd 2026-10-03
+```
+
+- **Stores** (`db/crud/board.py`; New-Store justification and retention in
+  migration `20261003010926_board_stores`):
+  - `board_links` — private ledger row / follow-up -> public issue, written
+    only once the issue exists, with the promotion audit (who approved it, the
+    privacy-scan receipt, the hash of the body that was scanned);
+  - `open_questions` + `open_question_blocks` — local-only owner decisions
+    and the work each one blocks (an edge, not a list entry);
+  - `board_events` — the append-only event log.
+  Each vocabulary is enforced in the CRUD module; `board_events.event` has no
+  CHECK because SQLite cannot alter one. A partial UNIQUE index on
+  `(event, observed_change_key)` dedups a re-read GitHub change.
+- **Mode lever** `board/config.py` (`off | propose_only | live`, re-read per
+  call; overlay `~/.genesis/config/board.local.yaml`; kill switch
+  `GENESIS_BOARD_DISABLED=1`). An invalid value degrades to `propose_only`:
+  reads stay on and writes stay off. `writes_allowed()` is the one predicate a
+  GitHub writer checks. `live` is OVERLAY-ONLY: the settings validator rejects
+  it (the `marketing_outreach` precedent), and it rejects `enabled: true`
+  too (that would re-arm a live overlay the owner paused), so a session can
+  only turn the board down, never arm it. The master `enabled` fails closed
+  unless it is the literal `true`. Nothing reads the lever yet: board
+  promotion is its first consumer (`GROUNDWORK(board-promotion)` tags mark the
+  entry points waiting on it).
+- **Open questions** (`mcp/health/open_question_tools.py`: `open_question_raise`,
+  `_resolve`, `_block`, `_list`) — never gated by the board mode, because they
+  write only local rows. A target id prefix must resolve uniquely against its
+  own table. Every target is validated first. Every WRITE (raise, resolve,
+  block add/remove) runs on a connection the tool owns, never the server's
+  shared one, because the health MCP middleware rolls the shared connection
+  back after any failed tool call and could discard or split a write already
+  reported saved. Each write is one `BEGIN IMMEDIATE` transaction (a raise:
+  the question and all its blocks, or nothing). Only taking the lock is
+  retried, so a write is never repeated; a lock reported after a durable WAL
+  commit counts as committed; the read-back runs after the commit and a failed
+  one is reported as "saved, not read back". A close is guarded on the
+  observed status, so a second answer never overwrites the first, and a closed
+  question's edges are history (not removable). Resolving and removing a block
+  are owner authority: in `_UNIVERSAL_DISALLOW` for every background profile
+  (overlay profiles included) and refused server-side for a dispatched,
+  unsupervised session (`guard_human_gate`). Listing is denied on the
+  external-ingesting profiles, and raising on the untrusted-inbound perimeter
+  and on read-only `observe`.
+  `open_question_list` pages (50 default, 200 max, `next_offset`), its
+  per-target blocker answer included. Removing an edge accepts a full id even
+  when the ledger row or follow-up behind it has since been purged. Card targets
+  and stored repo names are lowercased, because GitHub names are
+  case-insensitive. A test pins that the module has no GitHub or subprocess
+  path. `open_question_list` is on the reflection read allowlist.
+  **A block is ADVISORY today:** nothing refuses on one until board promotion
+  lands. The morning report's ground-truth section counts unverified questions
+  (count and oldest age only, never the text); that line is the push surface
+  that keeps a parked question from being a silent drop.
+- **Retention:** `scripts/prune_board.py` on the disk-hygiene timer prunes
+  closed questions (and their edges) after 90 d and events after 180 d.
+  Unverified questions and promotion pointers are never pruned.
+- **Do not:** write any card, column or status into a local table (the spec
+  allows exactly these three stores), or make Genesis move a card into
+  In Progress (only a human starts work).
+- **Measured facts the follow-on PRs depend on** (2026-10-03, private sandbox
+  project):
+  - on this account, issue timelines carry NO `ProjectV2ItemStatusChangedEvent`,
+    for UI drags or API writes alike. Change detection therefore keys on the
+    Status value's `updatedAt`, which is why the event log stores an
+    `observed_change_key`;
+  - a new user project gets a default workflow, "Pull request linked to issue",
+    that sets Status to In Progress on its own, and setup must delete it;
+  - project reads lag writes briefly.
 
 ---
 

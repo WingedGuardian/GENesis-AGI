@@ -221,6 +221,7 @@ genesis_gitnexus_installed_version() {
     _genesis_gitnexus_version_of "$binary"
 }
 
+# shellcheck disable=SC2120 # The binary argument is optional; callers may use automatic resolution.
 genesis_gitnexus_installed_is_pinned() {
     local version
     version="$(genesis_gitnexus_installed_version "${1:-}")" || return 1

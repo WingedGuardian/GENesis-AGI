@@ -173,6 +173,25 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         # overlay-file edit, never a UI round-trip.
         hidden_fields=frozenset({"require_approval"}),
     ),
+    "board": SettingsDomain(
+        name="board",
+        description=(
+            "Work board (GitHub Projects v2 front end) — master `enabled` + "
+            "`mode` off/propose_only/live. off (default, shipped) does nothing; "
+            "propose_only reads the board and holds promotions but writes "
+            "nothing to GitHub; live lets the reconciler and approved "
+            "promotions write, and is armed ONLY by an owner edit of "
+            "~/.genesis/config/board.local.yaml (settings_update rejects it). "
+            "Invalid mode degrades to propose_only. Kill "
+            "switch GENESIS_BOARD_DISABLED=1. A session may set enabled false or "
+            "mode off/propose_only, never live or enabled true (owner edits). "
+            "Read live per call by its consumers; none ships yet (board promotion "
+            "is the first), so a change here has no effect until then."
+        ),
+        config_filename="board.yaml",
+        readonly=False,
+        needs_restart=False,  # every consumer re-reads per call
+    ),
     "marketing_outreach": SettingsDomain(
         name="marketing_outreach",
         description=(
@@ -1622,6 +1641,48 @@ def _validate_contributor_worklog(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_board(changes: dict) -> list[str]:
+    """Validate work-board lever changes (see genesis.board.config).
+
+    ``mode`` accepts ``off``/``propose_only`` here, but ``live`` is REJECTED —
+    arming the board's GitHub writes is deliberately overlay-file-only, exactly
+    as ``_validate_marketing_outreach`` reserves its ``live``. A settings_update
+    (MCP tool or dashboard PUT) is reachable by any session, including a
+    dispatched one, so accepting ``live`` here would let a model arm public-repo
+    writes for itself. The owner arms it by editing
+    ``~/.genesis/config/board.local.yaml``, which ``board.config.load_config``
+    merges. (Safe to reject unconditionally: ``board`` is not a dashboard FORM
+    domain, so no whole-config PUT re-echoes an already-set ``live``.)
+    """
+    from genesis.board.config import MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+            elif value:
+                # Only an owner re-enables: `enabled: true` here would re-arm a
+                # `mode: live` overlay the owner paused with `enabled: false`.
+                errors.append(
+                    "'enabled: true' cannot be set through settings_update — "
+                    "re-enabling the board is an owner edit of "
+                    "~/.genesis/config/board.local.yaml"
+                )
+        elif value == "live":
+            errors.append(
+                "'mode: live' cannot be set through settings_update — arming the "
+                "board's GitHub writes is an owner edit of "
+                "~/.genesis/config/board.local.yaml"
+            )
+        elif value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
 def _validate_marketing_outreach(changes: dict) -> list[str]:
     """Validate marketing-outreach lever changes (see
     genesis.outreach.marketing_config).
@@ -2151,6 +2212,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "repo_pulse": _validate_repo_pulse,
     "zero_drop": _validate_zero_drop,
     "contributor_worklog": _validate_contributor_worklog,
+    "board": _validate_board,
     "marketing_outreach": _validate_marketing_outreach,
     "pr_watch": _validate_pr_watch,
     "skill_evolution_gate": _validate_skill_evolution_gate,
