@@ -419,7 +419,7 @@ fi
 
 if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
     echo "    Genesis (container-side):"
-    echo "      - Systemd units: genesis-server, genesis-bridge, genesis-watchdog, qdrant"
+    echo "      - Systemd units: genesis-server, genesis-bridge, genesis-watchdog, genesis-falkordb, qdrant"
     echo "      - Root timers: genesis-network-watchdog, genesis-tailscale-watchdog"
     echo "      - Repository: ~/genesis/"
     echo "      - Runtime state: ~/.genesis/"
@@ -541,6 +541,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-serena-claude-code.service genesis-serena-codex.service \
                     genesis-backup.timer genesis-backup.service \
                     genesis-server.service genesis-bridge.service \
+                    genesis-falkordb.service \
                     qdrant.service; do
             safe_disable_service "$unit"
         done
@@ -613,6 +614,14 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             skip "qdrant binary"
         fi
 
+        # The FalkorDB module lives under ~/.genesis/deps and is removed with
+        # that tree above. redis-server is NOT removed: it is an apt package
+        # other software on the box may depend on, and on a machine where it
+        # predated Genesis we never installed it in the first place. Same for
+        # the upstream apt repo. Say so rather than leaving it a silent
+        # omission — an operator who wants them gone needs to know they remain.
+        skip "redis-server package + apt repo (left in place deliberately)"
+
         # Clean Claude Code config (NOT Claude Code itself or ~/.claude/ global)
         for f in .claude/settings.json .claude/settings.local.json .mcp.json; do
             [ -e "$HOME/genesis/$f" ] && safe_remove "$HOME/genesis/$f" "CC config: $f"
@@ -645,7 +654,8 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                 systemctl --user stop genesis-star-milestone.timer genesis-star-milestone.service 2>/dev/null || true;
                 systemctl --user stop genesis-serena-claude-code.service genesis-serena-codex.service 2>/dev/null || true;
                 systemctl --user stop genesis-backup.timer genesis-backup.service 2>/dev/null || true;
-                systemctl --user stop genesis-server.service genesis-bridge.service qdrant.service 2>/dev/null || true;
+                systemctl --user stop genesis-server.service genesis-bridge.service \
+                    genesis-falkordb.service qdrant.service 2>/dev/null || true;
                 for u in genesis-server.service genesis-bridge.service \
                     genesis-watchdog.timer genesis-watchdog.service \
                     genesis-tmp-watchgod.service \
@@ -656,7 +666,8 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-star-milestone.timer genesis-star-milestone.service \
                     genesis-serena-claude-code.service genesis-serena-codex.service \
                     genesis-backup.timer genesis-backup.service \
-                    genesis-cc-settings-align.timer genesis-cc-settings-align.service qdrant.service; do
+                    genesis-cc-settings-align.timer genesis-cc-settings-align.service \
+                    genesis-falkordb.service qdrant.service; do
                     systemctl --user disable \"\$u\" 2>/dev/null || true;
                 done;
                 DRY_RUN=false;

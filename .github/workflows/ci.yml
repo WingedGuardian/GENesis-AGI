@@ -1112,4 +1112,14 @@ jobs:
         # Floor: 24153 +92 =24245; skip ceiling remains 102.
         # NVIDIA provider health: new test_provider_health_probes.py collects
         # 87 tests (0 -> 87); no added skips. Floor: 24245 + 87 = 24332.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24332
+        # FalkorDB provisioning (#1834): --collect-only on main's versions vs
+        # this branch's, after the last test-adding edit (new file = full count):
+        #   test_infra_protection_posture.py       50 -> 60   (+10)
+        #   test_collectors_container.py           51 -> 62   (+11)
+        #   test_systemd_template_placeholders.py  11 -> 13   (+2)
+        #   test_collectors_falkordb.py           new -> 19   (+19)
+        #   test_falkordb_install.py              new -> 58   (+58)
+        #   test_falkordb_module.py               new -> 24   (+24)
+        #   test_falkordb_key_pin.py              new -> 7    (+7)
+        # No added skips. Floor: 24332 + 131 = 24463; skip ceiling remains 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24463
