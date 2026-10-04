@@ -71,6 +71,39 @@ Two consequences worth internalizing:
   mid-"fix the findings": that work needs the implementation context you would
   be throwing away.
 
+### PR readiness and mode
+
+**Finish the work and clear blockers to entering review BEFORE opening a PR.**
+Complete the implementation, required local review, and verification required
+before publication. If unfinished work or an unresolved prerequisite prevents
+normal review from proceeding, keep the change local, resolve the blocker, and
+then open its PR. A draft PR is not a place to park incomplete or blocked work.
+
+**A session opens every PR in regular, non-draft mode.** Never create a PR with
+`--draft`. The exception is the runtime's own automated openers, which open
+drafts by design: the executor's build lane (`autonomy/executor/pr_open.py`) and
+the contribution opener (`contribution/pr_opener.py`).
+
+**Moving an open PR to draft** is for a blocker to review that appeared AFTER it
+opened (a prerequisite found missing, a design question raised in review); it
+needs no explicit user request. It is never a way to hold work that was already
+unfinished when the PR opened.
+
+**A PR in draft returns to regular once the blocker that put it there is
+resolved.** That holds for drafts opened before this rule. A draft from one of
+the automated openers is different: it has no blocker to clear, neither opener
+ever marks a PR ready, and the closing session counts and lists drafts without
+closing them, so marking it ready is the owner's decision, which the closing
+session's draft list is there to surface. Whoever resolves a blocker marks the
+PR ready (`gh pr ready <N>`) and requests review (`@codex review`), because
+marking a draft ready is not a step to rely on for triggering review. A draft
+is never abandoned in that state.
+
+CI and external review that run after opening, and verification explicitly
+required after merge, remain their normal gates; waiting for those is not a
+reason to use draft mode. Distinguish a blocker to entering review from a check
+that review or merge will subsequently require.
+
 ### Wiring Discipline
 
 Every new component needs at least one call site in the actual runtime

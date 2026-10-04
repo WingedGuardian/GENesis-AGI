@@ -352,6 +352,88 @@ verified: b0867170e 2026-10-02
   cause. Missing/unusable overload turn counts remain retryable by explicit
   policy, not proof of pre-work failure. See `cc/exceptions.py`,
   `cc/transient_retry.py` and `docs/reference/inbox-replay-safety.md`.
+
+- **`gh` holds NO GitHub credential in any dispatched session — the SESSION may
+  still reach one** (`cc/invoker.py` `_sealed_gh_config_dir` / `_gh_hardening` /
+  `_build_env` / `_assert_no_gh_credentials`). The headline is split that way
+  deliberately; see the SCOPE paragraph below, which used to contradict it. The
+  sealed `GH_CONFIG_DIR` used to carry a copy of the operator's `hosts.yml`, so
+  every gh-allowlisted dispatch ran with the operator's own scopes (install-
+  specific; on the box where this was measured, `delete_repo` among them). The
+  copy is gone and ALL FOUR of gh's documented credential variables are pinned
+  empty for EVERY dispatch (`_GH_CREDENTIAL_ENV`, enumerated from
+  `gh help environment`: `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`,
+  `GITHUB_ENTERPRISE_TOKEN`) — they outrank `hosts.yml`, so an inherited value
+  would beat the seal. Pinning `GH_TOKEN` ALONE was the first version and was
+  bypassed: MEASURED, `GITHUB_TOKEN` wins over an empty `GH_TOKEN`, and gh
+  documents the pair on one line.
+  **Pinned again at the settings level**: Claude Code applies settings `env`
+  AFTER launch, so a user or project settings file could otherwise restore a
+  credential or `GH_CONFIG_DIR`. Every dispatch passes `--settings` carrying the
+  same pins (`_settings_env_pins`, written by `cc_span_settings_path` to a file
+  named by a hash of the pins). MEASURED on CC 2.1.280: `--settings` env beats
+  both project settings env and the inherited environment.
+  **Enforced by `_assert_no_gh_credentials` at the launch gate, UNCONDITIONALLY** —
+  not by `_assert_hardening_present`, which `_launch_env` calls only for an
+  invocation declaring a Bash allowlist. The credentials were briefly inside the
+  per-binary hardening, which made an every-session claim depend on an invocation
+  shape that, once no profile declares an allowlist, never occurs: the pin was
+  written by the builder and verified by nothing.
+  **"`gh` holds no credential" is the claim; "the session is unauthenticated" is
+  NOT** — tool scope decides the second, and a profile permitting `Read` with an
+  outbound tool can still reach a credential FILE, which no env pin touches.
+  **The allowlist entry is classified in one of three states** — hardened,
+  deliberately needing none (`jq`), or unreviewed and REFUSED. A raw lookup plus a
+  skip was a denylist in allowlist clothing: `git` would have been permitted
+  unsealed, and `git -c core.pager=…` / `-c alias.x='!sh'` runs a program of its
+  own accord exactly as gh does. MEASURED on the shipped guard, varying the ENTRY:
+  `/usr/bin/gh` is permitted (rc=0) while a raw lookup misses — a real unsealed
+  launch, which `basename` closes; `"gh "` is refused for every command (rc=2),
+  because the guard's first-token split cannot emit whitespace, so stripping it is
+  normalisation and closes nothing.
+  **`reconcile_gh_seal()` runs at startup**, from the unconditional credential
+  self-heal, because the seal's own stale sweep is reachable only from an
+  allowlisted dispatch — so once no profile declares one, an install that ran the
+  copying version would keep the token forever. The sweep still runs on an
+  allowlisted launch and is what keeps the seal correct afterwards (VERIFIED on a
+  live seal, `['config.yml','hosts.yml']` → `['config.yml']`) — it is maintenance,
+  not the migration.
+  **The rewrite addresses the seal by DESCRIPTOR, not by path**, and that is a
+  consequence of making the sweep live: four path-level link checks were added one
+  per review round and each round found the next spelling — a symlinked seal
+  directory; a symlink named `config.yml`; the lock file one directory up, opened
+  in a truncating mode BEFORE any of those checks ran; a HARDLINK, which
+  `is_symlink()` cannot see and which satisfies every name, mode and content test
+  because it IS the same inode; and a FIFO, which is none of the types the
+  denylist named and which `is_file()` also rejects, so it was dropped from the
+  comparison set entirely and the seal read as CLEAN. Two of those are worth
+  spelling out. The hardlink made `_seal_matches` report CLEAN while a writable
+  name outside the seal owned gh's `config.yml` — MEASURED, an alias was written
+  through that name and read back from inside the seal, reopening the escape the
+  seal exists to close; a 0500 directory is the only write protection and a second
+  link goes around it. The FIFO was read THROUGH by gh, which adopted the account
+  in it, and under a name in `desired` it would have HUNG the check itself, since
+  reading a pipe with no writer blocks indefinitely.
+
+  A sixth defect was not a file type but a TIME-OF-CHECK gap: the first version of
+  the type allowlist inspected each name once and then re-read the content by name,
+  so the gate described one inode and the bytes came from whatever the name pointed
+  at by then (MEASURED by review: one false-CLEAN in ~500k trials against a racing
+  writer). Every gate is now answered from one open descriptor per entry —
+  `O_NOFOLLOW` so a link raises instead of resolving, `O_NONBLOCK` so a pipe cannot
+  block, `fstat` on that descriptor, and the bytes read from it.
+  So the seal is opened once with `O_DIRECTORY|O_NOFOLLOW`, every chmod, scan,
+  unlink and create runs against that descriptor, each file is created
+  `O_EXCL|O_NOFOLLOW` (a fresh inode at `st_nlink == 1`), nothing is kept, and
+  `_seal_matches` checks `st_nlink` too — because it is what decides whether the
+  rewrite happens at all. LIMIT: a symlinked ANCESTOR still resolves; that needs
+  `openat2`/`RESOLVE_NO_SYMLINKS`, and it is stated in the code rather than implied.
+  **SCOPE — do not over-read it:** `GH_CONFIG_DIR` is pinned only on the
+  allowlisted path, so a session with `Bash` and no declared allowlist still
+  reaches the credential on disk (MEASURED: an empty `GH_TOKEN` alone does not
+  de-authenticate). Widening that pin by origin was measured wrong twice over and
+  is documented in `.claude/docs/background-sessions.md`; the remedy is denying
+  `Bash`, not an env pin.
 - **NO dispatch profile grants Bash** (`cc/direct_session.py`,
   `_PROFILE_BASH_ALLOWLIST` is `{}`). `steward` was the only one — Bash restricted
   to `gh`, for upstream-PR stewardship — and it was REMOVED 2026-09-26 having never
