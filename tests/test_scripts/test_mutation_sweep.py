@@ -1,15 +1,19 @@
 """Controls for the mutation harness -- including the damage it must never do.
 
-The harness EDITS SOURCE FILES IN PLACE, so its failure modes are not "a wrong
-number in a report": a bad restore destroys uncommitted work, and a mis-reported
-survival retires a test that was actually fine. Both directions are pinned here.
+The harness mutates source files, so its failure modes are not "a wrong number
+in a report": a write to the caller's tree destroys uncommitted work, and a
+mis-reported survival retires a test that was actually fine. Both directions
+are pinned here. Since the isolated-copy redesign the first direction has one
+shape: the caller's tree is NEVER written, whatever the test under mutation
+does, and the copy it runs in is always removed.
 
-Install-agnostic: every case operates on files under `tmp_path`. No repo file is
-mutated by this suite, no network, no live DB.
+Install-agnostic: every case operates on a throwaway git repository under
+`tmp_path`. No repo file is mutated by this suite, no network, no live DB.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -20,31 +24,59 @@ import pytest
 from tests.conftest import private_module
 
 _REPO = Path(__file__).resolve().parent.parent.parent
-# Under `scripts/ci/` because CI invokes it as a required check: an
-# implementation behind a required check sits in the critical review lane, and
+# Under `scripts/ci/` because a CI job invokes it: every script ci.yml invokes
+# sits in the critical review lane, and
 # `test_required_check_implementations_are_critical` derives that from ci.yml.
+# (The job reports; it joins the required-check ruleset once it is stable.)
 _MOD = _REPO / "scripts" / "ci" / "mutation_sweep.py"
 
 # Via conftest so the module name is restored after loading rather than left
 # registered for the rest of the session.
 ms = private_module("_mutation_sweep", _MOD)
 
+# GIT_* is dropped for the fixture's own git calls for the same reason the
+# harness drops it: run from inside a git hook, GIT_DIR would aim them at the
+# hook's repository.
+_GIT_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+         "-c", "commit.gpgsign=false", *args],
+        capture_output=True, text=True, check=True, env=_GIT_ENV,
+    ).stdout
+
+
+def _commit_all(repo: Path) -> None:
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "fixture")
+
+
+def _worktrees(repo: Path) -> list[str]:
+    """Registered worktrees, INCLUDING prunable ones whose directory is gone."""
+    out = _git(repo, "worktree", "list", "--porcelain")
+    return [ln.split(" ", 1)[1] for ln in out.splitlines() if ln.startswith("worktree ")]
+
 
 @pytest.fixture(autouse=True)
 def _private_home(tmp_path_factory, monkeypatch):
-    """Keep the sweep's snapshot directories out of the real ``~/tmp``.
+    """Keep the sweep's copies out of the real ``~/tmp``.
 
-    `sweep` puts snapshots under ``Path.home() / "tmp"`` and deliberately KEEPS
-    them on a crash or a CONFLICT -- which several tests here provoke on
-    purpose. Without this, every run of this file left a dozen recovery
-    directories in the developer's real home.
+    `sweep` puts its copy under ``Path.home() / "tmp"`` by default. With HOME
+    private, "the copy was removed" is checkable as "that directory is empty".
     """
     monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
 
 
+def _copies_left() -> list[Path]:
+    root = Path.home() / "tmp"
+    return sorted(root.iterdir()) if root.exists() else []
+
+
 @pytest.fixture
 def project(tmp_path):
-    """A miniature project: one guard, one test that pins it."""
+    """A miniature COMMITTED project: one guard, one test that pins it."""
     src = tmp_path / "guard.py"
     src.write_text(
         textwrap.dedent(
@@ -71,6 +103,8 @@ def project(tmp_path):
         + "\n",
         encoding="utf-8",
     )
+    _git(tmp_path, "init", "-q")
+    _commit_all(tmp_path)
     return tmp_path
 
 
@@ -90,8 +124,23 @@ def _case(project, **kw):
 
 def _sweep(project, cases, **kw):
     kw.setdefault("check_baseline", False)  # most cases here mutate on purpose
-    return ms.sweep(cases, cwd=project, python=sys.executable,
-                    env={"PYTHONPATH": str(project)}, timeout=120, **kw)
+    return ms.sweep(cases, repo=project, python=sys.executable, timeout=120, **kw)
+
+
+def _around_child(monkeypatch, before=None, after=None):
+    """Run ``before(cwd)`` / ``after(cwd)`` around every pytest child the sweep
+    starts. ``cwd`` is where the child runs -- the COPY."""
+    real = ms._pytest
+
+    def run(cmd, *, cwd, env, timeout):
+        if before:
+            before(Path(cwd))
+        proc = real(cmd, cwd=cwd, env=env, timeout=timeout)
+        if after:
+            after(Path(cwd))
+        return proc
+
+    monkeypatch.setattr(ms, "_pytest", run)
 
 
 # --------------------------------------------------------------------------
@@ -113,7 +162,7 @@ def test_a_mutation_no_test_notices_is_reported_as_SURVIVED(project):
 
 
 # --------------------------------------------------------------------------
-# THE FILE MUST COME BACK. This is the half that can destroy work.
+# THE CALLER'S TREE IS NEVER WRITTEN. The sweep runs in an isolated copy.
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
@@ -129,67 +178,330 @@ def test_a_mutation_no_test_notices_is_reported_as_SURVIVED(project):
 )
 def test_the_target_is_byte_identical_afterwards(project, case_kw):
     """Whatever the outcome -- including the abort paths, and including the
-    SURVIVED path where the expected exit code is zero and a trailing restore
-    would still have run. The restore is in a `finally` precisely because the
-    GOOD outcome here is a nonzero exit."""
+    SURVIVED path where the expected exit code is zero."""
     target = project / "guard.py"
     before = target.read_bytes()
     _sweep(project, [_case(project, **case_kw)])
     assert target.read_bytes() == before
 
 
-def test_a_crash_mid_sweep_still_restores(project, monkeypatch):
+def test_the_child_imports_the_COPY_and_the_shared_file_is_never_written(
+    project, monkeypatch, tmp_path_factory
+):
+    """THE property the redesign exists for, observed from both sides.
+
+    From inside the child: the module the test imported lives in the copy, not
+    in the caller's tree. From outside: while the child ran, the caller's file
+    still held its original bytes. Together they mean the BIT below can only
+    have come from the copy -- the shared file was never mutated, so a child
+    importing it would have reported SURVIVED.
+    """
+    record = tmp_path_factory.mktemp("rec") / "imported-from"
+    (project / "test_where.py").write_text(
+        "import os, guard\n"
+        "def test_blocks_danger():\n"
+        "    with open(os.environ['RECORD'], 'a') as fh:\n"
+        "        fh.write(guard.__file__ + '\\n')\n"
+        "    assert guard.is_allowed('dangerous') is False\n",
+        encoding="utf-8",
+    )
     target = project / "guard.py"
     before = target.read_bytes()
+    seen = []
+    _around_child(monkeypatch, before=lambda cwd: seen.append(target.read_bytes()))
+    case = _case(project, test="test_where.py::test_blocks_danger",
+                 env={"RECORD": str(record)})
+    result = _sweep(project, [case])
+    assert seen == [before], "the caller's file was written while the child ran"
+    imported = record.read_text(encoding="utf-8").split()
+    assert imported and all(not Path(p).is_relative_to(project) for p in imported), imported
+    assert all(Path(p).is_relative_to(Path.home() / "tmp") for p in imported), imported
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
 
+
+@pytest.mark.parametrize("when", ["during-validation", "during-the-test-run"])
+def test_a_concurrent_edit_to_the_shared_target_is_untouched_and_the_verdict_stands(
+    project, monkeypatch, when
+):
+    """A peer editing the caller's file mid-case used to be the hard case: a
+    window between the drift check and the write was narrowed and never
+    closed, and a conflict left the verdict untrustworthy. With nothing written
+    to the caller's tree there is no window: the edit stands, and the verdict is
+    about the copy, which nobody else can touch."""
+    target = project / "guard.py"
+    peer = "# a peer session edited this\n"
+
+    def edit(*_):
+        target.write_text(peer, encoding="utf-8")
+
+    if when == "during-validation":
+        real_validate = ms._validate
+        monkeypatch.setattr(ms, "_validate",
+                            lambda case, text: (edit(), real_validate(case, text))[1])
+    else:
+        _around_child(monkeypatch, before=edit)
+    result = _sweep(project, [_case(project)])
+    assert target.read_text(encoding="utf-8") == peer
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
+    assert result.clean
+
+
+def test_the_copy_is_registered_while_it_runs_and_gone_afterwards(project, monkeypatch):
+    seen = {}
+
+    def look(cwd):
+        seen["cwd"] = cwd
+        seen["worktrees"] = _worktrees(project)
+
+    _around_child(monkeypatch, before=look)
+    _sweep(project, [_case(project)])
+    assert seen["cwd"] != project and not seen["cwd"].is_relative_to(project)
+    assert len(seen["worktrees"]) == 2, seen["worktrees"]
+    assert not seen["cwd"].exists(), "the copy was left on disk"
+    assert _worktrees(project) == [str(project)], "the copy is still registered"
+    assert _copies_left() == []
+
+
+def test_a_crash_still_removes_the_copy_and_its_registration(project, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("injected")
 
-    monkeypatch.setattr(ms.subprocess, "run", boom)
-    with pytest.raises(RuntimeError):
+    monkeypatch.setattr(ms, "_pytest", boom)
+    target = project / "guard.py"
+    before = target.read_bytes()
+    with pytest.raises(RuntimeError, match="injected"):
         _sweep(project, [_case(project)])
-    assert target.read_bytes() == before, "a crash must not leave the file mutated"
+    assert target.read_bytes() == before
+    assert _worktrees(project) == [str(project)]
+    assert _copies_left() == []
 
 
-def test_a_concurrent_edit_is_PRESERVED_not_overwritten(project, monkeypatch):
-    """THE 6-of-15 CASE. If the file changes while the test runs, that is someone
-    else's uncommitted work. Restoring the snapshot over it would destroy the
-    edit -- and a final hash check would happily confirm the overwrite
-    succeeded."""
-    target = project / "guard.py"
-    real_run = ms.subprocess.run
+def test_a_copy_its_test_destroyed_is_still_unregistered(project, monkeypatch):
+    """`git worktree remove` refuses a path that is no longer a working tree
+    (MEASURED: "is not a working tree", registration left behind as prunable),
+    so the harness removes the registration it recorded at creation."""
+    import shutil as _shutil
 
-    def edit_then_run(*a, **k):
-        target.write_text("# a peer session edited this\n", encoding="utf-8")
-        return real_run(*a, **k)
+    _around_child(monkeypatch, after=lambda cwd: _shutil.rmtree(cwd))
+    _sweep(project, [_case(project)])
+    assert _worktrees(project) == [str(project)]
+    assert _copies_left() == []
 
-    monkeypatch.setattr(ms.subprocess, "run", edit_then_run)
+
+def test_the_copy_matches_the_callers_working_tree_not_just_HEAD(project, monkeypatch):
+    """The caller is testing what is ON DISK: a modified tracked file, a new
+    untracked one, a deleted one, and a change hidden behind assume-unchanged
+    (which `git diff` does not report) must all be what the copy holds."""
+    (project / "obsolete.txt").write_text("old\n", encoding="utf-8")
+    (project / "flag.txt").write_text("old\n", encoding="utf-8")
+    (project / "swap").write_text("a file at HEAD\n", encoding="utf-8")
+    _commit_all(project)
+    _git(project, "update-index", "--assume-unchanged", "flag.txt")
+    (project / "flag.txt").write_text("new\n", encoding="utf-8")
+    (project / "obsolete.txt").unlink()
+    # A TYPE change: the tracked file is now a directory holding a new file.
+    (project / "swap").unlink()
+    (project / "swap").mkdir()
+    (project / "swap" / "inner.txt").write_text("inner\n", encoding="utf-8")
+    (project / "extra.txt").write_text("untracked\n", encoding="utf-8")
+    with (project / "guard.py").open("a", encoding="utf-8") as fh:
+        fh.write("# local edit\n")
+    (project / "test_tree.py").write_text(
+        "from pathlib import Path\nimport guard\n"
+        "def test_tree():\n"
+        "    assert Path('extra.txt').read_text() == 'untracked\\n'\n"
+        "    assert not Path('obsolete.txt').exists()\n"
+        "    assert Path('flag.txt').read_text() == 'new\\n'\n"
+        "    assert Path('swap/inner.txt').read_text() == 'inner\\n'\n"
+        "    assert '# local edit' in Path(guard.__file__).read_text()\n"
+        "    assert guard.is_allowed('dangerous') is False\n",
+        encoding="utf-8",
+    )
+    cwds = []
+    _around_child(monkeypatch, before=cwds.append)
+    # The BASELINE is what proves the tree assertions held in the copy; the
+    # mutation run alone could not tell a tree mismatch from a catch.
+    result = _sweep(project, [_case(project, test="test_tree.py::test_tree")],
+                    check_baseline=True)
+    assert cwds and all(not c.is_relative_to(project) for c in cwds), cwds
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
+
+
+def test_an_inherited_GIT_DIR_does_not_redirect_the_copy(project, monkeypatch, tmp_path_factory):
+    """Run from a git hook, GIT_DIR names the hook's repository; honouring it
+    would copy THAT tree, where the target does not exist."""
+    other = tmp_path_factory.mktemp("other")
+    (other / "README").write_text("x\n", encoding="utf-8")
+    _git(other, "init", "-q")
+    _commit_all(other)
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    seen = {}
+    # WHERE the copy is registered is the observable: the overlay rebuilds the
+    # caller's files onto any checkout, so a copy of the wrong repository can
+    # still bite -- while its registration, cleanup and ignored files belong to
+    # a repository the caller never named. (`_git` here scrubs GIT_* itself.)
+    _around_child(monkeypatch, before=lambda cwd: seen.update(
+        mine=_worktrees(project), theirs=_worktrees(other)))
     result = _sweep(project, [_case(project)])
-    assert target.read_text(encoding="utf-8") == "# a peer session edited this\n"
-    # And it must SAY SO. Asserting only the preservation locked in the silent
-    # half: CONFLICT was defined, rendered and never produced, so a verdict
-    # computed against a file that changed mid-flight was returned as though it
-    # were trustworthy -- invisible whenever no later case touches that path.
-    assert result.results[0].outcome == ms.CONFLICT
-    assert not result.clean
+    assert len(seen["mine"]) == 2 and seen["theirs"] == [str(other)], seen
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
 
 
-def test_the_next_case_aborts_after_a_drift(project, monkeypatch):
-    """And the drift must be REPORTED, not silently absorbed."""
-    target = project / "guard.py"
-    real_run = ms.subprocess.run
+def test_the_copy_goes_under_the_callers_tmp_root(project, monkeypatch, tmp_path_factory):
+    root = tmp_path_factory.mktemp("big-disk")
+    cwds = []
+    _around_child(monkeypatch, before=cwds.append)
+    _sweep(project, [_case(project)], tmp_root=root)
+    assert cwds and all(c.is_relative_to(root) for c in cwds), cwds
+    assert list(root.iterdir()) == []
+
+
+def test_a_tmp_root_inside_the_repository_is_refused(project):
+    """The copy would be written INTO the caller's tree -- the one thing the
+    sweep promises never to do."""
+    before = sorted(p.name for p in project.iterdir())
+    with pytest.raises(ValueError, match="inside the repository"):
+        _sweep(project, [_case(project)], tmp_root=project / "scratch")
+    assert sorted(p.name for p in project.iterdir()) == before
+
+
+def test_a_tree_that_is_not_a_git_work_tree_is_refused(tmp_path):
+    (tmp_path / "guard.py").write_text("x = 1\n", encoding="utf-8")
+    case = ms.Case(label="l", path=tmp_path / "guard.py", anchor="x = 1",
+                   replacement="x = 2", test="t.py", why="w", validator="python")
+    with pytest.raises(RuntimeError, match="git work tree"):
+        ms.sweep([case], repo=tmp_path, python=sys.executable, timeout=60)
+
+
+@pytest.mark.parametrize("scope", ["sweep", "case"])
+def test_an_env_pointing_into_the_shared_tree_is_refused(project, scope):
+    """A child pointed back at the caller's tree would import the UNMUTATED file
+    and report SURVIVED. The copy's import roots are named repo-relative."""
+    env = {"PYTHONPATH": str(project / "src")}
+    case = _case(project, env=env if scope == "case" else {})
+    with pytest.raises(ValueError, match="isolated copy"):
+        _sweep(project, [case], env=env if scope == "sweep" else None)
+
+
+def test_a_target_whose_directory_resolves_outside_the_repository_is_refused(
+    project, tmp_path_factory
+):
+    outside = tmp_path_factory.mktemp("outside")
+    victim = outside / "guard.py"
+    victim.write_bytes((project / "guard.py").read_bytes())
+    (project / "linked").symlink_to(outside, target_is_directory=True)
+    _commit_all(project)
+    with pytest.raises(ValueError, match="outside"):
+        _sweep(project, [_case(project, path=project / "linked" / "guard.py")])
+    assert victim.read_bytes() == (project / "guard.py").read_bytes()
+
+
+# --------------------------------------------------------------------------
+# BETWEEN CASES THE COPY IS RESET, whatever the last test did to it.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "damage", ["deleted", "directory", "symlink-to-outside", "hardlink-to-outside"])
+def test_the_reset_undoes_what_a_test_did_to_the_target(
+    project, monkeypatch, tmp_path_factory, damage
+):
+    """The next case must see the pristine file, and no reset may write
+    THROUGH what the test left: a symlink or a hard link to a file outside the
+    copy would otherwise carry the write out of it."""
+    import os as _os
+    import stat as _stat
+
+    _os.chmod(project / "guard.py", 0o755)  # a mode the reset must keep
+    victim = tmp_path_factory.mktemp("outside") / "victim.py"
+    victim.write_text("victim\n", encoding="utf-8")
+    calls = {"n": 0}
+    modes = []
+
+    def wreck(cwd):
+        calls["n"] += 1
+        target = cwd / "guard.py"
+        modes.append(_stat.S_IMODE(target.lstat().st_mode))
+        if calls["n"] > 1:
+            return
+        target.unlink()
+        if damage == "directory":
+            target.mkdir()
+        elif damage == "symlink-to-outside":
+            target.symlink_to(victim)
+        elif damage == "hardlink-to-outside":
+            target.hardlink_to(victim)
+
+    _around_child(monkeypatch, after=wreck)
+    result = _sweep(project, [_case(project, label="first"), _case(project, label="second")])
+    assert victim.read_text(encoding="utf-8") == "victim\n", "a reset wrote outside the copy"
+    assert [r.outcome for r in result.results] == [ms.BIT, ms.BIT], [
+        r.detail for r in result.results]
+    assert modes == [0o755, 0o755], "the mutation was written at the wrong mode"
+
+
+def test_damage_done_by_the_baseline_run_is_undone_before_the_case(project, monkeypatch):
+    """A baseline test (or its fixture) that deletes the target used to leave
+    the shared file gone. In the copy, the case writes its mutation over
+    whatever is there."""
     calls = {"n": 0}
 
-    def edit_on_first(*a, **k):
+    def delete_after_baseline(cwd):
         calls["n"] += 1
         if calls["n"] == 1:
-            target.write_text("# peer edit\n", encoding="utf-8")
-        return real_run(*a, **k)
+            (cwd / "guard.py").unlink()
 
-    monkeypatch.setattr(ms.subprocess, "run", edit_on_first)
+    _around_child(monkeypatch, after=delete_after_baseline)
+    result = _sweep(project, [_case(project)], check_baseline=True)
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
+    assert (project / "guard.py").exists()
+
+
+def test_a_failed_mutation_write_aborts_and_the_next_case_still_runs(project, monkeypatch):
+    import errno
+
+    real_put = ms._put
+    calls = {"n": 0}
+
+    def fail_first(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_put(*a, **k)
+
+    monkeypatch.setattr(ms, "_put", fail_first)
     result = _sweep(project, [_case(project, label="first"), _case(project, label="second")])
+    assert result.results[0].outcome == ms.ABORTED
+    assert "could not write the mutation" in result.results[0].detail
+    assert result.results[1].outcome == ms.BIT, result.results[1].detail
+
+
+def test_a_reset_that_cannot_be_verified_aborts_every_later_case(project, monkeypatch):
+    """A copy that is no longer pristine makes every later verdict suspect --
+    the next case's test may import the half-reset file."""
+    real_put = ms._put
+    calls = {"n": 0}
+
+    def fail_reset(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:   # 1 = first mutation, 2 = its reset
+            raise OSError("injected reset failure")
+        return real_put(*a, **k)
+
+    monkeypatch.setattr(ms, "_put", fail_reset)
+    result = _sweep(project, [_case(project, label="first"), _case(project, label="second")])
+    assert result.results[0].outcome == ms.BIT
     assert result.results[1].outcome == ms.ABORTED
-    assert "differs from the sweep baseline" in result.results[1].detail
+    assert "pristine" in result.results[1].detail
+
+
+def test_a_hard_linked_shared_target_is_swept_and_its_other_link_untouched(project):
+    """Refused while the harness wrote the caller's inode. A copy has its own."""
+    alias = project / "guard_alias.py"
+    alias.hardlink_to(project / "guard.py")
+    before = alias.read_bytes()
+    result = _sweep(project, [_case(project)])
+    assert alias.read_bytes() == before
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
 
 
 # --------------------------------------------------------------------------
@@ -348,7 +660,7 @@ def test_the_summary_parser_reads_exact_outcome_keywords(stdout, counts):
 ])
 def test_the_mutation_run_verdict_table(project, monkeypatch, rc, stdout, outcome,
                                         detail):
-    monkeypatch.setattr(ms.subprocess, "run", lambda *a, **k: _Ran(rc, stdout))
+    monkeypatch.setattr(ms, "_pytest", lambda *a, **k: _Ran(rc, stdout))
     result = _sweep(project, [_case(project)]).results[0]
     assert result.outcome == outcome, result.detail
     assert detail in result.detail
@@ -384,7 +696,7 @@ def test_the_mutation_run_verdict_table(project, monkeypatch, rc, stdout, outcom
     (0, "", "no readable pytest summary"),
 ])
 def test_the_baseline_verdict_table(project, monkeypatch, rc, stdout, problem):
-    monkeypatch.setattr(ms, "_baseline_run", lambda *a, **k: _Ran(rc, stdout))
+    monkeypatch.setattr(ms, "_pytest", lambda *a, **k: _Ran(rc, stdout))
     got = ms.assert_green_baseline([_case(project)], cwd=project,
                                    python=sys.executable, env=None, timeout=1)
     if problem is None:
@@ -435,10 +747,6 @@ def test_a_strict_xfail_target_ABORTS_the_sweep_rather_than_scoring_BIT(
     assert "xfailed" in out, out
     assert (project / "guard.py").read_bytes() == before
 
-
-# --------------------------------------------------------------------------
-# THE CONTRACT.
-# --------------------------------------------------------------------------
 
 # --------------------------------------------------------------------------
 # REQUIREMENTS CONTRIBUTED BY THE SESSION THAT WROTE 5 OF THE 15 HARNESSES.
@@ -503,17 +811,11 @@ def test_a_multi_edit_case_applies_all_edits_together(project, monkeypatch):
         test="test_guard.py::test_blocks_danger", why="w", validator="python",
     )
     seen = {}
-    real_run = ms.subprocess.run
-
-    def capture(*a, **k):
-        seen["text"] = (project / "guard.py").read_text(encoding="utf-8")
-        return real_run(*a, **k)
-
-    monkeypatch.setattr(ms.subprocess, "run", capture)
+    _around_child(monkeypatch, before=lambda cwd: seen.setdefault(
+        "text", (cwd / "guard.py").read_text(encoding="utf-8")))
     result = _sweep(project, [case])
-    # The MUTATED text is what proves both edits landed. Asserting only that
-    # "# touched" is absent afterwards tests the RESTORE, and stays true whether
-    # or not edit 2 ever applied -- edit 1 bites on its own.
+    # The MUTATED text, read where the child runs, is what proves both edits
+    # landed. Edit 1 bites on its own, so the verdict alone cannot.
     assert "if False:" in seen["text"]
     assert "# touched" in seen["text"]
     assert result.results[0].outcome == ms.BIT
@@ -528,14 +830,12 @@ def test_a_RED_baseline_refuses_to_sweep(project):
         "def test_blocks_danger():\n    assert False\n", encoding="utf-8"
     )
     with pytest.raises(RuntimeError, match="baseline is RED"):
-        ms.sweep([_case(project)], cwd=project, python=sys.executable,
-                 env={"PYTHONPATH": str(project)}, timeout=120, check_baseline=True)
+        _sweep(project, [_case(project)], check_baseline=True)
+    assert _copies_left() == [], "a refused sweep left its copy behind"
 
 
 def test_a_green_baseline_lets_the_sweep_proceed(project):
-    result = ms.sweep([_case(project)], cwd=project, python=sys.executable,
-                      env={"PYTHONPATH": str(project)}, timeout=120,
-                      check_baseline=True)
+    result = _sweep(project, [_case(project)], check_baseline=True)
     assert result.clean
 
 
@@ -677,49 +977,9 @@ def test_only_pytest_exit_0_and_1_mean_the_tests_ran(project, monkeypatch, rc, e
         stdout = "1 failed in 0.10s" if rc == 1 else "1 passed in 0.10s"
         stderr = ""
 
-    monkeypatch.setattr(ms.subprocess, "run", lambda *a, **k: Fake())
+    monkeypatch.setattr(ms, "_pytest", lambda *a, **k: Fake())
     result = _sweep(project, [_case(project)])
     assert result.results[0].outcome == expected
-
-
-# --------------------------------------------------------------------------
-# THE DATA-LOSS PATH.
-# --------------------------------------------------------------------------
-
-def test_a_child_that_DELETES_the_target_does_not_lose_it(project, monkeypatch):
-    """`_sha` raises on a missing file. In the restore `finally` that exception
-    escaped into `sweep`, whose cleanup then deleted the snapshot -- the only
-    remaining copy. MEASURED: FileNotFoundError, target absent, zero surviving
-    snapshots. Unrecoverable loss, in the tool sold on never damaging work."""
-    target = project / "guard.py"
-    before = target.read_bytes()
-    real_run = ms.subprocess.run
-
-    def delete_then_run(*a, **k):
-        target.unlink()
-        return real_run(*a, **k)
-
-    import os as _os
-    import stat as _stat
-    _os.chmod(target, 0o755)
-    mode_before = _stat.S_IMODE(target.stat().st_mode)
-
-    monkeypatch.setattr(ms.subprocess, "run", delete_then_run)
-    _sweep(project, [_case(project)])
-    assert target.exists(), "the target was destroyed"
-    assert target.read_bytes() == before
-    # AND its mode. `write_bytes` on a deleted file recreates it at the default
-    # creation mode -- MEASURED 0o755 -> 0o644 -- so a restored hook script would
-    # come back unrunnable. A quieter version of the same damage.
-    assert _stat.S_IMODE(target.stat().st_mode) == mode_before
-
-
-def test_baselines_are_PRESERVED_when_the_sweep_dies(project, monkeypatch, capsys):
-    """An abnormal exit is exactly when the snapshots are worth keeping."""
-    monkeypatch.setattr(ms, "run_case", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
-    with pytest.raises(RuntimeError):
-        _sweep(project, [_case(project)])
-    assert "baselines PRESERVED" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------
@@ -737,9 +997,7 @@ def test_the_green_baseline_uses_the_cases_own_env(project):
     case = _case(project, test="test_env.py::test_flag", env={"EXTRA": "1"},
                  why="the baseline must see the case's env")
     # check_baseline=True must NOT raise: the case's env makes its test green.
-    result = ms.sweep([case], cwd=project, python=sys.executable,
-                      env={"PYTHONPATH": str(project)}, timeout=120,
-                      check_baseline=True)
+    result = _sweep(project, [case], check_baseline=True)
     assert result.results[0].outcome == ms.SURVIVED
 
 
@@ -781,32 +1039,10 @@ def test_a_gated_case_does_not_kill_the_whole_sweep(project):
     gated = _case(project, label="needs an engine", requires=("an-engine",),
                   test="test_guard.py::test_missing_entirely")
     ordinary = _case(project, label="ordinary")
-    result = ms.sweep([gated, ordinary], cwd=project, python=sys.executable,
-                      env={"PYTHONPATH": str(project)}, timeout=120,
-                      check_baseline=True, available=set())
+    result = _sweep(project, [gated, ordinary], check_baseline=True, available=set())
     outcomes = {r.case.label: r.outcome for r in result.results}
     assert outcomes["needs an engine"] == ms.ABORTED
     assert outcomes["ordinary"] == ms.BIT, "the ungated case must still have run"
-
-
-def test_a_peer_edit_between_the_drift_check_and_the_write_is_not_clobbered(project, monkeypatch):
-    """TOCTOU. The drift check runs BEFORE the validator (and, for a `bash`
-    validator, before an out-of-process `bash -n`). A peer edit landing in that
-    window was overwritten by the mutation and then "restored" to the baseline --
-    silently destroying their work, which is the one thing guarantee (6) exists
-    to prevent. Re-checked immediately before the write."""
-    target = project / "guard.py"
-    real_validate = ms._validate
-
-    def edit_during_validation(case, text):
-        target.write_text("# a peer edited during validation\n", encoding="utf-8")
-        return real_validate(case, text)
-
-    monkeypatch.setattr(ms, "_validate", edit_during_validation)
-    result = _sweep(project, [_case(project)])
-    assert target.read_text(encoding="utf-8") == "# a peer edited during validation\n"
-    assert result.results[0].outcome == ms.CONFLICT
-    assert not result.clean
 
 
 def test_a_baseline_timeout_is_a_rendered_problem_not_a_traceback(project, monkeypatch):
@@ -815,10 +1051,9 @@ def test_a_baseline_timeout_is_a_rendered_problem_not_a_traceback(project, monke
     def boom(*a, **k):
         raise subprocess.TimeoutExpired(cmd="pytest", timeout=1)
 
-    monkeypatch.setattr(ms, "_baseline_run", boom)
+    monkeypatch.setattr(ms, "_pytest", boom)
     with pytest.raises(RuntimeError, match="timed out"):
-        ms.sweep([_case(project)], cwd=project, python=sys.executable,
-                 env={"PYTHONPATH": str(project)}, timeout=1, check_baseline=True)
+        _sweep(project, [_case(project)], check_baseline=True)
 
 
 def test_the_anti_deadlock_lever_survives_the_allowlist(monkeypatch):
@@ -830,10 +1065,6 @@ def test_the_anti_deadlock_lever_survives_the_allowlist(monkeypatch):
     monkeypatch.setenv("GENESIS_PYTEST_LOCK_HELD", "1")
     assert ms._child_env({})["GENESIS_PYTEST_LOCK_HELD"] == "1"
 
-
-# --------------------------------------------------------------------------
-# THREE P1s: a fixture error scoring as caught, and two ways to corrupt source.
-# --------------------------------------------------------------------------
 
 def test_a_fixture_error_is_an_ABORT_not_a_BIT(project, monkeypatch):
     """rc=1 with "1 error" is a setup failure, not a caught mutation.
@@ -848,18 +1079,17 @@ def test_a_fixture_error_is_an_ABORT_not_a_BIT(project, monkeypatch):
         stdout = "1 error in 0.24s"
         stderr = ""
 
-    monkeypatch.setattr(ms.subprocess, "run", lambda *a, **k: Fake())
+    monkeypatch.setattr(ms, "_pytest", lambda *a, **k: Fake())
     result = _sweep(project, [_case(project)])
     assert result.results[0].outcome == ms.ABORTED
     assert not result.clean
 
 
 def test_a_symlink_target_is_REFUSED(project):
-    """Mutating a symlink writes THROUGH to the referent, and the restore cannot
-    put the link back — MEASURED: the referent stays mutated permanently while
-    the case reports BIT. Refused rather than handled, because the correct
-    semantics (restore the link? the referent? one outside the repo?) are
-    genuinely ambiguous and a mutation harness must not guess."""
+    """Mutating a symlink writes THROUGH to the referent -- which may sit
+    outside the copy, in the caller's tree. Refused rather than handled, because
+    the correct semantics (the link? the referent?) are genuinely ambiguous and
+    a mutation harness must not guess."""
     real = project / "guard.py"
     link = project / "guard_link.py"
     link.symlink_to(real)
@@ -872,184 +1102,10 @@ def test_a_symlink_target_is_REFUSED(project):
     assert link.is_symlink(), "the link was replaced by a regular file"
 
 
-def test_a_baseline_that_DELETES_the_target_is_caught_with_a_copy_surviving(
-    project, monkeypatch, capsys
-):
-    """The snapshot used to be taken AFTER the baseline ran, so a baseline test
-    (or a fixture) that deleted a target left no recovery copy anywhere — a
-    permanently missing file, before a single mutation was written."""
-    target = project / "guard.py"
-    real_run = ms.subprocess.run
-
-    def delete_during_baseline(*a, **k):
-        if target.exists():
-            target.unlink()
-        return real_run(*a, **k)
-
-    monkeypatch.setattr(ms.subprocess, "run", delete_during_baseline)
-    with pytest.raises(RuntimeError, match="DELETED before any mutation"):
-        ms.sweep([_case(project)], cwd=project, python=sys.executable,
-                 env={"PYTHONPATH": str(project)}, timeout=120, check_baseline=True)
-    err = capsys.readouterr().err
-    assert "baselines PRESERVED" in err, "no recovery copy was reported"
-    snap_dir = err.split("baselines PRESERVED for recovery:")[1].strip().split()[0]
-    assert (Path(snap_dir)).exists(), "the recovery copy was deleted anyway"
-
-
-def test_a_baseline_that_MODIFIES_the_target_refuses_to_mutate(project, monkeypatch):
-    """Mutating a file that no longer matches what it was baselined against makes
-    every verdict from it meaningless."""
-    target = project / "guard.py"
-    real_run = ms.subprocess.run
-
-    def edit_during_baseline(*a, **k):
-        target.write_text("# a fixture rewrote this\n", encoding="utf-8")
-        return real_run(*a, **k)
-
-    monkeypatch.setattr(ms.subprocess, "run", edit_during_baseline)
-    with pytest.raises(RuntimeError, match="MODIFIED before any mutation"):
-        ms.sweep([_case(project)], cwd=project, python=sys.executable,
-                 env={"PYTHONPATH": str(project)}, timeout=120, check_baseline=True)
-
-
-# --------------------------------------------------------------------------
-# THE FILE'S IDENTITY. Every finding in the third review round sat on one seam:
-# the harness identified "the file" by a flattened path string (the snapshot
-# name) and its content hash (drift and restore checks), wrote the mutation
-# outside the scope that restores it, and restored by copying bytes onto a
-# pathname. A file is more than that -- a type, a mode, an inode, a link count --
-# and each of these tests is one way the narrower identity damaged it.
-# --------------------------------------------------------------------------
-
-def test_a_failed_mutation_write_leaves_the_source_intact(project, monkeypatch):
-    """A write that fails part-way (disk full, a file-size limit) used to sit
-    BEFORE the restoring `finally`: the in-place write had already truncated the
-    source, the exception escaped, and nothing put it back. Reproduced with a
-    real EFBIG from RLIMIT_FSIZE rather than a mocked write, so the test does not
-    depend on which write primitive the harness uses."""
-    import resource
-    import signal
-
-    target = project / "guard.py"
-    before = target.read_bytes()
-    snap = project.parent / "guard.snapshot"
-    snap.write_bytes(before)
-
-    soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
-    old_handler = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
-    real_validate = ms._validate
-
-    def limit_then_validate(case, text):
-        # Armed immediately before the write, after every read the case does.
-        resource.setrlimit(resource.RLIMIT_FSIZE, (16, hard))
-        return real_validate(case, text)
-
-    monkeypatch.setattr(ms, "_validate", limit_then_validate)
-    try:
-        result = ms.run_case(_case(project), snap, cwd=project,
-                             python=sys.executable, timeout=120)
-    finally:
-        resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
-        signal.signal(signal.SIGXFSZ, old_handler)
-    assert target.read_bytes() == before, "a failed write left the source damaged"
-    assert result.outcome == ms.ABORTED
-    assert "could not write the mutation" in result.detail
-    assert not [p for p in project.iterdir() if p.name.startswith(".guard.py.")], (
-        "the staging file of a failed write was left behind"
-    )
-
-
-def test_a_hard_linked_target_is_REFUSED(project, monkeypatch):
-    """A second hard link shares the inode the mutation writes. If the child then
-    deletes THIS pathname, the restore recreates only this name and the other
-    link stays mutated permanently while the case reports BIT."""
-    target = project / "guard.py"
-    alias = project / "guard_alias.py"
-    alias.hardlink_to(target)
-    before = target.read_bytes()
-    real_run = ms.subprocess.run
-
-    def delete_then_run(*a, **k):
-        if target.exists():
-            target.unlink()
-        return real_run(*a, **k)
-
-    monkeypatch.setattr(ms.subprocess, "run", delete_then_run)
-    result = _sweep(project, [_case(project)])
-    # The damage first, so a RED names it rather than a message mismatch.
-    assert alias.read_bytes() == before, "the other link was left mutated"
-    assert target.read_bytes() == before
-    assert result.results[0].outcome == ms.ABORTED
-    assert "HARD-LINKED" in result.results[0].detail
-
-
-def test_a_target_replaced_by_a_DIRECTORY_is_a_conflict_and_keeps_the_snapshot(
-    project, monkeypatch, capsys
-):
-    """`copy2(snapshot, target)` onto a directory writes the snapshot INSIDE it:
-    the source stays unusable, the case reports its verdict as though the restore
-    worked, and the completed sweep deletes the only copy."""
-    target = project / "guard.py"
-    before = target.read_bytes()
-    real_run = ms.subprocess.run
-
-    def replace_with_dir(*a, **k):
-        proc = real_run(*a, **k)
-        target.unlink()
-        target.mkdir()
-        return proc
-
-    monkeypatch.setattr(ms.subprocess, "run", replace_with_dir)
-    result = _sweep(project, [_case(project)])
-    assert result.results[0].outcome == ms.CONFLICT
-    assert list(target.iterdir()) == [], "the restore wrote into the directory"
-    err = capsys.readouterr().err
-    assert "baselines PRESERVED" in err, "the only copy of the source was deleted"
-    snap_dir = Path(err.split("baselines PRESERVED for recovery:")[1].strip().split()[0])
-    assert [p.read_bytes() for p in snap_dir.rglob("guard.py")] == [before]
-
-
-def test_a_mode_only_peer_edit_is_a_CONFLICT_not_overwritten(project, monkeypatch):
-    """The content hash cannot see a chmod. A peer making a hook executable while
-    the test ran was silently reverted by the restore."""
-    import os as _os
-    import stat as _stat
-
-    target = project / "guard.py"
-    _os.chmod(target, 0o644)
-    real_run = ms.subprocess.run
-
-    def chmod_then_run(*a, **k):
-        _os.chmod(target, 0o755)
-        return real_run(*a, **k)
-
-    monkeypatch.setattr(ms.subprocess, "run", chmod_then_run)
-    result = _sweep(project, [_case(project)])
-    assert result.results[0].outcome == ms.CONFLICT
-    assert _stat.S_IMODE(target.stat().st_mode) == 0o755, "the peer's chmod was reverted"
-
-
-def test_a_mode_drift_before_the_case_aborts_it(project):
-    """The drift check has the same blind spot: a mode change after the snapshot
-    was taken is drift, not a file that still matches its baseline."""
-    import os as _os
-    import shutil as _shutil
-
-    target = project / "guard.py"
-    _os.chmod(target, 0o644)
-    snap = project.parent / "guard.snapshot"
-    _shutil.copy2(target, snap)
-    _os.chmod(target, 0o755)
-    result = ms.run_case(_case(project), snap, cwd=project,
-                         python=sys.executable, timeout=120)
-    assert result.outcome == ms.ABORTED
-    assert "differs from the sweep baseline" in result.detail
-
-
-def test_snapshot_names_cannot_collide(project):
-    """`pkg/guard.py` and `pkg__guard.py` flattened to the same snapshot name, so
-    the later copy overwrote the earlier and a valid case aborted against
-    another file's contents."""
+def test_targets_with_colliding_flattened_names_stay_distinct(project):
+    """`pkg/guard.py` and `pkg__guard.py` once flattened to one snapshot name,
+    so a valid case ran against another file's contents. Pristine content is
+    keyed by the real relative path."""
     pkg = project / "pkg"
     pkg.mkdir()
     (pkg / "guard.py").write_text(
@@ -1072,18 +1128,19 @@ def test_snapshot_names_cannot_collide(project):
         r.detail for r in result.results]
 
 
-def test_a_deep_target_path_does_not_overflow_the_snapshot_name(project):
-    """The whole absolute path was flattened into ONE filename, which overflows
-    the single-component limit long before the path limit."""
+def test_a_deep_target_path_is_swept(project):
+    """Six 50-character directories: the copy adds its own prefix on top, and
+    nothing on the path may flatten the whole thing into one filename."""
     deep = project
     for i in range(6):
         deep = deep / (f"d{i}" * 25)
     deep.mkdir(parents=True)
     target = deep / "guard.py"
     target.write_bytes((project / "guard.py").read_bytes())
+    rel = target.relative_to(project).as_posix()
     (project / "test_deep.py").write_text(
         "import importlib.util, pathlib\n"
-        f"P = pathlib.Path({str(target)!r})\n"
+        f"P = pathlib.Path(__file__).parent / {rel!r}\n"
         "def test_blocks():\n"
         "    spec = importlib.util.spec_from_file_location('deep_guard', P)\n"
         "    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
@@ -1094,7 +1151,7 @@ def test_a_deep_target_path_does_not_overflow_the_snapshot_name(project):
 
 
 # --------------------------------------------------------------------------
-# THE TEST MUST RUN AGAINST THE MUTATED COPY.
+# THE TEST MUST RUN AGAINST THE MUTATED FILE.
 # --------------------------------------------------------------------------
 
 def test_a_stale_bytecode_cache_cannot_mask_the_mutation(project, monkeypatch):
@@ -1102,23 +1159,23 @@ def test_a_stale_bytecode_cache_cannot_mask_the_mutation(project, monkeypatch):
     timestamp-valid .pyc for the baseline, plus a same-length mutation written
     inside the source's recorded mtime second, makes the child import the
     BASELINE code -- a real catch reported as SURVIVED. The same-second window
-    is made deterministic by putting the original mtime back before the run."""
+    is made deterministic by putting the recorded mtime back on the copy's file
+    before the run (the untracked .pyc is carried into the copy with it)."""
     import os as _os
     import py_compile
 
     target = project / "guard.py"
     # TIMESTAMP explicitly: under SOURCE_DATE_EPOCH py_compile defaults to a
     # checked-hash pyc, which is never stale and would make this test vacuous.
-    py_compile.compile(str(target), doraise=True,
+    # `cfile` explicitly: py_compile honours sys.pycache_prefix, so under an
+    # inherited PYTHONPYCACHEPREFIX (MEASURED: a sweep's own child env) the pyc
+    # went to the prefix instead of the tree, and this test passed vacuously.
+    cfile = project / "__pycache__" / f"guard.{sys.implementation.cache_tag}.pyc"
+    py_compile.compile(str(target), cfile=str(cfile), doraise=True,
                        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
     st = target.stat()
-    real_run = ms.subprocess.run
-
-    def same_second_then_run(*a, **k):
-        _os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns))
-        return real_run(*a, **k)
-
-    monkeypatch.setattr(ms.subprocess, "run", same_second_then_run)
+    _around_child(monkeypatch, before=lambda cwd: _os.utime(
+        cwd / "guard.py", ns=(st.st_atime_ns, st.st_mtime_ns)))
     # Same LENGTH as the anchor, so the cached (mtime, size) pair still matches.
     case = _case(project, anchor='startswith("danger")',
                  replacement='startswith("dangeX")')
@@ -1159,13 +1216,8 @@ def test_a_utf8_bom_target_is_swept_and_keeps_its_bom(project, monkeypatch):
     target.write_bytes(b"\xef\xbb\xbf" + target.read_bytes())
     before = target.read_bytes()
     seen = {}
-    real_run = ms.subprocess.run
-
-    def capture(*a, **k):
-        seen["bytes"] = target.read_bytes()
-        return real_run(*a, **k)
-
-    monkeypatch.setattr(ms.subprocess, "run", capture)
+    _around_child(monkeypatch, before=lambda cwd: seen.setdefault(
+        "bytes", (cwd / "guard.py").read_bytes()))
     result = _sweep(project, [_case(project)])
     assert result.results[0].outcome == ms.BIT, result.results[0].detail
     assert seen["bytes"].startswith(b"\xef\xbb\xbf"), "the mutation dropped the BOM"
@@ -1178,13 +1230,8 @@ def test_a_pep263_latin1_target_is_swept_in_its_own_encoding(project, monkeypatc
         b"# -*- coding: latin-1 -*-\n# caf\xe9\n" + target.read_bytes())
     before = target.read_bytes()
     seen = {}
-    real_run = ms.subprocess.run
-
-    def capture(*a, **k):
-        seen["bytes"] = target.read_bytes()
-        return real_run(*a, **k)
-
-    monkeypatch.setattr(ms.subprocess, "run", capture)
+    _around_child(monkeypatch, before=lambda cwd: seen.setdefault(
+        "bytes", (cwd / "guard.py").read_bytes()))
     result = _sweep(project, [_case(project)])
     assert result.results[0].outcome == ms.BIT, result.results[0].detail
     assert b"# caf\xe9\n" in seen["bytes"], "the mutation re-encoded the source"
@@ -1276,27 +1323,3 @@ def test_the_mutation_job_does_not_persist_checkout_credentials():
     checkout = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout")]
     assert checkout, "precondition: the job checks out the repository"
     assert all(s.get("with", {}).get("persist-credentials") is False for s in checkout)
-
-
-def test_an_atomic_rewrite_of_the_SAME_bytes_is_still_restored(project, monkeypatch):
-    """The control for leaving the inode OUT of the fingerprint. A fixture that
-    atomically rewrites the target with the very bytes the mutation wrote has not
-    edited anything; reading it as a CONFLICT would leave the mutation in the
-    tree."""
-    import os as _os
-
-    target = project / "guard.py"
-    before = target.read_bytes()
-    real_run = ms.subprocess.run
-
-    def atomic_same_bytes_then_run(*a, **k):
-        staged = project / "staged.tmp"
-        staged.write_bytes(target.read_bytes())
-        _os.chmod(staged, target.stat().st_mode & 0o7777)
-        _os.replace(staged, target)
-        return real_run(*a, **k)
-
-    monkeypatch.setattr(ms.subprocess, "run", atomic_same_bytes_then_run)
-    result = _sweep(project, [_case(project)])
-    assert result.results[0].outcome == ms.BIT, result.results[0].detail
-    assert target.read_bytes() == before

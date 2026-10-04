@@ -503,9 +503,12 @@ jobs:
         run: python scripts/check_external_io.py
 
   mutation-gate:
-    # Verify-RED, enforced. A guard's test can stop pinning the property it is
-    # named for -- through a refactor, a widened assertion, a sibling layer that
-    # starts masking it -- and nothing goes red, because the test still passes.
+    # Verify-RED, reported; to be made a required check once the reworked
+    # harness is stable (it is not in the required-check ruleset yet, so a red
+    # run here does not block a merge on its own). A guard's test can stop
+    # pinning the property it is named for -- through a refactor, a widened
+    # assertion, a sibling layer that starts masking it -- and nothing goes
+    # red, because the test still passes.
     # This breaks a handful of load-bearing guard decisions on purpose and fails
     # if the test does NOT notice. An ABORT is a failure too: a case that could
     # not run has established nothing, which is the confident false negative this
@@ -534,7 +537,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-10-03: 69 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-02: 68 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -1150,4 +1153,9 @@ jobs:
         # case (25 + 29 + 20 + 1 = 75): the file collects 150
         # (`pytest --collect-only -q`, 88 - 13 + 75 = 150),
         # no skips. Floor: 24420 + 62 = 24482; skip ceiling remains 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24482
+        # Its isolated-copy redesign (#2821) retires 16 restore-machinery tests
+        # and adds 19 functions collecting 24 (16 plain + three parametrised
+        # at 2 + 2 + 4): the file collects
+        # 158 (`pytest --collect-only -q`, 150 - 16 + 24 = 158), no skips.
+        # Floor: 24482 + 8 = 24490; skip ceiling remains 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24490

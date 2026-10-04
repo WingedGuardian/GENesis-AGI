@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify-RED as a library: break the mechanism, prove the test notices, put it back.
+"""Verify-RED as a library: break the mechanism, prove the test notices.
 
 WHY THIS IS COMMITTED. The repo's own discipline says every new test must be seen
 to FAIL for the right reason before its green is trusted. Sessions do follow it --
@@ -20,53 +20,36 @@ The contract below is not designed; it is what those fifteen CONVERGED on:
     abort if the file drifted  9/15   <-- the one that matters most
     tally / rationale          8/15
 
-That last group is why this exists. The near-universal features are the ones
-people remember; **the drift check is the one they skip**, and it is the only
-one whose absence damages someone ELSE's work -- a mutation that overwrites a
-concurrent session's uncommitted edit, then "restores" a file it never owned.
-Six of fifteen would have done exactly that. A convention nobody is forced
-through is a convention with better documentation, so the obligation moves into
-a chokepoint here instead.
+All fifteen edited the shared source IN PLACE and restored it, and the drift
+check -- the one people skip -- is the only one whose absence damages someone
+ELSE's work. This module first made it mandatory; review showed the in-place
+shape was itself the defect (per a premise check of its review threads,
+2026-10-03: 15 of 28 findings came from writing the caller's tree and putting it
+back). A check can only narrow a check-then-write window. Not writing closes it:
+a sweep runs in ONE private copy (`isolated_copy`) holding what is on disk, and
+the caller's tree is never written.
 
 WHAT A SWEEP GUARANTEES, per case:
-  1. The target still matches the ONE baseline snapshot taken before the sweep.
-     Re-snapshotting per case would make this vacuous -- the file trivially
-     matches a copy a moment old. The baseline exists to catch a PREVIOUS case
-     that failed to restore, or a concurrent editor.
-  2. The anchor matches exactly once. With two or more edits, a whole-file
+  1. The anchor matches exactly once. With two or more edits, a whole-file
      "did it change" test stays true while a later anchor silently misses, so
      a partial mutation reads as complete.
-  3. The mutated source COMPILES, using the file's own parser. `compile()`, not
+  2. The mutated source COMPILES, using the file's own parser. `compile()`, not
      `ast.parse`: the latter accepts context-invalid constructs (a `return`
      outside a function), and the SyntaxError then surfaces at COLLECTION, where
      a nonzero exit reads as a successful RED.
-  4. The test command produced a RESULT LINE. No line means the run never
+  3. The test command produced a RESULT LINE. No line means the run never
      happened -- a lock, a guard, a timeout -- and "all mutations survived" from
      a sweep that never ran is the confident false negative this class is famous
      for. It is an ABORT, never a survival. The line is read by ONE grammar
      (`parse_pytest_summary`), by exact outcome keyword, and a baseline counts
      as green only when the target PASSED -- never xfailed, xpassed, skipped
      or deselected.
-  5. The file is restored, and the restore is VERIFIED against the baseline.
-     The mutation write and the restore share one `try/finally`, because the
-     expected outcome of a good case is a NONZERO exit and a trailing restore is
-     exactly the statement that does not run -- and a write that fails part-way
-     is the other statement that must not escape it.
-  6. The restore only overwrites what THIS mutation wrote. If the file changed
-     underneath, the sweep PRESERVES it, reports a CONFLICT, and keeps the
-     snapshots, rather than destroying an edit a final hash check would happily
-     confirm it had made.
-
-WHAT "THE FILE" MEANS. Guarantees 1, 5 and 6 all compare the target against
-something, and each comparison is only as good as its notion of identity. A file
-is not its path string plus its content hash: it has a TYPE (a child can replace
-it with a directory or a link), a MODE (a peer can chmod it), a LINK COUNT (a
-second hard link shares the bytes the mutation writes). One `_Fingerprint`
-carries all of them, and every check uses it. Writes go through a staged file
-and `os.replace`, so a failed write never leaves a truncated source and a
-restore never writes INTO whatever now sits at the path.
-Snapshots are keyed by position, not by a flattened path, so two targets cannot
-share one and a deep path cannot overflow a filename.
+  4. Each case starts from the PRISTINE target, read once when the copy is
+     made. Whatever a test did to the file -- deleted it, replaced it with a
+     directory, a symlink or a hard link -- the next write removes it and
+     creates a fresh file, so no write follows a link out of the copy. A reset
+     that cannot be verified aborts every later case: their verdicts would come
+     from a copy that is no longer the one under test.
 
 WHAT IT DELIBERATELY DOES NOT DO. It does not generate mutations. Picking the
 mutation is the thinking part -- a behaviourally-null edit (swapped operands
@@ -80,7 +63,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import hashlib
 import io
 import json
 import os
@@ -92,6 +74,7 @@ import sys
 import tempfile
 import tokenize
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -100,7 +83,6 @@ from pathlib import Path
 BIT = "BIT"
 SURVIVED = "SURVIVED"
 ABORTED = "ABORTED"
-CONFLICT = "CONFLICT"
 
 
 @dataclass(frozen=True)
@@ -223,7 +205,7 @@ class Sweep:
 
     @property
     def aborted(self) -> list[Result]:
-        return [r for r in self.results if r.outcome in (ABORTED, CONFLICT)]
+        return [r for r in self.results if r.outcome == ABORTED]
 
     @property
     def clean(self) -> bool:
@@ -233,10 +215,6 @@ class Sweep:
         established nothing about them.
         """
         return bool(self.results) and not self.survived and not self.aborted
-
-
-def _sha(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _child_env(extra: dict[str, str] | None) -> dict[str, str]:
@@ -474,96 +452,6 @@ def _validate(case: Case, text: str) -> str | None:
     return None
 
 
-@dataclass(frozen=True)
-class _Fingerprint:
-    """What "the same file" means for every check in this module.
-
-    Content alone was the old identity, and each field below is a measured way it
-    was blind: ``kind`` (a child replaced the target with a directory, and the
-    restore copied the snapshot INTO it), ``mode`` (a peer's chmod during the run
-    was silently reverted), ``nlink`` (a second hard link shares the bytes the
-    mutation writes).
-
-    Deliberately ABSENT: timestamps (the harness itself moves them, and the child
-    runs with bytecode caching isolated, so nothing here is decided by an mtime)
-    and the inode. An inode check would add only "replaced by a different file
-    with the SAME bytes and mode" -- and its realistic trigger is a fixture that
-    atomically rewrites the target with the mutated text, which it would turn
-    into a CONFLICT that leaves the mutation in the tree.
-    """
-
-    kind: str
-    sha: str | None
-    mode: int
-    nlink: int
-
-
-def _fingerprint(path: Path) -> _Fingerprint | None:
-    """The target's identity, or None when nothing is at the path.
-
-    Uses ``lstat``: a symlink is reported AS a symlink, never as its referent.
-    Any OSError other than absence propagates -- a file that cannot be inspected
-    cannot be proven to be ours, and the caller must treat it as such.
-    """
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        return None
-    if stat.S_ISREG(st.st_mode):
-        kind, sha = "file", _sha(path)
-    elif stat.S_ISLNK(st.st_mode):
-        kind, sha = "symlink", None
-    elif stat.S_ISDIR(st.st_mode):
-        kind, sha = "directory", None
-    else:
-        kind, sha = "other", None
-    return _Fingerprint(kind, sha, stat.S_IMODE(st.st_mode), st.st_nlink)
-
-
-def _is_baseline(fp: _Fingerprint | None, base_sha: str, base_mode: int) -> bool:
-    """A single-link regular file with the baseline's bytes AND mode."""
-    return (fp is not None and fp.kind == "file" and fp.nlink == 1
-            and fp.sha == base_sha and fp.mode == base_mode)
-
-
-def _replace_atomically(target: Path, *, data: bytes | None = None,
-                        source: Path | None = None, mode: int) -> _Fingerprint:
-    """Put new content at ``target`` all at once, and return what was put there.
-
-    Staged in the target's own directory, then ``os.replace``d: a write that
-    fails part-way (disk full, a file-size limit) fails on the STAGING file and
-    the target is untouched, and a reader never sees a half-written source. The
-    replace also never writes INTO a directory that took the target's place --
-    it raises instead. ``source`` copies with ``copy2`` so a restore carries the
-    snapshot's timestamps as well as its bytes; ``mode`` is applied explicitly
-    because the staging file is created 0600.
-
-    The fingerprint is taken from the staged file BEFORE the replace -- a rename
-    moves the same inode, so it is what lands at ``target`` -- rather than read
-    back afterwards, which would race the child (or a peer) for no gain.
-    """
-    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent),
-                                    prefix=f".{target.name}.",
-                                    suffix=".mutation-sweep")
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            if data is not None:
-                fh.write(data)
-        if source is not None:
-            shutil.copy2(source, tmp)
-        os.chmod(tmp, mode)
-        staged = _fingerprint(tmp)
-        if staged is None:
-            raise FileNotFoundError(f"staging file {tmp} vanished before the replace")
-        os.replace(tmp, target)
-    except BaseException:
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()
-        raise
-    return staged
-
-
 def _decode(case: Case, raw: bytes) -> tuple[str, str]:
     """Decode a target in ITS OWN encoding, and prove that is lossless.
 
@@ -587,44 +475,231 @@ def _decode(case: Case, raw: bytes) -> tuple[str, str]:
     return text, enc
 
 
-def _reject_unsafe_target(path: Path) -> str | None:
-    """A target whose restore cannot be made exact is REFUSED, not handled.
+# --------------------------------------------------------------------------
+# THE ISOLATED COPY.
+# --------------------------------------------------------------------------
 
-    SYMLINK -- MEASURED: the mutation writes THROUGH the link into the referent;
-    if the child then deletes the link, the restore recreates `target` as a
-    regular file holding the baseline text while THE REFERENT STAYS MUTATED --
-    permanently, with the case still reporting BIT. The correct semantics
-    (restore the link? the referent? one outside the repo?) are genuinely
-    ambiguous, and a mutation harness has no business guessing about them.
+def _git(repo: Path, *args: str) -> bytes:
+    """``git -C repo <args>`` -> stdout bytes; RuntimeError naming git's stderr.
 
-    HARD LINK -- the same shape through an inode instead of a name: a second
-    link shares the bytes the mutation writes, and a child deleting THIS name
-    leaves the other one mutated. Refused for the same reason.
+    GIT_* is dropped from the environment. Run from inside a git hook (a
+    pre-commit that runs the suite), an inherited GIT_DIR / GIT_WORK_TREE /
+    GIT_INDEX_FILE aims every call at the HOOK's repository instead of ``repo``,
+    and the copy would be of the wrong tree. Bytes, not text: a path git prints
+    is a filename, and filenames need not be valid UTF-8.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                          env=env, timeout=7200)
+    if proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} in {repo} failed: "
+                           f"{os.fsdecode(proc.stderr).strip()}")
+    return proc.stdout
 
-    Anything that is not a regular file has no restore at all.
+
+def _git_paths(repo: Path, *args: str) -> set[str]:
+    return {os.fsdecode(p) for p in _git(repo, *args).split(b"\0") if p}
+
+
+def _contained(root: Path, path: Path) -> bool:
+    """``path`` lies inside ``root`` once every symlinked DIRECTORY on the way
+    is followed. The final component is not followed: it is what gets written,
+    and every writer here removes whatever sits there first."""
+    return path.parent.resolve().is_relative_to(root)
+
+
+def _clear(path: Path) -> None:
+    """Remove whatever sits at ``path`` -- a file, a link, a directory -- without
+    following a link."""
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    elif os.path.lexists(path):
+        os.unlink(path)
+
+
+def _put(root: Path, path: Path, data: bytes, mode: int) -> None:
+    """Make ``path`` a FRESH regular file holding ``data``, inside the copy.
+
+    Fresh is the point: removing what is there and creating with O_EXCL |
+    O_NOFOLLOW means no write ever lands in an inode or through a link that a
+    test left behind -- a symlink or hard link to a file outside the copy would
+    otherwise carry the write out of it. Refuses a directory that resolves
+    outside ``root``. Raises ``OSError``.
+    """
+    if not _contained(root, path):
+        raise OSError(f"{path} resolves outside the copy; refusing to write it")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _clear(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+        os.fchmod(fh.fileno(), mode)
+
+
+def _overlay(top: Path, tree: Path) -> None:
+    """Make the fresh checkout at ``tree`` match ``top``'s WORKING TREE.
+
+    The paths: `git diff HEAD` (staged and unstaged, renames split), untracked
+    files that are not ignored, and every entry flagged assume-unchanged or
+    skip-worktree, whose changes `git diff` does not report. Each is copied as
+    it is on disk (a symlink as a symlink) or removed from the copy. Ignored
+    files and untracked nested repositories (a trailing slash) are not part of
+    this repository and are left out.
+    """
+    paths = _git_paths(top, "diff", "--name-only", "--no-renames", "-z", "HEAD")
+    paths |= _git_paths(top, "ls-files", "--others", "--exclude-standard", "-z")
+    for entry in _git(top, "ls-files", "-v", "-z").split(b"\0"):
+        if entry[:1].islower() or entry[:1] == b"S":
+            paths.add(os.fsdecode(entry[2:]))
+    for rel in sorted(p for p in paths if not p.endswith("/")):
+        src, dst = top / rel, tree / rel
+        if not _contained(tree, dst):
+            raise RuntimeError(f"{rel} would be copied outside the copy")
+        if os.path.islink(src):
+            _clear(dst)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(os.readlink(src), dst)
+        elif src.is_file():
+            _put(tree, dst, src.read_bytes(), stat.S_IMODE(src.stat().st_mode))
+        else:
+            # Deleted -- or now a DIRECTORY, whose files are entries of their
+            # own (sorted after it); HEAD's file must not stay in their way.
+            _clear(dst)
+
+
+def _force_rmtree(path: Path) -> None:
+    """rmtree that first makes a directory a test left read-only writable."""
+    def retry(func, p, _exc):
+        with contextlib.suppress(OSError):
+            os.chmod(os.path.dirname(p), 0o700)
+            func(p)
+    shutil.rmtree(path, onexc=retry)
+
+
+@contextlib.contextmanager
+def isolated_copy(repo: Path, tmp_root: Path | None = None) -> Iterator[Path]:
+    """Yield ``repo``'s place inside a private copy of its whole repository.
+
+    The copy is a detached `git worktree` of HEAD under a fresh directory in
+    ``tmp_root`` (default ``~/tmp``: a real disk, never the session's TMPDIR,
+    because a checkout is large temp), overlaid with the caller's working-tree
+    changes (`_overlay`). On ANY exit the copy and its registration are removed
+    -- this copy's only: `git worktree remove` on the path this call created,
+    then, if git no longer recognises it (a test deleted the directory), the
+    administrative entry recorded at creation.
     """
     try:
-        fp = _fingerprint(path)
+        top = Path(os.fsdecode(_git(repo, "rev-parse", "--show-toplevel").strip()))
+    except RuntimeError as exc:
+        raise RuntimeError(f"the sweep copies the tree with git, and {repo} is "
+                           f"not inside a git work tree ({exc})") from exc
+    top, repo = top.resolve(), repo.resolve()
+    parent = Path(tmp_root) if tmp_root is not None else Path.home() / "tmp"
+    if parent.resolve().is_relative_to(top):
+        raise ValueError(f"tmp_root {parent} is inside the repository {top}; the "
+                         "copy would be written into the tree it must not touch")
+    parent.mkdir(parents=True, exist_ok=True)
+    holder = Path(tempfile.mkdtemp(prefix="mutation-sweep-", dir=str(parent))).resolve()
+    tree = holder / holder.name   # the basename names git's admin entry too
+    admin: Path | None = None
+    try:
+        _git(top, "worktree", "add", "--detach", "--quiet", str(tree), "HEAD")
+        admin = Path(os.fsdecode(_git(tree, "rev-parse", "--absolute-git-dir").strip()))
+        _overlay(top, tree)
+        yield tree / repo.relative_to(top)
+    finally:
+        with contextlib.suppress(RuntimeError):
+            _git(top, "worktree", "remove", "--force", str(tree))
+        if os.path.lexists(holder):
+            _force_rmtree(holder)
+        if admin is not None and admin.parent.name == "worktrees" and admin.exists():
+            shutil.rmtree(admin, ignore_errors=True)
+        if os.path.lexists(holder) or (admin is not None and admin.exists()):
+            print(f"mutation-sweep: could not fully remove the copy at {holder}",
+                  file=sys.stderr)
+
+
+@dataclass(frozen=True)
+class _Target:
+    """A case's file INSIDE the copy, and its content when the copy was made."""
+
+    path: Path
+    pristine: bytes
+    mode: int
+
+
+def _load_target(root: Path, rel: Path) -> _Target | str:
+    """The copy's file at ``rel``, or why it is refused (named by ``rel``: the
+    copy is gone by the time anyone reads the message). A SYMLINK, or a
+    directory on the way that resolves outside the copy, would carry the
+    mutation to a file that may be the caller's own -- and which file is meant
+    is ambiguous, so it is refused rather than guessed."""
+    path = root / rel
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return f"{rel} does not exist in the tree under test"
     except OSError as exc:
-        return f"{path} cannot be inspected: {exc}"
-    if fp is None:
-        return f"{path} does not exist"
-    if fp.kind == "symlink":
-        return (f"{path} is a SYMLINK; mutating it writes through to the "
-                "referent and the restore cannot put the link back. Point the "
-                "case at the real file.")
-    if fp.kind != "file":
-        return f"{path} is a {fp.kind}, not a regular file"
-    if fp.nlink > 1:
-        return (f"{path} is HARD-LINKED ({fp.nlink} links); the mutation would "
-                "change every link and a restore through this name cannot put "
-                "the others back. Point the case at a file with one link.")
-    return None
+        return f"{rel} cannot be inspected: {exc}"
+    if stat.S_ISLNK(st.st_mode):
+        return (f"{rel} is a SYMLINK; mutating it writes through to the "
+                "referent, possibly outside the copy. Point the case at the real "
+                "file.")
+    if not _contained(root, path):
+        return f"{rel} resolves outside the copy"
+    if not stat.S_ISREG(st.st_mode):
+        return f"{rel} is not a regular file"
+    return _Target(path, path.read_bytes(), stat.S_IMODE(st.st_mode))
+
+
+def _repo_relative(repo: Path, path: Path) -> Path:
+    """``path`` relative to ``repo``, its directories resolved; ValueError when
+    that lands outside the repository."""
+    p = path if path.is_absolute() else repo / path
+    p = p.parent.resolve() / p.name
+    if not p.is_relative_to(repo):
+        raise ValueError(f"case path {path} resolves outside the repository {repo}")
+    return p.relative_to(repo)
+
+
+def _refuse_shared_tree_env(repo: Path, env: dict[str, str] | None,
+                            cases: list[Case]) -> None:
+    """An env value naming the caller's tree points the child BACK at it.
+
+    The child would then import the unmutated file and report SURVIVED for a
+    mutation its test would catch -- the isolation defeated by configuration.
+    Import roots are named repo-relative instead (`pythonpath`).
+    """
+    scopes = [("sweep", env or {})] + [(f"case {c.label!r}", c.env) for c in cases]
+    for scope, mapping in scopes:
+        for key, value in mapping.items():
+            if str(repo) in value:
+                raise ValueError(
+                    f"{scope} env {key}={value!r} points into the tree under test "
+                    f"({repo}). The sweep runs in an isolated copy, so a child "
+                    "pointed there tests the UNMUTATED file; name import roots "
+                    "repo-relative with `pythonpath` instead")
+
+
+# --------------------------------------------------------------------------
+# RUNNING.
+# --------------------------------------------------------------------------
+
+def _pytest(cmd: list[str], *, cwd: Path, env: dict[str, str],
+            timeout: int) -> subprocess.CompletedProcess:
+    """The ONE place a pytest child is started, baseline and mutation alike."""
+    return subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True,
+                          env=env, timeout=timeout)
+
+
+def _pytest_cmd(python: str, test: str, extra: tuple[str, ...]) -> list[str]:
+    return [python, "-m", "pytest", test, "-q", "--no-header",
+            "-p", "no:cacheprovider", *extra]
 
 
 def run_case(
     case: Case,
-    baseline: Path,
+    target: _Target,
     *,
     cwd: Path,
     python: str,
@@ -632,46 +707,25 @@ def run_case(
     timeout: int = 7200,
     available: set[str] | None = None,
 ) -> Result:
-    target = case.path
-
+    """Mutate ``target`` (a file in the copy, from its pristine bytes) and run
+    the case's test from ``cwd``. Leaves the target mutated: the sweep resets
+    it, because only the sweep knows whether a later case needs the copy."""
     # A case gated on shared live state ABORTS when that state is absent. It does
     # NOT skip: a skipped case and a killed one look identical in a summary line,
     # and "11/11 bit" means nothing if two of them never ran.
-    unsafe = _reject_unsafe_target(target)
-    if unsafe:
-        return Result(case, ABORTED, unsafe)
-
     missing = [r for r in case.requires if r not in (available or set())]
     if missing:
         return Result(case, ABORTED,
                       f"requires {', '.join(missing)}, which this run did not "
                       "declare available -- not skipped, because a skipped case "
                       "and a killed one are indistinguishable in a tally")
-
-    base_bytes = baseline.read_bytes()
-    base_sha = hashlib.sha256(base_bytes).hexdigest()
-    base_mode = stat.S_IMODE(baseline.stat().st_mode)
-
-    def drifted() -> bool:
-        try:
-            return not _is_baseline(_fingerprint(target), base_sha, base_mode)
-        except OSError:
-            return True
-
-    # (1) the file must still match the ONE baseline for the whole sweep -- by
-    # bytes AND mode, so a chmod after the snapshot is drift too.
-    if drifted():
-        return Result(case, ABORTED,
-                      "target differs from the sweep baseline -- a previous case "
-                      "failed to restore, or someone else is editing this file")
-
     try:
-        text, encoding = _decode(case, base_bytes)
+        text, encoding = _decode(case, target.pristine)
     except ValueError as exc:
         return Result(case, ABORTED, str(exc))
     mutated = text
     for i, edit in enumerate(case.edits):
-        # (2) EVERY edit is counted. With two or more, a whole-file "did it
+        # (1) EVERY edit is counted. With two or more, a whole-file "did it
         # change" test stays true while a later anchor silently misses, so a
         # partial mutation reads as complete.
         hits = mutated.count(edit.anchor)
@@ -681,7 +735,7 @@ def run_case(
                           f"{hits}x, expected exactly 1")
         mutated = mutated.replace(edit.anchor, edit.replacement, 1)
 
-    # (3) the declared validator, never a silent skip.
+    # (2) the declared validator, never a silent skip.
     err = _validate(case, mutated)
     if err:
         return Result(case, ABORTED, err)
@@ -691,120 +745,33 @@ def run_case(
         return Result(case, ABORTED,
                       f"the mutation cannot be written in the target's own "
                       f"encoding ({encoding}): {exc}")
-
-    # TOCTOU, NARROWED BUT NOT CLOSED -- stated plainly because the difference
-    # matters and a re-check cannot do better.
-    #
-    # The original drift check ran before `compile()` and, for a `bash`
-    # validator, before an out-of-process `bash -n`: a window measured in
-    # subprocess time. Re-checking here shrinks it to the gap between this read
-    # and the replace below. It does NOT eliminate it: a peer writing in that gap
-    # is clobbered, the restore then sees its own fingerprint, and no CONFLICT is
-    # reported. (The replace being atomic does not change that; it changes what
-    # a FAILED write leaves behind, not who can race a successful one.)
-    #
-    # A re-check can only ever narrow a TOCTOU. Closing it needs one of:
-    #   * mutating an ISOLATED COPY so the shared file is never written -- the
-    #     only option that actually closes it, and a rewrite of this module's
-    #     core (the test must then run against the copy);
-    #   * an exclusive lock across check/write/test/restore -- which serialises
-    #     other SWEEPS but not an arbitrary editor, and the arbitrary editor is
-    #     the threat. `flock` is advisory; a peer CC session does not take it.
-    # Accepted for now, and named here rather than left for the next reviewer to
-    # rediscover. Raised by CodeRabbit on PR #1851, tagged "heavy lift" by it too.
-    if drifted():
-        return Result(case, CONFLICT,
-                      "the target changed between the drift check and the "
-                      "mutation write -- a peer's edit was left untouched")
-
-    wrote: _Fingerprint | None = None
-    verdict: Result | None = None
-    conflict: str | None = None
     try:
-        # The write is INSIDE the scope that restores. It used to sit just
-        # above it, so a write that failed after truncating the source escaped
-        # with the source damaged and nothing putting it back.
-        try:
-            wrote = _replace_atomically(target, data=data, mode=base_mode)
-        except OSError as exc:
-            verdict = Result(case, ABORTED, f"could not write the mutation: {exc}")
-        if verdict is None:
-            verdict = _run_target(case, cwd=cwd, python=python, env=env,
-                                  timeout=timeout)
-    finally:
-        # (6) restore what this mutation wrote -- and NEVER lose the file.
-        conflict = _restore(target, baseline, wrote, base_sha=base_sha,
-                            base_mode=base_mode)
-
-    # AFTER the finally, so a conflict detected during restore is visible.
-    if verdict is None:  # pragma: no cover -- every branch above assigns one
-        verdict = Result(case, ABORTED, "no verdict produced")
-    if conflict:
-        return Result(case, CONFLICT, f"{conflict} (baseline copy: {baseline})",
-                      verdict.stdout)
-    return verdict
-
-
-def _run_target(case: Case, *, cwd: Path, python: str,
-                env: dict[str, str] | None, timeout: int) -> Result:
-    """Run the case's test against the mutated file and classify the outcome."""
-    cmd = [case.python or python, "-m", "pytest", case.test, "-q", "--no-header",
-           "-p", "no:cacheprovider", *case.pytest_args]
+        _put(cwd, target.path, data, target.mode)
+    except OSError as exc:
+        return Result(case, ABORTED, f"could not write the mutation: {exc}")
     try:
-        proc = subprocess.run(
-            cmd, cwd=str(cwd), capture_output=True, text=True,
-            env=_child_env({**(env or {}), **case.env}), timeout=timeout,
-        )
+        proc = _pytest(_pytest_cmd(case.python or python, case.test, case.pytest_args),
+                       cwd=cwd, env=_child_env({**(env or {}), **case.env}),
+                       timeout=timeout)
     except subprocess.TimeoutExpired:
         return Result(case, ABORTED, f"test timed out after {timeout}s")
-    # The exit code AND the summary decide, together, in `mutation_verdict` --
-    # the one place a mutated run is classified. Only stdout is parsed: pytest
-    # writes its summary there, and stderr belongs to whatever else ran.
+    # (3) the exit code AND the summary decide, together, in `mutation_verdict`
+    # -- the one place a mutated run is classified. Only stdout is parsed:
+    # pytest writes its summary there, and stderr belongs to whatever else ran.
     outcome, detail = mutation_verdict(proc.returncode, proc.stdout)
     return Result(case, outcome, detail, proc.stdout + proc.stderr)
 
 
-def _restore(target: Path, baseline: Path, wrote: _Fingerprint | None, *,
-             base_sha: str, base_mode: int) -> str | None:
-    """Undo the mutation if -- and only if -- the target is still what it wrote.
-
-    Returns None when the target is back at its baseline (verified, not
-    assumed), or a CONFLICT reason when it was left alone. Never raises for a
-    target-side problem: an exception here used to escape into `sweep`, whose
-    cleanup then deleted the snapshot directory -- the file's only remaining
-    copy (MEASURED with a child that unlinked the target).
-
-      * nothing at the path      -> the child deleted it; put it back.
-      * exactly what we wrote    -> ours; put it back.
-      * we never wrote, and it is
-        still the baseline       -> nothing to undo (the write failed cleanly).
-      * anything else            -> a peer's edit, a chmod, a directory or link
-                                    in its place, or something we cannot read.
-                                    PRESERVED, and reported, because a verdict
-                                    computed against a file that changed
-                                    mid-flight is not trustworthy.
-    """
+def _reset(root: Path, target: _Target) -> str | None:
+    """Put the pristine file back and VERIFY it; None, or why it failed."""
     try:
-        current = _fingerprint(target)
-    except OSError as exc:
-        return f"the target could not be inspected for restore ({exc}); left as is"
-    if current is not None and not (wrote is not None and current == wrote):
-        if wrote is None and _is_baseline(current, base_sha, base_mode):
+        _put(root, target.path, target.pristine, target.mode)
+        st = os.lstat(target.path)
+        if stat.S_ISREG(st.st_mode) and target.path.read_bytes() == target.pristine:
             return None
-        return ("the target changed while the test ran -- a peer's edit, or "
-                f"something replacing the file (now a {current.kind}), was "
-                "PRESERVED, so this case's verdict is not trustworthy")
-    try:
-        # `copy2` via the staging file rather than `write_bytes`: a target the
-        # child DELETED would otherwise come back at the default creation mode
-        # (MEASURED 0o755 -> 0o644) -- a restored hook script left unrunnable.
-        _replace_atomically(target, source=baseline, mode=base_mode)
-        restored = _fingerprint(target)
+        return f"{target.path} did not verify against its pristine content"
     except OSError as exc:
-        return f"RESTORE FAILED ({exc}); the baseline copy is the only good one"
-    if not _is_baseline(restored, base_sha, base_mode):
-        return "the restore did not verify against the baseline"
-    return None
+        return f"could not reset {target.path}: {exc}"
 
 
 def assert_green_baseline(
@@ -830,11 +797,12 @@ def assert_green_baseline(
             for c in cases}
     for test, py, extra, case_env in seen:
         try:
-            proc = _baseline_run(test, py, extra, case_env, cwd, python, env, timeout)
+            proc = _pytest(_pytest_cmd(py or python, test, extra), cwd=cwd,
+                           env=_child_env({**(env or {}), **dict(case_env)}),
+                           timeout=timeout)
         except subprocess.TimeoutExpired:
             # Every other outcome in this module is enumerated; a raw traceback
-            # here was the one path that escaped the contract. Nothing has been
-            # mutated at this point, so this is purely a reporting fix.
+            # here was the one path that escaped the contract.
             return (f"baseline run of {test} timed out after {timeout}s -- it "
                     "cannot be established as green, so no mutation is trustworthy")
         problem = baseline_problem(test, proc.returncode, proc.stdout)
@@ -843,152 +811,80 @@ def assert_green_baseline(
     return None
 
 
-def _baseline_run(test, py, extra, case_env, cwd, python, env, timeout):
-    """One baseline invocation, factored out so the timeout has somewhere to land."""
-    return subprocess.run(
-        [py or python, "-m", "pytest", test, "-q", "--no-header",
-         "-p", "no:cacheprovider", *extra],
-        cwd=str(cwd), capture_output=True, text=True,
-        env=_child_env({**(env or {}), **dict(case_env)}), timeout=timeout,
-    )
-
-
 def sweep(
     cases: list[Case],
     *,
-    cwd: Path,
+    repo: Path,
     python: str = sys.executable,
     env: dict[str, str] | None = None,
+    pythonpath: tuple[str, ...] = (),
     timeout: int = 7200,
     available: set[str] | None = None,
     check_baseline: bool = True,
+    tmp_root: Path | None = None,
 ) -> Sweep:
-    """Run every case, restoring between each. Never leaves a file mutated."""
+    """Run every case in ONE isolated copy of ``repo``'s repository.
+
+    ``cases`` name files in ``repo`` (the caller's tree); each is mutated at the
+    same relative place in the copy. ``pythonpath`` lists repo-relative import
+    roots, put on the children's PYTHONPATH as copy paths. ``tmp_root`` is where
+    the copy is made (default ``~/tmp``). The caller's tree is never written.
+    """
     if not cases:
         raise ValueError("a sweep with no cases proves nothing")
+    repo = Path(repo).resolve()
+    rels = {c.path: _repo_relative(repo, Path(c.path)) for c in cases}
+    _refuse_shared_tree_env(repo, env, cases)
 
-    # SNAPSHOT FIRST, BEFORE ANY CHILD PROCESS RUNS. The baseline check used to
-    # come first, and a baseline test (or one of its fixtures) that edits or
-    # deletes a target then had no recovery copy anywhere: a deleted target made
-    # the later copy2 raise with nothing to restore from, and an edited one
-    # became the snapshot and survived the sweep. A failing baseline left the
-    # same damage. The window existed for every case, on every run, before a
-    # single mutation was written.
-    #
-    # `~/tmp` is a Genesis-container convention, not a property of hosts, and
-    # mkdtemp against an absent parent raises.
-    tmp_root = Path.home() / "tmp"
-    tmp_root.mkdir(parents=True, exist_ok=True)
-    tmpdir = Path(tempfile.mkdtemp(prefix="mutation-sweep-", dir=str(tmp_root)))
-    baselines: dict[Path, Path] = {}
-    completed = False
+    with isolated_copy(repo, tmp_root) as root:
+        child_env = dict(env or {})
+        if pythonpath:
+            child_env = {"PYTHONPATH": os.pathsep.join(str(root / p) for p in pythonpath),
+                         **child_env}
+        # Read ONCE, before any child runs: whatever the baseline or a case does
+        # to a target afterwards, every case starts from this.
+        targets = {p: _load_target(root, rel) for p, rel in rels.items()}
 
-    try:
-        # Keyed by POSITION, never by a flattened path: `a/b.py` and `a__b.py`
-        # used to map to one snapshot name (the later copy overwrote the
-        # earlier, and a valid case aborted against another file's bytes), and a
-        # deep absolute path overflowed the single-component name limit. One
-        # directory per target keeps its real basename for whoever recovers it.
-        for i, c in enumerate(sorted({c.path for c in cases}, key=str)):
-            slot = tmpdir / f"{i:03d}"
-            slot.mkdir()
-            snap = slot / c.name
-            shutil.copy2(c, snap)
-            baselines[c] = snap
-        _run_baseline_and_verify(
-            cases, baselines, cwd=cwd, python=python, env=env, timeout=timeout,
-            available=available, check_baseline=check_baseline,
-        )
-    except BaseException:
-        print(f"mutation-sweep: baselines PRESERVED for recovery: {tmpdir}",
-              file=sys.stderr)
-        raise
+        if check_baseline:
+            # A case gated on state this run does not have CANNOT be baselined:
+            # its test fails without that state, the gate reads that as a RED
+            # baseline, and one unavailable resource would kill every OTHER case.
+            # `run_case` still aborts it, loudly. A refused target is reported
+            # per case below rather than through its baseline.
+            baselineable = [
+                c for c in cases
+                if all(r in (available or set()) for r in c.requires)
+                and isinstance(targets[c.path], _Target)
+            ]
+            if baselineable:
+                problem = assert_green_baseline(
+                    baselineable, cwd=root, python=python, env=child_env,
+                    timeout=timeout)
+                if problem:
+                    raise RuntimeError(problem)
 
-    try:
         out = Sweep()
+        dirty: str | None = None
         for case in cases:
-            out.results.append(
-                run_case(case, baselines[case.path], cwd=cwd, python=python,
-                         env=env, timeout=timeout, available=available)
-            )
-        # A CONFLICT means the target was deliberately NOT restored -- a peer's
-        # edit (possibly made on top of the mutated text), or something that
-        # replaced the file. The snapshot is then the only clean copy, so a
-        # sweep that "completed" with a conflict keeps it like a crash would.
-        completed = not any(r.outcome == CONFLICT for r in out.results)
+            target = targets[case.path]
+            if isinstance(target, str):
+                out.results.append(Result(case, ABORTED, target))
+            elif dirty:
+                out.results.append(Result(
+                    case, ABORTED, f"the copy is no longer pristine ({dirty}); "
+                    "a verdict from it would not be about the tree under test"))
+            else:
+                out.results.append(run_case(
+                    case, target, cwd=root, python=python, env=child_env,
+                    timeout=timeout, available=available))
+                dirty = _reset(root, target)
         return out
-    finally:
-        if completed:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        else:
-            # An abnormal exit is exactly when the snapshots are worth keeping:
-            # they may be the only surviving copy of a file whose restore did not
-            # finish. Deleting them here is what turned a crash into data loss.
-            print(f"mutation-sweep: baselines PRESERVED for recovery: {tmpdir}",
-                  file=sys.stderr)
-
-
-def _run_baseline_and_verify(
-    cases, baselines, *, cwd, python, env, timeout, available, check_baseline
-) -> None:
-    """Green-baseline check, then confirm no target was damaged by running it.
-
-    The verification half is not paranoia: a baseline test -- or one of its
-    fixtures -- can edit or delete the very file a case is about to mutate. With
-    the snapshot now taken first, that damage is recoverable; without the CHECK
-    it would still go unnoticed, and the sweep would mutate a file that no longer
-    matches what it was baselined against.
-    """
-    problem: str | None = None
-    if check_baseline:
-        # A case gated on state this run does not have CANNOT be baselined: its
-        # test fails without that state, the gate reads that as a RED baseline,
-        # and the RuntimeError kills the whole sweep -- so one unavailable
-        # resource silently prevents every OTHER case from running. That
-        # contradicts the per-case contract, which says such a case reports
-        # ABORTED and leaves the rest intact. `run_case` still aborts it, loudly.
-        #
-        # The test for requirement 5 could not catch this: it passes
-        # check_baseline=False, so it never exercised the interaction between the
-        # two mechanisms. Both are now asserted together.
-        baselineable = [
-            c for c in cases
-            if all(r in (available or set()) for r in c.requires)
-        ]
-        if baselineable:
-            problem = assert_green_baseline(
-                baselineable, cwd=cwd, python=python, env=env, timeout=timeout
-            )
-    # NOTE the deliberate ordering: the baseline verdict is CAPTURED, not raised
-    # yet. A damaged target EXPLAINS a red baseline -- if a fixture deleted the
-    # file under test, "baseline is RED" is a true statement and a useless
-    # diagnosis, and it hides the one fact the operator needs (their file is gone,
-    # and here is the copy). The specific cause reports first.
-
-    # Whether or not the baseline ran, confirm every target still matches its
-    # snapshot before a single mutation is written.
-    for target, snap in baselines.items():
-        if not target.exists():
-            raise RuntimeError(
-                f"{target} was DELETED before any mutation -- by a baseline test "
-                f"or its fixture. A recovery copy exists at {snap}."
-            )
-        if target.read_bytes() != snap.read_bytes():
-            raise RuntimeError(
-                f"{target} was MODIFIED before any mutation -- by a baseline test "
-                f"or its fixture. Mutating it now would be mutating a file that "
-                f"no longer matches what it was baselined against. Snapshot: {snap}"
-            )
-
-    if problem:
-        raise RuntimeError(problem)
 
 
 def render(result: Sweep) -> str:
     lines = []
     for r in result.results:
-        mark = {BIT: "BIT     ", SURVIVED: "SURVIVED", ABORTED: "ABORTED ",
-                CONFLICT: "CONFLICT"}[r.outcome]
+        mark = {BIT: "BIT     ", SURVIVED: "SURVIVED", ABORTED: "ABORTED "}[r.outcome]
         lines.append(f"  {mark}  {r.case.label}")
         if r.detail:
             lines.append(f"            {r.detail}")
@@ -1010,7 +906,7 @@ def _contained_path(repo: Path, rel: str) -> Path:
 
     The DIRECTORY part is resolved (so a symlinked directory cannot carry the
     target out of the tree); the final component is not, because a symlinked
-    target must still reach `run_case` AS a symlink to be refused there.
+    target must still reach `_load_target` AS a symlink to be refused there.
     """
     p = Path(rel)
     root = repo.resolve()
@@ -1055,27 +951,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="per test run (default 7200, the repo's timeout floor). A run "
              "that exceeds it ABORTS, which fails the gate.",
     )
+    ap.add_argument(
+        "--tmp-root", type=Path, default=None, metavar="DIR",
+        help="where the sweep makes its private copy of the repository "
+             "(default ~/tmp). A full checkout: put it on a real disk, never a "
+             "RAM-backed or quota-capped temp directory.",
+    )
     return ap
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    # Resolved ONCE, before anything is derived from it. The child runs with
-    # cwd=<repo>, so a relative --repo baked into PYTHONPATH was resolved by the
-    # child against its own cwd: <repo>/<repo>/src.
+    # Resolved ONCE, before anything is derived from it. A relative --repo once
+    # reached the child as a relative PYTHONPATH, resolved against the child's
+    # own cwd: <repo>/<repo>/src.
     repo = args.repo.resolve()
 
     doc = json.loads(args.manifest.read_text(encoding="utf-8"))
     cases = cases_from_json(doc, repo)
     # The child env is an ALLOWLIST (see _child_env), so anything the tests need
     # must be DECLARED. A manifest-level `env` covers the sweep; a case's own
-    # `env` overrides it. VERIFIED 2026-09-07 that the shipped cases pass under
-    # the minimal set, but leaving this undeclarable would be a trap for the
-    # first case that needs a marker variable.
-    env = {"PYTHONPATH": str(repo / "src"), **doc.get("env", {})}
+    # `env` overrides it. `src` is the package root, named repo-relative so it
+    # lands on the COPY's PYTHONPATH.
     available = set(doc.get("available", ())) | set(args.available)
-    result = sweep(cases, cwd=repo, python=args.python, env=env,
-                   available=available, timeout=args.timeout)
+    result = sweep(cases, repo=repo, python=args.python, env=doc.get("env", {}),
+                   pythonpath=("src",), available=available, timeout=args.timeout,
+                   tmp_root=args.tmp_root)
     print(render(result))
     return 0 if result.clean else 1
 
