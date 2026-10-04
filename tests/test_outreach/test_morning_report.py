@@ -1116,6 +1116,58 @@ async def test_ground_truth_stranded_work_line_emits_NO_branch_names(
     assert "private/path" not in ground_truth
 
 
+async def test_ground_truth_counts_open_questions_and_never_renders_their_text(
+    db, mock_health, mock_drafter
+):
+    """The push surface for parked owner decisions: a count and the oldest age,
+    never the question text (free prose a session wrote)."""
+    from genesis.db.crud import board
+
+    await db.commit()  # create_all_tables leaves a transaction open; a raise owns its own
+    await board.raise_question(
+        db, question="PRIVATE-QUESTION-TEXT about something", now="2026-09-01T00:00:00+00:00"
+    )
+    closed = await board.raise_question(db, question="closed one", now="2026-09-02T00:00:00+00:00")
+    await board.close_question(
+        db, question_id=closed, status="resolved", resolution="r", now="2026-09-03T00:00:00+00:00"
+    )
+
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    ground_truth = await gen._ground_truth_section()
+
+    assert "- Open questions awaiting your decision: 1 (oldest " in ground_truth
+    assert "PRIVATE-QUESTION-TEXT" not in ground_truth
+
+
+async def test_ground_truth_open_questions_zero_and_unmigrated(
+    db, mock_health, mock_drafter, tmp_path
+):
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    assert (
+        "- Open questions awaiting your decision: 0\n" in (await gen._ground_truth_section()) + "\n"
+    )
+
+    async with aiosqlite.connect(str(tmp_path / "bare.db")) as bare:
+        gen_bare = MorningReportGenerator(mock_health, bare, mock_drafter)
+        section = await gen_bare._ground_truth_section()
+    assert "- Open questions awaiting your decision: unavailable (store not migrated)" in section
+
+
+async def test_ground_truth_open_questions_read_failure_is_said_not_silent(
+    db, mock_health, mock_drafter, monkeypatch
+):
+    """A failed read must not look like zero questions: this line is the only
+    push surface for parked owner decisions."""
+    from genesis.db.crud import board
+
+    async def boom(_db):
+        raise RuntimeError("disk I/O error")
+
+    monkeypatch.setattr(board, "question_summary", boom)
+    section = await MorningReportGenerator(mock_health, db, mock_drafter)._ground_truth_section()
+    assert "- Open questions awaiting your decision: unavailable (read failed)" in section
+
+
 async def test_the_stranded_line_SURVIVES_the_whole_store_part_failing(
     db, mock_health, mock_drafter, monkeypatch, tmp_path
 ):
