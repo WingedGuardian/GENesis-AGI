@@ -1577,7 +1577,9 @@ _do_rollback() {
             # (The helper lives in the shared deploy-checkout lib, sourced at
             # the top.)
             if declare -F genesis_ephemeral_backup_before_reset >/dev/null; then
-                genesis_ephemeral_backup_before_reset "$GENESIS_ROOT" "$EPHEMERAL_BACKUP_ROOT"
+                # A failed save must not stop the rollback: the checkout refuses
+                # over an unsaved edit on its own.
+                genesis_ephemeral_backup_before_reset "$GENESIS_ROOT" "$EPHEMERAL_BACKUP_ROOT" || true
             else
                 echo "  WARNING: the ephemeral-file backup helper is not defined; an ephemeral edit this update changed makes the rollback refuse."
             fi

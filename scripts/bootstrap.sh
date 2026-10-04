@@ -72,23 +72,34 @@ if [ -f "$UPDATE_STATE" ]; then
         # cannot afford to). Save them first — the same save update.sh's rollback
         # and deploy_code_only.sh's reset make (genesis_ephemeral_*, shared lib).
         # update_state.json names no backup dir from the crashed run, so this
-        # save lands in a fresh run directory of its own.
+        # save lands in a fresh run directory of its own. When a save cannot be
+        # made the reset is REFUSED instead: a recovery left undone is
+        # recoverable, a lost edit is not.
         # shellcheck source=lib/deploy_marker.sh
         . "$SCRIPT_DIR/lib/deploy_marker.sh"
         # shellcheck source=lib/deploy_checkout.sh
         . "$SCRIPT_DIR/lib/deploy_checkout.sh"
-        genesis_ephemeral_backup_before_reset "$GENESIS_ROOT" "$EPHEMERAL_BACKUP_ROOT"
-
-        if [ -n "$ROLLBACK_TAG" ] && git -C "$GENESIS_ROOT" rev-parse "$ROLLBACK_TAG" >/dev/null 2>&1; then
-            echo "  Rolling back to $ROLLBACK_TAG..."
-            git -C "$GENESIS_ROOT" reset --hard "$ROLLBACK_TAG" 2>&1 || true
-            echo "  Rollback complete."
+        if genesis_ephemeral_backup_before_reset "$GENESIS_ROOT" "$EPHEMERAL_BACKUP_ROOT"; then
+            if [ -n "$ROLLBACK_TAG" ] && git -C "$GENESIS_ROOT" rev-parse "$ROLLBACK_TAG" >/dev/null 2>&1; then
+                echo "  Rolling back to $ROLLBACK_TAG..."
+                git -C "$GENESIS_ROOT" reset --hard "$ROLLBACK_TAG" 2>&1 || true
+                echo "  Rollback complete."
+            else
+                echo "  No rollback tag found — resetting to HEAD."
+                git -C "$GENESIS_ROOT" reset --hard HEAD 2>&1 || true
+            fi
         else
-            echo "  No rollback tag found — resetting to HEAD."
-            git -C "$GENESIS_ROOT" reset --hard HEAD 2>&1 || true
+            _RECOVERY_RESET_REFUSED=1
+            echo "  Refusing the recovery reset: an ephemeral edit could not be backed up (above)."
+            echo "  The tree is left as the crashed update left it — fix the backup failure and"
+            echo "  rerun bootstrap. update_state.json is kept, so the next run retries."
         fi
 # END crash-recovery-reset
 
+        if [ -n "${_RECOVERY_RESET_REFUSED:-}" ]; then
+            echo "  Crash recovery stopped before the reset — nothing was rolled back or discarded."
+            echo ""
+        else
         # Record crash recovery
         echo "  Recording crash recovery in update_history..."
         DB_PATH="$GENESIS_ROOT/data/genesis.db"
@@ -120,6 +131,7 @@ except Exception as e:
         rm -f "$HOME/.genesis/update_in_progress.pid"
         echo "  Crash recovery complete. Continuing bootstrap with rolled-back code."
         echo ""
+        fi
     fi
 fi
 

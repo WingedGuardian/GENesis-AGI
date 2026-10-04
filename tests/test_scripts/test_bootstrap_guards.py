@@ -730,6 +730,16 @@ def _crash_script(root: Path, home: Path, rollback_tag: str) -> str:
         f'HOME="{home}"\n'
         f'ROLLBACK_TAG="{rollback_tag}"\n'
         + _block(BOOTSTRAP, "crash-recovery-reset")
+        + 'echo "REFUSED=${_RECOVERY_RESET_REFUSED:-0}"\n'
+    )
+
+
+def _crash_run(script: str, home: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env={**os.environ, **_GIT_ENV, "HOME": str(home)},
     )
 
 
@@ -740,12 +750,7 @@ def test_crash_recovery_saves_an_ephemeral_edit_before_the_tag_reset(tmp_path):
     exists after the reset."""
     root, home = _crash_repo(tmp_path)
     (root / "AGENTS.md").write_text("local edits nobody saved\n")
-    r = subprocess.run(
-        ["bash", "-c", _crash_script(root, home, "pre-update-tag")],
-        capture_output=True,
-        text=True,
-        env={**os.environ, **_GIT_ENV, "HOME": str(home)},
-    )
+    r = _crash_run(_crash_script(root, home, "pre-update-tag"), home)
     assert r.returncode == 0, r.stderr
     assert _git(root, "rev-parse", "HEAD") == _git(root, "rev-parse", "pre-update-tag")
     saved = list((home / ".genesis" / "premerge-backups").glob("*/rollback/AGENTS.md/current"))
@@ -757,14 +762,69 @@ def test_crash_recovery_saves_an_ephemeral_edit_before_the_head_reset(tmp_path):
     """No rollback tag: the recovery resets to HEAD and the edit is still saved."""
     root, home = _crash_repo(tmp_path)
     (root / "AGENTS.md").write_text("local edits nobody saved\n")
-    r = subprocess.run(
-        ["bash", "-c", _crash_script(root, home, "")],
-        capture_output=True,
-        text=True,
-        env={**os.environ, **_GIT_ENV, "HOME": str(home)},
-    )
+    r = _crash_run(_crash_script(root, home, ""), home)
     assert r.returncode == 0, r.stderr
     assert (root / "AGENTS.md").read_text() == "upstream copy\n"
     saved = list((home / ".genesis" / "premerge-backups").glob("*/rollback/AGENTS.md/current"))
     assert len(saved) == 1, saved
     assert saved[0].read_text() == "local edits nobody saved\n"
+
+
+def test_crash_recovery_refuses_the_reset_when_a_backup_cannot_be_made(tmp_path):
+    """An unwritable backup dir with an edited ephemeral file: the recovery
+    reset is REFUSED so the edit survives — a recovery left undone is
+    recoverable, a lost edit is not."""
+    root, home = _crash_repo(tmp_path)
+    (root / "AGENTS.md").write_text("local edits nobody saved\n")
+    (home / ".genesis").mkdir()
+    (home / ".genesis" / "premerge-backups").write_text("a file where the dir must go\n")
+    head = _git(root, "rev-parse", "HEAD")
+    r = _crash_run(_crash_script(root, home, "pre-update-tag"), home)
+    assert r.returncode == 0, r.stderr
+    assert "REFUSED=1" in r.stdout, r.stdout
+    assert _git(root, "rev-parse", "HEAD") == head, "a refused reset must not move HEAD"
+    assert (root / "AGENTS.md").read_text() == "local edits nobody saved\n"
+
+
+def test_crash_recovery_backs_up_an_edit_hidden_by_a_flag(tmp_path):
+    """An assume-unchanged flag hides a worktree edit from git diff; the backup
+    compares bytes against HEAD, so the reset still saves it."""
+    root, home = _crash_repo(tmp_path)
+    _git(root, "update-index", "--assume-unchanged", "AGENTS.md")
+    (root / "AGENTS.md").write_text("edits hidden behind the flag\n")
+    r = _crash_run(_crash_script(root, home, "pre-update-tag"), home)
+    assert r.returncode == 0, r.stderr
+    saved = list((home / ".genesis" / "premerge-backups").glob("*/rollback/AGENTS.md/current"))
+    assert len(saved) == 1, saved
+    assert saved[0].read_text() == "edits hidden behind the flag\n"
+
+
+def test_a_flagged_files_backup_is_current_only_while_the_bytes_match(tmp_path):
+    """A flagged file's patches are empty at every rewrite, so only the saved
+    `current` copy can tell a NEW edit apart from the one already backed up:
+    is_current compares it byte for byte, and a stale copy is not trusted."""
+    root, home = _crash_repo(tmp_path)
+    _git(root, "update-index", "--assume-unchanged", "AGENTS.md")
+    (root / "AGENTS.md").write_text("first hidden edit\n")
+    script = (
+        "set -euo pipefail\n"
+        f'GENESIS_ROOT="{root}"\n'
+        f'. "{REPO_ROOT / "scripts" / "lib" / "deploy_marker.sh"}"\n'
+        f'. "{REPO_ROOT / "scripts" / "lib" / "deploy_checkout.sh"}"\n'
+        'genesis_ephemeral_backup "$GENESIS_ROOT" AGENTS.md "$EPHEMERAL_BACKUP_ROOT"\n'
+        'if genesis_ephemeral_backup_is_current "$GENESIS_ROOT" AGENTS.md "$EPHEMERAL_BACKUP_ROOT"; then\n'
+        '  echo "CHECK1=CURRENT"\n'
+        "else\n"
+        '  echo "CHECK1=STALE"\n'
+        "fi\n"
+        f'printf "second hidden edit\\n" > "{root}/AGENTS.md"\n'
+        'if genesis_ephemeral_backup_is_current "$GENESIS_ROOT" AGENTS.md "$EPHEMERAL_BACKUP_ROOT"; then\n'
+        '  echo "CHECK2=CURRENT"\n'
+        "else\n"
+        '  echo "CHECK2=STALE"\n'
+        "fi\n"
+    )
+    r = _crash_run(script, home)
+    assert r.returncode == 0, r.stderr
+    assert "CHECK1=CURRENT" in r.stdout, r.stdout
+    assert "CHECK2=STALE" in r.stdout, r.stdout

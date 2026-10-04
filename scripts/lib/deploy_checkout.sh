@@ -233,10 +233,20 @@ EPHEMERAL_CLEAR_PATHS=(AGENTS.md config/procedure_triggers.yaml)
 EPHEMERAL_BACKUP_ROOT="$HOME/.genesis/premerge-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 # Is <path> under <root> tracked AND different from HEAD in the index or the
-# worktree? The two diffs cover a staged edit and an unstaged one.
+# worktree? The two diffs cover a staged edit and an unstaged one. An
+# assume-unchanged or skip-worktree flag hides the worktree state from both, so
+# a flagged file is compared byte for byte against its HEAD blob.
 genesis_ephemeral_is_dirty() {
-    git -C "$1" ls-files --error-unmatch "$2" &>/dev/null \
-        && ! git -C "$1" diff --quiet HEAD -- "$2" 2>/dev/null
+    local root="$1" p="$2"
+    git -C "$root" ls-files --error-unmatch "$p" &>/dev/null || return 1
+    git -C "$root" diff --quiet HEAD -- "$p" 2>/dev/null || return 0
+    case "$(git -C "$root" ls-files -v -- "$p" 2>/dev/null | cut -d' ' -f1)" in
+        [a-z]|S)
+            [ -e "$root/$p" ] || return 1
+            [ "$(git -C "$root" hash-object "$root/$p" 2>/dev/null)" \
+                != "$(git -C "$root" rev-parse -q --verify "HEAD:$p" 2>/dev/null)" ] ;;
+        *) return 1 ;;
+    esac
 }
 
 # Save <path>'s local edits under <dest-root>/<path>/: the worktree and index
@@ -251,12 +261,18 @@ genesis_ephemeral_backup() {
 
 # Does the backup under <dest-root> still describe <path>'s edits exactly? Both
 # patches are compared: staging the same content after the backup changes only
-# index.patch, and the backup is then stale.
+# index.patch, and the backup is then stale. The saved `current` is compared
+# byte for byte too — a flagged file's patches are empty at every rewrite, so
+# only the copy can tell a new edit apart from the one already saved. A backup
+# with no `current` (the file was deleted when it ran) is current only while
+# the file stays deleted.
 genesis_ephemeral_backup_is_current() {
     local root="$1" p="$2" dest="$3/$2"
     [ -f "$dest/worktree.patch" ] && [ -f "$dest/index.patch" ] \
         && cmp -s "$dest/worktree.patch" <(git -C "$root" diff --binary HEAD -- "$p") \
-        && cmp -s "$dest/index.patch" <(git -C "$root" diff --binary --cached HEAD -- "$p")
+        && cmp -s "$dest/index.patch" <(git -C "$root" diff --binary --cached HEAD -- "$p") \
+        && { [ -f "$dest/current" ] && cmp -s "$dest/current" "$root/$p" \
+            || { [ ! -f "$dest/current" ] && [ ! -e "$root/$p" ]; }; }
 }
 
 # Before a reset that discards local edits wholesale (update.sh's rollback
@@ -264,12 +280,14 @@ genesis_ephemeral_backup_is_current() {
 # file whose CURRENT edits are not already saved under <dest-root> or
 # <dest-root>/late is backed up under <dest-root>/rollback. Unlike the
 # predicates above this one REPORTS to the operator, because a caller that gets
-# here has already decided to reset; a failed backup is named, never fatal —
-# what the caller does with a file it could not save is its own business
-# (update.sh's checkout then refuses over it; the caller's message says so).
-# Always returns 0.
+# here has already decided to reset; a failed backup is named, never fatal to
+# this function — what the caller does with a file it could not save is its own
+# business. Returns non-zero when any dirty file's backup failed, so a caller
+# whose reset is unconditional (bootstrap's `reset --hard`) can refuse it;
+# update.sh adds `|| true` because its non-forced checkout refuses over the
+# unsaved edit on its own.
 genesis_ephemeral_backup_before_reset() {
-    local root="$1" broot="$2" p
+    local root="$1" broot="$2" p rc=0
     for p in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
         genesis_ephemeral_is_dirty "$root" "$p" || continue
         if genesis_ephemeral_backup_is_current "$root" "$p" "$broot" \
@@ -280,7 +298,8 @@ genesis_ephemeral_backup_before_reset() {
             echo "  Backed up local edits to $p before the rollback: $broot/rollback/$p"
         else
             echo "  WARNING: could not back up local edits to $p before the rollback; the edit is left in place."
+            rc=1
         fi
     done
-    return 0
+    return "$rc"
 }
