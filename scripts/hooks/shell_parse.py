@@ -380,6 +380,36 @@ _RUN_CARRIER_VALUE_FLAGS = frozenset(
 )
 # Interpreters that run a script string passed after -c; recurse into it.
 _NESTED = {"bash", "sh", "dash", "zsh", "ksh", "ash"}
+#: Resolved executables that EXECUTE a here-document's body — the reason a
+#: quoted ``<<'EOF'`` body cannot simply be dropped. ``Segment.exe`` is already
+#: wrapper-, assignment- and directory-stripped, so the set names receivers,
+#: never spellings of them; ``python`` additionally prefix-matches the
+#: versioned spellings (``python3``, ``python3.12``) at the call site. The
+#: SAME SET lives in ``secrets_target._EXEC_RECEIVERS`` (Devin SEC finding,
+#: #1826), which imports this module — the shared copy cannot live there —
+#: so the two are kept in step by hand.
+_HEREDOC_STDIN_EXECUTORS = frozenset(
+    {
+        "bash",
+        "zsh",
+        "dash",
+        "sh",
+        "ksh",
+        "fish",
+        "node",
+        "nodejs",
+        "ruby",
+        "perl",
+        "php",
+        "lua",
+        "pwsh",
+        "powershell",
+        "ssh",
+        "docker",
+        "kubectl",
+        "podman",
+    }
+)
 # Shell tokens that can front a SIMPLE COMMAND within a segment (after
 # split_segments has already cut on ; | & && || newline). Stripping them at
 # command position lets analyze() resolve the real exe THROUGH a control
@@ -565,12 +595,20 @@ class _ParsedSegment(NamedTuple):
     ``argv_src`` is ``raw`` with every redirect operator+target removed — the string
     ``analyze`` tokenizes into argv, so a redirect target can never spoof the
     subcommand. ``redirects`` are the expansion operator-target words excised from
-    ``argv_src`` (observability).
+    ``argv_src`` (observability). ``heredocs`` holds the bodies of QUOTED
+    here-documents (``<<'EOF'``/``<<"EOF"``/``<<\\EOF``) opened on this segment —
+    captured, not emitted as segments, so literal text cannot masquerade as
+    commands; ``analyze`` re-feeds them as nested scripts only when the resolved
+    receiver EXECUTES its stdin (a ``bash <<'EOF'`` body really does run).
+    ``pipes_to_next`` marks a segment whose stdout is piped to the next segment's
+    stdin — the channel that lets ``cat <<'EOF' | bash`` execute a quoted body.
     """
 
     raw: str
     argv_src: str
     redirects: tuple[str, ...]
+    heredocs: tuple[str, ...] = ()
+    pipes_to_next: bool = False
 
 
 def _command_sub_end(command: str, i: int, n: int) -> int:
@@ -669,6 +707,72 @@ def _redirect_target_end(command: str, j0: int, n: int) -> int:
     return j
 
 
+def _heredoc_delimiter(word: str) -> tuple[str, bool]:
+    """The terminating delimiter and quoting of a ``<<`` target word.
+
+    Bash quote-removes the delimiter word; quoting ANY part of it — a ``'``,
+    a ``"``, or a ``\\`` — makes the body literal: no expansion, no command
+    substitution. Returns ``(delimiter, quoted)``; ``("", False)`` when the
+    word cannot delimit a body statically — empty, or carrying a ``$`` /
+    backtick expansion whose RESULT names the delimiter. An expansion
+    delimiter is left untracked on purpose: without a known terminator the
+    body's extent is unknowable, and today's line-wise behaviour (every body
+    line is a segment) is the posture that cannot hide a real command.
+    """
+    if not word or "$" in word or "`" in word:
+        return "", False
+    out: list[str] = []
+    q: str | None = None
+    quoted = False
+    i = 0
+    while i < len(word):
+        ch = word[i]
+        if q is not None:
+            if ch == q:
+                q = None
+            else:
+                out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < len(word):  # \<c> quotes the delimiter too
+            quoted = True
+            out.append(word[i + 1])
+            i += 2
+            continue
+        if ch in ("'", '"'):
+            quoted = True
+            q = ch
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    if q is not None:  # unterminated quote in the delimiter — invalid shell
+        return "", False
+    return "".join(out), quoted
+
+
+def _heredoc_body_end(
+    command: str, i: int, n: int, delim: str, strip_tabs: bool
+) -> tuple[str, int]:
+    """``(body, next_index)`` of a here-document body starting at ``command[i]``.
+
+    The body runs line-wise until a line equal to the delimiter (leading tabs
+    ignored only for ``<<-``, bash's tab-strip spelling) and ends BEFORE that
+    line — the delimiter is not part of the body. Unterminated input consumes
+    to end-of-string, matching bash reading to EOF.
+    """
+    body_start = i
+    while i < n:
+        line_end = command.find("\n", i)
+        if line_end == -1:
+            line_end = n
+        line = command[i : line_end]
+        if (line.lstrip("\t") if strip_tabs else line) == delim:
+            return command[body_start:i], line_end + (1 if line_end < n else 0)
+        i = line_end + 1
+    return command[body_start:n], n
+
+
 def parse_segments(command: str) -> list[_ParsedSegment]:
     """Split a command line into executed segments, returning per segment BOTH the raw
     text and a redirect-STRIPPED argv source (see ``_ParsedSegment``).
@@ -697,15 +801,29 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
     other direction (locked by the ``$(;)``/``$(&&)``/``$(|)`` cases in the redirect-argv
     test's EXPLOITS).
     """
-    pairs: list[tuple[str, str, list[str]]] = []
+    pairs: list[list] = []  # [raw, argv_src, redirects, quoted_heredoc_bodies, pipes_to_next]
     raw_buf: list[str] = []
     argv_buf: list[str] = []
     redirs: list[str] = []
+    #: ``(delimiter, quoted, strip_tabs, owner_pair_index)`` per ``<<``/``<<-``
+    #: opener on the line being scanned — every heredoc on a logical line queues
+    #: its body after the line's newline, in operator order.
+    pending: list[tuple[str, bool, bool, int]] = []
     i, n = 0, len(command)
     quote: str | None = None
+    in_comment = False
     while i < n:
         c = command[i]
-        if quote:
+        if in_comment:
+            if c != "\n":
+                # A `#` comment swallows operators whole — a `<<` in one opens
+                # NO heredoc, and a `;`/`|` inside it splits nothing.
+                raw_buf.append(c)
+                argv_buf.append(c)
+                i += 1
+                continue
+            in_comment = False  # the newline ends the comment AND splits
+        elif quote:
             raw_buf.append(c)
             argv_buf.append(c)
             if quote == '"' and c == "\\" and i + 1 < n:
@@ -723,9 +841,17 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
             argv_buf.append(c)
             i += 1
             continue
+        if c == "#" and (i == 0 or command[i - 1] in " \t\n;&|("):
+            in_comment = True
+            raw_buf.append(c)
+            argv_buf.append(c)
+            i += 1
+            continue
         two = command[i : i + 2]
         if two in ("&&", "||"):
-            pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
+            pairs.append(
+                ["".join(raw_buf), "".join(argv_buf), list(redirs), [], False]
+            )
             raw_buf, argv_buf, redirs = [], [], []
             i += 2
             continue
@@ -759,6 +885,21 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
             if j < n and t not in _TARGET_STOP:
                 j = _redirect_target_end(command, j0, n)
             target = command[j0:j]
+            if (
+                command[i] == "<"
+                and command[i + 1 : i + 2] == "<"
+                and command[i + 2 : i + 3] != "<"
+                and target
+            ):
+                # A `<<`/`<<-` here-document opener (NOT `<<<`, which returns
+                # op_len 3, and not `<&`, which starts with `<` alone). A `-`
+                # abutting the operator is `<<-`'s tab-strip marker, not part
+                # of the delimiter word.
+                strip_tabs = command[i + 2 : i + 3] == "-"
+                word = target[1:] if strip_tabs else target
+                delim, hquoted = _heredoc_delimiter(word)
+                if delim:
+                    pending.append((delim, hquoted, strip_tabs, len(pairs)))
             if "$" in target or "`" in target:
                 # Expansion-carrying target: KEEP in raw (nested command stays visible
                 # to the destructive guard via _substitutions), EXCLUDE from argv_src so
@@ -773,17 +914,56 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
             i = j
             continue
         if c in (";", "|", "&", "\n"):
-            pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
+            pairs.append(
+                [
+                    "".join(raw_buf),
+                    "".join(argv_buf),
+                    list(redirs),
+                    [],
+                    c == "|",
+                ]
+            )
             raw_buf, argv_buf, redirs = [], [], []
             i += 1
+            if c == "\n":
+                # Here-document bodies follow the line that opened them, in
+                # operator order. A QUOTED delimiter (`<<'E'`/`<<"E"`/`<<\E`)
+                # makes the body literal — captured on its owning segment and
+                # NEVER split into commands, matching what a single-quoted
+                # string already gets (#1889); analyze re-feeds it as a nested
+                # script iff the resolved receiver executes its stdin. An
+                # UNQUOTED body can still expand `$(…)`/backticks/`$var`, so
+                # its lines keep flowing through the segmenter as before.
+                while pending:
+                    delim, hquoted, strip_tabs, owner = pending.pop(0)
+                    body, i = _heredoc_body_end(command, i, n, delim, strip_tabs)
+                    if hquoted:
+                        pairs[owner][3].append(body)
+                    else:
+                        for ps in parse_segments(body):
+                            pairs.append(
+                                [
+                                    ps.raw,
+                                    ps.argv_src,
+                                    list(ps.redirects),
+                                    list(ps.heredocs),
+                                    ps.pipes_to_next,
+                                ]
+                            )
             continue
         raw_buf.append(c)
         argv_buf.append(c)
         i += 1
-    pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
+    pairs.append(["".join(raw_buf), "".join(argv_buf), list(redirs), [], False])
     return [
-        _ParsedSegment(raw=r.strip(), argv_src=a.strip(), redirects=tuple(d))
-        for (r, a, d) in pairs
+        _ParsedSegment(
+            raw=r.strip(),
+            argv_src=a.strip(),
+            redirects=tuple(d),
+            heredocs=tuple(h),
+            pipes_to_next=p,
+        )
+        for (r, a, d, h, p) in pairs
         if r.strip()  # filter on RAW — keeps the exact set/alignment split_segments had
     ]
 
@@ -3330,7 +3510,8 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
     # closes. Counted on the segment SOURCE text outside quotes and comments, so a
     # paren inside a quoted argument is never mistaken for a subshell.
     carried_open = 0
-    for seg in parse_segments(command):
+    parsed = parse_segments(command)
+    for idx, seg in enumerate(parsed):
         raw = seg.raw
         override = _has_trailing_override(raw)
         # argv is tokenized from the redirect-STRIPPED source, so a redirect target
@@ -3339,6 +3520,7 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
         argv = _strip_wrappers(tokens, carried_open)
         carried_open = max(0, carried_open + _net_subshell_depth(seg.argv_src))
         exe = _basename(argv[0]) if argv else ""
+        unresolved = _verb_unresolved(argv)
         out.append(
             Segment(
                 exe=exe,
@@ -3346,7 +3528,7 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
                 override=override,
                 raw=raw,
                 redirects=list(seg.redirects),
-                verb_unresolved=_verb_unresolved(argv),
+                verb_unresolved=unresolved,
             )
         )
         nested = []
@@ -3357,6 +3539,15 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
 
         nested.extend(_embedded_commands(_argv(seg.argv_src)))
         nested.extend(_substitutions(raw))
+        if seg.heredocs and _heredoc_bodies_execute(
+            parsed, idx, exe, unresolved, carried_open
+        ):
+            # A QUOTED-heredoc body is literal text — it reaches the nested
+            # scan only when its receiver runs stdin as a program (`bash
+            # <<'EOF'` really executes it; `cat <<'EOF'` does not). The
+            # pipe-forward case (`cat <<'EOF' | bash`) is decided on the NEXT
+            # segment's verb.
+            nested.extend(seg.heredocs)
         if not nested:
             continue
         # Past the bound, STOP DESCENDING — and SAY SO. Every scanner below runs
@@ -3385,6 +3576,47 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
                     )
                 )
     return out, ("depth" if truncated else None)
+
+
+def _exe_executes_heredoc_stdin(exe: str, verb_unresolved: bool) -> bool:
+    """Whether a segment's resolved verb RUNS a here-document body fed to it.
+
+    The known receivers are the executors (``_HEREDOC_STDIN_EXECUTORS``, the
+    same set ``secrets_target._EXEC_RECEIVERS`` carries); an EMPTY or
+    expansion-carrying verb is treated as executing — failing that direction
+    keeps a body visible, and the cost of a wrong True is a data heredoc's
+    prose scanned as commands, the posture this module takes everywhere else.
+    """
+    return (
+        not exe
+        or verb_unresolved
+        or exe in _HEREDOC_STDIN_EXECUTORS
+        or exe.startswith("python")
+    )
+
+
+def _heredoc_bodies_execute(
+    parsed: list[_ParsedSegment],
+    idx: int,
+    exe: str,
+    verb_unresolved: bool,
+    carried_open: int,
+) -> bool:
+    """Whether the quoted-heredoc bodies captured on ``parsed[idx]`` RUN.
+
+    True when the heredoc's own receiver executes stdin, or — the
+    ``cat <<'EOF' | bash`` idiom — the body is PIPED into a following segment
+    that does. Only the immediate pipe target is resolved: a longer chain
+    (``| grep | bash``) is a documented residue, not modelled.
+    """
+    if _exe_executes_heredoc_stdin(exe, verb_unresolved):
+        return True
+    seg = parsed[idx]
+    if not seg.pipes_to_next or idx + 1 >= len(parsed):
+        return False
+    nargv = _strip_wrappers(_argv(parsed[idx + 1].argv_src), carried_open)
+    nexe = _basename(nargv[0]) if nargv else ""
+    return _exe_executes_heredoc_stdin(nexe, _verb_unresolved(nargv))
 
 
 def is_pytest_invocation(seg: Segment) -> bool:

@@ -865,11 +865,17 @@ class TestATargetTheGuardCannotReadIsRefused:
     def test_prose_naming_a_supplied_removal_gets_an_honest_refusal(
         self, guard_cmd: str
     ) -> None:
-        """KNOWN COST, pinned. The parser keeps no here-document state, so prose that
-        names the removal under `xargs` in a here-document reads exactly like a body a
-        shell runs, and is refused. The refusal must not claim that anything runs or
-        name a target, and must give the remedy for text."""
+        """RETIRED COST (#1889), re-pinned. The parser keeps here-document
+        state now: a body under a QUOTED delimiter is literal text, so prose
+        naming the removal under `xargs` in `git commit -F - <<'EOF'` is DATA
+        and runs — the earlier "reads like a body a shell runs" refusal is
+        gone. The paired refusal survives where the body really does run: a
+        `bash <<'EOF'` body is a script bash executes, still refused with the
+        same honest wording (no invented target, the remedy for text)."""
         cmd = f"git commit -F - <<'EOF'\nfix: refuse `xargs {_PHRASE}`\nEOF"
+        result = _run_guard(guard_cmd, {"command": cmd})
+        assert result.returncode == 0, result.stdout + result.stderr
+        cmd = f"bash <<'EOF'\necho x | xargs {_PHRASE}\nEOF"
         result = _run_guard(guard_cmd, {"command": cmd})
         assert result.returncode == 2, result.stdout + result.stderr
         assert _UNREAD in result.stderr

@@ -869,6 +869,101 @@ def test_has_top_level_pipe_real_pipe_around_substitution(cmd):
     assert sp.has_top_level_pipe(cmd) is True
 
 
+# ── quoted heredocs (#1889) ─────────────────────────────────────────────
+
+
+class TestQuotedHeredocBody:
+    """Issue #1889: a here-document under a QUOTED delimiter is literal text
+    and must contribute no segments — the same treatment a single-quoted
+    string gets. The trap the fix cannot fall into: `bash <<'EOF'` executes
+    that "literal" body, so suppression applies only when the body is DATA —
+    the receiver (or the pipe target after it) decides. Bodies a resolved
+    executor reads as a program stay gated; an unresolved or expansion-carrying
+    verb fails toward visibility and scans the body as commands."""
+
+    def test_quoted_body_yields_no_segments(self):
+        cmd = "cat <<'EOF'\ngit push origin main\nEOF\necho after"
+        assert not _push_blocked(cmd)
+        assert [s.exe for s in sp.analyze(cmd)] == ["cat", "echo"]
+
+    def test_quoted_body_hides_substitution_text(self):
+        # The issue's own repro: a backticked merge inside a quoted body is
+        # prose, not a run command.
+        cmd = "cat <<'PROBE'\nprose: `git -C /x merge origin/main`\nPROBE"
+        assert not any(s.exe == "git" for s in sp.analyze(cmd))
+
+    @pytest.mark.parametrize(
+        "opener", ["<<'EOF'", '<<"EOF"', "<<\\EOF", "<<-'EOF'"]
+    )
+    def test_every_quoting_form_is_literal(self, opener):
+        # ANY quoted char of the delimiter word quotes the body; <<-
+        # additionally strips leading TABS on the delimiter line.
+        cmd = f"cat {opener}\ngit push origin main\nEOF"
+        if "<<-" in opener:
+            cmd = f"cat {opener}\n\tgit push origin main\n\tEOF"
+        assert not _push_blocked(cmd)
+
+    def test_unquoted_body_still_yields_segments(self):
+        # Regression pin: expansions DO happen in an unquoted body, so its
+        # lines keep flowing through the segmenter as before.
+        cmd = "cat <<EOF\ngit push origin main\nEOF"
+        assert _push_blocked(cmd)
+
+    def test_bash_executor_body_stays_gated(self):
+        assert _push_blocked("bash <<'EOF'\ngit push origin main\nEOF")
+
+    def test_wrapped_executor_body_stays_gated(self):
+        # exe is wrapper-stripped, so the receiver set names verbs, not
+        # spellings of them.
+        assert _push_blocked("sudo bash <<'EOF'\ngit push origin main\nEOF")
+
+    def test_python_executor_body_stays_gated(self):
+        segs = sp.analyze("python3 <<'PY'\nimport os\nPY")
+        assert any(s.exe == "import" and s.depth == 1 for s in segs)
+
+    def test_pipe_forward_to_executor_stays_gated(self):
+        # `cat <<'EOF' | bash` — cat cannot run the body, but bash can.
+        assert _push_blocked("cat <<'EOF' | bash\ngit push origin main\nEOF")
+
+    def test_pipe_to_data_consumer_suppresses(self):
+        cmd = "cat <<'EOF' | wc -l\ngit push origin main\nEOF"
+        assert not _push_blocked(cmd)
+
+    def test_unresolved_receiver_scans_body_as_commands(self):
+        # Expansion-carrying verb: cannot be told from a shell, so the body
+        # stays visible — the module's posture everywhere else.
+        assert _push_blocked("$SHELL <<'EOF'\ngit push origin main\nEOF")
+
+    def test_comment_cannot_open_a_heredoc(self):
+        # `<<` inside a `#` comment is not a redirect; the "body" is real code.
+        cmd = "echo hi;# <<'EOF'\ngit push origin main\nEOF"
+        assert _push_blocked(cmd)
+
+    def test_two_quoted_heredocs_share_one_line(self):
+        cmd = "a <<'E1' && b <<'E2'\nb1 git push\nE1\nb2 git merge\nE2\necho after"
+        assert [s.exe for s in sp.analyze(cmd)] == ["a", "b", "echo"]
+
+    def test_unquoted_then_quoted_keeps_order(self):
+        # The unquoted body's segments must land between the two owners, not
+        # after the quoted body's drain.
+        cmd = "a <<E1 && b <<'E2'\nb1 git push\nE1\nb2 git merge\nE2\necho after"
+        exes = [s.exe for s in sp.analyze(cmd)]
+        assert "b1" in exes
+        assert "b2" not in exes
+
+    def test_heredoc_inside_a_substitution(self):
+        # `$(cat <<'EOF' …)` inside an argument: the inner body is still
+        # quoted text, suppressed at depth 1.
+        cmd = 'gh pr create --body "$(cat <<\'EOF\'\nbare git push\nEOF\n)"'
+        assert not _push_blocked(cmd)
+
+    def test_expansion_delimiter_is_not_a_heredoc(self):
+        # A delimiter carrying an expansion cannot be resolved, so `<<$D`
+        # registers nothing and the body parses as commands — visible, the
+        # safe direction.
+        assert _push_blocked("cat <<$D\ngit push origin main\n$D")
+
+
 class TestSigilRunRegression:
     """A sigil passed to has_trailing_override but absent from _KNOWN_SIGILS is
     read as PROSE, so writing it FIRST silently ends the leading run and disables
