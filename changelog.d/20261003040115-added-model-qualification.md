@@ -1,6 +1,6 @@
-- Add an isolated MiMo qualification CLI that freezes evaluation contracts,
-  records provider identity and billing evidence, preserves interrupted attempts,
-  and refuses execution without independent reference approval and a complete
-  request budget within a frozen campaign ceiling (default $5). Preparation
-  checks both disposable novelty storage paths; paid answers remain recoverable
-  after local scoring failures. Production model selection is unchanged.
+- Add `python -m genesis.eval.qualification`, which measures whether an
+  OpenRouter routing alias agrees with owner-labelled references on the judge
+  rubrics, J9 relevance and procedure novelty, and pairs two aliases side by side.
+  Each request is pinned to one upstream with a price ceiling, spend is bounded by
+  a dedicated credit-limited key and a request cap, and paid answers are kept so a
+  rerun never pays twice. Production model selection is unchanged.

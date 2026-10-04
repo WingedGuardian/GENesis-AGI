@@ -2316,19 +2316,20 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 04b6c6614 2026-10-03
+verified: 788dd9a9 2026-09-06
 ```
 
-- **Model qualification has an isolated offline CLI** (`eval/qualification`,
-  `python -m genesis.eval.qualification`). It freezes contract/corpus/prompt and
-  parameter identities, observes the existing delegate's serialized requests and
-  provider responses, and reserves verified maximum charges in a private journal
-  before dispatch under a frozen campaign ceiling (default $5). Three repetitions exercise all six
-  registered rubrics, J9 relevance, and cross-type novelty with both disposable
-  storage paths. Synthetic tests establish transport/accounting/storage integration;
-  they do not qualify MiMo or prove real retrieval/extraction quality. Independent
-  labels, approved pricing bounds, paid qualification and route-specific promotion
-  remain separate prerequisites. See `docs/reference/model-qualification.md`.
+- **Model qualification is keyed by routing alias** (`eval/qualification`,
+  `python -m genesis.eval.qualification check|run|report`). Rubrics go through
+  `calibration.run_calibration` with `PinnedRouter`, a one-upstream, no-fallback
+  stand-in for `Router` (which would write production cost rows); J9 relevance and
+  cross-type novelty keep a small loop over the production `_judge_relevance` and
+  `_principle_is_novel` paths. Spend is bounded by a dedicated credit-limited
+  OpenRouter key plus a request cap counted from append-only `dispatch` lines;
+  paid answers carry a prompt hash and are reused, so a crash or rescore never pays
+  twice. The owner labels and approves references. `report --against` pairs two
+  aliases. Synthetic tests prove mechanics only; real labels, a paid run and route
+  promotion remain owner steps. See `docs/reference/model-qualification.md`.
 
 - **The graders are TOLD the response status; they must never infer it.** The
   triage/outcome/delta graders each judge an `InteractionSummary`, and the
