@@ -696,6 +696,9 @@ async def drain_pending_issue_posts(rt: object) -> int:
     mode = effective_mode()
     board_mode = _board_mode()
     if mode == "off" and board_mode == "off":
+        # Both levers off: no hold is touched, but the local relink pass still
+        # runs (see the end of this function).
+        await _reconcile_board_links(db, datetime.now(UTC).isoformat())
         return 0
 
     # Rate-cap VALUE read once per tick (live, no cache); the per-row COUNT that
@@ -758,6 +761,8 @@ async def drain_pending_issue_posts(rt: object) -> int:
                 resolved += 1
         # status == 'pending' → still awaiting the owner; leave held.
 
-    if board_mode != "off":
-        await _reconcile_board_links(db, datetime.now(UTC).isoformat())
+    # Not gated on the board lever: it writes only the local pointer for an issue
+    # already posted (no GitHub call), and skipping it while the board is off let
+    # an unlinked post age out of the cross-lane record.
+    await _reconcile_board_links(db, datetime.now(UTC).isoformat())
     return resolved

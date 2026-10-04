@@ -104,16 +104,13 @@ def _overlay_plan() -> tuple[Path, Path, dict | None]:
 
 
 def _record_project(plan: tuple[Path, Path, dict], owner: str, number: int, say) -> None:
-    import os
-
     import yaml
+
+    from genesis.util.atomic import atomic_write_text
 
     read_from, write_to, data = plan
     data = {**data, "project_owner": owner, "project_number": number}
-    write_to.parent.mkdir(parents=True, exist_ok=True)
-    tmp = write_to.with_name(write_to.name + ".tmp")
-    tmp.write_text(yaml.safe_dump(data, sort_keys=False))
-    os.replace(tmp, write_to)
+    atomic_write_text(write_to, yaml.safe_dump(data, sort_keys=False))
     if read_from != write_to:
         say(f"carried every key of the legacy overlay {read_from} into {write_to}")
     say(f"recorded project_owner={owner} project_number={number} in {write_to}")

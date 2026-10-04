@@ -348,7 +348,8 @@ async def prune_terminal(
     ``kind='follow_up' AND status IN ('pending', 'in_progress')``.
 
     Retention is WIDER than the close-loop needs: every ``posted`` row naming a
-    follow-up is kept while that follow-up row still exists — adopted rows and
+    follow-up — in either lane's spelling, the contributor lane's bare id or the
+    work-board lane's ``follow_up:<id>`` — is kept while that follow-up row still exists — adopted rows and
     resolved follow-ups included. It is the record that this follow-up already
     has a public issue, and the work-board lane's cross-lane check
     (``board.promotion`` at propose, the drain at post time) reads it; pruning
@@ -367,6 +368,7 @@ async def prune_terminal(
         "AND COALESCE(posted_at, rejected_at, dry_run_at, held_at) < ? "
         "AND NOT (status = 'posted' AND source_ref IS NOT NULL AND EXISTS ("
         "  SELECT 1 FROM follow_ups f WHERE f.id = pending_issue_posts.source_ref"
+        "  OR 'follow_up:' || f.id = pending_issue_posts.source_ref"
         "))",
         (cutoff,),
     )

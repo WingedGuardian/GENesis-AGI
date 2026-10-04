@@ -317,6 +317,20 @@ class TestCrud:
         assert (await pip.get_by_id(db, "p"))["status"] == "posted"
 
     @pytest.mark.asyncio
+    async def test_prune_keeps_a_board_lane_posted_row_naming_the_follow_up(self, db):
+        # The work-board lane spells the same record ``follow_up:<id>``; it is the
+        # cross-lane record just as the contributor lane's bare id is.
+        await _seed_followup(db, id="fu-b", status="completed")
+        row = {**_ROW, "id": "pb", "request_id": "r-pb", "source": "board"}
+        await pip.create(db, **{**row, "source_ref": "follow_up:fu-b"})
+        await pip.mark_posted(
+            db, "pb", issue_number=8, issue_url="u", posted_at="2026-01-01T00:00:00"
+        )
+        deleted = await pip.prune_terminal(db, older_than_days=30, now="2026-08-07T00:00:00")
+        assert deleted == 0
+        assert (await pip.get_by_id(db, "pb"))["status"] == "posted"
+
+    @pytest.mark.asyncio
     async def test_prune_reaps_a_posted_row_whose_follow_up_is_gone(self, db):
         # Bounded: once the follow-up row is deleted it can no longer be promoted,
         # so nothing needs the record and it ages out.

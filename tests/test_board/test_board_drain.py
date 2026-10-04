@@ -276,6 +276,34 @@ async def test_a_posted_row_missing_its_link_is_relinked_next_tick(db, monkeypat
     assert (await _row(db, out["pending_id"]))["status"] == "posted"
 
 
+@pytest.mark.parametrize("contributor_mode", ["off", "live"])
+async def test_the_relink_pass_runs_while_the_board_is_off(db, monkeypatch, contributor_mode):
+    """It writes only the local pointer for an issue already posted, so the board
+    lever must not stop it: skipped, an unlinked post aged out of the cross-lane
+    record and a contributor proposal could post a second issue."""
+    gh = FakeGh()
+    monkeypatch.setattr(ciw, "_run_gh", gh)
+    await _promote(db)
+
+    async def fail_once(*_a, **_k):
+        return False
+
+    with monkeypatch.context() as m:
+        m.setattr(ciw, "_link_board", fail_once)
+        await ciw.drain_pending_issue_posts(_RT(db))
+    assert (
+        await board_crud.get_link_by_source(db, source_kind="follow_up", source_id=FOLLOW) is None
+    )
+    # Board off; the contributor lane off (the drain returns early) or live (the
+    # drain runs to its end): either way no hold moves and the pointer is written.
+    monkeypatch.setattr(board_config, "effective_mode", lambda: "off")
+    monkeypatch.setattr(ciw, "effective_mode", lambda: contributor_mode)
+    await ciw.drain_pending_issue_posts(_RT(db))
+    link = await board_crud.get_link_by_source(db, source_kind="follow_up", source_id=FOLLOW)
+    assert link is not None and link["issue_number"] == 77
+    assert sum(1 for c in gh.calls if c[:2] == ["issue", "create"]) == 1, "nothing re-posted"
+
+
 async def test_a_failed_marker_lookup_never_posts(db, monkeypatch):
     out = await _promote(db)
 
