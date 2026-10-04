@@ -864,6 +864,44 @@ if [[ "$POST_MERGE" == "false" ]]; then
         _clear_deploy_state
         exit 1
     fi
+
+    # An excused path can be cleared before a normal merge, but a staged add or
+    # deletion on divergent histories can survive that clear and fail after stop.
+    # Fast-forward and local-ahead histories do not need this refusal.
+    # BEGIN staged-excused-divergence
+    _refuse_staged_excused_divergence() {
+        echo "  $1 — server NOT stopped, nothing changed."
+        git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
+        _clear_deploy_state
+        exit 1
+    }
+
+    _staged_guard_is_ancestor() {
+        local rc=0
+        git -C "$GENESIS_ROOT" merge-base --is-ancestor "$1" "$2" >/dev/null 2>&1 || rc=$?
+        [ "$rc" -le 1 ] || _refuse_staged_excused_divergence "Could not compare $1 with $2"
+        return "$rc"
+    }
+
+    if ! _staged_guard_is_ancestor HEAD "$DEPLOY_HEAD" \
+        && ! _staged_guard_is_ancestor "$DEPLOY_HEAD" HEAD; then
+        _excused_pathspecs=(':(literal)AGENTS.md' ':(literal)config/procedure_triggers.yaml'
+            ':(literal).claude/settings.local.json' ':(literal).serena/project.yml'
+            ':(literal)src/genesis/identity/USER.md')
+        if ! _staged_excused_status="$(git -C "$GENESIS_ROOT" diff --cached --name-status --no-renames HEAD -- "${_excused_pathspecs[@]}" 2>/dev/null)"; then
+            _refuse_staged_excused_divergence "Could not read the staged index for excused paths on divergent history"
+        fi
+        _staged_excused_ad=()
+        while IFS=$'\t' read -r _staged_status _staged_path; do
+            case "$_staged_status" in A|D) _staged_excused_ad+=("$_staged_status $_staged_path") ;; esac
+        done <<< "$_staged_excused_status"
+        if [ "${#_staged_excused_ad[@]}" -gt 0 ]; then
+            echo "  Staged additions or deletions on excused paths block a divergent update:"
+            printf '%s\n' "${_staged_excused_ad[@]}" | sed 's/^/    /'
+            _refuse_staged_excused_divergence "Resolve these staged path changes first"
+        fi
+    fi
+    # END staged-excused-divergence
 fi
 
 # ── Back up locally edited ephemeral files BEFORE anything stops ──────

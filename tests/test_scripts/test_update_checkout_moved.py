@@ -1157,3 +1157,138 @@ def test_another_fetch_moving_the_tracking_ref_cannot_change_the_pin(upstream_an
     )
     assert re.search(r"PIN=(\w+)", r.stdout).group(1) == _git(up, "rev-parse", "main")
     assert _git(clone, "for-each-ref", "refs/genesis/") == "", "the private ref is deleted"
+
+
+_EXCUSED_STAGED_PATHS = (
+    "AGENTS.md",
+    "config/procedure_triggers.yaml",
+    ".claude/settings.local.json",
+    ".serena/project.yml",
+    "src/genesis/identity/USER.md",
+)
+
+
+def _divergent_deploy_head(root: Path) -> str:
+    _git(root, "checkout", "-qb", "incoming")
+    (root / "upstream.txt").write_text("upstream\n")
+    _git(root, "add", "--", "upstream.txt")
+    _git(root, "commit", "-qm", "upstream change")
+    deploy_head = _git(root, "rev-parse", "HEAD")
+    _git(root, "checkout", "-q", "main")
+    (root / "local.txt").write_text("local\n")
+    _git(root, "add", "--", "local.txt")
+    _git(root, "commit", "-qm", "local divergence")
+    return deploy_head
+
+
+def _track_agents(root: Path) -> None:
+    (root / "AGENTS.md").write_text("tracked install file\n")
+    _git(root, "add", "--", "AGENTS.md")
+    _git(root, "commit", "-qm", "track excused file")
+
+
+def _run_staged_excused_guard(
+    root: Path, deploy_head: str, home: Path, *, git_override: str = ""
+):
+    script = (
+        f"""GENESIS_ROOT="{root}"
+DEPLOY_HEAD="{deploy_head}"
+POST_MERGE=false
+ROLLBACK_TAG=pre-update-test
+_clear_deploy_state() {{ echo CLEAR-STATE; }}
+"""
+        + git_override + _block("staged-excused-divergence") + 'echo PASSED\n'
+    )
+    return _run(script, home)
+
+
+@pytest.mark.parametrize(
+    ("case", "history", "action"),
+    [
+        ("deletion-divergence", "divergent", "delete"),
+        ("ignored-add-divergence", "divergent", "ignored-add"),
+        ("edit-divergence", "divergent", "edit"),
+        ("deletion-fast-forward", "fast-forward", "delete"),
+        ("deletion-local-ahead", "local-ahead", "delete"),
+    ],
+)
+def test_staged_excused_path_guard_cases(repo, tmp_path, case, history, action):
+    _track_agents(repo)
+    if history == "divergent":
+        deploy_head = _divergent_deploy_head(repo)
+    elif history == "fast-forward":
+        _git(repo, "checkout", "-qb", "incoming")
+        (repo / "upstream.txt").write_text("upstream\n")
+        _git(repo, "add", "--", "upstream.txt")
+        _git(repo, "commit", "-qm", "upstream change")
+        deploy_head = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "checkout", "-q", "main")
+    else:
+        deploy_head = _git(repo, "rev-parse", "HEAD")
+        (repo / "local.txt").write_text("local-ahead commit\n")
+        _git(repo, "add", "--", "local.txt")
+        _git(repo, "commit", "-qm", "local-ahead commit")
+    if action == "ignored-add":
+        (repo / ".gitignore").write_text("config/procedure_triggers.yaml\n")
+        _git(repo, "add", "--", ".gitignore")
+        _git(repo, "commit", "-qm", "ignore generated procedure cache")
+        path = repo / "config" / "procedure_triggers.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("install-local cache\n")
+        _git(repo, "add", "-f", "--", "config/procedure_triggers.yaml")
+    elif action == "edit":
+        (repo / "AGENTS.md").write_text("staged edit\n")
+        _git(repo, "add", "--", "AGENTS.md")
+    elif action == "delete":
+        _git(repo, "rm", "--cached", "--", "AGENTS.md")
+
+    result = _run_staged_excused_guard(repo, deploy_head, tmp_path)
+
+    status = {
+        "deletion-divergence": "D AGENTS.md",
+        "ignored-add-divergence": "A config/procedure_triggers.yaml",
+    }.get(case)
+    assert result.returncode == (1 if status else 0), result.stderr
+    if status:
+        assert "staged additions or deletions" in result.stdout.lower()
+        assert status in result.stdout
+        assert "CLEAR-STATE" in result.stdout
+        assert "PASSED" not in result.stdout
+    else:
+        assert "PASSED" in result.stdout
+        assert "CLEAR-STATE" not in result.stdout
+
+
+@pytest.mark.parametrize("failure", ["index", "ancestor"])
+def test_staged_guard_read_failures_refuse_and_clean_up(repo, tmp_path, failure):
+    deploy_head = _divergent_deploy_head(repo)
+    if failure == "index":
+        _track_agents(repo)
+        (repo / ".git" / "index").write_bytes(b"not a git index")
+        git_override = ""
+    else:
+        git_override = (
+            'git() { [[ "$*" == *"merge-base --is-ancestor"* ]] && return 2; '
+            'command git "$@"; }\n'
+        )
+    result = _run_staged_excused_guard(
+        repo, deploy_head, tmp_path, git_override=git_override
+    )
+
+    expected = (
+        "could not read the staged index"
+        if failure == "index"
+        else "could not compare head with"
+    )
+    assert result.returncode == 1 and expected in result.stdout.lower()
+    assert "CLEAR-STATE" in result.stdout and "PASSED" not in result.stdout
+
+
+def test_staged_excused_guard_uses_literal_paths_and_precedes_the_stop():
+    text = _text()
+    block = _block("staged-excused-divergence")
+    assert all(f":(literal){path}" in block for path in _EXCUSED_STAGED_PATHS)
+    assert "--no-renames" in block
+    guard = text.index("# BEGIN staged-excused-divergence")
+    stop = text.index("--- Stopping services for update ---")
+    assert text.index('DEPLOY_HEAD="$(git -C "$GENESIS_ROOT" rev-parse') < guard < stop
