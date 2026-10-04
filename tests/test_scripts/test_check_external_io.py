@@ -1,4 +1,4 @@
-"""WS5 external-I/O regression guard (scripts/check_external_io.py)."""
+"""External-I/O regression guard (scripts/check_external_io.py)."""
 
 from __future__ import annotations
 
@@ -32,16 +32,42 @@ def test_allowlisted_file_is_skipped(tmp_path):
     assert check.scan(tmp_path, allowlist={f.as_posix()}) == []
 
 
-def test_no_false_positive_on_legit_compute_post(tmp_path):
-    # Legit compute/read egress (embeddings/search/etc.) must NOT trip the guard.
-    (tmp_path / "compute.py").write_text(
+def test_flags_planted_provider_reference(tmp_path):
+    # Provider endpoints are in scope now: a host literal outside the sanctioned
+    # set is exactly what the tests/* linter exclusion needs a CI backstop for.
+    f = tmp_path / "side_door.py"
+    f.write_text(
         'r = await client.post("https://api.deepinfra.com/v1/embeddings", json=payload)\n'
+    )
+    assert len(check.scan(tmp_path)) == 1
+
+
+def test_allowlisted_provider_reference_is_skipped(tmp_path):
+    f = tmp_path / "sanctioned.py"
+    f.write_text('BASE = "https://api.deepinfra.com/v1/embeddings"\n')
+    assert check.scan(tmp_path, allowlist={f.as_posix()}) == []
+
+
+def test_no_false_positive_on_unrelated_url(tmp_path):
+    # A compute/read URL on NO covered host must not trip either class.
+    (tmp_path / "compute.py").write_text(
+        'r = await client.post("https://api.example.com/v1/embeddings", json=payload)\n'
     )
     assert check.scan(tmp_path) == []
 
 
 def test_real_tree_is_clean_under_allowlist(monkeypatch):
-    # The shipped ALLOWLIST must cover every current egress endpoint (fail-closed but
+    # The shipped allowlists must cover every current reference (fail-closed but
     # currently-clean). This is the completeness invariant the CI step also enforces.
     monkeypatch.chdir(_REPO_ROOT)
-    assert check.scan(check.SCAN_ROOT) == []
+    for root in check.SCAN_ROOTS:
+        assert check.scan(root) == [], f"violations under {root}"
+
+
+def test_allowlist_entries_exist_and_carry_rationales():
+    # An entry for a file that no longer exists is silent dead weight: the file
+    # it covered is gone but the hole in the census remains. Keep entries live.
+    for table in (check.ALLOWLIST, check.PROVIDER_ALLOWLIST):
+        for rel, rationale in table.items():
+            assert (_REPO_ROOT / rel).is_file(), f"stale allowlist entry: {rel}"
+            assert rationale.strip(), f"empty rationale: {rel}"
