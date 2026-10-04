@@ -1083,99 +1083,88 @@ class TestForcePushRepoFlag:
         assert guard_module._resolve_push_remote(seg) == "origin"
 
 
-# ── #2513: command-borne config cannot soften a force push ───────────────
+# ── #2513: push config supplied by the command is not trusted ────────────
 
 
 class TestForcePushCommandBorneConfig:
-    """#2513: the disjoint-push-url read runs BEFORE the command, so config the
-    command itself carries or writes makes it describe a different destination
-    than the one git resolves — a BLOCK quietly downgraded to an ask. Every such
-    spelling fails the whole-command allowlist and is treated as public:
-    blocked. The unchanged happy path (a bare `git push --force` to a disjoint
-    remote) is pinned by TestForcePushRemoteAware / TestForcePushUrlClassification."""
+    """#2513: destination config is read before the command runs."""
 
-    def test_dash_c_pushurl_blocks(self, remotes_repo):
-        # `git -c` rewrites backups' push url for THIS push only; the repo read
-        # still sees the disjoint one. Was: cautious ask. Now: blocked.
-        cmd = (
-            "git -c remote.backups.pushurl=https://elsewhere.example/x.git "
-            f"push {_FORCE} backups main"
-        )
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            f"git -c remote.backups.pushurl=https://elsewhere.example/x.git push {_FORCE} backups main",
+            f"git --config-env=remote.backups.pushurl=X push {_FORCE} backups main",
+            f"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.backups.pushurl GIT_CONFIG_VALUE_0=https://x.example/x.git git push {_FORCE} backups main",
+            f"HOME=/tmp/elsewhere git push {_FORCE} backups main",
+            f"env git push {_FORCE} backups main",
+            f"git commit -m x && git push {_FORCE} backups main",
+            f"git push {_FORCE} backups main >.git/config",
+            f"git push {_FORCE} backups main | cat",
+        ],
+    )
+    def test_force_push_must_be_one_plain_command(self, remotes_repo, cmd):
         res = _run_cwd(cmd, str(remotes_repo))
         assert res.returncode == 2
-        assert "carries config the guard cannot read" in res.stderr
+        assert "a force push off the public repo must be the whole command" in res.stderr
+        assert "Run the force push on its own." in res.stderr
 
-    def test_git_config_env_prefix_blocks(self, remotes_repo):
-        cmd = (
-            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.backups.pushurl "
-            f"GIT_CONFIG_VALUE_0=https://x.example/x.git git push {_FORCE} backups main"
-        )
+    @pytest.mark.parametrize(
+        "force",
+        [_FORCE, f"{_FORCE}-with-lease", "+main", "-f"],
+    )
+    def test_plain_disjoint_force_still_asks(self, remotes_repo, force):
+        res = _run_cwd(f"git push {force} backups main", str(remotes_repo))
+        assert res.returncode == 0
+        assert _decision(res) == "ask"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            f"git push {_FORCE} origin main",
+            "git -c x=y push -f origin main",
+        ],
+    )
+    def test_origin_force_keeps_origin_block_message(self, remotes_repo, cmd):
         res = _run_cwd(cmd, str(remotes_repo))
         assert res.returncode == 2
+        assert "Force push to origin/<public> is not allowed" in res.stderr
 
-    def test_home_prefix_blocks(self, remotes_repo):
-        res = _run_cwd(
-            f"HOME=/tmp/elsewhere git push {_FORCE} backups main", str(remotes_repo)
-        )
-        assert res.returncode == 2
-
-    def test_env_wrapper_blocks(self, remotes_repo):
-        # A stripped wrapper can carry env assignments the prefix check must
-        # not assume away — any non-`git` first word refuses.
-        res = _run_cwd(f"env git push {_FORCE} backups main", str(remotes_repo))
-        assert res.returncode == 2
-
-    def test_config_env_longform_blocks(self, remotes_repo):
-        cmd = (
-            "git --config-env=remote.backups.pushurl=X "
-            f"push {_FORCE} backups main"
-        )
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "git -c remote.origin.push=+HEAD:refs/heads/main push origin",
+            "git --config-env=remote.origin.push=E push origin",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:refs/heads/main git push origin feat",
+            "timeout 60 git push origin feat",
+            "sudo git push origin feat",
+            "./git push origin feat",
+        ],
+    )
+    def test_nonforce_command_config_to_origin_blocks(self, remotes_repo, cmd):
         res = _run_cwd(cmd, str(remotes_repo))
         assert res.returncode == 2
-
-    def test_two_dash_c_blocks(self, remotes_repo):
-        # git applies repeated -C cumulatively but the guard resolves only the
-        # first — a second one makes the read describe the wrong repo.
-        res = _run_cwd(
-            f"git -C {remotes_repo} -C . push {_FORCE} backups main",
-            str(remotes_repo),
+        assert (
+            "this push to origin/<public> carries a prefix, wrapper or git config option"
+            in res.stderr
         )
-        assert res.returncode == 2
+        assert "Retype it as a plain `git push` (`-C <dir>` is fine)." in res.stderr
 
-    def test_earlier_set_url_blocks(self, remotes_repo):
-        cmd = (
-            "git remote set-url --push backups https://x.example/x.git && "
-            f"git push {_FORCE} backups main"
-        )
-        res = _run_cwd(cmd, str(remotes_repo))
-        assert res.returncode == 2
+    def test_nonforce_git_capital_C_dir_to_origin_is_not_blocked_by_config_rule(
+        self, remotes_repo
+    ):
+        res = _run_cwd(f"git -C {remotes_repo} push origin feat", str(remotes_repo))
+        assert res.returncode == 0
+        assert _decision(res) == "ask"
 
-    def test_earlier_git_config_blocks(self, remotes_repo):
-        cmd = (
-            "git config remote.backups.pushurl https://x.example/x.git && "
-            f"git push {_FORCE} backups main"
-        )
-        res = _run_cwd(cmd, str(remotes_repo))
-        assert res.returncode == 2
+    @pytest.mark.parametrize("global_flag", ["-P", "--no-pager"])
+    def test_nonforce_safe_git_global_to_origin_is_not_blocked_by_config_rule(
+        self, remotes_repo, global_flag
+    ):
+        res = _run_cwd(f"git {global_flag} push origin feat", str(remotes_repo))
+        assert res.returncode == 0
+        assert _decision(res) == "ask"
 
-    def test_earlier_redirect_into_config_blocks(self, remotes_repo):
-        cmd = f"echo x >> .git/config && git push {_FORCE} backups main"
-        res = _run_cwd(cmd, str(remotes_repo))
-        assert res.returncode == 2
-
-    def test_second_force_push_blocks(self, remotes_repo):
-        # A second push is not an inert neighbour — documented over-block:
-        # the allowlist treats the compound as unprovable, never asks.
-        cmd = (
-            f"git push {_FORCE} backups main && "
-            f"git push {_FORCE} backups other"
-        )
-        res = _run_cwd(cmd, str(remotes_repo))
-        assert res.returncode == 2
-
-    def test_inert_neighbour_still_asks(self, remotes_repo):
-        # The allowlist, not a ban on compounds: status/cd leave config alone.
-        res = _run_cwd(
-            f"git status && git push {_FORCE} backups main", str(remotes_repo)
-        )
+    def test_nonforce_command_config_to_disjoint_remote_still_asks(self, remotes_repo):
+        res = _run_cwd("git -c x=y push backups feat", str(remotes_repo))
+        assert res.returncode == 0
         assert _decision(res) == "ask"

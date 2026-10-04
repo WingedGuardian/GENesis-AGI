@@ -323,6 +323,7 @@ try:
         commit_skips_hooks,
         gh_pr_subcommand,
         git_subcommand,
+        git_subcommand_index,
         has_trailing_override,
         mentions,
         split_segments,
@@ -10921,58 +10922,32 @@ def _push_seg_has_no_prefix(seg) -> bool:
     return bool(words) and words[0] == "git"
 
 
-def _push_globals_carry_no_config(argv: list[str]) -> bool:
-    """Whether a ``git push`` argv borrows no config the repo reads cannot see.
+def _push_carries_command_config(seg) -> bool:
+    """Whether a push segment has a prefix, wrapper, or untrusted git global.
 
-    The same allowlist ``_push_ref_positionals`` applies before the ``push``
-    token: only ``-C`` (at most once — git applies repeated ``-C``
-    cumulatively while callers resolve the push cwd from the first) and the
-    pager switches ``-P`` / ``--no-pager``. Any other global — above all
-    ``-c`` / ``--config-env``, which supply config — is a False, as is an argv
-    whose ``push`` token never arrives.
-    """
-    i = 1  # skip argv[0] == "git"
-    dash_c = 0
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_SAFE_GLOBAL_VALUE_FLAGS:
-            dash_c += 1
-            if dash_c > 1:
-                return False
-            i += 2
-            continue
-        if t in _PUSH_SAFE_GLOBAL_FLAGS:
-            i += 1
-            continue
-        if t.startswith("-"):
-            return False  # -c / --config-env / --exec-path / --git-dir / unknown
-        break
-    return i < len(argv) and argv[i] == "push"
-
-
-def _force_push_reads_run_config(seg, segs, command: str) -> bool:
-    """Whether the force arm's config reads describe the config the push USES.
-
-    The arm resolves the destination and compares push-url sets BEFORE the
-    command runs, so anything in the command that carries or writes git
-    config makes the read describe a different destination than the one git
-    resolves (#2513): an assignment/env prefix (``GIT_CONFIG_*``, ``HOME=``,
-    an ``env``/``sudo`` wrapper — the parse strips them from argv, so only
-    the segment's raw text sees them), a git global option that supplies
-    config (``-c``, ``--config-env``, ``--exec-path``, ``--git-dir``), or an
-    earlier segment that can write config (``git config``, ``git remote
-    set-url --push``, a redirect into ``.git/config``). Each leg reuses the
-    predicate the re-push relaxation already trusts:
-    ``_push_seg_has_no_prefix``, ``_push_globals_carry_no_config`` (the
-    ``_PUSH_SAFE_GLOBAL_*`` scan), and ``_push_compound_is_inert``. Callers
-    fail closed on False — a force push whose destination cannot be proven
-    is treated as public, and public means blocked.
+    Only ``-C <dir>``, ``-P`` and ``--no-pager`` are safe before ``push``.
+    Git config supplied through any other global option, or an unrecognized
+    argv shape, is not visible to the guard's repository-config reads.
     """
     if not _push_seg_has_no_prefix(seg):
-        return False
-    if not _push_globals_carry_no_config(getattr(seg, "argv", None) or []):
-        return False
-    return _push_compound_is_inert(segs, seg, command)
+        return True
+    argv = list(getattr(seg, "argv", None) or [])
+    push_index = git_subcommand_index(argv)
+    if push_index is None or argv[push_index] != "push":
+        return True
+
+    i = 1
+    while i < push_index:
+        token = argv[i]
+        if token in _PUSH_SAFE_GLOBAL_VALUE_FLAGS:
+            if i + 1 >= push_index:
+                return True
+            i += 2
+        elif token in _PUSH_SAFE_GLOBAL_FLAGS:
+            i += 1
+        else:
+            return True
+    return False
 
 
 def _ref_names_current_branch(ref: str, cur: str | None) -> bool:
@@ -11160,6 +11135,15 @@ def _push_dest_urls(dest: str, cwd: str | None = None) -> set[str]:
     if _looks_like_url(dest):
         return {dest}
     return set()
+
+
+def _push_dest_meets_origin(remote: str | None, pcwd: str | None, pcwd_unknown: bool) -> bool:
+    """Whether a push destination is public or cannot be proven disjoint from origin."""
+    if pcwd_unknown or remote is None or remote == "origin":
+        return True
+    dest_urls = _push_dest_urls(remote, cwd=pcwd)
+    origin_urls = _remote_push_urls("origin", cwd=pcwd)
+    return not dest_urls or not origin_urls or bool(dest_urls & origin_urls)
 
 
 def _remote_branch_sha(remote: str, branch: str, cwd: str | None = None) -> str | None:
@@ -12194,29 +12178,16 @@ def _run_merge_and_push_gates() -> int:
             # all count as public ⇒ blocked (fail closed). Only a destination
             # whose push urls resolve AND are DISJOINT from origin's gets the
             # softer cautious-ask path — interactive asks, dispatched denies.
-            # AND the URL reads must describe the config the push runs with:
-            # config carried by the command itself (a `git -c`/`--config-env`
-            # option, a `HOME=`/`GIT_CONFIG_*` prefix, an earlier config-writing
-            # segment) makes the read describe a different destination, so a
-            # force push that fails the whole-command allowlist is treated as
-            # public too — blocked, never asked (#2513).
+            # A force push known to target origin is blocked before checking the
+            # command shape, preserving the specific public-destination message.
+            # Off-origin force pushes must be exactly one plain `git push`: a
+            # prefix, wrapper, global option, redirect or other step can make
+            # the pre-command destination read differ from what Git will push.
+            # For non-force pushes, command-borne config is blocked when the
+            # resolved destination is origin/public; config-writing neighbour
+            # steps remain outside this command-config rule.
             force_segs = [s for s in push_segs if _push_is_force(s.argv)]
             if force_segs:
-                if not _force_push_reads_run_config(force_segs[0], segs, cmd):
-                    print(
-                        "BLOCKED: this force push carries config the guard cannot "
-                        "read before the command runs — a `git -c`/`--config-env` "
-                        "option, a HOME=/GIT_CONFIG_* prefix, or an earlier step "
-                        "that can write config — so its destination cannot be "
-                        "proven off the public repo.",
-                        file=sys.stderr,
-                    )
-                    print(
-                        "Run the force push as its own plain `git push` command; "
-                        "the destination check can then read the config it uses.",
-                        file=sys.stderr,
-                    )
-                    return 2
                 remote = _resolve_push_remote(force_segs[0], cwd=pcwd)
                 if pcwd_unknown or remote is None or remote == "origin":
                     print(
@@ -12224,11 +12195,19 @@ def _run_merge_and_push_gates() -> int:
                         file=sys.stderr,
                     )
                     return 2
+                if not _is_single_plain_push(segs, force_segs[0], cmd):
+                    print(
+                        "BLOCKED: a force push off the public repo must be the whole "
+                        "command — one plain `git push`, with no prefix, wrapper, git "
+                        "global option, redirect, pipe or other step — because the "
+                        "guard reads its destination before anything runs.",
+                        file=sys.stderr,
+                    )
+                    print("Run the force push on its own.", file=sys.stderr)
+                    return 2
                 # Classify by PUSH-url set — a non-"origin" name/url that shares any
                 # push url with origin is still a public force. Unresolvable ⇒ block.
-                dest_urls = _push_dest_urls(remote, cwd=pcwd)
-                origin_urls = _remote_push_urls("origin", cwd=pcwd)
-                if not dest_urls or not origin_urls or (dest_urls & origin_urls):
+                if _push_dest_meets_origin(remote, pcwd, pcwd_unknown):
                     print(
                         "BLOCKED: Force push to origin/<public> is not allowed — open a PR.",
                         file=sys.stderr,
@@ -12250,6 +12229,23 @@ def _run_merge_and_push_gates() -> int:
                 )
                 # Fall through: any hard-block below still takes precedence.
             else:
+                for push_seg in push_segs:
+                    if _push_carries_command_config(push_seg) and _push_dest_meets_origin(
+                        _resolve_push_remote(push_seg, cwd=pcwd), pcwd, pcwd_unknown
+                    ):
+                        print(
+                            "BLOCKED: this push to origin/<public> carries a prefix, "
+                            "wrapper or git config option (-c / --config-env / VAR=…). "
+                            "Config supplied that way can make it a force push "
+                            "(e.g. remote.origin.push=+…) that no flag shows, and the "
+                            "guard cannot read it before the command runs.",
+                            file=sys.stderr,
+                        )
+                        print(
+                            "Retype it as a plain `git push` (`-C <dir>` is fine).",
+                            file=sys.stderr,
+                        )
+                        return 2
                 # Non-force push: interactive asks, dispatched hard-denies.
                 _remote, branch = _get_push_remote_and_branch(push_segs[0], cwd=pcwd)
                 if _is_dispatched():
