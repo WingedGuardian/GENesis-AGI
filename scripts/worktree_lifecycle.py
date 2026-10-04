@@ -2152,10 +2152,10 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
         meta = json.loads(meta_path.read_text())
         pointer = _read_git_pointer(stored / ".git")
         # Same walk `_restore_from_dir` uses: symlinks and files only, `.git`
-        # and every `.trash_meta.json` basename excluded.
+        # and the ROOT `.trash_meta.json` (the reaper's own) excluded.
         for item in stored.rglob("*"):
             rel = item.relative_to(stored)
-            if ".git" in rel.parts or rel.name == ".trash_meta.json":
+            if ".git" in rel.parts or rel.parts == (".trash_meta.json",):
                 continue
             if item.is_symlink() or item.is_file():
                 candidates.append(rel.as_posix())
@@ -2200,7 +2200,7 @@ def _describe_recovery(stored: Path, repo_root: Path) -> bool:
                         continue  # the root dir member itself
                     root_entries.add(parts[1])
                     rel = PurePosixPath(*parts[1:])
-                    if ".git" in rel.parts or rel.name == ".trash_meta.json":
+                    if ".git" in rel.parts or rel.parts == (".trash_meta.json",):
                         continue
                     if m.isfile() or m.issym() or m.islnk():
                         candidates.append(rel.as_posix())
@@ -2996,7 +2996,9 @@ def _restore_from_dir(
         if not (item.is_symlink() or item.is_file()):
             continue  # dirs are created implicitly; skip FIFOs/sockets/etc.
         rel = item.relative_to(trash_path)
-        if rel.name == ".trash_meta.json":
+        # The reaper's own metadata is the ROOT file of that name only. A
+        # worktree's file of the same name in a subdirectory is its own work.
+        if rel.parts == (".trash_meta.json",):
             continue
         target = Path(original_path) / rel
         if os.path.lexists(str(target)):
