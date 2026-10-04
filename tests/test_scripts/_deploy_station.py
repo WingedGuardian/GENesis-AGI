@@ -16,6 +16,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -115,6 +116,8 @@ def systemctl_shim(calls: Path, manifest: Path, on_restart: str = "", booted_at:
         # After a restart, MainPID is $NEW_PID; with $NEW_PID_LATER set, every read
         # after the first one reports that pid instead (the unit restarted again).
         'if [[ " $* " == *" MainPID "* ]]; then\n'
+        # $MAIN_PID_RC: systemd could not be asked (a bus failure): no output.
+        '  [ -z "${MAIN_PID_RC:-}" ] || exit "$MAIN_PID_RC"\n'
         f'  if grep -q "restart genesis-server" "{calls}"; then\n'
         f'    if [ -n "${{NEW_PID_LATER:-}}" ] && [ -f "{calls}.pidread" ]; then echo "$NEW_PID_LATER";\n'
         f'    else touch "{calls}.pidread"; echo "${{NEW_PID:-2222}}"; fi\n'
@@ -286,6 +289,31 @@ def station(tmp_path):
     }
     site = tmp_path / "site"
     install_fixture(site, root)
+    # The process table the restart refusal scans (GENESIS_DEPLOY_PROC_ROOT): an
+    # empty fake /proc, so no test's verdict depends on what runs on the machine
+    # (the shim's MainPID, 1111, can be a real pid here). A test that wants
+    # sessions writes them into it (fake_proc_entry). The session table it names
+    # them from (GENESIS_DEPLOY_DB) is a path that does not exist unless a test
+    # builds it.
+    fake_proc = tmp_path / "proc"
+    fake_proc.mkdir()
+    (fake_proc / "stat").write_text(f"cpu 0\nbtime {int(time.time()) - 3600}\n")
+    env.update(
+        GENESIS_DEPLOY_PROC_ROOT=str(fake_proc),
+        GENESIS_DEPLOY_DB=str(tmp_path / "genesis.db"),
+    )
+    # A second layer under the systemctl shim: the user bus points at an empty
+    # directory, so a code path that bypasses the shim gets "Failed to connect to
+    # bus" (MEASURED, systemd 255) instead of stopping the live server. A
+    # backup/restore test once stopped it ten times in a day through that gap.
+    # Pointed elsewhere, not unset: deploy_code_only.sh fills both in with the
+    # real defaults when they are empty.
+    nobus = tmp_path / "nobus"
+    nobus.mkdir()
+    env.update(
+        XDG_RUNTIME_DIR=str(nobus),
+        DBUS_SESSION_BUS_ADDRESS=f"unix:path={nobus}/bus",
+    )
     env.update(
         HOME=str(home),
         PATH=f"{shims}:{env['PATH']}",
@@ -310,7 +338,19 @@ def station(tmp_path):
         "booted_at": booted_at,
         "lock": home / ".genesis" / "locks" / "update.lock",
         "queue": home / ".genesis" / "alerts" / "queue",
+        "proc": fake_proc,
     }
+
+
+def fake_proc_entry(st, pid: int, ppid: int, comm: str, argv: list[str]) -> None:
+    """Add /proc/<pid> to the station's fake process table (started a minute
+    after its fake boot)."""
+    d = st["proc"] / str(pid)
+    d.mkdir()
+    rest = ["S", str(ppid)] + ["0"] * 17 + ["6000", "0"]
+    (d / "stat").write_text(f"{pid} ({comm}) " + " ".join(rest) + "\n")
+    (d / "comm").write_text(comm + "\n")
+    (d / "cmdline").write_bytes(b"\x00".join(a.encode() for a in argv) + b"\x00")
 
 
 _ADVANCES = [0]

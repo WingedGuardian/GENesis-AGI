@@ -1,0 +1,1 @@
+- `scripts/deploy_code_only.sh deploy` and `restart` now refuse to restart genesis-server while Claude Code sessions it launched (dispatched work, chat turns, reflections) are running, since a restart ends them. The refusal names each session by pid and changes nothing; `--allow-killing <pid,…|all>` proceeds deliberately.
