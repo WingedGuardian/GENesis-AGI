@@ -172,17 +172,38 @@ esac
 # CBM leg so a requested GitNexus leg retains its normal outcome.
 _CBM_MANAGED_REFUSE=""
 _managed_config="${CODEBASE_MEMORY_MCP_MANAGED_CONFIG:-$HOME/.genesis/config/codebase-managed.json}"
-if { [ "$TOOLS" = cbm ] || [ "$TOOLS" = both ]; } \
-    && { [ -e "$_managed_config" ] || [ -L "$_managed_config" ]; }; then
+_managed_rc=1  # not selected unless the CBM leg derives otherwise
+if [ "$TOOLS" = cbm ] || [ "$TOOLS" = both ]; then
+    _managed_rc=2
+    _managed_lib="${_CODE_INTEL_ENTRYPOINT%/*}/codebase_managed_selection.sh"
+    # shellcheck source=scripts/lib/codebase_managed_selection.sh
+    if [ -r "$_managed_lib" ] && . "$_managed_lib"; then
+        _managed_rc=0
+        codebase_managed_selected "$_managed_config" "$HOME" || _managed_rc=$?
+    fi
+    case "$_managed_rc" in
+        0|1) ;;
+        3) _CBM_MANAGED_REFUSE="managed units name another settings path" ;;
+        *) _CBM_MANAGED_REFUSE="cannot establish managed selection" ;;
+    esac
+fi
+if [ "$_managed_rc" -eq 0 ]; then
+    # One physical spelling for both the validation and the exported root.
+    _managed_repo=""
+    if [ -n "$REPO_PATH" ]; then
+        _managed_repo="$(unset CDPATH; cd -- "$REPO_PATH" 2>/dev/null && pwd -P)" || _managed_repo=""
+    fi
     _managed_output=""
-    if _managed_output="$(/usr/bin/python3 -I "${_CODE_INTEL_ENTRYPOINT%/*}/../codebase_managed.py" \
-        --config "$_managed_config" batch --repo "$REPO_PATH")"; then
+    if [ -z "$_managed_repo" ]; then
+        _CBM_MANAGED_REFUSE="managed repository path unresolvable"
+    elif _managed_output="$(/usr/bin/python3 -I "${_CODE_INTEL_ENTRYPOINT%/*}/../codebase_managed.py" \
+        --config "$_managed_config" batch --repo "$_managed_repo")"; then
         mapfile -t _managed_fields <<< "$_managed_output"
         if [ "${#_managed_fields[@]}" -eq 4 ]; then
             export CODE_INTEL_CBM_WORKER_BINARY="${_managed_fields[0]}"
             export CBM_CACHE_DIR="${_managed_fields[1]}"
             export CBM_RUNTIME_DIR="${_managed_fields[2]}"
-            export CBM_ALLOWED_ROOT="$REPO_PATH"
+            export CBM_ALLOWED_ROOT="$_managed_repo"
             export CODE_INTEL_CBM_MEMORY_MAX="${_managed_fields[3]}"
         else
             _CBM_MANAGED_REFUSE="malformed managed batch settings"

@@ -47,15 +47,35 @@ if [[ -e "$_disable_file" ]]; then
 fi
 
 # Explicitly configured native lifecycle replaces per-session daemon bootstrap.
-# Settings presence includes a broken symlink: an unreadable configuration must
-# not silently fall back to a raw provider. Sentinel remains the first gate.
+# Selection is derived from the override, the settings path and the generated
+# unit fragments (scripts/lib/codebase_managed_selection.sh), so losing the
+# settings never revives the raw provider; only a never-configured install runs
+# raw. Sentinel remains the first gate. Nothing here writes to stdout.
 _managed_config="${CODEBASE_MEMORY_MCP_MANAGED_CONFIG:-${_user_home}/.genesis/config/codebase-managed.json}"
-if [[ -e "$_managed_config" || -L "$_managed_config" ]]; then
+_launcher_dir="${BASH_SOURCE[0]%/*}"
+[[ "$_launcher_dir" != "${BASH_SOURCE[0]}" ]] || _launcher_dir=.
+_launcher_dir="$(unset CDPATH; cd "$_launcher_dir" && pwd -P)" || exit 1
+_managed_lib="$_launcher_dir/../../scripts/lib/codebase_managed_selection.sh"
+_managed_rc=2
+# shellcheck source=scripts/lib/codebase_managed_selection.sh
+if [[ -r "$_managed_lib" ]] && . "$_managed_lib" >&2; then
+    _managed_rc=0
+    codebase_managed_selected "$_managed_config" "$_user_home" >&2 || _managed_rc=$?
+fi
+case "$_managed_rc" in
+    0|1) ;;
+    3)
+        printf '%s\n' 'run-codebase-memory: managed units name another settings path; set CODEBASE_MEMORY_MCP_MANAGED_CONFIG' >&2
+        exit 1 ;;
+    *)
+        printf '%s\n' 'run-codebase-memory: cannot establish managed selection' >&2
+        exit 1 ;;
+esac
+if [[ "$_managed_rc" == 0 ]]; then
     if [[ $# -ne 0 ]]; then
         printf '%s\n' 'run-codebase-memory: managed route accepts no provider flags' >&2
         exit 1
     fi
-    _launcher_dir="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
     exec /usr/bin/python3 -I "$_launcher_dir/../../scripts/codebase_managed.py" \
         --config "$_managed_config" launch
 fi

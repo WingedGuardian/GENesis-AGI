@@ -1103,3 +1103,90 @@ def test_managed_route_rejects_provider_flags(tmp_path):
     assert result.returncode == 1
     assert "accepts no provider flags" in result.stderr
     assert not binary_log.exists()
+
+
+def _managed_units(home: Path, config_path: Path) -> dict[str, str]:
+    """Render owned fragments with the REAL producer, naming ``config_path``."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "codebase_managed_launcher_fixture", _REPO_ROOT / "scripts/codebase_managed.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    config = dict(
+        version=1, enabled=True, main=str(home), binary=str(home / "b"), cache=str(home / "c"),
+        runtime=str(home / "r"), sentinel=str(home / "s"), build=module.BUILD,
+        name="genesis-cbm-query",
+    )
+    directory = home / ".config/systemd/user"
+    directory.mkdir(parents=True, exist_ok=True)
+    units = module.render_units(config, config_path)
+    for name, body in units.items():
+        (directory / name).write_text(body)
+    return units
+
+
+@pytest.mark.parametrize("selection", ["explicit", "owned-unit"])
+def test_missing_selected_config_never_executes_raw(tmp_path, selection):
+    """Codex P1 (#2841): settings loss after activation must not revive raw."""
+    config = Path(os.path.realpath(tmp_path)) / ".genesis/config/codebase-managed.json"
+    overrides = {}
+    if selection == "explicit":
+        overrides["CODEBASE_MEMORY_MCP_MANAGED_CONFIG"] = str(config)
+    else:
+        _managed_units(tmp_path, config)
+    fakebin, _ = _fake_systemd_run(tmp_path)
+    result, binary_log = _run_launcher(tmp_path, fakebin=fakebin, env_extra=overrides)
+    assert result.returncode != 0
+    assert "managed Codebase refused" in result.stderr  # the managed route, not a crash
+    assert result.stdout == ""
+    assert not binary_log.exists()
+
+
+@pytest.mark.parametrize("evidence", ["none", "foreign-unit", "empty-override"])
+def test_never_configured_install_keeps_raw_launch(tmp_path, evidence):
+    overrides = {}
+    if evidence == "foreign-unit":
+        directory = tmp_path / ".config/systemd/user"
+        directory.mkdir(parents=True)
+        (directory / "genesis-cbm-vendor.service").write_text("[Service]\nExecStart=/bin/true\n")
+    if evidence == "empty-override":
+        # Empty means unset in every caller, never "explicitly selected".
+        overrides["CODEBASE_MEMORY_MCP_MANAGED_CONFIG"] = ""
+    fakebin, _ = _fake_systemd_run(tmp_path)
+    result, binary_log = _run_launcher(tmp_path, fakebin=fakebin, env_extra=overrides)
+    assert result.returncode == 0, result.stderr
+    assert binary_log.exists()
+
+
+def test_owned_units_for_another_config_refuse_raw(tmp_path):
+    _managed_units(tmp_path, tmp_path / "elsewhere/codebase-managed.json")
+    fakebin, _ = _fake_systemd_run(tmp_path)
+    result, binary_log = _run_launcher(tmp_path, fakebin=fakebin)
+    assert result.returncode == 1
+    assert "another settings path" in result.stderr
+    assert not binary_log.exists()
+
+
+def test_invalid_explicit_managed_selection_refuses_parser_errors(tmp_path):
+    result, binary_log = _run_launcher(
+        tmp_path, env_extra={"CODEBASE_MEMORY_MCP_MANAGED_CONFIG": "relative-missing.json"}
+    )
+    assert result.returncode != 0
+    assert not binary_log.exists()
+
+
+def test_missing_selection_library_refuses_raw_launch(tmp_path, monkeypatch):
+    import shutil
+    root = tmp_path / "isolated"
+    launcher = root / ".claude/mcp/run-codebase-memory"
+    launcher.parent.mkdir(parents=True)
+    shutil.copy2(_LAUNCHER, launcher)
+    # No scripts/lib/codebase_managed_selection.sh: selection cannot be derived.
+    monkeypatch.setattr(__import__(__name__, fromlist=["_LAUNCHER"]), "_LAUNCHER", launcher)
+    fakebin, _ = _fake_systemd_run(tmp_path)
+    result, binary_log = _run_launcher(tmp_path, fakebin=fakebin)
+    assert result.returncode != 0
+    assert "cannot establish managed selection" in result.stderr
+    assert not binary_log.exists()

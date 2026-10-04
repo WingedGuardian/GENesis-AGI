@@ -3,6 +3,8 @@
 
 The settings route is fail closed once present. Configure does not remove the
 machine sentinel or start services. Internal ABI is pinned to the accepted build.
+Route selection is derived by scripts/lib/codebase_managed_selection.sh from the
+override, the settings path and the owned unit fragments rendered below.
 """
 
 from __future__ import annotations
@@ -27,7 +29,13 @@ from code_intel_cbm_worker import BUILD  # noqa: E402
 
 GIB = 1024**3
 DISABLED_KEYS = ("auto_index", "auto_watch", "watcher_enabled")
+# The first two lines of every generated fragment are its ownership record. The
+# shell selection library matches them byte for byte; change both together.
 MARKER = "# Genesis managed Codebase v1\n"
+CONFIG_LINE = "# Genesis managed config: "
+SCRIPT = Path(__file__).resolve()
+# newline="" keeps bytes exact: a CRLF fragment is foreign to both readers.
+UNIT_TEXT = dict(encoding="utf-8", errors="surrogateescape", newline="")
 
 
 def absolute(raw: str) -> Path:
@@ -37,6 +45,40 @@ def absolute(raw: str) -> Path:
     if not path.is_absolute():
         raise ValueError("managed path must be absolute")
     return path
+
+
+def config_path(raw: str) -> Path:
+    # Canonical directory, literal final component: a settings symlink is still
+    # refused rather than followed, while every unit records one spelling.
+    path = absolute(raw)
+    if not path.name:
+        raise ValueError("managed settings path must name a file")
+    try:
+        return path.parent.resolve() / path.name
+    except RuntimeError as error:  # symlink loop
+        raise ValueError(f"unresolvable managed settings directory: {error}") from error
+
+
+def main_script(config: dict) -> Path:
+    # Units always run the configured primary checkout's script, whichever
+    # checkout renders them, so the template never depends on the caller.
+    return Path(config["main"]) / "scripts/codebase_managed.py"
+
+
+def read_unit(fragment: Path) -> str:
+    with fragment.open(**UNIT_TEXT) as stream:
+        return stream.read()
+
+
+def units_dir() -> Path:
+    return Path.home() / ".config/systemd/user"
+
+
+def owned_fragment(fragment: Path, path: Path) -> bool:
+    if fragment.is_symlink() or not fragment.is_file():
+        return False
+    with fragment.open(**UNIT_TEXT) as stream:
+        return stream.readline() == MARKER and stream.readline() == CONFIG_LINE + str(path) + "\n"
 
 
 def read_settings(path: Path) -> dict:
@@ -110,6 +152,23 @@ def backend(config: dict) -> str:
     return config["name"] + ".service"
 
 
+def show(unit: str, *properties: str) -> dict[str, str]:
+    # One manager query. Explicitly requested properties are printed even when
+    # empty, in the manager's own order, so parse names rather than positions.
+    output = systemctl("show", unit, *(arg for name in properties for arg in ("-p", name)))
+    values = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+    if any(name not in values for name in properties):
+        raise ValueError(f"systemd omitted requested properties for {unit}")
+    return values
+
+
+def same_file(loaded: str, fragment: Path) -> bool:
+    try:
+        return bool(loaded) and os.path.samefile(loaded, fragment)
+    except OSError:
+        return False
+
+
 def check_backend(config: dict, *, starting: bool = False) -> None:
     unit = backend(config)
     if systemctl("show", unit, "-p", "ActiveState", "--value") not in (
@@ -119,6 +178,13 @@ def check_backend(config: dict, *, starting: bool = False) -> None:
     pid = int(systemctl("show", unit, "-p", "MainPID", "--value"))
     if pid <= 0 or not os.path.samefile(f"/proc/{pid}/exe", config["binary"]):
         raise ValueError("managed daemon identity mismatch")
+    leaf, _, version = resolve_cgroup(Path(f"/proc/{pid}/cgroup"), Path(f"/proc/{pid}/mountinfo"))
+    if (
+        version != 2
+        or (leaf / "memory.max").read_text().strip() != str(2 * GIB)
+        or (leaf / "memory.swap.max").read_text().strip() != "0"
+    ):
+        raise ValueError("managed daemon lacks required memory/zero-swap cap")
     membership = Path(f"/proc/{pid}/cgroup").read_text()
     if not any(
         row.startswith("0::") and Path(row[3:]).name == unit for row in membership.splitlines()
@@ -199,6 +265,7 @@ def execute_native(config: dict, role: str, unit: str) -> None:
         if role == "serve"
         else ["--tool-profile=analysis"]
     )
+    os.chdir(config["main"])
     with verified_binary(Path(config["binary"])) as executable:
         if role == "serve":
             # The stock LOCAL_CLI transition seals/repairs a dead native endpoint
@@ -226,17 +293,27 @@ def quote_unit(value: str) -> str:
 
 
 def render_units(config: dict, path: Path) -> dict[str, str]:
+    # Set the exact checkout directory in execute_native via os.chdir. Unit
+    # path parsing must not change whitespace/backslash spellings.
     command = " ".join(
         quote_unit(x)
-        for x in [sys.executable, str(Path(__file__).resolve()), "--config", str(path), "serve"]
+        for x in [
+            "/usr/bin/python3",
+            "-I",
+            str(main_script(config)),
+            "--config",
+            str(path),
+            "serve",
+        ]
     )
+    owner = MARKER + CONFIG_LINE + str(path) + "\n"
     return {
-        backend(config): MARKER
+        backend(config): owner
         + f"""[Unit]
 Description=Genesis pinned native Codebase query daemon
 [Service]
 Type=exec
-WorkingDirectory={config["main"].replace("%", "%%")}
+WorkingDirectory=/
 ExecStart=:{command}
 ExecStartPost=:{command.removesuffix(quote_unit("serve")) + quote_unit("ready")}
 TimeoutStartSec=120
@@ -251,7 +328,7 @@ TimeoutStopSec=30
 [Install]
 WantedBy=default.target
 """,
-        config["name"] + "-clients.slice": MARKER
+        config["name"] + "-clients.slice": owner
         + """[Unit]
 Description=Genesis managed Codebase frontend aggregate
 [Slice]
@@ -263,6 +340,32 @@ TasksMax=512
     }
 
 
+def unit_available(unit: str) -> bool:
+    # A running unit can become not-found after deletion and manager reload.
+    if systemctl("show", unit, "-p", "ActiveState", "--value") != "inactive" or systemctl(
+        "show", unit, "-p", "ControlGroup", "--value"
+    ):
+        return False
+    if systemctl("show", unit, "-p", "LoadState", "--value") == "not-found":
+        return True
+    # systemd synthesizes empty slice units on lookup. Preserve every explicit,
+    # active or modified unit, while allowing this inactive default-only object.
+    defaults = {
+        "FragmentPath": "",
+        "DropInPaths": "",
+        "Transient": "no",
+        "ActiveState": "inactive",
+        "ControlGroup": "",
+        "MemoryMax": "infinity",
+        "MemorySwapMax": "infinity",
+        "TasksMax": "infinity",
+        "CPUQuotaPerSecUSec": "infinity",
+    }
+    return unit.endswith(".slice") and all(
+        systemctl("show", unit, "-p", key, "--value") == value for key, value in defaults.items()
+    )
+
+
 def configure(args: argparse.Namespace, path: Path) -> None:
     main, source, state = (
         absolute(args.main).resolve(strict=True),
@@ -271,6 +374,12 @@ def configure(args: argparse.Namespace, path: Path) -> None:
     )
     if not (main / ".git").is_dir():
         raise ValueError("managed Codebase requires the primary checkout")
+    # Units pin this script's path. A linked worktree (even one nested inside the
+    # primary checkout) is archived or reaped, which would strand the service.
+    if main_script(dict(main=str(main))) != SCRIPT:
+        raise ValueError(
+            "run configure with scripts/codebase_managed.py from the configured primary checkout"
+        )
     config = dict(
         version=1,
         enabled=False,
@@ -285,7 +394,7 @@ def configure(args: argparse.Namespace, path: Path) -> None:
     # Apply the same schema before any filesystem mutation.
     if not re.fullmatch(r"genesis-cbm-[a-z0-9]+(?:-[a-z0-9]+)*", args.name):
         raise ValueError("invalid managed unit name")
-    unit_dir = Path.home() / ".config/systemd/user"
+    unit_dir = units_dir()
     units = render_units(config, path)
     unit_dir.mkdir(parents=True, exist_ok=True)
     with (unit_dir / ".genesis-codebase-config.lock").open("a") as lock:
@@ -297,47 +406,81 @@ def configure(args: argparse.Namespace, path: Path) -> None:
             or any((unit_dir / u).exists() or (unit_dir / u).is_symlink() for u in units)
         ):
             raise ValueError("existing settings/state/unit preserved; choose a fresh staging state")
-        if any(systemctl("show", u, "-p", "LoadState", "--value") != "not-found" for u in units):
+        if any(not unit_available(u) for u in units):
             raise ValueError("existing loaded/vendor managed unit preserved")
-        with verified_binary(source) as executable:
-            state.mkdir(mode=0o700, parents=True)
-            (state / "bin").mkdir(mode=0o700)
-            executable.seek(0)
-            with Path(config["binary"]).open("xb") as destination:
-                shutil.copyfileobj(executable, destination)
-            Path(config["binary"]).chmod(0o500)
-        cache = Path(config["cache"])
-        cache.mkdir(mode=0o700)
-        Path(config["runtime"]).mkdir(mode=0o700)
-        (cache / "config.json").write_text(json.dumps(dict(ui_enabled=False)))
-        with verified_binary(Path(config["binary"])) as executable:
-            for key in DISABLED_KEYS:
-                subprocess.run(
-                    [f"/proc/self/fd/{executable.fileno()}", "config", "set", key, "false"],
-                    env=native_env(config),
-                    pass_fds=(executable.fileno(),),
-                    check=True,
-                    timeout=30,
-                    stdout=subprocess.DEVNULL,
-                )
-        verify_cache(config)
-        for unit, text in units.items():
-            (unit_dir / unit).write_text(text)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_settings(path, config)
-        systemctl("daemon-reload")
+        # Everything below was verified absent under this lock, so a failure
+        # removes exactly what this run created: no partial configuration may
+        # select the managed route or block a retry with the same arguments.
+        created: list[Path] = []
+        try:
+            with verified_binary(source) as executable:
+                state.mkdir(mode=0o700, parents=True)
+                created.append(state)
+                (state / "bin").mkdir(mode=0o700)
+                executable.seek(0)
+                with Path(config["binary"]).open("xb") as destination:
+                    shutil.copyfileobj(executable, destination)
+                Path(config["binary"]).chmod(0o500)
+            cache = Path(config["cache"])
+            cache.mkdir(mode=0o700)
+            Path(config["runtime"]).mkdir(mode=0o700)
+            (cache / "config.json").write_text(json.dumps(dict(ui_enabled=False)))
+            with verified_binary(Path(config["binary"])) as executable:
+                for key in DISABLED_KEYS:
+                    subprocess.run(
+                        [f"/proc/self/fd/{executable.fileno()}", "config", "set", key, "false"],
+                        env=native_env(config),
+                        pass_fds=(executable.fileno(),),
+                        check=True,
+                        timeout=30,
+                        stdout=subprocess.DEVNULL,
+                    )
+            verify_cache(config)
+            for unit, text in units.items():
+                with (unit_dir / unit).open("x", **UNIT_TEXT) as stream:
+                    created.append(unit_dir / unit)  # only once this run owns it
+                    stream.write(text)
+            systemctl("daemon-reload")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            created.append(path)  # absent under the lock; rollback never removes a link
+            write_settings(path, config)  # commit point: settings exist only on success
+        except BaseException:
+            rollback_configure(created, unit_dir, state)
+            raise
     print("Configured; sentinel unchanged, services not started")
 
 
+def rollback_configure(created: list[Path], unit_dir: Path, state: Path) -> None:
+    for item in reversed(created):
+        try:
+            if item == state and item.is_dir() and not item.is_symlink():
+                shutil.rmtree(item)  # created by this run with mkdir, never pre-existing
+            elif item.is_file() and not item.is_symlink():
+                item.unlink()
+            elif item.exists() or item.is_symlink():
+                # This run creates no links or other directories; another actor did.
+                print(f"configure rollback preserved unexpected {item}", file=sys.stderr)
+        except OSError as error:
+            print(f"configure rollback could not remove {item}: {error}", file=sys.stderr)
+    if any(item.parent == unit_dir for item in created):
+        try:
+            systemctl("daemon-reload")
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"configure rollback daemon-reload failed: {error}", file=sys.stderr)
+
+
 def write_settings(path: Path, config: dict) -> None:
-    # Readers see one complete document; never follow/overwrite a config symlink.
+    atomic_write(path, json.dumps(config, indent=2) + "\n")
+
+
+def atomic_write(path: Path, text: str) -> None:
+    # Readers see one complete document; never follow/overwrite a symlink.
     if path.is_symlink():
-        raise ValueError("managed settings symlink preserved")
+        raise ValueError(f"managed symlink preserved: {path}")
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex)
     try:
-        with temporary.open("x") as stream:
-            json.dump(config, stream, indent=2)
-            stream.write("\n")
+        with temporary.open("x", **UNIT_TEXT) as stream:
+            stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
@@ -350,36 +493,101 @@ def write_settings(path: Path, config: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def verify_units(config: dict, path: Path, *, exact: bool = True) -> None:
+    """Prove each generated unit is ours and is what the manager loaded.
+
+    ``exact`` additionally requires the current template. Stopping needs only
+    ownership; starting or launching against an older template does not.
+    """
+    unit_dir = units_dir()
+    for unit, expected in render_units(config, path).items():
+        fragment = unit_dir / unit
+        if not owned_fragment(fragment, path):
+            raise ValueError(f"{unit} is not a generated fragment of this configuration")
+        if exact and read_unit(fragment) != expected:
+            raise ValueError(
+                f"{unit} differs from this checkout's template; from the primary "
+                "checkout run `codebase_managed.py disable` then `codebase_managed.py repair-units`"
+            )
+        loaded = show(unit, "FragmentPath", "DropInPaths", "NeedDaemonReload")
+        if not same_file(loaded["FragmentPath"], fragment):
+            raise ValueError(f"{unit} loaded fragment is not the generated fragment")
+        if loaded["DropInPaths"]:
+            raise ValueError(f"{unit} has unverified drop-ins")
+        if loaded["NeedDaemonReload"] != "no":
+            raise ValueError(f"{unit} load is stale; run systemctl --user daemon-reload")
+
+
 def set_enabled(config: dict, path: Path, enabled: bool) -> None:
-    unit_dir = Path.home() / ".config/systemd/user"
+    with (units_dir() / ".genesis-codebase-config.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        config = read_settings(path)
+        if not enabled:
+            # The operator's stop lever: persist first, so launch and batch
+            # refuse even when the unit cannot be proven ours and is not stopped.
+            config["enabled"] = False
+            write_settings(path, config)
+            try:
+                verify_units(config, path, exact=False)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                raise ValueError(
+                    f"settings disabled, but {backend(config)} was NOT stopped: {error}. "
+                    "Inspect the unit before stopping it by hand"
+                ) from error
+            systemctl("stop", backend(config))
+            return
+        verify_units(config, path)
+        if Path(config["sentinel"]).exists():
+            raise ValueError("machine sentinel is armed; explicit supervised activation required")
+        verify_cache(config)
+        with verified_binary(Path(config["binary"])):
+            pass
+        config["enabled"] = True
+        write_settings(path, config)
+        try:
+            systemctl("start", backend(config))
+        except subprocess.SubprocessError:
+            config["enabled"] = False
+            write_settings(path, config)
+            try:
+                systemctl("stop", backend(config))
+            except subprocess.SubprocessError as stop_error:
+                print(f"rollback stop failed: {stop_error}", file=sys.stderr)
+            raise
+
+
+def repair_units(path: Path) -> None:
+    """Re-render owned fragments after a template change; never adopts others."""
+    unit_dir = units_dir()
     with (unit_dir / ".genesis-codebase-config.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         config = read_settings(path)
-        if enabled:
-            if Path(config["sentinel"]).exists():
-                raise ValueError(
-                    "machine sentinel is armed; explicit supervised activation required"
-                )
-            verify_cache(config)
-            with verified_binary(Path(config["binary"])):
-                pass
-        config["enabled"] = enabled
-        write_settings(path, config)
-        try:
-            systemctl("start" if enabled else "stop", backend(config))
-        except subprocess.SubprocessError:
-            if enabled:
-                config["enabled"] = False
-                write_settings(path, config)
-                try:
-                    systemctl("stop", backend(config))
-                except subprocess.SubprocessError as stop_error:
-                    print(f"rollback stop failed: {stop_error}", file=sys.stderr)
-            raise
+        # Units pin the primary checkout's script, but the template text comes
+        # from whichever copy runs this; a branch copy must not rewrite them.
+        if main_script(config) != SCRIPT:
+            raise ValueError("run repair-units from the configured primary checkout")
+        units = render_units(config, path)
+        state = show(backend(config), "ActiveState", "ControlGroup")
+        # Restart=no leaves a crashed or rolled-back daemon "failed", which stop
+        # does not clear; with no control group left it is as idle as inactive.
+        if state["ActiveState"] not in ("inactive", "failed") or state["ControlGroup"]:
+            raise ValueError(f"{backend(config)} must be inactive; run disable first")
+        for unit in units:  # verify every fragment before rewriting any
+            fragment = unit_dir / unit
+            if not owned_fragment(fragment, path):
+                raise ValueError(f"{unit} is not a generated fragment of this configuration")
+            if not same_file(show(unit, "FragmentPath")["FragmentPath"], fragment):
+                raise ValueError(f"{unit} loaded fragment is not the generated fragment")
+        for unit, text in units.items():
+            if read_unit(unit_dir / unit) != text:
+                atomic_write(unit_dir / unit, text)
+        systemctl("daemon-reload")
+    print("Units repaired; services not started")
 
 
 def launch(config: dict, path: Path) -> None:
     require_enabled(config)
+    verify_units(config, path)
     verify_cache(config)
     check_backend(config)
     unit = config["name"] + "-client-" + uuid.uuid4().hex + ".service"
@@ -408,10 +616,11 @@ def launch(config: dict, path: Path) -> None:
         "TasksMax=32",
         "-p",
         "OOMScoreAdjust=500",
-        "--working-directory=" + config["main"],
+        "--working-directory=/",
         "--",
-        sys.executable,
-        str(Path(__file__).resolve()),
+        "/usr/bin/python3",
+        "-I",
+        str(main_script(config)),
         "--config",
         str(path),
         "client",
@@ -449,17 +658,24 @@ def main() -> int:
     commands.add_parser("status")
     commands.add_parser("disable")
     commands.add_parser("enable")
+    commands.add_parser("repair-units")
     args = parser.parse_args()
     try:
-        path = args.config or absolute(
-            os.environ.get("CODEBASE_MEMORY_MCP_MANAGED_CONFIG")
+        # An empty override means unset, exactly as the shell callers treat it.
+        path = config_path(
+            str(args.config)
+            if args.config is not None
+            else os.environ.get("CODEBASE_MEMORY_MCP_MANAGED_CONFIG")
             or str(Path.home() / ".genesis/config/codebase-managed.json")
         )
         if args.command == "configure":
             configure(args, path)
             return 0
-        if not path.exists() and not path.is_symlink():
-            return 2  # absent integration; malformed/unavailable settings are never absent
+        if args.command == "repair-units":
+            repair_units(path)
+            return 0
+        # Route selection happens in the shell callers. Every command reached
+        # here was selected or explicit, so it requires readable settings.
         config = read_settings(path)
         if args.command == "launch":
             launch(config, path)
@@ -484,7 +700,8 @@ def main() -> int:
                 )
             )
         return 0
-    except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
+    # RuntimeError: Path.resolve on a symlink loop (Python 3.12).
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as exc:
         print(f"managed Codebase refused: {exc}", file=sys.stderr)
         return 1
 

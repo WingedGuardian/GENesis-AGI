@@ -68,6 +68,10 @@ _OPERATOR_ONE_OFF = (
     "able to inspect a suspect database"
 )
 _ALLOWLIST: dict[str, str] = {
+    "codebase_managed.py": (
+        "opens only the native provider cache _config.db, never genesis.db; "
+        "outside the Genesis admission domain"
+    ),
     "dev/mw2_classifier_probe.py": _OPERATOR_ONE_OFF,
     "ambient_replay.py": _OPERATOR_ONE_OFF,
     "apply_entity_seed.py": _OPERATOR_ONE_OFF,

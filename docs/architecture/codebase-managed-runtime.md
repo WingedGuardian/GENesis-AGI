@@ -9,6 +9,60 @@ writes disabled settings and account-owned units; it never removes the machine
 sentinel or starts a service. Existing state, dangling settings links and loaded
 or vendor units are preserved through refusal.
 
+Managed route selection keeps no state of its own. The launcher and the queued
+entrypoint derive it in shell (`scripts/lib/codebase_managed_selection.sh`, so a
+never-configured install starts no Python) from three things that already
+exist: a non-empty `CODEBASE_MEMORY_MCP_MANAGED_CONFIG`, the settings path
+(a broken link counts), or a generated unit fragment in
+`~/.config/systemd/user/genesis-cbm-*` whose first two lines are the ownership
+marker and the settings path. Those fragments survive loss of the settings
+mount, so losing selected settings refuses execution instead of restoring raw
+bootstrap. Owned fragments naming a different settings path, or evidence that
+cannot be read (an unreadable fragment, or a unit directory or parent that
+cannot be listed or searched), also refuse. Only an install with none of this runs the raw
+provider; removing the generated units is the way back to it. An empty override
+means unset everywhere. The settings path is recorded with its directory
+canonicalised and its final component literal, so a settings symlink is still
+refused rather than followed.
+
+Configure runs only from `scripts/codebase_managed.py` inside the configured
+primary checkout, because the units pin that script and linked worktrees are
+archived or reaped. A configure that fails removes the state, units and
+settings it created (parent directories and the lock file stay) and reloads the
+manager, so the same command can be retried and nothing left behind selects the
+managed route. Rollback never removes a link or a directory another process put
+at those paths. Settings are written last.
+
+Starting and launching verify exact generated units, loaded fragments (compared
+by file identity), no drop-ins and a current manager load, using one batched
+`systemctl show` per unit. `disable` is the operator's stop lever: it persists
+`enabled=false` first, so launch and batch refuse at once, and then stops the
+service only if the units are proven ours (marker, settings path, loaded
+fragment, no drop-ins). A unit that cannot be proven ours is reported and left
+running for manual inspection. Units always run the configured primary
+checkout's `scripts/codebase_managed.py` under `python3 -I`, whichever checkout
+rendered them, so the template does not depend on the caller. After a template
+change, launch and `enable` refuse with a message naming `repair-units`;
+`disable` still stops the owned service. `repair-units` runs only from the
+primary checkout and only while the backend has no running processes
+(`inactive`, or `failed` with no control group, which `Restart=no` leaves after a
+crash and which `stop` does not clear). It rewrites only regular, owned
+fragments of this settings path whose loaded fragment is that same file, then
+reloads the manager. Ownership is byte-exact: a fragment rewritten with CRLF line
+endings is foreign to both the shell and Python checks. If the settings directory
+later becomes a symlink, the recorded spelling no longer matches; the route stays
+selected and refuses, and the units must be removed and configured again.
+
+Known limitation: the drop-in check reads the units' `DropInPaths`. Global user
+drop-ins such as `~/.config/systemd/user/service.d/*.conf` apply to every user
+service and can appear there (not measured on every distribution), which makes start and launch
+refuse until they are removed. This is deliberate: an unreviewed drop-in can
+change the limits the service depends on.
+
+Native processes set the exact checkout directory through `os.chdir`, so the
+unit's `WorkingDirectory=` is a constant `/` and path whitespace never depends on
+unit parsing.
+
 The query daemon has a 2 GiB, zero-swap service. Analysis frontends each have a
 256 MiB, zero-swap transient service beneath a separate aggregate 2 GiB,
 zero-swap slice. Requisite/After verify the existing daemon without starting it;
@@ -27,7 +81,7 @@ naming the exact permanent managed PID; a socket left by a crash is insufficient
 Configured launchers accept no provider flags and expose the stock 13-tool
 analysis profile without `index_repository`. Missing, malformed or disabled
 managed settings refuse rather than falling back to raw execution. Installs
-without managed settings retain their existing launcher behavior.
+that were never configured retain their existing launcher behavior.
 
 The existing queued entrypoint reads managed settings before cap selection and
 scope probing. It selects the verified worker adapter, shared canonical cache
@@ -57,6 +111,8 @@ sentinel retirement, `enable` starts the owned query service:
 .venv/bin/python scripts/codebase_managed.py enable
 # Reversible runtime disable; preserves native cache and incident sentinel:
 .venv/bin/python scripts/codebase_managed.py disable
+# After an update changes the unit template (backend inactive):
+.venv/bin/python scripts/codebase_managed.py repair-units
 ```
 
 Activation still requires deployed merged wiring, a preserved last valid graph,

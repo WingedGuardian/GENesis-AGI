@@ -222,10 +222,14 @@ def _test_entrypoint(tmp_path: Path, fakebin: Path) -> Path:
     source = _ENTRYPOINT.read_text()
     assert "/usr/bin/systemd-run" in source
     script.write_text(source.replace("/usr/bin/systemd-run", str(fakebin / "systemd-run")))
-    for name in ("cbm_disable_file.sh", "gitnexus_version.sh", "proc_pressure.sh"):
+    for name in ("cbm_disable_file.sh", "codebase_managed_selection.sh",
+                 "gitnexus_version.sh", "proc_pressure.sh"):
         companion = script_dir / name
         if not companion.exists():
             companion.symlink_to(_ENTRYPOINT.parent / name)
+    helper = script_dir.parent / "codebase_managed.py"
+    if not helper.exists():
+        helper.symlink_to(_ENTRYPOINT.parent.parent / "codebase_managed.py")
     return script
 
 
@@ -745,7 +749,10 @@ def _use_boundary_verifier(monkeypatch, verifier):
 
     def private_entry(root, bindir):
         script = original(root, bindir)
-        script.write_text(script.read_text().replace("/usr/bin/python3", str(verifier)))
+        script.write_text(script.read_text().replace(
+            '/usr/bin/python3 -I "${BASH_SOURCE[0]%/*}/code_intel_cbm_admission.py"',
+            str(verifier) + ' -I "${BASH_SOURCE[0]%/*}/code_intel_cbm_admission.py"'
+        ))
         return script
 
     monkeypatch.setitem(_run_entry.__globals__, "_test_entrypoint", private_entry)
@@ -2036,3 +2043,78 @@ def test_gitnexus_scope_uses_machine_node_selection(tmp_path, selection):
     else:
         assert result.returncode == 4, result.stdout + result.stderr
         assert "gitnexus ARGS:analyze" not in log.read_text()
+
+
+@pytest.mark.parametrize("tools,expected", [("cbm", 3), ("both", 5)])
+def test_missing_explicit_managed_config_refuses_only_cbm(tmp_path, tools, expected):
+    repo = _make_repo(tmp_path)
+    fakebin, log = tmp_path / "bin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    result = _run_entry(tmp_path, repo, tools, path=f"{fakebin}:{_SYSTEM_PATH}",
+                        env_extra={"CODEBASE_MEMORY_MCP_MANAGED_CONFIG": str(tmp_path / "missing.json")})
+    assert result.returncode == expected, result.stderr
+    calls = log.read_text() if log.exists() else ""
+    assert "codebase-memory-mcp ARGS:" not in calls
+    assert ("gitnexus ARGS:" in calls) is (tools == "both")
+
+
+def _owned_units(home: Path, config_path: Path) -> None:
+    """Owned fragments rendered by the REAL producer, naming ``config_path``."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "codebase_managed_index_fixture", _ENTRYPOINT.parent.parent / "codebase_managed.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    config = dict(
+        version=1, enabled=True, main=str(home), binary=str(home / "b"), cache=str(home / "c"),
+        runtime=str(home / "r"), sentinel=str(home / "s"), build=module.BUILD,
+        name="genesis-cbm-query",
+    )
+    directory = home / ".config/systemd/user"
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, body in module.render_units(config, config_path).items():
+        (directory / name).write_text(body)
+
+
+@pytest.mark.parametrize("tools,expected", [("cbm", 3), ("both", 5)])
+def test_owned_units_without_settings_refuse_only_cbm(tmp_path, tools, expected):
+    """Codex P1 (#2841): losing the settings must not resume raw CBM indexing."""
+    repo = _make_repo(tmp_path)
+    fakebin, log = tmp_path / "bin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    _owned_units(tmp_path, Path(os.path.realpath(tmp_path)) / ".genesis/config/codebase-managed.json")
+    result = _run_entry(tmp_path, repo, tools, path=f"{fakebin}:{_SYSTEM_PATH}")
+    assert result.returncode == expected, result.stderr
+    calls = log.read_text() if log.exists() else ""
+    assert "codebase-memory-mcp ARGS:" not in calls
+    assert ("gitnexus ARGS:" in calls) is (tools == "both")
+
+
+def test_managed_batch_resolves_relative_repository_before_validation(tmp_path):
+    repo = _make_repo(tmp_path)
+    alias = tmp_path / "alias"
+    alias.symlink_to(repo)
+    fakebin, log = tmp_path / "bin", tmp_path / "tools.log"
+    _fake_tools(fakebin, log)
+    _test_entrypoint(tmp_path, fakebin)
+    helper = tmp_path / "codebase_managed.py"
+    helper.unlink()  # replace only the private harness's helper link
+    receipt = tmp_path / "batch-arguments"
+    helper.write_text(
+        "import sys\nfrom pathlib import Path\n"
+        f"assert sys.argv[-1] == {str(repo)!r}, sys.argv\n"
+        f"Path({str(receipt)!r}).write_text(sys.argv[-1])\n"
+        f"print({str(fakebin / 'codebase-memory-mcp')!r})\n"
+        f"print({str(tmp_path)!r})\nprint({str(tmp_path)!r})\nprint('8G')\n"
+    )
+    allowed = tmp_path / "allowed-root"
+    manager = fakebin / "systemd-run"  # every contained launch inherits the export
+    shebang, body = manager.read_text().split("\n", 1)
+    manager.write_text(f'{shebang}\nprintf "%s" "${{CBM_ALLOWED_ROOT:-}}" > "{allowed}"\n{body}')
+    result = _run_entry(tmp_path, "alias", "cbm", path=f"{fakebin}:{_SYSTEM_PATH}", cwd=tmp_path,
+                        env_extra={"CODEBASE_MEMORY_MCP_MANAGED_CONFIG": str(tmp_path / "m.json")})
+    assert receipt.read_text() == str(repo), result.stderr
+    assert "MemoryMax=8G" in log.with_suffix(".systemd.log").read_text()
+    assert allowed.read_text() == str(repo)  # physical spelling, not "alias"
