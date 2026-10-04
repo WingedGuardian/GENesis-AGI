@@ -1081,3 +1081,101 @@ class TestForcePushRepoFlag:
         ][0]
         # --repo wins over the positional `backups`.
         assert guard_module._resolve_push_remote(seg) == "origin"
+
+
+# ── #2513: command-borne config cannot soften a force push ───────────────
+
+
+class TestForcePushCommandBorneConfig:
+    """#2513: the disjoint-push-url read runs BEFORE the command, so config the
+    command itself carries or writes makes it describe a different destination
+    than the one git resolves — a BLOCK quietly downgraded to an ask. Every such
+    spelling fails the whole-command allowlist and is treated as public:
+    blocked. The unchanged happy path (a bare `git push --force` to a disjoint
+    remote) is pinned by TestForcePushRemoteAware / TestForcePushUrlClassification."""
+
+    def test_dash_c_pushurl_blocks(self, remotes_repo):
+        # `git -c` rewrites backups' push url for THIS push only; the repo read
+        # still sees the disjoint one. Was: cautious ask. Now: blocked.
+        cmd = (
+            "git -c remote.backups.pushurl=https://elsewhere.example/x.git "
+            f"push {_FORCE} backups main"
+        )
+        res = _run_cwd(cmd, str(remotes_repo))
+        assert res.returncode == 2
+        assert "carries config the guard cannot read" in res.stderr
+
+    def test_git_config_env_prefix_blocks(self, remotes_repo):
+        cmd = (
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.backups.pushurl "
+            f"GIT_CONFIG_VALUE_0=https://x.example/x.git git push {_FORCE} backups main"
+        )
+        res = _run_cwd(cmd, str(remotes_repo))
+        assert res.returncode == 2
+
+    def test_home_prefix_blocks(self, remotes_repo):
+        res = _run_cwd(
+            f"HOME=/tmp/elsewhere git push {_FORCE} backups main", str(remotes_repo)
+        )
+        assert res.returncode == 2
+
+    def test_env_wrapper_blocks(self, remotes_repo):
+        # A stripped wrapper can carry env assignments the prefix check must
+        # not assume away — any non-`git` first word refuses.
+        res = _run_cwd(f"env git push {_FORCE} backups main", str(remotes_repo))
+        assert res.returncode == 2
+
+    def test_config_env_longform_blocks(self, remotes_repo):
+        cmd = (
+            "git --config-env=remote.backups.pushurl=X "
+            f"push {_FORCE} backups main"
+        )
+        res = _run_cwd(cmd, str(remotes_repo))
+        assert res.returncode == 2
+
+    def test_two_dash_c_blocks(self, remotes_repo):
+        # git applies repeated -C cumulatively but the guard resolves only the
+        # first — a second one makes the read describe the wrong repo.
+        res = _run_cwd(
+            f"git -C {remotes_repo} -C . push {_FORCE} backups main",
+            str(remotes_repo),
+        )
+        assert res.returncode == 2
+
+    def test_earlier_set_url_blocks(self, remotes_repo):
+        cmd = (
+            "git remote set-url --push backups https://x.example/x.git && "
+            f"git push {_FORCE} backups main"
+        )
+        res = _run_cwd(cmd, str(remotes_repo))
+        assert res.returncode == 2
+
+    def test_earlier_git_config_blocks(self, remotes_repo):
+        cmd = (
+            "git config remote.backups.pushurl https://x.example/x.git && "
+            f"git push {_FORCE} backups main"
+        )
+        res = _run_cwd(cmd, str(remotes_repo))
+        assert res.returncode == 2
+
+    def test_earlier_redirect_into_config_blocks(self, remotes_repo):
+        cmd = f"echo x >> .git/config && git push {_FORCE} backups main"
+        res = _run_cwd(cmd, str(remotes_repo))
+        assert res.returncode == 2
+
+    def test_second_force_push_blocks(self, remotes_repo):
+        # A second push is not an inert neighbour — documented over-block:
+        # the allowlist treats the compound as unprovable, never asks.
+        cmd = (
+            f"git push {_FORCE} backups main && "
+            f"git push {_FORCE} backups other"
+        )
+        res = _run_cwd(cmd, str(remotes_repo))
+        assert res.returncode == 2
+
+    def test_inert_neighbour_still_asks(self, remotes_repo):
+        # The allowlist, not a ban on compounds: status/cd leave config alone.
+        res = _run_cwd(
+            f"git status && git push {_FORCE} backups main", str(remotes_repo)
+        )
+        assert _decision(res) == "ask"

@@ -10921,6 +10921,60 @@ def _push_seg_has_no_prefix(seg) -> bool:
     return bool(words) and words[0] == "git"
 
 
+def _push_globals_carry_no_config(argv: list[str]) -> bool:
+    """Whether a ``git push`` argv borrows no config the repo reads cannot see.
+
+    The same allowlist ``_push_ref_positionals`` applies before the ``push``
+    token: only ``-C`` (at most once — git applies repeated ``-C``
+    cumulatively while callers resolve the push cwd from the first) and the
+    pager switches ``-P`` / ``--no-pager``. Any other global — above all
+    ``-c`` / ``--config-env``, which supply config — is a False, as is an argv
+    whose ``push`` token never arrives.
+    """
+    i = 1  # skip argv[0] == "git"
+    dash_c = 0
+    while i < len(argv):
+        t = argv[i]
+        if t in _PUSH_SAFE_GLOBAL_VALUE_FLAGS:
+            dash_c += 1
+            if dash_c > 1:
+                return False
+            i += 2
+            continue
+        if t in _PUSH_SAFE_GLOBAL_FLAGS:
+            i += 1
+            continue
+        if t.startswith("-"):
+            return False  # -c / --config-env / --exec-path / --git-dir / unknown
+        break
+    return i < len(argv) and argv[i] == "push"
+
+
+def _force_push_reads_run_config(seg, segs, command: str) -> bool:
+    """Whether the force arm's config reads describe the config the push USES.
+
+    The arm resolves the destination and compares push-url sets BEFORE the
+    command runs, so anything in the command that carries or writes git
+    config makes the read describe a different destination than the one git
+    resolves (#2513): an assignment/env prefix (``GIT_CONFIG_*``, ``HOME=``,
+    an ``env``/``sudo`` wrapper — the parse strips them from argv, so only
+    the segment's raw text sees them), a git global option that supplies
+    config (``-c``, ``--config-env``, ``--exec-path``, ``--git-dir``), or an
+    earlier segment that can write config (``git config``, ``git remote
+    set-url --push``, a redirect into ``.git/config``). Each leg reuses the
+    predicate the re-push relaxation already trusts:
+    ``_push_seg_has_no_prefix``, ``_push_globals_carry_no_config`` (the
+    ``_PUSH_SAFE_GLOBAL_*`` scan), and ``_push_compound_is_inert``. Callers
+    fail closed on False — a force push whose destination cannot be proven
+    is treated as public, and public means blocked.
+    """
+    if not _push_seg_has_no_prefix(seg):
+        return False
+    if not _push_globals_carry_no_config(getattr(seg, "argv", None) or []):
+        return False
+    return _push_compound_is_inert(segs, seg, command)
+
+
 def _ref_names_current_branch(ref: str, cur: str | None) -> bool:
     """Whether a push refspec (one side of it) names the CURRENT branch ``cur``.
 
@@ -12140,8 +12194,29 @@ def _run_merge_and_push_gates() -> int:
             # all count as public ⇒ blocked (fail closed). Only a destination
             # whose push urls resolve AND are DISJOINT from origin's gets the
             # softer cautious-ask path — interactive asks, dispatched denies.
+            # AND the URL reads must describe the config the push runs with:
+            # config carried by the command itself (a `git -c`/`--config-env`
+            # option, a `HOME=`/`GIT_CONFIG_*` prefix, an earlier config-writing
+            # segment) makes the read describe a different destination, so a
+            # force push that fails the whole-command allowlist is treated as
+            # public too — blocked, never asked (#2513).
             force_segs = [s for s in push_segs if _push_is_force(s.argv)]
             if force_segs:
+                if not _force_push_reads_run_config(force_segs[0], segs, cmd):
+                    print(
+                        "BLOCKED: this force push carries config the guard cannot "
+                        "read before the command runs — a `git -c`/`--config-env` "
+                        "option, a HOME=/GIT_CONFIG_* prefix, or an earlier step "
+                        "that can write config — so its destination cannot be "
+                        "proven off the public repo.",
+                        file=sys.stderr,
+                    )
+                    print(
+                        "Run the force push as its own plain `git push` command; "
+                        "the destination check can then read the config it uses.",
+                        file=sys.stderr,
+                    )
+                    return 2
                 remote = _resolve_push_remote(force_segs[0], cwd=pcwd)
                 if pcwd_unknown or remote is None or remote == "origin":
                     print(
