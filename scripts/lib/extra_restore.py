@@ -18,14 +18,19 @@ steps that need a real tar reader:
 stdout carries values only; diagnostics go to stderr. Exit codes: 0 restored;
 3 this Python's tarfile lacks the 2025 extraction-filter fixes (refused, fail
 closed); 4 restored, with some members refused; 5 refused or failed, nothing
-replaced.
+replaced; 6 restored, but a step after the rename failed (the parent directory
+could not be fsynced, so the rename is not proven durable, or an archived
+directory mode could not be applied).
 
 Members are extracted through the stdlib ``data`` filter (absolute links, ``..``
 escapes and special files are refused member by member), with two additions:
 every member and every link target must stay inside the archive's directory,
-and directories keep their archived mode minus setuid/setgid/sticky and
+and directories get their archived mode minus setuid/setgid/sticky and
 group/other write (the ``data`` filter alone drops directory modes, which would
-leave every directory at the caller's umask).
+leave every directory at the caller's umask). Directories stay owner-writable
+until the restored tree has been renamed into place, and only then get their
+archived modes: a read-only directory (0555) cannot be renamed to a new parent,
+and its staging copy could not be deleted after a failure.
 """
 
 from __future__ import annotations
@@ -74,10 +79,18 @@ def make_filter(root: str):
     ``refused`` collects one line per refused member."""
     want = parts(root)
     refused: list[str] = []
+    dir_modes: dict[str, int] = {}  # path relative to root -> archived mode, applied last
+    links: set[str] = set()  # paths of symlink members seen so far
 
     def keep(member: tarfile.TarInfo, dest: str):
-        if not _inside(parts(member.name), want):
+        p = parts(member.name)
+        if not _inside(p, want):
             refused.append(f"refused member {member.name!r}: outside {root}")
+            return None
+        # A member written THROUGH an earlier symlink member would land wherever that
+        # link leads, so name-based checks below would judge the wrong place.
+        if any("/".join(p[:i]) in links for i in range(1, len(p))):
+            refused.append(f"refused member {member.name!r}: its path runs through a link")
             return None
         if member.issym() and not member.linkname.startswith("/"):
             target = posixpath.normpath(
@@ -94,11 +107,16 @@ def make_filter(root: str):
         except tarfile.FilterError as e:
             refused.append(f"refused member {member.name!r}: {type(e).__name__}")
             return None
+        if out is not None and member.issym():
+            links.add("/".join(p))
         if out is not None and member.isdir():
-            out = out.replace(mode=member.mode & ~0o7022, deep=False)
+            final = member.mode & ~0o7022
+            dir_modes["/".join(parts(member.name)[len(want) :])] = final
+            out = out.replace(mode=final | 0o700, deep=False)
         return out
 
     keep.refused = refused  # type: ignore[attr-defined]
+    keep.dir_modes = dir_modes  # type: ignore[attr-defined]
     return keep
 
 
@@ -106,7 +124,11 @@ def _fsync_tree(top: str) -> None:
     """fsync every file and directory under ``top`` (only that filesystem), so a
     crash after the rename cannot leave a renamed directory of empty files. A
     global sync(2) would also wait on every other mount, including a dead one."""
-    for dirpath, _dirs, files in os.walk(top):
+
+    def _raise(err: OSError) -> None:
+        raise err
+
+    for dirpath, _dirs, files in os.walk(top, onerror=_raise):
         for name in files:
             p = os.path.join(dirpath, name)
             if os.path.islink(p):
@@ -170,6 +192,9 @@ def cmd_swap(tar: str, stage: str, root: str, target: str, aside: str) -> int:
                 print(f"aside {aside}")
         _err(f"could not move the restored directory into place: {e}")
         return 5
+    if moved:
+        print(f"aside {aside}")
+    problem = False
     try:
         fd = os.open(os.path.dirname(target), os.O_RDONLY)
         try:
@@ -177,19 +202,36 @@ def cmd_swap(tar: str, stage: str, root: str, target: str, aside: str) -> int:
         finally:
             os.close(fd)
     except OSError as e:
-        _err(f"restored, but could not fsync {os.path.dirname(target)}: {e}")
-    if moved:
-        print(f"aside {aside}")
+        _err(f"could not fsync {os.path.dirname(target)}: {e}")
+        problem = True
+    # Archived directory modes, deepest first, so a read-only parent never blocks
+    # setting a child below it.
+    real_target = os.path.realpath(target)  # $HOME itself may legitimately be a link
+    for rel in sorted(keep.dir_modes, key=lambda r: r.count("/") + bool(r), reverse=True):
+        path = os.path.join(target, rel) if rel else target
+        try:
+            # Never chmod through a link inside the restored tree (Linux has no lchmod).
+            expected = os.path.normpath(os.path.join(real_target, rel)) if rel else real_target
+            if os.path.realpath(path) != expected:
+                raise OSError(f"{path} is, or runs through, a symlink")
+            os.chmod(path, keep.dir_modes[rel])
+        except OSError as e:
+            _err(f"could not apply the archived mode to {path}: {e}")
+            problem = True
+    if problem:
+        return 6
     return 4 if keep.refused else 0
 
 
 def main(argv: list[str]) -> int:
-    if not _python_is_safe():
-        _err("this Python's tarfile lacks the 2025 extraction-filter fixes; refusing to extract")
-        return 3
     if len(argv) == 3 and argv[1] == "root":
-        return cmd_root(argv[2])
+        return cmd_root(argv[2])  # reads names only; extracts nothing
     if len(argv) == 7 and argv[1] == "swap":
+        if not _python_is_safe():
+            _err(
+                "this Python's tarfile lacks the 2025 extraction-filter fixes; refusing to extract"
+            )
+            return 3
         return cmd_swap(*argv[2:7])
     _err("usage: extra_restore.py root <tar> | swap <tar> <stage> <root> <target> <aside>")
     return 5

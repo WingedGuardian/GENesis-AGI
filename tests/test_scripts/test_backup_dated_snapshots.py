@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -104,9 +105,7 @@ def backup_env(tmp_path):
     systemctl_log = tmp_path / "systemctl.log"
     _make_stub(
         bind / "systemctl",
-        "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$*" >> "{systemctl_log}"\n'
-        "exit 3\n",
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{systemctl_log}"\nexit 3\n',
     )
     return {
         "home": home,
@@ -467,25 +466,38 @@ def test_extra_upload_failure_keeps_complete_but_marks_offsite_unconfirmed(backu
     assert status["extra_upload_failed"] == 1, status
     assert status["tier2_status"] == "partial", status
     assert status["offsite_confirmed"] is False, status
-    assert "extra dirs are incomplete (0 not archived, 1 not uploaded)" in proc.stdout, proc.stdout[-1500:]
+    assert "extra dirs are incomplete (0 not archived, 1 not uploaded)" in proc.stdout, proc.stdout[
+        -1500:
+    ]
 
 
-def test_extra_dirs_unsetting_the_variable_keeps_existing_archives(backup_env, tmp_path):
-    """An unset variable (a parse slip, a missing env) must not delete the last good
-    archives (security review W2); removing an entry from a non-empty list does."""
+def _next_second() -> None:
+    """Snapshot stamps have one-second resolution; two runs inside one second share a
+    snapshot dir. Real runs are hours apart; tests that compare two runs wait."""
+    time.sleep(1.1)
+
+
+def _snaps(offsite: Path) -> list[Path]:
+    """Dated off-site snapshot dirs, oldest first."""
+    host = next((offsite / "Genesis").iterdir())
+    return sorted(d for d in host.iterdir() if _STAMP_RE.fullmatch(d.name))
+
+
+def test_extra_dirs_unsetting_the_variable_carries_nothing_forward(backup_env, tmp_path):
+    """Fresh only: unsetting the variable means the next snapshot holds no extra
+    archive, and the log says so. (Older snapshots keep theirs under GFS retention;
+    a same-day earlier snapshot is pruned by the daily bucket, so not asserted.)"""
     _seed_extra_dir(backup_env["home"])
     offsite = tmp_path / "offsite"
     offsite.mkdir()
-    assert (
-        _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store"}).returncode
-        == 0
-    )
-    before = {p.name for p in (_repo(backup_env) / "extra").glob("*.tar.gpg")}
-    assert len(before) == 1
+    env = {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store"}
+    assert _run_local(backup_env, offsite, env).returncode == 0
+    _next_second()
     proc = _run_local(backup_env, offsite)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    assert {p.name for p in (_repo(backup_env) / "extra").glob("*.tar.gpg")} == before
-    assert "keeping 1 existing extra archive" in proc.stdout, proc.stdout[-1500:]
+    assert not list((_repo(backup_env) / "extra").glob("*.tar.gpg"))
+    assert "are not carried forward" in proc.stdout, proc.stdout[-1500:]
+    assert not list(_snaps(offsite)[-1].glob("extra/*.tar.gpg"))
 
 
 def test_extra_dirs_unset_is_a_noop(backup_env, tmp_path):
@@ -517,9 +529,9 @@ def test_extra_dirs_refuses_outside_home_missing_or_home_itself(backup_env, tmp_
     assert status["extra_dirs"] == 0 and status["extra_dirs_skipped"] == 1, status
 
 
-def test_extra_dirs_missing_dir_keeps_last_archive_and_unlisted_archive_is_dropped(
-    backup_env, tmp_path
-):
+def test_extra_missing_dir_is_absent_from_the_snapshot_and_marks_it_partial(backup_env, tmp_path):
+    """Fresh only: a listed directory that is missing this run is not in this
+    snapshot (no old archive under a new date), and the off-site copy is partial."""
     home = backup_env["home"]
     d = _seed_extra_dir(home)
     other = home / "work" / "other"
@@ -529,15 +541,35 @@ def test_extra_dirs_missing_dir_keeps_last_archive_and_unlisted_archive_is_dropp
     offsite.mkdir()
     env = {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store:~/work/other"}
     assert _run_local(backup_env, offsite, env).returncode == 0
-    names = {p.name for p in (_repo(backup_env) / "extra").glob("*.tar.gpg")}
-    assert len(names) == 2
-    store_archive = next(n for n in names if "store" in n)
-    # store vanishes temporarily: its last good archive must survive.
     d.rename(home / "work" / "store.moved")
-    # other is dropped from the list: its archive is removed.
-    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store"})
+    _next_second()
+    proc = _run_local(backup_env, offsite, env)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    assert {p.name for p in (_repo(backup_env) / "extra").glob("*.tar.gpg")} == {store_archive}
+    names = [p.name for p in (_repo(backup_env) / "extra").glob("*.tar.gpg")]
+    assert len(names) == 1 and "other" in names[0], names
+    assert "missing; not in this snapshot" in proc.stdout
+    last = _snaps(offsite)[-1]
+    assert [p.name for p in last.glob("extra/*.tar.gpg")] == names
+    status = _status(backup_env)
+    assert status["extra_dirs_skipped"] == 1 and status["tier2_status"] == "partial", status
+    # Core COMPLETE + only extras missing: retention still runs (else a listed dir that
+    # stays missing would stop it for good). The same-day earlier snapshot is pruned.
+    assert "GFS prune: removed off-site snapshot" in proc.stdout, proc.stdout[-1500:]
+
+
+def test_extra_complete_marker_lists_the_uploaded_archives(backup_env, tmp_path):
+    """restore.sh reads the COMPLETE marker to know which extras the snapshot holds."""
+    _seed_extra_dir(backup_env["home"])
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    assert (
+        _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store"}).returncode
+        == 0
+    )
+    last = _snaps(offsite)[-1]
+    lines = (last / "COMPLETE").read_text().splitlines()
+    (archive,) = last.glob("extra/*.tar.gpg")
+    assert lines == ["genesis-snapshot 1", f"extra {archive.name}"], lines
 
 
 _RESTORE = _BACKUP.parent / "restore.sh"
@@ -618,8 +650,11 @@ def test_extra_dirs_symlinked_home_still_archives(backup_env, tmp_path):
     "entry,reason",
     [
         ("work/store", "must be an absolute path"),  # relative: would resolve against the repo
-        ("~/backups", "contains the backups repo"),  # archives its own archives
-        ("~/backups/genesis-backups/memory", "inside the backups repo"),
+        ("~/backups", "the backup's own output"),  # contains the backups repo
+        ("~/backups/genesis-backups/memory", "the backup's own output"),  # inside it
+        ("~/offsite-local", "the backup's own output"),  # contains a local off-site root
+        ("~/work/link", "runs through, a symlink"),  # list the real directory instead
+        (":", "the list has no entries"),
         ("~/work/venv", "excluded name"),  # would archive nothing
         # restore swaps an extra directory as a unit; these overlap core restore paths
         ("~/.genesis", "which the core backup restores"),  # contains ~/.genesis/eval
@@ -631,8 +666,9 @@ def test_extra_dirs_refuses_risky_entries_with_a_reason(backup_env, tmp_path, en
     _seed_extra_dir(home)
     (home / "work" / "venv").mkdir(parents=True, exist_ok=True)
     (home / "work" / "venv" / "f").write_text("x")
-    offsite = tmp_path / "offsite"
-    offsite.mkdir()
+    (home / "work" / "link").symlink_to(home / "work" / "store")
+    offsite = home / "offsite-local" / "root"  # a local off-site root under $HOME
+    offsite.mkdir(parents=True)
     proc = _run_local(
         backup_env,
         offsite,
@@ -648,33 +684,28 @@ def _status(backup_env) -> dict:
 
 
 @pytest.mark.parametrize(
-    "second_value",
+    "value,archived",
     [
-        "work/store",  # every entry invalid
-        "~/work/store:work/typo",  # one valid, one invalid
-        "~/work/store: ~/work/other",  # a stray space makes the second entry relative
+        ("work/store", 0),  # every entry invalid
+        ("~/work/store:work/typo", 1),  # one valid, one invalid
+        ("~/work/store: ~/work/other", 1),  # a stray space makes the second entry relative
     ],
 )
-def test_extra_invalid_entry_never_deletes_another_entrys_archive(backup_env, tmp_path, second_value):
-    """Review S1 + Devin: archives are pruned only when the WHOLE list validated, so a
-    typo can never delete the last good archive of another entry."""
+def test_extra_invalid_entry_is_skipped_and_marks_the_snapshot_partial(
+    backup_env, tmp_path, value, archived
+):
+    """An invalid entry never stops a valid one being archived, and it is never
+    silent: the off-site copy is partial."""
     home = backup_env["home"]
     _seed_extra_dir(home)
     (home / "work" / "other").mkdir()
-    (home / "work" / "other" / "f").write_text("o")
     offsite = tmp_path / "offsite"
     offsite.mkdir()
-    first = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store:~/work/other"})
-    assert first.returncode == 0, first.stdout[-1500:]
-    before = sorted(p.name for p in (_repo(backup_env) / "extra").glob("*.tar.gpg"))
-    assert len(before) == 2, before
-    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": second_value})
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": value})
     assert proc.returncode == 0, proc.stdout[-1500:]
-    after = sorted(p.name for p in (_repo(backup_env) / "extra").glob("*.tar.gpg"))
-    assert after == before, f"an archive was pruned on an invalid list:\n{proc.stdout[-1500:]}"
-    assert "has invalid entries; no extra archive removed" in proc.stdout
+    assert len(list((_repo(backup_env) / "extra").glob("*.tar.gpg"))) == archived
     status = _status(backup_env)
-    assert status["extra_failed"] >= 1 and status["tier2_status"] == "partial", status
+    assert status["extra_dirs_skipped"] >= 1 and status["tier2_status"] == "partial", status
     assert status["offsite_confirmed"] is False, status
 
 
@@ -686,7 +717,7 @@ def test_extra_list_with_a_newline_archives_and_removes_nothing(backup_env, tmp_
     offsite.mkdir()
     proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store\n~/work/x"})
     assert proc.returncode == 0, proc.stdout[-1500:]
-    assert "contains a newline" in proc.stdout
+    assert "the list contains a newline" in proc.stdout
     assert not list((_repo(backup_env) / "extra").glob("*.tar.gpg"))
     assert _status(backup_env)["tier2_status"] == "partial"
 
@@ -707,26 +738,24 @@ def test_extra_tar_failure_marks_the_offsite_copy_partial(backup_env, tmp_path):
     assert proc.returncode == 0, proc.stdout[-1500:]
     assert "tar failed" in proc.stdout, proc.stdout[-1500:]
     status = _status(backup_env)
-    assert status["extra_failed"] == 1 and status["extra_dirs"] == 0, status
+    assert status["extra_dirs_skipped"] == 1 and status["extra_dirs"] == 0, status
     assert status["tier2_status"] == "partial" and status["offsite_confirmed"] is False, status
 
 
-def test_extra_exclude_matching_the_root_keeps_the_last_good_archive(backup_env, tmp_path):
+def test_extra_exclude_matching_the_root_is_refused_not_archived_empty(backup_env, tmp_path):
     """Review S3: tar excludes are wildcards; one matching the directory itself gives an
-    empty archive with rc 0. It must never replace the last good archive."""
+    archive without it, with rc 0. It is refused (partial) and never uploaded."""
     home = backup_env["home"]
     _seed_extra_dir(home)
     offsite = tmp_path / "offsite"
     offsite.mkdir()
     env = {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store"}
     assert _run_local(backup_env, offsite, env).returncode == 0
-    (archive,) = (_repo(backup_env) / "extra").glob("*.tar.gpg")
-    good = archive.read_bytes()
+    _next_second()
     proc = _run_local(backup_env, offsite, {**env, "GENESIS_BACKUP_EXTRA_EXCLUDES": "st*"})
     assert proc.returncode == 0, proc.stdout[-1500:]
-    assert "would not contain" in proc.stdout, proc.stdout[-1500:]
-    assert archive.read_bytes() == good, "the last good archive was replaced"
-    assert "work/store/a.parquet" in _list_extra_archive(archive, home)
+    assert "does an exclude pattern match the directory itself" in proc.stdout, proc.stdout[-1500:]
+    assert not list(_snaps(offsite)[-1].glob("extra/*.tar.gpg"))
     assert _status(backup_env)["tier2_status"] == "partial"
 
 
@@ -739,3 +768,114 @@ def test_extra_nested_entries_are_refused(backup_env, tmp_path):
     assert proc.returncode == 0, proc.stdout[-1500:]
     assert "another listed entry" in proc.stdout, proc.stdout[-1500:]
     assert len(list((_repo(backup_env) / "extra").glob("*.tar.gpg"))) == 1
+
+
+def test_extra_entry_overlapping_a_relocated_override_store_is_refused(backup_env, tmp_path):
+    """Codex round 2: the merge-gate override store can be relocated
+    (GENESIS_MERGE_OVERRIDE_DIR); an entry overlapping the configured store is refused
+    like one overlapping the default, so restore never swaps the live audit trail out."""
+    home = backup_env["home"]
+    store = home / "audit-custom"
+    store.mkdir()
+    (store / "x.jsonl").write_text("{}\n")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(
+        backup_env,
+        offsite,
+        {"GENESIS_BACKUP_EXTRA_DIRS": "~/audit-custom", "GENESIS_MERGE_OVERRIDE_DIR": str(store)},
+    )
+    assert proc.returncode == 0, proc.stdout[-1500:]
+    assert "which the core backup restores" in proc.stdout, proc.stdout[-1500:]
+    assert not list((_repo(backup_env) / "extra").glob("*.tar.gpg"))
+
+
+def _fail_offsite_cp(backup_env, part: str) -> None:
+    """A `cp` shim on PATH failing only uploads into the off-site <part>/ dir."""
+    shim = backup_env["bind"] / "cp"
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        f'for a in "$@"; do case "$a" in */Genesis/*/{part}/*) exit 1 ;; esac; done\n'
+        f'exec {shutil.which("cp")} "$@"\n'
+    )
+    shim.chmod(0o755)
+
+
+_TELEGRAM = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_FORUM_CHAT_ID": "c"}
+_ALERTED = "Telegram alert failed to send"  # the curl stub fails, so every alert logs this
+
+
+def test_an_extras_gap_never_silences_a_later_real_offsite_failure(backup_env, tmp_path):
+    """Audit S1: the core copy and the extras are deduplicated separately. Run 1 has
+    only an extras gap (alerts once); run 2 keeps that gap AND fails the core upload,
+    which must alert even though offsite_confirmed was already false."""
+    home = backup_env["home"]
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    env = {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/missing", **_TELEGRAM}
+    first = _run_local(backup_env, offsite, env)
+    assert first.returncode == 0, first.stdout[-1500:]
+    assert _ALERTED in first.stdout, first.stdout[-1500:]
+    s1 = _status(backup_env)
+    assert s1["offsite_core_complete"] is True and s1["extras_complete"] is False, s1
+    _next_second()
+    third = _run_local(backup_env, offsite, env)  # same extras gap: deduplicated
+    assert _ALERTED not in third.stdout, third.stdout[-1500:]
+    _next_second()
+    _fail_offsite_cp(backup_env, "data")
+    proc = _run_local(backup_env, offsite, env)
+    s2 = _status(backup_env)
+    assert s2["offsite_core_complete"] is False, s2
+    assert _ALERTED in proc.stdout, (
+        f"the real off-site failure was silenced:\n{proc.stdout[-1500:]}"
+    )
+    assert home.exists()
+
+
+def test_extra_dir_names_tar_would_escape_are_archived(backup_env, tmp_path):
+    """Audit S2: the archive check uses restore's own reader, never `tar -t` output,
+    which escapes backslashes and (under a C locale) non-ASCII names."""
+    home = backup_env["home"]
+    d = home / "work" / "café\\x"
+    d.mkdir(parents=True)
+    (d / "f.txt").write_text("x")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(
+        backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": f"{d}", "LC_ALL": "C", "LANG": "C"}
+    )
+    assert proc.returncode == 0, proc.stdout[-1500:]
+    assert len(list((_repo(backup_env) / "extra").glob("*.tar.gpg"))) == 1, proc.stdout[-1500:]
+    assert _status(backup_env)["extra_dirs_skipped"] == 0
+
+
+def test_complete_marker_records_skipped_entries(backup_env, tmp_path):
+    """Audit S3: a listed directory the run could not back up is named in COMPLETE,
+    so restore can say the snapshot does not hold it."""
+    _seed_extra_dir(backup_env["home"])
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    env = {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store:~/work/missing"}
+    assert _run_local(backup_env, offsite, env).returncode == 0
+    lines = (_snaps(offsite)[-1] / "COMPLETE").read_text().splitlines()
+    assert lines[0] == "genesis-snapshot 1"
+    assert "skipped work/missing" in lines, lines
+    assert sum(1 for ln in lines if ln.startswith("extra ")) == 1, lines
+
+
+def test_an_extras_gap_first_seen_during_a_core_outage_is_announced_after_it(backup_env, tmp_path):
+    """Verification review: during a core outage only the core alert is sent, so an
+    extras gap that started then must still be announced once the core recovers."""
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    env = {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/missing", **_TELEGRAM}
+    _fail_offsite_cp(backup_env, "data")
+    first = _run_local(backup_env, offsite, env)
+    assert _status(backup_env)["offsite_core_complete"] is False
+    assert _ALERTED in first.stdout
+    (backup_env["bind"] / "cp").unlink()
+    _next_second()
+    proc = _run_local(backup_env, offsite, env)
+    s = _status(backup_env)
+    assert s["offsite_core_complete"] is True and s["extras_complete"] is False, s
+    assert _ALERTED in proc.stdout, f"the extras gap was never announced:\n{proc.stdout[-1500:]}"

@@ -145,20 +145,35 @@ GENESIS_BACKUP_EXTRA_DIRS=~/.genesis/analytics:~/.genesis/tools/my-tool
 GENESIS_BACKUP_EXTRA_EXCLUDES=derived:scratch
 ```
 Each directory becomes one encrypted archive, `extra/<name>.tar.gpg`. It goes to
-the off-site tier only, never the git tier. Rebuildable caches (`.venv`,
-`node_modules`, `__pycache__`, …) are always excluded, and
-`GENESIS_BACKUP_EXTRA_EXCLUDES` adds more tar exclude patterns (wildcards
-allowed), matched at any depth. An entry that is outside your home directory,
-relative, nested in or containing another entry, or overlapping a path the core
-backup already restores (for example `~/.genesis` itself, or anything inside the
-repo) is skipped with a warning. So is a directory tar cannot read, or one an
-exclude pattern would empty; its last good archive is kept. None of these fails
-the backup, but each marks the off-site copy `partial` (`offsite_confirmed:
-false`) and sends the off-site alert, as does an archive that fails to upload;
-the core snapshot is still marked complete. A missing directory keeps its last
-archive without that warning. Removing an entry from a list in which every
-entry is valid deletes its archive; a list with any invalid entry, or an unset
-variable, deletes nothing.
+the off-site tier only, never the git tier. Every run builds these archives from
+scratch: a snapshot holds only what that run archived, and nothing is carried
+over from an earlier run. Rebuildable caches (`.venv`, `node_modules`,
+`__pycache__`, …) are always excluded, and `GENESIS_BACKUP_EXTRA_EXCLUDES` adds
+more tar exclude patterns (wildcards allowed), matched at any depth.
+
+A listed directory is skipped with a warning when it:
+- is relative, or outside your home directory;
+- is, or runs through, a symlink (list the real directory instead);
+- is inside or contains another entry, the backups repo, the backup temp dir, or
+  a local off-site root;
+- overlaps a path the core backup already restores (for example `~/.genesis`
+  itself, or anything inside the repo);
+- is missing, or tar cannot read it;
+- would be emptied by an exclude pattern.
+
+A skipped directory is simply absent from that snapshot; older snapshots keep it
+until retention drops them. None of this fails the backup, but each skip, and
+each archive that fails to upload, marks the off-site copy `partial`
+(`offsite_confirmed: false`, `extras_complete: false`) and sends the off-site
+alert once. The core snapshot is still marked complete
+(`offsite_core_complete: true`), retention still runs, and a later failure of the
+core off-site copy still alerts on its own. The snapshot's `COMPLETE` marker
+lists the extra archives it holds and the listed directories it skipped, so a
+restore can tell "none" apart from "could not list them" and can name what a
+snapshot is missing. A file that changes while it is being archived (tar exit 1)
+is kept but may be torn, and the log says so; stop a writer whose files must be
+consistent, or exclude them. Without an off-site tier the archives stay local
+only, in the backups checkout, and no off-site alert applies.
 
 `restore.sh` puts each directory back as a whole: it unpacks the archive next to
 the destination and renames it into place, so directory permissions and empty
@@ -169,8 +184,8 @@ failure. Members that use `..`, a special file, or a link pointing outside the
 restored directory are refused one by one and the rest restores. A whole archive
 is refused when its destination is a symlink, when its path runs through a
 symlink that leads outside your home directory, or when it overlaps a core
-restore path. Every refusal is recorded. After an off-site pull, only archives
-from the selected snapshot are restored.
+restore path. Every refusal is recorded. After an off-site pull, restore takes
+exactly the archives that snapshot's `COMPLETE` marker lists.
 
 Bootstrap installs the timer's unit files but does **not** enable them —
 scheduling a backup that silently leaves your database local-only would give a

@@ -120,9 +120,15 @@ source "$_SCRIPT_DIR/lib/deploy_marker.sh"
 _SQL_TMP=""
 _QDRANT_TMP=""
 _DB_STAGE=""
+_rm_stage() {  # remove a §4c staging tree, which may hold read-only dirs; never fatal
+    [ -n "${1:-}" ] && [ -e "$1" ] || return 0
+    chmod -R u+rwx -- "$1" 2>/dev/null || true
+    rm -rf -- "$1" 2>/dev/null || true
+    [ ! -e "$1" ]
+}
 _cleanup_plaintext() {
     rm -f "${_SQL_TMP:-}" "${_QDRANT_TMP:-}" "${_XT_TAR:-}" "${_XT_ERR:-}" 2>/dev/null || true
-    if [ -n "${_XT_STAGE:-}" ]; then rm -rf "$_XT_STAGE" 2>/dev/null || true; fi  # §4c plaintext staging
+    _rm_stage "${_XT_STAGE:-}" || true  # §4c plaintext staging
     if [ -n "${_DB_STAGE:-}" ]; then
         rm -f "$_DB_STAGE" "$_DB_STAGE-journal" "$_DB_STAGE-wal" "$_DB_STAGE-shm" 2>/dev/null || true
     fi
@@ -470,13 +476,35 @@ _pull_from_offsite() {
             fi
         done < <(backend_list "$snap/$_sub" 2>/dev/null | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u)
     done
-    # opt-in extra-directory archives (backup.sh §6f) — flat by construction,
-    # one <name>.tar.gpg per directory, so one single-level listing pulls them all.
-    # Only names pulled from THIS snapshot are restored (§4c), so an archive a
-    # previous run left in $BACKUP_DIR/extra cannot come back from another point in time.
+    # opt-in extra-directory archives (backup.sh §6f) — flat by construction, one
+    # <name>.tar.gpg per directory. Only names pulled from THIS snapshot are restored
+    # (§4c), so an archive a previous run left in $BACKUP_DIR/extra cannot come back
+    # from another point in time. The snapshot's COMPLETE marker lists the archives
+    # it holds (backup.sh writes it last). That list is authoritative: a failed
+    # off-site LISTING is indistinguishable from an empty one, while a failed
+    # download of the marker is detectable. An empty marker predates extra
+    # directories and means the snapshot holds none.
     _EXTRA_FROM_SNAPSHOT=true
     _EXTRA_PULLED=""
+    _xt_names=""
+    _xt_marker="$(mktemp -p "$GENESIS_BIG_TMP" complete.XXXXXX)" || _xt_marker=""
+    if [ -n "$_xt_marker" ] && backend_get "$snap/COMPLETE" "$_xt_marker"; then
+        if [ "$(head -1 "$_xt_marker")" = "genesis-snapshot 1" ]; then
+            _xt_names="$(awk '$1 == "extra" {print $2}' "$_xt_marker" | grep -E '^[A-Za-z0-9._-]+\.tar\.gpg$' || true)"
+            # Directories the source listed but could not back up in that run.
+            while IFS= read -r _xt_sk; do
+                [ -n "$_xt_sk" ] && warn "off-site: snapshot $latest does not hold extra directory ${_xt_sk} (backup skipped it that run); it is not restored"
+            done < <(awk '$1 == "skipped" {$1 = ""; sub(/^ /, ""); print}' "$_xt_marker" | tr -cd '[:print:]\n')
+        elif [ -s "$_xt_marker" ]; then
+            warn "off-site: snapshot $latest has a COMPLETE marker in an unknown format; its extra directories are not restored"
+        fi
+        # An empty marker predates extra directories: that snapshot holds none.
+    else
+        warn "off-site: could not read the COMPLETE marker of snapshot $latest — its extra directories cannot be verified or restored"
+    fi
+    [ -n "$_xt_marker" ] && rm -f "$_xt_marker"
     while read -r fname; do
+        [ -n "$fname" ] || continue
         mkdir -p "$BACKUP_DIR/extra"
         if backend_get "$snap/extra/$fname" "$BACKUP_DIR/extra/$fname"; then
             _EXTRA_PULLED+="$fname"$'\n'
@@ -484,7 +512,7 @@ _pull_from_offsite() {
         else
             warn "off-site: failed to pull extra/$fname from snapshot $latest"
         fi
-    done < <(backend_list "$snap/extra" 2>/dev/null | grep -oE '[A-Za-z0-9._-]+\.tar\.gpg' | sort -u)
+    done <<< "$_xt_names"
     # creds — Tier-1 git normally carries these; a no-git box needs them from the
     # snapshot too (restore §8 reads $BACKUP_DIR/creds). backend_list is
     # single-level, so iterate creds/ and creds/ssh/ separately; the .gpg filter
@@ -1245,8 +1273,8 @@ fi
 # refusal or failure for one archive is recorded and the rest of the restore runs.
 _xt_skip() {  # warn, drop this archive's temps, and let the caller `continue`
     warn "$1"
-    rm -f "${_XT_TAR:-}" "${_XT_ERR:-}"
-    [ -n "${_XT_STAGE:-}" ] && rm -rf "$_XT_STAGE"
+    rm -f "${_XT_TAR:-}" "${_XT_ERR:-}" 2>/dev/null || true
+    _rm_stage "${_XT_STAGE:-}" || warn "extra restore: could not remove the staging dir $_XT_STAGE (it holds decrypted data; remove it by hand)"
     _XT_TAR="" _XT_ERR="" _XT_STAGE=""
 }
 _xt_errtext() { head -c 300 "$_XT_ERR" 2>/dev/null | tr '\n' ' '; }
@@ -1326,14 +1354,16 @@ if find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2
         fi
         _xt_rc=0
         _xt_out="$(python3 "$_xt_helper" swap "$_XT_TAR" "$_XT_STAGE" "$_xt_root" "$_xt_target" "$_xt_aside" 2>"$_XT_ERR")" || _xt_rc=$?
-        if [ "$_xt_rc" -ne 0 ] && [ "$_xt_rc" -ne 4 ]; then
-            _xt_skip "extra archive refused (could not be restored, rc=$_xt_rc): $name: $(_xt_errtext)${_xt_out:+ [$_xt_out]}"
-            continue
-        fi
-        if [ "$_xt_rc" -eq 4 ]; then
-            warn "extra archive refused members (unsafe), the rest restored: $name: $(_xt_errtext)"
-        fi
-        rm -rf "$_XT_STAGE"
+        case "$_xt_rc" in
+            0) ;;
+            4) warn "extra archive refused members (unsafe), the rest restored: $name: $(_xt_errtext)" ;;
+            6) warn "extra archive $name restored, but a step after the rename failed (durability or directory modes): $(_xt_errtext)" ;;
+            *)
+                _xt_skip "extra archive refused (could not be restored, rc=$_xt_rc): $name: $(_xt_errtext)${_xt_out:+ [$_xt_out]}"
+                continue
+                ;;
+        esac
+        _rm_stage "$_XT_STAGE" || warn "extra restore: could not remove the staging dir $_XT_STAGE (it holds decrypted data; remove it by hand)"
         rm -f "$_XT_TAR" "$_XT_ERR"
         _XT_STAGE="" _XT_TAR="" _XT_ERR=""
         case "$_xt_out" in

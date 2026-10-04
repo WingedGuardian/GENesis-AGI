@@ -613,8 +613,11 @@ def test_extra_restore_treats_an_empty_existing_directory_as_absent(restore_sand
     _seed_extra_archive(sb, "work_store-abcd1234", {"work/store/a.parquet": b"NEW"})
     proc = subprocess.run(
         ["bash", str(_RESTORE), "--from", str(sb["backup"])],
-        env={**sb["env"], "GENESIS_BACKUP_PASSPHRASE": _TEST_PASSPHRASE,
-             "GNUPGHOME": str(sb["home"] / ".gnupg")},
+        env={
+            **sb["env"],
+            "GENESIS_BACKUP_PASSPHRASE": _TEST_PASSPHRASE,
+            "GNUPGHOME": str(sb["home"] / ".gnupg"),
+        },
         capture_output=True,
         text=True,
         stdin=subprocess.DEVNULL,
@@ -664,9 +667,19 @@ def test_extra_archive_without_its_directory_never_replaces_the_parent(restore_s
     plain = sb["tmp"] / "lone.tar"
     plain.write_bytes(buf.getvalue())
     subprocess.run(
-        ["gpg", "--batch", "--yes", "--passphrase", _TEST_PASSPHRASE, "--symmetric",
-         "--cipher-algo", "AES256", "-o", str(sb["backup"] / "extra" / "lone-88888888.tar.gpg"),
-         str(plain)],
+        [
+            "gpg",
+            "--batch",
+            "--yes",
+            "--passphrase",
+            _TEST_PASSPHRASE,
+            "--symmetric",
+            "--cipher-algo",
+            "AES256",
+            "-o",
+            str(sb["backup"] / "extra" / "lone-88888888.tar.gpg"),
+            str(plain),
+        ],
         env={**sb["env"], "GNUPGHOME": str(sb["home"] / ".gnupg")},
         check=True,
         capture_output=True,
@@ -704,3 +717,35 @@ def test_extra_dry_run_writes_nothing(restore_sandbox):
     assert proc.returncode == 0, proc.stdout
     assert "would restore" in proc.stdout
     assert not (sb["home"] / "work").exists()
+
+
+def test_extra_read_only_root_restores_and_the_restore_carries_on(restore_sandbox):
+    """Audit B1: a directory archived read-only (0555) used to fail the final rename,
+    and its staging copy then could not be removed, ending the whole restore under
+    set -e with decrypted data left behind. It now restores with its mode, later
+    sections run, and no staging is left."""
+    sb = restore_sandbox
+    _seed_tree_archive(
+        sb,
+        "work_ro-99999999",
+        [
+            ("work/ro", "dir", 0o555, b""),
+            ("work/ro/sub", "dir", 0o555, b""),
+            ("work/ro/sub/f.txt", "file", 0o444, b"x"),
+        ],
+    )
+    _seed_secret_payload(sb)
+    try:
+        proc = _restore_extra(sb)
+        ro = sb["home"] / "work" / "ro"
+        assert (ro / "sub" / "f.txt").read_bytes() == b"x", proc.stdout[-1500:]
+        assert stat.S_IMODE(ro.stat().st_mode) == 0o555
+        assert stat.S_IMODE((ro / "sub").stat().st_mode) == 0o555
+        status = _status(sb)
+        assert status["secrets_restored"] is True, status
+        assert status["extra_restored"] == 1, status
+        assert not list(sb["home"].rglob("*.restore.*"))
+    finally:
+        for p in sb["home"].rglob("*"):
+            if p.is_dir() and not p.is_symlink():
+                p.chmod(0o755)

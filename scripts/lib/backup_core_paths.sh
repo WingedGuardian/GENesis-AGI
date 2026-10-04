@@ -14,15 +14,24 @@
 #                                return 0; return 1 when there is none. <abs> must
 #                                already be resolved (realpath).
 #
-# The caller sets HOME, GENESIS_DIR and TRANSCRIPT_DIR before calling either.
+# The caller sets HOME, GENESIS_DIR, TRANSCRIPT_DIR and _SCRIPT_DIR before calling either.
 
 backup_core_paths() {
+    # The merge-gate override store can be relocated (GENESIS_MERGE_OVERRIDE_DIR);
+    # resolve it the way backup.sh §6d and restore.sh's audit section do. On a fresh
+    # DR box that setting arrives with secrets.env, after §4c, so restore can only
+    # check the default there; backup.sh, which has the setting loaded, refuses an
+    # entry overlapping the configured store, so such an archive is never written.
+    local override_store
+    override_store="$(python3 "$_SCRIPT_DIR/hooks/audit_jsonl.py" --store-dir GENESIS_MERGE_OVERRIDE_DIR 2>/dev/null \
+        || printf '%s' "$HOME/.genesis/merge_overrides")"
     printf '%s\n' \
         "$GENESIS_DIR" \
         "$TRANSCRIPT_DIR" \
         "$HOME/.genesis/eval" \
         "$HOME/.genesis/shared" \
         "$HOME/.genesis/merge_overrides" \
+        "$override_store" \
         "$HOME/.genesis/restore-creds" \
         "$HOME/.genesis/restore_status.json" \
         "$HOME/.ssh" \
