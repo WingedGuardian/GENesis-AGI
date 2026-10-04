@@ -46,6 +46,20 @@ if [[ -e "$_disable_file" ]]; then
     exit 1
 fi
 
+# Explicitly configured native lifecycle replaces per-session daemon bootstrap.
+# Settings presence includes a broken symlink: an unreadable configuration must
+# not silently fall back to a raw provider. Sentinel remains the first gate.
+_managed_config="${CODEBASE_MEMORY_MCP_MANAGED_CONFIG:-${_user_home}/.genesis/config/codebase-managed.json}"
+if [[ -e "$_managed_config" || -L "$_managed_config" ]]; then
+    if [[ $# -ne 0 ]]; then
+        printf '%s\n' 'run-codebase-memory: managed route accepts no provider flags' >&2
+        exit 1
+    fi
+    _launcher_dir="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
+    exec /usr/bin/python3 -I "$_launcher_dir/../../scripts/codebase_managed.py" \
+        --config "$_managed_config" launch
+fi
+
 # Locate the binary WITHOUT depending on $HOME: some MCP clients
 # spawn servers with a scrubbed environment (no HOME/USER/XDG_RUNTIME_DIR),
 # where ${HOME}/.local/bin/... would collapse to /.local/bin/... and fail the

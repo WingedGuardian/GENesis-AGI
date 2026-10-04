@@ -1082,3 +1082,24 @@ def test_http_does_not_touch_a_plain_grep_entry(tmp_path):
     log = clog.read_text() if clog.exists() else ""
     assert "mcp remove" not in log, "must never touch the operator's `grep`"
     assert "mcp add --transport http grep-app" in log, "ours still registers"
+
+
+@pytest.mark.parametrize("settings", ["malformed", "broken-link"])
+def test_managed_settings_presence_never_falls_back_to_raw(tmp_path, settings):
+    config = tmp_path / "managed.json"
+    if settings == "malformed":
+        config.write_text("not-json")
+    else:
+        config.symlink_to(tmp_path / "missing-config")
+    result, binary_log = _run_launcher(tmp_path, env_extra={"CODEBASE_MEMORY_MCP_MANAGED_CONFIG": str(config)})
+    assert result.returncode == 1
+    assert not binary_log.exists()
+
+
+def test_managed_route_rejects_provider_flags(tmp_path):
+    config = tmp_path / "managed.json"
+    config.write_text("{}")
+    result, binary_log = _run_launcher(tmp_path, "--tool-profile=all", env_extra={"CODEBASE_MEMORY_MCP_MANAGED_CONFIG": str(config)})
+    assert result.returncode == 1
+    assert "accepts no provider flags" in result.stderr
+    assert not binary_log.exists()

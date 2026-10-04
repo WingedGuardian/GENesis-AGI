@@ -1,4 +1,90 @@
-# Managed Codebase runtime: implementation and acceptance gates
+# Managed Codebase runtime: native lifecycle and activation
+
+## Current implementation
+
+The opt-in `scripts/codebase_managed.py` integration uses the accepted exact
+v0.11 portable executable. It reuses the worker adapter's executable digest and
+runs the verified inode. There is no custom broker or provider fork. Configure
+writes disabled settings and account-owned units; it never removes the machine
+sentinel or starts a service. Existing state, dangling settings links and loaded
+or vendor units are preserved through refusal.
+
+The query daemon has a 2 GiB, zero-swap service. Analysis frontends each have a
+256 MiB, zero-swap transient service beneath a separate aggregate 2 GiB,
+zero-swap slice. Requisite/After verify the existing daemon without starting it;
+StopPropagatedFrom and control-group cleanup retire clients when it ends.
+Protocol recovery requires fresh client initialization. Native bootstrap may
+briefly attempt a replacement during a scheduler race; containment and eventual
+owned cleanup are the contract, not instantaneous prohibition of every spawn.
+
+Every native startup verifies the executable, disabled UI/automatic indexing/
+watcher settings, exact running cgroup and memory/swap limits. The daemon uses
+native `config get auto_index` to seal the native startup transition and repair
+recorded dead endpoint generations before permanent startup. This does not spawn
+a daemon or modify configuration. Readiness requires a native status response
+naming the exact permanent managed PID; a socket left by a crash is insufficient.
+
+Configured launchers accept no provider flags and expose the stock 13-tool
+analysis profile without `index_repository`. Missing, malformed or disabled
+managed settings refuse rather than falling back to raw execution. Installs
+without managed settings retain their existing launcher behavior.
+
+The existing queued entrypoint reads managed settings before cap selection and
+scope probing. It selects the verified worker adapter, shared canonical cache
+and native account namespace, and measured 8 GiB/zero-swap batch cap. Destination
+admission, sibling reserve, pressure watchdog, single-flight and durable attempt
+outcomes remain authoritative. Ordinary daemon-delegating CLI indexing is not
+substituted for the physically contained worker.
+
+## Explicit staging and activation
+
+Use the primary checkout and an independently obtained accepted executable:
+
+```bash
+.venv/bin/python scripts/codebase_managed.py configure \
+  --main "$PWD" --binary /absolute/path/to/accepted/codebase-memory-mcp \
+  --state "$HOME/.genesis/codebase-managed" \
+  --sentinel "$HOME/.genesis/codebase-memory-mcp.disabled"
+.venv/bin/python scripts/codebase_managed.py status
+```
+
+Configuration is disabled. Enable refuses while the sentinel is armed; this
+command does not remove it. The sentinel and incident shim stay intact until
+supervised activation is ready. After the acceptance gates and deliberate
+sentinel retirement, `enable` starts the owned query service:
+
+```bash
+.venv/bin/python scripts/codebase_managed.py enable
+# Reversible runtime disable; preserves native cache and incident sentinel:
+.venv/bin/python scripts/codebase_managed.py disable
+```
+
+Activation still requires deployed merged wiring, a preserved last valid graph,
+queue state and pressure/OOM baselines, timer stopped before unblocking indexing,
+one supervised existing queued runner, actual worker placement and publication,
+fresh readers, and restoration of the timer after acceptance. A refused or failed
+rollout restores disabled state without resetting durable attempt counts.
+Enabling default boot startup is a separate explicit systemd enable operation.
+
+## Verification and operational scope
+
+The prerequisite private 24-hour canary passed with eight readers. It does not
+establish zero host swap activity or zero memory.high events. Native production
+shaped tests cover eight readers, peer disconnect, restart/fresh initialization,
+persistent inactive-daemon transaction refusal with a negative control, and
+repeated abrupt daemon death followed by native endpoint repair. Readiness checks
+prevent a dead runtime from being represented as healthy.
+
+This integration does not change broad OOM monitoring or enable optional
+`CODE_INTEL_WORKLOAD_SLICE` routing. Actual oomd selector exclusion and its
+provisioning/posture migration require separate disposable-VM acceptance.
+
+## Historical investigation (superseded v0.10.8 design)
+
+The following records the earlier investigation and queue contract. Its broker,
+provisional memory sizes and pending source/canary statements are historical;
+the current native implementation and gates above supersede those claims.
+
 
 Status: **in development; not an authorization to re-enable Codebase MCP**.
 The emergency disabled launcher must remain in place until runtime acceptance.

@@ -167,6 +167,31 @@ case "$WORKLOAD_SLICE" in 0|1) ;; *)
     exit 125 ;;
 esac
 
+# Load the explicit managed Codebase boundary BEFORE cap derivation/probing.
+# Fixed line fields are consumed without eval; invalid settings refuse only the
+# CBM leg so a requested GitNexus leg retains its normal outcome.
+_CBM_MANAGED_REFUSE=""
+_managed_config="${CODEBASE_MEMORY_MCP_MANAGED_CONFIG:-$HOME/.genesis/config/codebase-managed.json}"
+if { [ "$TOOLS" = cbm ] || [ "$TOOLS" = both ]; } \
+    && { [ -e "$_managed_config" ] || [ -L "$_managed_config" ]; }; then
+    _managed_output=""
+    if _managed_output="$(/usr/bin/python3 -I "${_CODE_INTEL_ENTRYPOINT%/*}/../codebase_managed.py" \
+        --config "$_managed_config" batch --repo "$REPO_PATH")"; then
+        mapfile -t _managed_fields <<< "$_managed_output"
+        if [ "${#_managed_fields[@]}" -eq 4 ]; then
+            export CODE_INTEL_CBM_WORKER_BINARY="${_managed_fields[0]}"
+            export CBM_CACHE_DIR="${_managed_fields[1]}"
+            export CBM_RUNTIME_DIR="${_managed_fields[2]}"
+            export CBM_ALLOWED_ROOT="$REPO_PATH"
+            export CODE_INTEL_CBM_MEMORY_MAX="${_managed_fields[3]}"
+        else
+            _CBM_MANAGED_REFUSE="malformed managed batch settings"
+        fi
+    else
+        _CBM_MANAGED_REFUSE="managed Codebase configuration refused"
+    fi
+fi
+
 _LEGACY_MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-}"
 # Four GiB is the provisional batch ceiling. The bounded child checks actual
 # destination-scope headroom for the entire requested cap before indexing.
@@ -476,7 +501,7 @@ fi
 
 # CBM-only. The workload charge is an operand of the minimum-bytes sum above,
 # so its refusal was captured before that sum was computed.
-GENESIS_CBM_ENV_REFUSE=""
+GENESIS_CBM_ENV_REFUSE="$_CBM_MANAGED_REFUSE"
 if [ -n "$_GENESIS_CHARGE_REFUSE" ]; then
     GENESIS_CBM_ENV_REFUSE="$_GENESIS_CHARGE_REFUSE"
 elif ! _genesis_uint_bounded "$CODE_INTEL_CBM_MIN_BYTES"; then

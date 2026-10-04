@@ -2869,7 +2869,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
-verified: b0867170e 2026-10-02
+verified: 19ff6e3ef 2026-10-04
 ```
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
@@ -3172,6 +3172,13 @@ verified: b0867170e 2026-10-02
   `genesis-workload.slice`; both launch paths verify actual scope membership before
   execution and retain refusal outcomes. This does not replace broad OOM monitors
   or certify core/recovery exclusion (see docs/reference/index-workload-routing.md).
+  Optional managed Codebase wiring (`scripts/codebase_managed.py`) uses a pinned
+  stock query daemon, separately capped native analysis frontends and the existing
+  contained queued worker. Configuration starts disabled and preserves the machine
+  sentinel. Native transition repair and status-PID readiness support abrupt-death
+  recovery; malformed managed settings never fall back to raw execution. This
+  does not activate workload-slice routing or broaden termination authority
+  (see docs/architecture/codebase-managed-runtime.md).
   Network-resilience
   invariants are first-class too: container `networkd_keep_configuration` +
   `network_watchdog_installed` (any-link/file-present facts for the annotation
