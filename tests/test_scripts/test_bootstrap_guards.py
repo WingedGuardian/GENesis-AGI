@@ -669,3 +669,102 @@ def test_root_resolution_survives_cdpath(script, var, prelude, hostile, tmp_path
     assert proc.stdout == expected, (
         f"{script}: resolved {proc.stdout!r}, expected {expected!r} (CDPATH={cdpath})"
     )
+
+
+# ── crash-recovery reset saves ephemeral edits first (Devin, #2632) ─────────
+
+
+def _block(script: Path, marker: str) -> str:
+    text = script.read_text()
+    match = re.search(
+        rf"# BEGIN {re.escape(marker)}[^\n]*\n(.*?)# END {re.escape(marker)}",
+        text,
+        re.DOTALL,
+    )
+    assert match, f"missing {marker} block in {script.name}"
+    return match.group(1)
+
+
+_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@t",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@t",
+    "GIT_CONFIG_NOSYSTEM": "1",
+}
+
+
+def _git(cwd: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, **_GIT_ENV},
+    ).stdout.strip()
+
+
+def _crash_repo(tmp_path: Path) -> tuple[Path, Path]:
+    """A scratch checkout whose AGENTS.md is tracked, a rollback tag at the first
+    commit and a second commit on top, plus a private HOME."""
+    root = tmp_path / "root"
+    _git(tmp_path, "init", "-q", "-b", "main", str(root))
+    (root / "AGENTS.md").write_text("upstream copy\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "c1")
+    _git(root, "tag", "pre-update-tag")
+    (root / "code.py").write_text("x = 1\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "merged work")
+    home = tmp_path / "home"
+    home.mkdir()
+    return root, home
+
+
+def _crash_script(root: Path, home: Path, rollback_tag: str) -> str:
+    """The recovery reset stanza, extracted verbatim, in a scratch checkout."""
+    return (
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        f'SCRIPT_DIR="{REPO_ROOT / "scripts"}"\n'
+        f'GENESIS_ROOT="{root}"\n'
+        f'HOME="{home}"\n'
+        f'ROLLBACK_TAG="{rollback_tag}"\n'
+        + _block(BOOTSTRAP, "crash-recovery-reset")
+    )
+
+
+def test_crash_recovery_saves_an_ephemeral_edit_before_the_tag_reset(tmp_path):
+    """Devin, #2632: a crashed update left AGENTS.md edited, and the recovery's
+    reset --hard would drop the edit wholesale. The same save update.sh's
+    rollback makes runs first, so a backup whose `current` equals the edit
+    exists after the reset."""
+    root, home = _crash_repo(tmp_path)
+    (root / "AGENTS.md").write_text("local edits nobody saved\n")
+    r = subprocess.run(
+        ["bash", "-c", _crash_script(root, home, "pre-update-tag")],
+        capture_output=True,
+        text=True,
+        env={**os.environ, **_GIT_ENV, "HOME": str(home)},
+    )
+    assert r.returncode == 0, r.stderr
+    assert _git(root, "rev-parse", "HEAD") == _git(root, "rev-parse", "pre-update-tag")
+    saved = list((home / ".genesis" / "premerge-backups").glob("*/rollback/AGENTS.md/current"))
+    assert len(saved) == 1, saved
+    assert saved[0].read_text() == "local edits nobody saved\n"
+
+
+def test_crash_recovery_saves_an_ephemeral_edit_before_the_head_reset(tmp_path):
+    """No rollback tag: the recovery resets to HEAD and the edit is still saved."""
+    root, home = _crash_repo(tmp_path)
+    (root / "AGENTS.md").write_text("local edits nobody saved\n")
+    r = subprocess.run(
+        ["bash", "-c", _crash_script(root, home, "")],
+        capture_output=True,
+        text=True,
+        env={**os.environ, **_GIT_ENV, "HOME": str(home)},
+    )
+    assert r.returncode == 0, r.stderr
+    assert (root / "AGENTS.md").read_text() == "upstream copy\n"
+    saved = list((home / ".genesis" / "premerge-backups").glob("*/rollback/AGENTS.md/current"))
+    assert len(saved) == 1, saved
+    assert saved[0].read_text() == "local edits nobody saved\n"

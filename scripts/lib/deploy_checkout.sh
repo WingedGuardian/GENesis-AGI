@@ -215,3 +215,72 @@ genesis_checkout_unmoved() {
     [ -n "$_now_head" ] && [ -n "$head" ] && [ "$_now_head" = "$head" ] \
         && [ -n "$branch" ] && [ "$_now_branch" = "$branch" ]
 }
+
+# ── Local edits to the regenerable tracked files, saved before they are
+#    discarded ─────────────────────────────────────────────────────────
+# The tracked files a deploy may find dirty and a reset may then discard. Both
+# are rewritten in place at runtime (the code-intel indexer rewrites AGENTS.md,
+# the server the trigger cache), so they sit on EPHEMERAL_DIRTY_RE's excuse
+# list — but "the file regenerates" is not "the edit was nobody's". Every deploy
+# path that drops such an edit (update.sh's clear before its merge and before
+# its rollback checkout, deploy_code_only.sh's reset, bootstrap.sh's
+# crash-recovery reset) backs it up first under one directory per run in
+# EPHEMERAL_BACKUP_ROOT, pruned by disk_hygiene.sh after 45 days, and discards
+# it only once a backup of its CURRENT content is on disk. Written by
+# scripts/update.sh and lifted here, logic unchanged, so every path that can
+# drop the same edit makes the same save (#2629, #2632).
+EPHEMERAL_CLEAR_PATHS=(AGENTS.md config/procedure_triggers.yaml)
+EPHEMERAL_BACKUP_ROOT="$HOME/.genesis/premerge-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+
+# Is <path> under <root> tracked AND different from HEAD in the index or the
+# worktree? The two diffs cover a staged edit and an unstaged one.
+genesis_ephemeral_is_dirty() {
+    git -C "$1" ls-files --error-unmatch "$2" &>/dev/null \
+        && ! git -C "$1" diff --quiet HEAD -- "$2" 2>/dev/null
+}
+
+# Save <path>'s local edits under <dest-root>/<path>/: the worktree and index
+# patches against HEAD, plus a copy of the file. Returns non-zero on ANY failure.
+genesis_ephemeral_backup() {
+    local root="$1" p="$2" dest="$3/$2"
+    mkdir -p "$dest" && chmod 700 "$3" "$dest" \
+        && git -C "$root" diff --binary HEAD -- "$p" > "$dest/worktree.patch" \
+        && git -C "$root" diff --binary --cached HEAD -- "$p" > "$dest/index.patch" \
+        && { [ ! -e "$root/$p" ] || cp -p "$root/$p" "$dest/current"; }
+}
+
+# Does the backup under <dest-root> still describe <path>'s edits exactly? Both
+# patches are compared: staging the same content after the backup changes only
+# index.patch, and the backup is then stale.
+genesis_ephemeral_backup_is_current() {
+    local root="$1" p="$2" dest="$3/$2"
+    [ -f "$dest/worktree.patch" ] && [ -f "$dest/index.patch" ] \
+        && cmp -s "$dest/worktree.patch" <(git -C "$root" diff --binary HEAD -- "$p") \
+        && cmp -s "$dest/index.patch" <(git -C "$root" diff --binary --cached HEAD -- "$p")
+}
+
+# Before a reset that discards local edits wholesale (update.sh's rollback
+# checkout, bootstrap.sh's crash-recovery `reset --hard`): every dirty ephemeral
+# file whose CURRENT edits are not already saved under <dest-root> or
+# <dest-root>/late is backed up under <dest-root>/rollback. Unlike the
+# predicates above this one REPORTS to the operator, because a caller that gets
+# here has already decided to reset; a failed backup is named, never fatal —
+# what the caller does with a file it could not save is its own business
+# (update.sh's checkout then refuses over it; the caller's message says so).
+# Always returns 0.
+genesis_ephemeral_backup_before_reset() {
+    local root="$1" broot="$2" p
+    for p in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
+        genesis_ephemeral_is_dirty "$root" "$p" || continue
+        if genesis_ephemeral_backup_is_current "$root" "$p" "$broot" \
+            || genesis_ephemeral_backup_is_current "$root" "$p" "$broot/late"; then
+            continue
+        fi
+        if genesis_ephemeral_backup "$root" "$p" "$broot/rollback"; then
+            echo "  Backed up local edits to $p before the rollback: $broot/rollback/$p"
+        else
+            echo "  WARNING: could not back up local edits to $p before the rollback; the edit is left in place."
+        fi
+    done
+    return 0
+}

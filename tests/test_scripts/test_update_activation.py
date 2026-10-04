@@ -88,6 +88,15 @@ _clear_deploy_state() { echo CLEARED-STATE; }
 _do_rollback() { echo "ROLLBACK: $1"; }
 """
 
+# The deploy libs update.sh sources at the top: deploy_checkout.sh now carries
+# EPHEMERAL_CLEAR_PATHS / EPHEMERAL_BACKUP_ROOT and the genesis_ephemeral_*
+# helpers the extracted blocks call; deploy_marker.sh precedes it as update.sh
+# sources it.
+_LIBS = (
+    f'. "{REPO_ROOT / "scripts" / "lib" / "deploy_marker.sh"}"\n'
+    f'. "{REPO_ROOT / "scripts" / "lib" / "deploy_checkout.sh"}"\n'
+)
+
 
 def _run(script: str, home: Path, **extra_env: str) -> subprocess.CompletedProcess:
     env = _env(home)
@@ -230,6 +239,90 @@ def test_the_same_diverged_range_without_the_local_file_is_admitted(ignored_coll
     r = _run(_fetch_script(clone), tmp_path)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "brings in files that already exist" not in r.stdout
+
+
+# ── 1c. a staged edit fails a 3-way merge after the stop (#2628) ────────────
+
+
+@pytest.fixture
+def diverged(tmp_path: Path) -> tuple[Path, Path]:
+    """A clone whose local commit upstream lacks — the merge is a true 3-way —
+    with a tracked excused path (.serena/project.yml) and AGENTS.md to stage."""
+    up = tmp_path / "upstream"
+    _git(tmp_path, "init", "-q", "-b", "main", str(up))
+    (up / ".serena").mkdir()
+    (up / ".serena" / "project.yml").write_text("v1\n")
+    (up / "AGENTS.md").write_text("stats\n")
+    (up / "f").write_text("1\n")
+    _git(up, "add", ".")
+    _git(up, "commit", "-qm", "c1")
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", str(up), str(clone))
+    (up / "g").write_text("upstream work\n")
+    _git(up, "add", ".")
+    _git(up, "commit", "-qm", "c2")
+    (clone / "x").write_text("local work\n")
+    _git(clone, "add", "x")
+    _git(clone, "commit", "-qm", "local diverge")
+    _git(clone, "fetch", "-q", "origin")
+    return up, clone
+
+
+def _staged_refusal_script(clone: Path) -> str:
+    deploy_head = _git(clone, "rev-parse", "origin/main")
+    return (
+        f'GENESIS_ROOT="{clone}"\nDEPLOY_HEAD="{deploy_head}"\n'
+        + _STUBS
+        + _LIBS
+        + _block("staged-edit-refusal")
+        + "echo PASSED\n"
+    )
+
+
+def test_a_staged_edit_to_an_excused_path_refuses_before_the_stop(diverged, tmp_path):
+    """Devin, #2628: on a true 3-way merge a staged edit fails the merge AFTER
+    the services stop — refused now, while nothing has stopped."""
+    _, clone = diverged
+    (clone / ".serena" / "project.yml").write_text("staged edit\n")
+    _git(clone, "add", ".serena/project.yml")
+    r = _run(_staged_refusal_script(clone), tmp_path)
+    assert r.returncode == 1, r.stdout
+    assert "fail AFTER the services stop" in r.stdout
+    assert ".serena/project.yml" in r.stdout
+    assert "CLEARED-STATE" in r.stdout and "PASSED" not in r.stdout
+    assert _git(clone, "diff", "--cached", "--name-only") == ".serena/project.yml"
+
+
+def test_a_staged_edit_to_an_ephemeral_clear_path_is_admitted(diverged, tmp_path):
+    """A staged edit to a clear path is backed up and cleared before the merge —
+    it must not feed the refusal."""
+    _, clone = diverged
+    (clone / "AGENTS.md").write_text("staged edit\n")
+    _git(clone, "add", "AGENTS.md")
+    r = _run(_staged_refusal_script(clone), tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "PASSED" in r.stdout
+
+
+def test_the_same_staged_edit_on_a_fast_forward_is_admitted(tmp_path):
+    """A fast-forward keeps every staged edit — no refusal."""
+    up = tmp_path / "upstream"
+    _git(tmp_path, "init", "-q", "-b", "main", str(up))
+    (up / ".serena").mkdir()
+    (up / ".serena" / "project.yml").write_text("v1\n")
+    _git(up, "add", ".")
+    _git(up, "commit", "-qm", "c1")
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", str(up), str(clone))
+    (up / "g").write_text("upstream work\n")
+    _git(up, "add", ".")
+    _git(up, "commit", "-qm", "c2")
+    _git(clone, "fetch", "-q", "origin")
+    (clone / ".serena" / "project.yml").write_text("staged edit\n")
+    _git(clone, "add", ".serena/project.yml")
+    r = _run(_staged_refusal_script(clone), tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "PASSED" in r.stdout
 
 
 def _late_scan_script(clone: Path) -> str:
@@ -391,6 +484,7 @@ def _backup_script(root: Path, extra: str = "") -> str:
         f'GENESIS_ROOT="{root}"\nPOST_MERGE=false\n'
         + _deploy_head(root)
         + _STUBS
+        + _LIBS
         + _block("ephemeral-prestop-backup")
         + extra
     )
@@ -438,6 +532,7 @@ def _clear_script(root: Path, between: str = "", deploy_head: str | None = None)
         f'GENESIS_ROOT="{root}"\nPOST_MERGE=false\n'
         + head
         + _STUBS
+        + _LIBS
         + _block("ephemeral-prestop-backup")
         + between
         + _block("ephemeral-clear")
@@ -598,11 +693,15 @@ def test_backup_runs_before_the_stop_and_the_clear_after_it():
 
 def test_every_cleared_path_is_one_the_dirty_gate_excuses():
     """The clear list and the gate's allowlist must agree: a path the gate refuses
-    never reaches the clear, and a path the clear would discard must be excused."""
-    text = UPDATE.read_text()
-    paths = re.search(r"^EPHEMERAL_CLEAR_PATHS=\(([^)]*)\)", text, re.M).group(1).split()
+    never reaches the clear, and a path the clear would discard must be excused.
+    The list lives in the shared deploy-checkout lib and is defined exactly once
+    across the three deploy paths that consult it."""
+    lib = (REPO_ROOT / "scripts" / "lib" / "deploy_checkout.sh").read_text()
+    paths = re.search(r"^EPHEMERAL_CLEAR_PATHS=\(([^)]*)\)", lib, re.M).group(1).split()
     assert paths == ["AGENTS.md", "config/procedure_triggers.yaml"]
-    assert text.count("EPHEMERAL_CLEAR_PATHS=(") == 1
+    assert lib.count("EPHEMERAL_CLEAR_PATHS=(") == 1
+    for script in ("scripts/update.sh", "scripts/deploy_code_only.sh", "scripts/bootstrap.sh"):
+        assert "EPHEMERAL_CLEAR_PATHS=(" not in (REPO_ROOT / script).read_text(), script
     marker = (REPO_ROOT / "scripts" / "lib" / "deploy_marker.sh").read_text()
     regex = re.search(r"^EPHEMERAL_DIRTY_RE='(.*)'$", marker, re.M).group(1)
     for p in paths:
@@ -620,10 +719,11 @@ def _rollback_script(root: Path, post_merge: bool, between: str = "") -> str:
         f'GENESIS_ROOT="{root}"\nPOST_MERGE={"true" if post_merge else "false"}\n'
         + _deploy_head(root)
         + _STUBS
+        + _LIBS
         + _block("ephemeral-prestop-backup")
         + 'echo "ROOT=$EPHEMERAL_BACKUP_ROOT"\n'
         + between
-        + '_ephemeral_backup_before_reset "$EPHEMERAL_BACKUP_ROOT"\n'
+        + 'genesis_ephemeral_backup_before_reset "$GENESIS_ROOT" "$EPHEMERAL_BACKUP_ROOT"\n'
     )
 
 
@@ -668,7 +768,9 @@ def test_the_rollback_saves_edits_before_its_reset():
     start = text.index("_do_rollback() {")
     body = text[start : text.index("\n}\n", start)]
     body = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
-    save = body.index('_ephemeral_backup_before_reset "$EPHEMERAL_BACKUP_ROOT"')
+    save = body.index(
+        'genesis_ephemeral_backup_before_reset "$GENESIS_ROOT" "$EPHEMERAL_BACKUP_ROOT"'
+    )
     reset = body.index('checkout -q --no-overwrite-ignore -B "$ORIGINAL_BRANCH" "$ROLLBACK_TAG"')
     assert save < reset
 

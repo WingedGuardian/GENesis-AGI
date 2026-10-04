@@ -864,6 +864,39 @@ if [[ "$POST_MERGE" == "false" ]]; then
         _clear_deploy_state
         exit 1
     fi
+
+    # A staged edit outside the ephemeral clear-paths fails a TRUE 3-way merge
+    # (the local branch has commits upstream lacks): git refuses on ANY index
+    # change, even to a path the incoming range never touches (measured, git
+    # 2.43) — and it refuses AFTER the services stop, so the run rolls back into
+    # a full outage for a condition knowable now. Staged edits to the clear
+    # paths are handled instead: backed up before the stop and cleared before
+    # the merge. A fast-forward keeps every staged edit, so this only bites on a
+    # real merge. (#2628)
+# BEGIN staged-edit-refusal (extracted by tests/test_scripts/test_update_activation.py)
+    if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor HEAD "$DEPLOY_HEAD" 2>/dev/null; then
+        _staged_excl=()
+        for _f in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
+            _staged_excl+=(":(exclude,literal)$_f")
+        done
+        _staged_rc=0
+        _staged="$(git -C "$GENESIS_ROOT" diff --cached --name-only HEAD -- . "${_staged_excl[@]}" 2>/dev/null)" || _staged_rc=$?
+        if [ "$_staged_rc" -ne 0 ]; then
+            echo "  Could not read the index for the staged-edit check — server NOT stopped, nothing changed."
+            git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
+            _clear_deploy_state
+            exit 1
+        fi
+        if [ -n "$_staged" ]; then
+            echo "ERROR: staged changes outside the ephemeral files make this 3-way merge fail AFTER the services stop"
+            echo "       (git refuses over any staged path, touched or not). Unstage them first — server NOT stopped, nothing changed:"
+            printf '%s\n' "$_staged" | sed 's/^/         /'
+            git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
+            _clear_deploy_state
+            exit 1
+        fi
+    fi
+# END staged-edit-refusal
 fi
 
 # ── Back up locally edited ephemeral files BEFORE anything stops ──────
@@ -878,14 +911,10 @@ fi
 # into the armed rollback trap. The clear before the merge discards a file's edits
 # only when a backup of its CURRENT content exists (see the clear loop).
 # BEGIN ephemeral-prestop-backup (extracted by tests/test_scripts/test_update_activation.py)
-EPHEMERAL_CLEAR_PATHS=(AGENTS.md config/procedure_triggers.yaml)
-EPHEMERAL_BACKUP_ROOT="$HOME/.genesis/premerge-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
-
-# Tracked AND different from HEAD in the index or the worktree.
-_ephemeral_is_dirty() {
-    git -C "$GENESIS_ROOT" ls-files --error-unmatch "$1" &>/dev/null \
-        && ! git -C "$GENESIS_ROOT" diff --quiet HEAD -- "$1" 2>/dev/null
-}
+# EPHEMERAL_CLEAR_PATHS, EPHEMERAL_BACKUP_ROOT and the genesis_ephemeral_* helpers
+# this block calls come from scripts/lib/deploy_checkout.sh (sourced at the top):
+# the same save is the one deploy_code_only.sh makes before its reset and
+# bootstrap.sh before its crash-recovery reset (#2629, #2632).
 
 # Must <path>'s local edit be cleared for the merge of $DEPLOY_HEAD? git merges
 # straight past an UNSTAGED edit to a file the incoming range does not touch, and
@@ -899,47 +928,6 @@ _ephemeral_merge_touches() {
     git -C "$GENESIS_ROOT" diff --cached --quiet HEAD -- "$1" 2>/dev/null || return 0
     mb="$(git -C "$GENESIS_ROOT" merge-base HEAD "$DEPLOY_HEAD" 2>/dev/null)" || return 0
     ! git -C "$GENESIS_ROOT" diff --quiet "$mb" "$DEPLOY_HEAD" -- "$1" 2>/dev/null
-}
-
-# Save <path>'s local edits under <dest-root>/<path>/: the worktree and index
-# patches against HEAD, plus a copy of the file. Returns non-zero on ANY failure.
-_ephemeral_backup() {
-    local p="$1" dest="$2/$1"
-    mkdir -p "$dest" && chmod 700 "$2" "$dest" \
-        && git -C "$GENESIS_ROOT" diff --binary HEAD -- "$p" > "$dest/worktree.patch" \
-        && git -C "$GENESIS_ROOT" diff --binary --cached HEAD -- "$p" > "$dest/index.patch" \
-        && { [ ! -e "$GENESIS_ROOT/$p" ] || cp -p "$GENESIS_ROOT/$p" "$dest/current"; }
-}
-
-# Does the backup under <dest-root> still describe <path>'s edits exactly?
-_ephemeral_backup_is_current() {
-    local p="$1" dest="$2/$1"
-    [ -f "$dest/worktree.patch" ] && [ -f "$dest/index.patch" ] \
-        && cmp -s "$dest/worktree.patch" <(git -C "$GENESIS_ROOT" diff --binary HEAD -- "$p") \
-        && cmp -s "$dest/index.patch" <(git -C "$GENESIS_ROOT" diff --binary --cached HEAD -- "$p")
-}
-
-# Called by _do_rollback before its checkout, which may clear an ephemeral file's
-# edit first (_ephemeral_clear_before_reset). The pre-stop backup can be missing (a
-# --post-merge run takes none) or stale (an indexer rewrote AGENTS.md after it), so
-# each dirty ephemeral file whose CURRENT edits are not already saved is backed up
-# under <root>/rollback. Never fails: a failed backup is named, not fatal, and the
-# edit is then not cleared (the clear needs a current backup).
-_ephemeral_backup_before_reset() {
-    local root="$1" p
-    for p in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
-        _ephemeral_is_dirty "$p" || continue
-        if _ephemeral_backup_is_current "$p" "$root" \
-            || _ephemeral_backup_is_current "$p" "$root/late"; then
-            continue
-        fi
-        if _ephemeral_backup "$p" "$root/rollback"; then
-            echo "  Backed up local edits to $p before the rollback: $root/rollback/$p"
-        else
-            echo "  WARNING: could not back up local edits to $p before the rollback; they are left in place, and the rollback refuses if this update changed $p."
-        fi
-    done
-    return 0
 }
 
 # The rollback undoes this run's merge by switching the branch the run started on
@@ -986,11 +974,11 @@ _ephemeral_backup_before_reset() {
 _ephemeral_clear_before_reset() {
     local root="$1" p
     for p in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
-        _ephemeral_is_dirty "$p" || continue
+        genesis_ephemeral_is_dirty "$GENESIS_ROOT" "$p" || continue
         git -C "$GENESIS_ROOT" diff --quiet HEAD "$ROLLBACK_TAG" -- "$p" 2>/dev/null && continue
-        if _ephemeral_backup_is_current "$p" "$root" \
-            || _ephemeral_backup_is_current "$p" "$root/late" \
-            || _ephemeral_backup_is_current "$p" "$root/rollback"; then
+        if genesis_ephemeral_backup_is_current "$GENESIS_ROOT" "$p" "$root" \
+            || genesis_ephemeral_backup_is_current "$GENESIS_ROOT" "$p" "$root/late" \
+            || genesis_ephemeral_backup_is_current "$GENESIS_ROOT" "$p" "$root/rollback"; then
             git -C "$GENESIS_ROOT" checkout -q HEAD -- "$p" 2>&1 \
                 || echo "  WARNING: could not clear the backed-up edit to $p; the rollback will refuse over it."
         fi
@@ -1003,8 +991,8 @@ if [[ "$POST_MERGE" == "false" ]]; then
     # clears an ephemeral edit its range touches (_ephemeral_clear_before_reset),
     # and it can happen after the stop, where a backup would be too late.
     for _eph in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
-        _ephemeral_is_dirty "$_eph" || continue
-        if ! _ephemeral_backup "$_eph" "$EPHEMERAL_BACKUP_ROOT"; then
+        genesis_ephemeral_is_dirty "$GENESIS_ROOT" "$_eph" || continue
+        if ! genesis_ephemeral_backup "$GENESIS_ROOT" "$_eph" "$EPHEMERAL_BACKUP_ROOT"; then
             echo "  Could not back up local edits to $_eph under $EPHEMERAL_BACKUP_ROOT — server NOT stopped, nothing changed."
             git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
             _clear_deploy_state
@@ -1586,10 +1574,10 @@ _do_rollback() {
             # _ephemeral_clear_before_reset has the measured behaviour). First the
             # ephemeral files' current edits are saved when no backup of them
             # exists yet; the clear below discards one only with such a backup.
-            # (The helper is defined with the pre-stop backup; this function is
-            # only reached after it.)
-            if declare -F _ephemeral_backup_before_reset >/dev/null; then
-                _ephemeral_backup_before_reset "$EPHEMERAL_BACKUP_ROOT"
+            # (The helper lives in the shared deploy-checkout lib, sourced at
+            # the top.)
+            if declare -F genesis_ephemeral_backup_before_reset >/dev/null; then
+                genesis_ephemeral_backup_before_reset "$GENESIS_ROOT" "$EPHEMERAL_BACKUP_ROOT"
             else
                 echo "  WARNING: the ephemeral-file backup helper is not defined; an ephemeral edit this update changed makes the rollback refuse."
             fi
@@ -1948,11 +1936,11 @@ fi
 # inside an `if`, so none of it can trip the armed ERR trap.
 # BEGIN ephemeral-clear (extracted by tests/test_scripts/test_update_activation.py)
 for _eph in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
-    _ephemeral_is_dirty "$_eph" || continue
+    genesis_ephemeral_is_dirty "$GENESIS_ROOT" "$_eph" || continue
     # An unstaged edit the merge does not touch survives the merge as it is: leave it.
     _ephemeral_merge_touches "$_eph" || continue
-    if ! _ephemeral_backup_is_current "$_eph" "$EPHEMERAL_BACKUP_ROOT"; then
-        if ! _ephemeral_backup "$_eph" "$EPHEMERAL_BACKUP_ROOT/late"; then
+    if ! genesis_ephemeral_backup_is_current "$GENESIS_ROOT" "$_eph" "$EPHEMERAL_BACKUP_ROOT"; then
+        if ! genesis_ephemeral_backup "$GENESIS_ROOT" "$_eph" "$EPHEMERAL_BACKUP_ROOT/late"; then
             echo "  WARNING: could not back up local edits to $_eph — leaving it in place."
             continue
         fi

@@ -66,6 +66,19 @@ if [ -f "$UPDATE_STATE" ]; then
         # Read rollback tag from state file
         ROLLBACK_TAG=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('rollback_tag',''))" 2>/dev/null || echo "")
 
+# BEGIN crash-recovery-reset (extracted by tests/test_scripts/test_bootstrap_guards.py)
+        # The resets below discard local edits to the ephemeral files wholesale
+        # (update.sh's non-forced checkout would refuse over them; this recovery
+        # cannot afford to). Save them first — the same save update.sh's rollback
+        # and deploy_code_only.sh's reset make (genesis_ephemeral_*, shared lib).
+        # update_state.json names no backup dir from the crashed run, so this
+        # save lands in a fresh run directory of its own.
+        # shellcheck source=lib/deploy_marker.sh
+        . "$SCRIPT_DIR/lib/deploy_marker.sh"
+        # shellcheck source=lib/deploy_checkout.sh
+        . "$SCRIPT_DIR/lib/deploy_checkout.sh"
+        genesis_ephemeral_backup_before_reset "$GENESIS_ROOT" "$EPHEMERAL_BACKUP_ROOT"
+
         if [ -n "$ROLLBACK_TAG" ] && git -C "$GENESIS_ROOT" rev-parse "$ROLLBACK_TAG" >/dev/null 2>&1; then
             echo "  Rolling back to $ROLLBACK_TAG..."
             git -C "$GENESIS_ROOT" reset --hard "$ROLLBACK_TAG" 2>&1 || true
@@ -74,6 +87,7 @@ if [ -f "$UPDATE_STATE" ]; then
             echo "  No rollback tag found — resetting to HEAD."
             git -C "$GENESIS_ROOT" reset --hard HEAD 2>&1 || true
         fi
+# END crash-recovery-reset
 
         # Record crash recovery
         echo "  Recording crash recovery in update_history..."
