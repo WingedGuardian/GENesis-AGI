@@ -968,9 +968,9 @@ def test_topic_summary_structured_fields():
     assert "Watch the embedding backlog." in msg
 
 
-def test_topic_summary_structured_observation_keeps_observation_and_next():
-    """The structured form shows its Observation and Next lines whole, even
-    when the full entry is longer than the old 300-character cut."""
+def test_topic_summary_structured_observation_shows_every_line():
+    """A four-line observation shows all four lines whole, Evidence included,
+    even when the full entry is longer than the old 300-character cut."""
     from genesis.cc.reflection_bridge._output import format_topic_summary
 
     entry = (
@@ -983,10 +983,93 @@ def test_topic_summary_structured_observation_keeps_observation_and_next():
     msg = format_topic_summary(
         Depth.DEEP, _cc_output(json.dumps({"observations": [entry]})),
     )
-    assert "Observation: The embedding backlog stopped draining" in msg
-    assert "Next: Restart the embedding worker; done when queue depth reaches zero." in msg
-    assert "Evidence:" not in msg
-    assert "Why it matters:" not in msg
+    for line in entry.splitlines():
+        assert line.strip() in msg
+    assert "not shown" not in msg
+
+
+def test_topic_observation_keeps_wrapped_continuation_lines():
+    """A labelled value wrapped onto a continuation line keeps that line, in
+    order: nothing is filtered by label."""
+    from genesis.cc.reflection_bridge import _output
+
+    entry = (
+        "Observation: queue stalled\n"
+        "Evidence: health snapshot\n"
+        "Why it matters: recall degrades\n"
+        "Next: restart the embedding worker\n"
+        "done when queue depth reaches zero"
+    )
+    assert _output._topic_observation(entry) == entry
+
+
+def test_topic_observation_budgets_escaped_length():
+    """The budget counts what Telegram receives: an entity-heavy observation
+    whose RAW text fits still stops when its ESCAPED text would not."""
+    from genesis.cc.reflection_bridge import _output
+
+    line = "a&b " * 60  # 240 raw characters, 480 once each & becomes &amp;
+    entry = "\n".join([line.strip()] * 4)
+    assert len(entry) <= _output._TOPIC_OBS_MAX  # the raw text would all fit
+    shown = _output._topic_observation(entry)
+    kept = shown.splitlines()[:-1]
+    assert shown.splitlines()[-1] == "… (2 more lines not shown)"
+    assert sum(len(k) + 1 for k in kept) - 1 <= _output._TOPIC_OBS_MAX
+    assert all("&amp;" in k and "&b" not in k for k in kept)
+
+
+def test_topic_observation_never_splits_an_entity():
+    """A shortened line is cut on the RAW text and escaped afterwards, so no
+    cut position can leave a partial entity, and the result fits the escaped
+    budget."""
+    import re
+
+    from genesis.cc.reflection_bridge import _output
+
+    bad = re.compile(r"&(?!(?:amp|lt|gt);)")
+    for pad in range(12):
+        line = "w" * pad + " " + "R&D <x> " * 400
+        shown = _output._topic_observation(line)
+        first = shown.splitlines()[0]
+        assert first.endswith("(shortened)")
+        assert len(first) <= _output._TOPIC_OBS_MAX
+        assert not bad.search(shown), (pad, shown[-40:])
+        assert "<" not in shown and ">" not in shown
+        assert "&amp;amp;" not in shown and "&amp;lt;" not in shown
+    # No spaces: no word boundary rescues an escape-then-cut design here, so
+    # only cutting the raw text before escaping keeps every entity whole.
+    for pad in range(6):
+        shown = _output._topic_observation("x" * pad + "&<>" * 800)
+        first = shown.splitlines()[0]
+        assert first.endswith("(shortened)")
+        assert len(first) <= _output._TOPIC_OBS_MAX
+        assert not bad.search(shown), (pad, shown[-40:])
+        assert "<" not in shown and ">" not in shown
+
+
+def test_topic_observation_marks_omitted_lines_singular_and_plural():
+    """Lines past the budget are counted in an omission marker, structured
+    entries included."""
+    from genesis.cc.reflection_bridge import _output
+
+    obs = "Observation: " + "o" * 300
+    ev = "Evidence: " + "e" * 500
+    why = "Why it matters: " + "w" * 500
+    nxt = "Next: restart the worker"
+    two = _output._topic_observation("\n".join([obs, ev, why, nxt]))
+    assert two.splitlines() == [obs, ev, "… (2 more lines not shown)"]
+    one = _output._topic_observation("\n".join([obs, ev, why]))
+    assert one.splitlines() == [obs, ev, "… (1 more line not shown)"]
+
+
+def test_topic_summary_escapes_observation_once():
+    """The observation reaches the topic escaped exactly once."""
+    from genesis.cc.reflection_bridge._output import format_topic_summary
+
+    payload = json.dumps({"observations": ["R&D <tag> said \"hi\""]})
+    msg = format_topic_summary(Depth.DEEP, _cc_output(payload))
+    assert "• R&amp;D &lt;tag&gt; said \"hi\"" in msg
+    assert "&amp;amp;" not in msg
 
 
 def test_topic_observation_states_what_it_leaves_out():
@@ -1005,8 +1088,34 @@ def test_topic_observation_shortens_one_overlong_line_at_a_word():
 
     shown = _output._topic_observation("word " * 400)
     assert shown.endswith("(shortened)")
-    assert len(shown) < 1300
-    assert "wor …" not in shown  # cut lands on a word boundary
+    assert len(shown) <= _output._TOPIC_OBS_MAX
+    kept = shown.removesuffix(_output._SHORTENED)
+    assert kept.split() and all(w == "word" for w in kept.split())
+    assert kept.endswith("word")  # cut lands on a word boundary
+
+
+def test_topic_observation_long_token_is_not_reduced_to_one_word():
+    """A word boundary that would keep less than half of what fits (a long
+    URL or hash after one short word) gives way to a mid-token cut."""
+    from genesis.cc.reflection_bridge import _output
+
+    shown = _output._topic_observation("see " + "b" * 3000)
+    assert shown.endswith("(shortened)")
+    assert len(shown) > _output._TOPIC_OBS_MAX // 2
+    assert len(shown) <= _output._TOPIC_OBS_MAX
+
+
+def test_topic_observation_counts_the_line_separator():
+    """Two 600-character lines joined by a newline make 1201 characters,
+    one over the budget, so the second line is left out."""
+    from genesis.cc.reflection_bridge import _output
+
+    a, b = "a" * 600, "b" * 600
+    assert _output._topic_observation(f"{a}\n{b}").splitlines() == [
+        a, "… (1 more line not shown)",
+    ]
+    c = "c" * 599
+    assert _output._topic_observation(f"{a}\n{c}") == f"{a}\n{c}"
 
 
 def test_topic_observation_overlong_first_line_still_counts_the_rest():
@@ -1016,27 +1125,6 @@ def test_topic_observation_overlong_first_line_still_counts_the_rest():
     first, last = shown.splitlines()[0], shown.splitlines()[-1]
     assert first.endswith("(shortened)")
     assert last == "… (2 more lines not shown)"
-
-
-def test_topic_observation_long_finding_keeps_next_step():
-    """A structured entry whose Observation line alone exceeds the budget still
-    shows its Next line."""
-    from genesis.cc.reflection_bridge import _output
-
-    entry = "Observation: " + "detail " * 300 + "\nEvidence: e\nNext: Do the thing."
-    shown = _output._topic_observation(entry)
-    assert shown.splitlines()[0].startswith("Observation: ")
-    assert shown.splitlines()[0].endswith("(shortened)")
-    assert shown.splitlines()[-1] == "Next: Do the thing."
-
-
-def test_topic_observation_partial_labels_keep_every_line():
-    """One label alone does not make an entry structured: unlabeled evidence or
-    an action line must not be discarded."""
-    from genesis.cc.reflection_bridge import _output
-
-    entry = "Observation: queue stalled\nseen in the health snapshot\nrestart the worker"
-    assert _output._topic_observation(entry) == entry
 
 
 def test_salvage_prompt_requests_four_line_observations():
