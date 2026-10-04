@@ -79,6 +79,11 @@ _TRANSCRIPT_RESTORED=0
 _MEMORY_RESTORED=0
 _EVAL_RESTORED=0
 _EXTRA_RESTORED=0
+# Set by _pull_from_offsite once a snapshot is selected: §4c then restores only
+# the extra archives that snapshot supplied (newline-separated names), never a
+# stale one left in a reused checkout by an earlier run.
+_EXTRA_FROM_SNAPSHOT=false
+_EXTRA_PULLED=""
 _CCMEM_RESTORED=false
 _OVERLAYS_RESTORED=0
 _SECRETS_RESTORED=false
@@ -116,8 +121,8 @@ _SQL_TMP=""
 _QDRANT_TMP=""
 _DB_STAGE=""
 _cleanup_plaintext() {
-    rm -f "${_SQL_TMP:-}" "${_QDRANT_TMP:-}" "${_XT_TAR:-}" 2>/dev/null || true
-    [ -n "${_XT_STAGE:-}" ] && rm -rf "$_XT_STAGE" 2>/dev/null || true  # §4c plaintext staging
+    rm -f "${_SQL_TMP:-}" "${_QDRANT_TMP:-}" "${_XT_TAR:-}" "${_XT_ERR:-}" 2>/dev/null || true
+    if [ -n "${_XT_STAGE:-}" ]; then rm -rf "$_XT_STAGE" 2>/dev/null || true; fi  # §4c plaintext staging
     if [ -n "${_DB_STAGE:-}" ]; then
         rm -f "$_DB_STAGE" "$_DB_STAGE-journal" "$_DB_STAGE-wal" "$_DB_STAGE-shm" 2>/dev/null || true
     fi
@@ -130,6 +135,8 @@ BACKUP_DIR="$HOME/backups/genesis-backups"
 _CC_PROJECT_ID=$(echo "$GENESIS_DIR" | tr '/' '-')
 MEMORY_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}/memory"
 TRANSCRIPT_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}"
+# shellcheck source=scripts/lib/backup_core_paths.sh
+source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
 SECRETS_FILE="${SECRETS_PATH:-$GENESIS_DIR/secrets.env}"
 QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 LOG_PREFIX="[genesis-restore]"
@@ -465,9 +472,14 @@ _pull_from_offsite() {
     done
     # opt-in extra-directory archives (backup.sh §6f) — flat by construction,
     # one <name>.tar.gpg per directory, so one single-level listing pulls them all.
+    # Only names pulled from THIS snapshot are restored (§4c), so an archive a
+    # previous run left in $BACKUP_DIR/extra cannot come back from another point in time.
+    _EXTRA_FROM_SNAPSHOT=true
+    _EXTRA_PULLED=""
     while read -r fname; do
         mkdir -p "$BACKUP_DIR/extra"
         if backend_get "$snap/extra/$fname" "$BACKUP_DIR/extra/$fname"; then
+            _EXTRA_PULLED+="$fname"$'\n'
             log "  off-site: pulled extra/$fname"
         else
             warn "off-site: failed to pull extra/$fname from snapshot $latest"
@@ -1220,113 +1232,115 @@ else
 fi
 
 # ── 4c. Opt-in extra directories (backup.sh §6f) ─────────────────────
-# Each extra/<name>.tar.gpg holds one directory, members stored relative to
-# $HOME. Members are extracted into a staging dir under $HOME through the stdlib
-# tarfile `data` filter, which refuses absolute paths, `..` escapes, links that
-# point outside the tree and special files member by member (each refusal is a
-# recorded failure; the rest restores). Files and in-tree symlinks are then moved
-# into place one by one, so a reader never sees a half-written file.
+# Each extra/<name>.tar.gpg holds ONE directory, members stored relative to
+# $HOME, restored as a unit by scripts/lib/extra_restore.py (its docstring has
+# the member rules). This section decides WHERE: the destination's parent must
+# resolve inside the real $HOME (an existing symlink there may stay inside $HOME,
+# never lead out), the destination must not be a symlink, and it must not overlap
+# a path the core restore owns. Staging is created next to the destination, so
+# the final step is a rename on one filesystem. An existing non-empty directory
+# is replaced only under --force, and is then moved aside to
+# <dir>.pre-restore-<stamp>, never deleted; an empty one counts as absent. After
+# an off-site pull, only archives from the selected snapshot are restored. A
+# refusal or failure for one archive is recorded and the rest of the restore runs.
+_xt_skip() {  # warn, drop this archive's temps, and let the caller `continue`
+    warn "$1"
+    rm -f "${_XT_TAR:-}" "${_XT_ERR:-}"
+    [ -n "${_XT_STAGE:-}" ] && rm -rf "$_XT_STAGE"
+    _XT_TAR="" _XT_ERR="" _XT_STAGE=""
+}
+_xt_errtext() { head -c 300 "$_XT_ERR" 2>/dev/null | tr '\n' ' '; }
 log "--- Extra directories ---"
 if find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2>/dev/null | grep -q .; then
+    _xt_home_real="$(realpath -- "$HOME")"
+    _xt_helper="$_SCRIPT_DIR/lib/extra_restore.py"
     while IFS= read -r -d '' src; do
         name="$(basename "$src")"
+        if $_EXTRA_FROM_SNAPSHOT && ! grep -Fxq -- "$name" <<<"$_EXTRA_PULLED"; then
+            log "Extra: skipping $name (not supplied by the selected off-site snapshot)"
+            continue
+        fi
         if $DRY_RUN; then
-            log "Extra: would restore archive $name (members under \$HOME)"
+            log "Extra: would restore archive $name (one directory under \$HOME)"
             _EXTRA_RESTORED=$(( _EXTRA_RESTORED + 1 ))
             continue
         fi
-        _XT_TAR="$(mktemp -p "$GENESIS_BIG_TMP" extra-restore.XXXXXX.tar)"
-        if ! decrypt_file "$src" "$_XT_TAR"; then
-            warn "extra decrypt failed: $name"
-            rm -f "$_XT_TAR"
-            _XT_TAR=""
+        if ! _XT_TAR="$(mktemp -p "$GENESIS_BIG_TMP" extra-restore.XXXXXX.tar)" \
+            || ! _XT_ERR="$(mktemp -p "$GENESIS_BIG_TMP" extra-restore.XXXXXX.err)"; then
+            _xt_skip "extra archive $name: cannot create a temp file in $GENESIS_BIG_TMP"
             continue
         fi
-        _XT_STAGE="$(mktemp -d -p "$HOME" .genesis-restore-extra.XXXXXX)"
-        # Extraction uses the stdlib tarfile `data` filter (PEP 706) rather than parsing
-        # `tar -tv` output: it refuses absolute paths, `..` escapes, links pointing
-        # outside the tree and special files PER MEMBER, and keeps everything else,
-        # including symlinks inside the tree. Refused members are named in the warning.
+        if ! decrypt_file "$src" "$_XT_TAR"; then
+            _xt_skip "extra decrypt failed: $name"
+            continue
+        fi
         _xt_rc=0
-        _xt_out="$(python3 - "$_XT_TAR" "$_XT_STAGE" 2>&1 <<'PY'
-import sys
-import tarfile
-
-if not hasattr(tarfile, "data_filter"):
-    print("FATAL tarfile.data_filter unavailable (Python too old)")
-    sys.exit(3)
-refused = 0
-
-
-def keep(member, dest):
-    global refused
-    try:
-        return tarfile.data_filter(member, dest)
-    except tarfile.FilterError as e:
-        refused += 1
-        print(f"refused member {member.name!r}: {type(e).__name__}")
-        return None
-
-
-with tarfile.open(sys.argv[1]) as tf:
-    tf.extractall(sys.argv[2], filter=keep)
-sys.exit(4 if refused else 0)
-PY
-)" || _xt_rc=$?
-        if [ "$_xt_rc" -ne 0 ] && [ "$_xt_rc" -ne 4 ]; then
-            warn "extra archive refused (could not be extracted safely, rc=$_xt_rc): $name: $(printf '%s' "$_xt_out" | head -c 300)"
-            rm -rf "$_XT_STAGE" "$_XT_TAR"
+        _xt_root="$(python3 "$_xt_helper" root "$_XT_TAR" 2>"$_XT_ERR")" || _xt_rc=$?
+        if [ "$_xt_rc" -ne 0 ] || [ -z "$_xt_root" ]; then
+            _xt_skip "extra archive refused (rc=$_xt_rc): $name: $(_xt_errtext)"
+            continue
+        fi
+        _xt_target="$HOME/$_xt_root"
+        _xt_parent="$(dirname "$_xt_target")"
+        _xt_inside=false
+        case "$(realpath -m -- "$_xt_parent")/" in
+            "$_xt_home_real"/*) _xt_inside=true ;;
+        esac
+        # Checked before mkdir (so mkdir -p never creates directories through a
+        # symlink that leads out) and again after it.
+        if $_xt_inside && mkdir -p -- "$_xt_parent" 2>/dev/null; then
+            case "$(realpath -- "$_xt_parent")/" in
+                "$_xt_home_real"/*) ;;
+                *) _xt_inside=false ;;
+            esac
+        elif $_xt_inside; then
+            _xt_skip "extra archive $name: could not create $_xt_parent"
+            continue
+        fi
+        if ! $_xt_inside; then
+            _xt_skip "extra archive refused: $name: an existing symlink in the destination path leads outside \$HOME"
+            continue
+        fi
+        if [ -L "$_xt_target" ]; then
+            _xt_skip "extra archive refused: $name: the destination ~/$_xt_root is a symlink (not replaced; restore it by hand)"
+            continue
+        fi
+        if _xt_core="$(backup_core_overlap "$(realpath -m -- "$_xt_target")")"; then
+            _xt_skip "extra archive refused: $name: ~/$_xt_root overlaps $_xt_core, which the core restore owns"
+            continue
+        fi
+        _xt_aside=""
+        if [ -d "$_xt_target" ] && rmdir -- "$_xt_target" 2>/dev/null; then
+            :  # an empty directory (e.g. created by bootstrap) counts as absent
+        elif [ -e "$_xt_target" ]; then
+            if ! $FORCE; then
+                _xt_skip "extra archive $name: ~/$_xt_root exists and was not replaced (re-run with --force; the current one is then moved aside)"
+                continue
+            fi
+            _xt_aside="$_xt_target.pre-restore-$(date -u +%Y%m%dT%H%M%SZ).$$"
+        fi
+        if ! _XT_STAGE="$(mktemp -d -p "$_xt_parent" ".$(basename "$_xt_target").restore.XXXXXX")"; then
             _XT_STAGE=""
-            _XT_TAR=""
+            _xt_skip "extra archive $name: cannot create a staging dir in $_xt_parent"
+            continue
+        fi
+        _xt_rc=0
+        _xt_out="$(python3 "$_xt_helper" swap "$_XT_TAR" "$_XT_STAGE" "$_xt_root" "$_xt_target" "$_xt_aside" 2>"$_XT_ERR")" || _xt_rc=$?
+        if [ "$_xt_rc" -ne 0 ] && [ "$_xt_rc" -ne 4 ]; then
+            _xt_skip "extra archive refused (could not be restored, rc=$_xt_rc): $name: $(_xt_errtext)${_xt_out:+ [$_xt_out]}"
             continue
         fi
         if [ "$_xt_rc" -eq 4 ]; then
-            warn "extra archive refused members (unsafe), the rest restored: $name: $(printf '%s' "$_xt_out" | head -c 300)"
+            warn "extra archive refused members (unsafe), the rest restored: $name: $(_xt_errtext)"
         fi
-        _xt_skipped=0
-        _xt_escaped=0
-        _xt_home_real="$(realpath -- "$HOME")"
-        # Move files AND in-tree symlinks into place one by one (a rename within one
-        # filesystem is atomic; across mounts mv copies). A pre-existing symlink in a
-        # destination's PARENT path could redirect the write outside $HOME, so each
-        # parent is re-resolved and a member whose real parent leaves the real $HOME
-        # is refused (security review: CRITICAL, reproduced).
-        while IFS= read -r -d '' f; do
-            rel="${f#"$_XT_STAGE"/}"
-            dst="$HOME/$rel"
-            _xt_parent_real="$(realpath -m -- "$(dirname "$dst")")"
-            case "$_xt_parent_real/" in
-                "$_xt_home_real"/*) ;;
-                *)
-                    _xt_escaped=$(( _xt_escaped + 1 ))
-                    continue
-                    ;;
-            esac
-            # Keep a newer live copy unless --force; compares the entries themselves
-            # (stat without -L), so symlink members get the same rule as files.
-            if { [ -e "$dst" ] || [ -L "$dst" ]; } && ! $FORCE \
-                && [ "$(stat -c %Y -- "$dst" 2>/dev/null || echo 0)" -gt "$(stat -c %Y -- "$f" 2>/dev/null || echo 0)" ]; then
-                continue
-            fi
-            if [ -d "$dst" ] && [ ! -L "$dst" ]; then
-                _xt_skipped=$(( _xt_skipped + 1 ))
-                continue
-            fi
-            if ! mkdir -p "$(dirname "$dst")" 2>/dev/null || ! mv -fT "$f" "$dst" 2>/dev/null; then
-                _xt_skipped=$(( _xt_skipped + 1 ))
-            fi
-        done < <(find "$_XT_STAGE" \( -type f -o -type l \) -print0)
-        rm -rf "$_XT_STAGE" "$_XT_TAR"
-        _XT_STAGE=""
-        _XT_TAR=""
-        if [ "$_xt_escaped" -gt 0 ]; then
-            warn "extra archive refused $_xt_escaped member(s) of $name: an existing symlink in the destination path leads outside \$HOME"
-        fi
-        if [ "$_xt_skipped" -gt 0 ]; then
-            warn "extra archive $name: $_xt_skipped file(s) could not be placed (a directory or file is in the way)"
-        fi
+        rm -rf "$_XT_STAGE"
+        rm -f "$_XT_TAR" "$_XT_ERR"
+        _XT_STAGE="" _XT_TAR="" _XT_ERR=""
+        case "$_xt_out" in
+            "aside "*) log "Extra: previous ~/$_xt_root kept at ${_xt_out#aside }" ;;
+        esac
         _EXTRA_RESTORED=$(( _EXTRA_RESTORED + 1 ))
-        log "Extra: restored $name"
+        log "Extra: restored $name → ~/$_xt_root"
     done < <(find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print0 2>/dev/null)
     log "Extra directories: $_EXTRA_RESTORED archive(s) restored"
 else

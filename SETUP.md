@@ -147,14 +147,30 @@ GENESIS_BACKUP_EXTRA_EXCLUDES=derived:scratch
 Each directory becomes one encrypted archive, `extra/<name>.tar.gpg`. It goes to
 the off-site tier only, never the git tier. Rebuildable caches (`.venv`,
 `node_modules`, `__pycache__`, …) are always excluded, and
-`GENESIS_BACKUP_EXTRA_EXCLUDES` adds more names, matched at any depth. An entry
-outside your home directory, or one that is missing, is skipped with a warning
-and never fails the backup; a missing directory keeps its last archive. Removing
-an entry from the list deletes its archive; unsetting the variable deletes nothing.
-`restore.sh` puts the files back under your home directory. It refuses, member by
-member, anything that uses `..`, a link pointing outside the tree, a special file,
-or a destination reached through an existing symlink that leads outside your home
-directory. Each refusal is recorded; the rest restores.
+`GENESIS_BACKUP_EXTRA_EXCLUDES` adds more tar exclude patterns (wildcards
+allowed), matched at any depth. An entry that is outside your home directory,
+relative, nested in or containing another entry, or overlapping a path the core
+backup already restores (for example `~/.genesis` itself, or anything inside the
+repo) is skipped with a warning. So is a directory tar cannot read, or one an
+exclude pattern would empty; its last good archive is kept. None of these fails
+the backup, but each marks the off-site copy `partial` (`offsite_confirmed:
+false`) and sends the off-site alert, as does an archive that fails to upload;
+the core snapshot is still marked complete. A missing directory keeps its last
+archive without that warning. Removing an entry from a list in which every
+entry is valid deletes its archive; a list with any invalid entry, or an unset
+variable, deletes nothing.
+
+`restore.sh` puts each directory back as a whole: it unpacks the archive next to
+the destination and renames it into place, so directory permissions and empty
+directories come back too. An existing non-empty directory is replaced only with
+`--force`, and the old one is kept beside it as `<dir>.pre-restore-<timestamp>`,
+never deleted; without `--force` that directory is skipped and recorded as a
+failure. Members that use `..`, a special file, or a link pointing outside the
+restored directory are refused one by one and the rest restores. A whole archive
+is refused when its destination is a symlink, when its path runs through a
+symlink that leads outside your home directory, or when it overlaps a core
+restore path. Every refusal is recorded. After an off-site pull, only archives
+from the selected snapshot are restored.
 
 Bootstrap installs the timer's unit files but does **not** enable them —
 scheduling a backup that silently leaves your database local-only would give a

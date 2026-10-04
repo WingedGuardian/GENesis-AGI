@@ -144,7 +144,7 @@ _write_status() {
     if [ "${_T2_STATUS:-}" = "ok" ]; then _offsite_confirmed=true; fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"extra_failed":${_EXTRA_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 
@@ -184,7 +184,7 @@ _on_exit() {
     # N2: the credential-bearing plaintext SQL dump must not outlive the script
     # if it died mid-section (before its inline rm).
     rm -f "${_SQL_TMP:-}" "${_SQL_ARTIFACT_TMP:-}" "${_SQL_VERIFY_TMP:-}" 2>/dev/null || true
-    rm -f "${_EXTRA_TAR_TMP:-}" 2>/dev/null || true  # §6f plaintext tar of a listed directory
+    rm -f "${_EXTRA_TAR_TMP:-}" "${_EXTRA_TAR_ERR:-}" 2>/dev/null || true  # §6f plaintext tar + its file-name diagnostics
     if [ -n "${_VERIFY_DB:-}" ]; then
         rm -f "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm" 2>/dev/null || true
     fi
@@ -198,6 +198,8 @@ BACKUP_DIR="$HOME/backups/genesis-backups"
 _CC_PROJECT_ID=$(echo "$GENESIS_DIR" | tr '/' '-')
 MEMORY_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}/memory"
 TRANSCRIPT_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}"
+# shellcheck source=scripts/lib/backup_core_paths.sh
+source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
 SECRETS_FILE="${SECRETS_PATH:-$GENESIS_DIR/secrets.env}"
 QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 LOG_PREFIX="[genesis-backup]"
@@ -746,7 +748,22 @@ find extra -maxdepth 1 -type f ! -name '*.tar.gpg' -delete 2>/dev/null || true
 _extra_wanted=()
 _EXTRA_TAR_TMP=""
 _EXTRA_UPLOAD_FAILED=0
-if [ -n "${GENESIS_BACKUP_EXTRA_DIRS:-}" ]; then
+_EXTRA_FAILED=0        # listed dirs NOT archived this run for a reason other than "missing"
+_EXTRA_TAR_ERR=""
+# The list is validated as a whole: archives of unlisted directories are removed
+# only when EVERY entry parsed and validated, so a typo in one entry can never
+# delete the last good archive of another (a missing directory is runtime state,
+# not a validation failure, and keeps its archive).
+_extra_list_valid=true
+_extra_abs_seen=()
+case "${GENESIS_BACKUP_EXTRA_DIRS:-}" in
+    *$'\n'*)
+        log "WARNING: GENESIS_BACKUP_EXTRA_DIRS contains a newline (entries are ':'-separated); no extra dir archived or removed this run"
+        _EXTRA_FAILED=$((_EXTRA_FAILED + 1))
+        _extra_list_valid=false
+        ;;
+esac
+if [ -n "${GENESIS_BACKUP_EXTRA_DIRS:-}" ] && $_extra_list_valid; then
     # Compare RESOLVED paths: a symlinked or slash-terminated $HOME must not reject every entry.
     _home_real="$(realpath -- "$HOME")"
     _bdir_real="$(realpath -m -- "$BACKUP_DIR")"
@@ -773,7 +790,7 @@ if [ -n "${GENESIS_BACKUP_EXTRA_DIRS:-}" ]; then
             *)
                 # A relative entry would resolve against this script's cwd (the backups repo).
                 log "WARNING: extra dir skipped (must be an absolute path or start with ~/): $_d"
-                _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+                _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1)); _EXTRA_FAILED=$((_EXTRA_FAILED + 1)); _extra_list_valid=false
                 continue
                 ;;
         esac
@@ -782,24 +799,42 @@ if [ -n "${GENESIS_BACKUP_EXTRA_DIRS:-}" ]; then
             "$_home_real"/?*) ;;
             *)
                 log "WARNING: extra dir skipped (must be a directory under \$HOME, not \$HOME itself): $_d"
-                _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+                _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1)); _EXTRA_FAILED=$((_EXTRA_FAILED + 1)); _extra_list_valid=false
                 continue
                 ;;
         esac
         case "$_abs/" in
             "$_bdir_real"/* | "$_btmp_real"/*)
                 log "WARNING: extra dir skipped (inside the backups repo or the backup temp dir): $_d"
-                _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+                _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1)); _EXTRA_FAILED=$((_EXTRA_FAILED + 1)); _extra_list_valid=false
                 continue
                 ;;
         esac
         case "$_bdir_real/" in
             "$_abs"/*)
                 log "WARNING: extra dir skipped (contains the backups repo; it would archive its own archives): $_d"
-                _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+                _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1)); _EXTRA_FAILED=$((_EXTRA_FAILED + 1)); _extra_list_valid=false
                 continue
                 ;;
         esac
+        if _core_hit="$(backup_core_overlap "$_abs")"; then
+            # restore.sh puts an extra directory back as a unit, which would swap this
+            # core path out of the way; the core backup already covers it.
+            log "WARNING: extra dir skipped (overlaps $_core_hit, which the core backup restores): $_d"
+            _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1)); _EXTRA_FAILED=$((_EXTRA_FAILED + 1)); _extra_list_valid=false
+            continue
+        fi
+        _dup=""
+        for _prev in "${_extra_abs_seen[@]+"${_extra_abs_seen[@]}"}"; do
+            case "$_abs/" in "$_prev"/*) _dup="$_prev" ;; esac
+            case "$_prev/" in "$_abs"/*) _dup="$_prev" ;; esac
+        done
+        if [ -n "$_dup" ]; then
+            log "WARNING: extra dir skipped (same as, inside, or containing another listed entry ~/${_dup#"$_home_real"/}): $_d"
+            _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1)); _EXTRA_FAILED=$((_EXTRA_FAILED + 1)); _extra_list_valid=false
+            continue
+        fi
+        _extra_abs_seen+=("$_abs")
         _rel="${_abs#"$_home_real"/}"
         _name="$(printf '%s' "$_rel" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)-$(printf '%s' "$_rel" | sha1sum | cut -c1-8).tar.gpg"
         _extra_wanted+=("$_name")
@@ -815,17 +850,18 @@ if [ -n "${GENESIS_BACKUP_EXTRA_DIRS:-}" ]; then
         done
         if [ -n "$_ex_hit" ]; then
             log "WARNING: extra dir skipped (its path contains the excluded name '$_ex_hit'; the archive would be empty): ~/$_rel"
-            _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+            _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1)); _EXTRA_FAILED=$((_EXTRA_FAILED + 1))
             continue
         fi
         if ! $_ENCRYPT_READY; then
             log "WARNING: extra dir skipped (GENESIS_BACKUP_PASSPHRASE not set — refusing plaintext): ~/$_rel"
-            _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+            _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1)); _EXTRA_FAILED=$((_EXTRA_FAILED + 1))
             continue
         fi
         _tar_tmp="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.tar)"
         _EXTRA_TAR_TMP="$_tar_tmp"
         _tar_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err)"
+        _EXTRA_TAR_ERR="$_tar_err"
         _gpg_tmp="extra/.${_name}.partial.$$"
         _tar_rc=0
         # --hard-dereference: a hard link is stored as file content, so restore never
@@ -838,17 +874,30 @@ if [ -n "${GENESIS_BACKUP_EXTRA_DIRS:-}" ]; then
             log "WARNING: extra dir skipped (tar failed rc=$_tar_rc; keeping its last archive): ~/$_rel: $(head -3 "$_tar_err" | tr '\n' ' ')"
             rm -f "$_tar_tmp" "$_tar_err"
             _EXTRA_TAR_TMP=""
-            _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+            _EXTRA_TAR_ERR=""
+            _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1)); _EXTRA_FAILED=$((_EXTRA_FAILED + 1))
             continue
         fi
         [ "$_tar_rc" -eq 1 ] && log "NOTE: ~/$_rel changed while archiving; a file that was changing may be torn: $(head -3 "$_tar_err" | tr '\n' ' ')"
         rm -f "$_tar_err"
+        _EXTRA_TAR_ERR=""
+        # tar treats excludes as wildcards, so a pattern can match the directory itself
+        # and yield an empty archive with rc 0. Never let that replace the last good one.
+        # (grep -c reads its whole input: no early exit, so no SIGPIPE under pipefail.)
+        _tar_root_n="$(tar -tf "$_tar_tmp" 2>/dev/null | grep -cxF -- "$_rel/" || true)"
+        if [ "${_tar_root_n:-0}" -eq 0 ]; then
+            log "WARNING: extra dir skipped (the archive would not contain ~/$_rel — does an exclude pattern match it?; keeping its last archive)"
+            rm -f "$_tar_tmp"
+            _EXTRA_TAR_TMP=""
+            _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1)); _EXTRA_FAILED=$((_EXTRA_FAILED + 1))
+            continue
+        fi
         if encrypt_file "$_tar_tmp" "$_gpg_tmp" && mv -f "$_gpg_tmp" "extra/$_name"; then
             _EXTRA_COUNT=$((_EXTRA_COUNT + 1))
         else
             log "WARNING: extra dir skipped (encryption failed; keeping its last archive): ~/$_rel"
             rm -f "$_gpg_tmp"
-            _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+            _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1)); _EXTRA_FAILED=$((_EXTRA_FAILED + 1))
         fi
         rm -f "$_tar_tmp"
         _EXTRA_TAR_TMP=""
@@ -862,7 +911,10 @@ if [ -z "${GENESIS_BACKUP_EXTRA_DIRS:-}" ]; then
     _extra_orphans="$(find extra -maxdepth 1 -type f -name '*.tar.gpg' 2>/dev/null | wc -l)"
     [ "$_extra_orphans" -gt 0 ] && log "NOTE: GENESIS_BACKUP_EXTRA_DIRS is unset; keeping $_extra_orphans existing extra archive(s)"
 fi
-while [ -n "${GENESIS_BACKUP_EXTRA_DIRS:-}" ] && IFS= read -r -d '' _f; do
+if [ -n "${GENESIS_BACKUP_EXTRA_DIRS:-}" ] && ! $_extra_list_valid; then
+    log "NOTE: GENESIS_BACKUP_EXTRA_DIRS has invalid entries; no extra archive removed this run"
+fi
+while [ -n "${GENESIS_BACKUP_EXTRA_DIRS:-}" ] && $_extra_list_valid && IFS= read -r -d '' _f; do
     _keep=false
     for _w in "${_extra_wanted[@]+"${_extra_wanted[@]}"}"; do
         [ "$(basename "$_f")" = "$_w" ] && _keep=true
@@ -1206,9 +1258,10 @@ else
             if backend_put "$f" "${_T2_DIR}/extra/${fname}"; then
                 log "  off-site: uploaded extra/${fname}"
             else
-                # Opt-in payload: reported on its own (status extra_upload_failed) and NOT
-                # allowed to withhold the core snapshot's COMPLETE marker.
-                log "WARNING: off-site upload failed for extra/${fname} (core snapshot unaffected)"
+                # Opt-in payload: it never withholds the core snapshot's COMPLETE marker
+                # (restore would then skip the core data too), but it does mark the off-site
+                # copy unconfirmed below (tier2_status=partial, offsite_confirmed=false).
+                log "WARNING: off-site upload failed for extra/${fname} (core snapshot still COMPLETE)"
                 _EXTRA_UPLOAD_FAILED=$((_EXTRA_UPLOAD_FAILED + 1))
             fi
         done < <(find extra -maxdepth 1 -type f -name '*.tar.gpg' -print0 2>/dev/null)
@@ -1269,7 +1322,13 @@ else
         rm -f "$_T2_MARKER"
     fi
 
-    if [ "$_T2_OK" = true ]; then
+    if [ "$_T2_OK" = true ] && [ $((_EXTRA_UPLOAD_FAILED + _EXTRA_FAILED)) -gt 0 ]; then
+        # Core snapshot is COMPLETE and restorable, but the off-site copy is not the
+        # full set the operator asked for (an extra dir was not archived this run, or
+        # its archive did not upload), so it is not reported as confirmed.
+        _T2_STATUS="partial"
+        log "WARNING: Tier 2 snapshot ${_T2_STAMP} is COMPLETE but extra dirs are incomplete (${_EXTRA_FAILED} not archived, ${_EXTRA_UPLOAD_FAILED} not uploaded)"
+    elif [ "$_T2_OK" = true ]; then
         _T2_STATUS="ok"
         log "Tier 2 backup copied to off-site snapshot ${_T2_STAMP} (backend: ${_T2_BACKEND})"
     else
@@ -1413,7 +1472,14 @@ if [ "${_T2_BACKEND:-none}" != "none" ] && [ "$_T2_STATUS" != "ok" ]; then
         # Escrow drift withheld the SQL dump from the off-site snapshot (the
         # target is fine — the escrowed passphrase is stale), so name the real
         # cause + fix instead of pointing at the off-site target.
-        if [ "$_SQL_ESCROW_DRIFT" = true ]; then
+        if [ "${_T2_OK:-}" = true ] && [ $((${_EXTRA_UPLOAD_FAILED:-0} + ${_EXTRA_FAILED:-0})) -gt 0 ]; then
+            _send_telegram "⚠️ *Off-site copy incomplete — extra directories*
+
+The core backup reached the off-site snapshot and is restorable, but the
+extra directories are incomplete: ${_EXTRA_FAILED:-0} not archived this run,
+${_EXTRA_UPLOAD_FAILED:-0} not uploaded. The backup log names each one.
+Time: $(date -Is)"
+        elif [ "$_SQL_ESCROW_DRIFT" = true ]; then
             _send_telegram "⚠️ *Off-site DR degraded — backup passphrase escrow drift*
 
 The local backup is OK (decrypts with the env passphrase), but the ESCROWED
