@@ -298,7 +298,7 @@ list means "none" — so only omit it once you have looked; write
 `issues: unchecked` if you have not. In the body,
 `## ═══ SUPERSEDED BELOW ═══` divides live content from archaeology; no divider
 means the whole file is live. What the body must STATE is set by "Due diligence
-before building" above, for every plan presented for approval.
+before building" above, for every development plan presented for approval.
 
 **`pinned.main` is the field that pays for itself**: it makes
 `git fetch origin main --quiet && git log --oneline <pinned.main>..origin/main`

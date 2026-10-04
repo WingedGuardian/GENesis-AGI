@@ -126,7 +126,7 @@ Item 5's carve-outs stay the owner's however small they look:
 
 Nothing checks a plan against this list. It is written by hand, and a plan that
 skips it fails silently until a review or the owner catches it. Pointing the
-advisory plan reminder's text here is a separate change.
+advisory plan reminder's text at the SKILL.md checklist is a separate change.
 
 Whether the rule changes behaviour is measured by re-counting the sessions in
 which the checklist prompt still had to be pasted: user-typed messages only,
