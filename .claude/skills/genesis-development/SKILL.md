@@ -2510,7 +2510,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   the problem disappears). Emit the `Design-premise:` block. Also informational,
   and its BROKEN verdict has a HIGH bar: it routes to the EXISTING
   premise-wrong disposition (architecture conversation, or
-  `needs-architecture-session` + a `ready` row) rather than to another round, so everything short of "the change cannot do what it
+  `needs-architecture-session` + draft + a `ready` row) rather than to another round, so everything short of "the change cannot do what it
   says" is SOUND-BUT-INFERIOR with the better shape named. Render a
   better-shape finding on the severity ladder too (normally SHOULD-FIX), or it
   is invisible to every surface that scores findings.
@@ -2849,7 +2849,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      obedience — STOP, post the round ledger (round → what it found → what it
      cost), name the cap explicitly ("we've hit the 3-round escalation cap"),
      and get a FRESH decision: HAND IT BACK through the established disposition
-     — architecture conversation, or `needs-architecture-session` + a `ready` row
+     — architecture conversation, or `needs-architecture-session` + draft + a `ready` row
      (three rounds
      each finding something new, after a class-level audit, is the strongest
      evidence available that the PREMISE and not the code is what is wrong —
@@ -3189,7 +3189,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      owner is deciding is fix-and-merge versus abandon-and-re-cut, never accept-and-ship.
      **With no user to ask** (a dispatched session): do not merge and do not open round
      3 — comment on the PR naming the tripwire and the P1, apply the
-     `needs-architecture-session` label, and open a `ready` follow-up, the same
+     `needs-architecture-session` label, move it to draft (`gh pr ready <N> --undo`),
+     and open a `ready` follow-up, the same
      unattended route the architecture-session rule below uses.
   6. **After round 1 the diff SHRINKS in SCOPE, never grows.** Line count is not the
      measure — a floor fix under rule 4 may add lines and is mandatory. What may not
