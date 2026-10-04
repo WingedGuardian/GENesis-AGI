@@ -84,6 +84,20 @@ models:
 # MiMo subscription URL is deliberately unset: copy YOUR region's Anthropic URL from
 # the Token Plan console (e.g. https://token-plan-sgp.xiaomimimo.com/anthropic).
 # Key VALUES belong in the environment/secrets.env, never in this YAML.
+#
+# Every route authenticates with ANTHROPIC_AUTH_TOKEN (bearer); there is no
+# API-key mode. Kimi's own guide shows ANTHROPIC_API_KEY, but its coding endpoint
+# reads a bearer header as the key too (probed 2026-10-04 with an invalid key:
+# the same "API Key appears to be invalid" error for either header, a different
+# one for none), and the commented automated Kimi peer below was validated on
+# bearer. An API key in interactive Claude Code is a credential the user may
+# decline, which falls back to the saved Anthropic login. The host is the one
+# Kimi's guide names today (api.kimi.ai); the older peer example's api.kimi.com
+# also still answers. The Kimi subscription key is the same Kimi Code key as that
+# peer (KIMI_CODING_API_KEY). The `[1m]` suffix is the form all three
+# vendors document for Claude Code; OpenRouter strips it before routing.
+# The launcher pins the chosen route through an owner-only --settings file as
+# well as the environment, so a settings file edited mid-session cannot re-route.
 gmodel:
   models:
     kimi-k3:
@@ -91,9 +105,8 @@ gmodel:
       routes:
         subscription:
           anthropic_base_url: https://api.kimi.ai/coding/
-          auth_env: KIMI_CODE_API_KEY
+          auth_env: KIMI_CODING_API_KEY
           model_id: "k3[1m]"
-          auth_mode: api_key
           context_tokens: 1048576
           effort: high
           interactive_only: true
@@ -101,14 +114,12 @@ gmodel:
           anthropic_base_url: https://api.moonshot.ai/anthropic
           auth_env: MOONSHOT_API_KEY
           model_id: "kimi-k3[1m]"
-          auth_mode: bearer
           context_tokens: 1048576
           effort: high
         openrouter:
           anthropic_base_url: https://openrouter.ai/api
           auth_env: API_KEY_OPENROUTER
           model_id: "moonshotai/kimi-k3[1m]"
-          auth_mode: bearer
           context_tokens: 1048576
           effort: high
     mimo-v2.6-pro:
@@ -118,21 +129,18 @@ gmodel:
           anthropic_base_url: null
           auth_env: MIMO_TOKEN_PLAN_API_KEY
           model_id: "mimo-v2.6-pro[1m]"
-          auth_mode: bearer
           context_tokens: 1048576
           effort: high
         api:
           anthropic_base_url: https://api.xiaomimimo.com/anthropic
           auth_env: MIMO_API_KEY
           model_id: "mimo-v2.6-pro[1m]"
-          auth_mode: bearer
           context_tokens: 1048576
           effort: high
         openrouter:
           anthropic_base_url: https://openrouter.ai/api
           auth_env: API_KEY_OPENROUTER
           model_id: "xiaomi/mimo-v2.6-pro[1m]"
-          auth_mode: bearer
           context_tokens: 1048576
           effort: high
 

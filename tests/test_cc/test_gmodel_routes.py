@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import copy
 import itertools
+import json
 import os
 import runpy
+import stat
 import sys
 import types
 from pathlib import Path
@@ -21,7 +23,7 @@ from genesis.cc import gmodel_routes, gmodel_settings, roster
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _GMODEL = _REPO_ROOT / "scripts" / "gmodel"
 _SECRET = "synthetic-provider-secret-never-print"
-_KEYS = {"subscription": "KIMI_CODE_API_KEY", "api": "MOONSHOT_API_KEY", "openrouter": "API_KEY_OPENROUTER"}
+_KEYS = {"subscription": "KIMI_CODING_API_KEY", "api": "MOONSHOT_API_KEY", "openrouter": "API_KEY_OPENROUTER"}
 
 
 @pytest.fixture
@@ -31,7 +33,6 @@ def route_config():
             "anthropic_base_url": "https://api.kimi.ai/coding/",
             "auth_env": _KEYS["subscription"],
             "model_id": "k3[1m]",
-            "auth_mode": "api_key",
             "context_tokens": 1048576,
             "effort": "high",
             "interactive_only": True,
@@ -40,7 +41,6 @@ def route_config():
             "anthropic_base_url": "https://api.moonshot.ai/anthropic",
             "auth_env": _KEYS["api"],
             "model_id": "kimi-k3[1m]",
-            "auth_mode": "bearer",
             "context_tokens": 1048576,
             "effort": "high",
         },
@@ -48,7 +48,6 @@ def route_config():
             "anthropic_base_url": "https://openrouter.ai/api",
             "auth_env": _KEYS["openrouter"],
             "model_id": "moonshotai/kimi-k3[1m]",
-            "auth_mode": "bearer",
             "context_tokens": 1048576,
             "effort": "high",
         },
@@ -56,7 +55,7 @@ def route_config():
     mimo = copy.deepcopy(routes)
     mimo["subscription"].update(
         anthropic_base_url=None, auth_env="MIMO_TOKEN_PLAN_API_KEY",
-        model_id="mimo-v2.6-pro[1m]", auth_mode="bearer", interactive_only=False,
+        model_id="mimo-v2.6-pro[1m]", interactive_only=False,
     )
     mimo["api"].update(
         anthropic_base_url="https://api.xiaomimimo.com/anthropic",
@@ -182,8 +181,8 @@ def test_foreground_catalog_never_enters_automated_failover(route_config, monkey
 def test_context_override_256k_is_retained(route_config):
     raw = route_config["gmodel"]["models"]["kimi-k3"]["routes"]["subscription"]
     raw.update(model_id="k3-256k", context_tokens=262144)
-    selected = _resolve(route_config, {"KIMI_CODE_API_KEY": _SECRET})
-    child = gmodel_routes.apply_route_env({"KIMI_CODE_API_KEY": _SECRET}, selected)
+    selected = _resolve(route_config, {"KIMI_CODING_API_KEY": _SECRET})
+    child = gmodel_routes.apply_route_env({"KIMI_CODING_API_KEY": _SECRET}, selected)
     assert child["ANTHROPIC_MODEL"] == "k3-256k"
     assert child["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "262144"
     assert child["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "262144"
@@ -199,16 +198,11 @@ def test_authentication_isolation_and_all_model_slots(route_config, route):
         "CLAUDE_CODE_EFFORT_LEVEL": "low",
     }, selected)
     assert child["ANTHROPIC_BASE_URL"] == selected.anthropic_base_url
-    assert "CLAUDE_CODE_OAUTH_TOKEN" not in child
-    if route == "subscription":
-        assert child["ANTHROPIC_API_KEY"] == _SECRET
-        assert "ANTHROPIC_AUTH_TOKEN" not in child
-    else:
-        assert child["ANTHROPIC_AUTH_TOKEN"] == _SECRET
-        if route == "openrouter":
-            assert child["ANTHROPIC_API_KEY"] == ""
-        else:
-            assert "ANTHROPIC_API_KEY" not in child
+    # Every route, the Kimi subscription included, uses the bearer slot; the
+    # lower-ranked credential slots are pinned empty rather than trusted to rank.
+    assert child["ANTHROPIC_AUTH_TOKEN"] == _SECRET
+    assert child["ANTHROPIC_API_KEY"] == ""
+    assert child["CLAUDE_CODE_OAUTH_TOKEN"] == ""
     for variable in roster._ROSTER_MODEL_ENV_VARS:
         assert child[variable] == selected.model_id
     assert child["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] == "1"
@@ -223,6 +217,7 @@ def launcher(monkeypatch, tmp_path, route_config):
     })
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(gmodel_settings, "_MANAGED_DIR", tmp_path / "managed-settings")
+    monkeypatch.setattr(gmodel_routes, "settings_dir", lambda: tmp_path / "gmodel-settings")
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: False
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -259,7 +254,14 @@ def test_exec_receives_selected_route_and_passthrough_once(launcher, monkeypatch
     captured = _capture_exec(launcher, monkeypatch)
     with pytest.raises(_ExecCaptured):
         launcher["main"](["kimi-k3", "--route", "api", "--permission-mode", "plan", "--resume", "old-session"])
-    assert captured["args"] == ["/fake/claude", "--permission-mode", "plan", "--resume", "old-session"]
+    assert captured["args"][:2] == ["/fake/claude", "--settings"]
+    assert captured["args"][3:] == ["--permission-mode", "plan", "--resume", "old-session"]
+    pinned = json.loads(Path(captured["args"][2]).read_text())
+    assert pinned["env"]["ANTHROPIC_BASE_URL"] == "https://api.moonshot.ai/anthropic"
+    assert pinned["env"]["ANTHROPIC_AUTH_TOKEN"] == _SECRET
+    assert pinned["env"]["ANTHROPIC_MODEL"] == "kimi-k3[1m]"
+    assert stat.S_IMODE(os.stat(captured["args"][2]).st_mode) == 0o600
+    assert _SECRET not in " ".join(captured["args"])
     assert captured["env"]["ANTHROPIC_BASE_URL"] == "https://api.moonshot.ai/anthropic"
     assert captured["env"]["ANTHROPIC_AUTH_TOKEN"] == _SECRET
     assert captured["env"]["ANTHROPIC_MODEL"] == "kimi-k3[1m]"
@@ -272,7 +274,8 @@ def test_route_flag_after_delimiter_is_preserved(launcher, monkeypatch):
     captured = _capture_exec(launcher, monkeypatch)
     with pytest.raises(_ExecCaptured):
         launcher["main"](["kimi-k3", "--", "--route", "not-a-launcher-choice"])
-    assert captured["args"] == ["/fake/claude", "--", "--route", "not-a-launcher-choice"]
+    assert captured["args"][:2] == ["/fake/claude", "--settings"]
+    assert captured["args"][3:] == ["--", "--route", "not-a-launcher-choice"]
 
 
 @pytest.mark.parametrize("args", [["--route"], ["--route", "typo"], ["--route", "api", "--route", "subscription"]])
@@ -297,14 +300,14 @@ def test_resume_auto_recomputes_current_available_route(launcher, monkeypatch, c
 
 @pytest.mark.parametrize("print_args", [["-p", "hello"], ["--print", "hello"], ["--bg"], ["--background"]])
 def test_headless_cli_skips_kimi_subscription(launcher, monkeypatch, capsys, print_args):
-    monkeypatch.setenv("KIMI_CODE_API_KEY", _SECRET)
+    monkeypatch.setenv("KIMI_CODING_API_KEY", _SECRET)
     monkeypatch.setenv("MOONSHOT_API_KEY", _SECRET)
     assert launcher["main"](["--print-env", "kimi-k3", *print_args]) == 0
     assert "https://api.moonshot.ai/anthropic" in capsys.readouterr().out
 
 
 def test_nontty_actual_launch_skips_kimi_subscription(launcher, monkeypatch):
-    monkeypatch.setenv("KIMI_CODE_API_KEY", _SECRET)
+    monkeypatch.setenv("KIMI_CODING_API_KEY", _SECRET)
     monkeypatch.setenv("MOONSHOT_API_KEY", _SECRET)
     monkeypatch.setattr(launcher["sys"].stdin, "isatty", lambda: False)
     captured = _capture_exec(launcher, monkeypatch)
@@ -327,34 +330,60 @@ def test_invalid_overlay_cannot_silently_reset_billing_preference(route_config, 
     (overlay_dir / "cc_roster.local.yaml").write_text(invalid)
     monkeypatch.setattr(roster, "_CONFIG_DIR", base_dir)
     monkeypatch.setattr(_config_overlay, "_user_config_dir", lambda: overlay_dir)
-    monkeypatch.setenv("KIMI_CODE_API_KEY", _SECRET)
+    monkeypatch.setenv("KIMI_CODING_API_KEY", _SECRET)
     with pytest.raises(roster.RosterError):
         gmodel_routes.resolve_route("kimi-k3")
 
 
-@pytest.mark.parametrize("variable", [
-    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_MODEL", "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
-])
-def test_user_settings_conflict_blocks_launch_without_printing_secret(launcher, monkeypatch, capsys, variable):
-    import json
-
+@pytest.mark.parametrize(
+    "variable",
+    [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+        "DISABLE_AUTO_COMPACT",
+    ],
+)
+def test_user_settings_are_not_read_the_pins_outrank_them(launcher, monkeypatch, variable):
+    """User/project settings no longer gate the launch: the --settings layer the
+    launcher passes outranks them, including when they are edited mid-session.
+    Every pinned variable is present in that layer with the selected value."""
     settings = Path(os.environ["HOME"]) / ".claude" / "settings.json"
     settings.parent.mkdir()
-    settings.write_text(json.dumps({"env": {variable: _SECRET}}))
-    monkeypatch.setenv("MOONSHOT_API_KEY", "another-provider-secret")
+    settings.write_text(json.dumps({"env": {variable: "user-value"}}))
+    monkeypatch.setenv("MOONSHOT_API_KEY", _SECRET)
+    captured = _capture_exec(launcher, monkeypatch)
+    with pytest.raises(_ExecCaptured):
+        launcher["main"](["kimi-k3", "--route", "api"])
+    pinned = json.loads(Path(captured["args"][2]).read_text())["env"]
+    assert pinned[variable] == captured["env"][variable] != "user-value"
+    assert settings.read_text() == json.dumps({"env": {variable: "user-value"}})
+
+
+def test_managed_settings_conflict_blocks_launch_without_printing_secret(
+    launcher, monkeypatch, capsys, tmp_path
+):
+    managed = tmp_path / "managed-settings" / "managed-settings.json"
+    managed.parent.mkdir()
+    managed.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://managed.invalid"}}))
+    monkeypatch.setenv("MOONSHOT_API_KEY", _SECRET)
     assert launcher["main"](["--print-env", "kimi-k3", "--route", "api"]) != 0
     captured = capsys.readouterr()
-    assert variable in captured.err
-    assert str(settings) in captured.err
+    assert "ANTHROPIC_BASE_URL" in captured.err and str(managed) in captured.err
     assert _SECRET not in captured.out + captured.err
-    assert settings.read_text() == json.dumps({"env": {variable: _SECRET}})
 
 
-@pytest.mark.parametrize("arguments", [
-    ["--model", "opus"], ["--model=opus"],
-    ["--settings", '{"env":{"ANTHROPIC_AUTH_TOKEN":"injected-secret"}}'],
-])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--model", "opus"],
+        ["--model=opus"],
+        ["--effort", "max"],
+        ["--settings", '{"env":{"ANTHROPIC_AUTH_TOKEN":"injected-secret"}}'],
+    ],
+)
 def test_conflicting_cli_overrides_cannot_switch_route(launcher, monkeypatch, capsys, arguments):
     monkeypatch.setenv("MOONSHOT_API_KEY", _SECRET)
     assert launcher["main"](["--print-env", "kimi-k3", "--route", "api", *arguments]) != 0
@@ -363,14 +392,54 @@ def test_conflicting_cli_overrides_cannot_switch_route(launcher, monkeypatch, ca
     assert _SECRET not in captured.out + captured.err
 
 
-def test_matching_inline_settings_credentials_never_appear_in_preview(launcher, monkeypatch, capsys):
-    import json
-
+def test_print_env_writes_no_settings_file(launcher, monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("MOONSHOT_API_KEY", _SECRET)
-    assert launcher["main"](["--print-env", "kimi-k3", "--route", "api", "--settings",
-                             json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": _SECRET}})]) == 0
-    captured = capsys.readouterr()
-    assert _SECRET not in captured.out + captured.err
+    assert launcher["main"](["--print-env", "kimi-k3", "--route", "api"]) == 0
+    assert "--settings" in capsys.readouterr().out
+    assert not (tmp_path / "gmodel-settings").exists()
+
+
+@pytest.mark.parametrize(
+    "present,expected_skips",
+    [
+        (
+            {"API_KEY_OPENROUTER"},
+            ["subscription: missing KIMI_CODING_API_KEY", "api: missing MOONSHOT_API_KEY"],
+        ),
+        ({"MOONSHOT_API_KEY"}, ["subscription: missing KIMI_CODING_API_KEY"]),
+    ],
+)
+def test_auto_says_why_it_reached_a_per_token_route(
+    launcher, monkeypatch, capsys, present, expected_skips
+):
+    for name in present:
+        monkeypatch.setenv(name, _SECRET)
+    assert launcher["main"](["--print-env", "kimi-k3"]) == 0
+    err = capsys.readouterr().err
+    assert "per-token" in err
+    for reason in expected_skips:
+        assert reason in err
+
+
+def test_auto_on_subscription_prints_no_skip_explanation(launcher, monkeypatch, capsys):
+    monkeypatch.setenv("KIMI_CODING_API_KEY", _SECRET)
+    monkeypatch.setenv("API_KEY_OPENROUTER", _SECRET)
+    assert launcher["main"](["--print-env", "kimi-k3"]) == 0
+    err = capsys.readouterr().err
+    assert "subscription quota" in err
+    assert "because" not in err
+
+
+def test_routed_resume_cannot_attach_to_a_running_background_session(launcher, monkeypatch, capsys):
+    """Claude Code does not attach a resume to a running background session when
+    --settings is on the command line (sessions docs, "Resume a running background
+    session"); a routed launch always carries it, so the route cannot be bypassed."""
+    monkeypatch.setenv("MOONSHOT_API_KEY", _SECRET)
+    captured = _capture_exec(launcher, monkeypatch)
+    with pytest.raises(_ExecCaptured):
+        launcher["main"](["kimi-k3", "--resume", "running-session"])
+    assert "--settings" in captured["args"]
+    assert "not attached" in capsys.readouterr().err
 
 
 def test_launch_failure_never_selects_another_billing_route(launcher, monkeypatch):
@@ -391,3 +460,19 @@ def test_launch_failure_never_selects_another_billing_route(launcher, monkeypatc
     else:
         assert result != 0
     assert attempts == ["https://api.moonshot.ai/anthropic"]
+
+
+def test_print_env_says_its_preview_assumes_an_interactive_terminal(launcher, monkeypatch, capsys):
+    monkeypatch.setenv("KIMI_CODING_API_KEY", _SECRET)
+    monkeypatch.setattr(launcher["sys"].stdin, "isatty", lambda: False)
+    assert launcher["main"](["--print-env", "kimi-k3"]) == 0
+    assert "assumes an interactive terminal launch" in capsys.readouterr().out
+
+
+def test_launch_warns_about_an_effort_cap_in_user_settings(launcher, monkeypatch, capsys):
+    settings = Path(os.environ["HOME"]) / ".claude" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_text(json.dumps({"maxEffortLevel": "low"}))
+    monkeypatch.setenv("MOONSHOT_API_KEY", _SECRET)
+    assert launcher["main"](["--print-env", "kimi-k3", "--route", "api"]) == 0
+    assert "caps effort at low" in capsys.readouterr().err

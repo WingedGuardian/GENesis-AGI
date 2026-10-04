@@ -1,147 +1,170 @@
-"""Selected billing/model pins survive discovered and supplied settings."""
+"""Launch checks for what the --settings pins cannot hold: managed settings and CLI flags."""
 import json
-import subprocess
-from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
+from genesis.cc import gmodel_routes, roster
 from genesis.cc import gmodel_settings as settings
-from genesis.cc import roster
+
+_SECRET = "selected-secret"
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "_MANAGED_DIR", tmp_path / "managed")
-    monkeypatch.setattr(settings, "_local_roots", lambda cwd: [cwd])
-    return {
-        "HOME": str(tmp_path / "home"),
-        "ANTHROPIC_MODEL": "kimi-k3[1m]",
-        "ANTHROPIC_BASE_URL": "https://api.moonshot.ai/anthropic",
-        "ANTHROPIC_AUTH_TOKEN": "selected-secret",
-        "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1048576",
-        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1048576",
-        "CLAUDE_CODE_EFFORT_LEVEL": "high",
-    }
+def selected():
+    return gmodel_routes.SelectedRoute(
+        "kimi-k3", "api", "https://api.moonshot.ai/anthropic", "MOONSHOT_API_KEY",
+        "kimi-k3[1m]", 1048576, "high",
+    )
 
 
-def write(path, value):
+@pytest.fixture
+def pins(selected):
+    return gmodel_routes.route_env_pins(selected, _SECRET)
+
+
+def managed(tmp_path, document, name="managed-settings.json"):
+    path = tmp_path / "managed" / name
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value))
+    path.write_text(json.dumps(document))
     return path
 
 
-def test_unrelated_settings_preserved(tmp_path, env):
-    write(Path(env["HOME"]) / ".claude/settings.json", {"permissions": {"allow": ["Read"]}})
-    write(tmp_path / ".claude/settings.json", {"env": {"MY_APP_KEY": "unrelated"}})
-    settings.validate_settings([], env, cwd=tmp_path)
+def check(tmp_path, selected, pins):
+    settings.validate_managed_settings(selected, pins, managed_dir=tmp_path / "managed")
 
 
-@pytest.mark.parametrize("key", sorted(settings._PROTECTED_ENV))
-def test_env_conflicts_redact_values(tmp_path, env, key):
-    path = write(tmp_path / ".claude/settings.json", {"env": {key: "leaked-secret"}})
+def test_no_managed_settings_is_clean(tmp_path, selected, pins):
+    check(tmp_path, selected, pins)
+
+
+@pytest.mark.parametrize("key", sorted(set(gmodel_routes.route_env_pins(
+    gmodel_routes.SelectedRoute("x", "api", "https://e.invalid", "K", "m", 1048576), "t"))))
+def test_managed_env_override_of_any_pin_refused_without_values(tmp_path, selected, pins, key):
+    # A value no pin accepts: non-off for switches, non-empty for empty pins.
+    value = "0" if key == "MAX_THINKING_TOKENS" or pins[key] == "1" else "1"
+    path = managed(tmp_path, {"env": {key: value}})
     with pytest.raises(roster.RosterError) as error:
-        settings.validate_settings([], env, cwd=tmp_path)
+        check(tmp_path, selected, pins)
     assert str(path) in str(error.value)
-    assert key in str(error.value)
+    assert f"env.{key}" in str(error.value)
+    assert _SECRET not in str(error.value)
+
+
+@pytest.mark.parametrize("key,value", [
+    ("CLAUDE_CODE_USE_BEDROCK", ""), ("CLAUDE_CODE_USE_BEDROCK", "0"),
+    ("DISABLE_AUTO_COMPACT", "false"), ("MAX_THINKING_TOKENS", "32000"),
+    ("ANTHROPIC_API_KEY", ""), ("ANTHROPIC_MODEL", "kimi-k3[1m]"),
+])
+def test_managed_env_agreeing_with_pin_is_clean(tmp_path, selected, pins, key, value):
+    managed(tmp_path, {"env": {key: value}})
+    check(tmp_path, selected, pins)
+
+
+def test_unrelated_managed_env_is_clean(tmp_path, selected, pins):
+    managed(tmp_path, {"env": {"MY_APP_KEY": "x"}, "permissions": {"allow": ["Read"]}})
+    check(tmp_path, selected, pins)
+
+
+@pytest.mark.parametrize("document,key", [
+    ({"availableModels": ["sonnet", "opus"]}, "availableModels"),
+    ({"availableModels": ["kimi-k"]}, "availableModels"),  # prefix-only: refused, not guessed
+    ({"availableModels": "kimi-k3"}, "availableModels"),
+    ({"deniedModels": ["kimi-k3"]}, "deniedModels"),
+    ({"fallbackModel": ["claude-sonnet-5"]}, "fallbackModel"),
+    ({"alwaysThinkingEnabled": False}, "alwaysThinkingEnabled"),
+    ({"autoCompactEnabled": False}, "autoCompactEnabled"),
+    ({"maxEffortLevel": "medium"}, "maxEffortLevel"),
+    ({"maxEffortLevel": 3}, "maxEffortLevel"),
+    ({"modelSettings": {"kimi-k3[1m]": {"maxEffortLevel": "low"}}}, "maxEffortLevel"),
+    ({"forceLoginMethod": "gateway"}, "forceLoginMethod"),
+    ({"forceLoginGatewayUrl": "https://gateway.invalid"}, "forceLoginGatewayUrl"),
+])
+def test_managed_keys_above_the_settings_layer_refused(tmp_path, selected, pins, document, key):
+    managed(tmp_path, document)
+    with pytest.raises(roster.RosterError, match=key):
+        check(tmp_path, selected, pins)
+
+
+@pytest.mark.parametrize("document", [
+    {"availableModels": ["kimi-k3[1m]"]}, {"availableModels": ["sonnet", "kimi-k3"]},
+    {"deniedModels": ["claude-opus-5-5"]}, {"fallbackModel": ["kimi-k3[1m]"]},
+    {"maxEffortLevel": "max"}, {"alwaysThinkingEnabled": True},
+    # A per-model entry replaces the file-wide cap for that model only.
+    {"maxEffortLevel": "low", "modelSettings": {"kimi-k3[1m]": {"maxEffortLevel": "max"}}},
+    {"modelSettings": {"claude-opus-5-5": {"maxEffortLevel": "low"}}},
+    {"forceLoginMethod": "claudeai"},
+    # ANTHROPIC_MODEL (pinned) outranks a managed `model` key.
+    {"model": "claude-opus-5-5"},
+])
+def test_managed_keys_compatible_with_route_are_clean(tmp_path, selected, pins, document):
+    managed(tmp_path, document)
+    check(tmp_path, selected, pins)
+
+
+def test_managed_dropins_checked_and_hidden_ignored(tmp_path, selected, pins):
+    path = managed(tmp_path, {"env": {"ANTHROPIC_BASE_URL": "https://other.invalid"}},
+                   "managed-settings.d/10-routing.json")
+    with pytest.raises(roster.RosterError, match=str(path)):
+        check(tmp_path, selected, pins)
+    path.unlink()
+    managed(tmp_path, {"env": {"ANTHROPIC_BASE_URL": "https://other.invalid"}},
+            "managed-settings.d/.hidden.json")
+    check(tmp_path, selected, pins)
+
+
+@pytest.mark.parametrize("raw", ['{"secret":"leaked-secret"', '["leaked-secret"]', "null"])
+def test_unreadable_managed_file_fails_closed_without_contents(tmp_path, selected, pins, raw):
+    path = tmp_path / "managed" / "managed-settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(raw)
+    with pytest.raises(roster.RosterError) as error:
+        check(tmp_path, selected, pins)
     assert "leaked-secret" not in str(error.value)
-    assert "selected-secret" not in str(error.value)
-
-
-def test_matching_pins_and_empty_api_key(tmp_path, env):
-    write(tmp_path / ".claude/settings.local.json", {
-        "env": {**{k: v for k, v in env.items() if k in settings._PROTECTED_ENV},
-                "ANTHROPIC_API_KEY": ""},
-        "model": env["ANTHROPIC_MODEL"], "fallbackModel": [env["ANTHROPIC_MODEL"]],
-        "effortLevel": "max",
-    })
-    settings.validate_settings(["--model", env["ANTHROPIC_MODEL"]], env, cwd=tmp_path)
 
 
 @pytest.mark.parametrize("flag", ["--model", "--fallback-model", "--effort", "--autocompact"])
 @pytest.mark.parametrize("equal", [False, True])
-def test_cli_pin_conflicts(tmp_path, env, flag, equal):
+def test_cli_pin_conflicts(selected, flag, equal):
     args = [flag + "=leaked-secret"] if equal else [flag, "leaked-secret"]
     with pytest.raises(roster.RosterError, match=flag) as error:
-        settings.validate_settings(args, env, cwd=tmp_path)
+        settings.validate_cli(args, selected)
     assert "leaked-secret" not in str(error.value)
 
 
-def test_prompt_option_values_and_separator_are_not_parsed(tmp_path, env):
-    settings.validate_settings([
+def test_matching_cli_values_accepted(selected):
+    settings.validate_cli(["--model", "kimi-k3[1m]", "--effort", "high",
+                           "--autocompact", "1048576"], selected)
+
+
+@pytest.mark.parametrize("effort", ["max", "xhigh", "medium"])
+def test_effort_must_match_exactly(selected, effort):
+    # CLAUDE_CODE_EFFORT_LEVEL is pinned and outranks --effort, so a different
+    # value would be silently ignored; `max` is not an alias of `high`.
+    with pytest.raises(roster.RosterError, match="--effort"):
+        settings.validate_cli(["--effort", effort], selected)
+
+
+@pytest.mark.parametrize("args", [
+    ["--settings", '{"env":{"ANTHROPIC_AUTH_TOKEN":"leaked-secret"}}'],
+    ["--settings=/some/file.json"], ["--bare"], ["--remote"], ["--remote", "session"],
+    ["--remote=session"], ["--cloud"], ["--teleport"],
+])
+def test_flags_that_escape_or_replace_the_pins_refused(selected, args):
+    with pytest.raises(roster.RosterError, match=args[0].split("=")[0]) as error:
+        settings.validate_cli(args, selected)
+    assert "leaked-secret" not in str(error.value)
+
+
+def test_prompt_option_values_and_separator_are_not_parsed(selected):
+    settings.validate_cli([
         "--append-system-prompt", "--model", "--system-prompt", "--settings",
-        "--", "--model", "unrelated",
-    ], env, cwd=tmp_path)
+        "--setting-sources", "user", "--", "--model", "unrelated",
+    ], selected)
 
 
-def test_setting_sources_and_custom_user_dir(tmp_path, env):
-    env["CLAUDE_CONFIG_DIR"] = str(tmp_path / "custom")
-    write(tmp_path / "custom/settings.json", {"model": "other"})
-    write(tmp_path / ".claude/settings.json", {"model": env["ANTHROPIC_MODEL"]})
-    settings.validate_settings(["--setting-sources", "project"], env, cwd=tmp_path)
-    with pytest.raises(roster.RosterError, match="custom/settings.json"):
-        settings.validate_settings(["--setting-sources=user"], env, cwd=tmp_path)
-
-
-def test_both_cwd_and_git_root_local_files_checked(tmp_path, env, monkeypatch):
-    child = tmp_path / "nested"
-    child.mkdir()
-    monkeypatch.setattr(settings, "_local_roots", lambda cwd: [cwd, tmp_path])
-    path = write(tmp_path / ".claude/settings.local.json", {"model": "other"})
-    with pytest.raises(roster.RosterError, match=str(path)):
-        settings.validate_settings([], env, cwd=child)
-    settings.validate_settings(["--setting-sources", "project"], env, cwd=child)
-
-
-def test_managed_dropin_always_checked(tmp_path, env):
-    path = write(tmp_path / "managed/managed-settings.d/10-routing.json", {"model": "other"})
-    with pytest.raises(roster.RosterError, match=str(path)):
-        settings.validate_settings(["--setting-sources", ""], env, cwd=tmp_path)
-    path.unlink()
-    write(tmp_path / "managed/managed-settings.d/.hidden.json", {"model": "other"})
-    settings.validate_settings([], env, cwd=tmp_path)
-
-
-@pytest.mark.parametrize("inline", [False, True])
-def test_supplied_settings_even_when_sources_disabled(tmp_path, env, inline):
-    doc = {"env": {"CLAUDE_CODE_OAUTH_TOKEN": "leaked-secret"}}
-    value = json.dumps(doc) if inline else str(write(tmp_path / "supplied.json", doc))
-    with pytest.raises(roster.RosterError, match="CLAUDE_CODE_OAUTH_TOKEN") as error:
-        settings.validate_settings(["--setting-sources", "", "--settings", value], env, cwd=tmp_path)
-    assert "leaked-secret" not in str(error.value)
-
-
-def test_bad_json_does_not_leak_decoder_content(tmp_path, env):
-    with pytest.raises(roster.RosterError, match="inline --settings") as error:
-        settings.validate_settings(["--settings", '{"secret":"leaked-secret"'], env, cwd=tmp_path)
-    assert "leaked-secret" not in str(error.value)
-
-
-def test_inline_array_error_does_not_print_contents(tmp_path, env):
-    with pytest.raises(roster.RosterError, match="inline --settings") as error:
-        settings.validate_settings(["--settings", '["leaked-secret"]'], env, cwd=tmp_path)
-    assert "leaked-secret" not in str(error.value)
-
-
-@pytest.mark.parametrize("doc", [None, ["other"], {"env": []}, {"fallbackModel": ["other"]}])
-def test_invalid_objects_and_fallback_pins(tmp_path, env, doc):
-    write(tmp_path / ".claude/settings.json", doc)
+def test_missing_option_value_refused(selected):
     with pytest.raises(roster.RosterError):
-        settings.validate_settings([], env, cwd=tmp_path)
-
-
-def test_missing_supplied_file_and_bad_sources(tmp_path, env):
-    for args in (["--settings", "missing.json"], ["--setting-sources", "other"], ["--model"]):
-        with pytest.raises(roster.RosterError):
-            settings.validate_settings(args, env, cwd=tmp_path)
-
-
-def test_git_root_discovery_uses_main_checkout(monkeypatch, tmp_path):
-    main = tmp_path / "main"
-    work = tmp_path / "linked"
-    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: SimpleNamespace(
-        returncode=0, stdout=f"{work}\n{main / '.git'}\n"))
-    assert settings._local_roots(work) == [work, main]
+        settings.validate_cli(["--model"], selected)
 
 
 @pytest.mark.parametrize("args, expected", [
@@ -162,44 +185,29 @@ def test_extract_route_rejects_missing_or_duplicate(args):
         settings.extract_route(args)
 
 
-def test_restricted_skips_discovered_settings_not_supplied(tmp_path, env):
-    write(tmp_path / ".claude/settings.json", {"model": "other"})
-    settings.validate_settings(["--restricted"], env, cwd=tmp_path)
-    with pytest.raises(roster.RosterError):
-        settings.validate_settings(["--restricted", "--settings", '{"model":"other"}'],
-                                   env, cwd=tmp_path)
+def _write(path, document):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document))
 
 
-def test_disabled_thinking_refused(tmp_path, env):
-    with pytest.raises(roster.RosterError, match="alwaysThinkingEnabled"):
-        settings.validate_settings(["--settings", '{"alwaysThinkingEnabled":false}'], env, cwd=tmp_path)
-    with pytest.raises(roster.RosterError, match="env.MAX_THINKING_TOKENS"):
-        settings.validate_settings(["--settings", '{"env":{"MAX_THINKING_TOKENS":"0"}}'],
-                                   env, cwd=tmp_path)
-    env["MAX_THINKING_TOKENS"] = "0"
-    with pytest.raises(roster.RosterError, match="MAX_THINKING_TOKENS"):
-        settings.validate_settings([], env, cwd=tmp_path)
+def test_effort_cap_in_any_settings_file_is_reported_not_refused(tmp_path, selected):
+    home = tmp_path / "home"
+    _write(home / ".claude" / "settings.json", {"maxEffortLevel": "medium"})
+    _write(tmp_path / "proj" / ".claude" / "settings.local.json",
+           {"modelSettings": {"kimi-k3[1m]": {"maxEffortLevel": "low"}}})
+    _write(tmp_path / "proj" / ".claude" / "settings.json", {"maxEffortLevel": "max"})
+    warnings = settings.effort_cap_warnings(selected, cwd=tmp_path / "proj", environ={"HOME": str(home)})
+    assert len(warnings) == 2
+    assert any("settings.json caps effort at medium" in w for w in warnings)
+    assert any("settings.local.json caps effort at low" in w for w in warnings)
 
 
-@pytest.mark.parametrize("args", [["--remote"], ["--remote", "session"], ["--remote=session"]])
-def test_deprecated_cloud_alias_refused(tmp_path, env, args):
-    with pytest.raises(roster.RosterError, match="--remote"):
-        settings.validate_settings(args, env, cwd=tmp_path)
-
-
-@pytest.mark.parametrize("source", ["environment", "settings"])
-@pytest.mark.parametrize("value", ["1", "true", "0", "false", "off", ""])
-def test_simple_mode_auth_sources(tmp_path, env, source, value):
-    args = []
-    if source == "environment":
-        env["CLAUDE_CODE_SIMPLE"] = value
-    else:
-        args = ["--settings", json.dumps({"env": {"CLAUDE_CODE_SIMPLE": value}})]
-    if value in {"1", "true"}:
-        with pytest.raises(roster.RosterError, match="CLAUDE_CODE_SIMPLE"):
-            settings.validate_settings(args, env, cwd=tmp_path)
-    else:
-        settings.validate_settings(args, env, cwd=tmp_path)
-    env.pop("ANTHROPIC_AUTH_TOKEN")
-    env["ANTHROPIC_API_KEY"] = "selected-secret"
-    settings.validate_settings(args, env, cwd=tmp_path)
+def test_effort_cap_reader_honours_config_dir_and_skips_unreadable(tmp_path, selected):
+    config = tmp_path / "custom"
+    _write(config / "settings.json", {"maxEffortLevel": "low"})
+    (tmp_path / "proj" / ".claude").mkdir(parents=True)
+    (tmp_path / "proj" / ".claude" / "settings.json").write_text("{broken")
+    warnings = settings.effort_cap_warnings(
+        selected, cwd=tmp_path / "proj",
+        environ={"HOME": str(tmp_path / "home"), "CLAUDE_CONFIG_DIR": str(config)})
+    assert warnings == [f"{config / 'settings.json'} caps effort at low; this route asks for high"]
