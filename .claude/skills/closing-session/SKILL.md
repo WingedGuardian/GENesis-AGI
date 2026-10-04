@@ -177,11 +177,13 @@ After it exits 0, compare it with the PR head before working:
 ```bash
 git -C <path> fetch origin "pull/<N>/head"
 git -C <path> rev-list --left-right --count FETCH_HEAD...HEAD
+git -C <path> status --short
 ```
 
-A non-zero right-hand count is the build session's unpushed work: stop and
-surface it to the owner. A non-zero left-hand count means the PR moved on:
-`git -C <path> merge --ff-only FETCH_HEAD`.
+A non-zero right-hand count is the build session's unpushed commits, and any
+`status` output is its uncommitted work, which the recovery restores as it was.
+Either way, stop and surface it to the owner. Otherwise, a non-zero left-hand
+count means the PR moved on: `git -C <path> merge --ff-only FETCH_HEAD`.
 
 This is foreground work. A dispatched session cannot push, so it does not start
 a recovery; it skips the PR and names it in its report.
@@ -565,9 +567,10 @@ not assume the absence of a recorded dependency means there is none.
 
 **When the owner splits a PR**, the split-off half opens as a REGULAR PR against
 main, never with `--draft`. Opening it is the owner's call, not this session's,
-because a closing session does not open new work on its own. The merge gate
-merges only into the default branch, so it targets main, and its diff includes
-the parent's changes. This repo merges by squash only, so the inherited changes
+because a closing session does not open new work on its own. It targets main
+by policy: a deliberately stacked PR is possible, but it merges only with
+`# stale-review-override` (the `base-branch` row above). Its diff includes the
+parent's changes. This repo merges by squash only, so the inherited changes
 stay in the diff even after the parent merges, until the child is updated from
 main. Reviewers will post findings on those inherited lines, and the gate scores
 them. Reply in-thread to each, pointing to the parent PR; a maintainer reply takes
