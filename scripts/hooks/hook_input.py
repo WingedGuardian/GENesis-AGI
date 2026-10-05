@@ -112,6 +112,14 @@ def tool_response(payload: dict) -> dict:
         resp = payload.get("tool_response")
         if isinstance(resp, dict):
             return resp
+        # MCP tools deliver their result as a JSON STRING, not an object
+        # (measured: the session observer's json.dumps of a genesis-health
+        # result is a quoted string). Reading only dicts made every
+        # MCP-triggered PostToolUse hook see {} and never fire.
+        if isinstance(resp, str):
+            parsed = _loads(resp)
+            if parsed:
+                return parsed
     return _loads(os.environ.get(_LEGACY_RESULT_ENV, ""))
 
 
