@@ -496,3 +496,28 @@ def test_20_report_and_merge_arm_agree(monkeypatch, capsys, acks, report_state, 
     row = next(ln for ln in out.splitlines() if ln.startswith("rework"))
     assert row.startswith("rework         : " + report_state), row
     assert (report_rc != 0) == (merge_rc != 0), out
+
+
+def test_21_a_value_written_under_its_field_counts():
+    """A bullet list under `Deviations:` is a value, not an empty field."""
+    section = (
+        "## Rework\nReplaces: #10\nSplit: PR 1 of 2\nDeviations:\n"
+        "- the slice check moved to enable, because the CLI owns the unit lifecycle\n"
+        "Questions answered:\n  - none were delegated\n"
+    )
+    assert G._rework_section_problems(section) == []
+
+
+def test_21b_a_field_followed_directly_by_the_next_field_is_still_empty():
+    section = "## Rework\nReplaces: #10\nSplit: x\nDeviations:\n\nQuestions answered: y\n"
+    assert G._rework_section_problems(section) == ["the `## Rework` section's `Deviations:` line is empty"]
+
+
+def test_22_a_heading_with_trailing_text_is_the_section():
+    section = _SECTION.replace("## Rework\n", "## Rework (replaces #10)\n")
+    assert G._rework_section_problems(section) == []
+
+
+def test_22b_the_acknowledgement_heading_is_not_the_section():
+    body = "## Rework acknowledgement\nReplaces: #10\nSplit: x\nDeviations: none\nQuestions answered: y\n"
+    assert G._rework_section_problems(body) == ["the PR body has no `## Rework` heading"]

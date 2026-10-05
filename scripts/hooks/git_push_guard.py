@@ -10056,7 +10056,11 @@ _REWORK_DECL_RE = re.compile(
     re.IGNORECASE,
 )
 _REWORK_REF_RE = re.compile(_REWORK_REF)
-_REWORK_HEADING_RE = re.compile(r"^\s{0,3}##[ \t]+rework[ \t]*#*[ \t]*$", re.IGNORECASE)
+#: `## Rework`, optionally followed by text (`## Rework (replaces #10)`), but never
+#: the acknowledgement heading, which belongs on the OLD PR.
+_REWORK_HEADING_RE = re.compile(
+    r"^\s{0,3}##[ \t]+rework\b(?![ \t]*acknowledg)[^\n]*$", re.IGNORECASE
+)
 _REWORK_SECTION_END_RE = re.compile(r"^\s{0,3}#{1,2}[ \t]")
 _REWORK_FIELD_RE = re.compile(
     r"^\s*(?:[-*+]\s+)?(?:\*\*|__)?(" + "|".join(_REWORK_FIELDS) + r")(?:\*\*|__)?\s*:"
@@ -10106,15 +10110,19 @@ def _rework_section_problems(body: str) -> list[str]:
     if start is None:
         return ["the PR body has no `## Rework` heading"]
     found: dict[str, bool] = {}
+    current: str | None = None
     for ln in lines[start + 1 :]:
         if _REWORK_SECTION_END_RE.match(ln):
             break
         m = _REWORK_FIELD_RE.match(ln)
         if not m:
+            # A value written under its field (a bullet list) belongs to that field.
+            if current is not None and ln.strip().strip("*_-+").strip():
+                found[current] = True
             continue
-        name = next(f for f in _REWORK_FIELDS if f.lower() == m.group(1).lower())
+        current = next(f for f in _REWORK_FIELDS if f.lower() == m.group(1).lower())
         value = (m.group(2) or "").strip().strip("*_").strip()
-        found[name] = found.get(name, False) or bool(value)
+        found[current] = found.get(current, False) or bool(value)
     problems = []
     for name in _REWORK_FIELDS:
         if name not in found:
