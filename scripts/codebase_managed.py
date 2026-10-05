@@ -352,13 +352,16 @@ def ready(config: dict) -> None:
         while time.monotonic() < deadline:
             try:
                 pid = check_backend(config, starting=True)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 response = subprocess.run(
                     [f"/proc/self/fd/{executable.fileno()}", "daemon", "status"],
                     env=native_env(config),
                     pass_fds=(executable.fileno(),),
                     capture_output=True,
                     text=True,
-                    timeout=3,
+                    timeout=remaining,
                 )
                 if (
                     response.returncode == 0

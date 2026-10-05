@@ -1124,8 +1124,8 @@ jobs:
         # 36 cases (0 -> 36). Two native-binary opt-ins skip without the explicit
         # acceptance binary; confirm the skip delta from the hosted junit report.
         # Floor: 24421 + 36 = 24457.
-        # Native CBM runtime/templates: new runtime file 22 and template file 26
+        # Native CBM runtime/templates: new runtime file 24 and template file 26
         # cases, plus template-placeholders 13 -> 14 (+1 hosted slice inventory).
-        # Other edited files retain counts. Floor: 24457 + 49 = 24506;
+        # Other edited files retain counts. Floor: 24457 + 51 = 24508;
         # no new skip sites.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 24506
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 24508
