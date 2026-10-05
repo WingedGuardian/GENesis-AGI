@@ -1112,8 +1112,7 @@ jobs:
         # Floor: 24153 +92 =24245; skip ceiling remains 102.
         # NVIDIA provider health: new test_provider_health_probes.py collects
         # 87 tests (0 -> 87); no added skips. Floor: 24245 + 87 = 24332.
-        # External-IO provider coverage: test_check_external_io.py grows
-        # 5 -> 8 (planted provider reference, allowlisted-provider control,
-        # allowlist-liveness check) — measured with --collect-only after the
-        # last edit; no added skips. Floor: 24332 + 3 = 24335.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24335
+        # External-I/O census and credential isolation collect 22 and 6 tests,
+        # respectively. The census file was 5 on main; measured with --collect-only.
+        # Floor: 24332 + (22 - 5) + 6 = 24355.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24355

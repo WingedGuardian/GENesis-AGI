@@ -18,6 +18,7 @@ from flask import jsonify, request
 
 from genesis.dashboard._blueprint import blueprint
 from genesis.dashboard.auth import has_verified_credential
+from genesis.env import CREDENTIAL_NAME_RE as _SENSITIVE_RE
 from genesis.env import bearer_token, repo_root, secrets_path
 
 logger = logging.getLogger(__name__)
@@ -46,9 +47,6 @@ _SIGNUP_RE = re.compile(r"^#\s*Signup:\s*(.+)", re.IGNORECASE)
 _KEY_RE = re.compile(r"^([A-Z][A-Z0-9_]+)=")
 # A key the template ships commented out — still registered, just unset.
 _COMMENTED_KEY_RE = re.compile(r"^#\s*([A-Z][A-Z0-9_]+)=")
-# Note: ``_PASS`` covers NAS/SMB passwords (GENESIS_BACKUP_NAS_PASS) and any
-# *_PASSWORD key; it also subsumes _PASSPHRASE but that is kept for clarity.
-_SENSITIVE_RE = re.compile(r"API_KEY_|_API_KEY|_TOKEN|_PASSPHRASE|_PASS|FIRECRAWL_API")
 
 
 def _parse_example_file() -> list[SecretKeyDef]:

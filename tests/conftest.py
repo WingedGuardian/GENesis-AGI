@@ -40,9 +40,26 @@ if _WORKTREE_SRC.is_dir():
 
 import contextlib  # noqa: E402
 import os  # noqa: E402
+import tempfile  # noqa: E402
 
 import aiosqlite  # noqa: E402
 import pytest  # noqa: E402
+
+_NO_SECRETS_PATH = str(
+    Path(tempfile.gettempdir()) / f"genesis-tests-no-secrets-{os.getpid()}" / "secrets.env"
+)
+_PINNED_CREDENTIALS: frozenset[str] = frozenset()
+
+
+def _pin_credentials() -> None:
+    global _PINNED_CREDENTIALS
+    from genesis.env import credential_env_names
+
+    _PINNED_CREDENTIALS = credential_env_names()
+    for name in _PINNED_CREDENTIALS:
+        os.environ[name] = ""
+    os.environ["SECRETS_PATH"] = _NO_SECRETS_PATH
+
 
 # ── Safety: prevent os.killpg(1, ...) from killing all processes ─────────
 _real_killpg = os.killpg
@@ -380,6 +397,8 @@ def _is_introspection_only(config) -> bool:
 
 
 def pytest_configure(config):
+    # Before lock and collection: three hook scripts call load_dotenv at import time.
+    _pin_credentials()
     # ── Box-wide serialization ─────────────────────────────────────────────
     # Acquire BEFORE anything else, and before the basetemp early-return
     # below, so every exit path from this function is already governed.
@@ -496,6 +515,27 @@ def pytest_unconfigure(config):
         lock = getattr(config, "_genesis_pytest_lock", None)
         if lock is not None:
             lock.release()
+
+
+# ── Safety: keep Genesis credentials out of tests ──
+@pytest.fixture(autouse=True)
+def _isolate_credentials():
+    """Keep Genesis credentials keyless in tests and inherited child processes.
+
+    Pin to ``""`` rather than deleting: python-dotenv ``override=False`` and
+    the ``setdefault`` loaders skip an existing key, so fixed-path loaders in
+    this process and children inheriting ``os.environ`` stay keyless.
+    ``SECRETS_PATH`` closes every ``override=True`` loader because they all
+    resolve through ``secrets_path()``. Children launched with a hand-built
+    ``env={...}`` do not inherit the pin. A test's own ``monkeypatch.setenv``
+    still wins; there is no opt-out flag.
+    """
+    mp = pytest.MonkeyPatch()
+    for name in _PINNED_CREDENTIALS:
+        mp.setenv(name, "")
+    mp.setenv("SECRETS_PATH", _NO_SECRETS_PATH)
+    yield
+    mp.undo()
 
 
 # ── Safety: prevent tests from polluting production circuit breaker state ──

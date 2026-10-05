@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -28,6 +29,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _DEFAULT_QDRANT_URL = "http://localhost:6333"
 _DEFAULT_OLLAMA_URL = "http://localhost:11434"
 _DEFAULT_LM_STUDIO_URL = "http://localhost:1234/v1"
+# Note: ``_PASS`` covers NAS/SMB passwords (GENESIS_BACKUP_NAS_PASS) and any
+# *_PASSWORD key; it also subsumes _PASSPHRASE but that is kept for clarity.
+CREDENTIAL_NAME_RE = re.compile(r"API_KEY_|_API_KEY|_TOKEN|_PASSPHRASE|_PASS|FIRECRAWL_API")
 
 # ---------------------------------------------------------------------------
 # Local config overlay — ~/.genesis/config/genesis.yaml
@@ -167,6 +171,18 @@ def _local_section(name: str) -> dict:
 def repo_root() -> Path:
     value = os.environ.get("GENESIS_REPO_ROOT")
     return Path(value).expanduser() if value else _REPO_ROOT
+
+
+def credential_env_names(example: Path | None = None) -> frozenset[str]:
+    """Return the single source of truth for which env names are credentials."""
+    names = {name for name in os.environ if CREDENTIAL_NAME_RE.search(name)}
+    example_path = example if example is not None else repo_root() / "secrets.env.example"
+    if example_path.is_file():
+        for line in example_path.read_text(encoding="utf-8").splitlines():
+            match = re.match(r"^#?\s*([A-Z][A-Z0-9_]*)=", line)
+            if match and CREDENTIAL_NAME_RE.search(match.group(1)):
+                names.add(match.group(1))
+    return frozenset(names)
 
 
 def venv_path() -> Path:
