@@ -593,6 +593,16 @@
                 ]
             },
             {
+                "matcher": "^Bash$",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/main_checkout_guard.py",
+                        "timeout": 30
+                    }
+                ]
+            },
+            {
                 "matcher": "WebFetch|mcp__genesis-health__browser_.*",
                 "hooks": [
                     {
@@ -638,6 +648,18 @@
                         "type": "command",
                         "command": "bash ${CLAUDE_PROJECT_DIR}/scripts/hooks/session_activity_touch.sh",
                         "timeout": 10
+                    }
+                ]
+            }
+        ],
+        "PostToolUseFailure": [
+            {
+                "matcher": "^Bash$",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/main_checkout_guard.py",
+                        "timeout": 30
                     }
                 ]
             }

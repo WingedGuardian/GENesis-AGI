@@ -1388,16 +1388,10 @@ _ADVISORY_BY_DESIGN = {
     "hooks/pr_close_advisory.py": "Say so; never block it.",
     "hooks/pre_push_privacy_review.py": "NON-BLOCKING.",
     "hooks/tmux_kill_server_guard.py": "which is exactly why this is ADVISORY, never a block",
-    # Not advisory: it DOES block, but only on a measured tracked file in the
-    # primary checkout, and by its owner-approved design every can't-evaluate
-    # state (a broken sibling included) allows with a note. It protects review
-    # discipline, not data, and the repair path for a broken hook tree must
-    # never run through it. Listed here because this table is what "does not
-    # block when degraded" means to the gate below.
-    "hooks/main_checkout_guard.py": (
-        "This guard fails OPEN: it blocks only on a MEASURED tracked file in the "
-        "primary checkout, and allows anything it cannot evaluate."
-    ),
+    # On Bash it is advisory outright: it snapshots before the call and reports
+    # after it, and never exits 2. (Its file-tool half does block, on a matcher
+    # this table does not cover.)
+    "hooks/main_checkout_guard.py": "BASH — DETECTED AFTER THE FACT, NEVER BLOCKED.",
     "procedure_advisor.py": "surfaces relevant procedures as advisory context.",
 }
 

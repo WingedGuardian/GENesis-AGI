@@ -284,15 +284,27 @@ def test_cc_span_settings_registers_the_main_checkout_guard(monkeypatch, tmp_pat
     monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", out)
 
     inv_mod.cc_span_settings_path()
-    entries = json.loads(out.read_text())["hooks"]["PreToolUse"]
+    hooks = json.loads(out.read_text())["hooks"]
+    entries = hooks["PreToolUse"]
     assert shlex.split(entries[0]["hooks"][0]["command"])[1] == inv_mod._ALLOWLIST_GUARD_SCRIPT
-    guard = {
-        e["matcher"]: e["hooks"][0]
-        for e in entries
-        if shlex.split(e["hooks"][0]["command"])[1:] == ["hooks/main_checkout_guard.py"]
-    }
+
+    def guard_entries(event):
+        return {
+            e["matcher"]: e["hooks"][0]
+            for e in hooks.get(event, [])
+            if shlex.split(e["hooks"][0]["command"])[1:] == ["hooks/main_checkout_guard.py"]
+        }
+
+    guard = guard_entries("PreToolUse")
     assert set(guard) == {"^Bash$", "^(Write|Edit|MultiEdit|NotebookEdit)$"}
-    for h in guard.values():
+    # The Bash half compares AFTER the call: a command that exits 0 ends in
+    # PostToolUse, one that fails in PostToolUseFailure, so both are wired.
+    post = guard_entries("PostToolUse")
+    failure = guard_entries("PostToolUseFailure")
+    assert set(post) == {"^Bash$"} and set(failure) == {"^Bash$"}
+    # cc_span_hook keeps index 0 of PostToolUse, which other tests pin.
+    assert "cc_span_hook.py" in hooks["PostToolUse"][0]["hooks"][0]["command"]
+    for h in [*guard.values(), *post.values(), *failure.values()]:
         assert shlex.split(h["command"])[0] == str(hook)
         assert h["timeout"] >= 10
     # Anchored: each fires on its own tools and not on a longer name (BashOutput).

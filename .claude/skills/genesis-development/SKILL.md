@@ -3467,21 +3467,31 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   daily timer and never deletes them (archive retention is off, #2504). Leave a dead worktree alone.
 - **Editing a tracked git hook blocks the commit** until its hash is re-recorded
   (`scripts/update_hook_versions.sh`).
-- **The primary checkout is the deployed install, and a guard refuses edits to
-  it.** `scripts/hooks/main_checkout_guard.py` (PreToolUse on
-  Write/Edit/MultiEdit/NotebookEdit and Bash, foreground and dispatched alike)
-  exits 2 when a call would change a TRACKED file in the primary checkout its own
-  script lives in: a file tool, a `cp`/`mv`/`install` destination (or an `mv`
-  source), or `git checkout <ref> -- <paths>` / `git restore --source=<ref>`.
-  Make the change in a worktree from `origin/main` and open a PR. Untracked files,
-  linked worktrees, other repositories, the deploy scripts' `EPHEMERAL_DIRTY_RE`
-  paths, and discarding an edit back to HEAD or the index stay open, the last
-  because it is the repair path for a dirty deploy root. It fails OPEN by design:
-  an unparseable command, an unknown cwd, a `cp`/`mv` option it does not model
-  (`-n`, `--parents`, …) or an internal error is allowed, with a note only when
-  the guarded checkout may be involved. The dashboard update pipeline's sessions carry `GENESIS_UPDATE_TIER` and
-  are allowed. Off-switches belong to the owner: `GENESIS_MAIN_CHECKOUT_GUARD=0`
-  or the `main_checkout_guard` settings domain.
+- **The primary checkout is the deployed install; a guard keeps hand edits out
+  of it — two different ways.** `scripts/hooks/main_checkout_guard.py`
+  (foreground and dispatched alike) REFUSES a Write/Edit/MultiEdit/NotebookEdit of
+  a TRACKED file in the primary checkout its own script lives in. Bash it never
+  refuses: it snapshots the deploy root's tracked state before the command
+  (PreToolUse, keyed by `tool_use_id`) and compares after it (PostToolUse and
+  PostToolUseFailure), and if a tracked file newly differs, an already-dirty one
+  changed again, or HEAD moved, the session gets an advisory naming the files —
+  with a restore command only when the call was aimed at the deploy root (its
+  cwd, or the root's path in the command) and no merge is in progress, and never
+  an instruction to move HEAD. An earlier version predicted what a shell command would
+  write from its own model of cp/mv/install, the shell and git; an audit measured
+  that model wrong in both directions, so it was removed rather than patched — the
+  "could a flag you've never heard of change the verdict?" test above, applied.
+  The Bash check reports after the fact: it prevents nothing, a file written and
+  run by the same command has already run, and anything else that changed the
+  deploy root during the command (a concurrent deploy) is reported too. Make the
+  change in a worktree from `origin/main` and open a PR; if the advisory fires,
+  restore the deploy root with the command it names. Untracked files, linked
+  worktrees, other repositories and the deploy scripts' `EPHEMERAL_DIRTY_RE`
+  paths are never reported. Sessions carrying `GENESIS_UPDATE_TIER=1` (exactly)
+  — the dashboard update pipeline's — are exempt. Off-switches belong to the
+  owner: `GENESIS_MAIN_CHECKOUT_GUARD=0`, or the `main_checkout_guard` settings
+  domain, whose overlay is read only from `${GENESIS_HOME:-~/.genesis}/config/`,
+  never from the checkout.
 - **⚠ `scripts/hooks/*` is NOT synced — and a WORKTREE edit is still not live.**
   `sync-hooks.sh` copies only the five GIT hooks (`commit-msg`, `post-commit`,
   `pre-commit`, `prepare-commit-msg`, `pre-push`) plus one helper into

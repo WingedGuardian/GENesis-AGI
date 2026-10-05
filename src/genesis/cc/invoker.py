@@ -386,9 +386,26 @@ _CC_SPAN_SETTINGS_PATH = Path.home() / ".genesis" / "cc-span-settings.json"
 # and the pre-launch checks that verify it cannot drift apart.
 _ALLOWLIST_GUARD_SCRIPT = "hooks/bash_allowlist_guard.sh"
 
-# The guard that refuses a change to a tracked file in the install's primary
-# checkout; registered for dispatched sessions by cc_span_settings_path.
+# The guard that keeps hand edits out of the install's primary checkout (it blocks
+# the file tools and reports Bash changes after the fact); registered for
+# dispatched sessions by cc_span_settings_path.
 _MAIN_CHECKOUT_GUARD_SCRIPT = "hooks/main_checkout_guard.py"
+
+
+def _main_checkout_guard_entry(genesis_hook: Path, matcher: str) -> dict[str, object]:
+    """One hook entry running the main-checkout guard on ``matcher``. 30s: a killed
+    PreToolUse hook lets the call proceed, and the guard stops its own git queries
+    at 20s so it can say so; the same bound serves its after-the-fact Bash check."""
+    return {
+        "matcher": matcher,
+        "hooks": [
+            {
+                "type": "command",
+                "command": shlex.join([str(genesis_hook), _MAIN_CHECKOUT_GUARD_SCRIPT]),
+                "timeout": 30,
+            },
+        ],
+    }
 
 
 # A sealed `gh` configuration for allowlisted sessions. Shared rather than
@@ -1684,17 +1701,22 @@ def cc_span_settings_path(env_pins: dict[str, str] | None = None) -> str | None:
       The no-op is cheap but not free: MEASURED ~30ms per Bash call on a live
       install, spent in the launcher rather than the guard, and paid by EVERY
       dispatched session rather than only scoped ones.
-    * ``main_checkout_guard`` (PreToolUse on Bash and on
-      Write/Edit/MultiEdit/NotebookEdit) refuses a change to a TRACKED file in
-      the install's primary checkout — the deploy root — and allows everything
-      else. A dispatched session's cwd is outside any repo, so the repo-level
-      registration of this guard never loads there; without this entry a
-      background session could hand-edit the deployed install unseen. Its
-      off-switches are ``GENESIS_MAIN_CHECKOUT_GUARD=0`` and the
-      ``main_checkout_guard`` settings domain, read by the guard itself, so the
-      registration stays unconditional. A dispatch whose cwd IS a checkout also
-      loads the repo registration, so the guard can run twice there; it only
-      reads, so the second run returns the same verdict.
+    * ``main_checkout_guard`` keeps hand edits out of the install's primary
+      checkout — the deploy root. PreToolUse on Write/Edit/MultiEdit/NotebookEdit
+      REFUSES a change to a tracked file there. On Bash it never refuses:
+      PreToolUse records a snapshot of the deploy root's tracked state keyed by
+      the call's ``tool_use_id``, and PostToolUse plus PostToolUseFailure (an
+      erroring call ends in the latter) compare against it and
+      tell the session what changed and how to restore it. A dispatched
+      session's cwd is outside any repo, so the repo-level registration never
+      loads there; without these entries a background session could hand-edit
+      the deployed install unseen. Its off-switches are
+      ``GENESIS_MAIN_CHECKOUT_GUARD=0`` and the ``main_checkout_guard`` settings
+      domain, read by the guard itself, so the registration stays
+      unconditional. A dispatch whose cwd IS a checkout also loads the repo
+      registration, so the guard can run twice there: the file-tool check only
+      reads, the pre snapshot is rewritten atomically, and the post check claims
+      the snapshot by rename, so only one of two post runs reports.
 
     MEASURED 2026-09-23 on CC 2.1.246, from a dispatch-shaped invocation (cwd
     outside any repo, ``--dangerously-skip-permissions``): a PreToolUse Bash
@@ -1761,21 +1783,8 @@ def cc_span_settings_path(env_pins: dict[str, str] | None = None) -> str | None:
                 # After the allowlist entry, never ahead of it: the pre-launch
                 # binding check matches that entry by content, and the tests pin
                 # it at index 0. Anchored matchers for the reason given above.
-                # 30s: a killed PreToolUse hook lets the call proceed, and the
-                # guard stops its own git queries at 20s so it can say so.
                 *(
-                    {
-                        "matcher": matcher,
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": shlex.join(
-                                    [str(genesis_hook), _MAIN_CHECKOUT_GUARD_SCRIPT]
-                                ),
-                                "timeout": 30,
-                            },
-                        ],
-                    }
+                    _main_checkout_guard_entry(genesis_hook, matcher)
                     for matcher in ("^Bash$", "^(Write|Edit|MultiEdit|NotebookEdit)$")
                 ),
             ],
@@ -1790,7 +1799,14 @@ def cc_span_settings_path(env_pins: dict[str, str] | None = None) -> str | None:
                         },
                     ],
                 },
+                _main_checkout_guard_entry(genesis_hook, "^Bash$"),
             ],
+            # A tool call that errors ends in PostToolUseFailure, not PostToolUse
+            # (READ from the CC 2.1.280 bundle, which defines both events with a
+            # tool_use_id). Which one a non-zero Bash exit reaches was not
+            # measured, so the guard's after-the-fact check is wired on both;
+            # whichever fires claims the snapshot.
+            "PostToolUseFailure": [_main_checkout_guard_entry(genesis_hook, "^Bash$")],
         },
     }
     path = _CC_SPAN_SETTINGS_PATH

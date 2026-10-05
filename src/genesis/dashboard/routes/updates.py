@@ -605,7 +605,8 @@ def _spawn_detached_cc(
 #: spawn_cc, Tier 3 via _spawn_detached_cc). Those sessions run with cwd = the
 #: main checkout and are told to resolve the update's merge there, which is the
 #: one legitimate hand-edit of the deploy root; scripts/hooks/main_checkout_guard.py
-#: allows a session carrying this variable and refuses everyone else.
+#: exempts a session carrying exactly "1" (it refuses everyone else's file-tool
+#: edits there and reports their Bash changes).
 UPDATE_TIER_ENV = "GENESIS_UPDATE_TIER"
 
 

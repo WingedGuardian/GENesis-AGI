@@ -394,19 +394,19 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
     "main_checkout_guard": SettingsDomain(
         name="main_checkout_guard",
         description=(
-            "Main-checkout guard — master `enabled` (default true). A PreToolUse hook "
-            "that REFUSES a Claude Code session's change to a TRACKED file in this "
-            "install's primary checkout (the deploy root hooks, scripts and the server "
-            "run from): Write/Edit/MultiEdit/NotebookEdit, and from Bash the "
-            "destinations of cp/mv/install plus `git checkout <ref> -- <paths>` / "
-            "`git restore --source=<ref>`. Untracked files, linked worktrees, other "
-            "repositories, the deploy scripts' known-ephemeral paths, discarding an "
-            "edit back to HEAD, and the dashboard update pipeline's sessions are "
-            "allowed; anything it cannot evaluate is allowed with a note. Applies to "
-            "foreground and dispatched sessions alike. Only `enabled: false` turns it "
-            "off; an invalid value keeps it ON. Read live per tool call — takes effect "
-            "immediately, no restart. Env kill switch GENESIS_MAIN_CHECKOUT_GUARD=0 "
-            "forces off."
+            "Main-checkout guard — master `enabled` (default true). Keeps a Claude "
+            "Code session's hand edits out of this install's primary checkout (the "
+            "deploy root hooks, scripts and the server run from). REFUSES a "
+            "Write/Edit/MultiEdit/NotebookEdit of a TRACKED file there. Never refuses "
+            "Bash: it snapshots the deploy root before each command and, after it, "
+            "tells the session which tracked files changed (or that HEAD moved) and "
+            "how to restore them. Untracked files, linked worktrees, other "
+            "repositories, the deploy scripts' known-ephemeral paths and the dashboard "
+            "update pipeline's sessions are left alone; anything it cannot evaluate is "
+            "allowed. Applies to foreground and dispatched sessions alike. Only "
+            "`enabled: false` turns it off; an invalid value keeps it ON. Read live "
+            "per tool call — takes effect immediately, no restart. Env kill switch "
+            "GENESIS_MAIN_CHECKOUT_GUARD=0 forces off."
         ),
         config_filename="main_checkout_guard.yaml",
         readonly=False,
