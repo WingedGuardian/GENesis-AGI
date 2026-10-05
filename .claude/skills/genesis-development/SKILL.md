@@ -102,7 +102,11 @@ is never abandoned in that state.
 CI and external review that run after opening, and verification explicitly
 required after merge, remain their normal gates; waiting for those is not a
 reason to use draft mode. Distinguish a blocker to entering review from a check
-that review or merge will subsequently require.
+that review or merge will subsequently require. Open review findings, and a
+dependency on another open PR named in the body, are of the second kind. A PR
+sent BACK for rework or for an architecture decision is of the first kind,
+because review stops until the rework lands (closing-session, "Sending a PR
+back").
 
 ### Wiring Discipline
 
@@ -2549,7 +2553,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   the problem disappears). Emit the `Design-premise:` block. Also informational,
   and its BROKEN verdict has a HIGH bar: it routes to the EXISTING
   premise-wrong disposition (architecture conversation, or
-  `needs-architecture-session` + a `ready` row) rather than to another round, so everything short of "the change cannot do what it
+  `needs-architecture-session` + draft + a `ready` row) rather than to another round, so everything short of "the change cannot do what it
   says" is SOUND-BUT-INFERIOR with the better shape named. Render a
   better-shape finding on the severity ladder too (normally SHOULD-FIX), or it
   is invisible to every surface that scores findings.
@@ -2888,7 +2892,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      obedience — STOP, post the round ledger (round → what it found → what it
      cost), name the cap explicitly ("we've hit the 3-round escalation cap"),
      and get a FRESH decision: HAND IT BACK through the established disposition
-     — architecture conversation, or `needs-architecture-session` + a `ready` row
+     — architecture conversation, or `needs-architecture-session` + draft + a `ready` row
      (three rounds
      each finding something new, after a class-level audit, is the strongest
      evidence available that the PREMISE and not the code is what is wrong —
@@ -3228,7 +3232,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      owner is deciding is fix-and-merge versus abandon-and-re-cut, never accept-and-ship.
      **With no user to ask** (a dispatched session): do not merge and do not open round
      3 — comment on the PR naming the tripwire and the P1, apply the
-     `needs-architecture-session` label, and open a `ready` follow-up, the same
+     `needs-architecture-session` label, move it to draft (`gh pr ready <N> --undo`),
+     and open a `ready` follow-up (a dispatched session's follow-up lands in the `tabled` lane; the intake gap is tracked in #2857), the same
      unattended route the architecture-session rule below uses.
   6. **After round 1 the diff SHRINKS in SCOPE, never grows.** Line count is not the
      measure — a floor fix under rule 4 may add lines and is mandatory. What may not
@@ -3283,9 +3288,10 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   If you ARE the session with the user present, hold the conversation now. With
   no user to ask, the action is: comment on the PR naming WHICH trigger fired and
   the evidence for it, apply the `needs-architecture-session` label (create it if
-  the repo lacks it — labels are per-repo and forks do not inherit them), open a
+  the repo lacks it — labels are per-repo and forks do not inherit them), move
+  the PR to draft (`gh pr ready <N> --undo`; see "PR readiness and mode"), open a
   `ready` follow-up naming the PR and the decision it awaits — the label is a
-  GitHub annotation nothing drains, so the row is the intake — and move on to the
+  GitHub annotation nothing drains, so the row is the intake (a dispatched session's follow-up lands in the `tabled` lane; the intake gap is tracked in #2857) — and move on to the
   next PR. Expect it to be uncommon: the owner's estimate, explicitly unmeasured,
   is on the order of 1 in 10 or fewer, so a session reaching for it often is
   mis-triaging. Worked example, PR #1605: main's shared settings writer had
@@ -3922,9 +3928,24 @@ So: post the finding, flag it, leave it open, and let the reviving session
 decide — including deciding to retire it in favour of a successor, which is that
 session's call to make and to justify.
 
-The same holds for a superseded PR: name the successor in a comment and leave it
-open. If you believe a PR should be retired and nobody is picking it up, that is
-a question for the user, not a judgment call for the review station.
+**A superseded PR is the one exception (standing owner rule, 2026-10-04).** The
+closing session may retire it when all three hold:
+
+1. **The owner authorized the supersession**: the decision to replace this
+   approach with another is the owner's, on record, not a reviewer's inference.
+2. **The successor PR is open**, or already merged, so the work has a live home.
+3. **It is superseded completely, in every part.** Walk the old PR's files one by
+   one against the successor and current `main`, and decide each as covered (name
+   the `file:line` that now does it) or moot (say why it no longer applies). One
+   part neither covered nor moot keeps the PR open, with a comment naming that
+   part.
+
+The closing comment carries that per-file mapping and names the successor, so the
+reasoning stays addressable after the close. Short of all three, name the
+successor in a comment and leave the PR open.
+
+If you believe any other PR should be retired and nobody is picking it up, that
+is a question for the user, not a judgment call for the review station.
 
 ### Keep the PR the PR — adjacent findings become issues (standing user rule, 2026-09-09)
 
@@ -4045,10 +4066,12 @@ finding is "too good" is not, which is why the action does not depend on it.
 path and it will measure that tree with complete confidence. Put the head SHA in
 the dispatch prompt and ask it to verify the match first.
 
-**When a PR IS superseded: name the successor in a comment and LEAVE IT OPEN.**
-Closing it is retiring, which is not the review station's call — see *Never
-RETIRE a PR you are not the one reviving* above. Do not "rebase and revive" it
-either; that is how the same change lands twice.
+**When a PR IS superseded: name the successor in a comment.** Leave it open
+unless all three conditions of the superseded-PR exception in *Never RETIRE a PR
+you are not the one reviving* above hold: owner-authorized supersession, the
+successor open or merged, and a per-file check showing it superseded in every
+part. Do not "rebase and revive" it either; that is how the same change lands
+twice.
 
 ## Pre-Merge Gate
 

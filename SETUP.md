@@ -66,9 +66,93 @@ Install via Claude Code's plugin manager.
   docker run -d --name qdrant -p 6333:6333 qdrant/qdrant
   ```
 - **Ollama**: Local embeddings. Set `OLLAMA_URL` in secrets.env.
+- **FalkorDB graph engine**: see below. `bootstrap.sh` fetches the engine
+  module; the `redis-server` that runs it is a manual step.
 
 Genesis degrades gracefully without these — it falls back to FTS5 text search
 and cloud embeddings.
+
+### Graph engine (FalkorDB)
+
+Optional. FalkorDB is a Redis module. `bootstrap.sh` fetches the module (one
+file under `~/.genesis/deps`, verified against a pinned digest) and writes the
+`genesis-falkordb` user unit, **left disabled**. It does **not** install the
+`redis-server` that loads the module: the module refuses anything below 8.0.0,
+Ubuntu/Debian stable ship 7.x, so it comes from Redis's upstream apt repository,
+and adding a third-party repository to your machine is your call. (Automated
+provisioning is tracked in issue #2827.) `GENESIS_FALKORDB_PROVISION_DISABLED=1`
+skips the module fetch too.
+
+The memory graph uses the engine only when `config/graphstore.yaml` selects
+`mode: falkordb`; the default is `networkx`, so an install that skips all of
+this loses nothing.
+
+**If this machine already runs `redis-server`**, adding the upstream repository
+upgrades it to 8.x on your next `apt upgrade`. Check first:
+
+```bash
+dpkg-query -W -f='${Status} ${Version}\n' redis-server
+command -v redis-server valkey-server
+```
+
+To set it up (Ubuntu, Debian, and derivatives that declare `UBUNTU_CODENAME`):
+
+1. Fetch Redis's signing key and **verify its fingerprint before trusting it**.
+   Redis's apt documentation publishes none; the expected value below is the
+   key `packages.redis.io/gpg` served on 2026-10-03, cross-checked against
+   independent third-party pins of the same repository.
+
+   ```bash
+   sudo apt-get install -y curl gpg
+   curl -fsSL https://packages.redis.io/gpg -o redis.gpg
+   gpg --show-keys --with-colons redis.gpg | grep -c '^pub:'
+   # must print: 1
+   gpg --show-keys --with-colons redis.gpg | awk -F: '$1 == "fpr" {print $10; exit}'
+   # must print: 54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C
+   ```
+
+   Anything else — more than one key, or a different fingerprint — stop here.
+
+2. Install the key and the source, then confirm apt now offers 8.0.0 or newer:
+
+   ```bash
+   sudo install -d -m 0755 /etc/apt/keyrings
+   sudo gpg --yes --dearmor -o /etc/apt/keyrings/redis-archive-keyring.gpg redis.gpg
+   sudo chmod 644 /etc/apt/keyrings/redis-archive-keyring.gpg
+   rm redis.gpg
+   suite="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")"
+   echo "deb [signed-by=/etc/apt/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $suite main" | sudo tee /etc/apt/sources.list.d/redis.list
+   sudo apt-get update
+   apt-cache policy redis-server   # Candidate: must be 8.0.0 or newer
+   sudo apt-get install -y redis-server
+   ```
+
+3. The package enables a **system** redis on TCP port 6379. Genesis does not use
+   it — its unit is a per-user instance with no TCP port, reached over a unix
+   socket in `~/.genesis/falkordb`. Unless you use that system redis yourself:
+
+   ```bash
+   sudo systemctl disable --now redis-server
+   ```
+
+4. Re-run `./scripts/bootstrap.sh`: it fetches the module if it is not already
+   there, and re-renders the unit with the `redis-server` path it now finds.
+   Then arm it:
+
+   ```bash
+   systemctl --user enable --now genesis-falkordb
+   systemctl --user status genesis-falkordb
+   ```
+
+Redis 8 is tri-licensed (RSALv2 / SSPLv1 / AGPLv3) rather than the plain BSD of
+the 7.x in your distro. Running it unmodified places no obligation on your own
+code, but you are the one installing it.
+
+Uninstall disables the unit and removes the module with `~/.genesis`. It never
+touches the `redis-server` package, the apt source, or the key you added; to
+remove those, `sudo apt-get purge redis-server` and delete
+`/etc/apt/sources.list.d/redis.list` and
+`/etc/apt/keyrings/redis-archive-keyring.gpg`.
 
 ## Post-Install Configuration
 
