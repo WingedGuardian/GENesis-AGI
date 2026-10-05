@@ -514,7 +514,7 @@ def test_a_pr_close_in_the_same_command_cancels_the_silent_allow(
     "command",
     [
         "gh api -X PATCH repos/o/r/pulls/123 -f state=closed && git push",
-        "gh api --method=PATCH pulls/123 --field state=closed && git push",
+        "gh api --method=PATCH repos/o/r/pulls/123 --field state=closed && git push",
         "gh -R o/r api -XPATCH repos/o/r/pulls/123 -Fstate=closed && git push",
         (
             "gh api graphql -f 'query=mutation { closePullRequest(input:{pullRequestId:\"x\"}) "

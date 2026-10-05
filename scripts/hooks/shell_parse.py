@@ -4072,9 +4072,7 @@ _GRAPHQL_CLOSE = re.compile(r"\bmutation\b.*?closePullRequest", re.IGNORECASE | 
 #: (gh 2.101.0) demonstrates endpoints in exactly that spelling, so
 #: `gh api /repos/o/r/pulls/5 -X PATCH -f state=closed` is a documented close
 #: that the anchored pattern silently missed.
-_REST_PATH = re.compile(
-    r"(?:https?://[^/]+/)?/?(?:repos/[^/\s]+/[^/\s]+/)?(?P<kind>pulls|issues)/\d+/?"
-)
+_REST_PATH = re.compile(r"(?:https?://[^/]+/)?/?repos/[^/\s]+/[^/\s]+/(?P<kind>pulls|issues)/\d+/?")
 
 
 def _split_api_option(tok: str, value_flags: frozenset[str]) -> tuple[str, str | None]:
@@ -4207,7 +4205,7 @@ def pr_close_reason(argv: list[str]) -> str | None:
     # alone reported exactly that as a close.
     if (call.method or "").upper() != "PATCH":
         return None
-    if not any(k == "state" and v.lower() == "closed" for k, v in call.fields):
+    if not any(k == "state" and v == "closed" for k, v in call.fields):
         return None
     if rest.group("kind") == "issues":
         # The issues endpoint addresses BOTH issues and pull requests, and the

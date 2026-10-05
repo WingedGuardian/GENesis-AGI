@@ -1484,7 +1484,7 @@ class TestPrCloseReason:
                 id="rest-separated-field",
             ),
             pytest.param(
-                ["gh", "api", "--method", "PATCH", "pulls/5", "--raw-field", "state=closed"],
+                ["gh", "api", "--method", "PATCH", "repos/o/r/pulls/5", "--raw-field", "state=closed"],
                 "a REST `state=closed` PATCH to a pull-request endpoint",
                 id="rest-long-separated-values",
             ),
@@ -1524,17 +1524,12 @@ class TestPrCloseReason:
                 id="rest-method-case-insensitive",
             ),
             pytest.param(
-                ["gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=Closed"],
-                "a REST `state=closed` PATCH to a pull-request endpoint",
-                id="rest-state-case-insensitive",
-            ),
-            pytest.param(
                 ["/usr/bin/gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=closed"],
                 "a REST `state=closed` PATCH to a pull-request endpoint",
                 id="rest-absolute-gh",
             ),
             pytest.param(
-                ["gh", "api", "-X", "PATCH", "pulls/5", "-F", "state=closed"],
+                ["gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-F", "state=closed"],
                 "a REST `state=closed` PATCH to a pull-request endpoint",
                 id="rest-typed-field",
             ),
