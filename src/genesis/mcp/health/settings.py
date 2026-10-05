@@ -185,8 +185,8 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "Invalid mode degrades to propose_only. Kill "
             "switch GENESIS_BOARD_DISABLED=1. A session may set enabled false or "
             "mode off/propose_only, never live or enabled true (owner edits). "
-            "Read live per call by its consumers; none ships yet (board promotion "
-            "is the first), so a change here has no effect until then."
+            "Read live per call by board promotion (board_promote and the drain), "
+            "so a change takes effect at the next promotion — no restart."
         ),
         config_filename="board.yaml",
         readonly=False,
@@ -1657,7 +1657,7 @@ def _validate_board(changes: dict) -> list[str]:
     from genesis.board.config import MODES
 
     errors: list[str] = []
-    valid_keys = ("enabled", "mode")
+    valid_keys = ("enabled", "mode", "project_owner", "project_number")
     for key, value in changes.items():
         if key not in valid_keys:
             errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
@@ -1672,6 +1672,16 @@ def _validate_board(changes: dict) -> list[str]:
                     "re-enabling the board is an owner edit of "
                     "~/.genesis/config/board.local.yaml"
                 )
+        elif key in ("project_owner", "project_number"):
+            # WHICH board the reconciler writes to is overlay-only, like `live`:
+            # a session that could repoint it could send Genesis's card writes
+            # to a project it controls. scripts/board_setup.py --write-config is
+            # the writer; it edits the overlay file directly.
+            errors.append(
+                f"'{key}' cannot be set through settings_update — run "
+                "scripts/board_setup.py --write-config, which records it in "
+                "~/.genesis/config/board.local.yaml"
+            )
         elif value == "live":
             errors.append(
                 "'mode: live' cannot be set through settings_update — arming the "
