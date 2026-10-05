@@ -113,6 +113,38 @@ Failed staging is not an exemption from whole-install uninstall. Existing
 documented deletion roots can still contain it. State outside those roots is
 not automatically deleted merely because a settings file names it.
 
+## Whole-install removal
+
+Run the ordinary `scripts/uninstall.sh` entry point. Real container cleanup
+enters the managed guard before changing monitoring or state. It acquires the
+existing runner lock, physical repository index lock, then lifecycle lock without
+waiting; a busy writer or freeze refuses removal. It also refuses surviving
+index scopes, including workers whose queue parent has gone away.
+Retirement precedes the direct script's backup/confirmation prompts. Cancelling
+keeps the repository and state, but leaves the query service stopped and disabled,
+as the entry point explicitly reports; deliberate native enablement is required
+to resume it. Make any desired backup before entering removal.
+
+The guard retires the fixed query service and client slice using native systemd
+commands and verifies inactive/failed state, zero MainPID and empty cgroups,
+including descendants. Missing, malformed or stale settings cannot bypass this
+proof. Manager failures, failed stop or uncertain state abort cleanup.
+
+The helper executes its fixed sibling uninstall script with the real lock
+descriptors inherited and checked on entry. Those descriptors remain held through
+removal of the repository, runtime state, database and Qdrant roots. Host cleanup
+delegates once to this same container transaction after its normal backup and
+confirmation; a missing/older guard or failed container command refuses cleanup
+without falling back to separate deletion commands. Host Guardian removal and
+full container deletion retain their existing distinct scope.
+
+Only the fixed CBM service/slice fragments and their known persistent/runtime
+enablement locations are removed. Symlinks are unlinked without deleting foreign
+targets; unrelated slices survive. Valid settings can report external retained
+binary/cache/runtime paths, but cannot expand the documented deletion roots.
+Dry-run does not acquire locks, stop managed units or delete state. An internal
+reentry marker alone is insufficient: it requires verified inherited descriptors.
+
 ## Verification
 
 The configuration test suite uses synthetic paths and fixtures. Native staging

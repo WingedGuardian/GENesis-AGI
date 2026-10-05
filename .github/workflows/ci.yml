@@ -1128,4 +1128,6 @@ jobs:
         # cases, plus template-placeholders 13 -> 14 (+1 hosted slice inventory).
         # Other edited files retain counts. Floor: 24457 + 49 = 24506;
         # no new skip sites.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 24506
+        # Guarded CBM removal: new uninstall file32 cases; other edited test
+        # files retain collection counts. Floor24506+32=24538; no added skips.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 24538

@@ -38,9 +38,10 @@ MODE="default"          # default | genesis-only | guardian-only | full
 DRY_RUN=false
 INTERACTIVE=true
 CONTAINER_NAME="genesis"
+MANAGED_UNINSTALL_FDS=()
 
-# ONE inventory of Persistent= timers, because there are TWO cleanup paths and
-# they have drifted apart before. A `Persistent=true` timer keeps a stamp under
+# ONE inventory of Persistent= timers in the shared cleanup transaction. The
+# former direct/host copies drifted apart. A `Persistent=true` timer keeps a stamp under
 # ~/.local/share/systemd/timers/ that removing the unit file does NOT delete;
 # systemd.timer(5) says to clear it BEFORE the unit goes away, or a reinstall
 # inherits a stale "last run" and can immediately replay a run it should skip.
@@ -134,6 +135,11 @@ while [ $# -gt 0 ]; do
         --dry-run)          DRY_RUN=true ;;
         --non-interactive)  INTERACTIVE=false ;;
         --container-name)   shift; CONTAINER_NAME="$1" ;;
+        --managed-uninstall-fds)
+            [ "$#" -ge 4 ] || { echo "Missing uninstall lock descriptors" >&2; exit 1; }
+            MANAGED_UNINSTALL_FDS=("$2" "$3" "$4")
+            shift 3
+            ;;
         -h|--help)
             sed -n '2,/^$/{ s/^# \?//; p }' "$0"
             exit 0
@@ -236,6 +242,24 @@ remove_serena_enablement() {
     done
 }
 
+# Fixed CBM names only. Unlink files/links, never recurse into a slice or follow
+# a foreign symlink target. Both native enablement locations are included.
+remove_cbm_units() {
+    local root unit path
+    for root in "$HOME/.config/systemd/user" "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/systemd/user"; do
+        for unit in genesis-cbm-query.service genesis-cbm-query-clients.slice; do
+            for path in "$root/$unit" "$root/default.target.wants/$unit"; do
+                if [ -L "$path" ] || [ -f "$path" ]; then
+                    rm -- "$path"
+                elif [ -e "$path" ]; then
+                    echo "ERROR: refusing non-file CBM unit artifact: $path" >&2
+                    return 1
+                fi
+            done
+        done
+    done
+}
+
 # Run a command inside the container (from host). Tolerates container issues.
 container_exec() {
     local cmd="$1"
@@ -282,6 +306,22 @@ if [ -f /run/host/container-manager ] || \
         warn "To remove Guardian, run this script on the host."
         MODE="genesis-only"
     fi
+fi
+
+# Enter before any monitoring/state mutation. The helper execs this exact script
+# with real inherited locks; a marker alone cannot authorize destructive cleanup.
+if [ "$IN_CONTAINER" = true ] && [ "$DRY_RUN" = false ]; then
+    MANAGED_HELPER="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/codebase_managed.py"
+    if [ "${#MANAGED_UNINSTALL_FDS[@]}" -eq 3 ]; then
+        /usr/bin/python3 -I "$MANAGED_HELPER" verify-uninstall-locks "${MANAGED_UNINSTALL_FDS[@]}"
+    else
+        MANAGED_ARGS=(--genesis-only)
+        [ "$INTERACTIVE" = true ] || MANAGED_ARGS+=(--non-interactive)
+        exec /usr/bin/python3 -I "$MANAGED_HELPER" uninstall -- "${MANAGED_ARGS[@]}"
+    fi
+elif [ "${#MANAGED_UNINSTALL_FDS[@]}" -ne 0 ]; then
+    echo "ERROR: inherited uninstall locks are only valid for direct cleanup" >&2
+    exit 1
 fi
 
 # Detect what exists
@@ -546,6 +586,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             safe_disable_service "$unit"
         done
         remove_serena_enablement
+        remove_cbm_units
 
         # Persistent= timers keep a stamp file under
         # ~/.local/share/systemd/timers/. Removing the unit file does NOT remove
@@ -633,105 +674,11 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
         else
             log "Cleaning Genesis inside container '$CONTAINER_NAME'..."
 
-            # Stop all services (timers first to prevent restart races)
-            container_exec "
-                systemctl --user stop genesis-watchdog.timer genesis-watchdog.service 2>/dev/null || true;
-                systemctl --user stop genesis-tmp-watchgod.service 2>/dev/null || true;
-                P=genesis-disk-hygiene-pressure; systemctl --user stop \${P}@standard.service \${P}@last-resort.service 2>/dev/null || true;
-                systemctl --user stop genesis-disk-hygiene.timer genesis-disk-hygiene.service 2>/dev/null || true;
-                systemctl --user stop genesis-cc-tmp-align.timer genesis-cc-tmp-align.service 2>/dev/null || true;
-                systemctl --user stop genesis-cc-settings-align.timer genesis-cc-settings-align.service 2>/dev/null || true;
-                systemctl --user stop genesis-graph-project.timer genesis-graph-project.service 2>/dev/null || true;
-                systemctl --user stop genesis-code-intel.timer genesis-code-intel.service 2>/dev/null || true;
-                systemctl --user stop genesis-star-milestone.timer genesis-star-milestone.service 2>/dev/null || true;
-                systemctl --user stop genesis-serena-claude-code.service genesis-serena-codex.service 2>/dev/null || true;
-                systemctl --user stop genesis-backup.timer genesis-backup.service 2>/dev/null || true;
-                systemctl --user stop genesis-server.service genesis-bridge.service \
-                    genesis-falkordb.service qdrant.service 2>/dev/null || true;
-                for u in genesis-server.service genesis-bridge.service \
-                    genesis-watchdog.timer genesis-watchdog.service \
-                    genesis-tmp-watchgod.service \
-                    genesis-disk-hygiene.timer genesis-disk-hygiene.service \
-                    genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
-                    genesis-graph-project.timer genesis-graph-project.service \
-                    genesis-code-intel.timer genesis-code-intel.service \
-                    genesis-star-milestone.timer genesis-star-milestone.service \
-                    genesis-serena-claude-code.service genesis-serena-codex.service \
-                    genesis-backup.timer genesis-backup.service \
-                    genesis-cc-settings-align.timer genesis-cc-settings-align.service \
-                    genesis-falkordb.service qdrant.service; do
-                    systemctl --user disable \"\$u\" 2>/dev/null || true;
-                done;
-                DRY_RUN=false;
-                $(declare -f remove_serena_enablement);
-                remove_serena_enablement
-            "
-            ok "Stopped Genesis services"
-
-            # Root network and Tailscale watchdogs (see GENESIS_ROOT_WATCHDOG_REMOVE).
-            if [ "$DRY_RUN" = true ]; then
-                echo "    [DRY RUN] Would disable and remove the root network and Tailscale watchdog timers"
-            else
-                report_root_watchdog_removal "$(container_exec "$GENESIS_ROOT_WATCHDOG_REMOVE")"
-            fi
-
-            # Persistent= timers keep a stamp file under
-            # ~/.local/share/systemd/timers/. systemd.timer(5) says to clear it
-            # BEFORE the unit is uninstalled, or a reinstall inherits a stale
-            # "last run" and can immediately replay a run it should not.
-            #
-            # This is the SAME step the direct-container branch performs. It was
-            # added there and not here, which is the asymmetry worth naming: the
-            # later cleanup removes ~/.genesis but NOT the stamps under
-            # ~/.local/share/systemd, so a host-driven `--genesis-only` uninstall
-            # that keeps the container left them behind entirely.
-            if [ "$DRY_RUN" = true ]; then
-                echo "    [DRY RUN] Would clear persistent timer state inside the container"
-            else
-                container_exec "
-                    systemctl --user clean --what=state $GENESIS_PERSISTENT_TIMERS 2>/dev/null || true
-                "
-            fi
-
-            # Wait for port 5000 to close inside container
-            for _i in $(seq 1 10); do
-                if ! incus exec "$CONTAINER_NAME" -- ss -tlnp 2>/dev/null | grep -q ':5000 '; then break; fi
-                sleep 1
-            done
-
-            # Remove systemd unit files
-            container_exec "
-                rm -f ~/.config/systemd/user/genesis-*.service \
-                      ~/.config/systemd/user/genesis-*.timer \
-                      ~/.config/systemd/user/qdrant.service 2>/dev/null;
-                systemctl --user daemon-reload 2>/dev/null || true
-            "
-            ok "Removed systemd unit files"
-
-            # Remove cron entries
-            container_exec "
-                if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -qE 'backup\.sh|inbox_sync\.sh'; then
-                    crontab -l 2>/dev/null | grep -vE 'backup\.sh|inbox_sync\.sh' | crontab - 2>/dev/null || true;
-                fi
-            "
-            ok "Cleaned cron entries"
-
-            # Remove Genesis directories and data
-            container_exec "rm -rf ~/genesis/ ~/.genesis/ ~/data/ ~/.qdrant/ 2>/dev/null || true"
-            ok "Removed Genesis directories (repo, state, data, qdrant)"
-            REMOVED+=("Genesis repo" "\$HOME/.genesis/" "\$HOME/data/" "\$HOME/.qdrant/")
-
-            # Remove Qdrant binary
-            container_exec "sudo rm -f /usr/local/bin/qdrant 2>/dev/null; rm -f ~/.local/bin/qdrant 2>/dev/null || true"
-            ok "Removed qdrant binary"
-
-            # Clean .bashrc
-            container_exec "
-                if grep -q 'DISABLE_INSTALLATION_CHECKS' ~/.bashrc 2>/dev/null; then
-                    grep -v 'DISABLE_INSTALLATION_CHECKS' ~/.bashrc > ~/.bashrc.tmp && mv ~/.bashrc.tmp ~/.bashrc;
-                fi
-            "
-            ok "Cleaned .bashrc"
+            # One guarded container transaction. Critical failures propagate;
+            # missing/older helpers never fall back to unguarded deletion.
+            incus exec "$CONTAINER_NAME" -- su - "$CONTAINER_USER" -c \
+                'exec /usr/bin/python3 -I "$HOME/genesis/scripts/codebase_managed.py" uninstall -- --genesis-only --non-interactive'
+            REMOVED+=("Genesis container cleanup")
 
             ok "Genesis removal complete (via incus exec)"
         fi

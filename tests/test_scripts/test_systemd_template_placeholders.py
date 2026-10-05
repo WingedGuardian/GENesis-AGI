@@ -324,11 +324,10 @@ def test_every_clean_site_uses_the_shared_timer_inventory():
         line for line in uninstall.splitlines() if not _COMMENT_LINE.match(line)
     )
     sites = re.findall(r"clean --what=state([^\n]*)", code)
-    # Denominator: both cleanup paths must be present, or this is vacuous.
-    assert len(sites) >= 2, (
-        f"expected at least 2 `clean --what=state` sites (direct-container and "
-        f"host-driven), found {len(sites)} — the scan is probably broken"
-    )
+    # Host delegates to this same direct transaction; a second cleanup body
+    # would reintroduce the asymmetry this inventory prevents.
+    assert len(sites) == 1, f"expected one shared cleanup site, found {len(sites)}"
+    assert '"$HOME/genesis/scripts/codebase_managed.py" uninstall' in code
     hardcoded = [site.strip() for site in sites if "$GENESIS_PERSISTENT_TIMERS" not in site]
     assert not hardcoded, (
         "every `clean --what=state` site must use $GENESIS_PERSISTENT_TIMERS so "
