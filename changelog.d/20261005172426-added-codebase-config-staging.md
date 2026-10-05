@@ -1,0 +1,1 @@
+- Add explicit pinned Codebase configuration staging and read-only diagnostics; setup preserves existing settings, failed staging and the machine disable switch, without activating a provider.
