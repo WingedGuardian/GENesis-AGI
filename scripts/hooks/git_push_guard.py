@@ -325,6 +325,7 @@ try:
         git_subcommand,
         has_trailing_override,
         mentions,
+        pr_close_reason,
         split_segments,
         unresolved_verb_programs,
     )
@@ -12086,7 +12087,8 @@ def _run_merge_and_push_gates() -> int:
                 s
                 for s in segs
                 if git_subcommand(s.argv) in {"commit", "push", "merge"}
-                or gh_pr_subcommand(s.argv) in {"create", "merge", "close"}
+                or gh_pr_subcommand(s.argv) in {"create", "merge"}
+                or pr_close_reason(s.argv) is not None
             ]
             if other_gated_actions:
                 # Defer this refusal to the tail. Specific hard checks below
@@ -12298,7 +12300,7 @@ def _run_merge_and_push_gates() -> int:
                     # The count cannot see a close that has not happened yet, so
                     # the command's own shape has to.
                     closes_pr = any(
-                        gh_pr_subcommand(s.argv) == "close" for s in segs
+                        pr_close_reason(s.argv) is not None for s in segs
                     )
                     if push_allow_reason and closes_pr:
                         push_allow_reason = None
