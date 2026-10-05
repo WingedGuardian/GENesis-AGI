@@ -7,7 +7,7 @@
 # update.sh. This script is that path with the discipline update.sh already has.
 #
 # Usage: scripts/deploy_code_only.sh [deploy|pull|restart] [--wait N]
-#                                    [--allow-killing <pid,...|all>]
+#                                    [--allow-killing <item,...|all>]
 #        scripts/deploy_code_only.sh status [--verify <token>]
 #
 #   deploy   (the default) fetch main and run every check, then stop
@@ -26,10 +26,11 @@
 #            the main checkout's own copy of this script and its libs.
 #   --wait N seconds to queue for the lock (default 7200, the same two hours a
 #            validation's hold may run, or GENESIS_DEPLOY_LOCK_WAIT)
-#   --allow-killing <pid,...|all>  deploy and restart only: restart even though
-#            these Claude Code sessions the server launched are running (the
-#            refusal below names their pids); `all` also proceeds when the
-#            process table cannot be read
+#   --allow-killing <item,...|all>  deploy and restart only: restart even though
+#            these sessions the server launched are running. Each item is what
+#            the refusal below prints: a process as <pid>@<start> (so a reused
+#            pid is not covered) or a session id. `all` also proceeds when
+#            something the check needs cannot be read
 #
 # Every mode except status runs with:
 #   the update.lock, EXCLUSIVE and QUEUING (update.sh keeps `flock -n`, so it
@@ -42,10 +43,12 @@
 #     files under src/, config/ or pyproject.toml, and a server running outside
 #     the unit (update.sh's fallback), which a restart would not replace, and,
 #     just before the server is first touched, a Claude Code session the server
-#     launched (dispatched work, a Telegram turn, a reflection: the server's
-#     process descendants, scripts/lib/server_sessions.py), because a restart
-#     ends it. That refusal lists each by pid, age and resumed session id, and is
-#     lifted by --allow-killing. Run in the foreground it also marks the caller's
+#     launched (dispatched work, a Telegram turn, a reflection), because a
+#     restart ends it: a live Claude process below the server, or a background
+#     session row this server boot still holds (a session outlives its process
+#     at both ends; scripts/lib/server_sessions.py). That refusal lists each
+#     process by pid, start, age and resumed session id and each row by session
+#     id, and is lifted by --allow-killing. Run in the foreground it also marks the caller's
 #     own session; launched detached (as below) it cannot, since its parent is
 #     the user manager, so a session the server started must hand a restart off.
 #     The scan is the last step before the stop or restart, but a session the
@@ -210,7 +213,7 @@ while [ $# -gt 0 ]; do
             MODE="$1"; shift ;;
         --wait) WAIT_S="${2:?--wait needs a value}"; shift 2 ;;
         --verify) VERIFY="${2:?--verify needs the token status printed}"; shift 2 ;;
-        --allow-killing) ALLOW_KILLING="${2:?--allow-killing needs pids (comma-separated) or all}"; shift 2 ;;
+        --allow-killing) ALLOW_KILLING="${2:?--allow-killing needs the sessions the refusal named (comma-separated) or all}"; shift 2 ;;
         --no-pull) die "--no-pull is now the restart mode: scripts/deploy_code_only.sh restart" ;;
         --no-restart) die "--no-restart is now the pull mode: scripts/deploy_code_only.sh pull" ;;
         *) die "unknown argument: $1 (modes: deploy, pull, restart, status)" ;;
@@ -223,8 +226,11 @@ if [ -n "$ALLOW_KILLING" ]; then
         deploy|restart) ;;
         *) die "--allow-killing belongs to deploy and restart, the modes that restart the server." ;;
     esac
-    [[ "$ALLOW_KILLING" == all || "$ALLOW_KILLING" =~ ^[0-9]+(,[0-9]+)*$ ]] \
-        || die "--allow-killing takes pids separated by commas, or all (got: $ALLOW_KILLING)"
+    # Each item is what a refusal prints: a process as <pid>@<start> (its start time
+    # in clock ticks, so a reused pid is not covered) or a session id (a uuid).
+    _ak_item='([0-9]+@[0-9]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
+    [[ "$ALLOW_KILLING" == all || "$ALLOW_KILLING" =~ ^${_ak_item}(,${_ak_item})*$ ]] \
+        || die "--allow-killing takes the sessions a refusal names (<pid>@<start> or a session id), separated by commas, or all (got: $ALLOW_KILLING)"
 fi
 case "$WAIT_S" in
     ''|*[!0-9]*) die "the lock wait must be a whole number of seconds (got: $WAIT_S)" ;;
@@ -291,92 +297,102 @@ _untracked_runtime() {
 # reflections). A restart ends every one of them: on stop the server cancels its
 # in-flight work, and a dispatched session's row is marked failed. So a restart
 # while any runs is a refusal, naming them, unless --allow-killing covers each
-# one. Called while the server is untouched (before deploy's stop, or before a
-# restart nothing has stopped), under the lock. The scan is
-# scripts/lib/server_sessions.py: the server's process DESCENDANTS, which is
-# exactly the set a restart ends (see its docstring for why not the
-# GENESIS_CC_SESSION stamp or the cc_sessions table).
+# one. Called under the lock as the last step before the server is touched. Two
+# signals, both from scripts/lib/server_sessions.py (its docstring says why each):
+#   - the server's live Claude Code process DESCENDANTS (a Telegram turn is seen
+#     only here), each named <pid>@<start> so a reused pid is not covered;
+#   - background session rows the CURRENT boot still holds active: a dispatched
+#     session or a reflection lives from before its Claude process starts until
+#     after it exits, and a restart cancels it anywhere in that span. Named by
+#     session id.
+# Whatever cannot be read (the MainPID, the process table, the boot time, the
+# session table) refuses, unless --allow-killing all.
 # GENESIS_DEPLOY_PROC_ROOT and GENESIS_DEPLOY_DB are TEST seams, like
 # GENESIS_DEPLOY_ROOT.
 _refuse_if_sessions() {
-    local main found rc=0 pid age resume self unlisted="" all_pids="" listing="" own=""
-    if ! main="$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null)"; then
-        [ "$ALLOW_KILLING" = all ] && {
-            echo "  WARNING: could not read genesis-server's MainPID to find its sessions; --allow-killing all given, so proceeding." >&2
+    local main boot found rows rc pid age resume self start rid tag started line
+    local unlisted="" all_items="" listing="" own="" item
+    _cannot_tell() {
+        if [ "$ALLOW_KILLING" = all ]; then
+            echo "  WARNING: $1; --allow-killing all given, so proceeding." >&2
             return 0
-        }
-        die "could not read genesis-server's MainPID from systemd, so the sessions it launched cannot be found (a restart would end them) — nothing changed. Pass --allow-killing all to restart anyway."
+        fi
+        die "$1, so the sessions genesis-server launched cannot be found (a restart would end them) — nothing changed. Pass --allow-killing all to restart anyway."
+    }
+    if ! main="$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null)"; then
+        _cannot_tell "could not read genesis-server's MainPID from systemd"
+        return 0
     fi
     if ! _positive_int "${main:-0}"; then
         echo "  No genesis-server process is running, so no session it launched can be ended."
         return 0
     fi
+    boot="$(systemctl --user show genesis-server -p ActiveEnterTimestamp --timestamp=unix --value 2>/dev/null || true)"
+    boot="${boot#@}"
+    rc=0
     found="$(python3 -I -S -c "$_SERVER_SESSIONS_PY" "$main" "${GENESIS_DEPLOY_PROC_ROOT:-/proc}" "$$")" || rc=$?
     if [ "$rc" -ne 0 ]; then
-        # Cannot tell which sessions run: refuse, like any other check this run
-        # cannot complete. --allow-killing all is the deliberate way past it.
-        [ "$ALLOW_KILLING" = all ] && {
-            echo "  WARNING: could not list processes to find the server's sessions; --allow-killing all given, so proceeding." >&2
-            return 0
-        }
-        die "could not list processes to find the sessions genesis-server launched (a restart would end them) — nothing changed. Pass --allow-killing all to restart anyway."
+        _cannot_tell "could not list processes to find the server's sessions"
+        found=""
     fi
-    [ -n "$found" ] || return 0
-    while IFS=$'\t' read -r pid age resume self; do
+    rows=""
+    if ! _positive_int "${boot:-0}"; then
+        _cannot_tell "could not read genesis-server's start time from systemd"
+    else
+        rc=0
+        rows="$(python3 -I -S -c "$_SERVER_SESSIONS_PY" --rows "${GENESIS_DEPLOY_DB:-$GENESIS_ROOT/data/genesis.db}" "$boot")" || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            _cannot_tell "could not read the cc_sessions table"
+            rows=""
+        fi
+    fi
+    _consider() {  # $1 = the item an override names ("-" = none can), $2 = its line
+        listing+="$2"$'\n'
+        if [ "$1" = - ]; then
+            [ "$ALLOW_KILLING" = all ] || unlisted+=" (unnamed)"
+            return 0
+        fi
+        all_items+=",$1"
+        if [ "$ALLOW_KILLING" != all ] && [[ ",$ALLOW_KILLING," != *",$1,"* ]]; then
+            unlisted+=" $1"
+        fi
+    }
+    while IFS=$'\t' read -r pid age resume self start; do
         [ -n "$pid" ] || continue
-        listing+="    pid $pid"
-        [ "$age" = -1 ] || listing+=", running $((age / 60))m"
-        [ "$resume" = - ] || listing+=", resumes $resume"
+        item="$pid@$start"
+        line="    process $item"
+        [ "$age" = -1 ] || line+=", running $((age / 60))m"
+        [ "$resume" = - ] || line+=", resumes $resume"
         if [ "$self" = self ]; then
-            listing+="  <- the session running this command"
+            line+="  <- the session running this command"
             own=1
         fi
-        listing+=$'\n'
-        all_pids+=",$pid"
-        if [ "$ALLOW_KILLING" != all ] && [[ ",$ALLOW_KILLING," != *",$pid,"* ]]; then
-            unlisted+=" $pid"
-        fi
+        _consider "$item" "$line"
     done <<< "$found"
+    while IFS=$'\t' read -r rid tag started; do
+        [ -n "$rid" ] || continue
+        if [ "$rid" = more ]; then
+            listing+="    ... and $tag more session rows"$'\n'
+            [ "$ALLOW_KILLING" = all ] || unlisted+=" (more)"
+            continue
+        fi
+        _consider "$rid" "    session $rid  ${tag:-?}, started $started"
+    done <<< "$rows"
+    [ -n "$listing" ] || return 0
     if [ -z "$unlisted" ]; then
         echo "  Ending these sessions with the restart (--allow-killing $ALLOW_KILLING):"
         printf '%s' "$listing"
         return 0
     fi
-    # Names from the session table, when it is readable: background rows carry
-    # no pid, so these are the records, not a pid-for-pid match.
-    local records
-    records="$(python3 -I -S -c '
-import sqlite3, sys, urllib.parse
-# Row text is free text written by other callers and read by whoever decides on
-# --allow-killing: printable ASCII, one line, bounded, like the resume id.
-def clean(v, n):
-    t = "".join(c if " " <= c <= "~" else "?" for c in str(v))
-    return t if len(t) <= n else t[: n - 3] + "..."
-try:
-    con = sqlite3.connect(
-        "file:" + urllib.parse.quote(sys.argv[1]) + "?mode=ro", uri=True, timeout=2
-    )
-    rows = con.execute(
-        "SELECT id, COALESCE(source_tag, ?), started_at FROM cc_sessions "
-        "WHERE status = ? AND session_type != ? ORDER BY started_at",
-        ("", "active", "foreground"),
-    ).fetchall()
-except Exception:
-    sys.exit(0)
-for rid, tag, started in rows[:20]:
-    print(f"    {clean(rid, 64)}  {clean(tag, 60)}  started {clean(started, 40)}")
-if len(rows) > 20:
-    print(f"    ... and {len(rows) - 20} more")
-' "${GENESIS_DEPLOY_DB:-$GENESIS_ROOT/data/genesis.db}" 2>/dev/null || true)"
     {
         echo "ERROR: genesis-server is running Claude Code sessions it launched, and a restart ends them:"
         printf '%s' "$listing"
-        if [ -n "$records" ]; then
-            echo "  Active background sessions on record:"
-            printf '%s\n' "$records"
+        echo "  Nothing changed. Wait for them to finish, or pass --allow-killing with what is listed"
+        if [ -n "$all_items" ]; then
+            echo "  (here: --allow-killing ${all_items#,}) to restart anyway; uncovered now:$unlisted."
+        else
+            echo "  (none of these can be named: --allow-killing all) to restart anyway."
         fi
-        echo "  Nothing changed. Wait for them to finish, or pass --allow-killing <pid,...|all>"
-        echo "  (here: --allow-killing ${all_pids#,}) to restart anyway; uncovered now:$unlisted."
         if [ -n "$own" ]; then
             echo "  The session running this command is one of them: a restart ends it too, so hand the"
             echo "  restart to a session the server did not launch rather than overriding."

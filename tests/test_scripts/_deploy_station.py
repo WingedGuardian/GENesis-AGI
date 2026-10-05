@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -298,9 +299,20 @@ def station(tmp_path):
     fake_proc = tmp_path / "proc"
     fake_proc.mkdir()
     (fake_proc / "stat").write_text(f"cpu 0\nbtime {int(time.time()) - 3600}\n")
+    # The session table: present and empty, with the columns the check reads. A
+    # test adds rows with session_row(); one that wants it unreadable points
+    # GENESIS_DEPLOY_DB elsewhere.
+    db = tmp_path / "genesis.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE TABLE cc_sessions (id TEXT, session_type TEXT, status TEXT,"
+        " source_tag TEXT, started_at TEXT)"
+    )
+    con.commit()
+    con.close()
     env.update(
         GENESIS_DEPLOY_PROC_ROOT=str(fake_proc),
-        GENESIS_DEPLOY_DB=str(tmp_path / "genesis.db"),
+        GENESIS_DEPLOY_DB=str(db),
     )
     # A second layer under the systemctl shim: the user bus points at an empty
     # directory, so a code path that bypasses the shim gets "Failed to connect to
@@ -342,15 +354,41 @@ def station(tmp_path):
     }
 
 
-def fake_proc_entry(st, pid: int, ppid: int, comm: str, argv: list[str]) -> None:
-    """Add /proc/<pid> to the station's fake process table (started a minute
-    after its fake boot)."""
+def fake_proc_entry(
+    st, pid: int, ppid: int, comm: str, argv: list[str], *, state: str = "S", start: int = 6000
+) -> None:
+    """Add /proc/<pid> to the station's fake process table (by default sleeping,
+    started a minute after its fake boot: start tick 6000)."""
     d = st["proc"] / str(pid)
     d.mkdir()
-    rest = ["S", str(ppid)] + ["0"] * 17 + ["6000", "0"]
+    rest = [state, str(ppid)] + ["0"] * 17 + [str(start), "0"]
     (d / "stat").write_text(f"{pid} ({comm}) " + " ".join(rest) + "\n")
     (d / "comm").write_text(comm + "\n")
     (d / "cmdline").write_bytes(b"\x00".join(a.encode() for a in argv) + b"\x00")
+
+
+def session_row(
+    st,
+    sid: str,
+    *,
+    session_type: str = "background_task",
+    status: str = "active",
+    source_tag: str = "direct_session",
+    started: float | None = None,
+) -> None:
+    """Add a cc_sessions row, started at *started* (unix). The default is a
+    minute from now: the shim's boot time sits a second after the fixture's last
+    commit, so "now" can still fall before it, and a row from before the boot is a
+    leftover the check ignores."""
+    when = time.time() + 60 if started is None else started
+    iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(when)) + ".123456+00:00"
+    con = sqlite3.connect(st["tmp"] / "genesis.db")
+    con.execute(
+        "INSERT INTO cc_sessions VALUES (?, ?, ?, ?, ?)",
+        (sid, session_type, status, source_tag, iso),
+    )
+    con.commit()
+    con.close()
 
 
 _ADVANCES = [0]
