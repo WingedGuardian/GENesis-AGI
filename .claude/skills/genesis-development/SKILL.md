@@ -4097,7 +4097,16 @@ REST endpoint, matched nothing, and reported "Codex clean" while P2s sat unread)
 When all gates pass it prints the exact atomic merge command to copy
 (`... --match-head-commit <verified-head>`); use that command verbatim.
 
-`git_push_guard.py` enforces a **hard gate** at merge time. Beyond the review
+`git_push_guard.py` enforces a **hard gate** at merge time. The gate reads only
+the `gh pr merge` spelling, so the guard refuses a pull-request merge spelled
+through the GitHub API instead: a non-GET to REST `pulls/N/merge` or
+`merge-async`, a GraphQL `mergePullRequest` / `enablePullRequestAutoMerge` /
+`enqueuePullRequest` mutation. It is a closed set: a `gh api` call that names a
+merge passes only when it is a plain read (one literal endpoint, read-only flags),
+and a GraphQL query or PUT endpoint it cannot read is refused too. The refusal
+names the gated command. The recogniser is `scripts/hooks/gh_merge.py` (#2768);
+it is a tripwire for ordinary spellings, not the boundary, which is server-side.
+Only the bare `gh pr merge --help` skips the merge arm. Beyond the review
 findings below, a gated `gh pr merge`:
 - must carry `--admin` (explicit approval flag) and be bound to the reviewed head
   via `--match-head-commit` (GitHub rejects it server-side if the head moved —
