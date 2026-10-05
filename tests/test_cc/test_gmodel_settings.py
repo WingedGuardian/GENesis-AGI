@@ -1,5 +1,7 @@
 """Launch checks for what the --settings pins cannot hold: the CLI grammar and effort caps."""
 import json
+import os
+import subprocess
 
 import pytest
 
@@ -74,6 +76,43 @@ def test_effort_cap_reader_honours_config_dir_and_skips_unreadable(tmp_path, sel
         selected, cwd=tmp_path / "proj",
         environ={"HOME": str(tmp_path / "home"), "CLAUDE_CONFIG_DIR": str(config)})
     assert warnings == [f"{config / 'settings.json'} caps effort at low; this route asks for high"]
+
+
+def _git(*args):
+    subprocess.run(["git", *args], check=True, capture_output=True,
+                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"})
+
+
+def test_effort_cap_in_the_main_checkout_local_file_is_reported_from_a_worktree_subdirectory(
+        tmp_path, selected):
+    """Claude Code reads settings.local.json at the repo root, and for a linked
+    worktree at the main checkout's root, not in the starting directory."""
+    main = tmp_path / "main"
+    main.mkdir()
+    _git("-C", str(main), "init", "-q")
+    _git("-C", str(main), "commit", "-q", "--allow-empty", "-m", "init")
+    _git("-C", str(main), "worktree", "add", "-q", str(tmp_path / "wt"))
+    _write(main / ".claude" / "settings.local.json", {"maxEffortLevel": "low"})
+    _write(tmp_path / "wt" / ".claude" / "settings.local.json", {"maxEffortLevel": "medium"})
+    (tmp_path / "wt" / "sub").mkdir()
+    warnings = settings.effort_cap_warnings(
+        selected, cwd=tmp_path / "wt" / "sub", environ={"HOME": str(tmp_path / "home")})
+    assert any(w.startswith(f"{main.resolve() / '.claude' / 'settings.local.json'} caps effort at low")
+               for w in warnings)
+    assert any("caps effort at medium" in w for w in warnings)
+    assert len(warnings) == 2
+
+
+@pytest.mark.parametrize("args, expected", [
+    (["--effort", "low"], ["--effort"]),
+    (["--autocompact=50", "--effort=max"], ["--effort", "--autocompact"]),
+    (["--", "--effort", "low"], []),
+    (["--resume", "x"], []),
+])
+def test_overridden_flags_are_named_not_refused(args, expected):
+    settings.validate_cli(args)
+    assert settings.overridden_flags(args) == expected
 
 
 @pytest.mark.parametrize("args", [

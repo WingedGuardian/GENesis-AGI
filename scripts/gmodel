@@ -42,8 +42,10 @@ The endpoint and key hold for the whole session; the model holds only until
 and key (aliases such as `opus` resolve to the route's model; a full Claude ID
 does not, and a Kimi or MiMo endpoint then rejects it). On the OpenRouter
 route, which also serves Claude model IDs, /model to a Claude ID bills Anthropic
-per-token through OpenRouter. On Kimi routes Alt+T turns thinking off, after
-which Kimi serves K2.8 Preview. To change model or provider, relaunch.
+per-token through OpenRouter. On Kimi routes Alt+T turns thinking off; on the
+Kimi subscription, Kimi then serves K2.8 Preview. --effort and --autocompact are
+accepted but outranked by the pins, and gmodel says so. To change model or
+provider, relaunch.
 
 Anthropic always runs on Max (native OAuth — `ANTHROPIC_API_KEY` is dropped so a
 stray key can't silently switch you to per-token billing; a routed launch pins it
@@ -270,8 +272,17 @@ def main(argv: list[str]) -> int:
             print("gmodel: /model to a Claude ID bills Anthropic per-token through OpenRouter.",
                   file=sys.stderr)
         if "kimi" in f"{name} {selected.model_id}".lower():
-            print("gmodel: Alt+T turns thinking off, after which Kimi serves K2.8 Preview.",
-                  file=sys.stderr)
+            # Kimi documents the K2.8 substitution for its coding subscription
+            # endpoint only; the platform API turns thinking off on K3 itself.
+            if selected.route == "subscription":
+                print("gmodel: Alt+T turns thinking off, after which Kimi serves K2.8 Preview.",
+                      file=sys.stderr)
+            else:
+                print("gmodel: Alt+T turns thinking off for the rest of the session.",
+                      file=sys.stderr)
+        for flag in gmodel_settings.overridden_flags(passthrough):
+            print(f"gmodel: {flag} is overridden by this route's pinned settings; "
+                  "the flag has no effect.", file=sys.stderr)
         for warning in gmodel_settings.effort_cap_warnings(selected, cwd=Path.cwd(), environ=env):
             print(f"gmodel: WARNING — {warning}. A maxEffortLevel cap in any settings file "
                   "applies over the pinned effort.", file=sys.stderr)

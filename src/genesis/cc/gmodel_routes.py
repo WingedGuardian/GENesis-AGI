@@ -59,8 +59,9 @@ _CONTEXT_VARS = ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODE_AUTO_COMPACT_WIN
 #: "yes", "on"), so "0" is off. MAX_THINKING_TOKENS is pinned EMPTY rather than
 #: "0", because 0 is what DISABLES thinking; CC treats an empty value as unset
 #: (`if(process.env.MAX_THINKING_TOKENS)` in the 2.1.280 binary). Disabled
-#: thinking matters beyond quality: Kimi serves K3 requests without thinking
-#: from K2.8 Preview (Kimi Code Claude Code guide, read 2026-10-04).
+#: thinking matters beyond quality: on the coding subscription Kimi serves K3
+#: requests without thinking from K2.8 Preview (Kimi Code Claude Code guide,
+#: read 2026-10-04).
 FEATURE_SWITCH_PINS = {
     "DISABLE_AUTO_COMPACT": "0",
     "DISABLE_COMPACT": "0",
@@ -318,9 +319,10 @@ def route_settings(selected: SelectedRoute, pins: Mapping[str, str]) -> dict:
     2026-10-04), so the switch would bill an Anthropic model per token. The
     launcher says so in the OpenRouter route's launch notice.
 
-    NOT pinned: thinking within the session. Alt+T (Option+T) turns it off,
-    and Kimi then serves a K3 model ID from K2.8 Preview (Kimi Code Claude Code
-    guide, read 2026-10-04). The launcher says so on Kimi routes.
+    NOT pinned: thinking within the session. Alt+T (Option+T) turns it off.
+    On the Kimi subscription, Kimi then serves a K3 model ID from K2.8 Preview
+    (Kimi Code Claude Code guide, read 2026-10-04); the platform API documents
+    no such substitution. The launcher says which applies on Kimi routes.
     """
     return {
         "env": dict(sorted(pins.items())),

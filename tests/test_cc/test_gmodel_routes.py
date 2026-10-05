@@ -522,12 +522,22 @@ def test_openrouter_route_announces_model_switch_billing_and_carries_no_hook(lau
     assert "hooks" not in json.loads(Path(captured["args"][2]).read_text())
 
 
-@pytest.mark.parametrize("name,route,key,expected", [
-    ("kimi-k3", "subscription", "KIMI_CODING_API_KEY", True),
-    ("kimi-k3", "api", "MOONSHOT_API_KEY", True),
-    ("mimo-v2.6-pro", "api", "MIMO_API_KEY", False),
+@pytest.mark.parametrize("name,route,key,toggle,downgrade", [
+    # Kimi documents the K2.8 substitution for the coding subscription only.
+    ("kimi-k3", "subscription", "KIMI_CODING_API_KEY", True, True),
+    ("kimi-k3", "api", "MOONSHOT_API_KEY", True, False),
+    ("mimo-v2.6-pro", "api", "MIMO_API_KEY", False, False),
 ])
-def test_kimi_routes_announce_the_thinking_toggle(launcher, monkeypatch, capsys, name, route, key, expected):
+def test_kimi_routes_announce_the_thinking_toggle(launcher, monkeypatch, capsys, name, route, key,
+                                                  toggle, downgrade):
     monkeypatch.setenv(key, _SECRET)
     assert launcher["main"](["--print-env", name, "--route", route]) == 0
-    assert ("Alt+T turns thinking off" in capsys.readouterr().err) is expected
+    err = capsys.readouterr().err
+    assert ("Alt+T turns thinking off" in err) is toggle
+    assert ("K2.8 Preview" in err) is downgrade
+
+
+def test_overridden_flag_is_announced_at_launch(launcher, monkeypatch, capsys):
+    monkeypatch.setenv("MOONSHOT_API_KEY", _SECRET)
+    assert launcher["main"](["--print-env", "kimi-k3", "--route", "api", "--effort", "low"]) == 0
+    assert "--effort is overridden by this route's pinned settings" in capsys.readouterr().err

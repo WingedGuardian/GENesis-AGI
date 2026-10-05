@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -47,6 +48,10 @@ _REFUSED = frozenset({
     "--model", "--fallback-model", "--settings", "--safe-mode", "--bare",
     "--cloud", "--remote", "--teleport", "--environment", "--route",
 })
+#: Accepted, but outranked by the pinned CLAUDE_CODE_EFFORT_LEVEL and
+#: CLAUDE_CODE_AUTO_COMPACT_WINDOW (Claude Code env-var docs), so the launcher
+#: says so rather than letting the flag vanish.
+_OVERRIDDEN = ("--effort", "--autocompact")
 _EFFORT_RANK = {level: rank for rank, level in enumerate(gmodel_routes.EFFORTS)}
 _READ_LIMIT = 2 * 1024 * 1024  # CC's own --settings bound; the same cap here.
 
@@ -136,6 +141,41 @@ def _cap_rank(cap: object, invalid: int) -> int:
     return _EFFORT_RANK.get(cap, invalid) if isinstance(cap, str) else invalid
 
 
+def _local_settings_dirs(cwd: Path) -> list[Path]:
+    """Every directory whose ``.claude/settings.local.json`` Claude Code may read.
+
+    From CC 2.1.211 that file is read at the repository root, and in a linked
+    worktree at the main checkout's root; a file an older version left in the
+    starting directory is still read (settings docs, "Where Claude Code keeps
+    the local file in a git repository"). Scanning the superset is deliberate:
+    over-warning costs an advisory line, while copying Claude Code's exact
+    resolver would drift from it.
+    """
+    dirs = [cwd]
+    # A local git query; the timeout keeps a stalled mount from holding the
+    # launch for an advisory, which then falls back to the starting directory.
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--path-format=absolute",
+             "--show-toplevel", "--git-common-dir"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return dirs
+    if len(out) == 2:
+        dirs += [Path(out[0]), Path(out[1]).parent]
+    unique = []
+    for directory in dirs:
+        if directory not in unique:
+            unique.append(directory)
+    return unique
+
+
+def overridden_flags(args: list[str]) -> list[str]:
+    """Pass-through flags the route's pinned environment silently outranks."""
+    return [name for name in _OVERRIDDEN if name in _options(args)]
+
+
 def effort_cap_warnings(selected: gmodel_routes.SelectedRoute, *, cwd: Path,
                         environ: Mapping[str, str]) -> list[str]:
     """Advisory: settings files whose ``maxEffortLevel`` lowers this route's effort.
@@ -146,8 +186,8 @@ def effort_cap_warnings(selected: gmodel_routes.SelectedRoute, *, cwd: Path,
     config = Path(environ.get("CLAUDE_CONFIG_DIR") or Path(environ.get("HOME") or Path.home()) / ".claude")
     wanted = _EFFORT_RANK[selected.effort]
     warnings = []
-    for path in (config / "settings.json", cwd / ".claude" / "settings.json",
-                 cwd / ".claude" / "settings.local.json"):
+    local = [directory / ".claude" / "settings.local.json" for directory in _local_settings_dirs(cwd)]
+    for path in (config / "settings.json", cwd / ".claude" / "settings.json", *local):
         try:
             document = _read(path)
         except roster.RosterError:

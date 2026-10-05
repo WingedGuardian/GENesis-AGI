@@ -360,7 +360,8 @@ verified: 6aae986bb 2026-10-04
   and are refused or read as headless by whole token. The model holds until
   `/model`, which keeps the endpoint and key; the OpenRouter route's launch
   notice says a Claude ID there bills per token, and Kimi routes say Alt+T
-  drops thinking (K2.8 Preview). Catalog loading is strict for
+  drops thinking (on the subscription, K2.8 Preview); `--effort` and
+  `--autocompact` are announced as outranked by the pins. Catalog loading is strict for
   catalog members only, and selection validates only the requested entry;
   native tiers never load the catalog, and a flat roster peer never fails on it
   (a strict failure falls back to the lenient roster path). Published endpoints remain
