@@ -206,6 +206,29 @@ class _InitDelegatesMixin:
         except (json.JSONDecodeError, ValueError, OSError) as exc:
             logger.info("Guardian heartbeat unreadable: %s", exc)
 
+    def _init_browser_automation(self) -> None:
+        """Resolve whether the Camoufox browser layer can launch; never raises.
+
+        Sets ``self._browser_engine_path`` to the installed engine directory when
+        the package and the engine it is pinned to are both present, else None
+        (capability ``degraded``, with the reason logged). Read-only: it uses
+        ``camoufox_engine_status``, never camoufox's own path lookup, which can
+        delete an engine and download another. Provisioning is
+        scripts/install_browser_stack.sh, run by bootstrap.
+        """
+        self._browser_engine_path = None
+        try:
+            from genesis.browser.engine import camoufox_engine_status
+
+            status = camoufox_engine_status()
+            if status.ready:
+                self._browser_engine_path = str(status.path)
+            else:
+                logger.info("Browser automation degraded: %s", status.detail)
+        except Exception as exc:  # noqa: BLE001 - probe is best-effort, never fatal
+            logger.info("Browser engine probe failed (treating as absent): %s", exc)
+            self._browser_engine_path = None
+
     def _init_office_deliverables(self) -> None:
         """Resolve the optional OfficeCLI render backend; never raises.
 

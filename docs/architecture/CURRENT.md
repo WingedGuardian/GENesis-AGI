@@ -1423,9 +1423,12 @@ verified: 246808153 2026-09-24
   All `/v1` bearer reads go through `genesis.env.bearer_token`. Text-only, and an
   empty completion is a 502 rather than a blank turn); Agent Zero adapter
   optional.
-- **browser/**: profile/state layer only (persistent
-  `~/.genesis/browser-profile`, `BrowserLayer` enum, pgrep patterns as the
-  single source of process detection). The automation TOOLS live in
+- **browser/**: profile/state layer (persistent `~/.genesis/browser-profile`,
+  `BrowserLayer` enum, pgrep patterns as the single source of process
+  detection for the runtime and tools), plus `engine.py` (read-only Camoufox
+  engine readiness: the launch guard and the `browser_automation` capability
+  both use it; it never calls camoufox's own path lookup, which deletes a
+  pre-0.5 engine and downloads). The automation TOOLS live in
   `mcp/health/browser.py`.
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
