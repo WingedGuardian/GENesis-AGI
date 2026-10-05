@@ -217,9 +217,12 @@ _PROFILE_DIR = Path.home() / ".genesis" / "camoufox-profile"
 _CHROMIUM_PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
 
 # Module-level browser state — persists across tool calls within a session.
+# Layer numbers match genesis.browser.types.BrowserLayer.
+# Layer 2: Chromium fallback (patchright)
 _playwright = None
 _context = None
 _page = None
+# Layer 1: Camoufox (default)
 _stealth_cm = None  # Camoufox context manager (for proper __aexit__)
 _stealth_browser = None
 _stealth_page = None
@@ -231,6 +234,10 @@ _remote_browser = None  # CDP Browser connection
 _remote_page = None  # Active page on user's remote Chrome
 _remote_cdp_url: str | None = None  # e.g. "http://100.x.y.z:9222"
 _remote_last_url: str | None = None  # URL at last Genesis action (drift detection)
+# CDP target id of the tab Genesis opened in the user's Chrome. Survives a
+# disconnect and cleanup on purpose: the tab is never closed (owner ruling), so
+# a reconnect finds it again and reuses it instead of opening another one.
+_remote_target_id: str | None = None
 
 # Layer 4: TinyFish cloud browser (on-demand CDP, paid credits)
 _tinyfish_pw = None  # Playwright instance for TinyFish session
@@ -497,7 +504,10 @@ async def _cleanup_remote_cdp() -> None:
     """Disconnect from remote Chrome. Does NOT close the user's browser.
 
     Playwright's browser.close() on a CDP connection is a disconnect only —
-    it does NOT terminate the remote Chrome process.
+    it does NOT terminate the remote Chrome process, and it does not close the
+    Genesis tab either (it lives in the user's own context). The tab is left
+    open on purpose and ``_remote_target_id`` is kept, so the next connect
+    reuses it.
     """
     global _remote_pw, _remote_browser, _remote_page, _remote_last_url
 
@@ -529,7 +539,8 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
     Returns the active remote page. The user must have Chrome running with
     ``--remote-debugging-port=9222``. Connection is via Tailscale IP.
 
-    Does NOT launch Chrome. Does NOT close the user's existing tabs.
+    Does NOT launch Chrome. Works in a tab of its own (see
+    _genesis_remote_tab) and never navigates or closes the user's tabs.
     On disconnect, clears state — next call gets a clear error.
     """
     global _remote_pw, _remote_browser, _remote_page, _remote_cdp_url
@@ -583,35 +594,71 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
 
         _remote_cdp_url = url
         _remote_browser.on("disconnected", lambda: _on_remote_disconnected())
-
-        # Find user's existing visible tab — never create phantom windows.
-        # connect_over_cdp() may create its own default context whose pages
-        # render in an invisible off-screen window.  Scan ALL contexts for a
-        # real Chrome page (chrome://newtab, about:blank, or any http(s) URL)
-        # and prefer that over Playwright's auto-created context.
-        _remote_page = None
-        for ctx in _remote_browser.contexts:
-            for pg in ctx.pages:
-                page_url = pg.url
-                if page_url.startswith(("chrome://", "about:", "http://", "https://")):
-                    _remote_page = pg
-                    logger.info("CDP remote connected — using existing tab: %s", page_url)
-                    break
-            if _remote_page is not None:
-                break
-
-        if _remote_page is None:
-            # No existing tab found — create in first available context
-            contexts = _remote_browser.contexts
-            if contexts:
-                _remote_page = await contexts[0].new_page()
-                logger.info("CDP remote connected — created new tab")
-            else:
-                ctx = await _remote_browser.new_context()
-                _remote_page = await ctx.new_page()
-                logger.info("CDP remote connected — created new context and tab")
-
+        _remote_page = await _genesis_remote_tab(_remote_browser)
         return _remote_page
+
+
+async def _cdp_target_id(page) -> str | None:
+    """The CDP target id of a Chromium page, or None if it cannot be read."""
+    try:
+        session = await page.context.new_cdp_session(page)
+        try:
+            info = await session.send("Target.getTargetInfo")
+        finally:
+            with contextlib.suppress(Exception):
+                await session.detach()
+        return info["targetInfo"]["targetId"]
+    except Exception:
+        # Warning, not debug: a None here means the Genesis tab cannot be found
+        # again, so every reconnect would silently open another tab.
+        logger.warning("Could not read the CDP target id of a remote tab", exc_info=True)
+        return None
+
+
+async def _genesis_remote_tab(remote_browser):
+    """Return Genesis's own tab in the user's Chrome, opening it if needed.
+
+    One Genesis tab per session (owner ruling): the user's tabs are never
+    navigated. A tab opened earlier is found again by its CDP target id and
+    reused; if the user closed it, a new one is opened. Genesis never closes
+    it: the user may still be reading it.
+
+    The tab opens in the context that already holds the user's visible tabs.
+    ``browser.new_context()`` is the last resort only, because over CDP its
+    pages render in an invisible off-screen window.
+    """
+    global _remote_target_id
+
+    contexts = list(remote_browser.contexts)
+    if _remote_target_id is not None:
+        for ctx in contexts:
+            # Newest first: the Genesis tab was opened after the user's tabs,
+            # so this usually finds it without probing every user tab.
+            for pg in reversed(ctx.pages):
+                if await _cdp_target_id(pg) == _remote_target_id:
+                    logger.info("CDP remote connected, reusing the Genesis tab: %s", pg.url)
+                    return pg
+
+    home = next(
+        (
+            ctx for ctx in contexts
+            if any(
+                pg.url.startswith(("chrome://", "about:", "http://", "https://"))
+                for pg in ctx.pages
+            )
+        ),
+        contexts[0] if contexts else None,
+    )
+    if home is None:
+        logger.warning(
+            "Remote Chrome exposes no browser context; opening one, whose tab "
+            "may not be visible on the user's screen"
+        )
+        home = await remote_browser.new_context()
+    page = await home.new_page()
+    _remote_target_id = await _cdp_target_id(page)
+    logger.info("CDP remote connected, opened a Genesis tab (target %s)", _remote_target_id)
+    return page
 
 
 async def _cleanup_tinyfish():
@@ -991,19 +1038,24 @@ async def _ensure_vnc():
                 started = True
                 logger.info("Started genesis-vnc + genesis-novnc via systemctl")
         except Exception:
-            # Fallback: start x11vnc directly if systemctl unavailable
+            # Fallback: start x11vnc directly if systemctl unavailable.
+            # The fallback keeps password authentication, like the unit: with
+            # no password file it starts nothing and says why.
+            vnc_passwd = Path.home() / ".genesis" / "vnc_passwd"
+            if not vnc_passwd.exists():
+                logger.warning(
+                    "VNC fallback not started: %s is missing, and the fallback "
+                    "keeps password authentication. Run scripts/setup-vnc.sh "
+                    "to create it.",
+                    vnc_passwd,
+                )
+                return
             try:
                 import subprocess as _sp2
 
-                vnc_passwd = Path.home() / ".genesis" / "vnc_passwd"
-                auth_arg = (
-                    ["-rfbauth", str(vnc_passwd)]
-                    if vnc_passwd.exists()
-                    else ["-nopw"]
-                )
                 _sp2.Popen(
                     ["x11vnc", "-display", _VNC_DISPLAY, "-forever", "-shared",
-                     "-rfbport", "5999", "-bg"] + auth_arg,
+                     "-rfbport", "5999", "-bg", "-rfbauth", str(vnc_passwd)],
                     stdout=_sp2.DEVNULL, stderr=_sp2.DEVNULL,
                 )
                 started = True
@@ -1057,6 +1109,11 @@ async def _get_page(
     return _active_page, is_new_tinyfish
 
 
+# Prefixes of the text _snapshot_page returns when there is no snapshot. An
+# aria snapshot is YAML ("- heading ..."), so it never starts with "(".
+_SNAPSHOT_PLACEHOLDERS = ("(snapshot timed out", "(snapshot unavailable")
+
+
 async def _snapshot_page(page) -> str:
     """Get accessibility tree snapshot of the current page."""
     try:
@@ -1065,9 +1122,9 @@ async def _snapshot_page(page) -> str:
         )
     except TimeoutError:
         logger.warning("Snapshot timed out (15s) — page accessibility tree stuck")
-        return "(snapshot timed out after 15s)"
+        return _SNAPSHOT_PLACEHOLDERS[0] + " after 15s)"
     except Exception as e:
-        return f"(snapshot unavailable: {e})"
+        return f"{_SNAPSHOT_PLACEHOLDERS[1]}: {e})"
 
 
 # ---------------------------------------------------------------------------
@@ -1266,15 +1323,196 @@ async def _with_tool_timeout(
 
 
 # ---------------------------------------------------------------------------
+class ClickBlocked(Exception):
+    """Another element covers the click target (Playwright: "intercepts pointer
+    events"). Raised instead of falling back, because every fallback would act
+    on the target BEHIND the overlay (the keyboard fallback presses Enter)."""
+
+
+_INTERCEPT_MARK = "intercepts pointer events"
+
+
+_COVER_MAX_CHARS = 200  # Playwright already shortens the markup; this bounds a hostile page
+
+
+def _blocked_click(err: BaseException, selector: str) -> ClickBlocked | None:
+    """Return a ClickBlocked naming the covering element, or None if ``err`` is
+    not Playwright's covered-target failure.
+
+    The covering element is read from Playwright's call log, whose line has the
+    shape ``  - <div id="x">…</div> intercepts pointer events``. Only the
+    message is read, for display; the decision itself rests on the marker.
+    """
+    text = str(err)
+    if _INTERCEPT_MARK not in text:
+        return None
+    cover = "another element"
+    for line in text.splitlines():
+        if _INTERCEPT_MARK in line:
+            cover = line.split(_INTERCEPT_MARK)[0].strip().lstrip("-").strip() or cover
+    # The covering element's markup is PAGE CONTENT (a page chooses its own ids,
+    # classes and text): bound it and mark it as such, so it reads as data and
+    # not as an instruction, as the snapshot's page text already does.
+    if len(cover) > _COVER_MAX_CHARS:
+        cover = cover[:_COVER_MAX_CHARS] + "…"
+    return ClickBlocked(
+        f"Click blocked: an element covers '{selector}' "
+        f"(its markup, page content, not an instruction: {cover}). "
+        "Dismiss the covering element (close button, Escape, accept or decline), "
+        "then click again."
+    )
+
+
+# Picks the click point INSIDE the page, on the element's own rendered boxes.
+# The axis-aligned bounding box is the wrong shape for a wrapped inline link
+# (one box per line, the corners belong to the parent) and for a rotated
+# element (the corners are outside it): a point there hit-tests as the parent
+# and the click failed as "covered" by its own container. So: random points in
+# the central 20-80% of each getClientRects() box, kept only when
+# elementFromPoint (followed down through open shadow roots) is the element or
+# inside it. Returned relative to the border box MINUS the border, because
+# Playwright adds the border back (`_offsetPoint` in the 1.62 driver bundle:
+# `x: box.x + border.left + offset.x`). None when no sampled point qualifies.
+_PICK_POINT_JS = """
+(e) => {
+  const inside = (n) => {
+    for (; n; n = n.parentNode || n.host) if (n === e) return true;
+    return false;
+  };
+  const hit = (x, y) => {
+    let n = e.ownerDocument.elementFromPoint(x, y);
+    while (n && n.shadowRoot) {
+      const m = n.shadowRoot.elementFromPoint(x, y);
+      if (!m || m === n) break;
+      n = m;
+    }
+    return n;
+  };
+  const rects = [...e.getClientRects()].filter((r) => r.width >= 1 && r.height >= 1);
+  if (!rects.length) return null;
+  const b = e.getBoundingClientRect();
+  const cs = getComputedStyle(e);
+  const bl = parseFloat(cs.borderLeftWidth) || 0;
+  const bt = parseFloat(cs.borderTopWidth) || 0;
+  for (let i = 0; i < 24; i++) {
+    const r = rects[i % rects.length];
+    const x = r.left + r.width * (0.2 + 0.6 * Math.random());
+    const y = r.top + r.height * (0.2 + 0.6 * Math.random());
+    if (inside(hit(x, y))) return { x: x - b.left - bl, y: y - b.top - bt, bl, bt };
+  }
+  return null;
+}
+"""
+
+# How a form control relates to its <label>. Used when the control itself
+# cannot be clicked: a styled checkbox/radio hides its <input> (zero size,
+# display:none) or covers it with its own decoration (<span class=mark>). The
+# label is the control's own click target then, so clicking it is not pushing
+# through an overlay. "wrap": the label is an ancestor; "for": label[for=id].
+_LABEL_JS = """
+(e) => {
+  const r = e.getBoundingClientRect();
+  const visible = r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden';
+  const label = e.labels && e.labels.length ? e.labels[0] : null;
+  if (!label) return { visible, label: null };
+  if (label.contains(e)) return { visible, label: 'wrap' };
+  return { visible, label: 'for', id: e.id || '' };
+}
+"""
+
+# Playwright's call log line for a pointer action that was actually sent:
+# `progress3.log(`  performing ${actionName} action`)` in _performPointerAction
+# (Playwright 1.62 driver, lib/coreBundle.js). Anything that fails before it
+# (not attached, not visible, not stable, covered at the pre-check) sent
+# nothing; anything after it may have been delivered.
+_CLICK_SENT_MARK = "performing click action"
+
+
+def _click_was_sent(err: BaseException) -> bool:
+    return _CLICK_SENT_MARK in str(err)
+
+
+def _label_locator(page, loc, info: dict):
+    """A Locator for the control's label (re-resolved per call, like the
+    control's own), or None."""
+    if info.get("label") == "wrap":
+        return loc.locator("xpath=ancestor::label[1]")
+    if info.get("label") == "for" and info.get("id"):
+        ident = info["id"].replace("\\", "\\\\").replace('"', '\\"')
+        return page.locator(f'label[for="{ident}"]').first
+    return None
+
+
+async def _humanized_click(page, target, timeout: int, label=None) -> None:
+    """Scroll ``target`` (a Locator) into view, move the mouse to a point on it
+    with Camoufox's humanized trail, dwell, then click that point.
+
+    ``label`` is the control's <label> Locator, if any. When no sampled point
+    on the control hit-tests as the control itself (a styled checkbox whose
+    <input> sits under its own <span class=mark>), the label is clicked
+    instead: that is where a person clicks, and the decoration is part of the
+    control, not an overlay. A real overlay still covers the label too, so the
+    label's click then fails as ClickBlocked naming it.
+
+    The click is NOT ``no_wait_after``: Playwright reads the hit-target
+    interceptor's verdict only when it waits after the action (`if
+    (options.waitAfter !== false)` around `stopHitTargetInterception`, 1.62
+    bundle), so with no_wait_after a click swallowed by an overlay that appears
+    during the move returned success with nothing clicked.
+    """
+    await target.scroll_into_view_if_needed(timeout=timeout)
+    pos = await target.evaluate(_PICK_POINT_JS)
+    if pos is None and label is not None:
+        target = label
+        await target.scroll_into_view_if_needed(timeout=timeout)
+        pos = await target.evaluate(_PICK_POINT_JS)
+    box = await target.bounding_box(timeout=timeout)
+    if box is None:
+        raise Exception("element has no layout box")
+    if pos is not None:
+        x = box["x"] + pos["bl"] + pos["x"]
+        y = box["y"] + pos["bt"] + pos["y"]
+    else:
+        x = box["x"] + box["width"] / 2
+        y = box["y"] + box["height"] / 2
+    # The cursor trail comes from page.mouse.move: Camoufox's humanize expands
+    # each step into a curve. NOT hover(): MEASURED 2026-10-05 on Camoufox 156 /
+    # Playwright 1.62 with the cursor parked away from the target, el.hover
+    # delivered 0 mousemove events to the page (3 of 3),
+    # page.mouse.move(steps=10) 144-180, el.click alone 35-49.
+    await page.mouse.move(x, y, steps=random.randint(5, 15))
+    _mouse_pos["x"] = x
+    _mouse_pos["y"] = y
+    await asyncio.sleep(random.uniform(0.05, 0.2))
+    kwargs = {"delay": random.uniform(40, 120), "timeout": timeout}
+    if pos is not None:
+        kwargs["position"] = {"x": pos["x"], "y": pos["y"]}
+    # No position: Playwright picks its own point from the element's quads,
+    # which handles every shape the sampler above could not.
+    await target.click(**kwargs)
+
+
 async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
-    """Human-like click: hover first, jitter position, realistic event chain.
+    """Human-like click through a Playwright Locator.
 
-    When Camoufox is active, generates a mousemove trail to the element
-    before clicking with a slight offset from center.  This produces
-    mousemove → mouseenter → mousedown → mouseup → click event chains
-    that match real human behavior.
+    Camoufox: scroll the target into view, pick a point that hit-tests as the
+    target (see _PICK_POINT_JS), move the mouse there (Camoufox's ``humanize``
+    draws the trail), dwell 50-200 ms, then ``click`` at that point, which
+    waits for the target to be stable and hit-tests it again. A Locator is
+    re-resolved on every call, so a node the page re-renders on mousemove is
+    found again rather than failing as detached. A form control that cannot be
+    clicked itself (a styled checkbox/radio) is clicked through its <label>.
 
-    Falls back to plain page.click() when not in stealth mode.
+    The earlier path measured the box without scrolling and pressed the mouse
+    at those coordinates: a target below the fold got no click, a covered
+    target clicked the overlay, and the tool reported success either way.
+
+    A covered target raises :class:`ClickBlocked` on every layer, with no
+    fallback. A click Playwright reports as sent (_CLICK_SENT_MARK in its call
+    log) is never repeated by a fallback. A failure before that keeps the
+    fallback chain (plain click, keyboard, shadow-DOM script click).
+
+    Other layers use plain ``page.click()``.
     """
     # --- Ambiguous text= selector guard ---
     # Bare text= selectors silently match the first element even when
@@ -1308,39 +1546,41 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
             logger.warning("Ambiguity check failed for '%s': %s", selector, amb_err)
 
     if not _is_camoufox_active():
-        await page.click(selector, timeout=timeout)
+        try:
+            await page.click(selector, timeout=timeout)
+        except Exception as err:
+            blocked = _blocked_click(err, selector)
+            if blocked is not None:
+                raise blocked from err
+            raise
         return
 
+    loc = page.locator(selector).first
     try:
-        el = await page.wait_for_selector(selector, timeout=timeout)
-        if el is None:
-            raise Exception(f"Element not found: {selector}")
-        box = await el.bounding_box()
-        if box is None:
-            await page.click(selector, timeout=timeout)
-            return
-
-        # Jitter: click within central 60% of element, not dead center
-        jitter_x = random.uniform(box["width"] * 0.2, box["width"] * 0.8)
-        jitter_y = random.uniform(box["height"] * 0.2, box["height"] * 0.8)
-        target_x = box["x"] + jitter_x
-        target_y = box["y"] + jitter_y
-
-        # Hover first — generates mousemove trail to the element
-        await page.mouse.move(target_x, target_y, steps=random.randint(5, 15))
-        _mouse_pos["x"] = target_x
-        _mouse_pos["y"] = target_y
-        await asyncio.sleep(random.uniform(0.05, 0.2))
-
-        # Click with realistic mousedown/mouseup gap
-        await page.mouse.down()
-        await asyncio.sleep(random.uniform(0.04, 0.12))
-        await page.mouse.up()
+        await loc.wait_for(state="attached", timeout=timeout)
+        info = await loc.evaluate(_LABEL_JS)
+        label = _label_locator(page, loc, info)
+        if not info.get("visible") and label is not None:
+            # A hidden <input> (display:none, zero size): only its label can be
+            # clicked.
+            await _humanized_click(page, label, timeout)
+        else:
+            await _humanized_click(page, loc, timeout, label=label)
     except Exception as stealth_err:
+        blocked = _blocked_click(stealth_err, selector)
+        if blocked is not None:
+            raise blocked from stealth_err
+        if _click_was_sent(stealth_err):
+            raise
         logger.warning("Stealth click failed for '%s': %s", selector, stealth_err)
         try:
             await page.click(selector, timeout=timeout)
         except Exception as plain_err:
+            blocked = _blocked_click(plain_err, selector)
+            if blocked is not None:
+                raise blocked from plain_err
+            if _click_was_sent(plain_err):
+                raise
             logger.warning("Plain click also failed for '%s': %s", selector, plain_err)
             # --- Keyboard fallback (last resort) ---
             # Focus the element and press Space/Enter.  Works for radios,
@@ -1423,6 +1663,36 @@ async def _click_in_shadow_dom(page, selector: str) -> bool:
         return False
 
 
+# browser_fill has no overall deadline: a long value legitimately takes a long
+# time (about 0.24 s per character measured, so 2,000 characters is about eight
+# minutes), and a length-derived deadline cut real fills short and reset the
+# page. What it guards against instead is the failure the old deadline existed
+# for: a Playwright call into Camoufox that never returns (MEASURED: a
+# page.click(timeout=10000) hung 22 minutes; see _TOOL_TIMEOUT_S). So every
+# browser call in a fill gets its own stall bound.
+#
+# 30 s: the longest LEGITIMATE single step is Playwright's own 10 s actionability
+# wait inside fill("")/click(); one keystroke (key down, key up) returns in
+# milliseconds, and the hold and gap we add between them (at most 0.2 s and 1 s)
+# are sleeps outside the bound. 30 s is three times the longest legitimate step,
+# so a step still running then is hung, not slow.
+_FILL_STALL_S: float = 30.0
+
+
+class FillStalled(Exception):
+    """A browser call inside browser_fill made no progress for _FILL_STALL_S."""
+
+
+async def _no_stall(awaitable, what: str):
+    """Await one browser call of a fill, failing if it stalls."""
+    try:
+        return await asyncio.wait_for(awaitable, timeout=_FILL_STALL_S)
+    except TimeoutError:
+        raise FillStalled(
+            f"{what} made no progress for {_FILL_STALL_S:.0f}s"
+        ) from None
+
+
 async def _human_type(page, selector: str, value: str) -> None:
     """Type text character-by-character with human-like timing.
 
@@ -1437,23 +1707,23 @@ async def _human_type(page, selector: str, value: str) -> None:
     Chromium fallback (dev/test): atomic page.fill() (no delay overhead).
     """
     if not _is_camoufox_active() and not _is_remote_active():
-        await page.fill(selector, value, timeout=10000)
+        await _no_stall(page.fill(selector, value, timeout=10000), "fill")
         return
 
     # Clear field reliably (works on React controlled inputs)
-    await page.fill(selector, "", timeout=10000)
+    await _no_stall(page.fill(selector, "", timeout=10000), "clearing the field")
     # Click to focus the field
-    await page.click(selector, timeout=10000)
+    await _no_stall(page.click(selector, timeout=10000), "focusing the field")
     # Type per-keystroke with hold time + flight time (IKI) jitter.
     # Hold time: log-normal, median ~86ms (CMU Keystroke Dynamics calibration).
     # Flight time: 50-200ms uniform with 5% thinking pauses.
-    for char in value:
+    for i, char in enumerate(value):
         # Hold phase: keydown → hold → keyup
         hold_s = random.lognormvariate(math.log(0.086), 0.35)
         hold_s = max(0.03, min(hold_s, 0.20))  # clamp 30-200ms
-        await page.keyboard.down(char)
+        await _no_stall(page.keyboard.down(char), f"keystroke {i + 1} of {len(value)}")
         await asyncio.sleep(hold_s)
-        await page.keyboard.up(char)
+        await _no_stall(page.keyboard.up(char), f"keystroke {i + 1} of {len(value)}")
         # Flight phase: gap to next key
         iki = random.uniform(0.05, 0.20)  # 50-200ms
         # 5% chance of a "thinking pause" (300-1000ms)
@@ -2272,17 +2542,17 @@ async def _impl_browser_navigate(
     tinyfish: bool = False,
 ) -> dict:
     """Navigate to a URL and return the page snapshot."""
-    global _collaborate_mode, _remote_last_url
+    global _remote_last_url
     _touch()
     _ts_log.info("browser_navigate called: url=%s stealth=%s remote=%s tinyfish=%s", url, stealth, remote, tinyfish)
 
     if tinyfish and remote:
         return {"error": "Cannot use tinyfish and remote simultaneously — pick one."}
 
-    # Auto-enable collaborate timing for remote CDP (user watching their screen)
-    if remote and not _collaborate_mode:
-        _collaborate_mode = True
-        logger.info("Auto-enabled collaborate timing for remote CDP session")
+    # No timing switch for remote CDP: _human_delay already uses collaborate
+    # timing (0.5-2 s) whenever the remote page is active, whatever
+    # _collaborate_mode says. Switching the flag on here only made fast timing
+    # stick to later Camoufox work (and survive a failed remote connect).
 
     try:
         page, is_new_tinyfish = await _get_page(
@@ -2324,13 +2594,15 @@ async def _impl_browser_navigate(
         snapshot = await _snapshot_page(page)
 
         def _layer_name():
+            from genesis.browser.types import BrowserLayer
+
             if tinyfish:
-                return "tinyfish_cdp"
+                return BrowserLayer.TINYFISH.value
             if _is_remote_active():
-                return "remote_cdp"
+                return BrowserLayer.REMOTE_CDP.value
             if _is_camoufox_active():
-                return "camoufox"
-            return "chromium"
+                return BrowserLayer.CAMOUFOX.value
+            return BrowserLayer.CHROMIUM.value
 
         result = {
             "url": page.url,
@@ -2397,6 +2669,7 @@ async def _impl_browser_click(selector: str) -> dict:
 
 async def _impl_browser_fill(selector: str, value: str) -> dict:
     """Fill a form field on the current page."""
+    global _active_page
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -2417,6 +2690,17 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
         await _human_type(page, selector, value)
         _update_remote_url()  # Fill + Enter may cause navigation
         return {"filled": selector, "url": page.url}
+    except FillStalled as e:
+        # Same recovery as a tool timeout: the browser is hung, so the page is
+        # in an unknown state and the next step must be a fresh navigate.
+        logger.warning("browser_fill stalled on '%s': %s — resetting active page", selector, e)
+        _active_page = None
+        return {
+            "error": (
+                f"Fill stalled on '{selector}': {e}. "
+                "Browser state was reset — call browser_navigate to resume."
+            )
+        }
     except Exception as e:
         return {"error": f"Fill failed on '{selector}': {e}"}
 
@@ -2499,6 +2783,12 @@ async def _impl_browser_snapshot() -> dict:
         page = _active_page
     try:
         snapshot = await _snapshot_page(page)
+        # Remote: the caller has now seen the current page, so it becomes the
+        # drift baseline. This is what the drift advisory's "call
+        # browser_snapshot()" recommendation relies on. Only a REAL snapshot
+        # counts: a timed-out or unavailable one showed the caller nothing.
+        if not snapshot.startswith(_SNAPSHOT_PLACEHOLDERS):
+            _update_remote_url()
         return {"url": page.url, "title": await page.title(), "snapshot": snapshot}
     except Exception as e:
         return {"error": f"Snapshot failed: {e}"}
@@ -2545,40 +2835,142 @@ async def _impl_browser_run_js(expression: str) -> dict:
         return {"error": f"JS execution failed: {e}"}
 
 
-async def _impl_browser_sessions() -> dict:
-    """List logged-in sessions from the persistent browser profile.
+def _cookie_profiles() -> tuple[tuple[str, Path], ...]:
+    """The two local browser profiles the cookie tools cover, labelled."""
+    return (("camoufox", _PROFILE_DIR), ("chromium", _CHROMIUM_PROFILE_DIR))
 
-    Does NOT launch a browser — reads the cookie database directly.
+
+def _live_cookie_context(kind: str):
+    """This process's live browser context for a profile, or None.
+
+    While the browser runs, its cookie jar lives in memory and is written back
+    to the file, so the live context's cookie API is the only correct way to
+    read or change it. Camoufox's persistent context IS the browser object.
     """
-    try:
-        from genesis.browser.profile import BrowserProfileManager
-        mgr = BrowserProfileManager()
-        info = mgr.get_info()
-        return {
-            "profile_path": info.profile_path,
-            "exists": info.exists,
-            "size_mb": info.size_mb,
-            "sessions": [
-                {"domain": s.domain, "cookie_count": s.cookie_count}
-                for s in info.sessions
-            ],
-        }
-    except Exception as e:
-        return {"error": f"Failed to read browser sessions: {e}"}
+    if kind == "camoufox":
+        if _stealth_page is not None and _is_page_alive(_stealth_page):
+            return _stealth_browser
+        return None
+    if _page is not None and _is_page_alive(_page):
+        return _context
+    return None
+
+
+# Bound on one cookie call to a live browser context. Camoufox is the reason:
+# a Playwright call into it has hung for 22 minutes (see _TOOL_TIMEOUT_S), and
+# these two tools have no tool-level timeout. A cookie read or clear on a
+# healthy browser returns in well under a second, so 30 s means a hung browser,
+# and the profile then reports an error instead of blocking the tool forever.
+_COOKIE_CALL_TIMEOUT_S: float = 30.0
+
+
+async def _cookie_call(awaitable):
+    return await asyncio.wait_for(awaitable, timeout=_COOKIE_CALL_TIMEOUT_S)
+
+
+def _domain_cookie_pattern(domain: str) -> re.Pattern:
+    """Playwright clear_cookies(domain=) filter equal to domain_matches()."""
+    return re.compile(r"^\.?(?:.+\.)?" + re.escape(domain) + "$", re.IGNORECASE)
+
+
+async def _impl_browser_sessions() -> dict:
+    """List cookie counts per domain in both local browser profiles.
+
+    Does NOT launch a browser. A profile whose browser runs in this process is
+    read through the live context; otherwise the cookie file is read
+    read-only. Each entry says which source it used.
+    """
+    from collections import Counter
+
+    from genesis.browser.profile import BrowserProfileManager
+
+    profiles = []
+    for kind, pdir in _cookie_profiles():
+        entry: dict = {"browser": kind, "profile_path": str(pdir)}
+        try:
+            ctx = _live_cookie_context(kind)
+            if ctx is not None:
+                counts = Counter(
+                    (c.get("domain") or "").lstrip(".") for c in await _cookie_call(ctx.cookies())
+                )
+                entry.update(
+                    source="live browser",
+                    exists=True,
+                    sessions=[
+                        {"domain": d, "cookie_count": n} for d, n in sorted(counts.items())
+                    ],
+                )
+            else:
+                mgr = BrowserProfileManager(pdir, browser=kind)
+                info = mgr.get_info()
+                entry.update(
+                    source="profile file",
+                    exists=info.exists,
+                    size_mb=info.size_mb,
+                    sessions=[
+                        {"domain": s.domain, "cookie_count": s.cookie_count}
+                        for s in info.sessions
+                    ],
+                )
+                if info.error:
+                    entry["error"] = info.error
+                pid = mgr.running_pid()
+                if pid is not None:
+                    entry["note"] = (
+                        f"open in another browser process (pid {pid}); the file "
+                        "can lag that browser's live cookies"
+                    )
+        except Exception as e:
+            entry["error"] = f"Failed to read {kind} sessions: {e}"
+        profiles.append(entry)
+    return {"profiles": profiles}
 
 
 async def _impl_browser_clear_domain(domain: str) -> dict:
-    """Clear cookies for a specific domain (selective logout).
+    """Clear the cookies of a domain and its subdomains in both profiles.
 
-    Does NOT launch a browser — modifies the cookie database directly.
+    Exact label matching: ``x.com`` clears ``x.com`` and ``*.x.com``, never
+    ``netflix.com``. Does NOT launch a browser: a profile whose browser runs in
+    this process is cleared through the live context, a closed one in its
+    cookie file, and one open in another process is refused (that browser
+    would write its cookies back) with the reason in its entry.
     """
+    from genesis.browser.profile import (
+        BrowserProfileManager,
+        ProfileInUse,
+        domain_matches,
+        normalize_domain,
+    )
+
     try:
-        from genesis.browser.profile import BrowserProfileManager
-        mgr = BrowserProfileManager()
-        removed = mgr.clear_domain(domain)
-        return {"domain": domain, "cookies_removed": removed}
-    except Exception as e:
-        return {"error": f"Failed to clear domain '{domain}': {e}"}
+        d = normalize_domain(domain)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    total = 0
+    profiles = []
+    for kind, pdir in _cookie_profiles():
+        entry: dict = {"browser": kind}
+        try:
+            ctx = _live_cookie_context(kind)
+            if ctx is not None:
+                n = sum(
+                    domain_matches(c.get("domain", ""), d)
+                    for c in await _cookie_call(ctx.cookies())
+                )
+                if n:
+                    await _cookie_call(ctx.clear_cookies(domain=_domain_cookie_pattern(d)))
+                entry.update(source="live browser", removed=n)
+            else:
+                n = BrowserProfileManager(pdir, browser=kind).clear_domain(d)
+                entry.update(source="profile file", removed=n)
+            total += n
+        except ProfileInUse as e:
+            entry["error"] = str(e)
+        except Exception as e:
+            entry["error"] = f"Failed to clear {kind} cookies: {e}"
+        profiles.append(entry)
+    return {"domain": d, "cookies_removed": total, "profiles": profiles}
 
 
 async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
@@ -2629,9 +3021,12 @@ async def browser_navigate(
 
     Set remote=True to drive the user's real Chrome over CDP/Tailscale.
     This connects to Chrome running on the user's machine with
-    --remote-debugging-port=9222. Real browser = real fingerprint = no detection.
-    Collaborate timing is auto-enabled. Use for ATS submissions with aggressive
-    anti-bot detection (Ashby, Greenhouse with reCAPTCHA v3).
+    --remote-debugging-port=9222 and works in a tab of its own (one per
+    session, reused on reconnect, never closed; the user's tabs are not
+    touched). Real Chrome fingerprint and the user's IP, but not invisible:
+    CDP control is itself detectable and clicks are not humanized. Remote
+    actions always use collaborate timing (0.5-2 s); the setting is untouched.
+    Use when fingerprint scoring blocks Camoufox and the user is available.
 
     Set tinyfish=True for a cloud-hosted browser via TinyFish Browser API.
     Fresh isolated Chromium on each session. Paid: 1 credit per 4 minutes.
@@ -2640,8 +3035,11 @@ async def browser_navigate(
     cdp_url: Override the CDP endpoint. Default: GENESIS_CDP_URL env var.
     Example: browser_navigate("https://jobs.ashbyhq.com/...", remote=True)
 
-    NOTE: If Cloudflare Turnstile is detected (Camoufox only), this call may
-    block for up to ~5 minutes while waiting for human resolution via VNC.
+    NOTE: If a Cloudflare challenge is detected (Camoufox and Chromium), this
+    call works on it before returning (auto-resolve poll, widget clicks, an
+    optional solver, VNC clicks, a reload); it does not wait for a person. If
+    unresolved, it sends a Telegram alert (when configured) and returns
+    turnstile.status == "blocked". This can take most of the 300 s timeout.
     """
     # Remote CDP: bounded by 30s connect + 30s goto = 60s ceiling.
     # Camoufox: Turnstile VNC resolution can take up to 5 minutes.
@@ -2664,11 +3062,21 @@ async def browser_click(selector: str) -> dict:
     If a text= selector matches multiple elements, the click fails with
     an ambiguity error listing the matches.
 
-    Keyboard fallback: if mouse click fails on a form control, the tool
-    automatically attempts keyboard activation (focus + Space/Enter).
+    The target is scrolled into view and hit-tested before the click. If
+    another element covers it (cookie banner, modal, sticky header), the
+    click fails with "Click blocked: <covering element> covers '<selector>'":
+    dismiss that element and click again.
+
+    A styled checkbox or radio whose <input> is hidden or covered by its own
+    decoration is clicked through its <label>.
+
+    Keyboard fallback: if the click fails for another reason before any click
+    was sent, the tool tries keyboard activation (focus + Space/Enter). A
+    click that may already have been delivered is never repeated.
     For manual keyboard navigation, use browser_press_key with Tab/Space.
 
-    Returns the updated page snapshot after clicking.
+    Returns the updated page snapshot after clicking. "clicked" means the
+    click was sent; confirm the page changed.
     """
     return await _with_tool_timeout(
         _impl_browser_click(selector),
@@ -2684,15 +3092,12 @@ async def browser_fill(selector: str, value: str) -> dict:
     Examples: browser_fill('#email', 'user@example.com')
 
     Per-keystroke typing is active for Camoufox and CDP remote — long
-    strings take proportionally longer. The tool timeout scales with
-    string length.
+    strings take proportionally longer (about 0.24 s per character after a
+    pre-delay of up to 15 s). There is no overall deadline: the call fails
+    only if one browser step (clearing, focusing, or a single keystroke)
+    makes no progress for 30 s, and then the page is reset.
     """
-    timeout = min(max(60.0, len(value) * 0.25), 300.0)
-    return await _with_tool_timeout(
-        _impl_browser_fill(selector, value),
-        timeout,
-        f"browser_fill('{selector}')",
-    )
+    return await _impl_browser_fill(selector, value)
 
 
 @mcp.tool()
@@ -2753,19 +3158,25 @@ async def browser_run_js(expression: str) -> dict:
 
 @mcp.tool()
 async def browser_sessions() -> dict:
-    """List logged-in sessions from the persistent browser profile.
+    """List logged-in sessions in both local browser profiles.
 
-    Reads the Chrome cookie database without launching a browser.
-    Shows which domains have saved cookies/sessions.
+    Covers Camoufox (~/.genesis/camoufox-profile) and Chromium
+    (~/.genesis/browser-profile), one labelled entry each, with cookie counts
+    per domain. Never launches a browser: a browser running in this session is
+    read live, otherwise the profile's cookie file is read.
     """
     return await _impl_browser_sessions()
 
 
 @mcp.tool()
 async def browser_clear_domain(domain: str) -> dict:
-    """Clear cookies for a specific domain (selective logout).
+    """Clear cookies for a domain and its subdomains (selective logout).
 
-    Modifies the cookie database directly without launching a browser.
+    Matches whole labels: 'x.com' clears x.com and api.x.com, never
+    netflix.com. Covers both local profiles and returns the number removed,
+    per profile and in total. Never launches a browser. A profile open in
+    another session's browser is refused for that profile (its entry says
+    why), because that browser would write its cookies back.
     Example: browser_clear_domain('github.com')
     """
     return await _impl_browser_clear_domain(domain)
@@ -2806,6 +3217,11 @@ async def browser_collaborate(enable: bool = True) -> dict:
 
     No browser restart. No page state loss. Just a timing change.
     """
+    return _impl_browser_collaborate(enable)
+
+
+def _impl_browser_collaborate(enable: bool = True) -> dict:
+    """Set the timing profile explicitly (see browser_collaborate)."""
     global _collaborate_mode
 
     _collaborate_mode = enable

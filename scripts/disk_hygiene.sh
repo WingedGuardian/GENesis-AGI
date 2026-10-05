@@ -47,6 +47,9 @@
 #  15. Retention prune of the work board's local stores → scripts/prune_board.py
 #      (closed open-questions + their edges >90d, board events >180d; unverified
 #      questions and promotion pointers are never pruned)
+#  16. Copytruncate rotation of the shared MCP logs in ~/tmp (>10MB, 2 kept)
+#      → rotate_log (mcp_health.log, turnstile_debug.log; held open by every
+#      session's MCP server, so they are copied and truncated, never renamed)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -286,6 +289,53 @@ prune_guard_corpus() {
         \( -name 'guard-corpus.jsonl' -o -name 'guard-corpus.jsonl.*.tmp' \) \
         -mtime +45 -delete 2>/dev/null \
         || echo "guard-corpus prune exited $?"
+}
+
+# rotate_log FILE [MAX_BYTES] [KEEP] — copytruncate rotation for a log that
+# long-lived processes hold open. The genesis-health MCP server of EVERY session
+# appends to ~/tmp/mcp_health.log through a logging.FileHandler opened once at
+# import, so renaming the file would leave each of them writing to the renamed
+# copy, and nothing ever rotated it (MEASURED 2026-10-04: 105,293,842 bytes,
+# first line 2026-06-30, so about 1.1 MB a day). Copy-then-truncate keeps the
+# writers on the same file: FileHandler opens in append mode (O_APPEND), so the
+# next write after the truncate lands at the new end, not at the old offset.
+#
+# One actor, once a day, rather than a RotatingFileHandler inside each of the
+# several MCP processes that share the file, which would race each other.
+#
+# The cost, stated rather than hidden: a line written between the copy and the
+# truncate is lost (logrotate's copytruncate has the same window). Rotated
+# copies are FILE.1 .. FILE.KEEP, oldest highest; they are ordinary ~/tmp
+# children, so prune_tmp also ages them out after 7 days.
+rotate_log() {
+    local f="$1" max="${2:-10000000}" keep="${3:-2}"
+    local size i
+    [ -f "$f" ] && [ ! -L "$f" ] || return 0
+    size="$(stat -c %s -- "$f" 2>/dev/null)" || return 0
+    [ "$size" -gt "$max" ] || return 0
+    for (( i = keep; i > 1; i-- )); do
+        if [ -f "$f.$((i - 1))" ]; then
+            mv -f -- "$f.$((i - 1))" "$f.$i"
+        fi
+    done
+    # Copy to a temp file first, so an interrupted copy never poses as FILE.1.
+    # If the copy fails (a full disk), the log is left exactly as it was:
+    # truncating without a copy would lose the whole file. The temp is a fresh
+    # mktemp file (O_EXCL), never a fixed name: cp writes THROUGH an existing
+    # symlink at its destination, so a pre-planted FILE.1.tmp link would have
+    # overwritten whatever it pointed at (security review of the rotation).
+    local tmp
+    if ! tmp="$(mktemp -p "$(dirname -- "$f")" ".$(basename -- "$f").rotate.XXXXXX")"; then
+        echo "rotate of $f failed (no temp file); the log was left as is"
+        return 0
+    fi
+    if cp -- "$f" "$tmp" && mv -f -- "$tmp" "$f.1"; then
+        : > "$f"
+        echo "rotated $f ($size bytes)"
+    else
+        rm -f -- "$tmp"
+        echo "rotate of $f failed; the log was left as is"
+    fi
 }
 
 prune_browser_backups() {
@@ -574,6 +624,13 @@ main() {
 
     echo "--- guard replay corpus retention prune (>45d) ---"
     prune_guard_corpus "$HOME/.genesis/output"
+
+    echo "--- MCP log rotation (>10MB, copytruncate, 2 kept) ---"
+    # 10 MB: about nine days of mcp_health.log at the measured rate, small
+    # enough to read whole, and with 2 copies the three files stay near 30 MB
+    # instead of growing without bound.
+    rotate_log "$HOME/tmp/mcp_health.log" 10000000 2
+    rotate_log "$HOME/tmp/turnstile_debug.log" 10000000 2
 
     echo "--- browser upgrade backups (>14d, only once the engine is ready) ---"
     local browser_state

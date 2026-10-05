@@ -242,7 +242,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 **genesis-health**
 
 - `bootstrap_manifest` — Which subsystems initialized successfully, failed, or degraded at startup.
-- `browser_clear_domain` — Clear cookies for a specific domain (selective logout).
+- `browser_clear_domain` — Clear cookies for a domain and its subdomains (selective logout).
 - `browser_click` — Click an element on the current page by CSS selector or text.
 - `browser_collaborate` — Toggle collaborative timing mode.
 - `browser_fill` — Fill a form field on the current page.
@@ -250,7 +250,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - `browser_press_key` — Press a keyboard key on the current page.
 - `browser_run_js` — Execute JavaScript in the browser's console on the current page.
 - `browser_screenshot` — Take a screenshot of the current page.
-- `browser_sessions` — List logged-in sessions from the persistent browser profile.
+- `browser_sessions` — List logged-in sessions in both local browser profiles.
 - `browser_snapshot` — Return the accessibility tree of the current page.
 - `browser_upload` — Upload a file to a file input element on the current page.
 - `build_lane_status` — What has the autonomous capability-build lane done — and how well do its verdicts track your decisions?
