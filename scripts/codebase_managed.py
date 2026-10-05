@@ -181,24 +181,111 @@ def require_no_batch() -> None:
 
 def retire_managed() -> None:
     errors = []
-    for argv in (("disable", BACKEND), ("stop", BACKEND), ("stop", SLICE)):
-        result = subprocess.run(
-            ["/usr/bin/systemctl", "--user", *argv],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode and not manager_absent(argv[1]):
-            errors.append((argv[0], result.stderr.strip()))
+    for argv in (
+        ("disable", BACKEND),
+        ("disable", "--runtime", BACKEND),
+        ("stop", BACKEND),
+        ("stop", SLICE),
+    ):
+        try:
+            result = subprocess.run(
+                ["/usr/bin/systemctl", "--user", *argv],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode and not manager_absent(argv[-1]):
+                errors.append((argv[0], result.stderr.strip()))
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            errors.append(("command", f"{argv[0]}: {error}"))
     for unit in (BACKEND, SLICE):
-        require_quiescent(unit)
-    state = show(BACKEND, "UnitFileState", "LoadState")
+        try:
+            require_quiescent(unit)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            errors.append(("proof", f"{unit}: {error}"))
+    try:
+        state = show(BACKEND, "UnitFileState", "LoadState")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        errors.append(("proof", str(error)))
+        state = {"UnitFileState": ""}
+    if state["UnitFileState"] in ("enabled", "enabled-runtime"):
+        errors.append(("proof", "query service retains native enablement"))
     if errors and (
-        any(action == "stop" for action, _ in errors)
+        any(action != "disable" for action, _ in errors)
         or state["UnitFileState"]
         not in ("", "generated", "transient", "static", "disabled", "masked")
     ):
         raise ValueError(f"managed retirement failed: {errors}")
+
+
+def runtime_config(path: Path) -> dict:
+    config = read_settings(path)
+    main = absolute(config["main"]).resolve(strict=True)
+    if main != SCRIPT.parent.parent or not (main / ".git").is_dir():
+        raise ValueError("managed runtime requires its configured primary checkout")
+    return config
+
+
+def enable(config: dict) -> None:
+    verify_cache(config)
+    with verified_binary(Path(config["binary"])):
+        pass  # fail before changing native state when the accepted inode is invalid
+    if sentinel_armed(config["sentinel"]):
+        raise ValueError("managed Codebase sentinel is armed")
+    properties = show(SLICE, "LoadState", "MemoryMax", "MemorySwapMax", "TasksMax")
+    if properties != dict(
+        LoadState="loaded", MemoryMax=str(2 * 1024**3), MemorySwapMax="0", TasksMax="512"
+    ):
+        raise ValueError("loaded managed client slice lacks required limits")
+    try:
+        subprocess.run(
+            ["/usr/bin/systemctl", "--user", "enable", "--now", BACKEND],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=150,
+        )
+        ready(config)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as startup:
+        rollback = "complete"
+        try:
+            retire_managed()
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            rollback = str(error)
+        raise ValueError(f"native enable failed: {startup}; rollback: {rollback}") from startup
+
+
+def remove_unit_artifacts() -> None:
+    runtime = absolute(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    for root in (units_dir(), runtime / "systemd/user"):
+        for unit in (BACKEND, SLICE):
+            for path in (root / unit, root / "default.target.wants" / unit):
+                try:
+                    mode = path.lstat().st_mode
+                except FileNotFoundError:
+                    continue
+                if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+                    raise ValueError(f"refusing non-file managed unit artifact: {path}")
+                path.unlink()
+    subprocess.run(["/usr/bin/systemctl", "--user", "daemon-reload"], check=True, timeout=30)
+
+
+def lifecycle_main(args: argparse.Namespace) -> int:
+    try:
+        with lifecycle_lock():
+            if args.command == "enable":
+                path = config_path(str(Path.home() / ".genesis/config/codebase-managed.json"))
+                if args.config and config_path(args.config) != path:
+                    raise ValueError("enable requires the installed settings path")
+                enable(runtime_config(path))
+            else:
+                retire_managed()
+                if args.command == "remove":
+                    remove_unit_artifacts()
+        return 0
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
+        print(f"managed lifecycle refused: {error}", file=sys.stderr)
+        return 1
 
 
 def report_retained_state() -> None:
@@ -588,7 +675,7 @@ def uninstall_main(args: argparse.Namespace) -> int:
         return 1
 
 
-def main(argv: list[str] | None = None) -> int:
+def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=None)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -598,13 +685,21 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("status")
     commands.add_parser("serve")
     commands.add_parser("ready")
+    for command in ("enable", "disable", "remove"):
+        commands.add_parser(command)
     teardown = commands.add_parser("uninstall")
     teardown.add_argument("arguments", nargs=argparse.REMAINDER)
     verification = commands.add_parser("verify-uninstall-locks")
     verification.add_argument("fds", type=int, nargs=3)
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_arguments(argv)
     if args.command in ("uninstall", "verify-uninstall-locks"):
         return uninstall_main(args)
+    if args.command in ("enable", "disable", "remove"):
+        return lifecycle_main(args)
     raw = (
         args.config
         or os.environ.get("CODEBASE_MEMORY_MCP_MANAGED_CONFIG")
@@ -623,10 +718,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status":
             print(json.dumps(status(path), indent=2))
         else:
-            config = read_settings(path)
-            main = absolute(config["main"]).resolve(strict=True)
-            if main != SCRIPT.parent.parent or not (main / ".git").is_dir():
-                raise ValueError("managed runtime requires its configured primary checkout")
+            config = runtime_config(path)
             (serve if args.command == "serve" else ready)(config)
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:

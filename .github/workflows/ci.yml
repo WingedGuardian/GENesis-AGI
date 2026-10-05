@@ -1130,4 +1130,6 @@ jobs:
         # no new skip sites.
         # Guarded CBM removal: new uninstall file32 cases; other edited test
         # files retain collection counts. Floor24506+32=24538; no added skips.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 24538
+        # Native CBM lifecycle: new lifecycle file31 cases; no added skips.
+        # Floor24538+31=24569; predecessor skip identity gate still applies.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 24569

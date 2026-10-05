@@ -8,6 +8,41 @@ install, upgrade or version-probe a PATH Codebase binary. The existing launcher,
 registration and index queue remain unchanged until their integration concerns.
 Staging and rendering alone do not make Codebase available.
 
+## Native lifecycle
+
+After staging and ordinary template rendering, deliberately use:
+
+```bash
+python3 -I scripts/codebase_managed.py enable
+python3 -I scripts/codebase_managed.py disable
+python3 -I scripts/codebase_managed.py remove
+```
+
+`enable` uses the fixed installed settings path, validates the pin/cache/sentinel
+and loaded aggregate slice limits before any enablement change, then enables and
+starts the query service and verifies native readiness. It never removes the
+sentinel. Failed startup attempts independent native disable and stops of backend
+and client slice; startup and rollback errors remain visible. A command timeout
+does not prevent the remaining retirement attempts.
+Persistent and runtime enablement links are disabled independently before final
+native state proof, including installations with both kinds of link.
+
+`disable` retires the fixed native units without reading settings, including
+missing, malformed, old-schema or stale-build settings. It verifies service PID,
+native enablement and recursive empty cgroups; slices/scopes do not expose the
+service-only MainPID property. Manager uncertainty or failed stop refuses success.
+`remove` first performs the same retirement, then unlinks only the fixed service,
+client slice and known persistent/runtime enablement artifacts and reloads the
+manager. Foreign symlink targets, unrelated slices, settings and provider state
+are preserved. No template ownership/header/repair mechanism is introduced.
+
+All three hold the exclusive nonblocking lifecycle lock through completion or
+rollback. Busy frontend/worker admission refuses; a worker already admitted is
+left to its existing watchdog. Daemon startup/readiness does not take a shared
+lock that could deadlock with this exclusive enable operation. The commands do
+not change immutable settings bytes. None starts the indexing queue or registers
+the forthcoming managed MCP frontend.
+
 ## Configure
 
 Run from the primary Genesis checkout, using the accepted v0.11.0 Linux x86_64
