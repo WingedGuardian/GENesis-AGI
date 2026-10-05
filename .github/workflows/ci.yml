@@ -1112,4 +1112,7 @@ jobs:
         # Floor: 24153 +92 =24245; skip ceiling remains 102.
         # NVIDIA provider health: new test_provider_health_probes.py collects
         # 87 tests (0 -> 87); no added skips. Floor: 24245 + 87 = 24332.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24332
+        # Staged excused-path guard: test_update_checkout_moved.py 79 -> 87
+        # (+8); test_update_activation.py 28 -> 28 (+0).
+        # Floor: 24332 + 8 = 24340; skip ceiling remains 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24340
