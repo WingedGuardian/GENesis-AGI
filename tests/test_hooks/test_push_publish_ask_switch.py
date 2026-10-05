@@ -19,7 +19,8 @@ These tests are organised around the ways that switch could reach further:
 
 Real git repos and real remotes are used so the destination resolution (``git
 remote get-url --push``, ``insteadOf`` expansion, ``_push_config_is_simple``) runs
-for real; only the network probes are stubbed.
+for real; the re-push dry-run proof is pinned because this suite exercises the
+first-publish ask switch.
 """
 
 from __future__ import annotations
@@ -88,9 +89,19 @@ def _decision(out: str):
 
 
 @pytest.fixture(autouse=True)
-def _first_publish(monkeypatch):
+def _first_publish(monkeypatch, tmp_path):
     """A first push (the branch is not on the remote), no network, foreground."""
+    home = tmp_path / "home"
+    home.mkdir()
+    xdg_config = tmp_path / "xdg"
+    xdg_config.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/repo")
+    monkeypatch.setattr(
+        gpg, "_push_dry_run_is_plain", lambda *a, **k: True, raising=False
+    )
     monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: False)
     monkeypatch.setattr(gpg, "push_allowlist", None)
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
@@ -227,11 +238,6 @@ def test_a_publishing_pr_create_still_asks_when_off(
         ),
         ("git push -u nosuch HEAD", (("remote.origin.url", PUBLIC),), "unresolvable destination"),
         ("git push -u origin main", (("remote.origin.url", PUBLIC),), "not the current branch"),
-        (
-            "git push -u origin HEAD",
-            (("remote.origin.url", PUBLIC), ("push.followTags", "true")),
-            "tags would ride along",
-        ),
     ],
 )
 def test_a_push_that_is_not_exactly_public_still_asks(
@@ -240,6 +246,21 @@ def test_a_push_that_is_not_exactly_public_still_asks(
     rc, out, err = _run(monkeypatch, tmp_path, capsys, command, git_config)
     assert rc == 0, (why, rc, out, err)
     assert _decision(out) == "ask", (why, out)
+
+
+def test_follow_tags_riding_along_keeps_first_publish_ask(
+    monkeypatch, tmp_path, capsys, off
+) -> None:
+    monkeypatch.setattr(gpg, "_push_dry_run_is_plain", lambda *a, **k: False)
+    rc, out, err = _run(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        "git push -u origin HEAD",
+        (("remote.origin.url", PUBLIC), ("push.followTags", "true")),
+    )
+    assert rc == 0, (rc, out, err)
+    assert _decision(out) == "ask", out
 
 
 def test_an_undeterminable_public_repo_still_asks(monkeypatch, tmp_path, capsys, off) -> None:
