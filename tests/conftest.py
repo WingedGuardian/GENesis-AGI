@@ -26,6 +26,7 @@
 # - This is the structural fix for the 2026-04-10 worktree-test-isolation
 #   footgun: before this guard, every sibling-worktree test run needed an
 #   explicit ``PYTHONPATH=src`` prefix or it silently tested main instead.
+import re
 import sys
 from pathlib import Path
 
@@ -45,17 +46,21 @@ import tempfile  # noqa: E402
 import aiosqlite  # noqa: E402
 import pytest  # noqa: E402
 
+from genesis.env import CREDENTIAL_NAME_RE  # noqa: E402
+
 _NO_SECRETS_PATH = str(
     Path(tempfile.gettempdir()) / f"genesis-tests-no-secrets-{os.getpid()}" / "secrets.env"
 )
 _PINNED_CREDENTIALS: frozenset[str] = frozenset()
+# Webhook URLs are bearer secrets, but the dashboard pattern deliberately doesn't change here.
+_TEST_PINNED_NAME_RE = re.compile(rf"{CREDENTIAL_NAME_RE.pattern}|^DISCORD_WEBHOOK_")
 
 
 def _pin_credentials() -> None:
     global _PINNED_CREDENTIALS
     from genesis.env import credential_env_names
 
-    _PINNED_CREDENTIALS = credential_env_names()
+    _PINNED_CREDENTIALS = credential_env_names(pattern=_TEST_PINNED_NAME_RE)
     for name in _PINNED_CREDENTIALS:
         os.environ[name] = ""
     os.environ["SECRETS_PATH"] = _NO_SECRETS_PATH

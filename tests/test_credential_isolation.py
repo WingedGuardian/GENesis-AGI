@@ -66,3 +66,41 @@ def test_credential_regex_covers_example_provider_keys():
 
     assert candidates
     assert all(CREDENTIAL_NAME_RE.search(name) for name in candidates)
+
+
+def test_credential_regex_covers_aws_credentials():
+    assert all(
+        CREDENTIAL_NAME_RE.search(name)
+        for name in (
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        )
+    )
+
+
+def test_credential_env_names_includes_aws_environment_names(tmp_path, monkeypatch):
+    empty_example = tmp_path / "empty.env.example"
+    empty_example.write_text("", encoding="utf-8")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "dummy-akid")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "dummy-secret")
+
+    names = credential_env_names(example=empty_example)
+
+    assert {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} <= names
+
+
+def test_discord_webhook_names_are_pinned_empty():
+    from tests.conftest import _PINNED_CREDENTIALS
+
+    example = Path(__file__).resolve().parents[1] / "secrets.env.example"
+    webhook_names = {
+        match.group(1)
+        for line in example.read_text(encoding="utf-8").splitlines()
+        if (match := re.match(r"^#?\s*([A-Z][A-Z0-9_]*)=", line))
+        and match.group(1).startswith("DISCORD_WEBHOOK_")
+    }
+
+    assert len(webhook_names) == 4
+    assert webhook_names <= _PINNED_CREDENTIALS
+    assert all(os.environ[name] == "" for name in webhook_names)

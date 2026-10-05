@@ -1120,7 +1120,7 @@ jobs:
         #   test_collectors_falkordb.py           new -> 23   (+23)
         #   test_falkordb_module.py               new -> 35   (+35)
         # No added skips. Floor: 24332 + 89 = 24421; skip ceiling remains 102.
-        # External-I/O census and credential isolation collect 22 and 6 tests,
-        # respectively. The census file was 5 on main; measured with --collect-only.
-        # Floor: 24421 + (22 - 5) + 6 = 24444.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24444
+        # External-I/O census collects 27; credential isolation collects 9 tests
+        # (main-merge counts were 22 and 6). Measured with --collect-only.
+        # Floor: 24444 + (27 - 22) + (9 - 6) = 24452.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24452

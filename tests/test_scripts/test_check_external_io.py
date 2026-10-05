@@ -143,6 +143,58 @@ def test_real_subdomain_and_port_still_flag(tmp_path):
     assert len(_violations(tmp_path, "provider")) == 2
 
 
+def test_two_provider_hosts_on_one_line_exceed_baseline(tmp_path):
+    (tmp_path / "two.py").write_text(
+        'A = "https://api.openai.com/v1"; B = "https://api.anthropic.com/v1"\n'
+    )
+    baseline = {("two.py", "provider"): (1, "one endpoint")}
+
+    violations = check.scan(tmp_path, baseline=baseline, classes=("provider",))
+
+    assert len(violations) == 2
+    assert {v.kind for v in violations} == {"over_baseline"}
+
+
+def test_repeated_host_on_one_line_counts_twice(tmp_path):
+    (tmp_path / "twice.py").write_text(
+        'A = "https://api.openai.com/v1"; B = "https://api.openai.com/v1"\n'
+    )
+
+    assert len(_violations(tmp_path, "provider")) == 2
+
+
+def test_overlapping_slack_patterns_count_one_reference(tmp_path):
+    (tmp_path / "slack.py").write_text('URL = "https://hooks.slack.com/api/x"\n')
+
+    assert len(_violations(tmp_path, "egress")) == 1
+
+
+def test_minified_javascript_counts_each_class_once_per_reference(tmp_path):
+    (tmp_path / "bundle.js").write_text(
+        'fetch("https://discord.com/api/v10");fetch("https://api.openai.com/v1")\n'
+    )
+
+    violations = check.scan(tmp_path, baseline={})
+
+    assert Counter(v.cls for v in violations) == Counter({"egress": 1, "provider": 1})
+
+
+def test_egress_api_endpoints_accept_explicit_ports(tmp_path):
+    (tmp_path / "ports.py").write_text(
+        'A = "https://discord.com:443/api/v10/channels/1/messages"\n'
+        'B = "https://discordapp.com:8443/api/x"\n'
+        'C = "https://slack.com:443/api/chat.postMessage"\n'
+    )
+
+    violations = _violations(tmp_path, "egress")
+
+    assert [(v.lineno, v.kind) for v in violations] == [
+        (1, "unlisted"),
+        (2, "unlisted"),
+        (3, "unlisted"),
+    ]
+
+
 def test_real_tree_is_clean_under_baseline():
     assert check.scan(_REPO_ROOT, subdirs=check.SCAN_ROOTS) == []
 
@@ -253,23 +305,16 @@ def test_provider_hosts_are_reconciled_with_inventories_and_call_sites():
 
     # Rule YAML and _DEGRADED_GATED drift are hook-surface and tracked in #2227.
     assert set(check.PROVIDER_HOSTS) <= inventory | set(check.CALL_SITE_ONLY_HOSTS)
-    source_config_files = [
-        path
+    source_config_texts = [
+        path.read_text(encoding="utf-8", errors="replace")
         for root in (_REPO_ROOT / "src", _REPO_ROOT / "config")
         for path in root.rglob("*")
         if path.is_file() and path.suffix in {".py", ".yaml", ".yml"}
     ]
     for host, reason in check.CALL_SITE_ONLY_HOSTS.items():
         assert reason.strip()
-        found = False
-        for path in source_config_files:
-            content = path.read_text(encoding="utf-8")
-            if host in content:
-                found = True
-                break
-            # The alternate MiniMax domain is declared by the hook rule's
-            # optional-label regex rather than as a concrete source URL.
-            if host == "api.minimax.com" and r"api\.minimaxi?\.com" in content:
-                found = True
-                break
+        found = any(
+            host in content or (host == "api.minimax.com" and r"api\.minimaxi?\.com" in content)
+            for content in source_config_texts
+        )
         assert found, f"call-site-only host not found in src/ or config/: {host}"

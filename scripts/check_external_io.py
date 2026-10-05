@@ -50,11 +50,11 @@ def _host(host_re: str) -> str:
 
 
 PATTERNS: list[re.Pattern[str]] = [
-    re.compile(_host(r"discord\.com") + r"/api", re.IGNORECASE),
-    re.compile(_host(r"discordapp\.com") + r"/api", re.IGNORECASE),
+    re.compile(_host(r"discord\.com") + r"(?::\d+)?/api", re.IGNORECASE),
+    re.compile(_host(r"discordapp\.com") + r"(?::\d+)?/api", re.IGNORECASE),
     re.compile(r"DISCORD_WEBHOOK"),
     re.compile(_host(r"api\.twitter\.com"), re.IGNORECASE),
-    re.compile(_host(r"slack\.com") + r"/api", re.IGNORECASE),
+    re.compile(_host(r"slack\.com") + r"(?::\d+)?/api", re.IGNORECASE),
     re.compile(_host(r"hooks\.slack\.com"), re.IGNORECASE),
 ]
 
@@ -91,7 +91,7 @@ BASELINE: dict[tuple[str, str], tuple[int, str]] = {
     ("scripts/behavioral_linter.py", "provider"): (1, "linter inventory/docs"),
     ("scripts/check_external_io.py", "egress"): (2, "guard egress patterns"),
     ("scripts/check_external_io.py", "provider"): (22, "guard provider inventory"),
-    ("scripts/install.sh", "provider"): (3, "installer probe, key validation, help text"),
+    ("scripts/install.sh", "provider"): (4, "installer probe, key validation, help text"),
     ("src/genesis/cc/invoker.py", "provider"): (1, "comment: api.anthropic.com outage note"),
     ("src/genesis/channels/stt.py", "provider"): (1, "Groq STT call site"),
     ("src/genesis/deliberation/backends/fusion.py", "provider"): (1, "OpenRouter fusion call site"),
@@ -105,22 +105,24 @@ BASELINE: dict[tuple[str, str], tuple[int, str]] = {
     ("src/genesis/recon/model_intelligence.py", "provider"): (1, "OpenRouter model metadata fetch"),
     ("src/genesis/research/perplexity.py", "provider"): (1, "Perplexity research call site"),
     ("src/genesis/routing/litellm_delegate.py", "provider"): (1, "sanctioned routing call path"),
-    ("src/genesis/runtime/init/outreach.py", "egress"): (9, "gated webhook wiring"),
+    ("src/genesis/runtime/init/outreach.py", "egress"): (10, "gated webhook wiring"),
+    ("tests/conftest.py", "egress"): (1, "test-only webhook credential pin"),
     ("tests/test_cc/test_roster.py", "provider"): (1, "roster routing fixture"),
     ("tests/test_channels/test_discord_adapter.py", "egress"): (12, "adapter fixture literals"),
+    ("tests/test_credential_isolation.py", "egress"): (1, "webhook credential-pin test"),
     ("tests/test_deliberation/test_deliberate.py", "provider"): (1, "deliberation fixtures"),
-    ("tests/test_hooks/test_behavioral_linter.py", "provider"): (36, "provider linter fixtures"),
+    ("tests/test_hooks/test_behavioral_linter.py", "provider"): (37, "provider linter fixtures"),
     ("tests/test_hooks/test_inline_hooks.py", "provider"): (1, "inline-hook fixtures"),
     ("tests/test_hooks/test_secret_scrub.py", "egress"): (6, "scrub fixtures"),
     ("tests/test_learning/test_procedure_extraction.py", "provider"): (1, "extraction fixture"),
-    ("tests/test_mcp/test_capability_shadow_wiring.py", "egress"): (1, "shadow wiring fixture"),
-    ("tests/test_mcp/test_outreach_mcp.py", "egress"): (15, "webhook environment fixtures"),
+    ("tests/test_mcp/test_capability_shadow_wiring.py", "egress"): (2, "shadow wiring fixture"),
+    ("tests/test_mcp/test_outreach_mcp.py", "egress"): (22, "webhook environment fixtures"),
     ("tests/test_memory/test_reranker.py", "provider"): (1, "reranker fixture"),
     ("tests/test_observability/test_key_validator.py", "provider"): (3, "key-validator fixtures"),
     ("tests/test_outreach/test_pipeline.py", "egress"): (1, "pipeline fixture"),
     ("tests/test_routing/test_provider_health_probes.py", "provider"): (5, "health-probe fixtures"),
-    ("tests/test_scripts/test_check_external_io.py", "egress"): (5, "guard egress fixtures"),
-    ("tests/test_scripts/test_check_external_io.py", "provider"): (10, "guard provider fixtures"),
+    ("tests/test_scripts/test_check_external_io.py", "egress"): (10, "guard egress fixtures"),
+    ("tests/test_scripts/test_check_external_io.py", "provider"): (17, "guard provider fixtures"),
 }
 CLASSES: dict[str, list[re.Pattern[str]]] = {
     "egress": PATTERNS,
@@ -144,6 +146,20 @@ def _within_subdirs(relpath: str, subdirs: tuple[str, ...] | list[str] | None) -
         return True
     path = Path(relpath)
     return any(path.is_relative_to(Path(subdir)) for subdir in subdirs)
+
+
+def _merged_spans(line: str, patterns: list[re.Pattern[str]]) -> list[tuple[int, int]]:
+    spans = sorted(
+        (match.start(), match.end()) for pattern in patterns for match in pattern.finditer(line)
+    )
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start < merged[-1][1]:
+            previous_start, previous_end = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def scan(
@@ -171,7 +187,7 @@ def scan(
         for cls in selected:
             patterns = CLASSES[cls]
             for lineno, line in enumerate(lines, start=1):
-                if any(pattern.search(line) for pattern in patterns):
+                for _start, _end in _merged_spans(line, patterns):
                     matches.setdefault((relpath, cls), []).append((lineno, line.strip()))
 
     violations: list[Violation] = []
