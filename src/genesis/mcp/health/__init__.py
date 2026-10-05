@@ -62,6 +62,7 @@ from genesis.mcp.health import (  # noqa: E402
     immunity_status,  # noqa: F401
     loop_closure_status,  # noqa: F401
 )
+from genesis.mcp.health import board_tools as _board_tools  # noqa: E402, F401
 from genesis.mcp.health import browser as _browser  # noqa: E402
 from genesis.mcp.health import build_lane_status as _build_lane_status  # noqa: E402, F401
 from genesis.mcp.health import calibration_status as _calibration_status  # noqa: E402, F401

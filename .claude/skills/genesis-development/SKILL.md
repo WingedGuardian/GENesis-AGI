@@ -102,7 +102,11 @@ is never abandoned in that state.
 CI and external review that run after opening, and verification explicitly
 required after merge, remain their normal gates; waiting for those is not a
 reason to use draft mode. Distinguish a blocker to entering review from a check
-that review or merge will subsequently require.
+that review or merge will subsequently require. Open review findings, and a
+dependency on another open PR named in the body, are of the second kind. A PR
+sent BACK for rework or for an architecture decision is of the first kind,
+because review stops until the rework lands (closing-session, "Sending a PR
+back").
 
 ### Wiring Discipline
 
@@ -206,6 +210,46 @@ Code tagged `# GROUNDWORK(feature-id): why` is intentional future
 investment. Never delete or refactor it as dead code. Only remove when
 the feature is fully active or the user explicitly cancels it.
 
+### Due diligence before building (standing owner rule, 2026-10-04)
+
+**Get it right the first time. On everything that could change the plan, the
+bar is beyond reasonable doubt BEFORE building, not after review finds it.** A
+PR that comes out half-built because half its premises were never checked is
+the failure this rule exists to stop. The checklist, which every development
+plan presented for approval answers (task-executor plans from `/task` keep their
+own `TASK_INTAKE.md` section contract instead):
+
+1. **Every free read is done.** A free read is anything this session can settle
+   read-only, or by a probe that changes nothing beyond scratch state, using
+   tools it already holds. It is owed whenever its answer could change a decision. That covers: the code and every caller the change touches,
+   its `CURRENT.md` entry, recent commits and PRs in the area, overlapping open
+   PRs and issues, peer sessions, code intelligence, an API or renderer probe,
+   and a corpus measurement. "I did not verify X, but it should be fine" is not
+   an answer for an X like that: verify it, or name it as a residual with the
+   reason no read or probe settles it.
+2. **Premises measured, then red-teamed.** Try to disprove the root cause and the
+   change's consequences, and name the alternatives weighed, simplest first.
+3. **The plan body states:** what, why and how; confidence per item with what
+   would disprove it; what was verified and what was NOT; alternatives; the
+   red-team of the root cause and consequences; regression markers; and the
+   test plan (targeted tests midway and at the end, CI for the full suite, a
+   functional check of the built thing, "Verify BEFORE the PR" below, and the
+   `E2E:` line for post-merge verification).
+4. **A revised plan opens with a "Changed in this revision" section** right
+   after its title (YAML frontmatter stays on line 1, and the title stays the
+   first heading): what changed, and why.
+5. **Ask the owner about intent, priorities and trade-offs. Decide measured
+   technical edge cases yourself** and state the call; the owner overrides at
+   approval. Design principles and standing axioms, approval and sovereignty
+   gates, irreversible or outward-facing actions, and anything user-visible
+   still go to the owner.
+
+A question is material when its answer could change the plan; stakes set how
+deep to go on each one, never whether it is asked. On the material ones, this
+bar is higher than CLAUDE.md's investigate-below-90% floor. Detail, the
+evidence behind the rule, and how it fits the rules it ties together:
+`references/due-diligence.md`.
+
 ### Architecture Review
 
 Every FINALIZED plan gets exactly ONE `genesis-architect` review — premise
@@ -213,7 +257,9 @@ check, scope drift, architecture — before it is presented for approval.
 The agent's Step 0.5/0.6 take the plan file as input; hand it the path.
 Revisions made in answer to that review do not re-trigger it. A plan too
 small to write down needs none. `/plan-ceo-review` and `/office-hours` are
-optional extras, if installed.
+optional extras, if installed. Its findings are claims, handled under
+CLAUDE.md's "Verify agent output": re-derive them, then fold the confirmed ones
+into the plan BEFORE presenting it.
 
 ### Skill invocation points
 
@@ -257,7 +303,8 @@ executes, in FULL ids, so a reader of either end can find the other. An absent
 list means "none" — so only omit it once you have looked; write
 `issues: unchecked` if you have not. In the body,
 `## ═══ SUPERSEDED BELOW ═══` divides live content from archaeology; no divider
-means the whole file is live.
+means the whole file is live. What the body must STATE is set by "Due diligence
+before building" above, for every development plan presented for approval.
 
 **`pinned.main` is the field that pays for itself**: it makes
 `git fetch origin main --quiet && git log --oneline <pinned.main>..origin/main`
@@ -2506,7 +2553,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   the problem disappears). Emit the `Design-premise:` block. Also informational,
   and its BROKEN verdict has a HIGH bar: it routes to the EXISTING
   premise-wrong disposition (architecture conversation, or
-  `needs-architecture-session` + a `ready` row) rather than to another round, so everything short of "the change cannot do what it
+  `needs-architecture-session` + draft + a `ready` row) rather than to another round, so everything short of "the change cannot do what it
   says" is SOUND-BUT-INFERIOR with the better shape named. Render a
   better-shape finding on the severity ladder too (normally SHOULD-FIX), or it
   is invisible to every surface that scores findings.
@@ -2845,7 +2892,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      obedience — STOP, post the round ledger (round → what it found → what it
      cost), name the cap explicitly ("we've hit the 3-round escalation cap"),
      and get a FRESH decision: HAND IT BACK through the established disposition
-     — architecture conversation, or `needs-architecture-session` + a `ready` row
+     — architecture conversation, or `needs-architecture-session` + draft + a `ready` row
      (three rounds
      each finding something new, after a class-level audit, is the strongest
      evidence available that the PREMISE and not the code is what is wrong —
@@ -3185,7 +3232,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      owner is deciding is fix-and-merge versus abandon-and-re-cut, never accept-and-ship.
      **With no user to ask** (a dispatched session): do not merge and do not open round
      3 — comment on the PR naming the tripwire and the P1, apply the
-     `needs-architecture-session` label, and open a `ready` follow-up, the same
+     `needs-architecture-session` label, move it to draft (`gh pr ready <N> --undo`),
+     and open a `ready` follow-up (a dispatched session's follow-up lands in the `tabled` lane; the intake gap is tracked in #2857), the same
      unattended route the architecture-session rule below uses.
   6. **After round 1 the diff SHRINKS in SCOPE, never grows.** Line count is not the
      measure — a floor fix under rule 4 may add lines and is mandatory. What may not
@@ -3240,9 +3288,10 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   If you ARE the session with the user present, hold the conversation now. With
   no user to ask, the action is: comment on the PR naming WHICH trigger fired and
   the evidence for it, apply the `needs-architecture-session` label (create it if
-  the repo lacks it — labels are per-repo and forks do not inherit them), open a
+  the repo lacks it — labels are per-repo and forks do not inherit them), move
+  the PR to draft (`gh pr ready <N> --undo`; see "PR readiness and mode"), open a
   `ready` follow-up naming the PR and the decision it awaits — the label is a
-  GitHub annotation nothing drains, so the row is the intake — and move on to the
+  GitHub annotation nothing drains, so the row is the intake (a dispatched session's follow-up lands in the `tabled` lane; the intake gap is tracked in #2857) — and move on to the
   next PR. Expect it to be uncommon: the owner's estimate, explicitly unmeasured,
   is on the order of 1 in 10 or fewer, so a session reaching for it often is
   mis-triaging. Worked example, PR #1605: main's shared settings writer had
@@ -3879,9 +3928,24 @@ So: post the finding, flag it, leave it open, and let the reviving session
 decide — including deciding to retire it in favour of a successor, which is that
 session's call to make and to justify.
 
-The same holds for a superseded PR: name the successor in a comment and leave it
-open. If you believe a PR should be retired and nobody is picking it up, that is
-a question for the user, not a judgment call for the review station.
+**A superseded PR is the one exception (standing owner rule, 2026-10-04).** The
+closing session may retire it when all three hold:
+
+1. **The owner authorized the supersession**: the decision to replace this
+   approach with another is the owner's, on record, not a reviewer's inference.
+2. **The successor PR is open**, or already merged, so the work has a live home.
+3. **It is superseded completely, in every part.** Walk the old PR's files one by
+   one against the successor and current `main`, and decide each as covered (name
+   the `file:line` that now does it) or moot (say why it no longer applies). One
+   part neither covered nor moot keeps the PR open, with a comment naming that
+   part.
+
+The closing comment carries that per-file mapping and names the successor, so the
+reasoning stays addressable after the close. Short of all three, name the
+successor in a comment and leave the PR open.
+
+If you believe any other PR should be retired and nobody is picking it up, that
+is a question for the user, not a judgment call for the review station.
 
 ### Keep the PR the PR — adjacent findings become issues (standing user rule, 2026-09-09)
 
@@ -4002,10 +4066,12 @@ finding is "too good" is not, which is why the action does not depend on it.
 path and it will measure that tree with complete confidence. Put the head SHA in
 the dispatch prompt and ask it to verify the match first.
 
-**When a PR IS superseded: name the successor in a comment and LEAVE IT OPEN.**
-Closing it is retiring, which is not the review station's call — see *Never
-RETIRE a PR you are not the one reviving* above. Do not "rebase and revive" it
-either; that is how the same change lands twice.
+**When a PR IS superseded: name the successor in a comment.** Leave it open
+unless all three conditions of the superseded-PR exception in *Never RETIRE a PR
+you are not the one reviving* above hold: owner-authorized supersession, the
+successor open or merged, and a per-file check showing it superseded in every
+part. Do not "rebase and revive" it either; that is how the same change lands
+twice.
 
 ## Pre-Merge Gate
 
@@ -4543,6 +4609,7 @@ references on every trigger.
 | Pending work, active incidents, subsystem status | `references/build-state.md` |
 | Auditing/deep-reviewing AI-generated code (failure taxonomy, audit passes) | `references/ai-code-audit.md` |
 | Writing or revising a multi-session plan document | `references/plan-docs.md` |
+| What a plan owes before building: free reads, red-team, body fields, ask vs decide | `references/due-diligence.md` |
 | Pre-release review, bug hunt, guard/gate change — verification method | `references/high-stakes-verification.md` |
 | Choosing a command/value/procedure by reasoning about an external tool | same, section 9 |
 | Auditing the CLAIMS a session wrote (wrap-up, or before any permanent record) | same, section 11 |

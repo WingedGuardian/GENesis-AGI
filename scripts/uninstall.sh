@@ -419,7 +419,7 @@ fi
 
 if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
     echo "    Genesis (container-side):"
-    echo "      - Systemd units: genesis-server, genesis-bridge, genesis-watchdog, qdrant"
+    echo "      - Systemd units: genesis-server, genesis-bridge, genesis-watchdog, genesis-falkordb, qdrant"
     echo "      - Root timers: genesis-network-watchdog, genesis-tailscale-watchdog"
     echo "      - Repository: ~/genesis/"
     echo "      - Runtime state: ~/.genesis/"
@@ -542,6 +542,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-cbm-query.service genesis-cbm-query-clients.slice \
                     genesis-backup.timer genesis-backup.service \
                     genesis-server.service genesis-bridge.service \
+                    genesis-falkordb.service \
                     qdrant.service; do
             safe_disable_service "$unit"
         done
@@ -648,7 +649,8 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                 systemctl --user stop genesis-serena-claude-code.service genesis-serena-codex.service 2>/dev/null || true;
                 systemctl --user stop genesis-cbm-query.service genesis-cbm-query-clients.slice 2>/dev/null || true;
                 systemctl --user stop genesis-backup.timer genesis-backup.service 2>/dev/null || true;
-                systemctl --user stop genesis-server.service genesis-bridge.service qdrant.service 2>/dev/null || true;
+                systemctl --user stop genesis-server.service genesis-bridge.service \
+                    genesis-falkordb.service qdrant.service 2>/dev/null || true;
                 for u in genesis-server.service genesis-bridge.service \
                     genesis-watchdog.timer genesis-watchdog.service \
                     genesis-tmp-watchgod.service \
@@ -660,7 +662,8 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-serena-claude-code.service genesis-serena-codex.service \
                     genesis-cbm-query.service genesis-cbm-query-clients.slice \
                     genesis-backup.timer genesis-backup.service \
-                    genesis-cc-settings-align.timer genesis-cc-settings-align.service qdrant.service; do
+                    genesis-cc-settings-align.timer genesis-cc-settings-align.service \
+                    genesis-falkordb.service qdrant.service; do
                     systemctl --user disable \"\$u\" 2>/dev/null || true;
                 done;
                 DRY_RUN=false;
