@@ -516,7 +516,10 @@ Two triggers, two labels:
   below with `needs-architecture-session`.
 - **The owner decides a terminal round is rework** → `needs-rework`. The owner is
   present by definition, so this runs in the foreground:
-  1. Comment with the evidence and a DECISION-COMPLETE rework spec. Its sections
+  1. Open the `ready` follow-up FIRST (step 4 below). Then comment with the
+     evidence and a DECISION-COMPLETE rework spec, and end it with a
+     `Follow-up: <id>` line carrying that row's id, so a builder on another
+     machine can cite it. Its sections
      are defined in `.claude/docs/premise-check.md`, "Handing a verdict to a
      builder": findings by class; what is kept; what is deleted; the prescribed
      shape; the SPLIT plan (the `PR-shape:` line, as a list of PRs); every
@@ -535,8 +538,8 @@ Two triggers, two labels:
      (`gh label create needs-rework --description "Sent back for rework"`).
   3. Move the PR to draft (`gh pr ready <N> --undo`). If that fails, keep the
      label and say so in a second comment.
-  4. Open a `ready` follow-up naming the PR and the rework; nothing drains the
-     label.
+  4. The `ready` follow-up, opened before step 1, names the PR and the rework;
+     nothing drains the label. Its id is the `Follow-up:` line in the spec.
 
 Leave it OPEN (genesis-development, "Never RETIRE a PR you are not the one
 reviving"). By default (owner ruling, 2026-10-04) the rework arrives as one or
@@ -638,8 +641,10 @@ happened already. Before requesting or answering any further review:
      WITHOUT `(aside)`, so Devin's monitor acts on it, and tell it to rework on
      this branch rather than close the PR and open a replacement. Then convert the
      PR to draft (`gh pr ready <N> --undo`) and add the `needs-rework` label.
-   - **`PR-shape: SPLIT` and no `Shape:` reason in the body**, whatever the
-     premise verdict: post the audit WITHOUT `(aside)` with the split plan, and
+   - **`PR-shape: SPLIT` because the PR carries more than one concern, or
+     because of its size with no `Shape:` reason in the body**, whatever the
+     premise verdict. A `Shape:` line answers size, never a concern-based
+     split. In that case: post the audit WITHOUT `(aside)` with the split plan, and
      tell Devin to open the listed PRs as NEW PRs and close this one when the
      last opens. (This is stricter than an ordinary PR, where size is the
      author's call, because Devin cannot be asked to weigh it in conversation.)

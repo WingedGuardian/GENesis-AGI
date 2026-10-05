@@ -17,7 +17,7 @@ Every plan and every issue that specifies work answers six questions:
 3. Do the scope limits block the obvious shared code?
 4. Is the caller named and tracked (an issue), or is there a stated reason there is none?
 5. Does every number say how it was measured (what was counted, by which script)?
-6. Is the PR shape stated: the expected size in counted lines, and either a split into one-concern PRs or a `Shape:` reason when it will pass 500? (The size rule and its bands: review step 6 below.)
+6. Is the PR shape stated: the expected size in counted lines, and either a split into one-concern PRs or a `Shape:` reason when it will reach 500 or more? (The size rule and its bands: review step 6 below.)
 
 The answers belong in the plan or issue body, not in a reviewer's first round.
 

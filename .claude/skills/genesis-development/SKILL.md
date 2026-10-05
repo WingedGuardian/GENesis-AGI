@@ -3555,12 +3555,15 @@ Verify before any commit:
   private DM leaked via a test docstring + a code comment after the commit
   message and PR body were already clean.)
 - GROUNDWORK-tagged code not accidentally deleted
-- **PR shape, before opening the PR (#2737; owner, 2026-10-05).** Count the
-  branch in counted lines, which excludes tests, prose, changelog fragments,
-  and blank and comment lines, and counts a moved line once:
+- **PR shape, after your last commit and before opening the PR (#2737; owner,
+  2026-10-05).** It reads committed history, so staged changes are not counted:
+  commit first. Count the branch in counted lines, which excludes tests, prose,
+  changelog fragments, and blank and comment lines, and counts a moved line
+  once:
 
-      # from the repo root, after `git fetch origin main`; a stacked PR uses its parent branch, not origin/main
-      git diff -M origin/main...HEAD | python3 -c "import sys; sys.path.insert(0, 'scripts'); import pr_shape; r = pr_shape.count_diff(sys.stdin.read()); print(r['counted'], r['band'])"
+      # from the repo root, after `git fetch origin main`; a stacked PR uses its parent branch, not origin/main.
+      # A git error stops it before anything is counted, so a failed diff never reads as "0 ok".
+      d=$(git --no-pager diff --no-color --no-ext-diff -M origin/main...HEAD) && printf '%s\n' "$d" | python3 -c "import sys; sys.path.insert(0, 'scripts'); import pr_shape; r = pr_shape.count_diff(sys.stdin.read()); print(r['counted'], r['band'])"
 
   - Under 500 is the target.
   - From 500 to 1,000, add a `Shape:` line to the PR body saying why it
@@ -3989,8 +3992,9 @@ that takes up the rework is the reviving session above, and it owns the followin
 1. **New PRs, by default.** The rework arrives as one or more NEW PRs, with fresh
    round counts. When the LAST one opens, close the old PR with a comment
    linking every replacement; whoever opens the last one closes it. Leave its
-   labels on, so the rebuild stays traceable to it. If the send-back opened a
-   follow-up row, cite it as `Follow-up: <id>` in the last PR's body. Reworking under the old number happens only when
+   labels on, so the rebuild stays traceable to it. If the spec carries a
+   `Follow-up: <id>` line, copy it into the last PR's body, so the follow-up
+   closes when that PR merges. Reworking under the old number happens only when
    the owner grants it. The standing grant is a Devin-built PR kicked back
    under closing-session "Devin-built PRs", which is reworked on its own branch
    unless its spec says SPLIT; it still acknowledges and carries the section

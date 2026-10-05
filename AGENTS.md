@@ -45,7 +45,8 @@ not build it. When you build a rework:
   posted; otherwise wait for an answer on the old PR. On a Devin-built old PR,
   start the comment with `(aside)`, or it starts a paid Devin session.
 - **Open NEW PRs** with fresh round counts. When the last one opens, close the
-  old PR with a link to every replacement, and leave its labels on.
+  old PR with a link to every replacement, and leave its labels on. If the spec
+  ends with a `Follow-up: <id>` line, copy that line into the last PR's body.
 - **Follow the spec's split plan.** Each PR carries one concern and names the
   PRs it depends on. Open them in dependency order against main; a PR whose
   dependency has not merged waits as a branch, or opens stacked with its base
