@@ -17,10 +17,12 @@ These tests are organised around the ways that switch could reach further:
     publish in one command, and the dispatched-session deny are unchanged.
   * **Default.** With the key absent, the prompt asks exactly as before.
 
-Since the first-push-requires-PR rule (owner directive: "make it deterministic"),
-a FIRST push whose destination is the configured public repo is DENIED in every
-mode unless the same command is ``<plain git push> && gh pr create …`` (ready,
-not draft). So on the public repo the shape the switch silences is that chained
+Since the first-push-requires-PR rule, a FIRST push of the CURRENT branch whose
+destination is the configured public repo is DENIED in every mode unless the
+same command is ``<plain git push> && gh pr create …`` (ready, not draft, literal
+values). That is the client half only, for the shape a hook can read from text;
+other push spellings keep their ask, and the guarantee that no branch stays
+public unchecked is the server-side leak scan on branch pushes. So on the public repo the shape the switch silences is that chained
 form, and the scope tests below drive it with ``CHAIN`` appended; tests whose
 destination is NOT the public repo keep the bare push, whose behaviour is
 unchanged. Section (f) pins the rule itself.
@@ -55,7 +57,6 @@ CHAIN = " && gh pr create --title t --body-file b.md"
 
 #: Captured before the autouse fixture stubs it, for the tests that drive it for real.
 _REAL_ABSENT = gpg._remote_branch_definitely_absent
-_REAL_HEADS = gpg._remote_heads
 
 
 def _repo(tmp_path, git_config=()) -> Path:
@@ -111,12 +112,6 @@ def _first_publish(monkeypatch):
     # The definitive-absence probe is a network call: stubbed to "absent" here,
     # driven for real against a local bare repo in its own tests below.
     monkeypatch.setattr(gpg, "_remote_branch_definitely_absent", lambda *a, **k: True)
-    # The remote's branch list (pushes that are not a plain current-branch
-    # update): empty — nothing published yet. Tests that need a re-push set it.
-    monkeypatch.setattr(gpg, "_remote_heads", lambda urls, cwd: set())
-    # A configured gh-merge-base is compared with the default branch, which is a
-    # gh call: answered locally.
-    monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", "main")
     # main() arms a module-global deadline that outlives the call; a later test
     # driving a real probe directly would otherwise inherit an expired budget.
     monkeypatch.setattr(gpg, "_merge_deadline", None)
@@ -263,8 +258,7 @@ def test_a_publishing_pr_create_still_asks_when_off(
             "push URL differs from fetch URL",
         ),
         ("git push -u nosuch HEAD", (("remote.origin.url", PUBLIC),), "unresolvable destination"),
-        # "not the current branch" moved to section (g): on the public repo a
-        # push that would create another branch is now refused, not asked.
+        ("git push -u origin main", (("remote.origin.url", PUBLIC),), "not the current branch"),
         (
             "git push -u origin HEAD",
             (("remote.origin.url", PUBLIC), ("push.followTags", "true")),
@@ -858,12 +852,13 @@ def test_a_glob_in_the_push_keeps_the_prompt(command: str) -> None:
 
 # ─── (f) a first push to the public repo must bring its PR with it ───────────
 #
-# Owner directive ("make it deterministic"): a session must never be able to
-# leave a branch published on the public repo with no PR. The re-push block only
-# catches the branch on its NEXT push; a session that stops after one push used
-# to leave it public, PR-less, outside CI and the leak scan. A first push to the
-# public repo is therefore refused unless the same command is exactly
-# `<plain git push> && gh pr create …` with a ready (non-draft) create.
+# The re-push block only catches a PR-less branch on its NEXT push; a session
+# that stops after one push used to leave it public with no PR. So a first push
+# of the CURRENT branch to the public repo is refused unless the same command is
+# exactly `<plain git push> && gh pr create …` with a ready create and literal
+# values. Client half only: what gh resolves at run time (base repo, base
+# branch, commits ahead) and other push spellings are not modelled here — the
+# server-side leak scan on branch pushes is the guarantee.
 
 
 @pytest.fixture(params=["default", "off", "on"])
@@ -894,7 +889,7 @@ def test_the_deny_is_written_for_the_agent(monkeypatch, tmp_path, capsys) -> Non
     work goes instead."""
     rc, out, err = _run(monkeypatch, tmp_path, capsys, "git push -u origin HEAD")
     _assert_first_push_denied(rc, out, err)
-    assert "PUBLIC with NO PR" in err and "CI and the leak detector" in err, err
+    assert "PUBLIC with NO PR" in err and "server-side leak scan" in err, err
     assert 'git push -u origin HEAD && gh pr create --title "..." --body-file <file>' in err, err
     assert "stays committed locally, unpushed" in err, err
     assert "--draft/-d" in err, err
@@ -971,6 +966,13 @@ def test_every_ready_create_spelling_qualifies(
         ("git push -u origin HEAD # note && gh pr create -t t -b b", "bash comments out the create"),
         ('git push -u origin HEAD && gh pr create -t "$(cat t)" -b b', "a run-time substitution"),
         ("git push -u origin HEAD && gh pr create -t $T -b b", "a run-time expansion"),
+        ("git push -u origin HEAD && gh pr create -t `cat t` -b b", "a backtick substitution"),
+        ("git push -u origin HEAD && gh pr create -t * -b b", "a glob (*)"),
+        ("git push -u origin HEAD && gh pr create -t 'a?' -b b", "a glob (?), even quoted"),
+        ("git push -u origin HEAD && gh pr create -t [ab] -b b", "a glob ([)"),
+        ("git push -u origin HEAD && gh pr create -t {a,b} -b b", "a brace expansion"),
+        ("git push -u origin HEAD && gh pr create -t t -F ~/b.md", "a tilde expansion"),
+        ('git push -u origin HEAD && gh pr create -t t -b "$(cat x)"', "a quoted substitution"),
         (
             "git push -u origin HEAD && gh pr create -t t -b b && gh pr create -t u -b b",
             "a third step",
@@ -1145,35 +1147,6 @@ def test_the_deny_names_what_a_create_needs(
     assert "exactly one of --fill/-f, --fill-first, --fill-verbose" in err, err
 
 
-# ─── finding 3: a configured gh-merge-base retargets the PR ──────────────────
-
-
-@pytest.mark.parametrize(
-    ("merge_base", "default", "silenced"),
-    [
-        (None, "main", True),
-        ("main", "main", True),
-        ("dev", "main", False),
-        ("main", "", False),  # the default branch could not be looked up
-    ],
-    ids=["unset", "names-the-default", "another-base", "default-unknown"],
-)
-def test_a_gh_merge_base_must_name_the_default_branch(
-    monkeypatch, tmp_path, capsys, off, create_publishes, merge_base, default, silenced
-) -> None:
-    """gh takes the base from `branch.<cur>.gh-merge-base` when --base is absent;
-    a PR onto any other base gets no CI and no leak scan."""
-    monkeypatch.setenv("_TEST_GH_DEFAULT_BRANCH", default)
-    cfg = [("remote.origin.url", PUBLIC)]
-    if merge_base is not None:
-        cfg.append(("branch.feat/x.gh-merge-base", merge_base))
-    rc, out, err = _run(monkeypatch, tmp_path, capsys, "git push -u origin HEAD" + CHAIN, tuple(cfg))
-    if silenced:
-        _assert_silenced(rc, out, err)
-    else:
-        _assert_first_push_denied(rc, out, err)
-
-
 # ─── finding 4: a dry-run push does not exempt the create after it ───────────
 
 
@@ -1186,183 +1159,6 @@ def test_a_dry_run_chain_keeps_the_create_probe(monkeypatch, tmp_path, capsys, o
     _assert_asks(rc, out, err)
     assert len(probed) == 1, probed
     assert "gh pr create would push" in _hso(out)["permissionDecisionReason"]
-
-
-# ─── (g) finding 2: every other push shape that would create a public branch ──
-#
-# The rule above sits on the plain current-branch push. Every other spelling
-# used to reach only the catch-all ask, so a session could still leave a
-# PR-less branch on the public repo by writing the push differently.
-
-
-def _shaped_repo(tmp_path, branches=("feat/y", "a", "b"), on=None, cfg=()) -> Path:
-    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC), *cfg))
-    for name in branches:
-        subprocess.run(["git", "-C", str(repo), "branch", name], check=True, timeout=30)
-    subprocess.run(["git", "-C", str(repo), "tag", "v1"], check=True, timeout=30)
-    if on:
-        subprocess.run(["git", "-C", str(repo), "checkout", "-q", on], check=True, timeout=30)
-    return repo
-
-
-def _run_in(monkeypatch, repo, capsys, command):
-    # The create probe is a network call; these tests never depend on it.
-    monkeypatch.setattr(gpg, "_pr_create_would_publish", lambda argv: True)
-    payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(repo)}
-    monkeypatch.setattr(gpg.sys, "stdin", io.StringIO(json.dumps(payload)))
-    monkeypatch.chdir(repo)
-    rc = gpg.main()
-    out = capsys.readouterr()
-    return rc, out.out, out.err
-
-
-def _heads(monkeypatch, *names):
-    monkeypatch.setattr(gpg, "_remote_heads", lambda urls, cwd: set(names))
-
-
-@pytest.mark.parametrize(
-    ("command", "on", "creates"),
-    [
-        ("git push -u origin HEAD:refs/heads/other", None, "'other'"),
-        ("git push -u origin feat/y", None, "'feat/y'"),
-        ("git push origin HEAD:feat/y", None, "'feat/y'"),
-        ("git push origin feat/y:refs/heads/feat/y", None, "'feat/y'"),
-        ("git push origin a b", None, "'a', 'b'"),
-        ("git push origin feat/x a", None, "'a', 'feat/x'"),
-        ("git push --all origin", None, "'a', 'b', 'feat/x', 'feat/y', 'main'"),
-        ("git push origin feat/y", "main", "'feat/y'"),
-        ("git push -u origin HEAD", "main", "'main'"),
-        ("git push origin HEAD:refs/heads/new && gh pr create -t t -b b", None, "'new'"),
-    ],
-)
-def test_another_shape_that_creates_a_public_branch_is_denied(
-    monkeypatch, tmp_path, capsys, any_mode, command, on, creates
-) -> None:
-    repo = _shaped_repo(tmp_path, branches=("feat/y", "a", "b", "main"), on=on)
-    rc, out, err = _run_in(monkeypatch, repo, capsys, command)
-    assert rc == 2, (command, rc, out, err)
-    assert f"would create {creates} on the public repo" in err, (command, err)
-    assert "git push -u origin HEAD && gh pr create" in err, err
-
-
-@pytest.mark.parametrize(
-    ("command", "why"),
-    [
-        ("git push -u --repo=origin HEAD", "push option --repo"),
-        ("git push origin nosuch", "'nosuch' is not exactly one local branch or tag"),
-        ("git push --prune origin feat/y", "push option --prune"),
-        ("git push --recurse-submodules=on-demand origin feat/y", "push option --recurse-submodules"),
-        ("git -c push.default=upstream push origin feat/y", "git -c push.default"),
-        ("git push origin HEAD~1:feat/q", "refspec HEAD~1:feat/q"),
-    ],
-)
-def test_a_public_push_the_guard_cannot_read_is_denied(
-    monkeypatch, tmp_path, capsys, command, why
-) -> None:
-    repo = _shaped_repo(tmp_path)
-    rc, out, err = _run_in(monkeypatch, repo, capsys, command)
-    assert rc == 2, (command, rc, out, err)
-    assert "cannot tell whether it would create a branch there" in err, err
-    assert why in err, (why, err)
-
-
-def test_an_unreadable_remote_branch_list_is_denied(monkeypatch, tmp_path, capsys) -> None:
-    monkeypatch.setattr(gpg, "_remote_heads", lambda urls, cwd: None)
-    rc, out, err = _run_in(monkeypatch, _shaped_repo(tmp_path), capsys, "git push origin feat/y")
-    assert rc == 2 and "branch list could not be read" in err, (rc, out, err)
-
-
-@pytest.mark.parametrize(
-    ("command", "on", "present"),
-    [
-        ("git push -u origin feat/y", None, ("feat/y",)),
-        ("git push origin HEAD:refs/heads/other", None, ("other",)),
-        ("git push origin a b", None, ("a", "b")),
-        ("git push --all origin", None, ("a", "b", "feat/x", "feat/y", "main")),
-        ("git push origin feat/y", "main", ("feat/y", "main")),
-        ("git push -u origin HEAD", "main", ("main",)),
-    ],
-)
-def test_a_repush_in_another_shape_keeps_its_ask(
-    monkeypatch, tmp_path, capsys, command, on, present
-) -> None:
-    """Control: the same shapes, every branch already on the remote — a re-push,
-    which keeps the existing ask and is not newly denied."""
-    _heads(monkeypatch, *present)
-    repo = _shaped_repo(tmp_path, branches=("feat/y", "a", "b", "main"), on=on)
-    _assert_asks(*_run_in(monkeypatch, repo, capsys, command))
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        "git push -n origin feat/y",
-        "git push --dry-run --all origin",
-        "git push origin --delete feat/y",
-        "git push -d origin feat/y",
-        "git push origin :refs/heads/feat/y",
-        "git push origin v1",
-        "git push --tags origin",
-        "git push origin HEAD:refs/tags/v2",
-    ],
-)
-def test_a_push_that_creates_no_branch_keeps_its_ask(monkeypatch, tmp_path, capsys, command) -> None:
-    """Dry runs, deletions and tags publish no branch."""
-    _assert_asks(*_run_in(monkeypatch, _shaped_repo(tmp_path), capsys, command))
-
-
-def test_another_shape_off_the_public_repo_keeps_its_ask(monkeypatch, tmp_path, capsys) -> None:
-    repo = _shaped_repo(tmp_path, cfg=(("remote.origin.url", OTHER),))
-    _assert_asks(*_run_in(monkeypatch, repo, capsys, "git push origin feat/y"))
-
-
-def test_another_shape_with_no_public_repo_declared_keeps_its_ask(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "")
-    _assert_asks(*_run_in(monkeypatch, _shaped_repo(tmp_path), capsys, "git push origin feat/y"))
-
-
-def test_a_raw_public_url_in_another_shape_is_denied(monkeypatch, tmp_path, capsys) -> None:
-    rc, out, err = _run_in(monkeypatch, _shaped_repo(tmp_path), capsys, f"git push {PUBLIC} feat/y")
-    assert rc == 2 and "would create 'feat/y'" in err, (rc, out, err)
-
-
-def test_a_misparsed_push_option_value_cannot_hide_the_public_repo(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    """`-uo fork origin`: git takes `fork` as the push-option value and pushes to
-    origin, while the guard's remote resolution reads `fork`. Both readings are
-    tested, so the public destination is still found."""
-    repo = _shaped_repo(tmp_path, cfg=(("remote.fork.url", OTHER),))
-    rc, out, err = _run_in(monkeypatch, repo, capsys, "git push -uo fork origin feat/y")
-    assert rc == 2 and "cannot tell" in err, (rc, out, err)
-
-
-def test_another_shape_current_branch_chain_keeps_its_ask(monkeypatch, tmp_path, capsys) -> None:
-    """A current-branch push the narrow predicate refused (tags ride along) is in
-    the catch-all; chained with its PR it creates only the current branch, so
-    the chained create covers it and the ask stands."""
-    repo = _shaped_repo(tmp_path, cfg=(("push.followTags", "true"),))
-    _assert_asks(*_run_in(monkeypatch, repo, capsys, "git push -u origin HEAD" + CHAIN))
-    rc, out, err = _run_in(monkeypatch, repo, capsys, "git push -u origin HEAD")
-    assert rc == 2 and "would create 'feat/x'" in err, (rc, out, err)
-
-
-def test_another_shape_deny_yields_to_a_hard_block(monkeypatch, tmp_path, capsys) -> None:
-    rc, out, err = _run_in(
-        monkeypatch, _shaped_repo(tmp_path), capsys,
-        "git push origin feat/y; git commit --no-verify -m x",
-    )
-    assert rc == 2 and "--no-verify" in err, err
-    assert "would create" not in err, err
-
-
-def test_the_real_remote_heads_lists_branches(tmp_path) -> None:
-    bare = _bare(tmp_path, True)
-    assert _REAL_HEADS({bare}, None) == {"feat/x"}
-    assert _REAL_HEADS({str(tmp_path / "nope.git")}, None) is None
-    assert _REAL_HEADS(set(), None) is None
 
 
 # ─── (h) review round: the remaining ways to end up public with no PR ─────────
@@ -1409,187 +1205,3 @@ def test_a_create_carrying_metadata_does_not_carry_a_first_push(
 )
 def test_the_create_allowlist_refuses_metadata(argv) -> None:
     assert gpg._create_opts_open_a_ready_pr(argv, None) is False
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        "git push --no-verify",
-        "git push --no-verify origin HEAD",
-        "git push --verify origin feat/x",
-        "git push --signed origin HEAD",
-        "git push --signed=if-asked origin HEAD",
-        "git push --no-signed origin HEAD",
-        "git -c core.sshCommand=ssh push origin HEAD",
-        "git --config-env=core.sshCommand=SSH_CMD push origin HEAD",
-        "git push --recurse-submodules=check origin HEAD",
-        "git push --no-recurse-submodules origin HEAD",
-        "git push --receive-pack=git-receive-pack origin HEAD",
-    ],
-)
-def test_a_repush_with_a_ref_neutral_option_keeps_its_ask(
-    monkeypatch, tmp_path, capsys, command
-) -> None:
-    """Options that change neither WHICH refs are pushed nor WHERE: the branch is
-    already on the remote (a re-push), so the push is not newly denied."""
-    _heads(monkeypatch, "feat/x")
-    _assert_asks(*_run_in(monkeypatch, _shaped_repo(tmp_path), capsys, command))
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        "git push --no-verify -u origin HEAD",
-        "git push --signed origin HEAD",
-        "git -c core.sshCommand=ssh push origin HEAD",
-        "git push --recurse-submodules=check origin HEAD",
-    ],
-)
-def test_a_first_push_with_a_ref_neutral_option_is_denied_by_name(
-    monkeypatch, tmp_path, capsys, command
-) -> None:
-    """Control: the same options on a FIRST push are still refused — and now by
-    what they would create, not by "cannot tell". Chained with its PR, an option
-    AFTER `push` keeps the ask; a `git -c` BEFORE it is not the one plain push
-    the chained shape accepts, so that chain is still refused."""
-    repo = _shaped_repo(tmp_path)
-    rc, out, err = _run_in(monkeypatch, repo, capsys, command)
-    assert rc == 2 and "would create 'feat/x'" in err, (command, rc, out, err)
-    rc, out, err = _run_in(monkeypatch, repo, capsys, command + CHAIN)
-    if command.startswith("git -c"):
-        assert rc == 2 and "would create 'feat/x'" in err, (command, rc, out, err)
-    else:
-        _assert_asks(rc, out, err)
-
-
-@pytest.mark.parametrize(
-    ("command", "why"),
-    [
-        ("git push --prune origin HEAD", "push option --prune"),
-        ("git push --recurse-submodules=on-demand origin HEAD", "--recurse-submodules=on-demand"),
-        ("git push --repo=origin HEAD", "push option --repo"),
-        ("git push --al origin", "push option --al"),
-        ("git push --mirr origin", "push option --mirr"),
-        ("git push --stdin origin", "push option --stdin"),
-        ("git -c remote.origin.push=refs/heads/*:refs/heads/x/* push origin HEAD", "git -c remote"),
-        ("git -c push.default=matching push", "git -c push.default"),
-        ("git -c url.https://example.invalid/.pushInsteadOf=x push origin HEAD", "git -c url"),
-        ("git -c submodule.recurse=true push origin HEAD", "git -c submodule"),
-        ("git --config-env=remote.origin.mirror=M push", "git --config-env remote"),
-        ("git --namespace=x push origin HEAD", "git option --namespace"),
-    ],
-)
-def test_an_option_that_moves_refs_is_still_cannot_tell_on_a_repush(
-    monkeypatch, tmp_path, capsys, command, why
-) -> None:
-    """Control: options that change WHICH refs go or WHERE stay "cannot tell" even
-    when every branch is already on the remote — the guard cannot know the set."""
-    _heads(monkeypatch, "feat/x", "feat/y", "a", "b", "main")
-    rc, out, err = _run_in(monkeypatch, _shaped_repo(tmp_path), capsys, command)
-    assert rc == 2 and "cannot tell" in err, (command, rc, out, err)
-    assert why in err, (why, err)
-
-
-@pytest.mark.parametrize(
-    ("on", "command"), [("main", "git push"), (None, "git push origin feat/y")]
-)
-def test_a_mirror_remote_cannot_be_read_and_is_denied(
-    monkeypatch, tmp_path, capsys, on, command
-) -> None:
-    """`remote.<r>.mirror=true` makes a push behave as `--mirror`: every local
-    ref, forced. Every branch is already on the remote here, so only the mirror
-    setting can make this a deny."""
-    _heads(monkeypatch, "feat/x", "feat/y", "a", "b", "main")
-    repo = _shaped_repo(
-        tmp_path,
-        branches=("feat/y", "a", "b", "main"),
-        on=on,
-        cfg=(("remote.origin.mirror", "true"),),
-    )
-    rc, out, err = _run_in(monkeypatch, repo, capsys, command)
-    assert rc == 2 and "cannot tell" in err and "mirror" in err, (rc, out, err)
-
-
-@pytest.mark.parametrize("value", ["false", None])
-def test_a_non_mirror_remote_keeps_its_ask(monkeypatch, tmp_path, capsys, value) -> None:
-    _heads(monkeypatch, "feat/x", "feat/y", "a", "b", "main")
-    cfg = (("remote.origin.mirror", value),) if value else ()
-    repo = _shaped_repo(tmp_path, branches=("feat/y", "a", "b", "main"), on="main", cfg=cfg)
-    _assert_asks(*_run_in(monkeypatch, repo, capsys, "git push"))
-
-
-def test_a_mirror_remote_blocks_the_silent_repush_too(monkeypatch, tmp_path, capsys) -> None:
-    """The current-branch re-push relaxation refuses a mirror remote, so it lands
-    in the catch-all — where it is now denied rather than asked."""
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
-    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 1)
-    _heads(monkeypatch, "feat/x")
-    repo = _shaped_repo(tmp_path, cfg=(("remote.origin.mirror", "true"),))
-    rc, out, err = _run_in(monkeypatch, repo, capsys, "git push origin HEAD")
-    assert rc == 2 and "mirror" in err, (rc, out, err)
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        'cd "$WT" && git push -u origin HEAD',
-        'cd "$WT" && git push origin feat/y',
-        'cd "$WT" && git push',
-        'cd "$WT" && git push git@github.com:owner/repo.git HEAD',
-        f'cd "$WT" && git push {PUBLIC}.git HEAD',
-        'cd "$WT" && git push -u origin HEAD' + CHAIN,
-        "cd - && git push -u origin HEAD",
-        "git --git-dir=.git push origin HEAD",
-    ],
-)
-def test_a_push_from_an_unresolvable_directory_is_denied(
-    monkeypatch, tmp_path, capsys, any_mode, command
-) -> None:
-    """The guard cannot tell which checkout, branch or remote the push uses, so
-    on an install with a public repo it refuses and says how to make it legible."""
-    rc, out, err = _run_in(monkeypatch, _shaped_repo(tmp_path), capsys, command)
-    assert rc == 2, (command, rc, out, err)
-    assert "cannot resolve the directory" in err and "git -C <literal path>" in err, err
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        f'cd "$WT" && git push {OTHER} HEAD',
-        'cd "$WT" && git push git@gitlab.com:owner/repo.git HEAD',
-        'cd "$WT" && git push ssh://git@github.com/owner/other.git HEAD',
-        'cd "$WT" && git push /srv/mirrors/repo.git HEAD',
-        'cd "$WT" && git push --dry-run origin HEAD',
-    ],
-)
-def test_an_unresolvable_directory_push_provably_off_the_public_repo_keeps_its_ask(
-    monkeypatch, tmp_path, capsys, command
-) -> None:
-    """Controls: a literal destination that names another repository, or a dry
-    run, cannot publish to the public repo — the ask stands, no new deny."""
-    _assert_asks(*_run_in(monkeypatch, _shaped_repo(tmp_path), capsys, command))
-
-
-def test_an_unresolvable_directory_push_with_no_public_repo_keeps_its_ask(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "")
-    _assert_asks(
-        *_run_in(monkeypatch, _shaped_repo(tmp_path), capsys, 'cd "$WT" && git push -u origin HEAD')
-    )
-
-
-def test_the_merge_base_is_read_once_per_command(monkeypatch, tmp_path, capsys, off) -> None:
-    """`_gh_merge_base_is_default` sits under every `_push_then_pr_create` call,
-    and a chained first push reaches that two or three times: one config read."""
-    reads = []
-    real = gpg._git_config_get
-
-    def counting(base, key, **kw):
-        if key.endswith(".gh-merge-base"):
-            reads.append(key)
-        return real(base, key, **kw)
-
-    monkeypatch.setattr(gpg, "_git_config_get", counting)
-    _assert_silenced(*_run(monkeypatch, tmp_path, capsys, "git push -u origin HEAD" + CHAIN))
-    assert reads == ["branch.feat/x.gh-merge-base"], reads

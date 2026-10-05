@@ -44,9 +44,9 @@ def _run(
     if dispatched:
         env["GENESIS_CC_SESSION"] = "1"
     # These run in the test process's checkout, whose origin is the real public
-    # repo. With an install's declared public repo in scope, a push there that
-    # would create a branch is refused outright (the first-push-requires-PR
-    # rule) — an answer that depends on install config and live branch state,
+    # repo. With an install's declared public repo in scope, a first push of the
+    # current branch there with no chained PR is refused outright (the
+    # first-push-requires-PR rule) — an answer that depends on install config and live branch state,
     # not on what these tests are about. Pin "no public repo declared", as on a
     # CI runner; the rule itself is covered in test_push_publish_ask_switch.py.
     env["_TEST_CANONICAL_PUBLIC_REPO"] = ""

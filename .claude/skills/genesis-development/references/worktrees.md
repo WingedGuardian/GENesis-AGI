@@ -104,14 +104,16 @@ over.
   autonomous delivery goes through the scope-gated server path, not the CC Bash
   tool). Force push (`--force` / `--force-with-lease` / `-f` / `+refspec` /
   `--mirror`) is **hard-blocked** in every session. Multiple pushes in one
-  command are blocked — each push needs its own approval. A push that would
-  **create** a branch on the configured public repo — in any spelling: the
-  current branch, another branch, a refspec, `--all` — is **denied** unless the
+  command are blocked — each push needs its own approval. A **first push of
+  the current branch** to the configured public repo is **denied** unless the
   same command opens its PR: exactly `git push -u origin HEAD && gh pr create
   --title "..." --body-file <file>` (ready, never `--draft`; title AND body, or
-  one `--fill` flag), from the branch's own checkout. A branch that is
-  not ready for a PR stays committed locally, unpushed. Full rule and residue:
-  the genesis-development SKILL, "A FIRST push to the configured public repo".
+  one `--fill` flag; literal values), from the branch's own checkout. Other
+  push spellings keep their ask; the guarantee that no branch stays public
+  unchecked is the server-side leak scan on branch pushes, not this hook. A
+  branch that is not ready for a PR stays committed locally, unpushed. Full
+  rule and what it does not model: the genesis-development SKILL, "A FIRST
+  push of the CURRENT branch".
 - `gh pr create` — a create only publishes code in the **implicit** form (no
   `--head`), where gh may *push* (and can fork) the current branch when it isn't
   fully on the remote. So an **explicit `--head`** (local, unpushed, or
