@@ -1968,3 +1968,37 @@ def test_partial_cover_needs_a_full_catch_somewhere():
     killed no test."""
     assert _verdicts(_PARTIAL_COVER_ALONE_IS_NOT_ENOUGH) == ["LEAKS"]
     assert _verdicts(_PARTIAL_COVER_PLUS_AN_OUTER_FULL_CATCH) == ["CLEANS_UP"]
+
+
+_DIRECTORY_TEMP_RMTREE_IS_CLEANUP = """
+import shutil
+
+def copy_aside(src, dest):
+    tmp = dest.with_name(dest.name + ".tmp")
+    try:
+        shutil.copytree(src, tmp)
+        tmp.rename(dest)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+"""
+
+_DIRECTORY_TEMP_WITHOUT_CLEANUP = """
+import shutil
+
+def copy_aside(src, dest):
+    tmp = dest.with_name(dest.name + ".tmp")
+    shutil.copytree(src, tmp)
+    tmp.rename(dest)
+"""
+
+
+def test_rmtree_of_a_directory_temp_is_cleanup():
+    """A temp can be a directory; `shutil.rmtree(tmp)` on the failure path is
+    its cleanup. Reading only unlink/remove reported the protected site LEAKS."""
+    assert _verdicts(_DIRECTORY_TEMP_RMTREE_IS_CLEANUP) == ["CLEANS_UP"]
+
+
+def test_a_directory_temp_without_cleanup_still_leaks():
+    """PRECISION half: crediting rmtree must not clear an unprotected site."""
+    assert _verdicts(_DIRECTORY_TEMP_WITHOUT_CLEANUP) != ["CLEANS_UP"]
