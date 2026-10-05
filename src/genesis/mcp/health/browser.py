@@ -832,19 +832,24 @@ async def _ensure_vnc():
                 started = True
                 logger.info("Started genesis-vnc + genesis-novnc via systemctl")
         except Exception:
-            # Fallback: start x11vnc directly if systemctl unavailable
+            # Fallback: start x11vnc directly if systemctl unavailable.
+            # The fallback keeps password authentication, like the unit: with
+            # no password file it starts nothing and says why.
+            vnc_passwd = Path.home() / ".genesis" / "vnc_passwd"
+            if not vnc_passwd.exists():
+                logger.warning(
+                    "VNC fallback not started: %s is missing, and the fallback "
+                    "keeps password authentication. Run scripts/setup-vnc.sh "
+                    "to create it.",
+                    vnc_passwd,
+                )
+                return
             try:
                 import subprocess as _sp2
 
-                vnc_passwd = Path.home() / ".genesis" / "vnc_passwd"
-                auth_arg = (
-                    ["-rfbauth", str(vnc_passwd)]
-                    if vnc_passwd.exists()
-                    else ["-nopw"]
-                )
                 _sp2.Popen(
                     ["x11vnc", "-display", _VNC_DISPLAY, "-forever", "-shared",
-                     "-rfbport", "5999", "-bg"] + auth_arg,
+                     "-rfbport", "5999", "-bg", "-rfbauth", str(vnc_passwd)],
                     stdout=_sp2.DEVNULL, stderr=_sp2.DEVNULL,
                 )
                 started = True

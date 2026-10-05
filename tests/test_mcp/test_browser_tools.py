@@ -1193,6 +1193,39 @@ class TestReclaimVncPort:
         kill.assert_not_called()
 
 
+class TestVncFallbackKeepsPasswordAuth:
+    """When systemctl is unavailable, _ensure_vnc starts x11vnc itself. That
+    fallback keeps password authentication, like the genesis-vnc unit."""
+
+    @staticmethod
+    async def _run(home: Path):
+        popen = MagicMock()
+        with (
+            patch.object(browser, "_reclaim_vnc_port"),
+            patch("subprocess.run", side_effect=FileNotFoundError("systemctl")),
+            patch("subprocess.Popen", popen),
+            patch.object(browser.Path, "home", return_value=home),
+        ):
+            await browser._ensure_vnc()
+        return popen
+
+    @pytest.mark.asyncio
+    async def test_no_password_file_starts_nothing(self, tmp_path):
+        popen = await self._run(tmp_path)
+        popen.assert_not_called()
+        assert browser._vnc_verified is False
+
+    @pytest.mark.asyncio
+    async def test_with_a_password_file_it_uses_it(self, tmp_path):
+        (tmp_path / ".genesis").mkdir()
+        (tmp_path / ".genesis" / "vnc_passwd").write_bytes(b"x")
+        popen = await self._run(tmp_path)
+        argv = popen.call_args.args[0]
+        assert argv[argv.index("-rfbauth") + 1] == str(tmp_path / ".genesis" / "vnc_passwd")
+        assert "-nopw" not in argv
+        assert browser._vnc_verified is True
+
+
 def _ts_page(*, selectors_present=(), title="Example Domain", url="https://example.com/"):
     """Fake page for turnstile detection tests."""
     present = set(selectors_present)
