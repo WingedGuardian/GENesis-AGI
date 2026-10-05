@@ -451,7 +451,10 @@ happened already. Before requesting or answering any further review:
    evidence, the effect question, the comparative question (an existing chokepoint
    the change duplicates or bypasses), the five plan-time questions, then
    BLOCKER / SHOULD-FIX / NOTE findings and what a rework should do. Hand it the PR
-   number, not your own reading of the diff.
+   number AND the expected head SHA, and have it fetch that head
+   (`git fetch origin pull/<N>/head:<ref>`) and confirm the match before
+   reading anything; an auditor pointed at a stale or main checkout audits the
+   wrong diff with full confidence. Never hand it your own reading of the diff.
 2. **Re-derive every claim the disposition rests on** from the PR head or by
    re-running the audit's own probe, before acting (CLAUDE.md, "Verify agent
    output").
@@ -469,12 +472,16 @@ happened already. Before requesting or answering any further review:
      ordinary per-PR loop.
 
    For Devin PRs this owner rule replaces premise-check.md's "SOUND-BUT-INFERIOR is
-   NOT a kick-back" and its two-signal bar: the audit runs before any rounds exist,
-   so there are no round signals to count.
+   NOT a kick-back" and its two-signal bar. The audit runs after at most Codex's
+   automatic opening round, before any further one, and round signals take several
+   rounds to accumulate; the owner ruled that a wrong shape goes back to Devin on
+   the audit's own evidence rather than spending those rounds to prove it.
 4. **Track every kick-back.** A draft leaves the closing set and nothing reads the
-   label, so open one `ready` follow-up per batch naming each PR, its audit
-   comment, and what closes it: Devin pushed the rework and marked it ready, or the
-   owner decided. Re-check those PRs on each queue sweep.
+   label, so open one follow-up per batch with `work_state="blocked_on_trigger"`
+   (it waits on Devin, so it is not actionable now) naming each PR and its audit
+   comment, with a `revisit_condition` saying what unblocks it: Devin pushed the
+   rework and marked it ready, or the owner decided. Re-check those PRs on each
+   queue sweep.
 5. **When a kicked-back PR comes back ready,** request `@codex review` (marking a
    draft ready is not a reliable trigger) and work it normally. If Devin closed it
    and opened a replacement instead, which happened with #2309 and #2354, link the

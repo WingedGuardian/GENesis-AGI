@@ -148,9 +148,9 @@ what it says it was built to do — a major rework, or a material finding that m
 the whole premise. Everything short of that stays in the gate and gets iterated
 on: a premise slightly off, needing modest rework a review session can carry in a
 round or two, is the ordinary case and is NOT a kick-back. (One owner-ruled
-exception: a Devin-built PR is audited before any rounds are spent, and a
-SOUND-BUT-INFERIOR verdict with a better shape that changes the mechanism IS
-kicked back to Devin. See the closing-session skill, "Devin-built PRs".)
+exception: a Devin-built PR is audited before further rounds are spent, and a
+SOUND-BUT-INFERIOR verdict with a better shape that changes the mechanism or the
+files touched IS kicked back to Devin. See the closing-session skill, "Devin-built PRs".)
 
 **The evidence bar is TWO OR MORE independent signals**, the same bar the
 round-2 gate message states, because a doc that set a lower one would be the
