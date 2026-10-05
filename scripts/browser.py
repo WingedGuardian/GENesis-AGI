@@ -15,14 +15,54 @@ Usage:
 """
 
 import argparse
+import fcntl
+import os
 import sys
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
-
 USER_DATA_DIR = Path.home() / ".genesis" / "browser-profile"
+
+# The browser-stack lock: the same path as genesis.browser.engine.BROWSER_LOCK_FILE
+# (this CLI imports no genesis modules; tests/test_scripts/test_browser_cli_stack_lock.py
+# keeps the two equal). A provisioning run holds it EXCLUSIVE; every local browser,
+# this one included, holds it SHARED while it may be alive.
+STACK_LOCK_FILE = Path.home() / ".genesis" / "locks" / "browser-provision.lock"
+
+# The open descriptor carries the shared hold; closing it, which the kernel does
+# when this process exits, is what releases it. Held for the whole run, so the
+# browser and its driver are gone before the lock is.
+_stack_lock_fd: int | None = None
+
+
+def _hold_browser_stack() -> None:
+    """Hold the browser-stack lock SHARED for the rest of this process.
+
+    Raises RuntimeError when a provisioning run holds it (an upgrade is in
+    progress). A lock file that cannot be opened or locked for any other reason
+    is reported on stderr and the command proceeds, as the MCP tools do.
+    """
+    global _stack_lock_fd
+    try:
+        STACK_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(STACK_LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    except OSError as exc:
+        print(f"Warning: could not open the browser-stack lock: {exc}", file=sys.stderr)
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise RuntimeError(
+            "the browser stack is being upgraded right now (another process holds the "
+            "browser-stack lock exclusively); try again when it finishes"
+        ) from None
+    except OSError as exc:
+        os.close(fd)
+        print(f"Warning: could not lock the browser-stack lock: {exc}", file=sys.stderr)
+        return
+    _stack_lock_fd = fd
 
 
 def _default_screenshot_path() -> str:
@@ -38,6 +78,15 @@ def _default_screenshot_path() -> str:
     return str(Path.home() / "tmp" / f"browser_screenshot_{stamp}_{uuid.uuid4().hex}.png")
 
 
+def _sync_playwright():
+    """playwright's sync context manager, imported only once the browser-stack
+    lock is held (main takes it first), so the import never reads package files
+    a provisioning run is halfway through replacing."""
+    from playwright.sync_api import sync_playwright
+
+    return sync_playwright()
+
+
 def _launch(pw):
     """Launch a persistent Chromium context with container-safe flags."""
     USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -51,7 +100,7 @@ def _launch(pw):
 
 
 def cmd_navigate(args):
-    with sync_playwright() as pw:
+    with _sync_playwright() as pw:
         context, page = _launch(pw)
         try:
             page.goto(args.url, wait_until="domcontentloaded", timeout=30000)
@@ -64,7 +113,7 @@ def cmd_navigate(args):
 
 
 def cmd_click(args):
-    with sync_playwright() as pw:
+    with _sync_playwright() as pw:
         context, page = _launch(pw)
         try:
             page.click(args.selector, timeout=10000)
@@ -74,7 +123,7 @@ def cmd_click(args):
 
 
 def cmd_fill(args):
-    with sync_playwright() as pw:
+    with _sync_playwright() as pw:
         context, page = _launch(pw)
         try:
             page.fill(args.selector, args.value, timeout=10000)
@@ -84,7 +133,7 @@ def cmd_fill(args):
 
 
 def cmd_snapshot(args):
-    with sync_playwright() as pw:
+    with _sync_playwright() as pw:
         context, page = _launch(pw)
         try:
             snapshot = page.locator("body").aria_snapshot()
@@ -94,7 +143,7 @@ def cmd_snapshot(args):
 
 
 def cmd_screenshot(args):
-    with sync_playwright() as pw:
+    with _sync_playwright() as pw:
         context, page = _launch(pw)
         try:
             path = args.path or _default_screenshot_path()
@@ -131,6 +180,7 @@ def main():
 
     args = parser.parse_args()
     try:
+        _hold_browser_stack()
         args.func(args)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)

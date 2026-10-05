@@ -33,14 +33,14 @@ def test_ready_engine_is_active(monkeypatch, tmp_path):
 
 def test_missing_engine_is_degraded_with_reason(monkeypatch, caplog):
     status = engine.EngineStatus(
-        engine.LEGACY_LAYOUT, "pre-0.5 engine; run install_browser_stack.sh"
+        engine.LEGACY_LAYOUT, f"pre-0.5 engine; {engine.PROVISION_HINT}"
     )
     monkeypatch.setattr(engine, "camoufox_engine_status", lambda: status)
     rt = _bare_runtime()
     with caplog.at_level(logging.INFO):
         rt._run_init_step("browser_automation", rt._init_browser_automation)
     assert rt._bootstrap_manifest["browser_automation"] == "degraded"
-    assert "install_browser_stack.sh" in caplog.text
+    assert "pre-0.5 engine" in caplog.text and engine.PROVISION_HINT in caplog.text
 
 
 def test_probe_error_degrades_never_fails(monkeypatch):

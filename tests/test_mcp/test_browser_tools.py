@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import os
 import re
 import signal
 import sys
@@ -21,10 +22,12 @@ def _clear_all_browser_state():
     browser._stealth_cm = None
     browser._stealth_browser = None
     browser._stealth_page = None
+    browser._playwright_cm = None
     browser._playwright = None
     browser._context = None
     browser._page = None
     browser._active_page = None
+    browser._stack_teardown_unconfirmed = None
     browser._collaborate_mode = False
     browser._browser_lock = asyncio.Lock()
     # Remote CDP state
@@ -45,10 +48,23 @@ def _reset_browser_state(tmp_path, monkeypatch):
     from genesis.browser import engine
 
     monkeypatch.setattr(engine, "BROWSER_LOCK_FILE", tmp_path / "locks" / "browser.lock")
+    # Which browser distributions count as loaded, and at what version, is
+    # process state the module accumulates; start each test from the startup view.
+    monkeypatch.setattr(
+        browser, "_LOADED_BROWSER_VERSIONS",
+        {d: v for d, v in browser._STARTUP_BROWSER_VERSIONS.items() if d in sys.modules},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        browser, "_LAST_SEEN_BROWSER_VERSIONS", dict(browser._STARTUP_BROWSER_VERSIONS),
+        raising=False,
+    )
     _clear_all_browser_state()
     yield
     _clear_all_browser_state()
-    browser._release_stack_lock()
+    if browser._stack_lock_fd is not None:
+        os.close(browser._stack_lock_fd)
+        browser._stack_lock_fd = None
 
 
 class TestIsPageAlive:
@@ -124,12 +140,12 @@ class TestEnsureBrowserRecovery:
         the call, so an unready engine must stop the launch before camoufox runs."""
         from genesis.browser import engine
 
-        legacy = engine.EngineStatus(engine.LEGACY_LAYOUT, "pre-0.5 engine; run install_browser_stack.sh")
+        legacy = engine.EngineStatus(engine.LEGACY_LAYOUT, f"pre-0.5 engine; {engine.PROVISION_HINT}")
         constructed = MagicMock()
         with (
             patch.object(engine, "camoufox_engine_status", return_value=legacy),
             patch.dict("sys.modules", {"camoufox.async_api": MagicMock(AsyncCamoufox=constructed)}),
-            pytest.raises(browser.CamoufoxEngineNotReady, match="install_browser_stack"),
+            pytest.raises(browser.CamoufoxEngineNotReady, match="pre-0.5 engine"),
         ):
             await browser._ensure_browser()
         constructed.assert_not_called()
@@ -163,7 +179,7 @@ class TestEnsureBrowserRecovery:
         assert "Restart this Claude Code session" in result["error"]
         assert "-> 9.99.0" in result["error"]
         assert "BrowserBindResult" in result["error"]
-        assert "install_browser_stack" not in result["error"]
+        assert "camoufox fetch" not in result["error"]
 
     @pytest.mark.asyncio
     async def test_launch_refused_on_stale_loaded_modules(self):
@@ -258,7 +274,9 @@ class TestEnsureBrowserRecovery:
         ):
             result = await browser._impl_browser_navigate("https://example.com")
         assert result["error"].startswith("Browser not available")
-        assert "install_browser_stack.sh" in result["error"]
+        from genesis.browser.engine import PROVISION_HINT
+
+        assert PROVISION_HINT in result["error"]
 
     @pytest.mark.asyncio
     async def test_cleanup_safe_on_dead_browser(self):
@@ -1620,3 +1638,510 @@ class TestBrowserScreenshotUniquePath:
         stamps = [Path(r["path"]).name.split("_")[-2] for r in (first, second)]
         assert stamps[0] != stamps[1], stamps
         assert stamps[0] < stamps[1], stamps
+
+
+# ── Browser-stack lock lifetime ──────────────────────────────────────────────
+# The shared hold on engine.BROWSER_LOCK_FILE must be held exactly while a local
+# browser process this MCP started may be alive. Each test drives one path that
+# creates or ends such a process and probes the lock from OUTSIDE, the way a
+# provisioning run does: an exclusive non-blocking flock on a separate open file
+# description, which fails while any shared hold exists.
+
+
+def _stack_lock_held() -> bool:
+    import fcntl
+
+    from genesis.browser import engine
+
+    path = engine.BROWSER_LOCK_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as probe:
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(probe, fcntl.LOCK_UN)
+        return False
+
+
+def _ready_engine():
+    from genesis.browser import engine
+
+    return patch.object(
+        engine,
+        "camoufox_engine_status",
+        return_value=engine.EngineStatus(engine.READY, "test engine", Path("/engine")),
+    )
+
+
+def _live_page():
+    page = MagicMock()
+    page.is_closed.return_value = False
+    page.url = "https://example.com"
+    return page
+
+
+def _dead_page():
+    page = MagicMock()
+    page.is_closed.return_value = True
+    return page
+
+
+def _camoufox_cm(*, enter=None, exit_=None):
+    """An AsyncCamoufox stand-in: __aenter__ returns a browser with one live page."""
+    cm = MagicMock()
+    if enter is None:
+        launched = MagicMock()
+        launched.pages = [_live_page()]
+        enter = AsyncMock(return_value=launched)
+    cm.__aenter__ = enter
+    cm.__aexit__ = exit_ if exit_ is not None else AsyncMock(return_value=None)
+    return cm
+
+
+def _camoufox_module(*cms):
+    """sys.modules entry whose AsyncCamoufox hands out ``cms`` in order."""
+    return {"camoufox.async_api": MagicMock(AsyncCamoufox=MagicMock(side_effect=list(cms)))}
+
+
+def _playwright_cm(*, start=None, context=None, stop=None):
+    """An async_playwright() stand-in owning one driver."""
+    pw = MagicMock()
+    pw.stop = stop if stop is not None else AsyncMock(return_value=None)
+    if context is None:
+        context = MagicMock()
+        context.pages = [_live_page()]
+        context.close = AsyncMock(return_value=None)
+    pw.chromium.launch_persistent_context = AsyncMock(return_value=context)
+    cm = MagicMock()
+    cm.start = start if start is not None else AsyncMock(return_value=pw)
+    cm.__aexit__ = AsyncMock(return_value=None)
+    return cm, pw
+
+
+def _playwright_module(*cms):
+    return {"playwright.async_api": MagicMock(async_playwright=MagicMock(side_effect=list(cms)))}
+
+
+class TestBrowserStackLockLifetime:
+    @pytest.mark.asyncio
+    async def test_direct_ensure_browser_holds_the_lock(self):
+        """Medium's CamoufoxBrowserClient calls _ensure_browser directly, never
+        _get_page: the launch itself must take the hold."""
+        from genesis.distribution.medium import CamoufoxBrowserClient
+
+        with (
+            _ready_engine(),
+            patch.dict("sys.modules", _camoufox_module(_camoufox_cm())),
+        ):
+            await CamoufoxBrowserClient()._ensure_browser()
+        assert browser._stealth_cm is not None
+        assert _stack_lock_held()
+
+        await browser.async_cleanup()
+        assert not _stack_lock_held()
+
+    @pytest.mark.asyncio
+    async def test_direct_ensure_browser_refused_mid_upgrade(self):
+        import fcntl
+
+        from genesis.browser import engine
+
+        cm = _camoufox_cm()
+        engine.BROWSER_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            _ready_engine(),
+            patch.dict("sys.modules", _camoufox_module(cm)),
+            open(engine.BROWSER_LOCK_FILE, "w") as provisioning,
+        ):
+            fcntl.flock(provisioning, fcntl.LOCK_EX)
+            with pytest.raises(Exception, match="being upgraded") as refused:
+                await browser._ensure_browser()
+        assert type(refused.value).__name__ == "BrowserStackBusy"
+        cm.__aenter__.assert_not_awaited()
+        assert browser._stealth_cm is None
+
+    @pytest.mark.asyncio
+    async def test_stale_camoufox_restart_keeps_the_lock(self):
+        """Stale-page recovery runs async_cleanup (which drops the hold) and then
+        launches a replacement: the replacement must be under the hold again."""
+        first, second = _camoufox_cm(), _camoufox_cm()
+        with (
+            _ready_engine(),
+            patch.dict("sys.modules", _camoufox_module(first, second)),
+            patch.object(browser, "_ensure_vnc", new=AsyncMock()),
+            patch.object(browser, "_start_idle_watcher"),
+        ):
+            await browser._get_page(stealth=True)
+            assert _stack_lock_held()
+            browser._stealth_page = _dead_page()
+            await browser._get_page(stealth=True)
+        first.__aexit__.assert_awaited_once()
+        second.__aenter__.assert_awaited_once()
+        assert _stack_lock_held(), "the replacement browser runs without the hold"
+
+    @pytest.mark.asyncio
+    async def test_stale_chromium_restart_keeps_the_lock(self):
+        (cm1, pw1), (cm2, _pw2) = _playwright_cm(), _playwright_cm()
+        with (
+            patch.dict("sys.modules", _playwright_module(cm1, cm2)),
+            patch.object(browser, "_ensure_vnc", new=AsyncMock()),
+            patch.object(browser, "_start_idle_watcher"),
+        ):
+            await browser._get_page(stealth=False)
+            assert _stack_lock_held()
+            browser._page = _dead_page()
+            await browser._get_page(stealth=False)
+        pw1.stop.assert_awaited_once()
+        cm2.start.assert_awaited_once()
+        assert _stack_lock_held(), "the replacement browser runs without the hold"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", [RuntimeError("launch failed"), asyncio.CancelledError()])
+    async def test_failed_camoufox_launch_cleans_up_and_releases(self, failure):
+        """__aenter__ failing (or being cancelled) after the manager exists may have
+        started the driver: it is closed, and then nothing holds the stack."""
+        cm = _camoufox_cm(enter=AsyncMock(side_effect=failure))
+        with (
+            _ready_engine(),
+            patch.dict("sys.modules", _camoufox_module(cm)),
+            pytest.raises(type(failure)),
+        ):
+            await browser._ensure_browser()
+        cm.__aexit__.assert_awaited_once()
+        assert browser._stealth_cm is None
+        assert not _stack_lock_held()
+
+    @pytest.mark.asyncio
+    async def test_failed_chromium_launch_stops_the_driver_and_releases(self):
+        """launch_persistent_context failing leaves a running driver behind."""
+        cm, pw = _playwright_cm()
+        pw.chromium.launch_persistent_context = AsyncMock(side_effect=RuntimeError("no browser"))
+        with (
+            patch.dict("sys.modules", _playwright_module(cm)),
+            pytest.raises(RuntimeError, match="no browser"),
+        ):
+            await browser._ensure_chromium_fallback()
+        pw.stop.assert_awaited_once()
+        assert browser._playwright is None
+        assert not _stack_lock_held()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_chromium_start_stops_the_driver_by_its_manager(self):
+        """start() cancelled after spawning the driver returns no Playwright
+        object; the manager is the only handle that can stop the driver."""
+        cm, _pw = _playwright_cm(start=AsyncMock(side_effect=asyncio.CancelledError()))
+        with (
+            patch.dict("sys.modules", _playwright_module(cm)),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await browser._ensure_chromium_fallback()
+        cm.__aexit__.assert_awaited_once()
+        assert not _stack_lock_held()
+
+    @pytest.mark.asyncio
+    async def test_failed_launch_keeps_the_hold_of_a_browser_still_open(self):
+        """A Camoufox launch failing while Chromium is open must not release the
+        hold the Chromium browser depends on."""
+        cm_pw, _pw = _playwright_cm()
+        bad = _camoufox_cm(enter=AsyncMock(side_effect=RuntimeError("launch failed")))
+        with (
+            _ready_engine(),
+            patch.dict("sys.modules", {**_playwright_module(cm_pw), **_camoufox_module(bad)}),
+        ):
+            await browser._ensure_chromium_fallback()
+            with pytest.raises(RuntimeError, match="launch failed"):
+                await browser._ensure_browser()
+        assert browser._context is not None
+        assert _stack_lock_held()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("left", [[4242], None])
+    async def test_unfinished_teardown_retains_the_lock(self, monkeypatch, left):
+        """A close that raised may have left the browser running: the hold stays
+        while a browser process remains under this one, or that cannot be read."""
+        cm = _camoufox_cm(exit_=AsyncMock(side_effect=RuntimeError("close failed")))
+        monkeypatch.setattr(browser, "_local_browser_processes", lambda: left, raising=False)
+        with _ready_engine(), patch.dict("sys.modules", _camoufox_module(cm)):
+            await browser._ensure_browser()
+        await browser.async_cleanup()
+        assert browser._stealth_cm is None
+        assert _stack_lock_held(), "provisioning could now swap the engine under a live browser"
+
+    @pytest.mark.asyncio
+    async def test_unfinished_teardown_releases_once_no_browser_remains(self, monkeypatch):
+        cm = _camoufox_cm(exit_=AsyncMock(side_effect=RuntimeError("close failed")))
+        remaining = [[4242], []]
+        monkeypatch.setattr(
+            browser, "_local_browser_processes", lambda: remaining.pop(0), raising=False
+        )
+        with _ready_engine(), patch.dict("sys.modules", _camoufox_module(cm)):
+            await browser._ensure_browser()
+        await browser.async_cleanup()
+        assert _stack_lock_held()
+        await browser.async_cleanup()  # the next cleanup sees no browser left
+        assert not _stack_lock_held()
+        assert browser._stack_teardown_unconfirmed is None
+
+    @pytest.mark.asyncio
+    async def test_hung_teardown_retains_the_lock(self, monkeypatch):
+        """A close that times out is the case the docstring warns can orphan a
+        browser."""
+        async def hang(*_a):
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(browser, "_TEARDOWN_TIMEOUT_S", 0.05, raising=False)
+        monkeypatch.setattr(browser, "_local_browser_processes", lambda: [4242], raising=False)
+        cm = _camoufox_cm(exit_=hang)
+        with _ready_engine(), patch.dict("sys.modules", _camoufox_module(cm)):
+            await browser._ensure_browser()
+        await browser.async_cleanup()
+        assert _stack_lock_held()
+
+    @pytest.mark.asyncio
+    async def test_clean_teardown_releases_without_a_process_scan(self, monkeypatch):
+        def scan():
+            raise AssertionError("a clean teardown needs no process scan")
+
+        monkeypatch.setattr(browser, "_local_browser_processes", scan, raising=False)
+        with _ready_engine(), patch.dict("sys.modules", _camoufox_module(_camoufox_cm())):
+            await browser._ensure_browser()
+        await browser.async_cleanup()
+        assert not _stack_lock_held()
+
+    @pytest.mark.asyncio
+    async def test_idle_timeout_cleanup_releases(self, monkeypatch):
+        with _ready_engine(), patch.dict("sys.modules", _camoufox_module(_camoufox_cm())):
+            await browser._ensure_browser()
+        monkeypatch.setattr(browser, "_last_used", 1.0)
+        monkeypatch.setattr(browser, "_IDLE_TIMEOUT_S", 0)
+        sleeps = []
+
+        async def no_wait(_s):
+            sleeps.append(_s)
+
+        with patch.object(browser.asyncio, "sleep", no_wait):
+            await browser._idle_watcher_loop()
+        assert sleeps and not _stack_lock_held()
+
+    @pytest.mark.asyncio
+    async def test_idle_cleanup_never_runs_during_a_launch(self, monkeypatch):
+        """The idle watcher fires while a launch holds _browser_lock (a stale
+        restart after an hour idle): tearing down the half-built browser would
+        orphan it without the stack lock. It must wait, then see the launch as use."""
+        import time as _time
+
+        monkeypatch.setattr(browser, "_IDLE_TIMEOUT_S", 100)
+        monkeypatch.setattr(browser, "_last_used", _time.monotonic() - 200)
+        cleanup = AsyncMock()
+        monkeypatch.setattr(browser, "async_cleanup", cleanup)
+        real_sleep = asyncio.sleep
+        polls = []
+
+        async def poll(_s):
+            polls.append(_s)
+            if len(polls) > 1:
+                raise asyncio.CancelledError  # end the loop after one re-poll
+            await real_sleep(0)
+
+        monkeypatch.setattr(browser.asyncio, "sleep", poll)
+        await browser._browser_lock.acquire()  # a launch in flight
+        try:
+            watcher = asyncio.ensure_future(browser._idle_watcher_loop())
+            for _ in range(5):
+                await real_sleep(0)
+            assert not cleanup.await_count, "cleanup ran under an in-flight launch"
+            browser._touch()  # the launch finished: that was use
+        finally:
+            browser._browser_lock.release()
+        await watcher
+        cleanup.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_launch_counts_as_use(self, monkeypatch):
+        monkeypatch.setattr(browser, "_last_used", 0.0)
+        with _ready_engine(), patch.dict("sys.modules", _camoufox_module(_camoufox_cm())):
+            await browser._ensure_browser()
+        assert browser._last_used > 0
+
+    @pytest.mark.asyncio
+    async def test_repeatedly_cancelled_launch_never_loses_the_browser(self, monkeypatch):
+        """anyio (the MCP SDK's request scope) cancels at EVERY await inside a
+        cancelled scope, so the failed launch's own teardown is cancelled too and
+        the manager stays set with no page. The next launch must close that
+        manager before replacing it, and the release must not trust the handles."""
+        import anyio
+
+        monkeypatch.setattr(browser, "_local_browser_processes", lambda: [4242], raising=False)
+
+        async def starting(*_a):
+            await asyncio.sleep(10)  # the browser is starting when the request is cancelled
+
+        async def closing(*_a):
+            await asyncio.sleep(10)  # a real close takes a moment; cancelled again here
+
+        first = _camoufox_cm(enter=AsyncMock(side_effect=starting), exit_=AsyncMock(side_effect=closing))
+        second = _camoufox_cm()
+        with _ready_engine(), patch.dict("sys.modules", _camoufox_module(first, second)):
+            with anyio.CancelScope() as scope:
+                asyncio.get_running_loop().call_later(0.05, scope.cancel)
+                await browser._ensure_browser()
+            assert browser._stealth_cm is first and browser._stealth_page is None
+            assert browser._stack_teardown_unconfirmed, "a cancelled close is not a finished one"
+            assert _stack_lock_held()
+
+            first.__aexit__ = AsyncMock(return_value=None)  # the retry's close completes
+            await browser._ensure_browser()
+        first.__aexit__.assert_awaited_once()  # closed before being replaced
+        assert browser._stealth_cm is second
+        await browser.async_cleanup()
+        assert _stack_lock_held(), "released while a browser of the cancelled launch may live"
+
+    @pytest.mark.asyncio
+    async def test_readiness_is_read_under_the_lock(self):
+        """The engine verdict and the camoufox import read files a provisioning
+        run replaces: neither may happen before the hold is taken."""
+        import fcntl
+
+        from genesis.browser import engine
+
+        status = MagicMock(return_value=engine.EngineStatus(engine.READY, "t", Path("/e")))
+        engine.BROWSER_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            patch.object(engine, "camoufox_engine_status", status),
+            patch.dict("sys.modules", _camoufox_module(_camoufox_cm())),
+            open(engine.BROWSER_LOCK_FILE, "w") as provisioning,
+        ):
+            fcntl.flock(provisioning, fcntl.LOCK_EX)
+            with pytest.raises(Exception, match="being upgraded"):
+                await browser._ensure_browser()
+        status.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_idle_watcher_task_releases_through_its_own_cancel(self, monkeypatch):
+        """The real watcher runs as _idle_task, and async_cleanup cancels and awaits
+        _idle_task: the watcher must survive cancelling itself and still release."""
+        with _ready_engine(), patch.dict("sys.modules", _camoufox_module(_camoufox_cm())):
+            await browser._ensure_browser()
+        monkeypatch.setattr(browser, "_IDLE_TIMEOUT_S", 0)
+        real_sleep = asyncio.sleep
+
+        async def fast(_s):
+            await real_sleep(0)
+
+        monkeypatch.setattr(browser.asyncio, "sleep", fast)
+        browser._start_idle_watcher()
+        task = browser._idle_task
+        await asyncio.wait_for(task, timeout=5)
+        assert browser._stealth_cm is None
+        assert not _stack_lock_held()
+
+    @pytest.mark.asyncio
+    async def test_navigate_reports_a_busy_stack_for_chromium_too(self, tmp_path):
+        import fcntl
+
+        from genesis.browser import engine
+
+        engine.BROWSER_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            patch.dict("sys.modules", _playwright_module(_playwright_cm()[0])),
+            patch.object(browser, "_ensure_vnc", new=AsyncMock()),
+            open(engine.BROWSER_LOCK_FILE, "w") as provisioning,
+        ):
+            fcntl.flock(provisioning, fcntl.LOCK_EX)
+            result = await browser._impl_browser_navigate("https://example.com", stealth=False)
+        assert "being upgraded" in result["error"]
+        assert not result["error"].startswith("Camoufox")
+
+
+class TestLocalBrowserProcesses:
+    """The descendant scan that decides whether an unfinished teardown left a browser."""
+
+    @staticmethod
+    def _proc(root: Path, pid: int, comm: str, ppid: int) -> None:
+        d = root / str(pid)
+        d.mkdir()
+        (d / "stat").write_text(f"{pid} ({comm}) S {ppid} 1 1 0 -1\n")
+
+    def test_finds_driver_and_browser_descendants_only(self, tmp_path):
+        me = os.getpid()
+        self._proc(tmp_path, me, "python3", 1)
+        self._proc(tmp_path, 900001, "node", me)
+        self._proc(tmp_path, 900002, "camoufox-bin", 900001)
+        self._proc(tmp_path, 900003, "Web Content (x)", 900002)  # parens in comm
+        self._proc(tmp_path, 900004, "chrome", 1)  # someone else's browser
+        self._proc(tmp_path, 900005, "pgrep", me)  # ours, not a browser
+        self._proc(tmp_path, 900006, "chrome-headless", me)  # chrome-headless-shell, cut to 15
+        self._proc(tmp_path, 900007, "headless_shell", me)  # older Playwright's name
+        (tmp_path / "self").mkdir()  # non-pid entries are ignored
+        assert browser._local_browser_processes(tmp_path) == [900001, 900002, 900006, 900007]
+
+    def test_none_left(self, tmp_path):
+        self._proc(tmp_path, os.getpid(), "python3", 1)
+        assert browser._local_browser_processes(tmp_path) == []
+
+    def test_unreadable_table_is_unknown(self, tmp_path):
+        assert browser._local_browser_processes(tmp_path / "missing") is None
+
+    def test_live_table_is_readable(self):
+        """Against the real /proc the scan answers (a list), never None, here."""
+        if not Path("/proc/self/stat").exists():
+            pytest.skip("no /proc")
+        assert isinstance(browser._local_browser_processes(), list)
+
+
+class TestLateImportBaseline:
+    """A browser package first imported AFTER it changed on disk loaded the new
+    files: it is current, not stale."""
+
+    def test_package_installed_then_imported_is_not_stale(self, monkeypatch):
+        startup = dict(browser._STARTUP_BROWSER_VERSIONS, camoufox="0.4.11")
+        monkeypatch.setattr(browser, "_STARTUP_BROWSER_VERSIONS", startup)
+        monkeypatch.setattr(browser, "_LOADED_BROWSER_VERSIONS", {}, raising=False)
+        monkeypatch.setattr(browser, "_LAST_SEEN_BROWSER_VERSIONS", dict(startup), raising=False)
+        upgraded = dict(startup, camoufox="0.5.7")
+        mods = {k: v for k, v in sys.modules.items() if k not in browser._BROWSER_DISTS}
+        with (
+            patch.object(browser, "_installed_browser_versions", return_value=upgraded),
+            patch.dict("sys.modules", mods, clear=True),
+        ):
+            browser._check_loaded_browser_modules()  # nothing loaded: fine
+            sys.modules["camoufox"] = MagicMock()  # the launch imports 0.5.7
+            browser._check_loaded_browser_modules()  # the next launch
+            browser._check_loaded_browser_modules()
+
+    def test_import_across_a_change_is_stale(self, monkeypatch):
+        """Loaded while the disk changed under it: which version is unknown, so
+        refuse and say restart."""
+        startup = dict(browser._STARTUP_BROWSER_VERSIONS, camoufox="0.4.11")
+        monkeypatch.setattr(browser, "_STARTUP_BROWSER_VERSIONS", startup)
+        monkeypatch.setattr(browser, "_LOADED_BROWSER_VERSIONS", {}, raising=False)
+        monkeypatch.setattr(browser, "_LAST_SEEN_BROWSER_VERSIONS", dict(startup), raising=False)
+        mods = {k: v for k, v in sys.modules.items() if k not in browser._BROWSER_DISTS}
+        mods["camoufox"] = MagicMock()
+        with (
+            patch.object(
+                browser, "_installed_browser_versions",
+                return_value=dict(startup, camoufox="0.5.7"),
+            ),
+            patch.dict("sys.modules", mods, clear=True),
+            pytest.raises(browser.BrowserPackagesChanged, match="Restart"),
+        ):
+            browser._check_loaded_browser_modules()
+
+    def test_change_after_the_import_is_stale(self, monkeypatch):
+        startup = dict(browser._STARTUP_BROWSER_VERSIONS, camoufox="0.5.7")
+        monkeypatch.setattr(browser, "_STARTUP_BROWSER_VERSIONS", startup)
+        monkeypatch.setattr(browser, "_LOADED_BROWSER_VERSIONS", {}, raising=False)
+        monkeypatch.setattr(browser, "_LAST_SEEN_BROWSER_VERSIONS", dict(startup), raising=False)
+        mods = {k: v for k, v in sys.modules.items() if k not in browser._BROWSER_DISTS}
+        mods["camoufox"] = MagicMock()
+        disk = {"now": dict(startup)}
+        with (
+            patch.object(browser, "_installed_browser_versions", lambda: dict(disk["now"])),
+            patch.dict("sys.modules", mods, clear=True),
+        ):
+            browser._check_loaded_browser_modules()  # loaded at 0.5.7: fine
+            disk["now"] = dict(startup, camoufox="0.6.0")
+            with pytest.raises(browser.BrowserPackagesChanged, match="0.5.7 -> 0.6.0"):
+                browser._check_loaded_browser_modules()

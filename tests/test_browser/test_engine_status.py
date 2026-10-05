@@ -8,7 +8,10 @@ never reports READY for a layout camoufox 0.5 would wipe, and never writes.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
+
+import pytest
 
 from genesis.browser import engine
 from genesis.browser.engine import camoufox_engine_status
@@ -34,9 +37,24 @@ def _engine(dirpath: Path, version: str, build: str) -> Path:
 PIN = {
     "tag": "v156.0.1-beta.34",
     "repo": "daijro/camoufox",
+    "repo_name": "Official",
     "version": "156.0.1",
     "build": "beta.34",
 }
+
+
+@pytest.fixture(autouse=True)
+def _no_playwright_floor(monkeypatch):
+    """The supported range must not depend on whichever playwright this machine
+    has; tests that exercise the floor set it themselves."""
+    monkeypatch.setattr(engine, "_playwright_build_floor", lambda *_: None)
+
+
+def _flagged_root(tmp_path: Path) -> Path:
+    root = tmp_path / "cache"
+    root.mkdir()
+    (root / ".0.5_FLAG").touch()
+    return root
 
 
 def _snapshot(root: Path) -> list[tuple[str, float]]:
@@ -51,7 +69,7 @@ def test_no_package(tmp_path, monkeypatch):
 
 
 def test_pre05_package_with_root_engine_is_ready(tmp_path, monkeypatch):
-    monkeypatch.setattr(engine, "_playwright_build_floor", lambda: None)
+    monkeypatch.setattr(engine, "_playwright_build_floor", lambda *_: None)
     pkg = _pkg(tmp_path, pin=None)
     root = _engine(tmp_path / "cache", "135.0.1", "beta.24")
     status = camoufox_engine_status(install_dir=root, package_dir=pkg)
@@ -73,7 +91,7 @@ def test_05_package_over_legacy_layout_is_not_ready(tmp_path):
     status = camoufox_engine_status(install_dir=root, package_dir=pkg)
     assert status.state == engine.LEGACY_LAYOUT
     assert not status.ready
-    assert "install_browser_stack.sh" in status.detail
+    assert engine.PROVISION_HINT in status.detail
     assert _snapshot(root) == before, "the status check must not modify the install"
 
 
@@ -189,7 +207,7 @@ def test_pre05_engine_below_playwright_floor_is_not_ready(tmp_path, monkeypatch)
     (a hand install, or a failed run whose package restore also failed);
     camoufox's own floor table says playwright >= 1.61 needs beta.30+, so that
     engine cannot launch."""
-    monkeypatch.setattr(engine, "_playwright_build_floor", lambda: 30)
+    monkeypatch.setattr(engine, "_playwright_build_floor", lambda *_: "beta.30")
     pkg = _pkg(tmp_path, pin=None)
     root = _engine(tmp_path / "cache", "135.0.1", "beta.24")
     status = camoufox_engine_status(install_dir=root, package_dir=pkg)
@@ -198,8 +216,9 @@ def test_pre05_engine_below_playwright_floor_is_not_ready(tmp_path, monkeypatch)
 
 
 def test_floor_from_installed_playwright(monkeypatch):
+    monkeypatch.undo()  # this test reads the real function
     monkeypatch.setattr(engine.importlib.metadata, "version", lambda name: "1.62.0")
-    assert engine._playwright_build_floor() == 30
+    assert engine._playwright_build_floor() == "beta.30"
     monkeypatch.setattr(engine.importlib.metadata, "version", lambda name: "1.58.0")
     assert engine._playwright_build_floor() is None
 
@@ -231,3 +250,230 @@ def test_active_version_alone_is_not_an_override(tmp_path, monkeypatch):
         json.dumps({"active_version": "browsers/official/156.0.1-beta.34-09effb44"})
     )
     assert camoufox_engine_status(install_dir=root).ready
+
+
+# ── Mirroring camoufox's own engine selection ────────────────────────────────
+# READY must mean camoufox would select an installed engine and launch it. Each
+# case below is one place camoufox's resolution (multiversion.get_active_path,
+# pkgman.camoufox_path, browser_pin.matches) would instead fetch.
+
+
+def test_pin_match_includes_the_repository(tmp_path):
+    """browser_pin.matches compares (repo_name, version, build): the same build in
+    another repository is not the paired engine, and camoufox would fetch."""
+    pkg = _pkg(tmp_path, pin=PIN)
+    root = _flagged_root(tmp_path)
+    _engine(root / "browsers" / "custom" / "156.0.1-beta.34", "156.0.1", "beta.34")
+    status = camoufox_engine_status(install_dir=root, package_dir=pkg)
+    assert status.state == engine.PIN_NOT_INSTALLED
+    assert "official/156.0.1-beta.34" in status.detail
+
+
+def test_pin_repo_name_is_case_insensitive(tmp_path):
+    """load_pin lowercases the pin's repo_name; matches lowercases the directory."""
+    pkg = _pkg(tmp_path, pin=PIN)
+    root = _flagged_root(tmp_path)
+    want = _engine(root / "browsers" / "OFFICIAL" / "156.0.1-beta.34", "156.0.1", "beta.34")
+    status = camoufox_engine_status(install_dir=root, package_dir=pkg)
+    assert status.ready and status.path == want
+
+
+def test_pinned_engine_below_playwright_floor_is_not_ready(tmp_path, monkeypatch):
+    """camoufox_path launches the paired engine only when it is supported; below
+    the playwright floor it fetches."""
+    monkeypatch.setattr(engine, "_playwright_build_floor", lambda *_: "beta.35")
+    pkg = _pkg(tmp_path, pin=PIN)
+    root = _flagged_root(tmp_path)
+    _engine(root / "browsers" / "official" / "156.0.1-beta.34", "156.0.1", "beta.34")
+    status = camoufox_engine_status(install_dir=root, package_dir=pkg)
+    assert not status.ready
+    assert "beta.35" in status.detail
+
+
+def test_pin_without_a_tag_is_no_pin(tmp_path):
+    """load_pin treats a pin with no tag as unpinned; so must this, or a pin it
+    would never enforce decides readiness."""
+    pin = {k: v for k, v in PIN.items() if k != "tag"}
+    assert engine.camoufox_pin(_pkg(tmp_path, pin=pin)) is None
+
+
+def test_pin_keeps_version_first(tmp_path):
+    pin = engine.camoufox_pin(_pkg(tmp_path, pin=PIN))
+    assert pin == ("156.0.1", "beta.34", "official")
+    assert pin[0] == "156.0.1"
+
+
+def test_unpinned_resolves_the_active_engine(tmp_path):
+    """get_active_path without a pin: config.json's active engine wins over the
+    newest installed one."""
+    pkg = _pkg(tmp_path, pin={})
+    root = _flagged_root(tmp_path)
+    _engine(root / "browsers" / "official" / "156.0.1-beta.33", "156.0.1", "beta.33")
+    active = _engine(root / "browsers" / "official" / "156.0.1-beta.40", "156.0.1", "beta.40")
+    (root / "config.json").write_text(
+        json.dumps({"active_version": "browsers/official/156.0.1-beta.40"})
+    )
+    status = camoufox_engine_status(install_dir=root, package_dir=pkg)
+    assert status.ready and status.path == active
+
+
+def test_unpinned_active_engine_below_floor_is_not_ready(tmp_path, monkeypatch):
+    """An old active build plus a newer installed one: camoufox launches the
+    active one, finds it unsupported, and fetches."""
+    monkeypatch.setattr(engine, "_playwright_build_floor", lambda *_: "beta.30")
+    pkg = _pkg(tmp_path, pin={})
+    root = _flagged_root(tmp_path)
+    _engine(root / "browsers" / "official" / "156.0.1-beta.34", "156.0.1", "beta.34")
+    _engine(root / "browsers" / "official" / "135.0.1-beta.24", "135.0.1", "beta.24")
+    (root / "config.json").write_text(
+        json.dumps({"active_version": "browsers/official/135.0.1-beta.24"})
+    )
+    status = camoufox_engine_status(install_dir=root, package_dir=pkg)
+    assert not status.ready
+    assert "beta.30" in status.detail
+
+
+def test_unpinned_without_active_takes_the_newest(tmp_path):
+    pkg = _pkg(tmp_path, pin={})
+    root = _flagged_root(tmp_path)
+    _engine(root / "browsers" / "official" / "156.0.1-beta.1", "156.0.1", "beta.1")
+    _engine(root / "browsers" / "official" / "156.0.1-beta.9", "156.0.1", "beta.9")
+    newest = _engine(root / "browsers" / "official" / "156.0.1-beta.10", "156.0.1", "beta.10")
+    status = camoufox_engine_status(install_dir=root, package_dir=pkg)
+    assert status.ready and status.path == newest  # numeric order, not name order
+
+
+def test_unpinned_channel_choice_without_active_is_not_ready(tmp_path):
+    """With a channel chosen and nothing active, get_active_path returns None and
+    camoufox fetches that channel's build."""
+    pkg = _pkg(tmp_path, pin={})
+    root = _flagged_root(tmp_path)
+    _engine(root / "browsers" / "official" / "156.0.1-beta.33", "156.0.1", "beta.33")
+    (root / "config.json").write_text(json.dumps({"channel": "official/prerelease"}))
+    assert not camoufox_engine_status(install_dir=root, package_dir=pkg).ready
+
+
+def test_version_json_tag_key_is_the_build(tmp_path):
+    """pkgman.Version.from_path reads the build from release, else tag."""
+    pkg = _pkg(tmp_path, pin=PIN)
+    root = _flagged_root(tmp_path)
+    d = _engine(root / "browsers" / "official" / "156.0.1-beta.34", "156.0.1", "beta.34")
+    (d / "version.json").write_text(json.dumps({"version": "156.0.1", "tag": "beta.34"}))
+    assert camoufox_engine_status(install_dir=root, package_dir=pkg).ready
+
+
+def test_build_key_mirrors_camoufox_ordering():
+    key = engine._build_key
+    assert key("alpha.1") < key("beta.9") < key("beta.30") < key("beta.34") < key("1")
+    assert key("beta.30") == key("beta.30.0")
+
+
+def test_recovery_hints_name_only_scripts_that_exist():
+    """Every repo script a browser message or doc points an operator at must
+    exist in this tree: a hint naming a script that is not shipped is a dead end."""
+    repo = Path(__file__).resolve().parents[2]
+    surfaces = [
+        "src/genesis/browser/engine.py",
+        "src/genesis/mcp/health/browser.py",
+        "src/genesis/runtime/_capabilities.py",
+        "src/genesis/runtime/_init_delegates.py",
+        "src/genesis/skills/browser-automation/SKILL.md",
+    ]
+    named = {
+        (surface, m)
+        for surface in surfaces
+        for m in re.findall(r"scripts/[\w./-]+\.(?:sh|py)", (repo / surface).read_text())
+    }
+    missing = sorted(f"{s}: {m}" for s, m in named if not (repo / m).exists())
+    assert not missing, missing
+
+
+# ── The installed package's own supported range ─────────────────────────────
+
+
+def _version_py(pkg: Path, body: str) -> None:
+    (pkg / "__version__.py").write_text(body)
+
+
+_V04 = """
+class CONSTRAINTS:
+    MIN_VERSION = 'beta.19'
+    MAX_VERSION = '1'
+"""
+
+
+def test_pre05_engine_below_the_packages_minimum_is_not_ready(tmp_path):
+    """camoufox 0.4.11's camoufox_path fetches when the root engine is below its
+    own MIN_VERSION ('beta.19'), which camoufox main's 'alpha.1' would pass."""
+    pkg = _pkg(tmp_path, pin=None)
+    _version_py(pkg, _V04)
+    root = _engine(tmp_path / "cache", "128.0", "beta.18")
+    status = camoufox_engine_status(install_dir=root, package_dir=pkg)
+    assert not status.ready
+    assert "beta.19" in status.detail
+
+
+def test_pre05_engine_inside_the_packages_range_is_ready(tmp_path):
+    pkg = _pkg(tmp_path, pin=None)
+    _version_py(pkg, _V04)
+    root = _engine(tmp_path / "cache", "135.0.1", "beta.24")
+    status = camoufox_engine_status(install_dir=root, package_dir=pkg)
+    assert status.ready
+    assert "copy" not in status.detail  # the package's own limits were read
+
+
+def test_05_package_minimum_raises_above_the_pinned_engine(tmp_path):
+    """A release that raises MIN_VERSION past an installed engine: camoufox
+    fetches, whatever Genesis's mirrored constants say."""
+    pkg = _pkg(tmp_path, pin=PIN)
+    _version_py(pkg, "class CONSTRAINTS:\n    MIN_VERSION = 'beta.35'\n    MAX_VERSION = '1'\n")
+    root = _flagged_root(tmp_path)
+    _engine(root / "browsers" / "official" / "156.0.1-beta.34", "156.0.1", "beta.34")
+    status = camoufox_engine_status(install_dir=root, package_dir=pkg)
+    assert not status.ready
+    assert "beta.35" in status.detail
+
+
+def test_package_floor_table_is_used(tmp_path, monkeypatch):
+    monkeypatch.undo()  # the real floor function, fed the package's table
+    monkeypatch.setattr(engine.importlib.metadata, "version", lambda name: "1.70.0")
+    pkg = _pkg(tmp_path, pin=PIN)
+    _version_py(
+        pkg,
+        "class CONSTRAINTS:\n    MIN_VERSION = 'alpha.1'\n    MAX_VERSION = '1'\n"
+        "    PLAYWRIGHT_BROWSER_FLOORS = (((1, 61), 'beta.30'), ((1, 70), 'beta.36'))\n",
+    )
+    root = _flagged_root(tmp_path)
+    _engine(root / "browsers" / "official" / "156.0.1-beta.34", "156.0.1", "beta.34")
+    status = camoufox_engine_status(install_dir=root, package_dir=pkg)
+    assert not status.ready
+    assert "beta.36" in status.detail
+
+
+def test_unreadable_package_limits_fall_back_and_say_so(tmp_path):
+    pkg = _pkg(tmp_path, pin=PIN)
+    _version_py(pkg, "this is not python (")
+    root = _flagged_root(tmp_path)
+    _engine(root / "browsers" / "official" / "156.0.1-beta.34", "156.0.1", "beta.34")
+    status = camoufox_engine_status(install_dir=root, package_dir=pkg)
+    assert status.ready
+    assert "unreadable" in status.detail
+
+
+def test_status_never_imports_camoufox_at_runtime(tmp_path):
+    """The AST check above covers the module's own imports; this covers what a
+    status call pulls in, in a fresh interpreter."""
+    import subprocess
+    import sys
+
+    repo = Path(__file__).resolve().parents[2]
+    code = (
+        f"import sys; sys.path.insert(0, {str(repo / 'src')!r})\n"
+        "from genesis.browser.engine import camoufox_engine_status\n"
+        "camoufox_engine_status()\n"
+        "print('camoufox' in sys.modules)\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert out == "False"

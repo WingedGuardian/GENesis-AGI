@@ -92,6 +92,10 @@ class CamoufoxEngineNotReady(RuntimeError):
     """Camoufox or its pinned engine is not installed; launching would download."""
 
 
+class BrowserStackBusy(RuntimeError):
+    """A provisioning run holds the browser-stack lock exclusive; no local launch."""
+
+
 _BROWSER_DISTS = ("camoufox", "playwright", "patchright")
 
 
@@ -115,19 +119,69 @@ def _installed_browser_versions() -> dict[str, str | None]:
 # layout moved it): only a restart loads the new versions.
 _STARTUP_BROWSER_VERSIONS = _installed_browser_versions()
 
+# Stands for "loaded, but which version is unknown": never equal to a version.
+_UNKNOWN_VERSION = object()
+
+# Per distribution, the on-disk version of the module this process LOADED.
+# Seeded with what was already imported at startup; a distribution imported
+# later is recorded when a check first sees it in sys.modules (see
+# _check_loaded_browser_modules), so a package installed after startup and
+# imported fresh is not mistaken for a stale one.
+_LOADED_BROWSER_VERSIONS: dict[str, object] = {
+    d: v for d, v in _STARTUP_BROWSER_VERSIONS.items() if d in sys.modules
+}
+# The on-disk versions at the most recent check (startup, before the first).
+_LAST_SEEN_BROWSER_VERSIONS: dict[str, str | None] = dict(_STARTUP_BROWSER_VERSIONS)
+
 
 class BrowserPackagesChanged(RuntimeError):
     """Browser packages changed on disk after this process imported them."""
 
 
-# The browser-stack lock (genesis.browser.engine.BROWSER_LOCK_FILE), held SHARED
-# while this process has a local browser (Camoufox or Chromium) open, so a
-# provisioning run, which takes it EXCLUSIVE, cannot replace packages, copy a
-# live profile or swap the engine under it, nor can a launch start mid-upgrade.
+# ── The browser-stack lock ───────────────────────────────────────────────────
+# genesis.browser.engine.BROWSER_LOCK_FILE, held SHARED by this process for as
+# long as a local browser process (Camoufox or Chromium) it started may be
+# alive, so a provisioning run, which takes it EXCLUSIVE, cannot replace
+# packages, copy a live profile or swap the engine under it, and a launch
+# cannot start mid-upgrade.
+#
+# One rule binds the hold to the processes, at the two places they begin and end:
+#   * acquired by the launch functions themselves (_ensure_browser,
+#     _ensure_chromium_fallback), under _browser_lock, after any stale-browser
+#     cleanup and before the readiness check, the import and the first process.
+#     Every caller of them (the MCP tools, Medium's CamoufoxBrowserClient, a
+#     stale-page relaunch) is covered, because they are the only places this
+#     module creates a local browser;
+#   * released only by _release_stack_lock_if_idle, which keeps the hold while
+#     any local browser handle is set, and after a teardown that did not finish
+#     (a close that raised or timed out, so a browser may have survived it)
+#     until no browser process remains among this process's descendants.
+# A launch that fails tears down whatever it created before deciding. A
+# cancelled teardown leaves its handles set, so the hold stays with them; the
+# kernel drops the lock when this process exits and its descriptor closes.
+#
+# Remote CDP and TinyFish are outside it on purpose: neither starts a browser
+# here, uses the local engine, or opens a local profile. Their Playwright
+# drivers are local `node` processes, though, so after an unfinished teardown
+# the descendant scan counts them too: that errs toward keeping the hold.
 _stack_lock_fd: int | None = None
+# Set when a local teardown did not finish; names it. Cleared only once no
+# browser process is left under this process (_local_browser_processes).
+_stack_teardown_unconfirmed: str | None = None
+
+# Process names (/proc/<pid>/stat comm, cut to 15 characters by the kernel) of
+# what a local launch starts: the Playwright Node driver and the browser itself.
+# Deliberately not BROWSER_PGREP_PATTERNS (genesis.browser.types): those match
+# command lines system-wide, this matches names among this process's descendants.
+# Chromium's headless shell ships as `chrome-headless-shell` (cut to
+# `chrome-headless`); older Playwright releases named it `headless_shell`.
+_LOCAL_BROWSER_COMMS = frozenset(
+    {"node", "camoufox-bin", "chrome", "chrome-headless", "headless_shell"}
+)
 
 
-def _hold_stack_lock() -> None:
+def _acquire_stack_lock() -> None:
+    """Take the shared hold (idempotent). Raises BrowserStackBusy mid-upgrade."""
     global _stack_lock_fd
     if _stack_lock_fd is not None:
         return
@@ -138,15 +192,17 @@ def _hold_stack_lock() -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
     except OSError:
+        # Fail open, loudly: a lock file that cannot be opened must not take the
+        # browser tools down; the warning names it.
         logger.warning("could not open the browser-stack lock %s", path, exc_info=True)
-        return  # no lock file possible: the provisioning preflight's process check remains
+        return
     try:
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
     except BlockingIOError:
         os.close(fd)
-        raise CamoufoxEngineNotReady(
-            "the browser stack is being upgraded right now (scripts/install_browser_stack.sh "
-            "is running); try again when it finishes"
+        raise BrowserStackBusy(
+            "the browser stack is being upgraded right now (another process holds the "
+            "browser-stack lock exclusively); try again when it finishes"
         ) from None
     except OSError:
         os.close(fd)
@@ -155,37 +211,156 @@ def _hold_stack_lock() -> None:
     _stack_lock_fd = fd
 
 
-def _release_stack_lock() -> None:
-    global _stack_lock_fd
-    if _stack_lock_fd is not None:
-        with contextlib.suppress(OSError):
-            os.close(_stack_lock_fd)
-        _stack_lock_fd = None
-
-
-async def _launch_local(launch):
-    """Run a local browser launch under the shared browser-stack lock."""
-    _hold_stack_lock()
-    try:
-        return await launch()
-    except BaseException:
-        if _stealth_cm is None and _context is None:
-            _release_stack_lock()  # nothing came up, so nothing holds the stack
-        raise
-
-
-def _packages_changed_message() -> str | None:
-    now = _installed_browser_versions()
-    if now == _STARTUP_BROWSER_VERSIONS:
-        return None
-    changed = ", ".join(
-        f"{d} {_STARTUP_BROWSER_VERSIONS[d]} -> {now[d]}"
-        for d in _BROWSER_DISTS
-        if now[d] != _STARTUP_BROWSER_VERSIONS[d]
+def _local_browser_handles_set() -> bool:
+    return any(
+        h is not None for h in (_stealth_cm, _playwright_cm, _playwright, _context)
     )
+
+
+def _local_browser_processes(proc: Path = Path("/proc")) -> list[int] | None:
+    """PIDs of driver/browser processes descended from this one, or None if unknown.
+
+    Walks the parent links in ``<proc>/<pid>/stat``. A process that already
+    exited between the listing and the read is skipped.
+    """
+    try:
+        entries = [p for p in proc.iterdir() if p.name.isdigit()]
+    except OSError:
+        return None
+    parent: dict[int, int] = {}
+    comm: dict[int, str] = {}
+    for entry in entries:
+        try:
+            stat = (entry / "stat").read_text()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        # "<pid> (<comm>) <state> <ppid> ...": comm may hold spaces or parens.
+        head, sep, rest = stat.rpartition(")")
+        fields = rest.split()
+        if not sep or len(fields) < 2 or "(" not in head:
+            return None
+        pid = int(entry.name)
+        comm[pid] = head.split("(", 1)[1]
+        parent[pid] = int(fields[1])
+    children: dict[int, list[int]] = {}
+    for pid, ppid in parent.items():
+        children.setdefault(ppid, []).append(pid)
+    found: list[int] = []
+    stack = list(children.get(os.getpid(), ()))
+    while stack:
+        pid = stack.pop()
+        if comm.get(pid) in _LOCAL_BROWSER_COMMS:
+            found.append(pid)
+        stack.extend(children.get(pid, ()))
+    return sorted(found)
+
+
+def _release_stack_lock_if_idle() -> None:
+    """Drop the shared hold, but only when no local browser can still be alive."""
+    global _stack_lock_fd, _stack_teardown_unconfirmed
+    if _stack_lock_fd is None or _local_browser_handles_set():
+        return
+    if _stack_teardown_unconfirmed is not None:
+        left = _local_browser_processes()
+        if left != []:
+            logger.warning(
+                "keeping the browser-stack lock: %s did not finish and %s; it is "
+                "released when they exit and the next browser cleanup runs, or when "
+                "this process exits",
+                _stack_teardown_unconfirmed,
+                "browser processes remain under this process (pids "
+                + ", ".join(map(str, left)) + ")"
+                if left
+                else "the process table could not be read",
+            )
+            return
+        _stack_teardown_unconfirmed = None
+    with contextlib.suppress(OSError):
+        os.close(_stack_lock_fd)
+    _stack_lock_fd = None
+
+
+# Per local teardown step (user-approved 10s, the value async_cleanup always used).
+_TEARDOWN_TIMEOUT_S = 10.0
+
+
+async def _teardown_step(label: str, aw) -> bool:
+    """Await one local teardown step; True only when it returned normally.
+
+    Anything else (a timeout, an error, a cancellation) means the browser it was
+    closing may have survived, so it is recorded as unfinished: the release rule
+    then asks the process table instead of trusting the handles. Cancellation
+    still propagates and leaves the caller's handles set, so the next launch
+    or cleanup tears them down again. (A repeated close is not proof either:
+    Playwright's context manager runs its stop only once, so a second
+    __aexit__ after a cancelled one returns without stopping anything.)
+    """
+    global _stack_teardown_unconfirmed
+    try:
+        await asyncio.wait_for(aw, timeout=_TEARDOWN_TIMEOUT_S)
+        return True
+    except TimeoutError:
+        logger.warning("%s timed out (%ss)", label, _TEARDOWN_TIMEOUT_S)
+    except asyncio.CancelledError:
+        _stack_teardown_unconfirmed = label
+        raise
+    except Exception:
+        logger.warning("%s failed", label, exc_info=True)
+    _stack_teardown_unconfirmed = label
+    return False
+
+
+async def _teardown_chromium() -> None:
+    """Close the Chromium fallback and stop its Playwright driver; clears its handles."""
+    global _playwright_cm, _playwright, _context, _page
+    if _context is not None:
+        await _teardown_step("the Chromium context close", _context.close())
+        _context = None
+        _page = None
+    if _playwright is not None or _playwright_cm is not None:
+        # Playwright.stop is the context manager's __aexit__; the manager alone is
+        # set when start() failed or was cancelled after spawning the driver.
+        stop = _playwright.stop() if _playwright is not None else _playwright_cm.__aexit__(None, None, None)
+        await _teardown_step("the Chromium Playwright driver stop", stop)
+        _playwright = None
+        _playwright_cm = None
+
+
+async def _teardown_camoufox() -> None:
+    """Close Camoufox (its __aexit__ closes the browser, then stops its driver)."""
+    global _stealth_cm, _stealth_browser, _stealth_page
+    if _stealth_cm is None:
+        return
+    await _teardown_step("the Camoufox cleanup", _stealth_cm.__aexit__(None, None, None))
+    _stealth_cm = None
+    _stealth_browser = None
+    _stealth_page = None
+
+
+def _changed_dists(now: dict[str, str | None]) -> list[str]:
+    return [d for d in _BROWSER_DISTS if now[d] != _STARTUP_BROWSER_VERSIONS[d]]
+
+
+def _packages_changed_message(stale: list[str] | None = None) -> str | None:
+    """Why a restart is needed, or None. ``stale`` names loaded distributions whose
+    files changed; without it, any change since startup counts."""
+    from genesis.browser.engine import PROVISION_HINT
+
+    now = _installed_browser_versions()
+    dists = stale if stale is not None else _changed_dists(now)
+    if not dists:
+        return None
+
+    def was(d: str) -> str:
+        v = _LOADED_BROWSER_VERSIONS.get(d, _STARTUP_BROWSER_VERSIONS[d])
+        return "an unknown version" if v is _UNKNOWN_VERSION else str(v)
+
+    changed = ", ".join(f"{d} {was(d)} -> {now[d]}" for d in dists)
     advice = "Restart this Claude Code session to load them."
     if any(now[d] is None for d in ("camoufox", "playwright")):
-        advice += " If the browser is still unavailable after that, run scripts/install_browser_stack.sh."
+        advice += f" If the browser is still unavailable after that, {PROVISION_HINT}."
     else:
         advice += " Do not reinstall."
     return f"Browser packages changed after this session started ({changed}). {advice}"
@@ -194,29 +369,40 @@ def _packages_changed_message() -> str | None:
 def _check_loaded_browser_modules() -> None:
     """Refuse a launch on modules that no longer match what is on disk.
 
-    Only a distribution this process has already imported matters: one not yet
-    loaded will be imported fresh from the files on disk.
+    Only a distribution this process has imported matters: one not yet loaded
+    will be imported fresh from the files on disk. A distribution first seen
+    loaded since the previous check was imported in between; when the disk did
+    not change across that interval, what it loaded is the current version.
+    When it did, which one it loaded is unknown, and that counts as stale.
     """
     now = _installed_browser_versions()
-    if any(
-        d in sys.modules and now[d] != _STARTUP_BROWSER_VERSIONS[d] for d in _BROWSER_DISTS
-    ):
-        raise BrowserPackagesChanged(_packages_changed_message())
+    for d in _BROWSER_DISTS:
+        if d in sys.modules and d not in _LOADED_BROWSER_VERSIONS:
+            same = now[d] == _LAST_SEEN_BROWSER_VERSIONS[d]
+            _LOADED_BROWSER_VERSIONS[d] = now[d] if same else _UNKNOWN_VERSION
+    _LAST_SEEN_BROWSER_VERSIONS.update(now)
+    stale = [
+        d for d in _BROWSER_DISTS
+        if d in sys.modules and _LOADED_BROWSER_VERSIONS[d] != now[d]
+    ]
+    if stale:
+        raise BrowserPackagesChanged(_packages_changed_message(stale))
 
 
 def _import_error_message(e: ImportError) -> str:
+    from genesis.browser.engine import PROVISION_HINT
+
     changed = _packages_changed_message()
     if changed:
         return f"{changed} (import failed: {e})"
-    return (
-        f"Browser not available: {e}. "
-        "Run scripts/install_browser_stack.sh to install the browser stack."
-    )
+    return f"Browser not available: {e}. To provision the browser stack, {PROVISION_HINT}."
+
 
 _PROFILE_DIR = Path.home() / ".genesis" / "camoufox-profile"
 _CHROMIUM_PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
 
 # Module-level browser state — persists across tool calls within a session.
+_playwright_cm = None  # Chromium's Playwright context manager (owns its driver)
 _playwright = None
 _context = None
 _page = None
@@ -315,8 +501,7 @@ async def async_cleanup():
     if the Playwright Node.js driver or browser process is stuck. Orphaned
     processes that survive timeout are caught by the process reaper (hourly at :15).
     """
-    global _playwright, _context, _page, _stealth_cm, _stealth_browser, _stealth_page, _active_page
-    global _idle_task, _last_used
+    global _active_page, _idle_task, _last_used
 
     _active_page = None
 
@@ -334,36 +519,11 @@ async def async_cleanup():
     # TinyFish: terminate cloud session (stops credit burn)
     await _cleanup_tinyfish()
 
-    if _context is not None:
-        try:
-            await asyncio.wait_for(_context.close(), timeout=10.0)
-        except TimeoutError:
-            logger.warning("Browser context close timed out (10s)")
-        except Exception:
-            logger.debug("Browser context cleanup failed", exc_info=True)
-        _context = None
-        _page = None
-    if _playwright is not None:
-        try:
-            await asyncio.wait_for(_playwright.stop(), timeout=10.0)
-        except TimeoutError:
-            logger.warning("Playwright stop timed out (10s) — driver may be orphaned")
-        except Exception:
-            logger.debug("Playwright cleanup failed", exc_info=True)
-        _playwright = None
-    if _stealth_cm is not None:
-        try:
-            await asyncio.wait_for(
-                _stealth_cm.__aexit__(None, None, None), timeout=10.0,
-            )
-        except TimeoutError:
-            logger.warning("Camoufox cleanup timed out (10s)")
-        except Exception:
-            logger.debug("Camoufox cleanup failed", exc_info=True)
-        _stealth_cm = None
-        _stealth_browser = None
-        _stealth_page = None
-    _release_stack_lock()  # no local browser is open any more
+    await _teardown_chromium()
+    await _teardown_camoufox()
+    # Drops the browser-stack hold only if every teardown above finished, or no
+    # browser process is left under this one.
+    _release_stack_lock_if_idle()
 
 
 async def _ensure_browser():
@@ -380,47 +540,62 @@ async def _ensure_browser():
     global _stealth_cm, _stealth_browser, _stealth_page
 
     async with _browser_lock:
-        if _stealth_page is not None:
-            if _is_page_alive(_stealth_page):
-                return _stealth_page
-            logger.warning("Camoufox page is stale — restarting browser")
+        if _stealth_page is not None and _is_page_alive(_stealth_page):
+            return _stealth_page
+        if _stealth_cm is not None or _stealth_page is not None:
+            # A dead page, or a launch or teardown cancelled part way (the
+            # manager is set, the page is not): the manager may still own a
+            # running driver and browser, so close it before replacing it.
+            logger.warning("Camoufox page is stale or its launch was interrupted — restarting browser")
             await async_cleanup()
 
-        # Refuse BEFORE camoufox runs: its launch path deletes a pre-0.5 engine
-        # directory and downloads the pinned build from inside this call, raced
-        # by every session's MCP process. Provisioning is bootstrap's job.
-        from genesis.browser.engine import camoufox_engine_status
+        # The hold comes FIRST: the readiness verdict and the import below read
+        # files a provisioning run replaces, and must describe what launches.
+        _acquire_stack_lock()  # raises BrowserStackBusy mid-upgrade
+        try:
+            # Refuse BEFORE camoufox runs: its launch path deletes a pre-0.5 engine
+            # directory and downloads the pinned build from inside this call, raced
+            # by every session's MCP process. Provisioning is never a tool call's job.
+            from genesis.browser.engine import camoufox_engine_status
 
-        engine = camoufox_engine_status()
-        if not engine.ready:
-            raise CamoufoxEngineNotReady(engine.detail)
-        _check_loaded_browser_modules()
+            engine = camoufox_engine_status()
+            if not engine.ready:
+                raise CamoufoxEngineNotReady(engine.detail)
+            _check_loaded_browser_modules()
 
-        from camoufox.async_api import AsyncCamoufox
+            from camoufox.async_api import AsyncCamoufox
 
-        _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+            _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Always headed — Xvfb :99 is always running.
-        os.environ["DISPLAY"] = _VNC_DISPLAY
+            # Always headed — Xvfb :99 is always running.
+            os.environ["DISPLAY"] = _VNC_DISPLAY
 
-        _stealth_cm = AsyncCamoufox(
-            headless=False,
-            persistent_context=True,
-            user_data_dir=str(_PROFILE_DIR),
-            humanize=2.5,  # Native Camoufox cursor humanization (Bézier curves, max 2.5s)
-            window=(1920, 1080),  # Fill VNC display (Xvfb :99 is 1920x1080x24)
-            firefox_user_prefs={
-                # Camoufox disables session history (max_entries=0) for
-                # anti-detection.  Re-enable it so back/forward navigation
-                # works in collaborate mode.
-                "browser.sessionhistory.max_entries": 10,
-                "browser.sessionhistory.max_total_viewers": -1,
-            },
-        )
-        _stealth_browser = await _stealth_cm.__aenter__()
-        # With persistent_context, browser IS the context
-        _stealth_page = _stealth_browser.pages[0] if _stealth_browser.pages else await _stealth_browser.new_page()
+            _stealth_cm = AsyncCamoufox(
+                headless=False,
+                persistent_context=True,
+                user_data_dir=str(_PROFILE_DIR),
+                humanize=2.5,  # Native Camoufox cursor humanization (Bézier curves, max 2.5s)
+                window=(1920, 1080),  # Fill VNC display (Xvfb :99 is 1920x1080x24)
+                firefox_user_prefs={
+                    # Camoufox disables session history (max_entries=0) for
+                    # anti-detection.  Re-enable it so back/forward navigation
+                    # works in collaborate mode.
+                    "browser.sessionhistory.max_entries": 10,
+                    "browser.sessionhistory.max_total_viewers": -1,
+                },
+            )
+            _stealth_browser = await _stealth_cm.__aenter__()
+            # With persistent_context, browser IS the context
+            _stealth_page = _stealth_browser.pages[0] if _stealth_browser.pages else await _stealth_browser.new_page()
+        except BaseException:
+            # Refused, or a partial launch that may have started the driver or
+            # the browser: close what was created (its __aexit__ handles a
+            # half-entered manager), then let the release rule decide.
+            await _teardown_camoufox()
+            _release_stack_lock_if_idle()
+            raise
         mode_str = "headed (collaborate)" if _collaborate_mode else "headed"
+        _touch()  # a launch is use: the idle clock starts now, whoever launched
         logger.info("Camoufox browser launched %s with persistent profile at %s", mode_str, _PROFILE_DIR)
         return _stealth_page
 
@@ -433,33 +608,45 @@ async def _ensure_chromium_fallback():
 
     Detects stale pages and automatically re-initializes.
     """
-    global _playwright, _context, _page
+    global _playwright_cm, _playwright, _context, _page
 
     async with _browser_lock:
-        if _page is not None:
-            if _is_page_alive(_page):
-                return _page
-            logger.warning("Chromium page is stale — restarting browser")
+        if _page is not None and _is_page_alive(_page):
+            return _page
+        if any(h is not None for h in (_page, _playwright_cm, _playwright, _context)):
+            # A dead page, or a launch or teardown cancelled part way: a driver
+            # may still run under a handle, so close it before replacing it.
+            logger.warning("Chromium page is stale or its launch was interrupted — restarting browser")
             await async_cleanup()
 
-        _check_loaded_browser_modules()
-        from playwright.async_api import async_playwright
+        _acquire_stack_lock()  # first, before the import reads the package files
+        try:
+            _check_loaded_browser_modules()
+            from playwright.async_api import async_playwright
 
-        _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+            _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Always headed — Xvfb :99 is always running.
-        os.environ["DISPLAY"] = _VNC_DISPLAY
+            # Always headed — Xvfb :99 is always running.
+            os.environ["DISPLAY"] = _VNC_DISPLAY
 
-        _playwright = await async_playwright().start()
-        _context = await _playwright.chromium.launch_persistent_context(
-            user_data_dir=str(_CHROMIUM_PROFILE_DIR),
-            headless=False,
-            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
-                  "--start-maximized"],
-            viewport={"width": 1280, "height": 720},
-        )
-        _page = _context.pages[0] if _context.pages else await _context.new_page()
+            # Keep the manager: if start() fails or is cancelled after spawning
+            # the driver, it is the only handle that can stop it.
+            _playwright_cm = async_playwright()
+            _playwright = await _playwright_cm.start()
+            _context = await _playwright.chromium.launch_persistent_context(
+                user_data_dir=str(_CHROMIUM_PROFILE_DIR),
+                headless=False,
+                args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                      "--start-maximized"],
+                viewport={"width": 1280, "height": 720},
+            )
+            _page = _context.pages[0] if _context.pages else await _context.new_page()
+        except BaseException:
+            await _teardown_chromium()
+            _release_stack_lock_if_idle()
+            raise
         mode_str = "headed (collaborate)" if _collaborate_mode else "headed"
+        _touch()  # a launch is use: the idle clock starts now, whoever launched
         logger.info("Chromium fallback launched %s with profile at %s", mode_str, _CHROMIUM_PROFILE_DIR)
         return _page
 
@@ -751,16 +938,26 @@ async def _idle_watcher_loop():
     calls async_cleanup() and exits. CancelledError is the normal shutdown
     path (MCP lifespan exit or explicit cleanup).
 
-    Note: does NOT acquire _browser_lock before cleanup. async_cleanup()
-    cancels and awaits _idle_task (this very coroutine), so holding the
-    lock here would self-deadlock. Cleanup is safe without the lock because
-    it sets _active_page = None atomically at entry and is individually
-    guarded throughout.
+    Cleanup runs under _browser_lock, so it can never tear down a browser a
+    launch is still building (which would leave that browser running with no
+    handle and without the browser-stack lock); the idle test is repeated once
+    the lock is held, because a launch that just finished counts as use.
+    async_cleanup() does not take _browser_lock itself, so holding it here
+    cannot deadlock; the cancel it sends to _idle_task (this coroutine) is
+    absorbed by its own await of the task.
     """
+
+    def idle() -> bool:
+        return _last_used > 0 and (time.monotonic() - _last_used) >= _IDLE_TIMEOUT_S
+
     try:
         while True:
             await asyncio.sleep(60)
-            if _last_used > 0 and (time.monotonic() - _last_used) >= _IDLE_TIMEOUT_S:
+            if not idle():
+                continue
+            async with _browser_lock:
+                if not idle():
+                    continue
                 logger.info("Browser idle for %ds — auto-cleaning up", _IDLE_TIMEOUT_S)
                 await async_cleanup()
                 return
@@ -1030,10 +1227,10 @@ async def _get_page(
         _active_page = await _ensure_remote_cdp(cdp_url)
     elif stealth:
         await _ensure_vnc()
-        _active_page = await _launch_local(_ensure_browser)
+        _active_page = await _ensure_browser()
     else:
         await _ensure_vnc()
-        _active_page = await _launch_local(_ensure_chromium_fallback)
+        _active_page = await _ensure_chromium_fallback()
     _touch()
     _start_idle_watcher()
     return _active_page, is_new_tinyfish
@@ -2275,6 +2472,8 @@ async def _impl_browser_navigate(
         return {"error": str(e)}
     except CamoufoxEngineNotReady as e:
         return {"error": f"Camoufox is not ready: {e}"}
+    except BrowserStackBusy as e:
+        return {"error": f"Browser not available: {e}"}
     except BrowserPackagesChanged as e:
         return {"error": str(e)}
     except ImportError as e:

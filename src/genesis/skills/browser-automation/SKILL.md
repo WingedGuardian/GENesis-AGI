@@ -186,7 +186,7 @@ button:has-text("Add to Cart")
 | Rate limited | Wait 30 seconds. Retry once. If still limited, back off exponentially. |
 | Wrong page | Use page snapshot to verify. Navigate back. Check URL. |
 | Stale element | Re-query the selector. Page may have re-rendered. |
-| "Camoufox is not ready" / "Browser not available" | The browser stack is not installed or mid-upgrade. Do NOT run the installer from a session (it downloads about 2 GB and would race other sessions). Tell the operator to run `scripts/install_browser_stack.sh`; meanwhile use `web_fetch` or another layer. |
+| "Camoufox is not ready" / "Browser not available" | The browser stack is not installed or mid-upgrade. Do NOT install packages or fetch the engine from a session (the engine download is large and would race other sessions). Pass the error's own instructions to the operator; meanwhile use `web_fetch` or another layer. |
 
 ## Form Filling Workflow
 

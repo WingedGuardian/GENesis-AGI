@@ -29,8 +29,10 @@ _STAMP = re.compile(r"^\d{8}T\d{12}Z$")
 def _load_cli():
     """Import the standalone CLI WITHOUT requiring playwright.
 
-    `scripts/browser.py` imports `playwright.sync_api` at module scope, and CI
-    does not install playwright. Guarding this class with a `skipif` therefore
+    `scripts/browser.py` once imported `playwright.sync_api` at module scope
+    (it now imports it only after taking the browser-stack lock, but the stub
+    keeps this loader independent of where the import sits), and CI does not
+    install playwright. Guarding this class with a `skipif` therefore
     meant the CLI half of the fix had ZERO coverage on the one machine that
     gates merges — it was only ever verified on a developer box that happened
     to have playwright, while CI reported a green run that had asserted
