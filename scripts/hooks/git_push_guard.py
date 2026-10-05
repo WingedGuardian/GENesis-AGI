@@ -10206,6 +10206,43 @@ def _is_dispatched() -> bool:
     return os.environ.get("GENESIS_CC_SESSION") == "1"
 
 
+def _is_subagent(payload) -> bool:
+    """True when this hook call comes from inside a SUBAGENT (an Agent-tool worker).
+
+    Keyed on ``agent_id`` in the hook input and nothing else. Claude Code's own
+    hook-input schema (READ in the 2.1.280 binary, and the hooks reference) says
+    ``agent_id`` is "Present only when the hook fires from within a subagent …
+    Absent for the main thread, even in --agent sessions. Use this field (not
+    agent_type) to distinguish subagent calls from main-thread calls."
+    ``agent_type`` is deliberately NOT read: a main session started with
+    ``--agent`` carries it too, and that session has a human at the prompt.
+
+    A missing, empty or non-string ``agent_id`` reads as the main thread, so a
+    payload this guard does not recognise keeps today's behaviour (the ordinary
+    push gates) rather than inventing a refusal."""
+    if not isinstance(payload, dict):
+        return False
+    agent_id = payload.get("agent_id")
+    return isinstance(agent_id, str) and bool(agent_id.strip())
+
+
+#: The refusal for a publish from inside a subagent. Written for the agent, and
+#: complete enough that it needs no human: what to do instead, and what to hand
+#: back. The owner sees nothing — a deny is not a prompt. Policy, not a scope
+#: judgement: it covers re-pushes of already-published branches and dry runs too,
+#: which from the main thread may pass without any prompt.
+_SUBAGENT_PUBLISH_DENY = (
+    "BLOCKED: subagents do not publish. This command runs `git push` or "
+    "`gh pr create` from inside a subagent; by owner policy (2026-10-05) pushing "
+    "and opening PRs are the main session's steps, whatever the branch's state.\n"
+    "Instead: commit your work locally on its branch and STOP. Report back to "
+    "the main session: the worktree path, the branch name, the head SHA "
+    "(`git rev-parse HEAD`), and the PR title and body you would have used "
+    "(write the body to a file and give its path). The main session pushes and "
+    "opens the PR. Do not retry the push or the create in another spelling."
+)
+
+
 # git push flags that consume the NEXT token as their value — so a value that
 # happens to start with '+' or contain 'f' is not misread as a force.
 _PUSH_VALUE_FLAGS = frozenset({"-o", "--push-option", "--repo", "--receive-pack", "--exec"})
@@ -11403,7 +11440,26 @@ def _no_url_rewrite_rules(cwd: str | None) -> bool:
     return got is not None and got[0] == 1
 
 
-def _push_publish_scope_holds(push_remote, segs, push_seg, cmd, cwd, branch=None) -> bool:
+#: Environment variables that pick a DIFFERENT repository, ref namespace or git
+#: program set than the one the checks below read through ``git -C <cwd>``. Set
+#: in the hook's environment, any of them keeps the ask. A per-command
+#: ``GIT_DIR=…`` prefix is refused separately (``_push_seg_has_no_prefix``); an
+#: ``export`` earlier in the command makes the cwd unknown (``_effective_cwd``).
+#: Same residue as ``_TRANSPORT_ENV``: a variable exported only in the Bash
+#: tool's shell profile is invisible here.
+_REPO_SELECTION_ENV = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_EXEC_PATH",
+)
+
+
+def _repo_selection_env_set() -> bool:
+    """Whether any ``_REPO_SELECTION_ENV`` variable is set in this process."""
+    return any(os.environ.get(v) for v in _REPO_SELECTION_ENV)
+
+
+def _push_publish_scope_holds(
+    push_remote, segs, push_seg, cmd, cwd, branch=None, hook_cwd=None
+) -> bool:
     """Whether a FIRST push of the current branch may go unprompted under
     ``hooks.asks.push_publish: off`` — i.e. every place it can land is the public
     repo and nothing else in the command can change that.
@@ -11418,13 +11474,24 @@ def _push_publish_scope_holds(push_remote, segs, push_seg, cmd, cwd, branch=None
         to expand, so it qualifies only when no rewrite rule exists at all;
       * every URL must be an EXACT public-repo match (``_all_urls_are_public_repo``);
       * the command is exactly ONE plain ``git push`` (``_is_single_plain_push``)
-        — no other segment at all, since any neighbour can change the push after
-        this check (a ``cd``, a hook, an fsmonitor, a clean filter);
+        — no other segment that runs before or beside it, since any neighbour can
+        change the push after this check (a ``cd``, a hook, an fsmonitor, a clean
+        filter). The two harmless spellings it admits — ``git -C <the top of a
+        worktree of this same repository>`` and an output-only ``2>&1 | tail -N``
+        suffix — are judged there; ``cwd`` is the directory every check below
+        reads, so a ``-C`` push is judged in the worktree it names;
+      * no repository-selecting variable (``_REPO_SELECTION_ENV``) is set in the
+        hook's environment;
       * a live probe confirms the branch is absent on the destination.
     Anything else returns False and the prompt stands."""
     if not push_remote:
         return False
-    if not _is_single_plain_push(segs, push_seg, cmd):
+    # FIRST, before any helper shells out: every probe below inherits this
+    # environment, so a repository-selecting variable would answer each of them
+    # about the overriding repository instead of the one named.
+    if _repo_selection_env_set():
+        return False
+    if not _is_single_plain_push(segs, push_seg, cmd, hook_cwd=hook_cwd, push_cwd=cwd):
         return False
     named = _raw_remote_push_urls(push_remote, cwd)
     if named is None:
@@ -11458,36 +11525,163 @@ def _push_publish_scope_holds(push_remote, segs, push_seg, cmd, cwd, branch=None
 _SINGLE_PUSH_FORBIDDEN = frozenset(";&|<>(){}$`\\\n\r*?[")
 
 
-def _is_single_plain_push(segs, push_seg, cmd: str) -> bool:
-    """Whether the WHOLE command is exactly one top-level ``git push …``.
+#: The only later stages a silenced first push may pipe into: ``head`` or ``tail``
+#: with a line count, and nothing else — no file operand, no ``-f``, no ``-c``,
+#: no ``+N``. Both only read stdin and write stdout, so neither can change where
+#: the push lands. One side effect is stated rather than hidden: ``head`` exits
+#: after N lines, and git's next write to the pipe can then die of SIGPIPE, cutting
+#: a push short (perhaps before ``-u`` records the upstream). That can only make
+#: less happen, never something else. A CLOSED set on purpose:
+#: ``tee`` writes files, ``xargs``/``sh``/``bash`` run what they read, and an
+#: open "filters are fine" rule is the neighbour allowlist that two audit rounds
+#: already outran.
+_PUSH_OUTPUT_FILTER = re.compile(r"(?:head|tail)[ \t]+(?:-[0-9]{1,6}|-n[ \t]+[0-9]{1,6})")
+_PUSH_OUTPUT_FILTER_EXES = frozenset({"head", "tail"})
+#: ``2>&1`` on the push itself: stderr joins stdout, which goes to the pipe or
+#: the terminal. Never a file — ``>`` with a path stays forbidden.
+_PUSH_STDERR_MERGE = re.compile(r"(?P<text>.*?)[ \t]+2>&1[ \t]*", re.DOTALL)
 
-    The ``push_publish`` suppression judges the repository the hook payload's
-    cwd names, before anything runs. Anything else in the command can change
-    what the push does after that judgement — a ``cd`` (through ``CDPATH``, in a
-    pipeline, in the background), a ``git status`` that runs ``core.fsmonitor``,
-    a ``git add`` that runs a clean filter, a ``git commit`` whose hook rewrites
-    the push URL or switches branch, a ``-C`` through a symlink. Two audit rounds
-    found members of that class faster than a neighbour allowlist could absorb
-    them, so the rule is structural: one segment, which is the push itself; no
-    shell metacharacter anywhere; the text re-tokenizes to exactly its argv
-    (no assignment prefix, no wrapper); and ``push`` immediately follows ``git``
-    (no global option at all: ``-C``, ``-c``, ``--git-dir``, ``--work-tree``,
-    ``--namespace``, ``--config-env``, …). Applies to the suppression only; the
-    re-push allow keeps ``_push_compound_is_inert``."""
-    if len(segs) != 1 or segs[0] is not push_seg:
+
+def _split_push_output_suffix(cmd: str):
+    """``(push_text, filter_argvs)`` when ``cmd`` is ``<push_text>[ 2>&1][ | <filter>]…``
+    with every filter matching ``_PUSH_OUTPUT_FILTER``; ``(cmd, [])`` when there
+    is no such suffix; None when a ``|`` stage is anything else.
+
+    Text-level and CLOSED: the suffix vocabulary is ``|``, ``2>&1``, ``head``,
+    ``tail``, ``-n``, digits and blanks, so no quote, ``#``, ``&``, ``;``, ``>``
+    or newline can hide in it. A ``|`` inside a quoted push argument splits the
+    push text here, which leaves an unbalanced quote or a non-filter stage and
+    so refuses — never the other way round. ``|&`` and ``||`` leave a stage that
+    is not a filter, and refuse too."""
+    head, *stages = cmd.split("|")
+    filters: list[list[str]] = []
+    for stage in stages:
+        stage = stage.strip(" \t")
+        if not _PUSH_OUTPUT_FILTER.fullmatch(stage):
+            return None
+        filters.append(stage.split())
+    m = _PUSH_STDERR_MERGE.fullmatch(head)
+    text = m.group("text") if m else head
+    if not stages and not m:
+        return cmd, []
+    if "#" in cmd:
+        # A comment would swallow the suffix (or the push's own tail) in bash
+        # while this split still reads it. Never worth modelling.
+        return None
+    return text, filters
+
+
+def _git_toplevel(path: str) -> str | None:
+    """``git -C <path> rev-parse --show-toplevel``, or None on any failure."""
+    got = _run_git_lines(["git", "-C", path, "rev-parse", "--show-toplevel"])
+    if got is None or got[0] != 0 or len(got[1]) != 1:
+        return None
+    return got[1][0]
+
+
+def _dash_c_names_sibling_worktree(path: str, hook_cwd) -> bool:
+    """Whether ``git -C <path>`` provably names the TOP of a worktree of the same
+    repository as the session's own cwd — the one ``-C`` the ``push_publish``
+    suppression admits.
+
+    Each condition closes a way ``-C`` reached a different repository than the
+    one the guard judged:
+      * ``path`` is ABSOLUTE and equals its own ``realpath`` — no symlink in any
+        component, no ``..``, no ``~`` (bash expands a leading tilde; Python's
+        realpath does not, so an unexpanded ``~`` can never compare equal), no
+        trailing slash. That is the audited ``-C lnk/..`` class: git follows the
+        link before applying ``..``, ``normpath`` does not;
+      * ``path`` IS the worktree's top level (``rev-parse --show-toplevel``), so
+        it is not a subdirectory whose own nested repository git would find;
+      * its git common dir equals the hook cwd's (both realpath'd), so it is a
+        worktree of THIS repository. Per-worktree config (``config.worktree``
+        under ``extensions.worktreeConfig``) can still differ — a pushurl, a
+        rewrite, a ``core.hooksPath`` — which is why every scope check after
+        this one reads ``push_cwd``, the ``-C`` directory itself: the push is
+        judged exactly as a plain ``git push`` run inside that worktree.
+    Anything unreadable → False, and the push keeps its prompt. The literalness
+    of the word itself (no ``$``, glob, brace or backslash) is enforced by the
+    caller's ``_SINGLE_PUSH_FORBIDDEN`` scan.
+
+    Refuses on its own when a ``_REPO_SELECTION_ENV`` variable is set, rather than
+    relying on its caller to have checked: the git probes below inherit this
+    environment, and a ``GIT_DIR`` there makes ``-C`` irrelevant, so two
+    unrelated directories would both report the overriding repository's top
+    level and common dir (MEASURED by review: the comparison then passes)."""
+    if _repo_selection_env_set():
         return False
+    if not isinstance(path, str) or not isinstance(hook_cwd, str) or not hook_cwd:
+        return False
+    if not os.path.isabs(path):
+        return False
+    try:
+        if os.path.realpath(path) != path:
+            return False
+    except (OSError, ValueError):
+        return False
+    if _git_toplevel(path) != path:
+        return False
+    mine = _git_common_dir(path)
+    return mine is not None and mine == _git_common_dir(hook_cwd)
+
+
+def _is_single_plain_push(segs, push_seg, cmd: str, hook_cwd=None, push_cwd=None) -> bool:
+    """Whether the WHOLE command is exactly one top-level ``git push …``, in one
+    of the few spellings that cannot change what the push does.
+
+    The ``push_publish`` suppression judges the repository the push's cwd names,
+    before anything runs. Anything else in the command can change what the push
+    does after that judgement — a ``cd`` (through ``CDPATH``, in a pipeline, in
+    the background), a ``git status`` that runs ``core.fsmonitor``, a ``git
+    add`` that runs a clean filter, a ``git commit`` whose hook rewrites the push
+    URL or switches branch, a ``-C`` through a symlink. Two audit rounds found
+    members of that class faster than a neighbour allowlist could absorb them,
+    so the rule is structural: the push is the only segment that is not an
+    output filter; no shell metacharacter in the push text; the text
+    re-tokenizes to exactly its argv (no assignment prefix, no wrapper); and
+    ``push`` immediately follows ``git`` — except for exactly ONE global option:
+
+      * ``git -C <path> push …`` where ``_dash_c_names_sibling_worktree`` holds
+        for the payload's cwd (``hook_cwd``) and ``<path>`` is the directory the
+        caller resolved and judged (``push_cwd``). Every other global option —
+        ``-c``, ``--git-dir``, ``--work-tree``, ``--namespace``,
+        ``--config-env``, a second ``-C``, the pager switches — still refuses.
+
+    And exactly one suffix (``_split_push_output_suffix``): ``2>&1`` on the push
+    and/or a pipeline into ``head``/``tail`` line counts. Those stages start
+    beside the push, but they read stdin and write stdout and cannot touch the
+    repository, its config or the network; each must also be a parsed top-level
+    segment whose argv is the filter exactly. Applies to the suppression only;
+    the re-push allow keeps ``_push_compound_is_inert``."""
+    split = _split_push_output_suffix(cmd)
+    if split is None:
+        return False
+    text, filters = split
+    if len(segs) != 1 + len(filters) or segs[0] is not push_seg:
+        return False
+    for seg, words in zip(segs[1:], filters, strict=True):
+        if getattr(seg, "depth", 0) or getattr(seg, "exe", "") not in _PUSH_OUTPUT_FILTER_EXES:
+            return False
+        if list(getattr(seg, "argv", None) or []) != words:
+            return False
     if getattr(push_seg, "depth", 0):
         return False
-    if any(c in _SINGLE_PUSH_FORBIDDEN for c in cmd):
+    if any(c in _SINGLE_PUSH_FORBIDDEN for c in text):
         return False
     if not _push_seg_has_no_prefix(push_seg):
         return False
     try:
-        words = shlex.split(cmd, comments=True)
+        words = shlex.split(text, comments=True)
     except ValueError:
         return False
     argv = list(getattr(push_seg, "argv", None) or [])
-    return words == argv and len(words) >= 2 and words[0] == "git" and words[1] == "push"
+    if words != argv or len(words) < 2 or words[0] != "git":
+        return False
+    if words[1] == "push":
+        return True
+    if len(words) >= 4 and words[1] == "-C" and words[3] == "push":
+        return push_cwd == words[2] and _dash_c_names_sibling_worktree(words[2], hook_cwd)
+    return False
 
 
 def _remote_branch_definitely_absent(url: str, branch: str | None, cwd: str | None) -> bool:
@@ -12037,6 +12231,26 @@ def _run_merge_and_push_gates() -> int:
                 "gated command as its own Bash call."
             )
 
+        # ── A subagent never publishes ─────────────────────────────────────
+        # A push or a PR create from inside an Agent-tool worker is REFUSED, by
+        # owner policy (2026-10-05): a fan-out of agents each publishing its own
+        # branch put a run of first-push approval prompts in front of the owner.
+        # The deny tells the agent to hand the branch back to the main session,
+        # which publishes. It is a blanket rule, not a prompt substitute: a
+        # re-push the main thread would be allowed silently, and a dry run, are
+        # refused here too. Ahead of the multiple-publish check so a subagent is
+        # not first told to split a command whose halves are each refused.
+        # Reach: every push and create the parse resolves, nested ones included
+        # (`push_segs` / `create_segs` hold parsed segments at any depth), and an
+        # unparseable one is the blind-spot net's. NOT reached — the accepted
+        # residue this guard documents elsewhere: a git or gh ALIAS, and a
+        # `gh api` write. This instructs a cooperating agent; it is not a
+        # security boundary. A main-thread session carries no `agent_id` and is
+        # unaffected, `--agent` sessions included.
+        if (push_segs or create_segs) and _is_subagent(payload):
+            print(_SUBAGENT_PUBLISH_DENY, file=sys.stderr)
+            return 2
+
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
         # command carrying more than one would collapse into ONE ask/gate
         # (evaluated only for the first), so approving it would run every push —
@@ -12260,7 +12474,8 @@ def _run_merge_and_push_gates() -> int:
                         # ask, scope checked only when the key is off.
                         publish_off = _ask_suppressed("push_publish")
                         if publish_off and _push_publish_scope_holds(
-                            push_remote, segs, push_segs[0], cmd, pcwd, branch=cur
+                            push_remote, segs, push_segs[0], cmd, pcwd, branch=cur,
+                            hook_cwd=payload.get("cwd") if isinstance(payload, dict) else None,
                         ):
                             publish_note = _suppressed_reason(
                                 "push_publish",

@@ -42,6 +42,10 @@ plain ``git push`` (e.g. ``git push -u origin HEAD``): no other step of any kind
 ``|``/``&``/newline), no redirection, no subshell, no global option between
 ``git`` and ``push`` (``-C``, ``-c``, ``--git-dir``…), no ``VAR=…`` prefix and no
 wrapper. A chained command still asks — run the first push as its own command.
+Two exceptions, both judged by the push guard's ``_is_single_plain_push``: one
+``-C <path>`` naming the literal, symlink-free top of a worktree of the same
+repository as the session's cwd, and an output-only suffix (``2>&1`` and/or a
+pipe into ``tail``/``head`` with a line count).
 It must also be true that:
 
 * the remote git will really push to (pushRemote > pushDefault >

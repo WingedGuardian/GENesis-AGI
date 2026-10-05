@@ -3440,7 +3440,10 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   It silences only the first push of the CURRENT branch, and only when the
   whole command is exactly one plain `git push` (e.g. `git push -u origin
   HEAD`) — a chained command still asks, so run the first push as its own
-  command. The remote git really pushes to must resolve (rewrites applied) to
+  command. Two spellings also qualify: `git -C <path> push …` when `<path>` is
+  the literal, symlink-free top of a worktree of the SAME repository as the
+  session's cwd, and a trailing `2>&1` and/or `| tail -N` / `| head -N`. The
+  remote git really pushes to must resolve (rewrites applied) to
   exactly `https://github.com/<public repo>` — ssh/scp forms always ask — with
   simple push config, no `http.*` config, no proxy/TLS/ssh/config env var in
   the hook's environment, and a live probe confirming the branch is absent
@@ -3450,6 +3453,13 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   without a TTY aborts rather than pushing. Force pushes, other destinations,
   close-then-push, the no-open-PR block, round-cap asks and the dispatched deny
   are untouched, and any doubt about the destination keeps the prompt.
+- **Subagents do not publish.** A `git push` or `gh pr create` from an
+  Agent-tool worker (the hook input carries `agent_id`) is refused, whatever
+  `push_publish` says — re-pushes of an already-published PR branch and dry
+  runs included (owner policy 2026-10-05). Commit locally, then hand the
+  worktree path, branch, head SHA and PR title and body back to the main
+  session, which pushes. A subagent dispatched to fix a PR therefore leaves the
+  push to the session that dispatched it.
 - **Ack sigils bind per-guard, and mostly to the LAST pipeline segment.**
   `git commit ... | tail  # audit-ack` puts the ack on `tail`. Run the commit
   bare. Some guards accept a sigil on any segment, others only on the offending

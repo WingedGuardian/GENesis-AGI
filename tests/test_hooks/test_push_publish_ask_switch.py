@@ -97,8 +97,14 @@ def _first_publish(monkeypatch):
     # The definitive-absence probe is a network call: stubbed to "absent" here,
     # driven for real against a local bare repo in its own tests below.
     monkeypatch.setattr(gpg, "_remote_branch_definitely_absent", lambda *a, **k: True)
-    for var in gpg._TRANSPORT_ENV:
+    for var in gpg._TRANSPORT_ENV + _REPO_ENV:
         monkeypatch.delenv(var, raising=False)
+
+
+#: Environment variables that select another repository, namespace or git program
+#: set. Spelled out here rather than read from the guard, so the test names what it
+#: requires instead of agreeing with whatever the guard lists.
+_REPO_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_EXEC_PATH")
 
 
 @pytest.fixture
@@ -685,7 +691,6 @@ def _hook_file(repo: Path, name: str, body: str) -> None:
         "cd sub; git push -u origin HEAD",
         "git push -u origin HEAD & git rev-parse HEAD",
         "git push -u origin HEAD > out.txt",
-        "git push -u origin HEAD 2>&1",
         "(git push -u origin HEAD)",
         "git push -u origin HEAD && true",
         "git -C . push -u origin HEAD",
@@ -801,3 +806,322 @@ def test_a_glob_in_the_push_keeps_the_prompt(command: str) -> None:
     could expand to a different word than the one judged: never silenced."""
     segs, _ = gpg.analyze_checked(command)
     assert gpg._is_single_plain_push(segs, segs[0], command) is False
+
+
+# ─── harmless spellings: `git -C <sibling worktree>` and an output-only pipe ──
+#
+# Measured 2026-10-05: dispatched agents published with
+# `git -C <worktree> push -u origin HEAD 2>&1 | tail -2`, and both the `-C` and
+# the pipe disqualified the suppression, so every one of them prompted. Each
+# accepted spelling below is silenced; each near-miss beside it still asks.
+
+
+def _real(path: Path) -> Path:
+    import os
+
+    return Path(os.path.realpath(path))
+
+
+def _with_worktree(tmp_path) -> tuple[Path, Path]:
+    """A repo whose origin is the public repo, plus a linked worktree of it on its
+    own branch. Real paths, so a symlinked tmp dir cannot fail the realpath rule."""
+    repo = _repo(_real(tmp_path) / "main", (("remote.origin.url", PUBLIC),))
+    wt = _real(tmp_path) / "wt"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", "feat/wt", str(wt)],
+        capture_output=True,
+        timeout=30,
+        check=True,
+    )
+    return repo, wt
+
+
+def _run_at(monkeypatch, capsys, command: str, cwd, extra: dict | None = None):
+    payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+    if cwd is not None:
+        payload["cwd"] = str(cwd)
+    payload.update(extra or {})
+    monkeypatch.setattr(gpg.sys, "stdin", io.StringIO(json.dumps(payload)))
+    if cwd is not None:
+        monkeypatch.chdir(cwd)
+    rc = gpg.main()
+    out = capsys.readouterr()
+    return rc, out.out, out.err
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git push -u origin HEAD 2>&1",
+        "git push -u origin HEAD 2>&1 | tail -2",
+        "git push -u origin HEAD | tail -n 5",
+        "git push -u origin HEAD 2>&1 | tail -n 20 | head -3",
+        "git push -u origin HEAD 2>&1|head -1",
+    ],
+)
+def test_an_output_only_suffix_is_silenced(monkeypatch, tmp_path, capsys, off, command) -> None:
+    _assert_silenced(*_run(monkeypatch, tmp_path, capsys, command))
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git push -u origin HEAD | tee out.txt",
+        "git push -u origin HEAD 2>&1 | tee out.txt",
+        "git push -u origin HEAD | sh",
+        "git push -u origin HEAD | bash",
+        "git push -u origin HEAD | xargs echo",
+        "git push -u origin HEAD | tail -f",
+        "git push -u origin HEAD | tail -2 out.txt",
+        "git push -u origin HEAD | tail +2",
+        "git push -u origin HEAD | head -c 5",
+        "git push -u origin HEAD |& tail -2",
+        "git push -u origin HEAD || tail -2",
+        "git push -u origin HEAD 2> err.txt",
+        "git push -u origin HEAD 2>&1 > out.txt",
+        "git push -u origin HEAD > out.txt 2>&1",
+        "git push -u origin HEAD 2>&1 | tail -2 > out.txt",
+        "git push -u origin HEAD 2>&1 | tail -2 && true",
+        "git push -u origin HEAD 2>&1 | tail -2; true",
+        "git push -u origin HEAD 2>&1 | tail -2 &",
+        "git push -u origin HEAD 2>&1 | tail -2 # note",
+        "git push -u origin HEAD # 2>&1 | tail -2",
+        "git push -u origin HEAD 2>&1 | tail -2 | sh",
+        "git push -u origin HEAD 2>&1 | tail <(git config -l)",
+        "tail -2 | git push -u origin HEAD",
+        "cd sub && git push -u origin HEAD 2>&1 | tail -2",
+        "git -c x.y=z push -u origin HEAD 2>&1 | tail -2",
+    ],
+)
+def test_a_pipe_or_redirect_that_can_do_more_than_filter_output_asks(
+    monkeypatch, tmp_path, capsys, off, command
+) -> None:
+    rc, out, err = _run(monkeypatch, tmp_path, capsys, command)
+    if rc == 2:
+        return  # refused outright by another gate: not silenced, which is the point
+    assert _decision(out) == "ask", (command, out, err)
+
+
+@pytest.mark.parametrize("suffix", ["", " 2>&1 | tail -2", " | tail -n 5"])
+def test_dash_C_to_a_sibling_worktree_is_silenced(monkeypatch, tmp_path, capsys, off, suffix):
+    """The measured incident shape: the session sits in the main checkout and
+    publishes a linked worktree's branch with `-C`."""
+    repo, wt = _with_worktree(tmp_path)
+    command = f"git -C {wt} push -u origin HEAD{suffix}"
+    rc, out, err = _run_at(monkeypatch, capsys, command, repo)
+    _assert_silenced(rc, out, err)
+    assert "feat/wt" in _hso(out)["additionalContext"], out  # judged in the worktree
+
+
+def test_dash_C_to_the_sessions_own_checkout_is_silenced(monkeypatch, tmp_path, capsys, off):
+    repo, _wt = _with_worktree(tmp_path)
+    _assert_silenced(*_run_at(monkeypatch, capsys, f"git -C {repo} push -u origin HEAD", repo))
+
+
+def test_dash_C_from_a_worktree_back_to_the_main_checkout_is_silenced(
+    monkeypatch, tmp_path, capsys, off
+):
+    repo, wt = _with_worktree(tmp_path)
+    _assert_silenced(*_run_at(monkeypatch, capsys, f"git -C {repo} push -u origin HEAD", wt))
+
+
+def test_dash_C_through_a_symlink_to_a_sibling_worktree_asks(monkeypatch, tmp_path, capsys, off):
+    import os
+
+    repo, wt = _with_worktree(tmp_path)
+    link = _real(tmp_path) / "lnk"
+    os.symlink(wt, link)
+    _assert_asks(*_run_at(monkeypatch, capsys, f"git -C {link} push -u origin HEAD", repo))
+
+
+def test_dash_C_through_a_symlinked_parent_asks(monkeypatch, tmp_path, capsys, off):
+    import os
+
+    repo, wt = _with_worktree(tmp_path)
+    alias = _real(tmp_path) / "alias"
+    os.symlink(wt.parent, alias)
+    command = f"git -C {alias / wt.name} push -u origin HEAD"
+    _assert_asks(*_run_at(monkeypatch, capsys, command, repo))
+
+
+def test_dash_C_to_another_repository_asks(monkeypatch, tmp_path, capsys, off):
+    """Same public origin, but a DIFFERENT repository: its hooks and config are
+    not the ones this session's checkout runs under."""
+    repo, _wt = _with_worktree(tmp_path)
+    other = _repo(_real(tmp_path) / "elsewhere", (("remote.origin.url", PUBLIC),))
+    _assert_asks(*_run_at(monkeypatch, capsys, f"git -C {other} push -u origin HEAD", repo))
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "{wt}/",  # trailing slash: not its own realpath
+        "{wt}/../wt",  # `..` in the word
+        "{wt}/sub",  # a subdirectory, not the top level
+        ".",  # relative
+        "wt",  # relative
+        "{wt} -C {wt}",  # two -C
+        "{wt} -c x.y=z",  # another global option after -C
+        "{wt} --no-pager",  # even a harmless global option
+    ],
+)
+def test_a_dash_C_that_is_not_exactly_a_worktree_top_asks(
+    monkeypatch, tmp_path, capsys, off, spelling
+):
+    repo, wt = _with_worktree(tmp_path)
+    (wt / "sub").mkdir()
+    command = f"git -C {spelling.format(wt=wt)} push -u origin HEAD"
+    rc, out, err = _run_at(monkeypatch, capsys, command, repo)
+    if rc == 2:
+        return
+    assert _decision(out) == "ask", (command, out, err)
+
+
+def test_dash_C_without_a_known_session_cwd_asks(monkeypatch, tmp_path, capsys, off):
+    """No payload cwd: there is nothing to compare the repository against."""
+    repo, wt = _with_worktree(tmp_path)
+    monkeypatch.chdir(repo)
+    _assert_asks(*_run_at(monkeypatch, capsys, f"git -C {wt} push -u origin HEAD", None))
+
+
+def test_dash_C_from_a_session_outside_any_repository_asks(monkeypatch, tmp_path, capsys, off):
+    _repo_dir, wt = _with_worktree(tmp_path)
+    elsewhere = _real(tmp_path) / "plain"
+    elsewhere.mkdir()
+    _assert_asks(*_run_at(monkeypatch, capsys, f"git -C {wt} push -u origin HEAD", elsewhere))
+
+
+@pytest.mark.parametrize("var", _REPO_ENV)
+def test_a_repository_selecting_variable_in_the_environment_asks(
+    monkeypatch, tmp_path, capsys, off, var
+) -> None:
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    # Set only for the guard's own decision, after the fixture repo exists: a
+    # repository variable in the environment would otherwise redirect the setup.
+    monkeypatch.setenv(var, str(repo / ".git") if var != "GIT_NAMESPACE" else "ns")
+    _assert_asks(*_run_at(monkeypatch, capsys, "git push -u origin HEAD", repo))
+
+
+@pytest.mark.parametrize("var", ["GIT_DIR", "GIT_COMMON_DIR"])
+def test_the_dash_C_check_refuses_a_repository_variable_on_its_own(
+    monkeypatch, tmp_path, var
+) -> None:
+    """Security review: with GIT_DIR in the environment every `git -C` probe answers
+    about the overriding repository, so an UNRELATED directory compared equal to
+    the session's repository. The helper must refuse by itself, whatever order its
+    caller checks the environment in."""
+    repo, wt = _with_worktree(tmp_path)
+    unrelated = _real(tmp_path) / "unrelated"
+    unrelated.mkdir()
+    for target, expected_clean in ((wt, True), (unrelated, False)):
+        command = f"git -C {target} push -u origin HEAD"
+        segs, _ = gpg.analyze_checked(command)
+        kw = {"hook_cwd": str(repo), "push_cwd": str(target)}
+        assert gpg._is_single_plain_push(segs, segs[0], command, **kw) is expected_clean
+        monkeypatch.setenv(var, str(repo / ".git"))
+        assert gpg._is_single_plain_push(segs, segs[0], command, **kw) is False, target
+        monkeypatch.delenv(var)
+
+
+def test_the_dash_C_judgement_runs_against_the_named_directory(tmp_path) -> None:
+    """Belt: the directory every scope check read (``push_cwd``) must BE the `-C`
+    word. A valid sibling worktree judged from a different directory refuses."""
+    repo, wt = _with_worktree(tmp_path)
+    command = f"git -C {wt} push -u origin HEAD"
+    segs, _ = gpg.analyze_checked(command)
+    kw = {"hook_cwd": str(repo)}
+    assert gpg._is_single_plain_push(segs, segs[0], command, push_cwd=str(wt), **kw) is True
+    assert gpg._is_single_plain_push(segs, segs[0], command, push_cwd=str(repo), **kw) is False
+    assert gpg._is_single_plain_push(segs, segs[0], command, push_cwd=None, **kw) is False
+
+
+def test_an_output_filter_must_be_its_own_parsed_segment() -> None:
+    """The text split and the parse must agree: a filter stage the parser did not
+    produce as a plain top-level segment refuses."""
+    command = "git push -u origin HEAD | tail -2"
+    segs, _ = gpg.analyze_checked(command)
+    assert gpg._is_single_plain_push(segs, segs[0], command) is True
+    assert gpg._is_single_plain_push(segs[:1], segs[0], command) is False
+    other, _ = gpg.analyze_checked("git push -u origin HEAD | head -2")
+    assert gpg._is_single_plain_push([segs[0], other[1]], segs[0], command) is False
+
+
+# ─── a subagent never publishes: refused, never asked ─────────────────────────
+
+_SUBAGENT = {"agent_id": "a0123456789abcdef", "agent_type": "general-purpose"}
+
+
+@pytest.mark.parametrize("policy", ["push_publish=off", ""])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git push -u origin HEAD",
+        "git push -u origin HEAD 2>&1 | tail -2",
+        "git push origin feat/x",
+        "bash -c 'git push -u origin HEAD'",
+        "gh pr create --title t --body b",
+        "git push -u origin HEAD && gh pr create --title t --body b",
+        # Told it does not publish, not first told to split the command.
+        "git push -u origin HEAD && git push origin HEAD",
+        # Policy, not a scope judgement: a dry run is refused too.
+        "git push --dry-run origin HEAD",
+    ],
+)
+def test_a_subagent_push_or_create_is_denied(monkeypatch, tmp_path, capsys, policy, command):
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", policy)
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    rc, out, err = _run_at(monkeypatch, capsys, command, repo, _SUBAGENT)
+    assert rc == 2, (command, rc, out, err)
+    assert "subagents do not publish" in err, err
+    assert "git rev-parse HEAD" in err and "main session" in err, err
+    assert not out.strip(), out  # no prompt, no note: the owner sees nothing
+
+
+def test_a_subagent_repush_of_a_published_branch_is_denied(monkeypatch, tmp_path, capsys) -> None:
+    """The re-push relaxation would ALLOW this from the main thread; a subagent
+    still does not publish."""
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    rc, out, err = _run_at(monkeypatch, capsys, "git push origin feat/x", repo, _SUBAGENT)
+    assert rc == 2 and "subagents do not publish" in err, (rc, out, err)
+
+
+def test_a_dispatched_subagent_is_still_denied(monkeypatch, tmp_path, capsys) -> None:
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: True)
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    rc, out, err = _run_at(monkeypatch, capsys, "git push -u origin HEAD", repo, _SUBAGENT)
+    assert rc == 2 and "BLOCKED" in err, (rc, out, err)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {},
+        {"agent_type": "security-reviewer"},  # a main session started with --agent
+        {"agent_id": ""},
+        {"agent_id": None},
+        {"agent_id": 7},
+    ],
+    ids=["no-agent-fields", "agent-type-only", "empty-id", "null-id", "non-string-id"],
+)
+def test_a_main_thread_push_is_unaffected(monkeypatch, tmp_path, capsys, off, extra) -> None:
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    rc, out, err = _run_at(monkeypatch, capsys, "git push -u origin HEAD", repo, extra)
+    _assert_silenced(rc, out, err)
+    assert "subagents do not publish" not in err
+
+
+def test_a_main_thread_push_still_asks_by_default(monkeypatch, tmp_path, capsys) -> None:
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    rc, out, err = _run_at(monkeypatch, capsys, "git push -u origin HEAD", repo, {"agent_type": "x"})
+    _assert_asks(rc, out, err)
+
+
+@pytest.mark.parametrize(
+    "command", ["git status", "git commit --allow-empty -m x", "gh pr view 5", "git log -1"]
+)
+def test_a_subagent_that_does_not_publish_is_not_refused(monkeypatch, tmp_path, capsys, command):
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    rc, out, err = _run_at(monkeypatch, capsys, command, repo, _SUBAGENT)
+    assert "subagents do not publish" not in err, (command, err)
+    assert rc == 0, (command, rc, out, err)
