@@ -528,15 +528,17 @@ Two triggers, two labels:
 
 Leave it OPEN (genesis-development, "Never RETIRE a PR you are not the one
 reviving"). A rework normally comes back as a FRESH PR with a new number, so
-its review round count starts over (owner rulings 2026-09-24 and 2026-10-05). The
+its round count is its own (owner rulings 2026-09-24 and 2026-10-05). The
 reworking session opens the replacement and names the old PR in its body. Those
 rulings are the on-record owner authorization (condition 1 of
 genesis-development's superseded-PR exception) for closing the old draft once
 the replacement is open. Conditions 2 and 3 are still checked per PR. So the
-closing session closes the old draft only when the replacement covers it in every
-part, with the per-file mapping in the closing comment. If any part is not covered,
-it leaves the old PR open with a comment naming that part. Either way it completes
-the step-4 follow-up, citing the replacement PR. Reworking on the old number is an
+closing session closes the old draft only when every part is covered by the
+replacement or moot, with the per-file mapping in the closing comment, and then
+completes the step-4 follow-up, citing the replacement PR. If any part is neither,
+it leaves the old PR open with a comment naming that part, and updates the
+follow-up to name it too, since the follow-up is what keeps the draft visible.
+Reworking on the old number is an
 owner-approved exception; there, the session that completes the rework marks it
 ready, removes the label, and requests review.
 
@@ -619,12 +621,14 @@ happened already. Before requesting or answering any further review:
    rework to this branch and marked it ready), or the owner decided. Re-check those
    PRs, and the open PRs that name them, on each queue sweep.
 5. **When the rework arrives as its replacement PR,** link the two on both PRs and
-   work the replacement normally; its round count starts at one. Check whether
-   the replacement covers the old PR completely, under genesis-development's
-   superseded-PR exception (condition 1 is met by the rulings cited in section 5).
-   If it does, close the old draft with the per-file mapping; if it does not, leave
-   the old PR open with a comment naming what is missing. Either way, complete the
-   step-4 follow-up, citing the replacement. If Devin pushed the rework onto the old branch instead and marked it
+   work the replacement normally; read its round count from
+   `scripts/review_budget.py` like any other PR's. Check whether the replacement
+   supersedes the old PR completely, under genesis-development's superseded-PR
+   exception (condition 1 is met by the rulings cited in section 5): every part
+   covered or moot. If it does, close the old draft with the per-file mapping and
+   complete the step-4 follow-up, citing the replacement. If it does not, leave the
+   old PR open with a comment naming what is missing, and update the follow-up to
+   name it, so the unfinished part stays tracked. If Devin pushed the rework onto the old branch instead and marked it
    ready, that reuse is an owner-approved exception: ask the owner before
    spending a round on it. With the owner's yes, request `@codex review` (marking
    a draft ready is not a reliable trigger) and work it normally.
