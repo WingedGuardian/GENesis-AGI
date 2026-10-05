@@ -1112,4 +1112,7 @@ jobs:
         # Floor: 24153 +92 =24245; skip ceiling remains 102.
         # NVIDIA provider health: new test_provider_health_probes.py collects
         # 87 tests (0 -> 87); no added skips. Floor: 24245 + 87 = 24332.
+        # Shared PR-close predicate (#2469): +32 collected across test_shell_parse,
+        # test_push_pr_adjacency, test_git_push_guard_escalation (373 -> 405).
+        # Floor: 24332 + 32 = 24364.
         run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24364
