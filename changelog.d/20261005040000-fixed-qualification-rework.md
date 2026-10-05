@@ -1,1 +1,1 @@
-Rebuild model qualification after terminal review: shared offline preflight, durable dispatch stops, strict J9 and novelty validation, and replay through both disposable procedure storage paths.
+- Rebuild model qualification after terminal review: shared offline preflight, durable dispatch stops, strict J9 and novelty validation, and replay through both disposable procedure storage paths.
