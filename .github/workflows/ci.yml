@@ -1113,5 +1113,5 @@ jobs:
         # NVIDIA provider health: new test_provider_health_probes.py collects
         # 87 tests (0 -> 87); no added skips. Floor: 24245 + 87 = 24332.
         # Quoted-heredoc receiver regressions: the five changed test files
-        # collect 583 on origin/main and 671 here (+88). Floor: 24332 + 88 = 24420.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24420
+        # collect 583 on origin/main and 671 here (+88). Floor: 24421 + 88 = 24509.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24509
