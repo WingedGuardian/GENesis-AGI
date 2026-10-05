@@ -34,6 +34,17 @@ def _clear_all_browser_state():
     browser._remote_cdp_url = None
     browser._remote_last_url = None
     browser._remote_target_id = None
+    # TinyFish state
+    browser._tinyfish_pw = None
+    browser._tinyfish_browser = None
+    browser._tinyfish_page = None
+    browser._tinyfish_session_id = None
+    browser._opened_by.clear()
+    # Per-layer idle tracking, and the watcher task a test may have started
+    browser._layer_last_used = {}
+    if browser._idle_task is not None:
+        browser._idle_task.cancel()
+    browser._idle_task = None
     # VNC verification flag — FIX 3 tests toggle it; reset to avoid leak
     browser._vnc_verified = False
 
@@ -298,6 +309,7 @@ class TestEnsureChromiumRecovery:
         new_page = MagicMock()
         mock_context = AsyncMock()
         mock_context.pages = [new_page]
+        mock_context.on = MagicMock()  # Playwright's event registration is sync
 
         mock_pw = AsyncMock()
         mock_pw.chromium.launch_persistent_context = AsyncMock(return_value=mock_context)
@@ -2466,3 +2478,758 @@ class TestReviewNotes:
         from genesis.browser.profile import normalize_domain
 
         assert normalize_domain("localhost") == "localhost"
+
+
+# ---------------------------------------------------------------------------
+# Per-layer lifecycle (#2874) and new tabs opened by a click (#2875)
+# ---------------------------------------------------------------------------
+
+def _alive_page(url="https://example.com"):
+    page = MagicMock()
+    page.url = url
+    page.is_closed.return_value = False
+    page.close = AsyncMock()
+    return page
+
+
+def _open_camoufox():
+    """A running Camoufox: its context manager, persistent context and page."""
+    cm = MagicMock()
+    cm.__aexit__ = AsyncMock(return_value=None)
+    ctx = MagicMock()
+    page = _alive_page("https://camoufox.example")
+    ctx.pages = [page]
+    browser._stealth_cm = cm
+    browser._stealth_browser = ctx
+    browser._stealth_page = page
+    return cm, page
+
+
+def _open_chromium():
+    pw = MagicMock()
+    pw.stop = AsyncMock()
+    ctx = MagicMock()
+    ctx.close = AsyncMock()
+    page = _alive_page("https://chromium.example")
+    browser._playwright = pw
+    browser._context = ctx
+    browser._page = page
+    return pw, ctx, page
+
+
+def _open_remote():
+    br = _mock_remote_browser(connected=True)
+    pw = MagicMock()
+    pw.stop = AsyncMock()
+    page = _alive_page("https://remote.example")
+    browser._remote_pw = pw
+    browser._remote_browser = br
+    browser._remote_page = page
+    browser._remote_target_id = "GEN-1"
+    return br, pw, page
+
+
+def _open_tinyfish():
+    br = MagicMock()
+    br.is_connected.return_value = True
+    br.close = AsyncMock()
+    pw = MagicMock()
+    pw.stop = AsyncMock()
+    page = _alive_page("https://tinyfish.example")
+    browser._tinyfish_pw = pw
+    browser._tinyfish_browser = br
+    browser._tinyfish_page = page
+    browser._tinyfish_session_id = "tf-session-0123456789"
+    return br, pw, page
+
+
+def _tinyfish_delete():
+    return patch(
+        "genesis.providers.tinyfish_client.browser_session_delete", new_callable=AsyncMock
+    )
+
+
+def _ready_engine():
+    from genesis.browser import engine
+
+    ready = engine.EngineStatus(engine.READY, "test engine", Path("/engine"))
+    return patch.object(engine, "camoufox_engine_status", return_value=ready)
+
+
+def _lock_is_free(lock_path) -> bool:
+    import fcntl
+
+    with open(lock_path, "w") as other:
+        try:
+            fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+
+class TestStaleRecoveryCleansOnlyItsOwnLayer:
+    @pytest.mark.asyncio
+    async def test_camoufox_restart_keeps_remote_cdp_and_tinyfish(self):
+        pytest.importorskip("camoufox", reason="camoufox not installed")
+        remote_br, remote_pw, remote_page = _open_remote()
+        tf_br, _, _ = _open_tinyfish()
+        dead = MagicMock()
+        dead.is_closed.return_value = True
+        old_cm = MagicMock()
+        old_cm.__aexit__ = AsyncMock(return_value=None)
+        browser._stealth_cm = old_cm
+        browser._stealth_browser = MagicMock()
+        browser._stealth_page = dead
+
+        new_page = _alive_page()
+        new_ctx = MagicMock()
+        new_ctx.pages = [new_page]
+        new_cm = MagicMock()
+        new_cm.__aenter__ = AsyncMock(return_value=new_ctx)
+        with (
+            patch("camoufox.async_api.AsyncCamoufox", return_value=new_cm),
+            _ready_engine(),
+            _tinyfish_delete() as delete,
+        ):
+            result = await browser._ensure_browser()
+
+        assert result is new_page
+        old_cm.__aexit__.assert_awaited_once()  # its own layer was cleaned
+        remote_br.close.assert_not_awaited()
+        remote_pw.stop.assert_not_awaited()
+        assert browser._remote_browser is remote_br
+        assert browser._remote_page is remote_page
+        delete.assert_not_awaited()
+        tf_br.close.assert_not_awaited()
+        assert browser._tinyfish_session_id == "tf-session-0123456789"
+
+    @pytest.mark.asyncio
+    async def test_chromium_restart_keeps_camoufox_and_remote_cdp(self):
+        pytest.importorskip("playwright", reason="playwright not installed")
+        cm, cam_page = _open_camoufox()
+        remote_br, _, _ = _open_remote()
+        dead = MagicMock()
+        dead.is_closed.return_value = True
+        old_pw = MagicMock()
+        old_pw.stop = AsyncMock()
+        old_ctx = MagicMock()
+        old_ctx.close = AsyncMock()
+        browser._playwright = old_pw
+        browser._context = old_ctx
+        browser._page = dead
+
+        new_page = _alive_page()
+        new_ctx = MagicMock()
+        new_ctx.pages = [new_page]
+        new_pw = MagicMock()
+        new_pw.chromium.launch_persistent_context = AsyncMock(return_value=new_ctx)
+        starter = MagicMock()
+        starter.start = AsyncMock(return_value=new_pw)
+        fake = MagicMock(async_playwright=MagicMock(return_value=starter))
+        with patch.dict("sys.modules", {"patchright.async_api": fake, "playwright.async_api": fake}):
+            result = await browser._ensure_chromium_fallback()
+
+        assert result is new_page
+        old_ctx.close.assert_awaited_once()
+        old_pw.stop.assert_awaited_once()
+        cm.__aexit__.assert_not_awaited()
+        assert browser._stealth_page is cam_page
+        remote_br.close.assert_not_awaited()
+        assert browser._remote_browser is remote_br
+
+
+class TestPerLayerIdle:
+    @pytest.mark.asyncio
+    async def test_an_abandoned_camoufox_is_reclaimed_while_remote_stays(self):
+        cm, _ = _open_camoufox()
+        remote_br, _, remote_page = _open_remote()
+        browser._active_page = remote_page
+        now = 100_000.0
+        browser._layer_last_used = {
+            browser.BrowserLayer.CAMOUFOX: now - browser._IDLE_TIMEOUT_S - 1,
+            browser.BrowserLayer.REMOTE_CDP: now - 5,
+        }
+        await browser._reclaim_idle_layers(now)
+
+        cm.__aexit__.assert_awaited_once()
+        assert browser._stealth_cm is None and browser._stealth_page is None
+        remote_br.close.assert_not_awaited()
+        assert browser._remote_page is remote_page
+        assert browser._active_page is remote_page
+        assert browser.BrowserLayer.CAMOUFOX not in browser._layer_last_used
+
+    @pytest.mark.asyncio
+    async def test_an_idle_tinyfish_session_is_terminated_alone(self):
+        _open_tinyfish()
+        cm, cam_page = _open_camoufox()
+        now = 100_000.0
+        browser._layer_last_used = {
+            browser.BrowserLayer.TINYFISH: now - browser._IDLE_TIMEOUT_S,
+            browser.BrowserLayer.CAMOUFOX: now,
+        }
+        with _tinyfish_delete() as delete:
+            await browser._reclaim_idle_layers(now)
+        delete.assert_awaited_once_with("tf-session-0123456789")
+        assert browser._tinyfish_session_id is None
+        cm.__aexit__.assert_not_awaited()
+        assert browser._stealth_page is cam_page
+
+    @pytest.mark.asyncio
+    async def test_an_open_layer_with_no_timestamp_starts_its_clock(self):
+        cm, _ = _open_camoufox()  # launched outside _get_page (medium.py path)
+        await browser._reclaim_idle_layers(100_000.0)
+        cm.__aexit__.assert_not_awaited()
+        assert browser._layer_last_used[browser.BrowserLayer.CAMOUFOX] == 100_000.0
+
+    @pytest.mark.asyncio
+    async def test_a_tool_call_refreshes_only_the_layer_it_used(self):
+        _open_camoufox()
+        _, _, remote_page = _open_remote()
+        remote_page.title = AsyncMock(return_value="t")
+        browser._active_page = remote_page
+        browser._layer_last_used = {
+            browser.BrowserLayer.CAMOUFOX: 1.0,
+            browser.BrowserLayer.REMOTE_CDP: 1.0,
+        }
+        with patch.object(browser, "_snapshot_page", new=AsyncMock(return_value="snap")):
+            await browser._impl_browser_snapshot()
+        assert browser._layer_last_used[browser.BrowserLayer.REMOTE_CDP] > 1.0
+        assert browser._layer_last_used[browser.BrowserLayer.CAMOUFOX] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_navigating_remote_does_not_refresh_camoufox(self):
+        _open_camoufox()
+        browser._layer_last_used = {browser.BrowserLayer.CAMOUFOX: 1.0}
+        await _navigate_remote()
+        assert browser._layer_last_used[browser.BrowserLayer.CAMOUFOX] == 1.0
+        assert browser._layer_last_used[browser.BrowserLayer.REMOTE_CDP] > 1.0
+
+    @pytest.mark.asyncio
+    async def test_the_watcher_stops_once_no_layer_is_open(self):
+        ticks = 0
+
+        async def tick(_s):
+            nonlocal ticks
+            ticks += 1
+            if ticks > 5:
+                raise AssertionError("the watcher kept polling with nothing open")
+
+        with patch.object(browser.asyncio, "sleep", new=tick):
+            await browser._idle_watcher_loop()
+        assert ticks == 1
+
+    @pytest.mark.asyncio
+    async def test_the_watcher_keeps_running_while_a_layer_is_open(self):
+        _open_remote()
+        browser._layer_last_used = {browser.BrowserLayer.REMOTE_CDP: time_now()}
+        ticks = 0
+
+        async def tick(_s):
+            nonlocal ticks
+            ticks += 1
+            if ticks == 3:
+                await browser._cleanup_remote_cdp()
+            if ticks > 5:
+                raise AssertionError("the watcher did not stop after the last layer closed")
+
+        with patch.object(browser.asyncio, "sleep", new=tick):
+            await browser._idle_watcher_loop()
+        assert ticks == 3
+
+
+def time_now():
+    import time
+
+    return time.monotonic()
+
+
+class TestAsyncCleanupStillCleansEverything:
+    @pytest.mark.asyncio
+    async def test_every_layer_is_closed_and_the_lock_released(self, tmp_path):
+        from genesis.browser import engine
+
+        cm, _ = _open_camoufox()
+        pw, ctx, _ = _open_chromium()
+        remote_br, remote_pw, _ = _open_remote()
+        tf_br, tf_pw, _ = _open_tinyfish()
+        browser._hold_stack_lock()
+        with _tinyfish_delete() as delete:
+            await browser.async_cleanup()
+        cm.__aexit__.assert_awaited_once()
+        ctx.close.assert_awaited_once()
+        pw.stop.assert_awaited_once()
+        remote_br.close.assert_awaited_once()
+        tf_br.close.assert_awaited_once()
+        delete.assert_awaited_once()
+        assert browser._active_page is None
+        assert browser._stack_lock_fd is None
+        assert _lock_is_free(engine.BROWSER_LOCK_FILE)
+        assert browser._layer_last_used == {}
+
+
+class TestStackLockAcrossTwoLocalBrowsers:
+    @pytest.mark.asyncio
+    async def test_closing_one_of_two_local_browsers_keeps_the_lock(self):
+        from genesis.browser import engine
+
+        _open_camoufox()
+        _open_chromium()
+        browser._hold_stack_lock()
+        await browser._cleanup_camoufox()
+        assert browser._stack_lock_fd is not None
+        assert not _lock_is_free(engine.BROWSER_LOCK_FILE)
+        await browser._cleanup_chromium()
+        assert browser._stack_lock_fd is None
+        assert _lock_is_free(engine.BROWSER_LOCK_FILE)
+
+    @pytest.mark.asyncio
+    async def test_cleaning_remote_or_tinyfish_never_touches_the_lock(self):
+        _open_camoufox()
+        _open_remote()
+        _open_tinyfish()
+        browser._hold_stack_lock()
+        with _tinyfish_delete():
+            await browser._cleanup_remote_cdp()
+            await browser._cleanup_tinyfish()
+        assert browser._stack_lock_fd is not None
+
+    @pytest.mark.asyncio
+    async def test_a_failed_camoufox_launch_leaves_no_half_state(self):
+        pytest.importorskip("camoufox", reason="camoufox not installed")
+        from genesis.browser import engine
+
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(side_effect=RuntimeError("launch failed"))
+        cm.__aexit__ = AsyncMock(return_value=None)
+        with (
+            patch("camoufox.async_api.AsyncCamoufox", return_value=cm),
+            _ready_engine(),
+            pytest.raises(RuntimeError),
+        ):
+            await browser._ensure_browser()
+        assert browser._stealth_cm is None
+        assert browser._stack_lock_fd is None
+        assert _lock_is_free(engine.BROWSER_LOCK_FILE)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_chromium_launch_stops_its_driver(self):
+        pytest.importorskip("playwright", reason="playwright not installed")
+        pw = MagicMock()
+        pw.stop = AsyncMock()
+        pw.chromium.launch_persistent_context = AsyncMock(side_effect=RuntimeError("no chrome"))
+        starter = MagicMock()
+        starter.start = AsyncMock(return_value=pw)
+        fake = MagicMock(async_playwright=MagicMock(return_value=starter))
+        with (
+            patch.dict("sys.modules", {"patchright.async_api": fake, "playwright.async_api": fake}),
+            pytest.raises(RuntimeError),
+        ):
+            await browser._ensure_chromium_fallback()
+        pw.stop.assert_awaited_once()
+        assert browser._playwright is None
+        assert browser._stack_lock_fd is None
+
+    @pytest.mark.asyncio
+    async def test_a_direct_ensure_browser_call_holds_the_lock(self):
+        """medium.py calls _ensure_browser directly, not through _get_page."""
+        pytest.importorskip("camoufox", reason="camoufox not installed")
+        new_ctx = MagicMock()
+        new_ctx.pages = [_alive_page()]
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=new_ctx)
+        with patch("camoufox.async_api.AsyncCamoufox", return_value=cm), _ready_engine():
+            await browser._ensure_browser()
+        assert browser._stack_lock_fd is not None
+
+
+class TestClosedWindowStopsTheDriver:
+    @pytest.mark.asyncio
+    async def test_camoufox_context_close_runs_its_cleanup(self):
+        pytest.importorskip("camoufox", reason="camoufox not installed")
+        handlers = {}
+        ctx = MagicMock()
+        ctx.pages = [_alive_page()]
+        ctx.on = MagicMock(side_effect=lambda ev, fn: handlers.__setitem__(ev, fn))
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=ctx)
+        cm.__aexit__ = AsyncMock(return_value=None)
+        with patch("camoufox.async_api.AsyncCamoufox", return_value=cm), _ready_engine():
+            await browser._ensure_browser()
+        assert "close" in handlers
+        handlers["close"](ctx)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        cm.__aexit__.assert_awaited_once()
+        assert browser._stealth_cm is None
+        assert browser._stack_lock_fd is None
+
+    @pytest.mark.asyncio
+    async def test_a_close_event_from_an_old_context_is_ignored(self):
+        cm, page = _open_camoufox()
+        browser._on_local_context_closed(browser.BrowserLayer.CAMOUFOX, MagicMock())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        cm.__aexit__.assert_not_awaited()
+        assert browser._stealth_page is page
+
+
+class TestReconnectAfterADropCleansTheOldLayer:
+    """A dropped connection clears the page/browser globals but leaves the
+    Playwright driver (and for TinyFish, the billed session id). The next
+    ensure must clean those up instead of starting a second driver over them."""
+
+    @pytest.mark.asyncio
+    async def test_remote_reconnect_after_a_disconnect_stops_the_old_driver(self):
+        _, old_pw, _ = _open_remote()
+        browser._on_remote_disconnected()
+        assert browser._remote_pw is old_pw  # precondition: the driver survived the drop
+        page = _cdp_page("about:blank", "GEN-1")
+        await _connect(_mock_remote_browser(pages=[page]))
+        old_pw.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_tinyfish_reconnect_after_a_disconnect_deletes_the_old_session(self):
+        _, old_pw, _ = _open_tinyfish()
+        browser._on_tinyfish_disconnected()
+        assert browser._tinyfish_session_id == "tf-session-0123456789"  # precondition
+
+        new_page = _alive_page()
+        ctx = MagicMock()
+        ctx.pages = [new_page]
+        new_br = MagicMock()
+        new_br.contexts = [ctx]
+        new_br.on = MagicMock()
+        new_pw = MagicMock()
+        new_pw.chromium.connect_over_cdp = AsyncMock(return_value=new_br)
+        starter = MagicMock()
+        starter.start = AsyncMock(return_value=new_pw)
+        create = AsyncMock(return_value={"session_id": "tf-new-session-99", "cdp_url": "ws://x"})
+        with (
+            _tinyfish_delete() as delete,
+            patch("genesis.providers.tinyfish_client.browser_session_create", new=create),
+            patch("playwright.async_api.async_playwright", return_value=starter),
+            patch.object(browser.asyncio, "sleep", new=AsyncMock()),
+        ):
+            page, is_new = await browser._ensure_tinyfish_browser()
+        delete.assert_awaited_once_with("tf-session-0123456789")
+        old_pw.stop.assert_awaited_once()
+        assert browser._tinyfish_session_id == "tf-new-session-99"
+        assert page is new_page and is_new
+
+
+class TestLayerSwitchLeavesTinyfish:
+    """Ending a paid session on a layer switch would be automatic cost control,
+    which the design principles rule out; its own idle clock bounds it."""
+
+    @pytest.mark.asyncio
+    async def test_switching_to_camoufox_leaves_the_tinyfish_session(self):
+        tf_br, _, tf_page = _open_tinyfish()
+        browser._active_page = tf_page
+        with _tinyfish_delete() as delete:
+            result = await _navigate_camoufox()
+        assert result["layer"] == "camoufox"
+        delete.assert_not_awaited()
+        tf_br.close.assert_not_awaited()
+        assert browser._tinyfish_session_id == "tf-session-0123456789"
+
+    @pytest.mark.asyncio
+    async def test_switching_to_remote_leaves_it_too(self):
+        _, _, tf_page = _open_tinyfish()
+        browser._active_page = tf_page
+        with _tinyfish_delete() as delete:
+            await _navigate_remote()
+        delete.assert_not_awaited()
+
+    def test_a_tinyfish_disconnect_clears_the_active_page(self):
+        """Review NOTE: the tools must say "No page open", not fail on a dead page."""
+        _, _, tf_page = _open_tinyfish()
+        browser._active_page = tf_page
+        browser._on_tinyfish_disconnected()
+        assert browser._active_page is None
+        assert browser._tinyfish_session_id == "tf-session-0123456789"  # still deleted later
+
+    @pytest.mark.asyncio
+    async def test_navigating_within_tinyfish_keeps_the_session(self):
+        _, _, tf_page = _open_tinyfish()
+        tf_page.title = AsyncMock(return_value="t")
+        tf_page.goto = AsyncMock()
+        tf_page.locator.return_value.aria_snapshot = AsyncMock(return_value="- x")
+        browser._active_page = tf_page
+        with _tinyfish_delete() as delete:
+            result = await browser._impl_browser_navigate("https://example.org", tinyfish=True)
+        assert "error" not in result, result
+        delete.assert_not_awaited()
+        assert browser._tinyfish_session_id == "tf-session-0123456789"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_switch_keeps_the_session(self):
+        _, _, tf_page = _open_tinyfish()
+        browser._active_page = tf_page
+        with (
+            _tinyfish_delete() as delete,
+            patch.object(
+                browser, "_ensure_remote_cdp", new_callable=AsyncMock,
+                side_effect=ConnectionError("unreachable"),
+            ),
+        ):
+            result = await browser._impl_browser_navigate("https://x.org", remote=True)
+        assert "error" in result
+        delete.assert_not_awaited()
+
+
+class _EventPage:
+    """A page double with real event semantics (on / once / remove_listener)."""
+
+    def __init__(self, url, title="Title", target_id=None):
+        self.url = url
+        self._title = title
+        self._closed = False
+        self._handlers: dict[str, list] = {}
+        self.close = AsyncMock()
+        self.wait_for_load_state = AsyncMock()
+        self.target_id = target_id
+        loc = MagicMock()
+        loc.aria_snapshot = AsyncMock(side_effect=lambda: f"- snapshot of {self.url}")
+        self.locator = MagicMock(return_value=loc)
+        self.context = MagicMock()
+        session = MagicMock()
+        session.send = AsyncMock(
+            side_effect=lambda *_a: {"targetInfo": {"targetId": self.target_id}}
+        )
+        session.detach = AsyncMock()
+        self.context.new_cdp_session = AsyncMock(return_value=session)
+
+    async def title(self):
+        return self._title
+
+    def is_closed(self):
+        return self._closed
+
+    def on(self, event, fn):
+        self._handlers.setdefault(event, []).append(fn)
+
+    def once(self, event, fn):
+        def wrapper(*a):
+            self.remove_listener(event, wrapper)
+            fn(*a)
+
+        self.on(event, wrapper)
+
+    def remove_listener(self, event, fn):
+        if fn in self._handlers.get(event, []):
+            self._handlers[event].remove(fn)
+
+    def emit(self, event, *args):
+        for fn in list(self._handlers.get(event, [])):
+            fn(*args)
+
+    def listeners(self, event):
+        return list(self._handlers.get(event, []))
+
+    def close_now(self):
+        self._closed = True
+        self.emit("close", self)
+
+
+def _popup_click(original, popup):
+    """A _stealth_click double: the click makes ``original`` open ``popup``."""
+
+    async def click(page, selector, timeout=10000):
+        assert page is original
+        if popup is not None:
+            page.emit("popup", popup)
+
+    return click
+
+
+async def _click(selector="#open"):
+    with (
+        patch.object(browser, "_human_delay", new=AsyncMock()),
+        patch("genesis.mcp.health.browser.asyncio.sleep", new=AsyncMock()),
+        patch.object(browser, "_NEW_TAB_WAIT_S", 0.05),
+    ):
+        return await browser._impl_browser_click(selector)
+
+
+class TestClickFollowsANewTab:
+    @pytest.mark.asyncio
+    async def test_camoufox_click_switches_to_the_new_tab_and_reports_it(self):
+        original = _EventPage("https://site.example/list")
+        popup = _EventPage("https://site.example/detail", title="Detail")
+        browser._stealth_cm = MagicMock()
+        browser._stealth_page = original
+        browser._active_page = original
+        with patch.object(browser, "_stealth_click", new=_popup_click(original, popup)):
+            result = await _click()
+
+        assert result["new_page"] == {"url": "https://site.example/detail", "title": "Detail"}
+        assert result["url"] == "https://site.example/detail"
+        assert "detail" in result["snapshot"]
+        assert browser._active_page is popup
+        assert browser._stealth_page is popup
+        assert browser._is_camoufox_active()
+        original.close.assert_not_awaited()
+        assert original.listeners("popup") == []  # the watch ends with the click
+
+        snap = await browser._impl_browser_snapshot()
+        assert snap["url"] == "https://site.example/detail"
+        assert "detail" in snap["snapshot"]
+
+    @pytest.mark.asyncio
+    async def test_no_new_tab_means_no_new_page_key(self):
+        original = _EventPage("https://site.example/list")
+        browser._page = original
+        browser._active_page = original
+        with patch.object(browser, "_stealth_click", new=_popup_click(original, None)):
+            result = await _click()
+        assert "new_page" not in result
+        assert browser._active_page is original
+        assert original.listeners("popup") == []
+
+    @pytest.mark.asyncio
+    async def test_chromium_click_switches_its_layer_page(self):
+        original = _EventPage("https://a.example")
+        popup = _EventPage("https://b.example")
+        browser._page = original
+        browser._active_page = original
+        with patch.object(browser, "_stealth_click", new=_popup_click(original, popup)):
+            await _click()
+        assert browser._page is popup and browser._active_page is popup
+
+    @pytest.mark.asyncio
+    async def test_remote_new_tab_becomes_the_tracked_genesis_tab(self):
+        original = _EventPage("https://a.example", target_id="GEN-1")
+        popup = _EventPage("https://b.example", title="B", target_id="GEN-2")
+        browser._remote_browser = _mock_remote_browser(connected=True)
+        browser._remote_page = original
+        browser._remote_target_id = "GEN-1"
+        browser._remote_last_url = "https://a.example"
+        browser._active_page = original
+        with patch.object(browser, "_stealth_click", new=_popup_click(original, popup)):
+            result = await _click()
+
+        assert result["new_page"]["url"] == "https://b.example"
+        assert browser._remote_page is popup
+        assert browser._remote_target_id == "GEN-2"
+        assert browser._is_remote_active()
+        assert browser._remote_last_url == "https://b.example"  # drift baseline moves
+        original.close.assert_not_awaited()  # the original tab is never closed
+
+    @pytest.mark.asyncio
+    async def test_when_the_new_tab_closes_itself_the_tools_return_to_the_original(self):
+        original = _EventPage("https://a.example", target_id="GEN-1")
+        popup = _EventPage("https://accounts.example/signin", target_id="GEN-2")
+        browser._remote_browser = _mock_remote_browser(connected=True)
+        browser._remote_page = original
+        browser._remote_target_id = "GEN-1"
+        browser._active_page = original
+        with patch.object(browser, "_stealth_click", new=_popup_click(original, popup)):
+            await _click()
+        assert browser._remote_page is popup  # precondition: the switch happened
+        popup.close_now()
+        assert browser._active_page is original
+        assert browser._remote_page is original
+        assert browser._remote_target_id == "GEN-1"
+
+    @pytest.mark.asyncio
+    async def test_a_new_tab_that_closes_after_a_layer_switch_changes_nothing(self):
+        original = _EventPage("https://a.example")
+        popup = _EventPage("https://b.example")
+        browser._page = original
+        browser._active_page = original
+        with patch.object(browser, "_stealth_click", new=_popup_click(original, popup)):
+            await _click()
+        assert browser._page is popup  # precondition: the switch happened
+        elsewhere = _alive_page()
+        browser._remote_page = elsewhere
+        browser._active_page = elsewhere
+        popup.close_now()
+        assert browser._active_page is elsewhere
+        assert browser._page is original  # the layer itself still goes back
+
+    @pytest.mark.asyncio
+    async def test_a_new_tab_already_closed_is_reported_not_followed(self):
+        original = _EventPage("https://a.example")
+        popup = _EventPage("https://b.example")
+        popup._closed = True  # it opened and closed itself within the wait
+        browser._stealth_cm = MagicMock()
+        browser._stealth_page = original
+        browser._active_page = original
+        with patch.object(browser, "_stealth_click", new=_popup_click(original, popup)):
+            result = await _click()
+        assert result["new_page"]["url"] == "https://b.example"
+        assert "closed" in result["new_page"]["note"]
+        assert browser._stealth_page is original and browser._active_page is original
+        assert result["url"] == "https://a.example"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_click_removes_the_watch(self):
+        original = _EventPage("https://a.example")
+        browser._page = original
+        browser._active_page = original
+
+        async def boom(page, selector, timeout=10000):
+            raise RuntimeError("element not found")
+
+        with patch.object(browser, "_stealth_click", new=boom):
+            result = await _click()
+        assert "error" in result
+        assert original.listeners("popup") == []
+
+
+class TestFollowNewTabReviewFixes:
+    """Architect review of the new-tab follow (PR-D)."""
+
+    def _remote(self, original):
+        browser._remote_browser = _mock_remote_browser(connected=True)
+        browser._remote_page = original
+        browser._remote_target_id = "GEN-1"
+        browser._active_page = original
+
+    @pytest.mark.asyncio
+    async def test_a_popup_closing_during_the_target_lookup_is_not_followed(self):
+        """MEASURED by the review: a close 240-360 ms in fired before the close
+        listener existed, leaving the tools on a dead tab with a None target id,
+        so the next reconnect opened a second Genesis tab."""
+        original = _EventPage("https://a.example", target_id="GEN-1")
+        popup = _EventPage("https://accounts.example/signin", target_id="GEN-2")
+        session = popup.context.new_cdp_session.return_value
+
+        async def close_while_asked(*_a):
+            popup.close_now()
+            return {"targetInfo": {"targetId": "GEN-2"}}
+
+        session.send = AsyncMock(side_effect=close_while_asked)
+        self._remote(original)
+        followed = await browser._follow_new_page(original, popup)
+        assert followed is False
+        assert browser._remote_page is original
+        assert browser._active_page is original
+        assert browser._remote_target_id == "GEN-1"
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_target_id_never_replaces_the_old_one_with_none(self):
+        original = _EventPage("https://a.example", target_id="GEN-1")
+        popup = _EventPage("https://b.example", target_id=None)
+        self._remote(original)
+        assert await browser._follow_new_page(original, popup) is True
+        assert browser._remote_page is popup
+        assert browser._remote_target_id == "GEN-1"
+
+    @pytest.mark.asyncio
+    async def test_a_popup_chain_returns_to_the_nearest_live_tab(self):
+        """original -> A -> B; A closes, then B: the tools go back to original
+        instead of restarting the browser."""
+        original = _EventPage("https://a.example")
+        a = _EventPage("https://b.example")
+        b = _EventPage("https://c.example")
+        browser._stealth_cm = MagicMock()
+        browser._stealth_page = original
+        browser._active_page = original
+        assert await browser._follow_new_page(original, a) is True
+        assert await browser._follow_new_page(a, b) is True
+        a.close_now()
+        assert browser._stealth_page is b  # still on the live popup
+        b.close_now()
+        assert browser._stealth_page is original
+        assert browser._active_page is original

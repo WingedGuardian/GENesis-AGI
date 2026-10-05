@@ -1,8 +1,11 @@
 """Browser automation tools for genesis-health MCP.
 
 Provides lightweight, on-demand browser tools with lazy initialization.
-The browser launches only when the first navigation/interaction tool is called,
-stays warm for the session, and shuts down when the MCP server exits.
+A browser launches only when the first navigation/interaction tool needs it and
+stays warm while used. Each layer (Camoufox, Chromium, remote CDP, TinyFish) has
+its own lifecycle: it is reclaimed after an hour without a tool call on it,
+a stale page restarts only its own layer, and everything shuts down when the
+MCP server exits.
 
 Primary browser: Camoufox (anti-detection Firefox). Persistent profile at
 ~/.genesis/camoufox-profile/ so cookies, localStorage, and login sessions
@@ -29,6 +32,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from genesis.browser.types import BrowserLayer
 from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
@@ -163,14 +167,36 @@ def _release_stack_lock() -> None:
         _stack_lock_fd = None
 
 
+def _local_browser_open() -> bool:
+    """True while this process has a local browser (Camoufox or Chromium) up.
+
+    A layer's globals are assigned only once its launch succeeded, so a set
+    global means a running browser (or its driver), never a half launch.
+    """
+    return _stealth_cm is not None or _context is not None or _playwright is not None
+
+
+def _release_stack_lock_if_no_local() -> None:
+    """Release the shared browser-stack lock once NO local browser is open.
+
+    Closing one of two local browsers keeps it: the other still runs on the
+    installed packages and engine, which provisioning must not replace.
+    """
+    if not _local_browser_open():
+        _release_stack_lock()
+
+
 async def _launch_local(launch):
-    """Run a local browser launch under the shared browser-stack lock."""
+    """Run a local browser launch under the shared browser-stack lock.
+
+    Called by _ensure_browser and _ensure_chromium_fallback around their launch,
+    so every caller (the tools and medium.py's direct _ensure_browser) holds it.
+    """
     _hold_stack_lock()
     try:
         return await launch()
     except BaseException:
-        if _stealth_cm is None and _context is None:
-            _release_stack_lock()  # nothing came up, so nothing holds the stack
+        _release_stack_lock_if_no_local()  # nothing came up, so nothing holds the stack
         raise
 
 
@@ -249,9 +275,13 @@ _tinyfish_session_id: str | None = None  # For cleanup via DELETE
 # User watches/interacts via noVNC at http://<tailscale-ip>:6080/vnc.html
 _collaborate_mode = False
 
-# Idle timeout — auto-cleanup browser after 1 hour of no tool calls.
-# User-approved value (2026-04-21). Background asyncio task polls every 60s.
-_last_used: float = 0.0
+# Idle timeout — each layer is reclaimed after 1 hour with no tool call ON THAT
+# LAYER. User-approved value (2026-04-21). Background asyncio task polls every
+# 60s. One timestamp per layer: with a single shared one, any call on any layer
+# kept every other layer alive, so a browser left behind on a layer switch
+# (Camoufox → remote CDP) never idled out, and a paid TinyFish session billed on
+# (#2874). Keyed by BrowserLayer; a layer is absent until first used.
+_layer_last_used: dict[BrowserLayer, float] = {}
 _idle_task: asyncio.Task | None = None
 _IDLE_TIMEOUT_S = 3600  # 1 hour
 
@@ -313,8 +343,145 @@ def _is_page_alive(page) -> bool:
         return False
 
 
+def _layer_page(layer: BrowserLayer):
+    """The page a layer currently drives (None when the layer is closed)."""
+    return {
+        BrowserLayer.CAMOUFOX: _stealth_page,
+        BrowserLayer.CHROMIUM: _page,
+        BrowserLayer.REMOTE_CDP: _remote_page,
+        BrowserLayer.TINYFISH: _tinyfish_page,
+    }[layer]
+
+
+def _layer_of(page) -> BrowserLayer | None:
+    """Which layer drives ``page`` (by identity), or None."""
+    if page is None:
+        return None
+    for layer in BrowserLayer:
+        if _layer_page(layer) is page:
+            return layer
+    return None
+
+
+def _layer_open(layer: BrowserLayer) -> bool:
+    """True while a layer holds anything its cleanup must release.
+
+    Wider than "has a live page" on purpose: a dropped CDP connection leaves its
+    Playwright driver, and a dropped TinyFish connection leaves a session that
+    still bills until it is DELETEd.
+    """
+    if layer is BrowserLayer.CAMOUFOX:
+        return _stealth_cm is not None
+    if layer is BrowserLayer.CHROMIUM:
+        return _context is not None or _playwright is not None
+    if layer is BrowserLayer.REMOTE_CDP:
+        return _remote_browser is not None or _remote_pw is not None
+    return (
+        _tinyfish_browser is not None
+        or _tinyfish_pw is not None
+        or _tinyfish_session_id is not None
+    )
+
+
+def _forget_layer(layer: BrowserLayer, page) -> None:
+    """Bookkeeping shared by every layer's cleanup: drop its idle clock, and
+    stop the tools pointing at its page."""
+    global _active_page
+    _layer_last_used.pop(layer, None)
+    if page is not None and _active_page is page:
+        _active_page = None
+
+
+async def _cleanup_camoufox() -> None:
+    """Close Camoufox (layer 1) and its Playwright driver. Touches no other layer.
+
+    The globals are detached BEFORE the close, so the context's own "close"
+    event (see _on_local_context_closed) finds nothing to do. Releases the
+    browser-stack lock only if Chromium is not open either.
+    """
+    global _stealth_cm, _stealth_browser, _stealth_page
+
+    cm, page = _stealth_cm, _stealth_page
+    _stealth_cm = None
+    _stealth_browser = None
+    _stealth_page = None
+    _forget_layer(BrowserLayer.CAMOUFOX, page)
+    if cm is not None:
+        try:
+            await asyncio.wait_for(cm.__aexit__(None, None, None), timeout=10.0)
+        except TimeoutError:
+            logger.warning("Camoufox cleanup timed out (10s)")
+        except Exception:
+            logger.debug("Camoufox cleanup failed", exc_info=True)
+    _release_stack_lock_if_no_local()
+
+
+async def _cleanup_chromium() -> None:
+    """Close the Chromium fallback (layer 2) and stop its driver. Touches no
+    other layer; releases the browser-stack lock only if Camoufox is closed too."""
+    global _playwright, _context, _page
+
+    pw, ctx, page = _playwright, _context, _page
+    _playwright = None
+    _context = None
+    _page = None
+    _forget_layer(BrowserLayer.CHROMIUM, page)
+    if ctx is not None:
+        try:
+            await asyncio.wait_for(ctx.close(), timeout=10.0)
+        except TimeoutError:
+            logger.warning("Browser context close timed out (10s)")
+        except Exception:
+            logger.debug("Browser context cleanup failed", exc_info=True)
+    if pw is not None:
+        try:
+            await asyncio.wait_for(pw.stop(), timeout=10.0)
+        except TimeoutError:
+            logger.warning("Playwright stop timed out (10s) — driver may be orphaned")
+        except Exception:
+            logger.debug("Playwright cleanup failed", exc_info=True)
+    _release_stack_lock_if_no_local()
+
+
+_LAYER_CLEANUP = {
+    BrowserLayer.CAMOUFOX: lambda: _cleanup_camoufox(),
+    BrowserLayer.CHROMIUM: lambda: _cleanup_chromium(),
+    BrowserLayer.REMOTE_CDP: lambda: _cleanup_remote_cdp(),
+    BrowserLayer.TINYFISH: lambda: _cleanup_tinyfish(),
+}
+
+
+def _on_local_context_closed(layer: BrowserLayer, ctx) -> None:
+    """A local browser's context closed on its own (its window was closed, or
+    the browser exited). Run that layer's cleanup, which stops the Playwright
+    driver: without this the driver stayed alive until the next cleanup.
+
+    A close event from a context this module no longer holds (an old launch,
+    or our own cleanup, which detaches first) is ignored.
+    """
+    current = _stealth_browser if layer is BrowserLayer.CAMOUFOX else _context
+    if current is None or current is not ctx:
+        return
+    logger.warning("%s window closed — stopping its driver", layer.value)
+
+    async def _reap():
+        async with _browser_lock:
+            now = _stealth_browser if layer is BrowserLayer.CAMOUFOX else _context
+            if now is ctx:
+                await _LAYER_CLEANUP[layer]()
+
+    from genesis.util.tasks import tracked_task
+
+    tracked_task(_reap(), name=f"browser-{layer.value}-closed")
+
+
 async def async_cleanup():
-    """Shut down browser. Called from MCP lifespan, idle timeout, or manually.
+    """Shut down EVERY browser layer. Called from the MCP lifespan end.
+
+    Idle reclaim and stale-page recovery use the per-layer cleanups instead
+    (_cleanup_camoufox, _cleanup_chromium, _cleanup_remote_cdp,
+    _cleanup_tinyfish), so they never disconnect remote CDP or end a paid
+    TinyFish session that is still in use.
 
     Safe to call when the browser is already dead — all steps are
     individually guarded so a crashed Camoufox won't hang cleanup.
@@ -322,54 +489,25 @@ async def async_cleanup():
     if the Playwright Node.js driver or browser process is stuck. Orphaned
     processes that survive timeout are caught by the process reaper (hourly at :15).
     """
-    global _playwright, _context, _page, _stealth_cm, _stealth_browser, _stealth_page, _active_page
-    global _idle_task, _last_used
+    global _active_page, _idle_task
 
     _active_page = None
 
-    # Cancel idle watcher first — prevent re-entrant cleanup
+    # Cancel the idle watcher first, so it cannot reclaim a layer concurrently.
     if _idle_task is not None:
         _idle_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await _idle_task
         _idle_task = None
-    _last_used = 0.0
 
     # Remote CDP: disconnect (does NOT close user's Chrome)
     await _cleanup_remote_cdp()
-
     # TinyFish: terminate cloud session (stops credit burn)
     await _cleanup_tinyfish()
-
-    if _context is not None:
-        try:
-            await asyncio.wait_for(_context.close(), timeout=10.0)
-        except TimeoutError:
-            logger.warning("Browser context close timed out (10s)")
-        except Exception:
-            logger.debug("Browser context cleanup failed", exc_info=True)
-        _context = None
-        _page = None
-    if _playwright is not None:
-        try:
-            await asyncio.wait_for(_playwright.stop(), timeout=10.0)
-        except TimeoutError:
-            logger.warning("Playwright stop timed out (10s) — driver may be orphaned")
-        except Exception:
-            logger.debug("Playwright cleanup failed", exc_info=True)
-        _playwright = None
-    if _stealth_cm is not None:
-        try:
-            await asyncio.wait_for(
-                _stealth_cm.__aexit__(None, None, None), timeout=10.0,
-            )
-        except TimeoutError:
-            logger.warning("Camoufox cleanup timed out (10s)")
-        except Exception:
-            logger.debug("Camoufox cleanup failed", exc_info=True)
-        _stealth_cm = None
-        _stealth_browser = None
-        _stealth_page = None
+    await _cleanup_chromium()
+    await _cleanup_camoufox()
+    _layer_last_used.clear()
+    _opened_by.clear()
     _release_stack_lock()  # no local browser is open any more
 
 
@@ -382,54 +520,69 @@ async def _ensure_browser():
     for all browsing.
 
     Detects stale pages (e.g. browser killed by a concurrent session) and
-    automatically cleans up + re-initializes.
+    restarts Camoufox alone: remote CDP and TinyFish are left as they are.
+    The launch holds the shared browser-stack lock (_launch_local).
     """
     global _stealth_cm, _stealth_browser, _stealth_page
 
     async with _browser_lock:
-        if _stealth_page is not None:
-            if _is_page_alive(_stealth_page):
-                return _stealth_page
-            logger.warning("Camoufox page is stale — restarting browser")
-            await async_cleanup()
+        if _stealth_page is not None and _is_page_alive(_stealth_page):
+            return _stealth_page
+        if _layer_open(BrowserLayer.CAMOUFOX):
+            logger.warning("Camoufox page is stale — restarting Camoufox")
+            await _cleanup_camoufox()
 
-        # Refuse BEFORE camoufox runs: its launch path deletes a pre-0.5 engine
-        # directory and downloads the pinned build from inside this call, raced
-        # by every session's MCP process. Provisioning is bootstrap's job.
-        from genesis.browser.engine import camoufox_engine_status
+        async def _launch():
+            global _stealth_cm, _stealth_browser, _stealth_page
 
-        engine = camoufox_engine_status()
-        if not engine.ready:
-            raise CamoufoxEngineNotReady(engine.detail)
-        _check_loaded_browser_modules()
+            # Refuse BEFORE camoufox runs: its launch path deletes a pre-0.5
+            # engine directory and downloads the pinned build from inside this
+            # call, raced by every session's MCP process. Provisioning is
+            # bootstrap's job.
+            from genesis.browser.engine import camoufox_engine_status
 
-        from camoufox.async_api import AsyncCamoufox
+            engine = camoufox_engine_status()
+            if not engine.ready:
+                raise CamoufoxEngineNotReady(engine.detail)
+            _check_loaded_browser_modules()
 
-        _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+            from camoufox.async_api import AsyncCamoufox
 
-        # Always headed — Xvfb :99 is always running.
-        os.environ["DISPLAY"] = _VNC_DISPLAY
+            _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
-        _stealth_cm = AsyncCamoufox(
-            headless=False,
-            persistent_context=True,
-            user_data_dir=str(_PROFILE_DIR),
-            humanize=2.5,  # Native Camoufox cursor humanization (Bézier curves, max 2.5s)
-            window=(1920, 1080),  # Fill VNC display (Xvfb :99 is 1920x1080x24)
-            firefox_user_prefs={
-                # Camoufox disables session history (max_entries=0) for
-                # anti-detection.  Re-enable it so back/forward navigation
-                # works in collaborate mode.
-                "browser.sessionhistory.max_entries": 10,
-                "browser.sessionhistory.max_total_viewers": -1,
-            },
-        )
-        _stealth_browser = await _stealth_cm.__aenter__()
-        # With persistent_context, browser IS the context
-        _stealth_page = _stealth_browser.pages[0] if _stealth_browser.pages else await _stealth_browser.new_page()
+            # Always headed — Xvfb :99 is always running.
+            os.environ["DISPLAY"] = _VNC_DISPLAY
+
+            cm = AsyncCamoufox(
+                headless=False,
+                persistent_context=True,
+                user_data_dir=str(_PROFILE_DIR),
+                humanize=2.5,  # Native Camoufox cursor humanization (Bézier curves, max 2.5s)
+                window=(1920, 1080),  # Fill VNC display (Xvfb :99 is 1920x1080x24)
+                firefox_user_prefs={
+                    # Camoufox disables session history (max_entries=0) for
+                    # anti-detection.  Re-enable it so back/forward navigation
+                    # works in collaborate mode.
+                    "browser.sessionhistory.max_entries": 10,
+                    "browser.sessionhistory.max_total_viewers": -1,
+                },
+            )
+            # A failed __aenter__ stops its own driver (camoufox 0.5.7,
+            # AsyncCamoufox.__aenter__), and nothing is assigned yet, so a
+            # failed launch leaves no half state behind to hold the lock.
+            ctx = await cm.__aenter__()
+            # With persistent_context, browser IS the context
+            _stealth_cm, _stealth_browser = cm, ctx
+            ctx.on("close", lambda c: _on_local_context_closed(BrowserLayer.CAMOUFOX, c))
+            _stealth_page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            return _stealth_page
+
+        page = await _launch_local(_launch)
         mode_str = "headed (collaborate)" if _collaborate_mode else "headed"
-        logger.info("Camoufox browser launched %s with persistent profile at %s", mode_str, _PROFILE_DIR)
-        return _stealth_page
+        logger.info(
+            "Camoufox browser launched %s with persistent profile at %s", mode_str, _PROFILE_DIR
+        )
+        return page
 
 
 async def _ensure_chromium_fallback():
@@ -443,52 +596,71 @@ async def _ensure_chromium_fallback():
     drop-in replacement; plain Playwright is used only when patchright is not
     installed, with a warning, because that Chromium is detectable.
 
-    Detects stale pages and automatically re-initializes.
+    Detects stale pages and restarts Chromium alone (other layers untouched).
+    The launch holds the shared browser-stack lock (_launch_local).
     """
-    global _playwright, _context, _page
-
     async with _browser_lock:
-        if _page is not None:
-            if _is_page_alive(_page):
-                return _page
-            logger.warning("Chromium page is stale — restarting browser")
-            await async_cleanup()
+        if _page is not None and _is_page_alive(_page):
+            return _page
+        if _layer_open(BrowserLayer.CHROMIUM):
+            logger.warning("Chromium page is stale — restarting Chromium")
+            await _cleanup_chromium()
 
-        _check_loaded_browser_modules()
-        try:
-            from patchright.async_api import async_playwright
-        except ImportError:
-            import importlib.util
+        async def _launch():
+            global _playwright, _context, _page
 
-            if importlib.util.find_spec("patchright") is not None:
-                raise  # installed but broken: report it, never switch silently
-            logger.warning(
-                "patchright is not installed; the Chromium fallback uses plain "
-                "Playwright, which sites can detect. Run scripts/install_browser_stack.sh."
-            )
-            from playwright.async_api import async_playwright
+            _check_loaded_browser_modules()
+            try:
+                from patchright.async_api import async_playwright
+            except ImportError:
+                import importlib.util
 
-        _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+                if importlib.util.find_spec("patchright") is not None:
+                    raise  # installed but broken: report it, never switch silently
+                logger.warning(
+                    "patchright is not installed; the Chromium fallback uses plain "
+                    "Playwright, which sites can detect. Run scripts/install_browser_stack.sh."
+                )
+                from playwright.async_api import async_playwright
 
-        # Always headed — Xvfb :99 is always running.
-        os.environ["DISPLAY"] = _VNC_DISPLAY
+            _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
-        _playwright = await async_playwright().start()
-        _context = await _playwright.chromium.launch_persistent_context(
-            user_data_dir=str(_CHROMIUM_PROFILE_DIR),
-            headless=False,
-            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
-                  "--start-maximized"],
-            # patchright's documented stealth setup: no emulated viewport (the
-            # real window size is used) and no custom headers or user agent.
-            no_viewport=True,
-        )
-        _page = _context.pages[0] if _context.pages else await _context.new_page()
+            # Always headed — Xvfb :99 is always running.
+            os.environ["DISPLAY"] = _VNC_DISPLAY
+
+            pw = await async_playwright().start()
+            try:
+                ctx = await pw.chromium.launch_persistent_context(
+                    user_data_dir=str(_CHROMIUM_PROFILE_DIR),
+                    headless=False,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-gpu",
+                        "--disable-dev-shm-usage",
+                        "--start-maximized",
+                    ],
+                    # patchright's documented stealth setup: no emulated viewport
+                    # (the real window size is used) and no custom headers or user
+                    # agent.
+                    no_viewport=True,
+                )
+            except BaseException:
+                # Stop the driver this launch started; left running, the next
+                # launch would start another and orphan this one.
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(pw.stop(), timeout=10.0)
+                raise
+            _playwright, _context = pw, ctx
+            ctx.on("close", lambda c: _on_local_context_closed(BrowserLayer.CHROMIUM, c))
+            _page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            return _page
+
+        page = await _launch_local(_launch)
         mode_str = "headed (collaborate)" if _collaborate_mode else "headed"
-        logger.info("Chromium fallback launched %s with profile at %s", mode_str, _CHROMIUM_PROFILE_DIR)
-        return _page
-
-
+        logger.info(
+            "Chromium fallback launched %s with profile at %s", mode_str, _CHROMIUM_PROFILE_DIR
+        )
+        return page
 def _on_remote_disconnected() -> None:
     """Callback when CDP connection drops (Chrome closed, machine asleep)."""
     global _remote_browser, _remote_page, _active_page
@@ -507,10 +679,11 @@ async def _cleanup_remote_cdp() -> None:
     it does NOT terminate the remote Chrome process, and it does not close the
     Genesis tab either (it lives in the user's own context). The tab is left
     open on purpose and ``_remote_target_id`` is kept, so the next connect
-    reuses it.
+    reuses it. Touches no other layer.
     """
     global _remote_pw, _remote_browser, _remote_page, _remote_last_url
 
+    _forget_layer(BrowserLayer.REMOTE_CDP, _remote_page)
     if _remote_browser is not None:
         try:
             await asyncio.wait_for(_remote_browser.close(), timeout=10.0)
@@ -547,9 +720,16 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
 
     async with _browser_lock:
         # Already connected and alive — reuse
-        if _remote_page is not None and _remote_browser is not None:
-            if _remote_browser.is_connected() and _is_page_alive(_remote_page):
-                return _remote_page
+        if (
+            _remote_page is not None
+            and _remote_browser is not None
+            and _remote_browser.is_connected()
+            and _is_page_alive(_remote_page)
+        ):
+            return _remote_page
+        # Anything left over (a dropped connection keeps its Playwright driver)
+        # is released before connecting again, or it would be orphaned.
+        if _layer_open(BrowserLayer.REMOTE_CDP):
             logger.warning("Remote CDP connection stale — cleaning up")
             await _cleanup_remote_cdp()
 
@@ -679,9 +859,11 @@ async def _cleanup_tinyfish():
     """Clean up TinyFish browser session (terminate to stop credit burn).
 
     Timeouts match the existing user-approved 10s pattern in async_cleanup().
+    Touches no other layer.
     """
     global _tinyfish_pw, _tinyfish_browser, _tinyfish_page, _tinyfish_session_id
 
+    _forget_layer(BrowserLayer.TINYFISH, _tinyfish_page)
     if _tinyfish_browser is not None:
         try:
             await asyncio.wait_for(_tinyfish_browser.close(), timeout=10.0)
@@ -731,16 +913,23 @@ async def _ensure_tinyfish_browser(url: str | None = None) -> tuple:
     Returns (page, is_new_session). When is_new_session is True and url was
     provided, the page has already navigated to the URL (skip goto).
 
-    Always call _cleanup_tinyfish() when done to terminate the session
-    and stop credit consumption.
+    _cleanup_tinyfish() terminates the session and stops credit consumption:
+    on a layer switch (_get_page), at idle reclaim, and at async_cleanup.
     """
     global _tinyfish_pw, _tinyfish_browser, _tinyfish_page, _tinyfish_session_id
 
     async with _browser_lock:
         # Already connected and alive — reuse
-        if _tinyfish_page is not None and _tinyfish_browser is not None:
-            if _tinyfish_browser.is_connected() and _is_page_alive(_tinyfish_page):
-                return _tinyfish_page, False
+        if (
+            _tinyfish_page is not None
+            and _tinyfish_browser is not None
+            and _tinyfish_browser.is_connected()
+            and _is_page_alive(_tinyfish_page)
+        ):
+            return _tinyfish_page, False
+        # A dropped connection keeps its driver AND its session id, which bills
+        # until DELETEd: end both before creating a new session over them.
+        if _layer_open(BrowserLayer.TINYFISH):
             logger.warning("TinyFish session stale — cleaning up")
             await _cleanup_tinyfish()
 
@@ -808,40 +997,70 @@ async def _ensure_tinyfish_browser(url: str | None = None) -> tuple:
 
 def _on_tinyfish_disconnected():
     """Handle TinyFish CDP disconnection — clear state, log warning."""
-    global _tinyfish_browser, _tinyfish_page, _tinyfish_session_id
+    global _tinyfish_browser, _tinyfish_page, _tinyfish_session_id, _active_page
     sid = _tinyfish_session_id[:12] if _tinyfish_session_id else "unknown"
     logger.warning("TinyFish CDP disconnected (session %s)", sid)
+    if _active_page is not None and _active_page is _tinyfish_page:
+        _active_page = None  # the tools report "No page open" instead of a dead page's errors
     _tinyfish_browser = None
     _tinyfish_page = None
-    # session_id is intentionally NOT cleared here — async_cleanup()
-    # or next _ensure_tinyfish_browser() will attempt DELETE
+    # session_id is intentionally NOT cleared here: _cleanup_tinyfish (the
+    # next _ensure_tinyfish_browser, a layer switch, idle reclaim or
+    # async_cleanup) still has to DELETE it to stop the billing.
 
 
-def _touch():
-    """Record browser activity timestamp for idle timeout tracking."""
-    global _last_used
-    _last_used = time.monotonic()
+def _touch(layer: BrowserLayer | None = None) -> None:
+    """Record activity on ONE layer for idle tracking: ``layer``, or the layer
+    of the active page when None. Other layers' clocks keep running."""
+    if layer is None:
+        layer = _layer_of(_active_page)
+    if layer is not None:
+        _layer_last_used[layer] = time.monotonic()
+
+
+async def _reclaim_idle_layers(now: float) -> None:
+    """One idle pass: clean up each open layer unused for _IDLE_TIMEOUT_S.
+
+    Each layer is judged on its own clock, so an abandoned Camoufox is reclaimed
+    while remote CDP stays in use. An open layer with no clock yet (launched
+    outside _get_page, e.g. medium.py's direct _ensure_browser) starts its clock
+    now rather than living forever. The cleanup runs under _browser_lock and
+    re-checks the clock there, so a tool call that touched the layer meanwhile
+    keeps it.
+    """
+    for layer in BrowserLayer:
+        if not _layer_open(layer):
+            _layer_last_used.pop(layer, None)
+            continue
+        last = _layer_last_used.setdefault(layer, now)
+        if now - last < _IDLE_TIMEOUT_S:
+            continue
+        async with _browser_lock:
+            last = _layer_last_used.get(layer, now)
+            if _layer_open(layer) and now - last >= _IDLE_TIMEOUT_S:
+                logger.info(
+                    "Browser layer %s idle for %ds — reclaiming it", layer.value, _IDLE_TIMEOUT_S,
+                )
+                await _LAYER_CLEANUP[layer]()
 
 
 async def _idle_watcher_loop():
-    """Background task: cleanup browser after idle timeout (1 hour).
+    """Background task: reclaim each browser layer after 1 hour idle on it.
 
-    Polls every 60s. When the browser has been idle for _IDLE_TIMEOUT_S,
-    calls async_cleanup() and exits. CancelledError is the normal shutdown
-    path (MCP lifespan exit or explicit cleanup).
-
-    Note: does NOT acquire _browser_lock before cleanup. async_cleanup()
-    cancels and awaits _idle_task (this very coroutine), so holding the
-    lock here would self-deadlock. Cleanup is safe without the lock because
-    it sets _active_page = None atomically at entry and is individually
-    guarded throughout.
+    Polls every 60s and exits once no layer is open (_get_page restarts it).
+    CancelledError is the normal shutdown path (async_cleanup at MCP lifespan
+    exit). Per-layer cleanups never cancel this task, so it may hold
+    _browser_lock while reclaiming without deadlocking itself.
     """
     try:
         while True:
             await asyncio.sleep(60)
-            if _last_used > 0 and (time.monotonic() - _last_used) >= _IDLE_TIMEOUT_S:
-                logger.info("Browser idle for %ds — auto-cleaning up", _IDLE_TIMEOUT_S)
-                await async_cleanup()
+            try:
+                await _reclaim_idle_layers(time.monotonic())
+            except Exception:
+                # One failed reclaim must not end idle tracking of the others.
+                logger.warning("Browser idle reclaim failed", exc_info=True)
+            if not any(_layer_open(layer) for layer in BrowserLayer):
                 return
     except asyncio.CancelledError:
         return
@@ -1105,22 +1324,42 @@ async def _get_page(
 
     Returns (page, is_new_tinyfish_session) — is_new_tinyfish_session is True
     only when a fresh TinyFish session was just created (URL already loaded).
+
+    Moving to another layer ENDS an open TinyFish session (paid per minute),
+    once the new layer is up: a failed switch keeps it. Abandoned local
+    browsers and remote CDP are left alone (owner ruling); each is reclaimed by
+    its own idle clock.
     """
     global _active_page
+    layer = _requested_layer(stealth, remote, tinyfish)
     is_new_tinyfish = False
-    if tinyfish:
-        _active_page, is_new_tinyfish = await _ensure_tinyfish_browser(url=tinyfish_url)
-    elif remote:
-        _active_page = await _ensure_remote_cdp(cdp_url)
-    elif stealth:
+    if layer is BrowserLayer.TINYFISH:
+        page, is_new_tinyfish = await _ensure_tinyfish_browser(url=tinyfish_url)
+    elif layer is BrowserLayer.REMOTE_CDP:
+        page = await _ensure_remote_cdp(cdp_url)
+    elif layer is BrowserLayer.CAMOUFOX:
         await _ensure_vnc()
-        _active_page = await _launch_local(_ensure_browser)
+        page = await _ensure_browser()
     else:
         await _ensure_vnc()
-        _active_page = await _launch_local(_ensure_chromium_fallback)
-    _touch()
+        page = await _ensure_chromium_fallback()
+    _active_page = page
+    # Leaving TinyFish does NOT end its session: ending a paid session because
+    # of what it costs is automatic cost control, which the design principles
+    # rule out (cost is observed, the user decides). Its own idle clock bounds
+    # an abandoned session to the idle window, like every other layer.
+    _touch(layer)
     _start_idle_watcher()
-    return _active_page, is_new_tinyfish
+    return page, is_new_tinyfish
+
+
+def _requested_layer(stealth: bool, remote: bool, tinyfish: bool) -> BrowserLayer:
+    """The layer a browser_navigate call asks for (same precedence as _get_page)."""
+    if tinyfish:
+        return BrowserLayer.TINYFISH
+    if remote:
+        return BrowserLayer.REMOTE_CDP
+    return BrowserLayer.CAMOUFOX if stealth else BrowserLayer.CHROMIUM
 
 
 # Prefixes of the text _snapshot_page returns when there is no snapshot. An
@@ -2557,7 +2796,9 @@ async def _impl_browser_navigate(
 ) -> dict:
     """Navigate to a URL and return the page snapshot."""
     global _remote_last_url
-    _touch()
+    # The layer this call uses, not the one it leaves: an abandoned layer's
+    # idle clock keeps running.
+    _touch(_requested_layer(stealth, remote, tinyfish))
     _ts_log.info("browser_navigate called: url=%s stealth=%s remote=%s tinyfish=%s", url, stealth, remote, tinyfish)
 
     if tinyfish and remote:
@@ -2647,8 +2888,158 @@ async def _impl_browser_navigate(
         return {"error": str(e), "url": url}
 
 
+# A click that opens a new tab or popup is followed: the tools switch to it.
+# Playwright emits the page's "popup" event only once the new tab's FIRST
+# RESPONSE has arrived, so the wait has to cover that. MEASURED 2026-10-05 on
+# the new stack (Camoufox 156 / Playwright 1.62 / patchright 1.62.3), served
+# over local HTTP, seconds from click to event:
+#   window.open (no noopener): Camoufox 0.06-0.11, patchright 0.016, CDP ~0
+#   target=_blank link:        Camoufox 3.1, 3.1, 7.8 (first window of a fresh
+#                              profile); patchright 0.03; CDP ~0
+#   _blank to a 2 s server:    Camoufox 2.4-3.1, patchright 1.97, CDP 2.01
+# A noopener tab in Firefox opens in a new content process, hence the seconds.
+# Waiting 10 s after EVERY click would be the price of catching those, so the
+# long wait applies only to a click whose target DECLARES a new tab (a link,
+# area or form with a non-self target; see _OPENS_NEW_TAB_JS). Every other
+# click waits up to 1 s (from the click's return; the 0.3 s navigation settle
+# runs inside it), which covers a script's window.open answering within about
+# a second. A tab whose first response comes later than its window is not
+# followed: the result has no new_page and the tools stay on the original.
+# Tab followed by a click -> (the page that opened it, its remote target id,
+# its URL at the time). Lets a close walk back to the nearest live ancestor.
+_opened_by: dict = {}
+
+_NEW_TAB_WAIT_S: float = 1.0
+_NEW_TAB_DECLARED_WAIT_S: float = 10.0
+
+# True when clicking ``e`` opens a new browsing context by declaration: a link
+# or area with a target other than the current one, or a submit control whose
+# form (or its own formtarget) names one. _parent/_top are the current tab on a
+# top-level page.
+_OPENS_NEW_TAB_JS = """
+(e) => {
+  const own = (v) => !!v && !['_self', '_parent', '_top'].includes(v.trim().toLowerCase());
+  const link = e.closest('a[href], area[href]');
+  if (link && own(link.getAttribute('target'))) return true;
+  // Only a SUBMIT control sends its form: a text field, checkbox or
+  // type=button inside a target=_blank form opens nothing.
+  const ctl = e.closest('button, input');
+  const submits = ctl && (ctl.tagName === 'BUTTON'
+    ? (ctl.getAttribute('type') || 'submit').toLowerCase() === 'submit'
+    : ['submit', 'image'].includes((ctl.type || '').toLowerCase()));
+  if (submits && ctl.form) {
+    if (own(ctl.getAttribute('formtarget'))) return true;
+    if (!ctl.hasAttribute('formtarget') && own(ctl.form.getAttribute('target'))) return true;
+  }
+  return false;
+}
+"""
+
+
+async def _declares_new_tab(page, selector: str) -> bool:
+    """Whether the click target declares a new tab (see _OPENS_NEW_TAB_JS).
+    Best effort: an unreadable target counts as not declaring one."""
+    try:
+        return bool(
+            await asyncio.wait_for(
+                page.locator(selector).first.evaluate(_OPENS_NEW_TAB_JS), timeout=2.0,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _set_layer_page(layer: BrowserLayer, page) -> None:
+    global _stealth_page, _page, _remote_page, _tinyfish_page
+    if layer is BrowserLayer.CAMOUFOX:
+        _stealth_page = page
+    elif layer is BrowserLayer.CHROMIUM:
+        _page = page
+    elif layer is BrowserLayer.REMOTE_CDP:
+        _remote_page = page
+    else:
+        _tinyfish_page = page
+
+
+async def _follow_new_page(old, new) -> bool:
+    """Make ``new`` (a tab or popup a click on ``old`` opened) the page its
+    layer drives, and the active page. ``old`` is never closed.
+
+    Remote CDP: the new tab becomes THE Genesis tab (its target id is the one
+    a reconnect looks for), because the tools drive one tab per session and
+    the drift guard, timing and health checks all key on _remote_page. The
+    original tab stays open in the user's Chrome and is no longer driven.
+
+    When ``new`` closes while its layer still drives it (a sign-in popup that
+    closes itself), the layer goes back to ``old``. Returns False, following
+    nothing, when ``old`` no longer drives any layer.
+    """
+    global _active_page, _remote_target_id
+
+    layer = _layer_of(old)
+    if layer is None:
+        return False
+    try:
+        old_url = old.url
+    except Exception:
+        old_url = None
+    # Who opened it, so a close can walk back to the nearest LIVE ancestor (a
+    # popup that opened a popup, then both closed, returns to the original).
+    _opened_by[new] = (old, _remote_target_id, old_url)
+
+    def _on_closed(_page) -> None:
+        global _active_page, _remote_target_id, _remote_last_url
+        if _layer_page(layer) is not new:
+            return  # not driven (never followed, or already moved on); keep the chain
+        cur, restore = new, None
+        while cur in _opened_by:
+            prev, prev_target_id, prev_url = _opened_by.pop(cur)
+            if _is_page_alive(prev):
+                restore = (prev, prev_target_id, prev_url)
+                break
+            cur = prev
+        if restore is None:
+            return
+        prev, prev_target_id, prev_url = restore
+        _set_layer_page(layer, prev)
+        if layer is BrowserLayer.REMOTE_CDP:
+            _remote_target_id = prev_target_id
+            # The restored tab's drift baseline: if it changed while the popup
+            # was open, the next action gets the drift advisory.
+            _remote_last_url = prev_url
+        if _active_page is new:
+            _active_page = prev
+        logger.info("New tab closed — %s is back on the tab that opened it", layer.value)
+
+    # BEFORE any await: a popup that closes itself during the target-id lookup
+    # below must still find its close handler (measured: registered after the
+    # await, a close 240-360 ms in was missed and the next reconnect opened a
+    # second Genesis tab).
+    new.once("close", _on_closed)
+    new_target_id = await _cdp_target_id(new) if layer is BrowserLayer.REMOTE_CDP else None
+    if new.is_closed() or _layer_page(layer) is not old:
+        # Closed while we asked, or the layer moved on: follow nothing.
+        _opened_by.pop(new, None)
+        return False
+    _set_layer_page(layer, new)
+    if layer is BrowserLayer.REMOTE_CDP and new_target_id is not None:
+        # An unreadable id keeps the old one, never None: a None makes the next
+        # reconnect open yet another tab.
+        _remote_target_id = new_target_id
+    if _active_page is old:
+        _active_page = new
+    logger.info("Click opened a new tab — %s now drives it: %s", layer.value, new.url)
+    return True
+
+
 async def _impl_browser_click(selector: str) -> dict:
-    """Click an element on the current page."""
+    """Click an element on the current page.
+
+    A new tab or popup the click opens (``target=_blank``, ``window.open``) is
+    followed: it becomes the page the tools drive, the result's url and
+    snapshot are its own, and ``new_page`` reports it. The original tab stays
+    open. Wait windows: _NEW_TAB_WAIT_S / _NEW_TAB_DECLARED_WAIT_S.
+    """
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -2664,9 +3055,22 @@ async def _impl_browser_click(selector: str) -> dict:
                 "recommendation": "Call browser_snapshot() to see current page state before acting.",
             }
         page = _active_page
+    new_pages: list = []
+    arrived = asyncio.Event()
+
+    def _on_popup(p) -> None:
+        new_pages.append(p)
+        arrived.set()
+
+    page.on("popup", _on_popup)
     try:
         await _human_delay()
+        wait_s = (
+            _NEW_TAB_DECLARED_WAIT_S if await _declares_new_tab(page, selector)
+            else _NEW_TAB_WAIT_S
+        )
         await _stealth_click(page, selector)
+        clicked_at = time.monotonic()
         # A click may trigger navigation (form submit, link). The stealth mouse
         # path — unlike page.click() — has no navigation auto-wait, so settle
         # briefly to let a nav commit, then best-effort wait for the new
@@ -2674,9 +3078,39 @@ async def _impl_browser_click(selector: str) -> dict:
         await asyncio.sleep(0.3)
         with contextlib.suppress(Exception):
             await page.wait_for_load_state("domcontentloaded", timeout=3000)
+        remaining = wait_s - (time.monotonic() - clicked_at)
+        if not new_pages and remaining > 0:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(arrived.wait(), timeout=remaining)
+    except Exception as e:
+        return {"error": f"Click failed on '{selector}': {e}"}
+    finally:
+        with contextlib.suppress(Exception):
+            page.remove_listener("popup", _on_popup)
+    try:
+        result: dict = {"clicked": selector}
+        if new_pages:
+            new = new_pages[0]
+            with contextlib.suppress(Exception):
+                await new.wait_for_load_state("domcontentloaded", timeout=3000)
+            if new.is_closed():
+                followed, why = False, "not followed: it closed again before the click returned"
+            else:
+                async with _browser_lock:
+                    followed = await _follow_new_page(page, new)
+                why = "not followed: the browser layer changed during the click"
+            title = ""
+            with contextlib.suppress(Exception):
+                title = await new.title()
+            result["new_page"] = {"url": new.url, "title": title}
+            if followed:
+                page = new
+            else:
+                result["new_page"]["note"] = why
         _update_remote_url()  # Click may cause navigation (form submit, link)
-        snapshot = await _snapshot_page(page)
-        return {"clicked": selector, "url": page.url, "snapshot": snapshot}
+        result["url"] = page.url
+        result["snapshot"] = await _snapshot_page(page)
+        return result
     except Exception as e:
         return {"error": f"Click failed on '{selector}': {e}"}
 
@@ -3051,6 +3485,10 @@ async def browser_navigate(
     Fresh isolated Chromium on each session. Paid: 1 credit per 4 minutes.
     Use when local browsers fail anti-bot or you need a clean isolated session.
 
+    Each layer is closed after 1 hour without a tool call on it; switching
+    layers leaves the previous one open until then (a TinyFish session keeps
+    billing until it idles out).
+
     cdp_url: Override the CDP endpoint. Default: GENESIS_CDP_URL env var.
     Example: browser_navigate("https://jobs.ashbyhq.com/...", remote=True)
 
@@ -3093,6 +3531,13 @@ async def browser_click(selector: str) -> dict:
     was sent, the tool tries keyboard activation (focus + Space/Enter). A
     click that may already have been delivered is never repeated.
     For manual keyboard navigation, use browser_press_key with Tab/Space.
+
+    New tab or popup: if the click opens one (target=_blank, window.open),
+    the tools switch to it. The result's url and snapshot are the new tab's,
+    and "new_page" gives its url and title. The original tab stays open; if
+    the new tab later closes itself (a sign-in popup), the tools go back to
+    the original. The tab must start loading within 10 s for a link or form
+    that declares a new tab, 1 s otherwise, or it is not followed.
 
     Returns the updated page snapshot after clicking. "clicked" means the
     click was sent; confirm the page changed.

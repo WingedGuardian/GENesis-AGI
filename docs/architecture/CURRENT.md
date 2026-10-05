@@ -1417,7 +1417,11 @@ verified: 246808153 2026-09-24
   patterns: its "is a browser running" check matches exact process names
   (`pgrep -x`), because a `pgrep -f` substring also matches any shell whose
   arguments merely mention the word. The automation TOOLS live in
-  `mcp/health/browser.py`.
+  `mcp/health/browser.py`: each layer (Camoufox, Chromium, remote CDP,
+  TinyFish) has its own idle clock and cleanup, so a stale-page restart or the
+  1 h idle reclaim of one layer never touches another (TinyFish included:
+  leaving it does not end its paid session, which bills until its own idle
+  reclaim); a click that opens a new tab switches the tools to it.
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
