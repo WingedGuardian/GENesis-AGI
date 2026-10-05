@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import logging
 import math
 import os
 import random
 import re
 import signal
+import sys
 import time
 import uuid
 from datetime import UTC, datetime
@@ -84,6 +86,132 @@ _ts_log = _TsLog()
 
 # Prevents concurrent browser init/cleanup races across tool calls.
 _browser_lock = asyncio.Lock()
+
+
+class CamoufoxEngineNotReady(RuntimeError):
+    """Camoufox or its pinned engine is not installed; launching would download."""
+
+
+_BROWSER_DISTS = ("camoufox", "playwright", "patchright")
+
+
+def _installed_browser_versions() -> dict[str, str | None]:
+    from importlib.metadata import PackageNotFoundError, version
+
+    found: dict[str, str | None] = {}
+    for dist in _BROWSER_DISTS:
+        try:
+            found[dist] = version(dist)
+        except PackageNotFoundError:
+            found[dist] = None
+    return found
+
+
+# What was on disk when this process started. A provisioning run that changes
+# these packages under a live session leaves any OLD module this process already
+# imported in sys.modules (playwright arrives with the first web fetch, camoufox
+# with the first launch). The new files then fail in ways reinstalling cannot
+# fix (an ImportError, or old camoufox looking for its engine where the new
+# layout moved it): only a restart loads the new versions.
+_STARTUP_BROWSER_VERSIONS = _installed_browser_versions()
+
+
+class BrowserPackagesChanged(RuntimeError):
+    """Browser packages changed on disk after this process imported them."""
+
+
+# The browser-stack lock (genesis.browser.engine.BROWSER_LOCK_FILE), held SHARED
+# while this process has a local browser (Camoufox or Chromium) open, so a
+# provisioning run, which takes it EXCLUSIVE, cannot replace packages, copy a
+# live profile or swap the engine under it, nor can a launch start mid-upgrade.
+_stack_lock_fd: int | None = None
+
+
+def _hold_stack_lock() -> None:
+    global _stack_lock_fd
+    if _stack_lock_fd is not None:
+        return
+    from genesis.browser import engine
+
+    path = engine.BROWSER_LOCK_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    except OSError:
+        logger.warning("could not open the browser-stack lock %s", path, exc_info=True)
+        return  # no lock file possible: the provisioning preflight's process check remains
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise CamoufoxEngineNotReady(
+            "the browser stack is being upgraded right now (scripts/install_browser_stack.sh "
+            "is running); try again when it finishes"
+        ) from None
+    except OSError:
+        os.close(fd)
+        logger.warning("could not lock %s", path, exc_info=True)
+        return
+    _stack_lock_fd = fd
+
+
+def _release_stack_lock() -> None:
+    global _stack_lock_fd
+    if _stack_lock_fd is not None:
+        with contextlib.suppress(OSError):
+            os.close(_stack_lock_fd)
+        _stack_lock_fd = None
+
+
+async def _launch_local(launch):
+    """Run a local browser launch under the shared browser-stack lock."""
+    _hold_stack_lock()
+    try:
+        return await launch()
+    except BaseException:
+        if _stealth_cm is None and _context is None:
+            _release_stack_lock()  # nothing came up, so nothing holds the stack
+        raise
+
+
+def _packages_changed_message() -> str | None:
+    now = _installed_browser_versions()
+    if now == _STARTUP_BROWSER_VERSIONS:
+        return None
+    changed = ", ".join(
+        f"{d} {_STARTUP_BROWSER_VERSIONS[d]} -> {now[d]}"
+        for d in _BROWSER_DISTS
+        if now[d] != _STARTUP_BROWSER_VERSIONS[d]
+    )
+    advice = "Restart this Claude Code session to load them."
+    if any(now[d] is None for d in ("camoufox", "playwright")):
+        advice += " If the browser is still unavailable after that, run scripts/install_browser_stack.sh."
+    else:
+        advice += " Do not reinstall."
+    return f"Browser packages changed after this session started ({changed}). {advice}"
+
+
+def _check_loaded_browser_modules() -> None:
+    """Refuse a launch on modules that no longer match what is on disk.
+
+    Only a distribution this process has already imported matters: one not yet
+    loaded will be imported fresh from the files on disk.
+    """
+    now = _installed_browser_versions()
+    if any(
+        d in sys.modules and now[d] != _STARTUP_BROWSER_VERSIONS[d] for d in _BROWSER_DISTS
+    ):
+        raise BrowserPackagesChanged(_packages_changed_message())
+
+
+def _import_error_message(e: ImportError) -> str:
+    changed = _packages_changed_message()
+    if changed:
+        return f"{changed} (import failed: {e})"
+    return (
+        f"Browser not available: {e}. "
+        "Run scripts/install_browser_stack.sh to install the browser stack."
+    )
 
 _PROFILE_DIR = Path.home() / ".genesis" / "camoufox-profile"
 _CHROMIUM_PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
@@ -235,14 +363,16 @@ async def async_cleanup():
         _stealth_cm = None
         _stealth_browser = None
         _stealth_page = None
+    _release_stack_lock()  # no local browser is open any more
 
 
 async def _ensure_browser():
     """Lazily initialize Camoufox (primary browser) with persistent profile.
 
-    Returns the active page. Raises ImportError if camoufox is not installed.
-    In collaborate mode, launches headed on virtual display :99 for VNC sharing.
-    Uses anti-detection Firefox by default for all browsing.
+    Returns the active page. Raises CamoufoxEngineNotReady when the package or
+    its pinned engine is not installed. In collaborate mode, launches headed on
+    virtual display :99 for VNC sharing. Uses anti-detection Firefox by default
+    for all browsing.
 
     Detects stale pages (e.g. browser killed by a concurrent session) and
     automatically cleans up + re-initializes.
@@ -255,6 +385,16 @@ async def _ensure_browser():
                 return _stealth_page
             logger.warning("Camoufox page is stale — restarting browser")
             await async_cleanup()
+
+        # Refuse BEFORE camoufox runs: its launch path deletes a pre-0.5 engine
+        # directory and downloads the pinned build from inside this call, raced
+        # by every session's MCP process. Provisioning is bootstrap's job.
+        from genesis.browser.engine import camoufox_engine_status
+
+        engine = camoufox_engine_status()
+        if not engine.ready:
+            raise CamoufoxEngineNotReady(engine.detail)
+        _check_loaded_browser_modules()
 
         from camoufox.async_api import AsyncCamoufox
 
@@ -302,6 +442,7 @@ async def _ensure_chromium_fallback():
             logger.warning("Chromium page is stale — restarting browser")
             await async_cleanup()
 
+        _check_loaded_browser_modules()
         from playwright.async_api import async_playwright
 
         _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
@@ -889,10 +1030,10 @@ async def _get_page(
         _active_page = await _ensure_remote_cdp(cdp_url)
     elif stealth:
         await _ensure_vnc()
-        _active_page = await _ensure_browser()
+        _active_page = await _launch_local(_ensure_browser)
     else:
         await _ensure_vnc()
-        _active_page = await _ensure_chromium_fallback()
+        _active_page = await _launch_local(_ensure_chromium_fallback)
     _touch()
     _start_idle_watcher()
     return _active_page, is_new_tinyfish
@@ -2132,8 +2273,12 @@ async def _impl_browser_navigate(
         )
     except ConnectionError as e:
         return {"error": str(e)}
+    except CamoufoxEngineNotReady as e:
+        return {"error": f"Camoufox is not ready: {e}"}
+    except BrowserPackagesChanged as e:
+        return {"error": str(e)}
     except ImportError as e:
-        return {"error": f"Browser not available: {e}. Install with: pip install playwright"}
+        return {"error": _import_error_message(e)}
 
     try:
         # Skip goto only when TinyFish session was JUST created with this URL

@@ -6,6 +6,7 @@ import asyncio
 import importlib.util
 import re
 import signal
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -37,11 +38,17 @@ def _clear_all_browser_state():
 
 
 @pytest.fixture(autouse=True)
-def _reset_browser_state():
-    """Reset module-level browser state before and after each test."""
+def _reset_browser_state(tmp_path, monkeypatch):
+    """Reset module-level browser state before and after each test. The
+    browser-stack lock points into tmp_path: a test must never hold the real
+    one, which a provisioning run on this machine would then see as a browser."""
+    from genesis.browser import engine
+
+    monkeypatch.setattr(engine, "BROWSER_LOCK_FILE", tmp_path / "locks" / "browser.lock")
     _clear_all_browser_state()
     yield
     _clear_all_browser_state()
+    browser._release_stack_lock()
 
 
 class TestIsPageAlive:
@@ -99,11 +106,159 @@ class TestEnsureBrowserRecovery:
         mock_cm.__aenter__ = AsyncMock(return_value=mock_browser)
         mock_cm.__aexit__ = AsyncMock(return_value=None)
 
-        with patch("camoufox.async_api.AsyncCamoufox", return_value=mock_cm):
+        from genesis.browser import engine
+
+        ready = engine.EngineStatus(engine.READY, "test engine", Path("/engine"))
+        with (
+            patch("camoufox.async_api.AsyncCamoufox", return_value=mock_cm),
+            patch.object(engine, "camoufox_engine_status", return_value=ready),
+        ):
             result = await browser._ensure_browser()
 
         assert result is new_page
         assert browser._stealth_page is new_page
+
+    @pytest.mark.asyncio
+    async def test_refuses_to_launch_without_a_ready_engine(self):
+        """camoufox 0.5's launch path deletes a pre-0.5 engine and downloads inside
+        the call, so an unready engine must stop the launch before camoufox runs."""
+        from genesis.browser import engine
+
+        legacy = engine.EngineStatus(engine.LEGACY_LAYOUT, "pre-0.5 engine; run install_browser_stack.sh")
+        constructed = MagicMock()
+        with (
+            patch.object(engine, "camoufox_engine_status", return_value=legacy),
+            patch.dict("sys.modules", {"camoufox.async_api": MagicMock(AsyncCamoufox=constructed)}),
+            pytest.raises(browser.CamoufoxEngineNotReady, match="install_browser_stack"),
+        ):
+            await browser._ensure_browser()
+        constructed.assert_not_called()
+        assert browser._stealth_cm is None
+
+    @pytest.mark.asyncio
+    async def test_navigate_reports_unready_engine_as_error(self):
+        from genesis.browser import engine
+
+        missing = engine.EngineStatus(engine.PIN_NOT_INSTALLED, "needs engine 156.0.1-beta.34")
+        with (
+            patch.object(engine, "camoufox_engine_status", return_value=missing),
+            patch.object(browser, "_ensure_vnc", new=AsyncMock()),
+        ):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert result["error"].startswith("Camoufox is not ready")
+        assert "156.0.1-beta.34" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_navigate_import_error_after_an_upgrade_says_restart(self):
+        """A provisioning run upgraded the packages under this live process: the
+        old playwright is still imported, so the new camoufox cannot import, and
+        reinstalling would not help. Only a restart does."""
+        upgraded = dict(browser._STARTUP_BROWSER_VERSIONS, playwright="9.99.0")
+        with (
+            patch.object(browser, "_installed_browser_versions", return_value=upgraded),
+            patch.object(browser, "_get_page", new=AsyncMock(side_effect=ImportError(
+                "cannot import name 'BrowserBindResult'"))),
+        ):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert "Restart this Claude Code session" in result["error"]
+        assert "-> 9.99.0" in result["error"]
+        assert "BrowserBindResult" in result["error"]
+        assert "install_browser_stack" not in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_launch_refused_on_stale_loaded_modules(self):
+        """Old camoufox already imported, new files on disk: the launch would
+        fail with a misleading 'run camoufox fetch'. Refuse it with 'restart'."""
+        from genesis.browser import engine
+
+        ready = engine.EngineStatus(engine.READY, "Camoufox 156.0.1-beta.34")
+        upgraded = dict(browser._STARTUP_BROWSER_VERSIONS, camoufox="9.9.9")
+        constructed = MagicMock()
+        with (
+            patch.object(engine, "camoufox_engine_status", return_value=ready),
+            patch.object(browser, "_installed_browser_versions", return_value=upgraded),
+            patch.object(browser, "_ensure_vnc", new=AsyncMock()),
+            patch.dict("sys.modules", {
+                "camoufox": MagicMock(),
+                "camoufox.async_api": MagicMock(AsyncCamoufox=constructed),
+            }),
+        ):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert "Restart this Claude Code session" in result["error"]
+        assert "-> 9.9.9" in result["error"]
+        constructed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_launch_during_an_upgrade_is_refused(self, tmp_path):
+        """Provisioning holds the browser-stack lock exclusive for its whole run."""
+        import fcntl
+
+        from genesis.browser import engine
+
+        lock = tmp_path / "browser.lock"
+        with (
+            patch.object(engine, "BROWSER_LOCK_FILE", lock),
+            patch.object(browser, "_ensure_vnc", new=AsyncMock()),
+            open(lock, "w") as provisioning,
+        ):
+            fcntl.flock(provisioning, fcntl.LOCK_EX)
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert "being upgraded" in result["error"]
+        assert browser._stack_lock_fd is None
+
+    @pytest.mark.asyncio
+    async def test_failed_launch_releases_the_stack_lock(self, tmp_path):
+        import fcntl
+
+        from genesis.browser import engine
+
+        lock = tmp_path / "browser.lock"
+        missing = engine.EngineStatus(engine.PIN_NOT_INSTALLED, "needs engine")
+        with (
+            patch.object(engine, "BROWSER_LOCK_FILE", lock),
+            patch.object(engine, "camoufox_engine_status", return_value=missing),
+            patch.object(browser, "_ensure_vnc", new=AsyncMock()),
+        ):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert "not ready" in result["error"]
+        assert browser._stack_lock_fd is None
+        with open(lock, "w") as provisioning:  # nothing still holds it shared
+            fcntl.flock(provisioning, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_an_unloaded_package_change_needs_no_restart(self):
+        """Only a distribution this process imported is stale; camoufox changed
+        on disk while only playwright is loaded does not block Chromium."""
+        changed = dict(browser._STARTUP_BROWSER_VERSIONS, camoufox="9.9.9")
+        modules = {k: v for k, v in sys.modules.items() if k != "camoufox"}
+        modules["playwright"] = MagicMock()
+        with (
+            patch.object(browser, "_installed_browser_versions", return_value=changed),
+            patch.dict("sys.modules", modules, clear=True),
+        ):
+            browser._check_loaded_browser_modules()  # does not raise
+
+    @pytest.mark.asyncio
+    async def test_nothing_loaded_yet_means_no_restart_needed(self):
+        upgraded = dict(browser._STARTUP_BROWSER_VERSIONS, camoufox="9.9.9")
+        with (
+            patch.object(browser, "_installed_browser_versions", return_value=upgraded),
+            patch.object(browser, "_BROWSER_DISTS", ("not-a-loaded-module",)),
+        ):
+            browser._check_loaded_browser_modules()  # does not raise
+
+    @pytest.mark.asyncio
+    async def test_navigate_import_error_without_an_upgrade_says_install(self):
+        with (
+            patch.object(
+                browser, "_installed_browser_versions",
+                return_value=dict(browser._STARTUP_BROWSER_VERSIONS),
+            ),
+            patch.object(browser, "_get_page", new=AsyncMock(side_effect=ImportError(
+                "No module named 'camoufox'"))),
+        ):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert result["error"].startswith("Browser not available")
+        assert "install_browser_stack.sh" in result["error"]
 
     @pytest.mark.asyncio
     async def test_cleanup_safe_on_dead_browser(self):
