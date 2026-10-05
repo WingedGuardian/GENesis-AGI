@@ -1324,3 +1324,22 @@ def test_interact_profile_loads_browser_safety_rules():
     from genesis.cc.direct_session import _PROFILE_SKILLS
 
     assert {"stealth-browser", "browser-automation"} <= set(_PROFILE_SKILLS["interact"])
+
+
+def test_explicit_skills_keep_the_interact_safety_rules():
+    """An explicit skill list adds to interact's mandatory skills, never replaces them."""
+    from genesis.cc.direct_session import DirectSessionRequest, _resolve_skills
+
+    skills = _resolve_skills(
+        DirectSessionRequest(prompt="x", profile="interact", skills=["genesis-voice"])
+    )
+    assert skills[0] == "genesis-voice"
+    assert {"stealth-browser", "browser-automation"} <= set(skills)
+
+
+def test_explicit_skills_keep_web_research():
+    from genesis.cc.direct_session import DirectSessionRequest, _resolve_skills
+
+    assert "web-research" in _resolve_skills(
+        DirectSessionRequest(prompt="x", profile="research", skills=[])
+    )

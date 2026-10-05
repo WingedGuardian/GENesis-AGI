@@ -48,7 +48,7 @@ result = solver.turnstile(sitekey="0x4AAAAAAA...", url="https://target.example/"
 
 Injecting a token means writing a hidden input with `browser_run_js`, which is
 logged and is an untrusted script action; prefer handing the challenge to the
-user over VNC (`browser-automation`, Safety gates).
+user, which depends on the layer (`browser-automation`, Safety gates, Hand-off).
 
 ---
 

@@ -154,7 +154,8 @@ at about 0.24 s per character after a pre-delay of up to 15 s, against a
 timeout of 60 s for anything under 240 characters. A value of roughly 200
 characters or more can time out and wipe the form. For long text: on a site
 without bot protection use the Chromium layer (atomic fill); otherwise hand
-that field to the user over VNC. `browser_fill` clears the field first, so a
+that field to the user: over VNC for Camoufox, or in the Chrome tab on their
+own machine for remote CDP (VNC shows Genesis's display, not their Chrome). `browser_fill` clears the field first, so a
 long value cannot be split across several calls.
 
 `browser_collaborate(True)` switches Camoufox to 0.5-2 s timing and returns the
@@ -302,7 +303,9 @@ other financial accounts are never automated: hand the step to the user.
 
 **Hand-off to the user** (CAPTCHA that did not resolve, 2FA, payment, banking):
 stop acting, call `browser_collaborate(True)` for the `vnc_url` (or name the
-tab in their Chrome for remote CDP), send what is needed and the link with
+tab in their Chrome for remote CDP). On TinyFish there is nothing to hand off:
+the page lives in a cloud browser that VNC does not show, so stop and report,
+or redo the step on a layer the user can see. Send what is needed and the link with
 `outreach_send_and_wait`, wait for the reply, then `browser_snapshot()` to
 confirm the state. Call `browser_collaborate(False)` before continuing
 unattended. In a background session with no reply, stop and report; never work

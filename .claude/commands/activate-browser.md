@@ -33,9 +33,10 @@ Add this entry to `~/genesis/.mcp.json` under `mcpServers`:
 ```
 
 - `--executablePath`: Genesis installs do not ship Google Chrome. Use any
-  installed Chrome/Chromium; Playwright's own Chromium, if installed, lives
-  under `~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome`
-  (`ls -d ~/.cache/ms-playwright/chromium-*` shows the current build).
+  installed Chrome/Chromium. Playwright's own Chromium, if installed, is under
+  `~/.cache/ms-playwright/chromium-*/`, in `chrome-linux64/chrome` on recent
+  Playwright and `chrome-linux/chrome` on older releases; list the executable
+  itself with `ls ~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`.
 - `--userDataDir`: keep it separate from `~/.genesis/browser-profile`, which the
   Chromium fallback layer uses. Two Chromium processes on one profile fail to
   start or corrupt it.
