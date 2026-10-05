@@ -1395,6 +1395,8 @@ def _report_env(monkeypatch, *, scheduled: str, head: str = HEAD):
     monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(head))
     monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
     monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", scheduled)
+    # The BLOCKING `rework` row: an empty sent-back list makes it n/a (green).
+    monkeypatch.setenv("_TEST_GH_REWORK_SENT_BACK", "")
     monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
     monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
     monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))

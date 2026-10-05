@@ -377,6 +377,10 @@ GitHub failure by retargeting a PR that was fine.
 | `scheduled-claude` | `n/a (scoped to the public repo only)` | Neither pass nor block — the gate does not apply to this repo. |
 | `scheduled-claude` | `ok (<kind> carried from <anc>, <check> green at head)` | A pass on a CARRIED-FORWARD review. It is not a review made at head; do not describe it as one. |
 | `review-body` / `inline-findings` | `BLOCK` | Unresolved findings → step 3. |
+| `rework` | `BLOCK — rebuild of sent-back PR(s) … rework contract unmet` | The PR rebuilds a PR sent back for rework (it declares `Replaces`/`Supersedes` one, or its commits contain one's head). The detail lines name each missing item: the builder's `## Rework acknowledgement` comment on the old PR, created before this PR opened, or a line of this PR's `## Rework` section (`Replaces:`, `Split:`, `Deviations:`, `Questions answered:`). Ask the builder for the missing acknowledgement or section. An acknowledgement posted AFTER the rebuild opened can never satisfy the check, so a late one means a fresh PR or the override. The gate checks form only; you judge the substance. `# rework-override` passes it and is logged, but only with the owner's yes. |
+| `rework` | `BLOCK — could not verify — …` | A declared rebuild whose acknowledgement, timeline or commit read failed. Re-run before acting. Do not override a read failure. |
+| `rework` | `could not check — …` | Advisory, never a block: nothing is declared and a read that decides rebuild-ness failed. Re-run if the PR might be a rebuild. |
+| `rework` | `n/a (…)` / `ok (…)` | Not a rebuild, or a rebuild whose contract is present. A `NOTE` under `ok` names a replaced PR still open: its builder closes it when the last replacement opens. |
 | `verdict` | `N gate(s) would block` | Not ready. The count tells you how many lines above to act on. |
 | `verdict` | `MERGEABLE (all gates pass)` | → step 4. The `merge-with` line above it is the command to use. |
 
@@ -529,6 +533,11 @@ Two triggers, two labels:
 Leave it OPEN (genesis-development, "Never RETIRE a PR you are not the one
 reviving"). The session that completes the rework marks it ready, removes the
 label, and requests review.
+
+A rework rebuilt as a NEW PR has to meet a contract the merge gate checks (the
+`rework` row): the gate blocks a rebuild that lacks the builder's
+`## Rework acknowledgement` comment on the old PR, posted before the new PR
+opened, or the new PR's `## Rework` section.
 
 ---
 

@@ -927,6 +927,9 @@ _KNOWN_SIGILS = (
     # with the owner's approval given in conversation (2026-09-24). Loses to
     # stale-review-override when both are present.
     "substitute-review",
+    # git_push_guard: merge a rebuild of a sent-back PR that lacks its rework
+    # acknowledgement or `## Rework` section. Needs the owner's yes; logged.
+    "rework-override",
     "discard-override",
     # Both were passed to has_trailing_override from the day they shipped but never
     # listed here, so the "kept in sync" claim above was false. The consequence is
