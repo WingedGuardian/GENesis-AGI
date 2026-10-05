@@ -25,7 +25,6 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from genesis.cc.child_env import pin_dispatched_env
-from genesis.cc.deploy_hold import wait_for_deploy_clear
 from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 logger = logging.getLogger(__name__)
@@ -213,11 +212,6 @@ async def _run_in_cwd(
     """The spawn itself, in a caller-owned cwd (see ``_judge_cwd``)."""
     try:
         argv = build_argv(model, claude_path, no_mcp_config)
-        if not await wait_for_deploy_clear():
-            return {
-                "status": "failed",
-                "reason": "CCDeployInProgressError: a deploy is still in progress",
-            }
         env = dict(os.environ)
         env["GENESIS_CC_SESSION"] = "1"  # never re-enter Genesis hooks
         pin_dispatched_env(env)  # shared dispatched pins (genesis.cc.child_env)

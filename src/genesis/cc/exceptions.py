@@ -11,10 +11,6 @@ class CCError(Exception):
     """Base for all CC invocation errors."""
 
 
-class CCDeployInProgressError(CCError):
-    """A deploy stayed active until the bounded spawn wait expired."""
-
-
 class CCTimeoutError(CCError):
     """CC session timed out."""
 

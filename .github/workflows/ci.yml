@@ -1112,7 +1112,7 @@ jobs:
         # Floor: 24153 +92 =24245; skip ceiling remains 102.
         # NVIDIA provider health: new test_provider_health_probes.py collects
         # 87 tests (0 -> 87); no added skips. Floor: 24245 + 87 = 24332.
-        # Deploy spawn hold (#2870): +13 cases across test_deploy_hold.py (new, 3)
-        # and spawn-gate/handler tests in existing files; no added skips.
-        # Floor: 24332 + 13 = 24345.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24345
+        # Checkout mutation fence (#2870): +21 collected tests across
+        # test_checkout_lock.py, spawn-admission tests, and deploy/update/candidate
+        # lock tests; no added skips. Floor: 24421 + 21 = 24442.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24442

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -50,53 +49,6 @@ async def test_poll_loop_reruns_recovery_periodically(db, monkeypatch):
     # 1 startup call + >=1 in-loop call. The bug (recovery only at startup)
     # would leave this at exactly 1.
     assert call_count["n"] >= 2
-
-
-@pytest.mark.asyncio
-async def test_poll_loop_leaves_queue_pending_during_deploy(db, monkeypatch):
-    qid = await dsq.enqueue(db, prompt="wait for deploy")
-    monkeypatch.setattr(ds_init, "_POLL_INTERVAL_S", 0.001)
-    monkeypatch.setattr("genesis.env.update_in_progress", lambda: True)
-    claim_next = AsyncMock(wraps=dsq.claim_next)
-    monkeypatch.setattr(dsq, "claim_next", claim_next)
-
-    runner = _FakeRunner()
-    runner.active_count = lambda: 0
-    task = asyncio.create_task(ds_init._direct_session_poll(runner, db))
-    await asyncio.sleep(0.02)
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
-
-    claim_next.assert_not_awaited()
-    row = await dsq.get_by_id(db, qid)
-    assert row["status"] == "pending"
-
-
-@pytest.mark.asyncio
-async def test_poll_loop_claims_queue_when_no_deploy(db, monkeypatch):
-    qid = await dsq.enqueue(db, prompt="dispatch")
-    monkeypatch.setattr(ds_init, "_POLL_INTERVAL_S", 0.001)
-    monkeypatch.setattr("genesis.env.update_in_progress", lambda: False)
-    spawned = asyncio.Event()
-
-    runner = _FakeRunner()
-    runner.active_count = lambda: 0
-
-    async def spawn(request):
-        spawned.set()
-        return "session-1"
-
-    runner.spawn = spawn
-    task = asyncio.create_task(ds_init._direct_session_poll(runner, db))
-    await asyncio.wait_for(spawned.wait(), timeout=1)
-    await asyncio.sleep(0.01)
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
-
-    row = await dsq.get_by_id(db, qid)
-    assert row["status"] == "dispatched"
 
 
 @pytest.mark.asyncio

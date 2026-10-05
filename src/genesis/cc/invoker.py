@@ -21,10 +21,9 @@ from dataclasses import replace
 from pathlib import Path
 
 from genesis.cc import roster
+from genesis.cc.checkout_lock import CheckoutAdmission, admit_launch
 from genesis.cc.child_env import pin_dispatched_env
-from genesis.cc.deploy_hold import wait_for_deploy_clear
 from genesis.cc.exceptions import (
-    CCDeployInProgressError,
     CCError,
     CCMCPError,
     CCNetworkOfflineError,
@@ -2904,6 +2903,15 @@ class CCInvoker:
         return env
 
     async def _run_inner(self, invocation: CCInvocation) -> CCOutput:
+        admission = await admit_launch()
+        try:
+            return await self._run_inner_with_admission(invocation, admission)
+        finally:
+            admission.release()
+
+    async def _run_inner_with_admission(
+        self, invocation: CCInvocation, admission: CheckoutAdmission
+    ) -> CCOutput:
         # Off the event loop: the pins may prepare the gh seal (filesystem
         # work behind a blocking lock) for a Bash-restricted profile.
         pins = await asyncio.to_thread(_settings_env_pins, tuple(invocation.bash_allowlist))
@@ -2933,10 +2941,6 @@ class CCInvoker:
         reg_key: str | None = None
         try:
             scope_args = await _get_scope_args()
-            if not await wait_for_deploy_clear():
-                raise CCDeployInProgressError(
-                    "Claude spawn refused: a deploy is still in progress",
-                )
             proc = await asyncio.create_subprocess_exec(
                 *scope_args,
                 *args,
@@ -2950,6 +2954,7 @@ class CCInvoker:
                 # kill paths can killpg the whole claude tree.
                 start_new_session=True,
             )
+            admission.release()
             reg_key = invocation.session_key or f"pid:{proc.pid}"
             self._register_proc(reg_key, proc)
             logger.info("CC subprocess spawned (PID %s)", proc.pid)
@@ -3128,6 +3133,20 @@ class CCInvoker:
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
     ) -> CCOutput:
         """Run CC with stream-json output, calling on_event for each line."""
+        admission = await admit_launch()
+        try:
+            return await self._run_streaming_inner_with_admission(
+                invocation, on_event, admission
+            )
+        finally:
+            admission.release()
+
+    async def _run_streaming_inner_with_admission(
+        self,
+        invocation: CCInvocation,
+        on_event: Callable[[StreamEvent], Awaitable[None]] | None,
+        admission: CheckoutAdmission,
+    ) -> CCOutput:
         # Off the event loop: the pins may prepare the gh seal (filesystem
         # work behind a blocking lock) for a Bash-restricted profile.
         pins = await asyncio.to_thread(_settings_env_pins, tuple(invocation.bash_allowlist))
@@ -3163,10 +3182,6 @@ class CCInvoker:
 
         try:
             scope_args = await _get_scope_args()
-            if not await wait_for_deploy_clear():
-                raise CCDeployInProgressError(
-                    "Claude spawn refused: a deploy is still in progress",
-                )
             proc = await asyncio.create_subprocess_exec(
                 *scope_args,
                 *args,
@@ -3181,6 +3196,7 @@ class CCInvoker:
                 # kill paths can killpg the whole claude tree.
                 start_new_session=True,
             )
+            admission.release()
         except FileNotFoundError:
             logger.error(
                 "Claude CLI not found at %r. Ensure @anthropic-ai/claude-code "

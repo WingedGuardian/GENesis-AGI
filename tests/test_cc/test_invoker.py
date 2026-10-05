@@ -10,12 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from genesis.cc.exceptions import (
-    CCDeployInProgressError,
-    CCProcessError,
-    CCStreamTruncatedError,
-    CCTimeoutError,
-)
+from genesis.cc.exceptions import CCProcessError, CCStreamTruncatedError, CCTimeoutError
 from genesis.cc.invoker import CCInvoker
 from genesis.cc.types import (
     CCInvocation,
@@ -1057,10 +1052,7 @@ async def test_run_success(invoker):
     mock_proc.communicate = AsyncMock(return_value=(result_line.encode(), b""))
     mock_proc.returncode = 0
 
-    with (
-        patch("genesis.cc.invoker.wait_for_deploy_clear", return_value=True),
-        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
-    ):
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
         output = await invoker.run(CCInvocation(prompt="hello"))
     assert output.text == "Hello world"
     assert output.session_id == "sess-out-1"
@@ -1071,26 +1063,6 @@ async def test_run_success(invoker):
     assert output.exit_code == 0
     assert not output.is_error
     assert not output.via_proxy
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("method", ["run", "run_streaming"])
-async def test_deploy_hold_refuses_spawn(invoker, method):
-    with (
-        patch("genesis.cc.invoker.wait_for_deploy_clear", return_value=False) as wait,
-        patch("asyncio.create_subprocess_exec") as spawn,
-        pytest.raises(CCDeployInProgressError),
-    ):
-        if method == "run":
-            await invoker.run(CCInvocation(prompt="hello"))
-        else:
-            await invoker.run_streaming(
-                CCInvocation(prompt="hello"),
-                on_event=AsyncMock(),
-            )
-
-    wait.assert_awaited_once_with()
-    spawn.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -6903,11 +6875,100 @@ async def test_run_paths_compute_pins_in_a_worker_thread(invoker, monkeypatch):
 
     import genesis.cc.invoker as inv_mod
 
-    for name in ("_run_inner", "_run_streaming_inner"):
+    for name in ("_run_inner_with_admission", "_run_streaming_inner_with_admission"):
         src = inspect.getsource(getattr(inv_mod.CCInvoker, name))
         assert "asyncio.to_thread(_settings_env_pins" in src, name
         assert "settings_pins=pins" in src, name
         assert "verify_allowlist_enforceable(invocation, settings_pins=pins)" in src, name
+
+
+def _track_checkout_admission(monkeypatch, invoker, *, streaming, spawn_error=None):
+    import genesis.cc.invoker as inv_mod
+
+    events = []
+
+    class Admission:
+        released = False
+
+        def release(self):
+            if not self.released:
+                events.append("release")
+                self.released = True
+
+    async def admit():
+        events.append("admit")
+        return Admission()
+
+    def pins(*_args):
+        events.append("pins")
+        return {}
+
+    async def probe(*_args, **_kwargs):
+        events.append("probe")
+
+    async def fallback(env, _invocation):
+        return env
+
+    monkeypatch.setattr(inv_mod, "admit_launch", admit)
+    monkeypatch.setattr(inv_mod, "_settings_env_pins", pins)
+    monkeypatch.setattr(inv_mod, "_get_scope_args", AsyncMock(return_value=[]))
+    monkeypatch.setattr(inv_mod, "set_oom_score_adj", lambda *_args: None)
+    monkeypatch.setattr(invoker, "verify_allowlist_enforceable", probe)
+    monkeypatch.setattr(invoker, "_build_env", lambda _invocation: {})
+    monkeypatch.setattr(invoker, "_apply_login_fallback", fallback)
+    monkeypatch.setattr(invoker, "_launch_env", lambda env, _invocation: env)
+    monkeypatch.setattr(invoker, "_register_proc", lambda *_args: None)
+    monkeypatch.setattr(invoker, "_unregister_proc", lambda *_args: None)
+
+    result = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "ok",
+        "session_id": "s",
+    }
+    proc = SimpleNamespace(
+        pid=41,
+        returncode=0,
+        communicate=AsyncMock(return_value=(json.dumps(result).encode(), b"")),
+    )
+    if streaming:
+        proc.stdout = _make_async_stdout(_make_stream_lines(result))
+        proc.stdin = _make_mock_stdin()
+        proc.stderr = _make_mock_stderr()
+        proc.wait = AsyncMock()
+        proc.terminate = MagicMock()
+
+    async def create(*_args, **_kwargs):
+        events.append("spawn")
+        if spawn_error:
+            raise spawn_error
+        return proc
+
+    monkeypatch.setattr(inv_mod.asyncio, "create_subprocess_exec", create)
+    return events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("streaming", "spawn_error"), [(False, False), (False, True), (True, False), (True, True)])
+async def test_checkout_admission_order_and_release(invoker, monkeypatch, streaming, spawn_error):
+    events = _track_checkout_admission(
+        monkeypatch,
+        invoker,
+        streaming=streaming,
+        spawn_error=FileNotFoundError("claude") if spawn_error else None,
+    )
+    method = invoker._run_streaming_inner if streaming else invoker._run_inner
+    if spawn_error:
+        with pytest.raises(CCProcessError):
+            await method(CCInvocation(prompt="hello"))
+    else:
+        await method(CCInvocation(prompt="hello"))
+    assert events.index("admit") < events.index("pins") < events.index("probe")
+    assert events.index("probe") < events.index("spawn")
+    assert events.index("spawn") + 1 == events.index("release")
+    if spawn_error:
+        assert events[-1] == "release"
 
 
 def test_verify_checks_the_settings_file_built_from_the_launch_pins(invoker, monkeypatch):

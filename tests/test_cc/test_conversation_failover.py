@@ -20,7 +20,6 @@ from genesis.cc.conversation import (
     _strip_session_control_block,
 )
 from genesis.cc.exceptions import (
-    CCDeployInProgressError,
     CCError,
     CCMCPError,
     CCNetworkOfflineError,
@@ -734,47 +733,6 @@ async def test_a_balance_refusal_does_not_trigger_a_fresh_sticky_retry(
     assert invoker.run_streaming.await_count == 1, (
         "retried a drained account with a fresh session"
     )
-
-
-@pytest.mark.asyncio
-async def test_deploy_hold_stops_failover_without_recording_peer(loop, invoker, monkeypatch):
-    peers = [
-        ("peer-a", replace(_PEER_INV, resume_session_id=None)),
-        ("peer-b", replace(_PEER_INV, resume_session_id=None)),
-    ]
-    monkeypatch.setattr(
-        roster, "failover_invocations",
-        lambda home, base, *a, **k: peers,
-    )
-    loop._session_fallback_session = lambda session: {
-        "roster_model": "peer-a",
-        "cc_session_id": "sticky-peer-session",
-    }
-    loop._merge_session_metadata = AsyncMock()
-    loop._session_mgr = MagicMock(update_activity=AsyncMock())
-    note_failure = MagicMock()
-    note_success = MagicMock()
-    monkeypatch.setattr(peer_availability, "note_failure", note_failure)
-    monkeypatch.setattr(peer_availability, "note_success", note_success)
-    invoker.run = AsyncMock(
-        side_effect=CCDeployInProgressError("a deploy is still in progress"),
-    )
-
-    result = await loop._try_roster_failover(
-        session={"id": "s1"},
-        base_inv=CCInvocation(prompt="x", roster_eligible=True),
-        channel=ChannelType.TERMINAL,
-        model=CCModel.SONNET,
-        effort=EffortLevel.LOW,
-        prompt_text="x",
-    )
-
-    assert result is None
-    invoker.run.assert_awaited_once()
-    attempted_inv = invoker.run.await_args.args[0]
-    assert attempted_inv.resume_session_id == "sticky-peer-session"
-    note_failure.assert_not_called()
-    note_success.assert_not_called()
 
 
 @pytest.mark.asyncio

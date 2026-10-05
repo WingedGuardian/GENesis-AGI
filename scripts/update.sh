@@ -114,6 +114,8 @@ MANIFEST_DELTA_PY="$(cat "$SCRIPT_DIR/lib/manifest_delta.py")"
 # shared with deploy_code_only.sh so the two deploy paths cannot disagree.
 # shellcheck source=lib/deploy_checkout.sh
 . "$SCRIPT_DIR/lib/deploy_checkout.sh"
+# shellcheck source=lib/checkout_lock.sh
+. "$SCRIPT_DIR/lib/checkout_lock.sh"
 
 # ── Update state file helper ────────────────────────────
 # Written at each phase boundary so crash recovery knows where we stopped.
@@ -1501,6 +1503,11 @@ _do_rollback() {
         server_down=false
     fi
     systemctl --user stop genesis-bridge 2>/dev/null || true
+    if [ "${_CHECKOUT_LOCK_BUSY:-0}" != "1" ]; then
+        if ! genesis_checkout_lock "$GENESIS_ROOT"; then
+            echo "  WARNING: checkout lock busy during rollback; continuing without it" >&2
+        fi
+    fi
 
     # What the code rollback may touch is decided from the checkout as it is NOW,
     # by exact commit identity: another session may have switched the branch,
@@ -1735,6 +1742,7 @@ _do_rollback() {
 
     # Restart services with old code — only when the guard above verified it IS
     # the old code.
+    genesis_checkout_unlock
     if [ "$restart_ok" = "true" ]; then
         for svc in "${WERE_RUNNING[@]}"; do
             if [ "$svc" = "genesis-server" ]; then
@@ -1879,6 +1887,11 @@ _checkout_unmoved_or_roll_back() {
 }
 _checkout_unmoved_or_roll_back
 # END checkout-unmoved
+if ! genesis_checkout_lock "$GENESIS_ROOT"; then
+    _CHECKOUT_LOCK_BUSY=1
+    _do_rollback "checkout lock busy: a Claude launch holds genesis-checkout.lock"
+    exit 1
+fi
 
 # Clear local edits to known-ephemeral tracked files (EPHEMERAL_DIRTY_RE) before
 # merging. They are rewritten in place at runtime and regenerate themselves
@@ -2124,6 +2137,7 @@ if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_HEAD" HEAD 2>/dev/
     exit 1
 fi
 
+genesis_checkout_unlock
 NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
 NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 

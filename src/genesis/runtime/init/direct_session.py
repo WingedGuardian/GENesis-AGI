@@ -89,7 +89,6 @@ def request_from_payload(payload: dict):
 async def _direct_session_poll(runner: DirectSessionRunner, db) -> None:
     """Poll direct_session_queue for pending items, dispatch to runner."""
     from genesis.db.crud import direct_session_queue as dsq
-    from genesis.env import update_in_progress
 
     # Crash recovery on boot: reset claims orphaned before a crash/restart.
     await _recover_stale_claims(db)
@@ -110,11 +109,6 @@ async def _direct_session_poll(runner: DirectSessionRunner, db) -> None:
             # spawn() returns immediately but sessions queue behind the
             # internal Semaphore — claiming more just wastes queue items.
             if runner.active_count() >= runner._MAX_CONCURRENT:
-                continue
-
-            # Leave work pending rather than claiming it into a deploy window.
-            # runner.spawn() has its own final gate for the check-to-spawn race.
-            if update_in_progress():
                 continue
 
             row = await dsq.claim_next(db)
