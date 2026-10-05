@@ -66,4 +66,4 @@ def test_status_module_never_imports_camoufox():
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
     assert "camoufox" not in imported
-    assert "platformdirs" not in imported
+    # platformdirs is allowed: it is camoufox's own path resolver, with no side effects.

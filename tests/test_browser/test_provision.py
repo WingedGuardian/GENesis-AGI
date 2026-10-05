@@ -106,12 +106,15 @@ def _install_pinned(install_dir: Path, *_):
     d = install_dir / "browsers" / "official" / f"{PIN[0]}-{PIN[1]}"
     d.mkdir(parents=True)
     (d / "version.json").write_text(json.dumps({"version": PIN[0], "release": PIN[1]}))
+    (d / "camoufox-bin").write_text("#!/bin/sh\n")
+    (d / "camoufox-bin").chmod(0o755)
 
 
 def _legacy_engine(root: Path, age_days: float = 90) -> None:
     root.mkdir(parents=True)
     (root / "version.json").write_text(json.dumps({"version": "135.0.1", "release": "beta.24"}))
     (root / "camoufox-bin").write_text("binary")
+    (root / "camoufox-bin").chmod(0o755)
     t = time.time() - age_days * 86400
     os.utime(root, (t, t))
 
@@ -905,3 +908,159 @@ def test_unchanged_packages_say_nothing_about_restarting(stack, tmp_path, monkey
     _versions(monkeypatch, NEW, NEW)
     _tx(tmp_path).run()
     assert "restart" not in capsys.readouterr().out
+
+
+# ── round-1 review findings ───────────────────────────────────────────────
+
+
+def test_a_retry_refreshes_the_profile_backup(tmp_path):
+    """After a failed upgrade the user kept using the old browser; the backup a
+    later rollback needs is the newest one, not the first attempt's."""
+    profile = tmp_path / "camoufox-profile"
+    profile.mkdir()
+    (profile / "cookies.sqlite").write_text("first")
+    provision.backup_if_upgrading(profile, 135, 156, "Camoufox")
+    (profile / "cookies.sqlite").write_text("after the failed attempt")
+    provision.backup_if_upgrading(profile, 135, 156, "Camoufox")
+    backups = list(tmp_path.glob("camoufox-profile.pre-v135-*"))
+    assert len(backups) == 1
+    assert (backups[0] / "cookies.sqlite").read_text() == "after the failed attempt"
+
+
+def test_failed_copy_leaves_no_temp_and_keeps_the_old_backup(tmp_path, monkeypatch):
+    profile = tmp_path / "camoufox-profile"
+    profile.mkdir()
+    (profile / "prefs.js").write_text("x")
+    first = provision.copy_aside(profile, "v135")
+
+    def no_space(src, dst, **kw):
+        Path(dst).mkdir()
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(provision.shutil, "copytree", no_space)
+    with pytest.raises(OSError):
+        provision.copy_aside(profile, "v135")
+    assert not list(tmp_path.glob("*.tmp"))
+    assert first.is_dir()
+
+
+def test_stale_staging_is_cleared_before_the_free_space_check(stack, tmp_path, monkeypatch):
+    stale = stack.parent / ".camoufox-staging-99999"
+    stale.mkdir()
+    seen = []
+    monkeypatch.setattr(provision, "preflight", lambda: seen.append(stale.exists()) or "low disk")
+    _tx(tmp_path).run()
+    assert seen == [False]
+
+
+def test_staged_engine_must_launch_before_the_swap(stack, tmp_path, monkeypatch):
+    """Files present is not usable: a staged engine that does not launch never
+    replaces the working one, and the packages go back."""
+    _legacy_engine(stack)
+    _versions(monkeypatch, OLD, NEW)
+    run = FakeRun(fetch=_install_pinned, fail=[lambda cmd: cmd[1:2] == ["-c"]])
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert (stack / "camoufox-bin").read_text() == "binary"  # legacy still in place
+    assert not list(stack.parent.glob("camoufox.pre-0.5-*"))
+    assert [c[3] for c in run.pip_calls()] == ["install", "uninstall"]
+    smoke_envs = [env for cmd, env in run.calls if cmd[1:2] == ["-c"]]
+    assert smoke_envs and ".camoufox-staging-" in smoke_envs[0]["XDG_CACHE_HOME"]
+    assert "engine=False" in outcome
+
+
+def test_a_set_override_is_reset_to_the_paired_build(stack, tmp_path, monkeypatch):
+    _install_pinned(stack)
+    (stack / "config.json").write_text(json.dumps({"channel": "official/prerelease"}))
+
+    def run(cmd, **kw):
+        if cmd[1:5] == ["-m", "camoufox", "set", "--release"]:
+            (stack / "config.json").write_text("{}")
+        return FakeRun()(cmd, **kw)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert json.loads((stack / "config.json").read_text()) == {}
+    assert "engine=True" in outcome
+
+
+def test_unmet_extra_after_install_fails_the_step(tmp_path, monkeypatch):
+    """The guarded installer masks pip's exit status; an older 0.5-era stack
+    still imports and has a pin, so only the versions tell."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "x"\n[project.optional-dependencies]\n'
+        'browser = ["camoufox>=0.5.7,<0.6", "playwright>=1.62,<1.63"]\n'
+    )
+    have = {"camoufox": "0.5.6", "playwright": "1.62.0"}
+    monkeypatch.setattr(provision.importlib.metadata, "version", lambda n: have[n])
+    assert provision.unmet_browser_requirements(pyproject) == [
+        "camoufox<0.6,>=0.5.7 (installed 0.5.6)"
+    ]
+    have["camoufox"] = "0.5.7"
+    assert provision.unmet_browser_requirements(pyproject) == []
+
+
+def test_a_browser_holding_the_lock_skips_with_its_own_reason(stack, tmp_path):
+    import fcntl
+
+    provision.LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(provision.LOCK_FILE, "w") as browser:
+        fcntl.flock(browser, fcntl.LOCK_SH)
+        outcome = _tx(tmp_path).run()
+    assert "has a browser open" in outcome
+
+
+def test_chromium_that_does_not_launch_gets_its_system_libraries(stack, tmp_path, monkeypatch):
+    _install_pinned(stack)
+    launches = iter([False, True])
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        if cmd[1:2] == ["-c"] and "patchright" in cmd[2]:
+            return SimpleNamespace(returncode=0 if next(launches) else 1, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert ["sudo", "-n", "true"] in calls
+    assert any(c[:2] == ["sudo", "-n"] and "install-deps" in c for c in calls)
+    assert "chromium=True" in outcome
+
+
+def test_chromium_without_sudo_names_the_command(stack, tmp_path, monkeypatch, capsys):
+    _install_pinned(stack)
+
+    def run(cmd, **kw):
+        if cmd[:2] == ["sudo", "-n"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        if cmd[1:2] == ["-c"] and "patchright" in cmd[2]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert "install-deps chromium" in capsys.readouterr().out
+    assert "chromium=False" in outcome
+
+
+def test_requirement_check_works_without_packaging(tmp_path, monkeypatch):
+    """packaging is not a declared dependency; a minimal venv lacked it (measured
+    in the live harness), so pip's vendored copy stands in."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_packaging(name, *a, **k):
+        if name == "packaging.requirements" or name == "packaging":
+            raise ImportError(name)
+        return real_import(name, *a, **k)
+
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "x"\n[project.optional-dependencies]\nbrowser = ["camoufox>=0.5.7"]\n'
+    )
+    monkeypatch.setattr(builtins, "__import__", no_packaging)
+    monkeypatch.setattr(provision.importlib.metadata, "version", lambda n: "0.5.7")
+    assert provision.unmet_browser_requirements(pyproject) == []

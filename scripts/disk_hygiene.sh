@@ -301,18 +301,32 @@ prune_browser_backups() {
     # (*.tmp) are never a valid backup and go after a day either way.
     local home="${1:-$HOME}" engine_state="${2:-unknown}"
     local cache="${XDG_CACHE_HOME:-$home/.cache}"
-    find "$home/.genesis" "$cache" -maxdepth 1 -type d \
-        \( -name 'camoufox*.pre-*.tmp' -o -name 'browser-profile.pre-*.tmp' \) -mtime +1 \
-        -exec rm -rf {} + 2>/dev/null || true
+    _prune_browser_tree_set "$home/.genesis" -mtime +1 \
+        \( -name 'camoufox*.pre-*.tmp' -o -name 'browser-profile.pre-*.tmp' \)
+    _prune_browser_tree_set "$cache" -mtime +1 -name 'camoufox*.pre-*.tmp'
     if [ "$engine_state" != "ready" ]; then
         echo "browser backups kept (engine state: $engine_state)"
         return 0
     fi
-    find "$cache" -maxdepth 1 -type d -name 'camoufox.pre-0.5*' ! -name '*.tmp' -mtime +14 \
-        -exec rm -rf {} + 2>/dev/null || echo "browser engine backup prune exited $?"
-    find "$home/.genesis" -maxdepth 1 -type d \
-        \( -name 'camoufox-profile.pre-*' -o -name 'browser-profile.pre-*' \) ! -name '*.tmp' \
-        -mtime +14 -exec rm -rf {} + 2>/dev/null || echo "browser profile backup prune exited $?"
+    _prune_browser_tree_set "$cache" -mtime +14 -name 'camoufox.pre-0.5*' ! -name '*.tmp'
+    _prune_browser_tree_set "$home/.genesis" -mtime +14 \
+        \( -name 'camoufox-profile.pre-*' -o -name 'browser-profile.pre-*' \) ! -name '*.tmp'
+}
+
+_prune_browser_tree_set() {
+    # Remove the direct child directories of $1 matching the find predicates in
+    # $2..., each through remove_tree_one_fs (spares a tree that is or holds a
+    # mount), over the CANONICAL root, like every other recursive deleter here.
+    local root canon mounts dir
+    root="$1"; shift
+    canon="$(cd -P -- "$root" 2>/dev/null && pwd -P)" || return 0
+    if ! mounts="$(mount_targets "$canon")"; then
+        echo "browser backup prune SKIPPED in $canon: the mount table is unreadable"
+        return 0
+    fi
+    while IFS= read -r -d '' dir; do
+        remove_tree_one_fs "$dir" "$mounts" 1 || echo "browser backup prune failed or spared $dir"
+    done < <(find "$canon" -mindepth 1 -maxdepth 1 -type d "$@" -print0 2>/dev/null)
 }
 
 main() {

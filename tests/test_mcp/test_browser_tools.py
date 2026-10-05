@@ -6,6 +6,7 @@ import asyncio
 import importlib.util
 import re
 import signal
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -37,11 +38,17 @@ def _clear_all_browser_state():
 
 
 @pytest.fixture(autouse=True)
-def _reset_browser_state():
-    """Reset module-level browser state before and after each test."""
+def _reset_browser_state(tmp_path, monkeypatch):
+    """Reset module-level browser state before and after each test. The
+    browser-stack lock points into tmp_path: a test must never hold the real
+    one, which a provisioning run on this machine would then see as a browser."""
+    from genesis.browser import engine
+
+    monkeypatch.setattr(engine, "BROWSER_LOCK_FILE", tmp_path / "locks" / "browser.lock")
     _clear_all_browser_state()
     yield
     _clear_all_browser_state()
+    browser._release_stack_lock()
 
 
 class TestIsPageAlive:
@@ -180,6 +187,55 @@ class TestEnsureBrowserRecovery:
         assert "Restart this Claude Code session" in result["error"]
         assert "-> 9.9.9" in result["error"]
         constructed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_launch_during_an_upgrade_is_refused(self, tmp_path):
+        """Provisioning holds the browser-stack lock exclusive for its whole run."""
+        import fcntl
+
+        from genesis.browser import engine
+
+        lock = tmp_path / "browser.lock"
+        with (
+            patch.object(engine, "BROWSER_LOCK_FILE", lock),
+            patch.object(browser, "_ensure_vnc", new=AsyncMock()),
+            open(lock, "w") as provisioning,
+        ):
+            fcntl.flock(provisioning, fcntl.LOCK_EX)
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert "being upgraded" in result["error"]
+        assert browser._stack_lock_fd is None
+
+    @pytest.mark.asyncio
+    async def test_failed_launch_releases_the_stack_lock(self, tmp_path):
+        import fcntl
+
+        from genesis.browser import engine
+
+        lock = tmp_path / "browser.lock"
+        missing = engine.EngineStatus(engine.PIN_NOT_INSTALLED, "needs engine")
+        with (
+            patch.object(engine, "BROWSER_LOCK_FILE", lock),
+            patch.object(engine, "camoufox_engine_status", return_value=missing),
+            patch.object(browser, "_ensure_vnc", new=AsyncMock()),
+        ):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert "not ready" in result["error"]
+        assert browser._stack_lock_fd is None
+        with open(lock, "w") as provisioning:  # nothing still holds it shared
+            fcntl.flock(provisioning, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_an_unloaded_package_change_needs_no_restart(self):
+        """Only a distribution this process imported is stale; camoufox changed
+        on disk while only playwright is loaded does not block Chromium."""
+        changed = dict(browser._STARTUP_BROWSER_VERSIONS, camoufox="9.9.9")
+        modules = {k: v for k, v in sys.modules.items() if k != "camoufox"}
+        modules["playwright"] = MagicMock()
+        with (
+            patch.object(browser, "_installed_browser_versions", return_value=changed),
+            patch.dict("sys.modules", modules, clear=True),
+        ):
+            browser._check_loaded_browser_modules()  # does not raise
 
     @pytest.mark.asyncio
     async def test_nothing_loaded_yet_means_no_restart_needed(self):
@@ -1595,3 +1651,40 @@ class TestRunJsWorld:
         assert not browser._is_patchright_page(page)
         assert await browser._evaluate_main_world(page, "1+6") == 7
         evaluate.assert_awaited_once_with("1+6")
+
+
+class TestChromiumFallbackImport:
+    @pytest.mark.asyncio
+    async def test_broken_patchright_is_reported_not_swapped_for_playwright(self):
+        """Plain Playwright is used only when patchright is absent; an installed
+        patchright whose import fails must surface, not silently change engines."""
+        playwright_mod = MagicMock()
+        with (
+            patch.object(browser, "_check_loaded_browser_modules"),
+            patch("importlib.util.find_spec", return_value=object()),
+            patch.dict(
+                "sys.modules",
+                {"patchright.async_api": None, "playwright.async_api": playwright_mod},
+            ),
+            pytest.raises(ImportError),
+        ):
+            await browser._ensure_chromium_fallback()
+        playwright_mod.async_playwright.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_absent_patchright_falls_back_to_playwright(self):
+        playwright_mod = MagicMock()
+        playwright_mod.async_playwright.return_value.start = AsyncMock(
+            side_effect=RuntimeError("stop here")
+        )
+        with (
+            patch.object(browser, "_check_loaded_browser_modules"),
+            patch("importlib.util.find_spec", return_value=None),
+            patch.dict(
+                "sys.modules",
+                {"patchright.async_api": None, "playwright.async_api": playwright_mod},
+            ),
+            pytest.raises(RuntimeError, match="stop here"),
+        ):
+            await browser._ensure_chromium_fallback()
+        playwright_mod.async_playwright.assert_called_once()

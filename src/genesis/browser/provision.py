@@ -61,6 +61,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 from genesis.browser.engine import (
+    BROWSER_LOCK_FILE,
+    OVERRIDDEN,
     EngineStatus,
     camoufox_engine_status,
     camoufox_install_dir,
@@ -100,7 +102,7 @@ CHROMIUM_PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
 # session TMPDIR is the shared, quota-capped cc-tmp volume (2 GB measured), and
 # a 1.3 GB engine download there breaks every session at once.
 STAGING_PARENT = Path.home() / "tmp"
-LOCK_FILE = Path.home() / ".genesis" / "locks" / "browser-provision.lock"
+LOCK_FILE = BROWSER_LOCK_FILE
 CAPABILITIES_FILE = Path.home() / ".genesis" / "capabilities.json"
 CAPABILITY = "browser_automation"
 
@@ -153,6 +155,38 @@ def installed_versions() -> dict[str, str]:
     return found
 
 
+def unmet_browser_requirements(pyproject: Path) -> list[str]:
+    """Each requirement of the ``browser`` extra that the installed packages miss.
+
+    Read from the repo's pyproject.toml, not the installed metadata, which a
+    failed install leaves at the previous version.
+    """
+    import tomllib
+
+    try:
+        from packaging.requirements import Requirement
+    except ImportError:
+        # Not a declared dependency (measured absent in a minimal venv); pip,
+        # which this transaction already requires, vendors the same module.
+        from pip._vendor.packaging.requirements import Requirement
+
+    data = tomllib.loads(pyproject.read_text())
+    extra = data.get("project", {}).get("optional-dependencies", {}).get("browser", [])
+    unmet: list[str] = []
+    for line in extra:
+        req = Requirement(line)
+        if req.marker is not None and not req.marker.evaluate({"extra": "browser"}):
+            continue
+        try:
+            have = importlib.metadata.version(req.name)
+        except importlib.metadata.PackageNotFoundError:
+            unmet.append(f"{req} (not installed)")
+            continue
+        if not req.specifier.contains(have, prereleases=True):
+            unmet.append(f"{req} (installed {have})")
+    return unmet
+
+
 # ── preflight ─────────────────────────────────────────────────────────────
 
 
@@ -199,6 +233,8 @@ def chromium_running() -> bool | None:
             exe = os.readlink(f"/proc/{pid}/exe")
         except FileNotFoundError:
             continue  # exited between pgrep and the read
+        except PermissionError:
+            continue  # another user's process: it cannot hold our profile or engine
         except OSError:
             return None
         if _is_playwright_chromium(exe):
@@ -256,25 +292,37 @@ def preflight() -> str | None:
 # ── backups ───────────────────────────────────────────────────────────────
 
 
-def copy_aside(src: Path, label: str) -> Path | None:
-    """Copy ``src`` to ``<src>.pre-<label>-<date>`` via a temp name.
+def copy_aside(src: Path, label: str) -> Path:
+    """Copy ``src`` to ``<src>.pre-<label>-<timestamp>``, replacing older copies.
 
-    Returns None when a finished backup with that label already exists. The
-    temp-then-rename means an interrupted copy is never taken for a finished one,
-    and the copy is touched so retention ages it from today.
+    Called only while the profile still records the OLD version, so the newest
+    copy is the one a rollback needs: after an upgrade that failed before the
+    newer browser opened the profile, the user kept using it, and a copy from the
+    first attempt would lose everything since. Older copies with the same label
+    are removed only after the new one is complete. The temp-then-rename means
+    an interrupted copy is never taken for a finished one, and the copy is
+    touched so retention ages it from today.
     """
-    finished = [
-        p for p in src.parent.glob(f"{src.name}.pre-{label}-*") if not p.name.endswith(".tmp")
-    ]
-    if finished:
-        return None
-    dest = src.with_name(f"{src.name}.pre-{label}-{_stamp()}")
+    stamp = _dt.datetime.now(_dt.UTC).strftime("%Y%m%dT%H%M%S")
+    older = [p for p in src.parent.glob(f"{src.name}.pre-{label}-*") if not p.name.endswith(".tmp")]
+    dest = src.with_name(f"{src.name}.pre-{label}-{stamp}")
+    n = 1
+    while dest.exists():  # a second copy within the same second
+        dest = src.with_name(f"{src.name}.pre-{label}-{stamp}-{n}")
+        n += 1
     tmp = dest.with_name(dest.name + ".tmp")
-    if tmp.exists():
-        shutil.rmtree(tmp)
-    shutil.copytree(src, tmp, symlinks=True)
-    tmp.rename(dest)
+    try:
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        shutil.copytree(src, tmp, symlinks=True)
+        tmp.rename(dest)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
     os.utime(dest)
+    for stale in older:
+        if stale != dest:
+            shutil.rmtree(stale, ignore_errors=True)
     return dest
 
 
@@ -342,8 +390,7 @@ def backup_if_upgrading(
         raise ProvisionError(f"a browser may be using the {kind} profile; not copying it")
     label = f"v{last_major}" if last_major is not None else "vunknown"
     backup = copy_aside(profile, label)
-    if backup:
-        _say(f"backed up the {kind} profile (last opened by {label}) to {backup}")
+    _say(f"backed up the {kind} profile (last opened by {label}) to {backup}")
 
 
 # ── capability ────────────────────────────────────────────────────────────
@@ -534,6 +581,13 @@ class Transaction:
             raise ProvisionError(
                 "the [browser] extra did not install camoufox 0.5 (no browser pin)"
             )
+        # The guarded installer masks pip's exit status, and an older 0.5-era
+        # stack passes both checks above: compare against the extra itself.
+        unmet = unmet_browser_requirements(self.repo_root / "pyproject.toml")
+        if unmet:
+            raise ProvisionError(
+                f"the [browser] extra is not satisfied after install: {'; '.join(unmet)}"
+            )
 
     # steps 3 and 4
     def engine(self) -> None:
@@ -546,6 +600,16 @@ class Transaction:
                 "Camoufox",
             )
         status = camoufox_engine_status()
+        if status.state == OVERRIDDEN:
+            # A bare `camoufox fetch` would fetch the overriding build, which the
+            # status (and so the launch guard) never accepts: it cannot converge.
+            _say(f"resetting to the paired Camoufox build: {status.detail}")
+            proc = self._run(
+                [sys.executable, "-m", "camoufox", "set", "--release"], timeout=STEP_TIMEOUT_S
+            )
+            if proc.returncode != 0:
+                raise ProvisionError(f"`camoufox set --release` exited {proc.returncode}")
+            status = camoufox_engine_status()
         if status.ready:
             _say(f"Camoufox engine up to date ({status.detail})")
             return
@@ -588,6 +652,12 @@ class Transaction:
             if not status.ready:
                 raise ProvisionError(
                     f"the Camoufox engine is not ready after fetch: {status.detail}"
+                )
+            # Files present is not "usable": launch the staged engine before it
+            # replaces the working one, which stays until this passes.
+            if not self.smoke(env=dict(self.env, XDG_CACHE_HOME=str(staging)), install_dir=staged):
+                raise ProvisionError(
+                    "the staged Camoufox engine did not launch; the previous engine is untouched"
                 )
             with _signals_held():
                 self._swap_in(staged)
@@ -680,15 +750,56 @@ class Transaction:
         except (ProvisionError, OSError) as exc:
             _say(f"FAILED: Chromium profile backup: {exc}")
             return False
-        return True
+        return self._chromium_launches_or_deps()
+
+    def _chromium_launches(self) -> bool:
+        try:
+            proc = self._run(
+                [sys.executable, "-c", _CHROMIUM_SMOKE],
+                capture_output=True,
+                text=True,
+                timeout=SMOKE_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            return False
+        return proc.returncode == 0
+
+    def _chromium_launches_or_deps(self) -> bool:
+        """`patchright install chromium` downloads the browser but not the Linux
+        libraries it needs; Playwright's docs require `install-deps` for those.
+        Run it only when the launch fails, and only through non-interactive sudo."""
+        if self._chromium_launches():
+            return True
+        deps = [sys.executable, "-m", "patchright", "install-deps", "chromium"]
+        try:
+            sudo_ok = self._run(["sudo", "-n", "true"], capture_output=True).returncode == 0
+        except FileNotFoundError:
+            sudo_ok = False
+        if sudo_ok:
+            _say("Chromium did not launch; installing its system libraries (install-deps)...")
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                self._run(["sudo", "-n", *deps], timeout=STEP_TIMEOUT_S)
+            if self._chromium_launches():
+                return True
+        _say(
+            "FAILED: Chromium did not launch; its system libraries may be missing. "
+            f"Run: sudo {' '.join(deps)}"
+        )
+        return False
 
     # step 6
-    def smoke(self) -> bool:
-        if not camoufox_engine_status().ready:
+    def smoke(self, env: dict[str, str] | None = None, install_dir: Path | None = None) -> bool:
+        status = (
+            camoufox_engine_status(install_dir=install_dir)
+            if install_dir is not None
+            else camoufox_engine_status()
+        )
+        if not status.ready:
             return False  # never let the smoke launch trigger camoufox's own download
         try:
             proc = self._run(
                 [sys.executable, "-c", _SMOKE],
+                env=env,
                 capture_output=True,
                 text=True,
                 timeout=SMOKE_TIMEOUT_S,
@@ -710,9 +821,19 @@ class Transaction:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                # The run holding the lock refreshes the capability itself.
+                # Browser launches hold this lock SHARED for their lifetime, and a
+                # provisioning run holds it EXCLUSIVE: tell the two apart.
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    # The run holding the lock refreshes the capability itself.
+                    return self._finish(
+                        "SKIPPED (another provisioning run holds the lock)", refresh=False
+                    )
+                fcntl.flock(lock, fcntl.LOCK_UN)
                 return self._finish(
-                    "SKIPPED (another provisioning run holds the lock)", refresh=False
+                    "SKIPPED (a Claude Code session has a browser open; it holds the "
+                    "browser lock until the browser closes)"
                 )
             self.lock_fd = lock.fileno()
             try:
@@ -727,10 +848,12 @@ class Transaction:
             shutil.rmtree(stale, ignore_errors=True)
 
     def _run_locked(self) -> str:
+        # Before the free-space check: a killed run's ~2.4 GB stage would
+        # otherwise keep every later run under the floor.
+        self._clear_stale_staging()
         reason = preflight()
         if reason:
             return self._finish(f"SKIPPED ({reason})")
-        self._clear_stale_staging()
         self.previous = installed_versions()
         STAGING_PARENT.mkdir(parents=True, exist_ok=True)
         self.tmpdir = Path(tempfile.mkdtemp(prefix="genesis-browser-", dir=STAGING_PARENT))
@@ -798,6 +921,20 @@ class Transaction:
         _say(outcome)
         return outcome
 
+
+_CHROMIUM_SMOKE = """
+import asyncio
+from patchright.async_api import async_playwright
+
+async def main():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.goto("about:blank")
+        await browser.close()
+
+asyncio.run(main())
+"""
 
 _SMOKE = """
 import asyncio

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import logging
 import math
 import os
@@ -119,6 +120,60 @@ class BrowserPackagesChanged(RuntimeError):
     """Browser packages changed on disk after this process imported them."""
 
 
+# The browser-stack lock (genesis.browser.engine.BROWSER_LOCK_FILE), held SHARED
+# while this process has a local browser (Camoufox or Chromium) open, so a
+# provisioning run, which takes it EXCLUSIVE, cannot replace packages, copy a
+# live profile or swap the engine under it, nor can a launch start mid-upgrade.
+_stack_lock_fd: int | None = None
+
+
+def _hold_stack_lock() -> None:
+    global _stack_lock_fd
+    if _stack_lock_fd is not None:
+        return
+    from genesis.browser import engine
+
+    path = engine.BROWSER_LOCK_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    except OSError:
+        logger.warning("could not open the browser-stack lock %s", path, exc_info=True)
+        return  # no lock file possible: the provisioning preflight's process check remains
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise CamoufoxEngineNotReady(
+            "the browser stack is being upgraded right now (scripts/install_browser_stack.sh "
+            "is running); try again when it finishes"
+        ) from None
+    except OSError:
+        os.close(fd)
+        logger.warning("could not lock %s", path, exc_info=True)
+        return
+    _stack_lock_fd = fd
+
+
+def _release_stack_lock() -> None:
+    global _stack_lock_fd
+    if _stack_lock_fd is not None:
+        with contextlib.suppress(OSError):
+            os.close(_stack_lock_fd)
+        _stack_lock_fd = None
+
+
+async def _launch_local(launch):
+    """Run a local browser launch under the shared browser-stack lock."""
+    _hold_stack_lock()
+    try:
+        return await launch()
+    except BaseException:
+        if _stealth_cm is None and _context is None:
+            _release_stack_lock()  # nothing came up, so nothing holds the stack
+        raise
+
+
 def _packages_changed_message() -> str | None:
     now = _installed_browser_versions()
     if now == _STARTUP_BROWSER_VERSIONS:
@@ -137,12 +192,16 @@ def _packages_changed_message() -> str | None:
 
 
 def _check_loaded_browser_modules() -> None:
-    """Refuse a launch on modules that no longer match what is on disk."""
-    if not any(d in sys.modules for d in _BROWSER_DISTS):
-        return  # nothing loaded yet: the next import picks up the files on disk
-    message = _packages_changed_message()
-    if message:
-        raise BrowserPackagesChanged(message)
+    """Refuse a launch on modules that no longer match what is on disk.
+
+    Only a distribution this process has already imported matters: one not yet
+    loaded will be imported fresh from the files on disk.
+    """
+    now = _installed_browser_versions()
+    if any(
+        d in sys.modules and now[d] != _STARTUP_BROWSER_VERSIONS[d] for d in _BROWSER_DISTS
+    ):
+        raise BrowserPackagesChanged(_packages_changed_message())
 
 
 def _import_error_message(e: ImportError) -> str:
@@ -304,6 +363,7 @@ async def async_cleanup():
         _stealth_cm = None
         _stealth_browser = None
         _stealth_page = None
+    _release_stack_lock()  # no local browser is open any more
 
 
 async def _ensure_browser():
@@ -391,6 +451,10 @@ async def _ensure_chromium_fallback():
         try:
             from patchright.async_api import async_playwright
         except ImportError:
+            import importlib.util
+
+            if importlib.util.find_spec("patchright") is not None:
+                raise  # installed but broken: report it, never switch silently
             logger.warning(
                 "patchright is not installed; the Chromium fallback uses plain "
                 "Playwright, which sites can detect. Run scripts/install_browser_stack.sh."
@@ -984,10 +1048,10 @@ async def _get_page(
         _active_page = await _ensure_remote_cdp(cdp_url)
     elif stealth:
         await _ensure_vnc()
-        _active_page = await _ensure_browser()
+        _active_page = await _launch_local(_ensure_browser)
     else:
         await _ensure_vnc()
-        _active_page = await _ensure_chromium_fallback()
+        _active_page = await _launch_local(_ensure_chromium_fallback)
     _touch()
     _start_idle_watcher()
     return _active_page, is_new_tinyfish

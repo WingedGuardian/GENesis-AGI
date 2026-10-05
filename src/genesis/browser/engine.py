@@ -26,6 +26,7 @@ import importlib.metadata
 import importlib.util
 import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,8 +35,14 @@ NO_PACKAGE = "no_package"
 LEGACY_LAYOUT = "legacy_layout"
 NOT_INSTALLED = "not_installed"
 PIN_NOT_INSTALLED = "pin_not_installed"
+OVERRIDDEN = "overridden"
 
 _PROVISION_HINT = "run scripts/install_browser_stack.sh (bootstrap runs it too)"
+
+# Provisioning holds this EXCLUSIVE for its whole transaction; each local browser
+# launch (Camoufox, Chromium) holds it SHARED for the browser's lifetime. So a
+# launch cannot start mid-upgrade, and an upgrade cannot start under a browser.
+BROWSER_LOCK_FILE = Path.home() / ".genesis" / "locks" / "browser-provision.lock"
 
 
 @dataclass(frozen=True)
@@ -54,12 +61,18 @@ class EngineStatus:
 def camoufox_install_dir() -> Path:
     """Where camoufox keeps its engines: ``platformdirs.user_cache_dir("camoufox")``.
 
-    Mirrors platformdirs on Linux without importing it: ``$XDG_CACHE_HOME`` when
-    it is set to an absolute path, else ``~/.cache``.
+    The same resolver camoufox uses (pkgman.INSTALL_DIR), so the two can never
+    look in different places; platformdirs is a camoufox dependency. Without it,
+    mirror its Linux rule: a non-blank ``$XDG_CACHE_HOME`` is used as given,
+    relative or not, else ``~/.cache``.
     """
-    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
-    base = Path(xdg) if xdg and os.path.isabs(xdg) else Path.home() / ".cache"
-    return base / "camoufox"
+    try:
+        from platformdirs import user_cache_dir
+    except ImportError:
+        xdg = os.environ.get("XDG_CACHE_HOME", "")
+        base = Path(xdg) if xdg.strip() else Path.home() / ".cache"
+        return base / "camoufox"
+    return Path(user_cache_dir("camoufox"))
 
 
 def _package_dir() -> Path | None:
@@ -150,9 +163,36 @@ def _installed_engines(install_dir: Path) -> list[tuple[Path, tuple[str, str]]]:
             continue
         for version_dir in sorted(repo_dir.iterdir()):
             ids = _engine_ids(version_dir / "version.json")
-            if version_dir.is_dir() and ids:
+            if version_dir.is_dir() and ids and _has_executable(version_dir):
                 found.append((version_dir, ids))
     return found
+
+
+# camoufox's browser_pin.is_explicit_choice (0.5.7): a `channel` or `pinned` in
+# <install>/config.json means the user chose a build other than the paired one.
+# NOT `active_version`: every plain fetch records that itself (measured: a
+# paired fetch wrote active_version=browsers/official/156.0.1-beta.34-09effb44).
+_OVERRIDE_KEYS = ("channel", "pinned")
+
+
+def _active_override(install_dir: Path) -> str | None:
+    config = _read_json(install_dir / "config.json") or {}
+    chosen = [f"{k}={config[k]}" for k in _OVERRIDE_KEYS if config.get(k)]
+    return ", ".join(chosen) or None
+
+
+# camoufox's pkgman.LAUNCH_FILE: the file it executes on each platform.
+_LAUNCH_FILES = {"linux": "camoufox-bin", "win32": "camoufox.exe"}
+
+
+def _has_executable(engine_dir: Path) -> bool:
+    """version.json alone does not make an engine: a truncated extraction can
+    leave the metadata without the binary. macOS bundles are not checked."""
+    name = next((f for p, f in _LAUNCH_FILES.items() if sys.platform.startswith(p)), None)
+    if name is None:
+        return True
+    exe = engine_dir / name
+    return exe.is_file() and os.access(exe, os.X_OK)
 
 
 def camoufox_engine_status(
@@ -177,7 +217,7 @@ def _status(install_dir: Path | None, package_dir: Path | None) -> EngineStatus:
     if not pin_file_present:
         # camoufox < 0.5: a single engine at the install root.
         ids = _engine_ids(root / "version.json")
-        if not ids:
+        if not ids or not _has_executable(root):
             return EngineStatus(NOT_INSTALLED, f"no Camoufox engine at {root}; {_PROVISION_HINT}")
         floor = _playwright_build_floor()
         if floor is not None and _beta_number(ids[1]) is not None and _beta_number(ids[1]) < floor:
@@ -209,6 +249,15 @@ def _status(install_dir: Path | None, package_dir: Path | None) -> EngineStatus:
 
     engines = _installed_engines(root)
     pin = camoufox_pin(pkg)
+    override = _active_override(root)
+    if pin is not None and override:
+        # `camoufox set` chose another build; camoufox would launch (and fetch)
+        # that one, not the pin this status and Genesis's provisioning manage.
+        return EngineStatus(
+            OVERRIDDEN,
+            f"a `camoufox set` choice ({override}) overrides the paired engine "
+            f"{pin[0]}-{pin[1]}; {_PROVISION_HINT} (it restores the paired build)",
+        )
     if pin is None:
         # Unpinned development copy: camoufox launches whatever is installed.
         if engines:

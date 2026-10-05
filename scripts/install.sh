@@ -908,9 +908,15 @@ if [ -d "$VENV_PATH" ]; then
         0)
             echo "    + Genesis installed in editable mode"
             # Every install gets the browser stack (owner decision 2026-10-04).
-            # Non-fatal by design; the last line it prints is the outcome.
-            GENESIS_VENV="$VENV_PATH" bash "$SCRIPT_DIR/install_browser_stack.sh" 2>&1 | sed 's/^/    /' \
-                || setup_warn "browser stack setup did not finish (re-run scripts/install_browser_stack.sh)"
+            # Non-fatal by design; the last line it prints is the outcome. The
+            # script always exits 0, so the warning is decided from that line.
+            _bs_log="$(mktemp)"
+            GENESIS_VENV="$VENV_PATH" bash "$SCRIPT_DIR/install_browser_stack.sh" 2>&1 \
+                | tee "$_bs_log" | sed 's/^/    /' || true
+            if ! tail -n 1 "$_bs_log" | grep -q 'browser stack: ready'; then
+                setup_warn "browser stack not ready (see above; re-run scripts/install_browser_stack.sh)"
+            fi
+            rm -f "$_bs_log"
             ;;
         1)
             # Blocked (worktree) — guard already printed the reason; the
