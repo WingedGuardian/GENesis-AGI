@@ -80,3 +80,12 @@ def test_update_surfaces_and_persists_non_aborting_backup_failure():
     assert "scripts/lib/backup_status_gate.py" in update
     assert 'degraded="${degraded:+$degraded,}$PRE_UPDATE_DEGRADED"' in update
     assert "backup.sh\" 2>&1 | tail" not in update
+
+
+def test_extras_only_gap_has_its_own_code(tmp_path):
+    """The core off-site copy is complete and only opt-in extra directories are missing:
+    a distinct code, so it is never mistaken for a real off-site failure."""
+    result = _gate(tmp_path, _base(tier2_status="partial", offsite_core_complete=True))
+    assert result.stdout.strip() == "continue_degraded:backup:tier2_extras"
+    result = _gate(tmp_path, _base(tier2_status="partial", offsite_core_complete=False))
+    assert result.stdout.strip() == "continue_degraded:backup:tier2"
