@@ -1398,9 +1398,20 @@ verified: 246808153 2026-09-24
   All `/v1` bearer reads go through `genesis.env.bearer_token`. Text-only, and an
   empty completion is a 502 rather than a blank turn); Agent Zero adapter
   optional.
-- **browser/**: profile/state layer only (persistent
-  `~/.genesis/browser-profile`, `BrowserLayer` enum, pgrep patterns as the
-  single source of process detection). The automation TOOLS live in
+- **browser/**: profile/state layer (persistent `~/.genesis/browser-profile`,
+  `BrowserLayer` enum, pgrep patterns as the single source of process
+  detection for the runtime and tools), plus `engine.py` (read-only Camoufox
+  engine readiness: the launch guard and the `browser_automation` capability
+  both use it; it never calls camoufox's own path lookup, which deletes a
+  pre-0.5 engine and downloads) and `provision.py` (the one-process upgrade
+  transaction behind `scripts/install_browser_stack.sh`, run by bootstrap.sh and
+  install.sh on every install and by update.sh after a recorded update: it
+  stages a new engine next to the old one and swaps by rename, puts the
+  previous packages back on failure, and refreshes `browser_automation` in
+  capabilities.json). `provision.py` deliberately does NOT use those pgrep
+  patterns: its "is a browser running" check matches exact process names
+  (`pgrep -x`), because a `pgrep -f` substring also matches any shell whose
+  arguments merely mention the word. The automation TOOLS live in
   `mcp/health/browser.py`.
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching

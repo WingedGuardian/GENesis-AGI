@@ -907,6 +907,10 @@ if [ -d "$VENV_PATH" ]; then
     case $_ei_rc in
         0)
             echo "    + Genesis installed in editable mode"
+            # Every install gets the browser stack (owner decision 2026-10-04).
+            # Non-fatal by design; the last line it prints is the outcome.
+            GENESIS_VENV="$VENV_PATH" bash "$SCRIPT_DIR/install_browser_stack.sh" 2>&1 | sed 's/^/    /' \
+                || setup_warn "browser stack setup did not finish (re-run scripts/install_browser_stack.sh)"
             ;;
         1)
             # Blocked (worktree) — guard already printed the reason; the

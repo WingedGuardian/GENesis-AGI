@@ -99,11 +99,110 @@ class TestEnsureBrowserRecovery:
         mock_cm.__aenter__ = AsyncMock(return_value=mock_browser)
         mock_cm.__aexit__ = AsyncMock(return_value=None)
 
-        with patch("camoufox.async_api.AsyncCamoufox", return_value=mock_cm):
+        from genesis.browser import engine
+
+        ready = engine.EngineStatus(engine.READY, "test engine", Path("/engine"))
+        with (
+            patch("camoufox.async_api.AsyncCamoufox", return_value=mock_cm),
+            patch.object(engine, "camoufox_engine_status", return_value=ready),
+        ):
             result = await browser._ensure_browser()
 
         assert result is new_page
         assert browser._stealth_page is new_page
+
+    @pytest.mark.asyncio
+    async def test_refuses_to_launch_without_a_ready_engine(self):
+        """camoufox 0.5's launch path deletes a pre-0.5 engine and downloads inside
+        the call, so an unready engine must stop the launch before camoufox runs."""
+        from genesis.browser import engine
+
+        legacy = engine.EngineStatus(engine.LEGACY_LAYOUT, "pre-0.5 engine; run install_browser_stack.sh")
+        constructed = MagicMock()
+        with (
+            patch.object(engine, "camoufox_engine_status", return_value=legacy),
+            patch.dict("sys.modules", {"camoufox.async_api": MagicMock(AsyncCamoufox=constructed)}),
+            pytest.raises(browser.CamoufoxEngineNotReady, match="install_browser_stack"),
+        ):
+            await browser._ensure_browser()
+        constructed.assert_not_called()
+        assert browser._stealth_cm is None
+
+    @pytest.mark.asyncio
+    async def test_navigate_reports_unready_engine_as_error(self):
+        from genesis.browser import engine
+
+        missing = engine.EngineStatus(engine.PIN_NOT_INSTALLED, "needs engine 156.0.1-beta.34")
+        with (
+            patch.object(engine, "camoufox_engine_status", return_value=missing),
+            patch.object(browser, "_ensure_vnc", new=AsyncMock()),
+        ):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert result["error"].startswith("Camoufox is not ready")
+        assert "156.0.1-beta.34" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_navigate_import_error_after_an_upgrade_says_restart(self):
+        """A provisioning run upgraded the packages under this live process: the
+        old playwright is still imported, so the new camoufox cannot import, and
+        reinstalling would not help. Only a restart does."""
+        upgraded = dict(browser._STARTUP_BROWSER_VERSIONS, playwright="9.99.0")
+        with (
+            patch.object(browser, "_installed_browser_versions", return_value=upgraded),
+            patch.object(browser, "_get_page", new=AsyncMock(side_effect=ImportError(
+                "cannot import name 'BrowserBindResult'"))),
+        ):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert "Restart this Claude Code session" in result["error"]
+        assert "-> 9.99.0" in result["error"]
+        assert "BrowserBindResult" in result["error"]
+        assert "install_browser_stack" not in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_launch_refused_on_stale_loaded_modules(self):
+        """Old camoufox already imported, new files on disk: the launch would
+        fail with a misleading 'run camoufox fetch'. Refuse it with 'restart'."""
+        from genesis.browser import engine
+
+        ready = engine.EngineStatus(engine.READY, "Camoufox 156.0.1-beta.34")
+        upgraded = dict(browser._STARTUP_BROWSER_VERSIONS, camoufox="9.9.9")
+        constructed = MagicMock()
+        with (
+            patch.object(engine, "camoufox_engine_status", return_value=ready),
+            patch.object(browser, "_installed_browser_versions", return_value=upgraded),
+            patch.object(browser, "_ensure_vnc", new=AsyncMock()),
+            patch.dict("sys.modules", {
+                "camoufox": MagicMock(),
+                "camoufox.async_api": MagicMock(AsyncCamoufox=constructed),
+            }),
+        ):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert "Restart this Claude Code session" in result["error"]
+        assert "-> 9.9.9" in result["error"]
+        constructed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_nothing_loaded_yet_means_no_restart_needed(self):
+        upgraded = dict(browser._STARTUP_BROWSER_VERSIONS, camoufox="9.9.9")
+        with (
+            patch.object(browser, "_installed_browser_versions", return_value=upgraded),
+            patch.object(browser, "_BROWSER_DISTS", ("not-a-loaded-module",)),
+        ):
+            browser._check_loaded_browser_modules()  # does not raise
+
+    @pytest.mark.asyncio
+    async def test_navigate_import_error_without_an_upgrade_says_install(self):
+        with (
+            patch.object(
+                browser, "_installed_browser_versions",
+                return_value=dict(browser._STARTUP_BROWSER_VERSIONS),
+            ),
+            patch.object(browser, "_get_page", new=AsyncMock(side_effect=ImportError(
+                "No module named 'camoufox'"))),
+        ):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert result["error"].startswith("Browser not available")
+        assert "install_browser_stack.sh" in result["error"]
 
     @pytest.mark.asyncio
     async def test_cleanup_safe_on_dead_browser(self):
@@ -146,14 +245,20 @@ class TestEnsureChromiumRecovery:
         mock_pw = AsyncMock()
         mock_pw.chromium.launch_persistent_context = AsyncMock(return_value=mock_context)
 
-        with patch("playwright.async_api.async_playwright") as mock_apw:
-            mock_starter = AsyncMock()
-            mock_starter.start = AsyncMock(return_value=mock_pw)
-            mock_apw.return_value = mock_starter
+        mock_starter = AsyncMock()
+        mock_starter.start = AsyncMock(return_value=mock_pw)
+        mock_apw = MagicMock(return_value=mock_starter)
+        # The fallback prefers patchright and drops to playwright without it;
+        # stub both so the test never launches a real browser either way.
+        fake = MagicMock(async_playwright=mock_apw)
+        with patch.dict("sys.modules", {"patchright.async_api": fake, "playwright.async_api": fake}):
             result = await browser._ensure_chromium_fallback()
 
         assert result is new_page
         assert browser._page is new_page
+        _, kwargs = mock_pw.chromium.launch_persistent_context.call_args
+        assert kwargs.get("no_viewport") is True
+        assert "viewport" not in kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -1465,3 +1570,28 @@ class TestBrowserScreenshotUniquePath:
         stamps = [Path(r["path"]).name.split("_")[-2] for r in (first, second)]
         assert stamps[0] != stamps[1], stamps
         assert stamps[0] < stamps[1], stamps
+
+
+class TestRunJsWorld:
+    """patchright evaluates in an isolated world by default, where page globals are
+    invisible; browser_run_js must ask for the page's own world on patchright pages."""
+
+    @staticmethod
+    def _page(module: str, value):
+        evaluate = AsyncMock(return_value=value)
+        cls = type("Page", (), {"__module__": module, "evaluate": evaluate})
+        return cls(), evaluate
+
+    @pytest.mark.asyncio
+    async def test_patchright_page_uses_main_world(self):
+        page, evaluate = self._page("patchright.async_api._generated", 42)
+        assert browser._is_patchright_page(page)
+        assert await browser._evaluate_main_world(page, "window.appState") == 42
+        evaluate.assert_awaited_once_with("window.appState", isolated_context=False)
+
+    @pytest.mark.asyncio
+    async def test_other_pages_use_plain_evaluate(self):
+        page, evaluate = self._page("playwright.async_api._generated", 7)
+        assert not browser._is_patchright_page(page)
+        assert await browser._evaluate_main_world(page, "1+6") == 7
+        evaluate.assert_awaited_once_with("1+6")

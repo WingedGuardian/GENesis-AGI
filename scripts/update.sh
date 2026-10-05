@@ -2363,7 +2363,7 @@ _write_state "bootstrap"
 # was stopped above, and the ERR trap is armed here, so a guard refusal would
 # escalate into a full update rollback. The guard must never gate this call.
 echo "--- Running bootstrap ---"
-GENESIS_BOOTSTRAP_ALLOW_LIVE=1 "$GENESIS_ROOT/scripts/bootstrap.sh" 2>&1 | tail -10
+GENESIS_BOOTSTRAP_ALLOW_LIVE=1 GENESIS_BROWSER_STACK_DEFERRED=1 "$GENESIS_ROOT/scripts/bootstrap.sh" 2>&1 | tail -10
 echo "  Bootstrap complete"
 echo ""
 
@@ -2942,6 +2942,22 @@ rm -f "$HOME/.genesis/update_conflicts.json"
 rm -f "$HOME/.genesis/last_update_summary.txt"
 # Clean up PID file
 _clear_deploy_state
+
+# ── Browser stack (after the update is recorded done) ─────────────────────
+# Bootstrap defers this step when update.sh runs it (GENESIS_BROWSER_STACK_DEFERRED
+# on the bootstrap call above). It runs HERE, after `_write_state "done"` and the
+# state cleanup, for two reasons: the first upgrade downloads about 2 GB, which
+# must not lengthen the server's stop window (nothing in it needs the server
+# stopped), and while update_state.json says an update is in progress
+# env.update_in_progress() is true and the watchdog will not restart the server,
+# so running it any earlier would leave the server unguarded for the whole
+# download. Non-fatal (`|| echo`, under errexit) so it can never turn a finished,
+# recorded update into a failure; its output is shown in full because
+# bootstrap's is cut to 10 lines, and its last line is the outcome.
+echo "--- Browser stack ---"
+bash "$GENESIS_ROOT/scripts/install_browser_stack.sh" 2>&1 \
+    || echo "  browser stack step did not finish (non-fatal; re-run scripts/install_browser_stack.sh)"
+echo ""
 
 # ── Done ──────────────────────────────────────────────────
 echo "  ──────────────────────────────────────"

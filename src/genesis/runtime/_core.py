@@ -214,6 +214,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         # Optional external OfficeCLI binary (deliverable-builder render backend);
         # resolved by _init_office_deliverables, None when not provisioned.
         self._officecli_path: str | None = None
+        # Installed Camoufox engine directory; resolved by _init_browser_automation,
+        # None when the browser stack is not provisioned.
+        self._browser_engine_path: str | None = None
         self._activity_tracker: ProviderActivityTracker | None = None
         self._span_writer: SpanWriter | None = None
         self._outreach_pipeline: OutreachPipeline | None = None
@@ -495,6 +498,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         # Unconditional (also in readonly probes): optional OfficeCLI render
         # backend. Present → active; absent → degraded (never fatal).
         self._run_init_step("office_deliverables", self._init_office_deliverables)
+        # Unconditional, like office_deliverables: the browser stack is optional
+        # infrastructure. Launchable engine -> active; anything else -> degraded.
+        self._run_init_step("browser_automation", self._init_browser_automation)
 
         if _full:
             await self._run_init_step_async(
@@ -758,6 +764,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         "pipeline": "_pipeline_orchestrator",
         "campaigns": "_campaign_runner",
         "office_deliverables": "_officecli_path",
+        "browser_automation": "_browser_engine_path",
     }
 
     def _run_init_step(self, name: str, func) -> None:

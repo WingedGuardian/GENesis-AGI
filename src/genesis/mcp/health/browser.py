@@ -22,6 +22,7 @@ import os
 import random
 import re
 import signal
+import sys
 import time
 import uuid
 from datetime import UTC, datetime
@@ -84,6 +85,74 @@ _ts_log = _TsLog()
 
 # Prevents concurrent browser init/cleanup races across tool calls.
 _browser_lock = asyncio.Lock()
+
+
+class CamoufoxEngineNotReady(RuntimeError):
+    """Camoufox or its pinned engine is not installed; launching would download."""
+
+
+_BROWSER_DISTS = ("camoufox", "playwright", "patchright")
+
+
+def _installed_browser_versions() -> dict[str, str | None]:
+    from importlib.metadata import PackageNotFoundError, version
+
+    found: dict[str, str | None] = {}
+    for dist in _BROWSER_DISTS:
+        try:
+            found[dist] = version(dist)
+        except PackageNotFoundError:
+            found[dist] = None
+    return found
+
+
+# What was on disk when this process started. A provisioning run that changes
+# these packages under a live session leaves any OLD module this process already
+# imported in sys.modules (playwright arrives with the first web fetch, camoufox
+# with the first launch). The new files then fail in ways reinstalling cannot
+# fix (an ImportError, or old camoufox looking for its engine where the new
+# layout moved it): only a restart loads the new versions.
+_STARTUP_BROWSER_VERSIONS = _installed_browser_versions()
+
+
+class BrowserPackagesChanged(RuntimeError):
+    """Browser packages changed on disk after this process imported them."""
+
+
+def _packages_changed_message() -> str | None:
+    now = _installed_browser_versions()
+    if now == _STARTUP_BROWSER_VERSIONS:
+        return None
+    changed = ", ".join(
+        f"{d} {_STARTUP_BROWSER_VERSIONS[d]} -> {now[d]}"
+        for d in _BROWSER_DISTS
+        if now[d] != _STARTUP_BROWSER_VERSIONS[d]
+    )
+    advice = "Restart this Claude Code session to load them."
+    if any(now[d] is None for d in ("camoufox", "playwright")):
+        advice += " If the browser is still unavailable after that, run scripts/install_browser_stack.sh."
+    else:
+        advice += " Do not reinstall."
+    return f"Browser packages changed after this session started ({changed}). {advice}"
+
+
+def _check_loaded_browser_modules() -> None:
+    """Refuse a launch on modules that no longer match what is on disk."""
+    if not any(d in sys.modules for d in _BROWSER_DISTS):
+        return  # nothing loaded yet: the next import picks up the files on disk
+    message = _packages_changed_message()
+    if message:
+        raise BrowserPackagesChanged(message)
+
+
+def _import_error_message(e: ImportError) -> str:
+    changed = _packages_changed_message()
+    if changed:
+        return f"{changed} (import failed: {e})"
+    return (
+        f"Browser not available: {e}. "
+        "Run scripts/install_browser_stack.sh to install the browser stack."
+    )
 
 _PROFILE_DIR = Path.home() / ".genesis" / "camoufox-profile"
 _CHROMIUM_PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
@@ -240,9 +309,10 @@ async def async_cleanup():
 async def _ensure_browser():
     """Lazily initialize Camoufox (primary browser) with persistent profile.
 
-    Returns the active page. Raises ImportError if camoufox is not installed.
-    In collaborate mode, launches headed on virtual display :99 for VNC sharing.
-    Uses anti-detection Firefox by default for all browsing.
+    Returns the active page. Raises CamoufoxEngineNotReady when the package or
+    its pinned engine is not installed. In collaborate mode, launches headed on
+    virtual display :99 for VNC sharing. Uses anti-detection Firefox by default
+    for all browsing.
 
     Detects stale pages (e.g. browser killed by a concurrent session) and
     automatically cleans up + re-initializes.
@@ -255,6 +325,16 @@ async def _ensure_browser():
                 return _stealth_page
             logger.warning("Camoufox page is stale — restarting browser")
             await async_cleanup()
+
+        # Refuse BEFORE camoufox runs: its launch path deletes a pre-0.5 engine
+        # directory and downloads the pinned build from inside this call, raced
+        # by every session's MCP process. Provisioning is bootstrap's job.
+        from genesis.browser.engine import camoufox_engine_status
+
+        engine = camoufox_engine_status()
+        if not engine.ready:
+            raise CamoufoxEngineNotReady(engine.detail)
+        _check_loaded_browser_modules()
 
         from camoufox.async_api import AsyncCamoufox
 
@@ -286,10 +366,15 @@ async def _ensure_browser():
 
 
 async def _ensure_chromium_fallback():
-    """Lazily initialize Playwright Chromium as fallback browser.
+    """Lazily initialize the Chromium fallback browser (patchright).
 
     Use only when Camoufox fails on a specific site. Persistent profile at
     ~/.genesis/browser-profile/ (separate from Camoufox profile).
+
+    patchright is Playwright with the Chromium automation leaks patched
+    (Runtime.enable, Console.enable, automation command-line flags). It is a
+    drop-in replacement; plain Playwright is used only when patchright is not
+    installed, with a warning, because that Chromium is detectable.
 
     Detects stale pages and automatically re-initializes.
     """
@@ -302,7 +387,15 @@ async def _ensure_chromium_fallback():
             logger.warning("Chromium page is stale — restarting browser")
             await async_cleanup()
 
-        from playwright.async_api import async_playwright
+        _check_loaded_browser_modules()
+        try:
+            from patchright.async_api import async_playwright
+        except ImportError:
+            logger.warning(
+                "patchright is not installed; the Chromium fallback uses plain "
+                "Playwright, which sites can detect. Run scripts/install_browser_stack.sh."
+            )
+            from playwright.async_api import async_playwright
 
         _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -315,7 +408,9 @@ async def _ensure_chromium_fallback():
             headless=False,
             args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
                   "--start-maximized"],
-            viewport={"width": 1280, "height": 720},
+            # patchright's documented stealth setup: no emulated viewport (the
+            # real window size is used) and no custom headers or user agent.
+            no_viewport=True,
         )
         _page = _context.pages[0] if _context.pages else await _context.new_page()
         mode_str = "headed (collaborate)" if _collaborate_mode else "headed"
@@ -2132,8 +2227,12 @@ async def _impl_browser_navigate(
         )
     except ConnectionError as e:
         return {"error": str(e)}
+    except CamoufoxEngineNotReady as e:
+        return {"error": f"Camoufox is not ready: {e}"}
+    except BrowserPackagesChanged as e:
+        return {"error": str(e)}
     except ImportError as e:
-        return {"error": f"Browser not available: {e}. Install with: pip install playwright"}
+        return {"error": _import_error_message(e)}
 
     try:
         # Skip goto only when TinyFish session was JUST created with this URL
@@ -2341,6 +2440,24 @@ async def _impl_browser_snapshot() -> dict:
         return {"error": f"Snapshot failed: {e}"}
 
 
+def _is_patchright_page(page) -> bool:
+    return type(page).__module__.startswith("patchright")
+
+
+async def _evaluate_main_world(page, expression: str):
+    """``page.evaluate`` in the page's own JavaScript world.
+
+    patchright evaluates in an isolated world by default (that is how it avoids
+    the Runtime.enable leak), where the page's own globals are invisible.
+    browser_run_js is documented as the DevTools console, so it asks for the
+    main world explicitly on patchright pages. Internal DOM reads elsewhere in
+    this module are fine in either world: the DOM is shared.
+    """
+    if _is_patchright_page(page):
+        return await page.evaluate(expression, isolated_context=False)
+    return await page.evaluate(expression)
+
+
 async def _impl_browser_run_js(expression: str) -> dict:
     """Execute JavaScript on the current page and return the result.
 
@@ -2357,7 +2474,7 @@ async def _impl_browser_run_js(expression: str) -> dict:
         page = _active_page
     try:
         logger.info("browser_run_js: %s", expression[:200])
-        result = await page.evaluate(expression)
+        result = await _evaluate_main_world(page, expression)
         _update_remote_url()  # JS may cause navigation
         return {"result": result, "url": page.url}
     except Exception as e:

@@ -78,7 +78,10 @@ jobs:
       - name: Install runtime deps + pip-audit
         run: |
           python -m pip install --upgrade pip
-          pip install -e .
+          # [browser] too: bootstrap installs it on every install, so its
+          # packages (camoufox, playwright, patchright) are runtime deps that
+          # need auditing. Python wheels only; no browser binaries download.
+          pip install -e ".[browser]"
           pip install pip-audit
       - name: Audit dependencies for known CVEs
         # STEP level, not job level, and the difference is the whole mechanism.

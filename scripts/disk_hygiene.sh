@@ -288,6 +288,33 @@ prune_guard_corpus() {
         || echo "guard-corpus prune exited $?"
 }
 
+prune_browser_backups() {
+    # scripts/install_browser_stack.sh keeps rollback material when it upgrades
+    # the browser stack: the pre-0.5 Camoufox engine moved aside
+    # (~/.cache/camoufox.pre-0.5-<date>, about 1.3 GB) and copies of each browser
+    # profile taken before a newer engine first opened it
+    # (~/.genesis/<profile>.pre-<label>-<date>, hundreds of MB each). They are
+    # only worth keeping while the new stack might still need rolling back, so
+    # they go after 14 days, and ONLY when the pinned engine is installed
+    # ($2 = "ready": files present; launchability is not stored), so a broken
+    # install keeps its way back. Interrupted copies
+    # (*.tmp) are never a valid backup and go after a day either way.
+    local home="${1:-$HOME}" engine_state="${2:-unknown}"
+    local cache="${XDG_CACHE_HOME:-$home/.cache}"
+    find "$home/.genesis" "$cache" -maxdepth 1 -type d \
+        \( -name 'camoufox*.pre-*.tmp' -o -name 'browser-profile.pre-*.tmp' \) -mtime +1 \
+        -exec rm -rf {} + 2>/dev/null || true
+    if [ "$engine_state" != "ready" ]; then
+        echo "browser backups kept (engine state: $engine_state)"
+        return 0
+    fi
+    find "$cache" -maxdepth 1 -type d -name 'camoufox.pre-0.5*' ! -name '*.tmp' -mtime +14 \
+        -exec rm -rf {} + 2>/dev/null || echo "browser engine backup prune exited $?"
+    find "$home/.genesis" -maxdepth 1 -type d \
+        \( -name 'camoufox-profile.pre-*' -o -name 'browser-profile.pre-*' \) ! -name '*.tmp' \
+        -mtime +14 -exec rm -rf {} + 2>/dev/null || echo "browser profile backup prune exited $?"
+}
+
 main() {
     local disk_reclaim_rc=0
     if [ -z "$VENV_PY" ]; then
@@ -533,6 +560,12 @@ main() {
 
     echo "--- guard replay corpus retention prune (>45d) ---"
     prune_guard_corpus "$HOME/.genesis/output"
+
+    echo "--- browser upgrade backups (>14d, only once the engine is ready) ---"
+    local browser_state
+    browser_state="$("$VENV_PY" -c 'from genesis.browser.engine import camoufox_engine_status as s; print("ready" if s().ready else s().state)' 2>/dev/null)" \
+        || browser_state="unknown"
+    prune_browser_backups "$HOME" "$browser_state"
 
     echo "=== genesis-disk-hygiene done ==="
     return "$disk_reclaim_rc"
