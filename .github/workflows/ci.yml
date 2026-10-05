@@ -1124,16 +1124,15 @@ jobs:
         # 36 cases (0 -> 36). Two native-binary opt-ins skip without the explicit
         # acceptance binary; confirm the skip delta from the hosted junit report.
         # Floor: 24421 + 36 = 24457.
-        # Native CBM runtime/templates: new runtime file 22 and template file 26
+        # Native CBM runtime/templates: new runtime file 24 and template file 26
         # cases, plus template-placeholders 13 -> 14 (+1 hosted slice inventory).
-        # Other edited files retain counts. Floor: 24457 + 49 = 24506;
+        # Other edited files retain counts. Floor: 24457 + 51 = 24508;
         # no new skip sites.
         # Guarded CBM removal: new uninstall file32 cases; other edited test
-        # files retain collection counts. Floor24506+32=24538; no added skips.
+        # files retain collection counts. Floor24508+32=24540; no added skips.
         # Native CBM lifecycle: new lifecycle file31 cases; no added skips.
-        # Floor24538+31=24569; predecessor skip identity gate still applies.
+        # Floor24540+31=24571; predecessor skip identity gate still applies.
         # Managed frontend: actual predecessor launcher39 -> branch35 (-4),
-        # plus28 new frontend cases = net24; two readiness regressions from
-        # the runtime followup give floor24569+24+2=24595.
+        # plus28 new frontend cases = net24; floor24571+24=24595.
         # Replaces legacy fallback/scope smoke premises; no new skip sites.
         run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 24595
