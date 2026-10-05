@@ -41,8 +41,9 @@ def _log_scrapling_unavailable_once() -> None:
     _scrapling_failure_logged = True
     logger.warning(
         "Scrapling is unavailable, so web fetches use plain httpx without TLS "
-        "impersonation. Run scripts/install_browser_stack.sh to install "
-        "the browser extra, which carries Scrapling's fetcher dependencies: %s",
+        "impersonation. Installing the browser extra into Genesis's virtualenv "
+        "(pip install -e '.[browser]' from the Genesis checkout) supplies the "
+        "playwright and browserforge packages that import needs. Import error: %s",
         _SCRAPLING_IMPORT_ERROR,
         exc_info=_SCRAPLING_IMPORT_ERROR,
     )
