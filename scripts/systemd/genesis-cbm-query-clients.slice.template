@@ -1,0 +1,8 @@
+[Unit]
+Description=Genesis managed Codebase frontend aggregate
+
+[Slice]
+MemoryAccounting=yes
+MemoryMax=2G
+MemorySwapMax=0
+TasksMax=512

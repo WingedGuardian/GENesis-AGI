@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Stage immutable, pinned Codebase configuration; diagnose without activation.
+"""Stage immutable Codebase settings and run its bounded native query service.
 
-This command does not render units, start providers, index repositories or remove
-the machine sentinel. Native runtime and lifecycle are separate integration steps.
+Configure does not activate providers, index repositories or remove the machine
+sentinel. Serve/ready are native unit entry points requiring persistent enablement.
 Configuration is published once. Native enablement owns operational state.
 """
 
@@ -13,16 +13,19 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
 import subprocess
 import sys
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from code_intel_cbm_admission import number, resolve_cgroup  # noqa: E402
 from code_intel_cbm_worker import BUILD  # noqa: E402
 
 SCRIPT = Path(__file__).resolve()
@@ -280,6 +283,126 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
     return result
 
 
+def show(unit: str, *properties: str) -> dict[str, str]:
+    output = subprocess.check_output(
+        [
+            "/usr/bin/systemctl",
+            "--user",
+            "show",
+            unit,
+            *(arg for name in properties for arg in ("-p", name)),
+        ],
+        text=True,
+        timeout=30,
+        stderr=subprocess.PIPE,
+    )
+    value = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+    if any(name not in value for name in properties):
+        raise ValueError(f"manager omitted requested properties for {unit}")
+    return value
+
+
+def require_enabled(config: dict) -> None:
+    if show(BACKEND, "UnitFileState")["UnitFileState"] != "enabled":
+        raise ValueError("managed query service must be persistently enabled")
+    if sentinel_armed(config["sentinel"]):
+        raise ValueError("managed Codebase sentinel is armed")
+
+
+def verify_query_boundary(pid: str) -> None:
+    leaf, root, version = resolve_cgroup(
+        Path(f"/proc/{pid}/cgroup"), Path(f"/proc/{pid}/mountinfo")
+    )
+    if version != 2 or leaf == root or leaf.name != BACKEND:
+        raise ValueError("managed daemon is outside its cgroup v2 service")
+    if (leaf / "memory.max").read_text().strip() != str(2 * 1024**3) or (
+        leaf / "memory.swap.max"
+    ).read_text().strip() != "0":
+        raise ValueError("managed daemon lacks exact memory/zero-swap cap")
+    cursor = leaf.parent
+    while cursor == root or root in cursor.parents:
+        try:
+            limit = (cursor / "memory.max").read_text().strip()
+        except FileNotFoundError:
+            if cursor != root:
+                raise
+            limit = "max"  # true cgroup filesystem root has no memory.max
+        if limit != "max" and number(limit, "ancestor memory.max") < 2 * 1024**3:
+            raise ValueError("ancestor cap is smaller than managed query budget")
+        if cursor == root:
+            break
+        cursor = cursor.parent
+
+
+def check_backend(config: dict, *, starting: bool = False) -> str:
+    value = show(BACKEND, "ActiveState", "MainPID")
+    if value["ActiveState"] not in (("active", "activating") if starting else ("active",)):
+        raise ValueError("managed native daemon is unavailable")
+    pid = value["MainPID"]
+    if number(pid, "MainPID") == 0 or not os.path.samefile(f"/proc/{pid}/exe", config["binary"]):
+        raise ValueError("managed native daemon identity mismatch")
+    verify_query_boundary(pid)
+    return pid
+
+
+def ready(config: dict) -> None:
+    require_enabled(config)
+    deadline = time.monotonic() + 60
+    with verified_binary(Path(config["binary"])) as executable:
+        while time.monotonic() < deadline:
+            try:
+                pid = check_backend(config, starting=True)
+                response = subprocess.run(
+                    [f"/proc/self/fd/{executable.fileno()}", "daemon", "status"],
+                    env=native_env(config),
+                    pass_fds=(executable.fileno(),),
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                if (
+                    response.returncode == 0
+                    and "daemon: active (permanent)" in response.stdout
+                    and re.search(r"^  pid: " + re.escape(pid) + r"$", response.stdout, re.M)
+                    and "state: stopping" not in response.stdout
+                    and check_backend(config, starting=True) == pid
+                ):
+                    require_enabled(config)
+                    return
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                pass  # bounded startup polling; deadline is a terminal refusal
+            time.sleep(0.1)
+    raise ValueError("managed native daemon did not become ready")
+
+
+def serve(config: dict) -> None:
+    require_enabled(config)
+    verify_cache(config)
+    verify_query_boundary("self")
+    os.chdir(config["main"])
+    # No shared lifecycle lock here: enable will hold exclusive while it waits
+    # for ExecStartPost readiness. Native startup must not deadlock against it.
+    with verified_binary(Path(config["binary"])) as executable:
+        # The pinned local CLI repairs a dead endpoint generation. Internal
+        # daemon startup alone refuses stale sockets after a prior SIGKILL.
+        subprocess.run(
+            [f"/proc/self/fd/{executable.fileno()}", "config", "get", "auto_index"],
+            env=native_env(config),
+            pass_fds=(executable.fileno(),),
+            stdout=subprocess.DEVNULL,
+            check=True,
+            timeout=45,
+        )
+        require_enabled(config)
+        verify_cache(config)
+        os.set_inheritable(executable.fileno(), True)
+        os.execve(  # noqa: S606 - accepted inode and fixed stock daemon argv
+            f"/proc/self/fd/{executable.fileno()}",
+            [config["binary"], "--cbm-daemon-internal", "--cbm-daemon-permanent"],
+            native_env(config),
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=None)
@@ -288,6 +411,8 @@ def main(argv: list[str] | None = None) -> int:
     for key in ("main", "binary", "state", "sentinel"):
         setup.add_argument("--" + key, required=True)
     commands.add_parser("status")
+    commands.add_parser("serve")
+    commands.add_parser("ready")
     args = parser.parse_args(argv)
     raw = (
         args.config
@@ -304,8 +429,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "configure":
             configure(args, path)
-        else:
+        elif args.command == "status":
             print(json.dumps(status(path), indent=2))
+        else:
+            config = read_settings(path)
+            main = absolute(config["main"]).resolve(strict=True)
+            if main != SCRIPT.parent.parent or not (main / ".git").is_dir():
+                raise ValueError("managed runtime requires its configured primary checkout")
+            (serve if args.command == "serve" else ready)(config)
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
         print(f"managed Codebase refused: {error}", file=sys.stderr)

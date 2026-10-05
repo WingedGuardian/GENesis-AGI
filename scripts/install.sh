@@ -661,25 +661,7 @@ if [ -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ]; then
     . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
     _cbm_disable="$(genesis_cbm_disable_file 2>/dev/null)" || _cbm_disable=""
 fi
-if [ -z "$_cbm_disable" ]; then
-    echo "    NOTE: codebase-memory-mcp kill-switch path unresolvable — refusing install (fail closed)"
-elif [ -e "$_cbm_disable" ]; then
-    echo "    . codebase-memory-mcp install/upgrade skipped (machine kill switch active)"
-else
-    # The pin, the digest and the install itself live in ONE place, shared with
-    # bootstrap.sh, so the commit and its digest cannot drift apart.
-    # shellcheck source=lib/cbm_installer.sh
-    . "$SCRIPT_DIR/lib/cbm_installer.sh"
-    _cbm_rc=0
-    genesis_cbm_install || _cbm_rc=$?
-    case "$_cbm_rc" in
-        0) echo "    + codebase-memory-mcp installed/upgraded" ;;
-        1) echo "    NOTE: codebase-memory-mcp installer download failed (optional)" ;;
-        3) echo "    ERROR: codebase-memory-mcp integrity check failed — the pinned installer does not match the committed digest (see above)" ;;
-        4) echo "    NOTE: codebase-memory-mcp install refused — machine kill switch active" ;;
-        *) echo "    NOTE: codebase-memory-mcp unavailable (optional) — see the error above" ;;
-    esac
-fi
+echo "    Codebase: explicit pinned setup required; see docs/reference/codebase-managed.md"
 
 _GITNEXUS_PIN_READY=0
 _gitnexus_pin_file="$SCRIPT_DIR/lib/gitnexus_version.sh"
@@ -1000,6 +982,13 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
+        case "$svc_name" in
+            genesis-cbm-query.service | genesis-cbm-query-clients.slice)
+                if [[ -L "$target" || ( -e "$target" && ! -f "$target" ) ]]; then
+                    echo "    ERROR: refusing nonregular managed Codebase unit: $target" >&2
+                    exit 1
+                fi ;;
+        esac
         if [ -f "$target" ]; then
             echo "    . $svc_name already exists (not overwriting)"
         else
@@ -1029,6 +1018,9 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             # backslash. `\\\\&` would emit TWO, leaving `&` still meaning "the
             # whole match" — verified by hand, since it looks correct and is not.
             _sed_repl_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+            _systemd_exec_esc() { printf '%s' "$1" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g'; }
+            _home_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$HOME")")
+            _repo_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$REPO_DIR")")
             _home_esc=$(_sed_repl_esc "$HOME")
             _venv_esc=$(_sed_repl_esc "$VENV_PATH")
             _repo_esc=$(_sed_repl_esc "$REPO_DIR")
@@ -1037,6 +1029,8 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             _falkordb_ver_esc=$(_sed_repl_esc "${FALKORDB_VERSION:-4.20.4}")
             _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)")
             sed -e "s|__HOME__|$_home_esc|g" \
+                -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
+                -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \
                 -e "s|__VENV__|$_venv_esc|g" \
                 -e "s|__REPO_DIR__|$_repo_esc|g" \
                 -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \

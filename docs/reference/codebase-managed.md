@@ -1,10 +1,12 @@
 # Managed Codebase configuration staging
 
-`scripts/codebase_managed.py` provides **preparation only**: `configure` stages
+`scripts/codebase_managed.py` provides configuration and native unit entry points: `configure` stages
 a pinned provider and publishes immutable settings; `status` diagnoses settings
-and native service state. This step does not change the existing launcher or
-index queue. Native units, activation and managed execution are subsequent
-integration changes; staging alone does not make Codebase available.
+and native service state. The ordinary install/bootstrap loops render disabled
+query service/client slice templates on every install and do not automatically
+install, upgrade or version-probe a PATH Codebase binary. The existing launcher,
+registration and index queue remain unchanged until their integration concerns.
+Staging and rendering alone do not make Codebase available.
 
 ## Configure
 
@@ -49,6 +51,35 @@ Configuration uses schema 2: paths and build identity, with no mutable `enabled`
 flag. Native systemd enablement will own operational state when lifecycle
 integration lands. The lifecycle lock coordinates cooperating same-user tools;
 it is not protection against deliberate same-user filesystem interference.
+
+## Native query unit entry points
+
+`genesis-cbm-query.service` invokes `serve` and `ready` using the installed
+settings path. These are unit entry points, not substitutes for the forthcoming
+operator lifecycle and managed MCP launcher. They require immutable accepted
+settings, the configured primary checkout, persistent native enablement and a
+definitely absent sentinel. Runtime-only enablement and all other unit file
+states refuse. Nothing automatically enables the service or removes the sentinel.
+
+The query daemon runs in its own cgroup v2 service with exactly 2 GiB memory,
+zero swap, TasksMax 128, CPUQuota 200%, OOMScoreAdjust 500 and control-group
+cleanup. Restart is disabled. Every visible finite ancestor must admit the full
+query budget; unreadable or malformed limits refuse. The aggregate client slice
+has 2 GiB memory, zero swap and TasksMax 512; the frontend integration comes later.
+
+Startup verifies cache flags and the executable inode, uses the pinned native
+local configuration read to repair a stale endpoint generation, then execs the
+stock permanent daemon. It holds no shared lifecycle lock while readiness is
+pending, avoiding a deadlock with a future exclusive enable operation. Readiness
+requires a native connect-only status RPC that names the permanent service PID,
+the correct executable and actual kernel limits. Socket existence is insufficient.
+
+Both ordinary renderer loops substitute quoted Exec paths using separate systemd
+and sed escaping. Whitespace, quote, backslash, dollar, percent, ampersand, pipe
+and Unicode paths retain their literal meaning. A symlink, directory or FIFO at
+either managed template destination is refused before writing; unrelated unit
+and FalkorDB rendering retain their existing behavior. Install preserves an
+existing regular unit; bootstrap updates it through its ordinary rendering loop.
 
 ## Diagnose and recover
 
