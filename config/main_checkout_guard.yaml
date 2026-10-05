@@ -1,0 +1,28 @@
+# Main-checkout guard — refuses a Claude Code session's change to a TRACKED file
+# in this install's primary checkout (the deploy root that hooks, scripts and the
+# server run from). Read by scripts/hooks/main_checkout_guard.py on every
+# Write/Edit/MultiEdit/NotebookEdit and Bash call.
+#
+# Why: a hand edit in the deploy root bypasses review and leaves the tree dirty,
+# which makes scripts/deploy_code_only.sh refuse the next deploy. Changes are made
+# in a worktree from origin/main and reach the deploy root through a merged PR and
+# scripts/deploy_code_only.sh or scripts/update.sh.
+#
+# What is refused: Write/Edit/MultiEdit/NotebookEdit of a tracked file, and from
+# Bash the destinations of cp/mv/install (and mv sources), plus
+# `git checkout <ref> -- <paths>` and `git restore --source=<ref> <paths>` with a
+# ref other than HEAD. Untracked files, linked worktrees, other repositories, the
+# known-ephemeral paths the deploy scripts also tolerate, and discarding an edit
+# back to HEAD or the index (the repair path) are all allowed. Anything the guard
+# cannot evaluate is allowed with a note: it blocks only on a measured tracked
+# file in the primary checkout.
+#
+# The dashboard update pipeline's sessions carry GENESIS_UPDATE_TIER and are
+# allowed, because resolving the update's merge in the deploy root is their job.
+#
+# enabled: master switch. Only the boolean `false` turns the guard off; any other
+# value (including a malformed file) keeps it ON.
+#
+# Read live per tool call — takes effect immediately, no restart. The env kill
+# switch GENESIS_MAIN_CHECKOUT_GUARD=0 also turns it off.
+enabled: true

@@ -271,6 +271,39 @@ def test_registered_guard_command_survives_a_space_in_the_install_root(monkeypat
     )
 
 
+def test_cc_span_settings_registers_the_main_checkout_guard(monkeypatch, tmp_path):
+    """Dispatched sessions get the main-checkout guard on Bash AND the file tools,
+    after the allowlist entry (which the binding check and tests keep at index 0)."""
+    import shlex
+
+    import genesis.cc.invoker as inv_mod
+
+    fake_repo, hook = _fake_genesis_hook_repo(tmp_path)
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(fake_repo))
+    out = tmp_path / "settings.json"
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", out)
+
+    inv_mod.cc_span_settings_path()
+    entries = json.loads(out.read_text())["hooks"]["PreToolUse"]
+    assert shlex.split(entries[0]["hooks"][0]["command"])[1] == inv_mod._ALLOWLIST_GUARD_SCRIPT
+    guard = {
+        e["matcher"]: e["hooks"][0]
+        for e in entries
+        if shlex.split(e["hooks"][0]["command"])[1:] == ["hooks/main_checkout_guard.py"]
+    }
+    assert set(guard) == {"^Bash$", "^(Write|Edit|MultiEdit|NotebookEdit)$"}
+    for h in guard.values():
+        assert shlex.split(h["command"])[0] == str(hook)
+        assert h["timeout"] >= 10
+    # Anchored: each fires on its own tools and not on a longer name (BashOutput).
+    import re
+
+    file_tools = "^(Write|Edit|MultiEdit|NotebookEdit)$"
+    assert all(re.search(file_tools, t) for t in ("Write", "Edit", "MultiEdit", "NotebookEdit"))
+    assert not re.search(file_tools, "EditX")
+    assert not re.search("^Bash$", "BashOutput")
+
+
 def test_bash_allowlist_guard_timeout_is_generous(monkeypatch, tmp_path):
     """A tight timeout on a containment hook converts it into a silent permit.
 

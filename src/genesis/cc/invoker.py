@@ -386,6 +386,10 @@ _CC_SPAN_SETTINGS_PATH = Path.home() / ".genesis" / "cc-span-settings.json"
 # and the pre-launch checks that verify it cannot drift apart.
 _ALLOWLIST_GUARD_SCRIPT = "hooks/bash_allowlist_guard.sh"
 
+# The guard that refuses a change to a tracked file in the install's primary
+# checkout; registered for dispatched sessions by cc_span_settings_path.
+_MAIN_CHECKOUT_GUARD_SCRIPT = "hooks/main_checkout_guard.py"
+
 
 # A sealed `gh` configuration for allowlisted sessions. Shared rather than
 # per-dispatch because its content is derived from the operator's own gh config
@@ -1661,10 +1665,11 @@ def cc_span_settings_path(env_pins: dict[str, str] | None = None) -> str | None:
     this file via ``--settings`` injects JUST these hooks; CC merges them with
     the user's settings, leaving every other hook untouched.
 
-    Two hooks, and BOTH are registered UNCONDITIONALLY because both are
-    documented no-ops unless an environment variable is set — which is what lets
-    this stay a single fixed path written idempotently, with no per-invocation
-    content for two concurrent dispatches to race over:
+    Three hooks, ALL registered UNCONDITIONALLY, which is what lets this stay a
+    single fixed path written idempotently, with no per-invocation content for
+    two concurrent dispatches to race over. The first two are documented no-ops
+    unless an environment variable is set; the third is not a no-op — it is
+    always on, and is here precisely so dispatched sessions get it too:
 
     * ``cc_span_hook`` (PostToolUse) no-ops unless ``GENESIS_TRACE_ID`` is set.
       This is the *single* registration — the repo-level one was removed to
@@ -1679,6 +1684,17 @@ def cc_span_settings_path(env_pins: dict[str, str] | None = None) -> str | None:
       The no-op is cheap but not free: MEASURED ~30ms per Bash call on a live
       install, spent in the launcher rather than the guard, and paid by EVERY
       dispatched session rather than only scoped ones.
+    * ``main_checkout_guard`` (PreToolUse on Bash and on
+      Write/Edit/MultiEdit/NotebookEdit) refuses a change to a TRACKED file in
+      the install's primary checkout — the deploy root — and allows everything
+      else. A dispatched session's cwd is outside any repo, so the repo-level
+      registration of this guard never loads there; without this entry a
+      background session could hand-edit the deployed install unseen. Its
+      off-switches are ``GENESIS_MAIN_CHECKOUT_GUARD=0`` and the
+      ``main_checkout_guard`` settings domain, read by the guard itself, so the
+      registration stays unconditional. A dispatch whose cwd IS a checkout also
+      loads the repo registration, so the guard can run twice there; it only
+      reads, so the second run returns the same verdict.
 
     MEASURED 2026-09-23 on CC 2.1.246, from a dispatch-shaped invocation (cwd
     outside any repo, ``--dangerously-skip-permissions``): a PreToolUse Bash
@@ -1742,6 +1758,26 @@ def cc_span_settings_path(env_pins: dict[str, str] | None = None) -> str | None:
                         },
                     ],
                 },
+                # After the allowlist entry, never ahead of it: the pre-launch
+                # binding check matches that entry by content, and the tests pin
+                # it at index 0. Anchored matchers for the reason given above.
+                # 30s: a killed PreToolUse hook lets the call proceed, and the
+                # guard stops its own git queries at 20s so it can say so.
+                *(
+                    {
+                        "matcher": matcher,
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": shlex.join(
+                                    [str(genesis_hook), _MAIN_CHECKOUT_GUARD_SCRIPT]
+                                ),
+                                "timeout": 30,
+                            },
+                        ],
+                    }
+                    for matcher in ("^Bash$", "^(Write|Edit|MultiEdit|NotebookEdit)$")
+                ),
             ],
             "PostToolUse": [
                 {
@@ -2267,11 +2303,12 @@ class CCInvoker:
         # servers cleanly (probe-verified) — the secure-by-default posture.
         if inv.strict_mcp_config and not inv.bare:
             args.append("--strict-mcp-config")
-        # Register the dispatch hooks (span capture, Bash allowlist enforcement)
-        # for this session. Dispatched sessions run with a cwd outside any git
-        # repo, so CC never loads the repo's .claude/settings.json; --settings
-        # injects just these hooks and CC merges them with the user's settings.
-        # Both no-op unless their env var is set. See cc_span_settings_path.
+        # Register the dispatch hooks (span capture, Bash allowlist enforcement,
+        # the main-checkout guard) for this session. Dispatched sessions run with
+        # a cwd outside any git repo, so CC never loads the repo's
+        # .claude/settings.json; --settings injects just these hooks and CC merges
+        # them with the user's settings. The first two no-op unless their env var
+        # is set; the guard is always on. See cc_span_settings_path.
         # The same file pins the session's credential and confinement env at the
         # settings level, which outranks user and project settings: see
         # _settings_env_pins.

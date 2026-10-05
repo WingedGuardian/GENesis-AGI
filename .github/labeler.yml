@@ -65,6 +65,8 @@ gate-surface:
           - 'scripts/review_findings.py'
           - 'src/genesis/session_awareness/external_review.py'
           - 'src/genesis/session_awareness/external_review_config.py'
+          - 'scripts/hooks/main_checkout_guard.py'
+          - 'config/main_checkout_guard.yaml'
 
 # CI and repository configuration: not hook surface, but a change here can
 # disable a required check as effectively as editing a gate.
