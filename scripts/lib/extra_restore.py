@@ -174,16 +174,34 @@ def cmd_swap(tar: str, stage: str, root: str, target: str, aside: str) -> int:
         _err(f"nothing was extracted for {root}")
         return 5
     _fsync_tree(new)
-    if os.path.lexists(target) and not aside:
+    # An existing EMPTY directory counts as absent (restore.sh passes no aside for it).
+    # It is removed only here, with the restored tree extracted and fsynced, and put
+    # back if the rename fails, so a failed restore never leaves it missing.
+    empty_target = (
+        not aside
+        and os.path.isdir(target)
+        and not os.path.islink(target)
+        and not os.listdir(target)
+    )
+    if os.path.lexists(target) and not aside and not empty_target:
         _err(f"{target} exists and no aside path was given")
         return 5
     moved = False
+    removed_empty = False
     try:
-        if os.path.lexists(target):
+        if empty_target:
+            os.rmdir(target)
+            removed_empty = True
+        elif os.path.lexists(target):
             os.rename(target, aside)
             moved = True
         os.rename(new, target)
     except OSError as e:
+        if removed_empty:
+            try:
+                os.mkdir(target)
+            except OSError as e2:
+                _err(f"could not recreate the empty directory {target}: {e2}")
         if moved:
             try:
                 os.rename(aside, target)

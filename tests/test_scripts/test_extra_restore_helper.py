@@ -163,3 +163,46 @@ def test_root_reads_names_on_any_python(tmp_path, monkeypatch):
     monkeypatch.setattr(er, "_python_is_safe", lambda: False)
     assert er.main(["x", "root", str(t)]) == 0
     assert er.main(["x", "swap", str(t), str(tmp_path), "w", str(tmp_path / "w"), ""]) == 3
+
+
+def test_an_empty_destination_survives_a_failed_rename(tmp_path, monkeypatch):
+    """Codex round 3: an existing empty destination is removed only when the restored
+    tree is ready, and recreated if the rename then fails."""
+    t = tmp_path / "a.tar"
+    with tarfile.open(t, "w") as tf:
+        d = tarfile.TarInfo("w")
+        d.type = tarfile.DIRTYPE
+        d.mode = 0o755
+        tf.addfile(d)
+        tf.addfile(tarfile.TarInfo("w/f"), io.BytesIO(b""))
+    target = tmp_path / "w"
+    target.mkdir()
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    real_rename = er.os.rename
+
+    def failing_rename(src, dst):
+        if str(dst) == str(target):
+            raise OSError(28, "ENOSPC")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(er.os, "rename", failing_rename)
+    assert er.cmd_swap(str(t), str(stage), "w", str(target), "") == 5
+    assert target.is_dir() and not any(target.iterdir())
+
+
+def test_an_empty_destination_is_replaced(tmp_path):
+    t = tmp_path / "a.tar"
+    with tarfile.open(t, "w") as tf:
+        d = tarfile.TarInfo("w")
+        d.type = tarfile.DIRTYPE
+        d.mode = 0o755
+        tf.addfile(d)
+        f = tarfile.TarInfo("w/f")
+        f.size = 1
+        tf.addfile(f, io.BytesIO(b"x"))
+    (tmp_path / "w").mkdir()
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    assert er.cmd_swap(str(t), str(stage), "w", str(tmp_path / "w"), "") == 0
+    assert (tmp_path / "w" / "f").read_bytes() == b"x"

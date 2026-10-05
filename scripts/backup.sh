@@ -1268,6 +1268,8 @@ else
                 # (restore would then skip the core data too), but it does mark the off-site
                 # copy unconfirmed below (tier2_status=partial, offsite_confirmed=false).
                 log "WARNING: off-site upload failed for extra/${fname} (core snapshot still COMPLETE)"
+                # Named in COMPLETE (written after this loop) so restore reports the gap.
+                _EXTRA_SKIP_LABELS+=("${fname} (upload failed)")
                 _EXTRA_UPLOAD_FAILED=$((_EXTRA_UPLOAD_FAILED + 1))
             fi
         done

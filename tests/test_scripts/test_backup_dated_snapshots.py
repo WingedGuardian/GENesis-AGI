@@ -469,6 +469,9 @@ def test_extra_upload_failure_keeps_complete_but_marks_offsite_unconfirmed(backu
     assert "extra dirs are incomplete (0 not archived, 1 not uploaded)" in proc.stdout, proc.stdout[
         -1500:
     ]
+    # Codex round 3: the failed upload is named in COMPLETE, so restore reports the gap.
+    lines = (snap / "COMPLETE").read_text().splitlines()
+    assert any(ln.startswith("skipped ") and ln.endswith("(upload failed)") for ln in lines), lines
 
 
 def _next_second() -> None:
@@ -615,6 +618,7 @@ def test_extra_round_trip_real_backup_into_real_restore_keeps_links(backup_env, 
     )
     assert "extra archive refused" not in r.stdout, r.stdout
     t = fresh / "work" / "tool"
+    assert (t / "a.txt").exists(), r.stdout[-3000:]
     assert (t / "a.txt").read_text() == "alpha\n" and (
         t / "a-hardlink.txt"
     ).read_text() == "alpha\n"

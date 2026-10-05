@@ -749,3 +749,35 @@ def test_extra_read_only_root_restores_and_the_restore_carries_on(restore_sandbo
         for p in sb["home"].rglob("*"):
             if p.is_dir() and not p.is_symlink():
                 p.chmod(0o755)
+
+
+def test_extra_empty_destination_is_kept_when_the_restore_fails(restore_sandbox):
+    """Codex round 3: an existing empty destination is not removed before the
+    replacement is ready. Extraction fails here (a file `x`, then a directory under
+    it), with the parent writable, and the empty destination must still be there."""
+    sb = restore_sandbox
+    store = sb["home"] / "work" / "store"
+    store.mkdir(parents=True)
+    _seed_tree_archive(
+        sb,
+        "work_store-abcd1234",
+        [
+            ("work/store", "dir", 0o755, b""),
+            ("work/store/x", "file", 0o644, b""),
+            ("work/store/x/y", "dir", 0o755, b""),
+        ],
+    )
+    proc = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(sb["backup"])],
+        env={
+            **sb["env"],
+            "GENESIS_BACKUP_PASSPHRASE": _TEST_PASSPHRASE,
+            "GNUPGHOME": str(sb["home"] / ".gnupg"),
+        },
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert "could not be restored" in proc.stdout, proc.stdout[-1500:]
+    assert store.is_dir(), "the empty destination was removed by a failed restore"
+    assert not list(sb["home"].rglob("*.restore.*"))

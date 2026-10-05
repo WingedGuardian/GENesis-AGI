@@ -1338,8 +1338,9 @@ if find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2
             continue
         fi
         _xt_aside=""
-        if [ -d "$_xt_target" ] && rmdir -- "$_xt_target" 2>/dev/null; then
-            :  # an empty directory (e.g. created by bootstrap) counts as absent
+        if [ -d "$_xt_target" ] && [ -z "$(ls -A -- "$_xt_target" 2>/dev/null)" ]; then
+            :  # an empty directory (e.g. created by bootstrap) counts as absent; the helper
+               # removes it only once the restored tree is ready to take its place
         elif [ -e "$_xt_target" ]; then
             if ! $FORCE; then
                 _xt_skip "extra archive $name: ~/$_xt_root exists and was not replaced (re-run with --force; the current one is then moved aside)"
