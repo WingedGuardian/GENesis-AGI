@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import stat
 import subprocess
 import sys
@@ -232,9 +231,22 @@ def station(tmp_path):
     manifest.write_text('{"pid": 1111, "manifest": {"db": "ok", "perception": "ok"}}')
     # curl answers per $CURL_RC, and records whether the deploy marker was held
     # at the moment the health check ran.
+    #
+    # The in-flight query (GET /api/genesis/inflight) is answered apart from the
+    # health check: $INFLIGHT_CODE (default 200; 000 = no answer at all) and the
+    # body in $INFLIGHT_FILE (default: nothing in flight). The headers it was sent
+    # on stdin are kept in inflight_headers.
     exec_file(
         shims / "curl",
         "#!/bin/bash\n"
+        'if [[ " $* " == *"/api/genesis/inflight"* ]]; then\n'
+        f'  printf "%s\\n" "$*" >> "{tmp_path}/inflight_args"\n'
+        f'  cat > "{tmp_path}/inflight_headers"\n'
+        '  code="${INFLIGHT_CODE:-200}"\n'
+        '  [ "$code" = 000 ] && exit 7\n'
+        '  if [ -n "${INFLIGHT_FILE:-}" ]; then cat "$INFLIGHT_FILE"; else printf \'{"items": []}\'; fi\n'
+        '  printf "\\n%s" "$code"; exit 0\n'
+        "fi\n"
         f'[ -f "{marker}" ] && echo held >> "{tmp_path}/marker_seen"\n'
         f'printf "%s\\n" "$*" >> "{tmp_path}/curl_args"\n'
         "exit ${CURL_RC:-0}\n",
@@ -245,11 +257,15 @@ def station(tmp_path):
     # the restarted unit, $NEW_PID or 2222); $PROBE_NONE = nothing listening;
     # $PROBE_FOREIGN_TOO = a second listener held by another process. Exit 0
     # means "every listener on the port is <pid>'s". Never the real probe: the
-    # live server listens on that port.
+    # live server listens on that port. The RUNNING server ($MAIN_PID, 1111 by
+    # default, before any restart) owns the port unless $PROBE_SERVER_FOREIGN: the restart refusal
+    # checks that before it hands the server the token or believes its answer.
     probe = tmp_path / "port_probe.py"
     probe.write_text(
         "import os, sys\n"
         "pid = sys.argv[2]\n"
+        "if pid == os.environ.get('MAIN_PID', '1111'):\n"
+        "    sys.exit(1 if os.environ.get('PROBE_SERVER_FOREIGN') else 0)\n"
         "if os.environ.get('PROBE_NONE') or os.environ.get('PROBE_FOREIGN_TOO'):\n"
         "    sys.exit(1)\n"
         "owner = os.environ.get('PROBE_OWNER') or os.environ.get('NEW_PID') or '2222'\n"
@@ -299,21 +315,10 @@ def station(tmp_path):
     fake_proc = tmp_path / "proc"
     fake_proc.mkdir()
     (fake_proc / "stat").write_text(f"cpu 0\nbtime {int(time.time()) - 3600}\n")
-    # The session table: present and empty, with the columns the check reads. A
-    # test adds rows with session_row(); one that wants it unreadable points
-    # GENESIS_DEPLOY_DB elsewhere.
-    db = tmp_path / "genesis.db"
-    con = sqlite3.connect(db)
-    con.execute(
-        "CREATE TABLE cc_sessions (id TEXT, session_type TEXT, status TEXT,"
-        " source_tag TEXT, started_at TEXT)"
-    )
-    con.commit()
-    con.close()
-    env.update(
-        GENESIS_DEPLOY_PROC_ROOT=str(fake_proc),
-        GENESIS_DEPLOY_DB=str(db),
-    )
+    env.update(GENESIS_DEPLOY_PROC_ROOT=str(fake_proc))
+    # The internal API token the server writes at boot: the in-flight query sends
+    # it (the curl shim keeps what it was sent).
+    (home / ".genesis" / "internal_api_token").write_text("station-token\n")
     # A second layer under the systemctl shim: the user bus points at an empty
     # directory, so a code path that bypasses the shim gets "Failed to connect to
     # bus" (MEASURED, systemd 255) instead of stopping the live server. A
@@ -367,28 +372,12 @@ def fake_proc_entry(
     (d / "cmdline").write_bytes(b"\x00".join(a.encode() for a in argv) + b"\x00")
 
 
-def session_row(
-    st,
-    sid: str,
-    *,
-    session_type: str = "background_task",
-    status: str = "active",
-    source_tag: str = "direct_session",
-    started: float | None = None,
-) -> None:
-    """Add a cc_sessions row, started at *started* (unix). The default is a
-    minute from now: the shim's boot time sits a second after the fixture's last
-    commit, so "now" can still fall before it, and a row from before the boot is a
-    leftover the check ignores."""
-    when = time.time() + 60 if started is None else started
-    iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(when)) + ".123456+00:00"
-    con = sqlite3.connect(st["tmp"] / "genesis.db")
-    con.execute(
-        "INSERT INTO cc_sessions VALUES (?, ?, ?, ?, ?)",
-        (sid, session_type, status, source_tag, iso),
-    )
-    con.commit()
-    con.close()
+def inflight_report(st, items: list[dict]) -> dict:
+    """Make the curl shim report *items* as the server's in-flight work; returns
+    the env to run with."""
+    path = st["tmp"] / "inflight.json"
+    path.write_text(json.dumps({"items": items}))
+    return {**st["env"], "INFLIGHT_FILE": str(path)}
 
 
 _ADVANCES = [0]

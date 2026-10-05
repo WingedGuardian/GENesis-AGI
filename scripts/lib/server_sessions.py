@@ -1,7 +1,7 @@
 """Which Claude Code sessions would a genesis-server restart end?
 
 Usage: server_sessions.py <server_pid> [proc_root [caller_pid]]
-       server_sessions.py --rows <db_path> <server_boot_unix>
+       server_sessions.py --inflight < <the server's /api/genesis/inflight JSON>
 
 The first form prints one line per live Claude Code process DESCENDED from
 <server_pid> (a zombie, exited but not yet reaped, is not live):
@@ -15,22 +15,19 @@ would end. <start> is the process's start time in clock ticks since host boot
 the pid is reused. Exits 2 when <proc_root> (default /proc) cannot be listed at
 all, so the caller cannot tell; the caller decides what that means.
 
-The second form prints one line per background session the CURRENT server boot
-is still running, from the cc_sessions table:
+The second form reads the server's own account of the work a restart would
+cancel (genesis.util.inflight: every Claude invocation, plus the whole life of
+a dispatched session or a CLI reflection, from before its Claude process starts
+to after its result is delivered) and prints one line per item:
 
-    <session id, or ->\\t<source tag>\\t<started_at>
+    <id, or ->\\t<kind>\\t<label>\\t<seconds running>
 
-and exits 2 when the table cannot be read. A dispatched session or a reflection
-holds its row from before its Claude process starts until after it exits (the
-result is stored, audited and delivered), and a restart cancels it anywhere in
-that span, so its row, not its process, is the session's lifetime. A row still
-"active" from an EARLIER boot is a leftover (a clean stop marks dispatched work
-failed; a reflection cancelled mid-run never closes its row), so only rows
-started since <server_boot_unix> count. Telegram turns are not here: their rows
-are long-lived conversations, and the process scan sees an in-flight turn.
-Text is printed as one bounded printable line per field (other callers write
-it, and whoever decides on the override reads it); a session id is printed only
-when it is uuid-shaped, since the override names sessions by it.
+capped at 20 items plus a final ``more\\t<count>\\t-\\t-`` line, and exits 2 when
+the input is not that report. Text is printed as one bounded printable line per
+field (the caller shows it to whoever decides on the override), and an id only
+when it has the shape the override accepts, since the override names items by
+it. The server's account is the authority; the process scan stays beside it as
+a check that needs nothing from the server.
 
 Why descendants of the server, and not a marker or a table:
 
@@ -46,11 +43,12 @@ Why descendants of the server, and not a marker or a table:
   detached hook workers that a restart never touches. ``/proc/<pid>/environ`` is
   also ptrace-gated (``src/genesis/cc/slot_liveness.py``), so reading it would fail
   for exactly the processes that matter.
-* The ``cc_sessions`` table cannot replace the scan: dispatched-task rows record
-  no pid (0 of 144 on a live install) and reflection rows only sometimes (28 of
-  83), while Telegram turns are stored as ``foreground``. MEASURED 2026-10-04.
-  It complements it (the --rows form): a background session lives longer than
-  its Claude process.
+* The ``cc_sessions`` table cannot answer it either: dispatched-task rows record
+  no pid (0 of 144 on a live install), Telegram turns are stored as
+  ``foreground``, and a session's row is marked completed before its result is
+  delivered, which a restart also cancels. MEASURED / READ 2026-10-04. The
+  server's own in-flight report (the --inflight form) is what covers a session's
+  whole life.
 
 The claude-process rules below are a COPY of ``src/genesis/cc/slot_liveness.py``
 (this file is stdlib-only and runs before the venv is trusted, so it cannot import
@@ -59,13 +57,12 @@ The claude-process rules below are a COPY of ``src/genesis/cc/slot_liveness.py``
 
 from __future__ import annotations
 
+import json
 import os
 import re
-import sqlite3
 import string
 import sys
 import time
-import urllib.parse
 from pathlib import Path
 
 _CLAUDE_NAMES = frozenset({b"claude", b"claude.exe", b"claude-code"})
@@ -78,8 +75,10 @@ _ID_CHARS = frozenset(string.hexdigits + "-")
 # A process that has exited but not been reaped (Z), or is being torn down (X, x),
 # has no work left to lose and cannot be killed.
 _DEAD_STATES = frozenset({b"Z", b"X", b"x"})
-_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-_MAX_ROWS = 20
+# What an in-flight item's id must look like to be printed (and so overridable):
+# deploy_code_only.sh validates --allow-killing items against the same shape.
+_ITEM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}")
+_MAX_ITEMS = 20
 
 
 def _read(path: Path) -> bytes | None:
@@ -223,58 +222,53 @@ def _clean(value: object, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
-def server_rows(db_path: str, boot_unix: int) -> list[tuple[str, str, str]] | None:
-    """``(session id or "-", source tag, started_at)`` for each background session
-    started since *boot_unix* and still active, or None when the table cannot be
-    read. Sanitized for printing; capped (the caller is told how many more)."""
-    # The table's started_at is ISO UTC with microseconds ("...T21:41:42.123456+00:00").
-    since = time.strftime("%Y-%m-%dT%H:%M:%S.000000+00:00", time.gmtime(boot_unix))
+def inflight_items(raw: str, now: float | None = None) -> list[tuple[str, str, str, int]] | None:
+    """``(id or "-", kind, label, seconds running)`` for each item in the
+    server's in-flight report, oldest first, sanitized for printing; None when
+    *raw* is not that report."""
     try:
-        con = sqlite3.connect(
-            "file:" + urllib.parse.quote(db_path) + "?mode=ro", uri=True, timeout=2
-        )
-        try:
-            rows = con.execute(
-                "SELECT id, COALESCE(source_tag, ?), started_at FROM cc_sessions "
-                "WHERE status = ? AND session_type IN (?, ?) AND started_at >= ? "
-                "ORDER BY started_at",
-                ("", "active", "background_task", "background_reflection", since),
-            ).fetchall()
-        finally:
-            con.close()
-    except sqlite3.Error:
+        doc = json.loads(raw)
+        items = doc["items"]
+        if not isinstance(items, list):
+            return None
+    except (ValueError, KeyError, TypeError):
         return None
+    now = time.time() if now is None else now
     out = []
-    for rid, tag, started in rows:
-        rid_text = str(rid)
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        iid = str(item.get("id", ""))
+        try:
+            age = max(0, int(now - float(item.get("started_at", now))))
+        except (TypeError, ValueError):
+            age = 0
         out.append(
             (
-                rid_text if _UUID.fullmatch(rid_text) else "-",
-                _clean(tag, 60),
-                _clean(started, 40),
+                iid if _ITEM_ID.fullmatch(iid) else "-",
+                _clean(item.get("kind", ""), 30),
+                _clean(item.get("label", ""), 80),
+                age,
             )
         )
     return out
 
 
-def _rows_main(argv: list[str]) -> int:
-    if len(argv) != 4 or not argv[3].isdigit():
-        print("usage: server_sessions.py --rows <db_path> <server_boot_unix>", file=sys.stderr)
+def _inflight_main() -> int:
+    items = inflight_items(sys.stdin.read())
+    if items is None:
+        print("not an in-flight report", file=sys.stderr)
         return 2
-    rows = server_rows(argv[2], int(argv[3]))
-    if rows is None:
-        print("cannot read the cc_sessions table", file=sys.stderr)
-        return 2
-    for rid, tag, started in rows[:_MAX_ROWS]:
-        print(f"{rid}\t{tag}\t{started}")
-    if len(rows) > _MAX_ROWS:
-        print(f"more\t{len(rows) - _MAX_ROWS}\t-")
+    for iid, kind, label, age in items[:_MAX_ITEMS]:
+        print(f"{iid}\t{kind}\t{label}\t{age}")
+    if len(items) > _MAX_ITEMS:
+        print(f"more\t{len(items) - _MAX_ITEMS}\t-\t-")
     return 0
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) >= 2 and argv[1] == "--rows":
-        return _rows_main(argv)
+    if argv[1:] == ["--inflight"]:
+        return _inflight_main()
     if (
         len(argv) not in (2, 3, 4)
         or not argv[1].isdigit()

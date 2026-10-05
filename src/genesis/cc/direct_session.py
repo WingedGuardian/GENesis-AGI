@@ -45,6 +45,7 @@ from genesis.cc.types import (
     origin_delivery_supported,
 )
 from genesis.observability.session_context import set_session_id as _set_obs_session
+from genesis.util.inflight import inflight
 from genesis.util.tasks import tracked_task
 
 if TYPE_CHECKING:
@@ -365,17 +366,27 @@ PROFILES: dict[str, list[str]] = {
         + _NO_OPEN_QUESTION_RAISE  # observe is read-only: no question rows either
     ),
     "interact": (
-        _UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES + _NO_MARKETING_SEND
-        + _NO_OUTREACH_QUEUE_CONTROL + _NO_OPEN_QUESTION_READS
+        _UNIVERSAL_DISALLOW
+        + _NO_OUTREACH_ENGAGEMENT
+        + _NO_RECON_WRITES
+        + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
+        + _NO_OPEN_QUESTION_READS
     ),
     "research": (
-        _UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION + _NO_MARKETING_SEND
-        + _NO_OUTREACH_QUEUE_CONTROL + _NO_OPEN_QUESTION_READS
+        _UNIVERSAL_DISALLOW
+        + _NO_OUTREACH_SEND
+        + _NO_BROWSER_INTERACTION
+        + _NO_MARKETING_SEND
+        + _NO_OUTREACH_QUEUE_CONTROL
+        + _NO_OPEN_QUESTION_READS
     ),
     # `campaign` is the ONLY profile that may call marketing_send — the intended
     # autonomous cold-marketing caller. Every other profile denies it above/below.
     "campaign": (
-        _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION + _NO_OUTREACH_QUEUE_CONTROL
+        _UNIVERSAL_DISALLOW
+        + _NO_BROWSER_INTERACTION
+        + _NO_OUTREACH_QUEUE_CONTROL
         + _NO_OPEN_QUESTION_READS
     ),
     # NO PROFILE SHIPS WITH Bash. A `steward` profile did until 2026-09-26 — the
@@ -410,7 +421,6 @@ PROFILES: dict[str, list[str]] = {
     # the coverage test in tests/test_cc/test_direct_session_profiles.py are
     # where it has to be classified.
     #
-
     # ── Community responder profile ─────────────────────────────
     # Reactive community responder: reads a community's channels and replies
     # via the discord-bot MCP server. MCP config loads discord-bot + health +
@@ -1000,7 +1010,7 @@ class DirectSessionRunner:
         session_id = session["id"]
 
         task = tracked_task(
-            self._run_session(request, session_id),
+            self._run_session_registered(request, session_id),
             name=f"direct-session-{session_id[:8]}",
         )
         self._active[session_id] = task
@@ -1009,6 +1019,19 @@ class DirectSessionRunner:
 
     def active_count(self) -> int:
         return len(self._active)
+
+    async def _run_session_registered(
+        self,
+        request: DirectSessionRequest,
+        session_id: str,
+    ) -> DirectSessionResult:
+        """``_run_session`` registered as in-flight work for its WHOLE life: the
+        wait for a runner slot, the Claude run, and the storing, auditing and
+        delivery after it. ``shutdown`` cancels it anywhere in that span, so a
+        restart asks about all of it (genesis.util.inflight)."""
+        label = f"{request.source_tag or 'direct_session'} ({request.profile})"
+        with inflight("direct_session", label, item_id=session_id):
+            return await self._run_session(request, session_id)
 
     async def shutdown(self, *, grace_s: float = 10.0) -> int:
         """Cancel in-flight session tasks and await their handlers.

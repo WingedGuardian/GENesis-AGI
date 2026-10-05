@@ -204,95 +204,65 @@ def test_a_dead_claude_process_is_not_a_session(root, state):
     assert [f[0] for f in _found(root, 1111)] == [5001]
 
 
-# -- the --rows form: background sessions this server boot still runs ---------
-BOOT = 1_790_000_000
-
-
-def _iso(unix: float) -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(unix)) + ".123456+00:00"
-
-
-@pytest.fixture()
-def db(tmp_path):
-    import sqlite3
-
-    path = tmp_path / "genesis.db"
-    con = sqlite3.connect(path)
-    con.execute(
-        "CREATE TABLE cc_sessions (id TEXT, session_type TEXT, status TEXT,"
-        " source_tag TEXT, started_at TEXT)"
-    )
-    con.commit()
-    con.close()
-    return path
-
-
-def _add(db, *rows) -> None:
-    import sqlite3
-
-    con = sqlite3.connect(db)
-    con.executemany("INSERT INTO cc_sessions VALUES (?, ?, ?, ?, ?)", rows)
-    con.commit()
-    con.close()
-
-
-U1 = "11111111-2222-4333-8444-555555555555"
-U2 = "66666666-7777-4888-8999-aaaaaaaaaaaa"
-
-
-def test_rows_are_active_background_sessions_of_this_boot(db):
-    _add(
-        db,
-        (U1, "background_task", "active", "direct_session", _iso(BOOT + 5)),
-        (U2, "background_reflection", "active", "reflection_deep", _iso(BOOT + 0.5)),
-        ("old", "background_task", "active", "direct_session", _iso(BOOT - 1)),
-        ("done", "background_task", "completed", "direct_session", _iso(BOOT + 9)),
-        ("fg", "foreground", "active", "", _iso(BOOT + 9)),
-    )
-    assert ss.server_rows(str(db), BOOT) == [
-        (U2, "reflection_deep", _iso(BOOT + 0.5)),
-        (U1, "direct_session", _iso(BOOT + 5)),
-    ]
-
-
-def test_a_row_started_in_the_boot_second_counts(db):
-    _add(db, (U1, "background_task", "active", "t", _iso(BOOT)))
-    assert [r[0] for r in ss.server_rows(str(db), BOOT)] == [U1]
-
-
-def test_row_text_is_sanitized_and_a_non_uuid_id_is_withheld(db):
-    _add(db, ("x; rm -rf /", "background_task", "active", "a\nb\x1bc" + "z" * 200, _iso(BOOT + 1)))
-    ((rid, tag, _started),) = ss.server_rows(str(db), BOOT)
-    assert rid == "-"
-    assert "\n" not in tag and "\x1b" not in tag and len(tag) <= 60
-
-
-def test_the_rows_cli_caps_its_output_and_exits_2_when_unreadable(db, tmp_path):
-    _add(
-        db,
-        *[
-            (
-                f"{i:08d}-0000-4000-8000-000000000000",
-                "background_task",
-                "active",
-                "t",
-                _iso(BOOT + 1 + i),
-            )
-            for i in range(23)
-        ],
-    )
-    r = subprocess.run(
-        [sys.executable, "-I", "-S", str(LIB), "--rows", str(db), str(BOOT)],
+# -- the --inflight form: the server's own account of the work it would cancel --
+def _run_inflight(raw: str):
+    return subprocess.run(
+        [sys.executable, "-I", "-S", str(LIB), "--inflight"],
+        input=raw,
         capture_output=True,
         text=True,
     )
+
+
+def test_inflight_items_are_printed_oldest_first_with_their_age():
+    import json
+
+    now = 1_790_000_000.0
+    doc = {
+        "items": [
+            {"id": "claude-7", "kind": "claude", "label": "sonnet", "started_at": now - 30},
+            {
+                "id": "d59a5284-9469-4d40-8324-10dee749a1c8",
+                "kind": "direct_session",
+                "label": "direct_session (observe)",
+                "started_at": now - 600,
+            },
+        ]
+    }
+    assert ss.inflight_items(json.dumps(doc), now=now) == [
+        ("claude-7", "claude", "sonnet", 30),
+        ("d59a5284-9469-4d40-8324-10dee749a1c8", "direct_session", "direct_session (observe)", 600),
+    ]
+
+
+def test_inflight_text_is_sanitized_and_an_unnameable_id_is_withheld():
+    import json
+
+    doc = {
+        "items": [
+            {"id": "x; rm -rf /", "kind": "k\nk", "label": "a\nb\x1bc" + "z" * 200, "started_at": 0}
+        ]
+    }
+    ((iid, kind, label, _age),) = ss.inflight_items(json.dumps(doc), now=10)
+    assert iid == "-"
+    assert "\n" not in kind and "\n" not in label and "\x1b" not in label and len(label) <= 80
+
+
+@pytest.mark.parametrize(
+    "raw", ["", "nope", "[]", '{"items": 3}', '{"other": []}', '{"items": [7]}']
+)
+def test_anything_but_the_report_exits_2(raw):
+    r = _run_inflight(raw)
+    assert r.returncode == 2 and r.stdout == "", (raw, r.stdout)
+
+
+def test_the_inflight_cli_caps_its_output():
+    import json
+
+    items = [
+        {"id": f"claude-{i}", "kind": "claude", "label": "x", "started_at": 0} for i in range(23)
+    ]
+    r = _run_inflight(json.dumps({"items": items}))
     lines = r.stdout.splitlines()
     assert r.returncode == 0 and len(lines) == 21
-    assert lines[-1] == "more\t3\t-"
-    for bad in (tmp_path / "missing.db", tmp_path):
-        b = subprocess.run(
-            [sys.executable, "-I", "-S", str(LIB), "--rows", str(bad), str(BOOT)],
-            capture_output=True,
-            text=True,
-        )
-        assert b.returncode == 2 and b.stdout == "", bad
+    assert lines[-1] == "more\t3\t-\t-"

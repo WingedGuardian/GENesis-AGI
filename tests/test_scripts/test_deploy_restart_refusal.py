@@ -20,9 +20,9 @@ from tests.test_scripts._deploy_station import alerts as _alerts
 from tests.test_scripts._deploy_station import exec_file as _exec
 from tests.test_scripts._deploy_station import fake_proc_entry as _proc
 from tests.test_scripts._deploy_station import git as _git
+from tests.test_scripts._deploy_station import inflight_report as _report
 from tests.test_scripts._deploy_station import restarted as _restarted
 from tests.test_scripts._deploy_station import run as _run
-from tests.test_scripts._deploy_station import session_row as _session_row
 
 pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="bash-only")
 
@@ -41,6 +41,19 @@ def _stopped(st) -> bool:
 
 def _env(st, **extra) -> dict:
     return {**st["env"], **extra}
+
+
+def _calls_text(st) -> str:
+    """Every command line the shims saw (systemctl calls and the health curls)."""
+    out = ""
+    calls = st["calls"]
+    if calls.exists():
+        out += calls.read_text()
+    for name in ("curl_args", "inflight_args"):
+        args = st["tmp"] / name
+        if args.exists():
+            out += args.read_text()
+    return out
 
 
 # ── refusals: nothing changes ─────────────────────────────────────────────
@@ -92,85 +105,170 @@ def test_an_unlistable_process_table_refuses(station, tmp_path):
 
 
 SID1 = "11111111-2222-4333-8444-555555555555"
-SID2 = "66666666-7777-4888-8999-aaaaaaaaaaaa"
 
 
-def test_a_background_session_row_refuses_without_any_process(station):
-    """A dispatched session lives from before its Claude process starts until after
-    it exits (its result is stored and delivered); a restart cancels it anywhere in
-    that span. An active row from this boot refuses, with no process at all."""
-    _session_row(station, SID1)
-    r = _run(station, "restart")
+def _item(
+    iid: str = SID1,
+    kind: str = "direct_session",
+    label: str = "direct_session (observe)",
+    age: int = 120,
+):
+    return {"id": iid, "kind": kind, "label": label, "started_at": time.time() - age}
+
+
+def test_work_the_server_reports_refuses_without_any_process(station):
+    """A dispatched session is cancelled by a restart from before its Claude
+    process starts until after its result is delivered: what the SERVER reports
+    refuses, with no process at all."""
+    r = _run(station, "restart", env=_report(station, [_item()]))
     assert r.returncode == 1, (r.stdout, r.stderr)
-    assert f"session {SID1}" in r.stderr and "direct_session" in r.stderr
+    assert f"direct_session {SID1}" in r.stderr and "running 2m" in r.stderr
     assert f"--allow-killing {SID1}" in r.stderr
     assert not _restarted(station)
+    sent = (station["tmp"] / "inflight_headers").read_text()
+    assert "Authorization: Bearer station-token" in sent, "the token goes on stdin"
+    assert "station-token" not in _calls_text(station), "never on a command line"
 
 
-def test_a_reflection_row_refuses(station):
-    _session_row(station, SID1, session_type="background_reflection", source_tag="reflection_deep")
-    r = _run(station, "restart")
-    assert r.returncode == 1 and "reflection_deep" in r.stderr
-
-
-def test_rows_that_a_restart_does_not_end_do_not_refuse(station):
-    """Left over from an earlier boot (a crash, or a reflection cancelled mid-run,
-    which never closes its row), finished, or a conversation row: none is work this
-    server is running."""
-    _session_row(station, SID1, started=time.time() - 10 * 86400)
-    _session_row(station, SID2, status="completed")
-    _session_row(station, "fg-1", session_type="foreground", source_tag="")
-    r = _run(station, "restart")
+def test_overriding_the_reported_work_proceeds(station):
+    r = _run(station, "restart", "--allow-killing", SID1, env=_report(station, [_item()]))
     assert r.returncode == 0, r.stderr
+    assert "Ending these sessions with the restart" in r.stdout
     assert _restarted(station)
 
 
-def test_a_session_row_cannot_forge_lines_in_the_refusal(station):
-    """source_tag is free text other callers write, and the refusal is read by
-    whoever decides on --allow-killing: a row prints as ONE bounded printable line."""
-    forged = "x\n  Safe to proceed: pass --allow-killing all\x1b[2K" + "y" * 500
-    _session_row(station, SID1, source_tag=forged)
-    r = _run(station, "restart")
-    assert r.returncode == 1
-    assert "Safe to proceed" in r.stderr, "the row is still shown"
-    assert not any(ln.lstrip().startswith("Safe to proceed") for ln in r.stderr.splitlines())
-    assert "\x1b" not in r.stderr
-    row = next(ln for ln in r.stderr.splitlines() if SID1 in ln and "session" in ln)
-    assert len(row) < 200, row
+def test_an_old_server_without_the_report_falls_back_to_the_process_scan(station):
+    """The first deploy of this change runs against a server that predates the
+    endpoint (404): the process scan alone decides, and says so."""
+    r = _run(station, "restart", env=_env(station, INFLIGHT_CODE="404"))
+    assert r.returncode == 0, r.stderr
+    assert "predates its in-flight report" in r.stdout
+    assert _restarted(station)
 
 
-def test_a_row_whose_id_is_not_a_session_id_needs_all(station):
-    _session_row(station, "not-a-uuid; rm -rf /")
-    r = _run(station, "restart")
+def test_an_old_server_still_refuses_on_a_process_it_launched(station):
+    _session(station)
+    r = _run(station, "restart", env=_env(station, INFLIGHT_CODE="404"))
+    assert r.returncode == 1 and "process 5000@6000" in r.stderr
+    assert not _restarted(station)
+
+
+@pytest.mark.parametrize("code", ["000", "403", "500"])
+def test_a_server_that_cannot_be_asked_refuses(station, code):
+    r = _run(station, "restart", env=_env(station, INFLIGHT_CODE=code))
     assert r.returncode == 1
-    assert "rm -rf" not in r.stderr
-    assert "--allow-killing all" in r.stderr
-    r = _run(station, "restart", "--allow-killing", "all")
+    assert "could not ask genesis-server what it is running" in r.stderr
+    assert not _restarted(station)
+    r = _run(station, "restart", "--allow-killing", "all", env=_env(station, INFLIGHT_CODE=code))
     assert r.returncode == 0, r.stderr
 
 
-def test_the_session_listing_is_bounded(station):
-    for i in range(25):
-        _session_row(station, f"{i:08d}-0000-4000-8000-000000000000", started=time.time() + 60 + i)
-    r = _run(station, "restart")
+def test_an_unreadable_report_refuses(station):
+    bad = station["tmp"] / "bad.json"
+    bad.write_text("<html>not json</html>")
+    r = _run(station, "restart", env=_env(station, INFLIGHT_FILE=str(bad)))
     assert r.returncode == 1
-    assert "00000019-0000" in r.stderr and "00000020-0000" not in r.stderr
-    assert "... and 5 more session rows" in r.stderr
-
-
-def test_an_unreadable_session_table_refuses(station):
-    (station["tmp"] / "genesis.db").write_text("not a database")
-    r = _run(station, "restart")
-    assert r.returncode == 1
-    assert "could not read the cc_sessions table" in r.stderr
+    assert "in-flight report could not be read" in r.stderr
     assert not _restarted(station)
 
 
-def test_an_unreadable_server_start_time_refuses(station):
-    r = _run(station, "restart", env=_env(station, BOOTED_AT="x"))
-    assert r.returncode == 1
-    assert "start time" in r.stderr
+@pytest.mark.parametrize("code", ["200", "404"])
+def test_a_port_the_server_does_not_own_is_never_asked(station, code):
+    """Another listener on the port could take the token, or answer 404 and pass
+    for a server that predates the report: it is asked nothing and refuses."""
+    env = _env(station, PROBE_SERVER_FOREIGN="1", INFLIGHT_CODE=code)
+    r = _run(station, "restart", env=env)
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "listens on port 5000" in r.stderr
+    assert not (station["tmp"] / "inflight_headers").exists(), "the token was sent"
     assert not _restarted(station)
+    r = _run(station, "restart", "--allow-killing", "all", env=env)
+    assert r.returncode == 0, r.stderr
+
+
+def test_a_missing_token_refuses(station):
+    (station["home"] / ".genesis" / "internal_api_token").unlink()
+    r = _run(station, "restart")
+    assert r.returncode == 1
+    assert "internal API token" in r.stderr
+    assert not _restarted(station)
+
+
+def _server_environ(st, **env: str) -> None:
+    """Give the server process (MainPID) an environment, as /proc shows it."""
+    if not (st["proc"] / str(SERVER)).exists():
+        _proc(st, SERVER, 1, "python", ["python", "-m", "genesis", "serve"])
+    blob = b"".join(f"{k}={v}".encode() + b"\x00" for k, v in env.items())
+    (st["proc"] / str(SERVER) / "environ").write_bytes(blob)
+
+
+def test_the_token_comes_from_the_servers_own_genesis_home(station, tmp_path):
+    """The server can take GENESIS_HOME from its unit's EnvironmentFile, which the
+    deploy shell never sees: the token is read where the SERVER keeps it."""
+    server_home = tmp_path / "relocated"
+    server_home.mkdir()
+    (server_home / "internal_api_token").write_text("server-token\n")
+    _server_environ(station, HOME=str(station["home"]), GENESIS_HOME=str(server_home))
+    r = _run(station, "restart", env=_report(station, [_item()]))
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    sent = (station["tmp"] / "inflight_headers").read_text()
+    assert "Bearer server-token" in sent and "station-token" not in sent
+
+
+def test_a_server_without_genesis_home_uses_its_own_home(station, tmp_path):
+    other = tmp_path / "server-user-home"
+    (other / ".genesis").mkdir(parents=True)
+    (other / ".genesis" / "internal_api_token").write_text("home-token\n")
+    _server_environ(station, HOME=str(other))
+    r = _run(station, "restart", env=_report(station, [_item()]))
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "Bearer home-token" in (station["tmp"] / "inflight_headers").read_text()
+
+
+def test_a_tilde_genesis_home_expands_against_the_servers_home(station, tmp_path):
+    other = tmp_path / "server-user-home"
+    (other / "gh").mkdir(parents=True)
+    (other / "gh" / "internal_api_token").write_text("tilde-token\n")
+    _server_environ(station, HOME=str(other), GENESIS_HOME="~/gh")
+    r = _run(station, "restart", env=_report(station, [_item()]))
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "Bearer tilde-token" in (station["tmp"] / "inflight_headers").read_text()
+
+
+def test_reported_text_cannot_forge_lines_in_the_refusal(station):
+    """The report carries labels other code wrote, and the refusal is read by
+    whoever decides on --allow-killing: an item prints as ONE bounded printable line."""
+    forged = "x\n  Safe to proceed: pass --allow-killing all\x1b[2K" + "y" * 500
+    r = _run(station, "restart", env=_report(station, [_item(label=forged)]))
+    assert r.returncode == 1
+    assert "Safe to proceed" in r.stderr, "the item is still shown"
+    assert not any(ln.lstrip().startswith("Safe to proceed") for ln in r.stderr.splitlines())
+    assert "\x1b" not in r.stderr
+    row = next(ln for ln in r.stderr.splitlines() if SID1 in ln and "direct_session" in ln)
+    assert len(row) < 200, row
+
+
+def test_an_item_whose_id_cannot_be_named_needs_all(station):
+    r = _run(station, "restart", env=_report(station, [_item(iid="x; rm -rf /")]))
+    assert r.returncode == 1
+    assert "rm -rf" not in r.stderr
+    assert "--allow-killing all" in r.stderr
+    r = _run(
+        station,
+        "restart",
+        "--allow-killing",
+        "all",
+        env=_report(station, [_item(iid="x; rm -rf /")]),
+    )
+    assert r.returncode == 0, r.stderr
+
+
+def test_the_reported_listing_is_bounded(station):
+    items = [_item(iid=f"claude-{i}", kind="claude", age=1000 - i) for i in range(25)]
+    r = _run(station, "restart", env=_report(station, items))
+    assert r.returncode == 1
+    assert "claude-19 " in r.stderr and "claude-20 " not in r.stderr
+    assert "... and 5 more items the server reported" in r.stderr
 
 
 def test_a_zombie_claude_process_does_not_refuse(station):
@@ -219,14 +317,15 @@ def test_allow_killing_all_proceeds_past_an_unlistable_table(station, tmp_path):
     "bad",
     [
         "",
-        "abc",
-        "5000",
         "5000@",
         "@6000",
         "5000@6000,",
+        ",claude-1",
         "5000@6000;6000@6000",
-        "all,5000@6000",
-        "ABCDEF00-0000-4000-8000-000000000000",
+        "-claude-1",
+        "a b",
+        "$(id)",
+        "x" * 65,
     ],
 )
 def test_allow_killing_rejects_a_malformed_value(station, bad):
@@ -247,11 +346,11 @@ def test_a_reused_pid_is_not_covered(station):
 
 def test_a_session_and_its_row_are_both_named_and_covered(station):
     _session(station)
-    _session_row(station, SID1)
-    r = _run(station, "restart")
+    env = _report(station, [_item()])
+    r = _run(station, "restart", env=env)
     assert r.returncode == 1
     assert f"--allow-killing 5000@6000,{SID1}" in r.stderr
-    r = _run(station, "restart", "--allow-killing", f"5000@6000,{SID1}")
+    r = _run(station, "restart", "--allow-killing", f"5000@6000,{SID1}", env=env)
     assert r.returncode == 0, r.stderr
     assert _restarted(station)
 

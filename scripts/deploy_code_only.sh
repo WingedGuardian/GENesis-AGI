@@ -29,8 +29,8 @@
 #   --allow-killing <item,...|all>  deploy and restart only: restart even though
 #            these sessions the server launched are running. Each item is what
 #            the refusal below prints: a process as <pid>@<start> (so a reused
-#            pid is not covered) or a session id. `all` also proceeds when
-#            something the check needs cannot be read
+#            pid is not covered) or an id the server reported. `all` also
+#            proceeds when something the check needs cannot be read or asked
 #
 # Every mode except status runs with:
 #   the update.lock, EXCLUSIVE and QUEUING (update.sh keeps `flock -n`, so it
@@ -44,11 +44,11 @@
 #     the unit (update.sh's fallback), which a restart would not replace, and,
 #     just before the server is first touched, a Claude Code session the server
 #     launched (dispatched work, a Telegram turn, a reflection), because a
-#     restart ends it: a live Claude process below the server, or a background
-#     session row this server boot still holds (a session outlives its process
-#     at both ends; scripts/lib/server_sessions.py). That refusal lists each
-#     process by pid, start, age and resumed session id and each row by session
-#     id, and is lifted by --allow-killing. Run in the foreground it also marks the caller's
+#     restart ends it: the work the SERVER reports it would cancel (GET
+#     /api/genesis/inflight; a session from before its Claude process starts
+#     until after its result is delivered), or a live Claude process below the
+#     server (scripts/lib/server_sessions.py). That refusal lists each item, and
+#     is lifted by --allow-killing. Run in the foreground it also marks the caller's
 #     own session; launched detached (as below) it cannot, since its parent is
 #     the user manager, so a session the server started must hand a restart off.
 #     The scan is the last step before the stop or restart, but a session the
@@ -167,6 +167,10 @@ LOCK_FILE="${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock"
 # The loopback address, not a name: nothing in the resolver's configuration can
 # point the health request elsewhere.
 HEALTH_URL="http://127.0.0.1:5000/api/genesis/health"
+# What the server would cancel (GET, internal bearer). The token lives in the
+# SERVER's Genesis home (_server_genesis_home).
+INFLIGHT_PORT=5000
+INFLIGHT_URL="http://127.0.0.1:$INFLIGHT_PORT/api/genesis/inflight"
 LOCK_HELD_RC=200
 
 # CC sessions lack the D-Bus env `systemctl --user` needs (same guard as update.sh).
@@ -227,10 +231,11 @@ if [ -n "$ALLOW_KILLING" ]; then
         *) die "--allow-killing belongs to deploy and restart, the modes that restart the server." ;;
     esac
     # Each item is what a refusal prints: a process as <pid>@<start> (its start time
-    # in clock ticks, so a reused pid is not covered) or a session id (a uuid).
-    _ak_item='([0-9]+@[0-9]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
+    # in clock ticks, so a reused pid is not covered) or the id of a piece of work
+    # the server reported (the shape scripts/lib/server_sessions.py prints).
+    _ak_item='([0-9]+@[0-9]+|[A-Za-z0-9][A-Za-z0-9_.:-]{0,63})'
     [[ "$ALLOW_KILLING" == all || "$ALLOW_KILLING" =~ ^${_ak_item}(,${_ak_item})*$ ]] \
-        || die "--allow-killing takes the sessions a refusal names (<pid>@<start> or a session id), separated by commas, or all (got: $ALLOW_KILLING)"
+        || die "--allow-killing takes the items a refusal names (<pid>@<start>, or an id the server reported), separated by commas, or all (got: $ALLOW_KILLING)"
 fi
 case "$WAIT_S" in
     ''|*[!0-9]*) die "the lock wait must be a whole number of seconds (got: $WAIT_S)" ;;
@@ -298,19 +303,46 @@ _untracked_runtime() {
 # in-flight work, and a dispatched session's row is marked failed. So a restart
 # while any runs is a refusal, naming them, unless --allow-killing covers each
 # one. Called under the lock as the last step before the server is touched. Two
-# signals, both from scripts/lib/server_sessions.py (its docstring says why each):
-#   - the server's live Claude Code process DESCENDANTS (a Telegram turn is seen
-#     only here), each named <pid>@<start> so a reused pid is not covered;
-#   - background session rows the CURRENT boot still holds active: a dispatched
-#     session or a reflection lives from before its Claude process starts until
-#     after it exits, and a restart cancels it anywhere in that span. Named by
-#     session id.
-# Whatever cannot be read (the MainPID, the process table, the boot time, the
-# session table) refuses, unless --allow-killing all.
-# GENESIS_DEPLOY_PROC_ROOT and GENESIS_DEPLOY_DB are TEST seams, like
-# GENESIS_DEPLOY_ROOT.
+# signals (scripts/lib/server_sessions.py; its docstring says why each):
+#   - the SERVER'S OWN account of the work a restart would cancel
+#     (GET /api/genesis/inflight, with the internal API token): every Claude
+#     invocation, plus the whole life of a dispatched session or a CLI
+#     reflection, from before its Claude process starts until after its result
+#     is delivered. Named by the id the server gives it. A server that answers
+#     404 predates the report (the first deploy of this change); the process scan
+#     alone then decides, and says so;
+#   - the server's live Claude Code process DESCENDANTS, each named <pid>@<start>
+#     so a reused pid is not covered: a check that needs nothing from the server.
+# Whatever cannot be read or asked (the MainPID, the process table, the token,
+# the server) refuses, unless --allow-killing all.
+# GENESIS_DEPLOY_PROC_ROOT is a TEST seam, like GENESIS_DEPLOY_ROOT.
+# The Genesis home of the RUNNING server, which keeps its internal API token there:
+# the server may take GENESIS_HOME from its unit's EnvironmentFile, which this
+# shell never sees, so it is read from the server process (same user: readable).
+# Only when that cannot be read does the caller's own GENESIS_HOME stand in; a
+# wrong guess finds no token or the wrong one, and refuses.
+_server_genesis_home() {  # $1 = MainPID
+    local env_file="${GENESIS_DEPLOY_PROC_ROOT:-/proc}/$1/environ" gh h
+    if [ ! -r "$env_file" ]; then
+        printf '%s' "${GENESIS_HOME:-$HOME/.genesis}"
+        return 0
+    fi
+    # Only the two variables are extracted: the server's environment also holds its
+    # API keys, which must never pass through this shell (xtrace would print them).
+    gh="$(grep -z -m1 '^GENESIS_HOME=' "$env_file" 2>/dev/null | tr -d '\0' || true)"
+    gh="${gh#GENESIS_HOME=}"
+    h="$(grep -z -m1 '^HOME=' "$env_file" 2>/dev/null | tr -d '\0' || true)"
+    h="${h#HOME=}"
+    h="${h:-$HOME}"
+    # shellcheck disable=SC2088  # matches a LITERAL ~ in the value, expanded by hand
+    case "$gh" in
+        "~") gh="$h" ;;
+        "~/"*) gh="$h/${gh#\~/}" ;;
+    esac
+    printf '%s' "${gh:-$h/.genesis}"
+}
 _refuse_if_sessions() {
-    local main boot found rows rc pid age resume self start rid tag started line
+    local main found work rc pid age resume self start iid kind label line code resp tok_file
     local unlisted="" all_items="" listing="" own="" item
     _cannot_tell() {
         if [ "$ALLOW_KILLING" = all ]; then
@@ -327,24 +359,44 @@ _refuse_if_sessions() {
         echo "  No genesis-server process is running, so no session it launched can be ended."
         return 0
     fi
-    boot="$(systemctl --user show genesis-server -p ActiveEnterTimestamp --timestamp=unix --value 2>/dev/null || true)"
-    boot="${boot#@}"
     rc=0
     found="$(python3 -I -S -c "$_SERVER_SESSIONS_PY" "$main" "${GENESIS_DEPLOY_PROC_ROOT:-/proc}" "$$")" || rc=$?
     if [ "$rc" -ne 0 ]; then
         _cannot_tell "could not list processes to find the server's sessions"
         found=""
     fi
-    rows=""
-    if ! _positive_int "${boot:-0}"; then
-        _cannot_tell "could not read genesis-server's start time from systemd"
+    work=""
+    tok_file="$(_server_genesis_home "$main")/internal_api_token"
+    if ! python3 -c "$_PORT_PROBE_PY" "$INFLIGHT_PORT" "$main" 2>/dev/null; then
+        # Whatever answers on the port must BE the server before it is handed the
+        # token or believed: another listener could take the token, or answer 404
+        # and pass for a server that predates the report.
+        _cannot_tell "could not confirm that genesis-server (pid $main) is what listens on port $INFLIGHT_PORT, so it was not asked what it is running"
+    elif [ ! -s "$tok_file" ] || [ ! -r "$tok_file" ]; then
+        _cannot_tell "could not read the internal API token ($tok_file) to ask genesis-server what it is running"
     else
-        rc=0
-        rows="$(python3 -I -S -c "$_SERVER_SESSIONS_PY" --rows "${GENESIS_DEPLOY_DB:-$GENESIS_ROOT/data/genesis.db}" "$boot")" || rc=$?
-        if [ "$rc" -ne 0 ]; then
-            _cannot_tell "could not read the cc_sessions table"
-            rows=""
-        fi
+        # The token goes straight from its file to curl's stdin (-H @-): never on a
+        # command line, and never in a shell variable. -q first, as curl requires:
+        # no .curlrc; --noproxy '*': no proxy for loopback.
+        resp="$({ printf 'Authorization: Bearer '; head -n1 "$tok_file"; } \
+            | curl -q --noproxy '*' -s --max-time 15 -H @- -w '\n%{http_code}' "$INFLIGHT_URL" 2>/dev/null || true)"
+        code="${resp##*$'\n'}"
+        case "$code" in
+            200)
+                rc=0
+                work="$(printf '%s' "${resp%$'\n'*}" | python3 -I -S -c "$_SERVER_SESSIONS_PY" --inflight)" || rc=$?
+                if [ "$rc" -ne 0 ]; then
+                    _cannot_tell "genesis-server's in-flight report could not be read"
+                    work=""
+                fi
+                ;;
+            404)
+                echo "  NOTE: genesis-server predates its in-flight report (HTTP 404), so only the Claude processes below it are checked."
+                ;;
+            *)
+                _cannot_tell "could not ask genesis-server what it is running (HTTP ${code:-no answer})"
+                ;;
+        esac
     fi
     _consider() {  # $1 = the item an override names ("-" = none can), $2 = its line
         listing+="$2"$'\n'
@@ -369,15 +421,15 @@ _refuse_if_sessions() {
         fi
         _consider "$item" "$line"
     done <<< "$found"
-    while IFS=$'\t' read -r rid tag started; do
-        [ -n "$rid" ] || continue
-        if [ "$rid" = more ]; then
-            listing+="    ... and $tag more session rows"$'\n'
+    while IFS=$'\t' read -r iid kind label age; do
+        [ -n "$iid" ] || continue
+        if [ "$iid" = more ]; then
+            listing+="    ... and $kind more items the server reported"$'\n'
             [ "$ALLOW_KILLING" = all ] || unlisted+=" (more)"
             continue
         fi
-        _consider "$rid" "    session $rid  ${tag:-?}, started $started"
-    done <<< "$rows"
+        _consider "$iid" "    ${kind:-work} $iid  ${label:-?}, running $((age / 60))m"
+    done <<< "$work"
     [ -n "$listing" ] || return 0
     if [ -z "$unlisted" ]; then
         echo "  Ending these sessions with the restart (--allow-killing $ALLOW_KILLING):"
