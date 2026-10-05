@@ -86,16 +86,10 @@ _finish_outcome() {
 # Check at each queue boundary; the sentinel can change while a tick runs.
 # Unresolvable configuration defers CBM, as the entrypoint does.
 _cbm_disabled() {
-    local sentinel
-    if ! declare -F genesis_cbm_disable_file >/dev/null; then
-        return 0
-    fi
-    sentinel="$(genesis_cbm_disable_file)" || return 0
-    [ -e "$sentinel" ]
+    ! /usr/bin/python3 -I "$SCRIPT_DIR/codebase_managed.py" \
+        --config "$HOME/.genesis/config/codebase-managed.json" available --repo "$1" \
+        >/dev/null 2>&1
 }
-
-# shellcheck source=lib/cbm_disable_file.sh
-[ ! -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ] || . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
 
 # Returns 0 (idle enough to run) or 1. Relaxed gate once a marker is starved.
 _idle_ok() {
@@ -176,7 +170,7 @@ for line in "${_MARKERS[@]}"; do
 
     # Deferral leaves the pending generation untouched. If a new GitNexus
     # request coalesces after this snapshot, the next tick sees it.
-    if [ "$_l_tools" = "cbm" ] && _cbm_disabled; then
+    if [ "$_l_tools" = "cbm" ] && _cbm_disabled "$_l_repo"; then
         _log "CBM disabled — leaving request pending: $_l_repo"
         continue
     fi
@@ -202,7 +196,7 @@ for line in "${_MARKERS[@]}"; do
 
     # Authoritative tools may differ from the snapshot, and disablement can
     # race claim. Restore durably before any escalation or tool invocation.
-    if [ "$tools" = "cbm" ] && _cbm_disabled; then
+    if [ "$tools" = "cbm" ] && _cbm_disabled "$repo"; then
         _finish_outcome "$hash" restore "$claim_id" >/dev/null || exit 76
         _log "CBM disabled after claim — restored request: $repo"
         continue

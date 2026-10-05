@@ -26,6 +26,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts.managed_code_intel_fixture import configured_sentinel, install_manager
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ENTRYPOINT = _REPO_ROOT / "scripts" / "lib" / "code_intel_index.sh"
 
@@ -186,6 +188,8 @@ except (module.AdmissionRefused, KeyError) as exc:
 
 def _run_entry(tmp_path: Path, *args, path: str, env_extra=None, **popen_kw):
     entrypoint = _test_entrypoint(tmp_path, Path(path.split(os.pathsep)[0]))
+    if env_extra and "CODEBASE_MEMORY_MCP_DISABLE_FILE" in env_extra:
+        configured_sentinel(tmp_path, env_extra["CODEBASE_MEMORY_MCP_DISABLE_FILE"])
     env = {
         "PATH": path,
         "HOME": str(tmp_path),
@@ -222,6 +226,14 @@ def _test_entrypoint(tmp_path: Path, fakebin: Path) -> Path:
     source = _ENTRYPOINT.read_text()
     assert "/usr/bin/systemd-run" in source
     script.write_text(source.replace("/usr/bin/systemd-run", str(fakebin / "systemd-run")))
+    install_manager(tmp_path / "codebase_managed.py", tmp_path, tmp_path / "repo", fakebin / "codebase-memory-mcp")
+    (script_dir / "code_intel_cbm_worker.py").write_text(
+        "import subprocess,sys\n"
+        "args=sys.argv[1:]\n"
+        "assert args[:1]==['--managed-config']\n"
+        "args=args[2:]\n"
+        f"raise SystemExit(subprocess.call([{str(fakebin / 'codebase-memory-mcp')!r},'cli','index_repository',*args]))\n"
+    )
     for name in ("cbm_disable_file.sh", "gitnexus_version.sh", "proc_pressure.sh"):
         companion = script_dir / name
         if not companion.exists():
@@ -339,7 +351,7 @@ def test_cbm_disable_sentinel_blocks_index_spawn(tmp_path):
     # let the runner consume the marker and stamp cbm's shared full clock for
     # work that never ran.
     assert res.returncode == 3, res.stderr
-    assert f"disabled by {disable_file}" in res.stdout
+    assert "managed Codebase unavailable" in res.stdout
     assert not log.exists()
 
 
@@ -456,7 +468,7 @@ def test_missing_requested_tools_return_rc3(tmp_path):
     repo = _make_repo(tmp_path)
     res = _run_entry(tmp_path, repo, "both", path=str(_minimal_path(tmp_path)))
     assert res.returncode == 3, res.stderr
-    assert "codebase-memory-mcp not on PATH" in res.stdout
+    assert "managed Codebase unavailable" in res.stdout
     assert "gitnexus not available" in res.stdout
     assert "missing or refused" in res.stdout
 
@@ -705,17 +717,22 @@ def test_lock_released_after_completion(tmp_path):
     assert log.read_text().count("codebase-memory-mcp ARGS:") == 2
 
 
-def test_no_flock_degrades_to_unlocked_run(tmp_path):
+@pytest.mark.parametrize("tools,expected", [("gitnexus", 0), ("both", 5), ("cbm", 75)])
+def test_no_flock_preserves_gitnexus_and_refuses_cbm(tmp_path, tools, expected):
     # Missing flock must degrade to "no dedup", never "silently skip".
     minbin = _minimal_path(tmp_path)
     (minbin / "flock").unlink()
     log = tmp_path / "tools.log"
     _fake_tools(minbin, log)
     repo = _make_repo(tmp_path)
-    res = _run_entry(tmp_path, repo, "cbm", path=str(minbin))
-    assert res.returncode == 0, res.stderr
-    assert "UNLOCKED" in res.stdout
-    assert "codebase-memory-mcp ARGS:" in log.read_text()
+    res = _run_entry(tmp_path, repo, tools, path=str(minbin))
+    assert res.returncode == expected, res.stderr
+    if tools != "cbm":
+        assert "UNLOCKED" in res.stdout
+        assert "gitnexus ARGS:" in log.read_text()
+        assert "codebase-memory-mcp ARGS:" not in log.read_text()
+    else:
+        assert not log.exists()
 
 
 # ── 3. resource caps ──────────────────────────────────────────────────────
@@ -730,7 +747,7 @@ def test_scope_path_passes_all_properties(tmp_path):
     res = _run_entry(tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}")
     assert res.returncode == 0, res.stderr
     calls = slog.read_text()
-    assert "MemoryMax=4G" in calls
+    assert "MemoryMax=8G" in calls
     assert "MemorySwapMax=0" in calls
     assert "IOWeight=20" in calls
     assert "CPUQuota=200%" in calls
@@ -745,7 +762,10 @@ def _use_boundary_verifier(monkeypatch, verifier):
 
     def private_entry(root, bindir):
         script = original(root, bindir)
-        script.write_text(script.read_text().replace("/usr/bin/python3", str(verifier)))
+        script.write_text(script.read_text().replace(
+            '/usr/bin/python3 -I "${BASH_SOURCE[0]%/*}/code_intel_cbm_admission.py"',
+            str(verifier) + ' -I "${BASH_SOURCE[0]%/*}/code_intel_cbm_admission.py"',
+        ))
         return script
 
     monkeypatch.setitem(_run_entry.__globals__, "_test_entrypoint", private_entry)
@@ -891,8 +911,8 @@ def test_both_tools_keep_distinct_slice_placement(tmp_path):
     res = _run_entry(tmp_path, repo, "both", path=f"{fakebin}:{_SYSTEM_PATH}")
     assert res.returncode == 0, res.stdout + res.stderr
     calls = slog.read_text().splitlines()
-    cbm = [line for line in calls if "MemoryMax=4G" in line]
-    gn = [line for line in calls if "MemoryMax=8G" in line]
+    cbm = [line for line in calls if "--slice-inherit" in line]
+    gn = [line for line in calls if "--scope" in line and "--slice-inherit" not in line]
     assert len(cbm) == len(gn) == 2  # each leg's probe and workload
     assert all("--slice-inherit" in line for line in cbm)
     assert all("--slice-inherit" not in line for line in gn)
@@ -908,11 +928,12 @@ def test_env_overrides_reach_scope(tmp_path):
         tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
         env_extra={"CODE_INTEL_INDEX_MEMORY_MAX": "5G",
                    "CODE_INTEL_INDEX_IO_WEIGHT": "5",
+                   "CODE_INTEL_CBM_MEMORY_MAX": "8G",
                    "CODE_INTEL_INDEX_CPU_QUOTA": "100%"},
     )
     assert res.returncode == 0, res.stderr
     calls = slog.read_text()
-    assert "MemoryMax=5G" in calls
+    assert "MemoryMax=8G" in calls
     assert "IOWeight=5" in calls
     assert "CPUQuota=100%" in calls
 
@@ -941,7 +962,7 @@ def test_both_tools_probe_each_cap_independently(tmp_path):
     assert "codebase-memory-mcp ARGS:" in log.read_text()
     assert "gitnexus ARGS:" not in log.read_text()
     assert "MemoryMax=invalid" in slog.read_text()
-    assert "MemoryMax=4G" in slog.read_text()
+    assert "MemoryMax=8G" in slog.read_text()
 
 
 def test_cbm_without_systemd_refuses_uncontained_run(tmp_path):
@@ -1140,10 +1161,10 @@ def test_cbm_default_uses_the_measured_four_gibibyte_target(tmp_path):
     assert res.returncode == 0, res.stdout + res.stderr
     runs = [
         line for line in systemd_log.read_text().splitlines()
-        if "codebase-memory-mcp cli index_repository" in line
+        if "code_intel_cbm_worker.py" in line
     ]
     assert len(runs) == 1
-    assert "MemoryMax=4G" in runs[0]
+    assert "MemoryMax=8G" in runs[0]
 
 
 def test_explicit_cbm_cap_does_not_bypass_destination_headroom(tmp_path):
@@ -1156,7 +1177,7 @@ def test_explicit_cbm_cap_does_not_bypass_destination_headroom(tmp_path):
 
     res = _run_entry(
         tmp_path, repo, "cbm", path=f"{fakebin}:{_SYSTEM_PATH}",
-        env_extra={"CODE_INTEL_CBM_MEMORY_MAX": "5G"},
+        env_extra={"CODE_INTEL_CBM_MEMORY_MAX": "8G"},
     )
 
     assert res.returncode == 3, res.stdout + res.stderr
@@ -1200,7 +1221,7 @@ def test_cbm_rss_peak_is_not_accepted_as_a_safe_scope_cap(tmp_path):
     )
 
     assert res.returncode == 3
-    assert "below" in res.stdout and "2964M" in res.stdout
+    assert "full 8 GiB job cap" in res.stdout
     assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
 
 

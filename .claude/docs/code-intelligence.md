@@ -82,6 +82,10 @@ backend has its separate2GiB cap. There is no raw/PATH or address-space fallback
 and no legacy cap override. Missing setup refuses; registration never activates
 the service. A contained reader failure can be reconnected with `/mcp`; backend
 failure requires deliberate recovery. See `docs/reference/codebase-managed.md`.
+Queued CBM indexing uses a physical pinned worker in the existing8GiB/zero-swap
+scope with a6GiB native budget, after fresh in-scope managed authorization.
+Managed unavailability leaves CBM pending; a combined request can finish
+GitNexus and retain CBM. No raw/PATH worker fallback or automatic activation.
 
 **GitNexus** — LadybugDB graph (v1.6.12). Snapshot-based: correct only when the
 index matches the working tree. Its reindex fires on local commit, **not** on

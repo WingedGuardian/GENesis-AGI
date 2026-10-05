@@ -1,0 +1,1 @@
+- Queued Codebase indexing requires managed native authority and a pinned physical worker in the existing 8 GiB scope; unavailable setup preserves pending work and admitted jobs release lifecycle admission before waiting.

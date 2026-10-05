@@ -1412,8 +1412,7 @@ verified: 3c750316479f 2026-10-05
   native query unit entry points in `scripts/codebase_managed.py`. Install and
   bootstrap render disabled query/client-slice templates without auto-upgrading
   a PATH provider. Staging does not activate it; MCP registration always uses
-  the managed launcher, including absent PATH binaries. Index queue integration
-  remains a separate concern. See
+  the managed launcher, including absent PATH binaries. See
   `docs/reference/codebase-managed.md`.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
@@ -1429,8 +1428,12 @@ verified: 3c750316479f 2026-10-05
   only. Managed frontends prove fresh shared admission and kernel caps inside
   the actual transient child:256MiB/zero swap/Tasks32 under2GiB/zero swap/Tasks512
   aggregate, fixed analysis tool profile, native backend dependency and permanent
-  PID readiness. No raw fallback or backend activation. Queued-worker admission
-  remains a separate concern.
+  PID readiness. No raw fallback or backend activation. The existing queue
+  checks managed availability at claim and leg boundaries, then admits a pinned
+  physical worker only inside its actual8GiB/zero-swap scope (native budget6GiB).
+  Shared lifecycle admission encloses fresh authorization and Popen, releasing
+  before wait; disabled/unavailable CBM retains its durable queue work without
+  attempt charges. Existing watchdog, cohort/publication and queue outcomes remain.
 - **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
   `/v1/chat/completions` endpoint, and registers the desk brain at

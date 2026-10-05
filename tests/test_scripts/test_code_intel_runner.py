@@ -22,6 +22,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+from tests.test_scripts.managed_code_intel_fixture import configured_sentinel, install_manager
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _RUNNER = _REPO_ROOT / "scripts" / "code_intel_runner.sh"
 _MARKER_PY = _REPO_ROOT / "scripts" / "lib" / "index_marker.py"
@@ -49,6 +51,17 @@ def _run_runner(
     tmp_path: Path, entry_rc: int, *, load="0.1", iowait="0", claude_cpu="0", extra_env=None
 ):
     home = tmp_path / ".genesis"
+    private = tmp_path / "runner"
+    private.mkdir(exist_ok=True)
+    runner = private / "code_intel_runner.sh"
+    runner.write_text(_RUNNER.read_text())
+    if not (private / "lib").exists():
+        (private / "lib").symlink_to(_RUNNER.parent / "lib")
+    binary = private / "accepted-test-backend"
+    binary.touch()
+    install_manager(private / "codebase_managed.py", tmp_path, Path(_REPO), binary)
+    if extra_env and "CODEBASE_MEMORY_MCP_DISABLE_FILE" in extra_env:
+        configured_sentinel(tmp_path, extra_env["CODEBASE_MEMORY_MCP_DISABLE_FILE"])
     env = {
         "PATH": "/usr/bin:/bin",
         "HOME": str(tmp_path),
@@ -60,7 +73,7 @@ def _run_runner(
         **(extra_env or {}),
     }
     return subprocess.run(
-        ["bash", str(_RUNNER)],
+        ["bash", str(runner)],
         env=env,
         capture_output=True,
         text=True,

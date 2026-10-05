@@ -1135,4 +1135,7 @@ jobs:
         # Managed frontend: actual predecessor launcher39 -> branch35 (-4),
         # plus28 new frontend cases = net24; floor24571+24=24595.
         # Replaces legacy fallback/scope smoke premises; no new skip sites.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 24595
+        # Managed queued worker:11 physical authorization cases,8 availability
+        # cases, existing flock test1->3 (+2); no added skip sites.
+        # Floor24595+21=24616; reconcile with landed main before publication.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 24616

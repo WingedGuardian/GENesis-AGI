@@ -746,6 +746,14 @@ def uninstall_main(args: argparse.Namespace) -> int:
         return 1
 
 
+def available(path: Path, repo: str) -> None:
+    config = runtime_config(path)
+    if absolute(repo).resolve(strict=True) != Path(config["main"]):
+        raise ValueError("managed indexing requires the configured physical main checkout")
+    verify_cache(config)
+    ready(config)
+
+
 def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=None)
@@ -759,6 +767,8 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     commands.add_parser("launch")
     frontend = commands.add_parser("client")
     frontend.add_argument("--unit", required=True)
+    availability = commands.add_parser("available")
+    availability.add_argument("--repo", required=True)
     for command in ("enable", "disable", "remove"):
         commands.add_parser(command)
     teardown = commands.add_parser("uninstall")
@@ -795,6 +805,8 @@ def main(argv: list[str] | None = None) -> int:
             launch(read_settings(path), path)
         elif args.command == "client":
             client(path, args.unit)
+        elif args.command == "available":
+            available(path, args.repo)
         else:
             config = runtime_config(path)
             (serve if args.command == "serve" else ready)(config)

@@ -43,8 +43,7 @@
 # Env overrides:
 #   CODE_INTEL_WORKLOAD_SLICE     default 0; 1 requires genesis-workload.slice
 #   CODE_INTEL_INDEX_MEMORY_MAX   legacy override for both tools
-#   CODE_INTEL_CBM_WORKER_BINARY  opt-in absolute pinned v0.11 worker executable
-#   CODE_INTEL_CBM_MEMORY_MAX     default 4G     (requested CBM batch ceiling)
+#   CODE_INTEL_CBM_MEMORY_MAX     default 8G     (required managed batch ceiling)
 #   CODE_INTEL_GITNEXUS_MEMORY_MAX default 8G    (measured GitNexus rebuild)
 #   CODE_INTEL_FILE_CACHE_RESERVE_BYTES default 2G (clean cache kept outside job)
 #   CODE_INTEL_INDEX_IO_WEIGHT    default 20     (1-10000; low = polite)
@@ -168,9 +167,9 @@ case "$WORKLOAD_SLICE" in 0|1) ;; *)
 esac
 
 _LEGACY_MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-}"
-# Four GiB is the provisional batch ceiling. The bounded child checks actual
+# Eight GiB is the accepted managed batch ceiling. The bounded child checks actual
 # destination-scope headroom for the entire requested cap before indexing.
-CBM_MEM_MAX="${CODE_INTEL_CBM_MEMORY_MAX:-${_LEGACY_MEM_MAX:-4G}}"
+CBM_MEM_MAX="${CODE_INTEL_CBM_MEMORY_MAX:-${_LEGACY_MEM_MAX:-8G}}"
 # Measured 2026-09-16: a forced full rebuild peaked at 4,874,166,272 bytes
 # (4.54 GiB) and completed under an 8 GiB, swapless scope. The old shared 2G
 # cap killed it on the way up. Keep headroom for repository growth; admission
@@ -527,27 +526,6 @@ IO_WEIGHT="${CODE_INTEL_INDEX_IO_WEIGHT:-20}"
 CPU_QUOTA="${CODE_INTEL_INDEX_CPU_QUOTA:-200%}"
 PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"
 
-# The kill-switch path resolves through the ONE shared site (same override
-# semantics the launcher enforces). An override that is relative, or begins
-# with a ~/ that no HOME can expand, would make `-e` silently read as
-# "not disabled" — an UNRESOLVABLE path instead refuses the cbm leg below,
-# never indexing a tool the machine may have switched off.
-CBM_DISABLE_FILE=""
-CBM_DISABLE_UNRESOLVED=1
-# %/* not dirname(1): minimal-PATH invocations (stripped-env services) may not
-# have dirname, and a resolver that cannot be found fails the leg closed.
-_cbm_disable_lib="${BASH_SOURCE[0]%/*}/cbm_disable_file.sh"
-[ "$_cbm_disable_lib" = "${BASH_SOURCE[0]}/cbm_disable_file.sh" ] \
-    && _cbm_disable_lib="./cbm_disable_file.sh"
-if [ -r "$_cbm_disable_lib" ]; then
-    # shellcheck source=cbm_disable_file.sh
-    . "$_cbm_disable_lib"
-    if declare -F genesis_cbm_disable_file >/dev/null \
-        && CBM_DISABLE_FILE="$(genesis_cbm_disable_file 2>/dev/null)"; then
-        CBM_DISABLE_UNRESOLVED=""
-    fi
-fi
-
 _GITNEXUS_PIN_READY=0
 _gitnexus_pin_file="$(dirname "${BASH_SOURCE[0]}")/gitnexus_version.sh"
 if [ -r "$_gitnexus_pin_file" ]; then
@@ -623,6 +601,7 @@ LOCK_FILE="$LOCK_DIR/code-intel-$(printf '%s' "$REPO_PATH" | sha1sum | cut -c1-1
 # If either is missing, proceed UNLOCKED with a warning — a missing lock tool
 # must degrade to "no dedup", never to "silently skip indexing" (a bare
 # `flock -n 9` failure is indistinguishable from "lock held" otherwise).
+_CBM_LOCK_REFUSE=0
 if command -v flock >/dev/null 2>&1 && { exec 9>"$LOCK_FILE"; } 2>/dev/null; then
     if ! flock -n 9; then
         # Lock held: either a concurrent index, or the managed genesis-code-intel-freeze
@@ -635,12 +614,16 @@ if command -v flock >/dev/null 2>&1 && { exec 9>"$LOCK_FILE"; } 2>/dev/null; the
         exit "${CODE_INTEL_INDEX_LOCK_SKIP_RC:-0}"
     fi
 else
+    if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
+        _log "managed CBM requires the repository flock — refusing unlocked execution"
+        _CBM_LOCK_REFUSE=1
+        [ "$TOOLS" != "cbm" ] || exit 75
+    fi
     _log "WARNING: flock or lock file unavailable ($LOCK_FILE) — proceeding UNLOCKED"
 fi
 
 # ── 3. Resource-capped runner ───────────────────────────────────────────
-# Probe systemd-run exactly like .claude/mcp/run-codebase-memory does: the
-# probe must create a real scope, because CC-spawned / hook-spawned contexts
+# The probe must create a real scope, because CC-spawned / hook-spawned contexts
 # sometimes cannot reach the user manager even when systemd-run exists.
 _GN_SCOPE_OK=0
 _CBM_SCOPE_OK=0
@@ -826,19 +809,19 @@ _leg_failed() {
 }
 
 if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
-    if [ -n "$CBM_DISABLE_UNRESOLVED" ]; then
-        _log "cbm kill-switch path unresolvable — refusing cbm leg (fail closed)"
+    if [ "$_CBM_LOCK_REFUSE" = "1" ]; then
         MISSING="${MISSING}cbm "
-    elif [ -e "$CBM_DISABLE_FILE" ]; then
-        _log "codebase-memory-mcp disabled by $CBM_DISABLE_FILE — skipped"
-        MISSING="${MISSING}cbm "
-    elif [ -n "${CODE_INTEL_CBM_WORKER_BINARY:-}" ] || command -v codebase-memory-mcp >/dev/null 2>&1; then
+    elif /usr/bin/python3 -I "${_CODE_INTEL_ENTRYPOINT%/*}/../codebase_managed.py" \
+        --config "$HOME/.genesis/config/codebase-managed.json" available --repo "$REPO_PATH" \
+        >/dev/null 2>&1; then
         CBM_MEM_REFUSE=""
         _cbm_want_b="$(_genesis_mem_bytes "$CBM_MEM_MAX")"
         if [ -n "$GENESIS_CBM_ENV_REFUSE" ]; then
             CBM_MEM_REFUSE="$GENESIS_CBM_ENV_REFUSE"
         elif [ -z "$_cbm_want_b" ]; then
             CBM_MEM_REFUSE="CODE_INTEL_CBM_MEMORY_MAX='${CBM_MEM_MAX}' is not a parseable memory value"
+        elif [ "$_cbm_want_b" -ne 8589934592 ]; then
+            CBM_MEM_REFUSE="managed worker requires the full 8 GiB job cap"
         elif [ "$_cbm_want_b" -lt "$CODE_INTEL_CBM_MIN_BYTES" ]; then
             CBM_MEM_REFUSE="configured cap ${CBM_MEM_MAX} is below the measured $(( CODE_INTEL_CBM_MIN_BYTES / 1024 / 1024 ))M Codebase Memory workload"
         fi
@@ -867,13 +850,11 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
                 _log "SKIP cbm: cannot create admission outcome marker"
                 MISSING="${MISSING:+$MISSING }cbm"
             else
-                _cbm_command=(codebase-memory-mcp cli index_repository)
-                if [ -n "${CODE_INTEL_CBM_WORKER_BINARY:-}" ]; then
-                    _cbm_command=(/usr/bin/python3 -I "${_CODE_INTEL_ENTRYPOINT%/*}/code_intel_cbm_worker.py")
-                fi
+                _cbm_command=(/usr/bin/python3 -I "${_CODE_INTEL_ENTRYPOINT%/*}/code_intel_cbm_worker.py")
                 if MEM_MAX="$CBM_MEM_MAX" CODE_INTEL_CHILD_ADMIT_CAP_BYTES="$_cbm_want_b" \
                     CODE_INTEL_CHILD_REFUSAL_MARKER="$_cbm_refusal_marker" \
                     _run_with_watchdog cbm "${_cbm_command[@]}" \
+                    --managed-config "$HOME/.genesis/config/codebase-managed.json" \
                     --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE"; then
                     CBM_RAN=1
                 else
@@ -890,7 +871,7 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
             fi
         fi
     else
-        _log "codebase-memory-mcp not on PATH — skipped"
+        _log "managed Codebase unavailable — skipped"
         MISSING="${MISSING}cbm "
     fi
 fi

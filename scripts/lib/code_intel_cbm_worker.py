@@ -1,7 +1,7 @@
 """Pinned stock CBM worker adapter, called only inside the admitted batch scope.
 
 Ordinary v0.11 CLI calls delegate to the account daemon, so their worker inherits
-that daemon's limits. This opt-in adapter runs stock internal worker mode in the
+that daemon's limits. This managed adapter runs stock internal worker mode in the
 queue's existing scope, preserving native cohort, mutation locks and publication.
 No provider patch or separate IPC namespace is used. Internal ABI is exact-build
 pinned. Crashes fail the queued attempt; provider skip-and-retry is not reproduced.
@@ -11,18 +11,20 @@ The entrypoint's cgroup watchdog owns cancellation and descendant cleanup.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import runpy
+import sqlite3
 import subprocess
 import sys
 import tempfile
+from contextlib import ExitStack
 from pathlib import Path
 
 # v0.11.0 Linux x86_64 portable release, independently matched to release digest.
 BUILD = "ce11c141431aeadd788506c3a7e6942db8fd438dec369d0707a39ec9fd8c6510"  # pragma: allowlist secret (public executable digest, not a secret)
 MAX_RESPONSE = 1024 * 1024
+JOB_CAP = 8 * 1024**3
 
 
 def verify_scope(env: dict[str, str]) -> int:
@@ -63,44 +65,80 @@ def read_result(path: Path) -> dict:
     return result
 
 
-def _execute_stock_worker(binary: Path, args: argparse.Namespace, cap: int) -> int:
-    if not binary.is_absolute() or not os.access(binary, os.X_OK):
-        raise ValueError("worker binary must be an absolute executable path")
-    # Keep the verified inode open through exec. Never resolve the incident shim
-    # on PATH or fall back to an ordinary CLI when this adapter refuses.
-    with binary.open("rb") as executable:
-        if hashlib.file_digest(executable, "sha256").hexdigest() != BUILD:
-            raise ValueError("unsupported worker build; rerun acceptance before upgrading")
-        cache = Path(os.environ.get("CBM_CACHE_DIR", ""))
-        if not cache.is_absolute() or not cache.is_dir():
-            raise ValueError("worker requires an explicit existing absolute cache directory")
-        # Response sizes are bounded and small; place them in the selected cache,
-        # never in the shared CC temporary volume.
-        with tempfile.TemporaryDirectory(prefix="genesis-worker-", dir=cache) as directory:
-            response = Path(directory) / "response.json"
-            command = [
-                f"/proc/self/fd/{executable.fileno()}",
-                "cli",
-                "--index-worker",
-                "--index-worker-build",
-                BUILD,
-                "index_repository",
-                json.dumps(
-                    {
-                        "repo_path": args.repo_path,
-                        "mode": args.mode,
-                        "persistence": args.persistence == "true",
-                    }
-                ),
-                "--response-out",
-                str(response),
-                "--index-worker-memory-budget-bytes",
-                str(cap * 3 // 4),
-            ]
-            rc = subprocess.call(command, pass_fds=(executable.fileno(),))
-            if rc != 0:
-                return 111  # failure, never queue deferral/partial-success codes
-            print(json.dumps(read_result(response)))
+def load_managed() -> dict:
+    return runpy.run_path(str(Path(__file__).resolve().parents[1] / "codebase_managed.py"))
+
+
+def _execute_stock_worker(path: Path, args: argparse.Namespace, cap: int) -> int:
+    with ExitStack() as resources:
+        spawn_started = False
+        try:
+            if cap != JOB_CAP:
+                raise ValueError("managed worker requires the full 8 GiB job cap")
+            managed = load_managed()
+            resources.enter_context(managed["lifecycle_lock"](shared=True))
+            config = managed["runtime_config"](managed["config_path"](str(path)))
+            if not Path(args.repo_path).is_absolute() or Path(args.repo_path).resolve(
+                strict=True
+            ) != Path(config["main"]):
+                raise ValueError("worker requires the configured physical main checkout")
+            managed["verify_cache"](config)
+            managed["ready"](config)
+            executable = managed["verified_binary"](Path(config["binary"]))
+            # Keep the accepted inode through child creation, but close the
+            # lifecycle admission lock immediately after Popen, before wait.
+            with (
+                executable as binary,
+                tempfile.TemporaryDirectory(
+                    prefix="genesis-worker-", dir=config["cache"]
+                ) as directory,
+            ):
+                managed["require_enabled"](config)
+                managed["check_backend"](config)
+                spawn_started = True
+                return _spawn_worker(managed, config, binary, args, cap, Path(directory), resources)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError):
+            if not spawn_started:
+                marker = os.environ.get("CODE_INTEL_CHILD_REFUSAL_MARKER")
+                if marker:
+                    Path(marker).write_text("refused\n")
+            raise
+
+
+def _spawn_worker(
+    managed: dict, config: dict, executable, args, cap: int, directory: Path, admission: ExitStack
+) -> int:
+    response = Path(directory) / "response.json"
+    command = [
+        f"/proc/self/fd/{executable.fileno()}",
+        "cli",
+        "--index-worker",
+        "--index-worker-build",
+        BUILD,
+        "index_repository",
+        json.dumps(
+            {
+                "repo_path": args.repo_path,
+                "mode": args.mode,
+                "persistence": args.persistence == "true",
+            }
+        ),
+        "--response-out",
+        str(response),
+        "--index-worker-memory-budget-bytes",
+        str(cap * 3 // 4),
+    ]
+    process = subprocess.Popen(
+        command,
+        pass_fds=(executable.fileno(),),
+        env=managed["native_env"](config),
+        cwd=config["main"],
+    )
+    admission.close()
+    rc = process.wait()
+    if rc != 0:
+        return 111  # failure, never queue deferral/partial-success codes
+    print(json.dumps(read_result(response)))
     return 0
 
 
@@ -109,13 +147,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo-path", required=True)
     parser.add_argument("--mode", choices=("fast", "moderate", "full"), required=True)
     parser.add_argument("--persistence", choices=("true", "false"), required=True)
+    parser.add_argument("--managed-config", required=True)
     args = parser.parse_args(argv)
     try:
         if not Path(args.repo_path).is_absolute():
             raise ValueError("repository path must be absolute")
         cap = verify_scope(dict(os.environ))
-        return _execute_stock_worker(Path(os.environ.get("CODE_INTEL_CBM_WORKER_BINARY", "")), args, cap)
-    except (OSError, ValueError, RuntimeError) as exc:
+        return _execute_stock_worker(Path(args.managed_config), args, cap)
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as exc:
         print(f"code-intel: stock worker refused/failed: {exc}", file=sys.stderr)
         return 111
 

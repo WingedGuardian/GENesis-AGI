@@ -122,7 +122,36 @@ Configuration uses schema 2: paths and build identity, with no mutable `enabled`
 flag. Native systemd enablement owns operational state. The lifecycle lock coordinates cooperating same-user tools;
 it is not protection against deliberate same-user filesystem interference.
 
-## Native query unit entry points
+## Queued physical indexing
+
+The existing idle-gated runner checks managed availability before and after a
+CBM-only claim. The index entrypoint checks again before its CBM leg. Missing or
+invalid configuration, native disablement, an armed sentinel or an unavailable
+backend defers CBM without starting a service or charging an indexing failure.
+A combined request can finish GitNexus and durably retain only CBM (`rc=5`).
+
+CBM always uses the pinned stock internal worker in the existing admitted
+8 GiB, zero-swap scope, with a 6 GiB native memory budget and OOM priority1000.
+Smaller or larger job-cap overrides refuse. Destination capacity, sibling/cache
+reserves and the existing pressure watchdog remain enforced. No PATH binary,
+ordinary daemon-delegating CLI or worker-binary environment override is used.
+
+Inside that actual scope, the worker acquires the shared lifecycle lock before
+fresh configuration and authorization checks, requires the configured physical
+main checkout, and executes the accepted inode with explicit managed environment.
+The lock releases immediately after child creation, before waiting. Disable
+refuses competing admission but does not cancel an already admitted worker;
+the existing scope watchdog owns cancellation and descendant cleanup.
+
+Authorization/capacity/lock refusals use the existing refusal marker and preserve
+queue attempts. Spawn, provider, response and crash failures remain charged
+errors (`111`); provider exit codes cannot impersonate queue deferrals. The
+generation-aware queue, escalation clock and durable outcomes are unchanged.
+The read-only `available --repo /absolute/main` command exposes these preflight
+checks; it is not execution authorization for another process. Worker invocation
+requires an explicit `--managed-config` argument from the existing entrypoint.
+
+## Native query service
 
 `genesis-cbm-query.service` invokes `serve` and `ready` using the installed
 settings path. These are unit entry points alongside the operator lifecycle and
