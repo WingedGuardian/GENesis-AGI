@@ -1279,21 +1279,41 @@ _xt_skip() {  # warn, drop this archive's temps, and let the caller `continue`
 }
 _xt_errtext() { head -c 300 "$_XT_ERR" 2>/dev/null | tr '\n' ' '; }
 log "--- Extra directories ---"
-# Without an off-site pull, the backup's local manifest (same format as the COMPLETE
-# marker) still says which listed directories that backup left out.
-if ! $_EXTRA_FROM_SNAPSHOT && [ -f "$BACKUP_DIR/extra/MANIFEST" ] \
-    && [ "$(head -1 "$BACKUP_DIR/extra/MANIFEST")" = "genesis-snapshot 1" ]; then
+# Only archives a list names are restored, never whatever happens to sit in extra/
+# (a file an earlier backup could not remove must not resurrect an old directory):
+# the names pulled from the selected snapshot, or else the backup's local manifest
+# ($BACKUP_DIR/.extra-manifest), which backup.sh rewrites on every run (same format
+# as the COMPLETE marker).
+_xt_allowed="" _xt_listed=false
+_xt_manifest="$BACKUP_DIR/.extra-manifest"
+if $_EXTRA_FROM_SNAPSHOT; then
+    _xt_allowed="$_EXTRA_PULLED" _xt_listed=true
+elif [ -f "$_xt_manifest" ] && [ "$(head -1 "$_xt_manifest")" = "genesis-snapshot 1" ]; then
+    _xt_listed=true
+    _xt_allowed="$(awk '$1 == "extra" {print $2}' "$_xt_manifest" | grep -E '^[A-Za-z0-9._-]+\.tar\.gpg$' || true)"
     while IFS= read -r _xt_sk; do
         warn "extra directory ${_xt_sk:-(unnamed entry)} was not in the last local backup; it is not restored"
-    done < <(awk '$1 == "skipped" {$1 = ""; sub(/^ /, ""); print}' "$BACKUP_DIR/extra/MANIFEST" | tr -cd '[:print:]\n')
+    done < <(awk '$1 == "skipped" {$1 = ""; sub(/^ /, ""); print}' "$_xt_manifest" | tr -cd '[:print:]\n')
+    while IFS= read -r _xt_n; do
+        if [ -n "$_xt_n" ] && [ ! -f "$BACKUP_DIR/extra/$_xt_n" ]; then
+            warn "extra archive $_xt_n is listed in .extra-manifest but missing from $BACKUP_DIR/extra; not restored"
+        fi
+    done <<<"$_xt_allowed"
 fi
-if find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2>/dev/null | grep -q .; then
+if ! $_xt_listed && find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2>/dev/null | grep -q .; then
+    warn "extra: $BACKUP_DIR/extra holds archives but no readable .extra-manifest, so which belong to the last backup is unknown; none restored"
+    log "Extra directories: 0 archive(s) restored"
+elif find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2>/dev/null | grep -q .; then
     _xt_home_real="$(realpath -- "$HOME")"
     _xt_helper="$_SCRIPT_DIR/lib/extra_restore.py"
     while IFS= read -r -d '' src; do
         name="$(basename "$src")"
-        if $_EXTRA_FROM_SNAPSHOT && ! grep -Fxq -- "$name" <<<"$_EXTRA_PULLED"; then
-            log "Extra: skipping $name (not supplied by the selected off-site snapshot)"
+        if ! grep -Fxq -- "$name" <<<"$_xt_allowed"; then
+            if $_EXTRA_FROM_SNAPSHOT; then
+                log "Extra: skipping $name (not supplied by the selected off-site snapshot)"
+            else
+                log "Extra: skipping $name (not listed in .extra-manifest: left from an earlier backup)"
+            fi
             continue
         fi
         if $DRY_RUN; then

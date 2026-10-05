@@ -420,14 +420,12 @@ def test_extra_dirs_archived_encrypted_offsite_only_with_default_excludes(backup
     members = _list_extra_archive(archives[0], home)
     assert "work/store/a.parquet" in members and "work/store/sub/b.txt" in members
     assert not any(".venv" in m or "__pycache__" in m or "scratch" in m for m in members), members
-    # No plaintext staging left behind (MANIFEST, a list of names, is the one
-    # intended plain file), and never committed to the git (Tier-1) repo.
+    # No plaintext staging left behind, and never committed to the git (Tier-1) repo.
     assert not [
-        p
-        for p in (_repo(backup_env) / "extra").iterdir()
-        if not p.name.endswith(".tar.gpg") and p.name != "MANIFEST"
+        p for p in (_repo(backup_env) / "extra").iterdir() if not p.name.endswith(".tar.gpg")
     ]
-    assert "extra/" in (_repo(backup_env) / ".gitignore").read_text().splitlines()
+    ignored = (_repo(backup_env) / ".gitignore").read_text().splitlines()
+    assert "extra/" in ignored and ".extra-manifest" in ignored, ignored
     tracked = subprocess.run(
         ["git", "ls-files", "extra"], cwd=_repo(backup_env), capture_output=True, text=True
     )
@@ -469,7 +467,7 @@ def test_extra_upload_failure_keeps_complete_but_marks_offsite_unconfirmed(backu
     assert status["extra_upload_failed"] == 1, status
     assert status["tier2_status"] == "partial", status
     assert status["offsite_confirmed"] is False, status
-    assert "extra dirs are incomplete (0 not archived, 1 not uploaded)" in proc.stdout, proc.stdout[
+    assert "extra dirs are incomplete (0 not archived, 0 partial, 1 not uploaded)" in proc.stdout, proc.stdout[
         -1500:
     ]
     # Codex round 3: the failed upload is named in COMPLETE, so restore reports the gap.
@@ -979,7 +977,7 @@ def test_a_non_ascii_entry_still_gets_a_named_skip_line(backup_env, tmp_path):
     lines = (_snaps(offsite)[-1] / "COMPLETE").read_text().splitlines()
     skipped = [ln for ln in lines if ln.startswith("skipped ")]
     assert skipped and all(len(ln) > len("skipped ") for ln in skipped), lines
-    manifest = (_repo(backup_env) / "extra" / "MANIFEST").read_text().splitlines()
+    manifest = (_repo(backup_env) / ".extra-manifest").read_text().splitlines()
     assert manifest[0] == "genesis-snapshot 1" and skipped[0] in manifest, manifest
 
 
@@ -1010,3 +1008,54 @@ def test_a_missing_nested_entry_never_refuses_its_existing_parent(backup_env, tm
     assert proc.returncode == 0, proc.stdout[-1500:]
     names = [p.name for p in (_repo(backup_env) / "extra").glob("*.tar.gpg")]
     assert len(names) == 1 and names[0].startswith("work_a-"), names
+
+
+@pytest.mark.parametrize("kind", ["link-out", "fifo"])
+def test_a_directory_restore_would_refuse_members_of_is_kept_as_partial(backup_env, tmp_path, kind):
+    """Codex P2 round 5: backup test-extracts each archive the way restore will, so a
+    symlink leading out of the directory or a FIFO inside it is known at backup time.
+    The archive is kept (the rest still restores) and recorded as partial, never as
+    complete."""
+    home = backup_env["home"]
+    d = home / "work" / "a"
+    d.mkdir(parents=True)
+    (d / "f").write_text("x")
+    if kind == "link-out":
+        (d / "out").symlink_to("/etc/hostname")
+    else:
+        os.mkfifo(d / "pipe")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/a"})
+    assert proc.returncode == 0, proc.stdout[-1500:]
+    assert "archived without members a restore would refuse" in proc.stdout, proc.stdout[-1500:]
+    assert len(list((_repo(backup_env) / "extra").glob("work_a-*.tar.gpg"))) == 1
+    status = _status(backup_env)
+    assert status["extras_complete"] is False and status["extra_dirs_partial"] == 1, status
+    assert status["tier2_status"] == "partial" and status["offsite_core_complete"] is True, status
+    manifest = (_repo(backup_env) / ".extra-manifest").read_text().splitlines()
+    assert "partial work/a" in manifest and any(ln.startswith("extra work_a-") for ln in manifest)
+    snap = _snaps(offsite)[-1]
+    marker = (snap / "COMPLETE").read_text().splitlines()
+    assert "partial work/a" in marker, marker
+    assert len(list((snap / "extra").glob("work_a-*.tar.gpg"))) == 1
+
+
+def test_the_local_manifest_is_rewritten_when_extras_are_unset(backup_env, tmp_path):
+    """Codex P2 round 5: a run with the setting unset still writes .extra-manifest, so
+    a local restore never reads an earlier run's skipped or extra lines."""
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    _seed_extra_dir(backup_env["home"])
+    env = {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store:~/work/missing"}
+    proc = _run_local(backup_env, offsite, env)
+    assert proc.returncode == 0, proc.stdout[-1500:]
+    manifest = _repo(backup_env) / ".extra-manifest"
+    first = manifest.read_text().splitlines()
+    assert any(ln.startswith("extra ") for ln in first) and "skipped work/missing" in first
+    _next_second()
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, proc.stdout[-1500:]
+    assert manifest.read_text() == "genesis-snapshot 1\n"
+    assert not list((manifest.parent / "extra").glob("*.tar.gpg"))
+    assert not (manifest.parent / ".extra-manifest.tmp").exists()

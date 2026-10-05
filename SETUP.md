@@ -173,9 +173,14 @@ alert, again whenever the set of missing directories changes. The core snapshot 
 core off-site copy still alerts on its own. The snapshot's `COMPLETE` marker
 lists the extra archives it holds and the listed directories it skipped, so a
 restore can tell "none" apart from "could not list them" and can name what a
-snapshot is missing; `extra/MANIFEST` in the backups checkout does the same for a
-restore that runs without an off-site pull. `scripts/update.sh` reports an
-extras-only gap as `backup:tier2_extras`, distinct from a real off-site failure. A file that changes while it is being archived (tar exit 1)
+snapshot is missing; `.extra-manifest` in the backups checkout does the same for a
+restore that runs without an off-site pull. Either way, restore only restores
+archives that list names: a leftover archive in `extra/` is never restored. Backup
+test-extracts each archive the way restore will (file contents left out), so it
+knows which members a restore would refuse, such as a symlink that leads outside
+the directory or a FIFO. Such a directory is still archived, but recorded as
+partial: the off-site copy is reported incomplete and the alert names it. Exclude
+those members with `GENESIS_BACKUP_EXTRA_EXCLUDES`. A file that changes while it is being archived (tar exit 1)
 is kept but may be torn, and the log says so; stop a writer whose files must be
 consistent, or exclude them. Without an off-site tier the archives stay local
 only, in the backups checkout, and no off-site alert applies.

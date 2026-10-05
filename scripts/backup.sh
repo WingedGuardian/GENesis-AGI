@@ -106,6 +106,7 @@ _QDRANT_COUNT=0
 _TRANSCRIPT_COUNT=0
 _MEMORY_COUNT=0
 _EXTRA_SKIP_LABELS=()  # declared before the EXIT trap can fire: its status write reads it
+_EXTRA_PARTIAL_LABELS=()
 # What this run's off-site alert block actually ANNOUNCED (or carried forward from a
 # run that did). A run that dies before the alert block records nothing announced, so
 # the next run alerts instead of assuming the earlier one did.
@@ -114,9 +115,13 @@ _ALERTED_GAP=""
 # A short fingerprint of WHICH listed directories this run left out (empty when none),
 # so the off-site alert re-fires when a different directory goes missing.
 _extras_gap_fingerprint() {
-    declare -p _EXTRA_SKIP_LABELS >/dev/null 2>&1 || return 0
-    [ "${#_EXTRA_SKIP_LABELS[@]}" -gt 0 ] || return 0
-    printf '%s\n' "${_EXTRA_SKIP_LABELS[@]}" | LC_ALL=C sort -u | sha1sum | cut -c1-12
+    declare -p _EXTRA_SKIP_LABELS _EXTRA_PARTIAL_LABELS >/dev/null 2>&1 || return 0
+    [ $((${#_EXTRA_SKIP_LABELS[@]} + ${#_EXTRA_PARTIAL_LABELS[@]})) -gt 0 ] || return 0
+    local _l
+    {
+        for _l in "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}"; do printf 'skipped %s\n' "$_l"; done
+        for _l in "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]}"}"; do printf 'partial %s\n' "$_l"; done
+    } | LC_ALL=C sort -u | sha1sum | cut -c1-12
 }
 _SECRETS_OK=false
 _SUCCESS=false
@@ -162,10 +167,10 @@ _write_status() {
     if [ "${_T2_STATUS:-}" = "ok" ] || [ "${_T2_EXTRAS_ONLY_PARTIAL:-false}" = true ]; then
         _offsite_core_complete=true
     fi
-    if [ $((${_EXTRA_SKIPPED:-0} + ${_EXTRA_UPLOAD_FAILED:-0})) -gt 0 ]; then _extras_complete=false; fi
+    if [ $((${_EXTRA_SKIPPED:-0} + ${_EXTRA_UPLOAD_FAILED:-0} + ${_EXTRA_PARTIAL:-0})) -gt 0 ]; then _extras_complete=false; fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 
@@ -774,10 +779,20 @@ _EXTRA_UPLOAD_FAILED=0
 _EXTRA_UPLOADED=()     # names that reached the off-site snapshot (recorded in COMPLETE)
 _EXTRA_BUILT=()        # names archived THIS run: the only ones uploaded
 _EXTRA_SKIP_LABELS=()  # listed entries not archived this run (recorded in COMPLETE)
+_EXTRA_PARTIAL=0       # archived, but a restore will refuse some of their members
+_EXTRA_PARTIAL_LABELS=()
 _extra_prev=0
 if mkdir -p extra 2>/dev/null; then
     _extra_prev="$(find extra -maxdepth 1 -type f -name '*.tar.gpg' 2>/dev/null | wc -l || true)"
     find extra -maxdepth 1 -type f -delete 2>/dev/null || true
+    # A file cleanup could not remove is never restored: restore takes only the
+    # names .extra-manifest lists, which is rewritten below on every run. It sits
+    # outside extra/, so an extra/ that cannot be written cannot pin an old one.
+    if find extra -maxdepth 1 -type f -print -quit 2>/dev/null | grep -q .; then
+        log "WARNING: extra/ still holds files from an earlier run that could not be removed; restore ignores them (only .extra-manifest's names are restored)"
+    fi
+else
+    log "WARNING: cannot create $BACKUP_DIR/extra; extra directories have no local copy this run"
 fi
 _extra_skip() {  # <reason> <entry>
     log "WARNING: extra dir skipped ($1): $2"
@@ -942,28 +957,45 @@ else
         fi
         [ "$_tar_rc" -eq 1 ] && log "NOTE: ~/$_rel changed while archiving; a file that was changing may be torn: $_tar_head"
         # tar treats excludes as wildcards, so a pattern can match the directory itself
-        # and yield an archive without it, with rc 0. Check with the reader restore uses
-        # (never by parsing `tar -t`, which escapes backslashes and, under a C locale,
-        # non-ASCII names), so backup keeps exactly what restore will accept.
-        _tar_root="" _tar_root_why=""
+        # and yield an archive without it, with rc 0. Check with the reader and the
+        # member filter restore uses (never by parsing `tar -t`, which escapes
+        # backslashes and, under a C locale, non-ASCII names), so backup keeps exactly
+        # what restore will accept.
+        _tar_root="" _tar_root_why="" _tar_verify_rc=0
         if _tar_root_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
             _EXTRA_TAR_ERR="$_tar_root_err"
-            _tar_root="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" root "$_tar_tmp" 2>"$_tar_root_err" || true)"
-            _tar_root_why="$(head -c 200 "$_tar_root_err" | tr '\n' ' ')"
+            _tar_root="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" verify "$_tar_tmp" "$GENESIS_BIG_TMP" 2>"$_tar_root_err")" || _tar_verify_rc=$?
+            _tar_root_why="$(head -c 300 "$_tar_root_err" | tr '\n' ' ')"
             rm -f "$_tar_root_err"
             _EXTRA_TAR_ERR=""
         else
+            _tar_verify_rc=5
             _tar_root_why="cannot create a temp file in $GENESIS_BIG_TMP"
         fi
-        if [ "$_tar_root" != "$_rel" ]; then
+        _tar_partial=false
+        if [ "$_tar_verify_rc" -eq 4 ] && [ "$_tar_root" = "$_rel" ]; then
+            # Kept: everything else in the directory still restores. Recorded as
+            # partial, so the off-site copy is not reported complete and the alert fires.
+            _tar_partial=true
+        elif [ "$_tar_verify_rc" -eq 0 ] && [ -n "$_tar_root" ] && [ "$_tar_root" != "$_rel" ]; then
             rm -f "$_tar_tmp"
             _EXTRA_TAR_TMP=""
-            _extra_skip "restore could not use the archive (${_tar_root_why:-it holds a different directory}); does an exclude pattern match the directory itself?" "$_d"
+            _extra_skip "the archive holds ${_tar_root} instead; does an exclude pattern match the directory itself?" "$_d"
+            continue
+        elif [ "$_tar_verify_rc" -ne 0 ] || [ "$_tar_root" != "$_rel" ]; then
+            rm -f "$_tar_tmp"
+            _EXTRA_TAR_TMP=""
+            _extra_skip "restore could not use the archive (rc=$_tar_verify_rc: ${_tar_root_why:-no directory member}); does an exclude pattern match the directory itself?" "$_d"
             continue
         fi
         if encrypt_file "$_tar_tmp" "$_gpg_tmp" && mv -f "$_gpg_tmp" "extra/$_name"; then
             _EXTRA_COUNT=$((_EXTRA_COUNT + 1))
             _EXTRA_BUILT+=("$_name")
+            if $_tar_partial; then
+                log "WARNING: extra dir archived without members a restore would refuse (exclude them with GENESIS_BACKUP_EXTRA_EXCLUDES): $_d: $_tar_root_why"
+                _EXTRA_PARTIAL=$((_EXTRA_PARTIAL + 1))
+                _EXTRA_PARTIAL_LABELS+=("$(LC_ALL=C printf '%q' "$_rel" | cut -c1-200)")
+            fi
         else
             rm -f "$_gpg_tmp"
             _extra_skip "encryption failed" "$_d"
@@ -974,14 +1006,24 @@ else
     if [ "$_extra_listed" -eq 0 ]; then
         _extra_skip "the list has no entries" "GENESIS_BACKUP_EXTRA_DIRS=$GENESIS_BACKUP_EXTRA_DIRS"
     fi
-    # Local manifest (same format as the off-site COMPLETE marker), for a restore
-    # that runs from this checkout without an off-site pull.
-    {
-        printf 'genesis-snapshot 1\n'
-        for _n in "${_EXTRA_BUILT[@]+"${_EXTRA_BUILT[@]}"}"; do printf 'extra %s\n' "$_n"; done
-        for _n in "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}"; do printf 'skipped %s\n' "$_n"; done
-    } > extra/MANIFEST 2>/dev/null || true
-    log "Extra dirs: $_EXTRA_COUNT archived, $_EXTRA_SKIPPED skipped"
+    log "Extra dirs: $_EXTRA_COUNT archived ($_EXTRA_PARTIAL partial), $_EXTRA_SKIPPED skipped"
+fi
+# Local manifest (same format as the off-site COMPLETE marker), written on EVERY run,
+# the setting unset included: a restore without an off-site pull restores only the
+# names it lists and reports what it says was skipped. Outside extra/ (gitignored
+# below), written to a temp name and renamed, so a reader never sees half of it; on
+# failure none is left behind, and a restore then restores no local extra archive
+# rather than a stale one.
+if {
+    printf 'genesis-snapshot 1\n'
+    for _n in "${_EXTRA_BUILT[@]+"${_EXTRA_BUILT[@]}"}"; do printf 'extra %s\n' "$_n"; done
+    for _n in "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}"; do printf 'skipped %s\n' "$_n"; done
+    for _n in "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]}"}"; do printf 'partial %s\n' "$_n"; done
+} 2>/dev/null > .extra-manifest.tmp && mv -f .extra-manifest.tmp .extra-manifest 2>/dev/null; then
+    :
+else
+    rm -f .extra-manifest.tmp .extra-manifest 2>/dev/null || true
+    log "WARNING: could not write .extra-manifest; a restore from this checkout will not restore its extra archives (the off-site snapshot is unaffected)"
 fi
 
 # --- 6d. Hook audit stores (Tier 1) ---
@@ -1390,6 +1432,9 @@ else
             for _n in "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}"; do
                 printf 'skipped %s\n' "$_n"
             done
+            for _n in "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]}"}"; do
+                printf 'partial %s\n' "$_n"
+            done
         } > "$_T2_MARKER"
         if ! backend_put "$_T2_MARKER" "${_T2_DIR}/COMPLETE"; then
             log "WARNING: off-site upload failed for COMPLETE marker — snapshot unusable for restore"
@@ -1398,13 +1443,13 @@ else
         rm -f "$_T2_MARKER"
     fi
 
-    if [ "$_T2_OK" = true ] && [ $((_EXTRA_UPLOAD_FAILED + _EXTRA_SKIPPED)) -gt 0 ]; then
+    if [ "$_T2_OK" = true ] && [ $((_EXTRA_UPLOAD_FAILED + _EXTRA_SKIPPED + _EXTRA_PARTIAL)) -gt 0 ]; then
         # Core snapshot is COMPLETE and restorable, but the off-site copy is not the
         # full set the operator asked for (an extra dir was not archived this run, or
         # its archive did not upload), so it is not reported as confirmed.
         _T2_STATUS="partial"
         _T2_EXTRAS_ONLY_PARTIAL=true  # core is complete: retention still runs (below)
-        log "WARNING: Tier 2 snapshot ${_T2_STAMP} is COMPLETE but extra dirs are incomplete (${_EXTRA_SKIPPED} not archived, ${_EXTRA_UPLOAD_FAILED} not uploaded)"
+        log "WARNING: Tier 2 snapshot ${_T2_STAMP} is COMPLETE but extra dirs are incomplete (${_EXTRA_SKIPPED} not archived, ${_EXTRA_PARTIAL} partial, ${_EXTRA_UPLOAD_FAILED} not uploaded)"
     elif [ "$_T2_OK" = true ]; then
         _T2_STATUS="ok"
         log "Tier 2 backup copied to off-site snapshot ${_T2_STAMP} (backend: ${_T2_BACKEND})"
@@ -1480,6 +1525,11 @@ if ! grep -qx 'extra/' .gitignore 2>/dev/null; then
     if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then printf '\n' >> .gitignore; fi
     printf 'extra/\n' >> .gitignore
     log "Added extra/ to the Tier 2 .gitignore exclusions"
+fi
+if ! grep -qx '.extra-manifest' .gitignore 2>/dev/null; then
+    if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then printf '\n' >> .gitignore; fi
+    printf '.extra-manifest\n.extra-manifest.tmp\n' >> .gitignore
+    log "Added .extra-manifest to the .gitignore exclusions"
 fi
 
 # --- Commit and push (Tier 1 only) ---
@@ -1582,8 +1632,9 @@ print(core, gap or '-')
 
 The core backup reached the off-site snapshot and is restorable, but the
 extra directories are incomplete: ${_EXTRA_SKIPPED:-0} not archived this run,
-${_EXTRA_UPLOAD_FAILED:-0} not uploaded. Not in this snapshot:
-$(printf '%s\n' "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}" | head -5)
+${_EXTRA_UPLOAD_FAILED:-0} not uploaded, ${_EXTRA_PARTIAL:-0} archived without members a
+restore would refuse. Missing or partial in this snapshot:
+$(printf '%s\n' "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}" "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]/%/ (partial)}"}" | head -5)
 Time: $(date -Is)"
         elif [ "$_SQL_ESCROW_DRIFT" = true ]; then
             _send_telegram "⚠️ *Off-site DR degraded — backup passphrase escrow drift*

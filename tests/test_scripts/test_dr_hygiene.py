@@ -269,7 +269,40 @@ def test_n5_force_with_payload_succeeds(restore_sandbox):
 # ── §4c opt-in extra directories (backup.sh §6f) ─────────────────────
 
 
-def _seed_extra_archive(sb, name: str, members: dict, *, symlinks: dict | None = None):
+def _write_extra_gpg(sb, name: str, tar_bytes: bytes, *, listed: bool = True):
+    """Encrypt ``tar_bytes`` to backup/extra/<name>.tar.gpg and, like backup.sh, list
+    it in .extra-manifest (restore takes only the names the manifest lists)."""
+    extra = sb["backup"] / "extra"
+    extra.mkdir(exist_ok=True)
+    plain = sb["tmp"] / f"{name}.tar"
+    plain.write_bytes(tar_bytes)
+    subprocess.run(
+        [
+            "gpg",
+            "--batch",
+            "--yes",
+            "--passphrase",
+            _TEST_PASSPHRASE,
+            "--symmetric",
+            "--cipher-algo",
+            "AES256",
+            "-o",
+            str(extra / f"{name}.tar.gpg"),
+            str(plain),
+        ],
+        env={**sb["env"], "GNUPGHOME": str(sb["home"] / ".gnupg")},
+        check=True,
+        capture_output=True,
+    )
+    if listed:
+        manifest = sb["backup"] / ".extra-manifest"
+        text = manifest.read_text() if manifest.exists() else "genesis-snapshot 1\n"
+        manifest.write_text(text + f"extra {name}.tar.gpg\n")
+
+
+def _seed_extra_archive(
+    sb, name: str, members: dict, *, symlinks: dict | None = None, listed: bool = True
+):
     """Write backup/extra/<name>.tar.gpg holding ``members`` (path -> bytes) and
     optional ``symlinks`` (path -> target), member paths stored verbatim."""
     import io
@@ -302,27 +335,7 @@ def _seed_extra_archive(sb, name: str, members: dict, *, symlinks: dict | None =
             info.type = tarfile.SYMTYPE
             info.linkname = target
             tf.addfile(info)
-    (sb["backup"] / "extra").mkdir(exist_ok=True)
-    plain = sb["tmp"] / f"{name}.tar"
-    plain.write_bytes(buf.getvalue())
-    subprocess.run(
-        [
-            "gpg",
-            "--batch",
-            "--yes",
-            "--passphrase",
-            _TEST_PASSPHRASE,
-            "--symmetric",
-            "--cipher-algo",
-            "AES256",
-            "-o",
-            str(sb["backup"] / "extra" / f"{name}.tar.gpg"),
-            str(plain),
-        ],
-        env={**sb["env"], "GNUPGHOME": str(sb["home"] / ".gnupg")},
-        check=True,
-        capture_output=True,
-    )
+    _write_extra_gpg(sb, name, buf.getvalue(), listed=listed)
 
 
 def _restore_extra(sb, *extra_args):
@@ -432,27 +445,7 @@ def test_unsafe_member_in_a_long_listing_is_still_refused(restore_sandbox, link_
             tf.addfile(info, io.BytesIO(b""))
         if not link_first:
             tf.addfile(link)
-    (sb["backup"] / "extra").mkdir(exist_ok=True)
-    plain = sb["tmp"] / "big.tar"
-    plain.write_bytes(buf.getvalue())
-    subprocess.run(
-        [
-            "gpg",
-            "--batch",
-            "--yes",
-            "--passphrase",
-            _TEST_PASSPHRASE,
-            "--symmetric",
-            "--cipher-algo",
-            "AES256",
-            "-o",
-            str(sb["backup"] / "extra" / "big-22222222.tar.gpg"),
-            str(plain),
-        ],
-        env={**sb["env"], "GNUPGHOME": str(sb["home"] / ".gnupg")},
-        check=True,
-        capture_output=True,
-    )
+    _write_extra_gpg(sb, "big-22222222", buf.getvalue())
     proc = _restore_extra(sb)
     assert "extra archive refused" in proc.stdout, proc.stdout[-2000:]
     assert not (sb["home"] / "work" / "big" / "aa-link").is_symlink()
@@ -507,27 +500,7 @@ def _seed_tree_archive(sb, name: str, entries: list):
             else:
                 info.size = len(data)
                 tf.addfile(info, io.BytesIO(data))
-    (sb["backup"] / "extra").mkdir(exist_ok=True)
-    plain = sb["tmp"] / f"{name}.tar"
-    plain.write_bytes(buf.getvalue())
-    subprocess.run(
-        [
-            "gpg",
-            "--batch",
-            "--yes",
-            "--passphrase",
-            _TEST_PASSPHRASE,
-            "--symmetric",
-            "--cipher-algo",
-            "AES256",
-            "-o",
-            str(sb["backup"] / "extra" / f"{name}.tar.gpg"),
-            str(plain),
-        ],
-        env={**sb["env"], "GNUPGHOME": str(sb["home"] / ".gnupg")},
-        check=True,
-        capture_output=True,
-    )
+    _write_extra_gpg(sb, name, buf.getvalue())
 
 
 def test_extra_restore_keeps_directory_entries_and_modes(restore_sandbox):
@@ -663,27 +636,7 @@ def test_extra_archive_without_its_directory_never_replaces_the_parent(restore_s
         info.type = tarfile.SYMTYPE
         info.linkname = "real_target"
         tf.addfile(info)
-    (sb["backup"] / "extra").mkdir(exist_ok=True)
-    plain = sb["tmp"] / "lone.tar"
-    plain.write_bytes(buf.getvalue())
-    subprocess.run(
-        [
-            "gpg",
-            "--batch",
-            "--yes",
-            "--passphrase",
-            _TEST_PASSPHRASE,
-            "--symmetric",
-            "--cipher-algo",
-            "AES256",
-            "-o",
-            str(sb["backup"] / "extra" / "lone-88888888.tar.gpg"),
-            str(plain),
-        ],
-        env={**sb["env"], "GNUPGHOME": str(sb["home"] / ".gnupg")},
-        check=True,
-        capture_output=True,
-    )
+    _write_extra_gpg(sb, "lone-88888888", buf.getvalue())
     proc = _restore_extra(sb)
     assert (projects / "other" / "keep.txt").read_text() == "keep"
     assert not list(sb["home"].glob("projects.pre-restore-*")), "the parent was moved aside"
@@ -762,9 +715,11 @@ def test_extra_empty_destination_is_kept_when_the_restore_fails(restore_sandbox)
         sb,
         "work_store-abcd1234",
         [
+            # a file member over a directory member: extraction itself fails (a member
+            # the filter refuses would only be dropped, and the rest restored)
             ("work/store", "dir", 0o755, b""),
-            ("work/store/x", "file", 0o644, b""),
-            ("work/store/x/y", "dir", 0o755, b""),
+            ("work/store/x", "dir", 0o755, b""),
+            ("work/store/x", "file", 0o644, b"x"),
         ],
     )
     proc = subprocess.run(
@@ -804,11 +759,13 @@ def test_extra_local_manifest_names_skipped_directories(restore_sandbox):
     manifest and records each directory the last backup left out."""
     sb = restore_sandbox
     _seed_extra_archive(sb, "work_store-abcd1234", {"work/store/a.parquet": b"x"})
-    (sb["backup"] / "extra" / "MANIFEST").write_text(
+    (sb["backup"] / ".extra-manifest").write_text(
         "genesis-snapshot 1\nextra work_store-abcd1234.tar.gpg\nskipped work/gone\n"
     )
     proc = _restore_extra(sb)
-    assert "extra directory work/gone was not in the last local backup" in proc.stdout, proc.stdout[-1500:]
+    assert "extra directory work/gone was not in the last local backup" in proc.stdout, proc.stdout[
+        -1500:
+    ]
     assert any("work/gone" in f for f in _status(sb)["failures"]), _status(sb)
     assert (sb["home"] / "work" / "store" / "a.parquet").read_bytes() == b"x"
 
@@ -830,3 +787,41 @@ def test_extra_unreadable_destination_is_not_treated_as_empty(restore_sandbox):
     finally:
         for p in (sb["home"] / "work").iterdir():
             p.chmod(0o755)
+
+
+def test_extra_archive_the_manifest_does_not_list_is_never_restored(restore_sandbox):
+    """Codex P2 round 5: a file an earlier backup could not remove stays in extra/;
+    a local restore takes only the names .extra-manifest lists."""
+    sb = restore_sandbox
+    _seed_extra_archive(sb, "fresh-11111111", {"fresh/f.txt": b"new"})
+    _seed_extra_archive(sb, "stale-22222222", {"stale/f.txt": b"old"}, listed=False)
+    proc = _restore_extra(sb)
+    assert (sb["home"] / "fresh" / "f.txt").read_bytes() == b"new", proc.stdout[-1500:]
+    assert not (sb["home"] / "stale").exists(), proc.stdout[-1500:]
+    assert "skipping stale-22222222.tar.gpg (not listed in .extra-manifest" in proc.stdout
+
+
+def test_extra_archives_without_a_manifest_are_not_restored(restore_sandbox):
+    """With no readable manifest, which archives belong to the last backup is unknown:
+    none is restored, and the restore says so as a failure."""
+    sb = restore_sandbox
+    _seed_extra_archive(sb, "work_store-abcd1234", {"work/store/a.parquet": b"x"}, listed=False)
+    proc = _restore_extra(sb)
+    assert not (sb["home"] / "work" / "store").exists(), proc.stdout[-1500:]
+    assert "holds archives but no readable .extra-manifest" in proc.stdout, proc.stdout[-1500:]
+    assert any("no readable .extra-manifest" in f for f in _status(sb)["failures"]), _status(sb)
+
+
+def test_extra_archive_listed_but_missing_is_reported(restore_sandbox):
+    """A name the local manifest lists with no archive behind it is a reported failure,
+    never a silent "none in backup"."""
+    sb = restore_sandbox
+    _seed_extra_archive(sb, "kept-00000000", {"kept/f.txt": b"ok"})
+    _seed_extra_archive(sb, "fresh-11111111", {"fresh/f.txt": b"new"})
+    (sb["backup"] / "extra" / "fresh-11111111.tar.gpg").unlink()
+    proc = _restore_extra(sb)
+    assert (
+        "extra archive fresh-11111111.tar.gpg is listed in .extra-manifest but missing"
+        in proc.stdout
+    ), proc.stdout[-1500:]
+    assert any("fresh-11111111" in f for f in _status(sb)["failures"]), _status(sb)

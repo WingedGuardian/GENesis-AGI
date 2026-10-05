@@ -252,3 +252,77 @@ def test_root_prints_a_non_utf8_name_under_a_strict_locale(tmp_path):
         )
         assert proc.returncode == 0, (locale, proc.stderr)
         assert proc.stdout == b"w\xff\n", (locale, proc.stdout)
+
+
+def _tar_file(tmp_path, entries):
+    t = tmp_path / "a.tar"
+    with _tar(entries) as src, tarfile.open(t, "w") as dst:
+        for m in src.getmembers():
+            dst.addfile(m, src.extractfile(m) if m.isfile() else None)
+    return t
+
+
+def test_verify_accepts_what_swap_restores_whole(tmp_path, capsysbinary):
+    t = _tar_file(
+        tmp_path,
+        [("w/s", "dir", None), ("w/s/f", "file", b"x"), ("w/s/cur", "sym", "f")],
+    )
+    assert er.cmd_verify(str(t), str(tmp_path)) == 0
+    assert capsysbinary.readouterr().out == b"w/s\n"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        ("w/s/out", "sym", "/etc/passwd"),  # absolute link
+        ("w/s/up", "sym", "../../x"),  # relative link leaving the directory
+    ],
+)
+def test_verify_reports_each_member_swap_would_refuse(tmp_path, capsysbinary, bad):
+    """Codex P2 round 5: backup must learn at backup time what restore will drop."""
+    t = _tar_file(tmp_path, [("w/s", "dir", None), ("w/s/f", "file", b"x"), bad])
+    assert er.cmd_verify(str(t), str(tmp_path)) == 4
+    cap = capsysbinary.readouterr()
+    assert cap.out == b"w/s\n"
+    assert bad[0].encode() in cap.err and b"refused member" in cap.err
+
+
+def test_verify_reports_a_special_file(tmp_path, capsysbinary):
+    t = tmp_path / "a.tar"
+    with tarfile.open(t, "w") as tf:
+        d = tarfile.TarInfo("w/s")
+        d.type = tarfile.DIRTYPE
+        tf.addfile(d)
+        f = tarfile.TarInfo("w/s/pipe")
+        f.type = tarfile.FIFOTYPE
+        tf.addfile(f)
+    assert er.cmd_verify(str(t), str(tmp_path)) == 4
+    assert b"w/s/pipe" in capsysbinary.readouterr().err
+
+
+def test_verify_judges_members_against_what_earlier_members_left(tmp_path, capsysbinary):
+    """Deep review: a link that runs through an extracted FILE is refused only during a
+    real extraction; verify must say so too, and swap must refuse that one member
+    instead of aborting the whole directory."""
+    t = tmp_path / "a.tar"
+    with tarfile.open(t, "w") as tf:
+        d = tarfile.TarInfo("w/s")
+        d.type = tarfile.DIRTYPE
+        d.mode = 0o755
+        tf.addfile(d)
+        f = tarfile.TarInfo("w/s/data.txt")
+        f.size = 1
+        tf.addfile(f, io.BytesIO(b"x"))
+        link = tarfile.TarInfo("w/s/zlink")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "data.txt/x"
+        tf.addfile(link)
+    assert er.cmd_verify(str(t), str(tmp_path)) == 4
+    assert b"w/s/zlink" in capsysbinary.readouterr().err
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith(".extra-verify")]
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    (tmp_path / "w").mkdir()  # restore.sh creates the parent first
+    assert er.cmd_swap(str(t), str(stage), "w/s", str(tmp_path / "w" / "s"), "") == 4
+    assert (tmp_path / "w" / "s" / "data.txt").read_bytes() == b"x"
+    assert not (tmp_path / "w" / "s" / "zlink").is_symlink()
