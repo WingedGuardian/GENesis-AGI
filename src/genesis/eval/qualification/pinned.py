@@ -443,7 +443,7 @@ class PinnedRouter:
             raise LocalFailure("qualification prohibits chain rotation")
         configured = self.params[route(self.contract)]
         for name, value in kwargs.items():
-            if name not in ROUTE_KEYS or configured.get(name, value) != value:
+            if name not in ROUTE_KEYS or name not in configured or configured[name] != value:
                 raise LocalFailure(f"call-site parameter {name!r} contradicts the params file")
         key = (self.contract, versions()[self.contract], case_id, self.repetition, prompt_hash)
         line = self.answers.get(key)

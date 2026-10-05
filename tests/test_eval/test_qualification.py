@@ -71,9 +71,9 @@ def _mutations():
     yield "nan embedding", corpus.NOVELTY, lambda c: c["new"].update(embedding=[float("nan")])
     yield "float64-only embedding", corpus.NOVELTY, lambda c: c["new"].update(embedding=[1e39])
     yield (
-        "duplicate task type",
+        "inconsistent repeated principle embedding",
         corpus.NOVELTY,
-        lambda c: c["existing"][0].update(task_type=c["existing"][1]["task_type"]),
+        lambda c: c["existing"][0].update(principle=c["existing"][1]["principle"]),
     )
 
 

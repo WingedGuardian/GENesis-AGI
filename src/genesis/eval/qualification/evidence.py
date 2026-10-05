@@ -63,6 +63,14 @@ def private_open(path: Path, flags: int) -> int:
     return fd
 
 
+def sync_directory(path: Path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class Campaign:
     """An exclusive ``flock`` on a 0700 directory plus its answers file.
 
@@ -91,6 +99,11 @@ class Campaign:
             self._file = private_open(
                 self.directory / "answers.jsonl", os.O_CREAT | os.O_RDWR | os.O_APPEND
             )
+            # File fsync alone cannot persist newly created directory entries.
+            os.fsync(self._lock)
+            os.fsync(self._file)
+            sync_directory(self.directory)
+            sync_directory(self.directory.parent)
             self._load()
         except BaseException:
             self.__exit__()

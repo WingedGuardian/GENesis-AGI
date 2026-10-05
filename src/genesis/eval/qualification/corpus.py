@@ -158,7 +158,7 @@ def validate_novelty(case: dict):
     candidate, existing = case.get("new"), case.get("existing")
     if not isinstance(candidate, dict) or not isinstance(existing, list) or not existing:
         raise Incomplete("novelty requires new and existing procedures")
-    names, ids, principles = set(), set(), set()
+    ids, embeddings = set(), {}
     for row in [candidate, *existing]:
         if not isinstance(row, dict):
             raise Incomplete("procedure must be a JSON object")
@@ -166,11 +166,6 @@ def validate_novelty(case: dict):
             value = row.get(key)
             if not isinstance(value, str) or not value.strip() or "\n" in value or "\r" in value:
                 raise Incomplete("invalid procedure text")
-        # Task types map rendered candidates back to ids; principles map embeddings.
-        if row["task_type"] in names or row["principle"] in principles:
-            raise Incomplete("task types and principles must be unique within a case")
-        names.add(row["task_type"])
-        principles.add(row["principle"])
         steps = row.get("steps")
         if (
             not isinstance(steps, list)
@@ -194,6 +189,10 @@ def validate_novelty(case: dict):
             or not any(vector)
         ):
             raise Incomplete("invalid deterministic embedding")
+        vector_key = tuple(vector) + (0.0,) * (EMBEDDING_DIM - len(vector))
+        if row["principle"] in embeddings and embeddings[row["principle"]] != vector_key:
+            raise Incomplete("same principle must have a consistent deterministic embedding")
+        embeddings[row["principle"]] = vector_key
     for row in existing:
         if not isinstance(row.get("id"), str) or not row["id"] or row["id"] in ids:
             raise Incomplete("invalid procedure id")

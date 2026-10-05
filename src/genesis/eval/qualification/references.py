@@ -21,7 +21,11 @@ def nonblank(value):
 
 
 def identity(value):
-    return unicodedata.normalize("NFC", value.strip()).casefold()
+    value = unicodedata.normalize("NFC", value.strip()).casefold()
+    prefixes = ("openrouter/", "deepinfra/", "nvidia_nim/", "litellm/")
+    while value.startswith(prefixes):
+        value = value.split("/", 1)[1].strip()
+    return value
 
 
 def validate_policy(policy, contracts):
@@ -35,8 +39,9 @@ def validate_policy(policy, contracts):
         not isinstance(models, list)
         or not models
         or any(not nonblank(m) or m != m.strip() for m in models)
-        or len(set(models)) != len(models)
-        or any(identity(m).startswith(("xiaomi/mimo", "deepseek/")) for m in models)
+        or any(not identity(m) for m in models)
+        or len({identity(m) for m in models}) != len(models)
+        or any(identity(m).startswith(("xiaomi/mimo", "deepseek/", "deepseek-ai/")) for m in models)
     ):
         raise Incomplete("approved frontier graders must exclude qualification candidates")
     if not nonblank(policy.get("guidance")):
@@ -112,7 +117,10 @@ def blockers(contract, case, policy, version):
             issues.append("invalid confidence")
         elif confidence < policy.get("confidence_threshold", 90):
             issues.append("confidence below human-review threshold")
-        if provenance.get("model_id") not in policy["approved_models"]:
+        model = provenance.get("model_id")
+        if not nonblank(model) or identity(model) not in {
+            identity(m) for m in policy["approved_models"]
+        }:
             issues.append("unapproved grader model")
         if not all(
             nonblank(provenance.get(k))

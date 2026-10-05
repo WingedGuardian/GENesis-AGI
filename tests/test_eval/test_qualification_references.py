@@ -39,6 +39,44 @@ def policy():
     }
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        "openrouter/xiaomi/mimo-v2.6-pro",
+        "OPENROUTER/XIAOMI/MIMO-V2.6-PRO",
+        "deepinfra/xiaomi/mimo-v2.6-pro",
+        "nvidia_nim/deepseek-ai/deepseek-v4.1-flash",
+        "litellm/openrouter/deepseek/deepseek-v4.1-flash",
+        "openrouter/deepseek/deepseek-v4-pro",
+    ],
+)
+def test_gateway_prefixes_do_not_admit_candidate_graders(model):
+    guidance = policy()
+    guidance["approved_models"] = [model]
+    with pytest.raises(Incomplete, match="exclude qualification candidates"):
+        references.validate_policy(guidance, corpus.versions())
+
+
+def test_normalized_grader_duplicates_are_rejected():
+    guidance = policy()
+    guidance["approved_models"] = ["synthetic-frontier", "openrouter/synthetic-frontier"]
+    with pytest.raises(Incomplete):
+        references.validate_policy(guidance, corpus.versions())
+
+
+@pytest.mark.parametrize("model", ["openrouter/", "litellm/openrouter/"])
+def test_gateway_without_a_model_is_rejected(model):
+    guidance = policy()
+    guidance["approved_models"] = [model]
+    with pytest.raises(Incomplete):
+        references.validate_policy(guidance, corpus.versions())
+
+
+def test_identity_normalizes_gateway_without_removing_vendor():
+    assert references.identity("litellm/openrouter/openai/gpt-6") == "openai/gpt-6"
+    assert references.identity("openrouter/xiaomi/mimo-v2.6-pro") == "xiaomi/mimo-v2.6-pro"
+
+
 def receipt(name, case, guidance):
     case["reference_review"] = {
         "reviewer": "synthetic-frontier-reviewer",

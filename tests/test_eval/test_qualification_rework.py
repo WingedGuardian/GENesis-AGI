@@ -3,12 +3,13 @@
 import asyncio
 import copy
 import json
+import os
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
-from genesis.eval.qualification import contracts, corpus, pinned, preflight, run
+from genesis.eval.qualification import contracts, corpus, evidence, pinned, preflight, run
 from genesis.eval.qualification.evidence import Campaign, Incomplete, digest
 from tests.test_eval.qualification_fixtures import (
     OpenRouter,
@@ -16,9 +17,154 @@ from tests.test_eval.qualification_fixtures import (
     novelty_case,
     params,
     relevance_case,
+    small_corpus,
 )
 from tests.test_eval.test_qualification import Stub
 from tests.test_eval.test_qualification_pinned import ask, router
+
+
+async def test_journal_directory_barriers_precede_completion(tmp_path, monkeypatch):
+    isolate_credentials(monkeypatch, tmp_path)
+    original = os.fsync
+    events = []
+    directory = tmp_path / "campaign"
+
+    def fsync(fd):
+        events.append(os.readlink(f"/proc/self/fd/{fd}"))
+        original(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    server = OpenRouter()
+
+    def transport(request):
+        if request.method == "POST":
+            events.append("POST")
+        return server(request)
+
+    with Campaign(directory) as campaign:
+        await ask(router(campaign, SimpleNamespace(transport=httpx.MockTransport(transport))))
+    assert events.index(str(directory)) < events.index("POST")
+    assert events.index(str(directory.parent)) < events.index("POST")
+    assert events.index(str(directory / "answers.jsonl")) < events.index("POST")
+
+
+@pytest.mark.parametrize("parent", [False, True])
+async def test_failed_directory_barrier_refuses_completion(tmp_path, monkeypatch, parent):
+    isolate_credentials(monkeypatch, tmp_path)
+    directory = tmp_path / "campaign"
+    original = evidence.sync_directory
+
+    def fail(path):
+        if path == (directory.parent if parent else directory):
+            raise OSError("synthetic directory sync failure")
+        original(path)
+
+    monkeypatch.setattr(evidence, "sync_directory", fail)
+    server = OpenRouter()
+    with pytest.raises(OSError, match="directory sync failure"), Campaign(directory) as campaign:
+        await ask(router(campaign, server))
+    assert not server.requests and not server.key_reads
+
+
+@pytest.mark.parametrize("route_name", ["judge", "relevance"])
+async def test_implicit_callsite_temperature_must_be_frozen(tmp_path, route_name):
+    cases = small_corpus(novelty=False)
+    name = corpus.RELEVANCE if route_name == "relevance" else next(iter(cases))
+    plan = await preflight.prepare({name: cases[name]}, tmp_path)
+    configured = params()
+    configured[route_name].pop("temperature")
+    with pytest.raises(Incomplete, match="call-site parameter"):
+        preflight.parameters("openrouter-mimo", configured, plan)
+
+
+async def test_implicit_router_parameter_refuses_before_key_read(tmp_path, monkeypatch):
+    isolate_credentials(monkeypatch, tmp_path)
+    configured = params()
+    configured["judge"].pop("temperature")
+    server = OpenRouter()
+    with (
+        Campaign(tmp_path / "campaign") as campaign,
+        pytest.raises(pinned.LocalFailure, match="contradicts"),
+    ):
+        await ask(router(campaign, server, params=configured))
+    assert not server.requests and not server.key_reads
+
+
+@pytest.mark.parametrize("same_principle", [False, True])
+@pytest.mark.parametrize("target", ["candidate-a", "candidate-b"])
+async def test_repeated_slugs_map_and_replay_exact_targets(tmp_path, target, same_principle):
+    case = novelty_case("synthetic-repeated", target)
+    for row in case["existing"]:
+        row["task_type"] = "repeated-slug"
+    if same_principle:
+        case["existing"][1]["principle"] = case["existing"][0]["principle"]
+        case["existing"][1]["embedding"] = case["existing"][0]["embedding"]
+    await preflight.prepare({corpus.NOVELTY: [case]}, tmp_path)
+    probe = contracts.Probe()
+    async with contracts.Sandbox(tmp_path) as sandbox:
+        await contracts.novelty(case, probe, sandbox)
+    mapping = contracts.candidate_mapping(case, probe.calls[0][0], probe.candidate_ids)
+    assert set(mapping) == {"candidate-a", "candidate-b"}
+    answer = json.dumps({"redundant_with": mapping.index(target) + 1})
+    assert contracts.raw_target(answer, mapping) == target
+
+
+@pytest.mark.parametrize("flag", ["deprecated", "quarantined"])
+async def test_excluded_identical_candidate_does_not_collide(tmp_path, flag):
+    case = novelty_case("synthetic-excluded", "candidate-a")
+    clone = copy.deepcopy(case["existing"][0])
+    clone.update(id="excluded-clone", **{flag: True})
+    case["existing"].append(clone)
+    original = contracts.extractor._row_get
+    probe = contracts.Probe()
+    async with contracts.Sandbox(tmp_path) as sandbox:
+        await contracts.novelty(case, probe, sandbox)
+    assert contracts.extractor._row_get is original
+    assert probe.candidate_ids == ["candidate-b", "candidate-a"]
+
+
+@pytest.mark.parametrize("population", [11, 501])
+async def test_unselected_identical_candidate_does_not_collide(tmp_path, population):
+    case = novelty_case("synthetic-limits", "candidate-b")
+    first = case["existing"][1]
+    first["embedding"] = [1, 0]
+    case["existing"] = [first]
+    for index in range(1, population):
+        clone = copy.deepcopy(first)
+        clone["id"] = f"population-{index}"
+        if index != population - 1:
+            clone["steps"] = [f"Distinct rendered action {index}"]
+        case["existing"].append(clone)
+    probe = contracts.Probe()
+    async with contracts.Sandbox(tmp_path) as sandbox:
+        await contracts.novelty(case, probe, sandbox)
+    assert len(probe.candidate_ids) == 10
+    assert probe.candidate_ids[0] == "candidate-b"
+    assert f"population-{population - 1}" not in probe.candidate_ids
+
+
+async def test_candidate_observer_restored_after_cancellation(tmp_path, monkeypatch):
+    original = contracts.extractor._row_get
+
+    async def cancelled(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(contracts.extractor, "_principle_is_novel", cancelled)
+    async with contracts.Sandbox(tmp_path) as sandbox:
+        with pytest.raises(asyncio.CancelledError):
+            await contracts.novelty(novelty_case("cancelled", None), contracts.Probe(), sandbox)
+    assert contracts.extractor._row_get is original
+
+
+async def test_indistinguishable_rendered_candidates_fail_offline(tmp_path):
+    case = novelty_case("synthetic-collision", "candidate-a")
+    first, second = case["existing"]
+    second.update(copy.deepcopy({k: v for k, v in first.items() if k != "id"}))
+    # Distinct tails beyond production's160-character truncation remain indistinguishable.
+    first["steps"] = ["x" * 160 + "a"]
+    second["steps"] = ["x" * 160 + "b"]
+    with pytest.raises(Incomplete, match="ambiguous rendered"):
+        await preflight.prepare({corpus.NOVELTY: [case]}, tmp_path)
 
 
 @pytest.mark.parametrize("provider", [None, "Synthetic"])
@@ -243,7 +389,7 @@ async def test_saved_verdict_replays_both_storage_paths(tmp_path, target):
     async with contracts.Sandbox(tmp_path) as sandbox:
         await contracts.novelty(case, probe, sandbox)
         messages = probe.calls[0][0]
-        mapping = contracts.candidate_mapping(case, messages)
+        mapping = contracts.candidate_mapping(case, messages, probe.candidate_ids)
         content = json.dumps({"redundant_with": mapping.index(target) + 1 if target else None})
         result = await replay(
             case, messages, mapping, content, sandbox, "openrouter-mimo", "xiaomi/mimo-v2.6-pro"
@@ -280,7 +426,7 @@ async def test_independent_storage_gates_are_reported_without_model_error(tmp_pa
         result = await replay(
             case,
             messages,
-            contracts.candidate_mapping(case, messages),
+            contracts.candidate_mapping(case, messages, probe.candidate_ids),
             content,
             sandbox,
             "openrouter-mimo",

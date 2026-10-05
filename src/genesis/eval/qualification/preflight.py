@@ -34,7 +34,7 @@ async def prepare(cases, temp_root, *, reference_policy=None):
                     from genesis.eval.qualification.storage import replay
 
                     messages = capture.calls[0][0]
-                    mapping = contracts.candidate_mapping(case, messages)
+                    mapping = contracts.candidate_mapping(case, messages, capture.candidate_ids)
                     target = case["expected_target"]
                     content = json.dumps(
                         {"redundant_with": mapping.index(target) + 1 if target else None}
@@ -93,6 +93,6 @@ def parameters(alias, configured, plan, *, config=None):
             for key, value in row["call_parameters"].items():
                 if key == "chain_offset" and value == 0:
                     continue
-                if key not in ROUTE_KEYS or body.get(key, value) != value:
+                if key not in ROUTE_KEYS or key not in body or body[key] != value:
                     raise Incomplete(f"{name}: call-site parameter {key!r} contradicts params")
     return configured

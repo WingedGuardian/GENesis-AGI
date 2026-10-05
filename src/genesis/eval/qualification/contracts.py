@@ -13,6 +13,7 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import aiosqlite
 
@@ -106,13 +107,42 @@ class Embedder:
         return self.vectors[text]
 
 
-def candidate_mapping(case, messages):
+def candidate_mapping(case, messages, selected_ids):
     """Candidate ids in the order the ACTUAL rendered prompt numbered them."""
-    names = {r["task_type"]: r["id"] for r in case["existing"]}
-    selected = re.findall(r"^  \[(\d+)\] task_type: (.+)$", messages[0]["content"], re.MULTILINE)
-    if not selected or [int(i) for i, _ in selected] != list(range(1, len(selected) + 1)):
+    text = messages[0]["content"]
+    selected = list(re.finditer(r"^  \[(\d+)\] task_type: .+$", text, re.MULTILINE))
+    suffix = extractor._CROSS_TYPE_DEDUP_PROMPT.split("{candidates}", 1)[1].format()
+    if (
+        not selected
+        or len(selected) != len(selected_ids)
+        or len(set(selected_ids)) != len(selected_ids)
+        or not text.endswith(suffix)
+        or [int(m.group(1)) for m in selected] != list(range(1, len(selected) + 1))
+    ):
         raise Incomplete("novelty candidate mapping unavailable")
-    return [names[name] for _, name in selected]
+    rows = {row["id"]: row for row in case["existing"]}
+    signatures = set()
+    for index, match in enumerate(selected):
+        end = (
+            selected[index + 1].start() - 1
+            if index + 1 < len(selected)
+            else len(text) - len(suffix)
+        )
+        actual = text[match.start() : end]
+        row = rows.get(selected_ids[index])
+        if row is None:
+            raise Incomplete("novelty candidate mapping unavailable")
+        steps = " | ".join(s[:160] for s in row["steps"][:6])
+        signature = (
+            f"task_type: {row['task_type']}\n"
+            f"      principle: {row['principle']}\n      steps: {steps}"
+        )
+        if actual != f"  [{index + 1}] {signature}":
+            raise Incomplete("novelty candidate mapping unavailable")
+        if signature in signatures:
+            raise Incomplete("ambiguous rendered novelty candidate identity")
+        signatures.add(signature)
+    return list(selected_ids)
 
 
 def raw_target(content, mapping):
@@ -162,22 +192,37 @@ async def relevance(case, router) -> dict:
 async def novelty(case, router, sandbox) -> dict:
     """Run the production cross-type judgment; grade the raw target it returned."""
     db = await sandbox.database(case)
+    selected_ids = []
+    row_get = extractor._row_get
+
+    def observe_row(row, key):
+        value = row_get(row, key)
+        # Production reads steps only while rendering the selected top-K rows.
+        # Retain those actual IDs instead of reconstructing retrieval/selection.
+        if key == "steps":
+            identity = row_get(row, "id")
+            if identity not in selected_ids:
+                selected_ids.append(identity)
+        return value
+
     try:
         new = case["new"]
-        await extractor._principle_is_novel(
-            db,
-            task_type=new["task_type"],
-            new_principle=new["principle"],
-            new_steps=new["steps"],
-            embedder=Embedder(case),
-            router=router,
-        )
+        with patch.object(extractor, "_row_get", observe_row):
+            await extractor._principle_is_novel(
+                db,
+                task_type=new["task_type"],
+                new_principle=new["principle"],
+                new_steps=new["steps"],
+                embedder=Embedder(case),
+                router=router,
+            )
     finally:
         await db.close()
     if len(router.calls) != 1:
         raise Incomplete("novelty case did not reach exactly one judge request")
     messages, content = router.calls[0]
-    mapping = candidate_mapping(case, messages)
+    router.candidate_ids = selected_ids
+    mapping = candidate_mapping(case, messages, selected_ids)
     if case["expected_target"] is not None and case["expected_target"] not in mapping:
         raise Incomplete("reference target is not in the rendered candidate selection")
     try:
