@@ -17,13 +17,35 @@ _USER_AGENT = "Genesis/3.0 (research bot)"
 
 # Scrapling gives TLS fingerprint impersonation via curl_cffi —
 # requests appear as real Chrome, bypassing most anti-bot detection.
+# The fallback is to plain httpx, which works but loses the impersonation, so
+# an import failure is recorded and logged once rather than swallowed.
+# `scrapling.fetchers` imports browser-automation packages (playwright and
+# browserforge, among others) even for the plain AsyncFetcher, so a missing
+# piece used to degrade every fetch with no trace.
+_SCRAPLING_IMPORT_ERROR: ImportError | None = None
 try:
     from scrapling.fetchers import AsyncFetcher as _ScraplingFetcher
 
     _HAS_SCRAPLING = True
-except ImportError:
+except ImportError as _exc:
     _ScraplingFetcher = None  # type: ignore[misc,assignment]
     _HAS_SCRAPLING = False
+    _SCRAPLING_IMPORT_ERROR = _exc
+_scrapling_failure_logged = False
+
+
+def _log_scrapling_unavailable_once() -> None:
+    global _scrapling_failure_logged
+    if _HAS_SCRAPLING or _scrapling_failure_logged:
+        return
+    _scrapling_failure_logged = True
+    logger.warning(
+        "Scrapling is unavailable, so web fetches use plain httpx without TLS "
+        "impersonation. Run scripts/install_browser_stack.sh to install "
+        "the browser extra, which carries Scrapling's fetcher dependencies: %s",
+        _SCRAPLING_IMPORT_ERROR,
+        exc_info=_SCRAPLING_IMPORT_ERROR,
+    )
 
 
 class WebFetcher:
@@ -42,6 +64,7 @@ class WebFetcher:
         self._timeout_s = timeout_s
         self._client: httpx.AsyncClient | None = None
         self._max_chars = max_chars
+        _log_scrapling_unavailable_once()
 
     def _get_httpx_client(self) -> httpx.AsyncClient:
         if self._client is None:

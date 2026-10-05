@@ -1,0 +1,1 @@
+- **Web fetches say when Scrapling is unavailable.** When Scrapling's fetcher cannot be imported (it needs browser-automation packages such as playwright and browserforge), web fetches fall back to plain HTTP without TLS impersonation. That fallback used to be silent; it now logs one warning per process naming the import error and the browser-stack installer.
