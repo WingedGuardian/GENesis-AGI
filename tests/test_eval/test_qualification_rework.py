@@ -21,25 +21,26 @@ from tests.test_eval.test_qualification import Stub
 from tests.test_eval.test_qualification_pinned import ask, router
 
 
-async def test_cleanup_cancellation_preserves_observed_answer(tmp_path, monkeypatch):
+@pytest.mark.parametrize("provider", [None, "Synthetic"])
+async def test_upstream_identity_observation_is_explicit(tmp_path, monkeypatch, provider):
     isolate_credentials(monkeypatch, tmp_path)
-    original = pinned.ObservedHTTPHandler.close
-
-    async def cancelled_close(handler):
-        await original(handler)
-        raise asyncio.CancelledError()
-
-    monkeypatch.setattr(pinned.ObservedHTTPHandler, "close", cancelled_close)
-    server = OpenRouter()
-    directory = tmp_path / "campaign"
-    with Campaign(directory) as campaign:
-        with pytest.raises(asyncio.CancelledError):
-            await ask(router(campaign, server))
-        assert [line["kind"] for line in campaign.lines] == ["dispatch", "answer"]
-    offline = OpenRouter()
-    with Campaign(directory) as campaign:
-        assert (await ask(router(campaign, offline, dispatch=False))).success
-    assert len(server.requests) == 1 and not offline.requests
+    cases = {corpus.RELEVANCE: [relevance_case("synthetic-identity", True)]}
+    server = OpenRouter(provider=provider)
+    with Campaign(tmp_path / "campaign") as campaign:
+        result, _ = await run.qualify(
+            "openrouter-mimo",
+            cases,
+            params(),
+            campaign,
+            tmp_path / "sqlite",
+            dispatch=True,
+            transport=server.transport,
+        )
+    assert result["upstream_identity"] == {
+        "observed_answers": 3 if provider else 0,
+        "unobserved_answers": 0 if provider else 3,
+    }
+    assert any("upstream is unobserved" in text for text in result["limitations"])
 
 
 @pytest.mark.parametrize("cancelled", [False, True])

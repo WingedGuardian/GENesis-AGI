@@ -210,12 +210,12 @@ def review(spec, versions):
         if (
             not isinstance(case, dict)
             or not nonblank(case.get("id"))
-            or case["id"] in seen
             or not isinstance(case.get("contract"), str)
             or case["contract"] not in versions
+            or (case["contract"], case["id"]) in seen
         ):
             raise Incomplete("invalid or duplicate reference identity")
-        seen.add(case["id"])
+        seen.add((case["contract"], case["id"]))
         issues = blockers(case["contract"], case, policy, versions[case["contract"]])
         human_issues = {
             "confidence below human-review threshold",

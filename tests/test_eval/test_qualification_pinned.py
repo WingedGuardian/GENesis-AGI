@@ -414,9 +414,7 @@ def test_cli_run_qualifies_then_report_rescores_offline(env, monkeypatch, capsys
     assert offline.requests == [] and offline.key_reads == 0
 
 
-def test_cli_rerun_after_interruption_stays_stopped(
-    env, monkeypatch, capsys, small_floors
-):
+def test_cli_rerun_after_interruption_stays_stopped(env, monkeypatch, capsys, small_floors):
     write_corpus(env / "corpus", small_corpus())
     flaky = OpenRouter()
     original = flaky.__call__
@@ -514,21 +512,36 @@ async def test_malformed_answer_is_a_model_error_not_a_local_failure(env, small_
     assert report["routes"]["novelty"] == "incomplete"  # staged: novelty not labelled yet
 
 
-async def test_answer_observed_before_a_late_cancellation_is_kept(env, monkeypatch):
-    original = pinned.LiteLLMDelegate.call
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("stage", ["delegate", "cleanup"])
+async def test_answer_observed_before_a_late_failure_is_kept(env, monkeypatch, cancelled, stage):
+    owner, method = (
+        (pinned.LiteLLMDelegate, "call")
+        if stage == "delegate"
+        else (pinned.ObservedHTTPHandler, "close")
+    )
+    original = getattr(owner, method)
 
     async def cancelled_after(self, *args, **kwargs):
         await original(self, *args, **kwargs)
-        raise asyncio.CancelledError()
+        if cancelled:
+            raise asyncio.CancelledError()
+        raise RuntimeError(f"synthetic late {stage} failure")
 
-    monkeypatch.setattr(pinned.LiteLLMDelegate, "call", cancelled_after)
+    monkeypatch.setattr(owner, method, cancelled_after)
     server = OpenRouter(answer=lambda _p: '{"score": 1}')
     with Campaign(env / "campaign") as campaign:
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError if cancelled else pinned.LocalFailure):
             await ask(router(campaign, server))
-        assert kinds(campaign) == ["dispatch", "answer"]
+        assert kinds(campaign) == ["dispatch", "answer", "failure"]
     with Campaign(env / "campaign") as campaign:
-        assert (await ask(router(campaign, OpenRouter(), dispatch=False))).content
+        offline = OpenRouter()
+        r = router(campaign, offline)
+        assert (await ask(r)).content
+        with pytest.raises(pinned.LocalFailure, match="recorded request failure"):
+            await ask(r, "another-case")
+        assert not offline.requests and not offline.key_reads
+    assert len(server.requests) == 1
 
 
 @pytest.mark.parametrize("alias", ["openrouter-mimo", "deepseek-chat"])

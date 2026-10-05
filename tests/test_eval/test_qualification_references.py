@@ -101,6 +101,27 @@ def test_default_human_validator_remains_strict(tmp_path):
     assert references.summary(loaded, guidance)["sources"] == {"human": 7, references.FRONTIER: 7}
 
 
+@pytest.mark.parametrize("same_contract", [False, True])
+def test_review_identity_is_scoped_to_contract(same_contract):
+    guidance, cases = mixed()
+    names = [next(n for n in cases if n != corpus.RELEVANCE), corpus.RELEVANCE]
+    if same_contract:
+        names[1] = names[0]
+    rows = []
+    for name in names:
+        case = copy.deepcopy(cases[name][0])
+        case["id"] = "shared-case-id"
+        case["contract"] = name
+        receipt(name, case, guidance)
+        rows.append(case)
+    spec = {"cases": rows, "reference_policy": guidance}
+    if same_contract:
+        with pytest.raises(Incomplete, match="duplicate reference identity"):
+            references.review(spec, corpus.versions())
+    else:
+        assert references.review(spec, corpus.versions())["counts"] == {"admitted": 2}
+
+
 @pytest.mark.parametrize(
     "change",
     [

@@ -384,16 +384,29 @@ class PinnedRouter:
         self.failure = LocalFailure(safe_text(str(error)))
         if self.dispatch and case_id in self.served:
             messages = self.calls[-1][0]
+            key = (
+                self.contract,
+                versions()[self.contract],
+                case_id,
+                self.repetition,
+                digest(messages),
+            )
+            self._post_answer_failure(
+                {**self.scope, **dict(zip(ANSWER_KEY, key, strict=True))}, key, error
+            )
+
+    def _post_answer_failure(self, fields, key, error):
+        self.failure = LocalFailure(safe_text(str(error)))
+        if (
+            self.dispatch
+            and key in self.answers
+            and not any(
+                line["kind"] == "failure" and self.in_scope(line) and self._key(line) == key
+                for line in self.campaign.lines
+            )
+        ):
             self.campaign.append(
-                "failure",
-                **self.scope,
-                contract=self.contract,
-                version=versions()[self.contract],
-                case_id=case_id,
-                repetition=self.repetition,
-                prompt_hash=digest(messages),
-                error=str(self.failure),
-                phase="local_processing",
+                "failure", **fields, error=str(self.failure), phase="local_processing"
             )
 
     async def route_call(self, call_site_id, messages, **kwargs):
@@ -492,6 +505,7 @@ class PinnedRouter:
                 )
         except BaseException as exc:
             self._settle(handler, line_fields, key, error=type(exc).__name__)
+            self._post_answer_failure(line_fields, key, exc)
             if not isinstance(exc, Exception):
                 raise  # cancellation and interpreter exits keep their meaning
             raise LocalFailure("the request raised before it settled") from exc
@@ -505,6 +519,7 @@ class PinnedRouter:
             try:
                 await handler.close()
             except BaseException as cleanup_error:
+                self._post_answer_failure(line_fields, key, cleanup_error)
                 if active_error is None or not isinstance(cleanup_error, Exception):
                     raise
         if line is None:

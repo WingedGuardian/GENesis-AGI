@@ -9,6 +9,7 @@ always a rescore of paid answers against the prompts rendered now.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 
 from genesis.eval.calibration import run_calibration
@@ -41,6 +42,7 @@ LIMITATIONS = [
     "References are owner-declared labels; this CLI does not authenticate them.",
     "Deterministic embeddings prove the novelty prompt path, not real retrieval quality.",
     "No production route has been promoted; the owner edits routing deliberately.",
+    "When the response omits its upstream provider, identity relies on enforced request pinning; the upstream is unobserved.",
 ]
 
 
@@ -202,6 +204,13 @@ def gate(name, cases, rows) -> dict:
     }
 
 
+def _upstream_identity(lines):
+    observed = Counter(
+        line.get("response_provider") is not None for line in lines if line["kind"] == "answer"
+    )
+    return {"observed_answers": observed[True], "unobserved_answers": observed[False]}
+
+
 def summarize(alias, corpus, records, clamped, router, campaign) -> dict:
     contracts_report = {}
     for name, cases in corpus.items():
@@ -245,6 +254,7 @@ def summarize(alias, corpus, records, clamped, router, campaign) -> dict:
         "alias": alias,
         "model": router.cfg.model_id,
         "upstream": router.params["upstream"],
+        "upstream_identity": _upstream_identity(scoped),
         "routes": routes,
         "contracts": contracts_report,
         "clamped_raw_scores": clamped,
