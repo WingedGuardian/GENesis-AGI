@@ -172,7 +172,11 @@ passes Turnstile more often than the widget click is unmeasured.
   (display notation; `localhost::5999` fails over IPv6). Never start another
   VNC server, and never one without a password: the display shows logged-in
   sessions, and when the service is down the tools kill a foreign x11vnc
-  holding port 5999.
+  holding port 5999. The tools start x11vnc themselves only when the
+  `systemctl` binary is missing or a `systemctl` call times out; they use the
+  password only if `~/.genesis/vnc_passwd` exists, so check that it does
+  before relying on VNC. If systemd is present but the unit is missing or
+  fails to start, nothing starts and VNC stays down.
 - `vncdotool` is optional (`vncdo` may be absent).
 - Window origin: `DISPLAY=:99 xdotool getactivewindow getwindowgeometry`, as the
   code does. Display `:99` is shared, so confirm the active window is this

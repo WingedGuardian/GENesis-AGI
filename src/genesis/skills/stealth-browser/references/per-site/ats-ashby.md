@@ -6,8 +6,8 @@
 - **No Cloudflare Turnstile** on application forms (correction recorded
   2026-04-22; an earlier note claiming Turnstile was wrong).
 - **Google reCAPTCHA v3 (invisible) scores the session** (live test
-  2026-04-23): the user filled the form entirely by hand over VNC in Camoufox
-  and the submit returned a spam error stating "we use Google's reCAPTCHA
+  2026-04-23): an Ashby test form filled entirely by hand over VNC in Camoufox
+  returned a spam error on submit stating "we use Google's reCAPTCHA
   technology", listing VPN/proxy, ad blockers, shared networks and "unusual
   browser settings" as causes. Conclusion from that one test: the Camoufox
   environment alone earns a low score; human-like behaviour does not fix it.

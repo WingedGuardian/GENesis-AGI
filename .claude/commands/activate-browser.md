@@ -27,7 +27,7 @@ Add this entry to `~/genesis/.mcp.json` under `mcpServers`:
     "--headless",
     "--executablePath", "<path to a Chrome or Chromium binary>",
     "--userDataDir", "${HOME}/.genesis/devtools-profile",
-    "--no-sandbox"
+    "--chrome-arg=--no-sandbox"
   ]
 }
 ```
@@ -40,6 +40,9 @@ Add this entry to `~/genesis/.mcp.json` under `mcpServers`:
 - `--userDataDir`: keep it separate from `~/.genesis/browser-profile`, which the
   Chromium fallback layer uses. Two Chromium processes on one profile fail to
   start or corrupt it.
+- `--chrome-arg=--no-sandbox`: Chrome flags must go through `--chrome-arg`. A
+  bare `--no-sandbox` is read as an option of chrome-devtools-mcp itself, which
+  has no such option, and is dropped without a warning.
 
 Then restart the CC session to pick up the new MCP server.
 
@@ -49,9 +52,10 @@ Launching the user's Chrome for remote debugging and reaching its port is
 described in ONE place: the `browser-automation` skill, "Remote CDP setup"
 (`src/genesis/skills/browser-automation/SKILL.md`). Chrome 136+ ignores
 `--remote-debugging-port` on the default profile, and headed Chrome binds the
-port to loopback, so follow that section. Once the endpoint answers on
-`http://127.0.0.1:9222` (for example through an SSH tunnel), replace the config
-above with:
+port to loopback, so follow that section. Once the endpoint answers, replace
+the config above with the following, using the same endpoint as
+`GENESIS_CDP_URL` in place of `http://127.0.0.1:9222` (that value is the SSH
+tunnel case):
 
 ```json
 "chrome-devtools-remote": {
@@ -66,8 +70,8 @@ above with:
 ## Deactivation
 
 When done with heavy browser work, remove the `chrome-devtools` entry from
-`.mcp.json` and restart the session. This reclaims ~17k tokens of context
-budget that the 29 Chrome DevTools MCP tools consume.
+`.mcp.json` and restart the session. This reclaims the ~17,000 chars of tool
+descriptions that the 29 Chrome DevTools MCP tools add to the context.
 
 ## Token Cost
 

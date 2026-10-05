@@ -14,9 +14,11 @@ described behaviour. Browser coordinate rules live in the
 | DPI-virtualised pixels | any Windows API read by a process that has not called `SetProcessDPIAware()` |
 | normalised 0-65,535 | `SendInput` in absolute mode |
 
-These coincide only at `devicePixelRatio == 1` and 100% display scaling, which
-is why the bug class sits dormant on an unscaled dev machine and breaks on a
-real laptop.
+The pixel spaces (CSS, physical, DPI-virtualised) coincide only at
+`devicePixelRatio == 1` and 100% display scaling, which is why the bug class
+sits dormant on an unscaled dev machine and breaks on a real laptop. The
+normalised `SendInput` space never coincides with them: it always needs the
+conversion below, at any scaling.
 
 ## `SendInput` absolute mode
 

@@ -1,8 +1,9 @@
 # Anti-Detection Services
 
-External services that supplement the browser's own anti-detection. None of
-the third-party ones below is installed or wired into Genesis; the code here
-is a sketch for a future integration.
+External services that supplement the browser's own anti-detection. TinyFish
+is wired in (the `tinyfish=True` browser layer, and the `web_fetch` /
+`web_agent` tools); the other third-party services below are not installed,
+and their code is a sketch for a future integration.
 
 **Every paid use needs the user's explicit approval, each time.** Prior
 approval does not carry over. Paying through a crypto wallet (x402) is a
@@ -16,8 +17,10 @@ Prices are as read on the date shown; recheck before quoting them.
 ## TinyFish (wired in)
 
 - `browser_navigate(url, tinyfish=True)`: cloud Chromium over CDP, 1 credit per
-  4 minutes (tool docstring, 2026-10-04). No tool ends the session early; it
-  ends at idle cleanup or session end. See `browser-automation`, Layer 4.
+  4 minutes (tool docstring, 2026-10-04). No tool ends the session on purpose;
+  it ends at idle cleanup, at MCP exit, or when a later Camoufox or Chromium
+  navigate finds its own page stale and resets every layer (#2874), which also
+  drops a remote CDP connection. See `browser-automation`, Layer 4.
 - `web_agent(url, goal)`: goal-driven agent, about $0.015 per step
   (tool docstring). The daily budget is checked and only logged, never
   enforced; the default `max_steps=100` is about $1.50 per call, so pass a

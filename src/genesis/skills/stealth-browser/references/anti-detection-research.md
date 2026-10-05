@@ -16,9 +16,13 @@ Known gaps:
   engine fell behind (upstream called the Firefox 135 build out of date on
   2026-07-16, in its v152.0.4-beta.27 release note). Development resumed in
   `daijro/camoufox`; engine v156.0.1-beta.34 was released 2026-10-03 (stack
-  survey, 2026-10-04). Genesis's `camoufox>=0.4` pin currently resolves to the
-  0.4.x line with the Firefox 135-based engine (camoufox 0.4.11, engine
-  135.0.1-beta.24 on the install surveyed 2026-10-04).
+  survey, 2026-10-04). Genesis's `camoufox>=0.4` pin is an open lower bound
+  with no lock file, so a fresh install gets the newest release (0.5.7 on
+  PyPI as of 2026-10-05). The install surveyed on 2026-10-04 had camoufox
+  0.4.11 with engine 135.0.1-beta.24. The Camoufox-specific behaviour
+  statements in these skills (`browser_run_js` running in an isolated world,
+  the "Camoufox 135" hidden-field result) were measured on that install and
+  may not hold on a newer release.
 - Camoufox cannot pass as Chrome: SpiderMonkey and V8 differ observably.
 - Canvas spoofing quality degraded in some releases (**unsourced**).
 
@@ -49,7 +53,9 @@ Known gaps:
 ### Scroll
 - Human scroll deltas vary (20-100 px) and include pauses and back-scrolls;
   scripted scrolls are uniform (**unsourced** numbers). Genesis has no
-  humanized scroll tool; a click scrolls its target into view.
+  humanized scroll tool. On Camoufox a click does NOT scroll its target into
+  view: scroll it there first (`browser-automation`, the off-screen click
+  workaround), or the click can report success and land nowhere.
 
 ### Paste
 - Some systems distinguish typed from pasted input (**unsourced**). Genesis
