@@ -46,6 +46,7 @@ from genesis.cc.types import (
     model_supports_effort,
 )
 from genesis.observability.spans import SpanKind, start_span
+from genesis.util.inflight import inflight
 from genesis.util.proc_kill import (
     kill_process_group,
     process_group_alive,
@@ -116,7 +117,9 @@ def _overload_error(message: str, raw_text: str, payload: dict | None) -> CCErro
     from genesis.cc.transient_retry import replay_unsafe
 
     overload = CCOverloadedError(
-        message, raw_text=raw_text, raw_event=payload,
+        message,
+        raw_text=raw_text,
+        raw_event=payload,
         num_turns=_int_or_none(payload.get("num_turns")) if payload else None,
     )
     if replay_unsafe(overload):
@@ -1563,6 +1566,15 @@ def _reset_failure_event_state() -> None:
     _failure_event_state.clear()
 
 
+def _inflight_label(invocation: CCInvocation) -> str:
+    """How an in-flight invocation is shown to whoever decides on a restart: the
+    model and the resumed session, never the prompt."""
+    model = getattr(invocation.model, "value", invocation.model)
+    if invocation.resume_session_id:
+        return f"{model}, resumes {invocation.resume_session_id}"
+    return str(model)
+
+
 async def _emit_invocation_failed_event(
     exc: CCError,
     invocation: CCInvocation,
@@ -2116,7 +2128,11 @@ class CCInvoker:
         file if seal preparation failed on one of the two calls.
         """
         allowlist = ",".join(inv.bash_allowlist)
-        pins = settings_pins if settings_pins is not None else _settings_env_pins(tuple(inv.bash_allowlist))
+        pins = (
+            settings_pins
+            if settings_pins is not None
+            else _settings_env_pins(tuple(inv.bash_allowlist))
+        )
         span_settings = cc_span_settings_path(pins)
         if span_settings is None:
             raise RuntimeError(
@@ -2330,7 +2346,11 @@ class CCInvoker:
         # _settings_env_pins.
         # The async run paths compute the pins in a worker thread (the seal
         # preparation behind them can block on a lock) and pass them in.
-        pins = settings_pins if settings_pins is not None else _settings_env_pins(tuple(inv.bash_allowlist))
+        pins = (
+            settings_pins
+            if settings_pins is not None
+            else _settings_env_pins(tuple(inv.bash_allowlist))
+        )
         span_settings = cc_span_settings_path(pins)
         if span_settings:
             args += ["--settings", span_settings]
@@ -2869,7 +2889,10 @@ class CCInvoker:
         """
         invocation, roster_model = roster.apply_active(invocation)
         try:
-            return await self._run_traced(invocation, roster_model)
+            # Registered for the whole call: a restart now would cancel it
+            # (genesis.util.inflight; a no-op inside a caller's open unit).
+            with inflight("claude", _inflight_label(invocation)):
+                return await self._run_traced(invocation, roster_model)
         except CCError as exc:
             await _emit_invocation_failed_event(
                 exc,
@@ -3128,7 +3151,8 @@ class CCInvoker:
         """Run CC with stream-json output; emit-then-reraise on CCError (see run())."""
         invocation, roster_model = roster.apply_active(invocation)
         try:
-            return await self._run_streaming_traced(invocation, roster_model, on_event)
+            with inflight("claude", _inflight_label(invocation)):
+                return await self._run_streaming_traced(invocation, roster_model, on_event)
         except CCError as exc:
             await _emit_invocation_failed_event(
                 exc,

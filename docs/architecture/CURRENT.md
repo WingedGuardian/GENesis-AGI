@@ -3217,7 +3217,12 @@ verified: b0867170e 2026-10-02
   encrypted `scripts/backup.sh` timer).
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
   `process_lock` (the reason bare `python -m genesis serve` blocks systemd),
-  tmp discipline (`~/tmp` for large temp — never override TMPDIR).
+  tmp discipline (`~/tmp` for large temp — never override TMPDIR),
+  `inflight` (the process-local registry of work a restart would cancel:
+  every `CCInvoker` call, plus a dispatched session's and a CLI reflection's
+  whole life; served at `GET /api/genesis/inflight` for
+  `scripts/deploy_code_only.sh`'s restart refusal; a subsystem's own work after
+  its invocation returns is not covered — #2917).
 - **env.py**: 3-tier resolution (env var → `~/.genesis/config/genesis.yaml` →
   default). **`update_in_progress()` is load-bearing**: the watchdog defers
   restarts during deploys (mid-deploy revival deadlocks bootstrap); fails open

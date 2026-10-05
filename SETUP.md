@@ -221,6 +221,68 @@ GENESIS_BACKUP_NAS_HOST=this-machine-label
 ```
 (`restore.sh` reads the same variable to find the source snapshot dir.)
 
+**Extra directories (optional).** To keep install-local data no other backup
+section knows about, list directories under your home directory, separated by
+`:`:
+```
+GENESIS_BACKUP_EXTRA_DIRS=~/.genesis/analytics:~/.genesis/tools/my-tool
+GENESIS_BACKUP_EXTRA_EXCLUDES=derived:scratch
+```
+Each directory becomes one encrypted archive, `extra/<name>.tar.gpg`. It goes to
+the off-site tier only, never the git tier. Every run builds these archives from
+scratch: a snapshot holds only what that run archived, and nothing is carried
+over from an earlier run. Rebuildable caches (`.venv`, `node_modules`,
+`__pycache__`, …) are always excluded, and `GENESIS_BACKUP_EXTRA_EXCLUDES` adds
+more tar exclude patterns (wildcards allowed), matched at any depth.
+
+A listed directory is skipped with a warning when it:
+- is relative, or outside your home directory;
+- is, or runs through, a symlink (list the real directory instead);
+- is inside or contains another entry, the backups repo, the backup temp dir, or
+  a local off-site root;
+- overlaps a path the core backup already restores (for example `~/.genesis`
+  itself, or anything inside the repo);
+- is missing, or tar cannot read it;
+- would be emptied by an exclude pattern;
+- could not be extracted by a restore on this machine: restore needs a Python whose
+  `tarfile` has the 2025 extraction-filter fixes (CPython 3.12.11 or later, or a
+  distribution backport). The machine you restore onto needs one too.
+
+A skipped directory is simply absent from that snapshot; older snapshots keep it
+until retention drops them. None of this fails the backup, but each skip, and
+each archive that fails to upload, marks the off-site copy `partial`
+(`offsite_confirmed: false`, `extras_complete: false`) and sends the off-site
+alert, again whenever the set of missing directories changes. The core snapshot is still marked complete
+(`offsite_core_complete: true`), retention still runs, and a later failure of the
+core off-site copy still alerts on its own. `scripts/update.sh` reports such an
+extras-only gap as `backup:tier2_extras`, distinct from a real off-site failure
+(`backup:tier2`). The snapshot's `COMPLETE` marker
+lists the extra archives it holds and the listed directories it skipped, so a
+restore can tell "none" apart from "could not list them" and can name what a
+snapshot is missing; `.extra-manifest` in the backups checkout does the same for a
+restore that runs without an off-site pull. Either way, restore only restores
+archives that list names: a leftover archive in `extra/` is never restored. Backup
+test-extracts each archive the way restore will (file contents left out), so it
+knows which members a restore would refuse, such as a symlink that leads outside
+the directory or a FIFO. Such a directory is still archived, but recorded as
+partial: the off-site copy is reported incomplete and the alert names it. Exclude
+those members with `GENESIS_BACKUP_EXTRA_EXCLUDES`. A file that changes while it is being archived (tar exit 1)
+is kept but may be torn, and the log says so; stop a writer whose files must be
+consistent, or exclude them. Without an off-site tier the archives stay local
+only, in the backups checkout, and no off-site alert applies.
+
+`restore.sh` puts each directory back as a whole: it unpacks the archive next to
+the destination and renames it into place, so directory permissions and empty
+directories come back too. An existing non-empty directory is replaced only with
+`--force`, and the old one is kept beside it as `<dir>.pre-restore-<timestamp>`,
+never deleted; without `--force` that directory is skipped and recorded as a
+failure. Members that use `..`, a special file, or a link pointing outside the
+restored directory are refused one by one and the rest restores. A whole archive
+is refused when its destination is a symlink, when its path runs through a
+symlink that leads outside your home directory, or when it overlaps a core
+restore path. Every refusal is recorded. After an off-site pull, restore takes
+exactly the archives that snapshot's `COMPLETE` marker lists.
+
 Bootstrap installs the timer's unit files but does **not** enable them —
 scheduling a backup that silently leaves your database local-only would give a
 false sense of safety. Once `GENESIS_BACKUP_REPO` and
