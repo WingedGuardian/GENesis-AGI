@@ -138,6 +138,16 @@ REFUSED = [
     pytest.param(f"gh api -X PUT {_R}//pulls/5/./merge", "5", id="rest-dot-segments"),
     pytest.param(f"gh api -X PUT {_R}/pulls/5/%6Derge", "5", id="rest-percent-encoded"),
     pytest.param(f"gh api -X PUT {_R}/PULLS/5/MERGE", "5", id="rest-upper-path"),
+    pytest.param(
+        "gh api graphql --raw-field=query='mutation { mergePullRequest(input:{}) { clientMutationId } }'",
+        None,
+        id="raw-field-attached-merge",
+    ),
+    pytest.param(
+        "gh api graphql -f query='mutation { \"x\" mergePullRequest(input:{}) { clientMutationId } }'",
+        None,
+        id="merge-after-a-string",
+    ),
     # A help flag on a merge spelling is not an exemption: gh may hand it to a value flag.
     pytest.param(f"gh api -X PUT {_R}/pulls/5/merge --help", "5", id="api-help-is-not-exempt"),
     # Short-flag groups: pflag hands the next word to the first value-taking letter.
@@ -224,6 +234,28 @@ SILENT = [
     pytest.param(
         'gh api -X PATCH "repos/$REPO/pulls/5" --input body.json',
         id="pr-body-patch-variable-endpoint",
+    ),
+    # Round 1 (Codex P2, Devin): reads that name a merge but cannot merge.
+    pytest.param(
+        "gh api graphql --raw-field=query='{ __type(name: \"mergePullRequest\") { name } }'",
+        id="raw-field-attached-introspection",
+    ),
+    pytest.param(
+        "gh api graphql --field=query='{ __type(name: \"mergePullRequest\") { name } }'",
+        id="field-attached-introspection",
+    ),
+    pytest.param(f"gh api {_R}/pulls/5/merge -q.merged", id="get-attached-jq"),
+    pytest.param(f"gh api {_R}/pulls/5/merge -t'{{{{.merged}}}}'", id="get-attached-template"),
+    pytest.param(f"gh api {_R}/pulls/5/merge -HAccept:application/json", id="get-attached-header"),
+    pytest.param(f"gh api {_R}/pulls/5/merge -pfoo", id="get-attached-preview"),
+    pytest.param(
+        'gh api graphql -f query=\'query { search(query: "mutation mergePullRequest", '
+        "type: ISSUE) { issueCount } }'",
+        id="mutation-words-inside-a-string",
+    ),
+    pytest.param(
+        "gh api graphql -f query='query { viewer { login } } # mutation mergePullRequest'",
+        id="mutation-words-inside-a-comment",
     ),
 ]
 

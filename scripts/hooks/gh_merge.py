@@ -124,53 +124,100 @@ def _is_group(tok: str) -> bool:
 
 #: Output filters: their values shape what is printed and can never write.
 _FILTER_FLAGS = ("--jq", "-q", "--template", "-t")
+#: Every spelling of a field flag with its value attached in the same word.
+_ATTACHED_FIELD = re.compile(r"^(?:-[fF]=?|--field=|--raw-field=)(?P<value>.+)$", re.DOTALL)
 
 
-def _scanned_tokens(argv: list[str]) -> list[str]:
-    """Every token except the value of a non-`query` field or of an output filter.
-    A form this does not recognise is scanned, so a miss can only over-refuse."""
-    out: list[str] = []
-    skip_value = False
+def _field_value(tok: str) -> str | None:
+    """The `key=value` carried by a field flag written as one word, or None."""
+    match = _ATTACHED_FIELD.match(tok)
+    return match["value"] if match else None
+
+
+def _scanned_tokens(argv: list[str]) -> tuple[list[str], list[str]]:
+    """``(words, queries)``. ``words`` is every token except field values and the
+    values of output filters; ``queries`` is the text of every ``query=`` field,
+    in any spelling. A form this does not recognise lands in ``words``, where a
+    mutation name counts on its own, so a miss can only over-refuse."""
+    words: list[str] = []
+    queries: list[str] = []
+    expect_field = False
     skip_filter = False
     for tok in argv[1:]:
         if skip_filter:
             skip_filter = False
             continue
-        if skip_value:
-            skip_value = False
-            if not tok.startswith("query="):
-                continue
+        if expect_field:
+            expect_field = False
+            if tok.startswith("query="):
+                queries.append(tok[len("query=") :])
+            continue
         if tok in _FIELD_FLAGS:
-            skip_value = True
+            expect_field = True
             continue
         if tok in _FILTER_FLAGS:
             skip_filter = True
             continue
-        name, eq, value = tok.partition("=")
+        name, eq, _ = tok.partition("=")
         if eq and name in _FILTER_FLAGS:
             continue
-        if eq and name in ("--field", "--raw-field") and not value.startswith("query="):
+        if tok[:2] in ("-q", "-t") and len(tok) > 2 and not tok.startswith("--"):
             continue
-        if (
-            tok[:2] in ("-f", "-F")
-            and len(tok) > 2
-            and not tok.startswith("--")
-            and not tok[2:].lstrip("=").startswith("query=")
-        ):
+        field = _field_value(tok)
+        if field is not None:
+            if field.startswith("query="):
+                queries.append(field[len("query=") :])
             continue
-        out.append(tok)
-    return out
+        if tok.startswith("query="):
+            queries.append(tok[len("query=") :])
+            continue
+        words.append(tok)
+    return words, queries
+
+
+def _graphql_code(text: str) -> str:
+    """The document with its strings and comments removed (GraphQL spec, Source
+    Text): a name inside either cannot execute. An unterminated string returns
+    the text unchanged, so a lexing doubt keeps every word visible."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith('"""', i):
+            end = text.find('"""', i + 3)
+            if end < 0:
+                return text
+            out.append(" ")
+            i = end + 3
+        elif text[i] == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            if j >= n:
+                return text
+            out.append(" ")
+            i = j + 1
+        elif text[i] == "#":
+            end = text.find("\n", i)
+            i = n if end < 0 else end
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def _is_merge_mutation(doc: str) -> bool:
+    code = _graphql_code(doc)
+    return bool(_MUTATION.search(code) and _MERGE_MUTATIONS.search(code))
 
 
 def _names_merge(argv: list[str]) -> bool:
-    """A merge path word, or a merge mutation name. Inside a GraphQL document the
-    name counts only beside `mutation`: an introspection query may name it."""
-    for tok in _scanned_tokens(argv):
-        if _MERGE_WORD.search(unquote(tok)):
+    """A merge path word or a merge mutation name in the argv, or a query field
+    whose document is a merge mutation (outside its strings and comments)."""
+    words, queries = _scanned_tokens(argv)
+    for tok in words:
+        if _MERGE_WORD.search(unquote(tok)) or _MERGE_MUTATIONS.search(tok):
             return True
-        if _MERGE_MUTATIONS.search(tok) and (_MUTATION.search(tok) or "query=" not in tok[:12]):
-            return True
-    return False
+    return any(_is_merge_mutation(q) for q in queries)
 
 
 def _plain_read(argv: list[str]) -> bool:
@@ -188,6 +235,9 @@ def _plain_read(argv: list[str]) -> bool:
             i += 1
         elif name in _READ_VALUE_FLAGS:
             i += 1 if eq else 2
+        elif tok[:2] in ("-q", "-t", "-H", "-p") and len(tok) > 2:
+            # A read flag with its value attached (`-q.merged`, `-HAccept:...`).
+            i += 1
         elif name in ("-X", "--method"):
             method = value if eq else (argv[i + 1] if i + 1 < len(argv) else "")
             if method.upper() not in _READ_METHODS:
@@ -214,7 +264,8 @@ def _plain_read(argv: list[str]) -> bool:
 def _plain_parse(argv: list[str]) -> bool:
     """No short-flag groups and no shell text outside output filters, so the
     parsed method and endpoint are the real ones."""
-    return not any(_is_group(t) or _SHELL_TEXT.search(t) for t in _scanned_tokens(argv))
+    words, _ = _scanned_tokens(argv)
+    return not any(_is_group(t) or _SHELL_TEXT.search(t) for t in words)
 
 
 def _read_text(ref: str, cwd: str | None) -> str | None:
@@ -359,7 +410,7 @@ def api_merge_reason(
             return ApiMerge(
                 "a GraphQL request whose query this guard cannot read", None, True, _QUERY_HINT
             )
-        if any(_MUTATION.search(d) and _MERGE_MUTATIONS.search(d) for d in docs):
+        if any(_is_merge_mutation(d) for d in docs):
             return ApiMerge("a GraphQL merge mutation", None, False)
         return None
     if not endpoint:
