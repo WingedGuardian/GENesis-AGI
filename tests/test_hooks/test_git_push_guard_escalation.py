@@ -339,6 +339,11 @@ def test_shell_expanded_body_cannot_claim_confirmation_exemption(monkeypatch):
         'git commit -m "fix"',
         "gh pr create --head feat/x --title x --body x",
         "gh pr close 1372 --repo owner/repo",
+        "gh api -X PATCH repos/o/r/pulls/5 -f state=closed",
+        (
+            "gh api graphql -f 'query=mutation { closePullRequest(input:{pullRequestId:\"x\"}) "
+            "{ clientMutationId } }'"
+        ),
     ],
 )
 def test_review_approval_cannot_cover_another_gated_action(monkeypatch, capsys, other):
@@ -347,6 +352,13 @@ def test_review_approval_cannot_cover_another_gated_action(monkeypatch, capsys, 
     _payload(monkeypatch, command)
     assert _mod.main() == 2
     assert "review request separately" in capsys.readouterr().err
+
+
+def test_review_approval_plus_get_does_not_trigger_compound_refusal(monkeypatch, capsys):
+    _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:4]])
+    _payload(monkeypatch, f"{TRIGGER} && gh api repos/o/r/pulls/5")
+    assert _mod.main() == 0
+    assert "review request separately" not in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

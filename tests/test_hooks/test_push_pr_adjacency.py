@@ -513,6 +513,40 @@ def test_a_pr_close_in_the_same_command_cancels_the_silent_allow(
 @pytest.mark.parametrize(
     "command",
     [
+        "gh api -X PATCH repos/o/r/pulls/123 -f state=closed && git push",
+        "gh api --method=PATCH pulls/123 --field state=closed && git push",
+        "gh -R o/r api -XPATCH repos/o/r/pulls/123 -Fstate=closed && git push",
+        (
+            "gh api graphql -f 'query=mutation { closePullRequest(input:{pullRequestId:\"x\"}) "
+            "{ clientMutationId } }' && git push"
+        ),
+        "gh api -X PATCH repos/o/r/issues/123 -f state=closed && git push",
+    ],
+)
+def test_a_pr_close_by_other_spelling_still_cancels_the_silent_allow(
+    monkeypatch, tmp_path, capsys, command
+) -> None:
+    """Text-visible REST and GraphQL closes void the open-PR state before a re-push."""
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 1)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(
+        monkeypatch, tmp_path, fake, capsys, command=command
+    )
+    assert rc == 0, (command, rc, out, err)
+    doc = json.loads(out)
+    reason = doc["hookSpecificOutput"]["permissionDecisionReason"]
+    assert doc["hookSpecificOutput"]["permissionDecision"] == "ask", (command, out)
+    assert "CLOSES a pull request" in reason, (command, reason)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "gh pr create --head feat/x --title t --body b && git push",
         "git push && gh pr create --title t --body b",
         "git push && gh pr create --dry-run --title t --body b",

@@ -1,0 +1,1 @@
+Closing a pull request through GitHub’s API is now treated consistently with `gh pr close` when publishing changes. This keeps a close from being combined with a review approval, while ordinary reads remain unaffected.
