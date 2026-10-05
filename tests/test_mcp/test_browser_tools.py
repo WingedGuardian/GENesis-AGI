@@ -1349,6 +1349,130 @@ class TestTurnstileShortGrace:
         alert.assert_awaited()         # ladder ran to exhaustion
 
 
+# ---------------------------------------------------------------------------
+# B7: cookie tools cover both profiles, label each, count, and use the live
+# context when this process runs that browser.
+# ---------------------------------------------------------------------------
+
+
+def _live_camoufox_ctx(cookies):
+    page = MagicMock()
+    page.is_closed.return_value = False
+    page.url = "https://example.com"
+    ctx = MagicMock()
+    ctx.cookies = AsyncMock(return_value=cookies)
+    ctx.clear_cookies = AsyncMock()
+    browser._stealth_page = page
+    browser._stealth_browser = ctx
+    browser._stealth_cm = MagicMock()  # the browser this process launched is open
+    return ctx
+
+
+class TestCookieToolsBothProfiles:
+    @pytest.mark.asyncio
+    async def test_a_closed_tab_keeps_the_live_context(self, tmp_path):
+        """Cookies belong to the context, not the remembered page: a closed tab
+        with the browser still open must clear through the context, not refuse
+        the profile as in use."""
+        ctx = _live_camoufox_ctx([{"domain": ".x.com"}])
+        browser._stealth_page.is_closed.return_value = True
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            result = await browser._impl_browser_clear_domain("x.com")
+        assert result["profiles"][0]["source"] == "live browser"
+        ctx.clear_cookies.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_sessions_labels_both_profiles(self, tmp_path):
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            result = await browser._impl_browser_sessions()
+        kinds = [p["browser"] for p in result["profiles"]]
+        assert kinds == ["camoufox", "chromium"]
+        assert all(p["exists"] is False for p in result["profiles"])
+
+    @pytest.mark.asyncio
+    async def test_a_running_camoufox_is_read_through_its_live_context(self, tmp_path):
+        _live_camoufox_ctx([
+            {"domain": ".github.com"}, {"domain": "github.com"}, {"domain": ".medium.com"},
+        ])
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            result = await browser._impl_browser_sessions()
+        cam = result["profiles"][0]
+        assert cam["source"] == "live browser"
+        assert cam["sessions"] == [
+            {"domain": "github.com", "cookie_count": 2},
+            {"domain": "medium.com", "cookie_count": 1},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_clear_uses_the_live_context_and_counts_exact_matches(self, tmp_path):
+        ctx = _live_camoufox_ctx([
+            {"domain": ".x.com"}, {"domain": "api.x.com"}, {"domain": ".netflix.com"},
+        ])
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            result = await browser._impl_browser_clear_domain("X.com")
+        assert result["domain"] == "x.com"
+        assert result["cookies_removed"] == 2
+        cam = result["profiles"][0]
+        assert cam == {"browser": "camoufox", "source": "live browser", "removed": 2}
+        pattern = ctx.clear_cookies.call_args.kwargs["domain"]
+        assert pattern.match(".x.com") and pattern.match("api.x.com") and pattern.match("x.com")
+        assert not pattern.match(".netflix.com")
+        assert not pattern.match("x.com.evil.example")
+
+    @pytest.mark.asyncio
+    async def test_clear_rejects_a_non_domain(self):
+        result = await browser._impl_browser_clear_domain("")
+        assert "error" in result
+
+
+    @pytest.mark.asyncio
+    async def test_a_hung_live_cookie_call_reports_an_error(self, tmp_path):
+        page = MagicMock()
+        page.is_closed.return_value = False
+        page.url = "https://example.com"
+
+        async def hang():
+            await asyncio.Event().wait()
+
+        ctx = MagicMock()
+        ctx.cookies = MagicMock(side_effect=lambda: hang())
+        browser._stealth_page = page
+        browser._stealth_browser = ctx
+        browser._stealth_cm = MagicMock()
+        with (
+            patch.object(browser, "_COOKIE_CALL_TIMEOUT_S", 0.1),
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            listed = await browser._impl_browser_sessions()
+            cleared = await browser._impl_browser_clear_domain("x.com")
+        assert "error" in listed["profiles"][0]
+        assert "error" in cleared["profiles"][0]
+        assert cleared["cookies_removed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_bare_tld_is_refused(self):
+        result = await browser._impl_browser_clear_domain("com")
+        assert "error" in result and "no dot" in result["error"]
+
+    def test_localhost_is_a_valid_cookie_domain(self):
+        from genesis.browser.profile import normalize_domain
+
+        assert normalize_domain("localhost") == "localhost"
+
+
 # Must stay in step with scripts/browser.py's copy of the scheme
 # (tests/test_scripts/test_browser_cli_screenshot_path.py asserts the same
 # shape on that side). Format: %Y%m%dT%H%M%S%fZ -> 20260902T190142123456Z

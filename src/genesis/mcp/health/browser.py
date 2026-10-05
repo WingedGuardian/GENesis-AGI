@@ -2364,40 +2364,144 @@ async def _impl_browser_run_js(expression: str) -> dict:
         return {"error": f"JS execution failed: {e}"}
 
 
-async def _impl_browser_sessions() -> dict:
-    """List logged-in sessions from the persistent browser profile.
+def _cookie_profiles() -> tuple[tuple[str, Path], ...]:
+    """The two local browser profiles the cookie tools cover, labelled."""
+    return (("camoufox", _PROFILE_DIR), ("chromium", _CHROMIUM_PROFILE_DIR))
 
-    Does NOT launch a browser — reads the cookie database directly.
+
+def _live_cookie_context(kind: str):
+    """This process's live browser context for a profile, or None.
+
+    While the browser runs, its cookie jar lives in memory and is written back
+    to the file, so the live context's cookie API is the only correct way to
+    read or change it. Camoufox's persistent context IS the browser object.
+
+    Liveness is the CONTEXT's, not the remembered page's: cookies belong to the
+    context, and the user closing one tab leaves the context (and its lock on
+    the profile) in place. A context this process holds counts until cleanup
+    clears it; a crashed one makes the cookie call fail, which is reported as
+    an error, never as an empty result.
     """
-    try:
-        from genesis.browser.profile import BrowserProfileManager
-        mgr = BrowserProfileManager()
-        info = mgr.get_info()
-        return {
-            "profile_path": info.profile_path,
-            "exists": info.exists,
-            "size_mb": info.size_mb,
-            "sessions": [
-                {"domain": s.domain, "cookie_count": s.cookie_count}
-                for s in info.sessions
-            ],
-        }
-    except Exception as e:
-        return {"error": f"Failed to read browser sessions: {e}"}
+    if kind == "camoufox":
+        return _stealth_browser if _stealth_cm is not None else None
+    return _context
+
+
+# Bound on one cookie call to a live browser context. Camoufox is the reason:
+# a Playwright call into it has hung for 22 minutes (see _TOOL_TIMEOUT_S), and
+# these two tools have no tool-level timeout. A cookie read or clear on a
+# healthy browser returns in well under a second, so 30 s means a hung browser,
+# and the profile then reports an error instead of blocking the tool forever.
+_COOKIE_CALL_TIMEOUT_S: float = 30.0
+
+
+async def _cookie_call(awaitable):
+    return await asyncio.wait_for(awaitable, timeout=_COOKIE_CALL_TIMEOUT_S)
+
+
+def _domain_cookie_pattern(domain: str) -> re.Pattern:
+    """Playwright clear_cookies(domain=) filter equal to domain_matches()."""
+    return re.compile(r"^\.?(?:.+\.)?" + re.escape(domain) + "$", re.IGNORECASE)
+
+
+async def _impl_browser_sessions() -> dict:
+    """List cookie counts per domain in both local browser profiles.
+
+    Does NOT launch a browser. A profile whose browser runs in this process is
+    read through the live context; otherwise the cookie file is read
+    read-only. Each entry says which source it used.
+    """
+    from collections import Counter
+
+    from genesis.browser.profile import BrowserProfileManager
+
+    profiles = []
+    for kind, pdir in _cookie_profiles():
+        entry: dict = {"browser": kind, "profile_path": str(pdir)}
+        try:
+            ctx = _live_cookie_context(kind)
+            if ctx is not None:
+                counts = Counter(
+                    (c.get("domain") or "").lstrip(".") for c in await _cookie_call(ctx.cookies())
+                )
+                entry.update(
+                    source="live browser",
+                    exists=True,
+                    sessions=[
+                        {"domain": d, "cookie_count": n} for d, n in sorted(counts.items())
+                    ],
+                )
+            else:
+                mgr = BrowserProfileManager(pdir, browser=kind)
+                info = mgr.get_info()
+                entry.update(
+                    source="profile file",
+                    exists=info.exists,
+                    size_mb=info.size_mb,
+                    sessions=[
+                        {"domain": s.domain, "cookie_count": s.cookie_count}
+                        for s in info.sessions
+                    ],
+                )
+                if info.error:
+                    entry["error"] = info.error
+                pid = mgr.running_pid()
+                if pid is not None:
+                    entry["note"] = (
+                        f"open in another browser process (pid {pid}); the file "
+                        "can lag that browser's live cookies"
+                    )
+        except Exception as e:
+            entry["error"] = f"Failed to read {kind} sessions: {e}"
+        profiles.append(entry)
+    return {"profiles": profiles}
 
 
 async def _impl_browser_clear_domain(domain: str) -> dict:
-    """Clear cookies for a specific domain (selective logout).
+    """Clear the cookies of a domain and its subdomains in both profiles.
 
-    Does NOT launch a browser — modifies the cookie database directly.
+    Exact label matching: ``x.com`` clears ``x.com`` and ``*.x.com``, never
+    ``netflix.com``. Does NOT launch a browser: a profile whose browser runs in
+    this process is cleared through the live context, a closed one in its
+    cookie file, and one open in another process is refused (that browser
+    would write its cookies back) with the reason in its entry.
     """
+    from genesis.browser.profile import (
+        BrowserProfileManager,
+        ProfileInUse,
+        domain_matches,
+        normalize_domain,
+    )
+
     try:
-        from genesis.browser.profile import BrowserProfileManager
-        mgr = BrowserProfileManager()
-        removed = mgr.clear_domain(domain)
-        return {"domain": domain, "cookies_removed": removed}
-    except Exception as e:
-        return {"error": f"Failed to clear domain '{domain}': {e}"}
+        d = normalize_domain(domain)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    total = 0
+    profiles = []
+    for kind, pdir in _cookie_profiles():
+        entry: dict = {"browser": kind}
+        try:
+            ctx = _live_cookie_context(kind)
+            if ctx is not None:
+                n = sum(
+                    domain_matches(c.get("domain", ""), d)
+                    for c in await _cookie_call(ctx.cookies())
+                )
+                if n:
+                    await _cookie_call(ctx.clear_cookies(domain=_domain_cookie_pattern(d)))
+                entry.update(source="live browser", removed=n)
+            else:
+                n = BrowserProfileManager(pdir, browser=kind).clear_domain(d)
+                entry.update(source="profile file", removed=n)
+            total += n
+        except ProfileInUse as e:
+            entry["error"] = str(e)
+        except Exception as e:
+            entry["error"] = f"Failed to clear {kind} cookies: {e}"
+        profiles.append(entry)
+    return {"domain": d, "cookies_removed": total, "profiles": profiles}
 
 
 async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
@@ -2572,19 +2676,25 @@ async def browser_run_js(expression: str) -> dict:
 
 @mcp.tool()
 async def browser_sessions() -> dict:
-    """List logged-in sessions from the persistent browser profile.
+    """List logged-in sessions in both local browser profiles.
 
-    Reads the Chrome cookie database without launching a browser.
-    Shows which domains have saved cookies/sessions.
+    Covers Camoufox (~/.genesis/camoufox-profile) and Chromium
+    (~/.genesis/browser-profile), one labelled entry each, with cookie counts
+    per domain. Never launches a browser: a browser running in this session is
+    read live, otherwise the profile's cookie file is read.
     """
     return await _impl_browser_sessions()
 
 
 @mcp.tool()
 async def browser_clear_domain(domain: str) -> dict:
-    """Clear cookies for a specific domain (selective logout).
+    """Clear cookies for a domain and its subdomains (selective logout).
 
-    Modifies the cookie database directly without launching a browser.
+    Matches whole labels: 'x.com' clears x.com and api.x.com, never
+    netflix.com. Covers both local profiles and returns the number removed,
+    per profile and in total. Never launches a browser. A profile open in
+    another session's browser is refused for that profile (its entry says
+    why), because that browser would write its cookies back.
     Example: browser_clear_domain('github.com')
     """
     return await _impl_browser_clear_domain(domain)
