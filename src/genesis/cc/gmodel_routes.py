@@ -14,7 +14,7 @@ Code applies env values" and "How env values interact with your shell", read
 later edit can overturn. The ``--settings`` layer outranks local, project and
 user settings for every key it sets (settings docs, "Settings precedence"), and
 reloads keep that order, so pinning the route there holds for the whole session.
-Only managed settings outrank it; ``gmodel_settings`` checks those before launch.
+Only managed settings outrank it, a documented residual (``gmodel_settings``).
 The MODEL is pinned at launch only: ``/model`` can still change it for the
 session, against the same endpoint and key (see ``route_settings``).
 This is the layer ``cc/invoker.py`` already uses for dispatched sessions
@@ -22,7 +22,6 @@ This is the layer ``cc/invoker.py`` already uses for dispatched sessions
 """
 from __future__ import annotations
 
-import copy
 import dataclasses
 import hashlib
 import json
@@ -75,25 +74,6 @@ FEATURE_SWITCH_PINS = {
 #: (Claude Code authentication docs, "Authentication precedence"); the empty
 #: pins remove the lower-ranked ones as well rather than relying on rank alone.
 EMPTY_CREDENTIAL_PINS = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS")
-#: The OpenRouter route's ``--settings`` hooks: refuse every requested model
-#: switch (``/model``, the picker, an SDK set_model). Exit 2 blocks the switch
-#: and shows stderr (hooks reference, PreModelSwitch, code.claude.com/docs/en/hooks).
-#: No matcher, so every target is refused: the alias slots already resolve to the
-#: route's model, so no switch on this route can usefully change anything.
-#: MEASURED on CC 2.1.280 (`-p "/model claude-opus-4-6"` against a local
-#: listener): without the hook the session switched; with it the switch was
-#: blocked. Two residuals, also measured or documented: Claude Code sends a
-#: one-token validation request for the requested model BEFORE the hook runs,
-#: and `disableAllHooks` (any settings file) or a managed `allowManagedHooksOnly`
-#: turns hooks off, so the refusal is then inert.
-OPENROUTER_MODEL_SWITCH_HOOKS = {"PreModelSwitch": [{"hooks": [{
-    "type": "command",
-    "command": ("echo 'gmodel: /model is refused on the OpenRouter route: OpenRouter also serves "
-                "Claude model IDs on this key and would bill them per token. To change model, "
-                "relaunch with gmodel.' >&2; exit 2"),
-}]}]}
-
-
 def settings_dir() -> Path:
     """Where routed launches keep their ``--settings`` files (resolved per call)."""
     return Path.home() / ".genesis" / "gmodel-settings"
@@ -318,8 +298,8 @@ def route_settings(selected: SelectedRoute, pins: Mapping[str, str]) -> dict:
     chain, so a user-level chain naming a Claude model would otherwise be sent
     to this endpoint on overload; a chain equal to the primary was accepted by
     CC 2.1.280, measured 2026-10-04), thinking and automatic compaction. A
-    managed value for any of these outranks this layer and is checked by
-    ``gmodel_settings.validate_managed_settings`` instead.
+    managed value for any of these outranks this layer; that residual is
+    documented, not checked (``gmodel_settings``).
 
     NOT pinnable here: ``maxEffortLevel``. When several files set it the LOWEST
     applies, and it caps CLAUDE_CODE_EFFORT_LEVEL too (settings reference,
@@ -336,18 +316,19 @@ def route_settings(selected: SelectedRoute, pins: Mapping[str, str]) -> dict:
     (its Claude Code guide configures only the base URL and token, and its
     "Anthropic Skin" maps the model; openrouter.ai/docs, Claude Code guide, read
     2026-10-04), so the switch would bill an Anthropic model per token. The
-    OpenRouter route therefore carries ``OPENROUTER_MODEL_SWITCH_HOOKS``.
+    launcher says so in the OpenRouter route's launch notice.
+
+    NOT pinned: thinking within the session. Alt+T (Option+T) turns it off,
+    and Kimi then serves a K3 model ID from K2.8 Preview (Kimi Code Claude Code
+    guide, read 2026-10-04). The launcher says so on Kimi routes.
     """
-    document = {
+    return {
         "env": dict(sorted(pins.items())),
         "model": selected.model_id,
         "fallbackModel": [selected.model_id],
         "alwaysThinkingEnabled": True,
         "autoCompactEnabled": True,
     }
-    if selected.route == "openrouter":
-        document["hooks"] = copy.deepcopy(OPENROUTER_MODEL_SWITCH_HOOKS)
-    return document
 
 
 def write_route_settings(document: Mapping, directory: Path | None = None) -> Path:

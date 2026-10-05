@@ -1,16 +1,14 @@
 """Foreground-only strict configuration, pin-file and CLI boundary regressions."""
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 import stat
-import subprocess
 
 import pytest
 
 from genesis import _config_overlay
-from genesis.cc import gmodel_routes, gmodel_settings, roster
+from genesis.cc import gmodel_routes, roster
 
 
 @pytest.mark.parametrize("contents", ["broken: [", "[]", "null", "false"])
@@ -64,13 +62,6 @@ def test_empty_strict_overlay_is_a_valid_noop(contents, tmp_path, monkeypatch):
     monkeypatch.setattr(_config_overlay, "_user_config_dir", lambda: tmp_path)
     (tmp_path / "cc_roster.local.yaml").write_text(contents)
     assert _config_overlay.merge_local_overlay({"a": 1}, tmp_path / "cc_roster.yaml", strict=True) == {"a": 1}
-
-
-@pytest.mark.parametrize("argument", ["-p", "--print", "--bg", "--background", "--resume", "--continue"])
-def test_mode_flags_inside_prompt_values_do_not_change_billing(argument):
-    assert not gmodel_settings.launch_flags(["--append-system-prompt", argument])
-    assert not gmodel_settings.launch_flags(["--", argument])
-    assert argument in gmodel_settings.launch_flags([argument])
 
 
 def test_catalog_rejects_secret_bearing_endpoint_before_listing():
@@ -211,15 +202,6 @@ def test_invalid_unrelated_foreground_config_preserves_existing_launches(name):
         gmodel_routes.resolve_route("broken", roster_data=data, environ={})
 
 
-@pytest.mark.parametrize("effort", gmodel_routes.EFFORTS)
-def test_explicit_yaml_effort_accepts_only_matching_cli(effort):
-    gmodel_settings.validate_cli(["--effort", effort], _selected(effort))
-    for other in gmodel_routes.EFFORTS:
-        if other != effort:
-            with pytest.raises(roster.RosterError):
-                gmodel_settings.validate_cli(["--effort", other], _selected(effort))
-
-
 _BASE_WITH_CATALOG = """\
 models:
   legacy-peer: {anthropic_base_url: "https://peer.invalid", auth_env: PEER_KEY, model_id: legacy-peer}
@@ -306,46 +288,3 @@ def test_effort_is_forced_on_for_custom_model_ids_in_both_layers():
     assert env["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] == "1"
     document = gmodel_routes.route_settings(_selected(), env)
     assert document["env"]["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] == "1"
-
-
-def _openrouter(model_id="vendor/example"):
-    return gmodel_routes.SelectedRoute("example", "openrouter", "https://openrouter.ai/api",
-                                       "EXAMPLE_KEY", model_id, 1048576)
-
-
-@pytest.mark.parametrize("kind", ["subscription", "api"])
-def test_model_switch_is_left_alone_off_openrouter(kind):
-    selected = dataclasses.replace(_selected(), route=kind)
-    env = gmodel_routes.apply_route_env({"EXAMPLE_KEY": "provider-key"}, selected)
-    assert "hooks" not in gmodel_routes.route_settings(selected, env)
-
-
-def test_openrouter_route_refuses_model_switches_with_its_own_hook():
-    """Codex 4176543944: on OpenRouter a /model switch to a Claude ID would bill an
-    Anthropic model per token on the same key, so the settings layer denies it.
-
-    Runs the generated command itself, with a real PreModelSwitch payload on stdin.
-    """
-    env = gmodel_routes.apply_route_env({"EXAMPLE_KEY": "provider-key"}, _openrouter())
-    document = gmodel_routes.route_settings(_openrouter(), env)
-    groups = document["hooks"]["PreModelSwitch"]
-    assert [list(group) for group in groups] == [["hooks"]]  # no matcher: every switch
-    (hook,) = groups[0]["hooks"]
-    assert hook["type"] == "command"
-    payload = json.dumps({"hook_event_name": "PreModelSwitch", "from_model": "vendor/example",
-                          "to_model": "claude-opus-4-6", "source": "command"})
-    result = subprocess.run(["sh", "-c", hook["command"]], input=payload, capture_output=True,
-                            text=True, timeout=60)
-    assert result.returncode == 2  # exit 2 blocks the switch (hooks reference)
-    assert "OpenRouter" in result.stderr and "relaunch" in result.stderr
-    assert "provider-key" not in hook["command"]
-
-
-
-@pytest.mark.parametrize("optional", sorted(gmodel_settings._OPTIONAL_OPTIONS))
-def test_optional_arguments_cannot_hide_later_routing_pins(optional):
-    route, remaining = gmodel_settings.extract_route([optional, "--route", "api", "--settings", '{"model":"other"}'])
-    assert route == "api"
-    with pytest.raises(roster.RosterError):
-        gmodel_settings.validate_cli(remaining, _selected())
-    assert "--background" in gmodel_settings.launch_flags([optional, "--background"])
