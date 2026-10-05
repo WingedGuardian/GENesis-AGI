@@ -101,7 +101,7 @@ def test_readiness_requires_permanent_native_rpc_matching_manager_pid(
     monkeypatch.setitem(namespace, "require_enabled", Mock())
     monkeypatch.setitem(namespace, "check_backend", lambda *a, **kw: "123")
     monkeypatch.setitem(namespace, "verified_binary", lambda *a: binary.open("rb"))
-    monkeypatch.setattr(namespace["time"], "monotonic", Mock(side_effect=[0, 0, 61]))
+    monkeypatch.setattr(namespace["time"], "monotonic", Mock(side_effect=[0, 0, 0, 61]))
     monkeypatch.setattr(namespace["time"], "sleep", Mock())
     monkeypatch.setattr(
         namespace["subprocess"],
@@ -127,7 +127,7 @@ def test_readiness_rechecks_authority_after_successful_rpc(runtime, tmp_path, mo
     monkeypatch.setitem(namespace, "show", lambda *a: state)
     monkeypatch.setitem(namespace, "check_backend", lambda *a, **kw: "123")
     monkeypatch.setitem(namespace, "verified_binary", lambda *a: binary.open("rb"))
-    monkeypatch.setattr(namespace["time"], "monotonic", Mock(side_effect=[0, 0, 61]))
+    monkeypatch.setattr(namespace["time"], "monotonic", Mock(side_effect=[0, 0, 0, 61]))
     monkeypatch.setattr(namespace["time"], "sleep", Mock())
 
     def rpc(*args, **kwargs):
@@ -147,3 +147,39 @@ def test_readiness_rechecks_authority_after_successful_rpc(runtime, tmp_path, mo
     )
     with pytest.raises(ValueError, match="ready"):
         runtime.ready(config)
+
+
+def test_native_status_can_use_remaining_startup_deadline(runtime, tmp_path, monkeypatch):
+    """A valid seven-second RPC must not be killed by a separate three-second cap."""
+    binary = tmp_path / "binary"
+    binary.write_bytes(b"fixture")
+    namespace = runtime.ready.__globals__
+    monkeypatch.setitem(namespace, "require_enabled", Mock())
+    monkeypatch.setitem(namespace, "check_backend", lambda *a, **kw: "123")
+    monkeypatch.setitem(namespace, "verified_binary", lambda *a: binary.open("rb"))
+    monkeypatch.setattr(namespace["time"], "monotonic", Mock(side_effect=[0, 0, 2, 61, 62, 63]))
+    monkeypatch.setattr(namespace["time"], "sleep", Mock())
+
+    def rpc(argv, **kwargs):
+        if kwargs["timeout"] < 7:
+            raise namespace["subprocess"].TimeoutExpired(argv, kwargs["timeout"])
+        assert kwargs["timeout"] == 58
+        return SimpleNamespace(returncode=0, stdout="daemon: active (permanent)\n  pid: 123\n")
+
+    monkeypatch.setattr(namespace["subprocess"], "run", rpc)
+    runtime.ready(dict(binary=str(binary), main=str(tmp_path), cache=str(tmp_path), runtime=str(tmp_path)))
+
+
+def test_readiness_does_not_start_rpc_after_deadline(runtime, tmp_path, monkeypatch):
+    binary = tmp_path / "binary"
+    binary.write_bytes(b"fixture")
+    namespace = runtime.ready.__globals__
+    monkeypatch.setitem(namespace, "require_enabled", Mock())
+    monkeypatch.setitem(namespace, "check_backend", Mock(return_value="123"))
+    monkeypatch.setitem(namespace, "verified_binary", lambda *a: binary.open("rb"))
+    monkeypatch.setattr(namespace["time"], "monotonic", Mock(side_effect=[0, 0, 60]))
+    rpc = Mock()
+    monkeypatch.setattr(namespace["subprocess"], "run", rpc)
+    with pytest.raises(ValueError, match="ready"):
+        runtime.ready(dict(binary=str(binary)))
+    rpc.assert_not_called()
