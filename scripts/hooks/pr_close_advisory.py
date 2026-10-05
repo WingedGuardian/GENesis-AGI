@@ -296,6 +296,22 @@ def _closes_a_pr(argv: list[str]) -> str | None:
     return "a REST `state=closed` PATCH to a pull-request endpoint"
 
 
+#: The superseded-PR exception, stated in full in BOTH notes. A session that
+#: never loaded genesis-development sees only this text, so it carries every
+#: condition and the evidence each needs rather than pointing at the skill.
+#: Both notes read this one constant, so they cannot drift apart.
+_SUPERSEDED_EXCEPTION = (
+    "A superseded PR gets a comment naming its successor and stays open, with "
+    "one exception that only the CLOSING session may use (not a build or "
+    "reviewer session): it may retire the PR when the owner's authorization of "
+    "the supersession is on record, the successor PR is open or merged, and every "
+    "file of the old PR was checked against the successor and current main and "
+    "found covered (naming the file:line that now does it) or moot (saying why). "
+    "That per-file mapping goes in the closing comment; one part neither covered "
+    "nor moot keeps the PR open."
+)
+
+
 def _advisory(reasons: list[str], closes: int) -> str:
     """`reasons` are the DISTINCT mechanisms; `closes` is how many were seen.
 
@@ -328,15 +344,13 @@ def _advisory(reasons: list[str], closes: int) -> str:
         "one reviving'): a reviewer session retires nothing. A PR that is wrong "
         "at the premise gets the `needs-architecture-session` label carrying the "
         "evidence, and STAYS OPEN — retiring belongs to the session that takes "
-        "up its revival. A superseded PR gets a comment naming its successor and "
-        "stays open, UNLESS all three hold: the owner authorized the "
-        "supersession, the successor PR is open or merged, and a per-file check "
-        "shows every part covered or moot (that mapping goes in the closing "
-        "comment). If you believe any other PR should be retired and nobody is "
-        "picking it up, that is a question for the user.\n"
+        f"up its revival. {_SUPERSEDED_EXCEPTION} If you believe any other PR "
+        "should be retired and nobody is picking it up, that is a question for "
+        "the user.\n"
         "So: if you are the reviving session, the user asked for this close by "
-        "name, or the superseded-PR conditions hold, proceed. Otherwise say what "
-        "you are about to close and why, and let them answer.\n"
+        "name, or you are the closing session and every superseded-PR condition "
+        "above holds with its evidence, proceed. Otherwise say what you are "
+        "about to close and why, and let them answer.\n"
         f"{_LIMIT}"
     )
 
@@ -355,10 +369,9 @@ def _unreadable_note(blind) -> str:
     return (
         f"NOTE: this command {blind.cause}, so I could not check whether it closes a "
         "pull request; it mentions a close. If it does: closing a PR is the user's "
-        "decision unless you are the session reviving it, or it is a wholly "
-        "superseded PR meeting that rule's conditions (genesis-development, "
-        "'Never RETIRE a PR you are not the one reviving'). For the specific check: "
-        f"{blind.hint}."
+        "decision unless you are the session reviving it (genesis-development, "
+        f"'Never RETIRE a PR you are not the one reviving'). {_SUPERSEDED_EXCEPTION} "
+        f"For the specific check: {blind.hint}."
     )
 
 
