@@ -89,9 +89,12 @@ _PROFILE_DIR = Path.home() / ".genesis" / "camoufox-profile"
 _CHROMIUM_PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
 
 # Module-level browser state — persists across tool calls within a session.
+# Layer numbers match genesis.browser.types.BrowserLayer.
+# Layer 2: Chromium fallback (patchright)
 _playwright = None
 _context = None
 _page = None
+# Layer 1: Camoufox (default)
 _stealth_cm = None  # Camoufox context manager (for proper __aexit__)
 _stealth_browser = None
 _stealth_page = None
@@ -2224,13 +2227,15 @@ async def _impl_browser_navigate(
         snapshot = await _snapshot_page(page)
 
         def _layer_name():
+            from genesis.browser.types import BrowserLayer
+
             if tinyfish:
-                return "tinyfish_cdp"
+                return BrowserLayer.TINYFISH.value
             if _is_remote_active():
-                return "remote_cdp"
+                return BrowserLayer.REMOTE_CDP.value
             if _is_camoufox_active():
-                return "camoufox"
-            return "chromium"
+                return BrowserLayer.CAMOUFOX.value
+            return BrowserLayer.CHROMIUM.value
 
         result = {
             "url": page.url,
@@ -2534,8 +2539,11 @@ async def browser_navigate(
     cdp_url: Override the CDP endpoint. Default: GENESIS_CDP_URL env var.
     Example: browser_navigate("https://jobs.ashbyhq.com/...", remote=True)
 
-    NOTE: If Cloudflare Turnstile is detected (Camoufox only), this call may
-    block for up to ~5 minutes while waiting for human resolution via VNC.
+    NOTE: If a Cloudflare challenge is detected (Camoufox and Chromium), this
+    call works on it before returning (auto-resolve poll, widget clicks, an
+    optional solver, VNC clicks, a reload); it does not wait for a person. If
+    unresolved, it sends a Telegram alert (when configured) and returns
+    turnstile.status == "blocked". This can take most of the 300 s timeout.
     """
     # Remote CDP: bounded by 30s connect + 30s goto = 60s ceiling.
     # Camoufox: Turnstile VNC resolution can take up to 5 minutes.
