@@ -27,6 +27,32 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+#: The bands are OWNER POLICY, re-checked against measured cost (2026-10-05).
+#: `scripts/pr_shape_study.py --out <dir>` re-derives the measurement: the 400
+#: most recently created merged PRs (none excluded), each sized by this counter
+#: on its squash commit, against its review rounds from `review_budget.py`.
+#:
+#: Median rounds by counted lines:
+#:
+#: | counted lines | PRs | median rounds |
+#: |---|---|---|
+#: | 0-50 | 147 | 1 |
+#: | 50-200 | 120 | 2 |
+#: | 200-400 | 67 | 3 |
+#: | 400-600 | 26 | 4 |
+#: | 600-800 | 18 | 4 |
+#: | 800-1000 | 8 | 3 |
+#: | 1000+ | 14 | 4 |
+#:
+#: Spearman rho = 0.43. The study's rule (median reaches 3 rounds, then 4) puts
+#: the shape and override points at about 200 and 400. The owner kept 500 and
+#: 1000 as a guideline the building session weighs, and the table records what
+#: a PR above them typically costs.
+#:
+#: Caveats on reading the table:
+#: - Medians cap near 4, because round 4 is terminal.
+#: - 354 of the 400 PRs predate ROUND_RULE_CUTOVER_ISO, so they count clean
+#:   reviews as rounds.
 SHAPE_AT = 500
 OVERRIDE_AT = 1001
 
