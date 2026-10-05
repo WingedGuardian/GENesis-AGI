@@ -68,18 +68,20 @@ mock patterns in tests. Use Grep for non-Python files. Default for
 symbol/reference/impact questions.
 
 **codebase-memory-mcp** — Tree-sitter code graph, SQLite index (~48MB for
-Genesis). Supports 66 languages. 3D visualization at `localhost:9749`.
+Genesis). Supports 66 languages. Managed execution disables visualization,
+watching and automatic indexing.
 Reindexed by the idle-gated runner, not inline on every commit — a commit
 queues a request marker and the runner rebuilds when the box is quiet (see
 below). If you need a fresh index, queue a marker; do NOT call the
 `index_repository` MCP tool directly for `~/genesis` (it bypasses the lock +
 host freeze — see the storm warning below).
-Runs under a hard 2G memory cap (`.claude/mcp/run-codebase-memory` wraps it in
-a systemd scope) because upstream v0.9.0 still leaks memory without bound on query (issue #581 open)
-operations (DeusData/codebase-memory-mcp#581). If its tools suddenly error
-mid-session, the instance likely hit the cap and was killed — run `/mcp` to
-reconnect a fresh one; Serena/GitNexus/Grep are unaffected. Cap override:
-`CODEBASE_MEMORY_MCP_MEMORY_MAX` (e.g. `4G`).
+`.claude/mcp/run-codebase-memory` requires immutable pinned managed settings and
+an explicitly enabled, running native query service. Each analysis reader has
+256MiB/zero-swap/Tasks32 under a 2GiB/zero-swap/Tasks512 aggregate; the permanent
+backend has its separate2GiB cap. There is no raw/PATH or address-space fallback
+and no legacy cap override. Missing setup refuses; registration never activates
+the service. A contained reader failure can be reconnected with `/mcp`; backend
+failure requires deliberate recovery. See `docs/reference/codebase-managed.md`.
 
 **GitNexus** — LadybugDB graph (v1.6.12). Snapshot-based: correct only when the
 index matches the working tree. Its reindex fires on local commit, **not** on

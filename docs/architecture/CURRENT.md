@@ -1411,8 +1411,9 @@ verified: 3c750316479f 2026-10-05
   External Codebase has pinned configuration staging/diagnostics and bounded
   native query unit entry points in `scripts/codebase_managed.py`. Install and
   bootstrap render disabled query/client-slice templates without auto-upgrading
-  a PATH provider. Staging does not activate it; MCP registration and indexing
-  retain their existing routes until their integration concerns land. See
+  a PATH provider. Staging does not activate it; MCP registration always uses
+  the managed launcher, including absent PATH binaries. Index queue integration
+  remains a separate concern. See
   `docs/reference/codebase-managed.md`.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
@@ -1425,7 +1426,11 @@ verified: 3c750316479f 2026-10-05
   native enable--now/readiness; failed startup attempts independent retirement.
   Disable/remove remain usable without valid settings, prove actual quiescence
   and preserve immutable settings/provider state. Remove unlinks fixed artifacts
-  only; frontend and queued-worker admission integration remain separate concerns.
+  only. Managed frontends prove fresh shared admission and kernel caps inside
+  the actual transient child:256MiB/zero swap/Tasks32 under2GiB/zero swap/Tasks512
+  aggregate, fixed analysis tool profile, native backend dependency and permanent
+  PID readiness. No raw fallback or backend activation. Queued-worker admission
+  remains a separate concern.
 - **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
   `/v1/chat/completions` endpoint, and registers the desk brain at

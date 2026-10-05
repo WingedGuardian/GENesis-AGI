@@ -1,0 +1,1 @@
+- Codebase MCP now uses managed, individually capped analysis readers against an explicitly enabled query backend. Install and bootstrap register this route even without a PATH provider; missing setup refuses without a raw or address-space fallback.

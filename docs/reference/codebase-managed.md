@@ -4,8 +4,9 @@
 a pinned provider and publishes immutable settings; `status` diagnoses settings
 and native service state. The ordinary install/bootstrap loops render disabled
 query service/client slice templates on every install and do not automatically
-install, upgrade or version-probe a PATH Codebase binary. The existing launcher,
-registration and index queue remain unchanged until their integration concerns.
+install, upgrade or version-probe a PATH Codebase binary. Registration always
+uses the managed launcher, including when no PATH provider exists. The index
+queue remains on its previous route until its separate integration lands.
 Staging and rendering alone do not make Codebase available.
 
 ## Native lifecycle
@@ -40,8 +41,43 @@ All three hold the exclusive nonblocking lifecycle lock through completion or
 rollback. Busy frontend/worker admission refuses; a worker already admitted is
 left to its existing watchdog. Daemon startup/readiness does not take a shared
 lock that could deadlock with this exclusive enable operation. The commands do
-not change immutable settings bytes. None starts the indexing queue or registers
-the forthcoming managed MCP frontend.
+not change immutable settings bytes. None starts the indexing queue.
+
+## Managed MCP frontend
+
+`.claude/mcp/run-codebase-memory` invokes the managed `launch` command. Missing
+or invalid settings, disabled native backend, armed sentinel, wrong pin/cache
+or unavailable manager refuse clearly. There is no raw/PATH binary, address-space
+fallback or legacy binary/memory/sentinel environment override. The immutable
+configuration selects these paths. Extra provider arguments are refused; the
+native tool profile is fixed to `analysis`.
+
+Install/bootstrap register this launcher on every install and heal stale raw
+registrations through the existing registration helper. Registration does not
+enable or start a provider. Worktree launchers use the configured physical main
+helper in the actual child, with the main checkout as its native working directory.
+
+Each frontend is a unique transient user service with 256 MiB memory, zero swap,
+TasksMax32 and OOMScoreAdjust500, inside the 2 GiB/zero-swap/TasksMax512 aggregate
+client slice. Requisite/After/StopPropagatedFrom bind it to the already running
+backend without activating that backend. Native collection, wait and pipe preserve
+MCP stdio; environment expansion is disabled for literal path arguments.
+
+Inside the actual capped child, shared nonblocking lifecycle admission precedes
+a fresh settings read and kernel leaf/aggregate/ancestor checks. Cache, pinned
+binary and native permanent-daemon RPC PID are verified again. The shared lock
+is released by CLOEXEC at the accepted binary exec; admitted readers do not hold
+up disable, which stops their dependency and aggregate slice. Inherited CBM_*
+values are scrubbed and explicit cache/runtime/root paths supplied. No graph
+indexing or runtime unit repair is performed by a frontend.
+
+The stock pinned MCP bootstrap can start a session daemon if its endpoint
+disappears after admission. Native StopPropagatedFrom also propagates unexpected
+backend death, and KillMode=control-group retires the reader and any descendants.
+A short spawn before the manager processes that transition remains possible;
+it stays inside the reader's 256MiB/zero-swap cgroup and aggregate. This is an
+accepted bounded timing residue, not a strict connect-only/no-fork guarantee.
+No alternate executable or uncapped execution path is provided by the launcher.
 
 ## Configure
 
@@ -83,15 +119,14 @@ differs from the installed service's default. Absolute paths retain whitespace.
 
 No service is enabled, no unit is rendered and no sentinel is removed.
 Configuration uses schema 2: paths and build identity, with no mutable `enabled`
-flag. Native systemd enablement will own operational state when lifecycle
-integration lands. The lifecycle lock coordinates cooperating same-user tools;
+flag. Native systemd enablement owns operational state. The lifecycle lock coordinates cooperating same-user tools;
 it is not protection against deliberate same-user filesystem interference.
 
 ## Native query unit entry points
 
 `genesis-cbm-query.service` invokes `serve` and `ready` using the installed
-settings path. These are unit entry points, not substitutes for the forthcoming
-operator lifecycle and managed MCP launcher. They require immutable accepted
+settings path. These are unit entry points alongside the operator lifecycle and
+managed MCP launcher. They require immutable accepted
 settings, the configured primary checkout, persistent native enablement and a
 definitely absent sentinel. Runtime-only enablement and all other unit file
 states refuse. Nothing automatically enables the service or removes the sentinel.
@@ -100,14 +135,17 @@ The query daemon runs in its own cgroup v2 service with exactly 2 GiB memory,
 zero swap, TasksMax 128, CPUQuota 200%, OOMScoreAdjust 500 and control-group
 cleanup. Restart is disabled. Every visible finite ancestor must admit the full
 query budget; unreadable or malformed limits refuse. The aggregate client slice
-has 2 GiB memory, zero swap and TasksMax 512; the frontend integration comes later.
+has 2 GiB memory, zero swap and TasksMax 512.
 
 Startup verifies cache flags and the executable inode, uses the pinned native
 local configuration read to repair a stale endpoint generation, then execs the
 stock permanent daemon. It holds no shared lifecycle lock while readiness is
-pending, avoiding a deadlock with a future exclusive enable operation. Readiness
+pending, avoiding a deadlock with the exclusive enable operation. Readiness
 requires a native connect-only status RPC that names the permanent service PID,
 the correct executable and actual kernel limits. Socket existence is insufficient.
+Each status RPC uses the remaining 60-second readiness window: the pinned CLI
+hashes its executable at startup, so a healthy status call can exceed three
+seconds. No status call starts once that window has expired.
 
 Both ordinary renderer loops substitute quoted Exec paths using separate systemd
 and sed escaping. Whitespace, quote, backslash, dollar, percent, ampersand, pipe

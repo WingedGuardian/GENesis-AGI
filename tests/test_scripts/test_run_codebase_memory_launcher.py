@@ -1,20 +1,7 @@
-"""Memory-cap launcher for codebase-memory-mcp (.claude/mcp/run-codebase-memory).
-
-Upstream v0.9.0 still leaks memory without bound on query operations (#581)
-(DeusData/codebase-memory-mcp#581), so the launcher wraps the server in a
-transient systemd scope with MemoryMax, falling back to an address-space
-rlimit where no user manager is reachable.
-
-These tests are binary- and environment-independent: the server binary and
-``systemd-run`` are both faked via PATH/env injection, so they run in CI
-runners with no systemd user manager and no codebase-memory-mcp install.
-One real-cgroup smoke test runs only where ``systemd-run --user`` works.
-"""
+"""Managed MCP registration and missing-setup refusal, without a native manager."""
 
 from __future__ import annotations
 
-import functools
-import os
 import stat
 import subprocess
 from pathlib import Path
@@ -22,10 +9,9 @@ from pathlib import Path
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_LAUNCHER = _REPO_ROOT / ".claude" / "mcp" / "run-codebase-memory"
-_REGISTER_LIB = _REPO_ROOT / "scripts" / "lib" / "mcp_register.sh"
-
-_SYSTEM_PATH = "/usr/bin:/bin"  # real python3/bash/coreutils for harnesses
+_LAUNCHER = _REPO_ROOT / ".claude/mcp/run-codebase-memory"
+_REGISTER_LIB = _REPO_ROOT / "scripts/lib/mcp_register.sh"
+_SYSTEM_PATH = "/usr/bin:/bin"
 
 
 def _write_exec(path: Path, body: str) -> Path:
@@ -34,495 +20,63 @@ def _write_exec(path: Path, body: str) -> Path:
     return path
 
 
-def _fake_binary(tmp_path: Path) -> tuple[Path, Path]:
-    """A stand-in server binary that records its args and its ulimit -v."""
-    log = tmp_path / "binary.log"
-    binary = _write_exec(
-        tmp_path / "fake-cbm",
-        "#!/usr/bin/env bash\n"
-        f'echo "ARGS:$*" >> "{log}"\n'
-        f'echo "ULIMIT_V:$(ulimit -v)" >> "{log}"\n',
-    )
-    return binary, log
-
-
-def _fake_systemd_run(tmp_path: Path, *, probe_ok: bool = True) -> tuple[Path, Path]:
-    """A fake systemd-run: logs argv, then execs the wrapped command.
-
-    The launcher probes with ``-- /bin/true`` before committing; ``probe_ok``
-    controls whether that probe (and everything else) succeeds.
-    """
-    fakebin = tmp_path / "fakebin"
-    fakebin.mkdir(exist_ok=True)
-    log = tmp_path / "systemd-run.log"
-    if probe_ok:
-        body = (
-            "#!/usr/bin/env bash\n"
-            f'echo "$*" >> "{log}"\n'
-            "# exec everything after the -- separator\n"
-            'while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done\n'
-            "shift\n"
-            'exec "$@"\n'
-        )
-    else:
-        body = f'#!/usr/bin/env bash\necho "$*" >> "{log}"\nexit 1\n'
-    _write_exec(fakebin / "systemd-run", body)
-    return fakebin, log
-
-
-def _run_launcher(tmp_path, *args, fakebin=None, env_extra=None):
-    binary, blog = _fake_binary(tmp_path)
-    path = f"{fakebin}:{_SYSTEM_PATH}" if fakebin else _SYSTEM_PATH
-    env = {
-        "PATH": path,
-        "HOME": str(tmp_path),
-        "CODEBASE_MEMORY_MCP_BIN": str(binary),
-        "CODEBASE_MEMORY_MCP_DISABLE_FILE": str(tmp_path / "not-disabled"),
-        **(env_extra or {}),
-    }
-    res = subprocess.run(
-        ["bash", str(_LAUNCHER), *args],
-        env=env, capture_output=True, text=True, timeout=30,
-    )
-    return res, blog
-
-
-# ── launcher behavior (fully faked, CI-safe) ──────────────────────────────
-
-
-def test_missing_binary_errors(tmp_path):
-    res = subprocess.run(
-        ["bash", str(_LAUNCHER)],
-        env={"PATH": _SYSTEM_PATH, "HOME": str(tmp_path),
-             "CODEBASE_MEMORY_MCP_BIN": str(tmp_path / "nope")},
-        capture_output=True, text=True, timeout=30,
-    )
-    assert res.returncode == 1
-    assert "not installed" in res.stderr
-
-
-def test_disable_sentinel_refuses_to_spawn_binary(tmp_path):
-    disable_file = tmp_path / "codebase-memory-mcp.disabled"
-    disable_file.write_text("incident freeze\n")
-    res, blog = _run_launcher(
-        tmp_path,
-        env_extra={"CODEBASE_MEMORY_MCP_DISABLE_FILE": str(disable_file)},
-    )
-    assert res.returncode == 1
-    assert f"disabled by {disable_file}" in res.stderr
-    assert not blog.exists()
-
-
-def test_scope_path_passes_memorymax(tmp_path):
-    fakebin, slog = _fake_systemd_run(tmp_path, probe_ok=True)
-    res, blog = _run_launcher(tmp_path, fakebin=fakebin)
-    assert res.returncode == 0, res.stderr
-    calls = slog.read_text()
-    assert "MemoryMax=2G" in calls
-    assert "MemorySwapMax=0" in calls
-    assert "--scope" in calls
-    assert "ARGS:" in blog.read_text()  # the server actually ran
-
-
-def test_mem_max_env_override(tmp_path):
-    fakebin, slog = _fake_systemd_run(tmp_path, probe_ok=True)
-    res, _ = _run_launcher(
-        tmp_path, fakebin=fakebin,
-        env_extra={"CODEBASE_MEMORY_MCP_MEMORY_MAX": "512M"},
-    )
-    assert res.returncode == 0, res.stderr
-    assert "MemoryMax=512M" in slog.read_text()
-
-
-def test_args_passthrough_scope_path(tmp_path):
-    fakebin, _ = _fake_systemd_run(tmp_path, probe_ok=True)
-    res, blog = _run_launcher(tmp_path, "cli", "impact", fakebin=fakebin)
-    assert res.returncode == 0, res.stderr
-    assert "ARGS:cli impact" in blog.read_text()
-
-
-def _minimal_path(tmp_path: Path) -> Path:
-    """A PATH dir with ONLY bash + env (genuinely no systemd-run).
-
-    ``/usr/bin:/bin`` contains the real systemd-run on most Linux hosts, so
-    using it would exercise the probe-fail path, not the absent-binary path.
-    """
-    d = tmp_path / "minbin"
-    d.mkdir(exist_ok=True)
-    for tool in ("bash", "env", "sh"):
-        src = Path("/usr/bin") / tool
-        if not src.exists():
-            src = Path("/bin") / tool
-        (d / tool).symlink_to(src)
-    return d
-
-
-def test_fallback_when_systemd_run_absent(tmp_path):
-    # command -v systemd-run itself fails → ulimit fallback (2G = 2097152 KB).
-    minbin = _minimal_path(tmp_path)
-    binary, blog = _fake_binary(tmp_path)
-    res = subprocess.run(
-        ["bash", str(_LAUNCHER)],
-        env={"PATH": str(minbin), "HOME": str(tmp_path),
-             "CODEBASE_MEMORY_MCP_BIN": str(binary)},
-        capture_output=True, text=True, timeout=30,
-    )
-    assert res.returncode == 0, res.stderr
-    assert "ULIMIT_V:2097152" in blog.read_text()
-
-
-def test_fallback_fractional_gig_truncates_cleanly(tmp_path):
-    # 2.5G is valid for systemd but the rlimit fallback truncates to 2G —
-    # and must NOT spray a bash arithmetic error on stderr.
-    minbin = _minimal_path(tmp_path)
-    binary, blog = _fake_binary(tmp_path)
-    res = subprocess.run(
-        ["bash", str(_LAUNCHER)],
-        env={"PATH": str(minbin), "HOME": str(tmp_path),
-             "CODEBASE_MEMORY_MCP_BIN": str(binary),
-             "CODEBASE_MEMORY_MCP_MEMORY_MAX": "2.5G"},
-        capture_output=True, text=True, timeout=30,
-    )
-    assert res.returncode == 0, res.stderr
-    assert "arithmetic" not in res.stderr
-    assert "ULIMIT_V:2097152" in blog.read_text()
-
-
-def test_fallback_when_probe_fails(tmp_path):
-    fakebin, slog = _fake_systemd_run(tmp_path, probe_ok=False)
-    res, blog = _run_launcher(tmp_path, "cli", fakebin=fakebin)
-    assert res.returncode == 0, res.stderr
-    # probe was attempted, then the binary ran under ulimit instead
-    assert slog.read_text().count("\n") == 1
-    out = blog.read_text()
-    assert "ULIMIT_V:2097152" in out
-    assert "ARGS:cli" in out
-
-
-def test_unparseable_memmax_warns_and_runs_uncapped(tmp_path):
-    res, blog = _run_launcher(
-        tmp_path, fakebin=None,
-        env_extra={"CODEBASE_MEMORY_MCP_MEMORY_MAX": "lots"},
-    )
-    assert res.returncode == 0, res.stderr
-    assert "running uncapped" in res.stderr
-    assert "ULIMIT_V:unlimited" in blog.read_text()
-
-
-# ── binary resolution without $HOME (env-scrubbed MCP clients) ────────────
-
-
-def _fake_named_binary(tmp_path: Path) -> tuple[Path, Path]:
-    """A fake server actually named ``codebase-memory-mcp`` in its own dir,
-    so PATH resolution (``command -v``) can find it. Returns (bindir, log)."""
-    log = tmp_path / "binary.log"
-    bindir = tmp_path / "realbin"
-    bindir.mkdir(exist_ok=True)
-    _write_exec(
-        bindir / "codebase-memory-mcp",
-        "#!/usr/bin/env bash\n"
-        f'echo "ARGS:$*" >> "{log}"\n'
-        f'echo "ULIMIT_V:$(ulimit -v)" >> "{log}"\n',
-    )
-    return bindir, log
-
-
-def test_scrubbed_env_resolves_via_path(tmp_path):
-    # Some MCP clients spawn servers with HOME empty and no
-    # CODEBASE_MEMORY_MCP_BIN; the launcher must fall through to a PATH
-    # lookup instead of dying with "not installed" (seen by the client as a
-    # bare EPIPE). No systemd-run on PATH either → ulimit fallback.
-    bindir, blog = _fake_named_binary(tmp_path)
-    minbin = _minimal_path(tmp_path)
-    res = subprocess.run(
-        ["bash", str(_LAUNCHER)],
-        env={
-            "PATH": f"{bindir}:{minbin}",
-            "HOME": "",
-            "CODEBASE_MEMORY_MCP_DISABLE_FILE": str(tmp_path / "not-disabled"),
-        },
-        capture_output=True, text=True, timeout=30,
-    )
-    assert res.returncode == 0, res.stderr
-    assert "ULIMIT_V:2097152" in blog.read_text()
-
-
-def test_home_default_preferred_when_home_set(tmp_path):
-    # With HOME set (Claude Code), the $HOME/.local/bin default still wins;
-    # PATH alone would NOT find the binary here (minbin has no fake).
-    home = tmp_path / "home"
-    (home / ".local" / "bin").mkdir(parents=True)
-    log = tmp_path / "binary.log"
-    _write_exec(
-        home / ".local" / "bin" / "codebase-memory-mcp",
-        "#!/usr/bin/env bash\n"
-        f'echo "ULIMIT_V:$(ulimit -v)" >> "{log}"\n',
-    )
-    minbin = _minimal_path(tmp_path)
-    res = subprocess.run(
-        ["bash", str(_LAUNCHER)],
-        env={"PATH": str(minbin), "HOME": str(home)},
-        capture_output=True, text=True, timeout=30,
-    )
-    assert res.returncode == 0, res.stderr
-    assert "ULIMIT_V:2097152" in log.read_text()
-
-
-# ── real-cgroup smoke (local only; skipped where no user manager) ─────────
-
-
-_SCOPE_PROBE = [
-    "systemd-run", "--user", "--scope", "--quiet",
-    "-p", "MemoryMax=2G", "-p", "MemorySwapMax=0", "--", "/bin/true",
-]
-
-
-def _launcher_env(**extra: str) -> dict[str, str]:
-    """The environment the launcher is given -- built in ONE place.
-
-    Forwarded CONDITIONALLY. `os.environ.get(k, "")` does not mean "pass it
-    through if set": it forwards an EMPTY STRING when the key is absent, and
-    for both of these an empty value is strictly WORSE than omitting the key,
-    because sd-bus treats set-but-empty as an address it must use and never
-    falls back. MEASURED on systemd 255 with the probe above:
-
-        DBUS absent,        XDG set            -> rc=0
-        DBUS set-but-EMPTY, XDG set            -> rc=1 connection refused
-        DBUS absent,        XDG set-but-EMPTY  -> rc=1 no such file
-
-    CONFIRMED IN CI: a GitHub runner has XDG_RUNTIME_DIR set and no
-    DBUS_SESSION_BUS_ADDRESS, so the old form handed the launcher an empty bus
-    address, its probe failed, it took its SILENT ulimit fallback, and
-    memory.max read `max` -- while the identical probe under pytest's own env
-    returned rc=0. That looked like a launcher regression for five days and was
-    a test-harness bug the whole time.
-
-    The gate below uses this too. A gate that probes under a DIFFERENT
-    environment than the subject asks a weaker question than the assertion
-    depends on, which is the same asymmetry in another axis.
-    """
-    return {
-        "PATH": os.environ["PATH"],
-        "HOME": os.environ["HOME"],
-        "CODEBASE_MEMORY_MCP_DISABLE_FILE": "/dev/null/not-disabled",
-        **{k: os.environ[k]
-           for k in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
-           if k in os.environ},
-        **extra,
-    }
-
-
-@functools.lru_cache(maxsize=1)
-def _user_scope_works() -> bool:
-    """Can a --user scope be created with the launcher's properties AND env?
-
-    The properties are not decoration: a plain scope needs only a reachable
-    user manager, while `MemoryMax` additionally needs the memory controller
-    delegated to the branch --user scopes are created in
-    (`user@UID.service/app.slice`). A gate that asks only the first question
-    says "usable" on a machine that cannot answer the second, and the assertion
-    then fails for an environmental reason instead of skipping -- a red CI that
-    says nothing about the launcher.
-
-    Called from inside the test, never as a `skipif` argument. A `skipif`
-    predicate is evaluated at COLLECTION, so this would spawn a real transient
-    scope on every collection of this module -- including `--collect-only` and
-    `-k` runs that deselect it. That is the same class as the two most recent
-    test fixes on main ("read the clock where it is used", "...when the helper
-    is called, not at module import"); cached so the cost stays one probe.
-    """
-    try:
-        return subprocess.run(
-            _SCOPE_PROBE, capture_output=True, timeout=15, env=_launcher_env(),
-        ).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-
-
-def _run(argv: list[str], env: dict[str, str] | None = None) -> str:
-    """Run *argv*, render rc/stdout/stderr on one line. Diagnostic use only.
-
-    ``errors="replace"`` because the default is strict decoding against the
-    locale: in a C/POSIX locale that is ASCII, and one non-ASCII byte on a
-    child's stderr would raise UnicodeDecodeError from inside the failure
-    message, losing the assertion it was added to explain.
-    """
-    try:
-        r = subprocess.run(
-            argv, capture_output=True, text=True, timeout=15, env=env, errors="replace",
-        )
-    except Exception as exc:  # noqa: BLE001 - a raising diagnostic destroys the evidence
-        return f"<{type(exc).__name__}: {exc}>"
-    out = (r.stdout or "").strip().replace("\n", " | ")
-    err = (r.stderr or "").strip().replace("\n", " | ")
-    return f"rc={r.returncode} out={out!r} err={err!r}"
-
-
-def _read(path: str) -> str:
-    try:
-        return Path(path).read_text(errors="replace").strip() or "<empty>"
-    except Exception as exc:  # noqa: BLE001 - same reason as _run
-        return f"<unreadable: {exc}>"
-
-
-def _cgroup_levels(rel: str) -> list[str]:
-    """controllers/subtree_control at every level of *rel*, root first."""
-    lines, node = [], "/sys/fs/cgroup"
-    for part in [""] + [p for p in rel.split("/") if p]:
-        node = f"{node}/{part}" if part else node
-        lines.append(
-            f"  {node}: controllers={_read(node + '/cgroup.controllers')} "
-            f"subtree_control={_read(node + '/cgroup.subtree_control')}"
-        )
-    return lines
-
-
-def _scope_diagnostics(launcher_env: dict[str, str], res) -> str:
-    """Why a real MemoryMax scope did not take -- in the failure message itself.
-
-    Written because this test failed three times on one branch (13 of 14 recent
-    CI runs across eight branches passed it) and reported only
-    ``assert 'max' == '2147483648'`` -- a verdict with no cause in it. The
-    failure does not reproduce on the development box, so the evidence has to
-    come from CI, and a diagnostic that cannot discriminate between the live
-    hypotheses wastes the cycle it costs.
-
-    The four hypotheses it must separate:
-      1. the launcher's probe failed and it took the silent ``ulimit -v``
-         fallback  -> the probe's own CG:/ULIMIT_V: line says so outright;
-      2. the probe failed because of the ENV this test hands it rather than
-         anything wrong with the machine -> the same probe is run twice, once
-         under the launcher's env and once under pytest's, and a disagreement
-         is the answer. MEASURED on systemd 255: a set-but-EMPTY
-         DBUS_SESSION_BUS_ADDRESS gives "Failed to connect to bus: Connection
-         refused" where an ABSENT one succeeds, and an empty XDG_RUNTIME_DIR
-         gives "No such file or directory" -- so ``os.environ.get(k, "")``
-         below forwards a value strictly WORSE than the key's absence;
-      3. the scope was created but MemoryMax did not apply -> CG: names a
-         transient scope while memory.max still reads max;
-      4. the memory controller is not delegated on the branch the scope is
-         created in -> that branch is ``user@UID.service/app.slice``, NOT this
-         process's own, and both are walked because they differ (measured).
-    """
-    uid = os.getuid()
-    scope_branch = f"user.slice/user-{uid}.slice/user@{uid}.service/app.slice"
-    with_props = [
-        "systemd-run", "--user", "--scope", "--quiet",
-        "-p", "MemoryMax=2G", "-p", "MemorySwapMax=0", "--", "/bin/true",
-    ]
-    plain = ["systemd-run", "--user", "--scope", "--quiet", "--", "/bin/true"]
-    shown = {
-        k: (v if k in ("PATH", "CODEBASE_MEMORY_MCP_BIN") else repr(v))
-        for k, v in launcher_env.items()
-        if k != "PATH"
-    }
-    own = _read("/proc/self/cgroup")
-    # Anchor on the unified line the way the probe itself does; a bare
-    # split("::") picks the wrong line on a hybrid hierarchy and yields
-    # authoritative-looking garbage in a message whose whole job is to be trusted.
-    rel = next((ln[3:] for ln in own.splitlines() if ln.startswith("0::")), "")
-    return "\n".join(
-        [
-            "",
-            "--- scope diagnostics (this assertion cannot explain itself alone) ---",
-            f"launcher stderr : {(res.stderr or '').strip()!r}",
-            f"launcher env    : {shown}",
-            f"probe+props, LAUNCHER env : {_run(with_props, env=launcher_env)}"
-            f"   (what the gate asks, and what the launcher needs)",
-            f"probe+props, pytest   env : {_run(with_props)}",
-            f"probe plain, pytest   env : {_run(plain)}   (no properties: weaker still)",
-            f"systemd         : {_run(['systemctl', '--version'])}",
-            f"/proc/self/cgroup: {own}",
-            "pytest's own branch:",
-            *_cgroup_levels(rel),
-            f"the branch --user scopes are created in ({scope_branch}):",
-            *_cgroup_levels(scope_branch),
-            "--- end diagnostics ---",
-        ]
-    )
-
-
-def test_launcher_env_omits_an_absent_key_rather_than_emptying_it(monkeypatch):
-    """The root cause, pinned where it cannot skip.
-
-    MEASURED on systemd 255: a set-but-EMPTY DBUS_SESSION_BUS_ADDRESS makes
-    `systemd-run --user` fail with "Failed to connect to bus: Connection
-    refused" where an ABSENT one succeeds -- sd-bus treats empty as an address
-    it must use and never falls back to XDG_RUNTIME_DIR. So `os.environ.get(k,
-    "")` hands the child something strictly worse than nothing.
-
-    This is a pure dict assertion ON PURPOSE. The real-scope test below cannot
-    carry this pin any more: its gate now probes under this same env, so
-    reintroducing the bug makes that test SKIP rather than fail -- measured,
-    when the mutation was run. A gate that protects a test from an environment
-    also hides a bug IN how that environment is built, and the only way out is
-    to assert the construction directly, where no systemd is involved and
-    nothing can skip.
-    """
-    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
-    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/12345")
-    env = _launcher_env()
-    assert "DBUS_SESSION_BUS_ADDRESS" not in env, (
-        "an absent key was forwarded as empty; empty is not absent, and for a "
-        "bus address it is strictly worse"
-    )
-    assert env["XDG_RUNTIME_DIR"] == "/run/user/12345", "a SET key must pass through"
-
-    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/12345/bus")
-    assert _launcher_env()["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/12345/bus"
-
-
-def test_real_scope_applies_memory_max(tmp_path):
-    if not _user_scope_works():
-        pytest.skip("no --user scope with MemoryMax available under the launcher's env")
-    probe = _write_exec(
-        tmp_path / "cgprobe",
-        "#!/usr/bin/env bash\n"
-        'cg="$(sed -n \'s/^0:://p\' /proc/self/cgroup)"\n'
-        # On stderr, so stdout stays exactly the one value the assertion reads.
-        # This is the single datum that separates "took the ulimit fallback"
-        # from "scope taken but MemoryMax did not apply" -- the launcher picks
-        # between them silently.
-        'printf \'CG:%s ULIMIT_V:%s\\n\' "$cg" "$(ulimit -v)" >&2\n'
-        'cat "/sys/fs/cgroup${cg}/memory.max"\n',
-    )
-    # Forward these two CONDITIONALLY. `os.environ.get(k, "")` does not mean
-    # "pass it through if set" -- it forwards an EMPTY STRING when the key is
-    # absent, and for both of these an empty value is strictly WORSE than
-    # omitting the key, because sd-bus treats set-but-empty as an address it
-    # must use and never falls back. MEASURED on systemd 255, running the
-    # launcher's own probe (`systemd-run --user --scope -p MemoryMax=2G
-    # -p MemorySwapMax=0 -- /bin/true`):
-    #     DBUS absent,        XDG set            -> rc=0
-    #     DBUS set-but-EMPTY, XDG set            -> rc=1 connection refused
-    #     DBUS absent,        XDG set-but-EMPTY  -> rc=1 no such file
-    # CONFIRMED IN CI, not just locally: a GitHub runner has XDG_RUNTIME_DIR
-    # set and no DBUS_SESSION_BUS_ADDRESS, so the old form handed the launcher
-    # `DBUS_SESSION_BUS_ADDRESS=''`, its probe failed with "Failed to connect
-    # to bus: Connection refused", it took its SILENT ulimit fallback, and
-    # memory.max read `max` -- while the identical probe under pytest's own
-    # env returned rc=0. The failure looked like a launcher regression and was
-    # a test-harness bug the whole time.
-    env = _launcher_env(CODEBASE_MEMORY_MCP_BIN=str(probe))
-    res = subprocess.run(
-        ["bash", str(_LAUNCHER)], env=env, capture_output=True, text=True, timeout=30,
-    )
-    assert res.returncode == 0, res.stderr
-    # The VERDICT is unchanged -- only the message is, and only on the failing
-    # branch, so a passing run pays nothing for any of it.
-    expected = str(2 * 1024**3)  # MemoryMax=2G
-    got = res.stdout.strip()
-    if got != expected:
-        raise AssertionError(
-            f"cgroup memory.max is {got!r}, expected {expected!r}. A value of "
-            f"'max' is consistent with EITHER the launcher's silent ulimit "
-            f"fallback OR a scope whose MemoryMax did not apply; the CG:/"
-            f"ULIMIT_V: line below says which."
-            + _scope_diagnostics(env, res)
-        )
+@pytest.mark.parametrize("override", ["none", "binary", "memory", "sentinel", "path"])
+def test_missing_setup_has_no_legacy_fallback(tmp_path, override):
+    log = tmp_path / "raw.log"
+    binary = _write_exec(tmp_path / "codebase-memory-mcp", f"#!/bin/sh\necho raw > {log}\n")
+    env = {"PATH": _SYSTEM_PATH, "HOME": str(tmp_path)}
+    if override == "binary":
+        env["CODEBASE_MEMORY_MCP_BIN"] = str(binary)
+    elif override == "memory":
+        env["CODEBASE_MEMORY_MCP_MEMORY_MAX"] = "lots"
+    elif override == "sentinel":
+        env["CODEBASE_MEMORY_MCP_DISABLE_FILE"] = str(tmp_path / "absent")
+    elif override == "path":
+        env["PATH"] = str(tmp_path) + ":" + _SYSTEM_PATH
+    result = subprocess.run(["/bin/bash", str(_LAUNCHER)], env=env,
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 1 and "managed Codebase refused" in result.stderr
+    assert "codebase-managed.json" in result.stderr
+    assert not log.exists()
 
 
 # ── _register_mcp drift-healing (sources the REAL shared lib) ─────────────
+
+
+@pytest.mark.parametrize("renderer", ["install.sh", "bootstrap.sh"])
+@pytest.mark.parametrize("existing", [False, True])
+def test_actual_registration_loop_without_path_provider(tmp_path, renderer, existing):
+    import json
+
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    log = tmp_path / "claude.log"
+    _write_exec(fakebin / "claude", f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{log}"\n')
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".genesis").mkdir()
+    (home / ".genesis/codebase-memory-mcp.disabled").touch()
+    if existing:
+        (home / ".claude.json").write_text(json.dumps({"mcpServers": {
+            "codebase-memory-mcp": {"command": "codebase-memory-mcp"}}}))
+    source = (_REPO_ROOT / "scripts" / renderer).read_text()
+    if renderer == "install.sh":
+        start = source.index("# Register code intelligence tools as MCP servers")
+        end = source.index("# Queue initial code intelligence indexing", start)
+    else:
+        start = source.index("# --- MCP Server Registration (Code Intelligence) ---")
+        end = source.index("# --- Code Intelligence Indexing ---", start)
+    env = {"PATH": str(fakebin) + ":" + _SYSTEM_PATH, "HOME": str(home),
+           "SCRIPT_DIR": str(_REPO_ROOT / "scripts"), "REPO_DIR": str(tmp_path),
+           "GENESIS_ROOT": str(tmp_path), "GENESIS_GREP_MCP_URL": ""}
+    result = subprocess.run(["/bin/bash", "-euc", source[start:end]], env=env,
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    calls = log.read_text()
+    assert f"mcp add codebase-memory-mcp -s user -- {tmp_path}/.claude/mcp/run-codebase-memory" in calls
+    if existing:
+        assert "mcp remove codebase-memory-mcp -s user" in calls
+    assert "enable" not in calls and "start" not in calls
 
 
 def _run_register(tmp_path: Path, args: list[str], claude_json: dict | None,

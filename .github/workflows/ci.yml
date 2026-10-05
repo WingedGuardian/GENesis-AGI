@@ -1132,4 +1132,8 @@ jobs:
         # files retain collection counts. Floor24506+32=24538; no added skips.
         # Native CBM lifecycle: new lifecycle file31 cases; no added skips.
         # Floor24538+31=24569; predecessor skip identity gate still applies.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 24569
+        # Managed frontend: actual predecessor launcher39 -> branch35 (-4),
+        # plus28 new frontend cases = net24; two readiness regressions from
+        # the runtime followup give floor24569+24+2=24595.
+        # Replaces legacy fallback/scope smoke premises; no new skip sites.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 24595

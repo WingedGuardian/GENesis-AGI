@@ -568,16 +568,8 @@ def require_enabled(config: dict) -> None:
         raise ValueError("managed Codebase sentinel is armed")
 
 
-def verify_query_boundary(pid: str) -> None:
-    leaf, root, version = resolve_cgroup(
-        Path(f"/proc/{pid}/cgroup"), Path(f"/proc/{pid}/mountinfo")
-    )
-    if version != 2 or leaf == root or leaf.name != BACKEND:
-        raise ValueError("managed daemon is outside its cgroup v2 service")
-    if (leaf / "memory.max").read_text().strip() != str(2 * 1024**3) or (
-        leaf / "memory.swap.max"
-    ).read_text().strip() != "0":
-        raise ValueError("managed daemon lacks exact memory/zero-swap cap")
+def verify_memory_ancestors(leaf: Path, root: Path) -> None:
+    """Every visible finite ancestor must admit the full query aggregate."""
     cursor = leaf.parent
     while cursor == root or root in cursor.parents:
         try:
@@ -591,6 +583,82 @@ def verify_query_boundary(pid: str) -> None:
         if cursor == root:
             break
         cursor = cursor.parent
+
+
+def verify_query_boundary(pid: str) -> None:
+    leaf, root, version = resolve_cgroup(
+        Path(f"/proc/{pid}/cgroup"), Path(f"/proc/{pid}/mountinfo")
+    )
+    if version != 2 or leaf == root or leaf.name != BACKEND:
+        raise ValueError("managed daemon is outside its cgroup v2 service")
+    if (leaf / "memory.max").read_text().strip() != str(2 * 1024**3) or (
+        leaf / "memory.swap.max"
+    ).read_text().strip() != "0":
+        raise ValueError("managed daemon lacks exact memory/zero-swap cap")
+    verify_memory_ancestors(leaf, root)
+
+
+def verify_frontend_boundary(unit: str) -> None:
+    if not re.fullmatch(r"genesis-cbm-query-client-[0-9a-f]{32}\.service", unit):
+        raise ValueError("invalid managed frontend unit")
+    leaf, root, version = resolve_cgroup(Path("/proc/self/cgroup"), Path("/proc/self/mountinfo"))
+    if version != 2 or leaf == root or leaf.name != unit or leaf.parent.name != SLICE:
+        raise ValueError("managed frontend is outside its capped client slice")
+    for node, memory, tasks in ((leaf, 256 * 1024**2, 32), (leaf.parent, 2 * 1024**3, 512)):
+        if (
+            (node / "memory.max").read_text().strip() != str(memory)
+            or (node / "memory.swap.max").read_text().strip() != "0"
+            or (node / "pids.max").read_text().strip() != str(tasks)
+        ):
+            raise ValueError("managed frontend lacks exact memory/swap/task caps")
+    verify_memory_ancestors(leaf, root)
+
+
+def launch(config: dict, path: Path) -> None:
+    """Read-only preflight; the actual capped child owns final admission."""
+    verify_cache(config)
+    ready(config)
+    main = absolute(config["main"]).resolve(strict=True)
+    if not (main / ".git").is_dir():
+        raise ValueError("managed frontend requires the configured primary checkout")
+    unit = "genesis-cbm-query-client-" + uuid.uuid4().hex + ".service"
+    command = [
+        "/usr/bin/systemd-run", "--user", "--pipe", "--quiet", "--collect", "--wait",
+        # systemd-run v255: preserve literal dollar/percent path arguments.
+        "--expand-environment=no", "--unit=" + unit, "--slice=" + SLICE,
+        "--setenv=HOME=" + str(Path.home()), "--working-directory=/",
+    ]
+    for property_value in (
+        "Requisite=" + BACKEND, "After=" + BACKEND, "StopPropagatedFrom=" + BACKEND,
+        "KillMode=control-group", "MemoryMax=256M", "MemorySwapMax=0",
+        "TasksMax=32", "OOMScoreAdjust=500",
+    ):
+        command.extend(("-p", property_value))
+    command.extend((
+        "--", "/usr/bin/python3", "-I", str(main / "scripts/codebase_managed.py"),
+        "--config", str(path), "client", "--unit", unit,
+    ))
+    os.execv(command[0], command)  # noqa: S606 - fixed systemd executable, no shell
+
+
+def client(path: Path, unit: str) -> None:
+    with lifecycle_lock(shared=True):
+        # Re-read inside the actual limited process after acquiring admission.
+        config = runtime_config(path)
+        verify_frontend_boundary(unit)
+        verify_cache(config)
+        ready(config)
+        os.chdir(config["main"])
+        with verified_binary(Path(config["binary"])) as executable:
+            require_enabled(config)
+            check_backend(config)
+            os.set_inheritable(executable.fileno(), True)
+            # The lifecycle descriptor stays CLOEXEC: admitted readers do not
+            # prevent disable, which stops their native dependency and slice.
+            os.execve(  # noqa: S606 - accepted inode and fixed analysis profile
+                f"/proc/self/fd/{executable.fileno()}",
+                [config["binary"], "--tool-profile=analysis"], native_env(config),
+            )
 
 
 def check_backend(config: dict, *, starting: bool = False) -> str:
@@ -611,13 +679,16 @@ def ready(config: dict) -> None:
         while time.monotonic() < deadline:
             try:
                 pid = check_backend(config, starting=True)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 response = subprocess.run(
                     [f"/proc/self/fd/{executable.fileno()}", "daemon", "status"],
                     env=native_env(config),
                     pass_fds=(executable.fileno(),),
                     capture_output=True,
                     text=True,
-                    timeout=3,
+                    timeout=remaining,
                 )
                 if (
                     response.returncode == 0
@@ -685,6 +756,9 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     commands.add_parser("status")
     commands.add_parser("serve")
     commands.add_parser("ready")
+    commands.add_parser("launch")
+    frontend = commands.add_parser("client")
+    frontend.add_argument("--unit", required=True)
     for command in ("enable", "disable", "remove"):
         commands.add_parser(command)
     teardown = commands.add_parser("uninstall")
@@ -717,6 +791,10 @@ def main(argv: list[str] | None = None) -> int:
             configure(args, path)
         elif args.command == "status":
             print(json.dumps(status(path), indent=2))
+        elif args.command == "launch":
+            launch(read_settings(path), path)
+        elif args.command == "client":
+            client(path, args.unit)
         else:
             config = runtime_config(path)
             (serve if args.command == "serve" else ready)(config)
