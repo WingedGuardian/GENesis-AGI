@@ -205,6 +205,102 @@ class TestToolTimeout:
             await browser._with_tool_timeout(broken(), 5.0, "test_op")
 
 
+# ---------------------------------------------------------------------------
+# B5: browser_fill fails only on a STALL, never on total length.
+# ---------------------------------------------------------------------------
+
+_REAL_SLEEP = asyncio.sleep
+
+
+def _typing_page(key_latency: float = 0.0, hang_at: int | None = None):
+    """A remote-CDP page (per-keystroke path) whose key presses take
+    ``key_latency`` seconds; keystroke ``hang_at`` (1-based) never returns."""
+    page = AsyncMock()
+    page.url = "https://form.example"
+    calls = {"down": 0}
+
+    async def down(_char):
+        calls["down"] += 1
+        if hang_at is not None and calls["down"] == hang_at:
+            await asyncio.Event().wait()  # never set: a hung browser call
+        await _REAL_SLEEP(key_latency)
+
+    page.keyboard.down = AsyncMock(side_effect=down)
+    page.keyboard.up = AsyncMock()
+    page.is_closed = MagicMock(return_value=False)
+    browser._active_page = page
+    browser._remote_page = page
+    browser._remote_browser = _mock_remote_browser(connected=True)
+    browser._remote_last_url = page.url
+    return page, calls
+
+
+async def _instant_sleep(_s):
+    await _REAL_SLEEP(0)
+
+
+class TestFillStallWatchdog:
+    @pytest.mark.asyncio
+    async def test_a_hung_keystroke_fails_and_resets_the_page(self):
+        page, _ = _typing_page(hang_at=3)
+        with (
+            patch.object(browser, "_FILL_STALL_S", 0.2),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            result = await browser._impl_browser_fill("#bio", "hello")
+        assert "stalled" in result["error"]
+        assert "keystroke 3 of 5" in result["error"]
+        assert browser._active_page is None
+
+    @pytest.mark.asyncio
+    async def test_a_long_fill_that_keeps_progressing_is_never_cut_short(self):
+        """Total time far beyond the stall bound is fine while every keystroke
+        returns: 40 keys x 20 ms = 0.8 s against a 0.2 s stall bound. The old
+        length-derived deadline is what reset real long fills."""
+        page, calls = _typing_page(key_latency=0.02)
+        with (
+            patch.object(browser, "_FILL_STALL_S", 0.2),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            result = await browser._impl_browser_fill("#bio", "x" * 40)
+        assert result.get("filled") == "#bio", result
+        assert calls["down"] == 40
+
+    @pytest.mark.asyncio
+    async def test_a_hung_clear_step_is_bounded_too(self):
+        page, _ = _typing_page()
+
+        async def hang(*_a, **_k):
+            await asyncio.Event().wait()
+
+        page.fill = AsyncMock(side_effect=hang)
+        with (
+            patch.object(browser, "_FILL_STALL_S", 0.2),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+        ):
+            result = await browser._impl_browser_fill("#bio", "hi")
+        assert "clearing the field" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_the_tool_has_no_length_derived_deadline(self):
+        """The MCP tool hands straight to the impl: no _with_tool_timeout whose
+        value comes from len(value)."""
+        spy = AsyncMock(return_value={"filled": "#bio"})
+        with (
+            patch.object(browser, "_impl_browser_fill", new=spy),
+            patch.object(browser, "_with_tool_timeout", new=AsyncMock()) as wrapped,
+        ):
+            fn = getattr(browser.browser_fill, "fn", browser.browser_fill)
+            result = await fn("#bio", "y" * 5000)
+        assert result == {"filled": "#bio"}
+        wrapped.assert_not_called()
+
+    def test_the_stall_bound_is_the_justified_value(self):
+        assert browser._FILL_STALL_S == 30.0
+
+
 class TestSnapshotTimeout:
     """Verify _snapshot_page handles timeout gracefully."""
 
