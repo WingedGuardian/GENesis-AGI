@@ -211,6 +211,14 @@ def test_the_note_states_the_superseded_pr_exception():
     )
 
 
+def test_the_short_note_states_the_superseded_pr_exception_too():
+    """A command the parse cannot read gets the short note instead. It must not
+    contradict the full one, so it names the superseded-PR exception as well."""
+    note = _note(_run("echo ok # a note \\\ngh pr close 5"))
+    assert "could not check whether it closes" in note
+    assert "wholly superseded" in note
+
+
 def test_it_names_every_distinct_close_in_a_compound():
     """A reader deciding whether to proceed needs to know the command closes two
     things by two routes, not that it closes something."""

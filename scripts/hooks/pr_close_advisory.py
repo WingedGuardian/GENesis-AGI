@@ -3,7 +3,7 @@
 
 WHAT GAP THIS FILLS
 ===================
-There IS a rule. `genesis-development/SKILL.md` carries a 30-line standing user
+There IS a rule. `genesis-development/SKILL.md` carries a standing user
 rule, "Never RETIRE a PR you are not the one reviving": a reviewer session
 retires nothing, a premise-wrong PR gets `needs-architecture-session` and stays
 OPEN, and retiring belongs to the session taking up the revival. A superseded PR
