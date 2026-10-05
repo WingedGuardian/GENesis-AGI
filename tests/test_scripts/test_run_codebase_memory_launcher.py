@@ -54,6 +54,7 @@ def _fake_systemd_run(tmp_path: Path, *, probe_ok: bool = True) -> tuple[Path, P
     """
     fakebin = tmp_path / "fakebin"
     fakebin.mkdir(exist_ok=True)
+    _write_exec(fakebin / "systemctl", "#!/bin/sh\necho not-found\nexit 4\n")
     log = tmp_path / "systemd-run.log"
     if probe_ok:
         body = (
@@ -72,7 +73,11 @@ def _fake_systemd_run(tmp_path: Path, *, probe_ok: bool = True) -> tuple[Path, P
 
 def _run_launcher(tmp_path, *args, fakebin=None, env_extra=None):
     binary, blog = _fake_binary(tmp_path)
-    path = f"{fakebin}:{_SYSTEM_PATH}" if fakebin else _SYSTEM_PATH
+    nativebin = tmp_path / "nativebin"
+    nativebin.mkdir(exist_ok=True)
+    if not (nativebin / "systemctl").exists():
+        _write_exec(nativebin / "systemctl", "#!/bin/sh\necho not-found\nexit 4\n")
+    path = f"{nativebin}:{fakebin}:{_SYSTEM_PATH}" if fakebin else f"{nativebin}:{_SYSTEM_PATH}"
     env = {
         "PATH": path,
         "HOME": str(tmp_path),
@@ -91,9 +96,10 @@ def _run_launcher(tmp_path, *args, fakebin=None, env_extra=None):
 
 
 def test_missing_binary_errors(tmp_path):
+    fakebin, _ = _fake_systemd_run(tmp_path)
     res = subprocess.run(
         ["bash", str(_LAUNCHER)],
-        env={"PATH": _SYSTEM_PATH, "HOME": str(tmp_path),
+        env={"PATH": f"{fakebin}:{_SYSTEM_PATH}", "HOME": str(tmp_path),
              "CODEBASE_MEMORY_MCP_BIN": str(tmp_path / "nope")},
         capture_output=True, text=True, timeout=30,
     )
@@ -154,6 +160,7 @@ def _minimal_path(tmp_path: Path) -> Path:
         if not src.exists():
             src = Path("/bin") / tool
         (d / tool).symlink_to(src)
+    _write_exec(d / "systemctl", "#!/bin/sh\necho not-found\nexit 4\n")
     return d
 
 
@@ -1107,25 +1114,11 @@ def test_managed_route_rejects_provider_flags(tmp_path):
     assert not binary_log.exists()
 
 
-def _managed_units(home: Path, config_path: Path) -> dict[str, str]:
-    """Render owned fragments with the REAL producer, naming ``config_path``."""
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(
-        "codebase_managed_launcher_fixture", _REPO_ROOT / "scripts/codebase_managed.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    config = dict(
-        version=1, enabled=True, main=str(home), binary=str(home / "b"), cache=str(home / "c"),
-        runtime=str(home / "r"), sentinel=str(home / "s"), build=module.BUILD,
-    )
-    directory = home / ".config/systemd/user"
-    directory.mkdir(parents=True, exist_ok=True)
-    units = module.render_units(config, config_path)
-    for name, body in units.items():
-        (directory / name).write_text(body)
-    return units
+def _managed_units(home: Path, config_path: Path) -> None:
+    """Model native configured state; installation does not encode config paths."""
+    directory = home / "nativebin"
+    directory.mkdir(exist_ok=True)
+    _write_exec(directory / "systemctl", "#!/bin/sh\necho disabled\nexit 1\n")
 
 
 @pytest.mark.parametrize("selection", ["explicit", "owned-unit"])
@@ -1161,12 +1154,12 @@ def test_never_configured_install_keeps_raw_launch(tmp_path, evidence):
     assert binary_log.exists()
 
 
-def test_owned_units_for_another_config_refuse_raw(tmp_path):
+def test_native_units_with_missing_default_settings_refuse_raw(tmp_path):
     _managed_units(tmp_path, tmp_path / "elsewhere/codebase-managed.json")
     fakebin, _ = _fake_systemd_run(tmp_path)
     result, binary_log = _run_launcher(tmp_path, fakebin=fakebin)
     assert result.returncode == 1
-    assert "another settings path" in result.stderr
+    assert "managed Codebase refused" in result.stderr
     assert not binary_log.exists()
 
 

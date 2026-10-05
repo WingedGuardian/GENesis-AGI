@@ -52,6 +52,7 @@ def _make_repo(tmp_path: Path, *, worktree: bool = False) -> Path:
 def _fake_tools(bindir: Path, log: Path, *, sleep: float = 0) -> None:
     """Fake codebase-memory-mcp + gitnexus that record args and ulimit -v."""
     bindir.mkdir(exist_ok=True)
+    _write_exec(bindir / "systemctl", "#!/bin/sh\necho not-found\nexit 4\n")
     _write_exec(
         bindir / "node",
         '#!/usr/bin/env bash\necho "${FAKE_NODE_VERSION:-v22.22.2}"\n',
@@ -250,6 +251,7 @@ def _minimal_path(tmp_path: Path, *extra_tools: str) -> Path:
         target = d / tool
         if not target.exists():
             target.symlink_to(src)
+    _write_exec(d / "systemctl", "#!/bin/sh\necho not-found\nexit 4\n")
     return d
 
 
@@ -2058,23 +2060,9 @@ def test_missing_explicit_managed_config_refuses_only_cbm(tmp_path, tools, expec
     assert ("gitnexus ARGS:" in calls) is (tools == "both")
 
 
-def _owned_units(home: Path, config_path: Path) -> None:
-    """Owned fragments rendered by the REAL producer, naming ``config_path``."""
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(
-        "codebase_managed_index_fixture", _ENTRYPOINT.parent.parent / "codebase_managed.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    config = dict(
-        version=1, enabled=True, main=str(home), binary=str(home / "b"), cache=str(home / "c"),
-        runtime=str(home / "r"), sentinel=str(home / "s"), build=module.BUILD,
-    )
-    directory = home / ".config/systemd/user"
-    directory.mkdir(parents=True, exist_ok=True)
-    for name, body in module.render_units(config, config_path).items():
-        (directory / name).write_text(body)
+def _installed_units(home: Path) -> None:
+    """Native manager reports the configured pair even when settings vanish."""
+    _write_exec(home / "bin/systemctl", "#!/bin/sh\necho disabled\nexit 1\n")
 
 
 @pytest.mark.parametrize("tools,expected", [("cbm", 3), ("both", 5)])
@@ -2083,7 +2071,7 @@ def test_owned_units_without_settings_refuse_only_cbm(tmp_path, tools, expected)
     repo = _make_repo(tmp_path)
     fakebin, log = tmp_path / "bin", tmp_path / "tools.log"
     _fake_tools(fakebin, log)
-    _owned_units(tmp_path, Path(os.path.realpath(tmp_path)) / ".genesis/config/codebase-managed.json")
+    _installed_units(tmp_path)
     result = _run_entry(tmp_path, repo, tools, path=f"{fakebin}:{_SYSTEM_PATH}")
     assert result.returncode == expected, result.stderr
     calls = log.read_text() if log.exists() else ""

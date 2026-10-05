@@ -2,11 +2,10 @@
 # Managed Codebase route selection, derived from state that already exists.
 #
 # Sourced by .claude/mcp/run-codebase-memory and scripts/lib/code_intel_index.sh.
-# There is no selection marker of its own: evidence is the explicit override,
-# the settings path, or a generated unit fragment that scripts/codebase_managed.py
-# configure wrote. Those fragments survive loss of the settings mount, and
-# `codebase_managed.py remove` (deleting them, then the settings) is the way back
-# to the raw provider.
+# Settings or native installation state select the route. Bootstrap renders
+# these disabled units only after configuration; their disabled/static state is
+# evidence too, so loss of settings after disable never re-enables raw bootstrap.
+# No generated headers, fragment scan or separate selection marker.
 
 # _codebase_managed_hidden DIR
 #   0 when a lookup below DIR cannot be trusted: an existing component that is
@@ -38,67 +37,23 @@ codebase_managed_sentinel_armed() {
     _codebase_managed_hidden "${1%/*}"
 }
 
-# codebase_managed_selected CONFIG HOME
-#   0  managed route selected: a non-empty override, settings present (a broken
-#      link included), or an owned fragment naming CONFIG
-#   1  never configured: none of the above and no owned fragment at all
-#   2  evidence could not be read
-#   3  owned fragments exist, but name a different settings path
-# Only status 1 permits the raw provider. Prints nothing on stdout, which is the
-# MCP transport for the launcher.
+# 0: configured/native units present; 1: settings absent and both units not-found;
+# 2: uncertain evidence. Only 1 permits raw. No stdout on the MCP transport.
 codebase_managed_selected() {
-    local config="${1:-}" home="${2:-}" directory resolved fragment first second other=0
-    # Empty means unset, as in every caller's ${VAR:-default} expansion.
-    if [[ -n "${CODEBASE_MEMORY_MCP_MANAGED_CONFIG:-}" ]]; then
-        return 0
-    fi
-    if [[ -e "$config" || -L "$config" ]]; then
-        return 0
-    fi
-    if [[ "$config" != /* || "$home" != /* ]]; then
-        return 2
-    fi
-    # The settings can only be absent if every existing directory above them
-    # is searchable; otherwise their presence cannot be read (refuse).
-    if _codebase_managed_hidden "${config%/*}"; then
-        return 2
-    fi
-    # Units record the settings path with its directory canonicalised and its
-    # final component literal (codebase_managed.config_path). Either spelling
-    # matches; a spelling neither produces still refuses, as status 3.
-    resolved="$config"
-    directory="${config%/*}"
-    if command -v realpath >/dev/null 2>&1 \
-        && directory="$(realpath -m -- "${directory:-/}" 2>/dev/null)"; then
-        resolved="${directory%/}/${config##*/}"
-    fi
-    # A glob over a directory it cannot list matches nothing, which would read as
-    # "never configured". Every existing component must be searchable and the
-    # unit directory listable, or the evidence is unreadable.
-    if _codebase_managed_hidden "$home/.config/systemd/user"; then
-        return 2
-    fi
-    if [[ -e "$home/.config/systemd/user" ]] \
-        && ! [[ -d "$home/.config/systemd/user" && -r "$home/.config/systemd/user" \
-            && -x "$home/.config/systemd/user" ]]; then
-        return 2
-    fi
-    for fragment in "$home"/.config/systemd/user/genesis-cbm-*; do
-        [[ -f "$fragment" ]] || continue
-        [[ -r "$fragment" ]] || return 2
-        first=""
-        second=""
-        { IFS= read -r first || :; IFS= read -r second || :; } < "$fragment" || return 2
-        [[ "$first" == "# Genesis managed Codebase v1" ]] || continue
-        case "$second" in
-            "# Genesis managed config: $config" | "# Genesis managed config: $resolved")
-                return 0 ;;
+    local config="${1:-}" home="${2:-}" unit state rc
+    [[ "$config" == /* && "$home" == /* ]] || return 2
+    [[ -n "${CODEBASE_MEMORY_MCP_MANAGED_CONFIG:-}" ]] && return 0
+    [[ -e "$config" || -L "$config" ]] && return 0
+    _codebase_managed_hidden "${config%/*}" && return 2
+    for unit in genesis-cbm-query.service genesis-cbm-query-clients.slice; do
+        rc=0
+        state="$(systemctl --user is-enabled "$unit" 2>/dev/null)" || rc=$?
+        case "$state:$rc" in
+            not-found:1 | not-found:4) ;;
+            enabled:0 | enabled-runtime:0 | static:0 | indirect:0 | alias:0 | generated:0 | transient:0 | disabled:1 | masked:1 | masked-runtime:1) return 0 ;;
+            *) return 2 ;;
         esac
-        other=1
     done
-    if [[ "$other" == 1 ]]; then
-        return 3
-    fi
     return 1
 }
 

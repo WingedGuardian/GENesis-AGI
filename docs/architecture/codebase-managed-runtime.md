@@ -2,209 +2,123 @@
 
 ## Current implementation
 
-The opt-in `scripts/codebase_managed.py` integration uses the accepted exact
-v0.11 portable executable. It reuses the worker adapter's executable digest and
-runs the verified inode. There is no custom broker or provider fork. Configure
-writes disabled settings and account-owned units; it never removes the machine
-sentinel or starts a service. Existing state, dangling settings or state links and loaded
-or vendor units are preserved through refusal.
+The optional integration uses the accepted exact v0.11 executable, verified by
+SHA-256 and executed through the verified descriptor. It keeps the stock native
+daemon and analysis frontends, with no broker or provider fork.
 
-Managed route selection keeps no state of its own. The launcher and the queued
-entrypoint derive it in shell (`scripts/lib/codebase_managed_selection.sh`, so a
-never-configured install starts no Python) from three things that already
-exist: a non-empty `CODEBASE_MEMORY_MCP_MANAGED_CONFIG`, the settings path
-(a broken link counts), or a generated unit fragment in
-`~/.config/systemd/user/genesis-cbm-*` whose first two lines are the ownership
-marker and the settings path. Those fragments survive loss of the settings
-mount, so losing selected settings refuses execution instead of restoring raw
-bootstrap. Owned fragments naming a different settings path, or evidence that
-cannot be read (an unreadable fragment, or a unit directory or parent that
-cannot be listed or searched), also refuse. Only an install with none of this runs the raw
-provider; `codebase_managed.py remove` is the way back to it. An empty override
-means unset everywhere. The settings path is recorded with its directory
-canonicalised and its final component literal, and the settings are read and
-written without following a final symlink, so a settings symlink is refused
-rather than followed by every command (including `disable`'s write).
+The replacement for PR #2841 follows issue #2887: bootstrap and install render
+standard `genesis-cbm-query.service` and `genesis-cbm-query-clients.slice`
+templates. The runtime does not render, prove ownership of, repair or delete unit
+fragments. The templates are rendered only when the default managed settings or
+either installed fragment already exists, including dangling links. Rendering
+does not enable or start these units. `configure` stages disabled settings,
+executable and private native state; it does not install units or remove the
+machine sentinel. Failed staging is retained for inspection.
 
-The machine sentinel permits execution only when it is definitely absent: the
-lookup fails with ENOENT and no component above it is a broken link (a lost
-mount target). A dangling link at the sentinel, an unsearchable parent, a parent
-that is not a directory, or any other lookup error reads as armed. The launcher,
-the queued entrypoint and the Python lifecycle share this rule
-(`codebase_managed_sentinel_armed` in the selection library mirrors
-`codebase_managed.sentinel_armed`). The queued runner's pre-claim check,
-bootstrap and install still use a plain existence test (issue #2860); for them a
-dangling sentinel only costs a refused CBM leg, not an indexing run.
+Configure must run from the configured primary checkout, uses the default
+settings path `~/.genesis/config/codebase-managed.json`, and refuses existing
+settings/state and overlapping directory topology. Settings publish last through
+a no-clobber link. Linked worktrees skip indexing before any managed or capacity
+preflight. Existing launcher behavior remains available on never-configured
+installs.
 
-Configure runs only from `scripts/codebase_managed.py` inside the configured
-primary checkout, because the units pin that script and linked worktrees are
-archived or reaped. A configure that fails removes the state, units and
-settings it created (parent directories and the lock file stay) and reloads the
-manager, so the same command can be retried and nothing left behind selects the
-managed route. Rollback never removes a link or a directory another process put
-at those paths. Settings are written last.
+Managed route selection uses a nonempty settings override, the settings path, or
+native `systemctl --user is-enabled` state for the fixed service and slice.
+Installed disabled/static/masked units keep the managed route selected after
+settings disappear. Unknown manager results and inaccessible settings paths
+refuse execution. Only definitely absent settings and both native units permit
+the legacy route. There is no ownership marker or second selection record.
 
-Starting and launching verify owned generated units, loaded fragments (compared
-by file identity), no drop-ins and a current manager load, using one batched
-`systemctl show` per unit. Only `enable` also requires the current template.
-Launch accepts an older template on purpose: a template change in an update must
-not take the Codebase MCP down on every configured install, and the limits that
-matter are read live before any native process runs (`check_backend` reads the
-daemon's memory.max, swap cap and cgroup membership; `verify_boundary` reads the
-client's own, its aggregate slice's and every ancestor's). `status` reports each
-unit as `current`, `drift` or `not owned`, so a drifted template is visible
-without failing anything. `disable` is the operator's stop lever: it persists
-`enabled=false` first, so launch and batch refuse at once, and then stops the
-service only if the units are proven ours (marker, settings path, loaded
-fragment, no drop-ins). A unit that cannot be proven ours is reported and left
-running for manual inspection. Units always run the configured primary
-checkout's `scripts/codebase_managed.py` under `python3 -I`, whichever checkout
-rendered them, so the template does not depend on the caller. After a template
-change, `enable` refuses with a message naming `repair-units`; launch continues
-and `disable` still stops the owned service. `repair-units` runs only from the
-primary checkout and only while the backend has no running processes
-(`inactive`, or `failed` with no control group, which `Restart=no` leaves after a
-crash and which `stop` does not clear). It rewrites only regular, owned
-fragments of this settings path whose loaded fragment is that same file, then
-reloads the manager. The first settings publish is a no-clobber link, so a file
-another process put there is refused rather than overwritten, and a configure
-rollback never removes the settings path: it only ever existed if this run
-published it, which is the last step. Later rewrites (disable, enable,
-repair-units, remove) are atomic renames under the configuration lock, with no
-expected-inode check: a check-then-rename is two syscalls and cannot be atomic,
-so it only narrowed a race it could not close. On a single-owner install the
-program coordinates with itself through that lock; a concurrent foreign writer to
-the settings or unit files is out of scope.
+The sentinel permits execution only when definitely absent. Broken links,
+unsearchable parents and lookup errors keep it armed. The launcher, queued
+entrypoint and Python lifecycle share this rule. The runner's earlier pre-claim
+check and installer still have the separate plain-existence limitation tracked
+in #2860; a dangling sentinel ultimately refuses the Codebase leg.
 
-The unit names are fixed (`genesis-cbm-query.service` and
-`genesis-cbm-query-clients.slice`), so uninstall needs no discovery. Paths are
-passed literally: the unit's Exec lines carry the `:` prefix, which disables
-variable substitution (systemd v255 `systemd.service`, executable prefixes), and
-escape only `%` as `%%`; the frontend's `systemd-run` passes
-`--expand-environment=no`, because transient service arguments otherwise undergo
-manager-side `${VAR}` expansion (systemd v255 `systemd-run`,
-`--expand-environment=BOOL`, listed by `systemd-run --help` on systemd 255). That
-option needs systemd 254 or later; an older `systemd-run` rejects it, so every
-frontend launch fails closed.
+Settings changes open a nonblocking, nofollow regular-file descriptor and use an
+inode lock. Writes require a single link and can change only `enabled`; foreign
+pathname replacements are preserved and reported. Truncate-first updates may
+leave malformed settings after interruption, which execution refuses. This is
+not power-loss atomic publication or protection from a malicious process of the
+same uid. `disable` accepts missing, malformed or older-build settings and still
+invokes `systemctl --user disable --now genesis-cbm-query.service`, independently
+of the client slice. When readable it first writes `enabled=false`; write errors
+also trigger an independent stop attempt. It checks that the backend is inactive
+or failed with no control group. `enable` writes true and uses `enable --now`;
+startup failure independently writes false and disables/stops the backend.
 
-If `start` fails during `enable`, for any reason including an `OSError` from
-`systemctl`, the rollback writes `enabled=false` and stops the unit as two
-independent attempts, reports whichever of them fails, and re-raises the original
-start error. Ownership is byte-exact: a fragment rewritten with CRLF line
-endings is foreign to both the shell and Python checks. If the settings directory
-later becomes a symlink, the recorded spelling no longer matches; the route stays
-selected and refuses, and the units must be removed and configured again.
+Each native startup checks the pin, disabled UI/automatic indexing/watchers and
+actual cgroup v2 limits. The daemon has a 2 GiB, zero-swap service. Each analysis
+frontend has 256 MiB and zero swap, beneath a 2 GiB, zero-swap aggregate slice.
+Visible bounded ancestors must admit the whole 2 GiB budget. Native processes
+set the exact checkout with `os.chdir`; units use `WorkingDirectory=/`. Unit Exec
+arguments use `:` to disable dollar expansion, escape quotes/backslashes and
+double percent specifiers. Frontends use `--expand-environment=no`, requiring
+systemd 254 or later. Requisite/After avoid starting the backend from a frontend;
+StopPropagatedFrom retires clients when the backend stops.
 
-Known limitation: the drop-in check reads the units' `DropInPaths`. Global user
-drop-ins such as `~/.config/systemd/user/service.d/*.conf` apply to every user
-service and can appear there (not measured on every distribution), which makes start and launch
-refuse until they are removed. This is deliberate: an unreviewed drop-in can
-change the limits the service depends on.
+Readiness requires native status identifying the exact permanent managed PID,
+not merely a leftover socket. The existing native `config get auto_index`
+transition repairs recorded dead endpoint generations without indexing or
+starting a daemon. Protocol recovery requires fresh client initialization.
+Analysis frontends expose the stock 13-tool profile without `index_repository`.
 
-Native processes set the exact checkout directory through `os.chdir`, so the
-unit's `WorkingDirectory=` is a constant `/` and path whitespace never depends on
-unit parsing.
-
-The query daemon has a 2 GiB, zero-swap service. Analysis frontends each have a
-256 MiB, zero-swap transient service beneath a separate aggregate 2 GiB,
-zero-swap slice. Every visible ancestor must admit the whole 2 GiB (the service
-cap, or the clients' aggregate), never just one 256 MiB client. The bound is per
-budget: an ancestor shared by both is not required to admit their 4 GiB sum. cgroup v2 limits
-can be over-committed, "the sum of the limits of children can exceed the amount
-of resource available to the parent" (kernel admin-guide `cgroup-v2`, Resource
-Distribution Models, Limits; docs.kernel.org, consulted 2026-10-04). Requisite/After verify the existing daemon without starting it;
-StopPropagatedFrom and control-group cleanup retire clients when it ends.
-Protocol recovery requires fresh client initialization. Native bootstrap may
-briefly attempt a replacement during a scheduler race; containment and eventual
-owned cleanup are the contract, not instantaneous prohibition of every spawn.
-
-Every native startup verifies the executable, disabled UI/automatic indexing/
-watcher settings, exact running cgroup and memory/swap limits. The daemon uses
-native `config get auto_index` to seal the native startup transition and repair
-recorded dead endpoint generations before permanent startup. This does not spawn
-a daemon or modify configuration. Readiness requires a native status response
-naming the exact permanent managed PID; a socket left by a crash is insufficient.
-
-Configured launchers accept no provider flags and expose the stock 13-tool
-analysis profile without `index_repository`. Missing, malformed or disabled
-managed settings refuse rather than falling back to raw execution. Installs
-that were never configured retain their existing launcher behavior.
-
-The existing queued entrypoint decides `CODE_INTEL_INDEX_DISABLE` and then the
-CBM kill switch before it touches any managed state, so a disabled runner never
-reads settings, the cache database or the executable on a stalled mount. It then
-derives selection and reads managed settings before cap selection and scope
-probing (the preflight lives in `codebase_managed_batch_env` in the selection
-library). It selects the verified worker adapter, shared canonical cache
-and native account namespace, and measured 8 GiB/zero-swap batch cap. Destination
-admission, sibling reserve, pressure watchdog, single-flight and durable attempt
-outcomes remain authoritative. Ordinary daemon-delegating CLI indexing is not
-substituted for the physically contained worker.
+Managed indexing still uses the existing queue and physically contained worker:
+8 GiB, zero swap, canonical main/cache/account namespace, destination admission,
+sibling reserve, pressure watchdog, single-flight and durable attempt outcomes.
+No second queue or daemon-delegating indexing path is added.
 
 ## Explicit staging and activation
 
-Use the primary checkout and an independently obtained accepted executable:
+Run from the configured primary checkout with an independently accepted binary:
 
 ```bash
 .venv/bin/python scripts/codebase_managed.py configure \
   --main "$PWD" --binary /absolute/path/to/accepted/codebase-memory-mcp \
   --state "$HOME/.genesis/codebase-managed" \
   --sentinel "$HOME/.genesis/codebase-memory-mcp.disabled"
+# Normal installation/update renders the selected native templates.
+./scripts/bootstrap.sh
 .venv/bin/python scripts/codebase_managed.py status
 ```
 
-Configuration is disabled. Enable refuses while the sentinel is armed; this
-command does not remove it. The sentinel and incident shim stay intact until
-supervised activation is ready. After the acceptance gates and deliberate
-sentinel retirement, `enable` starts the owned query service:
+Do not retire the sentinel until the supervised activation gates pass. Explicit
+`enable` opts into both immediate startup and default-target boot startup:
 
 ```bash
 .venv/bin/python scripts/codebase_managed.py enable
-# Reversible runtime disable; preserves native cache and incident sentinel:
 .venv/bin/python scripts/codebase_managed.py disable
-# After an update changes the unit template (backend inactive):
-.venv/bin/python scripts/codebase_managed.py repair-units
-# Retire the managed route and return to the raw provider:
+# Disable and retain managed routing and data:
 .venv/bin/python scripts/codebase_managed.py remove
 ```
 
-`remove` takes the configuration lock and persists `enabled=false` first. It then
-proves the units whose fragments remain are this configuration's (the same proof
-as `disable`), disables and stops them, deletes exactly those fragments,
-reloads the manager and deletes the settings. It can
-be re-run after an interruption: a unit whose fragment is already gone must be
-unknown to the manager after a reload (inactive, no control group), otherwise
-`remove` refuses. Like `disable` and `status`, it accepts settings written by an
-older accepted build, because none of them runs the executable. A backend that crashed is
-left `failed` by `Restart=no`; run `systemctl --user reset-failed` on it before
-configuring again. The state directory
-(pinned executable and native cache) and the sentinel are kept. A fragment that
-cannot be proven ours is never stopped or deleted: `remove` refuses and leaves
-the settings disabled. If the settings themselves are lost, remove the units by
-hand after checking their two-line ownership header. With a non-empty
-`CODEBASE_MEMORY_MCP_MANAGED_CONFIG` the route stays selected until that override
-is unset. `scripts/uninstall.sh` stops, disables and deletes the two fixed-name
-units. It does not remove the managed state directory.
+`remove` retains settings, templates and native state. Returning to the raw
+provider requires deliberate operator maintenance after stopping clients/backend
+and inspecting retained artifacts; remove alone does not authorize that fallback.
+There is no `repair-units` command. Ordinary bootstrap owns template updates.
 
-Activation still requires deployed merged wiring, a preserved last valid graph,
-queue state and pressure/OOM baselines, timer stopped before unblocking indexing,
-one supervised existing queued runner, actual worker placement and publication,
-fresh readers, and restoration of the timer after acceptance. A refused or failed
-rollout restores disabled state without resetting durable attempt counts.
-Enabling default boot startup is a separate explicit systemd enable operation.
+Both uninstall paths stop the fixed backend through the lifecycle helper and
+abort destructive removal if that step fails. They preserve all managed-prefix
+fragments and potential managed application roots (`~/genesis`, `~/.genesis`,
+`~/data`, `~/.qdrant`) when managed evidence exists. Older experimental custom
+units and retained roots need explicit operator cleanup. `--full` remains the
+explicit destruction of the entire container and its data.
 
 ## Verification and operational scope
 
-The prerequisite private 24-hour canary passed with eight readers. It does not
-establish zero host swap activity or zero memory.high events. Native production
-shaped tests cover eight readers, peer disconnect, restart/fresh initialization,
-persistent inactive-daemon transaction refusal with a negative control, and
-repeated abrupt daemon death followed by native endpoint repair. Readiness checks
-prevent a dead runtime from being represented as healthy.
+This source rebuild does not activate production. The machine sentinel,
+incident shim, cache and durable queue remain unchanged. Prior private canary
+results establish native design feasibility, not acceptance of this replacement
+or readiness for unattended resource-failure recovery.
 
-This integration does not change broad OOM monitoring or enable optional
-`CODE_INTEL_WORKLOAD_SLICE` routing. Actual oomd selector exclusion and its
-provisioning/posture migration require separate disposable-VM acceptance.
+Production activation still requires deployed merged wiring, a preserved valid
+graph, fresh queue/pressure/OOM/swap baselines, timer stopped before unblocking
+indexing, one supervised existing queued runner, actual worker placement and
+publication, fresh readers, and timer restoration after acceptance. Failure
+restores disabled state without resetting durable attempt counts. Broad OOM
+selector exclusion, optional workload-slice routing and unattended quarantine
+remain separate work.
+
 
 ## Historical investigation (superseded v0.10.8 design)
 

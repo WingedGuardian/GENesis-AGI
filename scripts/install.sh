@@ -995,11 +995,15 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         source "$SCRIPT_DIR/lib/falkordb_install.sh"
     fi
 
+    # shellcheck source=lib/codebase_managed_templates.sh
+    . "$SCRIPT_DIR/lib/codebase_managed_templates.sh"
+
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template "$SYSTEMD_TEMPLATE_DIR"/*.slice.template; do
         [ -f "$template" ] || continue
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
+        genesis_cbm_template_selected "$svc_name" "$SYSTEMD_USER_DIR" "$HOME" || continue
         if [ -f "$target" ]; then
             echo "    . $svc_name already exists (not overwriting)"
         else
@@ -1030,15 +1034,19 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             # whole match" — verified by hand, since it looks correct and is not.
             _sed_repl_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
             _home_esc=$(_sed_repl_esc "$HOME")
+        _home_exec_esc=$(_sed_repl_esc "$(genesis_cbm_exec_path "$HOME")")
             _venv_esc=$(_sed_repl_esc "$VENV_PATH")
             _repo_esc=$(_sed_repl_esc "$REPO_DIR")
+            _repo_exec_esc=$(_sed_repl_esc "$(genesis_cbm_exec_path "$REPO_DIR")")
             _ccbin_esc=$(_sed_repl_esc "$CC_BIN_DIR")
             _az_root_esc=$(_sed_repl_esc "${AZ_ROOT:-$HOME/agent-zero}")
             _falkordb_ver_esc=$(_sed_repl_esc "${FALKORDB_VERSION:-4.20.4}")
             _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)")
             sed -e "s|__HOME__|$_home_esc|g" \
+                -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
                 -e "s|__VENV__|$_venv_esc|g" \
                 -e "s|__REPO_DIR__|$_repo_esc|g" \
+                   -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \
                 -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
                 -e "s|__AZ_ROOT__|$_az_root_esc|g" \
                 -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \

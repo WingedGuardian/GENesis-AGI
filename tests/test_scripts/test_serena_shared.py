@@ -578,7 +578,8 @@ def uninstall_commands(path):
             '            container_exec "', source.index("# Stop all services (timers first")
         )
         commands = source[start : source.index('            ok "Stopped Genesis services"', start)]
-    return helper, commands
+    managed = source[source.index("managed_codebase_retention() {") : source.index("# Stop and disable a systemd")]
+    return 'info() { :; }; MANAGED_STATE_RETAIN=false;\n' + managed + helper, commands
 
 
 def uninstall_enablement_entries(tmp_path, entry):
@@ -635,6 +636,7 @@ if args[1]=='disable':
         ],
         env=dict(
             os.environ,
+            HOME=str(tmp_path),
             CALLS=str(calls),
             DISABLED=str(disabled),
             SERENA_PRESENT=str(serena_present),

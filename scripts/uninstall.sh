@@ -119,6 +119,7 @@ report_root_watchdog_removal() {
 }
 CONTAINER_USER="ubuntu"
 IN_CONTAINER=false
+MANAGED_STATE_RETAIN=false
 
 # Tracking what was removed for summary
 REMOVED=()
@@ -168,6 +169,15 @@ confirm() {
 safe_remove() {
     local path="$1"
     local label="${2:-$1}"
+    if [ "${MANAGED_STATE_RETAIN:-false}" = true ]; then
+        case "$path" in
+            "$HOME/genesis" | "$HOME/genesis/"* | "$HOME/.genesis" | "$HOME/.genesis/"* | \
+            "$HOME/data" | "$HOME/data/"* | "$HOME/.qdrant" | "$HOME/.qdrant/"*)
+                info "Retained $label: managed state requires explicit operator cleanup"
+                KEPT+=("$label")
+                return 0 ;;
+        esac
+    fi
     if [ -e "$path" ] || [ -L "$path" ]; then
         # Word splitting on $GENESIS_PERSISTENT_TIMERS is DELIBERATE in both
         # branches below: the inventory is a space-separated unit list, not one
@@ -185,6 +195,35 @@ safe_remove() {
         REMOVED+=("$label")
     else
         skip "$label"
+    fi
+}
+
+# Retain potential managed state, including earlier experimental custom units.
+managed_codebase_retention() {
+    local fragment
+    if [ -e "$HOME/.genesis/config/codebase-managed.json" ] || \
+       [ -L "$HOME/.genesis/config/codebase-managed.json" ] || \
+       [ -n "${CODEBASE_MEMORY_MCP_MANAGED_CONFIG:-}" ]; then
+        MANAGED_STATE_RETAIN=true
+    fi
+    for fragment in "$HOME"/.config/systemd/user/genesis-cbm-*; do
+        if [ -e "$fragment" ] || [ -L "$fragment" ]; then
+            MANAGED_STATE_RETAIN=true
+        fi
+    done
+}
+
+# Stop the bootstrap backend independently of settings or client-slice damage.
+managed_codebase_preflight() {
+    local helper="$HOME/genesis/scripts/codebase_managed.py"
+    managed_codebase_retention
+    if [ "$DRY_RUN" = true ]; then
+        info "Would disable the managed backend; managed artifacts retained"
+    elif [ "$MANAGED_STATE_RETAIN" = true ] && [ -f "$helper" ]; then
+        /usr/bin/python3 -I "$helper" disable || return 1
+    elif [ "$MANAGED_STATE_RETAIN" = true ]; then
+        echo "ERROR: managed Codebase lifecycle helper unavailable; state retained." >&2
+        return 1
     fi
 }
 
@@ -239,11 +278,16 @@ remove_serena_enablement() {
 # Run a command inside the container (from host). Tolerates container issues.
 container_exec() {
     local cmd="$1"
+    local strict="${2:-false}"
     if [ "$DRY_RUN" = true ]; then
         echo "    [DRY RUN] Would run in container: ${cmd:0:80}..."
         return 0
     fi
-    incus exec "$CONTAINER_NAME" -- su - "$CONTAINER_USER" -c "$cmd" 2>/dev/null || true
+    if [ "$strict" = true ]; then
+        incus exec "$CONTAINER_NAME" -- su - "$CONTAINER_USER" -c "$cmd"
+    else
+        incus exec "$CONTAINER_NAME" -- su - "$CONTAINER_USER" -c "$cmd" 2>/dev/null || true
+    fi
 }
 
 # Remove a line matching a pattern from a file
@@ -283,6 +327,8 @@ if [ -f /run/host/container-manager ] || \
         MODE="genesis-only"
     fi
 fi
+
+
 
 # Detect what exists
 HAS_GUARDIAN=false
@@ -539,7 +585,6 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-code-intel.timer genesis-code-intel.service \
                     genesis-star-milestone.timer genesis-star-milestone.service \
                     genesis-serena-claude-code.service genesis-serena-codex.service \
-                    genesis-cbm-query.service genesis-cbm-query-clients.slice \
                     genesis-backup.timer genesis-backup.service \
                     genesis-server.service genesis-bridge.service \
                     genesis-falkordb.service \
@@ -547,6 +592,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             safe_disable_service "$unit"
         done
         remove_serena_enablement
+        managed_codebase_preflight || { echo "ERROR: managed quiescence failed; removal aborted." >&2; exit 1; }
 
         # Persistent= timers keep a stamp file under
         # ~/.local/share/systemd/timers/. Removing the unit file does NOT remove
@@ -584,7 +630,10 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
         # Remove systemd unit files
         SYSTEMD_DIR="$HOME/.config/systemd/user"
         for f in "$SYSTEMD_DIR"/genesis-*.service "$SYSTEMD_DIR"/genesis-*.timer \
-                 "$SYSTEMD_DIR/genesis-cbm-query-clients.slice" "$SYSTEMD_DIR/qdrant.service"; do
+                 "$SYSTEMD_DIR/qdrant.service"; do
+            # Retained route fragments prevent a failed/partial uninstall from
+            # falling back to an uncapped raw Codebase process.
+            case "${f##*/}" in genesis-cbm-*) continue ;; esac
             [ -e "$f" ] && safe_remove "$f" "systemd/$(basename "$f")"
         done
         systemctl --user daemon-reload 2>/dev/null || true
@@ -626,7 +675,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
         remove_line_containing "$HOME/.bashrc" "DISABLE_INSTALLATION_CHECKS" \
             "DISABLE_INSTALLATION_CHECKS from .bashrc"
 
-        ok "Genesis removal complete (direct)"
+        ok "Genesis removal completed (direct); retained managed roots require operator cleanup"
     else
         # Running on host — reach into container via incus exec
         if [ "$MODE" = "full" ]; then
@@ -647,7 +696,6 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                 systemctl --user stop genesis-code-intel.timer genesis-code-intel.service 2>/dev/null || true;
                 systemctl --user stop genesis-star-milestone.timer genesis-star-milestone.service 2>/dev/null || true;
                 systemctl --user stop genesis-serena-claude-code.service genesis-serena-codex.service 2>/dev/null || true;
-                systemctl --user stop genesis-cbm-query.service genesis-cbm-query-clients.slice 2>/dev/null || true;
                 systemctl --user stop genesis-backup.timer genesis-backup.service 2>/dev/null || true;
                 systemctl --user stop genesis-server.service genesis-bridge.service \
                     genesis-falkordb.service qdrant.service 2>/dev/null || true;
@@ -660,7 +708,6 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-code-intel.timer genesis-code-intel.service \
                     genesis-star-milestone.timer genesis-star-milestone.service \
                     genesis-serena-claude-code.service genesis-serena-codex.service \
-                    genesis-cbm-query.service genesis-cbm-query-clients.slice \
                     genesis-backup.timer genesis-backup.service \
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service \
                     genesis-falkordb.service qdrant.service; do
@@ -668,8 +715,11 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                 done;
                 DRY_RUN=false;
                 $(declare -f remove_serena_enablement);
-                remove_serena_enablement
-            "
+                remove_serena_enablement;
+                MANAGED_STATE_RETAIN=false;
+                $(declare -f info managed_codebase_retention managed_codebase_preflight);
+                managed_codebase_preflight
+            " true || { echo "ERROR: managed quiescence failed; removal aborted." >&2; exit 1; }
             ok "Stopped Genesis services"
 
             # Root network and Tailscale watchdogs (see GENESIS_ROOT_WATCHDOG_REMOVE).
@@ -705,12 +755,12 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
 
             # Remove systemd unit files
             container_exec "
-                rm -f ~/.config/systemd/user/genesis-*.service \
-                      ~/.config/systemd/user/genesis-*.timer \
-                      ~/.config/systemd/user/genesis-cbm-query-clients.slice \
-                      ~/.config/systemd/user/qdrant.service 2>/dev/null;
+                for f in ~/.config/systemd/user/genesis-*.service ~/.config/systemd/user/genesis-*.timer ~/.config/systemd/user/qdrant.service; do
+                    case \"\$f\" in */genesis-cbm-*) continue ;; esac;
+                    rm -f -- \"\$f\" || exit 1;
+                done;
                 systemctl --user daemon-reload 2>/dev/null || true
-            "
+            " true
             ok "Removed systemd unit files"
 
             # Remove cron entries
@@ -722,9 +772,16 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             ok "Cleaned cron entries"
 
             # Remove Genesis directories and data
-            container_exec "rm -rf ~/genesis/ ~/.genesis/ ~/data/ ~/.qdrant/ 2>/dev/null || true"
-            ok "Removed Genesis directories (repo, state, data, qdrant)"
-            REMOVED+=("Genesis repo" "\$HOME/.genesis/" "\$HOME/data/" "\$HOME/.qdrant/")
+            container_exec "
+                DRY_RUN=false; MANAGED_STATE_RETAIN=false; REMOVED=(); SKIPPED=(); KEPT=();
+                $(declare -f info ok skip safe_remove managed_codebase_retention);
+                managed_codebase_retention;
+                safe_remove \"\$HOME/genesis\" repo;
+                safe_remove \"\$HOME/.genesis\" state;
+                safe_remove \"\$HOME/data\" data;
+                safe_remove \"\$HOME/.qdrant\" qdrant
+            " true
+            ok "Genesis directory cleanup completed; managed roots retained when present"
 
             # Remove Qdrant binary
             container_exec "sudo rm -f /usr/local/bin/qdrant 2>/dev/null; rm -f ~/.local/bin/qdrant 2>/dev/null || true"

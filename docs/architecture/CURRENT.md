@@ -3179,7 +3179,9 @@ verified: 19ff6e3ef 2026-10-04
   Optional managed Codebase wiring (`scripts/codebase_managed.py`) uses a pinned
   stock query daemon, separately capped native analysis frontends and the existing
   contained queued worker. Configuration starts disabled and preserves the machine
-  sentinel. Native transition repair and status-PID readiness support abrupt-death
+  sentinel. Standard bootstrap templates and native unit state replace runtime
+  fragment ownership; disable stops the backend even with lost settings, while
+  remove retains managed routing and data. Native transition repair and status-PID readiness support abrupt-death
   recovery; malformed managed settings never fall back to raw execution. This
   does not activate workload-slice routing or broaden termination authority
   (see docs/architecture/codebase-managed-runtime.md).

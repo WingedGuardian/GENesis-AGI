@@ -21,43 +21,8 @@ m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 
 
-def _manager(values: dict, actions: list):
-    """Fake systemctl for both `show -p X --value` and batched `show -p A -p B`."""
-
-    def systemctl(*args):
-        if args[0] != "show":
-            actions.append(args)
-            return ""
-        unit = args[1]
-        names = [args[i + 1] for i, arg in enumerate(args) if arg == "-p"]
-        lookup = {name: values(unit, name) if callable(values) else values[name] for name in names}
-        if "--value" in args:
-            return "\n".join(lookup.values())
-        return "\n".join(f"{k}={v}" for k, v in lookup.items())
-
-    return systemctl
-
-
 # Bound at import: tests patch m.subprocess.run, which is this same module.
 _RUN = subprocess.run
-
-
-def _selected(config: Path, home: Path) -> int:
-    env = {k: v for k, v in os.environ.items() if k != "CODEBASE_MEMORY_MCP_MANAGED_CONFIG"}
-    return _RUN(
-        [
-            "bash",
-            "-c",
-            '. "$0" && codebase_managed_selected "$1" "$2"',
-            SELECTION_LIB,
-            str(config),
-            str(home),
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    ).returncode
 
 
 @pytest.fixture(autouse=True)
@@ -142,7 +107,6 @@ def test_frontend_does_not_pull_backend_start(config, tmp_path, monkeypatch):
     monkeypatch.setattr(m, "require_enabled", lambda *a: None)
     monkeypatch.setattr(m, "verify_cache", lambda *a: None)
     monkeypatch.setattr(m, "check_backend", lambda *a: None)
-    monkeypatch.setattr(m, "verify_units", lambda *a, **k: None)
     captured = []
     monkeypatch.setattr(m.os, "execv", lambda _, args: captured.extend(args))
     m.launch(config, tmp_path / "settings")
@@ -162,14 +126,6 @@ def test_frontend_does_not_pull_backend_start(config, tmp_path, monkeypatch):
     ]
 
 
-def test_render_never_enables_or_starts_backend(config, tmp_path):
-    units = m.render_units(config, tmp_path / "settings")
-    assert set(units) == {"genesis-cbm-query.service", "genesis-cbm-query-clients.slice"}
-    assert "MemoryMax=2G" in units["genesis-cbm-query-clients.slice"]
-    assert "MemorySwapMax=0" in units["genesis-cbm-query.service"]
-    assert "Restart=no" in units["genesis-cbm-query.service"]
-    assert " serve" not in units["genesis-cbm-query.service"]  # quoted argv
-    assert '"serve"' in units["genesis-cbm-query.service"]
 
 
 def test_batch_other_repository_refused_before_provider(config, tmp_path, monkeypatch):
@@ -180,10 +136,6 @@ def test_batch_other_repository_refused_before_provider(config, tmp_path, monkey
         m.batch_values(config, str(other))
 
 
-def test_explicit_managed_paths_reject_unit_injection():
-    with pytest.raises(ValueError):
-        m.quote_unit("/tmp/a\nExecStart=/bin/false")
-    assert m.quote_unit('/tmp/a%"$x') == '"/tmp/a%%\\"$x"'
 
 
 def test_dollar_paths_reach_both_launch_paths_literally(tmp_path, config, monkeypatch):
@@ -193,12 +145,7 @@ def test_dollar_paths_reach_both_launch_paths_literally(tmp_path, config, monkey
     (v255 systemd.service), so a "$$" there would reach the program doubled.
     """
     config["main"] = str(tmp_path / "${HOME}repo")
-    service = m.render_units(config, tmp_path / "$x.json")[m.BACKEND]
-    exec_lines = [line for line in service.splitlines() if line.startswith("Exec")]
-    assert [line.split("=", 1)[1][0] for line in exec_lines] == [":", ":"]
-    assert all("/${HOME}repo/" in line and "$$" not in line for line in exec_lines)
-    assert all('/$x.json"' in line for line in exec_lines)
-    for attr in ("require_enabled", "verify_cache", "check_backend", "verify_units"):
+    for attr in ("require_enabled", "verify_cache", "check_backend"):
         monkeypatch.setattr(m, attr, lambda *a, **k: None)
     captured = []
     monkeypatch.setattr(m.os, "execv", lambda _, args: captured.extend(args))
@@ -207,13 +154,14 @@ def test_dollar_paths_reach_both_launch_paths_literally(tmp_path, config, monkey
     assert str(tmp_path / "$x.json") in captured[captured.index("--") :]
 
 
-@pytest.mark.parametrize("conflict", ["dangling-settings", "dangling-state", "loaded-unit"])
+@pytest.mark.parametrize("conflict", ["dangling-settings", "dangling-state"])
 def test_configure_preserves_foreign_artifacts_before_pin_or_state(tmp_path, monkeypatch, conflict):
     monkeypatch.setenv("HOME", str(tmp_path))
     main = tmp_path / "repo"
     (main / ".git").mkdir(parents=True)
     monkeypatch.setattr(m, "SCRIPT", main.resolve() / "scripts/codebase_managed.py", raising=False)
-    path = tmp_path / "settings.json"
+    path = tmp_path / ".genesis/config/codebase-managed.json"
+    path.parent.mkdir(parents=True)
     foreign = tmp_path / "foreign-target"
     if conflict == "dangling-settings":
         path.symlink_to(foreign)
@@ -253,13 +201,12 @@ def test_activation_start_failure_rolls_back_and_stops_owned_unit(
     config["enabled"] = False
     path.write_text(json.dumps(config))
     monkeypatch.setattr(m, "verify_cache", lambda *a: None)
-    monkeypatch.setattr(m, "verify_units", lambda *a: None)
     monkeypatch.setattr(m, "verified_binary", lambda *a: contextlib.nullcontext())
     actions = []
 
     def manager(*args):
         actions.append(args)
-        if args[0] == "start":
+        if args[0] == "enable":
             raise subprocess.CalledProcessError(1, "start")
         if stop_fails:
             raise subprocess.CalledProcessError(2, "stop")
@@ -272,7 +219,8 @@ def test_activation_start_failure_rolls_back_and_stops_owned_unit(
     assert ("rollback stop failed" in capsys.readouterr().err) is stop_fails
     assert m.read_settings(path)["enabled"] is False
     assert actions == [
-        ("start", "genesis-cbm-query.service"),
+        ("enable", "--now", "genesis-cbm-query.service"),
+        ("disable", "--now", "genesis-cbm-query.service"),
         ("stop", "genesis-cbm-query.service"),
     ]
 
@@ -285,7 +233,6 @@ def test_activation_preserves_armed_sentinel(tmp_path, config, monkeypatch):
     path.write_text(json.dumps(config))
     sentinel = Path(config["sentinel"])
     sentinel.write_text("incident")
-    monkeypatch.setattr(m, "verify_units", lambda *a: None)
     monkeypatch.setattr(m, "systemctl", lambda *a: pytest.fail("must not start disabled backend"))
     with pytest.raises(ValueError, match="sentinel"):
         m.set_enabled(config, path, True)
@@ -348,195 +295,24 @@ def test_ready_requires_native_rpc_matching_managed_pid(
             m.ready(config)
 
 
-def _write_units(config: dict, path: Path, home: Path) -> Path:
-    directory = home / ".config/systemd/user"
-    directory.mkdir(parents=True, exist_ok=True)
-    for name, body in m.render_units(config, path).items():
-        (directory / name).write_text(body)
-    return directory
 
 
-def _stale(text: str) -> str:
-    # An older template keeps the ownership header and changes the body.
-    assert "TasksMax=128\n" in text or "TasksMax=512\n" in text
-    return text.replace("TasksMax=128\n", "TasksMax=64\n").replace(
-        "TasksMax=512\n", "TasksMax=256\n"
-    )
 
 
-@pytest.mark.parametrize(
-    "fault", ["none", "modified", "symlink", "foreign", "drop-in", "reload", "old-template"]
-)
-@pytest.mark.parametrize("enabled", [False, True])
-def test_lifecycle_verifies_units_before_manager_mutation(
-    tmp_path, config, monkeypatch, fault, enabled
-):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    path = tmp_path / "settings.json"
-    path.write_text(json.dumps(config))
-    directory = _write_units(config, path, tmp_path)
-    fragment = directory / m.BACKEND
-    if fault == "modified":
-        fragment.write_text(m.MARKER + "[Service]\nExecStart=/bin/true\n")
-    if fault == "symlink":
-        target = tmp_path / "foreign"
-        target.write_text(fragment.read_text())
-        fragment.unlink()
-        fragment.symlink_to(target)
-    if fault == "old-template":
-        fragment.write_text(_stale(fragment.read_text()))
-    actions = []
-    values = {
-        "FragmentPath": lambda unit: (
-            "/foreign/unit" if fault == "foreign" else str(directory / unit)
-        ),
-        "DropInPaths": lambda unit: "/foreign/drop.conf" if fault == "drop-in" else "",
-        "NeedDaemonReload": lambda unit: "yes" if fault == "reload" else "no",
-    }
-    monkeypatch.setattr(m, "systemctl", _manager(lambda u, n: values[n](u), actions))
-    monkeypatch.setattr(m, "verify_cache", lambda *a: None)
-    monkeypatch.setattr(m, "verified_binary", lambda *a: contextlib.nullcontext())
-    # Ownership is enough to stop; starting requires the current template.
-    proceeds = fault == "none" or (fault == "old-template" and not enabled)
-    if proceeds:
-        m.set_enabled(config, path, enabled)
-        assert actions == [("start" if enabled else "stop", m.BACKEND)]
-        assert m.read_settings(path)["enabled"] is enabled
-    else:
-        with pytest.raises(ValueError) as error:
-            m.set_enabled(config, path, enabled)
-        assert not actions
-        if enabled:
-            assert m.read_settings(path) == config
-            if fault == "old-template":
-                assert "repair-units" in str(error.value)
-        else:
-            assert "NOT stopped" in str(error.value)
-            assert m.read_settings(path)["enabled"] is False
 
 
-def test_disable_with_unverifiable_fragment_still_persists_disabled(tmp_path, config, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    path = tmp_path / "settings.json"
-    path.write_text(json.dumps(config))
-    directory = _write_units(config, path, tmp_path)
-    (directory / m.BACKEND).write_text("[Service]\nExecStart=/usr/bin/vendor\n")
-    actions = []
-    monkeypatch.setattr(m, "systemctl", _manager({}, actions))
-    with pytest.raises(ValueError):
-        m.set_enabled(config, path, False)
-    assert m.read_settings(path)["enabled"] is False
-    assert not actions  # the unproven unit is never stopped by name
 
 
-def test_verify_units_compares_loaded_fragment_by_identity(tmp_path, config, monkeypatch):
-    real = tmp_path / "real-home"
-    real.mkdir()
-    alias = tmp_path / "alias-home"
-    alias.symlink_to(real)
-    monkeypatch.setenv("HOME", str(real))
-    path = tmp_path / "settings.json"
-    _write_units(config, path, real)
-    values = {
-        "FragmentPath": lambda unit: str(alias / ".config/systemd/user" / unit),
-        "DropInPaths": lambda unit: "",
-        "NeedDaemonReload": lambda unit: "no",
-    }
-    actions = []
-    monkeypatch.setattr(m, "systemctl", _manager(lambda u, n: values[n](u), actions))
-    m.verify_units(config, path)
-    assert actions == []
 
 
-def test_verify_units_queries_each_unit_once(tmp_path, config, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    path = tmp_path / "settings.json"
-    directory = _write_units(config, path, tmp_path)
-    calls = []
-
-    def systemctl(*args):
-        calls.append(args)
-        return f"NeedDaemonReload=no\nFragmentPath={directory / args[1]}\nDropInPaths="
-
-    monkeypatch.setattr(m, "systemctl", systemctl)
-    m.verify_units(config, path)
-    assert [c[1] for c in calls] == list(m.render_units(config, path))
-    assert all(c.count("-p") == 3 and "--value" not in c for c in calls)
 
 
-@pytest.mark.parametrize(
-    "fault",
-    [
-        "none",
-        "failed-idle",
-        "active",
-        "failed-busy",
-        "foreign",
-        "other-config",
-        "symlink",
-        "loaded-elsewhere",
-        "non-primary-checkout",
-    ],
-)
-def test_repair_units_rewrites_only_owned_inactive_fragments(tmp_path, config, monkeypatch, fault):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    path = tmp_path / "settings.json"
-    path.write_text(json.dumps(config))
-    directory = _write_units(config, path, tmp_path)
-    current = m.render_units(config, path)
-    for name, body in current.items():
-        (directory / name).write_text(_stale(body))
-    slice_unit = m.SLICE
-    if fault == "foreign":
-        (directory / slice_unit).write_text("[Slice]\nMemoryMax=8G\n")
-    if fault == "other-config":
-        (directory / slice_unit).write_text(
-            _stale(m.render_units(config, tmp_path / "other.json")[slice_unit])
-        )
-    if fault == "symlink":
-        target = tmp_path / "linked.slice"
-        target.write_text((directory / slice_unit).read_text())
-        (directory / slice_unit).unlink()
-        (directory / slice_unit).symlink_to(target)
-    before = {name: (directory / name).read_text() for name in current}
-    values = {
-        "ActiveState": lambda unit: (
-            "active" if fault == "active" else "failed" if fault.startswith("failed") else "inactive"
-        ),
-        "ControlGroup": lambda unit: "/user.slice/x" if fault in ("active", "failed-busy") else "",
-        "FragmentPath": lambda unit: (
-            "/etc/systemd/user/" + unit if fault == "loaded-elsewhere" else str(directory / unit)
-        ),
-    }
-    actions = []
-    monkeypatch.setattr(m, "systemctl", _manager(lambda u, n: values[n](u), actions))
-    if fault == "non-primary-checkout":
-        monkeypatch.setattr(m, "SCRIPT", tmp_path / ".worktrees/b/scripts/codebase_managed.py")
-    if fault in ("none", "failed-idle"):
-        m.repair_units(path)
-        assert {name: (directory / name).read_text() for name in current} == current
-        assert actions == [("daemon-reload",)]
-    else:
-        with pytest.raises(ValueError):
-            m.repair_units(path)
-        assert {name: (directory / name).read_text() for name in current} == before
-        assert actions == []
 
 
-def test_repair_units_command_is_wired(tmp_path, config, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    path = tmp_path / "settings.json"
-    seen = []
-    monkeypatch.setattr(m, "repair_units", lambda p: seen.append(p))
-    monkeypatch.setattr(
-        m.sys, "argv", ["codebase_managed.py", "--config", str(path), "repair-units"]
-    )
-    assert m.main() == 0
-    assert seen == [m.config_path(str(path))]
 
 
-@pytest.mark.parametrize("fail_at", ["config-set", "verify-cache", "daemon-reload", "settings"])
-def test_failed_configure_leaves_nothing_that_selects_or_blocks(tmp_path, monkeypatch, fail_at):
+@pytest.mark.parametrize("fail_at", ["config-set", "verify-cache", "settings"])
+def test_failed_configure_retains_staging_without_unsafe_rollback(tmp_path, monkeypatch, fail_at):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("CODEBASE_MEMORY_MCP_MANAGED_CONFIG", raising=False)
     main = (tmp_path / "repo").resolve()
@@ -554,7 +330,6 @@ def test_failed_configure_leaves_nothing_that_selects_or_blocks(tmp_path, monkey
             raise subprocess.CalledProcessError(1, stage)
 
     monkeypatch.setattr(m, "verified_binary", lambda p: open(p, "rb"))  # noqa: SIM115 - caller closes
-    monkeypatch.setattr(m, "unit_available", lambda unit: True)
     monkeypatch.setattr(
         m.subprocess,
         "run",
@@ -578,14 +353,13 @@ def test_failed_configure_leaves_nothing_that_selects_or_blocks(tmp_path, monkey
     )
     with pytest.raises(subprocess.CalledProcessError):
         m.configure(args, path)
-    assert not state.exists()
+    assert state.is_dir()
     assert not path.exists() and not path.is_symlink()
-    assert sorted(p.name for p in unit_dir.iterdir()) == [".genesis-codebase-config.lock"]
-    assert _selected(path, tmp_path) == 1  # the launcher would run raw, not refuse
+    before = {p.name: p.read_bytes() for p in unit_dir.glob("genesis-cbm-*")}
     failing["active"] = False
-    m.configure(args, path)  # the identical retry is not blocked
-    assert m.read_settings(path)["enabled"] is False
-    assert _selected(path, tmp_path) == 0
+    with pytest.raises(ValueError, match="preserved"):
+        m.configure(args, path)  # retained staging is never silently reclaimed
+    assert {p.name: p.read_bytes() for p in unit_dir.glob("genesis-cbm-*")} == before
 
 
 def test_configure_rollback_preserves_foreign_directory_at_settings(tmp_path, monkeypatch):
@@ -597,7 +371,6 @@ def test_configure_rollback_preserves_foreign_directory_at_settings(tmp_path, mo
     provider.write_bytes(b"accepted build")
     path = tmp_path / ".genesis/config/codebase-managed.json"
     monkeypatch.setattr(m, "verified_binary", lambda p: open(p, "rb"))  # noqa: SIM115
-    monkeypatch.setattr(m, "unit_available", lambda unit: True)
     monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0))
     monkeypatch.setattr(m, "verify_cache", lambda config: None)
     monkeypatch.setattr(m, "systemctl", lambda *a: "")
@@ -615,7 +388,7 @@ def test_configure_rollback_preserves_foreign_directory_at_settings(tmp_path, mo
     with pytest.raises(IsADirectoryError):
         m.configure(args, path)
     assert (path / "theirs").read_text() == "keep"
-    assert not (tmp_path / "state").exists()
+    assert (tmp_path / "state").is_dir()
 
 
 def test_configure_refuses_script_outside_primary_checkout(tmp_path, monkeypatch):
@@ -676,15 +449,6 @@ def test_config_path_symlink_loop_is_a_refusal_not_a_crash(tmp_path):
         m.config_path(str(tmp_path / "loop" / "settings.json"))
 
 
-def test_units_pin_configured_checkout_independent_of_caller(tmp_path, config, monkeypatch):
-    path = tmp_path / "settings.json"
-    expected = m.render_units(config, path)
-    monkeypatch.setattr(m, "SCRIPT", tmp_path / ".worktrees/b/scripts/codebase_managed.py")
-    service = m.render_units(config, path)[m.BACKEND]
-    assert m.render_units(config, path) == expected
-    script = str(Path(config["main"]) / "scripts/codebase_managed.py")
-    assert f'ExecStart=:"/usr/bin/python3" "-I" "{script}" ' in service
-    assert ".worktrees" not in service
 
 
 def test_empty_override_means_default_settings(tmp_path, monkeypatch, capsys):
@@ -697,103 +461,6 @@ def test_empty_override_means_default_settings(tmp_path, monkeypatch, capsys):
     )
 
 
-@pytest.mark.parametrize(
-    "evidence,expected",
-    [
-        ("none", 1),
-        ("override", 0),
-        ("settings", 0),
-        ("dangling-settings", 0),
-        ("owned-unit", 0),
-        ("owned-slice", 0),
-        ("unit-via-alias", 0),
-        ("foreign-unit", 1),
-        ("other-config-unit", 3),
-        ("unreadable-unit", 2),
-        ("unit-dir-unlistable", 2),
-        ("unit-dir-closed", 2),
-        ("config-dir-closed", 2),
-        ("settings-dir-closed", 2),
-        ("settings-dir-dangling-link", 2),
-        ("crlf-unit", 1),
-    ],
-)
-def test_shell_selection_derivation(tmp_path, config, evidence, expected):
-    home = tmp_path / "home"
-    home.mkdir()
-    path = m.config_path(str(home / ".genesis/config/codebase-managed.json"))
-    directory = home / ".config/systemd/user"
-    directory.mkdir(parents=True)
-    units = m.render_units(config, path)
-    service, slice_unit = m.BACKEND, m.SLICE
-    env = {k: v for k, v in os.environ.items() if k != "CODEBASE_MEMORY_MCP_MANAGED_CONFIG"}
-    queried = path
-    if evidence == "override":
-        env["CODEBASE_MEMORY_MCP_MANAGED_CONFIG"] = str(path)
-    if evidence in ("settings", "dangling-settings"):
-        path.parent.mkdir(parents=True)
-        if evidence == "settings":
-            path.write_text("{}")
-        else:
-            path.symlink_to(tmp_path / "missing")
-    if evidence == "owned-unit":
-        (directory / service).write_text(units[service])
-    if evidence == "owned-slice":
-        (directory / slice_unit).write_text(units[slice_unit])
-    if evidence == "unit-via-alias":
-        (directory / service).write_text(units[service])
-        (tmp_path / "alias").symlink_to(home)
-        queried = tmp_path / "alias/.genesis/config/codebase-managed.json"
-    if evidence == "foreign-unit":
-        (directory / "genesis-cbm-vendor.service").write_text("[Service]\nExecStart=/bin/true\n")
-    if evidence == "other-config-unit":
-        (directory / service).write_text(m.render_units(config, tmp_path / "other.json")[service])
-    if evidence == "unreadable-unit":
-        (directory / service).write_text(units[service])
-        (directory / service).chmod(0)
-        if os.access(directory / service, os.R_OK):
-            pytest.skip("running with privileges that ignore file modes")
-    if evidence == "crlf-unit":  # not a byte-exact generated fragment, for either reader
-        (directory / service).write_bytes(units[service].replace("\n", "\r\n").encode())
-        assert not m.owned_fragment(directory / service, path)
-    closed = {
-        "unit-dir-unlistable": (directory, 0o300),
-        "unit-dir-closed": (directory, 0o000),
-        "config-dir-closed": (home / ".config", 0o000),
-        "settings-dir-closed": (path.parent, 0o000),
-    }.get(evidence)
-    if evidence == "settings-dir-closed":  # settings present but unseeable
-        path.parent.mkdir(parents=True)
-        path.write_text("{}")
-    if evidence == "settings-dir-dangling-link":  # e.g. a lost mount target
-        (home / ".genesis").mkdir()
-        (home / ".genesis/config").symlink_to(tmp_path / "unmounted/config")
-    if closed:
-        if evidence != "settings-dir-closed":
-            (directory / service).write_text(units[service])  # owned evidence it cannot see
-        closed[0].chmod(closed[1])
-    try:
-        if closed and os.access(closed[0], os.R_OK | os.X_OK):
-            pytest.skip("running with privileges that ignore directory modes")
-        result = _RUN(
-            [
-                "bash",
-                "-c",
-                '. "$0" && codebase_managed_selected "$1" "$2"',
-                SELECTION_LIB,
-                str(queried),
-                str(home),
-            ],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    finally:
-        if closed:
-            closed[0].chmod(0o700)
-    assert result.returncode == expected, result.stderr
-    assert result.stdout == ""  # the launcher's stdout is the MCP transport
 
 
 @pytest.mark.parametrize("suffix", [" ", "\t", "\\", '"', "%", "\u00a0"])
@@ -815,53 +482,12 @@ def test_native_start_preserves_exact_checkout_cwd(tmp_path, config, monkeypatch
     m.execute_native(config, "client", "unused")
     assert captured == [str(directory)]
     assert (
-        "WorkingDirectory=/\n" in m.render_units(config, tmp_path / "settings")[m.BACKEND]
+        "WorkingDirectory=/\n" in (ROOT / "scripts/systemd/genesis-cbm-query.service.template").read_text()
     )
 
 
-@pytest.mark.parametrize(
-    "property_name",
-    [
-        "FragmentPath",
-        "DropInPaths",
-        "Transient",
-        "ActiveState",
-        "ControlGroup",
-        "MemoryMax",
-        "MemorySwapMax",
-        "TasksMax",
-        "CPUQuotaPerSecUSec",
-        "none",
-    ],
-)
-def test_only_unmodified_inactive_implicit_slice_is_available(monkeypatch, property_name):
-    values = {
-        "LoadState": "loaded",
-        "FragmentPath": "",
-        "DropInPaths": "",
-        "Transient": "no",
-        "ActiveState": "inactive",
-        "ControlGroup": "",
-        "MemoryMax": "infinity",
-        "MemorySwapMax": "infinity",
-        "TasksMax": "infinity",
-        "CPUQuotaPerSecUSec": "infinity",
-    }
-    if property_name != "none":
-        values[property_name] = "modified"
-    monkeypatch.setattr(m, "systemctl", lambda *a: values[a[3]])
-    assert m.unit_available("genesis-cbm-test-clients.slice") is (property_name == "none")
-    assert m.unit_available("genesis-cbm-test.service") is False
 
 
-@pytest.mark.parametrize(
-    "active,cgroup,available",
-    [("inactive", "", True), ("active", "/owned", False), ("inactive", "/retained", False)],
-)
-def test_notfound_unit_with_live_ownership_is_preserved(monkeypatch, active, cgroup, available):
-    values = {"LoadState": "not-found", "ActiveState": active, "ControlGroup": cgroup}
-    monkeypatch.setattr(m, "systemctl", lambda *a: values[a[3]])
-    assert m.unit_available("genesis-cbm-test.service") is available
 
 
 # ── round 4: fail-closed handling of filesystem, systemd and cgroup state ──
@@ -967,17 +593,13 @@ def test_configure_preserves_settings_created_during_configure(tmp_path, monkeyp
     provider.write_bytes(b"accepted build")
     path = tmp_path / ".genesis/config/codebase-managed.json"
     monkeypatch.setattr(m, "verified_binary", lambda p: open(p, "rb"))  # noqa: SIM115
-    monkeypatch.setattr(m, "unit_available", lambda unit: True)
     monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0))
     monkeypatch.setattr(m, "verify_cache", lambda config: None)
 
-    def manager(*args):
-        if args[0] == "daemon-reload" and not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("theirs")  # another actor wins after the absence check
-        return ""
-
-    monkeypatch.setattr(m, "systemctl", manager)
+    def race(config):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("theirs")
+    monkeypatch.setattr(m, "verify_cache", race)
     args = argparse.Namespace(
         main=str(main), binary=str(provider), state=str(tmp_path / "state"),
         sentinel=str(tmp_path / "disabled"),
@@ -985,7 +607,7 @@ def test_configure_preserves_settings_created_during_configure(tmp_path, monkeyp
     with pytest.raises(OSError):
         m.configure(args, path)
     assert path.read_text() == "theirs"
-    assert not (tmp_path / "state").exists()
+    assert (tmp_path / "state").is_dir()
 
 
 @pytest.mark.parametrize(
@@ -1001,7 +623,6 @@ def test_activation_rollback_attempts_each_step_and_keeps_start_error(
     config["enabled"] = False
     path.write_text(json.dumps(config))
     monkeypatch.setattr(m, "verify_cache", lambda *a: None)
-    monkeypatch.setattr(m, "verify_units", lambda *a, **k: None)
     monkeypatch.setattr(m, "verified_binary", lambda *a: contextlib.nullcontext())
     real_write = m.write_settings
     writes = []
@@ -1017,11 +638,11 @@ def test_activation_rollback_attempts_each_step_and_keeps_start_error(
 
     def manager(*args):
         actions.append(args)
-        if args[0] == "start":
+        if args[0] == "enable":
             if fault == "start-oserror":
                 raise PermissionError("systemctl became inaccessible")
             raise subprocess.CalledProcessError(1, "start")
-        if args[0] == "stop" and fault == "start-error-write-and-stop-fail":
+        if args[0] == "disable" and fault == "start-error-write-and-stop-fail":
             raise subprocess.CalledProcessError(2, "stop")
         return ""
 
@@ -1033,7 +654,8 @@ def test_activation_rollback_attempts_each_step_and_keeps_start_error(
         assert error.value.cmd == "start"
     assert writes == [True, False]
     assert actions == [
-        ("start", "genesis-cbm-query.service"),
+        ("enable", "--now", "genesis-cbm-query.service"),
+        ("disable", "--now", "genesis-cbm-query.service"),
         ("stop", "genesis-cbm-query.service"),
     ]
     if fault == "start-oserror":
@@ -1066,46 +688,8 @@ def test_client_ancestors_must_admit_the_aggregate_budget(tmp_path, config, monk
         m.verify_boundary(config, "client", unit)
 
 
-@pytest.mark.parametrize("fault", ["old-template", "drop-in", "foreign"])
-def test_launch_tolerates_template_drift_but_not_foreign_units(tmp_path, config, monkeypatch, fault):
-    """A1: a template change must not take the MCP down; ownership still holds."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    path = tmp_path / "settings.json"
-    directory = _write_units(config, path, tmp_path)
-    fragment = directory / m.BACKEND
-    fragment.write_text(_stale(fragment.read_text()))
-    values = {
-        "FragmentPath": lambda unit: "/foreign/unit" if fault == "foreign" else str(directory / unit),
-        "DropInPaths": lambda unit: "/foreign/drop.conf" if fault == "drop-in" else "",
-        "NeedDaemonReload": lambda unit: "no",
-    }
-    monkeypatch.setattr(m, "systemctl", _manager(lambda u, n: values[n](u), []))
-    monkeypatch.setattr(m, "verify_cache", lambda *a: None)
-    monkeypatch.setattr(m, "check_backend", lambda *a: None)
-    launched = []
-    monkeypatch.setattr(m.os, "execv", lambda _, args: launched.append(args))
-    if fault == "old-template":
-        m.launch(config, path)
-        assert launched
-    else:
-        with pytest.raises(ValueError):
-            m.launch(config, path)
-        assert not launched
 
 
-def test_status_reports_template_drift(tmp_path, config, monkeypatch, capsys):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    path = tmp_path / "settings.json"
-    path.write_text(json.dumps(config))
-    directory = _write_units(config, path, tmp_path)
-    fragment = directory / m.BACKEND
-    fragment.write_text(_stale(fragment.read_text()))
-    monkeypatch.setattr(m, "systemctl", lambda *a: "inactive")
-    monkeypatch.setattr(m.sys, "argv", ["codebase_managed.py", "--config", str(path), "status"])
-    assert m.main() == 0
-    report = json.loads(capsys.readouterr().out)
-    assert report["units"][m.BACKEND].startswith("drift")
-    assert report["units"][m.SLICE] == "current"
 
 
 @pytest.mark.parametrize("command", ["disable", "status"])
@@ -1116,7 +700,7 @@ def test_stale_build_still_reaches_disable_and_status(tmp_path, config, monkeypa
     path = tmp_path / "settings.json"
     path.write_text(json.dumps(config))
     called = []
-    monkeypatch.setattr(m, "set_enabled", lambda c, p, enabled: called.append(enabled))
+    monkeypatch.setattr(m, "disable", lambda p: called.append(False))
     monkeypatch.setattr(m, "systemctl", lambda *a: "inactive")
     monkeypatch.setattr(m.sys, "argv", ["codebase_managed.py", "--config", str(path), command])
     assert m.main() == 0
@@ -1137,125 +721,62 @@ def test_stale_build_still_refuses_running_commands(tmp_path, config, monkeypatc
     assert "unsupported managed build" in capsys.readouterr().err
 
 
-def _remove(path: Path) -> int:
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(m.sys, "argv", ["codebase_managed.py", "--config", str(path), "remove"])
-        return m.main()
-
-
-@pytest.mark.parametrize(
-    "fault",
-    ["none", "stale-build", "half-removed", "foreign", "settings-only", "units-still-loaded"],
-)
-def test_remove_retires_only_owned_units_and_the_settings(tmp_path, config, monkeypatch, fault):
-    """A2: after remove, selection derivation reports a never-configured install."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("CODEBASE_MEMORY_MCP_MANAGED_CONFIG", raising=False)
-    path = m.config_path(str(tmp_path / ".genesis/config/codebase-managed.json"))
-    path.parent.mkdir(parents=True)
-    directory = _write_units(config, path, tmp_path)
-    if fault == "stale-build":  # settings from an older accepted build can still retire
-        config["build"] = "0" * 64
-    path.write_text(json.dumps(config))
-    slice_unit = m.SLICE
-    if fault == "foreign":
-        (directory / slice_unit).write_text("[Slice]\nMemoryMax=8G\n")
-    if fault == "half-removed":  # an earlier remove stopped before its second unlink
-        (directory / m.BACKEND).unlink()
-    if fault in ("settings-only", "units-still-loaded"):
-        for unit in m.render_units(config, path):
-            (directory / unit).unlink()
-    loaded = {
-        "FragmentPath": lambda unit: str(directory / unit),
-        "DropInPaths": lambda unit: "",
-        "NeedDaemonReload": lambda unit: "no",
-        "LoadState": lambda unit: "not-found",
-        "ActiveState": lambda unit: "active" if fault == "units-still-loaded" else "inactive",
-        "ControlGroup": lambda unit: "/owned" if fault == "units-still-loaded" else "",
-    }
-    actions = []
-    monkeypatch.setattr(m, "systemctl", _manager(lambda u, n: loaded[n](u), actions))
-    before = {p.name: p.read_text() for p in directory.glob("genesis-cbm-*")}
-    result = _remove(path)
-    if fault in ("none", "stale-build"):
-        assert result == 0
-        assert actions == [
-            ("disable", m.BACKEND),
-            ("stop", m.BACKEND, slice_unit),
-            ("daemon-reload",),
-        ]
-    elif fault == "half-removed":
-        assert result == 0
-        assert actions == [("daemon-reload",), ("stop", slice_unit), ("daemon-reload",)]
-    elif fault == "settings-only":
-        assert result == 0 and actions == [("daemon-reload",)]
-    else:
-        assert result == 1
-        assert actions == ([("daemon-reload",)] if fault == "units-still-loaded" else [])
-        assert {p.name: p.read_text() for p in directory.glob("genesis-cbm-*")} == before
-        assert m.read_settings(path)["enabled"] is False  # the stop lever still landed
-        return
-    assert not any(directory.glob("genesis-cbm-*"))
-    assert not path.exists()
-    assert _selected(path, tmp_path) == 1
-
-
-def _uninstall_block(path: str) -> str:
+def test_uninstall_retains_managed_fragments_and_application_roots(tmp_path):
     source = (ROOT / "scripts/uninstall.sh").read_text()
-    if path == "direct":
-        helper = source[source.index("safe_disable_service() {") : source.index("# Run a command inside")]
-        start = source.index("        PRESSURE_UNIT=genesis-disk-hygiene-pressure")
-        return helper + source[start : source.index("        # Persistent= timers", start)]
-    helper = source[source.index("remove_serena_enablement() {") : source.index("# Run a command inside")]
-    helper += 'container_exec() { bash -c "$1"; }\n'
-    start = source.index('            container_exec "', source.index("# Stop all services (timers first"))
-    return helper + source[start : source.index('            ok "Stopped Genesis services"', start)]
-
-
-@pytest.mark.parametrize("path", ["direct", "host"])
-def test_uninstall_stops_and_disables_managed_codebase_units(tmp_path, path):
-    calls = tmp_path / "calls"
-    fake = tmp_path / "bin/systemctl"
-    fake.parent.mkdir()
-    fake.write_text(f'#!/bin/sh\necho "$*" >> "{calls}"\n')
-    fake.chmod(0o755)
-    _RUN(
-        ["bash", "-c", "DRY_RUN=false; ok() { :; }; skip() { :; };\n" + _uninstall_block(path)],
-        env=dict(os.environ, HOME=str(tmp_path), XDG_RUNTIME_DIR=str(tmp_path / "run"),
-                 PATH=f"{fake.parent}:{os.defpath}"),
-        check=True, capture_output=True, text=True, timeout=60,
-    )
-    recorded = [line.split() for line in calls.read_text().splitlines()]
-    for unit in ("genesis-cbm-query.service", "genesis-cbm-query-clients.slice"):
-        for operation in ("stop", "disable"):
-            assert any(args[:2] == ["--user", operation] and unit in args[2:] for args in recorded)
-
-
-@pytest.mark.parametrize("path", ["direct", "host"])
-def test_uninstall_deletes_managed_codebase_fragments(tmp_path, path):
-    """No owned fragment survives to re-select the managed route."""
-    source = (ROOT / "scripts/uninstall.sh").read_text()
-    if path == "direct":
-        start = source.index("        # Remove systemd unit files\n        SYSTEMD_DIR")
-        end = source.index("\n", source.index("daemon-reload", start))
-        block = source[source.index("safe_remove() {") : source.index("# Stop and disable a systemd")]
-        block += source[start:end]
-    else:
-        start = source.index("            # Remove systemd unit files\n")
-        block = 'container_exec() { bash -c "$1"; }\n'
-        block += source[start : source.index('            ok "Removed systemd unit files"', start)]
+    helpers = source[source.index("safe_remove() {"):source.index("# Stop and disable a systemd")]
+    start = source.index("        # Remove systemd unit files\n        SYSTEMD_DIR")
+    end = source.index("\n", source.index("daemon-reload", start))
+    directory = tmp_path / ".config/systemd/user"
+    directory.mkdir(parents=True)
+    for name in ("genesis-cbm-query.service", "genesis-cbm-custom.service", "genesis-cbm-custom-clients.slice"):
+        (directory / name).write_text("owned-or-foreign-preserve")
+    (tmp_path / ".genesis").mkdir()
+    (tmp_path / ".genesis/keep").write_text("managed cache")
     fake = tmp_path / "bin/systemctl"
     fake.parent.mkdir()
     fake.write_text("#!/bin/sh\nexit 0\n")
     fake.chmod(0o755)
+    block = 'DRY_RUN=false; MANAGED_STATE_RETAIN=true; REMOVED=(); KEPT=(); info() { :; }; ok() { :; }; skip() { :; };\n'
+    block += helpers + source[start:end] + '\nsafe_remove "$HOME/.genesis" state\n'
+    _RUN(["bash", "-c", block], env=dict(os.environ, HOME=str(tmp_path), PATH=f"{fake.parent}:{os.defpath}"), check=True)
+    assert len(list(directory.glob("genesis-cbm-*"))) == 3
+    assert (tmp_path / ".genesis/keep").read_text() == "managed cache"
+
+
+def test_host_uninstall_shares_only_managed_lifecycle_helpers():
+    source = (ROOT / "scripts/uninstall.sh").read_text()
+    assert "$(declare -f info managed_codebase_retention managed_codebase_preflight)" in source
+    assert "$(declare -f info ok skip safe_remove managed_codebase_retention)" in source
+    assert 'if [ "$strict" = true ]; then' in source
+    assert 'managed_codebase_preflight\n            " true ||' in source
+
+
+def test_host_uninstall_retains_managed_fragments_and_roots_using_real_commands(tmp_path):
+    source = (ROOT / "scripts/uninstall.sh").read_text()
+    helpers = source[source.index("safe_remove() {"):source.index("# Stop and disable a systemd")]
+    host = source.index("# Stop all services (timers first")
+    start = source.index('            # Remove systemd unit files', host)
+    end = source.index('            ok "Removed systemd unit files"', start)
+    unit_commands = source[start:end]
+    start = source.index('            # Remove Genesis directories and data', host)
+    end = source.index('            ok "Genesis directory cleanup completed', start)
+    root_commands = source[start:end]
     directory = tmp_path / ".config/systemd/user"
     directory.mkdir(parents=True)
-    names = ["genesis-cbm-query.service", "genesis-cbm-query-clients.slice"]
-    for name in names:
-        (directory / name).write_text(m.MARKER)
-    _RUN(
-        ["bash", "-c", "DRY_RUN=false; REMOVED=(); ok() { :; }; skip() { :; };\n" + block],
-        env=dict(os.environ, HOME=str(tmp_path), PATH=f"{fake.parent}:{os.defpath}"),
-        check=True, capture_output=True, text=True, timeout=60,
-    )
-    assert not [name for name in names if (directory / name).exists()]
+    for name in ("genesis-cbm-query.service", "genesis-cbm-custom.service", "genesis-cbm-custom-clients.slice"):
+        (directory / name).write_text("preserve")
+    ordinary = directory / "genesis-server.service"
+    ordinary.write_text("remove")
+    for name in ("genesis", ".genesis", "data", ".qdrant"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "keep").write_text("managed cache")
+    fake = tmp_path / "bin/systemctl"
+    fake.parent.mkdir()
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o755)
+    block = 'DRY_RUN=false; REMOVED=(); SKIPPED=(); KEPT=(); info() { :; }; ok() { :; }; skip() { :; }; container_exec() { bash -e -c "$1"; };\n'
+    block += helpers + unit_commands + root_commands
+    _RUN(["bash", "-e", "-c", block], env=dict(os.environ, HOME=str(tmp_path), PATH=f"{fake.parent}:{os.defpath}"), check=True)
+    assert not ordinary.exists()
+    assert len(list(directory.glob("genesis-cbm-*"))) == 3
+    assert all((tmp_path / name / "keep").read_text() == "managed cache" for name in ("genesis", ".genesis", "data", ".qdrant"))

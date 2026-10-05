@@ -1,0 +1,20 @@
+[Unit]
+Description=Genesis pinned native Codebase query daemon
+
+[Service]
+Type=exec
+WorkingDirectory=/
+ExecStart=:/usr/bin/python3 -I "__REPO_EXEC__/scripts/codebase_managed.py" --config "__HOME_EXEC__/.genesis/config/codebase-managed.json" serve
+ExecStartPost=:/usr/bin/python3 -I "__REPO_EXEC__/scripts/codebase_managed.py" --config "__HOME_EXEC__/.genesis/config/codebase-managed.json" ready
+TimeoutStartSec=120
+MemoryMax=2G
+MemorySwapMax=0
+TasksMax=128
+CPUQuota=200%
+OOMScoreAdjust=500
+KillMode=control-group
+Restart=no
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

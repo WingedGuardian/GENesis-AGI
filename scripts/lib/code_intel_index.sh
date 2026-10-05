@@ -56,6 +56,8 @@
 
 set -u
 
+_log() { printf '[code-intel-index] %s\n' "$*"; }
+
 # Private child launcher. The supervising script owns admission, scope control,
 # pausing and cleanup; making that supervisor an OOM target can remove the only
 # process able to stop or thaw the heavy job. Apply the kernel's maximum
@@ -177,6 +179,29 @@ fi
 # reads managed state until the switch is known to be off, and each refusal
 # skips only the CBM leg, so a requested GitNexus leg keeps its outcome. The
 # kill-switch path resolves through the ONE shared site (cbm_disable_file.sh);
+if [ -z "$REPO_PATH" ] || [ ! -d "$REPO_PATH" ]; then
+    _log "ERROR: repo path missing or not a directory: '$REPO_PATH'"
+    exit 1
+fi
+case "$TOOLS" in cbm|gitnexus|both) ;; *)
+    _log "ERROR: tool must be cbm|gitnexus|both, got '$TOOLS'"; exit 1 ;;
+esac
+case "$MODE" in fast|moderate|full) ;; *)
+    _log "ERROR: mode must be fast|moderate|full, got '$MODE'"; exit 1 ;;
+esac
+
+# Physical path (-P): the single-flight lock is keyed on this, and a symlinked
+# spelling of the same repo must not get a second lock (= second concurrent index).
+REPO_PATH="$(unset CDPATH; cd "$REPO_PATH" && pwd -P)"
+
+# ── 1. Worktree skip ────────────────────────────────────────────────────
+# In a linked worktree, <root>/.git is a FILE (gitdir pointer), not a dir.
+if [ -f "$REPO_PATH/.git" ]; then
+    _log "skip: $REPO_PATH is a linked git worktree (never indexed — use Serena there)"
+    exit 0
+fi
+
+
 # an unresolvable override refuses rather than reading as "not disabled".
 CBM_OFF=""
 if [ "$TOOLS" = cbm ] || [ "$TOOLS" = both ]; then
@@ -587,7 +612,6 @@ if [ -r "$_gitnexus_pin_file" ]; then
     fi
 fi
 
-_log() { printf '[code-intel-index] %s\n' "$*"; }
 
 # Shared load/iowait sampler for the pressure watchdog. Best-effort: if it's
 # missing (older checkout), the watchdog degrades to a wall-clock cap only.
@@ -610,28 +634,6 @@ _WD_BAD_SAMPLES="${CODE_INTEL_WATCHDOG_BAD_SAMPLES:-2}"   # consecutive bad samp
 _WD_CONT_PAUSE_MAX="${CODE_INTEL_WATCHDOG_CONT_PAUSE_MAX:-600}"  # kill if paused this long CONTINUOUSLY
 _WD_WALL_FAST="${CODE_INTEL_WATCHDOG_WALL_FAST:-3600}"    # wall cap for fast/moderate (s)
 _WD_WALL_FULL="${CODE_INTEL_WATCHDOG_WALL_FULL:-14400}"   # wall cap for full (s) — cbm can't resume
-
-if [ -z "$REPO_PATH" ] || [ ! -d "$REPO_PATH" ]; then
-    _log "ERROR: repo path missing or not a directory: '$REPO_PATH'"
-    exit 1
-fi
-case "$TOOLS" in cbm|gitnexus|both) ;; *)
-    _log "ERROR: tool must be cbm|gitnexus|both, got '$TOOLS'"; exit 1 ;;
-esac
-case "$MODE" in fast|moderate|full) ;; *)
-    _log "ERROR: mode must be fast|moderate|full, got '$MODE'"; exit 1 ;;
-esac
-
-# Physical path (-P): the single-flight lock is keyed on this, and a symlinked
-# spelling of the same repo must not get a second lock (= second concurrent index).
-REPO_PATH="$(unset CDPATH; cd "$REPO_PATH" && pwd -P)"
-
-# ── 1. Worktree skip ────────────────────────────────────────────────────
-# In a linked worktree, <root>/.git is a FILE (gitdir pointer), not a dir.
-if [ -f "$REPO_PATH/.git" ]; then
-    _log "skip: $REPO_PATH is a linked git worktree (never indexed — use Serena there)"
-    exit 0
-fi
 
 # ── 2. Single-flight lock (per repo path) ───────────────────────────────
 LOCK_DIR="${GENESIS_HOME:-$HOME/.genesis}/locks"

@@ -1175,11 +1175,15 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         CC_BIN_DIR="$CC_BIN_DIR:$_cc_prefix/bin"
     fi
 
+    # shellcheck source=lib/codebase_managed_templates.sh
+    . "$SCRIPT_DIR/lib/codebase_managed_templates.sh"
+
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template "$SYSTEMD_TEMPLATE_DIR"/*.slice.template; do
         [[ -f "$template" ]] || continue
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
+        genesis_cbm_template_selected "$svc_name" "$SYSTEMD_USER_DIR" "$HOME" || continue
         # The graph engine's unit only advances to a module that is verified on
         # disk. Provisioning above returns 0 when it skips or fails, so without
         # this a failed or unpinned provision would point a working unit at a
@@ -1205,8 +1209,10 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         # path — under set -e.
         _sed_repl_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
         _home_esc=$(_sed_repl_esc "$HOME")
+        _home_exec_esc=$(_sed_repl_esc "$(genesis_cbm_exec_path "$HOME")")
         _venv_esc=$(_sed_repl_esc "$GENESIS_ROOT/.venv")
         _repo_esc=$(_sed_repl_esc "$GENESIS_ROOT")
+        _repo_exec_esc=$(_sed_repl_esc "$(genesis_cbm_exec_path "$GENESIS_ROOT")")
         _ccbin_esc=$(_sed_repl_esc "$CC_BIN_DIR")
         # Every token any template uses must appear here, and `sed` will NOT
         # tell you when one is missing — an unknown `__TOKEN__` passes through
@@ -1224,8 +1230,10 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         _falkordb_ver_esc=$(_sed_repl_esc "${FALKORDB_VERSION:-4.20.4}")
         _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)")
         rendered=$(sed -e "s|__HOME__|$_home_esc|g" \
+                -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
                        -e "s|__VENV__|$_venv_esc|g" \
                        -e "s|__REPO_DIR__|$_repo_esc|g" \
+               -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \
                        -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
                        -e "s|__AZ_ROOT__|$_az_root_esc|g" \
                        -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
