@@ -108,6 +108,9 @@ stock permanent daemon. It holds no shared lifecycle lock while readiness is
 pending, avoiding a deadlock with a future exclusive enable operation. Readiness
 requires a native connect-only status RPC that names the permanent service PID,
 the correct executable and actual kernel limits. Socket existence is insufficient.
+Each status RPC uses the remaining 60-second readiness window: the pinned CLI
+hashes its executable at startup, so a healthy status call can exceed three
+seconds. No status call starts once that window has expired.
 
 Both ordinary renderer loops substitute quoted Exec paths using separate systemd
 and sed escaping. Whitespace, quote, backslash, dollar, percent, ampersand, pipe
