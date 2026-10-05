@@ -101,3 +101,26 @@ def test_a_planted_symlink_at_the_temp_name_is_never_written_through(tmp_path):
     assert (tmp_path / "mcp_health.log.1").read_text() == "log line\n" * 200
     assert not (tmp_path / "mcp_health.log.1").is_symlink()
     assert not list(tmp_path.glob(".mcp_health.log.rotate.*"))
+
+
+def test_a_failed_copy_keeps_every_retained_rotation(tmp_path):
+    """Codex round 1: the rotations used to shift before the copy could fail, so
+    a full disk lost the oldest kept copy while saying nothing had changed."""
+    f = tmp_path / "mcp_health.log"
+    f.write_text("current\n" * 200)
+    (tmp_path / "mcp_health.log.1").write_text("one")
+    (tmp_path / "mcp_health.log.2").write_text("two")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "cp").write_text("#!/bin/sh\nexit 1\n")  # a copy that fails, as on a full disk
+    (bindir / "cp").chmod(0o755)
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; PATH="$2:$PATH"; rotate_log "$3" 1000 2', "_",
+         str(_HYGIENE), str(bindir), str(f)],
+        capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL,
+    )
+    assert "left as is" in result.stdout
+    assert (tmp_path / "mcp_health.log.1").read_text() == "one"
+    assert (tmp_path / "mcp_health.log.2").read_text() == "two"
+    assert f.read_text() == "current\n" * 200
+    assert not list(tmp_path.glob(".mcp_health.log.rotate.*"))

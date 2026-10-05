@@ -684,6 +684,51 @@ class TestEnsureRemoteCdp:
     """Verify _ensure_remote_cdp connection lifecycle."""
 
     @pytest.mark.asyncio
+    async def test_a_failed_tab_open_disconnects_instead_of_leaking(self):
+        """Connected, but the Genesis tab cannot be opened: the driver and the
+        CDP connection are stopped now, or each retry would leak another."""
+        mock_br = _mock_remote_browser()
+        mock_br.contexts[0].new_page = AsyncMock(side_effect=RuntimeError("Target closed"))
+        browser._remote_target_id = "keep-me"
+        with pytest.raises(ConnectionError, match="could not open the Genesis tab"):
+            await _connect(mock_br)
+        mock_br.close.assert_awaited()
+        assert browser._remote_browser is None
+        assert browser._remote_pw is None
+        assert browser._remote_target_id == "keep-me"  # a retry can still reuse the tab
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_tab_open_still_disconnects(self):
+        """Codex round 1: the tool timeout cancels with a BaseException, which an
+        `except Exception` cleanup missed. The cancellation itself propagates."""
+        mock_br = _mock_remote_browser()
+        mock_br.contexts[0].new_page = AsyncMock(side_effect=asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await _connect(mock_br)
+        mock_br.close.assert_awaited()
+        assert browser._remote_browser is None
+        assert browser._remote_pw is None
+
+    @pytest.mark.asyncio
+    async def test_snapshot_does_not_resync_drift_if_the_page_moved_meanwhile(self):
+        """Codex round 1: a navigation during the snapshot means it may show the
+        old page; the drift baseline must not jump to the new one."""
+        page = _cdp_page("https://a.example/", "t1")
+        browser._remote_browser = _mock_remote_browser()
+        browser._remote_page = page
+        browser._active_page = page
+        browser._remote_last_url = "https://a.example/"
+
+        async def moving_snapshot(p):
+            page.url = "https://b.example/"
+            return "- heading 'A'"
+
+        page.title = AsyncMock(return_value="B")
+        with patch.object(browser, "_snapshot_page", side_effect=moving_snapshot):
+            await browser._impl_browser_snapshot()
+        assert browser._remote_last_url == "https://a.example/"
+
+    @pytest.mark.asyncio
     async def test_returns_alive_page_without_reconnect(self):
         """Already-connected, alive page is reused."""
         page = MagicMock()
@@ -2258,10 +2303,26 @@ def _live_camoufox_ctx(cookies):
     ctx.clear_cookies = AsyncMock()
     browser._stealth_page = page
     browser._stealth_browser = ctx
+    browser._stealth_cm = MagicMock()  # the browser this process launched is open
     return ctx
 
 
 class TestCookieToolsBothProfiles:
+    @pytest.mark.asyncio
+    async def test_a_closed_tab_keeps_the_live_context(self, tmp_path):
+        """Cookies belong to the context, not the remembered page: a closed tab
+        with the browser still open must clear through the context, not refuse
+        the profile as in use."""
+        ctx = _live_camoufox_ctx([{"domain": ".x.com"}])
+        browser._stealth_page.is_closed.return_value = True
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            result = await browser._impl_browser_clear_domain("x.com")
+        assert result["profiles"][0]["source"] == "live browser"
+        ctx.clear_cookies.assert_awaited()
+
     @pytest.mark.asyncio
     async def test_sessions_labels_both_profiles(self, tmp_path):
         with (
@@ -2384,6 +2445,7 @@ class TestReviewNotes:
         ctx.cookies = MagicMock(side_effect=lambda: hang())
         browser._stealth_page = page
         browser._stealth_browser = ctx
+        browser._stealth_cm = MagicMock()
         with (
             patch.object(browser, "_COOKIE_CALL_TIMEOUT_S", 0.1),
             patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),

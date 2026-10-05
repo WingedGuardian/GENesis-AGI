@@ -313,23 +313,28 @@ rotate_log() {
     [ -f "$f" ] && [ ! -L "$f" ] || return 0
     size="$(stat -c %s -- "$f" 2>/dev/null)" || return 0
     [ "$size" -gt "$max" ] || return 0
-    for (( i = keep; i > 1; i-- )); do
-        if [ -f "$f.$((i - 1))" ]; then
-            mv -f -- "$f.$((i - 1))" "$f.$i"
-        fi
-    done
-    # Copy to a temp file first, so an interrupted copy never poses as FILE.1.
-    # If the copy fails (a full disk), the log is left exactly as it was:
-    # truncating without a copy would lose the whole file. The temp is a fresh
-    # mktemp file (O_EXCL), never a fixed name: cp writes THROUGH an existing
-    # symlink at its destination, so a pre-planted FILE.1.tmp link would have
-    # overwritten whatever it pointed at (security review of the rotation).
+    # Copy to a temp file FIRST, before any retained rotation moves: if the copy
+    # fails (a full disk), nothing has changed, the log and every kept copy
+    # included. Truncating without a copy would lose the whole file. The temp
+    # is a fresh mktemp file (O_EXCL), never a fixed name: cp writes THROUGH an
+    # existing symlink at its destination, so a pre-planted FILE.1.tmp link
+    # would have overwritten whatever it pointed at.
     local tmp
     if ! tmp="$(mktemp -p "$(dirname -- "$f")" ".$(basename -- "$f").rotate.XXXXXX")"; then
         echo "rotate of $f failed (no temp file); the log was left as is"
         return 0
     fi
-    if cp -- "$f" "$tmp" && mv -f -- "$tmp" "$f.1"; then
+    if ! cp -- "$f" "$tmp"; then
+        rm -f -- "$tmp"
+        echo "rotate of $f failed; the log and its rotations were left as is"
+        return 0
+    fi
+    for (( i = keep; i > 1; i-- )); do
+        if [ -f "$f.$((i - 1))" ]; then
+            mv -f -- "$f.$((i - 1))" "$f.$i"
+        fi
+    done
+    if mv -f -- "$tmp" "$f.1"; then
         : > "$f"
         echo "rotated $f ($size bytes)"
     else

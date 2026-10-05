@@ -594,7 +594,21 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
 
         _remote_cdp_url = url
         _remote_browser.on("disconnected", lambda: _on_remote_disconnected())
-        _remote_page = await _genesis_remote_tab(_remote_browser)
+        try:
+            _remote_page = await _genesis_remote_tab(_remote_browser)
+        except BaseException as e:
+            # Connected but no usable tab (Chrome closed, the context refused a
+            # page, or the tool timeout cancelled the call): disconnect and stop
+            # this driver now, or the next attempt starts another and the first
+            # leaks. _remote_target_id is kept, so a retry still reuses the
+            # Genesis tab if it exists. The cleanup is shielded so a cancellation
+            # cannot cut it short.
+            await asyncio.shield(_cleanup_remote_cdp())
+            if not isinstance(e, Exception):
+                raise  # cancellation / interpreter exit: propagate as is
+            raise ConnectionError(
+                f"Connected to Chrome at {url} but could not open the Genesis tab: {e}"
+            ) from e
         return _remote_page
 
 
@@ -2782,12 +2796,15 @@ async def _impl_browser_snapshot() -> dict:
             return health
         page = _active_page
     try:
+        url_before = page.url
         snapshot = await _snapshot_page(page)
         # Remote: the caller has now seen the current page, so it becomes the
         # drift baseline. This is what the drift advisory's "call
         # browser_snapshot()" recommendation relies on. Only a REAL snapshot
-        # counts: a timed-out or unavailable one showed the caller nothing.
-        if not snapshot.startswith(_SNAPSHOT_PLACEHOLDERS):
+        # counts (a timed-out or unavailable one showed the caller nothing),
+        # and only if the URL held still while it was taken: a navigation in
+        # between means the snapshot may describe the old page.
+        if not snapshot.startswith(_SNAPSHOT_PLACEHOLDERS) and page.url == url_before:
             _update_remote_url()
         return {"url": page.url, "title": await page.title(), "snapshot": snapshot}
     except Exception as e:
@@ -2846,14 +2863,16 @@ def _live_cookie_context(kind: str):
     While the browser runs, its cookie jar lives in memory and is written back
     to the file, so the live context's cookie API is the only correct way to
     read or change it. Camoufox's persistent context IS the browser object.
+
+    Liveness is the CONTEXT's, not the remembered page's: cookies belong to the
+    context, and the user closing one tab leaves the context (and its lock on
+    the profile) in place. A context this process holds counts until cleanup
+    clears it; a crashed one makes the cookie call fail, which is reported as
+    an error, never as an empty result.
     """
     if kind == "camoufox":
-        if _stealth_page is not None and _is_page_alive(_stealth_page):
-            return _stealth_browser
-        return None
-    if _page is not None and _is_page_alive(_page):
-        return _context
-    return None
+        return _stealth_browser if _stealth_cm is not None else None
+    return _context
 
 
 # Bound on one cookie call to a live browser context. Camoufox is the reason:

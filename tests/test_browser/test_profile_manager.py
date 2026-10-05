@@ -121,9 +121,10 @@ class TestClearDomain:
         with pytest.raises(ValueError):
             populated_profile.clear_domain("  ")
 
-    def test_refuses_while_a_browser_has_the_profile_open(self, populated_profile):
+    def test_refuses_while_a_browser_has_the_profile_open(self, populated_profile, fake_browser):
+        proc = fake_browser("--user-data-dir=" + str(populated_profile.profile_dir))
         lock = populated_profile.profile_dir / "SingletonLock"
-        os.symlink(f"somehost-{os.getpid()}", lock)
+        os.symlink(f"somehost-{proc.pid}", lock)
         with pytest.raises(ProfileInUse):
             populated_profile.clear_domain("github.com")
         assert {s.domain for s in populated_profile.get_info().sessions} >= {"github.com"}
@@ -177,10 +178,11 @@ class TestCamoufoxProfile:
         assert mgr.clear_domain("x.com") == 2
         assert {s.domain for s in mgr.get_info().sessions} == {"netflix.com"}
 
-    def test_firefox_lock_link_marks_the_profile_in_use(self, tmp_path):
+    def test_firefox_lock_link_marks_the_profile_in_use(self, tmp_path, fake_browser):
         mgr = _camoufox_profile(tmp_path / "camoufox-profile", [".x.com"])
-        os.symlink(f"127.0.1.1:+{os.getpid()}", mgr.profile_dir / "lock")
-        assert mgr.running_pid() == os.getpid()
+        proc = fake_browser("-profile", str(mgr.profile_dir))
+        os.symlink(f"127.0.1.1:+{proc.pid}", mgr.profile_dir / "lock")
+        assert mgr.running_pid() == proc.pid
         with pytest.raises(ProfileInUse):
             mgr.clear_domain("x.com")
 
@@ -254,3 +256,34 @@ class TestBrowserLayerEnum:
         ).read_text()
         for n, name in enumerate(("Camoufox", "Chromium", "CDP remote", "TinyFish"), 1):
             assert f"# Layer {n}: {name}" in src, (n, name)
+
+
+@pytest.fixture
+def fake_browser():
+    """A live process whose argv names a profile, as Playwright launches the
+    real browsers (Firefox `-profile <dir>`, Chromium `--user-data-dir=<dir>`)."""
+    import subprocess
+    import sys
+
+    procs = []
+
+    def start(*argv):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)", *argv]
+        )
+        procs.append(proc)
+        return proc
+
+    yield start
+    for proc in procs:
+        proc.kill()
+        proc.wait()
+
+
+def test_a_reused_pid_is_not_mistaken_for_the_browser(tmp_path):
+    """A browser leaves its lock link behind; the OS can hand its pid to an
+    unrelated process. Only a process whose argv names this profile counts."""
+    mgr = _camoufox_profile(tmp_path / "camoufox-profile", [".x.com"])
+    os.symlink(f"127.0.1.1:+{os.getpid()}", mgr.profile_dir / "lock")  # pytest: not a browser
+    assert mgr.running_pid() is None
+    assert mgr.clear_domain("x.com") == 1

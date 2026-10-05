@@ -45,3 +45,20 @@ def test_export_state_refuses_a_non_chromium_profile(tmp_path):
     with pytest.raises(NotImplementedError):
         mgr.export_state(tmp_path / "state.json")
     assert not (tmp_path / "state.json").exists()
+
+
+@pytest.mark.parametrize("suffix", ["co.uk", "com.au", "github.io", ".CO.UK"])
+def test_a_public_suffix_is_never_cleared(suffix):
+    """Codex round 1: rejecting only single labels still let `co.uk` through,
+    which matches bank.co.uk and shop.co.uk alike (a bulk logout)."""
+    from genesis.browser.profile import normalize_domain
+
+    with pytest.raises(ValueError, match="public suffix"):
+        normalize_domain(suffix)
+
+
+@pytest.mark.parametrize("domain", ["bank.co.uk", "user.github.io", "x.com", "localhost", "app.internal"])
+def test_registrable_domains_still_clear(domain):
+    from genesis.browser.profile import normalize_domain
+
+    assert normalize_domain(domain) == domain

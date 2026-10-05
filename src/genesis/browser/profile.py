@@ -54,7 +54,37 @@ def normalize_domain(domain: str) -> str:
     # profiles; only localhost is a real single-label cookie host.
     if "." not in d and d != "localhost":
         raise ValueError(f"not a domain (no dot): {domain!r}")
+    if d != "localhost" and _is_public_suffix(d):
+        # "co.uk" would match bank.co.uk and shop.co.uk alike: clearing it is a
+        # bulk logout across unrelated sites in both profiles.
+        raise ValueError(f"not a registrable domain (a public suffix): {domain!r}")
     return d
+
+
+_SUFFIXES = None
+
+
+def _is_public_suffix(d: str) -> bool:
+    """Whether ``d`` is itself a public suffix (``co.uk``, ``github.io``).
+
+    tldextract with its BUNDLED Public Suffix List snapshot (no fetch, no
+    cache dir), including the private section, so ``github.io`` counts and a
+    clear cannot reach every user's site under it. It is a declared
+    dependency; if it is missing anyway the clear is refused rather than
+    guessed, because this check guards a credential-affecting bulk delete.
+    """
+    global _SUFFIXES
+    if _SUFFIXES is None:
+        try:
+            import tldextract
+        except ImportError as exc:
+            raise ValueError(
+                "cannot check the public-suffix boundary (tldextract is not installed)"
+            ) from exc
+        _SUFFIXES = tldextract.TLDExtract(
+            suffix_list_urls=(), cache_dir=None, include_psl_private_domains=True
+        )
+    return _SUFFIXES(d).domain == ""
 
 
 def domain_matches(host: str, domain: str) -> bool:
@@ -121,7 +151,28 @@ class BrowserProfileManager:
             return None
         except PermissionError:
             return pid  # alive, owned by another user
+        if not self._pid_uses_profile(pid):
+            return None  # a stale link whose pid the OS has since reused
         return pid
+
+    def _pid_uses_profile(self, pid: int) -> bool:
+        """Whether ``pid``'s command line names this profile directory.
+
+        Playwright launches Firefox (Camoufox) with ``-profile <dir>`` and
+        Chromium with ``--user-data-dir=<dir>`` (READ: its server/firefox and
+        server/chromium launchers), and the lock names that browser's main
+        process. A live pid whose command line does not mention the directory
+        is an unrelated process reusing the pid of a closed browser. Anything
+        unreadable counts as a match, so the check only ever un-blocks a case
+        it can prove.
+        """
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return True
+        args = raw.decode(errors="replace").split("\0")
+        wanted = {str(self._profile_dir), str(self._profile_dir.resolve())}
+        return any(w in a for a in args for w in wanted)
 
     def ensure_dir(self) -> Path:
         """Create the profile directory if it doesn't exist."""
