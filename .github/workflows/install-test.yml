@@ -197,12 +197,21 @@ jobs:
           # two globs is unmatched, so a repo with service templates and no
           # timer template would die on every run with no message. `[ -f ]`
           # inside the loop already handles the literal-pattern case.
+          #
+          # One deliberate exception, MIRRORED from the installer rather than
+          # restated (the same pattern as the backup.timer skip below): the
+          # managed Codebase units render only for an install that configured
+          # that integration. The predicate is the installer's own, so a job
+          # that configures it still requires both units, and every other
+          # template stays required.
+          . scripts/lib/codebase_managed_templates.sh
           _unrendered=""
           _tpl_count=0
           for _tpl in scripts/systemd/*.service.template scripts/systemd/*.timer.template; do
             [ -f "$_tpl" ] || continue
             _tpl_count=$((_tpl_count + 1))
             _want=$(basename "$_tpl" .template)
+            genesis_cbm_template_selected "$_want" ~/.config/systemd/user "$HOME" || continue
             [ -f ~/.config/systemd/user/"$_want" ] || _unrendered="$_unrendered $_want"
           done
           if [ -n "$_unrendered" ]; then

@@ -211,6 +211,26 @@ managed_codebase_retention() {
             MANAGED_STATE_RETAIN=true
         fi
     done
+    # configure publishes settings LAST and retains failed staging, so staging
+    # at the documented --state location can exist with no settings at all.
+    if [ -e "$HOME/.genesis/codebase-managed" ] || [ -L "$HOME/.genesis/codebase-managed" ]; then
+        MANAGED_STATE_RETAIN=true
+    fi
+    # Runtime, generated and transient units leave no fragment above. Ask the
+    # manager with the route-selection predicate itself (one evidence model):
+    # only its definite "not selected" (1) clears. An unreachable manager is
+    # reported and adds nothing, since nothing here could stop a unit anyway.
+    local selection="$HOME/genesis/scripts/lib/codebase_managed_selection.sh" rc=0
+    if [ -f "$selection" ]; then
+        if systemctl --user show-environment >/dev/null 2>&1; then
+            # shellcheck source=lib/codebase_managed_selection.sh
+            ( . "$selection"; codebase_managed_selected \
+                "$HOME/.genesis/config/codebase-managed.json" "$HOME" ) || rc=$?
+            [ "$rc" -eq 1 ] || MANAGED_STATE_RETAIN=true
+        else
+            info "User manager unreachable; managed runtime units not checked"
+        fi
+    fi
 }
 
 # Stop the bootstrap backend independently of settings or client-slice damage.

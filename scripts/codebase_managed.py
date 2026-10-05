@@ -409,8 +409,45 @@ def stop_backend() -> None:
         except (OSError, subprocess.SubprocessError) as exc:
             if error is None:
                 error = exc
-    if error is not None:
+    if error is not None and not backend_absent():
         raise error
+
+
+def backend_absent() -> bool:
+    """True only when the manager itself confirms no backend unit can be running.
+
+    `configure` installs no units, so settings routinely exist before bootstrap
+    renders the service, and both stop calls then fail (systemd 255: disable
+    exits 1, stop exits 5 for an unknown name). Neither exit code nor stderr is
+    parsed: only the manager's LoadState=not-found with an inactive, cgroup-free
+    unit counts. A loaded unit, a still-running unit whose file was deleted, or
+    an unreadable manager keeps the original stop failure.
+    """
+    try:
+        state = show(BACKEND, "LoadState", "ActiveState", "ControlGroup")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return (
+        state["LoadState"] == "not-found"
+        and state["ActiveState"] == "inactive"
+        and not state["ControlGroup"]
+    )
+
+
+def verify_client_slice() -> None:
+    """Every frontend runs in SLICE and refuses without its exact aggregate cap.
+
+    `systemd-run --slice=` creates a missing slice implicitly with no limits, so
+    an absent or damaged slice fragment only surfaces at the first MCP launch.
+    Activation checks the manager's loaded properties before reporting success.
+    """
+    state = show(SLICE, "LoadState", "MemoryMax", "MemorySwapMax")
+    if (
+        state["LoadState"] != "loaded"
+        or state["MemoryMax"] != str(2 * GIB)
+        or state["MemorySwapMax"] != "0"
+    ):
+        raise ValueError("managed frontend slice unavailable or uncapped; run bootstrap")
 
 
 def disable(path: Path | None) -> None:
@@ -453,6 +490,8 @@ def set_enabled(config: dict, path: Path, enabled: bool) -> None:
         verify_cache(config)
         with verified_binary(Path(config["binary"])):
             pass
+        # Before any state change: nothing to roll back if the slice is unusable.
+        verify_client_slice()
         config["enabled"] = True
         write_settings(path, config, replace=True)
         try:

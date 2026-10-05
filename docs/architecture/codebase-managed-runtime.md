@@ -100,7 +100,11 @@ There is no `repair-units` command. Ordinary bootstrap owns template updates.
 Both uninstall paths stop the fixed backend through the lifecycle helper and
 abort destructive removal if that step fails. They preserve all managed-prefix
 fragments and potential managed application roots (`~/genesis`, `~/.genesis`,
-`~/data`, `~/.qdrant`) when managed evidence exists. Older experimental custom
+`~/data`, `~/.qdrant`) when managed evidence exists: settings, any managed-prefix
+fragment, staging at the documented `--state` location, or any manager state the
+route-selection predicate does not report as definitely absent (runtime,
+generated and transient units included). An unreachable user manager is reported
+and adds no evidence. Older experimental custom
 units and retained roots need explicit operator cleanup. `--full` remains the
 explicit destruction of the entire container and its data.
 

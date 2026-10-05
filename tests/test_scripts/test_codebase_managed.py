@@ -202,6 +202,7 @@ def test_activation_start_failure_rolls_back_and_stops_owned_unit(
     path.write_text(json.dumps(config))
     monkeypatch.setattr(m, "verify_cache", lambda *a: None)
     monkeypatch.setattr(m, "verified_binary", lambda *a: contextlib.nullcontext())
+    monkeypatch.setattr(m, "verify_client_slice", lambda: None)
     actions = []
 
     def manager(*args):
@@ -218,11 +219,13 @@ def test_activation_start_failure_rolls_back_and_stops_owned_unit(
     assert error.value.cmd == "start"
     assert ("rollback stop failed" in capsys.readouterr().err) is stop_fails
     assert m.read_settings(path)["enabled"] is False
-    assert actions == [
+    assert actions[:3] == [
         ("enable", "--now", "genesis-cbm-query.service"),
         ("disable", "--now", "genesis-cbm-query.service"),
         ("stop", "genesis-cbm-query.service"),
     ]
+    # A failed stop consults the manager read-only before keeping the error.
+    assert all(a[0] == "show" for a in actions[3:])
 
 
 def test_activation_preserves_armed_sentinel(tmp_path, config, monkeypatch):
@@ -624,6 +627,7 @@ def test_activation_rollback_attempts_each_step_and_keeps_start_error(
     path.write_text(json.dumps(config))
     monkeypatch.setattr(m, "verify_cache", lambda *a: None)
     monkeypatch.setattr(m, "verified_binary", lambda *a: contextlib.nullcontext())
+    monkeypatch.setattr(m, "verify_client_slice", lambda: None)
     real_write = m.write_settings
     writes = []
 
@@ -653,11 +657,12 @@ def test_activation_rollback_attempts_each_step_and_keeps_start_error(
     if expected is subprocess.CalledProcessError:
         assert error.value.cmd == "start"
     assert writes == [True, False]
-    assert actions == [
+    assert actions[:3] == [
         ("enable", "--now", "genesis-cbm-query.service"),
         ("disable", "--now", "genesis-cbm-query.service"),
         ("stop", "genesis-cbm-query.service"),
     ]
+    assert all(a[0] == "show" for a in actions[3:])
     if fault == "start-oserror":
         assert m.read_settings(path)["enabled"] is False
     else:
