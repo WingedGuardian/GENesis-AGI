@@ -103,6 +103,10 @@ _remote_browser = None  # CDP Browser connection
 _remote_page = None  # Active page on user's remote Chrome
 _remote_cdp_url: str | None = None  # e.g. "http://100.x.y.z:9222"
 _remote_last_url: str | None = None  # URL at last Genesis action (drift detection)
+# CDP target id of the tab Genesis opened in the user's Chrome. Survives a
+# disconnect and cleanup on purpose: the tab is never closed (owner ruling), so
+# a reconnect finds it again and reuses it instead of opening another one.
+_remote_target_id: str | None = None
 
 # Layer 4: TinyFish cloud browser (on-demand CDP, paid credits)
 _tinyfish_pw = None  # Playwright instance for TinyFish session
@@ -338,7 +342,10 @@ async def _cleanup_remote_cdp() -> None:
     """Disconnect from remote Chrome. Does NOT close the user's browser.
 
     Playwright's browser.close() on a CDP connection is a disconnect only —
-    it does NOT terminate the remote Chrome process.
+    it does NOT terminate the remote Chrome process, and it does not close the
+    Genesis tab either (it lives in the user's own context). The tab is left
+    open on purpose and ``_remote_target_id`` is kept, so the next connect
+    reuses it.
     """
     global _remote_pw, _remote_browser, _remote_page, _remote_last_url
 
@@ -370,7 +377,8 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
     Returns the active remote page. The user must have Chrome running with
     ``--remote-debugging-port=9222``. Connection is via Tailscale IP.
 
-    Does NOT launch Chrome. Does NOT close the user's existing tabs.
+    Does NOT launch Chrome. Works in a tab of its own (see
+    _genesis_remote_tab) and never navigates or closes the user's tabs.
     On disconnect, clears state — next call gets a clear error.
     """
     global _remote_pw, _remote_browser, _remote_page, _remote_cdp_url
@@ -424,35 +432,85 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
 
         _remote_cdp_url = url
         _remote_browser.on("disconnected", lambda: _on_remote_disconnected())
-
-        # Find user's existing visible tab — never create phantom windows.
-        # connect_over_cdp() may create its own default context whose pages
-        # render in an invisible off-screen window.  Scan ALL contexts for a
-        # real Chrome page (chrome://newtab, about:blank, or any http(s) URL)
-        # and prefer that over Playwright's auto-created context.
-        _remote_page = None
-        for ctx in _remote_browser.contexts:
-            for pg in ctx.pages:
-                page_url = pg.url
-                if page_url.startswith(("chrome://", "about:", "http://", "https://")):
-                    _remote_page = pg
-                    logger.info("CDP remote connected — using existing tab: %s", page_url)
-                    break
-            if _remote_page is not None:
-                break
-
-        if _remote_page is None:
-            # No existing tab found — create in first available context
-            contexts = _remote_browser.contexts
-            if contexts:
-                _remote_page = await contexts[0].new_page()
-                logger.info("CDP remote connected — created new tab")
-            else:
-                ctx = await _remote_browser.new_context()
-                _remote_page = await ctx.new_page()
-                logger.info("CDP remote connected — created new context and tab")
-
+        try:
+            _remote_page = await _genesis_remote_tab(_remote_browser)
+        except BaseException as e:
+            # Connected but no usable tab (Chrome closed, the context refused a
+            # page, or the tool timeout cancelled the call): disconnect and stop
+            # this driver now, or the next attempt starts another and the first
+            # leaks. _remote_target_id is kept, so a retry still reuses the
+            # Genesis tab if it exists. The cleanup is shielded so a cancellation
+            # cannot cut it short.
+            await asyncio.shield(_cleanup_remote_cdp())
+            if not isinstance(e, Exception):
+                raise  # cancellation / interpreter exit: propagate as is
+            raise ConnectionError(
+                f"Connected to Chrome at {url} but could not open the Genesis tab: {e}"
+            ) from e
         return _remote_page
+
+
+async def _cdp_target_id(page) -> str | None:
+    """The CDP target id of a Chromium page, or None if it cannot be read."""
+    try:
+        session = await page.context.new_cdp_session(page)
+        try:
+            info = await session.send("Target.getTargetInfo")
+        finally:
+            with contextlib.suppress(Exception):
+                await session.detach()
+        return info["targetInfo"]["targetId"]
+    except Exception:
+        # Warning, not debug: a None here means the Genesis tab cannot be found
+        # again, so every reconnect would silently open another tab.
+        logger.warning("Could not read the CDP target id of a remote tab", exc_info=True)
+        return None
+
+
+async def _genesis_remote_tab(remote_browser):
+    """Return Genesis's own tab in the user's Chrome, opening it if needed.
+
+    One Genesis tab per session (owner ruling): the user's tabs are never
+    navigated. A tab opened earlier is found again by its CDP target id and
+    reused; if the user closed it, a new one is opened. Genesis never closes
+    it: the user may still be reading it.
+
+    The tab opens in the context that already holds the user's visible tabs.
+    ``browser.new_context()`` is the last resort only, because over CDP its
+    pages render in an invisible off-screen window.
+    """
+    global _remote_target_id
+
+    contexts = list(remote_browser.contexts)
+    if _remote_target_id is not None:
+        for ctx in contexts:
+            # Newest first: the Genesis tab was opened after the user's tabs,
+            # so this usually finds it without probing every user tab.
+            for pg in reversed(ctx.pages):
+                if await _cdp_target_id(pg) == _remote_target_id:
+                    logger.info("CDP remote connected, reusing the Genesis tab: %s", pg.url)
+                    return pg
+
+    home = next(
+        (
+            ctx for ctx in contexts
+            if any(
+                pg.url.startswith(("chrome://", "about:", "http://", "https://"))
+                for pg in ctx.pages
+            )
+        ),
+        contexts[0] if contexts else None,
+    )
+    if home is None:
+        logger.warning(
+            "Remote Chrome exposes no browser context; opening one, whose tab "
+            "may not be visible on the user's screen"
+        )
+        home = await remote_browser.new_context()
+    page = await home.new_page()
+    _remote_target_id = await _cdp_target_id(page)
+    logger.info("CDP remote connected, opened a Genesis tab (target %s)", _remote_target_id)
+    return page
 
 
 async def _cleanup_tinyfish():
@@ -898,6 +956,11 @@ async def _get_page(
     return _active_page, is_new_tinyfish
 
 
+# Prefixes of the text _snapshot_page returns when there is no snapshot. An
+# aria snapshot is YAML ("- heading ..."), so it never starts with "(".
+_SNAPSHOT_PLACEHOLDERS = ("(snapshot timed out", "(snapshot unavailable")
+
+
 async def _snapshot_page(page) -> str:
     """Get accessibility tree snapshot of the current page."""
     try:
@@ -906,9 +969,9 @@ async def _snapshot_page(page) -> str:
         )
     except TimeoutError:
         logger.warning("Snapshot timed out (15s) — page accessibility tree stuck")
-        return "(snapshot timed out after 15s)"
+        return _SNAPSHOT_PLACEHOLDERS[0] + " after 15s)"
     except Exception as e:
-        return f"(snapshot unavailable: {e})"
+        return f"{_SNAPSHOT_PLACEHOLDERS[1]}: {e})"
 
 
 # ---------------------------------------------------------------------------
@@ -2113,17 +2176,17 @@ async def _impl_browser_navigate(
     tinyfish: bool = False,
 ) -> dict:
     """Navigate to a URL and return the page snapshot."""
-    global _collaborate_mode, _remote_last_url
+    global _remote_last_url
     _touch()
     _ts_log.info("browser_navigate called: url=%s stealth=%s remote=%s tinyfish=%s", url, stealth, remote, tinyfish)
 
     if tinyfish and remote:
         return {"error": "Cannot use tinyfish and remote simultaneously — pick one."}
 
-    # Auto-enable collaborate timing for remote CDP (user watching their screen)
-    if remote and not _collaborate_mode:
-        _collaborate_mode = True
-        logger.info("Auto-enabled collaborate timing for remote CDP session")
+    # No timing switch for remote CDP: _human_delay already uses collaborate
+    # timing (0.5-2 s) whenever the remote page is active, whatever
+    # _collaborate_mode says. Switching the flag on here only made fast timing
+    # stick to later Camoufox work (and survive a failed remote connect).
 
     try:
         page, is_new_tinyfish = await _get_page(
@@ -2335,7 +2398,16 @@ async def _impl_browser_snapshot() -> dict:
             return health
         page = _active_page
     try:
+        url_before = page.url
         snapshot = await _snapshot_page(page)
+        # Remote: the caller has now seen the current page, so it becomes the
+        # drift baseline. This is what the drift advisory's "call
+        # browser_snapshot()" recommendation relies on. Only a REAL snapshot
+        # counts (a timed-out or unavailable one showed the caller nothing),
+        # and only if the URL held still while it was taken: a navigation in
+        # between means the snapshot may describe the old page.
+        if not snapshot.startswith(_SNAPSHOT_PLACEHOLDERS) and page.url == url_before:
+            _update_remote_url()
         return {"url": page.url, "title": await page.title(), "snapshot": snapshot}
     except Exception as e:
         return {"error": f"Snapshot failed: {e}"}
@@ -2448,9 +2520,12 @@ async def browser_navigate(
 
     Set remote=True to drive the user's real Chrome over CDP/Tailscale.
     This connects to Chrome running on the user's machine with
-    --remote-debugging-port=9222. Real browser = real fingerprint = no detection.
-    Collaborate timing is auto-enabled. Use for ATS submissions with aggressive
-    anti-bot detection (Ashby, Greenhouse with reCAPTCHA v3).
+    --remote-debugging-port=9222 and works in a tab of its own (one per
+    session, reused on reconnect, never closed; the user's tabs are not
+    touched). Real Chrome fingerprint and the user's IP, but not invisible:
+    CDP control is itself detectable and clicks are not humanized. Remote
+    actions always use collaborate timing (0.5-2 s); the setting is untouched.
+    Use when fingerprint scoring blocks Camoufox and the user is available.
 
     Set tinyfish=True for a cloud-hosted browser via TinyFish Browser API.
     Fresh isolated Chromium on each session. Paid: 1 credit per 4 minutes.
@@ -2625,6 +2700,11 @@ async def browser_collaborate(enable: bool = True) -> dict:
 
     No browser restart. No page state loss. Just a timing change.
     """
+    return _impl_browser_collaborate(enable)
+
+
+def _impl_browser_collaborate(enable: bool = True) -> dict:
+    """Set the timing profile explicitly (see browser_collaborate)."""
     global _collaborate_mode
 
     _collaborate_mode = enable
