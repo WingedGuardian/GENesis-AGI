@@ -52,7 +52,9 @@
 #     own session; launched detached (as below) it cannot, since its parent is
 #     the user manager, so a session the server started must hand a restart off.
 #     The scan is the last step before the stop or restart, but a session the
-#     server spawns in the moments between them is still ended unlisted (#2870).
+#     server spawns in the moments between them is still ended unlisted (#2870),
+#     and so is the short tail other subsystems run after their Claude call
+#     returns (a chat turn saving and delivering its reply, for one: #2917).
 #     A server that is not running has no sessions to end. Just
 #     before the restart, four of these are checked again (HEAD must be the
 #     exact commit this run checked, on main; no tracked change; no untracked
@@ -308,7 +310,8 @@ _untracked_runtime() {
 #     (GET /api/genesis/inflight, with the internal API token): every Claude
 #     invocation, plus the whole life of a dispatched session or a CLI
 #     reflection, from before its Claude process starts until after its result
-#     is delivered. Named by the id the server gives it. A server that answers
+#     is delivered. Named by the id the server gives it. NOT covered: what other
+#     subsystems do after their invocation returns (#2917). A server that answers
 #     404 predates the report (the first deploy of this change); the process scan
 #     alone then decides, and says so;
 #   - the server's live Claude Code process DESCENDANTS, each named <pid>@<start>
@@ -440,8 +443,12 @@ _refuse_if_sessions() {
         echo "ERROR: genesis-server is running Claude Code sessions it launched, and a restart ends them:"
         printf '%s' "$listing"
         echo "  Nothing changed. Wait for them to finish, or pass --allow-killing with what is listed"
-        if [ -n "$all_items" ]; then
+        # An item that cannot be named (an unsafe id, or one past the listing cap)
+        # can only be covered by `all`: naming the rest would refuse again.
+        if [ -n "$all_items" ] && [[ "$unlisted" != *"(unnamed)"* && "$unlisted" != *"(more)"* ]]; then
             echo "  (here: --allow-killing ${all_items#,}) to restart anyway; uncovered now:$unlisted."
+        elif [ -n "$all_items" ]; then
+            echo "  (some of these cannot be named, so only --allow-killing all covers them) to restart anyway."
         else
             echo "  (none of these can be named: --allow-killing all) to restart anyway."
         fi

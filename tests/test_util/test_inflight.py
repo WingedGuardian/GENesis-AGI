@@ -183,6 +183,75 @@ async def test_a_dispatched_session_is_registered_by_its_id_for_its_whole_run(db
     assert snapshot() == []
 
 
+async def test_a_dispatched_session_is_registered_before_its_task_first_runs(db):
+    """spawn() returns once the row exists and the task is scheduled; shutdown
+    cancels it from then on, so the report must name it before the task has had
+    a single step."""
+    from genesis.cc.direct_session import DirectSessionRequest, DirectSessionRunner
+    from genesis.cc.session_manager import SessionManager
+
+    sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
+    runner = DirectSessionRunner(
+        invoker=AsyncMock(), session_manager=sm, config_builder=AsyncMock(), runtime=object()
+    )
+    started = []
+
+    async def fake_run(_req, _sid):
+        started.append(True)
+
+    runner._run_session = fake_run
+    sid = await runner.spawn(
+        DirectSessionRequest(prompt="x", profile="research", source_tag="probe")
+    )
+    assert not started, "the task ran before the check below; the test proves nothing"
+    assert _ids() == [sid]
+    await asyncio.gather(runner._active.get(sid) or asyncio.sleep(0))
+    await asyncio.sleep(0)
+    assert snapshot() == [], "the unit closes with its task"
+
+
+async def test_a_claude_call_inside_a_dispatched_session_is_part_of_it(db):
+    from genesis.cc.direct_session import DirectSessionRequest, DirectSessionRunner
+    from genesis.cc.session_manager import SessionManager
+
+    sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
+    runner = DirectSessionRunner(
+        invoker=AsyncMock(), session_manager=sm, config_builder=AsyncMock(), runtime=object()
+    )
+    seen: list[list[str]] = []
+
+    async def fake_run(_req, _sid):
+        with inflight("claude", "the session's call"):
+            seen.append(_ids())
+
+    runner._run_session = fake_run
+    sid = await runner.spawn(DirectSessionRequest(prompt="x", profile="research"))
+    await asyncio.gather(runner._active.get(sid) or asyncio.sleep(0))
+    assert seen == [[sid]], "one piece of work is one item"
+
+
+async def test_a_session_cancelled_before_it_starts_is_released(db):
+    from genesis.cc.direct_session import DirectSessionRequest, DirectSessionRunner
+    from genesis.cc.session_manager import SessionManager
+
+    sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
+    runner = DirectSessionRunner(
+        invoker=AsyncMock(), session_manager=sm, config_builder=AsyncMock(), runtime=object()
+    )
+
+    async def fake_run(_req, _sid):
+        await asyncio.sleep(3600)
+
+    runner._run_session = fake_run
+    sid = await runner.spawn(DirectSessionRequest(prompt="x", profile="research"))
+    task = runner._active[sid]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+    assert snapshot() == []
+
+
 async def test_a_cli_reflection_stays_registered_through_its_post_processing(db):
     """The session's row is marked completed before the corpus recording and the
     routing that follow it, which a restart also cancels: the unit spans them."""

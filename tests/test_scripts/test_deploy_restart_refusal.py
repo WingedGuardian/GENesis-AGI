@@ -263,6 +263,16 @@ def test_an_item_whose_id_cannot_be_named_needs_all(station):
     assert r.returncode == 0, r.stderr
 
 
+def test_an_unnameable_item_beside_named_ones_recommends_all(station):
+    """Naming the nameable items cannot cover the one that has no safe name, so
+    the hint must not offer them: the next run would refuse again."""
+    items = [_item(), _item(iid="x; rm -rf /", kind="claude")]
+    r = _run(station, "restart", env=_report(station, items))
+    assert r.returncode == 1
+    assert "only --allow-killing all covers them" in r.stderr
+    assert f"--allow-killing {SID1}" not in r.stderr
+
+
 def test_the_reported_listing_is_bounded(station):
     items = [_item(iid=f"claude-{i}", kind="claude", age=1000 - i) for i in range(25)]
     r = _run(station, "restart", env=_report(station, items))

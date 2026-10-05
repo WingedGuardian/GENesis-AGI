@@ -45,7 +45,7 @@ from genesis.cc.types import (
     origin_delivery_supported,
 )
 from genesis.observability.session_context import set_session_id as _set_obs_session
-from genesis.util.inflight import inflight
+from genesis.util.inflight import close_unit, open_unit, within
 from genesis.util.tasks import tracked_task
 
 if TYPE_CHECKING:
@@ -1009,12 +1009,22 @@ class DirectSessionRunner:
         )
         session_id = session["id"]
 
-        task = tracked_task(
-            self._run_session_registered(request, session_id),
-            name=f"direct-session-{session_id[:8]}",
-        )
+        # Registered HERE, before the task is scheduled: a restart check that runs
+        # between this return and the task's first step must still see it, since
+        # shutdown cancels it from the moment it is in _active.
+        label = f"{request.source_tag or 'direct_session'} ({request.profile})"
+        unit = open_unit("direct_session", label, item_id=session_id)
+        try:
+            task = tracked_task(
+                self._run_session_registered(request, session_id, unit),
+                name=f"direct-session-{session_id[:8]}",
+            )
+        except BaseException:
+            close_unit(unit)
+            raise
         self._active[session_id] = task
         task.add_done_callback(lambda _t: self._active.pop(session_id, None))
+        task.add_done_callback(lambda _t, _unit=unit: close_unit(_unit))
         return session_id
 
     def active_count(self) -> int:
@@ -1024,13 +1034,14 @@ class DirectSessionRunner:
         self,
         request: DirectSessionRequest,
         session_id: str,
+        unit: str,
     ) -> DirectSessionResult:
-        """``_run_session`` registered as in-flight work for its WHOLE life: the
-        wait for a runner slot, the Claude run, and the storing, auditing and
-        delivery after it. ``shutdown`` cancels it anywhere in that span, so a
-        restart asks about all of it (genesis.util.inflight)."""
-        label = f"{request.source_tag or 'direct_session'} ({request.profile})"
-        with inflight("direct_session", label, item_id=session_id):
+        """``_run_session`` as part of the in-flight unit ``spawn`` opened for it
+        (genesis.util.inflight), so its WHOLE life is reported: the wait for a
+        runner slot, the Claude run, and the storing, auditing and delivery after
+        it. ``shutdown`` cancels it anywhere in that span. The unit closes when
+        the task does (a done-callback), whichever way it ends."""
+        with within(unit):
             return await self._run_session(request, session_id)
 
     async def shutdown(self, *, grace_s: float = 10.0) -> int:

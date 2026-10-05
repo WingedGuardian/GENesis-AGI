@@ -19,6 +19,12 @@ Registration is by context manager around a UNIT OF WORK:
   it always registers its own work: absorbing it would let it vanish from the
   report the moment its parent ends.
 
+What it does NOT cover: a subsystem that does its own work after the
+invocation returns without wrapping it (a chat turn saving and delivering its
+reply, inbox or mail post-processing) is reported only while its Claude call
+runs. That tail belongs at the server's shutdown, not in more registrations
+(#2917).
+
 Process-local and in memory on purpose: it describes THIS process, and a
 restart that empties it is exactly the event it reports on.
 """
@@ -35,7 +41,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 
-__all__ = ["InflightItem", "inflight", "snapshot"]
+__all__ = ["InflightItem", "close_unit", "inflight", "open_unit", "snapshot", "within"]
 
 
 @dataclass(frozen=True)
@@ -89,19 +95,45 @@ def inflight(kind: str, label: str = "", item_id: str | None = None) -> Iterator
         if live and outer_task is here:
             yield outer_id
             return
+    iid = open_unit(kind, label, item_id)
+    token = _enclosing.set((iid, here))
+    try:
+        yield iid
+    finally:
+        _enclosing.reset(token)
+        close_unit(iid)
+
+
+def open_unit(kind: str, label: str = "", item_id: str | None = None) -> str:
+    """Register a unit NOW and return its id, for work whose life does not fit one
+    ``with`` block: a dispatched session is registered when it is accepted, before
+    its task first runs, so there is no moment where the runner holds it and the
+    report does not. Pair with ``close_unit`` (a task's done-callback, say) and run
+    the work ``within`` it."""
     with _lock:
         iid = item_id or f"{kind}-{_BOOT}-{next(_counter)}"
         if iid in _items:
             # A caller reused an id: keep both visible rather than hide one.
             iid = f"{iid}-{next(_counter)}"
         _items[iid] = InflightItem(id=iid, kind=kind, label=label, started_at=time.time())
-    token = _enclosing.set((iid, here))
+    return iid
+
+
+def close_unit(iid: str) -> None:
+    """End a unit opened with ``open_unit``. Closing an unknown id is a no-op."""
+    with _lock:
+        _items.pop(iid, None)
+
+
+@contextmanager
+def within(iid: str) -> Iterator[str]:
+    """Run the current task's work as part of an already-open unit (``open_unit``):
+    work inside it, in this task, is absorbed rather than registered again."""
+    token = _enclosing.set((iid, _task()))
     try:
         yield iid
     finally:
         _enclosing.reset(token)
-        with _lock:
-            _items.pop(iid, None)
 
 
 def snapshot() -> list[InflightItem]:
