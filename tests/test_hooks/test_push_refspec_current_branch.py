@@ -409,6 +409,7 @@ def test_a_close_then_repush_is_reported(monkeypatch, tmp_path, capsys) -> None:
 
 
 def test_configured_push_refspec_remapping_keeps_the_ask(monkeypatch, tmp_path, capsys) -> None:
+    """Cover an explicit remote with no refspec, outside the matrix below."""
     decision, reason = _run(
         monkeypatch,
         tmp_path,
@@ -423,7 +424,7 @@ def test_configured_push_refspec_remapping_keeps_the_ask(monkeypatch, tmp_path, 
 
 
 def test_push_default_upstream_remapping_keeps_the_ask(monkeypatch, tmp_path, capsys) -> None:
-    """A bare push with upstream tracking main must not ride the feature approval."""
+    """Cover a bare push, outside the explicit-refspec matrix below."""
     decision, reason = _run(
         monkeypatch,
         tmp_path,
@@ -442,20 +443,156 @@ def test_push_default_upstream_remapping_keeps_the_ask(monkeypatch, tmp_path, ca
     assert "publishing externally" in reason
 
 
-def test_fully_qualified_destination_uses_the_dry_run_refset(
-    monkeypatch, tmp_path, capsys
+@pytest.mark.parametrize(
+    ("command", "config", "git_setup", "flag", "src", "dst"),
+    [
+        (
+            "git push origin feat/x",
+            ("remote.origin.push", "refs/heads/feat/x:refs/heads/main"),
+            None,
+            "*",
+            "refs/heads/feat/x",
+            "refs/heads/main",
+        ),
+        (
+            "git push origin refs/heads/feat/x",
+            ("remote.origin.push", "refs/heads/feat/x:refs/heads/main"),
+            None,
+            "*",
+            "refs/heads/feat/x",
+            "refs/heads/main",
+        ),
+        (
+            "git push -u origin HEAD",
+            ("remote.origin.push", "refs/heads/feat/x:refs/heads/main"),
+            None,
+            "=",
+            "HEAD",
+            "refs/heads/feat/x",
+        ),
+        (
+            "git push origin @",
+            ("remote.origin.push", "refs/heads/feat/x:refs/heads/main"),
+            None,
+            "=",
+            "HEAD",
+            "refs/heads/feat/x",
+        ),
+        (
+            "git push origin HEAD:refs/heads/feat/x",
+            ("remote.origin.push", "refs/heads/feat/x:refs/heads/main"),
+            None,
+            "=",
+            "HEAD",
+            "refs/heads/feat/x",
+        ),
+        (
+            "git push origin feat/x",
+            ("push.default", "upstream"),
+            [
+                ["push", "--no-verify", "origin", "feat/x:refs/heads/main"],
+                ["fetch", "origin", "main"],
+                ["branch", "--set-upstream-to=origin/main", "feat/x"],
+            ],
+            "=",
+            "refs/heads/feat/x",
+            "refs/heads/main",
+        ),
+        (
+            "git push origin refs/heads/feat/x",
+            ("push.default", "upstream"),
+            [
+                ["push", "--no-verify", "origin", "feat/x:refs/heads/main"],
+                ["fetch", "origin", "main"],
+                ["branch", "--set-upstream-to=origin/main", "feat/x"],
+            ],
+            "=",
+            "refs/heads/feat/x",
+            "refs/heads/main",
+        ),
+        (
+            "git push -u origin HEAD",
+            ("push.default", "upstream"),
+            [
+                ["push", "--no-verify", "origin", "feat/x:refs/heads/main"],
+                ["fetch", "origin", "main"],
+                ["branch", "--set-upstream-to=origin/main", "feat/x"],
+            ],
+            "=",
+            "HEAD",
+            "refs/heads/feat/x",
+        ),
+        (
+            "git push origin @",
+            ("push.default", "upstream"),
+            [
+                ["push", "--no-verify", "origin", "feat/x:refs/heads/main"],
+                ["fetch", "origin", "main"],
+                ["branch", "--set-upstream-to=origin/main", "feat/x"],
+            ],
+            "=",
+            "HEAD",
+            "refs/heads/feat/x",
+        ),
+        (
+            "git push origin HEAD:refs/heads/feat/x",
+            ("push.default", "upstream"),
+            [
+                ["push", "--no-verify", "origin", "feat/x:refs/heads/main"],
+                ["fetch", "origin", "main"],
+                ["branch", "--set-upstream-to=origin/main", "feat/x"],
+            ],
+            "=",
+            "HEAD",
+            "refs/heads/feat/x",
+        ),
+    ],
+    ids=[
+        "remote-push-short-branch",
+        "remote-push-full-branch",
+        "remote-push-set-upstream",
+        "remote-push-at",
+        "remote-push-qualified",
+        "default-upstream-short-branch",
+        "default-upstream-full-branch",
+        "default-upstream-set-upstream",
+        "default-upstream-at",
+        "default-upstream-qualified",
+    ],
+)
+def test_push_config_that_remaps_the_ref_keeps_the_ask(
+    monkeypatch, tmp_path, capsys, command, config, git_setup, flag, src, dst
 ) -> None:
+    """MEASURED with git 2.34.1:
+    remote.origin.push=refs/heads/feat/x:refs/heads/main: short/full ``*\\trefs/heads/feat/x:refs/heads/main\\t[new branch]``; HEAD/@/qualified ``=\\tHEAD:refs/heads/feat/x\\t[up to date]``.
+    push.default=upstream tracking origin/main: short/full ``=\\trefs/heads/feat/x:refs/heads/main\\t[up to date]``; HEAD/@/qualified ``=\\tHEAD:refs/heads/feat/x\\t[up to date]``.
+    """
+    dry_runs = []
+    real_dry_run = gpg._push_dry_run
+
+    def capture_dry_run(positionals, cwd):
+        result = real_dry_run(positionals, cwd)
+        dry_runs.append(result)
+        return result
+
+    monkeypatch.setattr(gpg, "_push_dry_run", capture_dry_run)
     decision, reason = _run(
         monkeypatch,
         tmp_path,
         capsys,
-        "git push origin HEAD:refs/heads/feat/x",
+        command,
         republish=True,
         open_prs=1,
-        config=("remote.origin.push", "refs/heads/feat/x:refs/heads/main"),
+        config=config,
+        git_setup=git_setup,
     )
-    assert decision == "allow", reason
-    assert "re-push to 'feat/x'" in reason
+    assert len(dry_runs) == 1
+    blocks = dry_runs[0]
+    assert blocks is not None and len(blocks) == 1
+    assert len(blocks[0].refs) == 1
+    ref = blocks[0].refs[0]
+    assert (ref.flag, ref.src, ref.dst) == (flag, src, dst)
+    assert decision == ("ask" if dst == "refs/heads/main" else "allow"), reason
 
 
 _SIDE_CHANNELS = [
@@ -506,6 +643,7 @@ def test_side_channel_config_keeps_the_ask_for_every_spelling(
     assert "publishing externally" in reason
 
 
+@pytest.mark.parametrize("command", ["git push origin", "git push -u origin HEAD"])
 @pytest.mark.parametrize(
     "setup",
     [
@@ -513,16 +651,17 @@ def test_side_channel_config_keeps_the_ask_for_every_spelling(
         ["remote", "set-url", "--add", "origin", "https://example.invalid/second.git"],
     ],
 )
-def test_a_remote_with_several_urls_keeps_the_ask(monkeypatch, tmp_path, capsys, setup) -> None:
+def test_a_remote_with_several_urls_keeps_the_ask(
+    monkeypatch, tmp_path, capsys, command, setup
+) -> None:
     """Audit finding, MEASURED in a lab: two `url` entries give equal fetch and
-    push URL sets, ls-remote hit on the first, and `git push origin HEAD`
-    created the branch on the second — a first publication the equality alone
-    let through."""
+    push URL sets and ls-remote hits only the first, while either spelling
+    pushes to both."""
     decision, reason = _run(
         monkeypatch,
         tmp_path,
         capsys,
-        "git push origin",
+        command,
         republish=True,
         open_prs=1,
         git_setup=[setup],

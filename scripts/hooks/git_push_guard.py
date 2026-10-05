@@ -10417,40 +10417,40 @@ _SAFE_RECURSE_SUBMODULES = frozenset({"no", "false", "off", "0", "check"})
 
 
 def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
-    """Reject execution-side config before Git's dry run can invoke its helpers."""
+    """Reject config that could hide push-side effects from the dry run."""
     if not remote:
         return False
     base = ["git"] + (["-C", cwd] if cwd else [])
-    for key in (
-        f"remote.{remote}.receivepack",
-        "push.recurseSubmodules",
-    ):
-        got = _git_config_get(base, key)
-        if got is None:
-            return False
-        rc, out = got
-        if rc == 0 and (
-            (key == f"remote.{remote}.receivepack" and bool(out))
-            or (
-                key == "push.recurseSubmodules"
-                and out.lower() not in _SAFE_RECURSE_SUBMODULES
-            )
-        ):
-            return False
-    for key in ("submodule.recurse", "push.gpgSign"):
-        got = _git_config_get(base, key, as_bool=key == "submodule.recurse")
-        if got is None:
-            return False
-        rc, out = got
-        if rc == 0 and (
-            (key == "submodule.recurse" and out == "true")
-            or (
-                key == "push.gpgSign"
-                and out.lower() not in ("false", "no", "off", "0")
-            )
-        ):
-            return False
-    return True
+    # A receivepack helper can execute even during a dry run.
+    got = _git_config_get(base, f"remote.{remote}.receivepack")
+    if got is None:
+        return False
+    rc, out = got
+    if rc == 0 and out:
+        return False
+
+    # Empty recurse settings are not in the known no-recursion set.
+    got = _git_config_get(base, "push.recurseSubmodules")
+    if got is None:
+        return False
+    rc, out = got
+    if rc == 0 and out.lower() not in _SAFE_RECURSE_SUBMODULES:
+        return False
+
+    # A true value can trigger recursive pushes that porcelain cannot show.
+    got = _git_config_get(base, "submodule.recurse", as_bool=True)
+    if got is None:
+        return False
+    rc, out = got
+    if rc == 0 and out == "true":
+        return False
+
+    # Empty signing settings are not among the explicitly safe values.
+    got = _git_config_get(base, "push.gpgSign")
+    if got is None:
+        return False
+    rc, out = got
+    return rc != 0 or out.lower() in ("false", "no", "off", "0")
 
 
 class _DryRunRef(NamedTuple):
@@ -10506,6 +10506,7 @@ def _parse_push_porcelain(out: str) -> tuple[_DryRunBlock, ...] | None:
 def _push_dry_run(
     positionals: list[str], cwd: str | None
 ) -> tuple[_DryRunBlock, ...] | None:
+    """Append positionals; --no-verify skips hooks, --recurse-submodules=no avoids recursion; fail closed."""
     argv = (
         ["git"]
         + (["-C", cwd] if cwd else [])
@@ -10534,13 +10535,15 @@ def _push_dry_run(
     return _parse_push_porcelain(result.stdout)
 
 
+_SCP_LIKE_URL_RE = re.compile(r"^[^/@:]+@[^/:]+:")
+
+
 def _same_push_destination(a: str, b: str) -> bool:
     if a == b:
         return True
-    scp_like = re.compile(r"^[^/@:]+@[^/:]+:")
     network_prefixes = ("https://", "http://", "ssh://", "git://")
-    a_network = a.lower().startswith(network_prefixes) or scp_like.match(a) is not None
-    b_network = b.lower().startswith(network_prefixes) or scp_like.match(b) is not None
+    a_network = a.lower().startswith(network_prefixes) or _SCP_LIKE_URL_RE.match(a) is not None
+    b_network = b.lower().startswith(network_prefixes) or _SCP_LIKE_URL_RE.match(b) is not None
     if not a_network or not b_network:
         return False
     # INFERRED: Git porcelain's `To` line may anonymize URL userinfo.

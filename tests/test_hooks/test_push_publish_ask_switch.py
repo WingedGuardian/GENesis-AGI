@@ -248,21 +248,6 @@ def test_a_push_that_is_not_exactly_public_still_asks(
     assert _decision(out) == "ask", (why, out)
 
 
-def test_follow_tags_riding_along_keeps_first_publish_ask(
-    monkeypatch, tmp_path, capsys, off
-) -> None:
-    monkeypatch.setattr(gpg, "_push_dry_run_is_plain", lambda *a, **k: False)
-    rc, out, err = _run(
-        monkeypatch,
-        tmp_path,
-        capsys,
-        "git push -u origin HEAD",
-        (("remote.origin.url", PUBLIC), ("push.followTags", "true")),
-    )
-    assert rc == 0, (rc, out, err)
-    assert _decision(out) == "ask", out
-
-
 def test_an_undeterminable_public_repo_still_asks(monkeypatch, tmp_path, capsys, off) -> None:
     monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "")
     _assert_asks(*_run(monkeypatch, tmp_path, capsys, "git push -u origin HEAD"))

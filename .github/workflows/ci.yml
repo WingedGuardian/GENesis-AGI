@@ -1113,9 +1113,9 @@ jobs:
         # NVIDIA provider health: new test_provider_health_probes.py collects
         # 87 tests (0 -> 87); no added skips. Floor: 24245 + 87 = 24332.
         # Push dry-run refset (#2565): --collect-only on main vs this branch:
-        #   test_push_refspec_current_branch.py  199 -> 227  (+28)
+        #   test_push_refspec_current_branch.py  199 -> 237  (+38)
         #   test_merge_review_gate.py            519 -> 517   (-2)
-        #   test_push_publish_ask_switch.py      136 -> 136   (+0)
+        #   test_push_publish_ask_switch.py      136 -> 135   (-1)
         #   test_push_pr_adjacency.py             61 -> 61    (+0)
-        # Net +26. Floor: 24421 + 26 = 24447; skip ceiling remains 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24447
+        # Net +35. Floor: 24421 + 35 = 24456; skip ceiling remains 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24456
