@@ -444,8 +444,11 @@ blocks, not your reading of the findings.
 - Doc-path findings never score under the default `doc_findings: skip`
   (an install can change it with `merge_gate.doc_findings`). That covers every
   `*.md`, including skill and agent files.
-- Findings under the lane threshold do not block.
-- If nothing outstanding scores and the rest of the gate passes, the next step
+- Below-floor findings (Codex P2, Devin non-severe, CodeRabbit Minor) do not
+  block while their score stays under the lane threshold. Floor findings (a
+  Codex P1, a CodeRabbit Critical or Major, a Devin severe finding) block
+  whatever the score.
+- If no finding blocks and the rest of the gate passes, the next step
   is the merge ask to the owner. Answer the findings in-thread rather than
   fix-and-re-review. A finding you accept as real still gets fixed (with the
   owner's yes) or filed; it is never only answered.
