@@ -990,7 +990,7 @@ def test_an_extras_gap_recorded_by_a_run_that_died_is_announced_next_run(backup_
     offsite.mkdir()
     env = {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/missing", **_TELEGRAM}
     _shim(backup_env, "git", "add -A")  # the Tier-1 commit step fails after Tier 2
-    first = _run_local(backup_env, offsite, env)
+    _run_local(backup_env, offsite, env)
     s1 = _status(backup_env)  # only the generic backup-failed alert went out
     assert s1["extras_complete"] is False and s1["extras_alerted_gap"] == "", s1
     (backup_env["bind"] / "git").unlink()
