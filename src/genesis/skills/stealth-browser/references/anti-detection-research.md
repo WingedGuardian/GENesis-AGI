@@ -1,127 +1,106 @@
 # Anti-Detection Research Summary
 
-Compiled: 2026-04-22. Source: web research + bot detection literature.
+Compiled 2026-04-22 from web research and bot-detection literature; revised
+2026-10-04. Every number carries its source, or is marked **unsourced**
+(community lore, kept as a hint, never as a fact to tune against).
 
-## Fingerprinting (browser engine handles this)
+## Fingerprinting (the browser engine's job)
 
-Modern anti-detection browsers (Camoufox, Patchright) handle:
-- Navigator/screen/WebGL/canvas/audio fingerprinting
-- Font enumeration spoofing
-- Playwright sandboxing removal
-- Headless mode masking
-- HTTP header normalization
-- WebRTC IP leak prevention
-- BrowserForge statistical fingerprint generation
+Anti-detection browsers (Camoufox for Firefox, patchright for Chromium) cover
+navigator/screen/WebGL/canvas/audio values, font lists, automation flags,
+WebRTC leaks and statistically consistent fingerprints (BrowserForge-style
+generation).
 
-**Known gaps (as of 2026-04):**
-- Camoufox has a maintenance gap — base Firefox version slightly outdated
-- Cannot masquerade as Chrome (SpiderMonkey vs V8 is unfakeable)
-- Canvas spoofing quality has degraded in recent versions
+Known gaps:
+- **Camoufox maintenance:** upstream paused roughly January-April 2026 and the
+  engine fell behind (upstream called the Firefox 135 build out of date on
+  2026-07-16, in its v152.0.4-beta.27 release note). Development resumed in
+  `daijro/camoufox`; engine v156.0.1-beta.34 was released 2026-10-03 (stack
+  survey, 2026-10-04). Genesis's `camoufox>=0.4` pin is an open lower bound
+  with no lock file, so a fresh install gets the newest release (0.5.7 on
+  PyPI as of 2026-10-05). The install surveyed on 2026-10-04 had camoufox
+  0.4.11 with engine 135.0.1-beta.24. The Camoufox-specific behaviour
+  statements in these skills (`browser_run_js` running in an isolated world,
+  the "Camoufox 135" hidden-field result) were measured on that install and
+  may not hold on a newer release.
+- Camoufox cannot pass as Chrome: SpiderMonkey and V8 differ observably.
+- Canvas spoofing quality degraded in some releases (**unsourced**).
 
-## Behavioral Signals (our responsibility)
+## Behavioural signals
 
 ### Timing
-- Human inter-keystroke interval: 239ms mean, 112ms SD (Aalto 136M study)
-- Common bigrams 40% faster, uncommon 30% slower
-- Gradual fatigue: ~0.05% slower per character
-- Page load to first interaction: 1.5-6 seconds (immediate = bot)
-- Pre-submit think time: 1.5-4 seconds
-- Form field to field: 2-8 seconds (log-normal, not uniform)
+- Human inter-key interval: mean 239 ms, SD 112 ms (Dhakal et al., "Observations
+  on Typing from 136 Million Keystrokes", CHI 2018, Aalto University).
+- Common bigrams faster, uncommon slower; slight fatigue over long text
+  (**unsourced** magnitudes: 40% / 30% / 0.05% per char).
+- Page load to first interaction 1.5-6 s, pre-submit pause 1.5-4 s, field to
+  field 2-8 s (**unsourced**). The tools' delays (median ~3.3 s, see the stealth-browser skill)
+  sit inside these ranges.
 
-### Mouse Movement
-- Humans generate hundreds of mousemove events per movement
-- Bots generate 0-10 events (or none)
-- 65% of fast movements overshoot by 3-12% then correct
-- Zero acceleration between points = bot
-- Bézier curves with noise > linear interpolation
+### Mouse
+- Real movements produce many `mousemove` events with acceleration; scripted
+  ones produce few or none, along straight lines (**unsourced** counts).
+  Camoufox's `humanize` setting generates a cursor trail for the tools.
 
-### Focus/Blur Events
-- `page.fill()` skips focus/blur events
-- Real browsers ALWAYS fire them
-- Critical for form detection systems
-- Must fire: click → focus → input → blur sequence
+### Focus and input events
+- Playwright's atomic `fill()` focuses the element and fires one `input` event
+  (Playwright docs, `locator.fill`). It does not fire per-character
+  `keydown`/`keypress`/`keyup`, which is what keystroke-dynamics checks look
+  for. `browser_fill` types per keystroke on Camoufox and remote CDP for this
+  reason.
+- Events dispatched from page script carry `isTrusted=false`.
 
-### Scroll Patterns
-- Human scroll delta variance: 20-100px
-- Bot scroll delta variance: <5px
-- Humans pause to read, occasionally scroll back up
-- Jump-to-element (no scroll) = bot signal
+### Scroll
+- Human scroll deltas vary (20-100 px) and include pauses and back-scrolls;
+  scripted scrolls are uniform (**unsourced** numbers). Genesis has no
+  humanized scroll tool. On Camoufox a click does NOT scroll its target into
+  view: scroll it there first (`browser-automation`, the off-screen click
+  workaround), or the click can report success and land nowhere.
 
-### Paste Detection
-- `element.fill()` doesn't fire paste/clipboard events
-- Some detection systems check if content was "typed" or "pasted"
-- For realistic behavior: simulate Ctrl+V event chain for pasted content
+### Paste
+- Some systems distinguish typed from pasted input (**unsourced**). Genesis
+  types; there is no paste tool.
 
-### Honeypot Fields
-- Hidden fields with CSS: `display:none`, `visibility:hidden`, `opacity:0`
-- Zero-dimension or off-screen positioned fields
-- Common names: `url`, `website`, `fax`, `phone2`
-- Filling ANY honeypot = instant bot flag
-- Must check computed CSS before filling
+### Honeypot fields
+- Hidden by CSS (`display:none`, `visibility:hidden`, `opacity:0`), zero size or
+  positioned off-screen; names like `url`, `website`, `fax`, `phone2`.
+  Filling one flags the submission. Check computed style first (the stealth-browser skill has the
+  `browser_run_js` snippet).
 
-## Detection Systems by Platform
+## Detection by platform
 
-| Platform | Detection | Primary signals |
-|----------|-----------|----------------|
-| Cloudflare Turnstile | Browser environment, NOT typing/mouse | Fingerprint, JS challenges |
-| DataDome | Behavioral + fingerprint | Mouse, timing, request patterns |
-| reCAPTCHA v3 | Risk score from page interaction | Engagement depth, timing |
-| Ashby (ATS) | Cloudflare Turnstile + form validation | Fingerprint, honeypots |
-| Greenhouse (ATS) | reCAPTCHA v2/v3 | Challenge-based |
-| Lever (ATS) | Basic rate limiting | Request frequency |
-| Reddit | Proprietary CQS + biometric verification | Account behavior, IP, burst patterns |
+| Platform | Detection | Primary signals | Source |
+|---|---|---|---|
+| Cloudflare Turnstile | browser environment and JS challenges | fingerprint, challenge results | **unsourced** that typing/mouse are not scored |
+| DataDome | behaviour + fingerprint | mouse, timing, request patterns | **unsourced** |
+| reCAPTCHA v3 | risk score from the session | environment, engagement, history | Google publishes no feature weights |
+| Ashby (ATS) | Google reCAPTCHA v3 at submit, plus post-submit fraud signals | fingerprint, IP | live test 2026-04-23 (`per-site/ats-ashby.md`) |
+| Greenhouse (ATS) | reCAPTCHA v2 or v3, employer-configured | challenge | **unsourced**, 2026-04 |
+| Lever (ATS) | rate limiting | request frequency | **unsourced**, 2026-04 |
+| Reddit | in-house scoring, verification walls | account behaviour, IP, bursts | `per-site/reddit.md` |
 
-## IP Reputation
+## IP reputation (**unsourced**, community consensus as of 2026-04)
+- Datacenter IPs are flagged hardest; residential IPs score better.
+- GeoIP should agree with the browser's timezone and locale.
+- Rotating IPs inside one session looks suspicious.
 
-- Datacenter IPs: instant flag on Reddit, high risk on Cloudflare
-- Residential proxies: necessary for high-detection sites
-- GeoIP must align with timezone/locale headers
-- IP stability matters: rotating too fast = suspicious
+## Vendor notes (gathered June 2026, all **unsourced**)
+- **AudioContext:** SwiftShader-identified audio output is reported as a
+  PerimeterX and DataDome block trigger. Camoufox spoofs AudioContext; plain
+  Playwright and custom CDP setups do not.
+- **PerimeterX `_px3`:** reported to expire in about 60 s; the `_pxvid` visitor
+  cookie should persist across pages in a session.
+- **WebRTC:** behind a proxy, a WebRTC-exposed local IP that contradicts the
+  proxy is a detectable inconsistency. Disable or proxy WebRTC.
+- **reCAPTCHA v3 history:** an active Google login and prior solves are reported
+  to raise the score. Google publishes no weights, so no number is given.
+- **DataDome:** trains per-site models, so acceptable cadence differs by site.
 
-## Vendor-Specific Intelligence (June 2026)
-
-### AudioContext Fingerprinting (all vendors)
-
-Camoufox handles AudioContext spoofing at the C++ level. Operators using
-non-Camoufox setups (plain Playwright, custom CDP) must independently
-verify that AudioContext oscillator output is not SwiftShader-identified.
-SwiftShader audio output is a primary PerimeterX and DataDome block trigger.
-
-### PerimeterX _px3 Token Lifecycle
-
-The _px3 security token expires in ~60 seconds -- the most aggressive
-expiry in any enterprise anti-bot system. Any pipeline navigating a
-PerimeterX site across multiple pages over >60s will fail mid-session.
-The `_pxvid` visitor ID cookie must persist across pages within a session.
-A fresh `_pxvid` on every navigation = strong automation signal.
-
-### WebRTC Local IP Consistency
-
-WebRTC STUN requests can expose the client's real local IP. When using
-residential proxies, ensure WebRTC is either disabled in the browser
-profile or routed through the proxy. A datacenter local IP behind a
-residential proxy creates a detectable inconsistency (PerimeterX, DataDome).
-
-### reCAPTCHA v3 History Signals
-
-- Active Google login (SID, HSID, SSID cookies) raises score +0.1 to +0.3
-- _GRECAPTCHA cookie: prior successful solves accumulate reputation
-- Cross-site reputation: good behavior on site A helps site B
-- Profile pre-warming should include visiting Google properties before
-  high-security reCAPTCHA v3 targets
-
-### DataDome Per-Site ML Cadence
-
-DataDome trains a separate ML model per protected site. Request cadence
-is site-specific -- what's human on a news site is bot-like on a checkout.
-After successful form submission or data extraction: wait 2-5s before
-navigating away or closing the session.
-
-## Calibration Datasets
+## Calibration datasets
 
 | Dataset | Content | Source |
-|---------|---------|--------|
-| CMU Keystroke Dynamics | 51 subjects, 20K reps, hold/flight distributions | cs.cmu.edu/~keystroke |
-| BlackTip | Pre-fitted calibration ranges from CMU data | github.com/rester159/blacktip |
-| Balabit Mouse Dynamics | 10 users, 8 weeks mouse trajectories | github.com/balabit/Mouse-Dynamics-Challenge |
-| BeCAPTCHA-Mouse | 9K trajectories, GAN-generated human paths | BiDAlab (request) |
+|---|---|---|
+| CMU Keystroke Dynamics | 51 subjects, 20,400 repetitions; hold/flight times (basis of the tools' key-hold distribution) | Killourhy and Maxion 2009, cs.cmu.edu/~keystroke |
+| BlackTip | pre-fitted ranges from the CMU data | github.com/rester159/blacktip |
+| Balabit Mouse Dynamics | 10 users, mouse trajectories | github.com/balabit/Mouse-Dynamics-Challenge |
+| BeCAPTCHA-Mouse | ~9K trajectories incl. GAN-generated human paths | BiDA Lab (on request) |

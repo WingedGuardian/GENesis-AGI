@@ -554,12 +554,20 @@ cannot access. Do not apologize for limitations. Handle what you can.
 
 # Skills auto-injected by profile (always loaded for that profile)
 _PROFILE_SKILLS: dict[str, list[str]] = {
-    "interact": ["stealth-browser"],
+    # Both: stealth-browser is behaviour-only; the safety gates (payments,
+    # credentials, hand-off to the user) live in browser-automation.
+    "interact": ["stealth-browser", "browser-automation"],
     "research": ["web-research"],
     "observe": [],
     "campaign": ["voice-master"],
     "community-responder": ["genesis-voice"],
     "mail": ["genesis-voice"],
+}
+
+# Skills a profile loads even when the caller passes an explicit skill list.
+_REQUIRED_PROFILE_SKILLS: dict[str, tuple[str, ...]] = {
+    "research": ("web-research",),
+    "interact": ("stealth-browser", "browser-automation"),
 }
 
 # Profiles that grant Bash run it under an allowlist of permitted command
@@ -789,8 +797,12 @@ def _resolve_skills(request: DirectSessionRequest) -> list[str]:
     """Determine which skills to inject: explicit > profile + auto-detect."""
     if request.skills is not None:
         skills = list(request.skills)
-        if request.profile == "research" and "web-research" not in skills:
-            skills.append("web-research")
+        # An explicit list adds to a profile's mandatory skills, never replaces
+        # them: interact's browser-automation carries the payment, credential
+        # and hand-off gates for every browser-capable session.
+        for name in _REQUIRED_PROFILE_SKILLS.get(request.profile, ()):
+            if name not in skills:
+                skills.append(name)
         return skills
 
     # Start with profile-bound skills
