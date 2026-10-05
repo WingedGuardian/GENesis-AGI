@@ -101,9 +101,7 @@ _PROMPT_NOTE = (
 def carried_more_than_the_refused_step(command: str) -> bool:
     """Whether the command holds more than one step, so a refusal lost collateral.
 
-    Structural only: it counts the steps the shell would run and never inspects
-    what any of them MEAN. No tool's option grammar can make it wrong, and a flag
-    invented tomorrow cannot change its answer.
+    ``split_segments`` consults a closed data-receiver set for quoted heredocs.
 
     ``split_segments`` is deliberately the whole predicate. It needs no cost bound
     of its own: it is a single-level, quote-aware split with NO recursion, linear

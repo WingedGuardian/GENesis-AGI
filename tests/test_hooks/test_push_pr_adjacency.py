@@ -671,6 +671,35 @@ def test_a_real_push_is_still_stopped(monkeypatch, tmp_path, capsys, on_the_publ
     assert "NO OPEN PR" in err
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat <<'EOF' > >(bash)\ngit push origin main\nEOF",
+        "cat() { bash; }; cat <<'EOF'\ngit push origin main\nEOF",
+    ],
+    ids=["process-substitution", "function-shadow"],
+)
+def test_unproven_heredoc_push_is_not_allowed(
+    monkeypatch, tmp_path, capsys, on_the_public_repo, command: str
+) -> None:
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: {PUBLIC_URL})
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(
+        monkeypatch, tmp_path, fake, capsys, command=command
+    )
+    if rc == 2:
+        assert "NO OPEN PR" in err, (command, err)
+    else:
+        assert rc == 0, (command, rc, out, err)
+        decision = json.loads(out)["hookSpecificOutput"]["permissionDecision"]
+        assert decision != "allow", (command, out)
+
+
 def test_a_full_result_window_is_unanswerable_not_absent(monkeypatch) -> None:
     """A response that FILLS the window is a truncated read.
 

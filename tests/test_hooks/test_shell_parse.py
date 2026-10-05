@@ -29,6 +29,14 @@ def _push_blocked(cmd: str) -> bool:
     return bool(segs) and not all(s.override for s in segs)
 
 
+def _push_segments(cmd: str) -> list[sp.Segment]:
+    return [
+        seg
+        for seg in sp.analyze(cmd)
+        if seg.exe == "git" and len(seg.argv) > 1 and seg.argv[1] == "push"
+    ]
+
+
 def _commit_nv(cmd: str) -> bool:
     return any(sp.commit_skips_hooks(s.argv) for s in sp.analyze(cmd))
 
@@ -873,95 +881,402 @@ def test_has_top_level_pipe_real_pipe_around_substitution(cmd):
 
 
 class TestQuotedHeredocBody:
-    """Issue #1889: a here-document under a QUOTED delimiter is literal text
-    and must contribute no segments — the same treatment a single-quoted
-    string gets. The trap the fix cannot fall into: `bash <<'EOF'` executes
-    that "literal" body, so suppression applies only when the body is DATA —
-    the receiver (or the pipe target after it) decides. Bodies a resolved
-    executor reads as a program stay gated; an unresolved or expansion-carrying
-    verb fails toward visibility and scans the body as commands."""
-
-    def test_quoted_body_yields_no_segments(self):
-        cmd = "cat <<'EOF'\ngit push origin main\nEOF\necho after"
-        assert not _push_blocked(cmd)
-        assert [s.exe for s in sp.analyze(cmd)] == ["cat", "echo"]
-
-    def test_quoted_body_hides_substitution_text(self):
-        # The issue's own repro: a backticked merge inside a quoted body is
-        # prose, not a run command.
-        cmd = "cat <<'PROBE'\nprose: `git -C /x merge origin/main`\nPROBE"
-        assert not any(s.exe == "git" for s in sp.analyze(cmd))
+    """Issue #1889: suppress only bodies proven to be literal receiver data."""
 
     @pytest.mark.parametrize(
-        "opener", ["<<'EOF'", '<<"EOF"', "<<\\EOF", "<<-'EOF'"]
+        ("command", "outside_argv"),
+        [
+            (
+                "echo before; cat <<'EOF'\ngit push origin main\nEOF\necho after",
+                (["echo", "before"], ["cat"], ["echo", "after"]),
+            ),
+            (
+                "echo before; git commit -F - <<'EOF'\ngit push origin main\nEOF\necho after",
+                (
+                    ["echo", "before"],
+                    ["git", "commit", "-F", "-"],
+                    ["echo", "after"],
+                ),
+            ),
+            (
+                "echo before; gh pr create --title x --body-file - <<'EOF'\n"
+                "git push origin main\nEOF\necho after",
+                (
+                    ["echo", "before"],
+                    ["gh", "pr", "create", "--title", "x", "--body-file", "-"],
+                    ["echo", "after"],
+                ),
+            ),
+            (
+                "echo before; cat <<'EOF' | git commit -F -\n"
+                "git push origin main\nEOF\necho after",
+                (
+                    ["echo", "before"],
+                    ["cat"],
+                    ["git", "commit", "-F", "-"],
+                    ["echo", "after"],
+                ),
+            ),
+            (
+                "echo before; cat <<'E1' && wc -l <<'E2'\n"
+                "git push origin main\nE1\ngit push origin main\nE2\necho after",
+                (
+                    ["echo", "before"],
+                    ["cat"],
+                    ["wc", "-l"],
+                    ["echo", "after"],
+                ),
+            ),
+            (
+                "echo before; cat <<'E$OF'\ngit push origin main\nE$OF\necho after",
+                (["echo", "before"], ["cat"], ["echo", "after"]),
+            ),
+            (
+                'echo before; cat <<"E$OF"\ngit push origin main\nE$OF\necho after',
+                (["echo", "before"], ["cat"], ["echo", "after"]),
+            ),
+            (
+                "echo before; cat <<$'EOF'\ngit push origin main\nEOF\necho after",
+                (["echo", "before"], ["cat"], ["echo", "after"]),
+            ),
+            (
+                "echo before; cat <<- 'EOF'\n\tgit push origin main\n\tEOF\necho after",
+                (["echo", "before"], ["cat"], ["echo", "after"]),
+            ),
+            (
+                "cat <<'EOF'\r\ngit push origin main\r\nEOF\r",
+                (["cat"],),
+            ),
+            (
+                "echo before; cat >s.sh <<'EOF'\ngit push origin main\nEOF",
+                (["echo", "before"], ["cat"]),
+            ),
+            (
+                "echo before; gh pr create --title x --body "
+                "\"$(cat <<'EOF'\ngit push origin main\nEOF\n)\"; echo after",
+                (
+                    ["echo", "before"],
+                    ["gh", "pr", "create", "--title", "x", "--body", "$(cat <<'EOF'\n"
+                    "git push origin main\nEOF\n)"],
+                    ["cat"],
+                    ["echo", "after"],
+                ),
+            ),
+            (
+                "echo before; git commit -m "
+                "\"$(cat <<'EOF'\ngit push origin main\nEOF\n)\"; echo after",
+                (
+                    ["echo", "before"],
+                    ["git", "commit", "-m", "$(cat <<'EOF'\ngit push origin main\nEOF\n)"],
+                    ["cat"],
+                    ["echo", "after"],
+                ),
+            ),
+        ],
+        ids=[
+            "cat",
+            "git-commit-file-stdin",
+            "gh-pr-body-file-stdin",
+            "pipeline-to-git-commit",
+            "two-openers",
+            "single-quoted-dollar-delimiter",
+            "double-quoted-dollar-delimiter",
+            "ansi-c-delimiter",
+            "tab-stripped-delimiter",
+            "crlf-delimiter",
+            "terminal-file-writer",
+            "gh-body-substitution",
+            "git-message-substitution",
+        ],
     )
-    def test_every_quoting_form_is_literal(self, opener):
-        # ANY quoted char of the delimiter word quotes the body; <<-
-        # additionally strips leading TABS on the delimiter line.
-        cmd = f"cat {opener}\ngit push origin main\nEOF"
-        if "<<-" in opener:
-            cmd = f"cat {opener}\n\tgit push origin main\n\tEOF"
-        assert not _push_blocked(cmd)
+    def test_only_proven_data_bodies_are_suppressed(
+        self, command: str, outside_argv: tuple[list[str], ...]
+    ) -> None:
+        segments = sp.analyze(command)
+        assert not [
+            seg
+            for seg in segments
+            if seg.exe == "git" and len(seg.argv) > 1 and seg.argv[1] == "push"
+        ]
+        for argv in outside_argv:
+            assert any(seg.argv == argv for seg in segments), (argv, segments)
 
-    def test_unquoted_body_still_yields_segments(self):
-        # Regression pin: expansions DO happen in an unquoted body, so its
-        # lines keep flowing through the segmenter as before.
-        cmd = "cat <<EOF\ngit push origin main\nEOF"
-        assert _push_blocked(cmd)
+    @pytest.mark.parametrize(
+        ("command", "visible"),
+        [
+            pytest.param(
+                "cat <<'EOF' > >(bash)\ngit push origin main\nEOF\n",
+                True,
+                id="procsub-output",
+            ),
+            pytest.param(
+                "cat <<'EOF' | tee >(bash)\ngit push origin main\nEOF\n",
+                True,
+                id="tee-procsub",
+            ),
+            pytest.param(
+                "cat <<'EOF' | tee >(bash) >/dev/null\n"
+                "git push origin main\nEOF\n",
+                True,
+                id="tee-procsub-and-null",
+            ),
+            pytest.param(
+                "cat <<'EOF' 1> >(sh)\ngit push origin main\nEOF\n",
+                True,
+                id="fd-dup-procsub",
+            ),
+            pytest.param(
+                "cat <<'EOF' | grep -f /dev/stdin <(bash)\n"
+                "git push origin main\nEOF\n",
+                True,
+                id="grep-file-procsub",
+            ),
+            pytest.param(
+                "cat <<'EOF' $(echo\ngit push origin main\n)\nbody\nEOF\n",
+                True,
+                id="newline-in-command-substitution",
+            ),
+            pytest.param(
+                "cat <<'EOF' `echo\ngit push origin main\n`\nbody\nEOF\n",
+                True,
+                id="newline-in-backtick",
+            ),
+            pytest.param(
+                "cat <<'EOF' \"a\ngit push origin main\"\nbody\nEOF\n",
+                False,
+                id="newline-in-double-quote-control",
+            ),
+            pytest.param(
+                "cat <<'EOF'\ngit push origin main\nEOF\n",
+                False,
+                id="plain-cat-control",
+            ),
+            pytest.param(
+                "cat() { bash; }; cat <<'EOF'\ngit push origin main\nEOF\n",
+                True,
+                id="function-shadow",
+            ),
+            pytest.param(
+                "function cat { bash; }; cat <<'EOF'\ngit push origin main\nEOF\n",
+                True,
+                id="function-keyword-shadow",
+            ),
+            pytest.param(
+                "cat() { bash; }; gh pr create --body-file - <<'EOF'\n"
+                "git push origin main\nEOF\n",
+                True,
+                id="function-shadow-gh-file-body",
+            ),
+            pytest.param(
+                "cat() { bash; }; gh pr create --body "
+                "\"$(cat <<'EOF'\ngit push origin main\nEOF\n)\"",
+                True,
+                id="function-shadow-gh-substitution",
+            ),
+            pytest.param(
+                "PATH=/tmp/x cat <<'EOF'\ngit push origin main\nEOF\n",
+                True,
+                id="path-assignment-prefix",
+            ),
+            pytest.param(
+                "LC_ALL=C cat <<'EOF'\ngit push origin main\nEOF\n",
+                True,
+                id="locale-assignment-prefix",
+            ),
+            pytest.param(
+                "cat <<'EOF' >\ngit push origin main\nEOF\n",
+                True,
+                id="empty-redirect-target",
+            ),
+        ],
+    )
+    def test_heredoc_receiver_edges_keep_push_visible(
+        self, command: str, visible: bool
+    ) -> None:
+        push_segments = [
+            segment
+            for segment in sp.analyze(command)
+            if segment.exe == "git"
+            and len(segment.argv) > 1
+            and segment.argv[1] == "push"
+        ]
+        assert bool(push_segments) is visible, (command, push_segments)
 
-    def test_bash_executor_body_stays_gated(self):
-        assert _push_blocked("bash <<'EOF'\ngit push origin main\nEOF")
+    def test_heredoc_substitution_data_verb_returns_bool(self) -> None:
+        assert sp._is_heredoc_substitution_data_verb(["git"]) is False
+        assert sp._is_heredoc_substitution_data_verb(["gh"]) is False
+        assert (
+            sp._is_heredoc_substitution_data_verb(["LC_ALL=C", "gh", "pr", "create"])
+            is False
+        )
 
-    def test_wrapped_executor_body_stays_gated(self):
-        # exe is wrapper-stripped, so the receiver set names verbs, not
-        # spellings of them.
-        assert _push_blocked("sudo bash <<'EOF'\ngit push origin main\nEOF")
+    @pytest.mark.parametrize(
+        ("word", "expected"),
+        [
+            ("'EOF'", ("EOF", True)),
+            ('"E$OF"', ("E$OF", True)),
+            ("E$OF", ("E$OF", False)),
+            ("$'EOF'", ("EOF", True)),
+            (r"E\OF", ("EOF", True)),
+            (r"$'E\OF'", ("", False)),
+            ("`EOF`", ("", False)),
+            ("''", ("", False)),
+        ],
+    )
+    def test_delimiter_quote_removal(self, word: str, expected: tuple[str, bool]) -> None:
+        assert sp._heredoc_delimiter(word) == expected
 
-    def test_python_executor_body_stays_gated(self):
-        segs = sp.analyze("python3 <<'PY'\nimport os\nPY")
-        assert any(s.exe == "import" and s.depth == 1 for s in segs)
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat <<'EOF' | bash\ngit push origin main\nEOF",
+            "cat <<'EOF' | cat | bash\ngit push origin main\nEOF",
+            "{ bash; } <<'EOF'\ngit push origin main\nEOF",
+            "while read -r line; do eval \"$line\"; done <<'EOF'\ngit push origin main\nEOF",
+            "make -f - <<'EOF'\ngit push origin main\nEOF",
+            "cat <<'EOF' \\\n| bash\ngit push origin main\nEOF",
+            "cat <<'EOF' >/dev/null && \\\ngit push origin main\nbody\nEOF",
+            "eval \"$(cat <<'EOF'\ngit push origin main\nEOF\n)\"",
+            "X=$(cat <<'EOF'\ngit push origin main\nEOF\n); eval \"$X\"",
+            "cat >s.sh <<'EOF'\ngit push origin main\nEOF\nbash s.sh",
+            "run() { bash; }; run <<'EOF'\ngit push origin main\nEOF",
+            "sudo cat <<'EOF'\ngit push origin main\nEOF",
+            "bash <<'EOF'\ngit push origin main\nEOF",
+            'echo $((1 << "2"))\ngit push origin main',
+            "cat \\<<'EOF'\ngit push origin main\nEOF",
+            "cat <<OUTER\ncat <<'INNER'\ngit push origin main\nINNER\nOUTER",
+            "cat <<'EOF'\ngit push origin main",
+            "echo `cat <<'EOF'\ngit push origin main\nEOF`",
+        ],
+        ids=[
+            "pipe-to-bash",
+            "longer-pipe-to-bash",
+            "brace-group",
+            "while-eval",
+            "make-stdin",
+            "continued-pipeline",
+            "continued-neighbor",
+            "eval-substitution",
+            "assignment-then-eval",
+            "write-then-bash",
+            "function-calls-bash",
+            "sudo-cat",
+            "bash",
+            "arithmetic-shift",
+            "escaped-opener",
+            "nested-opener-in-unquoted-body",
+            "unterminated",
+            "backtick",
+        ],
+    )
+    def test_every_unproven_body_stays_visible(self, command: str) -> None:
+        assert _push_segments(command)
 
-    def test_pipe_forward_to_executor_stays_gated(self):
-        # `cat <<'EOF' | bash` — cat cannot run the body, but bash can.
-        assert _push_blocked("cat <<'EOF' | bash\ngit push origin main\nEOF")
+    def test_unquoted_body_is_known_1748_over_block(self) -> None:
+        """Known #1748 over-block: expansion-capable bodies remain visible."""
+        assert _push_segments("cat <<EOF\ngit push origin main\nEOF")
 
-    def test_pipe_to_data_consumer_suppresses(self):
-        cmd = "cat <<'EOF' | wc -l\ngit push origin main\nEOF"
-        assert not _push_blocked(cmd)
+    @pytest.mark.parametrize(
+        "redirect",
+        [
+            "> out",
+            ">> out",
+            ">| out",
+            "&> out",
+            "&>> out",
+            "1> out",
+            "1>> out",
+            ">&3",
+        ],
+    )
+    def test_file_writing_redirect_keeps_heredoc_visible(self, redirect: str) -> None:
+        command = (
+            f"cat <<'EOF' {redirect}\n"
+            "git push origin main\nEOF\necho after"
+        )
+        assert _push_segments(command)
 
-    def test_unresolved_receiver_scans_body_as_commands(self):
-        # Expansion-carrying verb: cannot be told from a shell, so the body
-        # stays visible — the module's posture everywhere else.
-        assert _push_blocked("$SHELL <<'EOF'\ngit push origin main\nEOF")
+    @pytest.mark.parametrize(
+        "redirect",
+        [
+            "> /dev/null",
+            "> /dev/stdout",
+            "> /dev/stderr",
+            '>"&1"',
+            '>"&2"',
+            ">&1",
+            ">&2",
+            "2> out",
+        ],
+    )
+    def test_non_file_sink_redirect_allows_heredoc_suppression(
+        self, redirect: str
+    ) -> None:
+        command = (
+            f"cat <<'EOF' {redirect}\n"
+            "git push origin main\nEOF\necho after"
+        )
+        assert not _push_segments(command)
 
-    def test_comment_cannot_open_a_heredoc(self):
-        # `<<` inside a `#` comment is not a redirect; the "body" is real code.
-        cmd = "echo hi;# <<'EOF'\ngit push origin main\nEOF"
-        assert _push_blocked(cmd)
+    @pytest.mark.parametrize(
+        ("suffix", "visible"),
+        [
+            ("| tee out", False),
+            ("| tee -", False),
+            ("| tee /dev/null", False),
+            ("| tee out | cat", True),
+        ],
+    )
+    def test_tee_file_operand_must_be_last_pipeline_member(
+        self, suffix: str, visible: bool
+    ) -> None:
+        command = f"cat <<'EOF' {suffix}\ngit push origin main\nEOF"
+        assert bool(_push_segments(command)) is visible
 
-    def test_two_quoted_heredocs_share_one_line(self):
-        cmd = "a <<'E1' && b <<'E2'\nb1 git push\nE1\nb2 git merge\nE2\necho after"
-        assert [s.exe for s in sp.analyze(cmd)] == ["a", "b", "echo"]
+    def test_comment_cannot_register_a_heredoc(self) -> None:
+        assert _push_segments("echo hi;# <<'EOF'\ngit push origin main\nEOF")
 
-    def test_unquoted_then_quoted_keeps_order(self):
-        # The unquoted body's segments must land between the two owners, not
-        # after the quoted body's drain.
-        cmd = "a <<E1 && b <<'E2'\nb1 git push\nE1\nb2 git merge\nE2\necho after"
-        exes = [s.exe for s in sp.analyze(cmd)]
-        assert "b1" in exes
-        assert "b2" not in exes
+    def test_herestring_cannot_register_a_heredoc(self) -> None:
+        assert _push_segments("cat <<<'EOF'\ngit push origin main")
 
-    def test_heredoc_inside_a_substitution(self):
-        # `$(cat <<'EOF' …)` inside an argument: the inner body is still
-        # quoted text, suppressed at depth 1.
-        cmd = 'gh pr create --body "$(cat <<\'EOF\'\nbare git push\nEOF\n)"'
-        assert not _push_blocked(cmd)
+    def test_untokenizable_still_sees_suppressed_body_prose(self) -> None:
+        command = "cat <<'EOF'\ndon't\nEOF"
+        assert sp.suppressed_heredoc_bodies(command) == ("don't\n",)
+        assert sp.untokenizable(command)
 
-    def test_expansion_delimiter_is_not_a_heredoc(self):
-        # A delimiter carrying an expansion cannot be resolved, so `<<$D`
-        # registers nothing and the body parses as commands — visible, the
-        # safe direction.
-        assert _push_blocked("cat <<$D\ngit push origin main\n$D")
+    def test_nested_heredoc_belongs_to_its_substitution(self) -> None:
+        command = "cat \"$(bash <<'EOF'\ngit push origin main\nEOF\n)\""
+        assert _push_segments(command)
+
+    def test_parse_segments_can_leave_even_proven_data_visible(self) -> None:
+        parsed = sp.parse_segments(
+            "cat <<'EOF'\ngit push origin main\nEOF",
+            suppress_data_heredocs=False,
+        )
+        assert any(segment.raw == "git push origin main" for segment in parsed)
+
+    def test_suppressed_body_report_uses_the_analyzer_traversal(self) -> None:
+        command = (
+            "cat <<'A'\none\nA\n"
+            "gh pr create --body \"$(cat <<'B'\ntwo\nB\n)\""
+        )
+        assert sp.suppressed_heredoc_bodies(command) == ("one\n", "two\n")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "x" * (sp.MAX_COMMAND_CHARS + 1),
+            "echo "
+            + "$(echo " * (sp.MAX_SUBSTITUTION_DEPTH + 2)
+            + "true"
+            + ")" * (sp.MAX_SUBSTITUTION_DEPTH + 2),
+        ],
+        ids=["length", "depth"],
+    )
+    def test_suppressed_body_report_is_none_when_analysis_is_blind(
+        self, command: str
+    ) -> None:
+        assert sp.suppressed_heredoc_bodies(command) is None
 
 
 class TestSigilRunRegression:

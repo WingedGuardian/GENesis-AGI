@@ -1,5 +1,1 @@
-- A here-document under a quoted delimiter (`<<'EOF'`) no longer leaks its body
-  into the command segmenter: prose and code-shaped text in a literal body is
-  data, not executable segments. Bodies fed to a resolved executor
-  (`bash <<'EOF'`, `cat <<'EOF' | bash`, …) still scan as programs — a
-  suppression that hid those would have been a gate bypass.
+Quoted heredoc bodies supplied to proven data receivers—including the `gh` and `git` message-body substitution idiom—no longer appear as separate guard-visible commands. Every other body is scanned as before; apostrophe prose is still refused by `untokenizable`. The secrets gate now scans unquoted heredoc bodies and bodies sent to unknown receivers.
