@@ -783,7 +783,7 @@ class TestEffectivePushRemote:
     def test_explicit_repo_flag(self, guard_module):
         with patch.object(guard_module.subprocess, "run", side_effect=AssertionError):
             assert (
-                guard_module._effective_push_remote(_push_seg("git push --repo fork feat"), "feat")
+                guard_module._effective_push_remote(_push_seg("git push --repo fork"), "feat")
                 == "fork"
             )
 

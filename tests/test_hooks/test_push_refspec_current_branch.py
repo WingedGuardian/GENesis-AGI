@@ -135,9 +135,9 @@ def test_a_force_shorthand_refspec_never_reaches_the_colon_rule() -> None:
 def test_a_non_push_argv_is_not_a_bare_push(monkeypatch) -> None:
     """The ``None`` sentinel: a non-push argv must refuse, not read as bare push.
 
-    ``_push_arg_stream`` yields an EMPTY stream for both ``git status`` and a
-    bare ``git push``; the ``None``/``[]`` distinction is what keeps the empty
-    positional list from passing the allowlist for a segment that never pushes.
+    ``push_arg_stream`` returns ``None`` for ``git status`` and an EMPTY stream
+    for bare ``git push``; that distinction keeps the empty positional list from
+    passing the allowlist for a segment that never pushes.
     """
     monkeypatch.setattr(gpg, "_push_config_is_simple", lambda *a, **k: True)
     # Bare `git push` is the legitimate empty stream — this row must NOT change.
@@ -147,6 +147,21 @@ def test_a_non_push_argv_is_not_a_bare_push(monkeypatch) -> None:
     segs, _blind = gpg.analyze_checked("git status")
     seg = next(s for s in segs if s.exe == "git")
     assert gpg._push_targets_current_branch(seg, "feat/x", "origin", cwd=None) is False
+
+
+def test_shared_push_arg_stream_uses_typed_canonical_tokens() -> None:
+    argv = ["git", "-c", "+k=v", "push", "-uo", "-f", "--mirr", "origin", "+main"]
+    assert gpg.push_arg_stream(["git", "status"]) is None
+    assert gpg.push_arg_stream(["git", "push"]) == []
+    assert gpg.push_arg_stream(argv) == [
+        gpg.PushArg(gpg.PushArgKind.GLOBAL_VALUE, "-c"),
+        gpg.PushArg(gpg.PushArgKind.SHORT, "u"),
+        gpg.PushArg(gpg.PushArgKind.SHORT, "o"),
+        gpg.PushArg(gpg.PushArgKind.SHORT_VALUE, "-f"),
+        gpg.PushArg(gpg.PushArgKind.LONG, "--mirror"),
+        gpg.PushArg(gpg.PushArgKind.POSITIONAL, "origin"),
+        gpg.PushArg(gpg.PushArgKind.PLUS, "+main"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -248,6 +263,7 @@ def test_the_allowlisted_global_options_still_pass(command: str, monkeypatch) ->
     ("command", "dry"),
     [
         ("git push --dry-run origin HEAD", True),
+        ("git push --dry origin HEAD", True),
         ("git push -n origin HEAD", True),
         ("git push -un origin HEAD", True),
         # a push-option VALUE that spells a dry-run flag is data (git-push(1):
@@ -277,8 +293,27 @@ def test_dry_run_detection_skips_option_values(command: str, dry: bool) -> None:
         ("git push -o ci.skip origin HEAD", "origin", ["origin", "HEAD"], "separate value"),
         ("git push --push-option ci.skip origin HEAD", "origin", ["origin", "HEAD"], "long form"),
         ("git push --push-option=ci.skip origin HEAD", "origin", ["origin", "HEAD"], "glued long"),
+        ("git push --push x origin HEAD", "origin", ["origin", "HEAD"], "unique long abbreviation"),
+        (
+            "git push --recurse-submodules check rb HEAD:x",
+            "rb",
+            ["rb", "HEAD:x"],
+            "separate-value option",
+        ),
+        ("git push --recurse check rb HEAD:x", "rb", ["rb", "HEAD:x"], "unique long abbreviation"),
         ("git push -fo x origin HEAD", "origin", ["origin", "HEAD"], "-f + -o value in one bundle"),
-        ("git push origin +HEAD:refs/heads/feat/x", "origin", ["origin"], "+refspec is not a remote"),
+        (
+            "git push -o --repo=fork origin +main",
+            "origin",
+            ["origin"],
+            "repo spelling is an -o value",
+        ),
+        (
+            "git push origin +HEAD:refs/heads/feat/x",
+            "origin",
+            ["origin"],
+            "+refspec is not a remote",
+        ),
     ],
 )
 def test_an_option_value_is_never_a_remote_or_refspec(
@@ -306,11 +341,44 @@ def test_an_option_value_is_never_a_remote_or_refspec(
         ("git push origin +HEAD", True, "control: +refspec"),
         ("git push --force-with-lease origin HEAD", True, "control: long force form"),
         ("git push --mirror origin", True, "control: mirror is unconditional force"),
+        ("git push --mirr origin", True, "unique abbreviation of mirror"),
+        ("git push --mir origin", True, "unique abbreviation of mirror"),
+        ("git push --force-w origin main", True, "unique abbreviation of force-with-lease"),
+        ("git push --forc origin main", False, "ambiguous force prefix is not a force flag"),
     ],
 )
 def test_an_option_value_is_never_a_force(command: str, force: bool, why: str) -> None:
     argv = getattr(_parsed_push_seg(command), "argv", None) or []
     assert gpg._push_is_force(argv) is force, why
+
+
+@pytest.mark.parametrize(
+    ("command", "positionals", "force"),
+    [
+        ("git push -- origin HEAD", ["origin", "HEAD"], False),
+        ("git push origin -- -f", ["origin", "-f"], False),
+    ],
+)
+def test_double_dash_ends_push_option_scanning(
+    command: str, positionals: list[str], force: bool
+) -> None:
+    argv = getattr(_parsed_push_seg(command), "argv", None) or []
+    assert gpg._push_positionals(argv) == positionals
+    assert gpg._push_is_force(argv) is force
+
+
+@pytest.mark.parametrize(
+    ("command", "positionals"),
+    [
+        ("git push --set-up origin HEAD", ["origin", "HEAD"]),
+        ("git push --no-ver origin HEAD", None),
+    ],
+)
+def test_abbreviated_push_flags_use_the_canonical_safe_flag(
+    command: str, positionals: list[str] | None
+) -> None:
+    argv = getattr(_parsed_push_seg(command), "argv", None) or []
+    assert gpg._push_ref_positionals(argv) == positionals
 
 
 @pytest.mark.parametrize(
@@ -328,6 +396,26 @@ def test_a_repo_spelling_inside_an_option_value_is_not_a_repo_flag(
 ) -> None:
     argv = getattr(_parsed_push_seg(command), "argv", None) or []
     assert gpg._push_repo_flag(argv) == repo, why
+
+
+@pytest.mark.parametrize(
+    ("command", "remote"),
+    [
+        ("git push --repo backups origin main", "origin"),
+        ("git push --repo origin backups main", "backups"),
+        ("git push --repo=backups", "backups"),
+        ("git push --rep=backups", "backups"),
+    ],
+)
+def test_resolve_push_remote_prefers_positional_repository(command: str, remote: str) -> None:
+    assert gpg._resolve_push_remote(_parsed_push_seg(command)) == remote
+
+
+def test_push_option_repo_value_does_not_override_positional_destination() -> None:
+    seg = _parsed_push_seg("git push -o --repo=fork origin +main")
+    argv = getattr(seg, "argv", None) or []
+    assert gpg._resolve_push_remote(seg) == "origin"
+    assert gpg._push_is_force(argv) is True
 
 
 # ─── end to end through main(): the hygiene checks now run for HEAD ──────────
