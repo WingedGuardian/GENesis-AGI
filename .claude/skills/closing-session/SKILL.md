@@ -555,6 +555,73 @@ label, and requests review.
   evidence about the change, not an obstacle to route around. Approval gates and
   escalation caps are never downgrade candidates.
 
+## Devin-built PRs: premise audit before spending review rounds (standing owner rule, 2026-10-04)
+
+**How to tell a Devin PR.** Its head branch starts with `devin/`, or it carries the
+`devin-lifecycle` label, which Devin adds itself. The PR AUTHOR does not tell you:
+Devin pushes with the owner's token, so its PRs are authored by the owner's
+account, and `--author app/devin-ai-integration` lists none of them.
+`devin-ai-integration[bot]` is only the login Devin comments and reviews under.
+
+A Devin PR usually arrives without a plan: no record of what the repo already has,
+and outside-behaviour claims asserted rather than measured. Review rounds spent on
+a wrong-shaped change find defects indefinitely and never say the shape is wrong.
+Codex reviews automatically when the PR opens, so that first round has usually
+happened already. Before requesting or answering any further review:
+
+1. **Run a premise check and design audit** with a fresh-context
+   `genesis-architect`, following `.claude/docs/premise-check.md`: premises with
+   evidence, the effect question, the comparative question (an existing chokepoint
+   the change duplicates or bypasses), the five plan-time questions, then
+   BLOCKER / SHOULD-FIX / NOTE findings and what a rework should do. Hand it the PR
+   number AND the expected head SHA, and have it fetch that head
+   (`git fetch origin pull/<N>/head:<ref>`) and confirm the match before
+   reading anything; an auditor pointed at a stale or main checkout audits the
+   wrong diff with full confidence. Never hand it your own reading of the diff.
+2. **Re-derive every claim the disposition rests on** from the PR head or by
+   re-running the audit's own probe, before acting (CLAUDE.md, "Verify agent
+   output").
+3. **Decide by the audit's `Design-premise:` verdict, not by finding severity:**
+   - **BROKEN**: the established route, `needs-architecture-session` plus a
+     `ready` follow-up naming the PR and the decision it awaits (genesis-development,
+     "Some PRs are not a review problem"). Devin can rework a shape; it cannot
+     decide one.
+   - **SOUND-BUT-INFERIOR with a named better shape that changes the mechanism or
+     the files touched**: kick it back to Devin. Post the audit as a PR comment
+     WITHOUT `(aside)`, so Devin's monitor acts on it, and tell it to rework on
+     this branch rather than close the PR and open a replacement. Then convert the
+     PR to draft (`gh pr ready <N> --undo`) and add the `needs-rework` label.
+   - **SOUND, or local defects at any severity**: post the audit and continue the
+     ordinary per-PR loop.
+
+   For Devin PRs this owner rule replaces premise-check.md's "SOUND-BUT-INFERIOR is
+   NOT a kick-back" and its two-signal bar. The audit runs after at most Codex's
+   automatic opening round, before any further one, and round signals take several
+   rounds to accumulate; the owner ruled that a wrong shape goes back to Devin on
+   the audit's own evidence rather than spending those rounds to prove it.
+4. **Track every kick-back.** A draft leaves the closing set and nothing reads the
+   label, so open one follow-up per batch with `work_state="blocked_on_trigger"`
+   (it waits on Devin, so it is not actionable now) naming each PR and its audit
+   comment, with a `revisit_condition` saying what unblocks it: Devin pushed the
+   rework and marked it ready, or the owner decided. Re-check those PRs on each
+   queue sweep.
+5. **When a kicked-back PR comes back ready,** request `@codex review` (marking a
+   draft ready is not a reliable trigger) and work it normally. If Devin closed it
+   and opened a replacement instead, which happened with #2309 and #2354, link the
+   two on both PRs and leave the round count to the owner.
+
+**One writer per branch.** While a kick-back is outstanding, the closing session
+does not push to that branch. Its own replies there carry `(aside)`, since every
+other comment from a write-access user starts a paid Devin session.
+
+**Public comments.** Scrub the audit for public-artifact privacy (no install paths,
+hosts or personal context) before posting. Keep security-class findings out: a gap
+already live on `main` that would hand a capability to someone with less access
+(secrets, private data, an approval or privacy gate) goes to a private follow-up,
+never a comment or issue. For a security-class defect the PR itself introduces,
+describe its effect at class level without exploit strings; the detail can follow
+once it is fixed.
+
 ## Ordering between PRs
 
 PR→PR dependencies are **not modelled anywhere** — no store records "merge #A
