@@ -66,11 +66,26 @@ primary checkout and only while the backend has no running processes
 (`inactive`, or `failed` with no control group, which `Restart=no` leaves after a
 crash and which `stop` does not clear). It rewrites only regular, owned
 fragments of this settings path whose loaded fragment is that same file, then
-reloads the manager. Each rewrite replaces only the inode it verified (device
-and inode compared immediately before the rename), and the first settings
-publish is a no-clobber link, so a file another process put at either path is
-refused rather than overwritten. A configure rollback never removes the settings
-path: it only ever existed if this run published it, which is the last step.
+reloads the manager. The first settings publish is a no-clobber link, so a file
+another process put there is refused rather than overwritten, and a configure
+rollback never removes the settings path: it only ever existed if this run
+published it, which is the last step. Later rewrites (disable, enable,
+repair-units, remove) are atomic renames under the configuration lock, with no
+expected-inode check: a check-then-rename is two syscalls and cannot be atomic,
+so it only narrowed a race it could not close. On a single-owner install the
+program coordinates with itself through that lock; a concurrent foreign writer to
+the settings or unit files is out of scope.
+
+The unit names are fixed (`genesis-cbm-query.service` and
+`genesis-cbm-query-clients.slice`), so uninstall needs no discovery. Paths are
+passed literally: the unit's Exec lines carry the `:` prefix, which disables
+variable substitution (systemd v255 `systemd.service`, executable prefixes), and
+escape only `%` as `%%`; the frontend's `systemd-run` passes
+`--expand-environment=no`, because transient service arguments otherwise undergo
+manager-side `${VAR}` expansion (systemd v255 `systemd-run`,
+`--expand-environment=BOOL`, listed by `systemd-run --help` on systemd 255). That
+option needs systemd 254 or later; an older `systemd-run` rejects it, so every
+frontend launch fails closed.
 
 If `start` fails during `enable`, for any reason including an `OSError` from
 `systemctl`, the rollback writes `enabled=false` and stops the unit as two
@@ -155,12 +170,12 @@ sentinel retirement, `enable` starts the owned query service:
 
 `remove` takes the configuration lock and persists `enabled=false` first. It then
 proves the units whose fragments remain are this configuration's (the same proof
-as `disable`), disables and stops them, deletes exactly those fragments after
-re-checking their identity, reloads the manager and deletes the settings. It can
+as `disable`), disables and stops them, deletes exactly those fragments,
+reloads the manager and deletes the settings. It can
 be re-run after an interruption: a unit whose fragment is already gone must be
 unknown to the manager after a reload (inactive, no control group), otherwise
-`remove` refuses. Like `disable`, it accepts settings written by an older
-accepted build, because neither runs the executable. A backend that crashed is
+`remove` refuses. Like `disable` and `status`, it accepts settings written by an
+older accepted build, because none of them runs the executable. A backend that crashed is
 left `failed` by `Restart=no`; run `systemctl --user reset-failed` on it before
 configuring again. The state directory
 (pinned executable and native cache) and the sentinel are kept. A fragment that
@@ -168,10 +183,8 @@ cannot be proven ours is never stopped or deleted: `remove` refuses and leaves
 the settings disabled. If the settings themselves are lost, remove the units by
 hand after checking their two-line ownership header. With a non-empty
 `CODEBASE_MEMORY_MCP_MANAGED_CONFIG` the route stays selected until that override
-is unset. `scripts/uninstall.sh` stops and disables the default-named units
-(`genesis-cbm-query.service`, `genesis-cbm-query-clients.slice`) and deletes the
-generated fragments of any name (`genesis-cbm-*`). It does not remove the managed
-state directory.
+is unset. `scripts/uninstall.sh` stops, disables and deletes the two fixed-name
+units. It does not remove the managed state directory.
 
 Activation still requires deployed merged wiring, a preserved last valid graph,
 queue state and pressure/OOM baselines, timer stopped before unblocking indexing,

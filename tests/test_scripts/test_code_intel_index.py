@@ -2070,7 +2070,6 @@ def _owned_units(home: Path, config_path: Path) -> None:
     config = dict(
         version=1, enabled=True, main=str(home), binary=str(home / "b"), cache=str(home / "c"),
         runtime=str(home / "r"), sentinel=str(home / "s"), build=module.BUILD,
-        name="genesis-cbm-query",
     )
     directory = home / ".config/systemd/user"
     directory.mkdir(parents=True, exist_ok=True)

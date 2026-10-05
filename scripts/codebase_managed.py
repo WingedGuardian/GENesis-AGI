@@ -37,6 +37,8 @@ DISABLED_KEYS = ("auto_index", "auto_watch", "watcher_enabled")
 MARKER = "# Genesis managed Codebase v1\n"
 CONFIG_LINE = "# Genesis managed config: "
 SCRIPT = Path(__file__).resolve()
+NAME = "genesis-cbm-query"  # fixed: uninstall.sh stops exactly these units
+BACKEND, SLICE = NAME + ".service", NAME + "-clients.slice"
 # newline="" keeps bytes exact: a CRLF fragment is foreign to both readers.
 UNIT_TEXT = dict(encoding="utf-8", errors="surrogateescape", newline="")
 
@@ -68,8 +70,8 @@ def main_script(config: dict) -> Path:
     return Path(config["main"]) / "scripts/codebase_managed.py"
 
 
-def read_file(path: Path) -> tuple[str, tuple[int, int]]:
-    """Text and (device, inode) of a regular file, never following a final link."""
+def read_file(path: Path) -> str:
+    """Text of a regular file, never following a final link."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError as error:
@@ -77,23 +79,22 @@ def read_file(path: Path) -> tuple[str, tuple[int, int]]:
             raise ValueError(f"managed symlink refused: {path}") from error
         raise
     with open(fd, **UNIT_TEXT) as stream:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError(f"managed path is not a regular file: {path}")
-        return stream.read(), (info.st_dev, info.st_ino)
+        return stream.read()
 
 
 def units_dir() -> Path:
     return Path.home() / ".config/systemd/user"
 
 
-def owned_fragment(fragment: Path, path: Path) -> tuple[str, tuple[int, int]] | None:
-    """Text and identity of a regular generated fragment of this configuration."""
+def owned_fragment(fragment: Path, path: Path) -> str | None:
+    """Text of a regular generated fragment of this configuration."""
     try:
-        text, identity = read_file(fragment)
+        text = read_file(fragment)
     except (FileNotFoundError, ValueError):
         return None
-    return (text, identity) if text.startswith(MARKER + CONFIG_LINE + str(path) + "\n") else None
+    return text if text.startswith(MARKER + CONFIG_LINE + str(path) + "\n") else None
 
 
 def sentinel_armed(raw: str) -> bool:
@@ -112,9 +113,8 @@ def sentinel_armed(raw: str) -> bool:
     return True
 
 
-def load_settings(path: Path, *, require_build: bool = True) -> tuple[dict, tuple[int, int]]:
-    text, identity = read_file(path)
-    value = json.loads(text)
+def read_settings(path: Path, *, require_build: bool = True) -> dict:
+    value = json.loads(read_file(path))
     if (
         not isinstance(value, dict)
         or type(value.get("version")) is not int
@@ -124,19 +124,11 @@ def load_settings(path: Path, *, require_build: bool = True) -> tuple[dict, tupl
         raise ValueError("invalid managed settings")
     for key in ("main", "binary", "cache", "runtime", "sentinel"):
         absolute(value.get(key))
-    if not isinstance(value.get("name"), str) or not re.fullmatch(
-        r"genesis-cbm-[a-z0-9]+(?:-[a-z0-9]+)*", value["name"]
-    ):
-        raise ValueError("invalid managed unit name")
     # The pin gates running the executable. Disabling and retiring never run it,
     # so settings written by an older accepted build can still be switched off.
     if require_build and value.get("build") != BUILD:
         raise ValueError("unsupported managed build")
-    return value, identity
-
-
-def read_settings(path: Path) -> dict:
-    return load_settings(path)[0]
+    return value
 
 
 def require_enabled(config: dict) -> None:
@@ -186,10 +178,6 @@ def systemctl(*args: str) -> str:
     ).strip()
 
 
-def backend(config: dict) -> str:
-    return config["name"] + ".service"
-
-
 def show(unit: str, *properties: str) -> dict[str, str]:
     # One manager query. Explicitly requested properties are printed even when
     # empty, in the manager's own order, so parse names rather than positions.
@@ -208,7 +196,7 @@ def same_file(loaded: str, fragment: Path) -> bool:
 
 
 def check_backend(config: dict, *, starting: bool = False) -> None:
-    unit = backend(config)
+    unit = BACKEND
     if systemctl("show", unit, "-p", "ActiveState", "--value") not in (
         ("active", "activating") if starting else ("active",)
     ):
@@ -247,7 +235,7 @@ def ready(config: dict) -> None:
                     text=True,
                     timeout=3,
                 )
-                pid = systemctl("show", backend(config), "-p", "MainPID", "--value")
+                pid = systemctl("show", BACKEND, "-p", "MainPID", "--value")
                 if (
                     response.returncode == 0
                     and "daemon: active (permanent)" in response.stdout
@@ -264,7 +252,7 @@ def ready(config: dict) -> None:
 def verify_boundary(config: dict, role: str, unit: str) -> None:
     leaf, root, version = resolve_cgroup(Path("/proc/self/cgroup"), Path("/proc/self/mountinfo"))
     if role == "client" and not re.fullmatch(
-        re.escape(config["name"]) + r"-client-[0-9a-f]{32}\.service", unit
+        re.escape(NAME) + r"-client-[0-9a-f]{32}\.service", unit
     ):
         raise ValueError("invalid owned frontend unit")
     if version != 2 or leaf.name != unit:
@@ -276,9 +264,7 @@ def verify_boundary(config: dict, role: str, unit: str) -> None:
         raise ValueError("managed process lacks exact memory/zero-swap cap")
     if role == "client":
         parent = leaf.parent
-        if parent.name != config["name"] + "-clients.slice" or (
-            parent / "memory.max"
-        ).read_text().strip() != str(2 * GIB):
+        if parent.name != SLICE or (parent / "memory.max").read_text().strip() != str(2 * GIB):
             raise ValueError("managed frontend aggregate cap unavailable")
         if (parent / "memory.swap.max").read_text().strip() != "0":
             raise ValueError("managed frontend aggregate swap cap unavailable")
@@ -334,6 +320,7 @@ def quote_unit(value: str) -> str:
     absolute(value) if value.startswith("/") else None
     if any(c in value for c in "\n\r\x00"):
         raise ValueError("invalid unit argument")
+    # "$" stays literal: units use the ":" prefix, which disables substitution.
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
 
 
@@ -353,7 +340,7 @@ def render_units(config: dict, path: Path) -> dict[str, str]:
     )
     owner = MARKER + CONFIG_LINE + str(path) + "\n"
     return {
-        backend(config): owner
+        BACKEND: owner
         + f"""[Unit]
 Description=Genesis pinned native Codebase query daemon
 [Service]
@@ -373,7 +360,7 @@ TimeoutStopSec=30
 [Install]
 WantedBy=default.target
 """,
-        config["name"] + "-clients.slice": owner
+        SLICE: owner
         + """[Unit]
 Description=Genesis managed Codebase frontend aggregate
 [Slice]
@@ -434,11 +421,7 @@ def configure(args: argparse.Namespace, path: Path) -> None:
         runtime=str(state / "runtime"),
         sentinel=str(absolute(args.sentinel)),
         build=BUILD,
-        name=args.name,
     )
-    # Apply the same schema before any filesystem mutation.
-    if not re.fullmatch(r"genesis-cbm-[a-z0-9]+(?:-[a-z0-9]+)*", args.name):
-        raise ValueError("invalid managed unit name")
     unit_dir = units_dir()
     units = render_units(config, path)
     unit_dir.mkdir(parents=True, exist_ok=True)
@@ -517,16 +500,16 @@ def rollback_configure(created: list[Path], unit_dir: Path, state: Path) -> None
             print(f"configure rollback daemon-reload failed: {error}", file=sys.stderr)
 
 
-def write_settings(path: Path, config: dict, expected=None) -> tuple[int, int]:
-    return atomic_write(path, json.dumps(config, indent=2) + "\n", expected)
+def write_settings(path: Path, config: dict, *, replace: bool = False) -> None:
+    atomic_write(path, json.dumps(config, indent=2) + "\n", replace=replace)
 
 
-def atomic_write(path: Path, text: str, expected=None) -> tuple[int, int]:
-    """Publish one complete document and return its (device, inode).
+def atomic_write(path: Path, text: str, *, replace: bool = False) -> None:
+    """Publish one complete document; a symlink at ``path`` is never followed.
 
-    With no ``expected`` identity the path must not exist: the link fails
-    rather than clobber a file created concurrently. Otherwise the path must
-    still be the inode that was verified. A symlink is never followed.
+    Without ``replace`` the path must not exist: the link fails rather than
+    clobber a file created concurrently. Callers that replace hold the lock;
+    a foreign writer racing it is out of scope (codebase-managed-runtime.md).
     """
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex)
     try:
@@ -534,14 +517,7 @@ def atomic_write(path: Path, text: str, expected=None) -> tuple[int, int]:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
-            info = os.fstat(stream.fileno())
-        if expected is None:
-            os.link(temporary, path)
-        else:
-            current = os.lstat(path)
-            if stat.S_ISLNK(current.st_mode) or (current.st_dev, current.st_ino) != expected:
-                raise ValueError(f"{path} changed after it was verified; preserved")
-            os.replace(temporary, path)
+        (os.replace if replace else os.link)(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory)
@@ -549,25 +525,15 @@ def atomic_write(path: Path, text: str, expected=None) -> tuple[int, int]:
             os.close(directory)
     finally:
         temporary.unlink(missing_ok=True)
-    return info.st_dev, info.st_ino
 
 
-def remove_verified(path: Path, identity: tuple[int, int]) -> None:
-    current = os.lstat(path)
-    if (current.st_dev, current.st_ino) != identity:
-        raise ValueError(f"{path} changed after it was verified; preserved")
-    path.unlink()
-
-
-def verify_units(config: dict, path: Path, *, exact: bool = True, only=None) -> dict:
+def verify_units(config: dict, path: Path, *, exact: bool = True, only=None) -> None:
     """Prove each generated unit is ours and is what the manager loaded.
 
     ``exact`` additionally requires the current template, which only ``enable``
-    asks for. ``only`` limits the proof to those units. Returns each fragment's
-    verified (device, inode).
+    asks for. ``only`` limits the proof to those units.
     """
     unit_dir = units_dir()
-    identities = {}
     for unit, expected in render_units(config, path).items():
         if only is not None and unit not in only:
             continue
@@ -575,7 +541,7 @@ def verify_units(config: dict, path: Path, *, exact: bool = True, only=None) -> 
         owned = owned_fragment(fragment, path)
         if not owned:
             raise ValueError(f"{unit} is not a generated fragment of this configuration")
-        if exact and owned[0] != expected:
+        if exact and owned != expected:
             raise ValueError(
                 f"{unit} differs from this checkout's template; from the primary "
                 "checkout run `codebase_managed.py disable` then `codebase_managed.py repair-units`"
@@ -587,8 +553,6 @@ def verify_units(config: dict, path: Path, *, exact: bool = True, only=None) -> 
             raise ValueError(f"{unit} has unverified drop-ins")
         if loaded["NeedDaemonReload"] != "no":
             raise ValueError(f"{unit} load is stale; run systemctl --user daemon-reload")
-        identities[unit] = owned[1]
-    return identities
 
 
 def template_drift(config: dict, path: Path) -> dict[str, str]:
@@ -602,7 +566,7 @@ def template_drift(config: dict, path: Path) -> dict[str, str]:
             continue
         if not owned:
             report[unit] = "not owned"
-        elif owned[0] == expected:
+        elif owned == expected:
             report[unit] = "current"
         else:
             report[unit] = "drift: enable refuses until disable, then repair-units"
@@ -612,20 +576,20 @@ def template_drift(config: dict, path: Path) -> dict[str, str]:
 def set_enabled(config: dict, path: Path, enabled: bool) -> None:
     with (units_dir() / ".genesis-codebase-config.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        config, identity = load_settings(path, require_build=enabled)
+        config = read_settings(path, require_build=enabled)
         if not enabled:
             # The operator's stop lever: persist first, so launch and batch
             # refuse even when the unit cannot be proven ours and is not stopped.
             config["enabled"] = False
-            write_settings(path, config, identity)
+            write_settings(path, config, replace=True)
             try:
                 verify_units(config, path, exact=False)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 raise ValueError(
-                    f"settings disabled, but {backend(config)} was NOT stopped: {error}. "
+                    f"settings disabled, but {BACKEND} was NOT stopped: {error}. "
                     "Inspect the unit before stopping it by hand"
                 ) from error
-            systemctl("stop", backend(config))
+            systemctl("stop", BACKEND)
             return
         verify_units(config, path)
         if sentinel_armed(config["sentinel"]):
@@ -634,19 +598,19 @@ def set_enabled(config: dict, path: Path, enabled: bool) -> None:
         with verified_binary(Path(config["binary"])):
             pass
         config["enabled"] = True
-        identity = write_settings(path, config, identity)
+        write_settings(path, config, replace=True)
         try:
-            systemctl("start", backend(config))
+            systemctl("start", BACKEND)
         except BaseException:
             # Each rollback step is attempted whatever the other does, and the
             # start failure is what the caller sees.
             config["enabled"] = False
             try:
-                write_settings(path, config, identity)
+                write_settings(path, config, replace=True)
             except Exception as error:  # noqa: BLE001 - reported; start error wins
                 print(f"rollback could not persist enabled=false: {error}", file=sys.stderr)
             try:
-                systemctl("stop", backend(config))
+                systemctl("stop", BACKEND)
             except Exception as stop_error:  # noqa: BLE001 - reported; start error wins
                 print(f"rollback stop failed: {stop_error}", file=sys.stderr)
             raise
@@ -663,11 +627,11 @@ def repair_units(path: Path) -> None:
         if main_script(config) != SCRIPT:
             raise ValueError("run repair-units from the configured primary checkout")
         units = render_units(config, path)
-        state = show(backend(config), "ActiveState", "ControlGroup")
+        state = show(BACKEND, "ActiveState", "ControlGroup")
         # Restart=no leaves a crashed or rolled-back daemon "failed", which stop
         # does not clear; with no control group left it is as idle as inactive.
         if state["ActiveState"] not in ("inactive", "failed") or state["ControlGroup"]:
-            raise ValueError(f"{backend(config)} must be inactive; run disable first")
+            raise ValueError(f"{BACKEND} must be inactive; run disable first")
         owned = {}
         for unit in units:  # verify every fragment before rewriting any
             fragment = unit_dir / unit
@@ -677,8 +641,8 @@ def repair_units(path: Path) -> None:
             if not same_file(show(unit, "FragmentPath")["FragmentPath"], fragment):
                 raise ValueError(f"{unit} loaded fragment is not the generated fragment")
         for unit, text in units.items():
-            if owned[unit][0] != text:  # replaces only the inode verified above
-                atomic_write(unit_dir / unit, text, owned[unit][1])
+            if owned[unit] != text:
+                atomic_write(unit_dir / unit, text, replace=True)
         systemctl("daemon-reload")
     print("Units repaired; services not started")
 
@@ -694,9 +658,9 @@ def remove(path: Path) -> None:
     unit_dir = units_dir()
     with (unit_dir / ".genesis-codebase-config.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        config, identity = load_settings(path, require_build=False)
+        config = read_settings(path, require_build=False)
         config["enabled"] = False
-        identity = write_settings(path, config, identity)
+        write_settings(path, config, replace=True)
         units = render_units(config, path)
         present = [unit for unit in units if os.path.lexists(unit_dir / unit)]
         if len(present) < len(units):
@@ -704,14 +668,14 @@ def remove(path: Path) -> None:
             if not all(unit_available(unit) for unit in units if unit not in present):
                 raise ValueError("a managed unit whose fragment is gone is still loaded or running")
         if present:
-            fragments = verify_units(config, path, exact=False, only=present)
-            if backend(config) in present:
-                systemctl("disable", backend(config))  # drops any boot enablement link
+            verify_units(config, path, exact=False, only=present)
+            if BACKEND in present:
+                systemctl("disable", BACKEND)  # drops any boot enablement link
             systemctl("stop", *present)
-            for unit, fragment_identity in fragments.items():
-                remove_verified(unit_dir / unit, fragment_identity)
+            for unit in present:
+                (unit_dir / unit).unlink()
             systemctl("daemon-reload")
-        remove_verified(path, identity)
+        path.unlink()
     print(f"Managed route removed; state under {Path(config['cache']).parent} and sentinel kept")
 
 
@@ -724,7 +688,7 @@ def launch(config: dict, path: Path) -> None:
     verify_units(config, path, exact=False)
     verify_cache(config)
     check_backend(config)
-    unit = config["name"] + "-client-" + uuid.uuid4().hex + ".service"
+    unit = NAME + "-client-" + uuid.uuid4().hex + ".service"
     command = [
         "/usr/bin/systemd-run",
         "--user",
@@ -732,14 +696,17 @@ def launch(config: dict, path: Path) -> None:
         "--quiet",
         "--collect",
         "--wait",
+        # Manager-side ${VAR} expansion would rewrite path arguments (v255 man
+        # systemd-run, --expand-environment); argv must reach the client literally.
+        "--expand-environment=no",
         "--unit=" + unit,
-        "--slice=" + config["name"] + "-clients.slice",
+        "--slice=" + SLICE,
         "-p",
-        "Requisite=" + backend(config),
+        "Requisite=" + BACKEND,
         "-p",
-        "After=" + backend(config),
+        "After=" + BACKEND,
         "-p",
-        "StopPropagatedFrom=" + backend(config),
+        "StopPropagatedFrom=" + BACKEND,
         "-p",
         "KillMode=control-group",
         "-p",
@@ -781,7 +748,6 @@ def main() -> int:
     setup = commands.add_parser("configure")
     for key in ("main", "binary", "state", "sentinel"):
         setup.add_argument("--" + key, required=True)
-    setup.add_argument("--name", default="genesis-cbm-query")
     commands.add_parser("launch")
     commands.add_parser("serve")
     commands.add_parser("ready")
@@ -813,14 +779,13 @@ def main() -> int:
             remove(path)
             return 0
         # Route selection happens in the shell callers. Every command reached
-        # here was selected or explicit, so it requires readable settings.
-        config = read_settings(path)
+        # here was selected or explicit, so it requires readable settings. The
+        # build pin gates running the executable; disable and status never do.
+        config = read_settings(path, require_build=args.command not in ("disable", "status"))
         if args.command == "launch":
             launch(config, path)
         elif args.command in ("serve", "client"):
-            execute_native(
-                config, args.command, backend(config) if args.command == "serve" else args.unit
-            )
+            execute_native(config, args.command, BACKEND if args.command == "serve" else args.unit)
         elif args.command == "ready":
             ready(config)
         elif args.command == "batch":
@@ -832,7 +797,7 @@ def main() -> int:
                 json.dumps(
                     dict(
                         settings=config,
-                        service=systemctl("show", backend(config), "-p", "ActiveState", "--value"),
+                        service=systemctl("show", BACKEND, "-p", "ActiveState", "--value"),
                         units=template_drift(config, path),
                     ),
                     indent=2,

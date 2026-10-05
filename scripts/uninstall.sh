@@ -583,7 +583,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
         # Remove systemd unit files
         SYSTEMD_DIR="$HOME/.config/systemd/user"
         for f in "$SYSTEMD_DIR"/genesis-*.service "$SYSTEMD_DIR"/genesis-*.timer \
-                 "$SYSTEMD_DIR"/genesis-cbm-*-clients.slice "$SYSTEMD_DIR/qdrant.service"; do
+                 "$SYSTEMD_DIR/genesis-cbm-query-clients.slice" "$SYSTEMD_DIR/qdrant.service"; do
             [ -e "$f" ] && safe_remove "$f" "systemd/$(basename "$f")"
         done
         systemctl --user daemon-reload 2>/dev/null || true
@@ -704,7 +704,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
             container_exec "
                 rm -f ~/.config/systemd/user/genesis-*.service \
                       ~/.config/systemd/user/genesis-*.timer \
-                      ~/.config/systemd/user/genesis-cbm-*-clients.slice \
+                      ~/.config/systemd/user/genesis-cbm-query-clients.slice \
                       ~/.config/systemd/user/qdrant.service 2>/dev/null;
                 systemctl --user daemon-reload 2>/dev/null || true
             "
