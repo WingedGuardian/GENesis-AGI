@@ -244,7 +244,9 @@ def test_14b_timeline_only_sent_back_but_later_merged_is_na(rebuild):
     assert state == G.REWORK_NA, msg
 
 
-def test_15_url_form_declaration_is_detected(rebuild):
+def test_15_url_form_declaration_is_detected(rebuild, monkeypatch):
+    """With no ``repo`` given, a URL counts when it names the repo gh resolves."""
+    monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "o/r")
     body = _BODY.replace("Replaces: #10", "Replaces: see below") + (
         "\nSupersedes https://github.com/o/r/pull/10\n"
     )
@@ -259,6 +261,28 @@ def test_15b_url_into_another_repo_is_not_a_declaration(rebuild):
     assert G._rework_declared_refs(body, "20", "o/r") == set()
 
 
+def test_15b2_url_with_no_resolvable_repo_is_not_a_declaration(monkeypatch):
+    """No ``repo`` and none resolvable from the cwd: a URL could name any repo,
+    so it is not counted (review finding: a foreign URL blocked an unrelated merge)."""
+    monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "")
+    body = "Supersedes https://github.com/other/project/pull/10\n"
+    assert G._rework_declared_refs(body, "20", None) == set()
+
+
+def test_15b3_url_into_another_repo_with_derived_repo_is_not_a_declaration(monkeypatch):
+    monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "owner/project")
+    body = "Supersedes https://github.com/other/project/pull/10\nReplaces #11\n"
+    assert G._rework_declared_refs(body, "20", None) == {11}
+
+
+def test_15d_a_long_whitespace_run_after_a_reference_is_linear():
+    """Review finding: overlapping whitespace separators backtracked quadratically."""
+    body = "Replaces #10" + " " * 60000 + "x"
+    started = time.monotonic()
+    assert G._rework_declared_refs(body, "20", "o/r") == {10}
+    assert time.monotonic() - started < 1.0
+
+
 @pytest.mark.parametrize(
     "line, refs",
     [
@@ -270,13 +294,22 @@ def test_15b_url_into_another_repo_is_not_a_declaration(rebuild):
         ("replaces #10 & #11", {10, 11}),
         ("**Replaces #1930 and #1931.**", {1930, 1931}),
         ("Supersedes #2819 and #2832 after their terminal review", {2819, 2832}),
+        # Review findings: markup between references, and sentence boundaries.
+        ("**Replaces #10**, **#11**", {10, 11}),
+        ("__Replaces #10__ and `#11`", {10, 11}),
+        ("Replaces https://github.com/o/r/pull/10 and #11", {10, 11}),
+        ("This replaces the cache. Follow-up to #10", set()),
+        ("This replaces the cache; see #10", set()),
+        ("Replaces #10\n\n#11", {10}),
+        ("Replaces #10 and fixes #11", {10}),
         # Not declarations: no reference on the verb's line, or the verb inside a word.
         ("This PR replaces all six walks with one scanner", set()),
         ("`supersedes` was passed\n#10 is unrelated", set()),
         ("the supersede_outcome #10", set()),
     ],
 )
-def test_15c_declaration_shapes(line, refs):
+def test_15c_declaration_shapes(line, refs, monkeypatch):
+    monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "o/r")
     assert G._rework_declared_refs(line, "20", None) == refs
 
 
@@ -511,6 +544,41 @@ def test_21_a_value_written_under_its_field_counts():
 def test_21b_a_field_followed_directly_by_the_next_field_is_still_empty():
     section = "## Rework\nReplaces: #10\nSplit: x\nDeviations:\n\nQuestions answered: y\n"
     assert G._rework_section_problems(section) == ["the `## Rework` section's `Deviations:` line is empty"]
+
+
+def test_21c_another_label_line_does_not_fill_an_empty_field():
+    """Review finding: `Testing: pytest` under an empty `Deviations:` filled it."""
+    section = (
+        "## Rework\nReplaces: #10\nSplit: x\nDeviations:\nTesting: pytest\n"
+        "Questions answered: y\n"
+    )
+    assert G._rework_section_problems(section) == ["the `## Rework` section's `Deviations:` line is empty"]
+
+
+def test_21c2_the_templates_kept_line_does_not_fill_an_empty_split():
+    section = (
+        "## Rework\nReplaces: #10\nSplit:\n"
+        "Kept / deleted / reshaped as the spec asked: all kept\n"
+        "Deviations: none\nQuestions answered: y\n"
+    )
+    assert G._rework_section_problems(section) == ["the `## Rework` section's `Split:` line is empty"]
+
+
+def test_21d_an_unindented_plain_value_under_a_field_still_counts():
+    section = "## Rework\nReplaces: #10\nSplit: x\nDeviations:\nnone\nQuestions answered: y\n"
+    assert G._rework_section_problems(section) == []
+
+
+def test_21e_the_bot_allowlist_comes_from_the_reviewer_registry(monkeypatch):
+    """No login is hard-coded: the registry's devin-marker logins are the allowlist,
+    and an unimportable registry allows no bot."""
+    assert G._rework_ack_bot_logins() == G.enforced_logins()["devin-marker"]
+
+    def _broken():
+        raise RuntimeError("unimportable")
+
+    monkeypatch.setattr(G, "enforced_logins", _broken)
+    assert G._rework_ack_bot_logins() == frozenset()
 
 
 def test_22_a_heading_with_trailing_text_is_the_section():

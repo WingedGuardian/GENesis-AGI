@@ -10029,10 +10029,18 @@ _REWORK_LABELS = ("needs-rework", "needs-architecture-session")
 #: `gh pr list --limit` for the sent-back read. A result this long is truncated.
 _REWORK_LIST_LIMIT = 500
 
-#: Bot logins whose acknowledgement counts despite a NONE author association.
-#: EXACT logins, never a pattern: Devin builds rework itself and comments as this
-#: GitHub App, whose association is NONE.
-_REWORK_ACK_BOT_LOGINS = {"devin-ai-integration[bot]"}
+def _rework_ack_bot_logins() -> frozenset[str]:
+    """Bot logins whose acknowledgement counts despite a NONE author association.
+
+    EXACT logins from the reviewer registry (its ``devin-marker`` parser), never a
+    pattern: Devin builds rework itself and comments as a GitHub App whose
+    association is NONE. An unimportable registry allows no bot (fails closed).
+    """
+    try:
+        return frozenset(enforced_logins().get("devin-marker", frozenset()))
+    except Exception:  # noqa: BLE001 — the registry stub raises when unimportable.
+        return frozenset()
+
 
 #: The heading an acknowledgement comment opens with (after leading whitespace).
 _REWORK_ACK_HEADING = "## rework acknowledgement"
@@ -10041,20 +10049,29 @@ _REWORK_ACK_HEADING = "## rework acknowledgement"
 _REWORK_FIELDS = ("Replaces", "Split", "Deviations", "Questions answered")
 
 _REWORK_REF = r"(?:#(\d+)|https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+))"
-# One reference as written in prose: an optional "PR " and optional backticks.
-_REWORK_REF_WRITTEN = r"(?:PR\s*)?`?" + _REWORK_REF + r"`?"
+# One reference as written in prose, with an optional "PR ".
+_REWORK_REF_WRITTEN = r"(?:PR[ \t]*+)?" + _REWORK_REF
 #: Signal (a): `replaces`/`supersedes`, then one or more references separated by
-#: commas, slashes, ampersands, spaces or "and". Up to 60 characters of the SAME
-#: line may sit between the verb and the first reference, because real rebuilds
-#: write `**Replaces #1930**`, `Replaces: #10`, `Replaces PR #10` and (a live split
-#: rebuild) `Replaces the configuration concern in #2892`. A wide match costs
-#: little: a reference only matters when it names a sent-back PR.
+#: commas, slashes, ampersands, spaces or "and". It is matched against ONE clause
+#: at a time (see `_rework_declared_refs`): a line with its emphasis and backticks
+#: removed, cut at the first sentence end. Up to 60 characters of that clause may
+#: sit between the verb and the first reference, because real rebuilds write
+#: `**Replaces #1930**`, `Replaces: #10`, `Replaces PR #10` and (a live split
+#: rebuild) `Replaces the configuration concern in #2892`. Every quantifier on
+#: whitespace is possessive, so a long whitespace run cannot backtrack.
 _REWORK_DECL_RE = re.compile(
-    r"\b(?:replaces|supersedes)\b[^\n#]{0,60}?"
+    r"\b(?:replaces|supersedes)\b[^#]{0,60}?"
     r"(?P<refs>" + _REWORK_REF_WRITTEN
-    + r"(?:(?:\s*[,/&]\s*(?:and\s+)?|\s*,?\s*and\s+|\s+)" + _REWORK_REF_WRITTEN + r")*)",
+    + r"(?:[ \t]*+(?:[,/&][ \t]*+)?(?:and[ \t]++)?" + _REWORK_REF_WRITTEN + r")*)",
     re.IGNORECASE,
 )
+#: Markup removed from a line before matching: bold/italic asterisks, double
+#: underscores, strike-through and backticks, so `**Replaces #10**, **#11**`
+#: reads as `Replaces #10, #11`. Single underscores stay (repository names use them).
+_REWORK_MARKUP_RE = re.compile(r"\*+|__+|~~|`+")
+#: A sentence end inside a line: `.`, `;`, `!` or `?` followed by whitespace or the
+#: end of the line. A URL's dots are followed by more URL, so it is never cut.
+_REWORK_CLAUSE_END_RE = re.compile(r"[.;!?](?=\s|$)")
 _REWORK_REF_RE = re.compile(_REWORK_REF)
 #: `## Rework`, optionally followed by text (`## Rework (replaces #10)`), but never
 #: the acknowledgement heading, which belongs on the OLD PR.
@@ -10067,6 +10084,10 @@ _REWORK_FIELD_RE = re.compile(
     r"(?:\*\*|__)?(.*)$",
     re.IGNORECASE,
 )
+#: An unindented `Label:` line that is not a rework field (`Testing: pytest`,
+#: `**E2E:** none`). It ends the field above it rather than filling it. A bullet
+#: or indented line is never a label: it is the field's value.
+_REWORK_OTHER_FIELD_RE = re.compile(r"^(?:\*\*|__)?[A-Za-z][\w /()-]{0,60}(?:\*\*|__)?:")
 
 
 def _rework_deadline_passed() -> bool:
@@ -10084,22 +10105,33 @@ def _rework_unreadable(what: str) -> str:
 def _rework_declared_refs(body: str, pr_num: str, repo: str | None) -> set[int]:
     """PR numbers this body declares it replaces (signal a), excluding itself.
 
-    A URL into a DIFFERENT repository is ignored when ``repo`` is known: its number
-    names a PR there, not here. With ``repo`` unknown the URL is taken as this repo's.
+    Each line is matched on its own, with markup removed and cut into clauses at
+    sentence ends, so a verb never reaches a reference on another line or in
+    another sentence. A URL counts only when it names THIS repository: ``repo``,
+    or with ``repo`` unknown the repository gh resolves from the cwd (the one a
+    bare merge targets). If neither is known, URL references are not counted.
     """
     me = int(pr_num) if str(pr_num).isdigit() else -1
     refs: set[int] = set()
-    want = (repo or "").lower()
-    for decl in _REWORK_DECL_RE.finditer(body or ""):
-        for m in _REWORK_REF_RE.finditer(decl.group("refs")):
-            if m.group(1):
-                n = int(m.group(1))
-            else:
-                if want and m.group(2).lower() != want:
-                    continue
-                n = int(m.group(3))
-            if n != me:
-                refs.add(n)
+    want: str | None = repo.lower() if repo else None
+    resolved = repo is not None
+    for line in (body or "").splitlines():
+        line = _REWORK_MARKUP_RE.sub("", line)
+        for clause in _REWORK_CLAUSE_END_RE.split(line):
+            for decl in _REWORK_DECL_RE.finditer(clause):
+                for m in _REWORK_REF_RE.finditer(decl.group("refs")):
+                    if m.group(1):
+                        n = int(m.group(1))
+                    else:
+                        if not resolved:
+                            derived = _derive_repo_from_cwd(os.getcwd())
+                            want = derived.lower() if derived else None
+                            resolved = True
+                        if want is None or m.group(2).lower() != want:
+                            continue
+                        n = int(m.group(3))
+                    if n != me:
+                        refs.add(n)
     return refs
 
 
@@ -10116,8 +10148,12 @@ def _rework_section_problems(body: str) -> list[str]:
             break
         m = _REWORK_FIELD_RE.match(ln)
         if not m:
-            # A value written under its field (a bullet list) belongs to that field.
-            if current is not None and ln.strip().strip("*_-+").strip():
+            if _REWORK_OTHER_FIELD_RE.match(ln):
+                # Another `Label:` line (`Testing: pytest`) ends the pending field;
+                # its text is not that field's value.
+                current = None
+            elif current is not None and ln.strip().strip("*_-+").strip():
+                # A value written under its field (a bullet list) belongs to it.
                 found[current] = True
             continue
         current = next(f for f in _REWORK_FIELDS if f.lower() == m.group(1).lower())
@@ -10331,10 +10367,10 @@ def _rework_ack_problem(num: int, rows: list[dict], created: _dt.datetime) -> st
     ]
     if not candidates:
         return f"PR #{num} has no `## Rework acknowledgement` comment"
+    bots = _rework_ack_bot_logins()
     authorised = [
         r for r in candidates
-        if r.get("association") in _MAINTAINER_ASSOCIATIONS
-        or r.get("login") in _REWORK_ACK_BOT_LOGINS
+        if r.get("association") in _MAINTAINER_ASSOCIATIONS or r.get("login") in bots
     ]
     if not authorised:
         return (
