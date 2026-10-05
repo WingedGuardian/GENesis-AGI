@@ -25,22 +25,32 @@ Add this entry to `~/genesis/.mcp.json` under `mcpServers`:
   "args": [
     "chrome-devtools-mcp@0.21.0",
     "--headless",
-    "--executablePath", "/usr/bin/google-chrome",
-    "--userDataDir", "${HOME}/.genesis/browser-profile",
+    "--executablePath", "<path to a Chrome or Chromium binary>",
+    "--userDataDir", "${HOME}/.genesis/devtools-profile",
     "--no-sandbox"
   ]
 }
 ```
 
+- `--executablePath`: Genesis installs do not ship Google Chrome. Use any
+  installed Chrome/Chromium; Playwright's own Chromium, if installed, lives
+  under `~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome`
+  (`ls -d ~/.cache/ms-playwright/chromium-*` shows the current build).
+- `--userDataDir`: keep it separate from `~/.genesis/browser-profile`, which the
+  Chromium fallback layer uses. Two Chromium processes on one profile fail to
+  start or corrupt it.
+
 Then restart the CC session to pick up the new MCP server.
 
-## Remote Browser (CDP-over-SSH)
+## Remote Browser (the user's Chrome)
 
-To connect to the user's real Chrome:
-
-1. User launches Chrome with `--remote-debugging-port=9222`
-2. Set up SSH tunnel: `ssh -N -L 9222:localhost:9222 user@host`
-3. Replace the config above with:
+Launching the user's Chrome for remote debugging and reaching its port is
+described in ONE place: the `browser-automation` skill, "Remote CDP setup"
+(`src/genesis/skills/browser-automation/SKILL.md`). Chrome 136+ ignores
+`--remote-debugging-port` on the default profile, and headed Chrome binds the
+port to loopback, so follow that section. Once the endpoint answers on
+`http://127.0.0.1:9222` (for example through an SSH tunnel), replace the config
+above with:
 
 ```json
 "chrome-devtools-remote": {
@@ -62,7 +72,7 @@ budget that the 29 Chrome DevTools MCP tools consume.
 
 | Mode | Tools | Context Cost |
 |------|-------|-------------|
-| Genesis browser tools (always on) | 8 | ~800 chars |
+| Genesis browser tools (always on) | 11 | ~4,600 chars of tool descriptions (measured 2026-10-04) |
 | + Chrome DevTools MCP | +29 | ~17,000 chars |
 | + Playwright MCP | +27 | ~13,700 chars |
 

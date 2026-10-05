@@ -544,7 +544,9 @@ cannot access. Do not apologize for limitations. Handle what you can.
 
 # Skills auto-injected by profile (always loaded for that profile)
 _PROFILE_SKILLS: dict[str, list[str]] = {
-    "interact": ["stealth-browser"],
+    # Both: stealth-browser is behaviour-only; the safety gates (payments,
+    # credentials, hand-off to the user) live in browser-automation.
+    "interact": ["stealth-browser", "browser-automation"],
     "research": ["web-research"],
     "observe": [],
     "campaign": ["voice-master"],

@@ -1316,3 +1316,11 @@ def test_open_question_authority_is_universal_so_overlay_profiles_inherit_it():
 
     authority = {"mcp__genesis-health__open_question_resolve", "mcp__genesis-health__open_question_block"}
     assert authority <= set(_UNIVERSAL_DISALLOW)
+
+
+def test_interact_profile_loads_browser_safety_rules():
+    """Background browser sessions must see the payment, credential and hand-off
+    rules, which live in browser-automation; stealth-browser is behaviour-only."""
+    from genesis.cc.direct_session import _PROFILE_SKILLS
+
+    assert {"stealth-browser", "browser-automation"} <= set(_PROFILE_SKILLS["interact"])

@@ -1,353 +1,204 @@
 ---
 name: stealth-browser
-description: Anti-detection behavioral rules for stealth browser automation
+description: Anti-detection behaviour for Genesis browser automation - what the Camoufox tools already do, what the agent must still do, Cloudflare Turnstile handling, and per-site notes for bot-hostile sites
 consumer: cc_any
 phase: execution
-keywords: [browser, stealth, camoufox, cloudflare, turnstile, captcha, anti-bot, navigate, automation, vnc, click, medium, publish]
+keywords: [browser, stealth, camoufox, cloudflare, turnstile, captcha, recaptcha, anti-bot, bot, detection, honeypot, fingerprint, navigate, automation, vnc, click, medium, publish]
 ---
 
-# Stealth Browser Skill
+# Stealth Browser
 
-Tool-agnostic anti-detection behavioral rules for browser automation.
-Applies regardless of browser engine (Camoufox, Playwright, future tools).
+Behaviour rules for sites that try to detect automation. Read the
+`browser-automation` skill first: layers, timeouts, safety gates,
+verify-after-act, overlays and closing browsers live there and are not repeated
+here.
 
-**Load this skill when:** The `browser_navigate` tool is used with the
-default Camoufox (anti-detection) mode. The tool's docstring directs you here.
+Bot detection scores the environment (fingerprint, IP, how the browser is
+driven) and the behaviour. The browser engine and the tools cover most of
+both. Your job is the part only a planner can do: what to visit, in what order,
+what not to touch, and when to stop.
 
-## Core Principle
+## What the tools already do
 
-Bot detection systems look for **behavioral signals**, not just
-fingerprints. A perfect fingerprint with robotic behavior is still
-detectable. The browser engine handles fingerprinting. This skill
-handles behavior.
+Do not re-implement any of this.
 
----
+| Behaviour | Where | Detail |
+|---|---|---|
+| Fingerprint | Camoufox engine | Firefox-based, spoofed at engine level |
+| Delay before `browser_click`, `browser_fill`, `browser_upload` | all layers below | see Timing |
+| Per-keystroke typing | Camoufox, remote CDP | field cleared first; key hold log-normal, median 86 ms (clamped 30-200 ms, p95 ~153 ms); 50-200 ms between keys; 5% of gaps are 0.3-1 s pauses. Chromium and TinyFish fill atomically |
+| Cursor | Camoufox | `humanize=2.5` cursor trail, hover, 50-200 ms dwell, click inside the central 60% of the element, 40-120 ms press. No scroll and no hit test: see `browser-automation`, "Clicking today" |
+| Turnstile | Camoufox, Chromium | detected and worked on inside `browser_navigate` (below) |
+| Keyboard repeat | `browser_press_key` | 50-150 ms between repeats, no pre-delay |
 
-## Always-Headed Mode
+**Not done for you, and not to be faked:** idle cursor jitter, humanized
+scrolling, tab visibility changes. `_idle_jitter()` and `_human_scroll()` exist
+in `browser.py` with no call site. Do not emulate them with `browser_run_js`:
+script-dispatched events carry `isTrusted=false` and a synthetic
+`visibilitychange` leaves `document.visibilityState` at `visible`, so both are
+easier to detect than doing nothing.
 
-Camoufox always launches headed on VNC display :99. This means:
-- Human can always observe the browser via noVNC
-- CAPTCHA/Turnstile escalation doesn't require browser restart
-- `browser_collaborate(True)` speeds up timing (human watching)
-- `browser_collaborate(False)` restores stealth timing (nobody watching)
+### Timing
+| Context | Delay before click/fill/upload |
+|---|---|
+| Camoufox (default) | 1-15 s log-normal, median ~3.3 s, p90 ~7 s |
+| Camoufox with `browser_collaborate(True)` | 0.5-2 s uniform |
+| Remote CDP | 0.5-2 s uniform, always |
+| Chromium, TinyFish | none |
 
----
+Collaborate timing stays on after any `browser_navigate(..., remote=True)` call
+and after a VNC hand-off. Call `browser_collaborate(False)` before stealth work
+in Camoufox, or every later action runs at the fast 0.5-2 s pace.
 
-## Layer 1: Current Infrastructure (use now)
+The delays are automatic. Never add sleeps, and never "wait 1-3 s" yourself.
+Spend the time reading the snapshot and planning the next action instead.
 
-These rules work with the existing browser tools. The tools already
-implement human-like delays automatically — this section covers what
-YOU (the LLM session) must do on top.
+## What you must do
 
-### Profile Pre-Warming
-
-Before navigating to a target form (especially ATS job applications),
-browse the company's public careers page first. This builds browsing
-history and cookie trail in the persistent profile. A cold browser going
-straight to an application form is a bot signal.
-
-### Page Load Warm-Up
-
-After `browser_navigate`, wait before interacting. Read the page snapshot,
-plan your actions. Do NOT immediately call `browser_fill` or `browser_click`.
-A human would look at the page first. 1-3 seconds minimum.
-
-### Honeypot Detection
-
-Before filling ANY form field, check the accessibility snapshot for hidden
-fields. Do NOT fill fields that appear to be:
-- `display: none` or `visibility: hidden` in the snapshot
-- Zero-dimension elements
-- Fields with names like `url`, `website`, `fax` that aren't expected
-  for the form type (common honeypot names)
-- Fields positioned off-screen
-
-Filling a honeypot = instant bot detection. When in doubt, skip the field.
-
-### Form Filling Order
-
-Fill fields in visual top-to-bottom order, matching how a human would
-tab through the form. Do NOT fill them in an arbitrary order.
-
-### Pre-Submit Validation
-
-Before clicking submit:
-1. Take a `browser_screenshot()`
-2. Review the screenshot to verify all fields are filled correctly
-3. Only then click submit
-4. Take another screenshot after submit to capture confirmation
-
-### Error Recovery
-
-If a form fill or click fails:
-- Do NOT immediately retry — wait 2-5 seconds
-- Take a screenshot to understand the current state
-- Try an alternative selector
-- If the page has changed (redirect, modal), re-read the snapshot
-
-### Per-Site Escalation
-
-Before engaging high-detection sites, check `references/per-site/` for
-site-specific rules. High-detection sites include:
-- **ATS systems**: Ashby, Greenhouse, Lever
-- **Social platforms**: Reddit, X/Twitter, LinkedIn
-- **Search engines**: Google
-- **Tech communities**: Hacker News, Stack Overflow
-
-If no per-site reference exists, conduct a research pass first to
-understand the site's detection patterns before automating.
-
----
-
-## Layer 2: Active Infrastructure
-
-These features are now implemented in the browser tools.
-
-### Per-Keystroke Typing (active)
-
-`browser_fill` now types character-by-character with randomized inter-key
-intervals (50-200ms) when Camoufox is active. This fires the full
-keydown→keypress/input→keyup event chain per character. Atomic `fill()`
-only fires a single `input` event — trivially detectable.
-
-**Note for phone fields with input masks:** The per-keystroke typing
-interacts with auto-formatting. If a phone field adds characters mid-type
-(e.g., "(123) 456-..."), let the field format naturally — the typing
-engine handles this. If the result looks wrong, retry with `browser_fill`
-after clearing the field manually.
-
-### Stealth Click (active)
-
-`browser_click` now uses hover→mousemove trail→position jitter→realistic
-mousedown/mouseup gap when Camoufox is active. Clicks land within the
-central 60% of elements, not dead center. The Camoufox `humanize=2.5`
-setting provides native Bézier cursor movement at the browser level.
-
-### Turnstile/CAPTCHA Auto-Resolution (active)
-
-After `browser_navigate`, Turnstile is automatically detected and
-resolved. The resolution cascade runs without any manual intervention:
-
-1. **Auto-resolve** (15s) — trusted browsers with cf_clearance clear instantly
-2. **Widget click** — finds challenge container via DOM selectors and clicks
-   with Camoufox's native Juggler input. This is the primary solver.
-3. **playwright-captcha** — Shadow DOM traversal fallback
-4. **VNC click** — real X11 input events via vncdotool (last resort)
-
-**You do NOT need to:**
-- Manually find or click Turnstile elements
-- Use VNC/vncdotool yourself
-- Write any challenge-bypass code
-- Escalate to the user
-
-Simply call `browser_navigate(url)` and check the response. If
-`turnstile.status == "resolved"`, the page is ready. If `"embedded"`,
-the page merely embeds a Turnstile widget (no blocking interstitial —
-the page is already loaded; solve the widget only if a later form submit
-needs it). If `"blocked"`, a Telegram alert was already sent.
-
----
-
-## Layer 3: VNC Trusted Input Bridge (automatic fallback)
-
-VNC click is the LAST fallback in the automated cascade (Phase 2 in
-`_wait_for_turnstile`). You should almost never need to invoke it
-manually — `browser_navigate` handles it automatically after the widget
-click and playwright-captcha both fail.
-
-This section documents the mechanism for debugging only. The VNC
-protocol injects real input events, bypassing detection of synthetic
-events (XTest, CDP, Playwright mouse).
-
-**Coordinate correctness is NOT this skill's subject, and the rules live in
-one place.** This path is the only one in the codebase that mixes coordinate
-spaces — DOM coordinates in CSS pixels against a window origin in physical
-screen pixels — and it got that wrong until #1828 (2026-09-09) by measuring
-`devicePixelRatio` and never applying it. That fix also added a pointer
-readback, so the path now reports where the pointer actually landed; it still
-cannot tell what is under it. Anti-detection and hitting the right
-pixel are orthogonal concerns; see **Coordinate Safety** in the
-`browser-automation` skill rather than re-deriving it here, so the two cannot
-drift apart.
-
-### Why It Works
-
-x11vnc injects input through the VNC protocol, adding network-realistic
-timing and event sequencing patterns. While the underlying X11 mechanism
-is similar to xdotool, the VNC protocol layer produces timing closer to
-real human input (variable latency, natural event gaps). Playwright uses
-CDP protocol which Cloudflare directly fingerprints. The practical result:
-VNC-injected clicks pass Turnstile where xdotool and Playwright fail.
-
-### When to Use
-
-- Turnstile checkbox doesn't auto-resolve after 15 seconds
-- reCAPTCHA v2 checkbox needs a human-like click
-- Any anti-bot system that rejects automated clicks
-
-### Prerequisites
-
-- `genesis-vnc.service` running (x11vnc on port 5900, systemd auto-start)
-- `vncdotool` installed (`pip install vncdotool`)
-- If the VNC service uses password auth, start a temporary no-auth
-  instance for programmatic use:
-  `x11vnc -display :99 -forever -nopw -quiet -bg -rfbport 5999`
-
-### Steps
-
-1. **Find the element** — use `browser_run_js` to get the target
-   element's bounding rect:
-   ```javascript
-   document.querySelector('[style*="display: grid"]').getBoundingClientRect()
+1. **Arrive like a visitor.** Before a target form, login or checkout, open the
+   site's public page (careers page, home page) in the same profile and reach
+   the target by clicking links. `browser_navigate` sends no referrer, so a
+   cold navigate straight to a deep form URL has no history behind it. Benefit
+   is plausible but unmeasured; skip it when the form URL is the only entry.
+2. **Check for honeypots before filling.** The snapshot is an accessibility
+   tree: it drops `display: none` fields and says nothing about opacity, clip,
+   overflow, size or position, so it cannot tell you which field is a
+   honeypot, while a selector can still reach one. Run this with
+   `browser_run_js`; it returns only the suspect controls, each with reasons:
+   ```js
+   (() => {
+     const why = el => {
+       const r = [], b = el.getBoundingClientRect();
+       for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+         const s = getComputedStyle(n);
+         if (s.display === 'none') r.push('display:none');
+         if (s.visibility === 'hidden') r.push('visibility:hidden');
+         if (+s.opacity === 0) r.push('opacity:0');
+         if (s.clip && s.clip !== 'auto') r.push('clip');
+         if (s.clipPath && s.clipPath !== 'none' && (n === el || /inset\((50|100)%|circle\(0/.test(s.clipPath))) r.push('clip-path');
+         if (n === el && n.getAttribute('aria-hidden') === 'true') r.push('aria-hidden');
+         if (n !== el && n !== document.body && n !== document.documentElement) {
+           const a = n.getBoundingClientRect(), cuts = v => v === 'hidden' || v === 'clip';
+           const ox = Math.min(b.right, a.right) - Math.max(b.left, a.left);
+           const oy = Math.min(b.bottom, a.bottom) - Math.max(b.top, a.top);
+           if ((cuts(s.overflowX) && ox < 2) || (cuts(s.overflowY) && oy < 2)) r.push('clipped by ancestor');
+         }
+       }
+       if (b.width < 2 || b.height < 2) r.push('zero size');
+       if (b.left >= innerWidth || b.right <= 0 || b.bottom + scrollY <= 0) r.push('off-screen');
+       return [...new Set(r)];
+     };
+     const out = [];
+     for (const e of document.querySelectorAll('input:not([type=hidden]):not([type=file]):not([type=checkbox]):not([type=radio]),textarea,select')) {
+       const r = why(e);
+       if (r.length) out.push({field: e.name || e.id, type: e.type, reasons: r});
+     }
+     for (const e of document.querySelectorAll('input[type=checkbox],input[type=radio]')) {
+       const label = e.labels && e.labels[0];
+       const r = label ? why(label) : ['no label'];
+       if (r.length) out.push({field: e.name || e.id, type: e.type, reasons: r.map(x => 'label: ' + x)});
+     }
+     return out;
+   })()
    ```
+   It checks text-like fields and selects against their own style and every
+   ancestor's, including an ancestor with `overflow: hidden` that cuts the
+   field off. Checkboxes and radios are judged by their `<label>`, because
+   real sites routinely hide the native control (opacity 0,
+   `appearance: none`) behind a styled label; file inputs are skipped for the
+   same reason. Fields below the fold and inside scrollable boxes are not
+   reported. Never fill a reported field. A checkbox or radio reported with
+   `no label` may be a custom control: confirm with a screenshot. If every
+   field is reported, a dialog is probably open: dismiss it and re-run.
+   Measured 2026-10-04 on a fixture, identical in Chromium (headed) and
+   Camoufox 135 (headless): 13 of 13 hidden fields reported, 0 of 10
+   legitimate controls (styled checkbox, radio and file input, a rounded
+   `clip-path` container, a scroll container, below-the-fold fields, a page
+   with `overflow-x: hidden` on `html` and `body`, an `aria-hidden` ancestor).
+3. **Fill in visual order**, top to bottom, the way a person tabs through.
+4. **Use the tools for every interaction.** Never click, type or submit through
+   `browser_run_js` (`el.click()`, `dispatchEvent`, setting `.value`) on a
+   protected site: those events are untrusted. Reading with it is fine.
+5. **Type exactly what is meant.** No deliberate typos: `browser_fill` clears
+   the field and types the whole value, so a "correction" cannot be appended
+   and a typo can land in the submitted text.
+   Fields with input masks (phone, dates) reformat as you type; if the read-back
+   value is wrong, call `browser_fill` again with the raw digits.
+6. **On a failed action**, re-read the snapshot before retrying, retry once with
+   a better selector, and decide data rejection versus bot detection
+   (`browser-automation`, Diagnosis) before switching layers.
+7. **Pace the site, not the page.** Space repeated submissions from one
+   identity (several minutes apart for applications) and avoid bursts.
+8. **Check `src/genesis/skills/stealth-browser/references/per-site/`** (in the
+   Genesis repo) before Ashby, Greenhouse, Lever or Reddit. For another
+   high-detection site (X, LinkedIn, Google, Hacker News, Stack
+   Overflow) with no file, research its detection first.
 
-2. **Get window geometry** — the browser window position on the Xvfb display:
-   ```bash
-   DISPLAY=:99 xdotool getwindowgeometry $(DISPLAY=:99 xdotool search --name "Camoufox")
-   ```
+## Cloudflare Turnstile
 
-3. **Calculate screen coordinates**:
-   - `screen_x = window_x + page_element_x`
-   - `screen_y = window_y + browser_chrome_height + page_element_y`
-   - Chrome height is ~34px for Camoufox (viewport = window - 34)
+`browser_navigate` handles it (Camoufox and Chromium; not remote CDP or
+TinyFish). Read `turnstile` in the result:
+- absent: no challenge detected, OR detection itself errored (the cascade
+  returns nothing when it throws). Check the result's `title` is not
+  "Just a moment..." before treating the page as loaded.
+- `resolved`: page is ready. `method` says how.
+- `embedded`: the page only embeds a widget on already-loaded content; no
+  interstitial. It matters only if a later submit needs the token.
+- `blocked`: not resolved. The tool attempted a Telegram alert (skipped when
+  Telegram credentials are missing). Hand off to the user
+  (`browser-automation`, Safety gates) or stop. Do not loop navigations;
+  Cloudflare rate-limits rapid retries, so wait at least 10 s before one retry.
 
-4. **Send human-like mouse movement** — move through 1-2 intermediate
-   points with 200-300ms pauses, then click:
-   ```bash
-   vncdo -s localhost::5999 move {start_x} {start_y}
-   # pause 300ms
-   vncdo -s localhost::5999 move {mid_x} {mid_y}
-   # pause 200ms
-   vncdo -s localhost::5999 move {target_x} {target_y} click 1
-   ```
+The cascade for a blocking interstitial, in order: auto-resolve poll (15 s),
+widget click (up to 3), `playwright-captcha` solver, VNC click (up to 3), page
+reload plus 2 more VNC clicks, then `blocked`. `playwright-captcha` and
+`vncdotool` are optional and not Genesis dependencies; when absent those phases
+fail with nothing in the tool result (only the server log). The full cascade
+can run past the 300 s navigate timeout: you then get a timeout error with no
+`turnstile` field and a reset page. Check the title on the next navigate
+before retrying.
 
-5. **Wait and verify** — allow 5-8 seconds for server-side verification,
-   then check if the page title changed from "Just a moment..." to the
-   actual page title.
+`cf_clearance` (the cookie that skips the challenge next time) lasts 30 min by
+default, configurable per site; Cloudflare recommends 15-45 min (Cloudflare
+docs, "Challenge Passage", read 2026-10-04). Do not assume a cleared challenge
+persists across a long task.
 
-### Notes
+### Debugging the VNC click by hand
+Only to debug the cascade; the tool does this itself. The VNC bridge injects
+OS-level pointer events (x11vnc delivers them through XTEST); whether that
+passes Turnstile more often than the widget click is unmeasured.
+- Server: `genesis-vnc.service`, x11vnc on display `:99`, port 5999, password
+  auth. Talk to it with `vncdo -s 127.0.0.1:99 -p "${GENESIS_VNC_PASSWORD:-genesis}"`
+  (display notation; `localhost::5999` fails over IPv6). Never start another
+  VNC server, and never one without a password: the display shows logged-in
+  sessions, and when the service is down the tools kill a foreign x11vnc
+  holding port 5999.
+- `vncdotool` is optional (`vncdo` may be absent).
+- Window origin: `DISPLAY=:99 xdotool getactivewindow getwindowgeometry`, as the
+  code does. Display `:99` is shared, so confirm the active window is this
+  session's Camoufox.
+- Convert with `vnc_click_target()` in `browser.py`:
+  `x = win_x + left * dpr`, `y = win_y + (chrome_h + top) * dpr`, where
+  `left`/`top` come from `getBoundingClientRect()`, `chrome_h` from
+  `outerHeight - innerHeight` and `dpr` from `devicePixelRatio`.
+- Move and click as separate `vncdo` calls, then allow 5-8 s and check that the
+  title left "Just a moment...".
+- reCAPTCHA is not handled by this path; its targeting knows Cloudflare
+  selectors only.
 
-- The `cf_clearance` cookie persists for days/weeks after clearing
-  Turnstile. Subsequent page loads won't trigger the challenge.
-- If verification fails (checkbox reappears), wait 10 seconds and retry
-  once. Cloudflare rate-limits rapid attempts.
-- This technique works for ANY browser on Xvfb, not just Camoufox.
+## When stealth is not enough
 
----
+- **Fingerprint scoring** (reCAPTCHA v3, enterprise anti-bot): behaviour cannot
+  fix a fingerprint score. Move to remote CDP (the user's Chrome) with the user,
+  or hand the step to the user.
+- **Paid services** (TinyFish, CAPTCHA solvers, cloud browsers, residential
+  proxies): `src/genesis/skills/stealth-browser/references/services.md` (in the Genesis repo). Every paid use needs the user's approval,
+  each time.
+- **IP reputation**: a datacenter IP is the strongest single signal on several
+  sites; there is no tool-level fix. Ask the user.
 
-## Timing Profiles
-
-The browser tools implement automatic delays. These are the profiles:
-
-| Context | Inter-action delay | Notes |
-|---------|-------------------|-------|
-| Background (Camoufox, default) | 1-15s log-normal | Stealth priority. Mostly 2-5s, occasional long pauses |
-| Collaborate (Camoufox + VNC) | 0.5-2s uniform | Human watching. Responsive but not instant |
-| Playwright/Chromium (dev/test) | None | Speed priority. No stealth needed |
-
-The delay fires automatically before `browser_fill`, `browser_click`,
-and `browser_upload`. You do NOT need to add manual sleeps.
-
----
-
-## Anti-Detection Services
-
-See `references/services.md` for external services that supplement
-the browser's built-in anti-detection:
-- **2Captcha**: Programmatic CAPTCHA solving ($0.00145/solve)
-- **Browserbase**: Cloud browser with real hardware ($0.002/session)
-- **Residential proxies**: IP reputation improvement
-
----
-
-## Advanced Behavioral Rules
-
-These rules address detection surfaces beyond basic timing and clicks.
-Apply them in all Camoufox sessions unless site-specific guidance overrides.
-
-### Idle Mouse Micro-Jitter
-
-Real hands produce ±1-3px tremor while "still." Between actions (any
-dwell period >2s), the cursor must not be dead-still.
-
-- Emit 1-3 mousemove events every 1-2s during all dwell periods
-- Displacement: ±1-3px from current position (random, not oscillating)
-- Do NOT jitter during active movement (only during stillness)
-- `_idle_jitter()` exists in browser.py but **has no call site** — verified
-  against the current tree. Nothing emits this jitter on your behalf, so a
-  dwell is genuinely dead-still unless something invokes it. Treat this as a
-  rule with a helper available, not a behaviour you already have.
-
-### Keystroke Hold Time (keydown-to-keyup gap)
-
-Real keys are held briefly before release. Each keypress fires
-`keyboard.down(char)` → hold → `keyboard.up(char)`.
-
-- Hold time per key: sample from log-normal distribution
-- Calibration: median ~86ms (p5=48ms, p95=149ms) per CMU Keystroke dataset
-- Vary per keystroke -- NOT uniform across all keys
-- Flight time (key-up to next key-down): existing 50-200ms IKI still applies
-- Implemented in `_human_type()` in browser.py and wired: `browser_fill` calls
-  it whenever Camoufox or remote CDP is active, which is this skill's whole
-  scope. On plain Chromium it falls back to an atomic `page.fill()`, so the
-  per-keystroke timing is a property of the stealth path, not of every fill.
-
-### Navigation Graph Depth
-
-Arriving directly at a form/auth page with no prior navigation is a
-strong bot signal regardless of per-page behavior.
-
-- For ANY target that is a form, login, checkout, or data-heavy endpoint:
-  navigate through at least 2 prior pages on the same domain
-- Dwell 2-5s on each prior page before proceeding
-- This generalizes the existing "visit careers page" rule to all targets
-- Referrer chain must be organic (not cold-start direct navigation)
-
-### Tab Visibility Switch
-
-Sessions maintaining continuous focus for >15s are atypical for humans.
-
-- For pages with >15s dwell before form interaction: simulate one
-  visibilitychange event (tab hidden + visible) before submission
-- Use `browser_run_js` to dispatch: `document.dispatchEvent(new Event('visibilitychange'))`
-- Or use actual tab switching if available
-
-### Scroll Patterns
-
-Real scrolling decelerates, occasionally goes backwards, and pauses at
-content boundaries.
-
-- Include at least one upward scroll segment per page (probability 0.2)
-- Decelerate scroll to zero over 200-400ms at end of each gesture
-- Add "scroll past then back" pattern when targeting form fields (p=0.3)
-- Scroll delta variance: 20-100px per event (never constant)
-- `_human_scroll()` exists in browser.py but **has no call site** — verified
-  against the current tree. Scrolling done any other way has none of the
-  properties above.
-
-### Pre-Form Element Interaction
-
-Direct-to-form behavior (first interaction is a form field) scores
--0.1 to -0.3 on reCAPTCHA v3.
-
-- Before filling the first form field: move cursor to 1-2 non-form
-  elements (nav link, header, image), dwell 0.3-1.5s each
-- Then move to the first form field
-- This produces an interaction graph that doesn't start at the form target
-
-### Typo and Self-Correction (long text fields only)
-
-Real typists make errors at ~2% rate and correct them.
-
-- For text fields >20 characters: introduce one typo per ~50 chars
-- Type 1-2 wrong characters, pause 200-500ms, backspace, type correct
-- Do NOT apply to short fields (names, emails, passwords)
-- This is LLM-guided behavior, not auto-enforced in code
-
----
-
-## What This Skill Does NOT Cover
-
-- Browser fingerprinting (handled by Camoufox at C++ level)
-- Proxy/IP management (see references/services.md)
-- Account management (login sessions, credential storage)
+## References
+Paths are relative to the Genesis repo root:
+- `src/genesis/skills/stealth-browser/references/anti-detection-research.md`: detection signals and vendor notes.
+- `src/genesis/skills/stealth-browser/references/services.md`: paid services, with dated prices.
+- `src/genesis/skills/stealth-browser/references/per-site/`: `ats-ashby.md` (Ashby, Greenhouse, Lever), `reddit.md`.
