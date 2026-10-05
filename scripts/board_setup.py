@@ -2,35 +2,50 @@
 """Set up (or re-check) the work board on GitHub Projects v2 — idempotent.
 
 DRY RUN BY DEFAULT: prints what it would do and changes nothing. ``--apply``
-performs the GitHub changes; ``--write-config`` also records the project in the
-user overlay (``~/.genesis/config/board.local.yaml``). Both are outward actions
-the owner runs deliberately; nothing calls this script automatically.
+performs the GitHub changes; ``--write-config`` lets a run that CREATES the
+project record it in the board overlay. Both are outward actions the owner runs
+deliberately; nothing calls this script automatically.
+
+Which project: ONLY the one recorded in the board overlay
+(``project_owner`` / ``project_number``, read exactly as the runtime reads it),
+or one this script creates. It never adopts a project by its title — a
+same-titled project nobody recorded may be anyone's, and setup deletes
+workflows and rewrites fields — so an unrecorded same-titled project is a
+refusal: record the one you mean, or rename it.
 
 What it ensures, in order (every step is a no-op when already true):
 
-1. ONE open user project titled ``--title`` (default "Genesis Work Board"),
-   linked to the configured public tracker (``github.user`` /
+1. The project. Recorded -> it must exist, be open, and belong to the
+   authenticated account. Nothing recorded and no open project titled
+   ``--title`` (default "Genesis Work Board") -> create it (GitHub creates it
+   PRIVATE), record it (needs ``--write-config``) and STOP: project reads lag
+   writes by seconds (MEASURED), so a freshly created project is checked by a
+   re-run, never by this one.
+2. The project is linked to the configured public tracker (``github.user`` /
    ``github.public_repo`` — the repo promotions post to, never this checkout's
-   own remote, which on a fork clone is the operator's fork). Zero -> create
-   (GitHub creates it PRIVATE) and STOP: project reads lag writes by seconds
-   (MEASURED), so a freshly created project is checked by a re-run, never by
-   this one. More than one -> refuse, never guess which.
-2. Status options = Proposed / Ready / In Progress / In Review / Done, with every
-   existing option re-sent with its id (no card loses its value). An option
-   outside that list is dropped only when NO item uses it.
-3. A "Genesis" single-select field (Genesis's own per-card status) and a
+   own remote, which on a fork clone is the operator's fork), read from
+   ``ProjectV2.repositories``; linked with ``linkProjectV2ToRepository`` if not.
+3. Status options = Proposed / Ready / In Progress / In Review / Done, with every
+   existing option re-sent with its id. An option outside that list is ALWAYS
+   kept: deleting one clears it from every card that holds it, and no read
+   made before the write can prove no card holds it AT the write.
+4. A "Genesis" single-select field (Genesis's own per-card status) and a
    "Genesis note" text field.
-4. Workflows: deletes "Pull request linked to issue" (it sets In Progress by
+5. Workflows: deletes "Pull request linked to issue" (it sets In Progress by
    itself, and only a human may start work) and "Item added to project" (the
-   drain sets Proposed on a promoted issue, the reconciler on every other
-   one). Requires "Pull request merged" and "Item closed" to exist and be
-   enabled; GitHub offers NO API to create or enable a
-   workflow, so a missing one is reported with the UI step, and the exit code
-   is non-zero.
-5. Views "Active" (``-status:Proposed``) and "Backlog" (``status:Proposed``).
+   board reconciler sets a new card's Status itself). Requires "Pull request
+   merged" and "Item closed" to exist and be enabled; GitHub offers NO API to
+   create or enable a workflow, so a missing one is reported with the UI step,
+   and the exit code is non-zero.
+6. Views "Active" (``-status:Proposed``) and "Backlog" (``status:Proposed``).
 
-MEASURED behaviour this relies on: Genesis memory 339996e5 and the
-``genesis.board.projects_v2`` module docstring.
+The overlay write loads the SAME overlay the runtime resolves
+(``genesis._config_overlay``: the user dir first, then the legacy repo-local
+``config/board.local.yaml``) and keeps every key in it, so recording the project
+in the user overlay never hides a setting that lived in the legacy one.
+
+MEASURED behaviour this relies on: the ``genesis.board.projects_v2`` module
+docstring.
 """
 
 from __future__ import annotations
@@ -60,6 +75,108 @@ def _repo_slug() -> str:
     return "/".join(tracker)
 
 
+def _overlay_plan() -> tuple[Path, Path, dict | None]:
+    """``(read_from, write_to, data)`` for recording the project.
+
+    *read_from* is the overlay the runtime reads RIGHT NOW
+    (``_resolve_overlay_path``: the user dir first, then the legacy repo-local
+    file); *write_to* is the user overlay, which ``merge_local_overlay`` prefers
+    from the moment it exists. Writing the user overlay without carrying the
+    legacy file's keys would silently drop them (``mode``, ``enabled``, ...), so
+    *data* is that file's whole mapping — ``{}`` when there is none, None when
+    it cannot be read as a mapping (the caller refuses)."""
+    import yaml
+
+    from genesis._config_overlay import _resolve_overlay_path, _user_config_dir
+    from genesis.board import config as board_config
+
+    read_from = _resolve_overlay_path(board_config._base_path())
+    write_to = _user_config_dir() / "board.local.yaml"
+    if not read_from.exists():
+        return read_from, write_to, {}
+    try:
+        loaded = yaml.safe_load(read_from.read_text())
+    except (OSError, yaml.YAMLError):
+        return read_from, write_to, None
+    if loaded is None:
+        return read_from, write_to, {}
+    return read_from, write_to, loaded if isinstance(loaded, dict) else None
+
+
+def _record_project(plan: tuple[Path, Path, dict], owner: str, number: int, say) -> None:
+    import yaml
+
+    from genesis.util.atomic import atomic_write_text
+
+    read_from, write_to, data = plan
+    data = {**data, "project_owner": owner, "project_number": number}
+    atomic_write_text(write_to, yaml.safe_dump(data, sort_keys=False))
+    if read_from != write_to:
+        say(f"carried every key of the legacy overlay {read_from} into {write_to}")
+    say(f"recorded project_owner={owner} project_number={number} in {write_to}")
+
+
+async def _identify_project(pv, title, owner, owner_id, slug, apply, write_config, act, say):
+    """The recorded project (``(number, None)``), or an exit code
+    (``(None, code)``) when there is nothing to set up in this run: a refusal, a
+    dry run of the create, or a create that a re-run must finish."""
+    from genesis.board import config as board_config
+
+    ref = board_config.project_ref()
+    if ref is not None:
+        recorded_owner, number = ref
+        # GitHub logins are case-insensitive; a hand-written overlay may differ in case.
+        if recorded_owner.lower() != owner.lower():
+            say(
+                f"REFUSING: the recorded project belongs to {recorded_owner!r}, but gh is "
+                f"authenticated as {owner!r}"
+            )
+            return None, 2
+        return number, None
+
+    cfg = board_config.load_config()
+    if cfg.get("project_owner") is not None or cfg.get("project_number") is not None:
+        say("REFUSING: the board overlay's project_owner/project_number are malformed; fix them")
+        return None, 2
+    plan = _overlay_plan()
+    found = await pv.find_projects_by_title(owner, title)
+    if found:
+        # Point at the file the runtime reads now: a hand-made user overlay
+        # would hide a legacy repo-local one (and every key in it).
+        where = plan[0] if plan[0].exists() else plan[1]
+        say(
+            f"REFUSING: open project(s) titled {title!r} exist ({[p['number'] for p in found]}) "
+            f"but none is recorded in the board config, and setup never adopts a project by "
+            f"its title. Record the one you mean (project_owner: {owner}, project_number: <n>) "
+            f"in {where}, or rename it, then re-run."
+        )
+        return None, 2
+    if plan[2] is None:
+        say(f"REFUSING: the board overlay {plan[0]} is not a readable mapping; fix it first")
+        return None, 2
+    if not write_config:
+        say(
+            f"REFUSING to create project {title!r} without --write-config: a project this "
+            "script creates is identified by the number it records, never by its title"
+        )
+        return None, 2
+    say(f"{act}create private project {title!r} linked to {slug}, and record it in {plan[1]}")
+    if not apply:
+        say("(nothing further can be checked until the project exists)")
+        return None, 0
+    repo_owner, repo_name = slug.split("/", 1)
+    created = await pv.create_project(
+        owner_id, title, await pv.repository_id(repo_owner, repo_name)
+    )
+    _record_project(plan, owner, created["number"], say)
+    say(
+        f"created project #{created['number']} (public={created['public']}). GitHub reads "
+        "lag writes: wait a minute, then re-run this command to finish setup (an immediate "
+        "re-run may not see the new project yet)."
+    )
+    return None, 3
+
+
 async def run(title: str, apply: bool, write_config: bool, allow_public: bool = False) -> int:
     from genesis.board import projects_v2 as pv
 
@@ -72,31 +189,21 @@ async def run(title: str, apply: bool, write_config: bool, allow_public: bool = 
     slug = _repo_slug()
     say(f"account: {owner}; repo: {slug}")
 
-    found = await pv.find_projects_by_title(owner, title)
-    if len(found) > 1:
-        say(
-            f"REFUSING: {len(found)} open projects titled {title!r} ({[p['number'] for p in found]}); close extras first"
-        )
+    # 1. The project: the recorded one, or one this run creates.
+    number, code = await _identify_project(
+        pv, title, owner, owner_id, slug, apply, write_config, act, say
+    )
+    if number is None:
+        return code
+    try:
+        proj = await pv.get_project(owner, number)
+    except pv.ProjectsError as exc:
+        say(f"REFUSING: the recorded project #{number} cannot be read ({exc}); fix the record")
         return 2
-    if not found:
-        say(f"{act}create private project {title!r} linked to {slug}")
-        if not apply:
-            say("(nothing further can be checked until the project exists)")
-            return 0
-        repo_owner, repo_name = slug.split("/", 1)
-        created = await pv.create_project(
-            owner_id, title, await pv.repository_id(repo_owner, repo_name)
-        )
-        say(
-            f"created project #{created['number']} (public={created['public']}). GitHub reads "
-            "lag writes: wait a minute, then re-run this command to finish setup and record the config (an immediate re-run may not see the new project yet)."
-        )
-        return 3
-    else:
-        number = found[0]["number"]
-        say(f"project #{number} {title!r} exists")
-
-    proj = await pv.get_project(owner, number)
+    if proj.closed:
+        say(f"REFUSING: the recorded project #{number} is closed; reopen it or fix the record")
+        return 2
+    say(f"project #{number} {proj.title!r} (recorded)")
     if proj.public and not allow_public:
         say(
             "REFUSING: the project is PUBLIC, so Genesis's status text would be visible to anyone. "
@@ -104,33 +211,37 @@ async def run(title: str, apply: bool, write_config: bool, allow_public: bool = 
         )
         return 2
 
-    # 2. Status options — never clear a card's value.
+    # 2. Linked to the tracker promotions post to.
+    linked = {r.lower() for r in await pv.project_repositories(proj.id)}
+    if slug.lower() in linked:
+        say(f"project linked to {slug} OK")
+    else:
+        say(f"{act}link project #{number} to {slug}")
+        if apply:
+            repo_owner, repo_name = slug.split("/", 1)
+            await pv.link_repository(proj.id, await pv.repository_id(repo_owner, repo_name))
+
+    # 3. Status options — never delete one: that clears it from every card.
     status = proj.fields.get(pv.STATUS_FIELD)
     if status is None or status.kind != "single_select":
         say("PROBLEM: no single-select Status field")
         problems += 1
     else:
-        used = {
-            (it.get("status") or {}).get("name") for it in (await pv.list_items(proj.id))["items"]
-        }
-        unlisted = [o["name"] for o in status.raw_options if o["name"] not in pv.STATUS_OPTIONS]
-        keep_unlisted = any(name in used for name in unlisted)
-        wanted = pv.merge_options(
-            status.raw_options, pv.STATUS_OPTIONS, keep_unlisted=keep_unlisted
-        )
+        wanted = pv.merge_options(status.raw_options, pv.STATUS_OPTIONS, keep_unlisted=True)
         current = [o["name"] for o in status.raw_options]
         target = [o["name"] for o in wanted]
         if current != target:
+            kept = [n for n in current if n not in pv.STATUS_OPTIONS]
             say(
                 f"{act}set Status options {current} -> {target}"
-                + (" (unlisted options kept: a card uses one)" if keep_unlisted else "")
+                + (f" (options outside the board's columns kept: {kept})" if kept else "")
             )
             if apply:
                 await pv.update_single_select_options(status.id, wanted)
         else:
             say("Status options OK")
 
-    # 3. Genesis fields.
+    # 4. Genesis fields.
     gen = proj.fields.get(pv.GENESIS_FIELD)
     if gen is not None and gen.kind != "single_select":
         say(
@@ -152,14 +263,20 @@ async def run(title: str, apply: bool, write_config: bool, allow_public: bool = 
                 )
         else:
             say(f"{pv.GENESIS_FIELD!r} field OK")
-    if pv.GENESIS_NOTE_FIELD not in proj.fields:
+    note = proj.fields.get(pv.GENESIS_NOTE_FIELD)
+    if note is not None and note.kind != "text":
+        say(
+            f"PROBLEM: field {pv.GENESIS_NOTE_FIELD!r} exists but is not a text field; rename or delete it"
+        )
+        problems += 1
+    elif note is None:
         say(f"{act}create text field {pv.GENESIS_NOTE_FIELD!r}")
         if apply:
             await pv.create_text_field(proj.id, pv.GENESIS_NOTE_FIELD)
     else:
         say(f"{pv.GENESIS_NOTE_FIELD!r} field OK")
 
-    # 4. Workflows.
+    # 5. Workflows.
     workflows = await pv.list_workflows(proj.id)
     for wf in workflows:
         if wf["name"] in pv.WORKFLOWS_TO_DELETE:
@@ -178,7 +295,7 @@ async def run(title: str, apply: bool, write_config: bool, allow_public: bool = 
         else:
             say(f"workflow {name!r} OK")
 
-    # 5. Views.
+    # 6. Views.
     views = {v["name"]: v for v in await pv.list_views(proj.id)}
     for name, filt in VIEWS.items():
         view = views.get(name)
@@ -186,35 +303,23 @@ async def run(title: str, apply: bool, write_config: bool, allow_public: bool = 
             say(f"{act}create view {name!r} with filter {filt!r}")
             if apply:
                 await pv.set_view_filter(await pv.create_view(proj.id, name), filt)
-        elif view.get("filter") != filt:
-            say(f"{act}set view {name!r} filter {view.get('filter')!r} -> {filt!r}")
-            if apply:
-                await pv.set_view_filter(view["id"], filt)
         else:
-            say(f"view {name!r} OK")
+            ok = True
+            if view.get("layout") != pv.BOARD_LAYOUT:
+                ok = False
+                say(f"{act}set view {name!r} layout {view.get('layout')!r} -> {pv.BOARD_LAYOUT!r}")
+                if apply:
+                    await pv.set_view_layout(view["id"], pv.BOARD_LAYOUT)
+            if view.get("filter") != filt:
+                ok = False
+                say(f"{act}set view {name!r} filter {view.get('filter')!r} -> {filt!r}")
+                if apply:
+                    await pv.set_view_filter(view["id"], filt)
+            if ok:
+                say(f"view {name!r} OK")
 
-    # Config overlay.
     if write_config:
-        import yaml
-
-        from genesis._config_overlay import _user_config_dir
-
-        path = _user_config_dir() / "board.local.yaml"
-        data = {}
-        if path.exists():
-            loaded = yaml.safe_load(path.read_text()) or {}
-            if not isinstance(loaded, dict):
-                say(f"REFUSING to rewrite {path}: it is not a mapping")
-                return 2
-            data = loaded
-        if data.get("project_owner") == owner and data.get("project_number") == number:
-            say(f"config overlay OK ({path})")
-        else:
-            say(f"{act}record project_owner={owner} project_number={number} in {path}")
-            if apply:
-                data.update({"project_owner": owner, "project_number": number})
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(yaml.safe_dump(data, sort_keys=False))
+        say("config overlay OK (this project is the one recorded there)")
     say(json.dumps({"project_number": number, "problems": problems, "applied": apply}))
     return 1 if problems else 0
 
@@ -228,7 +333,9 @@ def main() -> None:
         "--apply", action="store_true", help="perform the GitHub changes (default: dry run)"
     )
     ap.add_argument(
-        "--write-config", action="store_true", help="record the project in the user overlay"
+        "--write-config",
+        action="store_true",
+        help="let a run that creates the project record it in the board overlay",
     )
     ap.add_argument(
         "--allow-public",

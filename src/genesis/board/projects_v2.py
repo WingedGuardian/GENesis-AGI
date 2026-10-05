@@ -8,7 +8,7 @@ view and workflow setup; item add; the per-value ``updatedAt`` the reconciler
 keys on).
 
 Behaviour that is MEASURED, not assumed (P1 probe on a private user project,
-2026-10-03; Genesis memory 339996e5):
+2026-10-03):
 
 * No API creates, enables or reads the configuration of a built-in project
   workflow — only ``deleteProjectV2Workflow`` exists. A NEW project ships six
@@ -139,6 +139,7 @@ class Project:
     title: str
     public: bool
     fields: dict[str, Field]
+    closed: bool = False
 
 
 _FIELDS_FRAGMENT = """
@@ -169,7 +170,14 @@ def _parse_project(node: dict) -> Project:
             fields[f["name"]] = Field(f["id"], f["name"], "text")
         else:
             fields[f["name"]] = Field(f["id"], f["name"], "other")
-    return Project(node["id"], node["number"], node["title"], node["public"], fields)
+    return Project(
+        node["id"],
+        node["number"],
+        node["title"],
+        node["public"],
+        fields,
+        closed=bool(node.get("closed")),
+    )
 
 
 async def viewer(*, runner: Runner | None = None) -> dict:
@@ -180,7 +188,7 @@ async def viewer(*, runner: Runner | None = None) -> dict:
 
 async def get_project(owner: str, number: int, *, runner: Runner | None = None) -> Project:
     data = await graphql(
-        "query($o: String!, $n: Int!) { user(login: $o) { projectV2(number: $n) { id number title public "
+        "query($o: String!, $n: Int!) { user(login: $o) { projectV2(number: $n) { id number title public closed "
         + _FIELDS_FRAGMENT
         + "} } }",
         {"o": owner, "n": number},
@@ -223,6 +231,41 @@ async def repository_id(owner: str, name: str, *, runner: Runner | None = None) 
     return data["repository"]["id"]
 
 
+async def project_repositories(project_id: str, *, runner: Runner | None = None) -> list[str]:
+    """``owner/name`` of every repository linked to the project, paginated to
+    the end (``ProjectV2.repositories``, READ by schema introspection
+    2026-10-04), so "not linked" is a complete answer."""
+    names, cursor = [], None
+    while True:
+        data = await graphql(
+            "query($p: ID!, $c: String) { node(id: $p) { ... on ProjectV2 { repositories("
+            "first: 100, after: $c) { nodes { nameWithOwner } pageInfo { hasNextPage endCursor } }"
+            " } } }",
+            {"p": project_id, "c": cursor},
+            runner=runner,
+        )
+        node = data.get("node")
+        if not isinstance(node, dict) or "repositories" not in node:
+            raise ProjectsError(f"project {project_id} could not be read")
+        conn = node["repositories"]
+        names += [r["nameWithOwner"] for r in conn["nodes"] if r]
+        if not conn["pageInfo"]["hasNextPage"]:
+            return names
+        cursor = conn["pageInfo"]["endCursor"]
+
+
+async def link_repository(project_id: str, repo_id: str, *, runner: Runner | None = None) -> None:
+    """Link a repository to the project (``linkProjectV2ToRepository``, READ by
+    schema introspection 2026-10-04: input ``projectId`` + ``repositoryId``)."""
+    await graphql(
+        "mutation($p: ID!, $r: ID!) { linkProjectV2ToRepository(input: {projectId: $p,"
+        " repositoryId: $r}) { repository { id } } }",
+        {"p": project_id, "r": repo_id},
+        runner=runner,
+    )
+
+
+# GROUNDWORK(board-reconciler-writes): see add_item.
 async def issue_node_id(owner: str, name: str, number: int, *, runner: Runner | None = None) -> str:
     data = await graphql(
         "query($o: String!, $n: String!, $i: Int!) { repository(owner: $o, name: $n) {"
@@ -386,6 +429,20 @@ async def create_view(project_id: str, name: str, *, runner: Runner | None = Non
     return data["createProjectV2View"]["projectV2View"]["id"]
 
 
+BOARD_LAYOUT = "BOARD_LAYOUT"  # ProjectV2ViewLayout value (MEASURED: reads back verbatim)
+
+
+async def set_view_layout(view_id: str, layout: str, *, runner: Runner | None = None) -> None:
+    """Set an existing view's layout (``UpdateProjectV2ViewInput.layout``, READ
+    by schema introspection 2026-10-04)."""
+    await graphql(
+        "mutation($v: ID!, $l: ProjectV2ViewLayout!) { updateProjectV2View(input: {viewId: $v,"
+        " layout: $l}) { projectV2View { id } } }",
+        {"v": view_id, "l": layout},
+        runner=runner,
+    )
+
+
 async def set_view_filter(view_id: str, filter_: str, *, runner: Runner | None = None) -> None:
     await graphql(
         "mutation($v: ID!, $f: String!) { updateProjectV2View(input: {viewId: $v, filter: $f})"
@@ -396,8 +453,6 @@ async def set_view_filter(view_id: str, filter_: str, *, runner: Runner | None =
 
 
 # ─── item operations (the reconciler's surface) ─────────────────────────────
-# issue_node_id / add_item / item_status / set_single_select place a promoted
-# issue on the board (the drain, autonomy.contributor_issue_watcher);
 # list_items / repo_open_counts / card_for_issue are the read-only reconciler's
 # and board_item's reads (board.reconciler, mcp.health.board_tools).
 # GROUNDWORK(board-reconciler-writes): set_text is the Genesis-note surface of
@@ -406,6 +461,9 @@ async def set_view_filter(view_id: str, filter_: str, *, runner: Runner | None =
 # against a private sandbox project.
 
 
+# GROUNDWORK(board-reconciler-writes): issue_node_id / add_item / item_status /
+# set_single_select are the reconciler's write half — it places every open issue
+# on the board and sets an empty Status. Promotion does not place cards.
 async def add_item(project_id: str, content_id: str, *, runner: Runner | None = None) -> str:
     """Add an issue/PR; re-adding returns the SAME item (MEASURED), so this is
     idempotent and safe to retry."""
@@ -418,20 +476,27 @@ async def add_item(project_id: str, content_id: str, *, runner: Runner | None = 
     return data["addProjectV2ItemById"]["item"]["id"]
 
 
+# GROUNDWORK(board-reconciler-writes): see add_item.
 async def item_status(item_id: str, *, runner: Runner | None = None) -> str | None:
-    """The item's current Status option name, or None when it has none. A
-    just-added item may not be readable yet (reads lag writes, MEASURED), which
-    also reads as None: for a new item that is the truth."""
+    """The item's current Status option name, or None ONLY when the item was
+    read and has no Status. An item that cannot be read raises instead, so it
+    is never mistaken for an empty column and overwritten. (MEASURED
+    2026-10-04: an unresolvable id comes back as ``node: null`` with a
+    ``NOT_FOUND`` error, which :func:`graphql` already raises on; the check
+    here covers a null node without an error, and a node of another type.)"""
     data = await graphql(
         "query($i: ID!) { node(id: $i) { ... on ProjectV2Item { status: fieldValueByName("
         'name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } } }',
         {"i": item_id},
         runner=runner,
     )
-    node = data.get("node") or {}
+    node = data.get("node")
+    if not isinstance(node, dict) or "status" not in node:
+        raise ProjectsError(f"project item {item_id} could not be read")
     return (node.get("status") or {}).get("name")
 
 
+# GROUNDWORK(board-reconciler-writes): see add_item.
 async def set_single_select(
     project_id: str, item_id: str, field_id: str, option_id: str, *, runner: Runner | None = None
 ) -> None:

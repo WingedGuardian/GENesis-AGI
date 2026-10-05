@@ -13,6 +13,23 @@ create a charter for it, send its identifiers to session tools, or add lifecycle
 hooks that make Genesis manage the conversation. See
 `.agents/skills/genesis-external-client/SKILL.md` when working through Codex.
 
+## Deploy and working-tree boundary
+
+The repository checkout you are working in is the tree the running server
+deploys from. Do not mutate it in place.
+
+- **Never edit tracked files in the main checkout directly.** Make changes on a
+  branch in a git worktree and open a PR; the checkout is advanced only by a
+  deploy, never by hand.
+- **Deploy only through the scripts** — `scripts/update.sh` (full update) or
+  `scripts/deploy_code_only.sh` (locked code-only pull + restart). Do not run
+  `git pull`, `git checkout <ref>`, `git reset`, or `pip install` against the
+  checkout yourself: those bypass the deploy lock, the guardian pause, and the
+  serving-commit record that the deploy path maintains.
+- **Never run `scripts/deploy_candidates`.** It is the operator tool for the
+  local `live` integration branch — running unmerged candidate branches on this
+  install before their PRs merge — not a development action.
+
 ## Genesis skill path resolution
 
 **Every entry in the generated "Genesis Capability Surface" below carries its

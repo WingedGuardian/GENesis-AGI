@@ -343,7 +343,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: b0867170e 2026-10-02
+verified: 691a10d44 2026-10-03
 ```
 
 - **Replay-unsafe CC outcomes do not enter full-tools recovery, failover or
@@ -979,7 +979,11 @@ verified: d6edbcc6 2026-09-11
   so N approved rows in one tick are bounded; cautious-rollout brake); `propose_only`
   → dry-run terminal (never posts). The STOP is `mode: off` / the env kill (freezes
   the drain, incl. approved held rows). Terminal rows pruned >30d via
-  `scripts/prune_contributor_issue_posts.py`; held rows never pruned. The
+  `scripts/prune_contributor_issue_posts.py`, except a posted row naming a
+  follow-up, kept while that follow-up exists (the record that it already has an
+  issue); held rows never pruned. The propose-time TITLE dedup still sees only
+  held rows and posted rows of the last 30 days (`TERMINAL_RETENTION_DAYS`); the
+  same-follow-up check has no age bound. The
   curator campaigns are LOCAL user data (uncommitted).
 - **Cold marketing-email substrate (PR1) — gated like email, recipient resolved
   in CODE.** The `marketing_send` MCP tool (genesis-outreach) stages a cold
@@ -3167,7 +3171,12 @@ verified: b0867170e 2026-10-02
   state) + `oomd_user_slice_kill` (config-plane scan of user.slice.d drop-ins,
   laid down by `scripts/lib/memory_resilience.sh` from install/bootstrap/update) and
   host-plane `swap_total_kb`, so the annotation layer flags unprotected
-  installs (see docs/reference/memory-resilience.md). Network-resilience
+  installs (see docs/reference/memory-resilience.md). Default-disabled
+  `CODE_INTEL_WORKLOAD_SLICE=1` routes only indexing batch scopes into the dormant
+  `genesis-workload.slice`; both launch paths verify actual scope membership before
+  execution and retain refusal outcomes. This does not replace broad OOM monitors
+  or certify core/recovery exclusion (see docs/reference/index-workload-routing.md).
+  Network-resilience
   invariants are first-class too: container `networkd_keep_configuration` +
   `network_watchdog_installed` (any-link/file-present facts for the annotation
   layer) alongside the posture check's *effective* variants
@@ -3405,30 +3414,61 @@ shipped mode is `off`.
   - a single-select options update always re-sends existing option ids, so no
     card loses its value.
   Query shapes are adapted from precursor-kanban (MIT).
-- **`scripts/board_setup.py`** (dry run unless `--apply`; `--write-config` records
-  `project_owner`/`project_number` in the user overlay, the only writer:
-  `settings_update` rejects both keys, as it rejects `mode: live`):
-  - links the configured public tracker (`github.user`/`github.public_repo`,
-    the repo promotions post to), never the checkout's own remote;
-  - one project per title; with two it refuses; a run that CREATES the
-    project stops there and asks for a re-run, because project reads lag
-    writes (MEASURED), so nothing it just created is checked by the same run;
-  - Status columns Proposed / Ready / In Progress / In Review / Done;
-  - the `Genesis` single-select (an existing field of another type is reported,
-    never mutated) and `Genesis note` text fields;
+- **`scripts/board_setup.py`** (dry run unless `--apply`; `--write-config` lets
+  a run that creates the project record `project_owner`/`project_number` in the
+  board overlay, the only writer: `settings_update` rejects both keys, as it
+  rejects `mode: live`):
+  - works ONLY on the project recorded in the board overlay, or one it creates
+    and records; it never adopts a project by title, so a same-titled project
+    nobody recorded is a refusal (record the one you mean, or rename it); a
+    recorded project must exist, be open and belong to the authenticated
+    account;
+  - a run that CREATES the project records it and stops there, asking for a
+    re-run, because project reads lag writes (MEASURED), so nothing it just
+    created is checked by the same run;
+  - verifies the project is linked to the configured public tracker
+    (`github.user`/`github.public_repo`, the repo promotions post to — never
+    the checkout's own remote) via `ProjectV2.repositories`, and links it with
+    `linkProjectV2ToRepository` when not (shown in the dry run first);
+  - Status columns Proposed / Ready / In Progress / In Review / Done; an
+    option outside them is ALWAYS kept, never deleted (deleting one clears it
+    from every card holding it, and no read before the write can prove none
+    does at the write);
+  - the `Genesis` single-select and `Genesis note` text fields (an existing
+    field of the wrong type is reported as a problem, never mutated);
   - deletes the "Pull request linked to issue" and "Item added to project"
     default workflows;
   - requires "Pull request merged" and "Item closed" (there is no API to
     enable a workflow, so a missing one exits non-zero with the UI step);
-  - creates the `Active` and `Backlog` views.
+  - creates the `Active` and `Backlog` views, and puts an existing one with the
+    wrong layout back on the board layout;
+  - the overlay write loads the overlay the runtime reads now (user dir first,
+    then the legacy repo-local `config/board.local.yaml`) and keeps all its
+    keys, so writing the user overlay never hides a legacy setting.
 - **Promotion** (`board/promotion.py`, MCP `board_promote`):
-  - **Refused when:** the board mode is off, or `live` with no project
-    configured; no public tracker is configured; the source does not resolve;
-    an UNVERIFIED open question blocks it (the one place a block is enforced);
-    it is already linked or pending; the privacy scan finds something (the
-    reply names line and scanner only); or a requested label does not exist
-    on the tracker (checked only after the scan passes, since the check sends
-    the label names to GitHub).
+  - **Refused when:** the board mode is off; no public tracker is configured;
+    the source does not resolve, or is closed (a completed/failed follow-up, a
+    done/absorbed/dropped ledger row) or tabled (never filed as an issue, by
+    the house rule); an UNVERIFIED open question blocks it (the one place a
+    block is enforced); it is already linked or pending; the draft already
+    carries a board marker (the drain posts a body only with exactly one, its
+    own); the privacy scan finds something (the reply names line and scanner
+    only); a requested label does not exist on the tracker (checked only after
+    the scan passes, since the check sends the label names to GitHub; a repo
+    that cannot be read is "could not verify", never "missing label"); or the
+    mode changed while it was proposing (the hold is stamped with the mode).
+    No project needs to be configured: promotion never places a card.
+  - **One precondition function** (`promotion.preconditions`) holds every
+    check that can change while a hold waits — the lever, the board store,
+    the labels, the source's state, open-question blocks, an existing pointer.
+    `propose` runs it before holding; the drain runs it once more immediately
+    before `gh issue create`. Each refusal is PERMANENT (source missing,
+    closed or tabled; a label the tracker lacks; already linked; an
+    unparseable source) or TRANSIENT (the lever, an open question, a label or
+    repo lookup that failed, the store unmigrated or unreadable). At post time
+    a permanent one ends the hold (`expired`) with the reason logged and a
+    `promotion_refused` event, so the owner can re-propose once fixed; a
+    transient one leaves it held.
   - **Approval** is per item on the dashboard (Comms) and counted in the
     morning report, like the contributor lane; there is no Telegram prompt.
   - **The public body** carries an opaque marker, a salted hash of `kind:id`.
@@ -3438,22 +3478,40 @@ shipped mode is `off`.
     approval that is NEVER self-approved.
 - **The shared drain** (`autonomy/contributor_issue_watcher.py`) has one lever
   per lane, and board rows:
-  - post only on a HUMAN resolver (`classify_resolver`), so a system or self
-    approval expires the hold unposted;
+  - post only when `classify_resolver` classifies the resolver as "human" (a
+    dashboard or Telegram resolution; a system or self approval expires the hold
+    unposted). That names a channel, not a person;
   - dedup by marker (recent window + search, any state), adopting a marked
     issue only when this account authored it;
-  - are exempt from the contributor daily cap;
-  - re-check open-question blocks immediately before the create (no GitHub
-    await in between); a block store that cannot be read counts as blocked;
-  - write the `board_links` pointer and a `promotion` event once the issue
-    exists, with each tick re-linking any posted row a crash left unlinked;
-  - put the issue on the configured project, writing Status=Proposed ONLY
-    when the item has no Status (a card the owner already moved keeps its
-    column), and record the item id; each tick retries any link without one.
+  - count toward the shared daily posting cap (`max_posts_per_day`), like
+    contributor posts, for that reason;
+  - re-run `promotion.preconditions` immediately before the create (its
+    GitHub lookups first, its local reads last, the board lever last of all
+    and outranking every other refusal, then the cross-lane check — no GitHub
+    await between those and the create, so a kill switch flipped during the
+    label lookups still stops the post);
+  - expire (never post) a hold whose marked issue another account wrote, or
+    whose body does not carry exactly one marker; a failed viewer lookup only
+    defers it;
+  - record a `promotion_refused` event for EVERY post-time ending of an
+    approved board hold (a non-human resolver, a permanent precondition, the
+    marker cases above, the other lane having posted), not only a log line;
+  - write the `board_links` pointer and its `promotion` event in ONE
+    transaction once the issue exists (both or neither, and a retry that finds
+    the pointer adds no second event), with each tick re-linking any posted
+    row a crash or failed write left unlinked;
+  - never touch the project: a promoted issue is created and linked, not
+    added to the board. The reconciler's write half (follow-on) places every
+    open issue; its adapter calls carry `GROUNDWORK(board-reconciler-writes)`.
 - Both lanes can each pass their propose-time duplicate check for one
   follow-up when proposed concurrently; the drain (the only poster, one job,
   rows in sequence) refuses a hold whose follow-up the OTHER lane already
-  posted. An exact hit inside a full search page counts as found; only "no
+  posted. That record survives: `pending_issue_posts.prune_terminal` keeps
+  every posted row naming a follow-up while the follow-up row exists (it
+  used to prune adopted rows and rows of resolved follow-ups at 30 days).
+  Holds that can never resolve (a create that keeps failing, a saturated
+  title search) are still log-only — a saturated search logs a warning naming
+  the repo each tick and stays held, never terminal; the alert is #2850. An exact hit inside a full search page counts as found; only "no
   hit" needs a complete page.
 - `approve_all_pending` excludes board promotions, because a sweep's resolver is
   human and only the exclusion keeps them per-item.

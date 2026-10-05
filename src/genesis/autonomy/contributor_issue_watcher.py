@@ -23,11 +23,18 @@ Two lanes share this ONE drain (spec: one drain, dispatching on ``source``):
   additionally: posts only on a HUMAN-resolved approval (a system or
   self-approval is refused); is deduped by the opaque marker in its body, not
   by title, and adopts an existing marked issue only when the account itself
-  authored it; is NOT subject to the contributor daily cap (each one was
-  approved individually); re-checks open-question blocks immediately before the
-  create; and, once its issue exists, writes the ``board_links`` pointer + a
-  ``promotion`` event and puts the issue on the configured project as Proposed
-  (only when it has no Status) — both re-tried every tick until recorded.
+  authored it; shares the daily posting cap (its approval is
+  resolver-classified, which cannot prove a human); re-runs :func:`genesis.board.promotion.preconditions`
+  immediately before the create — a PERMANENT refusal (the record closed, gone
+  or already linked; a label the tracker lost) ends the hold with the reason
+  recorded as a ``promotion_refused`` event, as does every other post-time
+  ending of an approved board hold (a non-human resolver, a body without
+  exactly one marker, a marked issue another account wrote, the other lane
+  having posted); a transient one (an open question, the lever, an unreadable
+  GitHub or store) leaves it held; and, once its issue exists, writes the ``board_links``
+  pointer and its ``promotion`` event in ONE transaction, re-tried every tick
+  until recorded. The drain never touches the project: placing issues on the
+  board is the board reconciler's job (a later change).
 
 Across lanes, a hold whose follow-up the OTHER lane already posted is refused at
 post time: both tools check each other when proposing, but only this one drain
@@ -46,10 +53,11 @@ public issue is more visible than a duplicate email):
    issue. If the dedup lookup fails we do NOT post (can't verify) — the row stays
    held and retries next cycle.
 
-The drain reads ONLY the sanitized ``pending_issue_posts`` row (never re-reads
-any source), so the read-private / write-public boundary is enforced at the
-table. ``gh`` uses ambient server-side auth (same idiom as
-``contribution/pr_opener``).
+Everything the drain PUBLISHES comes from the sanitized ``pending_issue_posts``
+row (it never re-reads a source's text), so the read-private / write-public
+boundary is enforced at the table. A board row's preconditions read the
+source's STATUS (open / closed / tabled), never its content. ``gh`` uses ambient
+server-side auth (same idiom as ``contribution/pr_opener``).
 """
 
 from __future__ import annotations
@@ -70,13 +78,17 @@ from genesis.autonomy.contributor_worklog_config import (
     normalize_title,
 )
 from genesis.board import config as board_config
+from genesis.board import promotion as board_promotion
+
+# One definition of the marker's shape, shared with the proposer that refuses a
+# draft already carrying one.
+from genesis.board.promotion import MARKER_RE as _MARKER_RE
 from genesis.db.crud import approval_requests as approval_crud
 from genesis.db.crud import pending_issue_posts as pip
 
 logger = logging.getLogger(__name__)
 
 _ISSUE_NUM_RE = re.compile(r"/issues/(\d+)\b")
-_MARKER_RE = re.compile(r"<!-- genesis-board:([0-9a-f]{24}) -->")
 # GROUNDWORK(autonomous-distribution): the GitHub issue-create egress door. Every
 # autonomous external post routes through the shadow-gate (observe) before the gh
 # call; the capability cell is observe-only today (enforce stage later).
@@ -208,6 +220,15 @@ async def _find_open_issue_by_title(repo: str, title_norm: str) -> tuple[bool, d
         if normalize_title(issue.get("title", "")) == title_norm:
             return True, issue
     if len(searched) >= _SEARCH_PAGE:
+        # Not terminal: the hold stays and retries, but loudly — this answer
+        # repeats every tick until the open issues matching the title thin out,
+        # and a silent hold reads exactly like one still awaiting approval.
+        logger.warning(
+            "title dedup search on %s returned a full page (%d) with no exact match; "
+            "absence unverified, the post stays held",
+            repo,
+            len(searched),
+        )
         return False, None
     return True, None
 
@@ -235,6 +256,12 @@ async def _find_issue_by_marker(repo: str, marker_digest: str) -> tuple[bool, di
         if marker_digest in _MARKER_RE.findall(issue.get("body") or ""):
             return True, issue
     if len(searched) >= _SEARCH_PAGE:
+        logger.warning(
+            "marker dedup search on %s returned a full page (%d) with no exact match; "
+            "absence unverified, the post stays held",
+            repo,
+            len(searched),
+        )
         return False, None
     return True, None
 
@@ -276,9 +303,11 @@ def _labels_of(row: dict) -> list[str]:
 async def _link_board(
     rt_db, row: dict, approval: dict | None, *, issue_number: int, adopted: bool, now: str
 ) -> bool:
-    """Write the ``board_links`` pointer + a ``promotion`` event for a posted
-    board row. Returns False (retried next tick by the reconcile pass) when the
-    board tables are missing or the write fails — never raises into the drain."""
+    """Write the ``board_links`` pointer and its ``promotion`` event, in ONE
+    transaction, for a posted board row. Returns False (retried next tick by the
+    reconcile pass, which selects posted rows with no pointer) when the board
+    tables are missing or the write fails — never raises into the drain. Both or
+    neither: a pointer without its event would never be retried."""
     from genesis.db.crud import board as board_crud
 
     try:
@@ -295,7 +324,7 @@ async def _link_board(
         # On a connection this drain owns: the board writers refuse the shared
         # one, where another caller's commit or rollback could land mid-write.
         async with board_crud.owned_connection(rt_db) as own:
-            link = await board_crud.record_link(
+            await board_crud.record_link(
                 own,
                 source_kind=kind,
                 source_id=source_id,
@@ -307,98 +336,33 @@ async def _link_board(
                 now=now,
                 adopted=adopted,
                 approval_id=row["request_id"],
+                log_promotion=True,
             )
-            try:
-                await board_crud.append_event(
-                    own,
-                    event="promotion",
-                    now=now,
-                    repo=row["repo"],
-                    issue_number=issue_number,
-                    worker="genesis",
-                    detail={"link_id": link["id"], "adopted": adopted},
-                )
-            except Exception:
-                # The pointer is written, which is what the re-link pass checks;
-                # the event is the audit line, so its loss is logged, not retried.
-                logger.error(
-                    "promotion event for linked row %s not recorded", row.get("id"), exc_info=True
-                )
     except Exception:
         logger.error(
             "board link for posted row %s failed — retried next tick", row.get("id"), exc_info=True
         )
         return False
-    # The card is placed by the end-of-tick pass (_place_unplaced_links), which
-    # also retries one that failed: one mechanism, not two.
     return True
 
 
-async def _place_on_board(rt_db, proj, link: dict, now: str) -> bool:
-    """Put one linked issue on *proj* (the configured project, already checked
-    to have a Status option ``Proposed``) and record its item id.
-
-    Status is written ONLY when the item has none, and only ever as Proposed:
-    re-adding an existing item returns it unchanged (MEASURED), so a card the
-    owner already moved keeps its column. The audit event is written BEFORE the
-    item id, so a failure between the two leaves the link unplaced and the
-    retry (which then reads Status as set) records no second event. Any failure
-    leaves ``project_item_id`` NULL for the next pass. Returns True once the
-    item id is recorded."""
-    from genesis.board import projects_v2 as pv
-    from genesis.db.crud import board as board_crud
-
-    status = proj.fields[pv.STATUS_FIELD]
-    try:
-        owner, _, name = link["repo"].partition("/")
-        content_id = await pv.issue_node_id(owner, name, int(link["issue_number"]))
-        if _board_mode() != "live":
-            return False
-        item_id = await pv.add_item(proj.id, content_id)
-        prior = await pv.item_status(item_id)
-        if prior is None:
-            await pv.set_single_select(proj.id, item_id, status.id, status.options["Proposed"])
-        async with board_crud.owned_connection(rt_db) as own:
-            if prior is None:
-                await board_crud.append_event(
-                    own,
-                    event="status_write",
-                    now=now,
-                    repo=link["repo"],
-                    issue_number=int(link["issue_number"]),
-                    project_item_id=item_id,
-                    worker="genesis",
-                    detail={"to": "Proposed", "from": None},
-                )
-            await board_crud.set_project_item(
-                own, link_id=link["id"], project_item_id=item_id, now=now
-            )
-        return True
-    except Exception:
-        logger.error(
-            "placing board link %s on the project failed — retried next tick",
-            link.get("id"),
-            exc_info=True,
+async def _end_hold(rt_db, row: dict, now: str, reason: str) -> bool:
+    """End an approved hold that can never post (``expired``, nothing posted).
+    For a BOARD row, also record a ``promotion_refused`` event carrying *reason*
+    — the same audit row a post-time precondition refusal writes — so every
+    post-time ending of an owner-approved promotion is on the board's record,
+    not only in a log line. Written only when this call actually ended the hold
+    (a row that already left ``held`` gets no second event). Returns whether it
+    did."""
+    ended = await pip.mark_rejected(rt_db, row["id"], rejected_at=now, expired=True)
+    if ended and row.get("source") == BOARD_SOURCE:
+        await board_promotion.log_refusal(
+            rt_db,
+            now,
+            f"at post time: {reason}",
+            {"source": row.get("source_ref"), "pending_id": row["id"]},
         )
-        return False
-
-
-async def _board_blocked(rt_db, row: dict) -> bool:
-    """True when an unverified open question blocks this board row's source —
-    or when that cannot be established (store missing, unparseable source):
-    a post that cannot be checked does not go out."""
-    from genesis.db.crud import board as board_crud
-
-    kind, _, source_id = (row.get("source_ref") or "").partition(":")
-    try:
-        if not await board_crud.tables_available(rt_db):
-            return True
-        return bool(
-            await board_crud.blocking_questions(rt_db, target_kind=kind, target_id=source_id)
-        )
-    except Exception:
-        logger.error("block check for board hold %s failed", row.get("id"), exc_info=True)
-        return True
+    return ended
 
 
 async def _other_lane_posted(rt_db, row: dict) -> bool:
@@ -437,7 +401,9 @@ async def _other_lane_posted(rt_db, row: dict) -> bool:
     if await cur.fetchone() is not None:
         return True
     if not await board_crud.tables_available(rt_db):
-        return False
+        # Fail toward NOT posting: the caller leaves the row held. (Before the
+        # board migration no link can exist, so this is rare.)
+        raise RuntimeError("board tables not available")
     return (
         await board_crud.get_link_by_source(rt_db, source_kind="follow_up", source_id=fid)
     ) is not None
@@ -474,48 +440,7 @@ async def _reconcile_board_links(rt_db, now: str) -> int:
             now=now,
         ):
             written += 1
-    await _place_unplaced_links(rt_db, now)
     return written
-
-
-async def _place_unplaced_links(rt_db, now: str) -> int:
-    """Place every linked issue whose card is not recorded yet: links written
-    this tick, and any whose placement failed before (the project was
-    unreachable, or a crash fell between the issue and its card). The project
-    is read once per pass. Returns how many were placed."""
-    from genesis.board import projects_v2 as pv
-
-    if _board_mode() != "live":
-        return 0
-    ref = board_config.project_ref()
-    try:
-        cur = await rt_db.execute(
-            "SELECT id, repo, issue_number FROM board_links WHERE project_item_id IS NULL "
-            "ORDER BY created_at"
-        )
-        links = [{"id": r[0], "repo": r[1], "issue_number": r[2]} for r in await cur.fetchall()]
-    except Exception:
-        logger.error("unplaced board link query failed", exc_info=True)
-        return 0
-    if not links:
-        return 0
-    if ref is None:
-        logger.warning("%d board link(s) not placed: no project configured", len(links))
-        return 0
-    try:
-        proj = await pv.get_project(*ref)
-    except Exception:
-        logger.error("board project read failed — placement retried next tick", exc_info=True)
-        return 0
-    status = proj.fields.get(pv.STATUS_FIELD)
-    if status is None or status.kind != "single_select" or "Proposed" not in status.options:
-        logger.error("board project has no Status option 'Proposed' — run board_setup.py")
-        return 0
-    placed = 0
-    for link in links:
-        if await _place_on_board(rt_db, proj, link, now):
-            placed += 1
-    return placed
 
 
 async def _resolve_approved(
@@ -568,20 +493,22 @@ async def _resolve_approved(
         return False
 
     if is_board:
-        # Re-check open-question blocks at POST time: a question raised after the
-        # proposal (spec §3.4 "hard at promotion") holds the row until it is
-        # resolved, instead of posting work the owner has since questioned.
-        # (Checked again immediately before the create, below: the lookups in
-        # between await GitHub for up to minutes.)
-        if await _board_blocked(rt_db, row):
-            logger.info("Board hold %s is blocked by an open question — left held", row["id"])
-            return False
+        # Everything that can change during the hold (an open question raised
+        # since, the record closed, a label deleted, ...) is re-checked ONCE,
+        # immediately before the create, by promotion.preconditions — below.
         digests = _MARKER_RE.findall(body)
         if len(digests) != 1:
+            # Permanent: the body is fixed at propose time, so no later tick can
+            # find exactly one marker in it. Leaving it held would log this every
+            # tick forever; end it, on the record, so the owner can re-propose.
             logger.error(
-                "Board hold %s carries %d markers (want 1) — left held", row["id"], len(digests)
+                "Board hold %s carries %d markers (want 1) — hold ended, nothing posted",
+                row["id"],
+                len(digests),
             )
-            return False
+            return await _end_hold(
+                rt_db, row, now, f"the body carries {len(digests)} board markers, not 1"
+            )
         ok, existing = await _find_issue_by_marker(repo, digests[0])
         if ok and existing is not None:
             # A marked issue exists. Adopt it ONLY if this account authored it
@@ -589,13 +516,22 @@ async def _resolve_approved(
             # else's issue is never trusted as ours.
             viewer = await _viewer_login()
             author = (existing.get("author") or {}).get("login")
-            if viewer is None or author != viewer:
+            if viewer is None:
+                logger.warning("Board hold %s: viewer lookup failed — retry next cycle", row["id"])
+                return False
+            if author != viewer:
+                # Permanent: another account's issue carries this record's marker,
+                # so it is never adopted and posting a second marked issue would
+                # leave two. Expire the hold rather than retrying it forever.
                 logger.error(
-                    "Board hold %s: marked issue #%s is not authored by this account — left held",
+                    "Board hold %s: marked issue #%s was written by another account — "
+                    "hold expired, nothing posted",
                     row["id"],
                     existing.get("number"),
                 )
-                return False
+                return await _end_hold(
+                    rt_db, row, now, "a marked issue already exists, written by another account"
+                )
     else:
         ok, existing = await _find_open_issue_by_title(repo, normalize_title(title))
     if not ok:
@@ -659,19 +595,19 @@ async def _resolve_approved(
     # row's count includes it) and the count survives a mid-window restart. At the cap
     # → leave held, retry next window. ``max_posts_per_day`` is knob_int-coerced ≥ 1 by
     # the caller, so a mistyped/0/negative value can never uncap the poster.
-    # A BOARD row is exempt: the cap bounds AUTONOMOUS posting, and every board row
-    # was approved individually by a human (refused otherwise, in the drain loop).
-    if not is_board:
-        since = (datetime.fromisoformat(now) - timedelta(hours=24)).isoformat()
-        posted_recent = await pip.count_posted_since(rt_db, since=since)
-        if posted_recent >= max_posts_per_day:
-            logger.info(
-                "Contributor issue %s deferred — daily post cap reached (%d/%d in last 24h)",
-                row["id"],
-                posted_recent,
-                max_posts_per_day,
-            )
-            return False
+    # Board rows share the cap: their approval is resolver-CLASSIFIED (refused
+    # unless classify_resolver says "human", in the drain loop), and that
+    # classification cannot prove a human, so it is no reason to bypass the cap.
+    since = (datetime.fromisoformat(now) - timedelta(hours=24)).isoformat()
+    posted_recent = await pip.count_posted_since(rt_db, since=since)
+    if posted_recent >= max_posts_per_day:
+        logger.info(
+            "Issue hold %s deferred — daily post cap reached (%d/%d in last 24h)",
+            row["id"],
+            posted_recent,
+            max_posts_per_day,
+        )
+        return False
 
     # Kill-switch recheck: re-read the lane's mode LIVE immediately before the
     # external create so a ``mode: off`` / env-kill flipped mid-tick halts THIS post
@@ -680,6 +616,32 @@ async def _resolve_approved(
     if lever() != "live":
         logger.info("Issue hold %s deferred — lever no longer live at post time", row["id"])
         return False
+    if is_board:
+        # The SAME checks propose() made before holding, re-run now: the hold
+        # waited an unbounded time for the owner. Its GitHub lookups come first,
+        # its local reads last and the lever last of all, so nothing below
+        # awaits GitHub before the create, and a kill switch flipped during the
+        # lookups still stops it.
+        refusal = await board_promotion.preconditions(
+            rt_db,
+            source_ref=row.get("source_ref") or "",
+            repo=repo,
+            labels=_labels_of(row),
+            require_live=True,
+        )
+        if refusal is not None:
+            if not refusal.permanent:
+                logger.info("Board hold %s not posted (%s) — left held", row["id"], refusal.reason)
+                return False
+            # Waiting cannot clear it: end the hold and say why, so the owner
+            # can fix the cause and propose again (a held row would block that).
+            logger.error(
+                "Board hold %s refused at post time (%s) — hold ended, nothing posted; "
+                "re-propose once fixed",
+                row["id"],
+                refusal.reason,
+            )
+            return await _end_hold(rt_db, row, now, refusal.reason)
     # Last local checks, with no await on GitHub between them and the create.
     try:
         other_posted = await _other_lane_posted(rt_db, row)
@@ -689,14 +651,11 @@ async def _resolve_approved(
     if other_posted:
         # The other lane already posted this follow-up: a second public issue
         # for one record is never right, so this hold ends here.
-        if await pip.mark_rejected(rt_db, row["id"], rejected_at=now, expired=True):
+        if await _end_hold(rt_db, row, now, "the other lane already posted this follow-up"):
             logger.error(
                 "Issue hold %s refused — the other lane already posted this follow-up", row["id"]
             )
             return True
-        return False
-    if is_board and await _board_blocked(rt_db, row):
-        logger.info("Board hold %s blocked by an open question at post time — held", row["id"])
         return False
 
     # Observe the egress, THEN post. mark_posted BEFORE mark_consumed so a crash
@@ -737,6 +696,9 @@ async def drain_pending_issue_posts(rt: object) -> int:
     mode = effective_mode()
     board_mode = _board_mode()
     if mode == "off" and board_mode == "off":
+        # Both levers off: no hold is touched, but the local relink pass still
+        # runs (see the end of this function).
+        await _reconcile_board_links(db, datetime.now(UTC).isoformat())
         return 0
 
     # Rate-cap VALUE read once per tick (live, no cache); the per-row COUNT that
@@ -775,9 +737,11 @@ async def drain_pending_issue_posts(rt: object) -> int:
                 )
                 continue
             if is_board and approval_crud.classify_resolver(approval.get("resolved_by")) != "human":
-                # A board promotion is human-only (spec §3.3). A system / self /
-                # unclassifiable resolver is refused outright, fail-closed.
-                if await pip.mark_rejected(db, row["id"], rejected_at=now, expired=True):
+                # A board promotion needs an owner-channel resolver (spec §3.3):
+                # a system / self / unclassifiable one is refused, fail-closed.
+                # The classification names a channel, not a person, which is why
+                # board posts also share the daily cap.
+                if await _end_hold(db, row, now, "approved by a non-human resolver"):
                     resolved += 1
                 logger.error(
                     "Board hold %s approved by a non-human resolver %r — refused, never posted",
@@ -797,6 +761,8 @@ async def drain_pending_issue_posts(rt: object) -> int:
                 resolved += 1
         # status == 'pending' → still awaiting the owner; leave held.
 
-    if board_mode != "off":
-        await _reconcile_board_links(db, datetime.now(UTC).isoformat())
+    # Not gated on the board lever: it writes only the local pointer for an issue
+    # already posted (no GitHub call), and skipping it while the board is off let
+    # an unlinked post age out of the cross-lane record.
+    await _reconcile_board_links(db, datetime.now(UTC).isoformat())
     return resolved

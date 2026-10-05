@@ -162,6 +162,7 @@ async def record_link(
     adopted: bool = False,
     approval_id: str | None = None,
     project_item_id: str | None = None,
+    log_promotion: bool = False,
 ) -> dict:
     """Write the pointer for a promotion that HAS happened (the issue exists).
 
@@ -172,6 +173,12 @@ async def record_link(
     and silently keeping the first would hide a duplicate issue on GitHub.
     ``repo`` is stored lowercased, because GitHub owner/name is case-insensitive
     and a case variant must not escape the one-issue-one-pointer rule.
+
+    With ``log_promotion`` the ``promotion`` event is written in the SAME
+    transaction as the pointer, and only when this call inserted it: both commit
+    or neither does, so a pointer can never exist without its audit line (the
+    drain re-links only rows with no pointer, so a separately-lost event would
+    never be retried), and a retry that finds the pointer adds no second event.
     """
     _one_of("source_kind", source_kind, SOURCE_KINDS)
     if not _HEX32.match(source_id or ""):
@@ -189,8 +196,20 @@ async def record_link(
         raise ValueError("now is required")
 
     link_id = uuid.uuid4().hex
+    event_row = (
+        _event_values(
+            event="promotion",
+            now=now,
+            repo=repo,
+            issue_number=issue_number,
+            worker="genesis",
+            detail={"link_id": link_id, "adopted": bool(adopted)},
+        )
+        if log_promotion
+        else None
+    )
     async with _write_unit(db, "record_link"):
-        await db.execute(
+        cur = await db.execute(
             "INSERT INTO board_links (id, source_kind, source_id, repo, issue_number, "
             "project_item_id, adopted, promoted_by, approval_id, scan_receipt, body_sha256, "
             "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
@@ -211,6 +230,8 @@ async def record_link(
                 now,
             ),
         )
+        if event_row is not None and cur.rowcount == 1:
+            await _insert_event(db, event_row)
         by_source = await get_link_by_source(db, source_kind=source_kind, source_id=source_id)
         by_issue = await get_link_by_issue(db, repo=repo, issue_number=issue_number)
     if by_source is None and by_issue is None:
@@ -256,7 +277,8 @@ async def get_link_by_issue(
     return _link_row(await _one(cur))
 
 
-# The drain records the card once it puts a promoted issue on the project.
+# GROUNDWORK(board-reconciler): the reconciler records the card once it adds the
+# issue to the project (the board PR after promotion).
 async def set_project_item(
     db: aiosqlite.Connection, *, link_id: str, project_item_id: str, now: str
 ) -> bool:
@@ -637,6 +659,39 @@ async def append_event(
     index absorbs a re-read of the same GitHub change). Any OTHER failure raises
     — the conflict clause names that index only, so a missing value can never be
     mistaken for a dedup hit."""
+    values = _event_values(
+        event=event,
+        now=now,
+        repo=repo,
+        issue_number=issue_number,
+        project_item_id=project_item_id,
+        attempt=attempt,
+        worker=worker,
+        reason=reason,
+        observed_change_key=observed_change_key,
+        detail=detail,
+    )
+    async with _write_unit(db, "append_event"):
+        cur = await _insert_event(db, values)
+    return cur.lastrowid if cur.rowcount == 1 else None
+
+
+def _event_values(
+    *,
+    event: str,
+    now: str,
+    repo: str | None = None,
+    issue_number: int | None = None,
+    project_item_id: str | None = None,
+    attempt: int | None = None,
+    worker: str | None = None,
+    reason: str | None = None,
+    observed_change_key: str | None = None,
+    detail: dict | None = None,
+) -> tuple:
+    """Validate one event and return its column values, in
+    :func:`_insert_event`'s order. Raises ``ValueError`` before anything is
+    written."""
     _one_of("event", event, EVENTS)
     if not now:
         raise ValueError("now is required")
@@ -663,27 +718,30 @@ async def append_event(
             raise ValueError(
                 f"detail is {len(detail_json.encode())} bytes; the limit is {MAX_DETAIL_BYTES}"
             )
-    async with _write_unit(db, "append_event"):
-        cur = await db.execute(
-            "INSERT INTO board_events (event, repo, issue_number, project_item_id, attempt, "
-            "worker, reason, observed_change_key, detail, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT (event, observed_change_key) WHERE observed_change_key IS NOT NULL "
-            "DO NOTHING",
-            (
-                event,
-                repo,
-                issue_number,
-                project_item_id,
-                attempt,
-                worker,
-                reason,
-                observed_change_key,
-                detail_json,
-                now,
-            ),
-        )
-    return cur.lastrowid if cur.rowcount == 1 else None
+    return (
+        event,
+        repo,
+        issue_number,
+        project_item_id,
+        attempt,
+        worker,
+        reason,
+        observed_change_key,
+        detail_json,
+        now,
+    )
+
+
+async def _insert_event(db: aiosqlite.Connection, values: tuple) -> aiosqlite.Cursor:
+    """The event INSERT, inside a caller's :func:`_write_unit` (never alone)."""
+    return await db.execute(
+        "INSERT INTO board_events (event, repo, issue_number, project_item_id, attempt, "
+        "worker, reason, observed_change_key, detail, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT (event, observed_change_key) WHERE observed_change_key IS NOT NULL "
+        "DO NOTHING",
+        values,
+    )
 
 
 # GROUNDWORK(board-tab): the dashboard Board tab lists recent events (drags,

@@ -1,0 +1,1 @@
+- AGENTS.md now states the deploy and working-tree boundary for external clients: never edit the main checkout directly (use a worktree + PR), deploy only through `scripts/update.sh` / `scripts/deploy_code_only.sh`, and never run `scripts/deploy_candidates` (the operator tool for the local `live` integration branch).

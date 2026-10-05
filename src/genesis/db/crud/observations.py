@@ -207,10 +207,8 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "user_model_delta": timedelta(days=14),
     "capability_improvement": timedelta(days=14),
     "strategic_analysis": timedelta(days=14),
-    # process_reaper dry-run audit trail — the WOULD-KILL evidence an operator
-    # reviews before arming the reaper (set_operator_armed). Kept 14d (vs the 3d
-    # process_reaper_kill above) so a multi-day audit window survives, and made
-    # explicit here so it no longer logs the unknown-type warning every tick.
+    # Legacy process-discovery audit type. The global sweep is observation-only;
+    # this name is retained for historical consumers and a multi-day audit window.
     "process_reaper_would_kill": timedelta(days=14),
     # ── 30-day (intake signals, need processing time) ──────────────────
     "finding": timedelta(days=30),

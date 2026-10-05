@@ -685,6 +685,12 @@ _NOT_WIRED = {
     # direction for a gate whose whole measured design property is that it must
     # never become the thing that wedges the work.
     "adopt_first_gate.py": "fail-open by contract — refusing would wedge every edit and plan exit",
+    # Not a hook at all: the deploy-candidates engine is a command-line program run
+    # through scripts/deploy_candidates. Its "return 2" is argparse's usage error,
+    # and a failed import exiting 1 is the correct CLI answer ("failed"), not a
+    # vanished guard. MEASURED 2026-10-01: 0 references to it in .claude/settings.json,
+    # .claude/ or scripts/hooks/, so Claude Code never runs it as a hook.
+    "deploy_candidates.py": "a CLI, not a hook: wired nowhere in .claude/settings.json",
 }
 
 

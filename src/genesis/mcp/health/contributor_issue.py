@@ -230,7 +230,7 @@ async def _impl_contributor_issue_propose(
     # 2) Backpressure + DB-side dedup (GitHub open-issue dedup is done at post
     #    time in the drain — the curator profile has no gh).
     cfg = load_config()
-    active = await pip.list_dedup_active(db, repo)
+    active = await pip.list_dedup_active(db, repo, now=datetime.now(UTC).isoformat())
     # Backpressure counts THIS lane's holds only: work-board promotions wait on
     # the owner indefinitely and must not throttle the contributor curator.
     held_count = sum(1 for r in active if r["status"] == "held" and r["source"] != "board")
@@ -254,12 +254,17 @@ async def _impl_contributor_issue_propose(
                 "status": "duplicate",
                 "reason": "this follow-up was already promoted onto the work board",
             }
+    # The same record, in either lane, at any age: its own lookup, because the
+    # title list below is bounded to the retention window and this is not.
+    same_record = await pip.find_active_by_source_ref(db, repo, [source_ref, board_ref])
+    if same_record is not None:
+        return {
+            "status": "duplicate",
+            "reason": "an active proposal already covers this item",
+            "existing_id": same_record["id"],
+        }
     for r in active:
-        if (
-            normalize_title(r["title"]) == title_norm
-            or (source_ref is not None and r["source_ref"] == source_ref)
-            or (board_ref is not None and r["source_ref"] == board_ref)
-        ):
+        if normalize_title(r["title"]) == title_norm:
             return {
                 "status": "duplicate",
                 "reason": "an active proposal already covers this item",

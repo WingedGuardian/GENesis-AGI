@@ -154,6 +154,28 @@ async def test_record_link_retry_is_idempotent(db):
     assert await board.count_links(db) == 1
 
 
+async def test_the_promotion_event_is_written_with_the_pointer_and_only_once(db):
+    first = await _link(db, log_promotion=True)
+    await _link(db, now=LATER, log_promotion=True)  # a retry finds the pointer
+    events = await board.list_events(db, event="promotion")
+    assert events["total"] == 1
+    assert events["items"][0]["detail"] == {"link_id": first["id"], "adopted": False}
+
+
+async def test_a_failed_promotion_event_rolls_the_pointer_back(db, monkeypatch):
+    """Both commit or neither: a pointer without its event would never be
+    retried, because the re-link pass selects rows with NO pointer."""
+
+    async def broken(_db, _values):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(board, "_insert_event", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        await _link(db, log_promotion=True)
+    assert await board.count_links(db) == 0
+    assert db.in_transaction is False
+
+
 async def test_same_source_to_a_different_issue_raises(db):
     """One private record maps to ONE issue: silently keeping the first would
     hide a duplicate issue on GitHub."""
