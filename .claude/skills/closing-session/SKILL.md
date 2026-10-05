@@ -516,9 +516,21 @@ Two triggers, two labels:
   below with `needs-architecture-session`.
 - **The owner decides a terminal round is rework** → `needs-rework`. The owner is
   present by definition, so this runs in the foreground:
-  1. Comment with the evidence: findings by class, what carries over, what the
-     rework is. The comment is public, so scrub it as you would an issue
-     (CLAUDE.md, "Where deferred work goes").
+  1. Comment with the evidence and a DECISION-COMPLETE rework spec. Its sections
+     are defined in `.claude/docs/premise-check.md`, "Handing a verdict to a
+     builder": findings by class; what is kept; what is deleted; the prescribed
+     shape; the SPLIT plan (the `PR-shape:` line, as a list of PRs); every
+     decided question; acceptance. The builder is often Codex or Devin on
+     another machine, building cold from this comment alone.
+     - Questions only the owner can answer get asked BEFORE posting.
+     - Any question left to the builder says "answer it in the PR body".
+     - Never post a bare open-questions list, and never omit the PR-shape
+       ruling: a split, or "one PR" with its counted size. "The diff grew to
+       +2,538 lines" is a symptom; "split into these four PRs" is the
+       instruction.
+
+     The comment is public, so scrub it as you would an issue (CLAUDE.md,
+     "Where deferred work goes").
   2. Apply `needs-rework`, creating it first if the repo lacks it
      (`gh label create needs-rework --description "Sent back for rework"`).
   3. Move the PR to draft (`gh pr ready <N> --undo`). If that fails, keep the
@@ -527,8 +539,42 @@ Two triggers, two labels:
      label.
 
 Leave it OPEN (genesis-development, "Never RETIRE a PR you are not the one
-reviving"). The session that completes the rework marks it ready, removes the
-label, and requests review.
+reviving"). By default (owner ruling, 2026-10-04) the rework arrives as one or
+more NEW PRs with fresh round counts. The BUILD session closes the old PR,
+linking every replacement, when the LAST one opens. The old PR keeps its label,
+so the rebuild stays traceable to it.
+
+Reworking under the old number is an exception only the owner grants. The
+standing exception is a Devin-built PR kicked back under "Devin-built PRs"
+below, which is reworked on its own branch unless its spec says SPLIT. Either way, a closing session
+neither does the rework nor closes the old PR.
+
+**Keep the line open both ways.** Before building, the builder acknowledges
+the spec on the old PR: its reading, its split, its questions (genesis-development,
+"Building a rework", item 0). Answer those questions there, or bring them to the
+owner. If the acknowledgement misreads the spec, correct it before any code is
+written.
+
+**When a rework PR arrives, check its rework section against the spec FIRST**,
+before spending a review round. The section is described in genesis-development,
+"Building a rework". Read it for:
+- `Replaces: #N` and the spec link;
+- its `Split:` position;
+- each deviation with its reason;
+- each delegated question with its answer.
+
+Then read the diff against both:
+- **A deviation with a stated reason** is a design question for the owner, not a
+  defect.
+- **A deviation with no stated reason**, a missing section, a missing
+  acknowledgement, or an unsplit PR the spec split goes back to the builder
+  before any review is requested. No response means the spec may not have been
+  read, and nobody can tell what changed mid-build.
+
+This is what lets the owner tell a flawed spec from a flawed build without
+reconstructing either. A form check can confirm that the section exists and
+names a split; only you can judge whether a stated deviation is real. Read the
+diff, not just the section.
 
 ---
 
@@ -572,8 +618,9 @@ happened already. Before requesting or answering any further review:
 1. **Run a premise check and design audit** with a fresh-context
    `genesis-architect`, following `.claude/docs/premise-check.md`: premises with
    evidence, the effect question, the comparative question (an existing chokepoint
-   the change duplicates or bypasses), the five plan-time questions, then
-   BLOCKER / SHOULD-FIX / NOTE findings and what a rework should do. Hand it the PR
+   the change duplicates or bypasses), the six plan-time questions (the sixth is
+   PR shape), then BLOCKER / SHOULD-FIX / NOTE findings and a decision-complete
+   rework spec (premise-check.md, "Handing a verdict to a builder"). Hand it the PR
    number AND the expected head SHA, and have it fetch that head
    (`git fetch origin pull/<N>/head:<ref>`) and confirm the match before
    reading anything; an auditor pointed at a stale or main checkout audits the
@@ -591,6 +638,12 @@ happened already. Before requesting or answering any further review:
      WITHOUT `(aside)`, so Devin's monitor acts on it, and tell it to rework on
      this branch rather than close the PR and open a replacement. Then convert the
      PR to draft (`gh pr ready <N> --undo`) and add the `needs-rework` label.
+   - **`PR-shape: SPLIT` and no `Shape:` reason in the body**, whatever the
+     premise verdict: post the audit WITHOUT `(aside)` with the split plan, and
+     tell Devin to open the listed PRs as NEW PRs and close this one when the
+     last opens. (This is stricter than an ordinary PR, where size is the
+     author's call, because Devin cannot be asked to weigh it in conversation.)
+     Then draft and label as above.
    - **SOUND, or local defects at any severity**: post the audit and continue the
      ordinary per-PR loop.
 
@@ -603,12 +656,13 @@ happened already. Before requesting or answering any further review:
    label, so open one follow-up per batch with `work_state="blocked_on_trigger"`
    (it waits on Devin, so it is not actionable now) naming each PR and its audit
    comment, with a `revisit_condition` saying what unblocks it: Devin pushed the
-   rework and marked it ready, or the owner decided. Re-check those PRs on each
+   rework and marked it ready, the last split PR opened, or the owner decided. Re-check those PRs on each
    queue sweep.
 5. **When a kicked-back PR comes back ready,** request `@codex review` (marking a
    draft ready is not a reliable trigger) and work it normally. If Devin closed it
    and opened a replacement instead, which happened with #2309 and #2354, link the
-   two on both PRs and leave the round count to the owner.
+   two on both PRs and leave the round count to the owner. A SPLIT kick-back's
+   replacements are expected, not this case: work each as a new PR.
 
 **One writer per branch.** While a kick-back is outstanding, the closing session
 does not push to that branch. Its own replies there carry `(aside)`, since every

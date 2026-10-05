@@ -75,8 +75,22 @@ block, and the calibration controls: `.claude/docs/premise-check.md`. In short:
    BEST available shape? Look for an existing chokepoint the change
    re-implements, a simpler mechanism, or a place the problem disappears. A
    sound-but-inferior approach is a FINDING.
+5. **Then the PR-shape question, every time:** should this arrive as ONE PR?
+   Size it in counted lines (`scripts/pr_shape.py`, `count_diff`), against
+   #2737's bands:
+   - under 500 is the target;
+   - 500 to 1,000 needs a `Shape:` reason;
+   - over 1,000 needs owner approval.
 
-Emit the `Design-premise:` block from the reference doc before the main review.
+   These are a guideline the builder weighs. A stated reason is enough. A
+   change that is too large for no stated reason, or that carries more than one
+   concern, gets a SPLIT plan: the PRs in dependency order, one concern each.
+   The split is often the whole rework, and sound code still gets one.
+
+Emit the `Design-premise:` block from the reference doc before the main review,
+including its `PR-shape:` line. When the check feeds a send-back, also write the
+decision-complete rework spec the reference doc describes ("Handing a verdict
+to a builder"). Never end it with a bare list of open questions.
 
 **BROKEN has a HIGH bar and routes to the repo's EXISTING disposition for a
 premise-wrong PR — a foreground architecture conversation with the user, or the

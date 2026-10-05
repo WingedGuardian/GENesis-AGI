@@ -37,5 +37,6 @@ body:
         3. Do the scope limits block the obvious shared code?
         4. Is the caller named and tracked (an issue), or is there a stated reason there is none?
         5. Does every number say how it was measured (what was counted, by which script)?
+        6. Is the PR shape stated: expected size in counted lines (scripts/pr_shape.py), and a split or a `Shape:` reason past 500?
     validations:
       required: false

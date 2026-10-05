@@ -30,6 +30,59 @@ deploys from. Do not mutate it in place.
   local `live` integration branch — running unmerged candidate branches on this
   install before their PRs merge — not a development action.
 
+## Rebuilding a PR that was sent back
+
+A `needs-rework` PR, or a `needs-architecture-session` PR whose owner decision
+has since been posted as a rework spec, carries that spec in its send-back
+comment (and any design issue that comment names). A
+`needs-architecture-session` PR with no posted spec has an undecided design: do
+not build it. When you build a rework:
+
+- **Before building, acknowledge the spec on the OLD PR** in one comment headed
+  `## Rework acknowledgement`. Give the spec in your own words, the split you
+  will build, and every question you need answered first. Open no PR, not even
+  a draft, until it is posted. If it asks no questions, proceed once it is
+  posted; otherwise wait for an answer on the old PR. On a Devin-built old PR,
+  start the comment with `(aside)`, or it starts a paid Devin session.
+- **Open NEW PRs** with fresh round counts. When the last one opens, close the
+  old PR with a link to every replacement, and leave its labels on.
+- **Follow the spec's split plan.** Each PR carries one concern and names the
+  PRs it depends on. Open them in dependency order against main; a PR whose
+  dependency has not merged waits as a branch, or opens stacked with its base
+  named. Being a rework is not itself a reason to stay unsplit.
+- **Size every PR in counted lines** (`scripts/pr_shape.py`; the rule is in `.claude/docs/premise-check.md`, step 6).
+  - Under 500 is the target.
+  - From 500 to 1,000, add a `Shape:` line to the PR body saying why it cannot
+    be smaller.
+  - Over 1,000 needs the owner's approval: ask in the acknowledgement or the
+    PR body; the owner decides before merge.
+
+  Size a stacked PR against its parent branch, not main.
+
+  This is a guideline: a stated, legitimate reason is enough.
+- **Report against the spec** in each PR body:
+  ```
+  ## Rework
+  Replaces: #N (spec: <link>; acknowledged: <link to your comment on the old PR>)
+  Split: PR k of n (<the others>)
+  Kept / deleted / reshaped as the spec asked: <one line each, or "as specified">
+  Deviations: <each: what differs, and the complication that forced it> | none
+  Questions answered: <each question the spec delegated or missed: the answer and why>
+  ```
+  Unforeseen complications are expected; unexplained deviations are not. Never
+  settle a question the spec left open silently, and never in the most
+  defensive direction without saying so. That is a design decision, and it
+  belongs in this section.
+
+Exception: a Devin-built PR kicked back under the closing-session skill's
+"Devin-built PRs" rule is reworked on its own branch unless its spec says SPLIT.
+It still acknowledges the spec on that PR and carries the `## Rework` section,
+with `Replaces:` naming itself.
+
+Full contract: `CLAUDE.md` ("Rework is a contract with two sides"),
+`.claude/docs/premise-check.md` ("Handing a verdict to a builder"), and the
+genesis-development skill ("Building a rework").
+
 ## Genesis skill path resolution
 
 **Every entry in the generated "Genesis Capability Surface" below carries its

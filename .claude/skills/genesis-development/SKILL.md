@@ -3555,6 +3555,23 @@ Verify before any commit:
   private DM leaked via a test docstring + a code comment after the commit
   message and PR body were already clean.)
 - GROUNDWORK-tagged code not accidentally deleted
+- **PR shape, before opening the PR (#2737; owner, 2026-10-05).** Count the
+  branch in counted lines, which excludes tests, prose, changelog fragments,
+  and blank and comment lines, and counts a moved line once:
+
+      # from the repo root, after `git fetch origin main`; a stacked PR uses its parent branch, not origin/main
+      git diff -M origin/main...HEAD | python3 -c "import sys; sys.path.insert(0, 'scripts'); import pr_shape; r = pr_shape.count_diff(sys.stdin.read()); print(r['counted'], r['band'])"
+
+  - Under 500 is the target.
+  - From 500 to 1,000, add a `Shape:` line to the PR body saying why it
+    cannot be smaller.
+  - Over 1,000 needs the owner's approval: ask in the PR body; the owner
+    decides before merge.
+
+  It is a guideline you weigh, not a wall: a legitimate reason, stated, is
+  enough. Prefer one concern per PR (one mechanism or behaviour change a
+  reviewer can accept or reject alone); that too is weighed.
+  Full rule: `.claude/docs/premise-check.md`, step 6.
 - New capabilities registered in `_capabilities.py` + bootstrap manifest
 - **Conventional commit prefixes**: `feat:`, `fix:`, `refactor:`, `docs:`,
   `test:`, `chore:`. Scope optional: `feat(ego): add cadence manager`.
@@ -3946,6 +3963,73 @@ successor in a comment and leave the PR open.
 
 If you believe any other PR should be retired and nobody is picking it up, that
 is a question for the user, not a judgment call for the review station.
+
+### Building a rework — report against the spec (standing owner rule, 2026-10-05)
+
+A PR sent back with `needs-rework`, or a `needs-architecture-session` PR whose
+owner decision has since been posted as a rework spec, carries that spec: the
+send-back comment, plus any design issue it names. A `needs-architecture-session`
+PR with no posted spec has an undecided design; do not build it. Its contract is in
+`.claude/docs/premise-check.md`, "Handing a verdict to a builder". The session
+that takes up the rework is the reviving session above, and it owns the following:
+
+0. **Acknowledge the spec on the OLD PR before building.** Post one comment
+   there with:
+   - the spec as you understood it, in your own words;
+   - the split you will build;
+   - every question you need answered before you start.
+
+   Head it `## Rework acknowledgement`, and open no PR, not even a draft, until
+   it is posted. If it asks no questions, proceed once it is posted; otherwise
+   wait for an answer on the old PR, from the closing session or the owner. On
+   a Devin-built old PR, start it with `(aside)`, or it starts a paid Devin
+   session. A question answered before building is cheap; the
+   same question answered silently inside the build is how a rebuild drifts. No
+   acknowledgement means nobody can tell whether the spec was read at all.
+1. **New PRs, by default.** The rework arrives as one or more NEW PRs, with fresh
+   round counts. When the LAST one opens, close the old PR with a comment
+   linking every replacement; whoever opens the last one closes it. Leave its
+   labels on, so the rebuild stays traceable to it. If the send-back opened a
+   follow-up row, cite it as `Follow-up: <id>` in the last PR's body. Reworking under the old number happens only when
+   the owner grants it. The standing grant is a Devin-built PR kicked back
+   under closing-session "Devin-built PRs", which is reworked on its own branch
+   unless its spec says SPLIT; it still acknowledges and carries the section
+   below, with `Replaces:` naming itself.
+2. **Follow the split.** If the spec has a `PR-shape: SPLIT` plan, open those PRs.
+   Each one carries one concern and names the PRs it depends on. Open them in
+   dependency order against main; a PR whose dependency has not merged waits as
+   a branch, or opens stacked with its base named. Being a rework is not itself
+   a reason to stay unsplit, and a better split is a deviation (item 4), not a
+   reason to skip splitting. If the spec has no split, size each PR by the rule
+   in `.claude/docs/premise-check.md` step 6: under 500 counted lines is the
+   target, and a `Shape:` line states why one cannot be smaller. Split a PR that
+   carries more than one concern.
+3. **Answer the delegated questions** in the PR body, each with your reasoning.
+   If you hit a question the spec should have answered and did not, answer it
+   the same way and mark it as missing from the spec. Do not resolve it
+   silently in the most defensive direction: a fail-closed answer is still a
+   design decision, and it can force machinery the spec never asked for.
+4. **Report every deviation.** Unforeseen complications are expected; an
+   unexplained deviation is not. The body of each replacement PR carries:
+
+   ```
+   ## Rework
+   Replaces: #N (spec: <link to the send-back comment / issue>; acknowledged: <link to your item-0 comment>)
+   Split: PR k of n (<the other PRs, by number or concern>)
+   Kept / deleted / reshaped as the spec asked: <one line each, or "as specified">
+   Deviations: <each: what differs from the spec, and the complication that forced it> | none
+   Questions answered: <each delegated or missing question: the answer and why>
+   ```
+
+The closing session reads this section before it spends a review round. A
+deviation with a stated reason goes to the owner as a design question. A missing
+section, an unexplained deviation, or an unsplit PR the spec split goes back to
+you before review. Origin: a rebuild came back as one PR, +2,538 raw lines
+(881 counted, so inside the `shape` band; size was not the failure), with
+conditional rendering, an uninstall retention mode and an in-place settings
+writer, none of which its spec asked for, and with no note explaining any of
+them. Working out whether the spec or the build had failed cost the owner a
+session.
 
 ### Keep the PR the PR — adjacent findings become issues (standing user rule, 2026-09-09)
 

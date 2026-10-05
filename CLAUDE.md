@@ -654,7 +654,7 @@ gate works, its exemption categories, and the unit rules for size bounds:
   One line is enough when building is right (`BUILD — cognitive core, no
   external substitute, searched: <terms>`); the point is that the question gets
   asked BEFORE the effort, which is the only moment it is cheap to answer.
-  **A plan or issue that specifies work answers the five premise questions
+  **A plan or issue that specifies work answers the six premise questions
   before work starts** — the plan-time half of the check in
   `.claude/docs/premise-check.md`:
   1. Is every claim about outside behaviour (GitHub, git, a provider API) measured or cited, not asserted?
@@ -662,6 +662,20 @@ gate works, its exemption categories, and the unit rules for size bounds:
   3. Do the scope limits block the obvious shared code?
   4. Is the caller named and tracked (an issue), or is there a stated reason there is none?
   5. Does every number say how it was measured (what was counted, by which script)?
+  6. Is the PR shape stated: expected size in counted lines (`scripts/pr_shape.py`), and a split or a `Shape:` reason past 500? The rule (`.claude/docs/premise-check.md`, step 6): under 500 is the target, 500-1,000 carries a `Shape:` reason, and over 1,000 needs owner approval. It is a guideline the session weighs; a stated reason is enough. Prefer one concern per PR (one mechanism a reviewer can accept or reject alone).
+- **Rework is a contract with two sides.** A send-back's spec is
+  decision-complete: what is kept, what is deleted, the shape, the split plan,
+  and every question either answered or explicitly delegated. It never ends in
+  a bare list of open questions. Before building, the builder acknowledges the
+  spec on the old PR (its reading, its split, its questions) and gets answers.
+  The rework then arrives as new PR(s), and each one's body reports against
+  the spec: `Replaces: #N`, its `Split:` position, every deviation with the
+  complication that forced it, and every delegated question answered. Being a
+  rework is not itself a reason to stay unsplit. The exception is a Devin-built PR kicked
+  back under the closing-session Devin rule, which is reworked on its own branch
+  unless its spec says SPLIT. Detail:
+  `.claude/docs/premise-check.md` ("Handing a verdict to a builder") and
+  genesis-development ("Building a rework").
 - **Use subagents** to keep main context clean. One concern per subagent.
   **A MANDATED subagent is already the request** — when a gate's block message
   tells you to dispatch one, dispatch it; don't stop to ask. Ask only for
