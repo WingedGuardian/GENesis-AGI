@@ -1,0 +1,1 @@
+- The `gh pr close` advisory now states the superseded-PR exception: the closing session may retire a superseded PR when the owner authorized the supersession, the successor is open or merged, and a per-file check shows every part covered or moot.
