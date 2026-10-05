@@ -136,8 +136,8 @@ anything — a reviewer session retires nothing.
 is HIGH.** The repo already has a route for a change that is wrong at the premise
 or structurally superseded, and it is NOT "hand it to a builder": it is a
 foreground ARCHITECTURE conversation with the user, and where no user is present,
-the `needs-architecture-session` label plus a `ready` follow-up naming the PR and
-the decision it awaits. See the genesis-development skill, "Some PRs are not a
+the `needs-architecture-session` label, the PR moved to draft, and a `ready`
+follow-up naming the PR and the decision it awaits (a dispatched session's follow-up lands in the `tabled` lane; the intake gap is tracked in #2857). See the genesis-development skill, "Some PRs are not a
 review problem". This check produces the EVIDENCE for that conversation; it does
 not invent a parallel path around it, and a session that reads "hand back" as
 "dispatch a builder and move on" has skipped the decision the label exists to
@@ -147,7 +147,10 @@ Recommend it only when the premise is genuinely wrong, or the change cannot do
 what it says it was built to do — a major rework, or a material finding that moves
 the whole premise. Everything short of that stays in the gate and gets iterated
 on: a premise slightly off, needing modest rework a review session can carry in a
-round or two, is the ordinary case and is NOT a kick-back.
+round or two, is the ordinary case and is NOT a kick-back. (One owner-ruled
+exception: a Devin-built PR is audited before further rounds are spent, and a
+SOUND-BUT-INFERIOR verdict with a better shape that changes the mechanism or the
+files touched IS kicked back to Devin. See the closing-session skill, "Devin-built PRs".)
 
 **The evidence bar is TWO OR MORE independent signals**, the same bar the
 round-2 gate message states, because a doc that set a lower one would be the

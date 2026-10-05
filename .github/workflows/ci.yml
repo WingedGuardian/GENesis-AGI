@@ -1112,7 +1112,8 @@ jobs:
         # Floor: 24153 +92 =24245; skip ceiling remains 102.
         # NVIDIA provider health: new test_provider_health_probes.py collects
         # 87 tests (0 -> 87); no added skips. Floor: 24245 + 87 = 24332.
-        # Force-push command-borne config (#2513): 24 new class cases, with one
-        # existing parameterized case moved here; net +23 tests. No added skips.
-        # Floor: 24332 + 23 = 24355.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24355
+        # Force-push command-borne config (#2513): the two changed files collect
+        # 336 on origin/main and 359 here (+23), including 24 new class cases
+        # with one existing parameterized case moved here. No added skips.
+        # Floor: origin/main 24421 + 23 = 24444.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24444

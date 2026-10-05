@@ -80,7 +80,7 @@ Emit the `Design-premise:` block from the reference doc before the main review.
 
 **BROKEN has a HIGH bar and routes to the repo's EXISTING disposition for a
 premise-wrong PR — a foreground architecture conversation with the user, or the
-`needs-architecture-session` label plus a `ready` follow-up when none is present
+`needs-architecture-session` label, the PR moved to draft, and a `ready` follow-up when none is present (a dispatched session's follow-up lands in the `tabled` lane; the intake gap is tracked in #2857)
 (genesis-development skill, "Some PRs are not a review problem"). Never a new
 path around it, and never another round —
 everything short of "the change cannot do what it says it was built to do" is
