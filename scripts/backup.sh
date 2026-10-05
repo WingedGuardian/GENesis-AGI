@@ -105,6 +105,19 @@ _SQLITE_LINES=0
 _QDRANT_COUNT=0
 _TRANSCRIPT_COUNT=0
 _MEMORY_COUNT=0
+_EXTRA_SKIP_LABELS=()  # declared before the EXIT trap can fire: its status write reads it
+# What this run's off-site alert block actually ANNOUNCED (or carried forward from a
+# run that did). A run that dies before the alert block records nothing announced, so
+# the next run alerts instead of assuming the earlier one did.
+_ALERTED_CORE=false
+_ALERTED_GAP=""
+# A short fingerprint of WHICH listed directories this run left out (empty when none),
+# so the off-site alert re-fires when a different directory goes missing.
+_extras_gap_fingerprint() {
+    declare -p _EXTRA_SKIP_LABELS >/dev/null 2>&1 || return 0
+    [ "${#_EXTRA_SKIP_LABELS[@]}" -gt 0 ] || return 0
+    printf '%s\n' "${_EXTRA_SKIP_LABELS[@]}" | LC_ALL=C sort -u | sha1sum | cut -c1-12
+}
 _SECRETS_OK=false
 _SUCCESS=false
 _FAILURE_REASON=""
@@ -144,14 +157,15 @@ _write_status() {
     if [ "${_T2_STATUS:-}" = "ok" ]; then _offsite_confirmed=true; fi
     # Separate signals so a chronic opt-in extras gap can never mask (or be masked
     # by) a real off-site failure in the alert dedup below.
-    local _offsite_core_complete=false _extras_complete=true
+    local _offsite_core_complete=false _extras_complete=true _extras_gap
+    _extras_gap="$(_extras_gap_fingerprint)"
     if [ "${_T2_STATUS:-}" = "ok" ] || [ "${_T2_EXTRAS_ONLY_PARTIAL:-false}" = true ]; then
         _offsite_core_complete=true
     fi
     if [ $((${_EXTRA_SKIPPED:-0} + ${_EXTRA_UPLOAD_FAILED:-0})) -gt 0 ]; then _extras_complete=false; fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 
@@ -760,15 +774,18 @@ _EXTRA_UPLOAD_FAILED=0
 _EXTRA_UPLOADED=()     # names that reached the off-site snapshot (recorded in COMPLETE)
 _EXTRA_BUILT=()        # names archived THIS run: the only ones uploaded
 _EXTRA_SKIP_LABELS=()  # listed entries not archived this run (recorded in COMPLETE)
-mkdir -p extra
-_extra_prev="$(find extra -maxdepth 1 -type f -name '*.tar.gpg' 2>/dev/null | wc -l)"
-find extra -maxdepth 1 -type f -delete 2>/dev/null || true
+_extra_prev=0
+if mkdir -p extra 2>/dev/null; then
+    _extra_prev="$(find extra -maxdepth 1 -type f -name '*.tar.gpg' 2>/dev/null | wc -l || true)"
+    find extra -maxdepth 1 -type f -delete 2>/dev/null || true
+fi
 _extra_skip() {  # <reason> <entry>
     log "WARNING: extra dir skipped ($1): $2"
     _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
-    # Shown $HOME-relative and printable-only in the COMPLETE marker, so restore can
-    # say which listed directory a snapshot does not hold.
-    _EXTRA_SKIP_LABELS+=("$(printf '%s' "${2#"$HOME"/}" | tr -cd '[:print:]' | cut -c1-200)")
+    # Shown $HOME-relative in the COMPLETE marker, so restore can say which listed
+    # directory a snapshot does not hold. Shell-quoted under the C locale, so every
+    # byte becomes printable ASCII and no name ever shrinks to an empty label.
+    _EXTRA_SKIP_LABELS+=("$(LC_ALL=C printf '%q' "${2#"$HOME"/}" | cut -c1-200)")
 }
 if [ -z "${GENESIS_BACKUP_EXTRA_DIRS:-}" ]; then
     [ "$_extra_prev" -gt 0 ] && log "NOTE: GENESIS_BACKUP_EXTRA_DIRS is unset; the previous run's $_extra_prev extra archive(s) are not carried forward (older off-site snapshots keep them until retention)"
@@ -781,7 +798,19 @@ else
     _bdir_real="$(realpath -m -- "$BACKUP_DIR")"
     _btmp_real="$(realpath -m -- "$GENESIS_BIG_TMP")"
     _lroot_real=""
-    [ -n "${GENESIS_BACKUP_LOCAL_PATH:-}" ] && _lroot_real="$(realpath -m -- "$GENESIS_BACKUP_LOCAL_PATH")"
+    if [ "$(_backend_resolve)" = local ] && [ -n "${GENESIS_BACKUP_LOCAL_PATH:-}" ]; then
+        _lroot_real="$(realpath -m -- "$GENESIS_BACKUP_LOCAL_PATH")"
+    fi
+    # Class 3 — an archive is only worth keeping if a restore can extract it. The
+    # restore helper refuses a Python whose tarfile lacks the 2025 extraction-filter
+    # fixes, so find that out NOW (loudly, as a partial backup), not during a disaster
+    # recovery. (The restore box needs a fixed Python too; SETUP.md says so.)
+    _extra_py_why=""
+    if ! _extra_py_why="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" check 2>&1)"; then
+        _extra_py_why="${_extra_py_why:-the restore helper could not run}"
+    else
+        _extra_py_why=""
+    fi
     _EXTRA_DEFAULT_EXCLUDES=(.venv venv node_modules __pycache__ .pytest_cache .ruff_cache .mypy_cache .tox)
     _extra_ex_args=()
     for _x in "${_EXTRA_DEFAULT_EXCLUDES[@]}"; do _extra_ex_args+=("--exclude=$_x"); done
@@ -855,11 +884,13 @@ else
             _extra_skip "same as, inside, or containing another listed entry ~/${_dup#"$_home_real"/}" "$_d"
             continue
         fi
-        _extra_abs_seen+=("$_abs")
         if [ ! -d "$_abs" ]; then
             _extra_skip "missing; not in this snapshot" "$_d"
             continue
         fi
+        # Recorded only for directories that exist, so a missing nested entry can
+        # never get its existing parent refused.
+        _extra_abs_seen+=("$_abs")
         _ex_hit=""
         IFS='/' read -r -a _rel_parts <<< "$_rel"
         for _part in "${_rel_parts[@]}"; do
@@ -873,10 +904,24 @@ else
             _extra_skip "GENESIS_BACKUP_PASSPHRASE not set — refusing plaintext" "$_d"
             continue
         fi
+        if [ -n "$_extra_py_why" ]; then
+            _extra_skip "a restore could not extract it: $_extra_py_why" "$_d"
+            continue
+        fi
         _name="$(printf '%s' "$_rel" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)-$(printf '%s' "$_rel" | sha1sum | cut -c1-8).tar.gpg"
-        _tar_tmp="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.tar)"
+        # Temp creation can fail (a full or inode-exhausted temp filesystem): skip this
+        # directory, never abort the whole backup over an optional payload.
+        if ! _tar_tmp="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.tar 2>/dev/null)"; then
+            _extra_skip "cannot create a temp file in $GENESIS_BIG_TMP" "$_d"
+            continue
+        fi
         _EXTRA_TAR_TMP="$_tar_tmp"
-        _tar_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err)"
+        if ! _tar_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
+            rm -f "$_tar_tmp"
+            _EXTRA_TAR_TMP=""
+            _extra_skip "cannot create a temp file in $GENESIS_BIG_TMP" "$_d"
+            continue
+        fi
         _EXTRA_TAR_ERR="$_tar_err"
         _gpg_tmp="extra/.${_name}.partial.$$"
         _tar_rc=0
@@ -900,12 +945,16 @@ else
         # and yield an archive without it, with rc 0. Check with the reader restore uses
         # (never by parsing `tar -t`, which escapes backslashes and, under a C locale,
         # non-ASCII names), so backup keeps exactly what restore will accept.
-        _tar_root_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err)"
-        _EXTRA_TAR_ERR="$_tar_root_err"
-        _tar_root="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" root "$_tar_tmp" 2>"$_tar_root_err" || true)"
-        _tar_root_why="$(head -c 200 "$_tar_root_err" | tr '\n' ' ')"
-        rm -f "$_tar_root_err"
-        _EXTRA_TAR_ERR=""
+        _tar_root="" _tar_root_why=""
+        if _tar_root_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
+            _EXTRA_TAR_ERR="$_tar_root_err"
+            _tar_root="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" root "$_tar_tmp" 2>"$_tar_root_err" || true)"
+            _tar_root_why="$(head -c 200 "$_tar_root_err" | tr '\n' ' ')"
+            rm -f "$_tar_root_err"
+            _EXTRA_TAR_ERR=""
+        else
+            _tar_root_why="cannot create a temp file in $GENESIS_BIG_TMP"
+        fi
         if [ "$_tar_root" != "$_rel" ]; then
             rm -f "$_tar_tmp"
             _EXTRA_TAR_TMP=""
@@ -925,6 +974,13 @@ else
     if [ "$_extra_listed" -eq 0 ]; then
         _extra_skip "the list has no entries" "GENESIS_BACKUP_EXTRA_DIRS=$GENESIS_BACKUP_EXTRA_DIRS"
     fi
+    # Local manifest (same format as the off-site COMPLETE marker), for a restore
+    # that runs from this checkout without an off-site pull.
+    {
+        printf 'genesis-snapshot 1\n'
+        for _n in "${_EXTRA_BUILT[@]+"${_EXTRA_BUILT[@]}"}"; do printf 'extra %s\n' "$_n"; done
+        for _n in "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}"; do printf 'skipped %s\n' "$_n"; done
+    } > extra/MANIFEST 2>/dev/null || true
     log "Extra dirs: $_EXTRA_COUNT archived, $_EXTRA_SKIPPED skipped"
 fi
 
@@ -1257,7 +1313,7 @@ else
     # Only the archives THIS run built (never whatever else sits in extra/), so a
     # stale file can never reach a new snapshot under a new date.
     if [ "${#_EXTRA_BUILT[@]}" -gt 0 ]; then
-        backend_mkdir "${_T2_DIR}/extra"
+        backend_mkdir "${_T2_DIR}/extra" || true  # a failed put below is counted per archive
         for fname in "${_EXTRA_BUILT[@]}"; do
             f="extra/$fname"
             if backend_put "$f" "${_T2_DIR}/extra/${fname}"; then
@@ -1493,21 +1549,29 @@ if [ "${_T2_BACKEND:-none}" != "none" ] && [ "$_T2_STATUS" != "ok" ]; then
     # extras are deduplicated SEPARATELY: one shared flag let a chronic extras gap
     # (a listed directory that stays missing) silence a later real off-site failure.
     # Older status files have no offsite_core_complete; offsite_confirmed stands in.
+    # Each signal is suppressed only when the previous run ANNOUNCED the same thing
+    # (offsite_core_alerted / extras_alerted_gap). Status files from before those
+    # fields fall back to the older inference.
     _prev_flags=$(python3 -c "
 import json
 s = json.load(open('$_STATUS_FILE'))
-print(s.get('offsite_core_complete', s.get('offsite_confirmed', True)), s.get('extras_complete', True))
-" 2>/dev/null || echo "True True")
-    _prev_core="${_prev_flags%% *}"
-    _prev_extras="${_prev_flags##* }"
+core_was_down = s.get('offsite_core_complete', s.get('offsite_confirmed', True)) is False
+core = s.get('offsite_core_alerted', core_was_down)
+gap = s.get('extras_alerted_gap')
+if gap is None:
+    gap = s.get('extras_gap') if s.get('extras_complete', True) is False and not core_was_down else ''
+print(core, gap or '-')
+" 2>/dev/null || echo "False -")
+    read -r _prev_core_alerted _prev_alerted_gap <<<"$_prev_flags"
     if [ "${_T2_EXTRAS_ONLY_PARTIAL:-false}" = true ]; then
         _alert_kind=extras
-        # Suppressed only if the previous run already announced this gap: during a
-        # core outage only the core alert is sent, so the gap was never mentioned.
-        if [ "$_prev_extras" = "False" ] && [ "$_prev_core" != "False" ]; then _alert_kind=""; fi
+        _cur_gap="$(_extras_gap_fingerprint)"
+        _ALERTED_GAP="$_cur_gap"  # announced now, or already announced by the last run
+        [ "${_prev_alerted_gap:-}" = "${_cur_gap:--}" ] && _alert_kind=""
     else
         _alert_kind=core
-        [ "$_prev_core" = "False" ] && _alert_kind=""
+        _ALERTED_CORE=true
+        [ "$_prev_core_alerted" = "True" ] && _alert_kind=""
     fi
     if [ -n "$_alert_kind" ]; then
         # Escrow drift withheld the SQL dump from the off-site snapshot (the
@@ -1518,7 +1582,8 @@ print(s.get('offsite_core_complete', s.get('offsite_confirmed', True)), s.get('e
 
 The core backup reached the off-site snapshot and is restorable, but the
 extra directories are incomplete: ${_EXTRA_SKIPPED:-0} not archived this run,
-${_EXTRA_UPLOAD_FAILED:-0} not uploaded. The backup log names each one.
+${_EXTRA_UPLOAD_FAILED:-0} not uploaded. Not in this snapshot:
+$(printf '%s\n' "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}" | head -5)
 Time: $(date -Is)"
         elif [ "$_SQL_ESCROW_DRIFT" = true ]; then
             _send_telegram "⚠️ *Off-site DR degraded — backup passphrase escrow drift*

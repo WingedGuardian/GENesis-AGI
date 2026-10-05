@@ -2,6 +2,7 @@
 
 import importlib.util
 import io
+import os
 import tarfile
 from pathlib import Path
 
@@ -206,3 +207,48 @@ def test_an_empty_destination_is_replaced(tmp_path):
     stage.mkdir()
     assert er.cmd_swap(str(t), str(stage), "w", str(tmp_path / "w"), "") == 0
     assert (tmp_path / "w" / "f").read_bytes() == b"x"
+
+
+def test_a_long_multibyte_name_gets_a_valid_short_aside(tmp_path, capsysbinary):
+    """Class audit: the aside name keeps at most 100 bytes of the directory's name, cut
+    on a character boundary, and is written to stdout as raw bytes."""
+    name = "目" * 40  # 120 bytes in UTF-8
+    t = tmp_path / "a.tar"
+    with tarfile.open(t, "w") as tf:
+        d = tarfile.TarInfo(name)
+        d.type = tarfile.DIRTYPE
+        d.mode = 0o755
+        tf.addfile(d)
+    target = tmp_path / name
+    target.mkdir()
+    (target / "old").write_text("old")
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    assert er.cmd_swap(str(t), str(stage), name, str(target), "auto") == 0
+    out = capsysbinary.readouterr().out
+    assert out.startswith(b"aside ")
+    aside = out[len(b"aside ") :].rstrip(b"\n")
+    os.fsdecode(aside).encode("utf-8")  # valid UTF-8: no character was split
+    assert (Path(os.fsdecode(aside)) / "old").read_text() == "old"
+    assert len(os.path.basename(aside)) < 255
+
+
+def test_root_prints_a_non_utf8_name_under_a_strict_locale(tmp_path):
+    """Class audit: `root` writes raw bytes, so a non-UTF-8 directory name works under
+    en_US.UTF-8 (a strict stdout) as well as under C.UTF-8."""
+    import subprocess
+
+    t = tmp_path / "a.tar"
+    with tarfile.open(t, "w", encoding="utf-8", errors="surrogateescape") as tf:
+        d = tarfile.TarInfo(os.fsdecode(b"w\xff"))
+        d.type = tarfile.DIRTYPE
+        d.mode = 0o755
+        tf.addfile(d)
+    for locale in ("en_US.UTF-8", "C.UTF-8"):
+        proc = subprocess.run(
+            ["python3", str(_HELPER), "root", str(t)],
+            capture_output=True,
+            env={**os.environ, "LC_ALL": locale},
+        )
+        assert proc.returncode == 0, (locale, proc.stderr)
+        assert proc.stdout == b"w\xff\n", (locale, proc.stdout)

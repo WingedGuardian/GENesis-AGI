@@ -420,9 +420,12 @@ def test_extra_dirs_archived_encrypted_offsite_only_with_default_excludes(backup
     members = _list_extra_archive(archives[0], home)
     assert "work/store/a.parquet" in members and "work/store/sub/b.txt" in members
     assert not any(".venv" in m or "__pycache__" in m or "scratch" in m for m in members), members
-    # No plaintext staging left behind, and never committed to the git (Tier-1) repo.
+    # No plaintext staging left behind (MANIFEST, a list of names, is the one
+    # intended plain file), and never committed to the git (Tier-1) repo.
     assert not [
-        p for p in (_repo(backup_env) / "extra").iterdir() if not p.name.endswith(".tar.gpg")
+        p
+        for p in (_repo(backup_env) / "extra").iterdir()
+        if not p.name.endswith(".tar.gpg") and p.name != "MANIFEST"
     ]
     assert "extra/" in (_repo(backup_env) / ".gitignore").read_text().splitlines()
     tracked = subprocess.run(
@@ -883,3 +886,127 @@ def test_an_extras_gap_first_seen_during_a_core_outage_is_announced_after_it(bac
     s = _status(backup_env)
     assert s["offsite_core_complete"] is True and s["extras_complete"] is False, s
     assert _ALERTED in proc.stdout, f"the extras gap was never announced:\n{proc.stdout[-1500:]}"
+
+
+def _shim(backup_env, name: str, fail_when: str, message: str = "") -> None:
+    """A PATH shim for `name` that exits 3 (printing `message` to stderr) when its
+    arguments contain `fail_when`, and runs the real command otherwise."""
+    real = shutil.which(name)
+    shim = backup_env["bind"] / name
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        f'case "$*" in *"{fail_when}"*) echo "{message}" >&2; exit 3 ;; esac\n'
+        f'exec {real} "$@"\n'
+    )
+    shim.chmod(0o755)
+
+
+def test_extra_skipped_when_this_python_could_not_restore_it(backup_env, tmp_path):
+    """Codex round 4 P1: the restore helper refuses a Python without the 2025 tarfile
+    fixes, so backup checks first and reports it as a partial backup, instead of
+    writing archives a disaster recovery on this Python could not extract."""
+    _seed_extra_dir(backup_env["home"])
+    _shim(backup_env, "python3", "extra_restore.py check", "old tarfile")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store"})
+    assert proc.returncode == 0, proc.stdout[-1500:]
+    assert "a restore could not extract it: old tarfile" in proc.stdout, proc.stdout[-1500:]
+    assert not list((_repo(backup_env) / "extra").glob("*.tar.gpg"))
+    assert _status(backup_env)["tier2_status"] == "partial"
+
+
+def test_extra_temp_failure_skips_the_directory_not_the_backup(backup_env, tmp_path):
+    """Codex round 4: a temp file that cannot be created (full temp filesystem) skips
+    that extra directory; the core backup still completes."""
+    _seed_extra_dir(backup_env["home"])
+    _shim(backup_env, "mktemp", "extra.XXXXXX")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store"})
+    assert proc.returncode == 0, proc.stdout[-1500:]
+    assert "cannot create a temp file" in proc.stdout, proc.stdout[-1500:]
+    s = _status(backup_env)
+    assert s["success"] is True and s["offsite_core_complete"] is True, s
+    assert s["tier2_status"] == "partial", s
+
+
+def test_an_inactive_local_offsite_path_does_not_refuse_entries(backup_env, tmp_path):
+    """Codex round 4: GENESIS_BACKUP_LOCAL_PATH counts as backup output only when the
+    local backend is the one in use."""
+    home = backup_env["home"]
+    d = home / "offsite-local"
+    (d / "root").mkdir(parents=True)
+    (d / "f.txt").write_text("x")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(
+        backup_env,
+        offsite,
+        {
+            "GENESIS_BACKUP_EXTRA_DIRS": "~/offsite-local",
+            "GENESIS_BACKUP_TIER2_BACKEND": "none",
+            "GENESIS_BACKUP_LOCAL_PATH": str(d / "root"),
+        },
+    )
+    assert proc.returncode == 0, proc.stdout[-1500:]
+    assert len(list((_repo(backup_env) / "extra").glob("*.tar.gpg"))) == 1, proc.stdout[-1500:]
+
+
+def test_the_extras_alert_refires_when_a_different_directory_goes_missing(backup_env, tmp_path):
+    """CodeRabbit round 4: one known gap must not hide a second, different one."""
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    one = {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/a", **_TELEGRAM}
+    two = {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/a:~/work/b", **_TELEGRAM}
+    assert _ALERTED in _run_local(backup_env, offsite, one).stdout
+    _next_second()
+    assert _ALERTED not in _run_local(backup_env, offsite, one).stdout  # same gap
+    _next_second()
+    proc = _run_local(backup_env, offsite, two)
+    assert _ALERTED in proc.stdout, (
+        f"a new missing directory was not announced:\n{proc.stdout[-1500:]}"
+    )
+
+
+def test_a_non_ascii_entry_still_gets_a_named_skip_line(backup_env, tmp_path):
+    """Class audit: labels are shell-quoted, not stripped, so an all-non-ASCII name
+    never becomes an empty `skipped` line that restore would drop."""
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/\u76ee\u5f55"})
+    assert proc.returncode == 0, proc.stdout[-1500:]
+    lines = (_snaps(offsite)[-1] / "COMPLETE").read_text().splitlines()
+    skipped = [ln for ln in lines if ln.startswith("skipped ")]
+    assert skipped and all(len(ln) > len("skipped ") for ln in skipped), lines
+    manifest = (_repo(backup_env) / "extra" / "MANIFEST").read_text().splitlines()
+    assert manifest[0] == "genesis-snapshot 1" and skipped[0] in manifest, manifest
+
+
+def test_an_extras_gap_recorded_by_a_run_that_died_is_announced_next_run(backup_env, tmp_path):
+    """Class audit: a run that dies after Tier 2 but before the alert block records the
+    gap without announcing it; the next run with the same gap must alert."""
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    env = {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/missing", **_TELEGRAM}
+    _shim(backup_env, "git", "add -A")  # the Tier-1 commit step fails after Tier 2
+    first = _run_local(backup_env, offsite, env)
+    s1 = _status(backup_env)  # only the generic backup-failed alert went out
+    assert s1["extras_complete"] is False and s1["extras_alerted_gap"] == "", s1
+    (backup_env["bind"] / "git").unlink()
+    _next_second()
+    proc = _run_local(backup_env, offsite, env)
+    assert _ALERTED in proc.stdout, f"the unannounced gap stayed silent:\n{proc.stdout[-1500:]}"
+
+
+def test_a_missing_nested_entry_never_refuses_its_existing_parent(backup_env, tmp_path):
+    """Class audit: nesting is judged among directories that exist."""
+    home = backup_env["home"]
+    (home / "work" / "a").mkdir(parents=True)
+    (home / "work" / "a" / "f").write_text("x")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/a/b:~/work/a"})
+    assert proc.returncode == 0, proc.stdout[-1500:]
+    names = [p.name for p in (_repo(backup_env) / "extra").glob("*.tar.gpg")]
+    assert len(names) == 1 and names[0].startswith("work_a-"), names

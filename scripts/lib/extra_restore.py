@@ -5,13 +5,16 @@ Each archive holds ONE directory, members stored relative to $HOME. restore.sh
 resolves where it goes and refuses unsafe destinations; this helper does the two
 steps that need a real tar reader:
 
+    extra_restore.py check
+        Exit 0 when this Python may extract (see _python_is_safe), else 3.
     extra_restore.py root <tar>
         Print the directory the archive holds (e.g. ``.genesis/analytics``); it
         must be a directory member of the archive.
     extra_restore.py swap <tar> <stage> <root> <target> <aside>
         Extract into <stage> (created by the caller next to <target>, so the
         final step is a rename on one filesystem), fsync what was written, move
-        an existing <target> to <aside> (only when <aside> is non-empty), and
+        an existing <target> aside (only when <aside> is non-empty; ``auto``
+        builds a short name next to <target>), and
         rename the restored directory into place. Prints ``aside <path>`` when
         an existing directory was moved aside.
 
@@ -39,10 +42,32 @@ import os
 import posixpath
 import sys
 import tarfile
+import time
 
 
 def _err(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+def _out(text: str) -> None:
+    """Write a value to stdout as raw bytes: a path may not be valid in the locale's
+    encoding (a non-UTF-8 name, or a UTF-8 one under a strict ASCII locale)."""
+    sys.stdout.buffer.write(os.fsencode(text) + b"\n")
+    sys.stdout.buffer.flush()
+
+
+def aside_path(target: str) -> str:
+    """<parent>/<first <=100 bytes of the name>.pre-restore-<UTC stamp>.<pid>, so the
+    name stays far below NAME_MAX. A UTF-8 name is cut on a character boundary."""
+    name = os.fsencode(os.path.basename(target))
+    stem = name[:100]
+    try:
+        name.decode("utf-8")
+        stem = stem.decode("utf-8", "ignore").encode("utf-8")
+    except UnicodeDecodeError:
+        pass  # not UTF-8 at all: there are no character boundaries to respect
+    suffix = f".pre-restore-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.{os.getpid()}"
+    return os.fsdecode(os.path.join(os.fsencode(os.path.dirname(target)), stem + suffix.encode()))
 
 
 def parts(name: str) -> list[str]:
@@ -159,11 +184,13 @@ def cmd_root(tar: str) -> int:
     if root is None:
         _err("the archive does not hold a single directory")
         return 5
-    print(root)
+    _out(root)
     return 0
 
 
 def cmd_swap(tar: str, stage: str, root: str, target: str, aside: str) -> int:
+    if aside == "auto":
+        aside = aside_path(target)
     keep = make_filter(root)
     with tarfile.open(tar) as tf:
         tf.extractall(stage, filter=keep)  # noqa: S202 — data filter + confinement to root
@@ -207,11 +234,11 @@ def cmd_swap(tar: str, stage: str, root: str, target: str, aside: str) -> int:
                 os.rename(aside, target)
             except OSError as e2:
                 _err(f"could not put the previous directory back from {aside}: {e2}")
-                print(f"aside {aside}")
+                _out(f"aside {aside}")
         _err(f"could not move the restored directory into place: {e}")
         return 5
     if moved:
-        print(f"aside {aside}")
+        _out(f"aside {aside}")
     problem = False
     try:
         fd = os.open(os.path.dirname(target), os.O_RDONLY)
@@ -242,6 +269,15 @@ def cmd_swap(tar: str, stage: str, root: str, target: str, aside: str) -> int:
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[1] == "check":
+        # backup.sh asks before archiving: an archive a restore cannot extract is
+        # better reported at backup time than discovered during a disaster recovery.
+        if _python_is_safe():
+            return 0
+        _err(
+            "its Python tarfile lacks the 2025 extraction-filter fixes (CPython 3.12.11+ or a distro backport)"
+        )
+        return 3
     if len(argv) == 3 and argv[1] == "root":
         return cmd_root(argv[2])  # reads names only; extracts nothing
     if len(argv) == 7 and argv[1] == "swap":
@@ -251,7 +287,7 @@ def main(argv: list[str]) -> int:
             )
             return 3
         return cmd_swap(*argv[2:7])
-    _err("usage: extra_restore.py root <tar> | swap <tar> <stage> <root> <target> <aside>")
+    _err("usage: extra_restore.py check | root <tar> | swap <tar> <stage> <root> <target> <aside>")
     return 5
 
 

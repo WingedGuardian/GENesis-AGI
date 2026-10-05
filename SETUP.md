@@ -159,18 +159,23 @@ A listed directory is skipped with a warning when it:
 - overlaps a path the core backup already restores (for example `~/.genesis`
   itself, or anything inside the repo);
 - is missing, or tar cannot read it;
-- would be emptied by an exclude pattern.
+- would be emptied by an exclude pattern;
+- could not be extracted by a restore on this machine: restore needs a Python whose
+  `tarfile` has the 2025 extraction-filter fixes (CPython 3.12.11 or later, or a
+  distribution backport). The machine you restore onto needs one too.
 
 A skipped directory is simply absent from that snapshot; older snapshots keep it
 until retention drops them. None of this fails the backup, but each skip, and
 each archive that fails to upload, marks the off-site copy `partial`
 (`offsite_confirmed: false`, `extras_complete: false`) and sends the off-site
-alert once. The core snapshot is still marked complete
+alert, again whenever the set of missing directories changes. The core snapshot is still marked complete
 (`offsite_core_complete: true`), retention still runs, and a later failure of the
 core off-site copy still alerts on its own. The snapshot's `COMPLETE` marker
 lists the extra archives it holds and the listed directories it skipped, so a
 restore can tell "none" apart from "could not list them" and can name what a
-snapshot is missing. A file that changes while it is being archived (tar exit 1)
+snapshot is missing; `extra/MANIFEST` in the backups checkout does the same for a
+restore that runs without an off-site pull. `scripts/update.sh` reports an
+extras-only gap as `backup:tier2_extras`, distinct from a real off-site failure. A file that changes while it is being archived (tar exit 1)
 is kept but may be torn, and the log says so; stop a writer whose files must be
 consistent, or exclude them. Without an off-site tier the archives stay local
 only, in the backups checkout, and no off-site alert applies.

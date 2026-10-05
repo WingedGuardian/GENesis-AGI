@@ -781,3 +781,52 @@ def test_extra_empty_destination_is_kept_when_the_restore_fails(restore_sandbox)
     assert "could not be restored" in proc.stdout, proc.stdout[-1500:]
     assert store.is_dir(), "the empty destination was removed by a failed restore"
     assert not list(sb["home"].rglob("*.restore.*"))
+
+
+def test_extra_long_directory_names_restore_with_short_sibling_names(restore_sandbox):
+    """Codex round 4: generated staging and aside names must stay under NAME_MAX for a
+    long (but valid) directory name; they reuse at most 100 bytes of it."""
+    sb = restore_sandbox
+    long = "d" * 240  # with ".pre-restore-<stamp>.<pid>" appended this would pass 255
+    live = sb["home"] / "work" / long
+    live.mkdir(parents=True)
+    (live / "old.txt").write_text("old")
+    _seed_extra_archive(sb, "work_long-12345678", {f"work/{long}/f.txt": b"new"})
+    proc = _restore_extra(sb)
+    assert (live / "f.txt").read_bytes() == b"new", proc.stdout[-1500:]
+    aside = list((sb["home"] / "work").glob("*.pre-restore-*"))
+    assert len(aside) == 1 and (aside[0] / "old.txt").read_text() == "old", aside
+    assert len(aside[0].name.encode()) < 255
+
+
+def test_extra_local_manifest_names_skipped_directories(restore_sandbox):
+    """Class audit: a restore without an off-site pull reads the backup's local
+    manifest and records each directory the last backup left out."""
+    sb = restore_sandbox
+    _seed_extra_archive(sb, "work_store-abcd1234", {"work/store/a.parquet": b"x"})
+    (sb["backup"] / "extra" / "MANIFEST").write_text(
+        "genesis-snapshot 1\nextra work_store-abcd1234.tar.gpg\nskipped work/gone\n"
+    )
+    proc = _restore_extra(sb)
+    assert "extra directory work/gone was not in the last local backup" in proc.stdout, proc.stdout[-1500:]
+    assert any("work/gone" in f for f in _status(sb)["failures"]), _status(sb)
+    assert (sb["home"] / "work" / "store" / "a.parquet").read_bytes() == b"x"
+
+
+def test_extra_unreadable_destination_is_not_treated_as_empty(restore_sandbox):
+    """Class audit: an unreadable directory is moved aside under --force like any
+    existing one, not mistaken for an empty one."""
+    sb = restore_sandbox
+    live = sb["home"] / "work" / "store"
+    live.mkdir(parents=True)
+    (live / "old.txt").write_text("old")
+    _seed_extra_archive(sb, "work_store-abcd1234", {"work/store/a.parquet": b"NEW"})
+    live.chmod(0)
+    try:
+        proc = _restore_extra(sb)
+        assert (live / "a.parquet").read_bytes() == b"NEW", proc.stdout[-1500:]
+        aside = list((sb["home"] / "work").glob("store.pre-restore-*"))
+        assert len(aside) == 1, aside
+    finally:
+        for p in (sb["home"] / "work").iterdir():
+            p.chmod(0o755)

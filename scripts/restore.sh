@@ -133,7 +133,7 @@ _cleanup_plaintext() {
         rm -f "$_DB_STAGE" "$_DB_STAGE-journal" "$_DB_STAGE-wal" "$_DB_STAGE-shm" 2>/dev/null || true
     fi
 }
-trap '_write_status; _release_deploy_marker; backend_cleanup; _cleanup_plaintext' EXIT
+trap '_cleanup_plaintext; _write_status; _release_deploy_marker; backend_cleanup' EXIT
 
 # ── Setup ────────────────────────────────────────────────────────────
 GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
@@ -493,7 +493,7 @@ _pull_from_offsite() {
             _xt_names="$(awk '$1 == "extra" {print $2}' "$_xt_marker" | grep -E '^[A-Za-z0-9._-]+\.tar\.gpg$' || true)"
             # Directories the source listed but could not back up in that run.
             while IFS= read -r _xt_sk; do
-                [ -n "$_xt_sk" ] && warn "off-site: snapshot $latest does not hold extra directory ${_xt_sk} (backup skipped it that run); it is not restored"
+                warn "off-site: snapshot $latest does not hold extra directory ${_xt_sk:-(unnamed entry)} (backup skipped it that run); it is not restored"
             done < <(awk '$1 == "skipped" {$1 = ""; sub(/^ /, ""); print}' "$_xt_marker" | tr -cd '[:print:]\n')
         elif [ -s "$_xt_marker" ]; then
             warn "off-site: snapshot $latest has a COMPLETE marker in an unknown format; its extra directories are not restored"
@@ -505,7 +505,7 @@ _pull_from_offsite() {
     [ -n "$_xt_marker" ] && rm -f "$_xt_marker"
     while read -r fname; do
         [ -n "$fname" ] || continue
-        mkdir -p "$BACKUP_DIR/extra"
+        mkdir -p "$BACKUP_DIR/extra" 2>/dev/null || true  # a failed get below warns per file
         if backend_get "$snap/extra/$fname" "$BACKUP_DIR/extra/$fname"; then
             _EXTRA_PULLED+="$fname"$'\n'
             log "  off-site: pulled extra/$fname"
@@ -1279,6 +1279,14 @@ _xt_skip() {  # warn, drop this archive's temps, and let the caller `continue`
 }
 _xt_errtext() { head -c 300 "$_XT_ERR" 2>/dev/null | tr '\n' ' '; }
 log "--- Extra directories ---"
+# Without an off-site pull, the backup's local manifest (same format as the COMPLETE
+# marker) still says which listed directories that backup left out.
+if ! $_EXTRA_FROM_SNAPSHOT && [ -f "$BACKUP_DIR/extra/MANIFEST" ] \
+    && [ "$(head -1 "$BACKUP_DIR/extra/MANIFEST")" = "genesis-snapshot 1" ]; then
+    while IFS= read -r _xt_sk; do
+        warn "extra directory ${_xt_sk:-(unnamed entry)} was not in the last local backup; it is not restored"
+    done < <(awk '$1 == "skipped" {$1 = ""; sub(/^ /, ""); print}' "$BACKUP_DIR/extra/MANIFEST" | tr -cd '[:print:]\n')
+fi
 if find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2>/dev/null | grep -q .; then
     _xt_home_real="$(realpath -- "$HOME")"
     _xt_helper="$_SCRIPT_DIR/lib/extra_restore.py"
@@ -1338,7 +1346,8 @@ if find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2
             continue
         fi
         _xt_aside=""
-        if [ -d "$_xt_target" ] && [ -z "$(ls -A -- "$_xt_target" 2>/dev/null)" ]; then
+        if [ -d "$_xt_target" ] && [ -r "$_xt_target" ] && [ -x "$_xt_target" ] \
+            && [ -z "$(ls -A -- "$_xt_target" 2>/dev/null)" ]; then
             :  # an empty directory (e.g. created by bootstrap) counts as absent; the helper
                # removes it only once the restored tree is ready to take its place
         elif [ -e "$_xt_target" ]; then
@@ -1346,9 +1355,11 @@ if find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2
                 _xt_skip "extra archive $name: ~/$_xt_root exists and was not replaced (re-run with --force; the current one is then moved aside)"
                 continue
             fi
-            _xt_aside="$_xt_target.pre-restore-$(date -u +%Y%m%dT%H%M%SZ).$$"
+            # The helper builds the name: short (at most 100 bytes of the directory's
+            # own name), cut on a character boundary, never past NAME_MAX.
+            _xt_aside=auto
         fi
-        if ! _XT_STAGE="$(mktemp -d -p "$_xt_parent" ".$(basename "$_xt_target").restore.XXXXXX")"; then
+        if ! _XT_STAGE="$(mktemp -d -p "$_xt_parent" .extra.restore.XXXXXX 2>/dev/null)"; then
             _XT_STAGE=""
             _xt_skip "extra archive $name: cannot create a staging dir in $_xt_parent"
             continue
