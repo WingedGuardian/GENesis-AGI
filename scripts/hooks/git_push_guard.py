@@ -5861,6 +5861,8 @@ _HOOK_SURFACE_FILES = (
             "config/external_review.yaml",  # external review identity + dispatch
             "src/genesis/session_awareness/external_review.py",
             "src/genesis/session_awareness/external_review_config.py",
+            "scripts/hooks/main_checkout_guard.py",  # deploy-root edit guard
+            "config/main_checkout_guard.yaml",  # main_checkout_guard.py
         }
     )
 )
