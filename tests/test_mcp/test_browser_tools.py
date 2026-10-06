@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import os
 import re
 import signal
 from datetime import UTC, datetime
@@ -1216,9 +1217,29 @@ class TestVncFallbackKeepsPasswordAuth:
         assert browser._vnc_verified is False
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("shape", ["directory", "empty", "short", "unreadable"])
+    async def test_unusable_password_path_starts_nothing(self, tmp_path, shape):
+        # x11vnc 0.9.16 reads the first 8 bytes of the -rfbauth file. Given a
+        # directory, a shorter file or one it cannot read, it still listens,
+        # offering only password auth that no password can pass.
+        target = tmp_path / ".genesis" / "vnc_passwd"
+        if shape == "directory":
+            target.mkdir(parents=True)
+        else:
+            target.parent.mkdir()
+            target.write_bytes({"empty": b"", "short": b"\0" * 7}.get(shape, b"\0" * 8))
+        if shape == "unreadable":
+            if os.geteuid() == 0:
+                pytest.skip("root reads a mode-000 file")
+            target.chmod(0)
+        popen = await self._run(tmp_path)
+        popen.assert_not_called()
+        assert browser._vnc_verified is False
+
+    @pytest.mark.asyncio
     async def test_with_a_password_file_it_uses_it(self, tmp_path):
         (tmp_path / ".genesis").mkdir()
-        (tmp_path / ".genesis" / "vnc_passwd").write_bytes(b"x")
+        (tmp_path / ".genesis" / "vnc_passwd").write_bytes(b"\0" * 8)
         popen = await self._run(tmp_path)
         argv = popen.call_args.args[0]
         assert argv[argv.index("-rfbauth") + 1] == str(tmp_path / ".genesis" / "vnc_passwd")
