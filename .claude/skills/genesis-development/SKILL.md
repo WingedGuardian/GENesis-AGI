@@ -2458,7 +2458,7 @@ reviewed diff's FULL content, so re-staging different content after the audit
 re-blocks. A precision-filtered "no findings" inline pass is FALSE CONFIDENCE for a
 substantial change — not clearance. Depth is override-exempt: a findings
 `# review-override` does NOT waive it; only a loud, announced-on-stderr `# depth-ack`
-does (announced, not RECORDED — nothing persists it, unlike the five PR-merge sigils
+does (announced, not RECORDED — nothing persists it, unlike the six PR-merge sigils
 below, whose rows survive the session; the word "logged" now means a durable row) (the
 audited escape for a genuine format mismatch). "Adversarial" is verified
 STRUCTURALLY, and the recognised vocabulary is NOT what an earlier version of this
@@ -4085,9 +4085,12 @@ twice.
 `python3 scripts/hooks/git_push_guard.py --check-pr <N> [--repo OWNER/REPO]`
 BEFORE proposing a merge. It runs the SAME check functions the enforcement gate uses, in this REPORT order
 (mergeable → CI → base-invariant → pin-receipts → e2e-plan *(advisory)* →
-Codex-freshness → scheduled-Claude-review → review-body → inline findings),
+Codex-freshness → rounds *(advisory)* → scheduled-Claude-review → review-body →
+inline findings → main-reverts *(advisory)* → rework),
 so the two use the same checks. The merge arm checks review-body and inline
-findings before scheduled review, and additionally applies the
+findings before scheduled review, runs `rework` last (waived only by the logged
+`# rework-override`, which needs the owner's yes), blocks on none of the three
+advisory rows, and additionally applies the
 `--match-head-commit` binding, which has no report row —
 this `--check-pr` read IS the mandatory pre-merge step: **always run it and read
 the PR's automated-review comments (Codex, leak/CI, the scheduled Claude review)
@@ -4472,10 +4475,10 @@ The review-findings gate specifically:
    prompt sit downstream of this guard and can still stop the command.
    Never any command text — the row is metadata only, because a trailing comment
    rides a Bash command that can carry a credential.
-   **Scope, stated so the log is not read as more complete than it is:** the five
+   **Scope, stated so the log is not read as more complete than it is:** the six
    PR-merge sigils are covered (`# review-override`, `# ci-override`,
    `# stale-review-override`, `# scheduled-review-override`,
-   `# substitute-review`), from the point the
+   `# substitute-review`, `# rework-override`), from the point the
    PR is resolved onward. A merge rejected BEFORE that point writes nothing —
    no `--admin`, an unresolvable repo/PR, a compound carrying two publish/merge
    operations, or a merge compounded with a local `git merge` into main are the
