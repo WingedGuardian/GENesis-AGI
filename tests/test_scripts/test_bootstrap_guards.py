@@ -34,13 +34,18 @@ def _code(path: Path) -> str:
     return "\n".join(ln for ln in path.read_text().splitlines() if not ln.lstrip().startswith("#"))
 
 
-def _recovery_git(root: Path, *args: str) -> str:
+def _recovery_env(**extra: str) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env.update(extra)
+    return env
+
+
+def _recovery_git(root: Path, *args: str) -> str:
     return subprocess.check_output(
         ["git", "-C", str(root), *args],
         text=True,
-        env=env,
+        env=_recovery_env(),
         timeout=30,
     ).strip()
 
@@ -114,15 +119,14 @@ def _run_crash_recovery(
         capture_output=True,
         text=True,
         timeout=30,
-        env={
-            **os.environ,
-            "HOME": str(home),
-            "RECOVERY_SCRIPTS": str(REPO_ROOT / "scripts"),
-            "RECOVERY_ROOT": str(root),
-            "TEST_BACKUP_ROOT": str(
+        env=_recovery_env(
+            HOME=str(home),
+            RECOVERY_SCRIPTS=str(REPO_ROOT / "scripts"),
+            RECOVERY_ROOT=str(root),
+            TEST_BACKUP_ROOT=str(
                 backup_root or home / ".genesis" / "premerge-backups" / "test-run"
             ),
-        },
+        ),
     )
 
 
@@ -918,12 +922,22 @@ def test_unsafe_recovery_cases_refuse_without_moving_unowned_code(tmp_path, case
 
 
 @pytest.mark.parametrize(
-    ("two_parent", "staged"),
-    [(False, False), (True, False), (False, True)],
-    ids=["S2-fast-forward", "S4-two-parent-merge", "S13-staged-edit"],
+    ("two_parent", "staged", "polluted_git_env"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+    ],
+    ids=[
+        "S2-fast-forward",
+        "S4-two-parent-merge",
+        "S13-staged-edit",
+        "S2-fast-forward-inherited-git-env",
+    ],
 )
 def test_crashed_owned_update_rolls_back_and_keeps_untouched_edit(
-    tmp_path, two_parent, staged
+    tmp_path, monkeypatch, two_parent, staged, polluted_git_env
 ):
     root, common, rollback = _recovery_repo(tmp_path)
     if two_parent:
@@ -941,9 +955,24 @@ def test_crashed_owned_update_rolls_back_and_keeps_untouched_edit(
     )
     if staged:
         _recovery_git(root, "add", "--", "untouched.txt")
+    if polluted_git_env:
+        decoy_parent = tmp_path / "decoy"
+        decoy_parent.mkdir()
+        decoy, _, _ = _recovery_repo(decoy_parent)
+        (decoy / "untouched.txt").write_text("decoy staged edit\n")
+        _recovery_git(decoy, "add", "--", "untouched.txt")
+        decoy_head = _recovery_git(decoy, "rev-parse", "HEAD")
+        decoy_index = decoy / ".git" / "index"
+        decoy_index_before = decoy_index.read_bytes()
+        monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
+        monkeypatch.setenv("GIT_WORK_TREE", str(decoy))
+        monkeypatch.setenv("GIT_INDEX_FILE", str(decoy_index))
     proc, state_path = _recover(tmp_path, root, own_head=rollback, deploy_head=deploy)
 
     _assert_recovered(proc, state_path, root, rollback)
+    if polluted_git_env:
+        assert _recovery_git(decoy, "rev-parse", "HEAD") == decoy_head
+        assert decoy_index.read_bytes() == decoy_index_before
     assert (root / "changed.txt").read_text() == "base changed\n"
     if staged:
         assert _recovery_git(root, "show", ":untouched.txt") == "staged operator edit"
@@ -1032,6 +1061,7 @@ def _merge_in_progress(tmp_path: Path) -> tuple[Path, str, str]:
     merge = subprocess.run(
         ["git", "-C", str(root), "merge", "--no-ff", "--no-edit", "incoming"],
         capture_output=True,
+        env=_recovery_env(),
         timeout=30,
     )
     assert merge.returncode != 0, "the fixture needs a conflicted merge"
