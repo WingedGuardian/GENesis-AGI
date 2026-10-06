@@ -31,6 +31,9 @@ _RUNTIME_FRESH_SCRIPTS=(
     scripts/hooks/bash_allowlist_lib.sh   # sourced by bash_allowlist_guard.sh on every run
     scripts/lib/deploy_marker.sh          # sourced by observability/snapshots/deploy_health.py's main-checkout probe on every snapshot
     scripts/lib/deploy_checkout.sh        # sourced by the same probe (its dirty-tree predicate)
+    scripts/hooks/main_checkout_guard.py  # registered by cc/invoker.py for dispatched sessions
+    scripts/hooks/hook_input.py           # imported by main_checkout_guard.py on every run
+    scripts/hooks/hook_output.py          # imported by main_checkout_guard.py to emit a note
     # Not under scripts/, but the same kind: cc/invoker.py runs the allowlist
     # guard through this launcher in the server, and reads its exit code.
     .claude/hooks/genesis-hook
