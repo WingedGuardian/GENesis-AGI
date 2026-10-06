@@ -48,17 +48,22 @@ class Levers:
     notes: tuple[str, ...] = ()
 
 
-def _read_env_file(path: Path) -> dict[str, str]:
+def _read_env_file(path: Path) -> tuple[dict[str, str], str | None]:
+    """The file's GENESIS_RB_* values, and a note when it exists but cannot be
+    read: an operator's threshold silently replaced by the default is worse than
+    a warning. An absent file is the normal case and says nothing."""
     values: dict[str, str] = {}
     try:
         text = path.read_text()
-    except OSError:
-        return values
+    except FileNotFoundError:
+        return values, None
+    except (OSError, UnicodeDecodeError) as exc:
+        return values, f"could not read {path} ({exc.__class__.__name__}); its values are ignored"
     for line in text.splitlines():
         key, sep, value = line.strip().removeprefix("export ").partition("=")
         if sep and key.strip().startswith("GENESIS_RB_"):
             values[key.strip()] = value.strip().strip("'\"")
-    return values
+    return values, None
 
 
 def load_levers(env: dict[str, str] | None = None, env_file: Path = ENV_FILE) -> Levers:
@@ -66,9 +71,11 @@ def load_levers(env: dict[str, str] | None = None, env_file: Path = ENV_FILE) ->
 
     An invalid value falls back to its default and says so in ``notes``.
     """
-    merged = {**_read_env_file(env_file), **(os.environ if env is None else env)}
+    from_file, file_note = _read_env_file(env_file)
+    merged = {**from_file, **(os.environ if env is None else env)}
     values: dict[str, float] = {}
-    notes = [
+    notes = [file_note] if file_note else []
+    notes += [
         f"{key} is not a known lever; ignored"
         for key in merged
         if key.startswith("GENESIS_RB_") and key not in _LEVER_DEFAULTS

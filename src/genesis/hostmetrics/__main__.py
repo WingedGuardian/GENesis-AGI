@@ -71,7 +71,7 @@ def _disk_arg(text: str) -> tuple[str, int]:
         if not sep or not path or not 0 <= float(gib) <= _MAX_NUMBER:  # nan fails too
             raise ValueError
         return str(Path(path).expanduser()), int(float(gib) * GIB)
-    except ValueError:
+    except (ValueError, RuntimeError):  # RuntimeError: ~unknown-user
         raise argparse.ArgumentTypeError(f"expected PATH=GB, got {text!r}") from None
 
 

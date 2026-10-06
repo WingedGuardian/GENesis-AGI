@@ -193,6 +193,18 @@ def test_invalid_lever_falls_back_loudly(tmp_path, bad):
     assert "GENESIS_RB_THRESHOLD_PCT" in lv.notes[0]
 
 
+def test_an_unreadable_env_file_is_named_not_silently_ignored(tmp_path):
+    # A directory where the file should be: exists, but read_text() fails.
+    (tmp_path / "resource-budget.env").mkdir()
+    lv = load_levers(env={}, env_file=tmp_path / "resource-budget.env")
+    assert lv.threshold_pct == 80.0
+    assert any("could not read" in n for n in lv.notes), lv.notes
+
+
+def test_an_absent_env_file_says_nothing(tmp_path):
+    assert load_levers(env={}, env_file=tmp_path / "none").notes == ()
+
+
 def test_levers_accept_export_lines_and_name_unknown_keys(tmp_path):
     f = tmp_path / "rb.env"
     f.write_text("export GENESIS_RB_THRESHOLD_PCT=50\nGENESIS_RB_TRESHOLD_PCT=60\n")
@@ -307,6 +319,8 @@ def test_live_jobs_reservation_counts_on_the_host_leg_too():
         ["preflight", "--name", "j", "--ram", "1", "--cpu", "50", "--disk", "/x=1e300"],
         ["status", "--cpu-window", "1e300"],
         ["status", "--cpu-window", "86400"],
+        # Path.expanduser raises RuntimeError for an unknown user (review, round 2)
+        ["preflight", "--name", "j", "--ram", "1", "--cpu", "50", "--disk", "~no-such-user-x9/o=1"],
     ],
 )
 def test_non_finite_numbers_are_usage_errors(fixed_snapshot, argv):
