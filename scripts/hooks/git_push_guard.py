@@ -311,6 +311,9 @@ _DEGRADED_GATED = (
 )
 
 try:
+    # Inside this block on purpose: a broken module degrades the guard closed
+    # (degraded_exit below) instead of exiting 1, which the harness reads as allow.
+    from gh_merge import api_merge_reason, files_trusted, is_help_only  # noqa: E402
     from git_repo_selection import (  # noqa: E402
         raw_sets_repo_env,
         seg_redirects_repo,
@@ -372,8 +375,14 @@ except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degrad
 # NOT. A word boundary asks the one thing that was meant — that the flag is a whole
 # token — without naming the characters that may follow it. MEASURED cost of the
 # widening over 74,282 real commands: 15,945 -> 15,995, i.e. +50 (+0.07%).
+# The three GraphQL merge mutations are named because `\bmerge\b` cannot match
+# inside `mergePullRequest` (#2768). MEASURED cost on the blind-spot arm over
+# 117,280 recorded commands (2026-10-05): 0 newly matched, since no unparseable
+# command named one of them without also naming `merge`.
+_MERGE_MUTATION_WORDS = r"\b(?:mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest)\b"
 _GATED_MENTION = re.compile(
-    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge)\b"
+    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge)\b|"
+    + _MERGE_MUTATION_WORDS
 )
 
 # The CARRIER arm's own net. It is `_GATED_MENTION` plus `\bcommit\b`, and it is
@@ -398,7 +407,8 @@ _GATED_MENTION = re.compile(
 # revision published the +9 as this guard's rate, having counted one arm of a
 # two-arm change.
 _CARRIER_GATED_MENTION = re.compile(
-    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge|commit)\b"
+    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge|commit)\b|"
+    + _MERGE_MUTATION_WORDS
 )
 
 # `gh pr create` is the FOURTH gated operation (it can push or fork the branch —
@@ -623,6 +633,52 @@ def _effective_cwd(cmd: str, payload: dict, seg=None):
         if dash_c is not None:
             return _resolve_against(cur, dash_c)
     return cur
+
+
+def _api_merge_deny(segs, cmd: str, payload: dict) -> str | None:
+    """The refusal for a PR merge spelled through the GitHub API, or None (#2768).
+
+    Reads argv only (plus a local query file the command names); runs no
+    subprocess, so the verdict lands before any network call this guard makes.
+    """
+    for seg in segs:
+        if seg.exe != "gh":
+            continue
+        # No cwd in the payload, or an ambiguous one, leaves a relative query
+        # file unreadable (refused) rather than read from the hook's own directory.
+        cwd = _effective_cwd(cmd, payload, seg=seg)
+        if not isinstance(cwd, str):
+            cwd = None
+        # A query file is read only when nothing else in the command could write it
+        # after this check and before gh reads it.
+        found = api_merge_reason(
+            seg.argv, cwd, raw=seg.raw, trusted=files_trusted(cmd, len(segs))
+        )
+        if found is None:
+            continue
+        pr = found.pr if found.pr and found.pr.isdigit() else "<N>"
+        if found.unreadable:
+            head = (
+                f"BLOCKED: {found.reason}. It may merge a pull request through the "
+                "GitHub API, which skips every merge-gate check (CI, review findings, "
+                "Codex at head, the head binding)."
+            )
+        else:
+            head = (
+                f"BLOCKED: {found.reason} merges a pull request through the GitHub API, "
+                "which skips every merge-gate check (CI, review findings, Codex at "
+                "head, the head binding)."
+            )
+        lines = [
+            head,
+            f"Merge with the gated command instead: run `python3 "
+            f"scripts/hooks/git_push_guard.py --check-pr {pr}` and use its merge-with "
+            f"line (`gh pr merge {pr} --squash --admin --match-head-commit <sha>`).",
+        ]
+        if found.hint:
+            lines.append(found.hint)
+        return "\n".join(lines)
+    return None
 
 
 def _git_common_dir(cwd: str | None) -> str | None:
@@ -5799,6 +5855,8 @@ _HOOK_SURFACE_FILES = (
             "config/external_review.yaml",  # external review identity + dispatch
             "src/genesis/session_awareness/external_review.py",
             "src/genesis/session_awareness/external_review_config.py",
+            "scripts/hooks/main_checkout_guard.py",  # deploy-root edit guard
+            "config/main_checkout_guard.yaml",  # main_checkout_guard.py
         }
     )
 )
@@ -11739,7 +11797,21 @@ def _run_merge_and_push_gates() -> int:
         push_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "push"]
         merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
         create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
-        merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
+        # `gh pr merge --help` merges nothing; it used to be refused as a merge
+        # without --admin (#2768).
+        merge_pr_segs = [
+            s for s in segs if gh_pr_subcommand(s.argv) == "merge" and not is_help_only(s.argv)
+        ]
+
+        # ── A PR merge spelled through the GitHub API → DENY (#2768) ──────
+        # Owner ruling 2026-10-05: refuse the SPELLING and name the gated
+        # command, so the merge runs every check below. Decided here, before
+        # any subprocess and before the blind-spot net, the same way in
+        # foreground and dispatched sessions: this path has no ask.
+        api_merge = _api_merge_deny(segs, cmd, payload)
+        if api_merge is not None:
+            print(api_merge, file=sys.stderr)
+            return 2
 
         # ── Blind-spot net: unverifiable near a gated op → DENY ────────────
         # Keep the broad raw-mention predicate: a failed parse cannot prove an

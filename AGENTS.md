@@ -187,7 +187,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 Each entry gives the full path to the skill's instruction file. The filename is usually `SKILL.md` but not always, so read the path as given rather than assuming one — and never infer a path from the name, because the name is not the directory. Some skills nest inside a container (`gitnexus-cli` lives under `.claude/skills/gitnexus/`, not `.claude/skills/gitnexus-cli/`), and skills live under two roots.
 
 - **aws-fde-delivery** (`src/genesis/skills/aws-fde-delivery/SKILL.md`) — Forward Deployed Engineer delivery contract for AWS engagements, build-first artifacts, grounded cost estimates, Well-Architected review, evolution roadmap
-- **browser-automation** (`src/genesis/skills/browser-automation/SKILL.md`) — Web and desktop automation with layered escalation (Fetch, Genesis Browser, Remote CDP, On-Demand MCP, Desktop), anti-detection, and persistent profiles
+- **browser-automation** (`src/genesis/skills/browser-automation/SKILL.md`) — Canonical guide to Genesis browser automation - layers (Camoufox, Chromium, the user's Chrome over CDP, TinyFish, desktop), per-tool timeouts, safety gates, verify-after-act, known click bugs and their workarounds, overlays, iframes, tabs, and failure diagnosis
 - **cc-update** (`.claude/skills/cc-update/SKILL.md`) — Update Claude Code (the CC CLI / "clog code") to a new version, or bump the pinned CC version. Use when the user asks to update Claude Code, bump the CC pin, evaluate a new CC release, or says "clog code update". Routes to the canonical, standardized process in docs/reference/cc-compatibility.md — do NOT re-derive the update mechanism by grepping every time. Do NOT use for general "what changed in CC" trivia with no intent to update.
 - **closing-session** (`.claude/skills/closing-session/SKILL.md`) — This skill should be used when a session's job is to DRIVE OPEN PRs TO MERGE rather than to write new code — "close out the open PRs", "review and fix the open PRs", "what's blocking our PRs", "which PRs are mergeable". It owns the In Review column: it reads each PR's gate status, verifies and fixes review findings on PRs OTHER sessions built, replies in-thread, and stops at the merge gate for the user's per-PR approval. Do NOT load it for building a feature and opening its PR — that is a build session (`genesis-development`).
 - **code-intelligence** (`.claude/skills/code-intelligence/SKILL.md`) — Code understanding tool selection. Use when exploring architecture, finding definitions, tracing call chains, assessing blast radius of changes, or debugging code paths in the Genesis codebase.
@@ -219,7 +219,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - **research** (`src/genesis/skills/research/SKILL.md`) — Deep research on a topic — use when investigating unfamiliar domains, answering complex questions requiring multiple sources, or when an evaluation flags something for deeper analysis
 - **retrospective** (`src/genesis/skills/retrospective/SKILL.md`) — Post-interaction retrospective analysis — use after completing a significant task, conversation, or phase to extract lessons, identify process improvements, and update procedures
 - **shelve** (`.claude/skills/shelve/SKILL.md`) — Shelve the current session — create a bookmark so you can find and resume it later with /unshelve.
-- **stealth-browser** (`src/genesis/skills/stealth-browser/SKILL.md`) — Anti-detection behavioral rules for stealth browser automation
+- **stealth-browser** (`src/genesis/skills/stealth-browser/SKILL.md`) — Anti-detection behaviour for Genesis browser automation - what the Camoufox tools already do, what the agent must still do, Cloudflare Turnstile handling, and per-site notes for bot-hostile sites
 - **subsystem-map** (`.claude/skills/subsystem-map/SKILL.md`) — This skill should be used before answering "does Genesis have X", "does Genesis lack X", auditing Genesis capabilities, comparing Genesis to an external system, or reviewing/summarizing the architecture. It routes to the canonical judgment-layer subsystem map so audits start from the map, not from a cold grep. Also fires after changing a subsystem's capabilities, to keep the map current.
 - **taste** (`.claude/skills/taste/SKILL.md`) — Use before generating, editing, or reviewing any user interface — a dashboard panel, a landing page, an email, a slide, an app screen. Sets three deliberate design dials (variance, motion, density) BEFORE generation so the output has a point of view instead of defaulting to the timid, uniform look that reads as "AI made this". Applies to Genesis's OWN dashboard UI, not only things built for others.
 - **triage-calibration** (`src/genesis/skills/triage-calibration/SKILL.md`) — Daily triage accuracy calibration — use during scheduled calibration runs to verify triage classification accuracy against few-shot examples and adjust confidence thresholds
@@ -241,6 +241,9 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 
 **genesis-health**
 
+- `board_item` — One issue or PR on the work board: its column and Genesis status (a live read), what blocks it (GitHub's blocked-by list, flagged when truncated), unverified open questions blocking it, and whether it was promoted from a private record.
+- `board_promote` — Propose turning a private ledger row or follow-up into a PUBLIC GitHub issue on the work board. Held for the owner's approval; nothing is posted by this call.
+- `board_status` — The work board as the reconciler last read it: counts by column, by Genesis status and by kind, coverage (open repo issues and PRs on the board against the repo's open total), drags logged, and whether the reconciler is alive. Reads stored heartbeats only, never GitHub, so it is cheap and safe.
 - `bootstrap_manifest` — Which subsystems initialized successfully, failed, or degraded at startup.
 - `browser_clear_domain` — Clear cookies for a specific domain (selective logout).
 - `browser_click` — Click an element on the current page by CSS selector or text.
@@ -279,7 +282,12 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - `job_health` — Scheduled job health: last run, last success, consecutive failures per job.
 - `module_call` — Execute an operation on an external module.
 - `module_list` — List all external modules and their available operations.
+- `open_question_block` — Add (or with ``remove=True`` drop) a block from an UNVERIFIED question to ``ledger:<id>``, ``follow_up:<id>`` or ``card:owner/repo#N``.
+- `open_question_list` — List open questions, one page at a time (newest first, with their blocks). ``total`` is the full count for the filter and ``listed`` what this page holds; ``next_offset`` is set while more remain (default page 50, max 200). Pages are offsets: a question raised or closed between two calls shifts the later pages by one, so if ``total`` changed, re-read from 0 rather than trusting the walk. ``status`` is ``unverified`` / ``resolved`` / ``dropped``, or empty for all. With ``target`` (``ledger:<id>`` / ``follow_up:<id>`` / ``card:owner/repo#N``) it answers instead whether that target is blocked, and by which unverified questions.
+- `open_question_raise` — Park a genuine owner fork as an open question, optionally blocking work.
+- `open_question_resolve` — Close an open question: ``status`` is ``resolved`` (answered) or ``dropped`` (no longer matters). ``resolution`` is required — say what settled it; an assumption is not an answer. Closing releases every block the question held (the edges are kept as history).
 - `provider_activity` — Per-provider call metrics: counts, error rates, latency percentiles, cache hits.
+- `session_address` — Which SendMessage name each Claude Code session id answers to.
 - `session_charter` — Read a session's charter: immutable origin, living mission/pointers, and the full ledger with item ids and status counts.
 - `session_charter_update` — Set the session's living mission and/or edit its pointer list.
 - `session_config` — Set model and/or effort for a Genesis conversation session.

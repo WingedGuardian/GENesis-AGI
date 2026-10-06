@@ -19,6 +19,10 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
+class ConfigOverlayError(ValueError):
+    """A strict caller cannot safely ignore an invalid configuration file."""
+
+
 def _user_config_dir() -> Path:
     """Canonical user config dir (``~/.genesis/config``).
 
@@ -42,6 +46,30 @@ def _resolve_overlay_path(base_path: Path) -> Path:
     if user_path.is_file():
         return user_path
     return base_path.with_suffix(".local.yaml")
+
+
+def _strict_overlay_path(base_path: Path) -> Path:
+    """Strict-mode overlay resolution: a user overlay that EXISTS AS A PATH wins.
+
+    ``_resolve_overlay_path`` asks ``is_file()``, which follows symlinks, so a
+    dangling ``~/.genesis/config/<name>.local.yaml`` link (a moved dotfiles
+    target) or a directory in that spot silently falls back to the repo sibling
+    and the user's settings vanish. A strict caller must not lose them that way,
+    so the user path is tested with ``lstat()`` — which does not follow the link
+    — and returned whenever anything is there; reading it then fails loudly.
+
+    Only a genuinely ABSENT user path delegates to ``_resolve_overlay_path``, so
+    the fallback stays one implementation (and test sandboxes that wrap it keep
+    covering strict callers).
+    """
+    user_path = _user_config_dir() / base_path.with_suffix(".local.yaml").name
+    try:
+        user_path.lstat()
+    except FileNotFoundError:
+        return _resolve_overlay_path(base_path)
+    except OSError:
+        raise ConfigOverlayError(f"Cannot inspect configuration overlay {user_path}") from None
+    return user_path
 
 
 #: Last-warned mtime per overlay path. A broken overlay MUST warn — but several
@@ -68,7 +96,7 @@ def _warn_overlay_once(local_path: Path, msg: str, *args, exc_info: bool = False
     logger.warning(msg, *args, exc_info=exc_info)
 
 
-def merge_local_overlay(base: dict, base_path: Path) -> dict:
+def merge_local_overlay(base: dict, base_path: Path, *, strict: bool = False) -> dict:
     """Deep-merge a ``.local.yaml`` overlay into *base* if it exists.
 
     *base_path* is the path to the base YAML file (e.g.
@@ -76,13 +104,18 @@ def merge_local_overlay(base: dict, base_path: Path) -> dict:
     (``~/.genesis/config/{stem}.local.yaml``), falling back to the repo-relative
     sibling.
 
-    Returns *base* unchanged when no overlay file exists, is unparseable, or is
-    valid YAML of the wrong SHAPE.
+    Returns *base* unchanged when no overlay file exists. By default unreadable
+    or malformed overlays warn and return base; strict callers raise instead.
     """
-    local_path = _resolve_overlay_path(base_path)
-    if not local_path.exists():
+    local_path = _strict_overlay_path(base_path) if strict else _resolve_overlay_path(base_path)
+    if not strict and not local_path.exists():
         return base
     try:
+        # A dangling symlink reports exists() False; in strict mode it must reach
+        # read_text() and fail there rather than read as "no overlay". (The
+        # lenient check stays above, outside the try, exactly as before.)
+        if strict and not local_path.exists() and not local_path.is_symlink():
+            return base
         local = yaml.safe_load(local_path.read_text())
         if local is None:
             # Empty file or an explicit `null` — legitimately nothing to merge,
@@ -93,6 +126,8 @@ def merge_local_overlay(base: dict, base_path: Path) -> dict:
             # this guard advertises catching.
             return base
         if not isinstance(local, dict):
+            if strict:
+                raise ConfigOverlayError(f"Configuration overlay {local_path} must be a mapping")
             # Valid YAML, wrong ROOT SHAPE — a list or a bare scalar. This is the
             # one malformed case the except below does NOT catch: parsing
             # succeeds, and the AttributeError from `.items()` would be raised by
@@ -109,6 +144,9 @@ def merge_local_overlay(base: dict, base_path: Path) -> dict:
             )
             return base
     except Exception:
+        if strict:
+            # Do not include parser messages: they can contain credential values.
+            raise ConfigOverlayError(f"Cannot load configuration overlay {local_path}") from None
         # NEVER silent. Returning `base` is the right FALLBACK, but an unlogged
         # one is indistinguishable from a clean load — the caller sees a valid
         # config and cannot tell that every override in this file was dropped.

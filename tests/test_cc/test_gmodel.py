@@ -172,7 +172,8 @@ def test_reexecs_into_venv_from_the_base_interpreter(tmp_path, hermetic_home):
         f"peer key read from secrets.env was not seen — re-exec did not happen.\n"
         f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     )
-    assert "key ✗" not in r.stdout
+    peer_row = next(line for line in r.stdout.splitlines() if "test-peer" in line)
+    assert "key ✗" not in peer_row
 
 
 @pytest.mark.skipif(not _GMODEL.is_file(), reason="gmodel launcher not present")

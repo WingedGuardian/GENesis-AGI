@@ -78,6 +78,12 @@ _QDRANT_RESTORED=0
 _TRANSCRIPT_RESTORED=0
 _MEMORY_RESTORED=0
 _EVAL_RESTORED=0
+_EXTRA_RESTORED=0
+# Set by _pull_from_offsite once a snapshot is selected: §4c then restores only
+# the extra archives that snapshot supplied (newline-separated names), never a
+# stale one left in a reused checkout by an earlier run.
+_EXTRA_FROM_SNAPSHOT=false
+_EXTRA_PULLED=""
 _CCMEM_RESTORED=false
 _OVERLAYS_RESTORED=0
 _SECRETS_RESTORED=false
@@ -92,7 +98,7 @@ _write_status() {
     _failures_json=$(printf '%s\n' "${_FAILURES[@]:-}" | python3 -c "import json,sys; print(json.dumps([l for l in sys.stdin.read().splitlines() if l]))")
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"dry_run":$DRY_RUN,"sqlite_restored":$_SQLITE_RESTORED,"qdrant_restored":$_QDRANT_RESTORED,"transcripts_restored":$_TRANSCRIPT_RESTORED,"memory_restored":$_MEMORY_RESTORED,"eval_restored":$_EVAL_RESTORED,"cc_memory_restored":$_CCMEM_RESTORED,"overlays_restored":$_OVERLAYS_RESTORED,"secrets_restored":$_SECRETS_RESTORED,"duration_s":$_duration,"failures":$_failures_json}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"dry_run":$DRY_RUN,"sqlite_restored":$_SQLITE_RESTORED,"qdrant_restored":$_QDRANT_RESTORED,"transcripts_restored":$_TRANSCRIPT_RESTORED,"memory_restored":$_MEMORY_RESTORED,"eval_restored":$_EVAL_RESTORED,"extra_restored":$_EXTRA_RESTORED,"cc_memory_restored":$_CCMEM_RESTORED,"overlays_restored":$_OVERLAYS_RESTORED,"secrets_restored":$_SECRETS_RESTORED,"duration_s":$_duration,"failures":$_failures_json}
 STATUSEOF
 }
 # ── Deploy-in-progress marker ────────────────────────────────────────
@@ -114,13 +120,20 @@ source "$_SCRIPT_DIR/lib/deploy_marker.sh"
 _SQL_TMP=""
 _QDRANT_TMP=""
 _DB_STAGE=""
+_rm_stage() {  # remove a §4c staging tree, which may hold read-only dirs; never fatal
+    [ -n "${1:-}" ] && [ -e "$1" ] || return 0
+    chmod -R u+rwx -- "$1" 2>/dev/null || true
+    rm -rf -- "$1" 2>/dev/null || true
+    [ ! -e "$1" ]
+}
 _cleanup_plaintext() {
-    rm -f "${_SQL_TMP:-}" "${_QDRANT_TMP:-}" 2>/dev/null || true
+    rm -f "${_SQL_TMP:-}" "${_QDRANT_TMP:-}" "${_XT_TAR:-}" "${_XT_ERR:-}" 2>/dev/null || true
+    _rm_stage "${_XT_STAGE:-}" || true  # §4c plaintext staging
     if [ -n "${_DB_STAGE:-}" ]; then
         rm -f "$_DB_STAGE" "$_DB_STAGE-journal" "$_DB_STAGE-wal" "$_DB_STAGE-shm" 2>/dev/null || true
     fi
 }
-trap '_write_status; _release_deploy_marker; backend_cleanup; _cleanup_plaintext' EXIT
+trap '_cleanup_plaintext; _write_status; _release_deploy_marker; backend_cleanup' EXIT
 
 # ── Setup ────────────────────────────────────────────────────────────
 GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
@@ -128,6 +141,8 @@ BACKUP_DIR="$HOME/backups/genesis-backups"
 _CC_PROJECT_ID=$(echo "$GENESIS_DIR" | tr '/' '-')
 MEMORY_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}/memory"
 TRANSCRIPT_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}"
+# shellcheck source=scripts/lib/backup_core_paths.sh
+source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
 SECRETS_FILE="${SECRETS_PATH:-$GENESIS_DIR/secrets.env}"
 QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 LOG_PREFIX="[genesis-restore]"
@@ -461,6 +476,43 @@ _pull_from_offsite() {
             fi
         done < <(backend_list "$snap/$_sub" 2>/dev/null | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u)
     done
+    # opt-in extra-directory archives (backup.sh §6f) — flat by construction, one
+    # <name>.tar.gpg per directory. Only names pulled from THIS snapshot are restored
+    # (§4c), so an archive a previous run left in $BACKUP_DIR/extra cannot come back
+    # from another point in time. The snapshot's COMPLETE marker lists the archives
+    # it holds (backup.sh writes it last). That list is authoritative: a failed
+    # off-site LISTING is indistinguishable from an empty one, while a failed
+    # download of the marker is detectable. An empty marker predates extra
+    # directories and means the snapshot holds none.
+    _EXTRA_FROM_SNAPSHOT=true
+    _EXTRA_PULLED=""
+    _xt_names=""
+    _xt_marker="$(mktemp -p "$GENESIS_BIG_TMP" complete.XXXXXX)" || _xt_marker=""
+    if [ -n "$_xt_marker" ] && backend_get "$snap/COMPLETE" "$_xt_marker"; then
+        if [ "$(head -1 "$_xt_marker")" = "genesis-snapshot 1" ]; then
+            _xt_names="$(awk '$1 == "extra" {print $2}' "$_xt_marker" | grep -E '^[A-Za-z0-9._-]+\.tar\.gpg$' || true)"
+            # Directories the source listed but could not back up in that run.
+            while IFS= read -r _xt_sk; do
+                warn "off-site: snapshot $latest does not hold extra directory ${_xt_sk:-(unnamed entry)} (backup skipped it that run); it is not restored"
+            done < <(awk '$1 == "skipped" {$1 = ""; sub(/^ /, ""); print}' "$_xt_marker" | tr -cd '[:print:]\n')
+        elif [ -s "$_xt_marker" ]; then
+            warn "off-site: snapshot $latest has a COMPLETE marker in an unknown format; its extra directories are not restored"
+        fi
+        # An empty marker predates extra directories: that snapshot holds none.
+    else
+        warn "off-site: could not read the COMPLETE marker of snapshot $latest — its extra directories cannot be verified or restored"
+    fi
+    [ -n "$_xt_marker" ] && rm -f "$_xt_marker"
+    while read -r fname; do
+        [ -n "$fname" ] || continue
+        mkdir -p "$BACKUP_DIR/extra" 2>/dev/null || true  # a failed get below warns per file
+        if backend_get "$snap/extra/$fname" "$BACKUP_DIR/extra/$fname"; then
+            _EXTRA_PULLED+="$fname"$'\n'
+            log "  off-site: pulled extra/$fname"
+        else
+            warn "off-site: failed to pull extra/$fname from snapshot $latest"
+        fi
+    done <<< "$_xt_names"
     # creds — Tier-1 git normally carries these; a no-git box needs them from the
     # snapshot too (restore §8 reads $BACKUP_DIR/creds). backend_list is
     # single-level, so iterate creds/ and creds/ssh/ separately; the .gpg filter
@@ -501,6 +553,8 @@ _backup_has_payload() {
     _dir_has_file "$d/transcripts" && return 0
     _dir_has_file "$d/memory" && return 0
     _dir_has_file "$d/eval" && return 0
+    # §4c restores these; matched to what §4c reads (`*.tar.gpg`), not any file.
+    find "$d/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2>/dev/null | grep -q . && return 0
     _dir_has_file "$d/creds" && return 0
     # §6d restores this store, so it is a restorable payload and must be counted
     # here or a backup whose ONLY surviving payload is the audit trail dies at the
@@ -542,7 +596,7 @@ _has_encrypted=false
 for candidate in "$BACKUP_DIR"/data/genesis.sql.gpg "$BACKUP_DIR"/secrets/secrets.env.gpg; do
     [ -f "$candidate" ] && _has_encrypted=true
 done
-if find "$BACKUP_DIR"/transcripts "$BACKUP_DIR"/memory "$BACKUP_DIR"/data/qdrant -name '*.gpg' -print -quit 2>/dev/null | grep -q .; then
+if find "$BACKUP_DIR"/transcripts "$BACKUP_DIR"/memory "$BACKUP_DIR"/data/qdrant "$BACKUP_DIR"/extra -name '*.gpg' -print -quit 2>/dev/null | grep -q .; then
     _has_encrypted=true
 fi
 if $_has_encrypted && [ -z "$_BACKUP_PASSPHRASE" ]; then
@@ -1203,6 +1257,156 @@ if [ -d "$BACKUP_DIR/eval" ]; then
     log "Eval golden sets: $_EVAL_RESTORED restored"
 else
     log "Eval golden sets: no backup directory"
+fi
+
+# ── 4c. Opt-in extra directories (backup.sh §6f) ─────────────────────
+# Each extra/<name>.tar.gpg holds ONE directory, members stored relative to
+# $HOME, restored as a unit by scripts/lib/extra_restore.py (its docstring has
+# the member rules). This section decides WHERE: the destination's parent must
+# resolve inside the real $HOME (an existing symlink there may stay inside $HOME,
+# never lead out), the destination must not be a symlink, and it must not overlap
+# a path the core restore owns. Staging is created next to the destination, so
+# the final step is a rename on one filesystem. An existing non-empty directory
+# is replaced only under --force, and is then moved aside to
+# <dir>.pre-restore-<stamp>, never deleted; an empty one counts as absent. After
+# an off-site pull, only archives from the selected snapshot are restored. A
+# refusal or failure for one archive is recorded and the rest of the restore runs.
+_xt_skip() {  # warn, drop this archive's temps, and let the caller `continue`
+    warn "$1"
+    rm -f "${_XT_TAR:-}" "${_XT_ERR:-}" 2>/dev/null || true
+    _rm_stage "${_XT_STAGE:-}" || warn "extra restore: could not remove the staging dir $_XT_STAGE (it holds decrypted data; remove it by hand)"
+    _XT_TAR="" _XT_ERR="" _XT_STAGE=""
+}
+_xt_errtext() { head -c 300 "$_XT_ERR" 2>/dev/null | tr '\n' ' '; }
+log "--- Extra directories ---"
+# Only archives a list names are restored, never whatever happens to sit in extra/
+# (a file an earlier backup could not remove must not resurrect an old directory):
+# the names pulled from the selected snapshot, or else the backup's local manifest
+# ($BACKUP_DIR/.extra-manifest), which backup.sh rewrites on every run (same format
+# as the COMPLETE marker).
+_xt_allowed="" _xt_listed=false
+_xt_manifest="$BACKUP_DIR/.extra-manifest"
+if $_EXTRA_FROM_SNAPSHOT; then
+    _xt_allowed="$_EXTRA_PULLED" _xt_listed=true
+elif [ -f "$_xt_manifest" ] && [ "$(head -1 "$_xt_manifest")" = "genesis-snapshot 1" ]; then
+    _xt_listed=true
+    _xt_allowed="$(awk '$1 == "extra" {print $2}' "$_xt_manifest" | grep -E '^[A-Za-z0-9._-]+\.tar\.gpg$' || true)"
+    while IFS= read -r _xt_sk; do
+        warn "extra directory ${_xt_sk:-(unnamed entry)} was not in the last local backup; it is not restored"
+    done < <(awk '$1 == "skipped" {$1 = ""; sub(/^ /, ""); print}' "$_xt_manifest" | tr -cd '[:print:]\n')
+    while IFS= read -r _xt_n; do
+        if [ -n "$_xt_n" ] && [ ! -f "$BACKUP_DIR/extra/$_xt_n" ]; then
+            warn "extra archive $_xt_n is listed in .extra-manifest but missing from $BACKUP_DIR/extra; not restored"
+        fi
+    done <<<"$_xt_allowed"
+fi
+if ! $_xt_listed && find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2>/dev/null | grep -q .; then
+    warn "extra: $BACKUP_DIR/extra holds archives but no readable .extra-manifest, so which belong to the last backup is unknown; none restored"
+    log "Extra directories: 0 archive(s) restored"
+elif find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2>/dev/null | grep -q .; then
+    _xt_home_real="$(realpath -- "$HOME")"
+    _xt_helper="$_SCRIPT_DIR/lib/extra_restore.py"
+    while IFS= read -r -d '' src; do
+        name="$(basename "$src")"
+        if ! grep -Fxq -- "$name" <<<"$_xt_allowed"; then
+            if $_EXTRA_FROM_SNAPSHOT; then
+                log "Extra: skipping $name (not supplied by the selected off-site snapshot)"
+            else
+                log "Extra: skipping $name (not listed in .extra-manifest: left from an earlier backup)"
+            fi
+            continue
+        fi
+        if $DRY_RUN; then
+            log "Extra: would restore archive $name (one directory under \$HOME)"
+            _EXTRA_RESTORED=$(( _EXTRA_RESTORED + 1 ))
+            continue
+        fi
+        if ! _XT_TAR="$(mktemp -p "$GENESIS_BIG_TMP" extra-restore.XXXXXX.tar)" \
+            || ! _XT_ERR="$(mktemp -p "$GENESIS_BIG_TMP" extra-restore.XXXXXX.err)"; then
+            _xt_skip "extra archive $name: cannot create a temp file in $GENESIS_BIG_TMP"
+            continue
+        fi
+        if ! decrypt_file "$src" "$_XT_TAR"; then
+            _xt_skip "extra decrypt failed: $name"
+            continue
+        fi
+        _xt_rc=0
+        _xt_root="$(python3 "$_xt_helper" root "$_XT_TAR" 2>"$_XT_ERR")" || _xt_rc=$?
+        if [ "$_xt_rc" -ne 0 ] || [ -z "$_xt_root" ]; then
+            _xt_skip "extra archive refused (rc=$_xt_rc): $name: $(_xt_errtext)"
+            continue
+        fi
+        _xt_target="$HOME/$_xt_root"
+        _xt_parent="$(dirname "$_xt_target")"
+        _xt_inside=false
+        case "$(realpath -m -- "$_xt_parent")/" in
+            "$_xt_home_real"/*) _xt_inside=true ;;
+        esac
+        # Checked before mkdir (so mkdir -p never creates directories through a
+        # symlink that leads out) and again after it.
+        if $_xt_inside && mkdir -p -- "$_xt_parent" 2>/dev/null; then
+            case "$(realpath -- "$_xt_parent")/" in
+                "$_xt_home_real"/*) ;;
+                *) _xt_inside=false ;;
+            esac
+        elif $_xt_inside; then
+            _xt_skip "extra archive $name: could not create $_xt_parent"
+            continue
+        fi
+        if ! $_xt_inside; then
+            _xt_skip "extra archive refused: $name: an existing symlink in the destination path leads outside \$HOME"
+            continue
+        fi
+        if [ -L "$_xt_target" ]; then
+            _xt_skip "extra archive refused: $name: the destination ~/$_xt_root is a symlink (not replaced; restore it by hand)"
+            continue
+        fi
+        if _xt_core="$(backup_core_overlap "$(realpath -m -- "$_xt_target")")"; then
+            _xt_skip "extra archive refused: $name: ~/$_xt_root overlaps $_xt_core, which the core restore owns"
+            continue
+        fi
+        _xt_aside=""
+        if [ -d "$_xt_target" ] && [ -r "$_xt_target" ] && [ -x "$_xt_target" ] \
+            && [ -z "$(ls -A -- "$_xt_target" 2>/dev/null)" ]; then
+            :  # an empty directory (e.g. created by bootstrap) counts as absent; the helper
+               # removes it only once the restored tree is ready to take its place
+        elif [ -e "$_xt_target" ]; then
+            if ! $FORCE; then
+                _xt_skip "extra archive $name: ~/$_xt_root exists and was not replaced (re-run with --force; the current one is then moved aside)"
+                continue
+            fi
+            # The helper builds the name: short (at most 100 bytes of the directory's
+            # own name), cut on a character boundary, never past NAME_MAX.
+            _xt_aside=auto
+        fi
+        if ! _XT_STAGE="$(mktemp -d -p "$_xt_parent" .extra.restore.XXXXXX 2>/dev/null)"; then
+            _XT_STAGE=""
+            _xt_skip "extra archive $name: cannot create a staging dir in $_xt_parent"
+            continue
+        fi
+        _xt_rc=0
+        _xt_out="$(python3 "$_xt_helper" swap "$_XT_TAR" "$_XT_STAGE" "$_xt_root" "$_xt_target" "$_xt_aside" 2>"$_XT_ERR")" || _xt_rc=$?
+        case "$_xt_rc" in
+            0) ;;
+            4) warn "extra archive refused members (unsafe), the rest restored: $name: $(_xt_errtext)" ;;
+            6) warn "extra archive $name restored, but a step after the rename failed (durability or directory modes): $(_xt_errtext)" ;;
+            *)
+                _xt_skip "extra archive refused (could not be restored, rc=$_xt_rc): $name: $(_xt_errtext)${_xt_out:+ [$_xt_out]}"
+                continue
+                ;;
+        esac
+        _rm_stage "$_XT_STAGE" || warn "extra restore: could not remove the staging dir $_XT_STAGE (it holds decrypted data; remove it by hand)"
+        rm -f "$_XT_TAR" "$_XT_ERR"
+        _XT_STAGE="" _XT_TAR="" _XT_ERR=""
+        case "$_xt_out" in
+            "aside "*) log "Extra: previous ~/$_xt_root kept at ${_xt_out#aside }" ;;
+        esac
+        _EXTRA_RESTORED=$(( _EXTRA_RESTORED + 1 ))
+        log "Extra: restored $name → ~/$_xt_root"
+    done < <(find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print0 2>/dev/null)
+    log "Extra directories: $_EXTRA_RESTORED archive(s) restored"
+else
+    log "Extra directories: none in backup"
 fi
 
 # ── 5. In-repo CC memory backup ──────────────────────────────────────
