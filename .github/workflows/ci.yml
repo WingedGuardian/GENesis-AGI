@@ -1120,7 +1120,6 @@ jobs:
         #   test_collectors_falkordb.py           new -> 23   (+23)
         #   test_falkordb_module.py               new -> 35   (+35)
         # No added skips. Floor: 24332 + 89 = 24421; skip ceiling remains 102.
-        # Staged excused-path guard: test_update_checkout_moved.py 79 -> 87
-        # (+8); test_update_activation.py 28 -> 28 (+0).
-        # Floor: 24421 + 8 = 24429; skip ceiling remains 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24429
+        # Staged excused-path guard: test_update_checkout_moved.py 79 -> 93 (+14).
+        # Floor: 24421 + 14 = 24435; skip ceiling remains 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24435

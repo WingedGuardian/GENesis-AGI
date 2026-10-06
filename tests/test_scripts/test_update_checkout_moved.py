@@ -62,14 +62,18 @@ def _block(marker: str) -> str:
     return match.group(1)
 
 
-def _run(script: str, home: Path) -> subprocess.CompletedProcess:
+def _run(
+    script: str, home: Path, *, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     libs = f'. "{MARKER_LIB}"\n. "{LIB}"\n'
+    env = _env(home)
+    env.update(extra_env or {})
     return subprocess.run(
         ["bash", "-c", "set -Eeuo pipefail\n" + libs + script],
         capture_output=True,
         text=True,
         timeout=60,
-        env=_env(home),
+        env=env,
     )
 
 
@@ -1187,8 +1191,21 @@ def _track_agents(root: Path) -> None:
     _git(root, "commit", "-qm", "track excused file")
 
 
+def _track_transitional(root: Path) -> None:
+    path = root / ".claude" / "settings.local.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"install": true}\n')
+    _git(root, "add", "--", ".claude/settings.local.json")
+    _git(root, "commit", "-qm", "track transitional excused file")
+
+
 def _run_staged_excused_guard(
-    root: Path, deploy_head: str, home: Path, *, git_override: str = ""
+    root: Path,
+    deploy_head: str,
+    home: Path,
+    *,
+    git_override: str = "",
+    extra_env: dict[str, str] | None = None,
 ):
     script = (
         f"""GENESIS_ROOT="{root}"
@@ -1199,21 +1216,29 @@ _clear_deploy_state() {{ echo CLEAR-STATE; }}
 """
         + git_override + _block("staged-excused-divergence") + 'echo PASSED\n'
     )
-    return _run(script, home)
+    return _run(script, home, extra_env=extra_env)
 
 
 @pytest.mark.parametrize(
-    ("case", "history", "action"),
+    ("history", "action", "refuses"),
     [
-        ("deletion-divergence", "divergent", "delete"),
-        ("ignored-add-divergence", "divergent", "ignored-add"),
-        ("edit-divergence", "divergent", "edit"),
-        ("deletion-fast-forward", "fast-forward", "delete"),
-        ("deletion-local-ahead", "local-ahead", "delete"),
+        ("divergent", "delete", True),
+        ("divergent", "ignored-add", True),
+        ("divergent", "intent-to-add", True),
+        ("divergent", "agents-edit", False),
+        ("fast-forward", "delete", False),
+        ("local-ahead", "delete", False),
+        ("divergent", "transition-deleted-edit", True),
+        ("divergent", "transition-broken-symlink", True),
+        ("divergent", "gitlink", True),
+        ("divergent", "descendant", True),
+        ("divergent", "transition-edit-present", True),
     ],
 )
-def test_staged_excused_path_guard_cases(repo, tmp_path, case, history, action):
+def test_staged_excused_path_guard_cases(repo, tmp_path, history, action, refuses):
     _track_agents(repo)
+    if action.startswith("transition-"):
+        _track_transitional(repo)
     if history == "divergent":
         deploy_head = _divergent_deploy_head(repo)
     elif history == "fast-forward":
@@ -1228,30 +1253,62 @@ def test_staged_excused_path_guard_cases(repo, tmp_path, case, history, action):
         (repo / "local.txt").write_text("local-ahead commit\n")
         _git(repo, "add", "--", "local.txt")
         _git(repo, "commit", "-qm", "local-ahead commit")
-    if action == "ignored-add":
+    extra_env = None
+    if action in {"ignored-add", "intent-to-add"}:
         (repo / ".gitignore").write_text("config/procedure_triggers.yaml\n")
         _git(repo, "add", "--", ".gitignore")
         _git(repo, "commit", "-qm", "ignore generated procedure cache")
         path = repo / "config" / "procedure_triggers.yaml"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("install-local cache\n")
-        _git(repo, "add", "-f", "--", "config/procedure_triggers.yaml")
-    elif action == "edit":
-        (repo / "AGENTS.md").write_text("staged edit\n")
-        _git(repo, "add", "--", "AGENTS.md")
+        _git(repo, "add", *(["-N"] if action == "intent-to-add" else []), "-f", "--",
+             "config/procedure_triggers.yaml")
     elif action == "delete":
         _git(repo, "rm", "--cached", "--", "AGENTS.md")
+    elif action == "agents-edit":
+        (repo / "AGENTS.md").write_text("staged edit\n")
+        _git(repo, "add", "--", "AGENTS.md")
+    elif action.startswith("transition-"):
+        path = repo / ".claude" / "settings.local.json"
+        path.write_text('{"install": false}\n')
+        _git(repo, "add", "--", ".claude/settings.local.json")
+        if action == "transition-deleted-edit":
+            path.unlink()
+        elif action == "transition-broken-symlink":
+            path.unlink()
+            path.symlink_to("missing-target")
+            _git(repo, "add", "--", ".claude/settings.local.json")
+    elif action == "gitlink":
+        _git(repo, "update-index", "--add", "--cacheinfo",
+             f"160000,{deploy_head},.serena/project.yml")
+        extra_env = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "diff.ignoreSubmodules",
+            "GIT_CONFIG_VALUE_0": "all",
+        }
+    elif action == "descendant":
+        path = repo / ".serena" / "project.yml" / "child"
+        path.parent.mkdir(parents=True)
+        path.write_text("staged child\n")
+        _git(repo, "add", "--", ".serena/project.yml/child")
 
-    result = _run_staged_excused_guard(repo, deploy_head, tmp_path)
+    result = _run_staged_excused_guard(
+        repo, deploy_head, tmp_path, extra_env=extra_env
+    )
 
-    status = {
-        "deletion-divergence": "D AGENTS.md",
-        "ignored-add-divergence": "A config/procedure_triggers.yaml",
-    }.get(case)
-    assert result.returncode == (1 if status else 0), result.stderr
-    if status:
-        assert "staged additions or deletions" in result.stdout.lower()
-        assert status in result.stdout
+    path = (
+        ".claude/settings.local.json"
+        if action.startswith("transition-")
+        else ".serena/project.yml"
+        if action in {"gitlink", "descendant"}
+        else "config/procedure_triggers.yaml"
+        if action in {"ignored-add", "intent-to-add"}
+        else "AGENTS.md"
+    )
+    assert result.returncode == int(refuses), result.stderr
+    if refuses:
+        assert "staged changes on excused paths" in result.stdout.lower()
+        assert f"    {path}" in result.stdout
         assert "CLEAR-STATE" in result.stdout
         assert "PASSED" not in result.stdout
     else:
@@ -1284,11 +1341,16 @@ def test_staged_guard_read_failures_refuse_and_clean_up(repo, tmp_path, failure)
     assert "CLEAR-STATE" in result.stdout and "PASSED" not in result.stdout
 
 
-def test_staged_excused_guard_uses_literal_paths_and_precedes_the_stop():
+def test_staged_excused_guard_uses_plumbing_and_runs_at_pre_stop():
     text = _text()
     block = _block("staged-excused-divergence")
-    assert all(f":(literal){path}" in block for path in _EXCUSED_STAGED_PATHS)
-    assert "--no-renames" in block
+    assert all(path in block for path in _EXCUSED_STAGED_PATHS)
+    assert "ls-files -s" in block and "ls-tree -r" in block
+    assert "diff --cached" not in block
+    assert "_staged_excused_divergence_guard" in _block("staged-excused-prestop")
     guard = text.index("# BEGIN staged-excused-divergence")
+    backup_end = text.index("# END ephemeral-prestop-backup")
+    snapshot = text.index("--- Snapshotting database ---")
+    prestop = text.index("# BEGIN staged-excused-prestop")
     stop = text.index("--- Stopping services for update ---")
-    assert text.index('DEPLOY_HEAD="$(git -C "$GENESIS_ROOT" rev-parse') < guard < stop
+    assert guard < backup_end < snapshot < prestop < stop

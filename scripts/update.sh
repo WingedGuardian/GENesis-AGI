@@ -865,8 +865,8 @@ if [[ "$POST_MERGE" == "false" ]]; then
         exit 1
     fi
 
-    # An excused path can be cleared before a normal merge, but a staged add or
-    # deletion on divergent histories can survive that clear and fail after stop.
+    # An excused path can be cleared before a normal merge, but staged changes
+    # on divergent histories can survive that clear or prevent it from working.
     # Fast-forward and local-ahead histories do not need this refusal.
     # BEGIN staged-excused-divergence
     _refuse_staged_excused_divergence() {
@@ -883,24 +883,73 @@ if [[ "$POST_MERGE" == "false" ]]; then
         return "$rc"
     }
 
-    if ! _staged_guard_is_ancestor HEAD "$DEPLOY_HEAD" \
-        && ! _staged_guard_is_ancestor "$DEPLOY_HEAD" HEAD; then
-        _excused_pathspecs=(':(literal)AGENTS.md' ':(literal)config/procedure_triggers.yaml'
-            ':(literal).claude/settings.local.json' ':(literal).serena/project.yml'
-            ':(literal)src/genesis/identity/USER.md')
-        if ! _staged_excused_status="$(git -C "$GENESIS_ROOT" diff --cached --name-status --no-renames HEAD -- "${_excused_pathspecs[@]}" 2>/dev/null)"; then
-            _refuse_staged_excused_divergence "Could not read the staged index for excused paths on divergent history"
+    # Plumbing keeps ignore-submodule settings, .gitmodules, renames, and
+    # intent-to-add entries from hiding index state; only the two paths cleared
+    # from HEAD before merge can safely allow staged blob edits.
+    _staged_excused_divergence_guard() {
+        local p idx='' tree='' tree_norm='' line='' meta='' path=''
+        local idx_meta='' idx_path='' idx_mode='' idx_oid='' idx_stage=''
+        local tree_meta='' tree_path='' tree_mode='' tree_type='' tree_oid='' tree_stage=''
+        local -a blocked=() tree_entries=()
+
+        if _staged_guard_is_ancestor HEAD "$DEPLOY_HEAD" \
+            || _staged_guard_is_ancestor "$DEPLOY_HEAD" HEAD; then
+            return 0
         fi
-        _staged_excused_ad=()
-        while IFS=$'\t' read -r _staged_status _staged_path; do
-            case "$_staged_status" in A|D) _staged_excused_ad+=("$_staged_status $_staged_path") ;; esac
-        done <<< "$_staged_excused_status"
-        if [ "${#_staged_excused_ad[@]}" -gt 0 ]; then
-            echo "  Staged additions or deletions on excused paths block a divergent update:"
-            printf '%s\n' "${_staged_excused_ad[@]}" | sed 's/^/    /'
+
+        for p in AGENTS.md config/procedure_triggers.yaml \
+            .claude/settings.local.json .serena/project.yml \
+            src/genesis/identity/USER.md; do
+            if ! idx="$(git -C "$GENESIS_ROOT" ls-files -s -- ":(literal)$p")"; then
+                _refuse_staged_excused_divergence "Could not read the staged index for excused paths on divergent history"
+            fi
+            if ! tree="$(git -C "$GENESIS_ROOT" ls-tree -r HEAD -- "$p")"; then
+                _refuse_staged_excused_divergence "Could not read HEAD's tree for excused paths on divergent history"
+            fi
+
+            tree_entries=()
+            while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                meta="${line%%$'\t'*}"
+                path="${line#*$'\t'}"
+                read -r tree_mode tree_type tree_oid <<< "$meta"
+                tree_entries+=("$tree_mode $tree_oid 0"$'\t'"$path")
+            done <<< "$tree"
+            tree_norm=""
+            if [ "${#tree_entries[@]}" -gt 0 ]; then
+                tree_norm="$(printf '%s\n' "${tree_entries[@]}")"
+            fi
+
+            [[ "$idx" == "$tree_norm" ]] && continue
+            if [[ "$p" == "AGENTS.md" || "$p" == "config/procedure_triggers.yaml" ]] \
+                && [[ "$idx" != *$'\n'* && "$tree_norm" != *$'\n'* ]]; then
+                IFS=$'\t' read -r idx_meta idx_path <<< "$idx"
+                read -r idx_mode idx_oid idx_stage <<< "$idx_meta"
+                IFS=$'\t' read -r tree_meta tree_path <<< "$tree_norm"
+                read -r tree_mode tree_oid tree_stage <<< "$tree_meta"
+                if [[ "$idx_path" == "$p" && "$idx_stage" == 0 \
+                    && "$tree_path" == "$p" && "$tree_stage" == 0 ]]; then
+                    case "$idx_mode:$tree_mode" in
+                        100644:100644|100644:100755|100644:120000|\
+                        100755:100644|100755:100755|100755:120000|\
+                        120000:100644|120000:100755|120000:120000)
+                            continue
+                            ;;
+                    esac
+                fi
+            fi
+            blocked+=("$p")
+        done
+
+        if [ "${#blocked[@]}" -gt 0 ]; then
+            echo "  Staged changes on excused paths block a divergent update; the merge would fail after the services stop:"
+            printf '%s\n' "${blocked[@]}" | sed 's/^/    /'
+            echo "  Unstage them first: git restore --staged -- <path>"
             _refuse_staged_excused_divergence "Resolve these staged path changes first"
         fi
-    fi
+    }
+
+    _staged_excused_divergence_guard
     # END staged-excused-divergence
 fi
 
@@ -1191,6 +1240,14 @@ if [ -f "$DB_FILE" ]; then
         exit 1
     fi
 fi
+
+# The staged-path guard again, as the last step before the stop: the backups and
+# the database snapshot above can take minutes.
+# BEGIN staged-excused-prestop
+if [[ "$POST_MERGE" == "false" ]]; then
+    _staged_excused_divergence_guard
+fi
+# END staged-excused-prestop
 
 # ── Stop services for update ──────────────────────────────
 echo "--- Stopping services for update ---"
