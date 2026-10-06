@@ -595,10 +595,24 @@ def _spawn_detached_cc(
         stderr=subprocess.STDOUT,
         start_new_session=True,
         cwd=str(_GENESIS_ROOT),
-        env=pin_dispatched_env(dict(os.environ)),
+        env=_update_tier_env(pin_dispatched_env(dict(os.environ))),
     )
     log_fh.close()  # child inherited the fd
     return proc
+
+
+#: Stamped on every update-pipeline session (Tier 1/2 via the orchestrator's
+#: spawn_cc, Tier 3 via _spawn_detached_cc). Those sessions run with cwd = the
+#: main checkout and are told to resolve the update's merge there, which is the
+#: one legitimate hand-edit of the deploy root; scripts/hooks/main_checkout_guard.py
+#: exempts a session carrying exactly "1" (it refuses everyone else's file-tool
+#: edits there and reports their Bash changes).
+UPDATE_TIER_ENV = "GENESIS_UPDATE_TIER"
+
+
+def _update_tier_env(env: dict[str, str]) -> dict[str, str]:
+    env[UPDATE_TIER_ENV] = "1"
+    return env
 
 
 # Template for the orchestrator subprocess. Baked-in paths avoid genesis imports.
@@ -642,7 +656,14 @@ def spawn_cc(prompt, model, effort=None):
         cmd.append("--dangerously-skip-permissions")
         # Mirrors genesis.cc.child_env.pin_dispatched_env (this script avoids
         # genesis imports): function hooks stay off in dispatched sessions.
-        env = {{**os.environ, "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "0"}}
+        # GENESIS_UPDATE_TIER mirrors _update_tier_env: these sessions resolve the
+        # update's merge in the main checkout, which main_checkout_guard allows
+        # only for a session carrying it.
+        env = {{
+            **os.environ,
+            "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "0",
+            "GENESIS_UPDATE_TIER": "1",
+        }}
         proc = subprocess.Popen(
             cmd, start_new_session=True, cwd=str(GENESIS_ROOT), env=env,
         )

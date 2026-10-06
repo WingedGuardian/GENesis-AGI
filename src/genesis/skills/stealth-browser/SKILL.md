@@ -27,7 +27,7 @@ Do not re-implement any of this.
 | Fingerprint | Camoufox engine | Firefox-based, spoofed at engine level |
 | Delay before `browser_click`, `browser_fill`, `browser_upload` | all layers below | see Timing |
 | Per-keystroke typing | Camoufox, remote CDP | field cleared first; key hold log-normal, median 86 ms (clamped 30-200 ms, p95 ~153 ms); 50-200 ms between keys; 5% of gaps are 0.3-1 s pauses. Chromium and TinyFish fill atomically |
-| Cursor | Camoufox | `humanize=2.5` cursor trail, hover, 50-200 ms dwell, click inside the central 60% of the element, 40-120 ms press. No scroll and no hit test: see `browser-automation`, "Clicking today" |
+| Cursor | Camoufox | scrolls the target into view, `humanize=2.5` cursor trail to a point in the central 60% of the element that hit-tests as the element (when none does, Playwright picks the point), 50-200 ms dwell, 40-120 ms press through Playwright's click, which hit-tests again. A cover the hit test finds fails as `Click blocked` naming it; a styled checkbox or radio is clicked through its own label. See `browser-automation`, "Clicking" |
 | Turnstile | Camoufox, Chromium | detected and worked on inside `browser_navigate` (below) |
 | Keyboard repeat | `browser_press_key` | 50-150 ms between repeats, no pre-delay |
 
