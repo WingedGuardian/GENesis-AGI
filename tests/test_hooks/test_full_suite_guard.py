@@ -296,3 +296,88 @@ class TestUvCarrierBypasses:
 
         seg = [s for s in analyze("uv rm -rf /") if s.depth == 0][0]
         assert seg.exe == "uv", seg.exe
+
+
+class TestWrappedRuns:
+    """A wrapper the resolver does not see through must not hide an untargeted run.
+
+    MEASURED before this change: every BLOCKED row below exited 0. The resolver
+    leaves the segment on the wrapper (`systemd-run`, `flock`, the interpreter
+    running `genesis.hostmetrics run`), so the pytest it carries never reached
+    `is_pytest_invocation`. `genesis.hostmetrics run` is the resource-budget
+    wrapper sessions are told to use for heavy jobs, which made the hole a
+    recommended path rather than an obscure one.
+    """
+
+    _PY = "~/genesis/.venv/bin/python"
+    _RUN = f"{_PY} -m genesis.hostmetrics run --name t --ram 2 --cpu 50"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "systemd-run --user --scope pytest -n 4",
+            "systemd-run --user --scope -p MemoryMax=1G -- pytest",
+            "systemd-run --user --scope --unit=x -p CPUQuota=50% python -m pytest tests/",
+            "systemd-run --user --scope -- sh -c 'pytest -q'",
+            "flock /tmp/l pytest",
+            "flock -w 5 /tmp/l pytest tests/",
+            "watch 'pytest -x'",
+            f"{_RUN} -- pytest -n 4",
+            f"{_RUN} -- python -m pytest",
+            f"{_RUN} --wait-until-fits 5 -- uv run pytest",
+            f"{_RUN} -- nice -n 19 pytest tests/",
+            f"{_RUN} pytest",  # argparse REMAINDER accepts a command without `--`
+            # a wrapper inside a wrapper is followed, not stopped at the outer one
+            "systemd-run --user --scope -- flock /tmp/l pytest",
+            # the inner command is a carrier the resolver cannot see through
+            "systemd-run --user --scope -- uv --color always run pytest",
+            # every candidate is judged, not just the first (review, MEASURED fail-open)
+            "eval 'pytest tests/x.py;' 'pytest -n 4'",
+            "watch -n 60 'pytest tests/x.py;' pytest",
+            'systemd-run --user --scope --description "pytest tests/x.py" pytest -n 4',
+            'systemd-run --user --scope -p "Description=run pytest tests/x.py" pytest',
+            'script -c "pytest -n 4" -- /dev/null',
+            # an option the walk cannot size: argparse prefix matching, or a newer flag
+            f"{_PY} -m genesis.hostmetrics run --na t --ram 2 --cpu 50 pytest -n 4",
+            f"{_PY} -m genesis.hostmetrics run --name t --ra 2 -- pytest",
+            f"{_PY} -m genesis.hostmetrics run --name t --wait 5 pytest",
+        ],
+    )
+    def test_untargeted_run_inside_a_wrapper_blocks(self, cmd):
+        r = _run_guard(cmd)
+        assert r.returncode == 2, f"{cmd!r} was allowed: {r.stderr}"
+        assert "BLOCKED" in r.stderr
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "systemd-run --user --scope pytest tests/x.py",
+            "systemd-run --user --scope -p MemoryMax=1G -- pytest -k foo",
+            "systemd-run --user --scope /bin/true",
+            "systemd-run --user --scope --unit=pytest-probe /bin/true",
+            "flock /tmp/l make -j8",
+            f"{_RUN} -- pytest tests/x.py -n 4",
+            f"{_RUN} -- make -j8",
+            f"{_RUN} --name pytest -- make -j8",  # the job's NAME is not its command
+            f"{_PY} -m genesis.hostmetrics preflight --name pytest --ram 2 --cpu 50",
+            f"{_PY} -m genesis.hostmetrics status",
+            "echo systemd-run pytest",
+            # after `--` the carried command is known: `echo`, not the word after it
+            "systemd-run --user --scope -- echo pytest",
+            # the override counts when written inside the wrapper, as it does bare
+            "systemd-run --user --scope -- bash -c 'pytest # full-suite-ok'",
+            # after `--` the command is exact: `echo`, not the word after it
+            f"{_RUN} -- echo pytest",
+            # =-form flags are sized exactly, so the command is still known to be `echo`
+            f"{_PY} -m genesis.hostmetrics run --name=t --ram=2 --cpu=50 echo pytest",
+            # =-form and boolean options are sized exactly
+            f"{_PY} -m genesis.hostmetrics run --name=t --ram=2 --cpu=50 --no-host make",
+            # only `run` launches a command; another subcommand's stray word is not one
+            f"{_PY} -m genesis.hostmetrics status pytest",
+            "systemd-run --user --scope pytest -n 4  # full-suite-ok",
+            f"{_RUN} -- pytest -n 4  # full-suite-ok",
+        ],
+    )
+    def test_targeted_or_unrelated_wrapped_command_is_allowed(self, cmd):
+        r = _run_guard(cmd)
+        assert r.returncode == 0, f"{cmd!r} was blocked: {r.stderr}"
