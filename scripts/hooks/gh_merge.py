@@ -44,11 +44,13 @@ spellings; the boundary that closes the rest is server-side.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shlex
 import stat
+import tempfile
 from typing import NamedTuple
 from urllib.parse import unquote
 
@@ -328,17 +330,18 @@ def _graphql_documents(call, cwd: str | None, trusted: bool) -> list[str] | None
 
 
 def is_help_only(argv: list[str]) -> bool:
-    """Exactly `gh pr merge --help` or `gh pr merge -h`, and nothing else.
+    """Exactly `gh pr merge --help`, `gh pr merge -h` or `gh help pr merge`.
 
     A closed form on purpose: with any other word present, gh's flag parser may
     hand `--help` to a value flag (`-sb --help` is a squash merge whose body is
-    `--help`), so the merge gate must judge it.
+    `--help`), so the merge gate must judge it. `gh help pr merge` is gh's help
+    command, which prints and merges nothing; the merge-segment scan finds the
+    `pr merge` words inside it all the same.
     """
-    return (
-        len(argv) == 4
-        and os.path.basename(argv[0]) == "gh"
-        and argv[1:3] == ["pr", "merge"]
-        and argv[3] in ("--help", "-h")
+    if len(argv) != 4 or os.path.basename(argv[0]) != "gh":
+        return False
+    return argv[1:] == ["help", "pr", "merge"] or (
+        argv[1:3] == ["pr", "merge"] and argv[3] in ("--help", "-h")
     )
 
 
@@ -420,3 +423,136 @@ def api_merge_reason(
     if _SHELL_TEXT.search(endpoint) and may_put:
         return ApiMerge("a write to an endpoint holding shell text", None, True, _SPELL_HINT)
     return None
+
+
+# ── The squash body a gated merge may carry ─────────────────────────────────
+#
+# The merge gate prints `--body-file <path>` so the squash commit on main records
+# which head was reviewed (`Squashed-From:`) and which sessions built it
+# (`Genesis-Session:`). Text written into the squash commit at merge time is
+# outside the scheduled leaks review, so the merge arm never trusts the file: it
+# recomputes the body from the live PR and requires the file to be byte-identical.
+# The path rules below exist so the file the hook reads is the file gh reads.
+
+#: GitHub caps a PR body at 65,536 characters; at four UTF-8 bytes each, plus the
+#: trailers, a legitimate body stays under this. Anything larger is refused unread.
+MERGE_BODY_MAX_BYTES = 512 * 1024
+_SESSION_TRAILER = re.compile(r"^Genesis-Session: ([0-9a-f]{8})$")
+_FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+_SHELL_INERT_PATH = re.compile(r"[A-Za-z0-9._/-]+")
+
+
+def merge_bodies_dir() -> str:
+    """The one directory a merge's ``--body-file`` may name (symlinks resolved)."""
+    return os.path.realpath(os.path.join(os.path.expanduser("~"), "tmp", "merge-bodies"))
+
+
+def body_file_path(repo: str | None, pr: str, head: str) -> str:
+    """Where ``--check-pr`` writes the body for one PR head."""
+    owner_repo = _NAME_UNSAFE.sub("_", (repo or "cwd").replace("/", "__"))
+    name = f"{owner_repo}__{_NAME_UNSAFE.sub('_', pr)}-{head[:12]}.md"
+    return os.path.join(merge_bodies_dir(), name)
+
+
+def compose_squash_body(pr_body: str | None, head: str, messages: list[str | None]) -> str:
+    """The PR body, a blank line, then the trailer block.
+
+    The trailers are ``Squashed-From: <head>`` and each distinct
+    ``Genesis-Session: <8hex>`` line from the LAST paragraph of each message
+    (where ``prepare-commit-msg`` puts it, and where git reads trailers), in
+    first-seen order. A session id is author-asserted, like any commit text. They
+    form their own final paragraph, so git reads them as the commit's trailers
+    even when the body's last paragraph is itself ``Key: value`` lines. Only the
+    END of the body is stripped: an interior trailing space is a markdown break.
+    """
+    if not _FULL_SHA.match(head or ""):
+        raise ValueError("head must be a full lowercase 40-hex sha")
+    body = (pr_body or "").replace("\r\n", "\n").rstrip()
+    sessions: list[str] = []
+    for message in messages:
+        paragraphs = [p for p in (message or "").replace("\r\n", "\n").split("\n\n") if p.strip()]
+        for line in (paragraphs[-1] if paragraphs else "").split("\n"):
+            m = _SESSION_TRAILER.match(line.rstrip("\r"))
+            if m and m.group(1) not in sessions:
+                sessions.append(m.group(1))
+    trailers = "\n".join([f"Squashed-From: {head}"] + [f"Genesis-Session: {s}" for s in sessions])
+    return (body + "\n\n" if body else "") + trailers + "\n"
+
+
+def body_file_path_problem(path: str) -> str | None:
+    """Why ``path`` cannot be a merge's ``--body-file``, else None.
+
+    The hook and gh are different processes, possibly in different directories,
+    and the hook sees argv BEFORE the shell expands it: a quoted ``'~/x'`` and a
+    bare ``~/x`` reach the hook as the same word, but only one is expanded. So
+    the path must be absolute, made only of characters no shell rewrites (an
+    ALLOWLIST: a deny-list of ``~``, ``$`` and backtick still let a glob such as
+    ``[a].md`` through, which bash expands to a different file after the hook has
+    read this one), resolve to itself (no symlink, no ``/proc/self`` or
+    ``/dev/fd`` alias), and sit directly in :func:`merge_bodies_dir`. A home
+    directory with any other character cannot use the file at all, and the
+    merge-with line then falls back to the plain command.
+    """
+    if not path or not os.path.isabs(path):
+        return "it must be an absolute path"
+    if not _SHELL_INERT_PATH.fullmatch(path):
+        return "it may contain only letters, digits and . _ / - (nothing a shell rewrites)"
+    if os.path.realpath(path) != path:
+        return "it must resolve to itself (no symlink or per-process alias)"
+    if os.path.dirname(path) != merge_bodies_dir():
+        return f"it must be a file the gate wrote, in {merge_bodies_dir()}"
+    return None
+
+
+def read_body_file(path: str) -> tuple[str | None, str]:
+    """``(text, "")`` for a regular UTF-8 file within the size cap, else ``(None, why)``."""
+    problem = body_file_path_problem(path)
+    if problem:
+        return None, problem
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        return None, f"it could not be opened ({exc.strerror or type(exc).__name__})"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, "it is not a regular file"
+        if st.st_size > MERGE_BODY_MAX_BYTES:
+            return None, f"it is larger than {MERGE_BODY_MAX_BYTES} bytes"
+        data = os.read(fd, MERGE_BODY_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > MERGE_BODY_MAX_BYTES:
+        return None, f"it is larger than {MERGE_BODY_MAX_BYTES} bytes"
+    try:
+        return data.decode("utf-8"), ""
+    except UnicodeDecodeError:
+        return None, "it is not UTF-8"
+
+
+def write_body_file(path: str, text: str) -> None:
+    """Write atomically (temp file, then rename), owner-only, so a merge never
+    reads a half-written body from a concurrent ``--check-pr``."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".body-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def redirects_output(command: str) -> bool:
+    """Whether a command carries an output redirect other than ``2>&1``.
+
+    The segment parser removes redirect targets from what the guard sees, so a
+    ``--body-file F > F`` would empty the file between the hook's read and gh's.
+    Read the raw text instead; refusing a harmless ``> /dev/null`` costs a rewrite.
+    """
+    return ">" in command.replace("2>&1", "")
