@@ -11,7 +11,8 @@ What these pin, from the design review and two review rounds:
   * pages dedupe per (domain, tier, episode) and per mode, and a page is
     recorded as sent only once it was actually queued;
   * every action stamp is written only after the action succeeded;
-  * observe mode (WATCHGOD_ACT=0, or any invalid value) changes nothing.
+  * observe mode (WATCHGOD_ACT=0, or any invalid value) changes nothing,
+    but still sends every page, titled and deduped as observe-mode.
 """
 
 from __future__ import annotations
@@ -219,11 +220,32 @@ def test_attribution_is_logged_once_per_episode(box):
     assert _log(box).count("top writers") == 1
 
 
-def test_observe_mode_pages_nothing_and_starts_nothing(box):
+def test_observe_mode_pages_but_starts_nothing(box):
+    """Observe mode once logged "would page EMERGENCY" and sent nothing while a
+    volume filled to 0 MB. It now sends the page, marked as observe-mode, and
+    still starts nothing."""
     _handle(box, "red", act=0)
-    assert not _pages(box)
+    pages = _pages(box)
+    assert len(pages) == 1, pages
+    assert pages[0]["title"].startswith("[observe mode, nothing was done] Disk nearly full")
+    assert pages[0]["severity"] == "emergency"
+    assert pages[0]["dedupe_key"].endswith(":observe")
+    assert "took none of the actions above" in pages[0]["body"]
     assert not [c for c in _calls(box) if " start " in f" {c} "], _calls(box)
-    assert "OBSERVE: would page EMERGENCY" in _log(box)
+    assert "OBSERVE: paged EMERGENCY" in _log(box)
+
+
+def test_observe_mode_retries_a_page_it_could_not_queue(box):
+    """An unqueued observe page is not marked sent, so the next poll retries."""
+    box["queue"].mkdir()
+    box["queue"].chmod(0o555)
+    try:
+        _handle(box, "red", act=0)
+        assert "OBSERVE: could not queue the page" in _log(box)
+    finally:
+        box["queue"].chmod(0o755)
+    _handle(box, "red", act=0)
+    assert len(_pages(box)) == 1
 
 
 def test_invalid_act_value_degrades_to_observe(box):
@@ -777,7 +799,8 @@ def test_switching_observe_to_act_mid_episode_still_pages(box, tier, title):
     """Codex P2: an observe-mode poll must not consume the page an acting poll
     owes. Flipping WATCHGOD_ACT 0 -> 1 while still in trouble pages."""
     _handle(box, tier, act=0)
-    assert not [p for p in _pages(box) if p["title"].startswith(title)], "observe pages nothing"
+    assert not [p for p in _pages(box) if p["title"].startswith(title)], "the observe page carries its own title"
+    assert [p for p in _pages(box) if title in p["title"] and p["title"].startswith("[observe mode")]
     _handle(box, tier, act=1)
     assert len([p for p in _pages(box) if p["title"].startswith(title)]) == 1
     _handle(box, tier, act=1)
@@ -1070,9 +1093,11 @@ def test_pages_label_writers_as_process_wide(box):
 
 
 def test_observe_mode_message_does_not_overclaim():
-    """#2521 item 7: OOM capture still pages in observe mode."""
+    """#2521 item 7, then the observe-mode page change: the startup line says
+    pages are sent and no action is taken."""
     text = _WATCHGOD.read_text()
-    assert "no disk action is taken and no disk page is sent (OOM capture still pages)" in text
+    assert "disk tiers are measured and logged and pages are sent; no disk action is taken" in text
+    assert "no disk page is sent" not in text
     assert "nothing is reclaimed, released or paged" not in text
 
 

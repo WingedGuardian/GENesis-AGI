@@ -1,0 +1,449 @@
+"""scripts/lib/watchgod_runaway.sh: naming the file that is filling a disk.
+
+Drives the REAL functions (tmp_watchgod.sh sourced; `main` is guarded) against
+a fake process table (DG_PROC) whose fd links point at real sparse files, with
+the durable alert queue pointed at a tmp dir.
+
+What these pin:
+  * a file held open for WRITING that alone is a large share of its filesystem
+    pages CRITICAL, naming the file and the processes holding it;
+  * growth of a large share between two polls pages, and asks for the fast
+    poll interval; a first sighting never counts as growth;
+  * a reader, a small file, and a file on an unwatched filesystem page nothing;
+  * one page per file per mode, and observe mode still sends it;
+  * a file under cc-tmp names its Claude Code session;
+  * detection changes nothing: no signal, no file touched.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+import pytest
+
+_ROOT = Path(__file__).resolve().parents[2]
+_WATCHGOD = _ROOT / "scripts" / "tmp_watchgod.sh"
+_MB = 1024 * 1024
+
+
+@pytest.fixture
+def box(tmp_path):
+    home = tmp_path / "home"
+    (home / ".genesis" / "logs").mkdir(parents=True)
+    (home / ".genesis" / "config").mkdir(parents=True)
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    data = tmp_path / "data"
+    data.mkdir()
+    return {"home": home, "proc": proc, "data": data, "queue": tmp_path / "queue", "tmp": tmp_path}
+
+
+def _file(box, rel: str, mb: int) -> Path:
+    """A sparse file of `mb` MiB: real size, no real disk use."""
+    path = box["data"] / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "ab") as fh:
+        fh.truncate(mb * _MB)
+    return path
+
+
+def _holder(
+    box,
+    pid: int,
+    target: Path,
+    *,
+    fd: int = 1,
+    flags: str = "0102001",
+    comm: str = "bash",
+    ppid: int = 1,
+    cmdline: str = "bash -c grep -r x .",
+) -> None:
+    """Fake /proc/<pid> holding `target` on descriptor `fd` with octal `flags`."""
+    d = box["proc"] / str(pid)
+    (d / "fd").mkdir(parents=True, exist_ok=True)
+    (d / "fdinfo").mkdir(exist_ok=True)
+    link = d / "fd" / str(fd)
+    if link.is_symlink():
+        link.unlink()
+    link.symlink_to(target)
+    (d / "fdinfo" / str(fd)).write_text(f"pos:\t0\nflags:\t{flags}\nmnt_id:\t1\n")
+    (d / "comm").write_text(comm + "\n")
+    (d / "status").write_text(f"Name:\t{comm}\nPPid:\t{ppid}\n")
+    (d / "cmdline").write_bytes(cmdline.replace(" ", "\0").encode() + b"\0")
+
+
+def _domain(box, total_mb: int, path: Path | None = None) -> str:
+    """One check_disks domain line for the sandbox filesystem."""
+    p = path or box["data"]
+    dev = os.stat(p).st_dev
+    return f"{dev}m1 {dev} {total_mb} {p}"
+
+
+def _run(box, snippet: str, act: int = 1) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env.update(
+        HOME=str(box["home"]), GENESIS_ALERT_QUEUE_ROOT=str(box["queue"]), DG_PROC=str(box["proc"])
+    )
+    script = (
+        f"set -euo pipefail\nsource '{_WATCHGOD}'\nload_config\nWATCHGOD_ACT={act}\n"
+        f'mkdir -p "$DG_STATE_DIR"\n{snippet}\n'
+    )
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=120,
+    )
+    assert proc.returncode == 0, f"rc={proc.returncode}\n{proc.stdout}\n{proc.stderr}"
+    return proc
+
+
+def _pages(box) -> list[dict]:
+    if not box["queue"].exists():
+        return []
+    return [json.loads(p.read_text()) for p in sorted(box["queue"].glob("*.json"))]
+
+
+def _check(
+    box, domains: str, act: int = 1, polls: int = 1, between: str = "", gap: int = 30
+) -> subprocess.CompletedProcess:
+    body = []
+    for i in range(polls):
+        if i:
+            # Age the previous sighting so the next poll has a time base.
+            body.append(f"_RW_PREV_T=$(( _RW_PREV_T - {gap} ))")
+            body.append(between)
+        body.append(f"wg_runaway_check '{domains}'; echo FAST=$RUNAWAY_FAST")
+    return _run(box, "\n".join(body), act=act)
+
+
+# ── the size rule ─────────────────────────────────────────────────
+
+
+def test_a_writer_holding_a_large_share_of_its_filesystem_pages(box):
+    f = _file(box, "out.log", 60)
+    _holder(box, 4242, f, comm="grep", ppid=4241, cmdline="grep -r needle /home")
+    _holder(box, 4241, f, comm="bash", ppid=1)
+    _check(box, _domain(box, 200))  # 60 of 200 MB = 30% >= 25%
+    pages = _pages(box)
+    assert len(pages) == 1, pages
+    page = pages[0]
+    assert page["severity"] == "critical"
+    assert page["title"] == f"Runaway file on {box['data']}: out.log"
+    assert str(f) in page["body"]
+    assert "pid 4242 grep" in page["body"] and "pid 4241 bash" in page["body"]
+    assert "grep -r needle /home" in page["body"]
+    assert "30% of" in page["body"]
+    assert page["dedupe_key"].startswith("watchgod:runaway:")
+
+
+def test_a_reader_is_not_a_writer(box):
+    f = _file(box, "big.db", 120)
+    _holder(box, 77, f, flags="0100000", comm="python")  # O_RDONLY
+    _check(box, _domain(box, 200))
+    assert not _pages(box)
+
+
+def test_rdwr_counts_as_a_writer(box):
+    f = _file(box, "big.db", 120)
+    _holder(box, 77, f, flags="0100002", comm="python")  # O_RDWR
+    _check(box, _domain(box, 200))
+    assert len(_pages(box)) == 1
+
+
+def test_a_file_below_the_minimum_is_not_followed(box):
+    f = _file(box, "small.log", 10)
+    _holder(box, 5, f)
+    _check(box, _domain(box, 20))  # 50% of the domain, but under DG_RUNAWAY_MIN_MB
+    assert not _pages(box)
+
+
+def test_a_file_on_an_unwatched_filesystem_is_ignored(box):
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    _check(box, "999999m1 999999 200 /elsewhere")
+    assert not _pages(box)
+
+
+def test_a_file_well_under_the_share_pages_nothing(box):
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    _check(box, _domain(box, 10_000))  # 0.6%
+    assert not _pages(box)
+
+
+# ── the growth rule ───────────────────────────────────────────────
+
+
+def test_fast_growth_between_polls_pages_and_asks_for_the_fast_poll(box):
+    f = _file(box, "grow.output", 60)
+    _holder(box, 9, f)
+    # 60 MB of a 10,000 MB domain is 0.6%; then +640 MB in one poll is 6.4%.
+    out = _check(box, _domain(box, 10_000), polls=2, between=f"truncate -s {700 * _MB} '{f}'")
+    assert out.stdout.splitlines() == ["FAST=0", "FAST=1"]
+    pages = _pages(box)
+    assert len(pages) == 1, pages
+    assert "it grew 640 MB" in pages[0]["body"]
+
+
+def test_a_first_sighting_is_never_growth(box):
+    """A file that first appears on a LATER poll has no previous size: its
+    whole size is not one poll's growth."""
+    f = _file(box, "new.output", 700)
+    dom = _domain(box, 10_000)
+    hidden = box["tmp"] / "hidden9"
+    _holder(box, 9, f)
+    (box["proc"] / "9").rename(hidden)
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'; echo FAST=$RUNAWAY_FAST
+        mv '{hidden}' '{box["proc"]}/9'
+        _RW_PREV_T=$(( _RW_PREV_T - 30 ))
+        wg_runaway_check '{dom}'; echo FAST=$RUNAWAY_FAST
+        """,
+    )
+    # Counted as growth, its 700 MB would be 7% of the domain in one poll.
+    assert out.stdout.splitlines() == ["FAST=0", "FAST=0"]
+    assert not _pages(box)
+
+
+def test_half_the_rate_threshold_asks_for_the_fast_poll_without_paging(box):
+    f = _file(box, "grow.output", 60)
+    _holder(box, 9, f)
+    # +300 MB of 10,000 MB = 3%: at least half the 5% threshold, under it.
+    out = _check(box, _domain(box, 10_000), polls=2, between=f"truncate -s {360 * _MB} '{f}'")
+    assert out.stdout.splitlines() == ["FAST=0", "FAST=1"]
+    assert not _pages(box)
+
+
+# ── paging discipline ─────────────────────────────────────────────
+
+
+def test_one_page_per_file_per_mode(box):
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    _check(box, _domain(box, 200), polls=3)
+    assert len(_pages(box)) == 1
+    _check(box, _domain(box, 200), act=0)
+    pages = _pages(box)
+    assert len(pages) == 2
+    assert pages[1]["title"].startswith("[observe mode, nothing was done] Runaway file on")
+    assert pages[1]["dedupe_key"].endswith(":observe")
+
+
+def test_two_holders_of_one_file_page_once(box):
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f, fd=1)
+    _holder(box, 5, f, fd=2)
+    _holder(box, 6, f, fd=1)
+    _check(box, _domain(box, 200))
+    pages = _pages(box)
+    assert len(pages) == 1
+    assert "pid 5 " in pages[0]["body"] and "pid 6 " in pages[0]["body"]
+
+
+def test_the_same_file_back_in_sight_reuses_its_key(box):
+    """Out of sight for a poll and back: queued again, under the SAME key, which
+    the alert drainer collapses. The identity is the file's, not a memory."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    dom = _domain(box, 200)
+    hide = f"mv '{box['proc']}/5' '{box['tmp']}/hidden5'"
+    show = f"mv '{box['tmp']}/hidden5' '{box['proc']}/5'"
+    _run(
+        box,
+        f"wg_runaway_check '{dom}'\n{hide}\nwg_runaway_check '{dom}'\n{show}\nwg_runaway_check '{dom}'",
+    )
+    keys = [p["dedupe_key"] for p in _pages(box)]
+    assert len(keys) == 2 and keys[0] == keys[1], keys
+
+
+def test_a_new_file_is_a_new_incident_even_at_the_same_path(box):
+    """A recreated file has a new birth time, so a new key: the drainer's 24 h
+    dedupe cannot swallow it, even where the inode number is reused at once."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    dom = _domain(box, 200)
+    _check(box, dom)
+    f.unlink()
+    time.sleep(1.1)
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    _check(box, dom)
+    keys = [p["dedupe_key"] for p in _pages(box)]
+    assert len(keys) == 2 and keys[0] != keys[1], keys
+
+
+def test_a_restart_re_sends_the_same_key(box):
+    """A crash-looping daemon must not mint a new key each start: the drainer
+    collapses one key, so a restart storm stays one page."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    _check(box, _domain(box, 200))
+    time.sleep(1.1)  # a clock-derived key would differ across this gap
+    _check(box, _domain(box, 200))
+    keys = [p["dedupe_key"] for p in _pages(box)]
+    assert len(keys) == 2 and keys[0] == keys[1], keys
+
+
+def test_the_key_is_device_inode_and_birth_time(box):
+    """Pinned exactly: on a filesystem that reuses inode numbers at once, the
+    birth time is the only part that tells a new file from the old one."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    _check(box, _domain(box, 200))
+    st = os.stat(f)
+    birth = subprocess.run(
+        ["stat", "-c", "%W", str(f)], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert _pages(box)[0]["dedupe_key"] == f"watchgod:runaway:{st.st_dev}:{st.st_ino}:{birth}"
+
+
+def test_the_writer_list_is_capped(box):
+    f = _file(box, "out.log", 60)
+    for pid in range(100, 125):
+        _holder(box, pid, f)
+    _check(box, _domain(box, 200))
+    body = _pages(box)[0]["body"]
+    assert body.count("  pid ") == 20
+    assert "+5 more" in body
+
+
+def test_a_cc_tmp_file_names_its_session(box):
+    cc = box["data"] / "cc-tmp"
+    f = _file(box, "cc-tmp/claude-1000/-proj/sess-abc123/tasks/b1.output", 600)
+    _holder(box, 31, f, comm="bash")
+    _run(box, f"CC_TMP_DIR='{cc}'\nwg_runaway_check '{_domain(box, 2048)}'")
+    pages = _pages(box)
+    assert len(pages) == 1
+    assert "Claude Code session: sess-abc123" in pages[0]["body"]
+
+
+def test_detection_changes_nothing(box):
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    before = f.stat()
+    out = _run(box, f"kill() {{ echo KILLED \"$@\"; }}\nwg_runaway_check '{_domain(box, 200)}'")
+    after = f.stat()
+    assert "KILLED" not in out.stdout
+    assert (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns)
+
+
+def test_runaway_thresholds_are_conf_tunables(box):
+    conf = box["home"] / ".genesis" / "config" / "watchgod.local.conf"
+    conf.write_text("DG_RUNAWAY_PCT=10\nDG_RUNAWAY_MIN_MB=5\n")
+    out = _run(
+        box,
+        'echo "$DG_RUNAWAY_PCT $DG_RUNAWAY_RATE_PCT $DG_RUNAWAY_MIN_MB"; : > '
+        + f"'{conf}'"
+        + '; load_config; echo "$DG_RUNAWAY_PCT $DG_RUNAWAY_MIN_MB"',
+    )
+    assert out.stdout.splitlines() == ["10 5 5", "25 50"]
+
+
+def test_check_disks_feeds_every_domain_to_the_detector():
+    """Wiring: the domains check_disks tiers are the ones the detector sees,
+    and fast growth shortens the next poll."""
+    text = _WATCHGOD.read_text()
+    assert 'rw_domains+="${key} ${key%%[qm]*} ${total} ${p}"' in text
+    assert 'wg_runaway_check "$rw_domains"' in text
+    assert "(( RUNAWAY_FAST )) && fast=1" in text
+
+
+def test_growth_is_judged_per_poll_interval_not_per_poll(box):
+    """At the 5 s fast poll the same writer shows a sixth of a 30 s poll's
+    growth. Normalised to POLL_INTERVAL it still pages and stays fast."""
+    f = _file(box, "grow.output", 60)
+    _holder(box, 9, f)
+    # +160 MB in ~5 s = 960 MB per 30 s = 9.6% of 10,000 MB; per POLL it is only
+    # 1.6%, so this pages only if growth is normalised. Margin: still >= 5% at a
+    # 9 s gap, should a loaded box stretch the 5 s between the two polls.
+    out = _check(
+        box, _domain(box, 10_000), polls=2, gap=5, between=f"truncate -s {220 * _MB} '{f}'"
+    )
+    assert out.stdout.splitlines() == ["FAST=0", "FAST=1"]
+    pages = _pages(box)
+    assert len(pages) == 1, pages
+    assert "it grew 160 MB in " in pages[0]["body"]
+
+
+def test_a_multiline_command_line_cannot_make_the_page_undeliverable(box):
+    """A Claude Code Bash call's command line can span thousands of lines; cut
+    per line kept them all, and the oversized body could not be queued."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    (box["proc"] / "5" / "cmdline").write_bytes(b"bash\0-c\0" + b"echo line\n" * 3000 + b"\0")
+    _check(box, _domain(box, 200))
+    pages = _pages(box)
+    assert len(pages) == 1
+    assert pages[0]["body"].count("echo line") < 20
+    assert len(pages[0]["body"]) < 2000
+
+
+def test_a_reused_descriptor_does_not_name_the_wrong_file(box):
+    """Between the walk and the naming, the fd number can be closed and reused:
+    the page names the file only if the link still leads to the measured inode."""
+    big = _file(box, "big.log", 60)
+    other = _file(box, "other.log", 1)
+    _holder(box, 5, big)
+    link = box["proc"] / "5" / "fd" / "1"
+    _run(
+        box,
+        f"""
+        saved_scan=$(_rw_scan)
+        [[ -n "$saved_scan" ]] || {{ echo "fixture: the walk saw nothing"; exit 1; }}
+        rm -f '{link}'; ln -s '{other}' '{link}'
+        _rw_scan() {{ printf '%s\\n' "$saved_scan"; }}
+        wg_runaway_check '{_domain(box, 200)}'
+        """,
+    )
+    assert not _pages(box)
+
+
+@pytest.mark.parametrize("bad", ["high", "25%", "-5", "0", ""])
+def test_a_bad_runaway_setting_falls_back_to_its_default(box, bad):
+    """A hand-edited value must never crash-loop the daemon (set -u) or turn
+    detection off silently: it is reset to the default, loudly."""
+    conf = box["home"] / ".genesis" / "config" / "watchgod.local.conf"
+    conf.write_text(f"DG_RUNAWAY_PCT={bad}\nDG_RUNAWAY_MIN_MB={bad}\n")
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    out = _run(
+        box,
+        f"""echo "$DG_RUNAWAY_PCT $DG_RUNAWAY_MIN_MB"
+wg_runaway_check '{_domain(box, 200)}'""",
+    )
+    assert out.stdout.splitlines()[0] == "25 50"
+    assert len(_pages(box)) == 1
+    log = (box["home"] / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert "DG_RUNAWAY_PCT=" in log and "using 25" in log
+
+
+@pytest.mark.parametrize("rc", [124, 125, 127, 137])
+def test_a_walk_that_did_not_complete_says_so(box, rc):
+    """Every status above find's normal 1 means the walk did not complete; none
+    may read as all clear."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    _run(
+        box,
+        f"""timeout() {{ while [[ "$1" != find ]]; do shift; done; "$@" >/dev/null; return {rc}; }}
+wg_runaway_check '{_domain(box, 200)}'""",
+    )
+    log = (box["home"] / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert f"did not complete (status {rc}" in log
+
+
+def test_a_normal_walk_logs_no_failure(box):
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    _check(box, _domain(box, 200))
+    log = (box["home"] / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert "did not complete" not in log
