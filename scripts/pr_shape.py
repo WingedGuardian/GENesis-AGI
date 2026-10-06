@@ -14,48 +14,65 @@ so every body-reader in the repo shares one scanner. Both load through
 ``RuntimeError`` rather than silently degrading into a second contract.
 
 Pure functions otherwise, stdlib only (no third-party packages), no
-subprocess — wiring it into ``gh pr create`` and the merge report is
-maintainer work done elsewhere.
+subprocess. The one exception is the command line, the single way every doc
+tells a session or builder to size a branch:
+
+    python3 scripts/pr_shape.py [--base origin/main] [--head HEAD] [--json]
+
+It reads the diff through ``review_scope``'s hardened git runner (no external
+diff, no textconv, no attributes file, no replace objects: each of those can
+empty or shrink a diff at exit 0), prints ``<counted> <band>``, and exits 2
+when git fails, so a broken read never reports as a small change.
 """
 
 from __future__ import annotations
 
+import argparse
 import fnmatch
 import importlib.util
+import json
+import os
 import re
 import sys
 from collections import Counter
 from pathlib import Path
 
-#: The bands are OWNER POLICY, re-checked against measured cost (2026-10-05).
+#: The bands are OWNER POLICY, re-checked against measured cost (2026-10-06).
 #: `scripts/pr_shape_study.py --out <dir>` re-derives the measurement: the 400
 #: most recently created PRs merged into main, each sized by this counter on its
 #: verified squash commit, against its review rounds from `review_budget.py`.
-#: Run 2026-10-05: 400 used, none excluded (none failed the squash check).
+#: Run 2026-10-06: 400 used, none excluded (none failed the squash check). PRs
+#: merged with no review round (75 of 400) are included.
 #:
-#: Median rounds by counted lines:
+#: Rounds by counted lines (buckets are half-open, [lo, hi)):
 #:
-#: | counted lines | PRs | median rounds |
-#: |---|---|---|
-#: | 0-50 | 147 | 1 |
-#: | 50-200 | 118 | 2 |
-#: | 200-400 | 67 | 3 |
-#: | 400-600 | 26 | 4 |
-#: | 600-800 | 18 | 4 |
-#: | 800-1000 | 10 | 3.5 |
-#: | 1000+ | 14 | 4 |
+#: | counted lines | PRs | median rounds | p75 | past round 4 |
+#: |---|---|---|---|---|
+#: | [0, 50) | 148 | 1 | 2 | 6 |
+#: | [50, 200) | 118 | 2 | 3 | 7 |
+#: | [200, 400) | 66 | 3 | 4 | 10 |
+#: | [400, 600) | 27 | 4 | 4.5 | 7 |
+#: | [600, 800) | 17 | 4 | 4 | 3 |
+#: | [800, 1000) | 10 | 3.5 | 4 | 2 |
+#: | [1000, +) | 14 | 4 | 4.75 | 4 |
 #:
-#: Spearman rho = 0.44 (counted lines); 0.46 for the plain size, which keeps
-#: comments and does not pair moves. The study's rule (median reaches 3 rounds,
-#: then 4) puts the shape and override points at about 200 and 400. The owner
-#: kept 500 and 1000 as a guideline the building session weighs, and the table
-#: records what a PR above them typically costs.
+#: p75 is linear interpolation (Hyndman-Fan type 7), the definition the median
+#: also follows.
+#:
+#: Spearman rho = 0.43 (counted lines); 0.46 for the plain size, which keeps
+#: comments and does not pair moves. The study's rule (the first bucket of at
+#: least 5 PRs whose median reaches 3 rounds, then 4) puts the shape and
+#: override points at 200 and 400 on counted lines, and at 400 and 800 on the
+#: plain size. The owner kept 500 and 1000 as a guideline the building session
+#: weighs, and the table records what a PR above them typically costs.
 #:
 #: Caveats on reading the table:
-#: - Medians cap near 4, because round 4 is terminal.
-#: - 350 of the 400 PRs were created before ROUND_RULE_CUTOVER_ISO. Their reviews
+#: - The medians stop rising at 4, but round 4 is not a ceiling: 39 of the 400
+#:   PRs ran past it, up to 15 rounds.
+#: - 347 of the 400 PRs were created before ROUND_RULE_CUTOVER_ISO. Their reviews
 #:   from before the cutover count clean heads as rounds; a PR reviewed across
-#:   the cutover mixes both rules.
+#:   the cutover mixes both rules. The 53 created after it are too few to place
+#:   either point on counted lines (every bucket from 200 up has under 5 PRs).
 SHAPE_AT = 500
 OVERRIDE_AT = 1001
 
@@ -406,3 +423,35 @@ def parse_shape(body: str | None) -> str | None:
             if value:
                 return value
     return None
+
+
+def branch_diff(base: str, head: str = "HEAD", cwd: str | None = None) -> str | None:
+    """``git diff -M <base>...<head>`` through review_scope's hardened runner, or None."""
+    scope = _load_sibling("review_scope.py", "_review_scope_for_pr_shape")
+    return scope._git(["diff", "--no-color", "-M", f"{base}...{head}"], cwd)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Count a branch's changed code lines and its size band.")
+    ap.add_argument("--base", default="origin/main", help="merge-base side (default: origin/main)")
+    ap.add_argument("--head", default="HEAD", help="branch tip (default: HEAD)")
+    ap.add_argument("--json", action="store_true", help="print the full count as JSON")
+    args = ap.parse_args(argv)
+    diff = branch_diff(args.base, args.head, os.getcwd())
+    if diff is None:
+        print(
+            f"pr_shape: could not read `git diff {args.base}...{args.head}`; "
+            "fetch the base and check both refs exist",
+            file=sys.stderr,
+        )
+        return 2
+    result = count_diff(diff)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"{result['counted']} {result['band']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

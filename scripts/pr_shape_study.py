@@ -36,6 +36,7 @@ another repository are refused) and ``report.json`` to ``--out``.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import statistics
 import subprocess
@@ -57,6 +58,9 @@ BUCKETS = [
     (1000, None),
 ]
 MIN_BUCKET_N = 5
+#: Bumped whenever a cached row's fields or their meaning change; a cache from
+#: another schema is refused rather than mixed into a report.
+ROW_SCHEMA = 2
 
 
 def spearman(xs: list[float], ys: list[float]) -> float | None:
@@ -87,34 +91,72 @@ def spearman(xs: list[float], ys: list[float]) -> float | None:
     return num / den if den else None
 
 
+def _p75(r: list[int]) -> float:
+    """75th percentile by linear interpolation between order statistics.
+
+    That is ``statistics.quantiles(method="inclusive")``, Hyndman-Fan type 7, and
+    its 50th percentile equals ``statistics.median``, so the two columns share one
+    definition. The default ``exclusive`` method was rejected: on ``[1, 4]`` it
+    returns 4.75, outside the observed range, which misleads in sparse buckets.
+    """
+    if len(r) == 1:
+        return float(r[0])
+    return statistics.quantiles(r, n=4, method="inclusive")[2]
+
+
 def bucket_table(rows: list[dict], key: str) -> list[dict]:
-    """Median and 75th-percentile rounds per size bucket of ``rows[key]``."""
+    """Rounds per half-open size bucket ``[lo, hi)`` of ``rows[key]``.
+
+    Each bucket reports n, the median and p75 rounds, and how many of its PRs ran
+    past round 4 (the terminal round), the tail a median alone hides.
+    """
     out = []
     for lo, hi in BUCKETS:
         r = sorted(x["rounds"] for x in rows if x[key] >= lo and (hi is None or x[key] < hi))
         out.append(
             {
-                "bucket": f"{lo}-{hi if hi is not None else '+'}",
+                "bucket": f"[{lo},{hi})" if hi is not None else f"[{lo},+)",
                 "lo": lo,
                 "n": len(r),
-                "median": statistics.median(r) if r else None,
-                "p75": r[int(0.75 * (len(r) - 1))] if r else None,
+                "median": float(statistics.median(r)) if r else None,
+                "p75": _p75(r) if r else None,
+                "past_round_4": sum(1 for x in r if x > 4),
             }
         )
     return out
 
 
-def implied_thresholds(table: list[dict]) -> tuple[int | None, int | None]:
-    """(shape, override): first bucket edges whose median reaches 3 and 4 rounds."""
-    shape = override = None
-    for row in table:
-        if row["median"] is None or row["n"] < MIN_BUCKET_N:
-            continue
-        if shape is None and row["median"] >= 3:
-            shape = row["lo"]
-        if override is None and row["median"] >= 4:
-            override = row["lo"]
-    return shape, override
+def implied_thresholds(table: list[dict]) -> dict:
+    """Shape and override points: the first bucket edges whose median reaches 3
+    and 4 rounds, among buckets with at least ``MIN_BUCKET_N`` PRs.
+
+    Each point carries a status, because a missing point has two different
+    meanings: ``reached``; ``not_reached`` (no bucket's median gets there);
+    ``insufficient_n`` (only a bucket too small to judge gets there).
+    """
+    out: dict = {}
+    for name, level in (("shape", 3), ("override", 4)):
+        value, status = None, "not_reached"
+        for row in table:
+            if row["median"] is None or row["median"] < level:
+                continue
+            if row["n"] < MIN_BUCKET_N:
+                status = "insufficient_n"
+                continue
+            value, status = row["lo"], "reached"
+            break
+        out[name] = value
+        out[f"{name}_status"] = status
+    return out
+
+
+def cohort_of(created: str, cutover: str) -> str:
+    """``post`` when the PR was created at or after the round-rule cutover."""
+
+    def parse(ts: str) -> datetime.datetime:
+        return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+    return "post" if parse(created) >= parse(cutover) else "pre"
 
 
 def _sh(*args: str) -> str:
@@ -172,6 +214,11 @@ def load_cache(path: Path, repo: str) -> dict[int, dict]:
             raise SystemExit(f"{path}: line {i + 1} is not JSON") from None
         if row.get("repo") != repo:
             raise SystemExit(f"{path}: line {i + 1} is from {row.get('repo')!r}, not {repo!r}")
+        if row.get("schema") != ROW_SCHEMA:
+            raise SystemExit(
+                f"{path}: line {i + 1} has row schema {row.get('schema')!r}, not {ROW_SCHEMA}; "
+                "use a fresh --out directory"
+            )
         done[row["pr"]] = row
     return done
 
@@ -252,6 +299,7 @@ def main(argv: list[str] | None = None) -> int:
                 excluded["budget_not_ok"] += 1
                 continue
             row = {
+                "schema": ROW_SCHEMA,
                 "repo": repo,
                 "pr": n,
                 "counted": counted["counted"],
@@ -259,7 +307,6 @@ def main(argv: list[str] | None = None) -> int:
                 "rounds": budget["count"],
                 "created": p["createdAt"],
                 "merged": p.get("mergedAt"),
-                "cohort": "post" if p["createdAt"] >= cutover[:19] else "pre",
             }
             fh.write(json.dumps(row) + "\n")
             fh.flush()
@@ -276,9 +323,16 @@ def main(argv: list[str] | None = None) -> int:
         "used": len(rows),
         "excluded": excluded,
         "cohorts": "by creation date against ROUND_RULE_CUTOVER_ISO",
+        "zero_round_prs": sum(1 for r in rows if r["rounds"] == 0),
+        "past_round_4": sum(1 for r in rows if r["rounds"] > 4),
+        "max_rounds": max((r["rounds"] for r in rows), default=None),
     }
     for cohort in ("all", "pre", "post"):
-        sub = rows if cohort == "all" else [r for r in rows if r["cohort"] == cohort]
+        sub = (
+            rows
+            if cohort == "all"
+            else [r for r in rows if cohort_of(r["created"], cutover) == cohort]
+        )
         tc, tp = bucket_table(sub, "counted"), bucket_table(sub, "plain")
         report[cohort] = {
             "n": len(sub),

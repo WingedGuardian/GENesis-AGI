@@ -2,6 +2,8 @@
 
 import importlib.util
 import json
+import statistics
+import subprocess
 import sys
 from pathlib import Path
 
@@ -21,21 +23,67 @@ def _rows(pairs):
 def test_bucket_table_medians_and_counts():
     table = study.bucket_table(_rows([(10, 1), (20, 1), (30, 2), (300, 3), (2000, 5)]), "counted")
     first = table[0]
-    assert (first["bucket"], first["n"], first["median"]) == ("0-50", 3, 1)
+    assert (first["bucket"], first["n"], first["median"]) == ("[0,50)", 3, 1.0)
     assert table[2]["n"] == 1 and table[2]["median"] == 3
     # One 1000+ bucket, as the table recorded in pr_shape.py has (review finding).
-    assert table[-1]["bucket"] == "1000-+" and table[-1]["median"] == 5
+    assert table[-1]["bucket"] == "[1000,+)" and table[-1]["median"] == 5
+    assert table[-1]["past_round_4"] == 1
     assert table[1]["n"] == 0 and table[1]["median"] is None
 
 
 def test_implied_thresholds_take_first_qualifying_bucket():
     rows = _rows([(10, 1)] * 5 + [(100, 2)] * 5 + [(250, 3)] * 5 + [(450, 4)] * 5)
-    assert study.implied_thresholds(study.bucket_table(rows, "counted")) == (200, 400)
+    assert study.implied_thresholds(study.bucket_table(rows, "counted")) == {
+        "shape": 200, "shape_status": "reached", "override": 400, "override_status": "reached",
+    }
 
 
 def test_implied_thresholds_ignore_buckets_under_minimum_n():
     rows = _rows([(10, 1)] * 5 + [(250, 4)] * (study.MIN_BUCKET_N - 1))
-    assert study.implied_thresholds(study.bucket_table(rows, "counted")) == (None, None)
+    # Review finding: "too few PRs to judge" must not read as "never reached".
+    assert study.implied_thresholds(study.bucket_table(rows, "counted")) == {
+        "shape": None, "shape_status": "insufficient_n",
+        "override": None, "override_status": "insufficient_n",
+    }
+
+
+def test_implied_thresholds_not_reached_is_its_own_status():
+    rows = _rows([(10, 1)] * 5 + [(250, 2)] * 5)
+    got = study.implied_thresholds(study.bucket_table(rows, "counted"))
+    assert (got["shape"], got["shape_status"]) == (None, "not_reached")
+
+
+def test_p75_is_linear_interpolation_and_matches_the_median_definition():
+    """Review finding: r[int(0.75*(n-1))] returned the minimum of [1, 4]."""
+    table = study.bucket_table(_rows([(10, 1), (20, 4)]), "counted")
+    assert table[0]["p75"] == 3.25
+    assert study.bucket_table(_rows([(10, 3)]), "counted")[0]["p75"] == 3.0
+    rows = _rows([(10, r) for r in (1, 2, 3, 4, 5, 9)])
+    assert study._p75(sorted(r["rounds"] for r in rows)) == 4.75
+    assert statistics.quantiles([1, 2, 3, 4, 5, 9], n=4, method="inclusive")[1] == statistics.median(
+        [1, 2, 3, 4, 5, 9]
+    )
+
+
+def test_spearman_ties_match_the_standard_ranked_correlation():
+    xs = [1, 2, 2, 3, 5, 5, 5, 8]
+    ys = [1, 3, 2, 2, 4, 6, 4, 9]
+    assert abs(study.spearman(xs, ys) - statistics.correlation(xs, ys, method="ranked")) < 1e-12
+
+
+@pytest.mark.parametrize(
+    "created, cohort",
+    [("2026-01-01T00:00:00Z", "pre"), ("2099-01-01T00:00:00Z", "post"), ("2099-01-01T00:00:00+05:00", "post")],
+)
+def test_cohort_is_computed_with_timezones(created, cohort):
+    assert study.cohort_of(created, "2026-09-01T00:00:00+00:00") == cohort
+
+
+def test_cache_refuses_rows_from_another_schema(tmp_path):
+    cache = tmp_path / "rows.jsonl"
+    cache.write_text(json.dumps({"repo": "o/r", "pr": 1, "schema": 1}) + "\n")
+    with pytest.raises(SystemExit):
+        study.load_cache(cache, "o/r")
 
 
 def test_spearman_perfect_and_inverse_and_ties():
@@ -98,7 +146,7 @@ def test_plain_size_takes_each_rename_side_on_its_own_path(old, new, plain):
 
 def test_cache_drops_only_a_torn_last_line(tmp_path):
     cache = tmp_path / "rows.jsonl"
-    good = json.dumps({"repo": "o/r", "pr": 1})
+    good = json.dumps({"repo": "o/r", "pr": 1, "schema": study.ROW_SCHEMA})
     cache.write_text(good + "\n" + '{"repo": "o/r", "pr"')
     assert set(study.load_cache(cache, "o/r")) == {1}
     assert cache.read_text() == good + "\n"
@@ -106,7 +154,7 @@ def test_cache_drops_only_a_torn_last_line(tmp_path):
 
 def test_cache_refuses_a_bad_line_before_the_end(tmp_path):
     cache = tmp_path / "rows.jsonl"
-    cache.write_text("not json\n" + json.dumps({"repo": "o/r", "pr": 1}) + "\n")
+    cache.write_text("not json\n" + json.dumps({"repo": "o/r", "pr": 1, "schema": study.ROW_SCHEMA}) + "\n")
     with pytest.raises(SystemExit):
         study.load_cache(cache, "o/r")
 
@@ -114,7 +162,7 @@ def test_cache_refuses_a_bad_line_before_the_end(tmp_path):
 def test_cache_refuses_rows_from_another_repository(tmp_path):
     """Review finding: a reused --out mixed two repositories' rows."""
     cache = tmp_path / "rows.jsonl"
-    cache.write_text(json.dumps({"repo": "other/r", "pr": 1}) + "\n")
+    cache.write_text(json.dumps({"repo": "other/r", "pr": 1, "schema": study.ROW_SCHEMA}) + "\n")
     with pytest.raises(SystemExit):
         study.load_cache(cache, "o/r")
 
@@ -131,3 +179,52 @@ def test_cache_refuses_rows_from_another_repository(tmp_path):
 def test_is_squash(monkeypatch, log, commits, squash):
     monkeypatch.setattr(study, "_sh", lambda *a: log)
     assert study._is_squash("abc", 7, lambda: commits) is squash
+
+
+def _repo(tmp_path):
+    def git(*a):
+        subprocess.run(["git", "-C", str(tmp_path), *a], check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.invalid")
+    git("config", "user.name", "t")
+    (tmp_path / "a.py").write_text("x = 0\n")
+    git("add", "a.py")
+    git("commit", "-q", "-m", "base")
+    git("checkout", "-q", "-b", "work")
+    (tmp_path / "a.py").write_text("x = 0\n" + "".join(f"y{i} = {i}\n" for i in range(5)))
+    git("commit", "-q", "-am", "work")
+    return git
+
+
+def _cli(tmp_path, *args):
+    return subprocess.run(
+        [sys.executable, str(_PATH.parent / "pr_shape.py"), *args],
+        cwd=tmp_path, capture_output=True, text=True, timeout=60,
+    )
+
+
+def test_cli_prints_the_count_and_band(tmp_path):
+    _repo(tmp_path)
+    run = _cli(tmp_path, "--base", "main")
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip() == "5 ok"
+
+
+def test_cli_ignores_an_attributes_file_that_hides_code(tmp_path):
+    """Review finding: an attributes file marking *.py binary emptied the count
+    (MEASURED by the premise check: 12,386 counted lines fell to 1,445)."""
+    git = _repo(tmp_path)
+    (tmp_path / "attrs").write_text("*.py binary\n")
+    git("config", "core.attributesFile", str(tmp_path / "attrs"))
+    (tmp_path / ".gitattributes").write_text("")
+    git("config", "diff.hide.textconv", "true")
+    assert _cli(tmp_path, "--base", "main").stdout.strip() == "5 ok"
+
+
+def test_cli_fails_loudly_on_a_bad_ref(tmp_path):
+    _repo(tmp_path)
+    run = _cli(tmp_path, "--base", "no-such-ref")
+    assert run.returncode == 2
+    assert "could not read" in run.stderr
+    assert run.stdout == ""
