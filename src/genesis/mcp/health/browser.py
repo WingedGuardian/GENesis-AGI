@@ -110,10 +110,19 @@ _remote_browser = None  # CDP Browser connection
 _remote_page = None  # Active page on user's remote Chrome
 _remote_cdp_url: str | None = None  # e.g. "http://100.x.y.z:9222"
 _remote_last_url: str | None = None  # URL at last Genesis action (drift detection)
-# CDP target id of the tab Genesis opened in the user's Chrome. Survives a
+# CDP target id of the tab Genesis opened in each Chrome, keyed by CDP URL (a
+# switch between endpoints must not lose the other's tab). Survives a
 # disconnect and cleanup on purpose: the tab is never closed (owner ruling), so
 # a reconnect finds it again and reuses it instead of opening another one.
-_remote_target_id: str | None = None
+_remote_target_ids: dict[str, str] = {}
+# Opens and closes run under asyncio.shield, kept until they end: asyncio
+# holds only a weak reference to a task, so one whose caller was cancelled
+# could be garbage-collected midway. async_cleanup drains what still runs.
+_remote_inflight: set[asyncio.Future] = set()
+# How long a cancelled connect waits for an unidentified tab's close before
+# returning; the close itself keeps running (retained) past this bound.
+# 10 s, the bound every other local and remote close here already uses.
+_UNIDENTIFIED_TAB_CLOSE_BOUND_S = 10.0
 
 # Layer 4: TinyFish cloud browser (on-demand CDP, paid credits)
 _tinyfish_pw = None  # Playwright instance for TinyFish session
@@ -378,8 +387,12 @@ async def async_cleanup():
             await _idle_task
         _idle_task = None
 
-    # Remote CDP: disconnect (does NOT close user's Chrome)
+    # Remote CDP: disconnect (does NOT close user's Chrome), then let shielded
+    # closes that outlived their caller finish, within the same 10s bound.
     await _cleanup_remote_cdp()
+    if _remote_inflight:
+        await asyncio.wait(set(_remote_inflight), timeout=10.0)
+
     # TinyFish: terminate cloud session (stops credit burn)
     await _cleanup_tinyfish()
     await _cleanup_chromium()
@@ -496,9 +509,16 @@ async def _ensure_chromium_fallback():
         return _page
 
 
-def _on_remote_disconnected() -> None:
-    """Callback when CDP connection drops (Chrome closed, machine asleep)."""
+def _on_remote_disconnected(remote_browser) -> None:
+    """Callback when CDP connection drops (Chrome closed, machine asleep).
+
+    Bound to one connection. An event from a browser that is no longer the
+    current one (a stale or failed attempt, or one cleanup is closing) is
+    ignored, so it cannot clear the connection that replaced it.
+    """
     global _remote_browser, _remote_page, _active_page
+    if remote_browser is not _remote_browser:
+        return
     logger.warning("Remote CDP disconnected (Chrome closed or network lost)")
     _remote_browser = None
     if _active_page is _remote_page:
@@ -507,38 +527,92 @@ def _on_remote_disconnected() -> None:
     # Preserve _remote_cdp_url so reconnection works on next call
 
 
+def _retain(aw) -> asyncio.Future:
+    """Run ``aw`` as a task held in _remote_inflight until it ends."""
+    task = asyncio.ensure_future(aw)
+    _remote_inflight.add(task)
+    task.add_done_callback(_forget_close)
+    return task
+
+
+def _forget_close(task: asyncio.Future) -> None:
+    _remote_inflight.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        # Warning: when the caller was cancelled, nobody else sees this.
+        logger.warning("Remote CDP open/close failed", exc_info=task.exception())
+
+
+async def _shielded(aw):
+    """Await ``aw``; cancelling the caller does not cut it short."""
+    return await asyncio.shield(_retain(aw))
+
+
+async def _open_or_close_late(aw, close, late: list | None = None):
+    """Await ``aw``, a call that creates something to close later. If the
+    caller is cancelled meanwhile, the call still completes (Playwright drops
+    the reply, it does not withdraw the request), so ``close`` is applied to
+    its result when it arrives instead of leaking it. That close task is
+    added to ``late``: a disconnect must wait for it, or the reply never
+    arrives and the tab stays open."""
+    task = _retain(aw)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        closing = _retain(_close_late(task, close))
+        if late is not None:
+            late.append(closing)
+        raise
+
+
+async def _close_late(task: asyncio.Future, close) -> None:
+    await close(await task)
+
+
 async def _cleanup_remote_cdp() -> None:
     """Disconnect from remote Chrome. Does NOT close the user's browser.
 
     Playwright's browser.close() on a CDP connection is a disconnect only —
     it does NOT terminate the remote Chrome process, and it does not close the
     Genesis tab either (it lives in the user's own context). The tab is left
-    open on purpose and ``_remote_target_id`` is kept, so the next connect
+    open on purpose and ``_remote_target_ids`` is kept, so the next connect
     reuses it. Touches no other layer.
+
+    The globals are cleared BEFORE the first await, and only the handles taken
+    here are closed (shielded). A cleanup that outlives its caller (a second
+    cancel releases the browser lock while it runs) therefore cannot clear or
+    stop a connection made after it started.
     """
-    global _remote_pw, _remote_browser, _remote_page, _remote_last_url
+    global _remote_pw, _remote_browser, _remote_page, _remote_last_url, _active_page
 
     _forget_layer(BrowserLayer.REMOTE_CDP, _remote_page)
-    if _remote_browser is not None:
+    remote_browser, remote_pw = _remote_browser, _remote_pw
+    if _active_page is not None and _active_page is _remote_page:
+        _active_page = None
+    _remote_browser = _remote_page = _remote_pw = None
+    _remote_last_url = None
+    await _shielded(_close_remote_handles(remote_browser, remote_pw))
+
+
+async def _close_remote_handles(remote_browser, remote_pw, late=()) -> None:
+    """Disconnect one CDP connection and stop its driver (either may be None),
+    once the late closes in ``late`` have run (the 10s bound used throughout)."""
+    if late:
+        await asyncio.wait(late, timeout=10.0)
+    if remote_browser is not None:
         try:
-            await asyncio.wait_for(_remote_browser.close(), timeout=10.0)
+            await asyncio.wait_for(remote_browser.close(), timeout=10.0)
         except TimeoutError:
             logger.warning("Remote CDP disconnect timed out (10s)")
         except Exception:
             logger.debug("Remote CDP cleanup failed", exc_info=True)
-        _remote_browser = None
-        _remote_page = None
 
-    if _remote_pw is not None:
+    if remote_pw is not None:
         try:
-            await asyncio.wait_for(_remote_pw.stop(), timeout=10.0)
+            await asyncio.wait_for(remote_pw.stop(), timeout=10.0)
         except TimeoutError:
             logger.warning("Remote Playwright stop timed out (10s)")
         except Exception:
             logger.debug("Remote Playwright cleanup failed", exc_info=True)
-        _remote_pw = None
-
-    _remote_last_url = None
 
 
 async def _ensure_remote_cdp(cdp_url: str | None = None):
@@ -562,9 +636,10 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
             and _is_page_alive(_remote_page)
         ):
             return _remote_page
-        # Anything left over (a dropped connection keeps its Playwright driver)
-        # is released before connecting again, or it would be orphaned.
-        if _layer_open(BrowserLayer.REMOTE_CDP):
+        # Any leftover handle (a disconnect event or _detach_dead_remote clears
+        # only some of them) is closed now: the publish below would otherwise
+        # overwrite it and leak its driver.
+        if _remote_pw is not None or _remote_browser is not None:
             logger.warning("Remote CDP connection stale — cleaning up")
             await _cleanup_remote_cdp()
 
@@ -581,14 +656,31 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
 
         from playwright.async_api import async_playwright
 
-        _remote_pw = await async_playwright().start()
+        # The attempt is built in locals and published to the globals only once
+        # it has a tab, so a failed or cancelled attempt is cleaned up through
+        # its own handles and never touches another connection's state.
+        pw = await _open_or_close_late(
+            async_playwright().start(), lambda p: _close_remote_handles(None, p)
+        )
         try:
-            _remote_browser = await asyncio.wait_for(
-                _remote_pw.chromium.connect_over_cdp(url), timeout=30.0
+            remote_browser = await asyncio.wait_for(
+                pw.chromium.connect_over_cdp(url), timeout=30.0
             )
-        except TimeoutError:
-            await _remote_pw.stop()
-            _remote_pw = None
+        except BaseException as e:
+            # Failed or cancelled mid-connect (the tool timeout, a client
+            # cancel): stop this driver, or the next call starts another and
+            # this one leaks.
+            await _shielded(_close_remote_handles(None, pw))
+            if not isinstance(e, Exception):
+                raise
+            if not isinstance(e, TimeoutError):
+                raise ConnectionError(
+                    f"Cannot connect to Chrome at {url}. Error: {e}\n\n"
+                    "Check:\n"
+                    "  1. Chrome is running with --remote-debugging-port=9222\n"
+                    "  2. Tailscale is connected on both machines\n"
+                    "  3. Windows firewall allows port 9222 from Tailscale"
+                ) from e
             raise ConnectionError(
                 f"CDP connection to {url} timed out after 30s. "
                 "The remote machine may be asleep or unreachable.\n\n"
@@ -596,41 +688,28 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
                 "  1. The machine is awake and on Tailscale\n"
                 "  2. Chrome is running with --remote-debugging-port=9222"
             ) from None
-        except Exception as e:
-            await _remote_pw.stop()
-            _remote_pw = None
-            raise ConnectionError(
-                f"Cannot connect to Chrome at {url}. Error: {e}\n\n"
-                "Check:\n"
-                "  1. Chrome is running with --remote-debugging-port=9222\n"
-                "  2. Tailscale is connected on both machines\n"
-                "  3. Windows firewall allows port 9222 from Tailscale"
-            ) from e
-        except BaseException:
-            # Cancelled mid-connect (the tool timeout, a client cancel): stop
-            # this driver, or the next call starts another and this one leaks.
-            await asyncio.shield(_remote_pw.stop())
-            _remote_pw = None
-            raise
 
         _remote_cdp_url = url
-        _remote_browser.on("disconnected", lambda: _on_remote_disconnected())
+        late: list = []
+        remote_browser.on("disconnected", lambda: _on_remote_disconnected(remote_browser))
         try:
-            _remote_page = await _genesis_remote_tab(_remote_browser)
+            page = await _genesis_remote_tab(remote_browser, url, late)
         except BaseException as e:
             # Connected but no usable tab (Chrome closed, the context refused a
             # page, or the tool timeout cancelled the call): disconnect and stop
             # this driver now, or the next attempt starts another and the first
-            # leaks. _remote_target_id is kept, so a retry still reuses the
+            # leaks. _remote_target_ids is kept, so a retry still reuses the
             # Genesis tab if it exists. The cleanup is shielded so a cancellation
             # cannot cut it short.
-            await asyncio.shield(_cleanup_remote_cdp())
+            await _shielded(_close_remote_handles(remote_browser, pw, late))
             if not isinstance(e, Exception):
                 raise  # cancellation / interpreter exit: propagate as is
             raise ConnectionError(
                 f"Connected to Chrome at {url} but could not open the Genesis tab: {e}"
             ) from e
-        return _remote_page
+        # No await between the tab lookup returning and this publish.
+        _remote_pw, _remote_browser, _remote_page = pw, remote_browser, page
+        return page
 
 
 async def _cdp_target_id(page) -> str | None:
@@ -645,37 +724,64 @@ async def _cdp_target_id(page) -> str | None:
         return info["targetInfo"]["targetId"]
     except Exception:
         # Warning, not debug: on a reconnect probe a None means this tab cannot
-        # be matched, so if it was the Genesis tab another one gets opened.
+        # be matched, which fails the connect if it was the Genesis tab.
         logger.warning("Could not read the CDP target id of a remote tab", exc_info=True)
         return None
 
 
-async def _genesis_remote_tab(remote_browser):
-    """Return Genesis's own tab in the user's Chrome, opening it if needed.
+async def _remote_target_exists(remote_browser, target_id: str) -> bool:
+    """Whether Chrome still has the target ``target_id`` (one browser-level
+    ``Target.getTargets``). Raises ConnectionError when that cannot be told:
+    the caller must not open a second Genesis tab on a guess."""
+    try:
+        session = await remote_browser.new_browser_cdp_session()
+        try:
+            reply = await session.send("Target.getTargets")
+        finally:
+            with contextlib.suppress(Exception):
+                await session.detach()
+        return any(t["targetId"] == target_id for t in reply["targetInfos"])
+    except Exception as e:
+        raise ConnectionError(
+            f"could not check whether the Genesis tab is still open, so no second one was opened: {e}"
+        ) from e
 
-    One Genesis tab per session (owner ruling): the user's tabs are never
-    navigated. A tab opened earlier is found again by its CDP target id and
-    reused; if the user closed it, a new one is opened. Genesis never closes
-    it: the user may still be reading it. The one exception is a tab just
+
+async def _genesis_remote_tab(remote_browser, url: str, late: list | None = None):
+    """Return Genesis's own tab in the Chrome at ``url``, opening it if needed.
+
+    One Genesis tab per session and endpoint (owner ruling): the user's tabs
+    are never navigated. A tab opened earlier is found again by its CDP target
+    id (remembered per CDP URL) and reused; if Chrome no longer has it (the user closed it), a new one is
+    opened. If whether it still exists cannot be told, or it exists but cannot
+    be attached, the connect fails rather than open a duplicate. Genesis never
+    closes it: the user may still be reading it. The one exception is a tab just
     opened whose target id cannot be read (or whose lookup is cancelled): it
     could never be found again, so each reconnect would open another, and it
-    is still blank. It is closed and the connect fails.
+    is still blank. It is closed and the connect fails. A tab whose open is
+    cancelled is closed once it arrives (see _open_or_close_late).
 
     The tab opens in the context that already holds the user's tabs.
     ``browser.new_context()`` is the last resort only, because over CDP its
     pages render in an invisible off-screen window.
     """
-    global _remote_target_id
-
+    known_id = _remote_target_ids.get(url)
     contexts = list(remote_browser.contexts)
-    if _remote_target_id is not None:
+    if known_id is not None and await _remote_target_exists(remote_browser, known_id):
         for ctx in contexts:
             # Newest first: the Genesis tab was opened after the user's tabs,
             # so this usually finds it without probing every user tab.
             for pg in reversed(ctx.pages):
-                if await _cdp_target_id(pg) == _remote_target_id:
+                if await _cdp_target_id(pg) == known_id:
                     logger.info("CDP remote connected, reusing the Genesis tab: %s", pg.url)
                     return pg
+        # Chrome still has the tab, but no page probe matched it (a probe
+        # failed, or Playwright does not list it): opening another would
+        # leave two Genesis tabs.
+        raise ConnectionError(
+            "the Genesis tab is still open in Chrome but could not be attached; "
+            "retry, or close that tab so a new one is opened"
+        )
 
     def _rank(ctx) -> int:
         # A context showing an ordinary web or browser page first, then one
@@ -695,15 +801,21 @@ async def _genesis_remote_tab(remote_browser):
             "may not be visible on the user's screen"
         )
         home = await remote_browser.new_context()
-    page = await home.new_page()
+    page = await _open_or_close_late(home.new_page(), lambda pg: pg.close(), late)
     target_id = None
     try:
         target_id = await _cdp_target_id(page)
     finally:
         if target_id is None:
-            # Shielded so a cancellation cannot cut the close short.
+            # Shielded so a cancellation cannot cut the close short, and bounded
+            # so a wedged CDP connection cannot hold the caller: in a finally
+            # under cancellation nothing else interrupts this await, and
+            # wait_for in the tool timeout waits for it. The retained close
+            # keeps running past the bound (async_cleanup drains it).
             try:
-                await asyncio.shield(page.close())
+                await asyncio.wait_for(
+                    _shielded(page.close()), timeout=_UNIDENTIFIED_TAB_CLOSE_BOUND_S
+                )
             except Exception:
                 logger.warning("Could not close an unidentified remote tab", exc_info=True)
     if target_id is None:
@@ -711,8 +823,8 @@ async def _genesis_remote_tab(remote_browser):
             "opened a tab but could not read its CDP target id, so it could not "
             "be found again; closed it"
         )
-    _remote_target_id = target_id
-    logger.info("CDP remote connected, opened a Genesis tab (target %s)", _remote_target_id)
+    _remote_target_ids[url] = target_id
+    logger.info("CDP remote connected, opened a Genesis tab (target %s)", target_id)
     return page
 
 
@@ -1137,19 +1249,36 @@ async def _ensure_vnc():
                 started = True
                 logger.info("Started genesis-vnc + genesis-novnc via systemctl")
         except Exception:
-            # Fallback: start x11vnc directly if systemctl unavailable
+            # Fallback: start x11vnc directly if systemctl unavailable.
+            # The fallback keeps password authentication, like the unit: with
+            # no usable password file it starts nothing and says why. x11vnc
+            # reads the first 8 bytes (what -storepasswd writes); given a
+            # directory, a shorter or an unreadable file it still listens, but
+            # no password can pass until the file is fixed.
+            vnc_passwd = Path.home() / ".genesis" / "vnc_passwd"
+            try:
+                usable = (
+                    vnc_passwd.is_file()
+                    and vnc_passwd.stat().st_size >= 8
+                    and os.access(vnc_passwd, os.R_OK)
+                )
+            except OSError:
+                usable = False
+            if not usable:
+                logger.warning(
+                    "VNC fallback not started: %s is missing or unusable (a "
+                    "readable file of at least 8 bytes), and the fallback keeps "
+                    "password authentication. Remove an unusable one and run "
+                    "scripts/setup-vnc.sh to create it.",
+                    vnc_passwd,
+                )
+                return
             try:
                 import subprocess as _sp2
 
-                vnc_passwd = Path.home() / ".genesis" / "vnc_passwd"
-                auth_arg = (
-                    ["-rfbauth", str(vnc_passwd)]
-                    if vnc_passwd.exists()
-                    else ["-nopw"]
-                )
                 _sp2.Popen(
                     ["x11vnc", "-display", _VNC_DISPLAY, "-forever", "-shared",
-                     "-rfbport", "5999", "-bg"] + auth_arg,
+                     "-rfbport", "5999", "-bg", "-rfbauth", str(vnc_passwd)],
                     stdout=_sp2.DEVNULL, stderr=_sp2.DEVNULL,
                 )
                 started = True
@@ -1224,6 +1353,11 @@ def _requested_layer(stealth: bool, remote: bool, tinyfish: bool) -> BrowserLaye
     if remote:
         return BrowserLayer.REMOTE_CDP
     return BrowserLayer.CAMOUFOX if stealth else BrowserLayer.CHROMIUM
+
+
+# Prefixes of the text _snapshot_page returns when there is no snapshot. An
+# aria snapshot is YAML ("- heading ..."), so it never starts with "(".
+_SNAPSHOT_PLACEHOLDERS = ("(snapshot timed out", "(snapshot unavailable")
 
 
 # Prefixes of the text _snapshot_page returns when there is no snapshot. An
@@ -2897,6 +3031,7 @@ async def _impl_browser_screenshot() -> dict:
 
 async def _impl_browser_snapshot() -> dict:
     """Return the accessibility tree snapshot of the current page."""
+    global _remote_last_url
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -3041,7 +3176,9 @@ async def browser_navigate(
     session, reused on reconnect, never closed; the user's tabs are not
     touched). Real Chrome fingerprint and the user's IP, but not invisible:
     CDP control is itself detectable and clicks are not humanized. Remote
-    actions always use collaborate timing (0.5-2 s); the setting is untouched.
+    clicks, fills and uploads wait 0.5-2 s first (collaborate timing);
+    navigation, key presses and run_js are not paced. The collaborate setting
+    is untouched.
     Use when fingerprint scoring blocks Camoufox and the user is available.
 
     Set tinyfish=True for a cloud-hosted browser via TinyFish Browser API.
@@ -3061,7 +3198,9 @@ async def browser_navigate(
     unresolved, it sends a Telegram alert (when configured) and returns
     turnstile.status == "blocked". This can take most of the 300 s timeout.
     """
-    # Remote CDP: bounded by 30s connect + 30s goto = 60s ceiling.
+    # Remote CDP: 60s for the connect (at most 30s), the tab lookup and the
+    # goto (at most 30s). A timeout cancels the call; its shielded cleanup
+    # finishes on its own.
     # Camoufox: Turnstile VNC resolution can take up to 5 minutes.
     timeout = _TOOL_TIMEOUT_S if remote else 300.0
     return await _with_tool_timeout(
@@ -3252,8 +3391,8 @@ def _impl_browser_collaborate(enable: bool = True) -> dict:
     }
     if _is_remote_active():
         result["remote_note"] = (
-            "Remote CDP session active — collaborate timing is always used "
-            "regardless of this setting (user watching their own screen)."
+            "Remote CDP session active — remote clicks, fills and uploads "
+            "always use collaborate timing, regardless of this setting."
         )
     return result
 

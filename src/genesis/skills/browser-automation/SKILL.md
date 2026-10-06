@@ -58,29 +58,32 @@ so after a failure take the layer from the call you made.
 - What it gives: a real Chrome fingerprint and the user's IP. What it does not
   give: invisibility. Driving Chrome over CDP is itself detectable, and clicks
   are not humanized (no cursor trail).
-- **It drives a tab the user already has open: the first page Playwright
-  lists in that Chrome (often, not reliably, the oldest tab)**, and navigates
-  it. Opening a spare tab does not protect the user's work. Before the first
-  remote navigate, ask the user to make the only (or first) tab one they do
-  not need.
-  Disconnecting never closes their Chrome or the tab.
+- **It works in a tab of its own.** The first remote navigate opens one
+  Genesis tab in the window that holds the user's tabs; the user's own tabs
+  are never navigated. Within a session a reconnect finds that tab again and
+  reuses it; a new session opens a new one. Genesis never closes it.
+  If Genesis cannot tell whether its tab is still open, the connect fails
+  rather than open a second one: retry, or close that tab.
+  Disconnecting never closes their Chrome or any tab.
 - Logged-in state is whatever the user logged into inside the dedicated CDP
   profile (Chrome 136+ forbids remote debugging of the main profile), not the
   user's everyday sessions.
-- **Any `remote=True` call switches collaborate (fast) timing on and nothing
-  switches it off automatically.** Before returning to stealth work in
-  Camoufox, call `browser_collaborate(False)`.
+- Remote clicks, fills and uploads wait 0.5-2 s first (collaborate timing) on
+  their own; navigation, key presses and `browser_run_js` are not paced. A
+  remote call never changes the `browser_collaborate` setting, so later
+  Camoufox work keeps whatever timing was set.
 - Drift guard: if the URL differs from the one recorded at Genesis's last
-  navigate, click, fill or run_js, click/fill/upload refuse with an `advisory`.
+  navigate, click, fill, run_js or snapshot, click/fill/upload refuse with an `advisory`.
   `browser_press_key` and `browser_upload` never update the recorded URL, so
   the advisory also fires after Genesis's own `browser_press_key("Enter")`
   submits a form, or after the page redirects itself, not only when the user
   clicked something.
-  `browser_snapshot()` shows the page but does NOT clear the advisory. After
-  reading the snapshot, re-sync with `browser_run_js("location.href")`: it
-  skips the drift check and records the current URL, without a reload. Only
-  if that fails, `browser_navigate(<current url>, remote=True)`, which reloads
-  the page and loses unsaved input.
+  `browser_snapshot()` re-syncs it: a remote snapshot records the page's URL
+  as seen, unless the snapshot failed or the URL changed while it was taken.
+  If the advisory persists after a snapshot, `browser_run_js("location.href")`
+  also records the current URL without a reload; only if that fails,
+  `browser_navigate(<current url>, remote=True)`, which reloads the page and
+  loses unsaved input.
 - Use it when Camoufox is blocked by fingerprint-based scoring (for example
   reCAPTCHA v3 on an ATS) and the user is available.
 
@@ -359,7 +362,7 @@ under about 20 navigations per task.
 | `Ambiguous selector` | Narrow the selector. |
 | `... timed out after N s. Browser state was reset` | Navigate again; form input is lost. Long fill: see "Long text". |
 | `Browser not available`, or an error saying Camoufox is not installed or telling you to run `camoufox fetch` | Browser packages or the Camoufox engine missing on this install; tell the user. Do not run `camoufox fetch`. |
-| `advisory: Page state changed` (remote) | The URL differs from the one recorded at Genesis's last navigate, click, fill or run_js: the user moved the tab, a `browser_press_key` submitted a form, or the page redirected itself. Snapshot, then re-sync with `browser_run_js("location.href")` (no reload). |
+| `advisory: Page state changed` (remote) | The URL differs from the one recorded at Genesis's last navigate, click, fill, run_js or snapshot: the user moved the tab, a `browser_press_key` submitted a form, or the page redirected itself. `browser_snapshot()` shows the page and re-syncs the URL; if the advisory persists, `browser_run_js("location.href")` (no reload). |
 | `Remote Chrome connection lost` | Chrome closed or machine asleep. Ask the user to restart it with the flag. |
 | `turnstile.status: blocked` | Hand off to the user or stop. See `stealth-browser`. |
 | Element not found | Different selector, iframe, not yet rendered (snapshot again), below a lazy-load boundary. |
