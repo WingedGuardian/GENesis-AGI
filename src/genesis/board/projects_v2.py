@@ -453,10 +453,12 @@ async def set_view_filter(view_id: str, filter_: str, *, runner: Runner | None =
 
 
 # ─── item operations (the reconciler's surface) ─────────────────────────────
-# GROUNDWORK(board-reconciler): set_text / list_items are the board
-# reconciler's read and Genesis-field surface (the next board PR: it adds every
-# open repo issue, makes the one bookkeeping move, and projects the Genesis
-# status). Verified live against a private sandbox project.
+# list_items / repo_open_counts / card_for_issue are the read-only reconciler's
+# and board_item's reads (board.reconciler, mcp.health.board_tools).
+# GROUNDWORK(board-reconciler-writes): set_text is the Genesis-note surface of
+# the reconciler's write half (backfill, the In Review move, the Genesis-field
+# projection), which ships behind ``live`` in the next board PR. Verified live
+# against a private sandbox project.
 
 
 # GROUNDWORK(board-reconciler-writes): issue_node_id / add_item / item_status /
@@ -553,3 +555,88 @@ async def list_items(project_id: str, *, runner: Runner | None = None) -> dict:
     if len(items) != total:
         raise ProjectsError(f"read {len(items)} items but the project reports {total}")
     return {"items": items, "total": total}
+
+
+async def repo_open_counts(owner: str, name: str, *, runner: Runner | None = None) -> dict:
+    """``{"issues", "pull_requests"}`` OPEN in the repo, from GitHub's own
+    totals: the coverage denominator (cost 1 point, MEASURED 2026-10-04)."""
+    data = await graphql(
+        "query($o: String!, $n: String!) { repository(owner: $o, name: $n) {"
+        " issues(states: OPEN) { totalCount } pullRequests(states: OPEN) { totalCount } } }",
+        {"o": owner, "n": name},
+        runner=runner,
+    )
+    repo = data.get("repository")
+    if not repo:
+        raise ProjectsError(f"no repository {owner}/{name}")
+    return {
+        "issues": repo["issues"]["totalCount"],
+        "pull_requests": repo["pullRequests"]["totalCount"],
+    }
+
+
+_CARD_QUERY = """
+query($o: String!, $n: String!, $i: Int!) { repository(owner: $o, name: $n) {
+  issueOrPullRequest(number: $i) {
+    __typename
+    ... on Issue { number state
+      projectItems(first: 100, includeArchived: false) { totalCount nodes { isArchived project { number owner { ... on User { login } ... on Organization { login } } }
+        status: fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name updatedAt } }
+        genesis: fieldValueByName(name: "Genesis") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } }
+      blockedBy(first: 20) { totalCount nodes { number state repository { nameWithOwner } } } }
+    ... on PullRequest { number state
+      projectItems(first: 100, includeArchived: false) { totalCount nodes { isArchived project { number owner { ... on User { login } ... on Organization { login } } }
+        status: fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name updatedAt } }
+        genesis: fieldValueByName(name: "Genesis") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } } }
+  } } }
+"""
+
+
+async def card_for_issue(
+    owner: str, name: str, number: int, *, runner: Runner | None = None
+) -> dict:
+    """One issue's or PR's board state, live: its unarchived cards (one per
+    project it is on, each with its Status and Genesis values), and for an issue
+    its ``blockedBy`` list. Both lists are capped by GitHub's page size (100
+    cards, 20 blockers), so each carries a total and a ``*_truncated`` flag
+    rather than passing a short list off as the whole. (Pull requests have no
+    ``blockedBy``; MEASURED by schema introspection 2026-10-04.)"""
+    data = await graphql(_CARD_QUERY, {"o": owner, "n": name, "i": number}, runner=runner)
+    node = (data.get("repository") or {}).get("issueOrPullRequest")
+    if not node:
+        raise ProjectsError(f"no issue or PR #{number} in {owner}/{name}")
+    items = node.get("projectItems") or {"totalCount": 0, "nodes": []}
+    cards = [
+        {
+            "project_owner": ((n.get("project") or {}).get("owner") or {}).get("login"),
+            "project_number": (n.get("project") or {}).get("number"),
+            "status": (n.get("status") or {}).get("name"),
+            "status_updated_at": (n.get("status") or {}).get("updatedAt"),
+            "genesis": (n.get("genesis") or {}).get("name"),
+        }
+        for n in items["nodes"]
+        # includeArchived defaults to TRUE on projectItems (MEASURED by schema
+        # introspection 2026-10-06); the query passes false, and an archived
+        # card that slips through anyway is still not the item's live card.
+        if n and not n.get("isArchived")
+    ]
+    blocked = node.get("blockedBy") or {"totalCount": 0, "nodes": []}
+    blockers = [
+        {
+            "number": b["number"],
+            "state": b["state"],
+            "repo": (b.get("repository") or {}).get("nameWithOwner"),
+        }
+        for b in blocked["nodes"]
+        if b
+    ]
+    return {
+        "kind": node["__typename"],
+        "number": node["number"],
+        "state": node["state"],
+        "cards": cards,
+        "cards_truncated": items["totalCount"] > len(cards),
+        "blocked_by": blockers,
+        "blocked_by_total": blocked["totalCount"],
+        "blockers_truncated": blocked["totalCount"] > len(blockers),
+    }

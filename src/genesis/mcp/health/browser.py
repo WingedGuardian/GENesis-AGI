@@ -972,19 +972,36 @@ async def _ensure_vnc():
                 started = True
                 logger.info("Started genesis-vnc + genesis-novnc via systemctl")
         except Exception:
-            # Fallback: start x11vnc directly if systemctl unavailable
+            # Fallback: start x11vnc directly if systemctl unavailable.
+            # The fallback keeps password authentication, like the unit: with
+            # no usable password file it starts nothing and says why. x11vnc
+            # reads the first 8 bytes (what -storepasswd writes); given a
+            # directory, a shorter or an unreadable file it still listens, but
+            # no password can pass until the file is fixed.
+            vnc_passwd = Path.home() / ".genesis" / "vnc_passwd"
+            try:
+                usable = (
+                    vnc_passwd.is_file()
+                    and vnc_passwd.stat().st_size >= 8
+                    and os.access(vnc_passwd, os.R_OK)
+                )
+            except OSError:
+                usable = False
+            if not usable:
+                logger.warning(
+                    "VNC fallback not started: %s is missing or unusable (a "
+                    "readable file of at least 8 bytes), and the fallback keeps "
+                    "password authentication. Remove an unusable one and run "
+                    "scripts/setup-vnc.sh to create it.",
+                    vnc_passwd,
+                )
+                return
             try:
                 import subprocess as _sp2
 
-                vnc_passwd = Path.home() / ".genesis" / "vnc_passwd"
-                auth_arg = (
-                    ["-rfbauth", str(vnc_passwd)]
-                    if vnc_passwd.exists()
-                    else ["-nopw"]
-                )
                 _sp2.Popen(
                     ["x11vnc", "-display", _VNC_DISPLAY, "-forever", "-shared",
-                     "-rfbport", "5999", "-bg"] + auth_arg,
+                     "-rfbport", "5999", "-bg", "-rfbauth", str(vnc_passwd)],
                     stdout=_sp2.DEVNULL, stderr=_sp2.DEVNULL,
                 )
                 started = True

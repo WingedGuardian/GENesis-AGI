@@ -472,6 +472,7 @@ def test_launcher_env_omits_an_absent_key_rather_than_emptying_it(monkeypatch):
     assert _launcher_env()["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/12345/bus"
 
 
+@pytest.mark.user_manager  # a transient --user scope; the conftest fence keeps the bus for it
 def test_real_scope_applies_memory_max(tmp_path):
     if not _user_scope_works():
         pytest.skip("no --user scope with MemoryMax available under the launcher's env")
