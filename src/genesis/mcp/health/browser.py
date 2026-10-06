@@ -2581,7 +2581,7 @@ async def browser_navigate(
     turnstile.status == "blocked". This can take most of the 300 s timeout.
     """
     # Remote CDP: bounded by 30s connect + 30s goto = 60s ceiling.
-    # Camoufox: Turnstile VNC resolution can take up to 5 minutes.
+    # Camoufox / Chromium: challenge handling can take most of 300 s.
     timeout = _TOOL_TIMEOUT_S if remote else 300.0
     return await _with_tool_timeout(
         _impl_browser_navigate(url, stealth, remote=remote, cdp_url=cdp_url, tinyfish=tinyfish),
