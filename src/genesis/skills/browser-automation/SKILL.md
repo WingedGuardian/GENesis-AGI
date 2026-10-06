@@ -73,7 +73,7 @@ so after a failure take the layer from the call you made.
   remote call never changes the `browser_collaborate` setting, so later
   Camoufox work keeps whatever timing was set.
 - Drift guard: if the URL differs from the one recorded at Genesis's last
-  navigate, click, fill or run_js, click/fill/upload refuse with an `advisory`.
+  navigate, click, fill, run_js or snapshot, click/fill/upload refuse with an `advisory`.
   `browser_press_key` and `browser_upload` never update the recorded URL, so
   the advisory also fires after Genesis's own `browser_press_key("Enter")`
   submits a form, or after the page redirects itself, not only when the user
@@ -361,7 +361,7 @@ under about 20 navigations per task.
 | `Ambiguous selector` | Narrow the selector. |
 | `... timed out after N s. Browser state was reset` | Navigate again; form input is lost. Long fill: see "Long text". |
 | `Browser not available`, or an error saying Camoufox is not installed or telling you to run `camoufox fetch` | Browser packages or the Camoufox engine missing on this install; tell the user. Do not run `camoufox fetch`. |
-| `advisory: Page state changed` (remote) | The URL differs from the one recorded at Genesis's last navigate, click, fill or run_js: the user moved the tab, a `browser_press_key` submitted a form, or the page redirected itself. `browser_snapshot()` shows the page and re-syncs the URL; if the advisory persists, `browser_run_js("location.href")` (no reload). |
+| `advisory: Page state changed` (remote) | The URL differs from the one recorded at Genesis's last navigate, click, fill, run_js or snapshot: the user moved the tab, a `browser_press_key` submitted a form, or the page redirected itself. `browser_snapshot()` shows the page and re-syncs the URL; if the advisory persists, `browser_run_js("location.href")` (no reload). |
 | `Remote Chrome connection lost` | Chrome closed or machine asleep. Ask the user to restart it with the flag. |
 | `turnstile.status: blocked` | Hand off to the user or stop. See `stealth-browser`. |
 | Element not found | Different selector, iframe, not yet rendered (snapshot again), below a lazy-load boundary. |
