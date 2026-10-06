@@ -3084,7 +3084,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   (⚠ it defaulted to the maximal `code-review` + `leaks` until the default was
   narrowed, so a discard there TIGHTENED — it now narrows instead, and likewise
   prints a NOTE when the key was visibly declared). The floor survives every
-  discard: `leaks` is irreducible. The rule below
+  discard: `leaks` is irreducible by config (its one exemption is per PR, for an
+  outside contribution; see Pre-Merge Gate). The rule below
   keys on this:
   - **`--source internal` (the default)** — a same-model self / genesis-architect /
     genesis-security / any-subagent review. It is free and shares the author-model's
@@ -3607,6 +3608,31 @@ Verify before any commit:
   private DM leaked via a test docstring + a code comment after the commit
   message and PR body were already clean.)
 - GROUNDWORK-tagged code not accidentally deleted
+- **PR shape, after your last commit and before opening the PR (#2737; owner,
+  2026-10-05).** It reads committed history, so staged changes are not counted:
+  commit first. Count the branch in counted lines, which excludes tests, prose,
+  changelog fragments, and blank and comment lines, and counts a moved line
+  once:
+
+      # from the repo root, after `git fetch origin main`; a stacked PR passes its parent branch as --base.
+      python3 scripts/pr_shape.py --base origin/main
+
+  It prints `<counted> <band>`. It reads the diff through the same hardened git
+  runner the review gates use, and exits 2 on a git error, so a failed diff never
+  reads as `0 ok`. Use this command, not a hand-written `git diff | count_diff`:
+  an attributes file, a textconv driver or a replace ref can each shrink a raw
+  diff at exit 0.
+
+  - Under 500 is the target.
+  - From 500 to 1,000, add a `Shape:` line to the PR body saying why it
+    cannot be smaller.
+  - Over 1,000 needs the owner's approval: ask in the PR body; the owner
+    decides before merge.
+
+  It is a guideline you weigh, not a wall: a legitimate reason, stated, is
+  enough. Prefer one concern per PR (one mechanism or behaviour change a
+  reviewer can accept or reject alone); that too is weighed.
+  Full rule: `.claude/docs/premise-check.md`, step 6.
 - New capabilities registered in `_capabilities.py` + bootstrap manifest
 - **Conventional commit prefixes**: `feat:`, `fix:`, `refactor:`, `docs:`,
   `test:`, `chore:`. Scope optional: `feat(ego): add cadence manager`.
@@ -3999,6 +4025,85 @@ successor in a comment and leave the PR open.
 If you believe any other PR should be retired and nobody is picking it up, that
 is a question for the user, not a judgment call for the review station.
 
+### Building a rework — report against the spec (standing owner rule, 2026-10-05)
+
+A PR sent back with `needs-rework`, or a `needs-architecture-session` PR whose
+owner decision has since been posted as a rework spec, carries that spec: a
+maintainer comment headed `## Rework spec`, plus any design issue it names. An
+audit or proposal without that heading is not a spec, and a
+`needs-architecture-session` PR with no posted spec has an undecided design; do
+not build it. Its contract is in
+`.claude/docs/premise-check.md`, "Handing a verdict to a builder". The session
+that takes up the rework is the reviving session above, and it owns the following:
+
+0. **Acknowledge the spec on the OLD PR before building.** Post one comment
+   there with:
+   - the spec as you understood it, in your own words;
+   - the split you will build;
+   - every question you need answered before you start.
+
+   Head it `## Rework acknowledgement`, and open no PR, not even a draft, until
+   it is posted. If it asks no questions, proceed once it is posted; otherwise
+   wait for an answer on the old PR, from the closing session or the owner. On
+   a Devin-built old PR, put `(aside)` on the first line and the heading under
+   it, or the comment starts a paid Devin session. Post it with
+   `gh api repos/<o>/<r>/issues/<N>/comments -F body=@<file>`: on a PR past
+   its terminal round the push guard reads a `gh pr comment` whose body it
+   cannot see (`--body-file`, or an inline body with a backtick or `$`) as a
+   possible `@codex review` request, which asks in the foreground and is
+   refused in a dispatched session. A question answered before building is cheap; the
+   same question answered silently inside the build is how a rebuild drifts. No
+   acknowledgement means nobody can tell whether the spec was read at all.
+1. **New PRs, by default.** The rework arrives as one or more NEW PRs, with fresh
+   round counts. When the LAST one opens, whoever opened it closes the old PR
+   with a comment that maps every part of it, file by file, to the `file:line`
+   in the replacement
+   that covers it, or says why that part is moot. If any part is neither,
+   leave the old PR open with a comment naming that part. Leave its labels on,
+   so the rebuild stays traceable to it. If the spec carries a
+   `Follow-up: <id>` line, copy it into the body of the replacement that will
+   merge into main LAST, so the follow-up closes only when the whole rework
+   has landed. A merge into any other base completes the marker too, so never
+   put it on a PR that merges into another PR. Reworking under the old number
+   happens only when the owner grants it. Devin builds a rework as fresh PR(s)
+   too, and never closes the old PR; the closing session does, after the same
+   coverage check (closing-session, "Devin-built PRs").
+2. **Follow the split.** If the spec has a `PR-shape: SPLIT` plan, open those PRs.
+   Each one carries one concern and names the PRs it depends on. Open them in
+   dependency order against main; a PR whose dependency has not merged waits as
+   a branch, or opens stacked with its base named. Being a rework is not itself
+   a reason to stay unsplit, and a better split is a deviation (item 4), not a
+   reason to skip splitting. If the spec has no split, size each PR by the rule
+   in `.claude/docs/premise-check.md` step 6: under 500 counted lines is the
+   target, and a `Shape:` line states why one cannot be smaller. Split a PR that
+   carries more than one concern.
+3. **Answer the delegated questions** in the PR body, each with your reasoning.
+   If you hit a question the spec should have answered and did not, answer it
+   the same way and mark it as missing from the spec. Do not resolve it
+   silently in the most defensive direction: a fail-closed answer is still a
+   design decision, and it can force machinery the spec never asked for.
+4. **Report every deviation.** Unforeseen complications are expected; an
+   unexplained deviation is not. The body of each replacement PR carries:
+
+   ```
+   ## Rework
+   Replaces: #N (spec: <link to the `## Rework spec` comment>; acknowledged: <link to your item-0 comment>)
+   Split: PR k of n (<the other PRs, by number or concern>)
+   Kept / deleted / reshaped as the spec asked: <one line each, or "as specified">
+   Deviations: <each: what differs from the spec, and the complication that forced it> | none
+   Questions answered: <each delegated or missing question: the answer and why>
+   ```
+
+The closing session reads this section before it spends a review round. A
+deviation with a stated reason goes to the owner as a design question. A missing
+section, an unexplained deviation, or an unsplit PR the spec split goes back to
+you before review. Origin: a rebuild came back as one PR, +2,538 raw lines
+(881 counted, so inside the `shape` band; size was not the failure), with
+conditional rendering, an uninstall retention mode and an in-place settings
+writer, none of which its spec asked for, and with no note explaining any of
+them. Working out whether the spec or the build had failed cost the owner a
+session.
+
 ### Keep the PR the PR — adjacent findings become issues (standing user rule, 2026-09-09)
 
 **A review session's job is to get THAT PR merged.** Reviews routinely surface
@@ -4225,7 +4330,19 @@ findings below, a gated `gh pr merge`:
   names the PR's current head — so if any required routine never ran, ran on a stale
   commit, or was rate-limited, the merge blocks (naming the missing kinds). An ADVISORY
   routine still posts its review on the PR to be read/addressed, but its absence does not
-  block. The block message is an **inventory**, not a diagnosis: under each missing
+  block. **An outside contribution needs no `leaks` marker** (owner ruling 2026-10-05):
+  a fork PR opened by a human who is not OWNER, MEMBER or COLLABORATOR, at the current
+  head, whose every commit they authored (committer them or `web-flow`, no
+  `Co-authored-by:` trailer), whose title only they renamed, whose body only they or a
+  named review app (`_BODY_EDIT_REVIEW_APPS`) edited, and with CI's `leak-detector`
+  green at that head (on a fork it runs without its private-pattern step, which needs a
+  secret forks do not get). The review guards the owner's private data, which an
+  outsider's text cannot hold. A commit, a committed suggestion or a text edit of ours
+  puts the requirement back, a leaks review that ran and objected is never overruled,
+  `--check-pr` shows `leaks not required: outside contribution by <login>`, and a fork
+  PR the exemption could not clear says why in its block message
+  (`_outside_contribution`). Text written into the squash commit at merge time
+  (`gh pr merge --body`) is not covered, as before. The block message is an **inventory**, not a diagnosis: under each missing
   kind it lists EVERY marker block the scan found that names that kind, with its
   status, and hides nothing. Run `python3 scripts/hooks/git_push_guard.py --check-pr <N>`
   — it renders those
