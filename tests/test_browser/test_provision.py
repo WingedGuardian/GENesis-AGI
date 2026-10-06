@@ -17,6 +17,8 @@ No test downloads or launches anything: subprocess steps are stubbed.
 
 from __future__ import annotations
 
+import contextlib
+import importlib.metadata
 import json
 import os
 import signal
@@ -33,6 +35,7 @@ from genesis.browser import engine, provision
 
 _REAL_BROWSERS_RUNNING = provision.browsers_running
 _REAL_RUN_GROUP = provision._run_group
+_REAL_INSTALLED_VERSIONS = provision.installed_versions
 PIN = engine.CamoufoxPin("156.0.1", "beta.34", "official")
 
 
@@ -178,7 +181,9 @@ def test_stage_then_swap_keeps_the_legacy_engine_until_the_new_one_checks_out(
     assert not list(stack.parent.glob(".camoufox-staging-*"))
     # The root is now the new engine...
     assert (stack / ".0.5_FLAG").exists()
-    assert (stack / "browsers" / "official" / f"{PIN.version}-{PIN.build}" / "version.json").is_file()
+    assert (
+        stack / "browsers" / "official" / f"{PIN.version}-{PIN.build}" / "version.json"
+    ).is_file()
     # ...and the legacy engine was renamed aside, aged from today.
     aside = stack.with_name(f"camoufox.pre-0.5-{provision._stamp()}")
     assert (aside / "camoufox-bin").read_text() == "binary"
@@ -294,6 +299,104 @@ def test_a_set_override_is_reset_to_the_paired_build(stack, tmp_path, monkeypatc
     assert "engine=True" in outcome
 
 
+def test_a_failed_run_puts_the_camoufox_set_choice_back(stack, tmp_path, monkeypatch):
+    """Devin + Codex (#2952, #2953): `set --release` forgets channel, pinned,
+    pinned_sha and active_version; a rollback before the swap restored only
+    the packages, so the operator's choice was lost."""
+    stack.mkdir()
+    (stack / ".0.5_FLAG").touch()
+    choice = '{"channel": "official/prerelease", "pinned": "157.0-alpha.1"}'
+    (stack / "config.json").write_text(choice)
+    _versions(monkeypatch, {**NEW, "camoufox": "0.5.6"}, NEW)
+    fake = FakeRun()  # its fetch installs nothing: "not ready after fetch"
+
+    def run(cmd, **kw):
+        if cmd[1:5] == ["-m", "camoufox", "set", "--release"]:
+            (stack / "config.json").write_text("{}")
+        return fake(cmd, **kw)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert "engine=False" in outcome
+    assert (stack / "config.json").read_text() == choice
+
+
+def test_an_in_place_rollback_leaves_the_old_engine_selected(stack, tmp_path, monkeypatch):
+    """Review finding on this slice: the in-place fetch records the new engine
+    as active_version (multiversion.set_active) and leaves its directory, so a
+    rolled-back unpinned package went on selecting the new engine."""
+    stack.mkdir()
+    (stack / ".0.5_FLAG").touch()
+    old = stack / "browsers" / "official" / "150.0.2-beta.25"
+    old.mkdir(parents=True)
+    (old / "version.json").write_text(json.dumps({"version": "150.0.2", "release": "beta.25"}))
+    before = '{"active_version": "browsers/official/150.0.2-beta.25"}'
+    (stack / "config.json").write_text(before)
+    _versions(monkeypatch, {**NEW, "camoufox": "0.5.6"}, NEW)
+
+    def fetch(install_dir, env):
+        _install_pinned(install_dir)
+        (install_dir / "config.json").write_text(
+            json.dumps({"active_version": f"browsers/official/{PIN.version}-{PIN.build}"})
+        )
+
+    smoke_fails = [lambda cmd: cmd[1:2] == ["-c"] and "AsyncCamoufox" in cmd[2]]
+    monkeypatch.setattr(subprocess, "run", FakeRun(fetch=fetch, fail=smoke_fails))
+    outcome = _tx(tmp_path).run()
+    assert "launch=False" in outcome
+    assert (stack / "config.json").read_text() == before
+    assert sorted(p.name for p in (stack / "browsers" / "official").iterdir()) == [
+        "150.0.2-beta.25"
+    ]
+
+
+def test_a_failed_root_restore_still_restores_the_packages(stack, tmp_path, monkeypatch, capsys):
+    """Review finding on this slice: a failed config write (ENOSPC after a
+    2.4 GB fetch) stopped the package restore that follows it."""
+    stack.mkdir()
+    (stack / ".0.5_FLAG").touch()
+    (stack / "config.json").write_text('{"channel": "official/prerelease"}')
+    _versions(monkeypatch, {**NEW, "camoufox": "0.5.6"}, NEW)
+
+    def no_space(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(provision, "atomic_write_text", no_space)
+    run = FakeRun()
+    monkeypatch.setattr(subprocess, "run", run)
+    _tx(tmp_path).run()
+    assert [c[3] for c in run.pip_calls()] == ["install"]
+    assert "official/prerelease" in capsys.readouterr().out, "the choice is printed to re-apply"
+
+
+def test_a_truncated_pinned_engine_is_replaced_not_skipped(stack, tmp_path, monkeypatch):
+    """Codex (#2953): camoufox's fetch returns early when the version directory
+    and its version.json exist, so a truncated pinned engine was never repaired."""
+    stack.mkdir()
+    (stack / ".0.5_FLAG").touch()
+    truncated = stack / "browsers" / "official" / f"{PIN.version}-{PIN.build}-09effb44"
+    truncated.mkdir(parents=True)
+    (truncated / "version.json").write_text(
+        json.dumps({"version": PIN.version, "release": PIN.build})
+    )
+    # Another engine with no executable is not the pin's, so it stays.
+    other = stack / "browsers" / "official" / "150.0.2-beta.25"
+    other.mkdir(parents=True)
+    (other / "version.json").write_text(json.dumps({"version": "150.0.2", "release": "beta.25"}))
+
+    def fetch(install_dir, env):
+        # multiversion.install_versioned without replace: skip what is there.
+        if any((install_dir / "browsers" / "official").glob(f"{PIN.version}-{PIN.build}*")):
+            return
+        _install_pinned(install_dir)
+
+    monkeypatch.setattr(subprocess, "run", FakeRun(fetch=fetch))
+    outcome = _tx(tmp_path).run()
+    assert "engine=True" in outcome, outcome
+    assert not truncated.exists()
+    assert other.is_dir()
+
+
 def test_fetch_exit_zero_without_an_engine_is_a_failure(stack, tmp_path, monkeypatch):
     """Measured: `camoufox fetch` with no network exits 0 and installs nothing."""
     monkeypatch.setattr(subprocess, "run", FakeRun())
@@ -376,20 +479,44 @@ def test_an_in_place_engine_that_does_not_launch_rolls_the_packages_back(
     (stack / ".0.5_FLAG").touch()
     _versions(monkeypatch, {**NEW, "camoufox": "0.5.6"}, NEW)
     _write_caps({"browser_automation": {"status": "active", "description": "d"}})
-    run = FakeRun(fetch=_install_pinned, fail=[lambda cmd: cmd[1:2] == ["-c"] and "AsyncCamoufox" in cmd[2]])
+    run = FakeRun(
+        fetch=_install_pinned, fail=[lambda cmd: cmd[1:2] == ["-c"] and "AsyncCamoufox" in cmd[2]]
+    )
     monkeypatch.setattr(subprocess, "run", run)
     outcome = _tx(tmp_path).run()
     assert [c[3] for c in run.pip_calls()] == ["install"]
     assert "camoufox==0.5.6" in run.pip_calls()[0]
     assert "engine=True" in outcome and "launch=False" in outcome
-    assert "installed but did not launch" in outcome
+    # The root goes back to how it was (no engine): the old unpinned package
+    # must not go on to select the engine the failed run fetched.
+    assert not (stack / "browsers" / "official" / f"{PIN.version}-{PIN.build}").exists()
     caps = json.loads(provision.CAPABILITIES_FILE.read_text())
     assert caps["browser_automation"]["status"] == "degraded"
 
 
-def test_a_signal_during_the_swap_waits_and_keeps_the_new_packages(
+def test_a_swapped_engine_that_then_fails_to_launch_is_reported_installed(
     stack, tmp_path, monkeypatch
 ):
+    """After the swap the new packages stay (they match the engine in place), so
+    a failed final launch reports the engine installed but not launching."""
+    _legacy_engine(stack)
+    _versions(monkeypatch, OLD, NEW)
+    fake = FakeRun(fetch=_install_pinned)
+
+    def run(cmd, env=None, **kw):
+        staged = env is not None and ".camoufox-staging-" in env.get("XDG_CACHE_HOME", "")
+        if cmd[1:2] == ["-c"] and "AsyncCamoufox" in cmd[2] and not staged:
+            fake.calls.append((cmd, env))
+            return SimpleNamespace(returncode=1, stdout="", stderr="no display")
+        return fake(cmd, env=env, **kw)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert "launch=False" in outcome and "installed but did not launch" in outcome
+    assert fake.pip_calls() == []
+
+
+def test_a_signal_during_the_swap_waits_and_keeps_the_new_packages(stack, tmp_path, monkeypatch):
     """The renames run with signals held; the signal then lands after the swap,
     when the new packages are the ones that match the engine in place."""
     _legacy_engine(stack)
@@ -427,6 +554,7 @@ def test_a_launch_that_hangs_is_a_failed_launch(stack, tmp_path, monkeypatch, ca
     monkeypatch.setattr(subprocess, "run", run)
     assert _tx(tmp_path).smoke() is False
     assert "did not launch within" in capsys.readouterr().out
+
 
 # ── a ready engine ────────────────────────────────────────────────────────
 
@@ -466,6 +594,7 @@ def test_fetch_failure_leaves_the_legacy_root_untouched_and_restores_packages(
             "pip",
             "install",
             "--quiet",
+            "--no-deps",
             "camoufox==0.4.11",
             "playwright==1.58.0",
         ],
@@ -495,18 +624,84 @@ def test_restore_includes_patchright_when_it_was_installed(stack, tmp_path, monk
     _tx(tmp_path).run()
     assert run.pip_calls()[0][-3:] == [
         "camoufox==0.4.11",
-        "playwright==1.58.0",
         "patchright==1.58.0",
+        "playwright==1.58.0",
     ]
 
 
-def test_failure_with_no_previous_camoufox_does_not_call_pip(stack, tmp_path, monkeypatch):
-    _versions(monkeypatch, {}, NEW)
+def test_failure_with_no_previous_camoufox_still_restores_the_rest(stack, tmp_path, monkeypatch):
+    """Review finding (#2951, #2952, #2953, #2956): with no camoufox before the
+    run, the restore returned early, leaving an upgraded playwright and an added
+    patchright (with no Chromium) behind a failed transaction."""
+    _versions(monkeypatch, {"playwright": "1.58.0"}, NEW)
     run = FakeRun()
     monkeypatch.setattr(subprocess, "run", run)
     outcome = _tx(tmp_path, install=True).run()
-    assert run.pip_calls() == []
+    assert run.pip_calls() == [
+        [sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", "playwright==1.58.0"],
+        [sys.executable, "-m", "pip", "uninstall", "--yes", "--quiet", "camoufox", "patchright"],
+    ]
     assert "engine=False" in outcome
+
+
+def test_restore_covers_the_dependency_closure(stack, tmp_path, monkeypatch):
+    """Codex P1 (#2951): the extra moves transitive dependencies too; restoring
+    only the three top-level pins left them upgraded or added."""
+    _legacy_engine(stack)
+    _versions(
+        monkeypatch,
+        {**OLD, "greenlet": "3.0.3", "pyee": "11.0.0"},
+        {**NEW, "greenlet": "3.1.1", "browserforge": "1.2.3"},
+    )
+    run = FakeRun()
+    monkeypatch.setattr(subprocess, "run", run)
+    _tx(tmp_path, install=True).run()
+    install, uninstall = run.pip_calls()
+    assert install[-4:] == [
+        "camoufox==0.4.11",
+        "greenlet==3.0.3",
+        "playwright==1.58.0",
+        "pyee==11.0.0",
+    ]
+    assert "--no-deps" in install
+    assert uninstall[-2:] == ["browserforge", "patchright"]
+
+
+def test_a_name_kept_out_of_the_restore_is_never_uninstalled(stack, tmp_path, monkeypatch):
+    """Review finding on this slice: an editable or unreadable dist is recorded
+    without a version; if it turns up readable after the run it is NOT 'added'."""
+    _legacy_engine(stack)
+    _versions(monkeypatch, {**OLD, "genesis-v3": None}, {**OLD, "genesis-v3": "3.0.0b18"})
+    run = FakeRun()
+    monkeypatch.setattr(subprocess, "run", run)
+    _tx(tmp_path, install=True).run()
+    assert not [arg for c in run.pip_calls() for arg in c if arg.startswith("genesis-v3")]
+
+
+def test_a_rollback_reinstalls_genesis_when_it_stopped_importing(stack, tmp_path, monkeypatch):
+    """Review finding on this slice: pip reinstalls the editable Genesis on every
+    run, so an interrupted install can leave it unimportable; the restore checks
+    it and puts it back from the checkout."""
+    _legacy_engine(stack)
+    _versions(monkeypatch, OLD, NEW)
+    run = FakeRun(fail=[lambda cmd: cmd[1:2] == ["-c"] and "genesis.runtime" in cmd[2]])
+    monkeypatch.setattr(subprocess, "run", run)
+    _tx(tmp_path, install=True).run()
+    installs = [c for c, _ in run.calls if c[0] == "bash"]
+    assert [c[-1] for c in installs] == ["browser", ""], "the extra, then Genesis alone"
+    assert "editable_install_guarded" in installs[1][2]
+
+
+def test_installed_versions_is_the_whole_venv_but_not_editables():
+    """The snapshot is every index-installed distribution; an editable or URL
+    install (Genesis itself) cannot be put back by name==version, so it is
+    recorded without a version rather than 'restored' from an index."""
+    found = _REAL_INSTALLED_VERSIONS()
+    assert "pytest" in found and found["pytest"] == importlib.metadata.version("pytest")
+    for dist in importlib.metadata.distributions():
+        if dist.read_text("direct_url.json"):
+            name = provision._canonical(dist.metadata["Name"])
+            assert name in found and found[name] is None
 
 
 def test_unchanged_packages_are_not_reinstalled(stack, tmp_path, monkeypatch):
@@ -791,6 +986,96 @@ def test_browsers_running_without_pgrep_is_unknown(monkeypatch):
     assert _REAL_BROWSERS_RUNNING() is None
 
 
+def test_chromium_running_sees_a_legacy_headless_shell(monkeypatch):
+    """Codex P1 (#2951): older Playwright names its shell `headless_shell`,
+    which the lock module already treats as a browser; the preflight did not."""
+    monkeypatch.undo()
+    monkeypatch.setattr(subprocess, "run", _fake_pgrep({"headless_shell": (0, "55\n")}))
+    monkeypatch.setattr(
+        provision.os,
+        "readlink",
+        lambda path: "/home/u/.cache/ms-playwright/chromium-1100/chrome-linux/headless_shell",
+    )
+    assert provision.chromium_running() is True
+
+
+def _driver_exe() -> str:
+    return "/venv/lib/python3.12/site-packages/playwright/driver/node"
+
+
+@pytest.mark.parametrize(
+    "exe, expected",
+    [(_driver_exe(), True), ("/usr/bin/node", False)],
+)
+def test_a_live_playwright_driver_blocks_the_upgrade(monkeypatch, exe, expected):
+    """Codex P1 (#2951): a remote-CDP or TinyFish session holds no stack lock
+    but runs this venv's Playwright Node driver, which the install replaces."""
+    monkeypatch.undo()
+    monkeypatch.setattr(subprocess, "run", _fake_pgrep({"node": (0, "66\n")}))
+    monkeypatch.setattr(provision.os, "readlink", lambda path: exe)
+    monkeypatch.setattr(
+        provision,
+        "_driver_dirs",
+        lambda: ["/venv/lib/python3.12/site-packages/playwright/driver/"],
+    )
+    assert _REAL_BROWSERS_RUNNING() is expected
+
+
+def test_driver_dirs_are_the_packages_own(tmp_path, monkeypatch):
+    pkg = tmp_path / "site-packages" / "playwright"
+    pkg.mkdir(parents=True)
+    specs = {"playwright": SimpleNamespace(submodule_search_locations=[str(pkg)])}
+    monkeypatch.setattr(provision.importlib.util, "find_spec", lambda name: specs.get(name))
+    assert provision._driver_dirs() == [str(pkg.resolve() / "driver") + os.sep]
+
+
+def test_a_signal_while_a_step_starts_still_stops_it(tmp_path, monkeypatch):
+    """Review finding on this slice: an interrupt raised inside Popen's own
+    construction escaped before the step was held, so nothing stopped it and
+    the rollback could start a second pip beside it."""
+    pidfile = tmp_path / "pid"
+    real_popen = subprocess.Popen
+
+    def popen_hit_by_sigterm(*a, **k):
+        proc = real_popen(*a, **k)
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(0.5)  # the handler runs here, before Popen has returned
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", popen_hit_by_sigterm)
+
+    def handler(signum, _frame):
+        # The transaction's handler; before the fix it raised unconditionally.
+        raise_interrupt = getattr(provision, "_raise_interrupt", None)
+        if raise_interrupt is None:
+            raise provision.ProvisionError("interrupted by signal SIGTERM")
+        raise_interrupt(signum)
+
+    previous = signal.signal(signal.SIGTERM, handler)
+    try:
+        with pytest.raises(provision.ProvisionError, match="SIGTERM"):
+            _REAL_RUN_GROUP(["bash", "-c", _TREE, "_", str(pidfile)])
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    deadline = time.monotonic() + 5
+    while not pidfile.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _alive(int(pidfile.read_text()))
+
+
+def test_a_disk_probe_error_is_a_reported_skip(cache, tmp_path, monkeypatch):
+    """Devin (#2951): an OSError from the free-space probe escaped before
+    _finish, so the capability was never refreshed and no outcome line printed."""
+
+    def unreadable(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(provision.shutil, "disk_usage", unreadable)
+    outcome = _tx(tmp_path, install=True).run()
+    assert outcome.startswith("browser stack: SKIPPED")
+    assert "Permission denied" in outcome
+
+
 def test_preflight_skips_when_running_is_unknown(monkeypatch):
     monkeypatch.setattr(provision, "MIN_FREE_BYTES", 0)
     monkeypatch.setattr(provision, "browsers_running", lambda: None)
@@ -974,6 +1259,30 @@ def test_run_group_says_when_the_group_survived(tmp_path, monkeypatch):
     assert isinstance(caught.value.__cause__, subprocess.TimeoutExpired)
 
 
+def test_run_group_does_not_wait_for_a_leader_that_survived(tmp_path, monkeypatch):
+    """Devin + Codex (#2951, #2952, #2953): `with Popen` waits for the leader
+    with no timeout on the way out, so a leader that outlived SIGKILL hung the
+    provisioner while it held the lock. The leader here is left alive on
+    purpose (the stub reports it survived without killing it)."""
+    leaders = []
+
+    def survived(proc):
+        leaders.append(proc.pid)
+        return False
+
+    monkeypatch.setattr(provision, "_kill_group", survived)
+    started = time.monotonic()
+    try:
+        with pytest.raises(provision.StepSurvived):
+            _REAL_RUN_GROUP(["sleep", "8"], timeout=0.5, capture_output=True, text=True)
+        assert time.monotonic() - started < 4, "it waited for the surviving leader"
+    finally:
+        for pid in leaders:
+            assert pid > 1 and pid != os.getpgrp()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(pid, signal.SIGKILL)
+
+
 def test_no_rollback_while_a_step_survives(stack, tmp_path, monkeypatch, capsys):
     """Codex finding on #2899: the rollback started a second pip beside a pip
     that outlived SIGKILL. Now the restore is refused and says why."""
@@ -1139,7 +1448,9 @@ def test_an_engine_upgrade_backs_up_the_profile_first(stack, tmp_path, monkeypat
     order = []
 
     def fetch(install_dir, env):
-        order.append(("fetch", len(list(provision.PROFILE_DIR.parent.glob("camoufox-profile.pre-v135-*")))))
+        order.append(
+            ("fetch", len(list(provision.PROFILE_DIR.parent.glob("camoufox-profile.pre-v135-*"))))
+        )
         _install_pinned(install_dir)
 
     monkeypatch.setattr(subprocess, "run", FakeRun(fetch=fetch))
@@ -1232,7 +1543,9 @@ def test_a_backup_ages_from_today_not_from_the_profile(tmp_path):
 def test_an_unreadable_pin_version_still_backs_up(stack, tmp_path, monkeypatch):
     _install_pinned(stack)
     _firefox_profile(provision.PROFILE_DIR)
-    monkeypatch.setattr(provision, "camoufox_pin", lambda: engine.CamoufoxPin("dev", "x", "official"))
+    monkeypatch.setattr(
+        provision, "camoufox_pin", lambda: engine.CamoufoxPin("dev", "x", "official")
+    )
     monkeypatch.setattr(subprocess, "run", FakeRun())
     _tx(tmp_path).run()
     assert len(list(provision.PROFILE_DIR.parent.glob("camoufox-profile.pre-v135-*"))) == 1
