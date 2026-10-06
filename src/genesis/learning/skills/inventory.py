@@ -15,7 +15,7 @@ SKILLS_INVENTORY: dict[str, dict] = {
     "osint": {"consumer": "cc_background_task", "phase": 7, "description": "OSINT investigation on people, companies, technologies"},
     "lead-generation": {"consumer": "cc_background_task", "phase": 7, "description": "Prospect discovery, enrichment, and scoring"},
     "video-processing": {"consumer": "cc_background_task", "phase": 7, "description": "Video download, transcription, clipping, and formatting"},
-    "browser-automation": {"consumer": "cc_background_task", "phase": 7, "description": "Web automation patterns and error recovery via Playwright"},
+    "browser-automation": {"consumer": "cc_background_task", "phase": 7, "description": "Browser layers, safety gates, verify-after-act, overlays and today's workarounds"},
     "deep-reflection": {"consumer": "cc_background_reflection", "phase": 7, "description": "Deep reflection cycle — memory consolidation, lessons extraction, surplus review, skill effectiveness review, cognitive state regeneration"},
     "strategic-reflection": {"consumer": "cc_background_reflection", "phase": 7, "description": "Strategic reflection — weekly self-assessment, quality calibration, learning stability monitoring"},
     "self-assessment": {"consumer": "cc_background_reflection", "phase": 7, "description": "Weekly self-assessment — evaluate reflection quality, procedure effectiveness, learning velocity, blind spots"},

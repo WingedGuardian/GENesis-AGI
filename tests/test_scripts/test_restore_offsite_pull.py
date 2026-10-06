@@ -226,3 +226,73 @@ def test_failed_memory_pull_warns_and_fails(sandbox):
     assert proc.returncode != 0, f"failed memory pull must fail the restore:\n{proc.stdout}"
     assert "failed to pull memory/note.md.gpg" in proc.stdout, \
         f"failed memory pull was silent (no warn):\n{proc.stdout}"
+
+
+def _extra_archive(sandbox, out: Path, member: str, data: bytes) -> None:
+    """Write an encrypted one-directory extra archive (backup.sh §6f format)."""
+    import io
+    import tarfile
+
+    plain = sandbox["home"].parent / f"{out.name}.plain"  # outside the off-site tree
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        root = tarfile.TarInfo(member.rsplit("/", 1)[0])
+        root.type = tarfile.DIRTYPE
+        root.mode = 0o755
+        tf.addfile(root)
+        info = tarfile.TarInfo(member)
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    plain.write_bytes(buf.getvalue())
+    out.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["gpg", "--batch", "--yes", "--homedir", str(sandbox["home"] / ".gnupg"),
+                    "--passphrase", "testpass", "--symmetric", "--cipher-algo", "AES256",
+                    "-o", str(out), str(plain)], check=True, capture_output=True)
+    plain.unlink()
+
+
+def test_extra_archive_left_from_an_earlier_run_is_not_restored(sandbox):
+    """Codex P2 on PR #2853: after an off-site pull, only extra archives supplied by
+    the SELECTED snapshot are restored. One left in a reused checkout by an earlier
+    run is skipped, so a point-in-time restore cannot resurrect data that snapshot
+    does not contain."""
+    _snapshot(sandbox, "sourcebox", _NEW)
+    snap = sandbox["offsite"] / "Genesis" / "sourcebox" / _NEW
+    _extra_archive(sandbox, snap / "extra" / "fresh-11111111.tar.gpg", "fresh/f.txt", b"new")
+    (snap / "COMPLETE").write_text("genesis-snapshot 1\nextra fresh-11111111.tar.gpg\n")
+    _extra_archive(sandbox, sandbox["backup"] / "extra" / "stale-22222222.tar.gpg",
+                   "stale/f.txt", b"old")
+    proc = _run(sandbox, host_override="sourcebox")
+    assert (sandbox["home"] / "fresh" / "f.txt").read_bytes() == b"new", proc.stdout[-2000:]
+    assert not (sandbox["home"] / "stale").exists(), "a stale extra archive was restored"
+    assert "not supplied by the selected off-site snapshot" in proc.stdout, proc.stdout[-2000:]
+
+
+def test_extra_restore_follows_the_complete_marker(sandbox):
+    """New snapshots list their extra archives in COMPLETE. Restore pulls exactly
+    those: an archive in extra/ the marker does not list is ignored, and one the
+    marker lists but cannot be fetched is a recorded failure (a failed listing must
+    never pass as "no extras")."""
+    _snapshot(sandbox, "sourcebox", _NEW)
+    snap = sandbox["offsite"] / "Genesis" / "sourcebox" / _NEW
+    _extra_archive(sandbox, snap / "extra" / "listed-11111111.tar.gpg", "listed/f.txt", b"ok")
+    _extra_archive(sandbox, snap / "extra" / "unlisted-22222222.tar.gpg", "unlisted/f.txt", b"no")
+    (snap / "COMPLETE").write_text(
+        "genesis-snapshot 1\nextra listed-11111111.tar.gpg\nextra gone-33333333.tar.gpg\n"
+    )
+    proc = _run(sandbox, host_override="sourcebox")
+    assert (sandbox["home"] / "listed" / "f.txt").read_bytes() == b"ok", proc.stdout[-2000:]
+    assert not (sandbox["home"] / "unlisted").exists()
+    assert "failed to pull extra/gone-33333333.tar.gpg" in proc.stdout, proc.stdout[-2000:]
+    assert proc.returncode != 0
+
+
+def test_extra_restore_warns_for_each_directory_the_snapshot_skipped(sandbox):
+    """Audit S3: a snapshot whose backup skipped a listed directory says so in
+    COMPLETE; restore records it rather than reporting a silent success."""
+    _snapshot(sandbox, "sourcebox", _NEW)
+    snap = sandbox["offsite"] / "Genesis" / "sourcebox" / _NEW
+    (snap / "COMPLETE").write_text("genesis-snapshot 1\nskipped work/missing\n")
+    proc = _run(sandbox, host_override="sourcebox")
+    assert "does not hold extra directory work/missing" in proc.stdout, proc.stdout[-2000:]
+    assert proc.returncode != 0

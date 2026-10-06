@@ -344,9 +344,7 @@ def test_every_documented_auth_env_has_a_secrets_slot():
     internally consistent, contradicting each other. Nothing checked the pair,
     so a human reviewer had to notice.
 
-    Scans COMMENTED examples too, on purpose: the shipped roster declares no
-    active peers (see test_shipped_config_ships_no_peers), so every auth_env in
-    it lives in a comment — which is exactly where the defect was.
+    Scans COMMENTED automated peer examples as well as active foreground routes.
     """
     import re
 
@@ -371,13 +369,15 @@ def test_every_documented_auth_env_has_a_secrets_slot():
 
     # "Is it declared?" is NOT enough, and verifying-RED proved it: the round-2
     # defect named ZHIPU_API_KEY, which IS a declared slot — it is simply the
-    # WRONG KIND of key. The real invariant is about the endpoint: every roster
-    # peer reaches its provider over the Anthropic protocol (that is what
-    # `anthropic_base_url` means), and those coding endpoints require a
-    # CODING-PLAN key, never the general/prepaid one. The naming convention
-    # `*_CODING_API_KEY` is what makes that mechanically checkable, and
-    # secrets.env.example documents it.
-    wrong_class = {n for n in named if not n.endswith("_CODING_API_KEY")}
+    # WRONG KIND of key. Automated peer examples retain the *_CODING_API_KEY
+    # naming convention. Foreground gmodel routes deliberately distinguish
+    # subscription, native API and OpenRouter keys: protocol is not billing.
+    import yaml
+
+    raw_models = yaml.safe_load(roster_text)["models"]
+    legacy_names = {raw["auth_env"] for raw in raw_models.values() if "auth_env" in raw}
+    legacy_names.update(re.findall(r"^#\s+auth_env:\s*([A-Z][A-Z0-9_]+)", roster_text, re.MULTILINE))
+    wrong_class = {n for n in legacy_names if not n.endswith("_CODING_API_KEY")}
     assert not wrong_class, (
         f"config/cc_roster.yaml names auth_env {sorted(wrong_class)} for a peer. "
         "A roster peer talks to an Anthropic-protocol coding endpoint, which "
