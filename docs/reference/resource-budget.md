@@ -1,11 +1,12 @@
-# Resource budget: readings and preflight
+# Resource budget: readings, preflight and run
 
 Before a session launches a heavy command (a build, a parallel test run, a
-stress run), ask whether it fits:
+stress run), ask whether it fits, or let `run` ask and then cap it:
 
 ```bash
 python -m genesis.hostmetrics status
 python -m genesis.hostmetrics preflight --name build --ram 4 --cpu 200 --disk ~/tmp=10
+python -m genesis.hostmetrics run --name build --ram 4 --cpu 200 -- make -j4
 ```
 
 `genesis.hostmetrics` is stdlib only and never imports the Genesis runtime, so it
@@ -95,10 +96,64 @@ WAIT build
   note: host leg unavailable: no host link configured (guardian_remote.yaml absent); judged on the container only
 ```
 
+## Running a job: `run`
+
+`run` takes the same arguments as `preflight`, then `-- COMMAND [ARGS...]`:
+
+1. It runs the preflight. On WAIT it exits 3 at once, unless
+   `--wait-until-fits MIN` is given; it then re-checks every 30 seconds until
+   the job fits or MIN minutes pass. On NO or ASK it exits with that code.
+2. On GO it launches the command in a transient user scope named
+   `genesis-job-<name>-<id>.scope`, with the estimates as hard caps:
+   `MemoryMax` = `--ram`, `MemorySwapMax=0`, `CPUQuota` = `--cpu`, plus
+   `IOWeight=50` (effective only where the io controller is delegated) and
+   `OOMPolicy=continue`. `--slice` places it in a slice, e.g.
+   `genesis-workload.slice`. A probe scope with the same properties runs first.
+   If systemd rejects `OOMPolicy` for scopes (before systemd 253), the job runs
+   without it, and a job killed at its cap then loses its exit report. If
+   systemd refuses any other property (an estimate it cannot apply, a bad
+   slice), `run` exits 64 and quotes systemd's error; it never falls back to
+   running uncapped. `--ram` below 16 MiB is refused for the same reason.
+3. The job's exit code is `run`'s exit code (128+N for signal N). On exit it
+   prints, on stderr, the job's peak memory, its CPU seconds, and whether it was
+   killed at its memory cap. The verdict also goes to stderr; stdout belongs to
+   the job. A command that is a shell builtin (`exit`, `exec`) ends the
+   in-scope reporter with it, so no report is printed.
+
+The scope is the job's ledger entry. `status` lists live `genesis-job-*`
+scopes, and every `preflight` counts their memory reservations: each job's
+`MemoryMax` minus its current use (page cache excluded, as it is from live
+use) is added to live memory use, on the container and host legs. So a second
+session sees the first session's job before that job has grown into its
+reservation. Two `run`s started within a few seconds of each other can both
+be admitted, since neither scope exists yet when the other checks. CPU is
+compressible and capped by the quota, so it is not reserved.
+
+SIGINT, SIGTERM and SIGHUP to `run` stop the scope; `run` does not wait for the
+job to finish stopping before it exits. A watchdog checks every 10 seconds;
+if container memory or a disk named with `--disk` stays over the line for 60
+seconds, it stops this job. It stops this job even when other work caused the
+pressure, because this is the job Genesis can stop safely; it never touches
+anything else. A resource approved with `--approved-over-line` is not watched.
+
+Without `systemd-run` or a reachable systemd user manager the job runs
+UNCAPPED, under `nice 19` and a data-segment limit (`RLIMIT_DATA`) of `--ram`;
+the output says so. An address-space limit is not used, because runtimes such
+as the JVM, node and OpenBLAS reserve address ranges they never touch and fail
+to start under one. An uncapped job is invisible to other sessions' `status`
+and `preflight`.
+
+`run` is for non-interactive jobs: the job runs in its own session, without a
+controlling terminal, so password prompts (ssh, sudo, git credentials) fail.
+
+Exit codes overlap: a job that itself exits 2, 3 or 4 looks like a verdict.
+Read stderr: the verdict lines start with the verdict (or are a JSON object
+under `--json`), and the job's own report lines start with `genesis-job`.
+
 ## Limits
 
-- Advisory only: nothing enforces the verdict yet. Jobs launched without it are
-  invisible to it, except through the live readings.
+- Advisory: a job launched without `run` is invisible to the reservations,
+  except through the live readings.
 - The CPU sample adds its window (default 3 s, minimum 0.5 s) to every call.
 - CPU reads cgroup v2 only. On cgroup v1, capacity is the affinity count and use
   comes from `/proc/stat`, which inside a container may cover the whole host.

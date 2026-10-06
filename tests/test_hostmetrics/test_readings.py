@@ -239,7 +239,8 @@ def test_runtime_cgroup_reexports_the_moved_readers():
 def test_import_does_not_load_the_runtime():
     code = (
         "import sys, genesis.hostmetrics.readings, genesis.hostmetrics.preflight, "
-        "genesis.hostmetrics.host, genesis.hostmetrics.__main__; "
+        "genesis.hostmetrics.host, genesis.hostmetrics.__main__, "
+        "genesis.hostmetrics.jobs, genesis.hostmetrics.run; "
         "print(sorted(m for m in sys.modules "
         "if m.startswith(('genesis.runtime', 'genesis.guardian', 'yaml'))))"
     )

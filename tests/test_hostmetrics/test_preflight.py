@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from genesis.hostmetrics import __main__ as cli
@@ -204,6 +206,7 @@ def test_levers_accept_export_lines_and_name_unknown_keys(tmp_path):
 def fixed_snapshot(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "take_snapshot", lambda paths, window, host=True: snap())
     monkeypatch.setattr(cli, "load_levers", lambda: Levers())
+    monkeypatch.setattr(cli.jobs, "live_jobs", lambda: [])
 
 
 @pytest.mark.parametrize(("ram", "code"), [("1", 0), ("7", 3), ("9", 2)])
@@ -255,3 +258,35 @@ def test_cli_status_json(fixed_snapshot, capsys):
     assert cli.main(["status", "--json"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["threshold_pct"] == 80.0 and out["memory"]["source"] == "cgroup"
+
+
+def test_live_jobs_hold_their_unused_reservation():
+    # 10 total, 2 used, line 8. Jobs reserve 3 beyond their use → committed 5; +4 → WAIT.
+    s = replace(snap(), reserved_beyond_use=3 * GIB)
+    r = evaluate(s, req(ram=4), Levers())
+    assert by(r, "memory").live == 5 * GIB and r.verdict == WAIT
+    assert evaluate(snap(), req(ram=4), Levers()).verdict == GO  # control: no jobs → GO
+
+
+def test_unknown_live_jobs_are_stated():
+    r = evaluate(replace(snap(), reserved_beyond_use=None), req(), Levers())
+    assert any("live jobs unknown" in n for n in r.notes)
+
+
+def test_cli_status_lists_live_jobs(fixed_snapshot, monkeypatch, capsys):
+    from genesis.hostmetrics.jobs import Job
+
+    job = Job("genesis-job-build-a1b2c3.scope", 2 * GIB, GIB, 150.0)
+    monkeypatch.setattr(cli.jobs, "live_jobs", lambda: [job])
+    assert cli.main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "1 live genesis job(s)" in out
+    assert "genesis-job-build-a1b2c3.scope: 1.0 GiB of 2.0 GiB reserved, cpu cap 150%" in out
+
+
+def test_live_jobs_reservation_counts_on_the_host_leg_too():
+    # Host 20 total, 13 used, line 16: +2 fits; with 2 reserved beyond use, 17 > 16.
+    host = HostMemory(total=20 * GIB, used=13 * GIB)
+    assert by(evaluate(snap(host=host), req(ram=2), Levers()), "memory (host)").verdict == GO
+    s = replace(snap(host=host), reserved_beyond_use=2 * GIB)
+    assert by(evaluate(s, req(ram=2), Levers()), "memory (host)").verdict == WAIT
