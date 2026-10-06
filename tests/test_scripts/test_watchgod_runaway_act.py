@@ -47,7 +47,9 @@ def _task_output(box, mb: int = 60, rel: str = "claude-1000/-proj/sess-1/tasks/b
     f.parent.mkdir(parents=True, exist_ok=True)
     with open(f, "ab") as fh:
         fh.write(b"head of the output\n")
-        fh.truncate(mb * _MB)
+        fh.flush()
+        # Allocated, not sparse: the detector measures space in use.
+        os.posix_fallocate(fh.fileno(), 0, mb * _MB)
     return f
 
 
@@ -257,7 +259,7 @@ def test_a_task_output_shape_outside_cc_tmp_is_not_acted_on(box):
     f = elsewhere / "claude-1000/-proj/sess-1/tasks/b1.output"
     f.parent.mkdir(parents=True)
     with open(f, "ab") as fh:
-        fh.truncate(60 * _MB)
+        os.posix_fallocate(fh.fileno(), 0, 60 * _MB)
     _session(box, f)
     _respond(box)
     assert not _kills(box)
@@ -288,7 +290,7 @@ def test_an_already_paused_holder_is_not_recorded_twice(box):
     _session(box, f)
     _respond(box)
     with open(f, "ab") as fh:  # the unpaused writer refilled it
-        fh.truncate(60 * _MB)
+        os.posix_fallocate(fh.fileno(), 0, 60 * _MB)
     _respond(box)
     assert [r[0] for r in _frozen(box)] == ["200", "201"]
 
@@ -423,8 +425,10 @@ _rw_scan() {
     assert f.stat().st_size == 0
 
 
-def test_a_holder_that_exists_without_a_claude_ancestor_still_blocks(box):
-    """The skip is for the GONE only: a live non-session holder vetoes."""
+def test_a_walked_pid_no_longer_on_the_file_is_not_a_holder(box):
+    """A pid the walk reported whose descriptor no longer leads to the file
+    (closed, reused) is dropped by revalidation and cannot veto; a live holder
+    that is on the file still does (test_a_holder_with_no_claude_ancestor_…)."""
     f = _task_output(box)
     _session(box, f)
     _proc(box, 300, "rsync", 1)
@@ -435,7 +439,7 @@ _rw_scan() {
 }
 """
     _run(box, _KILL_STUB + gone + f"wg_runaway_check '{_domains(box)}'")
-    assert not _kills(box)
+    assert _kills(box) == ["kill -STOP 200", "kill -STOP 201"]
 
 
 # ── review round (PR 2 delta) ─────────────────────────────────────

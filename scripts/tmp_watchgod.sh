@@ -872,7 +872,8 @@ check_disks() {
 
         tier_of[$key]="$tier"; free_of[$key]="$free"; total_of[$key]="$total"
         eta_of[$key]="$eta"; fstype_of[$key]="$fstype"
-        rw_domains+="${key} ${key%%[qm]*} ${total} ${tier} ${p}"$'\n'
+        # Canonical root: /proc names a held file by its resolved path.
+        rw_domains+="${key} ${key%%[qm]*} ${total} ${tier} $(wg_canon "$p")"$'\n'
 
         [[ -n "$DISK_JSON" ]] && DISK_JSON+=", "
         DISK_JSON+="$(_wg_json_str "$p"): {\"tier\": \"$tier\", \"floor_tier\": \"$floor\", \"free_mb\": $free, \"total_mb\": $total, \"used_pct\": $(( total > 0 ? used * 100 / total : 0 )), \"eta_min\": $([[ "$eta" == - ]] && echo null || echo "$eta"), \"rate_mb_per_min\": $rate, \"quota\": $([[ $quota == 1 ]] && echo true || echo false), \"unalloc_mb\": $([[ "$unalloc" == - ]] && echo null || echo "$unalloc"), \"meta_pct\": $([[ "$meta" == - ]] && echo null || echo "$meta"), \"fstype\": $(_wg_json_str "$fstype")}"
@@ -905,7 +906,8 @@ check_disks() {
     # here must never cost the tiers their poll.
     RUNAWAY_RELIEVED=()
     if [[ -n "$rw_domains" ]]; then
-        wg_runaway_check "$rw_domains" || _wg_warn_once runaway_check "runaway-file check failed this poll"
+        # The || keeps errexit off inside the check; it logs its own failures.
+        wg_runaway_check "$rw_domains" || true
         (( RUNAWAY_FAST )) && fast=1
     fi
 
