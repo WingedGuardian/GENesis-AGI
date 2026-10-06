@@ -149,12 +149,44 @@ carries NO trailer (heartbeat correctly skipped, `recent_files` caught it), and
 an idle one (neither fired). The middle case is why the filler is not optional:
 merging main into a branch strips the only signal the first two steps read.
 
-**None of this is a lock.** There is no lease or ownership record in the system
-today — this is evidence, read the same way the repo reads a peer's claim
+**None of this is a lock.** Session-claim locks exist (`scripts/hooks/worktree_claim.py`)
+but cover only Genesis sessions, and there is no lease or ownership record
+beyond them — this is evidence, read the same way the repo reads a peer's claim
 (`.claude/docs/concurrent-sessions.md`): a LEAD, not a fact. It makes a
 collision visible; it does not prevent one. So the standing rule still governs:
 every other worktree is an active session until shown otherwise, the PR is not
 yours to work if it is live, and you never `git worktree remove` it.
+
+**If the build worktree was archived by the reaper** (its
+`git worktree list --porcelain` entry reads `locked archived by the reaper -> …`),
+do not unlock it, and do not `git worktree add --force` its branch. Any OTHER
+lock reason means someone holds it, and the PR is not yours to work, as above,
+unless `python3 scripts/worktree_lifecycle.py --release-stale-claims` releases
+the claim as a dead session's. Re-read `git worktree list --porcelain`
+afterwards. If the entry is still locked, the PR is not yours.
+
+For a reaper archive, restore it with
+`python3 scripts/worktree_lifecycle.py --recover '<entry>'` (the lock reason names
+the entry). It returns at its original path on its own branch, so the review
+counters, the branch `gh` resolves, and the push guard's re-push relaxation carry
+over. If `--recover` refuses or exits 2 (`incomplete`), stop and give the owner its
+output. Do not hand-build a replacement worktree (tracked in #2855).
+
+After it exits 0, compare it with the PR head before working:
+
+```bash
+git -C <path> fetch origin "pull/<N>/head"
+git -C <path> rev-list --left-right --count FETCH_HEAD...HEAD
+git -C <path> status --short
+```
+
+A non-zero right-hand count is the build session's unpushed commits, and any
+`status` output is its uncommitted work, which the recovery restores as it was.
+Either way, stop and surface it to the owner. Otherwise, a non-zero left-hand
+count means the PR moved on: `git -C <path> merge --ff-only FETCH_HEAD`.
+
+This is foreground work. A dispatched session cannot push, so it does not start
+a recovery; it skips the PR and names it in its report.
 
 ### The constraint this session type is measured against
 
@@ -194,7 +226,7 @@ wins.
 
 ### 0. Freshness first — before reading anything else
 
-Two distinct staleness traps, both measured on this repo, both silent:
+Three distinct staleness traps, each seen on this repo, all silent:
 
 **(a) Your TREE is stale, so the code you test is not the code that exists.**
 MEASURED 2026-09-02: the main worktree sat at one commit from 09-01 13:40 to
@@ -260,6 +292,19 @@ this section exists to prevent.
 
 *"Verify against actual code" needs the companion clause "verify against actual
 CURRENT code."*
+
+**(c) Your RULES are stale.** These skills are versioned on main like the
+scripts are, and a long closing session outlives them. OBSERVED 2026-10-03: the
+"PR readiness and mode" rule (#2822) merged mid-session, and the session, still
+working from the copy it loaded at the start, proposed opening a draft PR, which
+that rule forbids. Before any open, send-back, round or merge decision, run
+`git fetch origin main` and then
+`git log <base>..origin/main -- .claude/ CLAUDE.md AGENTS.md`. For `<base>`, use
+the newest commit in the git status shown at session start; that is at or before
+what you loaded, which is the safe direction. Without it, use
+`git log --since='<session start>' origin/main -- …`. If that lists anything,
+re-read the changed sections from `git show origin/main:<path>`, not from the
+loaded copy.
 
 ### 1. Read the status — one command, no substitutes
 
@@ -328,7 +373,7 @@ GitHub failure by retargeting a PR that was fine.
 | `codex-at-head` | `ok (clean signal at head: comment\|summary)` | A **PASS**: the clean signal's abbreviated id resolves repo-wide through `commits/{short}` to exactly the head; a 422 for an ambiguous or unknown id refuses it. A matching head is the PR's commit. No Codex review object at head or Codex findings comment may contradict it, and any non-Codex edit or deleted edit revision on any Codex Bot comment permanently refuses the signal (the editor is named when available); unrelated comments' edit data is ignored. History veto covers head force-push, head-branch delete or restore, and base changes. A base change stays a veto because the signal names the head, not the base Codex reviewed against; retargeting changes the effective diff without moving the head. A base force-push is retired: merging requires the default base, whose ruleset forbids force-push and deletion, so a force-pushed non-default base can reach a merge only through a base change, which vetoes. The 541 commits dropped by 191 force-pushes still resolve repo-wide by 7-hex id, so dropped head commits are not the binding risk. A branch/tag named exactly after the short id can shadow GitHub lookup, but creating one needs base-repo push rights (held only by the owner), and no hex-named ref exists. A deleted comment leaves no API trace. The report uses the gate's own pass record, and merge-with stays bound to the verified head. |
 | `codex-at-head` | `BLOCK` with a `NOTE: Codex's clean <comment\|summary> naming commit … was read but not accepted` line | Codex's clean signal was seen but did not qualify; the note says why. If it also says a finding-free re-review **cannot clear this block** (the PR's history moved, or a Codex findings comment sits on it), do not re-request Codex expecting a clean pass. Either way: if another reviewer's review exists at the exact head, ask the owner and merge with `# substitute-review`. |
 | `codex-at-head` | `BLOCK — … — substitute available: <reviewer> reviewed this head` | Codex has not covered the head, but another reviewer has (any GitHub App reviewer except the PR's own workflow bot and CodeQL). Ask the owner in conversation first; with their yes, merge with `# substitute-review`, which records it. The gate keeps the base check and the head binding and refuses in a dispatched session. Asking is not optional, and the gate cannot check that you did, so the obligation is yours. |
-| `scheduled-claude` | `BLOCK` | The scheduled review never ran, or ran on an older head. Read the detail lines — they name WHICH cause, and the summary's `present: none` clause has been misread as "nothing was posted" when the marker was in the thread all along. |
+| `scheduled-claude` | `BLOCK` | The scheduled review never ran, or ran on an older head. Read the detail lines — they name WHICH cause, and the summary's `present: none` clause has been misread as "nothing was posted" when the marker was in the thread all along. If no `leaks` marker covers the current head and carried-forward relief does not apply, see "When the scheduled leaks review has not run" below. |
 | `scheduled-claude` | `n/a (scoped to the public repo only)` | Neither pass nor block — the gate does not apply to this repo. |
 | `scheduled-claude` | `ok (<kind> carried from <anc>, <check> green at head)` | A pass on a CARRIED-FORWARD review. It is not a review made at head; do not describe it as one. |
 | `review-body` / `inline-findings` | `BLOCK` | Unresolved findings → step 3. |
@@ -338,6 +383,44 @@ GitHub failure by retargeting a PR that was fine.
 A blocking gate prints its diagnosis on the lines BELOW its summary — which
 finding, which pattern, which cause, and usually the remedy. Read them; they are
 the actionable part, and the summary alone is not enough to act on.
+
+**When the scheduled leaks review has not run** at the current head, and
+carried-forward relief does not apply, run it as a fallback rather than leave the
+PR unreviewed (owner, 2026-10-03). The rules:
+
+- **Who reads:** a fresh-context subagent (for example `genesis-security-reviewer`),
+  never your own read.
+- **What it reads:** the PR range from `gh pr view <N> --json baseRefOid,headRefOid`,
+  after fetching both (`git fetch origin "pull/<N>/head" main`).
+  - every added line;
+  - every old and new path (`git diff --name-status -M <base>...<head>`);
+  - binary contents, or an explicit unread list;
+  - the branch name, title, body and commit messages.
+- **What it checks:**
+  - literal identifiers, against `~/.genesis/release-fingerprints.txt`;
+  - inferential personal context: anything that ties the change to a real
+    person's life directly or by inference (household, schedule, places,
+    devices at home, languages spoken). It is the class CLAUDE.md, "Where
+    deferred work goes", scrubs from issues.
+- **A clean result is not enough on its own.** Before any marker is posted, a
+  SECOND independent fresh-context pass re-derives it (CLAUDE.md, Rules, "Verify
+  agent output").
+- **On any finding,** fix it and re-run. Never post a passing marker over one.
+- **Who posts:** only a session authenticated as the repo owner posts the marker;
+  otherwise give the owner the result, and do not post it. Prefer a session that
+  did not author the PR.
+- **What the marker says:**
+  - It uses the gate's grammar (genesis-development, "every scheduled Claude
+    review at the current head").
+  - Its `head=` is the `headRefOid` the scan read. Re-read `headRefOid` just
+    before posting, and re-run the scan if it changed.
+  - It states the lines examined, each class with its result, and that a session
+    ran it as the fallback.
+  - It ends with the explicit verdict line `VERDICT: PASS`. The gate's blocking
+    patterns ignore negation, so without that line a clean marker can be refused
+    on wording alone (genesis-development, the clean-verdict rule).
+
+A shared review spec for the routine and this fallback is tracked in #2856.
 
 **Then read the review comments themselves.** `--check-pr` gives you the verdict
 and the finding TITLES (truncated at 120 characters, first line only) — never a
@@ -394,6 +477,20 @@ stop blocks commits whatever the round count, and the round
 budget gates review requests and fix commits whatever the streak. Neither
 overrides the other; only the budget's rounds are numbered as rounds.
 
+**Bring a premise check to every escalation.** Before putting any of these to
+the owner, run the premise check (a fresh-context agent following
+`.claude/docs/premise-check.md`) and present its verdict with the question:
+
+- a terminal or past-terminal decision: budget round 4 on the ordinary lane, or
+  round 2 on the gate-surface lane;
+- the streak's cap-3 stop.
+
+An option list on its own gives the owner nothing to decide with. And record
+every defect-bearing external round with
+`python3 scripts/review_state.py mark --source external --defects`, run from the
+PR's worktree when its fix is staged. The streak's stops fire only on rounds that
+were recorded, and a past round cannot be recorded later.
+
 Full mechanics for all three — class enumeration, the two-tier machine gate,
 what counts as a round — are in `genesis-development`. Do not re-derive them.
 
@@ -406,6 +503,44 @@ Present: what it does, what the review found, what you changed, and the exact
 merge command the report printed. Then stop. This is the most important property
 this session type has, and the one most worth protecting: a closing session that
 merges on its own initiative is worse than no closing session.
+
+### 5. Sending a PR back
+
+Two triggers, two labels:
+
+- **A BROKEN premise, or a design question** → `needs-architecture-session`.
+  This is the established disposition in genesis-development, "Some PRs are not
+  a review problem". Follow it there, owner-present and unattended alike; it
+  includes the draft step. Its unattended intake gap is tracked in #2857. If the
+  owner's architecture conversation decides to send the PR back, run steps 1-4
+  below with `needs-architecture-session`.
+- **The owner decides a terminal round is rework** → `needs-rework`. The owner is
+  present by definition, so this runs in the foreground:
+  1. Comment with the evidence: findings by class, what carries over, what the
+     rework is. The comment is public, so scrub it as you would an issue
+     (CLAUDE.md, "Where deferred work goes").
+  2. Apply `needs-rework`, creating it first if the repo lacks it
+     (`gh label create needs-rework --description "Sent back for rework"`).
+  3. Move the PR to draft (`gh pr ready <N> --undo`). If that fails, keep the
+     label and say so in a second comment.
+  4. Open a `ready` follow-up naming the PR and the rework; nothing drains the
+     label.
+
+Leave it OPEN (genesis-development, "Never RETIRE a PR you are not the one
+reviving"). A rework normally comes back as a FRESH PR with a new number, so
+its round count is its own (owner rulings 2026-09-24 and 2026-10-05). The
+reworking session opens the replacement and names the old PR in its body. Those
+rulings are the on-record owner authorization (condition 1 of
+genesis-development's superseded-PR exception) for closing the old draft once
+the replacement is open. Conditions 2 and 3 are still checked per PR. So the
+closing session closes the old draft only when every part is covered by the
+replacement or moot, with the per-file mapping in the closing comment, and then
+completes the step-4 follow-up, citing the replacement PR. If any part is neither,
+it leaves the old PR open with a comment naming that part, and updates the
+follow-up to name it too, since the follow-up is what keeps the draft visible.
+Reworking on the old number is an
+owner-approved exception; there, the session that completes the rework marks it
+ready, removes the label, and requests review.
 
 ---
 
@@ -432,6 +567,84 @@ merges on its own initiative is worse than no closing session.
   evidence about the change, not an obstacle to route around. Approval gates and
   escalation caps are never downgrade candidates.
 
+## Devin-built PRs: premise audit before spending review rounds (standing owner rule, 2026-10-04)
+
+**How to tell a Devin PR.** Its head branch starts with `devin/`, or it carries the
+`devin-lifecycle` label, which Devin adds itself. The PR AUTHOR does not tell you:
+Devin pushes with the owner's token, so its PRs are authored by the owner's
+account, and `--author app/devin-ai-integration` lists none of them.
+`devin-ai-integration[bot]` is only the login Devin comments and reviews under.
+
+A Devin PR usually arrives without a plan: no record of what the repo already has,
+and outside-behaviour claims asserted rather than measured. Review rounds spent on
+a wrong-shaped change find defects indefinitely and never say the shape is wrong.
+Codex reviews automatically when the PR opens, so that first round has usually
+happened already. Before requesting or answering any further review:
+
+1. **Run a premise check and design audit** with a fresh-context
+   `genesis-architect`, following `.claude/docs/premise-check.md`: premises with
+   evidence, the effect question, the comparative question (an existing chokepoint
+   the change duplicates or bypasses), the five plan-time questions, then
+   BLOCKER / SHOULD-FIX / NOTE findings and what a rework should do. Hand it the PR
+   number AND the expected head SHA, and have it fetch that head
+   (`git fetch origin pull/<N>/head:<ref>`) and confirm the match before
+   reading anything; an auditor pointed at a stale or main checkout audits the
+   wrong diff with full confidence. Never hand it your own reading of the diff.
+2. **Re-derive every claim the disposition rests on** from the PR head or by
+   re-running the audit's own probe, before acting (CLAUDE.md, "Verify agent
+   output").
+3. **Decide by the audit's `Design-premise:` verdict, not by finding severity:**
+   - **BROKEN**: the established route, `needs-architecture-session` plus a
+     `ready` follow-up naming the PR and the decision it awaits (genesis-development,
+     "Some PRs are not a review problem"). Devin can rework a shape; it cannot
+     decide one.
+   - **SOUND-BUT-INFERIOR with a named better shape that changes the mechanism or
+     the files touched**: kick it back to Devin. Post the audit as a PR comment
+     WITHOUT `(aside)`, so Devin's monitor acts on it. Tell it to bring the
+     rework back as a fresh PR with a new number that names this one, and not to
+     close this PR itself (it has closed old PRs on its own before, #2309 and #2354).
+     Then convert the PR to draft (`gh pr ready <N> --undo`) and add the
+     `needs-rework` label.
+   - **SOUND, or local defects at any severity**: post the audit and continue the
+     ordinary per-PR loop.
+
+   For Devin PRs this owner rule replaces premise-check.md's "SOUND-BUT-INFERIOR is
+   NOT a kick-back" and its two-signal bar. The audit runs after at most Codex's
+   automatic opening round, before any further one, and round signals take several
+   rounds to accumulate; the owner ruled that a wrong shape goes back to Devin on
+   the audit's own evidence rather than spending those rounds to prove it.
+4. **Track every kick-back.** A draft leaves the closing set and nothing reads the
+   label, so open one follow-up per batch with `work_state="blocked_on_trigger"`
+   (it waits on Devin, so it is not actionable now) naming each PR and its audit
+   comment, with a `revisit_condition` saying what unblocks it: Devin opened the
+   replacement PR naming this one (or, as an owner-approved exception, pushed the
+   rework to this branch and marked it ready), or the owner decided. Re-check those
+   PRs, and the open PRs that name them, on each queue sweep.
+5. **When the rework arrives as its replacement PR,** link the two on both PRs and
+   work the replacement normally; read its round count from
+   `scripts/review_budget.py` like any other PR's. Check whether the replacement
+   supersedes the old PR completely, under genesis-development's superseded-PR
+   exception (condition 1 is met by the rulings cited in section 5): every part
+   covered or moot. If it does, close the old draft with the per-file mapping and
+   complete the step-4 follow-up, citing the replacement. If it does not, leave the
+   old PR open with a comment naming what is missing, and update the follow-up to
+   name it, so the unfinished part stays tracked. If Devin pushed the rework onto the old branch instead and marked it
+   ready, that reuse is an owner-approved exception: ask the owner before
+   spending a round on it. With the owner's yes, request `@codex review` (marking
+   a draft ready is not a reliable trigger) and work it normally.
+
+**One writer per branch.** While a kick-back is outstanding, the closing session
+does not push to that branch. Its own replies there carry `(aside)`, since every
+other comment from a write-access user starts a paid Devin session.
+
+**Public comments.** Scrub the audit for public-artifact privacy (no install paths,
+hosts or personal context) before posting. Keep security-class findings out: a gap
+already live on `main` that would hand a capability to someone with less access
+(secrets, private data, an approval or privacy gate) goes to a private follow-up,
+never a comment or issue. For a security-class defect the PR itself introduces,
+describe its effect at class level without exploit strings; the detail can follow
+once it is fixed.
+
 ## Ordering between PRs
 
 PR→PR dependencies are **not modelled anywhere** — no store records "merge #A
@@ -441,6 +654,19 @@ creates them (PR2 builds on PR1's schema).
 So: before proposing a merge, check whether the PR's diff assumes something in
 another open PR, and say so in the approval request. This is manual today. Do
 not assume the absence of a recorded dependency means there is none.
+
+**When the owner splits a PR**, the split-off half opens as a REGULAR PR against
+main, never with `--draft`. Opening it is the owner's call, not this session's,
+because a closing session does not open new work on its own. It targets main
+by policy: a deliberately stacked PR is possible, but it merges only with
+`# stale-review-override` (the `base-branch` row above). Its diff includes the
+parent's changes. This repo merges by squash only, so the inherited changes
+stay in the diff even after the parent merges, until the child is updated from
+main. Reviewers will post findings on those inherited lines, and the gate scores
+them. Reply in-thread to each, pointing to the parent PR; a maintainer reply takes
+a finding off the score. Its body names the PR it depends on and the open
+findings it carries over (genesis-development, "PR readiness and mode", for why
+neither blocks opening).
 
 ## Working the queue
 

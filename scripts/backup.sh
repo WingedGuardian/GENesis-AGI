@@ -26,6 +26,12 @@
 #                                up to the same NAS, or their GFS prunes delete
 #                                each other's snapshots. Read symmetrically by
 #                                restore.sh to locate the source snapshot dir.
+#   GENESIS_BACKUP_EXTRA_DIRS  — ':'-separated directories under $HOME (`~/` ok) to
+#                                keep as encrypted, off-site-only tar archives
+#                                (§6f). Unset = none. Restored by restore.sh §4c.
+#   GENESIS_BACKUP_EXTRA_EXCLUDES — ':'-separated names excluded at any depth from
+#                                those archives, on top of the built-in rebuildable
+#                                caches (.venv, node_modules, __pycache__, …).
 set -euo pipefail
 umask 077
 
@@ -99,6 +105,24 @@ _SQLITE_LINES=0
 _QDRANT_COUNT=0
 _TRANSCRIPT_COUNT=0
 _MEMORY_COUNT=0
+_EXTRA_SKIP_LABELS=()  # declared before the EXIT trap can fire: its status write reads it
+_EXTRA_PARTIAL_LABELS=()
+# What this run's off-site alert block actually ANNOUNCED (or carried forward from a
+# run that did). A run that dies before the alert block records nothing announced, so
+# the next run alerts instead of assuming the earlier one did.
+_ALERTED_CORE=false
+_ALERTED_GAP=""
+# A short fingerprint of WHICH listed directories this run left out (empty when none),
+# so the off-site alert re-fires when a different directory goes missing.
+_extras_gap_fingerprint() {
+    declare -p _EXTRA_SKIP_LABELS _EXTRA_PARTIAL_LABELS >/dev/null 2>&1 || return 0
+    [ $((${#_EXTRA_SKIP_LABELS[@]} + ${#_EXTRA_PARTIAL_LABELS[@]})) -gt 0 ] || return 0
+    local _l
+    {
+        for _l in "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}"; do printf 'skipped %s\n' "$_l"; done
+        for _l in "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]}"}"; do printf 'partial %s\n' "$_l"; done
+    } | LC_ALL=C sort -u | sha1sum | cut -c1-12
+}
 _SECRETS_OK=false
 _SUCCESS=false
 _FAILURE_REASON=""
@@ -136,9 +160,17 @@ _write_status() {
     # offsite_confirmed: true only when the off-site copy fully succeeded.
     local _offsite_confirmed=false
     if [ "${_T2_STATUS:-}" = "ok" ]; then _offsite_confirmed=true; fi
+    # Separate signals so a chronic opt-in extras gap can never mask (or be masked
+    # by) a real off-site failure in the alert dedup below.
+    local _offsite_core_complete=false _extras_complete=true _extras_gap
+    _extras_gap="$(_extras_gap_fingerprint)"
+    if [ "${_T2_STATUS:-}" = "ok" ] || [ "${_T2_EXTRAS_ONLY_PARTIAL:-false}" = true ]; then
+        _offsite_core_complete=true
+    fi
+    if [ $((${_EXTRA_SKIPPED:-0} + ${_EXTRA_UPLOAD_FAILED:-0} + ${_EXTRA_PARTIAL:-0})) -gt 0 ]; then _extras_complete=false; fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 
@@ -178,6 +210,7 @@ _on_exit() {
     # N2: the credential-bearing plaintext SQL dump must not outlive the script
     # if it died mid-section (before its inline rm).
     rm -f "${_SQL_TMP:-}" "${_SQL_ARTIFACT_TMP:-}" "${_SQL_VERIFY_TMP:-}" 2>/dev/null || true
+    rm -f "${_EXTRA_TAR_TMP:-}" "${_EXTRA_TAR_ERR:-}" 2>/dev/null || true  # §6f plaintext tar + its file-name diagnostics
     if [ -n "${_VERIFY_DB:-}" ]; then
         rm -f "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm" 2>/dev/null || true
     fi
@@ -191,6 +224,8 @@ BACKUP_DIR="$HOME/backups/genesis-backups"
 _CC_PROJECT_ID=$(echo "$GENESIS_DIR" | tr '/' '-')
 MEMORY_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}/memory"
 TRANSCRIPT_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}"
+# shellcheck source=scripts/lib/backup_core_paths.sh
+source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
 SECRETS_FILE="${SECRETS_PATH:-$GENESIS_DIR/secrets.env}"
 QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 LOG_PREFIX="[genesis-backup]"
@@ -718,6 +753,279 @@ if [ -d "$_EVAL_DIR" ]; then
     fi
 fi
 
+# --- 6f. Opt-in extra directories (encrypted, Tier 2 / off-site only) ---
+# GENESIS_BACKUP_EXTRA_DIRS lists ':'-separated directories UNDER $HOME (a leading
+# `~/` is expanded) that this install wants kept — install-local data no other
+# section knows about. Each becomes ONE encrypted tar, extra/<name>.tar.gpg, so a
+# nested tree survives the single-level off-site listing restore.sh reads back.
+# Members are stored relative to $HOME and restore writes them back there.
+# extra/ is gitignored like transcripts/: off-site only, never the git tier.
+# Rebuildable caches are excluded at any depth (MEASURED, GNU tar 1.35:
+# `--exclude=.venv` drops a/.venv and a/sub/.venv but keeps a/keep.venvx), plus
+# GENESIS_BACKUP_EXTRA_EXCLUDES (tar patterns, wildcards allowed).
+# `--exclude-vcs-ignores` is NOT used: measured on the same tar, it kept a `.venv/`
+# the directory's .gitignore excluded.
+# FRESH ONLY: extra/ is emptied at the start of every run and holds only what this
+# run archived, so the snapshot never carries an old archive under a new date and
+# nothing ever needs pruning. A listed directory that is not archived this run
+# (refused, missing, unreadable, emptied by an exclude) is simply absent from this
+# snapshot, counted in extra_dirs_skipped, and marks the off-site copy partial;
+# older snapshots keep it until retention drops them. It never fails the backup.
+_EXTRA_COUNT=0
+_EXTRA_SKIPPED=0       # listed directories NOT archived this run, for any reason
+_EXTRA_TAR_TMP=""
+_EXTRA_TAR_ERR=""
+_EXTRA_UPLOAD_FAILED=0
+_EXTRA_UPLOADED=()     # names that reached the off-site snapshot (recorded in COMPLETE)
+_EXTRA_BUILT=()        # names archived THIS run: the only ones uploaded
+_EXTRA_SKIP_LABELS=()  # listed entries not archived this run (recorded in COMPLETE)
+_EXTRA_PARTIAL=0       # archived, but a restore will refuse some of their members
+_EXTRA_PARTIAL_LABELS=()
+_extra_prev=0
+if mkdir -p extra 2>/dev/null; then
+    _extra_prev="$(find extra -maxdepth 1 -type f -name '*.tar.gpg' 2>/dev/null | wc -l || true)"
+    find extra -maxdepth 1 -type f -delete 2>/dev/null || true
+    # A file cleanup could not remove is never restored: restore takes only the
+    # names .extra-manifest lists, which is rewritten below on every run. It sits
+    # outside extra/, so an extra/ that cannot be written cannot pin an old one.
+    if find extra -maxdepth 1 -type f -print -quit 2>/dev/null | grep -q .; then
+        log "WARNING: extra/ still holds files from an earlier run that could not be removed; restore ignores them (only .extra-manifest's names are restored)"
+    fi
+else
+    log "WARNING: cannot create $BACKUP_DIR/extra; extra directories have no local copy this run"
+fi
+_extra_skip() {  # <reason> <entry>
+    log "WARNING: extra dir skipped ($1): $2"
+    _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+    # Shown $HOME-relative in the COMPLETE marker, so restore can say which listed
+    # directory a snapshot does not hold. Shell-quoted under the C locale, so every
+    # byte becomes printable ASCII and no name ever shrinks to an empty label.
+    _EXTRA_SKIP_LABELS+=("$(LC_ALL=C printf '%q' "${2#"$HOME"/}" | cut -c1-200)")
+}
+if [ -z "${GENESIS_BACKUP_EXTRA_DIRS:-}" ]; then
+    [ "$_extra_prev" -gt 0 ] && log "NOTE: GENESIS_BACKUP_EXTRA_DIRS is unset; the previous run's $_extra_prev extra archive(s) are not carried forward (older off-site snapshots keep them until retention)"
+elif [[ "$GENESIS_BACKUP_EXTRA_DIRS" == *$'\n'* ]] || [[ "${GENESIS_BACKUP_EXTRA_EXCLUDES:-}" == *$'\n'* ]]; then
+    _extra_skip "the list contains a newline; entries are ':'-separated" "GENESIS_BACKUP_EXTRA_DIRS / GENESIS_BACKUP_EXTRA_EXCLUDES"
+else
+    # Compare RESOLVED paths: a symlinked or slash-terminated $HOME must not reject every entry.
+    _home_real="$(realpath -- "$HOME")"
+    _home_lex="$(realpath -s -m -- "$HOME")"
+    _bdir_real="$(realpath -m -- "$BACKUP_DIR")"
+    _btmp_real="$(realpath -m -- "$GENESIS_BIG_TMP")"
+    _lroot_real=""
+    if [ "$(_backend_resolve)" = local ] && [ -n "${GENESIS_BACKUP_LOCAL_PATH:-}" ]; then
+        _lroot_real="$(realpath -m -- "$GENESIS_BACKUP_LOCAL_PATH")"
+    fi
+    # Class 3 — an archive is only worth keeping if a restore can extract it. The
+    # restore helper refuses a Python whose tarfile lacks the 2025 extraction-filter
+    # fixes, so find that out NOW (loudly, as a partial backup), not during a disaster
+    # recovery. (The restore box needs a fixed Python too; SETUP.md says so.)
+    _extra_py_why=""
+    if ! _extra_py_why="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" check 2>&1)"; then
+        _extra_py_why="${_extra_py_why:-the restore helper could not run}"
+    else
+        _extra_py_why=""
+    fi
+    _EXTRA_DEFAULT_EXCLUDES=(.venv venv node_modules __pycache__ .pytest_cache .ruff_cache .mypy_cache .tox)
+    _extra_ex_args=()
+    for _x in "${_EXTRA_DEFAULT_EXCLUDES[@]}"; do _extra_ex_args+=("--exclude=$_x"); done
+    IFS=':' read -r -a _extra_user_ex <<< "${GENESIS_BACKUP_EXTRA_EXCLUDES:-}"
+    for _x in "${_extra_user_ex[@]+"${_extra_user_ex[@]}"}"; do
+        [ -n "$_x" ] && _extra_ex_args+=("--exclude=$_x")
+    done
+    _extra_abs_seen=()
+    _extra_listed=0
+    IFS=':' read -r -a _extra_dirs <<< "$GENESIS_BACKUP_EXTRA_DIRS"
+    for _d in "${_extra_dirs[@]+"${_extra_dirs[@]}"}"; do
+        [ -n "$_d" ] || continue
+        _extra_listed=$((_extra_listed + 1))
+        # The quoted "~" patterns match the literal `~` TEXT a config value carries,
+        # which is then expanded here by hand — not a tilde the shell should expand.
+        # shellcheck disable=SC2088
+        case "$_d" in
+            "~") _d="$HOME" ;;
+            "~/"*) _d="$HOME/${_d#\~/}" ;;
+        esac
+        case "$_d" in
+            /*) ;;
+            *)
+                # A relative entry would resolve against this script's cwd (the backups repo).
+                _extra_skip "must be an absolute path or start with ~/" "$_d"
+                continue
+                ;;
+        esac
+        _abs="$(realpath -m -- "$_d")"
+        case "$_abs" in
+            "$_home_real"/?*) ;;
+            *)
+                _extra_skip "must be a directory under \$HOME, not \$HOME itself" "$_d"
+                continue
+                ;;
+        esac
+        _rel="${_abs#"$_home_real"/}"
+        # A symlinked entry (or one under a symlinked dir) would be archived under its
+        # target's path, and restore would never recreate the path that was listed.
+        _lex="$(realpath -s -m -- "$_d")"
+        _rel_lex="${_lex#"$_home_lex"/}"
+        [ "$_rel_lex" = "$_lex" ] && _rel_lex="${_lex#"$_home_real"/}"
+        if [ "$_rel_lex" != "$_rel" ]; then
+            _extra_skip "it is, or runs through, a symlink; list the real directory ~/$_rel" "$_d"
+            continue
+        fi
+        _overlap=""
+        for _guard in "$_bdir_real" "$_btmp_real" "$_lroot_real"; do
+            [ -n "$_guard" ] || continue
+            case "$_abs/" in "$_guard"/*) _overlap="$_guard" ;; esac
+            case "$_guard/" in "$_abs"/*) _overlap="$_guard" ;; esac
+        done
+        if [ -n "$_overlap" ]; then
+            # Archiving the backups repo, the backup temp dir or a local off-site root
+            # (or anything containing one) would archive the backup's own output.
+            _extra_skip "same as, inside, or containing the backup's own output $_overlap" "$_d"
+            continue
+        fi
+        if _core_hit="$(backup_core_overlap "$_abs")"; then
+            # restore.sh puts an extra directory back as a unit, which would swap this
+            # core path out of the way; the core backup already covers it.
+            _extra_skip "overlaps $_core_hit, which the core backup restores" "$_d"
+            continue
+        fi
+        _dup=""
+        for _prev in "${_extra_abs_seen[@]+"${_extra_abs_seen[@]}"}"; do
+            case "$_abs/" in "$_prev"/*) _dup="$_prev" ;; esac
+            case "$_prev/" in "$_abs"/*) _dup="$_prev" ;; esac
+        done
+        if [ -n "$_dup" ]; then
+            _extra_skip "same as, inside, or containing another listed entry ~/${_dup#"$_home_real"/}" "$_d"
+            continue
+        fi
+        if [ ! -d "$_abs" ]; then
+            _extra_skip "missing; not in this snapshot" "$_d"
+            continue
+        fi
+        # Recorded only for directories that exist, so a missing nested entry can
+        # never get its existing parent refused.
+        _extra_abs_seen+=("$_abs")
+        _ex_hit=""
+        IFS='/' read -r -a _rel_parts <<< "$_rel"
+        for _part in "${_rel_parts[@]}"; do
+            for _x in "${_extra_ex_args[@]}"; do [ "--exclude=$_part" = "$_x" ] && _ex_hit="$_part"; done
+        done
+        if [ -n "$_ex_hit" ]; then
+            _extra_skip "its path contains the excluded name '$_ex_hit'; the archive would be empty" "$_d"
+            continue
+        fi
+        if ! $_ENCRYPT_READY; then
+            _extra_skip "GENESIS_BACKUP_PASSPHRASE not set — refusing plaintext" "$_d"
+            continue
+        fi
+        if [ -n "$_extra_py_why" ]; then
+            _extra_skip "a restore could not extract it: $_extra_py_why" "$_d"
+            continue
+        fi
+        _name="$(printf '%s' "$_rel" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)-$(printf '%s' "$_rel" | sha1sum | cut -c1-8).tar.gpg"
+        # Temp creation can fail (a full or inode-exhausted temp filesystem): skip this
+        # directory, never abort the whole backup over an optional payload.
+        if ! _tar_tmp="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.tar 2>/dev/null)"; then
+            _extra_skip "cannot create a temp file in $GENESIS_BIG_TMP" "$_d"
+            continue
+        fi
+        _EXTRA_TAR_TMP="$_tar_tmp"
+        if ! _tar_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
+            rm -f "$_tar_tmp"
+            _EXTRA_TAR_TMP=""
+            _extra_skip "cannot create a temp file in $GENESIS_BIG_TMP" "$_d"
+            continue
+        fi
+        _EXTRA_TAR_ERR="$_tar_err"
+        _gpg_tmp="extra/.${_name}.partial.$$"
+        _tar_rc=0
+        # --hard-dereference: a hard link is stored as file content, so restore never
+        # meets a hard-link member. Symlinks are kept as links; restore accepts the
+        # ones that stay inside the restored directory.
+        tar -C "$_home_real" --hard-dereference "${_extra_ex_args[@]}" -cf "$_tar_tmp" -- "$_rel" 2>"$_tar_err" || _tar_rc=$?
+        # GNU tar exit 1 = some files changed while being read: the archive is written,
+        # but a file that was changing may be torn. 2+ = fatal.
+        _tar_head="$(head -3 "$_tar_err" | tr '\n' ' ')"
+        rm -f "$_tar_err"
+        _EXTRA_TAR_ERR=""
+        if [ "$_tar_rc" -ge 2 ]; then
+            rm -f "$_tar_tmp"
+            _EXTRA_TAR_TMP=""
+            _extra_skip "tar failed rc=$_tar_rc: $_tar_head" "$_d"
+            continue
+        fi
+        [ "$_tar_rc" -eq 1 ] && log "NOTE: ~/$_rel changed while archiving; a file that was changing may be torn: $_tar_head"
+        # tar treats excludes as wildcards, so a pattern can match the directory itself
+        # and yield an archive without it, with rc 0. Check with the reader and the
+        # member filter restore uses (never by parsing `tar -t`, which escapes
+        # backslashes and, under a C locale, non-ASCII names), so backup keeps exactly
+        # what restore will accept.
+        _tar_root="" _tar_root_why="" _tar_verify_rc=0
+        if _tar_root_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
+            _EXTRA_TAR_ERR="$_tar_root_err"
+            _tar_root="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" verify "$_tar_tmp" "$GENESIS_BIG_TMP" 2>"$_tar_root_err")" || _tar_verify_rc=$?
+            _tar_root_why="$(head -c 300 "$_tar_root_err" | tr '\n' ' ')"
+            rm -f "$_tar_root_err"
+            _EXTRA_TAR_ERR=""
+        else
+            _tar_verify_rc=5
+            _tar_root_why="cannot create a temp file in $GENESIS_BIG_TMP"
+        fi
+        _tar_partial=false
+        if [ "$_tar_verify_rc" -eq 4 ] && [ "$_tar_root" = "$_rel" ]; then
+            # Kept: everything else in the directory still restores. Recorded as
+            # partial, so the off-site copy is not reported complete and the alert fires.
+            _tar_partial=true
+        elif [ "$_tar_verify_rc" -eq 0 ] && [ -n "$_tar_root" ] && [ "$_tar_root" != "$_rel" ]; then
+            rm -f "$_tar_tmp"
+            _EXTRA_TAR_TMP=""
+            _extra_skip "the archive holds ${_tar_root} instead; does an exclude pattern match the directory itself?" "$_d"
+            continue
+        elif [ "$_tar_verify_rc" -ne 0 ] || [ "$_tar_root" != "$_rel" ]; then
+            rm -f "$_tar_tmp"
+            _EXTRA_TAR_TMP=""
+            _extra_skip "restore could not use the archive (rc=$_tar_verify_rc: ${_tar_root_why:-no directory member}); does an exclude pattern match the directory itself?" "$_d"
+            continue
+        fi
+        if encrypt_file "$_tar_tmp" "$_gpg_tmp" && mv -f "$_gpg_tmp" "extra/$_name"; then
+            _EXTRA_COUNT=$((_EXTRA_COUNT + 1))
+            _EXTRA_BUILT+=("$_name")
+            if $_tar_partial; then
+                log "WARNING: extra dir archived without members a restore would refuse (exclude them with GENESIS_BACKUP_EXTRA_EXCLUDES): $_d: $_tar_root_why"
+                _EXTRA_PARTIAL=$((_EXTRA_PARTIAL + 1))
+                _EXTRA_PARTIAL_LABELS+=("$(LC_ALL=C printf '%q' "$_rel" | cut -c1-200)")
+            fi
+        else
+            rm -f "$_gpg_tmp"
+            _extra_skip "encryption failed" "$_d"
+        fi
+        rm -f "$_tar_tmp"
+        _EXTRA_TAR_TMP=""
+    done
+    if [ "$_extra_listed" -eq 0 ]; then
+        _extra_skip "the list has no entries" "GENESIS_BACKUP_EXTRA_DIRS=$GENESIS_BACKUP_EXTRA_DIRS"
+    fi
+    log "Extra dirs: $_EXTRA_COUNT archived ($_EXTRA_PARTIAL partial), $_EXTRA_SKIPPED skipped"
+fi
+# Local manifest (same format as the off-site COMPLETE marker), written on EVERY run,
+# the setting unset included: a restore without an off-site pull restores only the
+# names it lists and reports what it says was skipped. Outside extra/ (gitignored
+# below), written to a temp name and renamed, so a reader never sees half of it; on
+# failure none is left behind, and a restore then restores no local extra archive
+# rather than a stale one.
+if {
+    printf 'genesis-snapshot 1\n'
+    for _n in "${_EXTRA_BUILT[@]+"${_EXTRA_BUILT[@]}"}"; do printf 'extra %s\n' "$_n"; done
+    for _n in "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}"; do printf 'skipped %s\n' "$_n"; done
+    for _n in "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]}"}"; do printf 'partial %s\n' "$_n"; done
+} 2>/dev/null > .extra-manifest.tmp && mv -f .extra-manifest.tmp .extra-manifest 2>/dev/null; then
+    :
+else
+    rm -f .extra-manifest.tmp .extra-manifest 2>/dev/null || true
+    log "WARNING: could not write .extra-manifest; a restore from this checkout will not restore its extra archives (the off-site snapshot is unaffected)"
+fi
+
 # --- 6d. Hook audit stores (Tier 1) ---
 # The merge gate's override records: which merges bypassed which gate, and on what
 # stated grounds. One small file per flush, own-user-only, and SELF-CONTAINED —
@@ -1042,6 +1350,29 @@ else
         done < <(find eval -type f -name '*.gpg' -print0 2>/dev/null)
     fi
 
+    # Upload opt-in extra-dir archives (§6f). Flat by construction — one file
+    # per directory — so restore's single-level off-site pull reads them back.
+    # Only the archives THIS run built (never whatever else sits in extra/), so a
+    # stale file can never reach a new snapshot under a new date.
+    if [ "${#_EXTRA_BUILT[@]}" -gt 0 ]; then
+        backend_mkdir "${_T2_DIR}/extra" || true  # a failed put below is counted per archive
+        for fname in "${_EXTRA_BUILT[@]}"; do
+            f="extra/$fname"
+            if backend_put "$f" "${_T2_DIR}/extra/${fname}"; then
+                _EXTRA_UPLOADED+=("$fname")
+                log "  off-site: uploaded extra/${fname}"
+            else
+                # Opt-in payload: it never withholds the core snapshot's COMPLETE marker
+                # (restore would then skip the core data too), but it does mark the off-site
+                # copy unconfirmed below (tier2_status=partial, offsite_confirmed=false).
+                log "WARNING: off-site upload failed for extra/${fname} (core snapshot still COMPLETE)"
+                # Named in COMPLETE (written after this loop) so restore reports the gap.
+                _EXTRA_SKIP_LABELS+=("${fname} (upload failed)")
+                _EXTRA_UPLOAD_FAILED=$((_EXTRA_UPLOAD_FAILED + 1))
+            fi
+        done
+    fi
+
     backend_mkdir "${_T2_DIR}/config_overrides"
     while IFS= read -r -d '' f; do
         fname=$(basename "$f")
@@ -1089,7 +1420,22 @@ else
     # marker itself fails to upload, the snapshot is unusable for restore — treat
     # that as an off-site failure (partial + alert), not ok.
     if [ "$_T2_OK" = true ]; then
-        _T2_MARKER=$(mktemp)  # empty marker, uploaded only after a full snapshot
+        _T2_MARKER=$(mktemp)  # uploaded only after a full snapshot
+        # The marker lists the extra archives this snapshot holds. restore.sh reads it
+        # back to know what to expect, because a failed off-site LISTING looks the same
+        # as an empty one, while a failed download of this file is detectable.
+        {
+            printf 'genesis-snapshot 1\n'
+            for _n in "${_EXTRA_UPLOADED[@]+"${_EXTRA_UPLOADED[@]}"}"; do
+                printf 'extra %s\n' "$_n"
+            done
+            for _n in "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}"; do
+                printf 'skipped %s\n' "$_n"
+            done
+            for _n in "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]}"}"; do
+                printf 'partial %s\n' "$_n"
+            done
+        } > "$_T2_MARKER"
         if ! backend_put "$_T2_MARKER" "${_T2_DIR}/COMPLETE"; then
             log "WARNING: off-site upload failed for COMPLETE marker — snapshot unusable for restore"
             _T2_OK=false
@@ -1097,7 +1443,14 @@ else
         rm -f "$_T2_MARKER"
     fi
 
-    if [ "$_T2_OK" = true ]; then
+    if [ "$_T2_OK" = true ] && [ $((_EXTRA_UPLOAD_FAILED + _EXTRA_SKIPPED + _EXTRA_PARTIAL)) -gt 0 ]; then
+        # Core snapshot is COMPLETE and restorable, but the off-site copy is not the
+        # full set the operator asked for (an extra dir was not archived this run, or
+        # its archive did not upload), so it is not reported as confirmed.
+        _T2_STATUS="partial"
+        _T2_EXTRAS_ONLY_PARTIAL=true  # core is complete: retention still runs (below)
+        log "WARNING: Tier 2 snapshot ${_T2_STAMP} is COMPLETE but extra dirs are incomplete (${_EXTRA_SKIPPED} not archived, ${_EXTRA_PARTIAL} partial, ${_EXTRA_UPLOAD_FAILED} not uploaded)"
+    elif [ "$_T2_OK" = true ]; then
         _T2_STATUS="ok"
         log "Tier 2 backup copied to off-site snapshot ${_T2_STAMP} (backend: ${_T2_BACKEND})"
     else
@@ -1112,8 +1465,10 @@ else
     # Transcripts are preserved elsewhere (local git keep-forever + the latest snapshot
     # re-uploads the full set every run), so deleting an aged snapshot's transcripts/ copy
     # loses nothing. Only the off-site dated tree is touched; the local ~/backups git repo
-    # is never pruned here. Runs only after a fully-uploaded (ok) snapshot this run.
-    if [ "${_T2_STATUS:-}" = "ok" ] && backend_available; then
+    # is never pruned here. Runs only after a fully-uploaded (ok) snapshot this run, or
+    # one whose core is COMPLETE and only opt-in extra dirs are missing: otherwise a
+    # listed directory that stays missing would stop retention for good.
+    if { [ "${_T2_STATUS:-}" = "ok" ] || [ "${_T2_EXTRAS_ONLY_PARTIAL:-false}" = true ]; } && backend_available; then
         # DR-safety: the host segment flows into a DESTRUCTIVE backend_delete (smb deltree /
         # local rm -rf), so refuse to prune unless it is the plain filename charset — then a
         # pathological hostname can never break out of the snapshot path. (The stamps below
@@ -1154,7 +1509,7 @@ backend_cleanup
 
 # --- Ensure .gitignore excludes Tier 2 files ---
 # Tier 1 (git): memory/, config_overrides/, secrets/, infrastructure/, audit/
-# Tier 2 (off-site): data/, transcripts/
+# Tier 2 (off-site): data/, transcripts/, extra/
 if ! grep -q '^data/$' .gitignore 2>/dev/null; then
     cat >> .gitignore << 'GITIGNORE'
 # Tier 2 files — backed up off-site, not GitHub
@@ -1162,6 +1517,19 @@ data/
 transcripts/
 GITIGNORE
     log "Added Tier 2 exclusions to .gitignore"
+fi
+# extra/ (§6f) joined Tier 2 after the block above shipped: an existing install
+# already has that block, so it would never receive this line from it.
+if ! grep -qx 'extra/' .gitignore 2>/dev/null; then
+    # Keep the appended line on its own even if the file lacks a final newline.
+    if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then printf '\n' >> .gitignore; fi
+    printf 'extra/\n' >> .gitignore
+    log "Added extra/ to the Tier 2 .gitignore exclusions"
+fi
+if ! grep -qx '.extra-manifest' .gitignore 2>/dev/null; then
+    if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then printf '\n' >> .gitignore; fi
+    printf '.extra-manifest\n.extra-manifest.tmp\n' >> .gitignore
+    log "Added .extra-manifest to the .gitignore exclusions"
 fi
 
 # --- Commit and push (Tier 1 only) ---
@@ -1224,16 +1592,51 @@ fi
 # off-site copy did not fully land. Local-only installs (no off-site backend) are
 # a valid choice and do NOT alert.
 if [ "${_T2_BACKEND:-none}" != "none" ] && [ "$_T2_STATUS" != "ok" ]; then
-    # Dedup: alert only on the transition INTO off-site failure. The status file
-    # still holds the PREVIOUS run's state at this point (the EXIT trap rewrites
-    # it after). This avoids a 6-hourly alert while the off-site target stays down; it re-alerts
-    # once off-site recovers (offsite_confirmed flips true) and then fails again.
-    _prev_offsite=$(python3 -c "import json; print(json.load(open('$_STATUS_FILE')).get('offsite_confirmed', True))" 2>/dev/null || echo "True")
-    if [ "$_prev_offsite" != "False" ]; then
+    # Dedup: alert only on the transition INTO a failure. The status file still
+    # holds the PREVIOUS run's state at this point (the EXIT trap rewrites it after).
+    # This avoids a 6-hourly alert while the off-site target stays down; it re-alerts
+    # once that signal recovers and then fails again. The core copy and the opt-in
+    # extras are deduplicated SEPARATELY: one shared flag let a chronic extras gap
+    # (a listed directory that stays missing) silence a later real off-site failure.
+    # Older status files have no offsite_core_complete; offsite_confirmed stands in.
+    # Each signal is suppressed only when the previous run ANNOUNCED the same thing
+    # (offsite_core_alerted / extras_alerted_gap). Status files from before those
+    # fields fall back to the older inference.
+    _prev_flags=$(python3 -c "
+import json
+s = json.load(open('$_STATUS_FILE'))
+core_was_down = s.get('offsite_core_complete', s.get('offsite_confirmed', True)) is False
+core = s.get('offsite_core_alerted', core_was_down)
+gap = s.get('extras_alerted_gap')
+if gap is None:
+    gap = s.get('extras_gap') if s.get('extras_complete', True) is False and not core_was_down else ''
+print(core, gap or '-')
+" 2>/dev/null || echo "False -")
+    read -r _prev_core_alerted _prev_alerted_gap <<<"$_prev_flags"
+    if [ "${_T2_EXTRAS_ONLY_PARTIAL:-false}" = true ]; then
+        _alert_kind=extras
+        _cur_gap="$(_extras_gap_fingerprint)"
+        _ALERTED_GAP="$_cur_gap"  # announced now, or already announced by the last run
+        [ "${_prev_alerted_gap:-}" = "${_cur_gap:--}" ] && _alert_kind=""
+    else
+        _alert_kind=core
+        _ALERTED_CORE=true
+        [ "$_prev_core_alerted" = "True" ] && _alert_kind=""
+    fi
+    if [ -n "$_alert_kind" ]; then
         # Escrow drift withheld the SQL dump from the off-site snapshot (the
         # target is fine — the escrowed passphrase is stale), so name the real
         # cause + fix instead of pointing at the off-site target.
-        if [ "$_SQL_ESCROW_DRIFT" = true ]; then
+        if [ "$_alert_kind" = extras ]; then
+            _send_telegram "⚠️ *Off-site copy incomplete — extra directories*
+
+The core backup reached the off-site snapshot and is restorable, but the
+extra directories are incomplete: ${_EXTRA_SKIPPED:-0} not archived this run,
+${_EXTRA_UPLOAD_FAILED:-0} not uploaded, ${_EXTRA_PARTIAL:-0} archived without members a
+restore would refuse. Missing or partial in this snapshot:
+$(printf '%s\n' "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}" "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]/%/ (partial)}"}" | head -5)
+Time: $(date -Is)"
+        elif [ "$_SQL_ESCROW_DRIFT" = true ]; then
             _send_telegram "⚠️ *Off-site DR degraded — backup passphrase escrow drift*
 
 The local backup is OK (decrypts with the env passphrase), but the ESCROWED

@@ -102,7 +102,11 @@ is never abandoned in that state.
 CI and external review that run after opening, and verification explicitly
 required after merge, remain their normal gates; waiting for those is not a
 reason to use draft mode. Distinguish a blocker to entering review from a check
-that review or merge will subsequently require.
+that review or merge will subsequently require. Open review findings, and a
+dependency on another open PR named in the body, are of the second kind. A PR
+sent BACK for rework or for an architecture decision is of the first kind,
+because review stops until the rework lands (closing-session, "Sending a PR
+back").
 
 ### Wiring Discipline
 
@@ -2549,7 +2553,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   the problem disappears). Emit the `Design-premise:` block. Also informational,
   and its BROKEN verdict has a HIGH bar: it routes to the EXISTING
   premise-wrong disposition (architecture conversation, or
-  `needs-architecture-session` + a `ready` row) rather than to another round, so everything short of "the change cannot do what it
+  `needs-architecture-session` + draft + a `ready` row) rather than to another round, so everything short of "the change cannot do what it
   says" is SOUND-BUT-INFERIOR with the better shape named. Render a
   better-shape finding on the severity ladder too (normally SHOULD-FIX), or it
   is invisible to every surface that scores findings.
@@ -2888,7 +2892,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      obedience — STOP, post the round ledger (round → what it found → what it
      cost), name the cap explicitly ("we've hit the 3-round escalation cap"),
      and get a FRESH decision: HAND IT BACK through the established disposition
-     — architecture conversation, or `needs-architecture-session` + a `ready` row
+     — architecture conversation, or `needs-architecture-session` + draft + a `ready` row
      (three rounds
      each finding something new, after a class-level audit, is the strongest
      evidence available that the PREMISE and not the code is what is wrong —
@@ -3228,7 +3232,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
      owner is deciding is fix-and-merge versus abandon-and-re-cut, never accept-and-ship.
      **With no user to ask** (a dispatched session): do not merge and do not open round
      3 — comment on the PR naming the tripwire and the P1, apply the
-     `needs-architecture-session` label, and open a `ready` follow-up, the same
+     `needs-architecture-session` label, move it to draft (`gh pr ready <N> --undo`),
+     and open a `ready` follow-up (a dispatched session's follow-up lands in the `tabled` lane; the intake gap is tracked in #2857), the same
      unattended route the architecture-session rule below uses.
   6. **After round 1 the diff SHRINKS in SCOPE, never grows.** Line count is not the
      measure — a floor fix under rule 4 may add lines and is mandatory. What may not
@@ -3283,9 +3288,10 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   If you ARE the session with the user present, hold the conversation now. With
   no user to ask, the action is: comment on the PR naming WHICH trigger fired and
   the evidence for it, apply the `needs-architecture-session` label (create it if
-  the repo lacks it — labels are per-repo and forks do not inherit them), open a
+  the repo lacks it — labels are per-repo and forks do not inherit them), move
+  the PR to draft (`gh pr ready <N> --undo`; see "PR readiness and mode"), open a
   `ready` follow-up naming the PR and the decision it awaits — the label is a
-  GitHub annotation nothing drains, so the row is the intake — and move on to the
+  GitHub annotation nothing drains, so the row is the intake (a dispatched session's follow-up lands in the `tabled` lane; the intake gap is tracked in #2857) — and move on to the
   next PR. Expect it to be uncommon: the owner's estimate, explicitly unmeasured,
   is on the order of 1 in 10 or fewer, so a session reaching for it often is
   mis-triaging. Worked example, PR #1605: main's shared settings writer had
@@ -3712,7 +3718,7 @@ Merged-but-undeployable-elsewhere is a bug. The standard paths:
 
 | Change type | Deploy path |
 |---|---|
-| Runtime code | `scripts/deploy_code_only.sh`, or `update.sh` for dependency, unit or host changes. Modes: `deploy` (the default: a locked pull + restart that queues behind update.sh and validation holds, refuses a dirty tree or a venv that does not match the pyproject, and stands the Guardian and watchdog down); `pull` (the same pull, no restart: it reports every change the running server has not loaded, and the next step); `restart`; `status`. Launch `deploy` and `restart` DETACHED as a transient unit (`systemd-run --user`, the command is in the script's header): a session's background job dies with the session (#2101). **Validators sample, they don't chase:** deploys need not be 1:1 with merges. Validate `main` at a cadence, and on a failure bisect the merged range; per-PR CI already covers per-merge granularity. Validating against the live server? Hold `flock -s -w 7200 "${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock" <cmd>`, and deploy BEFORE taking the hold. The hold stops locked deploys, NOT every restarter (the watchdog, the dashboard's service routes, Guardian recovery) and not a bare `git pull`, so bracket the run and let the script judge it: keep the `bracket:` token `scripts/deploy_code_only.sh status` prints at the start (from a worktree it reports the main checkout), and run `scripts/deploy_code_only.sh status --verify <token>` at the end; exit 0 is a valid run. A token exists only when the server's boot commit is known, HEAD's runtime files (`src/`, `config/`, `pyproject.toml`, and the scripts it keeps imported, `_RUNTIME_RELOAD_SCRIPTS` in `scripts/lib/deploy_status.sh`) are the ones it booted from and were at every commit HEAD held since the boot (after a `pull` of code, even one a later commit undid: restart first — the server imports lazily, so the detour's modules stay loaded), and nothing there is edited outside git; otherwise it reads `unknown (<why>)`, which no token matches. It covers a restart (boot commit, MainPID, systemd invocation id) and an edit to an ignored override such as a `config/*.local.yaml` or to a user overlay in `~/.genesis/config`, and a change at HEAD to a script the server runs afresh (`_RUNTIME_FRESH_SCRIPTS`: voids the token, needs no restart); HEAD may move over docs, or hooks and scripts the server never runs. It is a tripwire, not a certificate: it cannot see, and reads valid through, a change to the venv's installed packages, the other files the server reads from `~/.genesis/config` (only the `*.local.yaml` overlays are fingerprinted), an edit undone without moving HEAD (a stash and its pop included), and a rewritten or backdated reflog. A daemon your command leaves behind keeps holding the lock, and overlapping holds can starve a waiting deploy (flock grants a late shared request ahead of a queued exclusive one) |
+| Runtime code | `scripts/deploy_code_only.sh`, or `update.sh` for dependency, unit or host changes. Modes: `deploy` (the default: a locked pull + restart that queues behind update.sh and validation holds, refuses a dirty tree or a venv that does not match the pyproject, and stands the Guardian and watchdog down); `deploy` and `restart` also refuse while the server is running work a restart would cancel, naming each item: what the server itself reports at `GET /api/genesis/inflight` (internal bearer; every Claude invocation, plus a dispatched session's or CLI reflection's whole life, from before its Claude process starts until its result is delivered; NOT the short tail other subsystems run after their call returns, such as a chat turn delivering its reply: #2917), and any live Claude process below the server. They proceed only with `--allow-killing <item,…|all>` using the items the refusal prints (`<pid>@<start>` or a reported id); a server too old to answer (404) gets the process check alone, and any other failure to ask refuses unless `all` — a session the server launched must hand the restart off rather than override (launched detached, the script cannot tell it is one of them); `update.sh` does NOT refuse, and its restarts end those sessions too; `pull` (the same pull, no restart: it reports every change the running server has not loaded, and the next step); `restart`; `status`. Launch `deploy` and `restart` DETACHED as a transient unit (`systemd-run --user`, the command is in the script's header): a session's background job dies with the session (#2101). **Validators sample, they don't chase:** deploys need not be 1:1 with merges. Validate `main` at a cadence, and on a failure bisect the merged range; per-PR CI already covers per-merge granularity. Validating against the live server? Hold `flock -s -w 7200 "${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock" <cmd>`, and deploy BEFORE taking the hold. The hold stops locked deploys, NOT every restarter (the watchdog, the dashboard's service routes, Guardian recovery) and not a bare `git pull`, so bracket the run and let the script judge it: keep the `bracket:` token `scripts/deploy_code_only.sh status` prints at the start (from a worktree it reports the main checkout), and run `scripts/deploy_code_only.sh status --verify <token>` at the end; exit 0 is a valid run. A token exists only when the server's boot commit is known, HEAD's runtime files (`src/`, `config/`, `pyproject.toml`, and the scripts it keeps imported, `_RUNTIME_RELOAD_SCRIPTS` in `scripts/lib/deploy_status.sh`) are the ones it booted from and were at every commit HEAD held since the boot (after a `pull` of code, even one a later commit undid: restart first — the server imports lazily, so the detour's modules stay loaded), and nothing there is edited outside git; otherwise it reads `unknown (<why>)`, which no token matches. It covers a restart (boot commit, MainPID, systemd invocation id) and an edit to an ignored override such as a `config/*.local.yaml` or to a user overlay in `~/.genesis/config`, and a change at HEAD to a script the server runs afresh (`_RUNTIME_FRESH_SCRIPTS`: voids the token, needs no restart); HEAD may move over docs, or hooks and scripts the server never runs. It is a tripwire, not a certificate: it cannot see, and reads valid through, a change to the venv's installed packages, the other files the server reads from `~/.genesis/config` (only the `*.local.yaml` overlays are fingerprinted), an edit undone without moving HEAD (a stash and its pop included), and a rewritten or backdated reflog. A daemon your command leaves behind keeps holding the lock, and overlapping holds can starve a waiting deploy (flock grants a late shared request ahead of a queued exclusive one) |
 | DB schema | additive idempotent migration — applies at restart |
 | One-off data fix / backfill | data-migration framework (post-boot, idempotent) — NEVER a hand-run script only this install executed |
 | **Naming either migration** | **UTC timestamp id: `` `date -u +%Y%m%d%H%M%S` ``_description.py** (data migrations prefix a `d`). NEVER hand-pick the next number — the legacy 4-digit namespace is FROZEN and CI refuses a new one. An id you have to CHOOSE is an id two branches choose identically: measured 2026-09-03, one PR was renumbered twice in a day and four open PRs held live collisions, while a duplicate prefix aborts bootstrap on every install. Nobody allocates a timestamp. |
@@ -4091,7 +4097,16 @@ REST endpoint, matched nothing, and reported "Codex clean" while P2s sat unread)
 When all gates pass it prints the exact atomic merge command to copy
 (`... --match-head-commit <verified-head>`); use that command verbatim.
 
-`git_push_guard.py` enforces a **hard gate** at merge time. Beyond the review
+`git_push_guard.py` enforces a **hard gate** at merge time. The gate reads only
+the `gh pr merge` spelling, so the guard refuses a pull-request merge spelled
+through the GitHub API instead: a non-GET to REST `pulls/N/merge` or
+`merge-async`, a GraphQL `mergePullRequest` / `enablePullRequestAutoMerge` /
+`enqueuePullRequest` mutation. It is a closed set: a `gh api` call that names a
+merge passes only when it is a plain read (one literal endpoint, read-only flags),
+and a GraphQL query or PUT endpoint it cannot read is refused too. The refusal
+names the gated command. The recogniser is `scripts/hooks/gh_merge.py` (#2768);
+it is a tripwire for ordinary spellings, not the boundary, which is server-side.
+Only the bare `gh pr merge --help` skips the merge arm. Beyond the review
 findings below, a gated `gh pr merge`:
 - must carry `--admin` (explicit approval flag) and be bound to the reviewed head
   via `--match-head-commit` (GitHub rejects it server-side if the head moved —
