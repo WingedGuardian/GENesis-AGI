@@ -323,7 +323,7 @@ def _run_config(cwd):
 def test_config_deny_does_not_claim_the_guard_is_unavailable(tmp_path):
     """MEASURED on a live install: every adapter deny (6 of 6) also printed
     'review guard unavailable', so Codex sessions reported the guard as broken."""
-    repo = _repo_with_launcher(tmp_path, 'echo "BLOCKED: probe reason" >&2; exit 2')
+    repo = _repo_with_launcher(tmp_path, 'echo "BLOCKED: probe reason" >&2; echo deny >&3; exit 2')
     run = _run_config(repo)
     assert run.returncode == 2
     assert "BLOCKED: probe reason" in run.stderr
@@ -469,3 +469,57 @@ def test_the_real_chain_explains_every_deny_once(tmp_path):
     assert run.stdout == ""
     assert run.stderr.count("BLOCKED") == 1
     assert "run it again" in run.stderr
+
+
+@pytest.mark.parametrize("body", [
+    "exit 2",  # exit 2 with no deny signal
+    "if then fi",  # a launcher syntax error: bash itself exits 2
+])
+def test_config_explains_a_launcher_exit_2_without_the_deny_signal(tmp_path, body):
+    """Review finding (round 2): bash exits 2 on a launcher syntax error too, so
+    exit 2 alone must not pass silently."""
+    repo = _repo_with_launcher(tmp_path, body)
+    run = _run_config(repo)
+    assert run.returncode == 2
+    assert "review guard failed (exit 2)" in run.stderr
+
+
+def test_launcher_signals_every_explained_deny_on_fd3_only(tmp_path):
+    """The signal goes to fd 3, never stdout: Codex reads hook stdout, and output
+    there that is not a valid decision was measured to permit the action."""
+    launcher = tmp_path / "codex-review-stop"
+    launcher.write_bytes((HOOKS / "codex-review-stop").read_bytes())
+    for stub in (
+        "import sys\nprint('deny')\nprint('BLOCKED: x', file=sys.stderr)\nsys.exit(2)\n",
+        "raise RuntimeError('probe')\n",
+    ):
+        (tmp_path / "codex_review_stop.py").write_text(stub)
+        run = subprocess.run(
+            ["bash", "-c", f'exec 4>&1; sig=$(bash "{launcher}" 3>&1 1>&4); rc=$?; printf "%s|%s" "$rc" "$sig" >&2'],
+            input="{}", text=True, capture_output=True,
+        )
+        assert run.stdout == ""
+        assert run.stderr.endswith("2|deny")
+        direct = subprocess.run(["bash", str(launcher)], input="{}", text=True, capture_output=True)
+        assert (direct.returncode, direct.stdout) == (2, "")
+
+
+@pytest.mark.parametrize("shell", [["bash", "-e", "-c"], ["sh", "-e", "-c"]])
+@pytest.mark.parametrize("body", ["exit 1", "kill -TERM $$"])
+def test_config_denies_under_errexit(tmp_path, shell, body):
+    """Class audit finding: under errexit, `out=$(...); rc=$?` exited with the
+    launcher's own code (1, 143), which Codex reads as permit."""
+    repo = _repo_with_launcher(tmp_path, body)
+    run = subprocess.run([*shell, _config_command()], cwd=repo, input="{}", text=True,
+                         capture_output=True, timeout=10)
+    assert run.returncode == 2
+    assert "review guard failed" in run.stderr
+
+
+def test_config_explained_deny_under_errexit_prints_once(tmp_path):
+    repo = _repo_with_launcher(tmp_path, 'echo "BLOCKED: probe" >&2; echo deny >&3; exit 2')
+    run = subprocess.run(["bash", "-e", "-c", _config_command()], cwd=repo, input="{}",
+                         text=True, capture_output=True, timeout=10)
+    assert run.returncode == 2
+    assert run.stderr.count("BLOCKED") == 1
+    assert run.stdout == ""

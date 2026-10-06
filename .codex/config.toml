@@ -6,12 +6,17 @@
 # The outer fallback denies if the repository or the launcher cannot be found.
 # It must NOT fire on the launcher's own deny (exit 2): that one has already
 # explained itself, and an "unavailable" line under it reads as a broken guard.
-# Any other launcher exit status is a guard failure: deny, and say so.
+# Exit 2 counts as explained only with the launcher's "deny" on fd 3 (bash
+# also exits 2 on a launcher syntax error). Anything else is a guard failure:
+# deny, and say so. `|| rc=$?` keeps an errexit shell (a profile's `set -e`;
+# Codex runs hooks as `$SHELL -lc`) from exiting with the launcher's code,
+# which Codex would read as permit. The launcher's stdout is discarded: it
+# never needs it, and hook stdout must stay empty.
 [[hooks.PreToolUse]]
 matcher = "^Bash$"
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = 'guard="$(git rev-parse --show-toplevel 2>/dev/null)/scripts/hooks/codex-review-stop"; [ -f "$guard" ] || { printf "%s\n" "BLOCKED: review guard unavailable; stop and handoff to the user." >&2; exit 2; }; bash "$guard"; rc=$?; [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 2 ] && exit 2; printf "%s\n" "BLOCKED: review guard failed (exit $rc); stop and handoff to the user." >&2; exit 2'
+command = 'guard="$(git rev-parse --show-toplevel 2>/dev/null)/scripts/hooks/codex-review-stop"; [ -f "$guard" ] || { printf "%s\n" "BLOCKED: review guard unavailable; stop and handoff to the user." >&2; exit 2; }; rc=0; out=$(bash "$guard" 3>&1 1>/dev/null) || rc=$?; [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 2 ] && [ "$out" = "deny" ] && exit 2; printf "%s\n" "BLOCKED: review guard failed (exit $rc); stop and handoff to the user." >&2; exit 2'
 
 [mcp_servers.genesis-health]
 command = "python3"

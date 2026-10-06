@@ -26,7 +26,10 @@ checkout, replacing worktree-local declarations. Updating only a linked worktree
 does not activate a new hook. After landing, update the primary checkout and
 trust its hook before starting another session. The command then resolves scripts
 from the current git checkout; reconcile old branches before relying on their
-policy. No Genesis server restart is needed. This behavior was checked against
+policy. A worktree on a branch from before the fd-3 deny signal runs the new
+config with its old launcher, so each denial there also prints "review guard
+failed (exit 2)" under the real reason until the branch is rebased; it still
+denies. No Genesis server restart is needed. This behavior was checked against
 the [configuration loader](https://github.com/openai/codex/blob/main/codex-rs/config/src/loader/mod.rs)
 and reproduced with harmless CLI probes: regular-checkout configuration blocked
 an exhausted request, while declarations present only in a linked worktree did not.
