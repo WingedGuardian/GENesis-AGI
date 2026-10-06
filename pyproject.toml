@@ -123,9 +123,22 @@ test = [
     # the parser is a dependency rather than a regex.
     "tinycss2>=1.3",
 ]
+# Installed by scripts/install_browser_stack.sh (src/genesis/browser/provision.py),
+# which moves these packages together with the Camoufox engine. playwright and
+# patchright live ONLY here, never in the core list: the core install runs before
+# the (skippable) browser step, and moving playwright to 1.62 there breaks a
+# camoufox < 0.5 engine that the browser step has not replaced yet (measured:
+# "Protocol error (Browser.setDefaultViewport)"). Inside the provisioning
+# transaction they move together with the engine, and go back if it fails.
 browser = [
-    "playwright>=1.40",
-    "camoufox>=0.4",
+    "camoufox>=0.5.7,<0.6",  # engine pinned by the package's browser-pin.json (Firefox 156).
+                             # Upper bound: 0.4 -> 0.5 shipped no migration guide and changed
+                             # the engine layout; take the next minor deliberately.
+    "playwright>=1.62,<1.63",  # camoufox 0.5.7 declares playwright<1.63.
+    "patchright>=1.62.1,<1.63",  # Chromium fallback layer (hides the Runtime.enable CDP signal).
+                                 # <1.63 so it ships the SAME Chromium build as playwright 1.62
+                                 # (151, build 1234; patchright 1.63 ships 153/1243): one download,
+                                 # and the profile is never opened by two Chromium versions.
 ]
 voice = [
     "openai[realtime]>=2.20",  # GPT-Realtime API for speech-to-speech voice sessions

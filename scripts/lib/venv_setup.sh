@@ -3,7 +3,10 @@
 # Genesis — shared venv/package-install helpers.
 # Sourced by install.sh and bootstrap.sh; not executable on its own.
 
-# editable_install_guarded <repo_dir> <venv_path>
+# editable_install_guarded <repo_dir> <venv_path> [extras]
+#
+# [extras] is an optional comma-separated extras list (e.g. "browser"); the
+# install target becomes "<repo_dir>[extras]". Same guard, same contract.
 #
 # Installs the Genesis package into <venv_path> in editable mode, refusing
 # to run when <repo_dir> is a linked git worktree: an editable install is
@@ -19,6 +22,11 @@
 editable_install_guarded() {
     local repo_dir="$1"
     local venv_path="$2"
+    local extras="${3:-}"
+    local target="$repo_dir"
+    if [ -n "$extras" ]; then
+        target="${repo_dir}[${extras}]"
+    fi
 
     # Canonical worktree detection: --git-common-dir differs from --git-dir
     # in a linked worktree. Checked against repo_dir explicitly (git -C), not
@@ -55,7 +63,7 @@ editable_install_guarded() {
         return 1
     fi
 
-    "$venv_path/bin/pip" install -e "$repo_dir" --quiet 2>&1 | tail -1 || true
+    "$venv_path/bin/pip" install -e "$target" --quiet 2>&1 | tail -1 || true
     # Validate pip actually installed Genesis (|| true above masks pip failures)
     if "$venv_path/bin/python" -c "from genesis.runtime import GenesisRuntime" 2>/dev/null; then
         return 0

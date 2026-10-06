@@ -1428,7 +1428,13 @@ verified: 246808153 2026-09-24
   detection for the runtime and tools), plus `engine.py` (read-only Camoufox
   engine readiness: the launch guard and the `browser_automation` capability
   both use it; it never calls camoufox's own path lookup, which deletes a
-  pre-0.5 engine and downloads). The automation TOOLS live in
+  pre-0.5 engine and downloads) and `provision.py` (the one-process upgrade
+  transaction behind `scripts/install_browser_stack.sh`: it installs the
+  `browser` extra under the browser-stack lock and puts the previous packages
+  back on failure). `provision.py` deliberately does NOT use those pgrep
+  patterns: its "is a browser running" check matches exact process names
+  (`pgrep -x`), because a `pgrep -f` substring also matches any shell whose
+  arguments merely mention the word. The automation TOOLS live in
   `mcp/health/browser.py`.
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
