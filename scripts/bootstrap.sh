@@ -1329,6 +1329,30 @@ else
 fi
 echo
 
+# --- Browser stack ---
+# Every install gets the browser stack (Camoufox engine, patchright Chromium):
+# owner decision 2026-10-04. Non-fatal by design: the script prints each failure
+# and the browser_automation capability reports the end state. After the VNC
+# step so a headed browser has its display.
+echo "--- Setting up browser stack ---"
+# GENESIS_BOOTSTRAP_ALLOW_LIVE also defers: only update.sh sets it, and the
+# update.sh that ships this step is the OLD copy (it re-execs itself before the
+# merge), which does not pass the deferral flag. Without this, that one update
+# would download about 2 GB while the server is stopped.
+if [ "${GENESIS_BROWSER_STACK_DEFERRED:-0}" = "1" ] || [ "${GENESIS_BOOTSTRAP_ALLOW_LIVE:-0}" = "1" ]; then
+    # update.sh runs it itself once the update is recorded done (outside its downtime window).
+    echo "  deferred: update.sh runs it once the update is recorded done"
+    if [ "${GENESIS_BROWSER_STACK_DEFERRED:-0}" != "1" ]; then
+        # Only the previous update.sh omits the flag (see above).
+        echo "  (this update.sh predates the step: the next update that applies commits"
+        echo "   runs it; until then the installed browser keeps working; or run scripts/install_browser_stack.sh)"
+    fi
+else
+    bash "$GENESIS_ROOT/scripts/install_browser_stack.sh" 2>&1 | sed 's/^/  /' \
+        || echo "  Browser stack setup did not finish (non-fatal — run scripts/install_browser_stack.sh)"
+fi
+echo
+
 # --- Memory restore ---
 BACKUP_DIR="$GENESIS_ROOT/data/cc-memory-backup"
 if [[ -d "$BACKUP_DIR" ]]; then

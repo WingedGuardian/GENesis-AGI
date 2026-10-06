@@ -3,9 +3,10 @@
 # (camoufox, playwright, patchright); the steps are listed in
 # src/genesis/browser/provision.py.
 #
-# It is idempotent and safe to re-run by hand. It never fails its caller: every
-# problem is printed, the last line is the outcome, and the `browser_automation`
-# capability (capabilities.json) reports the end state.
+# bootstrap.sh and install.sh run this on every install, and update.sh after a
+# recorded update. It is idempotent and safe to re-run by hand. It never fails
+# its caller: every problem is printed, the last line is the outcome, and the
+# `browser_automation` capability (capabilities.json) reports the end state.
 #
 # The transaction lives in src/genesis/browser/provision.py and runs in ONE
 # process. The worktree-guarded editable install stays in scripts/lib/venv_setup.sh

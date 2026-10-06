@@ -2,9 +2,10 @@
 
 ``python -m genesis.browser.provision run --root <repo> --lib <venv_setup.sh>`` is
 the whole transaction, in ONE process so nothing it learns has to be passed
-between steps as text. scripts/install_browser_stack.sh calls it. It never fails
-its caller: problems print, the outcome line is printed last, and the
-``browser_automation`` capability reports the end state.
+between steps as text. scripts/install_browser_stack.sh calls it; bootstrap.sh
+and install.sh run that on every install, and update.sh after a recorded update.
+It never fails its caller: problems print, the outcome line is printed last, and
+the ``browser_automation`` capability reports the end state.
 
 Steps, in order (all under the browser-stack lock held EXCLUSIVE, so two runs
 never overlap and no browser launches mid-run; a running browser holds it SHARED):

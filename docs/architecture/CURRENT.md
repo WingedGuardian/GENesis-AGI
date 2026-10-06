@@ -1429,7 +1429,9 @@ verified: 246808153 2026-09-24
   engine readiness: the launch guard and the `browser_automation` capability
   both use it; it never calls camoufox's own path lookup, which deletes a
   pre-0.5 engine and downloads) and `provision.py` (the one-process upgrade
-  transaction behind `scripts/install_browser_stack.sh`: under the
+  transaction behind `scripts/install_browser_stack.sh`, run by bootstrap.sh
+  and install.sh on every install and by update.sh after a recorded update:
+  under the
   browser-stack lock it installs the `browser` extra, backs up the Camoufox
   profile, stages the paired Camoufox engine next to the old one and swaps it
   in by rename only after it launches, and puts the previous packages back on
