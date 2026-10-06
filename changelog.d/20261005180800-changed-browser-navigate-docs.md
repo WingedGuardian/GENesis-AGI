@@ -1,0 +1,1 @@
+- The `browser_navigate` tool description now says what happens on a Cloudflare challenge: the tool works on it itself (on Camoufox and Chromium) and, if it stays unresolved, sends an alert and returns `turnstile.status == "blocked"`, rather than waiting for a person over VNC.
