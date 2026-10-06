@@ -384,6 +384,13 @@ A blocking gate prints its diagnosis on the lines BELOW its summary — which
 finding, which pattern, which cause, and usually the remedy. Read them; they are
 the actionable part, and the summary alone is not enough to act on.
 
+**An outside contributor's fork PR needs no leaks review** (owner, 2026-10-05): when
+it is wholly theirs, the gate exempts it and `--check-pr` says `leaks not required:
+outside contribution by <login>`. Do not run the fallback below for it. Once one of
+our sessions pushes a commit to it, the contributor commits one of our review
+suggestions, or we edit its title or body, the review is required again; the block
+message then says which condition failed.
+
 **When the scheduled leaks review has not run** at the current head, and
 carried-forward relief does not apply, run it as a fallback rather than leave the
 PR unreviewed (owner, 2026-10-03). The rules:
