@@ -1090,7 +1090,49 @@ def test_a_dispatched_subagent_is_still_denied(monkeypatch, tmp_path, capsys) ->
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: True)
     repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
     rc, out, err = _run_at(monkeypatch, capsys, "git push -u origin HEAD", repo, _SUBAGENT)
-    assert rc == 2 and "BLOCKED" in err, (rc, out, err)
+    assert rc == 2 and "only the main session publishes" in err, (rc, out, err)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr review 5 \\\n  --approve",
+        "gh issue close \\\n  7",
+        "gh api -X POST repos/o/r/issues/5/comments \\\n  -f body=x",
+        "gh pr view 5 \\\n  --json title",  # a read too: its text cannot be read
+    ],
+)
+def test_a_subagent_line_continued_gh_command_is_refused(
+    monkeypatch, tmp_path, capsys, command
+) -> None:
+    """A continuation withholds the segments, so the per-segment check sees nothing;
+    without this a continued gh write ran silently from a subagent."""
+    segs, blind = gpg.analyze_checked(command)
+    assert segs == [] and blind is not None and blind.bounds_induced, (segs, blind)
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    rc, out, err = _run_at(monkeypatch, capsys, command, repo, _SUBAGENT)
+    assert rc == 2 and "one line" in err, (command, rc, out, err)
+    assert not out.strip(), out
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr create --help",
+        "gh pr create -h",
+        "gh pr comment 5 --body '@codex review' --help",
+    ],
+)
+@pytest.mark.parametrize("extra", [{}, _SUBAGENT], ids=["main", "subagent"])
+def test_a_gh_help_request_raises_no_prompt(monkeypatch, tmp_path, capsys, extra, command) -> None:
+    """Help prints text and runs nothing, so neither the create arm nor the review
+    budget may put a prompt in front of the owner for it."""
+    # No budget module: a review request reaching the lookup reads "unknown" and
+    # asks, so only skipping it for help keeps the owner out of it. No network.
+    monkeypatch.setattr(gpg, "_review_budget", None)
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    rc, out, err = _run_at(monkeypatch, capsys, command, repo, extra)
+    assert rc == 0 and "permissionDecision" not in out, (command, rc, out, err)
 
 
 @pytest.mark.parametrize(
@@ -1213,6 +1255,15 @@ _GITHUB_WRITES = [
     "gh extension exec my-ext",
     "gh ext exec my-ext",
     "git subtree push --prefix=docs origin gh-pages",
+    # subtree takes its options before the verb too, with a separate value.
+    "git subtree --prefix docs push origin gh-pages",
+    "git subtree -P docs --squash push origin gh-pages",
+    # A mutation after a string, a comment, or an unterminated string stays a write.
+    r"""gh api graphql -f query='query { a(x: "\" ") } mutation { b }'""",
+    "gh api graphql -f query='query { a } # c\nmutation { b }'",
+    """gh api graphql -f query='query { a(x: "mutation) }'""",
+    "gh api graphql -f query='query { a(x: \"x\nmutation { b } \") }'",
+    '''gh api graphql -f query='query { a(x: """ \\""" """) } mutation { b }\'''',
     # `--help` as an unknown flag's value is not help: gh runs the command.
     "gh release create v1 --notes --help",
     "gh label create x --description --help",
@@ -1250,6 +1301,12 @@ _GITHUB_READS = [
     "gh api graphql -f query='query { viewer { login } }'",
     "gh api graphql -f query='query($n: Int!) { viewer { repositories(first: $n) { totalCount } } }' -F n=5",
     'gh api graphql -f query=\'query { m: __type(name: "Mutation") { name } }\'',
+    # The word `mutation` inside a string value or a comment is not an operation.
+    """gh api graphql -f 'query=query { search(query: "label:mutation bug", type: ISSUE) { issueCount } }'""",
+    '''gh api graphql -f query='query { search(query: """a mutation""", type: ISSUE) { issueCount } }\'''',
+    r"""gh api graphql -f query='query { a(x: "\"") b(y: "mutation") }'""",
+    '''gh api graphql -f query='query { a(x: """ \\""" mutation """) }\'''',
+    "gh api graphql -f query='query { viewer { login } } # no mutation here\n'",
     "git fetch origin",
     "git ls-remote origin",
     # Help lookups print text and run nothing (the largest wrongly-refused group).
@@ -1288,14 +1345,39 @@ def test_heredoc_text_that_starts_with_gh_is_not_a_gh_call() -> None:
     assert not any(gpg._github_write_segment(s) for s in segs), [s.argv for s in segs]
 
 
+#: Writes that the API-merge refusal (#2768) claims first, for every session: a
+#: REST merge, or a GraphQL query it cannot read. Its message, not this rule's,
+#: is the one a subagent sees. Pinned so the set cannot quietly grow: a write
+#: outside it must still carry the subagent message.
+_API_MERGE_REFUSED = frozenset(
+    {
+        "gh -X PUT api repos/o/r/pulls/5/merge",
+        "gh api graphql -F query=@q.graphql",
+        "gh api graphql --input q.json",
+        'gh api graphql -f query="$(cat q.graphql)"',
+        'gh api graphql -f query="$Q"',
+        "gh api graphql -f owner=o",
+    }
+)
+
+
 @pytest.mark.parametrize("command", _GITHUB_WRITES)
 def test_a_subagent_github_write_is_denied(monkeypatch, tmp_path, capsys, command) -> None:
     repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
     rc, out, err = _run_at(monkeypatch, capsys, command, repo, _SUBAGENT)
+    # The decision: refused (exit 2) with no prompt and no note, whichever rule
+    # refuses it. Never allowed, never asked.
     assert rc == 2, (command, rc, out, err)
-    assert "only the main session publishes" in err, (command, err)
-    assert "git rev-parse HEAD" in err, err
     assert not out.strip(), out  # no prompt, no note: the owner sees nothing
+    assert err.startswith("BLOCKED:"), (command, err)  # a refusal, not a crash
+    segs, _ = gpg.analyze_checked(command)
+    claimed = gpg._api_merge_deny(
+        segs, command, {"tool_input": {"command": command}, "cwd": str(repo)}
+    ) is not None
+    assert claimed == (command in _API_MERGE_REFUSED), command
+    if not claimed:
+        assert "only the main session publishes" in err, (command, err)
+        assert "git rev-parse HEAD" in err, err
 
 
 @pytest.mark.parametrize("command", _GITHUB_WRITES)

@@ -5341,7 +5341,7 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
     triggers = [
         (seg, body, signal)
         for seg in segs
-        if gh_pr_subcommand(seg.argv) == "comment"
+        if gh_pr_subcommand(seg.argv) == "comment" and not gh_requests_help(seg.argv)
         for body, _opaque, signal in (_comment_review_request(seg.argv),)
         if signal is not False
     ]
@@ -10605,6 +10605,45 @@ _GRAPHQL_MUTATION = re.compile(r'(?:^|[^\w"])mutation\b')
 _GRAPHQL_READ_START = re.compile(r"\s*(?:query\b|\{)")
 
 
+def _graphql_without_literals(q: str) -> str | None:
+    """``q`` with every GraphQL string, block string and comment replaced by a
+    space, so ``mutation`` inside a search string or a comment is not read as an
+    operation. Per the GraphQL lexical grammar: ``\"\"\"`` opens a block string
+    closed by an unescaped ``\"\"\"`` (``\\\"\"\"`` is its only escape), ``"`` opens a
+    string closed by an unescaped ``"`` on the same line, and ``#`` outside a
+    string runs to the end of the line. None for an unterminated string: the
+    caller then counts the query as a write."""
+    out: list[str] = []
+    i, n = 0, len(q)
+    while i < n:
+        if q.startswith('"""', i):
+            j = i + 3
+            while not q.startswith('"""', j):
+                if j >= n:
+                    return None
+                j += 4 if q.startswith('\\"""', j) else 1
+            i = j + 3
+            out.append(" ")
+        elif q[i] == '"':
+            j = i + 1
+            while j < n and q[j] != '"':
+                if q[j] in "\r\n":
+                    return None
+                j += 2 if q[j] == "\\" else 1
+            if j >= n:
+                return None
+            i = j + 1
+            out.append(" ")
+        elif q[i] == "#":
+            while i < n and q[i] not in "\r\n":
+                i += 1
+            out.append(" ")
+        else:
+            out.append(q[i])
+            i += 1
+    return "".join(out)
+
+
 def _gh_api_writes(argv: list[str]) -> bool:
     """Whether a ``gh api`` argv can change state on GitHub.
 
@@ -10632,7 +10671,8 @@ def _gh_api_writes(argv: list[str]) -> bool:
         queries = [v for k, v in req.fields if k == "query"]
         return not queries or not all(
             _GRAPHQL_READ_START.match(q)
-            and not _GRAPHQL_MUTATION.search(q)
+            and (bare := _graphql_without_literals(q)) is not None
+            and not _GRAPHQL_MUTATION.search(bare)
             and "$(" not in q
             and "${" not in q
             and "`" not in q
@@ -10678,9 +10718,12 @@ def _github_write_segment(seg) -> str | None:
         if sub in _GIT_PUBLISH_SUBCOMMANDS:
             return f"git {sub}"
         if sub in _GIT_PUSHING_FAMILIES:
+            # `push` ANYWHERE after the family word, not only first: options may
+            # precede the verb with a separate value (`git subtree --prefix docs
+            # push`), and which words are values is not modelled. A value that is
+            # literally `push` over-refuses, which is this classifier's direction.
             idx = git_subcommand_index(argv)
-            rest = [t for t in argv[(idx or 0) + 1 :] if not t.startswith("-")]
-            if rest[:1] == ["push"]:
+            if "push" in argv[(idx or 0) + 1 :]:
                 return f"git {sub} push"
         return None
     if exe != "gh":
@@ -10737,6 +10780,12 @@ _SUBAGENT_PUBLISH_DENY = (
     "(write the body to a file and give its path), plus any comment, review "
     "request or reply you would have posted. The main session publishes them. "
     "Do not retry the write in another spelling."
+)
+_SUBAGENT_UNREADABLE_GH_DENY = (
+    "BLOCKED: this command runs `gh` across a line continuation, which this guard "
+    "cannot read, from inside a subagent. Put the gh command on one line: a read "
+    "then runs, and a GitHub write is the main session's step (commit locally and "
+    "report back the worktree path, branch and head SHA instead)."
 )
 
 
@@ -12587,7 +12636,11 @@ def _run_merge_and_push_gates() -> int:
 
         push_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "push"]
         merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
-        create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
+        # A help request creates nothing; it used to raise the create arm's ask.
+        create_segs = [
+            s for s in segs
+            if gh_pr_subcommand(s.argv) == "create" and not gh_requests_help(s.argv)
+        ]
         # `gh pr merge --help` merges nothing; it used to be refused as a merge
         # without --admin (#2768).
         merge_pr_segs = [
@@ -12805,16 +12858,27 @@ def _run_merge_and_push_gates() -> int:
         # told to split a command whose halves are each refused, and ahead of the
         # round-escalation lookup, so a subagent's review request costs no
         # network call. Reach: every segment the parse resolves, nested ones
-        # included; an unparseable command is the blind-spot net's. NOT reached:
-        # a git ALIAS (git runs the alias body), a write made by a program that
-        # is not git or gh (curl to the API, another CLI), and anything outside
-        # the Bash tool (an MCP GitHub tool). This instructs a cooperating agent;
+        # included; a line-continued command naming gh is refused below, and
+        # any other unparseable one is the blind-spot net's. NOT reached: a git
+        # ALIAS (git runs the alias body), a gh write run through a launcher the
+        # parse does not open (`eval`, `find -exec`, `watch`, a pipe into
+        # `bash`), a write made by a program that is not git or gh (curl to the
+        # API, another CLI), and anything outside the Bash tool (an MCP GitHub
+        # tool). This instructs a cooperating agent;
         # it is not a security boundary. A main-thread session carries no
         # `agent_id` and is unaffected, `--agent` sessions included.
         if _is_subagent(payload):
             writes = [w for w in map(_github_write_segment, segs) if w]
             if writes:
                 print(_SUBAGENT_PUBLISH_DENY.format(what=", ".join(writes)), file=sys.stderr)
+                return 2
+            # A line continuation withholds the segments, so the check above saw
+            # nothing, and the blind-spot net covers only push, merge, create and
+            # review requests: `gh pr review 5 \⏎ --approve` ran silently. Read or
+            # write cannot be told apart without segments, so any continued
+            # command naming `gh` is refused with the one-line rewrite.
+            if blind is not None and blind.bounds_induced and mentions(cmd, _GH_MENTION):
+                print(_SUBAGENT_UNREADABLE_GH_DENY, file=sys.stderr)
                 return 2
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
