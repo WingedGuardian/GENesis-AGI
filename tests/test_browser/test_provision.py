@@ -718,7 +718,10 @@ def test_a_second_signal_while_the_step_is_stopped_keeps_the_survivor_known(
         pids.append(proc.pid)
         os.killpg(proc.pid, signal.SIGKILL)  # leave nothing behind in the test
         proc.wait()
-        os.kill(os.getpid(), signal.SIGINT)  # the second Ctrl-C, held until unmask
+        # The second Ctrl-C, held until unmask. Aimed at this thread: a
+        # process-directed signal can be taken by another thread of the test
+        # process that does not block it (the provisioner itself is one thread).
+        signal.pthread_kill(threading.get_ident(), signal.SIGINT)
         return False
 
     monkeypatch.setattr(provision, "_kill_group", survived)
