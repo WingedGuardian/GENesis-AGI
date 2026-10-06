@@ -264,10 +264,15 @@ Use the snapshot to pick a selector, most stable first:
 
 ## Tabs and popups
 
-The tools do not follow a tab or popup that a click opens; they stay on the
-original page and the new tab is invisible to them (#2875). If a link opens a
-new tab (`target="_blank"`, `window.open`), read its address with
-`browser_run_js("document.querySelector('<css selector>').href")` and
+When a click opens a tab or popup (`target="_blank"`, `window.open`), the
+tools switch to it: the click result's `url` and `snapshot` are the new tab's,
+and `new_page` names it. The original tab stays open. If the new tab closes
+itself (a sign-in popup), the tools go back to the tab that opened it (on
+remote CDP, only while the same connection lasts). A tab
+that starts loading later than the click's wait (10 s for a link or form that
+declares a new tab, 1 s otherwise) is not followed, and a `new_page` with a
+`note` says when one was seen but not followed. In that case, read its address
+with `browser_run_js("document.querySelector('<css selector>').href")` and
 `browser_navigate` to it in the same layer.
 
 ## Abandoned browsers

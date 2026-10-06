@@ -38,6 +38,7 @@ def _clear_all_browser_state():
     browser._tinyfish_browser = None
     browser._tinyfish_page = None
     browser._tinyfish_session_id = None
+    browser._opened_by.clear()
     # Per-layer idle tracking, and the watcher task a test may have started
     browser._layer_last_used = {}
     if browser._idle_task is not None:
@@ -2886,3 +2887,456 @@ class TestChromiumWindowClose:
             await asyncio.sleep(0)
         pw.stop.assert_awaited_once()
         assert browser._context is None and browser._playwright is None
+
+
+class _EventPage:
+    """A page double with real event semantics (on / once / remove_listener)."""
+
+    def __init__(self, url, title="Title", target_id=None):
+        self.url = url
+        self._title = title
+        self._closed = False
+        self._handlers: dict[str, list] = {}
+        self.close = AsyncMock()
+        self.wait_for_load_state = AsyncMock()
+        self.target_id = target_id
+        loc = MagicMock()
+        loc.aria_snapshot = AsyncMock(side_effect=lambda: f"- snapshot of {self.url}")
+        self.locator = MagicMock(return_value=loc)
+        self.context = MagicMock()
+        session = MagicMock()
+        session.send = AsyncMock(
+            side_effect=lambda *_a: {"targetInfo": {"targetId": self.target_id}}
+        )
+        session.detach = AsyncMock()
+        self.context.new_cdp_session = AsyncMock(return_value=session)
+
+    async def title(self):
+        return self._title
+
+    def is_closed(self):
+        return self._closed
+
+    def on(self, event, fn):
+        self._handlers.setdefault(event, []).append(fn)
+
+    def once(self, event, fn):
+        def wrapper(*a):
+            self.remove_listener(event, wrapper)
+            fn(*a)
+
+        self.on(event, wrapper)
+
+    def remove_listener(self, event, fn):
+        if fn in self._handlers.get(event, []):
+            self._handlers[event].remove(fn)
+
+    def emit(self, event, *args):
+        for fn in list(self._handlers.get(event, [])):
+            fn(*args)
+
+    def listeners(self, event):
+        return list(self._handlers.get(event, []))
+
+    def close_now(self):
+        self._closed = True
+        self.emit("close", self)
+
+
+def _popup_click(original, popup):
+    """A _stealth_click double: the click makes ``original`` open ``popup``."""
+
+    async def click(page, selector, timeout=10000):
+        assert page is original
+        if popup is not None:
+            page.emit("popup", popup)
+
+    return click
+
+
+async def _click(selector="#open"):
+    with (
+        patch.object(browser, "_human_delay", new=AsyncMock()),
+        patch("genesis.mcp.health.browser.asyncio.sleep", new=AsyncMock()),
+        patch.object(browser, "_NEW_TAB_WAIT_S", 0.05),
+    ):
+        return await browser._impl_browser_click(selector)
+
+
+class TestClickFollowsANewTab:
+    @pytest.mark.asyncio
+    async def test_camoufox_click_switches_to_the_new_tab_and_reports_it(self):
+        original = _EventPage("https://site.example/list")
+        popup = _EventPage("https://site.example/detail", title="Detail")
+        browser._stealth_cm = MagicMock()
+        browser._stealth_page = original
+        browser._active_page = original
+        with patch.object(browser, "_stealth_click", new=_popup_click(original, popup)):
+            result = await _click()
+
+        assert result["new_page"] == {"url": "https://site.example/detail", "title": "Detail"}
+        assert result["url"] == "https://site.example/detail"
+        assert "detail" in result["snapshot"]
+        assert browser._active_page is popup
+        assert browser._stealth_page is popup
+        assert browser._is_camoufox_active()
+        original.close.assert_not_awaited()
+        assert original.listeners("popup") == []  # the watch ends with the click
+
+        snap = await browser._impl_browser_snapshot()
+        assert snap["url"] == "https://site.example/detail"
+        assert "detail" in snap["snapshot"]
+
+    @pytest.mark.asyncio
+    async def test_no_new_tab_means_no_new_page_key(self):
+        original = _EventPage("https://site.example/list")
+        browser._page = original
+        browser._active_page = original
+        with patch.object(browser, "_stealth_click", new=_popup_click(original, None)):
+            result = await _click()
+        assert "new_page" not in result
+        assert browser._active_page is original
+        assert original.listeners("popup") == []
+
+    @pytest.mark.asyncio
+    async def test_chromium_click_switches_its_layer_page(self):
+        original = _EventPage("https://a.example")
+        popup = _EventPage("https://b.example")
+        browser._page = original
+        browser._active_page = original
+        with patch.object(browser, "_stealth_click", new=_popup_click(original, popup)):
+            await _click()
+        assert browser._page is popup and browser._active_page is popup
+
+    @pytest.mark.asyncio
+    async def test_remote_new_tab_becomes_the_tracked_genesis_tab(self):
+        original = _EventPage("https://a.example", target_id="GEN-1")
+        popup = _EventPage("https://b.example", title="B", target_id="GEN-2")
+        browser._remote_browser = _mock_remote_browser(connected=True)
+        browser._remote_page = original
+        browser._remote_target_id = "GEN-1"
+        browser._remote_last_url = "https://a.example"
+        browser._active_page = original
+        with patch.object(browser, "_stealth_click", new=_popup_click(original, popup)):
+            result = await _click()
+
+        assert result["new_page"]["url"] == "https://b.example"
+        assert browser._remote_page is popup
+        assert browser._remote_target_id == "GEN-2"
+        assert browser._is_remote_active()
+        assert browser._remote_last_url == "https://b.example"  # drift baseline moves
+        original.close.assert_not_awaited()  # the original tab is never closed
+
+    @pytest.mark.asyncio
+    async def test_when_the_new_tab_closes_itself_the_tools_return_to_the_original(self):
+        original = _EventPage("https://a.example", target_id="GEN-1")
+        popup = _EventPage("https://accounts.example/signin", target_id="GEN-2")
+        browser._remote_browser = _mock_remote_browser(connected=True)
+        browser._remote_page = original
+        browser._remote_target_id = "GEN-1"
+        browser._active_page = original
+        with patch.object(browser, "_stealth_click", new=_popup_click(original, popup)):
+            await _click()
+        assert browser._remote_page is popup  # precondition: the switch happened
+        popup.close_now()
+        assert browser._active_page is original
+        assert browser._remote_page is original
+        assert browser._remote_target_id == "GEN-1"
+
+    @pytest.mark.asyncio
+    async def test_a_new_tab_that_closes_after_a_layer_switch_changes_nothing(self):
+        original = _EventPage("https://a.example")
+        popup = _EventPage("https://b.example")
+        browser._page = original
+        browser._active_page = original
+        with patch.object(browser, "_stealth_click", new=_popup_click(original, popup)):
+            await _click()
+        assert browser._page is popup  # precondition: the switch happened
+        elsewhere = _alive_page()
+        browser._remote_page = elsewhere
+        browser._active_page = elsewhere
+        popup.close_now()
+        assert browser._active_page is elsewhere
+        assert browser._page is original  # the layer itself still goes back
+
+    @pytest.mark.asyncio
+    async def test_a_new_tab_already_closed_is_reported_not_followed(self):
+        original = _EventPage("https://a.example")
+        popup = _EventPage("https://b.example")
+        popup._closed = True  # it opened and closed itself within the wait
+        browser._stealth_cm = MagicMock()
+        browser._stealth_page = original
+        browser._active_page = original
+        with patch.object(browser, "_stealth_click", new=_popup_click(original, popup)):
+            result = await _click()
+        assert result["new_page"]["url"] == "https://b.example"
+        assert "closed" in result["new_page"]["note"]
+        assert browser._stealth_page is original and browser._active_page is original
+        assert result["url"] == "https://a.example"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_click_removes_the_watch(self):
+        original = _EventPage("https://a.example")
+        browser._page = original
+        browser._active_page = original
+
+        async def boom(page, selector, timeout=10000):
+            raise RuntimeError("element not found")
+
+        with patch.object(browser, "_stealth_click", new=boom):
+            result = await _click()
+        assert "error" in result
+        assert original.listeners("popup") == []
+
+
+class TestFollowNewTabReviewFixes:
+    """Review fixes for the new-tab follow."""
+
+    def _remote(self, original):
+        browser._remote_browser = _mock_remote_browser(connected=True)
+        browser._remote_page = original
+        browser._remote_target_id = "GEN-1"
+        browser._active_page = original
+
+    @pytest.mark.asyncio
+    async def test_a_popup_closing_during_the_target_lookup_is_not_followed(self):
+        """MEASURED by the review: a close 240-360 ms in fired before the close
+        listener existed, leaving the tools on a dead tab with a None target id,
+        so the next reconnect opened a second Genesis tab."""
+        original = _EventPage("https://a.example", target_id="GEN-1")
+        popup = _EventPage("https://accounts.example/signin", target_id="GEN-2")
+        session = popup.context.new_cdp_session.return_value
+
+        async def close_while_asked(*_a):
+            popup.close_now()
+            return {"targetInfo": {"targetId": "GEN-2"}}
+
+        session.send = AsyncMock(side_effect=close_while_asked)
+        self._remote(original)
+        why = await browser._follow_new_page(original, popup)
+        assert "closed" in why
+        assert browser._remote_page is original
+        assert browser._active_page is original
+        assert browser._remote_target_id == "GEN-1"
+
+    @pytest.mark.asyncio
+    async def test_a_remote_tab_without_a_readable_target_id_is_not_followed(self):
+        """Devin 4186535104: following it with the old id kept would put a
+        reconnect back on the original tab, losing the followed one."""
+        original = _EventPage("https://a.example", target_id="GEN-1")
+        popup = _EventPage("https://b.example", target_id=None)
+        self._remote(original)
+        why = await browser._follow_new_page(original, popup)
+        assert "identified" in why
+        assert browser._remote_page is original
+        assert browser._active_page is original
+        assert browser._remote_target_id == "GEN-1"
+        assert popup not in browser._opened_by
+
+    @pytest.mark.asyncio
+    async def test_a_popup_chain_returns_to_the_nearest_live_tab(self):
+        """original -> A -> B; A closes, then B: the tools go back to original
+        instead of restarting the browser."""
+        original = _EventPage("https://a.example")
+        a = _EventPage("https://b.example")
+        b = _EventPage("https://c.example")
+        browser._stealth_cm = MagicMock()
+        browser._stealth_page = original
+        browser._active_page = original
+        assert await browser._follow_new_page(original, a) is None
+        assert await browser._follow_new_page(a, b) is None
+        a.close_now()
+        assert browser._stealth_page is b  # still on the live popup
+        b.close_now()
+        assert browser._stealth_page is original
+        assert browser._active_page is original
+
+    @pytest.mark.asyncio
+    async def test_with_no_live_ancestor_the_closed_tab_is_no_longer_driven(self):
+        """Codex 4186821914: original closes while its popup is driven, then the
+        popup closes; the tools must not keep driving the closed popup."""
+        original = _EventPage("https://a.example")
+        popup = _EventPage("https://b.example")
+        browser._stealth_cm = MagicMock()
+        browser._stealth_page = original
+        browser._active_page = original
+        assert await browser._follow_new_page(original, popup) is None
+        original.close_now()
+        popup.close_now()
+        assert browser._stealth_page is None
+        assert browser._active_page is None
+        result = await browser._impl_browser_snapshot()
+        assert "No page open" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_popup_the_page_opens_during_the_pre_click_delay_is_not_this_clicks(self):
+        """Codex 4186821904: the popup listener starts at the click, not before
+        the human delay."""
+        original = _EventPage("https://a.example")
+        stray = _EventPage("https://ad.example")
+        browser._page = original
+        browser._active_page = original
+
+        async def delay_with_a_stray_popup(*_a, **_k):
+            original.emit("popup", stray)
+
+        with (
+            patch.object(browser, "_human_delay", new=delay_with_a_stray_popup),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=AsyncMock()),
+            patch.object(browser, "_NEW_TAB_WAIT_S", 0.05),
+            patch.object(browser, "_stealth_click", new=_popup_click(original, None)),
+        ):
+            result = await browser._impl_browser_click("#open")
+        assert "new_page" not in result
+        assert browser._active_page is original
+
+
+class TestDeclaresNewTabJs:
+    """_OPENS_NEW_TAB_JS evaluated in a real JavaScript engine against a minimal
+    DOM double, so the classifier logic itself is exercised."""
+
+    _DOM = r"""
+const DOC = { base: null, querySelector: (s) => (s === 'base[target]' ? DOC.base : null) };
+function matches(e, sel) {
+  return sel.split(',').some((s) => {
+    const m = s.trim().match(/^(\w+)(\[(\w+)\])?$/);
+    return !!m && e.tagName === m[1].toUpperCase() && (!m[3] || e.hasAttribute(m[3]));
+  });
+}
+function el(tag, attrs, extra) {
+  const e = Object.assign(
+    { tagName: tag.toUpperCase(), attrs: attrs || {}, parent: null, ownerDocument: DOC },
+    extra || {});
+  e.getAttribute = (n) => (n in e.attrs ? e.attrs[n] : null);
+  e.hasAttribute = (n) => n in e.attrs;
+  e.closest = (sel) => { for (let c = e; c; c = c.parent) if (matches(c, sel)) return c; return null; };
+  return e;
+}
+const OPENS = eval(JS_SRC);
+const out = {};
+function run(name, base, e) { DOC.base = base; out[name] = OPENS(e); }
+const blankBase = el('base', { target: '_blank' });
+const link = (attrs) => el('a', Object.assign({ href: '/x' }, attrs));
+run('plain_link', null, link({}));
+run('declared_link', null, link({ target: '_blank' }));
+run('base_target_link', blankBase, link({}));
+run('own_self_beats_base', blankBase, link({ target: '_self' }));
+const form = (attrs) => el('form', attrs || {});
+run('base_target_form', blankBase, el('button', {}, { type: 'submit', form: form() }));
+run('formtarget_self_beats_base', blankBase,
+    el('button', { formtarget: '_self' }, { type: 'submit', form: form() }));
+// type="bogus": the IDL type is "submit", which is what the browser submits by.
+run('invalid_type_button_submits', null,
+    el('button', { type: 'bogus' }, { type: 'submit', form: form({ target: '_blank' }) }));
+run('type_button_opens_nothing', null,
+    el('button', { type: 'button' }, { type: 'button', form: form({ target: '_blank' }) }));
+run('text_field_opens_nothing', blankBase, el('input', {}, { type: 'text', form: form() }));
+console.log(JSON.stringify(out));
+"""
+
+    def _results(self):
+        import json
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if node is None:
+            pytest.skip("node not available")
+        script = f"const JS_SRC = {json.dumps(browser._OPENS_NEW_TAB_JS)};\n" + self._DOM
+        r = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stderr[:800]
+        return json.loads(r.stdout)
+
+    def test_targets_including_the_documents_base_target(self):
+        """Codex 4186821927: a link or form with no target of its own takes the
+        document's <base target>; its own target still wins."""
+        assert self._results() == {
+            "plain_link": False,
+            "declared_link": True,
+            "base_target_link": True,
+            "own_self_beats_base": False,
+            "base_target_form": True,
+            "formtarget_self_beats_base": False,
+            "text_field_opens_nothing": False,
+            "invalid_type_button_submits": True,
+            "type_button_opens_nothing": False,
+        }
+
+
+class TestFollowNewTabChainsAndWaits:
+    """Second review round of the new-tab follow: the chain survives pruning,
+    a layer's cleanup drops its entries, and the wait windows are real."""
+
+    @pytest.mark.asyncio
+    async def test_pruning_keeps_the_way_back_past_a_closed_tab(self):
+        original = _EventPage("https://a.example")
+        b, c, d = (_EventPage(f"https://{n}.example") for n in "bcd")
+        browser._stealth_cm = MagicMock()
+        browser._stealth_page = original
+        browser._active_page = original
+        assert await browser._follow_new_page(original, b) is None
+        assert await browser._follow_new_page(b, c) is None
+        b.close_now()  # closes while c is driven
+        assert await browser._follow_new_page(c, d) is None  # prunes the map
+        d.close_now()
+        assert browser._stealth_page is c
+        c.close_now()
+        assert browser._stealth_page is original
+        assert browser._active_page is original
+
+    @pytest.mark.asyncio
+    async def test_a_layer_cleanup_drops_its_entries(self):
+        original = _EventPage("https://a.example")
+        popup = _EventPage("https://b.example")
+        cm = MagicMock()
+        cm.__aexit__ = AsyncMock(return_value=None)
+        browser._stealth_cm = cm
+        browser._stealth_page = original
+        browser._active_page = original
+        assert await browser._follow_new_page(original, popup) is None
+        assert popup in browser._opened_by
+        await browser._cleanup_camoufox()
+        assert browser._opened_by == {}
+
+    @staticmethod
+    def _late_popup_click(original, popup, delay_s):
+        async def click(page, selector, timeout=10000):
+            asyncio.get_running_loop().call_later(delay_s, original.emit, "popup", popup)
+
+        return click
+
+    async def _click_with(self, original, popup, delay_s, declared=False):
+        browser._page = original
+        browser._active_page = original
+        with (
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch.object(browser, "_NEW_TAB_WAIT_S", 0.3),
+            patch.object(browser, "_NEW_TAB_DECLARED_WAIT_S", 1.0),
+            patch.object(browser, "_declares_new_tab", new=AsyncMock(return_value=declared)),
+            patch.object(
+                browser, "_stealth_click", new=self._late_popup_click(original, popup, delay_s)
+            ),
+        ):
+            return await browser._impl_browser_click("#open")
+
+    @pytest.mark.asyncio
+    async def test_a_popup_arriving_within_the_wait_is_followed(self):
+        original, popup = _EventPage("https://a.example"), _EventPage("https://b.example")
+        result = await self._click_with(original, popup, delay_s=0.1)
+        assert result["new_page"]["url"] == "https://b.example"
+        assert browser._active_page is popup
+
+    @pytest.mark.asyncio
+    async def test_a_popup_arriving_after_the_wait_is_not_followed(self):
+        original, popup = _EventPage("https://a.example"), _EventPage("https://b.example")
+        result = await self._click_with(original, popup, delay_s=0.6)
+        assert "new_page" not in result
+        assert browser._active_page is original
+        assert original.listeners("popup") == []
+
+    @pytest.mark.asyncio
+    async def test_a_declared_new_tab_gets_the_longer_wait(self):
+        original, popup = _EventPage("https://a.example"), _EventPage("https://b.example")
+        result = await self._click_with(original, popup, delay_s=0.6, declared=True)
+        assert result["new_page"]["url"] == "https://b.example"
+        assert browser._active_page is popup
