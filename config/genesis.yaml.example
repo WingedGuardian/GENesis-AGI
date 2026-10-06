@@ -52,8 +52,10 @@ github:
 #
 # Two keys exist. `secrets_env` is the credentials prompt. `push_publish`
 # silences only the first push of the current branch, and only when the whole
-# command is exactly one plain `git push` (e.g. `git push -u origin HEAD`) —
-# chained commands still ask, so run the first push on its own — and the remote
+# command is exactly one plain `git push` (e.g. `git push -u origin HEAD`) or
+# that push followed by `&& gh pr create …` — other chained commands still ask.
+# A first push to the public repo is refused unless it is that chained form, so
+# there the chained form is the one this silences — and the remote
 # it really goes to is https://github.com/<the public repo named under `github:`
 # above>, where a live check finds the branch absent. A URL rewrite whose result is that https URL is fine;
 # the ssh / scp forms always ask, as does any `http.*` git config, a remote
