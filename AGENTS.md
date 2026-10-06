@@ -30,6 +30,67 @@ deploys from. Do not mutate it in place.
   local `live` integration branch — running unmerged candidate branches on this
   install before their PRs merge — not a development action.
 
+## Rebuilding a PR that was sent back
+
+A `needs-rework` PR, or a `needs-architecture-session` PR whose owner decision
+has since been posted as a rework spec, carries that spec in a maintainer
+comment headed `## Rework spec` (and any design issue that comment names). An
+audit or proposal without that heading is not a spec. A
+`needs-architecture-session` PR with no posted spec has an undecided design: do
+not build it. When you build a rework:
+
+- **Before building, acknowledge the spec on the OLD PR** in one comment headed
+  `## Rework acknowledgement`. Give the spec in your own words, the split you
+  will build, and every question you need answered first. Open no PR, not even
+  a draft, until it is posted. If it asks no questions, proceed once it is
+  posted; otherwise wait for an answer on the old PR. On a Devin-built old PR,
+  put `(aside)` on the first line and the heading under it, or the comment
+  starts a paid Devin session. Post it with
+  `gh api repos/<owner>/<repo>/issues/<N>/comments -F body=@<file>`;
+  `gh pr comment` can be refused on a PR past its review limit.
+- **Open NEW PRs** with fresh round counts. When the last one opens, close the
+  old PR with a comment that maps every part of it, file by file, to the
+  `file:line` in a
+  replacement covering it (or says why that part is moot), and leave its labels
+  on. If any part is neither, leave the old PR open and name that part on it.
+  If the spec ends with a `Follow-up: <id>` line, copy that line into the body
+  of the replacement that will merge into main LAST. A merge into any other
+  base completes it too, so never put it on a PR that merges into another PR.
+- **Follow the spec's split plan.** Each PR carries one concern and names the
+  PRs it depends on. Open them in dependency order against main; a PR whose
+  dependency has not merged waits as a branch, or opens stacked with its base
+  named. Being a rework is not itself a reason to stay unsplit.
+- **Size every PR in counted lines** (`python3 scripts/pr_shape.py --base origin/main`; the rule is in `.claude/docs/premise-check.md`, step 6).
+  - Under 500 is the target.
+  - From 500 to 1,000, add a `Shape:` line to the PR body saying why it cannot
+    be smaller.
+  - Over 1,000 needs the owner's approval: ask in the acknowledgement or the
+    PR body; the owner decides before merge.
+
+  Size a stacked PR against its parent branch, not main.
+
+  This is a guideline: from 500 to 1,000, a stated, legitimate reason is enough.
+- **Report against the spec** in each PR body:
+  ```
+  ## Rework
+  Replaces: #N (spec: <link>; acknowledged: <link to your comment on the old PR>)
+  Split: PR k of n (<the others>)
+  Kept / deleted / reshaped as the spec asked: <one line each, or "as specified">
+  Deviations: <each: what differs, and the complication that forced it> | none
+  Questions answered: <each question the spec delegated or missed: the answer and why>
+  ```
+  Unforeseen complications are expected; unexplained deviations are not. Never
+  settle a question the spec left open silently, and never in the most
+  defensive direction without saying so. That is a design decision, and it
+  belongs in this section.
+
+Devin builds a rework the same way, as fresh PR(s) naming the old one, but never
+closes the old PR: the closing session closes it after the same coverage check.
+
+Full contract: `CLAUDE.md` ("Rework is a contract with two sides"),
+`.claude/docs/premise-check.md` ("Handing a verdict to a builder"), and the
+genesis-development skill ("Building a rework").
+
 ## Genesis skill path resolution
 
 **Every entry in the generated "Genesis Capability Surface" below carries its
