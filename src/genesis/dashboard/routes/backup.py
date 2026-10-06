@@ -85,6 +85,8 @@ _STATUS_SAFE_FIELDS = frozenset(
         "snapshot_count",
         "pruned_count",
         "tier1_pushed",
+        "extra_dirs_skipped",
+        "extra_upload_failed",
     }
 )
 
@@ -524,6 +526,16 @@ def _backup_health(
             "code": "tier1_unpushed",
             "reason": "Backups are not fully replicated to GitHub — the last run succeeded "
             "locally but commits are not pushed to the remote. Check the Backup tab.",
+        }
+    if (
+    (lb.get("extra_dirs_skipped") or 0) > 0
+    or (lb.get("extra_upload_failed") or 0) > 0
+):
+        return {
+            "state": "warn",
+            "code": "extra_dirs_incomplete",
+            "reason": "Some configured extra directories were not fully backed up. "
+            "Check the Backup tab for details.",
         }
 
     # 8. Off-site (Tier-2) copy configured but incomplete. Gate on the RESOLVED
