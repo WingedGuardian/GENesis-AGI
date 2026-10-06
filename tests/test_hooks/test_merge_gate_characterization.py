@@ -1418,6 +1418,55 @@ def test_check_pr_report_includes_scheduled_line_ok(monkeypatch, capsys):
     assert rc == 0
 
 
+def test_check_pr_report_names_an_outside_contribution_exemption(monkeypatch, capsys):
+    """An outside fork PR with no leaks marker PASSES, and the row says the review
+    was not required -- never 'ok (at head)', which would claim a review ran."""
+    _report_env(monkeypatch, scheduled="")
+    monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "leaks")  # the shipped default
+    monkeypatch.setenv(
+        "_TEST_GH_OUTSIDE_PR",
+        json.dumps(
+            {
+                "headRefOid": HEAD,
+                "isCrossRepository": True,
+                "authorAssociation": "FIRST_TIME_CONTRIBUTOR",
+                "author": {"__typename": "User", "login": "outsider"},
+                "userContentEdits": {"totalCount": 0, "nodes": []},
+                "timelineItems": {"filteredCount": 0, "nodes": []},
+            }
+        ),
+    )
+    monkeypatch.setenv(
+        "_TEST_GH_PR_COMMITS",
+        json.dumps(
+            {
+                "sha": HEAD,
+                "parents": 1,
+                "author": "outsider",
+                "committer": "outsider",
+                "message": "fix",
+            }
+        ),
+    )
+    monkeypatch.setenv(
+        "_TEST_GH_ROLLUP_WITH_HEAD",
+        json.dumps(
+            {
+                "headRefOid": HEAD,
+                "statusCheckRollup": [
+                    {"name": "leak-detector", "workflowName": "CI", "conclusion": "SUCCESS"}
+                ],
+            }
+        ),
+    )
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    sched_line = next(ln for ln in out.splitlines() if ln.startswith("scheduled-claude"))
+    assert "leaks not required: outside contribution by outsider" in sched_line
+    assert "at head" not in sched_line
+    assert rc == 0, out
+
+
 @pytest.mark.parametrize(
     "result, shown",
     [
