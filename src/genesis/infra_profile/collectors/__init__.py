@@ -23,6 +23,7 @@ from genesis.infra_profile.collectors.container import (
     collect_versions,
     collect_virt,
 )
+from genesis.infra_profile.collectors.falkordb_facts import collect_falkordb
 from genesis.infra_profile.collectors.qdrant_facts import collect_qdrant
 from genesis.infra_profile.collectors.sqlite_facts import collect_sqlite
 from genesis.infra_profile.types import SectionResult
@@ -38,6 +39,7 @@ CONTAINER_COLLECTORS: list[Callable[[], Awaitable[SectionResult]]] = [
     collect_kernel,
     collect_sqlite,
     collect_qdrant,
+    collect_falkordb,
     collect_network,
     collect_systemd,
     collect_versions,

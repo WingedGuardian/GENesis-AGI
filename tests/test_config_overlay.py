@@ -232,7 +232,11 @@ def test_no_unisolated_local_yaml_resolver():
     # roster peer, telling the operator where to declare one. It reads the
     # roster through genesis.cc.roster (which routes via merge_local_overlay);
     # the path appears only in the human-facing message text.
-    prose_mentions = {"mcp/health/reflex_status.py", "cc/conversation.py"}
+    # awareness/loop.py: the graph-engine posture alert's stand-down text names
+    # graphstore.local.yaml as one place to set `mode: networkx`; the mode reaches
+    # the loop as a collector fact read through genesis.memory.graphstore_config
+    # (infra_profile/collectors/falkordb_facts.py), never through this path.
+    prose_mentions = {"mcp/health/reflex_status.py", "cc/conversation.py", "awareness/loop.py"}
     accounted = independent_resolvers | shared_seam_users | prose_mentions
 
     found: set[str] = set()
