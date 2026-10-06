@@ -175,7 +175,8 @@ def test_ordinary_exception_is_deny_not_exit_one(adapter, monkeypatch, capsys):
     monkeypatch.setattr(adapter, "decide", lambda _: 1 / 0)
     monkeypatch.setattr(adapter.sys, "stdin", __import__("io").StringIO("{}"))
     assert adapter.main() == 2
-    assert not capsys.readouterr().out
+    # Only the explicit deny signal: never an allow, never ask JSON.
+    assert capsys.readouterr().out == "deny\n"
 
 
 @pytest.mark.parametrize("poisoned", [
@@ -354,7 +355,7 @@ def test_launcher_adds_no_second_stop_to_an_explained_deny(tmp_path):
     launcher = tmp_path / "codex-review-stop"
     launcher.write_bytes((HOOKS / "codex-review-stop").read_bytes())
     (tmp_path / "codex_review_stop.py").write_text(
-        "import sys\nprint('BLOCKED: explained', file=sys.stderr)\nsys.exit(2)\n"
+        "import sys\nprint('deny')\nprint('BLOCKED: explained', file=sys.stderr)\nsys.exit(2)\n"
     )
     run = subprocess.run(["bash", str(launcher)], input="{}", text=True, capture_output=True)
     assert run.returncode == 2
@@ -413,3 +414,58 @@ def test_approval_and_evidence_denials_still_stop(adapter, monkeypatch, capsys, 
     monkeypatch.setattr(adapter.sys, "stdin", __import__("io").StringIO(json.dumps(data)))
     assert adapter.main() == 2
     assert "STOP and handoff" in capsys.readouterr().err
+
+
+def test_launcher_explains_a_missing_evaluator(tmp_path):
+    """Review finding: python3 exits 2 for a missing script too, with nothing on
+    stdout, which the launcher must not take for an explained deny."""
+    launcher = tmp_path / "codex-review-stop"
+    launcher.write_bytes((HOOKS / "codex-review-stop").read_bytes())
+    run = subprocess.run(["bash", str(launcher)], input="{}", text=True, capture_output=True)
+    assert run.returncode == 2
+    assert "Stop and handoff" in run.stderr
+
+
+@pytest.mark.parametrize("stub", [
+    "import sys\nsys.exit(2)\n",  # exit 2 with no deny signal
+    "import sys\nprint('BLOCKED: x', file=sys.stderr)\nsys.exit(2)\n",
+])
+def test_launcher_requires_the_deny_signal_to_stay_silent(tmp_path, stub):
+    launcher = tmp_path / "codex-review-stop"
+    launcher.write_bytes((HOOKS / "codex-review-stop").read_bytes())
+    (tmp_path / "codex_review_stop.py").write_text(stub)
+    run = subprocess.run(["bash", str(launcher)], input="{}", text=True, capture_output=True)
+    assert run.returncode == 2
+    assert "Stop and handoff" in run.stderr
+
+
+@pytest.mark.parametrize("code", [1, 3, 126])
+def test_config_explains_any_other_launcher_failure(tmp_path, code):
+    """Review finding: a silent non-0/non-2 exit gave a deny with no message."""
+    repo = _repo_with_launcher(tmp_path, f"exit {code}")
+    run = _run_config(repo)
+    assert run.returncode == 2
+    assert f"review guard failed (exit {code})" in run.stderr
+
+
+def test_the_real_chain_explains_every_deny_once(tmp_path):
+    """The real evaluator, launcher and config: one explanation, no second line."""
+    hooks = tmp_path / "scripts" / "hooks"
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    hooks.mkdir(parents=True)
+    for name in ("codex-review-stop", "codex_review_stop.py"):
+        (hooks / name).write_bytes((HOOKS / name).read_bytes())
+    for dep in HOOKS.glob("*.py"):
+        if not (hooks / dep.name).exists():
+            (hooks / dep.name).symlink_to(dep)
+    for dep in (ROOT / "scripts").glob("*.py"):
+        (tmp_path / "scripts" / dep.name).symlink_to(dep)
+    data = {"tool_name": "Bash", "cwd": str(tmp_path), "tool_input": {"command": "git add -A && git commit -m x"}}
+    run = subprocess.run(
+        ["bash", "-c", _config_command()], cwd=tmp_path, input=json.dumps(data),
+        text=True, capture_output=True, timeout=60,
+    )
+    assert run.returncode == 2
+    assert run.stdout == ""
+    assert run.stderr.count("BLOCKED") == 1
+    assert "run it again" in run.stderr

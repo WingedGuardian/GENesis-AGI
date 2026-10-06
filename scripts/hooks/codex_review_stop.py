@@ -191,6 +191,10 @@ def main() -> int:
     if reason is None:
         print("allow")
         return 0
+    # "deny" on stdout tells the launcher this denial was explained here. An
+    # interpreter that never ran this file (a missing or unreadable script also
+    # exits 2) prints nothing to stdout, so it cannot be mistaken for one.
+    print("deny")
     if isinstance(reason, Fixable):
         print(
             f"BLOCKED: {reason}\nThis is not an approval stop. Rewrite the command "
