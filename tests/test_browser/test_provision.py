@@ -378,7 +378,7 @@ def test_an_in_place_engine_that_does_not_launch_rolls_the_packages_back(
     outcome = _tx(tmp_path).run()
     assert [c[3] for c in run.pip_calls()] == ["install"]
     assert "camoufox==0.5.6" in run.pip_calls()[0]
-    assert "engine=True, launch=False" in outcome
+    assert "engine=True" in outcome and "launch=False" in outcome
     assert "installed but did not launch" in outcome
     caps = json.loads(provision.CAPABILITIES_FILE.read_text())
     assert caps["browser_automation"]["status"] == "degraded"
@@ -397,7 +397,9 @@ def test_a_signal_during_the_swap_waits_and_keeps_the_new_packages(
     def rename(self, target):
         if self == stack and not sent:
             sent.append(1)
-            os.kill(os.getpid(), signal.SIGTERM)
+            # Aimed at this thread, which holds signals (another thread of the
+            # test process could otherwise take a process-directed signal).
+            signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
             time.sleep(0.2)
         return real_rename(self, target)
 
