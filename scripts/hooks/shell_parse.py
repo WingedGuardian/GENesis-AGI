@@ -4025,6 +4025,131 @@ def gh_pr_subcommand(argv: list[str]) -> str | None:
     return None
 
 
+#: ``gh api`` options that add a request parameter. MEASURED from ``gh api
+#: --help`` (gh 2.101.0): any of them switches the default method from GET to
+#: POST, and ``-F key=@file`` reads the value from a file.
+_GH_API_FIELD_FLAGS = frozenset({"-f", "--raw-field", "-F", "--field"})
+
+
+class GhApiRequest(NamedTuple):
+    """A ``gh api`` invocation as gh will send it, read from argv alone.
+
+    ``method`` is the effective HTTP method, upper-cased: the ``-X``/``--method``
+    value when given (the LAST one, as gh keeps it), otherwise POST when any
+    parameter or ``--input`` body is supplied, otherwise GET — gh's own
+    documented defaulting. ``fields`` are the ``(key, value)`` pairs of every
+    parameter flag; ``has_input`` is a ``--input`` body (a file or stdin, whose
+    content argv cannot show). ``unmodelled`` are dashed tokens no modeled flag
+    row classifies, returned for the CALLER to choose a fail direction, as
+    :func:`gh_command` does.
+    """
+
+    endpoint: str | None
+    method: str
+    fields: tuple[tuple[str, str], ...]
+    has_input: bool
+    unmodelled: tuple[str, ...]
+
+
+def gh_api_request(argv: list[str]) -> GhApiRequest | None:
+    """Structured read of a ``gh api`` argv, or None when ``api`` is not the group.
+
+    Options are read on BOTH sides of the group word, as gh accepts them there
+    (``gh -X PATCH api …`` resolves), with the same two-phase flag table
+    :func:`gh_command` uses: the union before the command path, the ``api`` row
+    after it, so a value is never mistaken for a flag (``gh api … -i -X PATCH``
+    keeps its PATCH). The endpoint is the first positional after the path."""
+    inv = gh_command(argv)
+    if inv is None or inv.group != "api":
+        return None
+    api_values = _GH_FLAG_TABLE[("api", "")][0]
+    fields: list[tuple[str, str]] = []
+    method: str | None = None
+    has_input = False
+    positional_only = False
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if positional_only or not tok.startswith("-") or tok == "-":
+            i += 1
+            continue
+        if tok == "--":
+            positional_only = True
+            i += 1
+            continue
+        flags = _GH_ALL_VALUE_FLAGS if i < inv.path_end else api_values
+        name, value = _gh_option(tok, flags)
+        if value is None and name in flags:
+            i += 1
+            value = argv[i] if i < len(argv) else ""
+        if value is not None:
+            if name in _GH_API_FIELD_FLAGS:
+                key, _sep, val = value.partition("=")
+                fields.append((key, val))
+            elif name in ("-X", "--method"):
+                method = value
+            elif name == "--input":
+                has_input = True
+        i += 1
+    if method is None:
+        method = "POST" if fields or has_input else "GET"
+    return GhApiRequest(
+        inv.positionals[0] if inv.positionals else None,
+        method.upper(),
+        tuple(fields),
+        has_input,
+        inv.unmodelled,
+    )
+
+
+_GH_HELP_FLAGS = frozenset({"-h", "--help"})
+
+
+def gh_requests_help(argv: list[str]) -> bool:
+    """Whether a ``gh`` argv only prints help: ``-h``/``--help`` present as a FLAG.
+
+    A flag's VALUE is not a flag: ``gh pr comment 5 --body --help`` posts the
+    text ``--help`` (a string flag takes the next argument even when it starts
+    with a dash). So each value flag's argument is skipped, with the same
+    two-phase table :func:`gh_command` uses — the union before the command path,
+    the resolved row after it.
+
+    A flag no table knows could take a value too (MEASURED, gh 2.101:
+    ``gh variable get FOO --env --help`` RAN, with ``--help`` as the env name),
+    so help counts only when every dashed token before it is a KNOWN flag: one
+    of the resolved row's, or, before the path, ``-R``/``--repo``. A command
+    whose row is not modelled therefore counts as help only when nothing dashed
+    comes before the help flag. Any doubt reads as "runs"."""
+    inv = gh_command(argv)
+    if inv is None:
+        return False
+    row = _GH_FLAG_TABLE.get((inv.group, inv.subcommand or ""))
+    post_values = row[0] if row is not None else frozenset()
+    post_known = (row[0] | row[1]) if row is not None else frozenset()
+    pre_values = frozenset({"-R", "--repo"})
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            return False
+        if not tok.startswith("-") or tok == "-":
+            i += 1
+            continue
+        pre = i < inv.path_end
+        values = pre_values if pre else post_values
+        name, glued = _gh_option(tok, values)
+        if name in _GH_HELP_FLAGS and glued is None:
+            return True
+        if name in values:
+            i += 1 if glued is not None else 2
+            continue
+        if not pre and name in post_known:
+            i += 1
+            continue
+        return False  # an unknown flag: it may have taken the next word
+    return False
+
+
 def commit_skips_hooks(argv: list[str]) -> bool:
     """Whether a ``git commit`` argv carries --no-verify / -n (bundled or not).
 

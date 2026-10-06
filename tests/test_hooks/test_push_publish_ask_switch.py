@@ -1072,7 +1072,7 @@ def test_a_subagent_push_or_create_is_denied(monkeypatch, tmp_path, capsys, poli
     repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
     rc, out, err = _run_at(monkeypatch, capsys, command, repo, _SUBAGENT)
     assert rc == 2, (command, rc, out, err)
-    assert "subagents do not publish" in err, err
+    assert "only the main session publishes" in err, err
     assert "git rev-parse HEAD" in err and "main session" in err, err
     assert not out.strip(), out  # no prompt, no note: the owner sees nothing
 
@@ -1083,7 +1083,7 @@ def test_a_subagent_repush_of_a_published_branch_is_denied(monkeypatch, tmp_path
     monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
     repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
     rc, out, err = _run_at(monkeypatch, capsys, "git push origin feat/x", repo, _SUBAGENT)
-    assert rc == 2 and "subagents do not publish" in err, (rc, out, err)
+    assert rc == 2 and "only the main session publishes" in err, (rc, out, err)
 
 
 def test_a_dispatched_subagent_is_still_denied(monkeypatch, tmp_path, capsys) -> None:
@@ -1108,7 +1108,7 @@ def test_a_main_thread_push_is_unaffected(monkeypatch, tmp_path, capsys, off, ex
     repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
     rc, out, err = _run_at(monkeypatch, capsys, "git push -u origin HEAD", repo, extra)
     _assert_silenced(rc, out, err)
-    assert "subagents do not publish" not in err
+    assert "only the main session publishes" not in err
 
 
 def test_a_main_thread_push_still_asks_by_default(monkeypatch, tmp_path, capsys) -> None:
@@ -1123,5 +1123,235 @@ def test_a_main_thread_push_still_asks_by_default(monkeypatch, tmp_path, capsys)
 def test_a_subagent_that_does_not_publish_is_not_refused(monkeypatch, tmp_path, capsys, command):
     repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
     rc, out, err = _run_at(monkeypatch, capsys, command, repo, _SUBAGENT)
-    assert "subagents do not publish" not in err, (command, err)
+    assert "only the main session publishes" not in err, (command, err)
     assert rc == 0, (command, rc, out, err)
+
+
+# ─── every GitHub write, not only push/create (owner decision 2026-10-05) ─────
+#
+# Each command below writes to GitHub. From a subagent it is refused with the
+# hand-back message; from the main thread the SAME command is never refused by
+# this rule (it may still meet the guard's other gates, which are not this test's
+# subject). The classifier is driven through `main()`; the read list beside it
+# pins what a subagent keeps.
+
+_GITHUB_WRITES = [
+    # The incident: a subagent's review request reached the owner as a prompt.
+    "gh pr comment 5 --body '@codex review'",
+    "gh pr comment 5 --body 'an ordinary comment'",
+    "gh pr review 5 --approve",
+    "gh pr review 5 --comment -b looks-fine",
+    "gh pr edit 5 --add-label x",
+    "gh pr ready 5",
+    "gh pr ready 5 --undo",
+    "gh pr reopen 5",
+    "gh pr close 5",
+    "gh pr merge 5 --squash --admin",
+    "gh pr lock 5",
+    "gh pr update-branch 5",
+    "gh -R owner/repo pr comment 5 -b x",
+    "gh issue create --title t --body b",
+    "gh issue comment 7 --body x",
+    "gh issue edit 7 --add-label x",
+    "gh issue close 7",
+    "gh issue reopen 7",
+    "gh issue develop 7",
+    "gh release create v1",
+    "gh release upload v1 a.tgz",
+    "gh repo edit --description x",
+    "gh repo fork",
+    "gh repo sync",
+    "gh label create bug",
+    "gh gist create f.txt",
+    "gh workflow run ci.yml",
+    "gh workflow enable ci.yml",
+    "gh run rerun 123",
+    "gh run cancel 123",
+    "gh cache delete key",
+    "gh secret set NAME --body x",
+    "gh variable set NAME --body x",
+    "gh project item-add 1 --owner o --url u",
+    "gh codespace create",  # a group in neither table: unknown effect
+    "gh my-alias 5",  # a gh alias or extension: unknown effect
+    # REST writes: an explicit method, or a parameter (gh then defaults to POST).
+    "gh api -X POST repos/o/r/issues/5/comments -f body=x",
+    "gh api repos/o/r/pulls/5/comments -f body=fixed -F in_reply_to=123",
+    "gh api --method PATCH repos/o/r/pulls/5 -f state=closed",
+    "gh api -XDELETE repos/o/r/git/refs/heads/x",
+    "gh -X PUT api repos/o/r/pulls/5/merge",
+    "gh api repos/o/r/issues --input body.json",
+    # GraphQL: a mutation, or a query the command line does not show.
+    "gh api graphql -f query='mutation { addComment(input: {}) { clientMutationId } }'",
+    "gh api graphql -F query=@q.graphql",
+    "gh api graphql --input q.json",
+    # git publishing plumbing.
+    "git send-pack https://github.com/owner/repo HEAD",
+    "git http-push https://github.com/owner/repo HEAD",
+    "git lfs push origin feat/x",
+    # Nested, and chained behind a read.
+    "bash -c 'gh pr comment 5 --body x'",
+    "gh pr view 5 && gh pr comment 5 --body x",
+    # A flag before the verb: gh's lookup swallows the next word as its value, so
+    # the word that looks like a read verb is not the command that runs (MEASURED
+    # with `--help` appended, gh 2.101: each resolves to the write named last).
+    "gh pr --admin view merge 5",
+    "gh pr --yes view comment 5 -b x",
+    "gh release --draft list create --notes x",
+    "gh label --force list create",
+    "gh repo --clone list fork",
+    "gh secret --no-store list set NAME",
+    "gh --foo search pr comment 5 -b x",
+    # GraphQL whose text the command line does not show.
+    'gh api graphql -f query="$(cat q.graphql)"',
+    'gh api graphql -f query="$Q"',
+    'gh api graphql -f query="query { viewer { login } } $(cat more.graphql)"',
+    "gh api graphql -f query='query { a }`cat more.graphql`'",
+    "gh api graphql -f owner=o",
+    # A method override header, whatever method it names.
+    "gh api repos/o/r/pulls/5 -H 'X-HTTP-Method-Override: DELETE'",
+    # Running an extension, and git's other pushers.
+    "gh extension exec my-ext",
+    "gh ext exec my-ext",
+    "git subtree push --prefix=docs origin gh-pages",
+    # `--help` as an unknown flag's value is not help: gh runs the command.
+    "gh release create v1 --notes --help",
+    "gh label create x --description --help",
+    # `--version` belongs to the root command; after a group it swallows a word.
+    "gh pr --version view comment 5 -b x",
+    # GraphQL treats a comma as whitespace.
+    "gh api graphql -f query='query{viewer{login}},mutation{addStar(input:{}){x}}'",
+    # Extension and alias names may carry capitals and underscores.
+    "gh My_Ext run",
+    "gh foo_bar",
+]
+
+_GITHUB_READS = [
+    "gh pr view 5",
+    "gh pr list --state open",
+    "gh pr diff 5",
+    "gh pr checks 5",
+    "gh pr status",
+    "gh pr checkout 5",
+    "gh pr",
+    "gh issue view 7",
+    "gh issue list",
+    "gh run view 123 --log",
+    "gh run watch 123",
+    "gh workflow list",
+    "gh release view v1",
+    "gh repo view owner/repo",
+    "gh search prs foo",
+    "gh status",
+    "gh auth status",
+    "gh --version",
+    "gh api repos/o/r/pulls/5/comments",
+    "gh api repos/o/r/pulls/5/comments --paginate --jq '.[].body'",
+    "gh api -X GET search/issues -f q=repo:o/r",
+    "gh api graphql -f query='query { viewer { login } }'",
+    "gh api graphql -f query='query($n: Int!) { viewer { repositories(first: $n) { totalCount } } }' -F n=5",
+    'gh api graphql -f query=\'query { m: __type(name: "Mutation") { name } }\'',
+    "git fetch origin",
+    "git ls-remote origin",
+    # Help lookups print text and run nothing (the largest wrongly-refused group).
+    "gh pr merge 5 --squash --help",
+    "gh pr ready --help",
+    "gh label create -h",
+    "gh api --help",
+    # gh's own aliases for reads.
+    "gh pr ls",
+    "gh pr co 5",
+    "gh issue ls",
+    "gh ext list",
+    "gh rs list",
+    "gh repo gitignore list",
+    "gh -R owner/repo pr view 5",
+    "gh pr --repo=owner/repo view 5",
+    "gh pr --help view comment",  # help IS declared at the group level
+    # No verb: every word after the group is a flag value, nothing is hidden.
+    "gh status -o myorg",
+    "gh completion -s bash",
+    "gh browse -n",
+]
+
+
+def test_a_value_that_reads_as_help_is_not_help() -> None:
+    """`--body --help` posts the text "--help": the flag's value is not a flag."""
+    segs, _ = gpg.analyze_checked("gh pr comment 5 --body --help")
+    assert gpg._github_write_segment(segs[0]) == "gh pr comment"
+
+
+def test_heredoc_text_that_starts_with_gh_is_not_a_gh_call() -> None:
+    """A here-doc line `gh = Fake()` parses as a segment whose group is `=`."""
+    command = "cat >> t.py <<'EOF'\ngh = FakeGh()\nEOF"
+    segs, _ = gpg.analyze_checked(command)
+    assert any(s.exe == "gh" for s in segs), "fixture no longer yields a gh segment"
+    assert not any(gpg._github_write_segment(s) for s in segs), [s.argv for s in segs]
+
+
+@pytest.mark.parametrize("command", _GITHUB_WRITES)
+def test_a_subagent_github_write_is_denied(monkeypatch, tmp_path, capsys, command) -> None:
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    rc, out, err = _run_at(monkeypatch, capsys, command, repo, _SUBAGENT)
+    assert rc == 2, (command, rc, out, err)
+    assert "only the main session publishes" in err, (command, err)
+    assert "git rev-parse HEAD" in err, err
+    assert not out.strip(), out  # no prompt, no note: the owner sees nothing
+
+
+@pytest.mark.parametrize("command", _GITHUB_WRITES)
+def test_the_classifier_calls_every_listed_write_a_write(command) -> None:
+    """The same list at the classifier, so a miss names the segment rather than
+    depending on whatever else `main()` would have done with it."""
+    segs, _ = gpg.analyze_checked(command)
+    assert any(gpg._github_write_segment(s) for s in segs), command
+
+
+@pytest.mark.parametrize("command", _GITHUB_READS)
+def test_a_subagent_github_read_is_not_refused(command) -> None:
+    segs, _ = gpg.analyze_checked(command)
+    assert not any(gpg._github_write_segment(s) for s in segs), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr comment 5 --body x",
+        "gh pr review 5 --approve",
+        "gh issue comment 7 --body x",
+        "gh api -X POST repos/o/r/issues/5/comments -f body=x",
+        "gh api graphql -f query='mutation { x }'",
+        "gh release create v1",
+    ],
+)
+def test_a_main_thread_github_write_is_not_refused_by_this_rule(
+    monkeypatch, tmp_path, capsys, command
+) -> None:
+    """Main-session control: the same writes from the main thread are untouched
+    (none of these is one the guard otherwise gates)."""
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    rc, out, err = _run_at(monkeypatch, capsys, command, repo)
+    assert "only the main session publishes" not in err, (command, err)
+    assert rc == 0, (command, rc, out, err)
+
+
+def test_a_subagent_review_request_is_denied_before_the_round_lookup(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The prompt that reached the owner: a review request the round budget turns
+    into an ask. From the main thread it still asks; from a subagent it is refused
+    and the budget lookup (a network call) never runs."""
+    calls = []
+
+    def fake_escalation(segs, cmd="", payload=None):
+        calls.append(cmd)
+        return "ask", "review round needs approval"
+
+    monkeypatch.setattr(gpg, "_check_codex_round_escalation", fake_escalation)
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    command = "gh pr comment 5 --body '@codex review'"
+    rc, out, err = _run_at(monkeypatch, capsys, command, repo)
+    _assert_asks(rc, out, err)
+    assert len(calls) == 1
+    rc, out, err = _run_at(monkeypatch, capsys, command, repo, _SUBAGENT)
+    assert rc == 2 and "only the main session publishes" in err, (rc, out, err)
+    assert len(calls) == 1, "the subagent's request reached the round lookup"
