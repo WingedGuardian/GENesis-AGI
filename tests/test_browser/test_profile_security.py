@@ -62,3 +62,49 @@ def test_registrable_domains_still_clear(domain):
     from genesis.browser.profile import normalize_domain
 
     assert normalize_domain(domain) == domain
+
+
+@pytest.mark.parametrize(
+    ("domain", "ascii_form"),
+    [
+        ("bücher.example", "xn--bcher-kva.example"),
+        ("Bücher.Example", "xn--bcher-kva.example"),
+        # UTS46 non-transitional, as browsers store it; the stdlib codec
+        # (IDNA 2003) would give strasse.de, a different site.
+        ("straße.de", "xn--strae-oqa.de"),
+    ],
+)
+def test_an_internationalized_domain_matches_its_ascii_cookie_host(domain, ascii_form):
+    """Devin round 1: browsers store cookie hosts as ASCII IDNA labels, so a
+    Unicode domain matched nothing and the logout reported zero."""
+    from genesis.browser.profile import normalize_domain
+
+    assert normalize_domain(domain) == ascii_form
+
+
+def test_an_internationalized_domain_clears_from_the_profile_file(tmp_path):
+    mgr = _camoufox_profile(
+        tmp_path / "camoufox-profile", [".xn--bcher-kva.example", ".example.com"]
+    )
+    assert mgr.clear_domain("bücher.example") == 1
+    assert {s.domain for s in mgr.get_info().sessions} == {"example.com"}
+
+
+@pytest.mark.parametrize("suffix", ["公司.cn", "ｃｏ．ｕｋ"])
+def test_an_internationalized_public_suffix_is_still_refused(suffix):
+    """The suffix check runs on the encoded form: full-width ``ｃｏ．ｕｋ``
+    is ``co.uk`` once encoded, and had no ASCII dot before."""
+    from genesis.browser.profile import normalize_domain
+
+    with pytest.raises(ValueError, match="public suffix"):
+        normalize_domain(suffix)
+
+
+@pytest.mark.parametrize("domain", ["x.com.", "X.COM.", "x.com。", "bücher.example."])
+def test_a_trailing_dot_is_dropped(domain):
+    """A trailing dot (FQDN spelling) matched no cookie host, so the clear
+    reported zero while the cookies stayed."""
+    from genesis.browser.profile import normalize_domain
+
+    assert not normalize_domain(domain).endswith(".")
+    assert normalize_domain(domain) in {"x.com", "xn--bcher-kva.example"}

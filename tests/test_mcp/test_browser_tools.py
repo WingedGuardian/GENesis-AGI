@@ -1472,6 +1472,94 @@ class TestCookieToolsBothProfiles:
 
         assert normalize_domain("localhost") == "localhost"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("impl", ["sessions", "clear"])
+    async def test_a_cookie_call_waits_for_a_browser_that_is_starting(self, tmp_path, impl):
+        """Devin round 1 (severe): mid-startup the context is still unset, so a
+        cookie call that skipped the lifecycle lock fell back to the profile
+        FILE while the browser was opening it. It must wait and use the live
+        context once startup completes."""
+        ctx = MagicMock()
+        ctx.cookies = AsyncMock(return_value=[{"domain": ".x.com"}])
+        ctx.clear_cookies = AsyncMock()
+        started = asyncio.Event()
+
+        async def starting_browser():
+            async with browser._browser_lock:
+                browser._stealth_cm = MagicMock()  # __aenter__ still pending
+                started.set()
+                await asyncio.sleep(0.05)
+                browser._stealth_browser = ctx
+
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            launch = asyncio.create_task(starting_browser())
+            await started.wait()
+            if impl == "sessions":
+                result = await browser._impl_browser_sessions()
+            else:
+                result = await browser._impl_browser_clear_domain("x.com")
+            await launch
+        assert result["profiles"][0]["source"] == "live browser"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_clears_do_not_count_the_same_cookies_twice(self, tmp_path):
+        """Codex round 1 (P2): two clears that both read the jar before either
+        cleared it each reported the same cookies as removed."""
+        jar = [{"domain": ".x.com"}, {"domain": "api.x.com"}]
+
+        async def cookies():
+            await asyncio.sleep(0)
+            return list(jar)
+
+        async def clear_cookies(domain):
+            await asyncio.sleep(0)
+            jar[:] = [c for c in jar if not domain.match(c["domain"])]
+
+        ctx = _live_camoufox_ctx([])
+        ctx.cookies = MagicMock(side_effect=cookies)
+        ctx.clear_cookies = MagicMock(side_effect=clear_cookies)
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            a, b = await asyncio.gather(
+                browser._impl_browser_clear_domain("x.com"),
+                browser._impl_browser_clear_domain("x.com"),
+            )
+        assert a["cookies_removed"] + b["cookies_removed"] == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("impl", ["sessions", "clear"])
+    async def test_a_cookie_call_refreshes_the_idle_clock(self, tmp_path, monkeypatch, impl):
+        """Devin round 1: cookie tools left _last_used alone, so a session using
+        only them had its live browser closed by the idle watcher."""
+        monkeypatch.setattr(browser, "_last_used", 0.0)
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            if impl == "sessions":
+                await browser._impl_browser_sessions()
+            else:
+                await browser._impl_browser_clear_domain("x.com")
+        assert browser._last_used > 0
+
+    @pytest.mark.asyncio
+    async def test_an_internationalized_domain_clears_live_ascii_cookies(self, tmp_path):
+        ctx = _live_camoufox_ctx([{"domain": ".xn--bcher-kva.example"}, {"domain": ".example.com"}])
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            result = await browser._impl_browser_clear_domain("bücher.example")
+        assert result["domain"] == "xn--bcher-kva.example"
+        assert result["profiles"][0]["removed"] == 1
+        pattern = ctx.clear_cookies.call_args.kwargs["domain"]
+        assert pattern.match(".xn--bcher-kva.example") and not pattern.match(".example.com")
+
 
 # Must stay in step with scripts/browser.py's copy of the scheme
 # (tests/test_scripts/test_browser_cli_screenshot_path.py asserts the same

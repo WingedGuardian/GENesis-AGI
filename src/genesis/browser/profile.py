@@ -46,10 +46,25 @@ class ProfileInUse(RuntimeError):
 
 
 def normalize_domain(domain: str) -> str:
-    """Lower-case a domain and drop a leading dot; reject anything else."""
-    d = (domain or "").strip().lower().lstrip(".")
+    """Lower-case a domain, drop leading and trailing dots and encode Unicode
+    labels to their ASCII (IDNA) form; reject anything else. Cookie hosts carry
+    no trailing dot, so ``x.com.`` (the FQDN spelling) must become ``x.com``
+    or it would match nothing."""
+    d = (domain or "").strip().lower().strip(".")
     if not d or any(c.isspace() or c in "/:%*?" for c in d):
         raise ValueError(f"not a domain: {domain!r}")
+    if not d.isascii():
+        # Browsers store cookie hosts as ASCII IDNA labels, so a Unicode
+        # domain would match nothing. UTS46 non-transitional, as browsers
+        # encode (straße.de is xn--strae-oqa.de; the stdlib codec gives
+        # strasse.de, another site). ASCII input is left as is.
+        import idna
+
+        try:
+            # UTS46 maps a full-width or ideographic dot to ".", so strip again.
+            d = idna.encode(d, uts46=True).decode("ascii").strip(".")
+        except idna.IDNAError as exc:
+            raise ValueError(f"not a domain: {domain!r} ({exc})") from exc
     # A bare label ("com") would match every cookie under that TLD in both
     # profiles; only localhost is a real single-label cookie host.
     if "." not in d and d != "localhost":

@@ -2380,7 +2380,8 @@ def _live_cookie_context(kind: str):
     context, and the user closing one tab leaves the context (and its lock on
     the profile) in place. A context this process holds counts until cleanup
     clears it; a crashed one makes the cookie call fail, which is reported as
-    an error, never as an empty result.
+    an error, never as an empty result. Callers hold ``_browser_lock`` so a
+    browser that is still starting is waited for, not missed.
     """
     if kind == "camoufox":
         return _stealth_browser if _stealth_cm is not None else None
@@ -2392,6 +2393,8 @@ def _live_cookie_context(kind: str):
 # these two tools have no tool-level timeout. A cookie read or clear on a
 # healthy browser returns in well under a second, so 30 s means a hung browser,
 # and the profile then reports an error instead of blocking the tool forever.
+# The tools also wait for _browser_lock first; every holder of that lock runs
+# under its own tool timeout, so that wait ends when the holder's does.
 _COOKIE_CALL_TIMEOUT_S: float = 30.0
 
 
@@ -2409,51 +2412,55 @@ async def _impl_browser_sessions() -> dict:
 
     Does NOT launch a browser. A profile whose browser runs in this process is
     read through the live context; otherwise the cookie file is read
-    read-only. Each entry says which source it used.
+    read-only. Each entry says which source it used. Holds ``_browser_lock``
+    (see :func:`_impl_browser_clear_domain`).
     """
     from collections import Counter
 
     from genesis.browser.profile import BrowserProfileManager
 
+    _touch()
     profiles = []
-    for kind, pdir in _cookie_profiles():
-        entry: dict = {"browser": kind, "profile_path": str(pdir)}
-        try:
-            ctx = _live_cookie_context(kind)
-            if ctx is not None:
-                counts = Counter(
-                    (c.get("domain") or "").lstrip(".") for c in await _cookie_call(ctx.cookies())
-                )
-                entry.update(
-                    source="live browser",
-                    exists=True,
-                    sessions=[
-                        {"domain": d, "cookie_count": n} for d, n in sorted(counts.items())
-                    ],
-                )
-            else:
-                mgr = BrowserProfileManager(pdir, browser=kind)
-                info = mgr.get_info()
-                entry.update(
-                    source="profile file",
-                    exists=info.exists,
-                    size_mb=info.size_mb,
-                    sessions=[
-                        {"domain": s.domain, "cookie_count": s.cookie_count}
-                        for s in info.sessions
-                    ],
-                )
-                if info.error:
-                    entry["error"] = info.error
-                pid = mgr.running_pid()
-                if pid is not None:
-                    entry["note"] = (
-                        f"open in another browser process (pid {pid}); the file "
-                        "can lag that browser's live cookies"
+    async with _browser_lock:
+        for kind, pdir in _cookie_profiles():
+            entry: dict = {"browser": kind, "profile_path": str(pdir)}
+            try:
+                ctx = _live_cookie_context(kind)
+                if ctx is not None:
+                    counts = Counter(
+                        (c.get("domain") or "").lstrip(".")
+                        for c in await _cookie_call(ctx.cookies())
                     )
-        except Exception as e:
-            entry["error"] = f"Failed to read {kind} sessions: {e}"
-        profiles.append(entry)
+                    entry.update(
+                        source="live browser",
+                        exists=True,
+                        sessions=[
+                            {"domain": d, "cookie_count": n} for d, n in sorted(counts.items())
+                        ],
+                    )
+                else:
+                    mgr = BrowserProfileManager(pdir, browser=kind)
+                    info = mgr.get_info()
+                    entry.update(
+                        source="profile file",
+                        exists=info.exists,
+                        size_mb=info.size_mb,
+                        sessions=[
+                            {"domain": s.domain, "cookie_count": s.cookie_count}
+                            for s in info.sessions
+                        ],
+                    )
+                    if info.error:
+                        entry["error"] = info.error
+                    pid = mgr.running_pid()
+                    if pid is not None:
+                        entry["note"] = (
+                            f"open in another browser process (pid {pid}); the file "
+                            "can lag that browser's live cookies"
+                        )
+            except Exception as e:
+                entry["error"] = f"Failed to read {kind} sessions: {e}"
+            profiles.append(entry)
     return {"profiles": profiles}
 
 
@@ -2465,6 +2472,12 @@ async def _impl_browser_clear_domain(domain: str) -> dict:
     this process is cleared through the live context, a closed one in its
     cookie file, and one open in another process is refused (that browser
     would write its cookies back) with the reason in its entry.
+
+    Holds ``_browser_lock``, which browser startup and stale-page restarts also
+    hold: mid-startup the context is still unset, so an unlocked call would
+    edit the profile FILE the browser is opening, and two concurrent clears
+    would both count the same cookies. Refreshes the idle clock like every
+    other browser tool, so a session using only these keeps its browser.
     """
     from genesis.browser.profile import (
         BrowserProfileManager,
@@ -2478,29 +2491,31 @@ async def _impl_browser_clear_domain(domain: str) -> dict:
     except ValueError as e:
         return {"error": str(e)}
 
+    _touch()
     total = 0
     profiles = []
-    for kind, pdir in _cookie_profiles():
-        entry: dict = {"browser": kind}
-        try:
-            ctx = _live_cookie_context(kind)
-            if ctx is not None:
-                n = sum(
-                    domain_matches(c.get("domain", ""), d)
-                    for c in await _cookie_call(ctx.cookies())
-                )
-                if n:
-                    await _cookie_call(ctx.clear_cookies(domain=_domain_cookie_pattern(d)))
-                entry.update(source="live browser", removed=n)
-            else:
-                n = BrowserProfileManager(pdir, browser=kind).clear_domain(d)
-                entry.update(source="profile file", removed=n)
-            total += n
-        except ProfileInUse as e:
-            entry["error"] = str(e)
-        except Exception as e:
-            entry["error"] = f"Failed to clear {kind} cookies: {e}"
-        profiles.append(entry)
+    async with _browser_lock:
+        for kind, pdir in _cookie_profiles():
+            entry: dict = {"browser": kind}
+            try:
+                ctx = _live_cookie_context(kind)
+                if ctx is not None:
+                    n = sum(
+                        domain_matches(c.get("domain", ""), d)
+                        for c in await _cookie_call(ctx.cookies())
+                    )
+                    if n:
+                        await _cookie_call(ctx.clear_cookies(domain=_domain_cookie_pattern(d)))
+                    entry.update(source="live browser", removed=n)
+                else:
+                    n = BrowserProfileManager(pdir, browser=kind).clear_domain(d)
+                    entry.update(source="profile file", removed=n)
+                total += n
+            except ProfileInUse as e:
+                entry["error"] = str(e)
+            except Exception as e:
+                entry["error"] = f"Failed to clear {kind} cookies: {e}"
+            profiles.append(entry)
     return {"domain": d, "cookies_removed": total, "profiles": profiles}
 
 
