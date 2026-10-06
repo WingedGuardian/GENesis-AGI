@@ -606,11 +606,38 @@ def _bash_command(payload: dict) -> str:
     return cmd if isinstance(cmd, str) else ""
 
 
+_PATH_CHAR = re.compile(r"[A-Za-z0-9._~/-]")
+
+
+def _names_root(command: str) -> bool:
+    """Does ``command`` name the deploy root AS A PATH: the root itself or a path
+    under it, at component boundaries on both sides, and not continuing into a
+    linked worktree nested under it (``.claude/worktrees/``, ``.worktrees/``)? A
+    plain substring test would also match every worktree path and every sibling
+    sharing the root as a prefix (``<root>-old``), handing those calls restore
+    commands for changes they did not make."""
+    root = str(_SELF_ROOT)
+    start = command.find(root)
+    while start != -1:
+        end = start + len(root)
+        before = command[start - 1] if start else ""
+        after = command[end : end + 1]
+        rest = command[end:]
+        if (
+            not (before and _PATH_CHAR.match(before))
+            and not (after and after != "/" and _PATH_CHAR.match(after))
+            and not rest.startswith(("/.claude/worktrees/", "/.worktrees/"))
+        ):
+            return True
+        start = command.find(root, start + 1)
+    return False
+
+
 def _mentions_root(payload: dict, git: _Git) -> bool:
     """Does this call point at the deploy root — its path in the command text,
     or the session's cwd inside it? Gates the can't-check notes, so they appear
     only where they can matter."""
-    if str(_SELF_ROOT) in _bash_command(payload):
+    if _names_root(_bash_command(payload)):
         return True
     cwd = payload.get("cwd")
     if not isinstance(cwd, str) or not cwd:

@@ -558,6 +558,42 @@ def test_the_root_path_in_the_command_makes_the_call_attributable(bw):
     assert f"{_G} -C {bw['install']} checkout -- README.md" in text, text
 
 
+@pytest.mark.parametrize(
+    "named",
+    [
+        "{install}/.claude/worktrees/wt/README.md",  # a worktree nested under the root
+        "{install}-old/README.md",  # a sibling path sharing the root as a prefix
+        "{install}x",
+    ],
+)
+def test_a_path_that_only_starts_with_the_root_does_not_make_the_call_attributable(bw, named):
+    """The root's path must appear as a PATH, at a component boundary, and not
+    continue into a linked worktree: otherwise every command that names a
+    worktree under the root would be handed restore commands for another
+    actor's change."""
+    tid = "toolu_prefix"
+    cmd = "ls " + named.format(install=bw["install"]) + " >/dev/null 2>&1; true"
+    assert _hook(bw, _bash_payload("PreToolUse", cmd, bw["base"], tid)).returncode == 0
+    (bw["install"] / "README.md").write_text("another actor\n")
+    text = _advisory(_hook(bw, _bash_payload("PostToolUse", cmd, bw["base"], tid)))
+    assert "README.md" in text, text
+    assert "Do NOT discard" in text, text
+    assert "checkout --" not in text, text
+
+
+@pytest.mark.parametrize(
+    "named",
+    ["{install}", "{install}/", "'{install}/src'", "cd {install}&&true", "{install};true"],
+)
+def test_the_root_named_as_a_path_still_makes_the_call_attributable(bw, named):
+    tid = "toolu_rootnamed"
+    cmd = "true " + named.format(install=bw["install"])
+    assert _hook(bw, _bash_payload("PreToolUse", cmd, bw["base"], tid)).returncode == 0
+    (bw["install"] / "README.md").write_text("edited\n")
+    text = _advisory(_hook(bw, _bash_payload("PostToolUse", cmd, bw["base"], tid)))
+    assert "checkout -- README.md" in text, (named, text)
+
+
 def test_a_merge_in_progress_gets_no_restore_command(bw):
     """Unmerged entries mean a merge is being resolved there (most likely the
     update pipeline's); a restore would wipe it."""
