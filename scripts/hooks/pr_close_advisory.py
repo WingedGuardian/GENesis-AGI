@@ -194,6 +194,9 @@ class _ApiCall(NamedTuple):
     endpoint: str | None
     fields: tuple[tuple[str, str], ...]
     method: str | None
+    #: The `--input` value (a path, or `-` for stdin). It makes the request a
+    #: POST when no method is given, and it carries the whole body.
+    input: str | None = None
 
 
 def _parse_api(argv: list[str]) -> _ApiCall | None:
@@ -214,6 +217,7 @@ def _parse_api(argv: list[str]) -> _ApiCall | None:
     endpoint = inv.positionals[0] if inv.positionals else None
     fields: list[tuple[str, str]] = []
     method: str | None = None
+    body_input: str | None = None
     positional_only = False
     i = 1
     while i < len(argv):
@@ -237,8 +241,10 @@ def _parse_api(argv: list[str]) -> _ApiCall | None:
                     fields.append((key, val))
             elif name in ("-X", "--method"):
                 method = value
+            elif name == "--input":
+                body_input = value
         i += 1
-    return _ApiCall(endpoint, tuple(fields), method)
+    return _ApiCall(endpoint, tuple(fields), method, body_input)
 
 
 #: Printed INSIDE the advisory, never only here. A reader who learns the

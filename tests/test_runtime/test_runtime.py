@@ -35,6 +35,7 @@ def _all_init_patches():
         patch("genesis.runtime.GenesisRuntime._init_pipeline", new_callable=AsyncMock),
         patch("genesis.runtime.GenesisRuntime._init_surplus", new_callable=AsyncMock),
         patch("genesis.runtime.GenesisRuntime._init_learning", new_callable=AsyncMock),
+        patch("genesis.runtime.GenesisRuntime._init_board", new_callable=AsyncMock),
         patch("genesis.runtime.GenesisRuntime._init_inbox", new_callable=AsyncMock),
         patch("genesis.runtime.GenesisRuntime._init_reflection", new_callable=AsyncMock),
         patch("genesis.runtime.GenesisRuntime._init_health_data"),

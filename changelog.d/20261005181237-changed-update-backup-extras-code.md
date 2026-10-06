@@ -1,0 +1,1 @@
+- **`scripts/update.sh` now tells an extras-only backup gap apart from an off-site failure.** When the core off-site copy is complete and only opt-in extra directories are missing, the pre-update backup check reports `backup:tier2_extras` instead of `backup:tier2`.
