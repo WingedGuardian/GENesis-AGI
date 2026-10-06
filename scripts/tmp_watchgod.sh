@@ -17,7 +17,8 @@
 # touched for 7 days (sweep_cc_tmp). That is the only thing it deletes.
 #
 # WHAT IT DOES, by tier (per filesystem; free space AND time-to-full, see
-# dg_tier). It never deletes working files and never kills a process:
+# dg_tier). It never kills a process and never deletes a live session's files,
+# with ONE exception (RUNAWAY FILES below):
 #   YELLOW  log attribution once per episode: who is writing, and where the
 #           space went.
 #   ORANGE  reclaim: on the $HOME filesystem start genesis-disk-hygiene-
@@ -25,14 +26,21 @@
 #           spared); on cc-tmp's, run the retention sweep at 2 days. Page a
 #           WARNING.
 #   RED     release the reserve file, start genesis-disk-hygiene-pressure@
-#           last-resort, page EMERGENCY with attribution.
+#           last-resort, page EMERGENCY with attribution. On cc-tmp's own
+#           volume, release its small reserve (CC_RESERVE_NAME) instead, after
+#           the runaway response below has had its poll.
 # Reclaim levers only run for the filesystem they can actually relieve; the
 # others page with attribution.
 #
 # RUNAWAY FILES, at every tier (scripts/lib/watchgod_runaway.sh): a file held
 # open for writing that alone is a large share of its filesystem, or that grew
 # a large share in one poll, is paged CRITICAL with its path and the processes
-# holding it. Fast growth switches to the fast poll. Detection only.
+# holding it. Fast growth switches to the fast poll. The ONE exception to "never
+# kills, never deletes": when such a file is a Claude Code background task's
+# output in cc-tmp and cc-tmp is ORANGE or RED, its command is PAUSED (SIGSTOP,
+# never the session, never killed) and the file is emptied, its last 1 MB kept
+# in ~/tmp/watchgod-truncated. `scripts/watchgod thaw` resumes it. Everything
+# else, on every filesystem, is page-only.
 #
 # OBSERVE mode (WATCHGOD_ACT=0) changes nothing on disk but still sends every
 # page, titled as observe-mode.
@@ -144,7 +152,7 @@ _WG_TUNABLES="CC_TMP_DIR DOWNLOADS_DIR WATCHGOD_ACT WATCH_EXTRA_PATHS RESERVE_MA
     DG_YELLOW_PCT DG_ORANGE_PCT DG_RED_PCT DG_RED_MIN_MB
     DG_ETA_YELLOW_MIN DG_ETA_ORANGE_MIN DG_ETA_RED_MIN DG_META_RED_PCT DG_UNALLOC_RED_MB
     CC_SWEEP_INTERVAL_S CC_SWEEP_AGE_MIN CC_SWEEP_PRESSURE_AGE_MIN OOM_CONTAINED_UNIT_PREFIXES
-    DG_RUNAWAY_PCT DG_RUNAWAY_RATE_PCT DG_RUNAWAY_MIN_MB"
+    DG_RUNAWAY_PCT DG_RUNAWAY_RATE_PCT DG_RUNAWAY_MIN_MB DG_RUNAWAY_REPAGE_H"
 declare -A _WG_BASE=()
 _wg_snapshot_defaults() {
     local k
@@ -183,7 +191,7 @@ load_config() {
               PRESSURE_RETRIGGER_S:600:0 CC_SWEEP_INTERVAL_S:3600:0 \
               CC_SWEEP_AGE_MIN:10080:1440 CC_SWEEP_PRESSURE_AGE_MIN:2880:1440 \
               POLL_INTERVAL:30:1 FAST_POLL_INTERVAL:5:1 \
-              DG_RUNAWAY_PCT:25:1 DG_RUNAWAY_RATE_PCT:5:1 DG_RUNAWAY_MIN_MB:50:1; do
+              DG_RUNAWAY_PCT:25:1 DG_RUNAWAY_RATE_PCT:5:1 DG_RUNAWAY_MIN_MB:50:1 DG_RUNAWAY_REPAGE_H:6:1; do
         IFS=: read -r k d min <<< "$kv"
         _wg_uint "$k" "$d" "$min"
     done
@@ -345,6 +353,51 @@ reserve_release() {
     return 0
 }
 
+# cc-tmp's own reserve. cc-tmp is usually its own quota volume, so the $HOME
+# reserve frees nothing there; without one, the last few MB a session's Bash
+# needs (its per-call cwd file) go to whatever is filling the volume. Small on
+# purpose: it buys the seconds the runaway response needs, not a workspace.
+# min(128 MB, 5% of the volume); the retention sweep never reaps it.
+CC_RESERVE_NAME=".watchgod-reserve"
+
+cc_reserve_ensure() {
+    # $1 free MB, $2 total MB of cc-tmp's domain, when it is GREEN.
+    local free="$1" total="$2" size orange_floor f="$CC_TMP_DIR/$CC_RESERVE_NAME"
+    [[ -f "$f" ]] && return 0
+    size=$(( total * 5 / 100 ))
+    (( size > 128 )) && size=128
+    (( size >= 16 )) || return 0
+    orange_floor=$(( total * DG_ORANGE_PCT / 100 ))
+    (( free - size > orange_floor )) || return 0
+    if (( WATCHGOD_ACT == 0 )); then
+        _wg_warn_once cc_reserve_obs "OBSERVE: would create a ${size} MB reserve file at ${f}"
+        return 0
+    fi
+    if fallocate -l "${size}M" "$f" 2>/dev/null; then
+        log INFO "cc-tmp reserve created: ${size} MB at ${f} (released at cc-tmp RED)"
+    else
+        rm -f -- "$f" 2>/dev/null || true
+        _wg_warn_once cc_reserve_fail "cc-tmp reserve could not be preallocated at ${f} — cc-tmp RED has no reserve to release"
+    fi
+    return 0
+}
+
+cc_reserve_release() {
+    local f="$CC_TMP_DIR/$CC_RESERVE_NAME" sz
+    [[ -f "$f" ]] || { echo "none held"; return 0; }
+    sz=$(( $(stat -c %s -- "$f" 2>/dev/null || echo 0) / 1048576 ))
+    if (( WATCHGOD_ACT == 0 )); then
+        echo "OBSERVE: would release ${sz} MB"
+        return 0
+    fi
+    rm -f -- "$f" && echo "released ${sz} MB"
+    return 0
+}
+
+# Domains the runaway response relieved this poll (domain key -> 1). A RED
+# lever that would spend the last reserve waits a poll for them.
+declare -gA RUNAWAY_RELIEVED=()
+
 # ── Action stamps and pages ──────────────────────────────────
 # Two rules every stamp, marker and page in this daemon follows (review
 # findings, two rounds): an ACT-mode record is written only after the action
@@ -476,7 +529,7 @@ _cc_sweep_units() {
     while IFS= read -r -d '' c; do
         name="${c##*/}"
         case "$name" in
-            cc-socks|"cc-socks-$uid"|"cc-daemon-$uid") continue ;;
+            cc-socks|"cc-socks-$uid"|"cc-daemon-$uid"|"$CC_RESERVE_NAME") continue ;;
         esac
         if [[ "$name" =~ ^claude-[0-9]+$ && -d "$c" ]]; then
             find "$c" -mindepth 2 -maxdepth 2 -print0 2>/dev/null
@@ -659,6 +712,7 @@ handle_fs() {
         fi
         episode_clear "$dev"
         (( is_home )) && reserve_ensure "$free" "$total"
+        (( is_cc && ! is_home )) && cc_reserve_ensure "$free" "$total"
         return 0
     fi
 
@@ -691,6 +745,14 @@ handle_fs() {
         if (( is_home )); then
             rel="$(reserve_release)"
             start_pressure_unit last-resort
+        elif (( is_cc )); then
+            # Spend the last reserve only once the runaway response has had its
+            # poll: released first, the writer would eat it in seconds.
+            if [[ -n "${RUNAWAY_RELIEVED[$dev]:-}" ]]; then
+                rel="cc-tmp reserve held: a runaway output was emptied this poll; released next poll if still RED"
+            else
+                rel="cc-tmp reserve $(cc_reserve_release)"
+            fi
         fi
         if ! episode_seen "$dev" "red$pg"; then
             body="${summary}. Reserve: ${rel}."$'\n'"${writers_block}"
@@ -790,8 +852,11 @@ check_disks() {
         done
     fi
 
-    # Pass 2: tier and act, once per domain.
+    # Pass 2: tier every domain. Pass 3 runs the runaway-file response, then
+    # pass 4 handles each domain's tier: a lever below (the cc-tmp reserve) must
+    # see whether the runaway response already relieved its domain this poll.
     local rw_domains=""
+    local -A tier_of=() free_of=() total_of=() eta_of=() fstype_of=()
     for key in "${order[@]}"; do
         p="${path_of[$key]}"
         read -r free total quota unalloc meta fstype used_raw <<< "${meas_of[$key]}"
@@ -805,8 +870,9 @@ check_disks() {
         tier="$(dg_tier "$floor" "$etat")"
         [[ "$tier" == orange || "$tier" == red || "$etat" != green ]] && fast=1
 
-        handle_fs "$p" "$key" "$tier" "$free" "$total" "$eta" "$writers" "$fstype"
-        rw_domains+="${key} ${key%%[qm]*} ${total} ${p}"$'\n'
+        tier_of[$key]="$tier"; free_of[$key]="$free"; total_of[$key]="$total"
+        eta_of[$key]="$eta"; fstype_of[$key]="$fstype"
+        rw_domains+="${key} ${key%%[qm]*} ${total} ${tier} ${p}"$'\n'
 
         [[ -n "$DISK_JSON" ]] && DISK_JSON+=", "
         DISK_JSON+="$(_wg_json_str "$p"): {\"tier\": \"$tier\", \"floor_tier\": \"$floor\", \"free_mb\": $free, \"total_mb\": $total, \"used_pct\": $(( total > 0 ? used * 100 / total : 0 )), \"eta_min\": $([[ "$eta" == - ]] && echo null || echo "$eta"), \"rate_mb_per_min\": $rate, \"quota\": $([[ $quota == 1 ]] && echo true || echo false), \"unalloc_mb\": $([[ "$unalloc" == - ]] && echo null || echo "$unalloc"), \"meta_pct\": $([[ "$meta" == - ]] && echo null || echo "$meta"), \"fstype\": $(_wg_json_str "$fstype")}"
@@ -834,12 +900,20 @@ check_disks() {
         if [[ -n "$tmp_key" && "$key" == "$tmp_key" ]]; then SYS_COMPAT="$floor $free $total $fstype"; fi
     done
 
-    # Name the file filling a disk, and who is writing it, on every domain.
-    # A failure here must never cost the tiers above their poll.
+    # Pass 3: name the file filling a disk and who is writing it, on every
+    # domain, and answer a runaway Claude Code task output in cc-tmp. A failure
+    # here must never cost the tiers their poll.
+    RUNAWAY_RELIEVED=()
     if [[ -n "$rw_domains" ]]; then
         wg_runaway_check "$rw_domains" || _wg_warn_once runaway_check "runaway-file check failed this poll"
         (( RUNAWAY_FAST )) && fast=1
     fi
+
+    # Pass 4: each domain's tier levers and pages.
+    for key in "${order[@]}"; do
+        handle_fs "${path_of[$key]}" "$key" "${tier_of[$key]}" "${free_of[$key]}" "${total_of[$key]}" \
+            "${eta_of[$key]}" "$writers" "${fstype_of[$key]}"
+    done
 
     NEXT_POLL=$POLL_INTERVAL
     (( fast )) && NEXT_POLL=$FAST_POLL_INTERVAL

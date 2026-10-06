@@ -76,11 +76,11 @@ def _holder(
     (d / "cmdline").write_bytes(cmdline.replace(" ", "\0").encode() + b"\0")
 
 
-def _domain(box, total_mb: int, path: Path | None = None) -> str:
+def _domain(box, total_mb: int, path: Path | None = None, tier: str = "green") -> str:
     """One check_disks domain line for the sandbox filesystem."""
     p = path or box["data"]
     dev = os.stat(p).st_dev
-    return f"{dev}m1 {dev} {total_mb} {p}"
+    return f"{dev}m1 {dev} {total_mb} {tier} {p}"
 
 
 def _run(box, snippet: str, act: int = 1) -> subprocess.CompletedProcess:
@@ -167,7 +167,7 @@ def test_a_file_below_the_minimum_is_not_followed(box):
 def test_a_file_on_an_unwatched_filesystem_is_ignored(box):
     f = _file(box, "out.log", 60)
     _holder(box, 5, f)
-    _check(box, "999999m1 999999 200 /elsewhere")
+    _check(box, "999999m1 999999 200 green /elsewhere")
     assert not _pages(box)
 
 
@@ -352,7 +352,7 @@ def test_check_disks_feeds_every_domain_to_the_detector():
     """Wiring: the domains check_disks tiers are the ones the detector sees,
     and fast growth shortens the next poll."""
     text = _WATCHGOD.read_text()
-    assert 'rw_domains+="${key} ${key%%[qm]*} ${total} ${p}"' in text
+    assert 'rw_domains+="${key} ${key%%[qm]*} ${total} ${tier} ${p}"' in text
     assert 'wg_runaway_check "$rw_domains"' in text
     assert "(( RUNAWAY_FAST )) && fast=1" in text
 

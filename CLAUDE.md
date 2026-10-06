@@ -35,8 +35,10 @@ Use `codebase_navigate` MCP to explore.
   ("oxygen"), usually a quota-capped volume: filling it breaks EVERY session's temp at
   once. The `genesis-tmp-watchgod` service guards whole disks and sweeps cc-tmp
   of what ended sessions left behind (untouched 7 days, nothing holding it); it
-  never kills a session and never deletes live work — so nothing will clean up
-  a big file you park there in time. A CC session's `TMPDIR` points at `cc-tmp` by design;
+  never kills a session and never deletes live work, with one exception: a
+  Bash command's `tasks/*.output` that is filling cc-tmp has its command paused
+  (`scripts/watchgod thaw` resumes it) and the file emptied. So nothing will clean
+  up a big file you park there in time. A CC session's `TMPDIR` points at `cc-tmp` by design;
   do NOT override `TMPDIR` in scripts or service files (breaks CC — see the
   `tmp_filesystem_limit` procedure). Code that creates large temp must pass an
   explicit dir (`mktemp -p ~/tmp` / `tempfile(dir=…)`), never the default. For a
