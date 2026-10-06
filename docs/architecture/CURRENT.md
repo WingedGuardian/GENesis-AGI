@@ -3218,7 +3218,12 @@ verified: b0867170e 2026-10-02
   encrypted `scripts/backup.sh` timer).
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
   `process_lock` (the reason bare `python -m genesis serve` blocks systemd),
-  tmp discipline (`~/tmp` for large temp — never override TMPDIR).
+  tmp discipline (`~/tmp` for large temp — never override TMPDIR),
+  `inflight` (the process-local registry of work a restart would cancel:
+  every `CCInvoker` call, plus a dispatched session's and a CLI reflection's
+  whole life; served at `GET /api/genesis/inflight` for
+  `scripts/deploy_code_only.sh`'s restart refusal; a subsystem's own work after
+  its invocation returns is not covered — #2917).
 - **env.py**: 3-tier resolution (env var → `~/.genesis/config/genesis.yaml` →
   default). **`update_in_progress()` is load-bearing**: the watchdog defers
   restarts during deploys (mid-deploy revival deadlocks bootstrap); fails open
@@ -3394,10 +3399,40 @@ Genesis mirrors none of them. Genesis keeps three local stores and the glue
 around them. **What exists today:**
 - the stores, the `board` mode lever, and the open-question tools;
 - the Projects v2 adapter and its idempotent setup script;
-- promotion of a private record onto the board.
+- promotion of a private record onto the board;
+- the READ-ONLY reconciler and its two read tools.
 
-The reconciler (adding repo items, the bookkeeping move, the Genesis status) is
-follow-on work. The shipped mode is `off`.
+The reconciler's write half (adding every repo item, the bookkeeping move to In
+Review, the Genesis status) and the dashboard tab are follow-on work. The
+shipped mode is `off`.
+
+- **Reconciler, read-only** (`board/reconciler.py`; bootstrap step `board`,
+  `runtime/init/board.py`, a 5-min `CronTrigger` on the learning scheduler,
+  `max_instances=1`). Each tick:
+  - reads nothing while paused, in mode `off`, or with no project configured;
+  - otherwise reads the WHOLE project (a short read raises) and the tracker's
+    own open totals, and counts cards by Status, Genesis field and kind, plus
+    coverage: open tracker issues and PRs on the board against the repo's open
+    total;
+  - logs one `drag` event per In Progress card per Status change, keyed
+    `item@<Status updatedAt>`. That value moves on a real Status change and on
+    nothing else (MEASURED 2026-10-04 on a private sandbox, with a control);
+  - flags `observed_late` from the clock alone (older than one interval plus
+    slack), never from stored state;
+  - ALWAYS emits a `board` heartbeat (DEBUG) carrying the summary, in every mode
+    and while paused. So the pulse is not pause-gated and has no enable check,
+    and in mode `off` it is effectively a learning-scheduler canary;
+  - writes NOTHING to GitHub (a test pins it).
+  A clean tick records job success; a read error publishes `last_error` and no
+  counts, and records a failure. The step raises if the learning scheduler is
+  missing or stopped, so the manifest names that cause instead of the board.
+- **`board_status`** reads the stored heartbeats only, never GitHub: the newest
+  pulse (alive, mode, error) and the newest SUCCESSFUL read with its age.
+  **`board_item`** reads one issue or PR live (nothing while the mode is
+  `off`): its card on the configured
+  project (matched by owner AND number), GitHub's blocked-by list (flagged when
+  truncated), unverified open questions blocking it, and its promotion link.
+  Both are in the reflection read allowlist.
 
 - **Projects v2 adapter** (`board/projects_v2.py`):
   - GraphQL travels over `gh api graphql --input -`, so nothing reaches argv;
@@ -3536,8 +3571,9 @@ verified: b67423bd 2026-10-03
   too (that would re-arm a live overlay the owner paused), so a session can
   only turn the board down, never arm it. The master `enabled` fails closed
   unless it is the literal `true`. Board promotion (`board_promote` and the
-  drain) reads it on every call; the reconciler's entry points carry
-  `GROUNDWORK(board-reconciler)` tags until it lands.
+  drain) reads it on every call, and so do the reconciler and `board_item`.
+  The write entry points the read-only reconciler does not use yet carry
+  `GROUNDWORK(board-reconciler-writes)` (and the tab's, `GROUNDWORK(board-tab)`).
 - **Open questions** (`mcp/health/open_question_tools.py`: `open_question_raise`,
   `_resolve`, `_block`, `_list`) — never gated by the board mode, because they
   write only local rows. A target id prefix must resolve uniquely against its

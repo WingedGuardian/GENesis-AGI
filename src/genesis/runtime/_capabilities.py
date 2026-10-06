@@ -38,6 +38,7 @@ _CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "providers": "Provider registry — web search, STT, TTS, embeddings, health probes, research orchestrator",
     "awareness": "Awareness loop — periodic signal collection ticks driving system health and perception",
     "router": "LLM routing with circuit breakers, cost tracking, and dead-letter queue",
+    "board": "Work-board reconciler — reads the GitHub Projects board every 5 min (counts, coverage, drag log); read via board_status / board_item",
     "perception": "Reflection engine — observation creation, pattern detection, signal processing",
     "cc_relay": "Claude Code invoker, session manager, checkpoints, and reflection bridge",
     "direct_session": "Direct session spawner — profile-constrained background CC sessions with tool restrictions, Telegram notifications, and streaming observability",
