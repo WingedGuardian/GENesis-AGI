@@ -74,9 +74,30 @@ The ``gh pr create`` prompt is NOT covered: gh without a TTY aborts ("you must
 first push the current branch…") rather than pushing, so that arm is left
 exactly as it was.
 
-A force push, a push anywhere else, a close-then-push, a re-push with no open PR,
-a round-cap ask, every block and the dispatched-session deny are all outside the
-key's reach. Classified on the repo's three axes: verdict — a narrowing of an
+For ``push_publish``: a force push, a push anywhere else, a close-then-push, a
+re-push with no open PR, a round-cap ask, every block and the dispatched-session
+deny are all outside the key's reach.
+
+**``push_routine`` is the wider, separate switch** (owner ruling 2026-10-06), for
+an install whose sessions push from linked worktrees (``git -C <path> push``,
+which ``push_publish`` never covers) and chain steps. It silences the push
+guard's ROUTINE prompts: a first push in any spelling, a ``gh pr create`` that
+would publish, close-then-push, a re-push with no open PR off the public repo, and
+a re-push chained with other steps. It applies only when EVERY ask the command
+raised is one of those and its destination is a github.com https repo of the
+configured owner (``github.user``): every push URL, or for a ``gh pr create``
+its ``--repo`` or ``origin``; a raw URL also needs no ``insteadOf`` rule. A force
+push to another remote, a push to the default branch, a detached HEAD or another
+refspec, an undeterminable directory, and the review-round cap still ask; every
+block and the dispatched-session deny are unchanged. Same shape as the other
+keys: no decision, a context note naming the setting.
+
+Known limit, accepted by the owner (2026-10-06): like every arm of this guard,
+the branch and destination are read BEFORE the command runs. In a chained
+command an earlier step can change them, so ``git checkout main && git push``
+or ``git remote set-url origin <url> && git push`` is classed by the state it
+started from and silenced. ``push_publish`` avoids this by accepting only a
+single plain push; ``push_routine`` deliberately does not. Classified on the repo's three axes: verdict — a narrowing of an
 existing ASK, never a new allow or block; audience — the agent (the context note
 names what was silenced); background effect — none, because a dispatched session
 is denied every push before the key is consulted.
@@ -114,6 +135,7 @@ Configuration (all keys optional; absent means ask)::
       asks:
         secrets_env: off      # the secrets.env credentials prompt
         push_publish: off     # first publish of a branch to the public repo only
+        push_routine: off     # the push guard's routine prompts (see above)
 
 The value is the ask's ENABLED state, so YAML's own booleans read the right way
 round: ``off``/``false``/``no`` suppress, ``on``/``true``/``yes`` (and absent)
@@ -145,7 +167,7 @@ import sys
 #: policy this install declined to use — it is a key nothing classified, so it
 #: can never suppress anything. Adding a member is a deliberate act with a call
 #: site attached; there is no path that grows this set from configuration.
-KEYS = frozenset({"secrets_env", "push_publish"})
+KEYS = frozenset({"secrets_env", "push_publish", "push_routine"})
 
 _CONFIG_PATH = "~/.genesis/config/genesis.yaml"
 _SEAM = "_TEST_HOOK_ASK_POLICY"

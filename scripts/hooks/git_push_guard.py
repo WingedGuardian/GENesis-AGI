@@ -11450,6 +11450,50 @@ def _all_urls_are_public_repo(urls: set[str]) -> bool:
     return all(_strict_github_slug(u) == want for u in urls)
 
 
+def _routine_dest_owned(push_remote: str | None, urls: set[str], cwd: str | None) -> bool:
+    """The ``push_routine`` destination scope: every push URL is a github.com
+    https repo of the configured public repo's OWNER (``github.user``), i.e. one
+    of this install's own repos. A raw-URL destination qualifies only when no
+    ``insteadOf`` rule could move it. An undeterminable owner, an empty set, an
+    ssh/scp form or any other host keeps the prompt."""
+    canonical = _canonical_public_repo()
+    if not canonical or not urls or not push_remote:
+        return False
+    if _looks_like_url(push_remote) and not _no_url_rewrite_rules(cwd):
+        return False
+    owner = canonical.split("/", 1)[0].strip().lower()
+    return all((_strict_github_slug(u) or "").split("/", 1)[0] == owner for u in urls)
+
+
+def _create_dest_owned(argv: list[str], cwd: str | None) -> bool:
+    """The ``push_routine`` scope for a publishing ``gh pr create``: an explicit
+    ``--repo``/``-R`` must name a repo of the configured owner; without one, gh
+    targets the checkout's remotes, so ``origin`` must pass
+    :func:`_routine_dest_owned`. An unreadable value keeps the prompt."""
+    canonical = _canonical_public_repo()
+    if not canonical:
+        return False
+    owner = canonical.split("/", 1)[0].strip().lower()
+    repos = []
+    for i, tok in enumerate(argv):
+        if tok in ("--repo", "-R"):
+            if i + 1 >= len(argv):
+                return False
+            repos.append(argv[i + 1])
+        elif tok.startswith("--repo="):
+            repos.append(tok.split("=", 1)[1])
+        elif tok.startswith("-R") and len(tok) > 2:
+            repos.append(tok[2:])
+    if repos:
+        for repo in repos:
+            slug = _strict_github_slug(repo) if "://" in repo else repo.strip().lower()
+            parts = (slug or "").split("/")
+            if len(parts) != 2 or parts[0] != owner or not parts[1]:
+                return False
+        return True
+    return _routine_dest_owned("origin", _push_dest_urls("origin", cwd=cwd), cwd)
+
+
 def _no_url_rewrite_rules(cwd: str | None) -> bool:
     """True only when NO ``url.<base>.insteadOf``/``pushInsteadOf`` rule is set.
 
@@ -12187,6 +12231,16 @@ def _run_merge_and_push_gates() -> int:
         # off`, public-repo destinations only). Emitted at the tail as NO decision
         # plus a context note, and only if nothing else set an ask or a block.
         publish_note: str | None = None
+        # Routine prompts this install silenced (`hooks.asks.push_routine: off`).
+        # Each ask below is classed: ROUTINE (a first push in any spelling, a
+        # publishing `gh pr create`, close-then-push, a PR-less re-push off the
+        # public repo, a re-push chained with other steps) or NOT (the round-cap
+        # ask this starts from, a force push, any other push). The tail silences
+        # only when every ask was routine and every push lands on a GitHub repo of
+        # the configured owner.
+        ask_routine = False
+        ask_nonroutine = ask_reason is not None
+        routine_dest_ok = True
 
         # ── git push (any branch) ──────────────────────────────────
         # Interactive → the user approves in a dialog only they can satisfy.
@@ -12240,6 +12294,7 @@ def _run_merge_and_push_gates() -> int:
                         file=sys.stderr,
                     )
                     return 2
+                ask_nonroutine = True
                 ask_reason = (
                     f"FORCE push detected — this REWRITES remote history on "
                     f"'{remote}' (a non-origin remote). Approve only if you "
@@ -12346,6 +12401,10 @@ def _run_merge_and_push_gates() -> int:
                             if notes:
                                 publish_note = f"{publish_note}\n\n{notes}"
                         else:
+                            ask_routine = True
+                            routine_dest_ok = routine_dest_ok and _routine_dest_owned(
+                                push_remote, urls, pcwd
+                            )
                             ask_reason = _publish_ask_text(
                                 f"git push needs your approval before publishing "
                                 f"externally (target: {branch or 'default'}).",
@@ -12374,6 +12433,10 @@ def _run_merge_and_push_gates() -> int:
                     )
                     if push_allow_reason and closes_pr:
                         push_allow_reason = None
+                        ask_routine = True
+                        routine_dest_ok = routine_dest_ok and _routine_dest_owned(
+                            push_remote, urls, pcwd
+                        )
                         ask_reason = (
                             f"re-push to '{cur}': an earlier step in this command "
                             f"CLOSES a pull request, so the push that follows may "
@@ -12421,6 +12484,10 @@ def _run_merge_and_push_gates() -> int:
                         else:
                             # Off the public repo — or when the public repo is not
                             # declared — the pre-existing ask, unchanged.
+                            ask_routine = True
+                            routine_dest_ok = routine_dest_ok and _routine_dest_owned(
+                                push_remote, urls, pcwd
+                            )
                             ask_reason = (
                                 f"re-push to '{cur}': this branch is PUBLIC but has "
                                 f"NO OPEN PR, so CI and the leak scan never run on "
@@ -12435,6 +12502,10 @@ def _run_merge_and_push_gates() -> int:
                     # neighbour keeps the relaxation.
                     elif push_allow_reason and not _push_compound_is_inert(segs, push_segs[0], cmd):
                         push_allow_reason = None
+                        ask_routine = True
+                        routine_dest_ok = routine_dest_ok and _routine_dest_owned(
+                            push_remote, urls, pcwd
+                        )
                         ask_reason = (
                             f"re-push to '{cur}': another step in this command "
                             f"may change git config or remotes before the push "
@@ -12443,6 +12514,7 @@ def _run_merge_and_push_gates() -> int:
                             f"skip this prompt."
                         )
                 else:
+                    ask_nonroutine = True
                     ask_reason = (
                         f"git push needs your approval before publishing externally "
                         f"(target: {branch or 'default'})."
@@ -12524,6 +12596,12 @@ def _run_merge_and_push_gates() -> int:
                 )
                 return 2
             if ask_reason is None:
+                ask_routine = True
+                for s in create_segs:
+                    _ccwd = _effective_cwd(cmd, payload, seg=s)
+                    routine_dest_ok = routine_dest_ok and _create_dest_owned(
+                        s.argv, _ccwd if isinstance(_ccwd, str) else None
+                    )
                 ask_reason = (
                     "gh pr create would push this (not-yet-pushed) branch — approve it like a push."
                 )
@@ -13182,7 +13260,19 @@ def _run_merge_and_push_gates() -> int:
             print(no_open_pr_deny, file=sys.stderr)
             return 2
         if ask_reason is not None:
-            return _ask(ask_reason)
+            routine_off = ask_routine and _ask_suppressed("push_routine")
+            if routine_off and not ask_nonroutine and routine_dest_ok:
+                note = _suppressed_reason("push_routine", ask_reason)
+                notes = _drain_ask_notes()
+                return _emit_context_only(f"{note}\n\n{notes}" if notes else note)
+            if routine_off:
+                ask_reason += (
+                    "\n\nhooks.asks.push_routine is off, but this command did not "
+                    "qualify: a destination is not a github.com https repo of the "
+                    "configured owner, or is a raw URL that an insteadOf rule could move."
+                )
+            notes = _drain_ask_notes()
+            return _ask(f"{ask_reason}\n\n{notes}" if notes else ask_reason)
 
         # A first-publish prompt this install silenced — NO decision, only a
         # context note. After every block and every ask above (an ask from any
