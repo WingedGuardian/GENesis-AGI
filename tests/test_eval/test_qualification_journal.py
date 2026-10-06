@@ -57,16 +57,16 @@ def observe(campaign, attempt="case-0", **changes):
     return answer
 
 
-def settle(campaign, attempt="case-0", charge="0.1", **changes):
-    row = campaign.state.attempts[attempt]["spec"]
+def settle(campaign, attempt_id="case-0", charge="0.1", **changes):
+    row = campaign.state.attempts[attempt_id]["spec"]
     receipt = {
-        "generation_id": f"gen-{attempt}",
+        "generation_id": f"gen-{attempt_id}",
         "model": row["model"],
         "upstream": row["upstream"],
         "charge": charge,
     }
     receipt.update(changes)
-    campaign.settle(attempt, receipt)
+    campaign.settle(attempt_id, receipt)
 
 
 def test_campaign_files_private_locked_and_torn_tail_discarded(tmp_path):
@@ -549,3 +549,123 @@ def test_same_object_reentry_preserves_outer_writer_and_releases_lock(tmp_path, 
             campaign.reserve("case-0")
     with Campaign(tmp_path / "campaign"):
         pass
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_bound_receipt_recovers_charge_without_resending_lost_answer(tmp_path, failed):
+    with journal(tmp_path) as campaign:
+        dispatch(campaign)
+        if failed:
+            campaign.fail("case-0", "synthetic interrupted observation")
+    with journal(tmp_path) as campaign:
+        settle(
+            campaign,
+            charge="0.08",
+            attempt="case-0",
+            request_hash=manifest()["attempts"][0]["request_hash"],
+        )
+        assert campaign.state.settled == Decimal("0.08")
+        assert campaign.state.reserved == Decimal(0)
+        assert "answer:case-0" in campaign.state.blockers
+        assert "case-0" not in campaign.state.answers
+        with pytest.raises(Incomplete):
+            campaign.dispatch("case-0")
+        with pytest.raises(Incomplete):
+            campaign.reserve("case-1")
+        campaign.acknowledge("answer:case-0", "verified receipt; answer unavailable")
+        if failed:
+            campaign.acknowledge("failure:case-0", "verified charge for interrupted operation")
+        dispatch(campaign, "case-1")
+        assert "case-0" not in campaign.state.answers
+        expected = campaign.state
+    recovered = type(campaign).read(tmp_path / "campaign")
+    assert recovered.state == expected
+    assert (
+        sum(line["kind"] == "dispatch" and line["attempt"] == "case-0" for line in recovered.lines)
+        == 1
+    )
+    assert any(line["kind"] == "failure" for line in recovered.lines) == failed
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"attempt": None},
+        {"attempt": "case-1"},
+        {"request_hash": None},
+        {"request_hash": digest("wrong")},
+        {"generation_id": None},
+        {"model": "wrong"},
+        {"upstream": "wrong"},
+        {"charge": True},
+        {"charge": "0.11"},
+        {"charge": "NaN"},
+    ],
+)
+def test_receipt_without_answer_requires_complete_consistent_binding(tmp_path, change):
+    with journal(tmp_path) as campaign:
+        dispatch(campaign)
+        receipt = {"attempt": "case-0", "request_hash": manifest()["attempts"][0]["request_hash"]}
+        receipt.update(change)
+        settle(campaign, **receipt)
+        assert campaign.state.reserved == Decimal("0.1")
+        assert campaign.state.settled == Decimal(0)
+        with pytest.raises(Incomplete):
+            campaign.acknowledge("answer:case-0", "unverified receipt")
+        with pytest.raises(Incomplete):
+            campaign.reserve("case-1")
+        assert campaign.lines[-1]["kind"] == "billing"
+
+
+def test_receipt_only_generation_collision_restores_both_reservations(tmp_path):
+    with journal(tmp_path) as campaign:
+        for i in range(2):
+            attempt = f"case-{i}"
+            dispatch(campaign, attempt)
+            settle(
+                campaign,
+                attempt,
+                generation_id="gen-shared",
+                attempt=attempt,
+                request_hash=manifest()["attempts"][i]["request_hash"],
+            )
+            if i == 0:
+                campaign.acknowledge("answer:case-0", "verified receipt; lost answer")
+        assert campaign.state.reserved == Decimal("0.2")
+        assert campaign.state.settled == Decimal(0)
+        assert campaign.state.blockers >= {"identity:case-0", "identity:case-1"}
+        with pytest.raises(Incomplete):
+            campaign.reserve("case-2")
+        expected = campaign.state
+    assert type(campaign).read(tmp_path / "campaign").state == expected
+
+
+@pytest.mark.parametrize("field", ["attempt", "request_hash"])
+def test_missing_receipt_binding_cannot_settle_lost_answer(tmp_path, field):
+    with journal(tmp_path) as campaign:
+        dispatch(campaign)
+        row = manifest()["attempts"][0]
+        receipt = {
+            "attempt": row["id"],
+            "request_hash": row["request_hash"],
+            "model": row["model"],
+            "upstream": row["upstream"],
+            "generation_id": "synthetic",
+            "charge": "0.08",
+        }
+        del receipt[field]
+        campaign.settle("case-0", receipt)
+        assert campaign.state.reserved == Decimal("0.1")
+        assert "billing:case-0" in campaign.state.blockers
+
+
+@pytest.mark.parametrize("field", ["attempt", "request_hash"])
+def test_contradictory_receipt_binding_stops_even_with_saved_answer(tmp_path, field):
+    with journal(tmp_path) as campaign:
+        dispatch(campaign)
+        observe(campaign)
+        settle(campaign, **{field: "wrong"})
+        assert campaign.state.reserved == Decimal("0.1")
+        assert campaign.state.settled == Decimal(0)
+        with pytest.raises(Incomplete):
+            campaign.reserve("case-1")

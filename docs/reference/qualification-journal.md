@@ -25,11 +25,17 @@ reservation at or below the frozen budget. `dispatch` durably records one
 attempt before its caller may send a completion. `observe` retains raw answer
 evidence, and `settle` retains a billing receipt. Invalid or conflicting receipts,
 identity contradictions and missing billing keep execution stopped. There is no
-stored aggregate counter or retry ledger; state is reconstructed from events.
+stored aggregate counter or retry ledger; state is reconstructed incrementally
+from events, including receipt generation ownership. In-memory contributions
+are derived caches and are never persisted separately.
 
 Ordinary reopening never resends a dispatched attempt. After verified settlement,
 an explicit `acknowledge` can identify a failed operation or lost answer and its
 resolution, preserving all original events. The lost answer remains unavailable.
+A verified receipt without an observation must explicitly match the frozen
+attempt ID and request hash as well as model, upstream and generation identity.
+It settles accounting while leaving an answer-loss incident for acknowledgement;
+it supplies no answer and never authorizes resending that attempt.
 A reservation that never reached durable dispatch can be acknowledged from that
 verified no-dispatch evidence and used once; its full liability stays reserved.
 Unknown charge or identity cannot be acknowledged away. Acknowledgements are

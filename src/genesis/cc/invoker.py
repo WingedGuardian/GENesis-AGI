@@ -46,6 +46,7 @@ from genesis.cc.types import (
     model_supports_effort,
 )
 from genesis.observability.spans import SpanKind, start_span
+from genesis.util.inflight import inflight
 from genesis.util.proc_kill import (
     kill_process_group,
     process_group_alive,
@@ -116,7 +117,9 @@ def _overload_error(message: str, raw_text: str, payload: dict | None) -> CCErro
     from genesis.cc.transient_retry import replay_unsafe
 
     overload = CCOverloadedError(
-        message, raw_text=raw_text, raw_event=payload,
+        message,
+        raw_text=raw_text,
+        raw_event=payload,
         num_turns=_int_or_none(payload.get("num_turns")) if payload else None,
     )
     if replay_unsafe(overload):
@@ -385,6 +388,27 @@ _CC_SPAN_SETTINGS_PATH = Path.home() / ".genesis" / "cc-span-settings.json"
 # The hook that enforces GENESIS_BASH_ALLOWLIST, named once so the registration
 # and the pre-launch checks that verify it cannot drift apart.
 _ALLOWLIST_GUARD_SCRIPT = "hooks/bash_allowlist_guard.sh"
+
+# The guard that keeps hand edits out of the install's primary checkout (it blocks
+# the file tools and reports Bash changes after the fact); registered for
+# dispatched sessions by cc_span_settings_path.
+_MAIN_CHECKOUT_GUARD_SCRIPT = "hooks/main_checkout_guard.py"
+
+
+def _main_checkout_guard_entry(genesis_hook: Path, matcher: str) -> dict[str, object]:
+    """One hook entry running the main-checkout guard on ``matcher``. 30s: a killed
+    PreToolUse hook lets the call proceed, and the guard stops its own git queries
+    at 20s so it can say so; the same bound serves its after-the-fact Bash check."""
+    return {
+        "matcher": matcher,
+        "hooks": [
+            {
+                "type": "command",
+                "command": shlex.join([str(genesis_hook), _MAIN_CHECKOUT_GUARD_SCRIPT]),
+                "timeout": 30,
+            },
+        ],
+    }
 
 
 # A sealed `gh` configuration for allowlisted sessions. Shared rather than
@@ -1542,6 +1566,15 @@ def _reset_failure_event_state() -> None:
     _failure_event_state.clear()
 
 
+def _inflight_label(invocation: CCInvocation) -> str:
+    """How an in-flight invocation is shown to whoever decides on a restart: the
+    model and the resumed session, never the prompt."""
+    model = getattr(invocation.model, "value", invocation.model)
+    if invocation.resume_session_id:
+        return f"{model}, resumes {invocation.resume_session_id}"
+    return str(model)
+
+
 async def _emit_invocation_failed_event(
     exc: CCError,
     invocation: CCInvocation,
@@ -1661,10 +1694,11 @@ def cc_span_settings_path(env_pins: dict[str, str] | None = None) -> str | None:
     this file via ``--settings`` injects JUST these hooks; CC merges them with
     the user's settings, leaving every other hook untouched.
 
-    Two hooks, and BOTH are registered UNCONDITIONALLY because both are
-    documented no-ops unless an environment variable is set — which is what lets
-    this stay a single fixed path written idempotently, with no per-invocation
-    content for two concurrent dispatches to race over:
+    Three hooks, ALL registered UNCONDITIONALLY, which is what lets this stay a
+    single fixed path written idempotently, with no per-invocation content for
+    two concurrent dispatches to race over. The first two are documented no-ops
+    unless an environment variable is set; the third is not a no-op — it is
+    always on, and is here precisely so dispatched sessions get it too:
 
     * ``cc_span_hook`` (PostToolUse) no-ops unless ``GENESIS_TRACE_ID`` is set.
       This is the *single* registration — the repo-level one was removed to
@@ -1679,6 +1713,22 @@ def cc_span_settings_path(env_pins: dict[str, str] | None = None) -> str | None:
       The no-op is cheap but not free: MEASURED ~30ms per Bash call on a live
       install, spent in the launcher rather than the guard, and paid by EVERY
       dispatched session rather than only scoped ones.
+    * ``main_checkout_guard`` keeps hand edits out of the install's primary
+      checkout — the deploy root. PreToolUse on Write/Edit/MultiEdit/NotebookEdit
+      REFUSES a change to a tracked file there. On Bash it never refuses:
+      PreToolUse records a snapshot of the deploy root's tracked state keyed by
+      the call's ``tool_use_id``, and PostToolUse plus PostToolUseFailure (an
+      erroring call ends in the latter) compare against it and
+      tell the session what changed and how to restore it. A dispatched
+      session's cwd is outside any repo, so the repo-level registration never
+      loads there; without these entries a background session could hand-edit
+      the deployed install unseen. Its off-switches are
+      ``GENESIS_MAIN_CHECKOUT_GUARD=0`` and the ``main_checkout_guard`` settings
+      domain, read by the guard itself, so the registration stays
+      unconditional. A dispatch whose cwd IS a checkout also loads the repo
+      registration, so the guard can run twice there: the file-tool check only
+      reads, the pre snapshot is rewritten atomically, and the post check claims
+      the snapshot by rename, so only one of two post runs reports.
 
     MEASURED 2026-09-23 on CC 2.1.246, from a dispatch-shaped invocation (cwd
     outside any repo, ``--dangerously-skip-permissions``): a PreToolUse Bash
@@ -1742,6 +1792,13 @@ def cc_span_settings_path(env_pins: dict[str, str] | None = None) -> str | None:
                         },
                     ],
                 },
+                # After the allowlist entry, never ahead of it: the pre-launch
+                # binding check matches that entry by content, and the tests pin
+                # it at index 0. Anchored matchers for the reason given above.
+                *(
+                    _main_checkout_guard_entry(genesis_hook, matcher)
+                    for matcher in ("^Bash$", "^(Write|Edit|MultiEdit|NotebookEdit)$")
+                ),
             ],
             "PostToolUse": [
                 {
@@ -1754,7 +1811,14 @@ def cc_span_settings_path(env_pins: dict[str, str] | None = None) -> str | None:
                         },
                     ],
                 },
+                _main_checkout_guard_entry(genesis_hook, "^Bash$"),
             ],
+            # A tool call that errors ends in PostToolUseFailure, not PostToolUse
+            # (READ from the CC 2.1.280 bundle, which defines both events with a
+            # tool_use_id). Which one a non-zero Bash exit reaches was not
+            # measured, so the guard's after-the-fact check is wired on both;
+            # whichever fires claims the snapshot.
+            "PostToolUseFailure": [_main_checkout_guard_entry(genesis_hook, "^Bash$")],
         },
     }
     path = _CC_SPAN_SETTINGS_PATH
@@ -2064,7 +2128,11 @@ class CCInvoker:
         file if seal preparation failed on one of the two calls.
         """
         allowlist = ",".join(inv.bash_allowlist)
-        pins = settings_pins if settings_pins is not None else _settings_env_pins(tuple(inv.bash_allowlist))
+        pins = (
+            settings_pins
+            if settings_pins is not None
+            else _settings_env_pins(tuple(inv.bash_allowlist))
+        )
         span_settings = cc_span_settings_path(pins)
         if span_settings is None:
             raise RuntimeError(
@@ -2267,17 +2335,22 @@ class CCInvoker:
         # servers cleanly (probe-verified) — the secure-by-default posture.
         if inv.strict_mcp_config and not inv.bare:
             args.append("--strict-mcp-config")
-        # Register the dispatch hooks (span capture, Bash allowlist enforcement)
-        # for this session. Dispatched sessions run with a cwd outside any git
-        # repo, so CC never loads the repo's .claude/settings.json; --settings
-        # injects just these hooks and CC merges them with the user's settings.
-        # Both no-op unless their env var is set. See cc_span_settings_path.
+        # Register the dispatch hooks (span capture, Bash allowlist enforcement,
+        # the main-checkout guard) for this session. Dispatched sessions run with
+        # a cwd outside any git repo, so CC never loads the repo's
+        # .claude/settings.json; --settings injects just these hooks and CC merges
+        # them with the user's settings. The first two no-op unless their env var
+        # is set; the guard is always on. See cc_span_settings_path.
         # The same file pins the session's credential and confinement env at the
         # settings level, which outranks user and project settings: see
         # _settings_env_pins.
         # The async run paths compute the pins in a worker thread (the seal
         # preparation behind them can block on a lock) and pass them in.
-        pins = settings_pins if settings_pins is not None else _settings_env_pins(tuple(inv.bash_allowlist))
+        pins = (
+            settings_pins
+            if settings_pins is not None
+            else _settings_env_pins(tuple(inv.bash_allowlist))
+        )
         span_settings = cc_span_settings_path(pins)
         if span_settings:
             args += ["--settings", span_settings]
@@ -2816,7 +2889,10 @@ class CCInvoker:
         """
         invocation, roster_model = roster.apply_active(invocation)
         try:
-            return await self._run_traced(invocation, roster_model)
+            # Registered for the whole call: a restart now would cancel it
+            # (genesis.util.inflight; a no-op inside a caller's open unit).
+            with inflight("claude", _inflight_label(invocation)):
+                return await self._run_traced(invocation, roster_model)
         except CCError as exc:
             await _emit_invocation_failed_event(
                 exc,
@@ -3075,7 +3151,8 @@ class CCInvoker:
         """Run CC with stream-json output; emit-then-reraise on CCError (see run())."""
         invocation, roster_model = roster.apply_active(invocation)
         try:
-            return await self._run_streaming_traced(invocation, roster_model, on_event)
+            with inflight("claude", _inflight_label(invocation)):
+                return await self._run_streaming_traced(invocation, roster_model, on_event)
         except CCError as exc:
             await _emit_invocation_failed_event(
                 exc,

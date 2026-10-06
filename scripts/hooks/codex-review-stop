@@ -1,11 +1,29 @@
 #!/bin/bash
 # Codex continues after ordinary hook failures. Convert evaluator failure to an
 # explicit deny, including missing/broken Python imports. Never emit ask JSON.
+#
+# Exit 2 with "deny" on stdout is a decision the evaluator has already explained
+# on stderr (fix-and-retry, or stop for the user); adding a second, generic STOP
+# here made every fixable denial read as a dead end. Any OTHER outcome (a crash,
+# a missing or unreadable evaluator, which python3 also reports as exit 2, or a
+# result that is neither "allow" nor "deny") is a failure of this guard, and stops.
+#
+# Every deny explained here writes "deny" to file descriptor 3, which only the
+# project config opens. Bash failing before that line (a syntax error, or the cd
+# below) also exits 2, so the config needs the signal to tell the two apart.
+# Stdout stays empty: Codex reads hook stdout, and anything there that is not a
+# valid decision was measured to PERMIT the action (see the reference doc).
+# Called with no fd 3 (an older config), the write fails silently.
 hook_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 2
-if decision=$(python3 "$hook_dir/codex_review_stop.py"); then
-    if [ "$decision" = "allow" ]; then
-        exit 0
-    fi
+rc=0
+decision=$(python3 "$hook_dir/codex_review_stop.py") || rc=$?
+if [ "$rc" -eq 0 ] && [ "$decision" = "allow" ]; then
+    exit 0
+fi
+if [ "$rc" -eq 2 ] && [ "$decision" = "deny" ]; then
+    { printf 'deny\n' >&3; } 2>/dev/null
+    exit 2
 fi
 printf '%s\n' 'BLOCKED: Codex review-budget evaluation did not allow this action. Stop and handoff to the user.' >&2
+{ printf 'deny\n' >&3; } 2>/dev/null
 exit 2

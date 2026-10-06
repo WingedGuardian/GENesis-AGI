@@ -70,13 +70,13 @@ class State:
     answers: dict = field(default_factory=dict)
     settled: Decimal = Decimal(0)
     reserved: Decimal = Decimal(0)
+    generations: dict = field(default_factory=dict)
+    collisions: set = field(default_factory=set)
 
 
 def _billing(row):
     """Missing cost can reconcile; contradictory or invalid evidence cannot settle."""
     charges, ids = [], set()
-    if not row["observations"]:
-        return None
     for answer in row["observations"]:
         if not isinstance(answer, dict):
             return None
@@ -100,6 +100,9 @@ def _billing(row):
         if not isinstance(receipt, dict):
             return None
         if any(receipt.get(k) != row["spec"][k] for k in ("model", "upstream")):
+            return None
+        binding = {"attempt": row["spec"]["id"], "request_hash": row["spec"]["request_hash"]}
+        if any(receipt.get(k, v if row["observations"] else None) != v for k, v in binding.items()):
             return None
         generation = receipt.get("generation_id")
         if not isinstance(generation, str) or not generation.strip():
@@ -177,29 +180,33 @@ def _apply(state, line, index):
         raise Incomplete("invalid journal event ordering")
 
 
-def _summarize(state):
-    generations = {}
-    for attempt, row in state.attempts.items():
-        for observation in row["observations"]:
-            generation = observation.get("generation_id") if isinstance(observation, dict) else None
-            if isinstance(generation, str) and generation.strip():
-                generations.setdefault(generation, set()).add(attempt)
-    collisions = {
-        attempt for owners in generations.values() if len(owners) > 1 for attempt in owners
-    }
-    state.blockers, state.answers = {f"identity:{a}" for a in collisions}, {}
-    settled, reserved = [], []
-    for attempt, row in state.attempts.items():
-        if row.get("reserved_at") is None:
-            continue
-        charge = None if attempt in collisions else _billing(row)
+def _summarize(state, changed):
+    affected = {changed}
+    for item in state.attempts[changed]["observations"] + state.attempts[changed]["receipts"]:
+        generation = item.get("generation_id") if isinstance(item, dict) else None
+        if isinstance(generation, str) and generation.strip():
+            owners = state.generations.setdefault(generation, set())
+            owners.add(changed)
+            if len(owners) > 1:
+                state.collisions.update(owners)
+                affected.update(owners)
+    for attempt in affected:
+        row = state.attempts[attempt]
+        state.blockers -= {
+            f"{p}:{attempt}" for p in ("identity", "billing", "reservation", "answer", "failure")
+        }
+        state.answers.pop(attempt, None)
+        if attempt in state.collisions:
+            state.blockers.add(f"identity:{attempt}")
+        charge = None if attempt in state.collisions else _billing(row)
+        settled, reserved = Decimal(0), Decimal(0)
         if charge is None:
-            reserved.append(currency(row["spec"]["max_charge"]))
+            reserved = currency(row["spec"]["max_charge"])
             state.blockers.add(
                 f"billing:{attempt}" if row["dispatched"] else f"reservation:{attempt}"
             )
         else:
-            settled.append(charge)
+            settled = charge
             answers = row["observations"]
             if len(answers) == 1 and isinstance(answers[0].get("content"), str):
                 state.answers[attempt] = copy.deepcopy(answers[0])
@@ -208,7 +215,10 @@ def _summarize(state):
         if row["failed"]:
             state.blockers.add(f"failure:{attempt}")
         state.blockers -= row["acknowledged"]
-    state.settled, state.reserved = total(settled), total(reserved)
+        previous = row.get("totals", (Decimal(0), Decimal(0)))
+        state.settled = total([state.settled, previous[0].copy_negate(), settled])
+        state.reserved = total([state.reserved, previous[1].copy_negate(), reserved])
+        row["totals"] = settled, reserved
 
 
 def reconstruct(lines) -> State:
@@ -232,7 +242,7 @@ def reconstruct(lines) -> State:
     }
     for index, line in enumerate(lines[1:], 1):
         _apply(state, line, index)
-        _summarize(state)
+        _summarize(state, line["attempt"])
     return state
 
 
@@ -289,7 +299,7 @@ class Journal(Campaign):
                 self._ready(ignore)
             candidate = copy.deepcopy(self._derived)
             _apply(candidate, line, len(self._lines))
-            _summarize(candidate)
+            _summarize(candidate, line["attempt"])
             result = super().append(kind, **{k: v for k, v in line.items() if k != "kind"})
             self._derived = candidate  # Publish only after the event is durable.
             return result
