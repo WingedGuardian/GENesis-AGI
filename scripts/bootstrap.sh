@@ -122,61 +122,13 @@ PY
             recovery_branch="$current_branch"
         fi
 
-        if merge_head="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'MERGE_HEAD^{commit}' 2>/dev/null)"; then
-            # Prove the merge is this update's BEFORE aborting it: update.sh starts
-            # its merge with HEAD at the rollback tag on the original branch and
-            # MERGE_HEAD at the recorded deploy head. Anything else is someone
-            # else's merge, or an operator's, and aborting it would destroy work.
-            [ "$ORIGINAL_BRANCH_PRESENT" = "1" ] \
-                || _crash_recovery_refuse "old-format update state cannot prove the in-progress merge is this update's"
-            genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$recovery_branch" \
-                || _crash_recovery_refuse "the in-progress merge does not start from this update's rollback tag on $recovery_branch"
-            [ -n "$DEPLOY_HEAD" ] && [ "$merge_head" = "$DEPLOY_HEAD" ] \
-                || _crash_recovery_refuse "the in-progress merge is not of this update's deploy head"
-            merge_abort_dir="$EPHEMERAL_BACKUP_ROOT/merge-abort"
-            if ! mkdir -p "$merge_abort_dir" \
-                || ! chmod 700 "$EPHEMERAL_BACKUP_ROOT" "$merge_abort_dir"; then
-                _crash_recovery_refuse "cannot create the merge-abort backup directory"
-            fi
-            # Every path that differs from HEAD, not only the unmerged ones: an
-            # operator's staged resolution is a merged path the abort discards. The
-            # index is saved as a binary patch as well, so staged content survives.
-            if ! git -C "$GENESIS_ROOT" diff --cached --binary HEAD > "$merge_abort_dir/index.patch"; then
-                _crash_recovery_refuse "cannot save the index before aborting the merge"
-            fi
-            unmerged_paths="$(mktemp "$merge_abort_dir/.unmerged.XXXXXX")" \
-                || _crash_recovery_refuse "cannot create a temporary changed-path list"
-            if ! git -C "$GENESIS_ROOT" diff --name-only -z HEAD > "$unmerged_paths"; then
-                rm -f "$unmerged_paths"
-                _crash_recovery_refuse "cannot list changed paths before aborting the merge"
-            fi
-            merge_copy_failure=""
-            merge_copy_count=0
-            while IFS= read -r -d '' merge_path; do
-                # A path deleted in the working tree has nothing to copy; its
-                # content is in HEAD and in index.patch.
-                [ -e "$GENESIS_ROOT/$merge_path" ] || [ -L "$GENESIS_ROOT/$merge_path" ] || continue
-                merge_parent="$(dirname -- "$merge_path")"
-                if ! mkdir -p "$merge_abort_dir/$merge_parent" \
-                    || ! cp -p -- "$GENESIS_ROOT/$merge_path" "$merge_abort_dir/$merge_path"; then
-                    merge_copy_failure="$merge_path"
-                    break
-                fi
-                merge_copy_count=$((merge_copy_count + 1))
-            done < "$unmerged_paths"
-            if ! rm -f "$unmerged_paths"; then
-                _crash_recovery_refuse "cannot remove the temporary changed-path list"
-            fi
-            if [ -n "$merge_copy_failure" ]; then
-                _crash_recovery_refuse "cannot save unmerged path $merge_copy_failure before aborting the merge"
-            fi
-            if [ "$merge_copy_count" -gt 0 ]; then
-                echo "  Saved $merge_copy_count changed file(s) and the index to $merge_abort_dir before aborting the merge."
-            fi
-            echo "  Aborting in-progress merge..."
-            if ! git -C "$GENESIS_ROOT" merge --abort 2>&1; then
-                _crash_recovery_refuse "git merge --abort refused; the merge and its edits are left in place"
-            fi
+        # update.sh aborts its own conflicted merges before exiting, so a
+        # remaining MERGE_HEAD means a kill mid-merge or an external merge.
+        # Aborting can discard subsequent work; leave that decision to the operator.
+        recovery_git_dir="$(git -C "$GENESIS_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" \
+            || _crash_recovery_refuse "cannot read the git directory"
+        if [ -e "$recovery_git_dir/MERGE_HEAD" ]; then
+            _crash_recovery_refuse "a merge is in progress; save any edits you want to keep, run git -C \"$GENESIS_ROOT\" merge --abort yourself, then re-run scripts/bootstrap.sh"
         fi
 
         if genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$recovery_branch"; then
@@ -200,6 +152,12 @@ PY
         elif [ "$ORIGINAL_BRANCH_PRESENT" != "1" ]; then
             _crash_recovery_refuse "old-format update state and the checkout has moved from its rollback tag"
         else
+            case "$STATE_PHASE" in
+                merging|bootstrap|migrations|health_check) ;;
+                *)
+                    _crash_recovery_refuse "the checkout moved while the update was in phase '$STATE_PHASE', before it could have merged"
+                    ;;
+            esac
             current_head="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" \
                 || _crash_recovery_refuse "current HEAD cannot be read"
             own_update=false

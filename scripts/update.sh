@@ -123,21 +123,20 @@ MANIFEST_DELTA_PY="$(cat "$SCRIPT_DIR/lib/manifest_delta.py")"
 _write_state() {
     local phase="$1"
     mkdir -p "$HOME/.genesis"
-    cat > "$STATE_FILE" << SEOF
-{
-    "phase": "$phase",
-    "rollback_tag": "${ROLLBACK_TAG:-}",
-    "original_branch": "${ORIGINAL_BRANCH:-}",
-    "own_head": "${UPDATE_OWN_HEAD:-}",
-    "deploy_head": "${DEPLOY_HEAD:-}",
-    "old_tag": "${OLD_TAG:-}",
-    "old_commit": "${OLD_COMMIT:-}",
-    "started_at": "$STARTED_AT",
-    "pid": $$,
-    "services_stopped": [$(printf '"%s",' "${WERE_RUNNING[@]:-}" | sed 's/,$//')],
-    "timestamp": "$(date -Iseconds)"
-}
-SEOF
+    python3 - "$STATE_FILE" "$phase" "${ROLLBACK_TAG:-}" "${ORIGINAL_BRANCH:-}" \
+        "${UPDATE_OWN_HEAD:-}" "${DEPLOY_HEAD:-}" "${OLD_TAG:-}" "${OLD_COMMIT:-}" \
+        "$STARTED_AT" "$$" "$(date -Iseconds)" "${WERE_RUNNING[@]}" <<'PY'
+import json, os, sys
+keys = ("phase", "rollback_tag", "original_branch", "own_head", "deploy_head",
+        "old_tag", "old_commit", "started_at", "pid", "timestamp")
+path, *values = sys.argv[1:]
+state = dict(zip(keys, values))
+state["pid"] = int(state["pid"])
+state["services_stopped"] = values[len(keys):]
+with open(path + ".tmp", "w", encoding="utf-8") as f:
+    json.dump(state, f, indent=4)
+os.replace(path + ".tmp", path)
+PY
 }
 
 # Clear this run's deploy state files. The state file is ours (we wrote it) so

@@ -1127,7 +1127,7 @@ jobs:
         # test_update_activation.py 28 -> 28 (+0); test_update_checkout_moved.py
         # 79 -> 79 (+0); test_update_self_copy_trap.py 6 -> 6 (+0).
         # Floor: 24421 + 23 = 24444; skip ceiling remains 102.
-        # Crash-recovery polish: test_bootstrap_guards.py 50 -> 54 (+4: staged
-        # resolution saved, foreign merge refused, no deploy head refused,
-        # old-format state refused). Floor: 24444 + 4 = 24448.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24448
+        # Crash recovery: test_bootstrap_guards.py 29 -> 52 (+23);
+        # deploy_candidates_drop_status.py 67 -> 68 (+1), test_deploy_checkout.py 51 -> 52 (+1).
+        # Floor: 24421 + 25 = 24446; skip ceiling remains 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24446
