@@ -118,10 +118,13 @@ after clearing the field manually.
 
 ### Stealth Click (active)
 
-`browser_click` now uses hover→mousemove trail→position jitter→realistic
-mousedown/mouseup gap when Camoufox is active. Clicks land within the
-central 60% of elements, not dead center. The Camoufox `humanize=2.5`
-setting provides native Bézier cursor movement at the browser level.
+`browser_click` on Camoufox scrolls the target into view, picks a point in
+the central 60% of the element that hit-tests as the element, moves the
+cursor there along a humanized trail (Camoufox `humanize=2.5` draws the
+Bézier curve), dwells briefly, then clicks that point through Playwright,
+which hit-tests it again. A covered target (or a covered label of a hidden
+checkbox) fails with `Click blocked` naming the covering element; dismiss it
+and click again.
 
 ### Turnstile/CAPTCHA Auto-Resolution (active)
 

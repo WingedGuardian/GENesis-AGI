@@ -212,8 +212,9 @@ rather than as described behaviour.
 **Prefer a selector to a coordinate — but know which path you are on.**
 Playwright's own click resolves the element, hit-tests the point it is about to
 press, and *refuses* if something else is on top (`intercepts pointer events`).
-That is the guarantee worth having. The catch is that stealth mode is the
-DEFAULT in this codebase, and it does not take that path.
+That is the guarantee worth having. `browser_click` has it on its stealth
+(Camoufox, the default) and plain-click paths; its last-resort keyboard and
+shadow-DOM fallbacks, and every coordinate-driven path, do not.
 
 **Never mix coordinate spaces.** The recurring defect is arithmetic that adds
 two numbers from different spaces:
@@ -260,17 +261,22 @@ refusal.
 
 | click path | hit-tests the target? | reads back where it landed? |
 |---|---|---|
-| `page.click(selector)` — non-stealth `browser_click`, and every fallback | **yes** — Playwright refuses with `intercepts pointer events` | n/a, no coordinate |
-| stealth `browser_click` (Camoufox, the DEFAULT) | no — `bounding_box()` then `mouse.move`/`down`/`up` | no |
+| `page.click(selector)` — non-stealth `browser_click`, and the stealth path's plain-click fallback | **yes** — Playwright refuses with `intercepts pointer events` | n/a, no coordinate |
+| stealth `browser_click` (Camoufox, the DEFAULT) | **yes** — scrolls into view, aims at a point that hit-tests as the target, then `Locator.click` there, which hit-tests again; a covered target fails with `Click blocked` naming the cover | n/a, the click is bound to the element |
 | Turnstile widget click (`page.mouse.click(x, y)`) | no — raw coordinate input | no |
 | shadow-DOM fallback (`el.click()`) | no — dispatches a DOM click, no coordinate | n/a |
 | VNC input bridge (turnstile only) | no — `vncdo` has no concept of an element | **yes** — pointer position, drift vs intent, warns past 3px, then clicks anyway |
 
-Read that as: **the guarantee exists, and the default path is not the one that
-has it.** Stealth clicking trades the hit-test for a human-looking mouse
-trail. It is not unchecked — an ambiguity guard runs on `text=` selectors and
-the element must be visible first — but between reading the box and pressing
-the button, nothing re-checks what is now under the point.
+Read that as: **selector clicks are hit-tested; coordinate clicks are not.**
+Stealth clicking keeps the human-looking mouse trail AND the hit-test. A
+styled checkbox or radio whose `<input>` is hidden, or covered only by its own
+label's decoration, is clicked through its `<label>`, at a point that
+activates the control (never on a link inside the label). An overlay on the
+control or on that label fails as `Click blocked`. A click Playwright reports
+as sent is never repeated. Only a failure BEFORE anything was sent reaches the
+fallbacks, and those are unchecked: the keyboard one presses Space or Enter on
+whatever takes focus, the shadow-DOM one dispatches a DOM click. Either way
+"clicked" is not proof: confirm the page changed.
 
 The VNC row is the subtle one: it verifies DELIVERY, not IDENTITY. It will tell
 you the pointer arrived where you aimed. It cannot tell you the right thing was

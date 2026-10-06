@@ -455,7 +455,7 @@ def _locator(box, pick, label=None):
 
     async def evaluate(js, *a):
         if js is browser._LABEL_JS:
-            return label or {"visible": True, "label": None}
+            return label or {"visible": True, "label": False}
         if js is browser._PICK_POINT_JS:
             return pick
         raise AssertionError(f"unexpected evaluate: {js[:40]}")
@@ -481,7 +481,10 @@ def _camoufox_page(box=None, pick="default", label=None, label_loc=None):
         pick = {"x": 60.0, "y": 18.0, "bl": 1.0, "bt": 2.0}
     loc = _locator(box, pick, label)
     if label_loc is not None:
-        loc.locator = MagicMock(return_value=label_loc)
+        # The label is the control's own e.labels[0], as an ElementHandle.
+        handle = MagicMock()
+        handle.as_element = MagicMock(return_value=label_loc)
+        loc.evaluate_handle = AsyncMock(return_value=handle)
     top = MagicMock()
     top.first = loc
     top.count = AsyncMock(return_value=1)
@@ -617,54 +620,99 @@ class TestStealthClickLocator:
             {"x": 10.0, "y": 10.0, "width": 120.0, "height": 20.0},
             {"x": 5.0, "y": 5.0, "bl": 0.0, "bt": 0.0},
         )
-        # No sampled point on the <input> hit-tests as the input (the mark
-        # covers it), so the label is clicked, with no wasted click attempt.
+        # Every sampled point on the <input> hit-tested inside the control's
+        # own label (the mark), so the picker says "label".
         page, loc = _camoufox_page(
-            pick=None,
-            label={"visible": True, "label": "wrap"},
+            pick="label",
+            label={"visible": True, "label": True},
             label_loc=label_loc,
         )
         with _no_sleep():
             await browser._stealth_click(page, "#agree")
-        loc.locator.assert_called_once_with("xpath=ancestor::label[1]")
         loc.click.assert_not_awaited()
         label_loc.click.assert_awaited_once()
         assert label_loc.click.call_args.kwargs["position"] == {"x": 5.0, "y": 5.0}
         page.keyboard.press.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_hidden_input_goes_straight_to_its_label(self):
-        label_loc = _locator({"x": 10.0, "y": 10.0, "width": 120.0, "height": 20.0}, None)
-        page, loc = _camoufox_page(
-            label={"visible": False, "label": "for", "id": "opt-in"},
-            label_loc=label_loc,
+    async def test_hidden_input_goes_straight_to_its_own_label(self):
+        """The label is the control's own e.labels[0], never a page-wide
+        label[for=id] selector: that pierces every open shadow root and finds
+        the FIRST component's label when two components reuse an id."""
+        label_loc = _locator(
+            {"x": 10.0, "y": 10.0, "width": 120.0, "height": 20.0},
+            {"x": 5.0, "y": 5.0, "bl": 0.0, "bt": 0.0},
         )
-        label_top = MagicMock()
-        label_top.first = label_loc
-        page.locator = MagicMock(
-            side_effect=lambda sel: (
-                label_top if sel.startswith("label[for=") else MagicMock(first=loc)
-            )
+        page, loc = _camoufox_page(
+            label={"visible": False, "label": True},
+            label_loc=label_loc,
         )
         with _no_sleep():
             await browser._stealth_click(page, "#opt-in")
         loc.click.assert_not_awaited()
         label_loc.click.assert_awaited_once()
-        assert page.locator.call_args_list[-1].args == ('label[for="opt-in"]',)
+        assert loc.evaluate_handle.await_args.args == ("e => e.labels[0]",)
+        assert [c.args for c in page.locator.call_args_list] == [("#opt-in",)]
 
     @pytest.mark.asyncio
     async def test_a_labelled_control_under_a_real_overlay_still_fails_loudly(self):
-        label_loc = _locator({"x": 10.0, "y": 10.0, "width": 120.0, "height": 20.0}, None)
-        label_loc.click.side_effect = Exception(_INTERCEPT_LOG)
+        """The cover is not part of the label (a popover over the checkbox
+        only): the CONTROL is clicked, Playwright names the overlay, and the
+        exposed label is never used to reach the covered control."""
+        label_loc = _locator(
+            {"x": 10.0, "y": 10.0, "width": 120.0, "height": 20.0},
+            {"x": 5.0, "y": 5.0, "bl": 0.0, "bt": 0.0},
+        )
         page, loc = _camoufox_page(
             pick=None,
-            label={"visible": True, "label": "wrap"},
+            label={"visible": True, "label": True},
+            label_loc=label_loc,
+        )
+        loc.click.side_effect = Exception(_INTERCEPT_LOG)
+        with _no_sleep(), pytest.raises(browser.ClickBlocked) as exc:
+            await browser._stealth_click(page, "#agree")
+        assert "cookie-banner" in str(exc.value)
+        label_loc.click.assert_not_awaited()
+        assert "position" not in loc.click.call_args.kwargs
+        page.keyboard.press.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_label_with_no_activating_point_is_never_clicked_blind(self):
+        """No sampled point on the label activates the control and nothing
+        covers it (the label is all link): the label is NOT clicked at a point
+        Playwright picks, which could follow the link. Nothing was sent, so
+        the ordinary fallback chain runs."""
+        label_loc = _locator({"x": 10.0, "y": 10.0, "width": 120.0, "height": 20.0}, None)
+        page, loc = _camoufox_page(
+            label={"visible": False, "label": True},
+            label_loc=label_loc,
+        )
+        with _no_sleep():
+            await browser._stealth_click(page, "#agree")
+        label_loc.click.assert_not_awaited()
+        page.click.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_hidden_inputs_covered_label_fails_loudly_without_fallback(self):
+        """A cookie banner over the label of a display:none checkbox: the
+        fallbacks would reach the hidden input BEHIND the banner (the
+        shadow-DOM fallback clicks it by script), so it is ClickBlocked."""
+        label_loc = _locator(
+            {"x": 10.0, "y": 10.0, "width": 120.0, "height": 20.0},
+            {"cover": '<div id="cookie-banner">'},
+        )
+        page, loc = _camoufox_page(
+            label={"visible": False, "label": True},
             label_loc=label_loc,
         )
         with _no_sleep(), pytest.raises(browser.ClickBlocked) as exc:
             await browser._stealth_click(page, "#agree")
-        assert "cookie-banner" in str(exc.value)
+        assert '<div id="cookie-banner">' in str(exc.value)
+        assert "#agree" in str(exc.value)
+        label_loc.click.assert_not_awaited()
+        page.click.assert_not_awaited()
         page.keyboard.press.assert_not_awaited()
+        page.evaluate.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_non_camoufox_covered_click_names_the_overlay(self):
@@ -686,8 +734,213 @@ class TestStealthClickLocator:
         assert "clicked" not in result
         assert "Click blocked" in result["error"]
 
-    def test_the_sent_marker_is_the_text_playwright_logs(self):
+    def test_the_markers_are_the_text_the_installed_playwright_logs(self):
+        """Both decisions rest on two call-log strings. Read them out of the
+        INSTALLED driver, so a Playwright that rewords either line fails here
+        instead of silently re-firing a delivered click."""
+        import playwright
+
+        lib = Path(playwright.__file__).parent / "driver" / "package" / "lib"
+        if not lib.is_dir():
+            pytest.skip("playwright driver sources not present")
+        src = "".join(
+            p.read_text(errors="replace")
+            for p in lib.rglob("*.js")
+            if "performing ${actionName} action" in p.read_text(errors="replace")
+        )
+        assert src, "no driver file logs `performing ${actionName} action`"
         assert browser._CLICK_SENT_MARK == "performing click action"
+        assert "} " + browser._INTERCEPT_MARK + "`" in src
+
+    def test_a_click_sent_after_an_earlier_interception_is_not_blocked(self):
+        """Playwright's call log keeps every retry. An overlay intercepted the
+        first attempt, cleared, and a later attempt SENT the click; the
+        failure after that (a navigation wait) is not a covered target, and
+        reporting it as blocked would invite a second click."""
+        err = Exception(_INTERCEPT_LOG + "  - performing click action\n")
+        assert browser._blocked_click(err, "#submit") is None
+        assert browser._click_was_sent(err)
+
+    def test_an_interception_after_the_sent_line_is_still_blocked(self):
+        """Playwright's interceptor swallows the events of an attempt whose
+        hit target turned out wrong and logs the interception AFTER
+        `performing click action`: the latest attempt was blocked."""
+        err = Exception("Call log:\n  - performing click action\n" + _INTERCEPT_LOG)
+        assert isinstance(browser._blocked_click(err, "#submit"), browser.ClickBlocked)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("camoufox", [True, False])
+    async def test_every_layer_reraises_a_sent_click_after_an_interception(self, camoufox):
+        mixed = Exception(_INTERCEPT_LOG + "  - performing click action\n")
+        if camoufox:
+            page, loc = _camoufox_page()
+            loc.click.side_effect = mixed
+        else:
+            browser._stealth_cm = None
+            page = MagicMock()
+            page.click = AsyncMock(side_effect=mixed)
+        with _no_sleep(), pytest.raises(Exception) as exc:
+            await browser._stealth_click(page, "#submit")
+        assert not isinstance(exc.value, browser.ClickBlocked)
+        assert page.click.await_count == (0 if camoufox else 1)
+
+
+# ---------------------------------------------------------------------------
+# The in-page scripts, run in node against a minimal fake DOM. Geometry is a
+# real browser's job; these pin the DECISIONS: which hit counts as activating
+# the control, and when the label may stand in for it.
+# ---------------------------------------------------------------------------
+
+_FAKE_DOM = r"""
+const mk = (o) => Object.assign({
+  parentNode: null, host: null, shadowRoot: null, localName: 'span', sels: [],
+  labels: null, control: null, ownerDocument: doc,
+  matches(s) { return s.split(',').some((x) => this.sels.includes(x.trim())); },
+  contains(n) { for (; n; n = n.parentNode) if (n === this) return true; return false; },
+  getClientRects() { return this.rects || []; },
+  getBoundingClientRect() { return (this.rects || [{ left: 0, top: 0, width: 0, height: 0 }])[0]; },
+}, o);
+const doc = {
+  regions: [],
+  elementFromPoint(x, y) {
+    for (const [a, b, el] of this.regions) if (x >= a && x < b) return el;
+    return null;
+  },
+};
+globalThis.getComputedStyle = () => ({ borderLeftWidth: '0', borderTopWidth: '0', visibility: 'visible' });
+const seq = [];
+Math.random = () => (seq.length ? seq.shift() : 0.5);
+const R = (w, h) => [{ left: 0, top: 0, width: w, height: h }];
+"""
+
+
+def _run_js(body: str):
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; the mock-level tests above still apply")
+    script = (
+        _FAKE_DOM
+        + f"const PICK = {browser._PICK_POINT_JS};\nconst LABEL = {browser._LABEL_JS};\n"
+        + body
+    )
+    r = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"node failed: {r.stderr[:800]}"
+    return json.loads(r.stdout)
+
+
+_LABELLED = r"""
+const L = mk({ localName: 'label', rects: R(100, 20) });
+const C = mk({ localName: 'input', parentNode: L, rects: R(20, 20) });
+C.labels = [L]; L.control = C;
+"""
+
+
+class TestClickScripts:
+    def test_a_point_on_a_link_inside_the_label_is_rejected(self):
+        """Clicking interactive content inside a label does not activate the
+        control (HTML label activation behaviour): it follows the link."""
+        out = _run_js(
+            _LABELLED
+            + r"""
+const A = mk({ localName: 'a', sels: ['a[href]'], parentNode: L });
+const T = mk({ parentNode: L });
+doc.regions = [[0, 50, A], [50, 100, T]];
+seq.push(0.1, 0.5, 0.9, 0.5);  // first point on the link (x=26), second on text (x=74)
+const p = PICK(L);
+doc.regions = [[0, 100, A]];
+console.log(JSON.stringify([p, PICK(L)]));
+"""
+        )
+        assert out[0]["x"] >= 50
+        assert out[1] is None
+
+    def test_an_overlay_on_the_label_is_named_not_swallowed(self):
+        """A banner over the whole label: the picker names it, so the click
+        fails as ClickBlocked instead of falling back to a script click on the
+        hidden control behind the banner. A label that is all link names no
+        cover: nothing covers it."""
+        out = _run_js(
+            _LABELLED
+            + r"""
+const O = mk({ localName: 'div', id: 'cookie-banner', className: 'cover' });
+doc.regions = [[0, 100, O]];
+const a = PICK(L);
+const A = mk({ localName: 'a', sels: ['a[href]'], parentNode: L });
+doc.regions = [[0, 100, A]];
+console.log(JSON.stringify([a, PICK(L)]));
+"""
+        )
+        assert out == [{"cover": '<div id="cookie-banner" class="cover">'}, None]
+
+    def test_the_label_of_a_disabled_control_offers_no_point(self):
+        out = _run_js(
+            _LABELLED
+            + r"""
+C.sels = [':disabled'];
+doc.regions = [[0, 100, L]];
+console.log(JSON.stringify(PICK(L)));
+"""
+        )
+        assert out is None
+
+    def test_a_control_covered_by_its_own_label_decoration_says_label(self):
+        out = _run_js(
+            _LABELLED
+            + r"""
+const M = mk({ parentNode: L });  // <span class=mark> inside the label
+doc.regions = [[0, 100, M]];
+console.log(JSON.stringify(PICK(C)));
+"""
+        )
+        assert out == "label"
+
+    def test_a_control_covered_by_anything_outside_its_label_says_nothing(self):
+        """A popover over the checkbox, or a mix of decoration and popover:
+        the label must not be used to reach the covered control."""
+        out = _run_js(
+            _LABELLED
+            + r"""
+const M = mk({ parentNode: L });
+const O = mk({});  // an overlay, outside the label
+doc.regions = [[0, 100, O]];
+const a = PICK(C);
+doc.regions = [[0, 10, M], [10, 100, O]];
+seq.push(0.1, 0.5, 0.9, 0.5);
+console.log(JSON.stringify([a, PICK(C)]));
+"""
+        )
+        assert out == [None, None]
+
+    def test_a_disabled_or_unlabelled_control_is_not_routed_to_a_label(self):
+        out = _run_js(
+            _LABELLED
+            + r"""
+const a = LABEL(C);
+C.sels = [':disabled'];
+const b = LABEL(C);
+const D = mk({ localName: 'button', rects: R(40, 20) });
+console.log(JSON.stringify([a, b, LABEL(D)]));
+"""
+        )
+        assert out[1]["label"] is False  # disabled: its label does not activate it
+        assert out[2]["label"] is False  # no label at all
+        assert out[0] == {"visible": True, "label": True}
+
+    def test_a_visually_hidden_one_pixel_input_counts_as_hidden(self):
+        """The common `sr-only` pattern (1x1, clipped) cannot be hit: its
+        label is the click target, as for display:none."""
+        out = _run_js(
+            _LABELLED
+            + r"""
+C.rects = R(1, 1);
+console.log(JSON.stringify(LABEL(C)));
+"""
+        )
+        assert out["visible"] is False
 
 
 class TestPressKey:

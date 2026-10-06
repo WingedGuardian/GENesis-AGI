@@ -1126,9 +1126,16 @@ def _blocked_click(err: BaseException, selector: str) -> ClickBlocked | None:
     The covering element is read from Playwright's call log, whose line has the
     shape ``  - <div id="x">…</div> intercepts pointer events``. Only the
     message is read, for display; the decision itself rests on the marker.
+
+    The log keeps every retry, so the LAST marker decides. A click sent after
+    the last interception (the overlay cleared and a retry went through) may
+    have been delivered, so it is not a blocked click. An interception logged
+    after the sent line is: Playwright's hit-target interceptor swallowed that
+    attempt's events (``setupHitTargetInterceptor`` cancels them).
     """
     text = str(err)
-    if _INTERCEPT_MARK not in text:
+    at = text.rfind(_INTERCEPT_MARK)
+    if at < 0 or text.rfind(_CLICK_SENT_MARK) > at:
         return None
     cover = "another element"
     for line in text.splitlines():
@@ -1156,13 +1163,40 @@ def _blocked_click(err: BaseException, selector: str) -> ClickBlocked | None:
 # elementFromPoint (followed down through open shadow roots) is the element or
 # inside it. Returned relative to the border box MINUS the border, because
 # Playwright adds the border back (`_offsetPoint` in the 1.62 driver bundle:
-# `x: box.x + border.left + offset.x`). None when no sampled point qualifies.
+# `x: box.x + border.left + offset.x`).
+#
+# On a <label> a point qualifies only if a click there ACTIVATES the label's
+# control: not on other interactive content inside the label (a terms link: the
+# browser follows the link, per the HTML label activation behaviour), and never
+# for a disabled control. When no point qualifies: on a label, {cover: <tag>}
+# naming an element outside the label that a sampled point hit (an overlay),
+# else null; on a control, "label" if every sampled hit landed inside the
+# control's own label (its decoration, such as <span class=mark>), so the label
+# may stand in for it, else null, and the click goes to the control itself,
+# where Playwright names any overlay.
 _PICK_POINT_JS = """
 (e) => {
-  const inside = (n) => {
-    for (; n; n = n.parentNode || n.host) if (n === e) return true;
+  const up = (n) => n.parentNode || n.host;
+  const within = (n, t) => {
+    for (; n; n = up(n)) if (n === t) return true;
     return false;
   };
+  const ctl = e.localName === 'label' ? e.control : null;
+  if (ctl && ctl.matches(':disabled')) return null;
+  const INTERACTIVE = 'a[href], area[href], audio[controls], button, details, embed, iframe, '
+    + 'img[usemap], input:not([type=hidden]), label, select, textarea, video[controls], '
+    + '[role=button], [role=link]';
+  const inside = (n) => {
+    if (!within(n, e)) return false;
+    for (; ctl && n !== e; n = up(n)) {
+      if (n === ctl) return true;
+      if (n.matches && n.matches(INTERACTIVE)) return false;
+    }
+    return true;
+  };
+  const labels = ctl ? [] : [...(e.labels || [])];
+  let decorated = labels.length > 0;
+  let cover = null;
   const hit = (x, y) => {
     let n = e.ownerDocument.elementFromPoint(x, y);
     while (n && n.shadowRoot) {
@@ -1182,25 +1216,31 @@ _PICK_POINT_JS = """
     const r = rects[i % rects.length];
     const x = r.left + r.width * (0.2 + 0.6 * Math.random());
     const y = r.top + r.height * (0.2 + 0.6 * Math.random());
-    if (inside(hit(x, y))) return { x: x - b.left - bl, y: y - b.top - bt, bl, bt };
+    const n = hit(x, y);
+    if (inside(n)) return { x: x - b.left - bl, y: y - b.top - bt, bl, bt };
+    if (!labels.some((l) => within(n, l))) decorated = false;
+    if (ctl && n && !within(n, e)) cover = n;
   }
-  return null;
+  if (cover) {
+    const id = cover.id ? ` id="${cover.id}"` : '';
+    const cls = typeof cover.className === 'string' && cover.className ? ` class="${cover.className}"` : '';
+    return { cover: `<${cover.localName}${id}${cls}>` };
+  }
+  return decorated ? 'label' : null;
 }
 """
 
-# How a form control relates to its <label>. Used when the control itself
-# cannot be clicked: a styled checkbox/radio hides its <input> (zero size,
-# display:none) or covers it with its own decoration (<span class=mark>). The
-# label is the control's own click target then, so clicking it is not pushing
-# through an overlay. "wrap": the label is an ancestor; "for": label[for=id].
+# Whether a form control may be clicked through its <label>: it has one and is
+# enabled (a disabled control is not activated by its label, so the control is
+# clicked and Playwright waits for it to be enabled). "visible" is false for a
+# control nobody can hit: display:none, visibility:hidden, or the 1x1 clipped
+# box of a visually-hidden ("sr-only") input. Its label is the target then.
 _LABEL_JS = """
 (e) => {
   const r = e.getBoundingClientRect();
-  const visible = r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden';
-  const label = e.labels && e.labels.length ? e.labels[0] : null;
-  if (!label) return { visible, label: null };
-  if (label.contains(e)) return { visible, label: 'wrap' };
-  return { visible, label: 'for', id: e.id || '' };
+  const visible = r.width > 1 && r.height > 1 && getComputedStyle(e).visibility !== 'hidden';
+  const label = !!(e.labels && e.labels.length) && !e.matches(':disabled');
+  return { visible, label };
 }
 """
 
@@ -1216,27 +1256,21 @@ def _click_was_sent(err: BaseException) -> bool:
     return _CLICK_SENT_MARK in str(err)
 
 
-def _label_locator(page, loc, info: dict):
-    """A Locator for the control's label (re-resolved per call, like the
-    control's own), or None."""
-    if info.get("label") == "wrap":
-        return loc.locator("xpath=ancestor::label[1]")
-    if info.get("label") == "for" and info.get("id"):
-        ident = info["id"].replace("\\", "\\\\").replace('"', '\\"')
-        return page.locator(f'label[for="{ident}"]').first
-    return None
-
-
 async def _humanized_click(page, target, timeout: int, label=None) -> None:
     """Scroll ``target`` (a Locator) into view, move the mouse to a point on it
     with Camoufox's humanized trail, dwell, then click that point.
 
-    ``label`` is the control's <label> Locator, if any. When no sampled point
-    on the control hit-tests as the control itself (a styled checkbox whose
-    <input> sits under its own <span class=mark>), the label is clicked
-    instead: that is where a person clicks, and the decoration is part of the
-    control, not an overlay. A real overlay still covers the label too, so the
-    label's click then fails as ClickBlocked naming it.
+    ``label`` is the control's own <label> (an ElementHandle), if any. When
+    every sampled hit on the control landed inside that label (a styled
+    checkbox whose <input> sits under its own <span class=mark>), the label is
+    clicked instead: that is where a person clicks, and the decoration is part
+    of the control, not an overlay. A cover outside the label is an overlay:
+    the control itself is clicked, and Playwright names the cover. The label
+    is only ever clicked at a point that activates the control (see
+    _PICK_POINT_JS). With none: an overlay on the label fails as ClickBlocked;
+    a label that is all link sends nothing and the fallback chain runs. The
+    label is a handle, not a Locator: re-rendered on hover, it fails as
+    detached before anything is sent.
 
     The click is NOT ``no_wait_after``: Playwright reads the hit-target
     interceptor's verdict only when it waits after the action (`if
@@ -1246,11 +1280,21 @@ async def _humanized_click(page, target, timeout: int, label=None) -> None:
     """
     await target.scroll_into_view_if_needed(timeout=timeout)
     pos = await target.evaluate(_PICK_POINT_JS)
-    if pos is None and label is not None:
+    if pos == "label" and label is not None:
         target = label
         await target.scroll_into_view_if_needed(timeout=timeout)
         pos = await target.evaluate(_PICK_POINT_JS)
-    box = await target.bounding_box(timeout=timeout)
+    if isinstance(pos, dict) and "cover" in pos:
+        # An overlay covers the label. Phrased as Playwright's call-log line so
+        # _stealth_click raises ClickBlocked with no fallback: the fallbacks
+        # would reach the hidden control behind the overlay by script.
+        raise Exception(f"  - {pos['cover']} {_INTERCEPT_MARK}")
+    if not isinstance(pos, dict):
+        if target is label:
+            raise Exception("no point on the label would activate its control")
+        pos = None
+    # An ElementHandle's bounding_box takes no timeout; a Locator's does.
+    box = await (target.bounding_box() if target is label else target.bounding_box(timeout=timeout))
     if box is None:
         raise Exception("element has no layout box")
     if pos is not None:
@@ -1343,11 +1387,16 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
     try:
         await loc.wait_for(state="attached", timeout=timeout)
         info = await loc.evaluate(_LABEL_JS)
-        label = _label_locator(page, loc, info)
+        label = None
+        if info.get("label"):
+            # The control's OWN label, from the DOM. A selector rebuilt from its
+            # id (label[for=id]) searches the whole page through open shadow
+            # roots and finds another component's label when ids repeat.
+            label = (await loc.evaluate_handle("e => e.labels[0]")).as_element()
         if not info.get("visible") and label is not None:
-            # A hidden <input> (display:none, zero size): only its label can be
+            # A hidden <input> (display:none, sr-only): only its label can be
             # clicked.
-            await _humanized_click(page, label, timeout)
+            await _humanized_click(page, label, timeout, label=label)
         else:
             await _humanized_click(page, loc, timeout, label=label)
     except Exception as stealth_err:
@@ -2401,10 +2450,11 @@ async def _impl_browser_click(selector: str) -> dict:
     try:
         await _human_delay()
         await _stealth_click(page, selector)
-        # A click may trigger navigation (form submit, link). The stealth mouse
-        # path — unlike page.click() — has no navigation auto-wait, so settle
-        # briefly to let a nav commit, then best-effort wait for the new
-        # document. Fully swallowed: never break a click that already worked.
+        # A click may trigger navigation (form submit, link). Playwright's click
+        # waits only for navigations it sees start, and the keyboard and
+        # shadow-DOM fallbacks wait for none, so settle briefly to let a nav
+        # commit, then best-effort wait for the new document. Fully swallowed:
+        # never break a click that already worked.
         await asyncio.sleep(0.3)
         with contextlib.suppress(Exception):
             await page.wait_for_load_state("domcontentloaded", timeout=3000)
