@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import math
 import os
@@ -26,6 +27,8 @@ import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+
+from fastmcp import Context
 
 from genesis.mcp.health import mcp
 
@@ -1860,6 +1863,77 @@ async def _click_in_shadow_dom(page, selector: str) -> bool:
         return False
 
 
+# browser_fill has no overall deadline: a long value legitimately takes a long
+# time (the typing delays alone average about 0.24 s per character, so 2,000
+# characters is about eight minutes before any browser round trips), and a length-derived deadline cut real fills short and reset the
+# page. What it guards against instead is the failure the old deadline existed
+# for: a Playwright call into Camoufox that never returns (MEASURED: a
+# page.click(timeout=10000) hung 22 minutes; see _TOOL_TIMEOUT_S). So every
+# browser call in a fill gets its own stall bound.
+#
+# 30 s: the longest LEGITIMATE single step is Playwright's own 10 s actionability
+# wait inside fill("")/click(); one keystroke (key down, key up) returns in
+# milliseconds, and the hold and gap we add between them (at most 0.2 s and 1 s)
+# are sleeps outside the bound. 30 s is three times the longest legitimate step,
+# so a step still running then is hung, not slow.
+_FILL_STALL_S: float = 30.0
+
+# The MCP client has its own idle watchdog. Claude Code aborts a tool call that
+# sends no response or progress notification for CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT
+# (default 30 min for a stdio server, 5 min for a remote one), leaving a partly
+# filled field. MEASURED on CC 2.1.280 with a stdio probe server and the idle
+# timeout lowered to 20 s: a silent 45 s call was aborted, and the same call
+# reporting progress every 5 s completed. (A silent 150 s call under
+# MCP_TIMEOUT=120000 also completed: MCP_TIMEOUT does not bound a tool call.)
+# So the browser_fill tool reports
+# progress as steps complete, through this per-call reporter. It is unset for
+# direct callers of _impl_browser_fill, which have no client.
+_fill_progress: contextvars.ContextVar = contextvars.ContextVar(
+    "_fill_progress", default=None
+)
+# One notification per 5 s rather than one per step (about 8 a second: two
+# steps per character at about 0.24 s each), and still 60 times inside the
+# shortest default idle timeout (300 s).
+_FILL_PROGRESS_EVERY_S: float = 5.0
+# Each report awaits the client transport (fastmcp's report_progress awaits
+# session.send_progress_notification), so it gets its own bound: outside the
+# step's _FILL_STALL_S, a send that never returns would stall typing with it.
+# A healthy stdio send is a hand-off to the writer task and returns in
+# milliseconds, so 1 s is far beyond a slow-but-live send. Kept well under the
+# 5 s throttle: with a wedged transport every report times out, and the fill
+# then pauses at most 1 s per 5 s of typing, about as long as the thinking
+# pauses _human_type already inserts. A dropped report costs nothing while
+# any report in the client's idle window gets through, and the shortest
+# (300 s) holds 60 of them.
+_FILL_PROGRESS_SEND_S: float = 1.0
+
+
+class FillStalled(Exception):
+    """A browser call inside browser_fill made no progress for _FILL_STALL_S."""
+
+
+async def _no_stall(awaitable, what: str, *, report_progress: bool = True):
+    """Await one browser call of a fill, failing if it stalls.
+
+    A completed step is activity for BOTH idle watchdogs that could reclaim a
+    fill with no overall deadline: this server's (_IDLE_TIMEOUT_S, via _touch)
+    and the MCP client's (via the _fill_progress reporter). A key-down step
+    passes report_progress=False: a report can wait up to
+    _FILL_PROGRESS_SEND_S, which would stretch the key's hold.
+    """
+    try:
+        result = await asyncio.wait_for(awaitable, timeout=_FILL_STALL_S)
+    except TimeoutError:
+        raise FillStalled(
+            f"{what} made no progress for {_FILL_STALL_S:.0f}s"
+        ) from None
+    _touch()
+    report = _fill_progress.get() if report_progress else None
+    if report is not None:
+        await report(what)
+    return result
+
+
 async def _human_type(page, selector: str, value: str) -> None:
     """Type text character-by-character with human-like timing.
 
@@ -1874,23 +1948,27 @@ async def _human_type(page, selector: str, value: str) -> None:
     Chromium fallback (dev/test): atomic page.fill() (no delay overhead).
     """
     if not _is_camoufox_active() and not _is_remote_active():
-        await page.fill(selector, value, timeout=10000)
+        await _no_stall(page.fill(selector, value, timeout=10000), "fill")
         return
 
     # Clear field reliably (works on React controlled inputs)
-    await page.fill(selector, "", timeout=10000)
+    await _no_stall(page.fill(selector, "", timeout=10000), "clearing the field")
     # Click to focus the field
-    await page.click(selector, timeout=10000)
+    await _no_stall(page.click(selector, timeout=10000), "focusing the field")
     # Type per-keystroke with hold time + flight time (IKI) jitter.
     # Hold time: log-normal, median ~86ms (CMU Keystroke Dynamics calibration).
     # Flight time: 50-200ms uniform with 5% thinking pauses.
-    for char in value:
+    for i, char in enumerate(value):
         # Hold phase: keydown → hold → keyup
         hold_s = random.lognormvariate(math.log(0.086), 0.35)
         hold_s = max(0.03, min(hold_s, 0.20))  # clamp 30-200ms
-        await page.keyboard.down(char)
+        await _no_stall(
+            page.keyboard.down(char),
+            f"keystroke {i + 1} of {len(value)}",
+            report_progress=False,
+        )
         await asyncio.sleep(hold_s)
-        await page.keyboard.up(char)
+        await _no_stall(page.keyboard.up(char), f"keystroke {i + 1} of {len(value)}")
         # Flight phase: gap to next key
         iki = random.uniform(0.05, 0.20)  # 50-200ms
         # 5% chance of a "thinking pause" (300-1000ms)
@@ -2840,6 +2918,7 @@ async def _impl_browser_click(selector: str) -> dict:
 
 async def _impl_browser_fill(selector: str, value: str) -> dict:
     """Fill a form field on the current page."""
+    global _active_page
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -2860,6 +2939,28 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
         await _human_type(page, selector, value)
         _update_remote_url()  # Fill + Enter may cause navigation
         return {"filled": selector, "url": page.url}
+    except FillStalled as e:
+        # Same recovery as a tool timeout: the browser is hung, so the page is
+        # in an unknown state and the next step must be a fresh navigate. The
+        # lock was released before typing, so a browser_navigate may have
+        # replaced the active page meanwhile: reset only the page that stalled.
+        # A navigate on the same layer reuses the page object, so it is reset
+        # with it; that object is the one that hung.
+        logger.warning("browser_fill stalled on '%s': %s", selector, e)
+        if _active_page is not page:
+            return {
+                "error": (
+                    f"Fill stalled on '{selector}': {e}. The page it was filling "
+                    "is no longer the active page, so the active page is unchanged."
+                )
+            }
+        _active_page = None
+        return {
+            "error": (
+                f"Fill stalled on '{selector}': {e}. "
+                "Browser state was reset — call browser_navigate to resume."
+            )
+        }
     except Exception as e:
         return {"error": f"Fill failed on '{selector}': {e}"}
 
@@ -3147,21 +3248,47 @@ async def browser_click(selector: str) -> dict:
 
 
 @mcp.tool()
-async def browser_fill(selector: str, value: str) -> dict:
+async def browser_fill(selector: str, value: str, ctx: Context | None = None) -> dict:
     """Fill a form field on the current page.
 
     Examples: browser_fill('#email', 'user@example.com')
 
     Per-keystroke typing is active for Camoufox and CDP remote — long
-    strings take proportionally longer. The tool timeout scales with
-    string length.
+    strings take proportionally longer (about 0.24 s per character after a
+    pre-delay of up to 15 s). There is no overall deadline: besides ordinary
+    browser errors (selector not found, element detached), the call stops
+    early only if one browser step (clearing, focusing, or a single
+    keystroke) makes no progress for 30 s, and then the page is reset if it
+    is still the active page. Progress is reported as the fill advances, so
+    the MCP client's idle timeout does not cancel a long fill.
     """
-    timeout = min(max(60.0, len(value) * 0.25), 300.0)
-    return await _with_tool_timeout(
-        _impl_browser_fill(selector, value),
-        timeout,
-        f"browser_fill('{selector}')",
-    )
+    steps = 0
+    last_sent = time.monotonic()
+    report_failed = False
+
+    async def report(what: str) -> None:
+        nonlocal steps, last_sent, report_failed
+        steps += 1
+        if ctx is None or time.monotonic() - last_sent < _FILL_PROGRESS_EVERY_S:
+            return
+        last_sent = time.monotonic()
+        try:
+            await asyncio.wait_for(
+                ctx.report_progress(steps, message=what),
+                timeout=_FILL_PROGRESS_SEND_S,
+            )
+        except Exception:  # best effort: a lost report must not fail typing
+            # TimeoutError included: wait_for has cancelled the send, and the
+            # next report retries in 5 s.
+            if not report_failed:  # once per fill, not every 5 s after
+                logger.warning("browser_fill progress report failed", exc_info=True)
+            report_failed = True
+
+    token = _fill_progress.set(report)
+    try:
+        return await _impl_browser_fill(selector, value)
+    finally:
+        _fill_progress.reset(token)
 
 
 @mcp.tool()
