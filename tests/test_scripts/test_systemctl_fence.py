@@ -24,9 +24,28 @@ def test_systemctl_resolves_to_the_fence_shim():
     assert found is not None and "systemctl-fence" in found, found
 
 
-def test_the_session_bus_variables_are_gone():
-    assert "XDG_RUNTIME_DIR" not in os.environ
-    assert "DBUS_SESSION_BUS_ADDRESS" not in os.environ
+def test_the_session_bus_points_nowhere():
+    xdg = os.environ["XDG_RUNTIME_DIR"]
+    assert "systemctl-fence" in xdg and not os.path.exists(xdg)
+    assert os.environ["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path={xdg}/bus"
+
+
+def test_a_script_seeding_its_own_bus_default_still_cannot_connect():
+    """deploy_code_only.sh / update.sh style: `${XDG_RUNTIME_DIR:-/run/user/$uid}`
+    keeps the fence's value, and the real systemctl (called by absolute path, so
+    the PATH shim is bypassed on purpose) cannot reach the user manager."""
+    real = "/usr/bin/systemctl"
+    if not os.path.exists(real):
+        return
+    script = (
+        'XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" '
+        + real
+        + " --user is-active genesis-systemctl-fence-probe.service"
+    )
+    proc = subprocess.run(
+        ["bash", "-c", script], env=dict(os.environ), capture_output=True, text=True
+    )
+    assert "Failed to connect to bus" in proc.stderr, proc
 
 
 def test_a_script_calling_systemctl_reaches_the_shim_and_is_refused():

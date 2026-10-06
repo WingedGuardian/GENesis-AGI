@@ -11,11 +11,10 @@ from tests.test_scripts._deploy_candidates_world import (  # noqa: F401  (deploy
 )
 from tests.test_scripts._deploy_station import station  # noqa: F401  (the deploy script's fixture)
 
-# The variables through which `systemctl --user` reaches the live user manager. With
-# both unset it cannot connect at all ("Failed to connect to bus: No medium found",
-# measured on systemd 255), so a test env that is copied from os.environ, or built
-# from scratch, never carries a route to the running services.
-_SESSION_BUS_VARS = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+# The variables through which `systemctl --user` reaches the live user manager. The
+# fence points both at a path that does not exist, so `systemctl --user` cannot
+# connect ("Failed to connect to bus"), whether a test copies os.environ or a script
+# under test fills in its own default for an unset variable.
 
 
 def pytest_configure(config):
@@ -49,7 +48,7 @@ def _fence_systemctl(_systemctl_fence_dir, monkeypatch, request):
     restore, backup.sh stops services after a DB quarantine. A test that inherited
     the session's bus once stopped a live install's server on each of 10 runs. Two
     layers, because a test may build its env either way: the session-bus variables
-    are removed, and a refusing, logging shim goes first on PATH (exit 3, the code
+    point at a path that does not exist, and a refusing, logging shim goes first on PATH (exit 3, the code
     `is-active` gives for a unit that is not running). A test's own stub still wins
     when the test puts its directory ahead of PATH. A test marked `user_manager`
     keeps the bus variables, for read-only or self-contained work such as
@@ -60,5 +59,10 @@ def _fence_systemctl(_systemctl_fence_dir, monkeypatch, request):
     monkeypatch.setenv("PATH", f"{_systemctl_fence_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     if request.node.get_closest_marker("user_manager"):
         return
-    for var in _SESSION_BUS_VARS:
-        monkeypatch.delenv(var, raising=False)
+    # Point the bus at a path that does not exist rather than unsetting it: scripts
+    # such as deploy_code_only.sh and update.sh seed `${XDG_RUNTIME_DIR:-/run/user/$uid}`
+    # before calling systemctl, so an UNSET variable is recreated as the live route,
+    # while a set one is kept and leads nowhere.
+    nobus = _systemctl_fence_dir / "no-bus"
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(nobus))
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", f"unix:path={nobus}/bus")
