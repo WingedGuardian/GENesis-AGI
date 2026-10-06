@@ -10106,7 +10106,9 @@ _REWORK_ACK_HEADING = "## rework acknowledgement"
 #: The fields the `## Rework` section must carry, each with text after the colon.
 _REWORK_FIELDS = ("Replaces", "Split", "Deviations", "Questions answered")
 
-_REWORK_REF = r"(?:#(\d+)|https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+))"
+#: `#N` only standing alone: never `other/repo#10` (a cross-repository shorthand)
+#: or a URL fragment (`page#10`).
+_REWORK_REF = r"(?:(?<![\w/.#-])#(\d+)\b|https?://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+))"
 #: Signal (a): a STRUCTURED declaration, a line whose field is `Replaces:` or
 #: `Supersedes:` (optionally a bullet, optionally bold), naming PRs as `#N` or as
 #: this repository's PR URLs anywhere in its value. Owner ruling 2026-10-05: prose
@@ -10115,37 +10117,161 @@ _REWORK_REF = r"(?:#(\d+)|https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+))"
 #: a replacement the way the `## Rework` section already asks, and undeclared
 #: rebuilds are left to commit containment (signal b) and the closing session.
 #: Linear: anchored, no nested quantifier over whitespace.
+#: A field line, read from rendered paragraph text (emphasis already dropped):
+#: `Name: value`. Linear: anchored, no nested quantifier over whitespace.
 _REWORK_DECL_FIELD_RE = re.compile(
-    r"^[ \t]{0,3}(?:[-*+][ \t]+)?(?:\*\*|__)?(?:replaces|supersedes)(?:\*\*|__)?[ \t]*:"
-    r"(?P<value>[^\n]*)$",
-    re.IGNORECASE | re.MULTILINE,
+    r"^[ \t]*(?:replaces|supersedes)[ \t]*:(?P<value>.*)$", re.IGNORECASE
 )
-_REWORK_REF_RE = re.compile(_REWORK_REF)
-#: `## Rework`, optionally followed by text (`## Rework (replaces #10)`), but never
-#: the acknowledgement heading, which belongs on the OLD PR.
-_REWORK_HEADING_RE = re.compile(
-    r"^\s{0,3}##[ \t]+rework\b(?![ \t_-]*acknowledg)[^\n]*$", re.IGNORECASE
-)
-#: Any ATX heading ends the section, `###` included: a subsection is not the
-#: `## Rework` section, so its fields cannot fill a missing one.
-_REWORK_SECTION_END_RE = re.compile(r"^\s{0,3}#{1,6}(?:[ \t]|$)")
-#: A fenced code block's opening or closing line (CommonMark: 0-3 spaces, then
-#: three or more backticks or tildes).
-_REWORK_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_REWORK_REF_RE = re.compile(_REWORK_REF, re.IGNORECASE)
+#: The `## Rework` heading's rendered text: `Rework`, optionally followed by more
+#: (`Rework (replaces #10)`), but never the acknowledgement heading, which belongs
+#: on the OLD PR.
+_REWORK_HEADING_TEXT_RE = re.compile(r"^rework\b(?![ \t_-]*acknowledg)", re.IGNORECASE)
 #: The most declared PRs one body may name. Each unlisted one costs a PR read
 #: and a timeline read on a path with no shared deadline (`--check-pr`), so the
 #: bound keeps a degraded API from stalling the report. A rebuild replaces one
 #: to three PRs in practice; more blocks and takes the owner's override.
 _REWORK_MAX_DECLARED = 5
 _REWORK_FIELD_RE = re.compile(
-    r"^\s*(?:[-*+]\s+)?(?:\*\*|__)?(" + "|".join(_REWORK_FIELDS) + r")(?:\*\*|__)?\s*:"
-    r"(?:\*\*|__)?(.*)$",
-    re.IGNORECASE,
+    r"^[ \t]*(" + "|".join(_REWORK_FIELDS) + r")[ \t]*:(.*)$", re.IGNORECASE
 )
-#: An unindented `Label:` line that is not a rework field (`Testing: pytest`,
-#: `**E2E:** none`). It ends the field above it rather than filling it. A bullet
-#: or indented line is never a label: it is the field's value.
-_REWORK_OTHER_FIELD_RE = re.compile(r"^(?:\*\*|__)?[A-Za-z][\w /()-]{0,60}(?:\*\*|__)?:")
+#: Another `Label:` line (`Testing: pytest`, `E2E: none`). It ends the field above
+#: it rather than filling it. The colon must end the label (followed by a space
+#: or the line end), so a URL (`https://...`) is a value, never a label.
+_REWORK_OTHER_FIELD_RE = re.compile(r"^[ \t]*[A-Za-z][\w /()-]{0,60}:(?:[ \t]|$)")
+
+
+def _rework_markdown():
+    """A CommonMark parser (markdown-it-py), or None when it is not installed.
+
+    The rework readers judge the body AS IT RENDERS, so a quoted template in a code
+    block, a blockquote or an HTML comment is never a declaration, a field value or
+    a heading. Hand-written line rules missed some CommonMark construct in each of
+    three review passes, so the body is parsed instead. None makes every reader
+    report the body unreadable, which the fail-direction table handles.
+    """
+    try:
+        from markdown_it import MarkdownIt  # noqa: PLC0415 — optional at import time
+    except ImportError:
+        return None
+    return MarkdownIt("commonmark")
+
+
+class _ReworkUnreadable(Exception):
+    """The body could not be parsed (no Markdown parser installed)."""
+
+
+def _rework_inline_text(inline) -> str:
+    """An inline token's rendered text: emphasis markers and inline HTML dropped,
+    line breaks kept as newlines, link text kept, images dropped."""
+    out: list[str] = []
+    for child in inline.children or []:
+        if child.type in ("text", "code_inline"):
+            out.append(child.content)
+        elif child.type in ("softbreak", "hardbreak"):
+            out.append("\n")
+    return "".join(out)
+
+
+def _rework_blocks(body: str) -> list[tuple[str, object, str]]:
+    """The body's rendered blocks, in order, as ``(kind, where, text)``.
+
+    ``kind`` is ``"heading"`` (``where`` = level), ``"para"`` (``where`` = the tuple
+    of list-item positions enclosing it, empty at the top level), or ``"other"``
+    for a block that renders but carries no readable text (code, raw HTML, a
+    blockquote: their content is quoted material, never the author's field).
+    An HTML block that is only a comment renders nothing and is omitted. Raises
+    ``_ReworkUnreadable`` when no parser is installed.
+    """
+    md = _rework_markdown()
+    if md is None:
+        raise _ReworkUnreadable("the Markdown parser (markdown-it-py) is not installed")
+    tokens = md.parse((body or "").replace("\r\n", "\n"))
+    blocks: list[tuple[str, object, str]] = []
+    quote = 0
+    items: list[int] = []
+    counter = 0
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        t = tok.type
+        if t == "blockquote_open":
+            if quote == 0:
+                blocks.append(("other", (), ""))
+            quote += 1
+        elif t == "blockquote_close":
+            quote -= 1
+        elif quote:
+            pass
+        elif t == "list_item_open":
+            counter += 1
+            items.append(counter)
+        elif t == "list_item_close":
+            items.pop()
+        elif t == "heading_open":
+            inline = tokens[i + 1]
+            blocks.append(("heading", int(tok.tag[1:]), _rework_inline_text(inline)))
+            i += 2
+        elif t == "paragraph_open":
+            inline = tokens[i + 1]
+            blocks.append(("para", tuple(items), _rework_inline_text(inline)))
+            i += 2
+        elif t in ("fence", "code_block", "hr"):
+            blocks.append(("other", tuple(items), ""))
+        elif t == "html_block":
+            if re.sub(r"<!--.*?-->", "", tok.content, flags=re.DOTALL).strip():
+                blocks.append(("other", tuple(items), ""))
+        i += 1
+    return blocks
+
+
+def _rework_field_values(
+    blocks: list[tuple[str, object, str]], field_re: re.Pattern[str]
+) -> list[tuple[str, list[str]]]:
+    """Every field line ``field_re`` matches in ``blocks``, as ``(name, values)``.
+
+    A field's value is the rest of its line, the following lines of the same
+    paragraph up to another ``Label:`` line, and the paragraphs nested under the
+    field: inside the same list item, or, for a field in a top-level paragraph, the
+    list that directly follows it. Prose in a later paragraph is never a value.
+    """
+    out: list[tuple[str, list[str]]] = []
+    for bi, (kind, where, text) in enumerate(blocks):
+        if kind != "para":
+            continue
+        lines = text.split("\n")
+        for li, line in enumerate(lines):
+            m = field_re.match(line)
+            if not m:
+                continue
+            values = [m.group(m.lastindex).strip()] if m.group(m.lastindex).strip() else []
+            for nxt in lines[li + 1 :]:
+                if field_re.match(nxt) or _REWORK_OTHER_FIELD_RE.match(nxt):
+                    break
+                if nxt.strip():
+                    values.append(nxt.strip())
+            if li == len(lines) - 1 or not any(
+                field_re.match(n) or _REWORK_OTHER_FIELD_RE.match(n) for n in lines[li + 1 :]
+            ):
+                for k2, w2, t2 in blocks[bi + 1 :]:
+                    if k2 != "para":
+                        if k2 == "heading" or not where:
+                            break
+                        continue
+                    nested = (
+                        len(w2) > len(where) and w2[: len(where)] == where
+                        if where
+                        else bool(w2)
+                    )
+                    if not nested:
+                        break
+                    first = t2.split("\n", 1)[0]
+                    if field_re.match(first) or _REWORK_OTHER_FIELD_RE.match(first):
+                        break
+                    values.extend(v.strip() for v in t2.split("\n") if v.strip())
+            name = m.group(1) if m.lastindex and m.lastindex > 1 else ""
+            out.append((name, values))
+    return out
 
 
 def _rework_deadline_passed() -> bool:
@@ -10160,27 +10286,17 @@ def _rework_unreadable(what: str) -> str:
     return f"{what} could not be read"
 
 
-def _rework_visible_text(body: str) -> str:
-    """The body as it renders: fenced code blocks and HTML comments removed.
-
-    Every rework reader (declarations, the `## Rework` section, an acknowledgement
-    heading) reads this, so a quoted template in a fence or an unfilled template
-    comment is never a declaration, a field value, or a heading. An unclosed fence
-    or comment runs to the end of the body, as CommonMark renders it.
-    """
-    out: list[str] = []
-    fence: str | None = None
-    for ln in (body or "").replace("\r\n", "\n").split("\n"):
-        m = _REWORK_FENCE_RE.match(ln)
-        if fence is None:
-            if m:
-                fence = m.group(1)
-                continue
-            out.append(ln)
-        elif m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) \
-                and not ln[m.end():].strip():
-            fence = None
-    return re.sub(r"<!--.*?(?:-->|\Z)", "", "\n".join(out), flags=re.DOTALL)
+def _rework_repo(repo: str) -> str:
+    """``repo`` as an ``OWNER/REPO`` REST path segment: host and scheme dropped as
+    the merge arm drops them, and a trailing ``.git`` removed (gh accepts
+    ``https://github.com/o/r.git`` for ``-R``, but ``repos/o/r.git/...`` is a 404).
+    A value that does not normalize is returned unchanged; its reads then fail and
+    take the unreadable path."""
+    norm = _normalize_repo(repo)
+    if norm is None:
+        return repo
+    owner, _, name = norm.partition("/")
+    return f"{owner}/{name.removesuffix('.git')}"
 
 
 def _rework_declared_refs(body: str, pr_num: str, repo: str | None) -> set[int]:
@@ -10197,25 +10313,25 @@ def _rework_declarations(
     A ``Replaces:`` or ``Supersedes:`` FIELD line declares, anywhere in the body,
     and so does the ``## Rework`` section's ``Replaces:`` value, including the
     lines under it, read by the same traversal as the completeness check. Every
-    reference in a value counts, read from the rendered text
-    (``_rework_visible_text``). A URL counts only when it names THIS repository:
+    reference in a value counts, read from the body as it renders
+    (``_rework_blocks``). A URL counts only when it names THIS repository:
     ``repo`` (normalized), or with ``repo`` unknown the repository gh resolves from the cwd (the
     one a bare merge targets). Problems, each making the PR a declared rebuild that
     cannot be verified (so it blocks): a URL whose repository cannot be resolved.
+    Raises ``_ReworkUnreadable`` when the body cannot be parsed.
     """
     me = int(pr_num) if str(pr_num).isdigit() else -1
     refs: set[int] = set()
     problems: list[str] = []
     # `-R github.com/o/r` is a valid spelling of `o/r`; compare the normalized form,
     # as the merge arm does. A repository that does not normalize cannot be checked.
-    norm = _normalize_repo(repo) if repo else None
-    want: str | None = norm.lower() if norm else None
+    norm = _rework_repo(repo) if repo else None
+    want: str | None = norm.lower() if norm and _normalize_repo(norm) else None
     resolved = repo is not None
-    text = _rework_visible_text(body)
-    values = [m.group("value") for m in _REWORK_DECL_FIELD_RE.finditer(text)]
-    fields = _rework_section_fields(text)
-    section_values = (fields or {}).get("Replaces", [])
-    values.extend(section_values)
+    blocks = _rework_blocks(body)
+    values = [v for _n, vals in _rework_field_values(blocks, _REWORK_DECL_FIELD_RE) for v in vals]
+    fields = _rework_section_fields(body)
+    values.extend((fields or {}).get("Replaces", []))
     for value in values:
         for m in _REWORK_REF_RE.finditer(value):
             if m.group(1):
@@ -10242,34 +10358,30 @@ def _rework_declarations(
 def _rework_section_fields(body: str) -> dict[str, list[str]] | None:
     """The `## Rework` section's fields and their values, or None with no section.
 
-    Each field maps to the value text on its own line plus every continuation line
-    under it (a bullet list), which is how a value is read everywhere: by the
-    completeness check and by the declaration reader alike.
+    The section is the first level-2 heading whose text starts with `Rework` (never
+    the acknowledgement heading), up to the next heading of any level. Each field
+    maps to its values as ``_rework_field_values`` reads them, the same reading
+    the declaration reader uses. Raises ``_ReworkUnreadable`` when the body cannot
+    be parsed.
     """
-    lines = _rework_visible_text(body).splitlines()
-    start = next((i for i, ln in enumerate(lines) if _REWORK_HEADING_RE.match(ln)), None)
+    blocks = _rework_blocks(body)
+    start = next(
+        (
+            i
+            for i, (kind, where, text) in enumerate(blocks)
+            if kind == "heading" and where == 2 and _REWORK_HEADING_TEXT_RE.match(text.strip())
+        ),
+        None,
+    )
     if start is None:
         return None
+    end = next(
+        (j for j in range(start + 1, len(blocks)) if blocks[j][0] == "heading"), len(blocks)
+    )
     fields: dict[str, list[str]] = {}
-    current: str | None = None
-    for ln in lines[start + 1 :]:
-        if _REWORK_SECTION_END_RE.match(ln):
-            break
-        m = _REWORK_FIELD_RE.match(ln)
-        if not m:
-            if _REWORK_OTHER_FIELD_RE.match(ln):
-                # Another `Label:` line (`Testing: pytest`) ends the pending field;
-                # its text is not that field's value.
-                current = None
-            elif current is not None and ln.strip().strip("*_-+").strip():
-                # A value written under its field (a bullet list) belongs to it.
-                fields[current].append(ln.strip())
-            continue
-        current = next(f for f in _REWORK_FIELDS if f.lower() == m.group(1).lower())
-        value = (m.group(2) or "").strip().strip("*_").strip()
-        fields.setdefault(current, [])
-        if value:
-            fields[current].append(value)
+    for name, values in _rework_field_values(blocks[start + 1 : end], _REWORK_FIELD_RE):
+        canon = next(f for f in _REWORK_FIELDS if f.lower() == name.lower())
+        fields.setdefault(canon, []).extend(values)
     return fields
 
 
@@ -10362,6 +10474,31 @@ def _rework_sent_back(repo: str | None) -> tuple[dict[int, tuple[str, str]] | No
     return out, merged, ""
 
 
+def _rework_is_issue(num: int, repo: str | None) -> bool:
+    """True only when ``num`` is confirmed to be an issue in ``repo``.
+
+    A 404 on the PR endpoint also happens for a wrong repository spelling or a
+    number that does not exist, and reading either as "an issue" would turn a
+    declared reference into "not sent back". So the issue endpoint must answer
+    without a ``pull_request`` key; anything else (including a failed read) is
+    False, and the reference stays unverified.
+    """
+    timeout = _gh_timeout(8)
+    try:
+        got = subprocess.run(
+            [
+                "gh", "api", f"repos/{repo or ':owner/:repo'}/issues/{num}",
+                "--jq", 'has("pull_request")',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception:  # noqa: BLE001 — any failure leaves the reference unverified
+        return False
+    return got.returncode == 0 and got.stdout.strip() == "false"
+
+
 def _rework_timeline(num: int, repo: str | None) -> tuple[bool | None, str, str]:
     """Was PR ``num`` ever sent back, by its issue timeline? ``(was, why, state)``.
 
@@ -10409,7 +10546,7 @@ def _rework_timeline(num: int, repo: str | None) -> tuple[bool | None, str, str]
         except Exception:
             return None, _rework_unreadable(f"PR #{num}"), ""
         if pr.returncode != 0:
-            if "HTTP 404" in (pr.stderr or ""):
+            if "HTTP 404" in (pr.stderr or "") and _rework_is_issue(num, repo):
                 return False, "", ""  # an issue, not a pull request
             return None, _rework_unreadable(f"PR #{num}"), ""
         parts = pr.stdout.split()
@@ -10516,13 +10653,19 @@ def _rework_ts(value: object) -> _dt.datetime | None:
 
 
 def _rework_is_ack(body: str) -> bool:
-    """True when the comment's first rendered line IS the acknowledgement heading.
-
-    Exact, whitespace-normalized, never a prefix: "## Rework acknowledgement
-    needed" is an instruction, not an acknowledgement.
+    """True when the comment's first rendered block IS the acknowledgement heading:
+    a level-2 heading (ATX or setext) whose text is exactly "Rework
+    acknowledgement", whitespace-normalized. Never a prefix: "## Rework
+    acknowledgement needed" is an instruction, not an acknowledgement. Raises
+    ``_ReworkUnreadable`` when the comment cannot be parsed.
     """
-    first = next((ln for ln in _rework_visible_text(body).splitlines() if ln.strip()), "")
-    return " ".join(first.split()).lower() == _REWORK_ACK_HEADING
+    blocks = _rework_blocks(body)
+    if not blocks:
+        return False
+    kind, where, text = blocks[0]
+    return kind == "heading" and where == 2 and (
+        " ".join(text.split()).lower() == _REWORK_ACK_HEADING.removeprefix("## ")
+    )
 
 
 def _rework_ack_problem(num: int, rows: list[dict], created: _dt.datetime) -> str | None:
@@ -10598,6 +10741,10 @@ def _check_rework(
     """
     if force:
         return REWORK_OK, "waived by # rework-override (logged)"
+    # `-R github.com/o/r` is a valid gh spelling of `o/r`, but not a REST path:
+    # normalize once, before any endpoint is built, as the merge arm does.
+    if repo:
+        repo = _rework_repo(repo)
     ctx: dict[str, object] = {"declared": False, "reading": "the PR body"}
     try:
         return _check_rework_inner(pr_num, repo, head, ctx)
@@ -10616,10 +10763,17 @@ def _check_rework_inner(
     pr_num: str, repo: str | None, head: str | None, ctx: dict[str, object]
 ) -> tuple[str, str]:
     body = _pr_body_text(pr_num, repo)
+    body_why = _rework_unreadable("the PR body")
     me = int(pr_num) if str(pr_num).isdigit() else -1
-    refs, decl_problems = (
-        _rework_declarations(body, pr_num, repo) if body is not None else (set(), [])
-    )
+    refs: set[int] = set()
+    decl_problems: list[str] = []
+    if body is not None:
+        try:
+            refs, decl_problems = _rework_declarations(body, pr_num, repo)
+        except _ReworkUnreadable as exc:
+            # Unparseable is unreadable: whether it declares is unknown, so it takes
+            # the unreadable-body path (advisory unless containment finds a rebuild).
+            body, body_why = None, f"the PR body could not be read ({exc})"
     ctx["declared"] = bool(refs) or bool(decl_problems)
     if decl_problems:
         # A declaration we cannot resolve: fail closed (declared => BLOCK).
@@ -10677,22 +10831,26 @@ def _check_rework_inner(
                 )
             else:
                 shas = {sha.lower() for sha, _p in commits}
+                # A sent-back head in the list proves a rebuild whatever head the
+                # list was read at; a lagging list only means the set may be short.
+                replaced |= {n for n, h in others.items() if h in shas}
                 if head and head.strip().lower() not in shas:
                     containment_why = (
                         "this PR's commit list does not include the verified head "
                         f"{head.strip().lower()[:12]}, so it was read at another head"
                     )
-                else:
-                    replaced |= {n for n, h in others.items() if h in shas}
 
     if not replaced:
         if body is None:
-            return REWORK_UNCHECKED, _rework_unreadable("the PR body")
+            return REWORK_UNCHECKED, body_why
         if containment_why:
             return REWORK_UNCHECKED, containment_why
         return REWORK_NA, "not a rebuild of a sent-back PR"
 
-    # A rebuild. Every requirement must be verifiable; a failed read BLOCKS.
+    # A rebuild. Every requirement must be verifiable; a failed read BLOCKS, and so
+    # does any exception from here on (the wrapper reads this flag), however the
+    # rebuild was found: containment alone declares nothing.
+    ctx["declared"] = True
     names = ", ".join(f"#{n}" for n in sorted(replaced))
     problems: list[str] = []
     if containment_why:
@@ -10700,7 +10858,7 @@ def _check_rework_inner(
             f"could not verify the full set of replaced PRs — {containment_why}"
         )
     if body is None:
-        problems.append("could not verify — " + _rework_unreadable("the PR body"))
+        problems.append("could not verify — " + body_why)
     else:
         problems.extend(_rework_section_problems(body))
     ctx["reading"] = "this PR's creation time"

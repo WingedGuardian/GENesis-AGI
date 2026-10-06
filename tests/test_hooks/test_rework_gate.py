@@ -770,3 +770,254 @@ def test_35_the_first_unverifiable_reference_stops_the_reads(rebuild, monkeypatc
     state, msg = _check()
     assert state == G.REWORK_BLOCK
     assert calls == [40]
+# ── 36-40: round-2 review findings ──
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Example:\n\n    Replaces: #10\n",
+        "\tReplaces: #10\n",
+        "## Notes\n    Replaces: #10\n",
+    ],
+)
+def test_36_indented_code_does_not_declare(body):
+    """Review finding (Codex r2): an indented code block renders as code, so a
+    quoted template there is not a declaration."""
+    assert G._rework_declared_refs(body, "20", REPO) == set()
+
+
+def test_36b_indented_fields_under_the_heading_do_not_fill_the_section():
+    body = "## Rework\n" + "".join(f"    {ln}\n" for ln in _SECTION.splitlines()[1:])
+    assert len(G._rework_section_problems(body)) == 4
+
+
+def test_36c_a_value_indented_under_a_list_item_is_still_read():
+    body = (
+        "## Rework\n- Replaces:\n    - #10\n- Split: none\n- Deviations: none\n"
+        "- Questions answered: all\n"
+    )
+    assert G._rework_declared_refs(body, "20", REPO) == {10}
+    assert G._rework_section_problems(body) == []
+
+
+def test_36d_an_indented_acknowledgement_is_code(rebuild):
+    rebuild(acks=[_ack(body="    ## Rework acknowledgement\nRead it.")])
+    state, msg = _check()
+    assert state == G.REWORK_BLOCK
+    assert "PR #10 has no `## Rework acknowledgement` comment" in msg
+
+
+def test_37_a_containment_rebuild_blocks_when_a_later_read_raises(rebuild, monkeypatch):
+    """Review finding (Codex r2, P1): a rebuild found by containment alone declared
+    nothing, so a deadline error in the acknowledgement read came back advisory."""
+    rebuild(body="An ordinary change.\n", commits=(OLD_HEAD, HEAD))
+
+    def boom(num, repo):
+        raise RuntimeError("merge-gate deadline exceeded")
+
+    monkeypatch.setattr(G, "_rework_ack_comments", boom)
+    state, msg = _check()
+    assert state == G.REWORK_BLOCK, msg
+    assert "could not verify" in msg
+
+
+def test_38_a_host_qualified_repo_reaches_the_api_normalized(rebuild, monkeypatch):
+    """Review finding (Codex r2): `-R github.com/o/r` built REST paths such as
+    `repos/github.com/o/r/...`."""
+    seen = []
+    real = G._rework_ack_comments
+
+    def spy(num, repo):
+        seen.append(repo)
+        return real(num, repo)
+
+    monkeypatch.setattr(G, "_rework_ack_comments", spy)
+    rebuild()
+    state, msg = G._check_rework("20", "github.com/" + REPO)
+    assert state == G.REWORK_OK, msg
+    assert seen == [REPO]
+
+
+def test_39_a_mixed_case_url_still_declares():
+    """Review finding (Codex r2): scheme and host are case-insensitive."""
+    body = "Replaces: HTTPS://GitHub.com/o/r/pull/10\n"
+    assert G._rework_declared_refs(body, "20", "o/r") == {10}
+# ── 40-52: the body is read as CommonMark (markdown-it-py), class audit cases ──
+
+from pathlib import Path  # noqa: E402
+
+_TEMPLATE = (
+    Path(__file__).resolve().parents[2] / ".github" / "PULL_REQUEST_TEMPLATE.md"
+).read_text()
+
+
+def test_40_the_repo_pr_template_does_not_hide_the_section(rebuild):
+    """Class audit (P1): the template's indented HTML comment once swallowed the
+    rest of the body, so a real rebuild read as n/a."""
+    body = _TEMPLATE + "\n" + _SECTION
+    assert G._rework_declared_refs(body, "20", REPO) == {10}
+    assert G._rework_section_problems(body) == []
+    rebuild(body=body, acks=[])
+    state, msg = _check()
+    assert state == G.REWORK_BLOCK
+    assert "PR #10 has no `## Rework acknowledgement`" in msg
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Strips `<!--` markers.\n\nReplaces: #10\n",
+        "<!--\n```\n-->\nReplaces: #10\n",
+        "```x``` is inline\n\nReplaces: #10\n",
+        "1. Replaces: #10\n",
+    ],
+)
+def test_41_rendered_declarations_are_read(body):
+    """Class audit: a stray `<!--` in a code span, a fence inside a comment, an
+    inline triple-backtick span, and an ordered list item all render the field."""
+    assert G._rework_declared_refs(body, "20", REPO) == {10}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "> quoted\nReplaces: #10\n",
+        "> Replaces: #10\n",
+        "- a\n\n\t\t\tReplaces: #10\n",
+        "<div>\nReplaces: #10\n</div>\n",
+    ],
+)
+def test_42_quoted_or_code_or_html_text_does_not_declare(body):
+    """Class audit: a lazy blockquote continuation, a quote, code nested in a list
+    item, and a raw HTML block are not the author's field."""
+    assert G._rework_declared_refs(body, "20", REPO) == set()
+
+
+def test_43_prose_after_the_last_field_is_not_a_value():
+    body = _SECTION.replace("Replaces: #10", "Replaces: #30") + "\nThis also touches #10.\n"
+    assert G._rework_declared_refs(body, "20", REPO) == {30}
+
+
+def test_43b_later_prose_does_not_fill_an_empty_last_field():
+    body = (
+        _SECTION.replace(
+            "Questions answered: the spec's two open questions, answered in the design notes",
+            "Questions answered:",
+        )
+        + "\nThanks for reviewing.\n"
+    )
+    assert G._rework_section_problems(body) == [
+        "the `## Rework` section's `Questions answered:` line is empty"
+    ]
+
+
+def test_44_an_unbulleted_url_under_the_field_is_its_value():
+    body = _SECTION.replace("Replaces: #10", "Replaces:\nhttps://github.com/o/r/pull/10")
+    assert G._rework_declared_refs(body, "20", "o/r") == {10}
+    assert G._rework_section_problems(body) == []
+
+
+def test_44b_a_list_directly_under_a_top_level_field_is_its_value():
+    body = _SECTION.replace("Replaces: #10", "Replaces:\n\n- #10\n- #11\n")
+    assert G._rework_declared_refs(body, "20", REPO) == {10, 11}
+
+
+def test_45_setext_headings_are_headings():
+    """Class audit: a setext `Rework` heading is the section, and a setext
+    subsection ends it."""
+    section = _SECTION.replace("## Rework\n", "Rework\n------\n")
+    assert G._rework_section_problems(section) == []
+    kept = [ln for ln in _SECTION.splitlines() if not ln.startswith("Deviations")]
+    body = "\n".join(kept) + "\n\nNotes\n-----\nDeviations: from notes\n"
+    assert G._rework_section_problems(body) == ["the `## Rework` section has no `Deviations:` line"]
+
+
+def test_45b_a_quote_under_a_field_is_not_its_value():
+    body = _SECTION.replace("Replaces: #10", "Replaces: #30\n\n> earlier draft said #10\n")
+    assert 10 not in G._rework_declared_refs(body, "20", REPO)
+
+
+@pytest.mark.parametrize(
+    "body, is_ack",
+    [
+        ("## Rework acknowledgement ##\nRead it.", True),
+        ("Rework acknowledgement\n----------------------\nRead it.", True),
+        ("> ## Rework acknowledgement\nquoting the builder", False),
+        ("Rework acknowledgement\n======================\nRead it.", False),
+    ],
+)
+def test_46_acknowledgement_heading_forms(body, is_ack):
+    assert G._rework_is_ack(body) is is_ack
+
+
+@pytest.mark.parametrize(
+    "value, refs",
+    [
+        ("other/repo#10", set()),
+        ("https://example.com/doc#10", set()),
+        ("see issue#10", set()),
+        ("http://github.com/o/r/pull/10", {10}),
+        ("#10, #11", {10, 11}),
+    ],
+)
+def test_47_only_standalone_and_this_repo_references_count(value, refs):
+    """Class audit: `#N` inside another token named another repository's PR or a
+    URL fragment; `http://` URLs were missed."""
+    assert G._rework_declared_refs(f"Replaces: {value}\n", "20", "o/r") == refs
+
+
+@pytest.mark.parametrize("repo", ["o/r", "github.com/o/r", "https://github.com/o/r.git", "o/r.git"])
+def test_48_report_repositories_normalize_for_rest_paths(repo):
+    assert G._rework_repo(repo) == "o/r"
+    assert G._rework_declarations("Replaces: https://github.com/o/r/pull/7\n", "20", repo) == (
+        {7},
+        [],
+    )
+
+
+def test_49_a_404_is_an_issue_only_when_the_issue_endpoint_says_so(monkeypatch):
+    """Class audit: any 404 on the PR endpoint read as "an issue", so a wrong repo
+    spelling made a declared reference "not sent back"."""
+    import subprocess as sp
+
+    def fake(argv, **kw):
+        path = argv[2]
+        if "/pulls/" in path:
+            return sp.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+        return sp.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+
+    monkeypatch.delenv("_TEST_GH_REWORK_TIMELINE", raising=False)
+    monkeypatch.setattr(G.subprocess, "run", fake)
+    was, why, _state = G._rework_timeline(10, "o/r")
+    assert was is None and why
+
+    def fake_issue(argv, **kw):
+        if "/pulls/" in argv[2]:
+            return sp.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+        return sp.CompletedProcess(argv, 0, "false\n", "")
+
+    monkeypatch.setattr(G.subprocess, "run", fake_issue)
+    assert G._rework_timeline(10, "o/r")[0] is False
+
+
+def test_50_a_lagging_commit_list_still_proves_containment(rebuild):
+    """Class audit: a commit list read at another head that already contains a
+    sent-back head was discarded as could-not-check."""
+    rebuild(body="An ordinary change.\n", commits=(OLD_HEAD, "c" * 40))
+    state, msg = _check(head=HEAD)
+    assert state == G.REWORK_BLOCK, msg
+    assert "#10" in msg
+
+
+def test_51_no_parser_reads_the_body_as_unreadable(rebuild, monkeypatch):
+    """Without markdown-it-py an undeclared PR is could-not-check (advisory), and a
+    rebuild found by containment still blocks."""
+    monkeypatch.setattr(G, "_rework_markdown", lambda: None)
+    rebuild(body=_BODY, commits=(HEAD,))
+    state, msg = _check()
+    assert state == G.REWORK_UNCHECKED, msg
+    assert "markdown-it-py" in msg
+    rebuild(body=_BODY, commits=(OLD_HEAD, HEAD))
+    state, msg = _check()
+    assert state == G.REWORK_BLOCK, msg
