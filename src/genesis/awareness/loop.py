@@ -1377,6 +1377,10 @@ async def _resolve_memory_integrity_posture(db) -> None:
 # days old AND ≥20 commits behind; thresholds live beside derive_findings in
 # deploy_health.py, the single producer of finding keys), or a missing
 # systemd unit that has been alerted for >24h.
+# The same check also reports tracked files edited in place in the deploy
+# checkout (main_checkout_dirty, judged by the deploy scripts' own predicate):
+# not drift, but the state in which the next deploy refuses. Its own wording,
+# no update.sh advice (update.sh refuses a dirty tree), never critical.
 # Slow-moving by nature → hourly cadence (the WAL-truncate block).
 _DEPLOY_MISSING_UNIT_CRITICAL_S = 24 * 3600
 _DEPLOY_ALERT_COOLDOWN_S = 6 * 3600  # same-state re-alerts at most every 6h
@@ -1387,13 +1391,19 @@ _DEPLOY_ALERT_COOLDOWN_S = 6 * 3600  # same-state re-alerts at most every 6h
 _DEPLOY_SUPERSEDED_NOTE = "superseded by a new deploy-staleness alert state"
 _last_deploy_alert_at: float = 0.0
 _last_deploy_alert_key: str = ""
+# The deploy checkout's status on the previous tick (deploy_health's
+# main_checkout["status"]). An unreadable status raises its finding only on the
+# SECOND consecutive tick, so one slow git call never alerts; on the first one
+# the whole check holds, because acting on it would resolve a standing dirty
+# alert as if the tree had been restored.
+_last_main_checkout_status: str = ""
 
 
 async def _check_deploy_staleness(db) -> None:
     """Alert when merged changes have not been DEPLOYED here (see block comment).
 
     Best-effort — the whole body is guarded and never raises into the tick."""
-    global _last_deploy_alert_at, _last_deploy_alert_key
+    global _last_deploy_alert_at, _last_deploy_alert_key, _last_main_checkout_status
     if db is None:
         return
     try:
@@ -1404,6 +1414,21 @@ async def _check_deploy_staleness(db) -> None:
 
         snap = await deploy_health(db)
         if snap.get("status") == "error":
+            return
+        checkout = snap.get("main_checkout") or {}
+        checkout_status = checkout.get("status") or ""
+        previous_checkout_status = _last_main_checkout_status
+        _last_main_checkout_status = checkout_status
+        # Hold the whole check (no new alert, no resolution) on a tick whose
+        # deploy-checkout answer cannot be trusted yet: a deploy in progress
+        # (its own merge reads as dirty, and it would otherwise resolve a
+        # standing dirty alert), or the FIRST unreadable tick. Acting on either
+        # would resolve a dirty alert as if the tree had been restored; a
+        # second consecutive unreadable tick raises main_checkout_unreadable,
+        # which supersedes the dirty row instead. One tick is an hour.
+        if checkout_status == "deploying" or (
+            checkout_status == "unknown" and previous_checkout_status != "unknown"
+        ):
             return
         findings = snap.get("findings") or []
         if not findings:
@@ -1481,40 +1506,26 @@ async def _check_deploy_staleness(db) -> None:
             resolution_notes=_DEPLOY_SUPERSEDED_NOTE,
         )
 
-        missing_units = snap.get("missing_units") or []
-        tier2 = snap.get("tier2_pending") or []
-        host = snap.get("host_gateway") or {}
-        detail: list[str] = []
-        if age_days is not None:
-            detail.append(f"last successful update.sh: {age_days} days ago")
-        if behind is not None:
-            fetch_age = git_facts.get("fetch_age_hours")
-            detail.append(
-                f"{behind} commits behind upstream"
-                + (f" (as of last fetch, {fetch_age}h ago)" if fetch_age is not None else "")
-            )
-        if missing_units:
-            detail.append("missing systemd units: " + ", ".join(missing_units))
-        if tier2:
-            detail.append(f"{len(tier2)} update.sh-only file(s) changed since the last update")
-        if host.get("status") in ("drift", "unknown_commit"):
-            detail.append(
-                f"host guardian: {host.get('status')} "
-                f"(deployed_commit={host.get('deployed_commit')})"
+        paragraphs: list[str] = []
+        # The drift paragraph (and its update.sh recovery sentence) only when a
+        # drift class is present: update.sh REFUSES a dirty deploy checkout, so
+        # telling someone to run it for a dirty-only state is wrong advice.
+        if set(classes) - _DEPLOY_CHECKOUT_CLASSES:
+            paragraphs.append(_deploy_drift_paragraph(snap, age_days, behind, git_facts))
+        if "main_checkout_dirty" in classes:
+            paragraphs.append(_deploy_checkout_dirty_paragraph(checkout))
+        if "main_checkout_unreadable" in classes:
+            paragraphs.append(
+                "The deploy checkout's tracked-file status could not be read on two "
+                f"consecutive checks ({checkout.get('reason') or 'no reason given'}), so "
+                "whether the next deploy would refuse is unknown."
             )
         created = await observations.create(
             db,
             id=str(uuid.uuid4()),
             source="deploy_staleness_monitor",
             type="infrastructure_alert",
-            content=(
-                "Merged changes are NOT fully deployed on this install — "
-                + "; ".join(detail)
-                + ". Bare git merges deploy code but skip tier-2 activation "
-                "(systemd units, guardian host redeploy, CC/Node pins). "
-                "Recovery: run scripts/update.sh from ~/genesis. "
-                f"[findings: {', '.join(findings)}]"
-            ),
+            content=" ".join(paragraphs) + f" [findings: {', '.join(findings)}]",
             priority=priority,
             created_at=datetime.now(UTC).isoformat(),
             content_hash=content_hash,
@@ -1527,6 +1538,59 @@ async def _check_deploy_staleness(db) -> None:
         logger.warning("Deploy staleness alert (%s): %s", priority, ", ".join(findings))
     except Exception:
         logger.debug("Failed deploy staleness check", exc_info=True)
+
+
+#: Finding classes about the deploy checkout's own tree, not about merged code
+#: that has not been deployed. They get their own wording and never page:
+#: the critical branch keys only on stale_update and missing_units.
+_DEPLOY_CHECKOUT_CLASSES = frozenset({"main_checkout_dirty", "main_checkout_unreadable"})
+
+
+def _deploy_drift_paragraph(snap: dict, age_days, behind, git_facts: dict) -> str:
+    missing_units = snap.get("missing_units") or []
+    tier2 = snap.get("tier2_pending") or []
+    host = snap.get("host_gateway") or {}
+    detail: list[str] = []
+    if age_days is not None:
+        detail.append(f"last successful update.sh: {age_days} days ago")
+    if behind is not None:
+        fetch_age = git_facts.get("fetch_age_hours")
+        detail.append(
+            f"{behind} commits behind upstream"
+            + (f" (as of last fetch, {fetch_age}h ago)" if fetch_age is not None else "")
+        )
+    if missing_units:
+        detail.append("missing systemd units: " + ", ".join(missing_units))
+    if tier2:
+        detail.append(f"{len(tier2)} update.sh-only file(s) changed since the last update")
+    if host.get("status") in ("drift", "unknown_commit"):
+        detail.append(
+            f"host guardian: {host.get('status')} (deployed_commit={host.get('deployed_commit')})"
+        )
+    return (
+        "Merged changes are NOT fully deployed on this install — "
+        + "; ".join(detail)
+        + ". Bare git merges deploy code but skip tier-2 activation "
+        "(systemd units, guardian host redeploy, CC/Node pins). "
+        "Recovery: run scripts/update.sh from ~/genesis."
+    )
+
+
+def _deploy_checkout_dirty_paragraph(checkout: dict) -> str:
+    count = checkout.get("count") or 0
+    names = ", ".join(checkout.get("paths") or [])
+    omitted = checkout.get("paths_omitted") or 0
+    if omitted:
+        names += f", and {omitted} more"
+    return (
+        f"{count} tracked file(s) edited in place in the deploy checkout "
+        f"(as first detected: {names}; the deploy-health snapshot's main_checkout "
+        "field has the live list). Deploys refuse until each is restored or brought "
+        "in through a pull request. In-place writers include hand edits, coding "
+        "clients without the repo's edit hooks, and runtime writers such as the "
+        "learning pipeline's steering rules and the dashboard's config and file "
+        "editors."
+    )
 
 
 async def _resolve_deploy_staleness(db) -> None:
@@ -3755,7 +3819,8 @@ class AwarenessLoop:
                     # backlog clears. Best-effort (guarded internally).
                     await _check_embedding_backlog(self._db)
                     # Deploy staleness — merged-vs-deployed drift (update.sh age,
-                    # commits behind, missing units, host guardian). Day-scale
+                    # commits behind, missing units, host guardian), plus tracked
+                    # edits in the deploy checkout that would refuse a deploy. Day-scale
                     # signal → hourly; self-resolves on recovery. Best-effort
                     # (guarded internally); collectors never do network I/O.
                     await _check_deploy_staleness(self._db)

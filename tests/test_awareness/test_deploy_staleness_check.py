@@ -42,6 +42,7 @@ async def db():
 def _reset_cooldowns(monkeypatch):
     monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
     monkeypatch.setattr(loop, "_last_deploy_alert_key", "")
+    monkeypatch.setattr(loop, "_last_main_checkout_status", "")
 
 
 def _snap(
@@ -52,6 +53,7 @@ def _snap(
     missing_units=None,
     tier2=None,
     host_status="ok",
+    main_checkout=None,
 ):
     return {
         "status": "attention" if findings else "healthy",
@@ -61,6 +63,7 @@ def _snap(
         "missing_units": missing_units or [],
         "tier2_pending": tier2 or [],
         "host_gateway": {"status": host_status},
+        "main_checkout": main_checkout or {"status": "clean", "count": 0, "paths": []},
     }
 
 
@@ -261,3 +264,159 @@ async def test_check_never_raises_into_tick(db, monkeypatch):
     monkeypatch.setattr(dh_module, "deploy_health", boom)
     await loop._check_deploy_staleness(db)  # must not raise
     assert await _rows(db) == []
+
+
+# ── main_checkout: tracked edits in the deploy checkout ──────────────────
+
+
+def _dirty(count=1, paths=("identity/STEERING.md",)):
+    return {"status": "dirty", "count": count, "paths": list(paths), "paths_omitted": 0}
+
+
+_UNKNOWN = {"status": "unknown", "count": 0, "paths": [], "reason": "timed out after 10s"}
+
+
+async def test_dirty_only_alert_is_its_own_paragraph(db, monkeypatch):
+    """A dirty deploy root is not merged-but-undeployed drift: update.sh refuses
+    a dirty tree, so its recovery sentence, the drift opener and the update-age
+    and behind-count lines must all stay out of a dirty-only alert."""
+    _patch_snapshot(
+        monkeypatch,
+        _snap(["main_checkout_dirty:1"], age_days=1.0, behind=3, main_checkout=_dirty()),
+    )
+    await loop._check_deploy_staleness(db)
+    rows = await _rows(db)
+    assert len(rows) == 1
+    content = rows[0]["content"]
+    assert rows[0]["priority"] == "high"
+    assert "edited in place" in content
+    assert "identity/STEERING.md" in content
+    assert "as first detected" in content
+    assert "Recovery: run scripts/update.sh" not in content
+    assert "NOT fully deployed" not in content
+    assert "commits behind" not in content
+    assert "last successful update.sh" not in content
+
+
+async def test_dirty_with_drift_carries_both_paragraphs(db, monkeypatch):
+    _patch_snapshot(
+        monkeypatch,
+        _snap(
+            ["tier2_pending:2", "main_checkout_dirty:1"],
+            age_days=1.0,
+            behind=3,
+            tier2=["a", "b"],
+            main_checkout=_dirty(),
+        ),
+    )
+    await loop._check_deploy_staleness(db)
+    content = (await _rows(db))[0]["content"]
+    assert "NOT fully deployed" in content
+    assert "Recovery: run scripts/update.sh" in content
+    assert "edited in place" in content
+
+
+async def test_dirty_names_are_bounded_with_an_explicit_remainder(db, monkeypatch):
+    mc = {"status": "dirty", "count": 25, "paths": ["a.py", "b.py"], "paths_omitted": 23}
+    _patch_snapshot(monkeypatch, _snap(["main_checkout_dirty:25"], main_checkout=mc))
+    await loop._check_deploy_staleness(db)
+    content = (await _rows(db))[0]["content"]
+    assert "25 tracked file(s)" in content
+    assert "and 23 more" in content
+
+
+async def test_dirty_resolves_when_clean(db, monkeypatch):
+    _patch_snapshot(monkeypatch, _snap(["main_checkout_dirty:1"], main_checkout=_dirty()))
+    await loop._check_deploy_staleness(db)
+    assert len(await _rows(db)) == 1
+    _patch_snapshot(monkeypatch, _snap([]))
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db) == []
+    resolved = await _rows(db, resolved=1)
+    assert resolved[0]["resolution_notes"] == "auto-resolved: deploy staleness cleared"
+
+
+async def test_dirty_count_change_does_not_re_alert(db, monkeypatch):
+    _patch_snapshot(monkeypatch, _snap(["main_checkout_dirty:1"], main_checkout=_dirty()))
+    await loop._check_deploy_staleness(db)
+    first = await _rows(db)
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)  # bypass cooldown
+    _patch_snapshot(
+        monkeypatch,
+        _snap(["main_checkout_dirty:2"], main_checkout=_dirty(2, ("a.py", "b.py"))),
+    )
+    await loop._check_deploy_staleness(db)
+    rows = await _rows(db)
+    assert len(rows) == 1
+    assert rows[0]["content_hash"] == first[0]["content_hash"]
+
+
+async def test_dirty_never_pages_however_long_it_stands(db, monkeypatch):
+    _patch_snapshot(
+        monkeypatch, _snap(["main_checkout_dirty:1"], age_days=30.0, main_checkout=_dirty())
+    )
+    await loop._check_deploy_staleness(db)
+    old = (datetime.now(UTC) - timedelta(days=10)).isoformat()
+    await db.execute(f"UPDATE observations SET created_at=? WHERE source='{SOURCE}'", (old,))
+    await db.commit()
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    await loop._check_deploy_staleness(db)
+    rows = await _rows(db)
+    assert [r["priority"] for r in rows] == ["high"]
+
+
+async def test_one_unreadable_tick_raises_nothing(db, monkeypatch):
+    findings = dh_module.derive_findings(
+        missing_units=[],
+        tier2_pending=None,
+        host_gateway={"status": "ok"},
+        commits_behind=0,
+        main_checkout=_UNKNOWN,
+    )
+    assert findings == ["main_checkout_unreadable"]
+    _patch_snapshot(monkeypatch, _snap(findings, main_checkout=_UNKNOWN))
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db) == []
+    # Interrupted by a readable tick, the next unknown is a first one again.
+    _patch_snapshot(monkeypatch, _snap([]))
+    await loop._check_deploy_staleness(db)
+    _patch_snapshot(monkeypatch, _snap(findings, main_checkout=_UNKNOWN))
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db) == []
+    # A second CONSECUTIVE unknown raises it.
+    await loop._check_deploy_staleness(db)
+    rows = await _rows(db)
+    assert len(rows) == 1
+    assert rows[0]["priority"] == "high"
+    assert "could not be read" in rows[0]["content"]
+    assert "timed out after 10s" in rows[0]["content"]
+    assert "Recovery: run scripts/update.sh" not in rows[0]["content"]
+
+
+async def test_dirty_then_unreadable_supersedes_never_resolves(db, monkeypatch):
+    """An unreadable status must never read as clean: the first unknown tick
+    leaves the dirty alert standing, the second supersedes it (it is not
+    resolved as if the tree had been restored)."""
+    _patch_snapshot(monkeypatch, _snap(["main_checkout_dirty:1"], main_checkout=_dirty()))
+    await loop._check_deploy_staleness(db)
+    (dirty_row,) = await _rows(db)
+    _patch_snapshot(monkeypatch, _snap(["main_checkout_unreadable"], main_checkout=_UNKNOWN))
+    await loop._check_deploy_staleness(db)
+    assert [r["id"] for r in await _rows(db)] == [dirty_row["id"]]
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    await loop._check_deploy_staleness(db)
+    active = await _rows(db)
+    assert len(active) == 1
+    assert "could not be read" in active[0]["content"]
+    (old,) = await _rows(db, resolved=1)
+    assert old["id"] == dirty_row["id"]
+    assert old["resolution_notes"] == loop._DEPLOY_SUPERSEDED_NOTE
+
+
+async def test_a_tick_during_a_deploy_leaves_the_dirty_alert_standing(db, monkeypatch):
+    _patch_snapshot(monkeypatch, _snap(["main_checkout_dirty:1"], main_checkout=_dirty()))
+    await loop._check_deploy_staleness(db)
+    (dirty_row,) = await _rows(db)
+    _patch_snapshot(monkeypatch, _snap([], main_checkout={"status": "deploying"}))
+    await loop._check_deploy_staleness(db)
+    assert [r["id"] for r in await _rows(db)] == [dirty_row["id"]]

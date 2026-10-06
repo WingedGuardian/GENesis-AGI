@@ -489,6 +489,8 @@ _FRESH = (
     "scripts/disk_reclaim.py",
     "scripts/hooks/bash_allowlist_guard.sh",
     "scripts/hooks/bash_allowlist_lib.sh",
+    "scripts/lib/deploy_marker.sh",
+    "scripts/lib/deploy_checkout.sh",
     ".claude/hooks/genesis-hook",
 )
 

@@ -29,6 +29,8 @@ _RUNTIME_FRESH_SCRIPTS=(
     scripts/disk_reclaim.py               # run by autonomy/remediation.py
     scripts/hooks/bash_allowlist_guard.sh # run through .claude/hooks/genesis-hook by cc/invoker.py
     scripts/hooks/bash_allowlist_lib.sh   # sourced by bash_allowlist_guard.sh on every run
+    scripts/lib/deploy_marker.sh          # sourced by observability/snapshots/deploy_health.py's main-checkout probe on every snapshot
+    scripts/lib/deploy_checkout.sh        # sourced by the same probe (its dirty-tree predicate)
     # Not under scripts/, but the same kind: cc/invoker.py runs the allowlist
     # guard through this launcher in the server, and reads its exit code.
     .claude/hooks/genesis-hook
