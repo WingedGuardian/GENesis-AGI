@@ -261,6 +261,17 @@ optional extras, if installed. Its findings are claims, handled under
 CLAUDE.md's "Verify agent output": re-derive them, then fold the confirmed ones
 into the plan BEFORE presenting it.
 
+**A plan part that defers its own design is not finalized.** "Read X first, then
+design it" is a placeholder, and a review of the plan reviews the placeholder.
+Before coding that part, write its design, and give the part its own architect
+review. For anything that persists state another program reads, the design
+includes the writer-state × reader table: every state the writer can leave
+(complete, skipped, partial, failed midway, killed, a leftover from an earlier
+run) against every reader (genesis-architect Step 0.7 enumerates the lifecycle).
+(Origin: PR #2853 — the plan reviewed once, its backup part was a placeholder,
+and ten of 25 external findings over five rounds were cells of the
+backup/restore state table nobody had written down.)
+
 ### Skill invocation points
 
 Required steps at named moments. A skill marked "if installed" comes from an
@@ -1211,6 +1222,18 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   passed may be testing nothing; a whole suite passing every review round
   while a reviewer keeps finding real spec bugs is the tell that the tests
   encode the same wrong spec as the code.
+- **Verify-RED of a safety fence runs the test UNFENCED.** Removing a guard,
+  stub or sandbox to watch its test fail means whatever the test executes
+  reaches the real system for that run. Read the test first and make its probe
+  harmless even unguarded: `systemctl --user is-active <a unit that does not
+  exist>`, told apart from the stub by the stub's own log, never the dangerous
+  action itself. (Origin: the #2863 fence test's verify-RED ran a real
+  `systemctl --user stop genesis-server` and took a live server down for about
+  3.5 minutes.)
+- **Never edit a shell script while a test that runs it is in progress.** bash
+  reads a script as it executes it, so an edit mid-run yields bogus syntax
+  errors that look like real failures. Wait for the run to finish, or test a
+  copy.
 - **A RED that comes back GREEN has AT LEAST six causes, and "the test is
   vacuous" is the LAST one to reach for.** In rough order of how often they
   actually occur:
