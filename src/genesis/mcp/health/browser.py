@@ -3224,13 +3224,12 @@ async def browser_navigate(
     cdp_url: Override the CDP endpoint. Default: GENESIS_CDP_URL env var.
     Example: browser_navigate("https://jobs.ashbyhq.com/...", remote=True)
 
-    NOTE: If a Cloudflare challenge is detected (Camoufox and Chromium), this
-    call works on it before returning (auto-resolve poll, widget clicks, an
-    optional solver, VNC clicks, a reload); it does not wait for a person. If
-    unresolved, it sends a Telegram alert (when configured) and returns
-    turnstile.status == "blocked". If the challenge handling itself errors,
-    the result has no turnstile field even though a challenge may remain, so
-    check the page title. This can take most of the 300 s timeout.
+    NOTE: On a Cloudflare challenge (Camoufox and Chromium) this call works on
+    it before returning (steps: stealth-browser skill); it does not wait for a
+    person. If unresolved, it sends a Telegram alert (when configured) and
+    returns turnstile.status == "blocked". If the challenge handling itself
+    errors, the result has no turnstile field though a challenge may remain,
+    so check the page title. This can take most of the 300 s timeout.
     """
     # Remote CDP: 60s for the connect (at most 30s), the tab lookup and the
     # goto (at most 30s). A timeout cancels the call; its shielded cleanup
