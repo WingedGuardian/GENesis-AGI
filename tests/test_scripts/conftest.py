@@ -18,6 +18,15 @@ from tests.test_scripts._deploy_station import station  # noqa: F401  (the deplo
 _SESSION_BUS_VARS = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "user_manager: the test needs a reachable systemd user manager for a read-only "
+        "or self-contained operation (systemd-analyze verify, a transient scope); the "
+        "fence keeps the session-bus variables but still shims systemctl",
+    )
+
+
 @pytest.fixture(scope="session")
 def _systemctl_fence_dir(tmp_path_factory):
     d = tmp_path_factory.mktemp("systemctl-fence")
@@ -33,7 +42,7 @@ def _systemctl_fence_dir(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
-def _fence_systemctl(_systemctl_fence_dir, monkeypatch):
+def _fence_systemctl(_systemctl_fence_dir, monkeypatch, request):
     """Keep every script test away from the real `systemctl --user` (issue #2863).
 
     Scripts under test call it: restore.sh stops genesis-server before a SQLite
@@ -42,9 +51,14 @@ def _fence_systemctl(_systemctl_fence_dir, monkeypatch):
     layers, because a test may build its env either way: the session-bus variables
     are removed, and a refusing, logging shim goes first on PATH (exit 3, the code
     `is-active` gives for a unit that is not running). A test's own stub still wins
-    when the test puts its directory ahead of PATH. A test that truly needs the real
-    systemctl must restore PATH and the bus variables itself.
+    when the test puts its directory ahead of PATH. A test marked `user_manager`
+    keeps the bus variables, for read-only or self-contained work such as
+    `systemd-analyze --user verify` or a transient `systemd-run --user --scope`; the
+    systemctl shim still goes first on PATH for it. A test that truly needs the real
+    systemctl must restore PATH itself.
     """
     monkeypatch.setenv("PATH", f"{_systemctl_fence_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    if request.node.get_closest_marker("user_manager"):
+        return
     for var in _SESSION_BUS_VARS:
         monkeypatch.delenv(var, raising=False)
