@@ -3564,6 +3564,18 @@ Verify before any commit:
 - **Targeted tests during development.** Run ONLY the relevant test file(s)
   for your changes. NEVER run the full test suite locally — CI handles that.
   Check CI via `gh pr checks`. Bare `pytest` without a file path is banned.
+- **Heavy jobs go through `genesis.hostmetrics run`.** A build, a parallel test
+  run, a media encode, anything that holds gigabytes or several cores for
+  minutes: launch it with the Genesis venv's interpreter
+  (`~/genesis/.venv/bin/python` on a standard install; a session shell usually
+  has no bare `python`) as `… -m genesis.hostmetrics run --name N --ram GB --cpu
+  PCT -- CMD`. It checks the budget first (GO/WAIT/NO/ASK), then runs the job in a
+  systemd scope capped at its estimates that other sessions' `status` and
+  `preflight` see; without a systemd user manager it runs uncapped and invisible,
+  and says so. `preflight` checks without running. It is not a way around the
+  full-suite rule: test targets must still be named, and do not count on the
+  full-suite guard to see inside the wrapper. Guide:
+  `docs/reference/resource-budget.md`.
 - **Commit continuously**: after every logical unit of work. Uncommitted = lost.
 - **PR closes a ledger item → cite `Ledger: <item-id>` in the PR body** (the
   32-hex `session_ledger` row id, own line, e.g. `Ledger: 71337fab…`). The

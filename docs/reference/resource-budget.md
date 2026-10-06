@@ -4,13 +4,15 @@ Before a session launches a heavy command (a build, a parallel test run, a
 stress run), ask whether it fits, or let `run` ask and then cap it:
 
 ```bash
-python -m genesis.hostmetrics status
-python -m genesis.hostmetrics preflight --name build --ram 4 --cpu 200 --disk ~/tmp=10
-python -m genesis.hostmetrics run --name build --ram 4 --cpu 200 -- make -j4
+~/genesis/.venv/bin/python -m genesis.hostmetrics status
+~/genesis/.venv/bin/python -m genesis.hostmetrics preflight --name build --ram 4 --cpu 200 --disk ~/tmp=10
+~/genesis/.venv/bin/python -m genesis.hostmetrics run --name build --ram 4 --cpu 200 -- make -j4
 ```
 
-`genesis.hostmetrics` is stdlib only and never imports the Genesis runtime, so it
-runs under the venv or under system `python3` with `src/` on the path.
+`genesis.hostmetrics` is stdlib only and never imports the Genesis runtime. Run it with
+the Genesis venv's interpreter (`~/genesis/.venv/bin/python` on a standard install):
+a session shell usually has no bare `python`, and system `python3` cannot import
+`genesis` unless `src/` is on its path.
 
 ## What it measures
 
@@ -89,7 +91,7 @@ output says so in both cases.
 On a container with a 16 GiB limit, 6 GiB in use, and no host link:
 
 ```text
-$ python -m genesis.hostmetrics preflight --name build --ram 8 --cpu 200
+$ ~/genesis/.venv/bin/python -m genesis.hostmetrics preflight --name build --ram 8 --cpu 200
 WAIT build
   memory: WAIT — fits once current load drops (live 6.0 GiB, estimate 8.0 GiB, line 12.8 GiB, total 16.0 GiB)
   cpu: GO — fits under the line (live 50%, estimate 200%, line 320%, total 400%)

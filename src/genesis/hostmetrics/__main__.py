@@ -1,4 +1,4 @@
-"""CLI: ``python -m genesis.hostmetrics status | preflight | run``.
+"""CLI: ``<venv python> -m genesis.hostmetrics status | preflight | run``.
 
 Exit codes for ``preflight``: GO 0, NO 2, WAIT 3, ASK 4; 64 for a usage error
 (argparse's own 2 would read as NO). ``run`` returns the job's own exit code
@@ -217,7 +217,7 @@ def _run(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = _Parser(prog="python -m genesis.hostmetrics")
+    parser = _Parser(prog="genesis.hostmetrics")
     sub = parser.add_subparsers(dest="cmd", required=True, parser_class=_Parser)
     common = _Parser(add_help=False)
     common.add_argument("--json", action="store_true")
