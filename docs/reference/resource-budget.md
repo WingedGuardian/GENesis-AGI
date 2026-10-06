@@ -119,9 +119,11 @@ WAIT build
    `--ram` below 16 MiB is refused for the same reason. The probe also reads the
    limits the kernel applies inside its scope. Where systemd accepts a cap but
    the kernel is not applying it (the scope's `memory.max` or `cpu.max` reads
-   `max`), `run` warns that the cap is NOT enforced; where the limit file cannot
-   be read (cgroup v1, a controller missing from the parent), it warns that the
-   cap could not be verified. Either way the job still runs in the scope,
+   `max`, or `memory.swap.max` reads anything but the requested 0), `run` warns
+   that the cap is NOT enforced; where the limit file cannot be read (cgroup v1,
+   a controller missing from the parent, no memcg swap accounting), it warns
+   that the cap could not be verified. Swap is skipped when no swap device is
+   active, since nothing can swap. Either way the job still runs in the scope,
    visible to other sessions, and also gets the uncapped fallback's nice 19 and
    data limit.
 3. The job's exit code is `run`'s exit code (128+N for signal N). On exit it
@@ -179,7 +181,11 @@ under `--json`), and the job's own report lines start with `genesis-job`.
 - The host leg reads only memory. GPU is out of scope.
 - The memory line is the container's. A job started directly inside a
   session's own capped scope is also bound by that scope's `MemoryMax`, which
-  preflight does not read. Until the `run` wrapper (#2926, PR 2) exists, that is
-  every job a session starts. A `systemd-run --user --scope` job (what `run`
-  launches) lands under the user manager, not inside the caller's scope, so that
-  cap does not apply to it.
+  preflight does not read. That is any heavy job started without `run`. A job `run`
+  launches lands under the user manager (`systemd-run --user --scope`), not
+  inside the caller's scope, so that cap does not apply to it.
+- A live job's declared `--disk` estimate is checked when it is admitted but not
+  reserved afterwards: a second job admitted while the first has not yet written
+  its output sees that space as free. The watchdog stops only its own job, and
+  only after the line has been held for 60 s (not at all with `--approved-over-line disk`),
+  so a fast writer can fill the disk first (#2973).

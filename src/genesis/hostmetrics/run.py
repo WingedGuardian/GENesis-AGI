@@ -37,7 +37,7 @@ from genesis.hostmetrics.jobs import SCOPE_PREFIX, systemd_env
 _REPORT_SH = (
     "fd=$1; shift; rc=0; eval '\"$@\" '\"$fd\"'>&-' || rc=$?; "
     "cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); "
-    'printf "%s %s %s\\n" "$(cat "$cg/memory.peak" 2>/dev/null)" '
+    'printf "%s|%s|%s\\n" "$(cat "$cg/memory.peak" 2>/dev/null)" '
     '"$(sed -n "s/^usage_usec //p" "$cg/cpu.stat" 2>/dev/null)" '
     '"$(sed -n "s/^oom_kill //p" "$cg/memory.events" 2>/dev/null)" >&"$fd"; exit $rc'
 )
@@ -48,7 +48,8 @@ _SYSTEMD_TIMEOUT = 15  # a local D-Bus round trip; a hang means no reachable man
 _ENFORCEMENT_SH = (
     "cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); "
     'cat "$cg/memory.max" 2>/dev/null || echo missing; '
-    'cat "$cg/cpu.max" 2>/dev/null || echo missing'
+    'cat "$cg/cpu.max" 2>/dev/null || echo missing; '
+    'cat "$cg/memory.swap.max" 2>/dev/null || echo missing'
 )
 MIN_RAM = 16 * 1024 * 1024  # below this the probe itself is OOM-killed or refused
 
@@ -62,22 +63,57 @@ class Caps:
     """The properties a probe scope accepted, and which caps it did not enforce."""
 
     props: list[str]
-    unenforced: tuple[str, ...] = ()  # "memory"/"cpu": accepted, but `max` in the scope
-    unverified: tuple[str, ...] = ()  # "memory"/"cpu": the scope's limit file was unreadable
+    unenforced: tuple[str, ...] = ()  # "memory"/"cpu"/"swap": accepted, not applied
+    unverified: tuple[str, ...] = ()  # "memory"/"cpu"/"swap": the limit file was unreadable
 
 
-def _limits(stdout: bytes | str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
+# Why a cap reads as not enforced. Swap has no controller of its own: its limit
+# lives in the memory controller, so a non-zero reading means the kernel did not
+# apply MemorySwapMax=0, not that something is undelegated (round-2 audit).
+_UNENFORCED_WHY = {
+    "memory": "the memory controller is not delegated to the user manager",
+    "cpu": "the cpu controller is not delegated to the user manager",
+    "swap": "the kernel did not apply MemorySwapMax=0",
+}
+_UNVERIFIED_WHY = {
+    "memory": "memory.max was unreadable in the scope, e.g. cgroup v1",
+    "cpu": "cpu.max was unreadable in the scope, e.g. cgroup v1",
+    "swap": "memory.swap.max was unreadable: no memcg swap accounting, or cgroup v1",
+}
+
+
+def _swap_configured() -> bool:
+    """Whether any swap device is active (/proc/swaps lists one). With none,
+    nothing can swap and a missing swap limit is not worth a warning. An
+    unreadable file counts as configured, so the check errs toward warning."""
+    try:
+        with open("/proc/swaps") as f:
+            return len(f.read().strip().splitlines()) > 1
+    except OSError:
+        return True
+
+
+def _limits(
+    stdout: bytes | str | None, swap_present: bool = True
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """(unenforced, unverified) caps from the probe's readback of its own scope."""
     text = stdout.decode(errors="replace") if isinstance(stdout, bytes) else (stdout or "")
     lines = [ln.strip() for ln in text.splitlines()]
     memory = lines[0] if lines else "missing"
     cpu = lines[1].split()[0] if len(lines) > 1 and lines[1] else "missing"
+    swap = lines[2] if len(lines) > 2 else "missing"
     values = (("memory", memory), ("cpu", cpu))
+    # Every scope asks for MemorySwapMax=0, so anything but 0 read back means the
+    # zero-swap limit is not applied (systemd tolerates its absence: review).
+    swap_unenforced = swap_present and swap not in ("0", "missing", "")
+    swap_unverified = swap_present and swap in ("missing", "")
     return (
-        tuple(name for name, value in values if value == "max"),
+        tuple(name for name, value in values if value == "max")
+        + (("swap",) if swap_unenforced else ()),
         # Absent or unreadable (cgroup v1, a controller missing from subtree_control):
         # the cap cannot be confirmed either way.
-        tuple(name for name, value in values if value in ("missing", "")),
+        tuple(name for name, value in values if value in ("missing", ""))
+        + (("swap",) if swap_unverified else ()),
     )
 
 
@@ -149,7 +185,7 @@ def choose_properties(
         except OSError as exc:
             raise ProbeRefused(f"systemd-run could not run: {exc}") from None
         if probe.returncode == 0:
-            return Caps(props, *_limits(probe.stdout))
+            return Caps(props, *_limits(probe.stdout, _swap_configured()))
         err = probe.stderr.decode(errors="replace").strip() if probe.stderr else ""
         if "Failed to connect" in err:  # MEASURED: "Failed to connect to bus: …"
             return None
@@ -160,7 +196,9 @@ def choose_properties(
 
 def parse_report(raw: bytes) -> tuple[int | None, float | None, int | None]:
     """(peak bytes, CPU seconds, OOM kills) from the in-scope reporter's line."""
-    fields = raw.decode(errors="replace").split()
+    # Delimited, not whitespace-split: an unreadable file leaves an EMPTY field,
+    # and splitting on whitespace would shift every later metric into its slot.
+    fields = [f.strip() for f in raw.decode(errors="replace").strip().split("|")]
     values: list[float | None] = []
     for i in range(3):
         try:
@@ -336,16 +374,16 @@ def launch(
             for cap in caps.unenforced:
                 print(
                     f"genesis-job {unit}: WARNING: the {cap} cap is NOT enforced here "
-                    f"(the {cap} controller is not delegated to the user manager); the job "
+                    f"({_UNENFORCED_WHY.get(cap, 'not applied in the scope')}); the job "
                     "is visible to other sessions, runs at nice 19 with a data limit, but "
                     "its estimate is not a hard limit",
                     file=sys.stderr,
                 )
             for cap in caps.unverified:
                 print(
-                    f"genesis-job {unit}: WARNING: could not verify the {cap} cap (its "
-                    "limit file was unreadable in the scope, e.g. cgroup v1); the job runs "
-                    "at nice 19 with a data limit as well",
+                    f"genesis-job {unit}: WARNING: could not verify the {cap} cap "
+                    f"({_UNVERIFIED_WHY.get(cap, 'its limit file was unreadable')}); the "
+                    "job runs at nice 19 with a data limit as well",
                     file=sys.stderr,
                 )
         else:

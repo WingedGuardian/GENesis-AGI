@@ -108,21 +108,36 @@ def test_a_refused_property_is_an_error_not_uncapped(has_systemd_run):
 @pytest.mark.parametrize(
     ("stdout", "unenforced", "unverified"),
     [
-        (b"214745088\n20000 100000\n", (), ()),  # MEASURED: page-rounded MemoryMax, 20% quota
-        (b"max\n20000 100000\n", ("memory",), ()),
-        (b"214745088\nmax 100000\n", ("cpu",), ()),
-        (b"missing\nmissing\n", (), ("memory", "cpu")),  # e.g. cgroup v1
-        (b"", (), ("memory", "cpu")),
+        (b"214745088\n20000 100000\n0\n", (), ()),  # MEASURED: page-rounded, 20%, swap 0
+        (b"max\n20000 100000\n0\n", ("memory",), ()),
+        (b"214745088\nmax 100000\n0\n", ("cpu",), ()),
+        (b"214745088\n20000 100000\nmax\n", ("swap",), ()),  # accepted, not applied
+        (b"214745088\n20000 100000\nmissing\n", (), ("swap",)),  # no swap accounting
+        (b"missing\nmissing\nmissing\n", (), ("memory", "cpu", "swap")),  # e.g. cgroup v1
+        (b"", (), ("memory", "cpu", "swap")),
     ],
 )
 def test_probe_reports_caps_the_kernel_does_not_apply(
-    has_systemd_run, stdout, unenforced, unverified
+    has_systemd_run, monkeypatch, stdout, unenforced, unverified
 ):
     def fake(argv, **kw):
         return subprocess.CompletedProcess(argv, 0, stdout, b"")
 
+    monkeypatch.setattr(run, "_swap_configured", lambda: True)
     caps = run.choose_properties("u", 2**30, 100, None, fake)
     assert (caps.unenforced, caps.unverified) == (unenforced, unverified)
+
+
+@pytest.mark.parametrize("swap_line", [b"max\n", b"missing\n", b""])
+def test_no_swap_device_means_no_swap_warning(has_systemd_run, monkeypatch, swap_line):
+    # Nothing can swap without a swap device, so a missing or unapplied swap
+    # limit says nothing about the job (round-2 audit).
+    def fake(argv, **kw):
+        return subprocess.CompletedProcess(argv, 0, b"214745088\n20000 100000\n" + swap_line, b"")
+
+    monkeypatch.setattr(run, "_swap_configured", lambda: False)
+    caps = run.choose_properties("u", 2**30, 100, None, fake)
+    assert (caps.unenforced, caps.unverified) == ((), ())
 
 
 def test_no_systemd_run_means_uncapped(monkeypatch):
@@ -180,9 +195,12 @@ def test_stop_scope_never_raises_and_does_not_wait():
 
 
 def test_parse_report():
-    assert run.parse_report(b"104857600 162177 1\n") == (104857600, 0.162177, 1)
+    assert run.parse_report(b"104857600|162177|1\n") == (104857600, 0.162177, 1)
     assert run.parse_report(b"") == (None, None, None)
-    assert run.parse_report(b"66433024 147686 \n") == (66433024, 0.147686, None)
+    assert run.parse_report(b"66433024|147686|\n") == (66433024, 0.147686, None)
+    # An unreadable file leaves an empty field that must keep its slot (review).
+    assert run.parse_report(b"|162177|1\n") == (None, 0.162177, 1)
+    assert run.parse_report(b"66433024||1\n") == (66433024, None, 1)
 
 
 def test_watchdog_stops_only_after_the_grace_period():
