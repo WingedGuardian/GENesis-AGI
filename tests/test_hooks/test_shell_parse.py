@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -1472,3 +1473,170 @@ def test_sh_carries_the_union_because_the_allowlist_is_keyed_on_a_basename():
     # basename really does identify the binary.
     assert "h" not in sp._C_BUNDLE_OPTIONS["dash"]
     assert "git" not in [seg.exe for seg in sp.analyze("dash -ch 'git push origin main'")]
+
+
+_UNPROVEN_DATA_HEREDOC_CASES = [
+    ("parameter-expansion", "cat ${x:-<<'EOF'}", "EOF", (), (), True, True),
+    ("file-descriptor", "cat <<'EOF' >&file", "EOF", (), (), True, True),
+    ("fd-number", "cat <<'EOF' 01>file", "EOF", (), (), True, True),
+    ("writer-substitution", "x=$(cat <<'EOF' > f", "EOF", (), (")",), True, True),
+    ("path-cat", "./cat <<'EOF'", "EOF", (), (), True, True),
+    ("process-substitution", "cat <<'EOF' > >(bash)", "EOF", (), (), True, True),
+    ("function-definition", "cat() { bash; }; cat <<'EOF'", "EOF", (), (), True, True),
+    ("path-assignment", "PATH=/tmp cat <<'EOF'", "EOF", (), (), True, True),
+    ("sudo", "sudo cat <<'EOF'", "EOF", (), (), True, True),
+    ("env", "env cat <<'EOF'", "EOF", (), (), True, True),
+    ("second-line-open-quote", "echo \"x\ncat <<'EOF'", "EOF", (), (), False, False),
+    ("body-delimiter-prefix", "git commit -m \"$(cat <<'EOF'", "EOF", ("EOF)",), (')"',), False, True),
+    ("body-delimiter-space", "cat <<'EOF'", "EOF", ("EOF ",), (), True, True),
+    ("body-delimiter-cr", "cat <<'EOF'", "EOF", ("EOF\r",), (), True, True),
+    ("body-delimiter-tab", "cat <<'EOF'", "EOF", ("\tEOF",), (), True, True),
+    ("strip-tabs", "cat <<-'EOF'", "EOF", (), (), True, True),
+    ("unquoted", "cat <<EOF", "EOF", (), (), True, True),
+    ("double-quoted", 'cat <<"EOF"', "EOF", (), (), True, True),
+    ("two-openers", "cat <<'EOF' <<'BAR'", "EOF", (), (), True, True),
+    ("pipe", "cat <<'EOF' | bash", "EOF", (), (), True, True),
+    ("writer", "cat > f <<'EOF'", "EOF", (), (), True, True),
+    ("trailing-backslash", "cat <<'EOF'\\", "EOF", (), (), False, True),
+    ("rebase-exec", "git rebase --exec \"$(cat <<'EOF'", "EOF", (), (')"',), True, True),
+    ("git-global-option", "git -c x=y commit -F - <<'EOF'", "EOF", (), (), True, True),
+    ("python", "python3 - <<'PY'", "PY", (), (), True, True),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "head", "delimiter", "body_prefix", "after_terminator", "body_visible", "after_visible"),
+    _UNPROVEN_DATA_HEREDOC_CASES,
+    ids=[case[0] for case in _UNPROVEN_DATA_HEREDOC_CASES],
+)
+@pytest.mark.parametrize("push_location", ["body", "after"])
+def test_unproven_data_heredocs_stay_visible(
+    name,
+    head,
+    delimiter,
+    body_prefix,
+    after_terminator,
+    body_visible,
+    after_visible,
+    push_location,
+):
+    body_lines = list(body_prefix)
+    body_lines.append(
+        "git push --force origin main" if push_location == "body" else "ordinary prose"
+    )
+    lines = [head, *body_lines, delimiter, *after_terminator]
+    if push_location == "after":
+        lines.append("git push --force origin main")
+    command = "\n".join(lines)
+
+    assert sp.excise_data_heredoc(command) is None, name
+    visible = any(sp.git_subcommand(seg.argv) == "push" for seg in sp.analyze(command))
+    assert visible is (body_visible if push_location == "body" else after_visible), command
+
+
+def test_unterminated_data_heredoc_is_not_excised_and_keeps_main_visibility():
+    command = "cat <<'EOF'\ngit push --force origin main"
+    assert sp.excise_data_heredoc(command) is None
+    assert any(sp.git_subcommand(seg.argv) == "push" for seg in sp.analyze(command))
+
+
+def test_the_exact_review_corpus_keeps_its_post_heredoc_push_visible():
+    command = (
+        "python3 - <<'PY'\n"
+        "# It feeds the reviewer's answer into this gate. `cmd`\n"
+        "'''\n"
+        "PY\n"
+        "git push --force origin main"
+    )
+    assert sp.excise_data_heredoc(command) is None
+    assert any(sp.git_subcommand(seg.argv) == "push" for seg in sp.analyze(command))
+
+
+_DATA_HEREDOC_RELIEF_CASES = [
+    ("cat", "cat <<'EOF'", ""),
+    ("cat-dash", "cat - <<'EOF'", ""),
+    ("cat-redirects", "cat <<'EOF' >/dev/null 2>/dev/null", ""),
+    ("git-commit-short-file", "git commit -F - <<'EOF'", ""),
+    ("git-commit-file", "git commit --file - <<'EOF'", ""),
+    ("git-commit-file-equals", "git commit --file=- <<'EOF'", ""),
+    ("git-tag", "git tag -a v1 -F - <<'EOF'", ""),
+    ("git-notes", "git notes add -F - <<'EOF'", ""),
+    ("git-notes-append", "git notes append -F - <<'EOF'", ""),
+    ("gh-pr-create", 'gh pr create --title "x y" --body-file - <<\'EOF\'', ""),
+    ("gh-issue-comment", "gh issue comment 5 -F - <<'EOF'", ""),
+    ("gh-issue-create", "gh issue create --title x --body-file - <<'EOF'", ""),
+    ("gh-issue-edit", "gh issue edit 5 --body-file=- <<'EOF'", ""),
+    ("gh-pr-edit", "gh pr edit 5 --body-file=- <<'EOF'", ""),
+    ("gh-pr-comment", "gh pr comment 5 --body-file - <<'EOF'", ""),
+    ("git-commit-message", 'git commit -m "$(cat <<\'EOF\'', ')"'),
+    ("git-commit-message-equals", 'git commit --message="$(cat <<\'EOF\'', ')"'),
+    ("gh-pr-body", 'gh pr create --title t -b "$(cat <<\'EOF\'', ')"'),
+    ("gh-pr-comment-body", 'gh pr comment 5 --body "$(cat <<\'EOF\'', ')"'),
+]
+
+_DATA_HEREDOC_BODY = (
+    "it's prose with an apostrophe\n"
+    "`a backtick`\n"
+    "$(git push --force origin main)\n"
+    "# don't treat this as a command\n"
+    "line ending in \\\n"
+    "git push --force origin main"
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "head", "closing"),
+    _DATA_HEREDOC_RELIEF_CASES,
+    ids=[case[0] for case in _DATA_HEREDOC_RELIEF_CASES],
+)
+def test_proven_data_heredocs_are_excised_and_idempotent(name, head, closing):
+    command = f"{head}\n{_DATA_HEREDOC_BODY}\nEOF\n{closing}"
+    excised = sp.excise_data_heredoc(command)
+    assert excised is not None, name
+    excised_text, body = excised
+    assert "git push --force origin main" in body
+    assert sp._excised_text(command) == excised_text
+    assert sp._excised_text(excised_text) == excised_text
+    assert not any(
+        sp.git_subcommand(seg.argv) == "push" for seg in sp.analyze(command)
+    )
+    assert not any(
+        "git push --force origin main" in segment
+        for segment in sp.split_segments(command)
+    )
+    assert not sp.untokenizable(command)
+    assert sp.analyze_checked(command)[1] is None
+
+
+def test_plain_data_heredoc_preserves_a_later_push():
+    command = "cat <<'EOF'\nprose\nEOF\ngit push --force origin main"
+    excised = sp.excise_data_heredoc(command)
+    assert excised is not None
+    assert excised[0].endswith("git push --force origin main")
+    assert any(sp.git_subcommand(seg.argv) == "push" for seg in sp.analyze(command))
+
+
+def test_data_heredoc_excision_rejects_unbounded_or_single_line_commands():
+    assert sp.excise_data_heredoc("cat <<'EOF'") is None
+    assert (
+        sp.excise_data_heredoc(
+            "cat <<'EOF'\n" + "x" * (sp.MAX_COMMAND_CHARS + 1) + "\nEOF"
+        )
+        is None
+    )
+
+
+def test_data_heredoc_excision_is_linear_on_long_first_lines():
+    # Guards against super-linear backtracking, which at these lengths costs
+    # seconds; the bound is loose so shared CI runners don't flake on it.
+    commands = [
+        "cat " + "\\" * 16_000 + " <<'EOF'\nbody\nEOF",
+        "cat " + "x" * 48_000 + " <<'EOF'\nbody\nEOF",
+    ]
+    for command in commands:
+        best = float("inf")
+        for _ in range(5):
+            started = time.perf_counter()
+            assert sp.excise_data_heredoc(command) is None
+            best = min(best, time.perf_counter() - started)
+        assert best < 0.5, (len(command), best)

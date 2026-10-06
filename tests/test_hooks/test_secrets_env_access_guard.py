@@ -719,3 +719,30 @@ class TestAuditFindings:
         assert not self._touches(
             command=f"git commit -F - <<'EOF'\nrotate the keys in {target}\nEOF"
         )
+
+    def test_an_executor_fed_heredoc_body_is_scanned(self, fake_home: Path) -> None:
+        commands = [
+            "cat <<EOF\n$(cat secrets.env)\nEOF",
+            "python3 - <<'PY'\nopen('secrets.env')\nPY",
+            "python3 -c \"open('secrets.env')\"",
+        ]
+        for command in commands:
+            assert self._touches(command=command), command
+
+    def test_a_quoted_or_arithmetic_shift_is_not_a_heredoc(self, fake_home: Path) -> None:
+        commands = [
+            "echo '<<' 'secrets.env'",
+            "git commit -m 'a << b' -m 'secrets.env'",
+            "git commit -m 'document << heredoc syntax near secrets.env'",
+            "echo $((1<<2)) 'secrets.env'",
+        ]
+        for command in commands:
+            assert not self._touches(command=command), command
+
+    def test_a_writer_heredoc_does_not_promote_unrelated_quoted_mentions(
+        self, fake_home: Path
+    ) -> None:
+        command = (
+            'git commit -m "document secrets.env" && cat > f <<\'EOF\'\nbody\nEOF'
+        )
+        assert not self._touches(command=command), command

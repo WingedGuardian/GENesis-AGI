@@ -477,10 +477,15 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
     if not command:
         return False
 
-    # Heredoc bodies are data — unless the heredoc feeds an interpreter, in
-    # which case the body IS the executed payload and must be scanned.
-    exec_heredoc = _heredoc_feeds_an_executor(command)
-    scan = command if exec_heredoc else _HEREDOC.sub(" ", command)
+    excised = shell_parse.excise_data_heredoc(command)
+    if excised is not None:
+        scan = excised[0]
+        exec_heredoc = _heredoc_feeds_an_executor(scan)
+    else:
+        # Heredoc bodies are data — unless the heredoc feeds an interpreter, in
+        # which case the body IS the executed payload and must be scanned.
+        exec_heredoc = _heredoc_feeds_an_executor(command)
+        scan = command if exec_heredoc else _HEREDOC.sub(" ", command)
     # Quoted regions are DATA for the command-level arm too: a commit message
     # naming the file is not an operand. The declared shell-variable residual
     # (`f=secrets; cat $f.env`) is unquoted, so it survives stripping.

@@ -669,6 +669,169 @@ def _redirect_target_end(command: str, j0: int, n: int) -> int:
     return j
 
 
+_PLAIN_DATA_HEREDOC_LINE = re.compile(
+    r"^(?P<receiver>[^$`\\(){}#|;&<>]*?)"
+    r"<<'(?P<word>[A-Za-z_][A-Za-z0-9_]*)'(?P<tail>.*)$"
+)
+_IDIOM_DATA_HEREDOC_LINE = re.compile(
+    r"""^(?P<receiver>[^$`\\(){}#|;&<>]*?)"""
+    r"""(?P<flag>--message|-m|--body|-b)(?P<separator>[ \t]+|=)"""
+    r""""\$\((?:cat) <<'(?P<word>[A-Za-z_][A-Za-z0-9_]*)'$"""
+)
+
+
+def _data_heredoc_tail_is_allowed(tail: str) -> bool:
+    i = 0
+    while i < len(tail):
+        while i < len(tail) and tail[i] in " \t":
+            i += 1
+        if i == len(tail):
+            return True
+        if tail.startswith(">", i):
+            i += 1
+        elif i + 1 < len(tail) and tail[i] in "12" and tail[i + 1] == ">":
+            i += 2
+        else:
+            return False
+        while i < len(tail) and tail[i] in " \t":
+            i += 1
+        if not tail.startswith("/dev/null", i):
+            return False
+        i += len("/dev/null")
+    return True
+
+
+def _has_data_file_flag(argv: list[str], flags: frozenset[str]) -> bool:
+    for i in range(2, len(argv)):
+        if argv[i] in flags and i + 1 < len(argv) and argv[i + 1] == "-":
+            return True
+        if any(argv[i] == f"{flag}=-" for flag in flags if flag.startswith("--")):
+            return True
+    return False
+
+
+def _data_heredoc_receiver_is_allowed(
+    argv: list[str], *, idiom_flag: str | None = None
+) -> bool:
+    if not argv or "/" in argv[0] or "=" in argv[0]:
+        return False
+
+    if argv[0] == "cat":
+        return idiom_flag is None and argv in (["cat"], ["cat", "-"])
+
+    if argv[0] == "git" and len(argv) > 1:
+        if argv[1] in {"commit", "tag"}:
+            subcommand_args_start = 2
+        elif (
+            argv[1] == "notes"
+            and len(argv) > 2
+            and argv[2] in {"add", "append"}
+        ):
+            subcommand_args_start = 3
+        else:
+            return False
+        if idiom_flag is not None:
+            return idiom_flag in {"-m", "--message"}
+        return _has_data_file_flag(
+            ["git", argv[1], *argv[subcommand_args_start:]], frozenset({"-F", "--file"})
+        )
+
+    if (
+        argv[0] == "gh"
+        and len(argv) > 2
+        and argv[1] in {"pr", "issue"}
+        and argv[2] in {"create", "comment", "edit"}
+    ):
+        if idiom_flag is not None:
+            return idiom_flag in {"-b", "--body"}
+        return _has_data_file_flag(
+            ["gh", argv[1], *argv[2:]], frozenset({"-F", "--body-file"})
+        )
+
+    return False
+
+
+def excise_data_heredoc(command: str) -> tuple[str, str] | None:
+    """Return the command with one proven data-heredoc body removed, and that body.
+
+    This narrow grammar cannot see whether ``cat``, ``git`` or ``gh`` was redefined
+    outside the command (through ``PATH`` or earlier session state).
+    """
+    if len(command) > MAX_COMMAND_CHARS:
+        return None
+    newline = command.find("\n")
+    if newline < 0:
+        return None
+
+    first_line = command[:newline]
+    plain = _PLAIN_DATA_HEREDOC_LINE.match(first_line)
+    idiom = None
+    if plain is not None:
+        receiver_text = plain.group("receiver")
+        if not receiver_text or receiver_text[-1] not in " \t":
+            plain = None
+        else:
+            receiver_text = receiver_text.rstrip(" \t")
+            tail = plain.group("tail")
+            try:
+                argv = shlex.split(receiver_text)
+            except ValueError:
+                plain = None
+            else:
+                if not _data_heredoc_receiver_is_allowed(argv) or not (
+                    _data_heredoc_tail_is_allowed(tail)
+                ):
+                    plain = None
+
+    if plain is not None:
+        word = plain.group("word")
+    else:
+        idiom = _IDIOM_DATA_HEREDOC_LINE.match(first_line)
+        if idiom is None:
+            return None
+        separator = idiom.group("separator")
+        body_argument = (
+            f"{idiom.group('flag')}={_DATA_HEREDOC_BODY_PLACEHOLDER}"
+            if separator == "="
+            else f"{idiom.group('flag')}{separator}{_DATA_HEREDOC_BODY_PLACEHOLDER}"
+        )
+        try:
+            argv = shlex.split(idiom.group("receiver") + body_argument)
+        except ValueError:
+            return None
+        if not _data_heredoc_receiver_is_allowed(
+            argv, idiom_flag=idiom.group("flag")
+        ):
+            return None
+        word = idiom.group("word")
+
+    body_start = newline + 1
+    line_start = body_start
+    while line_start <= len(command):
+        line_end = command.find("\n", line_start)
+        if line_end < 0:
+            line_end = len(command)
+        line = command[line_start:line_end]
+        if line == word:
+            after_start = line_end + 1 if line_end < len(command) else len(command)
+            after = command[after_start:]
+            if idiom is not None and not after.startswith(')"'):
+                return None
+            return command[: newline + 1] + after, command[body_start:line_start]
+        if line.lstrip().startswith(word) or line_end == len(command):
+            return None
+        line_start = line_end + 1
+    return None
+
+
+_DATA_HEREDOC_BODY_PLACEHOLDER = "__DATA_HEREDOC_BODY__"
+
+
+def _excised_text(command: str) -> str:
+    excised = excise_data_heredoc(command)
+    return excised[0] if excised is not None else command
+
+
 def parse_segments(command: str) -> list[_ParsedSegment]:
     """Split a command line into executed segments, returning per segment BOTH the raw
     text and a redirect-STRIPPED argv source (see ``_ParsedSegment``).
@@ -789,10 +952,12 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
 
 
 def split_segments(command: str) -> list[str]:
-    """Executed-segment raw strings — a thin, byte-identical view over
-    ``parse_segments`` (all redirect/quote/comment semantics live there). Kept as the
-    stable ``list[str]`` API the cwd/occurrence consumers iterate."""
-    return [p.raw for p in parse_segments(command)]
+    """Executed-segment raw strings after only proven data-heredoc bodies are excised.
+
+    All redirect/quote/comment semantics live in ``parse_segments``. Kept as the
+    stable ``list[str]`` API the cwd/occurrence consumers iterate.
+    """
+    return [p.raw for p in parse_segments(_excised_text(command))]
 
 
 def has_top_level_pipe(command: str, *, count_substitutions: bool = False) -> bool:
@@ -1155,14 +1320,16 @@ def untokenizable(command: str) -> bool:
     segmentation off and drop a real, executing command from the parse, and the
     return value looks identical to "there was nothing to find".
 
-    Deliberately reads the WHOLE raw command, with no normalization of any kind.
-    An earlier version pre-processed it to suppress prompts on a class of
-    multi-line command, and that MEASURABLY disarmed the signal: on a shape a
-    developer writes without thinking, the command really ran (verified against
-    a shimmed binary, so the proof was execution rather than parse) while the
-    pre-processed text tokenized cleanly and the guard fell silent. The
-    triggering shape is deliberately not written down — this file is public and
-    the guard it protects is load-bearing.
+    Reads the WHOLE raw command except for one strict, proven data-heredoc form:
+    that body is removed to avoid the owner's ``204``/``212`` "cannot be parsed"
+    refusals when a data receiver carries ordinary prose. Every other command
+    remains unnormalized. An earlier broader pre-processing step suppressed
+    prompts on a class of multi-line command, and MEASURABLY disarmed the signal:
+    on a shape a developer writes without thinking, the command really ran
+    (verified against a shimmed binary, so the proof was execution rather than
+    parse) while the pre-processed text tokenized cleanly and the guard fell
+    silent. The triggering shape is deliberately not written down — this file is
+    public and the guard it protects is load-bearing.
 
     KNOWN COST, stated rather than hidden: ``_argv`` DOES normalize before its
     own tokenize (it strips trailing comments), so this probe over-reports
@@ -1196,7 +1363,7 @@ def untokenizable(command: str) -> bool:
     here with a message-hostile broadening.
     """
     try:
-        shlex.split(command)
+        shlex.split(_excised_text(command))
         return False
     except ValueError:
         return True
@@ -2019,9 +2186,10 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
         return [], _BLIND_OVER_LONG
     if reason == "depth":
         return [], _BLIND_OVER_NESTED
-    if has_continuation(command):
+    excised = _excised_text(command)
+    if has_continuation(excised):
         return [], _BLIND_CONTINUATION
-    if has_built_escape(command):
+    if has_built_escape(excised):
         return [], _BLIND_BUILT_ESCAPE
     if untokenizable(command):
         return segments, _BLIND_UNTOKENIZABLE
@@ -3323,6 +3491,8 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
     # every consumer that must not be blind is already asking for the reason.
     if _depth == 0 and len(command) > MAX_COMMAND_CHARS:
         return [], "length"
+    if _depth == 0:
+        command = _excised_text(command)
     out: list[Segment] = []
     truncated = False
     # Subshells opened and not yet closed by earlier segments of this command. A
