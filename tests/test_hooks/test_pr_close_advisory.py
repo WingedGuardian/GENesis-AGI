@@ -190,6 +190,55 @@ def test_the_note_states_the_limit_it_cannot_see():
     assert "silence is not evidence" in note
 
 
+#: The phrases the superseded-PR exception must carry in EVERY note: who may use
+#: it, and the evidence each condition needs (owner ruling, 2026-10-04; the
+#: genesis-development skill, "A superseded PR is the one exception").
+_EXCEPTION_PHRASES = (
+    "only the CLOSING session may use",
+    "not a build or reviewer session",
+    "owner's authorization of the supersession is on record",
+    "successor PR is open or merged",
+    "checked against the successor and current main",
+    "naming the file:line that now does it",
+    "moot (saying why)",
+    "one part neither covered nor moot keeps the PR open",
+)
+
+
+def _assert_full_exception(note: str) -> None:
+    for phrase in _EXCEPTION_PHRASES:
+        assert phrase in note, f"note lost {phrase!r}"
+
+
+def test_the_note_states_the_superseded_pr_exception():
+    """The skill lets the closing session retire a wholly superseded PR under three
+    conditions. A note saying superseded PRs always stay open would contradict the
+    rule it exists to surface, and one that drops a condition's evidence or the
+    closing-session scope would license a close the rule does not."""
+    note = _note(_run("gh pr close 1"))
+    _assert_full_exception(note)
+    assert "also stays open" not in note
+    skill = (
+        Path(__file__).resolve().parents[2]
+        / ".claude"
+        / "skills"
+        / "genesis-development"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "**A superseded PR is the one exception" in skill, (
+        "the skill no longer states the exception this note describes"
+    )
+
+
+def test_the_short_note_states_the_superseded_pr_exception_too():
+    """A command the parse cannot read gets the short note instead. A session that
+    never loaded the skill sees only this text, so it carries the full exception,
+    not a pointer to "that rule's conditions"."""
+    note = _note(_run("echo ok # a note \\\ngh pr close 5"))
+    assert "could not check whether it closes" in note
+    _assert_full_exception(note)
+
+
 def test_it_names_every_distinct_close_in_a_compound():
     """A reader deciding whether to proceed needs to know the command closes two
     things by two routes, not that it closes something."""

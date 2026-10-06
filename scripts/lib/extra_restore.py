@@ -10,6 +10,14 @@ steps that need a real tar reader:
     extra_restore.py root <tar>
         Print the directory the archive holds (e.g. ``.genesis/analytics``); it
         must be a directory member of the archive.
+    extra_restore.py verify <tar> <scratch-parent>
+        Like ``root``, then extract the archive the way ``swap`` does (same
+        filter, same order) into a temporary directory under <scratch-parent>,
+        with every file's content left out, and remove it again. So backup learns
+        exactly what a restore will refuse, including members refused only
+        because of what an earlier member left on disk. Prints the directory;
+        exit 4 (one line per member on stderr) when a restore would refuse any
+        member, 5 when a restore would fail outright.
     extra_restore.py swap <tar> <stage> <root> <target> <aside>
         Extract into <stage> (created by the caller next to <target>, so the
         final step is a rename on one filesystem), fsync what was written, move
@@ -38,10 +46,12 @@ and its staging copy could not be deleted after a failure.
 
 from __future__ import annotations
 
+import copy
 import os
 import posixpath
 import sys
 import tarfile
+import tempfile
 import time
 
 
@@ -132,6 +142,12 @@ def make_filter(root: str):
         except tarfile.FilterError as e:
             refused.append(f"refused member {member.name!r}: {type(e).__name__}")
             return None
+        except OSError as e:
+            # The filter resolves the path through what earlier members put on disk
+            # (a link loop, a link through a file): refuse this member, never abort
+            # the whole directory.
+            refused.append(f"refused member {member.name!r}: {type(e).__name__}: {e.strerror}")
+            return None
         if out is not None and member.issym():
             links.add("/".join(p))
         if out is not None and member.isdir():
@@ -186,6 +202,32 @@ def cmd_root(tar: str) -> int:
         return 5
     _out(root)
     return 0
+
+
+def cmd_verify(tar: str, scratch_parent: str) -> int:
+    with tarfile.open(tar) as tf:
+        root = archive_root(tf)
+        if root is None:
+            _err("the archive does not hold a single directory")
+            return 5
+        keep = make_filter(root)
+
+        def hollow(member: tarfile.TarInfo, dest: str):
+            out = keep(member, dest)
+            if out is not None and out.isreg():
+                out = copy.copy(out)  # file content plays no part in what is refused
+                out.size = 0
+                out.sparse = None
+            return out
+
+        # swap's extractall into a fresh empty stage, minus the bytes: the filter
+        # judges each member against what earlier members left on disk.
+        with tempfile.TemporaryDirectory(prefix=".extra-verify.", dir=scratch_parent) as dest:
+            tf.extractall(dest, filter=hollow)  # noqa: S202 — same filter as swap
+    for line in keep.refused:
+        _err(line)
+    _out(root)
+    return 4 if keep.refused else 0
 
 
 def cmd_swap(tar: str, stage: str, root: str, target: str, aside: str) -> int:
@@ -280,6 +322,11 @@ def main(argv: list[str]) -> int:
         return 3
     if len(argv) == 3 and argv[1] == "root":
         return cmd_root(argv[2])  # reads names only; extracts nothing
+    if len(argv) == 4 and argv[1] == "verify":
+        if not _python_is_safe():
+            _err("this Python's tarfile lacks the 2025 extraction-filter fixes")
+            return 3
+        return cmd_verify(argv[2], argv[3])
     if len(argv) == 7 and argv[1] == "swap":
         if not _python_is_safe():
             _err(
@@ -287,7 +334,9 @@ def main(argv: list[str]) -> int:
             )
             return 3
         return cmd_swap(*argv[2:7])
-    _err("usage: extra_restore.py check | root <tar> | swap <tar> <stage> <root> <target> <aside>")
+    _err(
+        "usage: extra_restore.py check | root <tar> | verify <tar> <scratch-parent> | swap <tar> <stage> <root> <target> <aside>"
+    )
     return 5
 
 

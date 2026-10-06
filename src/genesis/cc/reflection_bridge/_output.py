@@ -49,7 +49,12 @@ assessment).
 
 Required:
 - "observations": [string, ...]        (max 5 — the key discrete findings in \
-the prose; the reflection's concrete conclusions).
+the prose; the reflection's concrete conclusions). Write each as four short \
+labeled lines joined by \\n: "Observation:" the finding; "Evidence:" the source \
+the prose names for it; "Why it matters:" the consequence the prose gives; \
+"Next:" the action the prose proposes. When the prose does not give one of \
+these, say so on that line ("Evidence: not stated in the source", "Next: none \
+stated") rather than supplying it.
 - "cognitive_state_update": string — a tight, factual summary of the current \
 cognitive state / situation described in the prose.
 - "confidence": float 0.0–1.0 — a calibrated confidence in this reflection's \
@@ -510,6 +515,78 @@ async def _store_reflection_summary(
             )
 
 
+#: Soft size for one observation in the topic, counted in ESCAPED characters,
+#: which is what Telegram receives. Long topic messages are split by
+#: send_to_category, so this keeps the summary readable; it is not a limit on
+#: the stored observation.
+_TOPIC_OBS_MAX = 1200
+_SHORTENED = " … (shortened)"
+
+
+def _escape(text: str) -> str:
+    """Escape text for Telegram's HTML parse mode.
+
+    Telegram requires only ``<``, ``>`` and ``&`` outside tags to be replaced
+    by entities (Bot API, "HTML style"), so quotes stay literal: this is text
+    content, never an attribute value.
+    """
+    return _html.escape(text, quote=False)
+
+
+def _shorten_line(line: str, limit: int) -> str:
+    """``line`` escaped and marked as shortened, at most ``limit`` characters
+    (for ``limit`` larger than the marker).
+
+    The cut is made on the RAW text and escaping happens after it, so no cut
+    position can split an entity. It lands on the last word boundary whose
+    escaped prefix plus the marker fits ``limit``, unless that boundary would
+    keep less than half of what fits (a long URL, hash or path), in which
+    case the line is cut mid-word at the fit point instead.
+    """
+    room = limit - len(_SHORTENED)
+    cut = used = 0
+    for i, ch in enumerate(line):
+        used += len(_escape(ch))
+        if used > room:
+            break
+        cut = i + 1
+    head = line[:cut]
+    if " " in head:
+        word = head.rsplit(" ", 1)[0].rstrip()
+        if len(word) * 2 >= cut:
+            head = word
+    return _escape(head) + _SHORTENED
+
+
+def _topic_observation(text: str) -> str:
+    """One observation for the topic, as escaped HTML, in whole lines.
+
+    Every line is shown, in order, while the escaped lines and their
+    separators fit ``_TOPIC_OBS_MAX``; a first line longer than the whole
+    budget is shortened (see ``_shorten_line``) rather than dropped. Lines are
+    escaped whole, so the budget is measured on what Telegram receives and no
+    entity is ever split. Every shortened line and every line left out is
+    stated, never silently cut; the omission marker sits outside the budget.
+    The result is already escaped: callers must not escape it again.
+    """
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    shown: list[str] = []
+    used = 0
+    for line in lines:
+        escaped = _escape(line)
+        if used + len(escaped) > _TOPIC_OBS_MAX:
+            if not shown:
+                shown.append(_shorten_line(line, _TOPIC_OBS_MAX))
+            break
+        shown.append(escaped)
+        used += len(escaped) + 1
+    left = len(lines) - len(shown)
+    if left:
+        noun = "line" if left == 1 else "lines"
+        shown.append(f"… ({left} more {noun} not shown)")
+    return "\n".join(shown)
+
+
 def format_topic_summary(depth, output, *, text: str | None = None) -> str:
     """Build the Telegram topic message from PARSED reflection fields only.
 
@@ -547,7 +624,8 @@ def format_topic_summary(depth, output, *, text: str | None = None) -> str:
         for entry in (obs if isinstance(obs, list) else [])[:3]:
             text = entry if isinstance(entry, str) else ""
             if text.strip():
-                obs_lines.append(f"• {_html.escape(text[:300])}")
+                # _topic_observation returns escaped HTML; no second escape.
+                obs_lines.append(f"• {_topic_observation(text)}")
         if obs_lines:
             parts.append("\n".join(obs_lines))
         focus = data.get("focus_next_week") or data.get("focus_next")

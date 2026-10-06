@@ -1,0 +1,1 @@
+- The Backup tab's health banner now warns when configured extra backup directories were skipped or did not reach the off-site copy. Those runs still count as successful, so before this nothing surfaced the gap. A gap in the core off-site copy takes precedence over this warning.

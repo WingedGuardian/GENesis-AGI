@@ -1,0 +1,1 @@
+- The plan reminder that fires around plan mode now also asks, for development plans, that free reads are done, the architect plan review is run and verified, and measured edge cases are decided rather than asked; it points at the genesis-development "Due diligence before building" and "Architecture Review" sections for the rest. It stays advisory.

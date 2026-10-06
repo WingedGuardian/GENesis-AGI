@@ -95,6 +95,12 @@ exactly the failure CLAUDE.md's evidence principle names.
 Everything above that divider is live plan content. Everything below is
 archaeology, kept for provenance. A plan with no divider is entirely live.
 
+This is the one rule about body LAYOUT. What the live body must STATE (the
+verified/NOT-verified split, alternatives, red-team, test plan, "Changed in this
+revision") is the due-diligence checklist in SKILL.md, "Due diligence before
+building" (detail in `references/due-diligence.md`). It applies to every
+development plan presented for approval, not only to multi-session ones.
+
 **This closes failure mode 2 for a reader who OPENS the file. It does not close
 it for a grepper** — a hit at line N carries no signal about which side of the
 divider it fell on, and the grepper is the reader failure mode 2 names. So the
@@ -119,7 +125,7 @@ a tool-appended status block at end-of-file is not plan content and is current
 by construction. That is a real rough edge, not a clean exception, and it will
 read as archaeology to anyone scrolling.
 
-A plan doc's body answers the five plan-time premise questions in
+A plan doc's body answers the six plan-time premise questions in
 `.claude/docs/premise-check.md`, "At plan and issue time".
 
 ## What each field is for

@@ -1109,3 +1109,32 @@ def test_status_non_string_failure_reason_does_not_500(client, tmp_path):
     assert resp.status_code == 200
     data = resp.get_json()
     assert data["backup_health"]["code"] == "failed"
+
+
+# ── extra directories incomplete (#2854) ──
+
+
+@pytest.mark.parametrize("field", ["extra_dirs_skipped", "extra_upload_failed"])
+def test_health_extra_dirs_incomplete_warns(field):
+    lb = {**_healthy_lb(), field: 2}
+    r = _health(lb, _sch(), None)
+    assert (r["state"], r["code"]) == ("warn", "extra_dirs_incomplete")
+
+
+def test_health_extra_dirs_zero_is_healthy():
+    lb = {**_healthy_lb(), "extra_dirs_skipped": 0, "extra_upload_failed": 0}
+    assert _health(lb, _sch(), None)["state"] == "ok"
+
+
+@pytest.mark.parametrize("bad", ["3", "lots", None, True, -1, 1.5, [1]])
+def test_health_extra_dirs_malformed_counter_never_raises(bad):
+    lb = {**_healthy_lb(), "extra_dirs_skipped": bad, "extra_upload_failed": bad}
+    r = _health(lb, _sch(), None)
+    assert r["code"] != "extra_dirs_incomplete"
+
+
+def test_health_extra_dirs_do_not_mask_a_core_offsite_gap():
+    lb = {**_healthy_lb(), "tier2_backend": "smb", "extra_upload_failed": 1}
+    dest = {"tier2": {"backend": "smb", "status": "partial", "confirmed": False}}
+    r = _health(lb, _sch(), dest, resolved_backend="smb")
+    assert r["code"] == "tier2_incomplete"

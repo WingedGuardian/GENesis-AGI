@@ -10,13 +10,14 @@ and at **pre-push**, before an external reviewer spends a round on it.
 ## At plan and issue time
 
 The plan-time half runs before work starts, on the plan or the issue itself.
-Every plan and every issue that specifies work answers five questions:
+Every plan and every issue that specifies work answers six questions:
 
 1. Is every claim about outside behaviour (GitHub, git, a provider API) measured or cited, not asserted?
 2. Was the repo searched for existing code that already does this, with the result written down?
 3. Do the scope limits block the obvious shared code?
 4. Is the caller named and tracked (an issue), or is there a stated reason there is none?
 5. Does every number say how it was measured (what was counted, by which script)?
+6. Is the PR shape stated: the expected size in counted lines, and either a split into one-concern PRs, a `Shape:` reason when it will reach 500 to 1,000, or the owner's approval of the shape when it will exceed 1,000? (The size rule and its bands: step 6 of "The method" below.)
 
 The answers belong in the plan or issue body, not in a reviewer's first round.
 
@@ -73,6 +74,44 @@ for:
 A sound-but-inferior approach is a FINDING. Say so, name the better shape, and let
 whoever owns the change decide.
 
+**6. Then the PR-SHAPE question, every time:** should this arrive as ONE PR?
+Size by COUNTED lines, not raw insertions: `python3 scripts/pr_shape.py --base origin/main`
+(`count_diff` over a hardened diff) counts added and removed code lines and excludes tests,
+prose, changelog fragments, blank and comment lines, counting a moved line
+once. The rule it encodes (#2737):
+
+| Counted lines | Expectation |
+|---|---|
+| under 500 | the target |
+| 500 to 1,000 | a `Shape:` line in the PR body says why it cannot be smaller |
+| over 1,000 | explicit owner approval |
+
+The bands come from a study of 400 merged PRs (#2737), in which median review
+rounds rose from 1 to 6 across six size bands. That study's counting method is
+not recorded; #2775 tracks re-deriving the bands with this counter.
+
+This is a GUIDELINE the building session weighs, not a wall (owner,
+2026-10-05). A change can have a legitimate reason not to fit, and stating it
+is enough. What is not acceptable is never considering size at all.
+
+A change that is too large for no stated reason, or that carries more than one
+concern, gets a SPLIT plan: the PRs in dependency order, one concern each,
+roughly what each contains. Often the split is the WHOLE rework: the code can
+be right and still need to arrive as several PRs, so `SOUND` with
+`PR-shape: SPLIT` is an ordinary, complete verdict.
+
+What the verdict does depends on where you run the check:
+- **In a rework spec,** the split is part of the spec, decided before the
+  builder starts.
+- **On an ordinary open PR in review,** it is not a kick-back. Ask the author
+  for the split or for a `Shape:` reason, and let them decide. (A Devin-built PR
+  is the exception; its disposition is the decision table in closing-session,
+  "Devin-built PRs".)
+
+"Concern" here means one mechanism or behaviour change a reviewer can accept or
+reject on its own. Prefer one per PR; like size, this is weighed, not
+absolute. Being a rework is not itself a reason to stay unsplit.
+
 ## Two calibration controls
 
 - **A check where every premise fails is a check to distrust.** Some premises
@@ -92,6 +131,7 @@ Expected before checking: <one line>
   P2 …
 Effect: <what the caller does differently — or "nothing", which is the finding>
 Better shape: <none found | the alternative, named>
+PR-shape: <OK (N counted lines, band, one concern) | SPLIT — PR1 <concern>, PR2 <concern> …, in dependency order>
 ```
 
 ### Resolving the verdict — the cases that are otherwise undecidable
@@ -125,6 +165,52 @@ rather than left to judgement:
   score. Render the better-shape finding on the ladder as well — normally
   SHOULD-FIX — or it exists only in a paragraph.
 
+## Handing a verdict to a builder: the rework spec
+
+When a check leads to a send-back, the verdict becomes a SPEC, posted as a
+maintainer comment headed `## Rework spec` (on a Devin-built PR, whether it
+carries `(aside)` follows the `(aside)` table in closing-session, "Devin-built
+PRs": a spec Devin is to build never does), that another session,
+often Codex or Devin on another machine, builds from cold. Everything that spec
+leaves out, the builder decides alone, and a reviewer later cannot tell a
+misreading from a real complication. So the spec is decision-complete:
+
+- **Keep:** what carries over unchanged, named by function or file.
+- **Delete:** the machinery that is going away, named.
+- **Mechanism:** the prescribed shape of the change, including which existing chokepoint to
+  route through.
+- **Split:** the `PR-shape` plan, as the list of PRs.
+- **Decided questions:** every question the builder will hit, answered. A
+  question only the owner can answer goes to the owner BEFORE the spec is
+  handed over. One you deliberately leave to the builder is marked "builder
+  decides; answer it in the PR body with your reasoning". Never end a spec with
+  a bare "Open questions" list. A builder answers those silently, and a
+  fail-closed answer can force design growth the spec never asked for.
+- **Acceptance:** what the reviewer will check first.
+- **Contract:** the builder acknowledges the spec on the OLD PR before
+  building, and each replacement PR carries a `## Rework` section
+  (genesis-development, "Building a rework"). Say so in the spec.
+- **Follow-up:** the spec's last line, `Follow-up: <id>`, naming the follow-up
+  the closing session opened before posting it. The builder copies
+  it into the replacement that merges into main last.
+
+Keep the old PR's `needs-rework` or `needs-architecture-session` label on, so
+the rebuild stays traceable to it.
+
+Instance, 2026-10-05: a spec without a split plan, ending in two open
+questions, came back as one PR: +2,538 raw lines across 21 files, 881 counted,
+which is inside the `shape` band, so size alone was not its failure. It carried
+several concerns, three of them features its spec never asked for. The builder had answered
+the deciding question in the most fail-closed way, and three of round 1's six
+findings landed in machinery that answer produced. The premise was right, and the
+spec still allowed the failure.
+
+The builder's side of the contract (genesis-development, "Building a rework")
+is an acknowledgement on the old PR before building, then a rework section in
+each new PR's body. The section reports against this spec: its split position,
+each deviation with its reason, and each delegated question with its answer.
+Unforeseen complications are expected, and the section is where they are stated.
+
 ## What the verdict is FOR — and what it is not
 
 The output is a **judgment about direction**, handed to whoever owns the change. It
@@ -136,8 +222,8 @@ anything — a reviewer session retires nothing.
 is HIGH.** The repo already has a route for a change that is wrong at the premise
 or structurally superseded, and it is NOT "hand it to a builder": it is a
 foreground ARCHITECTURE conversation with the user, and where no user is present,
-the `needs-architecture-session` label plus a `ready` follow-up naming the PR and
-the decision it awaits. See the genesis-development skill, "Some PRs are not a
+the `needs-architecture-session` label, the PR moved to draft, and a `ready`
+follow-up naming the PR and the decision it awaits (a dispatched session's follow-up lands in the `tabled` lane; the intake gap is tracked in #2857). See the genesis-development skill, "Some PRs are not a
 review problem". This check produces the EVIDENCE for that conversation; it does
 not invent a parallel path around it, and a session that reads "hand back" as
 "dispatch a builder and move on" has skipped the decision the label exists to
@@ -147,7 +233,10 @@ Recommend it only when the premise is genuinely wrong, or the change cannot do
 what it says it was built to do — a major rework, or a material finding that moves
 the whole premise. Everything short of that stays in the gate and gets iterated
 on: a premise slightly off, needing modest rework a review session can carry in a
-round or two, is the ordinary case and is NOT a kick-back.
+round or two, is the ordinary case and is NOT a kick-back. (One owner-ruled
+exception: a Devin-built PR is audited before further rounds are spent, and a
+SOUND-BUT-INFERIOR verdict with a better shape that changes the mechanism or the
+files touched IS kicked back to Devin. See the closing-session skill, "Devin-built PRs".)
 
 **The evidence bar is TWO OR MORE independent signals**, the same bar the
 round-2 gate message states, because a doc that set a lower one would be the

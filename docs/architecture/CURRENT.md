@@ -343,9 +343,30 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 691a10d44 2026-10-03
+verified: 6aae986bb 2026-10-04
 ```
 
+- **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
+  `cc/gmodel_settings.py`): Kimi K3 and MiMo V2.6 Pro select subscription, native
+  API or OpenRouter from the isolated `gmodel.models` catalog. Auto recomputes at
+  launch/resume and prints why it passed over a cheaper route; provider errors
+  never switch billing routes. The chosen route (endpoint, bearer credential,
+  model slots, context, effort, compaction/thinking switches) is pinned in the
+  child environment AND an owner-only `--settings` file, which outranks user,
+  project and local settings across mid-session reloads and `/cd` (except a
+  `maxEffortLevel` cap, where the lowest file wins; the launcher warns). Managed
+  settings outrank it and are a documented residual, not checked. Pass-through
+  arguments follow a fixed grammar (`gmodel <name> [--route R] [claude args]`)
+  and are refused or read as headless by whole token. The model holds until
+  `/model`, which keeps the endpoint and key; the OpenRouter route's launch
+  notice says a Claude ID there bills per token, and Kimi routes say Alt+T
+  drops thinking (on the subscription, K2.8 Preview); `--effort` and
+  `--autocompact` are announced as outranked by the pins. Catalog loading is strict for
+  catalog members only, and selection validates only the requested entry;
+  native tiers never load the catalog, and a flat roster peer never fails on it
+  (a strict failure falls back to the lenient roster path). Published endpoints remain
+  unverified until live acceptance; these entries never join the automated
+  failover roster.
 - **Replay-unsafe CC outcomes do not enter full-tools recovery, failover or
   durable parking.** Stream truncation and overloads with known-work or MCP
   evidence share this boundary; provider diagnosis remains available as a
@@ -979,7 +1000,11 @@ verified: d6edbcc6 2026-09-11
   so N approved rows in one tick are bounded; cautious-rollout brake); `propose_only`
   → dry-run terminal (never posts). The STOP is `mode: off` / the env kill (freezes
   the drain, incl. approved held rows). Terminal rows pruned >30d via
-  `scripts/prune_contributor_issue_posts.py`; held rows never pruned. The
+  `scripts/prune_contributor_issue_posts.py`, except a posted row naming a
+  follow-up, kept while that follow-up exists (the record that it already has an
+  issue); held rows never pruned. The propose-time TITLE dedup still sees only
+  held rows and posted rows of the last 30 days (`TERMINAL_RETENTION_DAYS`); the
+  same-follow-up check has no age bound. The
   curator campaigns are LOCAL user data (uncommitted).
 - **Cold marketing-email substrate (PR1) — gated like email, recipient resolved
   in CODE.** The `marketing_send` MCP tool (genesis-outreach) stages a cold
@@ -3192,7 +3217,12 @@ verified: b0867170e 2026-10-02
   encrypted `scripts/backup.sh` timer).
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
   `process_lock` (the reason bare `python -m genesis serve` blocks systemd),
-  tmp discipline (`~/tmp` for large temp — never override TMPDIR).
+  tmp discipline (`~/tmp` for large temp — never override TMPDIR),
+  `inflight` (the process-local registry of work a restart would cancel:
+  every `CCInvoker` call, plus a dispatched session's and a CLI reflection's
+  whole life; served at `GET /api/genesis/inflight` for
+  `scripts/deploy_code_only.sh`'s restart refusal; a subsystem's own work after
+  its invocation returns is not covered — #2917).
 - **env.py**: 3-tier resolution (env var → `~/.genesis/config/genesis.yaml` →
   default). **`update_in_progress()` is load-bearing**: the watchdog defers
   restarts during deploys (mid-deploy revival deadlocks bootstrap); fails open
@@ -3365,10 +3395,154 @@ verified: 4cc75d50 2026-08-05
 The work board lives on a GitHub Projects v2 board: GitHub owns the cards,
 columns, positions and dependencies (native `blockedBy` / sub-issues), and
 Genesis mirrors none of them. Genesis keeps three local stores and the glue
-around them. **What exists today:** the stores, the `board` mode lever, and the
-open-question tools. The Projects v2 adapter, promotion onto the board and the
-reconciler are follow-on work. Nothing writes to GitHub yet, and the shipped
-mode is `off`.
+around them. **What exists today:**
+- the stores, the `board` mode lever, and the open-question tools;
+- the Projects v2 adapter and its idempotent setup script;
+- promotion of a private record onto the board;
+- the READ-ONLY reconciler and its two read tools.
+
+The reconciler's write half (adding every repo item, the bookkeeping move to In
+Review, the Genesis status) and the dashboard tab are follow-on work. The
+shipped mode is `off`.
+
+- **Reconciler, read-only** (`board/reconciler.py`; bootstrap step `board`,
+  `runtime/init/board.py`, a 5-min `CronTrigger` on the learning scheduler,
+  `max_instances=1`). Each tick:
+  - reads nothing while paused, in mode `off`, or with no project configured;
+  - otherwise reads the WHOLE project (a short read raises) and the tracker's
+    own open totals, and counts cards by Status, Genesis field and kind, plus
+    coverage: open tracker issues and PRs on the board against the repo's open
+    total;
+  - logs one `drag` event per In Progress card per Status change, keyed
+    `item@<Status updatedAt>`. That value moves on a real Status change and on
+    nothing else (MEASURED 2026-10-04 on a private sandbox, with a control);
+  - flags `observed_late` from the clock alone (older than one interval plus
+    slack), never from stored state;
+  - ALWAYS emits a `board` heartbeat (DEBUG) carrying the summary, in every mode
+    and while paused. So the pulse is not pause-gated and has no enable check,
+    and in mode `off` it is effectively a learning-scheduler canary;
+  - writes NOTHING to GitHub (a test pins it).
+  A clean tick records job success; a read error publishes `last_error` and no
+  counts, and records a failure. The step raises if the learning scheduler is
+  missing or stopped, so the manifest names that cause instead of the board.
+- **`board_status`** reads the stored heartbeats only, never GitHub: the newest
+  pulse (alive, mode, error) and the newest SUCCESSFUL read with its age.
+  **`board_item`** reads one issue or PR live (nothing while the mode is
+  `off`): its card on the configured
+  project (matched by owner AND number), GitHub's blocked-by list (flagged when
+  truncated), unverified open questions blocking it, and its promotion link.
+  Both are in the reflection read allowlist.
+
+- **Projects v2 adapter** (`board/projects_v2.py`):
+  - GraphQL travels over `gh api graphql --input -`, so nothing reaches argv;
+  - every `errors` entry raises, so an error is never read as empty data;
+  - an items read that comes up short against `totalCount` raises;
+  - a single-select options update always re-sends existing option ids, so no
+    card loses its value.
+  Query shapes are adapted from precursor-kanban (MIT).
+- **`scripts/board_setup.py`** (dry run unless `--apply`; `--write-config` lets
+  a run that creates the project record `project_owner`/`project_number` in the
+  board overlay, the only writer: `settings_update` rejects both keys, as it
+  rejects `mode: live`):
+  - works ONLY on the project recorded in the board overlay, or one it creates
+    and records; it never adopts a project by title, so a same-titled project
+    nobody recorded is a refusal (record the one you mean, or rename it); a
+    recorded project must exist, be open and belong to the authenticated
+    account;
+  - a run that CREATES the project records it and stops there, asking for a
+    re-run, because project reads lag writes (MEASURED), so nothing it just
+    created is checked by the same run;
+  - verifies the project is linked to the configured public tracker
+    (`github.user`/`github.public_repo`, the repo promotions post to — never
+    the checkout's own remote) via `ProjectV2.repositories`, and links it with
+    `linkProjectV2ToRepository` when not (shown in the dry run first);
+  - Status columns Proposed / Ready / In Progress / In Review / Done; an
+    option outside them is ALWAYS kept, never deleted (deleting one clears it
+    from every card holding it, and no read before the write can prove none
+    does at the write);
+  - the `Genesis` single-select and `Genesis note` text fields (an existing
+    field of the wrong type is reported as a problem, never mutated);
+  - deletes the "Pull request linked to issue" and "Item added to project"
+    default workflows;
+  - requires "Pull request merged" and "Item closed" (there is no API to
+    enable a workflow, so a missing one exits non-zero with the UI step);
+  - creates the `Active` and `Backlog` views, and puts an existing one with the
+    wrong layout back on the board layout;
+  - the overlay write loads the overlay the runtime reads now (user dir first,
+    then the legacy repo-local `config/board.local.yaml`) and keeps all its
+    keys, so writing the user overlay never hides a legacy setting.
+- **Promotion** (`board/promotion.py`, MCP `board_promote`):
+  - **Refused when:** the board mode is off; no public tracker is configured;
+    the source does not resolve, or is closed (a completed/failed follow-up, a
+    done/absorbed/dropped ledger row) or tabled (never filed as an issue, by
+    the house rule); an UNVERIFIED open question blocks it (the one place a
+    block is enforced); it is already linked or pending; the draft already
+    carries a board marker (the drain posts a body only with exactly one, its
+    own); the privacy scan finds something (the reply names line and scanner
+    only); a requested label does not exist on the tracker (checked only after
+    the scan passes, since the check sends the label names to GitHub; a repo
+    that cannot be read is "could not verify", never "missing label"); or the
+    mode changed while it was proposing (the hold is stamped with the mode).
+    No project needs to be configured: promotion never places a card.
+  - **One precondition function** (`promotion.preconditions`) holds every
+    check that can change while a hold waits — the lever, the board store,
+    the labels, the source's state, open-question blocks, an existing pointer.
+    `propose` runs it before holding; the drain runs it once more immediately
+    before `gh issue create`. Each refusal is PERMANENT (source missing,
+    closed or tabled; a label the tracker lacks; already linked; an
+    unparseable source) or TRANSIENT (the lever, an open question, a label or
+    repo lookup that failed, the store unmigrated or unreadable). At post time
+    a permanent one ends the hold (`expired`) with the reason logged and a
+    `promotion_refused` event, so the owner can re-propose once fixed; a
+    transient one leaves it held.
+  - **Approval** is per item on the dashboard (Comms) and counted in the
+    morning report, like the contributor lane; there is no Telegram prompt.
+  - **The public body** carries an opaque marker, a salted hash of `kind:id`.
+    The private id never appears. The marker itself is left out of the scan,
+    because detect-secrets reads its hex as a secret (MEASURED).
+  - **The hold** is a `pending_issue_posts` row with `source='board'`, behind an
+    approval that is NEVER self-approved.
+- **The shared drain** (`autonomy/contributor_issue_watcher.py`) has one lever
+  per lane, and board rows:
+  - post only when `classify_resolver` classifies the resolver as "human" (a
+    dashboard or Telegram resolution; a system or self approval expires the hold
+    unposted). That names a channel, not a person;
+  - dedup by marker (recent window + search, any state), adopting a marked
+    issue only when this account authored it;
+  - count toward the shared daily posting cap (`max_posts_per_day`), like
+    contributor posts, for that reason;
+  - re-run `promotion.preconditions` immediately before the create (its
+    GitHub lookups first, its local reads last, the board lever last of all
+    and outranking every other refusal, then the cross-lane check — no GitHub
+    await between those and the create, so a kill switch flipped during the
+    label lookups still stops the post);
+  - expire (never post) a hold whose marked issue another account wrote, or
+    whose body does not carry exactly one marker; a failed viewer lookup only
+    defers it;
+  - record a `promotion_refused` event for EVERY post-time ending of an
+    approved board hold (a non-human resolver, a permanent precondition, the
+    marker cases above, the other lane having posted), not only a log line;
+  - write the `board_links` pointer and its `promotion` event in ONE
+    transaction once the issue exists (both or neither, and a retry that finds
+    the pointer adds no second event), with each tick re-linking any posted
+    row a crash or failed write left unlinked;
+  - never touch the project: a promoted issue is created and linked, not
+    added to the board. The reconciler's write half (follow-on) places every
+    open issue; its adapter calls carry `GROUNDWORK(board-reconciler-writes)`.
+- Both lanes can each pass their propose-time duplicate check for one
+  follow-up when proposed concurrently; the drain (the only poster, one job,
+  rows in sequence) refuses a hold whose follow-up the OTHER lane already
+  posted. That record survives: `pending_issue_posts.prune_terminal` keeps
+  every posted row naming a follow-up while the follow-up row exists (it
+  used to prune adopted rows and rows of resolved follow-ups at 30 days).
+  Holds that can never resolve (a create that keeps failing, a saturated
+  title search) are still log-only — a saturated search logs a warning naming
+  the repo each tick and stays held, never terminal; the alert is #2850. An exact hit inside a full search page counts as found; only "no
+  hit" needs a complete page.
+- `approve_all_pending` excludes board promotions, because a sweep's resolver is
+  human and only the exclusion keeps them per-item.
+- The contributor lane's title dedup gained a search read beside its 200-issue
+  recent window (the repo had 638 open issues, MEASURED 2026-10-02).
 
 ```yaml subsystem-map
 entry: work-board
@@ -3395,9 +3569,10 @@ verified: b67423bd 2026-10-03
   it (the `marketing_outreach` precedent), and it rejects `enabled: true`
   too (that would re-arm a live overlay the owner paused), so a session can
   only turn the board down, never arm it. The master `enabled` fails closed
-  unless it is the literal `true`. Nothing reads the lever yet: board
-  promotion is its first consumer (`GROUNDWORK(board-promotion)` tags mark the
-  entry points waiting on it).
+  unless it is the literal `true`. Board promotion (`board_promote` and the
+  drain) reads it on every call, and so do the reconciler and `board_item`.
+  The write entry points the read-only reconciler does not use yet carry
+  `GROUNDWORK(board-reconciler-writes)` (and the tab's, `GROUNDWORK(board-tab)`).
 - **Open questions** (`mcp/health/open_question_tools.py`: `open_question_raise`,
   `_resolve`, `_block`, `_list`) — never gated by the board mode, because they
   write only local rows. A target id prefix must resolve uniquely against its
@@ -3423,8 +3598,9 @@ verified: b67423bd 2026-10-03
   and stored repo names are lowercased, because GitHub names are
   case-insensitive. A test pins that the module has no GitHub or subprocess
   path. `open_question_list` is on the reflection read allowlist.
-  **A block is ADVISORY today:** nothing refuses on one until board promotion
-  lands. The morning report's ground-truth section counts unverified questions
+  **A block is enforced at promotion** (`board_promote` refuses a blocked
+  record) and is advisory everywhere else. The morning report's ground-truth
+  section counts unverified questions
   (count and oldest age only, never the text); that line is the push surface
   that keeps a parked question from being a silent drop.
 - **Retention:** `scripts/prune_board.py` on the disk-hygiene timer prunes

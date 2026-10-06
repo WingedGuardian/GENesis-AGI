@@ -518,6 +518,9 @@ class AutonomousCliApprovalGate:
           when the type was minted rather than when a producer lands, because
           this set is a DENYLIST with no allowlist — an unregistered type is
           swept BY DEFAULT, so "add it later" is a gap that opens silently.
+        - Work-board promotions. Each turns ONE private record into a public
+          issue; the drain also refuses a non-human resolver, but a sweep's
+          resolver IS human, so only this exclusion keeps them per-item.
         """
         from genesis.autonomy.contributor_worklog_config import (
             CONTRIBUTOR_ISSUE_ACTION_TYPE,
@@ -525,12 +528,14 @@ class AutonomousCliApprovalGate:
         from genesis.autonomy.desktop_gate import DESKTOP_GATE_ACTION_TYPE
         from genesis.autonomy.email_gate import EMAIL_GATE_ACTION_TYPE
         from genesis.autonomy.task_unblock_config import TASK_UNBLOCK_ACTION_TYPE
+        from genesis.board.promotion import BOARD_PROMOTION_ACTION_TYPE
 
         excluded = {
             EMAIL_GATE_ACTION_TYPE,
             CONTRIBUTOR_ISSUE_ACTION_TYPE,
             DESKTOP_GATE_ACTION_TYPE,
             TASK_UNBLOCK_ACTION_TYPE,
+            BOARD_PROMOTION_ACTION_TYPE,
         }
         pending = await self._approval_manager.get_pending()
         count = 0
