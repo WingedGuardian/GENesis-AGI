@@ -29,30 +29,33 @@ from pathlib import Path
 
 #: The bands are OWNER POLICY, re-checked against measured cost (2026-10-05).
 #: `scripts/pr_shape_study.py --out <dir>` re-derives the measurement: the 400
-#: most recently created merged PRs (none excluded), each sized by this counter
-#: on its squash commit, against its review rounds from `review_budget.py`.
+#: most recently created PRs merged into main, each sized by this counter on its
+#: verified squash commit, against its review rounds from `review_budget.py`.
+#: Run 2026-10-05: 400 used, none excluded (none failed the squash check).
 #:
 #: Median rounds by counted lines:
 #:
 #: | counted lines | PRs | median rounds |
 #: |---|---|---|
 #: | 0-50 | 147 | 1 |
-#: | 50-200 | 120 | 2 |
+#: | 50-200 | 118 | 2 |
 #: | 200-400 | 67 | 3 |
 #: | 400-600 | 26 | 4 |
 #: | 600-800 | 18 | 4 |
-#: | 800-1000 | 8 | 3 |
+#: | 800-1000 | 10 | 3.5 |
 #: | 1000+ | 14 | 4 |
 #:
-#: Spearman rho = 0.43. The study's rule (median reaches 3 rounds, then 4) puts
-#: the shape and override points at about 200 and 400. The owner kept 500 and
-#: 1000 as a guideline the building session weighs, and the table records what
-#: a PR above them typically costs.
+#: Spearman rho = 0.44 (counted lines); 0.46 for the plain size, which keeps
+#: comments and does not pair moves. The study's rule (median reaches 3 rounds,
+#: then 4) puts the shape and override points at about 200 and 400. The owner
+#: kept 500 and 1000 as a guideline the building session weighs, and the table
+#: records what a PR above them typically costs.
 #:
 #: Caveats on reading the table:
 #: - Medians cap near 4, because round 4 is terminal.
-#: - 354 of the 400 PRs predate ROUND_RULE_CUTOVER_ISO, so they count clean
-#:   reviews as rounds.
+#: - 350 of the 400 PRs were created before ROUND_RULE_CUTOVER_ISO. Their reviews
+#:   from before the cutover count clean heads as rounds; a PR reviewed across
+#:   the cutover mixes both rules.
 SHAPE_AT = 500
 OVERRIDE_AT = 1001
 
@@ -225,6 +228,8 @@ class _FileState:
         self.old_rem = self.new_rem = 0
         self.added: list[str] = []
         self.removed: list[str] = []
+        # Non-blank changed lines with comments kept: the study's plain size.
+        self.plain_added = self.plain_removed = 0
 
     @property
     def path(self) -> str:
@@ -267,12 +272,16 @@ def count_diff(diff_text: str) -> dict:
                 # a `-# comment` in old.py stays a comment even when the file
                 # is being renamed to new.js.
                 old = current.old_path or current.path
-                if (content := line[1:].strip()) and not _is_comment(content, old):
-                    current.removed.append(content)
+                if content := line[1:].strip():
+                    current.plain_removed += 1
+                    if not _is_comment(content, old):
+                        current.removed.append(content)
             elif first == "+":
                 current.new_rem -= 1
-                if (content := line[1:].strip()) and not _is_comment(content, current.path):
-                    current.added.append(content)
+                if content := line[1:].strip():
+                    current.plain_added += 1
+                    if not _is_comment(content, current.path):
+                        current.added.append(content)
             elif first == " " or line == "":
                 current.old_rem, current.new_rem = current.old_rem - 1, current.new_rem - 1
             else:
@@ -326,6 +335,9 @@ def count_diff(diff_text: str) -> dict:
     # contributes nothing while the counted half is keyed under its path.
     sides: list[tuple[str, list[str], list[str]]] = []  # (by path, added, removed)
     excluded: dict[str, str] = {}
+    # The plain size: every non-blank changed line on the sides that count, with
+    # no comment filter and no move pairing (scripts/pr_shape_study.py).
+    plain = 0
     for f in files:
         old = f.old_path or f.path
         new_reason = _exclusion_reason(f.path)
@@ -338,11 +350,14 @@ def count_diff(diff_text: str) -> dict:
         elif old_reason:
             excluded[old] = old_reason
             sides.append((f.path, f.added, []))
+            plain += f.plain_added
         elif new_reason:
             excluded[f.path] = new_reason
             sides.append((old, [], f.removed))
+            plain += f.plain_removed
         else:
             sides.append((f.path, f.added, f.removed))
+            plain += f.plain_added + f.plain_removed
 
     # Moves pair globally across the diff by multiset: a line removed anywhere
     # and added verbatim elsewhere counts once, as the addition.
@@ -367,6 +382,7 @@ def count_diff(diff_text: str) -> dict:
         "by_file": by_file,
         "excluded": excluded,
         "moved": moved,
+        "plain": plain,
         "band": band,
     }
 

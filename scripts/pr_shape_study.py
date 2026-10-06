@@ -5,9 +5,12 @@ The bands in ``pr_shape.py`` (``SHAPE_AT`` / ``OVERRIDE_AT``) came from a study
 whose counting method was not recorded. This script re-runs it with the
 counter that applies them, so the derivation can be repeated:
 
-1. Take the most recently created merged PRs (``--limit``, default 400).
-2. Size each one by its squash commit on the default branch,
-   ``git diff -M <merge>^1 <merge>``, counted with ``pr_shape.count_diff``.
+1. Take the most recently created PRs merged into the default branch
+   (``--limit``, default 400).
+2. Size each one by its squash commit, ``git diff -M <merge>^1 <merge>``,
+   counted with ``pr_shape.count_diff``. A merge that is not a squash (more
+   than one parent, or a multi-commit PR whose commit subject lacks ``(#N)``)
+   is excluded, because one commit would not be the whole PR.
 3. Read each one's review rounds with ``scripts/review_budget.py``. A PR whose
    budget status is not ``ok`` is excluded, and the exclusion is counted.
 4. Report the median rounds per counted-size bucket, a Spearman rank
@@ -16,13 +19,18 @@ counter that applies them, so the derivation can be repeated:
      3 rounds, the point where the commit gate's round-2 stop has fired;
    - override: the first such bucket whose median reaches 4, the terminal round.
 
-Rounds before ``ROUND_RULE_CUTOVER_ISO`` follow the legacy rule (every head the
-primary reviewer saw, clean ones included), so results are reported for each
-era as well as overall. A plain count (added plus removed lines over the same
-files) is reported beside the counted one for comparison.
+Reviews before ``ROUND_RULE_CUTOVER_ISO`` follow the legacy rule (every head
+the primary reviewer saw, clean ones included). Results are reported overall
+and for two CREATION-DATE cohorts, PRs created before and after the cutover.
+A PR created before it but reviewed after carries rounds under both rules, so
+the cohorts approximate the rule eras rather than separate them. A plain size
+(``count_diff``'s ``plain``: every non-blank changed line on the same sides,
+comments kept, moves not paired) is reported beside the counted one.
 
-Run from a checkout whose default branch is fetched; it needs ``gh`` auth.
-Writes ``rows.jsonl`` (resumable) and ``report.json`` to ``--out``.
+Run from a checkout of the repository being studied, with its default branch
+fetched; it needs ``gh`` auth. The repository is always the checkout's own.
+Writes ``rows.jsonl`` (resumable; each row names its repository, and rows from
+another repository are refused) and ``report.json`` to ``--out``.
 """
 
 from __future__ import annotations
@@ -46,32 +54,16 @@ BUCKETS = [
     (400, 600),
     (600, 800),
     (800, 1000),
-    (1000, 1500),
-    (1500, None),
+    (1000, None),
 ]
 MIN_BUCKET_N = 5
 
 
-def plain_count(diff: str, excluded: dict) -> int:
-    """Added plus removed non-blank lines, over the files ``count_diff`` counted."""
-    n, path, old_path = 0, None, None
-    for line in diff.splitlines():
-        if line.startswith("--- "):
-            old_path = line[6:] if line.startswith("--- a/") else None
-            continue
-        if line.startswith("+++ "):
-            # A deleted file's new side is /dev/null; count it under its old path.
-            path = line[6:] if line.startswith("+++ b/") else old_path
-            continue
-        if path is None or path in excluded:
-            continue
-        if line.startswith(("+", "-")) and line[1:].strip():
-            n += 1
-    return n
+def spearman(xs: list[float], ys: list[float]) -> float | None:
+    """Spearman rank correlation with average ranks for ties.
 
-
-def spearman(xs: list[float], ys: list[float]) -> float:
-    """Spearman rank correlation with average ranks for ties; 0.0 when undefined."""
+    None when it is undefined: fewer than two rows, or a constant variable.
+    """
 
     def ranks(values: list[float]) -> list[float]:
         order = sorted(range(len(values)), key=lambda i: values[i])
@@ -87,12 +79,12 @@ def spearman(xs: list[float], ys: list[float]) -> float:
         return out
 
     if len(xs) < 2:
-        return 0.0
+        return None
     rx, ry = ranks(xs), ranks(ys)
     mx, my = statistics.mean(rx), statistics.mean(ry)
     num = sum((a - mx) * (b - my) for a, b in zip(rx, ry, strict=True))
     den = (sum((a - mx) ** 2 for a in rx) * sum((b - my) ** 2 for b in ry)) ** 0.5
-    return num / den if den else 0.0
+    return num / den if den else None
 
 
 def bucket_table(rows: list[dict], key: str) -> list[dict]:
@@ -129,26 +121,81 @@ def _sh(*args: str) -> str:
     return subprocess.run(args, capture_output=True, text=True, check=True, cwd=_ROOT).stdout
 
 
+def _is_squash(sha: str, pr: int, n_commits) -> bool:
+    """True when ``sha`` is the PR's squash commit: one parent, and either GitHub's
+    squash subject ``... (#N)`` or a one-commit PR. ``n_commits`` is a callable,
+    asked only when the subject does not settle it (listing every PR's commits in
+    one query exceeds GitHub's GraphQL node limit)."""
+    parents, subject = _sh("git", "log", "-1", "--format=%P%n%s", sha).split("\n", 1)
+    if len(parents.split()) != 1:
+        return False
+    return f"(#{pr})" in subject or n_commits() == 1
+
+
+def _commit_count(repo: str, pr: int) -> int:
+    return int(
+        _sh(
+            "gh",
+            "pr",
+            "view",
+            str(pr),
+            "-R",
+            repo,
+            "--json",
+            "commits",
+            "--jq",
+            ".commits | length",
+        )
+    )
+
+
+def load_cache(path: Path, repo: str) -> dict[int, dict]:
+    """Rows already measured, keyed by PR number.
+
+    A torn LAST line (an interrupted write) is dropped and the file truncated to
+    the good rows; a bad line anywhere else, or a row from another repository,
+    is an error, never silently reused.
+    """
+    if not path.exists():
+        return {}
+    lines = path.read_text().split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    done: dict[int, dict] = {}
+    for i, line in enumerate(lines):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            if i == len(lines) - 1:
+                path.write_text("".join(f"{x}\n" for x in lines[:-1]))
+                break
+            raise SystemExit(f"{path}: line {i + 1} is not JSON") from None
+        if row.get("repo") != repo:
+            raise SystemExit(f"{path}: line {i + 1} is from {row.get('repo')!r}, not {repo!r}")
+        done[row["pr"]] = row
+    return done
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--repo", help="OWNER/REPO (default: the checkout's GitHub repo)")
     ap.add_argument("--limit", type=int, default=400)
     ap.add_argument("--out", type=Path, required=True, help="output directory")
     args = ap.parse_args(argv)
-    repo = (
-        args.repo
-        or _sh("gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner").strip()
-    )
+    repo, base = _sh(
+        "gh",
+        "repo",
+        "view",
+        "--json",
+        "nameWithOwner,defaultBranchRef",
+        "--jq",
+        '.nameWithOwner + "\\n" + .defaultBranchRef.name',
+    ).split()
     args.out.mkdir(parents=True, exist_ok=True)
     import review_budget  # noqa: PLC0415
 
     cutover = review_budget.ROUND_RULE_CUTOVER_ISO
     cache = args.out / "rows.jsonl"
-    done = {}
-    if cache.exists():
-        for line in cache.read_text().splitlines():
-            row = json.loads(line)
-            done[row["pr"]] = row
+    done = load_cache(cache, repo)
     prs = json.loads(
         _sh(
             "gh",
@@ -158,13 +205,15 @@ def main(argv: list[str] | None = None) -> int:
             repo,
             "--state",
             "merged",
+            "--base",
+            base,
             "--limit",
             str(args.limit),
             "--json",
-            "number,mergeCommit,createdAt",
+            "number,mergeCommit,createdAt,mergedAt",
         )
     )
-    excluded = {"budget_not_ok": 0, "no_merge_commit": 0, "diff_error": 0}
+    excluded = {"budget_not_ok": 0, "no_merge_commit": 0, "diff_error": 0, "not_squash": 0}
     rows = []
     with cache.open("a") as fh:
         for p in prs:
@@ -177,9 +226,13 @@ def main(argv: list[str] | None = None) -> int:
                 excluded["no_merge_commit"] += 1
                 continue
             try:
-                diff = _sh("git", "diff", "-M", f"{sha}^1", sha)
+                squash = _is_squash(sha, n, lambda n=n: _commit_count(repo, n))
+                diff = _sh("git", "diff", "--no-color", "--no-ext-diff", "-M", f"{sha}^1", sha)
             except subprocess.CalledProcessError:
                 excluded["diff_error"] += 1
+                continue
+            if not squash:
+                excluded["not_squash"] += 1
                 continue
             counted = pr_shape.count_diff(diff)
             try:
@@ -199,25 +252,38 @@ def main(argv: list[str] | None = None) -> int:
                 excluded["budget_not_ok"] += 1
                 continue
             row = {
+                "repo": repo,
                 "pr": n,
                 "counted": counted["counted"],
-                "plain": plain_count(diff, counted["excluded"]),
+                "plain": counted["plain"],
                 "rounds": budget["count"],
-                "era": "post" if p["createdAt"] >= cutover[:19] else "pre",
+                "created": p["createdAt"],
+                "merged": p.get("mergedAt"),
+                "cohort": "post" if p["createdAt"] >= cutover[:19] else "pre",
             }
             fh.write(json.dumps(row) + "\n")
             fh.flush()
             rows.append(row)
-    report: dict = {"repo": repo, "population": len(prs), "used": len(rows), "excluded": excluded}
-    for era in ("all", "pre", "post"):
-        sub = rows if era == "all" else [r for r in rows if r["era"] == era]
+
+    def rho(sub: list[dict], key: str) -> float | None:
+        r = spearman([x[key] for x in sub], [x["rounds"] for x in sub])
+        return None if r is None else round(r, 3)
+
+    report: dict = {
+        "repo": repo,
+        "base": base,
+        "population": len(prs),
+        "used": len(rows),
+        "excluded": excluded,
+        "cohorts": "by creation date against ROUND_RULE_CUTOVER_ISO",
+    }
+    for cohort in ("all", "pre", "post"):
+        sub = rows if cohort == "all" else [r for r in rows if r["cohort"] == cohort]
         tc, tp = bucket_table(sub, "counted"), bucket_table(sub, "plain")
-        report[era] = {
+        report[cohort] = {
             "n": len(sub),
-            "rho_counted": round(
-                spearman([r["counted"] for r in sub], [r["rounds"] for r in sub]), 3
-            ),
-            "rho_plain": round(spearman([r["plain"] for r in sub], [r["rounds"] for r in sub]), 3),
+            "rho_counted": rho(sub, "counted"),
+            "rho_plain": rho(sub, "plain"),
             "counted": tc,
             "plain": tp,
             "thresholds_counted": implied_thresholds(tc),
