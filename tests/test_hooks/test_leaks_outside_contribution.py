@@ -43,6 +43,7 @@ def _facts(**over):
         "author": {"__typename": "User", "login": WHO},
         "userContentEdits": {"totalCount": 0, "nodes": []},
         "timelineItems": {"filteredCount": 0, "nodes": []},
+        "forcePushes": {"filteredCount": 0},
     }
     facts.update(over)
     return json.dumps(facts)
@@ -210,6 +211,10 @@ class TestNotExempt:
                 id="title-renamed-by-a-bot",
             ),
             pytest.param({"author": {"__typename": "Mannequin", "login": WHO}}, id="mannequin"),
+            # A rewrite can fold a commit of ours into one the contributor authored
+            # and committed, invisible in the current commit list (Codex P1).
+            pytest.param({"forcePushes": {"filteredCount": 1}}, id="force-pushed"),
+            pytest.param({"forcePushes": None}, id="force-push-history-unreadable"),
         ],
     )
     def test_pr_fact_breaks_the_exemption(self, monkeypatch, over):
@@ -321,8 +326,11 @@ class TestScope:
     def test_pr_with_its_marker_reads_nothing(self, monkeypatch):
         """CONTROL: a present marker passes without consulting the exemption at all."""
         monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker())
-        monkeypatch.setenv("_TEST_GH_OUTSIDE_PR", "__error__")
-        monkeypatch.setenv("_TEST_GH_PR_COMMITS", "__error__")
+
+        def no_read(*args, **kwargs):
+            raise AssertionError("the exemption was consulted on a PR that has its marker")
+
+        monkeypatch.setattr(_mod, "_outside_contribution", no_read)
         exempt: list = []
         assert _gate(exempt_out=exempt) is None
         assert exempt == []

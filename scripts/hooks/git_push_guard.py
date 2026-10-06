@@ -8635,7 +8635,9 @@ _OUTSIDE_PR_QUERY = (
     "author{__typename login} "
     "userContentEdits(first:100){totalCount nodes{editor{__typename login}}} "
     "timelineItems(itemTypes:[RENAMED_TITLE_EVENT],first:100){filteredCount "
-    "nodes{... on RenamedTitleEvent{actor{login}}}}}}}"
+    "nodes{... on RenamedTitleEvent{actor{login}}}} "
+    "forcePushes: timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT],first:1)"
+    "{filteredCount}}}}"
 )
 
 
@@ -8707,7 +8709,8 @@ def _outside_contribution(pr_num: str, repo: str | None, head: str) -> tuple[str
     marker is not required when ALL of these hold, read live and bound to ``head``:
       * the PR was opened by a human account (a Bot never qualifies) whose
         association is not OWNER, MEMBER or COLLABORATOR;
-      * its head lives in a fork, and is ``head``;
+      * its head lives in a fork, and is ``head``, and the branch was never
+        force-pushed (a rewrite can fold a commit of ours into one of theirs);
       * every commit's author is that account, and every committer is that account
         or ``web-flow`` (the committer GitHub records for the contributor's web
         edits, and for an Update-branch merge or UI rebase, which bring in only the
@@ -8738,9 +8741,17 @@ def _outside_contribution(pr_num: str, repo: str | None, head: str) -> tuple[str
         return None, "the PR author is a maintainer"
     if (facts.get("headRefOid") or "").lower() != head:
         return None, "the PR head moved"
+    # The commit checks below read the CURRENT commit list. A force-push rewrites
+    # it: a commit of ours could be squashed or rebased into one authored and
+    # committed by the contributor, leaving no trace in today's list. So any
+    # rewrite of the head branch, by anyone, ends the exemption (none of the
+    # outside PRs merged so far had one, MEASURED 2026-10-06 over 7).
+    forced = facts.get("forcePushes")
+    if not isinstance(forced, dict) or forced.get("filteredCount") != 0:
+        return None, "the PR branch was force-pushed, so its earlier commits cannot be checked"
     # The body's FULL edit history (``editor`` alone names only the last editor, so
-    # an edit of ours followed by a review app's would hide). The first node is the
-    # original body, credited to the author.
+    # an edit of ours followed by a review app's would hide). GitHub lists it
+    # newest first; every node is checked, so the order does not matter.
     edits = facts.get("userContentEdits")
     edit_nodes = edits.get("nodes") if isinstance(edits, dict) else None
     if not isinstance(edit_nodes, list) or edits.get("totalCount") != len(edit_nodes):
@@ -8885,14 +8896,6 @@ def _check_scheduled_claude_reviewed_head(
             missing = [k for k in missing if k != "leaks"]
             if exempt_out is not None:
                 exempt_out.append(("leaks", exempt_login))
-            if not missing:
-                print(
-                    f"NOTE: scheduled 'leaks' review not required for PR #{pr_num}: it is "
-                    f"an outside contribution by {exempt_login} (fork, every commit theirs, "
-                    f"no edit of ours, CI's leak-detector green at this head -- on a fork its "
-                    f"pattern-class scan only, without the private-pattern step).",
-                    file=sys.stderr,
-                )
     if missing:
         # A kind already ACCEPTED at an earlier head of this PR is satisfied when its
         # mechanical scanner is green at THIS head (see _MECHANICAL_RESCAN_BY_KIND).
@@ -8913,6 +8916,17 @@ def _check_scheduled_claude_reviewed_head(
                     file=sys.stderr,
                 )
     if not missing:
+        # Announced here, once the gate is known to clear, so a relieved other kind
+        # beside it never hides the note.
+        if exempt_login:
+            print(
+                f"NOTE: scheduled 'leaks' review not required for PR #{pr_num}: it is "
+                f"an outside contribution by {exempt_login} (fork, never force-pushed, "
+                f"every commit theirs, no edit of ours, CI's leak-detector green at this "
+                f"head -- on a fork its pattern-class scan only, without the "
+                f"private-pattern step).",
+                file=sys.stderr,
+            )
         return None
     # The message is an INVENTORY, not a verdict. Every marker block the scan found is
     # listed under the kind it names, with its status, and NOTHING is subtracted from

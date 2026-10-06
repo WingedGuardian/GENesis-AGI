@@ -1433,6 +1433,7 @@ def test_check_pr_report_names_an_outside_contribution_exemption(monkeypatch, ca
                 "author": {"__typename": "User", "login": "outsider"},
                 "userContentEdits": {"totalCount": 0, "nodes": []},
                 "timelineItems": {"filteredCount": 0, "nodes": []},
+                "forcePushes": {"filteredCount": 0},
             }
         ),
     )
