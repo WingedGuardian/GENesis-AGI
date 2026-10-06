@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
 import statistics
 import subprocess
 import sys
@@ -160,7 +161,26 @@ def cohort_of(created: str, cutover: str) -> str:
 
 
 def _sh(*args: str) -> str:
-    return subprocess.run(args, capture_output=True, text=True, check=True, cwd=_ROOT).stdout
+    """Run a command from the checkout. ``GH_REPO`` is removed, because gh would
+    otherwise read THAT repository's PRs while ``_git`` reads this checkout's history
+    (gh's environment help: GH_REPO selects the repository for commands that would
+    otherwise use the local one)."""
+    env = {k: v for k, v in os.environ.items() if k != "GH_REPO"}
+    return subprocess.run(args, capture_output=True, text=True, check=True, cwd=_ROOT, env=env).stdout
+
+
+def _rounds(repo: str, pr: int) -> int | None:
+    """The PR's review rounds from ``review_budget.py``, or None when it cannot say.
+    Read fresh on every run, cached size rows included: comments change after a
+    merge and the evaluator is outside ``ROW_SCHEMA``, so a cached count could mix
+    two rule sets in one table."""
+    try:
+        budget = json.loads(
+            _sh(sys.executable, str(_SCRIPTS / "review_budget.py"), "--repo", repo, "--pr", str(pr))
+        )
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return None
+    return budget["count"] if budget.get("status") == "ok" else None
 
 
 def _git(*args: str) -> str:
@@ -281,7 +301,11 @@ def main(argv: list[str] | None = None) -> int:
         for p in prs:
             n = p["number"]
             if n in done:
-                rows.append(done[n])
+                rounds = _rounds(repo, n)
+                if rounds is None:
+                    excluded["budget_not_ok"] += 1
+                    continue
+                rows.append({**done[n], "rounds": rounds})
                 continue
             sha = (p.get("mergeCommit") or {}).get("oid")
             if not sha:
@@ -297,20 +321,8 @@ def main(argv: list[str] | None = None) -> int:
                 excluded["not_squash"] += 1
                 continue
             counted = pr_shape.count_diff(diff)
-            try:
-                budget = json.loads(
-                    _sh(
-                        sys.executable,
-                        str(_SCRIPTS / "review_budget.py"),
-                        "--repo",
-                        repo,
-                        "--pr",
-                        str(n),
-                    )
-                )
-            except (subprocess.CalledProcessError, json.JSONDecodeError):
-                budget = {}
-            if budget.get("status") != "ok":
+            rounds = _rounds(repo, n)
+            if rounds is None:
                 excluded["budget_not_ok"] += 1
                 continue
             row = {
@@ -319,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
                 "pr": n,
                 "counted": counted["counted"],
                 "plain": counted["plain"],
-                "rounds": budget["count"],
+                "rounds": rounds,
                 "created": p["createdAt"],
                 "merged": p.get("mergedAt"),
             }

@@ -246,3 +246,45 @@ def test_study_git_failure_raises(monkeypatch):
     monkeypatch.setattr(scope, "_git", lambda *a, **k: None)
     with pytest.raises(subprocess.CalledProcessError):
         study._git("log", "-1", "a")
+
+
+def test_gh_reads_ignore_gh_repo(monkeypatch):
+    """Review finding: an inherited GH_REPO pointed gh at another repository while
+    git still read this checkout."""
+    seen = {}
+    monkeypatch.setenv("GH_REPO", "other/repo")
+    monkeypatch.setattr(
+        study.subprocess, "run",
+        lambda args, **kw: seen.update(kw) or subprocess.CompletedProcess(args, 0, "x", ""),
+    )
+    study._sh("gh", "repo", "view")
+    assert "GH_REPO" not in seen["env"]
+
+
+def test_resumed_rows_take_fresh_round_counts(monkeypatch, tmp_path):
+    """Review finding: a resumed run reused cached round counts, so one table could
+    mix two evaluators. Sizes come from the cache; rounds are always re-read."""
+    out = tmp_path / "out"
+    out.mkdir()
+    row = {"schema": study.ROW_SCHEMA, "repo": "o/r", "pr": 7, "counted": 10, "plain": 10,
+           "rounds": 9, "created": "2026-01-01T00:00:00Z", "merged": "2026-01-02T00:00:00Z"}
+    (out / "rows.jsonl").write_text(json.dumps(row) + "\n")
+    stale = {"schema": study.ROW_SCHEMA, "repo": "o/r", "pr": 8, "counted": 10, "plain": 10,
+             "rounds": 1, "created": "2026-01-01T00:00:00Z", "merged": "2026-01-02T00:00:00Z"}
+    with (out / "rows.jsonl").open("a") as fh:
+        fh.write(json.dumps(stale) + "\n")
+
+    def fake_sh(*args):
+        if args[:3] == ("gh", "repo", "view"):
+            return "o/r\nmain\n"
+        if args[:3] == ("gh", "pr", "list"):
+            return json.dumps([{"number": 7}, {"number": 8}])
+        raise AssertionError(args)
+
+    monkeypatch.setattr(study, "_sh", fake_sh)
+    monkeypatch.setattr(study, "_rounds", lambda repo, pr: {7: 2, 8: None}[pr])
+    study.main(["--out", str(out)])
+    report = json.loads((out / "report.json").read_text())
+    assert report["excluded"]["budget_not_ok"] == 1
+    assert report["used"] == 1
+    assert report["max_rounds"] == 2
