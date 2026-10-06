@@ -516,6 +516,19 @@ def test_config_denies_under_errexit(tmp_path, shell, body):
     assert "review guard failed" in run.stderr
 
 
+@pytest.mark.parametrize("shell", [["bash", "-e", "-c"], ["sh", "-e", "-c"]])
+@pytest.mark.parametrize("missing", ["no-repo", "no-launcher"])
+def test_config_denies_an_unfound_launcher_under_errexit(tmp_path, shell, missing):
+    """Codex round finding: `guard="$(git rev-parse ...)/..."` is an assignment, so
+    under errexit a failed lookup exited 128 there, which Codex reads as permit."""
+    if missing == "no-launcher":
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    run = subprocess.run([*shell, _config_command()], cwd=tmp_path, input="{}", text=True,
+                         capture_output=True, timeout=10)
+    assert run.returncode == 2
+    assert "review guard unavailable" in run.stderr
+
+
 def test_config_explained_deny_under_errexit_prints_once(tmp_path):
     repo = _repo_with_launcher(tmp_path, 'echo "BLOCKED: probe" >&2; echo deny >&3; exit 2')
     run = subprocess.run(["bash", "-e", "-c", _config_command()], cwd=repo, input="{}",
