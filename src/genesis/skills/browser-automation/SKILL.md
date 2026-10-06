@@ -54,7 +54,9 @@ leaves the browser entirely and is the only rung that reaches a non-web window.
 - Connects to user's Chrome via `playwright.chromium.connect_over_cdp()`
 - **Real browser, real fingerprint** — nothing to detect. Bulletproof for
   ATS submissions with reCAPTCHA v3 or aggressive anti-bot detection.
-- Collaborate timing auto-enabled (user watching their own screen)
+- Remote clicks, fills and uploads use collaborate timing (0.5-2s) on their
+  own; the `browser_collaborate` setting is left unchanged
+- Works in one Genesis tab of its own, reused on reconnect and never closed
 - Drift detection: warns if user navigated away since last Genesis action
 - **User setup**: Launch Chrome with `--remote-debugging-port=9222
   --user-data-dir=%USERPROFILE%\chrome-genesis` (Windows batch file)
