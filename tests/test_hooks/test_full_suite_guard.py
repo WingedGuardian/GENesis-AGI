@@ -13,6 +13,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -301,46 +302,66 @@ class TestUvCarrierBypasses:
 class TestWrappedRuns:
     """A wrapper the resolver does not see through must not hide an untargeted run.
 
-    MEASURED before this change: every BLOCKED row below exited 0. The resolver
-    leaves the segment on the wrapper (`systemd-run`, `flock`, the interpreter
-    running `genesis.hostmetrics run`), so the pytest it carries never reached
-    `is_pytest_invocation`. `genesis.hostmetrics run` is the resource-budget
-    wrapper sessions are told to use for heavy jobs, which made the hole a
-    recommended path rather than an obscure one.
+    MEASURED before wrappers were judged: `systemd-run --user --scope pytest -n 4`,
+    `flock /tmp/l pytest` and `<python> -m genesis.hostmetrics run … -- pytest -n 4`
+    all exited 0. Two exact rules now apply (see `_opaque_wrapper_ok` and
+    `_hostmetrics_ok`); a recursive re-parse of wrapper text was escaped seventeen
+    ways and went quadratic, so it is gone. Rows marked RESIDUAL are the documented
+    cases rule 2 cannot block, asserted at their documented verdict.
     """
 
     _PY = "~/genesis/.venv/bin/python"
-    _RUN = f"{_PY} -m genesis.hostmetrics run --name t --ram 2 --cpu 50"
+    _HM = f"{_PY} -m genesis.hostmetrics"
+    _RUN = f"{_HM} run --name t --ram 2 --cpu 50"
 
     @pytest.mark.parametrize(
         "cmd",
         [
+            # --- rule 2: an opaque wrapper mentioning pytest with no selector token
             "systemd-run --user --scope pytest -n 4",
             "systemd-run --user --scope -p MemoryMax=1G -- pytest",
-            "systemd-run --user --scope --unit=x -p CPUQuota=50% python -m pytest tests/",
             "systemd-run --user --scope -- sh -c 'pytest -q'",
+            "systemd-run --user --scope py.test",
             "flock /tmp/l pytest",
             "flock -w 5 /tmp/l pytest tests/",
             "watch 'pytest -x'",
+            "watch 'pytest;'",
+            "eval 'pytest;'",
+            "script -c 'pytest;' /dev/null",
+            'script -c "pytest -n 4" -- /dev/null',
+            "systemd-run --user --scope -- flock /tmp/l pytest",
+            "eval 'pytest tests/x.py;' 'pytest -n 4'",
+            # escapes of the re-parse design: the text is never parsed, only read
+            "eval 'p=pytest; $p -n 4'",
+            'eval "$(echo pytest)"',
+            "eval \"'py''test'\"",
+            "eval '(pytest)'",
+            "eval pytest\\&",
+            # only a TOP-LEVEL override counts; one inside the carried text does not
+            "eval 'pytest tests/ # full-suite-ok\npytest -n 4'",
+            "systemd-run --user --scope -- bash -c 'pytest # full-suite-ok'",
+            # --- rule 2b: a selector token is present, but a pytest token's own args
+            # are untargeted
+            "systemd-run --user --scope --unit=x -p CPUQuota=50% python -m pytest tests/",
+            'systemd-run --user --scope --description "pytest tests/x.py" pytest -n 4',
+            'systemd-run --user --scope -p "Description=run pytest tests/x.py" pytest',
+            "unshare -m pytest",
+            # --- rule 3: hostmetrics run, argparse REMAINDER from the first bare word
             f"{_RUN} -- pytest -n 4",
             f"{_RUN} -- python -m pytest",
             f"{_RUN} --wait-until-fits 5 -- uv run pytest",
             f"{_RUN} -- nice -n 19 pytest tests/",
-            f"{_RUN} pytest",  # argparse REMAINDER accepts a command without `--`
-            # a wrapper inside a wrapper is followed, not stopped at the outer one
-            "systemd-run --user --scope -- flock /tmp/l pytest",
-            # the inner command is a carrier the resolver cannot see through
-            "systemd-run --user --scope -- uv --color always run pytest",
-            # every candidate is judged, not just the first (review, MEASURED fail-open)
-            "eval 'pytest tests/x.py;' 'pytest -n 4'",
-            "watch -n 60 'pytest tests/x.py;' pytest",
-            'systemd-run --user --scope --description "pytest tests/x.py" pytest -n 4',
-            'systemd-run --user --scope -p "Description=run pytest tests/x.py" pytest',
-            'script -c "pytest -n 4" -- /dev/null',
-            # an option the walk cannot size: argparse prefix matching, or a newer flag
-            f"{_PY} -m genesis.hostmetrics run --na t --ram 2 --cpu 50 pytest -n 4",
-            f"{_PY} -m genesis.hostmetrics run --name t --ra 2 -- pytest",
-            f"{_PY} -m genesis.hostmetrics run --name t --wait 5 pytest",
+            f"{_RUN} pytest",
+            f"{_RUN} pytest -- tests/",  # a later `--` belongs to the command
+            f"{_HM} run --name t pytest tests/ -- -q",
+            f"{_HM} run --json pytest -- -n 4",
+            f"{_HM} run --cpu 50 pytest -x -- tests/",
+            f"{_RUN} -- systemd-run --user --scope pytest",  # inner wrapper: rule 2
+            f"{_RUN} -- uv --color always run pytest",
+            # an option the walk cannot size falls back to rule 2 on the rest
+            f"{_HM} run --na t --ram 2 --cpu 50 pytest -n 4",
+            f"{_HM} run --name t --ra 2 -- pytest",
+            f"{_HM} run --name t --wait 5 pytest",
         ],
     )
     def test_untargeted_run_inside_a_wrapper_blocks(self, cmd):
@@ -351,33 +372,92 @@ class TestWrappedRuns:
     @pytest.mark.parametrize(
         "cmd",
         [
+            "flock /tmp/l pytest tests/test_a.py",
             "systemd-run --user --scope pytest tests/x.py",
+            "systemd-run --user --scope pytest -k foo",
             "systemd-run --user --scope -p MemoryMax=1G -- pytest -k foo",
+            'script -c "pytest tests/test_a.py" /dev/null',  # /dev/null is not a dir here
             "systemd-run --user --scope /bin/true",
-            "systemd-run --user --scope --unit=pytest-probe /bin/true",
             "flock /tmp/l make -j8",
+            f"{_HM} run --name pytest -- pytest tests/test_a.py",
             f"{_RUN} -- pytest tests/x.py -n 4",
             f"{_RUN} -- make -j8",
             f"{_RUN} --name pytest -- make -j8",  # the job's NAME is not its command
-            f"{_PY} -m genesis.hostmetrics preflight --name pytest --ram 2 --cpu 50",
-            f"{_PY} -m genesis.hostmetrics status",
-            "echo systemd-run pytest",
-            # after `--` the carried command is known: `echo`, not the word after it
-            "systemd-run --user --scope -- echo pytest",
-            # the override counts when written inside the wrapper, as it does bare
-            "systemd-run --user --scope -- bash -c 'pytest # full-suite-ok'",
-            # after `--` the command is exact: `echo`, not the word after it
             f"{_RUN} -- echo pytest",
-            # =-form flags are sized exactly, so the command is still known to be `echo`
-            f"{_PY} -m genesis.hostmetrics run --name=t --ram=2 --cpu=50 echo pytest",
-            # =-form and boolean options are sized exactly
-            f"{_PY} -m genesis.hostmetrics run --name=t --ram=2 --cpu=50 --no-host make",
-            # only `run` launches a command; another subcommand's stray word is not one
-            f"{_PY} -m genesis.hostmetrics status pytest",
+            f"{_HM} run --name=t --ram=2 --cpu=50 echo pytest",
+            f"{_HM} run --name=t --ram=2 --cpu=50 --no-host make",
+            f"{_HM} preflight --name pytest --ram 2 --cpu 50",
+            f"{_HM} status pytest",
+            "echo systemd-run pytest",
             "systemd-run --user --scope pytest -n 4  # full-suite-ok",
             f"{_RUN} -- pytest -n 4  # full-suite-ok",
+            "eval 'pytest;'  # full-suite-ok",
         ],
     )
     def test_targeted_or_unrelated_wrapped_command_is_allowed(self, cmd):
         r = _run_guard(cmd)
         assert r.returncode == 0, f"{cmd!r} was blocked: {r.stderr}"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # the wrapper's OWN operand is a .py file, so rule 2a sees a selector, and
+            # the only pytest-named token's args (`capture.py`) look targeted
+            "script -c pytest capture.py",
+            "script -qc 'pytest -n 4' log.py",
+            "script -c 'pytest -n 4' -q out.py",
+            "su -c 'pytest -n 4' tests/x.py",
+            # the wrapper's own -m flag reads as a selector
+            "unshare -m sh -c 'pytest -n 4'",
+            # a quoted command string ending in .py is itself the selector token
+            "eval 'pytest tests/ x.py'",
+            # the general class: a sibling targeted run's selector or file satisfies it
+            "eval 'pytest -n 4;' pytest tests/x.py",
+            "eval pytest -k x '; pytest -n 4'",
+        ],
+    )
+    def test_residual_wrapper_operand_reads_as_selector_is_allowed(self, cmd):
+        assert _run_guard(cmd).returncode == 0, cmd
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "watch -n 5 'ps aux | grep pytest'",
+            "systemd-run --user --scope -- echo pytest",
+            "systemd-run --user --scope --unit=pytest-probe /bin/true",
+            "eval " + " ".join(["pytest", "-k", "x"] * 17),  # past _MAX_OPAQUE_RUNS
+        ],
+    )
+    def test_known_over_block_a_mention_is_refused(self, cmd):
+        assert _run_guard(cmd).returncode == 2, cmd
+        assert _run_guard(f"{cmd}  # full-suite-ok").returncode == 0, cmd
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "eval " + " ".join(["pytest"] * 1200),
+            "eval " + " ".join(["pytest", "-k", "x"] * 1200),
+            "eval " + " ".join(["pytest", "a.py"] * 1200),
+        ],
+    )
+    def test_many_pytest_words_are_refused(self, cmd):
+        assert _run_guard(cmd).returncode == 2
+
+    def test_a_versioned_spec_is_still_the_runner(self):
+        # `uvx NAME@8` names the runner with a version suffix (round-2 audit F3).
+        cmd = "systemd-run --user --scope uvx pytest@8 tests/ x.py"
+        assert _run_guard(cmd).returncode == 2
+
+    def test_the_wrapper_rule_scales_linearly(self):
+        # A ratio, not a wall-clock budget: absolute timings swing 100x with load.
+        # Uncapped, 4x the words cost ~13x the time (quadratic); capped, ~flat.
+        def cost(n):
+            text = "eval " + " ".join(["pytest", "-k", "x"] * n)
+            tokens = text.split()[1:]
+            t0 = time.perf_counter()
+            for _ in range(5):
+                _mod._opaque_wrapper_ok(text, tokens)
+            return time.perf_counter() - t0
+
+        cost(50)  # warm up
+        assert cost(1200) / max(cost(300), 1e-6) < 8

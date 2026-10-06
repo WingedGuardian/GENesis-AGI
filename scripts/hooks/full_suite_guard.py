@@ -20,14 +20,29 @@ Blocked:
   - pytest -v                               (no path at all)
   - python -m pytest tests/test_scripts/    (a whole directory)
   - pytest tests/foo.py tests/              (a file + a whole dir still runs the dir)
-  - systemd-run --user --scope pytest -n 4  (a wrapper does not hide the run; see
-    _wrapped_command — also flock/watch/… and `genesis.hostmetrics run -- …`)
+  - systemd-run --user --scope pytest -n 4  (a wrapper does not hide the run)
+
+Wrappers the resolver stops at get two exact rules, both single-pass and linear:
+  - a re-parse launcher (eval/watch/script/systemd-run/flock/su/… —
+    shell_parse._REPARSE_CARRIERS) is NOT re-parsed: if its text mentions pytest it
+    is refused unless its argv carries a selector or a .py token and every pytest
+    token in it is followed by a targeted arg list (see _opaque_wrapper_ok). NAMED
+    RESIDUAL: a pytest inside a QUOTED token is never sized, so it passes whenever any
+    argv token satisfies the selector test: the wrapper's own .py or -k/-m operand
+    (`script -qc 'pytest -n 4' log.py`) or a sibling targeted run's
+    (`eval 'pytest -n 4;' pytest tests/x.py`). Known over-block:
+    `watch 'ps aux | grep pytest'` (override clears it).
+  - `python -m genesis.hostmetrics run` is walked with its own closed option set and
+    its argparse.REMAINDER command parsed once (see _hostmetrics_ok).
+Only a top-level `# full-suite-ok` clears a refusal; one written inside a wrapper's
+carried text does not.
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shlex
 import sys
 
@@ -138,6 +153,17 @@ def _pytest_args(seg: Segment) -> list[str]:
     return argv  # unreachable when is_pytest_invocation(seg) is True
 
 
+def _is_selector(arg: str) -> bool:
+    """A -k/-m selector (separate value, =form, or glued) or --pyargs: narrows the run."""
+    return arg in ("-k", "-m", "--pyargs") or arg.startswith(("-k", "-m", "--keyword"))
+
+
+def _is_test_file(arg: str) -> bool:
+    """A real .py file or nodeid — NOT a mere substring, so a directory like
+    tests/.pytest_cache/ or foo.python_stuff/ counts as a directory, not a file."""
+    return arg.endswith(".py") or ".py::" in arg
+
+
 def _targets_specific_test(args: list[str]) -> bool:
     """True if this pytest arg list is a TARGETED run (allow), False for a bare or
     directory-touching run (block).
@@ -159,20 +185,14 @@ def _targets_specific_test(args: list[str]) -> bool:
         arg = args[i]
         if arg.startswith("-"):
             # a -k/-m selector (separate value, =form, or glued) narrows the run
-            if (
-                arg in ("-k", "-m")
-                or arg.startswith(("-k", "-m", "--keyword"))
-                or arg == "--pyargs"
-            ):
+            if _is_selector(arg):
                 has_selector = True
             elif arg in _VALUE_FLAGS:
                 i += 2  # skip the flag AND its value
                 continue
             i += 1
             continue
-        # A real .py file or nodeid — NOT a mere substring, so a directory like
-        # tests/.pytest_cache/ or foo.python_stuff/ counts as a directory, not a file.
-        if arg.endswith(".py") or ".py::" in arg:
+        if _is_test_file(arg):
             has_file = True
         else:
             has_dir = True  # a bare directory / non-file positional path
@@ -193,7 +213,7 @@ _NOT_A_RUN_FRONTEND = (
 )
 _REPARSE_JUDGED_ELSEWHERE = (
     "a re-parse launcher (shell_parse._REPARSE_CARRIERS) — not a `run` front-end; "
-    "the command it carries is judged by _wrapped_command instead"
+    "the command it carries is judged by _opaque_wrapper_ok instead"
 )
 _CARRIER_EXCLUDES: dict[str, str] = {
     # re-parse launchers — taken from the set itself, so the reason stays true
@@ -333,9 +353,17 @@ _HOSTMETRICS_VALUE_FLAGS = frozenset(
         "--approved-over-line",
     }
 )
-#: Wrappers inside wrappers are followed this deep; past it a pytest mention is
-#: judged untargeted (refused), never waved through.
-_MAX_WRAP_DEPTH = 8
+#: The other options of `genesis.hostmetrics run` (boolean). Together with
+#: `_HOSTMETRICS_VALUE_FLAGS` this is its whole grammar (the parser in
+#: `src/genesis/hostmetrics/__main__.py`, added by #2944; change both together);
+#: that parser sets `allow_abbrev=False`, so an option outside both (a flag added later) is one the
+#: walk cannot size, and it stops trusting its reading of which word is the command.
+_HOSTMETRICS_BOOL_FLAGS = frozenset({"--json", "--no-host", "--assume-default", "-h", "--help"})
+
+#: The word a wrapper rule looks for in text it does not parse.
+_PYTEST_WORD = re.compile(r"\bpy\.?test\b")
+#: Most pytest tokens one opaque wrapper may carry before it is refused outright.
+_MAX_OPAQUE_RUNS = 16
 
 
 def _hostmetrics_run_start(argv: list[str]) -> int | None:
@@ -346,122 +374,107 @@ def _hostmetrics_run_start(argv: list[str]) -> int | None:
     return None
 
 
-#: The other options of `genesis.hostmetrics run` (boolean). Together with
-#: `_HOSTMETRICS_VALUE_FLAGS` this is its whole grammar; an option outside both is
-#: one the walk cannot size (an abbreviation, a flag added later), and the walk
-#: stops trusting its own reading of which word is the command.
-_HOSTMETRICS_BOOL_FLAGS = frozenset({"--json", "--no-host", "--assume-default", "-h", "--help"})
+def _opaque_wrapper_ok(text: str, tokens: list[str]) -> bool:
+    """Rule for a wrapper whose carried command is NOT parsed (single pass, linear).
 
+    The resolver stops at the re-parse launchers (`shell_parse._REPARSE_CARRIERS`:
+    `eval`, `watch`, `script`, `systemd-run`, `flock`, `su`, …), so the pytest such a
+    wrapper carries never reaches `is_pytest_invocation`. Their grammars, and the
+    shell text they re-parse, are deliberately not modelled: an earlier recursive
+    re-parse was escaped seventeen ways and went quadratic. Instead, when `text`
+    mentions pytest/py.test as a word, the segment is refused UNLESS
+      (a) some token in `tokens` is a selector or a test file (`_is_selector` /
+          `_is_test_file` — the same predicates `_targets_specific_test` uses), and
+      (b) for every token that IS a pytest executable, the tokens after it pass
+          `_targets_specific_test`.
 
-def _pytest_candidates(tokens: list[str]) -> list[str]:
-    """Every reading of `tokens` that could start a carried pytest run.
-
-    A token named pytest starts one; so does a quoted string that mentions pytest,
-    joined with the tokens after it, because `eval` and `watch` join their
-    arguments into one command line (`eval 'pytest a.py;' 'pytest -n 4'` runs both).
+    NAMED RESIDUAL (allow): a wrapper whose own operand coincidentally is a `.py`
+    file or a `-k`/`-m` token satisfies (a) without narrowing the carried run —
+    `script -qc 'pytest -n 4' log.py`, `su -c 'pytest -n 4' tests/x.py`,
+    `unshare -m sh -c 'pytest -n 4'`. Likewise a quoted command string that itself ends in
+    `.py` (`eval 'pytest tests/ x.py'`) counts as the selector, because the text
+    inside a token is not parsed. The general class: a pytest inside a quoted token
+    is never sized, so ANY token satisfying (a) lets it through, including a
+    sibling targeted run's own selector or file (`eval 'pytest -n 4;' pytest tests/x.py`,
+    `eval pytest -k x '; pytest -n 4'`).
+    KNOWN OVER-BLOCK (refuse, `# full-suite-ok` clears): any mention of the word,
+    e.g. `watch -n 5 'ps aux | grep pytest'`, `systemd-run --unit=pytest-x /bin/true`;
+    and more than `_MAX_OPAQUE_RUNS` pytest tokens in one wrapper, because (b) costs
+    one `_targets_specific_test` walk per token — unbounded, that is quadratic
+    (MEASURED: `eval` + 1,200 × `pytest -k x` took 1.1 s; the hook fails open at 10 s).
     """
-    out: list[str] = []
-    for j, tok in enumerate(tokens):
-        if _basename(tok).split("@", 1)[0] in ("pytest", "py.test"):
-            out.append(shlex.join(tokens[j:]))
-        elif any(c.isspace() for c in tok) and mentions(tok, "pytest"):
-            out.append(" ".join(tokens[j:]))
-    return out
+    if not mentions(text, _PYTEST_WORD):
+        return True
+    if not any(_is_selector(t) or _is_test_file(t) for t in tokens):
+        return False
+    starts = [
+        j + 1
+        for j, tok in enumerate(tokens)
+        if _basename(tok).split("@", 1)[0] in ("pytest", "py.test")  # uvx pytest@8
+    ]
+    if len(starts) > _MAX_OPAQUE_RUNS:
+        return False  # keeps (b) linear; refusing is the safe direction
+    return all(_targets_specific_test(tokens[j:]) for j in starts)
 
 
-def _wrapped_command(seg: Segment) -> list[str] | None:
-    """Every command text a wrapper may carry, or None when `seg` is not a wrapper.
+def _hostmetrics_ok(argv: list[str], run_at: int) -> bool:
+    """Judge the command `genesis.hostmetrics run` launches; `run_at` is past `run`.
 
-    The resolver stops at these wrappers, so without this a pytest inside one never
-    reaches `is_pytest_invocation`. MEASURED before this function existed:
-    `systemd-run --user --scope pytest -n 4`, `flock /tmp/l pytest` and
-    `<venv python> -m genesis.hostmetrics run … -- pytest -n 4` all exited 0.
+    Mirrors the parser in `genesis/hostmetrics/__main__.py`: the command is an
+    `argparse.REMAINDER`, so it starts at the FIRST bare word (everything after it,
+    a later `--` included, belongs to the command), or after a `--` met as the first
+    command word — only that LEADING `--` is stripped. MEASURED escapes of the
+    previous split-at-any-`--` reading: `run --cpu 50 pytest -x -- tests/` and
+    `run --json pytest -- -n 4` were allowed.
 
-    EVERY candidate is returned and judged, never just the first: an earlier
-    version stopped at the first match and allowed `eval 'pytest a.py;' 'pytest
-    -n 4'` and `script -c "pytest -n 4" -- /dev/null` (MEASURED, review).
-
-    Two kinds, read differently:
-    - `genesis.hostmetrics run` is this repo's own CLI (`_HOSTMETRICS_VALUE_FLAGS`
-      + `_HOSTMETRICS_BOOL_FLAGS`). After `--` the command is exact. Otherwise it is
-      the first bare word no option consumes — until an option the walk cannot size
-      appears (an abbreviation argparse would accept, a newer flag), after which
-      every pytest token in the rest is a candidate instead.
-    - A re-parse launcher (`systemd-run`, `flock`, `watch`, … —
-      `shell_parse._REPARSE_CARRIERS`) has a grammar this repo deliberately does
-      not model. The tail after a `--` is one candidate; every pytest token, and
-      every quoted string mentioning pytest, BEFORE that `--` is another (a
-      launcher like `script -c CMD -- FILE` carries its command ahead of it).
-
-    This over-reads in the safe direction only: any argument spelled pytest — an
-    option value (`--unit pytest`), or the carried command's own argument
-    (`pip install pytest`) — can refuse a command that `# full-suite-ok` then
-    clears. It never allows an untargeted run that the bare form refuses.
+    An option the walk cannot size loses confidence: the rest is judged by
+    `_opaque_wrapper_ok`. A sized command is parsed ONCE and judged like a
+    top-level one; a wrapper inside it gets the opaque rule, never another parse.
     """
-    argv = seg.argv
-    exe = _basename(seg.exe)
-    if exe.startswith("python"):
-        i = _hostmetrics_run_start(argv)
-        if i is None:
-            return None
-        rest = argv[i:]
-        if "--" in rest:
-            return [shlex.join(rest[rest.index("--") + 1 :])]
-        k = 0
-        while k < len(rest):
-            tok = rest[k]
-            if tok in _HOSTMETRICS_VALUE_FLAGS:
-                k += 2
-                continue
-            if tok.split("=", 1)[0] in _HOSTMETRICS_VALUE_FLAGS | _HOSTMETRICS_BOOL_FLAGS:
-                k += 1
-                continue
-            if tok.startswith("-"):
-                return _pytest_candidates(rest[k:])  # an option it cannot size
-            return [shlex.join(rest[k:])]
-        return []
-    if exe not in _REPARSE_CARRIERS:
-        return None
-    rest = argv[1:]
-    if "--" in rest:
-        cut = rest.index("--")
-        return [shlex.join(rest[cut + 1 :]), *_pytest_candidates(rest[:cut])]
-    return _pytest_candidates(rest)
+    rest = argv[run_at:]
+    k = 0
+    while k < len(rest):
+        tok = rest[k]
+        if tok == "--":
+            k += 1
+            break
+        if tok in _HOSTMETRICS_VALUE_FLAGS:
+            k += 2
+            continue
+        if tok.split("=", 1)[0] in _HOSTMETRICS_VALUE_FLAGS | _HOSTMETRICS_BOOL_FLAGS:
+            k += 1
+            continue
+        if tok.startswith("-"):
+            return _opaque_wrapper_ok(shlex.join(rest[k:]), rest[k:])
+        break
+    text = shlex.join(rest[k:])
+    if not text:
+        return True  # no command: hostmetrics refuses to run
+    try:
+        inner, blind = analyze_checked(text)
+    except Exception:  # noqa: BLE001 — unreadable carried text is judged, not skipped
+        return not mentions(text, _PYTEST_WORD)
+    if blind is not None and blind.bounds_induced and mentions(text, _PYTEST_WORD):
+        return False
+    return all(_segment_ok(s, nested=True) for s in inner)
 
 
-def _wrapped_pytest_args(segments: list[Segment], depth: int = 0) -> list[list[str]]:
-    """Arg lists of the pytest runs that wrappers among `segments` carry.
-
-    Each carried command is parsed with the same `analyze_checked` and judged by
-    the same rules as a top-level one, so a wrapper changes nothing about what
-    counts as targeted — including the `# full-suite-ok` override written inside
-    it. An unreadable carried command that mentions pytest yields an EMPTY arg
-    list — untargeted — as does nesting past `_MAX_WRAP_DEPTH`.
-    """
-    runs: list[list[str]] = []
-    for seg in segments:
-        for text in _wrapped_command(seg) or []:
-            if not text:
-                continue
-            if depth >= _MAX_WRAP_DEPTH:
-                if mentions(text, "pytest"):
-                    runs.append([])
-                continue
-            try:
-                inner, blind = analyze_checked(text)
-            except Exception:  # noqa: BLE001 — unreadable carried text is judged, not skipped
-                if mentions(text, "pytest"):
-                    runs.append([])
-                continue
-            if blind is not None and blind.bounds_induced and mentions(text, "pytest"):
-                runs.append([])
-                continue
-            if any(has_trailing_override(s.raw, _OVERRIDE) for s in inner):
-                continue  # the override, written inside the wrapper, counts as at top level
-            runs += [_pytest_args(s) for s in inner if is_pytest_invocation(s)]
-            runs += [a for a in (_carried_pytest_args(s) for s in inner) if a is not None]
-            runs += _wrapped_pytest_args(inner, depth + 1)
-    return runs
+def _segment_ok(seg: Segment, nested: bool = False) -> bool:
+    """False when `seg` runs (or a wrapper of it carries) an untargeted pytest."""
+    if is_pytest_invocation(seg):
+        return _targets_specific_test(_pytest_args(seg))
+    carried = _carried_pytest_args(seg)  # unresolved `uv … run` etc.: same rule
+    if carried is not None:
+        return _targets_specific_test(carried)
+    if _basename(seg.exe) in _REPARSE_CARRIERS:
+        return _opaque_wrapper_ok(seg.raw, seg.argv[1:])
+    if seg.exe.startswith("python"):
+        run_at = _hostmetrics_run_start(seg.argv)
+        if run_at is not None:
+            if nested:  # no further recursion
+                return _opaque_wrapper_ok(seg.raw, seg.argv[run_at:])
+            return _hostmetrics_ok(seg.argv, run_at)
+    return True
 
 
 def main() -> None:
@@ -512,22 +525,12 @@ def main() -> None:
                 discarded_write.warn()
         sys.exit(2)
 
-    pytest_segs = [s for s in segments if is_pytest_invocation(s)]
-    # Unresolved carriers are evaluated on the same rule, not waved through.
-    carried = [a for a in (_carried_pytest_args(s) for s in segments) if a is not None]
-    # So are runs a wrapper carries (systemd-run, flock, genesis.hostmetrics run, …).
-    wrapped = _wrapped_pytest_args(segments)
-    if not pytest_segs and not carried and not wrapped:
+    # Block if ANY segment runs an untargeted pytest — directly, through an
+    # unresolved carrier, or inside a wrapper (systemd-run, flock, hostmetrics run, …).
+    if all(_segment_ok(s) for s in segments):
         return
     if any(has_trailing_override(s.raw, _OVERRIDE) for s in segments):
         return  # explicit opt-in to a local full/dir run
-
-    # Block if ANY pytest run — resolved or carried — is non-targeted.
-    resolved_ok = all(_targets_specific_test(_pytest_args(s)) for s in pytest_segs)
-    carried_ok = all(_targets_specific_test(a) for a in carried)
-    wrapped_ok = all(_targets_specific_test(a) for a in wrapped)
-    if resolved_ok and carried_ok and wrapped_ok:
-        return
 
     print(
         "BLOCKED: full-suite / whole-directory pytest run. On this shared box the "
