@@ -432,3 +432,38 @@ def test_check_pr_without_a_body_prints_the_plain_command_and_says_why(monkeypat
     assert rc == 0
     assert "--body-file" not in _merge_with_line(captured.out)
     assert "no squash body file" in captured.err
+
+
+def test_check_pr_with_a_shell_active_home_falls_back_and_says_why(
+    monkeypatch, capsys, tmp_path
+):
+    """GLM P2: a home path with a space would print a command the shell splits."""
+    home = tmp_path / "My Home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    _report_env(monkeypatch)
+    rc = _mod.check_pr_report("5", repo="o/r")
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "--body-file" not in _merge_with_line(captured.out)
+    assert "is unusable" in captured.err
+    assert not (home / "tmp").exists()
+
+
+def test_a_body_directory_others_can_write_is_refused():
+    """GLM P3: with ~/tmp symlinked into a shared /tmp, someone else may own it."""
+    d = _bodies_dir()
+    d.mkdir(parents=True)
+    path = gh_merge.body_file_path("o/r", "5", HEAD)
+    assert gh_merge.body_file_path_problem(path) is None
+    d.chmod(0o777)
+    assert "writable by nobody else" in gh_merge.body_file_path_problem(path)
+    with pytest.raises(PermissionError):
+        gh_merge.write_body_file(path, EXPECTED)
+    d.chmod(0o700)
+
+
+def test_an_uppercase_session_id_is_collected_in_lowercase():
+    """GLM P3: prepare-commit-msg keeps the case it found."""
+    body = gh_merge.compose_squash_body("", HEAD, ["x\n\nGenesis-Session: ABCD1234\n"])
+    assert body == f"Squashed-From: {HEAD}\nGenesis-Session: abcd1234\n"

@@ -10611,10 +10611,15 @@ def _prepare_squash_body_file(pr_num: str, repo: str | None, head: str) -> tuple
     if body is None:
         return None, why
     path = body_file_path(repo, pr_num, head)
+    # The merge arm would refuse a path that fails this, and printed unquoted it
+    # could split in the shell, so say why and fall back to the plain command.
+    problem = body_file_path_problem(path)
+    if problem:
+        return None, f"the body file path {path!r} is unusable: {problem}"
     try:
         write_body_file(path, body)
     except OSError as exc:
-        return None, f"the body file could not be written ({exc.strerror or type(exc).__name__})"
+        return None, f"the body file could not be written ({exc.strerror or exc})"
     return path, ""
 
 
@@ -13114,7 +13119,11 @@ def _run_merge_and_push_gates() -> int:
                 # the TOCTOU binding runs argv-only right after freshness, so
                 # only the tail advisory scanners (fail-OPEN by design) could
                 # ever be clipped, which nets the same outcome as their error
-                # path.
+                # path. A merge carrying --body-file adds the squash-body
+                # recompute right after the binding (commits 15 + body 6, each
+                # clamped by `_gh_timeout` to what is left): a drained budget
+                # there BLOCKS ("could not be recomputed"), never allows, and a
+                # merge without --body-file pays none of it.
                 # A timing-out fail-closed gate returns BLOCK immediately, so
                 # the additive worst case needs every call slow-but-successful.
                 mergeable = _check_mergeable(pr_num, repo=merge_repo)

@@ -437,7 +437,8 @@ def api_merge_reason(
 #: GitHub caps a PR body at 65,536 characters; at four UTF-8 bytes each, plus the
 #: trailers, a legitimate body stays under this. Anything larger is refused unread.
 MERGE_BODY_MAX_BYTES = 512 * 1024
-_SESSION_TRAILER = re.compile(r"^Genesis-Session: ([0-9a-f]{8})$")
+#: Either case: prepare-commit-msg stamps the id's leading hex as it found it.
+_SESSION_TRAILER = re.compile(r"^Genesis-Session: ([0-9a-fA-F]{8})$")
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _NAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 _SHELL_INERT_PATH = re.compile(r"[A-Za-z0-9._/-]+")
@@ -474,8 +475,8 @@ def compose_squash_body(pr_body: str | None, head: str, messages: list[str | Non
         paragraphs = [p for p in (message or "").replace("\r\n", "\n").split("\n\n") if p.strip()]
         for line in (paragraphs[-1] if paragraphs else "").split("\n"):
             m = _SESSION_TRAILER.match(line.rstrip("\r"))
-            if m and m.group(1) not in sessions:
-                sessions.append(m.group(1))
+            if m and m.group(1).lower() not in sessions:
+                sessions.append(m.group(1).lower())
     trailers = "\n".join([f"Squashed-From: {head}"] + [f"Genesis-Session: {s}" for s in sessions])
     return (body + "\n\n" if body else "") + trailers + "\n"
 
@@ -502,6 +503,23 @@ def body_file_path_problem(path: str) -> str | None:
         return "it must resolve to itself (no symlink or per-process alias)"
     if os.path.dirname(path) != merge_bodies_dir():
         return f"it must be a file the gate wrote, in {merge_bodies_dir()}"
+    return _dir_problem(os.path.dirname(path))
+
+
+def _dir_problem(directory: str) -> str | None:
+    """Why the body directory cannot be trusted, else None. If ``~/tmp`` is a
+    symlink into a shared ``/tmp``, someone else may own ``merge-bodies`` and swap
+    a file between the hook's read and gh's; only a directory this user owns,
+    writable by nobody else, keeps that window closed. Absent is fine: the
+    writer creates it, and a read of a missing file fails on its own."""
+    try:
+        st = os.lstat(directory)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"its directory cannot be checked ({exc.strerror or type(exc).__name__})"
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
+        return "its directory must be owned by this user and writable by nobody else"
     return None
 
 
@@ -536,6 +554,9 @@ def write_body_file(path: str, text: str) -> None:
     reads a half-written body from a concurrent ``--check-pr``."""
     directory = os.path.dirname(path)
     os.makedirs(directory, mode=0o700, exist_ok=True)
+    problem = _dir_problem(directory)
+    if problem:
+        raise PermissionError(problem)
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".body-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
