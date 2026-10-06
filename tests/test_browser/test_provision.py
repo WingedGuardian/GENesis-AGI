@@ -2,8 +2,12 @@
 scripts/install_browser_stack.sh.
 
 The hazards it exists for (measured on camoufox 0.5.7):
-  * the new packages cannot drive the old engine, so a failure reinstalls the
-    package versions that were there before and removes any the run added;
+  * camoufox 0.5's own fetch deletes a pre-0.5 engine directory BEFORE
+    downloading, so the new engine is staged next to the old one and swapped in
+    by rename only once it checks out;
+  * the new packages cannot drive the old engine, so a failure before the swap
+    reinstalls the package versions that were there before and removes any the
+    run added;
   * a step is usually a wrapper (bash running pip): an interrupt must stop the
     step's whole process tree before the rollback starts a second pip.
 No test downloads or launches anything: subprocess steps are stubbed.
@@ -91,16 +95,19 @@ def stack(cache, tmp_path, monkeypatch):
 
 
 class FakeRun:
-    """Stands in for subprocess.run."""
+    """Stands in for subprocess.run; ``fetch(install_dir, env)`` plays camoufox fetch."""
 
-    def __init__(self, fail=()):
+    def __init__(self, fetch=None, fail=()):
         self.calls: list[tuple[list[str], dict | None]] = []
+        self.fetch = fetch
         self.fail = fail  # predicates on cmd that return rc=1
 
     def __call__(self, cmd, env=None, **kw):
         self.calls.append((cmd, env))
         if any(pred(cmd) for pred in self.fail):
             return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+        if cmd[1:3] == ["-m", "camoufox"] and self.fetch:
+            self.fetch(Path(env["XDG_CACHE_HOME"]) / "camoufox", env)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     def pip_calls(self):
@@ -142,7 +149,281 @@ def _versions(monkeypatch, first: dict, then: dict) -> None:
     monkeypatch.setattr(provision, "installed_versions", lambda: next(calls, then))
 
 
-# ── the engine must suit the packages ─────────────────────────────────────
+# ── the engine: stage, then swap ──────────────────────────────────────────
+
+
+def test_stage_then_swap_keeps_the_legacy_engine_until_the_new_one_checks_out(
+    stack, tmp_path, monkeypatch
+):
+    _legacy_engine(stack, age_days=90)
+    seen = {}
+
+    def fetch(install_dir, env):
+        # The old engine is still in place, untouched, for the whole download.
+        seen["legacy_during_fetch"] = (stack / "camoufox-bin").read_text()
+        seen["staging"] = install_dir.parent
+        _install_pinned(install_dir)
+
+    run = FakeRun(fetch=fetch)
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+
+    assert seen["legacy_during_fetch"] == "binary"
+    # Staged on the same filesystem (next to the root), and removed afterwards.
+    assert seen["staging"].parent == stack.parent
+    assert seen["staging"].name.startswith(".camoufox-staging-")
+    assert not list(stack.parent.glob(".camoufox-staging-*"))
+    # The root is now the new engine...
+    assert (stack / ".0.5_FLAG").exists()
+    assert (stack / "browsers" / "official" / f"{PIN.version}-{PIN.build}" / "version.json").is_file()
+    # ...and the legacy engine was renamed aside, aged from today.
+    aside = stack.with_name(f"camoufox.pre-0.5-{provision._stamp()}")
+    assert (aside / "camoufox-bin").read_text() == "binary"
+    assert time.time() - aside.stat().st_mtime < 3600
+    assert "ready (engine=True, launch=True)" in outcome
+    assert run.pip_calls() == []
+
+
+def test_05_layout_is_fetched_in_place_and_never_renamed(stack, tmp_path, monkeypatch):
+    """camoufox 0.5 keeps versions side by side and deletes nothing in its own
+    layout, so a 0.5 root just gets the new version added."""
+    stack.mkdir()
+    (stack / ".0.5_FLAG").touch()
+    old = stack / "browsers" / "official" / "150.0.2-beta.25"
+    old.mkdir(parents=True)
+    (old / "version.json").write_text(json.dumps({"version": "150.0.2", "release": "beta.25"}))
+    inode = stack.stat().st_ino
+    envs = []
+
+    def fetch(install_dir, env):
+        envs.append(env["XDG_CACHE_HOME"])
+        _install_pinned(install_dir)
+
+    monkeypatch.setattr(subprocess, "run", FakeRun(fetch=fetch))
+    outcome = _tx(tmp_path).run()
+    assert envs == [str(stack.parent)], "fetched into the real install root"
+    assert stack.stat().st_ino == inode
+    assert (old / "version.json").is_file()
+    assert not list(stack.parent.glob("camoufox.pre-*"))
+    assert "engine=True" in outcome
+
+
+def test_residue_root_is_replaced_without_a_backup(stack, tmp_path, monkeypatch):
+    stack.mkdir()
+    (stack / "partial.zip").write_text("x")  # an interrupted download: no engine, no flag
+    monkeypatch.setattr(subprocess, "run", FakeRun(fetch=_install_pinned))
+    outcome = _tx(tmp_path).run()
+    assert not (stack / "partial.zip").exists() and (stack / ".0.5_FLAG").exists()
+    assert not list(stack.parent.glob("camoufox.pre-*"))
+    assert "engine=True" in outcome
+
+
+def test_no_root_at_all_is_staged_and_moved_in(stack, tmp_path, monkeypatch):
+    monkeypatch.setattr(subprocess, "run", FakeRun(fetch=_install_pinned))
+    outcome = _tx(tmp_path).run()
+    assert (stack / ".0.5_FLAG").exists() and "engine=True" in outcome
+
+
+def test_stale_staging_from_a_killed_run_is_removed(stack, tmp_path, monkeypatch):
+    stale = stack.parent / ".camoufox-staging-99999"
+    (stale / "camoufox").mkdir(parents=True)
+    _install_pinned(stack)
+    monkeypatch.setattr(subprocess, "run", FakeRun())
+    _tx(tmp_path).run()
+    assert not stale.exists()
+
+
+def test_stale_staging_is_cleared_before_the_free_space_check(stack, tmp_path, monkeypatch):
+    stale = stack.parent / ".camoufox-staging-99999"
+    stale.mkdir()
+    seen = []
+    monkeypatch.setattr(provision, "preflight", lambda: seen.append(stale.exists()) or "low disk")
+    _tx(tmp_path).run()
+    assert seen == [False]
+
+
+def test_failed_rename_into_place_puts_the_legacy_engine_back(stack, tmp_path, monkeypatch):
+    _legacy_engine(stack)
+    tx = _tx(tmp_path)
+    staged = tmp_path / "staged-elsewhere" / "camoufox"  # rename target that cannot exist
+    real_rename = Path.rename
+
+    def rename(self, target):
+        if self == staged:
+            raise OSError(18, "Invalid cross-device link")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", rename)
+    with pytest.raises(OSError):
+        tx._swap_in(staged)
+    assert (stack / "camoufox-bin").read_text() == "binary"
+    assert tx.swapped is False
+
+
+def test_staged_engine_must_launch_before_the_swap(stack, tmp_path, monkeypatch):
+    """Files present is not usable: a staged engine that does not launch never
+    replaces the working one, and the packages go back."""
+    _legacy_engine(stack)
+    _versions(monkeypatch, OLD, NEW)
+    run = FakeRun(fetch=_install_pinned, fail=[lambda cmd: cmd[1:2] == ["-c"]])
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert (stack / "camoufox-bin").read_text() == "binary"  # legacy still in place
+    assert not list(stack.parent.glob("camoufox.pre-0.5-*"))
+    assert [c[3] for c in run.pip_calls()] == ["install", "uninstall"]
+    smoke_envs = [env for cmd, env in run.calls if cmd[1:2] == ["-c"]]
+    assert smoke_envs and ".camoufox-staging-" in smoke_envs[0]["XDG_CACHE_HOME"]
+    assert "engine=False" in outcome
+
+
+def test_a_set_override_is_reset_to_the_paired_build(stack, tmp_path, monkeypatch):
+    _install_pinned(stack)
+    (stack / "config.json").write_text(json.dumps({"channel": "official/prerelease"}))
+
+    def run(cmd, **kw):
+        if cmd[1:5] == ["-m", "camoufox", "set", "--release"]:
+            (stack / "config.json").write_text("{}")
+        return FakeRun()(cmd, **kw)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert json.loads((stack / "config.json").read_text()) == {}
+    assert "engine=True" in outcome
+
+
+def test_fetch_exit_zero_without_an_engine_is_a_failure(stack, tmp_path, monkeypatch):
+    """Measured: `camoufox fetch` with no network exits 0 and installs nothing."""
+    monkeypatch.setattr(subprocess, "run", FakeRun())
+    with pytest.raises(provision.ProvisionError, match="not ready after fetch"):
+        _tx(tmp_path).engine()
+
+
+def test_in_place_fetch_exit_zero_without_an_engine_is_a_failure(stack, tmp_path, monkeypatch):
+    stack.mkdir()
+    (stack / ".0.5_FLAG").touch()
+    monkeypatch.setattr(subprocess, "run", FakeRun())
+    with pytest.raises(provision.ProvisionError, match="not ready after fetch"):
+        _tx(tmp_path).engine()
+
+
+def test_smoke_never_launches_without_a_ready_engine(monkeypatch, tmp_path):
+    monkeypatch.setattr(provision, "camoufox_engine_status", lambda: NOT_READY)
+    ran = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: ran.append(a))
+    assert _tx(tmp_path).smoke() is False
+    assert ran == []
+
+
+def test_a_signal_during_the_fetch_leaves_no_stage_and_restores(
+    stack, tmp_path, monkeypatch, capsys
+):
+    _legacy_engine(stack)
+    _versions(monkeypatch, OLD, NEW)
+
+    def interrupted_fetch(install_dir, env):
+        install_dir.mkdir(parents=True)
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(1)  # the handler raises before this returns
+
+    run = FakeRun(fetch=interrupted_fetch)
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert "interrupted by signal SIGTERM" in capsys.readouterr().out
+    assert (stack / "camoufox-bin").read_text() == "binary"
+    assert not list(stack.parent.glob(".camoufox-staging-*"))
+    assert [c[3] for c in run.pip_calls()] == ["install", "uninstall"]
+    assert "engine=False" in outcome
+
+
+# ── review findings on this slice ─────────────────────────────────────────
+
+
+def test_a_signal_swallowed_by_a_status_read_still_stops_the_run(
+    stack, tmp_path, monkeypatch, capsys
+):
+    """camoufox_engine_status never raises, so the handler's one ProvisionError
+    can die inside it; the next step must still see the interrupt."""
+    _legacy_engine(stack)
+    _versions(monkeypatch, OLD, NEW)
+    real_status = engine._status
+    calls = []
+
+    def status_hit_by_sigterm(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(1)  # the handler raises here, inside the catch-all
+        return real_status(*a, **k)
+
+    monkeypatch.setattr(engine, "_status", status_hit_by_sigterm)
+    run = FakeRun(fetch=_install_pinned)
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert not [c for c, _ in run.calls if c[1:3] == ["-m", "camoufox"]], "never fetched"
+    assert (stack / "camoufox-bin").read_text() == "binary"
+    assert [c[3] for c in run.pip_calls()] == ["install", "uninstall"]
+    assert "interrupted" in capsys.readouterr().out
+    assert "engine=False" in outcome
+
+
+def test_an_in_place_engine_that_does_not_launch_rolls_the_packages_back(
+    stack, tmp_path, monkeypatch
+):
+    stack.mkdir()
+    (stack / ".0.5_FLAG").touch()
+    _versions(monkeypatch, {**NEW, "camoufox": "0.5.6"}, NEW)
+    _write_caps({"browser_automation": {"status": "active", "description": "d"}})
+    run = FakeRun(fetch=_install_pinned, fail=[lambda cmd: cmd[1:2] == ["-c"] and "AsyncCamoufox" in cmd[2]])
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert [c[3] for c in run.pip_calls()] == ["install"]
+    assert "camoufox==0.5.6" in run.pip_calls()[0]
+    assert "engine=True, launch=False" in outcome
+    assert "installed but did not launch" in outcome
+    caps = json.loads(provision.CAPABILITIES_FILE.read_text())
+    assert caps["browser_automation"]["status"] == "degraded"
+
+
+def test_a_signal_during_the_swap_waits_and_keeps_the_new_packages(
+    stack, tmp_path, monkeypatch
+):
+    """The renames run with signals held; the signal then lands after the swap,
+    when the new packages are the ones that match the engine in place."""
+    _legacy_engine(stack)
+    _versions(monkeypatch, OLD, NEW)
+    real_rename = Path.rename
+    sent = []
+
+    def rename(self, target):
+        if self == stack and not sent:
+            sent.append(1)
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(0.2)
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", rename)
+    run = FakeRun(fetch=_install_pinned)
+    monkeypatch.setattr(subprocess, "run", run)
+    _tx(tmp_path).run()
+    assert sent
+    assert (stack / ".0.5_FLAG").exists(), "the new engine is in place"
+    assert (stack.with_name(f"camoufox.pre-0.5-{provision._stamp()}") / "camoufox-bin").exists()
+    assert run.pip_calls() == [], "never rolled back over the swapped engine"
+
+
+def test_a_launch_that_hangs_is_a_failed_launch(stack, tmp_path, monkeypatch, capsys):
+    _install_pinned(stack)
+
+    def run(cmd, **kw):
+        if cmd[1:2] == ["-c"]:
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert _tx(tmp_path).smoke() is False
+    assert "did not launch within" in capsys.readouterr().out
+
+# ── a ready engine ────────────────────────────────────────────────────────
 
 
 def test_ready_engine_completes_the_run(stack, tmp_path, monkeypatch):
@@ -150,24 +431,29 @@ def test_ready_engine_completes_the_run(stack, tmp_path, monkeypatch):
     run = FakeRun()
     monkeypatch.setattr(subprocess, "run", run)
     outcome = _tx(tmp_path, install=True).run()
-    assert "ready (engine=True)" in outcome
+    assert "ready (engine=True, launch=True)" in outcome
     assert run.pip_calls() == []
+    assert not [c for c, _ in run.calls if c[1:3] == ["-m", "camoufox"]], "never fetched"
 
 
 # ── failure: the packages go back ─────────────────────────────────────────
 
 
-def test_engine_unfit_for_the_new_packages_restores_them(stack, tmp_path, monkeypatch):
-    """A pre-0.5 engine under the new 0.5.7 package: camoufox would delete it."""
+def test_fetch_failure_leaves_the_legacy_root_untouched_and_restores_packages(
+    stack, tmp_path, monkeypatch
+):
+    """Measured: `camoufox fetch` with no network exits 0 and installs nothing."""
     _legacy_engine(stack)
     mtime = stack.stat().st_mtime
     _versions(monkeypatch, OLD, NEW)
-    run = FakeRun()
+    run = FakeRun(fetch=lambda install_dir, env: install_dir.mkdir(parents=True))
     monkeypatch.setattr(subprocess, "run", run)
     outcome = _tx(tmp_path, install=True).run()
 
     assert (stack / "camoufox-bin").read_text() == "binary"
     assert stack.stat().st_mtime == mtime
+    assert not list(stack.parent.glob("camoufox.pre-*"))
+    assert not list(stack.parent.glob(".camoufox-staging-*"))
     assert run.pip_calls() == [
         [
             sys.executable,

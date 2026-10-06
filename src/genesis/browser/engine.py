@@ -53,8 +53,9 @@ OVERRIDDEN = "overridden"
 # What an operator does about any not-ready state. Deliberately run by hand, with
 # no browser open: the same fetch inside a tool call is what this module prevents.
 PROVISION_HINT = (
-    "install the `browser` extra and the Camoufox engine it pairs with "
-    "(`python -m camoufox fetch`) while no browser session is running"
+    "run scripts/install_browser_stack.sh (it installs the `browser` extra and the "
+    "Camoufox engine it pairs with, and rolls back on failure) while no browser "
+    "session is running"
 )
 
 # A provisioning run holds this EXCLUSIVE for its whole transaction; each local

@@ -1,4 +1,4 @@
-"""Provision the browser stack: install the ``browser`` extra as one transaction.
+"""Provision the browser stack: the ``browser`` extra and the Camoufox engine.
 
 ``python -m genesis.browser.provision run --root <repo> --lib <venv_setup.sh>`` is
 the whole transaction, in ONE process so nothing it learns has to be passed
@@ -9,20 +9,31 @@ its caller: problems print, the outcome line is printed last, and the
 Steps, in order (all under the browser-stack lock held EXCLUSIVE, so two runs
 never overlap and no browser launches mid-run; a running browser holds it SHARED):
   1. preflight: enough disk, and no browser running (an upgrade under a live
-     browser would change its packages under it). Anything it cannot determine
+     browser would swap its engine mid-use). Anything it cannot determine
      counts as "not safe": skip and say why. The installed
      camoufox/playwright/patchright versions are recorded in memory.
   2. install the ``browser`` extra through the worktree-guarded installer in
      scripts/lib/venv_setup.sh (its one home), then check the packages import,
      that camoufox carries a browser pin, and that every installed version
      satisfies the extra's ranges (the installer masks pip's exit status).
-  3. the engine: the Camoufox engine camoufox would select must be ready for
-     the packages now installed (genesis.browser.engine).
-  4. refresh ``browser_automation`` in ~/.genesis/capabilities.json, so the
+  3. the engine. A ``camoufox set`` choice of another build is reset to the
+     paired one first. Already ready: nothing to do. An install root in
+     camoufox 0.5's side-by-side layout: ``camoufox fetch`` in place (it adds a
+     version and deletes nothing). Anything else (a pre-0.5 engine, the residue
+     of an interrupted download, no root at all): fetch into a staging directory
+     next to the root, check the staged engine and launch it from there, then
+     swap: the pre-0.5 engine is renamed to ``<root>.pre-0.5-<date>`` (residue
+     is deleted) and the staged engine is renamed into place. camoufox 0.5's
+     own fetch deletes a pre-0.5 root BEFORE downloading; staging keeps the old
+     engine in place for the whole download, so only the two renames are not
+     atomic, and signals are held off while they run.
+  4. launch Camoufox headless once, with the new packages.
+  5. refresh ``browser_automation`` in ~/.genesis/capabilities.json, so the
      capability reflects the new state without a server restart.
-If step 2 or 3 fails (or the run is interrupted by SIGTERM, SIGINT or SIGHUP),
-the versions recorded in step 1 are reinstalled and any browser package the
-step added is removed, so the previous browser works again. Every step runs in
+If step 2, 3 or 4 fails (or the run is interrupted by SIGTERM, SIGINT or SIGHUP)
+before the swap, the root was never touched, so the only thing to undo is the
+packages: the versions recorded in step 1 are reinstalled, any browser package
+the step added is removed, and the old engine works again. Every step runs in
 its own process group, and an interrupt stops the whole group before the
 rollback starts; if a member survives even SIGKILL, the rollback is refused
 rather than run beside it.
@@ -32,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime as _dt
 import fcntl
 import importlib.metadata
 import json
@@ -48,6 +60,7 @@ from pathlib import Path
 
 from genesis.browser.engine import (
     BROWSER_LOCK_FILE,
+    OVERRIDDEN,
     EngineStatus,
     camoufox_engine_status,
     camoufox_install_dir,
@@ -75,6 +88,11 @@ MIN_FREE_BYTES = _min_free_bytes()
 # unattended long step (genesis-development, Timeout Policy). A 1.3 GB download
 # on a slow link legitimately takes tens of minutes.
 STEP_TIMEOUT_S = 7200
+# The launch smoke test is the exception, with a named failure: a browser that
+# cannot start (missing system libraries, a wedged display) hangs instead of
+# exiting, and the install must not hang with it. A healthy launch measured a
+# few seconds; five minutes is two orders of magnitude of slack.
+SMOKE_TIMEOUT_S = 300
 
 # Downloads are staged here, never in the default temp dir: inside a Claude Code
 # session TMPDIR is the shared, quota-capped cc-tmp volume (2 GB measured), and
@@ -124,6 +142,10 @@ def _say_err(text: str) -> None:
 # Set once our output is found broken: later steps (the rollback's pip) then
 # write to /dev/null instead of a dead pipe, where a write error could fail them.
 _output_broken = False
+
+
+def _stamp() -> str:
+    return _dt.datetime.now(_dt.UTC).strftime("%Y%m%d")
 
 
 def installed_versions() -> dict[str, str]:
@@ -283,8 +305,11 @@ def _default_capability_description() -> str:
         return CAPABILITY
 
 
-def refresh_capability(status: EngineStatus) -> None:
+def refresh_capability(status: EngineStatus, launched: bool | None = None) -> None:
     """Set ``browser_automation`` in capabilities.json from ``status``; never raises.
+
+    ``launched=False`` (the launch check failed) reports it degraded even when
+    the engine's files are in place.
 
     The server writes the file at startup; without this the capability would
     report the pre-upgrade state until the next restart. Skipped when the file
@@ -299,7 +324,7 @@ def refresh_capability(status: EngineStatus) -> None:
             return
         entry = data.get(CAPABILITY)
         entry = dict(entry) if isinstance(entry, dict) else {}
-        entry["status"] = "active" if status.ready else "degraded"
+        entry["status"] = "active" if status.ready and launched is not False else "degraded"
         if not entry.get("description"):
             entry["description"] = _default_capability_description()
         entry.pop("error", None)
@@ -431,7 +456,9 @@ class Transaction:
         self.repo_root = root
         self.lib = lib
         self.install = install
+        self.engine_root = camoufox_install_dir()
         self.previous: dict[str, str] = {}
+        self.swapped = False
         self.interrupted = False
         self.step_survived = False
         self.rolling_back = False
@@ -439,7 +466,20 @@ class Transaction:
         self.env = dict(os.environ)
         self.lock_fd: int | None = None
 
+    def _check_interrupt(self) -> None:
+        """Raise for a signal that a catch-all swallowed.
+
+        The handler raises once, and camoufox_engine_status (by design) never
+        raises: a signal landing inside a status read is caught there and only
+        ``self.interrupted`` remembers it. Checked before every step and before
+        the swap, so such a signal still stops the run. Not during the rollback,
+        whose pip must run whatever arrives.
+        """
+        if self.interrupted and not self.rolling_back:
+            raise ProvisionError("interrupted by a signal")
+
     def _run(self, cmd: list[str], *, env: dict[str, str] | None = None, **kw):
+        self._check_interrupt()
         fds = (self.lock_fd,) if self.lock_fd is not None else ()
         try:
             return _run_group(
@@ -500,17 +540,96 @@ class Transaction:
 
     # step 3
     def engine(self) -> None:
-        """The engine camoufox would select must suit the packages now installed.
-
-        This build does not fetch an engine, so new packages that need one fail
-        here and are rolled back, leaving the previous browser working.
-        """
         status = camoufox_engine_status()
-        if not status.ready:
-            raise ProvisionError(
-                f"the Camoufox engine does not suit the installed packages: {status.detail}"
+        if status.state == OVERRIDDEN:
+            # A bare `camoufox fetch` would fetch the overriding build, which the
+            # status (and so the launch guard) never accepts: it cannot converge.
+            _say(f"resetting to the paired Camoufox build: {status.detail}")
+            proc = self._run(
+                [sys.executable, "-m", "camoufox", "set", "--release"], timeout=STEP_TIMEOUT_S
             )
-        _say(f"Camoufox engine up to date ({status.detail})")
+            if proc.returncode != 0:
+                raise ProvisionError(f"`camoufox set --release` exited {proc.returncode}")
+            status = camoufox_engine_status()
+        if status.ready:
+            _say(f"Camoufox engine up to date ({status.detail})")
+            return
+        root = self.engine_root
+        if (root / ".0.5_FLAG").exists():
+            # camoufox 0.5's layout keeps versions side by side and its fetch
+            # deletes nothing here, so fetching in place is safe.
+            self._fetch(self.env)
+            status = camoufox_engine_status()
+            if not status.ready:
+                raise ProvisionError(
+                    f"the Camoufox engine is not ready after fetch: {status.detail}"
+                )
+            _say(f"Camoufox engine installed ({status.detail})")
+            return
+        self._stage_and_swap()
+
+    def _fetch(self, env: dict[str, str]) -> None:
+        _say("fetching the pinned Camoufox engine (1.3 GB download, 2.4 GB unpacked)...")
+        try:
+            self._run([sys.executable, "-m", "camoufox", "fetch"], env=env, timeout=STEP_TIMEOUT_S)
+        except subprocess.TimeoutExpired as exc:
+            raise ProvisionError(f"camoufox fetch did not finish in {STEP_TIMEOUT_S}s") from exc
+        # The exit code is not trusted: with no network, fetch has exited 0
+        # having installed nothing (measured). The engine status is the test.
+
+    def _stage_and_swap(self) -> None:
+        root = self.engine_root
+        # Same parent, so the same filesystem: the swap is two renames.
+        staging = root.parent / f".camoufox-staging-{os.getpid()}"
+        try:
+            if staging.exists():
+                shutil.rmtree(staging)
+            staging.mkdir(parents=True)
+            # camoufox puts its engines in platformdirs.user_cache_dir, which
+            # honours an absolute XDG_CACHE_HOME; its config stores relative paths.
+            self._fetch(dict(self.env, XDG_CACHE_HOME=str(staging)))
+            staged = staging / "camoufox"
+            status = camoufox_engine_status(install_dir=staged)
+            if not status.ready:
+                raise ProvisionError(
+                    f"the Camoufox engine is not ready after fetch: {status.detail}"
+                )
+            # Files present is not "usable": launch the staged engine before it
+            # replaces the working one, which stays until this passes.
+            if not self.smoke(env=dict(self.env, XDG_CACHE_HOME=str(staging)), install_dir=staged):
+                raise ProvisionError(
+                    "the staged Camoufox engine did not launch; the previous engine is untouched"
+                )
+            self._check_interrupt()
+            with _signals_held():
+                self._swap_in(staged)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        _say(f"Camoufox engine installed ({camoufox_engine_status().detail})")
+
+    def _swap_in(self, staged: Path) -> None:
+        root = self.engine_root
+        moved: Path | None = None
+        if root.exists() or root.is_symlink():
+            if (root / "version.json").is_file():
+                moved = root.with_name(f"{root.name}.pre-0.5-{_stamp()}")
+                if moved.exists():
+                    moved = moved.with_name(f"{moved.name}-{os.getpid()}")
+                root.rename(moved)
+            elif root.is_dir() and not root.is_symlink():
+                shutil.rmtree(root)  # residue of an interrupted download; nothing to keep
+            else:
+                root.unlink()
+        try:
+            staged.rename(root)
+        except OSError:
+            if moved is not None:
+                moved.rename(root)  # put the old engine back before reporting
+            raise
+        self.swapped = True
+        if moved is not None:
+            os.utime(moved)  # rename keeps the old mtime; retention ages it from today
+            _say(f"moved the pre-0.5 Camoufox engine aside to {moved}")
 
     def restore_packages(self) -> None:
         """Reinstall the versions recorded before the install, if they changed."""
@@ -524,8 +643,10 @@ class Transaction:
                 f"they exit (until then it reports the lock as held)"
             )
         previous = self.previous
-        if "camoufox" not in previous:
-            return  # nothing to go back to
+        if "camoufox" not in previous or self.swapped:
+            # Nothing to go back to, or the new engine is already in place and the
+            # new packages are the ones that match it.
+            return
         current = installed_versions()
         changed = any(current.get(name) != version for name, version in previous.items())
         # A package the step ADDED is removed too: patchright left beside the
@@ -557,6 +678,33 @@ class Transaction:
                     f"`{sys.executable} -m pip uninstall {' '.join(added)}` by hand"
                 )
 
+    # step 4
+    def smoke(self, env: dict[str, str] | None = None, install_dir: Path | None = None) -> bool:
+        status = (
+            camoufox_engine_status(install_dir=install_dir)
+            if install_dir is not None
+            else camoufox_engine_status()
+        )
+        if not status.ready:
+            return False  # never let the smoke launch trigger camoufox's own download
+        try:
+            proc = self._run(
+                [sys.executable, "-c", _SMOKE],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=SMOKE_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            _say(f"FAILED: Camoufox did not launch within {SMOKE_TIMEOUT_S}s")
+            return False
+        if proc.returncode != 0:
+            _say("FAILED: Camoufox did not launch. Missing system libraries are the usual cause:")
+            for line in (proc.stderr or proc.stdout).strip().splitlines()[-3:]:
+                _say(f"    {line}")
+            return False
+        return True
+
     def run(self) -> str:
         """Run every step under one lock; returns the outcome line (printed last)."""
         LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -584,7 +732,16 @@ class Transaction:
             finally:
                 self.lock_fd = None
 
+    def _clear_stale_staging(self) -> None:
+        # Under the lock no other run is staging, so any staging dir is left from
+        # a run that was killed outright (SIGKILL, power loss): about 2.4 GB.
+        for stale in self.engine_root.parent.glob(".camoufox-staging-*"):
+            shutil.rmtree(stale, ignore_errors=True)
+
     def _run_locked(self) -> str:
+        # Before the free-space check: a killed run's ~2.4 GB stage would
+        # otherwise keep every later run under the floor.
+        self._clear_stale_staging()
         reason = preflight()
         if reason:
             return self._finish(f"SKIPPED ({reason})")
@@ -606,12 +763,18 @@ class Transaction:
             self.interrupted = True
 
         previous_handlers = {sig: signal.signal(sig, _interrupted) for sig in _SIGNALS}
-        engine_ok = False
+        engine_ok = smoke_ok = False
         try:
             try:
                 self.install_extras()
                 self.engine()
                 engine_ok = True
+                # Inside the rollback on every engine path (already ready, fetched
+                # in place, or staged and swapped): new packages that cannot
+                # launch Camoufox go back, unless the swap has already happened.
+                if not self.smoke():
+                    raise ProvisionError("Camoufox did not launch with the installed packages")
+                smoke_ok = True
             except Exception as exc:  # noqa: BLE001 - every failure is handled the same way
                 # From here on a signal is recorded, never raised: a second Ctrl-C
                 # must not kill the rollback's pip midway through a write.
@@ -640,18 +803,39 @@ class Transaction:
                 "browser packages changed; restart running Claude Code sessions "
                 "before using their browser tools"
             )
-        state = "ready" if engine_ok else "DEGRADED"
-        return self._finish(f"{state} (engine={engine_ok})")
+        state = "ready" if (engine_ok and smoke_ok) else "DEGRADED"
+        return self._finish(
+            f"{state} (engine={engine_ok}, launch={smoke_ok})",
+            launched=smoke_ok if engine_ok else None,
+        )
 
     @staticmethod
-    def _finish(result: str, *, refresh: bool = True) -> str:
+    def _finish(result: str, *, refresh: bool = True, launched: bool | None = None) -> str:
         status = camoufox_engine_status()
         if refresh:
-            refresh_capability(status)
-        usable = "Camoufox usable" if status.ready else "Camoufox DOWN until this is re-run"
+            refresh_capability(status, launched)
+        if not status.ready:
+            usable = "Camoufox DOWN until this is re-run"
+        elif launched is False:
+            usable = "Camoufox installed but did not launch"
+        else:
+            usable = "Camoufox usable"
         outcome = f"browser stack: {result}; {usable}: {status.detail}"
         _say(outcome)
         return outcome
+
+
+_SMOKE = """
+import asyncio
+from camoufox.async_api import AsyncCamoufox
+
+async def main():
+    async with AsyncCamoufox(headless=True) as browser:
+        page = await browser.new_page()
+        await page.goto("about:blank")
+
+asyncio.run(main())
+"""
 
 
 def main(argv: list[str] | None = None) -> int:
