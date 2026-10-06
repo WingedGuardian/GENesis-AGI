@@ -493,3 +493,48 @@ def test_e2e_main_removed_value_stays_clean(tmp_path: Path):
     pf.write_text("MAINLEAK_[0-9]+\nPRLEAK_[0-9]+\n", encoding="utf-8")
     _merge_ref_with(repo, None)  # PR clean; main added-then-removed MAINLEAK
     assert _run_gate_pipeline(repo, pf) == 0  # CLEAN — main history not re-flagged
+
+
+def test_range_mode_prints_the_branch_range_for_the_history_scan(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """--range prints the git revision range instead of added lines, so the
+    gitleaks history step scans exactly the commits the private step scans."""
+    r = _branch_repo(tmp_path)
+    monkeypatch.chdir(r["repo"])
+    monkeypatch.setenv("EVENT_NAME", "push")
+    monkeypatch.setenv("LEAK_SCAN_RANGE", "branch")
+    monkeypatch.setenv("HEAD_SHA", r["tip"])
+    assert lsa.main(["--range"]) == lsa.EXIT_OK
+    assert capsys.readouterr().out.strip() == f"{r['A']}..HEAD"
+
+
+def test_range_mode_turns_a_single_commit_spec_into_that_commit_alone(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """A new-branch push with no known base scans one commit; its history form
+    is `<sha>^!`, which git log reads as that commit alone."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    tip = _commit(repo, "base.txt", "hello\n", "A")
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("EVENT_NAME", "push")
+    monkeypatch.delenv("LEAK_SCAN_RANGE", raising=False)
+    monkeypatch.setenv("HEAD_SHA", tip)
+    monkeypatch.setenv("PUSH_BEFORE", "0" * 40)
+    assert lsa.main(["--range"]) == lsa.EXIT_OK
+    assert capsys.readouterr().out.strip() == f"{tip}^!"
+
+
+def test_range_mode_still_fails_closed(tmp_path: Path, monkeypatch, capsys):
+    """An unresolvable range is an error in --range mode too, never empty."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _commit(repo, "base.txt", "hello\n", "A")
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("EVENT_NAME", "push")
+    monkeypatch.setenv("LEAK_SCAN_RANGE", "branch")
+    assert lsa.main(["--range"]) == lsa.EXIT_UNRESOLVABLE
+    assert capsys.readouterr().out == ""

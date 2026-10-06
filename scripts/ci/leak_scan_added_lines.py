@@ -198,6 +198,9 @@ def added_lines(spec: tuple[str, str], cwd: str | None = None) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # --range prints the git revision range instead of the added lines, for the
+    # gitleaks history step: one range definition for both scans.
+    print_range = "--range" in (sys.argv[1:] if argv is None else argv)
     event_name = os.environ.get("EVENT_NAME", "")
     push_before = os.environ.get("PUSH_BEFORE", "")
     head_sha = os.environ.get("HEAD_SHA", "")
@@ -219,6 +222,11 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_UNRESOLVABLE
     try:
         spec = resolve_scan_spec(event_name, push_before, head_sha, branch_push=scope == "branch")
+        if print_range:
+            kind, value = spec
+            # `X^!` is git's "commit X alone", the history form of `git show X`.
+            print(value if kind == "range" else f"{value}^!")
+            return EXIT_OK
         out = added_lines(spec)
     except RangeError as exc:
         print(

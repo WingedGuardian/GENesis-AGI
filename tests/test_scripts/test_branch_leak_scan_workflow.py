@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -81,20 +84,33 @@ def test_branch_job_is_not_named_leak_detector():
     assert _load(_BRANCH)["name"] != "CI"
 
 
-def test_branch_workflow_concurrency_is_one_run_per_branch():
+def test_branch_workflow_never_cancels_or_replaces_a_scan():
+    """No concurrency group at all: a cancelled (or replaced pending) run is a
+    push whose commits may never be scanned, because a force-push can rewrite
+    them out of the next run's merge-base..HEAD range after they were public."""
     doc = _load(_BRANCH)
-    conc = doc["concurrency"]
-    assert "${{ github.ref }}" in conc["group"]
-    assert conc["cancel-in-progress"] is True
+    assert "concurrency" not in doc
+    assert "concurrency" not in doc["jobs"]["branch-leak-scan"]
     assert doc["permissions"] == {"contents": "read"}
 
 
 def test_both_workflows_call_the_same_script_steps():
+    """The branch job runs every leak-detector step, plus the history scan right
+    after the tree scan. The required check is unchanged; the history step is
+    branch-only for now."""
     ci_steps = _script_steps(_load(_CI)["jobs"]["leak-detector"])
     branch_steps = _script_steps(_load(_BRANCH)["jobs"]["branch-leak-scan"])
     assert ci_steps, "leak-detector no longer calls scripts/ci/leak_scan.sh"
-    assert ci_steps == branch_steps
-    assert set(ci_steps) == _script_subcommands()
+    i = ci_steps.index("gitleaks") + 1
+    assert branch_steps == [*ci_steps[:i], "gitleaks-history", *ci_steps[i:]]
+    assert set(branch_steps) == _script_subcommands()
+
+
+def test_branch_history_scan_uses_the_branch_range():
+    steps = _load(_BRANCH)["jobs"]["branch-leak-scan"]["steps"]
+    (hist,) = [s for s in steps if str(s.get("run", "")).endswith("leak_scan.sh gitleaks-history")]
+    assert hist["env"]["LEAK_SCAN_RANGE"] == "branch"
+    assert hist["env"]["EVENT_NAME"] == "${{ github.event_name }}"
 
 
 def test_no_leak_scan_logic_left_inline_in_either_workflow():
@@ -150,6 +166,50 @@ def test_script_keeps_pins_checksum_and_redact():
         "GITLEAKS_SHA256=2f92ab3b8e08319ac30836c32b90818e01519c3a4982771e4f45a7f5607872f7" in text
     )
     assert "sha256sum -c -" in text
-    assert re.search(r"gitleaks\" detect --no-git --redact -c \.gitleaks\.toml", text)
+    assert re.search(r'"\$gl" detect --no-git --redact -c \.gitleaks\.toml', text)
+    assert re.search(r'"\$gl" git --redact -c \.gitleaks\.toml --log-opts="\$range"', text)
+    # Every gitleaks invocation redacts: these logs are public.
+    calls = re.findall(r'"\$gl" (?:detect|git) [^\n]*', text)
+    assert len(calls) == 2 and all("--redact" in c for c in calls)
     assert text.startswith("#!/usr/bin/env bash")
     assert "set -euo pipefail" in text
+
+
+def _scratch_tree(tmp_path: Path) -> Path:
+    """A minimal tree the real script can run in: the script itself (it cds to
+    its own repo root), the portability helper the class step calls, and files
+    holding synthetic findings."""
+    root = tmp_path / "t"
+    (root / "scripts" / "ci").mkdir(parents=True)
+    shutil.copy(_SCRIPT, root / "scripts" / "ci" / "leak_scan.sh")
+    shutil.copy(_ROOT / "scripts" / "check_portability.sh", root / "scripts")
+    (root / "src").mkdir()
+    (root / "src" / "a.py").write_text('OWNER = "someone@personal-domain.org"\n', encoding="utf-8")
+    (root / "src" / "b.py").write_text('P = "/home/somebody/genesis/data"\n', encoding="utf-8")
+    return root
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not installed")
+def test_email_scan_names_the_place_never_the_address(tmp_path: Path):
+    root = _scratch_tree(tmp_path)
+    cp = subprocess.run(
+        ["bash", str(root / "scripts" / "ci" / "leak_scan.sh"), "email"],
+        capture_output=True,
+        text=True,
+    )
+    assert cp.returncode == 1
+    assert "src/a.py:1" in cp.stdout
+    assert "personal-domain" not in cp.stdout + cp.stderr
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not installed")
+def test_class_scan_names_the_place_never_the_value(tmp_path: Path):
+    root = _scratch_tree(tmp_path)
+    cp = subprocess.run(
+        ["bash", str(root / "scripts" / "ci" / "leak_scan.sh"), "class"],
+        capture_output=True,
+        text=True,
+    )
+    assert cp.returncode == 0, "the class scan is advisory"
+    assert "::warning::class match at ./src/b.py:1" in cp.stdout
+    assert "somebody" not in cp.stdout + cp.stderr

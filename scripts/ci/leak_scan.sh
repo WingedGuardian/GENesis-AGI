@@ -14,6 +14,7 @@
 #   install          pinned scanner install (detect-secrets, ripgrep)
 #   detect-secrets   secret scan over src/ config/ scripts/ .github/
 #   gitleaks         whole-tree gitleaks scan (version + checksum pinned, --redact)
+#   gitleaks-history gitleaks over every commit in the scan range (branch pushes)
 #   class            advisory class scan (never gating)
 #   email            personal-email scan
 #   binary           tracked binary/data artifact scan
@@ -30,8 +31,9 @@
 
 set -euo pipefail
 
-# Run from the repository root whatever the caller's cwd.
-cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+# Run from the repository root whatever the caller's cwd. CDPATH is cleared so
+# `cd` cannot search it and land in a different tree.
+cd -- "$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 # Scratch directory for scanner output and the gitleaks download. CI uses /tmp;
 # a local run can point it elsewhere.
@@ -70,20 +72,47 @@ print(real)
   echo "Secret scan: CLEAN (0 findings)"
 }
 
-step_gitleaks() {
-  # Blocking. Covers the whole tree (incl. docs/) with the repo's
-  # .gitleaks.toml PII/infrastructure rules — the detect-secrets step only
-  # covers src/config/scripts/.github. Version+checksum pinned;
-  # --redact is MANDATORY: these logs are public, a found secret
-  # must never be echoed into them.
+_gitleaks_bin() {
+  # Version+checksum pinned download, once per job. --redact is MANDATORY on
+  # every gitleaks call: these logs are public, and a found secret must never
+  # be echoed into them.
   local GITLEAKS_VERSION=8.22.1
   local GITLEAKS_SHA256=2f92ab3b8e08319ac30836c32b90818e01519c3a4982771e4f45a7f5607872f7
-  curl -sSfL -o "$WORK/gitleaks.tgz" \
-    "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-  echo "${GITLEAKS_SHA256}  $WORK/gitleaks.tgz" | sha256sum -c -
-  tar -xzf "$WORK/gitleaks.tgz" -C "$WORK" gitleaks
-  "$WORK/gitleaks" detect --no-git --redact -c .gitleaks.toml --source .
+  if [[ ! -x "$WORK/gitleaks" ]]; then
+    curl -sSfL -o "$WORK/gitleaks.tgz" \
+      "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+    echo "${GITLEAKS_SHA256}  $WORK/gitleaks.tgz" | sha256sum -c - >&2
+    tar -xzf "$WORK/gitleaks.tgz" -C "$WORK" gitleaks
+  fi
+  printf '%s\n' "$WORK/gitleaks"
+}
+
+step_gitleaks() {
+  # Blocking. Covers the whole TREE (incl. docs/) with the repo's
+  # .gitleaks.toml PII/infrastructure rules — the detect-secrets step only
+  # covers src/config/scripts/.github.
+  local gl
+  gl="$(_gitleaks_bin)"
+  "$gl" detect --no-git --redact -c .gitleaks.toml --source .
   echo "Leak scan (gitleaks): CLEAN"
+}
+
+step_gitleaks_history() {
+  # Blocking. The tree scan above reads only the tip, so a secret added and
+  # then removed inside the branch passes it while staying in published
+  # history. This scans every commit in the scan range with the same rules.
+  # The range comes from scripts/ci/leak_scan_added_lines.py (the private
+  # step's own definition; it fails closed on an unresolvable range), so both
+  # history scans cover the same commits.
+  local gl range
+  gl="$(_gitleaks_bin)"
+  range="$(python3 scripts/ci/leak_scan_added_lines.py --range)"
+  if [[ -z "$range" ]]; then
+    echo "::error::gitleaks history: empty scan range. Failing closed."
+    exit 3
+  fi
+  "$gl" git --redact -c .gitleaks.toml --log-opts="$range" .
+  echo "Leak scan (gitleaks history, $range): CLEAN"
 }
 
 step_class() {
@@ -112,7 +141,9 @@ step_class() {
     . 2>/dev/null || true)"
   findings="$(printf '%s\n%s\n' "$net" "$paths" | grep -vE '^[[:space:]]*$' || true)"
   if [[ -n "$findings" ]]; then
-    printf '%s\n' "$findings" | sed 's/^/::warning::/'
+    # path:line only: these logs are public and outlive the branch, so the
+    # matched text itself is never printed.
+    printf '%s\n' "$findings" | cut -d: -f1,2 | sed 's/^/::warning::class match at /'
     n="$(printf '%s\n' "$findings" | wc -l)"
     echo "Class scan: $n advisory finding(s) — non-gating."
   else
@@ -140,8 +171,9 @@ step_email() {
       || true
   )
   if [[ -n "$hits" ]]; then
-    echo "::error::Email scan found personal email addresses:"
-    printf '%s\n' "$hits"
+    # path:line only: these logs are public, so the address is never printed.
+    echo "::error::Email scan found $(printf '%s\n' "$hits" | wc -l) personal email address(es) at:"
+    printf '%s\n' "$hits" | cut -d: -f1,2
     exit 1
   fi
   echo "Email scan: CLEAN"
@@ -207,7 +239,11 @@ step_private() {
   added="$(python3 scripts/ci/leak_scan_added_lines.py)"
   body=""
   if [[ "${EVENT_NAME-}" == "pull_request" ]]; then
-    body="$(gh pr view "$PR_NUMBER" --json body -q .body 2>/dev/null || echo '')"
+    # Fail closed: an unreadable body is unscanned text, not an empty one.
+    if ! body="$(gh pr view "$PR_NUMBER" --json body -q .body)"; then
+      echo "::error::private-pattern scan: could not read the PR body. Failing closed."
+      exit 3
+    fi
   fi
 
   printf '%s\n%s\n' "$added" "$body" | python3 scripts/ci/private_pattern_scan.py --patterns "$pf"
@@ -217,12 +253,13 @@ case "${1-}" in
   install)        step_install ;;
   detect-secrets) step_detect_secrets ;;
   gitleaks)       step_gitleaks ;;
+  gitleaks-history) step_gitleaks_history ;;
   class)          step_class ;;
   email)          step_email ;;
   binary)         step_binary ;;
   private)        step_private ;;
   *)
-    echo "usage: $0 {install|detect-secrets|gitleaks|class|email|binary|private}" >&2
+    echo "usage: $0 {install|detect-secrets|gitleaks|gitleaks-history|class|email|binary|private}" >&2
     exit 2
     ;;
 esac

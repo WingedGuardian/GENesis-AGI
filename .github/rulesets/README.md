@@ -101,8 +101,14 @@ hold the repository.
 
 `branch-leak-scan` (the `Branch leak scan` workflow) is also absent on
 purpose. It runs the same steps as `leak-detector` — both call
-`scripts/ci/leak_scan.sh` — on every push to every non-main branch, so a branch
-with no PR is still scanned. A rule on `main` has nothing to require from it:
+`scripts/ci/leak_scan.sh` — plus a gitleaks scan of the branch's history, on
+every push to every non-main branch, so a branch with no PR is still scanned.
+Every push gets its own run (no concurrency group), because a cancelled run's
+commits can be force-pushed out of the next run's range after they were public.
+A push runs the workflow file at the pushed commit, so a branch cut from a main
+older than this workflow, or one that deletes it, is not scanned by it: it
+catches accidental leaks, beside GitHub's own secret scanning and push
+protection, and is not a boundary. A rule on `main` has nothing to require from it:
 `leak-detector` already covers every pull request, and the branch job is named
 differently precisely so a push to a PR's branch never puts a second
 `leak-detector` check on the same head commit. A red `branch-leak-scan` on a
