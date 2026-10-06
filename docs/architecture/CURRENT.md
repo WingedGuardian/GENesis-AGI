@@ -1424,8 +1424,9 @@ verified: 246808153 2026-09-24
   empty completion is a 502 rather than a blank turn); Agent Zero adapter
   optional.
 - **browser/**: profile/state layer only (persistent
-  `~/.genesis/browser-profile`, `BrowserLayer` enum, pgrep patterns as the
-  single source of process detection). The automation TOOLS live in
+  `~/.genesis/browser-profile`, `BrowserLayer` enum (the navigate result's
+  `layer` values, numbered as in `mcp/health/browser.py`), pgrep patterns as
+  the single source of process detection). The automation TOOLS live in
   `mcp/health/browser.py`.
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
