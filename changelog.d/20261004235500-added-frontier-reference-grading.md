@@ -1,0 +1,1 @@
+- Qualification can use declared frontier-model references with a confidence threshold, evidence and uncertainty checks, human adjudication, and corpus-wide propagation of human feedback. Human and machine labels stay distinct; paid frontier runs require current guidance and a real human corpus approval.

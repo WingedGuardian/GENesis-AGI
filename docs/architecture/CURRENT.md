@@ -2426,6 +2426,27 @@ modules: [learning, eval, experimentation, feedback, calibration, ledger]
 verified: 788dd9a9 2026-09-06
 ```
 
+- **Model qualification is keyed by routing alias** (`eval/qualification`,
+  `python -m genesis.eval.qualification check|run|report`). Rubrics go through
+  `calibration.run_calibration` with `PinnedRouter`, a one-upstream, no-fallback
+  stand-in for `Router` (which would write production cost rows); J9 relevance and
+  cross-type novelty keep a small loop over the production `_judge_relevance` and
+  `_principle_is_novel` paths. Spend is bounded by a dedicated credit-limited
+  OpenRouter key plus a request cap counted from append-only `dispatch` lines;
+  paid answers carry a prompt hash and are reused. Failures, unsettled dispatches
+  and wrong identities stop new requests across restart. Shared offline preflight
+  verifies actual prompts, candidate reachability and effective parameters before
+  execution. Saved novelty answers replay both procedure storage paths in disposable
+  SQLite, reporting current and hypothetical promoted behavior separately. References default to human labels. An explicit frontier-assisted policy
+  admits source-backed high-confidence model grades without calling them human;
+  uncertainty goes to human review. Human feedback requires a reasoned applicability
+  check across the whole corpus, including previously accepted cases. Current-policy
+  and input/decision hashes reject stale reviews; paid frontier runs require actual
+  human approval bound to corpus and policy. `review-references` checks this queue
+  offline; shared calibration remains strict human-only. `report --against` pairs two
+  aliases. Synthetic tests prove mechanics only; real labels, a paid run and route
+  promotion remain owner steps. See `docs/reference/model-qualification.md`.
+
 - **The graders are TOLD the response status; they must never infer it.** The
   triage/outcome/delta graders each judge an `InteractionSummary`, and the
   summarizer (`learning/triage/summarizer.py`) sizes `response_text` for them.
