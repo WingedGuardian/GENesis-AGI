@@ -296,6 +296,104 @@ def test_a_set_override_is_reset_to_the_paired_build(stack, tmp_path, monkeypatc
     assert "engine=True" in outcome
 
 
+def test_a_failed_run_puts_the_camoufox_set_choice_back(stack, tmp_path, monkeypatch):
+    """Devin + Codex (#2952, #2953): `set --release` forgets channel, pinned,
+    pinned_sha and active_version; a rollback before the swap restored only
+    the packages, so the operator's choice was lost."""
+    stack.mkdir()
+    (stack / ".0.5_FLAG").touch()
+    choice = '{"channel": "official/prerelease", "pinned": "157.0-alpha.1"}'
+    (stack / "config.json").write_text(choice)
+    _versions(monkeypatch, {**NEW, "camoufox": "0.5.6"}, NEW)
+    fake = FakeRun()  # its fetch installs nothing: "not ready after fetch"
+
+    def run(cmd, **kw):
+        if cmd[1:5] == ["-m", "camoufox", "set", "--release"]:
+            (stack / "config.json").write_text("{}")
+        return fake(cmd, **kw)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert "engine=False" in outcome
+    assert (stack / "config.json").read_text() == choice
+
+
+def test_an_in_place_rollback_leaves_the_old_engine_selected(stack, tmp_path, monkeypatch):
+    """Review finding on this slice: the in-place fetch records the new engine
+    as active_version (multiversion.set_active) and leaves its directory, so a
+    rolled-back unpinned package went on selecting the new engine."""
+    stack.mkdir()
+    (stack / ".0.5_FLAG").touch()
+    old = stack / "browsers" / "official" / "150.0.2-beta.25"
+    old.mkdir(parents=True)
+    (old / "version.json").write_text(json.dumps({"version": "150.0.2", "release": "beta.25"}))
+    before = '{"active_version": "browsers/official/150.0.2-beta.25"}'
+    (stack / "config.json").write_text(before)
+    _versions(monkeypatch, {**NEW, "camoufox": "0.5.6"}, NEW)
+
+    def fetch(install_dir, env):
+        _install_pinned(install_dir)
+        (install_dir / "config.json").write_text(
+            json.dumps({"active_version": f"browsers/official/{PIN.version}-{PIN.build}"})
+        )
+
+    smoke_fails = [lambda cmd: cmd[1:2] == ["-c"] and "AsyncCamoufox" in cmd[2]]
+    monkeypatch.setattr(subprocess, "run", FakeRun(fetch=fetch, fail=smoke_fails))
+    outcome = _tx(tmp_path).run()
+    assert "launch=False" in outcome
+    assert (stack / "config.json").read_text() == before
+    assert sorted(p.name for p in (stack / "browsers" / "official").iterdir()) == [
+        "150.0.2-beta.25"
+    ]
+
+
+def test_a_failed_root_restore_still_restores_the_packages(stack, tmp_path, monkeypatch, capsys):
+    """Review finding on this slice: a failed config write (ENOSPC after a
+    2.4 GB fetch) stopped the package restore that follows it."""
+    stack.mkdir()
+    (stack / ".0.5_FLAG").touch()
+    (stack / "config.json").write_text('{"channel": "official/prerelease"}')
+    _versions(monkeypatch, {**NEW, "camoufox": "0.5.6"}, NEW)
+
+    def no_space(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(provision, "atomic_write_text", no_space)
+    run = FakeRun()
+    monkeypatch.setattr(subprocess, "run", run)
+    _tx(tmp_path).run()
+    assert [c[3] for c in run.pip_calls()] == ["install"]
+    assert "official/prerelease" in capsys.readouterr().out, "the choice is printed to re-apply"
+
+
+def test_a_truncated_pinned_engine_is_replaced_not_skipped(stack, tmp_path, monkeypatch):
+    """Codex (#2953): camoufox's fetch returns early when the version directory
+    and its version.json exist, so a truncated pinned engine was never repaired."""
+    stack.mkdir()
+    (stack / ".0.5_FLAG").touch()
+    truncated = stack / "browsers" / "official" / f"{PIN.version}-{PIN.build}-09effb44"
+    truncated.mkdir(parents=True)
+    (truncated / "version.json").write_text(
+        json.dumps({"version": PIN.version, "release": PIN.build})
+    )
+    # Another engine with no executable is not the pin's, so it stays.
+    other = stack / "browsers" / "official" / "150.0.2-beta.25"
+    other.mkdir(parents=True)
+    (other / "version.json").write_text(json.dumps({"version": "150.0.2", "release": "beta.25"}))
+
+    def fetch(install_dir, env):
+        # multiversion.install_versioned without replace: skip what is there.
+        if any((install_dir / "browsers" / "official").glob(f"{PIN.version}-{PIN.build}*")):
+            return
+        _install_pinned(install_dir)
+
+    monkeypatch.setattr(subprocess, "run", FakeRun(fetch=fetch))
+    outcome = _tx(tmp_path).run()
+    assert "engine=True" in outcome, outcome
+    assert not truncated.exists()
+    assert other.is_dir()
+
+
 def test_fetch_exit_zero_without_an_engine_is_a_failure(stack, tmp_path, monkeypatch):
     """Measured: `camoufox fetch` with no network exits 0 and installs nothing."""
     monkeypatch.setattr(subprocess, "run", FakeRun())
@@ -386,9 +484,33 @@ def test_an_in_place_engine_that_does_not_launch_rolls_the_packages_back(
     assert [c[3] for c in run.pip_calls()] == ["install"]
     assert "camoufox==0.5.6" in run.pip_calls()[0]
     assert "engine=True" in outcome and "launch=False" in outcome
-    assert "installed but did not launch" in outcome
+    # The root goes back to how it was (no engine): the old unpinned package
+    # must not go on to select the engine the failed run fetched.
+    assert not (stack / "browsers" / "official" / f"{PIN.version}-{PIN.build}").exists()
     caps = json.loads(provision.CAPABILITIES_FILE.read_text())
     assert caps["browser_automation"]["status"] == "degraded"
+
+
+def test_a_swapped_engine_that_then_fails_to_launch_is_reported_installed(
+    stack, tmp_path, monkeypatch
+):
+    """After the swap the new packages stay (they match the engine in place), so
+    a failed final launch reports the engine installed but not launching."""
+    _legacy_engine(stack)
+    _versions(monkeypatch, OLD, NEW)
+    fake = FakeRun(fetch=_install_pinned)
+
+    def run(cmd, env=None, **kw):
+        staged = env is not None and ".camoufox-staging-" in env.get("XDG_CACHE_HOME", "")
+        if cmd[1:2] == ["-c"] and "AsyncCamoufox" in cmd[2] and not staged:
+            fake.calls.append((cmd, env))
+            return SimpleNamespace(returncode=1, stdout="", stderr="no display")
+        return fake(cmd, env=env, **kw)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert "launch=False" in outcome and "installed but did not launch" in outcome
+    assert fake.pip_calls() == []
 
 
 def test_a_signal_during_the_swap_waits_and_keeps_the_new_packages(stack, tmp_path, monkeypatch):

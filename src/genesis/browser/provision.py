@@ -31,9 +31,11 @@ never overlap and no browser launches mid-run; a running browser holds it SHARED
   5. refresh ``browser_automation`` in ~/.genesis/capabilities.json, so the
      capability reflects the new state without a server restart.
 If step 2, 3 or 4 fails (or the run is interrupted by SIGTERM, SIGINT or SIGHUP)
-before the swap, the root was never touched, so the only thing to undo is the
-packages: the versions recorded in step 1 are reinstalled, any distribution the
-step added is removed, and the old engine works again. Every step runs in
+before the swap, the root's existing engines were never touched, so what is
+undone is the packages (the versions recorded in step 1 are reinstalled, any
+distribution the step added is removed) and, for a 0.5 root, its config.json and
+any engine directory the run fetched into it; the old engine works again. Every
+step runs in
 its own process group, and an interrupt stops the whole group before the
 rollback starts; if a member survives even SIGKILL, the rollback is refused
 rather than run beside it.
@@ -60,6 +62,7 @@ import traceback
 from collections.abc import Callable
 from pathlib import Path
 
+from genesis.browser import engine as _engine
 from genesis.browser.engine import (
     BROWSER_LOCK_FILE,
     OVERRIDDEN,
@@ -68,6 +71,7 @@ from genesis.browser.engine import (
     camoufox_install_dir,
     camoufox_pin,
 )
+from genesis.util.atomic import atomic_write_text
 
 
 # MEASURED 2026-10-04 on a sandboxed live upgrade: the Camoufox 156 engine is a
@@ -555,6 +559,8 @@ class Transaction:
         self.engine_root = camoufox_install_dir()
         self.previous: dict[str, str | None] = {}
         self.swapped = False
+        # (config.json text or None if absent, engine dirs) of a 0.5 root.
+        self.root_snapshot: tuple[str | None, set[Path]] | None = None
         self.interrupted = False
         self.step_survived = False
         self.rolling_back = False
@@ -639,6 +645,7 @@ class Transaction:
 
     # step 3
     def engine(self) -> None:
+        self._snapshot_root()
         status = camoufox_engine_status()
         if status.state == OVERRIDDEN:
             # A bare `camoufox fetch` would fetch the overriding build, which the
@@ -657,6 +664,7 @@ class Transaction:
         if (root / ".0.5_FLAG").exists():
             # camoufox 0.5's layout keeps versions side by side and its fetch
             # deletes nothing here, so fetching in place is safe.
+            self._drop_truncated_pin()
             self._fetch(self.env)
             status = camoufox_engine_status()
             if not status.ready:
@@ -666,6 +674,55 @@ class Transaction:
             _say(f"Camoufox engine installed ({status.detail})")
             return
         self._stage_and_swap()
+
+    def _engine_dirs(self) -> set[Path]:
+        return {p for p in (self.engine_root / "browsers").glob("*/*") if p.is_dir()}
+
+    def _snapshot_root(self) -> None:
+        """Record a 0.5 root's config.json and engine directories.
+
+        Both `set --release` (forgetting channel, pinned, pinned_sha and
+        active_version) and the in-place fetch (multiversion.set_active, plus a
+        new version directory) change them; a rollback before any swap puts
+        them back, so the restored package selects the engine it had.
+        """
+        root = self.engine_root
+        if not (root / ".0.5_FLAG").exists():
+            return
+        config = root / "config.json"
+        self.root_snapshot = (config.read_text() if config.exists() else None, self._engine_dirs())
+
+    def _restore_root(self) -> None:
+        """Never raises: a failure here must not stop the package restore."""
+        if self.root_snapshot is None or self.swapped:
+            return
+        config_text, dirs = self.root_snapshot
+        config = self.engine_root / "config.json"
+        try:
+            for added in sorted(self._engine_dirs() - dirs):
+                _say(f"removing the engine this run fetched: {added}")
+                shutil.rmtree(added)
+            if config_text is None:
+                config.unlink(missing_ok=True)
+            else:
+                atomic_write_text(config, config_text)
+        except OSError as exc:
+            _say(
+                f"could not put {self.engine_root} back ({exc}); its config.json was: {config_text}"
+            )
+
+    def _drop_truncated_pin(self) -> None:
+        """Remove a pinned engine directory that has no executable.
+
+        camoufox's fetch skips a version directory whose version.json exists
+        (multiversion.install_versioned, and its CLI cannot ask for a
+        replacement), so a truncated extraction would never be repaired.
+        """
+        pin = camoufox_pin()
+        for eng in _engine._installed_engines(self.engine_root):
+            if pin is not None and eng.matches(pin) and not eng.executable:
+                _say(f"removing the incomplete Camoufox engine at {eng.path}")
+                shutil.rmtree(eng.path)
 
     def _fetch(self, env: dict[str, str]) -> None:
         _say("fetching the pinned Camoufox engine (1.3 GB download, 2.4 GB unpacked)...")
@@ -703,7 +760,8 @@ class Transaction:
             with _signals_held():
                 self._swap_in(staged)
         finally:
-            shutil.rmtree(staging, ignore_errors=True)
+            if not self.step_survived:  # a surviving fetch may still be unpacking there
+                shutil.rmtree(staging, ignore_errors=True)
         _say(f"Camoufox engine installed ({camoufox_engine_status().detail})")
 
     def _swap_in(self, staged: Path) -> None:
@@ -747,8 +805,15 @@ class Transaction:
                 f"so the previous browser packages were NOT restored (their temp dir "
                 f"{self.tmpdir} is kept); re-run scripts/install_browser_stack.sh once "
                 f"they exit (until then it reports the lock as held)"
+                + (
+                    f"; {self.engine_root}/config.json was not put back either, it was: "
+                    f"{self.root_snapshot[0]}"
+                    if self.root_snapshot is not None and not self.swapped
+                    else ""
+                )
             )
         previous = self.previous
+        self._restore_root()
         if self.swapped:
             # The new engine is already in place, and the new packages are the
             # ones that match it.
@@ -774,7 +839,7 @@ class Transaction:
                     f"pip exited {proc.returncode} restoring {' '.join(pins)}; run "
                     f"`{sys.executable} -m pip install --no-deps {' '.join(pins)}` by hand"
                 )
-            _say(f"restored {' '.join(pins)}; the previous Camoufox engine was never touched")
+            _say(f"restored {' '.join(pins)}")
         if added:
             _say(f"removing browser packages this run added: {' '.join(added)}")
             proc = self._run(
