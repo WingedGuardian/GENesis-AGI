@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
+import os
 import re
 import signal
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -25,6 +26,7 @@ def _clear_all_browser_state():
     browser._page = None
     browser._active_page = None
     browser._collaborate_mode = False
+    browser._last_used = 0.0  # the idle test drives it with a fake clock
     browser._browser_lock = asyncio.Lock()
     # Remote CDP state
     browser._remote_pw = None
@@ -32,6 +34,8 @@ def _clear_all_browser_state():
     browser._remote_page = None
     browser._remote_cdp_url = None
     browser._remote_last_url = None
+    browser._remote_target_ids = {}
+    browser._remote_inflight = set()
     # VNC verification flag — FIX 3 tests toggle it; reset to avoid leak
     browser._vnc_verified = False
 
@@ -203,6 +207,335 @@ class TestToolTimeout:
 
         with pytest.raises(ValueError, match="boom"):
             await browser._with_tool_timeout(broken(), 5.0, "test_op")
+
+
+# ---------------------------------------------------------------------------
+# B5: browser_fill fails only on a STALL, never on total length.
+# ---------------------------------------------------------------------------
+
+_REAL_SLEEP = asyncio.sleep
+
+
+def _typing_page(key_latency: float = 0.0, hang_at: int | None = None):
+    """A remote-CDP page (per-keystroke path) whose key presses take
+    ``key_latency`` seconds; keystroke ``hang_at`` (1-based) never returns."""
+    page = AsyncMock()
+    page.url = "https://form.example"
+    calls = {"down": 0}
+
+    async def down(_char):
+        calls["down"] += 1
+        if hang_at is not None and calls["down"] == hang_at:
+            await asyncio.Event().wait()  # never set: a hung browser call
+        await _REAL_SLEEP(key_latency)
+
+    page.keyboard.down = AsyncMock(side_effect=down)
+    page.keyboard.up = AsyncMock()
+    page.is_closed = MagicMock(return_value=False)
+    browser._active_page = page
+    browser._remote_page = page
+    browser._remote_browser = _mock_remote_browser(connected=True)
+    browser._remote_last_url = page.url
+    return page, calls
+
+
+async def _instant_sleep(_s):
+    await _REAL_SLEEP(0)
+
+
+class TestFillStallWatchdog:
+    @pytest.mark.asyncio
+    async def test_a_hung_keystroke_fails_and_resets_the_page(self):
+        page, _ = _typing_page(hang_at=3)
+        with (
+            patch.object(browser, "_FILL_STALL_S", 0.2),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            result = await browser._impl_browser_fill("#bio", "hello")
+        assert "stalled" in result["error"]
+        assert "keystroke 3 of 5" in result["error"]
+        assert browser._active_page is None
+
+    @pytest.mark.asyncio
+    async def test_a_long_fill_that_keeps_progressing_is_never_cut_short(self):
+        """Total time far beyond the stall bound is fine while every keystroke
+        returns: 40 keys x 20 ms = 0.8 s against a 0.2 s stall bound, so the
+        bound is per step, not on the whole fill."""
+        page, calls = _typing_page(key_latency=0.02)
+        with (
+            patch.object(browser, "_FILL_STALL_S", 0.2),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            result = await browser._impl_browser_fill("#bio", "x" * 40)
+        assert result.get("filled") == "#bio", result
+        assert calls["down"] == 40
+
+    @pytest.mark.asyncio
+    async def test_a_hung_clear_step_is_bounded_too(self):
+        page, _ = _typing_page()
+
+        async def hang(*_a, **_k):
+            await asyncio.Event().wait()
+
+        page.fill = AsyncMock(side_effect=hang)
+        with (
+            patch.object(browser, "_FILL_STALL_S", 0.2),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+        ):
+            result = await browser._impl_browser_fill("#bio", "hi")
+        assert "clearing the field" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_the_tool_has_no_length_derived_deadline(self):
+        """No deadline of any spelling wraps the fill: while the impl runs, the
+        event loop's clock jumps 10,000 s, past any length-derived cap, and the
+        tool must still return the impl's result."""
+
+        async def slow_impl(_selector, _value):
+            loop = asyncio.get_running_loop()
+            real_time = loop.time
+            loop.time = lambda: real_time() + 10_000.0
+            try:
+                for _ in range(5):  # let any armed deadline fire
+                    await _REAL_SLEEP(0)
+            finally:
+                del loop.time
+            return {"filled": "#bio"}
+
+        with patch.object(browser, "_impl_browser_fill", new=slow_impl):
+            fn = getattr(browser.browser_fill, "fn", browser.browser_fill)
+            result = await fn("#bio", "y" * 5000)
+        assert result == {"filled": "#bio"}
+
+    def test_the_stall_bound_is_the_justified_value(self):
+        assert browser._FILL_STALL_S == 30.0
+
+    @pytest.mark.asyncio
+    async def test_a_fill_longer_than_the_idle_timeout_is_never_idle(self):
+        """With no overall deadline a fill can outlast _IDLE_TIMEOUT_S. Every
+        completed step must count as activity, or the idle watcher reclaims
+        the browser mid-fill. Simulated clock: each keystroke takes 200 s, so
+        40 keys span 8,000 s, more than twice the idle timeout."""
+        now = [1000.0]
+        page, calls = _typing_page()
+        idle_seen = []
+
+        async def slow_down(_char):
+            calls["down"] += 1
+            now[0] += 200.0
+            # The idle watcher's own predicate, against the real constant.
+            idle_seen.append(now[0] - browser._last_used >= browser._IDLE_TIMEOUT_S)
+
+        page.keyboard.down = AsyncMock(side_effect=slow_down)
+        with (
+            patch.object(browser, "time", MagicMock(monotonic=lambda: now[0])),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            result = await browser._impl_browser_fill("#bio", "x" * 40)
+        assert result.get("filled") == "#bio", result
+        assert now[0] - 1000.0 > 2 * browser._IDLE_TIMEOUT_S
+        assert calls["down"] == 40
+        assert not any(idle_seen), f"idle at keystroke {idle_seen.index(True) + 1}"
+
+    @pytest.mark.asyncio
+    async def test_a_stall_does_not_discard_a_page_navigated_meanwhile(self):
+        """The fill releases _browser_lock before typing, so a browser_navigate
+        can replace the active page while a keystroke hangs. The stall must
+        reset only the page that stalled."""
+        page, calls = _typing_page()
+        newer = MagicMock()
+
+        async def hang_after_navigate(_char):
+            calls["down"] += 1
+            browser._active_page = newer  # a concurrent browser_navigate
+            await asyncio.Event().wait()
+
+        page.keyboard.down = AsyncMock(side_effect=hang_after_navigate)
+        with (
+            patch.object(browser, "_FILL_STALL_S", 0.2),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+        ):
+            result = await browser._impl_browser_fill("#bio", "hi")
+        assert "stalled" in result["error"]
+        assert browser._active_page is newer
+        assert "reset" not in result["error"]
+
+
+# Claude Code's default idle timeout for a stdio MCP tool call: it aborts a call
+# that sends no response or progress for this long (READ in the pinned CC binary,
+# 2.1.280: CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT, else 1,800,000 ms for stdio).
+_CC_STDIO_IDLE_S = 1800.0
+
+
+class TestFillKeepsTheClientAlive:
+    """A fill longer than the MCP client's idle timeout must report progress,
+    or the client cancels it mid-entry and leaves a partially filled field."""
+
+    @staticmethod
+    def _fake_clock_fill(key_seconds: float):
+        now = [1000.0]
+        page, calls = _typing_page()
+
+        async def slow_down(_char):
+            calls["down"] += 1
+            now[0] += key_seconds
+
+        page.keyboard.down = AsyncMock(side_effect=slow_down)
+        ctx = MagicMock()
+        reports = []
+
+        async def report_progress(progress, total=None, message=None):
+            reports.append((now[0], progress))
+
+        ctx.report_progress = AsyncMock(side_effect=report_progress)
+        return now, calls, ctx, reports
+
+    @pytest.mark.asyncio
+    async def test_a_fill_longer_than_the_client_idle_timeout_reports_progress(self):
+        """40 keystrokes of 200 s each span 8,000 s, over four times the client's
+        idle timeout. No silent gap may reach it, and progress must increase."""
+        now, calls, ctx, reports = self._fake_clock_fill(200.0)
+        fn = getattr(browser.browser_fill, "fn", browser.browser_fill)
+        with (
+            patch.object(browser, "time", MagicMock(monotonic=lambda: now[0])),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            result = await fn("#bio", "x" * 40, ctx)
+        assert result.get("filled") == "#bio", result
+        assert calls["down"] == 40
+        stamps = [1000.0] + [t for t, _ in reports] + [now[0]]
+        gaps = [b - a for a, b in zip(stamps, stamps[1:], strict=False)]
+        assert max(gaps) < _CC_STDIO_IDLE_S, f"silent for {max(gaps):.0f}s"
+        values = [p for _, p in reports]
+        assert values == sorted(set(values)), values
+
+    @pytest.mark.asyncio
+    async def test_progress_is_throttled_not_sent_per_keystroke(self):
+        """Keystrokes of 1 s each: progress goes out about every
+        _FILL_PROGRESS_EVERY_S, not twice per character."""
+        now, _calls, ctx, reports = self._fake_clock_fill(1.0)
+        fn = getattr(browser.browser_fill, "fn", browser.browser_fill)
+        with (
+            patch.object(browser, "time", MagicMock(monotonic=lambda: now[0])),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            await fn("#bio", "x" * 100, ctx)
+        expected = 100 / browser._FILL_PROGRESS_EVERY_S
+        assert expected / 2 <= len(reports) <= expected + 2, len(reports)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_progress_report_does_not_fail_the_fill(self, caplog):
+        _typing_page()
+        ctx = MagicMock()
+        ctx.report_progress = AsyncMock(side_effect=RuntimeError("client gone"))
+        fn = getattr(browser.browser_fill, "fn", browser.browser_fill)
+        with (
+            patch.object(browser, "_FILL_PROGRESS_EVERY_S", 0.0),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+            caplog.at_level("WARNING", logger=browser.logger.name),
+        ):
+            result = await fn("#bio", "hi", ctx)
+        assert result.get("filled") == "#bio", result
+        assert ctx.report_progress.await_count > 1
+        logged = [r for r in caplog.records if "progress report failed" in r.message]
+        assert len(logged) == 1, "a gone client is logged once per fill"
+
+    @pytest.mark.asyncio
+    async def test_a_hung_progress_report_does_not_stall_the_fill(self, caplog):
+        """report_progress awaits the client transport. If that send never
+        returns, typing must not wait on it: each report has its own bound, a
+        timed-out one is cancelled and logged once, and the fill completes."""
+        _typing_page()
+        ctx = MagicMock()
+        attempts = {"n": 0, "cancelled": 0}
+
+        async def hang(*_a, **_k):
+            attempts["n"] += 1
+            try:
+                await asyncio.Event().wait()  # a send that never returns
+            except asyncio.CancelledError:
+                attempts["cancelled"] += 1
+                raise
+
+        ctx.report_progress = AsyncMock(side_effect=hang)
+        fn = getattr(browser.browser_fill, "fn", browser.browser_fill)
+        with (
+            patch.object(browser, "_FILL_PROGRESS_EVERY_S", 0.0),
+            patch.object(browser, "_FILL_PROGRESS_SEND_S", 0.05),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+            caplog.at_level("WARNING", logger=browser.logger.name),
+        ):
+            # Real-clock ceiling so an unbounded report fails here, not hangs.
+            result = await asyncio.wait_for(fn("#bio", "hi", ctx), timeout=5.0)
+        assert result.get("filled") == "#bio", result
+        assert attempts["n"] > 1, "a timed-out report must not end reporting"
+        assert attempts["cancelled"] == attempts["n"], "no send left running"
+        logged = [r for r in caplog.records if "progress report" in r.message]
+        assert len(logged) == 1, "a hung client is logged once per fill"
+
+    @pytest.mark.asyncio
+    async def test_progress_is_never_sent_while_a_key_is_held(self):
+        """A report can wait up to _FILL_PROGRESS_SEND_S. Sent between key down
+        and key up, that wait would stretch the key's hold far past the 0.2 s
+        clamp; it belongs in the gap between keys."""
+        page, _calls = _typing_page()
+        held = {"down": False}
+        sent_while_held = []
+
+        async def down(_char):
+            held["down"] = True
+
+        async def up(_char):
+            held["down"] = False
+
+        page.keyboard.down = AsyncMock(side_effect=down)
+        page.keyboard.up = AsyncMock(side_effect=up)
+        ctx = MagicMock()
+
+        async def report_progress(*_a, **_k):
+            sent_while_held.append(held["down"])
+
+        ctx.report_progress = AsyncMock(side_effect=report_progress)
+        fn = getattr(browser.browser_fill, "fn", browser.browser_fill)
+        with (
+            patch.object(browser, "_FILL_PROGRESS_EVERY_S", 0.0),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            result = await fn("#bio", "abc", ctx)
+        assert result.get("filled") == "#bio", result
+        assert sent_while_held, "no progress was reported at all"
+        assert not any(sent_while_held), sent_while_held
+
+    def test_the_progress_send_bound_is_the_justified_value(self):
+        assert browser._FILL_PROGRESS_SEND_S == 1.0
+        assert browser._FILL_PROGRESS_SEND_S < browser._FILL_PROGRESS_EVERY_S
+
+    @pytest.mark.asyncio
+    async def test_the_reporter_is_scoped_to_the_tool_call(self):
+        """After the tool returns, a direct caller of _impl_browser_fill (no
+        MCP client) reports nothing to the finished call's client."""
+        _typing_page()
+        ctx = MagicMock()
+        ctx.report_progress = AsyncMock()
+        fn = getattr(browser.browser_fill, "fn", browser.browser_fill)
+        with (
+            patch.object(browser, "_FILL_PROGRESS_EVERY_S", 0.0),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            await fn("#bio", "hi", ctx)
+            sent = ctx.report_progress.await_count
+            result = await browser._impl_browser_fill("#bio", "more")
+        assert result.get("filled") == "#bio", result
+        assert ctx.report_progress.await_count == sent
 
 
 class TestSnapshotTimeout:
@@ -476,6 +809,47 @@ class TestPressKey:
 # ---------------------------------------------------------------------------
 
 
+def _cdp_page(url: str, target_id: str):
+    """A remote page whose CDP session reports ``target_id``."""
+    page = MagicMock()
+    page.url = url
+    page.is_closed.return_value = False
+    page.goto = AsyncMock()
+    page.close = AsyncMock()
+    session = MagicMock()
+    session.send = AsyncMock(return_value={"targetInfo": {"targetId": target_id}})
+    session.detach = AsyncMock()
+    page.context.new_cdp_session = AsyncMock(return_value=session)
+    page._target_id = target_id  # what Chrome lists for it (Target.getTargets)
+    return page
+
+
+_URL = "http://100.1.2.3:9222"
+
+
+async def _connect(remote_browser, mock_pw=None, timeout_s=None, url=_URL):
+    """Connect to ``remote_browser``. With ``timeout_s``, run it under the real
+    tool timeout, which cancels the task (returns its error dict)."""
+    if mock_pw is None:
+        mock_pw = AsyncMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=remote_browser)
+    mock_starter = AsyncMock()
+    mock_starter.start = AsyncMock(return_value=mock_pw)
+    # A stub module, not patch("playwright.async_api..."): CI does not install
+    # playwright, and patching by dotted path imports the real package first.
+    api = MagicMock()
+    api.async_playwright = MagicMock(return_value=mock_starter)
+    with patch.dict(sys.modules, {"playwright": MagicMock(async_api=api), "playwright.async_api": api}):
+        coro = browser._ensure_remote_cdp(url)
+        if timeout_s is None:
+            return await coro
+        return await browser._with_tool_timeout(coro, timeout_s=timeout_s, operation="nav")
+
+
+async def _hang(*_args, **_kwargs):
+    await asyncio.sleep(3600)
+
+
 def _mock_remote_browser(pages=None, connected=True):
     """Create a mock CDP browser with optional pages."""
     mock_browser = MagicMock()
@@ -487,15 +861,77 @@ def _mock_remote_browser(pages=None, connected=True):
     ctx.new_page = AsyncMock(return_value=MagicMock())
     mock_browser.contexts = [ctx]
     mock_browser.new_context = AsyncMock(return_value=ctx)
+
+    async def get_targets(method, params=None):
+        # Browser-level Target.getTargets: the targets of the pages it holds now.
+        ids = [getattr(pg, "_target_id", None) for c in mock_browser.contexts for pg in c.pages]
+        return {"targetInfos": [{"targetId": t, "type": "page"} for t in ids if isinstance(t, str)]}
+
+    cdp = MagicMock()
+    cdp.send = AsyncMock(side_effect=get_targets)
+    cdp.detach = AsyncMock()
+    mock_browser.new_browser_cdp_session = AsyncMock(return_value=cdp)
     return mock_browser
 
 
-@pytest.mark.skipif(
-    not importlib.util.find_spec("playwright"),
-    reason="playwright not installed",
-)
 class TestEnsureRemoteCdp:
     """Verify _ensure_remote_cdp connection lifecycle."""
+
+    @pytest.mark.asyncio
+    async def test_a_failed_tab_open_disconnects_instead_of_leaking(self):
+        """Connected, but the Genesis tab cannot be opened: the driver and the
+        CDP connection are stopped now, or each retry would leak another."""
+        mock_br = _mock_remote_browser()
+        mock_br.contexts[0].new_page = AsyncMock(side_effect=RuntimeError("Target closed"))
+        browser._remote_target_ids[_URL] = "keep-me"
+        with pytest.raises(ConnectionError, match="could not open the Genesis tab"):
+            await _connect(mock_br)
+        mock_br.close.assert_awaited()
+        assert browser._remote_browser is None
+        assert browser._remote_pw is None
+        assert browser._remote_target_ids.get(_URL) == "keep-me"  # a retry can still reuse the tab
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_tab_open_still_disconnects(self):
+        """Codex round 1: the tool timeout cancels with a BaseException, which an
+        `except Exception` cleanup missed. The cancellation itself propagates."""
+        mock_br = _mock_remote_browser()
+        mock_br.contexts[0].new_page = AsyncMock(side_effect=_hang)
+        result = await _connect(mock_br, timeout_s=0.2)
+        assert "timed out" in result["error"]
+        mock_br.close.assert_awaited()
+        assert browser._remote_browser is None
+        assert browser._remote_pw is None
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_connect_stops_the_driver(self):
+        """Round 1 review: cancellation during connect_over_cdp skipped both
+        `except` branches, so the driver was never stopped and leaked."""
+        mock_pw = AsyncMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(side_effect=_hang)
+        result = await _connect(None, mock_pw=mock_pw, timeout_s=0.2)
+        assert "timed out" in result["error"]
+        mock_pw.stop.assert_awaited_once()
+        assert browser._remote_pw is None
+
+    @pytest.mark.asyncio
+    async def test_snapshot_does_not_resync_drift_if_the_page_moved_meanwhile(self):
+        """Codex round 1: a navigation during the snapshot means it may show the
+        old page; the drift baseline must not jump to the new one."""
+        page = _cdp_page("https://a.example/", "t1")
+        browser._remote_browser = _mock_remote_browser()
+        browser._remote_page = page
+        browser._active_page = page
+        browser._remote_last_url = "https://a.example/"
+
+        async def moving_snapshot(p):
+            page.url = "https://b.example/"
+            return "- heading 'A'"
+
+        page.title = AsyncMock(return_value="B")
+        with patch.object(browser, "_snapshot_page", side_effect=moving_snapshot):
+            await browser._impl_browser_snapshot()
+        assert browser._remote_last_url == "https://a.example/"
 
     @pytest.mark.asyncio
     async def test_returns_alive_page_without_reconnect(self):
@@ -518,21 +954,15 @@ class TestEnsureRemoteCdp:
         browser._remote_browser = dead_browser
         browser._remote_page = MagicMock()
 
-        new_page = MagicMock()
-        new_page.url = "chrome://newtab/"
-        new_browser = _mock_remote_browser(pages=[new_page])
+        user_tab = _cdp_page("chrome://newtab/", "USER")
+        new_browser = _mock_remote_browser(pages=[user_tab])
+        genesis_tab = _cdp_page("about:blank", "GEN-1")
+        new_browser.contexts[0].new_page = AsyncMock(return_value=genesis_tab)
 
-        mock_pw = AsyncMock()
-        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=new_browser)
-        mock_pw.stop = AsyncMock()
+        result = await _connect(new_browser)
 
-        with patch("playwright.async_api.async_playwright") as mock_apw:
-            mock_starter = AsyncMock()
-            mock_starter.start = AsyncMock(return_value=mock_pw)
-            mock_apw.return_value = mock_starter
-            result = await browser._ensure_remote_cdp("http://100.1.2.3:9222")
-
-        assert result is new_page
+        assert result is genesis_tab
+        dead_browser.close.assert_awaited_once()
         assert browser._remote_cdp_url == "http://100.1.2.3:9222"
 
     @pytest.mark.asyncio
@@ -550,51 +980,83 @@ class TestEnsureRemoteCdp:
         )
         mock_pw.stop = AsyncMock()
 
-        with patch("playwright.async_api.async_playwright") as mock_apw:
-            mock_starter = AsyncMock()
-            mock_starter.start = AsyncMock(return_value=mock_pw)
-            mock_apw.return_value = mock_starter
-            with pytest.raises(ConnectionError, match="Cannot connect"):
-                await browser._ensure_remote_cdp("http://100.1.2.3:9222")
+        with pytest.raises(ConnectionError, match="Cannot connect"):
+            await _connect(None, mock_pw=mock_pw)
 
         # Playwright instance must be cleaned up
         mock_pw.stop.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_uses_existing_tab(self):
-        """Picks first tab with a real URL (chrome://, http://, etc)."""
-        visible_page = MagicMock()
-        visible_page.url = "chrome://newtab/"
-        other_page = MagicMock()
-        other_page.url = "https://already-open.com"
-        new_browser = _mock_remote_browser(pages=[visible_page, other_page])
+    async def test_opens_its_own_tab_and_leaves_the_users_tabs_alone(self):
+        """Owner ruling: Genesis works in a tab of its own, opened in the
+        context that holds the user's visible tabs (not browser.new_context(),
+        whose pages render in an invisible window). The user's tabs are never
+        navigated."""
+        user_tab = _cdp_page("chrome://newtab/", "USER-1")
+        other_tab = _cdp_page("https://already-open.com", "USER-2")
+        new_browser = _mock_remote_browser(pages=[user_tab, other_tab])
+        genesis_tab = _cdp_page("about:blank", "GEN-1")
+        new_browser.contexts[0].new_page = AsyncMock(return_value=genesis_tab)
 
-        mock_pw = AsyncMock()
-        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=new_browser)
+        result = await _connect(new_browser)
 
-        with patch("playwright.async_api.async_playwright") as mock_apw:
-            mock_starter = AsyncMock()
-            mock_starter.start = AsyncMock(return_value=mock_pw)
-            mock_apw.return_value = mock_starter
-            result = await browser._ensure_remote_cdp("http://100.1.2.3:9222")
+        assert result is genesis_tab
+        new_browser.contexts[0].new_page.assert_awaited_once()
+        new_browser.new_context.assert_not_awaited()
+        user_tab.goto.assert_not_called()
+        other_tab.goto.assert_not_called()
+        assert browser._remote_target_ids.get(_URL) == "GEN-1"
 
-        assert result is visible_page  # First tab with real URL
+    @pytest.mark.asyncio
+    async def test_tab_opens_in_the_context_that_holds_the_users_tabs(self):
+        """connect_over_cdp can expose a context with no visible pages; the tab
+        goes where the user's tabs are."""
+        empty_ctx = MagicMock()
+        empty_ctx.pages = []
+        empty_ctx.new_page = AsyncMock()
+        new_browser = _mock_remote_browser(pages=[_cdp_page("https://mail.example", "USER")])
+        new_browser.contexts = [empty_ctx, new_browser.contexts[0]]
+        genesis_tab = _cdp_page("about:blank", "GEN-2")
+        new_browser.contexts[1].new_page = AsyncMock(return_value=genesis_tab)
+
+        result = await _connect(new_browser)
+
+        assert result is genesis_tab
+        empty_ctx.new_page.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_reuses_the_genesis_tab_by_target_id(self):
+        browser._remote_target_ids[_URL] = "GEN-1"
+        user_tab = _cdp_page("https://mail.example", "USER")
+        genesis_tab = _cdp_page("https://form.example/step2", "GEN-1")
+        new_browser = _mock_remote_browser(pages=[user_tab, genesis_tab])
+
+        result = await _connect(new_browser)
+
+        assert result is genesis_tab
+        new_browser.contexts[0].new_page.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_opens_a_new_tab_when_the_genesis_tab_was_closed(self):
+        browser._remote_target_ids[_URL] = "GEN-OLD"
+        user_tab = _cdp_page("https://mail.example", "USER")
+        new_browser = _mock_remote_browser(pages=[user_tab])
+        genesis_tab = _cdp_page("about:blank", "GEN-NEW")
+        new_browser.contexts[0].new_page = AsyncMock(return_value=genesis_tab)
+
+        result = await _connect(new_browser)
+
+        assert result is genesis_tab
+        assert browser._remote_target_ids.get(_URL) == "GEN-NEW"
 
     @pytest.mark.asyncio
     async def test_creates_new_tab_when_no_pages(self):
         """Context exists but no pages — creates new tab."""
         new_browser = _mock_remote_browser(pages=[])
-        created_page = MagicMock()
+        created_page = _cdp_page("about:blank", "GEN-1")
         new_browser.contexts[0].new_page = AsyncMock(return_value=created_page)
 
-        mock_pw = AsyncMock()
-        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=new_browser)
-
-        with patch("playwright.async_api.async_playwright") as mock_apw:
-            mock_starter = AsyncMock()
-            mock_starter.start = AsyncMock(return_value=mock_pw)
-            mock_apw.return_value = mock_starter
-            result = await browser._ensure_remote_cdp("http://100.1.2.3:9222")
+        result = await _connect(new_browser)
 
         assert result is created_page
         new_browser.contexts[0].new_page.assert_awaited_once()
@@ -602,19 +1064,14 @@ class TestEnsureRemoteCdp:
     @pytest.mark.asyncio
     async def test_resolves_url_from_env(self):
         """Falls back to GENESIS_CDP_URL env var when no explicit URL."""
-        new_page = MagicMock()
-        new_page.url = "chrome://newtab/"
-        new_browser = _mock_remote_browser(pages=[new_page])
+        new_browser = _mock_remote_browser(pages=[_cdp_page("chrome://newtab/", "USER")])
+        new_browser.contexts[0].new_page = AsyncMock(return_value=_cdp_page("about:blank", "GEN-1"))
 
         mock_pw = AsyncMock()
         mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=new_browser)
 
-        with patch("playwright.async_api.async_playwright") as mock_apw, \
-             patch.dict("os.environ", {"GENESIS_CDP_URL": "http://env.url:9222"}):
-            mock_starter = AsyncMock()
-            mock_starter.start = AsyncMock(return_value=mock_pw)
-            mock_apw.return_value = mock_starter
-            await browser._ensure_remote_cdp(None)
+        with patch.dict("os.environ", {"GENESIS_CDP_URL": "http://env.url:9222"}):
+            await _connect(None, mock_pw=mock_pw, url=None)
 
         mock_pw.chromium.connect_over_cdp.assert_awaited_once_with("http://env.url:9222")
 
@@ -672,10 +1129,17 @@ class TestRemoteCleanup:
         browser._remote_pw = mock_pw
         browser._remote_last_url = "https://example.com"
 
+        tab = browser._remote_page
+        tab.close = AsyncMock()
+        browser._remote_target_ids[_URL] = "GEN-1"
         await browser._cleanup_remote_cdp()
 
         mock_br.close.assert_awaited_once()
         mock_pw.stop.assert_awaited_once()
+        # Owner ruling: the Genesis tab is left open, and remembered so a
+        # reconnect reuses it.
+        tab.close.assert_not_awaited()
+        assert browser._remote_target_ids.get(_URL) == "GEN-1"
         assert browser._remote_browser is None
         assert browser._remote_page is None
         assert browser._remote_pw is None
@@ -721,7 +1185,9 @@ class TestRemoteNavigate:
     """Verify _impl_browser_navigate with remote=True."""
 
     @pytest.mark.asyncio
-    async def test_navigate_remote_auto_enables_collaborate(self):
+    async def test_navigate_remote_leaves_the_timing_setting_alone(self):
+        """Remote timing comes from _human_delay itself, so navigate must not
+        flip _collaborate_mode (it used to, and the flag then stuck)."""
         page = MagicMock()
         page.url = "https://example.com"
         page.title = AsyncMock(return_value="Example")
@@ -740,7 +1206,7 @@ class TestRemoteNavigate:
                 "https://example.com", remote=True, cdp_url="http://x:9222"
             )
 
-        assert browser._collaborate_mode is True
+        assert browser._collaborate_mode is False
         assert result.get("layer") == "remote_cdp"
 
     @pytest.mark.asyncio
@@ -968,7 +1434,7 @@ class TestRemoteHelpers:
         browser._remote_page = page
         browser._active_page = page
 
-        browser._on_remote_disconnected()
+        browser._on_remote_disconnected(browser._remote_browser)
 
         assert browser._remote_browser is None
         assert browser._remote_page is None
@@ -994,6 +1460,484 @@ class TestRemoteHelpers:
         browser._update_remote_url()
 
         assert browser._remote_last_url == "https://old.com"  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# B3: remote CDP does not touch the collaborate setting.
+# B4: a remote snapshot re-syncs the drift tracker.
+# ---------------------------------------------------------------------------
+
+
+def _nav_page(url="https://example.com"):
+    page = MagicMock()
+    page.url = url
+    page.title = AsyncMock(return_value="Example")
+    page.goto = AsyncMock()
+    page.is_closed.return_value = False
+    locator = MagicMock()
+    locator.aria_snapshot = AsyncMock(return_value="- heading: Example")
+    page.locator.return_value = locator
+    return page
+
+
+async def _navigate_remote():
+    page = _nav_page()
+    browser._remote_page = page
+    with patch.object(browser, "_ensure_remote_cdp", new_callable=AsyncMock, return_value=page):
+        await browser._impl_browser_navigate("https://example.com", remote=True, cdp_url="http://x:9222")
+
+
+async def _navigate_camoufox():
+    page = _nav_page()
+
+    async def _ensure():
+        browser._stealth_cm = MagicMock()
+        browser._stealth_page = page
+        return page
+
+    with (
+        patch.object(browser, "_ensure_browser", new=_ensure),
+        patch.object(browser, "_ensure_vnc", new=AsyncMock()),
+        patch.object(browser, "_wait_for_turnstile", new=AsyncMock(return_value=None)),
+    ):
+        return await browser._impl_browser_navigate("https://example.com")
+
+
+class TestRemoteTimingDoesNotTouchTheSetting:
+    @pytest.mark.asyncio
+    async def test_camoufox_after_remote_keeps_background_timing(self):
+        await _navigate_remote()
+        await _navigate_camoufox()
+        assert browser._collaborate_mode is False, (
+            "fast timing leaked from remote CDP into Camoufox"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_failed_remote_connect_leaves_the_setting_alone(self):
+        with patch.object(
+            browser, "_ensure_remote_cdp", new_callable=AsyncMock,
+            side_effect=ConnectionError("No CDP URL configured"),
+        ):
+            result = await browser._impl_browser_navigate("https://example.com", remote=True)
+        assert "error" in result
+        assert browser._collaborate_mode is False
+
+    @pytest.mark.asyncio
+    async def test_remote_actions_still_use_collaborate_timing(self):
+        await _navigate_remote()
+        browser._active_page = browser._remote_page
+        with patch("genesis.mcp.health.browser.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            await browser._human_delay()
+        assert 0.5 <= sleep.call_args[0][0] <= 2.0
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_setting_is_kept(self):
+        browser._impl_browser_collaborate(True)
+        await _navigate_remote()
+        await _navigate_camoufox()
+        assert browser._collaborate_mode is True
+
+
+class TestRemoteSnapshotResyncsDrift:
+    @pytest.mark.asyncio
+    async def test_snapshot_clears_the_drift_advisory(self):
+        page = _nav_page("https://example.com/moved")
+        browser._active_page = page
+        browser._remote_page = page
+        browser._remote_browser = _mock_remote_browser(connected=True)
+        browser._remote_last_url = "https://example.com/form"
+
+        blocked = await browser._impl_browser_click("#go")
+        assert blocked.get("drift") == "url_changed"
+
+        snap = await browser._impl_browser_snapshot()
+        assert "error" not in snap
+        assert browser._remote_last_url == "https://example.com/moved"
+        assert browser._check_page_drift(page) is None
+
+    @pytest.mark.asyncio
+    async def test_non_remote_snapshot_leaves_the_tracker_alone(self):
+        page = _nav_page("https://example.com/b")
+        browser._active_page = page
+        browser._remote_last_url = "https://elsewhere.example/a"
+        await browser._impl_browser_snapshot()
+        assert browser._remote_last_url == "https://elsewhere.example/a"
+
+
+class TestReviewNotes:
+    @pytest.mark.asyncio
+    async def test_a_placeholder_snapshot_does_not_resync_drift(self):
+        page = _nav_page("https://example.com/moved")
+        page.locator.return_value.aria_snapshot = AsyncMock(side_effect=RuntimeError("detached"))
+        browser._active_page = page
+        browser._remote_page = page
+        browser._remote_browser = _mock_remote_browser(connected=True)
+        browser._remote_last_url = "https://example.com/form"
+        snap = await browser._impl_browser_snapshot()
+        assert snap["snapshot"].startswith("(snapshot unavailable")
+        assert browser._remote_last_url == "https://example.com/form"
+
+    @pytest.mark.asyncio
+    async def test_genesis_tab_is_looked_up_newest_first(self):
+        browser._remote_target_ids[_URL] = "GEN-1"
+        user_tab = _cdp_page("https://mail.example", "USER")
+        genesis_tab = _cdp_page("https://form.example", "GEN-1")
+        new_browser = _mock_remote_browser(pages=[user_tab, genesis_tab])
+        result = await _connect(new_browser)
+        assert result is genesis_tab
+        user_tab.context.new_cdp_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_title_does_not_resync_drift(self):
+        """Round 1 (Codex P2, Devin): the baseline means "the caller has seen
+        this page", so it moves only once the whole response is built."""
+        page = _nav_page("https://example.com/moved")
+        page.title = AsyncMock(side_effect=RuntimeError("Target closed"))
+        browser._active_page = page
+        browser._remote_page = page
+        browser._remote_browser = _mock_remote_browser(connected=True)
+        browser._remote_last_url = "https://example.com/form"
+        snap = await browser._impl_browser_snapshot()
+        assert "error" in snap
+        assert browser._remote_last_url == "https://example.com/form"
+
+
+def _unidentifiable_page():
+    """A freshly opened tab whose CDP target id cannot be read."""
+    page = _cdp_page("about:blank", "unused")
+    page.context.new_cdp_session = AsyncMock(side_effect=RuntimeError("no session"))
+    return page
+
+
+class TestGenesisTabIdentity:
+    """Round 1 (Codex P2, Devin): a tab Genesis cannot identify could never be
+    found again, so every reconnect would open another one."""
+
+    @pytest.mark.asyncio
+    async def test_an_unidentifiable_new_tab_is_closed_and_the_connect_fails(self):
+        mock_br = _mock_remote_browser(pages=[_cdp_page("https://mail.example", "USER")])
+        tab = _unidentifiable_page()
+        mock_br.contexts[0].new_page = AsyncMock(return_value=tab)
+        with pytest.raises(ConnectionError, match="could not open the Genesis tab"):
+            await _connect(mock_br)
+        tab.close.assert_awaited_once()
+        assert browser._remote_target_ids.get(_URL) is None
+        assert browser._remote_browser is None
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_target_lookup_closes_the_new_tab(self):
+        mock_br = _mock_remote_browser(pages=[_cdp_page("https://mail.example", "USER")])
+        tab = _cdp_page("about:blank", "unused")
+        tab.context.new_cdp_session = AsyncMock(side_effect=_hang)
+        mock_br.contexts[0].new_page = AsyncMock(return_value=tab)
+        result = await _connect(mock_br, timeout_s=0.2)
+        assert "timed out" in result["error"]
+        tab.close.assert_awaited_once()
+        assert browser._remote_target_ids.get(_URL) is None
+        assert browser._remote_browser is None
+
+    @pytest.mark.asyncio
+    async def test_a_wedged_tab_close_does_not_hold_a_cancelled_connect(self, monkeypatch):
+        """Codex P2 4196752666: the identity probe wedges, the tool timeout
+        cancels the connect, and the unidentified tab's close wedges too. The
+        cancelled connect must still return its timeout within the bound."""
+        monkeypatch.setattr(browser, "_UNIDENTIFIED_TAB_CLOSE_BOUND_S", 0.2)
+        tab = _cdp_page("about:blank", "unused")
+        tab.context.new_cdp_session = AsyncMock(side_effect=_hang)
+        tab.close = AsyncMock(side_effect=_hang)
+        mock_br = _mock_remote_browser(pages=[_cdp_page("https://mail.example", "USER")])
+        mock_br.contexts[0].new_page = AsyncMock(return_value=tab)
+        try:
+            result = await asyncio.wait_for(_connect(mock_br, timeout_s=0.2), timeout=5.0)
+            assert "timed out" in result["error"]
+            tab.close.assert_awaited_once()
+        finally:
+            for task in list(browser._remote_inflight):
+                task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_second_cancel_does_not_cut_the_tab_close_short(self):
+        """The close of an unidentified tab is shielded: a second cancel
+        arriving while it runs must not abandon it half done."""
+        closing, closed = asyncio.Event(), asyncio.Event()
+
+        async def slow_close():
+            closing.set()
+            await asyncio.sleep(0.05)
+            closed.set()
+
+        tab = _cdp_page("about:blank", "unused")
+        tab.close = AsyncMock(side_effect=slow_close)
+        tab.context.new_cdp_session = AsyncMock(side_effect=_hang)
+        mock_br = _mock_remote_browser()
+        mock_br.contexts[0].new_page = AsyncMock(return_value=tab)
+
+        task = asyncio.create_task(browser._genesis_remote_tab(mock_br, _URL))
+        await asyncio.sleep(0.02)
+        task.cancel()
+        await asyncio.wait_for(closing.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(closed.wait(), 1)
+
+    @pytest.mark.asyncio
+    async def test_tab_opens_beside_tabs_of_any_scheme_not_in_an_empty_context(self):
+        """Round 1 (Devin): a window holding only file:// tabs is still the
+        user's; an empty context ahead of it may be off-screen."""
+        empty_ctx = MagicMock()
+        empty_ctx.pages = []
+        empty_ctx.new_page = AsyncMock()
+        new_browser = _mock_remote_browser(pages=[_cdp_page("file:///tmp/report.html", "USER")])
+        new_browser.contexts = [empty_ctx, new_browser.contexts[0]]
+        genesis_tab = _cdp_page("about:blank", "GEN-3")
+        new_browser.contexts[1].new_page = AsyncMock(return_value=genesis_tab)
+
+        result = await _connect(new_browser)
+
+        assert result is genesis_tab
+        empty_ctx.new_page.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_probe_of_the_open_genesis_tab_opens_no_second_tab(self):
+        """Codex P2 (4191048107): a transient identity-probe failure read as "not
+        ours", so the reconnect opened a second Genesis tab. Chrome still lists
+        the tab, so the connect fails instead."""
+        browser._remote_target_ids[_URL] = "GEN-1"
+        genesis_tab = _cdp_page("https://form.example", "GEN-1")
+        genesis_tab.context.new_cdp_session = AsyncMock(side_effect=RuntimeError("transient"))
+        new_browser = _mock_remote_browser(pages=[_cdp_page("https://mail.example", "USER"), genesis_tab])
+        new_browser.contexts[0].new_page = AsyncMock(return_value=_cdp_page("about:blank", "GEN-2"))
+
+        with pytest.raises(ConnectionError, match="still open in Chrome"):
+            await _connect(new_browser)
+        new_browser.contexts[0].new_page.assert_not_awaited()
+        assert browser._remote_target_ids.get(_URL) == "GEN-1"
+        assert browser._remote_browser is None
+        new_browser.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_unanswerable_existence_check_opens_no_tab(self):
+        """If Chrome cannot say whether the Genesis tab still exists, the
+        connect fails rather than open a possible duplicate."""
+        browser._remote_target_ids[_URL] = "GEN-1"
+        new_browser = _mock_remote_browser(pages=[_cdp_page("https://mail.example", "USER")])
+        new_browser.new_browser_cdp_session = AsyncMock(side_effect=RuntimeError("busy"))
+        new_browser.contexts[0].new_page = AsyncMock(return_value=_cdp_page("about:blank", "GEN-2"))
+
+        with pytest.raises(ConnectionError, match="could not check whether the Genesis tab"):
+            await _connect(new_browser)
+        new_browser.contexts[0].new_page.assert_not_awaited()
+        assert browser._remote_target_ids.get(_URL) == "GEN-1"
+
+    @pytest.mark.asyncio
+    async def test_each_endpoint_keeps_its_own_genesis_tab(self):
+        """Devin 4191330182: one remembered id across CDP endpoints meant that
+        switching back to the first Chrome opened a second Genesis tab there."""
+        url_a, url_b = "http://a.example:9222", "http://b.example:9222"
+        tab_a = _cdp_page("about:blank", "A1")
+        chrome_a = _mock_remote_browser()
+        chrome_a.contexts[0].new_page = AsyncMock(return_value=tab_a)
+        assert await _connect(chrome_a, url=url_a) is tab_a
+        await browser._cleanup_remote_cdp()
+
+        chrome_b = _mock_remote_browser()
+        chrome_b.contexts[0].new_page = AsyncMock(return_value=_cdp_page("about:blank", "B1"))
+        await _connect(chrome_b, url=url_b)
+        await browser._cleanup_remote_cdp()
+
+        chrome_a_again = _mock_remote_browser(pages=[_cdp_page("https://mail.example", "USER"), tab_a])
+        chrome_a_again.contexts[0].new_page = AsyncMock(return_value=_cdp_page("about:blank", "A2"))
+        assert await _connect(chrome_a_again, url=url_a) is tab_a
+        chrome_a_again.contexts[0].new_page.assert_not_awaited()
+
+
+class TestStaleRemoteCleanupCannotTouchTheNextConnection:
+    """Codex P2 (4191048112): a second cancel releases the browser lock while
+    the shielded cleanup of a failed attempt still runs; that cleanup and that
+    attempt's late "disconnected" event must not touch the next connection."""
+
+    @staticmethod
+    async def _abandon_an_attempt_mid_cleanup():
+        release, closing = asyncio.Event(), asyncio.Event()
+
+        async def slow_close():
+            closing.set()
+            await release.wait()
+
+        old_br = _mock_remote_browser()
+        old_tab = _cdp_page("about:blank", "unused")
+        old_tab.context.new_cdp_session = AsyncMock(side_effect=_hang)  # the id lookup hangs
+        old_br.contexts[0].new_page = AsyncMock(return_value=old_tab)
+        old_br.close = AsyncMock(side_effect=slow_close)
+        old_pw = AsyncMock()
+        old_pw.chromium.connect_over_cdp = AsyncMock(return_value=old_br)
+
+        task = asyncio.create_task(_connect(old_br, mock_pw=old_pw))
+        await asyncio.sleep(0.02)
+        task.cancel()  # first cancel: the tab open aborts, shielded cleanup starts
+        await asyncio.wait_for(closing.wait(), 1)
+        task.cancel()  # second cancel: the caller gives up while cleanup runs
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not browser._browser_lock.locked()
+        return old_br, old_pw, release
+
+    @staticmethod
+    async def _connect_the_next():
+        new_tab = _cdp_page("about:blank", "GEN-NEW")
+        new_br = _mock_remote_browser()
+        new_br.contexts[0].new_page = AsyncMock(return_value=new_tab)
+        new_pw = AsyncMock()
+        new_pw.chromium.connect_over_cdp = AsyncMock(return_value=new_br)
+        assert await _connect(new_br, mock_pw=new_pw) is new_tab
+        browser._active_page = new_tab
+        return new_br, new_pw, new_tab
+
+    def _assert_intact(self, new_br, new_pw, new_tab):
+        assert browser._remote_browser is new_br
+        assert browser._remote_page is new_tab
+        assert browser._remote_pw is new_pw
+        assert browser._active_page is new_tab
+        new_pw.stop.assert_not_awaited()
+        new_br.close.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_late_cleanup_leaves_the_next_connection_alone(self):
+        old_br, old_pw, release = await self._abandon_an_attempt_mid_cleanup()
+        new_br, new_pw, new_tab = await self._connect_the_next()
+        release.set()
+        for _ in range(20):  # let the stale cleanup run to its end
+            await asyncio.sleep(0)
+        self._assert_intact(new_br, new_pw, new_tab)
+        old_pw.stop.assert_awaited_once()  # it stopped its own driver instead
+
+    @pytest.mark.asyncio
+    async def test_a_late_disconnect_event_leaves_the_next_connection_alone(self):
+        old_br, old_pw, release = await self._abandon_an_attempt_mid_cleanup()
+        release.set()
+        for _ in range(20):  # the stale cleanup finishes first: only the event is late
+            await asyncio.sleep(0)
+        old_pw.stop.assert_awaited_once()
+        new_br, new_pw, new_tab = await self._connect_the_next()
+        old_handler = old_br.on.call_args[0][1]
+        old_handler()  # the abandoned attempt's browser reports its disconnect late
+        self._assert_intact(new_br, new_pw, new_tab)
+
+    @pytest.mark.asyncio
+    async def test_a_leftover_driver_is_stopped_before_the_next_connect(self):
+        """A disconnect event clears the browser and page but not the driver
+        (the state set here); the next connect must stop that driver, not
+        overwrite (leak) it."""
+        old_pw = AsyncMock()
+        browser._remote_pw = old_pw
+
+        new_br, new_pw, new_tab = await self._connect_the_next()
+        old_pw.stop.assert_awaited_once()
+        self._assert_intact(new_br, new_pw, new_tab)
+
+    @pytest.mark.asyncio
+    async def test_a_late_stale_connection_cleanup_leaves_the_next_alone(self):
+        """_cleanup_remote_cdp clears the globals before its first await: a
+        cancel during the stale-connection cleanup leaves it running (shielded),
+        and it must not clear or stop the connection made next."""
+        release, closing = asyncio.Event(), asyncio.Event()
+
+        async def slow_close():
+            closing.set()
+            await release.wait()
+
+        stale_br = _mock_remote_browser(connected=False)
+        stale_br.close = AsyncMock(side_effect=slow_close)
+        stale_pw = AsyncMock()
+        browser._remote_browser, browser._remote_pw = stale_br, stale_pw
+        browser._remote_page = _cdp_page("https://a.example", "OLD")
+
+        task = asyncio.create_task(_connect(_mock_remote_browser()))
+        await asyncio.wait_for(closing.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        new_br, new_pw, new_tab = await asyncio.wait_for(self._connect_the_next(), 1)
+        release.set()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        self._assert_intact(new_br, new_pw, new_tab)
+        stale_pw.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_during_a_failed_connect_still_stops_the_driver(self):
+        """Architect review: the connect-failure branches awaited pw.stop()
+        unshielded, so a cancel arriving then left the driver running."""
+        stopping, stopped = asyncio.Event(), asyncio.Event()
+
+        async def slow_stop():
+            stopping.set()
+            await asyncio.sleep(0.05)
+            stopped.set()
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(side_effect=Exception("refused"))
+        mock_pw.stop = AsyncMock(side_effect=slow_stop)
+        task = asyncio.create_task(_connect(None, mock_pw=mock_pw))
+        await asyncio.wait_for(stopping.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(stopped.wait(), 1)
+
+    @pytest.mark.asyncio
+    async def test_a_tab_whose_open_was_cancelled_is_closed_when_it_arrives(self):
+        """Architect review: a cancelled new_page() still opens the tab
+        (Playwright drops the reply, not the request); it must not be left as
+        a blank tab nobody can find again."""
+        arrive, disconnected = asyncio.Event(), asyncio.Event()
+        late_tab = _cdp_page("about:blank", "GEN-LATE")
+
+        async def slow_new_page():
+            await arrive.wait()
+            if disconnected.is_set():  # as Playwright: a disconnect fails pending calls
+                raise RuntimeError("Target page, context or browser has been closed")
+            return late_tab
+
+        async def disconnect():
+            disconnected.set()
+
+        mock_br = _mock_remote_browser()
+        mock_br.close = AsyncMock(side_effect=disconnect)
+        mock_br.contexts[0].new_page = AsyncMock(side_effect=slow_new_page)
+        # The reply arrives after the tool timeout cancelled the call.
+        asyncio.get_running_loop().call_later(0.3, arrive.set)
+        result = await _connect(mock_br, timeout_s=0.2)
+        assert "timed out" in result["error"]
+        late_tab.close.assert_awaited_once()
+        assert disconnected.is_set()
+        assert browser._remote_target_ids.get(_URL) is None
+
+    @pytest.mark.asyncio
+    async def test_a_close_outliving_its_caller_is_kept_and_drained(self):
+        """Codex 4191375888: a shielded close whose caller was cancelled is
+        held (asyncio keeps only a weak reference) and async_cleanup waits for it."""
+        release = asyncio.Event()
+        closed = asyncio.Event()
+
+        async def slow_close():
+            await release.wait()
+            closed.set()
+
+        mock_br = _mock_remote_browser()
+        mock_br.close = AsyncMock(side_effect=slow_close)
+        browser._remote_browser, browser._remote_pw = mock_br, AsyncMock()
+        task = asyncio.create_task(browser._cleanup_remote_cdp())
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(browser._remote_inflight) == 1
+        asyncio.get_running_loop().call_later(0.05, release.set)
+        await browser.async_cleanup()
+        assert closed.is_set()
+        assert not browser._remote_inflight
 
 
 def _ss_line(pid, name="x11vnc", v6=False):
@@ -1191,6 +2135,59 @@ class TestReclaimVncPort:
         with patch("subprocess.run", side_effect=run), patch("os.kill") as kill:
             browser._reclaim_vnc_port()
         kill.assert_not_called()
+
+
+class TestVncFallbackKeepsPasswordAuth:
+    """When systemctl is unavailable, _ensure_vnc starts x11vnc itself. That
+    fallback keeps password authentication, like the genesis-vnc unit."""
+
+    @staticmethod
+    async def _run(home: Path):
+        popen = MagicMock()
+        with (
+            patch.object(browser, "_reclaim_vnc_port"),
+            patch("subprocess.run", side_effect=FileNotFoundError("systemctl")),
+            patch("subprocess.Popen", popen),
+            patch.object(browser.Path, "home", return_value=home),
+        ):
+            await browser._ensure_vnc()
+        return popen
+
+    @pytest.mark.asyncio
+    async def test_no_password_file_starts_nothing(self, tmp_path):
+        popen = await self._run(tmp_path)
+        popen.assert_not_called()
+        assert browser._vnc_verified is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("shape", ["directory", "empty", "short", "unreadable"])
+    async def test_unusable_password_path_starts_nothing(self, tmp_path, shape):
+        # x11vnc 0.9.16 reads the first 8 bytes of the -rfbauth file. Given a
+        # directory, a shorter file or one it cannot read, it still listens,
+        # offering only password auth that no password can pass.
+        target = tmp_path / ".genesis" / "vnc_passwd"
+        if shape == "directory":
+            target.mkdir(parents=True)
+        else:
+            target.parent.mkdir()
+            target.write_bytes({"empty": b"", "short": b"\0" * 7}.get(shape, b"\0" * 8))
+        if shape == "unreadable":
+            if os.geteuid() == 0:
+                pytest.skip("root reads a mode-000 file")
+            target.chmod(0)
+        popen = await self._run(tmp_path)
+        popen.assert_not_called()
+        assert browser._vnc_verified is False
+
+    @pytest.mark.asyncio
+    async def test_with_a_password_file_it_uses_it(self, tmp_path):
+        (tmp_path / ".genesis").mkdir()
+        (tmp_path / ".genesis" / "vnc_passwd").write_bytes(b"\0" * 8)
+        popen = await self._run(tmp_path)
+        argv = popen.call_args.args[0]
+        assert argv[argv.index("-rfbauth") + 1] == str(tmp_path / ".genesis" / "vnc_passwd")
+        assert "-nopw" not in argv
+        assert browser._vnc_verified is True
 
 
 def _ts_page(*, selectors_present=(), title="Example Domain", url="https://example.com/"):

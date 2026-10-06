@@ -245,7 +245,7 @@ async def generate_golden_set(count: int, output_path: Path) -> dict:
 
     Returns a summary dict with counts and pass/fail distribution.
     """
-    if output_path.exists():
+    if os.path.lexists(output_path):
         raise FileExistsError(f"refusing to overwrite reference file: {output_path}")
     from genesis.eval.rubrics import get_rubric
 
