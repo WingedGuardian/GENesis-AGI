@@ -640,7 +640,7 @@ class TestKeyboardFallback:
         el_mock.evaluate = AsyncMock(side_effect=["input", "radio"])
         page.wait_for_selector = AsyncMock(return_value=el_mock)
         # Plain click also fails
-        page.click = AsyncMock(side_effect=Exception("plain failed"))
+        page.click = AsyncMock(side_effect=Exception(_PLAIN_FAILED))
 
         # Keyboard mock
         page.keyboard = MagicMock()
@@ -665,7 +665,7 @@ class TestKeyboardFallback:
 
         # All methods fail
         page.wait_for_selector = AsyncMock(side_effect=Exception("nope"))
-        page.click = AsyncMock(side_effect=Exception("plain failed"))
+        page.click = AsyncMock(side_effect=Exception(_PLAIN_FAILED))
         page.keyboard = MagicMock()
         page.keyboard.press = AsyncMock(side_effect=Exception("kb failed"))
         # Shadow DOM fallback also fails (returns False = not found)
@@ -692,7 +692,7 @@ class TestShadowDomClick:
 
         # Stealth, plain, and keyboard all fail
         page.wait_for_selector = AsyncMock(side_effect=Exception("nope"))
-        page.click = AsyncMock(side_effect=Exception("plain failed"))
+        page.click = AsyncMock(side_effect=Exception(_PLAIN_FAILED))
         page.keyboard = MagicMock()
         page.keyboard.press = AsyncMock(side_effect=Exception("kb failed"))
         # Shadow DOM fallback succeeds (JS found and clicked the element)
@@ -770,7 +770,8 @@ _INTERCEPT_LOG = (
 # mouse events (_performPointerAction); a failure after that line may have
 # delivered the click.
 _SENT_LOG = (
-    "Target page, context or browser has been closed\nCall log:\n  - performing click action\n"
+    "Target page, context or browser has been closed\nCall log:\n"
+    "  - attempting click action\n    - performing click action\n"
 )
 
 def _click_err(text):
@@ -789,6 +790,11 @@ _SWALLOWED_LOG = (
     "    - performing click action\n"
     '    - <div id="cookie-banner" class="cover">…</div> intercepts pointer events\n'
 )
+
+# A plain page.click that failed before sending, as Playwright raises it: with
+# a call log. A click's own error with no log at all is unclassifiable and
+# counts as possibly sent (_click_was_sent), so it would stop the fallbacks.
+_PLAIN_FAILED = 'plain failed\nCall log:\n  - waiting for locator("text=No")\n'
 
 _DETACHED_LOG = (
     "Element is not attached to the DOM\nCall log:\n"
@@ -1220,6 +1226,13 @@ class TestStealthClickLocator:
     # and not an interception. Logs in the 1.58 compressCallLog shape. ---
 
     _PRE_SEND_FAILURES = {
+        # An ElementHandle click (the label route) has no selector to wait
+        # for: its log starts at the attempt.
+        "handle-attempt-only": (
+            "Timeout 5000ms exceeded.\nCall log:\n"
+            "  - attempting click action\n"
+            "    2 × element is not visible\n"
+        ),
         "selector": (
             "Element is not attached to the DOM\nCall log:\n"
             "  - waiting for locator(\"text=performing click action\").first\n"
@@ -1324,6 +1337,34 @@ class TestStealthClickLocator:
         log = "Timeout\nCall log:\n  - attempting click action\n    2 × performing click action\n"
         assert browser._click_was_sent(_click_err(log))
 
+    # A click's own error whose log this code cannot classify: no call log at
+    # all (the driver connection closed mid-click), a record format it does
+    # not parse (a newer Playwright's bullet), or records with none of
+    # Playwright's own attempt or wait records. Unclassifiable is not "not
+    # sent": a fallback could fire the click twice.
+    _UNCLASSIFIABLE = {
+        "no-log": "Target page, context or browser has been closed",
+        "new-format": (
+            "Timeout 10000ms exceeded.\nCall log:\n"
+            "  • attempting click action\n  • dispatching click\n"
+        ),
+        "unknown-records": "Timeout 10000ms exceeded.\nCall log:\n  - click dispatched\n",
+    }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("shape", sorted(_UNCLASSIFIABLE))
+    async def test_an_unclassifiable_click_error_counts_as_possibly_delivered(self, shape):
+        err = _click_err(self._UNCLASSIFIABLE[shape])
+        assert browser._click_was_sent(err)
+        page, loc = _camoufox_page()
+        loc.click.side_effect = err
+        page.url = "https://example.com"
+        page.is_closed.return_value = False
+        with _no_sleep(), patch.object(browser, "_human_delay", new=AsyncMock()):
+            result = await browser._impl_browser_click("#pay")
+        assert "may already have taken effect" in result["error"]
+        page.click.assert_not_awaited()  # no fallback re-click
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("camoufox", [True, False])
     async def test_a_sent_click_that_then_fails_is_reported_as_possibly_delivered(self, camoufox):
@@ -1359,6 +1400,11 @@ class TestStealthClickLocator:
             result = await browser.browser_click.fn("#pay")
         assert "timed out" in result["error"]
         assert "may already have been delivered" in result["error"]
+        # The timeout reset the active page, so a snapshot cannot check it, and
+        # a navigate shows a fresh copy: the advice must say what can.
+        assert browser._active_page is None
+        assert "browser_snapshot" not in result["error"]
+        assert "Do not click again until" in result["error"]
 
     @pytest.mark.asyncio
     async def test_the_label_clicked_is_the_one_the_hit_test_found(self):
@@ -1653,6 +1699,35 @@ doc.regions = [[0, 100, M]];
 const c = U(C);
 doc.regions = [[0, 100, O]];
 console.log(JSON.stringify([a, b, c, U(C)]));
+"""
+        )
+        assert out == [True, False, True, False]
+
+    def test_a_control_its_label_routing_calls_hidden_is_judged_on_its_label(self):
+        """The same "hidden" as _LABEL_JS: a 1x1 sr-only box, or a box that is
+        visibility:hidden, is not the control's own surface (it is clicked
+        through its label), so the probe reads the label's box, not the
+        clipped pixel. The pixel says nothing about the label either way."""
+        out = _run_js(
+            _LABELLED
+            + "const U = "
+            + browser._UNCOVERED_JS
+            + r""";
+const O = mk({ localName: 'div' });
+const B = mk({ localName: 'body' });
+C.rects = R(1, 1);
+doc.regions = [[0, 1, B], [1, 100, L]];  // the label is clear, the pixel is not
+const a = U(C);
+doc.regions = [[0, 70, L], [70, 100, O]];  // the pixel is clear, the label is covered
+const b = U(C);
+C.rects = R(20, 20);
+C.hidden = true;
+globalThis.getComputedStyle = (n) => ({
+  borderLeftWidth: '0', borderTopWidth: '0', visibility: n.hidden ? 'hidden' : 'visible',
+});
+doc.regions = [[0, 20, B], [20, 100, L]];
+const c = U(C);
+console.log(JSON.stringify([a, b, c, LABEL(C).visible]));
 """
         )
         assert out == [True, False, True, False]

@@ -1400,6 +1400,18 @@ def _is_intercept(record: str) -> bool:
     return record.startswith("<") and record.endswith(" " + _INTERCEPT_MARK)
 
 
+def _is_pre_send(record: str) -> bool:
+    # Records a Playwright 1.58 click logs before anything can be sent: the
+    # selector wait (frames.js _retryWithProgressIfNotConnected, also "waiting
+    # for element to be ..." in dom.js), each attempt (dom.js _retryAction), a
+    # cover. One of them in a log is what makes it a log this code can read.
+    return (
+        record.startswith("waiting for")  # the selector is cut out of a raw one
+        or record in ("attempting click action", "retrying click action")
+        or _is_intercept(record)
+    )
+
+
 _COVER_MAX_CHARS = 200  # Playwright already shortens the markup; this bounds a hostile page
 
 
@@ -1566,8 +1578,16 @@ def _click_was_sent(err: BaseException, selector: str = "") -> bool:
     Only a whole record of a click's own call log counts (_call_log): the same
     words inside a selector or an element preview are page or caller text,
     not a send.
+
+    A click's own error whose log this code cannot classify counts as sent:
+    no call log at all (the driver connection closed mid-click), or none of
+    the records every Playwright click log carries before it sends (its
+    selector wait, its attempt, a cover), as a reworded format would read.
+    Reading that as "not sent" would let a fallback fire the click twice.
     """
     records = _call_log(err, selector)
+    if getattr(err, _CLICK_ERROR_ATTR, False) and not any(map(_is_pre_send, records)):
+        return True
     sent = _last_record(records, lambda r: r == _CLICK_SENT_MARK)
     return sent > _last_record(records, _is_intercept)
 
@@ -1577,8 +1597,9 @@ def _click_was_sent(err: BaseException, selector: str = "") -> bool:
 # inside them. Asked only after Playwright logged an interception, to tell a
 # cover that has since cleared from one still there. A form control is clicked
 # through its label when hidden or decorated (_humanized_click), so its labels
-# count as itself, and a control with no box of its own (display:none, sr-only)
-# is judged on its visible labels' boxes. Strict on purpose: a partly covered,
+# count as itself, and a control _LABEL_JS calls hidden (no box, a 1x1 sr-only
+# box, visibility:hidden: the same `seen` test) is judged on its visible labels'
+# boxes, never on a clipped pixel. Strict on purpose: a partly covered,
 # unrendered or oddly shaped (rotated) target reads as covered and keeps the
 # block.
 _UNCOVERED_JS = """
@@ -1598,9 +1619,10 @@ _UNCOVERED_JS = """
     }
     return n;
   };
-  const boxes = (n, min) => [...n.getClientRects()].filter((r) => r.width >= min && r.height >= min);
-  let rects = boxes(e, 1);
-  if (!rects.length) rects = own.slice(1).flatMap((l) => boxes(l, 2));
+  const boxes = (n) => getComputedStyle(n).visibility === 'hidden'
+    ? [] : [...n.getClientRects()].filter((r) => r.width > 1 && r.height > 1);
+  let rects = boxes(e);
+  if (!rects.length) rects = own.slice(1).flatMap(boxes);
   if (!rects.length) return false;
   for (const r of rects)
     for (const fx of [0.25, 0.5, 0.75])
@@ -1635,9 +1657,16 @@ async def _humanized_click(page, target, timeout: int, is_label: bool = False) -
     during the move returned success with nothing clicked.
     """
     await target.scroll_into_view_if_needed(timeout=timeout)
-    pos = await target.evaluate(_PICK_POINT_JS)
+    # An ElementHandle's evaluate takes no timeout; a Locator's does.
+    pos = await (
+        target.evaluate(_PICK_POINT_JS)
+        if is_label
+        else target.evaluate(_PICK_POINT_JS, timeout=timeout)
+    )
     if not is_label and isinstance(pos, dict) and "label" in pos:
-        handle = await target.evaluate_handle("(e, i) => e.labels[i]", pos["label"])
+        handle = await target.evaluate_handle(
+            "(e, i) => e.labels[i]", pos["label"], timeout=timeout
+        )
         label = handle.as_element()
         if label is not None:
             await _humanized_click(page, label, timeout, is_label=True)
@@ -1701,9 +1730,10 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
 
     A target Playwright found covered, and that is still not entirely
     uncovered, raises :class:`ClickBlocked` on every layer, with no fallback
-    (see _blocked_click). A click Playwright reports as sent and not swallowed
-    (_click_was_sent) is never repeated by a fallback. A failure before that keeps the
-    fallback chain (plain click, keyboard, shadow-DOM script click).
+    (see _blocked_click). A click Playwright reports as sent and not swallowed,
+    or whose failure cannot be classified (_click_was_sent), is not repeated by
+    a fallback. A failure before that keeps the fallback chain (plain click,
+    keyboard, shadow-DOM script click).
 
     Other layers use plain ``page.click()``.
     """
@@ -1751,7 +1781,7 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
     loc = page.locator(selector).first
     try:
         await loc.wait_for(state="attached", timeout=timeout)
-        info = await loc.evaluate(_LABEL_JS)
+        info = await loc.evaluate(_LABEL_JS, timeout=timeout)
         label = None
         index = info.get("label", -1)
         if not info.get("visible") and type(index) is int and index >= 0:
@@ -1760,7 +1790,7 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
             # rebuilt from its id (label[for=id]) searches the whole page
             # through open shadow roots and finds another component's label
             # when ids repeat.
-            handle = await loc.evaluate_handle("(e, i) => e.labels[i]", index)
+            handle = await loc.evaluate_handle("(e, i) => e.labels[i]", index, timeout=timeout)
             label = handle.as_element()
         if label is not None:
             await _humanized_click(page, label, timeout, is_label=True)
@@ -2908,9 +2938,9 @@ async def _impl_browser_click(selector: str) -> dict:
         if not isinstance(e, ClickBlocked) and _click_was_sent(e, selector):
             return {
                 "error": (
-                    f"Click on '{selector}' was sent, then failed, so it may already "
-                    "have taken effect: call browser_snapshot and check before "
-                    f"clicking again. Detail: {e}"
+                    f"Click on '{selector}' failed after it was or may have been sent, "
+                    "so it may already have taken effect: call browser_snapshot and "
+                    f"check before clicking again. Detail: {e}"
                 )
             }
         return {"error": f"Click failed on '{selector}': {e}"}
@@ -3223,15 +3253,17 @@ async def browser_click(selector: str) -> dict:
     On the default Camoufox browser, a styled checkbox or radio whose <input>
     is hidden or covered by its own decoration is clicked through its <label>.
 
-    Keyboard fallback: if the click fails for another reason before any click
-    was sent, the tool tries keyboard activation (focus + Space/Enter). A
-    click that may already have been delivered is never repeated.
+    Keyboard fallback (Camoufox only): if the click fails for another reason
+    before any click was sent, the tool tries keyboard activation (focus + Space/Enter). A
+    click Playwright may have sent is not repeated by a fallback; the keyboard
+    and script fallbacks are not hit-tested, so verify what they did.
     For manual keyboard navigation, use browser_press_key with Tab/Space.
 
     Returns the updated page snapshot after clicking. "clicked" means the
     click was sent; confirm the page changed. An error that says the click
-    may already have taken effect (it was sent, or the call timed out) is
-    not a failed click: check the page before clicking again.
+    may already have taken effect is not a failed click: call browser_snapshot
+    and check before clicking again. A timeout also resets the page: do not
+    click again until the effect is confirmed where it persists.
     """
     return await _with_tool_timeout(
         _impl_browser_click(selector),
@@ -3239,10 +3271,15 @@ async def browser_click(selector: str) -> dict:
         f"browser_click('{selector}')",
         # The hang this timeout exists for can come after the click events
         # were sent (Playwright's post-action wait), and the cancellation
-        # discards the call log that would say so.
+        # discards the call log that would say so. The reset below drops the
+        # page, so a snapshot cannot check it, and a navigate loads a fresh
+        # copy that shows only what the click saved server-side.
         note=(
-            "The click may already have been delivered: after browser_navigate, "
-            "check whether it took effect before clicking again. "
+            "The click may already have been delivered, and its page can no longer "
+            "be read. Do not click again until its effect is confirmed where it "
+            "persists (for a submit: the confirmation, order or account page it "
+            "leads to) or by the user: a reloaded form is empty whether or not "
+            "the submit went through. "
         ),
     )
 
