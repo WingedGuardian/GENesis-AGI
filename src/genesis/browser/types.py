@@ -55,3 +55,8 @@ class ProfileInfo:
     exists: bool = False
     size_mb: float = 0.0
     sessions: list[BrowserSession] = field(default_factory=list)
+    browser: str = "chromium"
+    """Which browser's profile: ``camoufox`` or ``chromium``."""
+    error: str = ""
+    """Set when the cookie database could not be read (``sessions`` is then
+    empty because it is UNKNOWN, not because there are none)."""

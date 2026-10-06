@@ -1403,6 +1403,303 @@ class TestTurnstileShortGrace:
         alert.assert_awaited()         # ladder ran to exhaustion
 
 
+# ---------------------------------------------------------------------------
+# B7: cookie tools cover both profiles, label each, count, and use the live
+# context when this process runs that browser.
+# ---------------------------------------------------------------------------
+
+
+class _FakeJar:
+    """A live context's cookie jar with the browser's semantics, as measured on
+    headless Camoufox: adding a cookie replaces the one with the same (name,
+    domain, path), and an already-expired one deletes it. clear_cookies(domain=)
+    is Playwright 1.58's algorithm: read all, clear ALL, re-add the rest; the
+    current code never calls it, it is here to reproduce the old defect.
+    ``fail_after`` makes one add_cookies call fail after applying that many,
+    ``ignore_writes`` drops writes silently, and ``set_meanwhile`` is a cookie
+    a page sets while the delete runs."""
+
+    def __init__(self, cookies, fail_after=None, ignore_writes=False, set_meanwhile=None):
+        self.jar = [{"name": f"c{i}", "path": "/", **c} for i, c in enumerate(cookies)]
+        self.fail_after = fail_after
+        self.ignore_writes = ignore_writes
+        self.set_meanwhile = set_meanwhile
+
+    @staticmethod
+    def _key(c):
+        return (c["name"], c["domain"], c["path"], c.get("partitionKey"))
+
+    async def cookies(self):
+        await asyncio.sleep(0)
+        return [dict(c) for c in self.jar]
+
+    async def add_cookies(self, cookies):
+        await asyncio.sleep(0)
+        if self.ignore_writes:
+            return
+        for i, c in enumerate(cookies):
+            if self.fail_after is not None and i >= self.fail_after:
+                raise RuntimeError("browser rejected a cookie")
+            self.jar = [j for j in self.jar if self._key(j) != self._key(c)]
+            if c.get("expires", -1) == -1 or c["expires"] > datetime.now(UTC).timestamp():
+                self.jar.append(dict(c))
+        if self.set_meanwhile:
+            self.jar.append(self.set_meanwhile)
+
+    async def clear_cookies(self, domain=None):
+        current = await self.cookies()
+        self.jar = []
+        await self.add_cookies([c for c in current if not domain.match(c["domain"])])
+
+
+def _live_camoufox_ctx(cookies, **jar_kw):
+    page = MagicMock()
+    page.is_closed.return_value = False
+    page.url = "https://example.com"
+    ctx = _FakeJar(cookies, **jar_kw)
+    browser._stealth_page = page
+    browser._stealth_browser = ctx
+    browser._stealth_cm = MagicMock()  # the browser this process launched is open
+    return ctx
+
+
+class TestCookieToolsBothProfiles:
+    @pytest.mark.asyncio
+    async def test_a_closed_tab_keeps_the_live_context(self, tmp_path):
+        """Cookies belong to the context, not the remembered page: a closed tab
+        with the browser still open must clear through the context, not refuse
+        the profile as in use."""
+        ctx = _live_camoufox_ctx([{"domain": ".x.com"}])
+        browser._stealth_page.is_closed.return_value = True
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            result = await browser._impl_browser_clear_domain("x.com")
+        assert result["profiles"][0]["source"] == "live browser"
+        assert ctx.jar == []
+
+    @pytest.mark.asyncio
+    async def test_sessions_labels_both_profiles(self, tmp_path):
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            result = await browser._impl_browser_sessions()
+        kinds = [p["browser"] for p in result["profiles"]]
+        assert kinds == ["camoufox", "chromium"]
+        assert all(p["exists"] is False for p in result["profiles"])
+
+    @pytest.mark.asyncio
+    async def test_a_running_camoufox_is_read_through_its_live_context(self, tmp_path):
+        _live_camoufox_ctx([
+            {"domain": ".github.com"}, {"domain": "github.com"}, {"domain": ".medium.com"},
+        ])
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            result = await browser._impl_browser_sessions()
+        cam = result["profiles"][0]
+        assert cam["source"] == "live browser"
+        assert cam["sessions"] == [
+            {"domain": "github.com", "cookie_count": 2},
+            {"domain": "medium.com", "cookie_count": 1},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_clear_uses_the_live_context_and_counts_exact_matches(self, tmp_path):
+        ctx = _live_camoufox_ctx([
+            {"domain": ".x.com"}, {"domain": "api.x.com"}, {"domain": ".netflix.com"},
+        ])
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            result = await browser._impl_browser_clear_domain("X.com")
+        assert result["domain"] == "x.com"
+        assert result["cookies_removed"] == 2
+        cam = result["profiles"][0]
+        assert cam == {"browser": "camoufox", "source": "live browser", "removed": 2}
+        assert [c["domain"] for c in ctx.jar] == [".netflix.com"]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_live_clear_never_drops_other_sites(self, tmp_path):
+        """Playwright's clear_cookies(domain=) clears the whole jar and re-adds
+        the rest, so a failure partway logged the profile out of every other
+        site. Only the matching cookies may be touched, and the entry reports
+        what was actually removed."""
+        ctx = _live_camoufox_ctx(
+            [{"domain": ".x.com"}, {"domain": "api.x.com"},
+             {"domain": ".netflix.com"}, {"domain": "netflix.com"}],
+            fail_after=1,
+        )
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            result = await browser._impl_browser_clear_domain("x.com")
+        assert sorted(c["domain"] for c in ctx.jar if "netflix" in c["domain"]) == [
+            ".netflix.com", "netflix.com",
+        ]
+        cam = result["profiles"][0]
+        assert cam["removed"] == 1 and "browser rejected a cookie" in cam["error"]
+        assert result["cookies_removed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_write_the_browser_ignores_is_reported_not_counted(self, tmp_path):
+        _live_camoufox_ctx([{"domain": ".x.com"}, {"domain": ".netflix.com"}], ignore_writes=True)
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            result = await browser._impl_browser_clear_domain("x.com")
+        cam = result["profiles"][0]
+        assert cam["removed"] == 0 and "1 matching cookies remain" in cam["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_cookie_set_meanwhile_does_not_cancel_a_removal(self, tmp_path):
+        """The count is by identity: a page setting a new matching cookie during
+        the clear must not make a really-removed cookie read as kept."""
+        _live_camoufox_ctx(
+            [{"domain": ".x.com"}, {"domain": "api.x.com"}],
+            set_meanwhile={"name": "fresh", "domain": ".x.com", "path": "/"},
+        )
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            result = await browser._impl_browser_clear_domain("x.com")
+        cam = result["profiles"][0]
+        assert cam["removed"] == 2 and "1 matching cookies remain" in cam["error"]
+
+    def test_the_expired_copy_keeps_every_identity_field(self):
+        cookie = {
+            "name": "n", "value": "secret", "domain": ".x.com", "path": "/p",
+            "expires": 2_000_000_000, "httpOnly": True, "secure": True, "sameSite": "Strict",
+            "partitionKey": "https://top.example", "_crHasCrossSiteAncestor": False,
+        }
+        copy = browser._expired_copy(cookie)
+        assert copy["expires"] == 1 and copy["value"] != "secret"
+        for k in ("name", "domain", "path", "httpOnly", "secure", "sameSite",
+                  "partitionKey", "_crHasCrossSiteAncestor"):
+            assert copy[k] == cookie[k], k
+
+    @pytest.mark.asyncio
+    async def test_clear_rejects_a_non_domain(self):
+        result = await browser._impl_browser_clear_domain("")
+        assert "error" in result
+
+
+    @pytest.mark.asyncio
+    async def test_a_hung_live_cookie_call_reports_an_error(self, tmp_path):
+        page = MagicMock()
+        page.is_closed.return_value = False
+        page.url = "https://example.com"
+
+        async def hang():
+            await asyncio.Event().wait()
+
+        ctx = MagicMock()
+        ctx.cookies = MagicMock(side_effect=lambda: hang())
+        browser._stealth_page = page
+        browser._stealth_browser = ctx
+        browser._stealth_cm = MagicMock()
+        with (
+            patch.object(browser, "_COOKIE_CALL_TIMEOUT_S", 0.1),
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            listed = await browser._impl_browser_sessions()
+            cleared = await browser._impl_browser_clear_domain("x.com")
+        assert "error" in listed["profiles"][0]
+        assert "error" in cleared["profiles"][0]
+        assert cleared["cookies_removed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_bare_tld_is_refused(self):
+        result = await browser._impl_browser_clear_domain("com")
+        assert "error" in result and "no dot" in result["error"]
+
+    def test_localhost_is_a_valid_cookie_domain(self):
+        from genesis.browser.profile import normalize_domain
+
+        assert normalize_domain("localhost") == "localhost"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("impl", ["sessions", "clear"])
+    async def test_a_cookie_call_waits_for_a_browser_that_is_starting(self, tmp_path, impl):
+        """Devin round 1 (severe): mid-startup the context is still unset, so a
+        cookie call that skipped the lifecycle lock fell back to the profile
+        FILE while the browser was opening it. It must wait and use the live
+        context once startup completes."""
+        ctx = _FakeJar([{"domain": ".x.com"}])
+        started = asyncio.Event()
+
+        async def starting_browser():
+            async with browser._browser_lock:
+                browser._stealth_cm = MagicMock()  # __aenter__ still pending
+                started.set()
+                await asyncio.sleep(0.05)
+                browser._stealth_browser = ctx
+
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            launch = asyncio.create_task(starting_browser())
+            await started.wait()
+            if impl == "sessions":
+                result = await browser._impl_browser_sessions()
+            else:
+                result = await browser._impl_browser_clear_domain("x.com")
+            await launch
+        assert result["profiles"][0]["source"] == "live browser"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_clears_do_not_count_the_same_cookies_twice(self, tmp_path):
+        """Codex round 1 (P2): two clears that both read the jar before either
+        cleared it each reported the same cookies as removed."""
+        _live_camoufox_ctx([{"domain": ".x.com"}, {"domain": "api.x.com"}])
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            a, b = await asyncio.gather(
+                browser._impl_browser_clear_domain("x.com"),
+                browser._impl_browser_clear_domain("x.com"),
+            )
+        assert a["cookies_removed"] + b["cookies_removed"] == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("impl", ["sessions", "clear"])
+    async def test_a_cookie_call_refreshes_the_idle_clock(self, tmp_path, monkeypatch, impl):
+        """Devin round 1: cookie tools left _last_used alone, so a session using
+        only them had its live browser closed by the idle watcher."""
+        monkeypatch.setattr(browser, "_last_used", 0.0)
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            if impl == "sessions":
+                await browser._impl_browser_sessions()
+            else:
+                await browser._impl_browser_clear_domain("x.com")
+        assert browser._last_used > 0
+
+    @pytest.mark.asyncio
+    async def test_an_internationalized_domain_clears_live_ascii_cookies(self, tmp_path):
+        ctx = _live_camoufox_ctx([{"domain": ".xn--bcher-kva.example"}, {"domain": ".example.com"}])
+        with (
+            patch.object(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile"),
+            patch.object(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile"),
+        ):
+            result = await browser._impl_browser_clear_domain("bücher.example")
+        assert result["domain"] == "xn--bcher-kva.example"
+        assert result["profiles"][0]["removed"] == 1
+        assert [c["domain"] for c in ctx.jar] == [".example.com"]
+
+
 # Must stay in step with scripts/browser.py's copy of the scheme
 # (tests/test_scripts/test_browser_cli_screenshot_path.py asserts the same
 # shape on that side). Format: %Y%m%dT%H%M%S%fZ -> 20260902T190142123456Z

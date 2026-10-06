@@ -1,15 +1,23 @@
-"""BrowserProfileManager — manages persistent Playwright browser profiles.
+"""BrowserProfileManager — manages persistent browser profiles.
 
-The profile directory (default: ~/.genesis/browser-profile/) stores Chrome's
-user-data-dir, which persists cookies, localStorage, and login sessions across
-Playwright MCP sessions. This enables Layer 2 browser automation (managed
-browser with agent-owned logins).
+Two profiles exist, one per local browser layer: Camoufox (Firefox,
+~/.genesis/camoufox-profile/, cookies in ``cookies.sqlite``) and the Chromium
+fallback (~/.genesis/browser-profile/, cookies in ``Default/Cookies``). Each
+persists cookies, localStorage and login sessions across MCP sessions.
+
+The cookie readers here work on the profile FILES. Editing one is only safe
+while no browser has the profile open: a running browser keeps its cookie jar
+in memory and writes it back, so the edit would be lost or would race it.
+``running_pid()`` reports that case; a caller that holds the live browser
+context uses its cookie API instead (see mcp/health/browser.py).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import shutil
 import sqlite3
 from pathlib import Path
@@ -20,6 +28,87 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
 
+# Per browser: cookie-database candidates relative to the profile dir (first
+# existing wins), table, host column, and the lock symlink the browser keeps in
+# the profile while it is open. Chromium moved its cookie file to
+# Default/Network/Cookies on some platforms; the Linux profile on this install
+# still uses Default/Cookies (read 2026-10-05), so both are tried.
+_COOKIE_STORES: dict[str, tuple[tuple[str, ...], str, str, str]] = {
+    "chromium": (
+        ("Default/Network/Cookies", "Default/Cookies"), "cookies", "host_key", "SingletonLock",
+    ),
+    "camoufox": (("cookies.sqlite",), "moz_cookies", "host", "lock"),
+}
+
+
+class ProfileInUse(RuntimeError):
+    """The profile is open in a browser process this caller does not control."""
+
+
+def normalize_domain(domain: str) -> str:
+    """Lower-case a domain, drop leading and trailing dots and encode Unicode
+    labels to their ASCII (IDNA) form; reject anything else. Cookie hosts carry
+    no trailing dot, so ``x.com.`` (the FQDN spelling) must become ``x.com``
+    or it would match nothing."""
+    d = (domain or "").strip().lower().strip(".")
+    if not d or any(c.isspace() or c in "/:%*?" for c in d):
+        raise ValueError(f"not a domain: {domain!r}")
+    if not d.isascii():
+        # Browsers store cookie hosts as ASCII IDNA labels, so a Unicode
+        # domain would match nothing. UTS46 non-transitional, as browsers
+        # encode (straße.de is xn--strae-oqa.de; the stdlib codec gives
+        # strasse.de, another site). ASCII input is left as is.
+        import idna
+
+        try:
+            # UTS46 maps a full-width or ideographic dot to ".", so strip again.
+            d = idna.encode(d, uts46=True).decode("ascii").strip(".")
+        except idna.IDNAError as exc:
+            raise ValueError(f"not a domain: {domain!r} ({exc})") from exc
+    # A bare label ("com") would match every cookie under that TLD in both
+    # profiles; only localhost is a real single-label cookie host.
+    if "." not in d and d != "localhost":
+        raise ValueError(f"not a domain (no dot): {domain!r}")
+    if d != "localhost" and _is_public_suffix(d):
+        # "co.uk" would match bank.co.uk and shop.co.uk alike: clearing it is a
+        # bulk logout across unrelated sites in both profiles.
+        raise ValueError(f"not a registrable domain (a public suffix): {domain!r}")
+    return d
+
+
+_SUFFIXES = None
+
+
+def _is_public_suffix(d: str) -> bool:
+    """Whether ``d`` is itself a public suffix (``co.uk``, ``github.io``).
+
+    tldextract with its BUNDLED Public Suffix List snapshot (no fetch, no
+    cache dir), including the private section, so ``github.io`` counts and a
+    clear cannot reach every user's site under it. It is a declared
+    dependency; if it is missing anyway the clear is refused rather than
+    guessed, because this check guards a credential-affecting bulk delete.
+    """
+    global _SUFFIXES
+    if _SUFFIXES is None:
+        try:
+            import tldextract
+        except ImportError as exc:
+            raise ValueError(
+                "cannot check the public-suffix boundary (tldextract is not installed)"
+            ) from exc
+        _SUFFIXES = tldextract.TLDExtract(
+            suffix_list_urls=(), cache_dir=None, include_psl_private_domains=True
+        )
+    return _SUFFIXES(d).domain == ""
+
+
+def domain_matches(host: str, domain: str) -> bool:
+    """True when a cookie host belongs to ``domain``: the domain itself or one
+    of its subdomains. ``x.com`` matches ``x.com`` and ``api.x.com``, never
+    ``netflix.com`` (which the substring match this replaced did)."""
+    h = (host or "").lower().lstrip(".")
+    return h == domain or h.endswith("." + domain)
+
 
 class BrowserProfileManager:
     """Manages the persistent browser profile directory.
@@ -29,12 +118,76 @@ class BrowserProfileManager:
     backing up, and selectively clearing profile state.
     """
 
-    def __init__(self, profile_dir: str | Path | None = None) -> None:
+    def __init__(
+        self, profile_dir: str | Path | None = None, browser: str = "chromium",
+    ) -> None:
+        if browser not in _COOKIE_STORES:
+            raise ValueError(f"unknown browser profile kind: {browser!r}")
         self._profile_dir = Path(profile_dir) if profile_dir else _DEFAULT_PROFILE_DIR
+        self._browser = browser
 
     @property
     def profile_dir(self) -> Path:
         return self._profile_dir
+
+    @property
+    def browser(self) -> str:
+        return self._browser
+
+    def _cookie_store(self) -> tuple[Path, str, str]:
+        candidates, table, column, _lock = _COOKIE_STORES[self._browser]
+        paths = [self._profile_dir / c for c in candidates]
+        path = next((p for p in paths if p.exists()), paths[-1])
+        return path, table, column
+
+    def running_pid(self) -> int | None:
+        """PID of a live browser that has this profile open, else None.
+
+        Both browsers keep a lock symlink in the profile while it is open
+        (Firefox ``lock`` -> ``<ip>:+<pid>``, Chromium ``SingletonLock`` ->
+        ``<host>-<pid>``). The link alone proves nothing: Camoufox 156 leaves
+        it in place after a clean close (MEASURED 2026-10-05), and a crash
+        leaves one too. Only a link naming a live pid counts as running.
+        """
+        lock = self._profile_dir / _COOKIE_STORES[self._browser][3]
+        try:
+            target = os.readlink(lock)
+        except OSError:
+            return None
+        m = re.search(r"(\d+)$", target)
+        if not m:
+            return None
+        pid = int(m.group(1))
+        if pid <= 1:
+            return None  # never probe init or the process group
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        except PermissionError:
+            return pid  # alive, owned by another user
+        if not self._pid_uses_profile(pid):
+            return None  # a stale link whose pid the OS has since reused
+        return pid
+
+    def _pid_uses_profile(self, pid: int) -> bool:
+        """Whether ``pid``'s command line names this profile directory.
+
+        Playwright launches Firefox (Camoufox) with ``-profile <dir>`` and
+        Chromium with ``--user-data-dir=<dir>`` (READ: its server/firefox and
+        server/chromium launchers), and the lock names that browser's main
+        process. A live pid whose command line does not mention the directory
+        is an unrelated process reusing the pid of a closed browser. Anything
+        unreadable counts as a match, so the check only ever un-blocks a case
+        it can prove.
+        """
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return True
+        args = raw.decode(errors="replace").split("\0")
+        wanted = {str(self._profile_dir), str(self._profile_dir.resolve())}
+        return any(w in a for a in args for w in wanted)
 
     def ensure_dir(self) -> Path:
         """Create the profile directory if it doesn't exist."""
@@ -47,81 +200,122 @@ class BrowserProfileManager:
             return ProfileInfo(
                 profile_path=str(self._profile_dir),
                 exists=False,
+                browser=self._browser,
             )
 
         size_bytes = sum(
             f.stat().st_size for f in self._profile_dir.rglob("*") if f.is_file()
         )
-        sessions = self._list_sessions()
+        error = ""
+        try:
+            sessions = self._list_sessions()
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+            # Unreadable is its own state, never "no sessions".
+            logger.debug("Could not read cookies database", exc_info=True)
+            sessions = []
+            error = f"cookie database unreadable: {exc}"
 
         return ProfileInfo(
             profile_path=str(self._profile_dir),
             exists=True,
             size_mb=round(size_bytes / (1024 * 1024), 2),
             sessions=sessions,
+            browser=self._browser,
+            error=error,
         )
 
     def _list_sessions(self) -> list[BrowserSession]:
-        """List logged-in sessions by reading Chrome's cookie database."""
-        cookies_db = self._profile_dir / "Default" / "Cookies"
+        """Count cookies per domain in the profile's cookie database.
+
+        Read-only (``mode=ro``, which still sees a WAL-resident write). Raises
+        sqlite errors so an unreadable store is never reported as empty.
+        """
+        cookies_db, table, column = self._cookie_store()
         if not cookies_db.exists():
             return []
 
         sessions: dict[str, int] = {}
+        conn = sqlite3.connect(f"file:{cookies_db}?mode=ro", uri=True)
         try:
-            conn = sqlite3.connect(str(cookies_db))
-            try:
-                cursor = conn.execute(
-                    "SELECT host_key, COUNT(*) FROM cookies GROUP BY host_key"
-                )
-                for host, count in cursor.fetchall():
-                    domain = host.lstrip(".")
-                    sessions[domain] = sessions.get(domain, 0) + count
-            finally:
-                conn.close()
-        except (sqlite3.OperationalError, sqlite3.DatabaseError):
-            logger.debug("Could not read cookies database", exc_info=True)
-            return []
+            # table and column come from _COOKIE_STORES, never from a caller.
+            cursor = conn.execute(
+                f"SELECT {column}, COUNT(*) FROM {table} GROUP BY {column}"  # noqa: S608
+            )
+            for host, count in cursor.fetchall():
+                domain = (host or "").lstrip(".")
+                sessions[domain] = sessions.get(domain, 0) + count
+        finally:
+            conn.close()
 
         return [
             BrowserSession(domain=domain, cookie_count=count)
             for domain, count in sorted(sessions.items())
         ]
 
-    def clear_domain(self, domain: str) -> bool:
-        """Remove cookies for a specific domain (selective logout).
+    def clear_domain(self, domain: str) -> int:
+        """Remove the cookies of ``domain`` and its subdomains (selective logout).
 
-        Returns True if any cookies were removed.
+        Matching is by whole labels (see :func:`domain_matches`). Returns the
+        number of cookies removed. Raises :class:`ProfileInUse` when a browser
+        has the profile open, because that browser would write its in-memory
+        cookies back over the edit; ``ValueError`` on a non-domain; and the
+        sqlite error when the store cannot be read or written (never a quiet 0).
         """
-        cookies_db = self._profile_dir / "Default" / "Cookies"
+        d = normalize_domain(domain)
+        pid = self.running_pid()
+        if pid is not None:
+            raise ProfileInUse(
+                f"the {self._browser} profile is open in browser process {pid}; "
+                "its cookies can only be cleared by the session running that "
+                "browser, or after it closes"
+            )
+        cookies_db, table, column = self._cookie_store()
         if not cookies_db.exists():
-            return False
+            return 0
+        if cookies_db.is_symlink():
+            # A cookie store is a plain file; a link could point the edit at
+            # another database.
+            raise ValueError(f"{cookies_db} is a symlink; not editing it")
 
+        conn = sqlite3.connect(str(cookies_db))
         try:
-            conn = sqlite3.connect(str(cookies_db))
-            try:
-                # Escape LIKE wildcards to prevent unintended matches.
-                escaped = domain.replace("%", r"\%").replace("_", r"\_")
-                cursor = conn.execute(
-                    "DELETE FROM cookies WHERE host_key LIKE ? ESCAPE '\\'",
-                    (f"%{escaped}%",),
+            hosts = [
+                h
+                for (h,) in conn.execute(f"SELECT DISTINCT {column} FROM {table}")  # noqa: S608
+                if domain_matches(h, d)
+            ]
+            removed = 0
+            for host in hosts:
+                cur = conn.execute(f"DELETE FROM {table} WHERE {column} = ?", (host,))  # noqa: S608
+                removed += cur.rowcount
+            # Re-check just before committing: a browser that opened the profile
+            # since the check above would write its in-memory cookies back over
+            # this edit. Narrows the window to the commit itself.
+            pid = self.running_pid()
+            if pid is not None:
+                conn.rollback()
+                raise ProfileInUse(
+                    f"the {self._browser} profile was opened by browser process {pid} "
+                    "during the clear; nothing was changed"
                 )
-                conn.commit()
-                removed = cursor.rowcount > 0
-            finally:
-                conn.close()
-            if removed:
-                logger.info("Cleared cookies for domain: %s", domain)
-            return removed
-        except (sqlite3.OperationalError, sqlite3.DatabaseError):
-            logger.error("Failed to clear cookies for %s", domain, exc_info=True)
-            return False
+            conn.commit()
+        finally:
+            conn.close()
+        if removed:
+            logger.info("Cleared %d %s cookies for domain: %s", removed, self._browser, d)
+        return removed
 
     def export_state(self, dest: str | Path) -> Path:
         """Export the browser state (cookies, localStorage) to a JSON file.
 
         This uses Playwright's storage-state format for portability.
         """
+        if self._browser != "chromium":
+            # The query below is Chromium's schema; another profile would
+            # export an empty list without saying so.
+            raise NotImplementedError(
+                f"export_state supports the chromium profile, not {self._browser}"
+            )
         dest_path = Path(dest)
         cookies_db = self._profile_dir / "Default" / "Cookies"
 
