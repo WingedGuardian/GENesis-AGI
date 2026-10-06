@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -33,6 +34,10 @@ from genesis.hostmetrics.preflight import (
 
 EXIT_USAGE = 64
 _POLL_SECS = 30.0  # --wait-until-fits re-check interval; each check costs a CPU sample
+# Far beyond any real host (GiB or core-percent); a larger number is a typo, and
+# 1e300 overflows int(value * GIB) into a traceback instead of a usage error.
+_MAX_NUMBER = 1e6
+_MAX_WINDOW = 3600.0  # seconds: a CPU sample longer than an hour is a mistake
 
 
 class _Parser(argparse.ArgumentParser):
@@ -57,7 +62,7 @@ def take_snapshot(disk_paths: list[str], cpu_window: float, host: bool = True) -
 def _disk_arg(text: str) -> tuple[str, int]:
     path, sep, gib = text.rpartition("=")
     try:
-        if not sep or not path or float(gib) < 0:
+        if not sep or not path or not 0 <= float(gib) <= _MAX_NUMBER:  # nan fails too
             raise ValueError
         return str(Path(path).expanduser()), int(float(gib) * GIB)
     except ValueError:
@@ -69,15 +74,19 @@ def _nonneg(text: str) -> float:
         value = float(text)
     except ValueError:
         value = -1.0
-    if value < 0:
-        raise argparse.ArgumentTypeError(f"expected a number >= 0, got {text!r}")
+    if not math.isfinite(value) or not 0 <= value <= _MAX_NUMBER:
+        raise argparse.ArgumentTypeError(
+            f"expected a number from 0 to {_MAX_NUMBER:g}, got {text!r}"
+        )
     return value
 
 
 def _window(text: str) -> float:
     value = _nonneg(text)
-    if value < 0.5:  # shorter samples are noise, and a zero interval reads as unreadable
-        raise argparse.ArgumentTypeError(f"expected at least 0.5 seconds, got {text!r}")
+    if not 0.5 <= value <= _MAX_WINDOW:  # shorter is noise; zero reads as unreadable
+        raise argparse.ArgumentTypeError(
+            f"expected 0.5 to {_MAX_WINDOW:g} seconds, got {text!r}"
+        )
     return value
 
 
@@ -130,18 +139,21 @@ def _status(args) -> int:
 
 
 def _decide(args) -> tuple[Request, Levers, Result]:
-    disks, disk_notes = group_disks(args.disk or [], readings.disk_device)
     req = Request(
         name=args.name,
         ram=None if args.ram is None else int(args.ram * GIB),
         cpu=args.cpu,
-        disks=disks,
         assume_default=args.assume_default,
         approved_over_line=frozenset(args.approved_over_line or []),
     )
     levers = load_levers()
-    result = missing_estimate(req, levers)  # before the CPU sample and the host call
+    # Before any reading: the CPU sample, the host call, even a stat of a disk path
+    # (a stalled network mount would block a command that is about to say NO).
+    disk_notes: list[str] = []
+    result = missing_estimate(req, levers)
     if result is None:
+        disks, disk_notes = group_disks(args.disk or [], readings.disk_device)
+        req = replace(req, disks=disks)
         snap = take_snapshot(list(req.disks), args.cpu_window, host=not args.no_host)
         result = evaluate(snap, req, levers)
     return req, levers, replace(result, notes=(*disk_notes, *result.notes))

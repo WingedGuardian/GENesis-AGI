@@ -67,6 +67,8 @@ def parse_ram_status(payload: dict) -> HostMemory:
             unavailable=f"guardian ram-status: {_classify(str(payload.get('error', '')))}"
         )
     host = payload.get("host") or {}
+    if not isinstance(host, dict):
+        return HostMemory(unavailable="unrecognised host field in ram-status")
     if host.get("used_pct") is None:
         return HostMemory(unavailable="host memory not measured by the guardian")
     match = _DETAIL_RE.search(str(host.get("detail", "")))

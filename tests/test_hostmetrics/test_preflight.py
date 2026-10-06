@@ -290,3 +290,36 @@ def test_live_jobs_reservation_counts_on_the_host_leg_too():
     assert by(evaluate(snap(host=host), req(ram=2), Levers()), "memory (host)").verdict == GO
     s = replace(snap(host=host), reserved_beyond_use=2 * GIB)
     assert by(evaluate(s, req(ram=2), Levers()), "memory (host)").verdict == WAIT
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["preflight", "--name", "j", "--ram", "1", "--cpu", "nan"],
+        ["preflight", "--name", "j", "--ram", "nan", "--cpu", "50"],
+        ["preflight", "--name", "j", "--ram", "inf", "--cpu", "50"],
+        ["preflight", "--name", "j", "--ram", "1", "--cpu", "50", "--disk", "/x=inf"],
+        ["preflight", "--name", "j", "--ram", "1", "--cpu", "50", "--disk", "/x=nan"],
+        ["status", "--cpu-window", "nan"],
+        ["status", "--cpu-window", "inf"],
+        # finite but absurd: overflowed int(value * GiB) into a traceback (exit 1)
+        ["preflight", "--name", "j", "--ram", "1e300", "--cpu", "50"],
+        ["preflight", "--name", "j", "--ram", "1", "--cpu", "50", "--disk", "/x=1e300"],
+        ["status", "--cpu-window", "1e300"],
+        ["status", "--cpu-window", "86400"],
+    ],
+)
+def test_non_finite_numbers_are_usage_errors(fixed_snapshot, argv):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(argv)
+    assert exc.value.code == cli.EXIT_USAGE
+
+
+def test_missing_estimate_probes_no_disk(monkeypatch, capsys):
+    def boom(*a, **k):
+        raise AssertionError("a disk path was probed before the estimate check")
+
+    monkeypatch.setattr(cli.readings, "disk_device", boom)
+    monkeypatch.setattr(cli, "load_levers", lambda: Levers())
+    assert cli.main(["preflight", "--name", "j", "--ram", "1", "--disk", "/x=1"]) == 2
+    assert "estimate required" in capsys.readouterr().out

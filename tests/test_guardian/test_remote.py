@@ -469,3 +469,41 @@ class TestVzdumpStatus:
             res = await remote.request_vzdump_status("not-a-upid")
         assert not res["ok"] and "invalid UPID" in res["error"]
         assert not called, "malformed UPID must never reach the gateway"
+
+
+class TestCancellationKillsTheSshChild:
+    """A caller's own deadline (an outer asyncio.wait_for) cancels _ssh_command.
+
+    MEASURED before the fix: with a fake ssh that hangs, a cancelled call returned
+    while the ssh child lived on, reparented to PID 1, and the interpreter then
+    printed an "Event loop is closed" traceback at teardown.
+    """
+
+    def test_outer_timeout_leaves_no_ssh_process(self, tmp_path, monkeypatch):
+        import asyncio
+        import os
+        import time
+
+        pidfile = tmp_path / "ssh.pid"
+        fake = tmp_path / "ssh"
+        fake.write_text(f"#!/bin/sh\necho $$ > {pidfile}\nexec sleep 30\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+        r = GuardianRemote(host_ip="192.0.2.10", host_user="tester", key_path="/nonexistent")
+
+        async def call():
+            return await asyncio.wait_for(r._ssh_command("ram-status", timeout=60), 2.0)
+
+        with pytest.raises(TimeoutError):
+            asyncio.run(call())
+        assert pidfile.exists(), "the fake ssh never started: the test proves nothing"
+        pid = int(pidfile.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        os.kill(pid, 9)
+        pytest.fail("the ssh child outlived the cancelled call")
