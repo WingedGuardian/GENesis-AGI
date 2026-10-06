@@ -196,6 +196,9 @@ names, so an overlay of a read-only file is editable (#2446).
   `GENESIS_OUTPUT_DIR`, `GENESIS_CC_PROJECT_ID`; tuning — `GENESIS_DB_BUSY_TIMEOUT_MS`
   (MCP children default it to 15000), read-pool sizes, `GENESIS_RECALL_RERANK_RPM`.
   All in `src/genesis/env.py`. They reach a process via the unit, `secrets.env`, or the parent.
+- **`~/.genesis/resource-budget.env`** — optional `KEY=VALUE` file for the resource-budget
+  levers (`GENESIS_RB_*`), read by `genesis.hostmetrics`; the process environment wins over
+  it. Details: `docs/reference/resource-budget.md`.
 - **`env.example`** — a template of deployment/topology env vars. Its header suggests
   "`.env` at the repo root", but nothing in `src/` or `scripts/` loads a repo-root `.env`.
   Runtime entries belong in `secrets.env` or the unit environment. Install-time entries
