@@ -2,11 +2,12 @@
 
 Owner ruling 2026-10-06: on an install whose sessions push from linked worktrees
 (``git -C <path> push``) and chain steps, the routine push prompts go silent — a
-first push in any spelling, a publishing ``gh pr create``, close-then-push, a
-PR-less re-push off the public repo, a re-push chained with other steps. A force
-push to another remote and any other push keep asking, and so does any command
-that raises one of those beside a routine prompt. Every push URL must be a
-github.com https repo of the configured owner.
+first push in any spelling, close-then-push, a PR-less re-push off the public
+repo, a re-push chained with other steps. A force push to another remote, a
+publishing ``gh pr create`` (dropped from the switch, owner ruling 2026-10-06),
+a push of the remote's recorded default branch and any other push keep asking,
+and so does any command that raises one of those beside a routine prompt. Every
+push URL must be a github.com https repo of the configured owner.
 
 Same shape as ``push_publish``: silenced means NO permission decision plus a
 context note, never an ``allow``. The harness is the ``push_publish`` suite's:
@@ -34,7 +35,7 @@ OWNED = "https://github.com/owner/private-fork"
 STRANGER = "https://github.com/stranger/repo"
 
 
-def _repo(tmp_path, git_config=()) -> Path:
+def _repo(tmp_path, git_config=(), git_cmds=()) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir(parents=True)
     for args in (
@@ -55,6 +56,8 @@ def _repo(tmp_path, git_config=()) -> Path:
         capture_output=True,
         timeout=30,
     )
+    for args in git_cmds:
+        subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=30, check=True)
     return repo
 
 
@@ -66,13 +69,14 @@ def _run(
     git_config=(("remote.origin.url", PUBLIC),),
     *,
     from_elsewhere=False,
+    git_cmds=(),
 ):
     """Run the guard on ``command``; ``{repo}`` in it is the test repo's path.
 
     ``from_elsewhere`` puts the payload cwd OUTSIDE the repo, as Claude Code's
     Bash tool does after it resets to the project root: only ``git -C`` names it.
     """
-    repo = _repo(tmp_path, git_config)
+    repo = _repo(tmp_path, git_config, git_cmds)
     cwd = tmp_path if from_elsewhere else repo
     command = command.replace("{repo}", str(repo))
     payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(cwd)}
@@ -164,10 +168,39 @@ def test_a_first_push_to_another_owned_repo_is_silenced(monkeypatch, tmp_path, c
     )
 
 
-def test_a_publishing_pr_create_is_silenced(
-    monkeypatch, tmp_path, capsys, off, create_publishes
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr create --title t --body b",
+        "gh pr create --title t --repo owner/private-fork",
+        "gh pr create --title t -R github.com/owner/private-fork",
+        "GH_REPO=stranger/repo gh pr create --title t",
+    ],
+)
+def test_a_publishing_pr_create_still_asks(
+    monkeypatch, tmp_path, capsys, off, create_publishes, command
 ) -> None:
-    _assert_silenced(*_run(monkeypatch, tmp_path, capsys, "gh pr create --title t --body b"))
+    # Owner ruling 2026-10-06: dropped from the switch. gh, not git, picks where
+    # the head goes, so even an owned origin or an owned --repo keeps the prompt.
+    rc, out, err = _run(monkeypatch, tmp_path, capsys, command)
+    _assert_asks(rc, out, err)
+    assert "gh pr create would push" in _hso(out)["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr create --title t -R stranger/repo && git push -u origin HEAD",
+        "git push -u origin HEAD && gh pr create --title t -R stranger/repo",
+        "git -C {repo} push -u origin HEAD && gh pr create --title t",
+    ],
+)
+def test_a_publishing_create_beside_a_routine_push_still_asks(
+    monkeypatch, tmp_path, capsys, off, create_publishes, command
+) -> None:
+    # Review P1: the push sets the shown reason first, and the create must still
+    # count as a prompt the key does not cover.
+    _assert_asks(*_run(monkeypatch, tmp_path, capsys, command))
 
 
 def test_close_then_repush_is_silenced(monkeypatch, tmp_path, capsys, off) -> None:
@@ -275,7 +308,9 @@ def test_a_chained_republish_is_silenced(monkeypatch, tmp_path, capsys, off) -> 
     # Row 4: a re-push beside a step that is not on the inert-neighbour list.
     monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 1)
-    rc, out, err = _run(monkeypatch, tmp_path, capsys, "git config core.abbrev 12 && git push origin HEAD")
+    rc, out, err = _run(
+        monkeypatch, tmp_path, capsys, "git config core.abbrev 12 && git push origin HEAD"
+    )
     _assert_silenced(rc, out, err)
     assert "another step in this command" in _hso(out)["additionalContext"]
 
@@ -298,7 +333,11 @@ def test_a_prless_republish_to_a_stranger_still_asks(monkeypatch, tmp_path, caps
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
     _assert_asks(
         *_run(
-            monkeypatch, tmp_path, capsys, "git push origin HEAD", (("remote.origin.url", STRANGER),)
+            monkeypatch,
+            tmp_path,
+            capsys,
+            "git push origin HEAD",
+            (("remote.origin.url", STRANGER),),
         )
     )
 
@@ -311,14 +350,6 @@ def test_a_stranger_repo_flag_on_create_still_asks(
 ) -> None:
     # origin is the owner's public repo; the explicit flag is what gh targets.
     _assert_asks(*_run(monkeypatch, tmp_path, capsys, f"gh pr create --title t {flag}"))
-
-
-def test_an_owned_repo_flag_on_create_is_silenced(
-    monkeypatch, tmp_path, capsys, off, create_publishes
-) -> None:
-    _assert_silenced(
-        *_run(monkeypatch, tmp_path, capsys, "gh pr create --title t --repo owner/private-fork")
-    )
 
 
 def test_a_policy_note_survives_a_silenced_prompt(monkeypatch, tmp_path, capsys) -> None:
@@ -336,9 +367,104 @@ def test_a_policy_note_survives_a_silenced_prompt(monkeypatch, tmp_path, capsys)
 def test_a_publishing_create_toward_a_stranger_still_asks(
     monkeypatch, tmp_path, capsys, off, create_publishes, command
 ) -> None:
-    _assert_asks(
-        *_run(monkeypatch, tmp_path, capsys, command, (("remote.origin.url", STRANGER),))
+    _assert_asks(*_run(monkeypatch, tmp_path, capsys, command, (("remote.origin.url", STRANGER),)))
+
+
+# The checkout records origin's default branch as the current branch, feat/x.
+_FEAT_IS_DEFAULT = (
+    ["update-ref", "refs/remotes/origin/feat/x", "HEAD"],
+    ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/feat/x"],
+)
+_MAIN_IS_DEFAULT = (
+    ["update-ref", "refs/remotes/origin/main", "HEAD"],
+    ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+)
+
+
+@pytest.mark.parametrize(
+    ("command", "republish", "open_prs"),
+    [
+        ("git push -u origin HEAD", False, 1),  # first push
+        ("git push origin HEAD", True, 0),  # PR-less re-push off the public repo
+        ("git config core.abbrev 12 && git push origin HEAD", True, 1),  # chained
+        ("gh pr close 5 && git push origin HEAD", True, 1),  # close-then-push
+    ],
+)
+def test_a_push_of_the_recorded_default_branch_still_asks(
+    monkeypatch, tmp_path, capsys, off, command, republish, open_prs
+) -> None:
+    # Review P2: a default branch named other than main/master. origin/HEAD is
+    # what the checkout recorded, read locally with no network call.
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: republish)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: open_prs)
+    owned = (("remote.origin.url", OWNED),)
+    rc, out, err = _run(monkeypatch, tmp_path, capsys, command, owned, git_cmds=_FEAT_IS_DEFAULT)
+    _assert_asks(rc, out, err)
+    assert "did not qualify" in _hso(out)["permissionDecisionReason"]
+
+
+# Three spellings of one destination: the remote, a raw URL, and a second
+# remote with the same URL that has no recorded HEAD of its own.
+_SPELLINGS = ["git push -u origin HEAD", f"git push {OWNED} HEAD", "git push -u pub HEAD"]
+_TWO_REMOTES = (("remote.origin.url", OWNED), ("remote.pub.url", OWNED))
+
+
+@pytest.mark.parametrize("command", _SPELLINGS)
+def test_the_recorded_default_is_caught_in_every_spelling(
+    monkeypatch, tmp_path, capsys, off, command
+) -> None:
+    # Audit F1: keyed on no remote name, so a raw URL or a second remote that
+    # never recorded a HEAD is compared against origin's recorded default too.
+    rc, out, err = _run(
+        monkeypatch, tmp_path, capsys, command, _TWO_REMOTES, git_cmds=_FEAT_IS_DEFAULT
     )
+    _assert_asks(rc, out, err)
+    assert "did not qualify" in _hso(out)["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("command", _SPELLINGS)
+def test_a_recorded_default_elsewhere_keeps_the_silence(
+    monkeypatch, tmp_path, capsys, off, command
+) -> None:
+    # Control for the two tests above: a recorded default that is NOT the branch
+    # being pushed changes nothing, in any spelling.
+    _assert_silenced(
+        *_run(monkeypatch, tmp_path, capsys, command, _TWO_REMOTES, git_cmds=_MAIN_IS_DEFAULT)
+    )
+
+
+def test_a_first_push_whose_absence_is_unconfirmed_still_asks(
+    monkeypatch, tmp_path, capsys, off
+) -> None:
+    # Audit F2: `_push_is_republish` is False on an ls-remote error too. A branch
+    # already on the public repo with no open PR blocks when the probe answers,
+    # so a failed probe must not let it through silently.
+    monkeypatch.setattr(gpg, "_remote_branch_definitely_absent", lambda *a, **k: False)
+    rc, out, err = _run(monkeypatch, tmp_path, capsys, "git push -u origin HEAD")
+    _assert_asks(rc, out, err)
+    assert "confirmed absent" in _hso(out)["permissionDecisionReason"]
+
+
+def test_without_the_key_no_routine_check_runs(monkeypatch, tmp_path, capsys) -> None:
+    # F3: the destination and absence checks cost git calls (one a network
+    # probe); an install that never set the key must not pay for them.
+    def _boom(*a, **k):
+        raise AssertionError("routine check ran without the key")
+
+    monkeypatch.setattr(gpg, "_routine_dest_owned", _boom)
+    monkeypatch.setattr(gpg, "_remote_branch_definitely_absent", _boom)
+    _assert_asks(*_run(monkeypatch, tmp_path, capsys, "git status && git push -u origin HEAD"))
+
+
+def test_both_keys_off_drops_the_push_publish_miss_from_the_note(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    # F4: push_publish declines a chained push and says so in its ask text; once
+    # push_routine silenced that ask, the sentence is only noise.
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "push_routine=off,push_publish=off")
+    rc, out, err = _run(monkeypatch, tmp_path, capsys, "git status && git push -u origin HEAD")
+    _assert_silenced(rc, out, err)
+    assert "push_publish is off, but" not in _hso(out)["additionalContext"]
 
 
 # ─── unchanged ───────────────────────────────────────────────────────────────

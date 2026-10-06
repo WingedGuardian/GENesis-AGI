@@ -81,16 +81,29 @@ deny are all outside the key's reach.
 **``push_routine`` is the wider, separate switch** (owner ruling 2026-10-06), for
 an install whose sessions push from linked worktrees (``git -C <path> push``,
 which ``push_publish`` never covers) and chain steps. It silences the push
-guard's ROUTINE prompts: a first push in any spelling, a ``gh pr create`` that
-would publish, close-then-push, a re-push with no open PR off the public repo, and
-a re-push chained with other steps. It applies only when EVERY ask the command
-raised is one of those and its destination is a github.com https repo of the
-configured owner (``github.user``): every push URL, or for a ``gh pr create``
-its ``--repo`` or ``origin``; a raw URL also needs no ``insteadOf`` rule. A force
-push to another remote, a push to the default branch, a detached HEAD or another
-refspec, an undeterminable directory, and the review-round cap still ask; every
-block and the dispatched-session deny are unchanged. Same shape as the other
-keys: no decision, a context note naming the setting.
+guard's ROUTINE prompts: a first push in any spelling, close-then-push, a
+re-push with no open PR off the public repo, and a re-push chained with other
+steps. It applies only when EVERY ask the command raised is one of those and
+every push URL is a github.com https repo of the configured owner
+(``github.user``); a raw URL also needs no ``insteadOf`` rule. A ``gh pr create``
+that would publish is NOT covered (owner ruling 2026-10-06): gh, not git, picks
+where it pushes the head (``GH_REPO``, ``--repo``, its own remote choice), so it
+asks exactly as before, and a command containing one asks whatever else it
+raised. A force push to another remote, a push to the default branch (``main``,
+``master``, or a default the checkout recorded in ANY ``refs/remotes/*/HEAD``),
+a detached HEAD or another refspec, an undeterminable directory, a first push
+whose absence on the destination a live probe could not confirm (only with the
+key off, so other installs pay no network call), and the review-round cap still
+ask; every block and the dispatched-session deny are
+unchanged. Same shape as the other keys: no decision, a context note naming the
+setting.
+
+Ownership is judged from the configured URL text, with no network call: a
+remote left pointing at an owned repo that was since transferred or renamed is
+redirected by GitHub to wherever it went, and is still classed as owned. A
+default branch named other than ``main``/``master`` is caught only when the
+checkout recorded it (``git clone`` does; a hand-added remote does not until
+``git remote set-head``).
 
 Known limit, accepted by the owner (2026-10-06): like every arm of this guard,
 the branch and destination are read BEFORE the command runs. In a chained

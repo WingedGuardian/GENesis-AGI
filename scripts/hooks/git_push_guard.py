@@ -11450,48 +11450,47 @@ def _all_urls_are_public_repo(urls: set[str]) -> bool:
     return all(_strict_github_slug(u) == want for u in urls)
 
 
-def _routine_dest_owned(push_remote: str | None, urls: set[str], cwd: str | None) -> bool:
+def _recorded_remote_defaults(cwd: str | None) -> set[str] | None:
+    """Every default-branch ref the checkout RECORDED for any remote: the targets
+    of ``refs/remotes/*/HEAD`` (set by ``git clone`` and ``git remote set-head``),
+    e.g. ``refs/remotes/origin/develop``. One local call, no network, and keyed on
+    no remote name, so a push spelled as a raw URL or through a second remote with
+    the same URL is compared too. None on any error. Recorded state can be stale
+    or absent, so this can only ADD a default-branch name to compare against,
+    never vouch that a branch is not one."""
+    try:
+        args = ["git"] + (["-C", cwd] if cwd else [])
+        args += ["for-each-ref", "--format=%(symref)", "refs/remotes/*/HEAD"]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def _routine_dest_owned(
+    push_remote: str | None, urls: set[str], cwd: str | None, branch: str | None = None
+) -> bool:
     """The ``push_routine`` destination scope: every push URL is a github.com
     https repo of the configured public repo's OWNER (``github.user``), i.e. one
     of this install's own repos. A raw-URL destination qualifies only when no
     ``insteadOf`` rule could move it. An undeterminable owner, an empty set, an
-    ssh/scp form or any other host keeps the prompt."""
+    ssh/scp form or any other host keeps the prompt. So does ``branch`` when ANY
+    remote's recorded default ref ends in ``/<branch>`` (or the refs cannot be
+    read): the caller's literal ``main``/``master`` check cannot see a default
+    named anything else. Over-matching only keeps a prompt."""
     canonical = _canonical_public_repo()
     if not canonical or not urls or not push_remote:
         return False
     if _looks_like_url(push_remote) and not _no_url_rewrite_rules(cwd):
         return False
+    if branch:
+        defaults = _recorded_remote_defaults(cwd)
+        if defaults is None or any(ref.endswith(f"/{branch}") for ref in defaults):
+            return False
     owner = canonical.split("/", 1)[0].strip().lower()
     return all((_strict_github_slug(u) or "").split("/", 1)[0] == owner for u in urls)
-
-
-def _create_dest_owned(argv: list[str], cwd: str | None) -> bool:
-    """The ``push_routine`` scope for a publishing ``gh pr create``: an explicit
-    ``--repo``/``-R`` must name a repo of the configured owner; without one, gh
-    targets the checkout's remotes, so ``origin`` must pass
-    :func:`_routine_dest_owned`. An unreadable value keeps the prompt."""
-    canonical = _canonical_public_repo()
-    if not canonical:
-        return False
-    owner = canonical.split("/", 1)[0].strip().lower()
-    repos = []
-    for i, tok in enumerate(argv):
-        if tok in ("--repo", "-R"):
-            if i + 1 >= len(argv):
-                return False
-            repos.append(argv[i + 1])
-        elif tok.startswith("--repo="):
-            repos.append(tok.split("=", 1)[1])
-        elif tok.startswith("-R") and len(tok) > 2:
-            repos.append(tok[2:])
-    if repos:
-        for repo in repos:
-            slug = _strict_github_slug(repo) if "://" in repo else repo.strip().lower()
-            parts = (slug or "").split("/")
-            if len(parts) != 2 or parts[0] != owner or not parts[1]:
-                return False
-        return True
-    return _routine_dest_owned("origin", _push_dest_urls("origin", cwd=cwd), cwd)
 
 
 def _no_url_rewrite_rules(cwd: str | None) -> bool:
@@ -11685,16 +11684,20 @@ def _transport_is_plain(remote: str | None, cwd: str | None) -> bool:
     return True
 
 
+#: Appended to a first-publish ask that ``push_publish: off`` did not silence.
+_PUBLISH_OFF_MISS = (
+    "hooks.asks.push_publish is off, but this command did not qualify: "
+    "it is silenced only when EVERY destination resolves exactly to the "
+    "configured public repo and nothing else in the command can change that."
+)
+
+
 def _publish_ask_text(reason: str, publish_off: bool) -> str:
     """The first-publish ask, plus why ``push_publish: off`` did not silence it
     and any NOTE the policy raised (Claude Code drops an exit-0 hook's stderr, so
     the prompt is the only place a misconfigured key can be reported)."""
     if publish_off:
-        reason += (
-            "\n\nhooks.asks.push_publish is off, but this command did not qualify: "
-            "it is silenced only when EVERY destination resolves exactly to the "
-            "configured public repo and nothing else in the command can change that."
-        )
+        reason += f"\n\n{_PUBLISH_OFF_MISS}"
     notes = _drain_ask_notes()
     return f"{reason}\n\n{notes}" if notes else reason
 
@@ -12232,15 +12235,17 @@ def _run_merge_and_push_gates() -> int:
         # plus a context note, and only if nothing else set an ask or a block.
         publish_note: str | None = None
         # Routine prompts this install silenced (`hooks.asks.push_routine: off`).
-        # Each ask below is classed: ROUTINE (a first push in any spelling, a
-        # publishing `gh pr create`, close-then-push, a PR-less re-push off the
-        # public repo, a re-push chained with other steps) or NOT (the round-cap
-        # ask this starts from, a force push, any other push). The tail silences
-        # only when every ask was routine and every push lands on a GitHub repo of
-        # the configured owner.
+        # Each ask below is classed: ROUTINE (a first push in any spelling,
+        # close-then-push, a PR-less re-push off the public repo, a re-push
+        # chained with other steps) or NOT (the round-cap ask this starts from, a
+        # force push, a publishing `gh pr create`, any other push). The tail
+        # silences only when every ask was routine and every push lands on a
+        # GitHub repo of the configured owner.
         ask_routine = False
         ask_nonroutine = ask_reason is not None
-        routine_dest_ok = True
+        # (push_remote, urls, cwd, branch) of each routine ask, judged at the tail
+        # only when the key is off, so an install without it pays no git calls.
+        routine_dests: list[tuple] = []
 
         # ── git push (any branch) ──────────────────────────────────
         # Interactive → the user approves in a dialog only they can satisfy.
@@ -12401,10 +12406,24 @@ def _run_merge_and_push_gates() -> int:
                             if notes:
                                 publish_note = f"{publish_note}\n\n{notes}"
                         else:
+                            # `_push_is_republish` answers False on an ls-remote
+                            # error or timeout too, so "not confirmed present" is
+                            # not "absent": a branch already public with no open
+                            # PR would skip the no-open-PR block. Under
+                            # push_routine only (the probe is a network call),
+                            # this is routine only when every destination
+                            # definitely lacks the branch. Still classed routine
+                            # so the ask names why the key did not apply.
                             ask_routine = True
-                            routine_dest_ok = routine_dest_ok and _routine_dest_owned(
-                                push_remote, urls, pcwd
-                            )
+                            routine_dests.append((push_remote, urls, pcwd, cur))
+                            if _ask_suppressed("push_routine") and not (
+                                urls
+                                and all(
+                                    _remote_branch_definitely_absent(u, cur, pcwd)
+                                    for u in urls
+                                )
+                            ):
+                                ask_nonroutine = True
                             ask_reason = _publish_ask_text(
                                 f"git push needs your approval before publishing "
                                 f"externally (target: {branch or 'default'}).",
@@ -12434,9 +12453,7 @@ def _run_merge_and_push_gates() -> int:
                     if push_allow_reason and closes_pr:
                         push_allow_reason = None
                         ask_routine = True
-                        routine_dest_ok = routine_dest_ok and _routine_dest_owned(
-                            push_remote, urls, pcwd
-                        )
+                        routine_dests.append((push_remote, urls, pcwd, cur))
                         ask_reason = (
                             f"re-push to '{cur}': an earlier step in this command "
                             f"CLOSES a pull request, so the push that follows may "
@@ -12485,9 +12502,7 @@ def _run_merge_and_push_gates() -> int:
                             # Off the public repo — or when the public repo is not
                             # declared — the pre-existing ask, unchanged.
                             ask_routine = True
-                            routine_dest_ok = routine_dest_ok and _routine_dest_owned(
-                                push_remote, urls, pcwd
-                            )
+                            routine_dests.append((push_remote, urls, pcwd, cur))
                             ask_reason = (
                                 f"re-push to '{cur}': this branch is PUBLIC but has "
                                 f"NO OPEN PR, so CI and the leak scan never run on "
@@ -12503,9 +12518,7 @@ def _run_merge_and_push_gates() -> int:
                     elif push_allow_reason and not _push_compound_is_inert(segs, push_segs[0], cmd):
                         push_allow_reason = None
                         ask_routine = True
-                        routine_dest_ok = routine_dest_ok and _routine_dest_owned(
-                            push_remote, urls, pcwd
-                        )
+                        routine_dests.append((push_remote, urls, pcwd, cur))
                         ask_reason = (
                             f"re-push to '{cur}': another step in this command "
                             f"may change git config or remotes before the push "
@@ -12595,13 +12608,13 @@ def _run_merge_and_push_gates() -> int:
                     file=sys.stderr,
                 )
                 return 2
+            # NOT routine (owner ruling 2026-10-06): gh, not git, picks where the
+            # head is pushed (GH_REPO, --repo, its own remote choice), so the
+            # push_routine destination check cannot vouch for it. Marked whether
+            # or not a push already set the reason, so a create beside a silenced
+            # push still asks.
+            ask_nonroutine = True
             if ask_reason is None:
-                ask_routine = True
-                for s in create_segs:
-                    _ccwd = _effective_cwd(cmd, payload, seg=s)
-                    routine_dest_ok = routine_dest_ok and _create_dest_owned(
-                        s.argv, _ccwd if isinstance(_ccwd, str) else None
-                    )
                 ask_reason = (
                     "gh pr create would push this (not-yet-pushed) branch — approve it like a push."
                 )
@@ -13261,15 +13274,25 @@ def _run_merge_and_push_gates() -> int:
             return 2
         if ask_reason is not None:
             routine_off = ask_routine and _ask_suppressed("push_routine")
-            if routine_off and not ask_nonroutine and routine_dest_ok:
-                note = _suppressed_reason("push_routine", ask_reason)
+            if (
+                routine_off
+                and not ask_nonroutine
+                and routine_dests
+                and all(_routine_dest_owned(*d) for d in routine_dests)
+            ):
+                # The push_publish miss is noise once push_routine silenced it.
+                shown = ask_reason.replace(f"\n\n{_PUBLISH_OFF_MISS}", "")
+                note = _suppressed_reason("push_routine", shown)
                 notes = _drain_ask_notes()
                 return _emit_context_only(f"{note}\n\n{notes}" if notes else note)
             if routine_off:
                 ask_reason += (
                     "\n\nhooks.asks.push_routine is off, but this command did not "
                     "qualify: a destination is not a github.com https repo of the "
-                    "configured owner, or is a raw URL that an insteadOf rule could move."
+                    "configured owner, is a raw URL that an insteadOf rule could move, "
+                    "or the branch is a recorded default branch; or the branch could "
+                    "not be confirmed absent there; or the command also raised a "
+                    "prompt the key does not cover."
                 )
             notes = _drain_ask_notes()
             return _ask(f"{ask_reason}\n\n{notes}" if notes else ask_reason)
