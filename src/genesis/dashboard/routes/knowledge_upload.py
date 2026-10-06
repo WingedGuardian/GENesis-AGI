@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import mimetypes
+import os
 import re
 import uuid
 from pathlib import Path
@@ -225,22 +226,31 @@ async def knowledge_upload_cancel(upload_id: str):
         return jsonify({"error": "Cannot cancel — ingestion in progress"}), 409
 
     # The path was written under _UPLOAD_DIR at upload time; re-check at delete
-    # time so a corrupted or migrated row can't point the unlink elsewhere.
-    file_path = Path(upload["file_path"])
-    upload_root = _UPLOAD_DIR.resolve()
-    if not file_path.resolve().is_relative_to(upload_root):
+    # time so a corrupted or migrated row can't point the unlink elsewhere. Every
+    # operation below uses the RESOLVED path that was checked, never the stored
+    # one: a stored symlink outside the root must not be what gets unlinked.
+    upload_root = os.path.realpath(_UPLOAD_DIR)
+    resolved = os.path.normpath(os.path.realpath(upload["file_path"]))
+    if not resolved.startswith(upload_root + os.sep):
         logger.error(
             "Refusing to cancel upload %s: stored path %s is outside %s",
-            upload_id, file_path, upload_root,
+            upload_id, upload["file_path"], upload_root,
         )
         return jsonify({"error": "Stored file path is outside the upload directory"}), 409
+    file_path = Path(resolved)
+    if file_path.exists() and not file_path.is_file():
+        logger.error(
+            "Refusing to cancel upload %s: stored path %s is not a file",
+            upload_id, upload["file_path"],
+        )
+        return jsonify({"error": "Stored file path is not a file"}), 409
 
     # Remove file from disk
     if file_path.exists():
         file_path.unlink()
     # Clean up empty parent directory (never the upload root itself)
     parent = file_path.parent
-    if parent.resolve() != upload_root and parent.exists() and not any(parent.iterdir()):
+    if str(parent) != upload_root and parent.exists() and not any(parent.iterdir()):
         parent.rmdir()
 
     await knowledge_uploads.delete(rt.db, upload_id)

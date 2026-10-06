@@ -96,3 +96,47 @@ def test_cancel_never_removes_the_upload_root_itself(client, inbox):
     assert resp.status_code == 200
     assert not target.exists()
     assert inbox.exists()
+
+
+@pytest.mark.parametrize("which", ["root", "subdir"])
+def test_cancel_refuses_a_directory_path(client, inbox, which):
+    """A row naming the upload root or a subdirectory is refused, not a 500 from unlink."""
+    sub = inbox / "u1"
+    sub.mkdir()
+    (sub / "doc.txt").write_text("x")
+    target = inbox if which == "root" else sub
+
+    resp, mock_delete = _cancel(client, target)
+
+    assert resp.status_code == 409
+    assert (sub / "doc.txt").exists()
+    mock_delete.assert_not_awaited()
+
+
+def test_cancel_refuses_a_symlink_inside_that_points_outside(client, inbox, tmp_path):
+    victim = tmp_path / "keep.txt"
+    victim.write_text("x")
+    link = inbox / "link.txt"
+    link.symlink_to(victim)
+
+    resp, mock_delete = _cancel(client, link)
+
+    assert resp.status_code == 409
+    assert victim.exists()
+    assert link.is_symlink()
+    mock_delete.assert_not_awaited()
+
+
+def test_cancel_acts_on_the_checked_path_not_a_symlink_outside(client, inbox, tmp_path):
+    """A stored symlink outside the root that resolves inside: the file that was
+    checked is the one removed; nothing outside the root is touched."""
+    inside = inbox / "doc.txt"
+    inside.write_text("x")
+    link = tmp_path / "outside-link.txt"
+    link.symlink_to(inside)
+
+    resp, _ = _cancel(client, link)
+
+    assert resp.status_code == 200
+    assert not inside.exists()
+    assert link.is_symlink()
