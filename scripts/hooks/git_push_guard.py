@@ -10985,7 +10985,9 @@ def _push_carries_command_config(seg) -> bool:
 
     Only ``-C <dir>``, ``-P`` and ``--no-pager`` are safe before ``push``.
     Git config supplied through any other global option, or an unrecognized
-    argv shape, is not visible to the guard's repository-config reads.
+    argv shape, is not visible to the guard's repository-config reads. This
+    structural decision is independent of destination: supplied config can
+    retarget a remote or introduce a force refspec before Git runs.
     """
     if not _push_seg_has_no_prefix(seg):
         return True
@@ -12255,9 +12257,9 @@ def _run_merge_and_push_gates() -> int:
             # Off-origin force pushes must be exactly one plain `git push`: a
             # prefix, wrapper, global option, redirect or other step can make
             # the pre-command destination read differ from what Git will push.
-            # For non-force pushes, command-borne config is blocked when the
-            # resolved destination is origin/public; config-writing neighbour
-            # steps remain outside this command-config rule.
+            # For non-force pushes, command-borne config or a prefix is blocked
+            # regardless of destination; config-writing neighbour steps remain
+            # outside this command-config rule.
             force_segs = [s for s in push_segs if _push_is_force(s.argv)]
             if force_segs:
                 remote = _resolve_push_remote(force_segs[0], cwd=pcwd)
@@ -12302,15 +12304,14 @@ def _run_merge_and_push_gates() -> int:
                 # Fall through: any hard-block below still takes precedence.
             else:
                 for push_seg in push_segs:
-                    if _push_carries_command_config(push_seg) and _push_dest_meets_origin(
-                        _resolve_push_remote(push_seg, cwd=pcwd), pcwd, pcwd_unknown
-                    ):
+                    if _push_carries_command_config(push_seg):
                         print(
-                            "BLOCKED: this push to origin/<public> carries a prefix, "
-                            "wrapper or git config option (-c / --config-env / VAR=…). "
-                            "Config supplied that way can make it a force push "
-                            "(e.g. remote.origin.push=+…) that no flag shows, and the "
-                            "guard cannot read it before the command runs.",
+                            "BLOCKED: this push carries a prefix, wrapper or git config "
+                            "option (-c / --config-env / VAR=…). Config supplied that "
+                            "way can retarget the push or make it a force push (e.g. "
+                            "remote.<name>.push=+…, remote.<name>.pushurl=…) that no "
+                            "flag shows, and the guard cannot read it before the "
+                            "command runs.",
                             file=sys.stderr,
                         )
                         print(
