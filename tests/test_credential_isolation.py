@@ -79,6 +79,27 @@ def test_credential_regex_covers_aws_credentials():
     )
 
 
+def test_token_count_settings_are_not_credentials(tmp_path, monkeypatch):
+    empty = tmp_path / "empty.env"
+    empty.write_text("", encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "200000")
+    monkeypatch.setenv("MAX_THINKING_TOKENS", "8000")
+
+    names = credential_env_names(example=empty, secrets_file=empty)
+
+    assert not {"CLAUDE_CODE_MAX_CONTEXT_TOKENS", "MAX_THINKING_TOKENS"} & names
+    assert not CREDENTIAL_NAME_RE.search("MAX_TOKENS")
+    assert all(
+        CREDENTIAL_NAME_RE.search(name)
+        for name in (
+            "GH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "AWS_SESSION_TOKEN",
+            "TELEGRAM_BOT_TOKEN",
+        )
+    )
+
+
 def test_credential_env_names_includes_aws_environment_names(tmp_path, monkeypatch):
     empty_example = tmp_path / "empty.env.example"
     empty_example.write_text("", encoding="utf-8")

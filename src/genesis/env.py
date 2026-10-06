@@ -30,9 +30,10 @@ _DEFAULT_QDRANT_URL = "http://localhost:6333"
 _DEFAULT_OLLAMA_URL = "http://localhost:11434"
 _DEFAULT_LM_STUDIO_URL = "http://localhost:1234/v1"
 # ``_PASS`` covers NAS/SMB passwords and *_PASSWORD keys. AWS access/secret keys
-# are explicit alternatives; AWS_SESSION_TOKEN is covered by ``_TOKEN``.
+# are explicit alternatives; ``_TOKEN(?!S)`` covers AWS_SESSION_TOKEN while
+# skipping token-count settings such as MAX_THINKING_TOKENS.
 CREDENTIAL_NAME_RE = re.compile(
-    r"API_KEY_|_API_KEY|_TOKEN|_PASSPHRASE|_PASS|FIRECRAWL_API|"
+    r"API_KEY_|_API_KEY|_TOKEN(?!S)|_PASSPHRASE|_PASS|FIRECRAWL_API|"
     r"AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY"
 )
 
