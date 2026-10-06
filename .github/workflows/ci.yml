@@ -1121,6 +1121,6 @@ jobs:
         #   test_falkordb_module.py               new -> 35   (+35)
         # No added skips. Floor: 24332 + 89 = 24421; skip ceiling remains 102.
         # Push-argv shared scanner (#2576): five changed test files collect
-        # 916 here and 863 on origin/main (new file absent there), net +53.
-        # Floor: origin/main 24421 + 53 = 24474.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24474
+        # 924 here and 863 on origin/main (new file absent there), net +61.
+        # Floor: origin/main 24421 + 61 = 24482.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24482

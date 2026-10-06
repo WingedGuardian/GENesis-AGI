@@ -3777,11 +3777,14 @@ class PushArg(NamedTuple):
     text: str
 
 
-# Measured from `git push -h` on git 2.34.1; the drift test compares this table
-# with the installed binary's own help output.
+# Measured from `git push -h` on git 2.34.1, 2.43.0, and 2.55.0.
+# `branches` and `verify` are listed only from 2.43.0; 2.34.1 accepts
+# `--verify` as the negation of `--no-verify` without listing it, and has no
+# `--branches`.
 GIT_PUSH_LONG_OPTIONS: dict[str, str] = {
     "all": "none",
     "atomic": "none",
+    "branches": "none",
     "delete": "none",
     "dry-run": "none",
     "exec": "value",
@@ -3806,6 +3809,7 @@ GIT_PUSH_LONG_OPTIONS: dict[str, str] = {
     "thin": "none",
     "quiet": "none",
     "verbose": "none",
+    "verify": "none",
 }
 GIT_PUSH_SHORT_VALUE_LETTERS = frozenset("o")
 _GIT_PUSH_LONG_OPTION_CANDIDATES = frozenset(GIT_PUSH_LONG_OPTIONS) | frozenset(
@@ -3830,8 +3834,11 @@ def push_arg_stream(argv: list[str]) -> list[PushArg] | None:
     Returns ``None`` when ``argv`` is not a git push and ``[]`` for bare
     ``git push``. Unique long-option prefixes are canonicalised as git does;
     ambiguous and unknown options stay raw because git rejects those commands.
-    The option arities were measured from ``git push -h`` on git 2.34.1 and are
-    checked against the installed CLI by ``test_git_push_option_table.py``.
+    The option arities were measured from ``git push -h`` on git 2.34.1,
+    2.43.0, and 2.55.0 and are checked against the installed CLI by
+    ``test_git_push_option_table.py``. Git 2.34.1 accepts ``--verify`` as the
+    negation of ``--no-verify`` without listing it, and has no ``--branches``;
+    both are listed from 2.43.0.
     """
     push_index = git_subcommand_index(argv)
     if push_index is None or argv[push_index] != "push":

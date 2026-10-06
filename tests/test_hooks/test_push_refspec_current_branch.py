@@ -165,6 +165,22 @@ def test_shared_push_arg_stream_uses_typed_canonical_tokens() -> None:
 
 
 @pytest.mark.parametrize(
+    ("option", "canonical"),
+    [
+        ("--b", "--branches"),
+        ("--br", "--branches"),
+        ("--veri", "--verify"),
+        ("--ver", "--ver"),
+    ],
+)
+def test_abbreviated_push_options_match_git_canonicalization(option: str, canonical: str) -> None:
+    assert gpg.push_arg_stream(["git", "push", option, "origin"]) == [
+        gpg.PushArg(gpg.PushArgKind.LONG, canonical),
+        gpg.PushArg(gpg.PushArgKind.POSITIONAL, "origin"),
+    ]
+
+
+@pytest.mark.parametrize(
     ("command", "targets_cur"),
     [
         ("git push -u origin HEAD", True),
@@ -180,6 +196,8 @@ def test_shared_push_arg_stream_uses_typed_canonical_tokens() -> None:
         ("git push origin :refs/heads/feat/x", False),
         ("git push origin HEAD feat/y", False),
         ("git push --all origin", False),
+        ("git push --branches origin", False),
+        ("git push --b origin", False),
         ("git push --delete origin feat/x", False),
     ],
 )
@@ -517,6 +535,22 @@ def test_a_repush_with_an_open_pr_rides_its_first_approval(
     decision, reason = _run(monkeypatch, tmp_path, capsys, command, republish=True, open_prs=1)
     assert decision == "allow"
     assert "re-push to 'feat/x'" in reason
+
+
+@pytest.mark.parametrize(
+    ("command", "canonical"),
+    [
+        ("git push --branches origin", "--branches"),
+        ("git push --b origin", "--branches"),
+    ],
+)
+def test_broadening_options_keep_a_repush_on_ask(
+    monkeypatch, tmp_path, capsys, command: str, canonical: str
+) -> None:
+    stream = gpg.push_arg_stream(_parsed_push_seg(command).argv)
+    assert stream and stream[0] == gpg.PushArg(gpg.PushArgKind.LONG, canonical)
+    decision, _reason = _run(monkeypatch, tmp_path, capsys, command, republish=True, open_prs=1)
+    assert decision == "ask"
 
 
 def test_a_bundled_push_option_repushes_like_the_plain_spelling(

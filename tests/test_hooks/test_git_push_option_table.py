@@ -19,6 +19,7 @@ pytestmark = pytest.mark.skipif(GIT is None, reason="git CLI not installed")
 
 _OPTION_TOKEN = re.compile(r"(?<![\w-])--[\w-]+(?:\[[^\]]+\])?(?:=[^\s,]+)?|(?<![\w-])-[A-Za-z0-9]")
 _VALUE_PLACEHOLDER = re.compile(r"(?:<[^>]+>|\([^)]*\))")
+_LISTED_ONLY_IN_NEWER_GIT = frozenset({"branches", "verify"})
 
 
 def _measured_push_options() -> tuple[dict[str, str], frozenset[str]]:
@@ -29,6 +30,7 @@ def _measured_push_options() -> tuple[dict[str, str], frozenset[str]]:
     short_value_letters: set[str] = set()
     for line in (result.stdout + result.stderr).splitlines():
         spec = re.split(r"\s{2,}", line.strip(), maxsplit=1)[0]
+        spec = re.sub(r"--\[no-\]", "--", spec)
         if not spec.startswith("-"):
             continue
         tokens = _OPTION_TOKEN.findall(spec)
@@ -49,5 +51,7 @@ def _measured_push_options() -> tuple[dict[str, str], frozenset[str]]:
 
 def test_push_option_table_matches_git_help() -> None:
     options, short_value_letters = _measured_push_options()
-    assert options == sp.GIT_PUSH_LONG_OPTIONS
+    assert set(options) <= set(sp.GIT_PUSH_LONG_OPTIONS)
+    assert set(sp.GIT_PUSH_LONG_OPTIONS) - set(options) <= _LISTED_ONLY_IN_NEWER_GIT
+    assert options == {name: sp.GIT_PUSH_LONG_OPTIONS[name] for name in options}
     assert short_value_letters == sp.GIT_PUSH_SHORT_VALUE_LETTERS
