@@ -289,3 +289,127 @@ def test_optional_signing_key_cannot_hide_mode_reversal(adapter, monkeypatch, si
     monkeypatch.setattr(adapter.commits, "_branch_review_budget", lambda *a, **kw: {"status": "unknown"})
     command = "git commit " + modes.format(signing=signing) + " -m probe"
     assert bool(adapter.decide(payload(command))) == blocked
+# ── Deny messages: a deny is not a broken guard, and a fixable deny is not a STOP ──
+
+
+def _config_command():
+    import tomllib
+
+    config = tomllib.loads((ROOT / ".codex" / "config.toml").read_text())
+    return config["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+
+
+def _repo_with_launcher(tmp_path, body):
+    """A git checkout whose launcher is a stub script with ``body``."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    hooks = tmp_path / "scripts" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "codex-review-stop").write_text("#!/bin/bash\n" + body + "\n")
+    return tmp_path
+
+
+def _run_config(cwd):
+    return subprocess.run(
+        ["bash", "-c", _config_command()],
+        cwd=cwd,
+        input="{}",
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+
+def test_config_deny_does_not_claim_the_guard_is_unavailable(tmp_path):
+    """MEASURED on a live install: every adapter deny (6 of 6) also printed
+    'review guard unavailable', so Codex sessions reported the guard as broken."""
+    repo = _repo_with_launcher(tmp_path, 'echo "BLOCKED: probe reason" >&2; exit 2')
+    run = _run_config(repo)
+    assert run.returncode == 2
+    assert "BLOCKED: probe reason" in run.stderr
+    assert "unavailable" not in run.stderr
+
+
+@pytest.mark.parametrize("missing", ["no-repo", "no-launcher"])
+def test_config_reports_unavailable_only_when_the_launcher_cannot_be_found(tmp_path, missing):
+    if missing == "no-launcher":
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    run = _run_config(tmp_path)
+    assert run.returncode == 2
+    assert "review guard unavailable" in run.stderr
+
+
+@pytest.mark.parametrize("code", [1, 3, 126])
+def test_config_turns_any_other_launcher_failure_into_a_deny(tmp_path, code):
+    """Codex continues after an ordinary hook failure, so only 0 may pass."""
+    repo = _repo_with_launcher(tmp_path, f"exit {code}")
+    assert _run_config(repo).returncode == 2
+
+
+def test_config_allow_passes(tmp_path):
+    repo = _repo_with_launcher(tmp_path, "exit 0")
+    assert _run_config(repo).returncode == 0
+
+
+def test_launcher_adds_no_second_stop_to_an_explained_deny(tmp_path):
+    launcher = tmp_path / "codex-review-stop"
+    launcher.write_bytes((HOOKS / "codex-review-stop").read_bytes())
+    (tmp_path / "codex_review_stop.py").write_text(
+        "import sys\nprint('BLOCKED: explained', file=sys.stderr)\nsys.exit(2)\n"
+    )
+    run = subprocess.run(["bash", str(launcher)], input="{}", text=True, capture_output=True)
+    assert run.returncode == 2
+    assert run.stderr.strip() == "BLOCKED: explained"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git add -A && git commit -m x",
+        'git commit -m x && gh pr comment 1 --body "@codex review"',
+        "cat > f <<'EOF'\nit's the git commit text\nEOF",
+    ],
+)
+def test_self_fixable_denials_say_retry_not_stop(adapter, monkeypatch, capsys, command):
+    """These are the shapes Codex hit: a commit chained after another step, and a
+    heredoc the parser cannot read. The agent can rewrite either and run it again."""
+    monkeypatch.setattr(
+        adapter.commits, "_branch_review_budget", lambda *a, **kw: pytest.fail("lookup")
+    )
+    monkeypatch.setattr(
+        adapter.sys, "stdin", __import__("io").StringIO(json.dumps(payload(command)))
+    )
+    assert isinstance(adapter.decide(payload(command)), adapter.Fixable)
+    assert adapter.main() == 2
+    err = capsys.readouterr().err
+    assert "run it again" in err
+    assert "STOP" not in err
+
+
+def test_literal_target_with_unsupported_global_option_is_fixable(adapter, monkeypatch):
+    monkeypatch.setattr(
+        adapter.commits, "_branch_review_budget", lambda *a, **kw: pytest.fail("lookup")
+    )
+    assert isinstance(adapter.decide(payload("git -c x=y commit -m x")), adapter.Fixable)
+
+
+@pytest.mark.parametrize("setup", ["budget", "request", "payload"])
+def test_approval_and_evidence_denials_still_stop(adapter, monkeypatch, capsys, setup):
+    if setup == "budget":
+        monkeypatch.setattr(
+            adapter.commits,
+            "_branch_review_budget",
+            lambda *a, **kw: {"status": "ok", "commit_approval_required": True},
+        )
+        data = payload('git commit -m "test"')
+    elif setup == "request":
+        monkeypatch.setattr(
+            adapter.requests, "_check_codex_round_escalation", lambda *a: ("ask", "limit")
+        )
+        data = payload('gh pr comment 1 --body "@codex review"')
+    else:
+        data = {"tool_name": "other"}
+    reason = adapter.decide(data)
+    assert reason and not isinstance(reason, adapter.Fixable)
+    monkeypatch.setattr(adapter.sys, "stdin", __import__("io").StringIO(json.dumps(data)))
+    assert adapter.main() == 2
+    assert "STOP and handoff" in capsys.readouterr().err

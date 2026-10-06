@@ -1,11 +1,19 @@
 #!/bin/bash
 # Codex continues after ordinary hook failures. Convert evaluator failure to an
 # explicit deny, including missing/broken Python imports. Never emit ask JSON.
+#
+# Exit 2 from the evaluator is a decision it has already explained on stderr
+# (fix-and-retry, or stop for the user); adding a second, generic STOP here made
+# every fixable denial read as a dead end. Any OTHER outcome (a crash, a missing
+# file, a result that is not "allow") is a failure of this guard, and stops.
 hook_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 2
-if decision=$(python3 "$hook_dir/codex_review_stop.py"); then
-    if [ "$decision" = "allow" ]; then
-        exit 0
-    fi
+decision=$(python3 "$hook_dir/codex_review_stop.py")
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$decision" = "allow" ]; then
+    exit 0
+fi
+if [ "$rc" -eq 2 ] && [ -z "$decision" ]; then
+    exit 2
 fi
 printf '%s\n' 'BLOCKED: Codex review-budget evaluation did not allow this action. Stop and handoff to the user.' >&2
 exit 2

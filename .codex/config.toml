@@ -3,12 +3,14 @@
 # The launcher strips Genesis/Claude session identity before starting a server.
 
 # Local CLI shell guard only. No Genesis session registration or approval receipt.
-# The outer fallback also denies if repository resolution or the launcher fails.
+# The outer fallback denies if the repository or the launcher cannot be found.
+# It must NOT fire on the launcher's own deny (exit 2): that one has already
+# explained itself, and an "unavailable" line under it reads as a broken guard.
 [[hooks.PreToolUse]]
 matcher = "^Bash$"
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = 'bash "$(git rev-parse --show-toplevel)/scripts/hooks/codex-review-stop" || { printf "%s\n" "BLOCKED: review guard unavailable; stop and handoff to the user." >&2; exit 2; }'
+command = 'guard="$(git rev-parse --show-toplevel 2>/dev/null)/scripts/hooks/codex-review-stop"; [ -f "$guard" ] || { printf "%s\n" "BLOCKED: review guard unavailable; stop and handoff to the user." >&2; exit 2; }; bash "$guard" || exit 2'
 
 [mcp_servers.genesis-health]
 command = "python3"
