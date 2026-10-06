@@ -241,6 +241,9 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 
 **genesis-health**
 
+- `board_item` — One issue or PR on the work board: its column and Genesis status (a live read), what blocks it (GitHub's blocked-by list, flagged when truncated), unverified open questions blocking it, and whether it was promoted from a private record.
+- `board_promote` — Propose turning a private ledger row or follow-up into a PUBLIC GitHub issue on the work board. Held for the owner's approval; nothing is posted by this call.
+- `board_status` — The work board as the reconciler last read it: counts by column, by Genesis status and by kind, coverage (open repo issues and PRs on the board against the repo's open total), drags logged, and whether the reconciler is alive. Reads stored heartbeats only, never GitHub, so it is cheap and safe.
 - `bootstrap_manifest` — Which subsystems initialized successfully, failed, or degraded at startup.
 - `browser_clear_domain` — Clear cookies for a specific domain (selective logout).
 - `browser_click` — Click an element on the current page by CSS selector or text.

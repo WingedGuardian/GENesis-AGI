@@ -1101,8 +1101,10 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
         # cracks?" with its last, stale, confident zero, and nothing else in the
         # system contradicts it. Enable-gated like the others via
         # ``_subsystem_enabled`` (its mode lever), so turning it off does not
-        # buy a permanent alarm.
-        for _hb_name in ("ego", "inbox", "dashboard", "outreach", "zero_drop"):
+        # buy a permanent alarm. board needs no enable gate: its reconciler
+        # pulses on every tick in every mode (off, paused, live), so silence
+        # always means the job itself stopped.
+        for _hb_name in ("ego", "inbox", "dashboard", "outreach", "board", "zero_drop"):
             try:
                 # raise_on_error=True → a read failure fails LOUD (handled below by
                 # preserving any open alert), never a silent green that lets
