@@ -112,6 +112,10 @@ _remote_target_ids: dict[str, str] = {}
 # holds only a weak reference to a task, so one whose caller was cancelled
 # could be garbage-collected midway. async_cleanup drains what still runs.
 _remote_inflight: set[asyncio.Future] = set()
+# How long a cancelled connect waits for an unidentified tab's close before
+# returning; the close itself keeps running (retained) past this bound.
+# 10 s, the bound every other local and remote close here already uses.
+_UNIDENTIFIED_TAB_CLOSE_BOUND_S = 10.0
 
 # Layer 4: TinyFish cloud browser (on-demand CDP, paid credits)
 _tinyfish_pw = None  # Playwright instance for TinyFish session
@@ -632,9 +636,15 @@ async def _genesis_remote_tab(remote_browser, url: str, late: list | None = None
         target_id = await _cdp_target_id(page)
     finally:
         if target_id is None:
-            # Shielded so a cancellation cannot cut the close short.
+            # Shielded so a cancellation cannot cut the close short, and bounded
+            # so a wedged CDP connection cannot hold the caller: in a finally
+            # under cancellation nothing else interrupts this await, and
+            # wait_for in the tool timeout waits for it. The retained close
+            # keeps running past the bound (async_cleanup drains it).
             try:
-                await _shielded(page.close())
+                await asyncio.wait_for(
+                    _shielded(page.close()), timeout=_UNIDENTIFIED_TAB_CLOSE_BOUND_S
+                )
             except Exception:
                 logger.warning("Could not close an unidentified remote tab", exc_info=True)
     if target_id is None:

@@ -1307,6 +1307,25 @@ class TestGenesisTabIdentity:
         assert browser._remote_browser is None
 
     @pytest.mark.asyncio
+    async def test_a_wedged_tab_close_does_not_hold_a_cancelled_connect(self, monkeypatch):
+        """Codex P2 4196752666: the identity probe wedges, the tool timeout
+        cancels the connect, and the unidentified tab's close wedges too. The
+        cancelled connect must still return its timeout within the bound."""
+        monkeypatch.setattr(browser, "_UNIDENTIFIED_TAB_CLOSE_BOUND_S", 0.2)
+        tab = _cdp_page("about:blank", "unused")
+        tab.context.new_cdp_session = AsyncMock(side_effect=_hang)
+        tab.close = AsyncMock(side_effect=_hang)
+        mock_br = _mock_remote_browser(pages=[_cdp_page("https://mail.example", "USER")])
+        mock_br.contexts[0].new_page = AsyncMock(return_value=tab)
+        try:
+            result = await asyncio.wait_for(_connect(mock_br, timeout_s=0.2), timeout=5.0)
+            assert "timed out" in result["error"]
+            tab.close.assert_awaited_once()
+        finally:
+            for task in list(browser._remote_inflight):
+                task.cancel()
+
+    @pytest.mark.asyncio
     async def test_a_second_cancel_does_not_cut_the_tab_close_short(self):
         """The close of an unidentified tab is shielded: a second cancel
         arriving while it runs must not abandon it half done."""
