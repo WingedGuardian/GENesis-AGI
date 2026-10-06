@@ -10,8 +10,11 @@ the function, the house pattern for disk_hygiene steps.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 _HYGIENE = Path(__file__).resolve().parents[2] / "scripts" / "disk_hygiene.sh"
 
@@ -120,6 +123,106 @@ def test_a_failed_copy_keeps_every_retained_rotation(tmp_path):
         capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL,
     )
     assert "left as is" in result.stdout
+    assert (tmp_path / "mcp_health.log.1").read_text() == "one"
+    assert (tmp_path / "mcp_health.log.2").read_text() == "two"
+    assert f.read_text() == "current\n" * 200
+    assert not list(tmp_path.glob(".mcp_health.log.rotate.*"))
+
+
+def _assert_left_as_is(tmp_path: Path, f: Path, result: subprocess.CompletedProcess) -> None:
+    assert "rotated" not in result.stdout
+    assert "left as is" in result.stdout
+    assert f.read_text() == "current\n" * 200, "the live log was truncated"
+    assert not list(tmp_path.glob(".mcp_health.log.rotate.*"))
+
+
+@pytest.mark.parametrize("dir_slot, file_slot", [(1, None), (1, 2), (2, None)])
+def test_a_directory_in_any_rotation_slot_stops_the_rotation(tmp_path, dir_slot, file_slot):
+    """Codex P2 / Devin round 1: mv onto a directory moves the copy INSIDE it
+    and reports success, so the truncate followed a move that archived nothing
+    in its slot, and later runs piled copies into that directory."""
+    f = tmp_path / "mcp_health.log"
+    f.write_text("current\n" * 200)
+    slot_dir = tmp_path / f"mcp_health.log.{dir_slot}"
+    slot_dir.mkdir()
+    if file_slot is not None:
+        (tmp_path / f"mcp_health.log.{file_slot}").write_text("kept")
+    if dir_slot == 2:
+        (tmp_path / "mcp_health.log.1").write_text("kept")
+    result = _rotate(f)
+    _assert_left_as_is(tmp_path, f, result)
+    assert list(slot_dir.iterdir()) == [], "a copy was moved into the directory"
+    for slot in (1, 2):
+        p = tmp_path / f"mcp_health.log.{slot}"
+        if p.is_file():
+            assert p.read_text() == "kept"
+
+
+def test_a_symlink_to_a_directory_in_a_slot_stops_the_rotation(tmp_path):
+    f = tmp_path / "mcp_health.log"
+    f.write_text("current\n" * 200)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    os.symlink(elsewhere, tmp_path / "mcp_health.log.1")
+    result = _rotate(f)
+    _assert_left_as_is(tmp_path, f, result)
+    assert list(elsewhere.iterdir()) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write a mode-0444 file, so there is no failure to observe")
+def test_a_log_that_cannot_be_truncated_is_not_rotated(tmp_path):
+    """Codex P2 / Devin round 1: a read-only live log (its writers keep their
+    append handles) was copied, the history shifted, the truncate failed
+    unchecked, and the job still printed "rotated"."""
+    f = tmp_path / "mcp_health.log"
+    f.write_text("current\n" * 200)
+    (tmp_path / "mcp_health.log.1").write_text("one")
+    (tmp_path / "mcp_health.log.2").write_text("two")
+    f.chmod(0o444)
+    result = _rotate(f)
+    _assert_left_as_is(tmp_path, f, result)
+    assert (tmp_path / "mcp_health.log.1").read_text() == "one"
+    assert (tmp_path / "mcp_health.log.2").read_text() == "two"
+
+
+def _rotate_with_cp_side_effect(tmp_path: Path, f: Path, after_copy: str) -> subprocess.CompletedProcess:
+    """Run rotate_log with a cp that copies for real and then runs `after_copy`,
+    so the tree changes AFTER the up-front checks, as a race would."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    real_cp = shutil.which("cp")
+    (bindir / "cp").write_text(f'#!/bin/sh\n"{real_cp}" "$@" || exit $?\n{after_copy}\n')
+    (bindir / "cp").chmod(0o755)
+    return subprocess.run(
+        ["bash", "-c", 'source "$1"; PATH="$2:$PATH"; rotate_log "$3" 1000 2', "_",
+         str(_HYGIENE), str(bindir), str(f)],
+        capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL,
+    )
+
+
+def test_a_directory_appearing_after_the_checks_never_receives_the_copy(tmp_path):
+    """The mv -T backstop: a directory created at FILE.1 between the slot check
+    and the move must make the move fail, not swallow the copy."""
+    f = tmp_path / "mcp_health.log"
+    f.write_text("current\n" * 200)
+    slot = tmp_path / "mcp_health.log.1"
+    result = _rotate_with_cp_side_effect(tmp_path, f, f'mkdir "{slot}"')
+    assert "rotated" not in result.stdout
+    assert list(slot.iterdir()) == [], "the copy was moved into the directory"
+    survivors = [f, *tmp_path.glob(".mcp_health.log.rotate.*")]
+    assert any(p.read_text() == "current\n" * 200 for p in survivors), "the log's content was lost"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write a mode-0444 file, so there is no failure to observe")
+def test_a_truncate_that_fails_after_the_checks_keeps_every_rotation(tmp_path):
+    """Architect review: the log turning read-only after the -w check made the
+    truncate fail only after the history had shifted, dropping the oldest copy."""
+    f = tmp_path / "mcp_health.log"
+    f.write_text("current\n" * 200)
+    (tmp_path / "mcp_health.log.1").write_text("one")
+    (tmp_path / "mcp_health.log.2").write_text("two")
+    result = _rotate_with_cp_side_effect(tmp_path, f, f'chmod 444 "{f}"')
+    assert "rotated" not in result.stdout
     assert (tmp_path / "mcp_health.log.1").read_text() == "one"
     assert (tmp_path / "mcp_health.log.2").read_text() == "two"
     assert f.read_text() == "current\n" * 200

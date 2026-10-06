@@ -48,8 +48,9 @@
 #      (closed open-questions + their edges >90d, board events >180d; unverified
 #      questions and promotion pointers are never pruned)
 #  16. Copytruncate rotation of the shared MCP logs in ~/tmp (>10MB, 2 kept)
-#      → rotate_log (mcp_health.log, turnstile_debug.log; held open by every
-#      session's MCP server, so they are copied and truncated, never renamed)
+#      → rotate_log (mcp_health.log, turnstile_debug.log; the first is held open
+#      by every session's MCP server, so both are copied and truncated, never
+#      renamed)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -313,6 +314,15 @@ rotate_log() {
     [ -f "$f" ] && [ ! -L "$f" ] || return 0
     size="$(stat -c %s -- "$f" 2>/dev/null)" || return 0
     [ "$size" -gt "$max" ] || return 0
+    # Refuse BEFORE changing anything if a slot holds anything but a regular
+    # file (a directory, or a link to one): mv would put the copy INSIDE it, so
+    # the truncate would follow a move that archived nothing in its slot.
+    for (( i = 1; i <= keep; i++ )); do
+        if [ -e "$f.$i" ] && [ ! -f "$f.$i" ]; then
+            echo "rotate of $f failed ($f.$i is not a regular file); the log and its rotations were left as is"
+            return 0
+        fi
+    done
     # Copy to a temp file FIRST, before any retained rotation moves: if the copy
     # fails (a full disk), nothing has changed, the log and every kept copy
     # included. Truncating without a copy would lose the whole file. The temp
@@ -329,17 +339,26 @@ rotate_log() {
         echo "rotate of $f failed; the log and its rotations were left as is"
         return 0
     fi
+    # Truncate BEFORE shifting any kept copy, so a truncate that fails (the log
+    # turned read-only after the check above) has displaced no history.
+    if ! : > "$f"; then
+        rm -f -- "$tmp"
+        echo "rotate of $f failed (could not truncate); the log and its rotations were left as is"
+        return 0
+    fi
+    # -T (GNU: "treat DEST as a normal file") so no move can land inside a
+    # directory that appeared after the slot check. A failed move from here on
+    # keeps this run's copy at $tmp rather than deleting the only copy.
     for (( i = keep; i > 1; i-- )); do
-        if [ -f "$f.$((i - 1))" ]; then
-            mv -f -- "$f.$((i - 1))" "$f.$i"
+        if [ -f "$f.$((i - 1))" ] && ! mv -fT -- "$f.$((i - 1))" "$f.$i"; then
+            echo "rotate of $f failed (shifting $f.$((i - 1))); this run's copy is kept at $tmp"
+            return 0
         fi
     done
-    if mv -f -- "$tmp" "$f.1"; then
-        : > "$f"
+    if mv -fT -- "$tmp" "$f.1"; then
         echo "rotated $f ($size bytes)"
     else
-        rm -f -- "$tmp"
-        echo "rotate of $f failed; the log was left as is"
+        echo "rotate of $f failed (moving the copy to $f.1); it is kept at $tmp"
     fi
 }
 
