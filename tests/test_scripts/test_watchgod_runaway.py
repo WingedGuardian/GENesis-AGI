@@ -270,21 +270,25 @@ def test_a_short_absence_does_not_queue_the_page_again(box):
     dom = _domain(box, 200)
     hide = f"mv '{box['proc']}/5' '{box['tmp']}/hidden5'"
     show = f"mv '{box['tmp']}/hidden5' '{box['proc']}/5'"
-    _run(
+    out = _run(
         box,
         f"""
         wg_runaway_check '{dom}'
         {hide}; wg_runaway_check '{dom}'; {show}
         wg_runaway_check '{dom}'
         echo AFTER_SHORT=$(ls '{box["queue"]}' | wc -l)
+        echo FIRST=$(cat '{box["queue"]}'/*.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["dedupe_key"])')
+        rm -f '{box["queue"]}'/*.json   # delivered
         {hide}
         for g in "${{!_RW_LAST[@]}}"; do _RW_LAST[$g]=$(( _RW_LAST[$g] - DG_RUNAWAY_FORGET_S - 1 )); done
         wg_runaway_check '{dom}'; {show}
         wg_runaway_check '{dom}'
         """,
     )
+    assert "AFTER_SHORT=1" in out.stdout
+    first = next(ln.split("=", 1)[1] for ln in out.stdout.splitlines() if ln.startswith("FIRST="))
     keys = [p["dedupe_key"] for p in _pages(box)]
-    assert len(keys) == 2 and keys[0] == keys[1], keys
+    assert keys == [first], keys
 
 
 def test_a_new_file_is_a_new_incident_even_at_the_same_path(box):
@@ -309,9 +313,12 @@ def test_a_restart_re_sends_the_same_key(box):
     f = _file(box, "out.log", 60)
     _holder(box, 5, f)
     _check(box, _domain(box, 200))
+    first = [p["dedupe_key"] for p in _pages(box)]
+    for q in box["queue"].glob("*.json"):  # delivered; an undelivered copy collapses
+        q.unlink()
     time.sleep(1.1)  # a clock-derived key would differ across this gap
     _check(box, _domain(box, 200))
-    keys = [p["dedupe_key"] for p in _pages(box)]
+    keys = first + [p["dedupe_key"] for p in _pages(box)]
     assert len(keys) == 2 and keys[0] == keys[1], keys
 
 
@@ -492,7 +499,9 @@ def test_a_replacement_file_under_a_reused_inode_starts_afresh(box):
         box,
         f"""
         wg_runaway_check '{dom}'
-        stat() {{ command stat "$@" | awk '{{ print $1, $2 + 100 }}'; }}
+        # stat runs under timeout, which would exec the real binary: pass through.
+        timeout() {{ while [[ "$1" != stat && "$1" != find ]]; do shift; done; "$@"; }}
+        stat() {{ command stat "$@" | awk -F'\t' '{{ split($2, a, " "); printf "%s\t%s %d\\n", $1, a[1], a[2] + 100 }}'; }}
         _RW_PREV_T=$(( _RW_PREV_T - 30 ))
         wg_runaway_check '{dom}'; echo FAST=$RUNAWAY_FAST
         """,
@@ -562,4 +571,47 @@ def test_a_holder_gone_before_its_fdinfo_is_read_is_silent(box):
     (box["proc"] / "33" / "fdinfo" / "1").unlink()
     out = _check(box, _domain(box, 2048))
     assert "No such file" not in out.stderr
+    assert not _pages(box)
+
+
+def test_an_incomplete_walk_keeps_the_growth_baseline_of_files_it_missed(box):
+    """A file a timed-out walk did not report keeps its last size and time, so
+    the next complete poll still judges its growth instead of a first sighting."""
+    f = _file(box, "grow.log", 60)
+    _holder(box, 7, f)
+    dom = _domain(box, 2048)
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        timeout() {{ return 124; }}
+        wg_runaway_check '{dom}'
+        unset -f timeout
+        for g in "${{!_RW_PREV_AT[@]}}"; do _RW_PREV_AT[$g]=$(( _RW_PREV_AT[$g] - 60 )); done
+        python3 -c 'import os; fd = os.open("{f}", os.O_WRONLY); os.posix_fallocate(fd, 0, 360 * 1048576)'
+        wg_runaway_check '{dom}'
+        echo FAST=$RUNAWAY_FAST
+        """,
+    )
+    pages = _pages(box)
+    assert len(pages) == 1 and "it grew 300 MB" in pages[0]["body"], pages
+    assert "FAST=1" in out.stdout
+
+
+def test_a_stalled_revalidation_is_bounded_and_reported(box):
+    """stat -L on a held file whose mount stalled after the walk must not hang
+    the poll: it runs under the same timeout, and a timeout is logged."""
+    f = _file(box, "big.log", 600)
+    _holder(box, 8, f)
+    _run(
+        box,
+        f"""timeout() {{
+    local a=("$@"); while [[ "${{a[0]}}" != find && "${{a[0]}}" != stat ]]; do a=("${{a[@]:1}}"); done
+    [[ "${{a[0]}}" == stat ]] && return 124
+    "${{a[@]}}"
+}}
+wg_runaway_check '{_domain(box, 2048)}'""",
+    )
+    log = (box["home"] / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert "revalidation did not complete (status 124" in log
     assert not _pages(box)

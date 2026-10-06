@@ -70,6 +70,10 @@ DG_RUNAWAY_FORGET_S=3600
 # Per generation (device:inode:birth): space used at the previous poll, when it
 # was last seen, and the modes it has been paged in.
 declare -gA _RW_PREV=() _RW_LAST=() _RW_PAGED=()
+# When a baseline in _RW_PREV is older than the last poll: a file an
+# incomplete walk did not report keeps its last size and the time it was
+# measured, so growth is still judged against it (review finding).
+declare -gA _RW_PREV_AT=()
 _RW_PREV_T=0
 # Set by wg_runaway_check: 1 when some file grew fast enough to want 5 s polls.
 # shellcheck disable=SC2034  # read by check_disks in tmp_watchgod.sh
@@ -145,7 +149,7 @@ _rw_domain_for() {
     # the file is (the total, and so the percentage, are the same).
     if [[ -z "$best" && -n "$fallback" ]]; then
         local mnt
-        mnt="$(stat -c %m -- "${fpath%/*}" 2>/dev/null)" || mnt=""
+        mnt="$(timeout -k 1 2 stat -c %m -- "${fpath%/*}" 2>/dev/null)" || mnt=""
         [[ -n "$mnt" ]] && fallback="${fallback%% *} $(cut -d' ' -f2 <<< "$fallback") ${mnt}"
     fi
     printf '%s\n' "${best:-$fallback}"
@@ -194,15 +198,36 @@ wg_runaway_check() {
         size_of[$key]="$size"; dev_of[$key]="$dev"
         fds_of[$key]="${fds_of[$key]:-}${fds_of[$key]:+ }$pid/$fd"
     done <<< "$scan"
+    local walk_ok=1
     if [[ ! "$scan_rc" =~ ^[01]$ ]]; then
+        walk_ok=0
         log WARN "runaway-file walk of /proc did not complete (status ${scan_rc:-missing}; timeout ${DG_RUNAWAY_SCAN_TIMEOUT_S} s) — files it did not report were not checked this poll"
     fi
 
-    local dt=$(( now - _RW_PREV_T )) pg path dom dtotal dpath size_mb raw_b norm_b why sid body
-    local link id birth gen pf pfpid
-    local -A size_now=()
-    local -a holders
+    local dt pg path dom dtotal dpath size_mb raw_b norm_b why sid body
+    local link id birth gen pf pfpid st_line st_rc=0
+    local -A size_now=() st_of=()
+    local -a holders links=()
     pg="$(_wg_mode_tag)"
+    # Every descriptor is re-checked in ONE bounded stat: a held file on a
+    # network or FUSE mount that stalled after the walk must not hang the poll
+    # loop (review finding). /proc readlink never touches the target's
+    # filesystem; stat -L does. stat exits 1 when some link is gone (normal).
+    for key in "${!fds_of[@]}"; do
+        for pf in ${fds_of[$key]}; do links+=("${DG_PROC:-/proc}/${pf%/*}/fd/${pf#*/}"); done
+    done
+    if (( ${#links[@]} )); then
+        while IFS=$'\t' read -r link st_line; do
+            [[ -n "$link" ]] && st_of[$link]="$st_line"
+        done < <(rc=0
+                 timeout -k 2 "$DG_RUNAWAY_SCAN_TIMEOUT_S" stat -L -c $'%n\t%d:%i %W' -- "${links[@]}" 2>/dev/null || rc=$?
+                 printf '#rc\t%s\n' "$rc")
+        st_rc="${st_of["#rc"]:-unknown}"
+        if [[ ! "$st_rc" =~ ^[01]$ ]]; then
+            walk_ok=0
+            log WARN "runaway-file revalidation did not complete (status ${st_rc}; timeout ${DG_RUNAWAY_SCAN_TIMEOUT_S} s) — files were not revalidated this poll (a killed stat loses its buffered output)"
+        fi
+    fi
     for key in "${!size_of[@]}"; do
         # Every descriptor is re-checked: since the walk, one may have been
         # closed, its number reused, or its process gone. A holder counts only
@@ -213,7 +238,7 @@ wg_runaway_check() {
         for pf in ${fds_of[$key]}; do
             pfpid="${pf%/*}"
             local l="${DG_PROC:-/proc}/${pfpid}/fd/${pf#*/}" b=""
-            read -r id b < <(stat -L -c '%d:%i %W' -- "$l" 2>/dev/null) || id=""
+            read -r id b <<< "${st_of[$l]:-}" || id=""
             [[ "$id" == "$key" ]] || continue
             [[ -n "$link" ]] || { link="$l"; birth="$b"; }
             [[ -n "${counted[$pfpid]:-}" ]] && continue
@@ -233,6 +258,7 @@ wg_runaway_check() {
         [[ "$dtotal" =~ ^[0-9]+$ ]] && (( dtotal > 0 )) || continue
         size_mb=$(( ${size_of[$key]} / 1048576 ))
         raw_b=-1; norm_b=-1
+        dt=$(( now - ${_RW_PREV_AT[$gen]:-$_RW_PREV_T} ))
         if [[ -n "${_RW_PREV[$gen]:-}" ]] && (( _RW_PREV_T > 0 && dt > 0 )); then
             raw_b=$(( ${size_of[$key]} - ${_RW_PREV[$gen]} ))
             (( raw_b >= 0 )) && norm_b=$(( raw_b * POLL_INTERVAL / dt ))
@@ -266,11 +292,25 @@ wg_runaway_check() {
     # queued again under the same key, which the drainer collapses.
     for gen in "${!_RW_LAST[@]}"; do
         (( now - ${_RW_LAST[$gen]} > DG_RUNAWAY_FORGET_S )) || continue
-        unset "_RW_LAST[$gen]" "_RW_PAGED[$gen]"
+        unset "_RW_LAST[$gen]" "_RW_PAGED[$gen]" "_RW_PREV[$gen]" "_RW_PREV_AT[$gen]"
     done
 
-    _RW_PREV=()
+    # A file an incomplete walk did not report keeps its baseline and its time:
+    # dropping it would make the next poll a first sighting, and repeated
+    # incomplete walks would hide a fast grower for good (review finding).
+    local -A carry=() carry_at=()
+    if (( ! walk_ok )); then
+        for gen in "${!_RW_PREV[@]}"; do
+            [[ -n "${size_now[$gen]:-}" ]] && continue
+            carry[$gen]="${_RW_PREV[$gen]}"
+            carry_at[$gen]="${_RW_PREV_AT[$gen]:-$_RW_PREV_T}"
+        done
+    fi
+    _RW_PREV=(); _RW_PREV_AT=()
     for gen in "${!size_now[@]}"; do _RW_PREV[$gen]="${size_now[$gen]}"; done
+    for gen in "${!carry[@]}"; do
+        _RW_PREV[$gen]="${carry[$gen]}"; _RW_PREV_AT[$gen]="${carry_at[$gen]}"
+    done
     _RW_PREV_T=$now
     return 0
 }

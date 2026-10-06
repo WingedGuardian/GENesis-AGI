@@ -136,3 +136,21 @@ def test_queue_alert_try_fails_when_the_write_itself_fails(tmp_path):
         root.chmod(0o755)
     assert r.stdout.strip() == "FAILED"
     assert list(root.iterdir()) == []
+
+
+def test_an_identity_already_waiting_is_not_queued_twice(tmp_path):
+    """A caller restarting in a loop while delivery is down re-sends the same
+    key; the queue keeps one copy and reports it durable."""
+    root = tmp_path / "queue"
+    r = _run_bash(
+        'queue_alert_try critical wg "T1" "B1" "wg:k1" && echo first\n'
+        'queue_alert_try critical wg "T2" "B2" "wg:k1" && echo second\n'
+        'queue_alert_try critical wg "T3" "B3" "wg:k2" && echo third\n'
+        'queue_alert_try critical wg "T4" "B4" && echo nokey1\n'
+        'queue_alert_try critical wg "T5" "B5" && echo nokey2',
+        {"GENESIS_ALERT_QUEUE_ROOT": str(root)},
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == ["first", "second", "third", "nokey1", "nokey2"]
+    titles = sorted(e["title"] for e in _entries(root))
+    assert titles == ["T1", "T3", "T4", "T5"], "same key once; no key never deduped"

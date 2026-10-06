@@ -209,9 +209,12 @@ def test_red_starts_last_resort_reclaim(box):
 
 def test_green_ends_the_episode_so_the_next_one_pages_again(box):
     _handle(box, "orange")
+    first = [p for p in _pages(box) if p["severity"] == "warning"]
+    for q in box["queue"].glob("*.json"):  # delivered; an undelivered copy collapses
+        q.unlink()
     _handle(box, "green", free=90_000)
     _handle(box, "orange")
-    assert len([p for p in _pages(box) if p["severity"] == "warning"]) == 2
+    assert len(first + [p for p in _pages(box) if p["severity"] == "warning"]) == 2
 
 
 def test_attribution_is_logged_once_per_episode(box):
