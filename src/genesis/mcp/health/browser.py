@@ -1549,12 +1549,14 @@ _TOOL_TIMEOUT_S: float = 60.0
 
 
 async def _with_tool_timeout(
-    coro, timeout_s: float = _TOOL_TIMEOUT_S, operation: str = "browser"
+    coro, timeout_s: float = _TOOL_TIMEOUT_S, operation: str = "browser", note: str = ""
 ) -> dict:
     """Wrap a browser tool coroutine with a hard asyncio timeout.
 
     Returns a structured ``{"error": ...}`` dict on timeout instead of
-    raising, so the MCP caller gets a clean error response.
+    raising, so the MCP caller gets a clean error response. ``note`` is put
+    in front of the reset advice: what the cancelled call may already have
+    done (a click whose events were sent before the hang).
 
     On timeout, resets ``_active_page`` to None so subsequent tool calls
     don't operate on a page left in an indeterminate state.
@@ -1567,7 +1569,7 @@ async def _with_tool_timeout(
         _active_page = None
         return {
             "error": (
-                f"{operation} timed out after {timeout_s:.0f}s. "
+                f"{operation} timed out after {timeout_s:.0f}s. {note}"
                 "Browser state was reset — call browser_navigate to resume."
             )
         }
@@ -1586,23 +1588,37 @@ _INTERCEPT_MARK = "intercepts pointer events"
 _COVER_MAX_CHARS = 200  # Playwright already shortens the markup; this bounds a hostile page
 
 
-def _blocked_click(err: BaseException, selector: str) -> ClickBlocked | None:
+async def _blocked_click(err: BaseException, selector: str, page) -> ClickBlocked | None:
     """Return a ClickBlocked naming the covering element, or None if ``err`` is
-    not Playwright's covered-target failure.
+    not a click on a target that is covered NOW.
 
-    The covering element is read from Playwright's call log, whose line has the
-    shape ``  - <div id="x">…</div> intercepts pointer events``. Only the
-    message is read, for display; the decision itself rests on the marker.
+    Playwright's call log keeps every retry, so an interception line in it may
+    belong to a superseded attempt: the overlay cleared and a later attempt
+    failed for another reason. Which attempt the log ends on cannot be read
+    reliably (a timeout can land mid-attempt or in the wait between two), so
+    the log only says a cover was seen and the page is asked whether it is
+    still there (_UNCOVERED_JS). A target that is entirely uncovered now is
+    not a blocked click and the fallbacks may run; anything else, including a
+    probe that cannot run, keeps the block, because the fallbacks would act on
+    the target behind the overlay.
 
-    The log keeps every retry, so the LAST marker decides. A click sent after
-    the last interception (the overlay cleared and a retry went through) may
-    have been delivered, so it is not a blocked click. An interception logged
-    after the sent line is: Playwright's hit-target interceptor swallowed that
-    attempt's events (``setupHitTargetInterceptor`` cancels them).
+    A click sent after the last interception may have been delivered
+    (_click_was_sent), so it is never a blocked click.
+
+    The covering element is read from the call log, whose line has the shape
+    ``  - <div id="x">…</div> intercepts pointer events``, for display only.
     """
     text = str(err)
-    at = text.rfind(_INTERCEPT_MARK)
-    if at < 0 or text.rfind(_CLICK_SENT_MARK) > at:
+    if _INTERCEPT_MARK not in text or _click_was_sent(err):
+        return None
+    try:
+        # Bounded: the target resolved moments ago; one that is not attached
+        # now leaves the probe inconclusive, which keeps the block, so a long
+        # wait only spends the tool's 60 s budget.
+        uncovered = await page.locator(selector).first.evaluate(_UNCOVERED_JS, timeout=2000)
+    except Exception:
+        uncovered = False
+    if uncovered is True:
         return None
     cover = "another element"
     for line in text.splitlines():
@@ -1637,10 +1653,11 @@ def _blocked_click(err: BaseException, selector: str) -> ClickBlocked | None:
 # browser follows the link, per the HTML label activation behaviour), and never
 # for a disabled control. When no point qualifies: on a label, {cover: <tag>}
 # naming an element outside the label that a sampled point hit (an overlay),
-# else null; on a control, "label" if every sampled hit landed inside the
-# control's own label (its decoration, such as <span class=mark>), so the label
-# may stand in for it, else null, and the click goes to the control itself,
-# where Playwright names any overlay.
+# else null; on an enabled control, {label: i} if every sampled hit landed
+# inside ONE of the control's own labels, e.labels[i] (its decoration, such as
+# <span class=mark>), so THAT label, the one hit-tested, may stand in for it,
+# else null, and the click goes to the control itself, where Playwright names
+# any overlay.
 _PICK_POINT_JS = """
 (e) => {
   const up = (n) => n.parentNode || n.host;
@@ -1661,8 +1678,9 @@ _PICK_POINT_JS = """
     }
     return true;
   };
-  const labels = ctl ? [] : [...(e.labels || [])];
-  let decorated = labels.length > 0;
+  // A disabled control is not activated by its label, so it gets none.
+  const labels = ctl || e.matches(':disabled') ? [] : [...(e.labels || [])];
+  let which = labels.length ? -2 : -1;  // -2: no miss yet; -1: no single label
   let cover = null;
   const hit = (x, y) => {
     let n = e.ownerDocument.elementFromPoint(x, y);
@@ -1685,7 +1703,8 @@ _PICK_POINT_JS = """
     const y = r.top + r.height * (0.2 + 0.6 * Math.random());
     const n = hit(x, y);
     if (inside(n)) return { x: x - b.left - bl, y: y - b.top - bt, bl, bt };
-    if (!labels.some((l) => within(n, l))) decorated = false;
+    const j = labels.findIndex((l) => within(n, l));
+    which = which === -2 || which === j ? j : -1;
     if (ctl && n && !within(n, e)) cover = n;
   }
   if (cover) {
@@ -1693,21 +1712,27 @@ _PICK_POINT_JS = """
     const cls = typeof cover.className === 'string' && cover.className ? ` class="${cover.className}"` : '';
     return { cover: `<${cover.localName}${id}${cls}>` };
   }
-  return decorated ? 'label' : null;
+  return which >= 0 ? { label: which } : null;
 }
 """
 
-# Whether a form control may be clicked through its <label>: it has one and is
-# enabled (a disabled control is not activated by its label, so the control is
-# clicked and Playwright waits for it to be enabled). "visible" is false for a
-# control nobody can hit: display:none, visibility:hidden, or the 1x1 clipped
-# box of a visually-hidden ("sr-only") input. Its label is the target then.
+# "visible" is false for an element nobody can hit: display:none,
+# visibility:hidden, or the 1x1 clipped box of a visually-hidden ("sr-only")
+# one. A hidden form control is clicked through its <label>: "label" is the
+# index in e.labels of the first VISIBLE label (else 0, whose click then fails
+# before sending: Playwright waits for it to become visible until the click
+# timeout, and the fallback chain runs), or -1 when the control has none or is
+# disabled (a disabled control is not activated by its label, so the control
+# is clicked and Playwright waits for it to be enabled).
 _LABEL_JS = """
 (e) => {
-  const r = e.getBoundingClientRect();
-  const visible = r.width > 1 && r.height > 1 && getComputedStyle(e).visibility !== 'hidden';
-  const label = !!(e.labels && e.labels.length) && !e.matches(':disabled');
-  return { visible, label };
+  const seen = (n) => {
+    const r = n.getBoundingClientRect();
+    return r.width > 1 && r.height > 1 && getComputedStyle(n).visibility !== 'hidden';
+  };
+  const ls = [...(e.labels || [])];
+  const label = !ls.length || e.matches(':disabled') ? -1 : Math.max(ls.findIndex(seen), 0);
+  return { visible: seen(e), label };
 }
 """
 
@@ -1720,18 +1745,64 @@ _CLICK_SENT_MARK = "performing click action"
 
 
 def _click_was_sent(err: BaseException) -> bool:
-    return _CLICK_SENT_MARK in str(err)
+    """Whether the click may have been delivered: the last attempt that sent
+    events was not then intercepted. An interception logged AFTER the sent
+    line means Playwright's hit-target interceptor swallowed that attempt's
+    events (``setupHitTargetInterceptor`` cancels them), so nothing landed.
+    """
+    text = str(err)
+    return text.rfind(_CLICK_SENT_MARK) > text.rfind(_INTERCEPT_MARK)
 
 
-async def _humanized_click(page, target, timeout: int, label=None) -> None:
+# Whether an element is ENTIRELY uncovered now: a 3x3 grid over each of its
+# rendered boxes all hit-tests as the element, one of its own <label>s, or
+# inside them. Asked only after Playwright logged an interception, to tell a
+# cover that has since cleared from one still there. A form control is clicked
+# through its label when hidden or decorated (_humanized_click), so its labels
+# count as itself, and a control with no box of its own (display:none, sr-only)
+# is judged on its visible labels' boxes. Strict on purpose: a partly covered,
+# unrendered or oddly shaped (rotated) target reads as covered and keeps the
+# block.
+_UNCOVERED_JS = """
+(e) => {
+  const up = (n) => n.parentNode || n.host;
+  const own = [e, ...(e.labels || [])];
+  const within = (n) => {
+    for (; n; n = up(n)) if (own.includes(n)) return true;
+    return false;
+  };
+  const hit = (x, y) => {
+    let n = e.ownerDocument.elementFromPoint(x, y);
+    while (n && n.shadowRoot) {
+      const m = n.shadowRoot.elementFromPoint(x, y);
+      if (!m || m === n) break;
+      n = m;
+    }
+    return n;
+  };
+  const boxes = (n, min) => [...n.getClientRects()].filter((r) => r.width >= min && r.height >= min);
+  let rects = boxes(e, 1);
+  if (!rects.length) rects = own.slice(1).flatMap((l) => boxes(l, 2));
+  if (!rects.length) return false;
+  for (const r of rects)
+    for (const fx of [0.25, 0.5, 0.75])
+      for (const fy of [0.25, 0.5, 0.75])
+        if (!within(hit(r.left + r.width * fx, r.top + r.height * fy))) return false;
+  return true;
+}
+"""
+
+
+async def _humanized_click(page, target, timeout: int, is_label: bool = False) -> None:
     """Scroll ``target`` (a Locator) into view, move the mouse to a point on it
     with Camoufox's humanized trail, dwell, then click that point.
 
-    ``label`` is the control's own <label> (an ElementHandle), if any. When
-    every sampled hit on the control landed inside that label (a styled
-    checkbox whose <input> sits under its own <span class=mark>), the label is
-    clicked instead: that is where a person clicks, and the decoration is part
-    of the control, not an overlay. A cover outside the label is an overlay:
+    ``is_label`` says ``target`` is a control's own <label> (an ElementHandle).
+    When every sampled hit on a control landed inside one of its own labels (a
+    styled checkbox whose <input> sits under its own <span class=mark>), THAT
+    label, the one hit-tested, is clicked instead: that is where a person
+    clicks, and the decoration is part of the control, not an overlay. A cover
+    outside the label is an overlay:
     the control itself is clicked, and Playwright names the cover. The label
     is only ever clicked at a point that activates the control (see
     _PICK_POINT_JS). With none: an overlay on the label fails as ClickBlocked;
@@ -1747,21 +1818,24 @@ async def _humanized_click(page, target, timeout: int, label=None) -> None:
     """
     await target.scroll_into_view_if_needed(timeout=timeout)
     pos = await target.evaluate(_PICK_POINT_JS)
-    if pos == "label" and label is not None:
-        target = label
-        await target.scroll_into_view_if_needed(timeout=timeout)
-        pos = await target.evaluate(_PICK_POINT_JS)
+    if not is_label and isinstance(pos, dict) and "label" in pos:
+        handle = await target.evaluate_handle("(e, i) => e.labels[i]", pos["label"])
+        label = handle.as_element()
+        if label is not None:
+            await _humanized_click(page, label, timeout, is_label=True)
+            return
+        pos = None
     if isinstance(pos, dict) and "cover" in pos:
         # An overlay covers the label. Phrased as Playwright's call-log line so
         # _stealth_click raises ClickBlocked with no fallback: the fallbacks
         # would reach the hidden control behind the overlay by script.
         raise Exception(f"  - {pos['cover']} {_INTERCEPT_MARK}")
     if not isinstance(pos, dict):
-        if target is label:
+        if is_label:
             raise Exception("no point on the label would activate its control")
         pos = None
     # An ElementHandle's bounding_box takes no timeout; a Locator's does.
-    box = await (target.bounding_box() if target is label else target.bounding_box(timeout=timeout))
+    box = await (target.bounding_box() if is_label else target.bounding_box(timeout=timeout))
     if box is None:
         raise Exception("element has no layout box")
     if pos is not None:
@@ -1802,9 +1876,10 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
     at those coordinates: a target below the fold got no click, a covered
     target clicked the overlay, and the tool reported success either way.
 
-    A covered target raises :class:`ClickBlocked` on every layer, with no
-    fallback. A click Playwright reports as sent (_CLICK_SENT_MARK in its call
-    log) is never repeated by a fallback. A failure before that keeps the
+    A target Playwright found covered, and that is still not entirely
+    uncovered, raises :class:`ClickBlocked` on every layer, with no fallback
+    (see _blocked_click). A click Playwright reports as sent and not swallowed
+    (_click_was_sent) is never repeated by a fallback. A failure before that keeps the
     fallback chain (plain click, keyboard, shadow-DOM script click).
 
     Other layers use plain ``page.click()``.
@@ -1844,7 +1919,7 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
         try:
             await page.click(selector, timeout=timeout)
         except Exception as err:
-            blocked = _blocked_click(err, selector)
+            blocked = await _blocked_click(err, selector, page)
             if blocked is not None:
                 raise blocked from err
             raise
@@ -1855,19 +1930,21 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
         await loc.wait_for(state="attached", timeout=timeout)
         info = await loc.evaluate(_LABEL_JS)
         label = None
-        if info.get("label"):
-            # The control's OWN label, from the DOM. A selector rebuilt from its
-            # id (label[for=id]) searches the whole page through open shadow
-            # roots and finds another component's label when ids repeat.
-            label = (await loc.evaluate_handle("e => e.labels[0]")).as_element()
-        if not info.get("visible") and label is not None:
-            # A hidden <input> (display:none, sr-only): only its label can be
-            # clicked.
-            await _humanized_click(page, label, timeout, label=label)
+        index = info.get("label", -1)
+        if not info.get("visible") and type(index) is int and index >= 0:
+            # A hidden <input> (display:none, sr-only): only a label can be
+            # clicked. The control's OWN label, from the DOM: a selector
+            # rebuilt from its id (label[for=id]) searches the whole page
+            # through open shadow roots and finds another component's label
+            # when ids repeat.
+            handle = await loc.evaluate_handle("(e, i) => e.labels[i]", index)
+            label = handle.as_element()
+        if label is not None:
+            await _humanized_click(page, label, timeout, is_label=True)
         else:
-            await _humanized_click(page, loc, timeout, label=label)
+            await _humanized_click(page, loc, timeout)
     except Exception as stealth_err:
-        blocked = _blocked_click(stealth_err, selector)
+        blocked = await _blocked_click(stealth_err, selector, page)
         if blocked is not None:
             raise blocked from stealth_err
         if _click_was_sent(stealth_err):
@@ -1876,7 +1953,7 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
         try:
             await page.click(selector, timeout=timeout)
         except Exception as plain_err:
-            blocked = _blocked_click(plain_err, selector)
+            blocked = await _blocked_click(plain_err, selector, page)
             if blocked is not None:
                 raise blocked from plain_err
             if _click_was_sent(plain_err):
@@ -2934,6 +3011,15 @@ async def _impl_browser_click(selector: str) -> dict:
         snapshot = await _snapshot_page(page)
         return {"clicked": selector, "url": page.url, "snapshot": snapshot}
     except Exception as e:
+        # A ClickBlocked carries page markup, never Playwright's call log.
+        if not isinstance(e, ClickBlocked) and _click_was_sent(e):
+            return {
+                "error": (
+                    f"Click on '{selector}' was sent, then failed, so it may already "
+                    "have taken effect: call browser_snapshot and check before "
+                    f"clicking again. Detail: {e}"
+                )
+            }
         return {"error": f"Click failed on '{selector}': {e}"}
 
 
@@ -3222,11 +3308,11 @@ async def browser_click(selector: str) -> dict:
 
     The target is scrolled into view and hit-tested before the click. If
     another element covers it (cookie banner, modal, sticky header), the
-    click fails with "Click blocked: <covering element> covers '<selector>'":
-    dismiss that element and click again.
+    click fails with "Click blocked: an element covers '<selector>'", naming
+    the covering element's markup: dismiss that element and click again.
 
-    A styled checkbox or radio whose <input> is hidden or covered by its own
-    decoration is clicked through its <label>.
+    On the default Camoufox browser, a styled checkbox or radio whose <input>
+    is hidden or covered by its own decoration is clicked through its <label>.
 
     Keyboard fallback: if the click fails for another reason before any click
     was sent, the tool tries keyboard activation (focus + Space/Enter). A
@@ -3234,12 +3320,21 @@ async def browser_click(selector: str) -> dict:
     For manual keyboard navigation, use browser_press_key with Tab/Space.
 
     Returns the updated page snapshot after clicking. "clicked" means the
-    click was sent; confirm the page changed.
+    click was sent; confirm the page changed. An error that says the click
+    may already have taken effect (it was sent, or the call timed out) is
+    not a failed click: check the page before clicking again.
     """
     return await _with_tool_timeout(
         _impl_browser_click(selector),
         _TOOL_TIMEOUT_S,
         f"browser_click('{selector}')",
+        # The hang this timeout exists for can come after the click events
+        # were sent (Playwright's post-action wait), and the cancellation
+        # discards the call log that would say so.
+        note=(
+            "The click may already have been delivered: after browser_navigate, "
+            "check whether it took effect before clicking again. "
+        ),
     )
 
 
