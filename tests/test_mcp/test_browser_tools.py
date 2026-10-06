@@ -44,6 +44,7 @@ def _clear_all_browser_state():
     if browser._idle_task is not None:
         browser._idle_task.cancel()
     browser._idle_task = None
+    browser._pending_closes = set()
     # VNC verification flag — FIX 3 tests toggle it; reset to avoid leak
     browser._vnc_verified = False
 
@@ -2631,7 +2632,9 @@ class TestAsyncCleanupStillCleansEverything:
         ctx.close.assert_awaited_once()
         pw.stop.assert_awaited_once()
         remote_br.close.assert_awaited_once()
+        remote_pw.stop.assert_awaited_once()
         tf_br.close.assert_awaited_once()
+        tf_pw.stop.assert_awaited_once()
         delete.assert_awaited_once()
         assert browser._active_page is None
         assert browser._layer_last_used == {}
@@ -2883,10 +2886,12 @@ class TestChromiumWindowClose:
             await browser._ensure_chromium_fallback()
         assert "close" in handlers
         handlers["close"](ctx)
+        assert len(browser._pending_closes) == 1  # the reap task is retained
         for _ in range(5):
             await asyncio.sleep(0)
         pw.stop.assert_awaited_once()
         assert browser._context is None and browser._playwright is None
+        assert not browser._pending_closes
 
 
 class _EventPage:
@@ -3340,3 +3345,110 @@ class TestFollowNewTabChainsAndWaits:
         result = await self._click_with(original, popup, delay_s=0.6, declared=True)
         assert result["new_page"]["url"] == "https://b.example"
         assert browser._active_page is popup
+
+
+def _gated(done: list, gate: asyncio.Event, entered: asyncio.Event):
+    """An awaitable close that waits for ``gate`` and records its completion."""
+
+    async def close(*_a):
+        entered.set()
+        await gate.wait()
+        done.append(True)
+
+    return close
+
+
+class TestACancelledReclaimStillFinishesItsClose:
+    """Lifespan shutdown cancels the idle watcher while it is reclaiming a layer.
+    The cleanup has already detached the layer's globals, so async_cleanup cannot
+    find it again: the close must run to completion anyway, and async_cleanup
+    must wait for it."""
+
+    @pytest.mark.asyncio
+    async def test_chromium_driver_is_stopped_when_reclaim_is_cancelled_mid_close(self):
+        pw, ctx, _ = _open_chromium()
+        gate, entered, closed, stopped = asyncio.Event(), asyncio.Event(), [], []
+        ctx.close = AsyncMock(side_effect=_gated(closed, gate, entered))
+        pw.stop = AsyncMock(side_effect=lambda: stopped.append(True))
+        browser._layer_last_used[browser.BrowserLayer.CHROMIUM] = 0.0
+        browser._idle_task = asyncio.ensure_future(
+            browser._reclaim_idle_layers(browser._IDLE_TIMEOUT_S + 1.0)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        cleanup = asyncio.ensure_future(browser.async_cleanup())
+        await asyncio.sleep(0.05)
+        gate.set()
+        await asyncio.wait_for(cleanup, timeout=5)
+        await asyncio.sleep(0.05)  # let a close left running elsewhere finish too
+        assert closed == [True]
+        assert stopped == [True]  # the driver was not orphaned
+
+    @pytest.mark.asyncio
+    async def test_async_cleanup_waits_for_a_camoufox_close_a_cancel_left_running(self):
+        cm, _ = _open_camoufox()
+        gate, entered, exited = asyncio.Event(), asyncio.Event(), []
+        cm.__aexit__ = AsyncMock(side_effect=_gated(exited, gate, entered))
+        browser._layer_last_used[browser.BrowserLayer.CAMOUFOX] = 0.0
+        browser._idle_task = asyncio.ensure_future(
+            browser._reclaim_idle_layers(browser._IDLE_TIMEOUT_S + 1.0)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        cleanup = asyncio.ensure_future(browser.async_cleanup())
+        await asyncio.sleep(0.05)
+        assert not cleanup.done()  # still waiting for the close
+        gate.set()
+        await asyncio.wait_for(cleanup, timeout=5)
+        assert exited == [True]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_launch_cancelled_again_still_stops_its_driver(self):
+        pytest.importorskip("playwright", reason="playwright not installed")
+        gate, entered, stopped = asyncio.Event(), asyncio.Event(), []
+        pw = MagicMock()
+        pw.stop = AsyncMock(side_effect=_gated(stopped, gate, entered))
+        pw.chromium.launch_persistent_context = AsyncMock(side_effect=RuntimeError("no chrome"))
+        starter = MagicMock()
+        starter.start = AsyncMock(return_value=pw)
+        fake = MagicMock(async_playwright=MagicMock(return_value=starter))
+        with patch.dict("sys.modules", {"playwright.async_api": fake}):
+            launch = asyncio.ensure_future(browser._ensure_chromium_fallback())
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            launch.cancel()  # the tool timeout lands while the driver is stopping
+            with pytest.raises((asyncio.CancelledError, RuntimeError)):
+                await launch
+        cleanup = asyncio.ensure_future(browser.async_cleanup())
+        await asyncio.sleep(0.05)
+        gate.set()
+        await asyncio.wait_for(cleanup, timeout=5)
+        assert stopped == [True]
+
+    @pytest.mark.asyncio
+    async def test_cancelling_async_cleanup_does_not_cancel_the_close_it_waits_for(self):
+        pw, ctx, _ = _open_chromium()
+        gate, entered, closed, stopped = asyncio.Event(), asyncio.Event(), [], []
+        ctx.close = AsyncMock(side_effect=_gated(closed, gate, entered))
+        pw.stop = AsyncMock(side_effect=lambda: stopped.append(True))
+        browser._layer_last_used[browser.BrowserLayer.CHROMIUM] = 0.0
+        browser._idle_task = asyncio.ensure_future(
+            browser._reclaim_idle_layers(browser._IDLE_TIMEOUT_S + 1.0)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        cleanup = asyncio.ensure_future(browser.async_cleanup())
+        await asyncio.sleep(0.05)
+        cleanup.cancel()  # the lifespan exit is itself cut short
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup
+        gate.set()
+        await asyncio.sleep(0.05)
+        assert closed == [True] and stopped == [True]
+
+
+class TestARejectedNavigateTouchesNoLayer:
+    @pytest.mark.asyncio
+    async def test_tinyfish_plus_remote_does_not_refresh_the_tinyfish_clock(self):
+        browser._layer_last_used[browser.BrowserLayer.TINYFISH] = 123.0
+        result = await browser._impl_browser_navigate(
+            "https://example.com", tinyfish=True, remote=True,
+        )
+        assert "error" in result
+        assert browser._layer_last_used == {browser.BrowserLayer.TINYFISH: 123.0}
