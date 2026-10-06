@@ -74,7 +74,12 @@ enforces ONLY when the merge targets the configured PUBLIC repo — the declared
 ``github.user``/``github.public_repo`` in ``~/.genesis/config/genesis.yaml``
 (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any OTHER repo
 (a private fork, the voice repo, backups) no-ops, since the required ``/schedule``
-routines run only on the public repo. Deployment note: on the public repo the leaks
+routines run only on the public repo. One per-PR exception: an OUTSIDE contribution
+(a human non-maintainer's fork PR whose every commit and title rename is theirs, whose
+body only they or a named review app edited, and whose CI leak-detector is green at head;
+``_outside_contribution``) needs no ``leaks`` marker, since the review guards the
+owner's private data and an outsider's text cannot hold it -- unless a leaks review ran
+in the PR and objected. Deployment note: on the public repo the leaks
 routine IS configured (the deploy precondition); a clone that runs on its own public
 repo without a producer uses `# scheduled-review-override` — since the only default kind
 is the irreducible one, config cannot relax it, and the override valve is the escape by
@@ -8459,6 +8464,42 @@ def _sha_is_ancestor(ancestor: str, descendant: str, repo: str | None = None) ->
     return status == "ahead"
 
 
+def _kind_has_blocking_evidence(
+    kind: str, rejected: dict[str, set[str]], residue: dict[str, set[str]]
+) -> tuple[str, str] | None:
+    """``(cause, remedy)`` when ``kind`` has a blocking finding somewhere in the PR,
+    else None.
+
+    Shared by the mechanical-rescan relief and the outside-contribution exemption:
+    neither may clear a kind whose review ran and objected. ANY refusal for the kind,
+    at ANY head, counts (see THE RULE in ``_relieve_kinds_by_mechanical_rescan``).
+    So does RESIDUE: blocking evidence the scan could not credit to ``rejected`` (a
+    same-timestamp tie at some head, or a malformed / unknown-kind marker whose body
+    reads as blocking), at ANY head, since the finding was never provably retracted
+    and the head axis is not a time axis. A "*" entry is a blocking body under no
+    creditable kind: it counts for every kind. This closes the path an adversarial
+    audit REPRODUCED (2026-08-30): a [P1] body under a 12-char `head=` at HEAD landed
+    in `unusable`, and relief carried the older clean review straight over it.
+    """
+    if any(kind in kinds for kinds in rejected.values()):
+        return (
+            "a scheduled review for this kind was REFUSED in this PR and never "
+            "retracted at the commit it was made about",
+            "read that finding rather than re-running the review",
+        )
+    residue_kinds: set[str] = set()
+    for kinds in residue.values():
+        residue_kinds |= kinds
+    if kind in residue_kinds or "*" in residue_kinds:
+        return (
+            "a marker in this PR carries a blocking finding that could not be "
+            "credited to a head or a kind (a malformed field, or a verdict tied "
+            "with a clean one)",
+            "resolve that finding first",
+        )
+    return None
+
+
 def _relieve_kinds_by_mechanical_rescan(
     missing: list[str],
     accepted: dict[str, set[str]],
@@ -8531,32 +8572,10 @@ def _relieve_kinds_by_mechanical_rescan(
         if not pin:
             continue
         check_name, workflow = pin
-        # ANY refusal for this kind, at ANY head -> no relief. See THE RULE above.
-        if any(kind in kinds for kinds in rejected.values()):
-            reasons[kind] = (
-                "a scheduled review for this kind was REFUSED in this PR and never "
-                "retracted at the commit it was made about, so no earlier review is "
-                "carried forward -- read that finding rather than re-running the review"
-            )
-            continue
-        # Blocking evidence the scan could not credit to `rejected` -- a same-timestamp
-        # tie at some head, or a malformed / unknown-kind marker whose body reads as
-        # blocking -- is RESIDUE, and it denies exactly as a refusal does, at ANY head:
-        # the finding was never provably retracted, and the head axis is not a time
-        # axis. A "*" entry is a blocking body under no creditable kind: it denies
-        # every kind. This closes the path an adversarial audit REPRODUCED (2026-08-30):
-        # a [P1] body under a 12-char `head=` at HEAD landed in `unusable`, and relief
-        # carried the older clean review straight over it.
-        residue_kinds: set[str] = set()
-        for kinds in residue.values():
-            residue_kinds |= kinds
-        if kind in residue_kinds or "*" in residue_kinds:
-            reasons[kind] = (
-                "a marker in this PR carries a blocking finding that could not be "
-                "credited to a head or a kind (a malformed field, or a verdict tied "
-                "with a clean one), so no earlier review is carried forward -- "
-                "resolve that finding first"
-            )
+        blocking = _kind_has_blocking_evidence(kind, rejected, residue)
+        if blocking is not None:
+            cause, remedy = blocking
+            reasons[kind] = f"{cause}, so no earlier review is carried forward -- {remedy}"
             continue
         candidates = [h for h, kinds in accepted.items() if h != head and kind in kinds]
         if not candidates:
@@ -8608,6 +8627,172 @@ def _relieve_kinds_by_mechanical_rescan(
     return [k for k in missing if k not in relieved_kinds], relieved, reasons
 
 
+#: The one GraphQL read behind the outside-contribution exemption: who opened the
+#: PR (and as what), where its head lives, and who edited its title or body.
+_OUTSIDE_PR_QUERY = (
+    "query($owner:String!,$name:String!,$num:Int!){repository(owner:$owner,name:$name){"
+    "pullRequest(number:$num){headRefOid isCrossRepository authorAssociation "
+    "author{__typename login} "
+    "userContentEdits(first:100){totalCount nodes{editor{__typename login}}} "
+    "timelineItems(itemTypes:[RENAMED_TITLE_EVENT],first:100){filteredCount "
+    "nodes{... on RenamedTitleEvent{actor{login}}}} "
+    "forcePushes: timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT],first:1)"
+    "{filteredCount}}}}"
+)
+
+
+def _pr_outside_facts(pr_num: str, repo: str | None = None) -> dict | None:
+    """The ``pullRequest`` object of ``_OUTSIDE_PR_QUERY``, or None on any error.
+
+    Tests inject via ``_TEST_GH_OUTSIDE_PR`` (that object as JSON; ``__error__``
+    simulates a failed read).
+    """
+    raw = os.environ.get("_TEST_GH_OUTSIDE_PR")
+    if raw is None:
+        if repo is not None and not isinstance(repo, str):
+            return None
+        slug = _normalize_repo(repo) if repo else _derive_repo_from_cwd(os.getcwd())
+        if not slug or "/" not in slug or not str(pr_num).isdigit():
+            return None
+        owner, name = slug.split("/", 1)
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    "graphql",
+                    "-f",
+                    f"query={_OUTSIDE_PR_QUERY}",
+                    "-f",
+                    f"owner={owner}",
+                    "-f",
+                    f"name={name}",
+                    # -F: the number must reach GraphQL as an Int.
+                    "-F",
+                    f"num={pr_num}",
+                    "--jq",
+                    ".data.repository.pullRequest",
+                ],
+                capture_output=True,
+                text=True,
+                # Merge path, under the shared deadline; a failure means no exemption.
+                timeout=_gh_timeout(6),
+            )
+        except Exception:
+            return None
+        raw = result.stdout if result.returncode == 0 else ""
+    try:
+        facts = json.loads(raw)
+    except Exception:
+        return None
+    return facts if isinstance(facts, dict) else None
+
+
+#: Review apps whose own edits to an outside PR's body (a summary, a badge) keep the
+#: leaks exemption. MEASURED 2026-10-05 over 7 exempt-shaped merged outside PRs: every
+#: one carried a ``coderabbitai`` edit and all but one a ``devin-ai-integration`` edit.
+#: Named, not "any Bot": an unknown app's edit is not known to be generated text.
+_BODY_EDIT_REVIEW_APPS = frozenset({"coderabbitai", "devin-ai-integration"})
+
+#: A ``Co-authored-by:`` trailer names someone else's text inside a commit the
+#: contributor made -- GitHub adds one when a review suggestion is committed.
+_CO_AUTHOR_TRAILER = re.compile(r"(?im)^co-authored-by:")
+
+
+def _outside_contribution(pr_num: str, repo: str | None, head: str) -> tuple[str | None, str]:
+    """``(login, "")`` when PR ``pr_num`` at ``head`` is wholly an outside
+    contribution, else ``(None, why)`` (``why`` is "" when the PR is not even a
+    fork PR, so a maintainer PR's block message stays unchanged).
+
+    The leaks review exists to stop the OWNER's private data reaching the public repo,
+    and an outsider's own text cannot hold it (owner ruling, 2026-10-05). So the
+    marker is not required when ALL of these hold, read live and bound to ``head``:
+      * the PR was opened by a human account (a Bot never qualifies) whose
+        association is not OWNER, MEMBER or COLLABORATOR;
+      * its head lives in a fork, and is ``head``, and the branch was never
+        force-pushed (a rewrite can fold a commit of ours into one of theirs);
+      * every commit's author is that account, and every committer is that account
+        or ``web-flow`` (the committer GitHub records for the contributor's web
+        edits, and for an Update-branch merge or UI rebase, which bring in only the
+        base's content); and no commit carries a ``Co-authored-by:`` trailer, which
+        is how a committed review suggestion of ours would arrive;
+      * every edit of the PR body was the author's or a named review app's
+        (``_BODY_EDIT_REVIEW_APPS``), and every title rename was the author's;
+      * CI's leak-detector is green at ``head`` (the same identity check the
+        carried-forward relief uses). On a fork that job runs its pattern-class scan
+        but not the private-pattern step, which needs a repo secret forks do not get.
+    A commit or a text edit of ours, an unlinked commit identity (session commits
+    carry none), or any failed read means no exemption: the marker stays required.
+    Not covered, as before this exemption existed: text a session writes into the
+    squash commit itself at merge time (``gh pr merge --body``).
+    """
+    facts = _pr_outside_facts(pr_num, repo)
+    if facts is None:
+        return None, "the PR facts could not be read"
+    if facts.get("isCrossRepository") is not True:
+        return None, ""
+    author = facts.get("author") or {}
+    login = author.get("login") if isinstance(author, dict) else None
+    if not isinstance(login, str) or not login or author.get("__typename") != "User":
+        return None, "the PR was not opened by a human account"
+    me = login.lower()
+    assoc = facts.get("authorAssociation")
+    if not isinstance(assoc, str) or not assoc or assoc.upper() in _MAINTAINER_ASSOCIATIONS:
+        return None, "the PR author is a maintainer"
+    if (facts.get("headRefOid") or "").lower() != head:
+        return None, "the PR head moved"
+    # The commit checks below read the CURRENT commit list. A force-push rewrites
+    # it: a commit of ours could be squashed or rebased into one authored and
+    # committed by the contributor, leaving no trace in today's list. So any
+    # rewrite of the head branch, by anyone, ends the exemption (none of the
+    # outside PRs merged so far had one, MEASURED 2026-10-06 over 7).
+    forced = facts.get("forcePushes")
+    if not isinstance(forced, dict) or forced.get("filteredCount") != 0:
+        return None, "the PR branch was force-pushed, so its earlier commits cannot be checked"
+    # The body's FULL edit history (``editor`` alone names only the last editor, so
+    # an edit of ours followed by a review app's would hide). GitHub lists it
+    # newest first; every node is checked, so the order does not matter.
+    edits = facts.get("userContentEdits")
+    edit_nodes = edits.get("nodes") if isinstance(edits, dict) else None
+    if not isinstance(edit_nodes, list) or edits.get("totalCount") != len(edit_nodes):
+        return None, "the PR body's edit history could not be read in full"
+    for node in edit_nodes:
+        editor = node.get("editor") if isinstance(node, dict) else None
+        if not isinstance(editor, dict):
+            return None, "a PR body edit has no known editor"
+        name = str(editor.get("login") or "").lower()
+        if name != me and not (
+            editor.get("__typename") == "Bot" and name in _BODY_EDIT_REVIEW_APPS
+        ):
+            return None, f"the PR body was edited by {name or 'an unknown account'}"
+    # filteredCount, not totalCount: totalCount counts every timeline item, whatever
+    # the type filter (MEASURED: 8 and 22 on two PRs with no renames).
+    renames = facts.get("timelineItems")
+    nodes = renames.get("nodes") if isinstance(renames, dict) else None
+    if not isinstance(nodes, list) or renames.get("filteredCount") != len(nodes):
+        return None, "the PR title's rename history could not be read in full"
+    for node in nodes:
+        actor = node.get("actor") if isinstance(node, dict) else None
+        if not isinstance(actor, dict) or str(actor.get("login") or "").lower() != me:
+            return None, "the PR title was renamed by another account"
+    rows, why = _pr_commit_rows(pr_num, repo)
+    if rows is None:
+        return None, why
+    if head not in {r["sha"].lower() for r in rows}:
+        return None, "the PR head is not among its commits"
+    for r in rows:
+        if (r["author"] or "").lower() != me:
+            return None, f"commit {r['sha'][:12]} was not authored by {login}"
+        if (r["committer"] or "").lower() not in (me, "web-flow"):
+            return None, f"commit {r['sha'][:12]} was committed by another account"
+        if r["message"] is None or _CO_AUTHOR_TRAILER.search(r["message"]):
+            return None, f"commit {r['sha'][:12]} names a co-author (or its message is unread)"
+    check_name, workflow = _MECHANICAL_RESCAN_BY_KIND["leaks"]
+    if not _mechanical_scan_is_green(pr_num, head, check_name, workflow, repo=repo):
+        return None, f"CI's {check_name} is not green at this head"
+    return login, ""
+
+
 def _check_scheduled_claude_reviewed_head(
     pr_num: str,
     head_sha: str | None = None,
@@ -8615,6 +8800,7 @@ def _check_scheduled_claude_reviewed_head(
     *,
     force: bool = False,
     relief_out: list[tuple[str, str, str]] | None = None,
+    exempt_out: list[tuple[str, str]] | None = None,
 ) -> str | None:
     """Block a merge unless EVERY required scheduled Claude review (by the repo OWNER)
     has run on the PR's CURRENT head. Returns ``None`` when a valid owner marker for
@@ -8699,6 +8885,17 @@ def _check_scheduled_claude_reviewed_head(
     kinds_here = markers.get(head, set())
     required = _required_scheduled_review_kinds()
     missing = [k for k in required if k not in kinds_here]
+    # An outside contribution needs no leaks review (see _outside_contribution) --
+    # unless a leaks review ran in this PR and objected: an exemption is a reason
+    # not to ask, never a reason to overrule a finding. Read only when leaks is
+    # actually missing, so a PR carrying its marker pays nothing.
+    exempt_login, exempt_why = None, ""
+    if "leaks" in missing and _kind_has_blocking_evidence("leaks", rejected, residue) is None:
+        exempt_login, exempt_why = _outside_contribution(pr_num, repo, head)
+        if exempt_login:
+            missing = [k for k in missing if k != "leaks"]
+            if exempt_out is not None:
+                exempt_out.append(("leaks", exempt_login))
     if missing:
         # A kind already ACCEPTED at an earlier head of this PR is satisfied when its
         # mechanical scanner is green at THIS head (see _MECHANICAL_RESCAN_BY_KIND).
@@ -8719,6 +8916,17 @@ def _check_scheduled_claude_reviewed_head(
                     file=sys.stderr,
                 )
     if not missing:
+        # Announced here, once the gate is known to clear, so a relieved other kind
+        # beside it never hides the note.
+        if exempt_login:
+            print(
+                f"NOTE: scheduled 'leaks' review not required for PR #{pr_num}: it is "
+                f"an outside contribution by {exempt_login} (fork, never force-pushed, "
+                f"every commit theirs, no edit of ours, CI's leak-detector green at this "
+                f"head -- on a fork its pattern-class scan only, without the "
+                f"private-pattern step).",
+                file=sys.stderr,
+            )
         return None
     # The message is an INVENTORY, not a verdict. Every marker block the scan found is
     # listed under the kind it names, with its status, and NOTHING is subtracted from
@@ -8824,6 +9032,16 @@ def _check_scheduled_claude_reviewed_head(
                 f"  (relief for '{k}' was attempted and declined: {r}.)\n"
                 for k, r in sorted(relief_blocked.items())
             )
+        )
+        + (
+            f"  (leaks is not required: an outside contribution by {exempt_login}.)\n"
+            if exempt_login
+            else ""
+        )
+        + (
+            f"  (leaks exemption for an outside contribution not applied: {exempt_why}.)\n"
+            if exempt_why and "leaks" in missing
+            else ""
         )
         + "A marker is a comment/review by the repo OWNER carrying "
         f"'<!-- genesis-scheduled-review: head={head} kind=<name> -->' — the FULL 40-hex "
@@ -9697,15 +9915,25 @@ _MAIN_REVERTS_BUDGET_S = 90.0
 
 
 def _pr_commit_list(pr_num: str, repo: str | None = None) -> tuple[list[tuple[str, int]] | None, str]:
-    """``([(sha, parent_count), ...], "")`` for the PR's commits, or ``(None, reason)``.
+    """``([(sha, parent_count), ...], "")`` for the PR's commits, or ``(None, reason)``."""
+    rows, why = _pr_commit_rows(pr_num, repo)
+    if rows is None:
+        return None, why
+    return [(r["sha"], r["parents"]) for r in rows], ""
+
+
+def _pr_commit_rows(pr_num: str, repo: str | None = None) -> tuple[list[dict] | None, str]:
+    """``([{sha, parents, author, committer, message}, ...], "")`` for the PR's
+    commits, or ``(None, reason)``. ``author`` / ``committer`` are GitHub logins, None
+    when the commit's git identity is linked to no account.
 
     A saturated read (``>= _PR_COMMITS_CAP`` rows) is returned as None with the cap
     named: GitHub stops at 250 here, so the commits beyond it are unknown. An EMPTY
     read is also None — every PR has a commit, so empty is a degraded response.
 
     Tests inject via ``_TEST_GH_PR_COMMITS`` (one JSON object per line:
-    ``{"sha": ..., "parents": <int>}``; the literal ``__error__`` simulates an API
-    error).
+    ``{"sha": ..., "parents": <int>, "author": ..., "committer": ..., "message": ...}``,
+    all but sha and parents optional; the literal ``__error__`` simulates an API error).
     """
     raw = os.environ.get("_TEST_GH_PR_COMMITS")
     if raw == "__error__":
@@ -9721,11 +9949,14 @@ def _pr_commit_list(pr_num: str, repo: str | None = None) -> tuple[list[tuple[st
                     f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/commits?per_page=100",
                     "--paginate",
                     "--jq",
-                    ".[] | {sha: .sha, parents: (.parents | length)}",
+                    ".[] | {sha: .sha, parents: (.parents | length), "
+                    "author: .author.login, committer: .committer.login, "
+                    "message: .commit.message}",
                 ],
                 capture_output=True,
                 text=True,
-                # Report-only (never on the merge path): one paginated read.
+                # One paginated read. The main-reverts row reads it in report mode;
+                # the leaks exemption reads it on the merge path, under the deadline.
                 timeout=_gh_timeout(15),
             )
         except Exception:
@@ -9733,7 +9964,7 @@ def _pr_commit_list(pr_num: str, repo: str | None = None) -> tuple[list[tuple[st
         if result.returncode != 0:
             return None, "the PR's commit list could not be read (gh error)"
         raw = result.stdout
-    commits: list[tuple[str, int]] = []
+    commits: list[dict] = []
     for line in (raw or "").splitlines():
         line = line.strip()
         if not line:
@@ -9746,7 +9977,17 @@ def _pr_commit_list(pr_num: str, repo: str | None = None) -> tuple[list[tuple[st
         parents = obj.get("parents") if isinstance(obj, dict) else None
         if not isinstance(sha, str) or not sha or not isinstance(parents, int):
             return None, "the PR's commit list was malformed"
-        commits.append((sha, parents))
+        author, committer = obj.get("author"), obj.get("committer")
+        message = obj.get("message")
+        commits.append(
+            {
+                "sha": sha,
+                "parents": parents,
+                "author": author if isinstance(author, str) and author else None,
+                "committer": committer if isinstance(committer, str) and committer else None,
+                "message": message if isinstance(message, str) else None,
+            }
+        )
     if not commits:
         return None, "the PR's commit list came back empty"
     if len(commits) >= _PR_COMMITS_CAP:
@@ -13644,20 +13885,28 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         print("scheduled-claude: n/a (scoped to the public repo only)")
     else:
         sched_relief: list[tuple[str, str, str]] = []
+        sched_exempt: list[tuple[str, str]] = []
         sched_msg = _check_scheduled_claude_reviewed_head(
-            pr_num, verified_head, repo, relief_out=sched_relief
+            pr_num, verified_head, repo, relief_out=sched_relief, exempt_out=sched_exempt
         )
         if sched_msg:
             sched_state = "BLOCK — " + sched_msg.splitlines()[0]
-        elif sched_relief:
+        elif sched_relief or sched_exempt:
             # NEVER render a carried-forward review as one made at head: this line is
             # what a human (and a structured consumer) reads to judge freshness, and
             # "ok (at head)" here would be a false assertion about what was reviewed.
+            # Same for an exempted kind: it was never reviewed, and the line says so.
             sched_state = (
                 "ok ("
                 + "; ".join(
-                    f"{kind} carried from {anc}, {check} green at head"
-                    for kind, anc, check in sched_relief
+                    [
+                        f"{kind} carried from {anc}, {check} green at head"
+                        for kind, anc, check in sched_relief
+                    ]
+                    + [
+                        f"{kind} not required: outside contribution by {who}"
+                        for kind, who in sched_exempt
+                    ]
                 )
                 + ")"
             )

@@ -3084,7 +3084,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   (⚠ it defaulted to the maximal `code-review` + `leaks` until the default was
   narrowed, so a discard there TIGHTENED — it now narrows instead, and likewise
   prints a NOTE when the key was visibly declared). The floor survives every
-  discard: `leaks` is irreducible. The rule below
+  discard: `leaks` is irreducible by config (its one exemption is per PR, for an
+  outside contribution; see Pre-Merge Gate). The rule below
   keys on this:
   - **`--source internal` (the default)** — a same-model self / genesis-architect /
     genesis-security / any-subagent review. It is free and shares the author-model's
@@ -4222,7 +4223,19 @@ findings below, a gated `gh pr merge`:
   names the PR's current head — so if any required routine never ran, ran on a stale
   commit, or was rate-limited, the merge blocks (naming the missing kinds). An ADVISORY
   routine still posts its review on the PR to be read/addressed, but its absence does not
-  block. The block message is an **inventory**, not a diagnosis: under each missing
+  block. **An outside contribution needs no `leaks` marker** (owner ruling 2026-10-05):
+  a fork PR opened by a human who is not OWNER, MEMBER or COLLABORATOR, at the current
+  head, whose every commit they authored (committer them or `web-flow`, no
+  `Co-authored-by:` trailer), whose title only they renamed, whose body only they or a
+  named review app (`_BODY_EDIT_REVIEW_APPS`) edited, and with CI's `leak-detector`
+  green at that head (on a fork it runs without its private-pattern step, which needs a
+  secret forks do not get). The review guards the owner's private data, which an
+  outsider's text cannot hold. A commit, a committed suggestion or a text edit of ours
+  puts the requirement back, a leaks review that ran and objected is never overruled,
+  `--check-pr` shows `leaks not required: outside contribution by <login>`, and a fork
+  PR the exemption could not clear says why in its block message
+  (`_outside_contribution`). Text written into the squash commit at merge time
+  (`gh pr merge --body`) is not covered, as before. The block message is an **inventory**, not a diagnosis: under each missing
   kind it lists EVERY marker block the scan found that names that kind, with its
   status, and hides nothing. Run `python3 scripts/hooks/git_push_guard.py --check-pr <N>`
   — it renders those
