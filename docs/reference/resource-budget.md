@@ -105,3 +105,9 @@ WAIT build
 - Where the cgroup has no `*.pressure` files, PSI comes from `/proc/pressure`,
   which inside a container is host-wide, so memory ASK then reflects the host.
 - The host leg reads only memory. GPU is out of scope.
+- The memory line is the container's. A job started directly inside a
+  session's own capped scope is also bound by that scope's `MemoryMax`, which
+  preflight does not read. Until the `run` wrapper (#2926, PR 2) exists, that is
+  every job a session starts. A `systemd-run --user --scope` job (what `run`
+  launches) lands under the user manager, not inside the caller's scope, so that
+  cap does not apply to it.

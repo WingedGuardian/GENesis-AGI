@@ -24,6 +24,8 @@ import logging
 import re
 from pathlib import Path
 
+from genesis.util.proc_kill import kill_process_group, reap_bounded
+
 logger = logging.getLogger(__name__)
 
 # Client-side validation (defense in depth — the gateway re-validates too).
@@ -63,14 +65,12 @@ async def _reap(proc: asyncio.subprocess.Process) -> None:
     deadline: MEASURED, a child spawning `sleep 8 &` held an 0.5 s deadline for
     8 s. The kill is already sent; the bound only stops the wait hanging on pipes.
     """
-    try:
-        proc.kill()
-    except ProcessLookupError:
-        return
-    try:
-        await asyncio.wait_for(proc.wait(), 5)
-    except TimeoutError:
-        logger.warning("ssh child %s killed but its pipes stayed open; not waiting", proc.pid)
+    # ssh runs in its own session, so its pid is its process group: the group
+    # kill also ends a ProxyCommand/ProxyJump helper, which a kill of the ssh pid
+    # alone left holding the pipes (review, round 2). The shared helper guards
+    # pid <= 1 and a refused killpg (round-2 audit).
+    kill_process_group(proc)
+    await reap_bounded(proc, 5)
 
 
 class GuardianRemote:
@@ -132,6 +132,7 @@ class GuardianRemote:
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,  # its own process group, for _reap
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=wait_timeout + 5,
@@ -141,7 +142,9 @@ class GuardianRemote:
         except asyncio.CancelledError:
             # A caller's own deadline (an outer wait_for) cancelled us: the timeout
             # branch below never runs, so reap the child here or it outlives the call.
-            if proc is not None and proc.returncode is None:
+            # Even when ssh itself has exited: a helper it started can still hold
+            # the pipes, and the kernel keeps the group until its last member dies.
+            if proc is not None:
                 await _reap(proc)
             raise
         except TimeoutError:
