@@ -1134,6 +1134,61 @@ class ClickBlocked(Exception):
 
 _INTERCEPT_MARK = "intercepts pointer events"
 
+# How Playwright's call log reaches a Python exception, read from the INSTALLED
+# driver (playwright 1.58): ``format_call_log`` (playwright/_impl/_connection.py)
+# appends "\nCall log:\n" + "\n".join(log) to the message, and the server's
+# ``compressCallLog`` (driver/package/lib/server/callLog.js) prefixes each record
+# with whitespace and "- ", or "<n> × " where it folds a repeated run. Element
+# previews pass through ``oneLine``, and a selector Playwright can parse is
+# rendered JSON-escaped, but one it cannot parse is logged RAW (``asLocators``
+# returns ``[selector]`` on a parse error, lib/utils/isomorphic/locatorGenerators.js),
+# so only the caller's own selector can carry a newline into the log, and it is
+# cut out first. The log is then the text after the LAST header, one record per
+# line, and a decision reads a whole record, never a substring: page text in a
+# preview or a selector can contain either marker.
+_CALL_LOG_HEADER = "\nCall log:\n"
+_CALL_LOG_RECORD = re.compile(r"\s*(?:- |\d+ × )(.*)")
+
+# Set on an exception raised by one of OUR click calls (_click_call). Only such
+# an exception's call log is read: any other error text (an evaluate the page
+# can make throw, our own ambiguity message quoting page attributes) is page or
+# caller text, however much it looks like a call log.
+_CLICK_ERROR_ATTR = "_genesis_click_error"
+
+
+async def _click_call(click) -> None:
+    """Await a Playwright click, marking an exception it raises as the click's own."""
+    try:
+        await click
+    except Exception as err:
+        with contextlib.suppress(Exception):
+            setattr(err, _CLICK_ERROR_ATTR, True)
+        raise
+
+
+def _call_log(err: BaseException, selector: str = "") -> list[str]:
+    """The records of Playwright's call log in ``err``, prefix stripped; [] when
+    ``err`` is not a click's own error (_click_call) or carries no log."""
+    if not getattr(err, _CLICK_ERROR_ATTR, False):
+        return []
+    text = str(err)
+    if "\n" in selector:
+        text = text.replace(selector, " ")
+    _, sep, log = text.rpartition(_CALL_LOG_HEADER)
+    if not sep:
+        return []
+    return [m.group(1).strip() for line in log.split("\n") if (m := _CALL_LOG_RECORD.fullmatch(line))]
+
+
+def _last_record(records: list[str], match) -> int:
+    return max((i for i, r in enumerate(records) if match(r)), default=-1)
+
+
+def _is_intercept(record: str) -> bool:
+    # `  ${result.hitTargetDescription} intercepts pointer events` (dom.js
+    # _retryAction), where the description is an element preview, "<tag …>…".
+    return record.startswith("<") and record.endswith(" " + _INTERCEPT_MARK)
+
 
 _COVER_MAX_CHARS = 200  # Playwright already shortens the markup; this bounds a hostile page
 
@@ -1155,11 +1210,12 @@ async def _blocked_click(err: BaseException, selector: str, page) -> ClickBlocke
     A click sent after the last interception may have been delivered
     (_click_was_sent), so it is never a blocked click.
 
-    The covering element is read from the call log, whose line has the shape
-    ``  - <div id="x">…</div> intercepts pointer events``, for display only.
+    The covering element is read from the call log's last interception record
+    (``<div id="x">…</div> intercepts pointer events``), for display only.
     """
-    text = str(err)
-    if _INTERCEPT_MARK not in text or _click_was_sent(err):
+    records = _call_log(err, selector)
+    last = _last_record(records, _is_intercept)
+    if last < 0 or _click_was_sent(err, selector):
         return None
     try:
         # Bounded: the target resolved moments ago; one that is not attached
@@ -1170,10 +1226,7 @@ async def _blocked_click(err: BaseException, selector: str, page) -> ClickBlocke
         uncovered = False
     if uncovered is True:
         return None
-    cover = "another element"
-    for line in text.splitlines():
-        if _INTERCEPT_MARK in line:
-            cover = line.split(_INTERCEPT_MARK)[0].strip().lstrip("-").strip() or cover
+    cover = records[last][: -len(_INTERCEPT_MARK)].strip() or "another element"
     # The covering element's markup is PAGE CONTENT (a page chooses its own ids,
     # classes and text): bound it and mark it as such, so it reads as data and
     # not as an instruction, as the snapshot's page text already does.
@@ -1286,22 +1339,27 @@ _LABEL_JS = """
 }
 """
 
-# Playwright's call log line for a pointer action that was actually sent:
-# `progress3.log(`  performing ${actionName} action`)` in _performPointerAction
-# (Playwright 1.62 driver, lib/coreBundle.js). Anything that fails before it
-# (not attached, not visible, not stable, covered at the pre-check) sent
-# nothing; anything after it may have been delivered.
+# Playwright's call log record for a pointer action that was actually sent:
+# `progress.log(`  performing ${actionName} action`)` in _performPointerAction
+# (installed playwright 1.58, driver/package/lib/server/dom.js). Anything that
+# fails before it (not attached, not visible, not stable, covered at the
+# pre-check) sent nothing; anything after it may have been delivered.
 _CLICK_SENT_MARK = "performing click action"
 
 
-def _click_was_sent(err: BaseException) -> bool:
+def _click_was_sent(err: BaseException, selector: str = "") -> bool:
     """Whether the click may have been delivered: the last attempt that sent
     events was not then intercepted. An interception logged AFTER the sent
-    line means Playwright's hit-target interceptor swallowed that attempt's
+    record means Playwright's hit-target interceptor swallowed that attempt's
     events (``setupHitTargetInterceptor`` cancels them), so nothing landed.
+
+    Only a whole record of a click's own call log counts (_call_log): the same
+    words inside a selector or an element preview are page or caller text,
+    not a send.
     """
-    text = str(err)
-    return text.rfind(_CLICK_SENT_MARK) > text.rfind(_INTERCEPT_MARK)
+    records = _call_log(err, selector)
+    sent = _last_record(records, lambda r: r == _CLICK_SENT_MARK)
+    return sent > _last_record(records, _is_intercept)
 
 
 # Whether an element is ENTIRELY uncovered now: a 3x3 grid over each of its
@@ -1376,10 +1434,15 @@ async def _humanized_click(page, target, timeout: int, is_label: bool = False) -
             return
         pos = None
     if isinstance(pos, dict) and "cover" in pos:
-        # An overlay covers the label. Phrased as Playwright's call-log line so
+        # An overlay covers the label. Phrased as Playwright's call log so
         # _stealth_click raises ClickBlocked with no fallback: the fallbacks
-        # would reach the hidden control behind the overlay by script.
-        raise Exception(f"  - {pos['cover']} {_INTERCEPT_MARK}")
+        # would reach the hidden control behind the overlay by script. The
+        # cover's id and class are page text: one line, like Playwright's own
+        # previews, so they cannot forge a record of their own.
+        cover = str(pos["cover"]).replace("\n", "↵")
+        err = Exception(f"Label covered{_CALL_LOG_HEADER}  - {cover} {_INTERCEPT_MARK}\n")
+        setattr(err, _CLICK_ERROR_ATTR, True)
+        raise err
     if not isinstance(pos, dict):
         if is_label:
             raise Exception("no point on the label would activate its control")
@@ -1408,7 +1471,7 @@ async def _humanized_click(page, target, timeout: int, is_label: bool = False) -
         kwargs["position"] = {"x": pos["x"], "y": pos["y"]}
     # No position: Playwright picks its own point from the element's quads,
     # which handles every shape the sampler above could not.
-    await target.click(**kwargs)
+    await _click_call(target.click(**kwargs))
 
 
 async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
@@ -1467,7 +1530,7 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
 
     if not _is_camoufox_active():
         try:
-            await page.click(selector, timeout=timeout)
+            await _click_call(page.click(selector, timeout=timeout))
         except Exception as err:
             blocked = await _blocked_click(err, selector, page)
             if blocked is not None:
@@ -1497,16 +1560,16 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
         blocked = await _blocked_click(stealth_err, selector, page)
         if blocked is not None:
             raise blocked from stealth_err
-        if _click_was_sent(stealth_err):
+        if _click_was_sent(stealth_err, selector):
             raise
         logger.warning("Stealth click failed for '%s': %s", selector, stealth_err)
         try:
-            await page.click(selector, timeout=timeout)
+            await _click_call(page.click(selector, timeout=timeout))
         except Exception as plain_err:
             blocked = await _blocked_click(plain_err, selector, page)
             if blocked is not None:
                 raise blocked from plain_err
-            if _click_was_sent(plain_err):
+            if _click_was_sent(plain_err, selector):
                 raise
             logger.warning("Plain click also failed for '%s': %s", selector, plain_err)
             # --- Keyboard fallback (last resort) ---
@@ -2557,7 +2620,7 @@ async def _impl_browser_click(selector: str) -> dict:
         return {"clicked": selector, "url": page.url, "snapshot": snapshot}
     except Exception as e:
         # A ClickBlocked carries page markup, never Playwright's call log.
-        if not isinstance(e, ClickBlocked) and _click_was_sent(e):
+        if not isinstance(e, ClickBlocked) and _click_was_sent(e, selector):
             return {
                 "error": (
                     f"Click on '{selector}' was sent, then failed, so it may already "
