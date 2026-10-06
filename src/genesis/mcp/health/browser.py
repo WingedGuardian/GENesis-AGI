@@ -2402,9 +2402,25 @@ async def _cookie_call(awaitable):
     return await asyncio.wait_for(awaitable, timeout=_COOKIE_CALL_TIMEOUT_S)
 
 
-def _domain_cookie_pattern(domain: str) -> re.Pattern:
-    """Playwright clear_cookies(domain=) filter equal to domain_matches()."""
-    return re.compile(r"^\.?(?:.+\.)?" + re.escape(domain) + "$", re.IGNORECASE)
+def _expired_copy(cookie: dict) -> dict:
+    """The same cookie (name, domain, path, partition) already expired.
+
+    Setting it deletes that one cookie in place. Playwright's filtered
+    clear_cookies() instead clears the WHOLE jar and re-adds the rest
+    (server/browserContext.js clearCookies, 1.58.0), so a failed re-add would
+    log the profile out of every site. Every identity field is kept, including
+    Chromium's ``_crHasCrossSiteAncestor``, which Playwright otherwise defaults
+    to true and so would name a different partition.
+    """
+    keep = (
+        "name", "domain", "path", "secure", "httpOnly", "sameSite",
+        "partitionKey", "_crHasCrossSiteAncestor",
+    )
+    return {**{k: cookie[k] for k in keep if k in cookie}, "value": "deleted", "expires": 1}
+
+
+def _cookie_key(cookie: dict) -> tuple:
+    return (cookie.get("name"), cookie.get("domain"), cookie.get("path"), cookie.get("partitionKey"))
 
 
 async def _impl_browser_sessions() -> dict:
@@ -2459,7 +2475,7 @@ async def _impl_browser_sessions() -> dict:
                             "can lag that browser's live cookies"
                         )
             except Exception as e:
-                entry["error"] = f"Failed to read {kind} sessions: {e}"
+                entry["error"] = f"Failed to read {kind} sessions: {e!r}"
             profiles.append(entry)
     return {"profiles": profiles}
 
@@ -2500,13 +2516,39 @@ async def _impl_browser_clear_domain(domain: str) -> dict:
             try:
                 ctx = _live_cookie_context(kind)
                 if ctx is not None:
-                    n = sum(
-                        domain_matches(c.get("domain", ""), d)
-                        for c in await _cookie_call(ctx.cookies())
-                    )
-                    if n:
-                        await _cookie_call(ctx.clear_cookies(domain=_domain_cookie_pattern(d)))
+                    matched = [
+                        c for c in await _cookie_call(ctx.cookies())
+                        if domain_matches(c.get("domain", ""), d)
+                    ]
+                    failed = None
+                    if matched:
+                        # Only the matching cookies are touched; nothing else
+                        # in the jar is cleared or re-added.
+                        try:
+                            await _cookie_call(
+                                ctx.add_cookies([_expired_copy(c) for c in matched])
+                            )
+                        except Exception as e:
+                            failed = e  # re-read below: report what was removed
+                    try:
+                        after = {
+                            _cookie_key(c) for c in await _cookie_call(ctx.cookies())
+                            if domain_matches(c.get("domain", ""), d)
+                        }
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"re-reading the jar failed ({e!r}) after the delete "
+                            f"{'failed: ' + repr(failed) if failed else 'succeeded'}; "
+                            "removed count unknown"
+                        ) from e
+                    # By identity, not a net difference: a cookie a page sets
+                    # meanwhile must not cancel one that was really removed.
+                    n = sum(_cookie_key(c) not in after for c in matched)
                     entry.update(source="live browser", removed=n)
+                    if failed is not None:
+                        entry["error"] = f"Failed to clear {kind} cookies: {failed!r}"
+                    elif after:
+                        entry["error"] = f"{len(after)} matching cookies remain after the clear"
                 else:
                     n = BrowserProfileManager(pdir, browser=kind).clear_domain(d)
                     entry.update(source="profile file", removed=n)
@@ -2514,7 +2556,7 @@ async def _impl_browser_clear_domain(domain: str) -> dict:
             except ProfileInUse as e:
                 entry["error"] = str(e)
             except Exception as e:
-                entry["error"] = f"Failed to clear {kind} cookies: {e}"
+                entry["error"] = f"Failed to clear {kind} cookies: {e!r}"
             profiles.append(entry)
     return {"domain": d, "cookies_removed": total, "profiles": profiles}
 
