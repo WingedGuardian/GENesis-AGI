@@ -31,6 +31,12 @@ _AUTHORITATIVE_LINK_SQL = (
     "AND adopted = 0"
 )
 
+#: How long a TERMINAL row is kept: ``prune_terminal``'s default, the window
+#: ``scripts/disk_hygiene.sh`` passes it. Posted rows naming a still-existing
+#: follow-up outlive it (see ``prune_terminal``); the contributor lane's TITLE
+#: duplicate check still looks back only this far (see ``list_dedup_active``).
+TERMINAL_RETENTION_DAYS = 30
+
 
 async def create(
     db: aiosqlite.Connection,
@@ -139,7 +145,11 @@ async def count_posted_since(db: aiosqlite.Connection, *, since: str) -> int:
     a mid-window restart — an in-memory counter would not). Mirrors
     ``autonomous_email_sends.count_for_cell_since``. Global (not repo-scoped): the
     cautious-rollout intent is total owner exposure, and this install posts to one
-    repo — global generalizes cleanly to a multi-repo future."""
+    repo — global generalizes cleanly to a multi-repo future.
+
+    Work-board promotions (``source='board'``) COUNT too: each board row needs an
+    owner-classified approval, but that classification (``classify_resolver``)
+    cannot prove a human, so board posts share this cap rather than bypass it."""
     cursor = await db.execute(
         "SELECT COUNT(*) FROM pending_issue_posts WHERE status = 'posted' AND posted_at >= ?",
         (since,),
@@ -148,24 +158,63 @@ async def count_posted_since(db: aiosqlite.Connection, *, since: str) -> int:
     return int(row[0]) if row else 0
 
 
-async def list_dedup_active(db: aiosqlite.Connection, repo: str) -> list[dict]:
-    """Rows in *repo* that should block a duplicate proposal: still awaiting
-    owner review ('held') or already live ('posted'). ``dry_run`` deliberately
-    does NOT block — a dry-run hold is re-proposed under 'live' mode to actually
-    post it; ``rejected``/``expired`` also don't block (an item may be
-    re-drafted). Returns id/title/source_ref/status for the caller to normalize
-    and compare (bounded small by the ``max_held`` backpressure knob).
+async def list_dedup_active(db: aiosqlite.Connection, repo: str, *, now: str) -> list[dict]:
+    """Rows in *repo* that should block a proposal with the same TITLE (and feed
+    the ``max_held`` backpressure count): still awaiting owner review ('held'),
+    or posted ('posted') within the last :data:`TERMINAL_RETENTION_DAYS` before
+    *now* (injected, never wall-clock). ``dry_run`` deliberately does NOT block —
+    a dry-run hold is re-proposed under 'live' mode to actually post it;
+    ``rejected``/``expired`` also don't block (an item may be re-drafted).
+    Returns id/title/source/source_ref/status for the caller to normalize and
+    compare (bounded small by the ``max_held`` backpressure knob). Work-board
+    rows are included on purpose — a contributor proposal titled like a promoted
+    issue IS a duplicate — and carry ``source`` so the caller can keep them out
+    of its own backpressure count.
+
+    The posted-row window is the retention window this check always had in
+    effect: before ``prune_terminal`` kept posted rows naming a follow-up
+    indefinitely, an older posted row was simply gone. Without the bound, a
+    title matching an issue closed long ago would refuse every new proposal for
+    good. (``posted_at`` is an ADOPTED issue's own creation time, so an adopted
+    old issue leaves the window early — exactly as it was pruned early; the
+    drain's open-issue title dedup still backstops a live duplicate.) Whether a
+    RECORD already has an issue is a different question with no age bound:
+    :func:`find_active_by_source_ref`.
 
     The ``repo`` comparison is ``COLLATE NOCASE`` (mirroring
     ``posted_index_for_repo``): the proposer stores the repo lowercased while the
     dedup call passes the raw config slug, so a case-sensitive match would miss
     every existing row and silently bypass ``max_held`` backpressure."""
+    cutoff = _iso_days_before(now, TERMINAL_RETENTION_DAYS)
     cursor = await db.execute(
-        "SELECT id, title, source_ref, status FROM pending_issue_posts "
-        "WHERE repo = ? COLLATE NOCASE AND status IN ('held', 'posted')",
-        (repo,),
+        "SELECT id, title, source, source_ref, status FROM pending_issue_posts "
+        "WHERE repo = ? COLLATE NOCASE AND (status = 'held' OR "
+        "(status = 'posted' AND COALESCE(posted_at, held_at) >= ?))",
+        (repo, cutoff),
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def find_active_by_source_ref(
+    db: aiosqlite.Connection, repo: str, source_refs: list[str]
+) -> dict | None:
+    """The first held or posted row in *repo* whose ``source_ref`` is one of
+    *source_refs* — whether this RECORD already has a hold or a public issue,
+    in either lane (a contributor row keys the bare follow-up id, a board row
+    ``follow_up:<id>``). No age bound, unlike :func:`list_dedup_active`: a posted
+    row naming a follow-up is kept while the follow-up exists precisely so this
+    answer survives (see :func:`prune_terminal`). Returns id/status or None."""
+    refs = [r for r in source_refs if r]
+    if not refs:
+        return None
+    marks = ", ".join("?" for _ in refs)
+    cursor = await db.execute(
+        "SELECT id, status FROM pending_issue_posts WHERE repo = ? COLLATE NOCASE "
+        f"AND status IN ('held', 'posted') AND source_ref IN ({marks}) ORDER BY rowid LIMIT 1",
+        (repo, *refs),
+    )
+    row = await cursor.fetchone()
+    return {"id": row[0], "status": row[1]} if row else None
 
 
 async def posted_index_for_repo(db: aiosqlite.Connection, repo: str) -> dict[int, str]:
@@ -281,7 +330,9 @@ def _iso_days_before(now_iso: str, days: int) -> str:
     return (datetime.fromisoformat(now_iso) - timedelta(days=days)).isoformat()
 
 
-async def prune_terminal(db: aiosqlite.Connection, *, older_than_days: int = 30, now: str) -> int:
+async def prune_terminal(
+    db: aiosqlite.Connection, *, older_than_days: int = TERMINAL_RETENTION_DAYS, now: str
+) -> int:
     """Delete TERMINAL rows (posted / rejected / expired / dry_run) whose terminal
     timestamp is older than *older_than_days*. ``held`` rows are NEVER pruned —
     they await the owner indefinitely. ``now`` is injected (never wall-clock) so
@@ -294,22 +345,30 @@ async def prune_terminal(db: aiosqlite.Connection, *, older_than_days: int = 30,
     it (an issue can stay open past *older_than_days* before a close lands) would
     orphan the follow_up so it never resolves. "Open" mirrors the exact predicate
     the close-loop resolves against (``get_open_followups`` / ``absorb_followup``):
-    ``kind='follow_up' AND status IN ('pending', 'in_progress')``. A ``'posted'``
-    row with ``source_ref`` NULL (codebase) OR whose follow_up is resolved/tabled
-    stays prunable; non-posted terminal rows are always prunable. An ``adopted``
-    posted row is ALSO prunable on the normal schedule — it is excluded from
-    ``posted_index_for_repo``, so it can never resolve a follow_up and retaining it
-    past its age would only waste storage (the ``adopted = 0`` guard below)."""
+    ``kind='follow_up' AND status IN ('pending', 'in_progress')``.
+
+    Retention is WIDER than the close-loop needs: every ``posted`` row naming a
+    follow-up — in either lane's spelling, the contributor lane's bare id or the
+    work-board lane's ``follow_up:<id>`` — is kept while that follow-up row still exists — adopted rows and
+    resolved follow-ups included. It is the record that this follow-up already
+    has a public issue, and the work-board lane's cross-lane check
+    (``board.promotion`` at propose, the drain at post time) reads it; pruning
+    it after 30 days let a later promotion post a SECOND issue for the same
+    record. Bounded: a deleted follow-up can no longer be promoted, so its rows
+    go with it. The close-loop is unaffected — ``posted_index_for_repo`` still
+    filters to created, follow_up-sourced rows, and ``absorb_followup`` only
+    moves an open follow-up. Nor does the wider retention widen the contributor
+    lane's TITLE duplicate check, which still looks back only
+    :data:`TERMINAL_RETENTION_DAYS` (``list_dedup_active``). Non-posted terminal rows, and posted rows
+    with no ``source_ref``, stay prunable on the normal schedule."""
     cutoff = _iso_days_before(now, older_than_days)
     cursor = await db.execute(
         "DELETE FROM pending_issue_posts "
         "WHERE status IN ('posted', 'rejected', 'expired', 'dry_run') "
         "AND COALESCE(posted_at, rejected_at, dry_run_at, held_at) < ? "
-        "AND NOT (status = 'posted' AND adopted = 0 AND source_ref IS NOT NULL AND EXISTS ("
-        "  SELECT 1 FROM follow_ups f "
-        "  WHERE f.id = pending_issue_posts.source_ref "
-        "  AND f.kind = 'follow_up' "
-        "  AND f.status IN ('pending', 'in_progress')"
+        "AND NOT (status = 'posted' AND source_ref IS NOT NULL AND EXISTS ("
+        "  SELECT 1 FROM follow_ups f WHERE f.id = pending_issue_posts.source_ref"
+        "  OR 'follow_up:' || f.id = pending_issue_posts.source_ref"
         "))",
         (cutoff,),
     )

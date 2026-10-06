@@ -300,10 +300,13 @@ def test_a_deploy_excludes_update_sh_while_it_runs(station):
         _systemctl_shim(
             station["calls"],
             station["manifest"],
+            booted_at=station["booted_at"],
             on_restart=f'flock -n "{station["lock"]}" true; '
             f'echo "probe=$?" >> "{station["tmp"]}/probe"',
         ),
     )
+    # Something to take, so the deploy restarts (with nothing to take it does not).
+    _advance_upstream(station)
     r = _run(station)
     assert r.returncode == 0, r.stderr
     assert (station["tmp"] / "probe").read_text().strip() == "probe=1", (
@@ -425,7 +428,12 @@ def test_a_failed_restart_after_the_merge_alerts(station):
     tip = _advance_upstream(station)
     _exec(
         station["shims"] / "systemctl",
-        _systemctl_shim(station["calls"], station["manifest"], on_restart="exit 1"),
+        _systemctl_shim(
+            station["calls"],
+            station["manifest"],
+            on_restart="exit 1",
+            booted_at=station["booted_at"],
+        ),
     )
     r = _run(station)
     assert r.returncode != 0
@@ -467,7 +475,10 @@ def test_the_guardian_is_paused_across_the_restart_and_resumed(station):
     _exec(
         station["shims"] / "systemctl",
         _systemctl_shim(
-            station["calls"], station["manifest"], on_restart=f'echo RESTART >> "{log}"'
+            station["calls"],
+            station["manifest"],
+            on_restart=f'echo RESTART >> "{log}"',
+            booted_at=station["booted_at"],
         ),
     )
     _advance_upstream(station)
@@ -742,7 +753,9 @@ def test_no_child_outlives_the_script_holding_the_lock(station):
     )
     _exec(
         station["shims"] / "systemctl",
-        _systemctl_shim(station["calls"], station["manifest"], on_restart=child),
+        _systemctl_shim(
+            station["calls"], station["manifest"], on_restart=child, booted_at=station["booted_at"]
+        ),
     )
     _advance_upstream(station)
     try:

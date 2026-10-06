@@ -420,7 +420,14 @@ def test_every_lib_the_refusing_scripts_source_before_their_check_is_refused(dc)
         # A file read with `cat` before the check is code too: deploy_code_only.sh
         # runs serving_commit.py's text inside `status`, which returns before its
         # branch check and which readiness runs.
-        for lib in re.findall(r'\$\(cat "\$[A-Z_]+/(lib/[^"]+)"\)', text[:check]):
+        # Both spellings: `$(cat "$DIR/lib/x")` and `$(cat "${SEAM:-$DIR/lib/x}")`
+        # (a test seam in front of the default path hid port_owned_by.py from the
+        # first form).
+        read = re.findall(r'\$\(cat "\$\{?[A-Z_]*:?-?\$?[A-Z_]+/(lib/[^"}]+)\}?"\)', text[:check])
+        assert (
+            any(r.endswith("port_owned_by.py") for r in read) or script != "deploy_code_only.sh"
+        ), read
+        for lib in read:
             assert dc.gate.path_refusal(f"scripts/{lib}"), f"{script} reads scripts/{lib} first"
 
 

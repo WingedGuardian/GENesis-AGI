@@ -115,6 +115,11 @@ REFUSAL_FILES = (
     # serving read runs inside `deploy_code_only.sh status`, which readiness runs.
     "scripts/lib/serving_commit.py",
     "scripts/lib/manifest_delta.py",
+    # Also read at startup, run after the check: the restart refusal's session
+    # scan, and the restarted unit's identity probe (read through its test seam,
+    # `${GENESIS_DEPLOY_PORT_PROBE:-…}`, which the `cat` lock below now matches).
+    "scripts/lib/server_sessions.py",
+    "scripts/lib/port_owned_by.py",
     "src/genesis/dashboard/routes/updates.py",
     # PR C's file: readiness reads it from the server's base, and it will hold
     # bootstrap's crash-recovery branch guard.
