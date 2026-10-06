@@ -749,7 +749,7 @@ class TestStealthClickLocator:
         """Both decisions rest on two call-log strings. Read them out of the
         INSTALLED driver, so a Playwright that rewords either line fails here
         instead of silently re-firing a delivered click."""
-        import playwright
+        playwright = pytest.importorskip("playwright", reason="playwright not installed")
 
         lib = Path(playwright.__file__).parent / "driver" / "package" / "lib"
         if not lib.is_dir():
