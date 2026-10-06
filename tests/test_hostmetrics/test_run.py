@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 
 import pytest
@@ -56,30 +57,42 @@ def _props(argv):
 
 def test_ladder_takes_full_properties_when_accepted(has_systemd_run):
     fake, seen = _runner([(0, "")])
-    props = run.choose_properties("u", 2**30, 100, "s.slice", fake)
-    assert props == run.scope_properties(2**30, 100) and _props(seen[0]) == props
-    assert "--slice=s.slice" in seen[0] and "--collect" in seen[0] and seen[0][-1] == "/bin/true"
+    caps = run.choose_properties("u", 2**30, 100, "s.slice", fake)
+    assert caps.props == run.scope_properties(2**30, 100) and _props(seen[0]) == caps.props
+    assert "--slice=s.slice" in seen[0] and "--collect" in seen[0]
+    assert seen[0][-3:] == ["/bin/sh", "-c", run._ENFORCEMENT_SH]
 
 
 def test_ladder_drops_oom_policy_only_when_systemd_names_it(has_systemd_run):
     # systemd before 253 answers "Unknown assignment: OOMPolicy=continue" for a scope.
     fake, seen = _runner([(1, "Unknown assignment: OOMPolicy=continue"), (0, "")])
-    props = run.choose_properties("u", 2**30, 100, None, fake)
-    assert props == run.scope_properties(2**30, 100, oom_continue=False)
-    assert [_props(a) for a in seen] == [run.scope_properties(2**30, 100), props]
+    caps = run.choose_properties("u", 2**30, 100, None, fake)
+    assert caps.props == run.scope_properties(2**30, 100, oom_continue=False)
+    assert [_props(a) for a in seen] == [run.scope_properties(2**30, 100), caps.props]
     assert len({a[5] for a in seen}) == 2  # a distinct probe unit per rung
 
 
 @pytest.mark.parametrize(
     "outcome",
-    [
-        (1, "Failed to connect to bus: No such file or directory"),
-        OSError("no systemd-run"),
-        subprocess.TimeoutExpired("systemd-run", 15),
-    ],
+    [(1, "Failed to connect to bus: No such file or directory"), FileNotFoundError("gone")],
 )
 def test_unreachable_manager_runs_uncapped(has_systemd_run, outcome):
     assert run.choose_properties("u", 2**30, 100, None, _runner([outcome])[0]) is None
+
+
+def test_a_slow_probe_is_refused_not_uncapped(has_systemd_run):
+    # A probe that times out says nothing about whether the manager exists; running
+    # the job uncapped on that guess is what the probe is for preventing.
+    fake, seen = _runner([subprocess.TimeoutExpired("systemd-run", 15), (0, "")])
+    with pytest.raises(run.ProbeRefused, match="did not finish"):
+        run.choose_properties("u", 2**30, 100, None, fake)
+    assert seen[1][:4] == ["systemctl", "--user", "stop", "--no-block"]  # probe cleaned up
+    assert seen[1][-1] == "u-probe0.scope"
+
+
+def test_systemd_run_that_cannot_execute_is_refused(has_systemd_run):
+    with pytest.raises(run.ProbeRefused, match="could not run"):
+        run.choose_properties("u", 2**30, 100, None, _runner([PermissionError("noexec")])[0])
 
 
 def test_a_refused_property_is_an_error_not_uncapped(has_systemd_run):
@@ -90,6 +103,26 @@ def test_a_refused_property_is_an_error_not_uncapped(has_systemd_run):
         run.choose_properties("u", 0, 100, None, _runner([(1, err)])[0])
     with pytest.raises(run.ProbeRefused, match="exited 137"):
         run.choose_properties("u", 2**20, 100, None, _runner([(137, "")])[0])
+
+
+@pytest.mark.parametrize(
+    ("stdout", "unenforced", "unverified"),
+    [
+        (b"214745088\n20000 100000\n", (), ()),  # MEASURED: page-rounded MemoryMax, 20% quota
+        (b"max\n20000 100000\n", ("memory",), ()),
+        (b"214745088\nmax 100000\n", ("cpu",), ()),
+        (b"missing\nmissing\n", (), ("memory", "cpu")),  # e.g. cgroup v1
+        (b"", (), ("memory", "cpu")),
+    ],
+)
+def test_probe_reports_caps_the_kernel_does_not_apply(
+    has_systemd_run, stdout, unenforced, unverified
+):
+    def fake(argv, **kw):
+        return subprocess.CompletedProcess(argv, 0, stdout, b"")
+
+    caps = run.choose_properties("u", 2**30, 100, None, fake)
+    assert (caps.unenforced, caps.unverified) == (unenforced, unverified)
 
 
 def test_no_systemd_run_means_uncapped(monkeypatch):
@@ -110,7 +143,7 @@ class _Proc:
 def test_launch_runs_the_probed_properties(monkeypatch, capsys):
     props = run.scope_properties(2**30, 100)
     launched = []
-    monkeypatch.setattr(run, "choose_properties", lambda *a: props)
+    monkeypatch.setattr(run, "choose_properties", lambda *a: run.Caps(props))
     monkeypatch.setattr(
         run.subprocess,
         "Popen",
@@ -317,3 +350,112 @@ def test_uncapped_limit_is_the_data_segment_not_address_space(monkeypatch):
     monkeypatch.setattr(run.resource, "setrlimit", lambda which, lim: calls.append((which, lim)))
     run._uncapped_limits(2**30)()
     assert calls == [("nice", 19), (run.resource.RLIMIT_DATA, (2**30, 2**30))]
+
+
+class _SignallingProc:
+    """A launched job whose wait() delivers signals to this process first, the way a
+    user's Ctrl-C or a supervisor's SIGTERM would arrive while `run` waits."""
+
+    pid = 4242  # explicit: a mock pid of 1 would make killpg hit every process
+
+    def __init__(self, signals):
+        self.signals = signals
+
+    def wait(self):
+        import signal as _signal
+
+        for sig in self.signals:
+            os.kill(os.getpid(), sig)
+        return -_signal.SIGTERM
+
+
+def _launch_with(monkeypatch, caps, signals):
+    import signal as _signal
+
+    killed, stopped = [], []
+    monkeypatch.setattr(run, "choose_properties", lambda *a: caps)
+    monkeypatch.setattr(run.subprocess, "Popen", lambda argv, **kw: _SignallingProc(signals))
+    monkeypatch.setattr(
+        run, "kill_group", lambda pgid, sig=_signal.SIGTERM: killed.append((pgid, sig))
+    )
+    monkeypatch.setattr(run, "stop_scope", lambda unit, *a: stopped.append(unit))
+    rc = run.launch("j", ["true"], 2**30, 100, lambda: None)
+    return rc, killed, stopped
+
+
+def test_a_stop_reaches_the_launch_before_the_scope_exists(monkeypatch):
+    # Before systemd registers the scope the job is still the systemd-run client:
+    # stopping only the (not yet existing) unit would let the job start anyway.
+    import signal as _signal
+
+    caps = run.Caps(run.scope_properties(2**30, 100))
+    rc, killed, stopped = _launch_with(monkeypatch, caps, [_signal.SIGTERM])
+    assert killed == [(4242, _signal.SIGTERM)] and len(stopped) == 1
+    assert rc == 128 + _signal.SIGTERM
+
+
+def test_a_repeated_signal_escalates_to_sigkill(monkeypatch):
+    import signal as _signal
+
+    rc, killed, _ = _launch_with(monkeypatch, None, [_signal.SIGTERM, _signal.SIGINT])
+    assert killed == [(4242, _signal.SIGTERM), (4242, _signal.SIGKILL)]
+
+
+def test_an_unenforced_cap_is_announced(monkeypatch, capsys):
+    caps = run.Caps(run.scope_properties(2**30, 100), ("memory",), ("cpu",))
+    _launch_with(monkeypatch, caps, [])
+    err = capsys.readouterr().err
+    assert "the memory cap is NOT enforced here" in err
+    assert "could not verify the cpu cap" in err
+
+
+def test_watchdog_times_the_box_over_the_line_whatever_the_reason():
+    # Memory then a disk is still the box over the line: one continuous timer, so
+    # alternating reasons can never postpone the stop forever (review, MEASURED).
+    over = iter(["mem", "disk", "mem", "disk", "mem", "disk", "mem"])
+    stops = []
+    dog = run.Watchdog(lambda: next(over), lambda: stops.append(1), grace=60)
+    assert [dog.tick(t) for t in (0, 10, 20, 30, 40, 50)] == [False] * 6
+    assert dog.tick(60) is True and dog.fired == "mem for 60s" and stops == [1]
+
+
+def test_run_rejects_abbreviated_options(flow):
+    # `--na` would mean `--name` under argparse's default prefix matching.
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["run", "--na", "t", "--ram", "1", "--cpu", "50", "--", "true"])
+    assert exc.value.code == cli.EXIT_USAGE
+
+
+def test_run_rejects_a_non_finite_wait(flow):
+    argv = [
+        "run",
+        "--name",
+        "j",
+        "--ram",
+        "1",
+        "--cpu",
+        "50",
+        "--wait-until-fits",
+        "nan",
+        "--",
+        "true",
+    ]
+    with pytest.raises(SystemExit) as exc:
+        cli.main(argv)
+    assert exc.value.code == cli.EXIT_USAGE
+
+
+@pytest.mark.parametrize(
+    ("caps", "limited"),
+    [
+        (run.Caps(["MemoryMax=1"]), False),
+        (run.Caps(["MemoryMax=1"], ("memory",)), True),
+        (run.Caps(["MemoryMax=1"], (), ("cpu",)), True),
+    ],
+)
+def test_a_cap_the_kernel_is_not_applying_gets_the_fallback_limits(monkeypatch, caps, limited):
+    seen = {}
+    monkeypatch.setattr(run, "choose_properties", lambda *a: caps)
+    monkeypatch.setattr(run.subprocess, "Popen", lambda argv, **kw: seen.update(kw) or _Proc(argv))
+    run.launch("j", ["true"], 2**30, 100, lambda: None)
+    assert (seen.get("preexec_fn") is not None) is limited

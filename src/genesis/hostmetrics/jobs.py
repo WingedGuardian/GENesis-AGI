@@ -31,8 +31,12 @@ def systemd_env() -> dict[str, str]:
     manager; an env-scrubbed caller often lacks both variables."""
     uid = os.getuid()
     env = dict(os.environ)
-    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
-    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+    # An empty value is a scrubbed one, not a choice: systemd treats "" as an
+    # explicit, unusable address rather than discovering the user bus.
+    if not env.get("XDG_RUNTIME_DIR"):
+        env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
+    if not env.get("DBUS_SESSION_BUS_ADDRESS"):
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{uid}/bus"
     return env
 
 
@@ -67,13 +71,16 @@ def _cpu_pct(value: str) -> float | None:
     return None
 
 
-def _file_cache(control_group: str) -> int:
+def _file_cache(control_group: str) -> int | None:
+    """The scope's file-LRU bytes, or None when they cannot be read."""
     if not control_group:
-        return 0
-    return read_container_memory_reclaimable(CGROUP_ROOT / control_group.lstrip("/")) or 0
+        return None
+    return read_container_memory_reclaimable(CGROUP_ROOT / control_group.lstrip("/"))
 
 
-def parse_show(text: str, file_cache: Callable[[str], int] = _file_cache) -> list[Job]:
+def parse_show(
+    text: str, file_cache: Callable[[str], int | None] = _file_cache
+) -> list[Job]:
     """Jobs from ``systemctl show -p Id -p MemoryMax -p MemoryCurrent -p
     CPUQuotaPerSecUSec -p ControlGroup`` over several units (blank-line separated).
 
@@ -93,7 +100,10 @@ def parse_show(text: str, file_cache: Callable[[str], int] = _file_cache) -> lis
         except ValueError:
             current = 0  # "[not set]": started, nothing charged yet
         if unit.startswith(SCOPE_PREFIX):
-            current = max(0, current - file_cache(props.get("ControlGroup", "")))
+            cache = file_cache(props.get("ControlGroup", ""))
+            # Unknown cache: count the whole reservation (use 0), never MemoryCurrent,
+            # which would still include cache that live use excludes.
+            current = 0 if cache is None else max(0, current - cache)
             jobs.append(Job(unit, reserved, current, _cpu_pct(props.get("CPUQuotaPerSecUSec", ""))))
     return jobs
 

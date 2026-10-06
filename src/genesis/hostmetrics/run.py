@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from genesis.hostmetrics import readings
 from genesis.hostmetrics.jobs import SCOPE_PREFIX, systemd_env
@@ -41,11 +42,43 @@ _REPORT_SH = (
     '"$(sed -n "s/^oom_kill //p" "$cg/memory.events" 2>/dev/null)" >&"$fd"; exit $rc'
 )
 _SYSTEMD_TIMEOUT = 15  # a local D-Bus round trip; a hang means no reachable manager
+# The probe runs inside its scope and prints the limits the kernel actually applies:
+# systemd accepts MemoryMax/CPUQuota even where the controller is not delegated to
+# the user manager, and the scope's memory.max then stays `max`.
+_ENFORCEMENT_SH = (
+    "cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); "
+    'cat "$cg/memory.max" 2>/dev/null || echo missing; '
+    'cat "$cg/cpu.max" 2>/dev/null || echo missing'
+)
 MIN_RAM = 16 * 1024 * 1024  # below this the probe itself is OOM-killed or refused
 
 
 class ProbeRefused(Exception):
     """systemd refused the job's scope: a bad estimate or slice, not a missing manager."""
+
+
+@dataclass(frozen=True)
+class Caps:
+    """The properties a probe scope accepted, and which caps it did not enforce."""
+
+    props: list[str]
+    unenforced: tuple[str, ...] = ()  # "memory"/"cpu": accepted, but `max` in the scope
+    unverified: tuple[str, ...] = ()  # "memory"/"cpu": the scope's limit file was unreadable
+
+
+def _limits(stdout: bytes | str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(unenforced, unverified) caps from the probe's readback of its own scope."""
+    text = stdout.decode(errors="replace") if isinstance(stdout, bytes) else (stdout or "")
+    lines = [ln.strip() for ln in text.splitlines()]
+    memory = lines[0] if lines else "missing"
+    cpu = lines[1].split()[0] if len(lines) > 1 and lines[1] else "missing"
+    values = (("memory", memory), ("cpu", cpu))
+    return (
+        tuple(name for name, value in values if value == "max"),
+        # Absent or unreadable (cgroup v1, a controller missing from subtree_control):
+        # the cap cannot be confirmed either way.
+        tuple(name for name, value in values if value in ("missing", "")),
+    )
 
 
 def unit_name(name: str, job_id: str) -> str:
@@ -83,33 +116,46 @@ def choose_properties(
     cpu_pct: float,
     slice_name: str | None,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-) -> list[str] | None:
-    """The property set a probe scope accepts; None when no manager is reachable.
+) -> Caps | None:
+    """The caps a probe scope accepts; None only when no manager can be reached.
 
-    Raises ProbeRefused when systemd refuses the properties for any reason other
-    than an ``OOMPolicy`` it does not know (then the next rung drops it).
+    None means `systemd-run` is absent or the bus is unreachable (MEASURED stderr:
+    "Failed to connect to bus: …"). Anything ambiguous — a probe that times out, a
+    `systemd-run` that cannot execute — raises ProbeRefused, because running the
+    job uncapped on a guess is the outcome the probe exists to prevent. So does a
+    refused property, unless it is an ``OOMPolicy`` systemd does not know (then
+    the next rung drops it).
     """
     if shutil.which("systemd-run") is None:
         return None
     for rung, oom_continue in enumerate((True, False)):
         props = scope_properties(ram, cpu_pct, oom_continue)
+        probe_unit = f"{unit}-probe{rung}"
         try:
             probe = runner(
-                scope_argv(f"{unit}-probe{rung}", props, slice_name, "/bin/true"),
+                scope_argv(probe_unit, props, slice_name, "/bin/sh", "-c", _ENFORCEMENT_SH),
                 capture_output=True,
                 timeout=_SYSTEMD_TIMEOUT,
                 env=systemd_env(),
             )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
+        except FileNotFoundError:
+            return None  # systemd-run vanished after `which` found it
+        except subprocess.TimeoutExpired:
+            stop_scope(probe_unit, runner)
+            raise ProbeRefused(
+                f"the probe scope did not finish within {_SYSTEMD_TIMEOUT}s "
+                "(a slow manager is not a missing one)"
+            ) from None
+        except OSError as exc:
+            raise ProbeRefused(f"systemd-run could not run: {exc}") from None
         if probe.returncode == 0:
-            return props
+            return Caps(props, *_limits(probe.stdout))
         err = probe.stderr.decode(errors="replace").strip() if probe.stderr else ""
         if "Failed to connect" in err:  # MEASURED: "Failed to connect to bus: …"
             return None
         if not (oom_continue and "OOMPolicy" in err):
             raise ProbeRefused(err or f"probe scope exited {probe.returncode}")
-    return None
+    raise ProbeRefused("no probe rung succeeded")  # unreachable; fails closed if not
 
 
 def parse_report(raw: bytes) -> tuple[int | None, float | None, int | None]:
@@ -140,6 +186,7 @@ class Watchdog:
     def __init__(self, over: Callable[[], str | None], stop: Callable[[], None], grace=60.0):
         self.over, self.stop, self.grace = over, stop, grace
         self.since: float | None = None
+        self.reason: str | None = None
         self.fired: str | None = None
 
     def tick(self, now: float) -> bool:
@@ -147,8 +194,11 @@ class Watchdog:
         if reason is None:
             self.since = None
             return False
+        # One continuous timer: the box over the line for `grace` seconds, whichever
+        # resource it is (memory, then a disk, is still the box over the line).
         if self.since is None:
             self.since = now
+        self.reason = reason
         if now - self.since < self.grace:
             return False
         self.stop()
@@ -230,14 +280,18 @@ def launch(
     Raises ProbeRefused when systemd refuses the scope's properties.
     """
     unit = unit_name(name, secrets.token_hex(3))
-    props = choose_properties(unit, ram, cpu_pct, slice_name)
-    state: dict = {"stop": None, "pending": False, "reaped": False}
+    caps = choose_properties(unit, ram, cpu_pct, slice_name)
+    props = None if caps is None else caps.props
+    state: dict = {"stop": None, "pending": False, "reaped": False, "signals": 0}
 
     def forward(signum, _frame):
+        state["signals"] += 1
+        # The first signal asks; a repeat insists (a job may ignore SIGTERM).
+        sig = signal.SIGTERM if state["signals"] == 1 else signal.SIGKILL
         if state["stop"] is None:
             state["pending"] = True  # arrived before the job existed: stop it once it does
         else:
-            state["stop"]()
+            state["stop"](sig)
 
     forwarded = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
     previous = {s: signal.signal(s, forward) for s in forwarded}
@@ -256,12 +310,46 @@ def launch(
                 str(write_fd),
                 *cmd,
             )
+            weak = caps.unenforced + caps.unverified
             proc = subprocess.Popen(
-                argv, pass_fds=(write_fd,), env=systemd_env(), start_new_session=True
+                argv,
+                pass_fds=(write_fd,),
+                env=systemd_env(),
+                start_new_session=True,
+                # A cap the kernel is not applying gets at least the uncapped fallback's
+                # nice 19 and data limit (--scope execs, so they carry over to the job).
+                preexec_fn=_uncapped_limits(ram) if weak else None,
             )
-            state["stop"] = lambda: stop_scope(unit)
+
+            def stop_scoped(sig: int) -> None:
+                # Signal the launch's process group too: before systemd registers the
+                # scope it is still the systemd-run client, and a stop that arrives first
+                # would find no unit. After registration this also signals the in-scope
+                # reporter, so a job that ignores SIGTERM keeps running until the scope's
+                # own stop timeout while `run` has already reported its exit.
+                if not state["reaped"]:
+                    kill_group(proc.pid, sig)
+                stop_scope(unit)
+
+            state["stop"] = stop_scoped
             print(f"genesis-job {unit}: started ({', '.join(props)})", file=sys.stderr)
+            for cap in caps.unenforced:
+                print(
+                    f"genesis-job {unit}: WARNING: the {cap} cap is NOT enforced here "
+                    f"(the {cap} controller is not delegated to the user manager); the job "
+                    "is visible to other sessions, runs at nice 19 with a data limit, but "
+                    "its estimate is not a hard limit",
+                    file=sys.stderr,
+                )
+            for cap in caps.unverified:
+                print(
+                    f"genesis-job {unit}: WARNING: could not verify the {cap} cap (its "
+                    "limit file was unreadable in the scope, e.g. cgroup v1); the job runs "
+                    "at nice 19 with a data limit as well",
+                    file=sys.stderr,
+                )
         else:
+            base = resource.getrusage(resource.RUSAGE_CHILDREN)  # earlier children excluded
             try:
                 proc = subprocess.Popen(
                     cmd, preexec_fn=_uncapped_limits(ram), start_new_session=True
@@ -271,7 +359,7 @@ def launch(
                 os.close(read_fd)
                 return 127
             # After the job is reaped its pgid may be reused: never signal it then.
-            state["stop"] = lambda: None if state["reaped"] else kill_group(proc.pid)
+            state["stop"] = lambda sig: None if state["reaped"] else kill_group(proc.pid, sig)
             print(
                 f"genesis-job {name}: UNCAPPED (systemd user manager unreachable): "
                 "nice 19 and a data-segment limit; invisible to other sessions",
@@ -280,9 +368,9 @@ def launch(
         os.close(write_fd)
         write_fd = -1
         if state["pending"]:
-            state["stop"]()
+            state["stop"](signal.SIGKILL if state["signals"] > 1 else signal.SIGTERM)
         done = threading.Event()
-        watchdog = Watchdog(over, lambda: state["stop"]())
+        watchdog = Watchdog(over, lambda: state["stop"](signal.SIGTERM))
         threading.Thread(target=watchdog.run, args=(done,), daemon=True).start()
         try:
             rc = proc.wait()
@@ -300,11 +388,21 @@ def launch(
         raw = b""
     os.close(read_fd)
     rc = 128 - rc if rc < 0 else rc
-    _report(name if props is None else unit, rc, ram, raw, props is not None, watchdog.fired)
+    scoped = props is not None
+    _report(name if not scoped else unit, rc, ram, raw, scoped, watchdog.fired,
+            None if scoped else base)
     return rc
 
 
-def _report(label: str, rc: int, ram: int, raw: bytes, scoped: bool, fired: str | None) -> None:
+def _report(
+    label: str,
+    rc: int,
+    ram: int,
+    raw: bytes,
+    scoped: bool,
+    fired: str | None,
+    base: resource.struct_rusage | None = None,
+) -> None:
     parts = [f"exit {rc}"]
     if scoped:
         peak, cpu_s, ooms = parse_report(raw)
@@ -314,6 +412,8 @@ def _report(label: str, rc: int, ram: int, raw: bytes, scoped: bool, fired: str 
         # rusage covers this wrapper's children: the largest single process, not a group total.
         usage = resource.getrusage(resource.RUSAGE_CHILDREN)
         cpu_s, ooms = usage.ru_utime + usage.ru_stime, None
+        if base is not None:  # the probe and any earlier child are not this job
+            cpu_s -= base.ru_utime + base.ru_stime
         parts.append(f"largest process {usage.ru_maxrss / 1024:.0f} MiB")
     if cpu_s is not None:
         parts.append(f"cpu {cpu_s:.2f}s")

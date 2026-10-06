@@ -323,3 +323,17 @@ def test_missing_estimate_probes_no_disk(monkeypatch, capsys):
     monkeypatch.setattr(cli, "load_levers", lambda: Levers())
     assert cli.main(["preflight", "--name", "j", "--ram", "1", "--disk", "/x=1"]) == 2
     assert "estimate required" in capsys.readouterr().out
+
+
+def test_cli_status_json_lists_live_jobs(fixed_snapshot, monkeypatch, capsys):
+    import json
+
+    from genesis.hostmetrics.jobs import Job
+
+    job = Job("genesis-job-build-a1b2c3.scope", 2 * GIB, GIB, 150.0)
+    monkeypatch.setattr(cli.jobs, "live_jobs", lambda: [job])
+    assert cli.main(["status", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["jobs"] == [
+        {"unit": job.unit, "reserved": 2 * GIB, "current": GIB, "cpu_quota_pct": 150.0}
+    ]

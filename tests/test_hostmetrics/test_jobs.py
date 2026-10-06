@@ -104,7 +104,7 @@ def test_file_cache_reads_the_scope_cgroup(tmp_path, monkeypatch):
     (scope / "memory.stat").write_text("anon 10\ninactive_file 300\nactive_file 200\n")
     monkeypatch.setattr(jobs, "CGROUP_ROOT", tmp_path)
     assert jobs._file_cache("/app.slice/genesis-job-x-1.scope") == 500
-    assert jobs._file_cache("") == 0
+    assert jobs._file_cache("") is None
 
 
 def test_listed_but_unshowable_jobs_are_unknown(monkeypatch):
@@ -115,3 +115,17 @@ def test_listed_but_unshowable_jobs_are_unknown(monkeypatch):
 
     monkeypatch.setattr(jobs, "_systemctl", fake)
     assert jobs.live_jobs() is None
+
+
+def test_unreadable_cache_keeps_the_whole_reservation():
+    block = _SHOW.split("\n\n")[0]  # MemoryMax 300 MiB, MemoryCurrent 100 MiB
+    (job,) = jobs.parse_show(block, file_cache=lambda cg: None)
+    assert job.current == 0 and jobs.reserved_beyond_use([job]) == 300 * MIB
+
+
+def test_systemd_env_replaces_empty_bus_variables(monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "")
+    env = jobs.systemd_env()
+    assert env["XDG_RUNTIME_DIR"].startswith("/run/user/")
+    assert env["DBUS_SESSION_BUS_ADDRESS"].startswith("unix:path=/run/user/")

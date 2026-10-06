@@ -41,6 +41,12 @@ _MAX_WINDOW = 3600.0  # seconds: a CPU sample longer than an hour is a mistake
 
 
 class _Parser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        # No prefix matching (`--na` for `--name`): the grammar stays exactly the
+        # options declared below, which is what full_suite_guard models.
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
     def error(self, message: str):  # noqa: D102 — keep exit 2 meaning NO only
         self.print_usage(sys.stderr)
         self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
@@ -103,8 +109,12 @@ def _status(args) -> int:
         except OSError:
             continue
     snap = take_snapshot(list(paths.values()), args.cpu_window, host=not args.no_host)
+    live = jobs.live_jobs()
     if args.json:
-        print(json.dumps({"threshold_pct": levers.threshold_pct, **asdict(snap)}, indent=1))
+        listed = None if live is None else [asdict(j) for j in live]  # None: unknown
+        print(json.dumps(
+            {"threshold_pct": levers.threshold_pct, **asdict(snap), "jobs": listed}, indent=1
+        ))
         return 0
     print(f"budget line: {levers.threshold_pct:g}% of each total")
     for note in levers.notes:
@@ -127,7 +137,6 @@ def _status(args) -> int:
     for path, disk in snap.disks.items():
         if disk:
             print(f"disk {path}: {_gib(disk[0] - disk[1])} used of {_gib(disk[0])}")
-    live = jobs.live_jobs()
     if live is None:
         print("jobs: unknown (systemd user manager unreachable)")
     else:
