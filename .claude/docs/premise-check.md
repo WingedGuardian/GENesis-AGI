@@ -75,8 +75,8 @@ A sound-but-inferior approach is a FINDING. Say so, name the better shape, and l
 whoever owns the change decide.
 
 **6. Then the PR-SHAPE question, every time:** should this arrive as ONE PR?
-Size by COUNTED lines, not raw insertions: `scripts/pr_shape.py`
-(`count_diff`) counts added and removed code lines and excludes tests,
+Size by COUNTED lines, not raw insertions: `python3 scripts/pr_shape.py --base origin/main`
+(`count_diff` over a hardened diff) counts added and removed code lines and excludes tests,
 prose, changelog fragments, blank and comment lines, counting a moved line
 once. The rule it encodes (#2737):
 
@@ -105,9 +105,8 @@ What the verdict does depends on where you run the check:
   builder starts.
 - **On an ordinary open PR in review,** it is not a kick-back. Ask the author
   for the split or for a `Shape:` reason, and let them decide. (A Devin-built PR
-  is the one kick-back: it goes back when it carries more than one concern, or
-  reaches 500 counted lines with no `Shape:` reason, unless its premise is
-  BROKEN, which waits for the owner. See closing-session, "Devin-built PRs".)
+  is the exception; its disposition is the decision table in closing-session,
+  "Devin-built PRs".)
 
 "Concern" here means one mechanism or behaviour change a reviewer can accept or
 reject on its own. Prefer one per PR; like size, this is weighed, not
@@ -168,14 +167,16 @@ rather than left to judgement:
 
 ## Handing a verdict to a builder: the rework spec
 
-When a check leads to a send-back, the verdict becomes a SPEC that another session,
+When a check leads to a send-back, the verdict becomes a SPEC, posted as a
+maintainer comment headed `## Rework spec` (on a Devin-built PR, the line after
+`(aside)`), that another session,
 often Codex or Devin on another machine, builds from cold. Everything that spec
 leaves out, the builder decides alone, and a reviewer later cannot tell a
 misreading from a real complication. So the spec is decision-complete:
 
 - **Keep:** what carries over unchanged, named by function or file.
 - **Delete:** the machinery that is going away, named.
-- **Shape:** the prescribed mechanism, including which existing chokepoint to
+- **Mechanism:** the prescribed shape of the change, including which existing chokepoint to
   route through.
 - **Split:** the `PR-shape` plan, as the list of PRs.
 - **Decided questions:** every question the builder will hit, answered. A
@@ -188,8 +189,8 @@ misreading from a real complication. So the spec is decision-complete:
 - **Contract:** the builder acknowledges the spec on the OLD PR before
   building, and each replacement PR carries a `## Rework` section
   (genesis-development, "Building a rework"). Say so in the spec.
-- **Follow-up:** the spec's last line, `Follow-up: <id>`, naming the `ready`
-  follow-up the closing session opened before posting it. The builder copies
+- **Follow-up:** the spec's last line, `Follow-up: <id>`, naming the follow-up
+  the closing session opened before posting it. The builder copies
   it into the replacement that merges into main last.
 
 Keep the old PR's `needs-rework` or `needs-architecture-session` label on, so

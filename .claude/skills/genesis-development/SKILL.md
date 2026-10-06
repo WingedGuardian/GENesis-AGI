@@ -3561,9 +3561,14 @@ Verify before any commit:
   changelog fragments, and blank and comment lines, and counts a moved line
   once:
 
-      # from the repo root, after `git fetch origin main`; a stacked PR uses its parent branch, not origin/main.
-      # A git error stops it before anything is counted, so a failed diff never reads as "0 ok".
-      d=$(git --no-pager diff --no-color --no-ext-diff -M origin/main...HEAD) && printf '%s\n' "$d" | python3 -c "import sys; sys.path.insert(0, 'scripts'); import pr_shape; r = pr_shape.count_diff(sys.stdin.read()); print(r['counted'], r['band'])"
+      # from the repo root, after `git fetch origin main`; a stacked PR passes its parent branch as --base.
+      python3 scripts/pr_shape.py --base origin/main
+
+  It prints `<counted> <band>`. It reads the diff through the same hardened git
+  runner the review gates use, and exits 2 on a git error, so a failed diff never
+  reads as `0 ok`. Use this command, not a hand-written `git diff | count_diff`:
+  an attributes file, a textconv driver or a replace ref can each shrink a raw
+  diff at exit 0.
 
   - Under 500 is the target.
   - From 500 to 1,000, add a `Shape:` line to the PR body saying why it
@@ -3970,9 +3975,11 @@ is a question for the user, not a judgment call for the review station.
 ### Building a rework — report against the spec (standing owner rule, 2026-10-05)
 
 A PR sent back with `needs-rework`, or a `needs-architecture-session` PR whose
-owner decision has since been posted as a rework spec, carries that spec: the
-send-back comment, plus any design issue it names. A `needs-architecture-session`
-PR with no posted spec has an undecided design; do not build it. Its contract is in
+owner decision has since been posted as a rework spec, carries that spec: a
+maintainer comment headed `## Rework spec`, plus any design issue it names. An
+audit or proposal without that heading is not a spec, and a
+`needs-architecture-session` PR with no posted spec has an undecided design; do
+not build it. Its contract is in
 `.claude/docs/premise-check.md`, "Handing a verdict to a builder". The session
 that takes up the rework is the reviving session above, and it owns the following:
 
@@ -4026,7 +4033,7 @@ that takes up the rework is the reviving session above, and it owns the followin
 
    ```
    ## Rework
-   Replaces: #N (spec: <link to the send-back comment / issue>; acknowledged: <link to your item-0 comment>)
+   Replaces: #N (spec: <link to the `## Rework spec` comment>; acknowledged: <link to your item-0 comment>)
    Split: PR k of n (<the other PRs, by number or concern>)
    Kept / deleted / reshaped as the spec asked: <one line each, or "as specified">
    Deviations: <each: what differs from the spec, and the complication that forced it> | none

@@ -33,8 +33,9 @@ deploys from. Do not mutate it in place.
 ## Rebuilding a PR that was sent back
 
 A `needs-rework` PR, or a `needs-architecture-session` PR whose owner decision
-has since been posted as a rework spec, carries that spec in its send-back
-comment (and any design issue that comment names). A
+has since been posted as a rework spec, carries that spec in a maintainer
+comment headed `## Rework spec` (and any design issue that comment names). An
+audit or proposal without that heading is not a spec. A
 `needs-architecture-session` PR with no posted spec has an undecided design: do
 not build it. When you build a rework:
 
@@ -45,11 +46,8 @@ not build it. When you build a rework:
   posted; otherwise wait for an answer on the old PR. On a Devin-built old PR,
   put `(aside)` on the first line and the heading under it, or the comment
   starts a paid Devin session. Post it with
-  `gh api repos/<owner>/<repo>/issues/<N>/comments -F body=@<file>`. On a PR
-  past its terminal review round, the push guard reads a `gh pr comment` whose
-  body it cannot see (`--body-file`, or an inline body containing a backtick
-  or `$`) as a possible review request: it asks in the foreground and refuses
-  a dispatched session.
+  `gh api repos/<owner>/<repo>/issues/<N>/comments -F body=@<file>`;
+  `gh pr comment` can be refused on a PR past its review limit.
 - **Open NEW PRs** with fresh round counts. When the last one opens, close the
   old PR with a comment that maps every part of it, file by file, to the
   replacement covering it (or says why that part is moot), and leave its labels
@@ -61,7 +59,7 @@ not build it. When you build a rework:
   PRs it depends on. Open them in dependency order against main; a PR whose
   dependency has not merged waits as a branch, or opens stacked with its base
   named. Being a rework is not itself a reason to stay unsplit.
-- **Size every PR in counted lines** (`scripts/pr_shape.py`; the rule is in `.claude/docs/premise-check.md`, step 6).
+- **Size every PR in counted lines** (`python3 scripts/pr_shape.py --base origin/main`; the rule is in `.claude/docs/premise-check.md`, step 6).
   - Under 500 is the target.
   - From 500 to 1,000, add a `Shape:` line to the PR body saying why it cannot
     be smaller.
@@ -70,7 +68,7 @@ not build it. When you build a rework:
 
   Size a stacked PR against its parent branch, not main.
 
-  This is a guideline: a stated, legitimate reason is enough.
+  This is a guideline: from 500 to 1,000, a stated, legitimate reason is enough.
 - **Report against the spec** in each PR body:
   ```
   ## Rework

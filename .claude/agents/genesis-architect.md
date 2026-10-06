@@ -76,13 +76,16 @@ block, and the calibration controls: `.claude/docs/premise-check.md`. In short:
    re-implements, a simpler mechanism, or a place the problem disappears. A
    sound-but-inferior approach is a FINDING.
 5. **Then the PR-shape question, every time:** should this arrive as ONE PR?
-   Size it in counted lines (`scripts/pr_shape.py`, `count_diff`), against
+   Size it in counted lines (`python3 scripts/pr_shape.py --base origin/<base>
+   --head <ref>`, with `--head` set to the fetched PR ref when you are not on
+   that branch), against
    #2737's bands:
    - under 500 is the target;
    - 500 to 1,000 needs a `Shape:` reason;
    - over 1,000 needs owner approval.
 
-   These are a guideline the builder weighs. A stated reason is enough. A
+   These are a guideline the builder weighs. From 500 to 1,000, a stated
+   reason is enough; over 1,000 always needs the owner. A
    change that is too large for no stated reason, or that carries more than one
    concern, gets a SPLIT plan: the PRs in dependency order, one concern each.
    The split is often the whole rework, and sound code still gets one.

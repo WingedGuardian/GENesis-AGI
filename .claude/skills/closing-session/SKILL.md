@@ -500,7 +500,7 @@ what counts as a round — are in `genesis-development`. Do not re-derive them.
 approval never carries forward, and a peer session's request is not approval.
 
 Present: what it does, what the review found, what you changed, its counted
-size (`scripts/pr_shape.py`; over 1,000 counted lines needs the owner's
+size (`python3 scripts/pr_shape.py --base origin/<PR base> --head <fetched PR ref>`; over 1,000 counted lines needs the owner's
 explicit yes to the shape as well as the merge), and the exact merge command
 the report printed. Then stop. This is the most important property
 this session type has, and the one most worth protecting: a closing session that
@@ -515,16 +515,20 @@ Two triggers, two labels:
   a review problem". Follow it there, owner-present and unattended alike; it
   includes the draft step. Its unattended intake gap is tracked in #2857. If the
   owner's architecture conversation decides to send the PR back, run steps 1-4
-  below with `needs-architecture-session`.
+  below with `needs-architecture-session`, and reuse that PR's decision
+  follow-up (updating its text and work state) as the step-4 row below
+  instead of opening a second one.
 - **The owner decides a terminal round is rework** → `needs-rework`. The owner is
   present by definition, so this runs in the foreground:
   1. Open the `ready` follow-up FIRST (step 4 below). Then comment with the
-     evidence and a DECISION-COMPLETE rework spec, and end it with a
+     evidence and a DECISION-COMPLETE rework spec headed `## Rework spec`
+     (only a maintainer comment with that heading is a spec a builder may
+     build from; an audit or a proposal without it is not), and end it with a
      `Follow-up: <id>` line carrying that row's id, so a builder on another
      machine can cite it. Its sections
      are defined in `.claude/docs/premise-check.md`, "Handing a verdict to a
      builder": findings by class; what is kept; what is deleted; the prescribed
-     shape; the SPLIT plan (the `PR-shape:` line, as a list of PRs); every
+     mechanism; the SPLIT plan (the `PR-shape:` line, as a list of PRs); every
      decided question; acceptance. The builder is often Codex or Devin on
      another machine, building cold from this comment alone.
      - Questions only the owner can answer get asked BEFORE posting.
@@ -557,7 +561,7 @@ genesis-development's superseded-PR exception); condition 2 is the open
 replacement, and condition 3 is the per-file coverage mapping.
 
 The closing session verifies the mapping against the replacements' diffs.
-When it holds, leave the step-4 follow-up alone: the `Follow-up:` line in the
+When it holds, leave the follow-up alone: the `Follow-up:` line in the
 replacement that merges last completes it when the whole rework lands. When a
 part is uncovered and the old PR was closed anyway, reopen it or say so on it,
 and update the follow-up to name that part, since the follow-up is what keeps
@@ -569,9 +573,8 @@ requests review. A closing session never does the rework itself.
 the spec on the old PR: its reading, its split, its questions (genesis-development,
 "Building a rework", item 0). Answer those questions there, or bring them to the
 owner. If the acknowledgement misreads the spec, correct it before any code is
-written. On a Devin-built PR, post the answer WITHOUT `(aside)`: Devin is
-waiting for it, and an `(aside)` comment never reaches its monitor. The
-owner's yes to the kick-back covers that answer.
+written. On a Devin-built PR, who asked decides whether the answer carries
+`(aside)`: see the `(aside)` table under "Devin-built PRs".
 
 **When a rework PR arrives, check its rework section against the spec FIRST**,
 before spending a review round. The section is described in genesis-development,
@@ -588,6 +591,11 @@ Then read the diff against both:
   acknowledgement, or an unsplit PR the spec split goes back to the builder
   before any review is requested. No response means the spec may not have been
   read, and nobody can tell what changed mid-build.
+
+For a replacement Devin built, this check comes first, then the Devin premise
+audit ("Devin-built PRs"), both before any further review round. If the builder cannot
+be reached on the PR (a dispatched session that has ended, or a cloud agent with
+no listener there), bring the gap to the owner instead of waiting for an answer.
 
 This is what lets the owner tell a flawed spec from a flawed build without
 reconstructing either. A form check can confirm that the section exists and
@@ -646,33 +654,42 @@ happened already. Before requesting or answering any further review:
 2. **Re-derive every claim the disposition rests on** from the PR head or by
    re-running the audit's own probe, before acting (CLAUDE.md, "Verify agent
    output").
-3. **Decide by the audit's `Design-premise:` verdict, not by finding severity:**
-   - **BROKEN**: the established route, `needs-architecture-session` plus a
-     `ready` follow-up naming the PR and the decision it awaits (genesis-development,
-     "Some PRs are not a review problem"). Devin can rework a shape; it cannot
-     decide one.
-   - **SOUND-BUT-INFERIOR with a named better shape that changes the mechanism or
-     the files touched**: kick it back to Devin. Post the audit as a PR comment
-     WITHOUT `(aside)`, so Devin's monitor acts on it. Open its step-4 follow-up
-     first and end the comment with that row's `Follow-up: <id>` line. Tell
-     Devin to bring the rework back as a fresh PR with a new number that names
-     this one, not to push the rework to this branch, and not to close this PR
-     itself (it has closed old PRs on its own before, #2309 and #2354). Then
-     convert the PR to draft (`gh pr ready <N> --undo`) and add the
-     `needs-rework` label.
-   - **`PR-shape: SPLIT` because the PR carries more than one concern, or
-     because of its size with no `Shape:` reason in the body**, when the
-     premise verdict is SOUND or SOUND-BUT-INFERIOR. A BROKEN verdict keeps the
-     branch above (the owner decides the design first), and its spec carries
-     the split. A `Shape:` line answers size from 500 to 1,000 counted lines,
-     never a concern-based split; over 1,000 goes to the owner whatever the
-     line says. In that case: post the audit WITHOUT `(aside)` with the split
-     plan and its `Follow-up: <id>` line (as above), and tell Devin to open the
-     listed PRs as fresh PRs naming this one, and not to close it. (This is stricter than an ordinary PR, where size is the author's
-     call, because Devin cannot be asked to weigh it in conversation.) Then
-     draft and label as above.
-   - **SOUND, or local defects at any severity**: post the audit and continue the
-     ordinary per-PR loop.
+3. **Decide by this table. Read it top to bottom; the FIRST row that matches is
+   the disposition.** Its inputs come from the audit: the `Design-premise:`
+   verdict, the `PR-shape:` line, and the counted size:
+   `git fetch origin pull/<N>/head:pr-<N>`, then
+   `python3 scripts/pr_shape.py --base origin/<PR base> --head pr-<N>`. The
+   command defaults to `--head HEAD`, so run from any other checkout without
+   `--head` it sizes the wrong branch and can print a near-zero `ok`.
+
+   | # | When | Do |
+   |---|---|---|
+   | 1 | Over 1,000 counted lines, whatever the verdict or PR-shape | Stop: the owner decides the shape (and, for a BROKEN verdict, the design) before any kick-back or further review round. Post the audit `(aside)`, apply `needs-architecture-session`, move the PR to draft, and open a `ready` follow-up naming the shape decision (and the design decision, if BROKEN). With the owner present, ask now. Once the owner rules, re-enter this table at row 2. |
+   | 2 | Verdict BROKEN | The architecture route: `needs-architecture-session` plus a `ready` follow-up naming the PR and the decision it awaits (genesis-development, "Some PRs are not a review problem"). Post the audit `(aside)`, never headed `## Rework spec`: Devin can rework a shape, it cannot decide one, and the split belongs in the spec written after the owner decides. |
+   | 3 | Verdict SOUND or SOUND-BUT-INFERIOR, and either the audit names more than one concern, or the counted size is 500 to 1,000 and the PR body has no `Shape:` line (whatever the audit's `PR-shape:` line says) | Kick back for the split (below). If the verdict also names a better shape that changes the mechanism or the files touched, the one kick-back carries both. |
+   | 4 | SOUND-BUT-INFERIOR, and the better shape changes the mechanism or the files touched | Kick back for one fresh PR (below). |
+   | 5 | Anything else: SOUND, or SOUND-BUT-INFERIOR whose better shape keeps the mechanism and files, with local defects at any severity | Post the audit `(aside)` and continue the ordinary per-PR loop. |
+
+   Only a kick-back (rows 3 and 4) or a spec posted after the owner rules is
+   headed `## Rework spec`; an audit under rows 1, 2 or 5 never is, so a builder
+   cannot mistake it for a decided spec.
+
+   A `Shape:` line answers size from 500 to 1,000 counted lines only. It never
+   answers a concern-based split, and over 1,000 is row 1 whatever it says. Row 3
+   is stricter than an ordinary PR, where size is the author's call, because
+   Devin cannot be asked to weigh it in conversation.
+
+   **A kick-back (rows 3 and 4)** runs on this standing owner rule, so it needs
+   no per-PR yes:
+   1. Open its follow-up first ("Track every kick-back", below).
+   2. Post the audit WITHOUT `(aside)`, so Devin's monitor acts on it. Head it
+      `## Rework spec`, end it with that follow-up's `Follow-up: <id>` line, and
+      for row 3 include the split plan. Tell Devin to copy the `Follow-up:` line
+      into the replacement that will merge into main last.
+   3. Tell Devin to bring the rework back as fresh PR(s) naming this one, not
+      to push the rework to this branch, and not to close this PR (it has
+      closed old PRs on its own before, #2309 and #2354).
+   4. Convert the PR to draft (`gh pr ready <N> --undo`) and add `needs-rework`.
 
    For Devin PRs this owner rule replaces premise-check.md's "SOUND-BUT-INFERIOR is
    NOT a kick-back" and its two-signal bar. The audit runs after at most Codex's
@@ -686,7 +703,11 @@ happened already. Before requesting or answering any further review:
    the replacement carries, and the first merge would complete a shared row.
    Its `revisit_condition` says what unblocks it: Devin opened the
    replacement(s) naming this PR, or the owner decided. Re-check those PRs,
-   and the open PRs that name them, on each queue sweep.
+   and the open PRs that name them, on each queue sweep. A dispatched session
+   cannot open that row: `follow_up_create` files it as `tabled`, and the
+   marker lane reads only `follow_up` rows, so the replacement's `Follow-up:`
+   line would never close it. Name the row id in your handoff; a foreground
+   session promotes it by hand (no automated promoter exists).
 5. **When the rework arrives as its replacement PR,** link the two on both PRs and
    work the replacement normally; read its round count from
    `scripts/review_budget.py` like any other PR's. A SPLIT's replacements are
@@ -703,8 +724,19 @@ happened already. Before requesting or answering any further review:
    a round on it.
 
 **One writer per branch.** While a kick-back is outstanding, the closing session
-does not push to that branch. Its own replies there carry `(aside)`, since every
-other comment from a write-access user starts a paid Devin session.
+does not push to that branch, and its comments there follow the table below.
+
+**`(aside)` on a Devin-built PR.** Every comment a write-access user posts on a
+Devin-built PR starts a paid Devin session unless its first line is `(aside)`.
+
+| You are posting | `(aside)` first? |
+|---|---|
+| A `## Rework spec` Devin is to build (a kick-back under rows 3 or 4, or a spec posted after the owner rules), or a send-back of a Devin replacement that lacks its `## Rework` section or explains a deviation with no reason | No: it is the instruction Devin acts on |
+| An answer to an acknowledgement or question that `devin-ai-integration[bot]` wrote about a spec it is building | No: Devin is waiting for it; the standing rule, or the owner's decision behind the spec, covers it |
+| An answer to an acknowledgement or question from any other builder (a Codex or Claude session rebuilding a Devin PR) | Yes: without it a second, competing Devin session starts |
+| Anything else: an audit under rows 1, 2 or 5, a review reply, a status note, a closing comment | Yes |
+
+On a PR Devin did not build, `(aside)` changes nothing; leave it off.
 
 **Public comments.** Scrub the audit for public-artifact privacy (no install paths,
 hosts or personal context) before posting. Keep security-class findings out: a gap
