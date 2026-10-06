@@ -177,7 +177,7 @@ def test_cache_refuses_rows_from_another_repository(tmp_path):
     ],
 )
 def test_is_squash(monkeypatch, log, commits, squash):
-    monkeypatch.setattr(study, "_sh", lambda *a: log)
+    monkeypatch.setattr(study, "_git", lambda *a: log)
     assert study._is_squash("abc", 7, lambda: commits) is squash
 
 
@@ -228,3 +228,21 @@ def test_cli_fails_loudly_on_a_bad_ref(tmp_path):
     assert run.returncode == 2
     assert "could not read" in run.stderr
     assert run.stdout == ""
+
+
+def test_study_history_reads_go_through_the_hardened_runner(monkeypatch):
+    """Review finding: the study read diffs and logs with raw git, so an attributes
+    file or a replace ref could change its measurement while the CLI's did not."""
+    seen = []
+    scope = study.pr_shape._load_sibling("review_scope.py", "_review_scope_for_pr_shape")
+    monkeypatch.setattr(scope, "_git", lambda argv, cwd, *a, **k: seen.append(argv) or "x")
+    study._git("diff", "--no-color", "-M", "a^1", "a")
+    study._git("log", "-1", "a")
+    assert seen == [["diff", "--no-color", "-M", "a^1", "a"], ["--no-replace-objects", "log", "-1", "a"]]
+
+
+def test_study_git_failure_raises(monkeypatch):
+    scope = study.pr_shape._load_sibling("review_scope.py", "_review_scope_for_pr_shape")
+    monkeypatch.setattr(scope, "_git", lambda *a, **k: None)
+    with pytest.raises(subprocess.CalledProcessError):
+        study._git("log", "-1", "a")

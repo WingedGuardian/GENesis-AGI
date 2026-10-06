@@ -163,12 +163,27 @@ def _sh(*args: str) -> str:
     return subprocess.run(args, capture_output=True, text=True, check=True, cwd=_ROOT).stdout
 
 
+def _git(*args: str) -> str:
+    """A history read through ``review_scope``'s hardened runner, the same one the
+    ``pr_shape`` CLI uses: no attributes file, textconv, external diff or replace
+    objects, and git's own environment overrides removed. Each of those can empty or
+    change a read at exit 0. Raises ``CalledProcessError`` when the read fails, so a
+    failed read is excluded and counted, never measured as an empty change.
+    """
+    scope = pr_shape._load_sibling("review_scope.py", "_review_scope_for_pr_shape")
+    argv = list(args) if args[0] == "diff" else ["--no-replace-objects", *args]
+    out = scope._git(argv, str(_ROOT))
+    if out is None:
+        raise subprocess.CalledProcessError(1, ["git", *argv])
+    return out
+
+
 def _is_squash(sha: str, pr: int, n_commits) -> bool:
     """True when ``sha`` is the PR's squash commit: one parent, and either GitHub's
     squash subject ``... (#N)`` or a one-commit PR. ``n_commits`` is a callable,
     asked only when the subject does not settle it (listing every PR's commits in
     one query exceeds GitHub's GraphQL node limit)."""
-    parents, subject = _sh("git", "log", "-1", "--format=%P%n%s", sha).split("\n", 1)
+    parents, subject = _git("log", "-1", "--format=%P%n%s", sha).split("\n", 1)
     if len(parents.split()) != 1:
         return False
     return f"(#{pr})" in subject or n_commits() == 1
@@ -274,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             try:
                 squash = _is_squash(sha, n, lambda n=n: _commit_count(repo, n))
-                diff = _sh("git", "diff", "--no-color", "--no-ext-diff", "-M", f"{sha}^1", sha)
+                diff = _git("diff", "--no-color", "-M", f"{sha}^1", sha)
             except subprocess.CalledProcessError:
                 excluded["diff_error"] += 1
                 continue
