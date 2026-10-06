@@ -609,6 +609,100 @@ def test_a_merge_in_progress_gets_no_restore_command(bw):
     assert "merge is in progress" in text and "Do NOT discard" in text, text
 
 
+def test_a_merge_with_every_conflict_staged_still_gets_no_restore_command(bw):
+    """Once the last conflict is resolved and staged no unmerged entry is left,
+    but MERGE_HEAD still exists: the merge is still in progress, and a restore
+    would discard its staged resolution."""
+    inst = bw["install"]
+    _git(inst, "checkout", "-q", "-b", "side", "HEAD~1")
+    (inst / "README.md").write_text("side\n")
+    _git(inst, "commit", "-q", "-am", "side")
+    _git(inst, "checkout", "-q", "main")
+    merged = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(inst),
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@e",
+            "merge",
+            "-q",
+            "side",
+        ],
+        capture_output=True,
+    )
+    assert merged.returncode != 0, "fixture: the merge must conflict"
+    (inst / "README.md").write_text("resolved\n")
+    _git(inst, "add", "README.md")
+    status = _git(inst, "status", "--porcelain", "--untracked-files=no")
+    assert "UU" not in status and "M  README.md" in status, status
+    _, _, post = _around(bw, "echo more >> docs/guide.md")
+    text = _advisory(post)
+    assert "docs/guide.md" in text, text
+    assert "merge is in progress" in text and "Do NOT discard" in text, text
+    assert "checkout --" not in text and "restore --source" not in text, text
+
+
+def test_an_intent_to_add_entry_gets_a_restore_that_really_clears_it(bw):
+    """`git add -N` leaves a `.A` entry, which `git checkout --` does not clear;
+    the offered command must be one that does."""
+    inst = bw["install"]
+    _, _, post = _around(bw, f"echo n > new.txt && {_G} add -N new.txt")
+    text = _advisory(post)
+    assert "new.txt" in text, text
+    line = next(ln for ln in text.splitlines() if "new.txt" in ln and f"{_G} -C" in ln)
+    cmd = line.split("#", 1)[0].strip()
+    subprocess.run(["bash", "-c", cmd], check=True, capture_output=True)
+    assert _git(inst, "status", "--porcelain", "--untracked-files=no") == "", cmd
+
+
+def test_a_changed_skip_worktree_file_gets_no_checkout_command(bw):
+    """`git checkout -- <file>` fails on a skip-worktree entry, so the advisory
+    must not offer it; it names the flag instead."""
+    _git(bw["install"], "update-index", "--skip-worktree", "README.md")
+    _, _, post = _around(bw, "echo hidden >> README.md")
+    text = _advisory(post)
+    assert "README.md" in text and "skip-worktree" in text, text
+    assert "checkout -- README.md" not in text, text
+
+
+def _load_guard_copy(bw, monkeypatch, name):
+    from tests.conftest import private_module
+
+    monkeypatch.setenv("GENESIS_HOME", str(bw["ghome"]))
+    for var in ("GENESIS_MAIN_CHECKOUT_GUARD", "GENESIS_UPDATE_TIER"):
+        monkeypatch.delenv(var, raising=False)
+    return private_module(name, bw["guard"])
+
+
+def test_a_timed_out_after_snapshot_still_notes_a_call_from_the_root(bw, monkeypatch):
+    """When the after-snapshot exhausts the git deadline, deciding whether the
+    call pointed at the root must not fail on that same deadline — a call run
+    from the root has to get its NOT-checked note."""
+    mod = _load_guard_copy(bw, monkeypatch, "main_checkout_guard_deadline")
+    payload = _bash_payload("PreToolUse", "true", bw["install"], "toolu_deadline")
+    assert mod._bash_pre(payload, mod._Git()) is None
+    git = mod._Git()
+    git.deadline = 0.0  # spent before the after-snapshot runs
+    note = mod._bash_post({**payload, "hook_event_name": "PostToolUse"}, git)
+    assert note and "NOT checked" in note, note
+
+
+def test_a_failed_snapshot_write_leaves_no_temp_file(bw, monkeypatch):
+    mod = _load_guard_copy(bw, monkeypatch, "main_checkout_guard_tmpwrite")
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mod.json, "dump", boom)
+    target = mod._snapshot_file("toolu_tmp")
+    with pytest.raises(OSError):
+        mod._write_snapshot(target, {"v": 1})
+    assert not any(target.parent.iterdir()), list(target.parent.iterdir())
+
+
 def test_many_changed_files_point_at_status_instead_of_one_long_command(bw):
     names = [f"f{i}.txt" for i in range(15)]
     for name in names:

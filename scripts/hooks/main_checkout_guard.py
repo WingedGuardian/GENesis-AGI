@@ -118,6 +118,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -262,6 +263,7 @@ class _Git:
             if not k.startswith("GIT_") or k.startswith("GIT_CONFIG")
         }
         self._checkouts: dict[str, tuple[str, bool] | None] = {}
+        self._git_dirs: dict[str, str] = {}
 
     def run(self, cwd: str, *args: str) -> subprocess.CompletedProcess:
         remaining = self.deadline - time.monotonic()
@@ -314,7 +316,29 @@ class _Git:
         guarded = primary and os.path.realpath(toplevel) == str(_SELF_ROOT)
         result = (os.path.realpath(toplevel), guarded)
         self._checkouts[directory] = result
+        self._git_dirs[result[0]] = os.path.realpath(git_dir)
         return result
+
+    def operation_in_progress(self, root: str) -> str | None:
+        """The multi-step git operation under way in ``root`` (merge, rebase,
+        cherry-pick, revert), read from its git dir, or None. Its index can be
+        fully resolved and staged, with no unmerged entry left, while the
+        operation is still open: a restore there discards the resolution."""
+        if root not in self._git_dirs:
+            self.checkout(root)
+        git_dir = self._git_dirs.get(root)
+        if not git_dir:
+            return None
+        for marker, name in (
+            ("MERGE_HEAD", "merge"),
+            ("rebase-merge", "rebase"),
+            ("rebase-apply", "rebase"),
+            ("CHERRY_PICK_HEAD", "cherry-pick"),
+            ("REVERT_HEAD", "revert"),
+        ):
+            if os.path.exists(os.path.join(git_dir, marker)):
+                return name
+        return None
 
     def tracked(self, root: str, paths: list[str]) -> list[str]:
         """Repo-relative tracked paths among ``paths`` (literal pathspecs; a
@@ -536,6 +560,7 @@ def _snapshot(git: _Git, root: str) -> dict:
         "root": root,
         "head": headers.get("branch.oid"),
         "branch": headers.get("branch.head"),
+        "op": git.operation_in_progress(root),
         "paths": paths,
     }
 
@@ -575,11 +600,16 @@ def _write_snapshot(target: Path, snap: dict) -> None:
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
         os.chmod(directory, 0o700)
-    tmp = directory / f".{target.name}.{os.getpid()}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(snap, fh)
-    os.replace(tmp, target)
+    # mkstemp creates the temp 0600 with a unique name.
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(snap, fh)
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
     _prune(directory)
 
 
@@ -702,7 +732,11 @@ def _advisory(before: dict, after: dict, *, attributable: bool) -> str | None:
     if not (changed or head_moved):
         return None
     root = after.get("root") or str(_SELF_ROOT)
-    merging = any(_meta(v).startswith("u ") for v in new_paths.values())
+    # Unmerged entries are one sign; the operation's own marker in the git dir is
+    # the other, and the only one left once every conflict is resolved and staged.
+    op = after.get("op") or (
+        "merge" if any(_meta(v).startswith("u ") for v in new_paths.values()) else None
+    )
     parts = [
         f"{_TAG} ADVISORY: tracked state of {root} — this install's PRIMARY checkout, "
         "the deployed install that hooks, scripts and the server run from — changed "
@@ -732,23 +766,38 @@ def _advisory(before: dict, after: dict, *, attributable: bool) -> str | None:
             f"Changed while flagged assume-unchanged/skip-worktree (so `git status` hides "
             f"them): {_shown(flagged)}."
         )
-    if changed and attributable and not merging:
+    restorable = [p for p in changed if p not in flagged]
+    if changed and attributable and not op:
 
-        def has_staged(p: str) -> bool:
+        def needs_index_restore(p: str) -> bool:
+            # XY of a porcelain v2 entry: a staged change (X), or an intent-to-add
+            # entry (`.A`, from `git add -N`), which `git checkout --` leaves in place.
             fields = _meta(new_paths.get(p)).split(" ")
-            return len(fields) > 1 and len(fields[1]) == 2 and fields[1][0] != "."
+            xy = fields[1] if len(fields) > 1 else ""
+            return len(xy) == 2 and (xy[0] != "." or xy[1] == "A")
 
-        staged = [p for p in changed if has_staged(p)]
-        edited = [p for p in changed if p not in staged]
-        parts.append(
-            "If your command made these changes and it was not a deploy: put the work in "
-            "a worktree from origin/main and a PR, then restore the deploy root:\n"
-            + "\n".join(_repair_lines(root, edited, staged))
-        )
+        staged = [p for p in restorable if needs_index_restore(p)]
+        edited = [p for p in restorable if p not in staged]
+        if restorable:
+            parts.append(
+                "If your command made these changes and it was not a deploy: put the work "
+                "in a worktree from origin/main and a PR, then restore the deploy root:\n"
+                + "\n".join(_repair_lines(root, edited, staged))
+            )
+        if flagged:
+            parts.append(
+                "No restore command is offered for the flagged file(s): a plain checkout "
+                "does not restore an entry flagged skip-worktree or assume-unchanged. Tell "
+                "the user."
+            )
     elif changed:
         why = (
-            "a merge is in progress there (most likely the update pipeline's)"
-            if merging
+            (
+                "a merge is in progress there (most likely the update pipeline's)"
+                if op == "merge"
+                else f"a {op} is in progress there"
+            )
+            if op
             else "this call did not point at the deploy root, so another actor most likely "
             "made them"
         )
@@ -771,7 +820,9 @@ def _bash_pre(payload: dict, git: _Git) -> str | None:
             return None  # this script's checkout is not the deploy root
         _write_snapshot(_snapshot_file(tool_use_id), _snapshot(git, info[0]))
     except (_Unknown, OSError, ValueError) as exc:
-        if _mentions_root(payload, git):
+        # A fresh runner: the failure may be the shared deadline itself, and
+        # attribution on that same spent runner would always answer "no".
+        if _mentions_root(payload, _Git()):
             return _unchecked_note(f"no before-snapshot could be taken ({exc})")
     return None
 
@@ -789,7 +840,8 @@ def _bash_post(payload: dict, git: _Git) -> str | None:
     try:
         after = _snapshot(git, str(_SELF_ROOT))
     except (_Unknown, OSError) as exc:
-        if _mentions_root(payload, git):
+        # A fresh runner, for the reason given in _bash_pre.
+        if _mentions_root(payload, _Git()):
             return _unchecked_note(f"the after-snapshot could not be taken ({exc})")
         return None
     return _advisory(before, after, attributable=_mentions_root(payload, git))
