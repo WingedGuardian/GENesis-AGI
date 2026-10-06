@@ -105,6 +105,7 @@ REFUSAL_FILES = (
     "scripts/deploy_code_only.sh",
     "scripts/bootstrap.sh",
     "scripts/lib/deploy_checkout.sh",
+    "scripts/lib/server_session_refusal.sh",
     "scripts/lib/deploy_marker.sh",
     "scripts/lib/guardian_pause.sh",
     "scripts/lib/alert_queue.sh",
@@ -114,9 +115,9 @@ REFUSAL_FILES = (
     # serving read runs inside `deploy_code_only.sh status`, which readiness runs.
     "scripts/lib/serving_commit.py",
     "scripts/lib/manifest_delta.py",
-    # Also read at startup, run after the check: the restart refusal's session
-    # scan, and the restarted unit's identity probe (read through its test seam,
-    # `${GENESIS_DEPLOY_PORT_PROBE:-…}`, which the `cat` lock below now matches).
+    # Also read at startup by the refusal library, and by the restarted unit's
+    # identity probe (read through its test seam, `${GENESIS_DEPLOY_PORT_PROBE:-…}`,
+    # which the `cat` lock below now matches).
     "scripts/lib/server_sessions.py",
     "scripts/lib/port_owned_by.py",
     "src/genesis/dashboard/routes/updates.py",
