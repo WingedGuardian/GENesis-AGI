@@ -20,9 +20,15 @@ HOOK = REPO / "scripts/hooks/stealth_skill_nudge.py"
 
 
 def _nudge(
-    tmp: Path, layer: str | None, sid: str | None = "s1", as_string: bool = True
+    tmp: Path,
+    layer: str | None,
+    sid: str | None = "s1",
+    as_string: bool = True,
+    empty: bool = False,
 ) -> str:
     response = {"layer": layer, "url": "https://x.example"} if layer else {"error": "boom"}
+    if empty:
+        response = {}
     # Production shape: an MCP tool's tool_response is a JSON STRING (measured
     # from the session observer). Feeding a dict hid that the hook never fired.
     if as_string:
@@ -71,9 +77,40 @@ def test_each_pointer_fires_once_per_session(tmp_path):
     assert _nudge(tmp_path, "camoufox") == ""
 
 
-def test_a_failed_navigate_is_silent_and_spends_nothing(tmp_path):
-    assert _nudge(tmp_path, None) == ""
-    assert "Safety gates" in _nudge(tmp_path, "chromium")
+def test_a_failed_navigate_still_gets_the_safety_pointer(tmp_path):
+    """A navigate that errors after the page opened leaves that page usable
+    (browser_fill can type into it), and the error carries no layer. The safety
+    pointer is layer-independent, so it fires anyway. The stealth pointer needs
+    the layer, so it is left unspent for the next successful Camoufox navigate."""
+    text = _nudge(tmp_path, None)
+    assert "Safety gates" in text and "stealth-browser" not in text
+    later = _nudge(tmp_path, "camoufox")
+    assert "stealth-browser" in later and "Safety gates" not in later
+
+
+def test_an_empty_response_is_silent(tmp_path):
+    """Both shapes: an empty object, and the JSON string '{}' an MCP tool sends."""
+    assert _nudge(tmp_path, None, as_string=False, empty=True) == ""
+    assert _nudge(tmp_path, None, as_string=True, empty=True) == ""
+    assert not list(tmp_path.glob("genesis_*nudge_*"))
+
+
+def test_a_session_id_of_maximum_length_still_fires_once(tmp_path):
+    """session_id() accepts ids up to 255 bytes, but prefix + id must still fit
+    one filename component, or open() fails and the pointer repeats forever."""
+    sid = "a" * 255
+    assert "Safety gates" in _nudge(tmp_path, "camoufox", sid=sid)
+    assert _nudge(tmp_path, "camoufox", sid=sid) == ""
+    # A different long id that shares the leading bytes is a different session.
+    assert "Safety gates" in _nudge(tmp_path, "camoufox", sid="a" * 254 + "b")
+    names = [p.name for p in tmp_path.glob("genesis_*nudge_*")]
+    assert len(names) == 4 and all(len(n.encode()) <= 255 for n in names)
+
+
+def test_a_short_session_id_keeps_its_readable_sentinel_name(tmp_path):
+    assert _nudge(tmp_path, "camoufox", sid="s1")
+    assert (tmp_path / "genesis_stealth_nudge_s1").exists()
+    assert (tmp_path / "genesis_browser_safety_nudge_s1").exists()
 
 
 def test_no_session_id_never_persists_a_shared_sentinel(tmp_path):

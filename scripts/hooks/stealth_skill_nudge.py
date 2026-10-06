@@ -7,6 +7,11 @@ Safety gates of the browser-automation skill. On Camoufox, the default
 stealth layer, it also points at the stealth-browser skill for anti-detection
 behaviour.
 
+The safety pointer fires on any non-empty navigate response, failures
+included: an error carries no layer, but a navigate that fails after the page
+opened leaves that page usable. A failure before any page opened spends it too,
+which is harmless because the text still reaches the session.
+
 Each pointer fires once per session (its own sentinel file), so a session that
 starts on Chromium and later moves to Camoufox still gets the stealth pointer.
 With no usable session id the pointers repeat on every navigate instead.
@@ -16,6 +21,7 @@ Never blocks (exit 0 always). Advisory only.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -46,8 +52,23 @@ _STEALTH_NUDGE = (
 
 
 def _session_sentinel_path(sid: str, prefix: str = _SENTINEL_PREFIX) -> str:
-    """Path to a sentinel file that tracks whether we've nudged this session."""
-    return os.path.join(tempfile.gettempdir(), f"{prefix}{sid}")
+    """Path to a sentinel file that tracks whether we've nudged this session.
+
+    session_id() accepts ids up to 255 bytes, so prefix + id can overflow one
+    filename component; open() would then fail and the pointer would repeat on
+    every navigate. An id that does not fit is replaced by its SHA-256, which
+    is fixed-length and still distinct per session. Ids that fit keep their
+    readable name.
+    """
+    tmp = tempfile.gettempdir()
+    try:
+        name_max = os.pathconf(tmp, "PC_NAME_MAX")
+    except (OSError, ValueError):
+        name_max = 255
+    name = f"{prefix}{sid}"
+    if len(name.encode()) > name_max:
+        name = f"{prefix}{hashlib.sha256(sid.encode()).hexdigest()}"
+    return os.path.join(tmp, name)
 
 
 def _claim(sid: str, prefix: str) -> bool:
@@ -79,9 +100,12 @@ def main() -> int:
         if not result:
             return 0
 
+        # A navigate that fails after the page opened returns an error dict
+        # with no layer, yet the page stays usable (browser_fill types into
+        # it). The safety pointer does not depend on the layer, so it fires on
+        # any response; the stealth pointer needs the layer, so a failed
+        # navigate leaves it unspent for the next successful one.
         layer = result.get("layer", "")
-        if not layer:
-            return 0  # a failed navigate (error dict) carries no layer
 
         parts = []
         if _claim(sid, _SAFETY_SENTINEL_PREFIX):

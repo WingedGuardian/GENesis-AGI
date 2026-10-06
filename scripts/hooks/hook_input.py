@@ -117,8 +117,8 @@ def tool_response(payload: dict) -> dict:
             return resp
         # MCP tools deliver their result as a JSON STRING, not an object
         # (measured: the session observer's json.dumps of an MCP tool
-        # result is a quoted string). Reading only dicts made every
-        # MCP-triggered PostToolUse hook see {} and never fire.
+        # result is a quoted string). Reading only dicts made PostToolUse
+        # hooks that read an MCP result through this helper see {}.
         return _loads(resp) if isinstance(resp, str) else {}
     return _loads(os.environ.get(_LEGACY_RESULT_ENV, ""))
 
