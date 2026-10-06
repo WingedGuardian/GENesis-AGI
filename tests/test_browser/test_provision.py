@@ -11,6 +11,8 @@ No test downloads or launches anything: subprocess steps are stubbed.
 
 from __future__ import annotations
 
+import contextlib
+import importlib.metadata
 import json
 import os
 import signal
@@ -27,6 +29,7 @@ from genesis.browser import engine, provision
 
 _REAL_BROWSERS_RUNNING = provision.browsers_running
 _REAL_RUN_GROUP = provision._run_group
+_REAL_INSTALLED_VERSIONS = provision.installed_versions
 PIN = engine.CamoufoxPin("156.0.1", "beta.34", "official")
 
 
@@ -175,6 +178,7 @@ def test_engine_unfit_for_the_new_packages_restores_them(stack, tmp_path, monkey
             "pip",
             "install",
             "--quiet",
+            "--no-deps",
             "camoufox==0.4.11",
             "playwright==1.58.0",
         ],
@@ -204,18 +208,84 @@ def test_restore_includes_patchright_when_it_was_installed(stack, tmp_path, monk
     _tx(tmp_path).run()
     assert run.pip_calls()[0][-3:] == [
         "camoufox==0.4.11",
-        "playwright==1.58.0",
         "patchright==1.58.0",
+        "playwright==1.58.0",
     ]
 
 
-def test_failure_with_no_previous_camoufox_does_not_call_pip(stack, tmp_path, monkeypatch):
-    _versions(monkeypatch, {}, NEW)
+def test_failure_with_no_previous_camoufox_still_restores_the_rest(stack, tmp_path, monkeypatch):
+    """Review finding (#2951, #2952, #2953, #2956): with no camoufox before the
+    run, the restore returned early, leaving an upgraded playwright and an added
+    patchright (with no Chromium) behind a failed transaction."""
+    _versions(monkeypatch, {"playwright": "1.58.0"}, NEW)
     run = FakeRun()
     monkeypatch.setattr(subprocess, "run", run)
     outcome = _tx(tmp_path, install=True).run()
-    assert run.pip_calls() == []
+    assert run.pip_calls() == [
+        [sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", "playwright==1.58.0"],
+        [sys.executable, "-m", "pip", "uninstall", "--yes", "--quiet", "camoufox", "patchright"],
+    ]
     assert "engine=False" in outcome
+
+
+def test_restore_covers_the_dependency_closure(stack, tmp_path, monkeypatch):
+    """Codex P1 (#2951): the extra moves transitive dependencies too; restoring
+    only the three top-level pins left them upgraded or added."""
+    _legacy_engine(stack)
+    _versions(
+        monkeypatch,
+        {**OLD, "greenlet": "3.0.3", "pyee": "11.0.0"},
+        {**NEW, "greenlet": "3.1.1", "browserforge": "1.2.3"},
+    )
+    run = FakeRun()
+    monkeypatch.setattr(subprocess, "run", run)
+    _tx(tmp_path, install=True).run()
+    install, uninstall = run.pip_calls()
+    assert install[-4:] == [
+        "camoufox==0.4.11",
+        "greenlet==3.0.3",
+        "playwright==1.58.0",
+        "pyee==11.0.0",
+    ]
+    assert "--no-deps" in install
+    assert uninstall[-2:] == ["browserforge", "patchright"]
+
+
+def test_a_name_kept_out_of_the_restore_is_never_uninstalled(stack, tmp_path, monkeypatch):
+    """Review finding on this slice: an editable or unreadable dist is recorded
+    without a version; if it turns up readable after the run it is NOT 'added'."""
+    _legacy_engine(stack)
+    _versions(monkeypatch, {**OLD, "genesis-v3": None}, {**OLD, "genesis-v3": "3.0.0b18"})
+    run = FakeRun()
+    monkeypatch.setattr(subprocess, "run", run)
+    _tx(tmp_path, install=True).run()
+    assert not [arg for c in run.pip_calls() for arg in c if arg.startswith("genesis-v3")]
+
+
+def test_a_rollback_reinstalls_genesis_when_it_stopped_importing(stack, tmp_path, monkeypatch):
+    """Review finding on this slice: pip reinstalls the editable Genesis on every
+    run, so an interrupted install can leave it unimportable; the restore checks
+    it and puts it back from the checkout."""
+    _legacy_engine(stack)
+    _versions(monkeypatch, OLD, NEW)
+    run = FakeRun(fail=[lambda cmd: cmd[1:2] == ["-c"] and "genesis.runtime" in cmd[2]])
+    monkeypatch.setattr(subprocess, "run", run)
+    _tx(tmp_path, install=True).run()
+    installs = [c for c, _ in run.calls if c[0] == "bash"]
+    assert [c[-1] for c in installs] == ["browser", ""], "the extra, then Genesis alone"
+    assert "editable_install_guarded" in installs[1][2]
+
+
+def test_installed_versions_is_the_whole_venv_but_not_editables():
+    """The snapshot is every index-installed distribution; an editable or URL
+    install (Genesis itself) cannot be put back by name==version, so it is
+    recorded without a version rather than 'restored' from an index."""
+    found = _REAL_INSTALLED_VERSIONS()
+    assert "pytest" in found and found["pytest"] == importlib.metadata.version("pytest")
+    for dist in importlib.metadata.distributions():
+        if dist.read_text("direct_url.json"):
+            name = provision._canonical(dist.metadata["Name"])
+            assert name in found and found[name] is None
 
 
 def test_unchanged_packages_are_not_reinstalled(stack, tmp_path, monkeypatch):
@@ -500,6 +570,96 @@ def test_browsers_running_without_pgrep_is_unknown(monkeypatch):
     assert _REAL_BROWSERS_RUNNING() is None
 
 
+def test_chromium_running_sees_a_legacy_headless_shell(monkeypatch):
+    """Codex P1 (#2951): older Playwright names its shell `headless_shell`,
+    which the lock module already treats as a browser; the preflight did not."""
+    monkeypatch.undo()
+    monkeypatch.setattr(subprocess, "run", _fake_pgrep({"headless_shell": (0, "55\n")}))
+    monkeypatch.setattr(
+        provision.os,
+        "readlink",
+        lambda path: "/home/u/.cache/ms-playwright/chromium-1100/chrome-linux/headless_shell",
+    )
+    assert provision.chromium_running() is True
+
+
+def _driver_exe() -> str:
+    return "/venv/lib/python3.12/site-packages/playwright/driver/node"
+
+
+@pytest.mark.parametrize(
+    "exe, expected",
+    [(_driver_exe(), True), ("/usr/bin/node", False)],
+)
+def test_a_live_playwright_driver_blocks_the_upgrade(monkeypatch, exe, expected):
+    """Codex P1 (#2951): a remote-CDP or TinyFish session holds no stack lock
+    but runs this venv's Playwright Node driver, which the install replaces."""
+    monkeypatch.undo()
+    monkeypatch.setattr(subprocess, "run", _fake_pgrep({"node": (0, "66\n")}))
+    monkeypatch.setattr(provision.os, "readlink", lambda path: exe)
+    monkeypatch.setattr(
+        provision,
+        "_driver_dirs",
+        lambda: ["/venv/lib/python3.12/site-packages/playwright/driver/"],
+    )
+    assert _REAL_BROWSERS_RUNNING() is expected
+
+
+def test_driver_dirs_are_the_packages_own(tmp_path, monkeypatch):
+    pkg = tmp_path / "site-packages" / "playwright"
+    pkg.mkdir(parents=True)
+    specs = {"playwright": SimpleNamespace(submodule_search_locations=[str(pkg)])}
+    monkeypatch.setattr(provision.importlib.util, "find_spec", lambda name: specs.get(name))
+    assert provision._driver_dirs() == [str(pkg.resolve() / "driver") + os.sep]
+
+
+def test_a_signal_while_a_step_starts_still_stops_it(tmp_path, monkeypatch):
+    """Review finding on this slice: an interrupt raised inside Popen's own
+    construction escaped before the step was held, so nothing stopped it and
+    the rollback could start a second pip beside it."""
+    pidfile = tmp_path / "pid"
+    real_popen = subprocess.Popen
+
+    def popen_hit_by_sigterm(*a, **k):
+        proc = real_popen(*a, **k)
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(0.5)  # the handler runs here, before Popen has returned
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", popen_hit_by_sigterm)
+
+    def handler(signum, _frame):
+        # The transaction's handler; before the fix it raised unconditionally.
+        raise_interrupt = getattr(provision, "_raise_interrupt", None)
+        if raise_interrupt is None:
+            raise provision.ProvisionError("interrupted by signal SIGTERM")
+        raise_interrupt(signum)
+
+    previous = signal.signal(signal.SIGTERM, handler)
+    try:
+        with pytest.raises(provision.ProvisionError, match="SIGTERM"):
+            _REAL_RUN_GROUP(["bash", "-c", _TREE, "_", str(pidfile)])
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    deadline = time.monotonic() + 5
+    while not pidfile.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _alive(int(pidfile.read_text()))
+
+
+def test_a_disk_probe_error_is_a_reported_skip(cache, tmp_path, monkeypatch):
+    """Devin (#2951): an OSError from the free-space probe escaped before
+    _finish, so the capability was never refreshed and no outcome line printed."""
+
+    def unreadable(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(provision.shutil, "disk_usage", unreadable)
+    outcome = _tx(tmp_path, install=True).run()
+    assert outcome.startswith("browser stack: SKIPPED")
+    assert "Permission denied" in outcome
+
+
 def test_preflight_skips_when_running_is_unknown(monkeypatch):
     monkeypatch.setattr(provision, "MIN_FREE_BYTES", 0)
     monkeypatch.setattr(provision, "browsers_running", lambda: None)
@@ -681,6 +841,30 @@ def test_run_group_says_when_the_group_survived(tmp_path, monkeypatch):
     with pytest.raises(provision.StepSurvived) as caught:
         _REAL_RUN_GROUP(["bash", "-c", _TREE, "_", str(pidfile)], timeout=0.5)
     assert isinstance(caught.value.__cause__, subprocess.TimeoutExpired)
+
+
+def test_run_group_does_not_wait_for_a_leader_that_survived(tmp_path, monkeypatch):
+    """Devin + Codex (#2951, #2952, #2953): `with Popen` waits for the leader
+    with no timeout on the way out, so a leader that outlived SIGKILL hung the
+    provisioner while it held the lock. The leader here is left alive on
+    purpose (the stub reports it survived without killing it)."""
+    leaders = []
+
+    def survived(proc):
+        leaders.append(proc.pid)
+        return False
+
+    monkeypatch.setattr(provision, "_kill_group", survived)
+    started = time.monotonic()
+    try:
+        with pytest.raises(provision.StepSurvived):
+            _REAL_RUN_GROUP(["sleep", "8"], timeout=0.5, capture_output=True, text=True)
+        assert time.monotonic() - started < 4, "it waited for the surviving leader"
+    finally:
+        for pid in leaders:
+            assert pid > 1 and pid != os.getpgrp()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(pid, signal.SIGKILL)
 
 
 def test_no_rollback_while_a_step_survives(stack, tmp_path, monkeypatch, capsys):
