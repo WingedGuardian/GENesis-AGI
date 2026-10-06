@@ -24,7 +24,10 @@ Why this exists (the fail-BLOCK the former inline range hit):
   PR-authored secret there would escape the gate. A value the PR *introduces*
   always lives in a commit reachable from HEAD but not from main, so it is always
   in ``merge-base..HEAD``; the deliberate add-then-remove-within-a-PR detection is
-  preserved (all PR-own commits stay in range; ``--no-merges`` walks each).
+  preserved (all PR-own commits stay in range and each commit's patch is read).
+  A merge commit is read as its ``--remerge-diff``: only what its conflict
+  resolution added beyond git's own automatic merge, so a value introduced while
+  resolving a conflict is scanned and main's content merged in cleanly is not.
 
 Branch pushes (``LEAK_SCAN_RANGE=branch``, set only by
 ``.github/workflows/branch-leak-scan.yml``) use the same merge-base anchor, so
@@ -32,7 +35,8 @@ every non-main branch is scanned the moment it is pushed, PR or not. A push to
 main keeps ``before..after``.
 
 CONTRACT:
-  stdout  the added ('^+') lines across the range's non-merge commit patches
+  stdout  the added ('^+') lines across the range's commit patches (a merge
+          commit contributes its --remerge-diff: its conflict resolution only)
           (kept verbatim, INCLUDING '+++ b/path' headers — repo-relative paths
           never match an install value, and a '+++' filter once dropped added
           content beginning '++')
@@ -127,7 +131,7 @@ def resolve_scan_spec(
 ) -> tuple[str, str]:
     """Return the scan spec as ``(kind, value)``.
 
-    ``("range", "A..B")`` → scan ``git log -p --no-merges A..B``.
+    ``("range", "A..B")`` → scan ``git log -p --remerge-diff A..B``.
     ``("range", "HEAD")`` → scan every commit reachable from HEAD (orphan branch).
     ``("show", "<sha>")`` → scan a single commit's patch (new branch fallback).
     ``branch_push`` (set by the branch-leak-scan workflow via
@@ -162,18 +166,26 @@ def resolve_scan_spec(
     return ("show", head_sha or "HEAD")
 
 
-def added_lines(spec: tuple[str, str], cwd: str | None = None) -> str:
-    """Stream the '^+' lines for a scan spec. Raises :class:`RangeError` on git failure.
+#: How each spec kind becomes a patch stream. ``--remerge-diff`` shows a merge
+#: commit as the difference between git's own automatic merge and the recorded
+#: result, so a conflict resolution's additions are read while content a clean
+#: merge brings in from main is not (MEASURED, git 2.43: a resolution's value
+#: appears, a clean merge adds nothing). A non-merge commit shows its ordinary
+#: patch. Needs git 2.36 or later; an older git exits nonzero, which fails closed.
+_PATCH_ARGS = {
+    "range": ["log", "-p", "--remerge-diff", "--format=commit %H"],
+    "show": ["show", "--remerge-diff", "--format=commit %H"],
+}
 
-    Reads git output as BYTES, splits on ``b"\\n"`` only (git's LF patch
-    delimiter — NOT ``str.splitlines()``), keeps '+'-prefixed lines, and decodes
-    each with ``errors="replace"``. Streaming bounds memory to the added content.
+
+def _patch_stream(spec: tuple[str, str], cwd: str | None):
+    """Yield the raw patch lines (bytes, LF stripped) for a scan spec.
+
+    Raises :class:`RangeError` when git fails.
     """
     kind, value = spec
-    args = ["git", "log", "-p", "--no-merges", value] if kind == "range" else ["git", "show", value]
-
     proc = subprocess.Popen(
-        args,
+        ["git", *_PATCH_ARGS[kind], value],
         cwd=cwd,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -182,25 +194,81 @@ def added_lines(spec: tuple[str, str], cwd: str | None = None) -> str:
     if stdout is None:  # pragma: no cover - PIPE always yields a stream
         proc.wait()
         raise RangeError(f"git {kind} {value!r} produced no stdout stream")
-    kept: list[str] = []
     try:
         # Binary iteration splits on b"\n" ONLY (git's delimiter) — it does not
         # break on U+0085/U+2028 the way str.splitlines() would.
         for raw in stdout:
-            if raw.startswith(b"+"):
-                kept.append(raw.rstrip(b"\n").decode("utf-8", errors="replace"))
+            yield raw.rstrip(b"\n")
     finally:
         stdout.close()
         rc = proc.wait()
     if rc != 0:
         raise RangeError(f"git {kind} {value!r} failed (rc={rc})")
-    return "\n".join(kept)
+
+
+def _path_from_header(raw: bytes) -> str:
+    """The new-side path of a ``+++ b/<path>`` header ('' for /dev/null).
+
+    A path git had to quote (``"b/a\\tb"``) keeps its quoting minus the outer
+    quotes and prefix; callers that scope by path then see a name no scope
+    excludes, so an odd path is over-scanned, never skipped.
+    """
+    name = raw[4:].decode("utf-8", errors="replace")
+    if name == "/dev/null":
+        return ""
+    if name.startswith('"') and name.endswith('"'):
+        name = name[1:-1]
+    return name[2:] if name.startswith("b/") else name
+
+
+def added_lines_with_paths(spec: tuple[str, str], cwd: str | None = None) -> list[str]:
+    """Each added line in the range as ``<path>:<commit12>:<content>``.
+
+    For the history half of the email scan, which scopes by path and reports
+    ``path:commit`` locations. A ``+++`` line is a file header only before the
+    first hunk of its ``diff --git`` section, so added content that itself
+    begins ``++`` is kept as content.
+    """
+    out: list[str] = []
+    commit = path = ""
+    in_header = False
+    for raw in _patch_stream(spec, cwd):
+        if raw.startswith(b"commit ") and not in_header:
+            commit = raw[7:19].decode("ascii", errors="replace")
+        elif raw.startswith(b"diff --git ") or raw.startswith(b"diff --cc "):
+            in_header = True
+            path = ""
+        elif in_header and raw.startswith(b"+++ "):
+            path = _path_from_header(raw)
+        elif raw.startswith(b"@@"):
+            in_header = False
+        elif not in_header and raw.startswith(b"+") and path:
+            out.append(f"{path}:{commit}:{raw[1:].decode('utf-8', errors='replace')}")
+    return out
+
+
+def added_lines(spec: tuple[str, str], cwd: str | None = None) -> str:
+    """Stream the '^+' lines for a scan spec. Raises :class:`RangeError` on git failure.
+
+    Reads git output as BYTES, splits on ``b"\\n"`` only (git's LF patch
+    delimiter — NOT ``str.splitlines()``), keeps '+'-prefixed lines, and decodes
+    each with ``errors="replace"``. Streaming bounds memory to the added content.
+    """
+    return "\n".join(
+        raw.decode("utf-8", errors="replace")
+        for raw in _patch_stream(spec, cwd)
+        if raw.startswith(b"+")
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     # --range prints the git revision range instead of the added lines, for the
     # gitleaks history step: one range definition for both scans.
-    print_range = "--range" in (sys.argv[1:] if argv is None else argv)
+    # --with-paths prints each added line as path:commit:content, for the history
+    # half of the email scan, which scopes by path.
+    args = sys.argv[1:] if argv is None else argv
+    print_range = "--range" in args
+    with_paths = "--with-paths" in args
     event_name = os.environ.get("EVENT_NAME", "")
     push_before = os.environ.get("PUSH_BEFORE", "")
     head_sha = os.environ.get("HEAD_SHA", "")
@@ -227,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
             # `X^!` is git's "commit X alone", the history form of `git show X`.
             print(value if kind == "range" else f"{value}^!")
             return EXIT_OK
-        out = added_lines(spec)
+        out = "\n".join(added_lines_with_paths(spec)) if with_paths else added_lines(spec)
     except RangeError as exc:
         print(
             f"::error::leak scan range unresolvable — {exc}. Failing closed.",

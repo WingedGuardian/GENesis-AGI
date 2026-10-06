@@ -167,7 +167,10 @@ def test_script_keeps_pins_checksum_and_redact():
     )
     assert "sha256sum -c -" in text
     assert re.search(r'"\$gl" detect --no-git --redact -c \.gitleaks\.toml', text)
-    assert re.search(r'"\$gl" git --redact -c \.gitleaks\.toml --log-opts="\$range"', text)
+    # --remerge-diff: a merge's conflict resolution is read, not skipped.
+    assert re.search(
+        r'"\$gl" git --redact -c \.gitleaks\.toml --log-opts="--remerge-diff \$range"', text
+    )
     # Every gitleaks invocation redacts: these logs are public.
     calls = re.findall(r'"\$gl" (?:detect|git) [^\n]*', text)
     assert len(calls) == 2 and all("--redact" in c for c in calls)
@@ -213,3 +216,113 @@ def test_class_scan_names_the_place_never_the_value(tmp_path: Path):
     assert cp.returncode == 0, "the class scan is advisory"
     assert "::warning::class match at ./src/b.py:1" in cp.stdout
     assert "somebody" not in cp.stdout + cp.stderr
+
+
+def test_branch_email_and_binary_steps_read_the_branch_history():
+    """Codex P1/P2 (round 2): both steps read only the tip. On a branch push
+    they now also read the branch range, so they must carry it."""
+    steps = _load(_BRANCH)["jobs"]["branch-leak-scan"]["steps"]
+    for sub in ("email", "binary"):
+        (step,) = [s for s in steps if str(s.get("run", "")).endswith(f"leak_scan.sh {sub}")]
+        assert step["env"]["LEAK_SCAN_RANGE"] == "branch", sub
+        assert step["env"]["EVENT_NAME"] == "${{ github.event_name }}", sub
+
+
+def test_ci_email_and_binary_steps_stay_tip_only():
+    steps = _load(_CI)["jobs"]["leak-detector"]["steps"]
+    for sub in ("email", "binary"):
+        (step,) = [s for s in steps if str(s.get("run", "")).endswith(f"leak_scan.sh {sub}")]
+        assert "LEAK_SCAN_RANGE" not in (step.get("env") or {}), sub
+
+
+_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "ci@example.com",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "ci@example.com",
+    "GIT_CONFIG_NOSYSTEM": "1",
+}
+
+
+def _history_repo(tmp_path: Path) -> Path:
+    """A git repo holding the two scripts at a main commit, plus a branch whose
+    first commit adds content its second commit deletes, so the tip is clean."""
+    import os
+
+    root = tmp_path / "h"
+    (root / "scripts" / "ci").mkdir(parents=True)
+    shutil.copy(_SCRIPT, root / "scripts" / "ci" / "leak_scan.sh")
+    shutil.copy(_ROOT / "scripts" / "ci" / "leak_scan_added_lines.py", root / "scripts" / "ci")
+    env = {**os.environ, **_GIT_ENV, "HOME": str(root)}
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=root, env=env, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    git("add", "-A")
+    git("commit", "-q", "-m", "main")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    git("checkout", "-q", "-b", "feature")
+    (root / "src").mkdir()
+    (root / "src" / "a.py").write_text('OWNER = "someone@personal-domain.org"\n', encoding="utf-8")
+    (root / "tests").mkdir()
+    (root / "tests" / "t.py").write_text('X = "fixture@personal-domain.org"\n', encoding="utf-8")
+    (root / "data.db").write_bytes(b"SQLite format 3\x00")
+    git("add", "-A")
+    git("commit", "-q", "-m", "add")
+    git("rm", "-q", "src/a.py", "data.db")
+    git("commit", "-q", "-m", "remove")
+    return root
+
+
+def _run_step(root: Path, step: str, *, branch: bool) -> subprocess.CompletedProcess:
+    import os
+
+    env = {**os.environ, **_GIT_ENV, "HOME": str(root), "EVENT_NAME": "push"}
+    env.pop("LEAK_SCAN_RANGE", None)
+    if branch:
+        env["LEAK_SCAN_RANGE"] = "branch"
+    return subprocess.run(
+        ["bash", str(root / "scripts" / "ci" / "leak_scan.sh"), step],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_email_scan_reads_the_branch_history(tmp_path: Path):
+    """An address added and removed inside the branch is public in its history.
+    The tip half misses it (control); the branch range catches it, names the
+    file and commit, never the address, and still skips tests/."""
+    root = _history_repo(tmp_path)
+    tip_only = _run_step(root, "email", branch=False)
+    assert tip_only.returncode == 0, tip_only.stdout + tip_only.stderr
+    cp = _run_step(root, "email", branch=True)
+    assert cp.returncode == 1, cp.stdout + cp.stderr
+    assert re.search(r"^src/a\.py:[0-9a-f]{12}$", cp.stdout, re.M)
+    assert "tests/t.py" not in cp.stdout
+    assert "personal-domain" not in cp.stdout + cp.stderr
+
+
+def test_binary_scan_reads_the_branch_history(tmp_path: Path):
+    """A database added and deleted inside the branch stays downloadable from
+    its history. The tip half misses it (control); the branch range catches it."""
+    root = _history_repo(tmp_path)
+    tip_only = _run_step(root, "binary", branch=False)
+    assert tip_only.returncode == 0, tip_only.stdout + tip_only.stderr
+    cp = _run_step(root, "binary", branch=True)
+    assert cp.returncode == 1, cp.stdout + cp.stderr
+    assert "data.db" in cp.stdout
+
+
+def test_history_steps_fail_closed_without_a_range(tmp_path: Path):
+    """No origin/main to anchor the range: both history halves refuse (exit 3)
+    rather than reporting a clean scan of nothing."""
+    root = _history_repo(tmp_path)
+    subprocess.run(["git", "update-ref", "-d", "refs/remotes/origin/main"], cwd=root, check=True)
+    for step in ("email", "binary"):
+        cp = _run_step(root, step, branch=True)
+        assert cp.returncode == 3, (step, cp.stdout + cp.stderr)

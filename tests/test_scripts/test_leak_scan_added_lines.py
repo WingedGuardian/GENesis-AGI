@@ -538,3 +538,92 @@ def test_range_mode_still_fails_closed(tmp_path: Path, monkeypatch, capsys):
     monkeypatch.setenv("LEAK_SCAN_RANGE", "branch")
     assert lsa.main(["--range"]) == lsa.EXIT_UNRESOLVABLE
     assert capsys.readouterr().out == ""
+
+
+# --- Merge commits: a conflict resolution's additions are scanned ------------
+
+
+def _resolved_merge_repo(tmp_path: Path) -> dict:
+    """main and a branch edit the same line; the branch merges main and its
+    conflict resolution introduces PR_ADDED. main also adds a file the merge
+    brings in cleanly, carrying MAIN_SECRET."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    a = _commit(repo, "f.txt", "a\nb\nc\n", "A")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _commit(repo, "f.txt", "a\nFEAT\nc\n", "branch edit")
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, "f.txt", "a\nMAIN\nc\n", "main edit")
+    d = _commit(repo, "m.txt", f"{MAIN_SECRET}\n", "main adds a file")
+    _set_origin_main(repo, d)
+    _git(repo, "checkout", "-q", "feature")
+    subprocess.run(
+        ["git", "merge", "-q", "main"],
+        cwd=repo,
+        capture_output=True,
+        env={
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "ci@example.com",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "ci@example.com",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "HOME": str(repo),
+        },
+    )
+    (repo / "f.txt").write_text(f"a\n{PR_ADDED}\nc\n", encoding="utf-8")
+    _git(repo, "add", "f.txt")
+    _git(repo, "commit", "-q", "--no-edit")
+    return {"repo": repo, "A": a, "D": d, "tip": _git(repo, "rev-parse", "HEAD")}
+
+
+def test_a_merge_resolution_value_is_scanned(tmp_path: Path):
+    """Codex P1 (round 2): `--no-merges` skipped every merge commit, so a value
+    introduced while resolving a conflict was never read. The control proves
+    the old command misses it; the scan now reads it."""
+    r = _resolved_merge_repo(tmp_path)
+    repo = str(r["repo"])
+    spec = lsa.resolve_scan_spec("push", "0" * 40, r["tip"], cwd=repo, branch_push=True)
+    control = _git(r["repo"], "log", "-p", "--no-merges", spec[1])
+    assert PR_ADDED not in control
+    assert PR_ADDED in lsa.added_lines(spec, cwd=repo)
+
+
+def test_a_clean_merge_does_not_rescan_main(tmp_path: Path):
+    """What a merge brings in from main without a conflict is main's content,
+    scanned by main's own run; the remerge diff of the merge does not repeat it."""
+    r = _resolved_merge_repo(tmp_path)
+    repo = str(r["repo"])
+    spec = lsa.resolve_scan_spec("push", "0" * 40, r["tip"], cwd=repo, branch_push=True)
+    assert MAIN_SECRET not in lsa.added_lines(spec, cwd=repo)
+
+
+def test_with_paths_names_the_file_and_commit(tmp_path: Path):
+    """--with-paths emits path:commit12:content for every added line, a merge
+    resolution included, and keeps added content that itself starts with '++'."""
+    r = _branch_repo(tmp_path)
+    _commit(r["repo"], "plus.txt", "++ not a header\n", "E plus")
+    repo = str(r["repo"])
+    spec = lsa.resolve_scan_spec("push", "0" * 40, "HEAD", cwd=repo, branch_push=True)
+    rows = lsa.added_lines_with_paths(spec, cwd=repo)
+    first = _git(r["repo"], "rev-list", "--reverse", f"{r['A']}..HEAD").splitlines()[0]
+    assert f"first.txt:{first[:12]}:{PR_ADDED}" in rows
+    assert any(row.startswith("plus.txt:") and row.endswith(":++ not a header") for row in rows)
+
+    (tmp_path / "m").mkdir()
+    m = _resolved_merge_repo(tmp_path / "m")
+    mrepo = str(m["repo"])
+    mspec = lsa.resolve_scan_spec("push", "0" * 40, m["tip"], cwd=mrepo, branch_push=True)
+    assert f"f.txt:{m['tip'][:12]}:{PR_ADDED}" in lsa.added_lines_with_paths(mspec, cwd=mrepo)
+
+
+def test_with_paths_mode_from_the_command_line(tmp_path: Path, monkeypatch, capsys):
+    r = _branch_repo(tmp_path)
+    monkeypatch.chdir(r["repo"])
+    monkeypatch.setenv("EVENT_NAME", "push")
+    monkeypatch.setenv("LEAK_SCAN_RANGE", "branch")
+    monkeypatch.setenv("HEAD_SHA", r["tip"])
+    assert lsa.main(["--with-paths"]) == lsa.EXIT_OK
+    out = capsys.readouterr().out
+    assert f":{PR_ADDED}" in out
+    assert all(line.count(":") >= 2 for line in out.splitlines() if line)

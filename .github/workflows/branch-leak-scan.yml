@@ -28,6 +28,16 @@ name: Branch leak scan
 # GitHub's server-side secret scanning and push protection, not a boundary
 # against a pusher who removes it.
 #
+# Known limit: the range is merge-base(origin/main, HEAD)..HEAD, read when the
+# run starts. If the branch's own commits reach main before the run does, the
+# range is empty. A pull request cannot do that here: the repository allows
+# squash merges only (allow_merge_commit and allow_rebase_merge are false,
+# read from the repository settings 2026-10-06), so a squash creates a new
+# commit and the branch's commits never become reachable from main. Only a
+# direct push to main that bypasses the rulesets could. ci.yml's push run then
+# scans that push's added lines for the private patterns (before..after) and
+# the tip for everything else, but not its history with gitleaks.
+#
 # No `concurrency` group, on purpose: every push gets its own complete run.
 # Cancelling an older run is NOT safe for a security scan. A force-push can
 # rewrite the commits a cancelled run was scanning out of the branch, so the
@@ -72,7 +82,8 @@ jobs:
       - name: Leak scan of the branch history (gitleaks)
         # The tree scan above reads only the tip; this one reads every commit
         # the branch carries that main lacks, so a secret added and then
-        # removed inside the branch is still caught.
+        # removed inside the branch is still caught. A merge commit is read as
+        # its conflict resolution (leak_scan.sh, --remerge-diff).
         env:
           EVENT_NAME: ${{ github.event_name }}
           HEAD_SHA: ${{ github.sha }}
@@ -82,10 +93,23 @@ jobs:
       - name: Class scan (advisory — non-gating)
         run: bash scripts/ci/leak_scan.sh class
 
-      - name: Email scan
+      - name: Email scan (tip and branch history)
+        # With the branch range set, the step also reads every line the
+        # branch's commits added, so an address added and then removed before
+        # the push is caught.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.sha }}
+          LEAK_SCAN_RANGE: branch
         run: bash scripts/ci/leak_scan.sh email
 
-      - name: Binary/data artifact scan
+      - name: Binary/data artifact scan (tip and branch history)
+        # With the branch range set, the step also lists every artifact path
+        # any branch commit added, so one deleted before the push is caught.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.sha }}
+          LEAK_SCAN_RANGE: branch
         run: bash scripts/ci/leak_scan.sh binary
 
       - name: Private-pattern exact scan (hard gate)

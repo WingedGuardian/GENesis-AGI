@@ -16,8 +16,10 @@
 #   gitleaks         whole-tree gitleaks scan (version + checksum pinned, --redact)
 #   gitleaks-history gitleaks over every commit in the scan range (branch pushes)
 #   class            advisory class scan (never gating)
-#   email            personal-email scan
-#   binary           tracked binary/data artifact scan
+#   email            personal-email scan (tip; plus the branch's history on a
+#                    branch push)
+#   binary           tracked binary/data artifact scan (tip; plus every commit
+#                    in the branch's history on a branch push)
 #   private          private-pattern exact scan of ADDED lines (hard gate)
 #
 # Each step exits nonzero on a finding (except `class`, which is advisory).
@@ -111,7 +113,11 @@ step_gitleaks_history() {
     echo "::error::gitleaks history: empty scan range. Failing closed."
     exit 3
   fi
-  "$gl" git --redact -c .gitleaks.toml --log-opts="$range" .
+  # --remerge-diff: a merge commit is read as what its conflict resolution
+  # added, so a value introduced while resolving is scanned (MEASURED with
+  # gitleaks 8.22.1: the plain range misses it, this catches it, and a clean
+  # merge of main adds nothing).
+  "$gl" git --redact -c .gitleaks.toml --log-opts="--remerge-diff $range" .
   echo "Leak scan (gitleaks history, $range): CLEAN"
 }
 
@@ -151,27 +157,51 @@ step_class() {
   fi
 }
 
+# The address pattern and its allowlist, shared by the tip and history halves of
+# the email scan so the two cannot drift.
+EMAIL_RE='[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+
+_email_allowlist() {
+  # stdin: "path:location:content" lines; stdout: the ones not allowlisted.
+  grep -vE '(^|[^a-zA-Z0-9._+-])(noreply|no-reply)@' | \
+    grep -vE 'backup@genesis\.local\b' | \
+    grep -vE 'feedback@anthropic\.com\b' | \
+    grep -vE 'support@anthropic\.com\b' | \
+    grep -vE '@(example|example\.com|example\.org|localhost|test|invalid)\b' | \
+    grep -vE '@(claude|github|gitlab|sentry|grafana|slack|discord)\.com\b' | \
+    grep -vE 'user@[0-9]+\.service'
+}
+
 step_email() {
-  local hits
+  local hits hist_lines hist_hits
   hits=$(
     rg -n --hidden \
       --glob '!**/.git/**' \
       --glob '!**/tests/**' \
       --glob '!**/readme-legacy.md' \
       --glob '!**/vendor/**' \
-      -e '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' \
-      src/ config/ scripts/ .github/ 2>/dev/null | \
-    grep -vE '(^|[^a-zA-Z0-9._+-])(noreply|no-reply)@' | \
-    grep -vE 'backup@genesis\.local\b' | \
-    grep -vE 'feedback@anthropic\.com\b' | \
-    grep -vE 'support@anthropic\.com\b' | \
-    grep -vE '@(example|example\.com|example\.org|localhost|test|invalid)\b' | \
-    grep -vE '@(claude|github|gitlab|sentry|grafana|slack|discord)\.com\b' | \
-    grep -vE 'user@[0-9]+\.service' \
-      || true
+      -e "$EMAIL_RE" \
+      src/ config/ scripts/ .github/ 2>/dev/null | _email_allowlist || true
   )
+  if [[ "${LEAK_SCAN_RANGE-}" == "branch" ]]; then
+    # A branch push publishes its whole history, so an address added and then
+    # removed before the push is still public. Read every line the branch's
+    # commits added, in the same paths the tip scan covers.
+    if ! hist_lines="$(python3 scripts/ci/leak_scan_added_lines.py --with-paths)"; then
+      echo "::error::email history scan: the branch range could not be read. Failing closed."
+      exit 3
+    fi
+    hist_hits=$(
+      printf '%s\n' "$hist_lines" | \
+        grep -E '^(src|config|scripts|\.github)/' | \
+        grep -vE '^([^:]*/)?(tests|vendor)/|^([^:]*/)?readme-legacy\.md:' | \
+        grep -E "$EMAIL_RE" | _email_allowlist || true
+    )
+    hits="$(printf '%s\n%s\n' "$hits" "$hist_hits" | grep -v '^$' || true)"
+  fi
   if [[ -n "$hits" ]]; then
-    # path:line only: these logs are public, so the address is never printed.
+    # path:line (tip) or path:commit (history) only: these logs are public, so
+    # the address is never printed.
     echo "::error::Email scan found $(printf '%s\n' "$hits" | wc -l) personal email address(es) at:"
     printf '%s\n' "$hits" | cut -d: -f1,2
     exit 1
@@ -195,6 +225,24 @@ step_binary() {
   data_allow=()
   hits=$(git ls-files -z -- "${data_globs[@]}" "${data_allow[@]}" 2>/dev/null \
          | tr '\0' '\n' || true)
+  if [[ "${LEAK_SCAN_RANGE-}" == "branch" ]]; then
+    # A branch push publishes every commit, so an artifact added and deleted
+    # before the push is still downloadable. List each such path any commit in
+    # the branch range added; a merge counts through its conflict resolution,
+    # as in the other history scans, and renames are split into delete + add
+    # so a renamed-in artifact is seen too.
+    local range hist
+    if ! range="$(python3 scripts/ci/leak_scan_added_lines.py --range)" || [[ -z "$range" ]]; then
+      echo "::error::binary history scan: the branch range could not be read. Failing closed."
+      exit 3
+    fi
+    if ! hist="$(git log --remerge-diff --no-renames --diff-filter=A --name-only --format= \
+                 "$range" -- "${data_globs[@]}" "${data_allow[@]}")"; then
+      echo "::error::binary history scan: git log failed over $range. Failing closed."
+      exit 3
+    fi
+    hits="$(printf '%s\n%s\n' "$hits" "$hist" | grep -v '^$' | sort -u || true)"
+  fi
   if [[ -n "$hits" ]]; then
     echo "::error::Binary/data artifacts must never be committed (voiceprints, audio, databases, models):"
     printf '%s\n' "$hits"

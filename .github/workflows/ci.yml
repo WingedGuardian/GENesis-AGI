@@ -984,4 +984,12 @@ jobs:
         #   test_collectors_falkordb.py           new -> 23   (+23)
         #   test_falkordb_module.py               new -> 35   (+35)
         # No added skips. Floor: 24332 + 89 = 24421; skip ceiling remains 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24421
+        # Branch leak scan (#2880), --collect-only after the last test-adding
+        # edit:
+        #   test_leak_scan_added_lines.py      14 -> 33   (+19)
+        #   test_branch_leak_scan_workflow.py new -> 19   (+19)
+        # Floor: 24421 + 38 = 24459. Ceiling 102 -> 104: two of the new
+        # workflow tests run the tip half of leak_scan.sh's email and class
+        # steps, which call ripgrep, and this job does not install it, so they
+        # skip here by design (MEASURED: the run at 3b14708f1 skipped 104).
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 24459
