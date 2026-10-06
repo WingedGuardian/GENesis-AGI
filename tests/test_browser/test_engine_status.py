@@ -17,11 +17,16 @@ from genesis.browser import engine
 from genesis.browser.engine import camoufox_engine_status
 
 
-def _pkg(tmp_path: Path, pin: dict | None) -> Path:
+def _pkg(tmp_path: Path, pin: dict | None, *, multiversion: bool | None = None) -> Path:
+    """A camoufox package directory. Every 0.5 release ships multiversion.py and
+    no 0.4 release does; ``multiversion`` defaults to "a pin was given", the
+    0.4 / 0.5.7+ shapes. Pass it explicitly for a pinless 0.5 (0.5.3 to 0.5.6)."""
     pkg = tmp_path / "site" / "camoufox"
     pkg.mkdir(parents=True)
     if pin is not None:
         (pkg / "browser-pin.json").write_text(json.dumps(pin))
+    if multiversion if multiversion is not None else pin is not None:
+        (pkg / "multiversion.py").write_text("")
     return pkg
 
 
@@ -250,6 +255,63 @@ def test_active_version_alone_is_not_an_override(tmp_path, monkeypatch):
         json.dumps({"active_version": "browsers/official/156.0.1-beta.34-09effb44"})
     )
     assert camoufox_engine_status(install_dir=root).ready
+
+
+# ── One row per camoufox release family ──────────────────────────────────────
+# From the wheels of every release 0.4.1 to 0.5.8b1: no 0.4 package has
+# multiversion.py, every 0.5 package has it (its camoufox_path imports
+# COMPAT_FLAG from it), and browser-pin.json exists only from 0.5.7b1. So
+# 0.5.3 to 0.5.6 use the side-by-side layout with no pin.
+_FAMILIES = {
+    "0.4.1-0.4.11": {"pin": None, "multiversion": False},
+    "0.5.3-0.5.6": {"pin": None, "multiversion": True},
+    "0.5.7b1-0.5.8b1": {"pin": PIN, "multiversion": True},
+    "0.5 dev checkout": {"pin": {}, "multiversion": True},
+}
+
+
+@pytest.mark.parametrize(
+    ("family", "layout", "expected"),
+    [
+        ("0.4.1-0.4.11", "root", engine.READY),
+        ("0.4.1-0.4.11", "side_by_side", engine.NOT_INSTALLED),
+        ("0.5.3-0.5.6", "side_by_side", engine.READY),
+        ("0.5.3-0.5.6", "root", engine.LEGACY_LAYOUT),
+        ("0.5.7b1-0.5.8b1", "side_by_side", engine.READY),
+        ("0.5.7b1-0.5.8b1", "root", engine.LEGACY_LAYOUT),
+        ("0.5 dev checkout", "side_by_side", engine.READY),
+        ("0.5 dev checkout", "root", engine.LEGACY_LAYOUT),
+    ],
+)
+def test_status_per_release_family(tmp_path, family, layout, expected):
+    """The layout follows the package generation, never the pin: a pinless 0.5.6
+    over a side-by-side engine launches it, and over a root engine it deletes it."""
+    pkg = _pkg(tmp_path, **_FAMILIES[family])
+    if layout == "root":
+        root = want = _engine(tmp_path / "cache", "135.0.1", "beta.24")
+    else:
+        root = _flagged_root(tmp_path)
+        want = _engine(
+            root / "browsers" / "official" / "156.0.1-beta.34-abcd1234", "156.0.1", "beta.34"
+        )
+    status = camoufox_engine_status(install_dir=root, package_dir=pkg)
+    assert status.state == expected, status.detail
+    assert status.path == (want if expected == engine.READY else None)
+
+
+def test_engine_without_a_firefox_version_is_still_an_engine(tmp_path):
+    """camoufox reads ``version`` with .get in every release, so list_installed
+    keeps such an engine and get_active_path can select it; so must this."""
+    pkg = _pkg(tmp_path, **_FAMILIES["0.5.3-0.5.6"])
+    root = _flagged_root(tmp_path)
+    want = root / "browsers" / "official" / "beta.34"
+    want.mkdir(parents=True)
+    (want / "version.json").write_text(json.dumps({"release": "beta.34"}))
+    (want / "camoufox-bin").write_text("#!/bin/sh\n")
+    (want / "camoufox-bin").chmod(0o755)
+    status = camoufox_engine_status(install_dir=root, package_dir=pkg)
+    assert status.state == engine.READY, status.detail
+    assert status.path == want
 
 
 # ── Mirroring camoufox's own engine selection ────────────────────────────────

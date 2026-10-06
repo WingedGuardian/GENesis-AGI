@@ -64,7 +64,7 @@ _CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "voice_wyoming": "Wyoming STT+TTS servers — audio transport for HA voice pipeline (:10300/:10301)",
     "voice_s2s": "Speech-to-speech session manager — GPT-Realtime/Gemini Live voice front-end with Genesis tool calling",
     "campaigns": "Campaign subsystem — persistent, scheduled, LLM-driven operations with strategy docs, pre-checks, and autonomous session dispatch",
-    "browser_automation": "Camoufox browser engine installed (browser_* tools). Degraded = package or pinned engine missing, or an engine camoufox would replace by downloading; the logged reason says what to install.",
+    "browser_automation": "Camoufox browser engine installed (browser_* tools). Degraded = package missing, the engine camoufox would select missing, or an engine camoufox would replace by downloading; the logged reason says what to install.",
     "office_deliverables": "OfficeCLI (iOfficeAI) — high-fidelity .xlsx/.pptx/.docx renderer for the deliverable-builder skill; degrades to pandoc/CSV when the binary is absent. Optional external tool, provisioned by bootstrap.sh into ~/.genesis/deps/officecli/.",
 }
 

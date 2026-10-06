@@ -554,8 +554,10 @@ async def _ensure_browser():
         _acquire_stack_lock()  # raises BrowserStackBusy mid-upgrade
         try:
             # Refuse BEFORE camoufox runs: its launch path deletes a pre-0.5 engine
-            # directory and downloads the pinned build from inside this call, raced
+            # directory and downloads a build from inside this call, raced
             # by every session's MCP process. Provisioning is never a tool call's job.
+            # This covers the ENGINE only: camoufox can still fetch its default
+            # addons, and from 0.5.7 its fingerprint model, when those are missing.
             from genesis.browser.engine import camoufox_engine_status
 
             engine = camoufox_engine_status()

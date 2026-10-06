@@ -12,12 +12,13 @@ camoufox, never writes, never touches the network. It is the one check used by
 the ``browser_automation`` capability probe and by the Camoufox launch guard,
 so the two cannot disagree.
 
-Layouts it understands:
-  * camoufox < 0.5 (no ``browser-pin.json`` in the package): one engine at the
-    install root, ``<install>/version.json``.
+Layouts it understands, told apart as camoufox does, by the package's own code
+(``multiversion.py``, which every 0.5 release ships and no 0.4 release does):
+  * camoufox < 0.5: one engine at the install root, ``<install>/version.json``.
   * camoufox >= 0.5: ``<install>/.0.5_FLAG`` marks the side-by-side layout and
     engines live at ``<install>/browsers/<repo>/<version>-<build>[-sha8]/``.
-    The package's ``browser-pin.json`` names the build it was released with.
+    From 0.5.7 the package's ``browser-pin.json`` names the build it was
+    released with; 0.5.3 to 0.5.6 have no pin and resolve as unpinned.
 
 For 0.5 it mirrors camoufox's own resolution (multiversion.get_active_path, then
 pkgman.camoufox_path's supported-range check), so READY means camoufox would
@@ -128,8 +129,9 @@ class CamoufoxPin(NamedTuple):
 def camoufox_pin(package_dir: Path | None = None) -> CamoufoxPin | None:
     """The pin the installed package pairs with, or None.
 
-    None means a pre-0.5 package (no pin file) or an unpinned development copy;
-    callers distinguish the two by whether the file exists. Mirrors camoufox's
+    None means a package with no pin: any 0.4 release, 0.5.3 to 0.5.6, or a
+    development copy. It says nothing about the layout; :func:`_status` reads
+    that from the package code. Mirrors camoufox's
     browser_pin.load_pin: a pin without a ``tag`` is no pin (that is how the
     ``{}`` of a development checkout reads), and the repo is part of it.
     """
@@ -170,16 +172,16 @@ def _engine_ids(version_json: Path) -> tuple[str, str] | None:
     """``(version, build)`` recorded in an engine's version.json.
 
     camoufox's pkgman.Version.from_path reads the build from ``release``, else
-    ``tag``, else ``build``; so does this.
+    ``tag``, else ``build``; so does this. Like it, a missing ``version`` still
+    names an engine (every release reads it with ``.get``): it is ``""`` here.
     """
     data = _read_json(version_json)
     if not data:
         return None
-    version = data.get("version")
     build = data.get("release") or data.get("tag") or data.get("build")
-    if not version or not build:
+    if not build:
         return None
-    return str(version), str(build)
+    return str(data.get("version") or ""), str(build)
 
 
 # camoufox's supported engine range lives in the INSTALLED package's
@@ -354,6 +356,16 @@ def _has_executable(engine_dir: Path) -> bool:
     return exe.is_file() and os.access(exe, os.X_OK)
 
 
+def _is_multiversion_package(pkg: Path) -> bool:
+    """Whether the package uses the 0.5 side-by-side layout.
+
+    camoufox's own switch is the code it ships: every 0.5 release has
+    multiversion.py, whose COMPAT_FLAG its camoufox_path checks, and no 0.4
+    release has it. browser-pin.json is NOT the switch: 0.5.3 to 0.5.6 have none.
+    """
+    return any((pkg / f"multiversion{ext}").is_file() for ext in (".py", ".pyc"))
+
+
 def camoufox_engine_status(
     *,
     install_dir: Path | None = None,
@@ -371,10 +383,9 @@ def _status(install_dir: Path | None, package_dir: Path | None) -> EngineStatus:
     if pkg is None:
         return EngineStatus(NO_PACKAGE, f"camoufox is not installed; {PROVISION_HINT}")
     root = install_dir if install_dir is not None else camoufox_install_dir()
-    pin_file_present = (pkg / "browser-pin.json").is_file()
     limits = _package_constraints(pkg)
 
-    if not pin_file_present:
+    if not _is_multiversion_package(pkg):
         # camoufox < 0.5: a single engine at the install root.
         ids = _engine_ids(root / "version.json")
         if not ids or not _has_executable(root):
@@ -435,9 +446,9 @@ def _status(install_dir: Path | None, package_dir: Path | None) -> EngineStatus:
             )
         what = f"Camoufox {pin.version}-{pin.build}"
     else:
-        # Unpinned development copy: get_active_path's own order. config.json's
-        # active engine if it exists, else (unless a channel or pin is chosen)
-        # the first installed one.
+        # Unpinned (0.5.3 to 0.5.6, or a development copy): get_active_path's
+        # own order. config.json's active engine if it exists, else (unless a
+        # channel or pin is chosen) the first installed one.
         chosen = None
         active = config.get("active_version")
         if isinstance(active, str) and active:
@@ -458,13 +469,15 @@ def _status(install_dir: Path | None, package_dir: Path | None) -> EngineStatus:
             f"(a truncated extraction?); {PROVISION_HINT}",
         )
     # pkgman.camoufox_path launches the selected engine only when its build is
-    # supported; otherwise it fetches another.
+    # supported; otherwise it fetches another (0.5.6+) or fails (0.5.3 to 0.5.5).
+    # The playwright floor is camoufox's own only from 0.5.6; below that it is
+    # Genesis's, and the engine would launch and then fail to open a page.
     unsupported = _unsupported_reason(chosen.build, limits)
     if unsupported:
         return EngineStatus(
             NOT_INSTALLED,
-            f"camoufox would fetch a new engine: {chosen.repo_name}/{chosen.spec} is not "
-            f"usable because {unsupported}; {PROVISION_HINT}",
+            f"engine {chosen.repo_name}/{chosen.spec} is not usable because "
+            f"{unsupported}; {PROVISION_HINT}",
         )
     return EngineStatus(READY, what + _unread(limits), chosen.path)
 
