@@ -126,31 +126,46 @@ class RosterEntry:
     validated: str | None = None
 
 
-def _load_yaml(path: Path) -> dict:
+def _load_yaml(path: Path, *, strict: bool = False) -> dict:
     if not path.is_file():
+        if strict:
+            raise RosterError(f"Roster configuration is missing or unreadable: {path}")
         return {}
     try:
         data = yaml.safe_load(path.read_text())
     except Exception:
+        if strict:
+            raise RosterError(f"Cannot load roster configuration {path}") from None
         logger.warning("Failed to read roster config %s", path, exc_info=True)
         return {}
     if not isinstance(data, dict):
+        if strict:
+            raise RosterError(f"Roster configuration {path} must be a mapping")
         if data is not None:
             logger.warning("Roster config %s is not a mapping — ignoring", path)
         return {}
     return data
 
 
-def load_roster(config_dir: Path | None = None) -> dict:
+def load_roster(config_dir: Path | None = None, *, strict: bool = False) -> dict:
     """Return the merged roster config (base file + ``.local`` overlay).
 
     The overlay is resolved user-dir-first (``~/.genesis/config/``, where the
     ``cc_roster`` settings writer lands) via the shared ``merge_local_overlay``
     helper, so the settings domain actually controls the active model
     (cfg-001: loaders and writers must agree on overlay location).
+    ``strict=True`` is foreground opt-in: invalid configuration raises rather
+    than discarding a billing preference. Existing automated callers are unchanged.
     """
     cfg_dir = config_dir or _CONFIG_DIR
     base_path = cfg_dir / _ROSTER_FILE
+    if strict:
+        from genesis._config_overlay import ConfigOverlayError
+
+        try:
+            return merge_local_overlay(_load_yaml(base_path, strict=True), base_path, strict=True)
+        except ConfigOverlayError as exc:
+            raise RosterError(str(exc)) from None
     return merge_local_overlay(_load_yaml(base_path), base_path)
 
 

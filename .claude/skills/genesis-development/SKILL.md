@@ -3467,6 +3467,31 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   daily timer and never deletes them (archive retention is off, #2504). Leave a dead worktree alone.
 - **Editing a tracked git hook blocks the commit** until its hash is re-recorded
   (`scripts/update_hook_versions.sh`).
+- **The primary checkout is the deployed install; a guard keeps hand edits out
+  of it — two different ways.** `scripts/hooks/main_checkout_guard.py`
+  (foreground and dispatched alike) REFUSES a Write/Edit/MultiEdit/NotebookEdit of
+  a TRACKED file in the primary checkout its own script lives in. Bash it never
+  refuses: it snapshots the deploy root's tracked state before the command
+  (PreToolUse, keyed by `tool_use_id`) and compares after it (PostToolUse and
+  PostToolUseFailure), and if a tracked file newly differs, an already-dirty one
+  changed again, or HEAD moved, the session gets an advisory naming the files —
+  with a restore command only when the call was aimed at the deploy root (its
+  cwd, or the root's path in the command) and no merge is in progress, and never
+  an instruction to move HEAD. An earlier version predicted what a shell command would
+  write from its own model of cp/mv/install, the shell and git; an audit measured
+  that model wrong in both directions, so it was removed rather than patched — the
+  "could a flag you've never heard of change the verdict?" test above, applied.
+  The Bash check reports after the fact: it prevents nothing, a file written and
+  run by the same command has already run, and anything else that changed the
+  deploy root during the command (a concurrent deploy) is reported too. Make the
+  change in a worktree from `origin/main` and open a PR; if the advisory fires,
+  restore the deploy root with the command it names. Untracked files, linked
+  worktrees, other repositories and the deploy scripts' `EPHEMERAL_DIRTY_RE`
+  paths are never reported. Sessions carrying `GENESIS_UPDATE_TIER=1` (exactly)
+  — the dashboard update pipeline's — are exempt. Off-switches belong to the
+  owner: `GENESIS_MAIN_CHECKOUT_GUARD=0`, or the `main_checkout_guard` settings
+  domain, whose overlay is read only from `${GENESIS_HOME:-~/.genesis}/config/`,
+  never from the checkout.
 - **⚠ `scripts/hooks/*` is NOT synced — and a WORKTREE edit is still not live.**
   `sync-hooks.sh` copies only the five GIT hooks (`commit-msg`, `post-commit`,
   `pre-commit`, `prepare-commit-msg`, `pre-push`) plus one helper into
@@ -3718,7 +3743,7 @@ Merged-but-undeployable-elsewhere is a bug. The standard paths:
 
 | Change type | Deploy path |
 |---|---|
-| Runtime code | `scripts/deploy_code_only.sh`, or `update.sh` for dependency, unit or host changes. Modes: `deploy` (the default: a locked pull + restart that queues behind update.sh and validation holds, refuses a dirty tree or a venv that does not match the pyproject, and stands the Guardian and watchdog down); `pull` (the same pull, no restart: it reports every change the running server has not loaded, and the next step); `restart`; `status`. Launch `deploy` and `restart` DETACHED as a transient unit (`systemd-run --user`, the command is in the script's header): a session's background job dies with the session (#2101). **Validators sample, they don't chase:** deploys need not be 1:1 with merges. Validate `main` at a cadence, and on a failure bisect the merged range; per-PR CI already covers per-merge granularity. Validating against the live server? Hold `flock -s -w 7200 "${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock" <cmd>`, and deploy BEFORE taking the hold. The hold stops locked deploys, NOT every restarter (the watchdog, the dashboard's service routes, Guardian recovery) and not a bare `git pull`, so bracket the run and let the script judge it: keep the `bracket:` token `scripts/deploy_code_only.sh status` prints at the start (from a worktree it reports the main checkout), and run `scripts/deploy_code_only.sh status --verify <token>` at the end; exit 0 is a valid run. A token exists only when the server's boot commit is known, HEAD's runtime files (`src/`, `config/`, `pyproject.toml`, and the scripts it keeps imported, `_RUNTIME_RELOAD_SCRIPTS` in `scripts/lib/deploy_status.sh`) are the ones it booted from and were at every commit HEAD held since the boot (after a `pull` of code, even one a later commit undid: restart first — the server imports lazily, so the detour's modules stay loaded), and nothing there is edited outside git; otherwise it reads `unknown (<why>)`, which no token matches. It covers a restart (boot commit, MainPID, systemd invocation id) and an edit to an ignored override such as a `config/*.local.yaml` or to a user overlay in `~/.genesis/config`, and a change at HEAD to a script the server runs afresh (`_RUNTIME_FRESH_SCRIPTS`: voids the token, needs no restart); HEAD may move over docs, or hooks and scripts the server never runs. It is a tripwire, not a certificate: it cannot see, and reads valid through, a change to the venv's installed packages, the other files the server reads from `~/.genesis/config` (only the `*.local.yaml` overlays are fingerprinted), an edit undone without moving HEAD (a stash and its pop included), and a rewritten or backdated reflog. A daemon your command leaves behind keeps holding the lock, and overlapping holds can starve a waiting deploy (flock grants a late shared request ahead of a queued exclusive one) |
+| Runtime code | `scripts/deploy_code_only.sh`, or `update.sh` for dependency, unit or host changes. Modes: `deploy` (the default: a locked pull + restart that queues behind update.sh and validation holds, refuses a dirty tree or a venv that does not match the pyproject, and stands the Guardian and watchdog down); `deploy` and `restart` also refuse while the server is running work a restart would cancel, naming each item: what the server itself reports at `GET /api/genesis/inflight` (internal bearer; every Claude invocation, plus a dispatched session's or CLI reflection's whole life, from before its Claude process starts until its result is delivered; NOT the short tail other subsystems run after their call returns, such as a chat turn delivering its reply: #2917), and any live Claude process below the server. They proceed only with `--allow-killing <item,…|all>` using the items the refusal prints (`<pid>@<start>` or a reported id); a server too old to answer (404) gets the process check alone, and any other failure to ask refuses unless `all` — a session the server launched must hand the restart off rather than override (launched detached, the script cannot tell it is one of them); `update.sh` does NOT refuse, and its restarts end those sessions too; `pull` (the same pull, no restart: it reports every change the running server has not loaded, and the next step); `restart`; `status`. Launch `deploy` and `restart` DETACHED as a transient unit (`systemd-run --user`, the command is in the script's header): a session's background job dies with the session (#2101). **Validators sample, they don't chase:** deploys need not be 1:1 with merges. Validate `main` at a cadence, and on a failure bisect the merged range; per-PR CI already covers per-merge granularity. Validating against the live server? Hold `flock -s -w 7200 "${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock" <cmd>`, and deploy BEFORE taking the hold. The hold stops locked deploys, NOT every restarter (the watchdog, the dashboard's service routes, Guardian recovery) and not a bare `git pull`, so bracket the run and let the script judge it: keep the `bracket:` token `scripts/deploy_code_only.sh status` prints at the start (from a worktree it reports the main checkout), and run `scripts/deploy_code_only.sh status --verify <token>` at the end; exit 0 is a valid run. A token exists only when the server's boot commit is known, HEAD's runtime files (`src/`, `config/`, `pyproject.toml`, and the scripts it keeps imported, `_RUNTIME_RELOAD_SCRIPTS` in `scripts/lib/deploy_status.sh`) are the ones it booted from and were at every commit HEAD held since the boot (after a `pull` of code, even one a later commit undid: restart first — the server imports lazily, so the detour's modules stay loaded), and nothing there is edited outside git; otherwise it reads `unknown (<why>)`, which no token matches. It covers a restart (boot commit, MainPID, systemd invocation id) and an edit to an ignored override such as a `config/*.local.yaml` or to a user overlay in `~/.genesis/config`, and a change at HEAD to a script the server runs afresh (`_RUNTIME_FRESH_SCRIPTS`: voids the token, needs no restart); HEAD may move over docs, or hooks and scripts the server never runs. It is a tripwire, not a certificate: it cannot see, and reads valid through, a change to the venv's installed packages, the other files the server reads from `~/.genesis/config` (only the `*.local.yaml` overlays are fingerprinted), an edit undone without moving HEAD (a stash and its pop included), and a rewritten or backdated reflog. A daemon your command leaves behind keeps holding the lock, and overlapping holds can starve a waiting deploy (flock grants a late shared request ahead of a queued exclusive one) |
 | DB schema | additive idempotent migration — applies at restart |
 | One-off data fix / backfill | data-migration framework (post-boot, idempotent) — NEVER a hand-run script only this install executed |
 | **Naming either migration** | **UTC timestamp id: `` `date -u +%Y%m%d%H%M%S` ``_description.py** (data migrations prefix a `d`). NEVER hand-pick the next number — the legacy 4-digit namespace is FROZEN and CI refuses a new one. An id you have to CHOOSE is an id two branches choose identically: measured 2026-09-03, one PR was renumbered twice in a day and four open PRs held live collisions, while a duplicate prefix aborts bootstrap on every install. Nobody allocates a timestamp. |
@@ -4097,7 +4122,16 @@ REST endpoint, matched nothing, and reported "Codex clean" while P2s sat unread)
 When all gates pass it prints the exact atomic merge command to copy
 (`... --match-head-commit <verified-head>`); use that command verbatim.
 
-`git_push_guard.py` enforces a **hard gate** at merge time. Beyond the review
+`git_push_guard.py` enforces a **hard gate** at merge time. The gate reads only
+the `gh pr merge` spelling, so the guard refuses a pull-request merge spelled
+through the GitHub API instead: a non-GET to REST `pulls/N/merge` or
+`merge-async`, a GraphQL `mergePullRequest` / `enablePullRequestAutoMerge` /
+`enqueuePullRequest` mutation. It is a closed set: a `gh api` call that names a
+merge passes only when it is a plain read (one literal endpoint, read-only flags),
+and a GraphQL query or PUT endpoint it cannot read is refused too. The refusal
+names the gated command. The recogniser is `scripts/hooks/gh_merge.py` (#2768);
+it is a tripwire for ordinary spellings, not the boundary, which is server-side.
+Only the bare `gh pr merge --help` skips the merge arm. Beyond the review
 findings below, a gated `gh pr merge`:
 - must carry `--admin` (explicit approval flag) and be bound to the reviewed head
   via `--match-head-commit` (GitHub rejects it server-side if the head moved —

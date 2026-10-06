@@ -343,9 +343,30 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 691a10d44 2026-10-03
+verified: 6aae986bb 2026-10-04
 ```
 
+- **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
+  `cc/gmodel_settings.py`): Kimi K3 and MiMo V2.6 Pro select subscription, native
+  API or OpenRouter from the isolated `gmodel.models` catalog. Auto recomputes at
+  launch/resume and prints why it passed over a cheaper route; provider errors
+  never switch billing routes. The chosen route (endpoint, bearer credential,
+  model slots, context, effort, compaction/thinking switches) is pinned in the
+  child environment AND an owner-only `--settings` file, which outranks user,
+  project and local settings across mid-session reloads and `/cd` (except a
+  `maxEffortLevel` cap, where the lowest file wins; the launcher warns). Managed
+  settings outrank it and are a documented residual, not checked. Pass-through
+  arguments follow a fixed grammar (`gmodel <name> [--route R] [claude args]`)
+  and are refused or read as headless by whole token. The model holds until
+  `/model`, which keeps the endpoint and key; the OpenRouter route's launch
+  notice says a Claude ID there bills per token, and Kimi routes say Alt+T
+  drops thinking (on the subscription, K2.8 Preview); `--effort` and
+  `--autocompact` are announced as outranked by the pins. Catalog loading is strict for
+  catalog members only, and selection validates only the requested entry;
+  native tiers never load the catalog, and a flat roster peer never fails on it
+  (a strict failure falls back to the lenient roster path). Published endpoints remain
+  unverified until live acceptance; these entries never join the automated
+  failover roster.
 - **Replay-unsafe CC outcomes do not enter full-tools recovery, failover or
   durable parking.** Stream truncation and overloads with known-work or MCP
   evidence share this boundary; provider diagnosis remains available as a
@@ -3196,7 +3217,12 @@ verified: b0867170e 2026-10-02
   encrypted `scripts/backup.sh` timer).
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
   `process_lock` (the reason bare `python -m genesis serve` blocks systemd),
-  tmp discipline (`~/tmp` for large temp — never override TMPDIR).
+  tmp discipline (`~/tmp` for large temp — never override TMPDIR),
+  `inflight` (the process-local registry of work a restart would cancel:
+  every `CCInvoker` call, plus a dispatched session's and a CLI reflection's
+  whole life; served at `GET /api/genesis/inflight` for
+  `scripts/deploy_code_only.sh`'s restart refusal; a subsystem's own work after
+  its invocation returns is not covered — #2917).
 - **env.py**: 3-tier resolution (env var → `~/.genesis/config/genesis.yaml` →
   default). **`update_in_progress()` is load-bearing**: the watchdog defers
   restarts during deploys (mid-deploy revival deadlocks bootstrap); fails open

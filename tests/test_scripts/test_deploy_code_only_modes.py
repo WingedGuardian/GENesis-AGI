@@ -103,6 +103,7 @@ _SCRIPT_FILES = (
     "lib/port_owned_by.py",
     "lib/manifest_delta.py",
     "lib/serving_commit.py",
+    "lib/server_sessions.py",
     "lib/venv_matches_pyproject.py",
 )
 

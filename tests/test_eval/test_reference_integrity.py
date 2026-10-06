@@ -167,6 +167,28 @@ async def test_generator_draft_to_human_reference_calibration_e2e(tmp_path, monk
     grade.assert_not_called()
 
 
+async def test_generator_rejects_dangling_symlink_before_database_or_grading(tmp_path, monkeypatch):
+    import genesis.eval.reflection_golden_set as generator
+
+    output = tmp_path / "draft.jsonl"
+    output.symlink_to(tmp_path / "missing-target.jsonl")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("an occupied destination must be rejected before database work")
+
+    sample = AsyncMock()
+    grade = AsyncMock()
+    monkeypatch.setattr(generator.aiosqlite, "connect", forbidden)
+    monkeypatch.setattr(generator, "_sample_observations", sample)
+    monkeypatch.setattr(generator, "_grade_observation", grade)
+
+    with pytest.raises(FileExistsError, match="refusing to overwrite reference file"):
+        await generator.generate_golden_set(1, output)
+
+    sample.assert_not_awaited()
+    grade.assert_not_awaited()
+
+
 async def test_cli_preflight_rejects_legacy_file_before_router_allocation(tmp_path, monkeypatch):
     import genesis.eval.run_reflection_calibration as cli
 
