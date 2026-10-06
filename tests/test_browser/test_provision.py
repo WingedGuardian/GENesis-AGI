@@ -36,6 +36,7 @@ from genesis.browser import chromium, engine, provision
 _REAL_BROWSERS_RUNNING = provision.browsers_running
 _REAL_RUN_GROUP = provision._run_group
 _REAL_INSTALLED_VERSIONS = provision.installed_versions
+_REAL_EXTRA_ALREADY_SATISFIED = provision.extra_already_satisfied
 PIN = engine.CamoufoxPin("156.0.1", "beta.34", "official")
 
 
@@ -55,6 +56,8 @@ def _isolated(tmp_path, monkeypatch):
     # No real package metadata: by default nothing was installed before the run,
     # so nothing is ever reinstalled unless a test says otherwise.
     monkeypatch.setattr(provision, "installed_versions", lambda: {})
+    # The install step runs unless a test says the extra is already met.
+    monkeypatch.setattr(provision, "extra_already_satisfied", lambda _root: False)
     # Steps run through _run_group; route it through subprocess.run (looked up at
     # call time) so each test's FakeRun stands in for the step. _run_group itself
     # is tested against real processes below.
@@ -734,6 +737,26 @@ def test_failed_restore_is_reported_not_raised(stack, tmp_path, monkeypatch, cap
     outcome = _tx(tmp_path).run()
     assert "FAILED to restore the previous browser packages" in capsys.readouterr().out
     assert "engine=False" in outcome
+
+
+def test_an_already_satisfied_extra_runs_no_pip(tmp_path, monkeypatch):
+    """Review finding on #2956: update.sh now runs the step on every update,
+    with the server up; when the extra is already satisfied there is nothing
+    for pip to do, and reinstalling the editable Genesis there opens a window
+    where new processes cannot import it."""
+    unmet = []
+    monkeypatch.setattr(provision, "unmet_browser_requirements", lambda _p: unmet)
+    monkeypatch.setattr(provision, "camoufox_pin", lambda: PIN)
+    monkeypatch.setattr(provision, "extra_already_satisfied", _REAL_EXTRA_ALREADY_SATISFIED)
+    ran = []
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **k: ran.append(cmd))
+    _tx(tmp_path, install=True).install_extras()
+    assert ran == []
+    unmet.append("patchright<1.63,>=1.62.1 (not installed)")
+    assert provision.extra_already_satisfied(tmp_path) is False
+    monkeypatch.setattr(provision, "camoufox_pin", lambda: None)
+    unmet.clear()
+    assert provision.extra_already_satisfied(tmp_path) is False
 
 
 def test_extras_that_do_not_import_fail_the_install(tmp_path, monkeypatch):

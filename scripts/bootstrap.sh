@@ -1344,8 +1344,8 @@ if [ "${GENESIS_BROWSER_STACK_DEFERRED:-0}" = "1" ] || [ "${GENESIS_BOOTSTRAP_AL
     echo "  deferred: update.sh runs it once the update is recorded done"
     if [ "${GENESIS_BROWSER_STACK_DEFERRED:-0}" != "1" ]; then
         # Only the previous update.sh omits the flag (see above).
-        echo "  (this update.sh predates the step: the next update that applies commits"
-        echo "   runs it; until then the installed browser keeps working; or run scripts/install_browser_stack.sh)"
+        echo "  (this update.sh predates the step: the next run of scripts/update.sh, even with"
+        echo "   nothing new, runs it; until then the installed browser keeps working; or run scripts/install_browser_stack.sh)"
     fi
 else
     bash "$GENESIS_ROOT/scripts/install_browser_stack.sh" 2>&1 | sed 's/^/  /' \

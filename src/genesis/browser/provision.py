@@ -227,6 +227,18 @@ def unmet_browser_requirements(pyproject: Path) -> list[str]:
     return unmet
 
 
+def extra_already_satisfied(repo_root: Path) -> bool:
+    """Whether the installed packages already satisfy the ``browser`` extra
+    (and camoufox carries its browser pin), so the install step has nothing
+    to do. Any doubt reads as "not satisfied": the install then runs."""
+    try:
+        return camoufox_pin() is not None and not unmet_browser_requirements(
+            repo_root / "pyproject.toml"
+        )
+    except Exception:  # noqa: BLE001 - an unreadable pyproject means: install
+        return False
+
+
 # ── preflight ─────────────────────────────────────────────────────────────
 
 
@@ -751,6 +763,13 @@ class Transaction:
 
     def install_extras(self) -> None:
         if not self.install:
+            return
+        # update.sh runs this step on every update, with the server up: when
+        # the extra is already satisfied there is nothing for pip to do, and
+        # its reinstall of the editable Genesis would only open a window in
+        # which a newly started process cannot import it.
+        if extra_already_satisfied(self.repo_root):
+            _say("browser packages already match the [browser] extra; no pip run")
             return
         proc = self._guarded_install("browser")
         if proc.returncode != 0:

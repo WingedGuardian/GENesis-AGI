@@ -31,12 +31,30 @@ def test_the_script_never_fails_its_caller_without_a_venv(tmp_path):
     assert proc.stdout.splitlines()[-1].strip().startswith("browser stack: SKIPPED")
 
 
+_STEP_CALL = "\n    _run_browser_stack_step\n"
+
+
 def test_update_runs_the_step_after_the_update_is_recorded_done():
     text = (_SCRIPTS / "update.sh").read_text()
-    bootstrap_call = text.index('GENESIS_BROWSER_STACK_DEFERRED=1 "$GENESIS_ROOT/scripts/bootstrap.sh"')
+    bootstrap_call = text.index(
+        'GENESIS_BROWSER_STACK_DEFERRED=1 "$GENESIS_ROOT/scripts/bootstrap.sh"'
+    )
     done = text.index('_write_state "done"')
-    step = text.index('bash "$GENESIS_ROOT/scripts/install_browser_stack.sh"')
+    step = text.index("\n_run_browser_stack_step\n", done)
+    assert text.index("_run_browser_stack_step() {") < done, "defined before use"
     assert bootstrap_call < done < step
+
+
+def test_an_update_with_no_new_commit_still_runs_the_step():
+    """Codex (#2956): the already-up-to-date path exits early, so a step that
+    was skipped or degraded (a browser open, low disk, a failed download) was
+    never retried by re-running the update."""
+    text = (_SCRIPTS / "update.sh").read_text()
+    start = text.index('echo "  Already up to date ($NEW_COMMIT)."')
+    end = text.index('echo "  Nothing to do."', start)
+    block = text[start:end]
+    # After the deploy state is cleared: the watchdog guards the server again.
+    assert block.index("_clear_deploy_state") < block.index(_STEP_CALL)
 
 
 def _bootstrap_block() -> str:
@@ -88,9 +106,81 @@ def test_install_runs_the_step_and_warns_from_its_outcome_line():
         re.M,
     )
     warn = re.search(
-        r"^\s*if ! tail -n 1 \"\$_bs_log\" \| grep -q 'browser stack: ready'; then\n"
+        r"^\s*if ! tail -n 1 \"\$_bs_log\" \| grep -q 'Camoufox usable'; then\n"
         r"\s*setup_warn ",
         text,
         re.M,
     )
     assert call and warn and call.start() < warn.start()
+
+
+def _install_block() -> str:
+    text = (_SCRIPTS / "install.sh").read_text()
+    start = text.index('            mkdir -p "$HOME/tmp"\n            _bs_log=')
+    end = text.index('            rm -f "$_bs_log"\n', start) + len(
+        '            rm -f "$_bs_log"\n'
+    )
+    return text[start:end]
+
+
+@pytest.mark.parametrize(
+    "outcome, warns",
+    [
+        (
+            "browser stack: ready (engine=True, chromium=True, launch=True); Camoufox usable: x",
+            False,
+        ),
+        # No X display during install.sh (only bootstrap sets VNC up): the
+        # Chromium fallback is not the primary layer and must not fail strict CI.
+        (
+            "browser stack: DEGRADED (engine=True, chromium=False, launch=True); Camoufox usable: x",
+            False,
+        ),
+        (
+            "browser stack: DEGRADED (engine=False, chromium=False, launch=False); Camoufox DOWN until this is re-run: x",
+            True,
+        ),
+        ("browser stack: SKIPPED (a browser is running); Camoufox usable: x", False),
+    ],
+)
+def test_install_warns_only_when_camoufox_is_not_usable(tmp_path, outcome, warns):
+    """Review finding on this slice: install.sh has no display step, so the
+    headed Chromium check always reads DEGRADED there, and strict CI turned the
+    resulting warning into a failed install."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "install_browser_stack.sh").write_text(f"echo '{outcome}'\n")
+    script = (
+        "set -euo pipefail\n"
+        'setup_warn() { echo "WARNED: $1"; }\n'
+        f'SCRIPT_DIR="{scripts}"\nVENV_PATH=/nonexistent\n' + _install_block()
+    )
+    env = {**os.environ, "HOME": str(tmp_path)}
+    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert ("WARNED:" in proc.stdout) is warns, proc.stdout
+
+
+def _update_step_function() -> str:
+    text = (_SCRIPTS / "update.sh").read_text()
+    fn = text[text.index("_run_browser_stack_step() {") :]
+    return fn[: fn.index("\n}\n") + 3]
+
+
+def test_update_step_runs_the_script_and_survives_its_failure(tmp_path):
+    """Review finding on this slice: the update.sh tests compared text
+    positions only, and still passed with the step's body deleted."""
+    root = tmp_path / "root"
+    (root / "scripts").mkdir(parents=True)
+    marker = tmp_path / "ran"
+    (root / "scripts" / "install_browser_stack.sh").write_text(f'touch "{marker}"\nexit 7\n')
+    script = (
+        "set -Eeuo pipefail\ntrap 'echo ERR-TRAP' ERR\n"
+        + _update_step_function()
+        + "\n_run_browser_stack_step\necho survived\n"
+    )
+    env = {**os.environ, "GENESIS_ROOT": str(root)}
+    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+    assert proc.returncode == 0 and "survived" in proc.stdout, proc.stderr
+    assert marker.exists()
+    assert "did not finish" in proc.stdout and "ERR-TRAP" not in proc.stdout

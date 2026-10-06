@@ -2180,6 +2180,27 @@ PYEOF
 }
 # END tier2-baseline-check
 
+# The browser stack step (scripts/install_browser_stack.sh). Bootstrap defers it
+# when update.sh runs it (GENESIS_BROWSER_STACK_DEFERRED on the bootstrap call),
+# so update.sh runs it itself once the update is recorded done, on both exits:
+# after a full activation and on the no-new-commit path, so re-running the
+# update retries a step that was skipped or degraded (a browser was open, low
+# disk, a failed download). The first upgrade downloads about 2 GB, which must
+# not lengthen the server's stop window (nothing in it needs the server
+# stopped), and while update_state.json says an update is in progress
+# env.update_in_progress() is true and the watchdog will not restart the
+# server, so running it any earlier would leave the server unguarded for the
+# whole download (a supervised dashboard update keeps its own marker until
+# its session exits, so there the watchdog waits for that anyway). Non-fatal (`|| echo`, under errexit) so it can never turn a
+# finished update into a failure; its output is shown in full because
+# bootstrap's is cut to 10 lines, and its last line is the outcome.
+_run_browser_stack_step() {
+    echo "--- Browser stack ---"
+    bash "$GENESIS_ROOT/scripts/install_browser_stack.sh" 2>&1 \
+        || echo "  browser stack step did not finish (non-fatal; re-run scripts/install_browser_stack.sh)"
+    echo ""
+}
+
 if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]] && _tier2_pending_since_baseline; then
     echo "  No new commits, but update.sh-only paths changed since the last recorded"
     echo "  update — running full activation (bootstrap + migrations + restart)."
@@ -2293,6 +2314,7 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     fi
     _restart_tmp_watchgod_if_stale
     echo ""
+    _run_browser_stack_step
     echo "  Nothing to do."
     exit 0
 fi
@@ -2943,21 +2965,8 @@ rm -f "$HOME/.genesis/last_update_summary.txt"
 # Clean up PID file
 _clear_deploy_state
 
-# ── Browser stack (after the update is recorded done) ─────────────────────
-# Bootstrap defers this step when update.sh runs it (GENESIS_BROWSER_STACK_DEFERRED
-# on the bootstrap call above). It runs HERE, after `_write_state "done"` and the
-# state cleanup, for two reasons: the first upgrade downloads about 2 GB, which
-# must not lengthen the server's stop window (nothing in it needs the server
-# stopped), and while update_state.json says an update is in progress
-# env.update_in_progress() is true and the watchdog will not restart the server,
-# so running it any earlier would leave the server unguarded for the whole
-# download. Non-fatal (`|| echo`, under errexit) so it can never turn a finished,
-# recorded update into a failure; its output is shown in full because
-# bootstrap's is cut to 10 lines, and its last line is the outcome.
-echo "--- Browser stack ---"
-bash "$GENESIS_ROOT/scripts/install_browser_stack.sh" 2>&1 \
-    || echo "  browser stack step did not finish (non-fatal; re-run scripts/install_browser_stack.sh)"
-echo ""
+# ── Browser stack (after the update is recorded done; see the function) ───
+_run_browser_stack_step
 
 # ── Done ──────────────────────────────────────────────────
 echo "  ──────────────────────────────────────"

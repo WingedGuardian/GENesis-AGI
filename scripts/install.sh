@@ -909,13 +909,19 @@ if [ -d "$VENV_PATH" ]; then
             echo "    + Genesis installed in editable mode"
             # Every install gets the browser stack (owner decision 2026-10-04).
             # Non-fatal by design; the last line it prints is the outcome. The
-            # script always exits 0, so the warning is decided from that line.
+            # script always exits 0, so the warning is decided from that line,
+            # and only on Camoufox, the primary layer: the Chromium fallback's
+            # check runs headed on the VNC display, which bootstrap's VNC step
+            # sets up and install.sh does not, so it reads DEGRADED here.
             mkdir -p "$HOME/tmp"
             _bs_log="$(mktemp -p "$HOME/tmp" browser-stack.XXXXXX)"
             GENESIS_VENV="$VENV_PATH" bash "$SCRIPT_DIR/install_browser_stack.sh" 2>&1 \
                 | tee "$_bs_log" | sed 's/^/    /' || true
-            if ! tail -n 1 "$_bs_log" | grep -q 'browser stack: ready'; then
-                setup_warn "browser stack not ready (see above; re-run scripts/install_browser_stack.sh)"
+            if ! tail -n 1 "$_bs_log" | grep -q 'Camoufox usable'; then
+                setup_warn "browser stack: Camoufox not usable (see above; re-run scripts/install_browser_stack.sh)"
+            elif ! tail -n 1 "$_bs_log" | grep -q 'browser stack: ready'; then
+                echo "    NOTE: browser stack not fully ready (the Chromium fallback needs the"
+                echo "    :99 display that bootstrap's VNC step sets up); Camoufox is usable"
             fi
             rm -f "$_bs_log"
             ;;
