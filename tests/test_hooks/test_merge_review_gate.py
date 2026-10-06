@@ -127,24 +127,9 @@ def _argv_for_endpoint(run_mock, endpoint: str) -> list[str]:
 
 
 def _config_run(values: dict, default: tuple = (1, "")):
-    """A ``subprocess.run`` side_effect mapping a git-config KEY (the last argv
-    token) to ``(rc, stdout)``. Unlisted keys resolve to ``default`` = ``(1, "")``
-    (git's "unset" signal). Order/count-independent — robust to how many config
-    reads _push_config_is_simple performs.
-
-    ``git remote get-url [--push] --all <remote>`` (the push-URL-vs-probe check)
-    is keyed as ``get-url`` / ``get-url --push`` and defaults to one identical
-    URL for both, i.e. no pushurl / pushInsteadOf divergence. ``git rev-parse
-    --git-common-dir`` (the legacy remote-file check) resolves to a directory
-    that does not exist, i.e. no legacy remote file."""
+    """Map the last git-config argv token to ``(rc, stdout)``."""
 
     def run(argv, **kwargs):
-        if "--git-common-dir" in argv:
-            return _proc(0, "/nonexistent-git-common-dir")
-        if "get-url" in argv:
-            key = "get-url --push" if "--push" in argv else "get-url"
-            rc, out = values.get(key, (0, "https://example.invalid/r.git"))
-            return _proc(rc, out)
         key = argv[-1]
         rc, out = values.get(key, default)
         return _proc(rc, out)
@@ -493,68 +478,59 @@ class TestPushPositionals:
 
 
 class TestPushConfigIsSimple:
-    """_push_config_is_simple: True only when NO config broadens a bare/remote-only
-    push — no `remote.<remote>.push` refspec, push.default in {unset, simple,
-    current}, and no submodule push-recursion. Fail-CLOSED on any config-read
-    error / unresolved remote."""
+    """Execution-side config remains guarded before probing push destinations."""
 
     def test_all_unset_is_simple(self, guard_module):
         with patch.object(guard_module.subprocess, "run", side_effect=_config_run({})):
             assert guard_module._push_config_is_simple("origin") is True
 
-    def test_custom_push_refspec_not_simple(self, guard_module):
+    def test_receivepack_not_simple(self, guard_module):
         with patch.object(
             guard_module.subprocess,
             "run",
-            side_effect=_config_run({"remote.origin.push": (0, "HEAD:main")}),
+            side_effect=_config_run({"remote.origin.receivepack": (0, "/x/helper")}),
         ):
             assert guard_module._push_config_is_simple("origin") is False
 
-    def test_push_default_simple_ok(self, guard_module):
+    def test_receivepack_empty_is_simple(self, guard_module):
         with patch.object(
-            guard_module.subprocess, "run", side_effect=_config_run({"push.default": (0, "simple")})
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"remote.origin.receivepack": (0, "")}),
         ):
             assert guard_module._push_config_is_simple("origin") is True
 
-    def test_push_default_current_ok(self, guard_module):
+    def test_gpg_sign_not_simple(self, guard_module):
         with patch.object(
-            guard_module.subprocess,
-            "run",
-            side_effect=_config_run({"push.default": (0, "current")}),
+            guard_module.subprocess, "run", side_effect=_config_run({"push.gpgSign": (0, "true")})
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    def test_gpg_sign_empty_not_simple(self, guard_module):
+        with patch.object(
+            guard_module.subprocess, "run", side_effect=_config_run({"push.gpgSign": (0, "")})
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    def test_gpg_sign_false_is_simple(self, guard_module):
+        with patch.object(
+            guard_module.subprocess, "run", side_effect=_config_run({"push.gpgSign": (0, "false")})
         ):
             assert guard_module._push_config_is_simple("origin") is True
-
-    def test_push_default_matching_not_simple(self, guard_module):
-        with patch.object(
-            guard_module.subprocess,
-            "run",
-            side_effect=_config_run({"push.default": (0, "matching")}),
-        ):
-            assert guard_module._push_config_is_simple("origin") is False
-
-    def test_push_default_upstream_not_simple(self, guard_module):
-        # Regression (round-3 BLOCKER): upstream pushes cur to a possibly
-        # differently-named upstream branch (e.g. feat → origin/main).
-        with patch.object(
-            guard_module.subprocess,
-            "run",
-            side_effect=_config_run({"push.default": (0, "upstream")}),
-        ):
-            assert guard_module._push_config_is_simple("origin") is False
-
-    def test_push_default_tracking_not_simple(self, guard_module):
-        with patch.object(
-            guard_module.subprocess,
-            "run",
-            side_effect=_config_run({"push.default": (0, "tracking")}),
-        ):
-            assert guard_module._push_config_is_simple("origin") is False
 
     def test_recurse_submodules_on_demand_not_simple(self, guard_module):
         with patch.object(
             guard_module.subprocess,
             "run",
             side_effect=_config_run({"push.recurseSubmodules": (0, "on-demand")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    def test_recurse_submodules_empty_not_simple(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"push.recurseSubmodules": (0, "")}),
         ):
             assert guard_module._push_config_is_simple("origin") is False
 
@@ -575,24 +551,6 @@ class TestPushConfigIsSimple:
         ):
             assert guard_module._push_config_is_simple("origin") is True
 
-    def test_push_default_case_insensitive(self, guard_module):
-        # git enum values are case-insensitive — Matching must still be rejected.
-        with patch.object(
-            guard_module.subprocess,
-            "run",
-            side_effect=_config_run({"push.default": (0, "Matching")}),
-        ):
-            assert guard_module._push_config_is_simple("origin") is False
-
-    def test_mirror_true_not_simple(self, guard_module):
-        # P1: remote.<remote>.mirror=true → a bare push mirrors ALL refs → not simple.
-        with patch.object(
-            guard_module.subprocess,
-            "run",
-            side_effect=_config_run({"remote.origin.mirror": (0, "true")}),
-        ):
-            assert guard_module._push_config_is_simple("origin") is False
-
     def test_submodule_recurse_true_not_simple(self, guard_module):
         with patch.object(
             guard_module.subprocess,
@@ -606,7 +564,7 @@ class TestPushConfigIsSimple:
         with patch.object(
             guard_module.subprocess,
             "run",
-            side_effect=_config_run({"remote.origin.push": (128, "")}),
+            side_effect=_config_run({"remote.origin.receivepack": (128, "")}),
         ):
             assert guard_module._push_config_is_simple("origin") is False
 
@@ -620,8 +578,8 @@ class TestPushConfigIsSimple:
 
 
 class TestPushTargetsCurrentBranch:
-    """_push_targets_current_branch(seg, cur, remote) (ALLOWLIST posture) is True
-    ONLY for a plain current-branch update: bare / `<remote>` (with simple config)
+    """_push_targets_current_branch(seg, cur, remote) is True only for a plain
+    current-branch update: bare / `<remote>` (with config and dry-run proof)
     or explicit `<remote> <cur>`, carrying only ref-neutral flags. `remote` is the
     caller-resolved effective push remote. Every cross-name / delete / broadening /
     unknown-flag / bundled-delete form is False."""
@@ -629,11 +587,7 @@ class TestPushTargetsCurrentBranch:
     def _t(self, guard_module, cmd, cur):
         return guard_module._push_targets_current_branch(_push_seg(cmd), cur, "origin")
 
-    # ── explicit `<remote> <cur>` → gated on the same config check as bare ──
-    # git remaps a colon-free local-branch refspec through remote.<r>.push and
-    # push.default=upstream, so the explicit form is not config-immune. Pinned
-    # simple here so these rows do not depend on the host repo's own config;
-    # the bare/remote-only rows below patch it themselves.
+    # ── explicit `<remote> <cur>` → gated on config and dry-run proof ──
 
     @pytest.fixture(autouse=True)
     def _simple_config(self, request, guard_module):
@@ -641,11 +595,17 @@ class TestPushTargetsCurrentBranch:
         if name.startswith("test_bare_") or "remote_only" in name:
             yield
             return
-        with patch.object(guard_module, "_push_config_is_simple", return_value=True):
+        with (
+            patch.object(guard_module, "_push_config_is_simple", return_value=True),
+            patch.object(guard_module, "_push_dry_run_is_plain", return_value=True),
+        ):
             yield
 
     def test_explicit_current_branch_needs_simple_config(self, guard_module):
-        with patch.object(guard_module, "_push_config_is_simple", return_value=False):
+        with (
+            patch.object(guard_module, "_push_config_is_simple", return_value=False),
+            patch.object(guard_module, "_push_dry_run_is_plain", return_value=True),
+        ):
             assert self._t(guard_module, "git push origin feat", "feat") is False
 
     def test_explicit_current_branch(self, guard_module):
@@ -707,19 +667,28 @@ class TestPushTargetsCurrentBranch:
         for cmd in ("git push -ud origin feat", "git push -du origin feat", "git push -qd origin feat"):
             assert self._t(guard_module, cmd, "feat") is False, cmd
 
-    # ── bare / remote-only → gated on _push_config_is_simple (mocked) ──
+    # ── bare / remote-only → gated on config and dry-run proof ──
 
     def test_bare_push_simple_config_true(self, guard_module):
-        with patch.object(guard_module, "_push_config_is_simple", return_value=True):
+        with (
+            patch.object(guard_module, "_push_config_is_simple", return_value=True),
+            patch.object(guard_module, "_push_dry_run_is_plain", return_value=True),
+        ):
             assert self._t(guard_module, "git push", "feat") is True
 
     def test_bare_push_nonsimple_config_false(self, guard_module):
-        with patch.object(guard_module, "_push_config_is_simple", return_value=False):
+        with (
+            patch.object(guard_module, "_push_config_is_simple", return_value=False),
+            patch.object(guard_module, "_push_dry_run_is_plain", return_value=True),
+        ):
             assert self._t(guard_module, "git push", "feat") is False
 
     def test_remote_only_uses_effective_remote(self, guard_module):
         # The config check keys on the caller-resolved `remote`, not positionals[0].
-        with patch.object(guard_module, "_push_config_is_simple", return_value=True) as cfg:
+        with (
+            patch.object(guard_module, "_push_config_is_simple", return_value=True) as cfg,
+            patch.object(guard_module, "_push_dry_run_is_plain", return_value=True),
+        ):
             assert self._t(guard_module, "git push origin", "feat") is True
         assert cfg.call_args_list[0].args[0] == "origin"
 

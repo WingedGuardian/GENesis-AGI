@@ -1,0 +1,1 @@
+Re-push checks now confirm that Git is sending only the current branch to the approved destination before reusing a prior approval. Pushes that redirect elsewhere or include additional refs continue to require approval.

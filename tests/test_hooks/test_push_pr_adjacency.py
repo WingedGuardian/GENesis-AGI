@@ -241,12 +241,19 @@ def test_a_timeout_is_none(monkeypatch) -> None:
 
 
 def _run_guard_on_push(
-    monkeypatch, tmp_path, fake: FakeRun, capsys, command="git push", git_config=()
+    monkeypatch,
+    tmp_path,
+    fake: FakeRun,
+    capsys,
+    command="git push",
+    git_config=(),
+    dry_run_plain: bool | None = True,
 ):
     """Drive main() with a push payload from a real repo on `feat/x`.
 
     ``git_config`` is extra ``git config`` argument lists applied after init,
-    for tests that need real remotes rather than a stubbed URL set."""
+    for tests that need real remotes rather than a stubbed URL set. The dry-run
+    seam is pinned unless a case preserves the end-to-end regression path."""
     repo = tmp_path / "repo"
     repo.mkdir()
     for args in (
@@ -270,6 +277,13 @@ def _run_guard_on_push(
         "tool_input": {"command": command},
         "cwd": str(repo),
     }
+    if dry_run_plain is not None:
+        monkeypatch.setattr(
+            gpg,
+            "_push_dry_run_is_plain",
+            lambda *a, **k: dry_run_plain,
+            raising=False,
+        )
     monkeypatch.setattr(gpg.sys, "stdin", __import__("io").StringIO(json.dumps(payload)))
     rc = gpg.main()
     out = capsys.readouterr()
@@ -864,7 +878,12 @@ def test_the_scope_follows_the_real_push_destination(
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
 
     rc, out, err = _run_guard_on_push(
-        monkeypatch, tmp_path, fake, capsys, git_config=git_config
+        monkeypatch,
+        tmp_path,
+        fake,
+        capsys,
+        git_config=git_config,
+        dry_run_plain=None if blocked else True,
     )
     if blocked:
         assert rc == 2 and "NO OPEN PR" in err, (rc, out, err)
