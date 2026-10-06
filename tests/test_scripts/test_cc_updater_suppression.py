@@ -1405,6 +1405,7 @@ class TestUnitsAreLoadable:
         out.write_text(rendered)
         return out
 
+    @pytest.mark.user_manager  # read-only `systemd-analyze --user verify`; the fence keeps the bus
     @pytest.mark.parametrize(
         "name",
         [

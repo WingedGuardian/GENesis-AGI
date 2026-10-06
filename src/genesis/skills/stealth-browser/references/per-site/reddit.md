@@ -1,60 +1,56 @@
 # Reddit
 
-## Detection System (as of 2026-04)
+Gathered 2026-04 from public reporting and community sources. Nothing here was
+measured by Genesis; every number is **unsourced** unless a source is named.
+Recheck before relying on a limit.
 
-Reddit uses **proprietary internal detection**, not an external WAF.
+## Detection
+
+Reddit uses in-house detection, not an external WAF.
 
 ### Contributor Quality Score (CQS)
-Invisible 5-tier score based on:
-- Account age
-- IP stability
-- Karma (post + comment)
-- Engagement quality (replies, upvotes received)
-- Rule adherence (reports, removals)
+A hidden 5-tier score built from account age, IP stability, karma, engagement
+quality and rule adherence. Low CQS reportedly gets content removed before a
+human sees it.
 
-Low CQS = content auto-removed before any human sees it.
+### Verification wall (reported March 2026)
+Flagged accounts must verify with a passkey, biometrics or government ID. That
+cannot be automated, so the only strategy is never getting flagged.
 
-### Biometric Verification (March 2026)
-- Flagged accounts must verify via passkeys, biometrics, or government ID
-- **Cannot be automated** — this is the hard wall
-- Prevention (never getting flagged) is the only strategy
+Reddit is reported to remove about 100,000 bot accounts a day.
 
-### ~100,000 bot accounts removed daily
+## What gets accounts caught (reported, ranked by risk)
 
-## What Gets You Caught (ranked by risk)
+1. Plain Playwright/Selenium without stealth patches (immediate).
+2. Datacenter IPs (immediate).
+3. Burst activity; most bans are reported to come from bursts, not volume.
+4. The same content across several subreddits (shadowban).
+5. Polished, AI-sounding content.
+6. New accounts acting fast with little karma or age.
 
-1. Standard Playwright/Selenium without stealth patches (instant)
-2. Datacenter IPs (instant)
-3. Burst activity patterns — most bans from bursts, not total volume
-4. Same content across multiple subreddits (shadowban)
-5. AI-generated polished content (detected faster than casual writing)
-6. New accounts acting too quickly without karma/age
-
-## Rate Limits
+## Reported limits
 
 | Action | New account | Established |
-|--------|------------|-------------|
-| Comments | 2-3/day | Higher, varies |
-| Posts | None for ~2 weeks | Varies by subreddit |
-| Subreddit with low karma | 1 per 10 min | Normal |
-| API (OAuth) | 100 req/min | 100 req/min |
-| API (unauth) | 10 req/min | 10 req/min |
-| Browser scraping | ~50 pages before flagged | Similar |
-| DMs | <15 per 5 min | <15 per 5 min |
+|---|---|---|
+| Comments | 2-3/day | higher, varies |
+| Posts | none for ~2 weeks | varies by subreddit |
+| Low-karma posting in a subreddit | 1 per 10 min | normal |
+| API, OAuth | 100 requests/min | 100 requests/min |
+| API, unauthenticated | 10 requests/min | 10 requests/min |
+| Browser scraping | ~50 pages before a flag | similar |
+| DMs | under 15 per 5 min | under 15 per 5 min |
+
+Self-service API keys were reportedly withdrawn in November 2025; OAuth access
+now needs Reddit's manual approval.
 
 ## Strategy
 
-- **Residential proxy mandatory** — datacenter IPs are instant flags
-- **Account age matters** — don't use new accounts for automation
-- **No burst patterns** — space actions over hours, not minutes
-- **Content quality** — casual, human-like. Overly polished = suspicious
-- **IP stability** — don't rotate IPs within a session
-- **GeoIP alignment** — IP location must match account's typical location
-- **Self-service API keys eliminated** (Nov 2025) — all OAuth requires
-  manual Reddit pre-approval
+- Use an aged account; never automate a new one.
+- Residential IP, stable within a session, located where the account usually is.
+- No bursts: space actions over hours, not minutes.
+- Casual, specific writing; never cross-post identical text.
 
-## Bottom Line
+## Bottom line
 
-Reddit automation is HIGH RISK. The biometric verification wall means
-there's no recovery from being flagged. Every interaction must be
-designed to never trigger the first flag. Use with extreme caution.
+High risk. A flag leads to a verification wall with no automated way back, so
+every interaction has to avoid the first flag.
