@@ -179,14 +179,24 @@ def repo_root() -> Path:
 def credential_env_names(
     example: Path | None = None,
     *,
+    secrets_file: Path | None = None,
     pattern: re.Pattern[str] = CREDENTIAL_NAME_RE,
 ) -> frozenset[str]:
-    """Return the single source of truth for which env names are credentials."""
+    """Return the single source of truth for which env names are credentials.
+
+    Names come from the environment, from ``secrets.env.example``, and from the
+    install's real secrets file (``secrets_path()`` unless given), so a key that
+    exists only in the real file is still named. Only key names are taken from
+    either file; values are never returned.
+    """
     names = {name for name in os.environ if pattern.search(name)}
     example_path = example if example is not None else repo_root() / "secrets.env.example"
-    if example_path.is_file():
-        for line in example_path.read_text(encoding="utf-8").splitlines():
-            match = re.match(r"^#?\s*([A-Z][A-Z0-9_]*)=", line)
+    real_path = secrets_file if secrets_file is not None else secrets_path()
+    for path in (example_path, real_path):
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = re.match(r"^#?\s*(?:export\s+)?([A-Z][A-Z0-9_]*)=", line)
             if match and pattern.search(match.group(1)):
                 names.add(match.group(1))
     return frozenset(names)

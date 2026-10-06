@@ -104,3 +104,22 @@ def test_discord_webhook_names_are_pinned_empty():
     assert len(webhook_names) == 4
     assert webhook_names <= _PINNED_CREDENTIALS
     assert all(os.environ[name] == "" for name in webhook_names)
+
+
+def test_credential_env_names_includes_names_only_in_the_real_secrets_file(tmp_path):
+    """A key the install's secrets file holds, absent from the example and the
+    environment, is still named, so the test pin covers it. Only the name is
+    returned, never the value."""
+    empty_example = tmp_path / "empty.env.example"
+    empty_example.write_text("", encoding="utf-8")
+    real = tmp_path / "secrets.env"
+    real.write_text(
+        "ONLY_IN_REAL_FILE_API_KEY=not-a-real-value\nexport OTHER_TOKEN=x\nPLAIN=1\n",
+        encoding="utf-8",
+    )
+
+    names = credential_env_names(example=empty_example, secrets_file=real)
+
+    assert {"ONLY_IN_REAL_FILE_API_KEY", "OTHER_TOKEN"} <= names
+    assert "PLAIN" not in names
+    assert not any("not-a-real-value" in name for name in names)

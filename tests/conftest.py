@@ -41,16 +41,16 @@ if _WORKTREE_SRC.is_dir():
 
 import contextlib  # noqa: E402
 import os  # noqa: E402
-import tempfile  # noqa: E402
 
 import aiosqlite  # noqa: E402
 import pytest  # noqa: E402
 
 from genesis.env import CREDENTIAL_NAME_RE  # noqa: E402
 
-_NO_SECRETS_PATH = str(
-    Path(tempfile.gettempdir()) / f"genesis-tests-no-secrets-{os.getpid()}" / "secrets.env"
-)
+# Under /dev/null, which is not a directory: no read finds a file there, and a
+# write fails (ENOTDIR) instead of silently creating secrets in a temp dir, so
+# a test that forgets its own SECRETS_PATH fails loudly.
+_NO_SECRETS_PATH = "/dev/null/genesis-tests-no-secrets/secrets.env"
 _PINNED_CREDENTIALS: frozenset[str] = frozenset()
 # Webhook URLs are bearer secrets, but the dashboard pattern deliberately doesn't change here.
 _TEST_PINNED_NAME_RE = re.compile(rf"{CREDENTIAL_NAME_RE.pattern}|^DISCORD_WEBHOOK_")

@@ -129,6 +129,9 @@ def restore_sandbox(tmp_path):
         GENESIS_BACKUP_TMPDIR=str(home / "tmp"),
         GENESIS_BACKUP_TIER2_BACKEND="none",
         QDRANT_URL="http://127.0.0.1:1",
+        # The sandbox's own secrets file: the inherited test pin is not a
+        # writable path, and restore.sh writes secrets wherever this points.
+        SECRETS_PATH=str(home / "genesis" / "secrets.env"),
     )
     return {"home": home, "gd": gd, "backup": backup, "env": env, "tmp": tmp_path}
 
