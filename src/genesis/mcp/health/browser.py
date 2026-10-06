@@ -602,11 +602,43 @@ async def _ensure_browser():
         return _stealth_page
 
 
+def _patchright_installed() -> bool:
+    # Package metadata, as _installed_browser_versions reads it: metadata left
+    # behind by a half-removed patchright still counts as installed, so its
+    # import failure is reported instead of switching to plain Playwright.
+    return _installed_browser_versions()["patchright"] is not None
+
+
+def _chromium_async_playwright():
+    """``async_playwright`` for the Chromium fallback: patchright's, or plain
+    Playwright's (with a warning) only when patchright is not installed.
+
+    An installed patchright whose import fails is re-raised: switching silently to
+    the detectable Chromium would hide the broken install.
+    """
+    try:
+        from patchright.async_api import async_playwright
+    except ImportError:
+        if _patchright_installed():
+            raise
+        logger.warning(
+            "patchright is not installed; the Chromium fallback uses plain "
+            "Playwright, which sites can detect. Run scripts/install_browser_stack.sh."
+        )
+        from playwright.async_api import async_playwright
+    return async_playwright
+
+
 async def _ensure_chromium_fallback():
-    """Lazily initialize Playwright Chromium as fallback browser.
+    """Lazily initialize the Chromium fallback browser (patchright).
 
     Use only when Camoufox fails on a specific site. Persistent profile at
     ~/.genesis/browser-profile/ (separate from Camoufox profile).
+
+    patchright is Playwright with the Chromium automation leaks patched
+    (Runtime.enable, Console.enable, automation command-line flags). It is a
+    drop-in replacement; plain Playwright is used only when patchright is not
+    installed, with a warning, because that Chromium is detectable.
 
     Detects stale pages and automatically re-initializes.
     """
@@ -624,7 +656,7 @@ async def _ensure_chromium_fallback():
         _acquire_stack_lock()  # first, before the import reads the package files
         try:
             _check_loaded_browser_modules()
-            from playwright.async_api import async_playwright
+            async_playwright = _chromium_async_playwright()
 
             _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -640,7 +672,9 @@ async def _ensure_chromium_fallback():
                 headless=False,
                 args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
                       "--start-maximized"],
-                viewport={"width": 1280, "height": 720},
+                # patchright's documented stealth setup: no emulated viewport (the
+                # real window size is used) and no custom headers or user agent.
+                no_viewport=True,
             )
             _page = _context.pages[0] if _context.pages else await _context.new_page()
         except BaseException:
@@ -2687,6 +2721,24 @@ async def _impl_browser_snapshot() -> dict:
         return {"error": f"Snapshot failed: {e}"}
 
 
+def _is_patchright_page(page) -> bool:
+    return type(page).__module__.startswith("patchright")
+
+
+async def _evaluate_main_world(page, expression: str):
+    """``page.evaluate`` in the page's own JavaScript world.
+
+    patchright evaluates in an isolated world by default (that is how it avoids
+    the Runtime.enable leak), where the page's own globals are invisible.
+    browser_run_js is documented as the DevTools console, so it asks for the
+    main world explicitly on patchright pages. Internal DOM reads elsewhere in
+    this module are fine in either world: the DOM is shared.
+    """
+    if _is_patchright_page(page):
+        return await page.evaluate(expression, isolated_context=False)
+    return await page.evaluate(expression)
+
+
 async def _impl_browser_run_js(expression: str) -> dict:
     """Execute JavaScript on the current page and return the result.
 
@@ -2703,7 +2755,7 @@ async def _impl_browser_run_js(expression: str) -> dict:
         page = _active_page
     try:
         logger.info("browser_run_js: %s", expression[:200])
-        result = await page.evaluate(expression)
+        result = await _evaluate_main_world(page, expression)
         _update_remote_url()  # JS may cause navigation
         return {"result": result, "url": page.url}
     except Exception as e:

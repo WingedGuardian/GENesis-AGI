@@ -1,4 +1,4 @@
-"""Provision the browser stack: the ``browser`` extra, the Camoufox engine, safe upgrades.
+"""Provision the browser stack: Camoufox engine, patchright Chromium, safe upgrades.
 
 ``python -m genesis.browser.provision run --root <repo> --lib <venv_setup.sh>`` is
 the whole transaction, in ONE process so nothing it learns has to be passed
@@ -30,7 +30,9 @@ never overlap and no browser launches mid-run; a running browser holds it SHARED
      engine in place for the whole download, so only the two renames are not
      atomic, and signals are held off while they run.
   5. launch Camoufox headless once, with the new packages.
-  6. refresh ``browser_automation`` in ~/.genesis/capabilities.json, so the
+  6. the Chromium fallback (genesis.browser.chromium): patchright's Chromium,
+     its profile copy and launch check. Non-fatal: not the primary layer.
+  7. refresh ``browser_automation`` in ~/.genesis/capabilities.json, so the
      capability reflects the new state without a server restart.
 If step 2, 3, 4 or 5 fails (or the run is interrupted by SIGTERM, SIGINT or SIGHUP)
 before the swap, the root was never touched, so the only thing to undo is the
@@ -61,6 +63,7 @@ import traceback
 from collections.abc import Callable
 from pathlib import Path
 
+from genesis.browser import chromium as _chromium
 from genesis.browser.engine import (
     BROWSER_LOCK_FILE,
     OVERRIDDEN,
@@ -102,6 +105,7 @@ SMOKE_TIMEOUT_S = 300
 # a 1.3 GB engine download there breaks every session at once.
 STAGING_PARENT = Path.home() / "tmp"
 PROFILE_DIR = Path.home() / ".genesis" / "camoufox-profile"
+CHROMIUM_PROFILE_DIR = _chromium.PROFILE_DIR
 LOCK_FILE = BROWSER_LOCK_FILE
 CAPABILITIES_FILE = Path.home() / ".genesis" / "capabilities.json"
 CAPABILITY = "browser_automation"
@@ -781,6 +785,21 @@ class Transaction:
                     f"`{sys.executable} -m pip uninstall {' '.join(added)}` by hand"
                 )
 
+    # step 6 (non-fatal: the Chromium fallback is not the primary layer)
+    def chromium(self) -> bool:
+        return _chromium.provision(
+            self._run,
+            _say,
+            lambda: backup_if_upgrading(
+                CHROMIUM_PROFILE_DIR,
+                _chromium.profile_major(CHROMIUM_PROFILE_DIR),
+                _chromium.patchright_major(),
+                "Chromium",
+            ),
+            step_timeout=STEP_TIMEOUT_S,
+            smoke_timeout=SMOKE_TIMEOUT_S,
+        )
+
     # step 5
     def smoke(self, env: dict[str, str] | None = None, install_dir: Path | None = None) -> bool:
         status = (
@@ -866,7 +885,7 @@ class Transaction:
             self.interrupted = True
 
         previous_handlers = {sig: signal.signal(sig, _interrupted) for sig in _SIGNALS}
-        engine_ok = smoke_ok = False
+        engine_ok = chromium_ok = smoke_ok = False
         try:
             try:
                 self.install_extras()
@@ -890,6 +909,11 @@ class Transaction:
                     self.restore_packages()
                 except Exception as rb_exc:  # noqa: BLE001 - report, never raise
                     _say(f"FAILED to restore the previous browser packages: {rb_exc}")
+            if smoke_ok:
+                try:
+                    chromium_ok = self.chromium()
+                except ProvisionError as exc:  # a signal during step 6
+                    _say(f"FAILED: {exc}")
         finally:
             for sig, handler in previous_handlers.items():
                 signal.signal(sig, handler)
@@ -906,9 +930,9 @@ class Transaction:
                 "browser packages changed; restart running Claude Code sessions "
                 "before using their browser tools"
             )
-        state = "ready" if (engine_ok and smoke_ok) else "DEGRADED"
+        state = "ready" if (engine_ok and chromium_ok and smoke_ok) else "DEGRADED"
         return self._finish(
-            f"{state} (engine={engine_ok}, launch={smoke_ok})",
+            f"{state} (engine={engine_ok}, chromium={chromium_ok}, launch={smoke_ok})",
             launched=smoke_ok if engine_ok else None,
         )
 

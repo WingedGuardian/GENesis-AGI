@@ -48,6 +48,11 @@ def _reset_browser_state(tmp_path, monkeypatch):
     from genesis.browser import engine
 
     monkeypatch.setattr(engine, "BROWSER_LOCK_FILE", tmp_path / "locks" / "browser.lock")
+    # The Chromium fallback prefers patchright. Whether this machine has it must
+    # not decide which module a test's stub replaces: patchright reads as absent
+    # unless a test installs a stub for it (TestChromiumFallbackImport).
+    monkeypatch.setitem(sys.modules, "patchright.async_api", None)
+    monkeypatch.setattr(browser, "_patchright_installed", lambda: False)
     # Which browser distributions count as loaded, and at what version, is
     # process state the module accumulates; start each test from the startup view.
     monkeypatch.setattr(
@@ -327,6 +332,9 @@ class TestEnsureChromiumRecovery:
 
         assert result is new_page
         assert browser._page is new_page
+        _, kwargs = mock_pw.chromium.launch_persistent_context.call_args
+        assert kwargs.get("no_viewport") is True
+        assert "viewport" not in kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -2145,3 +2153,81 @@ class TestLateImportBaseline:
             disk["now"] = dict(startup, camoufox="0.6.0")
             with pytest.raises(browser.BrowserPackagesChanged, match="0.5.7 -> 0.6.0"):
                 browser._check_loaded_browser_modules()
+
+
+class TestRunJsWorld:
+    """patchright evaluates in an isolated world by default, where page globals are
+    invisible; browser_run_js must ask for the page's own world on patchright pages."""
+
+    @staticmethod
+    def _page(module: str, value):
+        evaluate = AsyncMock(return_value=value)
+        cls = type("Page", (), {"__module__": module, "evaluate": evaluate})
+        return cls(), evaluate
+
+    @pytest.mark.asyncio
+    async def test_patchright_page_uses_main_world(self):
+        page, evaluate = self._page("patchright.async_api._generated", 42)
+        assert browser._is_patchright_page(page)
+        assert await browser._evaluate_main_world(page, "window.appState") == 42
+        evaluate.assert_awaited_once_with("window.appState", isolated_context=False)
+
+    @pytest.mark.asyncio
+    async def test_other_pages_use_plain_evaluate(self):
+        page, evaluate = self._page("playwright.async_api._generated", 7)
+        assert not browser._is_patchright_page(page)
+        assert await browser._evaluate_main_world(page, "1+6") == 7
+        evaluate.assert_awaited_once_with("1+6")
+
+
+class TestChromiumFallbackImport:
+    def test_installed_patchright_is_preferred(self, monkeypatch):
+        patchright_mod = MagicMock()
+        monkeypatch.setitem(sys.modules, "patchright.async_api", patchright_mod)
+        assert browser._chromium_async_playwright() is patchright_mod.async_playwright
+
+    def test_broken_patchright_is_reported_not_swapped_for_playwright(self, monkeypatch):
+        """Plain Playwright is used only when patchright is absent; an installed
+        patchright whose import fails must surface, not silently change engines."""
+        playwright_mod = MagicMock()
+        monkeypatch.setitem(sys.modules, "playwright.async_api", playwright_mod)
+        monkeypatch.setattr(browser, "_patchright_installed", lambda: True)
+        with pytest.raises(ImportError):
+            browser._chromium_async_playwright()
+
+    def test_absent_patchright_falls_back_to_playwright(self, monkeypatch, caplog):
+        playwright_mod = MagicMock()
+        monkeypatch.setitem(sys.modules, "playwright.async_api", playwright_mod)
+        assert browser._chromium_async_playwright() is playwright_mod.async_playwright
+        assert "patchright is not installed" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_the_fallback_launch_goes_through_patchright(self, monkeypatch):
+        cm, pw = _playwright_cm()
+        patchright_mod = MagicMock(async_playwright=MagicMock(return_value=cm))
+        monkeypatch.setitem(sys.modules, "patchright.async_api", patchright_mod)
+        monkeypatch.setattr(browser, "_patchright_installed", lambda: True)
+        with patch.object(browser, "_check_loaded_browser_modules"):
+            await browser._ensure_chromium_fallback()
+        patchright_mod.async_playwright.assert_called_once()
+        await browser.async_cleanup()
+
+
+class TestChromiumFallbackLockOrder:
+    @pytest.mark.asyncio
+    async def test_the_import_waits_for_the_stack_lock(self, monkeypatch):
+        """#2906's rule: the hold comes before any read of the package files a
+        provisioning run replaces, and patchright's import is such a read."""
+        import fcntl
+
+        from genesis.browser import engine
+
+        def imported():
+            raise AssertionError("imported before taking the browser-stack lock")
+
+        monkeypatch.setattr(browser, "_chromium_async_playwright", imported)
+        engine.BROWSER_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(engine.BROWSER_LOCK_FILE, "w") as provisioning:
+            fcntl.flock(provisioning, fcntl.LOCK_EX)
+            with pytest.raises(browser.BrowserStackBusy):
+                await browser._ensure_chromium_fallback()

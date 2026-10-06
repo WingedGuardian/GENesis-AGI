@@ -8,8 +8,8 @@ The hazards it exists for (measured on camoufox 0.5.7):
   * the new packages cannot drive the old engine, so a failure before the swap
     reinstalls the package versions that were there before and removes any the
     run added;
-  * a Firefox profile opened by a newer version is refused by an older one, so
-    it is copied once before the newer version first opens it;
+  * a Firefox/Chromium profile opened by a newer version is refused by an older
+    one, so it is copied once before the newer version first opens it;
   * a step is usually a wrapper (bash running pip): an interrupt must stop the
     step's whole process tree before the rollback starts a second pip.
 No test downloads or launches anything: subprocess steps are stubbed.
@@ -29,7 +29,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from genesis.browser import engine, provision
+from genesis.browser import chromium, engine, provision
 
 _REAL_BROWSERS_RUNNING = provision.browsers_running
 _REAL_RUN_GROUP = provision._run_group
@@ -41,6 +41,8 @@ def _isolated(tmp_path, monkeypatch):
     """Every path the transaction can write is inside tmp_path."""
     home = tmp_path / "home"
     monkeypatch.setattr(provision, "PROFILE_DIR", home / ".genesis" / "camoufox-profile")
+    monkeypatch.setattr(provision, "CHROMIUM_PROFILE_DIR", home / ".genesis" / "browser-profile")
+    monkeypatch.setattr(chromium, "PROFILE_DIR", home / ".genesis" / "browser-profile")
     monkeypatch.setattr(provision, "LOCK_FILE", home / ".genesis" / "locks" / "provision.lock")
     monkeypatch.setattr(provision, "STAGING_PARENT", home / "tmp")
     monkeypatch.setattr(provision, "CAPABILITIES_FILE", home / ".genesis" / "capabilities.json")
@@ -183,7 +185,7 @@ def test_stage_then_swap_keeps_the_legacy_engine_until_the_new_one_checks_out(
     aside = stack.with_name(f"camoufox.pre-0.5-{provision._stamp()}")
     assert (aside / "camoufox-bin").read_text() == "binary"
     assert time.time() - aside.stat().st_mtime < 3600
-    assert "ready (engine=True, launch=True)" in outcome
+    assert "ready (engine=True, chromium=True, launch=True)" in outcome
     assert run.pip_calls() == []
 
 
@@ -436,7 +438,7 @@ def test_ready_engine_completes_the_run(stack, tmp_path, monkeypatch):
     run = FakeRun()
     monkeypatch.setattr(subprocess, "run", run)
     outcome = _tx(tmp_path, install=True).run()
-    assert "ready (engine=True, launch=True)" in outcome
+    assert "ready (engine=True, chromium=True, launch=True)" in outcome
     assert run.pip_calls() == []
     assert not [c for c, _ in run.calls if c[1:3] == ["-m", "camoufox"]], "never fetched"
 
@@ -1294,3 +1296,155 @@ def test_failed_copy_leaves_no_temp_and_keeps_the_old_backup(tmp_path, monkeypat
     assert not list(tmp_path.glob("*.tmp"))
     assert first.is_dir()
     assert len(list(tmp_path.glob("camoufox-profile.pre-v135-*"))) == 1
+
+
+# ── Chromium (non-fatal) ──────────────────────────────────────────────────
+
+
+def _chromium_profile(last_version: str = "145.0.7632.6") -> Path:
+    profile = provision.CHROMIUM_PROFILE_DIR
+    profile.mkdir(parents=True)
+    (profile / "Last Version").write_text(last_version)
+    (profile / "Cookies").write_text("c")
+    return profile
+
+
+def test_chromium_profile_major(tmp_path):
+    (tmp_path / "Last Version").write_text("145.0.7632.6\n")
+    assert chromium.profile_major(tmp_path) == 145
+    assert chromium.profile_major(tmp_path / "missing") is None
+
+
+def test_chromium_upgrade_backs_up_its_profile(stack, tmp_path, monkeypatch):
+    _install_pinned(stack)
+    _chromium_profile()
+    monkeypatch.setattr(chromium, "patchright_major", lambda: 151)
+    monkeypatch.setattr(subprocess, "run", FakeRun())
+    outcome = _tx(tmp_path).run()
+    assert len(list(provision.CHROMIUM_PROFILE_DIR.parent.glob("browser-profile.pre-v145-*"))) == 1
+    assert "chromium=True" in outcome
+
+
+def test_chromium_backup_refusal_is_non_fatal(stack, tmp_path, monkeypatch, capsys):
+    _install_pinned(stack)
+    _chromium_profile()
+    monkeypatch.setattr(chromium, "patchright_major", lambda: 151)
+    monkeypatch.setattr(provision, "chromium_running", lambda: True)
+    monkeypatch.setattr(subprocess, "run", FakeRun())
+    outcome = _tx(tmp_path).run()
+    assert "FAILED: Chromium profile backup" in capsys.readouterr().out
+    assert "engine=True, chromium=False, launch=True" in outcome
+
+
+def test_chromium_backup_oserror_is_non_fatal(tmp_path, monkeypatch):
+    _chromium_profile()
+    monkeypatch.setattr(chromium, "patchright_major", lambda: 151)
+
+    def no_space(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(provision, "copy_aside", no_space)
+    monkeypatch.setattr(subprocess, "run", FakeRun())
+    assert _tx(tmp_path).chromium() is False
+
+
+def test_chromium_install_failure_is_non_fatal(stack, tmp_path, monkeypatch, capsys):
+    _install_pinned(stack)
+    run = FakeRun(fail=[lambda cmd: cmd[1:4] == ["-m", "patchright", "install"]])
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert "patchright install chromium exited 1" in capsys.readouterr().out
+    assert "DEGRADED (engine=True, chromium=False, launch=True)" in outcome
+    assert run.pip_calls() == [], "a Chromium failure never rolls the packages back"
+
+
+def test_chromium_that_does_not_launch_gets_its_system_libraries(stack, tmp_path, monkeypatch):
+    _install_pinned(stack)
+    launches = iter([False, True])
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        if cmd[1:2] == ["-c"] and "patchright" in cmd[2]:
+            return SimpleNamespace(returncode=0 if next(launches) else 1, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert ["sudo", "-n", "true"] in calls
+    assert any(c[:2] == ["sudo", "-n"] and "install-deps" in c for c in calls)
+    assert "chromium=True" in outcome
+
+
+def test_chromium_without_sudo_names_the_command(stack, tmp_path, monkeypatch, capsys):
+    _install_pinned(stack)
+
+    def run(cmd, **kw):
+        if cmd[:2] == ["sudo", "-n"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        if cmd[1:2] == ["-c"] and "patchright" in cmd[2]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert "install-deps chromium" in capsys.readouterr().out
+    assert "chromium=False" in outcome
+
+
+def test_chromium_backup_state(monkeypatch):
+    _chromium_profile("151.0.7700.1")
+    monkeypatch.setattr(chromium, "patchright_major", lambda: 151)
+    assert chromium.backup_state() == "ready"
+    monkeypatch.setattr(chromium, "patchright_major", lambda: 153)
+    assert chromium.backup_state() == "not_opened_by_the_new_chromium"
+    monkeypatch.setattr(chromium, "patchright_major", lambda: None)
+    assert chromium.backup_state() == "unknown"
+
+
+def test_the_chromium_launch_check_runs_the_binary_the_fallback_runs():
+    """A plain headless launch runs chromium-headless-shell, which links fewer
+    system libraries than the headed `chromium` the fallback uses."""
+    assert 'channel="chromium"' in chromium.SMOKE
+
+
+def test_a_signal_during_the_chromium_step_is_reported_not_raised(stack, tmp_path, monkeypatch):
+    _install_pinned(stack)
+    fake = FakeRun()
+
+    def run(cmd, **kw):
+        if cmd[1:4] == ["-m", "patchright", "install"]:
+            raise provision.ProvisionError("interrupted by signal SIGTERM")
+        return fake(cmd, **kw)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert "DEGRADED (engine=True, chromium=False, launch=True)" in outcome
+    assert fake.pip_calls() == []
+
+
+def test_no_chromium_step_after_a_camoufox_failure(stack, tmp_path, monkeypatch):
+    _install_pinned(stack)
+    run = FakeRun(fail=[lambda cmd: cmd[1:2] == ["-c"] and "AsyncCamoufox" in cmd[2]])
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert not [c for c, _ in run.calls if "patchright" in " ".join(c)]
+    assert "chromium=False" in outcome
+
+
+def test_chromium_still_down_after_install_deps_names_the_command(
+    stack, tmp_path, monkeypatch, capsys
+):
+    _install_pinned(stack)
+
+    def run(cmd, **kw):
+        if cmd[1:2] == ["-c"] and "patchright" in cmd[2]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    out = capsys.readouterr().out
+    assert "installing its system libraries" in out
+    assert "Run: sudo" in out and "install-deps chromium" in out
+    assert "chromium=False" in outcome

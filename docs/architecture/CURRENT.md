@@ -1429,9 +1429,12 @@ verified: 246808153 2026-09-24
   engine readiness: the launch guard and the `browser_automation` capability
   both use it; it never calls camoufox's own path lookup, which deletes a
   pre-0.5 engine and downloads) and `provision.py` (the one-process upgrade
-  transaction behind `scripts/install_browser_stack.sh`: it installs the
-  `browser` extra under the browser-stack lock and puts the previous packages
-  back on failure). `provision.py` deliberately does NOT use those pgrep
+  transaction behind `scripts/install_browser_stack.sh`: under the
+  browser-stack lock it installs the `browser` extra, backs up the Camoufox
+  profile, stages the paired Camoufox engine next to the old one and swaps it
+  in by rename only after it launches, and puts the previous packages back on
+  failure; `chromium.py` is its non-fatal patchright Chromium step).
+  `provision.py` deliberately does NOT use those pgrep
   patterns: its "is a browser running" check matches exact process names
   (`pgrep -x`), because a `pgrep -f` substring also matches any shell whose
   arguments merely mention the word. The automation TOOLS live in

@@ -297,12 +297,21 @@ prune_browser_backups() {
     # only worth keeping while the new stack might still need rolling back, so
     # they go after 14 days, and ONLY when the pinned engine is installed
     # ($2 = "ready": files present; launchability is not stored), so a broken
-    # install keeps its way back. A copy interrupted by a killed run
-    # (<backup>.<random>.tmp, provision.copy_aside's temp dir) is never a valid
-    # backup and goes after a day either way.
-    local home="${1:-$HOME}" engine_state="${2:-unknown}"
+    # install keeps its way back. The Chromium profile's copies
+    # (~/.genesis/browser-profile.pre-<label>-<time>) have their own gate ($3 =
+    # "ready": the upgraded Chromium has opened the profile), because the
+    # Camoufox engine's readiness says nothing about the Chromium stack. A copy
+    # interrupted by a killed run (<backup>.<random>.tmp, provision.copy_aside's
+    # temp dir) is never a valid backup and goes after a day either way.
+    local home="${1:-$HOME}" engine_state="${2:-unknown}" chromium_state="${3:-unknown}"
     local cache="${XDG_CACHE_HOME:-$home/.cache}"
-    _prune_browser_tree_set "$home/.genesis" -mtime +1 -name 'camoufox-profile.pre-*.tmp'
+    _prune_browser_tree_set "$home/.genesis" -mtime +1 \
+        \( -name 'camoufox-profile.pre-*.tmp' -o -name 'browser-profile.pre-*.tmp' \)
+    if [ "$chromium_state" = "ready" ]; then
+        _prune_browser_tree_set "$home/.genesis" -mtime +14 -name 'browser-profile.pre-*' ! -name '*.tmp'
+    else
+        echo "Chromium profile backups kept (state: $chromium_state)"
+    fi
     if [ "$engine_state" != "ready" ]; then
         echo "browser backups kept (engine state: $engine_state)"
         return 0
@@ -577,7 +586,10 @@ main() {
     local browser_state
     browser_state="$("$VENV_PY" -c 'from genesis.browser.engine import camoufox_engine_status as s; print("ready" if s().ready else s().state)' 2>/dev/null)" \
         || browser_state="unknown"
-    prune_browser_backups "$HOME" "$browser_state"
+    local chromium_state
+    chromium_state="$("$VENV_PY" -c 'from genesis.browser.chromium import backup_state as s; print(s())' 2>/dev/null)" \
+        || chromium_state="unknown"
+    prune_browser_backups "$HOME" "$browser_state" "$chromium_state"
 
     echo "=== genesis-disk-hygiene done ==="
     return "$disk_reclaim_rc"
