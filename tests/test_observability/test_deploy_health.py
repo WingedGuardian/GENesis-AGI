@@ -36,6 +36,10 @@ from genesis.observability.snapshots.deploy_health import (
     resolve_commit,
 )
 
+# importlib, not a plain import: snapshots/__init__.py re-exports the function
+# under the submodule's own name, so `import … as` would bind the function.
+dh_module = importlib.import_module("genesis.observability.snapshots.deploy_health")
+
 
 def _git(repo: Path, *args: str) -> str:
     out = subprocess.run(
@@ -706,6 +710,164 @@ def test_main_checkout_bounds_the_display_list_but_counts_exactly(deploy_root):
     assert got["count"] == n
     assert len(got["paths"]) == MAIN_CHECKOUT_PATHS_SHOWN
     assert got["paths_omitted"] == 3
+
+
+# Names git quotes in porcelain output under its default core.quotePath:
+# non-ASCII bytes as octal escapes, and a space, quote, backslash or control
+# character wherever it appears (measured, git 2.43).
+_UNUSUAL_NAMES = (
+    "café.md",
+    "sp ace.md",
+    'quo"te.md',
+    "back\\slash.md",
+    "tab\there.md",
+    "new\nline.md",
+)
+
+
+def _commit_and_edit(root: Path, names) -> None:
+    for name in names:
+        (root / name).write_text("v1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "unusual names")
+    for name in names:
+        (root / name).write_text("v2\n")
+
+
+def test_main_checkout_names_quoted_paths_as_the_files_they_are(deploy_root):
+    """A name git quotes is reported as the file an operator can find, not as
+    git's escaped form ("caf\\303\\251.md")."""
+    _commit_and_edit(deploy_root, _UNUSUAL_NAMES)
+    # Guard-the-guard: git really quotes these in the porcelain it prints.
+    assert '"caf\\303\\251.md"' in _git(deploy_root, "status", "--porcelain")
+    got = collect_main_checkout_dirty(deploy_root)
+    assert got["status"] == "dirty"
+    assert sorted(got["paths"]) == sorted(_UNUSUAL_NAMES)
+    assert got["count"] == len(_UNUSUAL_NAMES)
+
+
+def test_main_checkout_names_a_hidden_edit_to_a_quoted_path(deploy_root):
+    """The assume-unchanged pass reads diff-files --name-status, which quotes a
+    non-ASCII or control-character name but NOT a space (measured, git 2.43)."""
+    _commit_and_edit(deploy_root, ["café.md"])
+    _git(deploy_root, "checkout", "--", "café.md")
+    _git(deploy_root, "update-index", "--assume-unchanged", "café.md")
+    (deploy_root / "café.md").write_text("hidden edit\n")
+    assert _git(deploy_root, "status", "--porcelain") == ""  # really hidden
+    assert collect_main_checkout_dirty(deploy_root)["paths"] == ["café.md"]
+
+
+def test_main_checkout_one_file_quoted_in_one_pass_and_not_the_other(deploy_root):
+    """A staged edit to "sp ace.md" arrives quoted from git status and the hidden
+    edit unquoted from diff-files: still one file."""
+    _commit_and_edit(deploy_root, ["sp ace.md"])
+    _git(deploy_root, "add", "sp ace.md")
+    _git(deploy_root, "update-index", "--assume-unchanged", "sp ace.md")
+    (deploy_root / "sp ace.md").write_text("v2\nthen edited\n")
+    got = collect_main_checkout_dirty(deploy_root)
+    assert got["paths"] == ["sp ace.md"]
+    assert got["count"] == 1
+
+
+def test_main_checkout_a_non_utf8_name_does_not_raise(deploy_root, monkeypatch):
+    """core.quotePath=false makes git print a name's raw bytes, and a POSIX name
+    need not be valid UTF-8. The collector must report the edit, with the bad
+    byte shown escaped, and never raise: a raise here took the whole deploy-health
+    snapshot down to "error", unrelated findings with it. LC_ALL=C makes the
+    predicate's grep pass the line through (under a UTF-8 locale it drops it,
+    which is the shared predicate's own defect and is tracked separately)."""
+    name = b"lat\xe9.md"
+    (deploy_root / os.fsdecode(name)).write_bytes(b"v1\n")
+    _git(deploy_root, "add", "-A")
+    _git(deploy_root, "commit", "-qm", "latin-1 name")
+    _git(deploy_root, "config", "core.quotePath", "false")
+    (deploy_root / os.fsdecode(name)).write_bytes(b"v2\n")
+    monkeypatch.setenv("LC_ALL", "C")
+    got = collect_main_checkout_dirty(deploy_root)
+    assert got["status"] == "dirty"
+    assert got["paths"] == ["lat\\xe9.md"]
+
+
+def test_main_checkout_counts_a_file_once_when_staged_and_hidden(deploy_root):
+    """A staged edit shows in git status and a further worktree edit behind
+    assume-unchanged shows in the hidden pass: two status records, one file."""
+    (deploy_root / "a.txt").write_text("staged\n")
+    _git(deploy_root, "add", "a.txt")
+    _git(deploy_root, "update-index", "--assume-unchanged", "a.txt")
+    (deploy_root / "a.txt").write_text("staged\nthen edited\n")
+    got = collect_main_checkout_dirty(deploy_root)
+    assert got["status"] == "dirty"
+    assert got["count"] == 1
+    assert got["paths"] == ["a.txt"]
+
+
+def test_main_checkout_a_failed_read_still_kills_the_probe(deploy_root, tmp_path, monkeypatch):
+    """A read that fails for any reason other than the timeout also kills the
+    probe's group before the failure propagates, so no git grandchild outlives
+    it; the collector then reports unknown rather than raising."""
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    pidfile = tmp_path / "git.pids"
+    (shim / "git").write_text('#!/bin/sh\necho $$ >> "$GIT_SHIM_PIDS"\nexec sleep 300\n')
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    monkeypatch.setenv("GIT_SHIM_PIDS", str(pidfile))
+    real_popen = subprocess.Popen
+
+    class FailingRead(real_popen):
+        failed = False
+
+        def communicate(self, input=None, timeout=None):
+            if not FailingRead.failed:
+                FailingRead.failed = True
+                deadline = time.monotonic() + 10  # let the shim git start first
+                while time.monotonic() < deadline and not pidfile.exists():
+                    time.sleep(0.05)
+                raise RuntimeError("read failed")
+            return super().communicate(input=input, timeout=timeout)
+
+    monkeypatch.setattr(dh_module.subprocess, "Popen", FailingRead)
+    got = collect_main_checkout_dirty(deploy_root, timeout=60.0)
+    assert got["status"] == "unknown"
+    assert got["reason"] == "collector failed: RuntimeError"
+    pids = [int(p) for p in pidfile.read_text().split()]
+    assert pids, "precondition: the shim git really ran"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not all(_pid_gone(p) for p in pids):
+        time.sleep(0.05)
+    leftover = [p for p in pids if not _pid_gone(p)]
+    for p in leftover:  # never leak a sleeper past the test, whatever happens
+        os.kill(p, signal.SIGKILL)
+    assert not leftover, f"git grandchildren survived the failed read: {leftover}"
+
+
+def test_main_checkout_collector_failure_is_unknown_not_raised(deploy_root, monkeypatch):
+    """Like every other collector here, an unexpected failure degrades to its
+    own unknown instead of escaping into deploy_health(), whose catch-all would
+    drop every unrelated finding on the tick."""
+
+    def broken(repo, timeout):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(dh_module, "_collect_main_checkout_dirty", broken)
+    got = collect_main_checkout_dirty(deploy_root)
+    assert got["status"] == "unknown"
+    assert got["reason"] == "collector failed: RuntimeError"
+
+
+@pytest.mark.parametrize(
+    ("quoted", "raw"),
+    [
+        (b"plain.txt", b"plain.txt"),
+        (b'"caf\\303\\251.md"', "café.md".encode()),
+        (b'"a\\tb\\nc\\"d\\\\e"', b'a\tb\nc"d\\e'),
+        # Escapes git never emits are kept literally rather than raising.
+        (b'"bad\\q\\9z"', b"bad\\q\\9z"),
+        (b'"trailing\\"', b"trailing\\"),
+    ],
+)
+def test_git_unquote(quoted, raw):
+    assert dh_module._git_unquote(quoted) == raw
 
 
 def test_derive_findings_main_checkout_keys():

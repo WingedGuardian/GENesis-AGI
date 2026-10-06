@@ -343,6 +343,78 @@ def _probe_reason(rc: int, err: str) -> str:
     return f"probe exited {rc}" + (f": {last}" if last else "")
 
 
+# git's C-style path quoting (quote.c): inside the double quotes a backslash
+# introduces one of these escapes, or three octal digits encoding one byte.
+_GIT_C_ESCAPES = {
+    ord("a"): 0x07,
+    ord("b"): 0x08,
+    ord("t"): 0x09,
+    ord("n"): 0x0A,
+    ord("v"): 0x0B,
+    ord("f"): 0x0C,
+    ord("r"): 0x0D,
+    ord('"'): 0x22,
+    ord("\\"): 0x5C,
+}
+_OCTAL_DIGITS = frozenset(b"01234567")
+
+
+def _git_unquote(name: bytes) -> bytes:
+    """Undo git's C-style quoting of one path (``"caf\\303\\251.md"`` is
+    ``café.md``); an unquoted path comes back as is. git quotes a path that
+    holds a space, a quote, a backslash or a control character, and, under the
+    default ``core.quotePath``, any byte above 0x7F. Never raises: an escape git
+    would not emit is kept literally."""
+    if len(name) < 2 or name[:1] != b'"' or name[-1:] != b'"':
+        return name
+    body, out, i = name[1:-1], bytearray(), 0
+    while i < len(body):
+        if body[i] == 0x5C and i + 1 < len(body):
+            if body[i + 1] in _GIT_C_ESCAPES:
+                out.append(_GIT_C_ESCAPES[body[i + 1]])
+                i += 2
+                continue
+            digits = body[i + 1 : i + 4]
+            if len(digits) == 3 and all(d in _OCTAL_DIGITS for d in digits):
+                out.append(int(digits, 8) & 0xFF)
+                i += 4
+                continue
+        out.append(body[i])
+        i += 1
+    return bytes(out)
+
+
+def _dirty_paths(out: bytes) -> list[str]:
+    """Distinct file names in the predicate's porcelain lines, first-seen order.
+
+    A line is two status columns, a space and the path (``--no-renames``, so
+    never an ``a -> b`` pair; a name holding a newline is always quoted, so
+    splitting on newlines is safe). The names are for display, so the bytes are
+    decoded with any invalid UTF-8 shown escaped: a decode error must not take
+    the snapshot down. One file can appear twice, as a staged change in ``git
+    status`` and a hidden worktree change from the assume-unchanged pass, and
+    is counted once: ``count`` is files, not status records."""
+    names: dict[bytes, None] = {}  # deduplicated on the raw bytes, before the lossy decode
+    for line in out.split(b"\n"):
+        if len(line) > 3:
+            names.setdefault(_git_unquote(line[3:]), None)
+    return [name.decode("utf-8", "backslashreplace") for name in names]
+
+
+def _kill_probe_group(proc: subprocess.Popen) -> None:
+    # start_new_session made the probe its own group leader, so its pid is the
+    # group id; > 1 is checked anyway, since killpg(1) signals everything.
+    if proc.pid > 1:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    # Bounded even now: a descendant that left the group (none in these libs)
+    # would hold the pipes open, and an unbounded read would wait on it. The
+    # probe itself is dead, so wait() returns at once.
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.communicate(timeout=5)
+    proc.wait()
+
+
 def collect_main_checkout_dirty(repo: Path, *, timeout: float = _CHEAP_TIMEOUT_S) -> dict:
     """Tracked files edited in place in the deploy checkout (ephemeral paths
     excluded): the condition under which ``deploy_code_only.sh`` and
@@ -350,16 +422,23 @@ def collect_main_checkout_dirty(repo: Path, *, timeout: float = _CHEAP_TIMEOUT_S
 
     ``status`` is one of:
 
-    - ``clean`` / ``dirty`` — the predicate answered; ``count`` is exact and
-      ``paths`` names at most :data:`MAIN_CHECKOUT_PATHS_SHOWN` of them, with
-      ``paths_omitted`` saying how many more there are;
+    - ``clean`` / ``dirty`` — the predicate answered; ``count`` is the exact
+      number of files and ``paths`` names at most
+      :data:`MAIN_CHECKOUT_PATHS_SHOWN` of them, with ``paths_omitted`` saying
+      how many more there are. ``clean`` answers the tracked-edit question
+      only: the deploy scripts also refuse on the branch and on incoming files
+      that collide with untracked ones, which this does not check;
     - ``not_deploy_root`` — ``repo`` is a linked worktree (a dev tree running
       the code), so it is not the checkout deploys touch;
     - ``deploying`` — a deploy is in progress (``env.update_in_progress()``):
       not probed, since a deploy's own merge would read as dirty;
     - ``unknown`` — it could not be read (a lib failed to source, git failed,
-      the probe timed out or could not start); ``reason`` says which. Never
-      reported as clean: an unreadable tree must not resolve a standing alert.
+      the probe timed out or could not start, or the collector itself failed);
+      ``reason`` says which. Never reported as clean: an unreadable tree must
+      not resolve a standing alert.
+
+    Never raises: like every other collector here it degrades on its own
+    failure, so the rest of the snapshot survives one bad read.
 
     Read-only by contract. ``GIT_OPTIONAL_LOCKS=0`` stops ``git status`` from
     refreshing and rewriting the index (which takes ``index.lock`` and could make
@@ -370,6 +449,19 @@ def collect_main_checkout_dirty(repo: Path, *, timeout: float = _CHEAP_TIMEOUT_S
     that file behind (inert to git). The probe runs in its own process group,
     and a timeout kills the whole group, so no git grandchild outlives it.
     """
+    try:
+        return _collect_main_checkout_dirty(repo, timeout)
+    except Exception as exc:
+        logger.warning("deploy_health: main-checkout collector failed", exc_info=True)
+        return {
+            "status": "unknown",
+            "count": 0,
+            "paths": [],
+            "reason": f"collector failed: {type(exc).__name__}",
+        }
+
+
+def _collect_main_checkout_dirty(repo: Path, timeout: float) -> dict:
     from genesis import env
     from genesis.session_awareness.zero_drop_git import scrubbed_git_env
 
@@ -381,12 +473,13 @@ def collect_main_checkout_dirty(repo: Path, *, timeout: float = _CHEAP_TIMEOUT_S
     run_env["GIT_OPTIONAL_LOCKS"] = "0"
     argv = ["bash", "-c", _MAIN_CHECKOUT_PROBE, "_", str(repo), str(marker_lib), str(checkout_lib)]
     try:
+        # Bytes, not text: a tracked name need not be valid UTF-8 (raw under
+        # core.quotePath=false), and decoding the whole stream would raise.
         proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell interpolation
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
-            text=True,
             env=run_env,
             start_new_session=True,
         )
@@ -394,19 +487,9 @@ def collect_main_checkout_dirty(repo: Path, *, timeout: float = _CHEAP_TIMEOUT_S
         logger.warning("deploy_health: main-checkout probe could not start: %s", exc)
         return {"status": "unknown", "count": 0, "paths": [], "reason": f"could not start: {exc}"}
     try:
-        out, err = proc.communicate(timeout=timeout)
+        out, err_bytes = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        # start_new_session made the probe its own group leader, so its pid is
-        # the group id; > 1 is checked anyway, since killpg(1) signals everything.
-        if proc.pid > 1:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
-        # Bounded even now: a descendant that left the group (none in these
-        # libs) would hold the pipes open, and an unbounded read would wait on
-        # it. The probe itself is dead, so wait() returns at once.
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.communicate(timeout=5)
-        proc.wait()
+        _kill_probe_group(proc)
         logger.warning("deploy_health: main-checkout probe timed out after %ss", timeout)
         return {
             "status": "unknown",
@@ -414,16 +497,18 @@ def collect_main_checkout_dirty(repo: Path, *, timeout: float = _CHEAP_TIMEOUT_S
             "paths": [],
             "reason": f"timed out after {timeout:g}s",
         }
+    except BaseException:
+        _kill_probe_group(proc)
+        raise
     rc = proc.returncode
     if rc == 3:
         return {"status": "not_deploy_root", "count": 0, "paths": []}
     if rc != 0:
+        err = err_bytes.decode("utf-8", "backslashreplace")
         logger.warning("deploy_health: main-checkout probe rc=%s stderr=%s", rc, err.strip())
         return {"status": "unknown", "count": 0, "paths": [], "reason": _probe_reason(rc, err)}
-    # Porcelain lines: two status columns, a space, the path (--no-renames, so
-    # never an "a -> b" pair). The predicate already dropped untracked and
-    # ephemeral lines.
-    paths = [line[3:] for line in out.splitlines() if len(line) > 3]
+    # The predicate already dropped untracked and ephemeral lines.
+    paths = _dirty_paths(out)
     shown = paths[:MAIN_CHECKOUT_PATHS_SHOWN]
     return {
         "status": "dirty" if paths else "clean",
@@ -515,12 +600,21 @@ def derive_findings(
         findings.append(f"stale_update:{round(update_age_days, 1)}d,{commits_behind}behind")
     if commits_behind is not None and commits_behind > behind_threshold:
         findings.append(f"behind_upstream:{commits_behind}")
-    checkout_status = (main_checkout or {}).get("status")
-    if checkout_status == "dirty":
-        findings.append(f"main_checkout_dirty:{main_checkout.get('count', 0)}")
-    elif checkout_status == "unknown":
-        findings.append("main_checkout_unreadable")
+    findings.extend(main_checkout_findings(main_checkout))
     return findings
+
+
+def main_checkout_findings(main_checkout: dict | None) -> list[str]:
+    """The finding keys a ``collect_main_checkout_dirty`` dict contributes. The
+    one producer of ``main_checkout_*`` keys: :func:`derive_findings` uses it,
+    and so does the awareness check when it carries a previous tick's checkout
+    reading forward over a tick whose own reading it cannot act on."""
+    status = (main_checkout or {}).get("status")
+    if status == "dirty":
+        return [f"main_checkout_dirty:{main_checkout.get('count', 0)}"]
+    if status == "unknown":
+        return ["main_checkout_unreadable"]
+    return []
 
 
 # ── Snapshot entry point (HealthDataService) ────────────────────────

@@ -43,6 +43,7 @@ def _reset_cooldowns(monkeypatch):
     monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
     monkeypatch.setattr(loop, "_last_deploy_alert_key", "")
     monkeypatch.setattr(loop, "_last_main_checkout_status", "")
+    monkeypatch.setattr(loop, "_last_actionable_main_checkout", None)
 
 
 def _snap(
@@ -420,3 +421,126 @@ async def test_a_tick_during_a_deploy_leaves_the_dirty_alert_standing(db, monkey
     _patch_snapshot(monkeypatch, _snap([], main_checkout={"status": "deploying"}))
     await loop._check_deploy_staleness(db)
     assert [r["id"] for r in await _rows(db)] == [dirty_row["id"]]
+
+
+# A tick whose checkout reading is not acted on (the first unreadable one, or
+# one during a deploy) still reconciles every other finding class: holding the
+# whole check would hide a missing unit or a sustained staleness read
+# conclusively on the same tick, for as long as the probe stays intermittent.
+_MISSING = ["x.timer"]
+_MISSING_AND_UNREADABLE = ["missing_units:x.timer", "main_checkout_unreadable"]
+
+
+async def test_first_unreadable_tick_still_raises_an_independent_finding(db, monkeypatch):
+    _patch_snapshot(monkeypatch, _snap([]))
+    await loop._check_deploy_staleness(db)  # an actionable clean reading
+    _patch_snapshot(
+        monkeypatch,
+        _snap(_MISSING_AND_UNREADABLE, missing_units=_MISSING, main_checkout=_UNKNOWN),
+    )
+    await loop._check_deploy_staleness(db)
+    (row,) = await _rows(db)
+    assert "missing systemd units: x.timer" in row["content"]
+    # The first unreadable tick still raises no unreadable finding of its own.
+    assert "main_checkout_unreadable" not in row["content"]
+    assert "could not be read" not in row["content"]
+
+
+async def test_first_unreadable_tick_carries_a_standing_dirty_reading(db, monkeypatch):
+    """A drift class appears while the probe times out over a standing dirty
+    alert: the new alert carries the LAST dirty reading (its count and names),
+    and the dirty-only row is superseded, never resolved as if cleared."""
+    _patch_snapshot(monkeypatch, _snap(["main_checkout_dirty:1"], main_checkout=_dirty()))
+    await loop._check_deploy_staleness(db)
+    (dirty_row,) = await _rows(db)
+    _patch_snapshot(
+        monkeypatch,
+        _snap(
+            ["tier2_pending:2", "main_checkout_unreadable"],
+            tier2=["a", "b"],
+            main_checkout=_UNKNOWN,
+        ),
+    )
+    await loop._check_deploy_staleness(db)
+    (active,) = await _rows(db)
+    assert active["id"] != dirty_row["id"]
+    content = active["content"]
+    assert "NOT fully deployed" in content
+    assert "1 tracked file(s) edited in place" in content
+    assert "identity/STEERING.md" in content
+    assert "main_checkout_dirty:1" in content
+    assert "As of the previous check" in content
+    assert "main_checkout_unreadable" not in content
+    (old,) = await _rows(db, resolved=1)
+    assert old["id"] == dirty_row["id"]
+    assert old["resolution_notes"] == loop._DEPLOY_SUPERSEDED_NOTE
+
+
+async def test_an_unreadable_tick_does_not_stall_missing_unit_escalation(db, monkeypatch):
+    _patch_snapshot(monkeypatch, _snap(["missing_units:x.timer"], missing_units=_MISSING))
+    await loop._check_deploy_staleness(db)
+    old = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    await db.execute(f"UPDATE observations SET created_at=? WHERE source='{SOURCE}'", (old,))
+    await db.commit()
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    _patch_snapshot(
+        monkeypatch,
+        _snap(_MISSING_AND_UNREADABLE, missing_units=_MISSING, main_checkout=_UNKNOWN),
+    )
+    await loop._check_deploy_staleness(db)
+    assert [r["priority"] for r in await _rows(db)] == ["critical"]
+
+
+async def test_a_tick_during_a_deploy_still_reconciles_drift(db, monkeypatch):
+    _patch_snapshot(monkeypatch, _snap([]))
+    await loop._check_deploy_staleness(db)
+    _patch_snapshot(
+        monkeypatch,
+        _snap(
+            ["missing_units:x.timer"], missing_units=_MISSING, main_checkout={"status": "deploying"}
+        ),
+    )
+    await loop._check_deploy_staleness(db)
+    (row,) = await _rows(db)
+    assert "missing systemd units: x.timer" in row["content"]
+
+
+async def test_with_nothing_to_carry_after_a_restart_one_tick_holds(db, monkeypatch):
+    """A restarted process has no actionable checkout reading to carry forward,
+    so an unreadable first tick still holds the whole check: a dirty alert
+    standing from before the restart must not be superseded by a drift-only
+    one. The hold is bounded, because the next consecutive unreadable tick is
+    acted on."""
+    _patch_snapshot(monkeypatch, _snap(["main_checkout_dirty:1"], main_checkout=_dirty()))
+    await loop._check_deploy_staleness(db)
+    (dirty_row,) = await _rows(db)
+    # The restart: module state gone, the dirty alert still standing in the DB.
+    monkeypatch.setattr(loop, "_last_main_checkout_status", "")
+    monkeypatch.setattr(loop, "_last_actionable_main_checkout", None)
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    monkeypatch.setattr(loop, "_last_deploy_alert_key", "")
+    _patch_snapshot(
+        monkeypatch,
+        _snap(_MISSING_AND_UNREADABLE, missing_units=_MISSING, main_checkout=_UNKNOWN),
+    )
+    await loop._check_deploy_staleness(db)
+    assert [r["id"] for r in await _rows(db)] == [dirty_row["id"]]
+    await loop._check_deploy_staleness(db)
+    (row,) = await _rows(db)
+    assert "missing systemd units: x.timer" in row["content"]
+    assert "could not be read" in row["content"]
+
+
+async def test_after_a_restart_with_no_dirty_alert_the_first_check_reconciles(db, monkeypatch):
+    """The server restarts several times a day, and the hourly check's first run
+    after one usually has nothing in memory to carry. With no dirty alert
+    standing in the store there is nothing to protect, so an unreadable first
+    tick must not hold back a missing unit read on the same tick."""
+    _patch_snapshot(
+        monkeypatch,
+        _snap(_MISSING_AND_UNREADABLE, missing_units=_MISSING, main_checkout=_UNKNOWN),
+    )
+    await loop._check_deploy_staleness(db)
+    (row,) = await _rows(db)
+    assert "missing systemd units: x.timer" in row["content"]
+    assert "could not be read" not in row["content"]

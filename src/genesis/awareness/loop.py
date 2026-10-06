@@ -1393,44 +1393,76 @@ _last_deploy_alert_at: float = 0.0
 _last_deploy_alert_key: str = ""
 # The deploy checkout's status on the previous tick (deploy_health's
 # main_checkout["status"]). An unreadable status raises its finding only on the
-# SECOND consecutive tick, so one slow git call never alerts; on the first one
-# the whole check holds, because acting on it would resolve a standing dirty
-# alert as if the tree had been restored.
+# SECOND consecutive tick, so one slow git call never alerts.
 _last_main_checkout_status: str = ""
+# The main_checkout dict from the last tick whose reading the check acted on.
+# A tick whose own reading cannot be acted on (the first unreadable one, or one
+# during a deploy) uses this instead: the checkout component keeps its previous
+# state while every other finding class is reconciled as usual. Acting on the
+# reading itself would resolve a standing dirty alert as if the tree had been
+# restored; holding the whole check would also hold missing-unit and staleness
+# findings that were read conclusively on the same tick. None until this
+# process's first actionable tick, which after a restart (several a day) is
+# usually the first check. Then the store decides: with no unresolved dirty
+# alert, the checkout contributes nothing and the rest is reconciled; with one
+# standing, the whole check holds, because nothing in memory says the dirty
+# state and a drift-only alert must not supersede it. That hold is bounded: a
+# second consecutive unreadable tick is actionable, so an unreadable probe holds
+# at most one tick, and a deploy only while it runs.
+_last_actionable_main_checkout: dict | None = None
 
 
 async def _check_deploy_staleness(db) -> None:
     """Alert when merged changes have not been DEPLOYED here (see block comment).
 
     Best-effort — the whole body is guarded and never raises into the tick."""
-    global _last_deploy_alert_at, _last_deploy_alert_key, _last_main_checkout_status
+    global _last_deploy_alert_at, _last_deploy_alert_key
+    global _last_main_checkout_status, _last_actionable_main_checkout
     if db is None:
         return
     try:
         # Submodule import (the package __init__ shadows the submodule name
         # with the function of the same name) — resolved per call, so tests
         # can monkeypatch the module attribute.
-        from genesis.observability.snapshots.deploy_health import deploy_health
+        from genesis.observability.snapshots.deploy_health import (
+            deploy_health,
+            main_checkout_findings,
+        )
 
         snap = await deploy_health(db)
         if snap.get("status") == "error":
             return
+        findings = snap.get("findings") or []
         checkout = snap.get("main_checkout") or {}
         checkout_status = checkout.get("status") or ""
         previous_checkout_status = _last_main_checkout_status
         _last_main_checkout_status = checkout_status
-        # Hold the whole check (no new alert, no resolution) on a tick whose
-        # deploy-checkout answer cannot be trusted yet: a deploy in progress
-        # (its own merge reads as dirty, and it would otherwise resolve a
-        # standing dirty alert), or the FIRST unreadable tick. Acting on either
-        # would resolve a dirty alert as if the tree had been restored; a
-        # second consecutive unreadable tick raises main_checkout_unreadable,
-        # which supersedes the dirty row instead. One tick is an hour.
+        # A deploy in progress (its own merge reads as dirty) or the FIRST
+        # unreadable tick: this tick's checkout reading is not acted on. Its
+        # checkout findings are replaced by the last actionable reading's, so a
+        # standing dirty alert is neither resolved as if the tree had been
+        # restored nor superseded, while every other finding class on the tick
+        # is reconciled as usual. A second consecutive unreadable tick IS acted
+        # on: it raises main_checkout_unreadable, which supersedes the dirty
+        # row. One tick is an hour.
+        carried = False
         if checkout_status == "deploying" or (
             checkout_status == "unknown" and previous_checkout_status != "unknown"
         ):
-            return
-        findings = snap.get("findings") or []
+            if _last_actionable_main_checkout is not None:
+                checkout = _last_actionable_main_checkout
+                carried = True
+            elif await observations.has_unresolved_matching(
+                db, source="deploy_staleness_monitor", content_like="%main_checkout_dirty%"
+            ):
+                return  # a dirty alert stands and nothing in memory says its state
+            else:
+                checkout = {}
+            findings = [
+                f for f in findings if f.split(":", 1)[0] not in _DEPLOY_CHECKOUT_CLASSES
+            ] + main_checkout_findings(checkout)
+        else:
+            _last_actionable_main_checkout = checkout
         if not findings:
             await _resolve_deploy_staleness(db)
             return
@@ -1513,7 +1545,12 @@ async def _check_deploy_staleness(db) -> None:
         if set(classes) - _DEPLOY_CHECKOUT_CLASSES:
             paragraphs.append(_deploy_drift_paragraph(snap, age_days, behind, git_facts))
         if "main_checkout_dirty" in classes:
-            paragraphs.append(_deploy_checkout_dirty_paragraph(checkout))
+            paragraph = _deploy_checkout_dirty_paragraph(checkout)
+            if carried:
+                paragraph += (
+                    " (As of the previous check: this check could not read the deploy checkout.)"
+                )
+            paragraphs.append(paragraph)
         if "main_checkout_unreadable" in classes:
             paragraphs.append(
                 "The deploy checkout's tracked-file status could not be read on two "
