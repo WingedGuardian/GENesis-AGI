@@ -527,8 +527,20 @@ Two triggers, two labels:
      label.
 
 Leave it OPEN (genesis-development, "Never RETIRE a PR you are not the one
-reviving"). The session that completes the rework marks it ready, removes the
-label, and requests review.
+reviving"). A rework normally comes back as a FRESH PR with a new number, so
+its round count is its own (owner rulings 2026-09-24 and 2026-10-05). The
+reworking session opens the replacement and names the old PR in its body. Those
+rulings are the on-record owner authorization (condition 1 of
+genesis-development's superseded-PR exception) for closing the old draft once
+the replacement is open. Conditions 2 and 3 are still checked per PR. So the
+closing session closes the old draft only when every part is covered by the
+replacement or moot, with the per-file mapping in the closing comment, and then
+completes the step-4 follow-up, citing the replacement PR. If any part is neither,
+it leaves the old PR open with a comment naming that part, and updates the
+follow-up to name it too, since the follow-up is what keeps the draft visible.
+Reworking on the old number is an
+owner-approved exception; there, the session that completes the rework marks it
+ready, removes the label, and requests review.
 
 ---
 
@@ -588,9 +600,11 @@ happened already. Before requesting or answering any further review:
      decide one.
    - **SOUND-BUT-INFERIOR with a named better shape that changes the mechanism or
      the files touched**: kick it back to Devin. Post the audit as a PR comment
-     WITHOUT `(aside)`, so Devin's monitor acts on it, and tell it to rework on
-     this branch rather than close the PR and open a replacement. Then convert the
-     PR to draft (`gh pr ready <N> --undo`) and add the `needs-rework` label.
+     WITHOUT `(aside)`, so Devin's monitor acts on it. Tell it to bring the
+     rework back as a fresh PR with a new number that names this one, and not to
+     close this PR itself (it has closed old PRs on its own before, #2309 and #2354).
+     Then convert the PR to draft (`gh pr ready <N> --undo`) and add the
+     `needs-rework` label.
    - **SOUND, or local defects at any severity**: post the audit and continue the
      ordinary per-PR loop.
 
@@ -602,13 +616,22 @@ happened already. Before requesting or answering any further review:
 4. **Track every kick-back.** A draft leaves the closing set and nothing reads the
    label, so open one follow-up per batch with `work_state="blocked_on_trigger"`
    (it waits on Devin, so it is not actionable now) naming each PR and its audit
-   comment, with a `revisit_condition` saying what unblocks it: Devin pushed the
-   rework and marked it ready, or the owner decided. Re-check those PRs on each
-   queue sweep.
-5. **When a kicked-back PR comes back ready,** request `@codex review` (marking a
-   draft ready is not a reliable trigger) and work it normally. If Devin closed it
-   and opened a replacement instead, which happened with #2309 and #2354, link the
-   two on both PRs and leave the round count to the owner.
+   comment, with a `revisit_condition` saying what unblocks it: Devin opened the
+   replacement PR naming this one (or, as an owner-approved exception, pushed the
+   rework to this branch and marked it ready), or the owner decided. Re-check those
+   PRs, and the open PRs that name them, on each queue sweep.
+5. **When the rework arrives as its replacement PR,** link the two on both PRs and
+   work the replacement normally; read its round count from
+   `scripts/review_budget.py` like any other PR's. Check whether the replacement
+   supersedes the old PR completely, under genesis-development's superseded-PR
+   exception (condition 1 is met by the rulings cited in section 5): every part
+   covered or moot. If it does, close the old draft with the per-file mapping and
+   complete the step-4 follow-up, citing the replacement. If it does not, leave the
+   old PR open with a comment naming what is missing, and update the follow-up to
+   name it, so the unfinished part stays tracked. If Devin pushed the rework onto the old branch instead and marked it
+   ready, that reuse is an owner-approved exception: ask the owner before
+   spending a round on it. With the owner's yes, request `@codex review` (marking
+   a draft ready is not a reliable trigger) and work it normally.
 
 **One writer per branch.** While a kick-back is outstanding, the closing session
 does not push to that branch. Its own replies there carry `(aside)`, since every
