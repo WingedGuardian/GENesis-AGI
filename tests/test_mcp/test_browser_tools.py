@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
 import signal
@@ -34,6 +35,7 @@ def _clear_all_browser_state():
     browser._remote_cdp_url = None
     browser._remote_last_url = None
     browser._remote_target_ids = {}
+    browser._remote_openers = {}
     browser._remote_inflight = set()
     # TinyFish state
     browser._tinyfish_pw = None
@@ -4101,3 +4103,244 @@ class TestClickFollowRoundOneFixes:
             result = await browser._impl_browser_click("#open")
         assert browser._active_page is dest
         assert result["new_page"]["url"] == "https://dest.example"
+
+
+class TestClickFollowRoundTwoFixes:
+    """Round-2 review of the new-tab follow (PR #2948)."""
+
+    def _remote(self, original):
+        browser._remote_browser = _mock_remote_browser(connected=True)
+        browser._remote_page = original
+        browser._remote_cdp_url = _URL
+        browser._remote_target_ids[_URL] = "GEN-1"
+        browser._active_page = original
+
+    async def _follow_remote_popup(self):
+        original = _EventPage("https://a.example", target_id="GEN-1")
+        popup = _EventPage("https://accounts.example/signin", target_id="GEN-2")
+        self._remote(original)
+        with patch.object(browser, "_stealth_click", new=_popup_click(original, popup)):
+            await _click()
+        assert browser._remote_target_ids[_URL] == "GEN-2"  # precondition: followed
+        return original, popup
+
+    @pytest.mark.asyncio
+    async def test_a_reconnect_after_the_followed_tab_closed_returns_to_its_opener(self):
+        """Codex 4197439539: an idle cleanup dropped the opener chain, so with
+        the sign-in popup gone the reconnect opened a new tab while the
+        original Genesis tab was still open."""
+        await self._follow_remote_popup()
+        await browser._cleanup_remote_cdp()  # idle reclaim: every page object goes
+        still_open = _cdp_page("https://a.example", "GEN-1")
+        new_browser = _mock_remote_browser(pages=[_cdp_page("https://mail.example", "USER"), still_open])
+        new_browser.contexts[0].new_page = AsyncMock(return_value=_cdp_page("about:blank", "GEN-NEW"))
+        result = await _connect(new_browser)
+        assert result is still_open
+        new_browser.contexts[0].new_page.assert_not_awaited()
+        assert browser._remote_target_ids[_URL] == "GEN-1"
+
+    @pytest.mark.asyncio
+    async def test_a_dropped_connection_keeps_the_way_back(self):
+        """Codex 4197439539: a CDP drop closes every page object, opener first,
+        so the popup's close handler finds no live opener; that must not lose
+        the original tab for the reconnect."""
+        original, popup = await self._follow_remote_popup()
+        original.close_now()  # the driver's disconnect: pages close in attach order
+        popup.close_now()
+        browser._on_remote_disconnected(browser._remote_browser)
+        still_open = _cdp_page("https://a.example", "GEN-1")
+        new_browser = _mock_remote_browser(pages=[still_open])
+        new_browser.contexts[0].new_page = AsyncMock(return_value=_cdp_page("about:blank", "GEN-NEW"))
+        assert await _connect(new_browser) is still_open
+        new_browser.contexts[0].new_page.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_followed_tab_reused_by_a_reconnect_is_dropped_when_it_closes(self):
+        """Codex 4197439539: the reused popup had no close handling, so after it
+        closed the tools kept the dead page and the next reconnect opened a
+        fresh tab instead of the original."""
+        await self._follow_remote_popup()
+        await browser._cleanup_remote_cdp()
+        reused = _EventPage("https://accounts.example/signin", target_id="GEN-2")
+        reused._target_id = "GEN-2"
+        first = _mock_remote_browser(pages=[_cdp_page("https://a.example", "GEN-1"), reused])
+        assert await _connect(first) is reused
+        browser._active_page = reused  # browser_navigate makes it the active page
+        reused.close_now()
+        assert browser._remote_page is None
+        assert browser._active_page is None
+        still_open = _cdp_page("https://a.example", "GEN-1")
+        second = _mock_remote_browser(pages=[still_open])
+        second.contexts[0].new_page = AsyncMock(return_value=_cdp_page("about:blank", "GEN-NEW"))
+        assert await _connect(second) is still_open
+        second.contexts[0].new_page.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_going_back_to_the_opener_shortens_the_kept_chain(self):
+        original, popup = await self._follow_remote_popup()
+        assert browser._remote_openers[_URL] == ["GEN-1"]
+        popup.close_now()
+        assert browser._remote_page is original
+        assert browser._remote_openers[_URL] == []
+
+    @pytest.mark.asyncio
+    async def test_a_popup_seen_before_a_sent_click_fails_is_followed(self):
+        """Codex 4197439549: the click was delivered, opened a tab, then raised
+        (the opener closed, a post-click wait timed out); the tab must not be
+        abandoned untracked."""
+        original = _EventPage("https://a.example")
+        popup = _EventPage("https://b.example", title="B")
+        browser._page = original
+        browser._active_page = original
+
+        async def click(page, selector, timeout=10000):
+            page.emit("popup", popup)
+            raise Exception(_SENT_LOG)
+
+        with patch.object(browser, "_stealth_click", new=click):
+            result = await _click()
+        assert "error" not in result
+        assert browser._active_page is popup and browser._page is popup
+        assert result["new_page"]["url"] == "https://b.example"
+        assert "may already have taken effect" in result["warning"]
+
+    @pytest.mark.asyncio
+    async def test_a_sent_click_that_opened_nothing_still_reports_the_error(self):
+        original = _EventPage("https://a.example")
+        browser._page = original
+        browser._active_page = original
+
+        async def click(page, selector, timeout=10000):
+            raise Exception(_SENT_LOG)
+
+        with patch.object(browser, "_stealth_click", new=click):
+            result = await _click()
+        assert "may already have taken effect" in result["error"]
+        assert browser._active_page is original
+
+    @pytest.mark.asyncio
+    async def test_a_failure_after_the_follow_still_reports_the_followed_tab(self):
+        """Codex 4197439549 class: an error once the tools have switched tabs
+        must say so, and must not read as a click that never happened. A
+        defensive path: _snapshot_page itself returns a placeholder rather than
+        raise, but page.url on a disposed page can."""
+        original = _EventPage("https://a.example")
+        popup = _EventPage("https://b.example")
+        browser._page = original
+        browser._active_page = original
+        with (
+            patch.object(browser, "_stealth_click", new=_popup_click(original, popup)),
+            patch.object(browser, "_snapshot_page", new=AsyncMock(side_effect=RuntimeError("gone"))),
+        ):
+            result = await _click()
+        assert browser._active_page is popup
+        assert "may already have taken effect" in result["error"]
+        assert result["new_page"]["url"] == "https://b.example"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_clicks_on_a_page_do_not_claim_each_others_tab(self):
+        """Codex 4197439558: click B, listening while click A's tab arrived,
+        reported A's tab as its own."""
+        original = _EventPage("https://a.example")
+        popup = _EventPage("https://b.example")
+        browser._page = original
+        browser._active_page = original
+        b_clicked = asyncio.Event()
+
+        async def click(page, selector, timeout=10000):
+            if selector == "#b":
+                b_clicked.set()  # B opens nothing
+                return
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(b_clicked.wait(), timeout=0.2)
+            page.emit("popup", popup)
+
+        with (
+            patch.object(browser, "_stealth_click", new=click),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=AsyncMock()),
+            patch.object(browser, "_NEW_TAB_WAIT_S", 0.3),
+        ):
+            a, b = await asyncio.gather(
+                browser._impl_browser_click("#a"), browser._impl_browser_click("#b")
+            )
+        assert a["new_page"]["url"] == "https://b.example"
+        assert "new_page" not in b
+        assert browser._active_page is popup
+
+    @pytest.mark.asyncio
+    async def test_a_key_press_waits_for_a_clicks_tab_watch(self):
+        """Codex 4197439558 class: a key press opening a tab during a click's
+        wait was claimed by that click."""
+        original = _EventPage("https://a.example")
+        keyed = _EventPage("https://k.example")
+        original.keyboard = MagicMock()
+        original.keyboard.press = AsyncMock(side_effect=lambda _k: original.emit("popup", keyed))
+        browser._page = original
+        browser._active_page = original
+        with (
+            patch.object(browser, "_stealth_click", new=_popup_click(original, None)),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=AsyncMock()),
+            patch.object(browser, "_NEW_TAB_WAIT_S", 0.3),
+        ):
+            clicked, _ = await asyncio.gather(
+                browser._impl_browser_click("#a"), browser._impl_browser_press_key("Enter")
+            )
+        assert "new_page" not in clicked
+        assert browser._active_page is original
+
+    @pytest.mark.asyncio
+    async def test_a_tool_waiting_on_a_busy_page_gives_up_before_its_timeout(self):
+        """Fresh review SF-1: a key press queued behind a click must not wait
+        into its own tool timeout, whose expiry resets the active page under
+        the click; it returns, having sent nothing."""
+        original = _EventPage("https://a.example")
+        popup = _EventPage("https://b.example")
+        original.keyboard = MagicMock()
+        original.keyboard.press = AsyncMock()
+        browser._page = original
+        browser._active_page = original
+        release = asyncio.Event()
+
+        async def slow_click(page, selector, timeout=10000):
+            await release.wait()
+            page.emit("popup", popup)
+
+        async def press_then_release():
+            out = await browser._impl_browser_press_key("Enter")
+            release.set()
+            return out
+
+        with (
+            patch.object(browser, "_stealth_click", new=slow_click),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=AsyncMock()),
+            patch.object(browser, "_NEW_TAB_WAIT_S", 0.3),
+            patch.object(browser, "_PAGE_ACTION_WAIT_S", 0.05, create=True),
+        ):
+            clicked, pressed = await asyncio.gather(
+                browser._impl_browser_click("#a"), press_then_release()
+            )
+        assert "nothing was sent" in pressed["error"]
+        original.keyboard.press.assert_not_awaited()
+        assert clicked["new_page"]["url"] == "https://b.example"
+        assert browser._active_page is popup
+
+    @pytest.mark.asyncio
+    async def test_a_reused_followed_tab_that_closes_during_the_reconnect_is_not_driven(self):
+        """Fresh review N-2: closed during the reconnect's target lookup, before
+        its close handler existed, it must not be published as the driven tab."""
+        await self._follow_remote_popup()
+        await browser._cleanup_remote_cdp()
+        reused = _EventPage("https://accounts.example/signin", target_id="GEN-2")
+        reused._target_id = "GEN-2"
+        session = reused.context.new_cdp_session.return_value
+
+        async def close_while_asked(*_a):
+            reused.close_now()
+            return {"targetInfo": {"targetId": "GEN-2"}}
+
+        session.send = AsyncMock(side_effect=close_while_asked)
+        await _connect(_mock_remote_browser(pages=[_cdp_page("https://a.example", "GEN-1"), reused]))
+        assert browser._remote_page is None
