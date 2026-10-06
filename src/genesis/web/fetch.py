@@ -40,10 +40,8 @@ def _log_scrapling_unavailable_once() -> None:
         return
     _scrapling_failure_logged = True
     logger.warning(
-        "Scrapling is unavailable, so web fetches use plain httpx without TLS "
-        "impersonation. Installing the browser extra into Genesis's virtualenv "
-        "(pip install -e '.[browser]' from the Genesis checkout) supplies the "
-        "playwright and browserforge packages that import needs. Import error: %s",
+        "Scrapling is unavailable: its fetcher could not be imported, so web "
+        "fetches use plain httpx without TLS impersonation. Import error: %s",
         _SCRAPLING_IMPORT_ERROR,
         exc_info=_SCRAPLING_IMPORT_ERROR,
     )
@@ -142,7 +140,7 @@ class WebFetcher:
         return body, resp.status, content_type, None
 
     async def _fetch_httpx(self, url: str) -> tuple[str, int, str, str | None]:
-        """Fetch via plain httpx (fallback when Scrapling not installed).
+        """Fetch via plain httpx (fallback when Scrapling's fetcher cannot be imported).
 
         Returns (body, status_code, content_type, error).
         """
