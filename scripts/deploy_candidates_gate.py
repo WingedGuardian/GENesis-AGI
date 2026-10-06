@@ -110,6 +110,7 @@ REFUSAL_FILES = (
     "scripts/lib/alert_queue.sh",
     "scripts/lib/deploy_status.sh",
     "scripts/lib/live_system_guard.sh",
+    "scripts/lib/checkout_lock.sh",
     # Read with `cat` before the branch check and run as python later: the
     # serving read runs inside `deploy_code_only.sh status`, which readiness runs.
     "scripts/lib/serving_commit.py",

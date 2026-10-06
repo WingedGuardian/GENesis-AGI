@@ -14,6 +14,13 @@ genesis_checkout_lock() {
         return 0
     fi
     wait_s="${GENESIS_CHECKOUT_LOCK_WAIT_S:-300}"
+    case "$wait_s" in
+        ''|*[!0-9]*)
+            # A typo here must not read as "checkout busy" further down.
+            echo "WARNING: GENESIS_CHECKOUT_LOCK_WAIT_S='$wait_s' is not a whole number of seconds; using 300" >&2
+            wait_s=300
+            ;;
+    esac
     # ASSUMED, unmeasured bound
     # Shared holders can starve a waiting exclusive lock, as in deploy_code_only.sh.
     if flock -x -w "$wait_s" "$GENESIS_CHECKOUT_LOCK_FD"; then

@@ -7016,6 +7016,33 @@ async def test_checkout_admission_order_and_release(invoker, monkeypatch, stream
         assert events[-1] == "release"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_a_launch_waiting_for_checkout_admission_is_listed_in_flight(
+    invoker, monkeypatch, streaming
+):
+    """A launch is registered in flight BEFORE it waits for checkout admission, so
+    while a deploy holds the lock the waiting launch is visible to the deploy's
+    session scan, which then refuses the restart instead of ending it unlisted."""
+    import genesis.cc.invoker as inv_mod
+    from genesis.util import inflight
+
+    _track_checkout_admission(monkeypatch, invoker, streaming=streaming)
+    seen = []
+    real_admit = inv_mod.admit_launch
+
+    async def admit():
+        seen.append([item.kind for item in inflight.snapshot()])
+        return await real_admit()
+
+    monkeypatch.setattr(inv_mod, "admit_launch", admit)
+    if streaming:
+        await invoker.run_streaming(CCInvocation(prompt="hello"))
+    else:
+        await invoker.run(CCInvocation(prompt="hello"))
+    assert seen and "claude" in seen[0]
+
+
 def test_verify_checks_the_settings_file_built_from_the_launch_pins(invoker, monkeypatch):
     """The binding check must read the file built from the SAME pins the
     launch used, not recompute them (a recomputation can hash to another file)."""
