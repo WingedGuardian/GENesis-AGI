@@ -1,4 +1,4 @@
-"""Provision the browser stack: the ``browser`` extra and the Camoufox engine.
+"""Provision the browser stack: the ``browser`` extra, the Camoufox engine, safe upgrades.
 
 ``python -m genesis.browser.provision run --root <repo> --lib <venv_setup.sh>`` is
 the whole transaction, in ONE process so nothing it learns has to be passed
@@ -9,14 +9,16 @@ its caller: problems print, the outcome line is printed last, and the
 Steps, in order (all under the browser-stack lock held EXCLUSIVE, so two runs
 never overlap and no browser launches mid-run; a running browser holds it SHARED):
   1. preflight: enough disk, and no browser running (an upgrade under a live
-     browser would swap its engine mid-use). Anything it cannot determine
-     counts as "not safe": skip and say why. The installed
+     browser would swap its engine and copy its profile mid-write). Anything
+     it cannot determine counts as "not safe": skip and say why. The installed
      camoufox/playwright/patchright versions are recorded in memory.
   2. install the ``browser`` extra through the worktree-guarded installer in
      scripts/lib/venv_setup.sh (its one home), then check the packages import,
      that camoufox carries a browser pin, and that every installed version
      satisfies the extra's ranges (the installer masks pip's exit status).
-  3. the engine. A ``camoufox set`` choice of another build is reset to the
+  3. copy the Camoufox profile if a newer Firefox major is about to open it
+     (Firefox refuses a profile last used by a newer version).
+  4. the engine. A ``camoufox set`` choice of another build is reset to the
      paired one first. Already ready: nothing to do. An install root in
      camoufox 0.5's side-by-side layout: ``camoufox fetch`` in place (it adds a
      version and deletes nothing). Anything else (a pre-0.5 engine, the residue
@@ -27,10 +29,10 @@ never overlap and no browser launches mid-run; a running browser holds it SHARED
      own fetch deletes a pre-0.5 root BEFORE downloading; staging keeps the old
      engine in place for the whole download, so only the two renames are not
      atomic, and signals are held off while they run.
-  4. launch Camoufox headless once, with the new packages.
-  5. refresh ``browser_automation`` in ~/.genesis/capabilities.json, so the
+  5. launch Camoufox headless once, with the new packages.
+  6. refresh ``browser_automation`` in ~/.genesis/capabilities.json, so the
      capability reflects the new state without a server restart.
-If step 2, 3 or 4 fails (or the run is interrupted by SIGTERM, SIGINT or SIGHUP)
+If step 2, 3, 4 or 5 fails (or the run is interrupted by SIGTERM, SIGINT or SIGHUP)
 before the swap, the root was never touched, so the only thing to undo is the
 packages: the versions recorded in step 1 are reinstalled, any browser package
 the step added is removed, and the old engine works again. Every step runs in
@@ -42,6 +44,7 @@ rather than run beside it.
 from __future__ import annotations
 
 import argparse
+import configparser
 import contextlib
 import datetime as _dt
 import fcntl
@@ -98,6 +101,7 @@ SMOKE_TIMEOUT_S = 300
 # session TMPDIR is the shared, quota-capped cc-tmp volume (2 GB measured), and
 # a 1.3 GB engine download there breaks every session at once.
 STAGING_PARENT = Path.home() / "tmp"
+PROFILE_DIR = Path.home() / ".genesis" / "camoufox-profile"
 LOCK_FILE = BROWSER_LOCK_FILE
 CAPABILITIES_FILE = Path.home() / ".genesis" / "capabilities.json"
 CAPABILITY = "browser_automation"
@@ -291,6 +295,97 @@ def preflight() -> str | None:
             "when no browser session is active"
         )
     return None
+
+
+# ── backups ───────────────────────────────────────────────────────────────
+
+
+def copy_aside(src: Path, label: str) -> Path:
+    """Copy ``src`` to ``<src>.pre-<label>-<timestamp>``, replacing older copies.
+
+    Called only while the profile still records the OLD version, so the newest
+    copy is the one a rollback needs: after an upgrade that failed before the
+    newer browser opened the profile, the user kept using it, and a copy from the
+    first attempt would lose everything since. Older copies with the same label
+    are removed only after the new one is complete. The copy is built inside a
+    TemporaryDirectory next to ``src`` and renamed out of it when complete, so an
+    interrupted copy is never taken for a finished one and any failure removes
+    it; a run killed outright leaves a ``*.tmp`` directory that
+    scripts/disk_hygiene.sh removes after a day. The copy is stamped
+    with today's time so retention ages it from today.
+    """
+    stamp = _dt.datetime.now(_dt.UTC).strftime("%Y%m%dT%H%M%S")
+    older = [p for p in src.parent.glob(f"{src.name}.pre-{label}-*") if not p.name.endswith(".tmp")]
+    dest = src.with_name(f"{src.name}.pre-{label}-{stamp}")
+    n = 1
+    while dest.exists():  # a second copy within the same second
+        dest = src.with_name(f"{src.name}.pre-{label}-{stamp}-{n}")
+        n += 1
+    with tempfile.TemporaryDirectory(
+        dir=src.parent, prefix=f"{dest.name}.", suffix=".tmp", ignore_cleanup_errors=True
+    ) as work:
+        copied = Path(work) / src.name
+        shutil.copytree(src, copied, symlinks=True)
+        # copytree keeps the profile's own mtime, which is its last browser
+        # session and can be older than the 14-day retention; stamped before the
+        # rename, so a finished backup always ages from today.
+        os.utime(copied)
+        copied.rename(dest)
+    for stale in older:
+        if stale != dest:
+            shutil.rmtree(stale, ignore_errors=True)
+    return dest
+
+
+def firefox_profile_major(profile: Path) -> int | None:
+    """Major Firefox version that last opened ``profile`` (compatibility.ini)."""
+    parser = configparser.ConfigParser()
+    try:
+        if not parser.read(profile / "compatibility.ini"):
+            return None
+        return int(parser.get("Compatibility", "LastVersion").split(".", 1)[0])
+    except (configparser.Error, ValueError):
+        return None
+
+
+def _major(version: str) -> int | None:
+    """Leading number of a version string; None when it has none (back it up)."""
+    try:
+        return int(version.split(".", 1)[0])
+    except ValueError:
+        return None
+
+
+def _running_check(kind: str) -> Callable[[], bool | None]:
+    # Looked up at call time so tests can patch the module attributes.
+    if kind == "Camoufox":
+        return camoufox_running
+    if kind == "Chromium":
+        return chromium_running
+    return browsers_running
+
+
+def backup_if_upgrading(
+    profile: Path, last_major: int | None, new_major: int | None, kind: str
+) -> None:
+    """Copy ``profile`` once before a newer major first opens it.
+
+    Stateless: the trigger is the profile's own record of the version that last
+    opened it, so once the new version has opened it no further copy is made.
+    An unreadable version on either side means "back it up": a missed copy of a
+    one-way profile upgrade cannot be recovered, an extra copy can be pruned.
+    """
+    if not profile.is_dir() or not any(profile.iterdir()):
+        return
+    if last_major is not None and new_major is not None and last_major >= new_major:
+        return
+    # Re-check right before copying: the preflight answer is minutes old by now.
+    # Only the browser that owns this profile matters here.
+    if _running_check(kind)() is not False:
+        raise ProvisionError(f"a browser may be using the {kind} profile; not copying it")
+    label = f"v{last_major}" if last_major is not None else "vunknown"
+    backup = copy_aside(profile, label)
+    _say(f"backed up the {kind} profile (last opened by {label}) to {backup}")
 
 
 # ── capability ────────────────────────────────────────────────────────────
@@ -538,8 +633,16 @@ class Transaction:
                 f"the [browser] extra is not satisfied after install: {'; '.join(unmet)}"
             )
 
-    # step 3
+    # steps 3 and 4
     def engine(self) -> None:
+        pin = camoufox_pin()
+        if pin:
+            backup_if_upgrading(
+                PROFILE_DIR,
+                firefox_profile_major(PROFILE_DIR),
+                _major(pin.version),
+                "Camoufox",
+            )
         status = camoufox_engine_status()
         if status.state == OVERRIDDEN:
             # A bare `camoufox fetch` would fetch the overriding build, which the
@@ -678,7 +781,7 @@ class Transaction:
                     f"`{sys.executable} -m pip uninstall {' '.join(added)}` by hand"
                 )
 
-    # step 4
+    # step 5
     def smoke(self, env: dict[str, str] | None = None, install_dir: Path | None = None) -> bool:
         status = (
             camoufox_engine_status(install_dir=install_dir)

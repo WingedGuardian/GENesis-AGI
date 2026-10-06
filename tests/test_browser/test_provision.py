@@ -8,6 +8,8 @@ The hazards it exists for (measured on camoufox 0.5.7):
   * the new packages cannot drive the old engine, so a failure before the swap
     reinstalls the package versions that were there before and removes any the
     run added;
+  * a Firefox profile opened by a newer version is refused by an older one, so
+    it is copied once before the newer version first opens it;
   * a step is usually a wrapper (bash running pip): an interrupt must stop the
     step's whole process tree before the rollback starts a second pip.
 No test downloads or launches anything: subprocess steps are stubbed.
@@ -38,6 +40,7 @@ PIN = engine.CamoufoxPin("156.0.1", "beta.34", "official")
 def _isolated(tmp_path, monkeypatch):
     """Every path the transaction can write is inside tmp_path."""
     home = tmp_path / "home"
+    monkeypatch.setattr(provision, "PROFILE_DIR", home / ".genesis" / "camoufox-profile")
     monkeypatch.setattr(provision, "LOCK_FILE", home / ".genesis" / "locks" / "provision.lock")
     monkeypatch.setattr(provision, "STAGING_PARENT", home / "tmp")
     monkeypatch.setattr(provision, "CAPABILITIES_FILE", home / ".genesis" / "capabilities.json")
@@ -1118,3 +1121,176 @@ def test_unchanged_packages_say_nothing_about_restarting(stack, tmp_path, monkey
     _versions(monkeypatch, NEW, NEW)
     _tx(tmp_path).run()
     assert "restart" not in capsys.readouterr().out
+
+
+# ── stateless profile backups ─────────────────────────────────────────────
+
+
+def _firefox_profile(profile: Path, last_version: str = "135.0.1-beta.24_x/x") -> Path:
+    profile.mkdir(parents=True)
+    (profile / "compatibility.ini").write_text(f"[Compatibility]\nLastVersion={last_version}\n")
+    (profile / "cookies.sqlite").write_text("c")
+    return profile
+
+
+def test_an_engine_upgrade_backs_up_the_profile_first(stack, tmp_path, monkeypatch):
+    _legacy_engine(stack)
+    _firefox_profile(provision.PROFILE_DIR)
+    order = []
+
+    def fetch(install_dir, env):
+        order.append(("fetch", len(list(provision.PROFILE_DIR.parent.glob("camoufox-profile.pre-v135-*")))))
+        _install_pinned(install_dir)
+
+    monkeypatch.setattr(subprocess, "run", FakeRun(fetch=fetch))
+    outcome = _tx(tmp_path).run()
+    assert order == [("fetch", 1)], "the copy exists before the new engine is fetched"
+    assert "engine=True" in outcome
+
+
+def test_profile_copy_failure_restores_packages_and_leaves_the_engine(stack, tmp_path, monkeypatch):
+    """ENOSPC while copying the profile happens before any engine change."""
+    _legacy_engine(stack)
+    _firefox_profile(provision.PROFILE_DIR)
+    _versions(monkeypatch, OLD, NEW)
+
+    def no_space(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(provision, "copy_aside", no_space)
+    run = FakeRun(fetch=_install_pinned)
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert (stack / "camoufox-bin").exists()
+    assert not [c for c, _ in run.calls if c[1:3] == ["-m", "camoufox"]], "never fetched"
+    assert [c[3] for c in run.pip_calls()] == ["install", "uninstall"]
+    assert "DEGRADED" in outcome
+
+
+def test_backup_only_when_a_newer_major_will_open_the_profile(tmp_path):
+    profile = _firefox_profile(tmp_path / "camoufox-profile")
+    last = provision.firefox_profile_major(profile)
+    assert last == 135
+    provision.backup_if_upgrading(profile, last, 156, "Camoufox")
+    assert len(list(tmp_path.glob("camoufox-profile.pre-v135-*"))) == 1
+    provision.backup_if_upgrading(profile, last, 156, "Camoufox")
+    assert len(list(tmp_path.glob("camoufox-profile.pre-v135-*"))) == 1
+    provision.backup_if_upgrading(profile, 156, 156, "Camoufox")
+    assert len(list(tmp_path.glob("camoufox-profile.pre-*"))) == 1
+
+
+def test_each_profile_checks_only_its_own_browser(tmp_path, monkeypatch):
+    """A running desktop-automation Chromium must not block the Camoufox copy, and
+    a running Camoufox must not block the Chromium copy."""
+    camoufox_profile = tmp_path / "camoufox-profile"
+    camoufox_profile.mkdir()
+    (camoufox_profile / "prefs.js").write_text("x")
+    monkeypatch.setattr(provision, "camoufox_running", lambda: False)
+    monkeypatch.setattr(provision, "chromium_running", lambda: True)
+    provision.backup_if_upgrading(camoufox_profile, 135, 156, "Camoufox")
+    assert len(list(tmp_path.glob("camoufox-profile.pre-v135-*"))) == 1
+
+    chromium_profile = tmp_path / "browser-profile"
+    chromium_profile.mkdir()
+    (chromium_profile / "Cookies").write_text("c")
+    monkeypatch.setattr(provision, "camoufox_running", lambda: True)
+    monkeypatch.setattr(provision, "chromium_running", lambda: False)
+    provision.backup_if_upgrading(chromium_profile, 145, 151, "Chromium")
+    assert len(list(tmp_path.glob("browser-profile.pre-v145-*"))) == 1
+
+    monkeypatch.setattr(provision, "chromium_running", lambda: None)
+    other = tmp_path / "other" / "browser-profile"
+    other.mkdir(parents=True)
+    (other / "Cookies").write_text("c")
+    with pytest.raises(provision.ProvisionError, match="may be using the Chromium"):
+        provision.backup_if_upgrading(other, 145, 151, "Chromium")
+
+
+def test_interrupted_copy_is_not_a_backup(tmp_path):
+    src = tmp_path / "camoufox-profile"
+    src.mkdir()
+    (src / "cookies.sqlite").write_text("c")
+    leftover = tmp_path / "camoufox-profile.pre-v135-20200101.tmp"
+    leftover.mkdir()
+    made = provision.copy_aside(src, "v135")
+    assert made is not None and (made / "cookies.sqlite").read_text() == "c"
+    assert leftover.is_dir(), "a killed run's temp is disk_hygiene's to remove, not a backup"
+
+
+def test_a_backup_ages_from_today_not_from_the_profile(tmp_path):
+    """copytree keeps the profile's mtime (its last session); a backup of a
+    profile unused for a month must not be pruned on its first day."""
+    src = tmp_path / "camoufox-profile"
+    src.mkdir()
+    (src / "prefs.js").write_text("x")
+    month_ago = time.time() - 30 * 86400
+    os.utime(src, (month_ago, month_ago))
+    made = provision.copy_aside(src, "v135")
+    assert abs(made.stat().st_mtime - time.time()) < 60
+
+
+def test_an_unreadable_pin_version_still_backs_up(stack, tmp_path, monkeypatch):
+    _install_pinned(stack)
+    _firefox_profile(provision.PROFILE_DIR)
+    monkeypatch.setattr(provision, "camoufox_pin", lambda: engine.CamoufoxPin("dev", "x", "official"))
+    monkeypatch.setattr(subprocess, "run", FakeRun())
+    _tx(tmp_path).run()
+    assert len(list(provision.PROFILE_DIR.parent.glob("camoufox-profile.pre-v135-*"))) == 1
+
+
+def test_firefox_profile_major(tmp_path):
+    (tmp_path / "compatibility.ini").write_text(
+        "[Compatibility]\nLastVersion=135.0.1-beta.24_20250315105650/20250315105650\n"
+    )
+    assert provision.firefox_profile_major(tmp_path) == 135
+    assert provision.firefox_profile_major(tmp_path / "missing") is None
+
+
+def test_unknown_version_still_backs_up(tmp_path):
+    profile = tmp_path / "camoufox-profile"
+    profile.mkdir()
+    (profile / "prefs.js").write_text("x")
+    provision.backup_if_upgrading(profile, None, 156, "Camoufox")
+    assert len(list(tmp_path.glob("camoufox-profile.pre-vunknown-*"))) == 1
+
+
+def test_backup_refused_while_its_browser_runs(tmp_path, monkeypatch):
+    profile = tmp_path / "camoufox-profile"
+    profile.mkdir()
+    (profile / "prefs.js").write_text("x")
+    monkeypatch.setattr(provision, "camoufox_running", lambda: True)
+    with pytest.raises(provision.ProvisionError, match="may be using"):
+        provision.backup_if_upgrading(profile, 135, 156, "Camoufox")
+
+
+def test_a_retry_refreshes_the_profile_backup(tmp_path):
+    """After a failed upgrade the user kept using the old browser; the backup a
+    later rollback needs is the newest one, not the first attempt's."""
+    profile = tmp_path / "camoufox-profile"
+    profile.mkdir()
+    (profile / "cookies.sqlite").write_text("first")
+    provision.backup_if_upgrading(profile, 135, 156, "Camoufox")
+    (profile / "cookies.sqlite").write_text("after the failed attempt")
+    provision.backup_if_upgrading(profile, 135, 156, "Camoufox")
+    backups = list(tmp_path.glob("camoufox-profile.pre-v135-*"))
+    assert len(backups) == 1
+    assert (backups[0] / "cookies.sqlite").read_text() == "after the failed attempt"
+
+
+def test_failed_copy_leaves_no_temp_and_keeps_the_old_backup(tmp_path, monkeypatch):
+    profile = tmp_path / "camoufox-profile"
+    profile.mkdir()
+    (profile / "prefs.js").write_text("x")
+    first = provision.copy_aside(profile, "v135")
+
+    def no_space(src, dst, **kw):
+        Path(dst).mkdir()
+        (Path(dst) / "half").write_text("x")
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(provision.shutil, "copytree", no_space)
+    with pytest.raises(OSError):
+        provision.copy_aside(profile, "v135")
+    assert not list(tmp_path.glob("*.tmp"))
+    assert first.is_dir()
+    assert len(list(tmp_path.glob("camoufox-profile.pre-v135-*"))) == 1
