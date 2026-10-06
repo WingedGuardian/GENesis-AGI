@@ -114,21 +114,48 @@ PY
         rb_commit="$(git -C "$GENESIS_ROOT" rev-parse -q --verify "refs/tags/$ROLLBACK_TAG^{commit}" 2>/dev/null)" \
             || _crash_recovery_refuse "rollback tag $ROLLBACK_TAG cannot be resolved to a commit"
 
-        if git -C "$GENESIS_ROOT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+        current_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+        if [ "$ORIGINAL_BRANCH_PRESENT" = "1" ]; then
+            [ -n "$ORIGINAL_BRANCH" ] || _crash_recovery_refuse "the recorded original branch is empty"
+            recovery_branch="$ORIGINAL_BRANCH"
+        else
+            recovery_branch="$current_branch"
+        fi
+
+        if merge_head="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'MERGE_HEAD^{commit}' 2>/dev/null)"; then
+            # Prove the merge is this update's BEFORE aborting it: update.sh starts
+            # its merge with HEAD at the rollback tag on the original branch and
+            # MERGE_HEAD at the recorded deploy head. Anything else is someone
+            # else's merge, or an operator's, and aborting it would destroy work.
+            [ "$ORIGINAL_BRANCH_PRESENT" = "1" ] \
+                || _crash_recovery_refuse "old-format update state cannot prove the in-progress merge is this update's"
+            genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$recovery_branch" \
+                || _crash_recovery_refuse "the in-progress merge does not start from this update's rollback tag on $recovery_branch"
+            [ -n "$DEPLOY_HEAD" ] && [ "$merge_head" = "$DEPLOY_HEAD" ] \
+                || _crash_recovery_refuse "the in-progress merge is not of this update's deploy head"
             merge_abort_dir="$EPHEMERAL_BACKUP_ROOT/merge-abort"
             if ! mkdir -p "$merge_abort_dir" \
                 || ! chmod 700 "$EPHEMERAL_BACKUP_ROOT" "$merge_abort_dir"; then
                 _crash_recovery_refuse "cannot create the merge-abort backup directory"
             fi
+            # Every path that differs from HEAD, not only the unmerged ones: an
+            # operator's staged resolution is a merged path the abort discards. The
+            # index is saved as a binary patch as well, so staged content survives.
+            if ! git -C "$GENESIS_ROOT" diff --cached --binary HEAD > "$merge_abort_dir/index.patch"; then
+                _crash_recovery_refuse "cannot save the index before aborting the merge"
+            fi
             unmerged_paths="$(mktemp "$merge_abort_dir/.unmerged.XXXXXX")" \
-                || _crash_recovery_refuse "cannot create a temporary unmerged-path list"
-            if ! git -C "$GENESIS_ROOT" diff --name-only --diff-filter=U -z > "$unmerged_paths"; then
+                || _crash_recovery_refuse "cannot create a temporary changed-path list"
+            if ! git -C "$GENESIS_ROOT" diff --name-only -z HEAD > "$unmerged_paths"; then
                 rm -f "$unmerged_paths"
-                _crash_recovery_refuse "cannot list unmerged paths before aborting the merge"
+                _crash_recovery_refuse "cannot list changed paths before aborting the merge"
             fi
             merge_copy_failure=""
             merge_copy_count=0
             while IFS= read -r -d '' merge_path; do
+                # A path deleted in the working tree has nothing to copy; its
+                # content is in HEAD and in index.patch.
+                [ -e "$GENESIS_ROOT/$merge_path" ] || [ -L "$GENESIS_ROOT/$merge_path" ] || continue
                 merge_parent="$(dirname -- "$merge_path")"
                 if ! mkdir -p "$merge_abort_dir/$merge_parent" \
                     || ! cp -p -- "$GENESIS_ROOT/$merge_path" "$merge_abort_dir/$merge_path"; then
@@ -138,13 +165,13 @@ PY
                 merge_copy_count=$((merge_copy_count + 1))
             done < "$unmerged_paths"
             if ! rm -f "$unmerged_paths"; then
-                _crash_recovery_refuse "cannot remove the temporary unmerged-path list"
+                _crash_recovery_refuse "cannot remove the temporary changed-path list"
             fi
             if [ -n "$merge_copy_failure" ]; then
                 _crash_recovery_refuse "cannot save unmerged path $merge_copy_failure before aborting the merge"
             fi
             if [ "$merge_copy_count" -gt 0 ]; then
-                echo "  Saved $merge_copy_count unmerged file(s) to $merge_abort_dir before aborting the merge."
+                echo "  Saved $merge_copy_count changed file(s) and the index to $merge_abort_dir before aborting the merge."
             fi
             echo "  Aborting in-progress merge..."
             if ! git -C "$GENESIS_ROOT" merge --abort 2>&1; then
@@ -152,19 +179,20 @@ PY
             fi
         fi
 
-        current_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD 2>/dev/null || true)"
-        if [ "$ORIGINAL_BRANCH_PRESENT" = "1" ]; then
-            [ -n "$ORIGINAL_BRANCH" ] || _crash_recovery_refuse "the recorded original branch is empty"
-            recovery_branch="$ORIGINAL_BRANCH"
-        else
-            recovery_branch="$current_branch"
-        fi
         if genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$recovery_branch"; then
             dirty_paths=""
             if ! dirty_paths="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")"; then
                 dirty_paths="(status unreadable)"
             fi
             if [ -n "$dirty_paths" ]; then
+                # In the merging phase, a dirty checkout at the tag is what a
+                # fast-forward killed mid-write leaves: HEAD unmoved, files half
+                # new. update.sh treats that state as CRITICAL; installing over it
+                # would run half-written code, so refuse and keep the state file.
+                if [ "$STATE_PHASE" = "merging" ]; then
+                    printf '%s\n' "$dirty_paths" | sed 's/^/    /'
+                    _crash_recovery_refuse "the checkout is at $ROLLBACK_TAG but tracked files changed during the merge (a half-written update or edits by someone else)"
+                fi
                 echo "  WARNING: tracked paths may be an interrupted merge's files or someone's edits; nothing was reset:"
                 printf '%s\n' "$dirty_paths" | sed 's/^/    /'
             fi

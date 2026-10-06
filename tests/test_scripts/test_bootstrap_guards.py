@@ -994,7 +994,10 @@ def test_merge_abort_preserves_unmerged_paths_and_refuses_lost_edits(
     if case == "rewritten-conflict":
         _assert_recovered(proc, state_path, root, rollback)
         assert (backup / conflict_path).read_text() == edited_content
-        assert f"  Saved 1 unmerged file(s) to {backup} before aborting the merge." in proc.stdout
+        assert (
+            f"  Saved 1 changed file(s) and the index to {backup} before aborting the merge."
+            in proc.stdout
+        )
         assert not (root / ".git" / "MERGE_HEAD").exists()
     else:
         _assert_recovery_refused(proc, state_path)
@@ -1046,8 +1049,83 @@ def test_recovery_warns_at_tag_or_skips_a_live_process(
         assert state_path.exists()
         assert _recovery_git(root, "rev-parse", "HEAD") == deploy
         return
+    if phase == "merging":
+        # A dirty checkout at the tag in the merging phase is what a fast-forward
+        # killed mid-write leaves. update.sh treats it as CRITICAL, so bootstrap
+        # refuses too (owner ruling 2026-10-06) and keeps the state and the edit.
+        _assert_recovery_refused(proc, state_path)
+        assert "tracked files changed during the merge" in proc.stdout + proc.stderr
+        assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+        assert local.read_text() == "operator edit\n"
+        return
     _assert_recovered(proc, state_path, root, rollback)
     assert "may be an interrupted merge's files or someone's edits; nothing was reset" in proc.stdout
     assert local.read_text() == "operator edit\n"
-    if case == "old-format":
-        assert "nothing to undo" in proc.stdout
+
+
+def _merge_in_progress(tmp_path: Path, *, foreign: bool) -> tuple[Path, str, str]:
+    """A crashed update's merge left in progress, with the operator's resolution
+    staged. ``foreign`` makes the in-progress merge someone else's: MERGE_HEAD is
+    not the recorded deploy head."""
+    root, common, rollback = _recovery_repo(tmp_path)
+    _recovery_git(root, "checkout", "-qb", "incoming", common)
+    deploy = _recovery_commit_file(root, "local.txt", "incoming\n", "incoming")
+    merged = "incoming"
+    if foreign:
+        _recovery_git(root, "checkout", "-qb", "other", common)
+        _recovery_commit_file(root, "local.txt", "foreign\n", "foreign")
+        merged = "other"
+    _recovery_git(root, "checkout", "-q", "main")
+    merge = subprocess.run(
+        ["git", "-C", str(root), "merge", "--no-ff", "--no-edit", merged],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert merge.returncode != 0, "the fixture needs a conflicted merge"
+    (root / "local.txt").write_text("OPERATOR RESOLUTION\n")
+    _recovery_git(root, "add", "--", "local.txt")
+    return root, rollback, deploy
+
+
+def test_a_staged_resolution_is_saved_before_the_merge_is_aborted(tmp_path):
+    """B1: an operator's STAGED resolution is a merged path, which the old
+    unmerged-only backup missed; the abort then destroyed it (reproduced on the
+    PR head before this fix)."""
+    root, rollback, deploy = _merge_in_progress(tmp_path, foreign=False)
+    backup_root = tmp_path / "home" / ".genesis" / "premerge-backups" / "known"
+    proc, state_path = _recover(
+        tmp_path, root, backup_root=backup_root, own_head=rollback, deploy_head=deploy
+    )
+    _assert_recovered(proc, state_path, root, rollback)
+    backup = backup_root / "merge-abort"
+    assert (backup / "local.txt").read_text() == "OPERATOR RESOLUTION\n"
+    assert "OPERATOR RESOLUTION" in (backup / "index.patch").read_text()
+
+
+def test_a_merge_that_is_not_this_updates_is_refused_not_aborted(tmp_path):
+    """B1: MERGE_HEAD is not the recorded deploy head, so the merge is someone
+    else's. Recovery refuses and leaves it, and the resolution, in place."""
+    root, rollback, deploy = _merge_in_progress(tmp_path, foreign=True)
+    proc, state_path = _recover(tmp_path, root, own_head=rollback, deploy_head=deploy)
+    _assert_recovery_refused(proc, state_path)
+    assert "not of this update's deploy head" in proc.stdout + proc.stderr
+    assert (root / ".git" / "MERGE_HEAD").exists()
+    assert (root / "local.txt").read_text() == "OPERATOR RESOLUTION\n"
+
+
+def test_a_merge_without_a_recorded_deploy_head_is_refused(tmp_path):
+    """Ownership cannot be proved without the deploy head; never abort on a guess."""
+    root, rollback, _ = _merge_in_progress(tmp_path, foreign=False)
+    proc, state_path = _recover(tmp_path, root, own_head=rollback, deploy_head="")
+    _assert_recovery_refused(proc, state_path)
+    assert (root / ".git" / "MERGE_HEAD").exists()
+
+
+def test_a_merge_with_old_format_state_is_refused(tmp_path):
+    root, rollback, deploy = _merge_in_progress(tmp_path, foreign=False)
+    proc, state_path = _recover(
+        tmp_path, root, own_head=rollback, deploy_head=deploy, original_branch=None
+    )
+    _assert_recovery_refused(proc, state_path)
+    assert (root / ".git" / "MERGE_HEAD").exists()
