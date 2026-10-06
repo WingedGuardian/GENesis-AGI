@@ -719,3 +719,15 @@ class TestAuditFindings:
         assert not self._touches(
             command=f"git commit -F - <<'EOF'\nrotate the keys in {target}\nEOF"
         )
+
+    def test_unproven_heredoc_bodies_are_scanned(self, fake_home: Path) -> None:
+        target = str(fake_home / "genesis" / "secrets.env")
+        commands = [
+            f"cat > f <<'EOF'\n{target}\nEOF",
+            f"unknown <<'EOF'\n{target}\nEOF",
+            "cat <<EOF\n$(cat secrets.env)\nEOF",
+            "python3 - <<'PY'\nopen('secrets.env')\nPY",
+            "python3 -c \"open('secrets.env')\"",
+        ]
+        for command in commands:
+            assert self._touches(command=command), command

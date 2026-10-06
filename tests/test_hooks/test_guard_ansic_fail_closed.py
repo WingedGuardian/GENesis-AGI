@@ -397,13 +397,10 @@ class TestUntokenizable:
         # $'msg' with no escaped quote tokenizes fine — must NOT be flagged.
         assert sp.untokenizable(f"{GIT} {COMMIT} -m $'l1\\nl2'") is False
 
-    def test_heredoc_apostrophe_body_is_untokenizable(self):
-        # The probe reads the RAW command deliberately. Ordinary punctuation in
-        # quoted multi-line input genuinely shifts analyze()'s segmentation, so
-        # this MUST read as a blind spot. Pre-processing the text to quieten the
-        # prompt was measured removing the very evidence the probe looks for.
+    def test_proven_data_heredoc_apostrophe_body_is_tokenizable(self):
         cmd = f"{GIT} {COMMIT} -F - <<'EOF'\nit's a message with an apostrophe\nEOF"
-        assert sp.untokenizable(cmd) is True
+        assert sp.excise_data_heredoc(cmd) is not None
+        assert sp.untokenizable(cmd) is False
 
 
 # ══════════════════════════════════════════════════════════════════════════
