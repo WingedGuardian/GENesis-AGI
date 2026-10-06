@@ -155,8 +155,9 @@ class TestReset:
 
 class TestBrowserLayerEnum:
     def test_layer_values_are_the_navigate_layer_field(self):
-        """One numbering everywhere: the enum, browser.py's "Layer N" comments
-        and the ``layer`` field browser_navigate returns."""
+        """The enum, browser.py's "Layer N" comments and the ``layer`` field
+        browser_navigate returns share one numbering. (The browser-automation
+        skill numbers its own rungs differently; those are not these.)"""
         assert [m.value for m in BrowserLayer] == [
             "camoufox", "chromium", "remote_cdp", "tinyfish_cdp",
         ]

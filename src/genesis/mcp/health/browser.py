@@ -90,7 +90,7 @@ _CHROMIUM_PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
 
 # Module-level browser state — persists across tool calls within a session.
 # Layer numbers match genesis.browser.types.BrowserLayer.
-# Layer 2: Chromium fallback (patchright)
+# Layer 2: Chromium fallback
 _playwright = None
 _context = None
 _page = None

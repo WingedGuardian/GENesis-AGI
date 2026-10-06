@@ -20,7 +20,7 @@ class BrowserLayer(StrEnum):
     """The browser layers of the genesis-health browser tools.
 
     Numbered as in ``src/genesis/mcp/health/browser.py``. The value is the
-    ``layer`` field of every ``browser_navigate`` result. Read-only fetching
+    ``layer`` field of a successful ``browser_navigate`` result. Read-only fetching
     (``web_fetch``) comes before these and needs no browser; desktop control of
     non-web windows is outside them.
     """
@@ -30,8 +30,8 @@ class BrowserLayer(StrEnum):
     ~/.genesis/camoufox-profile/, headed on display :99."""
 
     CHROMIUM = "chromium"
-    """Layer 2: the Chromium fallback (patchright, plain Playwright if patchright
-    is missing), persistent profile at ~/.genesis/browser-profile/."""
+    """Layer 2: the Chromium fallback (Playwright's Chromium), persistent profile
+    at ~/.genesis/browser-profile/."""
 
     REMOTE_CDP = "remote_cdp"
     """Layer 3: the user's own Chrome over CDP, in a tab Genesis opens."""
