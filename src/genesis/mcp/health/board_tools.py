@@ -70,6 +70,9 @@ async def board_promote(
 
 # A repo is always followed by '#', so "owner/repo25" can never read as
 # owner/repo2 issue 5; issue numbers start at 1.
+#: Reconciler states in which no board is being read, so no counts are current.
+_NO_BOARD_STATES = frozenset({"off", "not_set_up"})
+
 _TARGET_RE = re.compile(r"^(?:card:)?(?:([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+)#|#)?([1-9]\d*)$")
 
 
@@ -126,10 +129,29 @@ async def _impl_board_status(db, *, now=None) -> dict:
         "project": d.get("project"),
         "last_error": d.get("last_error"),
     }
+    # A board that is off or not set up publishes no counts: an older
+    # successful read is not the board's state now (docstring contract).
+    if d.get("board_state") in _NO_BOARD_STATES:
+        out["summary"] = None
+        out["note"] = f"board is {d.get('board_state')}; no counts are published"
+        return out
     ok = _newest([r for r in rows if _details(r).get("board_state") == "ok"], now)
     if ok is None:
+        # Past the scan window, look the last successful read up directly: a
+        # long outage must not erase the last good counts. The pulse message is
+        # "board ok (mode=...)" (reconciler heartbeat), and the details are
+        # re-checked so a stray message match cannot pass for a read.
+        try:
+            older = await events_crud.query(
+                db, subsystem="board", event_type="heartbeat", search="board ok (", limit=5
+            )
+        except Exception:
+            logger.error("board_status: last-good-read lookup failed", exc_info=True)
+            older = []
+        ok = _newest([r for r in older if _details(r).get("board_state") == "ok"], now)
+    if ok is None:
         out["summary"] = None
-        out["note"] = f"no successful board read in the last {len(rows)} pulses"
+        out["note"] = "no successful board read recorded"
         return out
     od = _details(ok)
     from genesis.observability.liveness import parse_iso_utc
@@ -183,12 +205,16 @@ async def _impl_board_item(db, target: str) -> dict:
             if c["project_number"] == ref[1]
             and (c.get("project_owner") or "").lower() == ref[0].lower()
         ]
+    # A truncated card list with no match does not show the item is off the
+    # board: its card may sit past the page. Say "unknown" rather than None.
+    board_card_known = ref is None or bool(on_board) or not card["cards_truncated"]
     out: dict = {
         "status": "ok",
         "target": f"{owner}/{name}#{number}",
         "kind": card["kind"],
         "state": card["state"],
         "board_card": (on_board[0] if on_board else None) if ref is not None else None,
+        "board_card_known": board_card_known,
         "board_configured": ref is not None,
         "all_cards": card["cards"],
         "cards_truncated": card["cards_truncated"],

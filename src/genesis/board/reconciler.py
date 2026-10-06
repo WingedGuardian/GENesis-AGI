@@ -77,6 +77,10 @@ async def _read_board(db, ref: tuple[str, int], tick_started: datetime) -> dict:
     from genesis.db.crud import board as board_crud
 
     proj = await pv.get_project(*ref)
+    if proj.closed:
+        # board_setup refuses a closed project; a board closed after setup is
+        # no longer the work board, so its counts are not published as if it were.
+        raise pv.ProjectsError(f"project {ref[0]}#{ref[1]} is closed")
     items = (await pv.list_items(proj.id))["items"]
 
     by_status: Counter = Counter()

@@ -38,7 +38,8 @@ async def _pulse(db, minutes_ago, **details):
         subsystem="board",
         severity="DEBUG",
         event_type="heartbeat",
-        message="board",
+        # The reconciler's own message format, which board_status searches on.
+        message=f"board {details.get('board_state')} (mode={details.get('mode')})",
         details=details,
         timestamp=(NOW - timedelta(minutes=minutes_ago)).isoformat(),
     )
@@ -71,11 +72,32 @@ async def test_latest_pulse_and_newest_successful_summary_are_both_reported(db):
 
 
 async def test_pulses_without_a_read_give_no_summary_and_say_why(db):
-    await _pulse(db, 5, board_state="off", mode="off")
-    await _pulse(db, 0, board_state="off", mode="off")
+    await _pulse(db, 5, board_state="error", mode="propose_only")
+    await _pulse(db, 0, board_state="error", mode="propose_only")
     out = await bt._impl_board_status(db, now=NOW)
-    assert out["latest"]["board_state"] == "off" and out["summary"] is None
-    assert "no successful board read in the last 2 pulses" in out["note"]
+    assert out["latest"]["board_state"] == "error" and out["summary"] is None
+    assert "no successful board read recorded" in out["note"]
+
+
+@pytest.mark.parametrize("state", ["off", "not_set_up"])
+async def test_a_board_that_is_off_publishes_no_old_counts(db, state):
+    """The docstring contract: off or not set up means a pulse and no summary,
+    even when an older successful read exists."""
+    await _pulse(db, 30, board_state="ok", mode="propose_only", items_total=4)
+    await _pulse(db, 0, board_state=state, mode="off")
+    out = await bt._impl_board_status(db, now=NOW)
+    assert out["latest"]["board_state"] == state and out["summary"] is None
+    assert state in out["note"]
+
+
+async def test_the_last_good_read_survives_a_long_outage(db):
+    """More failed pulses than the scan window must not erase the last good read."""
+    await _pulse(db, 400, board_state="ok", mode="propose_only", items_total=7)
+    for i in range(manifest._HEARTBEAT_SCAN_LIMIT + 5):
+        await _pulse(db, 300 - i, board_state="error", mode="propose_only", last_error="e")
+    out = await bt._impl_board_status(db, now=NOW)
+    assert out["latest"]["board_state"] == "error"
+    assert out["summary"]["items_total"] == 7 and out["summary"]["age_seconds"] == 400 * 60
 
 
 async def test_a_future_dated_pulse_is_never_taken_as_the_latest(db):
@@ -119,6 +141,31 @@ async def test_board_item_matches_the_configured_project_by_owner_and_number(db,
     out = await bt._impl_board_item(db, "#7")
     assert out["board_card"]["status"] == "Ready", "another owner's project #2 is not the board"
     assert out["blockers_truncated"] is True and out["blocked_by_total"] == 21
+
+
+async def test_board_item_says_unknown_when_a_truncated_list_hides_the_card(db, monkeypatch):
+    """No match in a truncated card list is not "not on the board"."""
+
+    async def card_for_issue(owner, name, number, *, runner=None):
+        return {
+            "kind": "Issue",
+            "number": number,
+            "state": "OPEN",
+            "cards": [{"project_owner": "someone", "project_number": 9, "status": "Done"}],
+            "cards_truncated": True,
+            "blocked_by": [],
+            "blocked_by_total": 0,
+            "blockers_truncated": False,
+        }
+
+    monkeypatch.setattr(pv, "card_for_issue", card_for_issue)
+    out = await bt._impl_board_item(db, "#7")
+    assert out["board_card"] is None and out["board_card_known"] is False
+
+
+async def test_board_item_knows_the_card_when_it_is_found(db, card):
+    out = await bt._impl_board_item(db, "#7")
+    assert out["board_card_known"] is True
 
 
 async def test_board_item_reports_open_questions_blocking_the_card(db, card):

@@ -303,6 +303,7 @@ async def test_card_for_issue_shape():
             "project_number": 2,
             "status": "In Review",
             "status_updated_at": "2026-10-04T05:12:52Z",
+            "genesis": None,
         }
     ]
     assert card["cards_truncated"] is False
@@ -325,6 +326,35 @@ async def test_card_for_issue_flags_truncated_lists_rather_than_hiding_them():
     assert card["blocked_by_total"] == 25 and card["blockers_truncated"] is True
     assert card["cards_truncated"] is True
     assert card["cards"][0]["status"] is None
+
+
+async def test_card_for_issue_reads_genesis_and_drops_archived_cards():
+    run = _runner(
+            _card_node(
+                projectItems={
+                    "totalCount": 2,
+                    "nodes": [
+                        {
+                            "isArchived": True,
+                            "project": {"number": 2, "owner": {"login": "o"}},
+                            "status": {"name": "Done"},
+                        },
+                        {
+                            "isArchived": False,
+                            "project": {"number": 2, "owner": {"login": "o"}},
+                            "status": {"name": "Ready"},
+                            "genesis": {"name": "Blocked"},
+                        },
+                    ],
+                }
+            )
+    )
+
+    card = await pv.card_for_issue("o", "r", 1, runner=run)
+    assert [c["status"] for c in card["cards"]] == ["Ready"]
+    assert card["cards"][0]["genesis"] == "Blocked"
+    # includeArchived defaults to TRUE on projectItems; the query must say false.
+    assert "includeArchived: false" in run.calls[0]["query"]
 
 
 async def test_card_for_a_pull_request_has_no_blockers_field():

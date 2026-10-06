@@ -580,12 +580,14 @@ query($o: String!, $n: String!, $i: Int!) { repository(owner: $o, name: $n) {
   issueOrPullRequest(number: $i) {
     __typename
     ... on Issue { number state
-      projectItems(first: 10) { totalCount nodes { project { number owner { ... on User { login } ... on Organization { login } } }
-        status: fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name updatedAt } } } }
+      projectItems(first: 100, includeArchived: false) { totalCount nodes { isArchived project { number owner { ... on User { login } ... on Organization { login } } }
+        status: fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name updatedAt } }
+        genesis: fieldValueByName(name: "Genesis") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } }
       blockedBy(first: 20) { totalCount nodes { number state repository { nameWithOwner } } } }
     ... on PullRequest { number state
-      projectItems(first: 10) { totalCount nodes { project { number owner { ... on User { login } ... on Organization { login } } }
-        status: fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name updatedAt } } } } }
+      projectItems(first: 100, includeArchived: false) { totalCount nodes { isArchived project { number owner { ... on User { login } ... on Organization { login } } }
+        status: fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name updatedAt } }
+        genesis: fieldValueByName(name: "Genesis") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } } }
   } } }
 """
 
@@ -593,9 +595,10 @@ query($o: String!, $n: String!, $i: Int!) { repository(owner: $o, name: $n) {
 async def card_for_issue(
     owner: str, name: str, number: int, *, runner: Runner | None = None
 ) -> dict:
-    """One issue's or PR's board state, live: its cards (one per project it is
-    on), and for an issue its ``blockedBy`` list. Both lists are capped by
-    GitHub's page size, so each carries a total and a ``*_truncated`` flag
+    """One issue's or PR's board state, live: its unarchived cards (one per
+    project it is on, each with its Status and Genesis values), and for an issue
+    its ``blockedBy`` list. Both lists are capped by GitHub's page size (100
+    cards, 20 blockers), so each carries a total and a ``*_truncated`` flag
     rather than passing a short list off as the whole. (Pull requests have no
     ``blockedBy``; MEASURED by schema introspection 2026-10-04.)"""
     data = await graphql(_CARD_QUERY, {"o": owner, "n": name, "i": number}, runner=runner)
@@ -609,9 +612,13 @@ async def card_for_issue(
             "project_number": (n.get("project") or {}).get("number"),
             "status": (n.get("status") or {}).get("name"),
             "status_updated_at": (n.get("status") or {}).get("updatedAt"),
+            "genesis": (n.get("genesis") or {}).get("name"),
         }
         for n in items["nodes"]
-        if n
+        # includeArchived defaults to TRUE on projectItems (MEASURED by schema
+        # introspection 2026-10-06); the query passes false, and an archived
+        # card that slips through anyway is still not the item's live card.
+        if n and not n.get("isArchived")
     ]
     blocked = node.get("blockedBy") or {"totalCount": 0, "nodes": []}
     blockers = [

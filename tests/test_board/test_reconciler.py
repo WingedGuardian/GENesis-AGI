@@ -76,16 +76,17 @@ def _item(item_id, status, *, updated=None, number=1, state="OPEN", kind="Issue"
 
 
 class FakeBoard:
-    def __init__(self, items, *, open_issues=3, open_prs=1, fail=None):
+    def __init__(self, items, *, open_issues=3, open_prs=1, fail=None, closed=False):
         self.items = items
         self.open = {"issues": open_issues, "pull_requests": open_prs}
         self.fail = fail
+        self.closed = closed
         self.calls = 0
 
     def install(self, monkeypatch):
         async def get_project(owner, number, *, runner=None):
             self.calls += 1
-            return pv.Project("PROJ", number, "Board", False, {})
+            return pv.Project("PROJ", number, "Board", False, {}, closed=self.closed)
 
         async def list_items(project_id, *, runner=None):
             self.calls += 1
@@ -239,6 +240,18 @@ async def test_a_short_read_publishes_an_error_and_no_counts(db, monkeypatch):
     assert "read 99 items" in d["last_error"]
     assert "by_status" not in d and "coverage" not in d and "items_total" not in d
     assert rt.successes == [] and rt.failures[0][0] == reconciler.JOB_ID
+
+
+async def test_a_closed_project_publishes_an_error_and_no_counts(db, monkeypatch):
+    """Setup refuses a closed project; one closed after setup is no longer the
+    work board, so its items are not read or published as the board's state."""
+    board = FakeBoard([_item("I1", "Ready")], closed=True).install(monkeypatch)
+    rt = FakeRT(db)
+    out = await reconciler.run_tick(rt, now=NOW)
+    d = _pulse(rt)
+    assert out["board_state"] == "error" and "is closed" in d["last_error"]
+    assert "by_status" not in d and "coverage" not in d
+    assert board.calls == 1, "nothing past the project read"
 
 
 async def test_a_long_error_is_bounded_and_says_so(db, monkeypatch):
