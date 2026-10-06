@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import math
 import os
@@ -26,6 +27,8 @@ import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+
+from fastmcp import Context
 
 from genesis.mcp.health import mcp
 
@@ -1279,6 +1282,24 @@ async def _click_in_shadow_dom(page, selector: str) -> bool:
 # so a step still running then is hung, not slow.
 _FILL_STALL_S: float = 30.0
 
+# The MCP client has its own idle watchdog. Claude Code aborts a tool call that
+# sends no response or progress notification for CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT
+# (default 30 min for a stdio server, 5 min for a remote one), leaving a partly
+# filled field. MEASURED on CC 2.1.280 with a stdio probe server and the idle
+# timeout lowered to 20 s: a silent 45 s call was aborted, and the same call
+# reporting progress every 5 s completed. (A silent 150 s call under
+# MCP_TIMEOUT=120000 also completed: MCP_TIMEOUT does not bound a tool call.)
+# So the browser_fill tool reports
+# progress as steps complete, through this per-call reporter. It is unset for
+# direct callers of _impl_browser_fill, which have no client.
+_fill_progress: contextvars.ContextVar = contextvars.ContextVar(
+    "_fill_progress", default=None
+)
+# One notification per 5 s rather than one per step (about 8 a second: two
+# steps per character at about 0.24 s each), and still 60 times inside the
+# shortest default idle timeout (300 s).
+_FILL_PROGRESS_EVERY_S: float = 5.0
+
 
 class FillStalled(Exception):
     """A browser call inside browser_fill made no progress for _FILL_STALL_S."""
@@ -1287,8 +1308,9 @@ class FillStalled(Exception):
 async def _no_stall(awaitable, what: str):
     """Await one browser call of a fill, failing if it stalls.
 
-    A completed step is browser activity: with no overall deadline a fill can
-    outlast _IDLE_TIMEOUT_S, and the idle watcher must not reclaim it mid-fill.
+    A completed step is activity for BOTH idle watchdogs that could reclaim a
+    fill with no overall deadline: this server's (_IDLE_TIMEOUT_S, via _touch)
+    and the MCP client's (via the _fill_progress reporter).
     """
     try:
         result = await asyncio.wait_for(awaitable, timeout=_FILL_STALL_S)
@@ -1297,6 +1319,9 @@ async def _no_stall(awaitable, what: str):
             f"{what} made no progress for {_FILL_STALL_S:.0f}s"
         ) from None
     _touch()
+    report = _fill_progress.get()
+    if report is not None:
+        await report(what)
     return result
 
 
@@ -2556,7 +2581,7 @@ async def browser_click(selector: str) -> dict:
 
 
 @mcp.tool()
-async def browser_fill(selector: str, value: str) -> dict:
+async def browser_fill(selector: str, value: str, ctx: Context | None = None) -> dict:
     """Fill a form field on the current page.
 
     Examples: browser_fill('#email', 'user@example.com')
@@ -2567,9 +2592,31 @@ async def browser_fill(selector: str, value: str) -> dict:
     browser errors (selector not found, element detached), the call stops
     early only if one browser step (clearing, focusing, or a single
     keystroke) makes no progress for 30 s, and then the page is reset if it
-    is still the active page.
+    is still the active page. Progress is reported as the fill advances, so
+    the MCP client's idle timeout does not cancel a long fill.
     """
-    return await _impl_browser_fill(selector, value)
+    steps = 0
+    last_sent = time.monotonic()
+    report_failed = False
+
+    async def report(what: str) -> None:
+        nonlocal steps, last_sent, report_failed
+        steps += 1
+        if ctx is None or time.monotonic() - last_sent < _FILL_PROGRESS_EVERY_S:
+            return
+        last_sent = time.monotonic()
+        try:
+            await ctx.report_progress(steps, message=what)
+        except Exception:  # best effort: a lost report must not fail typing
+            if not report_failed:  # once per fill, not every 5 s after
+                logger.warning("browser_fill progress report failed", exc_info=True)
+            report_failed = True
+
+    token = _fill_progress.set(report)
+    try:
+        return await _impl_browser_fill(selector, value)
+    finally:
+        _fill_progress.reset(token)
 
 
 @mcp.tool()

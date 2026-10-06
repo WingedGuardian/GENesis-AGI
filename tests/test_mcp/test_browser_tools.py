@@ -257,8 +257,8 @@ class TestFillStallWatchdog:
     @pytest.mark.asyncio
     async def test_a_long_fill_that_keeps_progressing_is_never_cut_short(self):
         """Total time far beyond the stall bound is fine while every keystroke
-        returns: 40 keys x 20 ms = 0.8 s against a 0.2 s stall bound. The old
-        length-derived deadline is what reset real long fills."""
+        returns: 40 keys x 20 ms = 0.8 s against a 0.2 s stall bound, so the
+        bound is per step, not on the whole fill."""
         page, calls = _typing_page(key_latency=0.02)
         with (
             patch.object(browser, "_FILL_STALL_S", 0.2),
@@ -286,17 +286,25 @@ class TestFillStallWatchdog:
 
     @pytest.mark.asyncio
     async def test_the_tool_has_no_length_derived_deadline(self):
-        """The MCP tool hands straight to the impl: no _with_tool_timeout whose
-        value comes from len(value)."""
-        spy = AsyncMock(return_value={"filled": "#bio"})
-        with (
-            patch.object(browser, "_impl_browser_fill", new=spy),
-            patch.object(browser, "_with_tool_timeout", new=AsyncMock()) as wrapped,
-        ):
+        """No deadline of any spelling wraps the fill: while the impl runs, the
+        event loop's clock jumps 10,000 s, past any length-derived cap, and the
+        tool must still return the impl's result."""
+
+        async def slow_impl(_selector, _value):
+            loop = asyncio.get_running_loop()
+            real_time = loop.time
+            loop.time = lambda: real_time() + 10_000.0
+            try:
+                for _ in range(5):  # let any armed deadline fire
+                    await _REAL_SLEEP(0)
+            finally:
+                del loop.time
+            return {"filled": "#bio"}
+
+        with patch.object(browser, "_impl_browser_fill", new=slow_impl):
             fn = getattr(browser.browser_fill, "fn", browser.browser_fill)
             result = await fn("#bio", "y" * 5000)
         assert result == {"filled": "#bio"}
-        wrapped.assert_not_called()
 
     def test_the_stall_bound_is_the_justified_value(self):
         assert browser._FILL_STALL_S == 30.0
@@ -351,6 +359,108 @@ class TestFillStallWatchdog:
         assert "stalled" in result["error"]
         assert browser._active_page is newer
         assert "reset" not in result["error"]
+
+
+# Claude Code's default idle timeout for a stdio MCP tool call: it aborts a call
+# that sends no response or progress for this long (READ in the pinned CC binary,
+# 2.1.280: CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT, else 1,800,000 ms for stdio).
+_CC_STDIO_IDLE_S = 1800.0
+
+
+class TestFillKeepsTheClientAlive:
+    """A fill longer than the MCP client's idle timeout must report progress,
+    or the client cancels it mid-entry and leaves a partially filled field."""
+
+    @staticmethod
+    def _fake_clock_fill(key_seconds: float):
+        now = [1000.0]
+        page, calls = _typing_page()
+
+        async def slow_down(_char):
+            calls["down"] += 1
+            now[0] += key_seconds
+
+        page.keyboard.down = AsyncMock(side_effect=slow_down)
+        ctx = MagicMock()
+        reports = []
+
+        async def report_progress(progress, total=None, message=None):
+            reports.append((now[0], progress))
+
+        ctx.report_progress = AsyncMock(side_effect=report_progress)
+        return now, calls, ctx, reports
+
+    @pytest.mark.asyncio
+    async def test_a_fill_longer_than_the_client_idle_timeout_reports_progress(self):
+        """40 keystrokes of 200 s each span 8,000 s, over four times the client's
+        idle timeout. No silent gap may reach it, and progress must increase."""
+        now, calls, ctx, reports = self._fake_clock_fill(200.0)
+        fn = getattr(browser.browser_fill, "fn", browser.browser_fill)
+        with (
+            patch.object(browser, "time", MagicMock(monotonic=lambda: now[0])),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            result = await fn("#bio", "x" * 40, ctx)
+        assert result.get("filled") == "#bio", result
+        assert calls["down"] == 40
+        stamps = [1000.0] + [t for t, _ in reports] + [now[0]]
+        gaps = [b - a for a, b in zip(stamps, stamps[1:], strict=False)]
+        assert max(gaps) < _CC_STDIO_IDLE_S, f"silent for {max(gaps):.0f}s"
+        values = [p for _, p in reports]
+        assert values == sorted(set(values)), values
+
+    @pytest.mark.asyncio
+    async def test_progress_is_throttled_not_sent_per_keystroke(self):
+        """Keystrokes of 1 s each: progress goes out about every
+        _FILL_PROGRESS_EVERY_S, not twice per character."""
+        now, _calls, ctx, reports = self._fake_clock_fill(1.0)
+        fn = getattr(browser.browser_fill, "fn", browser.browser_fill)
+        with (
+            patch.object(browser, "time", MagicMock(monotonic=lambda: now[0])),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            await fn("#bio", "x" * 100, ctx)
+        expected = 100 / browser._FILL_PROGRESS_EVERY_S
+        assert expected / 2 <= len(reports) <= expected + 2, len(reports)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_progress_report_does_not_fail_the_fill(self, caplog):
+        _typing_page()
+        ctx = MagicMock()
+        ctx.report_progress = AsyncMock(side_effect=RuntimeError("client gone"))
+        fn = getattr(browser.browser_fill, "fn", browser.browser_fill)
+        with (
+            patch.object(browser, "_FILL_PROGRESS_EVERY_S", 0.0),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+            caplog.at_level("WARNING", logger=browser.logger.name),
+        ):
+            result = await fn("#bio", "hi", ctx)
+        assert result.get("filled") == "#bio", result
+        assert ctx.report_progress.await_count > 1
+        logged = [r for r in caplog.records if "progress report failed" in r.message]
+        assert len(logged) == 1, "a gone client is logged once per fill"
+
+    @pytest.mark.asyncio
+    async def test_the_reporter_is_scoped_to_the_tool_call(self):
+        """After the tool returns, a direct caller of _impl_browser_fill (no
+        MCP client) reports nothing to the finished call's client."""
+        _typing_page()
+        ctx = MagicMock()
+        ctx.report_progress = AsyncMock()
+        fn = getattr(browser.browser_fill, "fn", browser.browser_fill)
+        with (
+            patch.object(browser, "_FILL_PROGRESS_EVERY_S", 0.0),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            await fn("#bio", "hi", ctx)
+            sent = ctx.report_progress.await_count
+            result = await browser._impl_browser_fill("#bio", "more")
+        assert result.get("filled") == "#bio", result
+        assert ctx.report_progress.await_count == sent
 
 
 class TestSnapshotTimeout:
