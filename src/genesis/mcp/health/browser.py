@@ -657,6 +657,7 @@ async def _ensure_chromium_fallback():
         try:
             _check_loaded_browser_modules()
             async_playwright = _chromium_async_playwright()
+            from genesis.browser import chromium as _chromium_launch
 
             _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -670,8 +671,8 @@ async def _ensure_chromium_fallback():
             _context = await _playwright.chromium.launch_persistent_context(
                 user_data_dir=str(_CHROMIUM_PROFILE_DIR),
                 headless=False,
-                args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
-                      "--start-maximized"],
+                # Shared with the provisioning launch check, which runs this launch.
+                args=list(_chromium_launch.LAUNCH_ARGS),
                 # patchright's documented stealth setup: no emulated viewport (the
                 # real window size is used) and no custom headers or user agent.
                 no_viewport=True,

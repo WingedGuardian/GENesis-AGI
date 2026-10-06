@@ -11,14 +11,14 @@ Steps, in order (all under the browser-stack lock held EXCLUSIVE, so two runs
 never overlap and no browser launches mid-run; a running browser holds it SHARED):
   1. preflight: enough disk, and no browser running (an upgrade under a live
      browser would swap its engine and copy its profile mid-write). Anything
-     it cannot determine counts as "not safe": skip and say why. The installed
-     camoufox/playwright/patchright versions are recorded in memory.
+     it cannot determine counts as "not safe": skip and say why. The version of
+     every distribution in the venv is recorded in memory.
   2. install the ``browser`` extra through the worktree-guarded installer in
      scripts/lib/venv_setup.sh (its one home), then check the packages import,
      that camoufox carries a browser pin, and that every installed version
      satisfies the extra's ranges (the installer masks pip's exit status).
-  3. copy the Camoufox profile if a newer Firefox major is about to open it
-     (Firefox refuses a profile last used by a newer version).
+  3. copy the Camoufox profile if another build is about to open it (Firefox
+     refuses a profile last used by a newer version, build included).
   4. the engine. A ``camoufox set`` choice of another build is reset to the
      paired one first. Already ready: nothing to do. An install root in
      camoufox 0.5's side-by-side layout: ``camoufox fetch`` in place (it adds a
@@ -36,9 +36,11 @@ never overlap and no browser launches mid-run; a running browser holds it SHARED
   7. refresh ``browser_automation`` in ~/.genesis/capabilities.json, so the
      capability reflects the new state without a server restart.
 If step 2, 3, 4 or 5 fails (or the run is interrupted by SIGTERM, SIGINT or SIGHUP)
-before the swap, the root was never touched, so the only thing to undo is the
-packages: the versions recorded in step 1 are reinstalled, any browser package
-the step added is removed, and the old engine works again. Every step runs in
+before the swap, the root's existing engines were never touched, so what is
+undone is the packages (the versions recorded in step 1 are reinstalled, any
+distribution the step added is removed) and, for a 0.5 root, its config.json and
+any engine directory the run fetched into it; the old engine works again. Every
+step runs in
 its own process group, and an interrupt stops the whole group before the
 rollback starts; if a member survives even SIGKILL, the rollback is refused
 rather than run beside it.
@@ -52,8 +54,10 @@ import contextlib
 import datetime as _dt
 import fcntl
 import importlib.metadata
+import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -65,6 +69,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from genesis.browser import chromium as _chromium
+from genesis.browser import engine as _engine
 from genesis.browser.engine import (
     BROWSER_LOCK_FILE,
     OVERRIDDEN,
@@ -73,6 +78,7 @@ from genesis.browser.engine import (
     camoufox_install_dir,
     camoufox_pin,
 )
+from genesis.util.atomic import atomic_write_text
 
 
 # MEASURED 2026-10-04 on a sandboxed live upgrade: the Camoufox 156 engine is a
@@ -111,9 +117,6 @@ LOCK_FILE = BROWSER_LOCK_FILE
 CAPABILITIES_FILE = Path.home() / ".genesis" / "capabilities.json"
 CAPABILITY = "browser_automation"
 
-# The packages whose versions are recorded before the install and put back if
-# the transaction fails.
-PACKAGES = ("camoufox", "playwright", "patchright")
 _SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 
 
@@ -157,14 +160,38 @@ def _stamp() -> str:
     return _dt.datetime.now(_dt.UTC).strftime("%Y%m%d")
 
 
-def installed_versions() -> dict[str, str]:
-    """Installed version of each of PACKAGES that is present."""
-    found: dict[str, str] = {}
-    for name in PACKAGES:
+def _canonical(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def installed_versions() -> dict[str, str | None]:
+    """Every distribution in this venv, with the version pip can put back by name.
+
+    The whole venv, not just camoufox, playwright and patchright: installing
+    the extra also adds or upgrades their dependencies, and a rollback of those
+    alone would leave the rest moved. A name an index cannot restore maps to
+    None: an editable or URL install (Genesis itself; direct_url.json), any
+    other copy of that name (an editable checkout's own src/*.egg-info has no
+    direct_url.json), and a dist whose version cannot be read. It is still
+    recorded, so the rollback never takes it for one the run added. Otherwise
+    the first copy of a name wins, as it does for importlib.metadata.version.
+    """
+    found: dict[str, str | None] = {}
+    for dist in importlib.metadata.distributions():
         try:
-            found[name] = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
+            name = _canonical(dist.metadata["Name"] or "")
+        except Exception:  # noqa: BLE001 - one unreadable dist must not stop the run
             continue
+        if not name:
+            continue
+        try:
+            version = None if dist.read_text("direct_url.json") else dist.version
+        except Exception:  # noqa: BLE001
+            version = None
+        if version is None:
+            found[name] = None
+        else:
+            found.setdefault(name, version)
     return found
 
 
@@ -223,7 +250,8 @@ def camoufox_running() -> bool | None:
 
 
 def _is_playwright_chromium(exe: str) -> bool:
-    if "ms-playwright" in exe or os.path.basename(exe).startswith("chrome-headless"):
+    base = os.path.basename(exe)
+    if "ms-playwright" in exe or base.startswith("chrome-headless") or base == "headless_shell":
         return True
     custom = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
     return bool(custom) and os.path.isabs(custom) and exe.startswith(custom.rstrip("/") + "/")
@@ -235,13 +263,22 @@ def chromium_running() -> bool | None:
     A ``chrome`` process counts only when its executable lives under a Playwright
     browsers directory (``ms-playwright``, or ``$PLAYWRIGHT_BROWSERS_PATH``), so a
     desktop Chrome does not block the upgrade. chrome-headless-shell's process
-    name is cut to 15 characters by the kernel, hence ``chrome-headless``.
+    name is cut to 15 characters by the kernel, hence ``chrome-headless``; older
+    Playwright releases named it ``headless_shell``. The same names as the lock
+    module's _LOCAL_BROWSER_COMMS (genesis.mcp.health.browser).
     """
-    chrome = _pids_named("chrome")
-    headless = _pids_named("chrome-headless")
-    if chrome is None or headless is None:
-        return None
-    for pid in chrome + headless:
+    return _any_exe(("chrome", "chrome-headless", "headless_shell"), _is_playwright_chromium)
+
+
+def _any_exe(names: tuple[str, ...], match: Callable[[str], bool]) -> bool | None:
+    """Whether a process with one of ``names`` runs an executable ``match`` accepts."""
+    pids: list[int] = []
+    for name in names:
+        found = _pids_named(name)
+        if found is None:
+            return None
+        pids += found
+    for pid in pids:
         try:
             exe = os.readlink(f"/proc/{pid}/exe")
         except FileNotFoundError:
@@ -250,9 +287,36 @@ def chromium_running() -> bool | None:
             continue  # another user's process: it cannot hold our profile or engine
         except OSError:
             return None
-        if _is_playwright_chromium(exe):
+        if match(exe):
             return True
     return False
+
+
+def _driver_dirs() -> list[str]:
+    """The Node driver directories of this venv's playwright and patchright."""
+    dirs = []
+    for name in ("playwright", "patchright"):
+        try:
+            spec = importlib.util.find_spec(name)
+        except (ImportError, ValueError):
+            continue
+        if spec is not None and spec.submodule_search_locations:
+            pkg = os.path.realpath(next(iter(spec.submodule_search_locations)))
+            dirs.append(os.path.join(pkg, "driver") + os.sep)
+    return dirs
+
+
+def playwright_driver_running() -> bool | None:
+    """Whether a Node driver of this venv's playwright or patchright runs.
+
+    A remote-CDP or TinyFish session holds no browser-stack lock (its browser
+    is not local), yet runs this driver from the package the install replaces.
+    This covers a session already open when the run starts. One that opens
+    mid-run is NOT covered: those sessions take no browser-stack lock
+    (genesis.mcp.health.browser), so closing that window is that module's change.
+    """
+    dirs = _driver_dirs()
+    return _any_exe(("node",), lambda exe: any(exe.startswith(d) for d in dirs))
 
 
 def browsers_running() -> bool | None:
@@ -261,13 +325,13 @@ def browsers_running() -> bool | None:
     Matches process NAMES, never command-line substrings: ``pgrep -f camoufox-bin``
     also matches any shell or grep whose arguments merely mention the word, which
     measured as a false "running" on a live run. This is deliberately stricter
-    than the ``pgrep -f`` patterns in genesis.browser.types.
+    than the ``pgrep -f`` patterns in genesis.browser.types. A Playwright driver
+    of this venv counts as running too (playwright_driver_running).
     """
-    camoufox = camoufox_running()
-    chromium = chromium_running()
-    if camoufox is None or chromium is None:
+    checks = (camoufox_running(), chromium_running(), playwright_driver_running())
+    if None in checks:
         return None
-    return camoufox or chromium
+    return any(checks)
 
 
 def _free_bytes(path: Path) -> int:
@@ -296,8 +360,8 @@ def preflight() -> str | None:
         return "could not tell whether a browser is running (pgrep unavailable or failed)"
     if running:
         return (
-            "a browser is running; re-run scripts/install_browser_stack.sh "
-            "when no browser session is active"
+            "a browser or a Playwright driver is running; re-run "
+            "scripts/install_browser_stack.sh when no browser session is active"
         )
     return None
 
@@ -342,23 +406,54 @@ def copy_aside(src: Path, label: str) -> Path:
     return dest
 
 
-def firefox_profile_major(profile: Path) -> int | None:
-    """Major Firefox version that last opened ``profile`` (compatibility.ini)."""
+def firefox_profile_version(profile: Path) -> str | None:
+    """The Camoufox build that last opened ``profile``, as ``<version>-<build>``.
+
+    compatibility.ini's LastVersion is ``<app version>_<build id>/<platform>``,
+    and Camoufox's app version is its own ``<version>-<build>`` (MEASURED on a
+    135.0.1-beta.24 engine: application.ini Version=135.0.1-beta.24, profile
+    LastVersion=135.0.1-beta.24_20250315105650/20250315105650), the same string
+    a camoufox pin names.
+    """
     parser = configparser.ConfigParser()
     try:
         if not parser.read(profile / "compatibility.ini"):
             return None
-        return int(parser.get("Compatibility", "LastVersion").split(".", 1)[0])
-    except (configparser.Error, ValueError):
+        return parser.get("Compatibility", "LastVersion").split("_", 1)[0] or None
+    except (configparser.Error, UnicodeDecodeError):
         return None
 
 
-def _major(version: str) -> int | None:
-    """Leading number of a version string; None when it has none (back it up)."""
-    try:
-        return int(version.split(".", 1)[0])
-    except ValueError:
-        return None
+_LABEL_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+-]{0,63}")
+# scripts/disk_hygiene.sh prunes a backup 14 days old; the state below waits as
+# long again after the migration.
+BACKUP_KEEP_S = 14 * 86400
+
+
+def camoufox_backup_state() -> str:
+    """ "ready" once the paired engine has opened the Camoufox profile.
+
+    scripts/disk_hygiene.sh prunes the Camoufox rollback material (the profile
+    copies and a moved-aside pre-0.5 engine) only in that state. Engine files in
+    place say nothing about the profile: a backup pruned before the new engine
+    first opens the profile, or after an upgrade whose launch never worked, is
+    the one copy an older Firefox could still open.
+    """
+    status = camoufox_engine_status()
+    if not status.ready:
+        return status.state
+    if not PROFILE_DIR.is_dir() or not any(PROFILE_DIR.iterdir()):
+        return "ready"  # no profile: nothing of it to protect, only the engine
+    pin, last = camoufox_pin(), firefox_profile_version(PROFILE_DIR)
+    if pin is None or last is None:
+        return "unknown"
+    if last != f"{pin.version}-{pin.build}":
+        return "not_opened_by_the_new_engine"
+    # compatibility.ini is rewritten only when another build opens the profile,
+    # so its age is the time since the migration: the 14 days start there, not
+    # at the copy, which may have sat unused for weeks before it.
+    opened = (PROFILE_DIR / "compatibility.ini").stat().st_mtime
+    return "ready" if time.time() - opened > BACKUP_KEEP_S else "opened_recently"
 
 
 def _running_check(kind: str) -> Callable[[], bool | None]:
@@ -370,25 +465,29 @@ def _running_check(kind: str) -> Callable[[], bool | None]:
     return browsers_running
 
 
-def backup_if_upgrading(
-    profile: Path, last_major: int | None, new_major: int | None, kind: str
-) -> None:
-    """Copy ``profile`` once before a newer major first opens it.
+def backup_if_upgrading(profile: Path, last: str | None, new: str | None, kind: str) -> None:
+    """Copy ``profile`` once before a different browser build first opens it.
 
     Stateless: the trigger is the profile's own record of the version that last
     opened it, so once the new version has opened it no further copy is made.
-    An unreadable version on either side means "back it up": a missed copy of a
-    one-way profile upgrade cannot be recovered, an extra copy can be pruned.
+    Any difference counts, not just a newer major: Firefox's downgrade check
+    compares the whole version, so a newer build of the same major can leave
+    the profile unusable to the build a rollback returns to. An unreadable
+    version on either side means "back it up": a missed copy of a one-way
+    profile upgrade cannot be recovered, an extra copy can be pruned.
     """
     if not profile.is_dir() or not any(profile.iterdir()):
         return
-    if last_major is not None and new_major is not None and last_major >= new_major:
+    if last is not None and last == new:
         return
     # Re-check right before copying: the preflight answer is minutes old by now.
     # Only the browser that owns this profile matters here.
     if _running_check(kind)() is not False:
         raise ProvisionError(f"a browser may be using the {kind} profile; not copying it")
-    label = f"v{last_major}" if last_major is not None else "vunknown"
+    # Named by the exact version: copy_aside keeps the newest copy per label,
+    # so a run going back to an older build must not replace the copy that
+    # build needs. The version comes from a file, so only a safe name is used.
+    label = f"v{last}" if last and _LABEL_RE.fullmatch(last) else "vunknown"
     backup = copy_aside(profile, label)
     _say(f"backed up the {kind} profile (last opened by {label}) to {backup}")
 
@@ -459,6 +558,24 @@ def _signals_held():
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
+# True while _run_group is starting a step. An interrupt raised inside Popen's
+# own construction escapes before the step is held, and nothing then stops it,
+# so the transaction's handler defers it (_raise_interrupt) and _run_group
+# raises it once the step can be stopped. Not done by blocking the signals: a
+# blocked mask is inherited across exec, and pip would start deaf to SIGTERM.
+_spawning = False
+_deferred: str | None = None
+
+
+def _raise_interrupt(signum: int) -> None:
+    global _deferred
+    message = f"interrupted by signal {signal.Signals(signum).name}"
+    if _spawning:
+        _deferred = message
+        return
+    raise ProvisionError(message)
+
+
 _GROUP_GRACE_S = 10  # how long a step's processes get to exit on SIGTERM before SIGKILL
 
 
@@ -519,35 +636,53 @@ def _run_group(
     nothing handles (SIGKILL, SIGQUIT). ``pass_fds`` carries the provisioning
     lock into the step: a flock belongs to the open file, so the lock stays held
     while any step process lives and a re-run cannot start a second pip.
+
+    Not ``with Popen``: its exit waits for the leader with no timeout, and on
+    the survivor path the leader may be the very process that outlived SIGKILL.
     """
+    global _spawning, _deferred
     inherited = subprocess.DEVNULL if _output_broken else None
     pipe = subprocess.PIPE if capture_output else inherited
-    with subprocess.Popen(
-        cmd,
-        env=env,
-        stdout=pipe,
-        stderr=pipe,
-        text=text,
-        start_new_session=True,
-        pass_fds=pass_fds,
-    ) as proc:
-        try:
-            out, err = proc.communicate(timeout=timeout)
-        except BaseException as exc:
-            # A second signal must not cut the cleanup short and leave the step
-            # running: hold them until the group is gone.
-            with _signals_held():
-                gone = _kill_group(proc)
-                if gone:
-                    proc.wait()
-                elif on_survived is not None:
-                    on_survived(proc.pid)
-            if not gone:
-                raise StepSurvived(
-                    f"`{' '.join(cmd[:4])}` (process group {proc.pid}) still has "
-                    f"processes after SIGKILL"
-                ) from exc
-            raise
+    _spawning = True
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=pipe,
+            stderr=pipe,
+            text=text,
+            start_new_session=True,
+            pass_fds=pass_fds,
+        )
+    except BaseException:
+        _deferred = None  # no step to stop; the caller's own interrupt flag remains
+        raise
+    finally:
+        _spawning = False
+    try:
+        if _deferred is not None:
+            message, _deferred = _deferred, None
+            raise ProvisionError(message)
+        out, err = proc.communicate(timeout=timeout)
+    except BaseException as exc:
+        # A second signal must not cut the cleanup short and leave the step
+        # running: hold them until the group is gone.
+        with _signals_held():
+            gone = _kill_group(proc)
+            if gone:
+                proc.wait()
+            elif on_survived is not None:
+                on_survived(proc.pid)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                with contextlib.suppress(OSError):
+                    stream.close()
+        if not gone:
+            raise StepSurvived(
+                f"`{' '.join(cmd[:4])}` (process group {proc.pid}) still has "
+                f"processes after SIGKILL"
+            ) from exc
+        raise
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
@@ -557,8 +692,10 @@ class Transaction:
         self.lib = lib
         self.install = install
         self.engine_root = camoufox_install_dir()
-        self.previous: dict[str, str] = {}
+        self.previous: dict[str, str | None] = {}
         self.swapped = False
+        # (config.json text or None if absent, engine dirs) of a 0.5 root.
+        self.root_snapshot: tuple[str | None, set[Path]] | None = None
         self.interrupted = False
         self.step_survived = False
         self.rolling_back = False
@@ -597,22 +734,25 @@ class Transaction:
         self.step_survived = True
 
     # step 2
-    def install_extras(self) -> None:
-        if not self.install:
-            return
-        venv = Path(sys.prefix)
-        proc = self._run(
+    def _guarded_install(self, extras: str) -> subprocess.CompletedProcess:
+        return self._run(
             [
                 "bash",
                 "-c",
-                '. "$1"; editable_install_guarded "$2" "$3" browser',
+                '. "$1"; editable_install_guarded "$2" "$3" "$4"',
                 "_",
                 str(self.lib),
                 str(self.repo_root),
-                str(venv),
+                str(Path(sys.prefix)),
+                extras,
             ],
             timeout=STEP_TIMEOUT_S,
         )
+
+    def install_extras(self) -> None:
+        if not self.install:
+            return
+        proc = self._guarded_install("browser")
         if proc.returncode != 0:
             raise ProvisionError(f"installing the [browser] extra failed (rc={proc.returncode})")
         # The guarded installer only checks that Genesis imports; check the extra.
@@ -644,10 +784,11 @@ class Transaction:
         if pin:
             backup_if_upgrading(
                 PROFILE_DIR,
-                firefox_profile_major(PROFILE_DIR),
-                _major(pin.version),
+                firefox_profile_version(PROFILE_DIR),
+                f"{pin.version}-{pin.build}",
                 "Camoufox",
             )
+        self._snapshot_root()
         status = camoufox_engine_status()
         if status.state == OVERRIDDEN:
             # A bare `camoufox fetch` would fetch the overriding build, which the
@@ -666,6 +807,7 @@ class Transaction:
         if (root / ".0.5_FLAG").exists():
             # camoufox 0.5's layout keeps versions side by side and its fetch
             # deletes nothing here, so fetching in place is safe.
+            self._drop_truncated_pin()
             self._fetch(self.env)
             status = camoufox_engine_status()
             if not status.ready:
@@ -675,6 +817,55 @@ class Transaction:
             _say(f"Camoufox engine installed ({status.detail})")
             return
         self._stage_and_swap()
+
+    def _engine_dirs(self) -> set[Path]:
+        return {p for p in (self.engine_root / "browsers").glob("*/*") if p.is_dir()}
+
+    def _snapshot_root(self) -> None:
+        """Record a 0.5 root's config.json and engine directories.
+
+        Both `set --release` (forgetting channel, pinned, pinned_sha and
+        active_version) and the in-place fetch (multiversion.set_active, plus a
+        new version directory) change them; a rollback before any swap puts
+        them back, so the restored package selects the engine it had.
+        """
+        root = self.engine_root
+        if not (root / ".0.5_FLAG").exists():
+            return
+        config = root / "config.json"
+        self.root_snapshot = (config.read_text() if config.exists() else None, self._engine_dirs())
+
+    def _restore_root(self) -> None:
+        """Never raises: a failure here must not stop the package restore."""
+        if self.root_snapshot is None or self.swapped:
+            return
+        config_text, dirs = self.root_snapshot
+        config = self.engine_root / "config.json"
+        try:
+            for added in sorted(self._engine_dirs() - dirs):
+                _say(f"removing the engine this run fetched: {added}")
+                shutil.rmtree(added)
+            if config_text is None:
+                config.unlink(missing_ok=True)
+            else:
+                atomic_write_text(config, config_text)
+        except OSError as exc:
+            _say(
+                f"could not put {self.engine_root} back ({exc}); its config.json was: {config_text}"
+            )
+
+    def _drop_truncated_pin(self) -> None:
+        """Remove a pinned engine directory that has no executable.
+
+        camoufox's fetch skips a version directory whose version.json exists
+        (multiversion.install_versioned, and its CLI cannot ask for a
+        replacement), so a truncated extraction would never be repaired.
+        """
+        pin = camoufox_pin()
+        for eng in _engine._installed_engines(self.engine_root):
+            if pin is not None and eng.matches(pin) and not eng.executable:
+                _say(f"removing the incomplete Camoufox engine at {eng.path}")
+                shutil.rmtree(eng.path)
 
     def _fetch(self, env: dict[str, str]) -> None:
         _say("fetching the pinned Camoufox engine (1.3 GB download, 2.4 GB unpacked)...")
@@ -712,7 +903,8 @@ class Transaction:
             with _signals_held():
                 self._swap_in(staged)
         finally:
-            shutil.rmtree(staging, ignore_errors=True)
+            if not self.step_survived:  # a surviving fetch may still be unpacking there
+                shutil.rmtree(staging, ignore_errors=True)
         _say(f"Camoufox engine installed ({camoufox_engine_status().detail})")
 
     def _swap_in(self, staged: Path) -> None:
@@ -740,7 +932,14 @@ class Transaction:
             _say(f"moved the pre-0.5 Camoufox engine aside to {moved}")
 
     def restore_packages(self) -> None:
-        """Reinstall the versions recorded before the install, if they changed."""
+        """Put the venv back as recorded before the install.
+
+        Every distribution whose version changed (or that vanished) is
+        reinstalled at its recorded version with --no-deps, so pip resolves
+        nothing beyond the record, and every one the run added is removed. That
+        holds whether or not a browser was installed before: a first install
+        that fails leaves no half-installed stack either.
+        """
         if self.step_survived:
             # pip (or its wrapper) may still be writing the venv; a second pip
             # beside it would interleave writes to the same files.
@@ -749,31 +948,41 @@ class Transaction:
                 f"so the previous browser packages were NOT restored (their temp dir "
                 f"{self.tmpdir} is kept); re-run scripts/install_browser_stack.sh once "
                 f"they exit (until then it reports the lock as held)"
+                + (
+                    f"; {self.engine_root}/config.json was not put back either, it was: "
+                    f"{self.root_snapshot[0]}"
+                    if self.root_snapshot is not None and not self.swapped
+                    else ""
+                )
             )
         previous = self.previous
-        if "camoufox" not in previous or self.swapped:
-            # Nothing to go back to, or the new engine is already in place and the
-            # new packages are the ones that match it.
+        self._restore_root()
+        if self.swapped:
+            # The new engine is already in place, and the new packages are the
+            # ones that match it.
             return
         current = installed_versions()
-        changed = any(current.get(name) != version for name, version in previous.items())
+        pins = [
+            f"{n}=={v}"
+            for n, v in sorted(previous.items())
+            if v is not None and current.get(n) != v
+        ]
         # A package the step ADDED is removed too: patchright left beside the
         # restored playwright would be preferred by the Chromium fallback while
         # its Chromium was never installed (measured in the live harness).
-        added = [name for name in PACKAGES if name not in previous and name in current]
-        if changed:
-            pins = [f"{name}=={previous[name]}" for name in PACKAGES if name in previous]
+        added = sorted(name for name in current if name not in previous)
+        if pins:
             _say(f"restoring the previous browser packages: {' '.join(pins)}")
             proc = self._run(
-                [sys.executable, "-m", "pip", "install", "--quiet", *pins],
+                [sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", *pins],
                 timeout=STEP_TIMEOUT_S,
             )
             if proc.returncode != 0:
                 raise ProvisionError(
                     f"pip exited {proc.returncode} restoring {' '.join(pins)}; run "
-                    f"`{sys.executable} -m pip install {' '.join(pins)}` by hand"
+                    f"`{sys.executable} -m pip install --no-deps {' '.join(pins)}` by hand"
                 )
-            _say(f"restored {' '.join(pins)}; the previous Camoufox engine was never touched")
+            _say(f"restored {' '.join(pins)}")
         if added:
             _say(f"removing browser packages this run added: {' '.join(added)}")
             proc = self._run(
@@ -785,6 +994,25 @@ class Transaction:
                     f"pip exited {proc.returncode} removing {' '.join(added)}; run "
                     f"`{sys.executable} -m pip uninstall {' '.join(added)}` by hand"
                 )
+        self._ensure_genesis_imports()
+
+    def _ensure_genesis_imports(self) -> None:
+        """pip reinstalls the editable Genesis on every install run, so an
+        interrupted or failed one can leave it unimportable, and no version
+        record can see that. Check it, and reinstall it from this checkout."""
+        if not self.install:
+            return
+        check = self._run(
+            [sys.executable, "-c", "import genesis.runtime"], capture_output=True, text=True
+        )
+        if check.returncode == 0:
+            return
+        _say("Genesis no longer imports after the failed install; reinstalling it")
+        if self._guarded_install("").returncode != 0:
+            raise ProvisionError(
+                "Genesis does not import and reinstalling it failed; run "
+                f"`{sys.executable} -m pip install -e {self.repo_root}` by hand"
+            )
 
     # step 6 (non-fatal: the Chromium fallback is not the primary layer)
     def chromium(self) -> bool:
@@ -793,8 +1021,8 @@ class Transaction:
             _say,
             lambda: backup_if_upgrading(
                 CHROMIUM_PROFILE_DIR,
-                _chromium.profile_major(CHROMIUM_PROFILE_DIR),
-                _chromium.patchright_major(),
+                _chromium.profile_version(CHROMIUM_PROFILE_DIR),
+                _chromium.patchright_version(),
                 "Chromium",
             ),
             step_timeout=STEP_TIMEOUT_S,
@@ -862,15 +1090,22 @@ class Transaction:
             shutil.rmtree(stale, ignore_errors=True)
 
     def _run_locked(self) -> str:
-        # Before the free-space check: a killed run's ~2.4 GB stage would
-        # otherwise keep every later run under the floor.
-        self._clear_stale_staging()
-        reason = preflight()
+        # Nothing has changed yet, so a failure to look is a skip, reported
+        # through _finish like any other (a traceback here would leave the
+        # capability stale and the caller without an outcome line).
+        try:
+            # Before the free-space check: a killed run's ~2.4 GB stage would
+            # otherwise keep every later run under the floor.
+            self._clear_stale_staging()
+            reason = preflight()
+            if not reason:
+                self.previous = installed_versions()
+                STAGING_PARENT.mkdir(parents=True, exist_ok=True)
+                self.tmpdir = Path(tempfile.mkdtemp(prefix="genesis-browser-", dir=STAGING_PARENT))
+        except OSError as exc:
+            reason = f"could not check or prepare the run: {exc}"
         if reason:
             return self._finish(f"SKIPPED ({reason})")
-        self.previous = installed_versions()
-        STAGING_PARENT.mkdir(parents=True, exist_ok=True)
-        self.tmpdir = Path(tempfile.mkdtemp(prefix="genesis-browser-", dir=STAGING_PARENT))
         self.env["TMPDIR"] = str(self.tmpdir)
 
         def _interrupted(signum, _frame):
@@ -880,7 +1115,7 @@ class Transaction:
             first = not (self.interrupted or self.rolling_back)
             self.interrupted = True
             if first:
-                raise ProvisionError(f"interrupted by signal {signal.Signals(signum).name}")
+                _raise_interrupt(signum)
 
         def _recorded(signum, _frame):
             self.interrupted = True

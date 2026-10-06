@@ -57,7 +57,9 @@ def _layout(home: Path) -> dict[str, Path]:
         "killed_copy": _aged_dir(g / "camoufox-profile.pre-v135-20261001T010203.k2j9x1.tmp", 3),
         "fresh_copy": _aged_dir(g / "camoufox-profile.pre-v135-20261005T010203.a8b7c6.tmp", 0.1),
         "old_chromium": _aged_dir(g / "browser-profile.pre-v145-20260901T000000", 20),
-        "killed_chromium_copy": _aged_dir(g / "browser-profile.pre-v145-20261001T010203.q1w2e3.tmp", 3),
+        "killed_chromium_copy": _aged_dir(
+            g / "browser-profile.pre-v145-20261001T010203.q1w2e3.tmp", 3
+        ),
         "live_chromium_profile": _aged_dir(g / "browser-profile", 400),
         "live_profile": _aged_dir(g / "camoufox-profile", 400),
         "live_engine": _aged_dir(c / "camoufox", 400),
@@ -93,3 +95,36 @@ def test_chromium_backups_follow_the_chromium_state_not_the_engine(tmp_path):
     _prune(tmp_path, "legacy_layout", "ready")
     assert not paths["old_chromium"].exists()
     assert paths["live_chromium_profile"].exists()
+
+
+def _probe(venv_py: str) -> str:
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; VENV_PY="$2"; browser_backup_state genesis.browser.provision camoufox_backup_state',
+            "_",
+            str(_HYGIENE),
+            venv_py,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return proc.stdout.strip()
+
+
+def test_a_probe_that_cannot_run_reads_as_probe_failed_and_keeps_backups(tmp_path):
+    """The state probe used to fold an import failure into "unknown", the same
+    word the state function returns for a profile it cannot read."""
+    assert _probe("false") == "probe_failed"
+
+
+def test_the_probe_asks_the_named_state_function(tmp_path):
+    stub = tmp_path / "py"
+    stub.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$2" | grep -q "import camoufox_backup_state" && echo ready\n'
+    )
+    stub.chmod(0o755)
+    assert _probe(str(stub)) == "ready"
+    main = _HYGIENE.read_text().split("\nmain() {", 1)[1]
+    assert "browser_backup_state genesis.browser.provision camoufox_backup_state" in main
