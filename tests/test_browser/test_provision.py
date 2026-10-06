@@ -1692,26 +1692,81 @@ def _chromium_profile(last_version: str = "145.0.7632.6") -> Path:
     return profile
 
 
-def test_chromium_profile_major(tmp_path):
+def _aged(path: Path, days: float) -> None:
+    t = time.time() - days * 86400
+    os.utime(path, (t, t))
+
+
+@pytest.mark.parametrize(
+    "last, new, opened_days_ago, expected",
+    [
+        ("151.0.7700.1", "151.0.7700.1", 20, "ready"),
+        # "Last Version" is rewritten on every launch, so its age dates nothing;
+        # the backup's own mtime (taken just before the check opens the
+        # profile) is what disk_hygiene ages.
+        ("151.0.7700.1", "151.0.7700.1", 0, "ready"),
+        # Devin red (#2954): after a downgrade the profile records a NEWER
+        # Chromium than the installed one, which cannot open it.
+        ("151.0.7700.1", "145.0.7632.6", 20, "not_opened_by_the_new_chromium"),
+        ("151.0.7700.1", "151.0.7700.9", 20, "not_opened_by_the_new_chromium"),
+        ("151.0.7700.1", None, 20, "unknown"),
+    ],
+)
+def test_chromium_backups_are_prunable_only_once_its_build_opened_the_profile(
+    monkeypatch, last, new, opened_days_ago, expected
+):
+    _chromium_profile(last)
+    _aged(provision.CHROMIUM_PROFILE_DIR / "Last Version", opened_days_ago)
+    monkeypatch.setattr(chromium, "patchright_version", lambda: new)
+    assert chromium.backup_state() == expected
+
+
+def test_chromium_profile_version(tmp_path):
     (tmp_path / "Last Version").write_text("145.0.7632.6\n")
-    assert chromium.profile_major(tmp_path) == 145
-    assert chromium.profile_major(tmp_path / "missing") is None
+    assert chromium.profile_version(tmp_path) == "145.0.7632.6"
+    assert chromium.profile_version(tmp_path / "missing") is None
+
+
+def test_a_same_major_chromium_build_change_backs_up_the_profile(stack, tmp_path, monkeypatch):
+    _install_pinned(stack)
+    _chromium_profile("151.0.7700.1")
+    monkeypatch.setattr(chromium, "patchright_version", lambda: "151.0.7700.9")
+    monkeypatch.setattr(subprocess, "run", FakeRun())
+    _tx(tmp_path).run()
+    assert len(list(provision.CHROMIUM_PROFILE_DIR.parent.glob("browser-profile.pre-v151*"))) == 1
+
+
+def test_the_chromium_launch_check_is_the_fallback_launch(stack, tmp_path, monkeypatch):
+    """Devin (#2954, #2956): a headless launch on a fresh profile passed where the
+    fallback's headed launch of the persistent profile on the VNC display could
+    not start; the check now runs the fallback's own launch."""
+    from genesis.mcp.health import browser
+
+    assert "launch_persistent_context" in chromium.SMOKE and "headless=False" in chromium.SMOKE
+    assert chromium.DISPLAY == browser._VNC_DISPLAY
+    assert chromium.PROFILE_DIR.name == browser._CHROMIUM_PROFILE_DIR.name
+    _install_pinned(stack)
+    run = FakeRun()
+    monkeypatch.setattr(subprocess, "run", run)
+    _tx(tmp_path).run()
+    smokes = [c for c, _ in run.calls if c[1:2] == ["-c"] and "patchright" in c[2]]
+    assert smokes and smokes[0][3:] == [str(chromium.PROFILE_DIR)]
 
 
 def test_chromium_upgrade_backs_up_its_profile(stack, tmp_path, monkeypatch):
     _install_pinned(stack)
     _chromium_profile()
-    monkeypatch.setattr(chromium, "patchright_major", lambda: 151)
+    monkeypatch.setattr(chromium, "patchright_version", lambda: "151.0.7700.1")
     monkeypatch.setattr(subprocess, "run", FakeRun())
     outcome = _tx(tmp_path).run()
-    assert len(list(provision.CHROMIUM_PROFILE_DIR.parent.glob("browser-profile.pre-v145-*"))) == 1
+    assert len(list(provision.CHROMIUM_PROFILE_DIR.parent.glob("browser-profile.pre-v145*"))) == 1
     assert "chromium=True" in outcome
 
 
 def test_chromium_backup_refusal_is_non_fatal(stack, tmp_path, monkeypatch, capsys):
     _install_pinned(stack)
     _chromium_profile()
-    monkeypatch.setattr(chromium, "patchright_major", lambda: 151)
+    monkeypatch.setattr(chromium, "patchright_version", lambda: "151.0.7700.1")
     monkeypatch.setattr(provision, "chromium_running", lambda: True)
     monkeypatch.setattr(subprocess, "run", FakeRun())
     outcome = _tx(tmp_path).run()
@@ -1721,7 +1776,7 @@ def test_chromium_backup_refusal_is_non_fatal(stack, tmp_path, monkeypatch, caps
 
 def test_chromium_backup_oserror_is_non_fatal(tmp_path, monkeypatch):
     _chromium_profile()
-    monkeypatch.setattr(chromium, "patchright_major", lambda: 151)
+    monkeypatch.setattr(chromium, "patchright_version", lambda: "151.0.7700.1")
 
     def no_space(*a, **k):
         raise OSError(28, "No space left on device")
@@ -1741,6 +1796,9 @@ def test_chromium_install_failure_is_non_fatal(stack, tmp_path, monkeypatch, cap
     assert run.pip_calls() == [], "a Chromium failure never rolls the packages back"
 
 
+_NO_LIBS = "chrome: error while loading shared libraries: libnss3.so: cannot open shared object"
+
+
 def test_chromium_that_does_not_launch_gets_its_system_libraries(stack, tmp_path, monkeypatch):
     _install_pinned(stack)
     launches = iter([False, True])
@@ -1749,7 +1807,8 @@ def test_chromium_that_does_not_launch_gets_its_system_libraries(stack, tmp_path
     def run(cmd, **kw):
         calls.append(cmd)
         if cmd[1:2] == ["-c"] and "patchright" in cmd[2]:
-            return SimpleNamespace(returncode=0 if next(launches) else 1, stdout="", stderr="")
+            ok = next(launches)
+            return SimpleNamespace(returncode=0 if ok else 1, stdout="", stderr=_NO_LIBS)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
@@ -1766,29 +1825,13 @@ def test_chromium_without_sudo_names_the_command(stack, tmp_path, monkeypatch, c
         if cmd[:2] == ["sudo", "-n"]:
             return SimpleNamespace(returncode=1, stdout="", stderr="")
         if cmd[1:2] == ["-c"] and "patchright" in cmd[2]:
-            return SimpleNamespace(returncode=1, stdout="", stderr="")
+            return SimpleNamespace(returncode=1, stdout="", stderr=_NO_LIBS)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
     outcome = _tx(tmp_path).run()
     assert "install-deps chromium" in capsys.readouterr().out
     assert "chromium=False" in outcome
-
-
-def test_chromium_backup_state(monkeypatch):
-    _chromium_profile("151.0.7700.1")
-    monkeypatch.setattr(chromium, "patchright_major", lambda: 151)
-    assert chromium.backup_state() == "ready"
-    monkeypatch.setattr(chromium, "patchright_major", lambda: 153)
-    assert chromium.backup_state() == "not_opened_by_the_new_chromium"
-    monkeypatch.setattr(chromium, "patchright_major", lambda: None)
-    assert chromium.backup_state() == "unknown"
-
-
-def test_the_chromium_launch_check_runs_the_binary_the_fallback_runs():
-    """A plain headless launch runs chromium-headless-shell, which links fewer
-    system libraries than the headed `chromium` the fallback uses."""
-    assert 'channel="chromium"' in chromium.SMOKE
 
 
 def test_a_signal_during_the_chromium_step_is_reported_not_raised(stack, tmp_path, monkeypatch):
@@ -1822,12 +1865,49 @@ def test_chromium_still_down_after_install_deps_names_the_command(
 
     def run(cmd, **kw):
         if cmd[1:2] == ["-c"] and "patchright" in cmd[2]:
-            return SimpleNamespace(returncode=1, stdout="", stderr="")
+            return SimpleNamespace(returncode=1, stdout="", stderr=_NO_LIBS)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
     outcome = _tx(tmp_path).run()
     out = capsys.readouterr().out
     assert "installing its system libraries" in out
-    assert "Run: sudo" in out and "install-deps chromium" in out
+    assert "run: sudo" in out and "install-deps chromium" in out
+    assert "chromium=False" in outcome
+
+
+def test_a_missing_display_names_the_display_and_installs_nothing(
+    stack, tmp_path, monkeypatch, capsys
+):
+    """Review finding on this slice: every failed launch ran a root apt
+    install-deps, including a missing X display (bootstrap treats a VNC setup
+    failure as non-fatal), which no library can fix."""
+    _install_pinned(stack)
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        if cmd[1:2] == ["-c"] and "patchright" in cmd[2]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="Missing X server or $DISPLAY")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert not [c for c in calls if c[:1] == ["sudo"]]
+    assert "X display :99" in capsys.readouterr().out
+    assert "chromium=False" in outcome
+
+
+def test_a_profile_from_a_newer_chromium_is_not_opened(stack, tmp_path, monkeypatch, capsys):
+    """Review finding on this slice: after a downgrade the check would open a
+    profile a newer Chromium wrote; it is backed up and left alone instead."""
+    _install_pinned(stack)
+    _chromium_profile("151.0.7700.1")
+    monkeypatch.setattr(chromium, "patchright_version", lambda: "145.0.7632.6")
+    run = FakeRun()
+    monkeypatch.setattr(subprocess, "run", run)
+    outcome = _tx(tmp_path).run()
+    assert not [c for c, _ in run.calls if c[1:2] == ["-c"] and "patchright" in c[2]]
+    assert len(list(provision.CHROMIUM_PROFILE_DIR.parent.glob("browser-profile.pre-v151*"))) == 1
+    assert "newer Chromium" in capsys.readouterr().out
     assert "chromium=False" in outcome

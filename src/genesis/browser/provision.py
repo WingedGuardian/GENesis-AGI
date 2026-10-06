@@ -1020,13 +1020,8 @@ class Transaction:
             _say,
             lambda: backup_if_upgrading(
                 CHROMIUM_PROFILE_DIR,
-                *(
-                    None if v is None else str(v)
-                    for v in (
-                        _chromium.profile_major(CHROMIUM_PROFILE_DIR),
-                        _chromium.patchright_major(),
-                    )
-                ),
+                _chromium.profile_version(CHROMIUM_PROFILE_DIR),
+                _chromium.patchright_version(),
                 "Chromium",
             ),
             step_timeout=STEP_TIMEOUT_S,
