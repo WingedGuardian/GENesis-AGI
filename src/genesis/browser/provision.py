@@ -16,8 +16,8 @@ never overlap and no browser launches mid-run; a running browser holds it SHARED
      scripts/lib/venv_setup.sh (its one home), then check the packages import,
      that camoufox carries a browser pin, and that every installed version
      satisfies the extra's ranges (the installer masks pip's exit status).
-  3. copy the Camoufox profile if a newer Firefox major is about to open it
-     (Firefox refuses a profile last used by a newer version).
+  3. copy the Camoufox profile if another build is about to open it (Firefox
+     refuses a profile last used by a newer version, build included).
   4. the engine. A ``camoufox set`` choice of another build is reset to the
      paired one first. Already ready: nothing to do. An install root in
      camoufox 0.5's side-by-side layout: ``camoufox fetch`` in place (it adds a
@@ -401,23 +401,54 @@ def copy_aside(src: Path, label: str) -> Path:
     return dest
 
 
-def firefox_profile_major(profile: Path) -> int | None:
-    """Major Firefox version that last opened ``profile`` (compatibility.ini)."""
+def firefox_profile_version(profile: Path) -> str | None:
+    """The Camoufox build that last opened ``profile``, as ``<version>-<build>``.
+
+    compatibility.ini's LastVersion is ``<app version>_<build id>/<platform>``,
+    and Camoufox's app version is its own ``<version>-<build>`` (MEASURED on a
+    135.0.1-beta.24 engine: application.ini Version=135.0.1-beta.24, profile
+    LastVersion=135.0.1-beta.24_20250315105650/20250315105650), the same string
+    a camoufox pin names.
+    """
     parser = configparser.ConfigParser()
     try:
         if not parser.read(profile / "compatibility.ini"):
             return None
-        return int(parser.get("Compatibility", "LastVersion").split(".", 1)[0])
-    except (configparser.Error, ValueError):
+        return parser.get("Compatibility", "LastVersion").split("_", 1)[0] or None
+    except (configparser.Error, UnicodeDecodeError):
         return None
 
 
-def _major(version: str) -> int | None:
-    """Leading number of a version string; None when it has none (back it up)."""
-    try:
-        return int(version.split(".", 1)[0])
-    except ValueError:
-        return None
+_LABEL_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+-]{0,63}")
+# scripts/disk_hygiene.sh prunes a backup 14 days old; the state below waits as
+# long again after the migration.
+BACKUP_KEEP_S = 14 * 86400
+
+
+def camoufox_backup_state() -> str:
+    """ "ready" once the paired engine has opened the Camoufox profile.
+
+    scripts/disk_hygiene.sh prunes the Camoufox rollback material (the profile
+    copies and a moved-aside pre-0.5 engine) only in that state. Engine files in
+    place say nothing about the profile: a backup pruned before the new engine
+    first opens the profile, or after an upgrade whose launch never worked, is
+    the one copy an older Firefox could still open.
+    """
+    status = camoufox_engine_status()
+    if not status.ready:
+        return status.state
+    if not PROFILE_DIR.is_dir() or not any(PROFILE_DIR.iterdir()):
+        return "ready"  # no profile: nothing of it to protect, only the engine
+    pin, last = camoufox_pin(), firefox_profile_version(PROFILE_DIR)
+    if pin is None or last is None:
+        return "unknown"
+    if last != f"{pin.version}-{pin.build}":
+        return "not_opened_by_the_new_engine"
+    # compatibility.ini is rewritten only when another build opens the profile,
+    # so its age is the time since the migration: the 14 days start there, not
+    # at the copy, which may have sat unused for weeks before it.
+    opened = (PROFILE_DIR / "compatibility.ini").stat().st_mtime
+    return "ready" if time.time() - opened > BACKUP_KEEP_S else "opened_recently"
 
 
 def _running_check(kind: str) -> Callable[[], bool | None]:
@@ -429,25 +460,29 @@ def _running_check(kind: str) -> Callable[[], bool | None]:
     return browsers_running
 
 
-def backup_if_upgrading(
-    profile: Path, last_major: int | None, new_major: int | None, kind: str
-) -> None:
-    """Copy ``profile`` once before a newer major first opens it.
+def backup_if_upgrading(profile: Path, last: str | None, new: str | None, kind: str) -> None:
+    """Copy ``profile`` once before a different browser build first opens it.
 
     Stateless: the trigger is the profile's own record of the version that last
     opened it, so once the new version has opened it no further copy is made.
-    An unreadable version on either side means "back it up": a missed copy of a
-    one-way profile upgrade cannot be recovered, an extra copy can be pruned.
+    Any difference counts, not just a newer major: Firefox's downgrade check
+    compares the whole version, so a newer build of the same major can leave
+    the profile unusable to the build a rollback returns to. An unreadable
+    version on either side means "back it up": a missed copy of a one-way
+    profile upgrade cannot be recovered, an extra copy can be pruned.
     """
     if not profile.is_dir() or not any(profile.iterdir()):
         return
-    if last_major is not None and new_major is not None and last_major >= new_major:
+    if last is not None and last == new:
         return
     # Re-check right before copying: the preflight answer is minutes old by now.
     # Only the browser that owns this profile matters here.
     if _running_check(kind)() is not False:
         raise ProvisionError(f"a browser may be using the {kind} profile; not copying it")
-    label = f"v{last_major}" if last_major is not None else "vunknown"
+    # Named by the exact version: copy_aside keeps the newest copy per label,
+    # so a run going back to an older build must not replace the copy that
+    # build needs. The version comes from a file, so only a safe name is used.
+    label = f"v{last}" if last and _LABEL_RE.fullmatch(last) else "vunknown"
     backup = copy_aside(profile, label)
     _say(f"backed up the {kind} profile (last opened by {label}) to {backup}")
 
@@ -744,8 +779,8 @@ class Transaction:
         if pin:
             backup_if_upgrading(
                 PROFILE_DIR,
-                firefox_profile_major(PROFILE_DIR),
-                _major(pin.version),
+                firefox_profile_version(PROFILE_DIR),
+                f"{pin.version}-{pin.build}",
                 "Camoufox",
             )
         self._snapshot_root()

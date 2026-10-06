@@ -295,9 +295,11 @@ prune_browser_backups() {
     # Camoufox profile taken before a newer engine first opened it
     # (~/.genesis/camoufox-profile.pre-<label>-<time>, hundreds of MB). They are
     # only worth keeping while the new stack might still need rolling back, so
-    # they go after 14 days, and ONLY when the pinned engine is installed
-    # ($2 = "ready": files present; launchability is not stored), so a broken
-    # install keeps its way back. A copy interrupted by a killed run
+    # they go after 14 days, and ONLY once the paired engine opened the profile
+    # at least 14 days ago ($2 = "ready", provision.camoufox_backup_state: the
+    # profile's compatibility.ini names the pinned build and is that old), so a
+    # broken install, or an upgrade nobody has browsed with yet, keeps its way
+    # back. A copy interrupted by a killed run
     # (<backup>.<random>.tmp, provision.copy_aside's temp dir) is never a valid
     # backup and goes after a day either way.
     local home="${1:-$HOME}" engine_state="${2:-unknown}"
@@ -309,6 +311,16 @@ prune_browser_backups() {
     fi
     _prune_browser_tree_set "$cache" -mtime +14 -name 'camoufox.pre-0.5*'
     _prune_browser_tree_set "$home/.genesis" -mtime +14 -name 'camoufox-profile.pre-*' ! -name '*.tmp'
+}
+
+browser_backup_state() {
+    # Print the state a browser module reports for its rollback backups
+    # (genesis.browser.provision.camoufox_backup_state and the like); only
+    # "ready" lets prune_browser_backups delete them. A probe that cannot run
+    # prints "probe_failed", distinct from the module's own "unknown".
+    local state
+    state="$("$VENV_PY" -c "from $1 import $2 as s; print(s())" 2>/dev/null)" || state=""
+    echo "${state:-probe_failed}"
 }
 
 _prune_browser_tree_set() {
@@ -573,10 +585,9 @@ main() {
     echo "--- guard replay corpus retention prune (>45d) ---"
     prune_guard_corpus "$HOME/.genesis/output"
 
-    echo "--- browser upgrade backups (>14d, only once the engine is ready) ---"
+    echo "--- browser upgrade backups (>14d, only once the new engine opened the profile) ---"
     local browser_state
-    browser_state="$("$VENV_PY" -c 'from genesis.browser.engine import camoufox_engine_status as s; print("ready" if s().ready else s().state)' 2>/dev/null)" \
-        || browser_state="unknown"
+    browser_state="$(browser_backup_state genesis.browser.provision camoufox_backup_state)"
     prune_browser_backups "$HOME" "$browser_state"
 
     echo "=== genesis-disk-hygiene done ==="

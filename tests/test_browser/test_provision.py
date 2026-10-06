@@ -1442,6 +1442,76 @@ def _firefox_profile(profile: Path, last_version: str = "135.0.1-beta.24_x/x") -
     return profile
 
 
+def test_a_same_major_build_change_backs_up_the_profile(stack, tmp_path, monkeypatch):
+    """Codex (#2953): Firefox's downgrade check compares the whole version, so a
+    newer 156 build can make the profile unusable to the older 156 build; a
+    major-only comparison skipped the copy."""
+    _legacy_engine(stack)
+    _firefox_profile(provision.PROFILE_DIR, f"{PIN.version}-beta.33_20260101/20260101")
+    monkeypatch.setattr(subprocess, "run", FakeRun(fetch=_install_pinned))
+    _tx(tmp_path).run()
+    assert len(list(provision.PROFILE_DIR.parent.glob("camoufox-profile.pre-v156*"))) == 1
+
+
+_OPENED = f"{PIN.version}-{PIN.build}_20260101/20260101"
+
+
+@pytest.mark.parametrize(
+    "last_version, opened_days_ago, engine_ready, expected",
+    [
+        (_OPENED, 20, True, "ready"),
+        # The 14 days run from the migration, not from the copy (Devin, #2953).
+        (_OPENED, 2, True, "opened_recently"),
+        (f"{PIN.version}-beta.33_20260101/20260101", 20, True, "not_opened_by_the_new_engine"),
+        ("135.0.1-beta.24_x/x", 20, True, "not_opened_by_the_new_engine"),
+        ("", 20, True, "unknown"),  # a profile with no readable record
+        (None, 0, True, "ready"),  # no profile at all: nothing of it to protect
+        (_OPENED, 20, False, engine.PIN_NOT_INSTALLED),
+    ],
+)
+def test_camoufox_backups_are_prunable_only_once_the_engine_opened_the_profile(
+    stack, last_version, opened_days_ago, engine_ready, expected
+):
+    """Devin red (#2953) + Codex (#2953, #2956): engine files being ready said
+    nothing about the profile; its rollback copy could be pruned before the new
+    engine ever opened it, or after an upgrade whose launch never worked."""
+    if engine_ready:
+        _install_pinned(stack)
+    if last_version is not None:
+        _firefox_profile(provision.PROFILE_DIR, last_version)
+        if not last_version:
+            (provision.PROFILE_DIR / "compatibility.ini").unlink()
+        else:
+            t = time.time() - opened_days_ago * 86400
+            os.utime(provision.PROFILE_DIR / "compatibility.ini", (t, t))
+    assert provision.camoufox_backup_state() == expected
+
+
+def test_a_rollback_run_keeps_the_copy_the_rollback_needs(tmp_path):
+    """Review finding on this slice: copies were kept newest-per-MAJOR, so going
+    back from beta.35 to beta.34 replaced the beta.34 copy with the beta.35
+    profile, which beta.34 refuses."""
+    profile = _firefox_profile(tmp_path / "camoufox-profile", "156.0.1-beta.34_1/1")
+    (profile / "cookies.sqlite").write_text("opened by beta.34")
+    provision.backup_if_upgrading(profile, "156.0.1-beta.34", "156.0.1-beta.35", "Camoufox")
+    (profile / "compatibility.ini").write_text("[Compatibility]\nLastVersion=156.0.1-beta.35_2/2\n")
+    (profile / "cookies.sqlite").write_text("opened by beta.35")
+    provision.backup_if_upgrading(profile, "156.0.1-beta.35", "156.0.1-beta.34", "Camoufox")
+    contents = sorted(
+        (p / "cookies.sqlite").read_text() for p in tmp_path.glob("camoufox-profile.pre-*")
+    )
+    assert contents == ["opened by beta.34", "opened by beta.35"]
+
+
+@pytest.mark.parametrize("last", ["../../etc", "1" * 300, "156.0.1/../x"])
+def test_an_odd_recorded_version_gets_a_safe_label(tmp_path, last):
+    profile = _firefox_profile(tmp_path / "camoufox-profile")
+    provision.backup_if_upgrading(profile, last, "156.0.1-beta.34", "Camoufox")
+    assert [p.name.split("-2")[0] for p in tmp_path.glob("camoufox-profile.pre-*")] == [
+        "camoufox-profile.pre-vunknown"
+    ]
+
+
 def test_an_engine_upgrade_backs_up_the_profile_first(stack, tmp_path, monkeypatch):
     _legacy_engine(stack)
     _firefox_profile(provision.PROFILE_DIR)
@@ -1449,7 +1519,7 @@ def test_an_engine_upgrade_backs_up_the_profile_first(stack, tmp_path, monkeypat
 
     def fetch(install_dir, env):
         order.append(
-            ("fetch", len(list(provision.PROFILE_DIR.parent.glob("camoufox-profile.pre-v135-*"))))
+            ("fetch", len(list(provision.PROFILE_DIR.parent.glob("camoufox-profile.pre-v135*"))))
         )
         _install_pinned(install_dir)
 
@@ -1478,15 +1548,15 @@ def test_profile_copy_failure_restores_packages_and_leaves_the_engine(stack, tmp
     assert "DEGRADED" in outcome
 
 
-def test_backup_only_when_a_newer_major_will_open_the_profile(tmp_path):
+def test_backup_only_when_another_build_will_open_the_profile(tmp_path):
     profile = _firefox_profile(tmp_path / "camoufox-profile")
-    last = provision.firefox_profile_major(profile)
-    assert last == 135
-    provision.backup_if_upgrading(profile, last, 156, "Camoufox")
-    assert len(list(tmp_path.glob("camoufox-profile.pre-v135-*"))) == 1
-    provision.backup_if_upgrading(profile, last, 156, "Camoufox")
-    assert len(list(tmp_path.glob("camoufox-profile.pre-v135-*"))) == 1
-    provision.backup_if_upgrading(profile, 156, 156, "Camoufox")
+    last = provision.firefox_profile_version(profile)
+    assert last == "135.0.1-beta.24"
+    provision.backup_if_upgrading(profile, last, "156.0.1-beta.34", "Camoufox")
+    assert len(list(tmp_path.glob("camoufox-profile.pre-v135*"))) == 1
+    provision.backup_if_upgrading(profile, last, "156.0.1-beta.34", "Camoufox")
+    assert len(list(tmp_path.glob("camoufox-profile.pre-v135*"))) == 1
+    provision.backup_if_upgrading(profile, "156.0.1-beta.34", "156.0.1-beta.34", "Camoufox")
     assert len(list(tmp_path.glob("camoufox-profile.pre-*"))) == 1
 
 
@@ -1498,23 +1568,23 @@ def test_each_profile_checks_only_its_own_browser(tmp_path, monkeypatch):
     (camoufox_profile / "prefs.js").write_text("x")
     monkeypatch.setattr(provision, "camoufox_running", lambda: False)
     monkeypatch.setattr(provision, "chromium_running", lambda: True)
-    provision.backup_if_upgrading(camoufox_profile, 135, 156, "Camoufox")
-    assert len(list(tmp_path.glob("camoufox-profile.pre-v135-*"))) == 1
+    provision.backup_if_upgrading(camoufox_profile, "135.0.1", "156.0.1", "Camoufox")
+    assert len(list(tmp_path.glob("camoufox-profile.pre-v135*"))) == 1
 
     chromium_profile = tmp_path / "browser-profile"
     chromium_profile.mkdir()
     (chromium_profile / "Cookies").write_text("c")
     monkeypatch.setattr(provision, "camoufox_running", lambda: True)
     monkeypatch.setattr(provision, "chromium_running", lambda: False)
-    provision.backup_if_upgrading(chromium_profile, 145, 151, "Chromium")
-    assert len(list(tmp_path.glob("browser-profile.pre-v145-*"))) == 1
+    provision.backup_if_upgrading(chromium_profile, "145.0.1", "151.0.1", "Chromium")
+    assert len(list(tmp_path.glob("browser-profile.pre-v145*"))) == 1
 
     monkeypatch.setattr(provision, "chromium_running", lambda: None)
     other = tmp_path / "other" / "browser-profile"
     other.mkdir(parents=True)
     (other / "Cookies").write_text("c")
     with pytest.raises(provision.ProvisionError, match="may be using the Chromium"):
-        provision.backup_if_upgrading(other, 145, 151, "Chromium")
+        provision.backup_if_upgrading(other, "145.0.1", "151.0.1", "Chromium")
 
 
 def test_interrupted_copy_is_not_a_backup(tmp_path):
@@ -1548,22 +1618,22 @@ def test_an_unreadable_pin_version_still_backs_up(stack, tmp_path, monkeypatch):
     )
     monkeypatch.setattr(subprocess, "run", FakeRun())
     _tx(tmp_path).run()
-    assert len(list(provision.PROFILE_DIR.parent.glob("camoufox-profile.pre-v135-*"))) == 1
+    assert len(list(provision.PROFILE_DIR.parent.glob("camoufox-profile.pre-v135*"))) == 1
 
 
-def test_firefox_profile_major(tmp_path):
+def test_firefox_profile_version(tmp_path):
     (tmp_path / "compatibility.ini").write_text(
         "[Compatibility]\nLastVersion=135.0.1-beta.24_20250315105650/20250315105650\n"
     )
-    assert provision.firefox_profile_major(tmp_path) == 135
-    assert provision.firefox_profile_major(tmp_path / "missing") is None
+    assert provision.firefox_profile_version(tmp_path) == "135.0.1-beta.24"
+    assert provision.firefox_profile_version(tmp_path / "missing") is None
 
 
 def test_unknown_version_still_backs_up(tmp_path):
     profile = tmp_path / "camoufox-profile"
     profile.mkdir()
     (profile / "prefs.js").write_text("x")
-    provision.backup_if_upgrading(profile, None, 156, "Camoufox")
+    provision.backup_if_upgrading(profile, None, "156.0.1", "Camoufox")
     assert len(list(tmp_path.glob("camoufox-profile.pre-vunknown-*"))) == 1
 
 
@@ -1573,7 +1643,7 @@ def test_backup_refused_while_its_browser_runs(tmp_path, monkeypatch):
     (profile / "prefs.js").write_text("x")
     monkeypatch.setattr(provision, "camoufox_running", lambda: True)
     with pytest.raises(provision.ProvisionError, match="may be using"):
-        provision.backup_if_upgrading(profile, 135, 156, "Camoufox")
+        provision.backup_if_upgrading(profile, "135.0.1", "156.0.1", "Camoufox")
 
 
 def test_a_retry_refreshes_the_profile_backup(tmp_path):
@@ -1582,10 +1652,10 @@ def test_a_retry_refreshes_the_profile_backup(tmp_path):
     profile = tmp_path / "camoufox-profile"
     profile.mkdir()
     (profile / "cookies.sqlite").write_text("first")
-    provision.backup_if_upgrading(profile, 135, 156, "Camoufox")
+    provision.backup_if_upgrading(profile, "135.0.1", "156.0.1", "Camoufox")
     (profile / "cookies.sqlite").write_text("after the failed attempt")
-    provision.backup_if_upgrading(profile, 135, 156, "Camoufox")
-    backups = list(tmp_path.glob("camoufox-profile.pre-v135-*"))
+    provision.backup_if_upgrading(profile, "135.0.1", "156.0.1", "Camoufox")
+    backups = list(tmp_path.glob("camoufox-profile.pre-v135*"))
     assert len(backups) == 1
     assert (backups[0] / "cookies.sqlite").read_text() == "after the failed attempt"
 
@@ -1606,4 +1676,4 @@ def test_failed_copy_leaves_no_temp_and_keeps_the_old_backup(tmp_path, monkeypat
         provision.copy_aside(profile, "v135")
     assert not list(tmp_path.glob("*.tmp"))
     assert first.is_dir()
-    assert len(list(tmp_path.glob("camoufox-profile.pre-v135-*"))) == 1
+    assert len(list(tmp_path.glob("camoufox-profile.pre-v135*"))) == 1

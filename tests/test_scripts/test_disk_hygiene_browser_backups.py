@@ -78,3 +78,36 @@ def test_unready_engine_keeps_rollback_material(tmp_path):
     assert not paths["stale_tmp"].exists(), "an interrupted copy is never a backup"
     assert not paths["killed_copy"].exists()
     assert paths["fresh_copy"].exists(), "a copy that may still be in progress is left alone"
+
+
+def _probe(venv_py: str) -> str:
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; VENV_PY="$2"; browser_backup_state genesis.browser.provision camoufox_backup_state',
+            "_",
+            str(_HYGIENE),
+            venv_py,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return proc.stdout.strip()
+
+
+def test_a_probe_that_cannot_run_reads_as_probe_failed_and_keeps_backups(tmp_path):
+    """The state probe used to fold an import failure into "unknown", the same
+    word the state function returns for a profile it cannot read."""
+    assert _probe("false") == "probe_failed"
+
+
+def test_the_probe_asks_the_named_state_function(tmp_path):
+    stub = tmp_path / "py"
+    stub.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$2" | grep -q "import camoufox_backup_state" && echo ready\n'
+    )
+    stub.chmod(0o755)
+    assert _probe(str(stub)) == "ready"
+    main = _HYGIENE.read_text().split("\nmain() {", 1)[1]
+    assert "browser_backup_state genesis.browser.provision camoufox_backup_state" in main
