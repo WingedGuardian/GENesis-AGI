@@ -268,6 +268,39 @@ def test_a_path_outside_any_repo_is_allowed(world):
     assert res.returncode == 0, res.stderr
 
 
+def test_a_tilde_path_is_expanded_before_it_is_judged(world):
+    """Claude Code's file tools expand a leading ``~`` (MEASURED 2026-10-05: a
+    Write to ``~/tmp/...`` landed in the home directory, not under the cwd), so
+    ``Edit ~/<root>/README.md`` writes the deploy root and must be judged there."""
+    tilde = "~/" + world["install"].name + "/README.md"
+    res = _run(world, _edit(tilde, world["plain"]), home=world["base"])
+    _assert_blocked(res, res.stderr)
+    assert "README.md" in res.stderr
+
+
+def test_a_symlink_to_a_tracked_primary_file_is_judged_by_its_target(world):
+    """A path is judged by the file a write through it would change, so an
+    untracked link (here outside any repo, and inside a linked worktree) to a
+    tracked deploy-root file is that file. CC 2.1.280 refuses to write through a
+    symlink (MEASURED); this pins the guard for a version that does not."""
+    for where in (world["plain"], world["wt"]):
+        link = where / "alias-to-readme"
+        if not link.is_symlink():
+            link.symlink_to(world["install"] / "README.md")
+        res = _run(world, _edit(link, where))
+        _assert_blocked(res, (where, res.stderr))
+
+
+def test_a_symlink_in_the_root_pointing_outside_it_is_allowed(world):
+    """The control: the write lands at the link's target, outside the deploy
+    root, so nothing tracked there changes."""
+    link = world["install"] / "alias-out"
+    if not link.is_symlink():
+        link.symlink_to(world["plain"] / "f.txt")
+    res = _run(world, _edit(link, world["install"]))
+    assert res.returncode == 0, res.stderr
+
+
 def test_a_guard_belonging_to_another_checkout_does_not_judge_this_one(world):
     """Same primary checkout, but the guard script lives in ANOTHER primary repo:
     the block is scoped to the checkout the hook script belongs to."""

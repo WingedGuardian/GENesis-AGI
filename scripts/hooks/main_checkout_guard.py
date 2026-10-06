@@ -13,7 +13,12 @@ The guard has two halves, and they work differently on purpose.
 1. FILE TOOLS — BLOCKED (PreToolUse on Write / Edit / MultiEdit / NotebookEdit).
    The tool names its path, so the guard asks git about that one path and exits 2
    when it is a TRACKED, non-ephemeral file in the primary checkout this script
-   belongs to. A path is judged in three steps, each a git query:
+   belongs to. The path is first resolved: a leading ``~`` is expanded (Claude
+   Code's file tools expand it — MEASURED on 2.1.280), and symlinks are followed,
+   final component included, so a path is judged by the file a write through it
+   would change. (2.1.280 itself refuses to Write or Edit through a symlink —
+   MEASURED — so following the final link matters only on a version that writes
+   through one.) It is then judged in three steps, each a git query:
      a. its nearest enclosing checkout is a PRIMARY one (the per-worktree git dir
         is the common dir — the definition ``genesis_is_primary_checkout`` in
         ``scripts/lib/deploy_checkout.sh`` uses, path arms included) AND it is the
@@ -336,15 +341,17 @@ def _blocking_files(git: _Git, abs_paths: list[str]) -> tuple[str, list[str]] | 
     ``abs_paths`` (a directory contributes the tracked files under it)."""
     by_root: dict[str, list[str]] = {}
     for path in abs_paths:
-        path = os.path.normpath(path)
-        parent = _existing_dir(path)
-        info = git.checkout(parent)
+        # Resolve FIRST, final component included, and judge the file a write
+        # through this path would change: an untracked link (anywhere, even in a
+        # worktree) to a tracked deploy-root file is that file, and a link in the
+        # root pointing outside it changes nothing tracked there. (CC 2.1.280
+        # refuses to write through a symlink at all; this covers a version that
+        # does not.)
+        real = os.path.realpath(path)
+        info = git.checkout(_existing_dir(real))
         if info is None or not info[1]:
             continue
         root = info[0]
-        real = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
-        if os.path.isdir(path):
-            real = os.path.realpath(path)
         rel = os.path.relpath(real, root)
         if rel == ".." or rel.startswith("../"):
             continue
@@ -409,7 +416,10 @@ def _decide_file_tool(payload: dict, tool: str, git: _Git) -> str | None:
     raw = ti.get(_FILE_TOOLS[tool]) if isinstance(ti, dict) else None
     if not isinstance(raw, str) or not raw:
         return None
-    path = raw
+    # Claude Code's file tools expand a leading `~` (MEASURED 2026-10-05: a Write
+    # to `~/tmp/...` landed in the home directory). The hook runs as the same
+    # user, so its HOME is the one the tool expanded.
+    path = os.path.expanduser(raw)
     if not os.path.isabs(path):
         cwd = payload.get("cwd")
         if not isinstance(cwd, str) or not cwd:
