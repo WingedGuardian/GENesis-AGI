@@ -2715,7 +2715,9 @@ async def browser_navigate(
     call works on it before returning (auto-resolve poll, widget clicks, an
     optional solver, VNC clicks, a reload); it does not wait for a person. If
     unresolved, it sends a Telegram alert (when configured) and returns
-    turnstile.status == "blocked". This can take most of the 300 s timeout.
+    turnstile.status == "blocked". If the challenge handling itself errors,
+    the result has no turnstile field even though a challenge may remain, so
+    check the page title. This can take most of the 300 s timeout.
     """
     # Remote CDP: 60s for the connect (at most 30s), the tab lookup and the
     # goto (at most 30s). A timeout cancels the call; its shielded cleanup
