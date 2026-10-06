@@ -108,18 +108,18 @@ def tool_response(payload: dict) -> dict:
     New shape carries it as ``tool_response``; the legacy contract used the
     ``CLAUDE_TOOL_USE_RESULT`` env var. Returns {} when unavailable.
     """
-    if isinstance(payload, dict):
-        resp = payload.get("tool_response")
+    # Authority is decided by PRESENCE of the key, as in ``session_id``: a
+    # present ``tool_response`` that is empty or unparseable answers {}, never
+    # the legacy env var, which could hold an earlier tool's result.
+    if isinstance(payload, dict) and "tool_response" in payload:
+        resp = payload["tool_response"]
         if isinstance(resp, dict):
             return resp
         # MCP tools deliver their result as a JSON STRING, not an object
-        # (measured: the session observer's json.dumps of a genesis-health
+        # (measured: the session observer's json.dumps of an MCP tool
         # result is a quoted string). Reading only dicts made every
         # MCP-triggered PostToolUse hook see {} and never fire.
-        if isinstance(resp, str):
-            parsed = _loads(resp)
-            if parsed:
-                return parsed
+        return _loads(resp) if isinstance(resp, str) else {}
     return _loads(os.environ.get(_LEGACY_RESULT_ENV, ""))
 
 

@@ -252,3 +252,15 @@ def test_tool_response_keeps_the_dict_shape_and_rejects_non_objects():
     assert hi.tool_response({"tool_response": {"ok": 1}}) == {"ok": 1}
     assert hi.tool_response({"tool_response": "plain text"}) == {}
     assert hi.tool_response({"tool_response": json.dumps([1, 2])}) == {}
+
+
+def test_a_present_tool_response_never_falls_back_to_the_legacy_env(monkeypatch):
+    """When the payload carries ``tool_response`` it is authoritative, whatever
+    its value: the legacy env var could hold an EARLIER tool's result, and a
+    hook would then act on the wrong call (claim a sentinel, keep a marker)."""
+    hi = _hook_input()
+    monkeypatch.setenv("CLAUDE_TOOL_USE_RESULT", '{"layer": "camoufox"}')
+    for present in ("{}", "plain text", json.dumps([1]), None, [1], 3):
+        assert hi.tool_response({"tool_response": present}) == {}, present
+    # Absent key: the legacy channel still answers.
+    assert hi.tool_response({}) == {"layer": "camoufox"}

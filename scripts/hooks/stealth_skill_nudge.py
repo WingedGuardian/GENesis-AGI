@@ -9,6 +9,7 @@ behaviour.
 
 Each pointer fires once per session (its own sentinel file), so a session that
 starts on Chromium and later moves to Camoufox still gets the stealth pointer.
+With no usable session id the pointers repeat on every navigate instead.
 
 Never blocks (exit 0 always). Advisory only.
 """
@@ -31,9 +32,9 @@ _SAFETY_NUDGE = (
     "Browser tools are active. Before any purchase or payment, and before "
     "typing a password, code or card number, follow the Safety gates in the "
     "browser-automation skill (`src/genesis/skills/browser-automation/SKILL.md`): "
-    "explicit approval for each transaction, never type a card number or a "
-    "credential pasted into chat, credentials only from reference_lookup, and "
-    "banking is handed to the user."
+    "explicit approval for each transaction, never type a card number, never "
+    "type a password or code pasted into chat, credentials for agent-owned "
+    "accounts only from reference_lookup, and banking is handed to the user."
 )
 
 _STEALTH_NUDGE = (
@@ -49,8 +50,16 @@ def _session_sentinel_path(sid: str, prefix: str = _SENTINEL_PREFIX) -> str:
     return os.path.join(tempfile.gettempdir(), f"{prefix}{sid}")
 
 
-def _claim(path: str) -> bool:
-    """True the first time this session reaches ``path``; records it."""
+def _claim(sid: str, prefix: str) -> bool:
+    """True the first time this session reaches the ``prefix`` sentinel; records it.
+
+    With no usable session id there is no per-session key, and a shared one
+    would let the first such session silence the pointer for every later one,
+    so the pointer repeats instead and nothing is written.
+    """
+    if not sid:
+        return True
+    path = _session_sentinel_path(sid, prefix)
     if os.path.exists(path):
         return False
     try:
@@ -63,7 +72,7 @@ def _claim(path: str) -> bool:
 
 def main() -> int:
     payload = read_payload()
-    sid = session_id(payload)
+    sid = session_id(payload, default="")
 
     try:
         result = tool_response(payload)
@@ -75,9 +84,9 @@ def main() -> int:
             return 0  # a failed navigate (error dict) carries no layer
 
         parts = []
-        if _claim(_session_sentinel_path(sid, _SAFETY_SENTINEL_PREFIX)):
+        if _claim(sid, _SAFETY_SENTINEL_PREFIX):
             parts.append(_SAFETY_NUDGE)
-        if layer == "camoufox" and _claim(_session_sentinel_path(sid)):
+        if layer == "camoufox" and _claim(sid, _SENTINEL_PREFIX):
             parts.append(_STEALTH_NUDGE)
         if not parts:
             return 0

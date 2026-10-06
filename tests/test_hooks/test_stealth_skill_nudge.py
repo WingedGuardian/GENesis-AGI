@@ -19,20 +19,24 @@ REPO = Path(__file__).resolve().parent.parent.parent
 HOOK = REPO / "scripts/hooks/stealth_skill_nudge.py"
 
 
-def _nudge(tmp: Path, layer: str | None, sid: str = "s1", as_string: bool = True) -> str:
+def _nudge(
+    tmp: Path, layer: str | None, sid: str | None = "s1", as_string: bool = True
+) -> str:
     response = {"layer": layer, "url": "https://x.example"} if layer else {"error": "boom"}
     # Production shape: an MCP tool's tool_response is a JSON STRING (measured
     # from the session observer). Feeding a dict hid that the hook never fired.
     if as_string:
         response = json.dumps(response)
+    payload = {
+        "tool_name": "mcp__genesis-health__browser_navigate",
+        "tool_input": {"url": "https://x.example"},
+        "tool_response": response,
+    }
+    if sid is not None:
+        payload["session_id"] = sid
     proc = subprocess.run(
         [sys.executable, str(HOOK)],
-        input=json.dumps({
-            "tool_name": "mcp__genesis-health__browser_navigate",
-            "tool_input": {"url": "https://x.example"},
-            "tool_response": response,
-            "session_id": sid,
-        }),
+        input=json.dumps(payload),
         capture_output=True, text=True, timeout=30,
         env={"PATH": "/usr/bin:/bin", "TMPDIR": str(tmp), "HOME": str(tmp)},
     )
@@ -70,6 +74,15 @@ def test_each_pointer_fires_once_per_session(tmp_path):
 def test_a_failed_navigate_is_silent_and_spends_nothing(tmp_path):
     assert _nudge(tmp_path, None) == ""
     assert "Safety gates" in _nudge(tmp_path, "chromium")
+
+
+def test_no_session_id_never_persists_a_shared_sentinel(tmp_path):
+    """Without a usable id every such session would share one sentinel, and the
+    first would silence the pointers for all later ones. Repeat instead."""
+    for sid in (None, "", "../bad"):
+        assert "stealth-browser" in _nudge(tmp_path, "camoufox", sid=sid)
+        assert "Safety gates" in _nudge(tmp_path, "camoufox", sid=sid)
+    assert not list(tmp_path.glob("genesis_*nudge_*"))
 
 
 def test_a_dict_shaped_response_still_works(tmp_path):
