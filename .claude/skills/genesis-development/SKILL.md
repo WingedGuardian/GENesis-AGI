@@ -255,11 +255,26 @@ evidence behind the rule, and how it fits the rules it ties together:
 Every FINALIZED plan gets exactly ONE `genesis-architect` review — premise
 check, scope drift, architecture — before it is presented for approval.
 The agent's Step 0.5/0.6 take the plan file as input; hand it the path.
-Revisions made in answer to that review do not re-trigger it. A plan too
-small to write down needs none. `/plan-ceo-review` and `/office-hours` are
+Revisions made in answer to that review do not re-trigger it; the one
+exception is a part whose design the plan deferred (below), which gets its own
+review once that design is written. A plan too small to write down needs none. `/plan-ceo-review` and `/office-hours` are
 optional extras, if installed. Its findings are claims, handled under
 CLAUDE.md's "Verify agent output": re-derive them, then fold the confirmed ones
 into the plan BEFORE presenting it.
+
+**A plan part that defers its own design is not finalized.** "Read X first, then
+design it" is a placeholder, and a review of the plan reviews the placeholder.
+Before coding that part, write its design, and give the part its own architect
+review. For anything that persists state another program reads, the design
+itself carries the writer-state × reader table: every state the writer can
+leave (complete, skipped, partial, failed midway, killed, a leftover from an
+earlier run) against every reader, with what each reader does in each cell.
+Hand that table to the architect and ask it to hunt for the missing cells.
+(genesis-architect Step 0.7 covers the lifecycle of state inside a guard or
+gate only, so it does not do this for you.)
+(Origin: PR #2853 — the plan reviewed once, its backup part was a placeholder,
+and ten of 25 external findings over five rounds were cells of the
+backup/restore state table nobody had written down.)
 
 ### Skill invocation points
 
@@ -1211,6 +1226,18 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   passed may be testing nothing; a whole suite passing every review round
   while a reviewer keeps finding real spec bugs is the tell that the tests
   encode the same wrong spec as the code.
+- **Verify-RED of a safety fence runs the test UNFENCED.** Removing a guard,
+  stub or sandbox to watch its test fail means whatever the test executes
+  reaches the real system for that run. Read the test first and make its probe
+  harmless even unguarded: `systemctl --user is-active <a unit that does not
+  exist>`, told apart from the stub by the stub's own log, never the dangerous
+  action itself. (Origin: the fence test in PR #2935, for issue #2863: its verify-RED ran a real
+  `systemctl --user stop genesis-server` and took a live server down for about
+  3.5 minutes.)
+- **Never edit a shell script while a test that runs it is in progress.** bash
+  reads a script as it executes it, so an edit mid-run yields bogus syntax
+  errors that look like real failures. Wait for the run to finish, or test a
+  copy.
 - **A RED that comes back GREEN has AT LEAST six causes, and "the test is
   vacuous" is the LAST one to reach for.** In rough order of how often they
   actually occur:
