@@ -64,6 +64,10 @@ def _profile(
     tailscaled: object = None,
     ts_watchdog: object = None,
     cc_tmp_isolated: object = True,
+    falkordb_active: object = None,
+    falkordb_socket: object = False,
+    falkordb_enabled: object = None,
+    falkordb_mode: object = None,
     container: object = "lxc",
     age_days: float = 0.0,
     collected_at: object = "auto",
@@ -103,6 +107,26 @@ def _profile(
             },
             "virt": {"status": "ok", "facts": {"container": container}},
             "storage": {"status": "ok", "facts": {"cc_tmp_isolated": cc_tmp_isolated}},
+            # Graph engine. Defaults are the unprovisioned state (no unit, no
+            # socket), which must stay SILENT — the engine is opt-in and most
+            # installs will never arm it.
+            "falkordb": {
+                "status": "ok",
+                # Volatile states live in METRICS (infra_profile/types.py):
+                # facts are hashed, and hashing a value that flips on every
+                # engine restart bills an LLM annotation each time.
+                "facts": {
+                    "unit": "genesis-falkordb.service",
+                    "unit_enabled": falkordb_enabled,
+                    # The graphstore lever as the collector read it: the
+                    # dependency signal, independent of unit enablement.
+                    "graphstore_mode": falkordb_mode,
+                },
+                "metrics": {
+                    "unit_active_state": falkordb_active,
+                    "socket_present": falkordb_socket,
+                },
+            },
         }
     }
     if collected_at is not None:
@@ -139,6 +163,8 @@ _ALL_DEFECTS = dict(
     tailscaled=True,  # tailscaled installed, its watchdog timer not
     ts_watchdog="",
     cc_tmp_isolated=False,
+    falkordb_active="active",  # armed...
+    falkordb_socket=False,     # ...but its socket never appeared
 )
 
 
@@ -147,6 +173,7 @@ def test_all_defects_detected():
         "cc_tmp_shared_fs",
         "container_swap_disabled",
         "container_swap_knob_off",
+        "falkordb_socket_missing",
         "host_swap_absent",
         "network_watchdog_absent",
         "networkd_keepconfig_missing",
@@ -503,6 +530,26 @@ async def test_unavailable_empty_section_does_not_block_resolve(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_unarmed_engine_collector_failure_does_not_block_resolve(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _profile(swap_max=0))
+        await _check_infra_protection_posture(db)
+        assert len(_open(await _alerts(db))) == 1
+
+        # The memory defect is fixed while the falkordb collector errors on an
+        # install that never armed the engine: its retained facts are non-empty
+        # (unit name, socket path) but fed no rule, so recovery must land.
+        healed = _profile(falkordb_active="inactive", falkordb_enabled="disabled")
+        healed["sections"]["falkordb"]["status"] = "error"
+        _use_profile(monkeypatch, healed)
+        await _check_infra_protection_posture(db)
+        assert _open(await _alerts(db)) == []
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_alert_notes_unverifiable_planes(monkeypatch):
     db = await _setup()
     try:
@@ -517,6 +564,190 @@ async def test_alert_notes_unverifiable_planes(monkeypatch):
         assert "host_system" in open_rows[0]["content"]
     finally:
         await db.close()
+
+
+def test_falkordb_unarmed_is_silent():
+    """Unselected and unarmed: absent/disabled/stopped must never alert.
+
+    Until the graphstore lever selects it, reads use NetworkX and nothing
+    depends on the engine, so a rule that fired on "not running" would cry
+    wolf on every box — the fastest way to get a posture check ignored.
+    """
+    for state in (None, "inactive", "failed", "activating"):
+        found = _infra_missing_protections(_profile(falkordb_active=state))
+        assert not [slug for slug in found if slug.startswith("falkordb")], state
+
+
+def test_falkordb_active_with_socket_is_silent():
+    found = _infra_missing_protections(
+        _profile(falkordb_active="active", falkordb_socket=True)
+    )
+    assert "falkordb_socket_missing" not in found
+
+
+def test_falkordb_active_without_socket_alerts():
+    """systemd says healthy, every reader would fail to connect — the one
+    combination worth waking someone for."""
+    found = _infra_missing_protections(
+        _profile(falkordb_active="active", falkordb_socket=False)
+    )
+    assert "falkordb_socket_missing" in found
+
+
+def test_falkordb_stale_section_does_not_assert_posture():
+    """A not-ok section retains previous readings; rules must not read them."""
+    prof = _profile(falkordb_active="active", falkordb_socket=False)
+    prof["sections"]["falkordb"]["status"] = "error"
+    assert "falkordb_socket_missing" not in _infra_missing_protections(prof)
+
+
+def test_falkordb_stale_section_holds_the_all_clear():
+    """Going quiet is not the same as being fine.
+
+    The rule's only inputs come from this section, so a collector failure makes
+    it fall silent. Without falkordb in _POSTURE_PLANES that silence would read
+    as recovery and RESOLVE an open alert while the engine is still broken and
+    unobservable — the exact false all-clear the mechanism exists to prevent.
+    """
+    prof = _profile(falkordb_active="active", falkordb_socket=False)
+    prof["sections"]["falkordb"]["status"] = "error"
+    assert "falkordb" in _loop._infra_unverifiable_planes(prof)
+
+
+def test_falkordb_armed_and_failed_alerts():
+    """Type=notify never reports `active` for an engine that cannot load its
+    module or never signals readiness: the unit cycles through the start
+    limiter into `failed`. Armed (enabled), that is the failure to surface."""
+    for enabled in ("enabled", "enabled-runtime"):
+        found = _infra_missing_protections(
+            _profile(falkordb_active="failed", falkordb_enabled=enabled)
+        )
+        assert "falkordb_unit_failed" in found, enabled
+
+
+def test_falkordb_failed_but_never_armed_is_silent():
+    for enabled in (None, "disabled", "static", "masked"):
+        found = _infra_missing_protections(
+            _profile(falkordb_active="failed", falkordb_enabled=enabled)
+        )
+        assert "falkordb_unit_failed" not in found, enabled
+
+
+def test_an_unarmed_engine_never_holds_the_all_clear():
+    """The collector always records the unit name and socket path, so retained
+    facts are non-empty on every install. An engine that was never armed fed
+    no rule, and its collector failing must not stall unrelated recovery."""
+    prof = _profile(falkordb_active="inactive", falkordb_enabled="disabled")
+    prof["sections"]["falkordb"]["status"] = "error"
+    assert "falkordb" not in _loop._infra_unverifiable_planes(prof)
+
+
+def test_an_armed_engine_still_holds_the_all_clear():
+    prof = _profile(falkordb_active="failed", falkordb_enabled="enabled")
+    prof["sections"]["falkordb"]["status"] = "error"
+    assert "falkordb" in _loop._infra_unverifiable_planes(prof)
+
+
+# ── armed by the graphstore lever, not only by enablement ──────────────────
+#
+# The repo's own guidance is START-only (`systemctl --user start
+# genesis-falkordb`, in config/graphstore.yaml and the settings tool), so an
+# engine reads depend on can be disabled at the unit level. Selecting
+# `mode: falkordb` is what makes reads depend on it; that is the arming signal.
+
+
+def test_a_selected_engine_that_failed_alerts_without_being_enabled():
+    """Started, never enabled, then failed: reads are falling back, so alert."""
+    for enabled in (None, "disabled", "static"):
+        found = _infra_missing_protections(
+            _profile(
+                falkordb_active="failed",
+                falkordb_enabled=enabled,
+                falkordb_mode="falkordb",
+            )
+        )
+        assert "falkordb_unit_failed" in found, enabled
+
+
+def test_a_selected_engine_that_is_stopped_alerts():
+    """A start-only unit after a reboot is `inactive`, never `failed`, and every
+    recall still degrades to NetworkX with a warning. Enablement cannot see it."""
+    found = _infra_missing_protections(
+        _profile(
+            falkordb_active="inactive",
+            falkordb_enabled="disabled",
+            falkordb_mode="falkordb",
+        )
+    )
+    assert "falkordb_selected_not_running" in found
+
+
+def test_a_selected_engine_with_no_unit_and_no_socket_alerts():
+    """No unit state to read (no unit rendered, or no systemd), and no socket:
+    nothing is serving the backend the lever selected."""
+    found = _infra_missing_protections(
+        _profile(falkordb_active=None, falkordb_socket=False, falkordb_mode="falkordb")
+    )
+    assert "falkordb_selected_not_running" in found
+
+
+def test_a_selected_engine_serving_without_systemd_is_silent():
+    """No unit state, but the socket is there: something is serving it."""
+    found = _infra_missing_protections(
+        _profile(falkordb_active=None, falkordb_socket=True, falkordb_mode="falkordb")
+    )
+    assert not [slug for slug in found if slug.startswith("falkordb")]
+
+
+def test_a_selected_engine_mid_transition_is_silent():
+    """activating/deactivating/reloading are transient; the profile refresh
+    must not open an alert off a restart it happened to sample."""
+    for state in ("activating", "deactivating", "reloading"):
+        found = _infra_missing_protections(
+            _profile(falkordb_active=state, falkordb_mode="falkordb")
+        )
+        assert not [slug for slug in found if slug.startswith("falkordb")], state
+
+
+def test_a_stopped_engine_nothing_selects_is_silent():
+    """mode networkx, unit disabled: the deliberate stood-down state."""
+    for state in ("inactive", "failed", None):
+        found = _infra_missing_protections(
+            _profile(
+                falkordb_active=state,
+                falkordb_enabled="disabled",
+                falkordb_mode="networkx",
+            )
+        )
+        assert not [slug for slug in found if slug.startswith("falkordb")], state
+
+
+def test_a_selected_engine_holds_the_all_clear():
+    """Retained facts that SELECT the engine could have fed a rule, so an
+    erroring collector must hold the all-clear even with the unit disabled."""
+    prof = _profile(
+        falkordb_active="inactive",
+        falkordb_enabled="disabled",
+        falkordb_mode="falkordb",
+    )
+    prof["sections"]["falkordb"]["status"] = "error"
+    assert "falkordb" in _loop._infra_unverifiable_planes(prof)
+
+
+def test_engine_stand_down_texts_say_to_deselect_it_first():
+    """With `mode: falkordb`, traversal reads depend on the engine and the health
+    probe goes DOWN without it, so "nothing depends on it" is false advice. Each
+    text that offers a stand-down must tell the operator to move the lever
+    back to networkx first."""
+    for slug, text in _loop._INFRA_POSTURE_DETAIL.items():
+        if not slug.startswith("falkordb"):
+            continue
+        assert "nothing depends on the engine" not in text, slug
+        assert "mode: networkx" in text, slug
+        # The rule reads a profile refreshed at boot and daily, so an operator
+        # who follows the advice is still alerted until the next refresh
+        # unless the text says how to take one now.
+        assert "infrastructure_profile(refresh=true)" in text, slug
 
 
 # ── coverage guardrails (provision-or-surface convention) ──────────────────
@@ -534,15 +765,40 @@ def test_every_rule_slug_has_detail_text():
     prof_blocked = _profile(**_ALL_DEFECTS)
     prof_blocked["sections"]["storage"]["facts"]["cc_tmp_apply_blocked_on_cc"] = True
     producible |= set(_infra_missing_protections(prof_blocked))
+    # The graph engine's branches are exclusive; cover the two _ALL_DEFECTS
+    # (active-without-socket) cannot reach.
+    producible |= set(
+        _infra_missing_protections(
+            _profile(falkordb_active="failed", falkordb_enabled="enabled")
+        )
+    )
+    producible |= set(
+        _infra_missing_protections(
+            _profile(falkordb_active="inactive", falkordb_mode="falkordb")
+        )
+    )
     assert producible == set(_loop._INFRA_POSTURE_DETAIL)
 
 
 def test_resilience_facts_are_covered():
-    # Provision-or-surface: every memory- AND network-resilience effective-fact
-    # must be read by the posture rules, so a protection can't silently lose its
+    # Provision-or-surface: every effective-fact a protection depends on must be
+    # read by the posture rules, so a protection can't silently lose its
     # surfacing signal in a refactor. (Adding a NEW protection fact requires
     # extending both the rules and this list — that is the point.)
-    src = inspect.getsource(_infra_missing_protections)
+    # The list has outgrown its original memory+network scope: storage and the
+    # graph engine are in here too, and the guarantee is the same for all of
+    # them — a rename on either side must fail HERE rather than silently
+    # disarming the rule.
+    # The graph-engine "armed" predicate lives in two helpers the rule calls
+    # (shared with the all-clear hold), so their source is part of the rule.
+    src = "".join(
+        inspect.getsource(fn)
+        for fn in (
+            _infra_missing_protections,
+            _loop._falkordb_armed,
+            _loop._falkordb_selected,
+        )
+    )
     for fact in (
         "cgroup_memory_swap_max",
         "oomd_user_slice_kill",
@@ -555,6 +811,12 @@ def test_resilience_facts_are_covered():
         "network_watchdog_enabled",
         "cc_tmp_isolated",
         "cc_tmp_apply_blocked_on_cc",
+        # Graph engine. These are the ONLY two keys tying the collector's output
+        # to the rule; a rename on either side disarms the alert silently.
+        "unit_active_state",
+        "socket_present",
+        "unit_enabled",
+        "graphstore_mode",
     ):
         assert fact in src, f"posture rules no longer read {fact!r}"
 

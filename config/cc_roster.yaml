@@ -2,7 +2,7 @@
 # behind Claude Code), and the fallback used when the Anthropic subscription hits
 # its usage cap.
 #
-# THIS FILE SHIPS INFRASTRUCTURE, NOT PEERS — and the reason is VERSION CHURN,
+# THE AUTOMATED ROSTER SHIPS INFRASTRUCTURE, NOT PEERS — the reason is VERSION CHURN,
 # not "peers are user data". Be clear about which argument is load-bearing,
 # because the weaker one does not survive contact with this repo:
 # `config/model_routing.yaml` ships ~28 named vendor providers, every one of
@@ -63,6 +63,86 @@ models:
   claude:
     native_subscription: true
     failover_order: 0
+
+# Foreground-only catalog: `gmodel <name> --route auto|subscription|api|openrouter`.
+# These entries NEVER enter the automated roster/failover chain above. Published
+# configuration, not a claim of live validation. Sources:
+# https://www.kimi.com/code/docs/en/third-party-tools/claude-code.html
+# https://platform.kimi.ai/docs/guide/claude-code-kimi
+# https://mimo.mi.com/docs/en-US/tokenplan/integration/claudecode
+# https://openrouter.ai/docs/cookbook/coding-agents/claude-code-integration
+#
+# Save preferences/overrides under `gmodel:` in cc_roster.local.yaml. Auto chooses
+# subscription -> api -> openrouter by configured endpoint + credential presence;
+# it does NOT probe entitlement, quota or compatibility. Errors never switch billing
+# routes. Auto chooses again on resume. Use --fork-session when switching providers.
+# Kimi subscriptions require personal interactive use. MiMo Token Plans are for
+# coding-tool usage; a website chat subscription alone does not supply these keys.
+#
+# Kimi K3 1M subscription requires an eligible tier. To use a 256K tier, override
+# subscription.model_id to k3-256k AND context_tokens to 262144. No automatic downgrade.
+# MiMo subscription URL is deliberately unset: copy YOUR region's Anthropic URL from
+# the Token Plan console (e.g. https://token-plan-sgp.xiaomimimo.com/anthropic).
+# Key VALUES belong in the environment/secrets.env, never in this YAML.
+#
+# Every route authenticates with ANTHROPIC_AUTH_TOKEN (bearer); there is no
+# API-key mode. Kimi's own guide shows ANTHROPIC_API_KEY, but its coding endpoint
+# reads a bearer header as the key too (probed 2026-10-04 with an invalid key:
+# the same "API Key appears to be invalid" error for either header, a different
+# one for none), and the commented automated Kimi peer below was validated on
+# bearer. An API key in interactive Claude Code is a credential the user may
+# decline, which falls back to the saved Anthropic login. The host is the one
+# Kimi's guide names today (api.kimi.ai); the older peer example's api.kimi.com
+# also still answers. The Kimi subscription key is the same Kimi Code key as that
+# peer (KIMI_CODING_API_KEY). The `[1m]` suffix is the form all three
+# vendors document for Claude Code; OpenRouter strips it before routing.
+# The launcher pins the chosen route through an owner-only --settings file as
+# well as the environment, so a settings file edited mid-session cannot re-route.
+gmodel:
+  models:
+    kimi-k3:
+      route: auto
+      routes:
+        subscription:
+          anthropic_base_url: https://api.kimi.ai/coding/
+          auth_env: KIMI_CODING_API_KEY
+          model_id: "k3[1m]"
+          context_tokens: 1048576
+          effort: high
+          interactive_only: true
+        api:
+          anthropic_base_url: https://api.moonshot.ai/anthropic
+          auth_env: MOONSHOT_API_KEY
+          model_id: "kimi-k3[1m]"
+          context_tokens: 1048576
+          effort: high
+        openrouter:
+          anthropic_base_url: https://openrouter.ai/api
+          auth_env: API_KEY_OPENROUTER
+          model_id: "moonshotai/kimi-k3[1m]"
+          context_tokens: 1048576
+          effort: high
+    mimo-v2.6-pro:
+      route: auto
+      routes:
+        subscription:
+          anthropic_base_url: null
+          auth_env: MIMO_TOKEN_PLAN_API_KEY
+          model_id: "mimo-v2.6-pro[1m]"
+          context_tokens: 1048576
+          effort: high
+        api:
+          anthropic_base_url: https://api.xiaomimimo.com/anthropic
+          auth_env: MIMO_API_KEY
+          model_id: "mimo-v2.6-pro[1m]"
+          context_tokens: 1048576
+          effort: high
+        openrouter:
+          anthropic_base_url: https://openrouter.ai/api
+          auth_env: API_KEY_OPENROUTER
+          model_id: "xiaomi/mimo-v2.6-pro[1m]"
+          context_tokens: 1048576
+          effort: high
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EXAMPLE PEERS — copy one into ~/.genesis/config/cc_roster.local.yaml and fill

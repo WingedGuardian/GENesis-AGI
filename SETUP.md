@@ -66,9 +66,93 @@ Install via Claude Code's plugin manager.
   docker run -d --name qdrant -p 6333:6333 qdrant/qdrant
   ```
 - **Ollama**: Local embeddings. Set `OLLAMA_URL` in secrets.env.
+- **FalkorDB graph engine**: see below. `bootstrap.sh` fetches the engine
+  module; the `redis-server` that runs it is a manual step.
 
 Genesis degrades gracefully without these — it falls back to FTS5 text search
 and cloud embeddings.
+
+### Graph engine (FalkorDB)
+
+Optional. FalkorDB is a Redis module. `bootstrap.sh` fetches the module (one
+file under `~/.genesis/deps`, verified against a pinned digest) and writes the
+`genesis-falkordb` user unit, **left disabled**. It does **not** install the
+`redis-server` that loads the module: the module refuses anything below 8.0.0,
+Ubuntu/Debian stable ship 7.x, so it comes from Redis's upstream apt repository,
+and adding a third-party repository to your machine is your call. (Automated
+provisioning is tracked in issue #2827.) `GENESIS_FALKORDB_PROVISION_DISABLED=1`
+skips the module fetch too.
+
+The memory graph uses the engine only when `config/graphstore.yaml` selects
+`mode: falkordb`; the default is `networkx`, so an install that skips all of
+this loses nothing.
+
+**If this machine already runs `redis-server`**, adding the upstream repository
+upgrades it to 8.x on your next `apt upgrade`. Check first:
+
+```bash
+dpkg-query -W -f='${Status} ${Version}\n' redis-server
+command -v redis-server valkey-server
+```
+
+To set it up (Ubuntu, Debian, and derivatives that declare `UBUNTU_CODENAME`):
+
+1. Fetch Redis's signing key and **verify its fingerprint before trusting it**.
+   Redis's apt documentation publishes none; the expected value below is the
+   key `packages.redis.io/gpg` served on 2026-10-03, cross-checked against
+   independent third-party pins of the same repository.
+
+   ```bash
+   sudo apt-get install -y curl gpg
+   curl -fsSL https://packages.redis.io/gpg -o redis.gpg
+   gpg --show-keys --with-colons redis.gpg | grep -c '^pub:'
+   # must print: 1
+   gpg --show-keys --with-colons redis.gpg | awk -F: '$1 == "fpr" {print $10; exit}'
+   # must print: 54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C
+   ```
+
+   Anything else — more than one key, or a different fingerprint — stop here.
+
+2. Install the key and the source, then confirm apt now offers 8.0.0 or newer:
+
+   ```bash
+   sudo install -d -m 0755 /etc/apt/keyrings
+   sudo gpg --yes --dearmor -o /etc/apt/keyrings/redis-archive-keyring.gpg redis.gpg
+   sudo chmod 644 /etc/apt/keyrings/redis-archive-keyring.gpg
+   rm redis.gpg
+   suite="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")"
+   echo "deb [signed-by=/etc/apt/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $suite main" | sudo tee /etc/apt/sources.list.d/redis.list
+   sudo apt-get update
+   apt-cache policy redis-server   # Candidate: must be 8.0.0 or newer
+   sudo apt-get install -y redis-server
+   ```
+
+3. The package enables a **system** redis on TCP port 6379. Genesis does not use
+   it — its unit is a per-user instance with no TCP port, reached over a unix
+   socket in `~/.genesis/falkordb`. Unless you use that system redis yourself:
+
+   ```bash
+   sudo systemctl disable --now redis-server
+   ```
+
+4. Re-run `./scripts/bootstrap.sh`: it fetches the module if it is not already
+   there, and re-renders the unit with the `redis-server` path it now finds.
+   Then arm it:
+
+   ```bash
+   systemctl --user enable --now genesis-falkordb
+   systemctl --user status genesis-falkordb
+   ```
+
+Redis 8 is tri-licensed (RSALv2 / SSPLv1 / AGPLv3) rather than the plain BSD of
+the 7.x in your distro. Running it unmodified places no obligation on your own
+code, but you are the one installing it.
+
+Uninstall disables the unit and removes the module with `~/.genesis`. It never
+touches the `redis-server` package, the apt source, or the key you added; to
+remove those, `sudo apt-get purge redis-server` and delete
+`/etc/apt/sources.list.d/redis.list` and
+`/etc/apt/keyrings/redis-archive-keyring.gpg`.
 
 ## Post-Install Configuration
 
@@ -136,6 +220,68 @@ will delete each other's snapshots:
 GENESIS_BACKUP_NAS_HOST=this-machine-label
 ```
 (`restore.sh` reads the same variable to find the source snapshot dir.)
+
+**Extra directories (optional).** To keep install-local data no other backup
+section knows about, list directories under your home directory, separated by
+`:`:
+```
+GENESIS_BACKUP_EXTRA_DIRS=~/.genesis/analytics:~/.genesis/tools/my-tool
+GENESIS_BACKUP_EXTRA_EXCLUDES=derived:scratch
+```
+Each directory becomes one encrypted archive, `extra/<name>.tar.gpg`. It goes to
+the off-site tier only, never the git tier. Every run builds these archives from
+scratch: a snapshot holds only what that run archived, and nothing is carried
+over from an earlier run. Rebuildable caches (`.venv`, `node_modules`,
+`__pycache__`, …) are always excluded, and `GENESIS_BACKUP_EXTRA_EXCLUDES` adds
+more tar exclude patterns (wildcards allowed), matched at any depth.
+
+A listed directory is skipped with a warning when it:
+- is relative, or outside your home directory;
+- is, or runs through, a symlink (list the real directory instead);
+- is inside or contains another entry, the backups repo, the backup temp dir, or
+  a local off-site root;
+- overlaps a path the core backup already restores (for example `~/.genesis`
+  itself, or anything inside the repo);
+- is missing, or tar cannot read it;
+- would be emptied by an exclude pattern;
+- could not be extracted by a restore on this machine: restore needs a Python whose
+  `tarfile` has the 2025 extraction-filter fixes (CPython 3.12.11 or later, or a
+  distribution backport). The machine you restore onto needs one too.
+
+A skipped directory is simply absent from that snapshot; older snapshots keep it
+until retention drops them. None of this fails the backup, but each skip, and
+each archive that fails to upload, marks the off-site copy `partial`
+(`offsite_confirmed: false`, `extras_complete: false`) and sends the off-site
+alert, again whenever the set of missing directories changes. The core snapshot is still marked complete
+(`offsite_core_complete: true`), retention still runs, and a later failure of the
+core off-site copy still alerts on its own. `scripts/update.sh` reports such an
+extras-only gap as `backup:tier2_extras`, distinct from a real off-site failure
+(`backup:tier2`). The snapshot's `COMPLETE` marker
+lists the extra archives it holds and the listed directories it skipped, so a
+restore can tell "none" apart from "could not list them" and can name what a
+snapshot is missing; `.extra-manifest` in the backups checkout does the same for a
+restore that runs without an off-site pull. Either way, restore only restores
+archives that list names: a leftover archive in `extra/` is never restored. Backup
+test-extracts each archive the way restore will (file contents left out), so it
+knows which members a restore would refuse, such as a symlink that leads outside
+the directory or a FIFO. Such a directory is still archived, but recorded as
+partial: the off-site copy is reported incomplete and the alert names it. Exclude
+those members with `GENESIS_BACKUP_EXTRA_EXCLUDES`. A file that changes while it is being archived (tar exit 1)
+is kept but may be torn, and the log says so; stop a writer whose files must be
+consistent, or exclude them. Without an off-site tier the archives stay local
+only, in the backups checkout, and no off-site alert applies.
+
+`restore.sh` puts each directory back as a whole: it unpacks the archive next to
+the destination and renames it into place, so directory permissions and empty
+directories come back too. An existing non-empty directory is replaced only with
+`--force`, and the old one is kept beside it as `<dir>.pre-restore-<timestamp>`,
+never deleted; without `--force` that directory is skipped and recorded as a
+failure. Members that use `..`, a special file, or a link pointing outside the
+restored directory are refused one by one and the rest restores. A whole archive
+is refused when its destination is a symlink, when its path runs through a
+symlink that leads outside your home directory, or when it overlaps a core
+restore path. Every refusal is recorded. After an off-site pull, restore takes
+exactly the archives that snapshot's `COMPLETE` marker lists.
 
 Bootstrap installs the timer's unit files but does **not** enable them —
 scheduling a backup that silently leaves your database local-only would give a

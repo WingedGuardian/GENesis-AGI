@@ -504,7 +504,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-10-03: 69 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-05: 70 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -1112,7 +1112,15 @@ jobs:
         # Floor: 24153 +92 =24245; skip ceiling remains 102.
         # NVIDIA provider health: new test_provider_health_probes.py collects
         # 87 tests (0 -> 87); no added skips. Floor: 24245 + 87 = 24332.
+        # FalkorDB provisioning (#1834): --collect-only on main's versions vs
+        # this branch's, after the last test-adding edit (new file = full count):
+        #   test_infra_protection_posture.py       50 -> 68   (+18)
+        #   test_collectors_container.py           51 -> 62   (+11)
+        #   test_systemd_template_placeholders.py  11 -> 13   (+2)
+        #   test_collectors_falkordb.py           new -> 23   (+23)
+        #   test_falkordb_module.py               new -> 35   (+35)
+        # No added skips. Floor: 24332 + 89 = 24421; skip ceiling remains 102.
         # Staged excused-path guard: test_update_checkout_moved.py 79 -> 87
         # (+8); test_update_activation.py 28 -> 28 (+0).
-        # Floor: 24332 + 8 = 24340; skip ceiling remains 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24340
+        # Floor: 24421 + 8 = 24429; skip ceiling remains 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24429

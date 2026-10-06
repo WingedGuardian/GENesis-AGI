@@ -230,18 +230,41 @@ async def _impl_contributor_issue_propose(
     # 2) Backpressure + DB-side dedup (GitHub open-issue dedup is done at post
     #    time in the drain — the curator profile has no gh).
     cfg = load_config()
-    active = await pip.list_dedup_active(db, repo)
-    held_count = sum(1 for r in active if r["status"] == "held")
+    active = await pip.list_dedup_active(db, repo, now=datetime.now(UTC).isoformat())
+    # Backpressure counts THIS lane's holds only: work-board promotions wait on
+    # the owner indefinitely and must not throttle the contributor curator.
+    held_count = sum(1 for r in active if r["status"] == "held" and r["source"] != "board")
     if held_count >= knob_int(cfg, "max_held"):
         return {
             "status": "backpressure",
             "reason": f"{held_count} issue(s) already awaiting review (max_held reached)",
         }
     title_norm = normalize_title(title)
-    for r in active:
-        if normalize_title(r["title"]) == title_norm or (
-            source_ref is not None and r["source_ref"] == source_ref
+    # A follow-up already promoted onto the work board (or with a promotion
+    # pending) must not get a second public issue through this lane. Board rows
+    # key their source as "follow_up:<id>"; the pointer table is checked too.
+    board_ref = f"follow_up:{source_ref}" if source_ref is not None else None
+    if source_ref is not None:
+        from genesis.db.crud import board as board_crud
+
+        if await board_crud.tables_available(db) and await board_crud.get_link_by_source(
+            db, source_kind="follow_up", source_id=source_ref
         ):
+            return {
+                "status": "duplicate",
+                "reason": "this follow-up was already promoted onto the work board",
+            }
+    # The same record, in either lane, at any age: its own lookup, because the
+    # title list below is bounded to the retention window and this is not.
+    same_record = await pip.find_active_by_source_ref(db, repo, [source_ref, board_ref])
+    if same_record is not None:
+        return {
+            "status": "duplicate",
+            "reason": "an active proposal already covers this item",
+            "existing_id": same_record["id"],
+        }
+    for r in active:
+        if normalize_title(r["title"]) == title_norm:
             return {
                 "status": "duplicate",
                 "reason": "an active proposal already covers this item",
