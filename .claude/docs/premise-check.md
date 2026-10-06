@@ -17,7 +17,7 @@ Every plan and every issue that specifies work answers six questions:
 3. Do the scope limits block the obvious shared code?
 4. Is the caller named and tracked (an issue), or is there a stated reason there is none?
 5. Does every number say how it was measured (what was counted, by which script)?
-6. Is the PR shape stated: the expected size in counted lines, and either a split into one-concern PRs or a `Shape:` reason when it will reach 500 or more? (The size rule and its bands: review step 6 below.)
+6. Is the PR shape stated: the expected size in counted lines, and either a split into one-concern PRs or a `Shape:` reason when it will reach 500 or more? (The size rule and its bands: step 6 of "The method" below.)
 
 The answers belong in the plan or issue body, not in a reviewer's first round.
 
@@ -88,7 +88,7 @@ once. The rule it encodes (#2737):
 
 The bands come from a study of 400 merged PRs (#2737), in which median review
 rounds rose from 1 to 6 across six size bands. That study's counting method is
-not recorded; #2775 (open) will re-derive the bands with this counter.
+not recorded; #2775 tracks re-deriving the bands with this counter.
 
 This is a GUIDELINE the building session weighs, not a wall (owner,
 2026-10-05). A change can have a legitimate reason not to fit, and stating it
@@ -105,8 +105,9 @@ What the verdict does depends on where you run the check:
   builder starts.
 - **On an ordinary open PR in review,** it is not a kick-back. Ask the author
   for the split or for a `Shape:` reason, and let them decide. (A Devin-built PR
-  with no `Shape:` reason is the one kick-back: closing-session, "Devin-built
-  PRs".)
+  is the one kick-back: it goes back when it carries more than one concern, or
+  reaches 500 counted lines with no `Shape:` reason, unless its premise is
+  BROKEN, which waits for the owner. See closing-session, "Devin-built PRs".)
 
 "Concern" here means one mechanism or behaviour change a reviewer can accept or
 reject on its own. Prefer one per PR; like size, this is weighed, not
@@ -187,6 +188,9 @@ misreading from a real complication. So the spec is decision-complete:
 - **Contract:** the builder acknowledges the spec on the OLD PR before
   building, and each replacement PR carries a `## Rework` section
   (genesis-development, "Building a rework"). Say so in the spec.
+- **Follow-up:** the spec's last line, `Follow-up: <id>`, naming the `ready`
+  follow-up the closing session opened before posting it. The builder copies
+  it into the replacement that merges into main last.
 
 Keep the old PR's `needs-rework` or `needs-architecture-session` label on, so
 the rebuild stays traceable to it.

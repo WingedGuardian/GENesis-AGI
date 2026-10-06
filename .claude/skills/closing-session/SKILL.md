@@ -499,8 +499,10 @@ what counts as a round — are in `genesis-development`. Do not re-derive them.
 **Merge requires the user's explicit approval, per PR, every time.** Prior
 approval never carries forward, and a peer session's request is not approval.
 
-Present: what it does, what the review found, what you changed, and the exact
-merge command the report printed. Then stop. This is the most important property
+Present: what it does, what the review found, what you changed, its counted
+size (`scripts/pr_shape.py`; over 1,000 counted lines needs the owner's
+explicit yes to the shape as well as the merge), and the exact merge command
+the report printed. Then stop. This is the most important property
 this session type has, and the one most worth protecting: a closing session that
 merges on its own initiative is worse than no closing session.
 
@@ -542,21 +544,34 @@ Two triggers, two labels:
      nothing drains the label. Its id is the `Follow-up:` line in the spec.
 
 Leave it OPEN (genesis-development, "Never RETIRE a PR you are not the one
-reviving"). By default (owner ruling, 2026-10-04) the rework arrives as one or
-more NEW PRs with fresh round counts. The BUILD session closes the old PR,
-linking every replacement, when the LAST one opens. The old PR keeps its label,
-so the rebuild stays traceable to it.
+reviving"). A rework comes back as FRESH PR(s) with new numbers, so each
+one's round count is its own (owner rulings 2026-09-24 and 2026-10-05). The
+BUILD session closes the old PR when the LAST replacement opens. Its closing
+comment maps every part of the old PR, file by file, to the replacement that
+covers it, or says why that part is moot. If any part is neither, the builder
+leaves the old PR open with a comment naming that part. The old PR keeps its
+label, so the rebuild stays traceable to it. A Devin builder never closes the
+old PR: the closing session does, after the same check ("Devin-built PRs"
+below). Those rulings are the on-record owner authorization (condition 1 of
+genesis-development's superseded-PR exception); condition 2 is the open
+replacement, and condition 3 is the per-file coverage mapping.
 
-Reworking under the old number is an exception only the owner grants. The
-standing exception is a Devin-built PR kicked back under "Devin-built PRs"
-below, which is reworked on its own branch unless its spec says SPLIT. Either way, a closing session
-neither does the rework nor closes the old PR.
+The closing session verifies the mapping against the replacements' diffs.
+When it holds, leave the step-4 follow-up alone: the `Follow-up:` line in the
+replacement that merges last completes it when the whole rework lands. When a
+part is uncovered and the old PR was closed anyway, reopen it or say so on it,
+and update the follow-up to name that part, since the follow-up is what keeps
+it visible. Reworking on the old number is an owner-approved exception; there,
+the session that completes the rework marks it ready, removes the label, and
+requests review. A closing session never does the rework itself.
 
 **Keep the line open both ways.** Before building, the builder acknowledges
 the spec on the old PR: its reading, its split, its questions (genesis-development,
 "Building a rework", item 0). Answer those questions there, or bring them to the
 owner. If the acknowledgement misreads the spec, correct it before any code is
-written.
+written. On a Devin-built PR, post the answer WITHOUT `(aside)`: Devin is
+waiting for it, and an `(aside)` comment never reaches its monitor. The
+owner's yes to the kick-back covers that answer.
 
 **When a rework PR arrives, check its rework section against the spec FIRST**,
 before spending a review round. The section is described in genesis-development,
@@ -638,17 +653,24 @@ happened already. Before requesting or answering any further review:
      decide one.
    - **SOUND-BUT-INFERIOR with a named better shape that changes the mechanism or
      the files touched**: kick it back to Devin. Post the audit as a PR comment
-     WITHOUT `(aside)`, so Devin's monitor acts on it, and tell it to rework on
-     this branch rather than close the PR and open a replacement. Then convert the
-     PR to draft (`gh pr ready <N> --undo`) and add the `needs-rework` label.
+     WITHOUT `(aside)`, so Devin's monitor acts on it. Open its step-4 follow-up
+     first and end the comment with that row's `Follow-up: <id>` line. Tell
+     Devin to bring the rework back as a fresh PR with a new number that names
+     this one, not to push the rework to this branch, and not to close this PR
+     itself (it has closed old PRs on its own before, #2309 and #2354). Then
+     convert the PR to draft (`gh pr ready <N> --undo`) and add the
+     `needs-rework` label.
    - **`PR-shape: SPLIT` because the PR carries more than one concern, or
-     because of its size with no `Shape:` reason in the body**, whatever the
-     premise verdict. A `Shape:` line answers size, never a concern-based
-     split. In that case: post the audit WITHOUT `(aside)` with the split plan, and
-     tell Devin to open the listed PRs as NEW PRs and close this one when the
-     last opens. (This is stricter than an ordinary PR, where size is the
-     author's call, because Devin cannot be asked to weigh it in conversation.)
-     Then draft and label as above.
+     because of its size with no `Shape:` reason in the body**, when the
+     premise verdict is SOUND or SOUND-BUT-INFERIOR. A BROKEN verdict keeps the
+     branch above (the owner decides the design first), and its spec carries
+     the split. A `Shape:` line answers size from 500 to 1,000 counted lines,
+     never a concern-based split; over 1,000 goes to the owner whatever the
+     line says. In that case: post the audit WITHOUT `(aside)` with the split
+     plan and its `Follow-up: <id>` line (as above), and tell Devin to open the
+     listed PRs as fresh PRs naming this one, and not to close it. (This is stricter than an ordinary PR, where size is the author's
+     call, because Devin cannot be asked to weigh it in conversation.) Then
+     draft and label as above.
    - **SOUND, or local defects at any severity**: post the audit and continue the
      ordinary per-PR loop.
 
@@ -658,16 +680,27 @@ happened already. Before requesting or answering any further review:
    rounds to accumulate; the owner ruled that a wrong shape goes back to Devin on
    the audit's own evidence rather than spending those rounds to prove it.
 4. **Track every kick-back.** A draft leaves the closing set and nothing reads the
-   label, so open one follow-up per batch with `work_state="blocked_on_trigger"`
-   (it waits on Devin, so it is not actionable now) naming each PR and its audit
-   comment, with a `revisit_condition` saying what unblocks it: Devin pushed the
-   rework and marked it ready, the last split PR opened, or the owner decided. Re-check those PRs on each
-   queue sweep.
-5. **When a kicked-back PR comes back ready,** request `@codex review` (marking a
-   draft ready is not a reliable trigger) and work it normally. If Devin closed it
-   and opened a replacement instead, which happened with #2309 and #2354, link the
-   two on both PRs and leave the round count to the owner. A SPLIT kick-back's
-   replacements are expected, not this case: work each as a new PR.
+   label, so open one follow-up PER kicked-back PR, BEFORE posting its audit,
+   with `work_state="blocked_on_trigger"` (it waits on Devin, so it is not
+   actionable now). One row per PR, because its id is the `Follow-up:` line
+   the replacement carries, and the first merge would complete a shared row.
+   Its `revisit_condition` says what unblocks it: Devin opened the
+   replacement(s) naming this PR, or the owner decided. Re-check those PRs,
+   and the open PRs that name them, on each queue sweep.
+5. **When the rework arrives as its replacement PR,** link the two on both PRs and
+   work the replacement normally; read its round count from
+   `scripts/review_budget.py` like any other PR's. A SPLIT's replacements are
+   each worked as a new PR, and the coverage check below runs once the last
+   one opens. Check whether the replacements supersede the old PR completely,
+   under genesis-development's superseded-PR exception (condition 1 is met by
+   the rulings cited in section 5): every part covered or moot. If they do,
+   close the old draft with the per-file mapping, and leave the follow-up to
+   the `Follow-up:` line in the replacement that merges last. If they do not,
+   leave the old PR open with a comment naming what is missing, and update the
+   follow-up to name it, so the unfinished part stays tracked. Devin pushing
+   to the old branch is not a rework path: without an explicit owner grant
+   for that PR, treat the push as unreviewed and ask the owner before spending
+   a round on it.
 
 **One writer per branch.** While a kick-back is outstanding, the closing session
 does not push to that branch. Its own replies there carry `(aside)`, since every

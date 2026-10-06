@@ -52,7 +52,7 @@ the lock file and blocks the systemd unit.
 ```bash
 scripts/deploy_code_only.sh                      # Deploy code: locked pull + restart (launch detached: see its header)
 scripts/deploy_code_only.sh pull                 # Locked pull, no restart; names what the server has not loaded
-scripts/deploy_code_only.sh restart              # Locked restart of the tree as it stands (launch detached)
+scripts/deploy_code_only.sh restart              # Locked restart of the tree as it stands (launch detached; refuses while server-launched sessions run, --allow-killing)
 scripts/deploy_code_only.sh status               # What the server runs + a validation token (--verify <token> judges it)
 systemctl --user restart genesis-server          # Bare restart: bypasses the deploy lock (NEVER nohup)
 systemctl --user status genesis-server           # Check
@@ -671,9 +671,10 @@ gate works, its exemption categories, and the unit rules for size bounds:
   The rework then arrives as new PR(s), and each one's body reports against
   the spec: `Replaces: #N`, its `Split:` position, every deviation with the
   complication that forced it, and every delegated question answered. Being a
-  rework is not itself a reason to stay unsplit. The exception is a Devin-built PR kicked
-  back under the closing-session Devin rule, which is reworked on its own branch
-  unless its spec says SPLIT. Detail:
+  rework is not itself a reason to stay unsplit. The builder closes the old PR
+  when the last replacement opens, mapping every part of it to a replacement
+  (or leaves it open, naming what is uncovered); Devin never closes one, so the
+  closing session does that for a Devin rework. Detail:
   `.claude/docs/premise-check.md` ("Handing a verdict to a builder") and
   genesis-development ("Building a rework").
 - **Use subagents** to keep main context clean. One concern per subagent.
