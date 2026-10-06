@@ -261,9 +261,10 @@ def test_15b_url_into_another_repo_is_not_a_declaration(rebuild):
     assert G._rework_declared_refs(body, "20", "o/r") == set()
 
 
-def test_15b2_url_with_no_resolvable_repo_is_not_a_declaration(monkeypatch):
-    """No ``repo`` and none resolvable from the cwd: a URL could name any repo,
-    so it is not counted (review finding: a foreign URL blocked an unrelated merge)."""
+def test_15b2_url_with_no_resolvable_repo_yields_no_refs(monkeypatch):
+    """No ``repo`` and none resolvable from the cwd: a URL could name any repo, so it
+    adds no reference. At the gate it is still a declaration that cannot be
+    verified, and blocks (test_27)."""
     monkeypatch.setenv("_TEST_GH_DERIVED_REPO", "")
     body = "Supersedes: https://github.com/other/project/pull/10\n"
     assert G._rework_declared_refs(body, "20", None) == set()
@@ -657,3 +658,115 @@ def test_27_an_unresolvable_declared_url_blocks(rebuild, monkeypatch):
     state, msg = G._check_rework("20", None)
     assert state == G.REWORK_BLOCK
     assert "could not verify" in msg
+# ── 28-35: round-1 review findings (rendered text, exact heading, bounds) ──
+
+
+_FENCED = "Docs example:\n```\nReplaces: #10\n```\n"
+
+
+def test_28_a_fenced_declaration_is_not_a_declaration(rebuild):
+    """Review finding (Codex, Devin, GLM): a quoted template in a fence blocked an
+    ordinary PR as a rebuild of the PR it named."""
+    assert G._rework_declared_refs(_FENCED, "20", REPO) == set()
+    assert G._rework_declared_refs("~~~~\nReplaces: #10\n~~~~\n", "20", REPO) == set()
+    rebuild(body=_FENCED)
+    state, msg = _check()
+    assert state == G.REWORK_NA, msg
+
+
+def test_28b_an_unclosed_fence_hides_the_rest_of_the_body():
+    assert G._rework_declared_refs("```\nReplaces: #10\n", "20", REPO) == set()
+
+
+def test_28c_a_fenced_section_does_not_satisfy_the_check():
+    body = "```\n" + _SECTION + "```\n"
+    assert G._rework_section_problems(body) == ["the PR body has no `## Rework` heading"]
+
+
+def test_29_an_html_comment_neither_declares_nor_fills_a_field():
+    """Review finding (Codex): an unfilled template comment counted as a value."""
+    assert G._rework_declared_refs("<!-- Replaces: #10 -->\n", "20", REPO) == set()
+    section = _SECTION.replace(
+        "Split: none, one PR carries the whole rebuild", "Split:\n<!-- one line per PR -->"
+    )
+    assert G._rework_section_problems(section) == [
+        "the `## Rework` section's `Split:` line is empty"
+    ]
+
+
+def test_30_a_level_three_heading_ends_the_section():
+    """Review finding (Devin, GLM): a later subsection filled a missing field."""
+    kept = [ln for ln in _SECTION.splitlines() if not ln.startswith("Questions answered")]
+    body = "\n".join(kept) + "\n### Notes\nQuestions answered: unrelated\n"
+    assert G._rework_section_problems(body) == [
+        "the `## Rework` section has no `Questions answered:` line"
+    ]
+
+
+def test_31_a_hyphenated_acknowledgement_heading_is_not_the_section():
+    body = _SECTION.replace("## Rework\n", "## Rework-acknowledgement\n")
+    assert G._rework_section_problems(body) == ["the PR body has no `## Rework` heading"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "## Rework acknowledgement needed\nPlease acknowledge first.",
+        "## Rework acknowledgements outstanding",
+        "```\n## Rework acknowledgement\n```",
+    ],
+)
+def test_32_only_the_exact_heading_is_an_acknowledgement(rebuild, body):
+    """Review finding (Codex): a prefix match accepted an instruction heading."""
+    rebuild(acks=[_ack(body=body)])
+    state, msg = _check()
+    assert state == G.REWORK_BLOCK
+    assert "PR #10 has no `## Rework acknowledgement` comment" in msg
+
+
+def test_32b_the_heading_is_matched_after_a_leading_comment_and_extra_spaces(rebuild):
+    rebuild(acks=[_ack(body="<!-- bot -->\n##  Rework   Acknowledgement \nRead it.")])
+    state, msg = _check()
+    assert state == G.REWORK_OK, msg
+
+
+def test_33_a_host_qualified_report_repo_still_matches_a_url():
+    """Review finding (Codex): `-R github.com/o/r` silently ignored a URL that the
+    merge arm, which normalizes, would have counted."""
+    body = "Replaces: https://github.com/o/r/pull/7\n"
+    assert G._rework_declarations(body, "20", "github.com/o/r") == ({7}, [])
+    assert G._rework_declarations(body, "20", "https://github.com/O/R") == ({7}, [])
+
+
+def test_33b_an_unnormalizable_repo_cannot_check_a_url():
+    refs, problems = G._rework_declarations(
+        "Replaces: https://github.com/o/r/pull/7\n", "20", "ghe.example/o/r"
+    )
+    assert refs == set()
+    assert problems
+
+
+def test_34_too_many_declared_prs_block_without_reading_them(rebuild, monkeypatch):
+    """Review finding (Codex): each declared PR costs reads on a path with no shared
+    deadline, so the count is bounded."""
+    n = G._REWORK_MAX_DECLARED + 1
+    refs = " ".join(f"#{100 + i}" for i in range(n))
+    rebuild(body=_BODY.replace("Replaces: #10", f"Replaces: {refs}"))
+    monkeypatch.setattr(G, "_rework_timeline", lambda *a: pytest.fail("read a timeline"))
+    state, msg = _check()
+    assert state == G.REWORK_BLOCK
+    assert f"declares {n} replaced PRs" in msg
+
+
+def test_35_the_first_unverifiable_reference_stops_the_reads(rebuild, monkeypatch):
+    calls = []
+
+    def timeline(num, repo):
+        calls.append(num)
+        return None, f"PR #{num} timeline could not be read", ""
+
+    rebuild(body=_BODY.replace("Replaces: #10", "Replaces: #40 #41 #42"))
+    monkeypatch.setattr(G, "_rework_timeline", timeline)
+    state, msg = _check()
+    assert state == G.REWORK_BLOCK
+    assert calls == [40]

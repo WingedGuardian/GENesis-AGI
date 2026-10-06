@@ -10124,9 +10124,19 @@ _REWORK_REF_RE = re.compile(_REWORK_REF)
 #: `## Rework`, optionally followed by text (`## Rework (replaces #10)`), but never
 #: the acknowledgement heading, which belongs on the OLD PR.
 _REWORK_HEADING_RE = re.compile(
-    r"^\s{0,3}##[ \t]+rework\b(?![ \t]*acknowledg)[^\n]*$", re.IGNORECASE
+    r"^\s{0,3}##[ \t]+rework\b(?![ \t_-]*acknowledg)[^\n]*$", re.IGNORECASE
 )
-_REWORK_SECTION_END_RE = re.compile(r"^\s{0,3}#{1,2}[ \t]")
+#: Any ATX heading ends the section, `###` included: a subsection is not the
+#: `## Rework` section, so its fields cannot fill a missing one.
+_REWORK_SECTION_END_RE = re.compile(r"^\s{0,3}#{1,6}(?:[ \t]|$)")
+#: A fenced code block's opening or closing line (CommonMark: 0-3 spaces, then
+#: three or more backticks or tildes).
+_REWORK_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+#: The most declared PRs one body may name. Each unlisted one costs a PR read
+#: and a timeline read on a path with no shared deadline (`--check-pr`), so the
+#: bound keeps a degraded API from stalling the report. A rebuild replaces one
+#: to three PRs in practice; more blocks and takes the owner's override.
+_REWORK_MAX_DECLARED = 5
 _REWORK_FIELD_RE = re.compile(
     r"^\s*(?:[-*+]\s+)?(?:\*\*|__)?(" + "|".join(_REWORK_FIELDS) + r")(?:\*\*|__)?\s*:"
     r"(?:\*\*|__)?(.*)$",
@@ -10150,6 +10160,29 @@ def _rework_unreadable(what: str) -> str:
     return f"{what} could not be read"
 
 
+def _rework_visible_text(body: str) -> str:
+    """The body as it renders: fenced code blocks and HTML comments removed.
+
+    Every rework reader (declarations, the `## Rework` section, an acknowledgement
+    heading) reads this, so a quoted template in a fence or an unfilled template
+    comment is never a declaration, a field value, or a heading. An unclosed fence
+    or comment runs to the end of the body, as CommonMark renders it.
+    """
+    out: list[str] = []
+    fence: str | None = None
+    for ln in (body or "").replace("\r\n", "\n").split("\n"):
+        m = _REWORK_FENCE_RE.match(ln)
+        if fence is None:
+            if m:
+                fence = m.group(1)
+                continue
+            out.append(ln)
+        elif m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) \
+                and not ln[m.end():].strip():
+            fence = None
+    return re.sub(r"<!--.*?(?:-->|\Z)", "", "\n".join(out), flags=re.DOTALL)
+
+
 def _rework_declared_refs(body: str, pr_num: str, repo: str | None) -> set[int]:
     """PR numbers this body declares it replaces; see ``_rework_declarations``."""
     return _rework_declarations(body, pr_num, repo)[0]
@@ -10164,17 +10197,21 @@ def _rework_declarations(
     A ``Replaces:`` or ``Supersedes:`` FIELD line declares, anywhere in the body,
     and so does the ``## Rework`` section's ``Replaces:`` value, including the
     lines under it, read by the same traversal as the completeness check. Every
-    reference in a value counts. A URL counts only when it names THIS repository:
-    ``repo``, or with ``repo`` unknown the repository gh resolves from the cwd (the
+    reference in a value counts, read from the rendered text
+    (``_rework_visible_text``). A URL counts only when it names THIS repository:
+    ``repo`` (normalized), or with ``repo`` unknown the repository gh resolves from the cwd (the
     one a bare merge targets). Problems, each making the PR a declared rebuild that
     cannot be verified (so it blocks): a URL whose repository cannot be resolved.
     """
     me = int(pr_num) if str(pr_num).isdigit() else -1
     refs: set[int] = set()
     problems: list[str] = []
-    want: str | None = repo.lower() if repo else None
+    # `-R github.com/o/r` is a valid spelling of `o/r`; compare the normalized form,
+    # as the merge arm does. A repository that does not normalize cannot be checked.
+    norm = _normalize_repo(repo) if repo else None
+    want: str | None = norm.lower() if norm else None
     resolved = repo is not None
-    text = (body or "").replace("\r\n", "\n")
+    text = _rework_visible_text(body)
     values = [m.group("value") for m in _REWORK_DECL_FIELD_RE.finditer(text)]
     fields = _rework_section_fields(text)
     section_values = (fields or {}).get("Replaces", [])
@@ -10209,7 +10246,7 @@ def _rework_section_fields(body: str) -> dict[str, list[str]] | None:
     under it (a bullet list), which is how a value is read everywhere: by the
     completeness check and by the declaration reader alike.
     """
-    lines = (body or "").splitlines()
+    lines = _rework_visible_text(body).splitlines()
     start = next((i for i, ln in enumerate(lines) if _REWORK_HEADING_RE.match(ln)), None)
     if start is None:
         return None
@@ -10478,12 +10515,21 @@ def _rework_ts(value: object) -> _dt.datetime | None:
     return got if got.tzinfo is not None else None
 
 
+def _rework_is_ack(body: str) -> bool:
+    """True when the comment's first rendered line IS the acknowledgement heading.
+
+    Exact, whitespace-normalized, never a prefix: "## Rework acknowledgement
+    needed" is an instruction, not an acknowledgement.
+    """
+    first = next((ln for ln in _rework_visible_text(body).splitlines() if ln.strip()), "")
+    return " ".join(first.split()).lower() == _REWORK_ACK_HEADING
+
+
 def _rework_ack_problem(num: int, rows: list[dict], created: _dt.datetime) -> str | None:
     """Why PR ``num`` lacks a valid acknowledgement, or None when it has one."""
     candidates = [
         r for r in rows
-        if isinstance(r.get("body"), str)
-        and r["body"].lstrip().lower().startswith(_REWORK_ACK_HEADING)
+        if isinstance(r.get("body"), str) and _rework_is_ack(r["body"])
     ]
     if not candidates:
         return f"PR #{num} has no `## Rework acknowledgement` comment"
@@ -10591,6 +10637,11 @@ def _check_rework_inner(
     states: dict[int, str] = {}
     if sent_back is not None:
         states.update({n: st for n, (_h, st) in sent_back.items()})
+    if len(refs) > _REWORK_MAX_DECLARED:
+        return REWORK_BLOCK, (
+            f"could not verify — the body declares {len(refs)} replaced PRs; at most "
+            f"{_REWORK_MAX_DECLARED} are checked (owner override for more)"
+        )
     for ref in sorted(refs):
         if sent_back is not None and ref in sent_back:
             replaced.add(ref)
@@ -10601,6 +10652,7 @@ def _check_rework_inner(
         was, why, state = _rework_timeline(ref, repo)
         if was is None:
             unverified.append(why)
+            break  # the verdict is already a block; read nothing more
         elif was:
             replaced.add(ref)
             states[ref] = state
