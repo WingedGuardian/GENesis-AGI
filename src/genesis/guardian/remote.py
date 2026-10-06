@@ -55,6 +55,24 @@ _GROW_ROOT_TIMEOUT = 330.0   # gateway: timeout 300 (incus LV + fs online resize
 _SET_LIMITS_TIMEOUT = 70.0   # gateway: timeout 60 (incus config set + verify)
 
 
+async def _reap(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL an ssh child and wait for it — boundedly.
+
+    Process.wait() returns only once every pipe is closed, so a grandchild that
+    inherited them (an ssh ProxyCommand, say) would hold the caller past its own
+    deadline: MEASURED, a child spawning `sleep 8 &` held an 0.5 s deadline for
+    8 s. The kill is already sent; the bound only stops the wait hanging on pipes.
+    """
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), 5)
+    except TimeoutError:
+        logger.warning("ssh child %s killed but its pipes stayed open; not waiting", proc.pid)
+
+
 class GuardianRemote:
     """SSH interface to the Guardian gateway on the host VM.
 
@@ -108,6 +126,7 @@ class GuardianRemote:
             f"{self._host_user}@{self._host_ip}",
             command,
         ]
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -119,13 +138,15 @@ class GuardianRemote:
             )
             output = stdout.decode().strip() or stderr.decode().strip()
             return proc.returncode == 0, output
+        except asyncio.CancelledError:
+            # A caller's own deadline (an outer wait_for) cancelled us: the timeout
+            # branch below never runs, so reap the child here or it outlives the call.
+            if proc is not None and proc.returncode is None:
+                await _reap(proc)
+            raise
         except TimeoutError:
             # Kill the orphaned SSH process to prevent accumulation
-            try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
+            await _reap(proc)
             logger.warning(
                 "SSH to %s@%s timed out after %.0fs",
                 self._host_user, self._host_ip, wait_timeout,

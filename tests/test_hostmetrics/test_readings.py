@@ -249,3 +249,14 @@ def test_import_does_not_load_the_runtime():
         [sys.executable, "-c", code], capture_output=True, text=True, check=True, env=env
     )
     assert out.stdout.strip() == "[]"
+
+
+def test_proc_stat_steal_time_is_not_counted_as_busy(cg, proc):
+    # cgroup usage_usec excludes steal; the /proc/stat fallback must agree, or an
+    # idle VM with hypervisor steal reads as busy and WAITs a job that fits.
+    tck = os.sysconf("SC_CLK_TCK")
+    _tree(proc, {"stat": f"cpu  {tck} 0 0 {50 * tck} 0 0 0 0 0 0\n"})
+    fake = _FakeTime(
+        lambda: _tree(proc, {"stat": f"cpu  {tck} 0 0 {51 * tck} 0 0 0 {4 * tck} 0 0\n"})
+    )
+    assert r.read_cpu_used(1.0, cg, proc, sleep=fake.sleep, clock=fake.clock) == 0.0

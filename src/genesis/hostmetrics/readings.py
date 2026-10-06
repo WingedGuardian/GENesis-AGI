@@ -176,7 +176,9 @@ def _cpu_usage_usec(root: Path, proc: Path) -> float | None:
         vals = [int(v) for v in first[1:9]]
     except ValueError:
         return None
-    busy = sum(vals) - vals[3] - vals[4]  # minus idle and iowait
+    # Minus idle, iowait and steal: cgroup usage_usec counts none of them, and
+    # hypervisor steal is time this system did NOT run.
+    busy = sum(vals) - vals[3] - vals[4] - (vals[7] if len(vals) > 7 else 0)
     return busy * 1e6 / os.sysconf("SC_CLK_TCK")
 
 

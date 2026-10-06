@@ -121,3 +121,14 @@ def test_reads_config_and_parses_the_reply(tmp_path):
     m = h.read_host_memory(cfg, factory)
     assert (m.total, m.used) == (4 * MIB, 2 * MIB)
     assert seen == {"ip": "192.0.2.10", "user": "tester", "key": "/nonexistent/key"}
+
+
+@pytest.mark.parametrize("host", ["unexpected", 3, ["a"], None])
+def test_a_malformed_host_field_is_unavailable_not_a_crash(host):
+    m = h.parse_ram_status({"ok": True, "host": host})
+    assert m.total is None and m.unavailable
+
+
+def test_a_non_string_detail_is_unavailable_not_a_crash():
+    m = h.parse_ram_status({"ok": True, "host": {"used_pct": 3.0, "detail": 12}})
+    assert m.unavailable == "unrecognised host detail in ram-status"
