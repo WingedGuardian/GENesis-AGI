@@ -53,6 +53,35 @@ def _no_playwright_floor(monkeypatch):
     """The supported range must not depend on whichever playwright this machine
     has; tests that exercise the floor set it themselves."""
     monkeypatch.setattr(engine, "_playwright_build_floor", lambda *_: None)
+    # Nor on whether this machine has playwright at all (CI installs no browser extra).
+    monkeypatch.setattr(engine, "_playwright_installed", lambda: True, raising=False)
+
+
+def test_missing_playwright_is_not_ready(tmp_path, monkeypatch):
+    """camoufox launches through playwright: without it nothing can launch,
+    whatever the engine. A missing distribution is not 'no floor'."""
+    pkg = _pkg(tmp_path, PIN)
+    root = _flagged_root(tmp_path)
+    _engine(root / "browsers" / "official" / "156.0.1-beta.34-abcd1234", "156.0.1", "beta.34")
+    # Guard: with playwright present this install is READY, so only playwright differs.
+    assert camoufox_engine_status(install_dir=root, package_dir=pkg).ready
+    monkeypatch.setattr(engine, "_playwright_installed", lambda: False, raising=False)
+    status = camoufox_engine_status(install_dir=root, package_dir=pkg)
+    assert not status.ready
+    assert "playwright" in status.detail
+
+
+def test_playwright_installed_reads_the_distribution(monkeypatch):
+    import importlib.metadata
+
+    def missing(_name):
+        raise importlib.metadata.PackageNotFoundError(_name)
+
+    monkeypatch.undo()  # this test is about the real check, not the autouse stub
+    monkeypatch.setattr(engine.importlib.metadata, "version", missing)
+    assert engine._playwright_installed() is False
+    monkeypatch.setattr(engine.importlib.metadata, "version", lambda _name: "1.58.0")
+    assert engine._playwright_installed() is True
 
 
 def _flagged_root(tmp_path: Path) -> Path:

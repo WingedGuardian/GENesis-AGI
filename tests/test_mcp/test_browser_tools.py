@@ -36,6 +36,11 @@ def _clear_all_browser_state():
     browser._remote_page = None
     browser._remote_cdp_url = None
     browser._remote_last_url = None
+    browser._tinyfish_pw = None
+    browser._tinyfish_browser = None
+    browser._tinyfish_page = None
+    browser._tinyfish_session_id = None
+    browser._launched_browser_pids = {}
     # VNC verification flag — FIX 3 tests toggle it; reset to avoid leak
     browser._vnc_verified = False
 
@@ -1969,10 +1974,12 @@ class TestBrowserStackLockLifetime:
         """anyio (the MCP SDK's request scope) cancels at EVERY await inside a
         cancelled scope, so the failed launch's own teardown is cancelled too and
         the manager stays set with no page. The next launch must close that
-        manager before replacing it, and the release must not trust the handles."""
+        manager, must not launch while a browser of the cancelled one may live,
+        and the release must not trust the handles."""
         import anyio
 
-        monkeypatch.setattr(browser, "_local_browser_processes", lambda: [4242], raising=False)
+        left = [[4242]]
+        monkeypatch.setattr(browser, "_local_browser_processes", lambda: left[0], raising=False)
 
         async def starting(*_a):
             await asyncio.sleep(10)  # the browser is starting when the request is cancelled
@@ -1991,11 +1998,14 @@ class TestBrowserStackLockLifetime:
             assert _stack_lock_held()
 
             first.__aexit__ = AsyncMock(return_value=None)  # the retry's close completes
+            with pytest.raises(Exception, match="did not finish"):
+                await browser._ensure_browser()  # ... but a process it started remains
+            first.__aexit__.assert_awaited_once()  # closed before anything replaces it
+            second.__aenter__.assert_not_awaited()
+            assert _stack_lock_held(), "released while a browser of the cancelled launch may live"
+            left[0] = []
             await browser._ensure_browser()
-        first.__aexit__.assert_awaited_once()  # closed before being replaced
         assert browser._stealth_cm is second
-        await browser.async_cleanup()
-        assert _stack_lock_held(), "released while a browser of the cancelled launch may live"
 
     @pytest.mark.asyncio
     async def test_readiness_is_read_under_the_lock(self):
@@ -2052,6 +2062,222 @@ class TestBrowserStackLockLifetime:
             result = await browser._impl_browser_navigate("https://example.com", stealth=False)
         assert "being upgraded" in result["error"]
         assert not result["error"].startswith("Camoufox")
+
+    @pytest.mark.asyncio
+    async def test_relaunch_refused_while_an_unfinished_teardown_left_a_browser(self, monkeypatch):
+        """The hold survives an unfinished teardown, so a relaunch must not take
+        it as permission: two browsers would share one persistent profile."""
+        left = [[4242]]
+        monkeypatch.setattr(browser, "_local_browser_processes", lambda: left[0], raising=False)
+        first = _camoufox_cm(exit_=AsyncMock(side_effect=RuntimeError("close failed")))
+        second = _camoufox_cm()
+        with _ready_engine(), patch.dict("sys.modules", _camoufox_module(first, second)):
+            await browser._ensure_browser()
+            await browser.async_cleanup()
+            assert _stack_lock_held()
+            with pytest.raises(Exception, match="did not finish") as refused:
+                await browser._ensure_browser()
+            assert type(refused.value).__name__ == "BrowserStackBusy"
+            second.__aenter__.assert_not_awaited()
+            left[0] = []  # the old browser exited
+            await browser._ensure_browser()
+        second.__aenter__.assert_awaited_once()
+        assert _stack_lock_held()
+
+    @pytest.mark.asyncio
+    async def test_reparented_browser_keeps_the_hold(self, tmp_path, monkeypatch):
+        """A browser whose driver died is reparented away from this process; the
+        descendant walk alone would not see it and would release the hold."""
+        proc = tmp_path / "proc"
+        proc.mkdir()
+        me = os.getpid()
+
+        def put(pid: int, comm: str, ppid: int) -> None:
+            (proc / str(pid)).mkdir(exist_ok=True)
+            (proc / str(pid) / "stat").write_text(f"{pid} ({comm}) S {ppid} 1 1 0 -1\n")
+
+        put(me, "python3", 1)
+        put(900001, "node", me)
+        put(900002, "camoufox-bin", 900001)
+        monkeypatch.setattr(browser, "_PROC", proc, raising=False)
+        cm = _camoufox_cm(exit_=AsyncMock(side_effect=RuntimeError("close failed")))
+        with _ready_engine(), patch.dict("sys.modules", _camoufox_module(cm)):
+            await browser._ensure_browser()
+        (proc / "900001" / "stat").unlink()
+        (proc / "900001").rmdir()  # the driver died ...
+        put(900002, "camoufox-bin", 1)  # ... and its browser now belongs to init
+        await browser.async_cleanup()
+        assert _stack_lock_held(), "released under a browser that is still running"
+        (proc / "900002" / "stat").unlink()
+        (proc / "900002").rmdir()
+        await browser.async_cleanup()
+        assert not _stack_lock_held()
+
+
+def _tinyfish_api():
+    from genesis.providers import tinyfish_client
+
+    session = {"session_id": "tf-session-0001", "cdp_url": "ws://127.0.0.1:1/devtools"}
+    create = AsyncMock(return_value=session)
+    return create, patch.multiple(
+        tinyfish_client, browser_session_create=create, browser_session_delete=AsyncMock()
+    )
+
+
+def _cdp_driver(*, stop=None):
+    """A started Playwright whose connect_over_cdp yields a browser with one tab."""
+    tab = _live_page()
+    pw = MagicMock()
+    pw.stop = stop if stop is not None else AsyncMock(return_value=None)
+    pw.chromium.connect_over_cdp = AsyncMock(return_value=_mock_remote_browser(pages=[tab]))
+    start = AsyncMock(return_value=pw)
+    module = {"playwright.async_api": MagicMock(async_playwright=MagicMock(return_value=MagicMock(start=start)))}
+    return module, start
+
+
+class TestPlaywrightDriverStackLock:
+    """Remote CDP and TinyFish start a LOCAL Playwright driver from this venv's
+    packages: it must run under the shared hold, on modules that match the disk."""
+
+    @staticmethod
+    async def _connect(kind: str) -> None:
+        if kind == "remote":
+            await browser._ensure_remote_cdp("http://127.0.0.1:9222")
+        else:
+            await browser._ensure_tinyfish_browser()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["remote", "tinyfish"])
+    async def test_driver_holds_the_lock_until_cleanup(self, kind, monkeypatch):
+        monkeypatch.setattr(browser.asyncio, "sleep", AsyncMock())
+        module, _start = _cdp_driver()
+        _create, api = _tinyfish_api()
+        with api, patch.dict("sys.modules", module):
+            await self._connect(kind)
+            assert _stack_lock_held(), "provisioning could replace playwright under this driver"
+            await browser.async_cleanup()
+        assert not _stack_lock_held()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["remote", "tinyfish"])
+    async def test_driver_refused_mid_upgrade(self, kind):
+        import fcntl
+
+        from genesis.browser import engine
+
+        module, start = _cdp_driver()
+        create, api = _tinyfish_api()
+        engine.BROWSER_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            api,
+            patch.dict("sys.modules", module),
+            open(engine.BROWSER_LOCK_FILE, "w") as provisioning,
+        ):
+            fcntl.flock(provisioning, fcntl.LOCK_EX)
+            with pytest.raises(Exception, match="being upgraded"):
+                await self._connect(kind)
+        start.assert_not_awaited()
+        create.assert_not_awaited()  # no paid session for a driver that cannot start
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["remote", "tinyfish"])
+    async def test_connect_refused_on_stale_loaded_modules(self, kind):
+        upgraded = dict(browser._STARTUP_BROWSER_VERSIONS, playwright="9.9.9")
+        module, start = _cdp_driver()
+        create, api = _tinyfish_api()
+        with (
+            api,
+            patch.object(browser, "_installed_browser_versions", return_value=upgraded),
+            patch.dict("sys.modules", {**module, "playwright": MagicMock()}),
+            pytest.raises(Exception, match="Restart this Claude Code session"),
+        ):
+            await self._connect(kind)
+        start.assert_not_awaited()
+        create.assert_not_awaited()
+        assert not _stack_lock_held()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["remote", "tinyfish"])
+    async def test_unfinished_driver_stop_keeps_the_hold(self, kind, monkeypatch):
+        monkeypatch.setattr(browser.asyncio, "sleep", AsyncMock())
+        monkeypatch.setattr(browser, "_local_browser_processes", lambda: [4242], raising=False)
+        module, _start = _cdp_driver(stop=AsyncMock(side_effect=RuntimeError("stop failed")))
+        _create, api = _tinyfish_api()
+        with api, patch.dict("sys.modules", module):
+            await self._connect(kind)
+            await browser.async_cleanup()
+        assert _stack_lock_held(), "released while the driver may still be running"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["remote", "tinyfish"])
+    async def test_reconnect_after_disconnect_stops_the_old_driver(self, kind, monkeypatch):
+        """A disconnect clears the browser and page but not the driver: the
+        reconnect must stop it, not overwrite its handle and lose it."""
+        monkeypatch.setattr(browser.asyncio, "sleep", AsyncMock())
+        old_stop = AsyncMock(return_value=None)
+        old, _ = _cdp_driver(stop=old_stop)
+        new, _ = _cdp_driver()
+        _create, api = _tinyfish_api()
+        with api:
+            with patch.dict("sys.modules", old):
+                await self._connect(kind)
+            if kind == "remote":
+                browser._on_remote_disconnected()
+            else:
+                browser._on_tinyfish_disconnected()
+            with patch.dict("sys.modules", new):
+                await self._connect(kind)
+            old_stop.assert_awaited_once()
+            await browser.async_cleanup()
+        assert not _stack_lock_held()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["remote", "tinyfish"])
+    async def test_failed_driver_start_stops_it_by_its_manager(self, kind):
+        """start() can fail or be cancelled after spawning node; the manager is
+        the only handle that can stop it. No paid session is created either."""
+        manager = MagicMock()
+        manager.start = AsyncMock(side_effect=RuntimeError("driver failed"))
+        manager.__aexit__ = AsyncMock(return_value=None)
+        module = {"playwright.async_api": MagicMock(async_playwright=MagicMock(return_value=manager))}
+        create, api = _tinyfish_api()
+        with api, patch.dict("sys.modules", module), pytest.raises(RuntimeError, match="driver failed"):
+            await self._connect(kind)
+        manager.__aexit__.assert_awaited_once()
+        create.assert_not_awaited()
+        assert not _stack_lock_held()
+
+    @pytest.mark.asyncio
+    async def test_failed_launch_records_its_browser_before_closing(self, tmp_path, monkeypatch):
+        """A launch that fails after the browser started never reaches the
+        post-launch record; its teardown must record what is still attached."""
+        proc = tmp_path / "proc"
+        proc.mkdir()
+        me = os.getpid()
+
+        def put(pid: int, comm: str, ppid: int) -> None:
+            (proc / str(pid)).mkdir(exist_ok=True)
+            (proc / str(pid) / "stat").write_text(f"{pid} ({comm}) S {ppid} 1 1 0 -1\n")
+
+        put(me, "python3", 1)
+        put(900001, "node", me)
+        put(900002, "camoufox-bin", 900001)
+        monkeypatch.setattr(browser, "_PROC", proc, raising=False)
+
+        async def close_fails(*_a):
+            (proc / "900001" / "stat").unlink()
+            (proc / "900001").rmdir()  # the close kills the driver ...
+            put(900002, "camoufox-bin", 1)  # ... and orphans the browser
+            raise RuntimeError("close failed")
+
+        cm = _camoufox_cm(enter=AsyncMock(side_effect=RuntimeError("no page")), exit_=close_fails)
+        with (
+            _ready_engine(),
+            patch.dict("sys.modules", _camoufox_module(cm)),
+            pytest.raises(RuntimeError, match="no page"),
+        ):
+            await browser._ensure_browser()
+        assert _stack_lock_held(), "released under the failed launch's orphaned browser"
 
 
 class TestLocalBrowserProcesses:

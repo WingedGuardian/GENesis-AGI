@@ -93,7 +93,8 @@ class CamoufoxEngineNotReady(RuntimeError):
 
 
 class BrowserStackBusy(RuntimeError):
-    """A provisioning run holds the browser-stack lock exclusive; no local launch."""
+    """The browser stack cannot be used now: a provisioning run holds the lock
+    exclusive, or a browser an unfinished teardown left may still be running."""
 
 
 _BROWSER_DISTS = ("camoufox", "playwright", "patchright")
@@ -140,33 +141,33 @@ class BrowserPackagesChanged(RuntimeError):
 
 # ── The browser-stack lock ───────────────────────────────────────────────────
 # genesis.browser.engine.BROWSER_LOCK_FILE, held SHARED by this process for as
-# long as a local browser process (Camoufox or Chromium) it started may be
-# alive, so a provisioning run, which takes it EXCLUSIVE, cannot replace
-# packages, copy a live profile or swap the engine under it, and a launch
-# cannot start mid-upgrade.
+# long as a local browser (Camoufox or Chromium) or a Playwright driver it
+# started may be alive, so a provisioning run, which takes it EXCLUSIVE, cannot
+# replace packages, copy a live profile or swap the engine under it, and a
+# launch cannot start mid-upgrade. Remote CDP and TinyFish count: their browsers
+# are remote, but their Playwright driver is a local `node` process run from
+# this venv's playwright.
 #
 # One rule binds the hold to the processes, at the two places they begin and end:
 #   * acquired by the launch functions themselves (_ensure_browser,
-#     _ensure_chromium_fallback), under _browser_lock, after any stale-browser
-#     cleanup and before the readiness check, the import and the first process.
-#     Every caller of them (the MCP tools, Medium's CamoufoxBrowserClient, a
-#     stale-page relaunch) is covered, because they are the only places this
-#     module creates a local browser;
+#     _ensure_chromium_fallback, _ensure_remote_cdp, _ensure_tinyfish_browser),
+#     under _browser_lock, after any stale cleanup and before the readiness
+#     check, the import and the first process. Every caller of them (the MCP
+#     tools, Medium's CamoufoxBrowserClient, a stale-page relaunch) is covered,
+#     because they are the only places this module starts a Playwright driver.
+#     A local launch is refused while an unfinished teardown may have left a
+#     browser running, which would share its persistent profile;
 #   * released only by _release_stack_lock_if_idle, which keeps the hold while
-#     any local browser handle is set, and after a teardown that did not finish
-#     (a close that raised or timed out, so a browser may have survived it)
-#     until no browser process remains among this process's descendants.
+#     any browser or driver handle is set, and after a teardown that did not
+#     finish (a close that raised or timed out, so a browser may have survived
+#     it) until no browser process remains among this process's descendants or
+#     among those recorded at launch, which a dead driver's browser is not.
 # A launch that fails tears down whatever it created before deciding. A
 # cancelled teardown leaves its handles set, so the hold stays with them; the
 # kernel drops the lock when this process exits and its descriptor closes.
-#
-# Remote CDP and TinyFish are outside it on purpose: neither starts a browser
-# here, uses the local engine, or opens a local profile. Their Playwright
-# drivers are local `node` processes, though, so after an unfinished teardown
-# the descendant scan counts them too: that errs toward keeping the hold.
 _stack_lock_fd: int | None = None
-# Set when a local teardown did not finish; names it. Cleared only once no
-# browser process is left under this process (_local_browser_processes).
+# Set when a teardown did not finish; names it. Cleared only once no browser
+# or driver process it may have left remains (_local_browser_processes).
 _stack_teardown_unconfirmed: str | None = None
 
 # Process names (/proc/<pid>/stat comm, cut to 15 characters by the kernel) of
@@ -213,15 +214,22 @@ def _acquire_stack_lock() -> None:
 
 def _local_browser_handles_set() -> bool:
     return any(
-        h is not None for h in (_stealth_cm, _playwright_cm, _playwright, _context)
+        h is not None
+        for h in (_stealth_cm, _playwright_cm, _playwright, _context, _remote_pw, _tinyfish_pw)
     )
 
 
-def _local_browser_processes(proc: Path = Path("/proc")) -> list[int] | None:
-    """PIDs of driver/browser processes descended from this one, or None if unknown.
+_PROC = Path("/proc")
+# pid -> comm of the driver/browser processes found under this one after each
+# launch. Cleared with the hold. A browser whose driver died is reparented away
+# from this process, out of the descendant walk; this is how it is still seen.
+_launched_browser_pids: dict[int, str] = {}
 
-    Walks the parent links in ``<proc>/<pid>/stat``. A process that already
-    exited between the listing and the read is skipped.
+
+def _proc_table(proc: Path) -> tuple[dict[int, int], dict[int, str]] | None:
+    """(pid -> ppid, pid -> comm) from ``<proc>/<pid>/stat``, or None if unreadable.
+
+    A process that already exited between the listing and the read is skipped.
     """
     try:
         entries = [p for p in proc.iterdir() if p.name.isdigit()]
@@ -232,8 +240,8 @@ def _local_browser_processes(proc: Path = Path("/proc")) -> list[int] | None:
     for entry in entries:
         try:
             stat = (entry / "stat").read_text()
-        except FileNotFoundError:
-            continue
+        except (FileNotFoundError, PermissionError):
+            continue  # exited, or another user's (hidepid): never one of ours
         except OSError:
             return None
         # "<pid> (<comm>) <state> <ppid> ...": comm may hold spaces or parens.
@@ -244,6 +252,10 @@ def _local_browser_processes(proc: Path = Path("/proc")) -> list[int] | None:
         pid = int(entry.name)
         comm[pid] = head.split("(", 1)[1]
         parent[pid] = int(fields[1])
+    return parent, comm
+
+
+def _descendant_browsers(parent: dict[int, int], comm: dict[int, str]) -> list[int]:
     children: dict[int, list[int]] = {}
     for pid, ppid in parent.items():
         children.setdefault(ppid, []).append(pid)
@@ -254,11 +266,49 @@ def _local_browser_processes(proc: Path = Path("/proc")) -> list[int] | None:
         if comm.get(pid) in _LOCAL_BROWSER_COMMS:
             found.append(pid)
         stack.extend(children.get(pid, ()))
+    return found
+
+
+def _record_launched_browsers() -> None:
+    """Remember the driver/browser processes now under this one (best effort)."""
+    table = _proc_table(_PROC)
+    if table is not None:
+        _launched_browser_pids.update({p: table[1][p] for p in _descendant_browsers(*table)})
+
+
+def _local_browser_processes(proc: Path | None = None) -> list[int] | None:
+    """PIDs of driver/browser processes descended from this one, or recorded at a
+    launch and still running under the same name wherever they now live; None
+    if the process table cannot be read. Reuse of a recorded pid by another
+    process of that name errs toward keeping the hold."""
+    table = _proc_table(proc if proc is not None else _PROC)
+    if table is None:
+        return None
+    parent, comm = table
+    found = set(_descendant_browsers(parent, comm))
+    found.update(p for p, name in _launched_browser_pids.items() if comm.get(p) == name)
     return sorted(found)
 
 
+def _refuse_launch_over_unfinished_teardown() -> None:
+    """A held lock is not permission to launch: after an unfinished teardown the
+    old browser may still be running on the profile a new one would open."""
+    global _stack_teardown_unconfirmed
+    if _stack_teardown_unconfirmed is None:
+        return
+    left = _local_browser_processes()
+    if left != []:
+        raise BrowserStackBusy(
+            f"{_stack_teardown_unconfirmed} did not finish and "
+            + (f"browser processes it may have left are still running (pids "
+               f"{', '.join(map(str, left))})" if left else "the process table could not be read")
+            + "; try again once they exit"
+        )
+    _stack_teardown_unconfirmed = None
+
+
 def _release_stack_lock_if_idle() -> None:
-    """Drop the shared hold, but only when no local browser can still be alive."""
+    """Drop the shared hold, but only when no browser or driver can still be alive."""
     global _stack_lock_fd, _stack_teardown_unconfirmed
     if _stack_lock_fd is None or _local_browser_handles_set():
         return
@@ -270,7 +320,7 @@ def _release_stack_lock_if_idle() -> None:
                 "released when they exit and the next browser cleanup runs, or when "
                 "this process exits",
                 _stack_teardown_unconfirmed,
-                "browser processes remain under this process (pids "
+                "browser processes it may have left remain (pids "
                 + ", ".join(map(str, left)) + ")"
                 if left
                 else "the process table could not be read",
@@ -280,6 +330,7 @@ def _release_stack_lock_if_idle() -> None:
     with contextlib.suppress(OSError):
         os.close(_stack_lock_fd)
     _stack_lock_fd = None
+    _launched_browser_pids.clear()
 
 
 # Per local teardown step (user-approved 10s, the value async_cleanup always used).
@@ -298,6 +349,9 @@ async def _teardown_step(label: str, aw) -> bool:
     __aexit__ after a cancelled one returns without stopping anything.)
     """
     global _stack_teardown_unconfirmed
+    # Still attached now; a close that fails may kill the driver and orphan the
+    # browser, which only this record then finds (a failed launch never got one).
+    _record_launched_browsers()
     try:
         await asyncio.wait_for(aw, timeout=_TEARDOWN_TIMEOUT_S)
         return True
@@ -549,6 +603,7 @@ async def _ensure_browser():
             logger.warning("Camoufox page is stale or its launch was interrupted — restarting browser")
             await async_cleanup()
 
+        _refuse_launch_over_unfinished_teardown()
         # The hold comes FIRST: the readiness verdict and the import below read
         # files a provisioning run replaces, and must describe what launches.
         _acquire_stack_lock()  # raises BrowserStackBusy mid-upgrade
@@ -596,6 +651,7 @@ async def _ensure_browser():
             await _teardown_camoufox()
             _release_stack_lock_if_idle()
             raise
+        _record_launched_browsers()
         mode_str = "headed (collaborate)" if _collaborate_mode else "headed"
         _touch()  # a launch is use: the idle clock starts now, whoever launched
         logger.info("Camoufox browser launched %s with persistent profile at %s", mode_str, _PROFILE_DIR)
@@ -621,6 +677,7 @@ async def _ensure_chromium_fallback():
             logger.warning("Chromium page is stale or its launch was interrupted — restarting browser")
             await async_cleanup()
 
+        _refuse_launch_over_unfinished_teardown()
         _acquire_stack_lock()  # first, before the import reads the package files
         try:
             _check_loaded_browser_modules()
@@ -647,10 +704,25 @@ async def _ensure_chromium_fallback():
             await _teardown_chromium()
             _release_stack_lock_if_idle()
             raise
+        _record_launched_browsers()
         mode_str = "headed (collaborate)" if _collaborate_mode else "headed"
         _touch()  # a launch is use: the idle clock starts now, whoever launched
         logger.info("Chromium fallback launched %s with profile at %s", mode_str, _CHROMIUM_PROFILE_DIR)
         return _page
+
+
+async def _start_driver(label: str):
+    """Start a Playwright driver. ``start()`` spawns node before it awaits, so a
+    start that fails or is cancelled is stopped through its manager, the only
+    handle that can (the Chromium launch keeps it for the same reason)."""
+    from playwright.async_api import async_playwright
+
+    manager = async_playwright()
+    try:
+        return await manager.start()
+    except BaseException:
+        await _teardown_step(f"the {label} driver stop", manager.__aexit__(None, None, None))
+        raise
 
 
 def _on_remote_disconnected() -> None:
@@ -683,12 +755,7 @@ async def _cleanup_remote_cdp() -> None:
         _remote_page = None
 
     if _remote_pw is not None:
-        try:
-            await asyncio.wait_for(_remote_pw.stop(), timeout=10.0)
-        except TimeoutError:
-            logger.warning("Remote Playwright stop timed out (10s)")
-        except Exception:
-            logger.debug("Remote Playwright cleanup failed", exc_info=True)
+        await _teardown_step("the remote CDP Playwright driver stop", _remote_pw.stop())
         _remote_pw = None
 
     _remote_last_url = None
@@ -707,9 +774,16 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
 
     async with _browser_lock:
         # Already connected and alive — reuse
-        if _remote_page is not None and _remote_browser is not None:
-            if _remote_browser.is_connected() and _is_page_alive(_remote_page):
-                return _remote_page
+        if (
+            _remote_page is not None
+            and _remote_browser is not None
+            and _remote_browser.is_connected()
+            and _is_page_alive(_remote_page)
+        ):
+            return _remote_page
+        if any(h is not None for h in (_remote_pw, _remote_browser, _remote_page)):
+            # Stale, or disconnected (which clears the browser, not the driver):
+            # stop the old driver before a new one replaces its handle.
             logger.warning("Remote CDP connection stale — cleaning up")
             await _cleanup_remote_cdp()
 
@@ -724,16 +798,22 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
                 "--user-data-dir=%USERPROFILE%\\chrome-genesis"
             )
 
-        from playwright.async_api import async_playwright
-
-        _remote_pw = await async_playwright().start()
+        # The browser is remote, but the driver is a local process run from this
+        # venv's playwright: it holds the stack lock like a local browser.
+        _acquire_stack_lock()  # raises BrowserStackBusy mid-upgrade
+        try:
+            _check_loaded_browser_modules()
+            _remote_pw = await _start_driver("remote CDP Playwright")
+        except BaseException:
+            _release_stack_lock_if_idle()
+            raise
         try:
             _remote_browser = await asyncio.wait_for(
                 _remote_pw.chromium.connect_over_cdp(url), timeout=30.0
             )
         except TimeoutError:
-            await _remote_pw.stop()
-            _remote_pw = None
+            await _cleanup_remote_cdp()
+            _release_stack_lock_if_idle()
             raise ConnectionError(
                 f"CDP connection to {url} timed out after 30s. "
                 "The remote machine may be asleep or unreachable.\n\n"
@@ -742,8 +822,8 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
                 "  2. Chrome is running with --remote-debugging-port=9222"
             ) from None
         except Exception as e:
-            await _remote_pw.stop()
-            _remote_pw = None
+            await _cleanup_remote_cdp()
+            _release_stack_lock_if_idle()
             raise ConnectionError(
                 f"Cannot connect to Chrome at {url}. Error: {e}\n\n"
                 "Check:\n"
@@ -802,12 +882,7 @@ async def _cleanup_tinyfish():
         _tinyfish_browser = None
 
     if _tinyfish_pw is not None:
-        try:
-            await asyncio.wait_for(_tinyfish_pw.stop(), timeout=10.0)
-        except TimeoutError:
-            logger.warning("TinyFish Playwright stop timed out (10s)")
-        except Exception:
-            logger.debug("TinyFish Playwright cleanup failed", exc_info=True)
+        await _teardown_step("the TinyFish Playwright driver stop", _tinyfish_pw.stop())
         _tinyfish_pw = None
 
     _tinyfish_page = None
@@ -848,40 +923,46 @@ async def _ensure_tinyfish_browser(url: str | None = None) -> tuple:
 
     async with _browser_lock:
         # Already connected and alive — reuse
-        if _tinyfish_page is not None and _tinyfish_browser is not None:
-            if _tinyfish_browser.is_connected() and _is_page_alive(_tinyfish_page):
-                return _tinyfish_page, False
+        if (
+            _tinyfish_page is not None
+            and _tinyfish_browser is not None
+            and _tinyfish_browser.is_connected()
+            and _is_page_alive(_tinyfish_page)
+        ):
+            return _tinyfish_page, False
+        if any(
+            h is not None
+            for h in (_tinyfish_pw, _tinyfish_browser, _tinyfish_page, _tinyfish_session_id)
+        ):
+            # Stale, or disconnected (the driver and the paid session outlive it).
             logger.warning("TinyFish session stale — cleaning up")
             await _cleanup_tinyfish()
 
-        from playwright.async_api import async_playwright
+        # Like remote CDP: a local driver from this venv, so the stack lock and
+        # the driver come first; the paid session only once the driver runs.
+        _acquire_stack_lock()  # raises BrowserStackBusy mid-upgrade
+        try:
+            _check_loaded_browser_modules()
+            from genesis.providers.tinyfish_client import browser_session_create
 
-        from genesis.providers.tinyfish_client import browser_session_create
-
-        # Create remote browser session (takes 10-30s)
-        logger.info("Creating TinyFish browser session...")
-        session = await browser_session_create(url=url)
-        _tinyfish_session_id = session["session_id"]
-        cdp_url = session["cdp_url"]
+            _tinyfish_pw = await _start_driver("TinyFish Playwright")
+            # Create remote browser session (takes 10-30s)
+            logger.info("Creating TinyFish browser session...")
+            session = await browser_session_create(url=url)
+            _tinyfish_session_id = session["session_id"]
+            cdp_url = session["cdp_url"]
+        except BaseException:
+            await _cleanup_tinyfish()  # stops the driver, deletes any session
+            _release_stack_lock_if_idle()
+            raise
         logger.info(
-            "TinyFish session %s created — connecting via CDP",
-            _tinyfish_session_id[:12],
+            "TinyFish session %s created — connecting via CDP", _tinyfish_session_id[:12]
         )
-
-        _tinyfish_pw = await async_playwright().start()
         try:
             _tinyfish_browser = await _tinyfish_pw.chromium.connect_over_cdp(cdp_url)
         except Exception as e:
-            await _tinyfish_pw.stop()
-            _tinyfish_pw = None
-            # Terminate the session we just created
-            try:
-                from genesis.providers.tinyfish_client import browser_session_delete
-
-                await browser_session_delete(_tinyfish_session_id)
-            except Exception:
-                pass
-            _tinyfish_session_id = None
+            await _cleanup_tinyfish()  # stops the driver and terminates the session
+            _release_stack_lock_if_idle()
             raise ConnectionError(
                 f"TinyFish CDP connection failed: {e}"
             ) from e

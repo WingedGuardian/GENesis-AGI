@@ -58,9 +58,9 @@ PROVISION_HINT = (
 )
 
 # A provisioning run holds this EXCLUSIVE for its whole transaction; each local
-# browser (Camoufox, Chromium) holds it SHARED for as long as its process may be
-# alive. So a launch cannot start mid-upgrade, and an upgrade cannot start under
-# a browser.
+# browser (Camoufox, Chromium) and each Playwright driver (remote CDP, TinyFish)
+# holds it SHARED for as long as its process may be alive. So a launch cannot
+# start mid-upgrade, and an upgrade cannot start under a browser.
 BROWSER_LOCK_FILE = Path.home() / ".genesis" / "locks" / "browser-provision.lock"
 
 
@@ -261,6 +261,16 @@ def _build_key(build: str) -> tuple[int, ...]:
     return tuple(parts + [0] * (5 - build.count(".")))
 
 
+def _playwright_installed() -> bool:
+    """camoufox launches through playwright (its async API is built on
+    ``playwright.async_api``): without the distribution nothing launches."""
+    try:
+        importlib.metadata.version("playwright")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return True
+
+
 def _playwright_build_floor(
     floors: tuple[tuple[tuple[int, int], str], ...] = _PLAYWRIGHT_FLOORS,
 ) -> str | None:
@@ -382,6 +392,12 @@ def _status(install_dir: Path | None, package_dir: Path | None) -> EngineStatus:
     pkg = package_dir if package_dir is not None else _package_dir()
     if pkg is None:
         return EngineStatus(NO_PACKAGE, f"camoufox is not installed; {PROVISION_HINT}")
+    if not _playwright_installed():
+        # Not "no floor": a missing driver is a launch that cannot happen.
+        return EngineStatus(
+            NO_PACKAGE,
+            f"playwright, which camoufox launches through, is not installed; {PROVISION_HINT}",
+        )
     root = install_dir if install_dir is not None else camoufox_install_dir()
     limits = _package_constraints(pkg)
 
