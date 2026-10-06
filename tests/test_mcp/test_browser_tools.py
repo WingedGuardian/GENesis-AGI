@@ -491,14 +491,24 @@ def _cdp_page(url: str, target_id: str):
     return page
 
 
-async def _connect(remote_browser):
-    mock_pw = AsyncMock()
-    mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=remote_browser)
+async def _connect(remote_browser, mock_pw=None, timeout_s=None):
+    """Connect to ``remote_browser``. With ``timeout_s``, run it under the real
+    tool timeout, which cancels the task (returns its error dict)."""
+    if mock_pw is None:
+        mock_pw = AsyncMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=remote_browser)
     with patch("playwright.async_api.async_playwright") as mock_apw:
         mock_starter = AsyncMock()
         mock_starter.start = AsyncMock(return_value=mock_pw)
         mock_apw.return_value = mock_starter
-        return await browser._ensure_remote_cdp("http://100.1.2.3:9222")
+        coro = browser._ensure_remote_cdp("http://100.1.2.3:9222")
+        if timeout_s is None:
+            return await coro
+        return await browser._with_tool_timeout(coro, timeout_s=timeout_s, operation="nav")
+
+
+async def _hang(*_args, **_kwargs):
+    await asyncio.sleep(3600)
 
 
 def _mock_remote_browser(pages=None, connected=True):
@@ -541,11 +551,22 @@ class TestEnsureRemoteCdp:
         """Codex round 1: the tool timeout cancels with a BaseException, which an
         `except Exception` cleanup missed. The cancellation itself propagates."""
         mock_br = _mock_remote_browser()
-        mock_br.contexts[0].new_page = AsyncMock(side_effect=asyncio.CancelledError())
-        with pytest.raises(asyncio.CancelledError):
-            await _connect(mock_br)
+        mock_br.contexts[0].new_page = AsyncMock(side_effect=_hang)
+        result = await _connect(mock_br, timeout_s=0.2)
+        assert "timed out" in result["error"]
         mock_br.close.assert_awaited()
         assert browser._remote_browser is None
+        assert browser._remote_pw is None
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_connect_stops_the_driver(self):
+        """Round 1 review: cancellation during connect_over_cdp skipped both
+        `except` branches, so the driver was never stopped and leaked."""
+        mock_pw = AsyncMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(side_effect=_hang)
+        result = await _connect(None, mock_pw=mock_pw, timeout_s=0.2)
+        assert "timed out" in result["error"]
+        mock_pw.stop.assert_awaited_once()
         assert browser._remote_pw is None
 
     @pytest.mark.asyncio
@@ -698,7 +719,7 @@ class TestEnsureRemoteCdp:
     async def test_creates_new_tab_when_no_pages(self):
         """Context exists but no pages — creates new tab."""
         new_browser = _mock_remote_browser(pages=[])
-        created_page = MagicMock()
+        created_page = _cdp_page("about:blank", "GEN-1")
         new_browser.contexts[0].new_page = AsyncMock(return_value=created_page)
 
         mock_pw = AsyncMock()
@@ -716,9 +737,8 @@ class TestEnsureRemoteCdp:
     @pytest.mark.asyncio
     async def test_resolves_url_from_env(self):
         """Falls back to GENESIS_CDP_URL env var when no explicit URL."""
-        new_page = MagicMock()
-        new_page.url = "chrome://newtab/"
-        new_browser = _mock_remote_browser(pages=[new_page])
+        new_browser = _mock_remote_browser(pages=[_cdp_page("chrome://newtab/", "USER")])
+        new_browser.contexts[0].new_page = AsyncMock(return_value=_cdp_page("about:blank", "GEN-1"))
 
         mock_pw = AsyncMock()
         mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=new_browser)
@@ -1243,6 +1263,102 @@ class TestReviewNotes:
         result = await _connect(new_browser)
         assert result is genesis_tab
         user_tab.context.new_cdp_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_title_does_not_resync_drift(self):
+        """Round 1 (Codex P2, Devin): the baseline means "the caller has seen
+        this page", so it moves only once the whole response is built."""
+        page = _nav_page("https://example.com/moved")
+        page.title = AsyncMock(side_effect=RuntimeError("Target closed"))
+        browser._active_page = page
+        browser._remote_page = page
+        browser._remote_browser = _mock_remote_browser(connected=True)
+        browser._remote_last_url = "https://example.com/form"
+        snap = await browser._impl_browser_snapshot()
+        assert "error" in snap
+        assert browser._remote_last_url == "https://example.com/form"
+
+
+def _unidentifiable_page():
+    """A freshly opened tab whose CDP target id cannot be read."""
+    page = _cdp_page("about:blank", "unused")
+    page.context.new_cdp_session = AsyncMock(side_effect=RuntimeError("no session"))
+    return page
+
+
+@pytest.mark.skipif(
+    not importlib.util.find_spec("playwright"),
+    reason="playwright not installed",
+)
+class TestGenesisTabIdentity:
+    """Round 1 (Codex P2, Devin): a tab Genesis cannot identify could never be
+    found again, so every reconnect would open another one."""
+
+    @pytest.mark.asyncio
+    async def test_an_unidentifiable_new_tab_is_closed_and_the_connect_fails(self):
+        mock_br = _mock_remote_browser(pages=[_cdp_page("https://mail.example", "USER")])
+        tab = _unidentifiable_page()
+        mock_br.contexts[0].new_page = AsyncMock(return_value=tab)
+        with pytest.raises(ConnectionError, match="could not open the Genesis tab"):
+            await _connect(mock_br)
+        tab.close.assert_awaited_once()
+        assert browser._remote_target_id is None
+        assert browser._remote_browser is None
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_target_lookup_closes_the_new_tab(self):
+        mock_br = _mock_remote_browser(pages=[_cdp_page("https://mail.example", "USER")])
+        tab = _cdp_page("about:blank", "unused")
+        tab.context.new_cdp_session = AsyncMock(side_effect=_hang)
+        mock_br.contexts[0].new_page = AsyncMock(return_value=tab)
+        result = await _connect(mock_br, timeout_s=0.2)
+        assert "timed out" in result["error"]
+        tab.close.assert_awaited_once()
+        assert browser._remote_target_id is None
+        assert browser._remote_browser is None
+
+    @pytest.mark.asyncio
+    async def test_a_second_cancel_does_not_cut_the_tab_close_short(self):
+        """The close of an unidentified tab is shielded: a second cancel
+        arriving while it runs must not abandon it half done."""
+        closing, closed = asyncio.Event(), asyncio.Event()
+
+        async def slow_close():
+            closing.set()
+            await asyncio.sleep(0.05)
+            closed.set()
+
+        tab = _cdp_page("about:blank", "unused")
+        tab.close = AsyncMock(side_effect=slow_close)
+        tab.context.new_cdp_session = AsyncMock(side_effect=_hang)
+        mock_br = _mock_remote_browser()
+        mock_br.contexts[0].new_page = AsyncMock(return_value=tab)
+
+        task = asyncio.create_task(browser._genesis_remote_tab(mock_br))
+        await asyncio.sleep(0.02)
+        task.cancel()
+        await asyncio.wait_for(closing.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(closed.wait(), 1)
+
+    @pytest.mark.asyncio
+    async def test_tab_opens_beside_tabs_of_any_scheme_not_in_an_empty_context(self):
+        """Round 1 (Devin): a window holding only file:// tabs is still the
+        user's; an empty context ahead of it may be off-screen."""
+        empty_ctx = MagicMock()
+        empty_ctx.pages = []
+        empty_ctx.new_page = AsyncMock()
+        new_browser = _mock_remote_browser(pages=[_cdp_page("file:///tmp/report.html", "USER")])
+        new_browser.contexts = [empty_ctx, new_browser.contexts[0]]
+        genesis_tab = _cdp_page("about:blank", "GEN-3")
+        new_browser.contexts[1].new_page = AsyncMock(return_value=genesis_tab)
+
+        result = await _connect(new_browser)
+
+        assert result is genesis_tab
+        empty_ctx.new_page.assert_not_awaited()
 
 
 def _ss_line(pid, name="x11vnc", v6=False):

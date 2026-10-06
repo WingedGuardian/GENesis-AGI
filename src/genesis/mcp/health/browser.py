@@ -429,6 +429,12 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
                 "  2. Tailscale is connected on both machines\n"
                 "  3. Windows firewall allows port 9222 from Tailscale"
             ) from e
+        except BaseException:
+            # Cancelled mid-connect (the tool timeout, a client cancel): stop
+            # this driver, or the next call starts another and this one leaks.
+            await asyncio.shield(_remote_pw.stop())
+            _remote_pw = None
+            raise
 
         _remote_cdp_url = url
         _remote_browser.on("disconnected", lambda: _on_remote_disconnected())
@@ -461,8 +467,8 @@ async def _cdp_target_id(page) -> str | None:
                 await session.detach()
         return info["targetInfo"]["targetId"]
     except Exception:
-        # Warning, not debug: a None here means the Genesis tab cannot be found
-        # again, so every reconnect would silently open another tab.
+        # Warning, not debug: on a reconnect probe a None means this tab cannot
+        # be matched, so if it was the Genesis tab another one gets opened.
         logger.warning("Could not read the CDP target id of a remote tab", exc_info=True)
         return None
 
@@ -473,9 +479,12 @@ async def _genesis_remote_tab(remote_browser):
     One Genesis tab per session (owner ruling): the user's tabs are never
     navigated. A tab opened earlier is found again by its CDP target id and
     reused; if the user closed it, a new one is opened. Genesis never closes
-    it: the user may still be reading it.
+    it: the user may still be reading it. The one exception is a tab just
+    opened whose target id cannot be read (or whose lookup is cancelled): it
+    could never be found again, so each reconnect would open another, and it
+    is still blank. It is closed and the connect fails.
 
-    The tab opens in the context that already holds the user's visible tabs.
+    The tab opens in the context that already holds the user's tabs.
     ``browser.new_context()`` is the last resort only, because over CDP its
     pages render in an invisible off-screen window.
     """
@@ -491,16 +500,18 @@ async def _genesis_remote_tab(remote_browser):
                     logger.info("CDP remote connected, reusing the Genesis tab: %s", pg.url)
                     return pg
 
-    home = next(
-        (
-            ctx for ctx in contexts
-            if any(
-                pg.url.startswith(("chrome://", "about:", "http://", "https://"))
-                for pg in ctx.pages
-            )
-        ),
-        contexts[0] if contexts else None,
-    )
+    def _rank(ctx) -> int:
+        # A context showing an ordinary web or browser page first, then one
+        # with tabs of any scheme (file://, extension pages), and only then an
+        # empty one, which may be an off-screen window. min() keeps the first
+        # of equal rank. Defensive: the pinned Playwright files every
+        # pre-existing target under its default context, so at connect time
+        # there is normally only one.
+        if any(pg.url.startswith(("chrome://", "about:", "http://", "https://")) for pg in ctx.pages):
+            return 0
+        return 1 if ctx.pages else 2
+
+    home = min(contexts, key=_rank, default=None)
     if home is None:
         logger.warning(
             "Remote Chrome exposes no browser context; opening one, whose tab "
@@ -508,7 +519,22 @@ async def _genesis_remote_tab(remote_browser):
         )
         home = await remote_browser.new_context()
     page = await home.new_page()
-    _remote_target_id = await _cdp_target_id(page)
+    target_id = None
+    try:
+        target_id = await _cdp_target_id(page)
+    finally:
+        if target_id is None:
+            # Shielded so a cancellation cannot cut the close short.
+            try:
+                await asyncio.shield(page.close())
+            except Exception:
+                logger.warning("Could not close an unidentified remote tab", exc_info=True)
+    if target_id is None:
+        raise ConnectionError(
+            "opened a tab but could not read its CDP target id, so it could not "
+            "be found again; closed it"
+        )
+    _remote_target_id = target_id
     logger.info("CDP remote connected, opened a Genesis tab (target %s)", _remote_target_id)
     return page
 
@@ -2397,18 +2423,27 @@ async def _impl_browser_snapshot() -> dict:
         if health:
             return health
         page = _active_page
+    global _remote_last_url
     try:
         url_before = page.url
         snapshot = await _snapshot_page(page)
-        # Remote: the caller has now seen the current page, so it becomes the
+        result = {"url": page.url, "title": await page.title(), "snapshot": snapshot}
+        # Remote: the caller is about to see this page, so it becomes the
         # drift baseline. This is what the drift advisory's "call
-        # browser_snapshot()" recommendation relies on. Only a REAL snapshot
-        # counts (a timed-out or unavailable one showed the caller nothing),
-        # and only if the URL held still while it was taken: a navigation in
-        # between means the snapshot may describe the old page.
-        if not snapshot.startswith(_SNAPSHOT_PLACEHOLDERS) and page.url == url_before:
-            _update_remote_url()
-        return {"url": page.url, "title": await page.title(), "snapshot": snapshot}
+        # browser_snapshot()" recommendation relies on. It moves only once
+        # the whole response is built (a failure after this point would show
+        # the caller nothing), only for a REAL snapshot (a timed-out or
+        # unavailable one shows nothing), and only if the URL held still
+        # throughout: a navigation in between means the snapshot may describe
+        # the old page. The baseline is THIS page's URL, the one returned.
+        if (
+            _is_remote_active()
+            and page is _active_page
+            and not snapshot.startswith(_SNAPSHOT_PLACEHOLDERS)
+            and result["url"] == url_before
+        ):
+            _remote_last_url = result["url"]
+        return result
     except Exception as e:
         return {"error": f"Snapshot failed: {e}"}
 
