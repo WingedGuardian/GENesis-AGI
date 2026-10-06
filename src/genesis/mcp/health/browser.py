@@ -242,6 +242,52 @@ def _forget_layer(layer: BrowserLayer, page) -> None:
         _active_page = None
 
 
+# Closes of detached local layers still running (see _run_close), and the
+# window-closed reaps (_on_local_context_closed). Held here because the event
+# loop keeps only a weak reference to a task; async_cleanup waits for them, so
+# the MCP exit cannot end the process mid-close.
+_pending_closes: set[asyncio.Task] = set()
+
+
+async def _run_close(coro) -> None:
+    """Run a close that nothing else can find again, to completion.
+
+    Its caller has already detached the layer's globals (or never assigned
+    them), so if the caller is cancelled (the MCP exit cancelling an idle
+    reclaim, a tool timeout) no later cleanup could reach the resource. The
+    close therefore runs as one task, held in _pending_closes (the event loop
+    keeps only a weak reference to a task), which the caller awaits shielded;
+    a cancelled caller leaves it running and async_cleanup awaits it.
+    """
+    task = asyncio.ensure_future(coro)
+    _pending_closes.add(task)
+    task.add_done_callback(_pending_closes.discard)
+    await asyncio.shield(task)
+
+
+async def _close_step(aw, what: str) -> None:
+    """Await one close step with the user-approved 10 s cap; log, never raise."""
+    try:
+        await asyncio.wait_for(aw, timeout=10.0)
+    except TimeoutError:
+        logger.warning("%s timed out (10s) — it may be orphaned", what)
+    except Exception:
+        logger.debug("%s failed", what, exc_info=True)
+
+
+async def _close_camoufox(cm) -> None:
+    await _close_step(cm.__aexit__(None, None, None), "Camoufox cleanup")
+
+
+async def _close_chromium(ctx, pw) -> None:
+    # One task for both steps: the driver is stopped even when the caller is
+    # cancelled during the context close.
+    if ctx is not None:
+        await _close_step(ctx.close(), "Browser context close")
+    if pw is not None:
+        await _close_step(pw.stop(), "Playwright stop")
+
+
 async def _cleanup_camoufox() -> None:
     """Close Camoufox (layer 1) and its Playwright driver. Touches no other layer.
 
@@ -256,19 +302,12 @@ async def _cleanup_camoufox() -> None:
     _stealth_page = None
     _forget_layer(BrowserLayer.CAMOUFOX, page)
     if cm is not None:
-        try:
-            # Shielded: the globals are already detached, so a cancel here (the
-            # MCP exit cancelling an idle reclaim) must not abandon the close.
-            await asyncio.wait_for(asyncio.shield(cm.__aexit__(None, None, None)), timeout=10.0)
-        except TimeoutError:
-            logger.warning("Camoufox cleanup timed out (10s)")
-        except Exception:
-            logger.debug("Camoufox cleanup failed", exc_info=True)
+        await _run_close(_close_camoufox(cm))
 
 
 async def _cleanup_chromium() -> None:
     """Close the Chromium fallback (layer 2) and stop its driver. Touches no
-    other layer."""
+    other layer. Globals detached first, as in _cleanup_camoufox."""
     global _playwright, _context, _page
 
     pw, ctx, page = _playwright, _context, _page
@@ -276,20 +315,8 @@ async def _cleanup_chromium() -> None:
     _context = None
     _page = None
     _forget_layer(BrowserLayer.CHROMIUM, page)
-    if ctx is not None:
-        try:
-            await asyncio.wait_for(asyncio.shield(ctx.close()), timeout=10.0)  # see _cleanup_camoufox
-        except TimeoutError:
-            logger.warning("Browser context close timed out (10s)")
-        except Exception:
-            logger.debug("Browser context cleanup failed", exc_info=True)
-    if pw is not None:
-        try:
-            await asyncio.wait_for(asyncio.shield(pw.stop()), timeout=10.0)
-        except TimeoutError:
-            logger.warning("Playwright stop timed out (10s) — driver may be orphaned")
-        except Exception:
-            logger.debug("Playwright cleanup failed", exc_info=True)
+    if ctx is not None or pw is not None:
+        await _run_close(_close_chromium(ctx, pw))
 
 
 _LAYER_CLEANUP = {
@@ -321,7 +348,9 @@ def _on_local_context_closed(layer: BrowserLayer, ctx) -> None:
 
     from genesis.util.tasks import tracked_task
 
-    tracked_task(_reap(), name=f"browser-{layer.value}-closed")
+    task = tracked_task(_reap(), name=f"browser-{layer.value}-closed")
+    _pending_closes.add(task)  # retained, and drained by async_cleanup
+    task.add_done_callback(_pending_closes.discard)
 
 
 async def async_cleanup():
@@ -355,6 +384,11 @@ async def async_cleanup():
     await _cleanup_tinyfish()
     await _cleanup_chromium()
     await _cleanup_camoufox()
+    # Closes a cancelled reclaim or launch left running: each step is capped
+    # at 10 s, so this wait is bounded.
+    # asyncio.wait, not gather: a cancelled gather cancels what it waits for.
+    if _pending_closes:
+        await asyncio.wait(set(_pending_closes))
     _layer_last_used.clear()
 
 
@@ -405,8 +439,7 @@ async def _ensure_browser():
         try:
             ctx = await cm.__aenter__()
         except BaseException:
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(cm.__aexit__(None, None, None), timeout=10.0)
+            await _run_close(_close_camoufox(cm))
             raise
         # With persistent_context, browser IS the context
         _stealth_cm, _stealth_browser = cm, ctx
@@ -453,8 +486,7 @@ async def _ensure_chromium_fallback():
         except BaseException:
             # Stop the driver this launch started; left running, the next
             # launch would start another and orphan this one.
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(pw.stop(), timeout=10.0)
+            await _run_close(_close_chromium(None, pw))
             raise
         _playwright, _context = pw, ctx
         ctx.on("close", lambda c: _on_local_context_closed(BrowserLayer.CHROMIUM, c))
@@ -2647,13 +2679,14 @@ async def _impl_browser_navigate(
 ) -> dict:
     """Navigate to a URL and return the page snapshot."""
     global _remote_last_url
-    # The layer this call uses, not the one it leaves: an abandoned layer's
-    # idle clock keeps running.
-    _touch(_requested_layer(stealth, remote, tinyfish))
     _ts_log.info("browser_navigate called: url=%s stealth=%s remote=%s tinyfish=%s", url, stealth, remote, tinyfish)
 
     if tinyfish and remote:
         return {"error": "Cannot use tinyfish and remote simultaneously — pick one."}
+    # The layer this call uses, not the one it leaves: an abandoned layer's
+    # idle clock keeps running. After the check above, so a rejected call
+    # keeps no layer (a paid TinyFish session above all) alive.
+    _touch(_requested_layer(stealth, remote, tinyfish))
 
     # No timing switch for remote CDP: _human_delay already uses collaborate
     # timing (0.5-2 s) whenever the remote page is active, whatever
