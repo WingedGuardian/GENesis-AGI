@@ -1299,18 +1299,31 @@ _fill_progress: contextvars.ContextVar = contextvars.ContextVar(
 # steps per character at about 0.24 s each), and still 60 times inside the
 # shortest default idle timeout (300 s).
 _FILL_PROGRESS_EVERY_S: float = 5.0
+# Each report awaits the client transport (fastmcp's report_progress awaits
+# session.send_progress_notification), so it gets its own bound: outside the
+# step's _FILL_STALL_S, a send that never returns would stall typing with it.
+# A healthy stdio send is a hand-off to the writer task and returns in
+# milliseconds, so 1 s is far beyond a slow-but-live send. Kept well under the
+# 5 s throttle: with a wedged transport every report times out, and the fill
+# then pauses at most 1 s per 5 s of typing, about as long as the thinking
+# pauses _human_type already inserts. A dropped report costs nothing while
+# any report in the client's idle window gets through, and the shortest
+# (300 s) holds 60 of them.
+_FILL_PROGRESS_SEND_S: float = 1.0
 
 
 class FillStalled(Exception):
     """A browser call inside browser_fill made no progress for _FILL_STALL_S."""
 
 
-async def _no_stall(awaitable, what: str):
+async def _no_stall(awaitable, what: str, *, report_progress: bool = True):
     """Await one browser call of a fill, failing if it stalls.
 
     A completed step is activity for BOTH idle watchdogs that could reclaim a
     fill with no overall deadline: this server's (_IDLE_TIMEOUT_S, via _touch)
-    and the MCP client's (via the _fill_progress reporter).
+    and the MCP client's (via the _fill_progress reporter). A key-down step
+    passes report_progress=False: a report can wait up to
+    _FILL_PROGRESS_SEND_S, which would stretch the key's hold.
     """
     try:
         result = await asyncio.wait_for(awaitable, timeout=_FILL_STALL_S)
@@ -1319,7 +1332,7 @@ async def _no_stall(awaitable, what: str):
             f"{what} made no progress for {_FILL_STALL_S:.0f}s"
         ) from None
     _touch()
-    report = _fill_progress.get()
+    report = _fill_progress.get() if report_progress else None
     if report is not None:
         await report(what)
     return result
@@ -1353,7 +1366,11 @@ async def _human_type(page, selector: str, value: str) -> None:
         # Hold phase: keydown → hold → keyup
         hold_s = random.lognormvariate(math.log(0.086), 0.35)
         hold_s = max(0.03, min(hold_s, 0.20))  # clamp 30-200ms
-        await _no_stall(page.keyboard.down(char), f"keystroke {i + 1} of {len(value)}")
+        await _no_stall(
+            page.keyboard.down(char),
+            f"keystroke {i + 1} of {len(value)}",
+            report_progress=False,
+        )
         await asyncio.sleep(hold_s)
         await _no_stall(page.keyboard.up(char), f"keystroke {i + 1} of {len(value)}")
         # Flight phase: gap to next key
@@ -2606,8 +2623,13 @@ async def browser_fill(selector: str, value: str, ctx: Context | None = None) ->
             return
         last_sent = time.monotonic()
         try:
-            await ctx.report_progress(steps, message=what)
+            await asyncio.wait_for(
+                ctx.report_progress(steps, message=what),
+                timeout=_FILL_PROGRESS_SEND_S,
+            )
         except Exception:  # best effort: a lost report must not fail typing
+            # TimeoutError included: wait_for has cancelled the send, and the
+            # next report retries in 5 s.
             if not report_failed:  # once per fill, not every 5 s after
                 logger.warning("browser_fill progress report failed", exc_info=True)
             report_failed = True

@@ -444,6 +444,78 @@ class TestFillKeepsTheClientAlive:
         assert len(logged) == 1, "a gone client is logged once per fill"
 
     @pytest.mark.asyncio
+    async def test_a_hung_progress_report_does_not_stall_the_fill(self, caplog):
+        """report_progress awaits the client transport. If that send never
+        returns, typing must not wait on it: each report has its own bound, a
+        timed-out one is cancelled and logged once, and the fill completes."""
+        _typing_page()
+        ctx = MagicMock()
+        attempts = {"n": 0, "cancelled": 0}
+
+        async def hang(*_a, **_k):
+            attempts["n"] += 1
+            try:
+                await asyncio.Event().wait()  # a send that never returns
+            except asyncio.CancelledError:
+                attempts["cancelled"] += 1
+                raise
+
+        ctx.report_progress = AsyncMock(side_effect=hang)
+        fn = getattr(browser.browser_fill, "fn", browser.browser_fill)
+        with (
+            patch.object(browser, "_FILL_PROGRESS_EVERY_S", 0.0),
+            patch.object(browser, "_FILL_PROGRESS_SEND_S", 0.05),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+            caplog.at_level("WARNING", logger=browser.logger.name),
+        ):
+            # Real-clock ceiling so an unbounded report fails here, not hangs.
+            result = await asyncio.wait_for(fn("#bio", "hi", ctx), timeout=5.0)
+        assert result.get("filled") == "#bio", result
+        assert attempts["n"] > 1, "a timed-out report must not end reporting"
+        assert attempts["cancelled"] == attempts["n"], "no send left running"
+        logged = [r for r in caplog.records if "progress report" in r.message]
+        assert len(logged) == 1, "a hung client is logged once per fill"
+
+    @pytest.mark.asyncio
+    async def test_progress_is_never_sent_while_a_key_is_held(self):
+        """A report can wait up to _FILL_PROGRESS_SEND_S. Sent between key down
+        and key up, that wait would stretch the key's hold far past the 0.2 s
+        clamp; it belongs in the gap between keys."""
+        page, _calls = _typing_page()
+        held = {"down": False}
+        sent_while_held = []
+
+        async def down(_char):
+            held["down"] = True
+
+        async def up(_char):
+            held["down"] = False
+
+        page.keyboard.down = AsyncMock(side_effect=down)
+        page.keyboard.up = AsyncMock(side_effect=up)
+        ctx = MagicMock()
+
+        async def report_progress(*_a, **_k):
+            sent_while_held.append(held["down"])
+
+        ctx.report_progress = AsyncMock(side_effect=report_progress)
+        fn = getattr(browser.browser_fill, "fn", browser.browser_fill)
+        with (
+            patch.object(browser, "_FILL_PROGRESS_EVERY_S", 0.0),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            result = await fn("#bio", "abc", ctx)
+        assert result.get("filled") == "#bio", result
+        assert sent_while_held, "no progress was reported at all"
+        assert not any(sent_while_held), sent_while_held
+
+    def test_the_progress_send_bound_is_the_justified_value(self):
+        assert browser._FILL_PROGRESS_SEND_S == 1.0
+        assert browser._FILL_PROGRESS_SEND_S < browser._FILL_PROGRESS_EVERY_S
+
+    @pytest.mark.asyncio
     async def test_the_reporter_is_scoped_to_the_tool_call(self):
         """After the tool returns, a direct caller of _impl_browser_fill (no
         MCP client) reports nothing to the finished call's client."""
