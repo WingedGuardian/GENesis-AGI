@@ -175,7 +175,8 @@ def test_ordinary_exception_is_deny_not_exit_one(adapter, monkeypatch, capsys):
     monkeypatch.setattr(adapter, "decide", lambda _: 1 / 0)
     monkeypatch.setattr(adapter.sys, "stdin", __import__("io").StringIO("{}"))
     assert adapter.main() == 2
-    assert not capsys.readouterr().out
+    # Only the explicit deny signal: never an allow, never ask JSON.
+    assert capsys.readouterr().out == "deny\n"
 
 
 @pytest.mark.parametrize("poisoned", [
@@ -289,3 +290,249 @@ def test_optional_signing_key_cannot_hide_mode_reversal(adapter, monkeypatch, si
     monkeypatch.setattr(adapter.commits, "_branch_review_budget", lambda *a, **kw: {"status": "unknown"})
     command = "git commit " + modes.format(signing=signing) + " -m probe"
     assert bool(adapter.decide(payload(command))) == blocked
+# ── Deny messages: a deny is not a broken guard, and a fixable deny is not a STOP ──
+
+
+def _config_command():
+    import tomllib
+
+    config = tomllib.loads((ROOT / ".codex" / "config.toml").read_text())
+    return config["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+
+
+def _repo_with_launcher(tmp_path, body):
+    """A git checkout whose launcher is a stub script with ``body``."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    hooks = tmp_path / "scripts" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "codex-review-stop").write_text("#!/bin/bash\n" + body + "\n")
+    return tmp_path
+
+
+def _run_config(cwd):
+    return subprocess.run(
+        ["bash", "-c", _config_command()],
+        cwd=cwd,
+        input="{}",
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+
+def test_config_deny_does_not_claim_the_guard_is_unavailable(tmp_path):
+    """MEASURED on a live install: every adapter deny (6 of 6) also printed
+    'review guard unavailable', so Codex sessions reported the guard as broken."""
+    repo = _repo_with_launcher(tmp_path, 'echo "BLOCKED: probe reason" >&2; echo deny >&3; exit 2')
+    run = _run_config(repo)
+    assert run.returncode == 2
+    assert "BLOCKED: probe reason" in run.stderr
+    assert "unavailable" not in run.stderr
+
+
+@pytest.mark.parametrize("missing", ["no-repo", "no-launcher"])
+def test_config_reports_unavailable_only_when_the_launcher_cannot_be_found(tmp_path, missing):
+    if missing == "no-launcher":
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    run = _run_config(tmp_path)
+    assert run.returncode == 2
+    assert "review guard unavailable" in run.stderr
+
+
+@pytest.mark.parametrize("code", [1, 3, 126])
+def test_config_turns_any_other_launcher_failure_into_a_deny(tmp_path, code):
+    """Codex continues after an ordinary hook failure, so only 0 may pass."""
+    repo = _repo_with_launcher(tmp_path, f"exit {code}")
+    assert _run_config(repo).returncode == 2
+
+
+def test_config_allow_passes(tmp_path):
+    repo = _repo_with_launcher(tmp_path, "exit 0")
+    assert _run_config(repo).returncode == 0
+
+
+def test_launcher_adds_no_second_stop_to_an_explained_deny(tmp_path):
+    launcher = tmp_path / "codex-review-stop"
+    launcher.write_bytes((HOOKS / "codex-review-stop").read_bytes())
+    (tmp_path / "codex_review_stop.py").write_text(
+        "import sys\nprint('deny')\nprint('BLOCKED: explained', file=sys.stderr)\nsys.exit(2)\n"
+    )
+    run = subprocess.run(["bash", str(launcher)], input="{}", text=True, capture_output=True)
+    assert run.returncode == 2
+    assert run.stderr.strip() == "BLOCKED: explained"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git add -A && git commit -m x",
+        'git commit -m x && gh pr comment 1 --body "@codex review"',
+        "cat > f <<'EOF'\nit's the git commit text\nEOF",
+    ],
+)
+def test_self_fixable_denials_say_retry_not_stop(adapter, monkeypatch, capsys, command):
+    """These are the shapes Codex hit: a commit chained after another step, and a
+    heredoc the parser cannot read. The agent can rewrite either and run it again."""
+    monkeypatch.setattr(
+        adapter.commits, "_branch_review_budget", lambda *a, **kw: pytest.fail("lookup")
+    )
+    monkeypatch.setattr(
+        adapter.sys, "stdin", __import__("io").StringIO(json.dumps(payload(command)))
+    )
+    assert isinstance(adapter.decide(payload(command)), adapter.Fixable)
+    assert adapter.main() == 2
+    err = capsys.readouterr().err
+    assert "run it again" in err
+    assert "STOP" not in err
+
+
+def test_literal_target_with_unsupported_global_option_is_fixable(adapter, monkeypatch):
+    monkeypatch.setattr(
+        adapter.commits, "_branch_review_budget", lambda *a, **kw: pytest.fail("lookup")
+    )
+    assert isinstance(adapter.decide(payload("git -c x=y commit -m x")), adapter.Fixable)
+
+
+@pytest.mark.parametrize("setup", ["budget", "request", "payload"])
+def test_approval_and_evidence_denials_still_stop(adapter, monkeypatch, capsys, setup):
+    if setup == "budget":
+        monkeypatch.setattr(
+            adapter.commits,
+            "_branch_review_budget",
+            lambda *a, **kw: {"status": "ok", "commit_approval_required": True},
+        )
+        data = payload('git commit -m "test"')
+    elif setup == "request":
+        monkeypatch.setattr(
+            adapter.requests, "_check_codex_round_escalation", lambda *a: ("ask", "limit")
+        )
+        data = payload('gh pr comment 1 --body "@codex review"')
+    else:
+        data = {"tool_name": "other"}
+    reason = adapter.decide(data)
+    assert reason and not isinstance(reason, adapter.Fixable)
+    monkeypatch.setattr(adapter.sys, "stdin", __import__("io").StringIO(json.dumps(data)))
+    assert adapter.main() == 2
+    assert "STOP and handoff" in capsys.readouterr().err
+
+
+def test_launcher_explains_a_missing_evaluator(tmp_path):
+    """Review finding: python3 exits 2 for a missing script too, with nothing on
+    stdout, which the launcher must not take for an explained deny."""
+    launcher = tmp_path / "codex-review-stop"
+    launcher.write_bytes((HOOKS / "codex-review-stop").read_bytes())
+    run = subprocess.run(["bash", str(launcher)], input="{}", text=True, capture_output=True)
+    assert run.returncode == 2
+    assert "Stop and handoff" in run.stderr
+
+
+@pytest.mark.parametrize("stub", [
+    "import sys\nsys.exit(2)\n",  # exit 2 with no deny signal
+    "import sys\nprint('BLOCKED: x', file=sys.stderr)\nsys.exit(2)\n",
+])
+def test_launcher_requires_the_deny_signal_to_stay_silent(tmp_path, stub):
+    launcher = tmp_path / "codex-review-stop"
+    launcher.write_bytes((HOOKS / "codex-review-stop").read_bytes())
+    (tmp_path / "codex_review_stop.py").write_text(stub)
+    run = subprocess.run(["bash", str(launcher)], input="{}", text=True, capture_output=True)
+    assert run.returncode == 2
+    assert "Stop and handoff" in run.stderr
+
+
+@pytest.mark.parametrize("code", [1, 3, 126])
+def test_config_explains_any_other_launcher_failure(tmp_path, code):
+    """Review finding: a silent non-0/non-2 exit gave a deny with no message."""
+    repo = _repo_with_launcher(tmp_path, f"exit {code}")
+    run = _run_config(repo)
+    assert run.returncode == 2
+    assert f"review guard failed (exit {code})" in run.stderr
+
+
+def test_the_real_chain_explains_every_deny_once(tmp_path):
+    """The real evaluator, launcher and config: one explanation, no second line."""
+    hooks = tmp_path / "scripts" / "hooks"
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    hooks.mkdir(parents=True)
+    for name in ("codex-review-stop", "codex_review_stop.py"):
+        (hooks / name).write_bytes((HOOKS / name).read_bytes())
+    for dep in HOOKS.glob("*.py"):
+        if not (hooks / dep.name).exists():
+            (hooks / dep.name).symlink_to(dep)
+    for dep in (ROOT / "scripts").glob("*.py"):
+        (tmp_path / "scripts" / dep.name).symlink_to(dep)
+    data = {"tool_name": "Bash", "cwd": str(tmp_path), "tool_input": {"command": "git add -A && git commit -m x"}}
+    run = subprocess.run(
+        ["bash", "-c", _config_command()], cwd=tmp_path, input=json.dumps(data),
+        text=True, capture_output=True, timeout=60,
+    )
+    assert run.returncode == 2
+    assert run.stdout == ""
+    assert run.stderr.count("BLOCKED") == 1
+    assert "run it again" in run.stderr
+
+
+@pytest.mark.parametrize("body", [
+    "exit 2",  # exit 2 with no deny signal
+    "if then fi",  # a launcher syntax error: bash itself exits 2
+])
+def test_config_explains_a_launcher_exit_2_without_the_deny_signal(tmp_path, body):
+    """Review finding (round 2): bash exits 2 on a launcher syntax error too, so
+    exit 2 alone must not pass silently."""
+    repo = _repo_with_launcher(tmp_path, body)
+    run = _run_config(repo)
+    assert run.returncode == 2
+    assert "review guard failed (exit 2)" in run.stderr
+
+
+def test_launcher_signals_every_explained_deny_on_fd3_only(tmp_path):
+    """The signal goes to fd 3, never stdout: Codex reads hook stdout, and output
+    there that is not a valid decision was measured to permit the action."""
+    launcher = tmp_path / "codex-review-stop"
+    launcher.write_bytes((HOOKS / "codex-review-stop").read_bytes())
+    for stub in (
+        "import sys\nprint('deny')\nprint('BLOCKED: x', file=sys.stderr)\nsys.exit(2)\n",
+        "raise RuntimeError('probe')\n",
+    ):
+        (tmp_path / "codex_review_stop.py").write_text(stub)
+        run = subprocess.run(
+            ["bash", "-c", f'exec 4>&1; sig=$(bash "{launcher}" 3>&1 1>&4); rc=$?; printf "%s|%s" "$rc" "$sig" >&2'],
+            input="{}", text=True, capture_output=True,
+        )
+        assert run.stdout == ""
+        assert run.stderr.endswith("2|deny")
+        direct = subprocess.run(["bash", str(launcher)], input="{}", text=True, capture_output=True)
+        assert (direct.returncode, direct.stdout) == (2, "")
+
+
+@pytest.mark.parametrize("shell", [["bash", "-e", "-c"], ["sh", "-e", "-c"]])
+@pytest.mark.parametrize("body", ["exit 1", "kill -TERM $$"])
+def test_config_denies_under_errexit(tmp_path, shell, body):
+    """Class audit finding: under errexit, `out=$(...); rc=$?` exited with the
+    launcher's own code (1, 143), which Codex reads as permit."""
+    repo = _repo_with_launcher(tmp_path, body)
+    run = subprocess.run([*shell, _config_command()], cwd=repo, input="{}", text=True,
+                         capture_output=True, timeout=10)
+    assert run.returncode == 2
+    assert "review guard failed" in run.stderr
+
+
+@pytest.mark.parametrize("shell", [["bash", "-e", "-c"], ["sh", "-e", "-c"]])
+@pytest.mark.parametrize("missing", ["no-repo", "no-launcher"])
+def test_config_denies_an_unfound_launcher_under_errexit(tmp_path, shell, missing):
+    """Codex round finding: `guard="$(git rev-parse ...)/..."` is an assignment, so
+    under errexit a failed lookup exited 128 there, which Codex reads as permit."""
+    if missing == "no-launcher":
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    run = subprocess.run([*shell, _config_command()], cwd=tmp_path, input="{}", text=True,
+                         capture_output=True, timeout=10)
+    assert run.returncode == 2
+    assert "review guard unavailable" in run.stderr
+
+
+def test_config_explained_deny_under_errexit_prints_once(tmp_path):
+    repo = _repo_with_launcher(tmp_path, 'echo "BLOCKED: probe" >&2; echo deny >&3; exit 2')
+    run = subprocess.run(["bash", "-e", "-c", _config_command()], cwd=repo, input="{}",
+                         text=True, capture_output=True, timeout=10)
+    assert run.returncode == 2
+    assert run.stderr.count("BLOCKED") == 1
+    assert run.stdout == ""

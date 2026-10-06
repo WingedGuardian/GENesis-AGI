@@ -160,6 +160,11 @@ class _InitDelegatesMixin:
 
         wire(self)
 
+    async def _init_board(self) -> None:
+        from genesis.runtime.init.board import init_board
+
+        await init_board(self)
+
     def _init_alert_drain(self) -> None:
         from genesis.runtime.init.alert_drain import wire
 
