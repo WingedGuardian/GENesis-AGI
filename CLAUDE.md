@@ -662,7 +662,7 @@ gate works, its exemption categories, and the unit rules for size bounds:
   3. Do the scope limits block the obvious shared code?
   4. Is the caller named and tracked (an issue), or is there a stated reason there is none?
   5. Does every number say how it was measured (what was counted, by which script)?
-  6. Is the PR shape stated: expected size in counted lines (`python3 scripts/pr_shape.py --base origin/main`), and a split or a `Shape:` reason at 500 or more? The rule (`.claude/docs/premise-check.md`, step 6): under 500 is the target, 500-1,000 carries a `Shape:` reason, and over 1,000 needs owner approval. It is a guideline the session weighs; from 500 to 1,000 a stated reason is enough. Prefer one concern per PR (one mechanism a reviewer can accept or reject alone).
+  6. Is the PR shape stated: expected size in counted lines (`python3 scripts/pr_shape.py --base origin/main`), and a split, a `Shape:` reason at 500 to 1,000, or the owner's approval over 1,000? The rule (`.claude/docs/premise-check.md`, step 6): under 500 is the target, 500-1,000 carries a `Shape:` reason, and over 1,000 needs owner approval. It is a guideline the session weighs; from 500 to 1,000 a stated reason is enough. Prefer one concern per PR (one mechanism a reviewer can accept or reject alone).
 - **Rework is a contract with two sides.** A send-back's spec is
   decision-complete: what is kept, what is deleted, the shape, the split plan,
   and every question either answered or explicitly delegated. It never ends in

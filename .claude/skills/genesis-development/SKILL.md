@@ -4003,7 +4003,8 @@ that takes up the rework is the reviving session above, and it owns the followin
    acknowledgement means nobody can tell whether the spec was read at all.
 1. **New PRs, by default.** The rework arrives as one or more NEW PRs, with fresh
    round counts. When the LAST one opens, whoever opened it closes the old PR
-   with a comment that maps every part of it, file by file, to the replacement
+   with a comment that maps every part of it, file by file, to the `file:line`
+   in the replacement
    that covers it, or says why that part is moot. If any part is neither,
    leave the old PR open with a comment naming that part. Leave its labels on,
    so the rebuild stays traceable to it. If the spec carries a

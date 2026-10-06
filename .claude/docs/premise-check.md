@@ -17,7 +17,7 @@ Every plan and every issue that specifies work answers six questions:
 3. Do the scope limits block the obvious shared code?
 4. Is the caller named and tracked (an issue), or is there a stated reason there is none?
 5. Does every number say how it was measured (what was counted, by which script)?
-6. Is the PR shape stated: the expected size in counted lines, and either a split into one-concern PRs or a `Shape:` reason when it will reach 500 or more? (The size rule and its bands: step 6 of "The method" below.)
+6. Is the PR shape stated: the expected size in counted lines, and either a split into one-concern PRs, a `Shape:` reason when it will reach 500 to 1,000, or the owner's approval of the shape when it will exceed 1,000? (The size rule and its bands: step 6 of "The method" below.)
 
 The answers belong in the plan or issue body, not in a reviewer's first round.
 
@@ -168,8 +168,9 @@ rather than left to judgement:
 ## Handing a verdict to a builder: the rework spec
 
 When a check leads to a send-back, the verdict becomes a SPEC, posted as a
-maintainer comment headed `## Rework spec` (on a Devin-built PR, the line after
-`(aside)`), that another session,
+maintainer comment headed `## Rework spec` (on a Devin-built PR, whether it
+carries `(aside)` follows the `(aside)` table in closing-session, "Devin-built
+PRs": a spec Devin is to build never does), that another session,
 often Codex or Devin on another machine, builds from cold. Everything that spec
 leaves out, the builder decides alone, and a reviewer later cannot tell a
 misreading from a real complication. So the spec is decision-complete:

@@ -551,14 +551,15 @@ Leave it OPEN (genesis-development, "Never RETIRE a PR you are not the one
 reviving"). A rework comes back as FRESH PR(s) with new numbers, so each
 one's round count is its own (owner rulings 2026-09-24 and 2026-10-05). The
 BUILD session closes the old PR when the LAST replacement opens. Its closing
-comment maps every part of the old PR, file by file, to the replacement that
-covers it, or says why that part is moot. If any part is neither, the builder
+comment walks every part of the old PR, file by file, naming the `file:line` in
+a replacement (or on `main`) that now covers it, or saying why that part is
+moot (genesis-development's superseded-PR exception, condition 3). If any part is neither, the builder
 leaves the old PR open with a comment naming that part. The old PR keeps its
 label, so the rebuild stays traceable to it. A Devin builder never closes the
 old PR: the closing session does, after the same check ("Devin-built PRs"
 below). Those rulings are the on-record owner authorization (condition 1 of
 genesis-development's superseded-PR exception); condition 2 is the open
-replacement, and condition 3 is the per-file coverage mapping.
+replacement, and condition 3 is that `file:line` coverage walk.
 
 The closing session verifies the mapping against the replacements' diffs.
 When it holds, leave the follow-up alone: the `Follow-up:` line in the
@@ -645,8 +646,10 @@ happened already. Before requesting or answering any further review:
    `genesis-architect`, following `.claude/docs/premise-check.md`: premises with
    evidence, the effect question, the comparative question (an existing chokepoint
    the change duplicates or bypasses), the six plan-time questions (the sixth is
-   PR shape), then BLOCKER / SHOULD-FIX / NOTE findings and a decision-complete
-   rework spec (premise-check.md, "Handing a verdict to a builder"). Hand it the PR
+   PR shape), then BLOCKER / SHOULD-FIX / NOTE findings and, for a SOUND or
+   SOUND-BUT-INFERIOR verdict, a decision-complete rework spec (premise-check.md,
+   "Handing a verdict to a builder"). For BROKEN it states the design question
+   for the owner instead: the owner decides the mechanism and the split. Hand it the PR
    number AND the expected head SHA, and have it fetch that head
    (`git fetch origin pull/<N>/head:<ref>`) and confirm the match before
    reading anything; an auditor pointed at a stale or main checkout audits the

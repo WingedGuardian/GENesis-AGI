@@ -50,6 +50,7 @@ not build it. When you build a rework:
   `gh pr comment` can be refused on a PR past its review limit.
 - **Open NEW PRs** with fresh round counts. When the last one opens, close the
   old PR with a comment that maps every part of it, file by file, to the
+  `file:line` in a
   replacement covering it (or says why that part is moot), and leave its labels
   on. If any part is neither, leave the old PR open and name that part on it.
   If the spec ends with a `Follow-up: <id>` line, copy that line into the body
