@@ -224,13 +224,24 @@ async def knowledge_upload_cancel(upload_id: str):
     if upload["status"] == "processing":
         return jsonify({"error": "Cannot cancel — ingestion in progress"}), 409
 
-    # Remove file from disk
+    # The path was written under _UPLOAD_DIR at upload time; re-check at delete
+    # time so a corrupted or migrated row can't point the unlink elsewhere.
     file_path = Path(upload["file_path"])
+    upload_root = _UPLOAD_DIR.resolve()
+    if not file_path.resolve().is_relative_to(upload_root):
+        logger.error(
+            "Refusing to cancel upload %s: stored path %s is outside %s",
+            upload_id, file_path, upload_root,
+        )
+        return jsonify({"error": "Stored file path is outside the upload directory"}), 409
+
+    # Remove file from disk
     if file_path.exists():
         file_path.unlink()
-    # Clean up empty parent directory
-    if file_path.parent.exists() and not any(file_path.parent.iterdir()):
-        file_path.parent.rmdir()
+    # Clean up empty parent directory (never the upload root itself)
+    parent = file_path.parent
+    if parent.resolve() != upload_root and parent.exists() and not any(parent.iterdir()):
+        parent.rmdir()
 
     await knowledge_uploads.delete(rt.db, upload_id)
     return jsonify({"status": "ok"})
