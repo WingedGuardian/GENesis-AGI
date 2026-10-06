@@ -13,9 +13,10 @@
 #     pause is accepted. The lib does not arm traps itself: a trap is one global
 #     slot per signal, and only the caller knows what else it must compose with.
 #   - a caller holding the deploy lock on a fd keeps its number in
-#     _UPDATE_LOCK_FD (that exact name); the renewer is launched with that fd
-#     CLOSED, because a background process that inherits it keeps the lock after
-#     the caller exits. A lock fd held under any other name is not closed.
+#     _UPDATE_LOCK_FD, and the checkout lock in GENESIS_CHECKOUT_LOCK_FD
+#     (scripts/lib/checkout_lock.sh); the renewer is launched with both CLOSED,
+#     because a background process that inherits one keeps that lock after the
+#     caller exits. A lock fd held under any other name is not closed.
 #
 # GUARDIAN_PAUSE_TTL and GUARDIAN_PAUSE_RENEW_MAX are plain assignments on purpose:
 # a caller derives its health window from them (update.sh's HEALTH_GUARDIAN_COVER),
@@ -129,11 +130,13 @@ _guardian_pause() {
         _GUARDIAN_PARENT_PID="$$"
         _GUARDIAN_PARENT_START="$(_guardian_proc_start "$$" || true)"
         _GUARDIAN_PARENT_START="${_GUARDIAN_PARENT_START#* }"
-        if [ -n "${_UPDATE_LOCK_FD:-}" ]; then
-            _guardian_renew_loop {_UPDATE_LOCK_FD}>&- >/dev/null 2>&1 &
-        else
-            _guardian_renew_loop >/dev/null 2>&1 &
-        fi
+        # The checkout-lock FD (scripts/lib/checkout_lock.sh) is closed the same
+        # way: inherited, it would block every Claude launch while the sleep lives.
+        (
+            if [ -n "${_UPDATE_LOCK_FD:-}" ]; then exec {_UPDATE_LOCK_FD}>&-; fi
+            if [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ]; then exec {GENESIS_CHECKOUT_LOCK_FD}>&-; fi
+            _guardian_renew_loop
+        ) >/dev/null 2>&1 &
         _GUARDIAN_RENEW_PID=$!
     else
         echo "  WARNING: guardian pause not accepted (old gateway or host unreachable) — proceeding unpaused" >&2

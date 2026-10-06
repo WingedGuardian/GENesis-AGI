@@ -1104,8 +1104,14 @@ _start_genesis_server() {
     # update.sh, and an inherited lock FD would keep the advisory lock held after
     # we exit — deadlocking every future update until this degraded server dies.
     # (systemd-started servers don't inherit our FDs; only this nohup path does.)
-    nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
-        {_UPDATE_LOCK_FD}>&- >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
+    # The checkout-lock FD too, closed in the child's own subshell: it is unset
+    # when the lock is not held, and a `{var}>&-` on an unset name fails the
+    # command. The subshell execs, so $! is the server's pid.
+    (
+        if [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ]; then exec {GENESIS_CHECKOUT_LOCK_FD}>&-; fi
+        exec nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
+            {_UPDATE_LOCK_FD}>&-
+    ) >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
     # No unit tracks this process, so the no-change path's health probe waits on
     # this pid instead of the unit's state.
     _SERVER_DIRECT_PID=$!

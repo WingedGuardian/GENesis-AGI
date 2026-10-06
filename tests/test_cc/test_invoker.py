@@ -7043,6 +7043,32 @@ async def test_a_launch_waiting_for_checkout_admission_is_listed_in_flight(
     assert seen and "claude" in seen[0]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_the_roster_read_happens_under_checkout_admission(invoker, monkeypatch, streaming):
+    """The roster read and the network preflight read checkout files, so a
+    checkout mutation must not start between them and the spawn: admission is
+    taken before the roster read and released once, after the spawn."""
+    import genesis.cc.invoker as inv_mod
+
+    events = _track_checkout_admission(monkeypatch, invoker, streaming=streaming)
+    real_apply = inv_mod.roster.apply_active
+
+    def apply_active(inv):
+        events.append("roster")
+        return real_apply(inv)
+
+    monkeypatch.setattr(inv_mod.roster, "apply_active", apply_active)
+    if streaming:
+        await invoker.run_streaming(CCInvocation(prompt="hello"))
+    else:
+        await invoker.run(CCInvocation(prompt="hello"))
+    assert events.index("admit") < events.index("roster") < events.index("probe")
+    assert events.count("admit") == 1
+    assert events.count("release") == 1
+    assert events.index("spawn") + 1 == events.index("release")
+
+
 def test_verify_checks_the_settings_file_built_from_the_launch_pins(invoker, monkeypatch):
     """The binding check must read the file built from the SAME pins the
     launch used, not recompute them (a recomputation can hash to another file)."""

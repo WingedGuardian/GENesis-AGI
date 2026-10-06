@@ -2887,23 +2887,40 @@ class CCInvoker:
         untouched and emits nothing. Roster routing is resolved HERE (it never
         raises) so the failure event names the routed model, not only the
         requested tier.
-        """
-        invocation, roster_model = roster.apply_active(invocation)
-        try:
-            # Registered for the whole call: a restart now would cancel it
-            # (genesis.util.inflight; a no-op inside a caller's open unit).
-            with inflight("claude", _inflight_label(invocation)):
-                return await self._run_traced(invocation, roster_model)
-        except CCError as exc:
-            await _emit_invocation_failed_event(
-                exc,
-                invocation,
-                streaming=False,
-                roster_model=roster_model,
-            )
-            raise
 
-    async def _run_traced(self, invocation: CCInvocation, roster_model: str) -> CCOutput:
+        Checkout admission is taken before the roster read: that read and the
+        network preflight read checkout files too, so a checkout mutation must
+        not start between them and the spawn. The launch is registered in flight
+        before it waits, so a deploy's session scan sees it (the label does not
+        depend on roster routing, which never changes ``model``). The spawn path
+        releases admission once the subprocess exists; the ``finally`` covers
+        every path that never spawns.
+        """
+        # Registered for the whole call: a restart now would cancel it
+        # (genesis.util.inflight; a no-op inside a caller's open unit).
+        with inflight("claude", _inflight_label(invocation)):
+            admission = await admit_launch()
+            try:
+                invocation, roster_model = roster.apply_active(invocation)
+                try:
+                    return await self._run_traced(invocation, roster_model, admission)
+                except CCError as exc:
+                    await _emit_invocation_failed_event(
+                        exc,
+                        invocation,
+                        streaming=False,
+                        roster_model=roster_model,
+                    )
+                    raise
+            finally:
+                admission.release()
+
+    async def _run_traced(
+        self,
+        invocation: CCInvocation,
+        roster_model: str,
+        admission: CheckoutAdmission | None = None,
+    ) -> CCOutput:
         """Run an already-roster-routed CC session (traced).
 
         Opens a ``cc.session`` span spanning the whole subprocess lifetime so
@@ -2924,7 +2941,7 @@ class CCInvoker:
             },
         ) as span:
             output = replace(
-                await self._run_inner(invocation),
+                await self._run_inner(invocation, admission),
                 roster_model=roster_model,
             )
             with contextlib.suppress(Exception):
@@ -2978,8 +2995,11 @@ class CCInvoker:
             logger.debug("login fallback check failed", exc_info=True)
         return env
 
-    async def _run_inner(self, invocation: CCInvocation) -> CCOutput:
-        admission = await admit_launch()
+    async def _run_inner(
+        self, invocation: CCInvocation, admission: CheckoutAdmission | None = None
+    ) -> CCOutput:
+        if admission is None:
+            admission = await admit_launch()
         try:
             return await self._run_inner_with_admission(invocation, admission)
         finally:
@@ -3159,25 +3179,35 @@ class CCInvoker:
         invocation: CCInvocation,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
     ) -> CCOutput:
-        """Run CC with stream-json output; emit-then-reraise on CCError (see run())."""
-        invocation, roster_model = roster.apply_active(invocation)
-        try:
-            with inflight("claude", _inflight_label(invocation)):
-                return await self._run_streaming_traced(invocation, roster_model, on_event)
-        except CCError as exc:
-            await _emit_invocation_failed_event(
-                exc,
-                invocation,
-                streaming=True,
-                roster_model=roster_model,
-            )
-            raise
+        """Run CC with stream-json output; emit-then-reraise on CCError (see run()).
+
+        In flight first, then checkout admission, then the roster read, as in run().
+        """
+        with inflight("claude", _inflight_label(invocation)):
+            admission = await admit_launch()
+            try:
+                invocation, roster_model = roster.apply_active(invocation)
+                try:
+                    return await self._run_streaming_traced(
+                        invocation, roster_model, on_event, admission
+                    )
+                except CCError as exc:
+                    await _emit_invocation_failed_event(
+                        exc,
+                        invocation,
+                        streaming=True,
+                        roster_model=roster_model,
+                    )
+                    raise
+            finally:
+                admission.release()
 
     async def _run_streaming_traced(
         self,
         invocation: CCInvocation,
         roster_model: str,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
+        admission: CheckoutAdmission | None = None,
     ) -> CCOutput:
         """Run an already-roster-routed stream-json session (traced — see _run_traced)."""
         await self._network_preflight(invocation)
@@ -3192,7 +3222,7 @@ class CCInvoker:
             },
         ) as span:
             output = replace(
-                await self._run_streaming_inner(invocation, on_event),
+                await self._run_streaming_inner(invocation, on_event, admission),
                 roster_model=roster_model,
             )
             with contextlib.suppress(Exception):
@@ -3208,13 +3238,13 @@ class CCInvoker:
         self,
         invocation: CCInvocation,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
+        admission: CheckoutAdmission | None = None,
     ) -> CCOutput:
         """Run CC with stream-json output, calling on_event for each line."""
-        admission = await admit_launch()
+        if admission is None:
+            admission = await admit_launch()
         try:
-            return await self._run_streaming_inner_with_admission(
-                invocation, on_event, admission
-            )
+            return await self._run_streaming_inner_with_admission(invocation, on_event, admission)
         finally:
             admission.release()
 
