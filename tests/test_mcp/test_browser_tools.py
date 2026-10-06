@@ -6,6 +6,7 @@ import asyncio
 import importlib.util
 import re
 import signal
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -497,10 +498,13 @@ async def _connect(remote_browser, mock_pw=None, timeout_s=None):
     if mock_pw is None:
         mock_pw = AsyncMock()
         mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=remote_browser)
-    with patch("playwright.async_api.async_playwright") as mock_apw:
-        mock_starter = AsyncMock()
-        mock_starter.start = AsyncMock(return_value=mock_pw)
-        mock_apw.return_value = mock_starter
+    mock_starter = AsyncMock()
+    mock_starter.start = AsyncMock(return_value=mock_pw)
+    # A stub module, not patch("playwright.async_api..."): CI does not install
+    # playwright, and patching by dotted path imports the real package first.
+    api = MagicMock()
+    api.async_playwright = MagicMock(return_value=mock_starter)
+    with patch.dict(sys.modules, {"playwright": MagicMock(async_api=api), "playwright.async_api": api}):
         coro = browser._ensure_remote_cdp("http://100.1.2.3:9222")
         if timeout_s is None:
             return await coro
