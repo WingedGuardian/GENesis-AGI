@@ -10,7 +10,7 @@ both halves -- the leak happens, and nothing sweeps that directory
 sweeps only `~/.genesis/cc-tmp`. Neither covers the `~/.genesis` root).
 
 WHY A GUARD AND NOT JUST FIXES. MEASURED 2026-09-09 against the merge of this
-tree (re-derived 2026-10-03): 69 atomic-write sites across 61 files, 30 of them dirty.
+tree (re-derived 2026-10-06): 70 atomic-write sites across 62 files, 30 of them dirty.
 That denominator moved FOUR times, in both directions, and every move is worth
 recording because each was invisible in a different way:
   * +1 site (58 -> 59). The temp-name test was anchored to the END of a string
@@ -48,6 +48,11 @@ recording because each was invisible in a different way:
     every time a PR adding sites is open while main re-measures, and it is the
     merge -- not either parent -- that has to be measured. Found by the audit of
     that merge, not by the merge itself.
+  * +1 site (69 -> 70, dirty unchanged at 30). The browser-stack provisioner's
+    `provision.refresh_capability` (mkstemp, os.replace, unlink on failure),
+    CLEANS_UP. A directory temp built with `tempfile.TemporaryDirectory` and
+    renamed out of it produces no row at all (that maker is outside the temp
+    set), so its cleanup rests on the context manager, not on this guard.
 Fixing 30 instances of a recurring pattern leaves nothing to stop instance 31.
 This is the prose-to-gate move: the rule was "clean up your temp", carried by
 convention, and conventions are what reviewers find one instance of at a time.
