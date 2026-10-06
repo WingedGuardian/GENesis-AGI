@@ -1265,8 +1265,8 @@ async def _click_in_shadow_dom(page, selector: str) -> bool:
 
 
 # browser_fill has no overall deadline: a long value legitimately takes a long
-# time (about 0.24 s per character measured, so 2,000 characters is about eight
-# minutes), and a length-derived deadline cut real fills short and reset the
+# time (the typing delays alone average about 0.24 s per character, so 2,000
+# characters is about eight minutes before any browser round trips), and a length-derived deadline cut real fills short and reset the
 # page. What it guards against instead is the failure the old deadline existed
 # for: a Playwright call into Camoufox that never returns (MEASURED: a
 # page.click(timeout=10000) hung 22 minutes; see _TOOL_TIMEOUT_S). So every
@@ -1285,13 +1285,19 @@ class FillStalled(Exception):
 
 
 async def _no_stall(awaitable, what: str):
-    """Await one browser call of a fill, failing if it stalls."""
+    """Await one browser call of a fill, failing if it stalls.
+
+    A completed step is browser activity: with no overall deadline a fill can
+    outlast _IDLE_TIMEOUT_S, and the idle watcher must not reclaim it mid-fill.
+    """
     try:
-        return await asyncio.wait_for(awaitable, timeout=_FILL_STALL_S)
+        result = await asyncio.wait_for(awaitable, timeout=_FILL_STALL_S)
     except TimeoutError:
         raise FillStalled(
             f"{what} made no progress for {_FILL_STALL_S:.0f}s"
         ) from None
+    _touch()
+    return result
 
 
 async def _human_type(page, selector: str, value: str) -> None:
@@ -2287,8 +2293,19 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
         return {"filled": selector, "url": page.url}
     except FillStalled as e:
         # Same recovery as a tool timeout: the browser is hung, so the page is
-        # in an unknown state and the next step must be a fresh navigate.
-        logger.warning("browser_fill stalled on '%s': %s — resetting active page", selector, e)
+        # in an unknown state and the next step must be a fresh navigate. The
+        # lock was released before typing, so a browser_navigate may have
+        # replaced the active page meanwhile: reset only the page that stalled.
+        # A navigate on the same layer reuses the page object, so it is reset
+        # with it; that object is the one that hung.
+        logger.warning("browser_fill stalled on '%s': %s", selector, e)
+        if _active_page is not page:
+            return {
+                "error": (
+                    f"Fill stalled on '{selector}': {e}. The page it was filling "
+                    "is no longer the active page, so the active page is unchanged."
+                )
+            }
         _active_page = None
         return {
             "error": (
@@ -2546,9 +2563,11 @@ async def browser_fill(selector: str, value: str) -> dict:
 
     Per-keystroke typing is active for Camoufox and CDP remote — long
     strings take proportionally longer (about 0.24 s per character after a
-    pre-delay of up to 15 s). There is no overall deadline: the call fails
-    only if one browser step (clearing, focusing, or a single keystroke)
-    makes no progress for 30 s, and then the page is reset.
+    pre-delay of up to 15 s). There is no overall deadline: besides ordinary
+    browser errors (selector not found, element detached), the call stops
+    early only if one browser step (clearing, focusing, or a single
+    keystroke) makes no progress for 30 s, and then the page is reset if it
+    is still the active page.
     """
     return await _impl_browser_fill(selector, value)
 

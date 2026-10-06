@@ -25,6 +25,7 @@ def _clear_all_browser_state():
     browser._page = None
     browser._active_page = None
     browser._collaborate_mode = False
+    browser._last_used = 0.0  # the idle test drives it with a fake clock
     browser._browser_lock = asyncio.Lock()
     # Remote CDP state
     browser._remote_pw = None
@@ -299,6 +300,57 @@ class TestFillStallWatchdog:
 
     def test_the_stall_bound_is_the_justified_value(self):
         assert browser._FILL_STALL_S == 30.0
+
+    @pytest.mark.asyncio
+    async def test_a_fill_longer_than_the_idle_timeout_is_never_idle(self):
+        """With no overall deadline a fill can outlast _IDLE_TIMEOUT_S. Every
+        completed step must count as activity, or the idle watcher reclaims
+        the browser mid-fill. Simulated clock: each keystroke takes 200 s, so
+        40 keys span 8,000 s, more than twice the idle timeout."""
+        now = [1000.0]
+        page, calls = _typing_page()
+        idle_seen = []
+
+        async def slow_down(_char):
+            calls["down"] += 1
+            now[0] += 200.0
+            # The idle watcher's own predicate, against the real constant.
+            idle_seen.append(now[0] - browser._last_used >= browser._IDLE_TIMEOUT_S)
+
+        page.keyboard.down = AsyncMock(side_effect=slow_down)
+        with (
+            patch.object(browser, "time", MagicMock(monotonic=lambda: now[0])),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            result = await browser._impl_browser_fill("#bio", "x" * 40)
+        assert result.get("filled") == "#bio", result
+        assert now[0] - 1000.0 > 2 * browser._IDLE_TIMEOUT_S
+        assert calls["down"] == 40
+        assert not any(idle_seen), f"idle at keystroke {idle_seen.index(True) + 1}"
+
+    @pytest.mark.asyncio
+    async def test_a_stall_does_not_discard_a_page_navigated_meanwhile(self):
+        """The fill releases _browser_lock before typing, so a browser_navigate
+        can replace the active page while a keystroke hangs. The stall must
+        reset only the page that stalled."""
+        page, calls = _typing_page()
+        newer = MagicMock()
+
+        async def hang_after_navigate(_char):
+            calls["down"] += 1
+            browser._active_page = newer  # a concurrent browser_navigate
+            await asyncio.Event().wait()
+
+        page.keyboard.down = AsyncMock(side_effect=hang_after_navigate)
+        with (
+            patch.object(browser, "_FILL_STALL_S", 0.2),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+        ):
+            result = await browser._impl_browser_fill("#bio", "hi")
+        assert "stalled" in result["error"]
+        assert browser._active_page is newer
+        assert "reset" not in result["error"]
 
 
 class TestSnapshotTimeout:

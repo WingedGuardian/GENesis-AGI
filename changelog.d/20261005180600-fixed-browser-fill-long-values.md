@@ -1,1 +1,1 @@
-- **Long form fields no longer time out.** `browser_fill` had a deadline based on the length of the text, which cut off values of a few hundred characters and reset the page. It now fails only if the browser stops responding for 30 seconds in one step.
+- **Long form fields no longer time out.** `browser_fill` had a deadline based on the length of the text, which cut off values of a few hundred characters and reset the page. It now times out only if the browser stops responding for 30 seconds in one step.
