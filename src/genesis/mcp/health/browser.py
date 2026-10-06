@@ -3040,7 +3040,6 @@ async def _impl_browser_snapshot() -> dict:
         if health:
             return health
         page = _active_page
-    global _remote_last_url
     try:
         url_before = page.url
         snapshot = await _snapshot_page(page)
@@ -3201,7 +3200,7 @@ async def browser_navigate(
     # Remote CDP: 60s for the connect (at most 30s), the tab lookup and the
     # goto (at most 30s). A timeout cancels the call; its shielded cleanup
     # finishes on its own.
-    # Camoufox: Turnstile VNC resolution can take up to 5 minutes.
+    # Camoufox / Chromium: challenge handling can take most of 300 s.
     timeout = _TOOL_TIMEOUT_S if remote else 300.0
     return await _with_tool_timeout(
         _impl_browser_navigate(url, stealth, remote=remote, cdp_url=cdp_url, tinyfish=tinyfish),
