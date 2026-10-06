@@ -268,7 +268,9 @@ When a click opens a tab or popup (`target="_blank"`, `window.open`), the
 tools switch to it: the click result's `url` and `snapshot` are the new tab's,
 and `new_page` names it. The original tab stays open. If the new tab closes
 itself (a sign-in popup), the tools go back to the tab that opened it (on
-remote CDP, only while the same connection lasts). A tab
+remote CDP, only while the same connection lasts). If one click opens several
+tabs, the tools follow the first one still open and `new_page.also_opened`
+lists the others' addresses. A tab
 that starts loading later than the click's wait (10 s for a link or form that
 declares a new tab, 1 s otherwise) is not followed, and a `new_page` with a
 `note` says when one was seen but not followed. In that case, read its address

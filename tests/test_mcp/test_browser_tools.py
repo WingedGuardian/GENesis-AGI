@@ -3201,7 +3201,9 @@ class TestDeclaresNewTabJs:
     DOM double, so the classifier logic itself is exercised."""
 
     _DOM = r"""
-const DOC = { base: null, querySelector: (s) => (s === 'base[target]' ? DOC.base : null) };
+const DOC = { base: null, frames: [], defaultView: { name: '' },
+  querySelector: (s) => (s === 'base[target]' ? DOC.base : null),
+  querySelectorAll: (s) => (s === 'iframe[name], frame[name]' ? DOC.frames : []) };
 function matches(e, sel) {
   return sel.split(',').some((s) => {
     const m = s.trim().match(/^(\w+)(\[(\w+)\])?$/);
@@ -3219,7 +3221,10 @@ function el(tag, attrs, extra) {
 }
 const OPENS = eval(JS_SRC);
 const out = {};
-function run(name, base, e) { DOC.base = base; out[name] = OPENS(e); }
+function run(name, base, e, frames, winName) {
+  DOC.base = base; DOC.frames = frames || []; DOC.defaultView.name = winName || '';
+  out[name] = OPENS(e);
+}
 const blankBase = el('base', { target: '_blank' });
 const link = (attrs) => el('a', Object.assign({ href: '/x' }, attrs));
 run('plain_link', null, link({}));
@@ -3236,6 +3241,11 @@ run('invalid_type_button_submits', null,
 run('type_button_opens_nothing', null,
     el('button', { type: 'button' }, { type: 'button', form: form({ target: '_blank' }) }));
 run('text_field_opens_nothing', blankBase, el('input', {}, { type: 'text', form: form() }));
+// Codex 4191375878: a named target already in use here is not a new tab.
+run('named_new_window', null, link({ target: 'preview' }));
+run('named_iframe_here', null, link({ target: 'preview' }), [el('iframe', { name: 'preview' })]);
+run('own_window_name', null, link({ target: 'main' }), [], 'main');
+run('other_iframe_name', null, link({ target: 'preview' }), [el('iframe', { name: 'other' })]);
 console.log(JSON.stringify(out));
 """
 
@@ -3265,6 +3275,10 @@ console.log(JSON.stringify(out));
             "text_field_opens_nothing": False,
             "invalid_type_button_submits": True,
             "type_button_opens_nothing": False,
+            "named_new_window": True,
+            "named_iframe_here": False,
+            "own_window_name": False,
+            "other_iframe_name": True,
         }
 
 
@@ -3452,3 +3466,99 @@ class TestARejectedNavigateTouchesNoLayer:
         )
         assert "error" in result
         assert browser._layer_last_used == {browser.BrowserLayer.TINYFISH: 123.0}
+
+
+class TestClickFollowRoundOneFixes:
+    """Round-1 review of the new-tab follow (PR #2948)."""
+
+    @pytest.mark.asyncio
+    async def test_a_popup_is_not_followed_once_another_layer_became_active(self):
+        """Devin 4191337473: a navigate to another layer during the click leaves
+        the click's layer page alone but moves the active page; following then
+        reported a popup the next tool would not act on."""
+        original = _EventPage("https://a.example")
+        popup = _EventPage("https://b.example")
+        elsewhere = _alive_page("https://camoufox.example")
+        browser._page = original
+        browser._active_page = original
+
+        async def click(page, selector, timeout=10000):
+            browser._stealth_page = elsewhere  # browser_navigate(stealth=True) lands
+            browser._active_page = elsewhere
+            page.emit("popup", popup)
+
+        with patch.object(browser, "_stealth_click", new=click):
+            result = await _click()
+        assert result["new_page"]["note"] == browser._NOT_FOLLOWED_LAYER_MOVED
+        assert browser._active_page is elsewhere
+        assert browser._page is original  # the click's layer did not move either
+        assert result["url"] != "https://b.example"
+
+    @pytest.mark.asyncio
+    async def test_a_followed_popup_that_closes_while_the_result_is_read(self):
+        """Devin 4191337577: the popup closes itself during the snapshot; the
+        result must describe the page the tools are back on, not the closed one."""
+        original = _EventPage("https://a.example")
+        popup = _EventPage("https://accounts.example/signin")
+        browser._page = original
+        browser._active_page = original
+        loc = MagicMock()
+
+        async def snap_then_close():
+            popup.close_now()  # _on_closed moves the layer back to ``original``
+            return "- snapshot of a closed page"
+
+        loc.aria_snapshot = AsyncMock(side_effect=snap_then_close)
+        popup.locator = MagicMock(return_value=loc)
+        with patch.object(browser, "_stealth_click", new=_popup_click(original, popup)):
+            result = await _click()
+        assert browser._active_page is original
+        assert result["url"] == "https://a.example"
+        assert "a.example" in result["snapshot"]
+        assert "closed" in result["new_page"]["note"]
+
+    @pytest.mark.asyncio
+    async def test_a_click_opening_several_tabs_follows_the_first_live_one_and_lists_the_rest(self):
+        """Codex 4191375886 / Devin 4191337647: one click, several popups."""
+        original = _EventPage("https://a.example")
+        helper = _EventPage("https://helper.example")
+        helper._closed = True  # a transient helper that closed itself at once
+        dest = _EventPage("https://dest.example", title="Dest")
+        ad = _EventPage("https://ad.example")
+        browser._page = original
+        browser._active_page = original
+
+        async def click(page, selector, timeout=10000):
+            for p in (helper, dest, ad):
+                page.emit("popup", p)
+
+        with patch.object(browser, "_stealth_click", new=click):
+            result = await _click()
+        assert browser._active_page is dest
+        assert result["new_page"]["url"] == "https://dest.example"
+        assert result["new_page"]["also_opened"] == ["https://ad.example"]
+
+    @pytest.mark.asyncio
+    async def test_a_helper_that_closes_at_once_does_not_end_the_wait(self):
+        """Fresh review S1: a popup that closed itself must not stop the wait
+        for the real one arriving later inside the window."""
+        original = _EventPage("https://a.example")
+        helper = _EventPage("https://helper.example")
+        dest = _EventPage("https://dest.example")
+        browser._page = original
+        browser._active_page = original
+
+        async def click(page, selector, timeout=10000):
+            page.emit("popup", helper)
+            helper._closed = True
+            asyncio.get_running_loop().call_later(0.1, page.emit, "popup", dest)
+
+        with (
+            patch.object(browser, "_stealth_click", new=click),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=AsyncMock()),
+            patch.object(browser, "_NEW_TAB_WAIT_S", 1.0),
+        ):
+            result = await browser._impl_browser_click("#open")
+        assert browser._active_page is dest
+        assert result["new_page"]["url"] == "https://dest.example"
