@@ -1124,10 +1124,10 @@ jobs:
         # UNION with this branch's strict data-heredoc post-pass tests. MEASURED
         # by --collect-only on each changed test file at origin/main and here:
         #   test_push_pr_adjacency.py        61 -> 66  (+5)
-        #   test_secrets_env_access_guard.py 59 -> 60  (+1)
+        #   test_secrets_env_access_guard.py 59 -> 62  (+3)
         #   test_shell_parse.py             258 -> 332 (+74)
         #   test_worktree_guard.py          129 -> 129  (+0)
         #   test_worktree_remote_guard.py   137 -> 139  (+2)
         #   test_guard_ansic_fail_closed.py 285 -> 285  (+0)
-        # Delta +82; floor: 24421 + 82 = 24503. No added skips.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24503
+        # Delta +84; floor: 24421 + 84 = 24505. No added skips.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24505

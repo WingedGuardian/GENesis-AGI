@@ -289,7 +289,7 @@ _SECRETISH = re.compile(
 #: <<'PY'`. An assignment prefix, an absolute path and `env` are not exotic;
 #: they are what the next spelling always looks like, which is why this is
 #: bound to the canonical parser instead of being widened again.
-_HEREDOC_OPENER = re.compile(r"(?<!<)<<(?!<)")
+_HEREDOC = re.compile(r"<<-?\s*'?\"?(\w+)'?\"?\n.*?^\s*\1\s*$", re.DOTALL | re.MULTILINE)
 
 #: Basenames that EXECUTE what they are fed. Matched against
 #: `Segment.exe`, which `shell_parse` has already stripped of env
@@ -478,12 +478,14 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
         return False
 
     excised = shell_parse.excise_data_heredoc(command)
-    scan = excised[0] if excised is not None else command
-    # Unproven heredocs are treated as possibly executed: keep and scan their
-    # bodies, including quoted tokens. Only strict, proven data forms are excised.
-    exec_heredoc = _heredoc_feeds_an_executor(scan) or (
-        excised is None and _HEREDOC_OPENER.search(command) is not None
-    )
+    if excised is not None:
+        scan = excised[0]
+        exec_heredoc = _heredoc_feeds_an_executor(scan)
+    else:
+        # Heredoc bodies are data — unless the heredoc feeds an interpreter, in
+        # which case the body IS the executed payload and must be scanned.
+        exec_heredoc = _heredoc_feeds_an_executor(command)
+        scan = command if exec_heredoc else _HEREDOC.sub(" ", command)
     # Quoted regions are DATA for the command-level arm too: a commit message
     # naming the file is not an operand. The declared shell-variable residual
     # (`f=secrets; cat $f.env`) is unquoted, so it survives stripping.

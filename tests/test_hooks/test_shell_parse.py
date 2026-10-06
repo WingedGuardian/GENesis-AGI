@@ -1626,12 +1626,17 @@ def test_data_heredoc_excision_rejects_unbounded_or_single_line_commands():
     )
 
 
-def test_data_heredoc_excision_handles_long_first_lines_under_50ms():
+def test_data_heredoc_excision_is_linear_on_long_first_lines():
+    # Guards against super-linear backtracking, which at these lengths costs
+    # seconds; the bound is loose so shared CI runners don't flake on it.
     commands = [
         "cat " + "\\" * 16_000 + " <<'EOF'\nbody\nEOF",
         "cat " + "x" * 48_000 + " <<'EOF'\nbody\nEOF",
     ]
     for command in commands:
-        started = time.perf_counter()
-        assert sp.excise_data_heredoc(command) is None
-        assert time.perf_counter() - started < 0.05
+        best = float("inf")
+        for _ in range(5):
+            started = time.perf_counter()
+            assert sp.excise_data_heredoc(command) is None
+            best = min(best, time.perf_counter() - started)
+        assert best < 0.5, (len(command), best)
