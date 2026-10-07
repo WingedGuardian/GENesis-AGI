@@ -879,7 +879,13 @@ def update_resolve():
         if refusal is not None:
             return jsonify(refusal[0]), refusal[1]
         proc = _spawn_detached_cc(tier3_prompt, "opus", "max")
-        _PID_FILE.write_text(str(proc.pid))
+        try:
+            _PID_FILE.write_text(str(proc.pid))
+        except OSError:
+            # As in _apply_supervised: a session no marker names would change the
+            # checkout unseen by the watchdog and every deploy; stop it.
+            proc.kill()
+            raise
     logger.info("Tier 3 (Opus) started (pid %d)", proc.pid)
 
     # Reaper thread prevents zombie — waits for Opus to finish, cleans up PID file.

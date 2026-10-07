@@ -306,6 +306,28 @@ def test_an_unopenable_lock_is_not_reported_as_a_running_deploy(client, w, start
     assert starts["calls"] == []
 
 
+def test_a_failed_marker_write_stops_the_tier3_session(client, w, starts, monkeypatch):
+    killed = []
+
+    class P:
+        pid = 6161
+
+        def kill(self):
+            killed.append(self.pid)
+
+    class Unwritable(type(w["marker"])):
+        def write_text(self, *a, **k):
+            raise OSError("read-only")
+
+    # Only the write fails: the claim, the dead-marker cleanup and the spawn run.
+    monkeypatch.setattr(updates, "_PID_FILE", Unwritable(w["marker"]))
+    monkeypatch.setattr(updates, "_spawn_detached_cc", lambda *a, **k: P())
+    with pytest.raises(OSError):
+        client.post("/api/genesis/updates/resolve", json={})
+    assert killed == [6161]
+    assert _lock_is_held(w["home"]) is False
+
+
 def test_a_failed_marker_write_stops_the_orchestrator(w, tmp_path, monkeypatch):
     """A running orchestrator that no marker names is invisible to the watchdog
     and to every deploy."""
