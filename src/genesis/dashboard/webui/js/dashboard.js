@@ -3749,7 +3749,7 @@
 
         async deleteConfigFile() {
           if (!this.configModal.deletable) return;
-          if (!(await this.showConfirm("Delete File", `Delete ${this.configModal.name}? This cannot be undone.`))) return;
+          if (!(await this.showConfirm("Delete File", `Move ${this.configModal.name} to the Genesis trash? It can be restored with: python -m genesis.trash restore`))) return;
           try {
             const resp = await fetchApi(
               `/api/genesis/config-files/${this.configModal.name.split('/').map(encodeURIComponent).join('/')}`,

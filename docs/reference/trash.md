@@ -79,8 +79,17 @@ revisit it.
   reaped; the task fails saying so, and it needs `git worktree unlock` or a
   manual removal.
 
-The dashboard's delete actions are #2926 PR 5, and an advisory on shell `rm` is
-PR 6.
+- **Dashboard file API delete** (`DELETE /api/genesis/files/delete`; no button
+  calls it today): the file (a symlink path deletes its target, as the route
+  always has). A file the trash refuses (Claude Code's temp volume, another
+  volume) is left alone with a 409. Neither `~/.genesis/trash` nor
+  `~/.genesis/worktree-trash` is listed or opened by the file browser: every
+  trashed item is renamed to `item`, so the browser's name rules could no
+  longer see what it was.
+- **Dashboard memory-file delete** (the config modal's Delete): the memory
+  file, as the link when it is a symlink. `MEMORY.md` is never deleted.
+
+An advisory on shell `rm` is #2926 PR 6.
 
 ## What does not go to the trash, and why
 
@@ -96,6 +105,11 @@ PR 6.
 - **Code with no production caller**, left as it is: the browser profile's
   `backup()`/`reset()` and the unwired `pending_reminders_hook.py`. They should
   use the trash if they are ever wired.
+- **Knowledge-upload Cancel** in the dashboard: the staged copy of a file just
+  uploaded from your browser, whose original stays on your machine. Upload
+  staging, like other temp.
+- **Database rows**: deleting a follow-up, a knowledge entry, a memory or a
+  reference from the dashboard deletes rows, not files, and is not covered.
 - **Task branches, not yet covered**: the executor's worktree cleanup still
   force-deletes a task's branch after the task ends, so a failed task's
   unpushed commits lose their only ref (#3020).

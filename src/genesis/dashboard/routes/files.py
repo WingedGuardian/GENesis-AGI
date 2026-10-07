@@ -544,6 +544,12 @@ def _is_allowed(path: Path) -> bool:
     # lock the operator out of every root at once on an install whose home
     # happened to carry a matching name.
     below = resolved.relative_to(root).parts
+    # Neither trash is browsable; restore goes through its own CLI. The Genesis
+    # trash renames every item to the fixed leaf ``item``, so the name rules
+    # below could not see what a trashed file was; the worktree trash holds
+    # archives whose contents those rules never see either.
+    if _in_a_trash(resolved):
+        return False
     # Block paths containing "secret" in any component (except dir names "secrets"/".secrets")
     for part in below:
         if "secret" in part.lower() and part.lower() not in ("secrets", ".secrets"):
@@ -592,6 +598,22 @@ def _is_allowed(path: Path) -> bool:
     # configured-area rule by living anywhere. That needs the registry (#2235),
     # not another guess.
     return not _is_sqlite_artifact(resolved.name)
+
+
+def _worktree_trash_dir() -> Path:
+    # Resolved as its writer resolves it (zero_drop_worker._default_trash_dir):
+    # Path.home(), not GENESIS_HOME.
+    return Path.home() / ".genesis" / "worktree-trash"
+
+
+def _trash_stores() -> tuple[Path, ...]:
+    from genesis.trash import home_trash_root
+
+    return (home_trash_root().resolve(), _worktree_trash_dir().resolve())
+
+
+def _in_a_trash(resolved: Path) -> bool:
+    return any(resolved.is_relative_to(store) for store in _trash_stores())
 
 
 def _sanitize_path(raw: str | None) -> tuple[Path | None, tuple | None]:
@@ -657,11 +679,14 @@ def file_list():
         return jsonify({"error": "Permission denied"}), 403
 
     items = []
+    stores = _trash_stores()
     for entry in entries:
         # Skip hidden files except known safe directories
         if entry.name.startswith(".") and entry.name not in (".claude", ".genesis"):
             continue
         if entry.name.lower() in _BLOCKED_NAMES:
+            continue
+        if entry.resolve() in stores:  # not browsable, so not listed either
             continue
         items.append(_file_info(entry))
 
@@ -839,7 +864,7 @@ def file_rename():
 
 @blueprint.route("/api/genesis/files/delete", methods=["DELETE"])
 def file_delete():
-    """Delete a file (not directories, for safety).
+    """Move a file to the Genesis trash (not directories, for safety).
 
     Query params: path – absolute file path
     """
@@ -853,13 +878,19 @@ def file_delete():
     if target.is_dir():
         return jsonify({"error": "Cannot delete directories via browser — use terminal"}), 400
 
+    from genesis.trash import TrashRefused, trash
+
+    # Deletes go to the Genesis trash (#2926); it refuses, with the file left in
+    # place, anything it cannot take (another volume, the Claude Code temp volume).
     try:
-        target.unlink()
+        stone = trash(target, reason="dashboard file browser delete", caller="dashboard.files.delete")
+    except TrashRefused as exc:
+        return jsonify({"error": str(exc)}), 409
     except Exception:
         logger.exception("Failed to delete %s", target)
         return jsonify({"error": "Delete failed"}), 500
 
-    return jsonify({"status": "ok", "path": str(target)})
+    return jsonify({"status": "ok", "path": str(target), "trash_entry": stone.entry_id})
 
 
 @blueprint.route("/api/genesis/files/download")

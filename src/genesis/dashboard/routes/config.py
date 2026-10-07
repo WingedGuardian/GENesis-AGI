@@ -229,7 +229,7 @@ def config_file_update(name: str):
 
 @blueprint.route("/api/genesis/config-files/<path:name>", methods=["DELETE"])
 def config_file_delete(name: str):
-    """Delete an auto-memory file."""
+    """Move an auto-memory file to the Genesis trash (#2926); never MEMORY.md."""
     if not name.startswith("memory/"):
         return jsonify({"error": "only memory files can be deleted"}), 403
 
@@ -239,10 +239,19 @@ def config_file_delete(name: str):
         return jsonify({"error": "file not found"}), 404
     if not target.resolve().is_relative_to(_MEMORY_DIR.resolve()):
         return jsonify({"error": "path traversal blocked"}), 403
+    # The index is not deletable (the listing marks it so); compare paths, not
+    # strings, so "memory/./MEMORY.md" is refused too.
+    if target.resolve() == (_MEMORY_DIR / "MEMORY.md").resolve():
+        return jsonify({"error": "MEMORY.md cannot be deleted"}), 403
+
+    from genesis.trash import TrashRefused, trash
 
     try:
-        target.unlink()
-        return jsonify({"status": "ok", "name": name})
+        # The unresolved path: a symlink goes to the trash as the link.
+        stone = trash(target, reason="dashboard memory file delete", caller="dashboard.config.memory_delete")
+        return jsonify({"status": "ok", "name": name, "trash_entry": stone.entry_id})
+    except TrashRefused as exc:
+        return jsonify({"error": str(exc)}), 409
     except Exception as exc:
         logger.error("Failed to delete memory file %s: %s", name, exc, exc_info=True)
         return jsonify({"error": "delete failed"}), 500
