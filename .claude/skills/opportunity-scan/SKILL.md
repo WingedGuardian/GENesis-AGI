@@ -168,4 +168,3 @@ coverage. This v1 includes all Claude Code projects/subagents but does not colle
 Codex sessions. Recommend changes with supporting evidence; never automatically alter
 rules, permissions, learning scores or policies. Keep outcomes in existing reports
 and plans rather than introducing another outcomes database.
-
