@@ -507,6 +507,17 @@ def _isolate_circuit_breaker_state(tmp_path, monkeypatch):
     monkeypatch.setattr(cb_mod, "_STATE_FILE", tmp_path / "cb_state.json")
 
 
+# ── Graph-traversal telemetry is OFF unless a test opts in ─────────────────
+@pytest.fixture(autouse=True)
+def _graph_telemetry_off(monkeypatch):
+    """Most traversal tests build minimal databases with no ``eval_events``
+    table, and several assert an exact count of WARNING records on the degraded
+    path. A telemetry write there would fail and log, changing what those tests
+    measure. Telemetry tests opt back in with
+    ``monkeypatch.delenv("GENESIS_GRAPH_TELEMETRY_DISABLED")``."""
+    monkeypatch.setenv("GENESIS_GRAPH_TELEMETRY_DISABLED", "1")
+
+
 # ── Safety: prevent tests from writing REAL durable alerts ──────────────────
 @pytest.fixture(autouse=True)
 def _isolate_alert_queue(tmp_path):
