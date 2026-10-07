@@ -86,11 +86,11 @@ def _holder(
     (d / "cmdline").write_bytes(cmdline.replace(" ", "\0").encode() + b"\0")
 
 
-def _domain(box, total_mb: int, path: Path | None = None) -> str:
+def _domain(box, total_mb: int, path: Path | None = None, tier: str = "green") -> str:
     """One check_disks domain line for the sandbox filesystem."""
     p = path or box["data"]
     dev = os.stat(p).st_dev
-    return f"{dev}m1 {dev} {total_mb} {p}"
+    return f"{dev}m1 {dev} {total_mb} {tier} {p}"
 
 
 def _run(box, snippet: str, act: int = 1) -> subprocess.CompletedProcess:
@@ -177,7 +177,7 @@ def test_a_file_below_the_minimum_is_not_followed(box):
 def test_a_file_on_an_unwatched_filesystem_is_ignored(box):
     f = _file(box, "out.log", 60)
     _holder(box, 5, f)
-    _check(box, "999999m1 999999 200 /elsewhere")
+    _check(box, "999999m1 999999 200 green /elsewhere")
     assert not _pages(box)
 
 
@@ -381,7 +381,7 @@ def test_check_disks_feeds_every_domain_to_the_detector():
     """Wiring: the domains check_disks tiers are the ones the detector sees,
     and fast growth shortens the next poll."""
     text = _WATCHGOD.read_text()
-    assert 'rw_domains+="${key} ${key%%[qm]*} ${total} $(wg_canon "$p")"' in text
+    assert 'rw_domains+="${key} ${key%%[qm]*} ${total} ${tier} $(wg_canon "$p")"' in text
     assert 'wg_runaway_check "$rw_domains"' in text
     assert "(( RUNAWAY_FAST )) && fast=1" in text
 
@@ -516,10 +516,10 @@ def test_an_unmatched_file_is_never_judged_by_a_quota_domain(box):
     f = _file(box, "out.log", 60)
     _holder(box, 5, f)
     dev = os.stat(box["data"]).st_dev
-    quota_only = f"{dev}q200 {dev} 200 /somewhere/else"
+    quota_only = f"{dev}q200 {dev} 200 green /somewhere/else"
     _check(box, quota_only)
     assert not _pages(box), "60 MB would be 30% of the 200 MB quota it is not in"
-    with_mount = f"{dev}q200 {dev} 200 /somewhere/else\n{dev}m1 {dev} 200 /mnt/whole"
+    with_mount = f"{dev}q200 {dev} 200 green /somewhere/else\n{dev}m1 {dev} 200 green /mnt/whole"
     _check(box, with_mount)
     assert len(_pages(box)) == 1
 
@@ -556,7 +556,7 @@ def test_a_fallback_domain_is_labelled_with_the_files_own_mount(box):
     mnt = subprocess.run(
         ["stat", "-c", "%m", str(box["data"])], capture_output=True, text=True, check=True
     ).stdout.strip()
-    _check(box, f"{dev}m1 {dev} 200 /mnt/elsewhere")
+    _check(box, f"{dev}m1 {dev} 200 green /mnt/elsewhere")
     pages = _pages(box)
     assert len(pages) == 1
     assert f"Runaway file on {mnt}:" in pages[0]["title"]

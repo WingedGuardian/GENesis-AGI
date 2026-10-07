@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
-# watchgod — look at the disk guardian.
+# watchgod — look at the disk guardian, and resume what it paused.
 #
 #   scripts/watchgod status          per-filesystem tier, free space, time to full
-#                                    and whether a quota binds, as of the last poll
+#                                    and whether a quota binds, as of the last poll;
+#                                    and every process the guardian paused
+#   scripts/watchgod thaw <pid>      resume one paused process (SIGCONT)
+#   scripts/watchgod thaw all        resume every paused process
 #
 # Reads ~/.genesis/watchgod_state.json, which the guardian
 # (scripts/tmp_watchgod.sh, the genesis-tmp-watchgod service) rewrites every poll.
+#
+# The guardian pauses only the command writing a runaway Claude Code task
+# output in cc-tmp, never a session, so any shell or session can run this. It
+# never resumes on its own: resuming the runaway would refill the volume. Thaw
+# once the cause is understood, or end the command instead. A pid is resumed
+# only if it is still the SAME process that was paused (its start time matches
+# the record); a recycled pid is never signalled.
 set -euo pipefail
 
 if [ -z "${HOME:-}" ]; then
@@ -14,10 +24,23 @@ if [ -z "${HOME:-}" ]; then
 fi
 
 STATE_FILE="${WATCHGOD_STATE_FILE:-$HOME/.genesis/watchgod_state.json}"
+DG_STATE_DIR="${DG_STATE_DIR:-$HOME/.genesis/watchgod}"
+FROZEN_FILE="$DG_STATE_DIR/frozen"
+LOG_FILE="${WATCHGOD_LOG_FILE:-$HOME/.genesis/logs/tmp_watchgod.log}"
+DG_PROC="${DG_PROC:-/proc}"
 
 usage() {
-    sed -n '4,5p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '4,8p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
+}
+
+_starttime() {
+    local rest
+    read -r rest 2>/dev/null < "$DG_PROC/$1/stat" || return 1
+    rest="${rest##*) }"
+    local -a f
+    read -r -a f <<< "$rest"
+    printf '%s' "${f[19]:-}"
 }
 
 cmd_status() {
@@ -34,10 +57,56 @@ PY
     else
         echo "no state file at $STATE_FILE (is genesis-tmp-watchgod running?)"
     fi
+    local pid st comm ts _key path state n=0
+    if [[ -s "$FROZEN_FILE" ]]; then
+        while IFS=$'\t' read -r pid st comm ts _key path; do
+            [[ "$pid" =~ ^[0-9]+$ ]] || continue
+            (( n++ == 0 )) && echo "paused:"
+            state="gone"
+            [[ "$(_starttime "$pid" 2>/dev/null || true)" == "$st" ]] && state="still paused"
+            echo "  pid ${pid} (${comm}) since ${ts}, writing ${path} — ${state}"
+        done < "$FROZEN_FILE"
+    fi
+    (( n )) || echo "paused: none"
+}
+
+cmd_thaw() {
+    local want="${1:-}"
+    [[ -n "$want" ]] || usage 2
+    [[ "$want" == all || "$want" =~ ^[0-9]+$ ]] || { echo "watchgod: thaw takes a pid or 'all'" >&2; exit 2; }
+    [[ -s "$FROZEN_FILE" ]] || { echo "nothing is paused"; return 0; }
+    # The guardian appends under this lock; hold it across read-and-rewrite.
+    exec 9>"$FROZEN_FILE.lock"
+    flock 9
+    local keep="" pid st comm ts path hit=0 line
+    while IFS= read -r line; do
+        IFS=$'\t' read -r pid st comm ts _ path <<< "$line"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        if [[ "$want" != all && "$want" != "$pid" ]]; then
+            keep+="${line}"$'\n'
+            continue
+        fi
+        hit=1
+        if [[ "$(_starttime "$pid" 2>/dev/null || true)" != "$st" ]]; then
+            echo "pid ${pid} (${comm}) is no longer running — record dropped"
+            continue
+        fi
+        if kill -CONT "$pid" 2>/dev/null; then
+            echo "resumed pid ${pid} (${comm})"
+            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [INFO] THAWED pid ${pid} (${comm}) by operator" >> "$LOG_FILE" 2>/dev/null || true
+        else
+            echo "could not signal pid ${pid} (${comm}) — record kept" >&2
+            keep+="${line}"$'\n'
+        fi
+    done < "$FROZEN_FILE"
+    printf '%s' "$keep" > "$FROZEN_FILE.tmp" && mv -f "$FROZEN_FILE.tmp" "$FROZEN_FILE"
+    (( hit )) || echo "pid ${want} is not in the paused list"
+    return 0
 }
 
 case "${1:-}" in
     status) cmd_status ;;
+    thaw) cmd_thaw "${2:-}" ;;
     -h|--help|help|"") usage 0 ;;
     *) echo "watchgod: unknown command '$1'" >&2; usage 2 ;;
 esac
