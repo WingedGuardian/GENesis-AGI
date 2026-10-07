@@ -321,8 +321,13 @@ def test_a_failed_marker_write_stops_the_tier3_session(client, w, starts, monkey
 
     # Only the write fails: the claim, the dead-marker cleanup and the spawn run.
     monkeypatch.setattr(updates, "_PID_FILE", Unwritable(w["marker"]))
-    monkeypatch.setattr(updates, "_spawn_detached_cc", lambda *a, **k: P())
-    with pytest.raises(OSError):
+    # A nested patch.object, never monkeypatch: `starts` already patched this
+    # name with patch.object, and monkeypatch (undone after it) would restore
+    # the fixture's stub for every later test in the session.
+    with (
+        patch.object(updates, "_spawn_detached_cc", lambda *a, **k: P()),
+        pytest.raises(OSError),
+    ):
         client.post("/api/genesis/updates/resolve", json={})
     assert killed == [6161]
     assert _lock_is_held(w["home"]) is False
