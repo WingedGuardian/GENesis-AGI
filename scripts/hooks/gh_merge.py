@@ -536,13 +536,33 @@ def read_body_file(path: str) -> tuple[str | None, str]:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             return None, "it is not a regular file"
+        if st.st_nlink != 1:
+            # A second name for the same inode is a way to write it unseen.
+            return None, "it has more than one name (a hard link)"
         if st.st_size > MERGE_BODY_MAX_BYTES:
             return None, f"it is larger than {MERGE_BODY_MAX_BYTES} bytes"
-        data = os.read(fd, MERGE_BODY_MAX_BYTES + 1)
+        # To EOF: one os.read may legally return less than asked, and a read that
+        # stopped where the expected body ends would compare equal while gh reads
+        # the rest. The bytes read must also be the whole file, before and after.
+        chunks: list[bytes] = []
+        total = 0
+        while total <= MERGE_BODY_MAX_BYTES:
+            chunk = os.read(fd, MERGE_BODY_MAX_BYTES + 1 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        data = b"".join(chunks)
+        after = os.fstat(fd)
     finally:
         os.close(fd)
     if len(data) > MERGE_BODY_MAX_BYTES:
         return None, f"it is larger than {MERGE_BODY_MAX_BYTES} bytes"
+    if len(data) != st.st_size or (after.st_size, after.st_mtime_ns) != (
+        st.st_size,
+        st.st_mtime_ns,
+    ):
+        return None, "it changed while it was being read"
     try:
         return data.decode("utf-8"), ""
     except UnicodeDecodeError:
@@ -569,11 +589,40 @@ def write_body_file(path: str, text: str) -> None:
         raise
 
 
-def redirects_output(command: str) -> bool:
-    """Whether a command carries an output redirect other than ``2>&1``.
+#: Every character with which bash turns ONE word the hook reads into something
+#: else: `$` and a backtick (a variable or command substitution: `$F` reaches gh
+#: as whatever F holds), and brace and glob characters (`{--body,x}` reaches gh as
+#: `--body x`). No flag check on the hook's argv can see what they become. The
+#: merge-with line the gate prints contains none of them.
+_EXPANDS = frozenset("$`{}*?[]")
 
-    The segment parser removes redirect targets from what the guard sees, so a
-    ``--body-file F > F`` would empty the file between the hook's read and gh's.
-    Read the raw text instead; refusing a harmless ``> /dev/null`` costs a rewrite.
+
+def shell_rewrites(words: list[str], *, redirects: bool) -> str | None:
+    """The first character in ``words`` that lets the shell hand gh something
+    other than what the hook parsed, else None.
+
+    ``words`` are WORDS, never the raw command: the raw text keeps a trailing
+    comment, and a sigil's reason (`# review-override: accepted P2s?`) must not
+    block a merge. The class is "what gh consumes differs from what the hook
+    judged", so this refuses the class: expansion characters always (they
+    rewrite argv), and with ``redirects`` every ``<`` or ``>`` (a redirect can
+    rewrite or replace the body file between the hook's read and gh's). The word
+    ``2>&1`` is the one redirect kept, since it touches no file. A gated merge has
+    no use for any of these, so a refusal costs one rewrite.
     """
-    return ">" in command.replace("2>&1", "")
+    for word in words:
+        if redirects and word == "2>&1":
+            continue
+        for ch in word:
+            if ch in _EXPANDS or (redirects and ch in "<>"):
+                return ch
+    return None
+
+
+def command_words(command: str) -> list[str] | None:
+    """The command's words with its trailing comment dropped (``shlex``, comments
+    on), or None when it cannot be tokenized. Redirect operators stay as words."""
+    try:
+        return shlex.split(command, comments=True)
+    except ValueError:
+        return None

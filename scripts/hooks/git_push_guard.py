@@ -322,11 +322,12 @@ try:
         api_merge_reason,
         body_file_path,
         body_file_path_problem,
+        command_words,
         compose_squash_body,
         files_trusted,
         is_help_only,
         read_body_file,
-        redirects_output,
+        shell_rewrites,
         write_body_file,
     )
     from git_repo_selection import (  # noqa: E402
@@ -10577,10 +10578,27 @@ def _expected_squash_body(pr_num: str, repo: str | None, head: str) -> tuple[str
         return None, str(exc)
 
 
-def _check_squash_body_file(pr_num: str, repo: str | None, head: str, path: str) -> str | None:
+def _recheck_squash_body_file(path: str, expected: str) -> str | None:
+    """The merge arm's LAST step: re-read the file and require the body the early
+    check approved. The early check runs right after the binding, so a hook killed
+    by its wall clock can never skip it; this second read, just before the hook
+    allows, narrows the window in which another process could change the file
+    before gh reads it. Local only, no network."""
+    text, why = read_body_file(path)
+    if text is None:
+        return f"--body-file {path} could not be re-read before the merge: {why}."
+    if text != expected:
+        return f"--body-file {path} changed after it was checked. Re-run --check-pr."
+    return None
+
+
+def _check_squash_body_file(
+    pr_num: str, repo: str | None, head: str, path: str, *, expected_out: list[str] | None = None
+) -> str | None:
     """None when ``path`` holds exactly the body recomputed for ``head``, else a
     block message. Every failure blocks: the remedy (drop --body-file, or re-run
-    --check-pr) is always available, so nothing here needs a sigil."""
+    --check-pr) is always available, so nothing here needs a sigil. On success the
+    approved body is appended to ``expected_out`` for :func:`_recheck_squash_body_file`."""
     remedy = (
         "Re-run --check-pr and use its merge-with line, or drop --body-file to merge "
         "without the provenance trailer."
@@ -10597,6 +10615,8 @@ def _check_squash_body_file(pr_num: str, repo: str | None, head: str, path: str)
             f"{head[:12]} (the PR body or its commits changed, or the file was edited). "
             + remedy
         )
+    if expected_out is not None:
+        expected_out.append(expected)
     return None
 
 
@@ -13063,6 +13083,20 @@ def _run_merge_and_push_gates() -> int:
                 # which the content check after the binding recomputes. This used
                 # to run only inside the head binding, so `# stale-review-override`
                 # (which skips the binding) let --body/--subject text through.
+                # Both checks read the argv the HOOK parsed. A brace or glob in a
+                # word makes bash hand gh a different argv (`{--body,x}` is one word
+                # here and `--body x` to gh), so a merge segment carrying one is
+                # refused first, on every merge.
+                _expands = shell_rewrites(merge_seg.argv, redirects=False)
+                if _expands:
+                    print(
+                        f"BLOCKED: a gated merge cannot carry the shell character "
+                        f"{_expands!r}: brace and glob expansion make the shell pass gh "
+                        f"arguments this gate never saw. Run the merge-with line from "
+                        f"--check-pr as printed.",
+                        file=sys.stderr,
+                    )
+                    return 2
                 body_file, body_file_problem = _merge_body_file(merge_seg.argv)
                 if body_file_problem or _merge_has_shadow_flag(merge_seg.argv):
                     print(
@@ -13085,11 +13119,17 @@ def _run_merge_and_push_gates() -> int:
                             "it is not a command of its own, so another part of the "
                             "command could rewrite the file after this check reads it"
                         )
-                    elif redirects_output(cmd):
-                        _bf_why = (
-                            "the command redirects output, which could rewrite the "
-                            "file after this check reads it"
+                    else:
+                        _words = command_words(cmd)
+                        _rewrite = (
+                            "unparseable" if _words is None
+                            else shell_rewrites(_words, redirects=True)
                         )
+                        if _rewrite:
+                            _bf_why = (
+                                f"the command carries a redirect or expansion ({_rewrite!r}), "
+                                "which could change the file or the arguments after this check"
+                            )
                     if _bf_why:
                         print(
                             f"BLOCKED: PR #{pr_num} — a merge carrying --body-file is "
@@ -13464,8 +13504,11 @@ def _run_merge_and_push_gates() -> int:
                 # A merge WITHOUT --body-file is allowed silently: the advisory for
                 # it lives in --check-pr's merge-with line, which is read, whereas
                 # stderr on this hook's exit-0 path is not delivered.
+                body_expected: list[str] = []
                 if body_file is not None:
-                    body_msg = _check_squash_body_file(pr_num, merge_repo, merge_head, body_file)
+                    body_msg = _check_squash_body_file(
+                        pr_num, merge_repo, merge_head, body_file, expected_out=body_expected
+                    )
                     if body_msg:
                         print(f"BLOCKED: PR #{pr_num} — {body_msg}", file=sys.stderr)
                         return 2
@@ -13552,6 +13595,13 @@ def _run_merge_and_push_gates() -> int:
                     )
                     print(_defang_gate_text(sched_msg), file=sys.stderr)
                     return 2
+
+                # Last, just before this arm allows: the body file once more.
+                if body_file is not None and body_expected:
+                    late_msg = _recheck_squash_body_file(body_file, body_expected[0])
+                    if late_msg:
+                        print(f"BLOCKED: PR #{pr_num} — {late_msg}", file=sys.stderr)
+                        return 2
 
         # ── sqlite3 write operations ────────────────────────────────
         # Whole-command match (never misses a fragmented/wrapped invocation),

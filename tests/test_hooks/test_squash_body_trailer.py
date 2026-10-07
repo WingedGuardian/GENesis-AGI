@@ -172,11 +172,33 @@ def test_write_then_read_round_trips_owner_only():
 
 
 @pytest.mark.parametrize(
-    ("command", "expected"),
-    [("gh pr merge 5 2>&1", False), ("gh pr merge 5 > /dev/null", True), ("gh pr merge 5", False)],
+    ("command", "redirects", "expected"),
+    [
+        ("gh pr merge 5 2>&1", True, None),
+        ("gh pr merge 5", True, None),
+        ("gh pr merge 5 > /dev/null", True, ">"),
+        ("gh pr merge 5 <<< x", True, "<"),
+        ("gh pr merge 5 < f", True, "<"),
+        ("gh pr merge 5 {--body,x}", False, "{"),
+        ("gh pr merge 5 --body-fil?", False, "?"),
+        ("gh pr merge 5 x*", False, "*"),
+        ("gh pr merge 5 [ab]", False, "["),
+        ("gh pr merge 5 $F", False, "$"),
+        ("gh pr merge 5 `x`", False, "`"),
+        ("gh pr merge 5 > f", False, None),
+        ("gh pr merge 5  # review-override: accepted P2s? see [codex]", False, None),
+        ("gh pr merge 5 --body-file /p  # note: a<b?", True, None),
+    ],
 )
-def test_output_redirects_are_seen_in_the_raw_text(command, expected):
-    assert gh_merge.redirects_output(command) is expected
+def test_shell_rewrites_names_the_first_character_that_changes_argv_or_the_file(
+    command, redirects, expected
+):
+    words = gh_merge.command_words(command)
+    assert gh_merge.shell_rewrites(words, redirects=redirects) == expected
+
+
+def test_an_untokenizable_command_has_no_words():
+    assert gh_merge.command_words("gh pr merge 5 'unclosed") is None
 
 
 # ── reading the flag off argv ───────────────────────────────────────────────
@@ -336,7 +358,7 @@ def test_a_body_file_merge_inside_a_compound_is_refused(monkeypatch, capsys):
 def test_a_body_file_merge_with_an_output_redirect_is_refused(monkeypatch, capsys):
     rc = _drive(monkeypatch, _merge("--body-file", _gate_file(), "> /dev/null"))
     assert rc == 2
-    assert "redirects output" in capsys.readouterr().err
+    assert "redirect or expansion" in capsys.readouterr().err
 
 
 def test_body_text_under_stale_review_override_is_now_refused(monkeypatch, capsys):
@@ -467,3 +489,87 @@ def test_an_uppercase_session_id_is_collected_in_lowercase():
     """GLM P3: prepare-commit-msg keeps the case it found."""
     body = gh_merge.compose_squash_body("", HEAD, ["x\n\nGenesis-Session: ABCD1234\n"])
     assert body == f"Squashed-From: {HEAD}\nGenesis-Session: abcd1234\n"
+
+
+# ── round 1 (#2988): what gh consumes must be what the hook judged ──────────
+
+
+@pytest.mark.parametrize(
+    "extra",
+    ["{--body,evil}", "{--body-file,/etc/hostname}", "--body-fil?"],
+    ids=["brace-body", "brace-body-file", "glob-flag"],
+)
+def test_a_merge_word_the_shell_would_expand_is_refused_on_every_merge(monkeypatch, capsys, extra):
+    """`{--body,evil}` is ONE word to the hook and `--body evil` to gh: refused
+    before any flag check reads the hook's argv, overrides included."""
+    rc = _drive(monkeypatch, _merge(extra) + "  # stale-review-override")
+    assert rc == 2
+    assert "shell character" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("redirect", ["<<< x", "< /dev/null"], ids=["here-string", "input"])
+def test_an_input_redirect_on_a_body_file_merge_is_refused(monkeypatch, capsys, redirect):
+    rc = _drive(monkeypatch, _merge("--body-file", _gate_file(), redirect))
+    assert rc == 2
+    assert "redirect or expansion" in capsys.readouterr().err
+
+
+def test_a_short_read_is_completed_not_trusted(monkeypatch):
+    """os.read may return less than asked: a read stopping where the expected
+    body ends must not pass for the whole file."""
+    path = _gate_file(EXPECTED + "appended text gh would read\n")
+    real_read = gh_merge.os.read
+    state = {"calls": 0}
+
+    def one_chunk_then_eof(fd, n):
+        state["calls"] += 1
+        return real_read(fd, len(EXPECTED.encode())) if state["calls"] == 1 else b""
+
+    monkeypatch.setattr(gh_merge.os, "read", one_chunk_then_eof)
+    text, why = gh_merge.read_body_file(path)
+    assert text is None and "changed while it was being read" in why
+
+
+def test_a_byte_at_a_time_read_still_reads_the_whole_file(monkeypatch):
+    path = _gate_file()
+    real_read = gh_merge.os.read
+    monkeypatch.setattr(gh_merge.os, "read", lambda fd, n: real_read(fd, 1))
+    assert gh_merge.read_body_file(path) == (EXPECTED, "")
+
+
+def test_a_hard_linked_body_file_is_refused(tmp_path):
+    path = _gate_file()
+    os.link(path, tmp_path / "second-name.md")
+    text, why = gh_merge.read_body_file(path)
+    assert text is None and "hard link" in why
+
+
+def test_a_body_file_changed_after_the_check_is_refused_last(monkeypatch, capsys):
+    """The early check runs right after the binding; a writer that changes the
+    file while the later gates run is caught by the re-read before allow."""
+    path = _gate_file()
+    real_sched = _mod._check_scheduled_claude_reviewed_head
+
+    def sched_then_tamper(*a, **kw):
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("late text\n")
+        return real_sched(*a, **kw)
+
+    monkeypatch.setattr(_mod, "_check_scheduled_claude_reviewed_head", sched_then_tamper)
+    rc = _drive(monkeypatch, _merge("--body-file", path))
+    assert rc == 2
+    assert "changed after it was checked" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("word", ["$F", "`printf x`"], ids=["variable", "backtick"])
+def test_a_variable_or_substitution_in_a_merge_word_is_refused(monkeypatch, capsys, word):
+    """A variable is the brace bypass by another spelling: gh gets what F holds."""
+    rc = _drive(monkeypatch, _merge(word))
+    assert rc == 2
+    assert "shell character" in capsys.readouterr().err
+
+
+def test_a_sigil_reason_holding_glob_characters_still_merges(monkeypatch, capsys):
+    """The scan reads words, not the raw text: a trailing comment is prose."""
+    rc = _drive(monkeypatch, _merge() + "  # review-override: accepted P2s? see [codex]")
+    assert rc == 0, capsys.readouterr().err
