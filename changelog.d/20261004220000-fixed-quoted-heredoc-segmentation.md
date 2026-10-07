@@ -1,0 +1,1 @@
+Quoted heredoc bodies supplied to proven data receivers—including the `gh` and `git` message-body substitution idiom—no longer appear as separate guard-visible commands. Every other body is scanned as before; apostrophe prose is still refused by `untokenizable`. The secrets gate now scans unquoted heredoc bodies and bodies sent to unknown receivers.

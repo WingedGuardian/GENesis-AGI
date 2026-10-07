@@ -1120,4 +1120,6 @@ jobs:
         #   test_collectors_falkordb.py           new -> 23   (+23)
         #   test_falkordb_module.py               new -> 35   (+35)
         # No added skips. Floor: 24332 + 89 = 24421; skip ceiling remains 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24421
+        # Quoted-heredoc receiver regressions: the five changed test files
+        # collect 583 on origin/main and 671 here (+88). Floor: 24421 + 88 = 24509.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24509

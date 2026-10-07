@@ -40,8 +40,9 @@ command text is the thing this module was written to avoid doing with strings,
 and it is still doing it one layer up.
 
 So the honest statement of what this is: a gate that closes the DIRECT
-spellings — a named path, a glob that expands to the file, a heredoc fed to a
-recognised interpreter — and does not close indirect access. It is strictly
+spellings — a named path, a glob that expands to the file, or an executable
+heredoc body — and does not close indirect access. Receiver classification is
+shared with ``shell_parse``. It is strictly
 better than the string matcher it replaced, and it is not the boundary. The
 replacement enforces at the filesystem and credential boundaries instead, where
 one check answers every row above at once; that is **issue #2230**, and it
@@ -275,83 +276,6 @@ _SECRETISH = re.compile(
 )
 
 
-#: Heredoc bodies are DATA, not operands — UNLESS the heredoc feeds an
-#: interpreter. `git commit -F - <<'EOF' … secrets.env … EOF` is a commit
-#: message discussing the file; nothing in it is opened. But `python3 <<'EOF'
-#: … cat secrets.env … EOF` EXECUTES the body — stripping it before the operand
-#: scan lets a nested credential read run without consent (Devin SEC finding,
-#: #1826). Which receiver a heredoc feeds is therefore a question about the
-#: command's resolved EXECUTABLE, and that is `shell_parse`'s job rather than a
-#: pattern's: the first version anchored the interpreter at the command start or
-#: after an operator, and MEASURED against the real file, three ordinary
-#: spellings hid it and ran the credential read without consent —
-#: `FOO=1 python3 <<'PY'`, `/usr/bin/python3 <<'PY'` and `env FOO=1 python3
-#: <<'PY'`. An assignment prefix, an absolute path and `env` are not exotic;
-#: they are what the next spelling always looks like, which is why this is
-#: bound to the canonical parser instead of being widened again.
-_HEREDOC = re.compile(r"<<-?\s*'?\"?(\w+)'?\"?\n.*?^\s*\1\s*$", re.DOTALL | re.MULTILINE)
-
-#: Basenames that EXECUTE what they are fed. Matched against
-#: `Segment.exe`, which `shell_parse` has already stripped of env
-#: assignments, `env`, `sudo`/`command` wrappers and any directory part — so
-#: this set names receivers, never spellings of them. `python` is a prefix
-#: match for the versioned forms (`python3`, `python3.12`).
-_EXEC_RECEIVERS = frozenset(
-    {
-        "bash",
-        "zsh",
-        "dash",
-        "sh",
-        "ksh",
-        "fish",
-        "node",
-        "nodejs",
-        "ruby",
-        "perl",
-        "php",
-        "lua",
-        "pwsh",
-        "powershell",
-        "ssh",
-        "docker",
-        "kubectl",
-        "podman",
-    }
-)
-
-
-def _heredoc_feeds_an_executor(command: str) -> bool:
-    """Does any segment of this command EXECUTE what a heredoc gives it?
-
-    Fails CLOSED in every direction a credentials gate should: an unparseable
-    command, a blind spot `shell_parse` reports, or an unresolved verb all
-    return True, which keeps the heredoc body in the operand scan. The cost of
-    a wrong True is that a data heredoc's prose is scanned — which at worst
-    asks for consent the user can grant; the cost of a wrong False is a
-    credential read that never asked.
-
-    Deliberately broader than "the segment carrying the `<<`": `Segment.raw`
-    has the redirect excised, so the introducer cannot be attributed back to
-    its own segment. An interpreter anywhere in a command that also carries a
-    heredoc is enough to keep the body. That over-scans a pipeline pairing an
-    interpreter with an unrelated data heredoc, and over-scanning is the
-    direction this module chooses everywhere else.
-    """
-    try:
-        segments, blind = shell_parse.analyze_checked(command)
-    except Exception:  # noqa: BLE001 - any parse failure is an unknown receiver
-        return True
-    if blind is not None:
-        return True
-    for seg in segments:
-        if seg.verb_unresolved:
-            return True
-        exe = seg.exe
-        if exe in _EXEC_RECEIVERS or exe.startswith("python"):
-            return True
-    return False
-
-
 #: Ceilings on the glob walk below. A glob is expanded against the REAL
 #: filesystem, so a token like ``/*/*/*/*/*/*`` walks an unbounded subtree —
 #: MEASURED on this box at 1.1s for ``/usr/*/*/*`` and 6.0s for ``/sys/*/*/*/*``,
@@ -477,10 +401,16 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
     if not command:
         return False
 
-    # Heredoc bodies are data — unless the heredoc feeds an interpreter, in
-    # which case the body IS the executed payload and must be scanned.
-    exec_heredoc = _heredoc_feeds_an_executor(command)
-    scan = command if exec_heredoc else _HEREDOC.sub(" ", command)
+    try:
+        bodies = shell_parse.suppressed_heredoc_bodies(command)
+    except Exception:  # noqa: BLE001 - unknown heredoc disposition fails closed
+        bodies = None
+    exec_heredoc = bodies is None or len(re.findall(r"<<(?!<)", command)) > len(bodies)
+    scan = command
+    if bodies is not None:
+        for body in bodies:
+            if command.count(body) == 1:
+                scan = scan.replace(body, " ", 1)
     # Quoted regions are DATA for the command-level arm too: a commit message
     # naming the file is not an operand. The declared shell-variable residual
     # (`f=secrets; cat $f.env`) is unquoted, so it survives stripping.
@@ -506,8 +436,8 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
     # gate regardless of quoting.
     unquoted = set(_tokens(bare))
     if exec_heredoc:
-        # Inside an executed heredoc a quoted string is a code operand —
-        # `open("secrets.env")` reads the file — not prose. Every token counts.
+        # Any unsuppressed heredoc may execute or have an unknown receiver, so
+        # quoted strings in its body count as possible code operands.
         unquoted.update(_tokens(scan))
 
     for raw_tok in _tokens(scan):

@@ -7,12 +7,13 @@ into ``argv`` and spoofed ``git_subcommand`` → the push and commit gates keyed
 exact subcommand and never fired (fail-OPEN). This locks:
 
   1. ``argv`` is sourced from a redirect-STRIPPED view → the right subcommand;
-  2. ``raw`` (hence ``split_segments``) is byte-identical to before for ordinary
+  2. ``raw`` (hence ``split_segments``) retains historical output for ordinary
      commands (three gate files match ``Segment.raw`` against a fresh re-split for
-     cwd/occurrence tracking — any UNINTENDED drift silently breaks them). The lone
-     intended difference: a ``$(…)``/backtick target with an unquoted control operator
-     (``;``/``&&``/``||``/``|``) is paren-balanced into one segment — strictly SAFER
-     than HEAD (which mis-split it, missing the push/commit) — locked via EXPLOITS;
+     cwd/occurrence tracking — any UNINTENDED drift silently breaks them). Quoted
+     heredoc bodies for proven data receivers are intentionally omitted. A
+     ``$(…)``/backtick target with an unquoted control operator (``;``/``&&``/``||``/``|``)
+     is paren-balanced into one segment — strictly SAFER than HEAD (which mis-split
+     it, missing the push/commit) — locked via EXPLOITS;
   3. the nested command stays visible where bash would actually run it.
 """
 
@@ -29,7 +30,7 @@ import shell_parse as sp  # noqa: E402
 
 _GOLDEN = Path(__file__).resolve().parent / "_split_segments_golden.json"
 
-# ── Byte-identical corpus: split_segments(cmd) MUST NOT change ───────────────
+# ── Frozen raw corpus (no proven-data heredocs) ──────────────────────────────
 CORPUS: list[str] = [
     # plain targets (stripped from raw today)
     "git 2>/dev/null push",
@@ -90,9 +91,9 @@ CORPUS: list[str] = [
 ]
 
 
-# ── (1)+(2) byte-identical raw contract ─────────────────────────────────────
-def test_split_segments_byte_identical_to_golden():
-    """split_segments over the corpus reproduces the frozen pre-change output."""
+# ── (1)+(2) historical raw contract, with the data-heredoc exception ─────────
+def test_split_segments_retains_historical_output_without_data_heredocs():
+    """This corpus has no proven-data heredocs and retains its frozen raw output."""
     golden = json.loads(_GOLDEN.read_text())
     for cmd, expected in golden.items():
         assert sp.split_segments(cmd) == expected, cmd

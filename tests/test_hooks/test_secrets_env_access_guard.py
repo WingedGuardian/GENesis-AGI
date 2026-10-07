@@ -562,13 +562,15 @@ class TestAuditFindings:
         assert self._touches(command="cat ./secrets.env")
 
     def test_executor_heredoc_body_is_scanned(self) -> None:
-        """Devin SEC finding, #1826: `python3 <<'EOF' … EOF` EXECUTES its body —
-        stripping it as data let `cat secrets.env` inside run ungated."""
-        cmd = "python3 <<'PY'\nimport subprocess\nsubprocess.run(['cat', 'secrets.env'])\nPY"
+        """An interpreter body is never suppressed as receiver data."""
+        cmd = "python3 <<'EOF'\nopen(\"secrets.env\")\nEOF"
         assert self._touches(command=cmd)
-        # The control: a heredoc feeding a non-executor stays data.
         msg = "git commit -F - <<'MSG'\nfeat: secrets.env is not a service\nMSG"
         assert not self._touches(command=msg)
+
+    def test_unknown_receiver_heredoc_body_is_scanned(self) -> None:
+        cmd = "foo <<'EOF'\ncat secrets.env\nEOF"
+        assert self._touches(command=cmd)
 
     def test_a_too_wild_glob_gates_instead_of_walking(self) -> None:
         """CodeRabbit Major, #1826: iglob walks a deep subtree BETWEEN yields,
@@ -685,12 +687,10 @@ class TestAuditFindings:
         """
         assert not self._touches(command="ls /usr/*/*/*")
 
-    # ── R-2: the heredoc receiver was matched by pattern, not resolved ──────
+    # ── Quoted heredoc bodies are visible unless a data receiver is proven ──
     #
-    # A heredoc body is data unless the heredoc feeds something that EXECUTES
-    # it. The first version anchored the interpreter at the command start or
-    # after an operator, so three ordinary spellings hid it and the credential
-    # read inside the body ran without consent. MEASURED against the real file.
+    # These executable and unknown receivers are not in shell_parse's closed
+    # data set, so their bodies remain visible to the credentials gate.
     @pytest.mark.parametrize(
         "prefix",
         [

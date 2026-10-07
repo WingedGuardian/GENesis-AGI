@@ -29,6 +29,14 @@ def _push_blocked(cmd: str) -> bool:
     return bool(segs) and not all(s.override for s in segs)
 
 
+def _push_segments(cmd: str) -> list[sp.Segment]:
+    return [
+        seg
+        for seg in sp.analyze(cmd)
+        if seg.exe == "git" and len(seg.argv) > 1 and seg.argv[1] == "push"
+    ]
+
+
 def _commit_nv(cmd: str) -> bool:
     return any(sp.commit_skips_hooks(s.argv) for s in sp.analyze(cmd))
 
@@ -867,6 +875,408 @@ def test_has_top_level_pipe_substitution_is_not_a_bg_pipe(cmd):
 )
 def test_has_top_level_pipe_real_pipe_around_substitution(cmd):
     assert sp.has_top_level_pipe(cmd) is True
+
+
+# ── quoted heredocs (#1889) ─────────────────────────────────────────────
+
+
+class TestQuotedHeredocBody:
+    """Issue #1889: suppress only bodies proven to be literal receiver data."""
+
+    @pytest.mark.parametrize(
+        ("command", "outside_argv"),
+        [
+            (
+                "echo before; cat <<'EOF'\ngit push origin main\nEOF\necho after",
+                (["echo", "before"], ["cat"], ["echo", "after"]),
+            ),
+            (
+                "echo before; git commit -F - <<'EOF'\ngit push origin main\nEOF\necho after",
+                (
+                    ["echo", "before"],
+                    ["git", "commit", "-F", "-"],
+                    ["echo", "after"],
+                ),
+            ),
+            (
+                "echo before; gh pr create --title x --body-file - <<'EOF'\n"
+                "git push origin main\nEOF\necho after",
+                (
+                    ["echo", "before"],
+                    ["gh", "pr", "create", "--title", "x", "--body-file", "-"],
+                    ["echo", "after"],
+                ),
+            ),
+            (
+                "echo before; cat <<'EOF' | git commit -F -\n"
+                "git push origin main\nEOF\necho after",
+                (
+                    ["echo", "before"],
+                    ["cat"],
+                    ["git", "commit", "-F", "-"],
+                    ["echo", "after"],
+                ),
+            ),
+            (
+                "echo before; cat <<'E1' && wc -l <<'E2'\n"
+                "git push origin main\nE1\ngit push origin main\nE2\necho after",
+                (
+                    ["echo", "before"],
+                    ["cat"],
+                    ["wc", "-l"],
+                    ["echo", "after"],
+                ),
+            ),
+            (
+                "echo before; cat <<'E$OF'\ngit push origin main\nE$OF\necho after",
+                (["echo", "before"], ["cat"], ["echo", "after"]),
+            ),
+            (
+                'echo before; cat <<"E$OF"\ngit push origin main\nE$OF\necho after',
+                (["echo", "before"], ["cat"], ["echo", "after"]),
+            ),
+            (
+                "echo before; cat <<$'EOF'\ngit push origin main\nEOF\necho after",
+                (["echo", "before"], ["cat"], ["echo", "after"]),
+            ),
+            (
+                "echo before; cat <<- 'EOF'\n\tgit push origin main\n\tEOF\necho after",
+                (["echo", "before"], ["cat"], ["echo", "after"]),
+            ),
+            (
+                "cat <<'EOF'\r\ngit push origin main\r\nEOF\r",
+                (["cat"],),
+            ),
+            (
+                "echo before; cat >s.sh <<'EOF'\ngit push origin main\nEOF",
+                (["echo", "before"], ["cat"]),
+            ),
+            (
+                "echo before; gh pr create --title x --body "
+                "\"$(cat <<'EOF'\ngit push origin main\nEOF\n)\"; echo after",
+                (
+                    ["echo", "before"],
+                    ["gh", "pr", "create", "--title", "x", "--body", "$(cat <<'EOF'\n"
+                    "git push origin main\nEOF\n)"],
+                    ["cat"],
+                    ["echo", "after"],
+                ),
+            ),
+            (
+                "echo before; git commit -m "
+                "\"$(cat <<'EOF'\ngit push origin main\nEOF\n)\"; echo after",
+                (
+                    ["echo", "before"],
+                    ["git", "commit", "-m", "$(cat <<'EOF'\ngit push origin main\nEOF\n)"],
+                    ["cat"],
+                    ["echo", "after"],
+                ),
+            ),
+        ],
+        ids=[
+            "cat",
+            "git-commit-file-stdin",
+            "gh-pr-body-file-stdin",
+            "pipeline-to-git-commit",
+            "two-openers",
+            "single-quoted-dollar-delimiter",
+            "double-quoted-dollar-delimiter",
+            "ansi-c-delimiter",
+            "tab-stripped-delimiter",
+            "crlf-delimiter",
+            "terminal-file-writer",
+            "gh-body-substitution",
+            "git-message-substitution",
+        ],
+    )
+    def test_only_proven_data_bodies_are_suppressed(
+        self, command: str, outside_argv: tuple[list[str], ...]
+    ) -> None:
+        segments = sp.analyze(command)
+        assert not [
+            seg
+            for seg in segments
+            if seg.exe == "git" and len(seg.argv) > 1 and seg.argv[1] == "push"
+        ]
+        for argv in outside_argv:
+            assert any(seg.argv == argv for seg in segments), (argv, segments)
+
+    @pytest.mark.parametrize(
+        ("command", "visible"),
+        [
+            pytest.param(
+                "cat <<'EOF' > >(bash)\ngit push origin main\nEOF\n",
+                True,
+                id="procsub-output",
+            ),
+            pytest.param(
+                "cat <<'EOF' | tee >(bash)\ngit push origin main\nEOF\n",
+                True,
+                id="tee-procsub",
+            ),
+            pytest.param(
+                "cat <<'EOF' | tee >(bash) >/dev/null\n"
+                "git push origin main\nEOF\n",
+                True,
+                id="tee-procsub-and-null",
+            ),
+            pytest.param(
+                "cat <<'EOF' 1> >(sh)\ngit push origin main\nEOF\n",
+                True,
+                id="fd-dup-procsub",
+            ),
+            pytest.param(
+                "cat <<'EOF' | grep -f /dev/stdin <(bash)\n"
+                "git push origin main\nEOF\n",
+                True,
+                id="grep-file-procsub",
+            ),
+            pytest.param(
+                "cat <<'EOF' $(echo\ngit push origin main\n)\nbody\nEOF\n",
+                True,
+                id="newline-in-command-substitution",
+            ),
+            pytest.param(
+                "cat <<'EOF' `echo\ngit push origin main\n`\nbody\nEOF\n",
+                True,
+                id="newline-in-backtick",
+            ),
+            pytest.param(
+                "cat <<'EOF' \"a\ngit push origin main\"\nbody\nEOF\n",
+                False,
+                id="newline-in-double-quote-control",
+            ),
+            pytest.param(
+                "cat <<'EOF'\ngit push origin main\nEOF\n",
+                False,
+                id="plain-cat-control",
+            ),
+            pytest.param(
+                "cat() { bash; }; cat <<'EOF'\ngit push origin main\nEOF\n",
+                True,
+                id="function-shadow",
+            ),
+            pytest.param(
+                "function cat { bash; }; cat <<'EOF'\ngit push origin main\nEOF\n",
+                True,
+                id="function-keyword-shadow",
+            ),
+            pytest.param(
+                "cat() { bash; }; gh pr create --body-file - <<'EOF'\n"
+                "git push origin main\nEOF\n",
+                True,
+                id="function-shadow-gh-file-body",
+            ),
+            pytest.param(
+                "cat() { bash; }; gh pr create --body "
+                "\"$(cat <<'EOF'\ngit push origin main\nEOF\n)\"",
+                True,
+                id="function-shadow-gh-substitution",
+            ),
+            pytest.param(
+                "PATH=/tmp/x cat <<'EOF'\ngit push origin main\nEOF\n",
+                True,
+                id="path-assignment-prefix",
+            ),
+            pytest.param(
+                "LC_ALL=C cat <<'EOF'\ngit push origin main\nEOF\n",
+                True,
+                id="locale-assignment-prefix",
+            ),
+            pytest.param(
+                "cat <<'EOF' >\ngit push origin main\nEOF\n",
+                True,
+                id="empty-redirect-target",
+            ),
+        ],
+    )
+    def test_heredoc_receiver_edges_keep_push_visible(
+        self, command: str, visible: bool
+    ) -> None:
+        push_segments = [
+            segment
+            for segment in sp.analyze(command)
+            if segment.exe == "git"
+            and len(segment.argv) > 1
+            and segment.argv[1] == "push"
+        ]
+        assert bool(push_segments) is visible, (command, push_segments)
+
+    def test_heredoc_substitution_data_verb_returns_bool(self) -> None:
+        assert sp._is_heredoc_substitution_data_verb(["git"]) is False
+        assert sp._is_heredoc_substitution_data_verb(["gh"]) is False
+        assert (
+            sp._is_heredoc_substitution_data_verb(["LC_ALL=C", "gh", "pr", "create"])
+            is False
+        )
+
+    @pytest.mark.parametrize(
+        ("word", "expected"),
+        [
+            ("'EOF'", ("EOF", True)),
+            ('"E$OF"', ("E$OF", True)),
+            ("E$OF", ("E$OF", False)),
+            ("$'EOF'", ("EOF", True)),
+            (r"E\OF", ("EOF", True)),
+            (r"$'E\OF'", ("", False)),
+            ("`EOF`", ("", False)),
+            ("''", ("", False)),
+        ],
+    )
+    def test_delimiter_quote_removal(self, word: str, expected: tuple[str, bool]) -> None:
+        assert sp._heredoc_delimiter(word) == expected
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat <<'EOF' | bash\ngit push origin main\nEOF",
+            "cat <<'EOF' | cat | bash\ngit push origin main\nEOF",
+            "{ bash; } <<'EOF'\ngit push origin main\nEOF",
+            "while read -r line; do eval \"$line\"; done <<'EOF'\ngit push origin main\nEOF",
+            "make -f - <<'EOF'\ngit push origin main\nEOF",
+            "cat <<'EOF' \\\n| bash\ngit push origin main\nEOF",
+            "cat <<'EOF' >/dev/null && \\\ngit push origin main\nbody\nEOF",
+            "eval \"$(cat <<'EOF'\ngit push origin main\nEOF\n)\"",
+            "X=$(cat <<'EOF'\ngit push origin main\nEOF\n); eval \"$X\"",
+            "cat >s.sh <<'EOF'\ngit push origin main\nEOF\nbash s.sh",
+            "run() { bash; }; run <<'EOF'\ngit push origin main\nEOF",
+            "sudo cat <<'EOF'\ngit push origin main\nEOF",
+            "bash <<'EOF'\ngit push origin main\nEOF",
+            'echo $((1 << "2"))\ngit push origin main',
+            "cat \\<<'EOF'\ngit push origin main\nEOF",
+            "cat <<OUTER\ncat <<'INNER'\ngit push origin main\nINNER\nOUTER",
+            "cat <<'EOF'\ngit push origin main",
+            "echo `cat <<'EOF'\ngit push origin main\nEOF`",
+        ],
+        ids=[
+            "pipe-to-bash",
+            "longer-pipe-to-bash",
+            "brace-group",
+            "while-eval",
+            "make-stdin",
+            "continued-pipeline",
+            "continued-neighbor",
+            "eval-substitution",
+            "assignment-then-eval",
+            "write-then-bash",
+            "function-calls-bash",
+            "sudo-cat",
+            "bash",
+            "arithmetic-shift",
+            "escaped-opener",
+            "nested-opener-in-unquoted-body",
+            "unterminated",
+            "backtick",
+        ],
+    )
+    def test_every_unproven_body_stays_visible(self, command: str) -> None:
+        assert _push_segments(command)
+
+    def test_unquoted_body_is_known_1748_over_block(self) -> None:
+        """Known #1748 over-block: expansion-capable bodies remain visible."""
+        assert _push_segments("cat <<EOF\ngit push origin main\nEOF")
+
+    @pytest.mark.parametrize(
+        "redirect",
+        [
+            "> out",
+            ">> out",
+            ">| out",
+            "&> out",
+            "&>> out",
+            "1> out",
+            "1>> out",
+            ">&3",
+        ],
+    )
+    def test_file_writing_redirect_keeps_heredoc_visible(self, redirect: str) -> None:
+        command = (
+            f"cat <<'EOF' {redirect}\n"
+            "git push origin main\nEOF\necho after"
+        )
+        assert _push_segments(command)
+
+    @pytest.mark.parametrize(
+        "redirect",
+        [
+            "> /dev/null",
+            "> /dev/stdout",
+            "> /dev/stderr",
+            '>"&1"',
+            '>"&2"',
+            ">&1",
+            ">&2",
+            "2> out",
+        ],
+    )
+    def test_non_file_sink_redirect_allows_heredoc_suppression(
+        self, redirect: str
+    ) -> None:
+        command = (
+            f"cat <<'EOF' {redirect}\n"
+            "git push origin main\nEOF\necho after"
+        )
+        assert not _push_segments(command)
+
+    @pytest.mark.parametrize(
+        ("suffix", "visible"),
+        [
+            ("| tee out", False),
+            ("| tee -", False),
+            ("| tee /dev/null", False),
+            ("| tee out | cat", True),
+        ],
+    )
+    def test_tee_file_operand_must_be_last_pipeline_member(
+        self, suffix: str, visible: bool
+    ) -> None:
+        command = f"cat <<'EOF' {suffix}\ngit push origin main\nEOF"
+        assert bool(_push_segments(command)) is visible
+
+    def test_comment_cannot_register_a_heredoc(self) -> None:
+        assert _push_segments("echo hi;# <<'EOF'\ngit push origin main\nEOF")
+
+    def test_herestring_cannot_register_a_heredoc(self) -> None:
+        assert _push_segments("cat <<<'EOF'\ngit push origin main")
+
+    def test_untokenizable_still_sees_suppressed_body_prose(self) -> None:
+        command = "cat <<'EOF'\ndon't\nEOF"
+        assert sp.suppressed_heredoc_bodies(command) == ("don't\n",)
+        assert sp.untokenizable(command)
+
+    def test_nested_heredoc_belongs_to_its_substitution(self) -> None:
+        command = "cat \"$(bash <<'EOF'\ngit push origin main\nEOF\n)\""
+        assert _push_segments(command)
+
+    def test_parse_segments_can_leave_even_proven_data_visible(self) -> None:
+        parsed = sp.parse_segments(
+            "cat <<'EOF'\ngit push origin main\nEOF",
+            suppress_data_heredocs=False,
+        )
+        assert any(segment.raw == "git push origin main" for segment in parsed)
+
+    def test_suppressed_body_report_uses_the_analyzer_traversal(self) -> None:
+        command = (
+            "cat <<'A'\none\nA\n"
+            "gh pr create --body \"$(cat <<'B'\ntwo\nB\n)\""
+        )
+        assert sp.suppressed_heredoc_bodies(command) == ("one\n", "two\n")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "x" * (sp.MAX_COMMAND_CHARS + 1),
+            "echo "
+            + "$(echo " * (sp.MAX_SUBSTITUTION_DEPTH + 2)
+            + "true"
+            + ")" * (sp.MAX_SUBSTITUTION_DEPTH + 2),
+        ],
+        ids=["length", "depth"],
+    )
+    def test_suppressed_body_report_is_none_when_analysis_is_blind(
+        self, command: str
+    ) -> None:
+        assert sp.suppressed_heredoc_bodies(command) is None
 
 
 class TestSigilRunRegression:

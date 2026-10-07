@@ -532,9 +532,8 @@ def _redirect_operator_len(command: str, i: int) -> int | None:
     already buffered and the following target is consumed by the caller):
     ``>`` ``>>`` ``>&`` ``>|`` ``<`` ``<<`` ``<<<`` ``<&`` ``&>`` ``&>>``.
     A bare ``&`` (background) and a bare ``|`` (pipe) are NOT redirects — they
-    stay control operators. Process substitution ``>(…)``/``<(…)`` is
-    deliberately NOT treated as a redirect (see ``_substitutions``' documented
-    gap); ``>(`` returns length 1 here so the ``(`` is handled normally.
+    stay control operators. Process substitutions are marked by ``parse_segments``
+    before their operator is handled here.
     """
     n = len(command)
     c = command[i]
@@ -546,8 +545,12 @@ def _redirect_operator_len(command: str, i: int) -> int | None:
         nxt = command[i + 1] if i + 1 < n else ""
         return 2 if nxt in (">", "&", "|") else 1
     if c == "<":
-        if command[i + 1 : i + 3] == "<<":  # <<<
+        if command[i : i + 3] == "<<<":
             return 3
+        if command[i : i + 3] == "<<-":
+            return 3
+        if command[i : i + 2] == "<<":
+            return 2
         nxt = command[i + 1] if i + 1 < n else ""
         return 2 if nxt in ("<", "&") else 1
     return None
@@ -557,20 +560,12 @@ _TARGET_STOP = (" ", "\t", "\n", ";", "|", "&", "<", ">", "(", ")")
 
 
 class _ParsedSegment(NamedTuple):
-    """A split segment with two text views.
-
-    ``raw`` is byte-identical to what ``split_segments`` has always returned (the
-    executed-segment string, comment retained; an EXPANSION-carrying redirect target
-    is retained so ``_substitutions`` still sees the nested command it EXECUTES).
-    ``argv_src`` is ``raw`` with every redirect operator+target removed — the string
-    ``analyze`` tokenizes into argv, so a redirect target can never spoof the
-    subcommand. ``redirects`` are the expansion operator-target words excised from
-    ``argv_src`` (observability).
-    """
+    """A segment's raw text, argv source, redirect targets, and suppressed bodies."""
 
     raw: str
     argv_src: str
     redirects: tuple[str, ...]
+    heredocs: tuple[str, ...] = ()
 
 
 def _command_sub_end(command: str, i: int, n: int) -> int:
@@ -669,43 +664,279 @@ def _redirect_target_end(command: str, j0: int, n: int) -> int:
     return j
 
 
-def parse_segments(command: str) -> list[_ParsedSegment]:
-    """Split a command line into executed segments, returning per segment BOTH the raw
-    text and a redirect-STRIPPED argv source (see ``_ParsedSegment``).
+def _heredoc_delimiter(word: str) -> tuple[str, bool]:
+    """The terminating delimiter and quoting of a ``<<`` target word.
 
-    Quote-aware: an operator inside a quoted string does not split. Splits on ``&&``,
-    ``||``, ``;``, ``|``, ``&`` and newlines. A ``#`` comment (opened outside quotes)
-    runs to end-of-line and is retained in ``raw`` so override detection can see it.
-
-    Redirect-aware: a redirection (``2>/dev/null``, ``> out.log``, ``2>&1``, ``&>log``,
-    ``>| f``, ``< in``, ``<<<here``) is consumed — operator AND target. A PLAIN-filename
-    target is dropped from BOTH views. A target that can carry a command expansion (any
-    ``$`` or backtick — ``2>$(rm x)``, ``2>"$(rm x)"``, ``2>$VAR``, backtick) is KEPT in
-    ``raw`` (so ``_substitutions`` still sees the nested command a substitution redirect
-    target EXECUTES) but EXCLUDED from ``argv_src`` — so it can no longer leak into argv
-    and spoof ``git_subcommand``/``commit_skips_hooks`` (the push/commit fail-open this
-    split closes). Process substitution ``<(…)``/``>(…)`` stays in BOTH (documented gap).
-    ``raw`` stays byte-identical to the historical ``split_segments`` output for every
-    ordinary command (the cwd/occurrence consumers match ``Segment.raw`` against a fresh
-    re-split; locked by a golden test over a broad corpus). ONE intentional difference
-    from the pre-#1455 scanner: a ``$(…)``/backtick target that contains an UNQUOTED
-    control operator (``;`` ``&&`` ``||`` ``|``) is now paren-balanced into ONE segment
-    instead of mis-split on that operator — which CLOSES an additional fail-open (HEAD
-    mis-split ``git 2>$(a; b) push`` into ``git  $(a`` + ``b) push`` so ``git_subcommand``
-    never saw the ``push``); the nested ``a``/``b`` still surface via ``_substitutions``.
-    So ``raw`` is byte-identical EXCEPT it is strictly SAFER on this class — never the
-    other direction (locked by the ``$(;)``/``$(&&)``/``$(|)`` cases in the redirect-argv
-    test's EXPLOITS).
+    Bash quote-removes the delimiter word; quoting ANY part of it — a ``'``,
+    a ``"``, a ``\\``, or ANSI-C ``$'…'`` — makes the body quoted. Dollar signs
+    are otherwise literal in this quote-removal-only pass. Returns
+    ``(delimiter, quoted)``; ``("", False)`` when the word is empty, contains a
+    backtick, or has a backslash inside ANSI-C quoting, since its delimiter is
+    not tracked safely.
     """
-    pairs: list[tuple[str, str, list[str]]] = []
+    if not word or "`" in word:
+        return "", False
+    out: list[str] = []
+    q: str | None = None
+    ansi_c = False
+    quoted = False
+    i = 0
+    while i < len(word):
+        ch = word[i]
+        if q is not None:
+            if ansi_c and ch == "\\":
+                return "", False
+            if ch == q:
+                q = None
+                ansi_c = False
+            else:
+                out.append(ch)
+            i += 1
+            continue
+        if word[i : i + 2] == "$'":
+            quoted = True
+            ansi_c = True
+            q = "'"
+            i += 2
+            continue
+        if ch == "\\" and i + 1 < len(word):  # \<c> quotes the delimiter too
+            quoted = True
+            out.append(word[i + 1])
+            i += 2
+            continue
+        if ch in ("'", '"'):
+            quoted = True
+            q = ch
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    if q is not None:  # unterminated quote in the delimiter — invalid shell
+        return "", False
+    delimiter = "".join(out)
+    return (delimiter, quoted) if delimiter else ("", False)
+
+
+def _heredoc_body_end(
+    command: str, i: int, n: int, delim: str, strip_tabs: bool
+) -> tuple[str, int, bool]:
+    """``(body, next_index, terminated)`` for a body starting at ``command[i]``.
+
+    The body runs line-wise until a line equal to the delimiter (leading tabs
+    ignored only for ``<<-``, bash's tab-strip spelling) and ends BEFORE that
+    line — the delimiter is not part of the body. Unterminated input consumes
+    to end-of-string, matching bash reading to EOF.
+    """
+    body_start = i
+    while i < n:
+        line_end = command.find("\n", i)
+        if line_end == -1:
+            line_end = n
+        line = command[i : line_end]
+        if (line.lstrip("\t") if strip_tabs else line) == delim:
+            return (
+                command[body_start:i],
+                line_end + (1 if line_end < n else 0),
+                True,
+            )
+        i = line_end + 1
+    return command[body_start:n], n, False
+
+
+_HEREDOC_FILE_SINKS = frozenset(
+    {"/dev/null", "/dev/stdout", "/dev/stderr", "&1", "&2"}
+)
+
+
+def _data_receiver(
+    argv_src: str,
+    redirects_to_file: bool,
+    procsub: bool,
+    redirect_empty: bool,
+) -> tuple[bool, bool]:
+    """Whether this command is a closed-set data receiver, and writes a file."""
+    if procsub or redirect_empty:
+        return False, False
+    argv = _argv(argv_src)
+    if not argv:
+        return False, redirects_to_file
+
+    exe = _basename(argv[0])
+    args = argv[1:]
+    if exe in {"cat", "wc", "grep"}:
+        return True, redirects_to_file
+    if exe == "tee":
+        after_options = False
+        operands: list[str] = []
+        for arg in args:
+            if arg == "--":
+                after_options = True
+            elif not after_options and arg.startswith("-") and arg != "-":
+                continue
+            else:
+                operands.append(arg)
+        tee_writes_file = any(
+            operand not in {"-", "/dev/null"} for operand in operands
+        )
+        return True, redirects_to_file or tee_writes_file
+    if exe == "git" and args and args[0] in {"commit", "tag", "notes"}:
+        file_stdin = any(
+            args[i : i + 2] in (["-F", "-"], ["--file", "-"])
+            or args[i] == "-F-"
+            or args[i] == "--file=-"
+            for i in range(len(args))
+        )
+        return file_stdin, redirects_to_file
+    if exe == "gh" and len(args) >= 2 and args[0] in {"pr", "issue"}:
+        if args[1] not in {"create", "comment", "edit"}:
+            return False, redirects_to_file
+        file_stdin = any(
+            args[i : i + 2] in (["--body-file", "-"], ["-F", "-"])
+            or args[i] == "--body-file=-"
+            for i in range(len(args))
+        )
+        return file_stdin, redirects_to_file
+    return False, redirects_to_file
+
+
+_FUNCTION_DEFINITION = re.compile(r"^\s*(?:function\s|[\w.:-]+\s*\(\s*\))")
+
+
+def _is_function_definition(argv_src: str) -> bool:
+    return bool(_FUNCTION_DEFINITION.match(argv_src))
+
+
+def _redirect_writes_file(operator: str, fd: str, target: str) -> bool:
+    """Whether a redirect sends stdout to a file rather than a standard sink."""
+    try:
+        words = shlex.split(target)
+        normalized = words[0] if len(words) == 1 else target
+    except ValueError:
+        normalized = target
+    if normalized in _HEREDOC_FILE_SINKS:
+        return False
+    if operator.startswith("&>"):
+        return True
+    if operator == ">&":
+        return normalized.isdigit() and normalized not in {"1", "2"}
+    return operator.startswith(">") and (not fd or fd == "1")
+
+
+def _heredoc_owners_are_data(
+    pairs: list[list], owners: set[int], command: str, last_delimiter_end: int
+) -> bool:
+    """Check all opener pipelines with one classification pass per pipeline."""
+    bounds_by_member: dict[int, tuple[int, int]] = {}
+    start = 0
+    for end, pair in enumerate(pairs):
+        if pair[4] != "|" or end + 1 == len(pairs):
+            for member in range(start, end + 1):
+                bounds_by_member[member] = (start, end)
+            start = end + 1
+    owners_by_pipeline: dict[tuple[int, int], list[int]] = {}
+    for owner in owners:
+        bounds = bounds_by_member[owner]
+        owners_by_pipeline.setdefault(bounds, []).append(owner)
+
+    for (start, end), pipeline_owners in owners_by_pipeline.items():
+        members = list(range(start, end + 1))
+        receiver_info = [
+            _data_receiver(
+                pairs[index][1], pairs[index][5], pairs[index][6], pairs[index][7]
+            )
+            for index in members
+        ]
+        suffix_allowed = [True] * (len(members) + 1)
+        suffix_writers = [0] * (len(members) + 1)
+        for offset in range(len(members) - 1, -1, -1):
+            member = members[offset]
+            links_next = pairs[member][4] == "|" and offset + 1 < len(members)
+            allowed, writes_file = receiver_info[offset]
+            suffix_allowed[offset] = allowed and (
+                not links_next or suffix_allowed[offset + 1]
+            )
+            suffix_writers[offset] = int(writes_file) + (
+                suffix_writers[offset + 1] if links_next else 0
+            )
+
+        for opener in pipeline_owners:
+            offset = opener - start
+            if not suffix_allowed[offset]:
+                return False
+            writer_count = suffix_writers[offset]
+            if writer_count and not (
+                writer_count == 1
+                and receiver_info[-1][1]
+                and pairs[end][4] in {"", "\n"}
+                and not command[last_delimiter_end:].strip()
+            ):
+                return False
+    return True
+
+
+def parse_segments(
+    command: str, *, suppress_data_heredocs: bool = True
+) -> list[_ParsedSegment]:
+    """Split commands and suppress only terminated quoted bodies with proven data owners.
+
+    ``suppress_data_heredocs=False`` leaves even proven data bodies visible.
+    """
+    pairs: list[list] = []
     raw_buf: list[str] = []
     argv_buf: list[str] = []
     redirs: list[str] = []
+    writes_file = False
+    procsub = False
+    redirect_empty = False
+    #: (delimiter, quoted, strip_tabs, owner pair), in opener order.
+    pending: list[tuple[str, bool, bool, int]] = []
+    pending_unsafe = False
+    scan_body_until = -1
+    continued_after_newline = False
     i, n = 0, len(command)
     quote: str | None = None
+    in_comment = False
+
+    def finish(separator: str) -> None:
+        nonlocal raw_buf, argv_buf, redirs, writes_file, procsub, redirect_empty
+        pairs.append(
+            [
+                "".join(raw_buf),
+                "".join(argv_buf),
+                list(redirs),
+                [],
+                separator,
+                writes_file,
+                procsub,
+                redirect_empty,
+            ]
+        )
+        raw_buf, argv_buf, redirs = [], [], []
+        writes_file = False
+        procsub = False
+        redirect_empty = False
+
+    def odd_backslash_run(pos: int) -> bool:
+        start = pos
+        while start > 0 and command[start - 1] == "\\":
+            start -= 1
+        return (pos - start) % 2 == 1
+
+    paren_depth = 0
+    in_backtick = False
     while i < n:
         c = command[i]
-        if quote:
+        newline_in_comment = False
+        if in_comment:
+            if c != "\n":
+                raw_buf.append(c)
+                argv_buf.append(c)
+                i += 1
+                continue
+            in_comment = False  # the newline ends the comment AND splits
+            newline_in_comment = True
+            # Fall through so this physical newline remains a segment boundary.
+        elif quote:
             raw_buf.append(c)
             argv_buf.append(c)
             if quote == '"' and c == "\\" and i + 1 < n:
@@ -717,29 +948,99 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
                 quote = None
             i += 1
             continue
-        if c in ("'", '"'):
+        escaped = odd_backslash_run(i)
+        if c in ("'", '"') and not escaped:
             quote = c
+            raw_buf.append(c)
+            argv_buf.append(c)
+            i += 1
+            continue
+        if c == "#" and (i == 0 or command[i - 1] in " \t\n;&|("):
+            in_comment = True
             raw_buf.append(c)
             argv_buf.append(c)
             i += 1
             continue
         two = command[i : i + 2]
         if two in ("&&", "||"):
-            pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
-            raw_buf, argv_buf, redirs = [], [], []
+            if (
+                continued_after_newline
+                and pairs
+                and not "".join(raw_buf).strip()
+                and not redirs
+                and not writes_file
+            ):
+                pairs[-1][4] = two
+                raw_buf, argv_buf = [], []
+            else:
+                finish(two)
+            continued_after_newline = False
             i += 2
             continue
+        if c in (";", "|", "\n") or (c == "&" and not command.startswith("&>", i)):
+            if (
+                continued_after_newline
+                and pairs
+                and not "".join(raw_buf).strip()
+                and not redirs
+                and not writes_file
+            ):
+                pairs[-1][4] = c
+                raw_buf, argv_buf = [], []
+            else:
+                finish(c)
+            escaped_newline = (
+                c == "\n" and not newline_in_comment and odd_backslash_run(i)
+            )
+            continued_after_newline = escaped_newline
+            i += 1
+            if c == "\n" and pending and not escaped_newline:
+                if paren_depth or in_backtick:
+                    pending_unsafe = True
+                else:
+                    cursor = i
+                    extents: list[tuple[str, int, bool, int, bool]] = []
+                    for delim, hquoted, strip_tabs, owner in pending:
+                        body, end, terminated = _heredoc_body_end(
+                            command, cursor, n, delim, strip_tabs
+                        )
+                        extents.append((body, end, terminated, owner, hquoted))
+                        cursor = end
+                    all_terminated = all(item[2] for item in extents)
+                    owners = {item[3] for item in extents}
+                    suppress = (
+                        suppress_data_heredocs
+                        and not pending_unsafe
+                        and all_terminated
+                        and all(item[4] for item in extents)
+                        and _heredoc_owners_are_data(pairs, owners, command, cursor)
+                    )
+                    if suppress:
+                        for body, _, _, owner, _ in extents:
+                            pairs[owner][3].append(body)
+                        i = cursor
+                    else:
+                        scan_body_until = cursor
+                    pending.clear()
+                    pending_unsafe = False
+            continue
+        if continued_after_newline and not c.isspace():
+            continued_after_newline = False
+        if i >= scan_body_until and not escaped and two in ("<(", ">("):
+            procsub = True
         op_len = _redirect_operator_len(command, i)
         if op_len is not None:
             # Drop a standalone leading fd digit-run from BOTH buffers (the '2' of
             # ` 2>`), but NOT a digit that ends a word (`push2>x` keeps 'push2'). The
             # trailing digits are mirrored in both buffers, so remove the same count.
+            fd = ""
             if c != "&":
                 k = len(raw_buf)
                 while k > 0 and raw_buf[k - 1].isdigit():
                     k -= 1
                 if k < len(raw_buf) and (k == 0 or raw_buf[k - 1].isspace()):
                     ndel = len(raw_buf) - k
+                    fd = "".join(raw_buf[k:])
                     del raw_buf[k:]
                     del argv_buf[len(argv_buf) - ndel :]
             j = i + op_len
@@ -759,6 +1060,24 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
             if j < n and t not in _TARGET_STOP:
                 j = _redirect_target_end(command, j0, n)
             target = command[j0:j]
+            if not target:
+                redirect_empty = True
+            is_heredoc = (
+                command[i] == "<"
+                and command[i : i + 2] == "<<"
+                and command[i : i + 3] != "<<<"
+            )
+            if is_heredoc and target and i >= scan_body_until:
+                strip_tabs = command[i : i + 3] == "<<-"
+                if not escaped and not in_backtick and paren_depth == 0:
+                    delim, hquoted = _heredoc_delimiter(target)
+                else:
+                    delim, hquoted = "", False
+                if delim:
+                    pending.append((delim, hquoted, strip_tabs, len(pairs)))
+            operator = command[i : i + op_len]
+            if _redirect_writes_file(operator, fd, target):
+                writes_file = True
             if "$" in target or "`" in target:
                 # Expansion-carrying target: KEEP in raw (nested command stays visible
                 # to the destructive guard via _substitutions), EXCLUDE from argv_src so
@@ -772,26 +1091,44 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
                 argv_buf.append(" ")
             i = j
             continue
-        if c in (";", "|", "&", "\n"):
-            pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
-            raw_buf, argv_buf, redirs = [], [], []
-            i += 1
-            continue
+        escaped = odd_backslash_run(i)
+        if c == "`" and not escaped:
+            in_backtick = not in_backtick
+        if not in_backtick and not escaped and c == "(":
+            paren_depth += 1
+        elif not in_backtick and not escaped and c == ")" and paren_depth:
+            paren_depth -= 1
         raw_buf.append(c)
         argv_buf.append(c)
         i += 1
-    pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
+    pairs.append(
+        [
+            "".join(raw_buf),
+            "".join(argv_buf),
+            list(redirs),
+            [],
+            "",
+            writes_file,
+            procsub,
+            redirect_empty,
+        ]
+    )
+    if suppress_data_heredocs and any(_is_function_definition(pair[1]) for pair in pairs):
+        return parse_segments(command, suppress_data_heredocs=False)
     return [
-        _ParsedSegment(raw=r.strip(), argv_src=a.strip(), redirects=tuple(d))
-        for (r, a, d) in pairs
+        _ParsedSegment(
+            raw=r.strip(),
+            argv_src=a.strip(),
+            redirects=tuple(d),
+            heredocs=tuple(h),
+        )
+        for r, a, d, h, _, _, _, _ in pairs
         if r.strip()  # filter on RAW — keeps the exact set/alignment split_segments had
     ]
 
 
 def split_segments(command: str) -> list[str]:
-    """Executed-segment raw strings — a thin, byte-identical view over
-    ``parse_segments`` (all redirect/quote/comment semantics live there). Kept as the
-    stable ``list[str]`` API the cwd/occurrence consumers iterate."""
+    """Executed-segment strings, including heredoc suppression from ``parse_segments``."""
     return [p.raw for p in parse_segments(command)]
 
 
@@ -1019,22 +1356,14 @@ def _ansi_c_spans(text: str) -> list[tuple[int, int, str, bool]]:
     Only spans OUTSIDE single- and double-quoted regions are ANSI-C: bash does
     NOT treat ``$'...'`` as ANSI-C inside ``"..."`` (there it is a literal ``$``
     followed by a quoted string), and everything inside ``'...'`` is literal.
-    Getting this dq/sq state right is what keeps the scan off heredoc-body and
-    quoted text. MEASURED to matter (author, 2026-09-04, over a corpus of 38,140
+    The scanner receives original text, including data bodies suppressed by
+    ``parse_segments``; apostrophes in that prose still affect untokenizability.
+    MEASURED to matter
+    (author, 2026-09-04, over a corpus of 38,140
     real Bash commands harvested from this install's CC transcripts): a naive
     ``$'`` scan flagged 89, dq-awareness cut that to 45, and the residue is
-    almost entirely heredoc bodies. Heredoc bodies are NOT excluded here, and
-    saying so plainly matters: :func:`parse_segments` has no heredoc state, so a
-    body line is already segmented as a command TODAY — MEASURED on origin/main,
-    a ``cat <<'EOF'`` body line holding a plain gated git command resolves to a
-    ``('git', <verb>)`` segment and is over-blocked with or without this decode.
-    The decode makes the ANSI-C form CONSISTENT with that pre-existing plain-form
-    over-block; it does not create the class, and the direction is over-block,
-    never fail-open. Heredoc-awareness belongs in :func:`parse_segments` (where
-    it fixes both forms at once, and must distinguish a DATA receiver like
-    ``cat`` from an EXECUTING one like ``bash <<'EOF'``, whose body bash really
-    does run) — tracked separately, not bolted on here. The counts are provenance
-    for the design choice, not a runtime invariant; the invariant is the
+    almost entirely heredoc bodies. The counts are provenance for the design choice,
+    not a runtime invariant; the invariant is the
     dq/sq/backslash state machine below, which a security review verified against
     bash's own rules.
     """
@@ -3294,7 +3623,13 @@ def analyze(command: str) -> list[Segment]:
     return _analyze_bounded(command)[0]
 
 
-def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], str | None]:
+def _analyze_bounded(
+    command: str,
+    *,
+    _depth: int = 0,
+    _heredoc_data: bool = True,
+    _suppressed: list[str] | None = None,
+) -> tuple[list[Segment], str | None]:
     """:func:`analyze`, plus which bound (if any) stopped it short of the whole command.
 
     Returns ``(segments, reason)`` where reason is None, ``"length"`` or ``"depth"``.
@@ -3314,7 +3649,8 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
     every bare-``analyze`` caller paying the unbounded first pass — which is the same
     "unmigrated consumer" hole the checked path exists to close.
 
-    ``_depth`` is internal bookkeeping; every caller passes a command and nothing else.
+    ``_depth`` and ``_heredoc_data`` are internal bookkeeping; callers pass the
+    command plus the context that determines whether a substitution body is data.
     """
     # Past the cap, parse NOTHING. Not a prefix: truncating a command mid-string flips
     # the quoting state for everything after the cut, so a prefix parse is not a
@@ -3330,7 +3666,12 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
     # closes. Counted on the segment SOURCE text outside quotes and comments, so a
     # paren inside a quoted argument is never mistaken for a subshell.
     carried_open = 0
-    for seg in parse_segments(command):
+    parsed = parse_segments(command, suppress_data_heredocs=_heredoc_data)
+    function_definition = any(_is_function_definition(seg.argv_src) for seg in parsed)
+    if _suppressed is not None:
+        for segment in parsed:
+            _suppressed.extend(segment.heredocs)
+    for seg in parsed:
         raw = seg.raw
         override = _has_trailing_override(raw)
         # argv is tokenized from the redirect-STRIPPED source, so a redirect target
@@ -3339,6 +3680,7 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
         argv = _strip_wrappers(tokens, carried_open)
         carried_open = max(0, carried_open + _net_subshell_depth(seg.argv_src))
         exe = _basename(argv[0]) if argv else ""
+        unresolved = _verb_unresolved(argv)
         out.append(
             Segment(
                 exe=exe,
@@ -3346,17 +3688,20 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
                 override=override,
                 raw=raw,
                 redirects=list(seg.redirects),
-                verb_unresolved=_verb_unresolved(argv),
+                verb_unresolved=unresolved,
             )
         )
-        nested = []
+        nested: list[tuple[str, bool]] = []
         if exe in _NESTED:
             script = _nested_script(argv, exe)
             if script:
-                nested.append(script)
+                nested.append((script, False))
 
-        nested.extend(_embedded_commands(_argv(seg.argv_src)))
-        nested.extend(_substitutions(raw))
+        nested.extend(
+            (script, False) for script in _embedded_commands(_argv(seg.argv_src))
+        )
+        heredoc_context = _is_heredoc_substitution_data_verb(_argv(seg.argv_src))
+        nested.extend((script, heredoc_context) for script in _substitutions(raw))
         if not nested:
             continue
         # Past the bound, STOP DESCENDING — and SAY SO. Every scanner below runs
@@ -3369,8 +3714,15 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
         if _depth >= MAX_SUBSTITUTION_DEPTH:
             truncated = True
             continue
-        for script in nested:
-            inner_segs, inner_reason = _analyze_bounded(script, _depth=_depth + 1)
+        for script, heredoc_data in nested:
+            if function_definition:
+                heredoc_data = False
+            inner_segs, inner_reason = _analyze_bounded(
+                script,
+                _depth=_depth + 1,
+                _heredoc_data=heredoc_data,
+                _suppressed=_suppressed,
+            )
             truncated = truncated or inner_reason == "depth"
             for inner in inner_segs:
                 out.append(
@@ -3385,6 +3737,34 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
                     )
                 )
     return out, ("depth" if truncated else None)
+
+
+def suppressed_heredoc_bodies(command: str) -> tuple[str, ...] | None:
+    """Return suppressed data bodies, or None when bounded analysis was blind."""
+    bodies: list[str] = []
+    try:
+        _, reason = _analyze_bounded(command, _suppressed=bodies)
+    except Exception:
+        return None
+    return None if reason is not None else tuple(bodies)
+
+
+def _is_heredoc_substitution_data_verb(argv: list[str]) -> bool:
+    """Whether this enclosing verb permits heredoc-data substitution context."""
+    args = list(argv)
+    if not args:
+        return False
+    exe = _basename(args[0])
+    rest = args[1:]
+    return bool(
+        (
+            exe == "gh"
+            and len(rest) >= 2
+            and rest[0] in {"pr", "issue"}
+            and rest[1] in {"create", "comment", "edit"}
+        )
+        or (exe == "git" and rest and rest[0] in {"commit", "tag", "notes"})
+    )
 
 
 def is_pytest_invocation(seg: Segment) -> bool:
