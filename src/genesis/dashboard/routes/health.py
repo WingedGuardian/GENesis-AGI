@@ -75,7 +75,7 @@ def invalidate_snapshot_cache() -> None:
     try:
         target = current_app.config.get("GENESIS_EVENT_LOOP")
     except RuntimeError:
-        target = None          # outside an app context (tests, direct calls)
+        target = None  # outside an app context (tests, direct calls)
 
     try:
         running = asyncio.get_running_loop()
@@ -95,6 +95,34 @@ def invalidate_snapshot_cache() -> None:
         # served a stale snapshot; invalidate directly rather than raising into
         # a route whose mutation already committed.
         health_data.invalidate()
+
+
+@blueprint.route("/api/genesis/inflight")
+def inflight_work():
+    """The work a restart of this server would cancel right now
+    (genesis.util.inflight): every Claude invocation, plus the whole life of a
+    dispatched session or a CLI reflection. scripts/deploy_code_only.sh asks this
+    before it stops or restarts the server.
+
+    Names sessions, so it is not public: a VERIFIED dashboard session or the
+    internal bearer (the trusted local caller's token) only. Verified, not
+    ``is_authenticated``: that one opens up on an install with no dashboard
+    password, which is a disclosure decision it must not make
+    (``has_verified_credential``).
+    """
+    from genesis.dashboard.auth import has_internal_bearer, has_verified_credential
+    from genesis.util.inflight import snapshot
+
+    if not (has_internal_bearer() or has_verified_credential()):
+        return jsonify({"error": "authentication required"}), 403
+    return jsonify(
+        {
+            "items": [
+                {"id": i.id, "kind": i.kind, "label": i.label, "started_at": i.started_at}
+                for i in snapshot()
+            ]
+        }
+    )
 
 
 @blueprint.route("/api/genesis/health")
@@ -148,11 +176,13 @@ async def heartbeat_canary():
         tick_count = rt.awareness_loop.tick_count
         last_tick_at = rt.awareness_loop.last_tick_at
 
-    return jsonify({
-        "alive": True,
-        "tick_count": tick_count,
-        "last_tick_at": last_tick_at,
-    }), 200
+    return jsonify(
+        {
+            "alive": True,
+            "tick_count": tick_count,
+            "last_tick_at": last_tick_at,
+        }
+    ), 200
 
 
 @blueprint.route("/api/genesis/liveness")
@@ -203,11 +233,13 @@ def liveness_probe():
     except Exception:
         awareness_block = None
 
-    return jsonify({
-        "alive": True,
-        "loop": loop_block,
-        "awareness": awareness_block,
-    }), 200
+    return jsonify(
+        {
+            "alive": True,
+            "loop": loop_block,
+            "awareness": awareness_block,
+        }
+    ), 200
 
 
 @blueprint.route("/api/genesis/provider-activity")
@@ -231,7 +263,6 @@ async def provider_activity():
     return jsonify(result)
 
 
-
 # GROUNDWORK(guardian-dialogue): Self-heal protocol endpoint.
 # V4 Step 1: acknowledge concern + respond need_help (no self-healing yet).
 # V4.5+: Genesis inspects its own state and attempts self-repair.
@@ -248,13 +279,15 @@ async def guardian_dialogue():
     rt = GenesisRuntime.instance()
 
     if not rt.is_bootstrapped:
-        return jsonify({
-            "acknowledged": False,
-            "status": "need_help",
-            "action": "",
-            "eta_s": 0,
-            "context": "Genesis is not bootstrapped",
-        }), 503
+        return jsonify(
+            {
+                "acknowledged": False,
+                "status": "need_help",
+                "action": "",
+                "eta_s": 0,
+                "context": "Genesis is not bootstrapped",
+            }
+        ), 503
 
     # Check if Genesis is paused — Guardian should stand down
     if rt.paused:
@@ -267,13 +300,17 @@ async def guardian_dialogue():
         except (json.JSONDecodeError, OSError):
             pass
 
-        return jsonify({
-            "acknowledged": True,
-            "status": "stand_down",
-            "action": "paused",
-            "eta_s": 0,
-            "context": f"Genesis is paused: {pause_reason}" if pause_reason else "Genesis is paused",
-        }), 200
+        return jsonify(
+            {
+                "acknowledged": True,
+                "status": "stand_down",
+                "action": "paused",
+                "eta_s": 0,
+                "context": f"Genesis is paused: {pause_reason}"
+                if pause_reason
+                else "Genesis is paused",
+            }
+        ), 200
 
     # Log the concern for observability
     try:
@@ -281,7 +318,8 @@ async def guardian_dialogue():
         failing = concern.get("signals_failing", [])
         logger.warning(
             "Guardian health concern received: signals_failing=%s, duration_s=%s",
-            failing, concern.get("duration_s"),
+            failing,
+            concern.get("duration_s"),
         )
     except (ValueError, TypeError, AttributeError) as exc:
         logger.debug("Failed to parse Guardian concern payload: %s", exc, exc_info=True)
@@ -296,25 +334,29 @@ async def guardian_dialogue():
             from genesis.util.tasks import tracked_task
 
             tracked_task(
-                sentinel.dispatch(SentinelRequest(
-                    trigger_source="guardian_dialogue",
-                    trigger_reason=f"Guardian concern: signals_failing={failing}",
-                    tier=2,
-                    context=concern,
-                )),
+                sentinel.dispatch(
+                    SentinelRequest(
+                        trigger_source="guardian_dialogue",
+                        trigger_reason=f"Guardian concern: signals_failing={failing}",
+                        tier=2,
+                        context=concern,
+                    )
+                ),
                 name="sentinel-guardian-dialogue",
             )
             # Sentinel just dispatched — report its initial state
             s_state = getattr(sentinel, "_state", None)
             state_val = s_state.current_state if s_state else "investigating"
-            return jsonify({
-                "acknowledged": True,
-                "status": "handling",
-                "action": "sentinel_dispatched",
-                "eta_s": 0,
-                "sentinel_state": state_val,
-                "context": f"Sentinel dispatched ({state_val})",
-            }), 200
+            return jsonify(
+                {
+                    "acknowledged": True,
+                    "status": "handling",
+                    "action": "sentinel_dispatched",
+                    "eta_s": 0,
+                    "sentinel_state": state_val,
+                    "context": f"Sentinel dispatched ({state_val})",
+                }
+            ), 200
         except Exception:
             logger.warning("Sentinel dispatch failed — falling back to need_help", exc_info=True)
     elif sentinel is not None and sentinel.is_active:
@@ -323,19 +365,23 @@ async def guardian_dialogue():
         # and escalates, causing competing restart attempts.
         s_state = getattr(sentinel, "_state", None)
         state_val = s_state.current_state if s_state else "investigating"
-        return jsonify({
-            "acknowledged": True,
-            "status": "handling",
-            "action": "sentinel_already_active",
-            "eta_s": 0,
-            "sentinel_state": state_val,
-            "context": f"Sentinel active ({state_val})",
-        }), 200
+        return jsonify(
+            {
+                "acknowledged": True,
+                "status": "handling",
+                "action": "sentinel_already_active",
+                "eta_s": 0,
+                "sentinel_state": state_val,
+                "context": f"Sentinel active ({state_val})",
+            }
+        ), 200
 
-    return jsonify({
-        "acknowledged": True,
-        "status": "need_help",
-        "action": "",
-        "eta_s": 0,
-        "context": "Genesis acknowledges the concern but cannot self-repair (Sentinel unavailable)",
-    }), 200
+    return jsonify(
+        {
+            "acknowledged": True,
+            "status": "need_help",
+            "action": "",
+            "eta_s": 0,
+            "context": "Genesis acknowledges the concern but cannot self-repair (Sentinel unavailable)",
+        }
+    ), 200

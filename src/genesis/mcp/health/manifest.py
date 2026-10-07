@@ -190,6 +190,11 @@ HEARTBEAT_EXPECTED = {
     # which is why it has a heartbeat at all. The tighter per-surface check is
     # the view's own last-run age, rendered beside every count.
     "zero_drop": (3600, 172800),
+    # The work-board reconciler (board/reconciler.py): a 5-min CronTrigger that
+    # pulses EVERY tick — mode off, paused or live — so it is neither pause-gated
+    # nor mode-conditional. Overdue at 30 min = six missed ticks, since one tick
+    # can take a minute or two of GitHub reads on a large board.
+    "board": (300, 1800),
 }
 
 # Subsystems whose heartbeat is emitted only AFTER their loop's
