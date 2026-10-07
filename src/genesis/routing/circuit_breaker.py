@@ -869,6 +869,37 @@ class CircuitBreakerRegistry:
                 uncovered.append(site)
         return uncovered
 
+    def uncovered_essential_sites_for(
+        self, provider: str, also_unavailable=None,
+    ) -> list[str] | None:
+        """The essential sites that use ``provider`` and have NO OTHER available
+        provider — i.e. the sites this provider's outage leaves unserved.
+
+        The provider itself never counts as cover: a dead provider whose breaker
+        has drifted OPEN -> HALF_OPEN reads "available" to the router, and must
+        not cover its own outage. ``also_unavailable(name)`` (optional) marks
+        providers the router will skip for reasons the breaker does not know
+        (a spent daily quota). ``[]`` = covered; ``None`` = coverage unknown (no
+        essential map), which callers must treat as "could be uncovered". The
+        known 429-reads-available gap of ``_provider_available`` still applies.
+        """
+        if self._essential_sites is None:
+            return None
+
+        def _serves(name: str) -> bool:
+            if name == provider or not self._provider_available(name):
+                return False
+            try:
+                return not (also_unavailable and also_unavailable(name))
+            except Exception:
+                return True  # unknown extra signal: fall back to the breaker's word
+
+        return sorted(
+            site
+            for site, chain in self._essential_sites.items()
+            if provider in chain and not any(_serves(p) for p in chain)
+        )
+
     def compute_degradation_level(self) -> DegradationLevel:
         """Compute system-wide degradation.
 

@@ -207,3 +207,101 @@ async def test_live_mode_promotes_a_propose_only_row(empty_db, monkeypatch):
     assert open_rows[0]["priority"] == "critical", (
         "the propose_only row was not promoted — the Telegram would never send"
     )
+
+
+async def _seed_high_notify(db, provider):
+    import hashlib
+    import json
+
+    notify_hash = hashlib.sha256(f"provider_dead_notify:{provider}".encode()).hexdigest()
+    await db.execute(
+        "INSERT INTO observations "
+        "(id, source, type, content, priority, resolved, content_hash, created_at) "
+        "VALUES (?, 'routing', 'provider_failure', ?, 'high', 0, ?, datetime('now'))",
+        (f"n-{provider}", json.dumps({"provider": provider, "outage_started_at": "x"}),
+         notify_hash),
+    )
+    await db.commit()
+
+
+async def _resolved(db, provider):
+    cur = await db.execute(
+        "SELECT resolved FROM observations WHERE id = ?", (f"n-{provider}",)
+    )
+    return (await cur.fetchone())["resolved"] == 1
+
+
+@pytest.mark.asyncio
+async def test_promotion_leaves_a_covered_providers_high_row_alone(empty_db):
+    """A covered outage is written high ON PURPOSE. Resolving it each tick would
+    only have the sweep re-create it at high: churn, and nothing delivered."""
+    await _seed_high_notify(empty_db, "covered")
+    await _seed_high_notify(empty_db, "uncovered")
+    cov = {"covered": [], "uncovered": ["9_fact_extraction"]}
+    await loop._promote_demoted_provider_notify(empty_db, coverage_for=cov.get)
+    assert not await _resolved(empty_db, "covered")
+    assert await _resolved(empty_db, "uncovered"), "lost coverage must promote"
+
+
+@pytest.mark.asyncio
+async def test_promotion_without_coverage_promotes_every_high_row(empty_db):
+    await _seed_high_notify(empty_db, "p")
+    await loop._promote_demoted_provider_notify(empty_db)
+    assert await _resolved(empty_db, "p")
+
+
+@pytest.mark.asyncio
+async def test_live_mode_passes_registry_coverage_to_the_sweep(monkeypatch):
+    from types import SimpleNamespace
+
+    sweep = AsyncMock(return_value=0)
+    promote = AsyncMock()
+    monkeypatch.setattr("genesis.routing.escalation.sweep_due_notifications", sweep)
+    monkeypatch.setattr(loop, "_promote_demoted_provider_notify", promote)
+    monkeypatch.setattr(
+        "genesis.awareness.provider_notify_config.effective_mode", lambda: "live"
+    )
+    reg = SimpleNamespace(
+        current_incident_identity=lambda p: None,
+        incident_owner=lambda p, i: p,
+        get=lambda n: None,
+        uncovered_essential_sites_for=lambda p: ["x"],
+    )
+    runtime = SimpleNamespace(_circuit_breakers=reg)
+    monkeypatch.setattr("genesis.runtime.GenesisRuntime.instance", lambda: runtime)
+    await loop._check_provider_outage_notify(object())
+    assert sweep.await_args.kwargs["coverage_for"] is reg.uncovered_essential_sites_for
+    assert promote.await_args.kwargs["coverage_for"] is reg.uncovered_essential_sites_for
+
+
+@pytest.mark.asyncio
+async def test_coverage_treats_a_daily_deselected_provider_as_unavailable(monkeypatch):
+    from types import SimpleNamespace
+
+    sweep = AsyncMock(return_value=0)
+    monkeypatch.setattr("genesis.routing.escalation.sweep_due_notifications", sweep)
+    monkeypatch.setattr(loop, "_promote_demoted_provider_notify", AsyncMock())
+    monkeypatch.setattr(
+        "genesis.awareness.provider_notify_config.effective_mode", lambda: "live"
+    )
+    seen = {}
+
+    def uncovered_for(name, also_unavailable=None):
+        seen["b"] = also_unavailable("b")
+        seen["c"] = also_unavailable("c")
+        return []
+
+    reg = SimpleNamespace(
+        current_incident_identity=lambda p: None, incident_owner=lambda p, i: p,
+        get=lambda n: None, uncovered_essential_sites_for=uncovered_for,
+    )
+    cfgs = {"b": SimpleNamespace(name="b"), "c": SimpleNamespace(name="c")}
+    router = SimpleNamespace(
+        config=SimpleNamespace(providers=cfgs),
+        _daily_budget=SimpleNamespace(exhausted=lambda cfg: cfg.name == "b"),
+    )
+    runtime = SimpleNamespace(_circuit_breakers=reg, _router=router)
+    monkeypatch.setattr("genesis.runtime.GenesisRuntime.instance", lambda: runtime)
+    await loop._check_provider_outage_notify(object())
+    assert sweep.await_args.kwargs["coverage_for"]("a") == []
+    assert seen == {"b": True, "c": False}
