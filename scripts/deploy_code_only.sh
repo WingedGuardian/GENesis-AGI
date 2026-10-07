@@ -899,7 +899,7 @@ _pull() {
     _PHASE="merging"
     for _f in "${_reset[@]}"; do
         echo "  Resetting $_f to HEAD for the merge: its local edit is dropped (it regenerates)."
-        git -C "$GENESIS_ROOT" checkout HEAD -- "$_f"
+        genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$_f"
         _RESET_NOTE="$_RESET_NOTE $_f"
     done
     # Safe for this script to merge the tree it runs from: git REPLACES a changed
@@ -914,7 +914,7 @@ _pull() {
     # a file written between that scan and this merge (the server, another
     # session) would be lost; with the flag git refuses it too, at the merge
     # itself, leaving HEAD and the tree as they were (measured, git 2.43).
-    if ! git -c gc.autoDetach=false -C "$GENESIS_ROOT" merge --ff-only --no-overwrite-ignore -q "$_upstream" {_UPDATE_LOCK_FD}>&-; then
+    if ! genesis_without_checkout_lock git -c gc.autoDetach=false -C "$GENESIS_ROOT" merge --ff-only --no-overwrite-ignore -q "$_upstream" {_UPDATE_LOCK_FD}>&-; then
         _status_after="$(_status_outside_resets)" || _status_after="unreadable after"
         if [ "$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null)" = "$_head" ] \
             && [ "$_status_after" = "$_status_before" ]; then

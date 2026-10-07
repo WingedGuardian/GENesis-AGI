@@ -88,7 +88,7 @@ async def test_run_records_cc_session_span_with_output_cost(tmp_path, monkeypatc
                 input_tokens=100, output_tokens=50, duration_ms=1000, exit_code=0,
             )
 
-            async def _fake_inner(_inv):
+            async def _fake_inner(_inv, _admission=None):
                 return fake
 
             monkeypatch.setattr(invoker, "_run_inner", _fake_inner)

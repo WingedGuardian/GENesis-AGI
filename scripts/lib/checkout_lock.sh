@@ -31,6 +31,20 @@ genesis_checkout_lock() {
     return 1
 }
 
+# Run a command with the checkout-lock descriptor closed in it. git runs hooks
+# (post-checkout, post-merge) as children of the command, and a hook that leaves
+# work running in the background would otherwise inherit the descriptor and hold
+# the lock after the parent releases it, so every Claude launch waits on it.
+# bash cannot mark a descriptor close-on-exec, so each git call made while the
+# lock is held goes through here. A no-op wrapper when the lock is not held.
+genesis_without_checkout_lock() {
+    if [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ]; then
+        "$@" {GENESIS_CHECKOUT_LOCK_FD}>&-
+    else
+        "$@"
+    fi
+}
+
 genesis_checkout_unlock() {
     if [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ]; then
         exec {GENESIS_CHECKOUT_LOCK_FD}>&-

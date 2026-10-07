@@ -1562,7 +1562,7 @@ _do_rollback() {
         ob_tip="$(git -C "$GENESIS_ROOT" rev-parse -q --verify "refs/heads/$ORIGINAL_BRANCH^{commit}" 2>/dev/null || true)"
         if { [ "$ob_tip" = "$rb_commit" ] || [ "$ob_tip" = "$own_head" ]; } \
             && left="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")" && [ -z "$left" ] \
-            && git -C "$GENESIS_ROOT" checkout -q --no-overwrite-ignore "$ORIGINAL_BRANCH" 2>&1; then
+            && genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout -q --no-overwrite-ignore "$ORIGINAL_BRANCH" 2>&1; then
             echo "  The checkout had been switched to ${_now_branch:-a detached HEAD}; switched back to $ORIGINAL_BRANCH (that branch keeps its commits)."
             if genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$ORIGINAL_BRANCH"; then
                 code_action=none
@@ -1578,7 +1578,7 @@ _do_rollback() {
             echo "  The checkout is still at $ROLLBACK_TAG on $ORIGINAL_BRANCH: no code to roll back."
             if [ "${MERGE_ATTEMPTED:-0}" = "1" ]; then
                 if git -C "$GENESIS_ROOT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
-                    if ! git -C "$GENESIS_ROOT" merge --abort 2>&1; then
+                    if ! genesis_without_checkout_lock git -C "$GENESIS_ROOT" merge --abort 2>&1; then
                         echo "  CRITICAL: an interrupted merge is in progress and could not be aborted."
                         checkout_ok=false
                     fi
@@ -1917,7 +1917,7 @@ if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$SETTINGS_LOCAL" &>/dev/null
    && [ -f "$GENESIS_ROOT/$SETTINGS_LOCAL" ]; then
     mkdir -p "$HOME/.genesis"
     cp "$GENESIS_ROOT/$SETTINGS_LOCAL" "$SETTINGS_LOCAL_BAK"
-    git -C "$GENESIS_ROOT" checkout HEAD -- "$SETTINGS_LOCAL" 2>/dev/null \
+    genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$SETTINGS_LOCAL" 2>/dev/null \
         && echo "  (backed up live $SETTINGS_LOCAL; cleared local edits pre-merge)"
 fi
 # END settings-local-premerge
@@ -1935,7 +1935,7 @@ if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$SERENA_YML" &>/dev/null \
    && [ -f "$GENESIS_ROOT/$SERENA_YML" ]; then
     mkdir -p "$HOME/.genesis"
     cp "$GENESIS_ROOT/$SERENA_YML" "$SERENA_YML_BAK"
-    git -C "$GENESIS_ROOT" checkout HEAD -- "$SERENA_YML" 2>/dev/null \
+    genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$SERENA_YML" 2>/dev/null \
         && echo "  (backed up live $SERENA_YML; cleared local edits pre-merge)"
 fi
 # END serena-yml-premerge
@@ -1954,7 +1954,7 @@ if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$USER_MD" &>/dev/null \
    && [ -f "$GENESIS_ROOT/$USER_MD" ]; then
     mkdir -p "$HOME/.genesis"
     cp "$GENESIS_ROOT/$USER_MD" "$USER_MD_BAK"
-    git -C "$GENESIS_ROOT" checkout HEAD -- "$USER_MD" 2>/dev/null \
+    genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$USER_MD" 2>/dev/null \
         && echo "  (backed up live $USER_MD; cleared local edits pre-merge)"
 fi
 # END user-md-premerge
@@ -1980,7 +1980,7 @@ for _eph in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
     # `checkout HEAD --` (not `checkout --`) restores BOTH index and worktree
     # from HEAD, so a staged edit is cleared too — `checkout --` alone would
     # leave a staged change and the merge would still abort.
-    if git -C "$GENESIS_ROOT" checkout HEAD -- "$_eph" 2>/dev/null; then
+    if genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$_eph" 2>/dev/null; then
         echo "  (cleared local edits to ephemeral $_eph before merge; backup under $EPHEMERAL_BACKUP_ROOT)"
     fi
 done
@@ -2025,7 +2025,7 @@ MERGE_RC=0
 # naming git's message. (A true 3-way merge ignores the flag, which is why the
 # pre-stop collision scan above exists.)
 MERGE_ATTEMPTED=1
-MERGE_OUTPUT=$(git -C "$GENESIS_ROOT" merge --no-overwrite-ignore "$DEPLOY_HEAD" --no-edit 2>&1) || MERGE_RC=$?
+MERGE_OUTPUT=$(genesis_without_checkout_lock git -C "$GENESIS_ROOT" merge --no-overwrite-ignore "$DEPLOY_HEAD" --no-edit 2>&1) || MERGE_RC=$?
 
 if [[ $MERGE_RC -ne 0 ]]; then
     # Check if this is a merge conflict (unmerged paths) vs other error
@@ -2083,7 +2083,7 @@ PYEOF
         # Abort the merge — don't leave the working tree in a broken state.
         # CC will resolve conflicts in a worktree, not in the main checkout.
         echo "  Aborting merge to keep working tree clean..."
-        git -C "$GENESIS_ROOT" merge --abort 2>/dev/null || true
+        genesis_without_checkout_lock git -C "$GENESIS_ROOT" merge --abort 2>/dev/null || true
 
         # Restart services with original code so the system stays operational
         echo "  Restarting services with pre-update code..."

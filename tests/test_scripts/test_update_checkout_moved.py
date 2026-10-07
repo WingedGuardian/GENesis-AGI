@@ -23,6 +23,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE = REPO_ROOT / "scripts" / "update.sh"
 LIB = REPO_ROOT / "scripts" / "lib" / "deploy_checkout.sh"
 MARKER_LIB = REPO_ROOT / "scripts" / "lib" / "deploy_marker.sh"
+# update.sh runs its hook-running git calls through genesis_without_checkout_lock.
+LOCK_LIB = REPO_ROOT / "scripts" / "lib" / "checkout_lock.sh"
 
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "t",
@@ -63,7 +65,7 @@ def _block(marker: str) -> str:
 
 
 def _run(script: str, home: Path) -> subprocess.CompletedProcess:
-    libs = f'. "{MARKER_LIB}"\n. "{LIB}"\n'
+    libs = f'. "{MARKER_LIB}"\n. "{LIB}"\n. "{LOCK_LIB}"\n'
     return subprocess.run(
         ["bash", "-c", "set -Eeuo pipefail\n" + libs + script],
         capture_output=True,
