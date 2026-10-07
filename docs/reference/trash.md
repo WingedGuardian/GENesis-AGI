@@ -12,12 +12,14 @@ An item is always **renamed**, never copied, into a trash on its own volume:
 - `~/.genesis/trash/` when the item is on the same device as `~/.genesis`;
 - `<mountpoint>/.genesis-trash-<uid>/` for an item on another mount.
 
-Each trashed item gets its own entry, named `<UTC timestamp>-<name>`:
+Each trashed item gets its own entry, named `<UTC timestamp>-<6 hex>-<name>`
+(the random part keeps ids unique across volumes):
 
 ```
-~/.genesis/trash/20261007T024821Z-notes.md/
+~/.genesis/trash/20261007T024821Z-3fa9c1-notes.md/
     item             the trashed file, directory or symlink (fixed name)
-    tombstone.json   original path and name, kind, size, reason, caller,
+    tombstone.json   original path and name, kind, size (null when a
+                     directory could not be fully read), reason, caller,
                      session id, timestamp
 ```
 

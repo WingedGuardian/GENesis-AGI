@@ -56,6 +56,24 @@ async def test_a_dirty_registered_worktree_is_left_in_place(repo):
 
 
 @pytest.mark.asyncio
+async def test_a_newline_in_the_repo_path_does_not_hide_a_registered_worktree(tmp_path, repo):
+    # git 2.43 prints a newline in a path literally in line mode; -z keeps it whole.
+    odd = tmp_path / "re\npo"
+    subprocess.run(["git", "clone", "-q", str(repo), str(odd)], check=True)
+    base = odd / ".claude" / "worktrees"
+    wt = await worktree_mgr.create_worktree(TASK, odd, base)
+    (wt / "work.txt").write_text("uncommitted")
+    subprocess.run(["git", "-C", str(wt), "add", "work.txt"], check=True)
+
+    records = await worktree_mgr._worktree_records(odd)
+    assert worktree_mgr._record_for(records, wt) is not None
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="uncommitted work"):
+        await worktree_mgr.create_worktree(TASK, odd, base)
+    assert (wt / "work.txt").read_text() == "uncommitted"
+    assert list_entries() == []
+
+
+@pytest.mark.asyncio
 async def test_a_locked_worktree_says_nothing_will_reap_it(repo):
     base = repo / ".claude" / "worktrees"
     wt = await worktree_mgr.create_worktree(TASK, repo, base)
@@ -82,10 +100,11 @@ async def test_an_orphan_directory_goes_to_the_trash_and_creation_proceeds(repo)
 
 
 @pytest.mark.asyncio
-async def test_an_unreadable_worktree_list_counts_as_registered(repo, monkeypatch):
-    # The direction that deletes nothing.
-    orphan = repo / ".claude" / "worktrees" / "task-x"
+async def test_an_unreadable_worktree_list_deletes_nothing(repo, monkeypatch):
+    base = repo / ".claude" / "worktrees"
+    orphan = base / f"task-{TASK[:8]}"
     orphan.mkdir(parents=True)
+    (orphan / "leftover.txt").write_text("keep")
     real = worktree_mgr.asyncio.create_subprocess_exec
 
     async def failing_list(*args, **kw):
@@ -94,4 +113,17 @@ async def test_an_unreadable_worktree_list_counts_as_registered(repo, monkeypatc
         return await real(*args, **kw)
 
     monkeypatch.setattr(worktree_mgr.asyncio, "create_subprocess_exec", failing_list)
-    assert await worktree_mgr._is_registered_worktree(orphan, repo) is True
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="could not be read"):
+        await worktree_mgr.create_worktree(TASK, repo, base)
+    assert (orphan / "leftover.txt").read_text() == "keep"
+    assert list_entries() == []
+
+
+@pytest.mark.asyncio
+async def test_an_empty_worktree_listing_reads_as_unreadable(monkeypatch, tmp_path):
+    # git always lists the main worktree, so nothing listed means nothing read.
+    async def empty(*a, **k):
+        return 0, ""
+
+    monkeypatch.setattr(worktree_mgr, "_git_read", empty)
+    assert await worktree_mgr._worktree_records(tmp_path) is None

@@ -85,7 +85,9 @@ async def _git_read(repo_root: Path, *args: str) -> tuple[int, str]:
         await proc.wait()
         logger.warning("git %s in %s timed out", " ".join(args), repo_root)
         return -1, ""
-    return proc.returncode or 0, (out or b"").decode(errors="replace").strip()
+    # surrogateescape: a path that is not UTF-8 must round-trip, or a worktree
+    # lookup by path would miss it.
+    return proc.returncode or 0, (out or b"").decode(errors="surrogateescape").strip()
 
 
 async def resolve_base(repo_root: Path) -> BaseRef | None:
@@ -211,36 +213,27 @@ class StaleWorktreeError(RuntimeError):
     """
 
 
-async def _is_registered_worktree(wt_path: Path, repo_root: Path) -> bool:
-    """Whether git lists ``wt_path`` as a worktree of ``repo_root``.
-
-    Not ``verify_worktree``: task worktrees live under the repo, so
-    ``git rev-parse`` inside an orphan directory walks up to the main
-    repository and succeeds (MEASURED). An unreadable list counts as
-    registered, the direction that deletes nothing.
-    """
-    rc, out = await _git_read(repo_root, "worktree", "list", "--porcelain")
-    if rc != 0:  # includes a timeout (-1)
-        return True
-    target = wt_path.resolve()
-    for line in out.splitlines():
-        if line.startswith("worktree ") and Path(line[len("worktree "):]).resolve() == target:
-            return True
-    return False
-
-
-async def _is_locked(wt_path: Path, repo_root: Path) -> bool:
-    """Whether git lists ``wt_path`` as locked (``git worktree list --porcelain``)."""
-    rc, out = await _git_read(repo_root, "worktree", "list", "--porcelain")
+async def _worktree_records(repo_root: Path) -> list[dict[str, str]] | None:
+    """``git worktree list --porcelain -z`` as one dict per worktree, or None
+    when it cannot be read. NUL-delimited, so a path holding a newline cannot
+    split a record (git 2.43: fields end in NUL, a record in an empty field)."""
+    rc, out = await _git_read(repo_root, "worktree", "list", "--porcelain", "-z")
     if rc != 0:
-        return False
-    target, current = wt_path.resolve(), None
-    for line in out.splitlines():
-        if line.startswith("worktree "):
-            current = Path(line[len("worktree "):]).resolve()
-        elif current == target and (line == "locked" or line.startswith("locked ")):
-            return True
-    return False
+        return None
+    records: list[dict[str, str]] = [{}]
+    for field in out.split("\0"):
+        if not field:
+            records.append({})
+            continue
+        key, _, value = field.partition(" ")
+        records[-1][key] = value
+    # git always lists at least the main worktree; an empty listing is unread.
+    return [r for r in records if "worktree" in r] or None
+
+
+def _record_for(records: list[dict[str, str]], wt_path: Path) -> dict[str, str] | None:
+    target = wt_path.resolve()
+    return next((r for r in records if Path(r["worktree"]).resolve() == target), None)
 
 
 async def _clear_stale_dir(wt_path: Path, repo_root: Path, task_id: str) -> None:
@@ -253,9 +246,21 @@ async def _clear_stale_dir(wt_path: Path, repo_root: Path, task_id: str) -> None
     registered (MEASURED: the add fails on the existing branch, then on the
     registered path). A directory git does not know is an orphan; it goes to
     the trash (#2926 G2) so the new worktree can take its place.
+
+    Registration comes from ``git worktree list``, not ``verify_worktree``:
+    task worktrees live under the repo, so ``git rev-parse`` inside an orphan
+    directory walks up to the main repository and succeeds (MEASURED). An
+    unreadable list deletes nothing.
     """
-    if await _is_registered_worktree(wt_path, repo_root):
-        if (wt_path / ".git").is_file() and await _is_locked(wt_path, repo_root):
+    records = await _worktree_records(repo_root)
+    if records is None:  # unreadable or timed out: treat as registered, delete nothing
+        raise StaleWorktreeError(
+            f"the previous worktree for this task, {wt_path}, was left in place: "
+            "git's worktree list could not be read to tell an orphan from live work"
+        )
+    record = _record_for(records, wt_path)
+    if record is not None:
+        if "locked" in record:
             raise StaleWorktreeError(
                 f"the previous worktree for this task, {wt_path}, is locked; nothing "
                 "reaps a locked worktree, so unlock it (git worktree unlock) or "

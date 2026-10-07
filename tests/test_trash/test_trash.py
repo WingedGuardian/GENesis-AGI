@@ -6,8 +6,10 @@ The suite-wide ``_isolate_trash_root`` fixture points the home trash at
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import shutil
 import stat
 from pathlib import Path
 
@@ -85,6 +87,76 @@ def test_the_same_name_twice_gets_distinct_entries(tmp_path):
 def _touch(p: Path) -> Path:
     p.write_text("x")
     return p
+
+
+def test_an_unreadable_subtree_makes_the_size_unknown(tmp_path):
+    d = tmp_path / "work"
+    (d / "locked").mkdir(parents=True)
+    (d / "locked" / "a.txt").write_text("abc")
+    (d / "b.txt").write_text("xy")
+    (d / "locked").chmod(0)
+    try:
+        if os.access(d / "locked", os.R_OK):
+            pytest.skip("running as a user that ignores directory permissions")
+        stone = trash(d, reason="r", caller="c")
+    finally:
+        with contextlib.suppress(OSError):
+            (d / "locked").chmod(0o700)
+        for p in Path(tmp_path).rglob("locked"):
+            with contextlib.suppress(OSError):
+                p.chmod(0o700)
+    assert stone.size is None  # never a partial total that reads as exact
+
+
+def test_entry_ids_are_unique_and_an_ambiguous_restore_is_refused(monkeypatch, tmp_path, root):
+    a = trash(_touch(tmp_path / "x.txt"), reason="r", caller="c")
+    b = trash(_touch(tmp_path / "x.txt"), reason="r", caller="c")
+    assert a.entry_id != b.entry_id
+    other = tmp_path / "other-root"
+    other.mkdir(mode=0o700)
+    shutil.copytree(_entry(a), other / a.entry_id)  # the same id in a second root
+    monkeypatch.setattr(gt, "_roots", lambda: [root, other])
+    with pytest.raises(TrashRefused, match="more than one root"):
+        restore(a.entry_id)
+    assert (_entry(a) / ITEM).exists()
+
+
+def test_two_roots_never_issue_the_same_id_in_the_same_second(tmp_path):
+    r1, r2 = tmp_path / "r1", tmp_path / "r2"
+    r1.mkdir()
+    r2.mkdir()
+    assert gt._claim_entry(r1, "x.txt").name != gt._claim_entry(r2, "x.txt").name
+
+
+def test_one_directory_behind_two_mount_points_is_one_root(tmp_path):
+    real = tmp_path / "m1"
+    (real / f".genesis-trash-{os.getuid()}").mkdir(parents=True, mode=0o700)
+    alias = tmp_path / "m2"
+    alias.symlink_to(real)
+    roots = gt._roots_from([str(real), str(alias), str(tmp_path / "none")])
+    assert roots[1:] == [real / f".genesis-trash-{os.getuid()}"]
+
+
+def test_a_file_gone_mid_scan_keeps_the_size_known(monkeypatch, tmp_path):
+    d = tmp_path / "work"
+    d.mkdir()
+    (d / "a.txt").write_text("abc")
+    (d / "gone.txt").write_text("zz")
+    real_lstat = os.lstat
+
+    def lstat(p, *a, **k):
+        if str(p).endswith("gone.txt"):
+            raise FileNotFoundError(p)
+        return real_lstat(p, *a, **k)
+
+    monkeypatch.setattr(gt.os, "lstat", lstat)
+    st = real_lstat(d)
+    assert gt._size(d, st) == 3
+
+
+def test_mount_escapes_are_all_decoded():
+    assert gt._unescape_mount("/mnt/a\\040b\\011c\\012d\\134e") == "/mnt/a b\tc\nd\\e"
+    assert gt._unescape_mount("/plain") == "/plain"
 
 
 def test_an_undecodable_name_is_trashed_and_restored(tmp_path):

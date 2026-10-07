@@ -1239,3 +1239,14 @@ def test_attribution_names_the_trash_stores_separately(box):
     lines = proc.stdout.splitlines()
     assert str(box["home"] / ".genesis" / "trash") in lines
     assert str(box["home"] / ".genesis" / "worktree-trash") in lines
+    # And du really gives them a line: it counts each inode once, in argument
+    # order, so a store listed after its parent would print nothing.
+    proc = _run(
+        box,
+        "DG_ATTRIBUTION_PATHS=''; mapfile -t t < <(attribution_paths); du -smx -- \"${t[@]}\"",
+    )
+    assert proc.returncode == 0, proc.stderr
+    measured = [line.split("\t", 1)[1] for line in proc.stdout.splitlines()]
+    assert str(box["home"] / ".genesis" / "trash") in measured
+    assert str(box["home"] / ".genesis" / "worktree-trash") in measured
+    assert str(box["home"] / ".genesis") in measured

@@ -19,6 +19,8 @@ import contextlib
 import errno
 import json
 import os
+import re
+import secrets
 import stat
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -116,18 +118,22 @@ def _size(item: Path, st: os.stat_result) -> int | None:
     if not stat.S_ISDIR(st.st_mode):
         return st.st_size
     total = 0
-    try:
-        for dirpath, _dirs, files in os.walk(item, followlinks=False):
-            for name in files:
-                with contextlib.suppress(OSError):
-                    total += os.lstat(os.path.join(dirpath, name)).st_size
-    except OSError:
-        return None
-    return total
+    errors: list[OSError] = []
+    for dirpath, _dirs, files in os.walk(item, onerror=errors.append, followlinks=False):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except FileNotFoundError:
+                continue  # gone mid-scan, so not part of what is trashed
+            except OSError as exc:
+                errors.append(exc)
+    return None if errors else total  # a partial total would read as exact
 
 
 def _claim_entry(root: Path, name: str) -> Path:
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    # The random part keeps ids unique across roots: two volumes can trash the
+    # same name in the same second, and restore() looks an id up in every root.
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
     # Filesystem encoding, so an undecodable name round-trips instead of raising.
     base = os.fsdecode(os.fsencode(f"{stamp}-{name}")[:_MAX_ENTRY_NAME])
     for n in range(_MAX_SUFFIX):
@@ -210,17 +216,40 @@ def _load(entry: Path) -> Tombstone | None:
 
 def _roots() -> list[Path]:
     """The home trash plus any per-mount trash of this uid that exists."""
-    roots = [home_trash_root()]
     try:
-        with open("/proc/self/mounts") as f:
+        # surrogateescape: a mount path that is not UTF-8 must not abort listing.
+        with open("/proc/self/mounts", encoding="utf-8", errors="surrogateescape") as f:
             mounts = [line.split()[1] for line in f if len(line.split()) > 1]
     except OSError:
         mounts = []
-    for mount in mounts:
-        candidate = Path(mount.replace("\\040", " ")) / f".genesis-trash-{os.getuid()}"
-        if candidate not in roots and _is_own_dir(candidate):
+    return _roots_from([_unescape_mount(m) for m in mounts])
+
+
+def _roots_from(mount_points: list[str]) -> list[Path]:
+    roots = [home_trash_root()]
+    seen = {_dir_key(roots[0])}
+    for mount in mount_points:
+        candidate = Path(mount) / f".genesis-trash-{os.getuid()}"
+        # One directory can be reachable through two mount points; list it once.
+        key = _dir_key(candidate)
+        if key not in seen and _is_own_dir(candidate):
+            seen.add(key)
             roots.append(candidate)
     return roots
+
+
+def _dir_key(path: Path) -> tuple[int, int] | Path:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return path
+    return (st.st_dev, st.st_ino)
+
+
+def _unescape_mount(field: str) -> str:
+    """Undo the octal escapes the kernel writes in /proc/self/mounts (space,
+    tab, newline and backslash appear as \\040, \\011, \\012, \\134)."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
 
 
 def _is_own_dir(path: Path) -> bool:
@@ -262,6 +291,9 @@ def restore(
     match = [e for e in list_entries(root) if e.path.name == entry_id]
     if not match:
         raise TrashRefused(f"no trash entry {entry_id}")
+    if len(match) > 1:
+        roots = ", ".join(str(e.path.parent) for e in match)
+        raise TrashRefused(f"trash entry {entry_id} exists in more than one root ({roots})")
     entry = match[0]
     if not entry.complete or entry.tombstone is None:
         raise TrashRefused(f"trash entry {entry_id} is incomplete")
