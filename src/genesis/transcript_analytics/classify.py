@@ -127,7 +127,9 @@ def classify(
         if denial_kind:
             return f"denied_{denial_kind}", "flag"
         return "other", "flag"
-    # Unflagged: strong evidence only.
+    if is_error is False:
+        return None, None
+    # Absent flag: strong evidence only.
     if is_hook:
         return "hook_block", "text"
     if denial_kind:

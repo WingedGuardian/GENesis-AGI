@@ -484,7 +484,11 @@ def test_the_scan_sees_each_shape_it_claims(tmp_path):
 # ── behaviour, through the deploy script ────────────────────────────────────
 # Named here so a parametrization cannot come up empty (an empty list would
 # collect no case and read as a pass); a test keeps them equal to the lists.
-_RELOAD = ("scripts/lib/index_marker.py", "scripts/hooks/worktree_claim.py")
+_RELOAD = (
+    "scripts/lib/index_marker.py",
+    "scripts/hooks/worktree_claim.py",
+    "scripts/hooks/secret_scrub.py",
+)
 _FRESH = (
     "scripts/disk_reclaim.py",
     "scripts/hooks/bash_allowlist_guard.sh",
