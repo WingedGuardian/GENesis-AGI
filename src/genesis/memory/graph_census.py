@@ -21,9 +21,13 @@ start second, a clock that stepped back, or a start older than git's expiry
 cutoff for unreachable entries.
 
 ``/proc/<pid>/environ`` is the environment at exec. A value a process loads into
-``os.environ`` later (the MCP server's ``secrets.env`` allowlist) is not in it;
-genesis-server reads the same ``secrets.env`` through its unit, so a kill switch
-set there shows up as this census's own ``telemetry_disabled`` row instead.
+``os.environ`` later (the MCP server's ``secrets.env`` allowlist) is not in it. So
+each memory server's kill switch is derived the way the server decides it: the
+exec-time value if set, else its secrets file (``SECRETS_PATH`` or the default),
+which counts only if unchanged since the process started; otherwise its state
+is unknown and the row is not clean until it restarts. genesis-server reads
+``secrets.env`` only when its unit starts, so each census also reads the file
+itself and says ``telemetry_disabled`` once the switch is set there.
 """
 
 from __future__ import annotations
@@ -143,7 +147,8 @@ def scan_mcp_servers(proc_root: Path = _PROC) -> tuple[list[dict], bool]:
                 "pid": pid,
                 "server": server,
                 "start": start,
-                "telemetry_off": env.get(telemetry._TELEMETRY_OFF_ENV) == "1",
+                "env_switch": env.get(telemetry._TELEMETRY_OFF_ENV),
+                "secrets_path": env.get("SECRETS_PATH"),
                 "db_path": env.get("GENESIS_DB_PATH"),
             }
         )
@@ -254,6 +259,9 @@ def build_census(
         complete = False
         reasons.append("reflog_unreadable")
 
+    from genesis.env import secrets_path
+
+    default_secrets = secrets_path()
     memory: list[dict] = []
     others: dict[str, int] = {}
     unclassified = 0
@@ -289,12 +297,13 @@ def build_census(
                 "held": held,
                 "telemetry": telemetry_ok,
                 "unknown": unknown,
-                "telemetry_off": proc["telemetry_off"],
-                # A relative path cannot be resolved against the other process's
-                # cwd from here, so it is never called foreign (never ignored).
+                "telemetry_off": effective_telemetry_off(proc, default_secrets),
+                # ``~`` expands as genesis_db_path() expands it. A relative path
+                # cannot be resolved against the other process's cwd from here,
+                # so it is never called foreign (never ignored).
                 "foreign": bool(db_path)
-                and Path(db_path).is_absolute()
-                and Path(db_path).resolve() != live,
+                and Path(db_path).expanduser().is_absolute()
+                and Path(db_path).expanduser().resolve() != live,
             }
         )
     return {
@@ -309,13 +318,57 @@ def build_census(
     }
 
 
+def effective_telemetry_off(proc: dict, default_secrets: Path) -> bool | None:
+    """Whether a memory server's traversal telemetry is off, the way the server
+    itself decides it (``scripts/genesis_mcp_server.py``): an exec-time
+    environment value wins; otherwise the value its secrets file held when it
+    loaded it. ``None`` when that cannot be proven, which the verdict treats as
+    not clean: the file changed after the process started (it read the old
+    contents), the path is relative, or the file cannot be read."""
+    if proc["env_switch"] is not None:
+        return proc["env_switch"] == "1"
+    raw = proc.get("secrets_path")
+    path = Path(raw).expanduser() if raw else default_secrets
+    if not path.is_absolute():
+        return None
+    try:
+        changed = path.stat().st_mtime
+    except FileNotFoundError:
+        return False  # no file, nothing loaded
+    except OSError:
+        return None
+    if changed >= proc["start"]:
+        return None
+    try:
+        from dotenv import dotenv_values
+
+        return dotenv_values(path).get(telemetry._TELEMETRY_OFF_ENV) == "1"
+    except Exception:
+        return None
+
+
+def _disabled_in_secrets() -> bool:
+    """Whether ``secrets.env`` sets the kill switch now (read on every census,
+    not inherited from the server's start). Unreadable counts as not set: the
+    file is optional, and the per-process environ read still applies."""
+    from genesis.env import secrets_path
+
+    try:
+        from dotenv import dotenv_values
+
+        return dotenv_values(secrets_path()).get(telemetry._TELEMETRY_OFF_ENV) == "1"
+    except Exception:
+        logger.debug("secrets.env unreadable for the census kill-switch check", exc_info=True)
+        return False
+
+
 async def record_census(db: aiosqlite.Connection) -> dict:
     """Write one census row. With the telemetry kill switch on in THIS process,
     the row says so instead of going silent, so the verdict can tell "disabled"
     from "genesis-server was down"."""
     from genesis.db.crud import j9_eval
 
-    if telemetry._telemetry_off():
+    if telemetry._telemetry_off() or await asyncio.to_thread(_disabled_in_secrets):
         metrics: dict = {
             "v": CENSUS_SCHEMA,
             "procs": [],

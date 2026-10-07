@@ -131,7 +131,7 @@ def test_scan_reads_the_kill_switch_and_db_path_from_each_process(proc_root):
 
     [p], _ = census.scan_mcp_servers(proc_root)
 
-    assert p["telemetry_off"] is True
+    assert p["env_switch"] == "1"
     assert p["db_path"] == "/x/bench.db"
 
 
@@ -409,3 +409,75 @@ def test_an_unreadable_cmdline_of_our_own_process_makes_the_scan_incomplete(proc
         (proc_root / "60" / "cmdline").chmod(0o644)
     assert found == []
     assert complete is False
+
+
+@pytest.mark.asyncio
+async def test_a_kill_switch_added_to_secrets_env_later_is_seen(db, monkeypatch, tmp_path):
+    """genesis-server reads secrets.env once, at start; memory servers read it at
+    their own start. A switch added in between silences new memory servers, so
+    the census reads the file itself each hour."""
+    monkeypatch.delenv("GENESIS_GRAPH_TELEMETRY_DISABLED", raising=False)
+    secrets = tmp_path / "secrets.env"
+    monkeypatch.setenv("SECRETS_PATH", str(secrets))
+    monkeypatch.setattr(census, "build_census", lambda: {"v": 1, "procs": [], "complete": True})
+
+    secrets.write_text("OTHER=1\n")
+    assert (await census.record_census(db))["complete"] is True
+
+    secrets.write_text("OTHER=1\nGENESIS_GRAPH_TELEMETRY_DISABLED=1\n")
+    metrics = await census.record_census(db)
+    assert metrics["reasons"] == ["telemetry_disabled"]
+    assert metrics["complete"] is False
+
+
+def _scanned(**over) -> dict:
+    proc = {"pid": 70, "server": "memory", "start": 1000.0, "env_switch": None,
+            "secrets_path": None, "db_path": None}
+    proc.update(over)
+    return proc
+
+
+def _secrets(path: Path, body: str, mtime: float) -> Path:
+    path.write_text(body)
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+@pytest.mark.parametrize(("value", "off"), [("1", True), ("0", False)])
+def test_an_exec_time_switch_wins(tmp_path, value, off):
+    default = _secrets(tmp_path / "secrets.env", "GENESIS_GRAPH_TELEMETRY_DISABLED=1\n", 500.0)
+    assert census.effective_telemetry_off(_scanned(env_switch=value), default) is off
+
+
+def test_an_unchanged_secrets_file_is_read(tmp_path):
+    on = _secrets(tmp_path / "a.env", "GENESIS_GRAPH_TELEMETRY_DISABLED=1\n", 500.0)
+    off = _secrets(tmp_path / "b.env", "OTHER=1\n", 500.0)
+    assert census.effective_telemetry_off(_scanned(), on) is True
+    assert census.effective_telemetry_off(_scanned(), off) is False
+
+
+def test_a_secrets_file_changed_after_start_is_unknown(tmp_path):
+    later = _secrets(tmp_path / "secrets.env", "OTHER=1\n", 2000.0)
+    assert census.effective_telemetry_off(_scanned(), later) is None
+
+
+def test_a_per_process_secrets_path_is_the_one_read(tmp_path):
+    default = _secrets(tmp_path / "default.env", "OTHER=1\n", 500.0)
+    own = _secrets(tmp_path / "own.env", "GENESIS_GRAPH_TELEMETRY_DISABLED=1\n", 500.0)
+    proc = _scanned(secrets_path=str(own))
+    assert census.effective_telemetry_off(proc, default) is True
+    assert census.effective_telemetry_off(_scanned(secrets_path="rel/secrets.env"), default) is None
+
+
+def test_no_secrets_file_means_nothing_was_loaded(tmp_path):
+    assert census.effective_telemetry_off(_scanned(), tmp_path / "absent.env") is False
+
+
+def test_a_tilde_db_path_is_expanded_before_the_foreign_check(proc_root, repo, tmp_path, monkeypatch):
+    r, _, _ = repo
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _proc(proc_root, 71, [*MCP, "memory"], started=_reflog_times(r)[0][0] + 60,
+          env={"GENESIS_DB_PATH": "~/bench.db"})
+    [p] = census.build_census(r, proc_root=proc_root, live_db=tmp_path / "live.db")["procs"]
+    assert p["foreign"] is True
+
