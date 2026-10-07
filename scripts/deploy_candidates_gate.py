@@ -451,65 +451,95 @@ def hooks_approved(cand: dict) -> bool:
     return isinstance(ha, dict) and ha.get("head") == cand["verified_head"]
 
 
-def hook_attribution_failures(
-    repo: Repo,
-    base: str,
-    tip: str,
-    approved: dict[str, str],
-    merged: dict[str, str] | None = None,
+def tree_entry(repo: Repo, commit: str, path: str) -> tuple[str, str] | None:
+    """(mode, object id) of ``path`` in ``commit``, or None when absent. The mode
+    is part of what a hook IS: git can merge one change's bytes with another's
+    mode, and a hook that loses its executable bit stops running."""
+    text = repo.git("ls-tree", "-z", commit, "--", path).stdout
+    head = text.split("\0", 1)[0]
+    if not head:
+        return None
+    meta = head.split("\t", 1)[0].split()
+    return (meta[0], meta[2])
+
+
+def hook_ownership_failures(
+    repo: Repo, base: str, tip: str, merged: Mapping[str, str], approved: set[str]
 ) -> dict[str, str]:
-    """Every hook path whose bytes at the rebuilt ``tip`` differ from ``base``
-    must be byte-identical to that path at some APPROVED merged candidate head
-    (``approved``: branch -> head; a deletion matches a head that deletes it).
-    git can merge a hook without a conflict into bytes nobody approved: an
-    approved change on top of a change origin/main made since the branch was
-    cut, or two approved candidates' changes to one hook. Returns the approved
-    candidates behind each such path, with why (to EXCLUDE, like a conflict);
-    empty when every hook on the tip is attributable. When no approved candidate
-    changed the path, a rebuild raises Refusal (admission makes that impossible);
-    a drop passes every candidate it keeps as ``merged`` and EXCLUDES the ones
-    without a current approval that changed the path, first, because drop is the
-    repair path. The Refusal remains only for a hook path nothing on the tip
-    changed, which a diff against ``base`` cannot produce."""
+    """Every hook path whose tree entry (mode and bytes) on the rebuilt ``tip``
+    differs from ``base`` must have exactly ONE owner: a single merged candidate
+    that changed it (against its own merge base), approved for that head, whose
+    entry the tip holds unchanged (so origin/main has not changed it since the
+    candidate was cut). Ownership replaces matching merged bytes against approved
+    heads, which kept admitting entries no approval held (a blend of two
+    approved changes, one's bytes with another's mode, a deletion "matched" by an
+    approved head that never had the file). Returns the candidates to EXCLUDE by
+    name, with why; empty when every changed hook path has its owner. The owner
+    is found by the merge STEP that changed the path, not by the candidate's own
+    diff (see below). Rebuild and drop (the repair path) both exclude rather
+    than refuse; the one Refusal is for a tip build_plan did not build. ``merged`` maps
+    branch -> merged head; ``approved`` names the branches approved at that head."""
     text = repo.git("diff", "--no-renames", "--name-only", "-z", base, tip, "--", *HOOK_DIRS).stdout
+    paths = [p for p in text.split("\0") if p]
     out: dict[str, str] = {}
-    for path in (p for p in text.split("\0") if p):
-        got = repo.blob_at(tip, path)
-        if any(repo.blob_at(h, path) == got for h in approved.values()):
-            continue
-        if merged:
-            # Repair (drop): a listed candidate whose approval is gone, or that
-            # never had one, goes first; an approved changer is blamed only when
-            # no unapproved one changed the path.
-            unapproved = [
-                b
-                for b, h in merged.items()
-                if b not in approved
-                and repo.blob_at(h, path) != repo.blob_at(repo.merge_base(base, h) or base, path)
-            ]
-            if unapproved:
-                for b in unapproved:
-                    out[b] = (
-                        f"changes {path} with no current hook approval; "
-                        "add it again with --approve-hooks"
-                    )
-                continue
-        changers = [
+    if not paths:
+        return out
+    # Ownership by MERGE STEP: the rebuild chains one merge per candidate
+    # (first parent = the tip so far, second = the candidate's head), so every
+    # change between base and tip is made by some step. A candidate's own diff
+    # is not enough: git's merge follows a rename origin/main made, so a
+    # candidate that edited the old path changes the hook path without touching
+    # it (MEASURED, git 2.43; merge-tree has no switch to turn that off).
+    branch_of = {h: b for b, h in merged.items()}
+    stepped: dict[str, set[str]] = {}
+    walk = repo.git("rev-list", "--first-parent", "--parents", tip, "--not", base).stdout
+    for line in walk.splitlines():
+        ids = line.split()
+        if len(ids) == 3 and ids[2] in branch_of:
+            changed = repo.git(
+                "diff", "--no-renames", "--name-only", "-z", ids[1], ids[0], "--", *HOOK_DIRS
+            ).stdout
+            stepped[branch_of[ids[2]]] = {q for q in changed.split("\0") if q}
+    for path in paths:
+        got = tree_entry(repo, tip, path)
+        if got == tree_entry(repo, base, path):
+            continue  # e.g. only the mode moved and back: nothing differs
+        # The union: a step that changed the path (a followed rename included),
+        # and a candidate whose own diff changed it even when its step did not
+        # (its bytes equal what an earlier candidate merged): one hook, one owner.
+        owners = [
             b
-            for b, h in approved.items()
-            if repo.blob_at(h, path) != repo.blob_at(repo.merge_base(base, h) or base, path)
+            for b, h in merged.items()
+            if path in stepped.get(b, set())
+            or tree_entry(repo, h, path) != tree_entry(repo, repo.merge_base(base, h) or base, path)
         ]
-        if not changers:
-            raise Refusal(
-                f"{path} on the rebuilt `live` matches no approved version, and no approved "
-                "candidate changed it; nothing changed"
+        if len(owners) > 1:
+            for b in owners:
+                out[b] = (
+                    f"{', '.join(owners)} each change {path}; only one candidate may change "
+                    "a hook at a time: drop all but one"
+                )
+            continue
+        if not owners:
+            # Every change past base is made by some merge step, so this means
+            # the tip was not built the way build_plan builds it.
+            raise Refusal(f"{path} changed on the rebuilt `live`, but no merge step changed it")
+        [owner] = owners
+        head = merged[owner]
+        if tree_entry(repo, head, path) == tree_entry(
+            repo, repo.merge_base(base, head) or base, path
+        ):
+            out[owner] = (
+                f"its merge changes {path} without its own diff touching it (git followed a "
+                "rename origin/main made onto a hook path): merge origin/main into it"
             )
-        for b in changers:
-            out[b] = (
-                f"origin/main changed {path} since it was cut, so the merge holds hook bytes "
-                "nobody approved: merge origin/main into it, then add it again with --approve-hooks"
-                if len(changers) == 1
-                else f"{', '.join(changers)} each change {path}, and git merged them into hook "
-                "bytes none was approved for: drop all but one"
+        elif owner not in approved:
+            out[owner] = (
+                f"changes {path} with no current hook approval; add it again with --approve-hooks"
+            )
+        elif got != tree_entry(repo, merged[owner], path):
+            out[owner] = (
+                f"origin/main changed {path} since it was cut, so the merge holds a hook nobody "
+                "approved: merge origin/main into it, then add it again with --approve-hooks"
             )
     return out

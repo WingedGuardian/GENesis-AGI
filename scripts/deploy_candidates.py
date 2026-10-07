@@ -309,28 +309,25 @@ class Engine(Repo):
         rebuild_id: str,
         sticky: dict[str, str],
         data: dict,
-        repair: bool = False,
     ) -> core.Plan:
-        """build_plan, then hook attribution: an approved candidate whose hook
-        bytes the merged tip does not hold is EXCLUDED by name (a blend is a known
-        negative, like a conflict) and the plan is built again. Each pass excludes
-        at least one more candidate, so it ends. rebuild, drop and status all plan
-        through here, so status never predicts what a rebuild would not do, and a
-        drop never leaves hook bytes whose approval it just removed. ``repair``
-        (drop) excludes rather than refuses (see hook_attribution_failures)."""
+        """build_plan, then hook ownership: a candidate that changes a hook path
+        another merged candidate also changes, or that lacks a current approval,
+        or whose hook origin/main has changed since it was cut, is EXCLUDED by
+        name (like a conflict) and the plan is built again. Each pass excludes at
+        least one more merged candidate, so it ends. rebuild, drop and status all
+        plan through here, so status never predicts what a rebuild would not do,
+        and a drop never leaves a hook whose approval it just removed."""
         approval = {c["branch"]: c for c in data["candidates"] if gate.hooks_approved(c)}
         sticky = dict(sticky)
         while True:
             p = plan.build_plan(self, base, cands, rebuild_id, sticky=sticky)
             approved = {
-                b: h for b, h in p.merged if b in approval and approval[b]["verified_head"] == h
+                b for b, h in p.merged if b in approval and approval[b]["verified_head"] == h
             }
-            blends = gate.hook_attribution_failures(
-                self, base, p.tip, approved, dict(p.merged) if repair else None
-            )
-            if not blends:
+            unowned = gate.hook_ownership_failures(self, base, p.tip, dict(p.merged), approved)
+            if not unowned:
                 return p
-            sticky.update(blends)
+            sticky.update(unowned)
 
     def _refuse_blockers(self, tip: str, what: str) -> None:
         blockers = plan.move_blockers(self, tip)
@@ -532,10 +529,10 @@ class Engine(Repo):
             ).get(branch, []):
                 sticky[b] = f"shares dropped {branch}'s unmerged commits; drop it too"
         rebuild_id = core.now().strftime("%Y%m%dT%H%M%SZ")
-        # Attributed like a rebuild: hook bytes the remaining candidates merge
-        # into must match an approval still listed (the dropped one's is gone).
+        # Planned like a rebuild: every hook the remaining candidates change
+        # needs its one approved owner among them (the dropped one's approval is gone).
         kept = {**data, "candidates": [c for c in data["candidates"] if c["branch"] != branch]}
-        p = self._attributed_plan(live_base, remaining, rebuild_id, sticky, kept, repair=True)
+        p = self._attributed_plan(live_base, remaining, rebuild_id, sticky, kept)
         out(
             f"deploy_candidates drop {branch} (on the base `live` is on, {live_base[:12]}; nothing fetched)"
         )

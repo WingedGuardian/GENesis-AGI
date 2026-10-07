@@ -1,8 +1,9 @@
 """Hook candidates behind the owner's approval (#2978, PR H).
 
 A candidate that changes a git or Claude Code hook goes live only with
-`add --approve-hooks <who>`, recorded per candidate for its pinned head. A
-rebuild refuses hook bytes no approved candidate holds, and after any move an
+`add --approve-hooks <who>`, recorded per candidate for its pinned head. Every
+hook path that differs from origin/main on `live` has exactly one owner: one
+merged candidate, approved, whose entry (mode and bytes) the tip holds. After any move an
 installed hook equal to the old checkout's copy is replaced: the scratch world
 has no .genesis-hook-versions, so sync-hooks.sh alone would keep every changed
 hook as "user-modified", which is the state the replacement exists for.
@@ -150,27 +151,23 @@ def test_two_approved_candidates_whose_hook_changes_merge_are_excluded(dc, dc_re
     assert _installed(w) == BASE_HOOK
 
 
-def test_dropping_the_approval_a_blend_matched_excludes_the_blend(dc, dc_ready, capsys):
-    """A and B merge into exactly C's approved bytes, so all three go live. Drop C
-    and its approval goes with it: the drop plans through attribution like a
-    rebuild and excludes A and B rather than leave bytes nobody approved."""
+def test_a_blend_equal_to_a_third_approval_is_still_excluded(dc, dc_ready, capsys):
+    """A and B merge into exactly C's approved bytes. Byte-matching admitted all
+    three, and dropping C then left the blend live (Codex, #3027 round 2). With
+    one owner per hook path, all three are excluded at the rebuild already."""
     w = dc_ready
     w.candidate("feat/a", {PRE_COMMIT: "#!/bin/sh -e\n# pre-commit\nexit 0\n"})
     w.candidate("feat/b", {PRE_COMMIT: "#!/bin/sh\n# pre-commit\nexit 0 # b\n"})
-    both = "#!/bin/sh -e\n# pre-commit\nexit 0 # b\n"
-    w.candidate("feat/c", {PRE_COMMIT: both})
+    w.candidate("feat/c", {PRE_COMMIT: "#!/bin/sh -e\n# pre-commit\nexit 0 # b\n"})
     hx = w.candidate("feat/x", {"x.txt": "x\n"})
     for b in ("feat/a", "feat/b", "feat/c"):
         assert _approve(w, dc, b) == 0, capsys.readouterr()
     assert w.add(dc, "feat/x") == 0
     assert w.run(dc, "rebuild") == 0, capsys.readouterr()
-    assert _installed(w) == both
-    capsys.readouterr()
-    assert w.run(dc, "drop", "feat/c") == 0, capsys.readouterr()
     out = capsys.readouterr().out
-    assert "EXCLUDED: feat/a" in out and "EXCLUDED: feat/b" in out, out
+    for b in ("feat/a", "feat/b", "feat/c"):
+        assert f"EXCLUDED: {b}" in out, out
     assert w.live_merges() == [("feat/x", hx)]
-    assert (w.root / PRE_COMMIT).read_text() == BASE_HOOK
     assert _installed(w) == BASE_HOOK
 
 
@@ -239,7 +236,9 @@ def test_a_hook_name_only_a_dropped_candidate_listed_is_removed(dc, dc_ready, ca
     assert not hook.exists(), "the dropped candidate's hook is still installed"
 
 
-def test_two_approved_candidates_with_identical_hook_bytes_go_live(dc, dc_ready, capsys):
+def test_one_owner_per_hook_even_for_identical_bytes(dc, dc_ready, capsys):
+    """Owner ruling 2026-10-07: a hook path has one owner on `live`, so two
+    approved candidates that change it are excluded even when their bytes match."""
     w = dc_ready
     same = "#!/bin/sh\n# same\nexit 0\n"
     w.candidate("feat/a", {PRE_COMMIT: same, "a.only": "a\n"})
@@ -247,7 +246,98 @@ def test_two_approved_candidates_with_identical_hook_bytes_go_live(dc, dc_ready,
     assert _approve(w, dc, "feat/a") == 0
     assert _approve(w, dc, "feat/b") == 0
     assert w.run(dc, "rebuild") == 0, capsys.readouterr()
-    assert _installed(w) == same
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/a" in out and "EXCLUDED: feat/b" in out, out
+    assert "only one candidate may change a hook" in out
+    assert _installed(w) == BASE_HOOK
+
+
+def test_a_mode_change_on_a_hook_is_a_change_of_that_hook(dc, dc_ready, capsys):
+    """git merges one change's bytes with another's mode into an entry neither
+    approved head held; with one owner per path, both are excluded."""
+    w = dc_ready
+    w.candidate("feat/a", {PRE_COMMIT: "#!/bin/sh -e\n# pre-commit\nexit 0\n"})
+    w.candidate("feat/m", {"m.only": "m\n"})
+    wt = w.tmp / "wt-feat-m"
+    # The fixture tracks hooks as 100644; flipping the bit is the mode change.
+    w.git(wt, "update-index", "--chmod=+x", PRE_COMMIT)
+    w.git(wt, "commit", "-q", "-m", "flip the exec bit")
+    assert _approve(w, dc, "feat/a") == 0
+    assert _approve(w, dc, "feat/m") == 0, capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/a" in out and "EXCLUDED: feat/m" in out, out
+    assert w.git(w.root, "ls-files", "-s", PRE_COMMIT).stdout.startswith("100644 ")
+
+
+def test_a_hook_that_leaves_the_sync_list_is_uninstalled_on_drop(dc, dc_ready, capsys):
+    """One approved candidate adds a hook file, another adds its name to the
+    sync list (different paths, each with its own owner). Dropping the list
+    change leaves the file in the tree but unmanaged: its installed copy goes."""
+    w = dc_ready
+    sync = (w.root / "scripts" / "hooks" / "sync-hooks.sh").read_text()
+    listed = sync.replace(
+        '    "pre-merge-commit"\n', '    "pre-merge-commit"\n    "post-merge"\n', 1
+    )
+    assert listed != sync, "the fixture's sync-hooks.sh changed shape"
+    w.candidate("feat/file", {"scripts/hooks/post-merge": "#!/bin/sh\nexit 0\n"})
+    w.candidate("feat/list", {"scripts/hooks/sync-hooks.sh": listed})
+    assert _approve(w, dc, "feat/file") == 0
+    assert _approve(w, dc, "feat/list") == 0
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    hook = w.root / ".git" / "hooks" / "post-merge"
+    assert hook.is_file(), "the approved pair did not install the hook"
+    assert w.run(dc, "drop", "feat/list") == 0, capsys.readouterr()
+    assert (w.root / "scripts" / "hooks" / "post-merge").is_file()
+    assert not hook.exists(), "the unlisted hook stayed installed"
+
+
+def test_a_rename_followed_onto_a_hook_path_is_owned_by_its_merge(dc, dc_ready, capsys):
+    """origin/main moves a file under scripts/hooks/; a candidate cut before the
+    move edited the old path. git's merge follows the rename, so the candidate
+    changes the hook without its own diff touching a hook path. Its merge step
+    owns the change, and it is excluded by name instead of the rebuild refusing."""
+    w = dc_ready
+    body = "".join(f"line {i}\n" for i in range(10))
+    w.advance_main({"src/tool.sh": body})
+    w.candidate("feat/old", {"src/tool.sh": body.replace("line 5", "line 5 edited")})
+    hx = w.candidate("feat/x", {"x.txt": "x\n"})
+    w.git(w.up, "checkout", "-q", "main")
+    w.git(w.up, "mv", "src/tool.sh", "scripts/hooks/tool.sh")
+    w.git(w.up, "commit", "-q", "-m", "move tool under the hooks")
+    w.git(w.up, "push", "-q", "origin", "main")
+    assert w.add(dc, "feat/old") == 0, capsys.readouterr()
+    assert w.add(dc, "feat/x") == 0
+    capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/old" in out and "followed a rename" in out, out
+    assert w.live_merges() == [("feat/x", hx)]
+    assert (w.root / "scripts" / "hooks" / "tool.sh").read_text() == body
+
+
+def test_an_unrelated_approval_never_covers_a_hook_deletion(dc, dc_ready, capsys):
+    """origin/main adds hook y after approved A was cut; U deletes y. Once U's
+    approval leaves the manifest, A (which never had y) must not read as its
+    owner: the next drop on `live` excludes U and y comes back."""
+    w = dc_ready
+    y = "scripts/hooks/y-guard"
+    w.candidate("feat/a", {PRE_COMMIT: "#!/bin/sh -e\n# pre-commit\nexit 0\n"})
+    w.advance_main({y: "#!/bin/sh\nexit 0\n"})
+    w.candidate("feat/u", {y: None})
+    w.candidate("feat/x", {"x.txt": "x\n"})
+    assert _approve(w, dc, "feat/a") == 0
+    assert _approve(w, dc, "feat/u") == 0
+    assert w.add(dc, "feat/x") == 0
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    assert not (w.root / y).exists()
+    assert w.run(dc, "drop", "feat/u", "--no-rebuild") == 0, capsys.readouterr()
+    capsys.readouterr()
+    assert w.run(dc, "drop", "feat/x") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/u" in out and "no current hook approval" in out, out
+    assert "EXCLUDED: feat/a" not in out
+    assert (w.root / y).is_file()
 
 
 def test_an_excluded_approved_candidate_takes_its_hook_with_it(dc, dc_ready, capsys):

@@ -366,9 +366,10 @@ def restore_moved_hooks(repo: Repo, before: str | None, after: str) -> None:
     refuse every rebuild. A hook equal to the pre-move checkout's copy was put
     there by a sync of that checkout, so this run may replace it; one edited by
     hand equals neither side and is left for sync-hooks.sh to report. The names
-    are BOTH checkouts' lists: a hook only the old one listed (a candidate added
-    it) is deleted when the new checkout has no source for it, since nothing else
-    ever removes an installed hook. Runs before sync_git_hooks, after the move;
+    are BOTH checkouts' lists: a hook the old checkout installed is deleted when
+    the new checkout no longer installs it (no source, or its list no longer
+    names it), since nothing else ever removes an installed hook. Runs before
+    sync_git_hooks, after the move;
     failures are reported per hook, never fatal."""
     if not before:
         return
@@ -379,27 +380,48 @@ def restore_moved_hooks(repo: Repo, before: str | None, after: str) -> None:
         # where sync does not.
         out("  NOTE: core.hooksPath is set; installed hooks were not restored.")
         return
-    names: list[str] = []
+    # A hook is managed on a side only when that side's list names it AND its
+    # source exists: a name leaving the list is gone even if its file stays (an
+    # approved list change enabled another candidate's file, and the list change
+    # was dropped). An unreadable list is unknown, never "empty": nothing is
+    # restored from an unknown old side, nothing deleted for an unknown new one.
+    listed: dict[str, list[str] | None] = {}
     for ref in (before, after):
         try:
-            names += [
-                n for n in sync_hook_names(repo.show(ref, SYNC_HOOKS) or "") if n not in names
-            ]
+            listed[ref] = sync_hook_names(repo.show(ref, SYNC_HOOKS) or "")
         except Refusal as exc:
+            listed[ref] = None
             out(
                 f"  NOTE: cannot read the hook list at {ref[:12]} ({exc}); its hooks were not restored."
             )
+    names: list[str] = []
+    for ref in (before, after):
+        names += [n for n in listed[ref] or [] if n not in names]
     for name in names:
         if name in (".", ".."):
             continue
         try:
-            _restore_one(repo, hooks_dir / name, f"scripts/hooks/{name}", before, after)
+            _restore_one(
+                repo,
+                hooks_dir / name,
+                f"scripts/hooks/{name}",
+                before if listed[before] is not None and name in listed[before] else None,
+                after,
+                after_listed=listed[after] is None or name in listed[after],
+            )
         except (OSError, Refusal) as exc:
             out(f"  NOTE: could not restore git hook {name} ({exc}); sync-hooks.sh follows.")
 
 
-def _restore_one(repo: Repo, dst: Path, path: str, before: str, after: str) -> None:
-    old, new = repo.blob_at(before, path), repo.blob_at(after, path)
+def _restore_one(
+    repo: Repo, dst: Path, path: str, before: str | None, after: str, after_listed: bool
+) -> None:
+    """``before`` is None when the old checkout did not manage this name, and
+    ``after_listed`` False when the moved-to list no longer names it."""
+    if before is None:
+        return
+    old = repo.blob_at(before, path)
+    new = repo.blob_at(after, path) if after_listed else None
     if old is None or old == new or not dst.is_file():
         return
     if is_symlink_at(repo, before, path) or is_symlink_at(repo, after, path):
@@ -407,10 +429,16 @@ def _restore_one(repo: Repo, dst: Path, path: str, before: str, after: str) -> N
         # copies the referent, so leave a linked hook to it.
         return
     if repo.git("hash-object", "--no-filters", "--", str(dst)).stdout.strip() != old:
+        if new is None:
+            # sync-hooks.sh will not mention a name its list no longer has.
+            out(
+                f"  NOTE: git hook {dst.name} is no longer installed by this checkout but "
+                "was edited by hand; left in place."
+            )
         return  # not the old checkout's copy: edited by hand, or never synced
     if new is None:
         dst.unlink()
-        out(f"  removed git hook {dst.name}: the moved-to checkout has no source for it.")
+        out(f"  removed git hook {dst.name}: the moved-to checkout no longer installs it.")
         return
     tmp = dst.with_name(f"{dst.name}.tmp.{os.getpid()}")
     try:
@@ -430,7 +458,8 @@ def sync_git_hooks(repo: Repo) -> None:
     its non-zero exits are reported, never fatal. On `live` the hook sources,
     sync-hooks.sh itself included, are reviewed main's or an approved
     candidate's: admission refuses any other candidate that changes them, and a
-    rebuild refuses a merged hook that matches no approved version."""
+    rebuild or drop excludes any candidate that is not the sole, approved owner of
+    a hook path it changes."""
     script = repo.root / "scripts" / "hooks" / "sync-hooks.sh"
     if not script.is_file():
         out(f"  NOTE: {script} is missing; the git hook copies were not synced.")
