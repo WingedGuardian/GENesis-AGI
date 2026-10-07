@@ -2584,7 +2584,7 @@ verified: af3e45d3c 2026-10-07
   standalone adapters run production relevance and novelty judgments with
   synthetic routers or caller-provided transport. Novelty uses disposable
   full-schema SQLite fixtures and observes the actual rendered candidate IDs.
-  Full preflight, storage replay and execution/reporting orchestration land later.
+  Execution/reporting orchestration lands later.
   See `docs/reference/qualification-corpus.md`.
   Qualification's pinned transport supplies a caller-provided adapter router
   through the production delegate, a shared one-egress wire guard, response-hook
@@ -2595,6 +2595,15 @@ verified: af3e45d3c 2026-10-07
   a later replacement. This verification refresh covers the qualification slice;
   other learning/evaluation entries retain their previous verification scope.
   See `docs/reference/qualification-transport.md`.
+  Complete offline preflight checks all registered corpus floors, current
+  reference policy/approval/source identities and explicit call-site parameters.
+  Production rendering determines duplicate questions and selected novelty IDs.
+  Disposable current/promoted replay uses both real stores, checks all original
+  procedure columns and verifies new insertion semantics; synthetic classifiers
+  isolate novelty wiring. Dedicated serial process only; no execution consent,
+  paid eligibility, model quality or promotion follows from this evidence.
+  The later runner must recompute it before credentials. See
+  `docs/reference/qualification-preflight.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).

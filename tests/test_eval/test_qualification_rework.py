@@ -8,10 +8,11 @@ import os
 import httpx
 import pytest
 
-from genesis.eval.qualification import contracts, corpus, evidence, pinned
+from genesis.eval.qualification import contracts, corpus, evidence, pinned, preflight
 from genesis.eval.qualification.evidence import Incomplete
 from tests.test_eval.qualification_contract_fixtures import Stub
-from tests.test_eval.qualification_fixtures import novelty_case, relevance_case
+from tests.test_eval.qualification_fixtures import novelty_case, relevance_case, small_corpus
+from tests.test_eval.qualification_preflight_fixtures import params
 from tests.test_eval.qualification_transport_fixtures import Gateway, ask, bundle, router
 
 
@@ -253,3 +254,140 @@ def test_ordinary_multiline_steps_remain_valid():
     case = novelty_case("synthetic", None)
     case["existing"][0]["steps"] = ["Run the command:\npython example.py\nthen inspect its output"]
     corpus.validate_novelty(case)
+
+
+@pytest.mark.parametrize("route_name", ["judge", "relevance"])
+async def test_implicit_callsite_temperature_must_be_frozen(tmp_path, route_name):
+    cases = small_corpus(novelty=False)
+    name = corpus.RELEVANCE if route_name == "relevance" else next(iter(cases))
+    plan = await preflight.prepare({name: cases[name]}, tmp_path)
+    configured = params()
+    configured[route_name].pop("temperature")
+    with pytest.raises(Incomplete, match="call-site parameter"):
+        preflight.parameters("openrouter-mimo", configured, plan)
+
+
+@pytest.mark.parametrize("same_principle", [False, True])
+@pytest.mark.parametrize("target", ["candidate-a", "candidate-b"])
+async def test_repeated_slugs_map_and_replay_exact_targets(tmp_path, target, same_principle):
+    case = novelty_case("synthetic-repeated", target)
+    for row in case["existing"]:
+        row["task_type"] = "repeated-slug"
+    if same_principle:
+        case["existing"][1]["principle"] = case["existing"][0]["principle"]
+        case["existing"][1]["embedding"] = case["existing"][0]["embedding"]
+    await preflight.prepare({corpus.NOVELTY: [case]}, tmp_path)
+    probe = contracts.Probe()
+    async with contracts.Sandbox(tmp_path) as sandbox:
+        await contracts.novelty(case, probe, sandbox)
+    mapping = contracts.candidate_mapping(case, probe.calls[0][0], probe.candidate_ids)
+    assert set(mapping) == {"candidate-a", "candidate-b"}
+    answer = json.dumps({"redundant_with": mapping.index(target) + 1})
+    assert contracts.raw_target(answer, mapping) == target
+
+
+async def test_indistinguishable_rendered_candidates_fail_offline(tmp_path):
+    case = novelty_case("synthetic-collision", "candidate-a")
+    first, second = case["existing"]
+    second.update(copy.deepcopy({k: v for k, v in first.items() if k != "id"}))
+    # Distinct tails beyond production's160-character truncation remain indistinguishable.
+    first["steps"] = ["x" * 160 + "a"]
+    second["steps"] = ["x" * 160 + "b"]
+    with pytest.raises(Incomplete, match="ambiguous rendered"):
+        await preflight.prepare({corpus.NOVELTY: [case]}, tmp_path)
+
+
+async def test_rendered_novelty_duplicates_ignore_database_ids(tmp_path):
+    a = novelty_case("synthetic", None)
+    b = copy.deepcopy(a)
+    b["id"] = "synthetic-other"
+    b["existing"][0]["id"] = "different-database-id"
+    with pytest.raises(Incomplete, match="duplicate rendered"):
+        await preflight.prepare({corpus.NOVELTY: [a, b]}, tmp_path)
+
+
+async def test_unreachable_target_fails_offline(tmp_path):
+    case = novelty_case("synthetic", "candidate-a")
+    case["existing"][0]["embedding"] = [-1, 0]
+    with pytest.raises(Incomplete, match="reference target"):
+        await preflight.prepare({corpus.NOVELTY: [case]}, tmp_path)
+
+
+@pytest.mark.parametrize("change", [{"max_tokens": 151}, {"temperature": 1}])
+async def test_callsite_parameter_contradiction_fails_offline(tmp_path, change):
+    plan = await preflight.prepare(
+        {corpus.RELEVANCE: [relevance_case("synthetic", True)]}, tmp_path
+    )
+    configured = params()
+    configured["relevance"].update(change)
+    with pytest.raises(Incomplete, match="call-site parameter"):
+        preflight.parameters("openrouter-mimo", configured, plan)
+
+
+@pytest.mark.parametrize("alias", ["openrouter-sonnet", "openrouter-opus", "openrouter-free"])
+async def test_incompatible_shipped_alias_is_rejected_offline(tmp_path, alias):
+    plan = await preflight.prepare(
+        {corpus.RELEVANCE: [relevance_case("synthetic", True)]}, tmp_path
+    )
+    with pytest.raises(Incomplete, match="alias"):
+        preflight.parameters(alias, params(), plan)
+
+
+@pytest.mark.parametrize("target", [None, "candidate-b"])
+async def test_saved_verdict_replays_both_storage_paths(tmp_path, target):
+    from genesis.eval.qualification.storage import replay
+
+    case = novelty_case("synthetic-storage", target)
+    probe = contracts.Probe()
+    async with contracts.Sandbox(tmp_path) as sandbox:
+        await contracts.novelty(case, probe, sandbox)
+        messages = probe.calls[0][0]
+        mapping = contracts.candidate_mapping(case, messages, probe.candidate_ids)
+        content = json.dumps({"redundant_with": mapping.index(target) + 1 if target else None})
+        result = await replay(
+            case, messages, mapping, content, sandbox, "openrouter-mimo", "xiaomi/mimo-v2.6-pro"
+        )
+    assert set(result) == {
+        "current_judge",
+        "current_extractor",
+        "promoted_judge",
+        "promoted_extractor",
+    }
+    for mode, row in result.items():
+        assert row["original_candidates_preserved"]
+        assert row["stored"] is (target is None or mode.startswith("current"))
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"skip": True},
+        {"reusability_score": 0.1},
+        {"principle": "Use supported replacement for the deprecated API"},
+    ],
+)
+async def test_independent_storage_gates_are_reported_without_model_error(tmp_path, extra):
+    from genesis.eval.qualification.storage import replay
+
+    case = novelty_case("synthetic-other-gate", None)
+    case["new"].update(extra)
+    await preflight.prepare({corpus.NOVELTY: [case]}, tmp_path)
+    probe = contracts.Probe()
+    async with contracts.Sandbox(tmp_path) as sandbox:
+        await contracts.novelty(case, probe, sandbox)
+        messages, content = probe.calls[0]
+        result = await replay(
+            case,
+            messages,
+            contracts.candidate_mapping(case, messages, probe.candidate_ids),
+            content,
+            sandbox,
+            "openrouter-mimo",
+            "xiaomi/mimo-v2.6-pro",
+        )
+    assert result["current_judge"]["stored"]
+    if "principle" in extra:
+        assert not result["current_extractor"]["stored"]
+        assert result["current_extractor"]["other_gate_rejections"]
+    else:
+        assert result["current_extractor"]["stored"]
