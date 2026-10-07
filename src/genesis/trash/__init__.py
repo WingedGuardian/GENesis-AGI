@@ -239,11 +239,17 @@ def _load(entry: Path) -> Tombstone | None:
 
 
 def list_entries() -> list[Entry]:
-    """Every entry, oldest first; incomplete entries are included and flagged."""
+    """Every entry, oldest first; incomplete entries are included and flagged.
+
+    A trash that does not exist yet is empty. One that exists but cannot be
+    read raises TrashRefused: reporting it as empty would hide recoverable data.
+    """
     try:
         names = sorted(os.listdir(root := _root()))
-    except (OSError, RuntimeError):
+    except FileNotFoundError:
         return []
+    except (OSError, RuntimeError) as exc:
+        raise TrashRefused(f"cannot read the trash: {exc}") from None
     out: list[Entry] = []
     for name in names:
         entry = root / name

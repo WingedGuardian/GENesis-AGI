@@ -358,7 +358,8 @@ def test_a_symlink_loop_in_the_trash_location_is_a_refusal(monkeypatch, tmp_path
     with pytest.raises(TrashRefused):
         trash(f, reason="r", caller="c")
     assert f.exists()
-    assert list_entries() == []
+    with pytest.raises(TrashRefused, match="cannot read the trash"):
+        list_entries()
 
 
 def test_cli_list_survives_a_hand_edited_tombstone(tmp_path, capsys):
@@ -369,6 +370,23 @@ def test_cli_list_survives_a_hand_edited_tombstone(tmp_path, capsys):
     tomb.write_text(json.dumps(data))
     assert main(["list"]) == 0
     capsys.readouterr().out.encode("utf-8")
+
+
+def test_an_unreadable_trash_is_reported_not_shown_empty(tmp_path, root, capsys):
+    trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
+    root.chmod(0)
+    try:
+        if os.access(root, os.R_OK):
+            pytest.skip("running as a user that ignores directory permissions")
+        assert main(["list"]) == EXIT_REFUSED
+        assert "cannot read the trash" in capsys.readouterr().err
+    finally:
+        root.chmod(0o700)
+    assert list_entries()  # readable again, entry intact
+
+
+def test_a_trash_not_created_yet_is_empty():
+    assert list_entries() == []
 
 
 def test_cli_usage_error_exits_64():

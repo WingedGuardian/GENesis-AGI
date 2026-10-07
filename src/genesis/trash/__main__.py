@@ -39,7 +39,11 @@ def _show(value: object) -> str:
 
 
 def _list() -> int:
-    entries = list_entries()
+    try:
+        entries = list_entries()
+    except TrashRefused as exc:
+        print(f"genesis.trash: refused: {_show(exc)}", file=sys.stderr)
+        return EXIT_REFUSED
     if not entries:
         print("trash is empty")
         return 0
