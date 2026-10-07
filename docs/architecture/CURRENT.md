@@ -1424,8 +1424,9 @@ verified: 246808153 2026-09-24
   empty completion is a 502 rather than a blank turn); Agent Zero adapter
   optional.
 - **browser/**: profile/state layer only (persistent
-  `~/.genesis/browser-profile`, `BrowserLayer` enum, pgrep patterns as the
-  single source of process detection). The automation TOOLS live in
+  `~/.genesis/browser-profile`, `BrowserLayer` enum (the navigate result's
+  `layer` values, numbered as in `mcp/health/browser.py`), pgrep patterns as
+  the single source of process detection). The automation TOOLS live in
   `mcp/health/browser.py`.
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
@@ -2423,7 +2424,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 788dd9a9 2026-09-06
+verified: 4117f6ed 2026-10-05
 ```
 
 - **The graders are TOLD the response status; they must never infer it.** The
@@ -2558,6 +2559,17 @@ verified: 788dd9a9 2026-09-06
   `model_profile='bench:genesis'` (the genesis row's `metadata_json.stats` is
   self-contained), and stamped with the uncalibrated-judge + `insufficient_data`
   caveat. A stats-less/all-skip run surfaces flagged, never crashes.
+- **eval/qualification journal**: groundwork for the six-part offline
+  qualification rebuild. Private append-only evidence with an exclusive writer,
+  immutable version-2 campaign manifest funding the full scheduled maximum,
+  decimal reservations, provider-scoped generation ownership and receipt-derived billing
+  and recovery state. Incremental publication follows durable append; uncertain
+  publication stops derived-state reading until reconstruction. Historical
+  reading never creates or truncates files; version-1 evidence cannot execute.
+  No transport, CLI, automatic execution or qualification verdict is wired yet;
+  subsequent replacement PRs supply those callers. Production credentials and
+  accounting stores are outside this boundary. See
+  `docs/reference/qualification-journal.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
@@ -2893,9 +2905,15 @@ config resolution, and hygiene utilities.
 ```yaml subsystem-map
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
-          restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
+          restore, util, infra_profile, onboarding, hostmetrics, env.py,
+          _config_overlay.py]
 verified: b0867170e 2026-10-02
 ```
+
+- **hostmetrics/**: stdlib-only resource readings (container cgroup memory and
+  CPU, PSI, disks, and the host's headroom through the guardian gateway) and the
+  `preflight`/`status` CLI that admits or refuses a heavy job against the
+  budget (`docs/reference/resource-budget.md`). Importable without the runtime.
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
   install usable" signal (CC OAuth login + ≥1 routing LLM key + ≥1 embedding key),
