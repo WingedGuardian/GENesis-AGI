@@ -458,12 +458,18 @@ class Router:
                                 )
                                 if budget_now.get(limit) is not None
                             ]
+                            blocked = budget_now.get("blocked_until")
                             await self._event_bus.emit(
                                 Subsystem.ROUTING, Severity.WARNING,
                                 "provider.budget_exhausted",
-                                f"{provider_name} daily budget spent — "
-                                f"deselected until the next UTC day "
-                                f"({', '.join(spent)})",
+                                (
+                                    f"{provider_name} daily quota spent (the provider "
+                                    f"said so) — deselected until {blocked}"
+                                    if blocked
+                                    else f"{provider_name} daily budget spent — "
+                                    f"deselected until the next UTC day "
+                                    f"({', '.join(spent)})"
+                                ),
                                 provider=provider_name,
                                 **budget_now,
                             )

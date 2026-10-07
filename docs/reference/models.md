@@ -421,7 +421,7 @@ Loose guidance — not prescriptive. Use your judgment based on the task require
 - **IMPORTANT:** Free tier data MAY be used for model training
   - Paid tier (Tier 1+, requires Cloud Billing) guarantees data is NOT used for training
   - If sending proprietary/sensitive data, use paid tier
-- RPD resets at midnight Pacific Time
+- RPD reset: MEASURED 2026-10-07 at **00:00 UTC**, not midnight Pacific (38 of 38 logged free-tier `gemini-3.8-flash` 429s, limit 20/day: each one's "retry in" time, added to its timestamp, ends at 00:00 UTC; the full bodies checked carried a matching `RetryInfo` delay). Routing does not assume either: a daily-quota 429 deselects the provider until the reset the 429 itself names (`routing/retry.daily_quota_reset_s`).
 - EU/EEA/UK/Switzerland restricted on free tier
 - Full 1M token context window available on free tier
 - Free tier limits can change without warning (Google cut limits 50-80% in Dec 2025)

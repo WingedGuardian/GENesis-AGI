@@ -2759,7 +2759,13 @@ verified: b0867170e8e3 2026-10-02
   429s backstop any undercount, while an overcount would deselect with no
   correcting signal); state persists to `~/.genesis/routing_budget_state.json`,
   server-only writer (WS-3c, like the breaker file), kill switch
-  `GENESIS_DAILY_BUDGET_DISABLED`. Per-provider circuit breaker (3 failures, exponential backoff
+  `GENESIS_DAILY_BUDGET_DISABLED`. **Provider-reported daily quota:** a 429
+  whose body carries a `google.rpc` `QuotaFailure` with a `PerDay` quota id and
+  a `RetryInfo` delay (≤ 26 h) is parsed by `retry.daily_quota_reset_s`; the
+  delegate flags it (`CallResult.daily_quota_exhausted`) and the ledger
+  deselects that provider until the reset the provider gave (`blocked_until`
+  in the state row, restored on restart, same event and kill switch). Per-minute
+  429s and unparseable bodies keep the old behaviour. Per-provider circuit breaker (3 failures, exponential backoff
   capped 30 min — 4h for QUOTA_EXHAUSTED and NOT_ENTITLED; 429 = backpressure,
   NOT a breaker failure; state persisted cross-process to
   `~/.genesis/circuit_breaker_state.json`). **Probe/call evidence symmetry** —
