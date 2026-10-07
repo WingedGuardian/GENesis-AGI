@@ -27,6 +27,15 @@ import pytest
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts" / "hooks"
 _GUARD = _SCRIPTS / "git_push_guard.py"
 
+_BLOCKED_COMMAND_CONFIG = (
+    "BLOCKED: this push carries a prefix, wrapper or git config option "
+    "(-c / --config-env / VAR=…). Config supplied that way can retarget the push "
+    "or make it a force push (e.g. remote.<name>.push=+…, "
+    "remote.<name>.pushurl=…) that no flag shows, and the guard cannot read it "
+    "before the command runs.\n"
+    "Retype it as a plain `git push` (`-C <dir>` is fine)."
+)
+
 sys.path.insert(0, str(_SCRIPTS))
 from shell_parse import analyze, git_subcommand  # noqa: E402
 
@@ -139,6 +148,12 @@ def remotes_repo(tmp_path):
     _git(r, "remote", "add", "mirror", origin_url)  # same URL as origin
     _git(r, "remote", "add", "backups", fork_url)  # different URL
     return r
+
+
+def _configure_feature_on_backups(repo):
+    _git(repo, "branch", "-m", "feature")
+    _git(repo, "config", "branch.feature.remote", "backups")
+    _git(repo, "config", "branch.feature.merge", "refs/heads/feature")
 
 
 @pytest.fixture
@@ -1081,3 +1096,143 @@ class TestForcePushRepoFlag:
         ][0]
         # --repo wins over the positional `backups`.
         assert guard_module._resolve_push_remote(seg) == "origin"
+
+
+# ── #2513: push config supplied by the command is not trusted ────────────
+
+
+class TestForcePushCommandBorneConfig:
+    """#2513: command-borne config is blocked before destination resolution."""
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            f"git -c remote.backups.pushurl=https://elsewhere.example/x.git push {_FORCE} backups main",
+            f"git --config-env=remote.backups.pushurl=X push {_FORCE} backups main",
+            f"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.backups.pushurl GIT_CONFIG_VALUE_0=https://x.example/x.git git push {_FORCE} backups main",
+            f"HOME=/tmp/elsewhere git push {_FORCE} backups main",
+            f"env git push {_FORCE} backups main",
+            f"git commit -m x && git push {_FORCE} backups main",
+            f"git push {_FORCE} backups main >.git/config",
+            f"git push {_FORCE} backups main | cat",
+        ],
+    )
+    def test_force_push_must_be_one_plain_command(self, remotes_repo, cmd):
+        res = _run_cwd(cmd, str(remotes_repo))
+        assert res.returncode == 2
+        assert "a force push off the public repo must be the whole command" in res.stderr
+        assert "Run the force push on its own." in res.stderr
+
+    @pytest.mark.parametrize(
+        "force",
+        [_FORCE, f"{_FORCE}-with-lease", "+main", "-f"],
+    )
+    def test_plain_disjoint_force_still_asks(self, remotes_repo, force):
+        res = _run_cwd(f"git push {force} backups main", str(remotes_repo))
+        assert res.returncode == 0
+        assert _decision(res) == "ask"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            f"git push {_FORCE} origin main",
+            "git -c x=y push -f origin main",
+        ],
+    )
+    def test_origin_force_keeps_origin_block_message(self, remotes_repo, cmd):
+        res = _run_cwd(cmd, str(remotes_repo))
+        assert res.returncode == 2
+        assert "Force push to origin/<public> is not allowed" in res.stderr
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "git -c remote.origin.push=+HEAD:refs/heads/main push origin",
+            "git --config-env=remote.origin.push=E push origin",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:refs/heads/main git push origin feat",
+            "timeout 60 git push origin feat",
+            "sudo git push origin feat",
+            "./git push origin feat",
+        ],
+    )
+    def test_nonforce_command_config_to_origin_blocks(self, remotes_repo, cmd):
+        res = _run_cwd(cmd, str(remotes_repo))
+        assert res.returncode == 2
+        assert _BLOCKED_COMMAND_CONFIG in res.stderr
+
+    def test_nonforce_git_capital_C_dir_to_origin_is_not_blocked_by_config_rule(
+        self, remotes_repo
+    ):
+        res = _run_cwd(f"git -C {remotes_repo} push origin feat", str(remotes_repo))
+        assert res.returncode == 0
+        assert _decision(res) == "ask"
+
+    @pytest.mark.parametrize("global_flag", ["-P", "--no-pager"])
+    def test_nonforce_safe_git_global_to_origin_is_not_blocked_by_config_rule(
+        self, remotes_repo, global_flag
+    ):
+        res = _run_cwd(f"git {global_flag} push origin feat", str(remotes_repo))
+        assert res.returncode == 0
+        assert _decision(res) == "ask"
+
+    def test_nonforce_config_can_retarget_a_disjoint_remote(self, remotes_repo):
+        origin_url = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=str(remotes_repo),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        cmd = (
+            f"git -c remote.backups.pushurl={origin_url} "
+            "-c remote.backups.push=+HEAD:refs/heads/main push backups"
+        )
+        res = _run_cwd(cmd, str(remotes_repo))
+        assert res.returncode == 2
+        assert _BLOCKED_COMMAND_CONFIG in res.stderr
+
+    def test_nonforce_command_config_to_disjoint_remote_blocks(self, remotes_repo):
+        res = _run_cwd("git -c x=y push backups feat", str(remotes_repo))
+        assert res.returncode == 2
+        assert _BLOCKED_COMMAND_CONFIG in res.stderr
+
+    @pytest.mark.parametrize(
+        "push_config",
+        [
+            ("branch.feature.pushRemote", "origin"),
+            ("remote.pushDefault", "origin"),
+        ],
+    )
+    def test_nonforce_bare_push_config_uses_effective_origin_precedence(
+        self, remotes_repo, push_config
+    ):
+        _configure_feature_on_backups(remotes_repo)
+        _git(remotes_repo, "config", *push_config)
+        res = _run_cwd(
+            "git -c remote.origin.push=+HEAD:refs/heads/main push",
+            str(remotes_repo),
+        )
+        assert res.returncode == 2
+        assert _BLOCKED_COMMAND_CONFIG in res.stderr
+
+    def test_nonforce_trace_prefix_to_disjoint_remote_blocks(self, remotes_repo):
+        _configure_feature_on_backups(remotes_repo)
+        res = _run_cwd("GIT_TRACE=1 git push backups feature", str(remotes_repo))
+        assert res.returncode == 2
+        assert _BLOCKED_COMMAND_CONFIG in res.stderr
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "git -C . push backups feature",
+            "git -P push backups feature",
+            "git --no-pager push backups feature",
+        ],
+    )
+    def test_nonforce_safe_git_globals_to_disjoint_remote_are_not_blocked(
+        self, remotes_repo, cmd
+    ):
+        _configure_feature_on_backups(remotes_repo)
+        res = _run_cwd(cmd, str(remotes_repo))
+        assert res.returncode == 0
+        assert _decision(res) == "ask"

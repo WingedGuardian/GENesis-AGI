@@ -41,6 +41,15 @@ gpg = private_module(
 PUBLIC = "https://github.com/owner/repo"
 OTHER = "https://github.com/owner/other"
 
+_BLOCKED_COMMAND_CONFIG = (
+    "BLOCKED: this push carries a prefix, wrapper or git config option "
+    "(-c / --config-env / VAR=…). Config supplied that way can retarget the push "
+    "or make it a force push (e.g. remote.<name>.push=+…, "
+    "remote.<name>.pushurl=…) that no flag shows, and the guard cannot read it "
+    "before the command runs.\n"
+    "Retype it as a plain `git push` (`-C <dir>` is fine)."
+)
+
 #: Captured before the autouse fixture stubs it, for the tests that drive it for real.
 _REAL_ABSENT = gpg._remote_branch_definitely_absent
 
@@ -686,14 +695,10 @@ def _hook_file(repo: Path, name: str, body: str) -> None:
         "git push -u origin HEAD & git rev-parse HEAD",
         "git push -u origin HEAD > out.txt",
         "git push -u origin HEAD 2>&1",
-        "(git push -u origin HEAD)",
         "git push -u origin HEAD && true",
         "git -C . push -u origin HEAD",
         "git -P push -u origin HEAD",
         "git --no-pager push -u origin HEAD",
-        "env git push -u origin HEAD",
-        "command git push -u origin HEAD",
-        "X=1 git push -u origin HEAD",
         "\\git push -u origin HEAD",
     ],
 )
@@ -701,6 +706,21 @@ def test_anything_but_a_single_plain_push_asks(monkeypatch, tmp_path, capsys, of
     rc, out, err = _run(monkeypatch, tmp_path, capsys, command)
     assert rc == 0, (command, rc, out, err)
     assert _decision(out) == "ask", (command, out, err)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "(git push -u origin HEAD)",
+        "env git push -u origin HEAD",
+        "command git push -u origin HEAD",
+        "X=1 git push -u origin HEAD",
+    ],
+)
+def test_command_borne_config_push_blocks(monkeypatch, tmp_path, capsys, off, command) -> None:
+    rc, out, err = _run(monkeypatch, tmp_path, capsys, command)
+    assert rc == 2, (command, rc, out, err)
+    assert _BLOCKED_COMMAND_CONFIG in err, (command, out, err)
 
 
 def test_a_cdpath_cd_before_the_push_asks(monkeypatch, tmp_path, capsys, off) -> None:

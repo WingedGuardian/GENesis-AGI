@@ -1120,4 +1120,10 @@ jobs:
         #   test_collectors_falkordb.py           new -> 23   (+23)
         #   test_falkordb_module.py               new -> 35   (+35)
         # No added skips. Floor: 24332 + 89 = 24421; skip ceiling remains 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24421
+        # Force-push command-borne config (#2513): collect-only on changed test
+        # files at origin/main vs this branch:
+        #   test_worktree_remote_guard.py      137 -> 168 (+31)
+        #   test_push_create_override.py        93 ->  93 (+0)
+        #   test_push_publish_ask_switch.py    136 -> 136 (+0)
+        # No added skips. Floor: origin/main 24421 + 31 = 24452.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24452
