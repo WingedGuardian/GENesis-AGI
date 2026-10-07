@@ -75,7 +75,11 @@ queues a request marker and the runner rebuilds when the box is quiet (see
 below). If you need a fresh index, queue a marker; do NOT call the
 `index_repository` MCP tool directly for `~/genesis` (it bypasses the lock +
 host freeze — see the storm warning below).
-`.claude/mcp/run-codebase-memory` requires immutable pinned managed settings and
+`.claude/mcp/run-codebase-memory` selects the installed interpreter through literal
+absolute `VENV_PATH` or the primary checkout `.venv`, without a system-Python
+fallback. Empty/unset HOME uses the passwd home before managed path selection.
+The capped child uses a fixed environment bridge for literal paths with systemd
+249-compatible options. The launcher requires immutable pinned managed settings and
 an explicitly enabled, running native query service. Each analysis reader has
 256MiB/zero-swap/Tasks32 under a 2GiB/zero-swap/Tasks512 aggregate; the permanent
 backend has its separate2GiB cap. There is no raw/PATH or address-space fallback

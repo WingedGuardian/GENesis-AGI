@@ -1340,7 +1340,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 3c750316479f 2026-10-05
+verified: 0a9e5ab70 2026-10-07
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -1422,15 +1422,23 @@ verified: 3c750316479f 2026-10-05
   foreign symlink targets are retained. No live-install removal acceptance is
   claimed by isolated fixture tests.
   Native enable/disable/remove share the fixed exclusive lifecycle lock. Enable
-  validates installed immutable state and loaded client slice limits before
-  native enable--now/readiness; failed startup attempts independent retirement.
-  Disable/remove remain usable without valid settings, prove actual quiescence
-  and preserve immutable settings/provider state. Remove unlinks fixed artifacts
-  only. Managed frontends prove fresh shared admission and kernel caps inside
-  the actual transient child:256MiB/zero swap/Tasks32 under2GiB/zero swap/Tasks512
-  aggregate, fixed analysis tool profile, native backend dependency and permanent
-  PID readiness. No raw fallback or backend activation. Queued-worker admission
-  remains a separate concern.
+  validates installed immutable state, typed backend commands/caps and loaded
+  client slice limits; it requires initial quiescence, enables without starting,
+  revalidates after reload, then starts and proves readiness. Failed startup
+  attempts the same canonical-source retirement as disable/remove: inspect both
+  fixed sources before a validated reload and refuse unsupported definitions.
+  Supported canonical retirement remains usable without valid settings or the
+  selected interpreter, proves actual quiescence and preserves immutable state.
+  Remove unlinks fixed artifacts only after validating the full population;
+  partial unlink failures refresh only after proving quiescence and accepted
+  remaining sources. Managed frontends use the selected installed interpreter
+  and normalized HOME, preserve literal paths through a fixed environment bridge,
+  and prove fresh shared admission and kernel caps inside the actual transient
+  child: 256MiB/zero swap/Tasks32 under2GiB/zero swap/Tasks512 aggregate. They
+  retain fixed analysis tools, permanent PID readiness and native stop propagation
+  without backend activation or a raw fallback. Queued-worker admission remains
+  a separate concern.
+
 - **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
   `/v1/chat/completions` endpoint, and registers the desk brain at

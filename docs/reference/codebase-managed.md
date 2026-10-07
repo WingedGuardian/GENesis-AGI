@@ -19,29 +19,69 @@ python3 -I scripts/codebase_managed.py disable
 python3 -I scripts/codebase_managed.py remove
 ```
 
-`enable` uses the fixed installed settings path, validates the pin/cache/sentinel
-and loaded aggregate slice limits before any enablement change, then enables and
-starts the query service and verifies native readiness. It never removes the
-sentinel. Failed startup attempts independent native disable and stops of backend
-and client slice; startup and rollback errors remain visible. A command timeout
-does not prevent the remaining retirement attempts.
+`enable` uses the fixed installed settings path and validates the pin/cache/sentinel.
+Before native mutation it requires exact current rendered service and slice sources
+in the supported installed namespaces, with no competing fragments or override
+namespaces anywhere in the manager's lookup paths. Extra directives, comments,
+whitespace changes, masks, generated/transient sources and final fragment symlinks
+refuse; selected directory aliases and literal installation paths remain supported.
+It explicitly refreshes accepted sources, verifies their loaded identities, commands
+and limits, enables through the same manager's native installation API without
+starting, rechecks and refreshes accepted sources again, then starts and verifies
+native readiness. Backend argv must match
+the installed positional bridge, including its `no-env-expand` flag; auxiliary
+execution commands refuse. A custom installation must supply the same absolute
+`VENV_PATH` used by `install.sh` when invoking `enable`; otherwise the configured
+main checkout's `.venv` is expected. Disable/remove do not require that variable.
+Missing typed manager properties, unsupported native namespace layouts or unavailable
+`busctl` refuse activation. Installation calls cannot fall back to a client-side
+reader. Current canonical templates are the authority, not a partial directive
+allowlist or `NeedDaemonReload` flag.
+Enable also requires an initially inactive or failed backend with no main PID or
+populated cgroup. An already running backend refuses before reload or retirement;
+this prevents rollback from executing newly reloaded incompatible stop commands.
+It never removes the
+sentinel. Failed startup uses the same canonical retirement contract; startup and
+incomplete rollback errors remain visible. A command timeout does not prevent the
+remaining independently authorized retirement attempts.
 Persistent and runtime enablement links are disabled independently before final
 native state proof, including installations with both kinds of link.
 
-`disable` retires the fixed native units without reading settings, including
+`disable` retires supported canonical native units without reading settings, including
 missing, malformed, old-schema or stale-build settings. It verifies service PID,
 native enablement and recursive empty cgroups; slices/scopes do not expose the
-service-only MainPID property. Manager uncertainty or failed stop refuses success.
+service-only MainPID property. Inert parameters from both typed startup commands
+allow retirement without the current virtualenv selection, interpreter existence,
+pin or sentinel. Unknown/customized/stale unit contracts refuse with files,
+settings and processes preserved for operator-directed native intervention. Because
+refresh is global, an unsupported source for either fixed unit blocks refresh and
+automated stopping of the pair; both units' state proofs and errors are reported.
+Manager uncertainty or failed stop refuses success. Accepted sources and quiescence
+are rechecked before refreshing cached installation state for final disablement.
+Native disable removes fixed-name and target-associated enablement links in its
+persistent/runtime namespaces, including aliases to the managed target; it never
+deletes their target files or recursively disables an independent auxiliary unit.
 `remove` first performs the same retirement, then unlinks only the fixed service,
 client slice and known persistent/runtime enablement artifacts and reloads the
-manager. Foreign symlink targets, unrelated slices, settings and provider state
-are preserved. No template ownership/header/repair mechanism is introduced.
+manager. All eight fixed candidates are validated before the first unlink;
+directories, FIFOs, lookup errors and observed replacements refuse. Selected unit
+and membership directory aliases are supported and remain intact. Final artifact
+links are unlinked without following their targets. Unrelated names, settings and
+provider state are preserved. A later unlink failure reports partial removal and
+still reloads after successful deletions; no artifacts are recreated as rollback.
+Partial removal refresh requires this invocation's prior successful retirement,
+both units quiescent and remaining sources canonical or intentionally removed.
+No template ownership/header/repair mechanism is introduced.
 
 All three hold the exclusive nonblocking lifecycle lock through completion or
 rollback. Busy frontend/worker admission refuses; a worker already admitted is
 left to its existing watchdog. Daemon startup/readiness does not take a shared
 lock that could deadlock with this exclusive enable operation. The commands do
 not change immutable settings bytes. None starts the indexing queue.
+These checks coordinate cooperating tools; validation followed by native start or
+unlink is not atomic against a noncooperating operator replacing files or parents.
+The user manager's environment, global defaults and unrelated native dependency
+owners remain trusted; canonical matching is not a sandbox for the whole manager.
 
 ## Managed MCP frontend
 
@@ -55,13 +95,19 @@ native tool profile is fixed to `analysis`.
 Install/bootstrap register this launcher on every install and heal stale raw
 registrations through the existing registration helper. Registration does not
 enable or start a provider. Worktree launchers use the configured physical main
-helper in the actual child, with the main checkout as its native working directory.
+helper in the actual child, with `/` as its neutral native working directory.
+The launcher selects the literal absolute `VENV_PATH`, or the primary checkout
+`.venv`, and refuses an unavailable interpreter without a system-Python fallback.
+An absent or empty HOME is normalized to the passwd home before path selection;
+a nonempty HOME must be absolute and is retained.
 
 Each frontend is a unique transient user service with 256 MiB memory, zero swap,
 TasksMax32 and OOMScoreAdjust500, inside the 2 GiB/zero-swap/TasksMax512 aggregate
 client slice. Requisite/After/StopPropagatedFrom bind it to the already running
 backend without activating that backend. Native collection, wait and pipe preserve
-MCP stdio; environment expansion is disabled for literal path arguments.
+MCP stdio. A fixed shell bridge transports paths in environment values and
+escapes systemd expansion with `$$`; it uses options available in systemd 249.
+This preserves literal paths without the newer `--expand-environment` option.
 
 Inside the actual capped child, shared nonblocking lifecycle admission precedes
 a fresh settings read and kernel leaf/aggregate/ancestor checks. Cache, pinned
@@ -79,6 +125,7 @@ it stays inside the reader's 256MiB/zero-swap cgroup and aggregate. This is an
 accepted bounded timing residue, not a strict connect-only/no-fork guarantee.
 No alternate executable or uncapped execution path is provided by the launcher.
 
+
 ## Configure
 
 Run from the primary Genesis checkout, using the accepted v0.11.0 Linux x86_64
@@ -87,7 +134,7 @@ Other builds/platforms require new acceptance before changing the build pin.
 The binary must be a regular executable file, rather than a symlink.
 
 ```bash
-python3 -I scripts/codebase_managed.py configure \
+.venv/bin/python -I scripts/codebase_managed.py configure \
   --main "$PWD" \
   --binary "$HOME/tmp/codebase-memory-mcp" \
   --state "$HOME/.genesis/cbm" \
@@ -143,21 +190,42 @@ states refuse. Nothing automatically enables the service or removes the sentinel
 The query daemon runs in its own cgroup v2 service with exactly 2 GiB memory,
 zero swap, TasksMax 128, CPUQuota 200%, OOMScoreAdjust 500 and control-group
 cleanup. Restart is disabled. Every visible finite ancestor must admit the full
-query budget; unreadable or malformed limits refuse. The aggregate client slice
+query budget. Startup checks current charged memory using the existing clean-file
+cache discount and 2 GiB cache reserve, and checks host available memory. It
+conservatively includes the small staging Python process without subtracting its
+leaf charge. This is a capacity observation, not an allocation reservation.
+Unreadable or malformed limits/current usage refuse; invalid cache statistics use
+the full charge. Recurring readiness verifies containment without repeating
+startup admission when siblings allocate memory. The aggregate client slice
 has 2 GiB memory, zero swap and TasksMax 512.
+
 
 Startup verifies cache flags and the executable inode, uses the pinned native
 local configuration read to repair a stale endpoint generation, then execs the
 stock permanent daemon. It holds no shared lifecycle lock while readiness is
 pending, avoiding a deadlock with the exclusive enable operation. Readiness
 requires a native connect-only status RPC that names the permanent service PID,
-the correct executable and actual kernel limits. Socket existence is insufficient.
-Each status RPC uses the remaining 60-second readiness window: the pinned CLI
+the correct executable and actual kernel memory, swap, CPU and task ceilings.
+Missing or unlimited CPU/task controls refuse, even if unit properties name caps.
+Socket existence is insufficient. Readiness uses an overall 120-second clock
+including its binary hash and startup polling. The first accepted native PID
+starts a 60-second RPC window clipped to that original deadline; a late native
+appearance can receive less than 60 seconds. Status and manager calls use the
+remaining window. The pinned CLI
 hashes its executable at startup, so a healthy status call can exceed three
-seconds. No status call starts once that window has expired.
+seconds. No status call starts once that window has expired. The unit's
+TimeoutStartSec remains the outer enforcement; ordinary file reads cannot be
+interrupted by the Python clock, so direct callers need their own timeout.
 
 Both ordinary renderer loops substitute quoted Exec paths using separate systemd
-and sed escaping. Whitespace, quote, backslash, dollar, percent, ampersand, pipe
+and sed escaping, including the installed venv interpreter. Install uses its
+selected VENV_PATH; bootstrap uses the checkout's .venv. Operator commands below
+assume that standard path; use the selected interpreter on a custom install.
+The fixed `/bin/sh -c 'exec "$@"' --` bridge passes that absolute interpreter path
+as a literal positional argument, because systemd's executable-name grammar
+rejects some characters that its argument grammar accepts. The fixed script
+never interpolates path data into shell code or performs PATH lookup.
+Whitespace, quote, backslash, dollar, percent, ampersand, pipe
 and Unicode paths retain their literal meaning. A symlink, directory or FIFO at
 either managed template destination is refused before writing; unrelated unit
 and FalkorDB rendering retain their existing behavior. Install preserves an
@@ -166,8 +234,8 @@ existing regular unit; bootstrap updates it through its ordinary rendering loop.
 ## Diagnose and recover
 
 ```bash
-python3 -I scripts/codebase_managed.py status
-python3 -I scripts/codebase_managed.py --config /absolute/settings.json status
+.venv/bin/python -I scripts/codebase_managed.py status
+.venv/bin/python -I scripts/codebase_managed.py --config /absolute/settings.json status
 ```
 
 `CODEBASE_MEMORY_MCP_MANAGED_CONFIG` supplies the default diagnostic override;
@@ -210,6 +278,10 @@ enters the managed guard before changing monitoring or state. It acquires the
 existing runner lock, physical repository index lock, then lifecycle lock without
 waiting; a busy writer or freeze refuses removal. It also refuses surviving
 index scopes, including workers whose queue parent has gone away.
+It also observes same-account fallback GitNexus entrypoints/analyze processes
+for this checkout, using kernel argv/cwd and stable process start identity.
+Observed writers or uncertain identity refuse removal; discovery sends no signals.
+The snapshot cannot prohibit a new unlocked process launched afterward.
 Retirement precedes the direct script's backup/confirmation prompts. Cancelling
 keeps the repository and state, but leaves the query service stopped and disabled,
 as the entry point explicitly reports; deliberate native enablement is required
@@ -218,22 +290,51 @@ to resume it. Make any desired backup before entering removal.
 The guard retires the fixed query service and client slice using native systemd
 commands and verifies inactive/failed state, zero MainPID and empty cgroups,
 including descendants. Missing, malformed or stale settings cannot bypass this
-proof. Manager failures, failed stop or uncertain state abort cleanup.
+proof. Unsupported unit contracts abort before deleting the installation; inspect
+the preserved definitions and use operator-directed native recovery. A native
+implicit slice can remain loaded without a fragment: it counts as absent only
+with empty source/override/enablement metadata, no transient identity, and proven
+inactive state and empty descendant groups. Manager failures, failed stop or
+uncertain state abort cleanup.
+Final enablement is checked even when the native disable call succeeds: surviving
+global/runtime enablement still refuses removal.
 
 The helper executes its fixed sibling uninstall script with the real lock
 descriptors inherited and checked on entry. Those descriptors remain held through
-removal of the repository, runtime state, database and Qdrant roots. Host cleanup
+removal of the repository, runtime contents, database and Qdrant roots. Existing
+`~/.genesis/locks` and its original inodes remain as coordination state; settings,
+queue and provider contents elsewhere within the fixed deletion roots are removed. This prevents a
+stalled entrypoint from recreating a different lock inode during teardown.
+Plain default locks and nonoverlapping external `GENESIS_HOME` are supported.
+Custom lock layouts intersecting the four deletion roots, or default namespace
+symlinks that cleanup would unlink, refuse before retirement. No lock relocation
+is performed. The lifecycle lock's systemd-directory namespace must also remain
+outside all four roots in both lexical and resolved paths, including through
+symlink ancestors; aliasing it into the retained runner locks is unsupported.
+Safe external systemd-directory aliases remain supported. No broad native-state
+retention mode is introduced. Assess conflicting layouts
+with all writers stopped; do not move live locks to bypass refusal. Host cleanup
 delegates once to this same container transaction after its normal backup and
 confirmation; a missing/older guard or failed container command refuses cleanup
-without falling back to separate deletion commands. Host Guardian removal and
-full container deletion retain their existing distinct scope.
+without falling back to separate deletion commands. Default host cleanup finishes
+before Guardian artifacts are removed. On refusal, its installation remains;
+the earlier monitoring pause is not automatically undone. Full container deletion
+keeps its existing inner-cleanup skip and separate confirmation behavior.
 
 Only the fixed CBM service/slice fragments and their known persistent/runtime
 enablement locations are removed. Symlinks are unlinked without deleting foreign
 targets; unrelated slices survive. Valid settings can report external retained
 binary/cache/runtime paths, but cannot expand the documented deletion roots.
+Unclassifiable diagnostic paths are reported and do not alter deletion authority.
+Both Qdrant binary locations and dangling known unit links are handled; foreign
+symlink targets remain untouched. Failed runtime inventory aborts before deleting
+install roots and retains the inventory for inspection.
 Dry-run does not acquire locks, stop managed units or delete state. An internal
 reentry marker alone is insufficient: it requires verified inherited descriptors.
+The teardown helper retains its system Python entry point and uses only standard
+library operations available on the supported Python 3.10 platform. It does not
+perform the native binary hash/launch acceptance used by the installed query
+runtime. Current-install tests are not a separate Python 3.10 runtime qualification.
 
 ## Verification
 

@@ -36,7 +36,7 @@ def render(tmp_path):
             HOME=str(home or tmp_path),
             REPO_DIR=str(home or tmp_path),
             GENESIS_ROOT=str(home or tmp_path),
-            VENV_PATH=str(tmp_path / ".venv"),
+            VENV_PATH=str(tmp_path / 'venv=$%&|λ" '),
             CC_BIN_DIR="/usr/bin",
             SERVICES_GENERATED="0",
             SERVICES_UPDATED="0",
@@ -59,7 +59,7 @@ def render(tmp_path):
 
 @pytest.mark.parametrize("renderer", ["install.sh", "bootstrap.sh"])
 @pytest.mark.parametrize(
-    "suffix", ["plain", "trailing ", 'quote"back\\slash', "$value%&|unicode-λ"]
+    "suffix", ["plain", "trailing ", 'quote"back\\slash', "=$value%&|unicode-λ"]
 )
 def test_rendered_exec_paths_are_literal_and_templates_are_unconditional(
     render, tmp_path, renderer, suffix
@@ -71,7 +71,10 @@ def test_rendered_exec_paths_are_literal_and_templates_are_unconditional(
     assert {p.name for p in units.iterdir()} == set(UNITS)
     body = (units / UNITS[0]).read_text()
     escaped = str(home).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
-    assert f'ExecStart=:/usr/bin/python3 -I "{escaped}/scripts/codebase_managed.py"' in body
+    venv = home / ".venv" if renderer == "bootstrap.sh" else tmp_path / 'venv=$%&|λ" '
+    venv_escaped = str(venv).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    for entry in ("ExecStart", "ExecStartPost"):
+        assert f"{entry}=:/bin/sh -c 'exec \"$@\"' -- \"{venv_escaped}/bin/python\" -I \"{escaped}/scripts/codebase_managed.py\"" in body
     assert f'--config "{escaped}/.genesis/config/codebase-managed.json" serve' in body
     assert "__" not in body
     assert "MemoryMax=2G" in body and "MemorySwapMax=0" in body
