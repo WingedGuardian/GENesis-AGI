@@ -1128,4 +1128,6 @@ jobs:
         # Floor: 24516 +367 =24883; no added skips, ceiling unchanged.
         # Corpus/adapters replacement:89 preserved original cases; no skips.
         # Floor:24883 +89 =24972 (reconcile against main before opening).
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24972
+        # Pinned transport:42 original pinned +15 rework +149 new evidence cases.
+        # Floor:24972 +206 =25178; no added skips, ceiling unchanged.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25178

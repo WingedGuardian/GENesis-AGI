@@ -1,0 +1,1 @@
+- Qualification transport now retains paid responses before SDK cleanup, refuses repeated completions, and reconciles exact costs through generation receipts. Frozen bindings and incident recovery are required; the execution runner and spending approval remain separate.

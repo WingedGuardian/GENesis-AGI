@@ -394,6 +394,11 @@ class Journal(Campaign):
         if blockers:
             raise Incomplete("campaign stopped: " + ", ".join(sorted(blockers)))
 
+    def ready(self):
+        """Check campaign-wide readiness without copying all attempts or history."""
+        with self._mutex:
+            self._ready()
+
     def reserve(self, attempt):
         self._ready()
         row = self._derived.attempts.get(attempt)

@@ -2424,7 +2424,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 4117f6ed 2026-10-05
+verified: af3e45d3c 2026-10-07
 ```
 
 - **The graders are TOLD the response status; they must never infer it.** The
@@ -2566,7 +2566,7 @@ verified: 4117f6ed 2026-10-05
   and recovery state. Incremental publication follows durable append; uncertain
   publication stops derived-state reading until reconstruction. Historical
   reading never creates or truncates files; version-1 evidence cannot execute.
-  No transport, CLI, automatic execution or qualification verdict is wired yet;
+  No CLI, automatic execution or qualification verdict is wired yet;
   subsequent replacement PRs supply those callers. Production credentials and
   accounting stores are outside this boundary. See
   `docs/reference/qualification-journal.md`. Offline reference admission also
@@ -2586,6 +2586,15 @@ verified: 4117f6ed 2026-10-05
   full-schema SQLite fixtures and observes the actual rendered candidate IDs.
   Full preflight, storage replay and execution/reporting orchestration land later.
   See `docs/reference/qualification-corpus.md`.
+  Qualification's pinned transport supplies a caller-provided adapter router
+  through the production delegate, a shared one-egress wire guard, response-hook
+  durability and exact lexical Decimal GET billing. Frozen schedule/provider
+  mapping and dedicated nonreset credentials are required; any journal incident
+  pauses new requests and replay until verified recovery. These checks do not
+  establish provider spend bounds or owner approval. The isolated runner remains
+  a later replacement. This verification refresh covers the qualification slice;
+  other learning/evaluation entries retain their previous verification scope.
+  See `docs/reference/qualification-transport.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
