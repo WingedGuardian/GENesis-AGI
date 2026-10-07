@@ -57,8 +57,20 @@ def _live_refusal() -> tuple[dict, int] | None:
     if verdict == (1, "other"):
         # "other" includes a branch named `live` that no manifest builds; the
         # deploy scripts refuse that by their branch rule (never `live`), so the
-        # route, which has no such rule of its own, refuses it here.
-        if _git("symbolic-ref", "-q", "HEAD") != "refs/heads/live":
+        # route, which has no such rule of its own, refuses it here. GIT_* from
+        # the server's environment (GIT_DIR, ...) would answer for another
+        # repository, so they are dropped, as live_checkout.py does.
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        try:
+            p = subprocess.run(
+                ["git", "-C", str(_GENESIS_ROOT), "symbolic-ref", "-q", "HEAD"],
+                capture_output=True, text=True, timeout=10, env=env,
+            )
+            # 1 with no output is a detached HEAD; any other failure cannot tell.
+            ref = p.stdout.strip() if p.returncode in (0, 1) else "refs/heads/live"
+        except (OSError, subprocess.SubprocessError):
+            ref = "refs/heads/live"  # cannot tell: refuse
+        if ref != "refs/heads/live":
             return None
         return {
             "error": (

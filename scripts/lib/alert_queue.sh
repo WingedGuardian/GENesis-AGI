@@ -32,7 +32,7 @@ queue_alert_try() {
     ALERT_QUEUE_ROOT="$_ALERT_QUEUE_ROOT" \
     ALERT_SEVERITY="$severity" ALERT_SOURCE="$source" \
     ALERT_TITLE="$title" ALERT_BODY="$body" ALERT_DEDUPE="$dedupe" \
-    python3 - <<'PY' 2>/dev/null
+    python3 -I -S - <<'PY' 2>/dev/null
 import json, os, time, uuid
 root = os.environ["ALERT_QUEUE_ROOT"]
 ts = time.time()

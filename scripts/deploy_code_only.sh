@@ -376,7 +376,7 @@ _refuse_if_sessions() {
     fi
     work=""
     tok_file="$(_server_genesis_home "$main")/internal_api_token"
-    if ! python3 -c "$_PORT_PROBE_PY" "$INFLIGHT_PORT" "$main" 2>/dev/null; then
+    if ! python3 -I -S -c "$_PORT_PROBE_PY" "$INFLIGHT_PORT" "$main" 2>/dev/null; then
         # Whatever answers on the port must BE the server before it is handed the
         # token or believed: another listener could take the token, or answer 404
         # and pass for a server that predates the report.
@@ -535,7 +535,7 @@ trap 'exit 143' TERM
 # finished one behind, and the watchdog's reader already treats it as over. Under
 # the exclusive lock no update.sh can be running. Anything unreadable refuses.
 if [ -e "$UPDATE_STATE_FILE" ]; then
-    _state_phase="$(python3 -c 'import json, sys
+    _state_phase="$(python3 -I -S -c 'import json, sys
 d = json.load(open(sys.argv[1]))
 p = d.get("phase") if isinstance(d, dict) else None
 print(p if isinstance(p, str) else "")' "$UPDATE_STATE_FILE" 2>/dev/null || true)"
@@ -619,7 +619,7 @@ fi
 # cannot fix: this interpreter is older than the incoming requires-python.
 _deps_ok() {
     local what="$1" remedy="$2" out rc=0
-    out="$("$VENV_DIR/bin/python" "$_SELF_DIR/lib/venv_matches_pyproject.py" "$GENESIS_ROOT" 2>&1)" || rc=$?
+    out="$("$VENV_DIR/bin/python" -P "$_SELF_DIR/lib/venv_matches_pyproject.py" "$GENESIS_ROOT" 2>&1)" || rc=$?
     case "$rc" in
         0) return 0 ;;
         3) echo "ERROR: $what needs a newer Python than this venv runs, and a reinstall cannot change that:" >&2 ;;
@@ -635,7 +635,7 @@ _deps_ok() {
 _deploy_health_paths() {
     local name="$1" ref="$2" src
     src="$(git -C "$GENESIS_ROOT" show "$ref:src/genesis/observability/snapshots/deploy_health.py" 2>/dev/null)" || return 0
-    DH_SRC="$src" "$VENV_DIR/bin/python" -c '
+    DH_SRC="$src" "$VENV_DIR/bin/python" -I -S -c '
 import ast, os, sys
 for node in ast.parse(os.environ["DH_SRC"]).body:
     if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == sys.argv[1] for t in node.targets):
@@ -1035,7 +1035,7 @@ _restarted_unit_serving() {
     else
         [ "$pid" != "$_SERVER_PID_BEFORE" ] || return 1
     fi
-    python3 -c "$_PORT_PROBE_PY" "$_HEALTH_PORT" "$pid" 2>/dev/null || return 1
+    python3 -I -S -c "$_PORT_PROBE_PY" "$_HEALTH_PORT" "$pid" 2>/dev/null || return 1
     printf '%s\n' "$pid"
 }
 
@@ -1112,7 +1112,7 @@ if [ "$_healthy" = true ]; then
     # an otherwise-good deploy is not failed over one non-critical subsystem, but
     # the regression is surfaced rather than swallowed.
     _degraded="$(SERVER_PID="$_SERVER_PID" SERVER_PID_BEFORE="$_SERVER_PID_BEFORE" \
-        MANIFEST_BEFORE="$_MANIFEST_BEFORE" python3 -c "$_MANIFEST_DELTA_PY" 2>/dev/null)" \
+        MANIFEST_BEFORE="$_MANIFEST_BEFORE" python3 -I -S -c "$_MANIFEST_DELTA_PY" 2>/dev/null)" \
         || _degraded="check:manifest-interpreter-failed"
     if [ -n "$_degraded" ]; then
         echo "  NOTE: subsystems not ok after the restart: $_degraded"

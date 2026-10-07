@@ -193,6 +193,21 @@ def test_a_live_branch_no_manifest_builds_is_still_refused(
 
 
 @pytest.mark.parametrize("route", ROUTES)
+def test_an_inherited_git_dir_does_not_hide_the_live_branch(
+    client, world, starters, route, tmp_path, monkeypatch
+):
+    """GIT_DIR in the server's environment names a repository on main; the
+    branch read must still be about the deployed checkout."""
+    _put_on_live(world, None)
+    other = tmp_path / "other"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    r = client.post(route, json={})
+    assert r.status_code == 409
+    assert starters == []
+
+
+@pytest.mark.parametrize("route", ROUTES)
 @pytest.mark.parametrize("manifest", [None, "{not json"])
 def test_on_main_the_route_proceeds_as_before(client, world, starters, route, manifest):
     if manifest is not None:
