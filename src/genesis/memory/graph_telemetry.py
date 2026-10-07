@@ -32,13 +32,15 @@ logger = logging.getLogger(__name__)
 # Logs cannot answer that: the fallback warnings in ``memory/graph.py`` come
 # mostly from MCP servers, which log to stderr that never reaches the journal.
 # So every traversal's outcome lands in ``eval_events``: ONE row per caller call
-# (a "tally"), plus a row of its own, written the moment it happens, for the
-# FIRST clock-breaking outcome of the call. A process killed mid-request can
-# therefore never lose the evidence that the clock broke; any later fallbacks in
-# the same call ride on the closing row. Only the first is written at once
-# because the recall graph budget counts traversal time, not this write, and an
-# engine outage makes every traversal a fallback. Clock-breaking outcomes carry
-# an event entry with the exception class names (never messages, ids or paths).
+# (a "tally"), plus a row of its own for the FIRST clock-breaking outcome of the
+# call, written the moment the selected store fails and before any fallback runs
+# (``graph.traverse``), so a process that hangs or is killed during the fallback
+# can never lose the evidence that the clock broke; any later fallbacks in the
+# same call ride on the closing row. Only the first is written at once because
+# that write sits on the traversal's own clock (it counts against recall's graph
+# budget) and an engine outage makes every traversal a fallback. Clock-breaking
+# outcomes carry an event entry with the exception class names (never messages,
+# ids or paths).
 #
 # A row that fails to write is counted twice over: in memory, carried on the
 # next row this process writes (``prior_write_failures``), and as one line in
@@ -261,20 +263,22 @@ async def _write_tally(
     global _write_failures, _proc_role
     if _telemetry_off():
         return
-    if _proc_role is None:
-        _proc_role = process_role()
     carried = _write_failures
-    metrics = {
-        "caller": tally.caller,
-        "proc": _proc_role,
-        "traversals": tally.traversals,
-        "outcomes": dict(tally.outcomes),
-        "served": dict(tally.served),
-        "configured": dict(tally.configured),
-        "events": tally.events,
-        "prior_write_failures": carried,
-    }
     try:
+        # Inside the try: this runs on a fallback path too, where anything
+        # escaping would replace the caller's result and lose the row uncounted.
+        if _proc_role is None:
+            _proc_role = process_role()
+        metrics = {
+            "caller": tally.caller,
+            "proc": _proc_role,
+            "traversals": tally.traversals,
+            "outcomes": dict(tally.outcomes),
+            "served": dict(tally.served),
+            "configured": dict(tally.configured),
+            "events": tally.events,
+            "prior_write_failures": carried,
+        }
         from genesis.db.crud import j9_eval
 
         if db_path is not None:
