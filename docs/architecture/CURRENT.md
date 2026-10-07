@@ -2714,7 +2714,11 @@ verified: b0867170e8e3 2026-10-02
   `activity_log`'s retained window, 10-06 18:02 to 10-07 18:03 UTC, 0 succeeded), so `listed` and even an earlier successful probe
   proved nothing durable. Its rung became `deepseek-flash` (DeepSeek's own API,
   the same V4.1 Flash, paid, prepaid account) followed by
-  `openrouter-deepseek-flash`; five free-only chains just drop it, and
+  `openrouter-deepseek-flash` — so eight sites now lead with a paid rung (the
+  dream-cycle synthesis and both challenge sites, wing_backfill, 38, 40, 43,
+  44), and five that are all-paid (17, 20, judge, both challenge sites) fail
+  outright, as before, once a configured spend budget is exceeded; five chains
+  with other free rungs just drop it, and
   `attention_salience` keeps Mistral alone (no other free model JSON-verified).
   The provider block stays, unchained. `gemini-free-latest`
   (`gemini-flash-latest`) is declared but unchained: it resolved to 3.8 Flash
@@ -2749,9 +2753,10 @@ verified: b0867170e8e3 2026-10-02
   `DailyBudgetLedger`): providers may carry `rpd_limit` / `tpd_limit`, each in
   the provider's OWN unit and never converted between them. As SHIPPED today:
   Groq carries both (`rpd_limit: 1000`, `tpd_limit: 200000`, the latter read
-  off Groq's own 429 text), and Gemini carries NEITHER — a daily cap for it is
-  inferred from a live 429 but not measured, and a wrong shipped cap would
-  deselect the provider on every install. When spent, the chain walk DESELECTS
+  off Groq's own 429 text), and Gemini carries NEITHER — its free tier is 20
+  requests/day per model (MEASURED 2026-10-07), but the quota belongs to the
+  key's Google project and is shared by every consumer of it, so a shipped cap
+  would be wrong wherever the key is shared or paid. When spent, the chain walk DESELECTS
   the provider until the next
   UTC day — no breaker trip (budget is not a health signal), one WARNING
   `provider.budget_exhausted` event at the crossing, counters visible in the

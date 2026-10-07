@@ -381,7 +381,7 @@ providers:
   deepseek-flash:
     type: deepseek
     model: deepseek-flash
-    profile: deepseek-v4.1-flash
+    profile: deepseek-flash-direct
     free: false
     rpm_limit: 20
     open_duration_s: 120

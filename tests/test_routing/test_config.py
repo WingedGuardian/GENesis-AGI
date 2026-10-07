@@ -140,6 +140,15 @@ def test_load_full_yaml(monkeypatch):
     # unchained) and gemini-free-latest (the gemini-flash-latest alias).
     assert len(cfg.providers) == 28
     assert "deepseek-flash" in cfg.providers and "gemini-free-latest" in cfg.providers
+    # The direct route is priced at DeepSeek's own rate, never the OpenRouter
+    # profile's (a cost fallback would under-record it ~4-9x).
+    import yaml
+
+    profiles = yaml.safe_load(
+        (Path(__file__).resolve().parents[2] / "config" / "model_profiles.yaml").read_text()
+    )["profiles"]
+    direct = profiles[cfg.providers["deepseek-flash"].profile]
+    assert (direct["cost_per_mtok_in"], direct["cost_per_mtok_out"]) == (0.30, 1.20)
     assert not any(
         "nvidia-nim-deepseek" in site.chain for site in cfg.call_sites.values()
     ), "NIM DeepSeek never answers on NVIDIA's side (2026-10-07); keep it out of chains"
