@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from pathlib import Path, PurePosixPath
 
 
@@ -18,11 +20,11 @@ def object_name(relative):
     return "v2-" + hashlib.sha256(os.fsencode(relative)).hexdigest() + ".tar.gpg"
 
 
-def sources(root):
+def sources(root, recursive=True):
     if root.is_symlink() or not root.is_dir():
         raise ValueError("source root is missing or a symlink")
     for directory, dirs, files in os.walk(root, followlinks=False, onerror=_raise):
-        dirs[:] = sorted(d for d in dirs if not (Path(directory) / d).is_symlink())
+        dirs[:] = sorted(d for d in dirs if recursive and not (Path(directory) / d).is_symlink())
         for name in sorted(files):
             path = Path(directory) / name
             eligible = name.endswith(".jsonl") or (
@@ -90,6 +92,8 @@ def capture(source, relative, target):
 
 
 def crypt(source, target, password, decrypt=False):
+    if not password:
+        raise ValueError("backup passphrase required for encrypted payloads")
     command = [
         "gpg",
         "--batch",
@@ -134,7 +138,21 @@ def backup(root, destination, scratch, password, project=None):
     except (OSError, ValueError):
         index = {}
     try:
-        for source in sources(root):
+        if project is not None and (
+            not project
+            or PurePosixPath(project).parts != (project,)
+            or project in (".", "..")
+            or "\0" in project
+        ):
+            raise ValueError("project must be one directory name")
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError("source root is missing or a symlink")
+        discovery_root = root / project if project is not None else root
+        if project is not None and not discovery_root.exists() and not discovery_root.is_symlink():
+            discovered = ()  # no transcripts yet in the selected project
+        else:
+            discovered = sources(discovery_root, recursive=project is None)
+        for source in discovered:
             relative = source.relative_to(root).as_posix()
             if project is not None and (
                 source.parent != root / project or source.suffix != ".jsonl"
@@ -258,6 +276,27 @@ def safe_target(root, relative):
     return target
 
 
+def validate_preferences(preferences):
+    """Validate operator input without touching any restore destination."""
+    result = {}
+    for item in preferences:
+        relative, separator, kind = item.rpartition("=")
+        path = PurePosixPath(relative)
+        if (
+            not separator
+            or kind not in ("legacy", "v2")
+            or relative in result
+            or "\0" in relative
+            or path.is_absolute()
+            or ".." in path.parts
+            or not path.parts
+            or str(path) != relative
+        ):
+            raise ValueError("invalid or repeated transcript preference")
+        result[relative] = kind
+    return result
+
+
 def restore_set(
     directory,
     root,
@@ -270,13 +309,7 @@ def restore_set(
     preferences=(),
 ):
     """Validate every candidate before choosing; legacy ciphertext has no source time."""
-    preference = {}
-    for item in preferences:
-        relative, separator, kind = item.rpartition("=")
-        safe_target(root, relative)
-        if not separator or kind not in ("legacy", "v2") or relative in preference:
-            raise ValueError("invalid or repeated transcript preference")
-        preference[relative] = kind
+    preference = validate_preferences(preferences)
     candidates, failures, count = {}, [], 0
     with tempfile.TemporaryDirectory(dir=scratch, prefix="transcript-set-") as temp:
         for number, source in enumerate(sorted(directory.iterdir())):
@@ -447,15 +480,21 @@ def analytics_restore(source, destination, scratch, password, force=False, dry_r
                         os.fsync(directory_fd)
                     finally:
                         os.close(directory_fd)
-                aside = destination.with_name(destination.name + ".pre-restore-" + str(os.getpid()))
+                aside = None
                 if destination.exists():
-                    if aside.exists():
-                        raise ValueError("analytics aside already exists")
-                    os.rename(destination, aside)
+                    # mkdtemp reserves a unique bounded sibling even at NAME_MAX.
+                    stem = os.fsencode(destination.name)[:100]
+                    prefix = os.fsdecode(stem) + ".pre-restore-"
+                    aside = Path(tempfile.mkdtemp(dir=destination.parent, prefix=prefix))
+                    try:
+                        os.rename(destination, aside)
+                    except OSError:
+                        aside.rmdir()
+                        raise
                 try:
                     os.rename(stage, destination)
                 except OSError:
-                    if aside.exists() and not destination.exists():
+                    if aside is not None and aside.exists() and not destination.exists():
                         os.rename(aside, destination)
                     raise
                 directory_fd = os.open(destination.parent, os.O_DIRECTORY)
@@ -463,6 +502,113 @@ def analytics_restore(source, destination, scratch, password, force=False, dry_r
                     os.fsync(directory_fd)
                 finally:
                     os.close(directory_fd)
+
+
+_POOL_OBJECT = re.compile(r"([0-9]+)-([a-f0-9]{64})\.gpg\Z")
+_CAPTURE_NAME = re.compile(r"(?:v2-[a-f0-9]{64}\.tar|[A-Za-z0-9._-]+\.jsonl)\.gpg\Z")
+
+
+def pool_rows(document, snapshot):
+    if (
+        not isinstance(document, dict)
+        or type(document.get("version")) is not int
+        or document.get("version") != 1
+        or document.get("snapshot") != snapshot
+        or not isinstance(document.get("captures"), list)
+    ):
+        raise ValueError("invalid or mismatched transcript manifest")
+    seen = set()
+    rows = []
+    for row in document["captures"]:
+        if (
+            not isinstance(row, list)
+            or len(row) != 3
+            or not isinstance(row[0], str)
+            or not _CAPTURE_NAME.fullmatch(row[0])
+            or row[0] in seen
+            or not isinstance(row[1], str)
+            or not _POOL_OBJECT.fullmatch(row[1])
+            or type(row[2]) is not int
+            or row[2] < 0
+        ):
+            raise ValueError("invalid transcript manifest entry")
+        seen.add(row[0])
+        rows.append(row)
+    return rows
+
+
+def pool_manifest(directory, target, snapshot, scratch, password):
+    rows = []
+    for source in sorted(directory.glob("*.gpg")):
+        if source.is_symlink() or not source.is_file() or not _CAPTURE_NAME.fullmatch(source.name):
+            raise ValueError("invalid local transcript capture")
+        before = fingerprint(source.stat())
+        object_id = f"{before[3]}-{checksum(source)}.gpg"
+        if fingerprint(source.stat()) != before:
+            raise ValueError("capture changed while building manifest")
+        rows.append([source.name, object_id, before[2]])
+    document = {"version": 1, "snapshot": snapshot, "captures": rows}
+    pool_rows(document, snapshot)
+    with tempfile.TemporaryDirectory(dir=scratch, prefix="transcript-manifest-") as temp:
+        plain = Path(temp) / "manifest.json"
+        plain.write_text(json.dumps(document))
+        crypt(plain, target, password)
+    return rows
+
+
+def pool_read(source, snapshot, scratch, password):
+    with tempfile.TemporaryDirectory(dir=scratch, prefix="transcript-manifest-") as temp:
+        plain = Path(temp) / "manifest.json"
+        crypt(source, plain, password, decrypt=True)
+        return pool_rows(json.loads(plain.read_text()), snapshot)
+
+
+def pool_verify(source, object_id, size):
+    match = _POOL_OBJECT.fullmatch(object_id)
+    if (
+        match is None
+        or source.is_symlink()
+        or not source.is_file()
+        or source.stat().st_size != size
+        or checksum(source) != match.group(2)
+    ):
+        raise ValueError("transcript pooled object checksum/size mismatch")
+
+
+def pool_missing(references, objects):
+    existing = set(objects.read_text().splitlines())
+    if any(
+        not _POOL_OBJECT.fullmatch(name) for name in existing if not name.startswith(".partial-")
+    ):
+        raise ValueError("unknown pooled object")
+    rows = [line.split("\t") for line in references.read_text().splitlines()]
+    if any(len(row) != 3 or not _POOL_OBJECT.fullmatch(row[1]) for row in rows):
+        raise ValueError("invalid pooled inventory")
+    return [row for row in rows if row[1] not in existing]
+
+
+def pool_gc(references, objects, now=None):
+    # Caller authenticates every retained/incomplete manifest before invoking this.
+    protected = set()
+    for line in references.read_text().splitlines():
+        row = line.split("\t")
+        if len(row) != 3 or not _POOL_OBJECT.fullmatch(row[1]):
+            raise ValueError("invalid GC reference inventory")
+        protected.add(row[1])
+    cutoff = int(((time.time() if now is None else now) - 7 * 86400) * 1_000_000_000)
+    names = objects.read_text().splitlines()
+    # Unknown objects imply a protocol/inspection mismatch: abort the entire sweep.
+    if any(not _POOL_OBJECT.fullmatch(name) for name in names if not name.startswith(".partial-")):
+        raise ValueError("unknown pooled object; refusing GC")
+    expired = []
+    for name in names:
+        if name.startswith(".partial-"):
+            stamp = re.match(r"\.partial-([0-9]+)-", name)
+            if stamp and int(stamp.group(1)) * 1_000_000_000 < cutoff:
+                expired.append(name)
+        elif name not in protected and int(_POOL_OBJECT.fullmatch(name).group(1)) < cutoff:
+            expired.append(name)
+    return expired
 
 
 def main():
@@ -478,6 +624,12 @@ def main():
             "analytics-backup",
             "analytics-restore",
             "name",
+            "validate-preferences",
+            "pool-manifest",
+            "pool-read",
+            "pool-verify",
+            "pool-gc",
+            "pool-missing",
         ),
     )
     parser.add_argument("source")
@@ -485,6 +637,9 @@ def main():
     parser.add_argument("--scratch", type=Path)
     parser.add_argument("--destination", type=Path)
     parser.add_argument("--project")
+    parser.add_argument("--snapshot")
+    parser.add_argument("--object-id")
+    parser.add_argument("--size", type=int)
     parser.add_argument("--selected", type=Path)
     parser.add_argument("--preference", action="append", default=[])
     parser.add_argument("--force", action="store_true")
@@ -493,9 +648,34 @@ def main():
     if args.operation == "name":
         print(object_name(args.source))
         return 0
+    if args.operation == "validate-preferences":
+        preferences = validate_preferences(args.preference)
+        if args.root is not None:
+            for relative in preferences:
+                safe_target(args.root, relative)
+        return 0
+    if args.operation == "pool-verify":
+        pool_verify(Path(args.source), args.object_id, args.size)
+        return 0
+    if args.operation == "pool-missing":
+        for row in pool_missing(Path(args.source), args.selected):
+            print("\t".join(row))
+        return 0
+    if args.operation == "pool-gc":
+        for name in pool_gc(Path(args.source), args.selected):
+            print(name)
+        return 0
     password = sys.stdin.buffer.read()
-    if not password:
-        raise ValueError("backup passphrase required")
+    if args.operation in ("pool-manifest", "pool-read"):
+        if args.operation == "pool-manifest":
+            rows = pool_manifest(
+                Path(args.source), args.destination, args.snapshot, args.scratch, password
+            )
+        else:
+            rows = pool_read(Path(args.source), args.snapshot, args.scratch, password)
+        for row in rows:
+            print("\t".join(map(str, row)))
+        return 0
     if args.operation == "analytics-backup":
         analytics_archive(Path(args.source), args.destination, args.scratch, password)
         return 0

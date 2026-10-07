@@ -907,6 +907,16 @@ else
             _extra_skip "overlaps $_core_hit, which the core backup restores" "$_d"
             continue
         fi
+        if [ -n "$_analytics_data" ]; then
+            _analytics_abs=$(realpath -m -- "$_analytics_data")
+            _analytics_overlap=false
+            case "$_abs/" in "$_analytics_abs"/*) _analytics_overlap=true ;; esac
+            case "$_analytics_abs/" in "$_abs"/*) _analytics_overlap=true ;; esac
+            if $_analytics_overlap; then
+                _extra_skip "overlaps dedicated analytics archive; remove this extra entry" "$_d"
+                continue
+            fi
+        fi
         _dup=""
         for _prev in "${_extra_abs_seen[@]+"${_extra_abs_seen[@]}"}"; do
             case "$_abs/" in "$_prev"/*) _dup="$_prev" ;; esac
@@ -1029,7 +1039,9 @@ if [ -n "$_analytics_data" ]; then
     _analytics_safe=true
     _analytics_abs=$(realpath -m -- "$_analytics_data")
     if _analytics_core=$(backup_core_overlap "$_analytics_abs"); then _analytics_safe=false; fi
-    for _analytics_guard in "$BACKUP_DIR" "$GENESIS_BIG_TMP" "${GENESIS_BACKUP_LOCAL_PATH:-}"; do
+    _analytics_local_guard=""
+    [ "$(_backend_resolve)" = local ] && _analytics_local_guard="${GENESIS_BACKUP_LOCAL_PATH:-}"
+    for _analytics_guard in "$BACKUP_DIR" "$GENESIS_BIG_TMP" "$_analytics_local_guard"; do
         [ -n "$_analytics_guard" ] || continue
         _analytics_guard=$(realpath -m -- "$_analytics_guard")
         case "$_analytics_abs/" in "$_analytics_guard"/*) _analytics_safe=false ;; esac
@@ -1279,6 +1291,17 @@ else
     _T2_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
     _T2_DIR="${_T2_HOST_DIR}/${_T2_STAMP}"
 
+    # Published and incomplete snapshots are immutable. A repeated timestamp
+    # (including clock rollback) must never overwrite a prior recovery point.
+    # Retry with a fresh timestamp; listing uncertainty also forbids writes.
+    _T2_PROBE_RC=0
+    backend_list_strict "$_T2_DIR" >/dev/null || _T2_PROBE_RC=$?
+    case "$_T2_PROBE_RC" in
+        3) ;;
+        0) die "off-site snapshot already exists: $_T2_DIR; retry with a fresh timestamp" ;;
+        *) die "cannot verify off-site snapshot absence: $_T2_DIR" ;;
+    esac
+
     # Create the snapshot directory tree (backend_mkdir creates ancestors;
     # pre-existing levels are idempotent).
     backend_mkdir "${_T2_DIR}/data"
@@ -1337,17 +1360,13 @@ else
         _T2_OK=false
     fi
 
-    # Upload transcripts (part of the off-site snapshot)
-    for f in transcripts/*.gpg; do
-        [ -f "$f" ] || continue
-        fname=$(basename "$f")
-        if backend_put "$f" "${_T2_DIR}/transcripts/$fname"; then
-            log "  off-site: uploaded transcripts/$fname"
-        else
-            log "WARNING: off-site upload failed for transcripts/$fname"
-            _T2_OK=false
-        fi
-    done
+    # Publish authenticated inventory and upload only missing immutable captures.
+    # shellcheck source=scripts/lib/transcript_pool.sh
+    source "$_SCRIPT_DIR/lib/transcript_pool.sh"
+    if ! transcript_pool_backup transcripts "$_T2_HOST_DIR" "$_T2_DIR"; then
+        log "WARNING: transcript pooled snapshot incomplete"
+        _T2_OK=false
+    fi
 
     # Upload memory / config overlays / secrets — previously git-Tier-1 only. Including
     # them here makes the off-site snapshot a COMPLETE copy, so a no-git fresh-box DR can
@@ -1466,7 +1485,7 @@ else
         # back to know what to expect, because a failed off-site LISTING looks the same
         # as an empty one, while a failed download of this file is detectable.
         {
-            printf 'genesis-snapshot 1\n'
+            printf 'genesis-snapshot 1\ntranscript-pool 1\n'
             for _n in "${_EXTRA_UPLOADED[@]+"${_EXTRA_UPLOADED[@]}"}"; do
                 printf 'extra %s\n' "$_n"
             done
@@ -1477,7 +1496,7 @@ else
                 printf 'partial %s\n' "$_n"
             done
         } > "$_T2_MARKER"
-        if ! backend_put "$_T2_MARKER" "${_T2_DIR}/COMPLETE"; then
+        if ! backend_put_atomic "$_T2_MARKER" "${_T2_DIR}/COMPLETE"; then
             log "WARNING: off-site upload failed for COMPLETE marker — snapshot unusable for restore"
             _T2_OK=false
         fi
@@ -1503,9 +1522,9 @@ else
     # Keep daily 7 / weekly 4 / monthly 6 of the COMPLETE off-site snapshots. gfs_select
     # ALWAYS keeps the newest (restore.sh selects the latest COMPLETE); we also skip the
     # current run's stamp explicitly. Best-effort — a prune failure never fails the backup.
-    # Transcripts are preserved elsewhere (local git keep-forever + the latest snapshot
-    # re-uploads the full set every run), so deleting an aged snapshot's transcripts/ copy
-    # loses nothing. Only the off-site dated tree is touched; the local ~/backups git repo
+    # Shared transcript objects remain while referenced by retained or incomplete
+    # pooled inventories. A safe sweep runs only after retention and publication.
+    # Only the off-site dated tree is touched; the local ~/backups git repo
     # is never pruned here. Runs only after a fully-uploaded (ok) snapshot this run, or
     # one whose core is COMPLETE and only opt-in extra dirs are missing: otherwise a
     # listed directory that stays missing would stop retention for good.
@@ -1545,6 +1564,12 @@ else
             _T2_SNAPSHOT_COUNT=$(( _T2_COMPLETE_TOTAL - _T2_PRUNED ))
         fi
     fi
+    if [ "$_T2_OK" = true ]; then
+        if ! transcript_pool_gc "$_T2_HOST_DIR" "$_T2_STAMP"; then
+            log "WARNING: transcript object GC deferred: incomplete or unreadable inventory; objects retained"
+        fi
+    fi
+
 fi
 backend_cleanup
 

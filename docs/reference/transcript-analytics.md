@@ -23,6 +23,22 @@ ignoring temporary collection kill switches. Missing optional dependencies or
 invalid configuration disable the analytics timer with a warning; core Genesis
 installation remains successful. There is no uncapped fallback.
 
+For scheduled collection, shell exports apply only to foreground commands. To
+pause scheduled collection temporarily, set the user manager environment, stop
+the active service, then stop the currently registered analytics worker scopes.
+The last command also stops active interactive analytics queries:
+
+```bash
+systemctl --user set-environment GENESIS_TRANSCRIPT_ANALYTICS_DISABLED=1
+systemctl --user stop genesis-transcript-analytics.service
+systemctl --user stop 'genesis-job-transcript-analytics-*.scope'
+```
+
+Resume with `systemctl --user unset-environment GENESIS_TRANSCRIPT_ANALYTICS_DISABLED`.
+The timer remains enabled and the next scheduled tick resumes collection. The
+persistent `DISABLED` file in the configured data directory also skips subsequent
+ticks; removing it resumes them. Neither lever rewrites the configured opt-in.
+
 ```bash
 python -m genesis transcripts status
 python -m genesis transcripts ingest --since 14
@@ -82,7 +98,8 @@ analytics locks. A dedicated analytics archive requires current enabled
 configuration to identify its destination, including directories outside HOME.
 
 Replacing an existing analytics directory retains the old directory beside it
-as `<data-dir>.pre-restore-<pid>`. The replacement uses two renames and is not
+with a name formed from the first 100 filesystem bytes of the data directory's
+basename, `.pre-restore-`, and a unique temporary-directory suffix. The replacement uses two renames and is not
 crash-atomic: interruption between them can leave the configured directory
 absent while its previous data remains in that sibling. Verify the recovery
 state before resuming collection or repeating restore.

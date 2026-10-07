@@ -75,6 +75,12 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Input-only validation must precede locks, epoch changes and all recovery writes.
+if ! python3 "$_SCRIPT_DIR/lib/transcript_archive.py" validate-preferences . --root "$HOME/.claude/projects" "${_TRANSCRIPT_PREFERENCES[@]}"; then
+    echo "Invalid transcript preferences; recovery has not started" >&2
+    exit 2
+fi
+
 # ── Status tracking ──────────────────────────────────────────────────
 _STATUS_FILE="$HOME/.genesis/restore_status.json"
 _STARTED_AT=$(date +%s)
@@ -425,6 +431,19 @@ _pull_from_offsite() {
     else
         warn "off-site: failed to pull genesis.sql.gpg from snapshot $latest — the database will not be restored from off-site"
     fi
+    _pool_expected=false
+    if _snapshot_children=$(backend_list_strict "$snap"); then
+        if grep -Fxq TRANSCRIPT_POOL <<<"$_snapshot_children"; then _pool_expected=true; fi
+    else
+        warn "off-site: cannot inspect selected snapshot inventory"
+    fi
+    _pool_marker=$(mktemp -p "$GENESIS_BIG_TMP" pool-complete.XXXXXX)
+    if backend_get "$snap/COMPLETE" "$_pool_marker"; then
+        if grep -Fxq 'transcript-pool 1' "$_pool_marker"; then _pool_expected=true; fi
+    else
+        warn "off-site: selected snapshot format marker unreadable"
+    fi
+    rm -f "$_pool_marker"
     # Qdrant snapshots + transcripts: list the subdir, then get each *.gpg.
     # Process substitution (not `list | grep | while`): a failed backend_get of
     # these — the two LARGEST DR payloads (vectors + the "permanent archive"
@@ -443,9 +462,20 @@ _pull_from_offsite() {
         fi
         _payload_rc=0
         _payload_list=$(backend_list_strict "$snap/$sub") || _payload_rc=$?
-        if [ "$_payload_rc" -eq 3 ]; then continue; fi
+        if [ "$_payload_rc" -eq 3 ]; then
+            if [ "$sub" = transcripts ] && $_pool_expected; then warn "off-site: pooled transcript inventory missing"; fi
+            continue
+        fi
         if [ "$_payload_rc" -ne 0 ]; then
             warn "off-site: failed to list $sub in snapshot $latest"
+            continue
+        fi
+        if [ "$sub" = transcripts ] && { $_pool_expected || grep -Fxq POOLED <<<"$_payload_list" || grep -Fxq manifest-v1.json.gpg <<<"$_payload_list"; }; then
+            # shellcheck source=scripts/lib/transcript_pool.sh
+            source "$_SCRIPT_DIR/lib/transcript_pool.sh"
+            if ! _TRANSCRIPTS_PULLED=$(transcript_pool_pull "$host_dir" "$snap" "$dst"); then
+                warn "off-site: transcript pooled inventory/object recovery incomplete"
+            fi
             continue
         fi
         while read -r fname; do
@@ -1350,7 +1380,9 @@ elif find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit
             _analytics_safe=true
             _analytics_abs=$(realpath -m -- "$_analytics_target")
             if _analytics_core=$(backup_core_overlap "$_analytics_abs"); then _analytics_safe=false; fi
-            for _analytics_guard in "$BACKUP_DIR" "$GENESIS_BIG_TMP" "${GENESIS_BACKUP_LOCAL_PATH:-}"; do
+            _analytics_local_guard=""
+            [ "$(_backend_resolve)" = local ] && _analytics_local_guard="${GENESIS_BACKUP_LOCAL_PATH:-}"
+            for _analytics_guard in "$BACKUP_DIR" "$GENESIS_BIG_TMP" "$_analytics_local_guard"; do
                 [ -n "$_analytics_guard" ] || continue
                 _analytics_guard=$(realpath -m -- "$_analytics_guard")
                 case "$_analytics_abs/" in "$_analytics_guard"/*) _analytics_safe=false ;; esac

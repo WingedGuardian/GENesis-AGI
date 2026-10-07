@@ -1,12 +1,15 @@
 import io
 import json
 
+import pytest
+
 from genesis.transcript_analytics import evidence, scrub
 
 
 def test_window_scrubs_and_bounds(tmp_path):
     secret = (
-        "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"  # pragma: allowlist secret — synthetic fixture
+        "ghp_"
+        + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"  # pragma: allowlist secret — synthetic fixture
     )  # pragma: allowlist secret — synthetic fixture
     result = evidence._window(io.BytesIO((secret + "\n" + "x" * 5000 + "\n").encode()), 1, 5, 100)
     assert secret not in json.dumps(result)
@@ -101,7 +104,7 @@ def test_encrypted_local_archive_fallback_and_authentication(tmp_path, monkeypat
     )
     assert out["origin"] == "local encrypted archive"
     assert out["target_available"]
-    assert out["records"][0]["text"] == raw.decode()
+    assert json.loads(out["records"][0]["text"]) == json.loads(raw)
     content = bytearray(archive.read_bytes())
     content[-1] ^= 1
     archive.write_bytes(content)
@@ -193,3 +196,185 @@ def test_escaped_targets_share_remaining_json_byte_budget():
     assert all(texts)
     assert abs(len(texts[0]) - len(texts[1])) <= 1
     assert len(json.dumps(result, ensure_ascii=False).encode()) <= 1024
+
+
+@pytest.mark.parametrize("kind,key", [("tool_use", "id"), ("tool_result", "tool_use_id")])
+def test_late_matching_block_survives_target_clipping(kind, key):
+    block = {"content": "payload" * 1000, "type": kind, key: "example"}
+    raw = (
+        json.dumps(
+            {"message": {"content": [{"type": "thinking", "thinking": "x" * 10000}, block]}}
+        ).encode()
+        + b"\n"
+    )
+    out = evidence._window(io.BytesIO(raw), 1, 0, 300, expected_id="example")
+    assert out["target_available"] and out["truncated"]
+    text = out["records"][0]["text"]
+    assert "example" in text and "payload" in text and "thinking" not in text
+
+
+def test_clipped_target_without_complete_identity_is_unavailable():
+    raw = (
+        json.dumps({"message": {"content": [{"type": "tool_use", "id": "x" * 1000}]}}).encode()
+        + b"\n"
+    )
+    out = evidence._window(io.BytesIO(raw), 1, 0, 100, expected_id="x" * 1000)
+    assert not out["target_available"]
+    assert out["truncated"]
+
+
+@pytest.mark.parametrize("raw_id", ["tool-\ud800", "jsonid:literal"])
+def test_transport_identity_decoded_before_raw_evidence_match(tmp_path, monkeypatch, raw_id):
+    from genesis.transcript_analytics.identity import encode_identity
+
+    identity = encode_identity(raw_id)
+    raw = json.dumps({"message": {"content": [{"type": "tool_use", "id": raw_id}]}})
+    (tmp_path / "call.jsonl").write_text(raw + "\n")
+    monkeypatch.setattr(evidence, "run_query", lambda *args: ([], [("call.jsonl", 1, None, None)]))
+    out = evidence.evidence(tmp_path, tmp_path, identity, budget=1024)
+    assert out["references"][0]["target_available"]
+    assert (
+        json.loads(out["references"][0]["records"][0]["text"])["message"]["content"][0]["id"]
+        == raw_id
+    )
+    assert len(json.dumps(out, ensure_ascii=False).encode()) <= 1024
+
+
+@pytest.mark.parametrize(
+    "kind,correct,wrong", [("tool_use", "id", "tool_use_id"), ("tool_result", "tool_use_id", "id")]
+)
+def test_identity_match_uses_field_for_actual_block_type(kind, correct, wrong):
+    raw = json.dumps(
+        {"message": {"content": [{"type": kind, correct: "other", wrong: "example"}]}}
+    ).encode()
+    out = evidence._window(io.BytesIO(raw + b"\n"), 1, 0, 1024, expected_id="example")
+    assert not out["target_available"]
+    assert out["records"] == []
+
+
+def test_structured_context_and_target_scrub_preserves_only_reference_ids():
+    token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"  # pragma: allowlist secret
+    records = [
+        {
+            "password": "synthetic-value",
+            "nested": [{"api_key": "opaquecredential123456"}],
+            "diagnostic": token,
+        },
+        {
+            "sessionId": token,
+            "message": {
+                "id": token,
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": token,
+                        "name": "Bash",
+                        "input": {
+                            "password": "synthetic-value",
+                            "id": token,
+                            "description": json.dumps({"api_key": "opaquecredential123456"}),
+                        },
+                    }
+                ],
+            },
+        },
+    ]
+    raw = "".join(
+        json.dumps(record).replace("ghp_", "\\u0067hp_") + "\n" for record in records
+    ).encode()
+    out = evidence._window(io.BytesIO(raw), 2, 1, 8192, expected_id=token)
+    assert out["target_available"]
+    assert "synthetic-value" not in json.dumps(out)
+    assert "opaquecredential123456" not in json.dumps(out)
+    context = json.loads(out["records"][0]["text"])
+    target = json.loads(out["records"][1]["text"])["message"]["content"][0]
+    assert context["diagnostic"] != token
+    assert target["id"] == token
+    assert target["input"]["id"] != token
+    assert target["input"]["password"] == "[REDACTED]"
+
+
+@pytest.mark.parametrize(
+    "raw", [b'{"password": "synthetic-value"', b'{"diagnostic": "\\u0067hp_opaque"']
+)
+def test_malformed_structured_context_is_withheld(raw):
+    out = evidence._window(io.BytesIO(raw + b"\n"), 1, 0, 4096)
+    assert "synthetic-value" not in json.dumps(out)
+    assert "opaque" not in json.dumps(out)
+    assert "withheld" in out["records"][0]["text"]
+
+
+@pytest.mark.parametrize("kind", ["text", "thinking", "tool_use", "tool_result"])
+@pytest.mark.parametrize("key", ["id", "tool_use_id"])
+def test_window_preserves_only_actual_tool_reference_ids(kind, key):
+    token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"  # pragma: allowlist secret
+    raw = json.dumps({"message": {"content": [{"type": kind, key: token}]}}).encode()
+    out = evidence._window(io.BytesIO(raw), 1, 0, 4096)
+    value = json.loads(out["records"][0]["text"])["message"]["content"][0][key]
+    assert (value == token) is ((kind, key) in (("tool_use", "id"), ("tool_result", "tool_use_id")))
+
+
+_ENCODINGS = (
+    "utf-8",
+    "utf-8-sig",
+    "utf-16",
+    "utf-16-le",
+    "utf-16-be",
+    "utf-32",
+    "utf-32-le",
+    "utf-32-be",
+)
+
+
+@pytest.mark.parametrize("encoding", _ENCODINGS)
+@pytest.mark.parametrize("diagnostic", ["café", "ascii"])
+def test_valid_encoding_population_keeps_valid_json_diagnostics(encoding, diagnostic):
+    record = {"diagnostic": diagnostic}
+    raw = json.dumps(record, ensure_ascii=False).encode(encoding)
+    out = evidence._window(io.BytesIO(raw), 1, 0, 4096)
+    text = out["records"][0]["text"]
+    assert json.loads(text.removeprefix("\ufeff")) == record
+    if encoding in ("utf-8", "utf-8-sig"):
+        assert text.encode("utf-8") == raw
+    else:
+        assert "\x00" not in text
+
+
+@pytest.mark.parametrize("encoding", _ENCODINGS)
+def test_changed_secret_encoding_population_uses_scrubbed_representation(encoding):
+    raw = json.dumps(
+        {"diagnostic": "café", "password": "synthetic-value"}, ensure_ascii=False
+    ).encode(encoding)
+    out = evidence._window(io.BytesIO(raw), 1, 0, 4096)
+    text = out["records"][0]["text"]
+    assert json.loads(text) == {"diagnostic": "café", "password": "[REDACTED]"}
+    assert "synthetic-value" not in text
+
+
+@pytest.mark.parametrize(
+    "raw", [b"\xffsynthetic-value", b'{"password":"synthetic-value"}\xff', b"\xff\xfe{\x00"]
+)
+def test_malformed_encoding_is_withheld_without_replacement_decoding(raw):
+    out = evidence._window(io.BytesIO(raw), 1, 0, 4096)
+    assert out["records"][0]["text"] == "[scrub failed: evidence withheld]"
+
+
+@pytest.mark.parametrize("encoding", _ENCODINGS)
+@pytest.mark.parametrize("nested", [False, True])
+def test_duplicate_record_keys_never_restore_shadowed_secret(encoding, nested):
+    token = "sk-" + "A" * 40  # pragma: allowlist secret
+    raw = '{"content":' + json.dumps(token) + ',"content":"harmless"}'
+    if nested:
+        raw = '{"nested":[' + raw + "]}"
+    out = evidence._window(io.BytesIO(raw.encode(encoding)), 1, 0, 4096)
+    text = out["records"][0]["text"]
+    assert token not in text
+    parsed = json.loads(text)
+    assert (parsed["nested"][0] if nested else parsed) == {"content": "harmless"}
+
+
+@pytest.mark.parametrize("encoding", _ENCODINGS)
+def test_malformed_json_encoding_population_never_falls_through_as_nul_text(encoding):
+    raw = '{"password":"synthetic-value"'.encode(encoding)
+    out = evidence._window(io.BytesIO(raw), 1, 0, 4096)
+    assert out["records"][0]["text"] == "[scrub failed: evidence withheld]"

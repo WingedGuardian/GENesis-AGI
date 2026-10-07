@@ -12,6 +12,11 @@
 # that must know whether the page is durable before recording it as sent (the
 # watchgod's episode markers). It still never exits the caller.
 #
+# An entry whose dedupe_key is already waiting in the queue is not written
+# again; the call reports success, since that alert is already durable.
+# (genesis.guardian.alert.queue returns False there; a shell caller treats 0
+# as "the page is durable", which it is.)
+#
 #   queue_alert <severity> <source> <title> <body> [dedupe_key]
 #   queue_alert_try <same arguments>   → 0 queued, non-zero not queued
 #
@@ -36,16 +41,38 @@ queue_alert_try() {
 import json, os, time, uuid
 root = os.environ["ALERT_QUEUE_ROOT"]
 ts = time.time()
+
+
+def text(name, default=""):
+    # File names and /proc process names may hold bytes that are not UTF-8;
+    # the environment hands them over as surrogates, which cannot be written
+    # as UTF-8. Replace them, or the write fails and the alert never queues.
+    return os.environ.get(name, default).encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
 entry = {
     "schema": 1,
     "ts": ts,
-    "severity": os.environ.get("ALERT_SEVERITY", "warning"),
-    "source": os.environ.get("ALERT_SOURCE", "shell"),
-    "title": os.environ.get("ALERT_TITLE", ""),
-    "body": os.environ.get("ALERT_BODY", ""),
-    "dedupe_key": os.environ.get("ALERT_DEDUPE") or None,
+    "severity": text("ALERT_SEVERITY", "warning"),
+    "source": text("ALERT_SOURCE", "shell"),
+    "title": text("ALERT_TITLE"),
+    "body": text("ALERT_BODY"),
+    "dedupe_key": text("ALERT_DEDUPE") or None,
     "meta": {},
 }
+# The same identity already waiting to be delivered: a second copy adds
+# nothing, and a caller that restarts in a loop while delivery is down would
+# otherwise fill the queue with it. Already durable, so report success.
+if entry["dedupe_key"]:
+    for name in os.listdir(root):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(root, name), encoding="utf-8") as fh:
+                if json.load(fh).get("dedupe_key") == entry["dedupe_key"]:
+                    raise SystemExit(0)
+        except (OSError, ValueError, AttributeError):
+            continue
 tmp = os.path.join(root, ".%s.tmp" % uuid.uuid4().hex)
 try:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
