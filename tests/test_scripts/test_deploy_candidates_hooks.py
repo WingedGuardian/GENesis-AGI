@@ -10,6 +10,8 @@ hook as "user-modified", which is the state the replacement exists for.
 
 from __future__ import annotations
 
+import pytest
+
 PRE_COMMIT = "scripts/hooks/pre-commit"
 BASE_HOOK = "#!/bin/sh\n# pre-commit\nexit 0\n"
 
@@ -211,3 +213,63 @@ def test_an_excluded_approved_candidate_takes_its_hook_with_it(dc, dc_ready, cap
     assert w.run(dc, "rebuild") == 0, capsys.readouterr()
     assert "EXCLUDED: feat/h" in capsys.readouterr().out
     assert _installed(w) == BASE_HOOK
+
+
+# ── symbolic links (sync-hooks.sh installs what a link points at) ─────────────
+
+
+def _link(w, repo, path: str, target: str, msg: str) -> str:
+    p = repo / path
+    p.unlink(missing_ok=True)
+    p.symlink_to(target)
+    w.git(repo, "add", "-A")
+    w.git(repo, "commit", "-q", "-m", msg)
+    return w.rev("HEAD", repo)
+
+
+def test_a_candidate_that_makes_a_hook_a_symlink_is_refused_even_approved(dc, dc_ready, capsys):
+    """The link's blob is a path; cp installs the referent's bytes, which a
+    second candidate could change without any approval."""
+    w = dc_ready
+    w.candidate("feat/l", {"scripts/lib/hook_body.sh": "#!/bin/sh\nexit 0\n"})
+    _link(w, w.tmp / "wt-feat-l", PRE_COMMIT, "../lib/hook_body.sh", "link the hook")
+    assert _approve(w, dc, "feat/l") == 1
+    assert "symbolic link" in capsys.readouterr().err
+    assert not w.manifest_path.exists()
+
+
+def test_restore_leaves_a_hook_main_turned_into_a_symlink_to_sync(dc, dc_ready, capsys):
+    """Restoring a link would install its target PATH as the hook's bytes."""
+    w = dc_ready
+    w.candidate("feat/x", {"x.txt": "x\n"})
+    assert w.add(dc, "feat/x") == 0, capsys.readouterr()
+    w.git(w.up, "checkout", "-q", "main")
+    w.commit(w.up, {"scripts/lib/hook_body.sh": "#!/bin/sh\n# via link\nexit 0\n"}, "body")
+    _link(w, w.up, PRE_COMMIT, "../lib/hook_body.sh", "main links the hook")
+    w.git(w.up, "push", "-q", "origin", "main")
+    w.run(dc, "rebuild")
+    capsys.readouterr()
+    assert _installed(w) == BASE_HOOK, "restore wrote the link's target path"
+    # No sync can make a linked hook match HEAD; readiness says why, by name.
+    assert w.run(dc, "rebuild") == 1
+    assert "pre-commit is a symbolic link at HEAD" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("hook_dir", ["scripts/hooks", ".claude/hooks"])
+def test_a_candidate_that_makes_a_hook_directory_a_symlink_is_refused(
+    dc, dc_ready, capsys, hook_dir
+):
+    """The changed path is the directory itself, with no trailing slash."""
+    w = dc_ready
+    w.candidate("feat/d", {"elsewhere/pre-commit": BASE_HOOK})
+    wt = w.tmp / "wt-feat-d"
+    w.git(wt, "rm", "-rq", "--ignore-unmatch", hook_dir)
+    (wt / hook_dir).parent.mkdir(parents=True, exist_ok=True)
+    (wt / hook_dir).symlink_to("../elsewhere")
+    w.git(wt, "add", "-A")
+    w.git(wt, "commit", "-q", "-m", "link the hook directory")
+    # Admission names the link; the flag cannot get it in either.
+    assert w.add(dc, "feat/d") == 1
+    assert f"makes {hook_dir} a symbolic link" in capsys.readouterr().err
+    assert _approve(w, dc, "feat/d") == 1
+    assert not w.manifest_path.exists()

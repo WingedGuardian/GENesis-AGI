@@ -240,6 +240,14 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
         want = repo.blob_at("HEAD", f"scripts/hooks/{name}")
         if want is None:
             continue  # sync-hooks.sh skips a name with no source
+        if is_symlink_at(repo, "HEAD", f"scripts/hooks/{name}"):
+            # The blob is the link's target path while sync installs the
+            # referent's bytes, so no sync could ever make them compare equal.
+            fails.append(
+                f"scripts/hooks/{name} is a symbolic link at HEAD; `live` does not support "
+                "linked git hooks"
+            )
+            continue
         dst = hooks_dir / name
         if not dst.is_file():
             fails.append(
@@ -295,6 +303,12 @@ def path_refusal(path: str, hooks_approved: bool = False) -> str | None:
     return None
 
 
+def is_symlink_at(repo: Repo, commit: str, path: str) -> bool:
+    """Whether ``path`` is a symbolic link (mode 120000) in ``commit``."""
+    text = repo.git("ls-tree", "-z", commit, "--", path).stdout
+    return text.startswith("120000 ")
+
+
 def changed_paths(repo: Repo, base: str, head: str) -> list[str]:
     """Every path this head changes against its merge base with origin/main
     (three dots, so a branch behind main is not charged with main's own
@@ -313,6 +327,17 @@ def admission_failures(repo: Repo, base: str, head: str, hooks_approved: bool = 
         why = path_refusal(path, hooks_approved)
         if why:
             fails.append(why)
+        elif (
+            path.startswith(HOOK_DIRS) or any(d.startswith(path + "/") for d in HOOK_DIRS)
+        ) and is_symlink_at(repo, head, path):
+            # sync-hooks.sh copies what a link points at, and Claude Code runs a
+            # hook through the link: an approval of the link's blob (a path)
+            # cannot cover those bytes, which another candidate may change. A
+            # hook DIRECTORY made a link is the same. Approved or not.
+            fails.append(
+                f"makes {path} a symbolic link; a hook is installed or run from what a link "
+                "points at, which an approval of the link cannot cover"
+            )
     commits = repo.rev_list(head, "--not", base)
     info = repo.read_commits(commits)
     for c in commits:

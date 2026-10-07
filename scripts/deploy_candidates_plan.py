@@ -35,7 +35,7 @@ from deploy_candidates_core import (  # noqa: E402
     after_move,
     out,
 )
-from deploy_candidates_gate import SYNC_HOOKS, sync_hook_names  # noqa: E402
+from deploy_candidates_gate import SYNC_HOOKS, is_symlink_at, sync_hook_names  # noqa: E402
 
 
 def shared_with(repo: Repo, base: str, heads: dict[str, str]) -> dict[str, list[str]]:
@@ -401,6 +401,10 @@ def restore_moved_hooks(repo: Repo, before: str | None, after: str) -> None:
 def _restore_one(repo: Repo, dst: Path, path: str, before: str, after: str) -> None:
     old, new = repo.blob_at(before, path), repo.blob_at(after, path)
     if old is None or old == new or not dst.is_file():
+        return
+    if is_symlink_at(repo, before, path) or is_symlink_at(repo, after, path):
+        # A link's blob is its target path, not the hook's bytes; sync-hooks.sh
+        # copies the referent, so leave a linked hook to it.
         return
     if repo.git("hash-object", "--no-filters", "--", str(dst)).stdout.strip() != old:
         return  # not the old checkout's copy: edited by hand, or never synced
