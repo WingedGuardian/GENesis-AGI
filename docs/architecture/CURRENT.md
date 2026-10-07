@@ -3247,6 +3247,10 @@ verified: b0867170e 2026-10-02
   to "no deploy". A marker or state-file holder counts only while it is running and
   not a zombie (`_marker_holder_live`, mirrored in `scripts/lib/deploy_marker.sh`);
   a reused pid still reads as live until the marker records a start tick (#2535).
+  The shell deploys and the dashboard update routes (#2525) check and write the
+  marker only while holding `locks/update.lock`; the routes also run the `live`
+  check under it and remove a marker only when its holder is dead or theirs.
+  Exception: `bootstrap.sh`'s crash recovery still removes it unconditionally.
   `secrets_path()` is repo-relative unless SECRETS_PATH set.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
   dicts merge, lists REPLACE wholesale); dependency-free by design to stay
