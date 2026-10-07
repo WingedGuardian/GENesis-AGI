@@ -8,7 +8,7 @@ staleness check rebuilds every source written under an older version.
 
 import pyarrow as pa
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 S, INT, B = pa.string(), pa.int64(), pa.bool_()
 
@@ -87,6 +87,7 @@ SCHEMAS: dict[str, pa.Schema] = {
             ("n_tool_use", INT),
             ("has_text", B),
             ("has_thinking", B),
+            ("scrub_failed", B),
         ]
     ),
     "hooks": pa.schema(
@@ -136,6 +137,7 @@ SCHEMAS: dict[str, pa.Schema] = {
             ("value", S),
             ("pr_repository", S),
             ("ts", S),
+            ("scrub_failed", B),
         ]
     ),
     "agents": pa.schema(
@@ -149,6 +151,7 @@ SCHEMAS: dict[str, pa.Schema] = {
             ("spawn_depth", INT),
             ("request_shape", S),
             ("non_interactive", B),
+            ("scrub_failed", B),
         ]
     ),
 }

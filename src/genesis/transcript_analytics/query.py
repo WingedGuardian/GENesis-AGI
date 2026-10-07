@@ -18,7 +18,7 @@ from genesis.transcript_analytics import store
 from genesis.transcript_analytics.extract import TABLES
 from genesis.transcript_analytics.locks import publication, restore_epoch
 
-VIEWS_VERSION = "4"
+VIEWS_VERSION = "5"
 _DERIVED = ("tool_calls", "turns", "hooks", "events", "session_meta", "agents", "sessions")
 
 
@@ -109,6 +109,27 @@ def read_connection(data, *, live=False):
         yield con
 
 
+def _execute_query(con, sql, params, snapshot):
+    try:
+        return con.sql(sql, params=params)
+    except duckdb.CatalogException as exc:
+        if snapshot and "raw_" in str(exc):
+            raise ValueError("raw_* views require --live") from exc
+        raise
+
+
+def _scrub_labels(sql, window, baseline):
+    from . import scrub
+
+    values = [scrub.scrub_text(value) for value in (sql, window, baseline)]
+    return {
+        "query": values[0][0],
+        "window": values[1][0],
+        "deployment_baseline": values[2][0],
+        "scrub_failed": any(v[1] for v in values),
+    }
+
+
 def run_query(
     data: Path, sql: str, params=None, *, live=False, manifest_path=None, window=None, baseline=None
 ):
@@ -137,10 +158,9 @@ def run_query(
             ),
             file=sys.stderr,
         )
-        rel = con.sql(sql, params=params)
+        rel = _execute_query(con, sql, params, snapshot)
         result = (rel.columns, rel.fetchall()) if rel is not None else ([], [])
         if manifest_path:
-            from . import scrub
             from .provenance import write_manifest
 
             snapshot = snapshot_manifest(data) if not live and snapshot_compatible(data) else None
@@ -148,9 +168,7 @@ def run_query(
             write_manifest(
                 manifest_path,
                 {
-                    "query": scrub.scrub_text(sql)[0],
-                    "window": window,
-                    "deployment_baseline": baseline,
+                    **_scrub_labels(sql, window, baseline),
                     "snapshot": snapshot,
                     "snapshot_current": derived_current(data),
                     "inventory": inventory,
@@ -167,7 +185,9 @@ def run_query(
                     "source_references": [s["ta.source"] for s in snapshot["sources"]]
                     if snapshot
                     else [
-                        store.source_metadata(data, key)[0].get(b"ta.source", b"").decode()
+                        store.source_identity(
+                            os.fsdecode(store.source_metadata(data, key)[0].get(b"ta.source", b""))
+                        )
                         for key in keys
                     ],
                 },
@@ -195,6 +215,7 @@ SELECT message_id, source_file FROM (
   SELECT f.message_id, f.source_file, count(*) AS n, any_value(s.file_first) AS file_first,
          any_value(s.file_last) AS file_last
   FROM fragments f JOIN file_span s USING (source_file)
+  WHERE f.message_id IS NOT NULL
   GROUP BY f.message_id, f.source_file)
 QUALIFY row_number() OVER (PARTITION BY message_id
                            ORDER BY n DESC, file_first NULLS LAST, file_last NULLS LAST, source_file) = 1;
@@ -239,28 +260,34 @@ SELECT
 FROM calls k FULL OUTER JOIN results r ON r.tool_use_id = k.tool_use_id;
 
 CREATE OR REPLACE VIEW turns AS
-WITH f AS (SELECT fr.* FROM fragments fr JOIN message_copy USING (message_id, source_file)),
+WITH selected AS (
+ SELECT fr.* FROM fragments fr JOIN message_copy USING (message_id, source_file)
+ UNION ALL SELECT * FROM fragments WHERE message_id IS NULL
+ QUALIFY row_number() OVER (PARTITION BY coalesce(uuid, source_file || ':' || line_no)
+ ORDER BY source_file, line_no) = 1
+), f AS (SELECT *, CASE WHEN message_id IS NOT NULL THEN 'provider:' || message_id
+ ELSE coalesce('uuid:' || uuid, 'local:' || source_file || ':' || line_no) END AS turn_key FROM selected),
 g AS (
-  SELECT message_id,
+  SELECT turn_key, any_value(message_id) AS message_id,
          arg_min(session_id, line_no) AS session_id, arg_min(agent_id, line_no) AS agent_id,
          any_value(source_file) AS source_file, min(ts) AS ts, max(ts) AS ts_last,
-         count(DISTINCT uuid) AS n_records, bool_or(stop_reason IS NOT NULL) AS usage_available,
+         count(*) AS n_records, bool_or(stop_reason IS NOT NULL) AS usage_available,
          sum(n_tool_use) AS n_tool_use, bool_or(is_sidechain) AS is_sidechain,
          any_value(entrypoint) AS entrypoint, any_value(attribution_skill) AS attribution_skill,
          any_value(attribution_mcp_server) AS attribution_mcp_server,
          any_value(attribution_mcp_tool) AS attribution_mcp_tool, any_value(effort) AS effort,
-         bool_or(is_api_error) AS is_api_error, any_value(cwd) AS cwd, any_value(git_branch) AS git_branch,
+         bool_or(is_api_error) AS is_api_error, bool_or(scrub_failed) AS scrub_failed, any_value(cwd) AS cwd, any_value(git_branch) AS git_branch,
          any_value(version) AS version
-  FROM f GROUP BY message_id),
+  FROM f GROUP BY turn_key),
 -- The LAST fragment in line order supplies usage, NULLs included: arg_max skips
 -- NULL values, which would mix columns from different fragments (review N-2).
 l AS (
   SELECT * EXCLUDE (rn) FROM (
-    SELECT message_id, stop_reason, model, request_id, input_tokens, output_tokens, cache_read,
+    SELECT turn_key, stop_reason, model, request_id, input_tokens, output_tokens, cache_read,
            cache_create, cache_create_5m, cache_create_1h, thinking_tokens,
-           row_number() OVER (PARTITION BY message_id ORDER BY line_no DESC) AS rn
+           row_number() OVER (PARTITION BY turn_key ORDER BY line_no DESC) AS rn
     FROM f) WHERE rn = 1)
-SELECT g.*, l.stop_reason, l.model, l.request_id,
+SELECT g.* EXCLUDE (turn_key), l.stop_reason, l.model, l.request_id,
        CASE WHEN g.usage_available THEN l.input_tokens END AS input_tokens,
        CASE WHEN g.usage_available THEN l.output_tokens END AS output_tokens,
        CASE WHEN g.usage_available THEN l.cache_read END AS cache_read,
@@ -268,7 +295,7 @@ SELECT g.*, l.stop_reason, l.model, l.request_id,
        CASE WHEN g.usage_available THEN l.cache_create_5m END AS cache_create_5m,
        CASE WHEN g.usage_available THEN l.cache_create_1h END AS cache_create_1h,
        CASE WHEN g.usage_available THEN l.thinking_tokens END AS thinking_tokens
-FROM g JOIN l USING (message_id);
+FROM g JOIN l USING (turn_key);
 
 CREATE OR REPLACE VIEW hooks AS
 SELECT * EXCLUDE (rn) FROM (
@@ -281,8 +308,8 @@ SELECT * EXCLUDE (rn) FROM (
                                ORDER BY source_file, line_no) AS rn FROM raw_events) WHERE rn = 1;
 
 CREATE OR REPLACE VIEW session_meta AS
-SELECT session_id, kind, value, any_value(pr_repository) AS pr_repository, min(ts) AS ts
-FROM raw_session_meta GROUP BY session_id, kind, value;
+SELECT session_id, kind, value, pr_repository, min(ts) AS ts, bool_or(scrub_failed) AS scrub_failed
+FROM raw_session_meta GROUP BY session_id, kind, value, pr_repository;
 
 CREATE OR REPLACE VIEW agents AS
 SELECT * EXCLUDE (rn) FROM (
@@ -306,10 +333,16 @@ c AS (
 m AS (
   -- ai-title records carry no timestamp; arg_max skips NULL keys, so coalesce.
   SELECT session_id, arg_max(value, coalesce(ts, '')) FILTER (WHERE kind = 'ai-title') AS ai_title,
-         list(DISTINCT value) FILTER (WHERE kind = 'pr-link') AS pr_numbers
-  FROM session_meta GROUP BY session_id)
+         list(DISTINCT value) FILTER (WHERE kind = 'pr-link') AS pr_numbers,
+         list(DISTINCT struct_pack(repository := pr_repository, number := value)) FILTER (WHERE kind = 'pr-link') AS pr_links
+  FROM session_meta GROUP BY session_id),
+s AS (SELECT session_id, bool_or(scrub_failed) AS scrub_failed FROM (
+ SELECT session_id,scrub_failed FROM turns UNION ALL SELECT session_id,scrub_failed FROM tool_calls
+ UNION ALL SELECT session_id,scrub_failed FROM hooks UNION ALL SELECT session_id,scrub_failed FROM events
+ UNION ALL SELECT session_id,scrub_failed FROM session_meta UNION ALL SELECT session_id,scrub_failed FROM agents
+) GROUP BY session_id)
 SELECT t.*, coalesce(c.n_tool_calls, 0) AS n_tool_calls, coalesce(c.n_errors_flagged, 0) AS n_errors_flagged,
        coalesce(c.n_errors_text, 0) AS n_errors_text, coalesce(c.n_hook_blocks, 0) AS n_hook_blocks,
-       m.ai_title, m.pr_numbers
-FROM t LEFT JOIN c USING (session_id) LEFT JOIN m USING (session_id);
+       m.ai_title, m.pr_numbers, m.pr_links, coalesce(s.scrub_failed, false) AS scrub_failed
+FROM t LEFT JOIN c USING (session_id) LEFT JOIN m USING (session_id) LEFT JOIN s USING (session_id);
 """

@@ -65,7 +65,7 @@ def _locked(lock_path: Path):
 
 
 def srckey(rel: str) -> str:
-    return hashlib.sha1(rel.encode(), usedforsecurity=False).hexdigest()[:16]
+    return hashlib.sha1(os.fsencode(rel), usedforsecurity=False).hexdigest()[:16]
 
 
 def discover(projects: Path) -> list[tuple[Path, str]]:
@@ -129,7 +129,11 @@ def compatible_sources(data: Path) -> tuple[list[str], list[dict]]:
         md, reason = source_metadata(data, key)
         if reason:
             excluded.append(
-                {"key": key, "source": md.get(b"ta.source", b"").decode(), "reason": reason}
+                {
+                    "key": key,
+                    "source": source_identity(os.fsdecode(md.get(b"ta.source", b""))),
+                    "reason": reason,
+                }
             )
         else:
             accepted.append(key)
@@ -145,31 +149,82 @@ def is_current(data: Path, key: str, fp: dict) -> bool:
     return reason is None and md.get(b"ta.fp") == json.dumps(fp).encode()
 
 
+def _utc_timestamp(value):
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _row_timestamps(row):
+    values = [row[key] for key in ("ts", "ts_call", "ts_result") if key in row]
+    present = [value for value in values if value is not None]
+    # A timestamp-bearing row without any timestamp cannot establish retention.
+    return [_utc_timestamp(value) for value in present] if present else ([None] if values else [])
+
+
 def _last_ts(tables: dict[str, list[dict]]) -> str | None:
-    best = None
-    for rows in tables.values():
-        for r in rows:
-            for k in ("ts", "ts_call", "ts_result"):
-                v = r.get(k)
-                if isinstance(v, str) and (best is None or v > best):
-                    best = v
-    return best
+    timestamps = [
+        timestamp for rows in tables.values() for row in rows for timestamp in _row_timestamps(row)
+    ]
+    if not timestamps or None in timestamps:
+        return None  # Unknown chronology must never authorize deletion.
+    return max(timestamps).isoformat()
+
+
+def _projects_root(data, projects, *, adopt=False):
+    path = data / "projects-root.json"
+    root = str(projects.resolve(strict=True))
+    try:
+        saved = json.loads(path.read_text())["projects_root"]
+    except FileNotFoundError:
+        if any(data.glob(f"{MARKER}__*.parquet")) and not adopt:
+            raise ValueError(
+                "store has no projects root; ingest with --adopt-projects-root after verifying its origin"
+            ) from None
+        saved = None
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ValueError("store projects-root record is unreadable") from exc
+    if saved is not None and saved != root and not adopt:
+        raise ValueError("projects root differs from the store; explicit root adoption required")
+    if saved != root:
+        temporary = data / ".projects-root.tmp"
+        temporary.write_text(json.dumps({"projects_root": root}))
+        os.replace(temporary, path)
+
+
+def source_identity(relative: str) -> str:
+    """UTF-8 transport of filesystem identities, reversible even for byte paths."""
+    if relative.startswith("fsbytes:") or any(0xD800 <= ord(c) <= 0xDFFF for c in relative):
+        return "fsbytes:" + os.fsencode(relative).hex()
+    return relative
+
+
+def source_path(identity: str) -> str:
+    return os.fsdecode(bytes.fromhex(identity[8:])) if identity.startswith("fsbytes:") else identity
 
 
 def _sanitize(rows: list[dict]) -> list[dict]:
-    """Make every string representable as UTF-8 (lone surrogates -> '?')."""
+    """Make text representable as UTF-8 while preserving filesystem identities."""
     return [
         {
-            k: (v.encode("utf-8", "replace").decode("utf-8") if isinstance(v, str) else v)
-            for k, v in r.items()
+            k: (
+                source_identity(v)
+                if k == "source_file"
+                else v.encode("utf-8", "replace").decode("utf-8")
+            )
+            if isinstance(v, str)
+            else v
+            for k, v in row.items()
         }
-        for r in rows
+        for row in rows
     ]
 
 
 def _to_table(rows: list[dict], table: str, meta: dict) -> pa.Table:
     try:
-        tbl = pa.Table.from_pylist(rows, schema=SCHEMAS[table])
+        tbl = pa.Table.from_pylist(_sanitize(rows), schema=SCHEMAS[table])
     except (UnicodeEncodeError, pa.ArrowInvalid, pa.ArrowTypeError, OverflowError):
         tbl = pa.Table.from_pylist(_sanitize(rows), schema=SCHEMAS[table])
     return tbl.replace_schema_metadata(meta)
@@ -185,7 +240,7 @@ def build_source(path: Path, rel: str, data: Path, st: os.stat_result) -> dict:
     staging = data / ".staging"
     staging.mkdir(parents=True, exist_ok=True)
     meta = {
-        b"ta.source": rel.encode(),
+        b"ta.source": os.fsencode(rel),
         b"ta.fp": json.dumps(fp).encode(),
         b"ta.schema": SCHEMA_VERSION.encode(),
         **semantics(),
@@ -225,7 +280,12 @@ def _sweep_staging(data: Path) -> None:
 
 
 def ingest(
-    projects: Path, data: Path, *, since_days: float | None = None, lock_path: Path | None = None
+    projects: Path,
+    data: Path,
+    *,
+    since_days: float | None = None,
+    lock_path: Path | None = None,
+    adopt_projects_root: bool = False,
 ) -> dict:
     if not scrub.available():
         raise ScrubberUnavailable("secret scrubber could not be loaded; nothing written")
@@ -247,6 +307,7 @@ def ingest(
     t0 = time.monotonic()
     cutoff = time.time() - since_days * 86400 if since_days else None
     with _locked(lock_path or DEFAULT_LOCK):
+        _projects_root(data, projects, adopt=adopt_projects_root)
         _sweep_staging(data)
         sources = discover(projects)
         for path, rel in sources:
@@ -302,6 +363,24 @@ def inventory(data):
         return {"unavailable": "no source discovery inventory"}
 
 
+def _prunable_key(marker, projects, cutoff):
+    try:
+        md = pq.read_metadata(marker).metadata or {}
+        rel = os.fsdecode(md.get(b"ta.source", b""))
+        last = _utc_timestamp(md.get(b"ta.last_ts", b"").decode())
+    except (OSError, ValueError):
+        print(f"prune: unreadable marker retained: {marker.name}", file=sys.stderr)
+        return None
+    if not rel or (projects / rel).exists():
+        return None
+    if last is None:
+        print(f"prune: unknown retention timestamp retained: {rel}", file=sys.stderr)
+        return None
+    if last >= cutoff:
+        return None
+    return marker.name[len(MARKER) + 2 : -len(".parquet")]
+
+
 def prune(data: Path, *, before: str, projects: Path, lock_path: Path | None = None) -> int:
     """Delete the files of sources whose transcript is GONE and whose last
     record is older than ``before`` (ISO date). A source whose transcript
@@ -309,23 +388,31 @@ def prune(data: Path, *, before: str, projects: Path, lock_path: Path | None = N
 
     Refuses (ValueError) a malformed date, and a projects directory that is
     missing or empty — a wrong path would make every source look gone."""
-    # Normalize: 3.12 also accepts "20260101" and "2026-W01-1", which would compare
-    # wrongly as raw strings and prune newer sources (re-audit SF-2).
-    before = date.fromisoformat(before).isoformat()  # ValueError for "9", "2026-13-01", …
-    if not projects.is_dir() or not discover(projects):
-        raise ValueError(f"projects directory missing or holds no transcripts: {projects}")
+    cutoff = datetime.combine(date.fromisoformat(before), datetime.min.time(), tzinfo=UTC)
+    if not projects.is_dir():
+        raise ValueError(f"projects directory missing: {projects}")
     removed = 0
-    with _locked(lock_path or DEFAULT_LOCK):
+    from .locks import publication
+
+    with _locked(lock_path or DEFAULT_LOCK), publication(exclusive=True):
+        # Pruning is read-only with respect to root binding: never adopt implicitly.
+        try:
+            root = json.loads((data / "projects-root.json").read_text())["projects_root"]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ValueError(
+                "store projects root is unbound or unreadable; ingest with explicit adoption first"
+            ) from exc
+        if root != str(projects.resolve(strict=True)):
+            raise ValueError("projects root differs from the store")
+        invalidated = False
         for marker in data.glob(f"{MARKER}__*.parquet"):
-            md = pq.read_metadata(marker).metadata or {}
-            rel = md.get(b"ta.source", b"").decode()
-            last = md.get(b"ta.last_ts", b"").decode()
-            if not rel or (projects / rel).exists() or not last or last >= before:
+            key = _prunable_key(marker, projects, cutoff)
+            if key is None:
                 continue
-            key = marker.name[len(MARKER) + 2 : -len(".parquet")]
-            for t in _PUBLISH_ORDER[::-1]:  # marker first, so a half-pruned source reads as stale
-                p = _table_path(data, t, key)
-                if p.exists():
-                    p.unlink()
+            if not invalidated:
+                (data / "derived/current").unlink(missing_ok=True)
+                invalidated = True
+            for table in _PUBLISH_ORDER[::-1]:
+                _table_path(data, table, key).unlink(missing_ok=True)
             removed += 1
     return removed

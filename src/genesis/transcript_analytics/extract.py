@@ -126,7 +126,10 @@ def _complete_lines(path: Path, stop_at: int | None, counter: dict):
     budget = os.path.getsize(path) if stop_at is None else stop_at
     with open(path, "rb") as fh:
         while True:
-            line = fh.readline()
+            remaining = budget - counter["consumed"]
+            if remaining <= 0:
+                return
+            line = fh.readline(remaining)
             if not line or not line.endswith(b"\n") or counter["consumed"] + len(line) > budget:
                 return
             counter["consumed"] += len(line)
@@ -181,12 +184,17 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
         if (
             rtype == "assistant"
             and msg is not None
-            and isinstance(msg.get("id"), str)
-            and msg["id"]
+            and (
+                (isinstance(msg.get("id"), str) and msg["id"]) or r.get("isApiErrorMessage") is True
+            )
         ):
-            if msg.get("model") == "<synthetic>":
+            if msg.get("model") == "<synthetic>" and r.get("isApiErrorMessage") is not True:
                 continue
-            usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+            usage = (
+                msg.get("usage")
+                if isinstance(msg.get("usage"), dict) and r.get("isApiErrorMessage") is not True
+                else {}
+            )
             cc = (
                 usage.get("cache_creation") if isinstance(usage.get("cache_creation"), dict) else {}
             )
@@ -202,11 +210,13 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     **common,
                     "line_no": line_no,
                     "uuid": _str(r.get("uuid")),
-                    "message_id": msg["id"],
+                    "message_id": _str(msg.get("id")),
                     "request_id": _str(r.get("requestId")),
                     "ts": ts,
                     "model": _str(msg.get("model")),
-                    "stop_reason": _str(msg.get("stop_reason")),
+                    "stop_reason": None
+                    if r.get("isApiErrorMessage") is True
+                    else _str(msg.get("stop_reason")),
                     "input_tokens": _int(usage.get("input_tokens")),
                     "output_tokens": _int(usage.get("output_tokens")),
                     "cache_read": _int(usage.get("cache_read_input_tokens")),
@@ -249,7 +259,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                 pending[b["id"]] = {
                     **common,
                     "tool_use_id": b["id"],
-                    "message_id": msg["id"],
+                    "message_id": _str(msg.get("id")),
                     "line_no_call": line_no,
                     "line_no_result": None,
                     "ts_call": ts,
@@ -357,7 +367,22 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                         "error_class": cls,
                         "error_text": err_text,
                         "tool_use_result_text": tur_text,
-                        "result_len": len(content),
+                        "result_len": (
+                            len(content)
+                            if isinstance(b.get("content"), str)
+                            or (
+                                isinstance(b.get("content"), list)
+                                and all(
+                                    isinstance(part, dict) and part.get("type") == "text"
+                                    for part in b["content"]
+                                )
+                            )
+                            else len(
+                                json.dumps(
+                                    b.get("content"), ensure_ascii=True, separators=(",", ":")
+                                )
+                            )
+                        ),
                         "exit_code": exit_code,
                         "interrupted": tur.get("interrupted")
                         if isinstance(tur, dict) and isinstance(tur.get("interrupted"), bool)
@@ -450,13 +475,15 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
         if rtype in _META_KINDS and sid:
             val = r.get(_META_KINDS[rtype])
             if isinstance(val, str):
+                val, val_failed = scrub_text(val)
                 t["session_meta"].append(
                     {
                         "source_file": rel,
                         "line_no": line_no,
                         "session_id": sid,
                         "kind": rtype,
-                        "value": scrub_text(val)[0],
+                        "value": val,
+                        "scrub_failed": val_failed,
                         "pr_repository": None,
                         "ts": ts,
                     }
@@ -484,6 +511,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
         except (OSError, ValueError):
             meta = None
         if isinstance(meta, dict):
+            description, desc_failed = scrub_text(_str(meta.get("description")))
             t["agents"].append(
                 {
                     "source_file": rel,
@@ -491,7 +519,8 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     "session_id": first_sid,
                     "agent_type": _str(meta.get("agentType")),
                     # Scrubbed like tool_calls.description (review N-4).
-                    "description": scrub_text(_str(meta.get("description")))[0],
+                    "description": description,
+                    "scrub_failed": desc_failed,
                     "tool_use_id": _str(meta.get("toolUseId")),
                     "spawn_depth": _int(meta.get("spawnDepth")),
                     "request_shape": _str(meta.get("requestShape")),
@@ -502,6 +531,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
             )
     for rows in t.values():
         for row in rows:
+            row.setdefault("scrub_failed", False)
             for key in _TEXT_FIELDS & row.keys():
                 if isinstance(row[key], str):
                     row[key], failed = scrub_text(row[key])

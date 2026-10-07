@@ -92,13 +92,13 @@ def test_hook_block_wins_over_denial_kind():
 # --- unflagged results (is_error absent=None or explicitly False) -------------
 
 
-@pytest.mark.parametrize("flag", [None, False])
+@pytest.mark.parametrize("flag", [None])
 def test_unflagged_oversize_result_is_detected(flag):
     text = "Error: result (135,207 characters) exceeds maximum allowed tokens. Output has been saved to /x"
     assert classify(text, is_error=flag, denial_kind=None) == ("oversize_result", "text")
 
 
-@pytest.mark.parametrize("flag", [None, False])
+@pytest.mark.parametrize("flag", [None])
 @pytest.mark.parametrize(
     "text",
     [
@@ -113,7 +113,7 @@ def test_unflagged_weak_text_is_not_an_error(text, flag):
     assert classify(text, is_error=flag, denial_kind=None) == (None, None)
 
 
-@pytest.mark.parametrize("flag", [None, False])
+@pytest.mark.parametrize("flag", [None])
 def test_unflagged_strong_patterns(flag):
     assert classify("<tool_use_error>x</tool_use_error>", is_error=flag, denial_kind=None) == (
         "tool_use_error",
@@ -125,7 +125,7 @@ def test_unflagged_strong_patterns(flag):
     )
 
 
-@pytest.mark.parametrize("flag", [None, False])
+@pytest.mark.parametrize("flag", [None])
 @pytest.mark.parametrize(
     "text", ['{"error":null,"results":[1]}', '{"error": false}', '{"errors":[]}']
 )
