@@ -92,6 +92,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -249,7 +250,14 @@ class DailyBudgetLedger:
             result.status_code == 429
             and result.daily_quota_exhausted
             and result.retry_after_s is not None
-            and result.retry_after_s > 0
+            # Bounded HERE as well as in the parser: any delegate can set these
+            # fields, and a block is a deselection, so a bad value must never
+            # silence a provider for longer than a daily reset can be.
+            and isinstance(result.retry_after_s, (int, float))
+            and not isinstance(result.retry_after_s, bool)
+            # range first: it rejects NaN, inf and huge ints without converting
+            and 0 < result.retry_after_s <= _MAX_DAILY_RESET_S
+            and math.isfinite(result.retry_after_s)
         ):
             # Not usage (a 429 never is): it is the provider's own statement
             # that the day's quota is spent, and when it comes back.
@@ -307,7 +315,10 @@ class DailyBudgetLedger:
         The unit of each pair is named explicitly — requests and tokens are
         never comparable and never converted.
         """
-        blocked = self._blocked_until(cfg.name, cfg.model_id)
+        blocked = (
+            None if daily_budget_disabled()
+            else self._blocked_until(cfg.name, cfg.model_id)
+        )
         if not _limited(cfg) and blocked is None:
             return None
         entry = self._peek(cfg.name)
@@ -378,10 +389,12 @@ class DailyBudgetLedger:
                     # Re-apply the parse-time bound: a value further out than
                     # any daily reset (a hand edit, a clock that jumped) must
                     # not silence a provider indefinitely.
-                    if (
+                    if until is not None and until <= now:
+                        pass  # expired: the ordinary end of a block, not news
+                    elif (
                         until is not None
                         and isinstance(model, str)
-                        and now < until <= now + timedelta(seconds=_MAX_DAILY_RESET_S)
+                        and until <= now + timedelta(seconds=_MAX_DAILY_RESET_S)
                     ):
                         self._blocked[name] = (until, model)
                     elif until is not None:

@@ -106,6 +106,12 @@ def daily_quota_reset_s(error_msg: str) -> float | None:
     ``retryDelay`` such as ``"21279s"`` naming the next reset (00:00 UTC for
     every one of 38 logged 429s).
 
+    The delay is honoured as the earliest time to call again, not as proof of
+    the reset: Google defines ``retryDelay`` as a minimum wait. Measured, it
+    has named the real reset (calls succeeded right after 00:00 UTC); if it
+    were ever shorter, the cost is one more 429 that re-blocks with a fresh
+    delay, never a longer silence.
+
     Only a quota whose id says PerDay counts: a per-minute 429 is ordinary
     backpressure and stays fail-fast. Anything this cannot decode returns
     None, which leaves the 429 exactly as it was handled before. It never

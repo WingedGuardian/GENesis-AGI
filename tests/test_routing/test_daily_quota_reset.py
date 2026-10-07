@@ -159,6 +159,15 @@ class TestLedger:
         assert ledger.record(cfg, _daily_429(3600)) is True
         assert ledger.record(cfg, _daily_429(3500)) is False
 
+    def test_the_ledger_bounds_a_delegates_delay_itself(self, tmp_path):
+        # The parser bounds the delay, but any delegate can set these fields.
+        ledger, _ = _ledger(tmp_path)
+        cfg = _cfg()
+        for bad in (27 * 3600.0, float("inf"), float("nan"), -1.0, "3600", True, 10**400):
+            assert ledger.record(cfg, _daily_429(bad)) is False, bad
+            assert ledger.exhausted(cfg) is False, bad
+        assert ledger.record(cfg, _daily_429(26 * 3600.0)) is True
+
     def test_an_ordinary_429_never_deselects(self, tmp_path):
         ledger, _ = _ledger(tmp_path)
         cfg = _cfg()
@@ -235,6 +244,14 @@ class TestLedger:
         ledger.record(_cfg(), _daily_429(3600))
         monkeypatch.setenv("GENESIS_DAILY_BUDGET_DISABLED", "1")
         assert ledger.exhausted(_cfg()) is False
+        assert ledger.status(_cfg()) is None, "the display must agree: no block shown"
+
+    def test_an_expired_stored_block_is_dropped_quietly(self, tmp_path, caplog):
+        self._stored_block(tmp_path, "2026-10-07T03:00:00+00:00")  # an hour ago
+        with caplog.at_level("WARNING"):
+            ledger, _ = _ledger(tmp_path)
+        assert ledger.exhausted(_cfg()) is False
+        assert "ignoring stored block" not in caplog.text
 
     def test_status_reports_the_block(self, tmp_path):
         ledger, _ = _ledger(tmp_path)
