@@ -58,6 +58,9 @@ editable_install_guarded() {
     "$venv_path/bin/pip" install -e "$repo_dir" --quiet 2>&1 | tail -1 || true
     # Validate pip actually installed Genesis (|| true above masks pip failures)
     if "$venv_path/bin/python" -c "from genesis.runtime import GenesisRuntime" 2>/dev/null; then
+        if "$venv_path/bin/python" -m genesis.transcript_analytics.config; then
+            "$venv_path/bin/pip" install -e "$repo_dir[transcript-analytics]" --quiet || return 2
+        fi
         return 0
     fi
     return 2

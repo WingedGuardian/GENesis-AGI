@@ -2427,6 +2427,14 @@ modules: [learning, eval, experimentation, feedback, calibration, ledger, transc
 verified: 0d4d27ce0 2026-10-06
 ```
 
+- **transcript_analytics/**: opt-in offline Claude Code analytics, disabled by
+  default. `genesis transcripts` collects all projects into per-source Parquet;
+  DuckDB queries compatible generations or a leased materialized snapshot.
+  Hourly collection is capped by hostmetrics admission and systemd; analysis is
+  on demand through opportunity-scan. Evidence follows call/result references,
+  scrubs text, and marks truncation/unavailability. Reports carry JSON provenance;
+  this does not update learning scores, policies, or the runtime database.
+
 - **The graders are TOLD the response status; they must never infer it.** The
   triage/outcome/delta graders each judge an `InteractionSummary`, and the
   summarizer (`learning/triage/summarizer.py`) sizes `response_text` for them.

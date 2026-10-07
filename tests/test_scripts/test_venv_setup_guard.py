@@ -119,3 +119,24 @@ def test_the_documented_return_contract_matches_the_code() -> None:
 
     assert "1 — blocked" in header
     assert "could not tell" in header, "the undeterminable case must be documented"
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_analytics_extra_is_installed_only_when_opted_in(tmp_path, enabled):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    calls = tmp_path / "pip-calls"
+    pip = venv / "bin/pip"
+    pip.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{calls}"\n')
+    python = venv / "bin/python"
+    python.write_text(
+        f'#!/bin/sh\nif [ "$1" = "-m" ]; then\n  exit {0 if enabled else 1}\nfi\nexit 0\n'
+    )
+    pip.chmod(0o700)
+    python.chmod(0o700)
+    result = _call(str(repo), str(venv))
+    assert result.returncode == 0, result.stderr
+    assert ("[transcript-analytics]" in calls.read_text()) is enabled

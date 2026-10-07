@@ -1,0 +1,11 @@
+[Unit]
+Description=Collect Claude Code transcript analytics (opt-in)
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_DIR__
+ExecStart=__VENV__/bin/python -m genesis transcripts ingest --timer
+SuccessExitStatus=75
+UMask=0077
+Nice=10
+TimeoutStartSec=1h

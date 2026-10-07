@@ -1386,6 +1386,11 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         timer_name=$(basename "$template" .template)
         case "$timer_name" in
             genesis-backup.timer) continue ;;  # deliberate setup step
+            genesis-transcript-analytics.timer)
+                if ! "$VENV_PATH/bin/python" -m genesis.transcript_analytics.config; then
+                    systemctl --user disable --now "$timer_name" 2>/dev/null || true
+                    continue
+                fi ;;
         esac
         if [ -f "$SYSTEMD_USER_DIR/$timer_name" ]; then
             systemctl --user enable --now "$timer_name" 2>/dev/null && \
