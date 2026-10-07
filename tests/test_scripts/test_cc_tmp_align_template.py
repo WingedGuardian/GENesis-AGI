@@ -62,5 +62,7 @@ def test_uninstall_stops_and_disables_the_new_units():
     # new service AND timer, or an uninstall leaves dangling enabled links under
     # default.target.wants / timers.target.wants (enable != file-glob removal).
     txt = (REPO_ROOT / "scripts" / "uninstall.sh").read_text()
-    assert txt.count("genesis-cc-tmp-align.timer") >= 2
-    assert txt.count("genesis-cc-tmp-align.service") >= 2
+    direct = txt[txt.index("# ── Phase 5:") : txt.index("# ── Phase 6:")]
+    assert "genesis-cc-tmp-align.timer" in direct
+    assert "genesis-cc-tmp-align.service" in direct
+    assert 'codebase_managed.py" uninstall -- --genesis-only --non-interactive' in direct

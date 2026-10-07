@@ -25,7 +25,14 @@ from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-from code_intel_cbm_admission import _mount_path, number, resolve_cgroup  # noqa: E402
+from code_intel_cbm_admission import (  # noqa: E402
+    _host_available,
+    _mount_path,
+    _working_charge,
+    number,
+    read_number,
+    resolve_cgroup,
+)
 from code_intel_cbm_worker import BUILD  # noqa: E402
 
 SCRIPT = Path(__file__).resolve()
@@ -76,8 +83,21 @@ def uninstall_lock_paths() -> tuple[Path, Path, Path]:
     main = (Path.home() / "genesis").resolve(strict=True)
     if main != SCRIPT.parent.parent or (main / ".git").is_file():
         raise ValueError("uninstall requires the installed primary checkout")
-    directory = Path(os.environ.get("GENESIS_HOME", str(Path.home() / ".genesis"))) / "locks"
+    directory = Path(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis")) / "locks"
     absolute(str(directory))
+    roots = [Path.home() / name for name in ("genesis", ".genesis", "data", ".qdrant")]
+    default = Path.home() / ".genesis/locks"
+    protected = [units_dir()]
+    if directory == default:
+        if directory.parent.is_symlink() or directory.is_symlink():
+            raise ValueError("uninstall refuses symlinked default lock namespace")
+    else:
+        protected.append(directory)
+    for location in protected:
+        for root in roots:
+            for namespace, deletion in ((location, root), (location.resolve(), root.resolve())):
+                if namespace.is_relative_to(deletion) or deletion.is_relative_to(namespace):
+                    raise ValueError("uninstall refuses lock namespace overlapping deletion roots")
     digest = hashlib.sha1(os.fsencode(main), usedforsecurity=False).hexdigest()[:16]
     return (
         directory / "code-intel-runner.lock",
@@ -154,7 +174,61 @@ def manager_absent(unit: str) -> bool:
     return show(unit, *expected) == expected
 
 
+def index_writer_targets_main(argv: list[str], cwd: Path, main: Path) -> bool:
+    """Recognize repository targets of the existing wrapper and native modes."""
+    entrypoint = main / "scripts/lib/code_intel_index.sh"
+    for index, arg in enumerate(argv[:-1]):
+        if Path(arg).name != "code_intel_index.sh":
+            continue
+        candidate = Path(arg) if Path(arg).is_absolute() else cwd / arg
+        if candidate.resolve() == entrypoint and (cwd / argv[index + 1]).resolve() == main:
+            return True
+    # The private OOM launcher contains both wrapper and native argv. Its fixed
+    # flag is not a repository argument; native classification must still run.
+    if "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv):
+        tail = argv[argv.index("analyze") + 1 :]
+        target = cwd / tail[0] if tail and not tail[0].startswith("-") else cwd
+        return target.resolve() == main
+    return False
+
+
+def observed_index_writers(proc: Path = Path("/proc")) -> list[int]:
+    """Observe existing lockless/scopeless writers; never signal a process."""
+    main = SCRIPT.parent.parent
+    writers = []
+    for process in proc.iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            # proc_pid_stat(5): comm can contain ')' and arbitrary filename bytes;
+            # starttime is field 22, after the final parenthesized comm delimiter.
+            started = process.joinpath("stat").read_text(errors="surrogateescape").rsplit(")", 1)[1].split()[19]
+            argv = [os.fsdecode(arg) for arg in process.joinpath("cmdline").read_bytes().split(b"\0") if arg]
+            wrapper = any(Path(arg).name == "code_intel_index.sh" for arg in argv)
+            native = "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv)
+            if not (wrapper or native):
+                continue
+            cwd = process.joinpath("cwd").resolve(strict=True)
+            recognized = index_writer_targets_main(argv, cwd, main)
+            if process.joinpath("stat").read_text(errors="surrogateescape").rsplit(")", 1)[1].split()[19] != started:
+                raise ValueError(f"index writer PID {process.name} changed during observation")
+            if recognized:
+                writers.append(int(process.name))
+        except FileNotFoundError:
+            if process.exists():
+                raise ValueError(f"cannot prove index writer identity for PID {process.name}") from None
+            continue  # process disappeared during observation
+        except (OSError, RuntimeError, IndexError) as error:
+            raise ValueError(f"cannot prove index writer identity for PID {process.name}") from error
+    return writers
+
+
 def require_no_batch() -> None:
+    writers = observed_index_writers()
+    if writers:
+        raise ValueError(f"uninstall refuses observed index writers: {writers}")
     result = subprocess.run(
         [
             "/usr/bin/systemctl",
@@ -207,15 +281,11 @@ def retire_managed() -> None:
         state = show(BACKEND, "UnitFileState", "LoadState")
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         errors.append(("proof", str(error)))
-        state = {"UnitFileState": ""}
-    if state["UnitFileState"] in ("enabled", "enabled-runtime"):
-        errors.append(("proof", "query service retains native enablement"))
-    if errors and (
-        any(action != "disable" for action, _ in errors)
-        or state["UnitFileState"]
-        not in ("", "generated", "transient", "static", "disabled", "masked")
-    ):
-        raise ValueError(f"managed retirement failed: {errors}")
+        state = {"UnitFileState": "", "LoadState": ""}
+    safe = state["UnitFileState"] in ("generated", "transient", "static", "disabled", "masked")
+    absent = state == {"UnitFileState": "", "LoadState": "not-found"}
+    if any(action != "disable" for action, _ in errors) or not (safe or absent):
+        raise ValueError(f"managed retirement failed: errors={errors}, state={state}")
 
 
 def runtime_config(path: Path) -> dict:
@@ -298,8 +368,13 @@ def report_retained_state() -> None:
     if config:
         roots = [Path.home() / name for name in ("genesis", ".genesis", "data", ".qdrant")]
         for key in ("binary", "cache", "runtime"):
-            path = absolute(config[key]).resolve()
-            if not any(path.is_relative_to(root.resolve()) for root in roots):
+            try:
+                path = absolute(config[key]).resolve()
+                inside = any(path.is_relative_to(root.resolve()) for root in roots)
+            except (OSError, RuntimeError) as error:
+                print(f"Preserved configured {key}; path classification failed: {error}", flush=True)
+                continue
+            if not inside:
                 print(f"Preserved configured {key}: {path}", flush=True)
 
 
@@ -593,7 +668,7 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
     return result
 
 
-def show(unit: str, *properties: str) -> dict[str, str]:
+def show(unit: str, *properties: str, timeout: float = 30) -> dict[str, str]:
     output = subprocess.check_output(
         [
             "/usr/bin/systemctl",
@@ -603,7 +678,7 @@ def show(unit: str, *properties: str) -> dict[str, str]:
             *(arg for name in properties for arg in ("-p", name)),
         ],
         text=True,
-        timeout=30,
+        timeout=timeout,
         stderr=subprocess.PIPE,
     )
     value = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
@@ -612,14 +687,14 @@ def show(unit: str, *properties: str) -> dict[str, str]:
     return value
 
 
-def require_enabled(config: dict) -> None:
-    if show(BACKEND, "UnitFileState")["UnitFileState"] != "enabled":
+def require_enabled(config: dict, *, timeout: float = 30) -> None:
+    if show(BACKEND, "UnitFileState", timeout=timeout)["UnitFileState"] != "enabled":
         raise ValueError("managed query service must be persistently enabled")
     if sentinel_armed(config["sentinel"]):
         raise ValueError("managed Codebase sentinel is armed")
 
 
-def verify_query_boundary(pid: str) -> None:
+def verify_query_boundary(pid: str, *, startup: bool = False) -> None:
     leaf, root, version = resolve_cgroup(
         Path(f"/proc/{pid}/cgroup"), Path(f"/proc/{pid}/mountinfo")
     )
@@ -629,6 +704,14 @@ def verify_query_boundary(pid: str) -> None:
         leaf / "memory.swap.max"
     ).read_text().strip() != "0":
         raise ValueError("managed daemon lacks exact memory/zero-swap cap")
+    cpu = (leaf / "cpu.max").read_text().split()
+    if len(cpu) != 2:
+        raise ValueError("managed daemon lacks an enforced CPU ceiling")
+    quota, period = (number(value, "cpu.max") for value in cpu)
+    if quota == 0 or period == 0 or quota > 2 * period:
+        raise ValueError("managed daemon exceeds the two-core CPU ceiling")
+    if number((leaf / "pids.max").read_text().strip(), "pids.max") > 128:
+        raise ValueError("managed daemon exceeds the 128-task ceiling")
     cursor = leaf.parent
     while cursor == root or root in cursor.parents:
         try:
@@ -639,13 +722,24 @@ def verify_query_boundary(pid: str) -> None:
             limit = "max"  # true cgroup filesystem root has no memory.max
         if limit != "max" and number(limit, "ancestor memory.max") < 2 * 1024**3:
             raise ValueError("ancestor cap is smaller than managed query budget")
+        if startup and limit != "max":
+            charge = _working_charge(
+                read_number(cursor / "memory.current"), cursor / "memory.stat", 2 * 1024**3, 2
+            )
+            # Admission includes this small staging process; do not subtract
+            # raw leaf usage from a cache-discounted ancestor charge. This is
+            # a startup snapshot, not a reservation or recurring RPC gate.
+            if number(limit, "ancestor memory.max") - charge < 2 * 1024**3:
+                raise ValueError("insufficient ancestor headroom for managed query budget")
         if cursor == root:
             break
         cursor = cursor.parent
+    if startup and _host_available(Path("/proc/meminfo")) < 2 * 1024**3:
+        raise ValueError("insufficient host available memory for managed query budget")
 
 
-def check_backend(config: dict, *, starting: bool = False) -> str:
-    value = show(BACKEND, "ActiveState", "MainPID")
+def check_backend(config: dict, *, starting: bool = False, timeout: float = 30) -> str:
+    value = show(BACKEND, "ActiveState", "MainPID", timeout=timeout)
     if value["ActiveState"] not in (("active", "activating") if starting else ("active",)):
         raise ValueError("managed native daemon is unavailable")
     pid = value["MainPID"]
@@ -656,13 +750,24 @@ def check_backend(config: dict, *, starting: bool = False) -> str:
 
 
 def ready(config: dict) -> None:
+    deadline = time.monotonic() + 120
+    native_deadline = None
     require_enabled(config)
-    deadline = time.monotonic() + 60
+
+    def manager_timeout() -> float:
+        remaining = (native_deadline or deadline) - time.monotonic()
+        if remaining <= 0:
+            raise ValueError("managed native daemon readiness deadline expired")
+        return min(30, remaining)
+
     with verified_binary(Path(config["binary"])) as executable:
-        while time.monotonic() < deadline:
+        while time.monotonic() < (native_deadline or deadline):
             try:
-                pid = check_backend(config, starting=True)
-                remaining = deadline - time.monotonic()
+                pid = check_backend(config, starting=True, timeout=manager_timeout())
+                now = time.monotonic()
+                if native_deadline is None:
+                    native_deadline = min(deadline, now + 60)
+                remaining = native_deadline - now
                 if remaining <= 0:
                     break
                 response = subprocess.run(
@@ -678,10 +783,11 @@ def ready(config: dict) -> None:
                     and "daemon: active (permanent)" in response.stdout
                     and re.search(r"^  pid: " + re.escape(pid) + r"$", response.stdout, re.M)
                     and "state: stopping" not in response.stdout
-                    and check_backend(config, starting=True) == pid
+                    and check_backend(config, starting=True, timeout=manager_timeout()) == pid
                 ):
-                    require_enabled(config)
-                    return
+                    require_enabled(config, timeout=manager_timeout())
+                    if time.monotonic() < native_deadline:
+                        return
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 pass  # bounded startup polling; deadline is a terminal refusal
             time.sleep(0.1)
@@ -708,6 +814,7 @@ def serve(config: dict) -> None:
         )
         require_enabled(config)
         verify_cache(config)
+        verify_query_boundary("self", startup=True)
         os.set_inheritable(executable.fileno(), True)
         os.execve(  # noqa: S606 - accepted inode and fixed stock daemon argv
             f"/proc/self/fd/{executable.fileno()}",
