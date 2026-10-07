@@ -354,7 +354,7 @@ def test_contained_slice_list_is_validated(tmp_path):
         home, bind, "_oom_contained_slices | tr '\\n' ' '",
         tree.env({"OOM_CONTAINED_SLICES": (
             "app.slice app-capped.slice app-capped-x.slice bad..slice -.slice "
-            "genesis-workload.slice x@y.slice"
+            "genesis-workload.slice unit@.slice"
         )}),
     )
     assert out.split() == ["app-capped.slice", "genesis-workload.slice"]
