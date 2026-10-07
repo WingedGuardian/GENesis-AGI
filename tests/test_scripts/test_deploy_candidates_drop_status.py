@@ -428,6 +428,24 @@ def test_every_lib_the_refusing_scripts_source_before_their_check_is_refused(dc)
         ), read
         for lib in read:
             assert dc.gate.path_refusal(f"scripts/{lib}"), f"{script} reads scripts/{lib} first"
+        # A lib run BY PATH, anywhere in the script, is a gate too: on `live` the
+        # restart runs venv_matches_pyproject.py from the tree, so a candidate
+        # editing it could wave its own dependency change through. Both spellings:
+        # `"$VENV_DIR/bin/python" "$_SELF_DIR/lib/x"` and `python3 … "$DIR/lib/x"`.
+        ran = re.findall(
+            r'"\$\{?[A-Z_]+\}?/bin/python[0-9.]*" "\$\{?[A-Z_]+\}?/(lib/[^"]+)"'
+            r'|python3[^\n"]*"\$\{?[A-Z_]+\}?/(lib/[^"]+\.py)"',
+            text,
+        )
+        for lib in {a or b for a, b in ran}:
+            assert dc.gate.path_refusal(f"scripts/{lib}"), f"{script} runs scripts/{lib}"
+    # The pass must see the one by-path run deploy_code_only.sh is known to make,
+    # or a changed spelling would leave it silently empty.
+    text = (SCRIPTS / "deploy_code_only.sh").read_text()
+    assert "lib/venv_matches_pyproject.py" in text and re.search(
+        r'"\$\{?[A-Z_]+\}?/bin/python[0-9.]*" "\$\{?[A-Z_]+\}?/lib/venv_matches_pyproject\.py"',
+        text,
+    )
 
 
 def test_child_processes_never_inherit_python_import_settings(dc):

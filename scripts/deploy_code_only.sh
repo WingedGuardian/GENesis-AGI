@@ -17,7 +17,10 @@
 #            tree applies by itself (Claude Code hooks, docs), or to stage code
 #            for a later restart. Any range is accepted: the report names every
 #            change the running server has not loaded, and the next step.
-#   restart  restart genesis-server on the tree as it stands; no fetch.
+#   restart  restart genesis-server on the tree as it stands; no fetch. The one
+#            mode that runs on `live`, the integration branch
+#            scripts/deploy_candidates builds from the deploy manifest; deploy and
+#            pull refuse there and name the rebuild instead.
 #   status   read-only, takes no lock: the commit the server booted from, HEAD,
 #            the server's MainPID and invocation, and what runs beside the commit
 #            (runtime-edits, runtime-overrides), and the validation bracket's
@@ -36,8 +39,9 @@
 #   the update.lock, EXCLUSIVE and QUEUING (update.sh keeps `flock -n`, so it
 #     REFUSES while a validation holds the lock shared);
 #   refusals BEFORE anything changes: a linked worktree, an unfinished update.sh
-#     run, a branch other than main, a dirty tree, a unit that runs a different
-#     venv or from a different directory, a live foreign deploy marker, and a
+#     run, a branch other than main (restart also accepts `live` when the deploy
+#     manifest names this repository; a manifest it cannot read refuses), a
+#     dirty tree, a unit that runs a different venv or from a different directory, a live foreign deploy marker, and a
 #     venv that does not match the pyproject.toml being deployed (that one needs
 #     update.sh, which reinstalls). deploy and restart also refuse untracked
 #     files under src/, config/ or pyproject.toml, and a server running outside
@@ -57,7 +61,7 @@
 #     returns (a chat turn saving and delivering its reply, for one: #2917).
 #     A server that is not running has no sessions to end. Just
 #     before the restart, four of these are checked again (HEAD must be the
-#     exact commit this run checked, on main; no tracked change; no untracked
+#     exact commit this run checked, on the branch it checked; no tracked change; no untracked
 #     runtime file; no server outside the unit). If one fails while the server
 #     is untouched, it is a refusal. If deploy has already stopped the server,
 #     it is restarted on the tree as it stands, health-checked, and the run ends
@@ -203,6 +207,8 @@ _PORT_PROBE_PY="$(cat "${GENESIS_DEPLOY_PORT_PROBE:-$_SELF_DIR/lib/port_owned_by
 _MANIFEST_DELTA_PY="$(cat "$_SELF_DIR/lib/manifest_delta.py")"
 _SERVING_COMMIT_PY="$(cat "$_SELF_DIR/lib/serving_commit.py")"
 _SERVER_SESSIONS_PY="$(cat "$_SELF_DIR/lib/server_sessions.py")"
+# Read for genesis_live_checkout (deploy_checkout.sh), which runs this copy.
+_LIVE_CHECKOUT_PY="$(cat "$_SELF_DIR/lib/live_checkout.py")"
 
 # Kept whole for the status hand-over below (the parse consumes "$@").
 _ORIG_ARGS=("$@")
@@ -536,9 +542,28 @@ print(p if isinstance(p, str) else "")' "$UPDATE_STATE_FILE" 2>/dev/null || true
     [ "$_state_phase" = "done" ] \
         || die "$UPDATE_STATE_FILE records an unfinished update.sh run; finish it with scripts/update.sh --post-merge."
 fi
-# No override here: GENESIS_ALLOW_NON_DEPLOY_BRANCH is update.sh's alone.
-genesis_deploy_branch_ok "$GENESIS_ROOT" \
-    || die "$GENESIS_ROOT is on '${_branch:-a detached HEAD}', not $DEPLOY_BRANCH."
+# `live`, the integration branch scripts/deploy_candidates builds from the deploy
+# manifest, is never pulled into: a fast-forward from upstream would drop every
+# candidate. restart runs on it as it stands; the rebuild moves it (#2978).
+_live_rc=0
+genesis_live_checkout "$GENESIS_ROOT" || _live_rc=$?
+case "$_live_rc" in
+    0)
+        [ "$MODE" = restart ] \
+            || die "$GENESIS_ROOT is on live, which the deploy manifest builds, and a $MODE would pull into it. Run scripts/deploy_candidates rebuild, then scripts/deploy_code_only.sh restart."
+        # Spelled as _checkout_unmoved reads it before the restart (`--short`,
+        # which prints heads/live when a tag shares the name).
+        _branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD || true)"
+        ;;
+    1)
+        # No override here: GENESIS_ALLOW_NON_DEPLOY_BRANCH is update.sh's alone.
+        genesis_deploy_branch_ok "$GENESIS_ROOT" \
+            || die "$GENESIS_ROOT is on '${_branch:-a detached HEAD}', not $DEPLOY_BRANCH."
+        ;;
+    *)
+        die "cannot tell whether $GENESIS_ROOT is on the live branch the deploy manifest builds (the manifest or git could not be read). Nothing was deployed."
+        ;;
+esac
 # Unreadable refuses (see genesis_tracked_dirty_paths for why it is read apart).
 _dirty="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")" \
     || die "cannot read the working tree's status — nothing was deployed."

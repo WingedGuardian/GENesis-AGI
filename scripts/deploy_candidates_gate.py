@@ -119,6 +119,10 @@ REFUSAL_FILES = (
     # `${GENESIS_DEPLOY_PORT_PROBE:-…}`, which the `cat` lock below now matches).
     "scripts/lib/server_sessions.py",
     "scripts/lib/port_owned_by.py",
+    # The verdict the refusals consult on `live` (read at startup like the
+    # above), and the dependency gate the restart on `live` runs by path.
+    "scripts/lib/live_checkout.py",
+    "scripts/lib/venv_matches_pyproject.py",
     "src/genesis/dashboard/routes/updates.py",
     # PR C's file: readiness reads it from the server's base, and it will hold
     # bootstrap's crash-recovery branch guard.
