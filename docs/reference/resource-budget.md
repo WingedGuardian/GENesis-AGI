@@ -131,9 +131,11 @@ WAIT build
    killed at its memory cap. The verdict also goes to stderr; stdout belongs to
    the job. A command that is a shell builtin (`exit`, `exec`) ends the
    in-scope reporter with it, so no report is printed. A kill at the cap is
-   reported here, to the caller, and NOT paged: the disk guardian treats
-   `genesis-job-*` scopes as contained (logged in
-   `~/.genesis/logs/oom_events.log`, with the unit named).
+   reported here, to the caller, and NOT paged: the job runs in
+   `app-capped.slice`, whose own `memory.events` counters let the disk guardian
+   see that the kill happened inside the slice AND that the slice's own limit
+   fired (logged in `~/.genesis/logs/oom_events.log`). A kill in that slice
+   caused by a limit outside it (the container's, or the host's) still pages.
 
 The scope is the job's ledger entry. `status` lists live `genesis-job-*`
 scopes, and every `preflight` counts their memory reservations: each job's

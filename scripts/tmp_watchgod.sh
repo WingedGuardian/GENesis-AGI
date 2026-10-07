@@ -67,24 +67,11 @@ ALERT_DIR="$HOME/.genesis/alerts"
 # point it at a fixture file. OOM_LOG lives beside the watchgod log (NOT in
 # cc-tmp) so it survives cleanup.
 OOM_EVENTS_FILE="${OOM_EVENTS_FILE:-/sys/fs/cgroup/memory.events}"
-# The trigger discriminator (Codex P1, #1790): a unit's `oom_kill` count records
-# WHICH process died, not WHOSE limit fired — when the container (or any
-# ancestor) hits its limit, the kernel can pick a high-RSS victim inside a
-# contained child scope, and the journal then names that child. Only the cgroup
-# whose OWN limit was hit records a LOCAL `oom` event, so the container root's
-# memory.events.local `oom` counter distinguishes container pressure from a
-# contained cap doing its job. Readable since kernel 4.19 wherever
-# memory.events is; unreadable here means the trigger cannot be verified and
-# the kill PAGES (attribution never silences on missing evidence).
-# Deliberately NOT resolved here. An explicit override wins, but the DEFAULT is
-# derived from OOM_EVENTS_FILE at the moment it is read (see
-# _read_oom_local_trigger), because resolving it at source time freezes it
-# against whatever OOM_EVENTS_FILE happened to be then — and anything that
-# reassigns OOM_EVENTS_FILE afterwards leaves this pointing at the real
-# /sys/fs/cgroup while believing otherwise. That is silent, and it is
-# environment-dependent: it reads correct on a host that has the file and
-# inverts every suppression decision on one that does not.
-OOM_EVENTS_LOCAL_FILE="${OOM_EVENTS_LOCAL_FILE:-}"
+# Whose limit fired is read from the same file's hierarchical `oom` field, and
+# where the victim lived from the contained slices' own memory.events (see
+# scripts/lib/watchgod_oom.sh). OOM_USER_CGROUP_DIR, when set, overrides the
+# user manager's cgroup directory the slices hang off (tests).
+OOM_USER_CGROUP_DIR="${OOM_USER_CGROUP_DIR:-}"
 # shellcheck disable=SC2034  # read by scripts/lib/watchgod_oom.sh
 OOM_LOG="$(dirname "$LOG_FILE")/oom_events.log"
 
@@ -129,11 +116,13 @@ RESERVE_MAX_MB=2048
 PRESSURE_RETRIGGER_S=600
 # Where space usually goes on this layout; `du` of each is logged at YELLOW.
 DG_ATTRIBUTION_PATHS=""
-# Units whose OOM kill is their own cap working, logged but not paged:
-# code-intel indexing scopes, the codebase-memory MCP scope, and the capped job
-# runner's scopes (`python -m genesis.hostmetrics run`, which tells its caller
-# "killed at its memory cap (raise --ram)").
-OOM_CONTAINED_UNIT_PREFIXES="${OOM_CONTAINED_UNIT_PREFIXES:-code-intel- cbm-mcp- genesis-job-}"
+# Slices whose OOM kills are capped work hitting its own cap: logged, not
+# paged, when that slice's own counters account for the kill (see
+# scripts/lib/watchgod_oom.sh). app-capped.slice holds the hostmetrics job
+# runner's scopes, the codebase-memory MCP scope and GitNexus index batches;
+# genesis-workload.slice holds opt-in indexing batches. A kill anywhere else, or
+# triggered by a limit outside these slices, pages.
+OOM_CONTAINED_SLICES="${OOM_CONTAINED_SLICES:-app-capped.slice genesis-workload.slice}"
 
 # ── Load config ──────────────────────────────────────────────
 # Every tunable a conf file may set. Their STARTUP values (code default, or an
@@ -147,7 +136,7 @@ _WG_TUNABLES="CC_TMP_DIR DOWNLOADS_DIR WATCHGOD_ACT WATCH_EXTRA_PATHS RESERVE_MA
     PRESSURE_RETRIGGER_S DG_ATTRIBUTION_PATHS
     DG_YELLOW_PCT DG_ORANGE_PCT DG_RED_PCT DG_RED_MIN_MB
     DG_ETA_YELLOW_MIN DG_ETA_ORANGE_MIN DG_ETA_RED_MIN DG_META_RED_PCT DG_UNALLOC_RED_MB
-    CC_SWEEP_INTERVAL_S CC_SWEEP_AGE_MIN CC_SWEEP_PRESSURE_AGE_MIN OOM_CONTAINED_UNIT_PREFIXES
+    CC_SWEEP_INTERVAL_S CC_SWEEP_AGE_MIN CC_SWEEP_PRESSURE_AGE_MIN OOM_CONTAINED_SLICES
     DG_RUNAWAY_PCT DG_RUNAWAY_RATE_PCT DG_RUNAWAY_MIN_MB"
 declare -A _WG_BASE=()
 _wg_snapshot_defaults() {
