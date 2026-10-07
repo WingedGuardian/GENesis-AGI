@@ -120,6 +120,83 @@ async def test_per_request_keys_never_reach_the_shared_snapshot():
 
 
 # --------------------------------------------------------------------------
+# The deploy checkout's file names are not public
+# --------------------------------------------------------------------------
+
+_CHECKOUT = {"status": "dirty", "count": 2, "paths": ["a.txt", "b.txt"], "paths_omitted": 0}
+
+
+async def _health_as(remote_addr, headers=None, *, verified=False, monkeypatch):
+    """Call the route as a peer at ``remote_addr``; returns (body, cached)."""
+    from genesis.dashboard import auth
+
+    monkeypatch.delenv("GENESIS_DASHBOARD_TRUSTED_NETWORKS", raising=False)
+    monkeypatch.setattr(auth, "has_verified_credential", lambda: verified)
+    svc = HealthDataService()
+
+    async def _compute():
+        return {
+            "infrastructure": {"genesis.db": {"status": "healthy"}},
+            "deploy_health": {"status": "attention", "main_checkout": dict(_CHECKOUT)},
+        }
+
+    svc._compute_snapshot = _compute
+    app = Flask(__name__)
+    with patch("genesis.runtime.GenesisRuntime") as GR:
+        GR.instance.return_value = _runtime_with(svc)
+        with app.test_request_context(
+            "/api/genesis/health",
+            environ_base={"REMOTE_ADDR": remote_addr},
+            headers=headers or {},
+        ):
+            resp, _code = await health_route.health_snapshot.__wrapped__()
+            body = resp.get_json()
+    return body, svc._cache
+
+
+@pytest.mark.asyncio
+async def test_an_untrusted_peer_gets_the_checkout_status_without_file_names(monkeypatch):
+    """The route is open to every network for the host supervisor; the names of
+    files edited in a deploy checkout are not its business, and can be a
+    private fork's. Status and count stay; the names do not, and the shared
+    cached snapshot keeps them for the callers that may see them."""
+    body, cached = await _health_as("198.51.100.7", monkeypatch=monkeypatch)
+    checkout = body["deploy_health"]["main_checkout"]
+    assert "paths" not in checkout
+    assert checkout["status"] == "dirty"
+    assert checkout["count"] == 2
+    assert body["deploy_health"]["status"] == "attention"
+    assert cached["deploy_health"]["main_checkout"]["paths"] == ["a.txt", "b.txt"]
+
+
+@pytest.mark.asyncio
+async def test_a_trusted_peer_gets_the_checkout_file_names(monkeypatch):
+    body, _ = await _health_as("127.0.0.1", monkeypatch=monkeypatch)
+    assert body["deploy_health"]["main_checkout"]["paths"] == ["a.txt", "b.txt"]
+
+
+@pytest.mark.asyncio
+async def test_a_verified_session_gets_the_checkout_file_names(monkeypatch):
+    body, _ = await _health_as("198.51.100.7", verified=True, monkeypatch=monkeypatch)
+    assert body["deploy_health"]["main_checkout"]["paths"] == ["a.txt", "b.txt"]
+
+
+@pytest.mark.asyncio
+async def test_the_internal_bearer_gets_the_checkout_file_names(monkeypatch):
+    from genesis.dashboard import auth
+
+    monkeypatch.setattr(auth, "get_or_create_internal_api_token", lambda: "tok")
+    body, _ = await _health_as(
+        "198.51.100.7", {"Authorization": "Bearer tok"}, monkeypatch=monkeypatch
+    )
+    assert body["deploy_health"]["main_checkout"]["paths"] == ["a.txt", "b.txt"]
+    body, _ = await _health_as(
+        "198.51.100.7", {"Authorization": "Bearer wrong"}, monkeypatch=monkeypatch
+    )
+    assert "paths" not in body["deploy_health"]["main_checkout"]
+
+
+# --------------------------------------------------------------------------
 # Getting the invalidation onto the loop
 # --------------------------------------------------------------------------
 

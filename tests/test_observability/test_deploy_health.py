@@ -668,6 +668,33 @@ def test_main_checkout_timeout_is_unknown_and_leaves_no_process(deploy_root, tmp
     assert not leftover, f"git grandchildren survived the timeout: {leftover}"
 
 
+def test_main_checkout_timeout_removes_its_scratch_index(deploy_root, tmp_path, monkeypatch):
+    """git wedges AFTER the hidden-edit pass has copied the index: the timeout
+    kills the probe before the lib's own rm runs, so the collector removes the
+    probe's scratch index itself. Every periodic run would otherwise leave
+    another full index copy in .git. A scratch index belonging to another
+    process (a concurrent deploy's) is left alone."""
+    import shutil
+
+    real_git = shutil.which("git")
+    _git(deploy_root, "update-index", "--assume-unchanged", "a.txt")
+    (deploy_root / "a.txt").write_text("hidden edit\n")
+    other = deploy_root / ".git" / "genesis-hidden-index.1.AbCdEf"
+    other.write_text("another process's scratch index\n")
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    # Only the scratch-index steps set GIT_INDEX_FILE; everything else is real git.
+    (shim / "git").write_text(
+        f'#!/bin/sh\n[ -n "$GIT_INDEX_FILE" ] && exec sleep 300\nexec "{real_git}" "$@"\n'
+    )
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    got = collect_main_checkout_dirty(deploy_root, timeout=3.0)
+    assert got["status"] == "unknown"
+    assert "timed out" in got["reason"]
+    assert list((deploy_root / ".git").glob("genesis-hidden-index.*")) == [other]
+
+
 def test_main_checkout_does_not_rewrite_the_index(deploy_root):
     """GIT_OPTIONAL_LOCKS=0: a stat-stale index must NOT be refreshed and
     written back by the probe, which would take index.lock under a concurrent

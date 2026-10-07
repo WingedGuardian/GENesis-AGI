@@ -1404,11 +1404,10 @@ _last_main_checkout_status: str = ""
 # findings that were read conclusively on the same tick. None until this
 # process's first actionable tick, which after a restart (several a day) is
 # usually the first check. Then the store decides: with no unresolved dirty
-# alert, the checkout contributes nothing and the rest is reconciled; with one
-# standing, the whole check holds, because nothing in memory says the dirty
-# state and a drift-only alert must not supersede it. That hold is bounded: a
-# second consecutive unreadable tick is actionable, so an unreadable probe holds
-# at most one tick, and a deploy only while it runs.
+# alert, the checkout contributes nothing; with one standing, the dirty class
+# is carried with its count and names unknown, so a drift-only alert never
+# supersedes it. Either way every other finding class is reconciled on the
+# same tick.
 _last_actionable_main_checkout: dict | None = None
 
 
@@ -1455,7 +1454,11 @@ async def _check_deploy_staleness(db) -> None:
             elif await observations.has_unresolved_matching(
                 db, source="deploy_staleness_monitor", content_like="%main_checkout_dirty%"
             ):
-                return  # a dirty alert stands and nothing in memory says its state
+                # A dirty alert stands and nothing in memory says its count or
+                # names: carry the class alone, so the alert is kept (or
+                # superseded, never resolved) while the rest is reconciled.
+                checkout = {"status": "dirty", "count": None, "paths": []}
+                carried = True
             else:
                 checkout = {}
             findings = [
@@ -1546,7 +1549,7 @@ async def _check_deploy_staleness(db) -> None:
             paragraphs.append(_deploy_drift_paragraph(snap, age_days, behind, git_facts))
         if "main_checkout_dirty" in classes:
             paragraph = _deploy_checkout_dirty_paragraph(checkout)
-            if carried:
+            if carried and checkout.get("count") is not None:
                 paragraph += (
                     " (As of the previous check: this check could not read the deploy checkout.)"
                 )
@@ -1614,15 +1617,27 @@ def _deploy_drift_paragraph(snap: dict, age_days, behind, git_facts: dict) -> st
 
 
 def _deploy_checkout_dirty_paragraph(checkout: dict) -> str:
-    count = checkout.get("count") or 0
+    count = checkout.get("count")
     names = ", ".join(checkout.get("paths") or [])
     omitted = checkout.get("paths_omitted") or 0
     if omitted:
         names += f", and {omitted} more"
+    if count is None:
+        # Carried from a standing alert after a restart: the class is known,
+        # its count and names are not.
+        lead = (
+            "Tracked files edited in place in the deploy checkout, as an earlier "
+            "alert recorded (this process has not yet read the checkout; the "
+            "deploy-health snapshot's main_checkout field has the live list)."
+        )
+    else:
+        lead = (
+            f"{count} tracked file(s) edited in place in the deploy checkout "
+            f"(as first detected: {names}; the deploy-health snapshot's main_checkout "
+            "field has the live list)."
+        )
     return (
-        f"{count} tracked file(s) edited in place in the deploy checkout "
-        f"(as first detected: {names}; the deploy-health snapshot's main_checkout "
-        "field has the live list). Deploys refuse until each is restored or brought "
+        lead + " Deploys refuse until each is restored or brought "
         "in through a pull request. In-place writers include hand edits, coding "
         "clients without the repo's edit hooks, and runtime writers such as the "
         "learning pipeline's steering rules and the dashboard's config and file "

@@ -125,6 +125,34 @@ def inflight_work():
     )
 
 
+def _redact_checkout_paths(snapshot: dict) -> None:
+    """Drop the deploy checkout's edited file names for an untrusted caller.
+
+    This route is reachable from any network (``_OPEN_FROM_ANY_NETWORK``, for
+    the host-side supervisor), and the names can be a private fork's or this
+    install's own files. The status and count stay public; the names go only
+    to a trusted-network peer, the internal bearer, or a verified dashboard
+    session. Rebuilt as new dicts: ``snapshot`` is a shallow copy, so its
+    nested dicts are the cached snapshot other callers read.
+    """
+    from genesis.dashboard.auth import (
+        _peer_is_trusted,
+        has_internal_bearer,
+        has_verified_credential,
+    )
+
+    deploy = snapshot.get("deploy_health")
+    checkout = deploy.get("main_checkout") if isinstance(deploy, dict) else None
+    if not isinstance(checkout, dict) or "paths" not in checkout:
+        return
+    if _peer_is_trusted(request.remote_addr) or has_internal_bearer() or has_verified_credential():
+        return
+    snapshot["deploy_health"] = {
+        **deploy,
+        "main_checkout": {k: v for k, v in checkout.items() if k != "paths"},
+    }
+
+
 @blueprint.route("/api/genesis/health")
 @_async_route(timeout=_HEALTH_SNAPSHOT_TIMEOUT_S)
 async def health_snapshot():
@@ -149,6 +177,7 @@ async def health_snapshot():
         pass
 
     snapshot["bridge"] = bridge_health
+    _redact_checkout_paths(snapshot)
 
     infra = snapshot.get("infrastructure", {})
     db_status = infra.get("genesis.db", {}).get("status", "") if isinstance(infra, dict) else ""

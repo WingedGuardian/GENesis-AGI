@@ -401,12 +401,38 @@ def _dirty_paths(out: bytes) -> list[str]:
     return [name.decode("utf-8", "backslashreplace") for name in names]
 
 
-def _kill_probe_group(proc: subprocess.Popen) -> None:
+def _git_dir_of(repo: Path) -> Path | None:
+    """``repo``'s git directory without running git: ``.git`` itself, or the
+    directory a ``gitdir:`` file names. None when neither reads."""
+    dot_git = repo / ".git"
+    if dot_git.is_dir():
+        return dot_git
+    try:
+        line = dot_git.read_text().strip()
+    except OSError:
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    target = Path(line.removeprefix("gitdir:").strip())
+    return target if target.is_absolute() else repo / target
+
+
+def _kill_probe_group(proc: subprocess.Popen, repo: Path | None = None) -> None:
     # start_new_session made the probe its own group leader, so its pid is the
     # group id; > 1 is checked anyway, since killpg(1) signals everything.
     if proc.pid > 1:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)
+        # A probe killed mid hidden-edit pass never reaches the lib's rm, and
+        # every later timed-out run would leave another index copy. The lib
+        # names the scratch file after the probe shell's pid ($$, which is
+        # proc.pid), so only this probe's copy matches. Removed before the
+        # reap: until then the pid cannot be reused by another process.
+        git_dir = _git_dir_of(repo) if repo is not None else None
+        if git_dir is not None:
+            for leftover in git_dir.glob(f"genesis-hidden-index.{proc.pid}.*"):
+                with contextlib.suppress(OSError):
+                    leftover.unlink()
     # Bounded even now: a descendant that left the group (none in these libs)
     # would hold the pipes open, and an unbounded read would wait on it. The
     # probe itself is dead, so wait() returns at once.
@@ -445,9 +471,10 @@ def collect_main_checkout_dirty(repo: Path, *, timeout: float = _CHEAP_TIMEOUT_S
     a concurrent deploy's merge fail), and git's location variables are scrubbed
     so the probe reads ``repo`` and nothing else. The predicate's hidden-edit
     pass writes one scratch index inside ``.git`` when a flagged entry exists and
-    removes it when it finishes; a probe killed by the timeout mid-pass can leave
-    that file behind (inert to git). The probe runs in its own process group,
-    and a timeout kills the whole group, so no git grandchild outlives it.
+    removes it when it finishes; when the timeout kills the probe mid-pass, the
+    collector removes that probe's copy itself. The probe runs in its own
+    process group, and a timeout kills the whole group, so no git grandchild
+    outlives it.
     """
     try:
         return _collect_main_checkout_dirty(repo, timeout)
@@ -489,7 +516,7 @@ def _collect_main_checkout_dirty(repo: Path, timeout: float) -> dict:
     try:
         out, err_bytes = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        _kill_probe_group(proc)
+        _kill_probe_group(proc, repo)
         logger.warning("deploy_health: main-checkout probe timed out after %ss", timeout)
         return {
             "status": "unknown",
@@ -498,7 +525,7 @@ def _collect_main_checkout_dirty(repo: Path, timeout: float) -> dict:
             "reason": f"timed out after {timeout:g}s",
         }
     except BaseException:
-        _kill_probe_group(proc)
+        _kill_probe_group(proc, repo)
         raise
     rc = proc.returncode
     if rc == 3:
@@ -611,7 +638,9 @@ def main_checkout_findings(main_checkout: dict | None) -> list[str]:
     reading forward over a tick whose own reading it cannot act on."""
     status = (main_checkout or {}).get("status")
     if status == "dirty":
-        return [f"main_checkout_dirty:{main_checkout.get('count', 0)}"]
+        count = main_checkout.get("count")
+        # None: a dirty state carried from a standing alert, count unknown.
+        return [f"main_checkout_dirty:{'?' if count is None else count}"]
     if status == "unknown":
         return ["main_checkout_unreadable"]
     return []
