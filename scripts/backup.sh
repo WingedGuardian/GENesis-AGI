@@ -104,6 +104,7 @@ _STARTED_AT=$(date +%s)
 _SQLITE_LINES=0
 _QDRANT_COUNT=0
 _TRANSCRIPT_COUNT=0
+_TRANSCRIPTS_COMPLETE=true
 _MEMORY_COUNT=0
 _EXTRA_SKIP_LABELS=()  # declared before the EXIT trap can fire: its status write reads it
 _EXTRA_PARTIAL_LABELS=()
@@ -646,26 +647,25 @@ log "Backing up CC transcripts..."
 mkdir -p transcripts
 # Purge any pre-encryption plaintext transcripts (staging only — NOT the .gpg).
 find transcripts -maxdepth 1 -name '*.jsonl' -type f -delete 2>/dev/null || true
-if [ -d "$TRANSCRIPT_DIR" ]; then
-    if ! $_ENCRYPT_READY; then
-        log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping transcripts (refusing plaintext)"
-    else
-        # Encrypt each jsonl to transcripts/<name>.jsonl.gpg. Skip re-encryption
-        # when the encrypted copy is newer than the source (mirrors cp -u).
-        while IFS= read -r -d '' src; do
-            name=$(basename "$src")
-            dst="transcripts/${name}.gpg"
-            if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
-                continue
-            fi
-            encrypt_file "$src" "$dst" || log "WARNING: failed to encrypt $name"
-        done < <(find "$TRANSCRIPT_DIR" -maxdepth 1 -name '*.jsonl' -type f -print0)
-        _TRANSCRIPT_COUNT=$(find transcripts -maxdepth 1 -name '*.jsonl.gpg' 2>/dev/null | wc -l)
-        log "Transcripts: $_TRANSCRIPT_COUNT files (encrypted)"
+_transcript_flags=()
+case "${GENESIS_BACKUP_TRANSCRIPT_SCOPE:-main}" in
+    main) _transcript_flags+=("--project=$_CC_PROJECT_ID") ;;
+    all) ;;
+    *) _TRANSCRIPTS_COMPLETE=false
+       _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }invalid transcript scope"
+       _FAILURE_STAGE="transcripts"
+       log "WARNING: transcript scope must be main or all" ;;
+esac
+if $_TRANSCRIPTS_COMPLETE; then
+    if ! printf '%s' "$_BACKUP_PASSPHRASE" | python3 "$_SCRIPT_DIR/lib/transcript_archive.py" backup \
+        "$HOME/.claude/projects" --destination transcripts --scratch "$GENESIS_BIG_TMP" "${_transcript_flags[@]}"; then
+        _TRANSCRIPTS_COMPLETE=false
+        _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }transcript coverage incomplete"
+        _FAILURE_STAGE="transcripts"
+        log "WARNING: transcript coverage incomplete; keeping last-good archives"
     fi
-else
-    log "WARNING: transcript directory not found"
 fi
+_TRANSCRIPT_COUNT=$(find transcripts -maxdepth 1 -name '*.gpg' -type f | wc -l)
 
 # --- 4. Auto-memory files (encrypted — auto-memory can hold credentials/PII) ---
 log "Backing up auto-memory..."
@@ -754,6 +754,19 @@ if [ -d "$_EVAL_DIR" ]; then
 fi
 
 # --- 6f. Opt-in extra directories (encrypted, Tier 2 / off-site only) ---
+# Analytics has a relative-member archive restored into the current config root.
+_ANALYTICS_CONFIG_ERROR=false
+_analytics_data=""
+if [ -f "$GENESIS_DIR/src/genesis/transcript_analytics/config.py" ]; then
+    if _analytics_data=$(PYTHONPATH="$GENESIS_DIR/src" "$GENESIS_DIR/.venv/bin/python" \
+        -m genesis.transcript_analytics.config --configured-enabled-data-dir); then
+        exec {_ANALYTICS_BACKUP_FD}>"${GENESIS_HOME:-$HOME/.genesis}/locks/transcript-analytics.lock"
+        flock "$_ANALYTICS_BACKUP_FD"
+    elif [ "$?" -ne 1 ]; then
+        _ANALYTICS_CONFIG_ERROR=true
+        _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }analytics backup config unavailable"
+    fi
+fi
 # GENESIS_BACKUP_EXTRA_DIRS lists ':'-separated directories UNDER $HOME (a leading
 # `~/` is expanded) that this install wants kept — install-local data no other
 # section knows about. Each becomes ONE encrypted tar, extra/<name>.tar.gpg, so a
@@ -781,6 +794,10 @@ _EXTRA_BUILT=()        # names archived THIS run: the only ones uploaded
 _EXTRA_SKIP_LABELS=()  # listed entries not archived this run (recorded in COMPLETE)
 _EXTRA_PARTIAL=0       # archived, but a restore will refuse some of their members
 _EXTRA_PARTIAL_LABELS=()
+if $_ANALYTICS_CONFIG_ERROR; then
+    _EXTRA_SKIPPED=1
+    _EXTRA_SKIP_LABELS+=("analytics configuration unavailable")
+fi
 _extra_prev=0
 if mkdir -p extra 2>/dev/null; then
     _extra_prev="$(find extra -maxdepth 1 -type f -name '*.tar.gpg' 2>/dev/null | wc -l || true)"
@@ -889,6 +906,16 @@ else
             # core path out of the way; the core backup already covers it.
             _extra_skip "overlaps $_core_hit, which the core backup restores" "$_d"
             continue
+        fi
+        if [ -n "$_analytics_data" ]; then
+            _analytics_abs=$(realpath -m -- "$_analytics_data")
+            _analytics_overlap=false
+            case "$_abs/" in "$_analytics_abs"/*) _analytics_overlap=true ;; esac
+            case "$_analytics_abs/" in "$_abs"/*) _analytics_overlap=true ;; esac
+            if $_analytics_overlap; then
+                _extra_skip "overlaps dedicated analytics archive; remove this extra entry" "$_d"
+                continue
+            fi
         fi
         _dup=""
         for _prev in "${_extra_abs_seen[@]+"${_extra_abs_seen[@]}"}"; do
@@ -1008,6 +1035,27 @@ else
     fi
     log "Extra dirs: $_EXTRA_COUNT archived ($_EXTRA_PARTIAL partial), $_EXTRA_SKIPPED skipped"
 fi
+if [ -n "$_analytics_data" ]; then
+    _analytics_safe=true
+    _analytics_abs=$(realpath -m -- "$_analytics_data")
+    if _analytics_core=$(backup_core_overlap "$_analytics_abs"); then _analytics_safe=false; fi
+    _analytics_local_guard=""
+    [ "$(_backend_resolve)" = local ] && _analytics_local_guard="${GENESIS_BACKUP_LOCAL_PATH:-}"
+    for _analytics_guard in "$BACKUP_DIR" "$GENESIS_BIG_TMP" "$_analytics_local_guard"; do
+        [ -n "$_analytics_guard" ] || continue
+        _analytics_guard=$(realpath -m -- "$_analytics_guard")
+        case "$_analytics_abs/" in "$_analytics_guard"/*) _analytics_safe=false ;; esac
+        case "$_analytics_guard/" in "$_analytics_abs"/*) _analytics_safe=false ;; esac
+    done
+    if $_analytics_safe && printf '%s' "$_BACKUP_PASSPHRASE" | python3 "$_SCRIPT_DIR/lib/transcript_archive.py" analytics-backup \
+        "$_analytics_data" --destination extra/transcript-analytics-v1.tar.gpg --scratch "$GENESIS_BIG_TMP"; then
+        _EXTRA_BUILT+=("transcript-analytics-v1.tar.gpg")
+        _EXTRA_COUNT=$((_EXTRA_COUNT + 1))
+    else
+        _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+        _EXTRA_SKIP_LABELS+=("analytics archive unavailable or unsafe")
+    fi
+fi
 # Local manifest (same format as the off-site COMPLETE marker), written on EVERY run,
 # the setting unset included: a restore without an off-site pull restores only the
 # names it lists and reports what it says was skipped. Outside extra/ (gitignored
@@ -1024,6 +1072,10 @@ if {
 else
     rm -f .extra-manifest.tmp .extra-manifest 2>/dev/null || true
     log "WARNING: could not write .extra-manifest; a restore from this checkout will not restore its extra archives (the off-site snapshot is unaffected)"
+fi
+
+if [ -n "${_ANALYTICS_BACKUP_FD:-}" ]; then
+    exec {_ANALYTICS_BACKUP_FD}>&-
 fi
 
 # --- 6d. Hook audit stores (Tier 1) ---
@@ -1239,6 +1291,17 @@ else
     _T2_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
     _T2_DIR="${_T2_HOST_DIR}/${_T2_STAMP}"
 
+    # Published and incomplete snapshots are immutable. A repeated timestamp
+    # (including clock rollback) must never overwrite a prior recovery point.
+    # Retry with a fresh timestamp; listing uncertainty also forbids writes.
+    _T2_PROBE_RC=0
+    backend_list_strict "$_T2_DIR" >/dev/null || _T2_PROBE_RC=$?
+    case "$_T2_PROBE_RC" in
+        3) ;;
+        0) die "off-site snapshot already exists: $_T2_DIR; retry with a fresh timestamp" ;;
+        *) die "cannot verify off-site snapshot absence: $_T2_DIR" ;;
+    esac
+
     # Create the snapshot directory tree (backend_mkdir creates ancestors;
     # pre-existing levels are idempotent).
     backend_mkdir "${_T2_DIR}/data"
@@ -1246,6 +1309,7 @@ else
     backend_mkdir "${_T2_DIR}/transcripts"
 
     _T2_OK=true
+    if ! $_TRANSCRIPTS_COMPLETE; then _T2_OK=false; fi
 
     # Upload Qdrant snapshots — FRESH ones only (SF3). A .gpg left on disk by
     # a prior run (this run's snapshot failed) must not be stamped into a new
@@ -1296,17 +1360,13 @@ else
         _T2_OK=false
     fi
 
-    # Upload transcripts (part of the off-site snapshot)
-    for f in transcripts/*.gpg; do
-        [ -f "$f" ] || continue
-        fname=$(basename "$f")
-        if backend_put "$f" "${_T2_DIR}/transcripts/$fname"; then
-            log "  off-site: uploaded transcripts/$fname"
-        else
-            log "WARNING: off-site upload failed for transcripts/$fname"
-            _T2_OK=false
-        fi
-    done
+    # Publish authenticated inventory and upload only missing immutable captures.
+    # shellcheck source=scripts/lib/transcript_pool.sh
+    source "$_SCRIPT_DIR/lib/transcript_pool.sh"
+    if ! transcript_pool_backup transcripts "$_T2_HOST_DIR" "$_T2_DIR"; then
+        log "WARNING: transcript pooled snapshot incomplete"
+        _T2_OK=false
+    fi
 
     # Upload memory / config overlays / secrets — previously git-Tier-1 only. Including
     # them here makes the off-site snapshot a COMPLETE copy, so a no-git fresh-box DR can
@@ -1425,7 +1485,7 @@ else
         # back to know what to expect, because a failed off-site LISTING looks the same
         # as an empty one, while a failed download of this file is detectable.
         {
-            printf 'genesis-snapshot 1\n'
+            printf 'genesis-snapshot 1\ntranscript-pool 1\n'
             for _n in "${_EXTRA_UPLOADED[@]+"${_EXTRA_UPLOADED[@]}"}"; do
                 printf 'extra %s\n' "$_n"
             done
@@ -1436,7 +1496,7 @@ else
                 printf 'partial %s\n' "$_n"
             done
         } > "$_T2_MARKER"
-        if ! backend_put "$_T2_MARKER" "${_T2_DIR}/COMPLETE"; then
+        if ! backend_put_atomic "$_T2_MARKER" "${_T2_DIR}/COMPLETE"; then
             log "WARNING: off-site upload failed for COMPLETE marker — snapshot unusable for restore"
             _T2_OK=false
         fi
@@ -1462,9 +1522,9 @@ else
     # Keep daily 7 / weekly 4 / monthly 6 of the COMPLETE off-site snapshots. gfs_select
     # ALWAYS keeps the newest (restore.sh selects the latest COMPLETE); we also skip the
     # current run's stamp explicitly. Best-effort — a prune failure never fails the backup.
-    # Transcripts are preserved elsewhere (local git keep-forever + the latest snapshot
-    # re-uploads the full set every run), so deleting an aged snapshot's transcripts/ copy
-    # loses nothing. Only the off-site dated tree is touched; the local ~/backups git repo
+    # Shared transcript objects remain while referenced by retained or incomplete
+    # pooled inventories. A safe sweep runs only after retention and publication.
+    # Only the off-site dated tree is touched; the local ~/backups git repo
     # is never pruned here. Runs only after a fully-uploaded (ok) snapshot this run, or
     # one whose core is COMPLETE and only opt-in extra dirs are missing: otherwise a
     # listed directory that stays missing would stop retention for good.
@@ -1504,6 +1564,12 @@ else
             _T2_SNAPSHOT_COUNT=$(( _T2_COMPLETE_TOTAL - _T2_PRUNED ))
         fi
     fi
+    if [ "$_T2_OK" = true ]; then
+        if ! transcript_pool_gc "$_T2_HOST_DIR" "$_T2_STAMP"; then
+            log "WARNING: transcript object GC deferred: incomplete or unreadable inventory; objects retained"
+        fi
+    fi
+
 fi
 backend_cleanup
 

@@ -98,7 +98,8 @@ analytics locks. A dedicated analytics archive requires current enabled
 configuration to identify its destination, including directories outside HOME.
 
 Replacing an existing analytics directory retains the old directory beside it
-as `<data-dir>.pre-restore-<pid>`. The replacement uses two renames and is not
+with a name formed from the first 100 filesystem bytes of the data directory's
+basename, `.pre-restore-`, and a unique temporary-directory suffix. The replacement uses two renames and is not
 crash-atomic: interruption between them can leave the configured directory
 absent while its previous data remains in that sibling. Verify the recovery
 state before resuming collection or repeating restore.

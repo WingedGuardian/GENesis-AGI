@@ -6,6 +6,7 @@
 #
 # Usage:
 #   scripts/restore.sh [--from <backup-repo-url>] [--dry-run] [--force] [--database-only]
+#                     [--transcript-preference RELATIVE_PATH=legacy|v2] (repeatable)
 #
 # Environment variables (match backup.sh):
 #   GENESIS_BACKUP_REPO        — Git URL (used when a fresh clone is needed)
@@ -56,11 +57,15 @@ BACKUP_REPO_OVERRIDE=""
 DRY_RUN=false
 FORCE=false
 DATABASE_ONLY=false
+_TRANSCRIPT_PREFERENCES=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --from) BACKUP_REPO_OVERRIDE="$2"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
         --force) FORCE=true; shift ;;
+        --transcript-preference)
+            [ $# -ge 2 ] || { echo "Missing transcript preference" >&2; exit 2; }
+            _TRANSCRIPT_PREFERENCES+=("--preference=$2"); shift 2 ;;
         --database-only) DATABASE_ONLY=true; shift ;;
         -h|--help)
             grep -E '^#( |$)' "$0" | sed 's/^# //; s/^#//'
@@ -70,12 +75,20 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Input-only validation must precede locks, epoch changes and all recovery writes.
+if ! python3 "$_SCRIPT_DIR/lib/transcript_archive.py" validate-preferences . --root "$HOME/.claude/projects" "${_TRANSCRIPT_PREFERENCES[@]}"; then
+    echo "Invalid transcript preferences; recovery has not started" >&2
+    exit 2
+fi
+
 # ── Status tracking ──────────────────────────────────────────────────
 _STATUS_FILE="$HOME/.genesis/restore_status.json"
 _STARTED_AT=$(date +%s)
 _SQLITE_RESTORED=false
 _QDRANT_RESTORED=0
 _TRANSCRIPT_RESTORED=0
+_TRANSCRIPTS_FROM_SNAPSHOT=false
+_TRANSCRIPTS_PULLED=""
 _MEMORY_RESTORED=0
 _EVAL_RESTORED=0
 _EXTRA_RESTORED=0
@@ -175,6 +188,18 @@ if ! flock -w "$_LOCK_WAIT" "$DR_LOCK_FD"; then
     die "backup-restore lock still held by ${_holder:-unknown} after ${_LOCK_WAIT}s — a backup is likely running; wait for it to finish and re-run (or set GENESIS_RESTORE_LOCK_WAIT higher)"
 fi
 dr_lock_stamp restore
+
+# The hourly analytics job takes these in the same order. Keep them through
+# extra-directory restore too, which can replace the analytics data root.
+if ! $DRY_RUN && ! $DATABASE_ONLY; then
+exec {_ANALYTICS_WRITER_FD}>"${GENESIS_HOME:-$HOME/.genesis}/locks/transcript-analytics.lock"
+flock -w "$_LOCK_WAIT" "$_ANALYTICS_WRITER_FD" || die "analytics writer is busy"
+exec {_ANALYTICS_PUBLICATION_FD}>"${GENESIS_HOME:-$HOME/.genesis}/locks/transcript-analytics-publication.lock"
+flock -w "$_LOCK_WAIT" "$_ANALYTICS_PUBLICATION_FD" || die "analytics readers are busy"
+    # Invalidate BEFORE any mutation, even if restore later dies or changes the
+    # configured analytics directory. No venv/YAML dependency during recovery.
+    printf '%s-%s\n' "$$" "$(date +%s%N)" >"${GENESIS_HOME:-$HOME/.genesis}/locks/transcript-analytics-restore-epoch"
+fi
 
 # Private-by-default for every plaintext this restore writes (SF7): gpg -d and
 # cp otherwise honor the inherited umask (typically 0022 → world-readable), so a
@@ -406,6 +431,19 @@ _pull_from_offsite() {
     else
         warn "off-site: failed to pull genesis.sql.gpg from snapshot $latest — the database will not be restored from off-site"
     fi
+    _pool_expected=false
+    if _snapshot_children=$(backend_list_strict "$snap"); then
+        if grep -Fxq TRANSCRIPT_POOL <<<"$_snapshot_children"; then _pool_expected=true; fi
+    else
+        warn "off-site: cannot inspect selected snapshot inventory"
+    fi
+    _pool_marker=$(mktemp -p "$GENESIS_BIG_TMP" pool-complete.XXXXXX)
+    if backend_get "$snap/COMPLETE" "$_pool_marker"; then
+        if grep -Fxq 'transcript-pool 1' "$_pool_marker"; then _pool_expected=true; fi
+    else
+        warn "off-site: selected snapshot format marker unreadable"
+    fi
+    rm -f "$_pool_marker"
     # Qdrant snapshots + transcripts: list the subdir, then get each *.gpg.
     # Process substitution (not `list | grep | while`): a failed backend_get of
     # these — the two LARGEST DR payloads (vectors + the "permanent archive"
@@ -418,14 +456,37 @@ _pull_from_offsite() {
     for sub in qdrant transcripts; do
         dst="$BACKUP_DIR/data/qdrant"
         [ "$sub" = transcripts ] && dst="$BACKUP_DIR/transcripts"
+        if [ "$sub" = transcripts ]; then
+            _TRANSCRIPTS_FROM_SNAPSHOT=true
+            _TRANSCRIPTS_PULLED=""
+        fi
+        _payload_rc=0
+        _payload_list=$(backend_list_strict "$snap/$sub") || _payload_rc=$?
+        if [ "$_payload_rc" -eq 3 ]; then
+            if [ "$sub" = transcripts ] && $_pool_expected; then warn "off-site: pooled transcript inventory missing"; fi
+            continue
+        fi
+        if [ "$_payload_rc" -ne 0 ]; then
+            warn "off-site: failed to list $sub in snapshot $latest"
+            continue
+        fi
+        if [ "$sub" = transcripts ] && { $_pool_expected || grep -Fxq POOLED <<<"$_payload_list" || grep -Fxq manifest-v1.json.gpg <<<"$_payload_list"; }; then
+            # shellcheck source=scripts/lib/transcript_pool.sh
+            source "$_SCRIPT_DIR/lib/transcript_pool.sh"
+            if ! _TRANSCRIPTS_PULLED=$(transcript_pool_pull "$host_dir" "$snap" "$dst"); then
+                warn "off-site: transcript pooled inventory/object recovery incomplete"
+            fi
+            continue
+        fi
         while read -r fname; do
             mkdir -p "$dst"
             if backend_get "$snap/$sub/$fname" "$dst/$fname"; then
+                if [ "$sub" = transcripts ]; then _TRANSCRIPTS_PULLED+="$fname"$'\n'; fi
                 log "  off-site: pulled $sub/$fname"
             else
                 warn "off-site: failed to pull $sub/$fname from snapshot $latest"
             fi
-        done < <(backend_list "$snap/$sub" | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u || true)
+        done < <(printf '%s\n' "$_payload_list" | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u || true)
     done
 
     # memory / config overlays / secrets — previously only in the Tier-1 git clone. Pull
@@ -1174,27 +1235,21 @@ fi
 # ── 3. CC transcripts ────────────────────────────────────────────────
 log "--- Transcripts ---"
 if [ -d "$BACKUP_DIR/transcripts" ]; then
-    mkdir -p "$TRANSCRIPT_DIR"
-    while IFS= read -r -d '' src; do
-        name=$(basename "$src")
-        # Strip .gpg if present to get dest name
-        dst_name="${name%.gpg}"
-        dst="$TRANSCRIPT_DIR/$dst_name"
-        if [ -f "$dst" ] && [ "$dst" -nt "$src" ] && ! $FORCE; then
-            continue
-        fi
-        if $DRY_RUN; then
-            log "Transcripts: would restore $name → $dst"
-            _TRANSCRIPT_RESTORED=$(( _TRANSCRIPT_RESTORED + 1 ))
-            continue
-        fi
-        if [[ "$name" == *.gpg ]]; then
-            decrypt_file "$src" "$dst" || { warn "transcript decrypt failed: $name"; continue; }
-        else
-            cp "$src" "$dst"
-        fi
-        _TRANSCRIPT_RESTORED=$(( _TRANSCRIPT_RESTORED + 1 ))
-    done < <(find "$BACKUP_DIR/transcripts" -maxdepth 1 \( -name '*.jsonl' -o -name '*.jsonl.gpg' \) -print0 2>/dev/null)
+    _v2_flags=("${_TRANSCRIPT_PREFERENCES[@]}")
+    $FORCE && _v2_flags+=(--force)
+    $DRY_RUN && _v2_flags+=(--dry-run)
+    if $_TRANSCRIPTS_FROM_SNAPSHOT; then
+        _selected_transcripts=$(mktemp -p "$GENESIS_BIG_TMP" selected-transcripts.XXXXXX)
+        printf '%s' "$_TRANSCRIPTS_PULLED" >"$_selected_transcripts"
+        _v2_flags+=(--selected "$_selected_transcripts")
+    fi
+    _v2_rc=0
+    _v2_count=$(printf '%s' "$_BACKUP_PASSPHRASE" | python3 "$_SCRIPT_DIR/lib/transcript_archive.py" restore-set \
+        "$BACKUP_DIR/transcripts" --root "$HOME/.claude/projects" "--project=$_CC_PROJECT_ID" \
+        --scratch "$GENESIS_BIG_TMP" "${_v2_flags[@]}") || _v2_rc=$?
+    [[ "$_v2_count" =~ ^[0-9]+$ ]] && _TRANSCRIPT_RESTORED=$_v2_count
+    [ "$_v2_rc" -eq 0 ] || warn "transcript restore incomplete (invalid captures or unresolved freshness)"
+    rm -f "${_selected_transcripts:-}"
     log "Transcripts: $_TRANSCRIPT_RESTORED restored"
 else
     log "Transcripts: no backup directory"
@@ -1313,6 +1368,34 @@ elif find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit
                 log "Extra: skipping $name (not supplied by the selected off-site snapshot)"
             else
                 log "Extra: skipping $name (not listed in .extra-manifest: left from an earlier backup)"
+            fi
+            continue
+        fi
+        if [ "$name" = transcript-analytics-v1.tar.gpg ]; then
+            if ! _analytics_target=$(PYTHONPATH="$GENESIS_DIR/src" "$GENESIS_DIR/.venv/bin/python" \
+                -m genesis.transcript_analytics.config --configured-enabled-data-dir); then
+                warn "analytics archive requires enabled persistent configuration and config runtime"
+                continue
+            fi
+            _analytics_safe=true
+            _analytics_abs=$(realpath -m -- "$_analytics_target")
+            if _analytics_core=$(backup_core_overlap "$_analytics_abs"); then _analytics_safe=false; fi
+            _analytics_local_guard=""
+            [ "$(_backend_resolve)" = local ] && _analytics_local_guard="${GENESIS_BACKUP_LOCAL_PATH:-}"
+            for _analytics_guard in "$BACKUP_DIR" "$GENESIS_BIG_TMP" "$_analytics_local_guard"; do
+                [ -n "$_analytics_guard" ] || continue
+                _analytics_guard=$(realpath -m -- "$_analytics_guard")
+                case "$_analytics_abs/" in "$_analytics_guard"/*) _analytics_safe=false ;; esac
+                case "$_analytics_guard/" in "$_analytics_abs"/*) _analytics_safe=false ;; esac
+            done
+            _analytics_flags=()
+            $FORCE && _analytics_flags+=(--force)
+            $DRY_RUN && _analytics_flags+=(--dry-run)
+            if $_analytics_safe && printf '%s' "$_BACKUP_PASSPHRASE" | python3 "$_SCRIPT_DIR/lib/transcript_archive.py" analytics-restore \
+                "$src" --destination "$_analytics_target" --scratch "$GENESIS_BIG_TMP" "${_analytics_flags[@]}"; then
+                _EXTRA_RESTORED=$((_EXTRA_RESTORED + 1))
+            else
+                warn "analytics archive restore failed or destination unsafe"
             fi
             continue
         fi
