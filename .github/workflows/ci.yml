@@ -504,7 +504,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-10-05: 70 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-07: 71 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -1120,10 +1120,16 @@ jobs:
         #   test_collectors_falkordb.py           new -> 23   (+23)
         #   test_falkordb_module.py               new -> 35   (+35)
         # No added skips. Floor: 24332 + 89 = 24421; skip ceiling remains 102.
+        # Qualification journal (replacement 1/6): new test file collects 95
+        # cases: 2 retained historical regressions plus 93 new accounting and
+        # recovery cases. Main has none of this package's original 231 cases.
+        # Floor: 24421 + 95 = 24516; no added skips, ceiling unchanged.
+        #
         # Immutable CBM staging: new test_codebase_managed_config.py collects
         # 76 cases (0 -> 76), plus 3 new provider-opener classification controls.
         # The native-binary opt-ins add two skip identities. Original PR CI had
         # seven additional browser skips absent on current main; counts alone
         # did not establish a two-slot allowance. Keep main's ceiling unchanged.
-        # Floor: 24421 + 76 + 3 = 24500.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24500
+        # On top of the journal floor above, measured by --collect-only against
+        # main's versions of both files: 24516 + 76 + 3 = 24595.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24595

@@ -189,9 +189,6 @@ except Exception:  # noqa: BLE001 — skew falls back to ASKING.
 _REVIEW_FINDINGS_ERROR: str | None = None
 try:
     from review_findings import (  # noqa: E402
-        CR_HEADER_FIELD_RE as _CR_HEADER_FIELD_RE,
-    )
-    from review_findings import (
         CR_SEVERITIES as _CR_SEVERITIES,
     )
     from review_findings import (
@@ -199,6 +196,9 @@ try:
     )
     from review_findings import (
         INLINE_P2_RE as _INLINE_P2_RE,
+    )
+    from review_findings import (
+        cr_header_fields as _cr_header_fields,
     )
     from review_findings import (
         cr_severity as _cr_severity,
@@ -223,8 +223,11 @@ except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate on
         f"scripts/review_findings.py is unimportable ({_findings_exc_type}); "
         f"repair the hook tree"
     )
-    _INLINE_P1_RE = _INLINE_P2_RE = _CR_HEADER_FIELD_RE = None  # type: ignore[assignment]
+    _INLINE_P1_RE = _INLINE_P2_RE = None  # type: ignore[assignment]
     _CR_SEVERITIES = frozenset()  # type: ignore[assignment]
+
+    def _cr_header_fields(line, *, skip_partial=False):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
 
     def enforced_logins():  # type: ignore[no-redef]
         raise RuntimeError(_REVIEW_FINDINGS_ERROR)
@@ -318,7 +321,18 @@ _DEGRADED_GATED = (
 try:
     # Inside this block on purpose: a broken module degrades the guard closed
     # (degraded_exit below) instead of exiting 1, which the harness reads as allow.
-    from gh_merge import api_merge_reason, files_trusted, is_help_only  # noqa: E402
+    from gh_merge import (  # noqa: E402
+        api_merge_reason,
+        body_file_path,
+        body_file_path_problem,
+        command_words,
+        compose_squash_body,
+        files_trusted,
+        is_help_only,
+        read_body_file,
+        shell_rewrites,
+        write_body_file,
+    )
     from git_repo_selection import (  # noqa: E402
         raw_sets_repo_env,
         seg_redirects_repo,
@@ -1830,8 +1844,10 @@ def _review_bots(sets: dict[str, frozenset[str]]) -> frozenset[str]:
 # the gate was blind to them (audited 2026-07-10: 173 findings across
 # 118 merged PRs passed unseen, 64 of them P1).
 
-# CodeRabbit states severity in a pipe-separated italic header on its FIRST line:
+# CodeRabbit states severity in a pipe-separated header on its FIRST line, italic
+# through 2026-10-05 and bold since 2026-10-06 (#2992):
 #   _🔒 Security & Privacy_ | _🟠 Major_ | _🏗️ Heavy lift_
+#   **🩺 Stability & Availability** | **🟠 Major** | **⚡ Quick win**
 # Its findings were already REACHED by the scan below — `user.type` is "Bot", so
 # they pass the author filter — and then dropped, because neither badge pattern
 # above matches and the if/elif has no else. Read, not recognised; a PR carrying
@@ -2410,10 +2426,20 @@ def _coderabbit_title(body: str) -> str:
     the finding, and reporting one of those as the title misnames the finding in
     the pre-merge report a human reads to decide a merge.
     """
+    first = True
     for line, is_markup in zip(body.split("\n"), _cr_markup_mask(body), strict=True):
         if is_markup:
             continue
         stripped = line.strip()
+        if not stripped:
+            continue
+        # The header is bold since 2026-10-06 (#2992), so it would be read as the
+        # title. Skip it, and only it: the header is always the FIRST line, and a
+        # later bold title holding a `|` (`str | None`) is header-shaped too.
+        if first:
+            first = False
+            if _cr_severity(stripped)[1]:
+                continue
         if stripped.startswith("**") and stripped.rstrip("*").strip():
             # Through _safe_title, NOT a bare slice: this is the branch a real
             # CodeRabbit finding takes, so it is the one that matters most.
@@ -2856,7 +2882,7 @@ def _cr_severity_inline(text: str) -> tuple[str | None, bool]:
     — the exact shape `_cr_severity`'s own docstring already adjudicates).
 
     So: split on `|`, accept only chunks that are COMPLETE italic fields
-    (`_CR_HEADER_FIELD_RE`, the anchored parser's own matcher), read each
+    (`_cr_header_fields`, the anchored parser's own matcher, italic or bold), read each
     field's LAST word, and adjudicate as `_cr_severity` does — exactly one
     DISTINCT level wins (unanimous duplicates included); two distinct levels
     are a format this code cannot adjudicate and land in the caller's
@@ -2870,11 +2896,8 @@ def _cr_severity_inline(text: str) -> tuple[str | None, bool]:
     direction for a merge gate.
     """
     hits: list[str] = []
-    for chunk in text.split("|"):
-        fld = _CR_HEADER_FIELD_RE.match(chunk.strip())
-        if not fld:
-            continue
-        words = fld.group(1).split()
+    for field_text in _cr_header_fields(text, skip_partial=True) or []:
+        words = field_text.split()
         if words and words[-1].casefold() in _CR_SEVERITIES:
             hits.append(words[-1].casefold())
     if hits and len(set(hits)) == 1:
@@ -3650,7 +3673,7 @@ def _check_inline_review_findings(
                         # No recognised severity — whether the header names a
                         # level this gate does not know, is ambiguous, or is
                         # missing entirely. Every observed CodeRabbit finding
-                        # leads with the italic pipe header, so a headerless
+                        # leads with the pipe header, so a headerless
                         # original is FORMAT DRIFT: filing it as an ordinary
                         # advisory printed "below Major" about a level that was
                         # never read, and a drifted Major would ride through
@@ -10435,14 +10458,67 @@ def _merge_match_head(argv: list[str]) -> str | None:
     return result
 
 
+def _merge_body_file(argv: list[str]) -> tuple[str | None, str | None]:
+    """``(path, problem)`` for a merge's ``--body-file``, read with the SAME
+    consumption model as :func:`_merge_match_head`.
+
+    ``(None, None)``: no ``--body-file``. ``(path, None)``: exactly one, long
+    form (``--body-file P`` / ``--body-file=P``), naming a file the gate itself
+    writes (``gh_merge.body_file_path_problem``). Anything else is a problem: two
+    of them (pflag keeps the last, the hook would judge one), a missing value, a
+    value gh could read as a flag or stdin, or a path the hook and gh might
+    resolve to different files. The short ``-F`` stays a shadow flag.
+    """
+    argv = argv or []
+    values: list[str | None] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            break
+        if tok in _GH_MERGE_VALUE_FLAGS:
+            if tok == "--body-file":
+                values.append(argv[i + 1] if i + 1 < len(argv) else None)
+            i += 2
+            continue
+        if tok.startswith("--body-file="):
+            values.append(tok.split("=", 1)[1])
+            i += 1
+            continue
+        if _short_cluster_consumes_next(tok):
+            i += 2
+            continue
+        i += 1
+    if not values:
+        return None, None
+    if len(values) > 1:
+        return None, "--body-file is given more than once"
+    path = values[0]
+    if not path or path == "-" or path.startswith("-"):
+        return None, "--body-file needs a file path as its value"
+    problem = body_file_path_problem(path)
+    if problem:
+        return None, f"--body-file {path}: {problem}"
+    return path, None
+
+
 def _merge_has_shadow_flag(argv: list[str]) -> bool:
     """Whether the merge carries a content flag that could shadow the head-match
     binding — long form, ``=`` form, bare short, or inside a short cluster
-    (``-db`` etc.). Refused outright as a fail-closed belt."""
+    (``-db`` etc.). Refused outright as a fail-closed belt.
+
+    A long ``--body-file`` naming a file the gate wrote is the one exemption: it
+    is how the squash body gets its provenance trailers, and the merge arm
+    compares that file with a body it recomputes. The exemption is keyed off
+    :func:`_merge_body_file`, so a ``--body-file`` whose value could be a flag is
+    still a shadow."""
+    body_file_ok = _merge_body_file(argv)[0] is not None
     for tok in argv or []:
         if tok == "--":
             break
         base = tok.split("=", 1)[0]
+        if base == "--body-file" and body_file_ok:
+            continue
         if base in _GH_MERGE_SHADOW_FLAGS:
             return True
         if _is_short_cluster(base):
@@ -10472,9 +10548,10 @@ def _require_match_head(
     # (gh takes it as text → no binding) and have no use on a gated squash-merge.
     if _merge_has_shadow_flag(merge_argv):
         return (
-            "--body/--subject/--body-file/--author-email are not allowed on a gated "
-            "merge — they can shadow the --match-head-commit binding. Remove them "
-            "(set a squash message via the GitHub UI if needed)."
+            "--body/--subject/--author-email/-F are not allowed on a gated merge — they "
+            "can shadow the --match-head-commit binding, and text they carry reaches "
+            "main unreviewed. Remove them; the only body a merge may carry is the "
+            "--body-file that --check-pr writes and prints in its merge-with line."
         )
     match_head = _merge_match_head(merge_argv)
     if match_head is None:
@@ -10490,6 +10567,92 @@ def _require_match_head(
             f"use the current verified head."
         )
     return None
+
+
+def _expected_squash_body(pr_num: str, repo: str | None, head: str) -> tuple[str | None, str]:
+    """``(body, "")``: the squash body for ``head``, recomputed from the LIVE PR
+    (its body and its commits' ``Genesis-Session:`` trailers), or ``(None, why)``.
+
+    ``head`` must be one of the PR's commits, so a stale or foreign head yields no
+    body rather than a body that merely names it. The commits are read first: a
+    head outside them settles the answer without the second read."""
+    rows, why = _pr_commit_rows(pr_num, repo)
+    if rows is None:
+        return None, why
+    if head not in {r["sha"] for r in rows}:
+        return None, f"{head[:12]} is not one of the PR's commits"
+    pr_body = _pr_body_text(pr_num, repo)
+    if pr_body is None:
+        return None, "the PR body could not be read"
+    try:
+        return compose_squash_body(pr_body, head, [r["message"] for r in rows]), ""
+    except ValueError as exc:
+        return None, str(exc)
+
+
+def _recheck_squash_body_file(path: str, expected: str) -> str | None:
+    """The merge arm's LAST step: re-read the file and require the body the early
+    check approved. The early check runs right after the binding, so a hook killed
+    by its wall clock can never skip it; this second read, just before the hook
+    allows, narrows the window in which another process could change the file
+    before gh reads it. Local only, no network."""
+    text, why = read_body_file(path)
+    if text is None:
+        return f"--body-file {path} could not be re-read before the merge: {why}."
+    if text != expected:
+        return f"--body-file {path} changed after it was checked. Re-run --check-pr."
+    return None
+
+
+def _check_squash_body_file(
+    pr_num: str, repo: str | None, head: str, path: str, *, expected_out: list[str] | None = None
+) -> str | None:
+    """None when ``path`` holds exactly the body recomputed for ``head``, else a
+    block message. Every failure blocks: the remedy (drop --body-file, or re-run
+    --check-pr) is always available, so nothing here needs a sigil. On success the
+    approved body is appended to ``expected_out`` for :func:`_recheck_squash_body_file`."""
+    remedy = (
+        "Re-run --check-pr and use its merge-with line, or drop --body-file to merge "
+        "without the provenance trailer."
+    )
+    text, why = read_body_file(path)
+    if text is None:
+        return f"--body-file {path} cannot be used: {why}. {remedy}"
+    expected, why = _expected_squash_body(pr_num, repo, head.strip().lower())
+    if expected is None:
+        return f"the squash body could not be recomputed to check --body-file: {why}. {remedy}"
+    if text != expected:
+        return (
+            f"--body-file {path} is not the body this gate computes for head "
+            f"{head[:12]} (the PR body or its commits changed, or the file was edited). "
+            + remedy
+        )
+    if expected_out is not None:
+        expected_out.append(expected)
+    return None
+
+
+def _prepare_squash_body_file(pr_num: str, repo: str | None, head: str) -> tuple[str | None, str]:
+    """For ``--check-pr``: write the squash body for ``head`` and return its path,
+    or ``(None, why)``. Not written in CI, where the path would mean nothing to
+    the reader of the log, nor under the hook tests' ``_TEST_SQUASH_BODY_FILE=off``
+    pin, which keeps report tests from writing into the real home directory."""
+    if os.environ.get("GITHUB_ACTIONS") or os.environ.get("_TEST_SQUASH_BODY_FILE") == "off":
+        return None, ""
+    body, why = _expected_squash_body(pr_num, repo, head)
+    if body is None:
+        return None, why
+    path = body_file_path(repo, pr_num, head)
+    # The merge arm would refuse a path that fails this, and printed unquoted it
+    # could split in the shell, so say why and fall back to the plain command.
+    problem = body_file_path_problem(path)
+    if problem:
+        return None, f"the body file path {path!r} is unusable: {problem}"
+    try:
+        write_body_file(path, body)
+    except OSError as exc:
+        return None, f"the body file could not be written ({exc.strerror or exc})"
+    return path, ""
 
 
 def _is_dispatched() -> bool:
@@ -13017,6 +13180,67 @@ def _run_merge_and_push_gates() -> int:
                             repo=merge_repo,
                             head=merge_head,
                         )
+                # ── The squash body (argv only, no network, every merge) ──
+                # Text a merge writes into the squash commit is outside the leaks
+                # review, so the only body allowed is the file --check-pr wrote,
+                # which the content check after the binding recomputes. This used
+                # to run only inside the head binding, so `# stale-review-override`
+                # (which skips the binding) let --body/--subject text through.
+                # Both checks read the argv the HOOK parsed. A brace or glob in a
+                # word makes bash hand gh a different argv (`{--body,x}` is one word
+                # here and `--body x` to gh), so a merge segment carrying one is
+                # refused first, on every merge.
+                _expands = shell_rewrites(merge_seg.argv, redirects=False)
+                if _expands:
+                    print(
+                        f"BLOCKED: a gated merge cannot carry the shell character "
+                        f"{_expands!r}: brace and glob expansion make the shell pass gh "
+                        f"arguments this gate never saw. Run the merge-with line from "
+                        f"--check-pr as printed.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                body_file, body_file_problem = _merge_body_file(merge_seg.argv)
+                if body_file_problem or _merge_has_shadow_flag(merge_seg.argv):
+                    print(
+                        "BLOCKED: "
+                        + (body_file_problem + ". " if body_file_problem else "")
+                        + "--body/--subject/--author-email/-F can shadow the "
+                        "--match-head-commit binding, and text they carry reaches main "
+                        "unreviewed. Remove them; the only body a merge may carry is "
+                        "the --body-file that --check-pr writes and prints in its "
+                        "merge-with line.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if body_file is not None:
+                    _bf_why = ""
+                    if not merge_head:
+                        _bf_why = "it is not bound with --match-head-commit"
+                    elif len(segs) != 1 or not files_trusted(cmd, len(segs)):
+                        _bf_why = (
+                            "it is not a command of its own, so another part of the "
+                            "command could rewrite the file after this check reads it"
+                        )
+                    else:
+                        _words = command_words(cmd)
+                        _rewrite = (
+                            "unparseable" if _words is None
+                            else shell_rewrites(_words, redirects=True)
+                        )
+                        if _rewrite:
+                            _bf_why = (
+                                f"the command carries a redirect or expansion ({_rewrite!r}), "
+                                "which could change the file or the arguments after this check"
+                            )
+                    if _bf_why:
+                        print(
+                            f"BLOCKED: PR #{pr_num} — a merge carrying --body-file is "
+                            f"refused when {_bf_why}. Run the merge-with line from "
+                            f"--check-pr exactly as printed, as its own command.",
+                            file=sys.stderr,
+                        )
+                        return 2
                 # ── Merge-path gh TIMEOUT BUDGET ──────────────────────────
                 # This hook runs under a 60s CC wall-clock (settings.json). A
                 # wall-clock overrun SIGKILLs the hook MID-GATE, which "fails
@@ -13038,7 +13262,11 @@ def _run_merge_and_push_gates() -> int:
                 # the TOCTOU binding runs argv-only right after freshness, so
                 # only the tail advisory scanners (fail-OPEN by design) could
                 # ever be clipped, which nets the same outcome as their error
-                # path.
+                # path. A merge carrying --body-file adds the squash-body
+                # recompute right after the binding (commits 15 + body 6, each
+                # clamped by `_gh_timeout` to what is left): a drained budget
+                # there BLOCKS ("could not be recomputed"), never allows, and a
+                # merge without --body-file pays none of it.
                 # A timing-out fail-closed gate returns BLOCK immediately, so
                 # the additive worst case needs every call slow-but-successful.
                 mergeable = _check_mergeable(pr_num, repo=merge_repo)
@@ -13373,6 +13601,21 @@ def _run_merge_and_push_gates() -> int:
                         print("BLOCKED: " + bind_msg, file=sys.stderr)
                         return 2
 
+                # The squash body's CONTENT, right after the binding and before the
+                # slow scanners, for the binding's reason: a hook killed at its wall
+                # clock lets the command run, so the leak boundary goes early.
+                # A merge WITHOUT --body-file is allowed silently: the advisory for
+                # it lives in --check-pr's merge-with line, which is read, whereas
+                # stderr on this hook's exit-0 path is not delivered.
+                body_expected: list[str] = []
+                if body_file is not None:
+                    body_msg = _check_squash_body_file(
+                        pr_num, merge_repo, merge_head, body_file, expected_out=body_expected
+                    )
+                    if body_msg:
+                        print(f"BLOCKED: PR #{pr_num} — {body_msg}", file=sys.stderr)
+                        return 2
+
                 # Unresolved review findings (review body) — AFTER freshness +
                 # binding (see the ordering note above). Waived by
                 # # review-override (the FINDINGS sigil — not the stale one).
@@ -13455,6 +13698,13 @@ def _run_merge_and_push_gates() -> int:
                     )
                     print(_defang_gate_text(sched_msg), file=sys.stderr)
                     return 2
+
+                # Last, just before this arm allows: the body file once more.
+                if body_file is not None and body_expected:
+                    late_msg = _recheck_squash_body_file(body_file, body_expected[0])
+                    if late_msg:
+                        print(f"BLOCKED: PR #{pr_num} — {late_msg}", file=sys.stderr)
+                        return 2
 
         # ── sqlite3 write operations ────────────────────────────────
         # Whole-command match (never misses a fragmented/wrapped invocation),
@@ -14084,7 +14334,20 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     # (right after codex-at-head) suggested a mergeable PR even when the scheduled or finding
     # gate below would block. Bound to the Codex-verified head (the TOCTOU pin).
     if failures == 0 and verified_head:
-        print("merge-with     : " + _suggested_merge_cmd(pr_num, verified_head, repo))
+        # The squash body carries `Squashed-From: <head>` plus the branch's session
+        # trailers. The merge arm recomputes it, so the file is a convenience for gh,
+        # never a source of trust. On a failure the plain command still merges.
+        merge_cmd = _suggested_merge_cmd(pr_num, verified_head, repo)
+        body_path, body_why = _prepare_squash_body_file(pr_num, repo, verified_head)
+        if body_path:
+            merge_cmd += f" --body-file {body_path}"
+        elif body_why:
+            print(
+                f"NOTE: PR #{pr_num} — no squash body file ({body_why}); the merge-with "
+                f"line below merges without the Squashed-From trailer.",
+                file=sys.stderr,
+            )
+        print("merge-with     : " + merge_cmd)
     print(
         "verdict        :",
         "MERGEABLE (all gates pass)" if failures == 0 else f"{failures} gate(s) would block",
