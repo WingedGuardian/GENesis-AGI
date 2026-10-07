@@ -212,6 +212,18 @@ def _sync_order(settings, state):
     ]
 
 
+def _assert_sync_order(observed, settings, state):
+    expected = _sync_order(settings, state)
+    # os.walk does not order sibling directories. Every file must still be
+    # synced once before the ordered directory and settings publication phase.
+    files = observed[:3]
+    assert len(files) == len(set(files))
+    assert set(files) <= set(expected[:3])
+    if len(observed) >= 3:
+        assert set(files) == set(expected[:3])
+    assert observed[3:] == expected[3 : len(observed)]
+
+
 @pytest.mark.parametrize("boundary", range(15))
 def test_configure_sync_failure_retains_evidence(
     managed, staged_configuration, monkeypatch, boundary
@@ -230,7 +242,8 @@ def test_configure_sync_failure_retains_evidence(
     monkeypatch.setattr(os, "fsync", sync)
     with pytest.raises(OSError, match="injected sync"):
         managed.configure(args, settings)
-    assert observed == _sync_order(settings, state)[: boundary + 1]
+    assert len(observed) == boundary + 1
+    _assert_sync_order(observed, settings, state)
     assert state.is_dir() and (state / "cache/_config.db").is_file()
     assert settings.exists() == (boundary == 14)
     if settings.exists():
@@ -254,7 +267,8 @@ def test_configure_syncs_before_publication(managed, staged_configuration, monke
 
     monkeypatch.setattr(os, "fsync", sync)
     managed.configure(args, settings)
-    assert observed == _sync_order(settings, state)
+    assert len(observed) == len(_sync_order(settings, state))
+    _assert_sync_order(observed, settings, state)
 
 
 def test_configure_explicit_nondefault_path_refuses(managed, staged_configuration):
