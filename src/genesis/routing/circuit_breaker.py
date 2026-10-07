@@ -877,27 +877,43 @@ class CircuitBreakerRegistry:
 
         The provider itself never counts as cover: a dead provider whose breaker
         has drifted OPEN -> HALF_OPEN reads "available" to the router, and must
-        not cover its own outage. ``also_unavailable(name)`` (optional) marks
-        providers the router will skip for reasons the breaker does not know
-        (a spent daily quota). ``[]`` = covered; ``None`` = coverage unknown (no
+        not cover its own outage. ``also_unavailable(name, site)`` (optional)
+        marks providers the router will skip for that site for reasons the
+        breaker does not know (a spent daily quota, a paid provider on a
+        never_pays site or over the spend budget). ``[]`` = covered; ``None`` = coverage unknown (no
         essential map), which callers must treat as "could be uncovered". The
-        known 429-reads-available gap of ``_provider_available`` still applies.
+        known gap of ``_provider_available`` still applies: a peer answering
+        every call with 429 or 400 never trips (the router records neither as a
+        breaker failure), so it reads CLOSED and counts as cover.
         """
         if self._essential_sites is None:
             return None
 
-        def _serves(name: str) -> bool:
+        def _serves(name: str, site: str) -> bool:
+            # CLOSED, not merely "not OPEN": HALF_OPEN only ever follows a trip,
+            # so a peer there is tripped-and-unproven -- two dead providers in
+            # HALF_OPEN must not cover each other.
             if name == provider or not self._provider_available(name):
                 return False
+            if self.get(name).state != ProviderState.CLOSED:
+                return False
             try:
-                return not (also_unavailable and also_unavailable(name))
+                return not (also_unavailable and also_unavailable(name, site))
             except Exception:
                 return True  # unknown extra signal: fall back to the breaker's word
+
+        def _used_by(site: str) -> bool:
+            # A provider the router never uses for this site (e.g. a paid one on
+            # a never_pays site) leaves nothing there uncovered by dying.
+            try:
+                return not (also_unavailable and also_unavailable(provider, site))
+            except Exception:
+                return True
 
         return sorted(
             site
             for site, chain in self._essential_sites.items()
-            if provider in chain and not any(_serves(p) for p in chain)
+            if provider in chain and _used_by(site) and not any(_serves(p, site) for p in chain)
         )
 
     def compute_degradation_level(self) -> DegradationLevel:

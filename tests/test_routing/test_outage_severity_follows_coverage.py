@@ -59,7 +59,7 @@ async def test_covered_outage_is_high_and_says_fallback_works(empty_db):
     assert await _notify(empty_db, lambda p: []) is True
     row, msg = await _notice(empty_db)
     assert row["priority"] == "high"
-    assert "every essential call site still has an available provider" in msg
+    assert "every essential call site it serves still has another healthy provider" in msg
 
 
 async def test_uncovered_essential_site_pages_and_names_it(empty_db):
@@ -180,7 +180,7 @@ async def test_a_deselected_provider_covers_nothing():
     reg = _registry({"site1": ["a", "b"]})
     _trip(reg, "a")
     assert reg.uncovered_essential_sites_for("a") == []
-    assert reg.uncovered_essential_sites_for("a", also_unavailable=lambda n: n == "b") == [
+    assert reg.uncovered_essential_sites_for("a", also_unavailable=lambda n, s: n == "b") == [
         "site1"
     ]
 
@@ -215,3 +215,23 @@ async def test_an_acknowledged_page_still_suppresses_a_repeat(empty_db):
         resolution_notes="acknowledged on the dashboard",
     )
     assert await _notify(empty_db, lambda p: ["9_fact_extraction"]) is False
+
+
+async def test_two_dead_providers_in_half_open_never_cover_each_other():
+    reg = _registry({"site1": ["a", "b"]})
+    _trip(reg, "a")
+    _trip(reg, "b")
+    reg.get("b")._opened_at -= 10**6  # b drifted to HALF_OPEN: tripped, unproven
+    assert reg.get("b").is_available()
+    assert reg.uncovered_essential_sites_for("a") == ["site1"]
+
+
+async def test_a_site_the_provider_never_serves_is_not_its_loss():
+    reg = _registry({"np_site": ["a", "b"]})
+    _trip(reg, "a")
+    _trip(reg, "b")
+
+    def paid_a(name, site):  # a is paid on a never_pays site
+        return name == "a"
+
+    assert reg.uncovered_essential_sites_for("a", also_unavailable=paid_a) == []

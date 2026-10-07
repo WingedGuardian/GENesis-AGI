@@ -2771,16 +2771,35 @@ async def _check_provider_outage_notify(db) -> None:
                     return _reg.get(name).state != ProviderState.CLOSED
 
                 coverage_for = _breakers.uncovered_essential_sites_for
-                # A provider whose daily quota is spent is skipped by the router
-                # while its breaker reads healthy: it covers nothing.
+                # The router skips some providers whose breakers read healthy:
+                # a spent daily quota, and a paid one on a never_pays site or
+                # while the spend budget is exceeded (router.py's chain walk and
+                # _filter_chain). Those cover nothing.
                 _router = getattr(GenesisRuntime.instance(), "_router", None)
-                _ledger = getattr(_router, "_daily_budget", None)
-                if _ledger is not None:
-                    def _deselected(name, _r=_router, _l=_ledger):
-                        cfg = _r.config.providers.get(name)
-                        return cfg is not None and _l.exhausted(cfg)
+                if _router is not None:
+                    _ledger = getattr(_router, "_daily_budget", None)
+                    _exceeded = False
+                    try:
+                        from genesis.routing.types import BudgetStatus
 
-                    def coverage_for(name, _reg=_breakers, _d=_deselected):
+                        _ct = getattr(_router, "cost_tracker", None)
+                        if _ct is not None:
+                            _exceeded = await _ct.check_budget() == BudgetStatus.EXCEEDED
+                    except Exception:
+                        _exceeded = False  # unknown: the breaker's word stands
+
+                    def _ineligible(name, site, _r=_router, _l=_ledger, _x=_exceeded):
+                        cfg = _r.config.providers.get(name)
+                        if cfg is None:
+                            return False
+                        if _l is not None and _l.exhausted(cfg):
+                            return True
+                        if not cfg.is_free:
+                            cs = _r.config.call_sites.get(site)
+                            return _x or bool(cs is not None and cs.never_pays)
+                        return False
+
+                    def coverage_for(name, _reg=_breakers, _d=_ineligible):
                         return _reg.uncovered_essential_sites_for(name, also_unavailable=_d)
         except Exception:
             provider_still_failing = None

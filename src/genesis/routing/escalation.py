@@ -622,7 +622,7 @@ async def notify_provider_if_due(
     elif uncovered == []:
         consequence = (
             "Calls are falling back to other providers in each chain; every "
-            "essential call site still has an available provider."
+            "essential call site it serves still has another healthy provider."
         )
     else:
         consequence = "Calls fall back to other providers where a chain has one."
