@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import io
 import os
+import subprocess
 import tarfile
 from pathlib import Path
 
@@ -244,3 +245,307 @@ def test_fresh_restore_needs_no_analytics_venv_and_invalidates_before_mutation(s
     epoch = sandbox["home"] / ".genesis/locks/transcript-analytics-restore-epoch"
     assert epoch.read_text().strip()
     assert not (sandbox["gd"] / ".venv").exists()
+
+
+def test_unchanged_capture_reused_but_cipher_corruption_recaptured(tmp_path, monkeypatch):
+    root, destination, scratch = (tmp_path / name for name in ('sources', 'cipher', 'scratch'))
+    for directory in (root, destination, scratch):
+        directory.mkdir()
+    source = root / 'a.jsonl'
+    source.write_text('initial')
+    calls = []
+    def copy_crypt(source, target, password, **kwargs):
+        calls.append(source)
+        target.write_bytes(source.read_bytes())
+    monkeypatch.setattr(archive, 'crypt', copy_crypt)
+    assert not archive.backup(root, destination, scratch, b'p')
+    assert not archive.backup(root, destination, scratch, b'p')
+    assert len(calls) == 1
+    cipher = destination / archive.object_name('a.jsonl')
+    cipher.write_bytes(b'corrupt')
+    assert not archive.backup(root, destination, scratch, b'p')
+    assert len(calls) == 2
+    original_mtime = source.stat().st_mtime_ns
+    source.write_text('changed')
+    os.utime(source, ns=(original_mtime, original_mtime))
+    assert not archive.backup(root, destination, scratch, b'p')
+    assert len(calls) == 3
+
+
+def test_main_scope_writes_v2_and_retains_other_projects(tmp_path, monkeypatch):
+    root, destination, scratch = (tmp_path / name for name in ('sources', 'cipher', 'scratch'))
+    for directory in (root, destination, scratch):
+        directory.mkdir()
+    for name in ('main/a.jsonl', 'other/a.jsonl', 'main/subagents/agent-x.jsonl'):
+        source = root / name
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text('{}')
+    monkeypatch.setattr(archive, 'crypt', lambda src, dst, *a, **k: dst.write_bytes(src.read_bytes()))
+    assert not archive.backup(root, destination, scratch, b'p')
+    old = destination / archive.object_name('other/a.jsonl')
+    before = old.read_bytes()
+    assert not archive.backup(root, destination, scratch, b'p', project='main')
+    assert old.read_bytes() == before
+    assert (destination / archive.object_name('main/a.jsonl')).exists()
+    assert not list(destination.glob('*.jsonl.gpg'))
+
+
+def test_filesystem_surrogate_path_roundtrip(tmp_path):
+    relative = os.fsdecode(b'project/session-\xff.jsonl')
+    source = tmp_path / os.fsdecode(b'source-\xff.jsonl')
+    source.write_bytes(b'data')
+    plain = tmp_path / 'capture.tar'
+    archive.capture(source, relative, plain)
+    assert archive.restore(plain, tmp_path / 'restored', archive.object_name(relative))
+    assert (tmp_path / 'restored' / relative).read_bytes() == b'data'
+
+
+def selection_setup(tmp_path, monkeypatch):
+    root, cipher, scratch = (tmp_path / name for name in ('root', 'cipher', 'scratch'))
+    for directory in (cipher, scratch):
+        directory.mkdir()
+    monkeypatch.setattr(archive, 'crypt', lambda src, dst, *a, **k: dst.write_bytes(src.read_bytes()))
+    plain, name = payload(tmp_path, relative='p/a.jsonl', content=b'v2')
+    (cipher / name).write_bytes(plain.read_bytes())
+    return root, cipher, scratch, name
+
+
+def test_incomparable_legacy_v2_is_conflict_even_force(tmp_path, monkeypatch, capsys):
+    root, cipher, scratch, name = selection_setup(tmp_path, monkeypatch)
+    (cipher / 'a.jsonl.gpg').write_bytes(b'legacy')
+    assert archive.restore_set(cipher, root, 'p', scratch, b'p', force=True)
+    assert not root.exists()
+    assert 'incomparable' in capsys.readouterr().err
+    assert not archive.restore_set(cipher, root, 'p', scratch, b'p', preferences=['p/a.jsonl=legacy'])
+    assert (root / 'p/a.jsonl').read_bytes() == b'legacy'
+
+
+def test_freshness_uses_recorded_mtime_not_cipher_mtime(tmp_path, monkeypatch):
+    root, cipher, scratch, name = selection_setup(tmp_path, monkeypatch)
+    destination = root / 'p/a.jsonl'
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b'newer existing')
+    os.utime(destination, ns=(1234567891000000000, 1234567891000000000))
+    # Download/cache timestamps must not override the archived source timestamp.
+    os.utime(cipher / name, ns=(2234567891000000000, 2234567891000000000))
+    assert not archive.restore_set(cipher, root, 'p', scratch, b'p')
+    assert destination.read_bytes() == b'newer existing'
+    assert not archive.restore_set(cipher, root, 'p', scratch, b'p', force=True)
+    assert destination.read_bytes() == b'v2'
+
+
+def test_invalid_v2_falls_back_to_valid_legacy_reports_incomplete(tmp_path, monkeypatch):
+    root, cipher, scratch, name = selection_setup(tmp_path, monkeypatch)
+    (cipher / name).write_bytes(b'bad archive')
+    (cipher / 'a.jsonl.gpg').write_bytes(b'valid legacy')
+    assert archive.restore_set(cipher, root, 'p', scratch, b'p')
+    assert (root / 'p/a.jsonl').read_bytes() == b'valid legacy'
+
+
+def test_digest_checked_during_dry_run(tmp_path):
+    plain, name = payload(tmp_path)
+    with tarfile.open(plain, 'r') as tar:
+        member = tar.getmembers()[0]
+    with tarfile.open(plain, 'w') as tar:
+        tar.addfile(member, io.BytesIO(b'bad\n'))
+    with pytest.raises(ValueError, match='digest'):
+        archive.restore(plain, tmp_path / 'restore', name, dry_run=True)
+
+
+def test_selected_inventory_excludes_conflicting_stale_cipher(tmp_path, monkeypatch):
+    root, cipher, scratch, name = selection_setup(tmp_path, monkeypatch)
+    (cipher / 'a.jsonl.gpg').write_bytes(b'stale')
+    assert not archive.restore_set(cipher, root, 'p', scratch, b'p', selected={name})
+    assert (root / 'p/a.jsonl').read_bytes() == b'v2'
+
+
+def test_analytics_outside_home_relative_restore_and_exclusions(tmp_path, monkeypatch):
+    source, scratch, destination = (tmp_path / name for name in ('outside', 'scratch', 'new-location'))
+    source.mkdir()
+    scratch.mkdir()
+    for name in ('events/p.parquet', 'inventory.json', 'derived/cached.duckdb', '.staging/temp'):
+        path = source / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(name)
+    monkeypatch.setattr(archive, 'crypt', lambda src, dst, *a, **k: dst.write_bytes(src.read_bytes()))
+    cipher = tmp_path / 'analytics.gpg'
+    archive.analytics_archive(source, cipher, scratch, b'p')
+    archive.analytics_restore(cipher, destination, scratch, b'p')
+    assert (destination / 'events/p.parquet').read_text() == 'events/p.parquet'
+    assert not (destination / 'derived').exists()
+    assert not (destination / '.staging').exists()
+    with pytest.raises(ValueError, match='exists'):
+        archive.analytics_restore(cipher, destination, scratch, b'p')
+    archive.analytics_restore(cipher, destination, scratch, b'p', force=True)
+    assert list(tmp_path.glob('new-location.pre-restore-*'))
+
+
+def test_analytics_refuses_links_before_cipher_publication(tmp_path, monkeypatch):
+    source, scratch = tmp_path / 'data', tmp_path / 'scratch'
+    source.mkdir()
+    scratch.mkdir()
+    (source / 'link').symlink_to(tmp_path)
+    cipher = tmp_path / 'analytics.gpg'
+    with pytest.raises(ValueError, match='link'):
+        archive.analytics_archive(source, cipher, scratch, b'p')
+    assert not cipher.exists()
+
+
+@pytest.mark.parametrize('member', ['../escape', '/absolute', 'derived/cache', 'x//y'])
+def test_analytics_refuses_unsafe_members(tmp_path, monkeypatch, member):
+    cipher, _ = payload(tmp_path, relative=member)
+    scratch = tmp_path / 'scratch'
+    scratch.mkdir()
+    monkeypatch.setattr(archive, 'crypt', lambda src, dst, *a, **k: dst.write_bytes(src.read_bytes()))
+    with pytest.raises(ValueError, match='unsafe'):
+        archive.analytics_restore(cipher, tmp_path / 'restore', scratch, b'p')
+
+
+def test_database_only_restore_does_not_take_analytics_lock(sandbox, monkeypatch):
+    lock_dir = sandbox['home'] / '.genesis/locks'
+    lock_dir.mkdir()
+    monkeypatch.setenv('GENESIS_RESTORE_LOCK_WAIT', '0')
+    with (lock_dir / 'transcript-analytics.lock').open('w') as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        result = _run(sandbox, extra_args=['--database-only'])
+    assert 'analytics writer is busy' not in result.stdout
+    assert not (lock_dir / 'transcript-analytics-restore-epoch').exists()
+
+
+@pytest.mark.parametrize("failure,expected", [("absent", 3), ("timeout", 1), ("denied", 1)])
+def test_strict_local_listing_distinguishes_absence(tmp_path, failure, expected):
+    helper = Path(__file__).parents[2] / "scripts/lib/backup_backends.sh"
+    function = {
+        "absent": 'echo "ls: cannot access x: No such file or directory" >&2; return 2',
+        "timeout": 'return 124',
+        "denied": 'echo "Permission denied" >&2; return 2',
+    }[failure]
+    command = 'source "$1"; _BACKEND=local; _BACKEND_LOCAL_ROOT="$2"; _t_ctl() { ' + function + '; }; backend_list_strict missing'
+    result = subprocess.run(["bash", "-c", command, "test", str(helper), str(tmp_path)], capture_output=True)
+    assert result.returncode == expected
+
+
+@pytest.mark.parametrize("status,expected", [("NT_STATUS_OBJECT_PATH_NOT_FOUND", 3),
+                                             ("NT_STATUS_ACCESS_DENIED", 1),
+                                             ("NT_STATUS_CONNECTION_DISCONNECTED", 1)])
+def test_strict_smb_listing_refuses_failed_cd(tmp_path, status, expected):
+    helper = Path(__file__).parents[2] / "scripts/lib/backup_backends.sh"
+    command = 'source "$1"; _BACKEND=smb; _smb_run() { echo "$3"; }; backend_list_strict missing'
+    # Function has its own positional arguments; capture the status outside it.
+    command = command.replace('_smb_run() { echo "$3"; }', 'status="$3"; _smb_run() { echo "$status"; }')
+    result = subprocess.run(["bash", "-c", command, "test", str(helper), str(tmp_path), status], capture_output=True)
+    assert result.returncode == expected
+
+
+def test_dryrun_restore_does_not_take_analytics_lock(sandbox, monkeypatch):
+    lock_dir = sandbox["home"] / ".genesis/locks"
+    lock_dir.mkdir()
+    monkeypatch.setenv("GENESIS_RESTORE_LOCK_WAIT", "0")
+    with (lock_dir / "transcript-analytics.lock").open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        result = _run(sandbox, extra_args=["--dry-run"])
+    assert "analytics writer is busy" not in result.stdout
+    assert not (lock_dir / "transcript-analytics-restore-epoch").exists()
+
+
+def test_shell_dedicated_analytics_archive_restores_to_current_outside_home(sandbox, tmp_path, monkeypatch):
+    _snapshot(sandbox, 'archive-host', _NEW)
+    snapshot = sandbox['offsite'] / 'Genesis/archive-host' / _NEW
+    extra = snapshot / 'extra'
+    extra.mkdir()
+    original = tmp_path / 'original-storage'
+    original.mkdir()
+    (original / 'inventory.json').write_text('{}')
+    scratch = tmp_path / 'scratch'
+    scratch.mkdir()
+    archive.analytics_archive(original, extra / 'transcript-analytics-v1.tar.gpg', scratch, b'testpass')
+    (snapshot / 'COMPLETE').write_text('genesis-snapshot 1\nextra transcript-analytics-v1.tar.gpg\n')
+    current = tmp_path / 'current-storage'
+    runtime = sandbox['gd'] / '.venv/bin/python'
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text('#!/bin/sh\n[ "$3" = "--configured-enabled-data-dir" ] || exit 9\nprintf "%s\\n" "$ANALYTICS_TEST_DESTINATION"\n')
+    runtime.chmod(0o700)
+    monkeypatch.setenv('ANALYTICS_TEST_DESTINATION', str(current))
+    result = _run(sandbox, host_override='archive-host')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (current / 'inventory.json').read_text() == '{}'
+    assert original.exists()
+
+
+
+def test_capture_index_published_once_per_batch(tmp_path, monkeypatch):
+    root, destination, scratch = (tmp_path / name for name in ('sources', 'cipher', 'scratch'))
+    for directory in (root, destination, scratch):
+        directory.mkdir()
+    for number in range(4):
+        (root / f'{number}.jsonl').write_text('{}')
+    monkeypatch.setattr(archive, 'crypt', lambda src, dst, *a, **k: dst.write_bytes(src.read_bytes()))
+    real_dump = archive.json.dump
+    publications = []
+    def count_dump(*args, **kwargs):
+        publications.append(True)
+        return real_dump(*args, **kwargs)
+    monkeypatch.setattr(archive.json, 'dump', count_dump)
+    assert not archive.backup(root, destination, scratch, b'p')
+    assert len(publications) == 1
+    assert not archive.backup(root, destination, scratch, b'p')
+    assert len(publications) == 1
+
+
+def test_index_publication_failure_preserves_cipher_and_recaptures(tmp_path, monkeypatch):
+    root, destination, scratch = (tmp_path / name for name in ('sources', 'cipher', 'scratch'))
+    for directory in (root, destination, scratch):
+        directory.mkdir()
+    (root / 'a.jsonl').write_text('{}')
+    real_replace = archive.os.replace
+    def fail_index(source, target):
+        if Path(target).name == '.capture-index.json':
+            raise OSError('index unavailable')
+        return real_replace(source, target)
+    calls = []
+    def copy_crypt(src, dst, *args, **kwargs):
+        calls.append(True)
+        dst.write_bytes(src.read_bytes())
+    monkeypatch.setattr(archive, 'crypt', copy_crypt)
+    monkeypatch.setattr(archive.os, 'replace', fail_index)
+    assert archive.backup(root, destination, scratch, b'p')
+    assert (destination / archive.object_name('a.jsonl')).exists()
+    assert not (destination / '.capture-index.json').exists()
+    monkeypatch.setattr(archive.os, 'replace', real_replace)
+    assert not archive.backup(root, destination, scratch, b'p')
+    assert len(calls) == 2
+
+
+def test_shell_preference_accepts_dash_prefixed_project(sandbox, tmp_path):
+    _snapshot(sandbox, 'archive-host', _NEW)
+    selected = sandbox['offsite'] / 'Genesis/archive-host' / _NEW / 'transcripts'
+    selected.mkdir()
+    source = tmp_path / 'source'
+    source.mkdir()
+    project = str(sandbox['gd']).replace('/', '-')
+    (source / project).mkdir()
+    (source / project / 'a.jsonl').write_text('v2')
+    scratch = tmp_path / 'scratch'
+    scratch.mkdir()
+    assert not archive.backup(source, selected, scratch, b'testpass')
+    legacy = tmp_path / 'legacy.jsonl'
+    legacy.write_text('preferred legacy')
+    archive.crypt(legacy, selected / 'a.jsonl.gpg', b'testpass')
+    result = _run(sandbox, host_override='archive-host',
+                  extra_args=['--transcript-preference', project + '/a.jsonl=legacy'])
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (sandbox['home'] / '.claude/projects' / project / 'a.jsonl').read_text() == 'preferred legacy'
+
+
+def test_backup_cli_accepts_dash_prefixed_main_project(tmp_path):
+    root, destination, scratch = (tmp_path / name for name in ('sources', 'cipher', 'scratch'))
+    for directory in (root, destination, scratch):
+        directory.mkdir()
+    (root / '-main').mkdir()
+    (root / '-main/a.jsonl').write_text('{}')
+    helper = Path(__file__).parents[2] / 'scripts/lib/transcript_archive.py'
+    result = subprocess.run(['python3', str(helper), 'backup', str(root),
+                             '--destination', str(destination), '--scratch', str(scratch),
+                             '--project=-main'], input=b'testpass', capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert (destination / archive.object_name('-main/a.jsonl')).exists()

@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import resource
+import stat
 import sys
 from pathlib import Path
 
@@ -43,7 +44,10 @@ def cmd_ingest(args) -> int:
         print("transcript-analytics: disabled by lever; nothing done")
         return 0
     try:
-        s = store.ingest(args.projects, args.data, since_days=args.since)
+        options = {"since_days": args.since}
+        if getattr(args, "adopt_projects_root", False):
+            options["adopt_projects_root"] = True
+        s = store.ingest(args.projects, args.data, **options)
     except store.Busy:
         print("transcript-analytics: another ingest/prune is running; skipped")
         return 75  # the unit's SuccessExitStatus: a skipped tick, not a failure
@@ -55,19 +59,21 @@ def cmd_ingest(args) -> int:
     from genesis.transcript_analytics import derive
 
     derive_failed = False
+    derive_deferred = False
     # Freshness is DERIVED from the inputs (re-audit SF-1), not from what this run did.
     if not args.no_derive and not derive.is_current(args.data):
         try:
             s["derived"] = derive.build(args.data)
         except store.Busy:
             s["derived"] = "skipped: lock busy"
+            derive_deferred = True
         except Exception as e:  # noqa: BLE001 - a derive failure must not lose the ingest summary (SF-3)
             s["derived"] = f"failed: {e!r}"
             derive_failed = True
     s["peak_rss_mb"] = _peak_rss_mb()
     s["scrub_version"] = scrub.version()
     print(json.dumps(s))
-    return 1 if s["failed"] or derive_failed else 0
+    return 1 if s["failed"] or derive_failed else (75 if derive_deferred else 0)
 
 
 def cmd_derive(args) -> int:
@@ -87,9 +93,51 @@ def cmd_derive(args) -> int:
     return 0
 
 
-def cmd_status(args) -> int:
+def _parquet_bytes(root):
+    """Count regular Parquet files without traversing directory symlinks."""
+    total = 0
+    errors = []
+    if root.is_symlink():
+        return total, ["data directory is a symlink"]
+    for directory, dirs, files in os.walk(
+        root, followlinks=False, onerror=lambda e: errors.append(str(e))
+    ):
+        dirs[:] = [name for name in dirs if not (Path(directory) / name).is_symlink()]
+        for name in files:
+            if not name.endswith(".parquet"):
+                continue
+            path = Path(directory) / name
+            try:
+                info = path.lstat()
+                if stat.S_ISREG(info.st_mode):
+                    total += info.st_size
+            except OSError as exc:
+                errors.append(str(exc))
+    return total, errors
+
+
+def _marker_totals(markers):
     import pyarrow.parquet as pq
 
+    malformed = 0
+    marker_errors = []
+    for m in markers:
+        try:
+            if m.is_symlink():
+                raise ValueError("marker is a symlink")
+            stats = json.loads((pq.read_metadata(m).metadata or {}).get(b"ta.stats", b"{}"))
+            if not isinstance(stats, dict):
+                raise ValueError("ta.stats is not an object")
+            count = stats.get("malformed", 0)
+            if type(count) is not int or count < 0:
+                raise ValueError("malformed count is not a nonnegative integer")
+            malformed += count
+        except (OSError, ValueError, TypeError) as exc:
+            marker_errors.append({"marker": m.name, "reason": str(exc)})
+    return malformed, marker_errors
+
+
+def cmd_status(args) -> int:
     from genesis.transcript_analytics import query, store
 
     sources = store.discover(args.projects)
@@ -102,17 +150,21 @@ def cmd_status(args) -> int:
         if not store.is_current(args.data, store.srckey(rel), store.source_fingerprint(p, st)):
             stale += 1
     markers = list(args.data.glob(f"{store.MARKER}__*.parquet"))
-    malformed = 0
-    for m in markers:
-        st = json.loads((pq.read_metadata(m).metadata or {}).get(b"ta.stats", b"{}"))
-        malformed += st.get("malformed", 0)
-    size = sum(f.stat().st_size for f in args.data.glob("*.parquet"))
+    malformed, marker_errors = _marker_totals(markers)
+    size, size_errors = _parquet_bytes(args.data)
+    snapshot_size, snapshot_errors = (
+        (0, []) if args.data.is_symlink() else _parquet_bytes(args.data / "derived")
+    )
     out = {
         "data": str(args.data),
         "transcripts_now": len(sources),
         "stale_or_unbuilt": stale,
         "sources_stored": len(markers),
         "store_mb": round(size / 2**20, 1),
+        "source_store_mb": round((size - snapshot_size) / 2**20, 1),
+        "snapshot_store_mb": round(snapshot_size / 2**20, 1),
+        "marker_errors": marker_errors,
+        "size_errors": size_errors + snapshot_errors,
         "malformed_lines": malformed,
         "disabled": (args.data / "DISABLED").exists(),
     }
@@ -192,7 +244,12 @@ def _configure(ap):
     p.add_argument(
         "--no-derive",
         action="store_true",
-        help="skip the snapshot rebuild (the unit runs it separately)",
+        help="skip the snapshot rebuild until a later ingest or explicit derive",
+    )
+    p.add_argument(
+        "--adopt-projects-root",
+        action="store_true",
+        help="explicitly bind a migrated store to this projects root",
     )
     p.set_defaults(handler=cmd_ingest)
     sub.add_parser("status").set_defaults(handler=cmd_status)

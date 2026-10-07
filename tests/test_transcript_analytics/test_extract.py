@@ -513,6 +513,7 @@ def test_agent_meta_sidecar(tmp_path):
         "spawn_depth": 1,
         "request_shape": "foreground",
         "non_interactive": True,
+        "scrub_failed": False,
     }
 
 

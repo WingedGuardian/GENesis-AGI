@@ -99,7 +99,7 @@ cd ~/genesis && ruff check .                      # Lint all Python
 pytest tests/test_memory/test_drift.py -v         # Targeted tests (ALWAYS specify file)
 python3 scripts/pytest_lock_wait.py                # Another run holds the test lock? wait
 gh pr checks <PR-number>                          # CI results (replaces local full suite)
-python -m genesis.hostmetrics preflight --name N --ram GB --cpu PCT  # Fits? before a heavy job
+~/genesis/.venv/bin/python -m genesis.hostmetrics run --name N --ram GB --cpu PCT -- CMD  # Admit + cap a heavy job
 curl -s http://localhost:6333/collections | jq .  # Verify Qdrant
 scripts/deploy_code_only.sh                       # Deploy main: locked pull + restart (launch detached)
 systemctl --user restart genesis-server           # Bare restart, bypasses the deploy lock (NEVER nohup)

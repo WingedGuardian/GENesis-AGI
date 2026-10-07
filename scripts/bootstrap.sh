@@ -1280,7 +1280,7 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         case "$timer_name" in
             genesis-backup.timer) continue ;;  # deliberate setup step — see note below
             genesis-transcript-analytics.timer)
-                if ! "$GENESIS_ROOT/.venv/bin/python" -m genesis.transcript_analytics.config; then
+                if ! transcript_analytics_ready "$GENESIS_ROOT/.venv"; then
                     systemctl --user disable --now "$timer_name" 2>/dev/null || true
                     continue
                 fi ;;

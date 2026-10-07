@@ -17,7 +17,11 @@ Use the normal update/bootstrap deployment path to install the pinned
 `transcript-analytics` extra and refresh the hourly user timer. Other installs
 remain disabled. `GENESIS_TRANSCRIPT_ANALYTICS_DISABLED=1` or a `DISABLED` file
 in the data directory stops collection. Resource admission can defer work with
-exit75; unavailable enforcement exits69. There is no uncapped fallback.
+exit75; unavailable enforcement exits69. Each heavy worker scope has a one-hour
+runtime limit. Installation and timer activation use persistent configuration,
+ignoring temporary collection kill switches. Missing optional dependencies or
+invalid configuration disable the analytics timer with a warning; core Genesis
+installation remains successful. There is no uncapped fallback.
 
 ```bash
 python -m genesis transcripts status
@@ -29,7 +33,8 @@ python -m genesis transcripts verify
 python -m genesis transcripts prune --before 2025-01-01
 ```
 
-`ingest` derives a snapshot unless `--no-derive` is supplied. SQL normally uses
+`ingest` derives a snapshot unless `--no-derive` is supplied. There is no separate
+derivation timer: after skipping, run `derive` or wait for the next hourly ingest. SQL normally uses
 the compatible published snapshot, even when stale; stderr discloses freshness,
 coverage and latest collection gaps. `--live` reconstructs views from compatible
 source tables and exposes `raw_<table>` views. Incompatible historical sources
@@ -40,20 +45,48 @@ deduplication, error classes and final token usage.
 
 `sql --manifest PATH --window LABEL --baseline COMMIT` writes private atomic
 JSON provenance. The window is a label: apply its filter in SQL. The
-opportunity-scan skill saves HTML plus matching manifests under the existing
-output directory. Missing skill attribution is unknown; a next successful Bash
+opportunity-scan skill writes one distinct manifest per query and lists all
+contributing manifests in its HTML report under the existing output directory. Missing skill attribution is unknown; a next successful Bash
 call alone is not evidence of recovery.
 
 Evidence defaults to five surrounding records and 64KiB total output. It checks
-the referenced tool ID, scrubs content, and falls back to locally available v2
-encrypted archives when live context is absent or changed. Decryption requires
+the referenced tool ID and scrubs content. With PR #3005 also installed, it falls
+back to locally available v2 encrypted archives when live context is absent or changed. Decryption requires
 `GENESIS_BACKUP_PASSPHRASE` in the environment. It never downloads an archive.
+
+The following backup, archive fallback and restore capabilities require PR #3005
+(https://github.com/WingedGuardian/GENesis-AGI/pull/3005); they are unavailable
+with the analytics integration alone.
 
 Set `GENESIS_BACKUP_TRANSCRIPT_SCOPE=all` in the existing backup environment to
 retain every project's JSONL and agent metadata as encrypted v2 objects; the
-legacy default remains `main`. Vanished sources retain their last archive.
-Enabled analytics joins the existing extra-directory backup, excluding derived
-snapshots and staging. Restore serializes with analytics and invalidates its
+default scope remains `main`; both scopes write v2 captures. Vanished sources retain their last archive.
+Enabled analytics uses a dedicated encrypted backup archive, excluding derived
+snapshots and staging, and restores into the currently configured data directory. Restore serializes with analytics and invalidates its
 snapshot. Legacy flat archives remain supported; v2 preserves original paths
 and source modification times. Use the existing restore dry run and sandbox
 verification before relying on a new installation's recovery path.
+
+Pruning verifies the store's recorded projects root and UTC retention timestamps,
+and invalidates the current snapshot before deleting sources. An older unbound
+store or an intentionally relocated root requires `ingest --adopt-projects-root`
+after verifying the directory is the intended source corpus.
+
+Restore validates candidates before selection. Legacy captures without recorded
+source timestamps conflict with valid v2 captures of the same destination; the
+affected transcript stays unchanged and recovery reports incomplete. Resolve a
+known conflict with the repeatable option
+`--transcript-preference PROJECT/SESSION.jsonl=legacy` (or `=v2`). `--force` does
+not resolve freshness conflicts. Database-only and dry-run recovery do not acquire
+analytics locks. A dedicated analytics archive requires current enabled
+configuration to identify its destination, including directories outside HOME.
+
+Replacing an existing analytics directory retains the old directory beside it
+as `<data-dir>.pre-restore-<pid>`. The replacement uses two renames and is not
+crash-atomic: interruption between them can leave the configured directory
+absent while its previous data remains in that sibling. Verify the recovery
+state before resuming collection or repeating restore.
+
+SQL and explicit manifest paths are trusted local interfaces, with the same
+filesystem authority as the invoking user; they are not exposed to untrusted
+remote callers.

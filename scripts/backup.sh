@@ -647,39 +647,25 @@ log "Backing up CC transcripts..."
 mkdir -p transcripts
 # Purge any pre-encryption plaintext transcripts (staging only — NOT the .gpg).
 find transcripts -maxdepth 1 -name '*.jsonl' -type f -delete 2>/dev/null || true
-if [ "${GENESIS_BACKUP_TRANSCRIPT_SCOPE:-main}" = all ]; then
+_transcript_flags=()
+case "${GENESIS_BACKUP_TRANSCRIPT_SCOPE:-main}" in
+    main) _transcript_flags+=("--project=$_CC_PROJECT_ID") ;;
+    all) ;;
+    *) _TRANSCRIPTS_COMPLETE=false
+       _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }invalid transcript scope"
+       _FAILURE_STAGE="transcripts"
+       log "WARNING: transcript scope must be main or all" ;;
+esac
+if $_TRANSCRIPTS_COMPLETE; then
     if ! printf '%s' "$_BACKUP_PASSPHRASE" | python3 "$_SCRIPT_DIR/lib/transcript_archive.py" backup \
-        "$HOME/.claude/projects" --destination transcripts --scratch "$GENESIS_BIG_TMP"; then
+        "$HOME/.claude/projects" --destination transcripts --scratch "$GENESIS_BIG_TMP" "${_transcript_flags[@]}"; then
         _TRANSCRIPTS_COMPLETE=false
         _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }transcript coverage incomplete"
         _FAILURE_STAGE="transcripts"
         log "WARNING: transcript coverage incomplete; keeping last-good archives"
     fi
-    _TRANSCRIPT_COUNT=$(find transcripts -maxdepth 1 -name '*.gpg' -type f | wc -l)
-elif [ "${GENESIS_BACKUP_TRANSCRIPT_SCOPE:-main}" != main ]; then
-    _TRANSCRIPTS_COMPLETE=false
-    _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }invalid transcript scope"
-    log "WARNING: GENESIS_BACKUP_TRANSCRIPT_SCOPE must be main or all"
-elif [ -d "$TRANSCRIPT_DIR" ]; then
-    if ! $_ENCRYPT_READY; then
-        log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping transcripts (refusing plaintext)"
-    else
-        # Encrypt each jsonl to transcripts/<name>.jsonl.gpg. Skip re-encryption
-        # when the encrypted copy is newer than the source (mirrors cp -u).
-        while IFS= read -r -d '' src; do
-            name=$(basename "$src")
-            dst="transcripts/${name}.gpg"
-            if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
-                continue
-            fi
-            encrypt_file "$src" "$dst" || log "WARNING: failed to encrypt $name"
-        done < <(find "$TRANSCRIPT_DIR" -maxdepth 1 -name '*.jsonl' -type f -print0)
-        _TRANSCRIPT_COUNT=$(find transcripts -maxdepth 1 -name '*.jsonl.gpg' 2>/dev/null | wc -l)
-        log "Transcripts: $_TRANSCRIPT_COUNT files (encrypted)"
-    fi
-else
-    log "WARNING: transcript directory not found"
 fi
+_TRANSCRIPT_COUNT=$(find transcripts -maxdepth 1 -name '*.gpg' -type f | wc -l)
 
 # --- 4. Auto-memory files (encrypted — auto-memory can hold credentials/PII) ---
 log "Backing up auto-memory..."
@@ -768,22 +754,14 @@ if [ -d "$_EVAL_DIR" ]; then
 fi
 
 # --- 6f. Opt-in extra directories (encrypted, Tier 2 / off-site only) ---
-# Enabled analytics uses the existing extra-directory transport. The module is
-# optional so old installations and recovery-only checkouts retain their defaults.
+# Analytics has a relative-member archive restored into the current config root.
 _ANALYTICS_CONFIG_ERROR=false
+_analytics_data=""
 if [ -f "$GENESIS_DIR/src/genesis/transcript_analytics/config.py" ]; then
     if _analytics_data=$(PYTHONPATH="$GENESIS_DIR/src" "$GENESIS_DIR/.venv/bin/python" \
-        -m genesis.transcript_analytics.config --data-dir); then
-        # A tar traversal must observe one committed generation, not a mix of
-        # atomic per-table replacements. Existing DR lock is held before this.
+        -m genesis.transcript_analytics.config --configured-enabled-data-dir); then
         exec {_ANALYTICS_BACKUP_FD}>"${GENESIS_HOME:-$HOME/.genesis}/locks/transcript-analytics.lock"
         flock "$_ANALYTICS_BACKUP_FD"
-        case ":${GENESIS_BACKUP_EXTRA_DIRS:-}:" in
-            *":$_analytics_data:"*) ;;
-            *) GENESIS_BACKUP_EXTRA_DIRS="${GENESIS_BACKUP_EXTRA_DIRS:+$GENESIS_BACKUP_EXTRA_DIRS:}$_analytics_data" ;;
-        esac
-        _analytics_rel="${_analytics_data#"$HOME"/}"
-        GENESIS_BACKUP_EXTRA_EXCLUDES="${GENESIS_BACKUP_EXTRA_EXCLUDES:+$GENESIS_BACKUP_EXTRA_EXCLUDES:}$_analytics_rel/derived:$_analytics_rel/.staging"
     elif [ "$?" -ne 1 ]; then
         _ANALYTICS_CONFIG_ERROR=true
         _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }analytics backup config unavailable"
@@ -1046,6 +1024,25 @@ else
         _extra_skip "the list has no entries" "GENESIS_BACKUP_EXTRA_DIRS=$GENESIS_BACKUP_EXTRA_DIRS"
     fi
     log "Extra dirs: $_EXTRA_COUNT archived ($_EXTRA_PARTIAL partial), $_EXTRA_SKIPPED skipped"
+fi
+if [ -n "$_analytics_data" ]; then
+    _analytics_safe=true
+    _analytics_abs=$(realpath -m -- "$_analytics_data")
+    if _analytics_core=$(backup_core_overlap "$_analytics_abs"); then _analytics_safe=false; fi
+    for _analytics_guard in "$BACKUP_DIR" "$GENESIS_BIG_TMP" "${GENESIS_BACKUP_LOCAL_PATH:-}"; do
+        [ -n "$_analytics_guard" ] || continue
+        _analytics_guard=$(realpath -m -- "$_analytics_guard")
+        case "$_analytics_abs/" in "$_analytics_guard"/*) _analytics_safe=false ;; esac
+        case "$_analytics_guard/" in "$_analytics_abs"/*) _analytics_safe=false ;; esac
+    done
+    if $_analytics_safe && printf '%s' "$_BACKUP_PASSPHRASE" | python3 "$_SCRIPT_DIR/lib/transcript_archive.py" analytics-backup \
+        "$_analytics_data" --destination extra/transcript-analytics-v1.tar.gpg --scratch "$GENESIS_BIG_TMP"; then
+        _EXTRA_BUILT+=("transcript-analytics-v1.tar.gpg")
+        _EXTRA_COUNT=$((_EXTRA_COUNT + 1))
+    else
+        _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+        _EXTRA_SKIP_LABELS+=("analytics archive unavailable or unsafe")
+    fi
 fi
 # Local manifest (same format as the off-site COMPLETE marker), written on EVERY run,
 # the setting unset included: a restore without an off-site pull restores only the

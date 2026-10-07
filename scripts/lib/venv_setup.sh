@@ -58,10 +58,39 @@ editable_install_guarded() {
     "$venv_path/bin/pip" install -e "$repo_dir" --quiet 2>&1 | tail -1 || true
     # Validate pip actually installed Genesis (|| true above masks pip failures)
     if "$venv_path/bin/python" -c "from genesis.runtime import GenesisRuntime" 2>/dev/null; then
-        if "$venv_path/bin/python" -m genesis.transcript_analytics.config; then
-            "$venv_path/bin/pip" install -e "$repo_dir[transcript-analytics]" --quiet || return 2
-        fi
+        local analytics_rc=0
+        "$venv_path/bin/python" -m genesis.transcript_analytics.config --configured-enabled || analytics_rc=$?
+        case "$analytics_rc" in
+            0)
+                if ! "$venv_path/bin/pip" install -e "$repo_dir[transcript-analytics]" --quiet; then
+                    echo "    WARNING: optional transcript analytics dependencies failed to install; core Genesis remains installed." >&2
+                fi
+                ;;
+            1) ;; # Deliberately disabled; the runtime kill switch is ignored here.
+            *) echo "    WARNING: invalid transcript analytics configuration; optional installation skipped." >&2 ;;
+        esac
         return 0
     fi
     return 2
+}
+
+# transcript_analytics_ready <venv_path>
+# Timer activation uses persistent configuration, not the temporary kill switch.
+# Missing dependencies or invalid configuration disable this optional timer only.
+transcript_analytics_ready() {
+    local venv_path="$1" analytics_rc=0
+    "$venv_path/bin/python" -m genesis.transcript_analytics.config --configured-enabled || analytics_rc=$?
+    case "$analytics_rc" in
+        0) ;;
+        1) return 1 ;;
+        *)
+            echo "    WARNING: transcript analytics timer disabled: configuration unavailable or invalid." >&2
+            return 1
+            ;;
+    esac
+    if ! "$venv_path/bin/python" -c 'import duckdb; import pyarrow' 2>/dev/null; then
+        echo "    WARNING: transcript analytics timer disabled: DuckDB/PyArrow unavailable; rerun normal bootstrap/update." >&2
+        return 1
+    fi
+    return 0
 }
