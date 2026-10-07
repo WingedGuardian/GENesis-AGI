@@ -92,9 +92,12 @@ _PROFILE_DIR = Path.home() / ".genesis" / "camoufox-profile"
 _CHROMIUM_PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
 
 # Module-level browser state — persists across tool calls within a session.
+# Layer numbers match genesis.browser.types.BrowserLayer.
+# Layer 2: Chromium fallback
 _playwright = None
 _context = None
 _page = None
+# Layer 1: Camoufox (default)
 _stealth_cm = None  # Camoufox context manager (for proper __aexit__)
 _stealth_browser = None
 _stealth_page = None
@@ -2865,13 +2868,15 @@ async def _impl_browser_navigate(
         snapshot = await _snapshot_page(page)
 
         def _layer_name():
+            from genesis.browser.types import BrowserLayer
+
             if tinyfish:
-                return "tinyfish_cdp"
+                return BrowserLayer.TINYFISH.value
             if _is_remote_active():
-                return "remote_cdp"
+                return BrowserLayer.REMOTE_CDP.value
             if _is_camoufox_active():
-                return "camoufox"
-            return "chromium"
+                return BrowserLayer.CAMOUFOX.value
+            return BrowserLayer.CHROMIUM.value
 
         result = {
             "url": page.url,
@@ -3219,13 +3224,17 @@ async def browser_navigate(
     cdp_url: Override the CDP endpoint. Default: GENESIS_CDP_URL env var.
     Example: browser_navigate("https://jobs.ashbyhq.com/...", remote=True)
 
-    NOTE: If Cloudflare Turnstile is detected (Camoufox only), this call may
-    block for up to ~5 minutes while waiting for human resolution via VNC.
+    NOTE: On a Cloudflare challenge (Camoufox and Chromium) this call works on
+    it before returning (steps: stealth-browser skill); it does not wait for a
+    person. If unresolved, it sends a Telegram alert (when configured) and
+    returns turnstile.status == "blocked". If the challenge handling itself
+    errors, the result has no turnstile field though a challenge may remain,
+    so check the page title. This can take most of the 300 s timeout.
     """
     # Remote CDP: 60s for the connect (at most 30s), the tab lookup and the
     # goto (at most 30s). A timeout cancels the call; its shielded cleanup
     # finishes on its own.
-    # Camoufox: Turnstile VNC resolution can take up to 5 minutes.
+    # Camoufox / Chromium: challenge handling can take most of 300 s.
     timeout = _TOOL_TIMEOUT_S if remote else 300.0
     return await _with_tool_timeout(
         _impl_browser_navigate(url, stealth, remote=remote, cdp_url=cdp_url, tinyfish=tinyfish),
