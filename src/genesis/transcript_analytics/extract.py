@@ -10,7 +10,7 @@ Every rule here is a measured fact about the transcript format (plan §2-§14,
 * ``is_error`` is tri-state; absent is not success. Failure text is classified
   from the CONTENT block; ``toolUseResult`` is kept only when it adds
   information beyond ``"Error: " + content``.
-* ``<synthetic>`` assistant records are not provider calls and are skipped.
+* ``<synthetic>`` records have no provider usage; API-error records are retained.
 * Only complete lines are read, up to a byte limit taken before reading, so a
   file still being appended never yields a torn record.
 * Only success LENGTHS are stored; text is stored for failures only, scrubbed.
@@ -18,14 +18,16 @@ Every rule here is a measured fact about the transcript format (plan §2-§14,
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from genesis.transcript_analytics.classify import _hook_script, classify, parse_hook_block
-from genesis.transcript_analytics.scrub import scrub_text
+from genesis.transcript_analytics.identity import normalize_rows
+from genesis.transcript_analytics.scrub import scrub_json, scrub_text
 
 TABLES = ("tool_calls", "fragments", "hooks", "events", "session_meta", "agents")
 
@@ -33,6 +35,9 @@ TABLES = ("tool_calls", "fragments", "hooks", "events", "session_meta", "agents"
 # fields and source_file stay exact so joins and raw evidence remain addressable.
 _TEXT_FIELDS = frozenset(
     {
+        "ts",
+        "ts_call",
+        "ts_result",
         "file_path",
         "cwd",
         "git_branch",
@@ -86,9 +91,20 @@ _META_KINDS = {
 @dataclass
 class ExtractResult:
     tables: dict[str, list[dict]] = field(default_factory=lambda: {t: [] for t in TABLES})
+    content_sha256: str = ""
+    last_timestamp: str | None = None
+    chronology_known: bool = True
     stats: dict[str, int] = field(
         default_factory=lambda: {"lines": 0, "malformed": 0, "bytes_read": 0}
     )
+
+
+def utc_timestamp(value):
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
+    except (ValueError, TypeError, AttributeError, OverflowError):
+        return None
 
 
 def _ms_between(a: str | None, b: str | None) -> int | None:
@@ -130,6 +146,8 @@ def _complete_lines(path: Path, stop_at: int | None, counter: dict):
             if remaining <= 0:
                 return
             line = fh.readline(remaining)
+            if "digest" in counter:
+                counter["digest"].update(line)
             if not line or not line.endswith(b"\n") or counter["consumed"] + len(line) > budget:
                 return
             counter["consumed"] += len(line)
@@ -158,7 +176,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
     )
 
     first_sid: str | None = None  # from ANY record, even ones no table keeps
-    counter = {"consumed": 0}
+    counter = {"consumed": 0, "digest": hashlib.sha256()}
     for line_no, raw in enumerate(_complete_lines(path, stop_at, counter), start=1):
         res.stats["lines"] += 1
         if not raw.strip():
@@ -166,11 +184,20 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
         try:
             r = json.loads(raw)
         except ValueError:
+            res.chronology_known = False
             res.stats["malformed"] += 1
             continue
         if not isinstance(r, dict):
+            res.chronology_known = False
             res.stats["malformed"] += 1
             continue
+
+        # Retention sees every complete record, including types not persisted.
+        timestamp = utc_timestamp(r.get("timestamp"))
+        if timestamp is None:
+            res.chronology_known = False
+        elif res.last_timestamp is None or timestamp > utc_timestamp(res.last_timestamp):
+            res.last_timestamp = timestamp.isoformat()
 
         rtype = _str(r.get("type"))
         sid = _str(r.get("sessionId"))
@@ -451,7 +478,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                 )
                 if r.get(k) is not None
             }
-            dtext, dfailed = scrub_text(json.dumps(detail, ensure_ascii=False) if detail else None)
+            dtext, dfailed = scrub_json(detail) if detail else (None, False)
             t["events"].append(
                 {
                     **common,
@@ -501,7 +528,10 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                 }
             )
 
+    res.content_sha256 = counter["digest"].hexdigest()
     res.stats["bytes_read"] = counter["consumed"]
+    if counter["consumed"] != (path.stat().st_size if stop_at is None else stop_at):
+        res.chronology_known = False  # Torn/truncated captured prefix has unknown chronology.
     t["tool_calls"].extend(pending.values())  # calls whose result never arrived (yet)
 
     if agent_id_from_name:
@@ -517,7 +547,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     "source_file": rel,
                     "agent_id": agent_id_from_name,
                     "session_id": first_sid,
-                    "agent_type": _str(meta.get("agentType")),
+                    "agent_type": _str(meta.get("agentType")) or _str(meta.get("taskKind")),
                     # Scrubbed like tool_calls.description (review N-4).
                     "description": description,
                     "scrub_failed": desc_failed,
@@ -537,4 +567,5 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     row[key], failed = scrub_text(row[key])
                     if "scrub_failed" in row:
                         row["scrub_failed"] |= failed
+    normalize_rows(t)
     return res

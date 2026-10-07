@@ -2424,7 +2424,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 0d4d27ce0 2026-10-06
+verified: e71bf5c32 2026-10-07
 ```
 
 - **The graders are TOLD the response status; they must never infer it.** The
@@ -2559,6 +2559,17 @@ verified: 0d4d27ce0 2026-10-06
   `model_profile='bench:genesis'` (the genesis row's `metadata_json.stats` is
   self-contained), and stamped with the uncalibrated-judge + `insufficient_data`
   caveat. A stats-less/all-skip run surfaces flagged, never crashes.
+- **eval/qualification journal**: groundwork for the six-part offline
+  qualification rebuild. Private append-only evidence with an exclusive writer,
+  immutable version-2 campaign manifest funding the full scheduled maximum,
+  decimal reservations, provider-scoped generation ownership and receipt-derived billing
+  and recovery state. Incremental publication follows durable append; uncertain
+  publication stops derived-state reading until reconstruction. Historical
+  reading never creates or truncates files; version-1 evidence cannot execute.
+  No transport, CLI, automatic execution or qualification verdict is wired yet;
+  subsequent replacement PRs supply those callers. Production credentials and
+  accounting stores are outside this boundary. See
+  `docs/reference/qualification-journal.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).

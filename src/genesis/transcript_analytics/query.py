@@ -18,7 +18,7 @@ from genesis.transcript_analytics import store
 from genesis.transcript_analytics.extract import TABLES
 from genesis.transcript_analytics.locks import publication, restore_epoch
 
-VIEWS_VERSION = "5"
+VIEWS_VERSION = "8"
 _DERIVED = ("tool_calls", "turns", "hooks", "events", "session_meta", "agents", "sessions")
 
 
@@ -202,7 +202,7 @@ SELECT source_file, min(ts) AS file_first, max(ts) AS file_last FROM raw_fragmen
 -- A record repeated inside ONE file counts once (review SF-5: 630 such pairs).
 CREATE OR REPLACE VIEW fragments AS
 SELECT * FROM raw_fragments
-QUALIFY row_number() OVER (PARTITION BY source_file, coalesce(uuid, line_no::VARCHAR) ORDER BY line_no) = 1;
+QUALIFY row_number() OVER (PARTITION BY source_file, uuid IS NULL, coalesce(uuid, line_no::VARCHAR) ORDER BY line_no) = 1;
 
 -- Which file's copy of a message is the original. Copies arise two ways, both
 -- measured: a resumed session re-writes earlier records WITH their original
@@ -212,8 +212,8 @@ QUALIFY row_number() OVER (PARTITION BY source_file, coalesce(uuid, line_no::VAR
 -- then ended earliest (the original stops when the resumed one continues).
 CREATE OR REPLACE VIEW message_copy AS
 SELECT message_id, source_file FROM (
-  SELECT f.message_id, f.source_file, count(*) AS n, any_value(s.file_first) AS file_first,
-         any_value(s.file_last) AS file_last
+  SELECT f.message_id, f.source_file, count(*) AS n, min(s.file_first) AS file_first,
+         max(s.file_last) AS file_last
   FROM fragments f JOIN file_span s USING (source_file)
   WHERE f.message_id IS NOT NULL
   GROUP BY f.message_id, f.source_file)
@@ -263,21 +263,22 @@ CREATE OR REPLACE VIEW turns AS
 WITH selected AS (
  SELECT fr.* FROM fragments fr JOIN message_copy USING (message_id, source_file)
  UNION ALL SELECT * FROM fragments WHERE message_id IS NULL
- QUALIFY row_number() OVER (PARTITION BY coalesce(uuid, source_file || ':' || line_no)
+ QUALIFY row_number() OVER (PARTITION BY uuid IS NULL, coalesce(uuid, source_file || ':' || line_no)
  ORDER BY source_file, line_no) = 1
 ), f AS (SELECT *, CASE WHEN message_id IS NOT NULL THEN 'provider:' || message_id
  ELSE coalesce('uuid:' || uuid, 'local:' || source_file || ':' || line_no) END AS turn_key FROM selected),
+-- Metadata selects the first non-null value in source record order.
 g AS (
-  SELECT turn_key, any_value(message_id) AS message_id,
-         arg_min(session_id, line_no) AS session_id, arg_min(agent_id, line_no) AS agent_id,
-         any_value(source_file) AS source_file, min(ts) AS ts, max(ts) AS ts_last,
+  SELECT turn_key, any_value(message_id ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, message_id ASC NULLS LAST) AS message_id,
+         any_value(session_id ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, session_id ASC NULLS LAST) AS session_id, any_value(agent_id ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, agent_id ASC NULLS LAST) AS agent_id,
+         any_value(source_file ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, source_file ASC NULLS LAST) AS source_file, min(ts) AS ts, max(ts) AS ts_last,
          count(*) AS n_records, bool_or(stop_reason IS NOT NULL) AS usage_available,
-         sum(n_tool_use) AS n_tool_use, bool_or(is_sidechain) AS is_sidechain,
-         any_value(entrypoint) AS entrypoint, any_value(attribution_skill) AS attribution_skill,
-         any_value(attribution_mcp_server) AS attribution_mcp_server,
-         any_value(attribution_mcp_tool) AS attribution_mcp_tool, any_value(effort) AS effort,
-         bool_or(is_api_error) AS is_api_error, bool_or(scrub_failed) AS scrub_failed, any_value(cwd) AS cwd, any_value(git_branch) AS git_branch,
-         any_value(version) AS version
+         CAST(sum(n_tool_use) AS DECIMAL(38,0)) AS n_tool_use, bool_or(is_sidechain) AS is_sidechain,
+         any_value(entrypoint ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, entrypoint ASC NULLS LAST) AS entrypoint, any_value(attribution_skill ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, attribution_skill ASC NULLS LAST) AS attribution_skill,
+         any_value(attribution_mcp_server ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, attribution_mcp_server ASC NULLS LAST) AS attribution_mcp_server,
+         any_value(attribution_mcp_tool ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, attribution_mcp_tool ASC NULLS LAST) AS attribution_mcp_tool, any_value(effort ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, effort ASC NULLS LAST) AS effort,
+         bool_or(is_api_error) AS is_api_error, bool_or(scrub_failed) AS scrub_failed, any_value(cwd ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, cwd ASC NULLS LAST) AS cwd, any_value(git_branch ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, git_branch ASC NULLS LAST) AS git_branch,
+         any_value(version ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, version ASC NULLS LAST) AS version
   FROM f GROUP BY turn_key),
 -- The LAST fragment in line order supplies usage, NULLs included: arg_max skips
 -- NULL values, which would mix columns from different fragments (review N-2).
@@ -299,12 +300,12 @@ FROM g JOIN l USING (turn_key);
 
 CREATE OR REPLACE VIEW hooks AS
 SELECT * EXCLUDE (rn) FROM (
-  SELECT *, row_number() OVER (PARTITION BY coalesce(uuid, source_file || ':' || line_no)
+  SELECT *, row_number() OVER (PARTITION BY uuid IS NULL, coalesce(uuid, source_file || ':' || line_no)
                                ORDER BY source_file, line_no) AS rn FROM raw_hooks) WHERE rn = 1;
 
 CREATE OR REPLACE VIEW events AS
 SELECT * EXCLUDE (rn) FROM (
-  SELECT *, row_number() OVER (PARTITION BY coalesce(uuid, source_file || ':' || line_no)
+  SELECT *, row_number() OVER (PARTITION BY uuid IS NULL, coalesce(uuid, source_file || ':' || line_no)
                                ORDER BY source_file, line_no) AS rn FROM raw_events) WHERE rn = 1;
 
 CREATE OR REPLACE VIEW session_meta AS
@@ -319,10 +320,12 @@ CREATE OR REPLACE VIEW sessions AS
 WITH t AS (
   SELECT session_id, min(ts) AS first_ts, max(ts_last) AS last_ts, count(*) AS n_turns,
          count(*) FILTER (WHERE agent_id IS NULL) AS n_main_turns, count(DISTINCT agent_id) AS n_subagents,
-         sum(output_tokens) AS output_tokens, sum(input_tokens) AS input_tokens,
-         sum(cache_read) AS cache_read, sum(cache_create) AS cache_create,
+         CAST(sum(output_tokens) AS DECIMAL(38,0)) AS output_tokens, CAST(sum(input_tokens) AS DECIMAL(38,0)) AS input_tokens,
+         CAST(sum(cache_read) AS DECIMAL(38,0)) AS cache_read, CAST(sum(cache_create) AS DECIMAL(38,0)) AS cache_create,
          count(*) FILTER (WHERE NOT usage_available) AS n_turns_no_usage,
-         list(DISTINCT model) AS models, any_value(cwd) AS cwd, any_value(git_branch) AS git_branch
+         list(DISTINCT model ORDER BY model ASC NULLS LAST) AS models,
+         any_value(cwd ORDER BY ts ASC NULLS LAST, source_file ASC NULLS LAST, message_id ASC NULLS LAST, cwd ASC NULLS LAST) AS cwd,
+         any_value(git_branch ORDER BY ts ASC NULLS LAST, source_file ASC NULLS LAST, message_id ASC NULLS LAST, git_branch ASC NULLS LAST) AS git_branch
   FROM turns GROUP BY session_id),
 c AS (
   SELECT session_id, count(*) AS n_tool_calls,
@@ -331,10 +334,12 @@ c AS (
          count(*) FILTER (WHERE error_class = 'hook_block') AS n_hook_blocks
   FROM tool_calls GROUP BY session_id),
 m AS (
-  -- ai-title records carry no timestamp; arg_max skips NULL keys, so coalesce.
-  SELECT session_id, arg_max(value, coalesce(ts, '')) FILTER (WHERE kind = 'ai-title') AS ai_title,
-         list(DISTINCT value) FILTER (WHERE kind = 'pr-link') AS pr_numbers,
-         list(DISTINCT struct_pack(repository := pr_repository, number := value)) FILTER (WHERE kind = 'pr-link') AS pr_links
+  -- Untimed titles retain the empty timestamp key; equal keys choose the
+  -- lexically greatest non-null title, independent of scan/parallel order.
+  SELECT session_id, arg_max(value, coalesce(ts, '') ORDER BY value DESC NULLS LAST) FILTER (WHERE kind = 'ai-title') AS ai_title,
+         list(DISTINCT value ORDER BY value ASC NULLS LAST) FILTER (WHERE kind = 'pr-link') AS pr_numbers,
+         list(DISTINCT struct_pack(repository := pr_repository, number := value)
+              ORDER BY struct_pack(repository := pr_repository, number := value) ASC NULLS LAST) FILTER (WHERE kind = 'pr-link') AS pr_links
   FROM session_meta GROUP BY session_id),
 s AS (SELECT session_id, bool_or(scrub_failed) AS scrub_failed FROM (
  SELECT session_id,scrub_failed FROM turns UNION ALL SELECT session_id,scrub_failed FROM tool_calls
