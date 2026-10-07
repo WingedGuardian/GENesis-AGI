@@ -291,7 +291,8 @@ async def set_project_item(
     return cur.rowcount == 1
 
 
-# GROUNDWORK(board-reconciler): coverage numerator for the board status read.
+# GROUNDWORK(board-tab): the dashboard Board tab's promotion count (the third
+# reconciler PR). board_status counts cards from the reconciler's own read.
 async def count_links(db: aiosqlite.Connection) -> int:
     cur = await db.execute("SELECT COUNT(*) FROM board_links")
     return (await cur.fetchone())[0]
@@ -743,7 +744,8 @@ async def _insert_event(db: aiosqlite.Connection, values: tuple) -> aiosqlite.Cu
     )
 
 
-# GROUNDWORK(board-reconciler): the board status read lists events.
+# GROUNDWORK(board-tab): the dashboard Board tab lists recent events (drags,
+# promotions); no runtime caller yet (tests only).
 async def list_events(
     db: aiosqlite.Connection,
     *,

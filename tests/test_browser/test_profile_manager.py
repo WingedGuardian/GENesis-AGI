@@ -154,7 +154,19 @@ class TestReset:
 
 
 class TestBrowserLayerEnum:
-    def test_layer_values(self):
-        assert BrowserLayer.FETCH == "fetch"
-        assert BrowserLayer.MANAGED == "managed"
-        assert BrowserLayer.RELAY == "relay"
+    def test_layer_values_are_the_navigate_layer_field(self):
+        """The enum, browser.py's "Layer N" comments and the ``layer`` field
+        browser_navigate returns share one numbering. (The browser-automation
+        skill numbers its own rungs differently; those are not these.)"""
+        assert [m.value for m in BrowserLayer] == [
+            "camoufox", "chromium", "remote_cdp", "tinyfish_cdp",
+        ]
+
+    def test_browser_py_layer_comments_match_the_enum_order(self):
+        from pathlib import Path
+
+        src = (
+            Path(__file__).resolve().parents[2] / "src/genesis/mcp/health/browser.py"
+        ).read_text()
+        for n, name in enumerate(("Camoufox", "Chromium", "CDP remote", "TinyFish"), 1):
+            assert f"# Layer {n}: {name}" in src, (n, name)
