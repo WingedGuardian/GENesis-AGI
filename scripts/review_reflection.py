@@ -469,6 +469,21 @@ def check(
     return parsed
 
 
+def before_any_fix(cwd: str, head: str, sha: str) -> bool:
+    """Whether reflection ``sha`` was made before any fix to round ``head``.
+
+    It must descend from the head, and its tree must still be the head's tree:
+    nothing but empty commits sits between them. A reflection made after a fix
+    landed is a rationalisation, not a reflection, and covers nothing. A second
+    reflection for the same round (a late review) still qualifies.
+    """
+    code, _, _ = _run(["git", "-C", cwd, "merge-base", "--is-ancestor", head, sha])
+    if code != 0:
+        return False
+    trees = _git(cwd, "rev-parse", f"{head}^{{tree}}", f"{sha}^{{tree}}").split()
+    return len(trees) == 2 and trees[0] == trees[1]
+
+
 def covered_keys(
     cwd: str,
     head: str,
@@ -481,8 +496,8 @@ def covered_keys(
 ) -> set[str]:
     """Keys answered at ``head`` by committed reflections. THE coverage check.
 
-    A reflection counts only when it is an EMPTY commit naming this exact head
-    and ``check`` passes it: the round's structure and obligations, the
+    A reflection counts only when it is an EMPTY commit naming this exact head,
+    made before any fix to it (``before_any_fix``), and ``check`` passes it: the round's structure and obligations, the
     recurring-class rule against this branch's previous round, a readable
     adversarial audit where one is cited, no escalation, and the acceptance
     points when the caller has them. A reflection committed by hand is held to
@@ -491,8 +506,8 @@ def covered_keys(
     """
     previous = previous_class_labels(cwd, head, base_ref=base_ref)
     covered: set[str] = set()
-    for _, kind, body in _log_reflections(cwd):
-        if kind != "empty":
+    for sha, kind, body in _log_reflections(cwd):
+        if kind != "empty" or not before_any_fix(cwd, head, sha):
             continue
         result = check(
             body,
@@ -520,7 +535,9 @@ def owed_state(
         "gate_lane": bool(budget.get("gate_surface")),
         "reflection_keys": budget.get("reflection_keys", "unknown"),
         "open_keys": list(budget.get("open_keys") or []),
-        "owed": [],
+        # None means UNKNOWN, never "nothing owed": an unreadable budget or a
+        # round whose findings could not all be keyed owes something unknown.
+        "owed": None,
         "round_head": None,
         "round_started": None,
         "settled": False,
@@ -529,10 +546,14 @@ def owed_state(
     rounds = budget.get("rounds") or []
     if budget.get("status") == "ok" and rounds:
         state["round_head"] = rounds[-1].get("head")
-    if budget.get("status") != "ok" or budget.get("round_state") != "open":
+    if budget.get("status") != "ok":
         return state
-    done = set(covered)
-    state["owed"] = [k for k in state["open_keys"] if k not in done]
+    if budget.get("round_state") != "open":
+        state["owed"] = []
+        return state
+    if state["reflection_keys"] == "ok":
+        done = set(covered)
+        state["owed"] = [k for k in state["open_keys"] if k not in done]
     times = [
         when
         for source in (rounds[-1].get("reviews") or [] if rounds else [])
@@ -567,7 +588,8 @@ def status(cwd: str, *, now: datetime | None = None) -> dict[str, Any]:
             acceptance=list(declared["bullets"]) if declared.get("present") else None,
             round_started=state["round_started"],
         )
-        state["owed"] = [k for k in state["open_keys"] if k not in covered]
+        if state["reflection_keys"] == "ok":
+            state["owed"] = [k for k in state["open_keys"] if k not in covered]
     state.update({"repo": repo, "pr": number, "errors": budget.get("errors", [])})
     return state
 
@@ -594,7 +616,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         for problem in parsed.problems:
             print(f"- {problem}")
         return 0 if parsed.ok else 1
-    except Refused as exc:
+    except (Refused, OSError, ImportError) as exc:
+        # Exit 1 means "the reflection is invalid"; anything that stopped the
+        # check from being made is 2, never mistaken for a verdict.
         print(f"review_reflection: {exc}", file=sys.stderr)
         return 2
 

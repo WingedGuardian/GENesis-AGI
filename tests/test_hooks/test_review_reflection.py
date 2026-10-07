@@ -278,7 +278,12 @@ def _budget(**over):
 
 def test_nothing_is_owed_unless_a_round_is_open():
     assert rr.owed_state(_budget(round_state="complete"), [], now=T0)["owed"] == []
-    assert rr.owed_state(_budget(status="unknown"), [], now=T0)["owed"] == []
+
+
+def test_unknown_evidence_owes_unknown_never_nothing():
+    assert rr.owed_state(_budget(status="unknown"), [], now=T0)["owed"] is None
+    partial = _budget(reflection_keys="unknown")
+    assert rr.owed_state(partial, ["c1", "c2", "r5:1"], now=T0)["owed"] is None
 
 
 def test_covered_keys_are_not_owed():
@@ -502,3 +507,23 @@ def _with_base(base, real):
 def test_unreadable_git_is_refused_never_nothing_owed(tmp_path):
     with pytest.raises(rr.Refused):
         rr.covered_keys(str(tmp_path), HEAD, round_number=1, gate_lane=False, base_ref="main")
+
+
+def test_a_reflection_made_after_a_fix_covers_nothing(repo, tmp_path):
+    """Secondary review P2: reflect-then-fix and fix-then-reflect must differ."""
+    path, head = repo
+    (path / "f.txt").write_text("fix\n")
+    _git(path, "commit", "-q", "-am", "fix")
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head) == set()
+
+
+def test_a_second_reflection_for_the_same_round_still_counts(repo, tmp_path):
+    path, head = repo
+    _commit_reflection(path, tmp_path, _reflection(keys=("c1",), head=head))
+    _commit_reflection(path, tmp_path, _reflection(keys=("c9",), head=head))
+    assert _covered(path, head) == {"c1", "c9"}
+
+
+def test_validate_reports_a_missing_file_as_unable_not_invalid(tmp_path, capsys):
+    assert rr.main(["validate", str(tmp_path / "absent.md")]) == 2
