@@ -83,8 +83,21 @@ def uninstall_lock_paths() -> tuple[Path, Path, Path]:
     main = (Path.home() / "genesis").resolve(strict=True)
     if main != SCRIPT.parent.parent or (main / ".git").is_file():
         raise ValueError("uninstall requires the installed primary checkout")
-    directory = Path(os.environ.get("GENESIS_HOME", str(Path.home() / ".genesis"))) / "locks"
+    directory = Path(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis")) / "locks"
     absolute(str(directory))
+    roots = [Path.home() / name for name in ("genesis", ".genesis", "data", ".qdrant")]
+    default = Path.home() / ".genesis/locks"
+    protected = [units_dir()]
+    if directory == default:
+        if directory.parent.is_symlink() or directory.is_symlink():
+            raise ValueError("uninstall refuses symlinked default lock namespace")
+    else:
+        protected.append(directory)
+    for location in protected:
+        for root in roots:
+            for namespace, deletion in ((location, root), (location.resolve(), root.resolve())):
+                if namespace.is_relative_to(deletion) or deletion.is_relative_to(namespace):
+                    raise ValueError("uninstall refuses lock namespace overlapping deletion roots")
     digest = hashlib.sha1(os.fsencode(main), usedforsecurity=False).hexdigest()[:16]
     return (
         directory / "code-intel-runner.lock",
@@ -161,7 +174,61 @@ def manager_absent(unit: str) -> bool:
     return show(unit, *expected) == expected
 
 
+def index_writer_targets_main(argv: list[str], cwd: Path, main: Path) -> bool:
+    """Recognize repository targets of the existing wrapper and native modes."""
+    entrypoint = main / "scripts/lib/code_intel_index.sh"
+    for index, arg in enumerate(argv[:-1]):
+        if Path(arg).name != "code_intel_index.sh":
+            continue
+        candidate = Path(arg) if Path(arg).is_absolute() else cwd / arg
+        if candidate.resolve() == entrypoint and (cwd / argv[index + 1]).resolve() == main:
+            return True
+    # The private OOM launcher contains both wrapper and native argv. Its fixed
+    # flag is not a repository argument; native classification must still run.
+    if "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv):
+        tail = argv[argv.index("analyze") + 1 :]
+        target = cwd / tail[0] if tail and not tail[0].startswith("-") else cwd
+        return target.resolve() == main
+    return False
+
+
+def observed_index_writers(proc: Path = Path("/proc")) -> list[int]:
+    """Observe existing lockless/scopeless writers; never signal a process."""
+    main = SCRIPT.parent.parent
+    writers = []
+    for process in proc.iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            # proc_pid_stat(5): comm can contain ')' and arbitrary filename bytes;
+            # starttime is field 22, after the final parenthesized comm delimiter.
+            started = process.joinpath("stat").read_text(errors="surrogateescape").rsplit(")", 1)[1].split()[19]
+            argv = [os.fsdecode(arg) for arg in process.joinpath("cmdline").read_bytes().split(b"\0") if arg]
+            wrapper = any(Path(arg).name == "code_intel_index.sh" for arg in argv)
+            native = "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv)
+            if not (wrapper or native):
+                continue
+            cwd = process.joinpath("cwd").resolve(strict=True)
+            recognized = index_writer_targets_main(argv, cwd, main)
+            if process.joinpath("stat").read_text(errors="surrogateescape").rsplit(")", 1)[1].split()[19] != started:
+                raise ValueError(f"index writer PID {process.name} changed during observation")
+            if recognized:
+                writers.append(int(process.name))
+        except FileNotFoundError:
+            if process.exists():
+                raise ValueError(f"cannot prove index writer identity for PID {process.name}") from None
+            continue  # process disappeared during observation
+        except (OSError, RuntimeError, IndexError) as error:
+            raise ValueError(f"cannot prove index writer identity for PID {process.name}") from error
+    return writers
+
+
 def require_no_batch() -> None:
+    writers = observed_index_writers()
+    if writers:
+        raise ValueError(f"uninstall refuses observed index writers: {writers}")
     result = subprocess.run(
         [
             "/usr/bin/systemctl",
@@ -200,12 +267,10 @@ def retire_managed() -> None:
     for unit in (BACKEND, SLICE):
         require_quiescent(unit)
     state = show(BACKEND, "UnitFileState", "LoadState")
-    if errors and (
-        any(action == "stop" for action, _ in errors)
-        or state["UnitFileState"]
-        not in ("", "generated", "transient", "static", "disabled", "masked")
-    ):
-        raise ValueError(f"managed retirement failed: {errors}")
+    safe = state["UnitFileState"] in ("generated", "transient", "static", "disabled", "masked")
+    absent = state == {"UnitFileState": "", "LoadState": "not-found"}
+    if any(action == "stop" for action, _ in errors) or not (safe or absent):
+        raise ValueError(f"managed retirement failed: errors={errors}, state={state}")
 
 
 def report_retained_state() -> None:
@@ -218,8 +283,13 @@ def report_retained_state() -> None:
     if config:
         roots = [Path.home() / name for name in ("genesis", ".genesis", "data", ".qdrant")]
         for key in ("binary", "cache", "runtime"):
-            path = absolute(config[key]).resolve()
-            if not any(path.is_relative_to(root.resolve()) for root in roots):
+            try:
+                path = absolute(config[key]).resolve()
+                inside = any(path.is_relative_to(root.resolve()) for root in roots)
+            except (OSError, RuntimeError) as error:
+                print(f"Preserved configured {key}; path classification failed: {error}", flush=True)
+                continue
+            if not inside:
                 print(f"Preserved configured {key}: {path}", flush=True)
 
 

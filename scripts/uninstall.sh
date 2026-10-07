@@ -311,7 +311,7 @@ fi
 # Enter before any monitoring/state mutation. The helper execs this exact script
 # with real inherited locks; a marker alone cannot authorize destructive cleanup.
 if [ "$IN_CONTAINER" = true ] && [ "$DRY_RUN" = false ]; then
-    MANAGED_HELPER="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/codebase_managed.py"
+    MANAGED_HELPER="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/codebase_managed.py"
     if [ "${#MANAGED_UNINSTALL_FDS[@]}" -eq 3 ]; then
         /usr/bin/python3 -I "$MANAGED_HELPER" verify-uninstall-locks "${MANAGED_UNINSTALL_FDS[@]}"
     else
@@ -505,53 +505,6 @@ elif [ "$DRY_RUN" = false ]; then
     fi
 fi
 
-# ── Phase 4: Remove Guardian (host-side) ─────────────────────
-
-if [ "$MODE" != "genesis-only" ] && [ "$HAS_GUARDIAN" = true ]; then
-    echo ""
-    echo "  [4/6] Removing Guardian..."
-
-    SYSTEMD_DIR="$HOME/.config/systemd/user"
-
-    # Stop and disable all Guardian systemd units
-    for unit in genesis-guardian.timer genesis-guardian.service \
-                genesis-guardian-watchman.timer genesis-guardian-watchman.service; do
-        safe_disable_service "$unit"
-    done
-
-    # Remove unit files
-    for unit in genesis-guardian.service genesis-guardian.timer \
-                genesis-guardian-watchman.service genesis-guardian-watchman.timer; do
-        safe_remove "$SYSTEMD_DIR/$unit" "systemd/$unit"
-    done
-    systemctl --user daemon-reload 2>/dev/null || true
-
-    # Remove Guardian code, state, and gateway
-    safe_remove "$HOME/.local/share/genesis-guardian" "Guardian code (~/.local/share/genesis-guardian/)"
-    safe_remove "$HOME/.local/state/genesis-guardian" "Guardian state (~/.local/state/genesis-guardian/)"
-    safe_remove "$HOME/.local/bin/guardian-gateway.sh" "Guardian gateway"
-
-    # Clean SSH authorized_keys — remove only the genesis-guardian-control entry
-    remove_line_containing "$HOME/.ssh/authorized_keys" "genesis-guardian-control" \
-        "Guardian SSH key from authorized_keys"
-
-    # Remove Incus disk device
-    if [ "$HAS_CONTAINER" = true ]; then
-        if incus config device get "$CONTAINER_NAME" guardian-shared source &>/dev/null 2>&1; then
-            incus config device remove "$CONTAINER_NAME" guardian-shared
-            ok "Removed Incus disk device 'guardian-shared'"
-            REMOVED+=("Incus device guardian-shared")
-        else
-            skip "Incus device guardian-shared"
-        fi
-    fi
-
-    ok "Guardian removal complete"
-else
-    echo ""
-    echo "  [4/6] Guardian removal... (skipped)"
-fi
-
 # ── Phase 5: Remove Genesis (container-side) ─────────────────
 
 if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
@@ -624,7 +577,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
         # Remove systemd unit files
         SYSTEMD_DIR="$HOME/.config/systemd/user"
         for f in "$SYSTEMD_DIR"/genesis-*.service "$SYSTEMD_DIR"/genesis-*.timer "$SYSTEMD_DIR/qdrant.service"; do
-            [ -e "$f" ] && safe_remove "$f" "systemd/$(basename "$f")"
+            { [ -e "$f" ] || [ -L "$f" ]; } && safe_remove "$f" "systemd/$(basename "$f")"
         done
         systemctl --user daemon-reload 2>/dev/null || true
 
@@ -639,21 +592,45 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
 
         # Remove Genesis directories
         GENESIS_ROOT="$HOME/genesis"
+        # Keep canonical coordination inodes: a stalled entrypoint can reopen
+        # these names after it has already checked that the repository exists.
+        if [ "$DRY_RUN" = true ]; then
+            echo "    [DRY RUN] Would remove runtime state except its coordination locks"
+        elif [ -d "$HOME/.genesis" ] && [ ! -L "$HOME/.genesis" ]; then
+            RUNTIME_INVENTORY="$(mktemp -p "$HOME" .genesis-uninstall.XXXXXXXX)"
+            if ! find "$HOME/.genesis" -mindepth 1 -maxdepth 1 ! -name locks -print0 > "$RUNTIME_INVENTORY"; then
+                echo "ERROR: could not enumerate runtime state; retained inventory: $RUNTIME_INVENTORY" >&2
+                exit 1
+            fi
+            while IFS= read -r -d '' entry; do
+                safe_remove "$entry" "Runtime state: $(basename "$entry")"
+            done < "$RUNTIME_INVENTORY"
+            rm -f -- "$RUNTIME_INVENTORY"
+            info "Preserved coordination namespace: $HOME/.genesis/locks"
+        else
+            safe_remove "$HOME/.genesis" "Runtime state (~/.genesis/)"
+        fi
         safe_remove "$GENESIS_ROOT" "Genesis repo ($GENESIS_ROOT)"
-        safe_remove "$HOME/.genesis" "Runtime state (~/.genesis/)"
         safe_remove "$HOME/data" "Database (~/data/)"
         safe_remove "$HOME/.qdrant" "Qdrant data (~/.qdrant/)"
 
         # Remove Qdrant binary
-        if [ -f /usr/local/bin/qdrant ]; then
-            sudo rm -f /usr/local/bin/qdrant 2>/dev/null || rm -f /usr/local/bin/qdrant 2>/dev/null || true
-            ok "Removed /usr/local/bin/qdrant"
-            REMOVED+=("qdrant binary")
-        elif [ -f "$HOME/.local/bin/qdrant" ]; then
-            safe_remove "$HOME/.local/bin/qdrant" "qdrant binary"
-        else
-            skip "qdrant binary"
+        QDRANT_REMOVE_FAILED=false
+        if [ -e "/usr/local/bin/qdrant" ] || [ -L "/usr/local/bin/qdrant" ]; then
+            if [ "$DRY_RUN" = true ]; then
+                echo "    [DRY RUN] Would remove: /usr/local/bin/qdrant"
+            elif sudo rm -f "/usr/local/bin/qdrant" 2>/dev/null || rm -f "/usr/local/bin/qdrant" 2>/dev/null; then
+                ok "Removed /usr/local/bin/qdrant"
+                REMOVED+=("qdrant binary")
+            else
+                warn "Could not remove /usr/local/bin/qdrant"
+                QDRANT_REMOVE_FAILED=true
+            fi
         fi
+        if [ -e "$HOME/.local/bin/qdrant" ] || [ -L "$HOME/.local/bin/qdrant" ]; then
+            safe_remove "$HOME/.local/bin/qdrant" "qdrant binary"
+        fi
+        [ "$QDRANT_REMOVE_FAILED" = false ] || exit 1
 
         # Clean Claude Code config (NOT Claude Code itself or ~/.claude/ global)
         for f in .claude/settings.json .claude/settings.local.json .mcp.json; do
@@ -686,6 +663,53 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
 else
     echo ""
     echo "  [5/6] Genesis removal... (skipped)"
+fi
+
+# ── Phase 4: Remove Guardian (host-side) ─────────────────────
+
+if [ "$MODE" != "genesis-only" ] && [ "$HAS_GUARDIAN" = true ]; then
+    echo ""
+    echo "  [4/6] Removing Guardian..."
+
+    SYSTEMD_DIR="$HOME/.config/systemd/user"
+
+    # Stop and disable all Guardian systemd units
+    for unit in genesis-guardian.timer genesis-guardian.service \
+                genesis-guardian-watchman.timer genesis-guardian-watchman.service; do
+        safe_disable_service "$unit"
+    done
+
+    # Remove unit files
+    for unit in genesis-guardian.service genesis-guardian.timer \
+                genesis-guardian-watchman.service genesis-guardian-watchman.timer; do
+        safe_remove "$SYSTEMD_DIR/$unit" "systemd/$unit"
+    done
+    systemctl --user daemon-reload 2>/dev/null || true
+
+    # Remove Guardian code, state, and gateway
+    safe_remove "$HOME/.local/share/genesis-guardian" "Guardian code (~/.local/share/genesis-guardian/)"
+    safe_remove "$HOME/.local/state/genesis-guardian" "Guardian state (~/.local/state/genesis-guardian/)"
+    safe_remove "$HOME/.local/bin/guardian-gateway.sh" "Guardian gateway"
+
+    # Clean SSH authorized_keys — remove only the genesis-guardian-control entry
+    remove_line_containing "$HOME/.ssh/authorized_keys" "genesis-guardian-control" \
+        "Guardian SSH key from authorized_keys"
+
+    # Remove Incus disk device
+    if [ "$HAS_CONTAINER" = true ]; then
+        if incus config device get "$CONTAINER_NAME" guardian-shared source &>/dev/null 2>&1; then
+            incus config device remove "$CONTAINER_NAME" guardian-shared
+            ok "Removed Incus disk device 'guardian-shared'"
+            REMOVED+=("Incus device guardian-shared")
+        else
+            skip "Incus device guardian-shared"
+        fi
+    fi
+
+    ok "Guardian removal complete"
+else
+    echo ""
+    echo "  [4/6] Guardian removal... (skipped)"
 fi
 
 # ── Phase 6: Delete Container (--full only) ──────────────────

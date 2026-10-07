@@ -1131,6 +1131,6 @@ jobs:
         # Unit-root guard adds 5 controls for the backend's neutral cwd exception.
         # Other edited files retain counts. Floor: 24500 + 84 = 24584;
         # no new skip sites.
-        # Guarded CBM removal: new uninstall file32 cases; other edited test
-        # files retain collection counts. Floor24584+32=24616; no added skips.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24616
+        # Guarded CBM removal: new uninstall file90 cases; other edited test
+        # files retain collection counts. Floor24584+90=24674; no added skips.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24674

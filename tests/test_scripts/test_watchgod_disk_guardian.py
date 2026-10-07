@@ -792,12 +792,11 @@ def test_uninstall_stops_the_watchgod_and_both_pressure_instances():
     # email scan reads a literal name@word.service as an address), so match
     # the instance suffixes next to that variable.
     text = (_ROOT / "scripts" / "uninstall.sh").read_text()
-    assert text.count("genesis-tmp-watchgod.service") >= 2
+    assert "genesis-tmp-watchgod.service" in text
     assert text.count("PRESSURE_UNIT=genesis-disk-hygiene-pressure") == 1
-    assert text.count("P=genesis-disk-hygiene-pressure;") == 1
+    assert 'codebase_managed.py" uninstall -- --genesis-only --non-interactive' in text
     for suffix in ("@standard.service", "@last-resort.service"):
         assert text.count("${PRESSURE_UNIT}" + suffix) == 1, f"in-container path misses {suffix}"
-        assert text.count("\\${P}" + suffix) == 1, f"host-driven path misses {suffix}"
 
 
 def test_the_domain_key_ignores_which_wall_binds(box):
