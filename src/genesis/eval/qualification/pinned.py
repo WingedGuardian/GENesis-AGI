@@ -537,6 +537,18 @@ def validate_params(params) -> dict:
     return params
 
 
+def request_body(model, params, contract, messages):
+    """One canonical wire constructor for scheduling and actual dispatch."""
+    return load_json(canonical({
+        "model": model, "messages": messages, **params[route(contract)],
+        "provider": {
+            "only": [params["upstream"]], "allow_fallbacks": False,
+            "require_parameters": True, "max_price": params["max_price"],
+        },
+        "usage": {"include": True},
+    }))
+
+
 class PinnedRouter:
     """Adapter router for one frozen, fully funded model campaign.
 
@@ -633,24 +645,7 @@ class PinnedRouter:
             self.campaign.fail(self.served[case_id], str(self.failure))
 
     def request(self, messages):
-        body = self.params[route(self.contract)]
-        policy = {
-            "only": [self.params["upstream"]],
-            "allow_fallbacks": False,
-            "require_parameters": True,
-            "max_price": self.params["max_price"],
-        }
-        return load_json(
-            canonical(
-                {
-                    "model": self.cfg.model_id,
-                    "messages": messages,
-                    **body,
-                    "provider": policy,
-                    "usage": {"include": True},
-                }
-            )
-        )
+        return request_body(self.cfg.model_id, self.params, self.contract, messages)
 
     async def route_call(self, call_site_id, messages, **kwargs):
         case_id = self.case_id or self.prompts.get(digest(messages))

@@ -2584,15 +2584,15 @@ verified: af3e45d3c 2026-10-07
   standalone adapters run production relevance and novelty judgments with
   synthetic routers or caller-provided transport. Novelty uses disposable
   full-schema SQLite fixtures and observes the actual rendered candidate IDs.
-  Execution/reporting orchestration lands later.
+  Offline reporting orchestration is available in a dedicated serial process.
   See `docs/reference/qualification-corpus.md`.
   Qualification's pinned transport supplies a caller-provided adapter router
   through the production delegate, a shared one-egress wire guard, response-hook
   durability and exact lexical Decimal GET billing. Frozen schedule/provider
   mapping and dedicated nonreset credentials are required; any journal incident
   pauses new requests and replay until verified recovery. These checks do not
-  establish provider spend bounds or owner approval. The isolated runner remains
-  a later replacement. This verification refresh covers the qualification slice;
+  establish provider spend bounds or owner approval. The isolated paid-run
+  boundary remains unavailable. This verification refresh covers the qualification slice;
   other learning/evaluation entries retain their previous verification scope.
   See `docs/reference/qualification-transport.md`.
   Complete offline preflight checks all registered corpus floors, current
@@ -2602,8 +2602,18 @@ verified: af3e45d3c 2026-10-07
   procedure columns and verifies new insertion semantics; synthetic classifiers
   isolate novelty wiring. Dedicated serial process only; no execution consent,
   paid eligibility, model quality or promotion follows from this evidence.
-  The later runner must recompute it before credentials. See
+  The runner recomputes it before report scoring or paid eligibility. See
   `docs/reference/qualification-preflight.md`.
+  The offline CLI reads existing campaign snapshots without mutation or keys,
+  binds all current schedule/wire/reference/source identities, and scores retained
+  verified answers with production rubric/J9/novelty contracts. Local faults stop
+  further acquisition; novelty verdicts replay both stores in disposable state.
+  Independent model campaigns can be paired against the same shared admission.
+  Public `run` refuses after offline admission, before keys or campaign creation,
+  until an actual financial eligibility verifier exists. Historical actor proof,
+  real model quality and spending/promotion approval remain separate and unproven.
+  Final runner code review and full post-review E2E are still pending. See
+  `docs/reference/qualification-runner.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).

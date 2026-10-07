@@ -1,0 +1,1 @@
+- Add offline model qualification checks and read-only paired reports over private retained campaign answers. Reports require current reference/source and request identities and use the production scoring and disposable novelty storage paths. Paid qualification remains unavailable until complete financial eligibility and spending approval are established.

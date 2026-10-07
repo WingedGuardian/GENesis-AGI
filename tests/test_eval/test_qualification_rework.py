@@ -8,11 +8,13 @@ import os
 import httpx
 import pytest
 
-from genesis.eval.qualification import contracts, corpus, evidence, pinned, preflight
+from genesis.eval.qualification import contracts, corpus, evidence, pinned, preflight, run
+from genesis.eval.qualification.accounting import Journal
 from genesis.eval.qualification.evidence import Incomplete
 from tests.test_eval.qualification_contract_fixtures import Stub
 from tests.test_eval.qualification_fixtures import novelty_case, relevance_case, small_corpus
 from tests.test_eval.qualification_preflight_fixtures import params
+from tests.test_eval.qualification_runner_fixtures import make_router, runner_data  # noqa: F401
 from tests.test_eval.qualification_transport_fixtures import Gateway, ask, bundle, router
 
 
@@ -23,6 +25,38 @@ def transport_env(monkeypatch, tmp_path):
     monkeypatch.setenv("SECRETS_PATH", str(path))
     for name in pinned.PRODUCTION_KEY_NAMES:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.parametrize("provider", [None, "Synthetic"])
+async def test_upstream_identity_observation_is_explicit(data, provider):
+    data.gateway.provider = provider
+    with Journal(data.path, data.manifest) as campaign:
+        records, clamped = await run.score(data.cases, make_router(data, campaign, True), data.temp)
+        report = run.summarize(data.alias, data.cases, records, clamped, campaign)
+    # An unobserved or contradictory provider is retained but cannot qualify.
+    assert len(data.gateway.requests) == 1
+    assert report["history"]["observed_provider"] == int(provider is not None)
+    assert report["history"]["unobserved_provider"] == int(provider is None)
+    assert all(row["local"] for reps in records.values() for rows in reps.values() for row in rows.values())
+
+
+async def test_post_answer_processing_failure_stops_acquisition_and_restart(data, monkeypatch):
+    original = run._case
+
+    async def fail(*args):
+        await original(*args)
+        raise Incomplete("synthetic post-answer processing failure")
+
+    monkeypatch.setattr(run, "_case", fail)
+    with Journal(data.path, data.manifest) as campaign:
+        records, _ = await run.score(data.cases, make_router(data, campaign, True), data.temp)
+        assert any(line["kind"] == "failure" for line in campaign.lines)
+    assert len(data.gateway.requests) == 1
+    with Journal(data.path, data.manifest) as campaign:
+        rerun, _ = await run.score(data.cases, make_router(data, campaign, True), data.temp)
+    assert all(row["local"] for reps in records.values() for rows in reps.values() for row in rows.values())
+    assert all(row["local"] for reps in rerun.values() for rows in reps.values() for row in rows.values())
+    assert len(data.gateway.requests) == 1
 
 
 async def test_journal_directory_barriers_precede_completion(tmp_path, monkeypatch):

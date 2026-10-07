@@ -4,10 +4,12 @@ import inspect
 import json
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from genesis.eval import calibration, j9_aggregator, j9_batch
-from genesis.eval.qualification import contracts, corpus
+from genesis.eval.qualification import contracts, corpus, run
+from genesis.eval.qualification.__main__ import main
 from genesis.eval.qualification.evidence import Incomplete
 from genesis.eval.rubrics import list_rubrics
 from genesis.learning.procedural import extractor
@@ -19,6 +21,43 @@ from tests.test_eval.qualification_fixtures import (
     small_corpus,
     write_corpus,
 )
+
+
+@pytest.fixture
+def no_http(monkeypatch):
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("an offline command attempted HTTP")
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", refuse)
+    monkeypatch.setattr(httpx.Client, "send", refuse)
+
+
+def test_check_cli_is_offline_and_reports_counts(tmp_path, capsys, no_http):
+    directory = write_corpus(tmp_path / "corpus", small_corpus())
+    code = main(["check", "--corpus", str(directory), "--temp-root", str(tmp_path / "t")])
+    result = json.loads(capsys.readouterr().out)
+    assert code == 2 and result["status"] == "incomplete"
+    assert result["corpus"][corpus.NOVELTY] == {"cases": 2, "true": 1, "false": 1}
+    assert len(result["coverage_issues"]) == len(corpus.versions())
+
+
+def test_check_reports_missing_contract_files(tmp_path, capsys, no_http):
+    cases = {k: v for k, v in small_corpus(per_class=25).items() if k == corpus.RELEVANCE}
+    directory = write_corpus(tmp_path / "corpus", cases)
+    assert main(["check", "--corpus", str(directory), "--temp-root", str(tmp_path / "t")]) == 2
+    issues = json.loads(capsys.readouterr().out)["coverage_issues"]
+    assert len(issues) == len(corpus.versions()) - 1
+    assert all("no corpus file" in issue for issue in issues)
+
+
+def test_check_rejects_novelty_case_that_never_reaches_the_judge(tmp_path, capsys, no_http):
+    cases = {corpus.NOVELTY: [novelty_case("d0", None)]}
+    for row in cases[corpus.NOVELTY][0]["existing"]:
+        row["embedding"] = [0, 1]
+    directory = write_corpus(tmp_path / "corpus", cases)
+    assert main(["check", "--corpus", str(directory), "--temp-root", str(tmp_path / "t")]) == 2
+    # Stronger privacy contract: no exception text containing private inputs.
+    assert json.loads(capsys.readouterr().out)["reason"] == "admission_or_processing_failed"
 
 
 def test_corpus_loads_every_contract_and_counts(tmp_path):
@@ -190,3 +229,87 @@ def test_private_production_signatures_this_tool_depends_on():
     )
     # candidate_mapping parses the rendered candidate list; pin its line shape.
     assert "  [{i}] task_type: {" in inspect.getsource(extractor._cross_type_duplicate)
+
+
+def rows(name, outcomes):
+    """``outcomes``: (label, prediction, error, local) per case."""
+    cases, result = [], {}
+    for index, (label, prediction, error, local) in enumerate(outcomes):
+        key = "expected_target" if name == corpus.NOVELTY else "user_passed"
+        value = ("candidate-b" if label else None) if name == corpus.NOVELTY else label
+        cases.append({"id": str(index), key: value})
+        result[str(index)] = run._record(
+            name, cases[-1], {"prediction": prediction, "error": error}, local
+        )
+    return cases, result
+
+def judge_rows(right_false=25, right_true=25, n=25, error=0, local=0):
+    outcomes = [(False, i >= right_false, None, None) for i in range(n)]
+    outcomes += [(True, i < right_true, None, None) for i in range(n)]
+    for i in range(error):
+        outcomes[i] = (False, None, "judge_parse_fail", None)
+    for i in range(local):
+        outcomes[-1 - i] = (True, None, None, "unanswered")
+    return outcomes
+
+@pytest.mark.parametrize(
+    ("outcomes", "status"),
+    [
+        (judge_rows(), "pass"),
+        (judge_rows(right_false=20, right_true=20), "pass"),  # exactly 0.8 per class
+        (judge_rows(right_false=19), "fail"),
+        (judge_rows(n=100, right_false=79, right_true=100), "fail"),  # 0.79 < 0.8
+        (judge_rows(error=1), "fail"),
+        (judge_rows(local=1), "incomplete"),
+        (judge_rows(n=24), "incomplete"),
+    ],
+)
+def test_judge_gate_boundaries(outcomes, status):
+    name = list_rubrics()[0].name
+    assert run.gate(name, *rows(name, outcomes))["status"] == status
+
+def novelty_rows(false_merge=False, wrong_target=False, misses=0, local=False):
+    outcomes = [(False, None, None, None) for _ in range(300)]
+    outcomes += [(True, "candidate-b", None, None) for _ in range(100)]
+    if false_merge:
+        outcomes[0] = (False, "candidate-b", None, None)
+    if wrong_target:
+        outcomes[-1] = (True, "candidate-a", None, None)
+    for i in range(misses):
+        outcomes[300 + i] = (True, None, None, None)
+    if local:
+        outcomes[1] = (False, None, None, "unanswered")
+    return outcomes
+
+@pytest.mark.parametrize(
+    ("outcomes", "status"),
+    [
+        (novelty_rows(), "pass"),
+        (novelty_rows(misses=20), "pass"),
+        (novelty_rows(misses=21), "fail"),
+        (novelty_rows(false_merge=True), "fail"),
+        (novelty_rows(wrong_target=True), "fail"),
+        (novelty_rows(local=True), "incomplete"),
+        (novelty_rows(local=True, wrong_target=True), "fail"),  # zero tolerance wins
+    ],
+)
+def test_novelty_gate_boundaries(outcomes, status):
+    assert run.gate(corpus.NOVELTY, *rows(corpus.NOVELTY, outcomes))["status"] == status
+
+def test_worst_status_order():
+    """A failed repetition is decided, so fail outranks incomplete."""
+    assert run.worst(["pass", "fail"]) == "fail"
+    assert run.worst(["fail", "incomplete", "pass"]) == "fail"
+    assert run.worst(["incomplete", "pass"]) == "incomplete"
+    assert run.worst([]) == "incomplete"
+    # Across independent routes or aliases, remaining work is what the top level says.
+    assert run.worst(["fail", "incomplete"], run.OVERALL) == "incomplete"
+    assert run.worst(["fail", "pass"], run.OVERALL) == "fail"
+
+@pytest.mark.parametrize(
+    ("content", "clamped"), [('{"score": 1.5}', True), ('{"score": 1}', False)]
+)
+def test_clamped_raw_scores_are_counted(content, clamped):
+    assert run._clamped(list_rubrics()[0].name, content) is clamped
+    relevance = content.replace("score", "relevance")
+    assert run._clamped(corpus.RELEVANCE, relevance) is clamped

@@ -1,6 +1,7 @@
 """Original transport regressions adapted to frozen Journal v2 transitions."""
 
 import asyncio
+import copy
 import dataclasses
 import json
 import logging
@@ -10,8 +11,18 @@ import httpx
 import litellm
 import pytest
 
-from genesis.eval.qualification import pinned
+from genesis.eval.qualification import corpus, pinned, run
+from genesis.eval.qualification.__main__ import main
+from genesis.eval.qualification.accounting import Journal
 from genesis.eval.qualification.evidence import Incomplete
+from tests.test_eval.qualification_fixtures import small_corpus, write_corpus
+from tests.test_eval.qualification_runner_fixtures import (  # noqa: F401
+    LabelGateway,
+    instrument,
+    make_router,
+    report_cli,
+    runner_data,
+)
 from tests.test_eval.qualification_transport_fixtures import Gateway, ask, bundle, router
 
 
@@ -67,6 +78,175 @@ async def test_paid_answer_is_reused_offline_without_a_key(env, monkeypatch):
         with pytest.raises(pinned.LocalFailure, match="unanswered"):
             await ask(router(data, offline, dispatch=False), data.messages, "case-2")
     assert not offline.requests and offline.key_reads == 0
+
+
+def test_cli_run_refuses_incomplete_coverage_without_requests(env, monkeypatch, capsys):
+    directory = write_corpus(env / "corpus", small_corpus())
+    assert main(["run", "--alias", "openrouter-mimo", "--campaign", str(env / "campaign"),
+                 "--corpus", str(directory), "--temp-root", str(env)]) == 2
+    assert json.loads(capsys.readouterr().out)["reason"] == "coverage_incomplete"
+    assert not (env / "campaign").exists()
+
+
+async def test_cli_run_qualifies_then_report_rescores_offline(data, monkeypatch, capsys):
+    # The real paid CLI remains unavailable. Exercise acquisition only with the
+    # socket-denied transport instrument, then the actual read-only CLI plumbing.
+    data.gateway = LabelGateway(data)
+    with Journal(data.path, data.manifest) as campaign:
+        records, _ = await run.score(data.cases, make_router(data, campaign, True), data.temp)
+    assert all(r["agreed"] for reps in records.values() for rows in reps.values() for r in rows.values())
+    assert len(data.gateway.requests) == 6
+    monkeypatch.delenv(pinned.KEY_ENV)
+    before = {p.name: p.read_bytes() for p in data.path.iterdir()}
+    assert await asyncio.to_thread(report_cli, data, monkeypatch) == 2  # subset cannot qualify every required route
+    result = json.loads(capsys.readouterr().out)
+    assert result["history"]["dispatched"] == 6
+    assert all(rep["correct"] == 2 and rep["unscored"] == 0
+               for value in result["contracts"].values() for rep in value["repetitions"])
+    assert before == {p.name: p.read_bytes() for p in data.path.iterdir()}
+
+
+async def test_cli_rerun_after_interruption_stays_stopped(data, monkeypatch, capsys):
+    with Journal(data.path, data.manifest) as campaign:
+        campaign.reserve("attempt-0")
+        campaign.dispatch("attempt-0")
+    assert await asyncio.to_thread(report_cli, data, monkeypatch) == 2
+    assert json.loads(capsys.readouterr().out)["history"]["dispatched"] == 1
+    assert not data.gateway.requests and not data.gateway.key_reads
+
+
+async def test_cli_report_against_pairs_two_aliases(data, monkeypatch, capsys):
+    # Independent directories and frozen model identity, not two aliases in one Journal.
+    other = await instrument(data.temp, copy.deepcopy(data.cases), alias="openrouter-deepseek-flash")
+    other.path = data.temp / "flash-campaign"
+    assert other.manifest["binding"]["transports"][other.alias]["model"] == "deepseek/deepseek-v4.1-flash"
+    records = []
+    for item in (data, other):
+        item.gateway = LabelGateway(item)
+        with Journal(item.path, item.manifest) as campaign:
+            scored, _ = await run.score(item.cases, make_router(item, campaign, True), item.temp)
+        records.append(scored)
+    paired = run.pair(data.cases, *records)
+    assert all(row["valid_pairs"] == row["both_correct"] == row["matching_predictions"] == 2
+               for rows in paired.values() for row in rows)
+    assert await asyncio.to_thread(report_cli, data, monkeypatch, "--against", other.alias,
+                                   "--against-campaign", str(other.path)) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert all(row["valid_pairs"] == row["both_correct"] == 2
+               for rows in report["paired"].values() for row in rows)
+    assert await asyncio.to_thread(report_cli, data, monkeypatch, "--against", other.alias,
+                                   "--against-campaign", str(data.path)) == 2
+    assert json.loads(capsys.readouterr().out)["reason"] == "paired_campaigns_invalid"
+
+
+async def test_cli_report_marks_changed_prompts_unanswered(data, monkeypatch, capsys):
+    with Journal(data.path, data.manifest):
+        pass
+    next(iter(data.cases.values()))[0]["actual"] += " edited"
+    assert await asyncio.to_thread(report_cli, data, monkeypatch) == 2
+    report = json.loads(capsys.readouterr().out)
+    assert all(rep["unscored"] == 2 and rep["errors"] == 0
+               for value in report["contracts"].values() for rep in value["repetitions"])
+
+
+async def test_malformed_answer_is_a_model_error_not_a_local_failure(data):
+    data.gateway.answer = "not a judgment"
+    with Journal(data.path, data.manifest) as campaign:
+        records, clamped = await run.score(data.cases, make_router(data, campaign, True), data.temp)
+        report = run.summarize(data.alias, data.cases, records, clamped, campaign)
+    assert all(rep["errors"] == 2 and rep["unscored"] == 0
+               for value in report["contracts"].values() for rep in value["repetitions"])
+
+
+@pytest.mark.parametrize("alias", ["openrouter-mimo", "deepseek-chat"])
+def test_cli_invalid_params_or_alias_create_no_campaign(env, monkeypatch, capsys, alias):
+    directory = write_corpus(env / "corpus", small_corpus())
+    path = env / "params.json"
+    path.write_text(json.dumps({alias: {"upstream": "x"}}))
+    assert main(["report", "--alias", alias, "--campaign", str(env / "campaign"),
+                 "--params", str(path), "--corpus", str(directory), "--temp-root", str(env)]) == 2
+    assert json.loads(capsys.readouterr().out)["status"] == "incomplete"
+    assert not (env / "campaign").exists()
+
+
+async def test_evidence_write_error_is_a_local_failure_not_a_model_error(data, monkeypatch):
+    with Journal(data.path, data.manifest) as campaign:
+        def fail(*_args, **_kwargs):
+            raise OSError("synthetic full disk")
+
+        monkeypatch.setattr(campaign, "observe", fail)
+        records, _ = await run.score(data.cases, make_router(data, campaign, True), data.temp)
+    assert len(data.gateway.requests) == 1
+    assert all(row["local"] and not row["error"]
+               for reps in records.values() for rows in reps.values() for row in rows.values())
+
+
+async def test_editing_the_corpus_mid_run_cannot_change_what_is_graded(data, monkeypatch):
+    # Public qualify detaches inputs before its first await. This direct scorer
+    # probe uses the same detached snapshot while an observer changes the original.
+    frozen = copy.deepcopy(data.cases)
+    original = data.gateway.__call__
+
+    def edit(request):
+        if request.method == "POST":
+            next(iter(data.cases.values()))[0]["actual"] += " edited"
+        return original(request)
+
+    with Journal(data.path, data.manifest) as campaign:
+        candidate = make_router(data, campaign, True)
+        candidate.transport = httpx.MockTransport(edit)
+        records, _ = await run.score(frozen, candidate, data.temp)
+    assert len(data.gateway.requests) == 6
+    assert all(not row["local"] for reps in records.values() for rows in reps.values() for row in rows.values())
+
+
+async def test_unanswered_relevance_case_is_unscored_not_a_model_error(data):
+    current = await instrument(data.temp, {corpus.RELEVANCE: small_corpus()[corpus.RELEVANCE]})
+    with Journal(current.path, current.manifest):
+        pass
+    records, _ = await run.score(current.cases, make_router(current, run.ReadView(current.path), False), current.temp)
+    assert all(row["local"] == "unanswered" and not row["error"]
+               for reps in records.values() for rows in reps.values() for row in rows.values())
+
+
+async def test_a_prompt_the_router_cannot_match_is_unscored_not_a_model_error(data, monkeypatch):
+    from genesis.eval import scorers
+
+    monkeypatch.setattr(scorers, "render_rubric_prompt", lambda *_args: "different prompt")
+    with Journal(data.path, data.manifest) as campaign:
+        records, _ = await run.score(data.cases, make_router(data, campaign, True), data.temp)
+    assert not data.gateway.requests
+    assert all(row["local"] and not row["error"]
+               for reps in records.values() for rows in reps.values() for row in rows.values())
+
+
+def test_a_failed_route_does_not_close_a_route_still_open(env, monkeypatch, capsys):
+    cases = small_corpus(novelty=False)
+    monkeypatch.setattr(corpus, "DEFAULT_FLOOR", {False: 1, True: 1})
+    records = {name: {rep: {case["id"]: run._record(name, case, {"prediction": False, "error": None})
+                           for case in items} for rep in run.REPETITIONS} for name, items in cases.items()}
+    report = run.summarize("openrouter-mimo", cases, records, dict.fromkeys(cases, 0), None)
+    assert report["routes"] == {"judge": "fail", "novelty": "incomplete"}
+    assert report["status"] == "incomplete"
+
+
+async def test_served_cases_do_not_leak_between_contracts_sharing_case_ids(data, monkeypatch):
+    candidates = dict(list(small_corpus(novelty=False).items())[:2])
+    for items in candidates.values():
+        for index, case in enumerate(items):
+            case["id"] = f"shared-{index}"
+    current = await instrument(data.temp, candidates)
+    current.gateway = LabelGateway(current)
+    first, second = candidates
+    from genesis.eval import scorers
+
+    actual = scorers.render_rubric_prompt
+    monkeypatch.setattr(scorers, "render_rubric_prompt",
+                        lambda rubric, *args: "different prompt" if rubric.name == second else actual(rubric, *args))
+    with Journal(current.path, current.manifest) as campaign:
+        records, _ = await run.score(current.cases, make_router(current, campaign, True), current.temp)
+    assert all(row["agreed"] for rows in records[first].values() for row in rows.values())
+    assert all(row["local"] and not row["error"] for rows in records[second].values() for row in rows.values())
 
 
 async def test_request_cap_counts_dispatch_lines_across_restarts(env):
