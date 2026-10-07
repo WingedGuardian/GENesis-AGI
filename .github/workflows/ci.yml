@@ -1124,8 +1124,12 @@ jobs:
         # cases: 2 retained historical regressions plus 93 new accounting and
         # recovery cases. Main has none of this package's original 231 cases.
         # Floor: 24421 + 95 = 24516; no added skips, ceiling unchanged.
-        # Checkout mutation fence (#2870): +31 collected tests, measured with
-        # --collect-only against main's versions of the ten changed test files
-        # (test_checkout_lock.py 8 + 7 new, invoker +8, child_env +1, deploy/update/
-        # candidate lock tests +7); no added skips. Floor: 24516 + 31 = 24547.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24547
+        # Reference admission: 23 preserved +98 boundary +246 actor-role cases.
+        # Floor: 24516 +367 =24883; no added skips, ceiling unchanged.
+        #
+        # Checkout mutation fence (#2870): +32 collected tests, measured with
+        # --collect-only against main's versions of the changed test files
+        # (checkout-lock shell and Python tests, invoker +8, child_env +1,
+        # deploy/update/candidate lock tests); no added skips.
+        # Floor: 24883 + 32 = 24915.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24915
