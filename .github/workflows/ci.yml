@@ -1124,9 +1124,12 @@ jobs:
         # cases: 2 retained historical regressions plus 93 new accounting and
         # recovery cases. Main has none of this package's original 231 cases.
         # Floor: 24421 + 95 = 24516; no added skips, ceiling unchanged.
+        # Reference admission: 23 preserved +98 boundary +246 actor-role cases.
+        # Floor: 24516 +367 =24883; no added skips, ceiling unchanged.
+        #
         # Crash recovery (#2632), measured with --collect-only against main's
-        # versions of the changed test files: test_bootstrap_guards.py 29 -> 57
-        # (+28), test_deploy_candidates_drop_status.py 68 -> 69 (+1),
-        # test_deploy_checkout.py 51 -> 52 (+1); the other five are unchanged.
-        # No added skips. Floor: 24516 + 30 = 24546; skip ceiling remains 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24546
+        # versions of the changed test files: test_bootstrap_guards.py 29 -> 59
+        # (+30), test_deploy_candidates_drop_status.py 68 -> 69 (+1),
+        # test_deploy_checkout.py 51 -> 52 (+1); the others are unchanged.
+        # No added skips. Floor: 24883 + 32 = 24915; skip ceiling remains 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24915
