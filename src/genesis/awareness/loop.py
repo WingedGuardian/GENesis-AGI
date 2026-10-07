@@ -2752,6 +2752,13 @@ async def _check_provider_outage_notify(db) -> None:
         provider_still_failing = None
         current_incident_identity = None
         incident_owner = None
+        # SEVERITY FOLLOWS COVERAGE: a dead provider pages (critical) only when
+        # an essential call site that uses it has no available provider left.
+        # Otherwise its notice is "high" — dashboard + morning report, not
+        # Telegram — because fallback is working. Unknown coverage keeps the
+        # mode's priority. (MEASURED 2026-10-07: neither the NIM nor the Gemini
+        # outage that paged critical left any essential site uncovered.)
+        coverage_for = None
         try:
             from genesis.routing.types import ProviderState
             from genesis.runtime import GenesisRuntime
@@ -2762,6 +2769,38 @@ async def _check_provider_outage_notify(db) -> None:
                 incident_owner = _breakers.incident_owner
                 def provider_still_failing(name, _reg=_breakers):
                     return _reg.get(name).state != ProviderState.CLOSED
+
+                coverage_for = _breakers.uncovered_essential_sites_for
+                # The router skips some providers whose breakers read healthy:
+                # a spent daily quota, and a paid one on a never_pays site or
+                # while the spend budget is exceeded (router.py's chain walk and
+                # _filter_chain). Those cover nothing.
+                _router = getattr(GenesisRuntime.instance(), "_router", None)
+                if _router is not None:
+                    _ledger = getattr(_router, "_daily_budget", None)
+                    _exceeded = False
+                    try:
+                        from genesis.routing.types import BudgetStatus
+
+                        _ct = getattr(_router, "cost_tracker", None)
+                        if _ct is not None:
+                            _exceeded = await _ct.check_budget() == BudgetStatus.EXCEEDED
+                    except Exception:
+                        _exceeded = False  # unknown: the breaker's word stands
+
+                    def _ineligible(name, site, _r=_router, _l=_ledger, _x=_exceeded):
+                        cfg = _r.config.providers.get(name)
+                        if cfg is None:
+                            return False
+                        if _l is not None and _l.exhausted(cfg):
+                            return True
+                        if not cfg.is_free:
+                            cs = _r.config.call_sites.get(site)
+                            return _x or bool(cs is not None and cs.never_pays)
+                        return False
+
+                    def coverage_for(name, _reg=_breakers, _d=_ineligible):
+                        return _reg.uncovered_essential_sites_for(name, also_unavailable=_d)
         except Exception:
             provider_still_failing = None
 
@@ -2773,12 +2812,15 @@ async def _check_provider_outage_notify(db) -> None:
             # nothing. Resolve the demoted rows; the sweep below re-creates
             # them at critical in this same tick, which delivers the pending
             # notification — the point of turning the lever up.
-            await _promote_demoted_provider_notify(db)
+            await _promote_demoted_provider_notify(
+                db, coverage_for=coverage_for, incident_owner=incident_owner,
+            )
 
         written = await sweep_due_notifications(
             db, priority=priority, provider_still_failing=provider_still_failing,
             current_incident_identity=current_incident_identity,
             incident_owner=incident_owner,
+            coverage_for=coverage_for,
         )
         if written:
             logger.info(
@@ -2816,18 +2858,42 @@ async def _open_notify_rows(db) -> list[dict]:
     return out
 
 
-async def _promote_demoted_provider_notify(db) -> None:
+async def _promote_demoted_provider_notify(
+    db, *, coverage_for=None, incident_owner=None,
+) -> None:
     """Resolve high-priority notify rows so live mode can rewrite them critical.
 
     Without this, a row written under `propose_only` blocks the critical write
     via `skip_if_duplicate` (dedup keys exclude priority) and upgrading the
     lever silently delivers nothing — found at review.
+
+    With ``coverage_for``, only rows whose provider would be written critical
+    NOW are resolved (an essential site it serves is uncovered, or coverage is
+    unknown). A covered provider's row is high on purpose: resolving it would
+    only have the sweep re-create it at high, every tick. A row whose provider
+    later becomes the cause of an uncovered site is promoted then.
     """
     try:
+        import json as _json
+
         from genesis.db.crud import observations
 
+        def _now_critical(row) -> bool:
+            if coverage_for is None:
+                return True
+            try:
+                blob = _json.loads(row.get("content") or "")
+                name = blob.get("provider")
+                if incident_owner is not None:  # same mapping as the sweep
+                    name = incident_owner(name, blob.get("incident_identity"))
+                if name is None:
+                    return True
+                return coverage_for(name) != []
+            except Exception:
+                return True  # unknown → the sweep keeps critical, so promote
+
         demoted = [r["id"] for r in await _open_notify_rows(db)
-                   if r.get("priority") == "high"]
+                   if r.get("priority") == "high" and _now_critical(r)]
         if demoted:
             from datetime import UTC, datetime
 
@@ -2836,7 +2902,8 @@ async def _promote_demoted_provider_notify(db) -> None:
                 demoted,
                 resolved_at=datetime.now(UTC).isoformat(),
                 resolution_notes=(
-                    "superseded: lever raised to live — re-created at critical"
+                    "superseded: lever raised to live, or essential coverage lost — "
+                    "re-created at critical"
                 ),
             )
             logger.info(

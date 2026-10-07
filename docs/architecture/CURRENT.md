@@ -2900,7 +2900,14 @@ verified: b0867170e8e3 2026-10-02
   when traffic stopped and its per-process flags produced four review defects.
   Lever: `provider_outage_notify` domain (off/propose_only/live) +
   `GENESIS_PROVIDER_NOTIFY_DISABLED`; off resolves open notify rows (so off→on
-  re-notifies a still-dead provider, deliberately). Recovery resolves BOTH
+  re-notifies a still-dead provider, deliberately). **Severity follows essential
+  coverage** (2026-10-07): in `live` mode the notice is `critical` (Telegram)
+  only while an essential call site that lists the provider has no available
+  provider left (`CircuitBreakerRegistry.uncovered_essential_sites_for`); while
+  fallback covers every such site it is written `high` (dashboard + morning
+  report) and says so. Unknown coverage keeps `critical`. A `high` row is
+  promoted (resolved, re-created critical) only when its provider becomes the
+  cause of an uncovered site, so covered outages never churn. Recovery resolves BOTH
   hashes — **notify hash FIRST**: the two
   are separately committed (this connection has no transactions), so a failure
   between them must leave the VISIBLE row open (a provider shown as failing when
