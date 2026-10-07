@@ -1286,7 +1286,9 @@ async def _synthesize_and_deprecate(
     median_confidence = statistics.median(source_confidences)
     _CONFIDENCE_CEILING = 0.85
 
-    new_memory_id = await store.store(
+    # store_reporting_creation, not store(): rollback COMPENSATES for this write
+    # by hard-deleting the synthesis, so it must know whether the id is new.
+    new_memory_id, created = await store.store_reporting_creation(
         synthesis["content"],
         source="dream_cycle",
         memory_type="episodic",
@@ -1297,6 +1299,17 @@ async def _synthesize_and_deprecate(
         room=synthesis.get("room", room),
         auto_link=False,  # We create provenance links explicitly below
     )
+
+    # Exact-content dedup handed back an EXISTING memory (one of this cluster's
+    # originals, an earlier synthesis, or anything else). Every write below
+    # would then go wrong: it would be stamped as this run's synthesis, which
+    # rollback HARD-DELETES, and the originals would point at a memory this run
+    # did not create (or, for an original, at themselves). The dedup is a pure
+    # read, so blocking here leaves nothing behind.
+    if not created:
+        raise SynthesisBlockedError(
+            error=f"synthesis deduplicated onto existing memory {new_memory_id[:8]}",
+        )
 
     # Set synthesized_from on the new memory's Qdrant payload
     from genesis.qdrant.collections import update_payload
@@ -1332,10 +1345,15 @@ async def _synthesize_and_deprecate(
             # SQLite: mark as deprecated. deprecated_at is the authoritative
             # deprecation time for link aging — the synthesis's created_at is
             # unreliable (store()'s exact-dedup can return an old memory).
+            # superseded_by/superseded_at record the synthesis as successor in
+            # SQLite (same columns as memory_crud.mark_superseded), not only in
+            # Qdrant's synthesized_into. No recall path reads it yet; the edge
+            # re-attach (#2993) and forward-pointing recall will.
             await db.execute(
                 "UPDATE memory_metadata SET deprecated = 1, "
-                "dream_cycle_run_id = ?, deprecated_at = ? WHERE memory_id = ?",
-                (run_id, deprecated_at, original_id),
+                "dream_cycle_run_id = ?, deprecated_at = ?, "
+                "superseded_by = ?, superseded_at = ? WHERE memory_id = ?",
+                (run_id, deprecated_at, new_memory_id, deprecated_at, original_id),
             )
             deprecated_count += 1
         except Exception:
@@ -1441,7 +1459,8 @@ async def rollback(
         try:
             await db.execute(
                 "UPDATE memory_metadata SET deprecated = 0, "
-                "dream_cycle_run_id = NULL, deprecated_at = NULL WHERE memory_id = ?",
+                "dream_cycle_run_id = NULL, deprecated_at = NULL, "
+                "superseded_by = NULL, superseded_at = NULL WHERE memory_id = ?",
                 (mid,),
             )
             update_payload(

@@ -442,7 +442,9 @@ async def _deprecate_memory(
     """Two-layer deprecation: Qdrant payload + SQLite metadata.
 
     Mirrors the deprecation logic in ``dream_cycle._synthesize_and_deprecate``
-    but without creating a new synthesized memory.
+    but without creating a new synthesized memory — and without copying edges
+    onto the survivor, which is why ``deprecated_at`` is not stamped here
+    (issue #2993 tracks the edge rewire).
     """
     from genesis.qdrant.collections import update_payload
 
@@ -457,10 +459,20 @@ async def _deprecate_memory(
         },
     )
 
-    # SQLite: mark as deprecated
+    # SQLite: mark as deprecated and record the survivor as the successor, so
+    # the forward pointer lives in SQLite and not only in Qdrant's
+    # ``merged_into``. No recall path reads it yet; the edge re-attach (#2993)
+    # and forward-pointing recall will. Same columns as the explicit supersede
+    # path (``memory_crud.mark_superseded``).
+    #
+    # ``deprecated_at`` is deliberately NOT stamped: dream_link_repair prunes
+    # the edges of any memory whose ``deprecated_at`` has aged past the window,
+    # and this merge copies no edges onto the survivor, so stamping it would
+    # delete the retired memory's graph connections outright.
     await db.execute(
         "UPDATE memory_metadata SET deprecated = 1, "
-        "dream_cycle_run_id = ? WHERE memory_id = ?",
-        (run_id, memory_id),
+        "dream_cycle_run_id = ?, superseded_by = ?, superseded_at = ? "
+        "WHERE memory_id = ?",
+        (run_id, survivor_id, datetime.now(UTC).isoformat(), memory_id),
     )
     await db.commit()

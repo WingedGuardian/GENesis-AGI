@@ -513,10 +513,18 @@ async def mark_superseded(
 
     Sets ``deprecated=1``, ``superseded_by``, and ``superseded_at``.
     Returns True if the memory was found and updated.
+
+    Also clears ``dream_cycle_run_id``: an explicit supersession now owns the
+    row, so a dream-run rollback must not un-deprecate it or erase this
+    pointer, and the supersede repair path must recognise it as committed.
+    On a dream SYNTHESIS row this also drops its ``synthesis:`` stamp: rollback
+    then leaves it deprecated instead of hard-deleting a memory someone
+    explicitly referenced, at the cost of its ``extends`` provenance edges
+    losing link repair's exemption. That trade is deliberate.
     """
     cursor = await db.execute(
         "UPDATE memory_metadata SET deprecated = 1, "
-        "superseded_by = ?, superseded_at = ? "
+        "superseded_by = ?, superseded_at = ?, dream_cycle_run_id = NULL "
         "WHERE memory_id = ?",
         (new_id, timestamp, old_id),
     )
@@ -531,8 +539,8 @@ async def get_metadata(
     """Return metadata row for a memory_id, or None if not found."""
     rows = await db.execute_fetchall(
         "SELECT memory_id, collection, embedding_status, deprecated, "
-        "superseded_by, superseded_at, invalid_at FROM memory_metadata "
-        "WHERE memory_id = ?",
+        "superseded_by, superseded_at, invalid_at, dream_cycle_run_id "
+        "FROM memory_metadata WHERE memory_id = ?",
         (memory_id,),
     )
     row = rows[0] if rows else None
@@ -546,6 +554,9 @@ async def get_metadata(
         "superseded_by": row[4],
         "superseded_at": row[5],
         "invalid_at": row[6],
+        # Non-NULL when the dream cycle retired this row: its superseded_by was
+        # written by consolidation, not by an explicit supersede.
+        "dream_cycle_run_id": row[7],
     }
 
 

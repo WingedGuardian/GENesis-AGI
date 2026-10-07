@@ -115,3 +115,45 @@ async def test_survivor_is_the_load_bearing_memory(db, monkeypatch):
     rows = await _audit_rows(db)
     assert rows[0]["action"] == "auto_merge"
     assert rows[0]["survivor_id"] == "a"  # older but load-bearing survives
+
+
+async def _meta(db, memory_id):
+    cur = await db.execute(
+        "SELECT deprecated, superseded_by, superseded_at, deprecated_at, "
+        "dream_cycle_run_id FROM memory_metadata WHERE memory_id = ?",
+        (memory_id,),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+@pytest.mark.asyncio
+async def test_merge_records_the_survivor_in_sqlite(db, monkeypatch):
+    """A merged-away memory must name its survivor in SQLite, not only in the
+    Qdrant payload: recall's "point forward" and the supersession chain read
+    ``superseded_by``. ``deprecated_at`` stays NULL on purpose — it arms
+    dream_link_repair's aged-edge prune, and an entity merge copies no edges
+    onto the survivor, so stamping it would delete the retired memory's edges."""
+    for pid in ("a", "b"):
+        await db.execute(
+            "INSERT INTO memory_metadata (memory_id, created_at, deprecated) "
+            "VALUES (?, ?, 0)",
+            (pid, NOW.isoformat()),
+        )
+    await db.commit()
+    older = NOW - timedelta(days=1)
+    a = _point("a", confidence=0.8, retrieved_count=9, created_at=older)
+    b = _point("b", confidence=0.8, retrieved_count=0, created_at=NOW)
+
+    report = await _run(db, a, b, 0.99, monkeypatch)
+
+    assert report["auto_merged"] == 1
+    retired = await _meta(db, "b")
+    assert retired["deprecated"] == 1
+    assert retired["dream_cycle_run_id"] == "test-run"
+    assert retired["superseded_by"] == "a"
+    assert retired["superseded_at"] is not None
+    assert retired["deprecated_at"] is None
+    survivor = await _meta(db, "a")
+    assert survivor["deprecated"] == 0
+    assert survivor["superseded_by"] is None
