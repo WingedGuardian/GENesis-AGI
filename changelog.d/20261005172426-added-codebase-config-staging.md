@@ -1,1 +1,1 @@
-- Add explicit pinned Codebase configuration staging and read-only diagnostics; setup preserves existing settings, failed staging and the machine disable switch, without activating a provider.
+- Add explicit pinned Codebase configuration staging and read-only diagnostics; setup synchronizes staged files and directory entries before immutable publication, preserves failed staging and the machine disable switch, and reports incompatible builds while limiting the environment path override to status.

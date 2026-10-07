@@ -38,6 +38,12 @@ Configure creates private `bin`, `cache` and `runtime` directories under that
 state path. It verifies the source executable, copies and re-verifies it, sets
 the provider's `auto_index`, `auto_watch` and `watcher_enabled` settings to false,
 disables its UI and verifies the resulting cache before publishing settings.
+The validation database handle is closed, every staged file is synchronized,
+and staging directories are synchronized from children through the first
+existing ancestor. Newly created settings-parent entries are made durable
+before publication; the final settings-directory synchronization follows the
+no-clobber link. These separate file and directory barriers follow
+[fsync(2)](https://man7.org/linux/man-pages/man2/fsync.2.html).
 These native `config set` calls initialize only the selected cache/runtime;
 they do not index the repository or start a query daemon.
 
@@ -92,12 +98,17 @@ python3 -I scripts/codebase_managed.py --config /absolute/settings.json status
 ```
 
 `CODEBASE_MEMORY_MCP_MANAGED_CONFIG` supplies the default diagnostic override;
-an empty override uses the standard path. Status does not execute the provider
+it applies only to `status`. An explicit `--config` wins; an empty override uses
+the standard path. `configure` always uses the installed default unless an
+explicit argument names it, and refuses an explicit nondefault path.
+Status does not execute the provider
 or mutate settings. It returns JSON with separate settings and manager errors,
 including when settings are missing, malformed, old, or unresolvable. A zero
 status exit means the diagnostic completed, not that execution is ready.
 Diagnostic settings include only known scalar metadata; unknown fields and
 deeply nested invalid values cannot prevent reporting manager state.
+An incompatible build populates `settings_error` while retaining its metadata
+and independently reporting systemd status.
 
 Existing settings and state are never refreshed in place. Schema 1 and other
 builds remain diagnosable, but are not valid schema-2 execution configurations.

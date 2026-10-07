@@ -258,7 +258,9 @@ each archive that fails to upload, marks the off-site copy `partial`
 (`offsite_confirmed: false`, `extras_complete: false`) and sends the off-site
 alert, again whenever the set of missing directories changes. The core snapshot is still marked complete
 (`offsite_core_complete: true`), retention still runs, and a later failure of the
-core off-site copy still alerts on its own. The snapshot's `COMPLETE` marker
+core off-site copy still alerts on its own. `scripts/update.sh` reports such an
+extras-only gap as `backup:tier2_extras`, distinct from a real off-site failure
+(`backup:tier2`). The snapshot's `COMPLETE` marker
 lists the extra archives it holds and the listed directories it skipped, so a
 restore can tell "none" apart from "could not list them" and can name what a
 snapshot is missing; `.extra-manifest` in the backups checkout does the same for a

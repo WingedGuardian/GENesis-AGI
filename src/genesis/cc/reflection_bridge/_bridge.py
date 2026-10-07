@@ -39,6 +39,7 @@ from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.session_context import set_session_id as _set_obs_session
 from genesis.observability.spans import SpanKind, start_span
 from genesis.perception.types import ReflectionResult
+from genesis.util.inflight import inflight
 
 if TYPE_CHECKING:
     from genesis.cc.protocol import AgentProvider
@@ -189,7 +190,9 @@ class CCReflectionBridge:
     def _model_for_depth(self, depth: Depth) -> CCModel:
         return model_for_depth(depth)
 
-    def _effort_for_context(self, depth: Depth, tick=None, escalation_source: str | None = None) -> EffortLevel:
+    def _effort_for_context(
+        self, depth: Depth, tick=None, escalation_source: str | None = None
+    ) -> EffortLevel:
         """Effort level per depth — config-driven via the reflection_models domain."""
         # GROUNDWORK(v4-executor): escalation_source will drive executor effort.
         if depth == Depth.DEEP and escalation_source:
@@ -216,7 +219,10 @@ class CCReflectionBridge:
         return ReflectionResult(success=False, reason=f"CC throttled — {work_type} deferred")
 
     def _check_dispatch_gate(
-        self, depth: Depth, *, earned_level: int | None = None,
+        self,
+        depth: Depth,
+        *,
+        earned_level: int | None = None,
     ) -> ReflectionResult | None:
         """Pre-dispatch autonomy gate."""
         required_level = _DEPTH_AUTONOMY_LEVEL.get(depth, 1)
@@ -231,7 +237,8 @@ class CCReflectionBridge:
         if decision == ApprovalDecision.BLOCK:
             logger.warning(
                 "Dispatch gate BLOCKED %s reflection (required L%d, ceiling exceeded)",
-                depth.value, required_level,
+                depth.value,
+                required_level,
             )
             return ReflectionResult(
                 success=False,
@@ -240,12 +247,17 @@ class CCReflectionBridge:
         if decision == ApprovalDecision.PROPOSE:
             logger.info(
                 "Dispatch gate PROPOSE for %s reflection (required L%d) — proceeding in V3",
-                depth.value, required_level,
+                depth.value,
+                required_level,
             )
         return None
 
     async def reflect(
-        self, depth: Depth, tick, *, db,
+        self,
+        depth: Depth,
+        tick,
+        *,
+        db,
         escalation_source: str | None = None,
         skip_approval: bool = False,
     ) -> ReflectionResult:
@@ -255,23 +267,39 @@ class CCReflectionBridge:
         nest under it (one trace per cycle). Best-effort — a no-op when capture
         is disabled; never alters reflection behavior.
         """
-        with start_span(
-            "reflection.cycle",
-            SpanKind.OPERATION,
-            attributes={"depth": getattr(depth, "value", str(depth))},
-        ) as span:
+        with (
+            start_span(
+                "reflection.cycle",
+                SpanKind.OPERATION,
+                attributes={"depth": getattr(depth, "value", str(depth))},
+            ) as span,
+            contextlib.ExitStack() as units,
+        ):
+            # A CLI reflection registers as in-flight work from its session's
+            # creation until this returns: the corpus recording, routing and
+            # delivery after the Claude run are lost to a restart too
+            # (genesis.util.inflight). An API-only reflection registers nothing.
             result = await self._reflect_inner(
-                depth, tick, db=db,
-                escalation_source=escalation_source, skip_approval=skip_approval,
+                depth,
+                tick,
+                db=db,
+                escalation_source=escalation_source,
+                skip_approval=skip_approval,
+                inflight_units=units,
             )
             with contextlib.suppress(Exception):
                 span.set_attr("success", result.success)
             return result
 
     async def _reflect_inner(
-        self, depth: Depth, tick, *, db,
+        self,
+        depth: Depth,
+        tick,
+        *,
+        db,
         escalation_source: str | None = None,
         skip_approval: bool = False,
+        inflight_units: contextlib.ExitStack | None = None,
     ) -> ReflectionResult:
         """Run reflection via CC background session or API fallback."""
         # Check CC budget before proceeding
@@ -299,7 +327,9 @@ class CCReflectionBridge:
 
         # 1. Build prompt
         prompt, gathered_obs_ids, gathered_surplus_ids = await build_reflection_prompt(
-            depth, tick, db=db,
+            depth,
+            tick,
+            db=db,
             context_gatherer=self._context_gatherer,
             context_assembler=self._context_assembler,
             prompt_dir=self._prompt_dir,
@@ -311,9 +341,7 @@ class CCReflectionBridge:
         # DEEP/STRATEGIC load the genesis-only "reflection" profile. The helper
         # derives the read-only denylist and sets strict so user-scoped
         # ~/.claude.json servers can't leak in (--mcp-config is additive without it).
-        _reflection_profile = (
-            "reflection" if depth in (Depth.DEEP, Depth.STRATEGIC) else "none"
-        )
+        _reflection_profile = "reflection" if depth in (Depth.DEEP, Depth.STRATEGIC) else "none"
         _lockdown = _reflection_lockdown_kwargs(_reflection_profile)
         invocation = CCInvocation(
             prompt=prompt,
@@ -375,6 +403,12 @@ class CCReflectionBridge:
                 )
                 session_id = sess["id"]
                 _set_obs_session(session_id)
+                if inflight_units is not None:
+                    inflight_units.enter_context(
+                        inflight(
+                            "reflection", f"reflection_{depth.value.lower()}", item_id=session_id
+                        )
+                    )
             except Exception:
                 logger.exception("Failed to create background session for %s", depth.value)
                 return ReflectionResult(success=False, reason="Session creation failed")
@@ -391,17 +425,17 @@ class CCReflectionBridge:
         # Model downgrade response (Layer 2)
         if used_cli and output.downgraded and depth == Depth.STRATEGIC:
             logger.warning(
-                "Strategic reflection got downgraded model (%s -> %s), "
-                "retrying after %ds backoff",
-                model, output.model_used, _DOWNGRADE_RETRY_BACKOFF_S,
+                "Strategic reflection got downgraded model (%s -> %s), retrying after %ds backoff",
+                model,
+                output.model_used,
+                _DOWNGRADE_RETRY_BACKOFF_S,
             )
             await asyncio.sleep(_DOWNGRADE_RETRY_BACKOFF_S)
             try:
                 retry_output = await self._invoker.run(invocation)
             except Exception:
                 logger.warning(
-                    "Strategic reflection retry failed, using original "
-                    "downgraded output",
+                    "Strategic reflection retry failed, using original downgraded output",
                     exc_info=True,
                 )
                 retry_output = None
@@ -416,8 +450,10 @@ class CCReflectionBridge:
                 output = retry_output
                 if self._event_bus:
                     from genesis.observability.types import Severity, Subsystem
+
                     await self._event_bus.emit(
-                        Subsystem.REFLECTION, Severity.WARNING,
+                        Subsystem.REFLECTION,
+                        Severity.WARNING,
                         "reflection.model_degraded",
                         f"Strategic reflection fell back from {model} to "
                         f"{retry_output.model_used} after retry",
@@ -428,12 +464,15 @@ class CCReflectionBridge:
         elif used_cli and output.downgraded and depth == Depth.DEEP:
             logger.warning(
                 "Deep reflection model downgraded (%s -> %s), proceeding with weaker model",
-                model, output.model_used,
+                model,
+                output.model_used,
             )
             if self._event_bus:
                 from genesis.observability.types import Severity, Subsystem
+
                 await self._event_bus.emit(
-                    Subsystem.REFLECTION, Severity.WARNING,
+                    Subsystem.REFLECTION,
+                    Severity.WARNING,
                     "reflection.model_degraded",
                     f"Deep reflection fell back from {model} to {output.model_used}",
                     requested_model=str(model),
@@ -446,17 +485,22 @@ class CCReflectionBridge:
         if used_cli and session_id and not session_id.startswith("api:") and output.session_id:
             try:
                 await cc_sessions_crud.update_cc_session_id(
-                    self._db, session_id, cc_session_id=output.session_id,
+                    self._db,
+                    session_id,
+                    cc_session_id=output.session_id,
                 )
             except Exception:
                 logger.warning(
                     "Failed to write cc_session_id for %s",
-                    session_id[:8], exc_info=True,
+                    session_id[:8],
+                    exc_info=True,
                 )
 
         if output.is_error:
             logger.error(
-                "CC %s reflection failed: %s", depth.value, output.error_message,
+                "CC %s reflection failed: %s",
+                depth.value,
+                output.error_message,
             )
             if used_cli:
                 await self._session_manager.fail(session_id, reason=output.error_message)
@@ -471,8 +515,10 @@ class CCReflectionBridge:
             )
 
             await record_last_run(
-                db, _DEPTH_CALL_SITE.get(depth, f"cc_reflection_{depth.value.lower()}"),
-                provider="cc", model_id=output.model_used or str(model),
+                db,
+                _DEPTH_CALL_SITE.get(depth, f"cc_reflection_{depth.value.lower()}"),
+                provider="cc",
+                model_id=output.model_used or str(model),
                 response_text=output.text,
                 input_tokens=output.input_tokens,
                 output_tokens=output.output_tokens,
@@ -482,6 +528,7 @@ class CCReflectionBridge:
         try:
             from genesis.cc.reflection_bridge._prompts import _light_focus_area
             from genesis.db.crud import reflection_corpus
+
             _focus = _light_focus_area(tick) if depth == Depth.LIGHT else None
             await reflection_corpus.record(
                 db,
@@ -512,8 +559,10 @@ class CCReflectionBridge:
                 )
                 if self._event_bus:
                     from genesis.observability.types import Severity, Subsystem
+
                     await self._event_bus.emit(
-                        Subsystem.REFLECTION, Severity.WARNING,
+                        Subsystem.REFLECTION,
+                        Severity.WARNING,
                         "deep_reflection.salvaged",
                         "Deep reflection ended in prose; structured JSON re-derived via salvage",
                         depth=depth.value,
@@ -524,12 +573,12 @@ class CCReflectionBridge:
         if self._output_router and depth == Depth.DEEP:
             try:
                 routing_summary = await route_deep_output(
-                    deep_text, db=db, output_router=self._output_router,
+                    deep_text,
+                    db=db,
+                    output_router=self._output_router,
                     gathered_obs_ids=gathered_obs_ids,
                     gathered_surplus_ids=gathered_surplus_ids,
-                    tick_signal_names=(
-                        {s.name for s in tick.signals} if tick.signals else None
-                    ),
+                    tick_signal_names=({s.name for s in tick.signals} if tick.signals else None),
                 )
                 if routing_summary.get("parse_failed") or routing_summary.get("empty_output"):
                     routing_failed = True
@@ -546,6 +595,7 @@ class CCReflectionBridge:
             if gathered_obs_ids and output.text and output.text.strip():
                 try:
                     from genesis.db.crud import observations
+
                     await observations.mark_influenced_batch(db, list(gathered_obs_ids))
                 except Exception:
                     logger.warning("Failed to mark influenced observations", exc_info=True)
@@ -554,7 +604,9 @@ class CCReflectionBridge:
         # Use the salvaged JSON (deep_text) so a prose-ended deep reflection shows
         # a real summary instead of the "not parseable" stub.
         await send_to_topic(
-            session_id, depth, format_topic_summary(depth, output, text=deep_text),
+            session_id,
+            depth,
+            format_topic_summary(depth, output, text=deep_text),
             topic_manager=self._topic_manager,
         )
 
@@ -562,7 +614,9 @@ class CCReflectionBridge:
             "%s %s reflection completed (cost=$%.4f, tokens=%d+%d)",
             "CLI" if used_cli else "API",
             depth.value,
-            output.cost_usd, output.input_tokens, output.output_tokens,
+            output.cost_usd,
+            output.input_tokens,
+            output.output_tokens,
         )
 
         if routing_failed:
@@ -579,7 +633,12 @@ class CCReflectionBridge:
     # ── Weekly jobs ───────────────────────────────────────────────────
 
     async def run_weekly_assessment(self, db) -> ReflectionResult:
-        """Run weekly self-assessment via CC background session."""
+        """Run weekly self-assessment via CC background session (registered as
+        in-flight work for the whole call; genesis.util.inflight)."""
+        with inflight("reflection", "weekly_assessment"):
+            return await self._run_weekly_assessment(db)
+
+    async def _run_weekly_assessment(self, db) -> ReflectionResult:
         throttle_result = await self._check_throttle(priority=3, work_type="weekly_assessment")
         if throttle_result is not None:
             return throttle_result
@@ -641,8 +700,10 @@ class CCReflectionBridge:
         )
 
         await record_last_run(
-            db, "14_weekly_self_assessment",
-            provider="cc", model_id=output.model_used or str(CCModel.SONNET),
+            db,
+            "14_weekly_self_assessment",
+            provider="cc",
+            model_id=output.model_used or str(CCModel.SONNET),
             response_text=output.text,
             input_tokens=output.input_tokens,
             output_tokens=output.output_tokens,
@@ -650,11 +711,13 @@ class CCReflectionBridge:
 
         if self._output_router:
             from genesis.reflection.output_router import parse_weekly_assessment_output
+
             parsed = parse_weekly_assessment_output(output.text)
             if parsed.parse_failed:
                 logger.error("Weekly assessment output could not be parsed")
                 return ReflectionResult(
-                    success=False, reason="Weekly assessment output unparseable",
+                    success=False,
+                    reason="Weekly assessment output unparseable",
                 )
             await self._output_router.route_assessment(parsed, db)
 
@@ -662,7 +725,12 @@ class CCReflectionBridge:
         return ReflectionResult(success=True, reason="Weekly assessment completed")
 
     async def run_quality_calibration(self, db) -> ReflectionResult:
-        """Run weekly quality calibration via CC background session."""
+        """Run weekly quality calibration via CC background session (registered
+        as in-flight work for the whole call; genesis.util.inflight)."""
+        with inflight("reflection", "quality_calibration"):
+            return await self._run_quality_calibration(db)
+
+    async def _run_quality_calibration(self, db) -> ReflectionResult:
         throttle_result = await self._check_throttle(priority=3, work_type="quality_calibration")
         if throttle_result is not None:
             return throttle_result
@@ -724,8 +792,10 @@ class CCReflectionBridge:
         )
 
         await record_last_run(
-            db, "16_quality_calibration",
-            provider="cc", model_id=output.model_used or str(CCModel.SONNET),
+            db,
+            "16_quality_calibration",
+            provider="cc",
+            model_id=output.model_used or str(CCModel.SONNET),
             response_text=output.text,
             input_tokens=output.input_tokens,
             output_tokens=output.output_tokens,
@@ -733,11 +803,13 @@ class CCReflectionBridge:
 
         if self._output_router:
             from genesis.reflection.output_router import parse_quality_calibration_output
+
             parsed = parse_quality_calibration_output(output.text)
             if parsed.parse_failed:
                 logger.error("Quality calibration output could not be parsed")
                 return ReflectionResult(
-                    success=False, reason="Quality calibration output unparseable",
+                    success=False,
+                    reason="Quality calibration output unparseable",
                 )
             await self._output_router.route_calibration(parsed, db)
 
@@ -758,8 +830,7 @@ class CCReflectionBridge:
         elif depth == Depth.LIGHT:
             return (
                 "You are Genesis, an autonomous AI cognitive agent "
-                "analyzing system health for your user.\n\n---\n\n"
-                + depth_prompt
+                "analyzing system health for your user.\n\n---\n\n" + depth_prompt
             )
         return depth_prompt
 
