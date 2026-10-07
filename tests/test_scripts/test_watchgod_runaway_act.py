@@ -507,7 +507,10 @@ def test_no_pause_when_the_proc_walk_did_not_complete(box):
     _run(
         box,
         _KILL_STUB
-        + f"""timeout() {{ while [[ "$1" != find ]]; do shift; done; "$@"; return 124; }}
+        + f"""timeout() {{ while [[ "$1" != find && "$1" != stat ]]; do shift; done
+    if [[ "$1" == find ]]; then "$@"; return 124; fi
+    "$@"
+}}
 wg_runaway_check '{_domains(box)}'""",
     )
     assert not _kills(box)
@@ -553,7 +556,15 @@ def test_a_pause_nobody_resumed_is_paged_again_once_per_period(box):
     _record(box, 202, 2020, hours_ago=9)  # pid gone
     _paused(box, 203, 9999)
     _record(box, 203, 2030, hours_ago=9)  # pid recycled
-    _run(box, f"wg_runaway_check '{_domains(box)}'\nwg_runaway_check '{_domains(box)}'")
+    # The first page is delivered (queue emptied) before the next poll, so a
+    # second copy could not collapse into a waiting one: only the period stops it.
+    _run(
+        box,
+        f"wg_runaway_check '{_domains(box)}'\n"
+        f"cp '{box['queue']}'/*.json '{box['tmp']}'/ && rm -f '{box['queue']}'/*.json\n"
+        f"wg_runaway_check '{_domains(box)}'\n"
+        f"cp '{box['tmp']}'/*.json '{box['queue']}'/",
+    )
     still = [p for p in _pages(box) if p["title"].startswith("Still paused")]
     assert len(still) == 1, "once per period, not every poll"
     body = still[0]["body"]
