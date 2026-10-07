@@ -94,18 +94,38 @@ _oom_killed_units() {
     if [[ -n "$_newcur" ]]; then
         _oom_persist_cursor "$_newcur" || rm -f "$_OOM_CURSOR_FILE" 2>/dev/null || true
     fi
-    # `-o cat` renders systemd's line as `<unit>: Failed with result 'oom-kill'.`
-    # A unit name can legally contain ':' (template instances); cut would then
-    # truncate it, and a truncated name cannot match a contained prefix — so a
-    # pathological name mis-classifies toward PAGING, the safe direction.
-    # NOT `sort -u`: the caller compares this list's RECORD COUNT against the
-    # kill delta, and de-duplicating collapses two kills of the same unit name
-    # into one line — which would under-count and suppress a page for a kill
-    # nothing accounted for. Cardinality is the point; the display string
-    # de-duplicates separately. (The `-- cursor:` line carries no oom-kill
-    # phrase, so grep drops it here.)
-    printf '%s
-' "$out"         | { grep -F ": Failed with result 'oom-kill'" || true; }         | cut -d: -f1
+    # Count `<unit>: A process of this unit has been killed by the OOM killer.`
+    # — systemd's catalog message for a killed process (catalog id
+    # fe6faa94e7774663a0da52717891d8ef), one per counter change it observes on
+    # that unit. NOT `Failed with result 'oom-kill'.`: a scope run with
+    # OOMPolicy=continue (the capped job runner's `genesis-job-*` scopes)
+    # survives a kill and writes none, a main-process kill writes BOTH for one
+    # kill, and the two can land in DIFFERENT queries (measured 1-47 ms apart),
+    # so a leftover Failed line would count as a record for a later, unrelated
+    # kill and silence it. systemd-oomd also writes Failed lines with no kernel
+    # kill behind them. (MEASURED, systemd 255, live journal 2026-10-05..07.)
+    # A systemd too old for the process message counts nothing, so every kill
+    # pages: the safe direction.
+    # `*.slice` lines never count: a daemon-reload re-reads slice counters and
+    # logs the process phrase for `-.slice` / `app.slice` with no new kill
+    # behind it (the container oom_kill counter did not move at any of the
+    # three measured instances); processes never live in a slice cgroup, so a
+    # real kill is reported on its own scope or service.
+    # The unit is everything before the first ": ". A unit name can legally
+    # contain ':' (template instances) but not ": ", so it splits intact; a
+    # pathological name that did would be truncated, and a truncated name
+    # cannot match a contained prefix — it mis-classifies toward PAGING, the
+    # safe direction.
+    # NOT de-duplicated: the caller compares this list's RECORD COUNT against
+    # the kill delta, so a unit killed twice is emitted twice. Cardinality is
+    # the point; the display string de-duplicates separately. (The `-- cursor:`
+    # line carries no such message, so it is dropped here.)
+    printf '%s\n' "$out" | awk '
+        { i = index($0, ": ") }
+        i == 0 { next }
+        { u = substr($0, 1, i - 1) }
+        u ~ /\.slice$/ { next }
+        substr($0, i + 2) == "A process of this unit has been killed by the OOM killer." { print u }'
 }
 
 _oom_units_all_contained() {
@@ -298,6 +318,10 @@ check_oom_events() {
         local _obligations=$(( prev_deficit + n )) _new_deficit
         _new_deficit=$(( _obligations - _oom_n ))
         (( _new_deficit < 0 )) && _new_deficit=0
+        # Record the attribution with the snapshot, so a past kill can be named
+        # after the journal has rotated (the snapshot alone never said who).
+        echo "## attributed: ${_oom_who} (${_oom_n} of ${_obligations} kill(s) accounted)" \
+            >> "$OOM_LOG" 2>/dev/null || true
         if (( prev_drain == 0 && _container_trigger == 0 )) \
             && [[ -n "$loc_oom" && -n "$prev_local" && -n "$_oom_units" ]] \
             && (( _oom_n == _obligations )) \

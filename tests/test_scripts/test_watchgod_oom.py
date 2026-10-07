@@ -198,7 +198,7 @@ def test_oom_unavailable_is_noop(tmp_path):
 # ── Issue #1775: attribute the kill before paging ────────────────────────
 
 
-_KILL_LINE = "code-intel-4408aa696643-cbm-4107466.scope: Failed with result 'oom-kill'."
+_KILL_LINE = "code-intel-4408aa696643-cbm-4107466.scope: A process of this unit has been killed by the OOM killer."
 
 
 def test_oom_contained_kill_snapshots_but_does_not_page(tmp_path):
@@ -231,7 +231,7 @@ def test_oom_noncontained_unit_pages_and_names_it(tmp_path):
         _PRELUDE + 'result=$(check_oom_events "4:0:0:0:0"); echo "BASELINE=$result"',
         {
             "OOM_EVENTS_FILE": str(oom),
-            "STUB_JOURNAL": "run-u1234.scope: Failed with result 'oom-kill'.",
+            "STUB_JOURNAL": "run-u1234.scope: A process of this unit has been killed by the OOM killer.",
         },
     )
     assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
@@ -275,7 +275,7 @@ def test_oom_fully_attributed_batch_of_two_does_not_page(tmp_path):
     """
     home, _cc, bind = _sandbox(tmp_path)
     oom = _oom_file(tmp_path, 6)  # +2 kills
-    second = "code-intel-4408aa696643-gitnexus-4107467.scope: Failed with result 'oom-kill'."
+    second = "code-intel-4408aa696643-gitnexus-4107467.scope: A process of this unit has been killed by the OOM killer."
     out = _run(
         home,
         bind,
@@ -327,7 +327,7 @@ def test_oom_mixed_units_page(tmp_path):
         _PRELUDE + 'result=$(check_oom_events "4:0:0:0:0"); echo "BASELINE=$result"',
         {
             "OOM_EVENTS_FILE": str(oom),
-            "STUB_JOURNAL": _KILL_LINE + "\nrun-u1234.scope: Failed with result 'oom-kill'.",
+            "STUB_JOURNAL": _KILL_LINE + "\nrun-u1234.scope: A process of this unit has been killed by the OOM killer.",
         },
     )
     assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
@@ -360,7 +360,7 @@ def test_oom_contained_prefixes_are_configurable(tmp_path):
         _PRELUDE + 'result=$(check_oom_events "4:0:0:0:0"); echo "BASELINE=$result"',
         {
             "OOM_EVENTS_FILE": str(oom),
-            "STUB_JOURNAL": "myjob-heavy.scope: Failed with result 'oom-kill'.",
+            "STUB_JOURNAL": "myjob-heavy.scope: A process of this unit has been killed by the OOM killer.",
             "OOM_CONTAINED_UNIT_PREFIXES": "myjob-",
         },
     )
@@ -454,7 +454,7 @@ def test_oom_cbm_wrapper_kill_is_contained_by_default(tmp_path):
         _PRELUDE + 'result=$(check_oom_events "4:0:0:0:0"); echo "BASELINE=$result"',
         {
             "OOM_EVENTS_FILE": str(oom),
-            "STUB_JOURNAL": "cbm-mcp-4107466.scope: Failed with result 'oom-kill'.",
+            "STUB_JOURNAL": "cbm-mcp-4107466.scope: A process of this unit has been killed by the OOM killer.",
         },
     )
     assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
@@ -581,7 +581,7 @@ def test_oom_late_record_retires_its_own_deficit_and_the_new_contained_kill_supp
     jfile = tmp_path / "journal.txt"
     jfile.write_text("")  # tick 1: A's record has not landed
     oom = _oom_file(tmp_path, 5)
-    second = "code-intel-4408aa696643-gitnexus-4107467.scope: Failed with result 'oom-kill'."
+    second = "code-intel-4408aa696643-gitnexus-4107467.scope: A process of this unit has been killed by the OOM killer."
     snippet = (
         _PRELUDE
         + f'OOM_EVENTS_FILE="{oom}"; '
@@ -1289,10 +1289,154 @@ def test_unqueued_page_logs_who_was_killed(tmp_path):
     out = _run(
         home, bind,
         _PRELUDE + 'r=$(check_oom_events "3:0:0:0:0"); echo "B=$r"',
-        {"OOM_EVENTS_FILE": str(oom), "STUB_JOURNAL": "worker.service: Failed with result 'oom-kill'."},
+        {"OOM_EVENTS_FILE": str(oom), "STUB_JOURNAL": "worker.service: A process of this unit has been killed by the OOM killer."},
     )
     assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
     assert out.stdout.split("B=")[1].strip().endswith(":owed=3-4"), out.stdout
     wg_log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
     line = next(ln for ln in wg_log.splitlines() if "could not be queued" in ln)
     assert "worker.service" in line, line
+
+
+# ── Capped job scopes: the journal line systemd 255 actually writes ──────
+# MEASURED on a live install (journalctl --user, 2026-10-05..07): every kill in
+# a capped `genesis-job-*.scope` (hostmetrics `run`) logs "A process of this
+# unit has been killed by the OOM killer." — the scope runs OOMPolicy=continue,
+# so it survives and writes NO "Failed with result 'oom-kill'" line. When the
+# main process dies (OOMPolicy=stop) BOTH lines appear for ONE kill. A systemd
+# daemon-reload re-reads slice counters and logs the same phrase for
+# `-.slice` / `app.slice` with no new kill behind it (the container's oom_kill
+# counter did not move at any of the three measured instances).
+
+_PROC_TAIL = ": A process of this unit has been killed by the OOM killer."
+_JOB = "genesis-job-qualification-preflight-quality-03c7cb.scope"
+
+
+def _check(tmp_path, prev_spec, kills, journal, extra=None):
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = _oom_file(tmp_path, kills)
+    env = {"OOM_EVENTS_FILE": str(oom), "STUB_JOURNAL": journal}
+    env.update(extra or {})
+    out = _run(
+        home,
+        bind,
+        _PRELUDE + f'result=$(check_oom_events "{prev_spec}"); echo "BASELINE=$result"',
+        env,
+    )
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    calls_f = home / ".genesis" / "alerts" / "calls.log"
+    calls = calls_f.read_text() if calls_f.exists() else ""
+    return home, out, calls
+
+
+def test_capped_job_kill_with_only_the_process_line_is_contained(tmp_path):
+    """The defect: OOMPolicy=continue leaves no Failed line, so the kill counted
+    as unattributed and paged EMERGENCY for a cap doing its job."""
+    home, _out, calls = _check(tmp_path, "4:0:0:0:0", 5, _JOB + _PROC_TAIL)
+    assert calls == "", f"a capped job hitting its own cap must not page: {calls}"
+    wg_log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert f"contained in [{_JOB}]" in wg_log, wg_log
+
+
+def test_a_lone_failed_line_is_not_a_record(tmp_path):
+    """Only the process line counts. A Failed line can land in a different
+    query from its kill's process line (measured 1-47 ms apart) and
+    systemd-oomd writes Failed lines with no kernel kill behind them, so a
+    Failed line counted as a record could silence an unrelated kill."""
+    _home, _out, calls = _check(
+        tmp_path, "4:0:0:0:0", 5, f"{_JOB}: Failed with result 'oom-kill'."
+    )
+    assert "emergency watchgod:oom" in calls, calls
+    assert "unattributed" in calls, calls
+
+
+def test_a_leftover_failed_line_cannot_silence_the_next_kill(tmp_path):
+    """Tick 1: a contained kill's process line (silent, correct). Tick 2: an
+    unrelated kill with no record of its own, while the first kill's Failed
+    line arrives late. The Failed line must not account for it."""
+    home, _cc, bind = _sandbox(tmp_path)
+    oom = tmp_path / "memory.events"
+    jfile = tmp_path / "journal"
+    (tmp_path / "memory.events.local").write_text("oom 0\noom_kill 0\n")
+    snippet = (
+        _PRELUDE
+        + f'printf "oom_kill 5\\n" > "{oom}"; printf "%s\\n" "{_JOB}{_PROC_TAIL}" > "{jfile}"; '
+        + 'a=$(check_oom_events "4:0:0:0:0"); '
+        + f'printf "oom_kill 6\\n" > "{oom}"; printf "%s\\n" "{_JOB}: Failed with result \'oom-kill\'." > "{jfile}"; '
+        + 'b=$(check_oom_events "$a"); echo "A=$a B=$b"'
+    )
+    out = _run(home, bind, snippet, {"OOM_EVENTS_FILE": str(oom), "STUB_JOURNAL_FILE": str(jfile)})
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    calls_f = home / ".genesis" / "alerts" / "calls.log"
+    calls = calls_f.read_text() if calls_f.exists() else ""
+    assert calls.count("emergency watchgod:oom") == 1, calls
+    assert "oom_kill 5->6" in calls, calls
+
+
+def test_genesis_job_is_a_default_contained_prefix(tmp_path):
+    _home, _out, calls = _check(tmp_path, "4:0:0:0:0", 5, f"{_JOB}{_PROC_TAIL}")
+    assert calls == "", calls
+
+
+def test_process_and_failed_line_for_one_kill_count_once(tmp_path):
+    """OOMPolicy=stop: one kill writes BOTH lines. Counting both would make 2
+    records for 1 kill and the reconciliation would never balance."""
+    unit = "code-intel-4408aa696643-cbm-4107466.scope"
+    journal = f"{unit}{_PROC_TAIL}\n{unit}: Failed with result 'oom-kill'."
+    _home, out, calls = _check(tmp_path, "4:0:0:0:0", 5, journal)
+    assert calls == "", calls
+    assert "BASELINE=5:0:0:" in out.stdout, out.stdout  # no deficit left over
+
+
+def test_wrapper_and_child_killed_in_one_scope_are_both_accounted(tmp_path):
+    """MEASURED shape (auditprobe-4096-probe): +2 kills, two process lines and
+    one Failed line for the same scope. The old count (Failed lines only) was 1
+    of 2 and paged."""
+    journal = f"{_JOB}{_PROC_TAIL}\n{_JOB}{_PROC_TAIL}\n{_JOB}: Failed with result 'oom-kill'."
+    _home, out, calls = _check(tmp_path, "4:0:0:0:0", 6, journal)
+    assert calls == "", calls
+    assert "BASELINE=6:0:0:" in out.stdout, out.stdout
+
+
+def test_slice_lines_in_the_same_tick_never_count(tmp_path):
+    """A reload's `-.slice` / `app.slice` lines name no new kill; counted, they
+    would turn 1 contained kill into 3 records (and `app.slice` is uncontained)."""
+    journal = f"{_JOB}{_PROC_TAIL}\n-.slice{_PROC_TAIL}\napp.slice{_PROC_TAIL}"
+    _home, _out, calls = _check(tmp_path, "4:0:0:0:0", 5, journal)
+    assert calls == "", calls
+
+
+def test_slice_lines_alone_do_not_account_for_a_kill(tmp_path):
+    """The other direction: a real kill whose only records are slice lines is
+    UNATTRIBUTED and pages — slice lines can never explain a kill away."""
+    journal = f"-.slice{_PROC_TAIL}\napp.slice{_PROC_TAIL}"
+    _home, _out, calls = _check(tmp_path, "4:0:0:0:0", 5, journal)
+    assert "emergency watchgod:oom" in calls, calls
+    assert "unattributed" in calls, calls
+
+
+def test_an_uncontained_service_kill_still_pages_and_names_it(tmp_path):
+    journal = f"genesis-server.service{_PROC_TAIL}"
+    _home, _out, calls = _check(tmp_path, "4:0:0:0:0", 5, journal)
+    assert "emergency watchgod:oom" in calls, calls
+    assert "genesis-server.service" in calls, calls
+
+
+def test_a_contained_and_an_uncontained_process_kill_page(tmp_path):
+    journal = f"{_JOB}{_PROC_TAIL}\nrun-u1234.scope{_PROC_TAIL}"
+    _home, _out, calls = _check(tmp_path, "4:0:0:0:0", 6, journal)
+    assert "emergency watchgod:oom" in calls, calls
+
+
+def test_the_oom_log_records_who_was_killed(tmp_path):
+    """Every event block names its attribution, so a past kill is never
+    'unknown' once the journal has rotated (September's 53 pages were)."""
+    home, _out, _calls = _check(tmp_path, "4:0:0:0:0", 5, _JOB + _PROC_TAIL)
+    oom_log = (home / ".genesis" / "logs" / "oom_events.log").read_text()
+    assert f"## attributed: {_JOB} (1 of 1 kill(s) accounted)" in oom_log, oom_log
+
+
+def test_the_oom_log_says_unattributed_when_nothing_names_the_kill(tmp_path):
+    home, _out, _calls = _check(tmp_path, "4:0:0:0:0", 5, "")
+    oom_log = (home / ".genesis" / "logs" / "oom_events.log").read_text()
+    assert "## attributed: unattributed (0 of 1 kill(s) accounted)" in oom_log, oom_log

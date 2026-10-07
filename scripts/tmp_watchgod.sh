@@ -129,7 +129,11 @@ RESERVE_MAX_MB=2048
 PRESSURE_RETRIGGER_S=600
 # Where space usually goes on this layout; `du` of each is logged at YELLOW.
 DG_ATTRIBUTION_PATHS=""
-OOM_CONTAINED_UNIT_PREFIXES="${OOM_CONTAINED_UNIT_PREFIXES:-code-intel- cbm-mcp-}"
+# Units whose OOM kill is their own cap working, logged but not paged:
+# code-intel indexing scopes, the codebase-memory MCP scope, and the capped job
+# runner's scopes (`python -m genesis.hostmetrics run`, which tells its caller
+# "killed at its memory cap (raise --ram)").
+OOM_CONTAINED_UNIT_PREFIXES="${OOM_CONTAINED_UNIT_PREFIXES:-code-intel- cbm-mcp- genesis-job-}"
 
 # ── Load config ──────────────────────────────────────────────
 # Every tunable a conf file may set. Their STARTUP values (code default, or an

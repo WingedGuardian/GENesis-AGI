@@ -130,7 +130,10 @@ WAIT build
    prints, on stderr, the job's peak memory, its CPU seconds, and whether it was
    killed at its memory cap. The verdict also goes to stderr; stdout belongs to
    the job. A command that is a shell builtin (`exit`, `exec`) ends the
-   in-scope reporter with it, so no report is printed.
+   in-scope reporter with it, so no report is printed. A kill at the cap is
+   reported here, to the caller, and NOT paged: the disk guardian treats
+   `genesis-job-*` scopes as contained (logged in
+   `~/.genesis/logs/oom_events.log`, with the unit named).
 
 The scope is the job's ledger entry. `status` lists live `genesis-job-*`
 scopes, and every `preflight` counts their memory reservations: each job's
