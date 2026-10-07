@@ -53,9 +53,8 @@ Known gaps:
 ### Scroll
 - Human scroll deltas vary (20-100 px) and include pauses and back-scrolls;
   scripted scrolls are uniform (**unsourced** numbers). Genesis has no
-  humanized scroll tool. On Camoufox a click does NOT scroll its target into
-  view: scroll it there first (`browser-automation`, the off-screen click
-  workaround), or the click can report success and land nowhere.
+  humanized scroll tool. `browser_click` scrolls its own target into view,
+  with Playwright's own scroll, not a humanized one.
 
 ### Paste
 - Some systems distinguish typed from pasted input (**unsourced**). Genesis

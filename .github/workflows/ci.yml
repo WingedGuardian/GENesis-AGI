@@ -504,7 +504,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-10-05: 70 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-07: 71 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -1112,9 +1112,6 @@ jobs:
         # Floor: 24153 +92 =24245; skip ceiling remains 102.
         # NVIDIA provider health: new test_provider_health_probes.py collects
         # 87 tests (0 -> 87); no added skips. Floor: 24245 + 87 = 24332.
-        # Checkout mutation fence (#2870): +21 collected tests across
-        # test_checkout_lock.py, spawn-admission tests, and deploy/update/candidate
-        # lock tests; no added skips. Floor: 24421 + 21 = 24442.
         # FalkorDB provisioning (#1834): --collect-only on main's versions vs
         # this branch's, after the last test-adding edit (new file = full count):
         #   test_infra_protection_posture.py       50 -> 68   (+18)
@@ -1123,4 +1120,12 @@ jobs:
         #   test_collectors_falkordb.py           new -> 23   (+23)
         #   test_falkordb_module.py               new -> 35   (+35)
         # No added skips. Floor: 24332 + 89 = 24421; skip ceiling remains 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24442
+        # Qualification journal (replacement 1/6): new test file collects 95
+        # cases: 2 retained historical regressions plus 93 new accounting and
+        # recovery cases. Main has none of this package's original 231 cases.
+        # Floor: 24421 + 95 = 24516; no added skips, ceiling unchanged.
+        # Checkout mutation fence (#2870): +27 collected tests, measured with
+        # --collect-only against main's versions of the ten changed test files
+        # (test_checkout_lock.py 8 + 3 new, invoker +8, child_env +1, deploy/update/
+        # candidate lock tests +7); no added skips. Floor: 24516 + 27 = 24543.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24543

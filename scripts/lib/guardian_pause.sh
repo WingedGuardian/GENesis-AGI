@@ -89,11 +89,14 @@ _guardian_pause() {
     local cfg="$HOME/.genesis/guardian_remote.yaml"
     [ -f "$cfg" ] || return 0
     local hip hus key
-    hip=$("$VENV_DIR/bin/python" -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_ip',''))" 2>/dev/null || true)
-    hus=$("$VENV_DIR/bin/python" -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_user','ubuntu'))" 2>/dev/null || echo ubuntu)
+    # -P: neither the working directory (a `live` checkout holding candidate
+    # files) nor any script directory goes first on sys.path. Not -I -S: yaml
+    # comes from the venv's site-packages.
+    hip=$("$VENV_DIR/bin/python" -P -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_ip',''))" 2>/dev/null || true)
+    hus=$("$VENV_DIR/bin/python" -P -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_user','ubuntu'))" 2>/dev/null || echo ubuntu)
     # Honor the configured ssh_key (guardian_remote.yaml), expanding a leading ~,
     # and fall back to the historical default when the field is absent/empty.
-    key=$("$VENV_DIR/bin/python" -c "import yaml,pathlib,os;k=yaml.safe_load(pathlib.Path('$cfg').read_text()).get('ssh_key','') or '';print(os.path.expanduser(k))" 2>/dev/null || true)
+    key=$("$VENV_DIR/bin/python" -P -c "import yaml,pathlib,os;k=yaml.safe_load(pathlib.Path('$cfg').read_text()).get('ssh_key','') or '';print(os.path.expanduser(k))" 2>/dev/null || true)
     [ -n "$key" ] || key="$HOME/.ssh/genesis_guardian_ed25519"
     [ -n "$hip" ] && [ -f "$key" ] || return 0
     _GUARDIAN_HOST="${hus:-ubuntu}@${hip}"
