@@ -40,8 +40,11 @@ Semantics and invariants — read before changing:
   is why that is easy to miss. Reaching this needs a provider with BOTH a
   configured daily limit AND a non-UTC reset. `groq-free` is the only
   provider carrying limits today (enumerated: every `rpd_limit`/`tpd_limit`
-  in `config/model_routing.yaml` is in its block), and Gemini — the known
-  Pacific-reset case, `docs/reference/models.md` — deliberately carries none.
+  in `config/model_routing.yaml` is in its block), and Gemini deliberately
+  carries none. (Gemini was long recorded as a midnight-Pacific reset; its
+  free-tier 429s MEASURED 2026-10-07 named 00:00 UTC, 38 of 38. Either way it
+  needs no configured limit: its 429 names its own reset — see the
+  provider-reported block below.)
 
   But that eliminates the candidate whose boundary is KNOWN and says nothing
   about the one that is live. Groq's own reset window is recorded NOWHERE in
@@ -58,8 +61,18 @@ Semantics and invariants — read before changing:
 - **Limits live in config, not here.** ``exhausted()`` / ``record()`` take
   the live ``ProviderConfig``, so a dashboard config reload takes effect on
   the next check with zero ledger code. A provider with neither limit set is
-  never tracked and never touches the state file — a fresh install with no
-  limits configured never creates it.
+  never COUNTED; it reaches the state file only through the block below.
+- **Provider-reported block.** A 429 the delegate flags as a spent DAILY
+  quota with a named reset (``CallResult.daily_quota_exhausted`` +
+  ``retry_after_s``, parsed by ``retry.daily_quota_reset_s``) deselects that
+  provider until that reset, with or without configured limits — the
+  provider's own word is exact even where another consumer shares the quota,
+  which no local count can model. Bound to the model it was spent on (the
+  quota is per model). Persisted as ``blocked_until`` + ``blocked_model`` on
+  the provider's row so a restart keeps it; an unparseable value, or one
+  further out than any daily reset, fails open. To lift a block early (e.g.
+  billing enabled mid-day): delete those two keys from the row while the
+  server is stopped, or use the kill switch.
 - **Single-writer persistence** (mirrors the circuit-breaker WS-3c rule):
   only the genesis-server process writes the state file; MCP children
   construct with ``persist=False`` — they load the server's counters once,
@@ -80,11 +93,12 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genesis.env import daily_budget_disabled
+from genesis.routing.retry import _MAX_DAILY_RESET_S
 from genesis.util.atomic import atomic_write_text
 
 if TYPE_CHECKING:
@@ -158,7 +172,8 @@ class DailyBudgetLedger:
     JSON file.
 
     Thread contract: the server loop writes counters and provider bindings;
-    dashboard Flask workers read through non-mutating ``_peek``. A reentrant
+    dashboard Flask workers read through ``status()``, which only drops an
+    expired provider block (under the lock) and otherwise mutates nothing. A reentrant
     lock covers alias resolution, iteration and counted writes so cross-thread
     readers cannot iterate a changing dictionary. ``_save`` performs an fsync'd
     atomic write on the writer thread once per counted call; bounded by free-tier
@@ -177,6 +192,14 @@ class DailyBudgetLedger:
         self._persist = persist
         # name -> {"day": "YYYY-MM-DD", "requests": int, "tokens": int}
         self._counters: dict[str, dict] = {}
+        # name -> (aware UTC datetime, model_id): the provider said its DAILY
+        # quota is spent and named when it resets (a 429 carrying that reset;
+        # see retry.daily_quota_reset_s). Deselected until then, whether or not
+        # a limit is configured: the provider's own word is the limit, and it is
+        # right even where another consumer shares the same quota. Bound to the
+        # model it was spent on: the quota is per model, so a config that now
+        # points the provider at another model is not blocked.
+        self._blocked: dict[str, tuple[datetime, str]] = {}
         self._lock = threading.RLock()
         self._load()
 
@@ -188,7 +211,11 @@ class DailyBudgetLedger:
         False for providers with no limits, and always False under the
         GENESIS_DAILY_BUDGET_DISABLED kill switch.
         """
-        if daily_budget_disabled() or not _limited(cfg):
+        if daily_budget_disabled():
+            return False
+        if self._blocked_until(cfg.name, cfg.model_id) is not None:
+            return True
+        if not _limited(cfg):
             return False
         entry = self._peek(cfg.name)
         if cfg.rpd_limit is not None and entry["requests"] >= cfg.rpd_limit:
@@ -216,7 +243,24 @@ class DailyBudgetLedger:
         is the visibility for that case. (Zero/negative limits, the other
         born-exhausted route, are rejected at config parse time.)
         """
-        if daily_budget_disabled() or not _limited(cfg):
+        if daily_budget_disabled():
+            return False
+        if (
+            result.status_code == 429
+            and result.daily_quota_exhausted
+            and result.retry_after_s is not None
+            and result.retry_after_s > 0
+        ):
+            # Not usage (a 429 never is): it is the provider's own statement
+            # that the day's quota is spent, and when it comes back.
+            was_exhausted = self.exhausted(cfg)
+            self._blocked[cfg.name] = (
+                self._clock() + timedelta(seconds=result.retry_after_s),
+                cfg.model_id,
+            )
+            self._save()
+            return not was_exhausted
+        if not _limited(cfg):
             return False
         # Undercount-biased counting rule — see module docstring.
         #
@@ -263,21 +307,42 @@ class DailyBudgetLedger:
         The unit of each pair is named explicitly — requests and tokens are
         never comparable and never converted.
         """
-        if not _limited(cfg):
+        blocked = self._blocked_until(cfg.name, cfg.model_id)
+        if not _limited(cfg) and blocked is None:
             return None
         entry = self._peek(cfg.name)
-        return {
+        out = {
             "requests_used": entry["requests"],
             "rpd_limit": cfg.rpd_limit,
             "tokens_used": entry["tokens"],
             "tpd_limit": cfg.tpd_limit,
             "exhausted": self.exhausted(cfg),
         }
+        # Present only while the provider has said its daily quota is spent,
+        # so every other status keeps its shape.
+        if blocked is not None:
+            out["blocked_until"] = blocked.isoformat()
+        return out
 
     # ── internals ───────────────────────────────────────────────────────
 
     def _today(self) -> str:
         return self._clock().strftime("%Y-%m-%d")
+
+    def _blocked_until(self, name: str, model_id: str | None = None) -> datetime | None:
+        """The provider-named reset still ahead of now, or None. With a
+        ``model_id``, only a block spent on that same model counts."""
+        with self._lock:
+            entry = self._blocked.get(name)
+            if entry is None:
+                return None
+            until, blocked_model = entry
+            if self._clock() >= until:
+                del self._blocked[name]
+                return None
+            if model_id is not None and model_id != blocked_model:
+                return None
+            return until
 
     def _peek(self, name: str) -> dict:
         """Pure current-day view of one explicitly named provider's counters."""
@@ -307,6 +372,23 @@ class DailyBudgetLedger:
                 row = _sanitized_counters(entry) if isinstance(entry, dict) else None
                 if row is not None:
                     self._counters[name] = row
+                    until = _parse_blocked_until(entry.get("blocked_until"))
+                    model = entry.get("blocked_model")
+                    now = self._clock()
+                    # Re-apply the parse-time bound: a value further out than
+                    # any daily reset (a hand edit, a clock that jumped) must
+                    # not silence a provider indefinitely.
+                    if (
+                        until is not None
+                        and isinstance(model, str)
+                        and now < until <= now + timedelta(seconds=_MAX_DAILY_RESET_S)
+                    ):
+                        self._blocked[name] = (until, model)
+                    elif until is not None:
+                        logger.warning(
+                            "daily budget: ignoring stored block for %s (%s, model %r)",
+                            name, until.isoformat(), model,
+                        )
                 else:
                     # Not a counter row at all (no `day`). Nothing here is
                     # salvageable, so the provider starts from zero — the
@@ -336,10 +418,19 @@ class DailyBudgetLedger:
             return
         today = self._today()
         current = {
-            name: entry
+            name: dict(entry)
             for name, entry in self._counters.items()
             if entry.get("day") == today
         }
+        # A block outlives the UTC day it was set on (a reset can be up to a
+        # day away), so it is saved with whatever row the provider has.
+        for name in list(self._blocked):
+            until = self._blocked_until(name)
+            if until is None:
+                continue
+            row = current.setdefault(name, {"day": today, "requests": 0, "tokens": 0})
+            row["blocked_until"] = until.isoformat()
+            row["blocked_model"] = self._blocked[name][1]
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_text(
@@ -351,6 +442,19 @@ class DailyBudgetLedger:
             logger.warning(
                 "Daily budget state save to %s failed", self._path, exc_info=True,
             )
+
+
+def _parse_blocked_until(value: object) -> datetime | None:
+    """A persisted reset time, or None for anything that is not an aware
+    ISO-8601 timestamp (a corrupt value fails OPEN: the provider is called,
+    and its own 429 sets the block again)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def _limited(cfg: ProviderConfig) -> bool:

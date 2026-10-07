@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import random
 
@@ -86,6 +87,61 @@ def classify_error(status_code: int | None, error_msg: str) -> ErrorCategory:
         return ErrorCategory.DEGRADED
 
     return ErrorCategory.TRANSIENT
+
+
+#: Longest reset a DAILY quota can name, with margin. A value past this is not
+#: a daily reset we can account for, and honouring it would deselect a
+#: provider for longer than any day lasts.
+_MAX_DAILY_RESET_S = 26 * 3600
+
+
+def daily_quota_reset_s(error_msg: str) -> float | None:
+    """Seconds until a provider-side DAILY quota resets, or None.
+
+    Reads Google's structured error (``google.rpc.QuotaFailure`` and
+    ``google.rpc.RetryInfo`` in ``error.details``), as the Gemini API returns
+    it inside a 429. MEASURED on a live install (2026-10-06/07): the free
+    tier's daily cap answers with quotaId
+    ``GenerateRequestsPerDayPerProjectPerModel-FreeTier`` and a
+    ``retryDelay`` such as ``"21279s"`` naming the next reset (00:00 UTC for
+    every one of 38 logged 429s).
+
+    Only a quota whose id says PerDay counts: a per-minute 429 is ordinary
+    backpressure and stays fail-fast. Anything this cannot decode returns
+    None, which leaves the 429 exactly as it was handled before. It never
+    raises: it runs inside the delegate's 429 handler, where an exception would
+    escape the router instead of falling through to the next provider.
+    """
+    start = error_msg.find("{")
+    if start < 0:
+        return None
+    try:
+        body, _ = json.JSONDecoder().raw_decode(error_msg[start:])
+    except (ValueError, RecursionError):  # malformed, or nested past the stack
+        return None
+    error = body.get("error") if isinstance(body, dict) else None
+    details = error.get("details") if isinstance(error, dict) else None
+    if not isinstance(details, list):
+        return None
+    daily = False
+    delay: float | None = None
+    for item in details:
+        if not isinstance(item, dict):
+            continue
+        violations = item.get("violations")
+        for violation in violations if isinstance(violations, list) else ():
+            quota_id = violation.get("quotaId") if isinstance(violation, dict) else None
+            if isinstance(quota_id, str) and "PerDay" in quota_id:
+                daily = True
+        retry = item.get("retryDelay")
+        if isinstance(retry, str) and retry.endswith("s"):
+            try:
+                delay = float(retry[:-1])
+            except ValueError:
+                delay = None
+    if not daily or delay is None or not 0 < delay <= _MAX_DAILY_RESET_S:
+        return None
+    return delay
 
 
 def compute_delay(policy: RetryPolicy, attempt: int) -> float:
