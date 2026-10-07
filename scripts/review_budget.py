@@ -261,6 +261,10 @@ def _unknown(*errors: str, current_head: str = "") -> dict[str, Any]:
         "approval_required": True,
         "commit_approval_required": True,
         "strongly_discouraged": True,
+        "open_keys": [],
+        "reflection_keys": "unknown",
+        "reviewers_reported": [],
+        "expected_reviewers": [],
         "errors": [e for e in errors if e],
     }
 
@@ -334,6 +338,39 @@ def _findings_module() -> Any:
     return review_findings
 
 
+def _is_id(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _round_source(
+    item: Mapping[str, object], login: str, flagged: Sequence[int], in_body: int
+) -> dict[str, Any]:
+    """One review's place in a round, keyed for the round reflection.
+
+    A finding is keyed by what a reader can find it by and that never changes:
+    ``c<comment id>`` for an inline comment. A finding in a review's BODY has no
+    id of its own: ``r<review id>/<k>`` for k in 1..``body_finding_count`` is a
+    SLOT in that review's count, not a pointer to a particular finding, so a
+    reflection answers for the review's body findings as a set. A key whose id is
+    missing is None: the round still counts, it just cannot be discharged by key,
+    which ``reflection_keys`` reports.
+    """
+    review_id = item.get("id")
+    ids = item.get("top_level_ids")
+    keys: list[str | None] = []
+    for index in flagged:
+        comment_id = ids[index] if isinstance(ids, list) and index < len(ids) else None
+        keys.append(f"c{comment_id}" if _is_id(comment_id) else None)
+    for k in range(1, in_body + 1):
+        keys.append(f"r{review_id}/{k}" if _is_id(review_id) else None)
+    return {
+        "id": review_id if _is_id(review_id) else None,
+        "login": login,
+        "submitted_at": item.get("submitted_at"),
+        "finding_keys": keys,
+    }
+
+
 def evaluate_evidence(
     *,
     current_head: str,
@@ -403,11 +440,23 @@ def evaluate_evidence(
         if before:
             legacy.add(sha)
 
-    def add_round(sha: str, login: str, findings: int) -> None:
-        entry = found.setdefault(sha, {"findings": 0, "reviewers": []})
+    def add_round(
+        sha: str, login: str, findings: int, source: Mapping[str, Any] | None = None
+    ) -> None:
+        entry = found.setdefault(sha, {"findings": 0, "reviewers": [], "reviews": []})
         entry["findings"] += findings
         if login not in entry["reviewers"]:
             entry["reviewers"].append(login)
+        if source is not None:
+            entry["reviews"].append(source)
+
+    # Who reported on which head, for the reflection's settle window. A clean
+    # review reports as surely as one with findings, so every counted reviewer's
+    # review lands here before the findings test below.
+    reported: dict[str, set[str]] = {}
+
+    def report(sha: str, login: str) -> None:
+        reported.setdefault(sha, set()).add(login)
 
     surface_only = review_findings.surface_only_logins()
     for item in reviews:
@@ -447,6 +496,8 @@ def evaluate_evidence(
             # Only a test seam omits the time; a non-primary review cannot be
             # placed on either side of the cutover, and dropping it undercounts.
             return _unknown("review_time_missing", current_head=head)
+        if item.get("state") != "PENDING":
+            report(sha, login)
         if before:
             continue
         top_level = item.get("top_level")
@@ -459,10 +510,16 @@ def evaluate_evidence(
             or not isinstance(body, str)
         ):
             return _unknown("review_comments_unreadable", current_head=head)
-        findings = sum(1 for b in top_level if review_findings.is_finding(login, b))
-        findings += review_findings.body_finding_count(login, body)
+        flagged = [i for i, b in enumerate(top_level) if review_findings.is_finding(login, b)]
+        in_body = review_findings.body_finding_count(login, body)
+        findings = len(flagged) + in_body
         if findings:
-            add_round(sha, login, findings)
+            add_round(
+                sha,
+                login,
+                findings,
+                _round_source(item, login, flagged, in_body),
+            )
         elif not top_level and review_findings.declares_findings(login, body):
             # Its body says it posted findings and no top-level comment
             # survives: they were deleted, which must not read as a clean review.
@@ -512,13 +569,27 @@ def evaluate_evidence(
             if error:
                 return _unknown(error, current_head=head)
             confirm(resolved or "", before)
+            report(resolved or "", login)
             continue
         is_findings, sha = review_findings.codex_comment_finding_head(body)
         if is_findings and not before:
             if sha is None:
                 return _unknown("codex_findings_comment_unbound", current_head=head)
             confirm(sha, False)
-            add_round(sha, login, 1)
+            report(sha, login)
+            comment_id = item.get("id")
+            add_round(
+                sha,
+                login,
+                1,
+                {
+                    "id": None,
+                    "login": login,
+                    "submitted_at": item.get("created_at"),
+                    # A findings comment has no review object; its own id keys it.
+                    "finding_keys": [f"i{comment_id}" if _is_id(comment_id) else None],
+                },
+            )
 
     paths: list[str] = []
     for item in changed_files:
@@ -547,6 +618,7 @@ def evaluate_evidence(
             "legacy": sha not in found,
             "findings": found[sha]["findings"] if sha in found else None,
             "reviewers": found[sha]["reviewers"] if sha in found else [],
+            "reviews": found[sha]["reviews"] if sha in found else [],
         }
         for sha in sorted(round_heads, key=lambda s: (order.get(s, -1), s))
     ]
@@ -608,6 +680,28 @@ def evaluate_evidence(
     else:
         round_state = "complete"
 
+    # What a round reflection must answer for (consumed by
+    # scripts/review_reflection.py and the commit gate). The newest round only,
+    # and only while it is open. NOT attached: a review submitted on an earlier
+    # head after the fix was pushed stays on that head, so it is never owed here.
+    open_keys: list[str] = []
+    keys_known = True
+    if round_state == "open":
+        for source in rounds[-1]["reviews"]:
+            for key in source["finding_keys"]:
+                if key is None:
+                    keys_known = False
+                elif key not in open_keys:
+                    open_keys.append(key)
+        # A head the old rule counted carries findings that were never keyed, even
+        # when a post-cutover review on the same head was: its keys are partial.
+        keys_known = keys_known and rounds[-1]["head"] not in legacy
+    # The settle window waits for every reviewer that took part in EARLIER
+    # rounds of this PR. Round 1 has nobody to wait for by this rule, and the
+    # reader then waits the whole window: a reviewer that has not posted yet is
+    # indistinguishable from one that never will.
+    expected = sorted({login for sha, who in reported.items() if sha != head for login in who})
+
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "ok",
@@ -627,6 +721,10 @@ def evaluate_evidence(
         "round_state": round_state,
         "trend": trend,
         "legacy_heads": len(legacy),
+        "open_keys": open_keys,
+        "reflection_keys": "ok" if keys_known else "unknown",
+        "reviewers_reported": sorted(reported.get(head, set())),
+        "expected_reviewers": expected,
         "errors": [],
     }
 
@@ -680,12 +778,13 @@ _GRAPHQL_READ_SECONDS = 20.0
 _GRAPHQL_CONNECTIONS = {
     "reviews": (
         "reviews(first: 100, after: $after_reviews) { pageInfo { hasNextPage endCursor } "
-        "nodes { state submittedAt body author { login __typename } commit { oid } "
-        "comments(first: 100) { pageInfo { hasNextPage } nodes { replyTo { id } body } } } }"
+        "nodes { fullDatabaseId state submittedAt body author { login __typename } "
+        "commit { oid } comments(first: 100) { pageInfo { hasNextPage } "
+        "nodes { fullDatabaseId replyTo { id } body } } } }"
     ),
     "comments": (
         "comments(first: 100, after: $after_comments) { pageInfo { hasNextPage endCursor } "
-        "nodes { body createdAt author { login __typename } } }"
+        "nodes { fullDatabaseId body createdAt author { login __typename } } }"
     ),
     "files": (
         "files(first: 100, after: $after_files) { pageInfo { hasNextPage endCursor } "
@@ -736,6 +835,25 @@ def _graphql_author(author: object) -> tuple[str | None, str | None]:
     return login, kind
 
 
+def _node_id(node: Mapping[str, object]) -> int | None:
+    """The REST id of a review, review comment or issue comment, or None.
+
+    Read from ``fullDatabaseId``, never ``databaseId``: GitHub deprecated the
+    latter on these types because it cannot hold a 64-bit id (MEASURED
+    2026-10-07 by schema introspection, announced removal 2024-07-01), and ids
+    here already exceed 2**31. The value is a BigInt, which GraphQL sends as a
+    JSON string. An absent or malformed id is None and never fails the read: an
+    id only keys a reflection, so it must not be able to turn the round count
+    unknown for every PR.
+    """
+    raw = node.get("fullDatabaseId")
+    # Bounded before int(): past 4,300 digits int() raises, which would land in
+    # the malformed-read handler and turn the whole PR unknown.
+    if isinstance(raw, str) and len(raw) <= 20 and raw.isascii() and raw.isdigit():
+        raw = int(raw)
+    return raw if _is_id(raw) else None
+
+
 def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]:
     """Convert one page of nodes to the REST row shapes. Raises ValueError."""
     if not isinstance(nodes, list):
@@ -764,25 +882,30 @@ def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]
                 # unread finding is an uncounted round (MEASURED 2026-09-29: max 16).
                 raise _Truncated
             top_level = []
+            top_level_ids = []
             for comment in thread["nodes"]:
                 if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
                     raise ValueError(name)
                 if comment.get("replyTo") is None:
                     top_level.append(comment["body"])
+                    top_level_ids.append(_node_id(comment))
             rows.append(
                 {
+                    "id": _node_id(node),
                     "login": login,
                     "commit_id": (commit or {}).get("oid"),
                     "state": node.get("state"),
                     "submitted_at": submitted,
                     "body": node.get("body"),
                     "top_level": top_level,
+                    "top_level_ids": top_level_ids,
                 }
             )
         elif name == "comments":
             login, kind = _graphql_author(node.get("author"))
             rows.append(
                 {
+                    "id": _node_id(node),
                     "login": login,
                     "type": kind,
                     "body": node.get("body"),
@@ -817,9 +940,14 @@ def _review_digest(rows: Sequence[Mapping[str, object]], rf: Any) -> list[tuple[
         login = row.get("login")
         body = row.get("body") if isinstance(row.get("body"), str) else ""
         tops = row.get("top_level") if isinstance(row.get("top_level"), list) else []
+        ids = row.get("top_level_ids") if isinstance(row.get("top_level_ids"), list) else []
         named = isinstance(login, str)
         digest.append(
             (
+                # Ids are immutable, so comparing them cannot turn a reviewer's
+                # edit into ``unknown``; they make a delete-and-repost visible.
+                row.get("id"),
+                tuple(ids),
                 login,
                 row.get("commit_id"),
                 row.get("state"),

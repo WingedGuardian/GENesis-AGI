@@ -582,3 +582,218 @@ def test_an_unreadable_entry_after_a_trivial_one_still_counts():
     """Only the `_Source:` footer is skipped; a later entry whose header has no
     readable severity is drift, and drift counts."""
     assert rf.is_finding(RABBIT, CR_TRIVIAL + "\n\n_⚠️ Potential issue_\n\n**Wrong.**") is True
+
+
+# -- reflection keys: what a round reflection must answer for ----------------
+#
+# A round reflection names every finding of the open round by an immutable key
+# (`c<comment id>`, `r<review id>/<k>`, `i<issue comment id>`). The keys ride on
+# the same evaluation as the count, and must never change the count.
+
+
+def _keyed(rv, review_id, comment_ids):
+    return dict(rv, id=review_id, top_level_ids=list(comment_ids))
+
+
+def test_an_open_round_keys_each_finding_by_its_comment_id():
+    got = _ev(
+        head=H2,
+        reviews=(
+            _keyed(_rv(CODEX, H1, P2), 10, [100]),
+            _keyed(_rv(CODEX, H2, P2, P3, P1), 11, [111, 112, 113]),
+        ),
+    )
+    assert got["round_state"] == "open"
+    # The P3 is informational: it opens no round and owes no disposition.
+    assert got["open_keys"] == ["c111", "c113"]
+    assert got["reflection_keys"] == "ok"
+    assert got["rounds"][-1]["reviews"] == [
+        {"id": 11, "login": CODEX, "submitted_at": AFTER, "finding_keys": ["c111", "c113"]}
+    ]
+
+
+def test_body_findings_and_a_codex_findings_comment_have_keys():
+    body = (
+        "**Actionable comments posted: 0**\n<details>\n"
+        "<summary>⚠️ Outside diff range comments (2)</summary>\n</details>"
+    )
+    rabbit = _keyed(_rv(RABBIT, H5, body=body), 20, [])
+    bulb = dict(_cm(_bulb(H5)), id=30)
+    got = _ev(reviews=(rabbit,), comments=(bulb,))
+    assert got["open_keys"] == ["r20/1", "r20/2", "i30"]
+    assert got["reflection_keys"] == "ok"
+
+
+def test_a_missing_id_makes_the_keys_unknown_and_never_the_count():
+    keyed = _ev(head=H2, reviews=(_keyed(_rv(DEVIN, H2, _devin("🟡")), 40, [400]),))
+    bare = _ev(head=H2, reviews=(_rv(DEVIN, H2, _devin("🟡")),))
+    assert keyed["reflection_keys"] == "ok" and keyed["open_keys"] == ["c400"]
+    assert bare["status"] == "ok" and bare["count"] == keyed["count"] == 1
+    assert bare["reflection_keys"] == "unknown" and bare["open_keys"] == []
+
+
+def test_a_complete_round_owes_nothing_and_a_late_review_stays_on_its_head():
+    """Stated residual: no late attachment. A finding submitted on H1 after H2
+    was pushed belongs to H1's round, which is complete, so nothing is owed."""
+    got = _ev(
+        head=H2,
+        reviews=(
+            _keyed(_rv(CODEX, H1, P2), 10, [100]),
+            _keyed(_rv(DEVIN, H1, _devin("🟡"), when=LATER), 41, [410]),
+        ),
+    )
+    assert got["round_state"] == "complete"
+    assert got["open_keys"] == [] and got["reflection_keys"] == "ok"
+
+
+def test_a_legacy_round_at_head_cannot_be_keyed():
+    got = _ev(head=H2, reviews=(_keyed(_rv(CODEX, H2, P2, when=BEFORE), 10, [100]),))
+    assert got["round_state"] == "open"
+    assert got["reflection_keys"] == "unknown"
+
+
+def test_who_reported_and_who_is_expected():
+    """Round 1 expects nobody (the reader waits the whole window); later rounds
+    expect every reviewer of an earlier head. A clean review and a Codex clean
+    comment both report."""
+    first = _ev(head=H1, reviews=(_keyed(_rv(DEVIN, H1, _devin("🟡")), 40, [400]),))
+    assert first["expected_reviewers"] == []
+    assert first["reviewers_reported"] == [DEVIN]
+    later = _ev(
+        head=H2,
+        reviews=(
+            _keyed(_rv(DEVIN, H1, _devin("🟡")), 40, [400]),
+            _keyed(_rv(RABBIT, H1), 50, []),
+            _keyed(_rv(RABBIT, H2), 51, []),
+        ),
+        comments=(_clean(H2[:10]),),
+    )
+    assert later["expected_reviewers"] == [RABBIT, DEVIN]
+    assert later["reviewers_reported"] == [CODEX, RABBIT]
+
+
+def test_ids_never_change_any_existing_field():
+    """B1a-1's acceptance as a property: the same evidence with and without ids
+    evaluates identically outside the new reflection fields."""
+    new = {"open_keys", "reflection_keys", "rounds"}
+    rng = random.Random(20261007)
+    for _ in range(200):
+        reviews, comments = _random_corpus(rng, [BEFORE, AFTER, LATER])
+        keyed = [
+            dict(
+                r,
+                id=1000 + i,
+                top_level_ids=[5000 + 10 * i + j for j in range(len(r["top_level"]))],
+            )
+            for i, r in enumerate(reviews)
+        ]
+        plain = _ev(reviews=reviews, comments=comments)
+        withids = _ev(reviews=keyed, comments=comments)
+        assert {k: v for k, v in plain.items() if k not in new} == {
+            k: v for k, v in withids.items() if k not in new
+        }
+        strip = [{k: v for k, v in r.items() if k != "reviews"} for r in withids.get("rounds", [])]
+        assert strip == [
+            {k: v for k, v in r.items() if k != "reviews"} for r in plain.get("rounds", [])
+        ]
+
+
+def test_unknown_carries_the_reflection_fields():
+    got = rb._unknown("x")
+    assert got["open_keys"] == [] and got["reflection_keys"] == "unknown"
+    assert got["reviewers_reported"] == [] and got["expected_reviewers"] == []
+
+
+@pytest.mark.parametrize(
+    "raw, want",
+    [
+        ("6030876162", 6030876162),
+        (6030876162, 6030876162),
+        (None, None),
+        ("", None),
+        ("-1", None),
+        ("12a", None),
+        ("١٢", None),
+        (True, None),
+        (0, None),
+    ],
+)
+def test_node_ids_come_from_full_database_id(raw, want):
+    """`fullDatabaseId` is a BigInt sent as a string; ids already pass 2**31."""
+    node = {} if raw is None else {"fullDatabaseId": raw}
+    assert rb._node_id(node) == want
+
+
+def test_the_query_never_asks_for_the_deprecated_database_id():
+    """`databaseId` on reviews and review comments is deprecated (schema
+    introspection, 2026-10-07). If GitHub removes it, a query naming it errors
+    and every PR's budget goes unknown."""
+    query = rb._graphql_query(list(rb._GRAPHQL_CONNECTIONS))
+    assert "fullDatabaseId" in query
+    assert " databaseId" not in query and "{databaseId" not in query
+
+
+def test_graphql_rows_carry_ids_parallel_to_top_level():
+    node = _node(H1, tops=["a", "b"], replies=["r"])
+    node["fullDatabaseId"] = "7"
+    node["comments"]["nodes"][0]["fullDatabaseId"] = "71"
+    rows, _ = rb._graphql_rows("reviews", [node])
+    assert rows[0]["id"] == 7
+    assert rows[0]["top_level"] == ["a", "b"] and rows[0]["top_level_ids"] == [71, None]
+    comment = {
+        "fullDatabaseId": "9",
+        "body": "x",
+        "createdAt": AFTER,
+        "author": {"login": "chatgpt-codex-connector", "__typename": "Bot"},
+    }
+    assert rb._graphql_rows("comments", [comment])[0][0]["id"] == 9
+
+
+def test_the_reread_sees_a_deleted_and_reposted_comment():
+    first = rb._graphql_rows("reviews", [_node(H1, tops=[_devin("🟡")])])[0]
+    first[0]["top_level_ids"] = [400]
+    reposted = [dict(first[0], top_level_ids=[401])]
+    assert rb._review_digest(first, rf) != rb._review_digest(reposted, rf)
+
+
+def test_a_mixed_old_and_new_round_at_head_has_partial_keys():
+    """A pre-cutover Codex P1 and a post-cutover Devin finding on one head: only
+    Devin's is keyed, so the keys must not read as complete."""
+    got = _ev(
+        head=H2,
+        reviews=(
+            _keyed(_rv(CODEX, H2, P1, when=BEFORE), 10, [100]),
+            _keyed(_rv(DEVIN, H2, _devin("🟡")), 40, [400]),
+        ),
+    )
+    assert got["round_state"] == "open" and got["open_keys"] == ["c400"]
+    assert got["reflection_keys"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    "extra, reports",
+    [
+        (_rv(CODEX, H2, state="PENDING"), False),  # pending: not a report
+        (_rv("a-maintainer", H2), False),  # a human never reports
+        (_rv("github-actions[bot]", H2), False),  # nor a workflow bot
+        (_rv(RABBIT, H2, when=BEFORE), True),  # before cutover still reports
+    ],
+)
+def test_what_counts_as_reporting_on_the_head(extra, reports):
+    got = _ev(head=H2, reviews=(extra,))
+    assert (extra["login"] in got["reviewers_reported"]) is reports
+
+
+def test_a_codex_findings_comment_reports_on_its_head():
+    got = _ev(head=H5, comments=(dict(_cm(_bulb(H5)), id=30),))
+    assert got["reviewers_reported"] == [CODEX]
+
+
+def test_a_review_counted_twice_keys_its_findings_once():
+    row = _keyed(_rv(DEVIN, H2, _devin("🟡")), 40, [400])
+    got = _ev(head=H2, reviews=(row, dict(row)))
+    assert got["open_keys"] == ["c400"]
+
+
+def test_an_absurdly_long_id_is_none_not_a_crash():
+    assert rb._node_id({"fullDatabaseId": "9" * 5000}) is None
