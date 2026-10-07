@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 import uuid
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
@@ -319,10 +319,58 @@ def verify_cache(config: dict) -> None:
     cache = Path(config["cache"])
     if read_document(cache / "config.json").get("ui_enabled") is not False:
         raise ValueError("managed UI must be explicitly disabled")
-    with sqlite3.connect((cache / "_config.db").as_uri() + "?mode=ro", uri=True) as db:
+    with closing(sqlite3.connect((cache / "_config.db").as_uri() + "?mode=ro", uri=True)) as db:
         values = dict(db.execute("SELECT key,value FROM config"))
     if any(values.get(key) != "false" for key in DISABLED_KEYS):
         raise ValueError("managed automatic indexing/watchers must be disabled")
+
+
+def sync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | OPEN_FLAGS)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def first_existing_parent(path: Path) -> Path:
+    parent = path.parent
+    while not parent.exists():
+        parent = parent.parent
+    return parent
+
+
+def sync_ancestors(path: Path, stop: Path) -> None:
+    """Persist each new directory's entry through its first existing parent."""
+    while True:
+        sync_directory(path)
+        if path == stop:
+            return
+        path = path.parent
+
+
+def sync_staging(state: Path, existing_parent: Path) -> None:
+    # Native config commands have exited and the validation reader is closed.
+    # File fsync alone does not persist containing entries (fsync(2)).
+    def fail(error: OSError) -> None:
+        raise error
+
+    directories = []
+    for root, _children, files in os.walk(state, onerror=fail):
+        directories.append(Path(root))
+        for name in sorted(files):
+            fd = os.open(Path(root) / name, os.O_RDONLY | OPEN_FLAGS)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise ValueError("staged files must be regular")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    for directory in sorted(directories, key=lambda p: (-len(p.parts), str(p))):
+        if directory == state:
+            continue
+        sync_directory(directory)
+    sync_ancestors(state, existing_parent)
 
 
 def publish_settings(path: Path, config: dict) -> None:
@@ -336,11 +384,7 @@ def publish_settings(path: Path, config: dict) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.link(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        sync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -375,6 +419,7 @@ def configure(args: argparse.Namespace, path: Path) -> None:
         if any(os.path.lexists(p) for p in (path, absolute(args.state), state)):
             raise ValueError("existing settings/state preserved; choose a fresh staging state")
         try:
+            existing_parent = first_existing_parent(state)
             with verified_binary(source) as executable:
                 state.mkdir(parents=True, mode=0o700)
                 (state / "bin").mkdir(mode=0o700)
@@ -382,7 +427,6 @@ def configure(args: argparse.Namespace, path: Path) -> None:
                     shutil.copyfileobj(executable, destination)
                     destination.flush()
                     os.fchmod(destination.fileno(), 0o500)
-                    os.fsync(destination.fileno())
             cache = state / "cache"
             cache.mkdir(mode=0o700)
             (state / "runtime").mkdir(mode=0o700)
@@ -399,7 +443,10 @@ def configure(args: argparse.Namespace, path: Path) -> None:
                         stdout=subprocess.DEVNULL,
                     )
             verify_cache(config)
+            sync_staging(state, existing_parent)
+            settings_parent = first_existing_parent(path.parent)
             path.parent.mkdir(parents=True, exist_ok=True)
+            sync_ancestors(path.parent, settings_parent)
             publish_settings(path, config)
         except BaseException:
             print(
@@ -424,7 +471,7 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
                 for key, item in value.items()
                 if key in ("version", "build", "enabled", *PATH_KEYS)
             }
-            validate_settings(value, require_build=False)
+            validate_settings(value)
     except (OSError, ValueError) as error:
         result["settings_error"] = str(error)
     try:
@@ -610,7 +657,11 @@ def main(argv: list[str] | None = None) -> int:
         return uninstall_main(args)
     raw = (
         args.config
-        or os.environ.get("CODEBASE_MEMORY_MCP_MANAGED_CONFIG")
+        or (
+            os.environ.get("CODEBASE_MEMORY_MCP_MANAGED_CONFIG")
+            if args.command == "status"
+            else None
+        )
         or str(Path.home() / ".genesis/config/codebase-managed.json")
     )
     try:

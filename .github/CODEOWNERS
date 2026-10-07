@@ -88,6 +88,8 @@
 /scripts/review_findings.py             @WingedGuardian
 /src/genesis/session_awareness/external_review.py @WingedGuardian
 /src/genesis/session_awareness/external_review_config.py @WingedGuardian
+/scripts/hooks/main_checkout_guard.py   @WingedGuardian
+/config/main_checkout_guard.yaml        @WingedGuardian
 
 # ── CI and repository configuration ─────────────────────────────────────────
 # Not hook surface, but it decides what runs and what binds: a change here can
