@@ -65,6 +65,8 @@ from genesis.memory.graphstore_nx import (  # noqa: F401
 )
 
 if TYPE_CHECKING:  # pragma: no cover
+    from collections.abc import Awaitable, Callable
+
     import aiosqlite
 
 logger = logging.getLogger(__name__)
@@ -240,11 +242,13 @@ async def traverse(
         TraversalResult with connected nodes and query timing.
 
     Every call is recorded for the FalkorDB cutover (``memory/graph_telemetry``):
-    which store was configured, which answered, and why it differed. Recording
-    happens after ``query_ms`` is fixed. A failure to record never changes the
-    result or exception the caller sees; the one exception is a cancellation
-    delivered while the row is being written, which propagates as cancellations
-    must.
+    which store was configured, which answered, and why it differed. A clean
+    outcome is recorded after ``query_ms`` is fixed; a failure of the selected
+    store is recorded the moment it happens, before any fallback runs, so that
+    one write counts in ``query_ms`` (served is "pending": no tier has answered
+    yet). A failure to record never changes the result or exception the caller
+    sees; the one exception is a cancellation delivered while the row is being
+    written, which propagates as cancellations must.
     """
     start = time.monotonic()
 
@@ -254,14 +258,43 @@ async def traverse(
     track = _TraversalTrack(served_by=getattr(active, "name", "?"))
     outcome: str | None = None
     final_reason: str | None = None
+
+    async def _record_break(kind: str) -> None:
+        # The engine has failed: record that NOW, before awaiting a fallback that
+        # could hang or be killed, so the broken clock can never be lost with it.
+        # The row says served "pending" because no tier has answered yet; this
+        # call writes nothing more afterwards (one traversal, one row).
+        track.recorded = True
+        await note_traversal(
+            db,
+            outcome=kind,
+            configured=configured,
+            served_by="pending",
+            primary_reason=selection_error or track.primary_reason,
+            final_reason=None,
+        )
+
+    track.on_break = _record_break
     try:
+        if selection_error:
+            await _record_break("selection_failed")
         result = await _traverse_tiers(
             db, active, root_id, track, start,
             max_depth=max_depth, min_strength=min_strength,
             include_deprecated=include_deprecated,
         )
     except asyncio.CancelledError:
-        outcome, track.served_by = "cancelled", "none"
+        # A cancellation is neutral for the cutover ONLY when the engine had not
+        # already failed. With on_break the failure is already recorded by the
+        # time a cancellation can land; this classification is the backstop for
+        # a track without one.
+        if selection_error:
+            outcome = "selection_failed"
+        elif track.fell_back:
+            outcome = "fallback"
+        else:
+            outcome = "cancelled"
+        track.served_by = "none"
         raise
     except Exception as exc:
         outcome, track.served_by, final_reason = "error", "none", exception_reason(exc)
@@ -278,8 +311,9 @@ async def traverse(
         return result
     finally:
         # Only a classified outcome is recorded: anything else escaping
-        # (interpreter shutdown) must not trigger a database write.
-        if outcome is not None:
+        # (interpreter shutdown) must not trigger a database write. A traversal
+        # whose break was already recorded has its row.
+        if outcome is not None and not track.recorded:
             await note_traversal(
                 db,
                 outcome=outcome,
@@ -298,6 +332,10 @@ class _TraversalTrack:
     declined: bool = False
     fell_back: bool = False
     primary_reason: str | None = None
+    #: Called once when the selected store fails, before any fallback runs.
+    on_break: Callable[[str], Awaitable[None]] | None = None
+    #: The break was recorded as it happened; nothing more to write.
+    recorded: bool = False
 
 
 async def _traverse_tiers(
@@ -350,6 +388,8 @@ async def _traverse_tiers(
     except GraphUnavailableError as exc:
         track.fell_back = True
         track.primary_reason = exception_reason(exc)
+        if track.on_break is not None and not track.recorded:
+            await track.on_break("fallback")
         # Traversal is an ENRICHMENT path — its readers already treat a thin
         # result as "no neighbours", so degrading keeps them working.
         # centrality_scores below is the opposite case and must not do this.

@@ -153,12 +153,34 @@ async def test_a_fallback_to_networkx_is_recorded_with_its_cause(db, monkeypatch
 
     [row] = await _rows(db)
     assert row["outcomes"] == {"fallback": 1}
-    assert row["served"] == {"networkx": 1}
+    # Written when the engine failed, before any tier answered.
+    assert row["served"] == {"pending": 1}
     [event] = row["events"]
     assert event["outcome"] == "fallback"
-    assert event["served_by"] == "networkx"
+    assert event["served_by"] == "pending"
     assert event["primary_reason"] == "ConnectionRefusedError"
     assert event["final_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_fallback_row_is_durable_before_the_fallback_runs(db, monkeypatch):
+    """A fallback that hangs, or a process killed during it, must not take the
+    broken clock with it: the row is already there when the fallback starts."""
+    seen: list[list[dict]] = []
+
+    class _Watching(_OkStore):
+        async def traverse(self, *a, **k):
+            seen.append(await _rows(db))
+            return []
+
+    monkeypatch.setattr(graph_mod, "_traversal_store", lambda: _DeadStore())
+    monkeypatch.setattr(graph_mod, "_store", _Watching(name="networkx"))
+
+    await graph_mod.traverse(db, "root")
+
+    [[row]] = seen
+    assert row["outcomes"] == {"fallback": 1}
+    assert len(await _rows(db)) == 1  # and nothing more after it
 
 
 @pytest.mark.asyncio
@@ -170,7 +192,7 @@ async def test_a_fallback_all_the_way_to_the_cte_is_recorded(db, monkeypatch):
 
     [row] = await _rows(db)
     assert row["outcomes"] == {"fallback": 1}
-    assert row["served"] == {"cte": 1}
+    assert row["served"] == {"pending": 1}
 
 
 @pytest.mark.asyncio
@@ -201,7 +223,7 @@ async def test_an_escaping_error_is_recorded_and_still_raised(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_cte_failure_after_a_fallback_is_an_error(db, monkeypatch):
+async def test_a_cte_failure_after_a_fallback_keeps_exactly_the_fallback_row(db, monkeypatch):
     async def _boom(*a, **k):
         raise sqlite_locked()
 
@@ -217,11 +239,13 @@ async def test_a_cte_failure_after_a_fallback_is_an_error(db, monkeypatch):
     with pytest.raises(GraphUnavailableError):
         await graph_mod.traverse(db, "root")
 
+    # The break was recorded before the fallback ran; the later failure of the
+    # last tier adds no second row for the same traversal.
     [row] = await _rows(db)
-    assert row["outcomes"] == {"error": 1}
+    assert row["outcomes"] == {"fallback": 1}
+    assert row["traversals"] == 1
     [event] = row["events"]
     assert event["primary_reason"] == "ConnectionRefusedError"
-    assert event["final_reason"] == "OperationalError"
 
 
 @pytest.mark.asyncio
@@ -284,7 +308,7 @@ async def test_a_selection_failure_is_recorded(db, monkeypatch):
     [row] = await _rows(db)
     assert row["outcomes"] == {"selection_failed": 1}
     assert row["configured"] == {"falkordb": 1}
-    assert row["served"] == {"networkx": 1}
+    assert row["served"] == {"pending": 1}
     [event] = row["events"]
     assert event["primary_reason"] == "ImportError"
 
@@ -537,3 +561,46 @@ def test_a_prune_keeps_a_line_appended_through_a_handle_opened_before_it():
     assert path.stat().st_ino == inode
     assert [json.loads(line)["caller"] for line in path.read_text().splitlines()] == ["late"]
 
+
+@pytest.mark.asyncio
+async def test_a_cancellation_during_the_fallback_still_breaks_the_clock(db, monkeypatch):
+    """FalkorDB failed, and the request was cancelled while the fallback store
+    was answering: the row must say fallback, not a neutral cancellation."""
+
+    class _SlowFallback(_OkStore):
+        async def traverse(self, *a, **k):
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(graph_mod, "_traversal_store", lambda: _DeadStore())
+    monkeypatch.setattr(graph_mod, "_store", _SlowFallback(name="networkx"))
+
+    with pytest.raises(asyncio.CancelledError):
+        await graph_mod.traverse(db, "root")
+
+    [row] = await _rows(db)
+    assert row["outcomes"] == {"fallback": 1}
+    assert row["served"] == {"pending": 1}
+    [event] = row["events"]
+    assert event["primary_reason"] == "ConnectionRefusedError"
+
+
+
+@pytest.mark.asyncio
+async def test_a_fault_building_the_row_never_reaches_the_caller(db, monkeypatch):
+    """The early write runs inside the fallback path: a fault while building the
+    row must be counted as a lost write, never replace the traversal's result."""
+
+    def _boom(*a, **k):
+        raise RuntimeError("no argv")
+
+    monkeypatch.setattr(telemetry, "_proc_role", None)
+    monkeypatch.setattr(telemetry, "process_role", _boom)
+    monkeypatch.setattr(graph_mod, "_traversal_store", lambda: _DeadStore())
+    monkeypatch.setattr(graph_mod, "_store", _OkStore(name="networkx"))
+
+    result = await graph_mod.traverse(db, "root")
+
+    assert result.nodes == []
+    assert telemetry._write_failures == 1
+    [line] = _lost_lines()
+    assert line["clock_breaking"] == 1
