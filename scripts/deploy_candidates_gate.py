@@ -452,7 +452,11 @@ def hooks_approved(cand: dict) -> bool:
 
 
 def hook_attribution_failures(
-    repo: Repo, base: str, tip: str, approved: dict[str, str]
+    repo: Repo,
+    base: str,
+    tip: str,
+    approved: dict[str, str],
+    merged: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Every hook path whose bytes at the rebuilt ``tip`` differ from ``base``
     must be byte-identical to that path at some APPROVED merged candidate head
@@ -461,14 +465,35 @@ def hook_attribution_failures(
     approved change on top of a change origin/main made since the branch was
     cut, or two approved candidates' changes to one hook. Returns the approved
     candidates behind each such path, with why (to EXCLUDE, like a conflict);
-    empty when every hook on the tip is attributable. Raises Refusal when no
-    approved candidate changed the path, which admission makes impossible."""
+    empty when every hook on the tip is attributable. When no approved candidate
+    changed the path, a rebuild raises Refusal (admission makes that impossible);
+    a drop passes every candidate it keeps as ``merged`` and EXCLUDES the ones
+    without a current approval that changed the path, first, because drop is the
+    repair path. The Refusal remains only for a hook path nothing on the tip
+    changed, which a diff against ``base`` cannot produce."""
     text = repo.git("diff", "--no-renames", "--name-only", "-z", base, tip, "--", *HOOK_DIRS).stdout
     out: dict[str, str] = {}
     for path in (p for p in text.split("\0") if p):
         got = repo.blob_at(tip, path)
         if any(repo.blob_at(h, path) == got for h in approved.values()):
             continue
+        if merged:
+            # Repair (drop): a listed candidate whose approval is gone, or that
+            # never had one, goes first; an approved changer is blamed only when
+            # no unapproved one changed the path.
+            unapproved = [
+                b
+                for b, h in merged.items()
+                if b not in approved
+                and repo.blob_at(h, path) != repo.blob_at(repo.merge_base(base, h) or base, path)
+            ]
+            if unapproved:
+                for b in unapproved:
+                    out[b] = (
+                        f"changes {path} with no current hook approval; "
+                        "add it again with --approve-hooks"
+                    )
+                continue
         changers = [
             b
             for b, h in approved.items()

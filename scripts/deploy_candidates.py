@@ -309,12 +309,15 @@ class Engine(Repo):
         rebuild_id: str,
         sticky: dict[str, str],
         data: dict,
+        repair: bool = False,
     ) -> core.Plan:
         """build_plan, then hook attribution: an approved candidate whose hook
         bytes the merged tip does not hold is EXCLUDED by name (a blend is a known
         negative, like a conflict) and the plan is built again. Each pass excludes
-        at least one more approved candidate, so it ends. rebuild and status both
-        plan through here, so status never predicts what a rebuild would not do."""
+        at least one more candidate, so it ends. rebuild, drop and status all plan
+        through here, so status never predicts what a rebuild would not do, and a
+        drop never leaves hook bytes whose approval it just removed. ``repair``
+        (drop) excludes rather than refuses (see hook_attribution_failures)."""
         approval = {c["branch"]: c for c in data["candidates"] if gate.hooks_approved(c)}
         sticky = dict(sticky)
         while True:
@@ -322,7 +325,9 @@ class Engine(Repo):
             approved = {
                 b: h for b, h in p.merged if b in approval and approval[b]["verified_head"] == h
             }
-            blends = gate.hook_attribution_failures(self, base, p.tip, approved)
+            blends = gate.hook_attribution_failures(
+                self, base, p.tip, approved, dict(p.merged) if repair else None
+            )
             if not blends:
                 return p
             sticky.update(blends)
@@ -527,7 +532,10 @@ class Engine(Repo):
             ).get(branch, []):
                 sticky[b] = f"shares dropped {branch}'s unmerged commits; drop it too"
         rebuild_id = core.now().strftime("%Y%m%dT%H%M%SZ")
-        p = plan.build_plan(self, live_base, remaining, rebuild_id, sticky=sticky)
+        # Attributed like a rebuild: hook bytes the remaining candidates merge
+        # into must match an approval still listed (the dropped one's is gone).
+        kept = {**data, "candidates": [c for c in data["candidates"] if c["branch"] != branch]}
+        p = self._attributed_plan(live_base, remaining, rebuild_id, sticky, kept, repair=True)
         out(
             f"deploy_candidates drop {branch} (on the base `live` is on, {live_base[:12]}; nothing fetched)"
         )

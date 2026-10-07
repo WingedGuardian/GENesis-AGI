@@ -150,6 +150,54 @@ def test_two_approved_candidates_whose_hook_changes_merge_are_excluded(dc, dc_re
     assert _installed(w) == BASE_HOOK
 
 
+def test_dropping_the_approval_a_blend_matched_excludes_the_blend(dc, dc_ready, capsys):
+    """A and B merge into exactly C's approved bytes, so all three go live. Drop C
+    and its approval goes with it: the drop plans through attribution like a
+    rebuild and excludes A and B rather than leave bytes nobody approved."""
+    w = dc_ready
+    w.candidate("feat/a", {PRE_COMMIT: "#!/bin/sh -e\n# pre-commit\nexit 0\n"})
+    w.candidate("feat/b", {PRE_COMMIT: "#!/bin/sh\n# pre-commit\nexit 0 # b\n"})
+    both = "#!/bin/sh -e\n# pre-commit\nexit 0 # b\n"
+    w.candidate("feat/c", {PRE_COMMIT: both})
+    hx = w.candidate("feat/x", {"x.txt": "x\n"})
+    for b in ("feat/a", "feat/b", "feat/c"):
+        assert _approve(w, dc, b) == 0, capsys.readouterr()
+    assert w.add(dc, "feat/x") == 0
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    assert _installed(w) == both
+    capsys.readouterr()
+    assert w.run(dc, "drop", "feat/c") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/a" in out and "EXCLUDED: feat/b" in out, out
+    assert w.live_merges() == [("feat/x", hx)]
+    assert (w.root / PRE_COMMIT).read_text() == BASE_HOOK
+    assert _installed(w) == BASE_HOOK
+
+
+def test_a_drop_excludes_a_hook_on_live_that_no_listed_approval_covers(dc, dc_ready, capsys):
+    """`drop --no-rebuild` takes h's approval out of the manifest while `live`
+    still runs h's hook. The next drop on `live` re-plans with the approvals
+    still listed: h is excluded (repair never refuses over a hook)."""
+    w = dc_ready
+    new = "#!/bin/sh\n# approved once\nexit 0\n"
+    w.candidate("feat/h", {PRE_COMMIT: new})
+    hx = w.candidate("feat/x", {"x.txt": "x\n"})
+    hy = w.candidate("feat/y", {"y.txt": "y\n"})
+    assert _approve(w, dc, "feat/h") == 0
+    assert w.add(dc, "feat/x") == 0
+    assert w.add(dc, "feat/y") == 0
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    assert _installed(w) == new
+    assert w.run(dc, "drop", "feat/h", "--no-rebuild") == 0, capsys.readouterr()
+    capsys.readouterr()
+    assert w.run(dc, "drop", "feat/y") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/h" in out and "no current hook approval" in out, out
+    assert w.live_merges() == [("feat/x", hx)] and hy
+    assert (w.root / PRE_COMMIT).read_text() == BASE_HOOK
+    assert _installed(w) == BASE_HOOK
+
+
 def test_main_changing_an_approved_hook_excludes_that_candidate_only(dc, dc_ready, capsys):
     """origin/main changes the same hook after the branch was cut: the merge
     holds bytes nobody approved. The candidate is excluded with the remedy; an
