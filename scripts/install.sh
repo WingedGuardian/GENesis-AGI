@@ -897,11 +897,11 @@ fi
 # ══════════════════════════════════════════════════════════════
 echo "  [6/$TOTAL_STEPS] Installing Genesis package..."
 
+# shellcheck source=lib/venv_setup.sh
+. "$SCRIPT_DIR/lib/venv_setup.sh"
 if [ -d "$VENV_PATH" ]; then
     # Worktree guard + editable install + import verification — shared with
     # bootstrap.sh so the guard can't drift between the two entry points.
-    # shellcheck source=lib/venv_setup.sh
-    . "$SCRIPT_DIR/lib/venv_setup.sh"
     _ei_rc=0
     editable_install_guarded "$REPO_DIR" "$VENV_PATH" || _ei_rc=$?
     case $_ei_rc in
@@ -1387,7 +1387,7 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         case "$timer_name" in
             genesis-backup.timer) continue ;;  # deliberate setup step
             genesis-transcript-analytics.timer)
-                if ! "$VENV_PATH/bin/python" -m genesis.transcript_analytics.config; then
+                if ! transcript_analytics_ready "$VENV_PATH"; then
                     systemctl --user disable --now "$timer_name" 2>/dev/null || true
                     continue
                 fi ;;

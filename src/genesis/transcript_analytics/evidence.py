@@ -14,7 +14,7 @@ from .query import run_query
 
 
 def _window(stream, line, surrounding, budget, expected_id=None):
-    records, truncated = [], False
+    records = []
     identity_matches = expected_id is None
     for number, raw in enumerate(stream, 1):
         if number < max(1, line - surrounding):
@@ -37,24 +37,36 @@ def _window(stream, line, surrounding, budget, expected_id=None):
         if failed:
             text = "[scrub failed: evidence withheld]"
         encoded = (text or "").encode()
-        if len(encoded) > budget:
-            text = encoded[:budget].decode("utf-8", "ignore")
-            truncated = True
-        records.append({"line": number, "text": text})
-        budget -= len((text or "").encode())
-        if budget <= 0:
-            truncated = True
-            break
+        records.append(
+            {
+                "line": number,
+                "text": encoded[:budget].decode("utf-8", "ignore"),
+                "truncated": len(encoded) > budget,
+            }
+        )
     if not identity_matches:
         return {
             "unavailable": "target line no longer matches the referenced tool use",
             "records": [],
             "target_available": False,
         }
+    selected = []
+    truncated = False
+    for record in sorted(records, key=lambda r: (abs(r["line"] - line), r["line"])):
+        encoded = record["text"].encode()
+        if budget <= 0:
+            truncated = True
+            continue
+        text = encoded[:budget].decode("utf-8", "ignore")
+        clipped = record["truncated"] or len(encoded) > budget
+        selected.append({"line": record["line"], "text": text, "truncated": clipped})
+        truncated |= clipped
+        budget -= len(text.encode())
+    selected.sort(key=lambda r: r["line"])
     return {
-        "records": records,
+        "records": selected,
         "truncated": truncated,
-        "target_available": any(r["line"] == line for r in records),
+        "target_available": any(r["line"] == line for r in selected),
     }
 
 
@@ -105,7 +117,13 @@ def _archive_window(archive, relative, line, surrounding, budget, expected_id=No
 def read_reference(
     projects, relative, line, *, surrounding=5, budget=65536, archive_dir=None, expected_id=None
 ):
-    path = PurePosixPath(relative)
+    from .store import source_path
+
+    try:
+        relative = source_path(relative)
+        path = PurePosixPath(relative)
+    except (TypeError, ValueError):
+        return {"unavailable": "invalid source reference"}
     if path.is_absolute() or ".." in path.parts or not path.parts or line < 1:
         return {"unavailable": "invalid source reference"}
     target = projects / relative
@@ -119,7 +137,7 @@ def read_reference(
             raise FileNotFoundError("live evidence identity changed")
     except FileNotFoundError:
         archive_dir = archive_dir or Path.home() / "backups/genesis-backups/transcripts"
-        archive = archive_dir / f"v2-{hashlib.sha256(relative.encode()).hexdigest()}.tar.gpg"
+        archive = archive_dir / f"v2-{hashlib.sha256(os.fsencode(relative)).hexdigest()}.tar.gpg"
         if not archive.is_file():
             return {"unavailable": "source and local encrypted archive absent"}
         try:
@@ -128,6 +146,62 @@ def read_reference(
             return {"unavailable": "local archive unreadable or invalid"}
     except OSError:
         return {"unavailable": "source unreadable"}
+
+
+def _clip_json_text(text, budget):
+    """Largest character prefix whose JSON string payload fits the byte budget."""
+    lower, upper = 0, len(text)
+    while lower < upper:
+        middle = (lower + upper + 1) // 2
+        cost = len(json.dumps(text[:middle], ensure_ascii=False).encode()) - 2
+        if cost <= budget:
+            lower = middle
+        else:
+            upper = middle - 1
+    return text[:lower]
+
+
+def _fit_output(out, budget):
+    """Discard distant context first, then share target text space fairly."""
+
+    def size():
+        return len(json.dumps(out, ensure_ascii=False).encode())
+
+    while size() > budget:
+        context = [
+            (ref, record)
+            for ref in out.get("references", [])
+            for record in ref.get("records", [])
+            if record["line"] != ref["line"]
+        ]
+        if not context:
+            break
+        ref, record = max(context, key=lambda pair: abs(pair[1]["line"] - pair[0]["line"]))
+        ref["records"].remove(record)
+        ref["truncated"] = True
+        out["truncated"] = True
+    if size() <= budget:
+        return out
+    targets = [
+        (ref, record, record["text"])
+        for ref in out.get("references", [])
+        for record in ref.get("records", [])
+    ]
+    out["truncated"] = True
+    for ref, record, _ in targets:
+        record["text"] = ""
+        ref["truncated"] = True
+    available = budget - size()
+    if available < 0 or not targets:
+        return {"truncated": True, "unavailable": "references exceed evidence byte budget"}
+    # Short targets release unused space to longer targets; JSON escaping counts.
+    targets.sort(key=lambda item: len(json.dumps(item[2], ensure_ascii=False).encode()))
+    for index, (_, record, text) in enumerate(targets):
+        clipped = _clip_json_text(text, available // (len(targets) - index))
+        record["text"] = clipped
+        record["truncated"] |= clipped != text
+        available -= len(json.dumps(clipped, ensure_ascii=False).encode()) - 2
+    return out
 
 
 def evidence(data, projects, tool_use_id, *, surrounding=5, budget=65536):
@@ -142,7 +216,7 @@ def evidence(data, projects, tool_use_id, *, surrounding=5, budget=65536):
     out = {"tool_use_id": tool_use_id, "references": [], "truncated": False}
     if not rows:
         out["unavailable"] = "tool use ID absent from query coverage"
-        return out
+        return _fit_output(out, budget)
     for relative, line in ((rows[0][0], rows[0][1]), (rows[0][2], rows[0][3])):
         if not relative or line is None:
             out["references"].append({"unavailable": "call or result reference absent"})
@@ -161,14 +235,8 @@ def evidence(data, projects, tool_use_id, *, surrounding=5, budget=65536):
         }
         out["references"].append(ref)
         out["truncated"] |= ref.get("truncated", False)
-    # JSON escaping and metadata count against the output budget too.
-    while len(json.dumps(out, ensure_ascii=False).encode()) > budget:
-        candidates = [r for r in out["references"] if r.get("records")]
-        if not candidates:
-            return {"truncated": True, "unavailable": "references exceed evidence byte budget"}
-        max(candidates, key=lambda r: len(json.dumps(r))).get("records").pop()
-        out["truncated"] = True
-    for ref in out["references"]:
+    out = _fit_output(out, budget)
+    for ref in out.get("references", []):
         if "records" in ref:
             ref["target_available"] = any(r["line"] == ref["line"] for r in ref["records"])
     return out

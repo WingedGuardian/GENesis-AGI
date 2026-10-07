@@ -37,8 +37,6 @@ def build(data: Path, *, lock_path: Path | None = None) -> dict:
     t0 = time.monotonic()
     root = data / "derived"
     with store._locked(lock_path or store.DEFAULT_LOCK):
-        if not all(any(data.glob(f"{t}__*.parquet")) for t in store.TABLES):
-            return {"skipped": "empty store"}
         root.mkdir(
             parents=True, exist_ok=True
         )  # BEFORE reading input_fp: creating it bumps data's mtime
@@ -64,12 +62,16 @@ def build(data: Path, *, lock_path: Path | None = None) -> dict:
                 "views_version": query.VIEWS_VERSION,
                 "restore_epoch": restore_epoch(),
                 "input_fp": input_fp,
-                "semantics": {k.decode(): v.decode() for k, v in store.semantics().items()},
+                "semantics": {k.decode(): os.fsdecode(v) for k, v in store.semantics().items()},
                 "coverage": {"included": len(keys), "excluded": excluded},
                 "inventory": store.inventory(data),
                 "sources": [
                     {
-                        k.decode(): v.decode()
+                        k.decode(): (
+                            store.source_identity(os.fsdecode(v))
+                            if k == b"ta.source"
+                            else v.decode()
+                        )
                         for k, v in store.source_metadata(data, key)[0].items()
                         if k in (b"ta.source", b"ta.fp", b"ta.generation")
                     }

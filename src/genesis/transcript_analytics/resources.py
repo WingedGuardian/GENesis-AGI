@@ -73,6 +73,8 @@ def ensure_capped(argv: list[str], cfg: Config) -> int | None:
         "MemorySwapMax=0",
         "-p",
         f"CPUQuota={cpu:.2f}%",
+        "-p",
+        "RuntimeMaxSec=1h",
         "--",
         sys.executable,
         "-m",

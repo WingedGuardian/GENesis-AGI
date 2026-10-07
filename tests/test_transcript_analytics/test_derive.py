@@ -164,9 +164,10 @@ def test_reaudit_sf2_prune_date_is_normalized(tmp_path):
     )  # 2026-09-01 is NOT before 2026-01-01
 
 
-def test_reaudit_sf3_derive_on_empty_store_is_skipped_not_fatal(tmp_path):
+def test_reaudit_sf3_derive_on_empty_store_publishes_empty_views(tmp_path):
     (tmp_path / "data").mkdir()
-    assert derive.build(tmp_path / "data").get("skipped") == "empty store"
+    assert "views" in derive.build(tmp_path / "data")
+    assert query.run_query(tmp_path / "data", "select count(*) from turns")[1] == [(0,)]
 
 
 def test_reaudit_sf3_ingest_survives_a_derive_failure(built, monkeypatch, capsys):

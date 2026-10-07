@@ -85,6 +85,7 @@ def test_scope_caps_command_and_exit(base, admitted):
     assert "MemoryMax=268435456" in args
     assert "MemorySwapMax=0" in args
     assert "CPUQuota=100.00%" in args
+    assert "RuntimeMaxSec=1h" in args
     assert args[-2:] == ["transcripts", "ingest"]
     assert run.call_args.kwargs["env"][resources._CHILD] == "268435456,100.00"
 

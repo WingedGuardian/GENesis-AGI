@@ -66,10 +66,18 @@ if __name__ == "__main__":
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--data-dir", action="store_true")
     mode.add_argument("--configured-data-dir", action="store_true")
+    mode.add_argument("--configured-enabled", action="store_true")
+    mode.add_argument("--configured-enabled-data-dir", action="store_true")
     args = parser.parse_args()
     try:
-        cfg = load(ignore_kill=args.configured_data_dir)
-        if args.configured_data_dir or (args.data_dir and cfg.enabled):
+        cfg = load(
+            ignore_kill=args.configured_data_dir
+            or args.configured_enabled
+            or args.configured_enabled_data_dir
+        )
+        if args.configured_data_dir or (
+            (args.data_dir or args.configured_enabled_data_dir) and cfg.enabled
+        ):
             print(cfg.data_dir)
         raise SystemExit(0 if cfg.enabled or args.configured_data_dir else 1)
     except Exception as exc:
