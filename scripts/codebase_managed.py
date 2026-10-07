@@ -34,7 +34,19 @@ from code_intel_cbm_admission import (  # noqa: E402
     resolve_cgroup,
 )
 from code_intel_cbm_worker import BUILD  # noqa: E402
-from codebase_managed_unit import loaded_properties, validate_backend  # noqa: E402,F401
+from codebase_managed_unit import (  # noqa: E402,F401
+    artifact_parent,
+    artifact_snapshot,
+    canonical_sources,
+    implicit_slice_absent,
+    loaded_properties,
+    native_env,
+    native_install,
+    parent_identity,
+    sentinel_armed,
+    validate_backend,
+    validate_source_identity,
+)
 
 SCRIPT = Path(__file__).resolve()
 BACKEND = "genesis-cbm-query.service"
@@ -254,39 +266,86 @@ def require_no_batch() -> None:
         require_quiescent(unit)
 
 
-def retire_managed() -> None:
+def inspect_sources(config=None, *, removed=False):
+    runtime = absolute(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    sources = canonical_sources(SCRIPT, (units_dir(), runtime / "systemd/user"),
+                                (BACKEND, SLICE), config)
+    for unit, (snapshot, _) in sources[1].items():
+        if snapshot is None:
+            if config:
+                raise ValueError(f"enable requires canonical installed {unit}")
+            if removed:
+                require_quiescent(unit)  # own deletion leaves a cached inactive object
+            elif unit == SLICE and not manager_absent(unit) and implicit_slice_absent(unit):
+                require_quiescent(unit)  # native implicit slice must still be empty/inactive
+            elif not manager_absent(unit):
+                raise ValueError(f"missing source is not native absence: {unit}")
+        elif config and snapshot[0].parent != units_dir().resolve():
+            raise ValueError("enable requires persistent installed unit sources")
+    return sources
+
+
+def refresh_sources(sources, config=None, *, removed=False) -> None:
+    if inspect_sources(config, removed=removed) != sources:
+        raise ValueError("managed unit sources changed before refresh")
+    if not removed and all(snapshot is None for snapshot, _ in sources[1].values()):
+        return  # strict native absence needs no global manager mutation
+    subprocess.run(["/usr/bin/systemctl", "--user", "daemon-reload"], check=True, timeout=30)
+    if inspect_sources(config) != sources:
+        raise ValueError("managed unit sources changed during refresh")
+    for unit, (snapshot, parameters) in sources[1].items():
+        if snapshot:
+            validate_source_identity(unit, snapshot)
+            if unit == BACKEND:
+                validate_backend({}, BACKEND, absolute, parameters)
+
+
+def retire_managed():
     errors = []
+    try:
+        sources = inspect_sources()
+        refresh_sources(sources)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        errors.append(("authority", str(error)))
+        sources = None
     for argv in (
         ("disable", BACKEND),
         ("disable", "--runtime", BACKEND),
         ("stop", BACKEND),
         ("stop", SLICE),
     ):
+        if sources is None or sources[1][argv[-1]][0] is None:
+            continue  # unknown authority is a refusal, not a permissive emergency stop
         try:
-            result = subprocess.run(
-                ["/usr/bin/systemctl", "--user", *argv],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            if result.returncode and not manager_absent(argv[-1]):
-                errors.append((argv[0], result.stderr.strip()))
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            if inspect_sources() != sources:
+                raise ValueError("managed unit sources changed before retirement command")
+            if argv[0] == "disable":
+                native_install("disable", BACKEND, runtime="--runtime" in argv)
+            else:
+                subprocess.run(["/usr/bin/systemctl", "--user", *argv], capture_output=True,
+                               text=True, check=True, timeout=60)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             errors.append(("command", f"{argv[0]}: {error}"))
     for unit in (BACKEND, SLICE):
         try:
             require_quiescent(unit)
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             errors.append(("proof", f"{unit}: {error}"))
+    if sources is not None and not any(action == "proof" for action, _ in errors):
+        try:
+            refresh_sources(sources)  # native installation state may still be cached
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            errors.append(("refresh", str(error)))
     try:
         state = show(BACKEND, "UnitFileState", "LoadState")
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         errors.append(("proof", str(error)))
         state = {"UnitFileState": "", "LoadState": ""}
-    safe = state["UnitFileState"] in ("generated", "transient", "static", "disabled", "masked")
+    safe = state == {"UnitFileState": "disabled", "LoadState": "loaded"}
     absent = state == {"UnitFileState": "", "LoadState": "not-found"}
-    if any(action != "disable" for action, _ in errors) or not (safe or absent):
+    if errors or not (safe or absent):
         raise ValueError(f"managed retirement failed: errors={errors}, state={state}")
+    return sources
 
 
 def runtime_config(path: Path) -> dict:
@@ -301,12 +360,16 @@ def validate_loaded_backend(config: dict) -> None:
     validate_backend(config, BACKEND, absolute)
 
 
-def enable_preflight(config: dict) -> None:
+def runtime_preflight(config: dict) -> None:
     verify_cache(config)
     with verified_binary(Path(config["binary"])):
         pass  # fail before changing native state when the accepted inode is invalid
     if sentinel_armed(config["sentinel"]):
         raise ValueError("managed Codebase sentinel is armed")
+
+
+def enable_preflight(config: dict) -> None:
+    runtime_preflight(config)
     properties = show(SLICE, "LoadState", "MemoryMax", "MemorySwapMax", "TasksMax")
     if properties != dict(
         LoadState="loaded", MemoryMax=str(2 * 1024**3), MemorySwapMax="0", TasksMax="512"
@@ -316,23 +379,20 @@ def enable_preflight(config: dict) -> None:
 
 
 def enable(config: dict) -> None:
-    enable_preflight(config)
-    # Never reload a running backend then retire rejected stop commands.
-    # unit_stop is a no-op for inactive/failed units; this check also proves
-    # no surviving descendants before the first native enablement mutation.
+    runtime_preflight(config)
     require_quiescent(BACKEND)
+    sources = inspect_sources(config)
     try:
-        subprocess.run(
-            ["/usr/bin/systemctl", "--user", "enable", BACKEND],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=150,
-        )
+        refresh_sources(sources, config)
+        enable_preflight(config)
+        native_install("enable", BACKEND)
         installed = Path.home() / ".genesis/config/codebase-managed.json"
         if runtime_config(installed) != config:
             raise ValueError("managed settings changed during enablement")
-        enable_preflight(config)  # enable reloads; validate that snapshot before start
+        runtime_preflight(config)
+        require_quiescent(BACKEND)
+        refresh_sources(sources, config)
+        enable_preflight(config)
         subprocess.run(["/usr/bin/systemctl", "--user", "start", BACKEND],
                        capture_output=True, text=True, check=True, timeout=150)
         ready(config)
@@ -345,41 +405,9 @@ def enable(config: dict) -> None:
         raise ValueError(f"native enable failed: {startup}; rollback: {rollback}") from startup
 
 
-def artifact_snapshot(path: Path):
-    try:
-        value = path.lstat()
-    except FileNotFoundError:
-        return None
-    if not (stat.S_ISREG(value.st_mode) or stat.S_ISLNK(value.st_mode)):
-        raise ValueError(f"refusing non-file managed unit artifact: {path}")
-    return value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode)
-
-
-def artifact_parent(path: Path) -> Path:
-    # Directory aliases are selected native namespaces. Resolve parents only;
-    # final artifact links must never resolve into their target files.
-    for ancestor in (path, *path.parents):
-        if ancestor.is_symlink():
-            ancestor.resolve(strict=True)  # a dangling directory alias is not absence
-    if path.is_symlink() or path.exists():
-        parent = path.resolve(strict=True)
-        if not parent.is_dir():
-            raise ValueError(f"refusing non-directory managed unit parent: {path}")
-        return parent
-    return path.resolve()  # definitely absent ordinary directory: no creation
-
-
-def parent_identity(path: Path):
-    try:
-        value = path.stat()
-    except FileNotFoundError:
-        return None
-    if not stat.S_ISDIR(value.st_mode):
-        raise ValueError(f"refusing non-directory managed unit parent: {path}")
-    return value.st_dev, value.st_ino
-
-
-def remove_unit_artifacts() -> None:
+def remove_unit_artifacts(retired=None) -> None:
+    if retired is None:
+        retired = retire_managed()
     runtime = absolute(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
     candidates = []
     parents = []
@@ -415,8 +443,15 @@ def remove_unit_artifacts() -> None:
     # Native manager state must be refreshed even after a partial unlink failure.
     if deleted or failure is None:
         try:
-            subprocess.run(["/usr/bin/systemctl", "--user", "daemon-reload"], check=True, timeout=30)
-        except (OSError, subprocess.SubprocessError) as error:
+            for unit in (BACKEND, SLICE):
+                require_quiescent(unit)
+            remaining = inspect_sources(removed=True)
+            # Only this invocation's intentionally removed sources may disappear.
+            for unit, (snapshot, _) in remaining[1].items():
+                if snapshot is not None and remaining[1][unit] != retired[1][unit]:
+                    raise ValueError("remaining managed source changed during removal")
+            refresh_sources(remaining, removed=True)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             raise ValueError(f"managed artifact removal: {failure}; reload failed: {error}") from error
     if failure is not None:
         raise ValueError(f"managed artifact removal failed (partial={deleted}): {failure}") from failure
@@ -431,9 +466,9 @@ def lifecycle_main(args: argparse.Namespace) -> int:
                     raise ValueError("enable requires the installed settings path")
                 enable(runtime_config(path))
             else:
-                retire_managed()
+                retired = retire_managed()
                 if args.command == "remove":
-                    remove_unit_artifacts()
+                    remove_unit_artifacts(retired)
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
         print(f"managed lifecycle refused: {error}", file=sys.stderr)
@@ -537,26 +572,6 @@ def verified_binary(path: Path):
         stream.close()
         raise
     return stream
-
-
-def sentinel_armed(raw: str) -> bool:
-    try:
-        os.lstat(raw)
-    except FileNotFoundError:
-        return any(os.path.lexists(p) and not os.path.exists(p) for p in Path(raw).parents)
-    except OSError:
-        return True
-    return True
-
-
-def native_env(config: dict) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CBM_")}
-    env.update(
-        CBM_CACHE_DIR=config["cache"],
-        CBM_RUNTIME_DIR=config["runtime"],
-        CBM_ALLOWED_ROOT=config["main"],
-    )
-    return env
 
 
 def verify_cache(config: dict) -> None:

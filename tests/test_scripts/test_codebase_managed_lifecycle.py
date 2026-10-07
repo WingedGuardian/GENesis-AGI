@@ -158,6 +158,9 @@ def startup(operator, monkeypatch):
     monkeypatch.setitem(namespace, "validate_loaded_backend", lambda config: calls.append("loaded"))
     config = {"binary": "/binary", "sentinel": "/sentinel", "main": "/main"}
     monkeypatch.setitem(namespace, "runtime_config", lambda path: config)
+    monkeypatch.setitem(namespace, "inspect_sources", lambda *a, **k: "canonical sources")
+    monkeypatch.setitem(namespace, "refresh_sources", lambda *a, **k: calls.append("refresh"))
+    monkeypatch.setitem(namespace, "native_install", lambda action, unit: calls.append(action))
     monkeypatch.setattr(namespace["subprocess"], "run", lambda argv, **k: calls.append(argv[2]))
     monkeypatch.setitem(namespace, "ready", lambda config: calls.append("ready"))
     monkeypatch.setitem(namespace, "require_quiescent", lambda unit: calls.append("quiescent"))
@@ -179,7 +182,8 @@ def test_invalid_setup_refuses_before_enable(operator, startup, monkeypatch, fau
         properties[fault] = "wrong"
     with pytest.raises(ValueError):
         operator.enable(config)
-    assert "enable" not in calls and "rollback" not in calls
+    assert "enable" not in calls
+    assert ("rollback" not in calls) == (fault in ("cache", "binary", "sentinel"))
 
 
 @pytest.mark.parametrize("failure", ["start", "ready", "rollback"])
@@ -208,7 +212,8 @@ def test_failed_enable_retains_startup_and_rollback_errors(operator, startup, mo
 def test_success_requires_actual_readiness(operator, startup):
     _, calls, _, config = startup
     operator.enable(config)
-    assert calls == ["cache", "loaded", "quiescent", "enable", "cache", "loaded", "start", "ready"]
+    assert calls == ["cache", "quiescent", "refresh", "cache", "loaded", "enable",
+                     "cache", "quiescent", "refresh", "cache", "loaded", "start", "ready"]
 
 
 def test_active_existing_backend_refuses_before_reload_or_retirement(operator, startup, monkeypatch):
@@ -225,20 +230,21 @@ def test_post_reload_changes_never_start_and_are_retired(operator, startup, monk
     if fault == "settings":
         monkeypatch.setitem(namespace, "runtime_config", lambda path: {"changed": True})
     elif fault == "sentinel":
-        monkeypatch.setitem(namespace, "sentinel_armed", Mock(side_effect=[False, True]))
+        monkeypatch.setitem(namespace, "sentinel_armed", Mock(side_effect=[False, False, True]))
     else:
         name = "validate_loaded_backend" if fault == "loaded" else "verify_cache"
         error = sqlite3.DatabaseError("late corruption") if fault == "database" else ValueError("late change")
-        monkeypatch.setitem(namespace, name, Mock(side_effect=[None, error]))
+        monkeypatch.setitem(namespace, name, Mock(side_effect=[None, error] if fault == "loaded"
+                                                        else [None, None, error]))
     with pytest.raises(ValueError, match="native enable failed"):
         operator.enable(config)
     assert "enable" in calls and "start" not in calls and "rollback" in calls
 
 
-def test_partial_parent_resolution_failure_still_reloads(operator, tmp_path, monkeypatch):
+def test_partial_parent_resolution_failure_still_reloads(operator, fixed_artifact_authority, tmp_path, monkeypatch):
     paths = artifact_population(operator, tmp_path, monkeypatch)
     resolve = operator.artifact_parent
-    namespace = resolve.__globals__
+    namespace = operator.remove_unit_artifacts.__globals__
     def changed(path):
         if not paths[0].exists():
             raise RuntimeError("symlink loop after first unlink")
@@ -251,6 +257,35 @@ def test_partial_parent_resolution_failure_still_reloads(operator, tmp_path, mon
     assert "symlink loop" in str(error.value)
     reload.assert_called_once()
     assert paths[1].exists()
+
+
+@pytest.fixture
+def fixed_artifact_authority(operator, monkeypatch):
+    """Artifact tests isolate inode/unlink behavior; source gates have their own suite."""
+    namespace = operator.remove_unit_artifacts.__globals__
+    sources = ((), {operator.BACKEND: (None, None), operator.SLICE: (None, None)})
+    monkeypatch.setitem(namespace, "inspect_sources", lambda *a, **k: sources)
+    monkeypatch.setitem(namespace, "require_quiescent", lambda unit: None)
+    monkeypatch.setitem(namespace, "refresh_sources", lambda *a, **k:
+                        namespace["subprocess"].run(["/usr/bin/systemctl", "--user", "daemon-reload"],
+                                                    check=True, timeout=30))
+    # Direct artifact tests also enter the retirement precondition. Retirement
+    # behavior itself remains exercised with explicit supported-state fixtures.
+    monkeypatch.setitem(namespace, "retire_managed", lambda: sources)
+
+
+@pytest.fixture
+def supported_retirement(operator, monkeypatch):
+    namespace = operator.retire_managed.__globals__
+    sources = ((), {operator.BACKEND: ("source", None), operator.SLICE: ("source", None)})
+    monkeypatch.setitem(namespace, "inspect_sources", lambda *a, **k: sources)
+    monkeypatch.setitem(namespace, "refresh_sources", lambda *a, **k: None)
+    def install(action, unit, *, runtime=False):
+        result = namespace["subprocess"].run(
+            ["/usr/bin/systemctl", "--user", action, *(("--runtime",) if runtime else ()), unit])
+        if result.returncode:
+            raise subprocess.CalledProcessError(result.returncode, action)
+    monkeypatch.setitem(namespace, "native_install", install)
 
 
 def artifact_population(operator, tmp_path, monkeypatch):
@@ -269,7 +304,7 @@ def artifact_population(operator, tmp_path, monkeypatch):
 @pytest.mark.parametrize("slot", range(8))
 @pytest.mark.parametrize("kind", ["directory", "fifo"])
 def test_invalid_artifact_anywhere_preserves_complete_population(
-    operator, tmp_path, monkeypatch, slot, kind
+    operator, fixed_artifact_authority, tmp_path, monkeypatch, slot, kind
 ):
     paths = artifact_population(operator, tmp_path, monkeypatch)
     paths[slot].unlink()
@@ -285,7 +320,7 @@ def test_invalid_artifact_anywhere_preserves_complete_population(
 
 @pytest.mark.parametrize("membership", [False, True])
 def test_selected_directory_aliases_preserve_unrelated_names_and_targets(
-    operator, tmp_path, monkeypatch, membership
+    operator, fixed_artifact_authority, tmp_path, monkeypatch, membership
 ):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "runtime"))
@@ -305,7 +340,7 @@ def test_selected_directory_aliases_preserve_unrelated_names_and_targets(
     assert not (external / operator.BACKEND).is_symlink()
 
 
-def test_partial_unlink_failure_reloads_and_reports_failure(operator, tmp_path, monkeypatch):
+def test_partial_unlink_failure_reloads_and_reports_failure(operator, fixed_artifact_authority, tmp_path, monkeypatch):
     paths = artifact_population(operator, tmp_path, monkeypatch)
     unlink = Path.unlink
     def fail(path, *args, **kwargs):
@@ -322,12 +357,12 @@ def test_partial_unlink_failure_reloads_and_reports_failure(operator, tmp_path, 
 
 
 @pytest.mark.parametrize("fault", ["appeared", "replaced", "vanished", "lookup"])
-def test_population_recheck_preserves_observed_changes(operator, tmp_path, monkeypatch, fault):
+def test_population_recheck_preserves_observed_changes(operator, fixed_artifact_authority, tmp_path, monkeypatch, fault):
     paths = artifact_population(operator, tmp_path, monkeypatch)
     if fault == "appeared":
         paths[-1].unlink()
     snapshot = operator.artifact_snapshot
-    namespace = snapshot.__globals__
+    namespace = operator.remove_unit_artifacts.__globals__
     count = 0
     def observe(path):
         nonlocal count
@@ -356,7 +391,7 @@ def test_population_recheck_preserves_observed_changes(operator, tmp_path, monke
 
 
 @pytest.mark.parametrize("kind", ["dangling", "cyclic", "file", "fifo"])
-def test_invalid_membership_parent_refuses_every_unlink(operator, tmp_path, monkeypatch, kind):
+def test_invalid_membership_parent_refuses_every_unlink(operator, fixed_artifact_authority, tmp_path, monkeypatch, kind):
     paths = artifact_population(operator, tmp_path, monkeypatch)
     parent = paths[2].parent
     for path in paths[2:4]:
@@ -379,7 +414,7 @@ def test_invalid_membership_parent_refuses_every_unlink(operator, tmp_path, monk
 
 
 @pytest.mark.parametrize("partial", [False, True])
-def test_reload_failure_never_reports_success(operator, tmp_path, monkeypatch, partial):
+def test_reload_failure_never_reports_success(operator, fixed_artifact_authority, tmp_path, monkeypatch, partial):
     paths = artifact_population(operator, tmp_path, monkeypatch)
     if partial:
         unlink = Path.unlink
@@ -411,7 +446,7 @@ def test_corrupt_cache_reports_refusal_before_mutation(
 
 
 @pytest.mark.parametrize("initial", [{"runtime"}, {"persistent", "runtime"}])
-def test_runtime_and_mixed_enablement_are_both_retired(operator, monkeypatch, initial):
+def test_runtime_and_mixed_enablement_are_both_retired(operator, monkeypatch, initial, supported_retirement):
     links = set(initial)
     namespace = operator.retire_managed.__globals__
 
@@ -443,7 +478,7 @@ def test_runtime_and_mixed_enablement_are_both_retired(operator, monkeypatch, in
         "still-enabled",
     ],
 )
-def test_retirement_attempts_all_commands_and_proofs(operator, monkeypatch, failure):
+def test_retirement_attempts_all_commands_and_proofs(operator, monkeypatch, failure, supported_retirement):
     namespace = operator.retire_managed.__globals__
     calls, proofs = [], []
     selected = {
@@ -495,7 +530,7 @@ def test_retirement_does_not_read_settings(operator, tmp_path, monkeypatch, comm
     )
     calls = []
     monkeypatch.setitem(namespace, "retire_managed", lambda: calls.append("retire"))
-    monkeypatch.setitem(namespace, "remove_unit_artifacts", lambda: calls.append("remove"))
+    monkeypatch.setitem(namespace, "remove_unit_artifacts", lambda retired: calls.append("remove"))
     assert operator.lifecycle_main(argparse.Namespace(command=command, config="/bad/settings")) == 0
     assert calls == (["retire"] if command == "disable" else ["retire", "remove"])
 
@@ -514,7 +549,7 @@ def test_exclusive_lifecycle_lock_refuses_busy_admission(operator, tmp_path, mon
 
 @pytest.mark.parametrize("kind", ["regular", "symlink", "dangling", "directory", "fifo"])
 def test_fixed_fragment_removal_preserves_state_and_foreign_targets(
-    operator, tmp_path, monkeypatch, kind
+    operator, fixed_artifact_authority, tmp_path, monkeypatch, kind
 ):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "runtime"))

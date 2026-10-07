@@ -1424,11 +1424,13 @@ verified: 3c750316479f 2026-10-05
   validates installed immutable state, typed backend commands/caps and loaded
   client slice limits; it requires initial quiescence, enables without starting,
   revalidates after reload, then starts and proves readiness. Failed startup
-  attempts independent retirement without reloading an already running backend.
-  Disable/remove remain usable without valid settings, prove actual quiescence
-  and preserve immutable settings/provider state. Remove unlinks fixed artifacts
-  only after validating the full candidate population; partial unlink failures
-  still reload native state. Frontend and queued-worker admission integration
+  attempts the same canonical-source retirement as disable/remove: inspect both
+  fixed sources before a validated reload and refuse unsupported definitions.
+  Supported canonical retirement remains usable without valid settings or the
+  selected interpreter, proves actual quiescence and preserves immutable state.
+  Remove unlinks fixed artifacts only after validating the full population;
+  partial unlink failures refresh only after proving quiescence and accepted
+  remaining sources. Frontend and queued-worker admission integration
   remain separate concerns.
 - **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw

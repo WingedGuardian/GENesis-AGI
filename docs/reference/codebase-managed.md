@@ -18,29 +18,48 @@ python3 -I scripts/codebase_managed.py disable
 python3 -I scripts/codebase_managed.py remove
 ```
 
-`enable` uses the fixed installed settings path and validates the pin/cache/sentinel,
-aggregate slice limits, and typed loaded backend commands and limits before any
-enablement change. It enables without starting, revalidates after the native reload,
-then starts the query service and verifies native readiness. Backend argv must match
+`enable` uses the fixed installed settings path and validates the pin/cache/sentinel.
+Before native mutation it requires exact current rendered service and slice sources
+in the supported installed namespaces, with no competing fragments or override
+namespaces anywhere in the manager's lookup paths. Extra directives, comments,
+whitespace changes, masks, generated/transient sources and final fragment symlinks
+refuse; selected directory aliases and literal installation paths remain supported.
+It explicitly refreshes accepted sources, verifies their loaded identities, commands
+and limits, enables through the same manager's native installation API without
+starting, rechecks and refreshes accepted sources again, then starts and verifies
+native readiness. Backend argv must match
 the installed positional bridge, including its `no-env-expand` flag; auxiliary
 execution commands refuse. A custom installation must supply the same absolute
 `VENV_PATH` used by `install.sh` when invoking `enable`; otherwise the configured
 main checkout's `.venv` is expected. Disable/remove do not require that variable.
-Missing typed manager properties or unavailable `busctl` refuse activation.
+Missing typed manager properties, unsupported native namespace layouts or unavailable
+`busctl` refuse activation. Installation calls cannot fall back to a client-side
+reader. Current canonical templates are the authority, not a partial directive
+allowlist or `NeedDaemonReload` flag.
 Enable also requires an initially inactive or failed backend with no main PID or
 populated cgroup. An already running backend refuses before reload or retirement;
 this prevents rollback from executing newly reloaded incompatible stop commands.
 It never removes the
-sentinel. Failed startup attempts independent native disable and stops of backend
-and client slice; startup and rollback errors remain visible. A command timeout
-does not prevent the remaining retirement attempts.
+sentinel. Failed startup uses the same canonical retirement contract; startup and
+incomplete rollback errors remain visible. A command timeout does not prevent the
+remaining independently authorized retirement attempts.
 Persistent and runtime enablement links are disabled independently before final
 native state proof, including installations with both kinds of link.
 
-`disable` retires the fixed native units without reading settings, including
+`disable` retires supported canonical native units without reading settings, including
 missing, malformed, old-schema or stale-build settings. It verifies service PID,
 native enablement and recursive empty cgroups; slices/scopes do not expose the
-service-only MainPID property. Manager uncertainty or failed stop refuses success.
+service-only MainPID property. Inert parameters from both typed startup commands
+allow retirement without the current virtualenv selection, interpreter existence,
+pin or sentinel. Unknown/customized/stale unit contracts refuse with files,
+settings and processes preserved for operator-directed native intervention. Because
+refresh is global, an unsupported source for either fixed unit blocks refresh and
+automated stopping of the pair; both units' state proofs and errors are reported.
+Manager uncertainty or failed stop refuses success. Accepted sources and quiescence
+are rechecked before refreshing cached installation state for final disablement.
+Native disable removes fixed-name and target-associated enablement links in its
+persistent/runtime namespaces, including aliases to the managed target; it never
+deletes their target files or recursively disables an independent auxiliary unit.
 `remove` first performs the same retirement, then unlinks only the fixed service,
 client slice and known persistent/runtime enablement artifacts and reloads the
 manager. All eight fixed candidates are validated before the first unlink;
@@ -49,6 +68,8 @@ and membership directory aliases are supported and remain intact. Final artifact
 links are unlinked without following their targets. Unrelated names, settings and
 provider state are preserved. A later unlink failure reports partial removal and
 still reloads after successful deletions; no artifacts are recreated as rollback.
+Partial removal refresh requires this invocation's prior successful retirement,
+both units quiescent and remaining sources canonical or intentionally removed.
 No template ownership/header/repair mechanism is introduced.
 
 All three hold the exclusive nonblocking lifecycle lock through completion or
@@ -59,6 +80,8 @@ not change immutable settings bytes. None starts the indexing queue or registers
 the forthcoming managed MCP frontend.
 These checks coordinate cooperating tools; validation followed by native start or
 unlink is not atomic against a noncooperating operator replacing files or parents.
+The user manager's environment, global defaults and unrelated native dependency
+owners remain trusted; canonical matching is not a sandbox for the whole manager.
 
 ## Configure
 
@@ -224,8 +247,13 @@ to resume it. Make any desired backup before entering removal.
 The guard retires the fixed query service and client slice using native systemd
 commands and verifies inactive/failed state, zero MainPID and empty cgroups,
 including descendants. Missing, malformed or stale settings cannot bypass this
-proof. Manager failures, failed stop or uncertain state abort cleanup.
-Final enablement is checked even when `systemctl disable` succeeds: surviving
+proof. Unsupported unit contracts abort before deleting the installation; inspect
+the preserved definitions and use operator-directed native recovery. A native
+implicit slice can remain loaded without a fragment: it counts as absent only
+with empty source/override/enablement metadata, no transient identity, and proven
+inactive state and empty descendant groups. Manager failures, failed stop or
+uncertain state abort cleanup.
+Final enablement is checked even when the native disable call succeeds: surviving
 global/runtime enablement still refuses removal.
 
 The helper executes its fixed sibling uninstall script with the real lock

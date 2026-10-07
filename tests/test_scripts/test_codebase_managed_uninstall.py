@@ -17,6 +17,15 @@ from tests.test_scripts.test_codebase_managed_config import ROOT, managed
 guard = managed
 
 
+@pytest.fixture
+def supported_retirement(guard, monkeypatch):
+    namespace = guard.retire_managed.__globals__
+    sources = ((), {guard.BACKEND: ("source", None), guard.SLICE: ("source", None)})
+    monkeypatch.setitem(namespace, "inspect_sources", lambda *a, **k: sources)
+    monkeypatch.setitem(namespace, "refresh_sources", lambda *a, **k: None)
+    monkeypatch.setitem(namespace, "native_install", lambda *a, **k: None)
+
+
 @pytest.mark.parametrize("layout", ["default", "empty", "external", "data", "repo", "qdrant", "nested", "default-alias", "locks-alias", "external-alias"])
 def test_namespace_layout_before_mutation(guard, transaction, monkeypatch, layout):
     home = transaction
@@ -87,7 +96,7 @@ def test_lifecycle_alias_into_retained_runner_namespace_refuses(guard, transacti
 
 
 @pytest.mark.parametrize("state", ["enabled", "enabled-runtime", "linked", "indirect", "alias", "unknown", ""])
-def test_retirement_rejects_surviving_enablement_after_success(guard, monkeypatch, state):
+def test_retirement_rejects_surviving_enablement_after_success(guard, monkeypatch, state, supported_retirement):
     g = guard.retire_managed.__globals__
     monkeypatch.setattr(g["subprocess"], "run", lambda *a, **kw: SimpleNamespace(returncode=0, stderr=""))
     monkeypatch.setitem(g, "require_quiescent", lambda unit: None)
@@ -97,12 +106,16 @@ def test_retirement_rejects_surviving_enablement_after_success(guard, monkeypatc
 
 
 @pytest.mark.parametrize("state,load", [("disabled", "loaded"), ("masked", "loaded"), ("static", "loaded"), ("generated", "loaded"), ("transient", "loaded"), ("", "not-found")])
-def test_retirement_accepts_proved_nonenabled_state(guard, monkeypatch, state, load):
+def test_retirement_accepts_proved_nonenabled_state(guard, monkeypatch, state, load, supported_retirement):
     g = guard.retire_managed.__globals__
     monkeypatch.setattr(g["subprocess"], "run", lambda *a, **kw: SimpleNamespace(returncode=0, stderr=""))
     monkeypatch.setitem(g, "require_quiescent", lambda unit: None)
     monkeypatch.setitem(g, "show", lambda *a: {"UnitFileState": state, "LoadState": load})
-    guard.retire_managed()
+    if state in ("disabled", ""):
+        guard.retire_managed()
+    else:
+        with pytest.raises(ValueError, match="retirement failed"):
+            guard.retire_managed()
 
 
 @pytest.mark.parametrize("key", ["binary", "cache", "runtime"])
@@ -309,6 +322,18 @@ elif "show" in args:
 elif "stop" in args and os.environ.get("STOP_FAIL"):sys.exit(1)
 """)
     systemctl.chmod(0o755)
+    busctl = tools / "busctl"
+    busctl.write_text("""#!/usr/bin/python3
+import json,os,sys
+from pathlib import Path
+home=Path(os.environ["HOME"])
+roots=[home/".config/systemd/user",home/"runtime/systemd/user"]
+if "Get" in sys.argv and "UnitPath" in sys.argv:
+ print(json.dumps({"type":"v","data":[{"type":"as","data":[str(root)+".control" for root in roots]+[str(root) for root in roots]}]}))
+else:
+ sys.exit("unexpected typed native operation in absent-unit fixture")
+""")
+    busctl.chmod(0o755)
     for name in ("sleep", "sudo", "ss", "systemd-detect-virt"):
         path = tools / name
         path.write_text("#!/bin/sh\nexit 0\n")
@@ -347,7 +372,8 @@ os.execv("/usr/bin/rm",["rm",*sys.argv[1:]])
     (scripts / "codebase_managed.py").write_text(helper)
     shutil.copy2(ROOT / "scripts/uninstall.sh", scripts / "uninstall.sh")
     for name in ("code_intel_cbm_worker.py", "code_intel_cbm_admission.py", "codebase_managed_unit.py"):
-        shutil.copy2(ROOT / "scripts/lib" / name, scripts / "lib" / name)
+        content = (ROOT / "scripts/lib" / name).read_text()
+        (scripts / "lib" / name).write_text(content.replace('"/usr/bin/busctl"', json.dumps(str(busctl))))
     for name in (
         ".genesis/config",
         "data",
@@ -378,7 +404,8 @@ os.execv("/usr/bin/rm",["rm",*sys.argv[1:]])
 
 
 @pytest.mark.parametrize("settings", ["missing", "malformed", "schema1", "stale"])
-def test_actual_direct_cleanup_does_not_depend_on_settings(owned_install, settings):
+@pytest.mark.parametrize("unsupported_fragment", [False, True])
+def test_actual_direct_cleanup_does_not_depend_on_settings(owned_install, settings, unsupported_fragment):
     home, scripts, env = owned_install
     external = home / "preserved-state"
     external.mkdir()
@@ -404,7 +431,8 @@ def test_actual_direct_cleanup_does_not_depend_on_settings(owned_install, settin
     for root in (home / ".config/systemd/user", home / "runtime/systemd/user"):
         (root / "default.target.wants").mkdir()
         for unit in ("genesis-cbm-query.service", "genesis-cbm-query-clients.slice"):
-            (root / unit).symlink_to(foreign)
+            if unsupported_fragment:
+                (root / unit).symlink_to(foreign)
             (root / "default.target.wants" / unit).symlink_to(root / unit)
         (root / "unrelated.slice").write_text("preserved")
     result = subprocess.run(
@@ -414,6 +442,13 @@ def test_actual_direct_cleanup_does_not_depend_on_settings(owned_install, settin
         capture_output=True,
         timeout=20,
     )
+    if unsupported_fragment:
+        assert result.returncode != 0 and "authority refused" in result.stderr
+        assert all((home / name).is_dir() for name in ("genesis", ".genesis", "data", ".qdrant"))
+        assert foreign.read_text() == "preserved" and "LOCKS_HELD rm" not in (home/"calls").read_text()
+        assert all((root / "genesis-cbm-query.service").is_symlink() for root in
+                   (home / ".config/systemd/user", home / "runtime/systemd/user"))
+        return
     assert result.returncode == 0, result.stdout + result.stderr
     for name in ("genesis", "data", ".qdrant"):
         assert not (home / name).exists()
@@ -562,8 +597,10 @@ def test_actual_confirmation_cancel_preserves_roots_and_reports_retirement(owned
     assert result.returncode == 0 and "Aborted" in result.stdout
     assert "cancelling removal leaves it disabled" in result.stdout
     assert (home / "genesis").is_dir() and (home / ".genesis").is_dir()
-    assert "disable genesis-cbm-query.service" in (home / "calls").read_text()
-    assert "LOCKS_HELD rm" not in (home / "calls").read_text()
+    calls = (home / "calls").read_text()
+    assert "UnitFileState" in calls and "MainPID" in calls
+    assert "disable genesis-cbm-query.service" not in calls  # strictly absent unit needs no mutation
+    assert "LOCKS_HELD rm" not in calls
 
 
 def test_host_delegation_executes_the_same_actual_transaction(owned_install):
