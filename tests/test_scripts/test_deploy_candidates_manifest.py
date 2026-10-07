@@ -404,6 +404,7 @@ def test_every_manifest_reader_on_this_tree_reads_only_the_repo_key():
     known = {
         "scripts/hooks/git_push_guard.py": "_live_manifest_binding",
         "scripts/review_enforcement_commit.py": "_live_manifest_binding",
+        "scripts/lib/live_checkout.py": "state",
         "scripts/hooks/pre-commit": None,
         "scripts/hooks/pre-merge-commit": None,
     }
