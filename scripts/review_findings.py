@@ -185,15 +185,16 @@ def cr_header_shaped(line: str) -> bool:
     delimiter and has a ``|`` between. Linear on purpose: the regex form
     (``^_.*\\|.*_$``) is quadratic on a long pipe-heavy line of third-party text,
     on a hook path (MEASURED: 3.4 s on a 60k-character line)."""
-    for delim in ("**", "_"):
-        if (
-            len(line) > 2 * len(delim)
-            and line.startswith(delim)
-            and line.endswith(delim)
-            and "|" in line
-        ):
-            return True
-    return False
+    if "|" not in line:
+        return False
+    if len(line) > 2 and line.startswith("_") and line.endswith("_"):
+        return True  # the italic shape, exactly as the regex it replaced read it
+    # Bold: the FIRST field must itself be a complete bold span. A bold TITLE that
+    # holds a pipe (`**Prefer `str | None` here.**`) opens and closes with `**`
+    # too, and reading it as an unreadable header would count a Trivial's round.
+    first = line.split("|", 1)[0].strip()
+    m = CR_HEADER_FIELD_RE.match(first)
+    return line.endswith("**") and m is not None and m.group(2) is not None
 
 
 def cr_header_fields(line: str, *, skip_partial: bool = False) -> list[str] | None:

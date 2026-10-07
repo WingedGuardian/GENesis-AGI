@@ -157,24 +157,40 @@ def test_a_bold_title_holding_a_pipe_is_still_the_title():
 
 @pytest.mark.parametrize(
     "line",
-    [
-        "_a_ | _b_",
-        "_a | b_",
-        "**a** | **b**",
-        "**a | b**",
-        "_|_",
-        "**|**",
-        "**a**",
-        "_a_",
-        "plain | text",
-        "**a | b_",
-        "_a | b**",
-        "| **a** | 3 |",
-        "",
-    ],
+    ["_a_ | _b_", "_a | b_", "_|_", "_a_", "plain | text", "_a | b**", "| _a_ | 3 |", ""],
 )
-def test_the_linear_shape_check_agrees_with_the_regex_it_replaced(line):
+def test_the_italic_shape_reads_exactly_as_the_removed_regex(line):
+    """The regex this replaced was ITALIC-only (`^_.*\\|.*_$`); italic must not move."""
     import re
 
-    old = re.compile(r"^(?:_.*\|.*_|\*\*.*\|.*\*\*)$")
-    assert rf.cr_header_shaped(line) is bool(old.match(line))
+    removed = re.compile(r"^_.*\|.*_$")
+    assert rf.cr_header_shaped(line) is bool(removed.match(line))
+
+
+@pytest.mark.parametrize(
+    ("line", "shaped"),
+    [
+        ("**a** | **b**", True),
+        ("**🎯 Functional Correctness** | 🟠 Major **", True),
+        ("**a | b**", False),
+        ("**Prefer `str | None` over Optional.**", False),
+        ("**Fix the `a | b` split.**", False),
+        ("**a**", False),
+        ("| **a** | 3 |", False),
+    ],
+)
+def test_a_bold_line_is_header_shaped_only_when_its_first_field_is_bold(line, shaped):
+    """GLM P3: a bold TITLE holding a pipe opens and closes with `**` as well."""
+    assert rf.cr_header_shaped(line) is shaped
+
+
+def test_a_bold_trivial_whose_title_holds_a_pipe_does_not_count():
+    """GLM P3 reproduction: the title is not an unreadable header."""
+    body = _comment(TRIVIAL, "Prefer `str | None` over Optional.")
+    assert rf.is_finding(RABBIT, body) is False
+
+
+def test_a_headerless_finding_keeps_its_piped_bold_title():
+    """GLM P3 reproduction: the first line is the title when it is not a header."""
+    body = "**Fix the `a | b` split.**\n\n**Second bold line.**\n\nprose\n"
+    assert guard._coderabbit_title(body) == "Fix the `a | b` split."
