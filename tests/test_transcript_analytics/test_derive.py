@@ -114,6 +114,28 @@ def test_swap_keeps_previous_snapshot_and_drops_older(built):
     assert os.readlink(data / "derived" / "current") == os.path.basename(third)
 
 
+def test_ingest_cli_derives_only_when_something_changed(built, monkeypatch, capsys):
+    from genesis.transcript_analytics import cli, config, resources
+
+    monkeypatch.setattr(config, "load", lambda: config.Config(enabled=True))
+    monkeypatch.setattr(resources, "ensure_capped", lambda *args: None)
+
+    projects, data, f = built
+    calls = []
+    monkeypatch.setattr(
+        derive, "build", lambda d, **k: calls.append(d) or {"dir": "x", "views": []}
+    )
+    args = ["--projects", str(projects), "--data", str(data), "ingest"]
+    assert cli.main(args) == 0 and len(calls) == 1  # no snapshot yet -> build
+    monkeypatch.setattr(derive, "is_current", lambda d: True)
+    with open(f, "a") as fh:
+        fh.write(json.dumps(_asst("m3", "2026-10-01T00:00:03Z", 1)) + "\n")
+    # Freshness is derived from the inputs, not from whether THIS run rebuilt (re-audit SF-1):
+    assert cli.main(args) == 0 and len(calls) == 1  # snapshot reports current -> no derive
+    monkeypatch.setattr(derive, "is_current", lambda d: False)
+    assert (
+        cli.main(args) == 0 and len(calls) == 2
+    )  # snapshot stale -> derive, even with nothing rebuilt
 
 
 # Re-audit fixes (SF-1..SF-5) -------------------------------------------------
@@ -142,11 +164,27 @@ def test_reaudit_sf2_prune_date_is_normalized(tmp_path):
     )  # 2026-09-01 is NOT before 2026-01-01
 
 
-def test_reaudit_sf3_derive_on_empty_store_is_skipped_not_fatal(tmp_path):
+def test_reaudit_sf3_derive_on_empty_store_publishes_empty_views(tmp_path):
     (tmp_path / "data").mkdir()
-    assert derive.build(tmp_path / "data").get("skipped") == "empty store"
+    assert "views" in derive.build(tmp_path / "data")
+    assert query.run_query(tmp_path / "data", "select count(*) from turns")[1] == [(0,)]
 
 
+def test_reaudit_sf3_ingest_survives_a_derive_failure(built, monkeypatch, capsys):
+    from genesis.transcript_analytics import cli, config, resources
+
+    monkeypatch.setattr(config, "load", lambda: config.Config(enabled=True))
+    monkeypatch.setattr(resources, "ensure_capped", lambda *args: None)
+
+    projects, data, f = built
+
+    def boom(d, **k):
+        raise RuntimeError("synthetic derive failure")
+
+    monkeypatch.setattr(derive, "build", boom)
+    rc = cli.main(["--projects", str(projects), "--data", str(data), "ingest"])
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert rc == 1 and "synthetic derive failure" in out["derived"] and out["sources"] == 1
 
 
 def test_reaudit_sf4_build_sweeps_leftover_staging_and_temp_links(built):
