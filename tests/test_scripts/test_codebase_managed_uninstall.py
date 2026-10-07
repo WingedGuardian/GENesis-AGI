@@ -346,7 +346,7 @@ os.execv("/usr/bin/rm",["rm",*sys.argv[1:]])
     )
     (scripts / "codebase_managed.py").write_text(helper)
     shutil.copy2(ROOT / "scripts/uninstall.sh", scripts / "uninstall.sh")
-    for name in ("code_intel_cbm_worker.py", "code_intel_cbm_admission.py"):
+    for name in ("code_intel_cbm_worker.py", "code_intel_cbm_admission.py", "codebase_managed_unit.py"):
         shutil.copy2(ROOT / "scripts/lib" / name, scripts / "lib" / name)
     for name in (
         ".genesis/config",

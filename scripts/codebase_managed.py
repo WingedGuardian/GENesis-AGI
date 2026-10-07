@@ -34,6 +34,7 @@ from code_intel_cbm_admission import (  # noqa: E402
     resolve_cgroup,
 )
 from code_intel_cbm_worker import BUILD  # noqa: E402
+from codebase_managed_unit import loaded_properties, validate_backend  # noqa: E402,F401
 
 SCRIPT = Path(__file__).resolve()
 BACKEND = "genesis-cbm-query.service"
@@ -296,7 +297,11 @@ def runtime_config(path: Path) -> dict:
     return config
 
 
-def enable(config: dict) -> None:
+def validate_loaded_backend(config: dict) -> None:
+    validate_backend(config, BACKEND, absolute)
+
+
+def enable_preflight(config: dict) -> None:
     verify_cache(config)
     with verified_binary(Path(config["binary"])):
         pass  # fail before changing native state when the accepted inode is invalid
@@ -307,16 +312,31 @@ def enable(config: dict) -> None:
         LoadState="loaded", MemoryMax=str(2 * 1024**3), MemorySwapMax="0", TasksMax="512"
     ):
         raise ValueError("loaded managed client slice lacks required limits")
+    validate_loaded_backend(config)
+
+
+def enable(config: dict) -> None:
+    enable_preflight(config)
+    # Never reload a running backend then retire rejected stop commands.
+    # unit_stop is a no-op for inactive/failed units; this check also proves
+    # no surviving descendants before the first native enablement mutation.
+    require_quiescent(BACKEND)
     try:
         subprocess.run(
-            ["/usr/bin/systemctl", "--user", "enable", "--now", BACKEND],
+            ["/usr/bin/systemctl", "--user", "enable", BACKEND],
             capture_output=True,
             text=True,
             check=True,
             timeout=150,
         )
+        installed = Path.home() / ".genesis/config/codebase-managed.json"
+        if runtime_config(installed) != config:
+            raise ValueError("managed settings changed during enablement")
+        enable_preflight(config)  # enable reloads; validate that snapshot before start
+        subprocess.run(["/usr/bin/systemctl", "--user", "start", BACKEND],
+                       capture_output=True, text=True, check=True, timeout=150)
         ready(config)
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as startup:
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as startup:
         rollback = "complete"
         try:
             retire_managed()
@@ -325,19 +345,81 @@ def enable(config: dict) -> None:
         raise ValueError(f"native enable failed: {startup}; rollback: {rollback}") from startup
 
 
+def artifact_snapshot(path: Path):
+    try:
+        value = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not (stat.S_ISREG(value.st_mode) or stat.S_ISLNK(value.st_mode)):
+        raise ValueError(f"refusing non-file managed unit artifact: {path}")
+    return value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode)
+
+
+def artifact_parent(path: Path) -> Path:
+    # Directory aliases are selected native namespaces. Resolve parents only;
+    # final artifact links must never resolve into their target files.
+    for ancestor in (path, *path.parents):
+        if ancestor.is_symlink():
+            ancestor.resolve(strict=True)  # a dangling directory alias is not absence
+    if path.is_symlink() or path.exists():
+        parent = path.resolve(strict=True)
+        if not parent.is_dir():
+            raise ValueError(f"refusing non-directory managed unit parent: {path}")
+        return parent
+    return path.resolve()  # definitely absent ordinary directory: no creation
+
+
+def parent_identity(path: Path):
+    try:
+        value = path.stat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(value.st_mode):
+        raise ValueError(f"refusing non-directory managed unit parent: {path}")
+    return value.st_dev, value.st_ino
+
+
 def remove_unit_artifacts() -> None:
     runtime = absolute(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    candidates = []
+    parents = []
     for root in (units_dir(), runtime / "systemd/user"):
-        for unit in (BACKEND, SLICE):
-            for path in (root / unit, root / "default.target.wants" / unit):
-                try:
-                    mode = path.lstat().st_mode
-                except FileNotFoundError:
-                    continue
-                if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
-                    raise ValueError(f"refusing non-file managed unit artifact: {path}")
-                path.unlink()
-    subprocess.run(["/usr/bin/systemctl", "--user", "daemon-reload"], check=True, timeout=30)
+        for parent in (root, root / "default.target.wants"):
+            resolved = artifact_parent(parent)
+            parents.append((parent, resolved, parent_identity(resolved)))
+            candidates.extend(resolved / unit for unit in (BACKEND, SLICE))
+    snapshots = [(path, artifact_snapshot(path)) for path in candidates]
+    if any(artifact_parent(parent) != resolved or parent_identity(resolved) != identity
+           for parent, resolved, identity in parents):
+        raise ValueError("managed unit parent changed during removal")
+    for path, snapshot in snapshots:
+        current = artifact_snapshot(path)
+        if current is not None and current != snapshot:
+            raise ValueError(f"managed unit artifact changed during removal: {path}")
+    deleted = False
+    failure = None
+    try:
+        for path, snapshot in snapshots:
+            if any(artifact_parent(parent) != resolved or parent_identity(resolved) != identity
+                   for parent, resolved, identity in parents):
+                raise ValueError("managed unit parent changed during removal")
+            current = artifact_snapshot(path)
+            if current is None:
+                continue
+            if current != snapshot:
+                raise ValueError(f"managed unit artifact changed during removal: {path}")
+            path.unlink()
+            deleted = True
+    except (OSError, ValueError, RuntimeError) as error:
+        failure = error
+    # Native manager state must be refreshed even after a partial unlink failure.
+    if deleted or failure is None:
+        try:
+            subprocess.run(["/usr/bin/systemctl", "--user", "daemon-reload"], check=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise ValueError(f"managed artifact removal: {failure}; reload failed: {error}") from error
+    if failure is not None:
+        raise ValueError(f"managed artifact removal failed (partial={deleted}): {failure}") from failure
 
 
 def lifecycle_main(args: argparse.Namespace) -> int:

@@ -18,9 +18,19 @@ python3 -I scripts/codebase_managed.py disable
 python3 -I scripts/codebase_managed.py remove
 ```
 
-`enable` uses the fixed installed settings path, validates the pin/cache/sentinel
-and loaded aggregate slice limits before any enablement change, then enables and
-starts the query service and verifies native readiness. It never removes the
+`enable` uses the fixed installed settings path and validates the pin/cache/sentinel,
+aggregate slice limits, and typed loaded backend commands and limits before any
+enablement change. It enables without starting, revalidates after the native reload,
+then starts the query service and verifies native readiness. Backend argv must match
+the installed positional bridge, including its `no-env-expand` flag; auxiliary
+execution commands refuse. A custom installation must supply the same absolute
+`VENV_PATH` used by `install.sh` when invoking `enable`; otherwise the configured
+main checkout's `.venv` is expected. Disable/remove do not require that variable.
+Missing typed manager properties or unavailable `busctl` refuse activation.
+Enable also requires an initially inactive or failed backend with no main PID or
+populated cgroup. An already running backend refuses before reload or retirement;
+this prevents rollback from executing newly reloaded incompatible stop commands.
+It never removes the
 sentinel. Failed startup attempts independent native disable and stops of backend
 and client slice; startup and rollback errors remain visible. A command timeout
 does not prevent the remaining retirement attempts.
@@ -33,8 +43,13 @@ native enablement and recursive empty cgroups; slices/scopes do not expose the
 service-only MainPID property. Manager uncertainty or failed stop refuses success.
 `remove` first performs the same retirement, then unlinks only the fixed service,
 client slice and known persistent/runtime enablement artifacts and reloads the
-manager. Foreign symlink targets, unrelated slices, settings and provider state
-are preserved. No template ownership/header/repair mechanism is introduced.
+manager. All eight fixed candidates are validated before the first unlink;
+directories, FIFOs, lookup errors and observed replacements refuse. Selected unit
+and membership directory aliases are supported and remain intact. Final artifact
+links are unlinked without following their targets. Unrelated names, settings and
+provider state are preserved. A later unlink failure reports partial removal and
+still reloads after successful deletions; no artifacts are recreated as rollback.
+No template ownership/header/repair mechanism is introduced.
 
 All three hold the exclusive nonblocking lifecycle lock through completion or
 rollback. Busy frontend/worker admission refuses; a worker already admitted is
@@ -42,6 +57,8 @@ left to its existing watchdog. Daemon startup/readiness does not take a shared
 lock that could deadlock with this exclusive enable operation. The commands do
 not change immutable settings bytes. None starts the indexing queue or registers
 the forthcoming managed MCP frontend.
+These checks coordinate cooperating tools; validation followed by native start or
+unlink is not atomic against a noncooperating operator replacing files or parents.
 
 ## Configure
 

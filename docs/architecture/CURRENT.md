@@ -1421,11 +1421,15 @@ verified: 3c750316479f 2026-10-05
   foreign symlink targets are retained. No live-install removal acceptance is
   claimed by isolated fixture tests.
   Native enable/disable/remove share the fixed exclusive lifecycle lock. Enable
-  validates installed immutable state and loaded client slice limits before
-  native enable--now/readiness; failed startup attempts independent retirement.
+  validates installed immutable state, typed backend commands/caps and loaded
+  client slice limits; it requires initial quiescence, enables without starting,
+  revalidates after reload, then starts and proves readiness. Failed startup
+  attempts independent retirement without reloading an already running backend.
   Disable/remove remain usable without valid settings, prove actual quiescence
   and preserve immutable settings/provider state. Remove unlinks fixed artifacts
-  only; frontend and queued-worker admission integration remain separate concerns.
+  only after validating the full candidate population; partial unlink failures
+  still reload native state. Frontend and queued-worker admission integration
+  remain separate concerns.
 - **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
   `/v1/chat/completions` endpoint, and registers the desk brain at
