@@ -1124,12 +1124,15 @@ jobs:
         # cases: 2 retained historical regressions plus 93 new accounting and
         # recovery cases. Main has none of this package's original 231 cases.
         # Floor: 24421 + 95 = 24516; no added skips, ceiling unchanged.
+        # Reference admission: 23 preserved +98 boundary +246 actor-role cases.
+        # Floor: 24516 +367 =24883; no added skips, ceiling unchanged.
         #
         # Immutable CBM staging: new test_codebase_managed_config.py collects
         # 76 cases (0 -> 76), plus 3 new provider-opener classification controls.
         # The native-binary opt-ins add two skip identities. Original PR CI had
         # seven additional browser skips absent on current main; counts alone
         # did not establish a two-slot allowance. Keep main's ceiling unchanged.
-        # On top of the journal floor above, measured by --collect-only against
-        # main's versions of both files: 24516 + 76 + 3 = 24595.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24595
+        # On top of the reference-admission floor above, measured by
+        # --collect-only against main's versions of both files:
+        # 24883 + 76 + 3 = 24962.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24962
