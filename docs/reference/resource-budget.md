@@ -109,8 +109,12 @@ WAIT build
    `genesis-job-<name>-<id>.scope`, with the estimates as hard caps:
    `MemoryMax` = `--ram`, `MemorySwapMax=0`, `CPUQuota` = `--cpu`, plus
    `IOWeight=50` (effective only where the io controller is delegated) and
-   `OOMPolicy=continue`. `--slice` places it in a slice, e.g.
-   `genesis-workload.slice`. A probe scope with the same properties runs first.
+   `OOMPolicy=continue`. The scope runs in `app-capped.slice` (a child of
+   `app.slice`, so no ancestor limit changes) unless `--slice` names another,
+   e.g. `genesis-workload.slice`. That slice outlives its scopes and keeps its own
+   `oom_kill` count, which is how the disk guardian can tell a job killed at its
+   own cap from any other OOM kill. The cbm MCP wrapper and GitNexus index batches
+   use the same slice. A probe scope with the same properties runs first.
    If systemd rejects `OOMPolicy` for scopes (before systemd 253), the job runs
    without it, and a job killed at its cap then loses its exit report. If
    systemd refuses any other property (an estimate it cannot apply, a bad
