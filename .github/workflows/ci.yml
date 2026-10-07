@@ -1120,8 +1120,8 @@ jobs:
         #   test_collectors_falkordb.py           new -> 23   (+23)
         #   test_falkordb_module.py               new -> 35   (+35)
         # No added skips. Floor: 24332 + 89 = 24421; skip ceiling remains 102.
-        # Qualification journal (replacement 1/6): new test file collects 80
-        # cases: 2 retained historical regressions plus 78 new accounting and
+        # Qualification journal (replacement 1/6): new test file collects 95
+        # cases: 2 retained historical regressions plus 93 new accounting and
         # recovery cases. Main has none of this package's original 231 cases.
-        # Floor: 24421 + 80 = 24501; no added skips, ceiling unchanged.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24501
+        # Floor: 24421 + 95 = 24516; no added skips, ceiling unchanged.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24516

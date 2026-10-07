@@ -2561,8 +2561,11 @@ verified: 4117f6ed 2026-10-05
   caveat. A stats-less/all-skip run surfaces flagged, never crashes.
 - **eval/qualification journal**: groundwork for the six-part offline
   qualification rebuild. Private append-only evidence with an exclusive writer,
-  immutable campaign manifest, decimal reservations and receipt-derived billing
-  and recovery state. Historical reading never creates or truncates files.
+  immutable version-2 campaign manifest funding the full scheduled maximum,
+  decimal reservations, provider-scoped generation ownership and receipt-derived billing
+  and recovery state. Incremental publication follows durable append; uncertain
+  publication stops derived-state reading until reconstruction. Historical
+  reading never creates or truncates files; version-1 evidence cannot execute.
   No transport, CLI, automatic execution or qualification verdict is wired yet;
   subsequent replacement PRs supply those callers. Production credentials and
   accounting stores are outside this boundary. See

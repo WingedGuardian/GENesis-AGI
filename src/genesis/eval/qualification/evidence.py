@@ -196,8 +196,8 @@ class Campaign:
             if written != len(record):
                 raise OSError("short evidence write")
             os.fsync(self._file)
+            self._lines.append(line)
+            return copy.deepcopy(line)
         except BaseException:
             self._poisoned = True
             raise
-        self._lines.append(line)
-        return copy.deepcopy(line)

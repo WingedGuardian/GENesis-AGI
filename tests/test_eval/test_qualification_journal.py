@@ -11,9 +11,9 @@ from genesis.eval.qualification import evidence
 from genesis.eval.qualification.evidence import Campaign, Incomplete, digest
 
 
-def manifest(budget="0.3", maximum="0.1"):
+def manifest(budget="0.4", maximum="0.1"):
     return {
-        "version": 1,
+        "version": 2,
         "budget": budget,
         "binding": {"source": "synthetic"},
         "attempts": [
@@ -25,6 +25,7 @@ def manifest(budget="0.3", maximum="0.1"):
                 "endpoint": "https://synthetic.invalid/chat/completions",
                 "request_hash": digest([i]),
                 "max_charge": maximum,
+                "generation_namespace": "synthetic-billing",
             }
             for i in range(4)
         ],
@@ -43,7 +44,7 @@ def dispatch(campaign, attempt="case-0"):
 
 
 def observe(campaign, attempt="case-0", **changes):
-    row = campaign.state.attempts[attempt]["spec"]
+    row = campaign.attempt(attempt)["spec"]
     answer = {
         "model": row["model"],
         "upstream": row["upstream"],
@@ -58,7 +59,7 @@ def observe(campaign, attempt="case-0", **changes):
 
 
 def settle(campaign, attempt_id="case-0", charge="0.1", **changes):
-    row = campaign.state.attempts[attempt_id]["spec"]
+    row = campaign.attempt(attempt_id)["spec"]
     receipt = {
         "generation_id": f"gen-{attempt_id}",
         "model": row["model"],
@@ -103,15 +104,15 @@ def test_campaign_directory_must_be_private(tmp_path):
 
 def test_decimal_boundary_and_cross_model_budget_survive_restart(tmp_path):
     with journal(tmp_path) as campaign:
-        for i in range(3):
+        for i in range(4):
             dispatch(campaign, f"case-{i}")
             observe(campaign, f"case-{i}")
             settle(campaign, f"case-{i}")
-        assert campaign.state.settled == Decimal("0.3")
+        assert campaign.state.settled == Decimal("0.4")
     with journal(tmp_path) as campaign:
-        with pytest.raises(Incomplete, match="budget"):
+        with pytest.raises(Incomplete, match="duplicate"):
             campaign.reserve("case-3")
-        assert campaign.state.settled == Decimal("0.3")
+        assert campaign.state.settled == Decimal("0.4")
 
 
 @pytest.mark.parametrize(
@@ -298,6 +299,7 @@ def test_exact_currency_precision_is_independent_of_decimal_context(tmp_path):
 
     tiny = "0." + "0" * 99 + "1"
     frozen = manifest(budget="0.1" + "0" * 98 + "1")
+    frozen["attempts"] = frozen["attempts"][:2]
     frozen["attempts"][1]["max_charge"] = tiny
     with localcontext() as context:
         context.prec = 2
@@ -482,13 +484,14 @@ def test_billing_totals_do_not_inherit_exponent_limits_or_traps(tmp_path):
         tiny = "0." + "0" * 39 + "1"
         budget = "0." + "0" * 39 + "2"
         frozen = manifest(budget=budget, maximum=tiny)
+        frozen["attempts"] = frozen["attempts"][:2]
         with Journal(tmp_path / "campaign", frozen) as campaign:
             for i in range(2):
                 dispatch(campaign, f"case-{i}")
                 observe(campaign, f"case-{i}", usage={"cost": tiny})
                 settle(campaign, f"case-{i}", charge=tiny)
             assert campaign.state.settled == Decimal(budget)
-            with pytest.raises(Incomplete, match="budget"):
+            with pytest.raises(Incomplete, match="unscheduled"):
                 campaign.reserve("case-2")
 
 
@@ -669,3 +672,188 @@ def test_contradictory_receipt_binding_stops_even_with_saved_answer(tmp_path, fi
         assert campaign.state.settled == Decimal(0)
         with pytest.raises(Incomplete):
             campaign.reserve("case-1")
+
+
+def test_entire_frozen_schedule_must_fit_budget_before_publication(tmp_path):
+    from genesis.eval.qualification.accounting import Journal
+
+    frozen = manifest(budget="0.15")
+    frozen["attempts"] = frozen["attempts"][:2]
+    with (
+        pytest.raises(Incomplete, match="scheduled maximum"),
+        Journal(tmp_path / "campaign", frozen),
+    ):
+        pass
+    assert Campaign.read(tmp_path / "campaign").lines == []
+
+
+def test_late_conflict_cannot_reopen_unfunded_headroom(tmp_path):
+    with journal(tmp_path) as campaign:
+        dispatch(campaign)
+        observe(campaign, usage={"cost": "0.05"})
+        settle(campaign, charge="0.05")
+        dispatch(campaign, "case-1")
+        settle(campaign, charge="0.06")
+        assert campaign.state.settled + campaign.state.reserved == Decimal("0.20")
+        assert campaign.state.settled + campaign.state.reserved <= Decimal("0.4")
+        assert campaign.lines[-1]["receipt"]["charge"] == "0.06"
+        with pytest.raises(Incomplete):
+            campaign.reserve("case-2")
+    assert type(campaign).read(tmp_path / "campaign").state == campaign.state
+
+
+@pytest.mark.parametrize("same_namespace", [False, True])
+def test_generation_ownership_uses_frozen_billing_namespace(tmp_path, same_namespace):
+    from genesis.eval.qualification.accounting import Journal
+
+    frozen = manifest()
+    frozen["attempts"][1]["upstream"] = "Other upstream"
+    if not same_namespace:
+        frozen["attempts"][1]["generation_namespace"] = "independent-billing"
+    with Journal(tmp_path / "campaign", frozen) as campaign:
+        dispatch(campaign)
+        observe(campaign)
+        settle(campaign)
+        dispatch(campaign, "case-1")
+        observe(campaign, "case-1", generation_id="gen-case-0")
+        settle(campaign, "case-1", generation_id="gen-case-0")
+        assert bool(campaign.state.collisions) is same_namespace
+        assert campaign.state.settled == Decimal("0" if same_namespace else "0.2")
+        expected = campaign.state
+    assert Journal.read(tmp_path / "campaign").state == expected
+
+
+def test_version_one_is_historical_only_and_retains_bytes(tmp_path):
+    from genesis.eval.qualification.accounting import Journal
+
+    frozen = manifest()
+    frozen["version"] = 1
+    with Campaign(tmp_path / "campaign") as campaign:
+        campaign.append("manifest", manifest=frozen)
+        campaign.append("dispatch", attempt="case-0")
+    before = (tmp_path / "campaign" / "answers.jsonl").read_bytes()
+    assert "legacy" in Journal.read(tmp_path / "campaign").state.blockers
+    with pytest.raises(Incomplete, match="manifest"), Journal(tmp_path / "campaign", frozen):
+        pass
+    assert (tmp_path / "campaign" / "answers.jsonl").read_bytes() == before
+
+
+def test_live_append_does_not_copy_or_traverse_other_attempts(tmp_path, monkeypatch):
+    from genesis.eval.qualification import accounting
+
+    class NoTraversal(dict):
+        def __iter__(self):
+            raise AssertionError("whole attempt table traversed")
+
+        def items(self):
+            raise AssertionError("whole attempt table copied")
+
+        def values(self):
+            raise AssertionError("whole attempt table traversed")
+
+    with journal(tmp_path) as campaign:
+        original = campaign._derived.attempts["case-3"]
+        campaign._derived.attempts = NoTraversal(campaign._derived.attempts)
+        copy = accounting.copy.deepcopy
+
+        def scoped(value, *args, **kwargs):
+            assert value is not campaign._derived and value is not original
+            return copy(value, *args, **kwargs)
+
+        monkeypatch.setattr(accounting.copy, "deepcopy", scoped)
+        dispatch(campaign)
+        observe(campaign)
+        settle(campaign)
+        assert campaign.attempt("case-0")["totals"] == (Decimal("0.1"), Decimal(0))
+        assert campaign._derived.attempts["case-3"] is original
+
+
+@pytest.mark.parametrize(
+    "point",
+    ["lines", "return", "attempts", "generations", "collisions", "blockers", "answers", "totals"],
+)
+def test_post_fsync_failures_require_reconstruction(tmp_path, monkeypatch, point):
+    from genesis.eval.qualification import accounting
+
+    class BrokenList(list):
+        def append(self, value):
+            raise MemoryError("synthetic publication failure")
+
+    class BrokenDict(dict):
+        def update(self, *args, **kwargs):
+            raise MemoryError("synthetic publication failure")
+
+    class BrokenSet(set):
+        def update(self, *args, **kwargs):
+            raise MemoryError("synthetic publication failure")
+
+    with journal(tmp_path) as campaign:
+        if point == "lines":
+            campaign._lines = BrokenList(campaign._lines)
+        elif point == "return":
+            copy = evidence.copy.deepcopy
+
+            def broken_return(value, *args, **kwargs):
+                if isinstance(value, dict) and value.get("kind") == "reservation" and "at" in value:
+                    raise MemoryError("synthetic publication failure")
+                return copy(value, *args, **kwargs)
+
+            monkeypatch.setattr(evidence.copy, "deepcopy", broken_return)
+        elif point == "totals":
+            assign = accounting.State.__setattr__
+
+            def broken_total(state, name, value):
+                if state is campaign._derived and name == "settled":
+                    raise MemoryError("synthetic publication failure")
+                assign(state, name, value)
+
+            monkeypatch.setattr(accounting.State, "__setattr__", broken_total)
+        else:
+            value = getattr(campaign._derived, point)
+            setattr(
+                campaign._derived,
+                point,
+                BrokenSet(value) if isinstance(value, set) else BrokenDict(value),
+            )
+        with pytest.raises(MemoryError):
+            campaign.reserve("case-0")
+        monkeypatch.undo()
+        with pytest.raises(Incomplete, match="uncertain write"):
+            _ = campaign.state
+        with pytest.raises(Incomplete, match="uncertain write"):
+            campaign.attempt("case-0")
+        with pytest.raises(Incomplete):
+            campaign.reserve("case-1")
+    recovered = type(campaign).read(tmp_path / "campaign")
+    assert recovered.state.reserved == Decimal("0.1")
+    assert recovered.lines[-1]["kind"] == "reservation"
+    with (
+        type(campaign)(tmp_path / "campaign", manifest()) as reopened,
+        pytest.raises(Incomplete),
+    ):
+        reopened.dispatch("case-0")
+
+
+def test_durable_manifest_publication_failure_poisons_state(tmp_path, monkeypatch):
+    from genesis.eval.qualification import accounting
+
+    writer = journal(tmp_path)
+    reduce = accounting.reconstruct
+
+    def fail_manifest(lines):
+        if lines:
+            raise MemoryError("synthetic manifest publication failure")
+        return reduce(lines)
+
+    monkeypatch.setattr(accounting, "reconstruct", fail_manifest)
+    with pytest.raises(MemoryError), writer:
+        pass
+    monkeypatch.undo()
+    with pytest.raises(Incomplete, match="uncertain write"):
+        _ = writer.state
+    with pytest.raises(Incomplete, match="uncertain write"):
+        writer.attempt("case-0")
+    assert accounting.Journal.read(tmp_path / "campaign").state.manifest == manifest()
+    with accounting.Journal(tmp_path / "campaign", manifest()) as reopened:
+        dispatch(reopened)
+        assert len([r for r in reopened.lines if r["kind"] == "manifest"]) == 1

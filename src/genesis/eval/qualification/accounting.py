@@ -41,7 +41,7 @@ def validate_manifest(manifest):
     if (
         not isinstance(manifest, dict)
         or type(manifest.get("version")) is not int
-        or manifest["version"] != 1
+        or manifest["version"] != 2
         or not isinstance(manifest.get("binding"), dict)
         or not manifest["binding"]
         or not isinstance(manifest.get("attempts"), list)
@@ -53,13 +53,25 @@ def validate_manifest(manifest):
     for row in manifest["attempts"]:
         if not isinstance(row, dict) or any(
             not isinstance(row.get(k), str) or not row[k].strip()
-            for k in ("id", "alias", "model", "upstream", "endpoint", "request_hash")
+            for k in (
+                "id",
+                "alias",
+                "model",
+                "upstream",
+                "endpoint",
+                "request_hash",
+                "generation_namespace",
+            )
         ):
             raise Incomplete("invalid scheduled attempt")
         if row["id"] in seen or re.fullmatch(r"[a-f0-9]{64}", row["request_hash"]) is None:
             raise Incomplete("duplicate attempt or invalid request hash")
         seen.add(row["id"])
         currency(row.get("max_charge"))
+    if total(currency(row["max_charge"]) for row in manifest["attempts"]) > currency(
+        manifest["budget"]
+    ):
+        raise Incomplete("complete scheduled maximum exceeds campaign budget")
 
 
 @dataclass
@@ -185,16 +197,15 @@ def _summarize(state, changed):
     for item in state.attempts[changed]["observations"] + state.attempts[changed]["receipts"]:
         generation = item.get("generation_id") if isinstance(item, dict) else None
         if isinstance(generation, str) and generation.strip():
-            owners = state.generations.setdefault(generation, set())
+            key = state.attempts[changed]["spec"]["generation_namespace"], generation
+            owners = state.generations.setdefault(key, set())
             owners.add(changed)
             if len(owners) > 1:
                 state.collisions.update(owners)
                 affected.update(owners)
     for attempt in affected:
         row = state.attempts[attempt]
-        state.blockers -= {
-            f"{p}:{attempt}" for p in ("identity", "billing", "reservation", "answer", "failure")
-        }
+        state.blockers.difference_update(_incidents(attempt))
         state.answers.pop(attempt, None)
         if attempt in state.collisions:
             state.blockers.add(f"identity:{attempt}")
@@ -221,6 +232,51 @@ def _summarize(state, changed):
         row["totals"] = settled, reserved
 
 
+def _incidents(attempt):
+    return {f"{p}:{attempt}" for p in ("identity", "billing", "reservation", "answer", "failure")}
+
+
+def _stage(state, line, index):
+    """Copy only this event's row and generation collision owners."""
+    attempt = line.get("attempt")
+    if not isinstance(attempt, str) or attempt not in state.attempts:
+        raise Incomplete("event names an unscheduled attempt")
+    staged = State(
+        manifest=state.manifest,
+        attempts={attempt: copy.deepcopy(state.attempts[attempt])},
+        blockers=state.blockers,
+        settled=state.settled,
+        reserved=state.reserved,
+    )
+    _apply(staged, line, index)
+    row = staged.attempts[attempt]
+    for item in row["observations"] + row["receipts"]:
+        generation = item.get("generation_id") if isinstance(item, dict) else None
+        if isinstance(generation, str) and generation.strip():
+            key = row["spec"]["generation_namespace"], generation
+            staged.generations[key] = set(state.generations.get(key, ()))
+            for owner in staged.generations[key]:
+                if owner not in staged.attempts:
+                    staged.attempts[owner] = copy.deepcopy(state.attempts[owner])
+    staged.collisions = state.collisions.intersection(staged.attempts)
+    staged.blockers = set()
+    _summarize(staged, attempt)
+    return staged
+
+
+def _publish(state, staged):
+    """Called under the writer mutex; a failure requires disk reconstruction."""
+    state.attempts.update(staged.attempts)
+    state.generations.update(staged.generations)
+    state.collisions.update(staged.collisions)
+    for attempt in staged.attempts:
+        state.blockers.difference_update(_incidents(attempt))
+        state.answers.pop(attempt, None)
+    state.blockers.update(staged.blockers)
+    state.answers.update(staged.answers)
+    state.settled, state.reserved = staged.settled, staged.reserved
+
+
 def reconstruct(lines) -> State:
     """Validate ordering and reconstruct liability; legacy evidence stays readable."""
     state = State()
@@ -228,6 +284,9 @@ def reconstruct(lines) -> State:
         state.blockers.add("legacy")
         return state
     state.manifest = copy.deepcopy(lines[0].get("manifest"))
+    if isinstance(state.manifest, dict) and state.manifest.get("version") == 1:
+        state.blockers.add("legacy")
+        return state
     validate_manifest(state.manifest)
     state.attempts = {
         r["id"]: {
@@ -241,8 +300,7 @@ def reconstruct(lines) -> State:
         for r in state.manifest["attempts"]
     }
     for index, line in enumerate(lines[1:], 1):
-        _apply(state, line, index)
-        _summarize(state, line["attempt"])
+        _publish(state, _stage(state, line, index))
     return state
 
 
@@ -256,8 +314,12 @@ class Journal(Campaign):
         self._derived = reconstruct([])
 
     def _load(self):
-        super()._load()
-        self._derived = reconstruct(self._lines)
+        try:
+            super()._load()
+            self._derived = reconstruct(self._lines)
+        except BaseException:
+            self._poisoned = True
+            raise
 
     def __enter__(self):
         super().__enter__()
@@ -266,8 +328,12 @@ class Journal(Campaign):
                 raise Incomplete("journal has an uncertain write")
             validate_manifest(self.expected_manifest)
             if not self._lines:
-                super().append("manifest", manifest=self.expected_manifest)
-                self._derived = reconstruct(self._lines)
+                try:
+                    super().append("manifest", manifest=self.expected_manifest)
+                    self._derived = reconstruct(self._lines)
+                except BaseException:
+                    self._poisoned = True
+                    raise
             state = self.state
             if state.manifest is None:
                 raise Incomplete("legacy journal cannot execute")
@@ -282,10 +348,21 @@ class Journal(Campaign):
     @property
     def state(self):
         with self._mutex:
+            self._readable()
             state = copy.deepcopy(self._derived)
-            if self.torn_tail or self._poisoned:
+            if self.torn_tail:
                 state.blockers.add("uncertain write")
             return state
+
+    def _readable(self):
+        if self._poisoned:
+            raise Incomplete("journal has an uncertain write; reconstruct before reading state")
+
+    def attempt(self, attempt):
+        """Detached per-attempt view, without copying the campaign."""
+        with self._mutex:
+            self._readable()
+            return copy.deepcopy(self._derived.attempts[attempt])
 
     def append(self, kind, **data):
         with self._mutex:
@@ -297,16 +374,22 @@ class Journal(Campaign):
                     raise Incomplete("dispatch requires reservation")
                 ignore = f"reservation:{attempt}" if row["reserved_at"] >= self.opened_at else None
                 self._ready(ignore)
-            candidate = copy.deepcopy(self._derived)
-            _apply(candidate, line, len(self._lines))
-            _summarize(candidate, line["attempt"])
+            self._ready_write()
+            candidate = _stage(self._derived, line, len(self._lines))
             result = super().append(kind, **{k: v for k, v in line.items() if k != "kind"})
-            self._derived = candidate  # Publish only after the event is durable.
+            try:
+                _publish(self._derived, candidate)
+            except BaseException:
+                self._poisoned = True
+                raise
             return result
 
-    def _ready(self, ignore=None):
+    def _ready_write(self):
         if self._file is None or self.torn_tail or self._poisoned:
             raise Incomplete("journal is closed or has an uncertain write")
+
+    def _ready(self, ignore=None):
+        self._ready_write()
         blockers = self._derived.blockers - {ignore}
         if blockers:
             raise Incomplete("campaign stopped: " + ", ".join(sorted(blockers)))
