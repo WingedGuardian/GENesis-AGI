@@ -189,9 +189,6 @@ except Exception:  # noqa: BLE001 — skew falls back to ASKING.
 _REVIEW_FINDINGS_ERROR: str | None = None
 try:
     from review_findings import (  # noqa: E402
-        CR_HEADER_FIELD_RE as _CR_HEADER_FIELD_RE,
-    )
-    from review_findings import (
         CR_SEVERITIES as _CR_SEVERITIES,
     )
     from review_findings import (
@@ -199,6 +196,9 @@ try:
     )
     from review_findings import (
         INLINE_P2_RE as _INLINE_P2_RE,
+    )
+    from review_findings import (
+        cr_header_fields as _cr_header_fields,
     )
     from review_findings import (
         cr_severity as _cr_severity,
@@ -223,8 +223,11 @@ except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate on
         f"scripts/review_findings.py is unimportable ({_findings_exc_type}); "
         f"repair the hook tree"
     )
-    _INLINE_P1_RE = _INLINE_P2_RE = _CR_HEADER_FIELD_RE = None  # type: ignore[assignment]
+    _INLINE_P1_RE = _INLINE_P2_RE = None  # type: ignore[assignment]
     _CR_SEVERITIES = frozenset()  # type: ignore[assignment]
+
+    def _cr_header_fields(line, *, skip_partial=False):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
 
     def enforced_logins():  # type: ignore[no-redef]
         raise RuntimeError(_REVIEW_FINDINGS_ERROR)
@@ -1830,8 +1833,10 @@ def _review_bots(sets: dict[str, frozenset[str]]) -> frozenset[str]:
 # the gate was blind to them (audited 2026-07-10: 173 findings across
 # 118 merged PRs passed unseen, 64 of them P1).
 
-# CodeRabbit states severity in a pipe-separated italic header on its FIRST line:
+# CodeRabbit states severity in a pipe-separated header on its FIRST line, italic
+# through 2026-10-05 and bold since 2026-10-06 (#2992):
 #   _🔒 Security & Privacy_ | _🟠 Major_ | _🏗️ Heavy lift_
+#   **🩺 Stability & Availability** | **🟠 Major** | **⚡ Quick win**
 # Its findings were already REACHED by the scan below — `user.type` is "Bot", so
 # they pass the author filter — and then dropped, because neither badge pattern
 # above matches and the if/elif has no else. Read, not recognised; a PR carrying
@@ -2410,10 +2415,20 @@ def _coderabbit_title(body: str) -> str:
     the finding, and reporting one of those as the title misnames the finding in
     the pre-merge report a human reads to decide a merge.
     """
+    first = True
     for line, is_markup in zip(body.split("\n"), _cr_markup_mask(body), strict=True):
         if is_markup:
             continue
         stripped = line.strip()
+        if not stripped:
+            continue
+        # The header is bold since 2026-10-06 (#2992), so it would be read as the
+        # title. Skip it, and only it: the header is always the FIRST line, and a
+        # later bold title holding a `|` (`str | None`) is header-shaped too.
+        if first:
+            first = False
+            if _cr_severity(stripped)[1]:
+                continue
         if stripped.startswith("**") and stripped.rstrip("*").strip():
             # Through _safe_title, NOT a bare slice: this is the branch a real
             # CodeRabbit finding takes, so it is the one that matters most.
@@ -2856,7 +2871,7 @@ def _cr_severity_inline(text: str) -> tuple[str | None, bool]:
     — the exact shape `_cr_severity`'s own docstring already adjudicates).
 
     So: split on `|`, accept only chunks that are COMPLETE italic fields
-    (`_CR_HEADER_FIELD_RE`, the anchored parser's own matcher), read each
+    (`_cr_header_fields`, the anchored parser's own matcher, italic or bold), read each
     field's LAST word, and adjudicate as `_cr_severity` does — exactly one
     DISTINCT level wins (unanimous duplicates included); two distinct levels
     are a format this code cannot adjudicate and land in the caller's
@@ -2870,11 +2885,8 @@ def _cr_severity_inline(text: str) -> tuple[str | None, bool]:
     direction for a merge gate.
     """
     hits: list[str] = []
-    for chunk in text.split("|"):
-        fld = _CR_HEADER_FIELD_RE.match(chunk.strip())
-        if not fld:
-            continue
-        words = fld.group(1).split()
+    for field_text in _cr_header_fields(text, skip_partial=True) or []:
+        words = field_text.split()
         if words and words[-1].casefold() in _CR_SEVERITIES:
             hits.append(words[-1].casefold())
     if hits and len(set(hits)) == 1:
@@ -3650,7 +3662,7 @@ def _check_inline_review_findings(
                         # No recognised severity — whether the header names a
                         # level this gate does not know, is ambiguous, or is
                         # missing entirely. Every observed CodeRabbit finding
-                        # leads with the italic pipe header, so a headerless
+                        # leads with the pipe header, so a headerless
                         # original is FORMAT DRIFT: filing it as an ordinary
                         # advisory printed "below Major" about a level that was
                         # never read, and a drifted Major would ride through
