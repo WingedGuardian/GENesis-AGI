@@ -537,3 +537,25 @@ def test_a_prune_keeps_a_line_appended_through_a_handle_opened_before_it():
     assert path.stat().st_ino == inode
     assert [json.loads(line)["caller"] for line in path.read_text().splitlines()] == ["late"]
 
+
+@pytest.mark.asyncio
+async def test_a_cancellation_during_the_fallback_still_breaks_the_clock(db, monkeypatch):
+    """FalkorDB failed, and the request was cancelled while the fallback store
+    was answering: the row must say fallback, not a neutral cancellation."""
+
+    class _SlowFallback(_OkStore):
+        async def traverse(self, *a, **k):
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(graph_mod, "_traversal_store", lambda: _DeadStore())
+    monkeypatch.setattr(graph_mod, "_store", _SlowFallback(name="networkx"))
+
+    with pytest.raises(asyncio.CancelledError):
+        await graph_mod.traverse(db, "root")
+
+    [row] = await _rows(db)
+    assert row["outcomes"] == {"fallback": 1}
+    assert row["served"] == {"none": 1}
+    [event] = row["events"]
+    assert event["primary_reason"] == "ConnectionRefusedError"
+

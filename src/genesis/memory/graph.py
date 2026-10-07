@@ -261,7 +261,16 @@ async def traverse(
             include_deprecated=include_deprecated,
         )
     except asyncio.CancelledError:
-        outcome, track.served_by = "cancelled", "none"
+        # A cancellation is neutral for the cutover ONLY when the engine had not
+        # already failed: one that lands during the fallback must still break
+        # the clock, or the fallback would vanish behind it.
+        if selection_error:
+            outcome = "selection_failed"
+        elif track.fell_back:
+            outcome = "fallback"
+        else:
+            outcome = "cancelled"
+        track.served_by = "none"
         raise
     except Exception as exc:
         outcome, track.served_by, final_reason = "error", "none", exception_reason(exc)
