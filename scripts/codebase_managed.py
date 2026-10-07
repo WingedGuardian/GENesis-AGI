@@ -34,6 +34,19 @@ from code_intel_cbm_admission import (  # noqa: E402
     resolve_cgroup,
 )
 from code_intel_cbm_worker import BUILD  # noqa: E402
+from codebase_managed_unit import (  # noqa: E402,F401
+    artifact_parent,
+    artifact_snapshot,
+    canonical_sources,
+    implicit_slice_absent,
+    loaded_properties,
+    native_env,
+    native_install,
+    parent_identity,
+    sentinel_armed,
+    validate_backend,
+    validate_source_identity,
+)
 
 SCRIPT = Path(__file__).resolve()
 BACKEND = "genesis-cbm-query.service"
@@ -253,24 +266,213 @@ def require_no_batch() -> None:
         require_quiescent(unit)
 
 
-def retire_managed() -> None:
+def inspect_sources(config=None, *, removed=False):
+    runtime = absolute(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    sources = canonical_sources(SCRIPT, (units_dir(), runtime / "systemd/user"),
+                                (BACKEND, SLICE), config)
+    for unit, (snapshot, _) in sources[1].items():
+        if snapshot is None:
+            if config:
+                raise ValueError(f"enable requires canonical installed {unit}")
+            if removed:
+                require_quiescent(unit)  # own deletion leaves a cached inactive object
+            elif unit == SLICE and not manager_absent(unit) and implicit_slice_absent(unit):
+                require_quiescent(unit)  # native implicit slice must still be empty/inactive
+            elif not manager_absent(unit):
+                raise ValueError(f"missing source is not native absence: {unit}")
+        elif config and snapshot[0].parent != units_dir().resolve():
+            raise ValueError("enable requires persistent installed unit sources")
+    return sources
+
+
+def refresh_sources(sources, config=None, *, removed=False) -> None:
+    if inspect_sources(config, removed=removed) != sources:
+        raise ValueError("managed unit sources changed before refresh")
+    if not removed and all(snapshot is None for snapshot, _ in sources[1].values()):
+        return  # strict native absence needs no global manager mutation
+    subprocess.run(["/usr/bin/systemctl", "--user", "daemon-reload"], check=True, timeout=30)
+    if inspect_sources(config) != sources:
+        raise ValueError("managed unit sources changed during refresh")
+    for unit, (snapshot, parameters) in sources[1].items():
+        if snapshot:
+            validate_source_identity(unit, snapshot)
+            if unit == BACKEND:
+                validate_backend({}, BACKEND, absolute, parameters)
+
+
+def retire_managed():
     errors = []
-    for argv in (("disable", BACKEND), ("stop", BACKEND), ("stop", SLICE)):
-        result = subprocess.run(
-            ["/usr/bin/systemctl", "--user", *argv],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode and not manager_absent(argv[1]):
-            errors.append((argv[0], result.stderr.strip()))
+    try:
+        sources = inspect_sources()
+        refresh_sources(sources)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        errors.append(("authority", str(error)))
+        sources = None
+    for argv in (
+        ("disable", BACKEND),
+        ("disable", "--runtime", BACKEND),
+        ("stop", BACKEND),
+        ("stop", SLICE),
+    ):
+        if sources is None or sources[1][argv[-1]][0] is None:
+            continue  # unknown authority is a refusal, not a permissive emergency stop
+        try:
+            if inspect_sources() != sources:
+                raise ValueError("managed unit sources changed before retirement command")
+            if argv[0] == "disable":
+                native_install("disable", BACKEND, runtime="--runtime" in argv)
+            else:
+                subprocess.run(["/usr/bin/systemctl", "--user", *argv], capture_output=True,
+                               text=True, check=True, timeout=60)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            errors.append(("command", f"{argv[0]}: {error}"))
     for unit in (BACKEND, SLICE):
-        require_quiescent(unit)
-    state = show(BACKEND, "UnitFileState", "LoadState")
-    safe = state["UnitFileState"] in ("generated", "transient", "static", "disabled", "masked")
+        try:
+            require_quiescent(unit)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            errors.append(("proof", f"{unit}: {error}"))
+    if sources is not None and not any(action == "proof" for action, _ in errors):
+        try:
+            refresh_sources(sources)  # native installation state may still be cached
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            errors.append(("refresh", str(error)))
+    try:
+        state = show(BACKEND, "UnitFileState", "LoadState")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        errors.append(("proof", str(error)))
+        state = {"UnitFileState": "", "LoadState": ""}
+    safe = state == {"UnitFileState": "disabled", "LoadState": "loaded"}
     absent = state == {"UnitFileState": "", "LoadState": "not-found"}
-    if any(action == "stop" for action, _ in errors) or not (safe or absent):
+    if errors or not (safe or absent):
         raise ValueError(f"managed retirement failed: errors={errors}, state={state}")
+    return sources
+
+
+def runtime_config(path: Path) -> dict:
+    config = read_settings(path)
+    main = absolute(config["main"]).resolve(strict=True)
+    if main != SCRIPT.parent.parent or not (main / ".git").is_dir():
+        raise ValueError("managed runtime requires its configured primary checkout")
+    return config
+
+
+def validate_loaded_backend(config: dict) -> None:
+    validate_backend(config, BACKEND, absolute)
+
+
+def runtime_preflight(config: dict) -> None:
+    verify_cache(config)
+    with verified_binary(Path(config["binary"])):
+        pass  # fail before changing native state when the accepted inode is invalid
+    if sentinel_armed(config["sentinel"]):
+        raise ValueError("managed Codebase sentinel is armed")
+
+
+def enable_preflight(config: dict) -> None:
+    runtime_preflight(config)
+    properties = show(SLICE, "LoadState", "MemoryMax", "MemorySwapMax", "TasksMax")
+    if properties != dict(
+        LoadState="loaded", MemoryMax=str(2 * 1024**3), MemorySwapMax="0", TasksMax="512"
+    ):
+        raise ValueError("loaded managed client slice lacks required limits")
+    validate_loaded_backend(config)
+
+
+def enable(config: dict) -> None:
+    runtime_preflight(config)
+    require_quiescent(BACKEND)
+    sources = inspect_sources(config)
+    try:
+        refresh_sources(sources, config)
+        enable_preflight(config)
+        native_install("enable", BACKEND)
+        installed = Path.home() / ".genesis/config/codebase-managed.json"
+        if runtime_config(installed) != config:
+            raise ValueError("managed settings changed during enablement")
+        runtime_preflight(config)
+        require_quiescent(BACKEND)
+        refresh_sources(sources, config)
+        enable_preflight(config)
+        subprocess.run(["/usr/bin/systemctl", "--user", "start", BACKEND],
+                       capture_output=True, text=True, check=True, timeout=150)
+        ready(config)
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as startup:
+        rollback = "complete"
+        try:
+            retire_managed()
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            rollback = str(error)
+        raise ValueError(f"native enable failed: {startup}; rollback: {rollback}") from startup
+
+
+def remove_unit_artifacts(retired=None) -> None:
+    if retired is None:
+        retired = retire_managed()
+    runtime = absolute(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    candidates = []
+    parents = []
+    for root in (units_dir(), runtime / "systemd/user"):
+        for parent in (root, root / "default.target.wants"):
+            resolved = artifact_parent(parent)
+            parents.append((parent, resolved, parent_identity(resolved)))
+            candidates.extend(resolved / unit for unit in (BACKEND, SLICE))
+    snapshots = [(path, artifact_snapshot(path)) for path in candidates]
+    if any(artifact_parent(parent) != resolved or parent_identity(resolved) != identity
+           for parent, resolved, identity in parents):
+        raise ValueError("managed unit parent changed during removal")
+    for path, snapshot in snapshots:
+        current = artifact_snapshot(path)
+        if current is not None and current != snapshot:
+            raise ValueError(f"managed unit artifact changed during removal: {path}")
+    deleted = False
+    failure = None
+    try:
+        for path, snapshot in snapshots:
+            if any(artifact_parent(parent) != resolved or parent_identity(resolved) != identity
+                   for parent, resolved, identity in parents):
+                raise ValueError("managed unit parent changed during removal")
+            current = artifact_snapshot(path)
+            if current is None:
+                continue
+            if current != snapshot:
+                raise ValueError(f"managed unit artifact changed during removal: {path}")
+            path.unlink()
+            deleted = True
+    except (OSError, ValueError, RuntimeError) as error:
+        failure = error
+    # Native manager state must be refreshed even after a partial unlink failure.
+    if deleted or failure is None:
+        try:
+            for unit in (BACKEND, SLICE):
+                require_quiescent(unit)
+            remaining = inspect_sources(removed=True)
+            # Only this invocation's intentionally removed sources may disappear.
+            for unit, (snapshot, _) in remaining[1].items():
+                if snapshot is not None and remaining[1][unit] != retired[1][unit]:
+                    raise ValueError("remaining managed source changed during removal")
+            refresh_sources(remaining, removed=True)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            raise ValueError(f"managed artifact removal: {failure}; reload failed: {error}") from error
+    if failure is not None:
+        raise ValueError(f"managed artifact removal failed (partial={deleted}): {failure}") from failure
+
+
+def lifecycle_main(args: argparse.Namespace) -> int:
+    try:
+        with lifecycle_lock():
+            if args.command == "enable":
+                path = config_path(str(Path.home() / ".genesis/config/codebase-managed.json"))
+                if args.config and config_path(args.config) != path:
+                    raise ValueError("enable requires the installed settings path")
+                enable(runtime_config(path))
+            else:
+                retired = retire_managed()
+                if args.command == "remove":
+                    remove_unit_artifacts(retired)
+        return 0
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
+        print(f"managed lifecycle refused: {error}", file=sys.stderr)
+        return 1
 
 
 def report_retained_state() -> None:
@@ -370,26 +572,6 @@ def verified_binary(path: Path):
         stream.close()
         raise
     return stream
-
-
-def sentinel_armed(raw: str) -> bool:
-    try:
-        os.lstat(raw)
-    except FileNotFoundError:
-        return any(os.path.lexists(p) and not os.path.exists(p) for p in Path(raw).parents)
-    except OSError:
-        return True
-    return True
-
-
-def native_env(config: dict) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CBM_")}
-    env.update(
-        CBM_CACHE_DIR=config["cache"],
-        CBM_RUNTIME_DIR=config["runtime"],
-        CBM_ALLOWED_ROOT=config["main"],
-    )
-    return env
 
 
 def verify_cache(config: dict) -> None:
@@ -751,7 +933,7 @@ def uninstall_main(args: argparse.Namespace) -> int:
         return 1
 
 
-def main(argv: list[str] | None = None) -> int:
+def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=None)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -761,13 +943,21 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("status")
     commands.add_parser("serve")
     commands.add_parser("ready")
+    for command in ("enable", "disable", "remove"):
+        commands.add_parser(command)
     teardown = commands.add_parser("uninstall")
     teardown.add_argument("arguments", nargs=argparse.REMAINDER)
     verification = commands.add_parser("verify-uninstall-locks")
     verification.add_argument("fds", type=int, nargs=3)
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_arguments(argv)
     if args.command in ("uninstall", "verify-uninstall-locks"):
         return uninstall_main(args)
+    if args.command in ("enable", "disable", "remove"):
+        return lifecycle_main(args)
     raw = (
         args.config
         or (
@@ -790,10 +980,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status":
             print(json.dumps(status(path), indent=2))
         else:
-            config = read_settings(path)
-            main = absolute(config["main"]).resolve(strict=True)
-            if main != SCRIPT.parent.parent or not (main / ".git").is_dir():
-                raise ValueError("managed runtime requires its configured primary checkout")
+            config = runtime_config(path)
             (serve if args.command == "serve" else ready)(config)
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:

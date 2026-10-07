@@ -1,0 +1,1 @@
+- Managed Codebase now has deliberate native enable, disable and remove commands with validated startup, independent failure cleanup and preservation of immutable settings and provider state.
