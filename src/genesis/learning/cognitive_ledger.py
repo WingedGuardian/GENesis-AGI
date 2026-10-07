@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,6 +33,7 @@ from pathlib import Path
 import aiosqlite
 
 from genesis.db.crud import cognitive_file_modifications as cfm_crud
+from genesis.trash import TrashRefused, restore, trash
 
 logger = logging.getLogger(__name__)
 
@@ -180,20 +182,47 @@ async def rollback(
         return result
 
     # Restore the pre-image (or remove the file if it didn't exist before).
+    # Whatever is replaced or removed goes to the trash unless this ledger row
+    # already holds it: removing the created file, and a forced rollback over
+    # newer content that no row records, are both recoverable (#2926 G2).
+    stone = None
     try:
+        held_by_row = current is not None and current == row.get("applied_content")
+        if os.path.lexists(path) and (row.get("prior_content") is None or not held_by_row):
+            stone = trash(
+                path,
+                reason=f"cognitive rollback of modification {mod_id}",
+                caller="cognitive_ledger.rollback",
+            )
         if row.get("prior_content") is None:
-            path.unlink(missing_ok=True)
             restored = "absent"
         else:
             _atomic_write(path, row["prior_content"])
             restored = "prior"
-    except OSError as exc:
+    except TrashRefused as exc:
         result = {
             "ok": False,
             "refused": False,
             "mod_id": mod_id,
             "target_path": row["target_path"],
-            "reason": f"restore failed: {exc}",
+            "reason": f"could not move the current file to the trash: {exc}",
+        }
+        await _emit_rollback_observation(db, row, result)
+        return result
+    except OSError as exc:
+        reason = f"restore failed: {exc}"
+        if stone is not None:  # the write failed after the current file was trashed
+            try:
+                restore(stone.entry_id, root=Path(stone.root))
+                reason += "; the current file was put back"
+            except TrashRefused as back:
+                reason += f"; the current file is in the trash as {stone.entry_id} ({back})"
+        result = {
+            "ok": False,
+            "refused": False,
+            "mod_id": mod_id,
+            "target_path": row["target_path"],
+            "reason": reason,
         }
         await _emit_rollback_observation(db, row, result)
         return result

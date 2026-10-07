@@ -159,13 +159,8 @@ async def create_worktree(
     if wt_path.exists():
         logger.info("Stale worktree dir %s exists, cleaning up", wt_path)
         await cleanup_worktree(wt_path, repo_root)
-        # If cleanup failed (logged as warning), force-remove the directory
-        # so git worktree add doesn't fail on an existing path.
         if wt_path.exists():
-            import shutil
-
-            shutil.rmtree(wt_path, ignore_errors=True)
-            logger.warning("Force-removed stale worktree dir at %s", wt_path)
+            await _clear_stale_dir(wt_path, repo_root, task_id)
     else:
         # No dir but branch might linger from a prior crash
         await _prune_worktrees(repo_root)
@@ -207,6 +202,83 @@ async def create_worktree(
         logger.info("Created worktree at %s (branch %s)", wt_path, branch)
 
     return wt_path
+
+
+class StaleWorktreeError(RuntimeError):
+    """A previous task worktree could not be cleared without losing work.
+
+    Nothing was deleted; the message says where it is and why it was left.
+    """
+
+
+async def _is_registered_worktree(wt_path: Path, repo_root: Path) -> bool:
+    """Whether git lists ``wt_path`` as a worktree of ``repo_root``.
+
+    Not ``verify_worktree``: task worktrees live under the repo, so
+    ``git rev-parse`` inside an orphan directory walks up to the main
+    repository and succeeds (MEASURED). An unreadable list counts as
+    registered, the direction that deletes nothing.
+    """
+    rc, out = await _git_read(repo_root, "worktree", "list", "--porcelain")
+    if rc != 0:  # includes a timeout (-1)
+        return True
+    target = wt_path.resolve()
+    for line in out.splitlines():
+        if line.startswith("worktree ") and Path(line[len("worktree "):]).resolve() == target:
+            return True
+    return False
+
+
+async def _is_locked(wt_path: Path, repo_root: Path) -> bool:
+    """Whether git lists ``wt_path`` as locked (``git worktree list --porcelain``)."""
+    rc, out = await _git_read(repo_root, "worktree", "list", "--porcelain")
+    if rc != 0:
+        return False
+    target, current = wt_path.resolve(), None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            current = Path(line[len("worktree "):]).resolve()
+        elif current == target and (line == "locked" or line.startswith("locked ")):
+            return True
+    return False
+
+
+async def _clear_stale_dir(wt_path: Path, repo_root: Path, task_id: str) -> None:
+    """Clear a task-worktree path that ``cleanup_worktree`` could not remove.
+
+    A registered worktree survives cleanup because ``git worktree remove``
+    (no ``--force``) refused it, i.e. it holds uncommitted work or a lock.
+    It is never deleted: the worktree reaper archives it into the worktree
+    trash, and re-creating at the same path cannot work while git still has it
+    registered (MEASURED: the add fails on the existing branch, then on the
+    registered path). A directory git does not know is an orphan; it goes to
+    the trash (#2926 G2) so the new worktree can take its place.
+    """
+    if await _is_registered_worktree(wt_path, repo_root):
+        if (wt_path / ".git").is_file() and await _is_locked(wt_path, repo_root):
+            raise StaleWorktreeError(
+                f"the previous worktree for this task, {wt_path}, is locked; nothing "
+                "reaps a locked worktree, so unlock it (git worktree unlock) or "
+                "remove it by hand before retrying"
+            )
+        raise StaleWorktreeError(
+            f"the previous worktree for this task, {wt_path}, holds uncommitted work "
+            "git would not remove; it was left in place, and the worktree reaper "
+            "archives it into the worktree trash once it goes idle"
+        )
+    from genesis.trash import TrashRefused, trash
+
+    try:
+        stone = trash(
+            wt_path,
+            reason=f"orphan task worktree directory, task {task_id}",
+            caller="worktree_mgr.create_worktree",
+        )
+    except TrashRefused as exc:
+        raise StaleWorktreeError(
+            f"the stale directory {wt_path} could not be moved to the trash: {exc}"
+        ) from None
+    logger.warning("Moved orphan task worktree dir %s to the trash (%s)", wt_path, stone.entry_id)
 
 
 async def verify_worktree(wt_path: Path) -> bool:

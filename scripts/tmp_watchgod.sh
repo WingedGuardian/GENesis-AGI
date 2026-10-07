@@ -250,7 +250,8 @@ attribution_paths() {
     fi
     for p in "$HOME/tmp" "$DOWNLOADS_DIR" "$CC_TMP_DIR" "$HOME/genesis/.claude/worktrees" \
              "$HOME/genesis/data" "$HOME/.genesis" "$HOME/.cache" "$HOME/.npm" \
-             "$HOME/.local/share" "$HOME/.claude"; do
+             "$HOME/.local/share" "$HOME/.claude" \
+             "$HOME/.genesis/trash" "$HOME/.genesis/worktree-trash"; do
         [[ -e "$p" ]] && printf '%s\n' "$p"
     done
     return 0

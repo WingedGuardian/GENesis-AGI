@@ -2894,11 +2894,15 @@ config resolution, and hygiene utilities.
 ```yaml subsystem-map
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
-          restore, util, infra_profile, onboarding, hostmetrics, env.py,
+          restore, util, infra_profile, onboarding, hostmetrics, trash, env.py,
           _config_overlay.py]
 verified: b0867170e 2026-10-02
 ```
 
+- **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
+  item into a per-volume Genesis trash with a tombstone, never copying;
+  `python -m genesis.trash list|restore`. Callers: cognitive rollback and the
+  orphan task-worktree reset (`docs/reference/trash.md`). Stdlib only.
 - **hostmetrics/**: stdlib-only resource readings (container cgroup memory and
   CPU, PSI, disks, and the host's headroom through the guardian gateway) and the
   `preflight`/`status` CLI that admits or refuses a heavy job against the
