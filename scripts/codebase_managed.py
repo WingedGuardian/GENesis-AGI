@@ -25,7 +25,13 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-from code_intel_cbm_admission import number, resolve_cgroup  # noqa: E402
+from code_intel_cbm_admission import (  # noqa: E402
+    _host_available,
+    _working_charge,
+    number,
+    read_number,
+    resolve_cgroup,
+)
 from code_intel_cbm_worker import BUILD  # noqa: E402
 
 SCRIPT = Path(__file__).resolve()
@@ -334,7 +340,7 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
     return result
 
 
-def show(unit: str, *properties: str) -> dict[str, str]:
+def show(unit: str, *properties: str, timeout: float = 30) -> dict[str, str]:
     output = subprocess.check_output(
         [
             "/usr/bin/systemctl",
@@ -344,7 +350,7 @@ def show(unit: str, *properties: str) -> dict[str, str]:
             *(arg for name in properties for arg in ("-p", name)),
         ],
         text=True,
-        timeout=30,
+        timeout=timeout,
         stderr=subprocess.PIPE,
     )
     value = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
@@ -353,14 +359,14 @@ def show(unit: str, *properties: str) -> dict[str, str]:
     return value
 
 
-def require_enabled(config: dict) -> None:
-    if show(BACKEND, "UnitFileState")["UnitFileState"] != "enabled":
+def require_enabled(config: dict, *, timeout: float = 30) -> None:
+    if show(BACKEND, "UnitFileState", timeout=timeout)["UnitFileState"] != "enabled":
         raise ValueError("managed query service must be persistently enabled")
     if sentinel_armed(config["sentinel"]):
         raise ValueError("managed Codebase sentinel is armed")
 
 
-def verify_query_boundary(pid: str) -> None:
+def verify_query_boundary(pid: str, *, startup: bool = False) -> None:
     leaf, root, version = resolve_cgroup(
         Path(f"/proc/{pid}/cgroup"), Path(f"/proc/{pid}/mountinfo")
     )
@@ -370,6 +376,14 @@ def verify_query_boundary(pid: str) -> None:
         leaf / "memory.swap.max"
     ).read_text().strip() != "0":
         raise ValueError("managed daemon lacks exact memory/zero-swap cap")
+    cpu = (leaf / "cpu.max").read_text().split()
+    if len(cpu) != 2:
+        raise ValueError("managed daemon lacks an enforced CPU ceiling")
+    quota, period = (number(value, "cpu.max") for value in cpu)
+    if quota == 0 or period == 0 or quota > 2 * period:
+        raise ValueError("managed daemon exceeds the two-core CPU ceiling")
+    if number((leaf / "pids.max").read_text().strip(), "pids.max") > 128:
+        raise ValueError("managed daemon exceeds the 128-task ceiling")
     cursor = leaf.parent
     while cursor == root or root in cursor.parents:
         try:
@@ -380,13 +394,24 @@ def verify_query_boundary(pid: str) -> None:
             limit = "max"  # true cgroup filesystem root has no memory.max
         if limit != "max" and number(limit, "ancestor memory.max") < 2 * 1024**3:
             raise ValueError("ancestor cap is smaller than managed query budget")
+        if startup and limit != "max":
+            charge = _working_charge(
+                read_number(cursor / "memory.current"), cursor / "memory.stat", 2 * 1024**3, 2
+            )
+            # Admission includes this small staging process; do not subtract
+            # raw leaf usage from a cache-discounted ancestor charge. This is
+            # a startup snapshot, not a reservation or recurring RPC gate.
+            if number(limit, "ancestor memory.max") - charge < 2 * 1024**3:
+                raise ValueError("insufficient ancestor headroom for managed query budget")
         if cursor == root:
             break
         cursor = cursor.parent
+    if startup and _host_available(Path("/proc/meminfo")) < 2 * 1024**3:
+        raise ValueError("insufficient host available memory for managed query budget")
 
 
-def check_backend(config: dict, *, starting: bool = False) -> str:
-    value = show(BACKEND, "ActiveState", "MainPID")
+def check_backend(config: dict, *, starting: bool = False, timeout: float = 30) -> str:
+    value = show(BACKEND, "ActiveState", "MainPID", timeout=timeout)
     if value["ActiveState"] not in (("active", "activating") if starting else ("active",)):
         raise ValueError("managed native daemon is unavailable")
     pid = value["MainPID"]
@@ -397,13 +422,24 @@ def check_backend(config: dict, *, starting: bool = False) -> str:
 
 
 def ready(config: dict) -> None:
+    deadline = time.monotonic() + 120
+    native_deadline = None
     require_enabled(config)
-    deadline = time.monotonic() + 60
+
+    def manager_timeout() -> float:
+        remaining = (native_deadline or deadline) - time.monotonic()
+        if remaining <= 0:
+            raise ValueError("managed native daemon readiness deadline expired")
+        return min(30, remaining)
+
     with verified_binary(Path(config["binary"])) as executable:
-        while time.monotonic() < deadline:
+        while time.monotonic() < (native_deadline or deadline):
             try:
-                pid = check_backend(config, starting=True)
-                remaining = deadline - time.monotonic()
+                pid = check_backend(config, starting=True, timeout=manager_timeout())
+                now = time.monotonic()
+                if native_deadline is None:
+                    native_deadline = min(deadline, now + 60)
+                remaining = native_deadline - now
                 if remaining <= 0:
                     break
                 response = subprocess.run(
@@ -419,10 +455,11 @@ def ready(config: dict) -> None:
                     and "daemon: active (permanent)" in response.stdout
                     and re.search(r"^  pid: " + re.escape(pid) + r"$", response.stdout, re.M)
                     and "state: stopping" not in response.stdout
-                    and check_backend(config, starting=True) == pid
+                    and check_backend(config, starting=True, timeout=manager_timeout()) == pid
                 ):
-                    require_enabled(config)
-                    return
+                    require_enabled(config, timeout=manager_timeout())
+                    if time.monotonic() < native_deadline:
+                        return
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 pass  # bounded startup polling; deadline is a terminal refusal
             time.sleep(0.1)
@@ -449,6 +486,7 @@ def serve(config: dict) -> None:
         )
         require_enabled(config)
         verify_cache(config)
+        verify_query_boundary("self", startup=True)
         os.set_inheritable(executable.fileno(), True)
         os.execve(  # noqa: S606 - accepted inode and fixed stock daemon argv
             f"/proc/self/fd/{executable.fileno()}",
