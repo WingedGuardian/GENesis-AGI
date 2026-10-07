@@ -49,6 +49,9 @@ Settings are published at `~/.genesis/config/codebase-managed.json` last, withou
 overwriting any existing destination—including dangling links or nonregular
 files. Configure refuses linked worktrees and a settings-path override that
 differs from the installed service's default. Absolute paths retain whitespace.
+Resolved paths must satisfy the same validation as the published settings:
+newline and carriage-return characters introduced by symlink ancestors are
+refused before staging. The final settings filename remains unresolved.
 
 No service is enabled, no unit is rendered and no sentinel is removed.
 Configuration uses schema 2: paths and build identity, with no mutable `enabled`
@@ -82,12 +85,15 @@ Before reconfiguration, stop any existing managed native processes, preserve
 old settings and state at a backup location you select, then configure a fresh
 state path. This staging command does not perform the stop or backup itself.
 
-If staging fails, inspect the reported state path. It is retained for diagnosis;
+If an attempt fails after creating its staging directory, inspect the reported
+state path. It is retained for diagnosis;
 settings remain unpublished unless their final link was already created before
 a directory-sync failure. In that case the published settings are retained too
 and the command reports failure. Do not blindly rerun: an existing state/settings
 destination refuses. Preserve or remove only artifacts you have identified as
 belonging to that failed attempt.
+Source-executable refusal before staging creation does not report a retained
+staging directory.
 
 Failed staging is not an exemption from whole-install uninstall. Existing
 documented deletion roots can still contain it. State outside those roots is

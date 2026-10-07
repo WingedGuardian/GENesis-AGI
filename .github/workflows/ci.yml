@@ -1121,9 +1121,9 @@ jobs:
         #   test_falkordb_module.py               new -> 35   (+35)
         # No added skips. Floor: 24332 + 89 = 24421; skip ceiling remains 102.
         # Immutable CBM staging: new test_codebase_managed_config.py collects
-        # 61 cases (0 -> 61), plus 3 new provider-opener classification controls.
+        # 76 cases (0 -> 76), plus 3 new provider-opener classification controls.
         # The native-binary opt-ins add two skip identities. Original PR CI had
         # seven additional browser skips absent on current main; counts alone
         # did not establish a two-slot allowance. Keep main's ceiling unchanged.
-        # Floor: 24421 + 61 + 3 = 24485.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24485
+        # Floor: 24421 + 76 + 3 = 24500.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24500

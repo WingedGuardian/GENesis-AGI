@@ -281,6 +281,71 @@ def test_cache_validation_closes_native_database(managed, tmp_path, monkeypatch,
     db.close.assert_called_once_with()
 
 
+@pytest.mark.parametrize("field", ["main", "state", "settings"])
+@pytest.mark.parametrize("character", ["\n", "\r", " é $% "])
+def test_resolved_path_validation_matches_reader(
+    managed, staged_configuration, monkeypatch, tmp_path, field, character
+):
+    args, settings, _state = staged_configuration
+    canonical = tmp_path / ("canonical" + character + "target")
+    alias = tmp_path / "clean-alias"
+    invalid = character in ("\n", "\r")
+    if field == "main":
+        Path(args.main).rename(canonical)
+        monkeypatch.setitem(
+            managed.configure.__globals__, "SCRIPT", canonical / "scripts/codebase_managed.py"
+        )
+        alias.symlink_to(canonical, target_is_directory=True)
+        args.main = str(alias)
+    else:
+        canonical.mkdir()
+        alias.symlink_to(canonical, target_is_directory=True)
+        if field == "settings":
+            if invalid:
+                with pytest.raises(ValueError, match="invalid managed path"):
+                    managed.config_path(str(alias / "settings.json"))
+            else:
+                assert managed.config_path(str(alias / "settings.json")) == canonical / "settings.json"
+            return
+        args.state = str(alias / "fresh")
+    if invalid:
+        with pytest.raises(ValueError, match="invalid managed path"):
+            managed.configure(args, settings)
+        assert not settings.exists() and not Path(args.state).exists()
+    else:
+        managed.configure(args, settings)
+        assert managed.read_settings(settings)["main"] == str(Path(args.main).resolve())
+
+
+@pytest.mark.parametrize("kind", ["missing", "unexecutable", "wrong-pin", "link", "directory", "fifo"])
+def test_source_refusal_does_not_claim_retained_staging(
+    managed, staged_configuration, monkeypatch, capsys, kind
+):
+    args, settings, state = staged_configuration
+    source = Path(args.binary)
+    if kind == "unexecutable":
+        source.chmod(0o400)
+    elif kind == "wrong-pin":
+        monkeypatch.setattr(
+            hashlib, "file_digest", lambda *a: SimpleNamespace(hexdigest=lambda: "wrong")
+        )
+    else:
+        source.unlink()
+        if kind == "link":
+            foreign = source.with_name("foreign-binary")
+            foreign.write_bytes(b"accepted")
+            foreign.chmod(0o500)
+            source.symlink_to(foreign)
+        elif kind == "directory":
+            source.mkdir()
+        elif kind == "fifo":
+            os.mkfifo(source)
+    with pytest.raises((OSError, ValueError)):
+        managed.configure(args, settings)
+    assert "Incomplete staging retained" not in capsys.readouterr().err
+    assert not state.exists() and not settings.exists()
+
+
 def test_verified_executable_is_same_inode_and_foreign_path_survives(
     managed, tmp_path, monkeypatch
 ):
