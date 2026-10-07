@@ -1414,6 +1414,12 @@ verified: 3c750316479f 2026-10-05
   a PATH provider. Staging does not activate it; MCP registration and indexing
   retain their existing routes until their integration concerns land. See
   `docs/reference/codebase-managed.md`.
+  Whole-install removal enters the same fixed guarded transaction from direct
+  and host cleanup: runner/repository/lifecycle locks survive exec and all root
+  deletions; native query/client cgroup proof and orphan-scope checks precede
+  cleanup regardless of configuration validity. External configured state and
+  foreign symlink targets are retained. No live-install removal acceptance is
+  claimed by isolated fixture tests.
 - **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
   `/v1/chat/completions` endpoint, and registers the desk brain at

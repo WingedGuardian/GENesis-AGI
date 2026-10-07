@@ -2459,17 +2459,13 @@ class TestConsumersReadTheChannel:
         someone runs --dry-run to avoid.
         """
         src = (_REPO_ROOT / "scripts" / "uninstall.sh").read_text()
-        # EVERY site, not `src.index(...)`. uninstall.sh has two cleanup paths —
-        # direct-container and host-driven — and checking only the first
-        # occurrence left the second entirely unverified. That is the same
-        # first-occurrence blind spot that let a timer be added to one path and
-        # not the other; a guard test must not share the defect's granularity.
+        # The host delegates to the same guarded direct transaction; verify
+        # every remaining clean site plus that delegation rather than requiring
+        # a second independently maintained cleanup inventory.
         needle = "systemctl --user clean --what=state"
         sites = [i for i in range(len(src)) if src.startswith(needle, i)]
-        assert len(sites) >= 2, (
-            f"expected a clean site in BOTH uninstall paths, found {len(sites)} "
-            "— either a path lost its cleanup or this scan is wrong"
-        )
+        assert len(sites) == 1
+        assert 'codebase_managed.py" uninstall -- --genesis-only --non-interactive' in src
         unguarded = [
             src[:i].count("\n") + 1
             for i in sites

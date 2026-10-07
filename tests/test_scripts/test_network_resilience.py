@@ -944,7 +944,8 @@ def test_root_watchdog_reporter_keeps_left_warning():
 
 def test_both_uninstall_paths_report_instead_of_claiming_success():
     text = UNINSTALL.read_text()
-    assert text.count('report_root_watchdog_removal "$(') == 2
+    assert text.count('report_root_watchdog_removal "$(') == 1
+    assert '"$HOME/genesis/scripts/codebase_managed.py" uninstall' in text
     for match in re.finditer(r'report_root_watchdog_removal "\$\(', text):
         before = text[max(0, match.start() - 300) : match.start()]
         start = before.rfind('if [ "$DRY_RUN" = true ]; then')

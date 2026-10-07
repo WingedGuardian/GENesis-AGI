@@ -21,12 +21,13 @@ import subprocess
 import sys
 import time
 import uuid
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from code_intel_cbm_admission import (  # noqa: E402
     _host_available,
+    _mount_path,
     _working_charge,
     number,
     read_number,
@@ -63,18 +64,260 @@ def units_dir() -> Path:
 
 
 @contextmanager
-def lifecycle_lock(*, shared: bool = False):
+def file_lock(path: Path, *, shared: bool = False):
     """Coordinate cooperating tools; never replace/delete the lock pathname."""
-    directory = units_dir()
-    directory.mkdir(parents=True, exist_ok=True)
-    fd = os.open(
-        directory / ".genesis-codebase-config.lock", os.O_RDWR | os.O_CREAT | OPEN_FLAGS, 0o600
-    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | OPEN_FLAGS, 0o600)
     with os.fdopen(fd, "a") as stream:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError("lifecycle lock must be regular")
         fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
         yield stream
+
+
+def lifecycle_lock(*, shared: bool = False):
+    return file_lock(units_dir() / ".genesis-codebase-config.lock", shared=shared)
+
+
+def uninstall_lock_paths() -> tuple[Path, Path, Path]:
+    main = (Path.home() / "genesis").resolve(strict=True)
+    if main != SCRIPT.parent.parent or (main / ".git").is_file():
+        raise ValueError("uninstall requires the installed primary checkout")
+    directory = Path(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis")) / "locks"
+    absolute(str(directory))
+    roots = [Path.home() / name for name in ("genesis", ".genesis", "data", ".qdrant")]
+    default = Path.home() / ".genesis/locks"
+    protected = [units_dir()]
+    if directory == default:
+        if directory.parent.is_symlink() or directory.is_symlink():
+            raise ValueError("uninstall refuses symlinked default lock namespace")
+    else:
+        protected.append(directory)
+    for location in protected:
+        for root in roots:
+            for namespace, deletion in ((location, root), (location.resolve(), root.resolve())):
+                if namespace.is_relative_to(deletion) or deletion.is_relative_to(namespace):
+                    raise ValueError("uninstall refuses lock namespace overlapping deletion roots")
+    digest = hashlib.sha1(os.fsencode(main), usedforsecurity=False).hexdigest()[:16]
+    return (
+        directory / "code-intel-runner.lock",
+        directory / f"code-intel-{digest}.lock",
+        units_dir() / ".genesis-codebase-config.lock",
+    )
+
+
+def verify_uninstall_locks(fds: list[int]) -> None:
+    if len(set(fds)) != 3 or any(fd <= 2 for fd in fds):
+        raise ValueError("uninstall requires three inherited lock descriptors")
+    for fd, path in zip(fds, uninstall_lock_paths(), strict=True):
+        held, named = os.fstat(fd), path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(held.st_mode) or (held.st_dev, held.st_ino) != (
+            named.st_dev,
+            named.st_ino,
+        ):
+            raise ValueError("uninstall lock identity mismatch")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def cgroup_empty(control: str) -> None:
+    if not control:
+        return
+    path = absolute(control)
+    if ".." in path.parts:
+        raise ValueError("invalid managed ControlGroup")
+    mountinfo = Path("/proc/self/mountinfo")
+    _, root, version = resolve_cgroup(Path("/proc/self/cgroup"), mountinfo)
+    if version != 2:
+        raise ValueError("uninstall requires visible cgroup v2 state")
+    mappings = []
+    for row in mountinfo.read_text().splitlines():
+        left, separator, right = row.partition(" - ")
+        fields = left.split()
+        if (
+            separator
+            and right.split()[:1] == ["cgroup2"]
+            and len(fields) >= 5
+            and _mount_path(fields[4]) == root
+        ):
+            mappings.append(_mount_path(fields[3]))
+    if len(set(mappings)) != 1:
+        raise ValueError("ambiguous managed cgroup mount")
+    mounted = mappings[0]
+    relative = path.relative_to(mounted) if path.is_relative_to(mounted) else path.relative_to("/")
+    group = root / relative
+    try:
+        values = dict(line.split() for line in (group / "cgroup.events").read_text().splitlines())
+    except FileNotFoundError:
+        if group.exists():
+            raise
+        return  # stopped group has been removed from the visible hierarchy
+    if values.get("populated") != "0":
+        raise ValueError("managed cgroup still contains processes (including descendants)")
+
+
+def require_quiescent(unit: str) -> None:
+    properties = ["ActiveState", "ControlGroup"]
+    if unit.endswith(".service"):
+        properties.append("MainPID")
+    value = show(unit, *properties)
+    if value["ActiveState"] not in ("inactive", "failed") or (
+        unit.endswith(".service") and number(value["MainPID"], "MainPID")
+    ):
+        raise ValueError(f"uninstall refuses nonquiescent {unit}")
+    cgroup_empty(value["ControlGroup"])
+
+
+def manager_absent(unit: str) -> bool:
+    expected = {"LoadState": "not-found", "ActiveState": "inactive", "ControlGroup": ""}
+    if unit.endswith(".service"):
+        expected["MainPID"] = "0"
+    return show(unit, *expected) == expected
+
+
+def index_writer_targets_main(argv: list[str], cwd: Path, main: Path) -> bool:
+    """Recognize repository targets of the existing wrapper and native modes."""
+    entrypoint = main / "scripts/lib/code_intel_index.sh"
+    for index, arg in enumerate(argv[:-1]):
+        if Path(arg).name != "code_intel_index.sh":
+            continue
+        candidate = Path(arg) if Path(arg).is_absolute() else cwd / arg
+        if candidate.resolve() == entrypoint and (cwd / argv[index + 1]).resolve() == main:
+            return True
+    # The private OOM launcher contains both wrapper and native argv. Its fixed
+    # flag is not a repository argument; native classification must still run.
+    if "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv):
+        tail = argv[argv.index("analyze") + 1 :]
+        target = cwd / tail[0] if tail and not tail[0].startswith("-") else cwd
+        return target.resolve() == main
+    return False
+
+
+def observed_index_writers(proc: Path = Path("/proc")) -> list[int]:
+    """Observe existing lockless/scopeless writers; never signal a process."""
+    main = SCRIPT.parent.parent
+    writers = []
+    for process in proc.iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            # proc_pid_stat(5): comm can contain ')' and arbitrary filename bytes;
+            # starttime is field 22, after the final parenthesized comm delimiter.
+            started = process.joinpath("stat").read_text(errors="surrogateescape").rsplit(")", 1)[1].split()[19]
+            argv = [os.fsdecode(arg) for arg in process.joinpath("cmdline").read_bytes().split(b"\0") if arg]
+            wrapper = any(Path(arg).name == "code_intel_index.sh" for arg in argv)
+            native = "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv)
+            if not (wrapper or native):
+                continue
+            cwd = process.joinpath("cwd").resolve(strict=True)
+            recognized = index_writer_targets_main(argv, cwd, main)
+            if process.joinpath("stat").read_text(errors="surrogateescape").rsplit(")", 1)[1].split()[19] != started:
+                raise ValueError(f"index writer PID {process.name} changed during observation")
+            if recognized:
+                writers.append(int(process.name))
+        except FileNotFoundError:
+            if process.exists():
+                raise ValueError(f"cannot prove index writer identity for PID {process.name}") from None
+            continue  # process disappeared during observation
+        except (OSError, RuntimeError, IndexError) as error:
+            raise ValueError(f"cannot prove index writer identity for PID {process.name}") from error
+    return writers
+
+
+def require_no_batch() -> None:
+    writers = observed_index_writers()
+    if writers:
+        raise ValueError(f"uninstall refuses observed index writers: {writers}")
+    result = subprocess.run(
+        [
+            "/usr/bin/systemctl",
+            "--user",
+            "list-units",
+            "--all",
+            "--type=scope",
+            "--plain",
+            "--no-legend",
+            "--no-pager",
+            "code-intel-*.scope",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    for row in result.stdout.splitlines():
+        unit = row.split()[0]
+        if not re.fullmatch(r"code-intel-[0-9a-f]{12}-(?:cbm|gitnexus)-[0-9]+\.scope", unit):
+            raise ValueError("unrecognized code-intel scope; cannot prove writer absence")
+        require_quiescent(unit)
+
+
+def retire_managed() -> None:
+    errors = []
+    for argv in (("disable", BACKEND), ("stop", BACKEND), ("stop", SLICE)):
+        result = subprocess.run(
+            ["/usr/bin/systemctl", "--user", *argv],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode and not manager_absent(argv[1]):
+            errors.append((argv[0], result.stderr.strip()))
+    for unit in (BACKEND, SLICE):
+        require_quiescent(unit)
+    state = show(BACKEND, "UnitFileState", "LoadState")
+    safe = state["UnitFileState"] in ("generated", "transient", "static", "disabled", "masked")
+    absent = state == {"UnitFileState": "", "LoadState": "not-found"}
+    if any(action == "stop" for action, _ in errors) or not (safe or absent):
+        raise ValueError(f"managed retirement failed: errors={errors}, state={state}")
+
+
+def report_retained_state() -> None:
+    try:
+        config = read_settings(
+            Path.home() / ".genesis/config/codebase-managed.json", require_build=False
+        )
+    except (OSError, ValueError, RuntimeError):
+        config = None  # missing/bad settings never expand uninstall deletion roots
+    if config:
+        roots = [Path.home() / name for name in ("genesis", ".genesis", "data", ".qdrant")]
+        for key in ("binary", "cache", "runtime"):
+            try:
+                path = absolute(config[key]).resolve()
+                inside = any(path.is_relative_to(root.resolve()) for root in roots)
+            except (OSError, RuntimeError) as error:
+                print(f"Preserved configured {key}; path classification failed: {error}", flush=True)
+                continue
+            if not inside:
+                print(f"Preserved configured {key}: {path}", flush=True)
+
+
+def uninstall(arguments: list[str]) -> None:
+    # Only the fixed sibling script is executable; no caller-supplied command.
+    if any(arg not in ("--genesis-only", "--non-interactive") for arg in arguments):
+        raise ValueError("guarded cleanup accepts only --genesis-only/--non-interactive")
+    with ExitStack() as stack:
+        locks = [stack.enter_context(file_lock(path)) for path in uninstall_lock_paths()]
+        require_no_batch()  # refuse orphan workers before retiring query readers
+        retire_managed()
+        print("Managed Codebase query retired; cancelling removal leaves it disabled.", flush=True)
+        require_no_batch()
+        report_retained_state()
+        fds = [stream.fileno() for stream in locks]
+        for fd in fds:
+            os.set_inheritable(fd, True)
+        os.execv(  # noqa: S606 - fixed Bash and sibling script, validated cleanup flags
+            "/bin/bash",
+            [
+                "/bin/bash",
+                str(SCRIPT.with_name("uninstall.sh")),
+                "--genesis-only",
+                *arguments,
+                "--managed-uninstall-fds",
+                *map(str, fds),
+            ],
+        )
 
 
 def read_document(path: Path) -> dict:
@@ -495,6 +738,19 @@ def serve(config: dict) -> None:
         )
 
 
+def uninstall_main(args: argparse.Namespace) -> int:
+    try:
+        if args.command == "uninstall":
+            arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
+            uninstall(arguments)
+        else:
+            verify_uninstall_locks(args.fds)
+        return 0
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f"managed uninstall refused: {error}", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=None)
@@ -505,7 +761,13 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("status")
     commands.add_parser("serve")
     commands.add_parser("ready")
+    teardown = commands.add_parser("uninstall")
+    teardown.add_argument("arguments", nargs=argparse.REMAINDER)
+    verification = commands.add_parser("verify-uninstall-locks")
+    verification.add_argument("fds", type=int, nargs=3)
     args = parser.parse_args(argv)
+    if args.command in ("uninstall", "verify-uninstall-locks"):
+        return uninstall_main(args)
     raw = (
         args.config
         or (

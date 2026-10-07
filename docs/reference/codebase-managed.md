@@ -153,6 +153,66 @@ Failed staging is not an exemption from whole-install uninstall. Existing
 documented deletion roots can still contain it. State outside those roots is
 not automatically deleted merely because a settings file names it.
 
+## Whole-install removal
+
+Run the ordinary `scripts/uninstall.sh` entry point. Real container cleanup
+enters the managed guard before changing monitoring or state. It acquires the
+existing runner lock, physical repository index lock, then lifecycle lock without
+waiting; a busy writer or freeze refuses removal. It also refuses surviving
+index scopes, including workers whose queue parent has gone away.
+It also observes same-account fallback GitNexus entrypoints/analyze processes
+for this checkout, using kernel argv/cwd and stable process start identity.
+Observed writers or uncertain identity refuse removal; discovery sends no signals.
+The snapshot cannot prohibit a new unlocked process launched afterward.
+Retirement precedes the direct script's backup/confirmation prompts. Cancelling
+keeps the repository and state, but leaves the query service stopped and disabled,
+as the entry point explicitly reports; deliberate native enablement is required
+to resume it. Make any desired backup before entering removal.
+
+The guard retires the fixed query service and client slice using native systemd
+commands and verifies inactive/failed state, zero MainPID and empty cgroups,
+including descendants. Missing, malformed or stale settings cannot bypass this
+proof. Manager failures, failed stop or uncertain state abort cleanup.
+Final enablement is checked even when `systemctl disable` succeeds: surviving
+global/runtime enablement still refuses removal.
+
+The helper executes its fixed sibling uninstall script with the real lock
+descriptors inherited and checked on entry. Those descriptors remain held through
+removal of the repository, runtime contents, database and Qdrant roots. Existing
+`~/.genesis/locks` and its original inodes remain as coordination state; settings,
+queue and provider contents elsewhere within the fixed deletion roots are removed. This prevents a
+stalled entrypoint from recreating a different lock inode during teardown.
+Plain default locks and nonoverlapping external `GENESIS_HOME` are supported.
+Custom lock layouts intersecting the four deletion roots, or default namespace
+symlinks that cleanup would unlink, refuse before retirement. No lock relocation
+is performed. The lifecycle lock's systemd-directory namespace must also remain
+outside all four roots in both lexical and resolved paths, including through
+symlink ancestors; aliasing it into the retained runner locks is unsupported.
+Safe external systemd-directory aliases remain supported. No broad native-state
+retention mode is introduced. Assess conflicting layouts
+with all writers stopped; do not move live locks to bypass refusal. Host cleanup
+delegates once to this same container transaction after its normal backup and
+confirmation; a missing/older guard or failed container command refuses cleanup
+without falling back to separate deletion commands. Default host cleanup finishes
+before Guardian artifacts are removed. On refusal, its installation remains;
+the earlier monitoring pause is not automatically undone. Full container deletion
+keeps its existing inner-cleanup skip and separate confirmation behavior.
+
+Only the fixed CBM service/slice fragments and their known persistent/runtime
+enablement locations are removed. Symlinks are unlinked without deleting foreign
+targets; unrelated slices survive. Valid settings can report external retained
+binary/cache/runtime paths, but cannot expand the documented deletion roots.
+Unclassifiable diagnostic paths are reported and do not alter deletion authority.
+Both Qdrant binary locations and dangling known unit links are handled; foreign
+symlink targets remain untouched. Failed runtime inventory aborts before deleting
+install roots and retains the inventory for inspection.
+Dry-run does not acquire locks, stop managed units or delete state. An internal
+reentry marker alone is insufficient: it requires verified inherited descriptors.
+The teardown helper retains its system Python entry point and uses only standard
+library operations available on the supported Python 3.10 platform. It does not
+perform the native binary hash/launch acceptance used by the installed query
+runtime. Current-install tests are not a separate Python 3.10 runtime qualification.
+
 ## Verification
 
 The configuration test suite uses synthetic paths and fixtures. Native staging
