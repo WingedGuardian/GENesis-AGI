@@ -263,8 +263,12 @@ attribution_paths() {
         for p in $DG_ATTRIBUTION_PATHS; do printf '%s\n' "$p"; done
         return 0
     fi
+    # du counts each inode once, in argument order, so a store nested in a
+    # listed parent (cc-tmp, the two trashes) comes BEFORE the parent to get a
+    # line of its own; the parent's line is then the remainder.
     for p in "$HOME/tmp" "$DOWNLOADS_DIR" "$CC_TMP_DIR" "$HOME/genesis/.claude/worktrees" \
-             "$HOME/genesis/data" "$HOME/.genesis" "$HOME/.cache" "$HOME/.npm" \
+             "$HOME/genesis/data" "$HOME/.genesis/trash" "$HOME/.genesis/worktree-trash" \
+             "$HOME/.genesis" "$HOME/.cache" "$HOME/.npm" \
              "$HOME/.local/share" "$HOME/.claude"; do
         [[ -e "$p" ]] && printf '%s\n' "$p"
     done
