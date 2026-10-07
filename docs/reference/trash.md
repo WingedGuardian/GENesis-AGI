@@ -28,12 +28,19 @@ A symlink is trashed as the link itself, never its target. The tombstone is
 written before the move, so a crash between the two leaves an entry that lists
 as incomplete rather than an untraceable item.
 
-## Listing and restoring
+## Trashing, listing and restoring
 
 ```bash
+~/genesis/.venv/bin/python -m genesis.trash put PATH... --reason R
 ~/genesis/.venv/bin/python -m genesis.trash list
 ~/genesis/.venv/bin/python -m genesis.trash restore <entry> [--to PATH]
 ```
+
+`put` is how a session deletes user or project data from the shell: each path
+goes to the trash (caller `cli`, the session id when one is set), and its entry
+id is printed. One refusal does not stop the others. Unlike `rm -f`, a missing
+path is a refusal. When `put` refuses, ask the user rather than deleting the
+item some other way. `rm` remains fine for a session's own files and temp.
 
 `restore` moves the item back to its original path (or `--to`) and removes the
 entry. It refuses an incomplete entry or a destination that already exists. The
@@ -47,8 +54,9 @@ Exit codes: 0 done, 1 refused (the reason is printed), 64 usage error.
 
 `genesis.trash` leaves the item untouched and raises `TrashRefused` when the
 item is missing or unreadable, `''`/`.`/`..`, a mount point, `$HOME` or a parent
-of it, a parent of the trash itself, already in the trash, on the Claude Code
-temp volume (`~/.genesis/cc-tmp`, which has its own retention), or on another
+of it, a parent of the trash itself, already in the trash, the live Genesis
+database (the configured file, its `-wal`/`-shm`/`-journal`, or a directory
+holding it: moving it away would split it), on the Claude Code temp volume (`~/.genesis/cc-tmp`, which has its own retention), or on another
 volume than the trash. It never falls back to copying. "Another volume" is
 caught twice: a different device number (another disk, a btrfs subvolume), and
 the kernel's own refusal to rename across mount points (a bind mount, an

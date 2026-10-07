@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from genesis import env as _env
 from genesis.env import genesis_home
 from genesis.util.atomic import atomic_write_text
 
@@ -153,6 +154,25 @@ def _claim_entry(root: Path, name: str) -> Path:
     raise TrashRefused(f"no free entry name under {root}")
 
 
+def _is_live_database(item: Path) -> bool:
+    """The configured database, a sidecar of it, or a directory holding it.
+    Renaming a live database away splits it: the server keeps writing to the
+    moved file and a new empty one appears at the old path."""
+    configured = _env.genesis_db_path()  # through the module, so tests can isolate it
+    try:
+        targets = {configured.absolute(), configured.resolve()}  # a symlinked path too
+    except (OSError, RuntimeError):
+        return True  # cannot tell where the database is: refuse rather than guess
+    for db in targets:
+        if item == db or _within(db, item):
+            return True
+        if item.parent == db.parent and item.name in tuple(
+            db.name + suffix for suffix in ("-wal", "-shm", "-journal")
+        ):
+            return True
+    return False
+
+
 def _refuse_sentinel(path: str | os.PathLike[str]) -> None:
     """Refuse '', '.', '..' and any path ending in them, BEFORE normalising:
     abspath turns them into the working directory or its parent. A ``Path``
@@ -168,8 +188,8 @@ def trash(path: str | os.PathLike[str], *, reason: str, caller: str) -> Tombston
 
     Raises TrashRefused, leaving the item untouched, when it is missing,
     unreadable, a mount point, a parent of the trash or of $HOME, already in
-    the trash, on the Claude Code temp volume, or on another volume than the
-    trash. A symlink is trashed as the link itself, never its target.
+    the trash, the live database (or a sidecar, or a directory holding it), on
+    the Claude Code temp volume, or on another volume than the trash. A symlink is trashed as the link itself, never its target.
     """
     _refuse_sentinel(path)
     raw = Path(os.path.abspath(path))
@@ -191,6 +211,8 @@ def trash(path: str | os.PathLike[str], *, reason: str, caller: str) -> Tombston
             raise TrashRefused(f"{item} contains {protected}")
     if _within(item, root):
         raise TrashRefused(f"{item} is already in the trash")
+    if _is_live_database(item):
+        raise TrashRefused(f"{item} is (or holds) the live Genesis database")
     if _within(item, (genesis_home() / "cc-tmp").resolve()):
         raise TrashRefused(f"{item} is on the Claude Code temp volume, which has its own retention")
     try:
