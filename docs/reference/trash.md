@@ -54,7 +54,8 @@ caught twice: a different device number (another disk, a btrfs subvolume), and
 the kernel's own refusal to rename across mount points (a bind mount, an
 overlay's lower layer). The refusal says to ask the user before deleting the
 item any other way. A trash directory that is a symlink, owned by another
-user, or not mode 0700 is refused too.
+user, or not mode 0700 is refused too, both when trashing and when listing or
+restoring (an entry forged into such a directory is never restored).
 
 The trash used to be planned per volume (a trash on each mount, after
 `send2trash`). It was narrowed to one trash because every caller lives on the

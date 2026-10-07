@@ -93,6 +93,12 @@ def _ensure_root(root: Path) -> None:
         pass
     except OSError as exc:
         raise TrashRefused(f"cannot create trash root {root}: {exc.strerror}") from None
+    _check_root(root)
+
+
+def _check_root(root: Path) -> None:
+    """Refuse a root that is a symlink, not a directory, another user's, or not
+    0700: deleting into it, or restoring a forged entry out of it, is unsafe."""
     st = os.lstat(root)
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
         raise TrashRefused(f"trash root {root} is not a plain directory")
@@ -245,7 +251,11 @@ def list_entries() -> list[Entry]:
     read raises TrashRefused: reporting it as empty would hide recoverable data.
     """
     try:
-        names = sorted(os.listdir(root := _root()))
+        root = _root()
+        if not os.path.lexists(root):
+            return []
+        _check_root(root)
+        names = sorted(os.listdir(root))
     except FileNotFoundError:
         return []
     except (OSError, RuntimeError) as exc:

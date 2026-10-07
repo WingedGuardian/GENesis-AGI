@@ -379,10 +379,28 @@ def test_an_unreadable_trash_is_reported_not_shown_empty(tmp_path, root, capsys)
         if os.access(root, os.R_OK):
             pytest.skip("running as a user that ignores directory permissions")
         assert main(["list"]) == EXIT_REFUSED
-        assert "cannot read the trash" in capsys.readouterr().err
+        # _check_root fires first now; listdir's "cannot read" is reachable
+        # only through an ACL or LSM denial on a 0700 root.
+        assert "is not mode 0700" in capsys.readouterr().err
     finally:
         root.chmod(0o700)
     assert list_entries()  # readable again, entry intact
+
+
+@pytest.mark.parametrize("shape", ["mode", "symlink"])
+def test_restore_refuses_a_root_that_is_no_longer_ours(tmp_path, root, shape):
+    stone = trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
+    if shape == "mode":
+        root.chmod(0o755)
+    else:
+        moved = tmp_path / "moved-trash"
+        root.rename(moved)
+        root.symlink_to(moved)
+    with pytest.raises(TrashRefused):
+        restore(stone.entry_id)
+    with pytest.raises(TrashRefused):
+        list_entries()
+    assert not (tmp_path / "a.txt").exists()
 
 
 def test_a_trash_not_created_yet_is_empty():

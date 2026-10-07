@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +42,7 @@ async def _delete_branch(branch: str, repo_root: Path) -> None:
         cwd=str(repo_root),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_scrubbed_git_env(),
     )
     _, stderr = await proc.communicate()
     if proc.returncode == 0:
@@ -69,6 +71,23 @@ class BaseRef:
     sha: str
 
 
+#: Repository-local variables, as ``git rev-parse --local-env-vars`` lists them
+#: (git 2.43). Any of them can point git at another repository than repo_root,
+#: so every git call here runs without them: a classification read and the
+#: mutation that follows it must see the same repository.
+_GIT_LOCATION_VARS = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+    "GIT_SHALLOW_FILE", "GIT_COMMON_DIR",
+)
+
+
+def _scrubbed_git_env() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k not in _GIT_LOCATION_VARS}
+
+
 async def _git_read(repo_root: Path, *args: str) -> tuple[int, str]:
     """Run a read-only git command; (returncode, stripped stdout). A timeout
     reads as a failure (-1), never a hang."""
@@ -77,6 +96,7 @@ async def _git_read(repo_root: Path, *args: str) -> tuple[int, str]:
         cwd=str(repo_root),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_scrubbed_git_env(),
     )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=_GIT_READ_TIMEOUT_S)
@@ -123,6 +143,7 @@ async def _prune_worktrees(repo_root: Path) -> None:
         cwd=str(repo_root),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_scrubbed_git_env(),
     )
     await proc.communicate()
 
@@ -177,6 +198,7 @@ async def create_worktree(
         cwd=str(repo_root),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_scrubbed_git_env(),
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
@@ -188,6 +210,7 @@ async def create_worktree(
                 cwd=str(repo_root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=_scrubbed_git_env(),
             )
             _, stderr = await proc.communicate()
             if proc.returncode != 0:
@@ -247,7 +270,7 @@ async def _clear_stale_dir(wt_path: Path, repo_root: Path, task_id: str) -> None
     registered path). A directory git does not know is an orphan; it goes to
     the trash (#2926 G2) so the new worktree can take its place.
 
-    Registration comes from ``git worktree list``, not ``verify_worktree``:
+    Registration comes from ``git worktree list``, not ``git rev-parse`` inside the directory:
     task worktrees live under the repo, so ``git rev-parse`` inside an orphan
     directory walks up to the main repository and succeeds (MEASURED). An
     unreadable list deletes nothing.
@@ -288,18 +311,26 @@ async def _clear_stale_dir(wt_path: Path, repo_root: Path, task_id: str) -> None
     logger.warning("Moved orphan task worktree dir %s to the trash (%s)", wt_path, stone.entry_id)
 
 
-async def verify_worktree(wt_path: Path) -> bool:
-    """Check if a path is a valid git worktree."""
+async def is_registered_worktree(wt_path: Path, repo_root: Path) -> bool:
+    """Whether git lists ``wt_path`` as a worktree of ``repo_root`` (#3021).
+
+    Not ``git rev-parse`` inside the directory: task worktrees live under the
+    repo, so in an orphan directory it walks up to the main repository and
+    succeeds (MEASURED), and a resumed task would then run against the main
+    checkout. An unreadable listing raises StaleWorktreeError rather than
+    reading as False, so nothing is re-created over a live worktree.
+    """
     if not wt_path.exists():
         return False
-    proc = await asyncio.create_subprocess_exec(
-        "git", "rev-parse", "--git-dir",
-        cwd=str(wt_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    await proc.communicate()
-    return proc.returncode == 0
+    records = await _worktree_records(repo_root)
+    if records is None:
+        # Not False: the caller would re-create, and re-creating removes a
+        # clean worktree and force-deletes its branch, committed steps included.
+        raise StaleWorktreeError(
+            f"the worktree for this task, {wt_path}, was left in place: "
+            "git's worktree list could not be read"
+        )
+    return _record_for(records, wt_path) is not None
 
 
 async def cleanup_worktree(
@@ -323,6 +354,7 @@ async def cleanup_worktree(
         cwd=str(repo_root),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_scrubbed_git_env(),
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
