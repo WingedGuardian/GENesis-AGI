@@ -513,6 +513,19 @@ def hook_ownership_failures(
             if path in stepped.get(b, set())
             or tree_entry(repo, h, path) != tree_entry(repo, repo.merge_base(base, h) or base, path)
         ]
+        if path == SYNC_HOOKS and owners:
+            # The restore after a later move reads this list to know what this
+            # checkout installed; one it cannot read is unknown there, and a hook
+            # only this list named would stay installed after its candidate left.
+            try:
+                sync_hook_names(repo.show(tip, SYNC_HOOKS) or "")
+            except Refusal as exc:
+                for b in owners:
+                    out[b] = (
+                        f"leaves {SYNC_HOOKS} in a form the engine cannot read ({exc}); "
+                        "keep each list as one quoted name per line"
+                    )
+                continue
         if len(owners) > 1:
             for b in owners:
                 out[b] = (

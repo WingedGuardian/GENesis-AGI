@@ -292,6 +292,32 @@ def test_a_hook_that_leaves_the_sync_list_is_uninstalled_on_drop(dc, dc_ready, c
     assert not hook.exists(), "the unlisted hook stayed installed"
 
 
+def test_a_sync_list_the_engine_cannot_read_keeps_its_candidate_off_live(dc, dc_ready, capsys):
+    """Valid bash the engine's list reader does not parse (`declare -a`) would
+    install a hook that a later drop could never see again: the old list would
+    read as unknown. The candidate is excluded, so `live` never holds such a
+    list (Codex, #3027 round 4)."""
+    w = dc_ready
+    sync = (w.root / "scripts" / "hooks" / "sync-hooks.sh").read_text()
+    odd = sync.replace("HOOKS_TO_SYNC=(\n", "declare -a HOOKS_TO_SYNC=(\n", 1).replace(
+        '    "pre-merge-commit"\n', '    "pre-merge-commit"\n    "post-merge"\n', 1
+    )
+    assert odd != sync and "declare -a HOOKS_TO_SYNC" in odd, "fixture shape changed"
+    w.candidate(
+        "feat/odd",
+        {"scripts/hooks/sync-hooks.sh": odd, "scripts/hooks/post-merge": "#!/bin/sh\nexit 0\n"},
+    )
+    hx = w.candidate("feat/x", {"x.txt": "x\n"})
+    assert _approve(w, dc, "feat/odd") == 0, capsys.readouterr()
+    assert w.add(dc, "feat/x") == 0
+    capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/odd" in out and "cannot read" in out, out
+    assert w.live_merges() == [("feat/x", hx)]
+    assert not (w.root / ".git" / "hooks" / "post-merge").exists()
+
+
 def test_a_rename_followed_onto_a_hook_path_is_owned_by_its_merge(dc, dc_ready, capsys):
     """origin/main moves a file under scripts/hooks/; a candidate cut before the
     move edited the old path. git's merge follows the rename, so the candidate
