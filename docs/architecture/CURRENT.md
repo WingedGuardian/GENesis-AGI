@@ -2566,9 +2566,9 @@ verified: af3e45d3c 2026-10-07
   and recovery state. Incremental publication follows durable append; uncertain
   publication stops derived-state reading until reconstruction. Historical
   reading never creates or truncates files; version-1 evidence cannot execute.
-  No CLI, automatic execution or qualification verdict is wired yet;
-  subsequent replacement PRs supply those callers. Production credentials and
-  accounting stores are outside this boundary. See
+  The journal supplies no CLI or qualification verdict itself; the offline
+  callers are described below. Automatic paid execution remains unavailable.
+  Production credentials and accounting stores are outside this boundary. See
   `docs/reference/qualification-journal.md`. Offline reference admission also
   binds current policy, source-labelled decisions and whole-corpus feedback
   receipts; all public admission boundaries validate the full current policy
@@ -2616,7 +2616,7 @@ verified: af3e45d3c 2026-10-07
   Public `run` refuses after offline admission, before keys or campaign creation,
   until an actual financial eligibility verifier exists. Historical actor proof,
   real model quality and spending/promotion approval remain separate and unproven.
-  Final runner code review and full post-review E2E are still pending. See
+  See
   `docs/reference/qualification-runner.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
