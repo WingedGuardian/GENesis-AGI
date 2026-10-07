@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import unicodedata
 from collections import Counter
+from copy import deepcopy
 
 from genesis.eval.qualification.evidence import Incomplete, digest
 
@@ -29,6 +30,12 @@ def identity(value):
 
 
 def validate_policy(policy, contracts):
+    if (
+        not isinstance(contracts, dict)
+        or not contracts
+        or any(not nonblank(k) or not nonblank(v) for k, v in contracts.items())
+    ):
+        raise Incomplete("full current contract versions are required")
     if not isinstance(policy, dict) or policy.get("version") != VERSION:
         raise Incomplete("unknown reference policy")
     threshold = policy.get("confidence_threshold", 90)
@@ -41,7 +48,7 @@ def validate_policy(policy, contracts):
         or any(not nonblank(m) or m != m.strip() for m in models)
         or any(not identity(m) for m in models)
         or len({identity(m) for m in models}) != len(models)
-        or any(identity(m).startswith(("xiaomi/mimo", "deepseek/", "deepseek-ai/")) for m in models)
+        or any(candidate(identity(m)) for m in models)
     ):
         raise Incomplete("approved frontier graders must exclude qualification candidates")
     if not nonblank(policy.get("guidance")):
@@ -61,6 +68,34 @@ def validate_policy(policy, contracts):
         ):
             raise Incomplete("invalid or duplicate human feedback")
         seen.add(item["id"])
+
+
+def candidate(model):
+    """Configured candidate families, including bare IDs and routing aliases."""
+    family = model.rsplit("/", 1)[-1].split("[", 1)[0]
+    return (
+        family in ("mimo", "deepseek")
+        or family.startswith(("mimo-", "deepseek-"))
+        or model.startswith(
+            (
+                "xiaomi/mimo",
+                "deepseek/",
+                "deepseek-ai/",
+                "openrouter-mimo",
+                "openrouter-deepseek",
+                "nvidia-nim-deepseek",
+            )
+        )
+    )
+
+
+def _policy_context(policy, contracts, contract=None, version=None):
+    # Validation and consumption share this snapshot, not the caller's mutable dict.
+    policy, contracts = deepcopy(policy), deepcopy(contracts)
+    validate_policy(policy, contracts)
+    if contract is not None and (contract not in contracts or contracts[contract] != version):
+        raise Incomplete("admission contract/version differs from current context")
+    return policy
 
 
 def passed(case):
@@ -85,8 +120,18 @@ def case_hash(contract, case):
     )
 
 
-def blockers(contract, case, policy, version):
+def blockers(contract, case, policy, version, *, contracts=None):
+    """Review obligations under a fully validated current policy context."""
+    if not nonblank(contract) or not nonblank(version):
+        raise Incomplete("admission requires a contract and version")
+    policy = _policy_context(policy, contracts, contract, version)
+    return _blockers(contract, deepcopy(case), policy, version)
+
+
+def _blockers(contract, case, policy, version):
     """Return review obligations without manufacturing a label or receipt."""
+    if not isinstance(case, dict):
+        raise Incomplete("reference case must be an object")
     issues = []
     provenance = case.get("reference_provenance")
     if not isinstance(provenance, dict):
@@ -158,15 +203,35 @@ def blockers(contract, case, policy, version):
     return issues
 
 
-def admit(contract, cases, policy, version):
+def admit(contract, cases, policy, version, *, contracts=None):
+    if not nonblank(contract) or not nonblank(version):
+        raise Incomplete("admission requires a contract and version")
+    policy = _policy_context(policy, contracts, contract, version)
+    _admit(contract, deepcopy(cases), policy, version)
+
+
+def _admit(contract, cases, policy, version):
+    if not isinstance(cases, list) or not cases:
+        raise Incomplete("reference admission needs nonempty cases")
     for case in cases:
-        issues = blockers(contract, case, policy, version)
+        issues = _blockers(contract, case, policy, version)
         if issues:
             raise Incomplete(f"{contract}: reference review required: {', '.join(issues)}")
 
 
-def approval_issues(corpus, policy, approval):
+def approval_issues(corpus, policy, approval, *, contracts=None):
     """Real human sign-off on machine-assisted references; no generated approval."""
+    corpus, contracts, approval = deepcopy(corpus), deepcopy(contracts), deepcopy(approval)
+    try:
+        policy = _policy_context(policy, contracts)
+        if not isinstance(corpus, dict) or not corpus:
+            raise Incomplete("reference approval needs a nonempty admitted corpus")
+        for contract, cases in corpus.items():
+            if contract not in contracts:
+                raise Incomplete("unknown approval contract")
+            _admit(contract, cases, policy, contracts[contract])
+    except Incomplete as exc:
+        return [f"reference corpus/policy requires admission: {exc}"]
     labelers = {
         identity(c["reference_provenance"]["reviewer"])
         for cases in corpus.values()
@@ -209,10 +274,10 @@ def summary(corpus, policy):
 
 def review(spec, versions):
     """Offline queue from graded drafts, including cases accepted before new feedback."""
+    spec, versions = deepcopy(spec), deepcopy(versions)
     if not isinstance(spec, dict) or not isinstance(spec.get("cases"), list) or not spec["cases"]:
         raise Incomplete("reference review needs nonempty cases")
-    policy = spec.get("reference_policy")
-    validate_policy(policy, versions)
+    policy = _policy_context(spec.get("reference_policy"), versions)
     rows, seen = [], set()
     for case in spec["cases"]:
         if (
@@ -224,7 +289,7 @@ def review(spec, versions):
         ):
             raise Incomplete("invalid or duplicate reference identity")
         seen.add((case["contract"], case["id"]))
-        issues = blockers(case["contract"], case, policy, versions[case["contract"]])
+        issues = _blockers(case["contract"], case, policy, versions[case["contract"]])
         human_issues = {
             "confidence below human-review threshold",
             "missing supporting evidence",

@@ -1,8 +1,10 @@
 """Offline reference admission/feedback; original stage-two regression identities."""
 
 import copy
+from pathlib import Path
 
 import pytest
+import yaml
 
 from genesis.eval.qualification import references
 from genesis.eval.qualification.evidence import Incomplete, digest
@@ -187,7 +189,7 @@ def test_new_feedback_invalidates_every_accepted_case_including_human_labels():
 def test_human_corpus_approval_binds_policy_and_corpus():
     guidance, cases = mixed()
     approved = approval(cases, guidance)
-    assert references.approval_issues(cases, guidance, approved) == []
+    assert references.approval_issues(cases, guidance, approved, contracts=versions()) == []
     for key, value in [
         ("reviewer", " SYNTHETIC-FRONTIER-REVIEWER "),
         ("label_source", references.FRONTIER),
@@ -195,7 +197,9 @@ def test_human_corpus_approval_binds_policy_and_corpus():
         ("policy_hash", "old"),
         ("corpus_hash", "old"),
     ]:
-        assert references.approval_issues(cases, guidance, {**approved, key: value})
+        assert references.approval_issues(
+            cases, guidance, {**approved, key: value}, contracts=versions()
+        )
 
 
 def test_review_queue_keeps_routine_work_with_llm_and_only_escalates_uncertainty():
@@ -209,3 +213,200 @@ def test_review_queue_keeps_routine_work_with_llm_and_only_escalates_uncertainty
     assert references.review(spec, versions())["counts"] == {"needs_llm_regrade": 1}
     case["reference_provenance"]["confidence_percent"] = 89
     assert references.review(spec, versions())["counts"] == {"human_review": 1}
+
+
+def invoke_boundary(boundary, guidance, name, case, context):
+    if boundary == "approval":
+        cases = {name: [case]}
+        return references.approval_issues(
+            cases, guidance, approval(cases, guidance), contracts=context
+        )
+    if boundary == "review":
+        case = {**case, "contract": name}
+        if isinstance(guidance.get("feedback"), list):
+            receipt(name, case, guidance)
+        return references.review({"reference_policy": guidance, "cases": [case]}, context)
+    return getattr(references, boundary)(
+        name,
+        [case] if boundary == "admit" else case,
+        guidance,
+        versions()[name],
+        contracts=context,
+    )
+
+
+INVALID_POLICIES = [
+    ("version", "bogus"),
+    ("confidence_threshold", 0),
+    ("confidence_threshold", True),
+    ("confidence_threshold", 90.0),
+    ("confidence_threshold", "90"),
+    ("confidence_threshold", 101),
+    ("approved_models", []),
+    ("approved_models", ["synthetic-frontier", "openrouter/synthetic-frontier"]),
+    ("approved_models", ["xiaomi/mimo-v2.6-pro"]),
+    ("approved_models", ["mimo-v2.6-pro[1m]"]),
+    ("approved_models", ["deepseek-v4.1-flash"]),
+    ("guidance", " "),
+    ("feedback", None),
+    ("feedback", [{"id": "bad", "text": "x", "evidence": "x", "contracts": ["unknown"]}]),
+]
+
+
+@pytest.mark.parametrize("boundary", ["admit", "blockers", "approval", "review"])
+@pytest.mark.parametrize("key,value", INVALID_POLICIES)
+def test_every_admission_boundary_validates_complete_policy(boundary, key, value):
+    guidance, cases = mixed()
+    name = next(iter(cases))
+    case = cases[name][0]
+    guidance[key] = value
+    if key == "approved_models" and len(value) == 1:
+        case["reference_provenance"]["model_id"] = value[0]
+    # Rehash the invalid policy: a self-consistent receipt must not legitimize it.
+    if key != "feedback" or isinstance(value, list):
+        receipt(name, case, guidance)
+    if boundary == "approval":
+        assert invoke_boundary(boundary, guidance, name, case, versions())
+    else:
+        with pytest.raises(Incomplete):
+            invoke_boundary(boundary, guidance, name, case, versions())
+
+
+@pytest.mark.parametrize("boundary", ["admit", "blockers", "approval", "review"])
+@pytest.mark.parametrize("context", [None, {}, {"unknown": "v1"}, {NOVELTY: " "}])
+def test_admission_requires_full_current_context(boundary, context):
+    guidance, cases = mixed()
+    name = next(iter(cases))
+    if boundary == "approval":
+        assert invoke_boundary(boundary, guidance, name, cases[name][0], context)
+    else:
+        with pytest.raises(Incomplete):
+            invoke_boundary(boundary, guidance, name, cases[name][0], context)
+
+
+@pytest.mark.parametrize("boundary", ["admit", "blockers"])
+@pytest.mark.parametrize("contract,version", [(None, "v1"), ("unknown", "v1"), (NOVELTY, None)])
+def test_contract_version_is_bound_at_direct_boundary(boundary, contract, version):
+    guidance, cases = mixed()
+    case = next(iter(cases.values()))[0]
+    with pytest.raises(Incomplete):
+        getattr(references, boundary)(
+            contract,
+            [case] if boundary == "admit" else case,
+            guidance,
+            version,
+            contracts=versions(),
+        )
+
+
+def test_policy_mutation_after_prior_validation_is_rechecked():
+    guidance, cases = mixed()
+    references.validate_policy(guidance, versions())
+    guidance["confidence_threshold"] = 0
+    name = next(iter(cases))
+    receipt(name, cases[name][0], guidance)
+    with pytest.raises(Incomplete):
+        references.admit(name, cases[name], guidance, versions()[name], contracts=versions())
+
+
+def test_direct_calls_without_context_never_grant_admission():
+    guidance, cases = mixed()
+    name = next(iter(cases))
+    case = cases[name][0]
+    with pytest.raises(Incomplete):
+        references.admit(name, [case], guidance, versions()[name])
+    with pytest.raises(Incomplete):
+        references.blockers(name, case, guidance, versions()[name])
+    assert references.approval_issues(cases, guidance, approval(cases, guidance))
+
+
+def test_stale_version_mapping_refuses_a_direct_call():
+    guidance, cases = mixed()
+    name = next(iter(cases))
+    context = versions()
+    context[name] = "old-version"
+    with pytest.raises(Incomplete):
+        references.admit(name, cases[name], guidance, versions()[name], contracts=context)
+
+
+@pytest.mark.parametrize("cases", [[], None, {}, [None]])
+def test_empty_or_malformed_cases_cannot_be_admitted_or_approved(cases):
+    guidance = policy()
+    name = RELEVANCE
+    with pytest.raises(Incomplete):
+        references.admit(name, cases, guidance, versions()[name], contracts=versions())
+    assert references.approval_issues(
+        {name: cases}, guidance, approval({name: cases}, guidance), contracts=versions()
+    )
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "mimo-v2.6-pro[1m]",
+        "MIMO-V2.6-PRO",
+        "litellm/openrouter/mimo-v2.6-pro[1m]",
+        "deepseek-chat",
+        "deepseek-flash[1m]",
+        "deepseek-v4.1-flash",
+        "mimo",
+        "deepseek",
+    ],
+)
+def test_bare_candidate_families_cannot_grade(model):
+    guidance = policy()
+    guidance["approved_models"] = [model]
+    with pytest.raises(Incomplete):
+        references.validate_policy(guidance, versions())
+
+
+def test_all_configured_candidate_model_ids_and_aliases_are_excluded():
+    root = Path(__file__).resolve().parents[2]
+    roster = yaml.safe_load((root / "config/cc_roster.yaml").read_text())
+    routing = yaml.safe_load((root / "config/model_routing.yaml").read_text())
+    profiles = yaml.safe_load((root / "config/model_profiles.yaml").read_text())
+    # Collect candidate identities from actual config, not a hand-maintained test list.
+    models = set()
+
+    def visit(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if isinstance(item, str) and key in ("model", "model_id", "api_id"):
+                    normalized = references.identity(item)
+                    if "mimo" in normalized or "deepseek" in normalized:
+                        models.add(item)
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    for config in (roster, routing, profiles):
+        visit(config)
+    for alias, row in routing["providers"].items():
+        if "mimo" in row.get("model", "") or "deepseek" in row.get("model", ""):
+            models.add(alias)
+    assert "mimo-v2.6-pro[1m]" in models and len(models) >= 10
+    for model in sorted(models):
+        guidance = policy()
+        guidance["approved_models"] = [model]
+        with pytest.raises(Incomplete, match="exclude qualification candidates"):
+            references.validate_policy(guidance, versions())
+
+
+@pytest.mark.parametrize(
+    "model", ["synthetic-frontier", "openai/gpt-6", "anthropic/claude", "mimosa"]
+)
+def test_independent_grader_positive_controls_still_admit(model):
+    guidance, cases = mixed()
+    name = next(iter(cases))
+    case = cases[name][0]
+    guidance["approved_models"] = [model]
+    case["reference_provenance"]["model_id"] = model
+    receipt(name, case, guidance)
+    original = copy.deepcopy((guidance, case))
+    references.admit(name, [case], guidance, versions()[name], contracts=versions())
+    assert not references.blockers(name, case, guidance, versions()[name], contracts=versions())
+    assert not references.approval_issues(
+        {name: [case]}, guidance, approval({name: [case]}, guidance), contracts=versions()
+    )
+    assert (guidance, case) == original

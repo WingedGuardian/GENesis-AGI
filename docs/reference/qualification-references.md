@@ -5,12 +5,21 @@ already graded references and identifies outstanding review obligations;
 it makes no model calls and never invents labels, receipts or human approval.
 Corpus/prompt validation, CLI integration and candidate qualification land later.
 
-The caller passes the current contract-version mapping to `validate_policy`
-and `review`, or a contract version to `admit`. Frontier-assisted policy uses
+The caller passes the full current contract-version mapping to `validate_policy`
+and `review`, and as `contracts=versions` to `admit`, `blockers` and
+`approval_issues`. Direct admission also takes its contract version, which must
+match that mapping. Missing context refuses admission; no prior validation call
+is trusted. The caller owns the mapping's completeness and currentness; the
+library does not authenticate a canonical contract registry. Each boundary
+validates the complete policy against a detached
+snapshot. `approval_issues` checks admission of the corpus as well as the
+attestation. Invalid policy, unknown contracts or empty/malformed case lists
+cannot produce an empty approval-issues result. Frontier-assisted policy uses
 `frontier-assisted-v1`, an approved grader list, source-backed guidance and a
 feedback list. Approved grader identities normalize NFC, case and supported
 slash-delimited gateway prefixes; MiMo and DeepSeek candidate families are
-excluded. The confidence threshold is an integer from 90 to 100. Confidence is
+excluded, including configured bare model IDs, context-window suffixes and
+routing aliases. The confidence threshold is an integer from 90 to 100. Confidence is
 self-reported, not measured calibration or proof of correctness.
 
 Human decisions use `user_passed`; frontier decisions use `reference_passed`.
@@ -36,7 +45,8 @@ confidence, missing supporting evidence or unresolved uncertainty route to
 `human_review`. A clean receipt is `admitted`. This status proves reference
 admission only; it is not a candidate qualification result or storage replay.
 
-For an admitted corpus, `approval_issues(corpus, policy, approval)` checks a
+`approval_issues(corpus, policy, approval, contracts=versions)` first checks
+reference admission and then checks a
 human, approved, independent attestation with supporting evidence and exact
 corpus/policy hashes. Its reviewer must differ from the declared frontier
 labelers after identity normalization. These are declarations, not authenticated

@@ -2571,7 +2571,9 @@ verified: 4117f6ed 2026-10-05
   accounting stores are outside this boundary. See
   `docs/reference/qualification-journal.md`. Offline reference admission also
   binds current policy, source-labelled decisions and whole-corpus feedback
-  receipts; declared frontier identities cannot grade the candidate families.
+  receipts; all public admission boundaries validate the full current policy
+  context, and declared frontier identities cannot grade configured candidate
+  families, including bare and gateway model IDs.
   Human approval binds the exact corpus and policy; receipts do not authenticate
   reviewers or calibrate confidence. See `docs/reference/qualification-references.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
