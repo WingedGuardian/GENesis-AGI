@@ -615,3 +615,26 @@ wg_runaway_check '{_domain(box, 2048)}'""",
     log = (box["home"] / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
     assert "revalidation did not complete (status 124" in log
     assert not _pages(box)
+
+
+def test_a_long_walk_outage_does_not_expire_the_baselines_it_carries(box):
+    """Nothing is forgotten while the walk is incomplete: an outage longer than
+    DG_RUNAWAY_FORGET_S must not turn a fast grower into a first sighting."""
+    f = _file(box, "grow2.log", 60)
+    _holder(box, 9, f)
+    dom = _domain(box, 2048)
+    _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        timeout() {{ return 124; }}
+        for g in "${{!_RW_LAST[@]}}"; do _RW_LAST[$g]=$(( _RW_LAST[$g] - DG_RUNAWAY_FORGET_S - 10 )); done
+        wg_runaway_check '{dom}'
+        unset -f timeout
+        for g in "${{!_RW_PREV_AT[@]}}"; do _RW_PREV_AT[$g]=$(( _RW_PREV_AT[$g] - 60 )); done
+        python3 -c 'import os; fd = os.open("{f}", os.O_WRONLY); os.posix_fallocate(fd, 0, 360 * 1048576)'
+        wg_runaway_check '{dom}'
+        """,
+    )
+    pages = _pages(box)
+    assert len(pages) == 1 and "it grew 300 MB" in pages[0]["body"], pages

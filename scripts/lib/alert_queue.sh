@@ -41,14 +41,23 @@ queue_alert_try() {
 import json, os, time, uuid
 root = os.environ["ALERT_QUEUE_ROOT"]
 ts = time.time()
+
+
+def text(name, default=""):
+    # File names and /proc process names may hold bytes that are not UTF-8;
+    # the environment hands them over as surrogates, which cannot be written
+    # as UTF-8. Replace them, or the write fails and the alert never queues.
+    return os.environ.get(name, default).encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
 entry = {
     "schema": 1,
     "ts": ts,
-    "severity": os.environ.get("ALERT_SEVERITY", "warning"),
-    "source": os.environ.get("ALERT_SOURCE", "shell"),
-    "title": os.environ.get("ALERT_TITLE", ""),
-    "body": os.environ.get("ALERT_BODY", ""),
-    "dedupe_key": os.environ.get("ALERT_DEDUPE") or None,
+    "severity": text("ALERT_SEVERITY", "warning"),
+    "source": text("ALERT_SOURCE", "shell"),
+    "title": text("ALERT_TITLE"),
+    "body": text("ALERT_BODY"),
+    "dedupe_key": text("ALERT_DEDUPE") or None,
     "meta": {},
 }
 # The same identity already waiting to be delivered: a second copy adds

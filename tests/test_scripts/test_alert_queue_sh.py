@@ -154,3 +154,18 @@ def test_an_identity_already_waiting_is_not_queued_twice(tmp_path):
     assert r.stdout.split() == ["first", "second", "third", "nokey1", "nokey2"]
     titles = sorted(e["title"] for e in _entries(root))
     assert titles == ["T1", "T3", "T4", "T5"], "same key once; no key never deduped"
+
+
+def test_bytes_that_are_not_utf8_still_queue(tmp_path):
+    """A file or process name may hold any bytes; the alert must still queue
+    (with replacement characters), never fail and retry forever."""
+    root = tmp_path / "queue"
+    r = _run_bash(
+        "queue_alert_try critical wg \"T $(printf 'a\\377b')\" \"B $(printf '\\376')\" \"k:$(printf '\\375')\" && echo QUEUED",
+        {"GENESIS_ALERT_QUEUE_ROOT": str(root)},
+    )
+    assert r.returncode == 0, r.stderr
+    assert "QUEUED" in r.stdout
+    (e,) = _entries(root)
+    assert e["title"] == "T a\ufffdb" and e["body"] == "B \ufffd"
+    assert e["dedupe_key"] == "k:\ufffd"

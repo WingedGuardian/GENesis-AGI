@@ -289,11 +289,15 @@ wg_runaway_check() {
     done
 
     # Out of sight for DG_RUNAWAY_FORGET_S: forgotten. Seen again later, it is
-    # queued again under the same key, which the drainer collapses.
-    for gen in "${!_RW_LAST[@]}"; do
-        (( now - ${_RW_LAST[$gen]} > DG_RUNAWAY_FORGET_S )) || continue
-        unset "_RW_LAST[$gen]" "_RW_PAGED[$gen]" "_RW_PREV[$gen]" "_RW_PREV_AT[$gen]"
-    done
+    # queued again under the same key, which the drainer collapses. Only a
+    # complete walk proves a file absent: during an outage of the walk nothing
+    # is forgotten, or the baselines it carries would expire (review finding).
+    if (( walk_ok )); then
+        for gen in "${!_RW_LAST[@]}"; do
+            (( now - ${_RW_LAST[$gen]} > DG_RUNAWAY_FORGET_S )) || continue
+            unset "_RW_LAST[$gen]" "_RW_PAGED[$gen]" "_RW_PREV[$gen]" "_RW_PREV_AT[$gen]"
+        done
+    fi
 
     # A file an incomplete walk did not report keeps its baseline and its time:
     # dropping it would make the next poll a first sighting, and repeated
