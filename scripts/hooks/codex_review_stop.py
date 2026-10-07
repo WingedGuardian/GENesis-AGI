@@ -37,6 +37,17 @@ from shell_parse import (  # noqa: E402
 )
 
 
+class Fixable(str):
+    """A denial the agent can clear by rewriting the command and running it again.
+
+    Every other denial is a STOP for the user: a review-budget or approval
+    boundary, or evidence the adapter cannot read. Telling an agent to stop on a
+    reason it could fix by itself stalls the work; telling it to retry a budget
+    stop would invite it to route around the boundary. The command is still
+    re-checked in full when it is run again.
+    """
+
+
 def _non_mutating(seg) -> bool:
     """Prove help/dry-run from option positions, never from message/path text."""
     argv = seg.argv
@@ -129,7 +140,7 @@ def decide(payload: object) -> str | None:
     segs, blind = analyze_checked(command)
     if blind is not None:
         if mentions(command, re.compile(r"\b(?:git|gh)\b")):
-            return f"Cannot classify this shell action: {blind.cause}. {blind.hint}"
+            return Fixable(f"Cannot classify this shell action: {blind.cause}. {blind.hint}")
         return None
     actions = [
         seg for seg in segs if not _non_mutating(seg) and (
@@ -144,14 +155,17 @@ def decide(payload: object) -> str | None:
     # Exact raw/resolved argv agreement excludes stripped env assignments and
     # wrappers. Single top-level commands exclude prior/conditional shell state.
     if len(segs) != 1 or actions[0].depth or _argv(actions[0].raw) != actions[0].argv:
-        return "Run the action as one standalone, unwrapped git/gh command."
+        return Fixable("Run the action as one standalone, unwrapped git/gh command.")
     if any(os.environ.get(name) for name in (*REPO_VARS, "GH_REPO")):
         return "Inherited repository-selection overrides cannot be resolved."
     seg = actions[0]
     if git_subcommand(seg.argv) == "commit":
         effective_cwd = _commit_cwd(seg, cwd)
         if effective_cwd is None:
-            return "Use the current directory or one literal git -C directory; other global options are unsupported."
+            return Fixable(
+                "Use the current directory or one literal git -C directory; "
+                "other global options are unsupported."
+            )
         deadline = Deadline.after(commits._COMMIT_HOOK_REGISTERED_TIMEOUT - 0.5)
         branch = state.get_current_branch(cwd=effective_cwd, deadline=deadline.expires_at)
         result = commits._branch_review_budget(
@@ -177,6 +191,17 @@ def main() -> int:
     if reason is None:
         print("allow")
         return 0
+    # "deny" on stdout tells the launcher this denial was explained here. An
+    # interpreter that never ran this file (a missing or unreadable script also
+    # exits 2) prints nothing to stdout, so it cannot be mistaken for one.
+    print("deny")
+    if isinstance(reason, Fixable):
+        print(
+            f"BLOCKED: {reason}\nThis is not an approval stop. Rewrite the command "
+            "as described and run it again; the rewritten command is checked in full.",
+            file=sys.stderr,
+        )
+        return 2
     print(
         f"BLOCKED: {reason}\nSTOP and handoff to the user. This Codex CLI adapter "
         "cannot obtain fresh native approval. Do not retry, add an override, "

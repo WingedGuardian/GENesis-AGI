@@ -504,7 +504,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-10-03: 69 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-05: 70 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -1121,15 +1121,17 @@ jobs:
         #   test_falkordb_module.py               new -> 35   (+35)
         # No added skips. Floor: 24332 + 89 = 24421; skip ceiling remains 102.
         # Immutable CBM staging: new test_codebase_managed_config.py collects
-        # 36 cases (0 -> 36). Two native-binary opt-ins skip without the explicit
-        # acceptance binary; confirm the skip delta from the hosted junit report.
-        # Floor: 24421 + 36 = 24457.
+        # 76 cases (0 -> 76), plus 3 new provider-opener classification controls.
+        # The native-binary opt-ins add two skip identities. Original PR CI had
+        # seven additional browser skips absent on current main; counts alone
+        # did not establish a two-slot allowance. Keep main's ceiling unchanged.
+        # Floor: 24421 + 76 + 3 = 24500.
         # Native CBM runtime/templates: new runtime file 24 and template file 26
         # cases, plus template-placeholders 13 -> 14 (+1 hosted slice inventory).
-        # Other edited files retain counts. Floor: 24457 + 51 = 24508;
+        # Other edited files retain counts. Floor: 24500 + 51 = 24551;
         # no new skip sites.
         # Guarded CBM removal: new uninstall file32 cases; other edited test
-        # files retain collection counts. Floor24508+32=24540; no added skips.
+        # files retain collection counts. Floor24551+32=24583; no added skips.
         # Native CBM lifecycle: new lifecycle file31 cases; no added skips.
-        # Floor24540+31=24571; predecessor skip identity gate still applies.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 24571
+        # Floor24583+31=24614; predecessor skip identity gate still applies.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24614

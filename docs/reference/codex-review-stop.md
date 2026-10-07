@@ -26,7 +26,10 @@ checkout, replacing worktree-local declarations. Updating only a linked worktree
 does not activate a new hook. After landing, update the primary checkout and
 trust its hook before starting another session. The command then resolves scripts
 from the current git checkout; reconcile old branches before relying on their
-policy. No Genesis server restart is needed. This behavior was checked against
+policy. A worktree on a branch from before the fd-3 deny signal runs the new
+config with its old launcher, so each denial there also prints "review guard
+failed (exit 2)" under the real reason until the branch is rebased; it still
+denies. No Genesis server restart is needed. This behavior was checked against
 the [configuration loader](https://github.com/openai/codex/blob/main/codex-rs/config/src/loader/mod.rs)
 and reproduced with harmless CLI probes: regular-checkout configuration blocked
 an exhausted request, while declarations present only in a linked worktree did not.
@@ -59,8 +62,18 @@ also outside its protection claim. It is not a universal enforcement boundary.
 
 ## Handoff
 
-When blocked, stop and present the reason to the user. Earlier “continue” does
-not authorize another action. Do not add a sigil, persist an approval file,
+A block is one of two kinds, and its message says which.
+
+- **Rewrite and run again.** The guard could not read or scope the command: an
+  action chained to another step, a heredoc or quoting it cannot parse, an
+  unsupported git global option. Rewrite the command as the message says and run
+  it again. The rewritten command is checked in full, budget included, so this is
+  not a way around a stop.
+- **Stop and hand off.** A review-budget or approval boundary, unreadable
+  evidence, or a guard failure ("review guard unavailable", "review guard
+  failed"). Stop and present the reason to the user.
+
+After a stop, earlier “continue” does not authorize another action. Do not add a sigil, persist an approval file,
 disable hooks, or retry through another tool. The user may choose merge with
 accepted issues, rework, or further work in a client with a supported fresh native
 approval boundary. That client's decision cannot become a reusable Codex receipt.
