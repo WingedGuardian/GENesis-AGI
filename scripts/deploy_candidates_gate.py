@@ -93,7 +93,8 @@ HOST_DRIVER_PREFIXES = (
     "scripts/systemd/genesis-cc-tmp-align.",
 )
 # The git and Claude Code hooks (owner, 2026-10-01): the guards that protect the
-# repository never run unreviewed code. Only these two directories (owner ruling
+# repository never run code that is neither reviewed nor owner-approved for that
+# head (#2978: `add --approve-hooks`). Only these two directories (owner ruling
 # 87b86c40): the wider hook surface (.claude/settings.json, config/behavioral_rules/,
 # the hook scripts at scripts/ root) is admitted, an accepted residual.
 HOOK_DIRS = ("scripts/hooks/", ".claude/hooks/")
@@ -185,8 +186,9 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
 
     The server's base is merge-base(serving commit, origin/main): what the
     server runs that is reviewed main. The hooks are compared with the commit
-    the checkout holds (HEAD), whose scripts/hooks/ admission keeps equal to
-    reviewed main on `live`, and against the directory git runs them from."""
+    the checkout holds (HEAD), whose scripts/hooks/ on `live` is reviewed main's
+    or an approved candidate's (admission and hook attribution), and against the
+    directory git runs them from."""
     fails: list[str] = []
     too_old = git_version_failure(repo)
     if too_old:
@@ -259,8 +261,10 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
 
 
 # ── admission ─────────────────────────────────────────────────────────────
-def path_refusal(path: str) -> str | None:
-    """Why a changed path keeps a candidate off `live`, or None."""
+def path_refusal(path: str, hooks_approved: bool = False) -> str | None:
+    """Why a changed path keeps a candidate off `live`, or None.
+    ``hooks_approved`` skips ONLY the hook rule: every other rule still applies
+    to a path under the hook directories (a .gitattributes there, say)."""
     if path.startswith(MIGRATION_DIRS):
         # Any change, not only an addition: a merged migration this install has
         # not applied yet runs at the next boot in whatever form `live` holds.
@@ -273,8 +277,11 @@ def path_refusal(path: str) -> str | None:
         return f"changes the Claude Code pin ({path}), which reaches the host"
     if path.startswith(HOST_DRIVER_PREFIXES):
         return f"changes what drives the host from this checkout ({path}), which reaches the host"
-    if path.startswith(HOOK_DIRS):
-        return f"changes a git or Claude Code hook ({path}); hooks go live only after they merge"
+    if path.startswith(HOOK_DIRS) and not hooks_approved:
+        return (
+            f"changes a git or Claude Code hook ({path}); hooks go live only after they merge, "
+            "or with the owner's approval (add --approve-hooks)"
+        )
     if path in REFUSAL_FILES or path.startswith(ENGINE_PREFIX):
         return f"changes what keeps the wipers and this engine safe on `live` ({path})"
     if path == ".gitattributes" or path.endswith("/.gitattributes"):
@@ -288,19 +295,24 @@ def path_refusal(path: str) -> str | None:
     return None
 
 
-def admission_failures(repo: Repo, base: str, head: str) -> list[str]:
+def changed_paths(repo: Repo, base: str, head: str) -> list[str]:
+    """Every path this head changes against its merge base with origin/main
+    (three dots, so a branch behind main is not charged with main's own
+    changes)."""
+    text = repo.git("diff", "--no-renames", "--name-only", "-z", f"{base}...{head}").stdout
+    return [p for p in text.split("\0") if p]
+
+
+def admission_failures(repo: Repo, base: str, head: str, hooks_approved: bool = False) -> list[str]:
     """What keeps this head from going live: the diff against its merge base
-    with origin/main (three dots, so a branch behind main is not charged with
-    main's own changes), and any `Deploy-rebuild:` commit it carries."""
-    text = repo.git("diff", "--no-renames", "--name-status", "-z", f"{base}...{head}").stdout
-    parts = text.split("\0")
+    with origin/main, and any `Deploy-rebuild:` commit it carries.
+    ``hooks_approved`` (the owner approved THIS head's hook changes) waives the
+    hook rule only (see path_refusal)."""
     fails: list[str] = []
-    i = 0
-    while i + 1 < len(parts) and parts[i]:
-        why = path_refusal(parts[i + 1])
+    for path in changed_paths(repo, base, head):
+        why = path_refusal(path, hooks_approved)
         if why:
             fails.append(why)
-        i += 2
     commits = repo.rev_list(head, "--not", base)
     info = repo.read_commits(commits)
     for c in commits:
@@ -397,7 +409,53 @@ def gate_failure(repo: Repo, base: str, cand: dict) -> str | None:
             f"the branch moved to {tip[:12]} since {head[:12]} was added: "
             f"add it again to run this commit (scripts/deploy_candidates add {branch} ...)"
         )
-    fails = admission_failures(repo, base, head)
+    fails = admission_failures(repo, base, head, hooks_approved(cand))
     if fails:
         return "admission: " + "; ".join(fails)
     return pr_failure(repo, cand)
+
+
+def hooks_approved(cand: dict) -> bool:
+    """The owner approved this candidate's hook changes, for exactly the head it
+    is pinned at (the validator also requires that; checked again here)."""
+    ha = cand.get("hook_approval")
+    return isinstance(ha, dict) and ha.get("head") == cand["verified_head"]
+
+
+def hook_attribution_failures(
+    repo: Repo, base: str, tip: str, approved: dict[str, str]
+) -> dict[str, str]:
+    """Every hook path whose bytes at the rebuilt ``tip`` differ from ``base``
+    must be byte-identical to that path at some APPROVED merged candidate head
+    (``approved``: branch -> head; a deletion matches a head that deletes it).
+    git can merge a hook without a conflict into bytes nobody approved: an
+    approved change on top of a change origin/main made since the branch was
+    cut, or two approved candidates' changes to one hook. Returns the approved
+    candidates behind each such path, with why (to EXCLUDE, like a conflict);
+    empty when every hook on the tip is attributable. Raises Refusal when no
+    approved candidate changed the path, which admission makes impossible."""
+    text = repo.git("diff", "--no-renames", "--name-only", "-z", base, tip, "--", *HOOK_DIRS).stdout
+    out: dict[str, str] = {}
+    for path in (p for p in text.split("\0") if p):
+        got = repo.blob_at(tip, path)
+        if any(repo.blob_at(h, path) == got for h in approved.values()):
+            continue
+        changers = [
+            b
+            for b, h in approved.items()
+            if repo.blob_at(h, path) != repo.blob_at(repo.merge_base(base, h) or base, path)
+        ]
+        if not changers:
+            raise Refusal(
+                f"{path} on the rebuilt `live` matches no approved version, and no approved "
+                "candidate changed it; nothing changed"
+            )
+        for b in changers:
+            out[b] = (
+                f"origin/main changed {path} since it was cut, so the merge holds hook bytes "
+                "nobody approved: merge origin/main into it, then add it again with --approve-hooks"
+                if len(changers) == 1
+                else f"{', '.join(changers)} each change {path}, and git merged them into hook "
+                "bytes none was approved for: drop all but one"
+            )
+    return out
