@@ -73,6 +73,9 @@ def test_identity_normalizes_gateway_without_removing_vendor():
 
 def receipt(name, case, guidance):
     case["reference_review"] = {
+        "label_source": references.FRONTIER,
+        "model_id": (guidance.get("approved_models") or ["synthetic-frontier"])[0],
+        "model_identity_evidence": "Synthetic feedback model identity",
         "reviewer": "synthetic-frontier-reviewer",
         "evidence_complete": True,
         "uncertainties": [],
@@ -410,3 +413,133 @@ def test_independent_grader_positive_controls_still_admit(model):
         {name: [case]}, guidance, approval({name: [case]}, guidance), contracts=versions()
     )
     assert (guidance, case) == original
+
+
+def actor_boundary(boundary, guidance, name, case):
+    context = versions()
+    if boundary == "admit":
+        try:
+            references.admit(name, [case], guidance, context[name], contracts=context)
+        except Incomplete:
+            return False
+        return True
+    if boundary == "blockers":
+        return not references.blockers(name, case, guidance, context[name], contracts=context)
+    if boundary == "approval":
+        corpus = {name: [case]}
+        return not references.approval_issues(
+            corpus, guidance, approval(corpus, guidance), contracts=context
+        )
+    return (
+        references.review({"reference_policy": guidance, "cases": [case]}, context)["status"]
+        == "pass"
+    )
+
+
+@pytest.mark.parametrize("boundary", ["admit", "blockers", "approval", "review"])
+@pytest.mark.parametrize("kind", ["human", "frontier", "novelty"])
+@pytest.mark.parametrize("disposition", ["regraded", "unaffected"])
+@pytest.mark.parametrize(
+    "actor",
+    [
+        {},
+        {"label_source": "unknown", "reviewer": "x"},
+        {"label_source": references.FRONTIER, "reviewer": "x", "model_id": "mimo-v2.6-pro"},
+        {"label_source": references.FRONTIER, "reviewer": "x", "model_id": "deepseek-v4.1-flash"},
+        {"label_source": references.FRONTIER, "reviewer": "x", "model_id": "unapproved"},
+        {"label_source": references.FRONTIER, "reviewer": "x", "model_id": "synthetic-frontier"},
+        {"label_source": "human", "reviewer": "x", "model_id": None},
+        {"label_source": "human", "reviewer": "x", "model_identity_evidence": None},
+    ],
+)
+def test_feedback_actor_class_fails_closed(boundary, kind, disposition, actor):
+    guidance, cases = mixed()
+    name = next(iter(cases)) if kind != "novelty" else NOVELTY
+    case = copy.deepcopy(next(iter(cases.values()))[kind == "human"])
+    if kind == "novelty":
+        case["expected_target"] = None
+    case["reference_provenance"]["rubric_version"] = versions()[name]
+    case["contract"] = name
+    receipt(name, case, guidance)
+    review = case["reference_review"]
+    for key in ("reviewer", "label_source", "model_id", "model_identity_evidence"):
+        review.pop(key)
+    review.update(actor)
+    if (
+        actor.get("label_source") == references.FRONTIER
+        and actor.get("model_id") != "synthetic-frontier"
+    ):
+        # Isolate model exclusion from the separate missing-identity-evidence arm.
+        review["model_identity_evidence"] = "Synthetic declared identity"
+    review["feedback_applicability"]["when"]["disposition"] = disposition
+    assert not actor_boundary(boundary, guidance, name, case)
+
+
+@pytest.mark.parametrize("role", ["human", references.FRONTIER])
+def test_valid_feedback_actor_changes_stale_approval_without_self_hash(role):
+    guidance, cases = mixed()
+    old = approval(cases, guidance)
+    name = next(iter(cases))
+    case = cases[name][1]  # Human label with a distinct frontier feedback actor.
+    review = case["reference_review"]
+    review.update(label_source=role, reviewer="mimo-v2.6-pro")
+    if role == "human":
+        review.pop("model_id")
+        review.pop("model_identity_evidence")
+    references.admit(name, [case], guidance, versions()[name], contracts=versions())
+    assert references.approval_issues(cases, guidance, old, contracts=versions())
+    assert not references.approval_issues(
+        cases, guidance, approval(cases, guidance), contracts=versions()
+    )
+
+
+def test_frontier_feedback_actor_cannot_approve_human_only_labels():
+    guidance, cases = mixed()
+    corpus = {name: [rows[1]] for name, rows in cases.items()}
+    approved = approval(corpus, guidance)
+    approved["reviewer"] = " litellm/openrouter/SYNTHETIC-FRONTIER-REVIEWER "
+    assert references.approval_issues(corpus, guidance, approved, contracts=versions())
+
+
+@pytest.mark.parametrize("field", ["model_id", "model_identity_evidence"])
+def test_human_machine_identity_contradiction_in_labeler_and_approver(field):
+    guidance, cases = mixed()
+    approved = approval(cases, guidance)
+    approved[field] = None
+    assert references.approval_issues(cases, guidance, approved, contracts=versions())
+    name = next(iter(cases))
+    case = cases[name][1]
+    case["reference_provenance"][field] = None
+    receipt(name, case, guidance)
+    assert not actor_boundary("admit", guidance, name, case)
+
+
+@pytest.mark.parametrize("boundary", ["admit", "blockers", "approval", "review"])
+@pytest.mark.parametrize("source", ["human", references.FRONTIER])
+@pytest.mark.parametrize("kind", ["human", "frontier", "novelty"])
+@pytest.mark.parametrize("disposition", ["regraded", "unaffected"])
+def test_complete_feedback_actors_positive_population(boundary, source, kind, disposition):
+    guidance, cases = mixed()
+    name = next(iter(cases)) if kind != "novelty" else NOVELTY
+    case = copy.deepcopy(next(iter(cases.values()))[kind == "human"])
+    if kind == "novelty":
+        case["expected_target"] = None
+    case["contract"] = name
+    case["reference_provenance"]["rubric_version"] = versions()[name]
+    receipt(name, case, guidance)
+    review = case["reference_review"]
+    review.update(label_source=source, reviewer="mimo-v2.6-pro")
+    if source == "human":
+        review.pop("model_id")
+        review.pop("model_identity_evidence")
+    review["feedback_applicability"]["when"]["disposition"] = disposition
+    assert actor_boundary(boundary, guidance, name, case)
+
+
+def test_feedback_actor_summary_keeps_label_and_feedback_sources_separate():
+    guidance, cases = mixed()
+    result = references.summary(cases, guidance)
+    assert result["sources"] == {"human": 7, references.FRONTIER: 7}
+    assert result["feedback_sources"] == {references.FRONTIER: 14}
+    next(iter(cases.values()))[0]["reference_review"].pop("label_source")
+    assert references.summary(cases, guidance)["feedback_sources"]["unknown"] == 1

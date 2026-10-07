@@ -2574,7 +2574,11 @@ verified: 4117f6ed 2026-10-05
   receipts; all public admission boundaries validate the full current policy
   context, and declared frontier identities cannot grade configured candidate
   families, including bare and gateway model IDs.
-  Human approval binds the exact corpus and policy; receipts do not authenticate
+  Feedback actors declare their own role and approved model identity; human
+  declarations reject machine identity fields. Approval independence includes
+  frontier labelers and feedback reviewers. Missing historical actor metadata
+  remains a review obligation. Human approval binds the exact corpus and policy;
+  receipts do not authenticate
   reviewers or calibrate confidence. See `docs/reference/qualification-references.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,

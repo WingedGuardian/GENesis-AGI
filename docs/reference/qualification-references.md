@@ -31,13 +31,22 @@ identity evidence, rationale, supporting evidence and an empty uncertainty list.
 Missing evidence or uncertainty stops admission even at high confidence.
 
 Every admitted case, including human-labelled cases, needs a feedback review
-receipt. It binds the current policy hash and case hash, declares its reviewer,
+receipt. It binds the current policy hash and case hash, declares its reviewer
+and `label_source` (`human` or `frontier_llm`),
 and accounts for every feedback ID with a reasoned `regraded` or `unaffected`
 disposition. The case hash covers active inputs, decisions and provenance;
 review receipts and historical judgments are excluded from that hash. Changing
 guidance invalidates existing receipts throughout the corpus, including cases
 outside the feedback's named contracts: every case needs a fresh applicability
 assessment. Never fill receipts automatically to bypass that review.
+
+Frontier feedback actors also declare an approved, noncandidate `model_id` and
+nonblank `model_identity_evidence`. Human actors, including labelers and
+approvers, cannot carry these machine identity fields. Reviewer names are opaque;
+they need not match a model ID. Missing legacy feedback actor declarations remain
+review obligations; preserve historical snapshots and obtain grounded metadata
+before making a new snapshot. Reassessment can retain an unchanged judgment.
+Changed active judgments must carry corresponding active provenance.
 
 `review(spec, versions)` returns case obligations keyed by contract and case ID.
 Routine missing/stale receipts route to `needs_llm_regrade`; below-threshold
@@ -49,7 +58,10 @@ admission only; it is not a candidate qualification result or storage replay.
 reference admission and then checks a
 human, approved, independent attestation with supporting evidence and exact
 corpus/policy hashes. Its reviewer must differ from the declared frontier
-labelers after identity normalization. These are declarations, not authenticated
+labelers and frontier feedback reviewers after identity normalization. A valid
+receipt actor change can retain case admission but invalidates the old full-corpus
+approval. `summary` reports initial `sources` and separate `feedback_sources`;
+these counts confer no admission. These are declarations, not authenticated
 identities or signatures. Keep real approvals and references private; publish
 only synthetic test fixtures. Preserve approved snapshots when guidance changes,
 and record new evidence rather than overwriting their history.

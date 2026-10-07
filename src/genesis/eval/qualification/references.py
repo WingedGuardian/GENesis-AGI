@@ -98,6 +98,31 @@ def _policy_context(policy, contracts, contract=None, version=None):
     return policy
 
 
+def _actor_issues(actor, policy):
+    """Validate declared roles; reviewer names are opaque, not model identities."""
+    if not isinstance(actor, dict):
+        return ["missing actor declaration"]
+    issues = []
+    source = actor.get("label_source")
+    if source not in ("human", FRONTIER):
+        issues.append("unapproved label source")
+    if not nonblank(actor.get("reviewer")):
+        issues.append("missing reviewer")
+    if source == "human" and any(key in actor for key in ("model_id", "model_identity_evidence")):
+        issues.append("human actor carries machine identity")
+    if source == FRONTIER:
+        model = actor.get("model_id")
+        if (
+            not nonblank(model)
+            or identity(model) not in {identity(m) for m in policy["approved_models"]}
+            or candidate(identity(model))
+        ):
+            issues.append("unapproved grader model")
+        if not nonblank(actor.get("model_identity_evidence")):
+            issues.append("missing grader identity evidence")
+    return issues
+
+
 def passed(case):
     """Machine labels never occupy the field reserved for human judgments."""
     provenance = case.get("reference_provenance", {})
@@ -137,8 +162,7 @@ def _blockers(contract, case, policy, version):
     if not isinstance(provenance, dict):
         return ["ungraded reference"]
     source = provenance.get("label_source")
-    if source not in ("human", FRONTIER):
-        issues.append("unapproved label source")
+    issues.extend(_actor_issues(provenance, policy))
     if not nonblank(provenance.get("reviewer")) or provenance.get("rubric_version") != version:
         issues.append("missing reviewer or mismatched contract version")
     if contract == NOVELTY:
@@ -162,11 +186,6 @@ def _blockers(contract, case, policy, version):
             issues.append("invalid confidence")
         elif confidence < policy.get("confidence_threshold", 90):
             issues.append("confidence below human-review threshold")
-        model = provenance.get("model_id")
-        if not nonblank(model) or identity(model) not in {
-            identity(m) for m in policy["approved_models"]
-        }:
-            issues.append("unapproved grader model")
         if not all(
             nonblank(provenance.get(k))
             for k in ("model_identity_evidence", "rationale", "evidence")
@@ -198,8 +217,7 @@ def _blockers(contract, case, policy, version):
             ):
                 issues.append("feedback needs a reasoned regrade or unaffected disposition")
                 break
-    if not nonblank(receipt.get("reviewer")):
-        issues.append("feedback reviewer missing")
+    issues.extend(f"feedback actor: {issue}" for issue in _actor_issues(receipt, policy))
     return issues
 
 
@@ -233,13 +251,15 @@ def approval_issues(corpus, policy, approval, *, contracts=None):
     except Incomplete as exc:
         return [f"reference corpus/policy requires admission: {exc}"]
     labelers = {
-        identity(c["reference_provenance"]["reviewer"])
+        identity(actor["reviewer"])
         for cases in corpus.values()
         for c in cases
-        if c["reference_provenance"]["label_source"] == FRONTIER
+        for actor in (c["reference_provenance"], c["reference_review"])
+        if actor["label_source"] == FRONTIER
     }
     if (
         not isinstance(approval, dict)
+        or _actor_issues(approval, policy)
         or approval.get("label_source") != "human"
         or approval.get("approved") is not True
         or approval.get("independent") is not True
@@ -263,6 +283,13 @@ def summary(corpus, policy):
         "sources": dict(
             Counter(
                 c["reference_provenance"]["label_source"] for rows in corpus.values() for c in rows
+            )
+        ),
+        "feedback_sources": dict(
+            Counter(
+                (c.get("reference_review") or {}).get("label_source", "unknown")
+                for rows in corpus.values()
+                for c in rows
             )
         ),
         "limitations": [
