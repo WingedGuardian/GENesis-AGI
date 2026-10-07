@@ -1,4 +1,3 @@
-### Fixed
 - Managed Codebase enablement checks typed backend commands and containment before
   activation and again after explicit native refreshes. Exact current rendered
   sources and override-free native namespaces govern activation and retirement;
