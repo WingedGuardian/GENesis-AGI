@@ -8,6 +8,7 @@ import os
 import runpy
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -120,6 +121,164 @@ def test_stale_pin_remains_diagnosable(managed, tmp_path):
     path = tmp_path / "settings"
     path.write_text(json.dumps(data))
     assert managed.read_settings(path, require_build=False) == data
+
+
+@pytest.mark.parametrize("build", ["old", None])
+def test_status_checks_build_and_preserves_metadata(managed, tmp_path, monkeypatch, build):
+    data = config(tmp_path, managed)
+    data["build"] = managed.BUILD if build is None else build
+    path = tmp_path / "settings"
+    path.write_text(json.dumps(data))
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: "ActiveState=inactive\n")
+    result = managed.status(path)
+    assert result["settings"] == data
+    assert bool(result["settings_error"]) == (build is not None)
+    assert result["service"] == {"ActiveState": "inactive"}
+
+
+@pytest.mark.parametrize("command", ["status", "configure"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_config_path_precedence(managed, tmp_path, monkeypatch, command, explicit):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CODEBASE_MEMORY_MCP_MANAGED_CONFIG", str(tmp_path / "environment"))
+    calls = []
+    globals_ = managed.main.__globals__
+    monkeypatch.setitem(globals_, "status", lambda path: calls.append(path) or {})
+    monkeypatch.setitem(globals_, "configure", lambda args, path: calls.append(path))
+    argv = ["--config", str(tmp_path / "explicit")] if explicit else []
+    argv += [command]
+    if command == "configure":
+        argv += sum(
+            (["--" + key, str(tmp_path)] for key in ("main", "binary", "state", "sentinel")), []
+        )
+    assert managed.main(argv) == 0
+    selected = (
+        "explicit"
+        if explicit
+        else ("environment" if command == "status" else ".genesis/config/codebase-managed.json")
+    )
+    assert calls == [tmp_path / selected]
+
+
+@pytest.fixture
+def staged_configuration(managed, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    monkeypatch.setitem(
+        managed.configure.__globals__, "SCRIPT", repo / "scripts/codebase_managed.py"
+    )
+    binary = tmp_path / "source"
+    binary.write_bytes(b"accepted")
+    binary.chmod(0o500)
+    monkeypatch.setattr(
+        hashlib, "file_digest", lambda *a: SimpleNamespace(hexdigest=lambda: managed.BUILD)
+    )
+    state = tmp_path / "new ancestor" / "nested" / "staged $%\\ Unicode \u00e9 "
+    settings = home / ".genesis/config/codebase-managed.json"
+    args = SimpleNamespace(
+        main=str(repo), binary=str(binary), state=str(state), sentinel=str(home / "disabled")
+    )
+
+    def native_config(argv, *, env, **kwargs):
+        with sqlite3.connect(Path(env["CBM_CACHE_DIR"]) / "_config.db") as db:
+            db.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY,value TEXT)")
+            db.execute("INSERT OR REPLACE INTO config VALUES (?,?)", argv[-2:])
+        db.close()
+
+    monkeypatch.setattr(subprocess, "run", native_config)
+    return args, settings, state
+
+
+def _sync_order(settings, state):
+    return [
+        state / "bin/codebase-memory-mcp",
+        state / "cache/_config.db",
+        state / "cache/config.json",
+        state / "bin",
+        state / "cache",
+        state / "runtime",
+        state,
+        state.parent,
+        state.parent.parent,
+        state.parent.parent.parent,
+        settings.parent,
+        settings.parent.parent,
+        settings.parent.parent.parent,
+        "settings-file",
+        settings.parent,
+    ]
+
+
+@pytest.mark.parametrize("boundary", range(15))
+def test_configure_sync_failure_retains_evidence(
+    managed, staged_configuration, monkeypatch, boundary
+):
+    args, settings, state = staged_configuration
+    observed = []
+    real_sync = os.fsync
+
+    def sync(fd):
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        observed.append("settings-file" if path.name.startswith(settings.name + ".") else path)
+        if len(observed) == boundary + 1:
+            raise OSError("injected sync failure")
+        real_sync(fd)
+
+    monkeypatch.setattr(os, "fsync", sync)
+    with pytest.raises(OSError, match="injected sync"):
+        managed.configure(args, settings)
+    assert observed == _sync_order(settings, state)[: boundary + 1]
+    assert state.is_dir() and (state / "cache/_config.db").is_file()
+    assert settings.exists() == (boundary == 14)
+    if settings.exists():
+        assert managed.read_settings(settings)["binary"] == str(state / "bin/codebase-memory-mcp")
+
+
+def test_configure_syncs_before_publication(managed, staged_configuration, monkeypatch):
+    args, settings, state = staged_configuration
+    observed = []
+    real_sync = os.fsync
+
+    def sync(fd):
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        observed.append(
+            "settings-file"
+            if stat.S_ISREG(os.fstat(fd).st_mode) and path.name.startswith(settings.name + ".")
+            else path
+        )
+        assert settings.exists() == (len(observed) == 15)
+        real_sync(fd)
+
+    monkeypatch.setattr(os, "fsync", sync)
+    managed.configure(args, settings)
+    assert observed == _sync_order(settings, state)
+
+
+def test_configure_explicit_nondefault_path_refuses(managed, staged_configuration):
+    args, settings, state = staged_configuration
+    with pytest.raises(ValueError, match="default installed-service"):
+        managed.configure(args, settings.with_name("override"))
+    assert not state.exists()
+
+
+@pytest.mark.parametrize("valid", [False, True])
+def test_cache_validation_closes_native_database(managed, tmp_path, monkeypatch, valid):
+    data = config(tmp_path, managed)
+    cache = Path(data["cache"])
+    cache.mkdir()
+    (cache / "config.json").write_text('{"ui_enabled": false}')
+    db = Mock()
+    db.execute.return_value = [(key, "false" if valid else "true") for key in managed.DISABLED_KEYS]
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **kw: db)
+    if valid:
+        managed.verify_cache(data)
+    else:
+        with pytest.raises(ValueError, match="automatic indexing"):
+            managed.verify_cache(data)
+    db.close.assert_called_once_with()
 
 
 def test_verified_executable_is_same_inode_and_foreign_path_survives(
