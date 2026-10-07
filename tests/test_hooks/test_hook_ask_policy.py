@@ -49,10 +49,10 @@ _KEY = "secrets_env"
 # ─── the module itself: every failure lands on ASK ───────────────────────────
 
 
-def test_the_key_set_is_exactly_the_two_classified_asks() -> None:
+def test_the_key_set_is_exactly_the_classified_asks() -> None:
     """The closed vocabulary, pinned whole. Growing it is a design decision with
     a call site attached, never a side effect."""
-    assert frozenset({"secrets_env", "push_publish"}) == policy.KEYS
+    assert frozenset({"secrets_env", "push_publish", "push_routine"}) == policy.KEYS
 
 
 def test_an_undeclared_ask_is_enabled(monkeypatch) -> None:

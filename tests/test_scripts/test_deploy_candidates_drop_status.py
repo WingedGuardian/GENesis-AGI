@@ -429,6 +429,24 @@ def test_every_lib_the_refusing_scripts_source_before_their_check_is_refused(dc)
         ), read
         for lib in read:
             assert dc.gate.path_refusal(f"scripts/{lib}"), f"{script} reads scripts/{lib} first"
+        # A lib run BY PATH, anywhere in the script, is a gate too: on `live` the
+        # restart runs venv_matches_pyproject.py from the tree, so a candidate
+        # editing it could wave its own dependency change through. Both spellings:
+        # `"$VENV_DIR/bin/python" "$_SELF_DIR/lib/x"` and `python3 … "$DIR/lib/x"`.
+        ran = re.findall(
+            r'"\$\{?[A-Z_]+\}?/bin/python[0-9.]*"(?: -[A-Z]+)* "\$\{?[A-Z_]+\}?/(lib/[^"]+)"'
+            r'|python3[^\n"]*"\$\{?[A-Z_]+\}?/(lib/[^"]+\.py)"',
+            text,
+        )
+        for lib in {a or b for a, b in ran}:
+            assert dc.gate.path_refusal(f"scripts/{lib}"), f"{script} runs scripts/{lib}"
+    # The pass must see the one by-path run deploy_code_only.sh is known to make,
+    # or a changed spelling would leave it silently empty.
+    text = (SCRIPTS / "deploy_code_only.sh").read_text()
+    assert "lib/venv_matches_pyproject.py" in text and re.search(
+        r'"\$\{?[A-Z_]+\}?/bin/python[0-9.]*"(?: -[A-Z]+)* "\$\{?[A-Z_]+\}?/lib/venv_matches_pyproject\.py"',
+        text,
+    )
 
 
 def test_child_processes_never_inherit_python_import_settings(dc):
@@ -446,6 +464,34 @@ def test_every_python_the_status_path_runs_is_isolated():
     text = (SCRIPTS / "lib" / "deploy_status.sh").read_text()
     calls = re.findall(r"\bpython3\b[^\n]*", text)
     assert calls and all(c.startswith("python3 -I -S ") for c in calls), calls
+
+
+def test_every_python_the_deploy_path_runs_is_isolated():
+    """deploy_code_only.sh restarts the server on `live`, a checkout holding
+    candidate code: no python it runs, nor any its sourced libs run, may put the
+    working directory or the script's directory first on sys.path (a candidate's
+    `json.py` or `tomllib.py` would shadow an import), read PYTHON*, or process a
+    the system's site-packages for a stdlib-only helper. So each python3 is
+    `-I -S`. The venv's python reads packages from the venv (packaging, yaml), so
+    it runs `-P`: no cwd or script directory first, site-packages kept (its .pth
+    puts the checkout's src/ on the path, the code the restart is about to run)."""
+    text = (SCRIPTS / "deploy_code_only.sh").read_text()
+    libs = re.findall(r'^\s*(?:\.|source) "\$[A-Z_]+/(lib/[^"]+)"', text, re.MULTILINE)
+    call = re.compile(r'(?:(?<![\w.$-])(?:/[\w./-]*/)?python[0-9.]*|/bin/python[0-9.]*"|\$\{?PY\w*\}?")\s+(-\S+(?:\s+-\S+)?)?')
+    seen = 0
+    for name in ["deploy_code_only.sh", *libs]:
+        for n, line in enumerate((SCRIPTS / name).read_text().splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            # A message ("cannot read which python ...") is prose, not a call.
+            code = re.split(r'\b(?:die|echo|printf)\s+["\']', line)[0]
+            for m in call.finditer(code):
+                seen += 1
+                venv = m.group(0).startswith("/bin/python")
+                want = ("-I -S", "-P", "-P -c") if venv else ("-I -S",)
+                assert m.group(1) in want, f"{name}:{n}: {line.strip()}"
+    # Both spellings are present today: a matcher that found none would pass.
+    assert seen >= 10, seen
 
 
 def test_the_engine_is_inert_in_this_repository_until_pr_c_lands(dc):

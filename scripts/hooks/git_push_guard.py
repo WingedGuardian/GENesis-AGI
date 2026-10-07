@@ -74,7 +74,12 @@ enforces ONLY when the merge targets the configured PUBLIC repo — the declared
 ``github.user``/``github.public_repo`` in ``~/.genesis/config/genesis.yaml``
 (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any OTHER repo
 (a private fork, the voice repo, backups) no-ops, since the required ``/schedule``
-routines run only on the public repo. Deployment note: on the public repo the leaks
+routines run only on the public repo. One per-PR exception: an OUTSIDE contribution
+(a human non-maintainer's fork PR whose every commit and title rename is theirs, whose
+body only they or a named review app edited, and whose CI leak-detector is green at head;
+``_outside_contribution``) needs no ``leaks`` marker, since the review guards the
+owner's private data and an outsider's text cannot hold it -- unless a leaks review ran
+in the PR and objected. Deployment note: on the public repo the leaks
 routine IS configured (the deploy precondition); a clone that runs on its own public
 repo without a producer uses `# scheduled-review-override` — since the only default kind
 is the irreducible one, config cannot relax it, and the override valve is the escape by
@@ -184,9 +189,6 @@ except Exception:  # noqa: BLE001 — skew falls back to ASKING.
 _REVIEW_FINDINGS_ERROR: str | None = None
 try:
     from review_findings import (  # noqa: E402
-        CR_HEADER_FIELD_RE as _CR_HEADER_FIELD_RE,
-    )
-    from review_findings import (
         CR_SEVERITIES as _CR_SEVERITIES,
     )
     from review_findings import (
@@ -194,6 +196,9 @@ try:
     )
     from review_findings import (
         INLINE_P2_RE as _INLINE_P2_RE,
+    )
+    from review_findings import (
+        cr_header_fields as _cr_header_fields,
     )
     from review_findings import (
         cr_severity as _cr_severity,
@@ -218,8 +223,11 @@ except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate on
         f"scripts/review_findings.py is unimportable ({_findings_exc_type}); "
         f"repair the hook tree"
     )
-    _INLINE_P1_RE = _INLINE_P2_RE = _CR_HEADER_FIELD_RE = None  # type: ignore[assignment]
+    _INLINE_P1_RE = _INLINE_P2_RE = None  # type: ignore[assignment]
     _CR_SEVERITIES = frozenset()  # type: ignore[assignment]
+
+    def _cr_header_fields(line, *, skip_partial=False):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
 
     def enforced_logins():  # type: ignore[no-redef]
         raise RuntimeError(_REVIEW_FINDINGS_ERROR)
@@ -313,7 +321,18 @@ _DEGRADED_GATED = (
 try:
     # Inside this block on purpose: a broken module degrades the guard closed
     # (degraded_exit below) instead of exiting 1, which the harness reads as allow.
-    from gh_merge import api_merge_reason, files_trusted, is_help_only  # noqa: E402
+    from gh_merge import (  # noqa: E402
+        api_merge_reason,
+        body_file_path,
+        body_file_path_problem,
+        command_words,
+        compose_squash_body,
+        files_trusted,
+        is_help_only,
+        read_body_file,
+        shell_rewrites,
+        write_body_file,
+    )
     from git_repo_selection import (  # noqa: E402
         raw_sets_repo_env,
         seg_redirects_repo,
@@ -1825,8 +1844,10 @@ def _review_bots(sets: dict[str, frozenset[str]]) -> frozenset[str]:
 # the gate was blind to them (audited 2026-07-10: 173 findings across
 # 118 merged PRs passed unseen, 64 of them P1).
 
-# CodeRabbit states severity in a pipe-separated italic header on its FIRST line:
+# CodeRabbit states severity in a pipe-separated header on its FIRST line, italic
+# through 2026-10-05 and bold since 2026-10-06 (#2992):
 #   _🔒 Security & Privacy_ | _🟠 Major_ | _🏗️ Heavy lift_
+#   **🩺 Stability & Availability** | **🟠 Major** | **⚡ Quick win**
 # Its findings were already REACHED by the scan below — `user.type` is "Bot", so
 # they pass the author filter — and then dropped, because neither badge pattern
 # above matches and the if/elif has no else. Read, not recognised; a PR carrying
@@ -2405,10 +2426,20 @@ def _coderabbit_title(body: str) -> str:
     the finding, and reporting one of those as the title misnames the finding in
     the pre-merge report a human reads to decide a merge.
     """
+    first = True
     for line, is_markup in zip(body.split("\n"), _cr_markup_mask(body), strict=True):
         if is_markup:
             continue
         stripped = line.strip()
+        if not stripped:
+            continue
+        # The header is bold since 2026-10-06 (#2992), so it would be read as the
+        # title. Skip it, and only it: the header is always the FIRST line, and a
+        # later bold title holding a `|` (`str | None`) is header-shaped too.
+        if first:
+            first = False
+            if _cr_severity(stripped)[1]:
+                continue
         if stripped.startswith("**") and stripped.rstrip("*").strip():
             # Through _safe_title, NOT a bare slice: this is the branch a real
             # CodeRabbit finding takes, so it is the one that matters most.
@@ -2851,7 +2882,7 @@ def _cr_severity_inline(text: str) -> tuple[str | None, bool]:
     — the exact shape `_cr_severity`'s own docstring already adjudicates).
 
     So: split on `|`, accept only chunks that are COMPLETE italic fields
-    (`_CR_HEADER_FIELD_RE`, the anchored parser's own matcher), read each
+    (`_cr_header_fields`, the anchored parser's own matcher, italic or bold), read each
     field's LAST word, and adjudicate as `_cr_severity` does — exactly one
     DISTINCT level wins (unanimous duplicates included); two distinct levels
     are a format this code cannot adjudicate and land in the caller's
@@ -2865,11 +2896,8 @@ def _cr_severity_inline(text: str) -> tuple[str | None, bool]:
     direction for a merge gate.
     """
     hits: list[str] = []
-    for chunk in text.split("|"):
-        fld = _CR_HEADER_FIELD_RE.match(chunk.strip())
-        if not fld:
-            continue
-        words = fld.group(1).split()
+    for field_text in _cr_header_fields(text, skip_partial=True) or []:
+        words = field_text.split()
         if words and words[-1].casefold() in _CR_SEVERITIES:
             hits.append(words[-1].casefold())
     if hits and len(set(hits)) == 1:
@@ -3645,7 +3673,7 @@ def _check_inline_review_findings(
                         # No recognised severity — whether the header names a
                         # level this gate does not know, is ambiguous, or is
                         # missing entirely. Every observed CodeRabbit finding
-                        # leads with the italic pipe header, so a headerless
+                        # leads with the pipe header, so a headerless
                         # original is FORMAT DRIFT: filing it as an ordinary
                         # advisory printed "below Major" about a level that was
                         # never read, and a drifted Major would ride through
@@ -8459,6 +8487,42 @@ def _sha_is_ancestor(ancestor: str, descendant: str, repo: str | None = None) ->
     return status == "ahead"
 
 
+def _kind_has_blocking_evidence(
+    kind: str, rejected: dict[str, set[str]], residue: dict[str, set[str]]
+) -> tuple[str, str] | None:
+    """``(cause, remedy)`` when ``kind`` has a blocking finding somewhere in the PR,
+    else None.
+
+    Shared by the mechanical-rescan relief and the outside-contribution exemption:
+    neither may clear a kind whose review ran and objected. ANY refusal for the kind,
+    at ANY head, counts (see THE RULE in ``_relieve_kinds_by_mechanical_rescan``).
+    So does RESIDUE: blocking evidence the scan could not credit to ``rejected`` (a
+    same-timestamp tie at some head, or a malformed / unknown-kind marker whose body
+    reads as blocking), at ANY head, since the finding was never provably retracted
+    and the head axis is not a time axis. A "*" entry is a blocking body under no
+    creditable kind: it counts for every kind. This closes the path an adversarial
+    audit REPRODUCED (2026-08-30): a [P1] body under a 12-char `head=` at HEAD landed
+    in `unusable`, and relief carried the older clean review straight over it.
+    """
+    if any(kind in kinds for kinds in rejected.values()):
+        return (
+            "a scheduled review for this kind was REFUSED in this PR and never "
+            "retracted at the commit it was made about",
+            "read that finding rather than re-running the review",
+        )
+    residue_kinds: set[str] = set()
+    for kinds in residue.values():
+        residue_kinds |= kinds
+    if kind in residue_kinds or "*" in residue_kinds:
+        return (
+            "a marker in this PR carries a blocking finding that could not be "
+            "credited to a head or a kind (a malformed field, or a verdict tied "
+            "with a clean one)",
+            "resolve that finding first",
+        )
+    return None
+
+
 def _relieve_kinds_by_mechanical_rescan(
     missing: list[str],
     accepted: dict[str, set[str]],
@@ -8531,32 +8595,10 @@ def _relieve_kinds_by_mechanical_rescan(
         if not pin:
             continue
         check_name, workflow = pin
-        # ANY refusal for this kind, at ANY head -> no relief. See THE RULE above.
-        if any(kind in kinds for kinds in rejected.values()):
-            reasons[kind] = (
-                "a scheduled review for this kind was REFUSED in this PR and never "
-                "retracted at the commit it was made about, so no earlier review is "
-                "carried forward -- read that finding rather than re-running the review"
-            )
-            continue
-        # Blocking evidence the scan could not credit to `rejected` -- a same-timestamp
-        # tie at some head, or a malformed / unknown-kind marker whose body reads as
-        # blocking -- is RESIDUE, and it denies exactly as a refusal does, at ANY head:
-        # the finding was never provably retracted, and the head axis is not a time
-        # axis. A "*" entry is a blocking body under no creditable kind: it denies
-        # every kind. This closes the path an adversarial audit REPRODUCED (2026-08-30):
-        # a [P1] body under a 12-char `head=` at HEAD landed in `unusable`, and relief
-        # carried the older clean review straight over it.
-        residue_kinds: set[str] = set()
-        for kinds in residue.values():
-            residue_kinds |= kinds
-        if kind in residue_kinds or "*" in residue_kinds:
-            reasons[kind] = (
-                "a marker in this PR carries a blocking finding that could not be "
-                "credited to a head or a kind (a malformed field, or a verdict tied "
-                "with a clean one), so no earlier review is carried forward -- "
-                "resolve that finding first"
-            )
+        blocking = _kind_has_blocking_evidence(kind, rejected, residue)
+        if blocking is not None:
+            cause, remedy = blocking
+            reasons[kind] = f"{cause}, so no earlier review is carried forward -- {remedy}"
             continue
         candidates = [h for h, kinds in accepted.items() if h != head and kind in kinds]
         if not candidates:
@@ -8608,6 +8650,172 @@ def _relieve_kinds_by_mechanical_rescan(
     return [k for k in missing if k not in relieved_kinds], relieved, reasons
 
 
+#: The one GraphQL read behind the outside-contribution exemption: who opened the
+#: PR (and as what), where its head lives, and who edited its title or body.
+_OUTSIDE_PR_QUERY = (
+    "query($owner:String!,$name:String!,$num:Int!){repository(owner:$owner,name:$name){"
+    "pullRequest(number:$num){headRefOid isCrossRepository authorAssociation "
+    "author{__typename login} "
+    "userContentEdits(first:100){totalCount nodes{editor{__typename login}}} "
+    "timelineItems(itemTypes:[RENAMED_TITLE_EVENT],first:100){filteredCount "
+    "nodes{... on RenamedTitleEvent{actor{login}}}} "
+    "forcePushes: timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT],first:1)"
+    "{filteredCount}}}}"
+)
+
+
+def _pr_outside_facts(pr_num: str, repo: str | None = None) -> dict | None:
+    """The ``pullRequest`` object of ``_OUTSIDE_PR_QUERY``, or None on any error.
+
+    Tests inject via ``_TEST_GH_OUTSIDE_PR`` (that object as JSON; ``__error__``
+    simulates a failed read).
+    """
+    raw = os.environ.get("_TEST_GH_OUTSIDE_PR")
+    if raw is None:
+        if repo is not None and not isinstance(repo, str):
+            return None
+        slug = _normalize_repo(repo) if repo else _derive_repo_from_cwd(os.getcwd())
+        if not slug or "/" not in slug or not str(pr_num).isdigit():
+            return None
+        owner, name = slug.split("/", 1)
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    "graphql",
+                    "-f",
+                    f"query={_OUTSIDE_PR_QUERY}",
+                    "-f",
+                    f"owner={owner}",
+                    "-f",
+                    f"name={name}",
+                    # -F: the number must reach GraphQL as an Int.
+                    "-F",
+                    f"num={pr_num}",
+                    "--jq",
+                    ".data.repository.pullRequest",
+                ],
+                capture_output=True,
+                text=True,
+                # Merge path, under the shared deadline; a failure means no exemption.
+                timeout=_gh_timeout(6),
+            )
+        except Exception:
+            return None
+        raw = result.stdout if result.returncode == 0 else ""
+    try:
+        facts = json.loads(raw)
+    except Exception:
+        return None
+    return facts if isinstance(facts, dict) else None
+
+
+#: Review apps whose own edits to an outside PR's body (a summary, a badge) keep the
+#: leaks exemption. MEASURED 2026-10-05 over 7 exempt-shaped merged outside PRs: every
+#: one carried a ``coderabbitai`` edit and all but one a ``devin-ai-integration`` edit.
+#: Named, not "any Bot": an unknown app's edit is not known to be generated text.
+_BODY_EDIT_REVIEW_APPS = frozenset({"coderabbitai", "devin-ai-integration"})
+
+#: A ``Co-authored-by:`` trailer names someone else's text inside a commit the
+#: contributor made -- GitHub adds one when a review suggestion is committed.
+_CO_AUTHOR_TRAILER = re.compile(r"(?im)^co-authored-by:")
+
+
+def _outside_contribution(pr_num: str, repo: str | None, head: str) -> tuple[str | None, str]:
+    """``(login, "")`` when PR ``pr_num`` at ``head`` is wholly an outside
+    contribution, else ``(None, why)`` (``why`` is "" when the PR is not even a
+    fork PR, so a maintainer PR's block message stays unchanged).
+
+    The leaks review exists to stop the OWNER's private data reaching the public repo,
+    and an outsider's own text cannot hold it (owner ruling, 2026-10-05). So the
+    marker is not required when ALL of these hold, read live and bound to ``head``:
+      * the PR was opened by a human account (a Bot never qualifies) whose
+        association is not OWNER, MEMBER or COLLABORATOR;
+      * its head lives in a fork, and is ``head``, and the branch was never
+        force-pushed (a rewrite can fold a commit of ours into one of theirs);
+      * every commit's author is that account, and every committer is that account
+        or ``web-flow`` (the committer GitHub records for the contributor's web
+        edits, and for an Update-branch merge or UI rebase, which bring in only the
+        base's content); and no commit carries a ``Co-authored-by:`` trailer, which
+        is how a committed review suggestion of ours would arrive;
+      * every edit of the PR body was the author's or a named review app's
+        (``_BODY_EDIT_REVIEW_APPS``), and every title rename was the author's;
+      * CI's leak-detector is green at ``head`` (the same identity check the
+        carried-forward relief uses). On a fork that job runs its pattern-class scan
+        but not the private-pattern step, which needs a repo secret forks do not get.
+    A commit or a text edit of ours, an unlinked commit identity (session commits
+    carry none), or any failed read means no exemption: the marker stays required.
+    Not covered, as before this exemption existed: text a session writes into the
+    squash commit itself at merge time (``gh pr merge --body``).
+    """
+    facts = _pr_outside_facts(pr_num, repo)
+    if facts is None:
+        return None, "the PR facts could not be read"
+    if facts.get("isCrossRepository") is not True:
+        return None, ""
+    author = facts.get("author") or {}
+    login = author.get("login") if isinstance(author, dict) else None
+    if not isinstance(login, str) or not login or author.get("__typename") != "User":
+        return None, "the PR was not opened by a human account"
+    me = login.lower()
+    assoc = facts.get("authorAssociation")
+    if not isinstance(assoc, str) or not assoc or assoc.upper() in _MAINTAINER_ASSOCIATIONS:
+        return None, "the PR author is a maintainer"
+    if (facts.get("headRefOid") or "").lower() != head:
+        return None, "the PR head moved"
+    # The commit checks below read the CURRENT commit list. A force-push rewrites
+    # it: a commit of ours could be squashed or rebased into one authored and
+    # committed by the contributor, leaving no trace in today's list. So any
+    # rewrite of the head branch, by anyone, ends the exemption (none of the
+    # outside PRs merged so far had one, MEASURED 2026-10-06 over 7).
+    forced = facts.get("forcePushes")
+    if not isinstance(forced, dict) or forced.get("filteredCount") != 0:
+        return None, "the PR branch was force-pushed, so its earlier commits cannot be checked"
+    # The body's FULL edit history (``editor`` alone names only the last editor, so
+    # an edit of ours followed by a review app's would hide). GitHub lists it
+    # newest first; every node is checked, so the order does not matter.
+    edits = facts.get("userContentEdits")
+    edit_nodes = edits.get("nodes") if isinstance(edits, dict) else None
+    if not isinstance(edit_nodes, list) or edits.get("totalCount") != len(edit_nodes):
+        return None, "the PR body's edit history could not be read in full"
+    for node in edit_nodes:
+        editor = node.get("editor") if isinstance(node, dict) else None
+        if not isinstance(editor, dict):
+            return None, "a PR body edit has no known editor"
+        name = str(editor.get("login") or "").lower()
+        if name != me and not (
+            editor.get("__typename") == "Bot" and name in _BODY_EDIT_REVIEW_APPS
+        ):
+            return None, f"the PR body was edited by {name or 'an unknown account'}"
+    # filteredCount, not totalCount: totalCount counts every timeline item, whatever
+    # the type filter (MEASURED: 8 and 22 on two PRs with no renames).
+    renames = facts.get("timelineItems")
+    nodes = renames.get("nodes") if isinstance(renames, dict) else None
+    if not isinstance(nodes, list) or renames.get("filteredCount") != len(nodes):
+        return None, "the PR title's rename history could not be read in full"
+    for node in nodes:
+        actor = node.get("actor") if isinstance(node, dict) else None
+        if not isinstance(actor, dict) or str(actor.get("login") or "").lower() != me:
+            return None, "the PR title was renamed by another account"
+    rows, why = _pr_commit_rows(pr_num, repo)
+    if rows is None:
+        return None, why
+    if head not in {r["sha"].lower() for r in rows}:
+        return None, "the PR head is not among its commits"
+    for r in rows:
+        if (r["author"] or "").lower() != me:
+            return None, f"commit {r['sha'][:12]} was not authored by {login}"
+        if (r["committer"] or "").lower() not in (me, "web-flow"):
+            return None, f"commit {r['sha'][:12]} was committed by another account"
+        if r["message"] is None or _CO_AUTHOR_TRAILER.search(r["message"]):
+            return None, f"commit {r['sha'][:12]} names a co-author (or its message is unread)"
+    check_name, workflow = _MECHANICAL_RESCAN_BY_KIND["leaks"]
+    if not _mechanical_scan_is_green(pr_num, head, check_name, workflow, repo=repo):
+        return None, f"CI's {check_name} is not green at this head"
+    return login, ""
+
+
 def _check_scheduled_claude_reviewed_head(
     pr_num: str,
     head_sha: str | None = None,
@@ -8615,6 +8823,7 @@ def _check_scheduled_claude_reviewed_head(
     *,
     force: bool = False,
     relief_out: list[tuple[str, str, str]] | None = None,
+    exempt_out: list[tuple[str, str]] | None = None,
 ) -> str | None:
     """Block a merge unless EVERY required scheduled Claude review (by the repo OWNER)
     has run on the PR's CURRENT head. Returns ``None`` when a valid owner marker for
@@ -8699,6 +8908,17 @@ def _check_scheduled_claude_reviewed_head(
     kinds_here = markers.get(head, set())
     required = _required_scheduled_review_kinds()
     missing = [k for k in required if k not in kinds_here]
+    # An outside contribution needs no leaks review (see _outside_contribution) --
+    # unless a leaks review ran in this PR and objected: an exemption is a reason
+    # not to ask, never a reason to overrule a finding. Read only when leaks is
+    # actually missing, so a PR carrying its marker pays nothing.
+    exempt_login, exempt_why = None, ""
+    if "leaks" in missing and _kind_has_blocking_evidence("leaks", rejected, residue) is None:
+        exempt_login, exempt_why = _outside_contribution(pr_num, repo, head)
+        if exempt_login:
+            missing = [k for k in missing if k != "leaks"]
+            if exempt_out is not None:
+                exempt_out.append(("leaks", exempt_login))
     if missing:
         # A kind already ACCEPTED at an earlier head of this PR is satisfied when its
         # mechanical scanner is green at THIS head (see _MECHANICAL_RESCAN_BY_KIND).
@@ -8719,6 +8939,17 @@ def _check_scheduled_claude_reviewed_head(
                     file=sys.stderr,
                 )
     if not missing:
+        # Announced here, once the gate is known to clear, so a relieved other kind
+        # beside it never hides the note.
+        if exempt_login:
+            print(
+                f"NOTE: scheduled 'leaks' review not required for PR #{pr_num}: it is "
+                f"an outside contribution by {exempt_login} (fork, never force-pushed, "
+                f"every commit theirs, no edit of ours, CI's leak-detector green at this "
+                f"head -- on a fork its pattern-class scan only, without the "
+                f"private-pattern step).",
+                file=sys.stderr,
+            )
         return None
     # The message is an INVENTORY, not a verdict. Every marker block the scan found is
     # listed under the kind it names, with its status, and NOTHING is subtracted from
@@ -8824,6 +9055,16 @@ def _check_scheduled_claude_reviewed_head(
                 f"  (relief for '{k}' was attempted and declined: {r}.)\n"
                 for k, r in sorted(relief_blocked.items())
             )
+        )
+        + (
+            f"  (leaks is not required: an outside contribution by {exempt_login}.)\n"
+            if exempt_login
+            else ""
+        )
+        + (
+            f"  (leaks exemption for an outside contribution not applied: {exempt_why}.)\n"
+            if exempt_why and "leaks" in missing
+            else ""
         )
         + "A marker is a comment/review by the repo OWNER carrying "
         f"'<!-- genesis-scheduled-review: head={head} kind=<name> -->' — the FULL 40-hex "
@@ -9697,15 +9938,25 @@ _MAIN_REVERTS_BUDGET_S = 90.0
 
 
 def _pr_commit_list(pr_num: str, repo: str | None = None) -> tuple[list[tuple[str, int]] | None, str]:
-    """``([(sha, parent_count), ...], "")`` for the PR's commits, or ``(None, reason)``.
+    """``([(sha, parent_count), ...], "")`` for the PR's commits, or ``(None, reason)``."""
+    rows, why = _pr_commit_rows(pr_num, repo)
+    if rows is None:
+        return None, why
+    return [(r["sha"], r["parents"]) for r in rows], ""
+
+
+def _pr_commit_rows(pr_num: str, repo: str | None = None) -> tuple[list[dict] | None, str]:
+    """``([{sha, parents, author, committer, message}, ...], "")`` for the PR's
+    commits, or ``(None, reason)``. ``author`` / ``committer`` are GitHub logins, None
+    when the commit's git identity is linked to no account.
 
     A saturated read (``>= _PR_COMMITS_CAP`` rows) is returned as None with the cap
     named: GitHub stops at 250 here, so the commits beyond it are unknown. An EMPTY
     read is also None — every PR has a commit, so empty is a degraded response.
 
     Tests inject via ``_TEST_GH_PR_COMMITS`` (one JSON object per line:
-    ``{"sha": ..., "parents": <int>}``; the literal ``__error__`` simulates an API
-    error).
+    ``{"sha": ..., "parents": <int>, "author": ..., "committer": ..., "message": ...}``,
+    all but sha and parents optional; the literal ``__error__`` simulates an API error).
     """
     raw = os.environ.get("_TEST_GH_PR_COMMITS")
     if raw == "__error__":
@@ -9721,11 +9972,14 @@ def _pr_commit_list(pr_num: str, repo: str | None = None) -> tuple[list[tuple[st
                     f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/commits?per_page=100",
                     "--paginate",
                     "--jq",
-                    ".[] | {sha: .sha, parents: (.parents | length)}",
+                    ".[] | {sha: .sha, parents: (.parents | length), "
+                    "author: .author.login, committer: .committer.login, "
+                    "message: .commit.message}",
                 ],
                 capture_output=True,
                 text=True,
-                # Report-only (never on the merge path): one paginated read.
+                # One paginated read. The main-reverts row reads it in report mode;
+                # the leaks exemption reads it on the merge path, under the deadline.
                 timeout=_gh_timeout(15),
             )
         except Exception:
@@ -9733,7 +9987,7 @@ def _pr_commit_list(pr_num: str, repo: str | None = None) -> tuple[list[tuple[st
         if result.returncode != 0:
             return None, "the PR's commit list could not be read (gh error)"
         raw = result.stdout
-    commits: list[tuple[str, int]] = []
+    commits: list[dict] = []
     for line in (raw or "").splitlines():
         line = line.strip()
         if not line:
@@ -9746,7 +10000,17 @@ def _pr_commit_list(pr_num: str, repo: str | None = None) -> tuple[list[tuple[st
         parents = obj.get("parents") if isinstance(obj, dict) else None
         if not isinstance(sha, str) or not sha or not isinstance(parents, int):
             return None, "the PR's commit list was malformed"
-        commits.append((sha, parents))
+        author, committer = obj.get("author"), obj.get("committer")
+        message = obj.get("message")
+        commits.append(
+            {
+                "sha": sha,
+                "parents": parents,
+                "author": author if isinstance(author, str) and author else None,
+                "committer": committer if isinstance(committer, str) and committer else None,
+                "message": message if isinstance(message, str) else None,
+            }
+        )
     if not commits:
         return None, "the PR's commit list came back empty"
     if len(commits) >= _PR_COMMITS_CAP:
@@ -10194,14 +10458,67 @@ def _merge_match_head(argv: list[str]) -> str | None:
     return result
 
 
+def _merge_body_file(argv: list[str]) -> tuple[str | None, str | None]:
+    """``(path, problem)`` for a merge's ``--body-file``, read with the SAME
+    consumption model as :func:`_merge_match_head`.
+
+    ``(None, None)``: no ``--body-file``. ``(path, None)``: exactly one, long
+    form (``--body-file P`` / ``--body-file=P``), naming a file the gate itself
+    writes (``gh_merge.body_file_path_problem``). Anything else is a problem: two
+    of them (pflag keeps the last, the hook would judge one), a missing value, a
+    value gh could read as a flag or stdin, or a path the hook and gh might
+    resolve to different files. The short ``-F`` stays a shadow flag.
+    """
+    argv = argv or []
+    values: list[str | None] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            break
+        if tok in _GH_MERGE_VALUE_FLAGS:
+            if tok == "--body-file":
+                values.append(argv[i + 1] if i + 1 < len(argv) else None)
+            i += 2
+            continue
+        if tok.startswith("--body-file="):
+            values.append(tok.split("=", 1)[1])
+            i += 1
+            continue
+        if _short_cluster_consumes_next(tok):
+            i += 2
+            continue
+        i += 1
+    if not values:
+        return None, None
+    if len(values) > 1:
+        return None, "--body-file is given more than once"
+    path = values[0]
+    if not path or path == "-" or path.startswith("-"):
+        return None, "--body-file needs a file path as its value"
+    problem = body_file_path_problem(path)
+    if problem:
+        return None, f"--body-file {path}: {problem}"
+    return path, None
+
+
 def _merge_has_shadow_flag(argv: list[str]) -> bool:
     """Whether the merge carries a content flag that could shadow the head-match
     binding — long form, ``=`` form, bare short, or inside a short cluster
-    (``-db`` etc.). Refused outright as a fail-closed belt."""
+    (``-db`` etc.). Refused outright as a fail-closed belt.
+
+    A long ``--body-file`` naming a file the gate wrote is the one exemption: it
+    is how the squash body gets its provenance trailers, and the merge arm
+    compares that file with a body it recomputes. The exemption is keyed off
+    :func:`_merge_body_file`, so a ``--body-file`` whose value could be a flag is
+    still a shadow."""
+    body_file_ok = _merge_body_file(argv)[0] is not None
     for tok in argv or []:
         if tok == "--":
             break
         base = tok.split("=", 1)[0]
+        if base == "--body-file" and body_file_ok:
+            continue
         if base in _GH_MERGE_SHADOW_FLAGS:
             return True
         if _is_short_cluster(base):
@@ -10231,9 +10548,10 @@ def _require_match_head(
     # (gh takes it as text → no binding) and have no use on a gated squash-merge.
     if _merge_has_shadow_flag(merge_argv):
         return (
-            "--body/--subject/--body-file/--author-email are not allowed on a gated "
-            "merge — they can shadow the --match-head-commit binding. Remove them "
-            "(set a squash message via the GitHub UI if needed)."
+            "--body/--subject/--author-email/-F are not allowed on a gated merge — they "
+            "can shadow the --match-head-commit binding, and text they carry reaches "
+            "main unreviewed. Remove them; the only body a merge may carry is the "
+            "--body-file that --check-pr writes and prints in its merge-with line."
         )
     match_head = _merge_match_head(merge_argv)
     if match_head is None:
@@ -10249,6 +10567,92 @@ def _require_match_head(
             f"use the current verified head."
         )
     return None
+
+
+def _expected_squash_body(pr_num: str, repo: str | None, head: str) -> tuple[str | None, str]:
+    """``(body, "")``: the squash body for ``head``, recomputed from the LIVE PR
+    (its body and its commits' ``Genesis-Session:`` trailers), or ``(None, why)``.
+
+    ``head`` must be one of the PR's commits, so a stale or foreign head yields no
+    body rather than a body that merely names it. The commits are read first: a
+    head outside them settles the answer without the second read."""
+    rows, why = _pr_commit_rows(pr_num, repo)
+    if rows is None:
+        return None, why
+    if head not in {r["sha"] for r in rows}:
+        return None, f"{head[:12]} is not one of the PR's commits"
+    pr_body = _pr_body_text(pr_num, repo)
+    if pr_body is None:
+        return None, "the PR body could not be read"
+    try:
+        return compose_squash_body(pr_body, head, [r["message"] for r in rows]), ""
+    except ValueError as exc:
+        return None, str(exc)
+
+
+def _recheck_squash_body_file(path: str, expected: str) -> str | None:
+    """The merge arm's LAST step: re-read the file and require the body the early
+    check approved. The early check runs right after the binding, so a hook killed
+    by its wall clock can never skip it; this second read, just before the hook
+    allows, narrows the window in which another process could change the file
+    before gh reads it. Local only, no network."""
+    text, why = read_body_file(path)
+    if text is None:
+        return f"--body-file {path} could not be re-read before the merge: {why}."
+    if text != expected:
+        return f"--body-file {path} changed after it was checked. Re-run --check-pr."
+    return None
+
+
+def _check_squash_body_file(
+    pr_num: str, repo: str | None, head: str, path: str, *, expected_out: list[str] | None = None
+) -> str | None:
+    """None when ``path`` holds exactly the body recomputed for ``head``, else a
+    block message. Every failure blocks: the remedy (drop --body-file, or re-run
+    --check-pr) is always available, so nothing here needs a sigil. On success the
+    approved body is appended to ``expected_out`` for :func:`_recheck_squash_body_file`."""
+    remedy = (
+        "Re-run --check-pr and use its merge-with line, or drop --body-file to merge "
+        "without the provenance trailer."
+    )
+    text, why = read_body_file(path)
+    if text is None:
+        return f"--body-file {path} cannot be used: {why}. {remedy}"
+    expected, why = _expected_squash_body(pr_num, repo, head.strip().lower())
+    if expected is None:
+        return f"the squash body could not be recomputed to check --body-file: {why}. {remedy}"
+    if text != expected:
+        return (
+            f"--body-file {path} is not the body this gate computes for head "
+            f"{head[:12]} (the PR body or its commits changed, or the file was edited). "
+            + remedy
+        )
+    if expected_out is not None:
+        expected_out.append(expected)
+    return None
+
+
+def _prepare_squash_body_file(pr_num: str, repo: str | None, head: str) -> tuple[str | None, str]:
+    """For ``--check-pr``: write the squash body for ``head`` and return its path,
+    or ``(None, why)``. Not written in CI, where the path would mean nothing to
+    the reader of the log, nor under the hook tests' ``_TEST_SQUASH_BODY_FILE=off``
+    pin, which keeps report tests from writing into the real home directory."""
+    if os.environ.get("GITHUB_ACTIONS") or os.environ.get("_TEST_SQUASH_BODY_FILE") == "off":
+        return None, ""
+    body, why = _expected_squash_body(pr_num, repo, head)
+    if body is None:
+        return None, why
+    path = body_file_path(repo, pr_num, head)
+    # The merge arm would refuse a path that fails this, and printed unquoted it
+    # could split in the shell, so say why and fall back to the plain command.
+    problem = body_file_path_problem(path)
+    if problem:
+        return None, f"the body file path {path!r} is unusable: {problem}"
+    try:
+        write_body_file(path, body)
+    except OSError as exc:
+        return None, f"the body file could not be written ({exc.strerror or exc})"
+    return path, ""
 
 
 def _is_dispatched() -> bool:
@@ -11450,6 +11854,49 @@ def _all_urls_are_public_repo(urls: set[str]) -> bool:
     return all(_strict_github_slug(u) == want for u in urls)
 
 
+def _recorded_remote_defaults(cwd: str | None) -> set[str] | None:
+    """Every default-branch ref the checkout RECORDED for any remote: the targets
+    of ``refs/remotes/*/HEAD`` (set by ``git clone`` and ``git remote set-head``),
+    e.g. ``refs/remotes/origin/develop``. One local call, no network, and keyed on
+    no remote name, so a push spelled as a raw URL or through a second remote with
+    the same URL is compared too. None on any error. Recorded state can be stale
+    or absent, so this can only ADD a default-branch name to compare against,
+    never vouch that a branch is not one."""
+    try:
+        args = ["git"] + (["-C", cwd] if cwd else [])
+        args += ["for-each-ref", "--format=%(symref)", "refs/remotes/*/HEAD"]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def _routine_dest_owned(
+    push_remote: str | None, urls: set[str], cwd: str | None, branch: str | None = None
+) -> bool:
+    """The ``push_routine`` destination scope: every push URL is a github.com
+    https repo of the configured public repo's OWNER (``github.user``), i.e. one
+    of this install's own repos. A raw-URL destination qualifies only when no
+    ``insteadOf`` rule could move it. An undeterminable owner, an empty set, an
+    ssh/scp form or any other host keeps the prompt. So does ``branch`` when ANY
+    remote's recorded default ref ends in ``/<branch>`` (or the refs cannot be
+    read): the caller's literal ``main``/``master`` check cannot see a default
+    named anything else. Over-matching only keeps a prompt."""
+    canonical = _canonical_public_repo()
+    if not canonical or not urls or not push_remote:
+        return False
+    if _looks_like_url(push_remote) and not _no_url_rewrite_rules(cwd):
+        return False
+    if branch:
+        defaults = _recorded_remote_defaults(cwd)
+        if defaults is None or any(ref.endswith(f"/{branch}") for ref in defaults):
+            return False
+    owner = canonical.split("/", 1)[0].strip().lower()
+    return all((_strict_github_slug(u) or "").split("/", 1)[0] == owner for u in urls)
+
+
 def _no_url_rewrite_rules(cwd: str | None) -> bool:
     """True only when NO ``url.<base>.insteadOf``/``pushInsteadOf`` rule is set.
 
@@ -11641,16 +12088,20 @@ def _transport_is_plain(remote: str | None, cwd: str | None) -> bool:
     return True
 
 
+#: Appended to a first-publish ask that ``push_publish: off`` did not silence.
+_PUBLISH_OFF_MISS = (
+    "hooks.asks.push_publish is off, but this command did not qualify: "
+    "it is silenced only when EVERY destination resolves exactly to the "
+    "configured public repo and nothing else in the command can change that."
+)
+
+
 def _publish_ask_text(reason: str, publish_off: bool) -> str:
     """The first-publish ask, plus why ``push_publish: off`` did not silence it
     and any NOTE the policy raised (Claude Code drops an exit-0 hook's stderr, so
     the prompt is the only place a misconfigured key can be reported)."""
     if publish_off:
-        reason += (
-            "\n\nhooks.asks.push_publish is off, but this command did not qualify: "
-            "it is silenced only when EVERY destination resolves exactly to the "
-            "configured public repo and nothing else in the command can change that."
-        )
+        reason += f"\n\n{_PUBLISH_OFF_MISS}"
     notes = _drain_ask_notes()
     return f"{reason}\n\n{notes}" if notes else reason
 
@@ -12187,6 +12638,18 @@ def _run_merge_and_push_gates() -> int:
         # off`, public-repo destinations only). Emitted at the tail as NO decision
         # plus a context note, and only if nothing else set an ask or a block.
         publish_note: str | None = None
+        # Routine prompts this install silenced (`hooks.asks.push_routine: off`).
+        # Each ask below is classed: ROUTINE (a first push in any spelling,
+        # close-then-push, a PR-less re-push off the public repo, a re-push
+        # chained with other steps) or NOT (the round-cap ask this starts from, a
+        # force push, a publishing `gh pr create`, any other push). The tail
+        # silences only when every ask was routine and every push lands on a
+        # GitHub repo of the configured owner.
+        ask_routine = False
+        ask_nonroutine = ask_reason is not None
+        # (push_remote, urls, cwd, branch) of each routine ask, judged at the tail
+        # only when the key is off, so an install without it pays no git calls.
+        routine_dests: list[tuple] = []
 
         # ── git push (any branch) ──────────────────────────────────
         # Interactive → the user approves in a dialog only they can satisfy.
@@ -12240,6 +12703,7 @@ def _run_merge_and_push_gates() -> int:
                         file=sys.stderr,
                     )
                     return 2
+                ask_nonroutine = True
                 ask_reason = (
                     f"FORCE push detected — this REWRITES remote history on "
                     f"'{remote}' (a non-origin remote). Approve only if you "
@@ -12346,6 +12810,24 @@ def _run_merge_and_push_gates() -> int:
                             if notes:
                                 publish_note = f"{publish_note}\n\n{notes}"
                         else:
+                            # `_push_is_republish` answers False on an ls-remote
+                            # error or timeout too, so "not confirmed present" is
+                            # not "absent": a branch already public with no open
+                            # PR would skip the no-open-PR block. Under
+                            # push_routine only (the probe is a network call),
+                            # this is routine only when every destination
+                            # definitely lacks the branch. Still classed routine
+                            # so the ask names why the key did not apply.
+                            ask_routine = True
+                            routine_dests.append((push_remote, urls, pcwd, cur))
+                            if _ask_suppressed("push_routine") and not (
+                                urls
+                                and all(
+                                    _remote_branch_definitely_absent(u, cur, pcwd)
+                                    for u in urls
+                                )
+                            ):
+                                ask_nonroutine = True
                             ask_reason = _publish_ask_text(
                                 f"git push needs your approval before publishing "
                                 f"externally (target: {branch or 'default'}).",
@@ -12374,6 +12856,8 @@ def _run_merge_and_push_gates() -> int:
                     )
                     if push_allow_reason and closes_pr:
                         push_allow_reason = None
+                        ask_routine = True
+                        routine_dests.append((push_remote, urls, pcwd, cur))
                         ask_reason = (
                             f"re-push to '{cur}': an earlier step in this command "
                             f"CLOSES a pull request, so the push that follows may "
@@ -12421,6 +12905,8 @@ def _run_merge_and_push_gates() -> int:
                         else:
                             # Off the public repo — or when the public repo is not
                             # declared — the pre-existing ask, unchanged.
+                            ask_routine = True
+                            routine_dests.append((push_remote, urls, pcwd, cur))
                             ask_reason = (
                                 f"re-push to '{cur}': this branch is PUBLIC but has "
                                 f"NO OPEN PR, so CI and the leak scan never run on "
@@ -12435,6 +12921,8 @@ def _run_merge_and_push_gates() -> int:
                     # neighbour keeps the relaxation.
                     elif push_allow_reason and not _push_compound_is_inert(segs, push_segs[0], cmd):
                         push_allow_reason = None
+                        ask_routine = True
+                        routine_dests.append((push_remote, urls, pcwd, cur))
                         ask_reason = (
                             f"re-push to '{cur}': another step in this command "
                             f"may change git config or remotes before the push "
@@ -12443,6 +12931,7 @@ def _run_merge_and_push_gates() -> int:
                             f"skip this prompt."
                         )
                 else:
+                    ask_nonroutine = True
                     ask_reason = (
                         f"git push needs your approval before publishing externally "
                         f"(target: {branch or 'default'})."
@@ -12523,6 +13012,12 @@ def _run_merge_and_push_gates() -> int:
                     file=sys.stderr,
                 )
                 return 2
+            # NOT routine (owner ruling 2026-10-06): gh, not git, picks where the
+            # head is pushed (GH_REPO, --repo, its own remote choice), so the
+            # push_routine destination check cannot vouch for it. Marked whether
+            # or not a push already set the reason, so a create beside a silenced
+            # push still asks.
+            ask_nonroutine = True
             if ask_reason is None:
                 ask_reason = (
                     "gh pr create would push this (not-yet-pushed) branch — approve it like a push."
@@ -12685,6 +13180,67 @@ def _run_merge_and_push_gates() -> int:
                             repo=merge_repo,
                             head=merge_head,
                         )
+                # ── The squash body (argv only, no network, every merge) ──
+                # Text a merge writes into the squash commit is outside the leaks
+                # review, so the only body allowed is the file --check-pr wrote,
+                # which the content check after the binding recomputes. This used
+                # to run only inside the head binding, so `# stale-review-override`
+                # (which skips the binding) let --body/--subject text through.
+                # Both checks read the argv the HOOK parsed. A brace or glob in a
+                # word makes bash hand gh a different argv (`{--body,x}` is one word
+                # here and `--body x` to gh), so a merge segment carrying one is
+                # refused first, on every merge.
+                _expands = shell_rewrites(merge_seg.argv, redirects=False)
+                if _expands:
+                    print(
+                        f"BLOCKED: a gated merge cannot carry the shell character "
+                        f"{_expands!r}: brace and glob expansion make the shell pass gh "
+                        f"arguments this gate never saw. Run the merge-with line from "
+                        f"--check-pr as printed.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                body_file, body_file_problem = _merge_body_file(merge_seg.argv)
+                if body_file_problem or _merge_has_shadow_flag(merge_seg.argv):
+                    print(
+                        "BLOCKED: "
+                        + (body_file_problem + ". " if body_file_problem else "")
+                        + "--body/--subject/--author-email/-F can shadow the "
+                        "--match-head-commit binding, and text they carry reaches main "
+                        "unreviewed. Remove them; the only body a merge may carry is "
+                        "the --body-file that --check-pr writes and prints in its "
+                        "merge-with line.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if body_file is not None:
+                    _bf_why = ""
+                    if not merge_head:
+                        _bf_why = "it is not bound with --match-head-commit"
+                    elif len(segs) != 1 or not files_trusted(cmd, len(segs)):
+                        _bf_why = (
+                            "it is not a command of its own, so another part of the "
+                            "command could rewrite the file after this check reads it"
+                        )
+                    else:
+                        _words = command_words(cmd)
+                        _rewrite = (
+                            "unparseable" if _words is None
+                            else shell_rewrites(_words, redirects=True)
+                        )
+                        if _rewrite:
+                            _bf_why = (
+                                f"the command carries a redirect or expansion ({_rewrite!r}), "
+                                "which could change the file or the arguments after this check"
+                            )
+                    if _bf_why:
+                        print(
+                            f"BLOCKED: PR #{pr_num} — a merge carrying --body-file is "
+                            f"refused when {_bf_why}. Run the merge-with line from "
+                            f"--check-pr exactly as printed, as its own command.",
+                            file=sys.stderr,
+                        )
+                        return 2
                 # ── Merge-path gh TIMEOUT BUDGET ──────────────────────────
                 # This hook runs under a 60s CC wall-clock (settings.json). A
                 # wall-clock overrun SIGKILLs the hook MID-GATE, which "fails
@@ -12706,7 +13262,11 @@ def _run_merge_and_push_gates() -> int:
                 # the TOCTOU binding runs argv-only right after freshness, so
                 # only the tail advisory scanners (fail-OPEN by design) could
                 # ever be clipped, which nets the same outcome as their error
-                # path.
+                # path. A merge carrying --body-file adds the squash-body
+                # recompute right after the binding (commits 15 + body 6, each
+                # clamped by `_gh_timeout` to what is left): a drained budget
+                # there BLOCKS ("could not be recomputed"), never allows, and a
+                # merge without --body-file pays none of it.
                 # A timing-out fail-closed gate returns BLOCK immediately, so
                 # the additive worst case needs every call slow-but-successful.
                 mergeable = _check_mergeable(pr_num, repo=merge_repo)
@@ -13041,6 +13601,21 @@ def _run_merge_and_push_gates() -> int:
                         print("BLOCKED: " + bind_msg, file=sys.stderr)
                         return 2
 
+                # The squash body's CONTENT, right after the binding and before the
+                # slow scanners, for the binding's reason: a hook killed at its wall
+                # clock lets the command run, so the leak boundary goes early.
+                # A merge WITHOUT --body-file is allowed silently: the advisory for
+                # it lives in --check-pr's merge-with line, which is read, whereas
+                # stderr on this hook's exit-0 path is not delivered.
+                body_expected: list[str] = []
+                if body_file is not None:
+                    body_msg = _check_squash_body_file(
+                        pr_num, merge_repo, merge_head, body_file, expected_out=body_expected
+                    )
+                    if body_msg:
+                        print(f"BLOCKED: PR #{pr_num} — {body_msg}", file=sys.stderr)
+                        return 2
+
                 # Unresolved review findings (review body) — AFTER freshness +
                 # binding (see the ordering note above). Waived by
                 # # review-override (the FINDINGS sigil — not the stale one).
@@ -13124,6 +13699,13 @@ def _run_merge_and_push_gates() -> int:
                     print(_defang_gate_text(sched_msg), file=sys.stderr)
                     return 2
 
+                # Last, just before this arm allows: the body file once more.
+                if body_file is not None and body_expected:
+                    late_msg = _recheck_squash_body_file(body_file, body_expected[0])
+                    if late_msg:
+                        print(f"BLOCKED: PR #{pr_num} — {late_msg}", file=sys.stderr)
+                        return 2
+
         # ── sqlite3 write operations ────────────────────────────────
         # Whole-command match (never misses a fragmented/wrapped invocation),
         # narrowed to DML in statement position so the `replace()` scalar
@@ -13182,7 +13764,29 @@ def _run_merge_and_push_gates() -> int:
             print(no_open_pr_deny, file=sys.stderr)
             return 2
         if ask_reason is not None:
-            return _ask(ask_reason)
+            routine_off = ask_routine and _ask_suppressed("push_routine")
+            if (
+                routine_off
+                and not ask_nonroutine
+                and routine_dests
+                and all(_routine_dest_owned(*d) for d in routine_dests)
+            ):
+                # The push_publish miss is noise once push_routine silenced it.
+                shown = ask_reason.replace(f"\n\n{_PUBLISH_OFF_MISS}", "")
+                note = _suppressed_reason("push_routine", shown)
+                notes = _drain_ask_notes()
+                return _emit_context_only(f"{note}\n\n{notes}" if notes else note)
+            if routine_off:
+                ask_reason += (
+                    "\n\nhooks.asks.push_routine is off, but this command did not "
+                    "qualify: a destination is not a github.com https repo of the "
+                    "configured owner, is a raw URL that an insteadOf rule could move, "
+                    "or the branch is a recorded default branch; or the branch could "
+                    "not be confirmed absent there; or the command also raised a "
+                    "prompt the key does not cover."
+                )
+            notes = _drain_ask_notes()
+            return _ask(f"{ask_reason}\n\n{notes}" if notes else ask_reason)
 
         # A first-publish prompt this install silenced — NO decision, only a
         # context note. After every block and every ask above (an ask from any
@@ -13644,20 +14248,28 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         print("scheduled-claude: n/a (scoped to the public repo only)")
     else:
         sched_relief: list[tuple[str, str, str]] = []
+        sched_exempt: list[tuple[str, str]] = []
         sched_msg = _check_scheduled_claude_reviewed_head(
-            pr_num, verified_head, repo, relief_out=sched_relief
+            pr_num, verified_head, repo, relief_out=sched_relief, exempt_out=sched_exempt
         )
         if sched_msg:
             sched_state = "BLOCK — " + sched_msg.splitlines()[0]
-        elif sched_relief:
+        elif sched_relief or sched_exempt:
             # NEVER render a carried-forward review as one made at head: this line is
             # what a human (and a structured consumer) reads to judge freshness, and
             # "ok (at head)" here would be a false assertion about what was reviewed.
+            # Same for an exempted kind: it was never reviewed, and the line says so.
             sched_state = (
                 "ok ("
                 + "; ".join(
-                    f"{kind} carried from {anc}, {check} green at head"
-                    for kind, anc, check in sched_relief
+                    [
+                        f"{kind} carried from {anc}, {check} green at head"
+                        for kind, anc, check in sched_relief
+                    ]
+                    + [
+                        f"{kind} not required: outside contribution by {who}"
+                        for kind, who in sched_exempt
+                    ]
                 )
                 + ")"
             )
@@ -13722,7 +14334,20 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     # (right after codex-at-head) suggested a mergeable PR even when the scheduled or finding
     # gate below would block. Bound to the Codex-verified head (the TOCTOU pin).
     if failures == 0 and verified_head:
-        print("merge-with     : " + _suggested_merge_cmd(pr_num, verified_head, repo))
+        # The squash body carries `Squashed-From: <head>` plus the branch's session
+        # trailers. The merge arm recomputes it, so the file is a convenience for gh,
+        # never a source of trust. On a failure the plain command still merges.
+        merge_cmd = _suggested_merge_cmd(pr_num, verified_head, repo)
+        body_path, body_why = _prepare_squash_body_file(pr_num, repo, verified_head)
+        if body_path:
+            merge_cmd += f" --body-file {body_path}"
+        elif body_why:
+            print(
+                f"NOTE: PR #{pr_num} — no squash body file ({body_why}); the merge-with "
+                f"line below merges without the Squashed-From trailer.",
+                file=sys.stderr,
+            )
+        print("merge-with     : " + merge_cmd)
     print(
         "verdict        :",
         "MERGEABLE (all gates pass)" if failures == 0 else f"{failures} gate(s) would block",

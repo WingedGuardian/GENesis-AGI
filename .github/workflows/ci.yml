@@ -504,7 +504,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-10-05: 70 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-07: 71 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -1120,14 +1120,13 @@ jobs:
         #   test_collectors_falkordb.py           new -> 23   (+23)
         #   test_falkordb_module.py               new -> 35   (+35)
         # No added skips. Floor: 24332 + 89 = 24421; skip ceiling remains 102.
-        # Deploy recovery test collections (main -> branch): test_bootstrap_guards.py
-        # 29 -> 50 (+21); test_deploy_candidates_drop_status.py 67 -> 68 (+1);
-        # test_deploy_checkout.py 51 -> 52 (+1); test_deploy_code_only.py
-        # 66 -> 66 (+0); test_deploy_code_only_modes.py 74 -> 74 (+0);
-        # test_update_activation.py 28 -> 28 (+0); test_update_checkout_moved.py
-        # 79 -> 79 (+0); test_update_self_copy_trap.py 6 -> 6 (+0).
-        # Floor: 24421 + 23 = 24444; skip ceiling remains 102.
-        # Crash recovery: test_bootstrap_guards.py 29 -> 53 (+24);
-        # deploy_candidates_drop_status.py 67 -> 68 (+1), test_deploy_checkout.py 51 -> 52 (+1).
-        # Floor: 24421 + 26 = 24447; skip ceiling remains 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24447
+        # Qualification journal (replacement 1/6): new test file collects 95
+        # cases: 2 retained historical regressions plus 93 new accounting and
+        # recovery cases. Main has none of this package's original 231 cases.
+        # Floor: 24421 + 95 = 24516; no added skips, ceiling unchanged.
+        # Crash recovery (#2632), measured with --collect-only against main's
+        # versions of the changed test files: test_bootstrap_guards.py 29 -> 57
+        # (+28), test_deploy_candidates_drop_status.py 68 -> 69 (+1),
+        # test_deploy_checkout.py 51 -> 52 (+1); the other five are unchanged.
+        # No added skips. Floor: 24516 + 30 = 24546; skip ceiling remains 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24546
