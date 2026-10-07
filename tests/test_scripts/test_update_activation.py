@@ -87,6 +87,7 @@ _STUBS = """
 ROLLBACK_TAG=test-rollback-tag
 _clear_deploy_state() { echo CLEARED-STATE; }
 _do_rollback() { echo "ROLLBACK: $1"; }
+_write_state() { echo "STATE=$1"; }
 """
 
 

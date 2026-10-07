@@ -1944,6 +1944,11 @@ if [ -n "$_merged_head" ] && { [ "$_merged_head" = "$DEPLOY_HEAD" ] \
     || [ "$_merged_head" = "$VALIDATED_HEAD" ] \
     || [ "$_merged_parents" = "$VALIDATED_HEAD $DEPLOY_HEAD " ]; }; then
     UPDATE_OWN_HEAD="$_merged_head"
+    # Record the adopted head at once. The "merging" state was written before
+    # the merge, naming the pre-update commit; if this run dies now, bootstrap's
+    # crash recovery acts only on the exact head recorded here and does not
+    # guess whether the checkout is this update's merge.
+    _write_state "merging"
 fi
 
 # A merge that reported success must have brought the pinned head in, on the

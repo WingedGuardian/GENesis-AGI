@@ -1061,17 +1061,21 @@ def test_only_this_runs_merge_is_adopted_as_its_own_head(tmp_path):
         f'GENESIS_ROOT="{clone}"\nUPDATE_REMOTE=origin\nDEPLOY_BRANCH=main\nORIGINAL_BRANCH=main\n'
         f'DEPLOY_HEAD="{pin}"\nVALIDATED_HEAD="{validated}"\nUPDATE_OWN_HEAD="{validated}"\n'
         '_do_rollback() { echo "ROLLBACK: $1"; }\n'
+        '_write_state() { echo "STATE=$1"; }\n'
     )
     script = base + _assertion_block() + 'echo "OWN=$UPDATE_OWN_HEAD"\n'
     r = _run(script, tmp_path)
     assert r.returncode == 0, r.stdout + r.stderr
     assert f"OWN={_git(clone, 'rev-parse', 'HEAD')}" in r.stdout
+    # The adopted head is recorded at once, so bootstrap recovery knows it.
+    assert "STATE=merging" in r.stdout
     # Someone commits on top of the merge before it is recorded: not adopted.
     _git(clone, "commit", "-q", "--allow-empty", "-m", "theirs")
     r = _run(script, tmp_path)
     assert r.returncode == 1
     assert "ROLLBACK: merge did not bring in" in r.stdout
     assert "OWN=" not in r.stdout
+    assert "STATE=merging" not in r.stdout
 
 
 def test_the_merge_result_becomes_the_runs_own_head_before_anything_can_fail():

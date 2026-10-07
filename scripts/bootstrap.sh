@@ -132,19 +132,28 @@ PY
         fi
 
         if genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$recovery_branch"; then
+            # In the merging phase, a dirty checkout at the tag is what a
+            # fast-forward killed mid-write leaves: HEAD unmoved, files half
+            # new. update.sh treats that state as CRITICAL; installing over it
+            # would run half-written code, so refuse and keep the state file.
+            # Every tracked path counts here, the ephemeral allowlist included:
+            # the merge writes those too, and the deployability predicate below
+            # skips them.
+            if [ "$STATE_PHASE" = "merging" ]; then
+                merge_dirty=""
+                if ! merge_dirty="$(git -C "$GENESIS_ROOT" status --porcelain --untracked-files=no --no-renames 2>/dev/null)"; then
+                    merge_dirty="(status unreadable)"
+                fi
+                if [ -n "$merge_dirty" ]; then
+                    printf '%s\n' "$merge_dirty" | sed 's/^/    /'
+                    _crash_recovery_refuse "the checkout is at $ROLLBACK_TAG but tracked files changed during the merge (a half-written update or edits by someone else)"
+                fi
+            fi
             dirty_paths=""
             if ! dirty_paths="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")"; then
                 dirty_paths="(status unreadable)"
             fi
             if [ -n "$dirty_paths" ]; then
-                # In the merging phase, a dirty checkout at the tag is what a
-                # fast-forward killed mid-write leaves: HEAD unmoved, files half
-                # new. update.sh treats that state as CRITICAL; installing over it
-                # would run half-written code, so refuse and keep the state file.
-                if [ "$STATE_PHASE" = "merging" ]; then
-                    printf '%s\n' "$dirty_paths" | sed 's/^/    /'
-                    _crash_recovery_refuse "the checkout is at $ROLLBACK_TAG but tracked files changed during the merge (a half-written update or edits by someone else)"
-                fi
                 echo "  WARNING: tracked paths may be an interrupted merge's files or someone's edits; nothing was reset:"
                 printf '%s\n' "$dirty_paths" | sed 's/^/    /'
             fi
@@ -153,30 +162,22 @@ PY
             _crash_recovery_refuse "old-format update state and the checkout has moved from its rollback tag"
         else
             case "$STATE_PHASE" in
-                merging|bootstrap|migrations|health_check) ;;
+                merging|bootstrap) ;;
+                migrations|health_check)
+                    # The state does not say whether migrations ran or which
+                    # database snapshot matches, so a code rollback here could
+                    # leave old code on a migrated schema. Leave both as they are.
+                    _crash_recovery_refuse "the update died in phase '$STATE_PHASE', after its database migrations may have run; the code was left in place with the database it may have migrated (restore data/genesis.db.pre-update by hand only together with the old code)"
+                    ;;
                 *)
                     _crash_recovery_refuse "the checkout moved while the update was in phase '$STATE_PHASE', before it could have merged"
                     ;;
             esac
-            current_head="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" \
-                || _crash_recovery_refuse "current HEAD cannot be read"
-            own_update=false
-            if genesis_checkout_unmoved "$GENESIS_ROOT" "$OWN_HEAD" "$ORIGINAL_BRANCH"; then
-                own_update=true
-            elif [ -n "$DEPLOY_HEAD" ] && [ "$current_branch" = "$ORIGINAL_BRANCH" ]; then
-                if [ "$current_head" = "$DEPLOY_HEAD" ]; then
-                    own_update=true
-                else
-                    current_parents="$(git -C "$GENESIS_ROOT" rev-list --parents -n 1 "$current_head" 2>/dev/null)" \
-                        || _crash_recovery_refuse "cannot inspect current commit parents"
-                    current_parent_ids="${current_parents#* }"
-                    if [ "$current_parent_ids" = "$rb_commit $DEPLOY_HEAD" ]; then
-                        own_update=true
-                    fi
-                fi
-            fi
-            [ "$own_update" = true ] \
-                || _crash_recovery_refuse "the checkout moved; refusing to change code not owned by this update"
+            # Only the exact head update.sh recorded as its own merge is undone.
+            # It records that head the moment it adopts the merge, so a checkout
+            # anywhere else (someone's commit or pull, another branch) is left.
+            genesis_checkout_unmoved "$GENESIS_ROOT" "$OWN_HEAD" "$ORIGINAL_BRANCH" \
+                || _crash_recovery_refuse "the checkout is not at the merge this update recorded as its own; refusing to change code it does not own"
             if ! genesis_rollback_checkout \
                 "$GENESIS_ROOT" "$ROLLBACK_TAG" "$ORIGINAL_BRANCH" "$EPHEMERAL_BACKUP_ROOT" "$rb_commit"; then
                 _crash_recovery_refuse "the non-forced rollback checkout was refused; code was left in place"
