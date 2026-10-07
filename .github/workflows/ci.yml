@@ -1129,7 +1129,8 @@ jobs:
         # Corpus/adapters replacement:89 preserved original cases; no skips.
         # Floor:24883 +89 =24972 (reconcile against main before opening).
         # Pinned transport:42 original pinned +15 rework +149 new evidence cases.
-        # Floor:24972 +206 =25178; no added skips, ceiling unchanged.
+        # Documented routing metadata adds44 collected cases, all passing without skips.
+        # Floor:24972 +206 +44 =25222; no added skips, ceiling unchanged.
         # Offline preflight:19 retained rework cases and79 new boundary cases.
-        # Parent-relative floor:25178 +98 =25276; no added skips.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25276
+        # Parent-relative floor:25222 +98 =25320; no added skips.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25320

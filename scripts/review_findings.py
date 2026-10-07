@@ -165,12 +165,63 @@ CR_SEVERITIES = frozenset({"critical", "major", "minor", "trivial", "info"})
 # character longer would push a genuine Critical into the non-blocking path.
 # The bound is a sanity check against runaway prose, not a filter doing real
 # work, so it costs nothing to give it real headroom.
-CR_HEADER_FIELD_RE = re.compile(r"^_([^_\n]{1,64})_$")
-# A line that LOOKS like an attempted severity header — italic markers and a
+#
+# TWO delimiters (#2992). Through 2026-10-05 CodeRabbit wrote each field in
+# italics (`_⚠️ Potential issue_ | _🟠 Major_`); from 2026-10-06 in bold
+# (`**🩺 Stability & Availability** | **🟠 Major** | **⚡ Quick win**`). MEASURED
+# over this repo's 976 top-level CodeRabbit inline comments to 2026-10-07: 961
+# italic headers, the last on 10-05; 15 bold, the first on 10-06. Group 1 is the
+# italic text, group 2 the bold; read a match
+# through :func:`cr_header_fields`, never by group number.
+CR_HEADER_FIELD_RE = re.compile(r"^(?:_([^_\n]{1,64})_|\*\*([^*\n]{1,64})\*\*)$")
+
+
+# A line that LOOKS like an attempted severity header — field markers and a
 # field separator — used only to tell "not a header" apart from "a header this
 # code failed to parse". Conflating those two makes an unparsed finding print
 # as "below Major", a false statement about a level that was never read.
-CR_HEADER_SHAPE_RE = re.compile(r"^_.*\|.*_$")
+def cr_header_shaped(line: str) -> bool:
+    """Whether ``line`` LOOKS like a header: opens and closes with one field
+    delimiter and has a ``|`` between. Linear on purpose: the regex form
+    (``^_.*\\|.*_$``) is quadratic on a long pipe-heavy line of third-party text,
+    on a hook path (MEASURED: 3.4 s on a 60k-character line)."""
+    if "|" not in line:
+        return False
+    if len(line) > 2 and line.startswith("_") and line.endswith("_"):
+        return True  # the italic shape, exactly as the regex it replaced read it
+    # Bold: the FIRST field must itself be a complete bold span. A bold TITLE that
+    # holds a pipe (`**Prefer `str | None` here.**`) opens and closes with `**`
+    # too, and reading it as an unreadable header would count a Trivial's round.
+    first = line.split("|", 1)[0].strip()
+    m = CR_HEADER_FIELD_RE.match(first)
+    return line.endswith("**") and m is not None and m.group(2) is not None
+
+
+def cr_header_fields(line: str, *, skip_partial: bool = False) -> list[str] | None:
+    """The text of each ``|``-separated header field on ``line``, or None.
+
+    A field is a COMPLETE italic or bold span (``CR_HEADER_FIELD_RE``). With
+    ``skip_partial`` a chunk that is not one is dropped (the review-body reader,
+    whose header can share a line with prose); without it, any such chunk means
+    the line is not a header. A BOLD field counts only on a line with a ``|``:
+    CodeRabbit's finding TITLE is a lone bold line, and reading it as a one-field
+    header would make every finding's title an unreadable header. Every real
+    bold header has three or more fields. The price: a bold header of ONE field
+    (never observed) reads as no header rather than as unknown format. An
+    italic field keeps its old reading, alone or not, so the italic corpus
+    parses exactly as before.
+    """
+    chunks = line.split("|")
+    fields: list[str] = []
+    for chunk in chunks:
+        m = CR_HEADER_FIELD_RE.match(chunk.strip())
+        if m is None or (m.group(2) is not None and len(chunks) < 2):
+            if skip_partial:
+                continue
+            return None
+        fields.append(m.group(1) if m.group(1) is not None else m.group(2))
+    return fields
+
 
 DEVIN_META_PREFIX = "<!-- devin-review-comment "
 
@@ -198,7 +249,7 @@ def cr_severity(body: str) -> tuple[str | None, bool]:
     the merge and been reported as "Critical/Major": worse than the blindness it
     replaces, since issue #1642 warns that poor precision trains reflex overrides.
 
-    Every field must be a COMPLETE italic span, so a line is accepted as a header
+    Every field must be a COMPLETE italic or bold span, so a line is accepted as a header
     only if it is entirely one. Severity is read as the field's LAST word, never
     by position — one observed finding omits the severity field entirely, and a
     positional read would take the effort field ("Heavy lift") for a severity.
@@ -216,13 +267,13 @@ def cr_severity(body: str) -> tuple[str | None, bool]:
         stripped = line.strip()
         if not stripped:
             continue
-        fields = [CR_HEADER_FIELD_RE.match(f.strip()) for f in stripped.split("|")]
-        if not all(fields):
+        fields = cr_header_fields(stripped)
+        if fields is None:
             # Header-SHAPED but unparseable is a canary, not a clean miss.
-            return None, bool(CR_HEADER_SHAPE_RE.match(stripped))
+            return None, cr_header_shaped(stripped)
         hits = []
-        for fld in fields:
-            words = fld.group(1).split()  # type: ignore[union-attr]
+        for text in fields:
+            words = text.split()
             if words and words[-1].casefold() in CR_SEVERITIES:
                 hits.append(words[-1].casefold())
         if len(set(hits)) == 1 and hits:

@@ -602,7 +602,7 @@ def test_every_recursive_delete_goes_through_the_mount_guard():
     scripts = Path(__file__).resolve().parents[2] / "scripts"
     lib = scripts / "lib"
     files = [scripts / "disk_hygiene.sh", scripts / "tmp_watchgod.sh",
-             *(lib / n for n in ("tmp_liveness.sh", "disk_guardian.sh", "watchgod_oom.sh", "alert_queue.sh"))]
+             *(lib / n for n in ("tmp_liveness.sh", "disk_guardian.sh", "watchgod_oom.sh", "watchgod_runaway.sh", "alert_queue.sh"))]
     # Short (-r, -rf, -Rf) and long (--recursive) spellings, after any
     # number of other flags (review of #2570: --recursive was missed).
     rm_r = re.compile(r"(?<![\w-])rm\s+(?:-\S*\s+)*(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?![\w-])")

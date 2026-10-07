@@ -2588,7 +2588,11 @@ verified: af3e45d3c 2026-10-07
   See `docs/reference/qualification-corpus.md`.
   Qualification's pinned transport supplies a caller-provided adapter router
   through the production delegate, a shared one-egress wire guard, response-hook
-  durability and exact lexical Decimal GET billing. Frozen schedule/provider
+  durability and exact lexical Decimal GET billing. Documented selected-route
+  metadata is checked on live acceptance and replay; gateway response caching
+  is explicitly disabled. Contradictory served identities retain unresolved
+  liability, while expense settlement cannot qualify invalid routing evidence.
+  Frozen schedule/provider
   mapping and dedicated nonreset credentials are required; any journal incident
   pauses new requests and replay until verified recovery. These checks do not
   establish provider spend bounds or owner approval. The isolated runner remains

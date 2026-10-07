@@ -1,0 +1,1 @@
+- The merge gate reads CodeRabbit's new bold severity header (`**🟠 Major**`) as well as the old italic one. Since CodeRabbit switched formats on 2026-10-06, its Critical and Major findings had stopped blocking merges, and review-round counting had counted every Trivial comment as a finding.

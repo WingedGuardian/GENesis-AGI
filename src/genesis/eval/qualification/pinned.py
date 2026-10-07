@@ -132,6 +132,116 @@ class DeferredCloseStream(httpx.AsyncByteStream):
         return self.source.__aiter__()
 
 
+def _selected_routes(raw):
+    metadata = raw.get("openrouter_metadata")
+    endpoints = metadata.get("endpoints") if isinstance(metadata, dict) else None
+    available = endpoints.get("available") if isinstance(endpoints, dict) else None
+    selected = [item for item in available if isinstance(item, dict) and item.get("selected") is True] \
+        if isinstance(available, list) else []
+    return metadata, available, selected
+
+
+def _route_facts(observation):
+    """Derive identity from retained bytes; no acknowledgement changes these facts."""
+    try:
+        raw = load_json(observation["raw_body"])
+        if not isinstance(raw, dict):
+            raise LocalFailure("routing response is not an object")
+    except (KeyError, ValueError, UnicodeError, TypeError) as exc:
+        raise LocalFailure("routing response evidence is unavailable") from exc
+    return raw, *_selected_routes(raw)
+
+
+def _response_identity(raw, response_headers):
+    """Retain only gateway identity/cache headers and keep contrary IDs separate."""
+    headers = {name: response_headers[name] for name in (
+        "x-generation-id", "x-openrouter-cache-status"
+    ) if name in response_headers}
+    body, header = raw.get("id"), headers.get("x-generation-id")
+    generation = body if "id" in raw else header
+    conflict = body is not None and header is not None and body != header
+    _, _, selected = _selected_routes(raw)
+    return {
+        "response_provider": selected[0].get("provider") if len(selected) == 1 else raw.get("provider"),
+        "body_generation_id": body, "header_generation_id": header,
+        "generation_id": [body, header] if conflict else generation,
+        "response_headers": headers,
+        "error": "body and header generation identities conflict" if conflict else None,
+    }
+
+
+def _observed_identity(observation, spec):
+    """Keep field-specific conflicting facts unresolved in existing accounting fields.
+
+    Manifest identities remain strings. A list of actual contrary observation
+    facts cannot equal that frozen string, including after a late observation.
+    """
+    try:
+        raw, _, _, selected = _route_facts(observation)
+    except LocalFailure:
+        # Malformed/missing raw evidence must still be durably observed. Legacy
+        # receipt-only observations can account expense, never qualify a route.
+        return {"model": observation.get("model", observation.get("response_model")),
+                "upstream": observation.get("upstream")}
+    models = [raw.get("model"), *(item.get("model") for item in selected)]
+    providers = [raw.get("provider"), *(item.get("provider") for item in selected)]
+    wrong_models = [value for value in models if value is not None and value != spec["model"]]
+    wrong_providers = [value for value in providers if value is not None and value != spec["receipt_provider"]]
+    return {
+        "model": wrong_models or observation.get("response_model", observation.get("model")),
+        "upstream": wrong_providers or (
+            spec["upstream"] if observation.get("response_provider") == spec["receipt_provider"] else None
+        ),
+    }
+
+
+def verify_routing(observation, spec):
+    """Qualify the documented gateway route, never infer backend parameter execution."""
+    raw, metadata, available, selected = _route_facts(observation)
+    headers = observation.get("response_headers", {})
+    if not isinstance(headers, dict) or headers.get("x-openrouter-cache-status") not in (None, "MISS"):
+        raise LocalFailure("response is not evidence of a fresh gateway completion")
+    if (
+        not isinstance(metadata, dict)
+        or not isinstance(available, list)
+        or any(not isinstance(item, dict) or type(item.get("selected")) is not bool for item in available)
+        or len(selected) != 1
+        or raw.get("model") != spec["model"]
+        or metadata.get("requested") != spec["model"]
+        or metadata.get("strategy") != "direct"
+        or type(metadata.get("attempt")) is not int
+        or metadata["attempt"] != 1
+        or metadata.get("is_byok") is not False
+        or ("pipeline" in metadata and metadata["pipeline"] != [])
+    ):
+        raise LocalFailure("routing metadata does not verify one unchanged pinned gateway attempt")
+    endpoint = selected[0]
+    if (
+        endpoint.get("model") != spec["model"]
+        or endpoint.get("provider") != spec["receipt_provider"]
+        or observation.get("response_provider") != endpoint["provider"]
+        or ("provider" in raw and raw["provider"] != endpoint["provider"])
+    ):
+        raise LocalFailure("observed routing identity contradicts the frozen request")
+    if "attempts" in metadata:
+        attempts = metadata["attempts"]
+        if (
+            not isinstance(attempts, list) or len(attempts) != 1 or not isinstance(attempts[0], dict)
+            or attempts[0].get("model") != spec["model"]
+            or attempts[0].get("provider") != spec["receipt_provider"]
+            or type(attempts[0].get("status")) is not int or attempts[0]["status"] != 200
+        ):
+            raise LocalFailure("gateway attempt history contradicts the frozen request")
+    generation = raw.get("id")
+    header_generation = headers.get("x-generation-id")
+    if (
+        not isinstance(generation, str) or not generation.strip()
+        or observation.get("generation_id") != generation
+        or (header_generation is not None and header_generation != generation)
+    ):
+        raise LocalFailure("routing generation identity is missing or contradictory")
+
+
 class ObservedHTTPHandler(AsyncHTTPHandler):
     """One serialized egress guard, shared by every SDK replacement client.
 
@@ -168,6 +278,10 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
         ):
             self.error = "serialized request differs from the pinned request"
             raise LocalFailure(self.error)
+        # Set these after SDK construction, at the final serialized egress hook.
+        # SDK caching=False does not control the gateway's response cache.
+        request.headers["X-OpenRouter-Metadata"] = "enabled"
+        request.headers["X-OpenRouter-Cache"] = "false"
 
     async def after(self, response: httpx.Response):
         if response.is_closed:
@@ -215,14 +329,15 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
             self.error = self.error or "provider returned an error instead of an answer"
         if choice.get("finish_reason") == "error" or not isinstance(content, str):
             self.error = self.error or "provider response has no usable answer"
+        identity = _response_identity(raw, response.headers)
+        self.error = self.error or identity["error"]
         self.observed = safe_evidence(
             {
                 "http_status": response.status_code,
                 "raw_body": raw_body,
                 "finish_reason": choice.get("finish_reason"),
                 "response_model": raw.get("model"),
-                "response_provider": raw.get("provider"),
-                "generation_id": raw.get("id"),
+                **identity,
                 "usage": {
                     key: usage[key]
                     for key in ("prompt_tokens", "completion_tokens", "cost")
@@ -447,6 +562,10 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None):
             or data.get("provider_name") != display
         ):
             raise LocalFailure("billing GET identity differs from frozen request")
+        for observation in row["observations"]:
+            identity_fields = _observed_identity(observation, spec)
+            if any(value is not None and value != spec[name] for name, value in identity_fields.items()):
+                raise LocalFailure("retained routing identity contradicts billing settlement")
         evidence.update(model=data["model"], upstream=spec["upstream"], charge=data["total_cost"])
     except (ValueError, KeyError, TypeError) as exc:
         evidence["error"] = safe_text(str(exc))
@@ -689,6 +808,7 @@ class PinnedRouter:
                     raise LocalFailure("unanswered")
                 answer = await self._send(attempt, expected)
             spec = row["spec"]
+            verify_routing(answer, spec)
             if (
                 answer.get("model") != spec["model"]
                 or answer.get("upstream") != spec["upstream"]
@@ -748,12 +868,10 @@ class PinnedRouter:
             spec = row["spec"]
             observed = {
                 **observation,
-                "model": observation["response_model"],
-                "upstream": spec["upstream"]
-                if observation["response_provider"] == spec["receipt_provider"]
-                else observation["response_provider"],
+                **_observed_identity(observation, spec),
             }
             self.campaign.observe(attempt, observed)
+            verify_routing(observed, spec)
             if (
                 observation["response_model"] != spec["model"]
                 or observation["response_provider"] != spec["receipt_provider"]
