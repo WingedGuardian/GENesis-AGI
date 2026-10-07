@@ -9,6 +9,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+from code_intel_cbm_admission import _mount_path, number, resolve_cgroup
+
 
 def bus_call(path: str, interface: str, method: str, *args: str) -> dict:
     result = subprocess.run(
@@ -328,3 +330,112 @@ def native_env(config: dict) -> dict[str, str]:
         CBM_ALLOWED_ROOT=config["main"],
     )
     return env
+
+
+def absolute(raw: str) -> Path:
+    if not isinstance(raw, str) or not raw or any(c in raw for c in "\n\r\x00"):
+        raise ValueError("invalid managed path")
+    path = Path(raw)
+    if not path.is_absolute():
+        raise ValueError("managed path must be absolute")
+    return path
+
+
+def config_path(raw: str) -> Path:
+    path = absolute(raw)
+    if not path.name:
+        raise ValueError("settings path must name a file")
+    return absolute(str(path.parent.resolve() / path.name))
+
+
+def cgroup_empty(control: str) -> None:
+    if not control:
+        return
+    path = absolute(control)
+    if ".." in path.parts:
+        raise ValueError("invalid managed ControlGroup")
+    mountinfo = Path("/proc/self/mountinfo")
+    _, root, version = resolve_cgroup(Path("/proc/self/cgroup"), mountinfo)
+    if version != 2:
+        raise ValueError("uninstall requires visible cgroup v2 state")
+    mappings = []
+    for row in mountinfo.read_text().splitlines():
+        left, separator, right = row.partition(" - ")
+        fields = left.split()
+        if (
+            separator
+            and right.split()[:1] == ["cgroup2"]
+            and len(fields) >= 5
+            and _mount_path(fields[4]) == root
+        ):
+            mappings.append(_mount_path(fields[3]))
+    if len(set(mappings)) != 1:
+        raise ValueError("ambiguous managed cgroup mount")
+    mounted = mappings[0]
+    relative = path.relative_to(mounted) if path.is_relative_to(mounted) else path.relative_to("/")
+    group = root / relative
+    try:
+        values = dict(line.split() for line in (group / "cgroup.events").read_text().splitlines())
+    except FileNotFoundError:
+        if group.exists():
+            raise
+        return  # stopped group has been removed from the visible hierarchy
+    if values.get("populated") != "0":
+        raise ValueError("managed cgroup still contains processes (including descendants)")
+
+
+def verify_memory_ancestors(leaf: Path, root: Path) -> None:
+    """Every visible finite ancestor must admit the full query aggregate."""
+    cursor = leaf.parent
+    while cursor == root or root in cursor.parents:
+        try:
+            limit = (cursor / "memory.max").read_text().strip()
+        except FileNotFoundError:
+            if cursor != root:
+                raise
+            limit = "max"  # true cgroup filesystem root has no memory.max
+        if limit != "max" and number(limit, "ancestor memory.max") < 2 * 1024**3:
+            raise ValueError("ancestor cap is smaller than managed query budget")
+        if cursor == root:
+            break
+        cursor = cursor.parent
+
+
+def validate_frontend_boundary(unit: str, leaf: Path, root: Path, version: int, slice_name: str) -> None:
+    if not re.fullmatch(r"genesis-cbm-query-client-[0-9a-f]{32}\.service", unit):
+        raise ValueError("invalid managed frontend unit")
+    if version != 2 or leaf == root or leaf.name != unit or leaf.parent.name != slice_name:
+        raise ValueError("managed frontend is outside its capped client slice")
+    for node, memory, tasks in ((leaf, 256 * 1024**2, 32), (leaf.parent, 2 * 1024**3, 512)):
+        if (
+            (node / "memory.max").read_text().strip() != str(memory)
+            or (node / "memory.swap.max").read_text().strip() != "0"
+            or (node / "pids.max").read_text().strip() != str(tasks)
+        ):
+            raise ValueError("managed frontend lacks exact memory/swap/task caps")
+    verify_memory_ancestors(leaf, root)
+
+
+def frontend_command(main: Path, settings: Path, unit: str, backend: str, slice_name: str) -> list[str]:
+    """Build the native frontend transport from validated literal parameters."""
+    venv = os.environ.get("VENV_PATH") or str(main) + "/.venv"
+    absolute(venv)
+    interpreter = venv + "/bin/python"
+    if not Path(interpreter).is_file() or not os.access(interpreter, os.X_OK):
+        raise ValueError("selected installed interpreter is unavailable")
+    helper = str(main / "scripts/codebase_managed.py")
+    command = ["/usr/bin/systemd-run", "--user", "--pipe", "--quiet", "--collect", "--wait",
+               "--unit=" + unit, "--slice=" + slice_name, "--working-directory=/",
+               "--setenv=HOME=" + os.environ["HOME"], "--setenv=VENV_PATH=" + venv]
+    for key, value in (("PYTHON", interpreter), ("HELPER", helper),
+                       ("CONFIG", str(settings)), ("UNIT", unit)):
+        if key != "UNIT":
+            absolute(value)
+        command.append("--setenv=CBM_CLIENT_" + key + "=" + value)
+    for value in ("Requisite=" + backend, "After=" + backend, "StopPropagatedFrom=" + backend,
+                  "KillMode=control-group", "MemoryMax=256M", "MemorySwapMax=0",
+                  "TasksMax=32", "OOMScoreAdjust=500"):
+        command.extend(("-p", value))
+    bridge = 'exec "$$CBM_CLIENT_PYTHON" -I "$$CBM_CLIENT_HELPER" --config "$$CBM_CLIENT_CONFIG" client --unit "$$CBM_CLIENT_UNIT"'
+    command.extend(("--", "/bin/sh", "-c", bridge))
+    return command

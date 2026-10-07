@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import re
 import shutil
 import sqlite3
@@ -27,7 +28,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from code_intel_cbm_admission import (  # noqa: E402
     _host_available,
-    _mount_path,
     _working_charge,
     number,
     read_number,
@@ -35,9 +35,13 @@ from code_intel_cbm_admission import (  # noqa: E402
 )
 from code_intel_cbm_worker import BUILD  # noqa: E402
 from codebase_managed_unit import (  # noqa: E402,F401
+    absolute,
     artifact_parent,
     artifact_snapshot,
     canonical_sources,
+    cgroup_empty,
+    config_path,
+    frontend_command,
     implicit_slice_absent,
     loaded_properties,
     native_env,
@@ -45,6 +49,7 @@ from codebase_managed_unit import (  # noqa: E402,F401
     parent_identity,
     sentinel_armed,
     validate_backend,
+    validate_frontend_boundary,
     validate_source_identity,
 )
 
@@ -54,22 +59,6 @@ SLICE = "genesis-cbm-query-clients.slice"
 DISABLED_KEYS = ("auto_index", "auto_watch", "watcher_enabled")
 PATH_KEYS = ("main", "binary", "cache", "runtime", "sentinel")
 OPEN_FLAGS = os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-
-
-def absolute(raw: str) -> Path:
-    if not isinstance(raw, str) or not raw or any(c in raw for c in "\n\r\x00"):
-        raise ValueError("invalid managed path")
-    path = Path(raw)
-    if not path.is_absolute():
-        raise ValueError("managed path must be absolute")
-    return path
-
-
-def config_path(raw: str) -> Path:
-    path = absolute(raw)
-    if not path.name:
-        raise ValueError("settings path must name a file")
-    return absolute(str(path.parent.resolve() / path.name))
 
 
 def units_dir() -> Path:
@@ -130,42 +119,6 @@ def verify_uninstall_locks(fds: list[int]) -> None:
         ):
             raise ValueError("uninstall lock identity mismatch")
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-
-def cgroup_empty(control: str) -> None:
-    if not control:
-        return
-    path = absolute(control)
-    if ".." in path.parts:
-        raise ValueError("invalid managed ControlGroup")
-    mountinfo = Path("/proc/self/mountinfo")
-    _, root, version = resolve_cgroup(Path("/proc/self/cgroup"), mountinfo)
-    if version != 2:
-        raise ValueError("uninstall requires visible cgroup v2 state")
-    mappings = []
-    for row in mountinfo.read_text().splitlines():
-        left, separator, right = row.partition(" - ")
-        fields = left.split()
-        if (
-            separator
-            and right.split()[:1] == ["cgroup2"]
-            and len(fields) >= 5
-            and _mount_path(fields[4]) == root
-        ):
-            mappings.append(_mount_path(fields[3]))
-    if len(set(mappings)) != 1:
-        raise ValueError("ambiguous managed cgroup mount")
-    mounted = mappings[0]
-    relative = path.relative_to(mounted) if path.is_relative_to(mounted) else path.relative_to("/")
-    group = root / relative
-    try:
-        values = dict(line.split() for line in (group / "cgroup.events").read_text().splitlines())
-    except FileNotFoundError:
-        if group.exists():
-            raise
-        return  # stopped group has been removed from the visible hierarchy
-    if values.get("populated") != "0":
-        raise ValueError("managed cgroup still contains processes (including descendants)")
 
 
 def require_quiescent(unit: str) -> None:
@@ -835,6 +788,43 @@ def verify_query_boundary(pid: str, *, startup: bool = False) -> None:
         raise ValueError("insufficient host available memory for managed query budget")
 
 
+def verify_frontend_boundary(unit: str) -> None:
+    leaf, root, version = resolve_cgroup(Path("/proc/self/cgroup"), Path("/proc/self/mountinfo"))
+    validate_frontend_boundary(unit, leaf, root, version, SLICE)
+
+
+def launch(config: dict, path: Path) -> None:
+    """Read-only preflight; the actual capped child owns final admission."""
+    verify_cache(config)
+    ready(config)
+    main = absolute(config["main"]).resolve(strict=True)
+    if not (main / ".git").is_dir():
+        raise ValueError("managed frontend requires the configured primary checkout")
+    unit = "genesis-cbm-query-client-" + uuid.uuid4().hex + ".service"
+    command = frontend_command(main, path, unit, BACKEND, SLICE)
+    os.execv(command[0], command)  # noqa: S606 - fixed systemd executable
+
+
+def client(path: Path, unit: str) -> None:
+    with lifecycle_lock(shared=True):
+        # Re-read inside the actual limited process after acquiring admission.
+        config = runtime_config(path)
+        verify_frontend_boundary(unit)
+        verify_cache(config)
+        ready(config)
+        os.chdir(config["main"])
+        with verified_binary(Path(config["binary"])) as executable:
+            require_enabled(config)
+            check_backend(config)
+            os.set_inheritable(executable.fileno(), True)
+            # The lifecycle descriptor stays CLOEXEC: admitted readers do not
+            # prevent disable, which stops their native dependency and slice.
+            os.execve(  # noqa: S606 - accepted inode and fixed analysis profile
+                f"/proc/self/fd/{executable.fileno()}",
+                [config["binary"], "--tool-profile=analysis"], native_env(config),
+            )
+
+
 def check_backend(config: dict, *, starting: bool = False, timeout: float = 30) -> str:
     value = show(BACKEND, "ActiveState", "MainPID", timeout=timeout)
     if value["ActiveState"] not in (("active", "activating") if starting else ("active",)):
@@ -943,6 +933,9 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     commands.add_parser("status")
     commands.add_parser("serve")
     commands.add_parser("ready")
+    commands.add_parser("launch")
+    child = commands.add_parser("client")
+    child.add_argument("--unit", required=True)
     for command in ("enable", "disable", "remove"):
         commands.add_parser(command)
     teardown = commands.add_parser("uninstall")
@@ -954,6 +947,13 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_arguments(argv)
+    try:
+        home = os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
+        absolute(home)
+        os.environ["HOME"] = home
+    except (KeyError, OSError, ValueError, RuntimeError) as error:
+        print(f"managed Codebase refused: invalid HOME: {error}", file=sys.stderr)
+        return 1
     if args.command in ("uninstall", "verify-uninstall-locks"):
         return uninstall_main(args)
     if args.command in ("enable", "disable", "remove"):
@@ -979,6 +979,10 @@ def main(argv: list[str] | None = None) -> int:
             configure(args, path)
         elif args.command == "status":
             print(json.dumps(status(path), indent=2))
+        elif args.command == "launch":
+            launch(read_settings(path), path)
+        elif args.command == "client":
+            client(path, args.unit)
         else:
             config = runtime_config(path)
             (serve if args.command == "serve" else ready)(config)

@@ -1095,25 +1095,8 @@ if command -v claude &>/dev/null; then
     . "$SCRIPT_DIR/lib/mcp_register.sh"
     [ -x "$REPO_DIR/.claude/mcp/run-gitnexus" ] && \
         _register_mcp "gitnexus" "user" "$REPO_DIR/.claude/mcp/run-gitnexus" "mcp"
-    # Via the repo launcher (NOT the bare binary): wraps the server in a
-    # systemd scope with MemoryMax=2G to contain upstream's unbounded memory
-    # leak (DeusData/codebase-memory-mcp#581). Rationale in the launcher.
-    if command -v codebase-memory-mcp &>/dev/null; then
-        # REGISTERED EVEN WHEN THE KILL SWITCH IS ACTIVE, deliberately. Registration
-        # does not start anything, and the launcher is fail-closed on the sentinel
-        # (.claude/mcp/run-codebase-memory exits 1 with "disabled by <file>"), so
-        # writing the registration while disabled cannot run the server.
-        #
-        # Skipping preserved the exact drift this helper exists to repair: a
-        # PRE-EXISTING registration pointing at the bare `codebase-memory-mcp`
-        # binary survives untouched, bypasses the launcher entirely, and starts the
-        # uncapped raw server in the next session — and stays uncapped after the
-        # sentinel is removed until somebody runs this again.
-        _register_mcp "codebase-memory-mcp" "user" "$REPO_DIR/.claude/mcp/run-codebase-memory"
-        if [ -n "${_cbm_disable:-}" ] && [ -e "$_cbm_disable" ]; then
-            echo "    . codebase-memory-mcp registered to the launcher; kill switch active, so it will refuse to start"
-        fi
-    fi
+    # Register managed setup on every install; registration never activates CBM.
+    _register_mcp "codebase-memory-mcp" "user" "$REPO_DIR/.claude/mcp/run-codebase-memory"
     _serena_registration_available && \
         _register_serena "$REPO_DIR"
     # grep-app (grep.app) — literal/regex code search over ~1M public GitHub

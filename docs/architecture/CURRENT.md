@@ -1340,7 +1340,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 3c750316479f 2026-10-05
+verified: 0a9e5ab70 2026-10-07
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -1411,8 +1411,9 @@ verified: 3c750316479f 2026-10-05
   External Codebase has pinned configuration staging/diagnostics and bounded
   native query unit entry points in `scripts/codebase_managed.py`. Install and
   bootstrap render disabled query/client-slice templates without auto-upgrading
-  a PATH provider. Staging does not activate it; MCP registration and indexing
-  retain their existing routes until their integration concerns land. See
+  a PATH provider. Staging does not activate it; MCP registration always uses
+  the managed launcher, including absent PATH binaries. Index queue integration
+  remains a separate concern. See
   `docs/reference/codebase-managed.md`.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
@@ -1430,8 +1431,14 @@ verified: 3c750316479f 2026-10-05
   selected interpreter, proves actual quiescence and preserves immutable state.
   Remove unlinks fixed artifacts only after validating the full population;
   partial unlink failures refresh only after proving quiescence and accepted
-  remaining sources. Frontend and queued-worker admission integration
-  remain separate concerns.
+  remaining sources. Managed frontends use the selected installed interpreter
+  and normalized HOME, preserve literal paths through a fixed environment bridge,
+  and prove fresh shared admission and kernel caps inside the actual transient
+  child: 256MiB/zero swap/Tasks32 under2GiB/zero swap/Tasks512 aggregate. They
+  retain fixed analysis tools, permanent PID readiness and native stop propagation
+  without backend activation or a raw fallback. Queued-worker admission remains
+  a separate concern.
+
 - **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
   `/v1/chat/completions` endpoint, and registers the desk brain at
