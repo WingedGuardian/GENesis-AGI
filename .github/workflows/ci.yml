@@ -1126,10 +1126,11 @@ jobs:
         # seven additional browser skips absent on current main; counts alone
         # did not establish a two-slot allowance. Keep main's ceiling unchanged.
         # Floor: 24421 + 76 + 3 = 24500.
-        # Native CBM runtime/templates: new runtime file 24 and template file 26
+        # Native CBM runtime/templates: new runtime file 52 and template file 26
         # cases, plus template-placeholders 13 -> 14 (+1 hosted slice inventory).
-        # Other edited files retain counts. Floor: 24500 + 51 = 24551;
+        # Unit-root guard adds 5 controls for the backend's neutral cwd exception.
+        # Other edited files retain counts. Floor: 24500 + 84 = 24584;
         # no new skip sites.
         # Guarded CBM removal: new uninstall file32 cases; other edited test
-        # files retain collection counts. Floor24551+32=24583; no added skips.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24583
+        # files retain collection counts. Floor24584+32=24616; no added skips.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24616
