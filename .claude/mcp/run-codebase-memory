@@ -4,4 +4,16 @@
 set -eu
 SCRIPT_DIR="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 GENESIS_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
-exec /usr/bin/python3 -I "$GENESIS_ROOT/scripts/codebase_managed.py" launch "$@"
+MANAGED_VENV="${VENV_PATH:-$GENESIS_ROOT/.venv}"
+case "$MANAGED_VENV" in
+    /*) ;;
+    *) printf '%s\n' 'managed Codebase refused: VENV_PATH must be absolute' >&2; exit 1 ;;
+esac
+case "$MANAGED_VENV" in
+    *$'\n'*|*$'\r'*) printf '%s\n' 'managed Codebase refused: invalid VENV_PATH' >&2; exit 1 ;;
+esac
+if [ ! -f "$MANAGED_VENV/bin/python" ] || [ ! -x "$MANAGED_VENV/bin/python" ]; then
+    printf '%s\n' 'managed Codebase refused: selected installed interpreter is unavailable' >&2
+    exit 1
+fi
+exec "$MANAGED_VENV/bin/python" -I "$GENESIS_ROOT/scripts/codebase_managed.py" launch "$@"

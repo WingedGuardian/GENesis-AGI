@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,8 @@ def _write_exec(path: Path, body: str) -> Path:
 def test_missing_setup_has_no_legacy_fallback(tmp_path, override):
     log = tmp_path / "raw.log"
     binary = _write_exec(tmp_path / "codebase-memory-mcp", f"#!/bin/sh\necho raw > {log}\n")
-    env = {"PATH": _SYSTEM_PATH, "HOME": str(tmp_path)}
+    env = {"PATH": _SYSTEM_PATH, "HOME": str(tmp_path),
+           "VENV_PATH": str(Path(sys.executable).parent.parent)}
     if override == "binary":
         env["CODEBASE_MEMORY_MCP_BIN"] = str(binary)
     elif override == "memory":
@@ -38,6 +40,41 @@ def test_missing_setup_has_no_legacy_fallback(tmp_path, override):
     assert result.returncode == 1 and "managed Codebase refused" in result.stderr
     assert "codebase-managed.json" in result.stderr
     assert not log.exists()
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "nonexecutable", "dangling", "relative", "newline", "carriage-return"])
+def test_launcher_refuses_unavailable_selected_interpreter(tmp_path, kind):
+    venv = tmp_path / "selected"
+    interpreter = venv / "bin/python"
+    interpreter.parent.mkdir(parents=True)
+    if kind == "directory":
+        interpreter.mkdir()
+    elif kind == "nonexecutable":
+        interpreter.write_text("not executable")
+    elif kind == "dangling":
+        interpreter.symlink_to(tmp_path / "absent")
+    raw = {"relative": "relative", "newline": str(venv) + "\n", "carriage-return": str(venv) + "\r"}.get(kind, str(venv))
+    result = subprocess.run(["/bin/bash", str(_LAUNCHER)], env={"PATH": _SYSTEM_PATH, "HOME": str(tmp_path), "VENV_PATH": raw},
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 1
+    assert "managed Codebase refused" in result.stderr
+    assert "codebase-managed.json" not in result.stderr
+
+
+@pytest.mark.parametrize("literal", ["space path", "$HOME", "%n %%", "quotes'\"", "back\\slash", "λ雪", "$(touch marker)", "`touch marker`"])
+def test_launcher_custom_literal_interpreter_reaches_actual_helper(tmp_path, literal):
+    venv = tmp_path / literal
+    interpreter = venv / "bin/python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.symlink_to(sys.executable)
+    home = tmp_path / "home"
+    home.mkdir()
+    result = subprocess.run(["/bin/bash", str(_LAUNCHER)], env={"PATH": _SYSTEM_PATH, "HOME": str(home), "VENV_PATH": str(venv)},
+                            cwd=tmp_path, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 1
+    assert "managed Codebase refused" in result.stderr
+    assert str(home / ".genesis/config/codebase-managed.json") in result.stderr
+    assert not (tmp_path / "marker").exists()
 
 
 # ── _register_mcp drift-healing (sources the REAL shared lib) ─────────────

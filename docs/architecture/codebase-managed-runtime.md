@@ -3,7 +3,7 @@
 Status: **six-part rebuild in review; production acceptance remains pending**.
 This plan does not authorize deployment or re-enabling Codebase MCP.
 
-## Current delivery and operational plan (2026-10-06)
+## Current delivery and operational plan (2026-10-07)
 
 The accepted replacement for the broker investigation below uses the pinned
 v0.11.0 native executable, immutable schema-2 settings, and the existing durable
@@ -13,7 +13,7 @@ commands and exact containment settings are documented in
 
 The six concerns are configuration publication (#2909), native runtime (#3000),
 guarded uninstall (#3006), lifecycle (#3007), frontend (#3011), and queued-worker
-integration. Successors are stacked for review; each must reconcile and target
+integration (#3012). Successors are stacked for review; each must reconcile and target
 main after its predecessor lands. All six are required before activation.
 
 The query daemon has a 2 GiB, zero-swap service cap. Readers have individual
@@ -21,6 +21,10 @@ The query daemon has a 2 GiB, zero-swap service cap. Readers have individual
 8 GiB, zero-swap scope and verifies physical placement before native execution.
 These ceilings do not establish production capacity: host and effective ancestor
 headroom must still fit the worker plus reader, query, sibling and cache reserves.
+The worker coordinator retains its inherited nonmaximum OOM adjustment; only
+its accepted native exec child is promoted to1000. That preference does not
+guarantee immunity or change group-kill policy. A failed canonical lock namespace
+refuses managed work even if a temporary fallback opens.
 
 Queue prerequisite #2023 [merged on September 15](https://github.com/WingedGuardian/GENesis-AGI/pull/2023).
 Its existing generation and attempt accounting is retained. Resource/OOM

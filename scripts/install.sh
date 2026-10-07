@@ -1021,6 +1021,7 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             _systemd_exec_esc() { printf '%s' "$1" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g'; }
             _home_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$HOME")")
             _repo_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$REPO_DIR")")
+            _venv_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$VENV_PATH")")
             _home_esc=$(_sed_repl_esc "$HOME")
             _venv_esc=$(_sed_repl_esc "$VENV_PATH")
             _repo_esc=$(_sed_repl_esc "$REPO_DIR")
@@ -1031,6 +1032,7 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             sed -e "s|__HOME__|$_home_esc|g" \
                 -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
                 -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \
+                -e "s|__VENV_EXEC__|$_venv_exec_esc|g" \
                 -e "s|__VENV__|$_venv_esc|g" \
                 -e "s|__REPO_DIR__|$_repo_esc|g" \
                 -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \

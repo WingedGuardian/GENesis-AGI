@@ -494,6 +494,9 @@ def test_native_configure_cli_e2e(native_root, long_runtime):
     shutil.copy2(
         ROOT / "scripts/lib/code_intel_cbm_admission.py", repo / "scripts/lib/code_intel_cbm_admission.py"
     )
+    shutil.copy2(
+        ROOT / "scripts/lib/codebase_managed_unit.py", repo / "scripts/lib/codebase_managed_unit.py"
+    )
     subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
     settings = home / ".genesis/config/codebase-managed.json"
     state = home / ("staged" + ("x" * 100 if long_runtime else ""))

@@ -41,13 +41,14 @@ def verify_scope(env: dict[str, str]) -> int:
                 env.get("CODE_INTEL_FILE_CACHE_RESERVE_BYTES", "2147483648"), "cache reserve"
             ),
         )
-    except admission["AdmissionRefused"]:
+        adjustment = int(Path("/proc/self/oom_score_adj").read_text().strip())
+        if not -1000 <= adjustment < 1000:
+            raise ValueError("worker supervisor requires a nonmaximum OOM adjustment")
+    except (OSError, ValueError):
         marker = env.get("CODE_INTEL_CHILD_REFUSAL_MARKER")
         if marker:
             Path(marker).write_text("refused\n")
         raise
-    if Path("/proc/self/oom_score_adj").read_text().strip() != "1000":
-        raise ValueError("worker requires OOM priority 1000")
     return cap
 
 
@@ -129,7 +130,8 @@ def _spawn_worker(
         str(cap * 3 // 4),
     ]
     process = subprocess.Popen(
-        command,
+        ["/bin/bash", str(Path(__file__).with_name("code_intel_index.sh")),
+         "--exec-indexer-with-oom-adj", *command],
         pass_fds=(executable.fileno(),),
         env=managed["native_env"](config),
         cwd=config["main"],

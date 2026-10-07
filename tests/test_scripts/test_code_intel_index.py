@@ -232,7 +232,7 @@ def _test_entrypoint(tmp_path: Path, fakebin: Path) -> Path:
         "args=sys.argv[1:]\n"
         "assert args[:1]==['--managed-config']\n"
         "args=args[2:]\n"
-        f"raise SystemExit(subprocess.call([{str(fakebin / 'codebase-memory-mcp')!r},'cli','index_repository',*args]))\n"
+        f"raise SystemExit(subprocess.call(['/bin/bash',{str(script)!r},'--exec-indexer-with-oom-adj',{str(fakebin / 'codebase-memory-mcp')!r},'cli','index_repository',*args]))\n"
     )
     for name in ("cbm_disable_file.sh", "gitnexus_version.sh", "proc_pressure.sh"):
         companion = script_dir / name
@@ -1099,6 +1099,16 @@ def test_no_raw_index_spawns_outside_entrypoint():
             if "index_repository" in line:
                 violations.append(f"{rel}:{lineno}: raw index_repository spawn")
             elif "gitnexus" in line and "analyze" in line:
+                if rel == Path("scripts/codebase_managed.py") and stripped in (
+                    'if "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv):',
+                    'native = "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv)',
+                ):
+                    continue  # exact read-only argv comparisons, not execution
+                if rel == Path("tests/test_scripts/test_codebase_managed_uninstall.py") and stripped in (
+                    '(process / "cmdline").write_bytes(b"node\\0/opt/gitnexus/dist/cli/index.js\\0analyze\\0")',
+                    'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "/opt/gitnexus/dist/cli/index.js", "analyze"], cwd=transaction / "genesis")',
+                ):
+                    continue  # exact synthetic cmdline and owned Python sleeper
                 violations.append(f"{rel}:{lineno}: raw gitnexus analyze spawn")
     assert not violations, (
         "Raw code-intel index spawn(s) found — route them through "
@@ -1146,10 +1156,20 @@ def test_installer_does_not_claim_queue_success_after_writer_failure():
     assert "WARNING: could not queue initial code intelligence index" in queue
 
 
+@pytest.mark.parametrize("path", ["scripts/codebase_managed.py", "tests/test_scripts/test_codebase_managed_uninstall.py"])
+def test_observation_exceptions_do_not_exempt_raw_spawns(tmp_path, monkeypatch, path):
+    file = tmp_path / path
+    file.parent.mkdir(parents=True)
+    file.write_text('subprocess.Popen(["gitnexus", "analyze"])\n')
+    monkeypatch.setitem(test_no_raw_index_spawns_outside_entrypoint.__globals__, "_REPO_ROOT", tmp_path)
+    with pytest.raises(AssertionError, match="raw gitnexus analyze spawn"):
+        test_no_raw_index_spawns_outside_entrypoint()
+
+
 # ── Codebase Memory batch admission ───────────────────────────────────────
 
 
-def test_cbm_default_uses_the_measured_four_gibibyte_target(tmp_path):
+def test_cbm_default_requires_the_managed_eight_gibibyte_target(tmp_path):
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
     systemd_log = tmp_path / "systemd.log"
     _fake_tools(fakebin, log)
@@ -1589,8 +1609,9 @@ def test_oom_score_adj_negative_is_refused_not_attempted(tmp_path):
     assert not log.exists() or "codebase-memory-mcp ARGS:" not in log.read_text()
 
 
-def test_oom_score_adj_keeps_a_higher_inherited_value(tmp_path):
-    """An inherited maximum remains maximum in the disposable child."""
+@pytest.mark.parametrize("tool", ["cbm", "gitnexus"])
+def test_oom_score_adj_keeps_a_higher_inherited_value(tmp_path, tool):
+    """Maximum refuses the managed coordinator; ordinary native use remains."""
     fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
     _fake_tools(fakebin, log)
     repo = _make_repo(tmp_path)
@@ -1599,14 +1620,17 @@ def test_oom_score_adj_keeps_a_higher_inherited_value(tmp_path):
     res = _run_entry(
         tmp_path,
         repo,
-        "cbm",
+        tool,
         path=f"{fakebin}:{_SYSTEM_PATH}",
         preexec_fn=lambda: Path("/proc/self/oom_score_adj").write_text("1000\n"),
     )
-    assert res.returncode == 0, res.stderr
-    assert "OOM_ADJ:1000" in log.read_text(), (
-        "the inherited maximum did not reach the disposable child"
-    )
+    if tool == "cbm":
+        assert res.returncode == 3
+        assert "nonmaximum supervisor" in res.stderr
+        assert not log.exists()
+    else:
+        assert res.returncode == 0, res.stderr
+        assert "OOM_ADJ:1000" in log.read_text()
     assert "requires 1000" not in res.stderr
 
 

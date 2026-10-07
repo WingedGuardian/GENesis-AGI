@@ -61,7 +61,10 @@ set -u
 # preference only in the disposable child, immediately before exec, and verify
 # the effective value. +1000 is maximally preferred among tasks eligible in the
 # applicable OOM domain; cgroup OOM-domain boundaries still govern eligibility.
-if [ "${1:-}" = "--exec-indexer-with-oom-adj" ]; then
+if [ "${1:-}" = "--exec-indexer-with-oom-adj" ] \
+    || [ "${1:-}" = "--exec-managed-supervisor" ]; then
+    _supervisor=0
+    [ "$1" != "--exec-managed-supervisor" ] || _supervisor=1
     shift
     if [ "$#" -eq 0 ]; then
         printf '%s\n' "code-intel: missing indexer command" >&2
@@ -109,13 +112,24 @@ if [ "${1:-}" = "--exec-indexer-with-oom-adj" ]; then
         exit 125
     fi
     _oom_adj_file=/proc/self/oom_score_adj
-    if ! { printf '%s\n' 1000 > "$_oom_adj_file"; } 2>/dev/null; then
+    if [ "$_supervisor" = "0" ] \
+        && ! { printf '%s\n' 1000 > "$_oom_adj_file"; } 2>/dev/null; then
         printf '%s\n' "code-intel: cannot establish oom_score_adj=1000; refusing batch workload" >&2
         exit 125
     fi
     _oom_adj_actual=""
     read -r _oom_adj_actual < "$_oom_adj_file" 2>/dev/null || _oom_adj_actual=""
-    if [ "$_oom_adj_actual" != "1000" ]; then
+    if [ "$_supervisor" = "1" ]; then
+        # Preserve the inherited coordinator adjustment; never rely on a
+        # privileged reset. Only its disposable native child is promoted.
+        if ! [[ "$_oom_adj_actual" =~ ^-?[0-9]+$ ]] \
+            || [ "$_oom_adj_actual" -lt -1000 ] || [ "$_oom_adj_actual" -ge 1000 ]; then
+            [ -z "${CODE_INTEL_CHILD_REFUSAL_MARKER:-}" ] \
+                || printf '%s\n' refused > "$CODE_INTEL_CHILD_REFUSAL_MARKER"
+            printf '%s\n' "code-intel: cannot prove nonmaximum supervisor OOM adjustment" >&2
+            exit 125
+        fi
+    elif [ "$_oom_adj_actual" != "1000" ]; then
         printf '%s\n' \
             "code-intel: cannot establish oom_score_adj=1000 (read back '${_oom_adj_actual:-unavailable}'); refusing batch workload" >&2
         exit 125
@@ -594,14 +608,22 @@ fi
 
 # ── 2. Single-flight lock (per repo path) ───────────────────────────────
 LOCK_DIR="${GENESIS_HOME:-$HOME/.genesis}/locks"
-mkdir -p "$LOCK_DIR" 2>/dev/null || LOCK_DIR="${TMPDIR:-/tmp}"
+_CBM_LOCK_REFUSE=0
+case "$LOCK_DIR" in /*) : ;; *) _CBM_LOCK_REFUSE=1 ;; esac
+if ! mkdir -p "$LOCK_DIR" 2>/dev/null; then
+    _CBM_LOCK_REFUSE=1
+    LOCK_DIR="${TMPDIR:-/tmp}"
+fi
+if [ "$_CBM_LOCK_REFUSE" = "1" ] && [ "$TOOLS" != "gitnexus" ]; then
+    _log "managed CBM requires the canonical repository lock namespace"
+    [ "$TOOLS" != "cbm" ] || exit 75
+fi
 LOCK_FILE="$LOCK_DIR/code-intel-$(printf '%s' "$REPO_PATH" | sha1sum | cut -c1-16).lock"
 
 # Take the lock only when flock AND a writable lock file are both available.
 # If either is missing, proceed UNLOCKED with a warning — a missing lock tool
 # must degrade to "no dedup", never to "silently skip indexing" (a bare
 # `flock -n 9` failure is indistinguishable from "lock held" otherwise).
-_CBM_LOCK_REFUSE=0
 if command -v flock >/dev/null 2>&1 && { exec 9>"$LOCK_FILE"; } 2>/dev/null; then
     if ! flock -n 9; then
         # Lock held: either a concurrent index, or the managed genesis-code-intel-freeze
@@ -663,7 +685,7 @@ _run_capped() {
                 "CODE_INTEL_CHILD_RESERVE_BYTES=$CODE_INTEL_SIBLING_RESERVE_BYTES" \
                 "CODE_INTEL_CHILD_SCOPE_UNIT=${_CI_SCOPE_UNIT:-}" \
                 "CODE_INTEL_CHILD_REFUSAL_MARKER=${CODE_INTEL_CHILD_REFUSAL_MARKER:-}" \
-                /bin/bash "$_CODE_INTEL_ENTRYPOINT" --exec-indexer-with-oom-adj "$@"
+                /bin/bash "$_CODE_INTEL_ENTRYPOINT" "${_CI_EXEC_MODE:---exec-indexer-with-oom-adj}" "$@"
     else
         # Fallback: polite scheduling + soft address-space cap. Mirrors the
         # run-codebase-memory launcher's degradation (never block on missing
@@ -754,8 +776,10 @@ _run_with_watchdog() {
     local label="$1"; shift
     local _SCOPE_OK="$_GN_SCOPE_OK"
     local scope_inherit=0
+    local _CI_EXEC_MODE=--exec-indexer-with-oom-adj
     [ "$label" = "cbm" ] && _SCOPE_OK="$_CBM_SCOPE_OK"
     [ "$label" = "cbm" ] && scope_inherit=1
+    [ "$label" != "cbm" ] || _CI_EXEC_MODE=--exec-managed-supervisor
     if [ "$WORKLOAD_SLICE" = "1" ] && [ "$_SCOPE_OK" != "1" ]; then
         if [ -n "${CODE_INTEL_CHILD_REFUSAL_MARKER:-}" ]; then
             printf '%s\n' refused > "$CODE_INTEL_CHILD_REFUSAL_MARKER" 2>/dev/null || true

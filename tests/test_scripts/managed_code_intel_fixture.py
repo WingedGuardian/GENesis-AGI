@@ -35,7 +35,7 @@ def install_manager(
         "g=ns['main'].__globals__\n"
         f"g['SCRIPT']=Path({str(main / 'scripts/codebase_managed.py')!r})\n"
         "g['verify_cache']=lambda config: None\n"
-        "g['show']=lambda unit,*props: {'UnitFileState':'enabled'}\n"
+        "g['show']=lambda unit,*props,**kwargs: {'UnitFileState':'enabled'}\n"
         "def ready(config):\n"
         "    g['require_enabled'](config)\n"
         "    if not Path(config['binary']).exists(): raise ValueError('backend unavailable')\n"

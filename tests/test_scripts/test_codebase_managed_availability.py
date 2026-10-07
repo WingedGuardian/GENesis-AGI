@@ -25,7 +25,7 @@ def test_readonly_availability_refuses_incomplete_authority(availability, tmp_pa
     monkeypatch.setitem(
         namespace,
         "show",
-        lambda *args: {"UnitFileState": "disabled" if fault == "disabled" else "enabled"},
+        lambda *args, **kwargs: {"UnitFileState": "disabled" if fault == "disabled" else "enabled"},
     )
     cache = Mock()
     monkeypatch.setitem(namespace, "verify_cache", cache)

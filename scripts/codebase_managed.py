@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import re
 import shutil
 import sqlite3
@@ -25,8 +26,35 @@ from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-from code_intel_cbm_admission import _mount_path, number, resolve_cgroup  # noqa: E402
+from code_intel_cbm_admission import (  # noqa: E402
+    _host_available,
+    _working_charge,
+    number,
+    read_number,
+    resolve_cgroup,
+)
 from code_intel_cbm_worker import BUILD  # noqa: E402
+from codebase_managed_unit import (  # noqa: E402,F401
+    absolute,
+    artifact_parent,
+    artifact_snapshot,
+    canonical_sources,
+    cgroup_empty,
+    config_path,
+    frontend_command,
+    implicit_slice_absent,
+    loaded_properties,
+    native_env,
+    native_install,
+    parent_identity,
+    sentinel_armed,
+    validate_backend,
+    validate_frontend_boundary,
+    validate_source_identity,
+)
+from codebase_managed_unit import (
+    parse_arguments as native_parse_arguments,
+)
 
 SCRIPT = Path(__file__).resolve()
 BACKEND = "genesis-cbm-query.service"
@@ -34,22 +62,6 @@ SLICE = "genesis-cbm-query-clients.slice"
 DISABLED_KEYS = ("auto_index", "auto_watch", "watcher_enabled")
 PATH_KEYS = ("main", "binary", "cache", "runtime", "sentinel")
 OPEN_FLAGS = os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-
-
-def absolute(raw: str) -> Path:
-    if not isinstance(raw, str) or not raw or any(c in raw for c in "\n\r\x00"):
-        raise ValueError("invalid managed path")
-    path = Path(raw)
-    if not path.is_absolute():
-        raise ValueError("managed path must be absolute")
-    return path
-
-
-def config_path(raw: str) -> Path:
-    path = absolute(raw)
-    if not path.name:
-        raise ValueError("settings path must name a file")
-    return absolute(str(path.parent.resolve() / path.name))
 
 
 def units_dir() -> Path:
@@ -76,8 +88,21 @@ def uninstall_lock_paths() -> tuple[Path, Path, Path]:
     main = (Path.home() / "genesis").resolve(strict=True)
     if main != SCRIPT.parent.parent or (main / ".git").is_file():
         raise ValueError("uninstall requires the installed primary checkout")
-    directory = Path(os.environ.get("GENESIS_HOME", str(Path.home() / ".genesis"))) / "locks"
+    directory = Path(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis")) / "locks"
     absolute(str(directory))
+    roots = [Path.home() / name for name in ("genesis", ".genesis", "data", ".qdrant")]
+    default = Path.home() / ".genesis/locks"
+    protected = [units_dir()]
+    if directory == default:
+        if directory.parent.is_symlink() or directory.is_symlink():
+            raise ValueError("uninstall refuses symlinked default lock namespace")
+    else:
+        protected.append(directory)
+    for location in protected:
+        for root in roots:
+            for namespace, deletion in ((location, root), (location.resolve(), root.resolve())):
+                if namespace.is_relative_to(deletion) or deletion.is_relative_to(namespace):
+                    raise ValueError("uninstall refuses lock namespace overlapping deletion roots")
     digest = hashlib.sha1(os.fsencode(main), usedforsecurity=False).hexdigest()[:16]
     return (
         directory / "code-intel-runner.lock",
@@ -99,42 +124,6 @@ def verify_uninstall_locks(fds: list[int]) -> None:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
-def cgroup_empty(control: str) -> None:
-    if not control:
-        return
-    path = absolute(control)
-    if ".." in path.parts:
-        raise ValueError("invalid managed ControlGroup")
-    mountinfo = Path("/proc/self/mountinfo")
-    _, root, version = resolve_cgroup(Path("/proc/self/cgroup"), mountinfo)
-    if version != 2:
-        raise ValueError("uninstall requires visible cgroup v2 state")
-    mappings = []
-    for row in mountinfo.read_text().splitlines():
-        left, separator, right = row.partition(" - ")
-        fields = left.split()
-        if (
-            separator
-            and right.split()[:1] == ["cgroup2"]
-            and len(fields) >= 5
-            and _mount_path(fields[4]) == root
-        ):
-            mappings.append(_mount_path(fields[3]))
-    if len(set(mappings)) != 1:
-        raise ValueError("ambiguous managed cgroup mount")
-    mounted = mappings[0]
-    relative = path.relative_to(mounted) if path.is_relative_to(mounted) else path.relative_to("/")
-    group = root / relative
-    try:
-        values = dict(line.split() for line in (group / "cgroup.events").read_text().splitlines())
-    except FileNotFoundError:
-        if group.exists():
-            raise
-        return  # stopped group has been removed from the visible hierarchy
-    if values.get("populated") != "0":
-        raise ValueError("managed cgroup still contains processes (including descendants)")
-
-
 def require_quiescent(unit: str) -> None:
     properties = ["ActiveState", "ControlGroup"]
     if unit.endswith(".service"):
@@ -154,7 +143,61 @@ def manager_absent(unit: str) -> bool:
     return show(unit, *expected) == expected
 
 
+def index_writer_targets_main(argv: list[str], cwd: Path, main: Path) -> bool:
+    """Recognize repository targets of the existing wrapper and native modes."""
+    entrypoint = main / "scripts/lib/code_intel_index.sh"
+    for index, arg in enumerate(argv[:-1]):
+        if Path(arg).name != "code_intel_index.sh":
+            continue
+        candidate = Path(arg) if Path(arg).is_absolute() else cwd / arg
+        if candidate.resolve() == entrypoint and (cwd / argv[index + 1]).resolve() == main:
+            return True
+    # The private OOM launcher contains both wrapper and native argv. Its fixed
+    # flag is not a repository argument; native classification must still run.
+    if "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv):
+        tail = argv[argv.index("analyze") + 1 :]
+        target = cwd / tail[0] if tail and not tail[0].startswith("-") else cwd
+        return target.resolve() == main
+    return False
+
+
+def observed_index_writers(proc: Path = Path("/proc")) -> list[int]:
+    """Observe existing lockless/scopeless writers; never signal a process."""
+    main = SCRIPT.parent.parent
+    writers = []
+    for process in proc.iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            # proc_pid_stat(5): comm can contain ')' and arbitrary filename bytes;
+            # starttime is field 22, after the final parenthesized comm delimiter.
+            started = process.joinpath("stat").read_text(errors="surrogateescape").rsplit(")", 1)[1].split()[19]
+            argv = [os.fsdecode(arg) for arg in process.joinpath("cmdline").read_bytes().split(b"\0") if arg]
+            wrapper = any(Path(arg).name == "code_intel_index.sh" for arg in argv)
+            native = "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv)
+            if not (wrapper or native):
+                continue
+            cwd = process.joinpath("cwd").resolve(strict=True)
+            recognized = index_writer_targets_main(argv, cwd, main)
+            if process.joinpath("stat").read_text(errors="surrogateescape").rsplit(")", 1)[1].split()[19] != started:
+                raise ValueError(f"index writer PID {process.name} changed during observation")
+            if recognized:
+                writers.append(int(process.name))
+        except FileNotFoundError:
+            if process.exists():
+                raise ValueError(f"cannot prove index writer identity for PID {process.name}") from None
+            continue  # process disappeared during observation
+        except (OSError, RuntimeError, IndexError) as error:
+            raise ValueError(f"cannot prove index writer identity for PID {process.name}") from error
+    return writers
+
+
 def require_no_batch() -> None:
+    writers = observed_index_writers()
+    if writers:
+        raise ValueError(f"uninstall refuses observed index writers: {writers}")
     result = subprocess.run(
         [
             "/usr/bin/systemctl",
@@ -179,43 +222,86 @@ def require_no_batch() -> None:
         require_quiescent(unit)
 
 
-def retire_managed() -> None:
+def inspect_sources(config=None, *, removed=False):
+    runtime = absolute(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    sources = canonical_sources(SCRIPT, (units_dir(), runtime / "systemd/user"),
+                                (BACKEND, SLICE), config)
+    for unit, (snapshot, _) in sources[1].items():
+        if snapshot is None:
+            if config:
+                raise ValueError(f"enable requires canonical installed {unit}")
+            if removed:
+                require_quiescent(unit)  # own deletion leaves a cached inactive object
+            elif unit == SLICE and not manager_absent(unit) and implicit_slice_absent(unit):
+                require_quiescent(unit)  # native implicit slice must still be empty/inactive
+            elif not manager_absent(unit):
+                raise ValueError(f"missing source is not native absence: {unit}")
+        elif config and snapshot[0].parent != units_dir().resolve():
+            raise ValueError("enable requires persistent installed unit sources")
+    return sources
+
+
+def refresh_sources(sources, config=None, *, removed=False) -> None:
+    if inspect_sources(config, removed=removed) != sources:
+        raise ValueError("managed unit sources changed before refresh")
+    if not removed and all(snapshot is None for snapshot, _ in sources[1].values()):
+        return  # strict native absence needs no global manager mutation
+    subprocess.run(["/usr/bin/systemctl", "--user", "daemon-reload"], check=True, timeout=30)
+    if inspect_sources(config) != sources:
+        raise ValueError("managed unit sources changed during refresh")
+    for unit, (snapshot, parameters) in sources[1].items():
+        if snapshot:
+            validate_source_identity(unit, snapshot)
+            if unit == BACKEND:
+                validate_backend({}, BACKEND, absolute, parameters)
+
+
+def retire_managed():
     errors = []
+    try:
+        sources = inspect_sources()
+        refresh_sources(sources)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        errors.append(("authority", str(error)))
+        sources = None
     for argv in (
         ("disable", BACKEND),
         ("disable", "--runtime", BACKEND),
         ("stop", BACKEND),
         ("stop", SLICE),
     ):
+        if sources is None or sources[1][argv[-1]][0] is None:
+            continue  # unknown authority is a refusal, not a permissive emergency stop
         try:
-            result = subprocess.run(
-                ["/usr/bin/systemctl", "--user", *argv],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            if result.returncode and not manager_absent(argv[-1]):
-                errors.append((argv[0], result.stderr.strip()))
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            if inspect_sources() != sources:
+                raise ValueError("managed unit sources changed before retirement command")
+            if argv[0] == "disable":
+                native_install("disable", BACKEND, runtime="--runtime" in argv)
+            else:
+                subprocess.run(["/usr/bin/systemctl", "--user", *argv], capture_output=True,
+                               text=True, check=True, timeout=60)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             errors.append(("command", f"{argv[0]}: {error}"))
     for unit in (BACKEND, SLICE):
         try:
             require_quiescent(unit)
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             errors.append(("proof", f"{unit}: {error}"))
+    if sources is not None and not any(action == "proof" for action, _ in errors):
+        try:
+            refresh_sources(sources)  # native installation state may still be cached
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            errors.append(("refresh", str(error)))
     try:
         state = show(BACKEND, "UnitFileState", "LoadState")
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         errors.append(("proof", str(error)))
-        state = {"UnitFileState": ""}
-    if state["UnitFileState"] in ("enabled", "enabled-runtime"):
-        errors.append(("proof", "query service retains native enablement"))
-    if errors and (
-        any(action != "disable" for action, _ in errors)
-        or state["UnitFileState"]
-        not in ("", "generated", "transient", "static", "disabled", "masked")
-    ):
-        raise ValueError(f"managed retirement failed: {errors}")
+        state = {"UnitFileState": "", "LoadState": ""}
+    safe = state == {"UnitFileState": "disabled", "LoadState": "loaded"}
+    absent = state == {"UnitFileState": "", "LoadState": "not-found"}
+    if errors or not (safe or absent):
+        raise ValueError(f"managed retirement failed: errors={errors}, state={state}")
+    return sources
 
 
 def runtime_config(path: Path) -> dict:
@@ -226,27 +312,47 @@ def runtime_config(path: Path) -> dict:
     return config
 
 
-def enable(config: dict) -> None:
+def validate_loaded_backend(config: dict) -> None:
+    validate_backend(config, BACKEND, absolute)
+
+
+def runtime_preflight(config: dict) -> None:
     verify_cache(config)
     with verified_binary(Path(config["binary"])):
         pass  # fail before changing native state when the accepted inode is invalid
     if sentinel_armed(config["sentinel"]):
         raise ValueError("managed Codebase sentinel is armed")
+
+
+def enable_preflight(config: dict) -> None:
+    runtime_preflight(config)
     properties = show(SLICE, "LoadState", "MemoryMax", "MemorySwapMax", "TasksMax")
     if properties != dict(
         LoadState="loaded", MemoryMax=str(2 * 1024**3), MemorySwapMax="0", TasksMax="512"
     ):
         raise ValueError("loaded managed client slice lacks required limits")
+    validate_loaded_backend(config)
+
+
+def enable(config: dict) -> None:
+    runtime_preflight(config)
+    require_quiescent(BACKEND)
+    sources = inspect_sources(config)
     try:
-        subprocess.run(
-            ["/usr/bin/systemctl", "--user", "enable", "--now", BACKEND],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=150,
-        )
+        refresh_sources(sources, config)
+        enable_preflight(config)
+        native_install("enable", BACKEND)
+        installed = Path.home() / ".genesis/config/codebase-managed.json"
+        if runtime_config(installed) != config:
+            raise ValueError("managed settings changed during enablement")
+        runtime_preflight(config)
+        require_quiescent(BACKEND)
+        refresh_sources(sources, config)
+        enable_preflight(config)
+        subprocess.run(["/usr/bin/systemctl", "--user", "start", BACKEND],
+                       capture_output=True, text=True, check=True, timeout=150)
         ready(config)
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as startup:
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as startup:
         rollback = "complete"
         try:
             retire_managed()
@@ -255,19 +361,56 @@ def enable(config: dict) -> None:
         raise ValueError(f"native enable failed: {startup}; rollback: {rollback}") from startup
 
 
-def remove_unit_artifacts() -> None:
+def remove_unit_artifacts(retired=None) -> None:
+    if retired is None:
+        retired = retire_managed()
     runtime = absolute(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    candidates = []
+    parents = []
     for root in (units_dir(), runtime / "systemd/user"):
-        for unit in (BACKEND, SLICE):
-            for path in (root / unit, root / "default.target.wants" / unit):
-                try:
-                    mode = path.lstat().st_mode
-                except FileNotFoundError:
-                    continue
-                if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
-                    raise ValueError(f"refusing non-file managed unit artifact: {path}")
-                path.unlink()
-    subprocess.run(["/usr/bin/systemctl", "--user", "daemon-reload"], check=True, timeout=30)
+        for parent in (root, root / "default.target.wants"):
+            resolved = artifact_parent(parent)
+            parents.append((parent, resolved, parent_identity(resolved)))
+            candidates.extend(resolved / unit for unit in (BACKEND, SLICE))
+    snapshots = [(path, artifact_snapshot(path)) for path in candidates]
+    if any(artifact_parent(parent) != resolved or parent_identity(resolved) != identity
+           for parent, resolved, identity in parents):
+        raise ValueError("managed unit parent changed during removal")
+    for path, snapshot in snapshots:
+        current = artifact_snapshot(path)
+        if current is not None and current != snapshot:
+            raise ValueError(f"managed unit artifact changed during removal: {path}")
+    deleted = False
+    failure = None
+    try:
+        for path, snapshot in snapshots:
+            if any(artifact_parent(parent) != resolved or parent_identity(resolved) != identity
+                   for parent, resolved, identity in parents):
+                raise ValueError("managed unit parent changed during removal")
+            current = artifact_snapshot(path)
+            if current is None:
+                continue
+            if current != snapshot:
+                raise ValueError(f"managed unit artifact changed during removal: {path}")
+            path.unlink()
+            deleted = True
+    except (OSError, ValueError, RuntimeError) as error:
+        failure = error
+    # Native manager state must be refreshed even after a partial unlink failure.
+    if deleted or failure is None:
+        try:
+            for unit in (BACKEND, SLICE):
+                require_quiescent(unit)
+            remaining = inspect_sources(removed=True)
+            # Only this invocation's intentionally removed sources may disappear.
+            for unit, (snapshot, _) in remaining[1].items():
+                if snapshot is not None and remaining[1][unit] != retired[1][unit]:
+                    raise ValueError("remaining managed source changed during removal")
+            refresh_sources(remaining, removed=True)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            raise ValueError(f"managed artifact removal: {failure}; reload failed: {error}") from error
+    if failure is not None:
+        raise ValueError(f"managed artifact removal failed (partial={deleted}): {failure}") from failure
 
 
 def lifecycle_main(args: argparse.Namespace) -> int:
@@ -279,9 +422,9 @@ def lifecycle_main(args: argparse.Namespace) -> int:
                     raise ValueError("enable requires the installed settings path")
                 enable(runtime_config(path))
             else:
-                retire_managed()
+                retired = retire_managed()
                 if args.command == "remove":
-                    remove_unit_artifacts()
+                    remove_unit_artifacts(retired)
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
         print(f"managed lifecycle refused: {error}", file=sys.stderr)
@@ -298,8 +441,13 @@ def report_retained_state() -> None:
     if config:
         roots = [Path.home() / name for name in ("genesis", ".genesis", "data", ".qdrant")]
         for key in ("binary", "cache", "runtime"):
-            path = absolute(config[key]).resolve()
-            if not any(path.is_relative_to(root.resolve()) for root in roots):
+            try:
+                path = absolute(config[key]).resolve()
+                inside = any(path.is_relative_to(root.resolve()) for root in roots)
+            except (OSError, RuntimeError) as error:
+                print(f"Preserved configured {key}; path classification failed: {error}", flush=True)
+                continue
+            if not inside:
                 print(f"Preserved configured {key}: {path}", flush=True)
 
 
@@ -380,26 +528,6 @@ def verified_binary(path: Path):
         stream.close()
         raise
     return stream
-
-
-def sentinel_armed(raw: str) -> bool:
-    try:
-        os.lstat(raw)
-    except FileNotFoundError:
-        return any(os.path.lexists(p) and not os.path.exists(p) for p in Path(raw).parents)
-    except OSError:
-        return True
-    return True
-
-
-def native_env(config: dict) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CBM_")}
-    env.update(
-        CBM_CACHE_DIR=config["cache"],
-        CBM_RUNTIME_DIR=config["runtime"],
-        CBM_ALLOWED_ROOT=config["main"],
-    )
-    return env
 
 
 def verify_cache(config: dict) -> None:
@@ -593,7 +721,7 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
     return result
 
 
-def show(unit: str, *properties: str) -> dict[str, str]:
+def show(unit: str, *properties: str, timeout: float = 30) -> dict[str, str]:
     output = subprocess.check_output(
         [
             "/usr/bin/systemctl",
@@ -603,7 +731,7 @@ def show(unit: str, *properties: str) -> dict[str, str]:
             *(arg for name in properties for arg in ("-p", name)),
         ],
         text=True,
-        timeout=30,
+        timeout=timeout,
         stderr=subprocess.PIPE,
     )
     value = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
@@ -612,15 +740,31 @@ def show(unit: str, *properties: str) -> dict[str, str]:
     return value
 
 
-def require_enabled(config: dict) -> None:
-    if show(BACKEND, "UnitFileState")["UnitFileState"] != "enabled":
+def require_enabled(config: dict, *, timeout: float = 30) -> None:
+    if show(BACKEND, "UnitFileState", timeout=timeout)["UnitFileState"] != "enabled":
         raise ValueError("managed query service must be persistently enabled")
     if sentinel_armed(config["sentinel"]):
         raise ValueError("managed Codebase sentinel is armed")
 
 
-def verify_memory_ancestors(leaf: Path, root: Path) -> None:
-    """Every visible finite ancestor must admit the full query aggregate."""
+def verify_query_boundary(pid: str, *, startup: bool = False) -> None:
+    leaf, root, version = resolve_cgroup(
+        Path(f"/proc/{pid}/cgroup"), Path(f"/proc/{pid}/mountinfo")
+    )
+    if version != 2 or leaf == root or leaf.name != BACKEND:
+        raise ValueError("managed daemon is outside its cgroup v2 service")
+    if (leaf / "memory.max").read_text().strip() != str(2 * 1024**3) or (
+        leaf / "memory.swap.max"
+    ).read_text().strip() != "0":
+        raise ValueError("managed daemon lacks exact memory/zero-swap cap")
+    cpu = (leaf / "cpu.max").read_text().split()
+    if len(cpu) != 2:
+        raise ValueError("managed daemon lacks an enforced CPU ceiling")
+    quota, period = (number(value, "cpu.max") for value in cpu)
+    if quota == 0 or period == 0 or quota > 2 * period:
+        raise ValueError("managed daemon exceeds the two-core CPU ceiling")
+    if number((leaf / "pids.max").read_text().strip(), "pids.max") > 128:
+        raise ValueError("managed daemon exceeds the 128-task ceiling")
     cursor = leaf.parent
     while cursor == root or root in cursor.parents:
         try:
@@ -631,38 +775,25 @@ def verify_memory_ancestors(leaf: Path, root: Path) -> None:
             limit = "max"  # true cgroup filesystem root has no memory.max
         if limit != "max" and number(limit, "ancestor memory.max") < 2 * 1024**3:
             raise ValueError("ancestor cap is smaller than managed query budget")
+        if startup and limit != "max":
+            charge = _working_charge(
+                read_number(cursor / "memory.current"), cursor / "memory.stat", 2 * 1024**3, 2
+            )
+            # Admission includes this small staging process; do not subtract
+            # raw leaf usage from a cache-discounted ancestor charge. This is
+            # a startup snapshot, not a reservation or recurring RPC gate.
+            if number(limit, "ancestor memory.max") - charge < 2 * 1024**3:
+                raise ValueError("insufficient ancestor headroom for managed query budget")
         if cursor == root:
             break
         cursor = cursor.parent
-
-
-def verify_query_boundary(pid: str) -> None:
-    leaf, root, version = resolve_cgroup(
-        Path(f"/proc/{pid}/cgroup"), Path(f"/proc/{pid}/mountinfo")
-    )
-    if version != 2 or leaf == root or leaf.name != BACKEND:
-        raise ValueError("managed daemon is outside its cgroup v2 service")
-    if (leaf / "memory.max").read_text().strip() != str(2 * 1024**3) or (
-        leaf / "memory.swap.max"
-    ).read_text().strip() != "0":
-        raise ValueError("managed daemon lacks exact memory/zero-swap cap")
-    verify_memory_ancestors(leaf, root)
+    if startup and _host_available(Path("/proc/meminfo")) < 2 * 1024**3:
+        raise ValueError("insufficient host available memory for managed query budget")
 
 
 def verify_frontend_boundary(unit: str) -> None:
-    if not re.fullmatch(r"genesis-cbm-query-client-[0-9a-f]{32}\.service", unit):
-        raise ValueError("invalid managed frontend unit")
     leaf, root, version = resolve_cgroup(Path("/proc/self/cgroup"), Path("/proc/self/mountinfo"))
-    if version != 2 or leaf == root or leaf.name != unit or leaf.parent.name != SLICE:
-        raise ValueError("managed frontend is outside its capped client slice")
-    for node, memory, tasks in ((leaf, 256 * 1024**2, 32), (leaf.parent, 2 * 1024**3, 512)):
-        if (
-            (node / "memory.max").read_text().strip() != str(memory)
-            or (node / "memory.swap.max").read_text().strip() != "0"
-            or (node / "pids.max").read_text().strip() != str(tasks)
-        ):
-            raise ValueError("managed frontend lacks exact memory/swap/task caps")
-    verify_memory_ancestors(leaf, root)
+    validate_frontend_boundary(unit, leaf, root, version, SLICE)
 
 
 def launch(config: dict, path: Path) -> None:
@@ -673,23 +804,8 @@ def launch(config: dict, path: Path) -> None:
     if not (main / ".git").is_dir():
         raise ValueError("managed frontend requires the configured primary checkout")
     unit = "genesis-cbm-query-client-" + uuid.uuid4().hex + ".service"
-    command = [
-        "/usr/bin/systemd-run", "--user", "--pipe", "--quiet", "--collect", "--wait",
-        # systemd-run v255: preserve literal dollar/percent path arguments.
-        "--expand-environment=no", "--unit=" + unit, "--slice=" + SLICE,
-        "--setenv=HOME=" + str(Path.home()), "--working-directory=/",
-    ]
-    for property_value in (
-        "Requisite=" + BACKEND, "After=" + BACKEND, "StopPropagatedFrom=" + BACKEND,
-        "KillMode=control-group", "MemoryMax=256M", "MemorySwapMax=0",
-        "TasksMax=32", "OOMScoreAdjust=500",
-    ):
-        command.extend(("-p", property_value))
-    command.extend((
-        "--", "/usr/bin/python3", "-I", str(main / "scripts/codebase_managed.py"),
-        "--config", str(path), "client", "--unit", unit,
-    ))
-    os.execv(command[0], command)  # noqa: S606 - fixed systemd executable, no shell
+    command = frontend_command(main, path, unit, BACKEND, SLICE)
+    os.execv(command[0], command)  # noqa: S606 - fixed systemd executable
 
 
 def client(path: Path, unit: str) -> None:
@@ -712,8 +828,8 @@ def client(path: Path, unit: str) -> None:
             )
 
 
-def check_backend(config: dict, *, starting: bool = False) -> str:
-    value = show(BACKEND, "ActiveState", "MainPID")
+def check_backend(config: dict, *, starting: bool = False, timeout: float = 30) -> str:
+    value = show(BACKEND, "ActiveState", "MainPID", timeout=timeout)
     if value["ActiveState"] not in (("active", "activating") if starting else ("active",)):
         raise ValueError("managed native daemon is unavailable")
     pid = value["MainPID"]
@@ -724,13 +840,24 @@ def check_backend(config: dict, *, starting: bool = False) -> str:
 
 
 def ready(config: dict) -> None:
+    deadline = time.monotonic() + 120
+    native_deadline = None
     require_enabled(config)
-    deadline = time.monotonic() + 60
+
+    def manager_timeout() -> float:
+        remaining = (native_deadline or deadline) - time.monotonic()
+        if remaining <= 0:
+            raise ValueError("managed native daemon readiness deadline expired")
+        return min(30, remaining)
+
     with verified_binary(Path(config["binary"])) as executable:
-        while time.monotonic() < deadline:
+        while time.monotonic() < (native_deadline or deadline):
             try:
-                pid = check_backend(config, starting=True)
-                remaining = deadline - time.monotonic()
+                pid = check_backend(config, starting=True, timeout=manager_timeout())
+                now = time.monotonic()
+                if native_deadline is None:
+                    native_deadline = min(deadline, now + 60)
+                remaining = native_deadline - now
                 if remaining <= 0:
                     break
                 response = subprocess.run(
@@ -746,10 +873,11 @@ def ready(config: dict) -> None:
                     and "daemon: active (permanent)" in response.stdout
                     and re.search(r"^  pid: " + re.escape(pid) + r"$", response.stdout, re.M)
                     and "state: stopping" not in response.stdout
-                    and check_backend(config, starting=True) == pid
+                    and check_backend(config, starting=True, timeout=manager_timeout()) == pid
                 ):
-                    require_enabled(config)
-                    return
+                    require_enabled(config, timeout=manager_timeout())
+                    if time.monotonic() < native_deadline:
+                        return
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 pass  # bounded startup polling; deadline is a terminal refusal
             time.sleep(0.1)
@@ -776,6 +904,7 @@ def serve(config: dict) -> None:
         )
         require_enabled(config)
         verify_cache(config)
+        verify_query_boundary("self", startup=True)
         os.set_inheritable(executable.fileno(), True)
         os.execve(  # noqa: S606 - accepted inode and fixed stock daemon argv
             f"/proc/self/fd/{executable.fileno()}",
@@ -806,31 +935,18 @@ def available(path: Path, repo: str) -> None:
 
 
 def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=None)
-    commands = parser.add_subparsers(dest="command", required=True)
-    setup = commands.add_parser("configure")
-    for key in ("main", "binary", "state", "sentinel"):
-        setup.add_argument("--" + key, required=True)
-    commands.add_parser("status")
-    commands.add_parser("serve")
-    commands.add_parser("ready")
-    commands.add_parser("launch")
-    frontend = commands.add_parser("client")
-    frontend.add_argument("--unit", required=True)
-    availability = commands.add_parser("available")
-    availability.add_argument("--repo", required=True)
-    for command in ("enable", "disable", "remove"):
-        commands.add_parser(command)
-    teardown = commands.add_parser("uninstall")
-    teardown.add_argument("arguments", nargs=argparse.REMAINDER)
-    verification = commands.add_parser("verify-uninstall-locks")
-    verification.add_argument("fds", type=int, nargs=3)
-    return parser.parse_args(argv)
+    return native_parse_arguments(argv, __doc__)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_arguments(argv)
+    try:
+        home = os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
+        absolute(home)
+        os.environ["HOME"] = home
+    except (KeyError, OSError, ValueError, RuntimeError) as error:
+        print(f"managed Codebase refused: invalid HOME: {error}", file=sys.stderr)
+        return 1
     if args.command in ("uninstall", "verify-uninstall-locks"):
         return uninstall_main(args)
     if args.command in ("enable", "disable", "remove"):

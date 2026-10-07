@@ -1126,18 +1126,21 @@ jobs:
         # seven additional browser skips absent on current main; counts alone
         # did not establish a two-slot allowance. Keep main's ceiling unchanged.
         # Floor: 24421 + 76 + 3 = 24500.
-        # Native CBM runtime/templates: new runtime file 24 and template file 26
+        # Native CBM runtime/templates: new runtime file 52 and template file 26
         # cases, plus template-placeholders 13 -> 14 (+1 hosted slice inventory).
-        # Other edited files retain counts. Floor: 24500 + 51 = 24551;
+        # Unit-root guard adds 5 controls for the backend's neutral cwd exception.
+        # Other edited files retain counts. Floor: 24500 + 84 = 24584;
         # no new skip sites.
-        # Guarded CBM removal: new uninstall file32 cases; other edited test
-        # files retain collection counts. Floor24551+32=24583; no added skips.
-        # Native CBM lifecycle: new lifecycle file31 cases; no added skips.
-        # Floor24583+31=24614; predecessor skip identity gate still applies.
-        # Managed frontend: actual predecessor launcher39 -> branch35 (-4),
-        # plus28 new frontend cases = net24; floor24614+24=24638.
-        # Replaces legacy fallback/scope smoke premises; no new skip sites.
-        # Managed queued worker:11 physical authorization cases,8 availability
-        # cases, existing flock test1->3 (+2); no added skip sites.
-        # Floor24638+21=24659; reconcile against main again before landing.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24659
+        # Guarded CBM removal: new uninstall file90 cases; other edited test
+        # files retain collection counts. Floor24584+90=24674; no added skips.
+        # Native CBM lifecycle: lifecycle file152 and authority file295 cases;
+        # uninstall90 ->94 (+4 unsupported-fragment preservation controls).
+        # Parent24674 +152 +295 +4 =25125 (post-integration collection).
+        # Skip ceiling remains102; compare identities against the actual parent.
+        # Managed frontend: actual parent launcher39 ->50 (+11), plus74 new
+        # frontend cases. Measured after final edits: net85; 25125+85=25210.
+        # No added skip sites; actual hosted-base identity reconciliation owed.
+        # Managed queued worker: parent262 existing cases -> current312 (+50):
+        # 11 authorization,8 availability,26 roles,flock +2,spawn fence +2,OOM +1.
+        # Floor25210+50=25260; hosted skip identities still require reconciliation.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25260
