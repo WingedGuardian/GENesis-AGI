@@ -13,6 +13,74 @@ from . import scrub
 from .query import run_query
 
 
+def _target_available(records, line, expected_id):
+    target = next((record for record in records if record["line"] == line), None)
+    if target is None or not target["text"]:
+        return False
+    if expected_id is None:
+        return True
+    token = json.dumps(expected_id, ensure_ascii=True)
+    return any(f'"{key}": {token}' in target["text"] for key in ("id", "tool_use_id"))
+
+
+def _matching_record(raw, expected_id):
+    try:
+        record = json.loads(raw)
+        blocks = record.get("message", {}).get("content", [])
+        block = (
+            next(
+                (
+                    b
+                    for b in blocks
+                    if isinstance(b, dict)
+                    and b.get("type") in ("tool_use", "tool_result")
+                    and b.get("id" if b["type"] == "tool_use" else "tool_use_id") == expected_id
+                ),
+                None,
+            )
+            if isinstance(blocks, list)
+            else None
+        )
+        if block is None:
+            return raw, False
+        key = "id" if block["type"] == "tool_use" else "tool_use_id"
+        block = {
+            "type": block["type"],
+            key: expected_id,
+            **{k: v for k, v in block.items() if k not in ("type", key)},
+        }
+        return (
+            json.dumps({"message": {"content": [block]}}, ensure_ascii=True) + "\n"
+        ).encode(), True
+    except (ValueError, AttributeError):
+        return raw, False
+
+
+def _scrub_record(raw):
+    """Retain original JSON only when its bytes are valid UTF-8 JSON."""
+    try:
+        decoded, duplicates = scrub.load_json(raw)
+    except (ValueError, UnicodeError):
+        try:
+            plain = raw.decode("utf-8")
+        except UnicodeError:
+            return None, True
+        if "\x00" in plain or plain.removeprefix("\ufeff").lstrip().startswith(("{", "[")):
+            return None, True
+        return scrub.scrub_text(plain)
+    text, failed = scrub.scrub_json(decoded, preserve_identity=True)
+    if not failed and not duplicates and json.loads(text) == decoded:
+        try:
+            original = raw.decode("utf-8")
+            # BOM-less UTF-16/32 ASCII can decode as UTF-8 but contains NULs.
+            json.loads(original.removeprefix("\ufeff"))
+        except (ValueError, UnicodeError):
+            pass  # The validated scrubbed JSON is already safe UTF-8 text.
+        else:
+            text = original
+    return text, failed
+
+
 def _window(stream, line, surrounding, budget, expected_id=None):
     records = []
     identity_matches = expected_id is None
@@ -22,18 +90,8 @@ def _window(stream, line, surrounding, budget, expected_id=None):
         if number > line + surrounding:
             break
         if number == line and expected_id is not None:
-            try:
-                record = json.loads(raw)
-                blocks = record.get("message", {}).get("content", [])
-                identity_matches = isinstance(blocks, list) and any(
-                    isinstance(b, dict)
-                    and b.get("type") in ("tool_use", "tool_result")
-                    and (b.get("id") == expected_id or b.get("tool_use_id") == expected_id)
-                    for b in blocks
-                )
-            except (ValueError, AttributeError):
-                identity_matches = False
-        text, failed = scrub.scrub_text(raw.decode("utf-8", "replace"))
+            raw, identity_matches = _matching_record(raw, expected_id)
+        text, failed = _scrub_record(raw)
         if failed:
             text = "[scrub failed: evidence withheld]"
         encoded = (text or "").encode()
@@ -66,7 +124,7 @@ def _window(stream, line, surrounding, budget, expected_id=None):
     return {
         "records": selected,
         "truncated": truncated,
-        "target_available": any(r["line"] == line for r in selected),
+        "target_available": _target_available(selected, line, expected_id),
     }
 
 
@@ -207,6 +265,9 @@ def _fit_output(out, budget):
 def evidence(data, projects, tool_use_id, *, surrounding=5, budget=65536):
     if surrounding < 0 or budget < 1024:
         raise ValueError("evidence requires nonnegative context and at least 1024 bytes")
+    from .identity import decode_identity
+
+    raw_id = decode_identity(tool_use_id)
     _, rows = run_query(
         data,
         "SELECT source_file,line_no_call,result_source_file,line_no_result "
@@ -230,7 +291,7 @@ def evidence(data, projects, tool_use_id, *, surrounding=5, budget=65536):
                 line,
                 surrounding=surrounding,
                 budget=budget // 3,
-                expected_id=tool_use_id,
+                expected_id=raw_id,
             ),
         }
         out["references"].append(ref)
@@ -238,5 +299,5 @@ def evidence(data, projects, tool_use_id, *, surrounding=5, budget=65536):
     out = _fit_output(out, budget)
     for ref in out.get("references", []):
         if "records" in ref:
-            ref["target_available"] = any(r["line"] == ref["line"] for r in ref["records"])
+            ref["target_available"] = _target_available(ref["records"], ref["line"], raw_id)
     return out

@@ -4,6 +4,7 @@ Description=Collect Claude Code transcript analytics (opt-in)
 [Service]
 Type=oneshot
 WorkingDirectory=__REPO_DIR__
+# Runtime kill switch comes from systemctl --user set-environment, not shell exports.
 ExecStart=__VENV__/bin/python -m genesis transcripts ingest --timer
 SuccessExitStatus=75
 UMask=0077

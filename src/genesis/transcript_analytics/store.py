@@ -4,7 +4,8 @@ Layout (flat, so a single-level backup lister can copy it):
     <data>/<table>__<srckey>.parquet      one file per table per source
     <data>/.staging/                      same filesystem; never matched by the table globs
 
-No state file. A source needs rebuilding when any of its table files is
+No source index; projects-root.json binds the origin. A source needs
+rebuilding when any of its table files is
 missing, or when the ``fragments`` file's stored fingerprint, schema version
 or scrubber version differs from now. ``fragments`` is renamed into place LAST,
 so it is the commit marker: a crash part-way through publishing leaves it stale
@@ -18,11 +19,13 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import sys
 import time
 import uuid
 from datetime import UTC, date, datetime
+from numbers import Real
 from pathlib import Path
 
 import pyarrow as pa
@@ -30,14 +33,24 @@ import pyarrow.parquet as pq
 
 from genesis.env import genesis_home
 from genesis.transcript_analytics import scrub
-from genesis.transcript_analytics.extract import TABLES, extract_source
+from genesis.transcript_analytics.extract import TABLES, extract_source, utc_timestamp
+from genesis.transcript_analytics.identity import source_identity
+from genesis.transcript_analytics.identity import source_path as source_path
+from genesis.transcript_analytics.locks import publication
 from genesis.transcript_analytics.schema import SCHEMA_VERSION, SCHEMAS
 
 MARKER = "fragments"
 EXTRACTION_VERSION = hashlib.sha256(
     b"".join(
         Path(__file__).with_name(name).read_bytes()
-        for name in ("extract.py", "classify.py", "schema.py")
+        for name in (
+            "extract.py",
+            "classify.py",
+            "schema.py",
+            "scrub.py",
+            "identity.py",
+            "store.py",
+        )
     )
 ).hexdigest()
 _PUBLISH_ORDER = [t for t in TABLES if t != MARKER] + [MARKER]
@@ -149,28 +162,7 @@ def is_current(data: Path, key: str, fp: dict) -> bool:
     return reason is None and md.get(b"ta.fp") == json.dumps(fp).encode()
 
 
-def _utc_timestamp(value):
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
-    except (ValueError, TypeError, AttributeError):
-        return None
-
-
-def _row_timestamps(row):
-    values = [row[key] for key in ("ts", "ts_call", "ts_result") if key in row]
-    present = [value for value in values if value is not None]
-    # A timestamp-bearing row without any timestamp cannot establish retention.
-    return [_utc_timestamp(value) for value in present] if present else ([None] if values else [])
-
-
-def _last_ts(tables: dict[str, list[dict]]) -> str | None:
-    timestamps = [
-        timestamp for rows in tables.values() for row in rows for timestamp in _row_timestamps(row)
-    ]
-    if not timestamps or None in timestamps:
-        return None  # Unknown chronology must never authorize deletion.
-    return max(timestamps).isoformat()
+_utc_timestamp = utc_timestamp
 
 
 def _projects_root(data, projects, *, adopt=False):
@@ -194,43 +186,76 @@ def _projects_root(data, projects, *, adopt=False):
         os.replace(temporary, path)
 
 
-def source_identity(relative: str) -> str:
-    """UTF-8 transport of filesystem identities, reversible even for byte paths."""
-    if relative.startswith("fsbytes:") or any(0xD800 <= ord(c) <= 0xDFFF for c in relative):
-        return "fsbytes:" + os.fsencode(relative).hex()
-    return relative
+def _to_table(rows: list[dict], table: str, meta: dict) -> pa.Table:
+    # The extractor returns normalized rows; repeating identity transport would
+    # escape the reserved prefixes twice and break raw evidence addressing.
+    return pa.Table.from_pylist(rows, schema=SCHEMAS[table]).replace_schema_metadata(meta)
 
 
-def source_path(identity: str) -> str:
-    return os.fsdecode(bytes.fromhex(identity[8:])) if identity.startswith("fsbytes:") else identity
+def _rename_candidates(data, projects):
+    """Index absent paths once per ingest, never once per discovered source."""
+    if projects is None:
+        return {}
+    paths = {}
+    for table in _PUBLISH_ORDER[::-1]:
+        for path in data.glob(f"{table}__*.parquet"):
+            paths.setdefault(path.stem.split("__", 1)[1], path)
+    candidates = {}
+    for key, path in paths.items():
+        try:
+            md = pq.read_metadata(path).metadata or {}
+            previous = json.loads(md[b"ta.fp"])
+            old_rel = os.fsdecode(md[b"ta.source"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if (
+            not isinstance(previous, dict)
+            or key != srckey(old_rel)
+            or (projects / old_rel).exists()
+            or not md.get(b"ta.content_sha256")
+        ):
+            continue
+        identity = tuple(previous.get(k) for k in ("dev", "ino", "size", "mtime_ns"))
+        if any(type(v) is not int for v in identity):
+            continue
+        candidates.setdefault(identity, []).append((key, old_rel, md[b"ta.content_sha256"]))
+    return candidates
 
 
-def _sanitize(rows: list[dict]) -> list[dict]:
-    """Make text representable as UTF-8 while preserving filesystem identities."""
+def _rename_keys(candidates, data, rel, fp, content_digest):
+    """Absent old path + exact inode fingerprint + exact captured-byte digest.
+
+    Existing hardlinks are independent sources; legacy rows without a digest
+    and reused inodes with changed bytes are not rename proof and are retained.
+    """
+    identity = tuple(fp[k] for k in ("dev", "ino", "size", "mtime_ns"))
     return [
-        {
-            k: (
-                source_identity(v)
-                if k == "source_file"
-                else v.encode("utf-8", "replace").decode("utf-8")
-            )
-            if isinstance(v, str)
-            else v
-            for k, v in row.items()
-        }
-        for row in rows
+        key
+        for key, old_rel, digest in candidates.get(identity, [])
+        if old_rel != rel
+        and digest == content_digest.encode()
+        and any(_table_path(data, table, key).exists() for table in TABLES)
     ]
 
 
-def _to_table(rows: list[dict], table: str, meta: dict) -> pa.Table:
-    try:
-        tbl = pa.Table.from_pylist(_sanitize(rows), schema=SCHEMAS[table])
-    except (UnicodeEncodeError, pa.ArrowInvalid, pa.ArrowTypeError, OverflowError):
-        tbl = pa.Table.from_pylist(_sanitize(rows), schema=SCHEMAS[table])
-    return tbl.replace_schema_metadata(meta)
+def _invalidate_snapshot(data):
+    (data / "derived/current").unlink(missing_ok=True)
 
 
-def build_source(path: Path, rel: str, data: Path, st: os.stat_result) -> dict:
+def _retire_sources(data, keys):
+    # Marker first: a killed migration cannot leave two compatible identities.
+    for key in keys:
+        for table in _PUBLISH_ORDER[::-1]:
+            _table_path(data, table, key).unlink(missing_ok=True)
+
+
+def build_source(
+    path: Path,
+    rel: str,
+    data: Path,
+    st: os.stat_result,
+    rename_candidates: dict | None = None,
+) -> dict:
     """Extract one source and publish all of its tables, marker last."""
     fp = source_fingerprint(path, st)
     res = extract_source(path, rel, stop_at=st.st_size)
@@ -246,7 +271,10 @@ def build_source(path: Path, rel: str, data: Path, st: os.stat_result) -> dict:
         **semantics(),
         b"ta.generation": uuid.uuid4().hex.encode(),
         b"ta.ingested_at": datetime.now(UTC).isoformat().encode(),
-        b"ta.last_ts": (_last_ts(res.tables) or "").encode(),
+        b"ta.last_ts": (
+            res.last_timestamp if res.chronology_known and res.last_timestamp else ""
+        ).encode(),
+        b"ta.content_sha256": res.content_sha256.encode(),
         b"ta.stats": json.dumps(res.stats).encode(),
     }
     tmp_paths = {}
@@ -257,8 +285,23 @@ def build_source(path: Path, rel: str, data: Path, st: os.stat_result) -> dict:
             with open(tmp, "rb") as fh:
                 os.fsync(fh.fileno())
             tmp_paths[table] = tmp
-        for table in _PUBLISH_ORDER:  # marker last
-            os.replace(tmp_paths[table], _table_path(data, table, key))
+        retired = _rename_keys(
+            rename_candidates or {},
+            data,
+            rel,
+            fp,
+            res.content_sha256,
+        )
+        with publication(exclusive=True) if retired else contextlib.nullcontext():
+            if retired:
+                _invalidate_snapshot(data)
+                # Keep old table bodies until replacement commits. Marker
+                # removal excludes them during a crash; retry cleans leftovers.
+                for old_key in retired:
+                    _table_path(data, MARKER, old_key).unlink(missing_ok=True)
+            for table in _PUBLISH_ORDER:  # marker last
+                os.replace(tmp_paths[table], _table_path(data, table, key))
+            _retire_sources(data, retired)
     finally:
         for tmp in tmp_paths.values():
             if tmp.exists():
@@ -287,6 +330,13 @@ def ingest(
     lock_path: Path | None = None,
     adopt_projects_root: bool = False,
 ) -> dict:
+    if since_days is not None and (
+        isinstance(since_days, bool)
+        or not isinstance(since_days, Real)
+        or not math.isfinite(since_days)
+        or since_days <= 0
+    ):
+        raise ValueError("since_days must be a finite positive number")
     if not scrub.available():
         raise ScrubberUnavailable("secret scrubber could not be loaded; nothing written")
     data.mkdir(parents=True, exist_ok=True)
@@ -310,6 +360,7 @@ def ingest(
         _projects_root(data, projects, adopt=adopt_projects_root)
         _sweep_staging(data)
         sources = discover(projects)
+        rename_candidates = _rename_candidates(data, projects)
         for path, rel in sources:
             try:
                 st = os.stat(path)
@@ -321,10 +372,18 @@ def ingest(
                 continue
             summary["sources"] += 1
             try:
-                if is_current(data, srckey(rel), source_fingerprint(path, st)):
+                fp = source_fingerprint(path, st)
+                # A possible rename must be checked against newly captured
+                # bytes, even if a destination already has equal metadata.
+                # Cached destination digests cannot rule out same-metadata edits.
+                identity = tuple(fp[k] for k in ("dev", "ino", "size", "mtime_ns"))
+                possible_rename = any(
+                    old_rel != rel for _, old_rel, _ in rename_candidates.get(identity, [])
+                )
+                if not possible_rename and is_current(data, srckey(rel), fp):
                     summary["unchanged"] += 1
                     continue
-                stats = build_source(path, rel, data, st)
+                stats = build_source(path, rel, data, st, rename_candidates=rename_candidates)
             except FileNotFoundError:  # removed between stat and read
                 summary["vanished"] += 1
                 summary["sources"] -= 1
@@ -387,13 +446,11 @@ def prune(data: Path, *, before: str, projects: Path, lock_path: Path | None = N
     still exists is kept: the next ingest would only rebuild it.
 
     Refuses (ValueError) a malformed date, and a projects directory that is
-    missing or empty — a wrong path would make every source look gone."""
+    missing or differs from the bound root. An empty bound root is valid."""
     cutoff = datetime.combine(date.fromisoformat(before), datetime.min.time(), tzinfo=UTC)
     if not projects.is_dir():
         raise ValueError(f"projects directory missing: {projects}")
     removed = 0
-    from .locks import publication
-
     with _locked(lock_path or DEFAULT_LOCK), publication(exclusive=True):
         # Pruning is read-only with respect to root binding: never adopt implicitly.
         try:
@@ -410,7 +467,7 @@ def prune(data: Path, *, before: str, projects: Path, lock_path: Path | None = N
             if key is None:
                 continue
             if not invalidated:
-                (data / "derived/current").unlink(missing_ok=True)
+                _invalidate_snapshot(data)
                 invalidated = True
             for table in _PUBLISH_ORDER[::-1]:
                 _table_path(data, table, key).unlink(missing_ok=True)

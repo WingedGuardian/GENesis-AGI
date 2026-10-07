@@ -5,11 +5,12 @@ diagnose causes (that is a judgement for whoever reads the rows, with the full
 error text kept beside the class). Rules were derived from a full-corpus pass
 on 2026-10-04: 6,730 flagged errors, 11 left in ``other`` (plan §5, §14).
 
-Two regimes, because ``is_error`` is absent on ~31% of tool results and absent
+Three regimes, because ``is_error`` is absent on ~31% of tool results and absent
 does not mean success (plan §14):
 
 * flagged (``is_error`` is True): every rule applies; no match -> ``other``.
-* unflagged (``None``/``False``): only STRONG, start-anchored patterns that a
+* explicit success (``False``): never a failure.
+* unflagged (``None``): only STRONG, start-anchored patterns that a
   successful result does not produce, plus explicit denial kinds. A generic
   ``Error``/``Exit code``/``Traceback`` prefix is NOT enough here: a successful
   Read of a log file can start that way.
@@ -30,6 +31,7 @@ _FLAGGED_RULES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (name, re.compile(pattern, re.S))
     for name, pattern in (
         ("user_rejected", r"^The user doesn't want to proceed"),
+        ("agent_api_error", r"^Agent terminated early due to an API error:"),
         ("oversize_result", r"^Error: result \(.*?\) exceeds maximum allowed tokens"),
         ("tool_use_error", r"^<tool_use_error>"),
         ("validation", r"^\d+ validation errors? for "),
@@ -52,8 +54,8 @@ _FLAGGED_RULES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     )
 )
 
-# Subset that may classify a result whose is_error flag is absent or False.
-_STRONG = frozenset({"oversize_result", "tool_use_error", "mcp_error"})
+# Subset that may classify a result whose is_error flag is absent.
+_STRONG = frozenset({"oversize_result", "tool_use_error", "mcp_error", "agent_api_error"})
 _UNFLAGGED_RULES = tuple((n, rx) for n, rx in _FLAGGED_RULES if n in _STRONG)
 
 _HEAD = 400

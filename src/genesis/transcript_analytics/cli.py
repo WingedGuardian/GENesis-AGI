@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import resource
 import stat
@@ -37,8 +38,22 @@ def _disabled(args) -> bool:
     )
 
 
+def _positive_window(value):
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("--since must be a finite positive number") from exc
+    if isinstance(value, bool) or not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("--since must be a finite positive number")
+    return parsed
+
+
 def cmd_ingest(args) -> int:
     from genesis.transcript_analytics import scrub, store
+
+    args.since = _positive_window(args.since)
 
     if args.timer and _disabled(args):
         print("transcript-analytics: disabled by lever; nothing done")
@@ -93,12 +108,24 @@ def cmd_derive(args) -> int:
     return 0
 
 
+def _file_bytes(path, root):
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            return 0, 0, None
+        if path.relative_to(root).parts[0] == "derived":
+            return 0, info.st_size, None
+        return info.st_size, 0, None
+    except OSError as exc:
+        return 0, 0, str(exc)
+
+
 def _parquet_bytes(root):
     """Count regular Parquet files without traversing directory symlinks."""
-    total = 0
+    source, snapshot = 0, 0
     errors = []
     if root.is_symlink():
-        return total, ["data directory is a symlink"]
+        return source, snapshot, ["data directory is a symlink"]
     for directory, dirs, files in os.walk(
         root, followlinks=False, onerror=lambda e: errors.append(str(e))
     ):
@@ -107,13 +134,12 @@ def _parquet_bytes(root):
             if not name.endswith(".parquet"):
                 continue
             path = Path(directory) / name
-            try:
-                info = path.lstat()
-                if stat.S_ISREG(info.st_mode):
-                    total += info.st_size
-            except OSError as exc:
-                errors.append(str(exc))
-    return total, errors
+            source_bytes, snapshot_bytes, error = _file_bytes(path, root)
+            source += source_bytes
+            snapshot += snapshot_bytes
+            if error:
+                errors.append(error)
+    return source, snapshot, errors
 
 
 def _marker_totals(markers):
@@ -137,34 +163,37 @@ def _marker_totals(markers):
     return malformed, marker_errors
 
 
-def cmd_status(args) -> int:
+def _status(args):
     from genesis.transcript_analytics import query, store
 
     sources = store.discover(args.projects)
     stale = 0
+    source_errors = []
     for p, rel in sources:
         try:
             st = os.stat(p)
         except FileNotFoundError:  # removed since discovery (review N-6)
             continue
-        if not store.is_current(args.data, store.srckey(rel), store.source_fingerprint(p, st)):
+        try:
+            if not store.is_current(args.data, store.srckey(rel), store.source_fingerprint(p, st)):
+                stale += 1
+        except (OSError, ValueError) as exc:
             stale += 1
+            source_errors.append({"source": store.source_identity(rel), "reason": str(exc)})
     markers = list(args.data.glob(f"{store.MARKER}__*.parquet"))
     malformed, marker_errors = _marker_totals(markers)
-    size, size_errors = _parquet_bytes(args.data)
-    snapshot_size, snapshot_errors = (
-        (0, []) if args.data.is_symlink() else _parquet_bytes(args.data / "derived")
-    )
+    source_size, snapshot_size, size_errors = _parquet_bytes(args.data)
     out = {
         "data": str(args.data),
         "transcripts_now": len(sources),
         "stale_or_unbuilt": stale,
         "sources_stored": len(markers),
-        "store_mb": round(size / 2**20, 1),
-        "source_store_mb": round((size - snapshot_size) / 2**20, 1),
+        "store_mb": round((source_size + snapshot_size) / 2**20, 1),
+        "source_store_mb": round(source_size / 2**20, 1),
         "snapshot_store_mb": round(snapshot_size / 2**20, 1),
         "marker_errors": marker_errors,
-        "size_errors": size_errors + snapshot_errors,
+        "source_errors": source_errors,
+        "size_errors": size_errors,
         "malformed_lines": malformed,
         "disabled": (args.data / "DISABLED").exists(),
     }
@@ -174,6 +203,15 @@ def cmd_status(args) -> int:
     out["snapshot"] = query.snapshot_manifest(args.data)
     out["snapshot_current"] = query.derived_current(args.data)
     out["snapshot_compatible"] = query.snapshot_compatible(args.data)
+    return out
+
+
+def cmd_status(args) -> int:
+    from genesis.transcript_analytics import store
+    from genesis.transcript_analytics.locks import publication
+
+    with store._locked(store.DEFAULT_LOCK), publication():
+        out = _status(args)
     print(json.dumps(out, indent=2))
     return 0
 
@@ -238,7 +276,10 @@ def _configure(ap):
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("ingest")
     p.add_argument(
-        "--since", type=float, default=None, help="only sources modified in the last N days"
+        "--since",
+        type=_positive_window,
+        default=None,
+        help="only sources modified in the last N days",
     )
     p.add_argument("--timer", action="store_true", help="honour the disable lever")
     p.add_argument(

@@ -3,6 +3,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from genesis.transcript_analytics import cli, config
 
 
@@ -141,3 +143,67 @@ def test_status_does_not_descend_into_symlink_data_root(tmp_path, monkeypatch, c
     out = json.loads(capsys.readouterr().out)
     assert out["store_mb"] == out["source_store_mb"] == out["snapshot_store_mb"] == 0
     assert out["size_errors"] == ["data directory is a symlink"]
+
+
+def test_status_classifies_source_and_snapshot_bytes_in_one_walk(tmp_path, monkeypatch):
+    source = tmp_path / "fragments__x.parquet"
+    source.write_bytes(b"source")
+    (tmp_path / "derived" / "old").mkdir(parents=True)
+    (tmp_path / "derived" / "old" / "turns.parquet").write_bytes(b"snapshot")
+    walks = []
+    original = cli.os.walk
+
+    def once(*args, **kwargs):
+        walks.append(args)
+        yield from original(*args, **kwargs)
+
+    monkeypatch.setattr(cli.os, "walk", once)
+    assert cli._parquet_bytes(tmp_path) == (6, 8, [])
+    assert len(walks) == 1
+
+
+@pytest.mark.parametrize("window", ["0", "-1", "nan", "inf", "-inf"])
+def test_ingestion_window_parser_rejects_invalid_values(window):
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    cli._configure(parser)
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["ingest", "--since", window])
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("window", [0, -1, float("nan"), float("inf"), True])
+def test_direct_ingest_handler_rejects_window_before_store(window, tmp_path, monkeypatch):
+    import argparse
+
+    from genesis.transcript_analytics import store
+
+    calls = []
+    monkeypatch.setattr(store, "ingest", lambda *args, **kwargs: calls.append(args))
+    with pytest.raises(argparse.ArgumentTypeError):
+        cli.cmd_ingest(argparse.Namespace(since=window))
+    assert not calls
+
+
+def test_status_reports_unreadable_source_fingerprint(tmp_path, monkeypatch, capsys):
+    import argparse
+
+    from genesis.transcript_analytics import query, store
+
+    source = tmp_path / "session.jsonl"
+    source.write_text("{}\n")
+    monkeypatch.setattr(store, "discover", lambda *args: [(source, source.name)])
+
+    def unavailable(*args):
+        raise ValueError("agent metadata is a symlink")
+
+    monkeypatch.setattr(store, "source_fingerprint", unavailable)
+    monkeypatch.setattr(store, "compatible_sources", lambda *args: ([], []))
+    monkeypatch.setattr(query, "snapshot_manifest", lambda *args: {})
+    monkeypatch.setattr(query, "snapshot_compatible", lambda *args: False)
+    monkeypatch.setattr(query, "derived_current", lambda *args: False)
+    assert cli.cmd_status(argparse.Namespace(data=tmp_path, projects=tmp_path)) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["stale_or_unbuilt"] == 1
+    assert out["source_errors"][0]["source"] == source.name

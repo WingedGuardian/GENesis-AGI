@@ -184,10 +184,10 @@ def test_sf4_unexpected_failure_is_counted_and_others_still_build(env, monkeypat
     )
     real = store.build_source
 
-    def boom(path, rel, data_, st):
+    def boom(path, rel, data_, st, **kwargs):
         if rel.endswith("aaaa.jsonl"):
             raise RuntimeError("synthetic failure")
-        return real(path, rel, data_, st)
+        return real(path, rel, data_, st, **kwargs)
 
     monkeypatch.setattr(store, "build_source", boom)
     s = store.ingest(projects, data, lock_path=lock)

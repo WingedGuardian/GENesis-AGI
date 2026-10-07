@@ -53,8 +53,9 @@ def load(base_path: Path | None = None, *, ignore_kill: bool = False) -> Config:
         if key not in kwargs or (key == "ram_bytes" and kwargs[key] is None):
             continue
         value = kwargs[key]
-        if type(value) is not int or value <= 0:
-            raise ValueError(f"{key} must be a positive integer")
+        minimum = {"evidence_records": 0, "evidence_bytes": 1024, "ram_bytes": 1}[key]
+        if type(value) is not int or value < minimum:
+            raise ValueError(f"{key} must be an integer >= {minimum}")
     return Config(**kwargs)
 
 

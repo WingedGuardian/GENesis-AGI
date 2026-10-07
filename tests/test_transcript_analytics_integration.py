@@ -13,6 +13,8 @@ from genesis.transcript_analytics import config, resources
 def base(tmp_path, monkeypatch):
     from genesis import _config_overlay
 
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "genesis"))
+
     monkeypatch.setattr(_config_overlay, "_user_config_dir", lambda: tmp_path)
     monkeypatch.delenv("GENESIS_TRANSCRIPT_ANALYTICS_DISABLED", raising=False)
     monkeypatch.delenv(resources._CHILD, raising=False)
@@ -71,9 +73,9 @@ def admitted(monkeypatch):
         {},
     )
     monkeypatch.setattr(metrics, "take_snapshot", lambda *args: snap)
-    monkeypatch.setattr(resources.shutil, "which", lambda _: "/usr/bin/systemd-run")
-    run = Mock(return_value=Mock(returncode=0))
-    monkeypatch.setattr(resources.subprocess, "run", run)
+    run = Mock(return_value=Mock(wait=Mock(return_value=0)))
+    monkeypatch.setattr(resources.subprocess, "Popen", run)
+    monkeypatch.setattr(resources, "_await_ready", lambda *args: True)
     return run, snap, metrics
 
 
@@ -86,6 +88,7 @@ def test_scope_caps_command_and_exit(base, admitted):
     assert "MemorySwapMax=0" in args
     assert "CPUQuota=100.00%" in args
     assert "RuntimeMaxSec=1h" in args
+    assert any(value.startswith("--unit=genesis-job-transcript-analytics-") for value in args)
     assert args[-2:] == ["transcripts", "ingest"]
     assert run.call_args.kwargs["env"][resources._CHILD] == "268435456,100.00"
 
@@ -100,9 +103,9 @@ def test_admission_deferred_does_not_start(base, admitted, monkeypatch, capsys):
 
 def test_no_uncapped_fallback(base, admitted, monkeypatch):
     run, _, _ = admitted
-    monkeypatch.setattr(resources.shutil, "which", lambda _: None)
+    run.side_effect = FileNotFoundError("systemd-run missing")
     assert resources.ensure_capped([], config.Config(enabled=True)) == 69
-    run.assert_not_called()
+    assert run.call_count == 1
 
 
 @pytest.mark.parametrize("ram_bytes,available,verdict", [(None, 100, "WAIT"), (2**31, 2**30, "NO")])
@@ -145,3 +148,86 @@ def test_kernel_limit_verification(monkeypatch, memory, swap, cpu, expected):
     }
     monkeypatch.setattr(Path, "read_text", lambda path: files[path.name])
     assert resources._enforced("1024,25") is expected
+
+
+def test_admission_is_exclusive_until_positive_worker_confirmation(base, admitted):
+    import fcntl
+
+    from genesis.env import genesis_home
+
+    run, _, _ = admitted
+    path = genesis_home() / "locks/transcript-analytics-admission.lock"
+    path.parent.mkdir(parents=True)
+    with path.open("a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert resources.ensure_capped([], config.Config(enabled=True)) == 75
+    run.assert_not_called()
+
+
+def test_launch_rejection_is_unavailable_and_child_failure_preserved(base, admitted, monkeypatch):
+    run, _, _ = admitted
+    proc = run.return_value
+    proc.poll.return_value = 1
+    proc.wait.return_value = 1
+    monkeypatch.setattr(resources, "_await_ready", lambda *args: False)
+    from genesis.hostmetrics import run as runner
+
+    stop = Mock()
+    monkeypatch.setattr(runner, "stop_scope", stop)
+    assert resources.ensure_capped([], config.Config(enabled=True)) == 69
+    assert stop.call_count == 1
+    monkeypatch.setattr(resources, "_await_ready", lambda *args: True)
+    assert resources.ensure_capped([], config.Config(enabled=True)) == 1
+
+
+def test_positive_acknowledgement_requires_real_enforcement(monkeypatch):
+    import os
+
+    for enforced, wanted in [(True, b"1"), (False, b"0")]:
+        read, write = os.pipe()
+        monkeypatch.setenv(resources._READY, str(write))
+        resources._acknowledge(enforced)
+        assert os.read(read, 1) == wanted
+        os.close(read)
+        assert resources._READY not in resources.os.environ
+
+
+@pytest.mark.parametrize("marker", ["nan,25", "1024,inf", "0,25", "1024,0"])
+def test_nonfinite_or_zero_caps_are_unavailable(marker):
+    assert not resources._enforced(marker)
+
+
+def test_evidence_config_matches_runtime_zero_context_and_minimum_budget(base):
+    base.with_suffix(".local.yaml").write_text(
+        "enabled: true\nevidence_records: 0\nevidence_bytes: 1024\n"
+    )
+    assert config.load(base).evidence_records == 0
+    base.with_suffix(".local.yaml").write_text("enabled: true\nevidence_bytes: 1023\n")
+    with pytest.raises(ValueError):
+        config.load(base)
+
+
+def test_unreachable_manager_ledger_is_unavailable(base, admitted, monkeypatch):
+    run, snap, metrics = admitted
+    monkeypatch.setattr(
+        metrics, "take_snapshot", lambda *args: replace(snap, reserved_beyond_use=None)
+    )
+    assert resources.ensure_capped([], config.Config(enabled=True)) == 69
+    run.assert_not_called()
+
+
+def test_child_acknowledges_before_cli_import_or_failure(monkeypatch):
+    import runpy
+
+    events = []
+    monkeypatch.setattr(resources, "_enforced", lambda marker: True)
+    monkeypatch.setattr(resources, "_acknowledge", lambda enforced: events.append("ack"))
+
+    def fail(*args, **kwargs):
+        events.append("cli")
+        raise SystemExit(2)
+
+    monkeypatch.setattr(runpy, "run_module", fail)
+    with pytest.raises(SystemExit) as exc:
+        resources._child_main()
+    assert exc.value.code == 2 and events == ["ack", "cli"]
