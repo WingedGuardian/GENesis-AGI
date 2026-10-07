@@ -519,3 +519,21 @@ def test_old_lost_write_lines_are_pruned_and_recent_or_unreadable_ones_kept():
 
 def test_pruning_a_missing_lost_writes_file_is_a_no_op():
     assert telemetry.prune_lost_writes() == 0
+
+
+def test_a_prune_keeps_a_line_appended_through_a_handle_opened_before_it():
+    """An appender that opened the file before a prune ran must still land its
+    line in the file the report reads (the prune rewrites in place; it never
+    swaps the file out from under an open handle)."""
+    path = telemetry.lost_writes_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"ts": "2000-01-01T00:00:00.000000Z", "caller": "old"}\n')
+    inode = path.stat().st_ino
+
+    with path.open("a", encoding="utf-8") as early:  # opened before the prune
+        assert telemetry.prune_lost_writes() == 1
+        early.write('{"ts": "2999-01-01T00:00:00.000000Z", "caller": "late"}\n')
+
+    assert path.stat().st_ino == inode
+    assert [json.loads(line)["caller"] for line in path.read_text().splitlines()] == ["late"]
+

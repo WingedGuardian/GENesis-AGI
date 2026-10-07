@@ -7,6 +7,7 @@ out of the facade so that module stays about choosing and calling a store.
 from __future__ import annotations
 
 import contextvars
+import fcntl
 import json
 import logging
 import os
@@ -324,28 +325,36 @@ def lost_writes_path() -> Path:
 
 def prune_lost_writes(days: int = TELEMETRY_RETENTION_DAYS) -> int:
     """Drop lost-write lines older than ``days``; returns how many were dropped.
-    An unreadable line is kept (it may be the only trace of a lost row)."""
+    An unreadable line is kept (it may be the only trace of a lost row).
+
+    Rewritten IN PLACE under the same exclusive lock every append takes, never
+    via a temp file and rename: a rename would swap the inode, and a process
+    that opened the old file to append would write its line into a file nobody
+    reads again, erasing the only record of a lost row."""
     from datetime import timedelta
 
     path = lost_writes_path()
     if not path.exists():
         return 0
     cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    keep: list[str] = []
-    dropped = 0
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            old = json.loads(line)["ts"] < cutoff
-        except (ValueError, KeyError, TypeError):
-            old = False
-        if old:
-            dropped += 1
-        else:
-            keep.append(line)
-    if dropped:
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text("".join(f"{line}\n" for line in keep), encoding="utf-8")
-        tmp.replace(path)
+    with path.open("r+", encoding="utf-8") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        keep: list[str] = []
+        dropped = 0
+        for line in fh.read().splitlines():
+            try:
+                old = json.loads(line)["ts"] < cutoff
+            except (ValueError, KeyError, TypeError):
+                old = False
+            if old:
+                dropped += 1
+            else:
+                keep.append(line)
+        if dropped:
+            fh.seek(0)
+            fh.write("".join(f"{line}\n" for line in keep))
+            fh.truncate()
+            fh.flush()
     return dropped
 
 
@@ -367,6 +376,7 @@ def _record_lost_write(tally: _Tally, exc: BaseException) -> None:
             }
         )
         with path.open("a", encoding="utf-8") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)  # serialised with prune_lost_writes
             fh.write(line + "\n")
     except Exception:
         logger.warning("graph traversal lost-write record also failed", exc_info=True)
