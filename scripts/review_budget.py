@@ -680,10 +680,12 @@ def evaluate_evidence(
     else:
         round_state = "complete"
 
-    # What a round reflection must answer for (consumed by
-    # scripts/review_reflection.py and the commit gate). The newest round only,
-    # and only while it is open. NOT attached: a review submitted on an earlier
-    # head after the fix was pushed stays on that head, so it is never owed here.
+    # What a round reflection must answer for. NOTHING READS THESE YET: the
+    # reflection tool and the commit-gate check that consume them are later PRs
+    # of the same series, so until then they are reported, never enforced. The
+    # newest round only, and only while it is open. NOT attached: a review
+    # submitted on an earlier head after the fix was pushed stays on that head,
+    # so it is never owed here.
     open_keys: list[str] = []
     keys_known = True
     if round_state == "open":
@@ -693,13 +695,18 @@ def evaluate_evidence(
                     keys_known = False
                 elif key not in open_keys:
                     open_keys.append(key)
-        # A head the old rule counted carries findings that were never keyed, even
-        # when a post-cutover review on the same head was: its keys are partial.
+        # A head the old rule counted may carry findings that were never keyed,
+        # even when a post-cutover review on the same head was. The old rule did
+        # not read findings, so a head the primary reviewed CLEAN before the
+        # cutover reads the same way: unknown. Fail-closed, and only a PR whose
+        # current head predates the cutover can reach it.
         keys_known = keys_known and rounds[-1]["head"] not in legacy
-    # The settle window waits for every reviewer that took part in EARLIER
-    # rounds of this PR. Round 1 has nobody to wait for by this rule, and the
-    # reader then waits the whole window: a reviewer that has not posted yet is
-    # indistinguishable from one that never will.
+    # Who the settle window waits for: every reviewer that reported on ANY other
+    # head of this PR, clean reviews included (a reviewer that reviewed an
+    # earlier push is the best predictor of one still to come). Before any other
+    # head was reviewed there is nobody, and the reader then waits the whole
+    # window: a reviewer that has not posted yet is indistinguishable from one
+    # that never will.
     expected = sorted({login for sha, who in reported.items() if sha != head for login in who})
 
     return {

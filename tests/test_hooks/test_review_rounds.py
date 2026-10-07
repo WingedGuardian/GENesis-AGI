@@ -797,3 +797,27 @@ def test_a_review_counted_twice_keys_its_findings_once():
 
 def test_an_absurdly_long_id_is_none_not_a_crash():
     assert rb._node_id({"fullDatabaseId": "9" * 5000}) is None
+
+
+def test_a_clean_pre_cutover_primary_review_at_head_makes_keys_unknown():
+    """Accepted, fail-closed: the old rule never read findings, so a head the
+    primary reviewed before the cutover cannot be told clean from unkeyed."""
+    got = _ev(
+        head=H2,
+        reviews=(
+            _keyed(_rv(CODEX, H2, when=BEFORE), 10, []),
+            _keyed(_rv(DEVIN, H2, _devin("🟡")), 40, [400]),
+        ),
+    )
+    assert got["open_keys"] == ["c400"] and got["reflection_keys"] == "unknown"
+
+
+def test_a_clean_review_of_an_earlier_head_makes_its_reviewer_expected():
+    """Deliberate: a reviewer that reviewed an earlier push, even clean, is
+    expected again, though that head was never a round."""
+    got = _ev(
+        head=H2,
+        reviews=(_rv(RABBIT, H1), _keyed(_rv(DEVIN, H2, _devin("🟡")), 40, [400])),
+    )
+    assert got["count"] == 1
+    assert got["expected_reviewers"] == [RABBIT]
