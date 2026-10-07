@@ -1,5 +1,5 @@
 genesis_checkout_lock() {
-    local root="${1:?checkout root required}" common_dir lock_path wait_s
+    local root="${1:?checkout root required}" common_dir lock_path wait_s lock_fd
     if [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ]; then
         return 0
     fi
@@ -9,7 +9,11 @@ genesis_checkout_lock() {
         return 0
     fi
     lock_path="$common_dir/genesis-checkout.lock"
-    if ! exec {GENESIS_CHECKOUT_LOCK_FD}>>"$lock_path"; then
+    # Opened under a local name: GENESIS_CHECKOUT_LOCK_FD means "held", and the
+    # re-entry check above trusts it, so it is set only once flock succeeds. Set
+    # at open, a signal trap running during the wait below would take the lock
+    # as held and change the checkout unfenced.
+    if ! exec {lock_fd}>>"$lock_path"; then
         echo "WARNING: cannot open checkout lock $lock_path; continuing without the lock" >&2
         return 0
     fi
@@ -23,10 +27,11 @@ genesis_checkout_lock() {
     esac
     # ASSUMED, unmeasured bound
     # Shared holders can starve a waiting exclusive lock, as in deploy_code_only.sh.
-    if flock -x -w "$wait_s" "$GENESIS_CHECKOUT_LOCK_FD"; then
+    if flock -x -w "$wait_s" "$lock_fd"; then
+        GENESIS_CHECKOUT_LOCK_FD=$lock_fd
         return 0
     fi
-    genesis_checkout_unlock
+    exec {lock_fd}>&-
     echo "checkout busy (a Claude launch holds genesis-checkout.lock); nothing changed" >&2
     return 1
 }

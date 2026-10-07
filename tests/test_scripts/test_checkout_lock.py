@@ -60,6 +60,57 @@ def test_shell_helper_times_out_behind_shared_holder(tmp_path):
     assert "checkout busy (a Claude launch holds genesis-checkout.lock)" in result.stderr
 
 
+def test_a_trap_during_the_wait_does_not_take_the_lock_as_held(tmp_path):
+    """A signal while the lock is still awaited runs update.sh's trap, which
+    re-enters genesis_checkout_lock for the rollback. The re-entry check trusts
+    GENESIS_CHECKOUT_LOCK_FD, so that variable must not exist until flock has
+    succeeded: here a shared holder keeps the lock, and the trap's re-entry has
+    to wait for it and refuse rather than proceed as if it held it."""
+    import os
+    import signal
+    import time
+
+    root = repo(tmp_path)
+    common = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    lock_path = common / "genesis-checkout.lock"
+    body = (
+        'source "$1"; R="$2"; '
+        "trap 'if GENESIS_CHECKOUT_LOCK_WAIT_S=1 genesis_checkout_lock \"$R\"; "
+        "then echo TRAP-HELD; else echo TRAP-REFUSED; fi; exit 0' TERM; "
+        'echo waiting; GENESIS_CHECKOUT_LOCK_WAIT_S=30 genesis_checkout_lock "$2"; '
+        "echo NOT-REACHED"
+    )
+    with held(lock_path, fcntl.LOCK_SH):
+        proc = subprocess.Popen(
+            ["bash", "-c", body, "bash", str(HELPER), str(root)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            assert proc.stdout.readline().strip() == "waiting"
+            # The whole group, as a service stop or ^C delivers it: flock dies too.
+            assert proc.pid > 1
+            children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children")
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not any(
+                Path(f"/proc/{c}/comm").read_text().strip() == "flock"
+                for c in children.read_text().split()
+                if Path(f"/proc/{c}/comm").exists()
+            ):
+                time.sleep(0.05)
+            os.killpg(proc.pid, signal.SIGTERM)
+            out, err = proc.communicate(timeout=20)
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+    assert "TRAP-REFUSED" in out, out + err
+    assert "TRAP-HELD" not in out
+    assert "NOT-REACHED" not in out
+
+
 def test_shell_helper_warns_and_fails_open_for_unresolvable_checkout(tmp_path):
     result = subprocess.run(
         [
@@ -139,22 +190,26 @@ def _held_regions(text):
 
 
 @pytest.mark.parametrize("script", ["update.sh", "deploy_code_only.sh"])
-def test_every_hook_running_git_call_in_a_held_region_is_wrapped(script):
-    """checkout and merge run git hooks (post-checkout, post-merge). Inside the
-    held regions each must go through genesis_without_checkout_lock, or run with
-    hooks disabled, so a hook's child cannot hold the lock."""
+def test_every_hook_running_git_call_is_wrapped(script):
+    """checkout and merge run git hooks (post-checkout, post-merge). Each must go
+    through genesis_without_checkout_lock, or run with hooks disabled, so a hook's
+    child cannot hold the lock. The whole file, not the text between lock and
+    unlock: helpers defined elsewhere run inside the held regions (the rollback's
+    _ephemeral_clear_before_reset did), and the wrapper is a plain call when no
+    lock is held."""
     import re
 
-    lines, spans = _held_regions((REPO_ROOT / "scripts" / script).read_text())
+    text = (REPO_ROOT / "scripts" / script).read_text()
+    lines, spans = _held_regions(text)
     assert spans, f"{script}: no held region found"
     # The subcommand must end at whitespace: `merge-base` reads and runs no hooks.
     hooky = re.compile(r"\bgit (?:-c \S+ )*-C \S+ (?:-c \S+ )*(?:checkout|merge|switch)(?=\s|$)")
+    calls = [n for n, line in enumerate(lines) if hooky.search(line.split("#", 1)[0])]
+    assert calls, f"{script}: the pattern found no git calls at all"
     unwrapped = [
         f"{script}:{n + 1}: {lines[n].strip()}"
-        for a, b in spans
-        for n in range(a, b + 1)
-        if hooky.search(lines[n].split("#", 1)[0])
-        and "genesis_without_checkout_lock" not in lines[n]
+        for n in calls
+        if "genesis_without_checkout_lock" not in lines[n]
         and "core.hooksPath=/dev/null" not in lines[n]
     ]
     assert unwrapped == []

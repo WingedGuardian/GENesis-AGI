@@ -993,7 +993,7 @@ _ephemeral_clear_before_reset() {
         if _ephemeral_backup_is_current "$p" "$root" \
             || _ephemeral_backup_is_current "$p" "$root/late" \
             || _ephemeral_backup_is_current "$p" "$root/rollback"; then
-            git -C "$GENESIS_ROOT" checkout -q HEAD -- "$p" 2>&1 \
+            genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout -q HEAD -- "$p" 2>&1 \
                 || echo "  WARNING: could not clear the backed-up edit to $p; the rollback will refuse over it."
         fi
     done
