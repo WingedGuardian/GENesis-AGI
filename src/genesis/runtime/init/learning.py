@@ -260,9 +260,9 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
     )
 
     async def _prune_graph_traverse() -> None:
-        # Graph-traversal telemetry (memory/graph_telemetry.py): one eval_events row per
-        # recall/expand/drift call, read by the FalkorDB cutover verdict over a
-        # 14-day window. Only that event type is pruned.
+        # Graph-traversal telemetry (memory/graph_telemetry.py): eval_events rows
+        # read by the FalkorDB cutover verdict over a 14-day window, plus the
+        # local lost-writes file. Only that event type is pruned.
         if rt._db is None:
             return
         try:
@@ -274,6 +274,7 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
                 event_type=_graph.TELEMETRY_EVENT_TYPE,
                 days=_graph.TELEMETRY_RETENTION_DAYS,
             )
+            _graph.prune_lost_writes()
             rt.record_job_success("graph_traverse_prune")
             if removed:
                 logger.info(

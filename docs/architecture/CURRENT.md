@@ -256,11 +256,17 @@ enrichment (MCP, and genesis-server's tool API), `memory_expand`, and
 `drift_recall` (MCP drift mode and the ambient worker). Recall's own graph step (`graph_expansion.py`) reads
 `memory_links` through SQL and never touches it.
 **Every traversal outcome is recorded** for the default-on cutover (owner gate:
-14 days in falkordb mode with zero fallbacks): one `eval_events` row
-(`event_type="graph_traverse"`, `dimension="system"`) per caller call, built by
-`memory/graph_telemetry.py`, with the configured mode, the store that answered, and
-the exception class of any fallback, selection failure or error. Pruned at 30
-days (`graph_traverse_prune`); kill switch `GENESIS_GRAPH_TELEMETRY_DISABLED=1`.
+14 days in falkordb mode with zero fallbacks): `eval_events` rows
+(`event_type="graph_traverse"`, `dimension="system"`) built by
+`memory/graph_telemetry.py`, one per caller call, with the configured mode, the
+store that answered, and the exception class of any fallback, selection failure
+or error. A call's first fallback, selection failure or error is also written as
+its own row the moment it happens, so a process killed mid-request cannot lose the
+evidence that the clock broke. A row that fails to write is carried as
+`prior_write_failures` on the next row and appended to
+`~/.genesis/telemetry/graph_traverse_lost_writes.jsonl`, which outlives the
+process. `graph_traverse_prune` deletes rows, and file lines, older than 30 days;
+kill switch `GENESIS_GRAPH_TELEMETRY_DISABLED=1`.
 The fallback WARNINGs alone could never answer this: MCP servers log to stderr,
 which never reaches the journal.
 

@@ -57,8 +57,9 @@ async def test_wire_drip_retention_jobs_registers_all():
 # tests/test_awareness/test_git_health_check.py.
 
 
-async def test_graph_traverse_prune_removes_only_old_telemetry(db):
-    """The job prunes graph_traverse rows past retention and nothing else."""
+async def test_graph_traverse_prune_removes_only_old_telemetry(db, tmp_path, monkeypatch):
+    """The job prunes graph_traverse rows past retention and nothing else, and
+    trims old lines from the local lost-writes file."""
     from datetime import UTC, datetime, timedelta
 
     from genesis.db.crud import j9_eval
@@ -81,6 +82,11 @@ async def test_graph_traverse_prune_removes_only_old_telemetry(db):
         metrics={"k": "other-type"}, timestamp=_ts(old),
     )
 
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path))
+    lost = graph_mod.lost_writes_path()
+    lost.parent.mkdir(parents=True)
+    lost.write_text('{"ts": "2000-01-01T00:00:00.000000Z"}\n{"ts": "2999-01-01T00:00:00.000000Z"}\n')
+
     rt = _StubRT()
     rt._db = db
     sched = AsyncIOScheduler()
@@ -97,3 +103,4 @@ async def test_graph_traverse_prune_removes_only_old_telemetry(db):
         (graph_mod.TELEMETRY_EVENT_TYPE, '{"k": "recent"}'),
         ("recall_trace", '{"k": "other-type"}'),
     ]
+    assert lost.read_text() == '{"ts": "2999-01-01T00:00:00.000000Z"}\n'
