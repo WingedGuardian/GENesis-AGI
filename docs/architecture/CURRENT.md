@@ -2708,7 +2708,18 @@ verified: b0867170e8e3 2026-10-02
   Pro chain references and both Fusion panels use MiMo V2.6 Pro; the novelty
   suppressor's exact validated pair and standalone evaluation judge remain
   DeepSeek Pro. Candidate compatibility has been probed; candidate quality for
-  these protected judgments has not been qualified.
+  these protected judgments has not been qualified. **2026-10-07:** that NIM
+  alias left every chain — on this install's key NVIDIA accepted V4.1 Flash
+  requests and never answered (every probe variant timed out; of 26 calls in
+  `activity_log`'s retained window, 10-06 18:02 to 10-07 18:03 UTC, 0 succeeded), so `listed` and even an earlier successful probe
+  proved nothing durable. Its rung became `deepseek-flash` (DeepSeek's own API,
+  the same V4.1 Flash, paid, prepaid account) followed by
+  `openrouter-deepseek-flash`; five free-only chains just drop it, and
+  `attention_salience` keeps Mistral alone (no other free model JSON-verified).
+  The provider block stays, unchained. `gemini-free-latest`
+  (`gemini-flash-latest`) is declared but unchained: it resolved to 3.8 Flash
+  (same model and quota as `gemini-free`), so it joins the chains only once it
+  resolves to a different model.
 - **Coherent routing reloads** (`Router.reload_config`,
   `LiteLLMDelegate.for_config`): requests capture config/delegate/pacing/breaker
   bindings before yielding. Replacement/rename breakers preserve holds while
