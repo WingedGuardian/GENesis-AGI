@@ -104,6 +104,7 @@ _STARTED_AT=$(date +%s)
 _SQLITE_LINES=0
 _QDRANT_COUNT=0
 _TRANSCRIPT_COUNT=0
+_TRANSCRIPTS_COMPLETE=true
 _MEMORY_COUNT=0
 _EXTRA_SKIP_LABELS=()  # declared before the EXIT trap can fire: its status write reads it
 _EXTRA_PARTIAL_LABELS=()
@@ -646,7 +647,20 @@ log "Backing up CC transcripts..."
 mkdir -p transcripts
 # Purge any pre-encryption plaintext transcripts (staging only — NOT the .gpg).
 find transcripts -maxdepth 1 -name '*.jsonl' -type f -delete 2>/dev/null || true
-if [ -d "$TRANSCRIPT_DIR" ]; then
+if [ "${GENESIS_BACKUP_TRANSCRIPT_SCOPE:-main}" = all ]; then
+    if ! printf '%s' "$_BACKUP_PASSPHRASE" | python3 "$_SCRIPT_DIR/lib/transcript_archive.py" backup \
+        "$HOME/.claude/projects" --destination transcripts --scratch "$GENESIS_BIG_TMP"; then
+        _TRANSCRIPTS_COMPLETE=false
+        _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }transcript coverage incomplete"
+        _FAILURE_STAGE="transcripts"
+        log "WARNING: transcript coverage incomplete; keeping last-good archives"
+    fi
+    _TRANSCRIPT_COUNT=$(find transcripts -maxdepth 1 -name '*.gpg' -type f | wc -l)
+elif [ "${GENESIS_BACKUP_TRANSCRIPT_SCOPE:-main}" != main ]; then
+    _TRANSCRIPTS_COMPLETE=false
+    _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }invalid transcript scope"
+    log "WARNING: GENESIS_BACKUP_TRANSCRIPT_SCOPE must be main or all"
+elif [ -d "$TRANSCRIPT_DIR" ]; then
     if ! $_ENCRYPT_READY; then
         log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping transcripts (refusing plaintext)"
     else
@@ -754,6 +768,27 @@ if [ -d "$_EVAL_DIR" ]; then
 fi
 
 # --- 6f. Opt-in extra directories (encrypted, Tier 2 / off-site only) ---
+# Enabled analytics uses the existing extra-directory transport. The module is
+# optional so old installations and recovery-only checkouts retain their defaults.
+_ANALYTICS_CONFIG_ERROR=false
+if [ -f "$GENESIS_DIR/src/genesis/transcript_analytics/config.py" ]; then
+    if _analytics_data=$(PYTHONPATH="$GENESIS_DIR/src" "$GENESIS_DIR/.venv/bin/python" \
+        -m genesis.transcript_analytics.config --data-dir); then
+        # A tar traversal must observe one committed generation, not a mix of
+        # atomic per-table replacements. Existing DR lock is held before this.
+        exec {_ANALYTICS_BACKUP_FD}>"${GENESIS_HOME:-$HOME/.genesis}/locks/transcript-analytics.lock"
+        flock "$_ANALYTICS_BACKUP_FD"
+        case ":${GENESIS_BACKUP_EXTRA_DIRS:-}:" in
+            *":$_analytics_data:"*) ;;
+            *) GENESIS_BACKUP_EXTRA_DIRS="${GENESIS_BACKUP_EXTRA_DIRS:+$GENESIS_BACKUP_EXTRA_DIRS:}$_analytics_data" ;;
+        esac
+        _analytics_rel="${_analytics_data#"$HOME"/}"
+        GENESIS_BACKUP_EXTRA_EXCLUDES="${GENESIS_BACKUP_EXTRA_EXCLUDES:+$GENESIS_BACKUP_EXTRA_EXCLUDES:}$_analytics_rel/derived:$_analytics_rel/.staging"
+    elif [ "$?" -ne 1 ]; then
+        _ANALYTICS_CONFIG_ERROR=true
+        _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }analytics backup config unavailable"
+    fi
+fi
 # GENESIS_BACKUP_EXTRA_DIRS lists ':'-separated directories UNDER $HOME (a leading
 # `~/` is expanded) that this install wants kept — install-local data no other
 # section knows about. Each becomes ONE encrypted tar, extra/<name>.tar.gpg, so a
@@ -781,6 +816,10 @@ _EXTRA_BUILT=()        # names archived THIS run: the only ones uploaded
 _EXTRA_SKIP_LABELS=()  # listed entries not archived this run (recorded in COMPLETE)
 _EXTRA_PARTIAL=0       # archived, but a restore will refuse some of their members
 _EXTRA_PARTIAL_LABELS=()
+if $_ANALYTICS_CONFIG_ERROR; then
+    _EXTRA_SKIPPED=1
+    _EXTRA_SKIP_LABELS+=("analytics configuration unavailable")
+fi
 _extra_prev=0
 if mkdir -p extra 2>/dev/null; then
     _extra_prev="$(find extra -maxdepth 1 -type f -name '*.tar.gpg' 2>/dev/null | wc -l || true)"
@@ -1026,6 +1065,10 @@ else
     log "WARNING: could not write .extra-manifest; a restore from this checkout will not restore its extra archives (the off-site snapshot is unaffected)"
 fi
 
+if [ -n "${_ANALYTICS_BACKUP_FD:-}" ]; then
+    exec {_ANALYTICS_BACKUP_FD}>&-
+fi
+
 # --- 6d. Hook audit stores (Tier 1) ---
 # The merge gate's override records: which merges bypassed which gate, and on what
 # stated grounds. One small file per flush, own-user-only, and SELF-CONTAINED —
@@ -1246,6 +1289,7 @@ else
     backend_mkdir "${_T2_DIR}/transcripts"
 
     _T2_OK=true
+    if ! $_TRANSCRIPTS_COMPLETE; then _T2_OK=false; fi
 
     # Upload Qdrant snapshots — FRESH ones only (SF3). A .gpg left on disk by
     # a prior run (this run's snapshot failed) must not be stamped into a new

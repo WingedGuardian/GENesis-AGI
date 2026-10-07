@@ -76,6 +76,8 @@ _STARTED_AT=$(date +%s)
 _SQLITE_RESTORED=false
 _QDRANT_RESTORED=0
 _TRANSCRIPT_RESTORED=0
+_TRANSCRIPTS_FROM_SNAPSHOT=false
+_TRANSCRIPTS_PULLED=""
 _MEMORY_RESTORED=0
 _EVAL_RESTORED=0
 _EXTRA_RESTORED=0
@@ -175,6 +177,18 @@ if ! flock -w "$_LOCK_WAIT" "$DR_LOCK_FD"; then
     die "backup-restore lock still held by ${_holder:-unknown} after ${_LOCK_WAIT}s — a backup is likely running; wait for it to finish and re-run (or set GENESIS_RESTORE_LOCK_WAIT higher)"
 fi
 dr_lock_stamp restore
+
+# The hourly analytics job takes these in the same order. Keep them through
+# extra-directory restore too, which can replace the analytics data root.
+exec {_ANALYTICS_WRITER_FD}>"${GENESIS_HOME:-$HOME/.genesis}/locks/transcript-analytics.lock"
+flock -w "$_LOCK_WAIT" "$_ANALYTICS_WRITER_FD" || die "analytics writer is busy"
+exec {_ANALYTICS_PUBLICATION_FD}>"${GENESIS_HOME:-$HOME/.genesis}/locks/transcript-analytics-publication.lock"
+flock -w "$_LOCK_WAIT" "$_ANALYTICS_PUBLICATION_FD" || die "analytics readers are busy"
+if ! $DRY_RUN && ! $DATABASE_ONLY; then
+    # Invalidate BEFORE any mutation, even if restore later dies or changes the
+    # configured analytics directory. No venv/YAML dependency during recovery.
+    printf '%s-%s\n' "$$" "$(date +%s%N)" >"${GENESIS_HOME:-$HOME/.genesis}/locks/transcript-analytics-restore-epoch"
+fi
 
 # Private-by-default for every plaintext this restore writes (SF7): gpg -d and
 # cp otherwise honor the inherited umask (typically 0022 → world-readable), so a
@@ -418,14 +432,23 @@ _pull_from_offsite() {
     for sub in qdrant transcripts; do
         dst="$BACKUP_DIR/data/qdrant"
         [ "$sub" = transcripts ] && dst="$BACKUP_DIR/transcripts"
+        if [ "$sub" = transcripts ]; then
+            _TRANSCRIPTS_FROM_SNAPSHOT=true
+            _TRANSCRIPTS_PULLED=""
+        fi
+        if ! _payload_list=$(backend_list "$snap/$sub"); then
+            warn "off-site: failed to list $sub in snapshot $latest"
+            continue
+        fi
         while read -r fname; do
             mkdir -p "$dst"
             if backend_get "$snap/$sub/$fname" "$dst/$fname"; then
+                if [ "$sub" = transcripts ]; then _TRANSCRIPTS_PULLED+="$fname"$'\n'; fi
                 log "  off-site: pulled $sub/$fname"
             else
                 warn "off-site: failed to pull $sub/$fname from snapshot $latest"
             fi
-        done < <(backend_list "$snap/$sub" | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u || true)
+        done < <(printf '%s\n' "$_payload_list" | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u || true)
     done
 
     # memory / config overlays / secrets — previously only in the Tier-1 git clone. Pull
@@ -1177,9 +1200,14 @@ if [ -d "$BACKUP_DIR/transcripts" ]; then
     mkdir -p "$TRANSCRIPT_DIR"
     while IFS= read -r -d '' src; do
         name=$(basename "$src")
+        if $_TRANSCRIPTS_FROM_SNAPSHOT && ! grep -Fxq "$name" <<< "$_TRANSCRIPTS_PULLED"; then continue; fi
         # Strip .gpg if present to get dest name
         dst_name="${name%.gpg}"
         dst="$TRANSCRIPT_DIR/$dst_name"
+        _v2_name=$(python3 "$_SCRIPT_DIR/lib/transcript_archive.py" name "$_CC_PROJECT_ID/$dst_name")
+        if [ -f "$BACKUP_DIR/transcripts/$_v2_name" ]; then
+            if ! $_TRANSCRIPTS_FROM_SNAPSHOT || grep -Fxq "$_v2_name" <<< "$_TRANSCRIPTS_PULLED"; then continue; fi
+        fi
         if [ -f "$dst" ] && [ "$dst" -nt "$src" ] && ! $FORCE; then
             continue
         fi
@@ -1195,6 +1223,19 @@ if [ -d "$BACKUP_DIR/transcripts" ]; then
         fi
         _TRANSCRIPT_RESTORED=$(( _TRANSCRIPT_RESTORED + 1 ))
     done < <(find "$BACKUP_DIR/transcripts" -maxdepth 1 \( -name '*.jsonl' -o -name '*.jsonl.gpg' \) -print0 2>/dev/null)
+    _v2_flags=()
+    $FORCE && _v2_flags+=(--force)
+    $DRY_RUN && _v2_flags+=(--dry-run)
+    while IFS= read -r -d '' src; do
+        name=$(basename "$src")
+        if $_TRANSCRIPTS_FROM_SNAPSHOT && ! grep -Fxq "$name" <<< "$_TRANSCRIPTS_PULLED"; then continue; fi
+        if _v2_count=$(printf '%s' "$_BACKUP_PASSPHRASE" | python3 "$_SCRIPT_DIR/lib/transcript_archive.py" restore \
+            "$src" --root "$HOME/.claude/projects" --scratch "$GENESIS_BIG_TMP" "${_v2_flags[@]}"); then
+            _TRANSCRIPT_RESTORED=$((_TRANSCRIPT_RESTORED + _v2_count))
+        else
+            warn "transcript v2 restore failed: $name"
+        fi
+    done < <(find "$BACKUP_DIR/transcripts" -maxdepth 1 -type f -name 'v2-*.tar.gpg' -print0)
     log "Transcripts: $_TRANSCRIPT_RESTORED restored"
 else
     log "Transcripts: no backup directory"
