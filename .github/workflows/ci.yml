@@ -1124,4 +1124,6 @@ jobs:
         # cases: 2 retained historical regressions plus 93 new accounting and
         # recovery cases. Main has none of this package's original 231 cases.
         # Floor: 24421 + 95 = 24516; no added skips, ceiling unchanged.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24516
+        # Reference admission: 23 preserved +98 boundary +246 actor-role cases.
+        # Floor: 24516 +367 =24883; no added skips, ceiling unchanged.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24883
