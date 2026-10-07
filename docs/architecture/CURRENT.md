@@ -2423,8 +2423,8 @@ Self-improvement loops and the instrumentation that keeps them honest.
 
 ```yaml subsystem-map
 entry: learning-evaluation
-modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 788dd9a9 2026-09-06
+modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
+verified: 0d4d27ce0 2026-10-06
 ```
 
 - **The graders are TOLD the response status; they must never infer it.** The
