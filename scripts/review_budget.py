@@ -142,6 +142,11 @@ HOOK_SURFACE_FILES = frozenset(
         "config/external_review.yaml",
         "src/genesis/session_awareness/external_review.py",
         "src/genesis/session_awareness/external_review_config.py",
+        # Named explicitly though the scripts/hooks/ prefix already covers it, so
+        # a later narrowing of that prefix cannot drop it silently; its decision
+        # config rides alongside.
+        "scripts/hooks/main_checkout_guard.py",
+        "config/main_checkout_guard.yaml",
     }
 )
 
