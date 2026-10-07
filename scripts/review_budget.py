@@ -342,18 +342,30 @@ def _is_id(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _without_ids(rows: object) -> object:
+    if not isinstance(rows, list):
+        return rows
+    return [
+        {k: v for k, v in row.items() if k != "id"} if isinstance(row, dict) else row
+        for row in rows
+    ]
+
+
 def _round_source(
     item: Mapping[str, object], login: str, flagged: Sequence[int], in_body: int
 ) -> dict[str, Any]:
     """One review's place in a round, keyed for the round reflection.
 
     A finding is keyed by what a reader can find it by and that never changes:
-    ``c<comment id>`` for an inline comment. A finding in a review's BODY has no
-    id of its own: ``r<review id>/<k>`` for k in 1..``body_finding_count`` is a
-    SLOT in that review's count, not a pointer to a particular finding, so a
-    reflection answers for the review's body findings as a set. A key whose id is
-    missing is None: the round still counts, it just cannot be discharged by key,
-    which ``reflection_keys`` reports.
+    ``c<comment id>`` for an inline comment. Findings in a review's BODY have no
+    id of their own, so the review answers for them as ONE key,
+    ``r<review id>:<count>``. The count is part of the key, so a body whose
+    finding count changes owes a new answer. The count never sizes anything: it
+    comes from reviewer-written text, and an earlier shape that built one key
+    per counted finding let a malformed body allocate without bound inside a
+    hook (PR #3040, round 1). A key whose id is missing is None: the round still
+    counts, it just cannot be discharged by key, which ``reflection_keys``
+    reports.
     """
     review_id = item.get("id")
     ids = item.get("top_level_ids")
@@ -361,8 +373,12 @@ def _round_source(
     for index in flagged:
         comment_id = ids[index] if isinstance(ids, list) and index < len(ids) else None
         keys.append(f"c{comment_id}" if _is_id(comment_id) else None)
-    for k in range(1, in_body + 1):
-        keys.append(f"r{review_id}/{k}" if _is_id(review_id) else None)
+    if in_body:
+        # Bounded before it is formatted: a sum of several maximal sections
+        # passes int() and then overflows str() (4,300 digits), which would turn
+        # the whole lookup unknown. Past the bound the key is unknown instead.
+        bounded = 0 < in_body < 10**9
+        keys.append(f"r{review_id}:{in_body}" if _is_id(review_id) and bounded else None)
     return {
         "id": review_id if _is_id(review_id) else None,
         "login": login,
@@ -543,7 +559,7 @@ def evaluate_evidence(
         # not on who wrote it, so a deleted author's comment still counts for both.
         for marker in _CONFIRMATION_RE.finditer(body):
             confirmation_heads.add(marker.group(1).lower())
-        for pattern in identities:
+        for index, pattern in enumerate(identities):
             for match in pattern.finditer(body):
                 resolved, error = _resolve_sha(match.group(1), commits)
                 if error == "unresolved_review_head" and not before:
@@ -551,6 +567,9 @@ def evaluate_evidence(
                 if error:
                     return _unknown(error, current_head=head)
                 confirm(resolved or "", before)
+                # Matched on TEXT, so whoever posted it is not the reviewer: the
+                # configured identity is, named by its position in the config.
+                report(resolved or "", f"identity:{index}")
         if login is None or author_type is None:
             continue  # deleted author: never the primary
         if not isinstance(login, str) or not isinstance(author_type, str):
@@ -572,11 +591,12 @@ def evaluate_evidence(
             report(resolved or "", login)
             continue
         is_findings, sha = review_findings.codex_comment_finding_head(body)
+        if is_findings and sha is not None:
+            report(sha, login)  # a report on either side of the cutover, like a review
         if is_findings and not before:
             if sha is None:
                 return _unknown("codex_findings_comment_unbound", current_head=head)
             confirm(sha, False)
-            report(sha, login)
             comment_id = item.get("id")
             add_round(
                 sha,
@@ -686,21 +706,22 @@ def evaluate_evidence(
     # newest round only, and only while it is open. NOT attached: a review
     # submitted on an earlier head after the fix was pushed stays on that head,
     # so it is never owed here.
-    open_keys: list[str] = []
+    seen: dict[str, None] = {}  # ordered and linear, however many keys arrive
     keys_known = True
     if round_state == "open":
         for source in rounds[-1]["reviews"]:
             for key in source["finding_keys"]:
                 if key is None:
                     keys_known = False
-                elif key not in open_keys:
-                    open_keys.append(key)
+                else:
+                    seen.setdefault(key)
         # A head the old rule counted may carry findings that were never keyed,
         # even when a post-cutover review on the same head was. The old rule did
         # not read findings, so a head the primary reviewed CLEAN before the
         # cutover reads the same way: unknown. Fail-closed, and only a PR whose
         # current head predates the cutover can reach it.
         keys_known = keys_known and rounds[-1]["head"] not in legacy
+    open_keys = list(seen)
     # Who the settle window waits for: every reviewer that reported on ANY other
     # head of this PR, clean reviews included (a reviewer that reviewed an
     # earlier push is the best predictor of one still to come). Before any other
@@ -947,14 +968,14 @@ def _review_digest(rows: Sequence[Mapping[str, object]], rf: Any) -> list[tuple[
         login = row.get("login")
         body = row.get("body") if isinstance(row.get("body"), str) else ""
         tops = row.get("top_level") if isinstance(row.get("top_level"), list) else []
-        ids = row.get("top_level_ids") if isinstance(row.get("top_level_ids"), list) else []
         named = isinstance(login, str)
+        # Ids are deliberately NOT compared. They key only the round reflection,
+        # and a comment deleted and reposted between the two reads would make
+        # them differ: comparing them would add a path to ``unknown`` that the
+        # count never had (PR #3040, round 1). The keys then come from the first
+        # read, and the next lookup reads the repost.
         digest.append(
             (
-                # Ids are immutable, so comparing them cannot turn a reviewer's
-                # edit into ``unknown``; they make a delete-and-repost visible.
-                row.get("id"),
-                tuple(ids),
                 login,
                 row.get("commit_id"),
                 row.get("state"),
@@ -1221,7 +1242,9 @@ def _evaluate_pr_inner(
                 fetched[item], review_findings
             )
         else:
-            same = again == fetched[item]
+            # Ids never decide the count, so they never decide this either (see
+            # _review_digest): a repost between the reads is not a new unknown.
+            same = _without_ids(again) == _without_ids(fetched[item])
         if not same:
             return _unknown("evidence_changed_during_evaluation", current_head=final_head)
 

@@ -620,7 +620,7 @@ def test_body_findings_and_a_codex_findings_comment_have_keys():
     rabbit = _keyed(_rv(RABBIT, H5, body=body), 20, [])
     bulb = dict(_cm(_bulb(H5)), id=30)
     got = _ev(reviews=(rabbit,), comments=(bulb,))
-    assert got["open_keys"] == ["r20/1", "r20/2", "i30"]
+    assert got["open_keys"] == ["r20:2", "i30"]
     assert got["reflection_keys"] == "ok"
 
 
@@ -749,11 +749,13 @@ def test_graphql_rows_carry_ids_parallel_to_top_level():
     assert rb._graphql_rows("comments", [comment])[0][0]["id"] == 9
 
 
-def test_the_reread_sees_a_deleted_and_reposted_comment():
+def test_the_reread_never_compares_ids():
+    """A comment deleted and reposted between the two reads changes only its
+    id; comparing ids would make that `unknown`, a path the count never had."""
     first = rb._graphql_rows("reviews", [_node(H1, tops=[_devin("🟡")])])[0]
-    first[0]["top_level_ids"] = [400]
-    reposted = [dict(first[0], top_level_ids=[401])]
-    assert rb._review_digest(first, rf) != rb._review_digest(reposted, rf)
+    first[0].update(id=7, top_level_ids=[400])
+    reposted = [dict(first[0], id=8, top_level_ids=[401])]
+    assert rb._review_digest(first, rf) == rb._review_digest(reposted, rf)
 
 
 def test_a_mixed_old_and_new_round_at_head_has_partial_keys():
@@ -821,3 +823,126 @@ def test_a_clean_review_of_an_earlier_head_makes_its_reviewer_expected():
     )
     assert got["count"] == 1
     assert got["expected_reviewers"] == [RABBIT]
+
+
+def test_a_huge_body_count_is_one_key_not_a_billion():
+    """Round 1 of #3040: the count comes from reviewer text, so it must never
+    size anything. One key per review carries it."""
+    body = (
+        "**Actionable comments posted: 0**\n<details>\n"
+        "<summary>⚠️ Outside diff range comments (999999999)</summary>\n</details>"
+    )
+    got = _ev(reviews=(_keyed(_rv(RABBIT, H5, body=body), 20, []),))
+    assert got["open_keys"] == ["r20:999999999"]
+
+
+def test_a_changed_body_count_changes_the_key():
+    def body(n):
+        return (
+            "**Actionable comments posted: 0**\n<details>\n"
+            f"<summary>♻️ Duplicate comments ({n})</summary>\n</details>"
+        )
+
+    one = _ev(reviews=(_keyed(_rv(RABBIT, H5, body=body(1)), 20, []),))
+    two = _ev(reviews=(_keyed(_rv(RABBIT, H5, body=body(2)), 20, []),))
+    assert one["open_keys"] == ["r20:1"] and two["open_keys"] == ["r20:2"]
+
+
+_TEMPLATE = "external report head={head}"
+_GONE = "f" * 40  # a commit a force-push removed from the PR
+
+
+@pytest.mark.parametrize(
+    "branch, reviews, comments, templates, reporters",
+    [
+        ("review after cutover", (_rv(DEVIN, H2),), (), (), [DEVIN]),
+        ("review before cutover", (_rv(DEVIN, H2, when=BEFORE),), (), (), [DEVIN]),
+        ("primary review", (_rv(CODEX, H2),), (), (), [CODEX]),
+        ("pending primary review", (_rv(CODEX, H2, state="PENDING"),), (), (), []),
+        ("human review", (_rv("a-maintainer", H2),), (), (), []),
+        ("workflow bot review", (_rv("github-actions[bot]", H2),), (), (), []),
+        ("codeql review", (_rv("github-advanced-security[bot]", H2),), (), (), []),
+        ("codex clean comment", (), (_clean(H2[:10]),), (), [CODEX]),
+        (
+            "human posting codex clean text",
+            (),
+            (_cm(_clean(H2[:10])["body"], login="a-person", kind="User"),),
+            (),
+            [],
+        ),
+        ("codex findings comment after cutover", (), (_cm(_bulb(H2)),), (), [CODEX]),
+        ("codex findings comment before cutover", (), (_cm(_bulb(H2), when=BEFORE),), (), [CODEX]),
+        (
+            "findings comment citing two commits, before cutover",
+            (),
+            (_cm(_bulb(H2, H3), when=BEFORE),),
+            (),
+            [],
+        ),
+        (
+            "another bot posting a codex-style findings comment",
+            (),
+            (_cm(_bulb(H2), login=DEVIN),),
+            (),
+            [],
+        ),
+        (
+            "identity template",
+            (),
+            (_cm("external report head=" + H2, login="a-person", kind="User"),),
+            (_TEMPLATE,),
+            ["identity:0"],
+        ),
+        (
+            "identity template, deleted author",
+            (),
+            (
+                {
+                    "login": None,
+                    "type": None,
+                    "body": "external report head=" + H2,
+                    "created_at": AFTER,
+                },
+            ),
+            (_TEMPLATE,),
+            ["identity:0"],
+        ),
+        (
+            "second identity template",
+            (),
+            (_cm("second report head=" + H2, login="a-person", kind="User"),),
+            (_TEMPLATE, "second report head={head}"),
+            ["identity:1"],
+        ),
+        (
+            "identity on a removed commit after cutover",
+            (),
+            (_cm("external report head=" + _GONE, login="a-person", kind="User"),),
+            (_TEMPLATE,),
+            [],
+        ),
+    ],
+)
+def test_every_evidence_branch_reports_exactly_its_reviewer(
+    branch, reviews, comments, templates, reporters
+):
+    """Class B of #3040's round 1: each branch that recognises a reviewer's
+    evidence on a head reports exactly that reviewer, and nobody else."""
+    got = _ev(head=H2, reviews=reviews, comments=comments, templates=templates)
+    assert got["status"] == "ok", (branch, got["errors"])
+    assert got["reviewers_reported"] == reporters, branch
+    assert got["expected_reviewers"] == [], branch
+
+
+def test_two_maximal_body_sections_never_crash_the_lookup():
+    """Round 1 of #3040, fix-code audit: a sum of two 4,300-digit counts passes
+    int() and overflows str(). The key goes unknown; the count is untouched."""
+    nines = "9" * 4300
+    body = (
+        "**Actionable comments posted: 0**\n"
+        f"<details>\n<summary>⚠️ Outside diff range comments ({nines})</summary>\n</details>\n"
+        f"<details>\n<summary>♻️ Duplicate comments ({nines})</summary>\n</details>"
+    )
+    got = _ev(reviews=(_keyed(_rv(RABBIT, H5, body=body), 20, []),))
+    assert got["status"] == "ok" and got["count"] == 1
+    assert got["reflection_keys"] == "unknown" and got["open_keys"] == []
