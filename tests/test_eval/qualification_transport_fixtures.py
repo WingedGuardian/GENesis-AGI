@@ -12,6 +12,15 @@ from genesis.eval.qualification.evidence import digest
 from genesis.eval.qualification.pinned import ENDPOINT
 
 
+def routing_metadata(model, provider):
+    return {
+        "requested": model, "strategy": "direct", "attempt": 1, "is_byok": False,
+        "endpoints": {"total": 1, "available": [
+            {"model": model, "provider": provider, "selected": True}
+        ]},
+    }
+
+
 def delegate_campaign(tmp_path):
     alias = "openrouter-mimo"
     model = pinned.resolve(alias).model_id
@@ -151,7 +160,7 @@ class Gateway:
                 "object": "chat.completion",
                 "created": 1,
                 "model": model,
-                "provider": self.provider,
+                "openrouter_metadata": routing_metadata(model, self.provider),
                 "choices": [
                     {
                         "index": 0,

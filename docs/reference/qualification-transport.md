@@ -8,7 +8,7 @@ bounds or grant spending approval. Complete preflight and the isolated CLI
 runner are later replacements. No automatic execution or route promotion is
 wired by this change.
 
-`binding.transports[alias]` freezes model, effective `params`, gateway `endpoint`,
+`binding.transports[alias]` freezes model, requested `params`, gateway `endpoint`,
 common `generation_namespace` and SHA256 `credential_fingerprint`. Every attempt
 also repeats the credential fingerprint and binds contract/version/case/repetition/prompt hash, the exact serialized
 request hash, `receipt_provider` display name and `provider_identity_evidence`.
@@ -29,6 +29,15 @@ owner spending approval must still prevent the later runner from executing.
 
 Reservation and dispatch are durable before the delegate runs. Every SDK
 replacement client shares the same exact-wire and second-request refusal guard.
+The serialized HTTP hook enables documented routing metadata and explicitly
+disables OpenRouter response caching. Each qualified answer needs one selected
+endpoint matching the frozen model and provider display, direct routing, one
+gateway attempt, no BYOK and no material pipeline. Unselected candidates and
+unrelated additive metadata fields do not imply retries. The legacy top-level
+provider is optional; if present, it cannot contradict the selected identity.
+This gateway witness does not prove effective backend parameters or internal
+provider retries. See [routing metadata](https://openrouter.ai/docs/guides/features/router-metadata)
+and [response caching](https://openrouter.ai/docs/guides/features/response-caching).
 The response hook defers stream closure until the complete decoded response is
 durably recorded, then releases the original stream. Partial reads retain the
 funded dispatch without inventing an answer. It appends before auth/SDK/client cleanup can
@@ -54,11 +63,24 @@ by a later receipt. Missing or contradictory observed generation IDs refuse.
 Receipt-only recovery requires explicit independently verified attempt/request
 association, never an inferred latest generation. A settled lost answer needs
 an explicit answer-loss acknowledgement and is never resent.
+Body and response-header generation identities are retained separately; a
+contradiction stays unresolved. An ID captured from this response's header may
+support expense recovery when the body ID is absent, but cannot qualify an
+answer lacking the required completion evidence. Only generation and cache
+status headers are retained; credentials and unrelated headers are excluded.
+Contradictory observed model/provider identities remain lists of actual contrary
+facts in the existing observation fields, which cannot match frozen string
+identities. They block settlement, including when appended after an earlier
+receipt. Missing identity is not silently replaced by requested routing.
 
 Any unresolved campaign incident pauses both new completions and answer replay.
 After GET settlement and explicit acknowledgement of a retained local failure,
-the same paid answer can replay without reading a credential or sending another
+an eligible retained answer can replay without reading a credential or sending another
 completion. An acknowledged undispatched reservation continues the same attempt
 without reserving twice. Neither acknowledgement deletes evidence. Final reports
 must reconstruct current accounting, including generation collisions that can
 invalidate earlier answers; the later runner owns those reports.
+Every live acceptance and retained replay rechecks the raw routing evidence.
+Expense settlement and failure acknowledgement cannot qualify a cached,
+transformed, retried or otherwise invalid response. Recovery remains explicit
+GET-only; rejected answers never trigger another completion.

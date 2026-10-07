@@ -28,6 +28,7 @@ from tests.test_eval.qualification_transport_fixtures import (
     bundle,
     delegate_campaign,
     router,
+    routing_metadata,
 )
 
 
@@ -230,7 +231,8 @@ def wire_campaign(tmp_path):
 
 def response_bytes(cost="0.0001"):
     return (
-        '{"id":"gen-0","model":"synthetic/model","provider":"Synthetic",'
+        '{"id":"gen-0","model":"synthetic/model",'
+        '"openrouter_metadata":' + json.dumps(routing_metadata("synthetic/model", "Synthetic Gateway Display")) + ','
         '"choices":[{"message":{"content":"answer"},"finish_reason":"stop"}],'
         '"usage":{"prompt_tokens":20,"completion_tokens":5,"cost":' + cost + "}}"
     ).encode()
@@ -254,7 +256,7 @@ async def test_response_is_durable_before_auth_cleanup(tmp_path, cancelled):
             {
                 **observation,
                 "model": observation["response_model"],
-                "upstream": observation["response_provider"],
+                "upstream": campaign.expected_manifest["attempts"][0]["upstream"],
             },
         )
 
@@ -462,7 +464,7 @@ async def test_get_only_billing_and_offline_full_history_recovery(tmp_path, isol
             "synthetic-only-key",
             lambda obs: campaign.observe(
                 "case-0",
-                {**obs, "model": obs["response_model"], "upstream": obs["response_provider"]},
+                {**obs, "model": obs["response_model"], "upstream": campaign.expected_manifest["attempts"][0]["upstream"]},
             ),
             transport=httpx.MockTransport(gateway),
         )
@@ -612,6 +614,7 @@ async def test_production_delegate_to_journal_billing_reopen_and_offline_replay(
                 "created": 1,
                 "model": model,
                 "provider": "Synthetic Gateway Display",
+                "openrouter_metadata": routing_metadata(model, "Synthetic Gateway Display"),
                 "choices": [
                     {
                         "index": 0,
