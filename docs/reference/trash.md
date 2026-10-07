@@ -7,16 +7,17 @@ recoverable". The code is `src/genesis/trash/` (stdlib only).
 
 ## Where things go
 
-An item is always **renamed**, never copied, into a trash on its own volume:
+There is one trash, `~/.genesis/trash/` (under `GENESIS_HOME`), and an item is
+always **renamed** into it, never copied. So only an item on the same volume as
+`~/.genesis` can be trashed; on a standard install that covers the repo, its
+worktrees, `~/.genesis` and `~/.claude`. An item on another volume is refused
+and left where it is (see below).
 
-- `~/.genesis/trash/` when the item is on the same device as `~/.genesis`;
-- `<mountpoint>/.genesis-trash-<uid>/` for an item on another mount.
-
-Each trashed item gets its own entry, named `<UTC timestamp>-<6 hex>-<name>`
-(the random part keeps ids unique across volumes):
+Each trashed item gets its own entry, named `<UTC timestamp>-<name>` (a `-N`
+suffix when the same name is trashed twice in one second):
 
 ```
-~/.genesis/trash/20261007T024821Z-3fa9c1-notes.md/
+~/.genesis/trash/20261007T024821Z-notes.md/
     item             the trashed file, directory or symlink (fixed name)
     tombstone.json   original path and name, kind, size (null when a
                      directory could not be fully read), reason, caller,
@@ -45,11 +46,22 @@ Exit codes: 0 done, 1 refused (the reason is printed), 64 usage error.
 ## What is refused
 
 `genesis.trash` leaves the item untouched and raises `TrashRefused` when the
-item is missing, a mount point, `$HOME` or a parent of it, a parent of the
-trash itself, already in a trash, on the Claude Code temp volume
-(`~/.genesis/cc-tmp`, which has its own retention), or on a different device
-from its trash. It never falls back to copying. A per-mount trash root that is
-a symlink, owned by another user, or not mode 0700 is refused too.
+item is missing or unreadable, `''`/`.`/`..`, a mount point, `$HOME` or a parent
+of it, a parent of the trash itself, already in the trash, on the Claude Code
+temp volume (`~/.genesis/cc-tmp`, which has its own retention), or on another
+volume than the trash. It never falls back to copying. "Another volume" is
+caught twice: a different device number (another disk, a btrfs subvolume), and
+the kernel's own refusal to rename across mount points (a bind mount, an
+overlay's lower layer). The refusal says to ask the user before deleting the
+item any other way. A trash directory that is a symlink, owned by another
+user, or not mode 0700 is refused too.
+
+The trash used to be planned per volume (a trash on each mount, after
+`send2trash`). It was narrowed to one trash because every caller lives on the
+home volume, and the per-volume roots were where the defects were (aliased
+mounts, bind mounts, btrfs subvolumes whose trash could be written but never
+listed). If a real caller on another volume appears, that is the time to
+revisit it.
 
 ## What goes to the trash today
 

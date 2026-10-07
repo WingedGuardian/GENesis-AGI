@@ -9,7 +9,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import shutil
 import stat
 from pathlib import Path
 
@@ -108,35 +107,6 @@ def test_an_unreadable_subtree_makes_the_size_unknown(tmp_path):
     assert stone.size is None  # never a partial total that reads as exact
 
 
-def test_entry_ids_are_unique_and_an_ambiguous_restore_is_refused(monkeypatch, tmp_path, root):
-    a = trash(_touch(tmp_path / "x.txt"), reason="r", caller="c")
-    b = trash(_touch(tmp_path / "x.txt"), reason="r", caller="c")
-    assert a.entry_id != b.entry_id
-    other = tmp_path / "other-root"
-    other.mkdir(mode=0o700)
-    shutil.copytree(_entry(a), other / a.entry_id)  # the same id in a second root
-    monkeypatch.setattr(gt, "_roots", lambda: [root, other])
-    with pytest.raises(TrashRefused, match="more than one root"):
-        restore(a.entry_id)
-    assert (_entry(a) / ITEM).exists()
-
-
-def test_two_roots_never_issue_the_same_id_in_the_same_second(tmp_path):
-    r1, r2 = tmp_path / "r1", tmp_path / "r2"
-    r1.mkdir()
-    r2.mkdir()
-    assert gt._claim_entry(r1, "x.txt").name != gt._claim_entry(r2, "x.txt").name
-
-
-def test_one_directory_behind_two_mount_points_is_one_root(tmp_path):
-    real = tmp_path / "m1"
-    (real / f".genesis-trash-{os.getuid()}").mkdir(parents=True, mode=0o700)
-    alias = tmp_path / "m2"
-    alias.symlink_to(real)
-    roots = gt._roots_from([str(real), str(alias), str(tmp_path / "none")])
-    assert roots[1:] == [real / f".genesis-trash-{os.getuid()}"]
-
-
 def test_a_file_gone_mid_scan_keeps_the_size_known(monkeypatch, tmp_path):
     d = tmp_path / "work"
     d.mkdir()
@@ -152,11 +122,6 @@ def test_a_file_gone_mid_scan_keeps_the_size_known(monkeypatch, tmp_path):
     monkeypatch.setattr(gt.os, "lstat", lstat)
     st = real_lstat(d)
     assert gt._size(d, st) == 3
-
-
-def test_mount_escapes_are_all_decoded():
-    assert gt._unescape_mount("/mnt/a\\040b\\011c\\012d\\134e") == "/mnt/a b\tc\nd\\e"
-    assert gt._unescape_mount("/plain") == "/plain"
 
 
 def test_an_undecodable_name_is_trashed_and_restored(tmp_path):
@@ -193,7 +158,7 @@ def test_home_is_refused(monkeypatch, tmp_path):
 
 def test_an_item_already_in_the_trash_is_refused(tmp_path):
     stone = trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
-    with pytest.raises(TrashRefused, match="already in a trash"):
+    with pytest.raises(TrashRefused, match="already in the trash"):
         trash(_entry(stone) / ITEM, reason="r", caller="c")
 
 
@@ -207,25 +172,100 @@ def test_the_claude_code_temp_volume_is_refused(monkeypatch, tmp_path):
     assert f.exists()
 
 
-def test_another_device_is_refused_and_never_copied(monkeypatch, tmp_path):
-    # Fake only the trash root's parent device: faking the ITEM's device would
-    # also flip os.path.ismount, which compares an item's device with its parent's.
+def test_another_volume_is_refused_and_never_copied(monkeypatch, tmp_path, root):
+    # Fake the trash parent's device only: faking the ITEM's device would also
+    # flip os.path.ismount, which compares an item's device with its parent's.
     f = _touch(tmp_path / "a.txt")
-    other = tmp_path / "other-volume"
-    other.mkdir()
-    monkeypatch.setattr(gt, "_root_for", lambda dev, item: other / "trash")
     real_stat = os.stat
 
     def fake_stat(p, *a, **k):
         st = real_stat(p, *a, **k)
-        if Path(p) == other:
+        if Path(p) == root.parent:
             return os.stat_result((st.st_mode, st.st_ino, st.st_dev + 999) + tuple(st)[3:])
         return st
 
     monkeypatch.setattr(gt.os, "stat", fake_stat)
-    with pytest.raises(TrashRefused, match="another device"):
+    with pytest.raises(TrashRefused, match="another volume") as exc:
         trash(f, reason="r", caller="c")
+    assert "Ask the user" in str(exc.value)  # never an invitation to rm it instead
     assert f.read_text() == "x"
+
+
+@pytest.mark.parametrize("raw", ["", ".", "..", "sub/.", "sub/..", "sub/./", "/"])
+def test_dot_paths_are_refused_before_normalising(monkeypatch, tmp_path, raw):
+    (tmp_path / "sub").mkdir()
+    _touch(tmp_path / "sub" / "keep.txt")
+    monkeypatch.chdir(tmp_path / "sub")
+    with pytest.raises(TrashRefused, match="not a trashable path"):
+        trash(raw, reason="r", caller="c")
+    assert (tmp_path / "sub" / "keep.txt").exists()
+
+
+def test_an_entry_that_cannot_be_created_is_a_refusal(monkeypatch, tmp_path, root):
+    import errno
+
+    f = _touch(tmp_path / "a.txt")
+    real_mkdir = os.mkdir
+
+    def full(p, *a, **k):
+        if Path(p).parent == root:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_mkdir(p, *a, **k)
+
+    monkeypatch.setattr(gt.os, "mkdir", full)
+    with pytest.raises(TrashRefused, match="cannot create a trash entry"):
+        trash(f, reason="r", caller="c")
+    assert f.exists()
+
+
+@pytest.mark.parametrize("bad", ["loop", "nul"])
+def test_an_unreadable_path_is_a_refusal_not_a_crash(tmp_path, bad):
+    if bad == "loop":
+        (tmp_path / "l1").symlink_to(tmp_path / "l2")
+        (tmp_path / "l2").symlink_to(tmp_path / "l1")
+        target = tmp_path / "l1" / "x"
+    else:
+        target = str(tmp_path / "a\0b")
+    with pytest.raises(TrashRefused):
+        trash(target, reason="r", caller="c")
+
+
+def test_a_long_multibyte_name_is_cut_on_a_character(tmp_path):
+    # 2 + 240 bytes: with the 18-byte stamp prefix a 200-byte cut lands
+    # mid-character, which a naive byte slice would split.
+    name = "ab" + "\u00e9" * 120
+    stone = trash(_touch(tmp_path / name), reason="r", caller="c")
+    assert len(os.fsencode(stone.entry_id)) <= gt._MAX_ENTRY_NAME
+    stone.entry_id.encode("utf-8")  # no lone surrogate from a split code point
+    assert restore(stone.entry_id) == tmp_path / name
+
+
+def test_a_symlinked_genesis_home_still_sees_its_own_trash(monkeypatch, tmp_path):
+    real = tmp_path / "realg"
+    real.mkdir()
+    link = tmp_path / "linkg"
+    link.symlink_to(real)
+    monkeypatch.setattr(gt, "home_trash_root", lambda: link / "trash")
+    stone = trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
+    inside = real / "trash" / stone.entry_id / ITEM
+    with pytest.raises(TrashRefused, match="already in the trash"):
+        trash(inside, reason="r", caller="c")
+    assert [e.complete for e in list_entries()] == [True]
+
+
+def test_restore_into_an_unreadable_place_is_a_refusal(tmp_path):
+    stone = trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0)
+    try:
+        if os.access(locked, os.R_OK):
+            pytest.skip("running as a user that ignores directory permissions")
+        with pytest.raises(TrashRefused):
+            restore(stone.entry_id, to=locked / "sub" / "a.txt")
+    finally:
+        locked.chmod(0o700)
+    assert (_entry(stone) / ITEM).exists()
 
 
 def test_a_cross_device_rename_failure_leaves_no_entry(monkeypatch, tmp_path, root):
@@ -237,7 +277,7 @@ def test_a_cross_device_rename_failure_leaves_no_entry(monkeypatch, tmp_path, ro
         raise OSError(errno.EXDEV, "Invalid cross-device link")
 
     monkeypatch.setattr(gt.os, "rename", exdev)
-    with pytest.raises(TrashRefused, match="another device"):
+    with pytest.raises(TrashRefused, match="another volume"):
         trash(f, reason="r", caller="c")
     assert f.exists()
     assert list(root.iterdir()) == []  # the claimed entry was removed
@@ -298,6 +338,37 @@ def test_cli_list_and_restore(tmp_path, capsys):
     assert main(["restore", stone.entry_id]) == 0
     assert f.exists()
     assert main(["restore", stone.entry_id]) == EXIT_REFUSED
+
+
+def test_cli_output_survives_odd_names(tmp_path, capsys):
+    trash(_touch(tmp_path / os.fsdecode(b"bad\xff")), reason="r", caller="c")
+    trash(_touch(tmp_path / "two\nlines"), reason="r", caller="c")
+    assert main(["list"]) == 0
+    out = capsys.readouterr().out
+    out.encode("utf-8")  # printable on a strict UTF-8 terminal
+    assert len(out.splitlines()) == 2  # one line per entry
+    assert "two\\nlines" in out and "bad\\xff" in out
+
+
+def test_a_symlink_loop_in_the_trash_location_is_a_refusal(monkeypatch, tmp_path):
+    (tmp_path / "la").symlink_to(tmp_path / "lb")
+    (tmp_path / "lb").symlink_to(tmp_path / "la")
+    monkeypatch.setattr(gt, "home_trash_root", lambda: tmp_path / "la" / "x" / "trash")
+    f = _touch(tmp_path / "a.txt")
+    with pytest.raises(TrashRefused):
+        trash(f, reason="r", caller="c")
+    assert f.exists()
+    assert list_entries() == []
+
+
+def test_cli_list_survives_a_hand_edited_tombstone(tmp_path, capsys):
+    stone = trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
+    tomb = _entry(stone) / TOMBSTONE
+    data = json.loads(tomb.read_text())
+    data["reason"] = "\ud800"
+    tomb.write_text(json.dumps(data))
+    assert main(["list"]) == 0
+    capsys.readouterr().out.encode("utf-8")
 
 
 def test_cli_usage_error_exits_64():

@@ -274,7 +274,9 @@ async def _clear_stale_dir(wt_path: Path, repo_root: Path, task_id: str) -> None
     from genesis.trash import TrashRefused, trash
 
     try:
-        stone = trash(
+        # Off the event loop: sizing a large orphan tree walks every file.
+        stone = await asyncio.to_thread(
+            trash,
             wt_path,
             reason=f"orphan task worktree directory, task {task_id}",
             caller="worktree_mgr.create_worktree",

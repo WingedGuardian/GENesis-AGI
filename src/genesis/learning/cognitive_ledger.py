@@ -213,7 +213,7 @@ async def rollback(
         reason = f"restore failed: {exc}"
         if stone is not None:  # the write failed after the current file was trashed
             try:
-                restore(stone.entry_id, root=Path(stone.root))
+                restore(stone.entry_id)
                 reason += "; the current file was put back"
             except TrashRefused as back:
                 reason += f"; the current file is in the trash as {stone.entry_id} ({back})"

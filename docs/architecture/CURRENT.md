@@ -2900,7 +2900,8 @@ verified: b0867170e 2026-10-02
 ```
 
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
-  item into a per-volume Genesis trash with a tombstone, never copying;
+  item into the Genesis trash (`~/.genesis/trash`) with a tombstone, never
+  copying, and refuses an item on another volume;
   `python -m genesis.trash list|restore`. Callers: cognitive rollback and the
   orphan task-worktree reset (`docs/reference/trash.md`). Stdlib only.
 - **hostmetrics/**: stdlib-only resource readings (container cgroup memory and

@@ -6,6 +6,7 @@ Exit codes: 0 done, 1 refused (the reason is on stderr), 64 usage error.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from genesis.trash import TrashRefused, list_entries, restore
@@ -25,6 +26,18 @@ class _Parser(argparse.ArgumentParser):
         sys.exit(EXIT_USAGE)
 
 
+def _show(value: object) -> str:
+    """Printable on any terminal: non-UTF-8 bytes as backslash escapes, control
+    characters (a newline in a name) escaped, so one entry stays one line."""
+    s = str(value)
+    try:
+        raw = os.fsencode(s)
+    except UnicodeEncodeError:  # a lone surrogate from a hand-edited tombstone
+        raw = s.encode("utf-8", "surrogatepass")
+    text = raw.decode("utf-8", "backslashreplace")
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in text)
+
+
 def _list() -> int:
     entries = list_entries()
     if not entries:
@@ -33,11 +46,14 @@ def _list() -> int:
     for e in entries:
         t = e.tombstone
         if t is None:
-            print(f"{e.path.name}  (no readable tombstone)  {e.path}")
+            print(f"{_show(e.path.name)}  (no readable tombstone)  {_show(e.path)}")
             continue
         size = "?" if t.size is None else f"{t.size} B"
-        state = "" if e.complete else "  INCOMPLETE (item missing)"
-        print(f"{t.entry_id}  {t.kind} {size}  {t.original_path}  [{t.caller}: {t.reason}]{state}")
+        state = "" if e.complete else "  INCOMPLETE (no item in the entry)"
+        print(
+            f"{_show(t.entry_id)}  {_show(t.kind)} {size}  {_show(t.original_path)}"
+            f"  [{_show(t.caller)}: {_show(t.reason)}]{state}"
+        )
     return 0
 
 
@@ -54,9 +70,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         dest = restore(args.entry, to=args.to)
     except TrashRefused as exc:
-        print(f"genesis.trash: refused: {exc}", file=sys.stderr)
+        print(f"genesis.trash: refused: {_show(exc)}", file=sys.stderr)
         return EXIT_REFUSED
-    print(f"restored to {dest}")
+    print(f"restored to {_show(dest)}")
     return 0
 
 

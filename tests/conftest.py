@@ -549,8 +549,6 @@ def _isolate_trash_root(tmp_path):
     the live ``~/.genesis/trash``. Fixture-owned ``MonkeyPatch``, as above."""
     mp = pytest.MonkeyPatch()
     mp.setattr("genesis.trash.home_trash_root", lambda: tmp_path / "genesis-trash")
-    # Listing also scans every mount for a per-volume trash; keep it to tmp.
-    mp.setattr("genesis.trash._roots", lambda: [tmp_path / "genesis-trash"])
     yield
     mp.undo()
 
