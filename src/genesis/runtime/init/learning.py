@@ -260,20 +260,24 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
     )
 
     async def _prune_graph_traverse() -> None:
-        # Graph-traversal telemetry (memory/graph_telemetry.py): eval_events rows
-        # read by the FalkorDB cutover verdict over a 14-day window, plus the
-        # local lost-writes file. Only that event type is pruned.
+        # Graph-traversal telemetry (memory/graph_telemetry.py) and the process
+        # census (memory/graph_census.py): eval_events rows read by the FalkorDB
+        # cutover verdict, plus the local lost-writes file. Only those two event
+        # types are pruned.
         if rt._db is None:
             return
         try:
             from genesis.db.crud import j9_eval as _j9
             from genesis.memory import graph_telemetry as _graph
+            from genesis.memory.graph_census import CENSUS_EVENT_TYPE
 
-            removed = await _j9.prune_event_type_older_than(
-                rt._db,
-                event_type=_graph.TELEMETRY_EVENT_TYPE,
-                days=_graph.TELEMETRY_RETENTION_DAYS,
-            )
+            removed = 0
+            for event_type in (_graph.TELEMETRY_EVENT_TYPE, CENSUS_EVENT_TYPE):
+                removed += await _j9.prune_event_type_older_than(
+                    rt._db,
+                    event_type=event_type,
+                    days=_graph.TELEMETRY_RETENTION_DAYS,
+                )
             _graph.prune_lost_writes()
             rt.record_job_success("graph_traverse_prune")
             if removed:
@@ -1643,6 +1647,12 @@ async def init(rt: GenesisRuntime) -> None:
         # policy — activity markers + live-terminal gate, dry-run→auto-arm).
         # Extracted to a testable seam; see process_reaper.py.
         _wire_process_reaper(rt._learning_scheduler, rt)
+
+        # Hourly census of memory-server processes: when the FalkorDB cutover
+        # clock may start (see memory/graph_census.py).
+        from genesis.memory.graph_census import _wire_graph_census
+
+        _wire_graph_census(rt._learning_scheduler, rt)
 
         # Rate-limit resume engine (re-dispatch parked CC work at reset; gated
         # per-tick by cc_rate_limit_resume mode). Testable seam; CronTrigger */10.

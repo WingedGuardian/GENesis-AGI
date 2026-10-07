@@ -58,8 +58,8 @@ async def test_wire_drip_retention_jobs_registers_all():
 
 
 async def test_graph_traverse_prune_removes_only_old_telemetry(db, tmp_path, monkeypatch):
-    """The job prunes graph_traverse rows past retention and nothing else, and
-    trims old lines from the local lost-writes file."""
+    """The job prunes graph_traverse and census rows past retention and nothing
+    else, and trims old lines from the local lost-writes file."""
     from datetime import UTC, datetime, timedelta
 
     from genesis.db.crud import j9_eval
@@ -81,6 +81,13 @@ async def test_graph_traverse_prune_removes_only_old_telemetry(db, tmp_path, mon
         db, dimension="memory", event_type="recall_trace",
         metrics={"k": "other-type"}, timestamp=_ts(old),
     )
+    from genesis.memory.graph_census import CENSUS_EVENT_TYPE
+
+    for label, age in (("census-old", old), ("census-recent", 1)):
+        await j9_eval.insert_event(
+            db, dimension="system", event_type=CENSUS_EVENT_TYPE,
+            metrics={"k": label}, timestamp=_ts(age),
+        )
 
     monkeypatch.setenv("GENESIS_HOME", str(tmp_path))
     lost = graph_mod.lost_writes_path()
@@ -101,6 +108,7 @@ async def test_graph_traverse_prune_removes_only_old_telemetry(db, tmp_path, mon
     left = [(r[0], r[1]) for r in await cur.fetchall()]
     assert left == [
         (graph_mod.TELEMETRY_EVENT_TYPE, '{"k": "recent"}'),
+        (CENSUS_EVENT_TYPE, '{"k": "census-recent"}'),
         ("recall_trace", '{"k": "other-type"}'),
     ]
     assert lost.read_text() == '{"ts": "2999-01-01T00:00:00.000000Z"}\n'

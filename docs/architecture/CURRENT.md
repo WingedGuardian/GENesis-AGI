@@ -269,6 +269,20 @@ process. `graph_traverse_prune` deletes rows, and file lines, older than 30 days
 kill switch `GENESIS_GRAPH_TELEMETRY_DISABLED=1`.
 The fallback WARNINGs alone could never answer this: MCP servers log to stderr,
 which never reaches the journal.
+A memory server started before that code was deployed traverses without writing
+anything, so genesis-server also runs an **hourly census** (`graph_traverse_census`
+job, `:45`, `memory/graph_census.py`): one `eval_events` row
+(`event_type="graph_traverse_census"`) listing each live
+`genesis_mcp_server.py --server memory` process with its start time, every
+commit the main checkout has held since it started (read by
+`scripts/lib/serving_commit.py`, the reader the deploy scripts use, which refuses
+on a reflog gap, a move in the start second, a clock step back or git's expiry
+cutoff), whether ALL of them contain the telemetry module (a module imported
+after start loads whatever is on disk then), its exec-time kill switch and DB
+path, plus whether HEAD has the module and whether `src/genesis/memory/` is
+dirty. Git runs with `--no-optional-locks`, so the hourly read never takes the
+index lock a deploy needs. The cutover clock can only start at a census with no
+server that could be running older code. Pruned with the telemetry rows.
 
 Freshness has one stated boundary: all 13 `invalidate_graph_cache()` sites are
 `memory_links` writers, while the visibility predicate below reads
