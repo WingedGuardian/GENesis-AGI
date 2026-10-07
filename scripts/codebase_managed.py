@@ -49,7 +49,7 @@ def config_path(raw: str) -> Path:
     path = absolute(raw)
     if not path.name:
         raise ValueError("settings path must name a file")
-    return path.parent.resolve() / path.name
+    return absolute(str(path.parent.resolve() / path.name))
 
 
 def units_dir() -> Path:
@@ -415,13 +415,16 @@ def configure(args: argparse.Namespace, path: Path) -> None:
         runtime=str(state / "runtime"),
         sentinel=str(absolute(args.sentinel)),
     )
+    validate_settings(config)
     with lifecycle_lock():
         if any(os.path.lexists(p) for p in (path, absolute(args.state), state)):
             raise ValueError("existing settings/state preserved; choose a fresh staging state")
+        staging_created = False
         try:
             existing_parent = first_existing_parent(state)
             with verified_binary(source) as executable:
                 state.mkdir(parents=True, mode=0o700)
+                staging_created = True
                 (state / "bin").mkdir(mode=0o700)
                 with Path(config["binary"]).open("xb") as destination:
                     shutil.copyfileobj(executable, destination)
@@ -449,9 +452,10 @@ def configure(args: argparse.Namespace, path: Path) -> None:
             sync_ancestors(path.parent, settings_parent)
             publish_settings(path, config)
         except BaseException:
-            print(
-                f"Incomplete staging retained at {state}; inspect before retrying", file=sys.stderr
-            )
+            if staging_created:
+                print(
+                    f"Incomplete staging retained at {state}; inspect before retrying", file=sys.stderr
+                )
             raise
     print("Configured; no service activated. Native lifecycle integration is a separate step.")
 
