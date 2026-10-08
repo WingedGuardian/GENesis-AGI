@@ -94,6 +94,7 @@ EXPECTED_TABLES = [
     "peer_task_runtime",
     "peer_task_consents",
     "peer_operations",
+    "peer_artifacts",
 ]
 
 

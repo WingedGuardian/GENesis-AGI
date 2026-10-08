@@ -5,7 +5,17 @@ from __future__ import annotations
 import json
 import math
 
-from a2a.types import CancelTaskRequest, Role, SendMessageRequest, Task, TaskState, TaskStatus
+from a2a.types import (
+    Artifact,
+    CancelTaskRequest,
+    Message,
+    Part,
+    Role,
+    SendMessageRequest,
+    Task,
+    TaskState,
+    TaskStatus,
+)
 from a2a.utils.errors import InvalidParamsError, UnsupportedOperationError, VersionNotSupportedError
 from a2a.utils.proto_utils import validate_proto_required_fields
 from google.protobuf.json_format import MessageToDict, ParseDict
@@ -126,4 +136,26 @@ def task_view(row: dict) -> Task:
         stamp = Timestamp()
         stamp.FromJsonString(row["updated_at"])
         status.timestamp.CopyFrom(stamp)
-    return Task(id=row["id"], context_id=row["context_id"], status=status)
+    task = Task(id=row["id"], context_id=row["context_id"], status=status)
+    result = row.get("_peer_result")
+    text = result["summary"] if result is not None else row.get("_peer_reason")
+    if text:
+        task.status.message.CopyFrom(
+            Message(
+                message_id=row["id"] + ":status",
+                role=Role.ROLE_AGENT,
+                parts=[Part(text=text)],
+                context_id=row["context_id"],
+                task_id=row["id"],
+            )
+        )
+    if result is not None:
+        task.artifacts.append(
+            Artifact(
+                artifact_id=result["artifact_id"],
+                name="result.md",
+                parts=[Part(url=result["url"], media_type="text/plain", filename="result.md")],
+            )
+        )
+        task.metadata.update({"toolsSummary": result["tools_summary"]})
+    return task

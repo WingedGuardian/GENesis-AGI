@@ -42,7 +42,10 @@ handoff requires its exact task/generation/segment/session proof, confirmed
 drain, current disclosure authority, no outstanding hold and known consequential
 outcomes. An exact-budget timely result can be handed off after cleanup; it
 cannot start another execution segment. The required trusted result publisher is
-an internal seam supplied by the owned-results slice, not an exposed callback.
+an internal seam supplied by `PeerArtifacts`, not an exposed callback. Its final
+transaction rechecks authority and receipts before atomically publishing the
+artifact, completing the task and retiring its provider park. See
+[owned results](peer-results.md).
 
 The early integration fixture uses actual SQLite, runner, Unix broker, stdio
 facade, notification pipeline and authenticated dashboard resolution, with fake

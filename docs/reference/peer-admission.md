@@ -17,7 +17,8 @@ and `A2A-Version: 1.0`:
   accepted. Request configuration `returnImmediately: true` returns the durable
   submitted task. Otherwise the route waits up to thirty seconds; 504 includes
   its task ID and leaves accepted work durable.
-- `GET /v1/agent/a2a/tasks/<id>`: owned task state and timestamps.
+- `GET /v1/agent/a2a/tasks/<id>`: owned task state and timestamps; authorized
+  completed publication can also supply a safe status preview and artifact URL.
 - `GET /v1/agent/a2a/tasks`: `pageSize` defaults to twenty, maximum one hundred;
   `pageToken` is bound to the peer and relationship epoch. Unsupported filters
   are refused. Other peers' task IDs and cursors return 404.
@@ -44,6 +45,9 @@ expiry. Paused/held segments retain durable state; their slot policy belongs to
 that coordinator. Legacy direct-session claiming and stale-claim recovery exclude
 peer queue rows, so they cannot fall through to an unconstrained session.
 
-Status views disclose no input history, tool arguments, internal paths or results
-in this slice. Runtime execution, approval notifications/resume and artifact
-publication require their dependent PRs and separate functionality/E2E evidence.
+Status views disclose no input history, tool arguments or internal paths. The
+dependent [owned result components](peer-results.md) project safe publication
+snapshots and serve authenticated full artifacts. LIST omits artifact references
+but still checks preview authority. Approval holds and failures use constant
+status explanations. Complete runtime installation and recovery remain required
+before public activation, with separate functionality/E2E evidence.

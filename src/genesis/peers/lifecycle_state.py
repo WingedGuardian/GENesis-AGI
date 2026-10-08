@@ -94,7 +94,7 @@ async def disclosure_authorized(db, row):
         raise TaskRefusal("unauthorized", 401)
 
 
-async def effects_known(db, task_id):
+async def effects_known(db, task_id, *, persist=True):
     """Stopped work is not evidence of a known consequential outcome."""
     unknown = await (
         await db.execute(
@@ -103,7 +103,7 @@ async def effects_known(db, task_id):
             (task_id,),
         )
     ).fetchone()
-    if unknown is not None:
+    if unknown is not None and persist:
         await db.execute(
             "UPDATE peer_task_runtime SET hold_reason='reconciliation',"
             "safe_error='Operation outcome requires owner reconciliation' WHERE task_id=?",

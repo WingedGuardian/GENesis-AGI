@@ -130,20 +130,22 @@ class PeerTasks:
                 ).fetchone()
             )
 
-    async def owned(self, identity: dict, task_id: str) -> dict:
-        async with self.registry.connection() as db:
-            row = await (
-                await db.execute(
-                    "SELECT t.* FROM peer_tasks t JOIN peers p ON p.peer_id=t.peer_id "
-                    "WHERE t.id=? AND t.peer_id=? AND t.epoch=? AND p.epoch=t.epoch AND p.active=1 "
-                    "AND EXISTS(SELECT 1 FROM peer_grants g WHERE g.peer_id=p.peer_id "
-                    "AND g.capability='conversation' AND g.decision!='deny')",
-                    (task_id, identity["peer_id"], identity["epoch"]),
-                )
-            ).fetchone()
-            if row is None:
-                raise TaskRefusal("not_found", 404)
-            return dict(row)
+    async def owned(self, identity: dict, task_id: str, *, db=None) -> dict:
+        if db is None:
+            async with self.registry.connection() as connection:
+                return await self.owned(identity, task_id, db=connection)
+        row = await (
+            await db.execute(
+                "SELECT t.* FROM peer_tasks t JOIN peers p ON p.peer_id=t.peer_id "
+                "WHERE t.id=? AND t.peer_id=? AND t.epoch=? AND p.epoch=t.epoch AND p.active=1 "
+                "AND EXISTS(SELECT 1 FROM peer_grants g WHERE g.peer_id=p.peer_id "
+                "AND g.capability='conversation' AND g.decision!='deny')",
+                (task_id, identity["peer_id"], identity["epoch"]),
+            )
+        ).fetchone()
+        if row is None:
+            raise TaskRefusal("not_found", 404)
+        return dict(row)
 
     async def page(
         self, identity: dict, *, page_size: int = 20, page_token: str = ""
