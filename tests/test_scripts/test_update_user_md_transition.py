@@ -24,6 +24,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE_SH = REPO_ROOT / "scripts" / "update.sh"
+# update.sh runs these checkouts through genesis_without_checkout_lock, which
+# the extracted block needs defined, exactly as update.sh sources it.
+LOCK_LIB = REPO_ROOT / "scripts" / "lib" / "checkout_lock.sh"
 
 USER_MD_REL = "src/genesis/identity/USER.md"
 _TEMPLATE = "# User Profile\n\n- **Name**: Your name\n"
@@ -39,7 +42,7 @@ def _extract_block(name: str) -> str:
 
 
 def _run_block(name: str, genesis_root: Path, home: Path) -> subprocess.CompletedProcess:
-    script = _extract_block(name)
+    script = f'. "{LOCK_LIB}"\n' + _extract_block(name)
     return subprocess.run(
         ["bash", "-c", script],
         env={"GENESIS_ROOT": str(genesis_root), "HOME": str(home), "PATH": "/usr/bin:/bin"},

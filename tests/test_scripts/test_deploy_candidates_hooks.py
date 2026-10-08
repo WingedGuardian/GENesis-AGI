@@ -521,9 +521,7 @@ def test_a_drop_off_live_goes_through_for_a_hook_sync_never_installs(dc, dc_read
 def test_a_sync_list_naming_the_hook_directory_itself_is_refused(dc, dc_ready, capsys, name):
     w = dc_ready
     sync = (w.root / "scripts" / "hooks" / "sync-hooks.sh").read_text()
-    listed = sync.replace(
-        '    "pre-merge-commit"\n', f'    "pre-merge-commit"\n    "{name}"\n', 1
-    )
+    listed = sync.replace('    "pre-merge-commit"\n', f'    "pre-merge-commit"\n    "{name}"\n', 1)
     assert listed != sync
     w.candidate("feat/l", {"scripts/hooks/sync-hooks.sh": listed})
     assert _approve(w, dc, "feat/l") == 1
@@ -566,3 +564,133 @@ def test_a_candidate_that_makes_a_hook_directory_a_symlink_is_refused(
     assert f"makes {hook_dir} a symbolic link" in capsys.readouterr().err
     assert _approve(w, dc, "feat/d") == 1
     assert not w.manifest_path.exists()
+
+
+# ── a hook list the rebuilt tip holds (#3067) ──────────────────────────────
+
+
+def _listing(w, *names: str, repo=None) -> str:
+    """sync-hooks.sh with ``names`` added to HOOKS_TO_SYNC, read from ``repo``
+    (default: the checkout)."""
+    sync = ((repo or w.root) / "scripts" / "hooks" / "sync-hooks.sh").read_text()
+    extra = "".join(f'    "{n}"\n' for n in names)
+    listed = sync.replace('    "pre-merge-commit"\n', '    "pre-merge-commit"\n' + extra, 1)
+    assert listed != sync, "the fixture's sync-hooks.sh changed shape"
+    return listed
+
+
+def test_a_list_and_another_candidates_directory_are_excluded_together(dc, dc_ready, capsys):
+    """X lists `foo` (absent at X's head) and Y adds `foo/x.py` (a regular
+    leaf): each passes admission alone, and together the rebuilt `live` would
+    list a directory, which sync-hooks.sh skips and readiness then refuses on
+    every later rebuild. Both are excluded by name; status predicts it."""
+    w = dc_ready
+    w.candidate("feat/x", {"scripts/hooks/sync-hooks.sh": _listing(w, "foo")})
+    w.candidate("feat/y", {"scripts/hooks/foo/x.py": "x = 1\n"})
+    hz = w.candidate("feat/z", {"z.txt": "z\n"})
+    assert _approve(w, dc, "feat/x") == 0, capsys.readouterr()
+    assert _approve(w, dc, "feat/y") == 0, capsys.readouterr()
+    assert w.add(dc, "feat/z") == 0
+    capsys.readouterr()
+    assert w.run(dc, "status") == 0
+    predicted = capsys.readouterr().out
+    assert predicted.count("which is a directory there") == 2, predicted
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/x" in out and "EXCLUDED: feat/y" in out, out
+    assert w.live_merges() == [("feat/z", hz)]
+    # The next rebuild's readiness still passes: nothing listed is a directory.
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+
+
+def test_an_unrelated_list_edit_is_not_blamed_for_mains_listed_name(dc, dc_ready, capsys):
+    """origin/main lists `foo` with no source yet. Y adds `foo/x.py`, which makes
+    the listed name a directory: Y is excluded. Z's approved list edit adds an
+    unrelated name and stays live."""
+    w = dc_ready
+    w.advance_main({"scripts/hooks/sync-hooks.sh": _listing(w, "foo")})
+    hy = w.candidate("feat/y", {"scripts/hooks/foo/x.py": "x = 1\n"})
+    hz = w.candidate("feat/z", {"scripts/hooks/sync-hooks.sh": _listing(w, "bar", repo=w.up)})
+    assert hy
+    assert _approve(w, dc, "feat/y") == 0, capsys.readouterr()
+    assert _approve(w, dc, "feat/z") == 0, capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/y" in out and "which is a directory there (feat/y)" in out, out
+    assert "EXCLUDED: feat/z" not in out, out
+    assert w.live_merges() == [("feat/z", hz)]
+
+
+def test_a_stale_list_naming_what_main_made_a_directory_is_excluded(dc, dc_ready, capsys):
+    """X was cut before origin/main added the directory `foo/`, so its list
+    passed admission; on the rebuilt tip it names a directory main made. X
+    (the list's owner) is excluded."""
+    w = dc_ready
+    w.candidate("feat/x", {"scripts/hooks/sync-hooks.sh": _listing(w, "foo")})
+    hz = w.candidate("feat/z", {"z.txt": "z\n"})
+    assert _approve(w, dc, "feat/x") == 0, capsys.readouterr()
+    assert w.add(dc, "feat/z") == 0
+    w.advance_main({"scripts/hooks/foo/x.py": "x = 1\n"})
+    capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/x" in out and "which is a directory there (feat/x)" in out, out
+    assert w.live_merges() == [("feat/z", hz)]
+
+
+def test_a_file_and_a_directory_at_one_hook_name_conflict(dc, dc_ready, capsys):
+    """X adds a regular `foo` and lists it; Y adds `foo/x.py`. git cannot merge
+    a file and a directory at one path, so the later candidate is excluded as a
+    conflict and X goes live with its approved hook installed."""
+    w = dc_ready
+    hook = "#!/bin/sh\nexit 0\n"
+    hx = w.candidate(
+        "feat/x",
+        {"scripts/hooks/sync-hooks.sh": _listing(w, "foo"), "scripts/hooks/foo": hook},
+    )
+    w.candidate("feat/y", {"scripts/hooks/foo/x.py": "x = 1\n"})
+    assert _approve(w, dc, "feat/x") == 0, capsys.readouterr()
+    assert _approve(w, dc, "feat/y") == 0, capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/y" in out and "conflicts with" in out, out
+    assert w.live_merges() == [("feat/x", hx)]
+    assert _installed(w, "foo") == hook
+
+
+def test_an_edit_inside_a_directory_main_already_had_is_not_blamed(dc, dc_ready, capsys):
+    """origin/main adds the unlisted directory `foo/` after X was cut; X lists
+    `foo`. W edits a file in that directory: W did not make `foo` a directory,
+    so only X is excluded."""
+    w = dc_ready
+    w.candidate("feat/x", {"scripts/hooks/sync-hooks.sh": _listing(w, "foo")})
+    w.advance_main({"scripts/hooks/foo/x.py": "x = 1\n"})
+    hw = w.candidate("feat/w", {"scripts/hooks/foo/x.py": "x = 2\n"})
+    assert _approve(w, dc, "feat/x") == 0, capsys.readouterr()
+    assert _approve(w, dc, "feat/w") == 0, capsys.readouterr()
+    capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/x" in out and "which is a directory there (feat/x)" in out, out
+    assert "EXCLUDED: feat/w" not in out, out
+    assert w.live_merges() == [("feat/w", hw)]
+
+
+def test_a_list_is_judged_after_the_candidates_excluded_for_other_reasons(dc, dc_ready, capsys):
+    """Y and V both add the same `foo/x.py` (identical bytes merge cleanly), so
+    the one-owner rule excludes both. X's list names `foo`, which is absent once
+    they are gone: X goes live rather than being blamed for a directory nobody
+    keeps."""
+    w = dc_ready
+    hx = w.candidate("feat/x", {"scripts/hooks/sync-hooks.sh": _listing(w, "foo")})
+    w.candidate("feat/y", {"scripts/hooks/foo/x.py": "x = 1\n"})
+    w.candidate("feat/v", {"scripts/hooks/foo/x.py": "x = 1\n"})
+    for b in ("feat/x", "feat/y", "feat/v"):
+        assert _approve(w, dc, b) == 0, capsys.readouterr()
+    capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/y" in out and "EXCLUDED: feat/v" in out, out
+    assert "drop all but one" in out, out
+    assert "EXCLUDED: feat/x" not in out, out
+    assert w.live_merges() == [("feat/x", hx)]

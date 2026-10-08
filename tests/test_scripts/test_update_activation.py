@@ -83,7 +83,12 @@ def _merge_assertion_block() -> str:
     )
 
 
-_STUBS = """
+# The real checkout-lock lib: update.sh runs the hook-running git calls in these
+# blocks through genesis_without_checkout_lock, which with no lock held runs the
+# command as is.
+_CHECKOUT_LOCK_LIB = '. "' + str(REPO_ROOT / "scripts/lib/checkout_lock.sh") + '"\n'
+
+_STUBS = _CHECKOUT_LOCK_LIB + """
 ROLLBACK_TAG=test-rollback-tag
 _clear_deploy_state() { echo CLEARED-STATE; }
 _do_rollback() { echo "ROLLBACK: $1"; }
@@ -289,7 +294,11 @@ def test_the_real_merge_line_refuses_an_ignored_file_on_a_fast_forward(tmp_path)
     The control strips only the flag and shows git overwriting it, so the flag is
     what bites."""
     text = UPDATE.read_text()
-    line = next(ln for ln in text.splitlines() if ln.startswith("MERGE_OUTPUT=$(git -C"))
+    line = next(
+        ln
+        for ln in text.splitlines()
+        if ln.startswith("MERGE_OUTPUT=$(") and 'git -C "$GENESIS_ROOT" merge ' in ln
+    )
     assert "--no-overwrite-ignore" in line
 
     def attempt(merge_line: str) -> tuple[str, bytes]:
@@ -308,7 +317,8 @@ def test_the_real_merge_line_refuses_an_ignored_file_on_a_fast_forward(tmp_path)
         (clone / "local.env").write_bytes(b"LOCAL-SECRET\n")
         deploy_head = _git(clone, "rev-parse", "origin/main")
         script = (
-            f'GENESIS_ROOT="{clone}"\nDEPLOY_HEAD="{deploy_head}"\nMERGE_RC=0\n'
+            _CHECKOUT_LOCK_LIB
+            + f'GENESIS_ROOT="{clone}"\nDEPLOY_HEAD="{deploy_head}"\nMERGE_RC=0\n'
             f'{merge_line}\necho "RC=$MERGE_RC"\n'
         )
         r = _run(script, tmp_path)

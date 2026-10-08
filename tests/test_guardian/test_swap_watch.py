@@ -132,6 +132,27 @@ async def test_live_zero_activates_and_info_alerts(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_live_zero_under_a_byte_ceiling_is_reported_not_overwritten(tmp_path):
+    """The persistent key holds a byte ceiling, yet the live cgroup reads 0.
+    Writing "max" would replace the ceiling with unlimited swap until the next
+    restart, so the live half is reported and left alone."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc({"get": (0, "2GiB", "")})
+    act = AsyncMock(return_value=True)
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="0")),
+        patch.object(swap_watch, "activate_swap_max", act),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    act.assert_not_awaited()
+    assert [c[2] for c in sp.calls] == ["get"]  # the ceiling itself is kept too
+    assert _sent_severities(d) == [AlertSeverity.WARNING]
+    assert "2GiB" in d.send.call_args.args[0].body
+
+
+@pytest.mark.asyncio
 async def test_live_heal_with_unverified_config_warns_not_info(tmp_path):
     """config read fails but the cgroup is still writable and at 0: activating
     live must NOT claim a clean reconcile — the persistent knob is unverified
@@ -313,3 +334,220 @@ def test_run_check_wires_the_watch():
     text = Path(check_mod.__file__).read_text()
     assert "await _check_container_swap_and_alert(config, dispatcher)" in text
     assert "from genesis.guardian.swap_watch import check_container_swap_and_alert" in text
+
+
+@pytest.mark.asyncio
+async def test_byte_valued_knob_is_not_reset_to_true(tmp_path):
+    """A parseable Incus byte size (the native swap-ceiling form) is swap-on
+    and must NOT be reset to ``true`` — doing so is a live Incus update that
+    rewrites the cgroup to 0 (Incus 6.0 driver_lxc.go, confirmed from source:
+    any ``limits.memory.swap`` value other than a parseable size or explicit
+    false writes ``SetMemorySwapLimit(0)`` at apply time). Resetting it here
+    would flip swap off every tick on an operator- or guardian-set ceiling."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc({"get": (0, "10737418240\n", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="10737418240")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get"], "a byte value must not trigger a 'set'"
+    assert not d.send.called
+
+
+@pytest.mark.asyncio
+async def test_byte_valued_knob_with_suffix_is_not_reset(tmp_path):
+    """Same, for a human-written size with a unit suffix ('8GiB')."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc({"get": (0, "8GiB\n", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get"]
+    assert not d.send.called
+
+
+@pytest.mark.asyncio
+async def test_garbage_knob_value_is_still_healed(tmp_path):
+    """A value that is neither a bool nor a parseable size is NOT swap-on and
+    still gets reconciled to true (distinguishes 'not recognized as a size'
+    from 'recognized as swap-on')."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc({"get": (0, "garbage\n", ""), "set": (0, "", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get", "set"]
+
+
+@pytest.mark.asyncio
+async def test_bare_zero_knob_is_still_reconciled(tmp_path):
+    """'0' is NOT a 0-byte ceiling here — Incus's own IsFalse("0") claims it
+    as a boolean before any byte-size parsing is attempted (shared/util/
+    boolean.go), so it must be reconciled to 'true' exactly like 'false'.
+    Misreading it as a byte size would silently defeat the guardian's
+    deliberate-override policy for this one spelling of false."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc({"get": (0, "0\n", ""), "set": (0, "", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get", "set"]
+
+
+@pytest.mark.asyncio
+async def test_bare_one_knob_is_not_reset(tmp_path):
+    """'1' is Incus's IsTrue("1") — treated exactly like 'true' (same
+    SetMemorySwapLimit(0) branch), so there is nothing to reconcile."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc({"get": (0, "1\n", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get"]
+
+
+@pytest.mark.asyncio
+async def test_zero_valued_suffixed_sizes_are_still_reconciled(tmp_path):
+    """A zero-valued byte-size ceiling parses structurally but represents
+    zero bytes of swap -- Incus applies it literally and disables swap,
+    exactly like the boolean FALSE spellings. Every zero-valued suffix form
+    must still heal to 'true', not be mistaken for an already-on ceiling.
+    (Codex finding on PR #3069.)"""
+    for zero_form in ("0B", "0 bytes", "00GiB", "0GiB", "0kB", "0MB", "0TiB", "0PB", "0EiB"):
+        cfg = _Cfg(tmp_path)
+        d = _dispatcher()
+        sp = _subproc({"get": (0, f"{zero_form}\n", ""), "set": (0, "", "")})
+        with (
+            patch.object(swap_watch, "_run_subprocess", sp),
+            patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+        ):
+            await swap_watch.check_container_swap_and_alert(cfg, d)
+        assert [c[2] for c in sp.calls] == ["get", "set"], (
+            f"{zero_form!r} must be reconciled (it is zero bytes of swap), not left alone"
+        )
+
+
+@pytest.mark.asyncio
+async def test_nonzero_value_with_leading_zero_digits_is_not_reset(tmp_path):
+    """A leading-zero-padded but genuinely NONZERO value ('010GiB' = 10 GiB)
+    must still be recognized as swap-on -- the fix targets an all-zero
+    digit run, not any digit string containing a zero."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc({"get": (0, "010GiB\n", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get"]
+
+
+@pytest.mark.asyncio
+async def test_long_zero_padded_nonzero_size_does_not_raise(tmp_path):
+    """4,301 leading zeros + '1GiB' is a legitimate (if perverse) 1 GiB
+    ceiling Incus's own parser accepts with no overflow -- Python's
+    int(raw) would raise ValueError past ~4,300 digits and must never be
+    used for the nonzero check. Must be recognized as swap-on (not reset),
+    and must not raise. (Second Codex finding on PR #3069.)"""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    huge = ("0" * 4301) + "1GiB"
+    sp = _subproc({"get": (0, f"{huge}\n", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get"]
+
+
+@pytest.mark.asyncio
+async def test_long_zero_padded_all_zero_size_is_reconciled(tmp_path):
+    """The all-zero counterpart of the above: a huge digit run that is
+    genuinely all zeros must still be recognized as swap-off and healed,
+    and must not raise."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    huge_zero = ("0" * 4301) + "GiB"
+    sp = _subproc({"get": (0, f"{huge_zero}\n", ""), "set": (0, "", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get", "set"]
+
+
+# ── direct unit coverage of the classification functions ───────────────────
+# (fresh-context class audit, 2026-10-08: coverage lived only behind the
+# subprocess-mocked integration surface; these probe the pure functions
+# directly, cheaper insurance against a future round finding a case the
+# integration tests happen not to exercise.)
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", False),
+        ("   ", False),
+        ("true", True),
+        ("True", True),
+        ("TRUE", True),
+        ("tRuE", True),
+        ("1", True),
+        ("yes", True),
+        ("YES", True),
+        ("on", True),
+        ("ON", True),
+        ("false", False),
+        ("False", False),
+        ("0", False),
+        ("no", False),
+        ("NO", False),
+        ("off", False),
+        ("OFF", False),
+        ("00", False),  # not a word-list member -> falls through to size parsing, all zeros
+        ("01", True),   # not a word-list member -> size parsing, nonzero
+        ("2", True),
+        ("42", True),
+        ("5GiB", True),
+        ("0GiB", False),
+        ("00GiB", False),
+        # The suffix is no longer separately validated (Codex finding,
+        # "Remove the second Incus size parser") -- any nonzero digit
+        # PREFIX is trusted as a swap-on ceiling, on the theory that
+        # incus config get could only ever have returned it after Incus's
+        # OWN write-time validator accepted it on some version. These four
+        # all have a nonzero leading digit run, so they now read True even
+        # though their "suffix" (whatever trails the digits) isn't one
+        # this file's old allowlist recognized -- a real Incus would have
+        # refused "1.5GiB"/"5Gib"/"5XB"/"5 GiB" as a `config set` in the
+        # first place, so this function is never asked to judge them in
+        # practice; what matters is that it no longer FALSELY rejects a
+        # real future suffix it simply hasn't seen before.
+        ("5Gib", True),
+        ("5XB", True),
+        ("1.5GiB", True),
+        ("5 GiB", True),
+        ("+5GiB", False),   # sign -- '+' isn't an ASCII digit, no leading run at all
+        ("-5GiB", False),
+        ("garbage", False),
+        ("५GiB", False),    # Devanagari digit 5 -- not an ASCII digit
+    ],
+)
+def test_is_swap_on_matrix(value, expected):
+    assert swap_watch._is_swap_on(value) is expected, value

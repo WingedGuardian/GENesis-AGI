@@ -1754,7 +1754,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 788dd9a9 2026-09-06
+verified: 477efb7f7 2026-10-05
 ```
 
 - **Peer-handoff surface (2026-09-26)**: a SessionStart hook
@@ -1768,6 +1768,14 @@ verified: 788dd9a9 2026-09-06
   keyed to name + content hash, so a rewritten handoff resurfaces). The hook's scan
   runs in a forked worker under a hard deadline (`SCAN_TIMEOUT_S`) — a hung mount
   reads as UNKNOWN, never as silence. Marked via `python -m genesis handoffs mark`.
+  Write side (2026-10-07, `session_awareness/handoff_send.py`): for installs that
+  share no directory, `python -m genesis handoffs send` delivers a file over ssh
+  into the peer's configured `dir` (refuses when unset; same sha = no-op, different
+  content needs `--replace`; read back by sha256), and with `--session` adds one
+  fixed-text pointer row to that peer session's ledger and checks `charter.md`.
+  `handoffs sessions` is a read-only peer listing. Peers: `config/peers.yaml` +
+  local overlay. Context transfer only, untrusted on arrival; not the findings
+  pipeline. See `docs/reference/peer-handoff.md`.
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
   (`scripts/surface_pr_updates.py` → `session_awareness/pr_watch.py`) mirrors the
   GitHub-steward owner notifications already in `outreach_history` (category
@@ -1834,7 +1842,13 @@ verified: 788dd9a9 2026-09-06
   commits behind from local refs, missing systemd units, host-guardian
   deployed_commit via `~/.genesis/host_gateway_state.json`; collectors in
   `observability/snapshots/deploy_health.py`), `high` on any drift, `critical`
-  only sustained (≥7d AND ≥20 commits, or a missing unit alerted >24h).
+  only sustained (≥7d AND ≥20 commits, or a missing unit alerted >24h). The
+  same check reports tracked files edited in place in the deploy checkout
+  (`main_checkout_dirty`, judged by the deploy scripts' own bash predicate,
+  so a deploy would refuse): its own wording without the update.sh advice,
+  never critical; an unreadable status alerts only on the second consecutive
+  tick, and the first unreadable tick (or a tick during a deploy) holds the
+  check rather than resolving a standing dirty alert.
   Also (hourly) ego cycle liveness (`_check_ego_liveness`, `ego/liveness.py`): an
   ego with no COMPLETED cycle past a conservative multiple of its current
   interval (the `job_health.last_success` gap — never the `is_running`/heartbeat/
@@ -2955,7 +2969,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, env.py,
           _config_overlay.py]
-verified: b0867170e 2026-10-02
+verified: 477efb7f7 2026-10-05
 ```
 
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
@@ -3130,7 +3144,11 @@ verified: b0867170e 2026-10-02
   `~/.genesis/host_gateway_state.json`, written by `cc_align_host_sync` on
   every gateway version probe — update.sh and the nightly cc-align timer);
   its `GUARDIAN_HOST_PATHS` must stay in LOCKSTEP with update.sh
-  GUARDIAN_PATHS. **Total-cessation detection** (`observability/liveness.py`,
+  GUARDIAN_PATHS. Its `main_checkout` probe SOURCES
+  `scripts/lib/deploy_marker.sh` + `deploy_checkout.sh` on every snapshot
+  (listed in deploy_status.sh `_RUNTIME_FRESH_SCRIPTS`), read-only
+  (`GIT_OPTIONAL_LOCKS=0`, own process group killed on timeout): do not copy
+  the ephemeral-path regex into Python. **Total-cessation detection** (`observability/liveness.py`,
   and for outreach a deliberately channel-INDEPENDENT heartbeat in
   `outreach/heartbeat.py`): a subsystem that stops entirely emits nothing, so
   absence-of-signal is itself the signal — the alarm keys on the gap since the

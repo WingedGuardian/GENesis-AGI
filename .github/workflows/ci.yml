@@ -1141,6 +1141,16 @@ jobs:
         # (+40), test_deploy_candidates_drop_status.py 68 -> 69 (+1),
         # test_deploy_checkout.py 51 -> 52 (+1); the others are unchanged.
         # No added skips. Floor: 24962 + 42 = 25004; skip ceiling remains 102.
-        # Corpus/adapters replacement: 89 additional cases; no added skips.
-        # Integrated main floor 25004 + 89 + 26 review regressions = 25119.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25119
+        #
+        # Checkout mutation fence (#2870): +36 collected tests, measured with
+        # --collect-only against main's versions of the changed test files
+        # (checkout-lock shell and Python tests, invoker +8, child_env +1,
+        # deploy/update/candidate lock and rollback tests); no added skips.
+        # Floor: 25004 + 36 = 25040.
+        #
+        # Corpus/adapters replacement (#3071): +115 collected tests, measured with
+        # --collect-only against main's versions of the changed test files
+        # (test_qualification +63, test_qualification_references +24,
+        # test_qualification_rework +28); no added skips.
+        # Floor: 25040 + 115 = 25155.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25155

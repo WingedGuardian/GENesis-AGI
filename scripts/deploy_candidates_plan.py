@@ -13,8 +13,10 @@ Flat sibling of deploy_candidates.py (see that file for the commands).
 
 from __future__ import annotations
 
+import fcntl
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import NamedTuple
 
@@ -249,7 +251,53 @@ class Move(NamedTuple):
     at: str
 
 
+_CHECKOUT_LOCK_WAIT_S = 300.0
+_CHECKOUT_LOCK_POLL_S = 0.25
+# ASSUMED, unmeasured bound
+
+
+def _acquire_checkout_lock(repo: Repo) -> int:
+    try:
+        result = repo.git(
+            "rev-parse", "--path-format=absolute", "--git-common-dir", check=False, timeout=2
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Refusal(f"cannot resolve checkout lock path; nothing moved: {exc}") from exc
+    common_dir = result.stdout.strip()
+    if result.returncode != 0 or not common_dir:
+        raise Refusal(f"cannot resolve checkout lock path; nothing moved: {result.stderr.strip()}")
+    path = Path(common_dir).resolve() / "genesis-checkout.lock"
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    except OSError as exc:
+        raise Refusal(f"cannot open checkout lock {path}; nothing moved: {exc}") from exc
+    deadline = time.monotonic() + _CHECKOUT_LOCK_WAIT_S
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise Refusal(
+                        "checkout busy (a Claude launch holds genesis-checkout.lock); nothing moved"
+                    ) from None
+                time.sleep(min(_CHECKOUT_LOCK_POLL_S, remaining))
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def move_checkout(repo: Repo, plan: Plan, branch: str | None) -> Move:
+    lock_fd = _acquire_checkout_lock(repo)
+    try:
+        return _move_checkout_locked(repo, plan, branch)
+    finally:
+        os.close(lock_fd)
+
+
+def _move_checkout_locked(repo: Repo, plan: Plan, branch: str | None) -> Move:
     """Point the checkout at ``plan.tip``: not at all when nothing changed, the
     ref alone when only commits changed, otherwise ONE `git switch`. Returns
     whether the checkout's files changed and where `live` is (a Move). Git
