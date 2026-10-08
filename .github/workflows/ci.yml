@@ -1141,6 +1141,6 @@ jobs:
         # (+40), test_deploy_candidates_drop_status.py 68 -> 69 (+1),
         # test_deploy_checkout.py 51 -> 52 (+1); the others are unchanged.
         # No added skips. Floor: 24962 + 42 = 25004; skip ceiling remains 102.
-        # Corpus/adapters replacement:89 additional +26 review regressions; no skips.
-        # Integrated main floor25004 +115 =25119.
+        # Corpus/adapters replacement: 89 additional cases; no added skips.
+        # Integrated main floor 25004 + 89 + 26 review regressions = 25119.
         run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25119
