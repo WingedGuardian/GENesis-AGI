@@ -113,6 +113,18 @@ class TestContextVarSemantics:
 class TestExceptionCapture:
 
     @pytest.mark.asyncio
+    async def test_private_child_error_stays_redacted_in_parent_when_capture_disabled(
+        self, wired, monkeypatch
+    ) -> None:
+        from genesis.observability import spans
+
+        with pytest.raises(ValueError), start_span("parent") as parent, monkeypatch.context() as child:
+            child.setattr(spans, "_enabled", False)
+            with start_span("private", error_message="private operation failed"):
+                raise ValueError("synthetic private error content")
+        assert parent.status_message == "private operation failed"
+
+    @pytest.mark.asyncio
     async def test_exception_sets_error_status_and_reraises(self, wired) -> None:
         captured = {}
         with pytest.raises(ValueError), start_span("op", SpanKind.OPERATION) as s:
