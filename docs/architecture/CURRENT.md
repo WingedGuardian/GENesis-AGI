@@ -2619,8 +2619,11 @@ verified: af3e45d3c 2026-10-07
   Independent model campaigns can be paired against the same shared admission.
   Public `run` refuses after offline admission, before keys or campaign creation,
   unless a complete private operating plan and actual hash-bound spending approval
-  pass current admission. Both model campaigns run serially under one credential
-  lock; key/receipt uncertainty stops both. Observed receipt expenses remain
+  pass current admission. Flash alone (2250 requests) or the historical complete
+  MiMo–Flash pair (4500 requests) runs serially under one credential lock shared
+  across both population sizes; exact population-bound consent is required.
+  Key/receipt uncertainty stops the whole selected run. Single-model execution
+  emits no paired statistics. Observed receipt expenses remain
   distinct from declared journal allocations and can exceed them. Historical actor proof,
   real model quality and spending/promotion approval remain separate and unproven.
   See

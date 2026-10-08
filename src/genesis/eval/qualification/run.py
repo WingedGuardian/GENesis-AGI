@@ -112,7 +112,7 @@ def validate_campaign(manifest, checked, alias):
 
 
 def _paid_eligibility(checked, operating=None, **unsupported):
-    """Only the complete paired operating-plan context can authorize acquisition."""
+    """Only a complete, consent-bound Operating context can authorize acquisition."""
     from .execution import Operating
 
     if unsupported or not isinstance(operating, Operating):
@@ -313,7 +313,7 @@ async def qualify(alias, cases, params, campaign, temp_root, *, reference_policy
     records = unscored(cases, "campaign_unavailable")
     clamped = dict.fromkeys(cases, 0)
     try:
-        view = campaign if dispatch else ReadView(campaign)
+        view = campaign if dispatch or isinstance(campaign, ReadView) else ReadView(campaign)
         validate_campaign(view.state.manifest, checked, alias)
         factory = operating.router if dispatch else pinned.PinnedRouter
         router = factory(view, alias=alias, params=params, dispatch=dispatch,

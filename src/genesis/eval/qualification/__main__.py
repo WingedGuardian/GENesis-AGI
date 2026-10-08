@@ -34,9 +34,20 @@ async def admit(args, cases, configured, options):
     from genesis.eval.qualification import corpus, execution, preflight
     from genesis.eval.qualification.evidence import Incomplete
 
-    aliases = list(execution.ALIASES) if args.command == "run" else (
-        [args.alias] if args.alias else list(configured)
-    )
+    paths = {}
+    if args.command == "run":
+        if (bool(args.against) != bool(args.against_campaign)
+                or args.against == args.alias):
+            raise Incomplete("paired_campaigns_invalid")
+        paths = {args.alias: args.campaign}
+        if args.against:
+            paths[args.against] = args.against_campaign
+        aliases = execution.selected_aliases(paths)
+        if (set(configured) != set(aliases)
+                or len({path.resolve() for path in paths.values()}) != len(aliases)):
+            raise Incomplete("paired_campaigns_invalid")
+    else:
+        aliases = [args.alias] if args.alias else list(configured)
     checked = await preflight.check(
         cases, args.temp_root, reference_policy=options["reference_policy"],
         current_policy=options["current_reference_policy"],
@@ -47,19 +58,15 @@ async def admit(args, cases, configured, options):
         return {"status": "pass", "scope": "offline admission only", "corpus": corpus.counts(cases)}
     if not args.operating_plan or not args.spending_approval:
         raise Incomplete("financial_eligibility_unavailable")
-    if (set(configured) != set(execution.ALIASES)
-            or {args.alias, args.against} != set(execution.ALIASES)
-            or args.against_campaign is None):
-        raise Incomplete("paired_campaigns_invalid")
     return await execution.execute(
-        cases, checked, {args.alias: args.campaign, args.against: args.against_campaign},
+        cases, checked, paths,
         args.temp_root, plan_path=args.operating_plan, approval_path=args.spending_approval,
         options=options,
     )
 
 
 async def run(args):
-    from genesis.eval.qualification import corpus, preflight, references
+    from genesis.eval.qualification import corpus, execution, preflight, references
     from genesis.eval.qualification import run as qualification
     from genesis.eval.qualification.evidence import Incomplete, load_json
 
@@ -97,17 +104,23 @@ async def run(args):
         raise Incomplete("paired_campaigns_invalid")
     reports, records = {}, {}
     aliases = [args.alias] + ([against] if against else [])
+    # Pair scoring and financial ownership must use the same immutable snapshots.
+    views = {alias: qualification.ReadView(path) for alias, path in zip(aliases, paths, strict=True)} \
+        if against else {}
     for alias, path in zip(aliases, paths, strict=True):
         reports[alias], records[alias] = await qualification.qualify(
-            alias, cases, configured[alias], path, args.temp_root, **options
+            alias, cases, configured[alias], views.get(alias, path), args.temp_root, **options
         )
     if not against:
         return reports[args.alias]
     if reports[args.alias]["admission"] != reports[against]["admission"]:
         raise Incomplete("paired_admission_changed")
+    financial = execution.cost_report({alias: view.state for alias, view in views.items()})
     return {
-        "status": qualification.worst((r["status"] for r in reports.values()), qualification.OVERALL),
+        "status": "incomplete" if financial["unresolved_attempts"] else
+        qualification.worst((r["status"] for r in reports.values()), qualification.OVERALL),
         "models": reports, "paired": qualification.pair(cases, *(records[a] for a in aliases)),
+        "financial": financial,
     }
 
 

@@ -37,6 +37,9 @@ checks, not authentication of declared actors or a full transitive attestation.
 Add `--against <second-alias> --against-campaign <second-private-directory>`
 for paired reporting. Each model has its own campaign. Pairing requires the same
 current shared admission identity and never selects a winner or promotes a route.
+Paired financial reporting censuses both exact scored snapshots together;
+conflicting generation ownership makes the combined result incomplete and
+excludes the conflicting charges from its resolved expense total.
 Judge qualification includes all registered rubrics and J9 relevance. Every
 repetition needs 80% agreement overall and in each class with the required class
 floors. Novelty permits no false or wrong-target suppression, including when
@@ -45,41 +48,53 @@ under current and simulated promoted allowlists in disposable SQLite databases.
 Deterministic embeddings and synthetic classifiers establish wiring, not model
 or retrieval quality.
 
-`run` requires both candidates in one serial invocation: `--alias`, `--campaign`,
-`--against`, `--against-campaign`, `--operating-plan` and `--spending-approval`,
-as well as all complete admission inputs above. Missing spending approval still
+`run` supports Flash alone (`--alias openrouter-deepseek-flash --campaign`),
+or the historical MiMo–Flash pair with both `--against` and `--against-campaign`.
+Both modes require `--operating-plan`, `--spending-approval` and all complete
+admission inputs above. The parameters file must contain exactly the selected
+population. Other singleton aliases and additional candidates are refused.
+Missing spending approval still
 refuses before credentials or campaign creation. The private version-1 operating
-plan freezes both complete 2,250-attempt manifests, source admission, requested
+plan freezes one or two complete 2,250-attempt manifests, source admission, requested
 parameters, receipt-provider identities, credential fingerprint, price evidence,
 per-model and combined allowances, key limit and baseline usage. Currency uses
 exact nonnegative decimal strings. The plan names
 `financial_promise=operating_budget_with_overrun_risk` and
-`stop_semantics=stop_both_on_unresolved_evidence_no_resend`.
+`stop_semantics=stop_campaign_on_unresolved_evidence_no_resend` for Flash alone,
+or `stop_semantics=stop_both_on_unresolved_evidence_no_resend` for the pair.
 
 These are operating allocations, not externally guaranteed maximum charges.
 The key envelope must fund every allocation and fit the combined allowance.
 The separate private approval binds the entire canonical plan hash, the owner,
-4500-request scope and actual decision provenance. This is a trusted local
+`2250_requests` or `4500_requests` scope matching the exact selected population,
+and actual decision provenance. Changing the population invalidates old consent.
+This is a trusted local
 operator assertion, not cryptographic authentication of a human decision. An
 agent must never fabricate that record from design approval or a test fixture.
 
 A private kernel comparison lock, shared by credential fingerprint across both
-campaigns, precedes journal writers and credential reads. The final pre-dispatch
+population sizes and all campaign directories, precedes journal writers and credential reads. The final pre-dispatch
 key observation must match the approved nonreset limit and baseline plus exact
-consistent receipt costs from both campaigns; remaining credit must cover all
+consistent receipt costs from the selected campaigns; remaining credit must cover all
 undispatched allocations. One inference is in flight globally. Settlement and a
 fresh key observation precede the next request. Uncertainty or processing failure
-stops new acquisition in both models and retains an existing journal incident
+stops new acquisition in the entire selected population and retains an existing journal incident
 when there is a dispatched attempt. Pre-dispatch refusal invents no reservation,
 dispatch or acknowledgement. Resume never resends a dispatched coordinate.
 
 Plan and approval descriptors remain open: metadata/replacement checks run per
-request, and full hashes are checked at admission and completion. This detects
-accidental edits, not deliberate same-user evasion. Reports separately show
+request, and full hashes are checked at admission and completion. Equal-size
+writes within a filesystem timestamp tick can evade the per-request metadata
+check; edited bytes never replace the frozen admitted plan or consent, and
+completion hashing refuses changed content. Editing these files is not an
+immediate revocation mechanism. These checks do not prevent deliberate
+same-user evasion. Reports separately show
 consistent observed receipt expenses (including above-allocation charges),
 unresolved costs, over-allocation incidents and journal settled/reserved totals.
 Late or undisclosed provider charges can exceed the allowance; a stopped or
-incomplete comparison cannot qualify or promote either model. Effective provider
+incomplete run cannot qualify or promote any model. Single-model execution reports
+its model and financial aggregates without fabricated paired statistics; detached
+single-model reports retain their existing format. Effective provider
 parameters, real quality, final paid settings, genuine corpus consent and actual
 spending approval remain separate decisions.
 The CLI prints aggregate results and fixed failure codes. Exit codes are 0 for

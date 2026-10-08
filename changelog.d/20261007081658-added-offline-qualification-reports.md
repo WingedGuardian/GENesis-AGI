@@ -1,1 +1,1 @@
-- Add current-bound offline qualification reports and a separately approved serial MiMo–Flash comparison with operating allocations, retained billing incidents and observed-cost reporting; provider charges can exceed the approved allowance.
+- Add current-bound offline qualification reports and separately approved serial Flash-only or MiMo–Flash runs with operating allocations, retained billing incidents and observed-cost reporting; provider charges can exceed the approved allowance.

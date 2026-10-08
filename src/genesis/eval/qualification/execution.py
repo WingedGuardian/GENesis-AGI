@@ -18,6 +18,16 @@ from .evidence import Incomplete, canonical, check_directory, digest, load_json,
 ALIASES = ("openrouter-mimo", "openrouter-deepseek-flash")
 PROMISE = "operating_budget_with_overrun_risk"
 STOP = "stop_both_on_unresolved_evidence_no_resend"
+SINGLE_STOP = "stop_campaign_on_unresolved_evidence_no_resend"
+
+
+def selected_aliases(models):
+    """Only Flash alone or the historical complete pair can acquire answers."""
+    if not isinstance(models, dict) or set(models) not in (
+        {ALIASES[1]}, set(ALIASES)
+    ):
+        raise Incomplete("operating_plan_invalid")
+    return tuple(alias for alias in ALIASES if alias in models)
 
 
 def identity(info):
@@ -89,14 +99,17 @@ def validate(plan, consent, checked):
             "models"}
     if (not isinstance(plan, dict) or set(plan) != keys
             or type(plan["version"]) is not int or plan["version"] != 1
-            or plan["financial_promise"] != PROMISE or plan["stop_semantics"] != STOP
-            or not isinstance(plan["models"], dict) or set(plan["models"]) != set(ALIASES)
-            or set(checked["models"]) != set(ALIASES)):
+            or plan["financial_promise"] != PROMISE):
+        raise Incomplete("operating_plan_invalid")
+    aliases = selected_aliases(plan["models"])
+    if (set(checked["models"]) != set(aliases)
+            or plan["stop_semantics"] != (SINGLE_STOP if len(aliases) == 1 else STOP)):
         raise Incomplete("operating_plan_invalid")
     if (not isinstance(consent, dict)
             or set(consent) != {"version", "plan_hash", "scope", "author", "decision_evidence"}
             or type(consent["version"]) is not int or consent["version"] != 1
-            or consent["plan_hash"] != digest(plan) or consent["scope"] != "4500_requests"
+            or consent["plan_hash"] != digest(plan)
+            or consent["scope"] != f"{2250 * len(aliases)}_requests"
             or consent["author"] != "owner"
             or not isinstance(consent["decision_evidence"], str)
             or not consent["decision_evidence"].strip()):
@@ -113,7 +126,7 @@ def validate(plan, consent, checked):
             or any(not isinstance(v, str) or not v.strip() for v in snapshot.values())):
         raise Incomplete("operating_price_evidence_missing")
     manifests, budgets, allocations = {}, [], []
-    for alias in ALIASES:
+    for alias in aliases:
         model = plan["models"][alias]
         if not isinstance(model, dict) or set(model) != {"manifest"}:
             raise Incomplete("operating_model_invalid")
@@ -135,13 +148,14 @@ def validate(plan, consent, checked):
 
 
 class Operating:
-    """One comparison, with initial/final full-history reads and per-attempt updates."""
+    """One campaign or pair, with boundary history reads and per-attempt updates."""
 
     def __init__(self, plan, consent, checked):
         from .run import admission_identity
 
         self.inputs, self.plan = (plan, consent), plan.value
         self.manifests = validate(plan.value, consent.value, checked)
+        self.aliases = tuple(self.manifests)
         self.admission = digest(admission_identity(checked))
         self.journals, self.costs, self.owners = {}, {}, {}
         self.observed = currency("0")
@@ -316,7 +330,8 @@ async def execute(cases, checked, paths, temp_root, *, plan_path, approval_path,
                   config=None, transport=None):
     from . import run
 
-    if set(paths) != set(ALIASES) or len({Path(p).resolve() for p in paths.values()}) != 2:
+    aliases = selected_aliases(paths)
+    if len({Path(p).resolve() for p in paths.values()}) != len(aliases):
         raise Incomplete("paired_campaigns_invalid")
     with ExitStack() as stack:
         plan = Input(plan_path)
@@ -324,15 +339,17 @@ async def execute(cases, checked, paths, temp_root, *, plan_path, approval_path,
         consent = Input(approval_path)
         stack.callback(consent.close)
         operating = Operating(plan, consent, checked)
+        if aliases != operating.aliases:
+            raise Incomplete("paired_campaigns_invalid")
         stack.enter_context(comparison_lock(operating.plan["credential_fingerprint"]))
         journals = {alias: stack.enter_context(Journal(paths[alias], operating.manifests[alias]))
-                    for alias in ALIASES}
+                    for alias in aliases}
         try:
             operating.attach(journals)
         except (ValueError, OSError) as exc:
             operating.stop(exc)
         reports, records = {}, {}
-        for alias in ALIASES:
+        for alias in aliases:
             try:
                 reports[alias], records[alias] = await run.qualify(
                     alias, cases, checked["parameters"][alias], journals[alias], temp_root,
@@ -350,5 +367,7 @@ async def execute(cases, checked, paths, temp_root, *, plan_path, approval_path,
         financial = operating.report()
         return {"status": "incomplete" if operating.stopped else
                 run.worst((r["status"] for r in reports.values()), run.OVERALL),
-                "models": reports, "paired": run.pair(cases, *(records[a] for a in ALIASES)),
+                "models": reports,
+                **({"paired": run.pair(cases, *(records[a] for a in aliases))}
+                   if len(aliases) == 2 else {}),
                 "financial": financial}

@@ -1145,7 +1145,9 @@ jobs:
         # Runner: measured parent->current core37->57, pinned42->56,
         # references391->395, rework62->65, scorer21->22, new runner39.
         # Delta81 =41 retained original +39 new runner +1 scorer regression.
-        # Operating controls:30 new collected cases; final-observation hook adds3.
-        # Parent-relative floor25425 +81 +74 +3 =25583; skip ceiling unchanged.
+        # Operating controls:79 collected cases; Flash population controls add32.
+        # Durable early run verified79+32+39runner+40delegate =190, no skips.
+        # Final-observation hook adds3; parent-relative floor:
+        # 25425 +81 +79 +32 +3 =25620; skip ceiling unchanged.
         # Reconcile against actual main and hosted skip identities before opening.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25583
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25620

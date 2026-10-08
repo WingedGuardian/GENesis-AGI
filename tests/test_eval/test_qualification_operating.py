@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+from contextlib import ExitStack
 from decimal import localcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,6 +64,18 @@ def write_input(path, value):
     return execution.Input(path)
 
 
+def select_flash(plan):
+    """Reduce synthetic geometry, rebinding admission and full-plan consent."""
+    alias = execution.ALIASES[1]
+    for key in ("models", "parameters"):
+        plan.checked[key] = {alias: plan.checked[key][alias]}
+    plan.value["models"] = {alias: plan.value["models"][alias]}
+    plan.value["models"][alias]["manifest"]["binding"]["admission"] = run.admission_identity(plan.checked)
+    plan.value["stop_semantics"] = execution.SINGLE_STOP
+    plan.consent.update(scope="2250_requests", plan_hash=digest(plan.value))
+    return plan
+
+
 def test_plan_binds_every_coordinate_and_allocation(plan):
     frozen = execution.validate(plan.value, plan.consent, plan.checked)
     assert sum(len(m["attempts"]) for m in frozen.values()) == 4500
@@ -121,9 +134,25 @@ def test_input_edit_or_replacement_detected_without_full_hash_per_dispatch(tmp_p
             other.chmod(0o600)
             other.replace(path)
         else:
-            path.write_text('{"value": 2}')
+            # Same-tick equal-size writes can share mtime/ctime on real filesystems.
+            path.write_text('{"value": 200}')
         with pytest.raises(Incomplete, match="changed"):
             item.check()
+    finally:
+        item.close()
+
+
+def test_metadata_collision_preserves_frozen_input_and_final_hash_refuses(tmp_path, monkeypatch):
+    path = tmp_path / "plan.json"
+    item = write_input(path, {"value": 1})
+    try:
+        path.write_text('{"value": 2}')
+        # Deliberately model the measured equal-size/equal-timestamp collision.
+        monkeypatch.setattr(execution, "identity", lambda _info: item.stamp)
+        item.check()
+        assert item.value == {"value": 1}
+        with pytest.raises(Incomplete, match="changed"):
+            item.check(final=True)
     finally:
         item.close()
 
@@ -225,11 +254,16 @@ def test_comparison_lock_releases_and_excludes_other_campaign_orders(tmp_path, m
 
 
 @pytest.mark.parametrize("mode", ["settled", "over_allocation", "usage_discrepancy", "processing_failure"])
-async def test_live_paired_dispatch_settlement_and_persistent_stop(plan, monkeypatch, mode):
+@pytest.mark.parametrize("population", ["pair", "flash"])
+async def test_live_paired_dispatch_settlement_and_persistent_stop(plan, monkeypatch, mode, population):
     import httpx
 
     from genesis.eval.qualification.accounting import total
     from tests.test_eval.qualification_transport_fixtures import Gateway, ask
+
+    if population == "flash":
+        select_flash(plan)
+    aliases = execution.selected_aliases(plan.value["models"])
 
     monkeypatch.setenv(pinned.KEY_ENV, "synthetic-only-key")
     secrets = plan.tmp / "secrets.env"
@@ -263,12 +297,14 @@ async def test_live_paired_dispatch_settlement_and_persistent_stop(plan, monkeyp
     right = write_input(plan.tmp / "consent.json", plan.consent)
     try:
         control = execution.Operating(left, right, plan.checked)
-        with Journal(plan.tmp / "mimo", control.manifests[execution.ALIASES[0]]) as a, \
-                Journal(plan.tmp / "flash", control.manifests[execution.ALIASES[1]]) as b:
-            control.attach(dict(zip(execution.ALIASES, (a, b), strict=True)))
+        with ExitStack() as stack:
+            journals = {alias: stack.enter_context(Journal(plan.tmp / alias, control.manifests[alias]))
+                        for alias in aliases}
+            a = journals[aliases[0]]
+            control.attach(journals)
             adapters = [control.router(j, alias=alias, params=plan.checked["parameters"][alias],
                                        dispatch=True, transport=gateway.transport)
-                        for alias, j in zip(execution.ALIASES, (a, b), strict=True)]
+                        for alias, j in journals.items()]
             contract, rows = next(iter(plan.checked["plan"].items()))
             messages = rows["case-0"]["messages"]
             for adapter in adapters:
@@ -281,16 +317,21 @@ async def test_live_paired_dispatch_settlement_and_persistent_stop(plan, monkeyp
                 if mode == "processing_failure":
                     adapters[0].stop_processing("case-0", RuntimeError("synthetic local error"))
             if mode == "settled":
-                assert (await ask(adapters[1], messages, "case-0")).success
+                adapter = adapters[-1]
+                adapter.bind(contract, 1, case_id="case-1" if population == "flash" else "case-0")
+                assert (await ask(adapter, messages, "case-1" if population == "flash" else "case-0")).success
                 assert len(gateway.requests) == 2 and control.observed == currency("0.0002")
                 # Replaying a settled coordinate performs no POST or credential GET.
                 reads = gateway.key_reads
+                adapters[0].bind(contract, 1, case_id="case-0")
                 assert (await ask(adapters[0], messages, "case-0")).success
                 assert len(gateway.requests) == 2 and gateway.key_reads == reads
             else:
                 reads = gateway.key_reads
                 with pytest.raises(Incomplete):
-                    await ask(adapters[1], messages, "case-0")
+                    if population == "flash":
+                        adapters[0].bind(contract, 1, case_id="case-1")
+                    await ask(adapters[-1], messages, "case-1" if population == "flash" else "case-0")
                 assert len(gateway.requests) == 1 and gateway.key_reads == reads
                 assert control.stopped
                 assert any(line["kind"] == "failure" for line in a.lines)
@@ -298,10 +339,10 @@ async def test_live_paired_dispatch_settlement_and_persistent_stop(plan, monkeyp
             if mode == "over_allocation":
                 assert financial["observed_receipt_cost"] == "0.003"
                 assert financial["over_allocation_attempts"] == 1
-                assert financial["journal_accounting"][execution.ALIASES[0]]["journal_settled"] == "0"
+                assert financial["journal_accounting"][aliases[0]]["journal_settled"] == "0"
             frozen = copy.deepcopy(control.manifests)
         if mode != "settled":
-            with (Journal(plan.tmp / "mimo", frozen[execution.ALIASES[0]]) as reopened,
+            with (Journal(plan.tmp / aliases[0], frozen[aliases[0]]) as reopened,
                   pytest.raises(Incomplete)):
                 reopened.ready()
     finally:
