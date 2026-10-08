@@ -123,8 +123,13 @@ def _parse_incus_bytes(raw: str) -> int | None:
     validates this value server-side with the identical grammar at write time
     (``internal/instance/config.go``'s ``validate.IsSize``, which itself calls
     ``units.ParseByteSizeString``), so a value read back from ``incus config
-    get`` can never contain one anyway. Matching the narrower grammar removes
-    the gap rather than relying on that unreachability.
+    get`` can never contain a non-ASCII digit anyway. Matching the narrower
+    grammar removes the gap rather than relying on that unreachability. The
+    same bound rules out overflow-scale digit runs too: Incus's
+    ``strconv.ParseInt`` rejects any integer portion that does not fit an
+    int64, so ``IsSize`` — and thus ``incus config set`` — rejects it at
+    write time as well, meaning ``incus config get`` can never return one
+    either (fresh-context class audit on the stacked PR #3069, 2026-10-08).
 
     Leading zeros in the digit run are stripped BEFORE calling ``int()``:
     Incus's own parser (``strconv.ParseInt``-style accumulation) tolerates

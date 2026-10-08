@@ -790,6 +790,58 @@ async def test_zero_valued_ceiling_knob_is_still_reconciled(tmp_path):
     assert [c[2] for c in sp.calls] == ["get", "set"]
 
 
+@pytest.mark.asyncio
+async def test_nonzero_value_with_leading_zero_digits_is_not_reset(tmp_path):
+    """A leading-zero-padded but genuinely NONZERO value ('010GiB' = 10 GiB)
+    must still be recognized as swap-on -- the fix targets an all-zero
+    digit run, not any digit string containing a zero."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc({"get": (0, "010GiB\n", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get"]
+
+
+@pytest.mark.asyncio
+async def test_long_zero_padded_nonzero_size_does_not_raise(tmp_path):
+    """4,301 leading zeros + '1GiB' is a legitimate (if perverse) 1 GiB
+    ceiling Incus's own parser accepts with no overflow -- Python's
+    int(raw) would raise ValueError past ~4,300 digits and must never be
+    used for the nonzero check. Must be recognized as swap-on (not reset),
+    and must not raise. (Second Codex finding on PR #3069.)"""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    huge = ("0" * 4301) + "1GiB"
+    sp = _subproc({"get": (0, f"{huge}\n", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get"]
+
+
+@pytest.mark.asyncio
+async def test_long_zero_padded_all_zero_size_is_reconciled(tmp_path):
+    """The all-zero counterpart of the above: a huge digit run that is
+    genuinely all zeros must still be recognized as swap-off and healed,
+    and must not raise."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    huge_zero = ("0" * 4301) + "GiB"
+    sp = _subproc({"get": (0, f"{huge_zero}\n", ""), "set": (0, "", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get", "set"]
+
+
 def test_legacy_flat_timestamp_migrates_to_swap_off_class(tmp_path):
     """A legacy flat-format record is migrated into the dict under the
     swap_off class, not dropped, when a DIFFERENT class is recorded next."""
@@ -813,3 +865,51 @@ def test_write_swap_max_rejects_octal_ambiguous_leading_zero():
         assert cgroup_ops._SWAP_MAX_VALUE_RE.fullmatch(bad) is None, bad
     assert cgroup_ops._SWAP_MAX_VALUE_RE.fullmatch("0") is not None
     assert cgroup_ops._SWAP_MAX_VALUE_RE.fullmatch("10") is not None
+
+
+# ── direct unit coverage of the classification functions ───────────────────
+# (fresh-context class audit, 2026-10-08: coverage lived only behind the
+# subprocess-mocked integration surface; these probe the pure functions
+# directly, cheaper insurance against a future round finding a case the
+# integration tests happen not to exercise.)
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", False),
+        ("   ", False),
+        ("true", True),
+        ("True", True),
+        ("TRUE", True),
+        ("tRuE", True),
+        ("1", True),
+        ("yes", True),
+        ("YES", True),
+        ("on", True),
+        ("ON", True),
+        ("false", False),
+        ("False", False),
+        ("0", False),
+        ("no", False),
+        ("NO", False),
+        ("off", False),
+        ("OFF", False),
+        ("00", False),  # not a word-list member -> falls through to size parsing, all zeros
+        ("01", True),   # not a word-list member -> size parsing, nonzero
+        ("2", True),
+        ("42", True),
+        ("5GiB", True),
+        ("0GiB", False),
+        ("00GiB", False),
+        ("5Gib", False),  # wrong case suffix -> unparseable -> not swap-on
+        ("5XB", False),   # unknown suffix
+        ("1.5GiB", False),  # decimal point -> not a digit run + suffix
+        ("+5GiB", False),   # sign
+        ("-5GiB", False),
+        ("5 GiB", False),   # internal whitespace the grammar doesn't allow
+        ("garbage", False),
+        ("५GiB", False),    # Devanagari digit 5 -- not an ASCII digit
+    ],
+)
+def test_is_swap_on_matrix(value, expected):
+    assert swap_watch._is_swap_on(value) is expected, value
