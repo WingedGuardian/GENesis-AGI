@@ -40,6 +40,26 @@ from pathlib import Path
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_deadline import (  # noqa: E402
+    LockedStdout,
+    arm_from_spawn,
+    disarm,
+    process_age_s,
+)
+
+# The process-level hard stop (hook_deadline.py), armed as early as possible
+# and ONLY when this file runs as the hook: an import (a test, ambient_replay)
+# must never get a timer that calls os._exit. 8.5 s after spawn, below Claude
+# Code's 10 s limit, which it is measured to enforce up to several seconds late.
+# The lambda resolves _hard_stop_notice at fire time, so a stop that fires
+# during the imports below still works (it prints no notice).
+_HARD_STOP_S = 8.5
+_HARD_STOP = (
+    arm_from_spawn(_HARD_STOP_S, lambda: _hard_stop_notice(), label="proactive_memory_hook")
+    if __name__ == "__main__"
+    else None
+)
+
 from hook_input import session_path  # noqa: E402
 from hook_output import (  # noqa: E402
     DEFAULT_BUDGET,
@@ -155,7 +175,12 @@ def _writer() -> BoundedStdout:
     """This hook's bounded stdout. Lazy so direct callers of helpers still work."""
     global _OUT
     if _OUT is None:
-        _OUT = BoundedStdout(DEFAULT_BUDGET, label="proactive", reserve=_CUT_NOTICE_RESERVE)
+        _OUT = BoundedStdout(
+            DEFAULT_BUDGET,
+            label="proactive",
+            reserve=_CUT_NOTICE_RESERVE,
+            stream=LockedStdout(),  # so the hard stop never interleaves a write
+        )
     return _OUT
 
 
@@ -177,9 +202,11 @@ def _emit_tracked(out: BoundedStdout, text: str, block: str) -> bool:
     wrongly marked surfaced is suppressed and never shown again, while one
     wrongly left unmarked is merely offered again.
     """
+    global _RECALL_LANDED
     if out.closed:
         return False
     out.emit(text, block=block)
+    _RECALL_LANDED = True
     return True
 
 
@@ -221,7 +248,22 @@ _SERVER_TIMEOUT_S = 4.75
 _SERVER_CONNECT_TIMEOUT_S = 0.25
 # Claude Code kills UserPromptSubmit hooks at 10 seconds. Keep the whole run
 # below that ceiling with enough room for the deferred flush and cut notice.
+# The ceiling counts from when Claude Code spawned the hook, so main() charges
+# the time already spent before _run (the launcher's `exec`, the interpreter,
+# imports, load_dotenv) against this budget: see _process_age_s.
 _RUN_DEADLINE_S = 8.0
+#: Set by _emit_tracked when a recall line reaches stdout; reset by _run.
+_RECALL_LANDED = False
+#: Set once the run's output is final (_flush_deferred ran); reset by _run.
+#: Read, with _RECALL_LANDED, by the deadline notice and the hard stop.
+_FLUSHED = False
+#: The process age main() measured before the run, for the notice text.
+_PROCESS_AGE = 0.0
+
+#: Process age, from hook_deadline.process_age_s (CLOCK_BOOTTIME against the
+#: start time in /proc/self/stat; /proc/uptime is lxcfs-virtualised). Kept under
+#: this name so callers and tests have one seam to patch.
+_process_age_s = process_age_s
 
 
 class _RunBudgetExpired(RuntimeError):
@@ -273,6 +315,13 @@ def _sqlite_connect(
             raise _RunBudgetExpired
     effective_timeout = timeout if remaining is None else min(timeout, remaining)
     conn = sqlite3.connect(str(db_path), timeout=effective_timeout, uri=uri)
+    # WAL + NORMAL: a commit no longer fsyncs. An fsync is an uninterruptible
+    # wait, which even the hard stop cannot cut short (the process cannot exit
+    # until it returns). NORMAL under WAL keeps the database consistent and
+    # risks only the last commits on power loss; the server uses the same
+    # setting (src/genesis/db/connection.py).
+    with contextlib.suppress(sqlite3.Error):
+        conn.execute("PRAGMA synchronous=NORMAL")
     if deadline is not None:
         conn.set_progress_handler(
             lambda: 1 if time.monotonic() >= deadline else 0,
@@ -1809,7 +1858,7 @@ def _heartbeat_write(
 ) -> float:
     """Write session heartbeat. Returns elapsed ms. Best-effort."""
     hb_start = time.monotonic()
-    if not session_id or not db_path.exists():
+    if not session_id or _deadline_expired(deadline) or not db_path.exists():
         return 0.0
 
     try:
@@ -1836,7 +1885,9 @@ def _heartbeat_write(
         # Prompt-time truth repair for the terminal session row: advance the
         # reaper's idle clock and undo an adoption-era 'completed' lie the
         # moment the user types (2026-09-04 ghost). Same best-effort posture.
-        touch_terminal_session_row_sync(str(db_path), session_id)
+        # It takes no deadline (its own 1 s lock wait), so skip it once spent.
+        if not _deadline_expired(deadline):
+            touch_terminal_session_row_sync(str(db_path), session_id)
     except Exception:
         pass  # Best-effort — never block
 
@@ -1940,7 +1991,7 @@ def _heartbeat_read_and_inject(
 ) -> float:
     """Read concurrent sessions and print [Concurrent] tags. Returns elapsed ms."""
     hb_start = time.monotonic()
-    if not session_id or not db_path.exists():
+    if not session_id or _deadline_expired(deadline) or not db_path.exists():
         return 0.0
 
     try:
@@ -2009,22 +2060,60 @@ def _heartbeat_read_and_inject(
     return (time.monotonic() - hb_start) * 1000
 
 
-async def _run(prompt: str, session_id: str = "") -> None:
-    """Run the hook within one aggregate budget and always flush deferred lines."""
+def _out_of_time_notice(process_age_s: float) -> str:
+    """The line a run that hit its deadline prints, so the gap is not silent.
+
+    The startup clause appears only when startup took a noticeable share of the
+    budget; an unknown age reads as 0 and says nothing.
+    """
+    started = (
+        f" ({process_age_s:.1f}s passed before it started)" if process_age_s >= 1.0 else ""
+    )
+    return (
+        f"[Memory: the hook ran out of its {_RUN_DEADLINE_S:g}s budget{started}, so recall "
+        "may be missing or incomplete this turn; use memory_recall if prior context matters]"
+    )
+
+
+def _hard_stop_notice() -> str | None:
+    """The line the hard stop adds, or None. Runs on the timer thread: no imports.
+
+    None once the output is final or a recall line already reached stdout (the
+    model has what the run produced). Clipped so stdout stays under the cap the
+    harness enforces: the notice, a leading and a trailing newline.
+    """
+    if _FLUSHED or _RECALL_LANDED:
+        return None
+    room = HOOK_STDOUT_CAP - (_OUT.emitted_chars if _OUT is not None else 0) - 3
+    if room <= 0:
+        return None
+    return clip_to_cost(_out_of_time_notice(_PROCESS_AGE), room)
+
+
+async def _run(prompt: str, session_id: str = "", *, process_age_s: float = 0.0) -> None:
+    """Run the hook within one aggregate budget and always flush deferred lines.
+
+    ``process_age_s`` is how long the process ran before this call. The budget
+    shrinks by it, because Claude Code's 10 s limit counts from the spawn, not
+    from here. main() passes it; a direct caller (a test) gets the full budget.
+    """
+    global _RECALL_LANDED, _FLUSHED
+    _RECALL_LANDED = False
+    _FLUSHED = False
     deferred_lines: list[str] = []
-    flushed = False
 
     def _flush_deferred() -> None:
         """Emit buffered session metadata at most once."""
-        nonlocal flushed
-        if flushed:
+        global _FLUSHED
+        if _FLUSHED:
             return
-        flushed = True
+        _FLUSHED = True
         out = _writer()
         for line in deferred_lines:
             out.emit(line, block="session-metadata")
 
-    deadline = time.monotonic() + _RUN_DEADLINE_S
+    deadline = time.monotonic() + max(0.0, _RUN_DEADLINE_S - process_age_s)
+    timed_out = False
     loop_deadline = asyncio.get_running_loop().time() + max(
         0.0,
         deadline - time.monotonic(),
@@ -2039,9 +2128,21 @@ async def _run(prompt: str, session_id: str = "") -> None:
                 deadline=deadline,
             )
     except TimeoutError:
+        timed_out = True
         return
     finally:
+        # Owed only when the run had NOT reached its own output decision: every
+        # path that decides (off mode, a short prompt, the server and degraded
+        # paths) flushes first, so an expired deadline after that owes nothing.
+        # Captured BEFORE the flush below, which would otherwise make it vacuous.
+        owed = (
+            not _FLUSHED
+            and not _RECALL_LANDED
+            and (timed_out or _deadline_expired(deadline))
+        )
         _flush_deferred()
+        if owed:
+            _writer().emit(_out_of_time_notice(process_age_s), block="recall-timeout")
 
 
 async def _run_body(
@@ -2168,7 +2269,10 @@ async def _run_body(
             prompt, session_id, file_keywords, suppress_ids
         )
         server_ms = (time.monotonic() - _t_srv) * 1000
-        if _deadline_expired(deadline):
+        # An answer that already arrived is printed even when the budget ran out
+        # while waiting for it: printing costs microseconds, and the steps after
+        # it check the deadline themselves. Only a missing answer stops here.
+        if server_data is None and _deadline_expired(deadline):
             return
 
     if server_data is not None:
@@ -2273,6 +2377,8 @@ async def _run_body(
             server_ms=server_ms,
         )
         # Ambient fold on the server-returned prompt embedding (None-safe).
+        if _deadline_expired(deadline):
+            return
         _ambient_fold(embedding, session_id, prompt, recent_files)
         return
 
@@ -2388,6 +2494,8 @@ async def _run_body(
         server_ms=server_ms,
     )
     # No embedding on the fallback path — the ambient fold degrades silently.
+    if _deadline_expired(deadline):
+        return
     _ambient_fold(None, session_id, prompt, recent_files)
 
 
@@ -2483,8 +2591,10 @@ def main() -> None:
             return
 
         session_id = data.get("session_id", "")
+        global _PROCESS_AGE
+        _PROCESS_AGE = _process_age_s() or 0.0
         try:
-            asyncio.run(_run(prompt, session_id=session_id))
+            asyncio.run(_run(prompt, session_id=session_id, process_age_s=_PROCESS_AGE))
         finally:
             # In a `finally`, so a cut is announced on EVERY exit: the ordinary
             # return, an early return from one of _run's several gates, and the
@@ -2500,4 +2610,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        disarm(_HARD_STOP)

@@ -637,7 +637,7 @@ def test_a_cut_is_announced_even_when_the_budget_is_exactly_spent() -> None:
     # emit_cost bills one unit for the newline print() adds, hence the -1.
     ceiling = pmh.DEFAULT_BUDGET - pmh._CUT_NOTICE_RESERVE
 
-    async def _flood(prompt: str, session_id: str = "") -> None:
+    async def _flood(prompt: str, session_id: str = "", **_kwargs: object) -> None:
         out = pmh._writer()
         out.emit("x" * (ceiling - 1), block="server-recall")
         out.emit("y" * 500, block="code-hints")
@@ -683,6 +683,7 @@ def test_the_cut_notice_fits_the_reserve_it_declares() -> None:
             "code-hints",
             "degraded-recall",
             "session-metadata",
+            "recall-timeout",
         ],
         key=len,
     )

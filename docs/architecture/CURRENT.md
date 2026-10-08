@@ -144,7 +144,11 @@ Easy-to-forget mechanisms:
   when the server can't answer. Latency budget: 4.5s server / 4.75s client
   (sized to the production engine's measured cold path — embed + a 1.0s
   rerank timebox + retrieval under load; see the #1169 timeout
-  investigation), inside the hook wrapper's 10s ceiling. The
+  investigation), inside the hook wrapper's 10s ceiling. The hook keeps to
+  that ceiling with an 8s soft deadline counted from process start and a
+  process-level hard stop at 8.5s (`scripts/hooks/hook_deadline.py`) that
+  ends a run stuck inside one step, with a one-line out-of-time notice and the
+  blocked frame on stderr, instead of being killed silently. The
   `memory_proactive` MCP tool shares the engine but stays unfiltered/
   un-reranked.
 - `procedure_recall` deliberately uses Jaccard tag-overlap
