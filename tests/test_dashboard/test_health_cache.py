@@ -170,6 +170,29 @@ async def test_an_untrusted_peer_gets_the_checkout_status_without_file_names(mon
 
 
 @pytest.mark.asyncio
+async def test_an_untrusted_peer_gets_no_probe_error_text(monkeypatch):
+    """An unreadable checkout carries the probe's last stderr line, which can name
+    absolute paths on the install. Untrusted callers get the status alone."""
+    global _CHECKOUT
+    saved = _CHECKOUT
+    _CHECKOUT = {
+        "status": "unknown",
+        "count": 0,
+        "paths": [],
+        "reason": "probe exited 2: fatal: unable to read /srv/install/private/file",
+    }
+    try:
+        body, cached = await _health_as("198.51.100.7", monkeypatch=monkeypatch)
+    finally:
+        _CHECKOUT = saved
+    checkout = body["deploy_health"]["main_checkout"]
+    assert checkout["status"] == "unknown"
+    assert "reason" not in checkout
+    assert "paths" not in checkout
+    assert cached["deploy_health"]["main_checkout"]["reason"].startswith("probe exited 2")
+
+
+@pytest.mark.asyncio
 async def test_a_trusted_peer_gets_the_checkout_file_names(monkeypatch):
     body, _ = await _health_as("127.0.0.1", monkeypatch=monkeypatch)
     assert body["deploy_health"]["main_checkout"]["paths"] == ["a.txt", "b.txt"]

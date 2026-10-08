@@ -695,6 +695,140 @@ def test_main_checkout_timeout_removes_its_scratch_index(deploy_root, tmp_path, 
     assert list((deploy_root / ".git").glob("genesis-hidden-index.*")) == [other]
 
 
+def test_main_checkout_a_failed_flag_listing_is_unknown_not_clean(
+    deploy_root, tmp_path, monkeypatch
+):
+    """The hidden-edit pass pipes `git ls-files -v -z` into xargs. Without pipefail
+    a failed listing reads as success, the flags stay set, the hidden edit is
+    missed and the checkout reports clean, which would resolve a standing alert.
+    The probe runs the lib under pipefail, as the deploy scripts do."""
+    import shutil
+
+    real_git = shutil.which("git")
+    _git(deploy_root, "update-index", "--assume-unchanged", "a.txt")
+    (deploy_root / "a.txt").write_text("hidden edit\n")
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "git").write_text(
+        "#!/bin/sh\n"
+        'case " $* " in *" ls-files -v -z "*) exit 128 ;; esac\n'
+        f'exec "{real_git}" "$@"\n'
+    )
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    assert collect_main_checkout_dirty(deploy_root)["status"] == "unknown"
+
+
+def test_main_checkout_a_deploy_that_starts_during_the_probe_is_deploying(deploy_root, monkeypatch):
+    """deploy_code_only.sh pull keeps the server up, so a deploy can begin after
+    the up-front check and merge under the probe: that reading is not the
+    checkout's own, and it must not be reported (or alerted) as dirty."""
+    from genesis import env
+
+    (deploy_root / "a.txt").write_text("mid-merge state\n")
+    answers = iter([False, True])
+    monkeypatch.setattr(env, "update_in_progress", lambda: next(answers))
+    assert collect_main_checkout_dirty(deploy_root)["status"] == "deploying"
+
+
+def test_kill_probe_group_reap_is_bounded(monkeypatch):
+    """SIGKILL stays pending while the probe is in uninterruptible I/O, so the
+    reap after it must be bounded: an unbounded wait() would strand the snapshot
+    worker during the very failure the timeout contains."""
+    # The package __init__ shadows the submodule with its same-named function.
+    dh = importlib.import_module("genesis.observability.snapshots.deploy_health")
+
+    signals = []
+    monkeypatch.setattr(dh.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+
+    class Stuck:
+        pid = 2_147_483_000  # never signalled for real: killpg is patched above
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired("probe", timeout)
+
+        def wait(self, timeout=None):
+            if timeout is None:
+                raise AssertionError("unbounded wait() on a probe that may never exit")
+            raise subprocess.TimeoutExpired("probe", timeout)
+
+    dh._kill_probe_group(Stuck())
+    assert signals == [(Stuck.pid, signal.SIGKILL)]
+
+
+def test_main_checkout_a_failed_worktree_read_is_unknown_not_another_root(
+    deploy_root, tmp_path, monkeypatch
+):
+    """genesis_is_primary_checkout swallows a failed `rev-parse --is-inside-work-tree`
+    as "not a primary checkout", and not_deploy_root resolves a standing dirty
+    alert like clean. The probe reads it itself first, so a failure is unknown."""
+    import shutil
+
+    real_git = shutil.which("git")
+    (deploy_root / "a.txt").write_text("edited\n")
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "git").write_text(
+        "#!/bin/sh\n"
+        'case " $* " in *" --is-inside-work-tree "*) exit 128 ;; esac\n'
+        f'exec "{real_git}" "$@"\n'
+    )
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    assert collect_main_checkout_dirty(deploy_root)["status"] == "unknown"
+
+
+def test_main_checkout_an_empty_ephemeral_pattern_is_unknown_not_clean(deploy_root):
+    """`grep -vE ""` drops every line, so an empty EPHEMERAL_DIRTY_RE (renamed or
+    blanked in the marker lib) would read every checkout as clean."""
+    lib = deploy_root / "scripts" / "lib" / "deploy_marker.sh"
+    lib.write_text(lib.read_text() + "\nEPHEMERAL_DIRTY_RE=\n")
+    (deploy_root / "a.txt").write_text("edited\n")
+    got = collect_main_checkout_dirty(deploy_root)
+    assert got["status"] == "unknown", got
+
+
+def test_main_checkout_a_probe_killed_from_outside_leaves_no_scratch_index(
+    deploy_root, tmp_path, monkeypatch
+):
+    """A signal from outside the timeout (an OOM kill, say) ends the probe mid
+    hidden-edit pass with rc < 0, before the lib's rm: the collector removes that
+    probe's scratch index then too."""
+    import shutil
+
+    real_git = shutil.which("git")
+    _git(deploy_root, "update-index", "--assume-unchanged", "a.txt")
+    (deploy_root / "a.txt").write_text("hidden edit\n")
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    # The scratch-index steps set GIT_INDEX_FILE: kill the probe's whole group there.
+    (shim / "git").write_text(
+        f'#!/bin/sh\n[ -n "$GIT_INDEX_FILE" ] && kill -KILL 0\nexec "{real_git}" "$@"\n'
+    )
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    got = collect_main_checkout_dirty(deploy_root, timeout=30.0)
+    assert got["status"] == "unknown"
+    assert not list((deploy_root / ".git").glob("genesis-hidden-index.*"))
+
+
+def test_main_checkout_a_deploy_during_a_timed_out_probe_is_deploying(
+    deploy_root, tmp_path, monkeypatch
+):
+    """The timeout path re-checks the deploy marker too: a probe that ran out of
+    time while a deploy began reports deploying, not unreadable."""
+    from genesis import env
+
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "git").write_text("#!/bin/sh\nexec sleep 300\n")
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    answers = iter([False, True])
+    monkeypatch.setattr(env, "update_in_progress", lambda: next(answers))
+    assert collect_main_checkout_dirty(deploy_root, timeout=1.0)["status"] == "deploying"
+
+
 def test_main_checkout_does_not_rewrite_the_index(deploy_root):
     """GIT_OPTIONAL_LOCKS=0: a stat-stale index must NOT be refreshed and
     written back by the probe, which would take index.lock under a concurrent

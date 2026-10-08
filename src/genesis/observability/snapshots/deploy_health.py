@@ -329,10 +329,19 @@ MAIN_CHECKOUT_PATHS_SHOWN = 20
 #      path, i.e. a dev tree running the code, not the deploy root
 #   4  a lib could not be sourced
 _MAIN_CHECKOUT_PROBE = (
+    # pipefail, as both deploy scripts run the lib: without it a failed producer
+    # inside a pipeline (git ls-files feeding xargs) reads as success, and an
+    # unreadable hidden edit would report the checkout clean.
+    "set -o pipefail\n"
     'source "$2" || exit 4\n'
     'source "$3" || exit 4\n'
+    # An empty allowlist pattern makes `grep -vE ""` drop every line: clean.
+    '[ -n "${EPHEMERAL_DIRTY_RE:-}" ] || exit 4\n'
     'genesis_checkout_git_dirs "$1"\n'
     '[ -n "$_git_dir" ] && [ -n "$_common_dir" ] || exit 2\n'
+    # Read here first: the lib's primary-checkout test swallows a failure of this
+    # call as "not a primary checkout", which would read as not_deploy_root.
+    'git -C "$1" rev-parse --is-inside-work-tree >/dev/null || exit 2\n'
     'genesis_is_primary_checkout "$1" "$_git_dir" "$_common_dir" || exit 3\n'
     'genesis_tracked_dirty_paths "$1"\n'
 )
@@ -417,6 +426,16 @@ def _git_dir_of(repo: Path) -> Path | None:
     return target if target.is_absolute() else repo / target
 
 
+def _remove_probe_scratch(pid: int, repo: Path | None) -> None:
+    """Remove the scratch index a probe with this pid left in ``repo``'s git
+    directory. The lib names it after the probe shell's pid ($$)."""
+    git_dir = _git_dir_of(repo) if repo is not None else None
+    if git_dir is not None:
+        for leftover in git_dir.glob(f"genesis-hidden-index.{pid}.*"):
+            with contextlib.suppress(OSError):
+                leftover.unlink()
+
+
 def _kill_probe_group(proc: subprocess.Popen, repo: Path | None = None) -> None:
     # start_new_session made the probe its own group leader, so its pid is the
     # group id; > 1 is checked anyway, since killpg(1) signals everything.
@@ -428,17 +447,19 @@ def _kill_probe_group(proc: subprocess.Popen, repo: Path | None = None) -> None:
         # names the scratch file after the probe shell's pid ($$, which is
         # proc.pid), so only this probe's copy matches. Removed before the
         # reap: until then the pid cannot be reused by another process.
-        git_dir = _git_dir_of(repo) if repo is not None else None
-        if git_dir is not None:
-            for leftover in git_dir.glob(f"genesis-hidden-index.{proc.pid}.*"):
-                with contextlib.suppress(OSError):
-                    leftover.unlink()
+        _remove_probe_scratch(proc.pid, repo)
     # Bounded even now: a descendant that left the group (none in these libs)
     # would hold the pipes open, and an unbounded read would wait on it. The
-    # probe itself is dead, so wait() returns at once.
+    # reap is bounded as well: SIGKILL stays pending while the leader is in
+    # uninterruptible I/O, the very failure the timeout contains, and an
+    # unbounded wait() would strand the snapshot worker on it. Popen reaps a
+    # process left this way when the object is collected.
     with contextlib.suppress(subprocess.TimeoutExpired):
         proc.communicate(timeout=5)
-    proc.wait()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        logger.warning("deploy_health: checkout probe %s did not exit after SIGKILL", proc.pid)
 
 
 def collect_main_checkout_dirty(repo: Path, *, timeout: float = _CHEAP_TIMEOUT_S) -> dict:
@@ -461,7 +482,9 @@ def collect_main_checkout_dirty(repo: Path, *, timeout: float = _CHEAP_TIMEOUT_S
     - ``unknown`` — it could not be read (a lib failed to source, git failed,
       the probe timed out or could not start, or the collector itself failed);
       ``reason`` says which. Never reported as clean: an unreadable tree must
-      not resolve a standing alert.
+      not resolve a standing alert. One exception, shared with the deploy
+      scripts: git status skips a subdirectory it cannot open and still exits
+      0, so an edit under one reads clean here exactly as it does for them.
 
     Never raises: like every other collector here it degrades on its own
     failure, so the rest of the snapshot survives one bad read.
@@ -518,6 +541,9 @@ def _collect_main_checkout_dirty(repo: Path, timeout: float) -> dict:
     except subprocess.TimeoutExpired:
         _kill_probe_group(proc, repo)
         logger.warning("deploy_health: main-checkout probe timed out after %ss", timeout)
+        # A deploy that began meanwhile explains a slow read better than a fault.
+        if env.update_in_progress():
+            return {"status": "deploying", "count": 0, "paths": []}
         return {
             "status": "unknown",
             "count": 0,
@@ -528,6 +554,15 @@ def _collect_main_checkout_dirty(repo: Path, timeout: float) -> dict:
         _kill_probe_group(proc, repo)
         raise
     rc = proc.returncode
+    if rc < 0:
+        # Killed by a signal from outside (an OOM kill), possibly mid hidden-edit
+        # pass, before the lib's own rm.
+        _remove_probe_scratch(proc.pid, repo)
+    # A deploy that began while the probe ran (deploy_code_only.sh pull keeps the
+    # server up) may have been mid-merge under it: its reading is not the
+    # checkout's, so it reports the same state a deploy found up front does.
+    if env.update_in_progress():
+        return {"status": "deploying", "count": 0, "paths": []}
     if rc == 3:
         return {"status": "not_deploy_root", "count": 0, "paths": []}
     if rc != 0:

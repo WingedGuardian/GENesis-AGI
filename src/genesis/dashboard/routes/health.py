@@ -126,11 +126,13 @@ def inflight_work():
 
 
 def _redact_checkout_paths(snapshot: dict) -> None:
-    """Drop the deploy checkout's edited file names for an untrusted caller.
+    """Drop the deploy checkout's edited file names, and the probe's error
+    text, for an untrusted caller.
 
     This route is reachable from any network (``_OPEN_FROM_ANY_NETWORK``, for
     the host-side supervisor), and the names can be a private fork's or this
-    install's own files. The status and count stay public; the names go only
+    install's own files; a probe error can name absolute paths on the install.
+    The status and count stay public; the names and the reason go only
     to a trusted-network peer, the internal bearer, or a verified dashboard
     session. Rebuilt as new dicts: ``snapshot`` is a shallow copy, so its
     nested dicts are the cached snapshot other callers read.
@@ -143,13 +145,13 @@ def _redact_checkout_paths(snapshot: dict) -> None:
 
     deploy = snapshot.get("deploy_health")
     checkout = deploy.get("main_checkout") if isinstance(deploy, dict) else None
-    if not isinstance(checkout, dict) or "paths" not in checkout:
+    if not isinstance(checkout, dict) or not ({"paths", "reason"} & checkout.keys()):
         return
     if _peer_is_trusted(request.remote_addr) or has_internal_bearer() or has_verified_credential():
         return
     snapshot["deploy_health"] = {
         **deploy,
-        "main_checkout": {k: v for k, v in checkout.items() if k != "paths"},
+        "main_checkout": {k: v for k, v in checkout.items() if k not in ("paths", "reason")},
     }
 
 

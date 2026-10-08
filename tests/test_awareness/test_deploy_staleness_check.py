@@ -207,7 +207,8 @@ async def test_recovery_resolves_and_retires_anchors(db, monkeypatch):
     await db.execute(
         "INSERT INTO observations (id, source, type, content, priority, created_at,"
         " resolved, resolution_notes) VALUES ('old', ?, 'infrastructure_alert',"
-        " 'missing_units:x.timer', 'high', '2020-01-01T00:00:00+00:00', 1, ?)",
+        " 'Merged changes are NOT fully deployed [findings: missing_units:x.timer]',"
+        " 'high', '2020-01-01T00:00:00+00:00', 1, ?)",
         (SOURCE, loop._DEPLOY_SUPERSEDED_NOTE),
     )
     await db.commit()
@@ -231,7 +232,8 @@ async def test_partial_recovery_retires_missing_unit_anchors(db, monkeypatch):
     await db.execute(
         "INSERT INTO observations (id, source, type, content, priority, created_at,"
         " resolved, resolution_notes) VALUES ('old', ?, 'infrastructure_alert',"
-        " 'missing_units:x.timer', 'high', '2020-01-01T00:00:00+00:00', 1, ?)",
+        " 'Merged changes are NOT fully deployed [findings: missing_units:x.timer]',"
+        " 'high', '2020-01-01T00:00:00+00:00', 1, ?)",
         (SOURCE, loop._DEPLOY_SUPERSEDED_NOTE),
     )
     await db.commit()
@@ -505,6 +507,32 @@ async def test_a_tick_during_a_deploy_still_reconciles_drift(db, monkeypatch):
     assert "missing systemd units: x.timer" in row["content"]
 
 
+async def test_an_edited_file_named_like_a_finding_is_not_an_escalation_anchor(db, monkeypatch):
+    """The dirty paragraph lists edited file names, free text that can contain a
+    finding class (and `_` is a LIKE wildcard, so `missing-units` matches too).
+    A dirty alert standing for 25h must not serve as the >24h missing-unit
+    anchor: the first real missing unit gets its grace period, not a page."""
+    named = _dirty(paths=("docs/missing-units.md",))
+    _patch_snapshot(monkeypatch, _snap(["main_checkout_dirty:1"], main_checkout=named))
+    await loop._check_deploy_staleness(db)
+    old = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    await db.execute(f"UPDATE observations SET created_at=? WHERE source='{SOURCE}'", (old,))
+    await db.commit()
+    (row,) = await _rows(db)
+    assert "missing-units" in row["content"]  # precondition: the prose carries it
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    _patch_snapshot(
+        monkeypatch,
+        _snap(
+            ["missing_units:x.timer", "main_checkout_dirty:1"],
+            missing_units=_MISSING,
+            main_checkout=named,
+        ),
+    )
+    await loop._check_deploy_staleness(db)
+    assert [r["priority"] for r in await _rows(db)] == ["high"]
+
+
 def _restart(monkeypatch):
     """Module state gone, as after a server restart; the store is untouched."""
     monkeypatch.setattr(loop, "_last_main_checkout_status", "")
@@ -545,6 +573,28 @@ async def test_after_a_restart_a_standing_dirty_alert_does_not_hold_other_findin
     (old,) = await _rows(db, resolved=1)
     assert old["id"] == dirty_row["id"]
     assert old["resolution_notes"] == loop._DEPLOY_SUPERSEDED_NOTE
+
+
+@pytest.mark.parametrize(
+    "checkout", [_UNKNOWN, {"status": "deploying"}], ids=["unreadable", "deploying"]
+)
+async def test_after_a_restart_a_standing_unreadable_alert_is_not_resolved(
+    db, monkeypatch, checkout
+):
+    """Two unreadable ticks raise the unreadable alert; the server restarts; the
+    next tick's reading is again not actionable. Nothing was read, so the alert
+    stands rather than being resolved and re-raised on every restart."""
+    _patch_snapshot(monkeypatch, _snap(["main_checkout_unreadable"], main_checkout=_UNKNOWN))
+    await loop._check_deploy_staleness(db)
+    await loop._check_deploy_staleness(db)
+    (row,) = await _rows(db)
+    assert "could not be read" in row["content"]
+    _restart(monkeypatch)
+    findings = ["main_checkout_unreadable"] if checkout is _UNKNOWN else []
+    _patch_snapshot(monkeypatch, _snap(findings, main_checkout=checkout))
+    await loop._check_deploy_staleness(db)
+    assert [r["id"] for r in await _rows(db)] == [row["id"]]
+    assert await _rows(db, resolved=1) == []
 
 
 async def test_after_a_restart_with_only_the_dirty_alert_it_stands_unchanged(db, monkeypatch):

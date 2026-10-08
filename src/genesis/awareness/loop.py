@@ -1389,6 +1389,14 @@ _DEPLOY_ALERT_COOLDOWN_S = 6 * 3600  # same-state re-alerts at most every 6h
 # (or unresolved) so escalating cannot reset its own clock; recovery rewrites
 # the note so retired anchors can never resurrect a future alert.
 _DEPLOY_SUPERSEDED_NOTE = "superseded by a new deploy-staleness alert state"
+
+
+def _finding_like(finding_class: str) -> str:
+    """A LIKE pattern matching an alert row by a finding class in its
+    structured `[findings: ...]` suffix, never by the prose before it, which
+    carries free text (edited file names, a probe's error) that can contain the
+    class name; `_` is a LIKE wildcard, so `missing-units` would match too."""
+    return f"%[findings: %{finding_class}%"
 _last_deploy_alert_at: float = 0.0
 _last_deploy_alert_key: str = ""
 # The deploy checkout's status on the previous tick (deploy_health's
@@ -1452,12 +1460,27 @@ async def _check_deploy_staleness(db) -> None:
                 checkout = _last_actionable_main_checkout
                 carried = True
             elif await observations.has_unresolved_matching(
-                db, source="deploy_staleness_monitor", content_like="%main_checkout_dirty%"
+                db, source="deploy_staleness_monitor", content_like=_finding_like("main_checkout_dirty")
             ):
                 # A dirty alert stands and nothing in memory says its count or
                 # names: carry the class alone, so the alert is kept (or
                 # superseded, never resolved) while the rest is reconciled.
                 checkout = {"status": "dirty", "count": None, "paths": []}
+                carried = True
+            elif await observations.has_unresolved_matching(
+                db,
+                source="deploy_staleness_monitor",
+                content_like=_finding_like("main_checkout_unreadable"),
+            ):
+                # Likewise for a standing unreadable alert: nothing was read on
+                # this tick, so it stands rather than being resolved here and
+                # re-raised by the next unreadable tick.
+                checkout = {
+                    "status": "unknown",
+                    "count": 0,
+                    "paths": [],
+                    "reason": "carried from the standing alert",
+                }
                 carried = True
             else:
                 checkout = {}
@@ -1496,7 +1519,7 @@ async def _check_deploy_staleness(db) -> None:
                 source="deploy_staleness_monitor",
                 from_notes=_DEPLOY_SUPERSEDED_NOTE,
                 to_notes="deploy staleness cleared",
-                content_like="%missing_units%",
+                content_like=_finding_like("missing_units"),
             )
         if not critical and "missing_units" in classes:
             # Escalate a missing unit that has been alerted for >24h. Anchor =
@@ -1507,7 +1530,7 @@ async def _check_deploy_staleness(db) -> None:
             anchor_created_at = await observations.oldest_created_at(
                 db,
                 source="deploy_staleness_monitor",
-                content_like="%missing_units%",
+                content_like=_finding_like("missing_units"),
                 resolution_notes=_DEPLOY_SUPERSEDED_NOTE,
             )
             if anchor_created_at:
