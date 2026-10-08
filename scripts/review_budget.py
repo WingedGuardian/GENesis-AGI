@@ -22,7 +22,7 @@ import re
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -261,10 +261,8 @@ def _unknown(*errors: str, current_head: str = "") -> dict[str, Any]:
         "strongly_discouraged": True,
         "open_keys": [],
         "reflection_keys": "unknown",
-        "late_keys": [],
-        "late_since": {},
-        "late_started": None,
         "body": None,
+        "body_changed": False,
         "reviewers_reported": [],
         "expected_reviewers": [],
         "errors": [e for e in errors if e],
@@ -389,61 +387,6 @@ def _round_source(
     }
 
 
-def _late_findings(
-    rounds: Sequence[Mapping[str, Any]],
-    commits: Sequence[str],
-    head: str,
-    commit_times: Mapping[str, object] | None,
-) -> tuple[dict[str, str], str | None, bool]:
-    """``({key: fix commit}, earliest late review time (UTC), known)`` for
-    findings a review left on an earlier round head AFTER the commit that
-    followed that head (the fix) was made. The fix commit is returned with each
-    key because a late finding is answerable from that commit onward: a
-    reflection naming any later head may answer it, so it retires once answered
-    instead of being owed again at every new head.
-
-    Such a review arrived after the fix it should have informed, so it opens no
-    round, yet its findings were never answered (owner ruling 2026-10-07). The
-    fix time is the next commit's COMMITTER time: GitHub reports no push time
-    (GraphQL ``pushedDate`` is null), and a later push of an earlier commit is
-    still a fix made before the review. A committer time is set by the
-    committing machine, so a clock running ahead (or one set by hand) can hide a
-    late finding: this binds an honest session's history, not a forged one. A
-    head force-pushed out of the PR has no next commit here and is never late.
-    An unreadable time, or an unkeyable finding on a late review, makes the
-    answer unknown rather than empty. A round from before
-    ``ROUND_RULE_CUTOVER_ISO`` carries no keyed reviews, so its late findings
-    are not owed: deliberately, since they can never be keyed and reading them
-    as unknown would leave an older PR owing something it can never answer.
-    """
-    if commit_times is None:
-        return {}, None, True
-    order = {sha: index for index, sha in enumerate(commits)}
-    keys: dict[str, str] = {}
-    earliest: datetime | None = None
-    for entry in rounds:
-        sha = entry.get("head")
-        if sha == head or sha not in order or order[sha] + 1 >= len(commits):
-            continue
-        fix = commits[order[sha] + 1]
-        ok, fixed_at = _parse_time(commit_times.get(fix))
-        if not ok or fixed_at is None:
-            return {}, None, False
-        for source in entry.get("reviews") or []:
-            ok, when = _parse_time(source.get("submitted_at"))
-            if not ok or when is None:
-                return {}, None, False
-            if when <= fixed_at:
-                continue
-            for key in source.get("finding_keys") or []:
-                if key is None:
-                    return {}, None, False
-                keys.setdefault(key, fix)
-            earliest = when if earliest is None else min(earliest, when)
-    started = earliest.astimezone(UTC).isoformat() if earliest else None
-    return keys, started, True
-
-
 def evaluate_evidence(
     *,
     current_head: str,
@@ -454,15 +397,8 @@ def evaluate_evidence(
     external_identity_templates: Sequence[str] = (),
     primary_login: str = CODEX_REVIEW_BOT,
     cutover: str | None = None,
-    commit_times: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     """Evaluate already-fetched PR evidence without I/O.
-
-    ``commit_times`` maps a PR commit's full SHA to its committer time. It
-    decides ``late_keys``: findings from a review on an EARLIER round head
-    submitted after the next PR commit was made (owner ruling 2026-10-07: owed,
-    but never a round). ``None`` means the times were not read, and then no
-    late key is computed; the live read always supplies them.
 
     A ROUND is a distinct head that drew findings (owner ruling 2026-10-01): a
     review by any GitHub App reviewer carrying at least one finding, by
@@ -765,11 +701,11 @@ def evaluate_evidence(
         round_state = "complete"
 
     # What a round reflection must answer for, read by review_reflection.status
-    # (and by the commit gate once it enforces reflections). The newest round
-    # only, and only while it is open. A review submitted on an EARLIER head
-    # after the next commit was made counts toward that head, never toward a
-    # later one, so it never reopens the round the fix is in; its findings are
-    # owed separately, as ``late_keys`` below.
+    # (and by the commit gate once it enforces reflections; until then they are
+    # reported, never enforced). The newest round only, and only while it is
+    # open. NOT attached (a later PR owes them separately): a review
+    # submitted on an earlier head after the fix was pushed stays on that head,
+    # so it is never owed here.
     seen: dict[str, None] = {}  # ordered and linear, however many keys arrive
     keys_known = True
     if round_state == "open":
@@ -786,8 +722,6 @@ def evaluate_evidence(
         # current head predates the cutover can reach it.
         keys_known = keys_known and rounds[-1]["head"] not in legacy
     open_keys = list(seen)
-    late_since, late_started, late_known = _late_findings(rounds, commits, head, commit_times)
-    keys_known = keys_known and late_known
     # Who the settle window waits for: every reviewer that reported on ANY other
     # head of this PR, clean reviews included (a reviewer that reviewed an
     # earlier push is the best predictor of one still to come). Before any other
@@ -816,9 +750,6 @@ def evaluate_evidence(
         "trend": trend,
         "legacy_heads": len(legacy),
         "open_keys": open_keys,
-        "late_keys": list(late_since),
-        "late_since": late_since,
-        "late_started": late_started,
         "reflection_keys": "ok" if keys_known else "unknown",
         "reviewers_reported": sorted(reported.get(head, set())),
         "expected_reviewers": expected,
@@ -889,7 +820,7 @@ _GRAPHQL_CONNECTIONS = {
     ),
     "commits": (
         "commits(first: 100, after: $after_commits) { pageInfo { hasNextPage endCursor } "
-        "nodes { commit { oid committedDate } } }"
+        "nodes { commit { oid } } }"
     ),
 }
 
@@ -1020,7 +951,7 @@ def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]
             commit = node.get("commit")
             if not isinstance(commit, dict):
                 raise ValueError(name)
-            rows.append({"sha": commit.get("oid"), "committed_at": commit.get("committedDate")})
+            rows.append({"sha": commit.get("oid")})
     return rows, path_changed
 
 
@@ -1321,18 +1252,11 @@ def _evaluate_pr_inner(
             return _unknown("evidence_changed_during_evaluation", current_head=final_head)
 
     commit_heads: list[str] = []
-    # Commit times decide late findings. The live read always carries them; a
-    # test seam may omit them, and then no late key is computed.
-    commit_times: dict[str, object] | None = {}
     for item in fetched["commits"]:
         sha = item.get("sha")
         if not isinstance(sha, str):
             return _unknown("commits_malformed", current_head=test_head)
         commit_heads.append(sha)
-        if "committed_at" in item and commit_times is not None:
-            commit_times[sha] = item["committed_at"]
-        else:
-            commit_times = None
 
     result = evaluate_evidence(
         current_head=test_head,
@@ -1342,13 +1266,16 @@ def _evaluate_pr_inner(
         changed_files=fetched["files"],
         external_identity_templates=external_identity_templates,
         primary_login=primary_login,
-        commit_times=commit_times,
     )
-    # The PR body, for the reflection's acceptance points. Read from the first
-    # snapshot only and never compared between reads: it is not evidence the
-    # count rests on, and a reviewer editing it mid-read must not turn the whole
-    # result unknown.
-    result["body"] = (first or {}).get("body")
+    # The PR body, for the reflection's acceptance points. It is not evidence
+    # the count rests on, so a body edited between the two reads leaves the
+    # count standing; but acceptance must bind the body as it now is, so the
+    # final read's body is the one returned, and two reads that disagree return
+    # no body and say so (``body_changed``), for the reader to refuse rather
+    # than check acceptance against either.
+    bodies = [s.get("body") for s in (first, second) if s is not None]
+    result["body_changed"] = len(bodies) == 2 and bodies[0] != bodies[1]
+    result["body"] = None if result["body_changed"] or not bodies else bodies[-1]
     return result
 
 

@@ -441,7 +441,6 @@ def _covered(path, head, **kw):
     kw.setdefault("prior_heads", [])
     kw.setdefault("acceptance", None)
     kw.setdefault("round_started", T0 - timedelta(days=3650))
-    kw.setdefault("late_since", {})
     return rr.covered_keys(str(path), head, **kw)
 
 
@@ -462,7 +461,7 @@ def _strong_premise(tmp_path: Path) -> Path:
 
 def _round_two(tmp_path: Path) -> list[str]:
     """What an ordinary round-2 reflection owes: the premise check."""
-    return [*CHECK_LINES, f"Premise-evidence: {_strong_premise(tmp_path)} SOUND"]
+    return [*CHECK_LINES, f"Premise-evidence: {_strong_premise(tmp_path)} SOUND-BUT-INFERIOR"]
 
 
 def _strong_audit(tmp_path: Path) -> Path:
@@ -862,6 +861,10 @@ def test_the_commit_clock_slack_is_one_second(tmp_path):
         ("Design-premise: SOUND\n  P1 the cap holds \u2014 TRUE\n", False),  # one claim
         ("Design-premise: SOUND\n  P1 a \u2014 TRUE\n  P1 b \u2014 FALSE\n", False),  # same P twice
         (
+            "Design-premise: SOUND\n  P1 a \u2014 TRUE\n  P1 b \u2014 FALSE\n  P2 c \u2014 TRUE\n",
+            False,
+        ),  # one claim, two verdicts
+        (
             "Premise: SOUND (~80%)\n| 1 | real | TRUE |\n| 2 | real | FALSE |\n",
             False,
         ),  # a summary table
@@ -881,6 +884,101 @@ def test_premise_evidence_must_be_a_premise_check_block(tmp_path, text, ok):
     evidence.write_text(text)
     got = _evidence(evidence, kind="premise", cwd=tmp_path)
     assert (got is None) is ok, got
+
+
+@pytest.mark.parametrize(
+    "line, verdict",
+    [
+        ("Design-premise: SOUND-BUT-INFERIOR", "SOUND-BUT-INFERIOR"),
+        ("Design-premise: SOUND", "SOUND"),
+        ("**Design-premise: BROKEN**", "BROKEN"),
+        ("| Design-premise: SOUND |", "SOUND"),
+        ("Design-premise: SOUND \u2014 UNPROVEN(1)", "SOUND"),
+        ("Design-premise: SOUND|SOUND-BUT-INFERIOR|BROKEN", None),  # the template
+        ("Design-premise: SOUNDNESS", None),
+        ("Design-premise: SOUND/BROKEN", None),  # audit N2: two verdicts, either way
+        ("Design-premise: SOUND | BROKEN", None),
+        ("Design-premise: SOUND (80%)", "SOUND"),
+    ],
+)
+def test_the_premise_verdict_is_read_whole(line, verdict):
+    """Class audit C1c: the alternation read SOUND out of SOUND-BUT-INFERIOR
+    and out of the template line, which binding would have trusted."""
+    text = f"{line}\n  P1 a \u2014 TRUE\n  P2 b \u2014 FALSE\n"
+    got, claims, why = rr.premise_block(text)
+    assert got == verdict, why
+    if verdict:
+        assert claims == {"1": "TRUE", "2": "FALSE"}
+
+
+def test_a_claim_verdict_is_the_first_one_on_its_line():
+    """Class audit C1d: a falsifier that names another verdict is not the claim's."""
+    text = (
+        "Design-premise: SOUND\n"
+        "  P1 the reader is bounded \u2014 TRUE \u00b7 falsified by a FALSE read\n"
+        "  P2 the caller retries \u2014 UNPROVEN \u00b7 falsified by TRUE retries\n"
+    )
+    assert rr.premise_block(text)[1] == {"1": "TRUE", "2": "UNPROVEN"}
+
+
+def test_a_premise_check_naming_two_verdicts_is_refused():
+    text = "Design-premise: SOUND\nDesign-premise: BROKEN\n  P1 a \u2014 TRUE\n  P2 b \u2014 FALSE\n"
+    assert "more than one" in rr.premise_block(text)[2]
+    again = "Design-premise: SOUND\nlater: Design-premise: SOUND\n  P1 a \u2014 TRUE\n  P2 b \u2014 TRUE\n"
+    assert rr.premise_block(again)[0] == "SOUND"
+
+
+def _bound(tmp_path, *, premise="SOUND-BUT-INFERIOR", cited="SOUND-BUT-INFERIOR", checks=CHECK_LINES):
+    lines = [*checks, f"Premise-evidence: {_strong_premise(tmp_path)} {cited}"]
+    parsed = rr.parse(_reflection(premise=premise, extra=lines), round_number=2)
+    assert parsed.ok, parsed.problems
+    return rr.evidence_problem(
+        parsed.premise_evidence,
+        kind="premise",
+        cwd=str(tmp_path),
+        round_started=T0,
+        made_at=datetime.now(UTC) + timedelta(hours=1),
+        reflection=parsed,
+    )
+
+
+def test_the_premise_verdict_is_bound_to_the_reflection(tmp_path):
+    """#3107 c4222860280: the file's verdict was checked only for existence, so
+    a file concluding BROKEN could be cited by a reflection saying SOUND."""
+    assert _bound(tmp_path) is None
+    assert "cites it as SOUND" in _bound(tmp_path, cited="SOUND")
+    assert "Premise is SOUND" in _bound(tmp_path, premise="SOUND")
+    flipped = ["Premise-check: P1 FALSE the store already dedups", CHECK_LINES[1]]
+    assert "P1 says FALSE" in _bound(tmp_path, checks=flipped)
+    unknown = [*CHECK_LINES, "Premise-check: P7 TRUE a claim the file never made"]
+    assert "has no claim P7" in _bound(tmp_path, checks=unknown)
+
+
+def test_a_premise_evidence_line_needs_its_verdict():
+    line = "Premise-evidence: ~/.genesis/review_evidence/p.txt"
+    got = rr.parse(_reflection(extra=[*CHECK_LINES, line]), round_number=2)
+    assert any("not a recognised field" in p for p in got.problems)
+
+
+def test_a_reflection_giving_one_claim_two_verdicts_is_refused():
+    twice = [*CHECK_LINES, "Premise-check: P1 FALSE the store already dedups by key"]
+    got = rr.parse(_reflection(extra=twice), round_number=1)
+    assert any("given two verdicts" in p for p in got.problems)
+
+
+def test_a_broken_premise_check_cannot_cover_its_findings(repo, tmp_path):
+    """The file decides: BROKEN cited honestly escalates, and cited as anything
+    else it fails the binding; either way nothing is covered."""
+    path, first = repo
+    _commit_reflection(path, tmp_path, _reflection(head=first))
+    _fix(path, "fix\n")
+    second = _git(path, "rev-parse", "HEAD").strip()
+    broken = tmp_path / "broken.txt"
+    broken.write_text(PREMISE_BLOCK.replace("SOUND-BUT-INFERIOR", "BROKEN"))
+    for premise in ("BROKEN", "SOUND-BUT-INFERIOR"):
+        lines = [*CHECK_LINES, f"Premise-evidence: {broken} {premise}"]
+        _commit_reflection(path, tmp_path, _reflection(head=second, premise=premise, extra=lines))
+    assert _covered(path, second, round_number=2, prior_heads=[first]) == set()
 
 
 def test_a_round_two_reflection_needs_a_real_premise_check(repo, tmp_path):
@@ -950,99 +1048,6 @@ def test_an_acceptance_point_maps_within_one_covered_scope_line(scopes, ok):
     assert got.ok is ok, got.problems
 
 
-def test_late_findings_are_owed_when_no_round_is_open():
-    """Owner ruling 2026-10-07: a review that landed after the fix opens no
-    round, yet its findings are owed, answered by a current-head reflection."""
-    late_at = "2026-10-07T12:40:00Z"
-    budget = _budget(round_state="complete", open_keys=[], late_keys=["c9"], late_started=late_at)
-    got = rr.owed_state(budget, (), now=T0)
-    assert got["owed"] == ["c9"] and got["settled"]
-    assert got["round_started"] == "2026-10-07T12:40:00+00:00"
-    assert rr.owed_state(budget, ("c9",), now=T0)["owed"] == []
-
-
-def test_an_unknown_late_answer_is_unknown_never_nothing_owed():
-    """Fix-code audit B1: a complete round whose late findings could not be
-    read must not read as owing nothing."""
-    budget = _budget(round_state="complete", open_keys=[], late_keys=[], reflection_keys="unknown")
-    assert rr.owed_state(budget, (), now=T0)["owed"] is None
-
-
-def test_a_late_finding_answered_earlier_stays_answered(repo, tmp_path):
-    """Fix-code audit S1: a late key answered by a reflection at the head
-    after its fix must not be owed again at every later head."""
-    path, first = repo
-    _fix(path, "fix one\n")
-    fix = _git(path, "rev-parse", "HEAD").strip()
-    answer = _reflection(keys=("c9", "c1"), head=fix)
-    _commit_reflection(path, tmp_path, answer)
-    _fix(path, "fix two\n")
-    later = _git(path, "rev-parse", "HEAD").strip()
-    # The late key retires; the reflection's other key was that head's own,
-    # and is never credited to a later head.
-    assert _covered(path, later, late_since={"c9": fix}) == {"c9"}
-    # Control: a late key whose fix comes AFTER the reflection's head is not
-    # answered by it.
-    assert _covered(path, later, late_since={"c9": later}) == set()
-    # A head the late key was not mapped to answers nothing.
-    assert _covered(path, later, late_since={}) == set()
-    # A reflection naming a head the PR head does not descend from (a local
-    # branch that diverged from the PR) answers nothing for that PR head.
-    assert _covered(path, first, late_since={"c9": fix}) == set()
-
-
-def test_an_earlier_answer_is_not_re_judged_by_a_later_round(repo, tmp_path):
-    """GLM secondary P2: re-checking an earlier head's reflection against the
-    CURRENT round's obligations and evidence window un-answered it whenever
-    the head moved. Answered stays answered."""
-    path, _ = repo
-    _fix(path, "fix one\n")
-    fix = _git(path, "rev-parse", "HEAD").strip()
-    _commit_reflection(path, tmp_path, _reflection(keys=("c9",), head=fix))
-    _fix(path, "fix two\n")
-    later = _git(path, "rev-parse", "HEAD").strip()
-    future = datetime.now(UTC) + timedelta(hours=1)
-    # Round 3 of the ordinary lane owes an audit and a premise check, and the
-    # window opens after the reflection: neither applies to the earlier answer.
-    got = _covered(path, later, round_number=3, round_started=future, late_since={"c9": fix})
-    assert got == {"c9"}
-
-
-def test_an_escalating_earlier_answer_answers_nothing(repo, tmp_path):
-    path, _ = repo
-    _fix(path, "fix one\n")
-    fix = _git(path, "rev-parse", "HEAD").strip()
-    _commit_reflection(path, tmp_path, _reflection(keys=("c9",), head=fix, escalate="yes"))
-    _fix(path, "fix two\n")
-    later = _git(path, "rev-parse", "HEAD").strip()
-    assert _covered(path, later, late_since={"c9": fix}) == set()
-
-
-def test_an_ungrammatical_earlier_answer_answers_nothing(repo, tmp_path):
-    path, _ = repo
-    _fix(path, "fix one\n")
-    fix = _git(path, "rev-parse", "HEAD").strip()
-    bad = _reflection(keys=("c9",), head=fix, decision="whatever")
-    assert not rr.parse(bad).ok and rr.parse(bad).keys == ["c9"]
-    _commit_reflection(path, tmp_path, bad)
-    _fix(path, "fix two\n")
-    later = _git(path, "rev-parse", "HEAD").strip()
-    assert _covered(path, later, late_since={"c9": fix}) == set()
-
-
-def test_an_earlier_answer_made_after_a_fix_answers_nothing(repo, tmp_path):
-    """The reflection must come before any fix to the head it names, so a
-    late answer written after the next fix does not count."""
-    path, _ = repo
-    _fix(path, "fix one\n")
-    fix = _git(path, "rev-parse", "HEAD").strip()
-    _fix(path, "fix two\n")
-    _commit_reflection(path, tmp_path, _reflection(keys=("c9",), head=fix))
-    _fix(path, "fix three\n")
-    later = _git(path, "rev-parse", "HEAD").strip()
-    assert _covered(path, later, late_since={"c9": fix}) == set()
-
-
 def test_an_open_round_with_unknown_keys_still_reports_its_timing():
     """GLM secondary P3: owed stays unknown, but the settle window is still
     reported, so a reader can tell when the round settles."""
@@ -1052,40 +1057,45 @@ def test_an_open_round_with_unknown_keys_still_reports_its_timing():
     assert got["settle_until"] == (T0 + rr.SETTLE).isoformat()
 
 
-def test_status_answers_late_findings_from_the_budget_body(repo, tmp_path, monkeypatch):
-    """The late-only path end to end: every round head is prior, the window
-    opens at the late review, and the body comes from the budget read."""
-    path, head = repo
-    # The late key is answered at the fix's head, and the PR has moved on since.
-    _commit_reflection(path, tmp_path, _reflection(keys=("c9",), head=head))
-    _fix(path, "later\n")
-    current = _git(path, "rev-parse", "HEAD").strip()
+def _status_with(monkeypatch, path, budget):
     import review_budget
 
-    late_at = (T0 - timedelta(days=1)).isoformat()
-    budget = _budget(
-        round_state="complete",
-        open_keys=[],
-        late_keys=["c9", "c8"],
-        late_since={"c9": head, "c8": head},
-        late_started=late_at,
-        current_head=current,
-        body="no acceptance section here",
-    )
     monkeypatch.setattr(rr, "pr_identity", lambda cwd: ("o/r", 7))
+    monkeypatch.setattr(review_budget, "evaluate_pr", lambda repo, number: budget)
 
     def no_second_read(repo, number):
         raise AssertionError("the body came with the budget; no gh pr view")
 
     monkeypatch.setattr(rr, "_pr_meta", no_second_read)
-    monkeypatch.setattr(review_budget, "evaluate_pr", lambda repo, number: budget)
-    got = rr.status(str(path), now=T0)
-    assert got["owed"] == ["c8"] and got["settled"]
+    return rr.status(str(path), now=T0 + timedelta(hours=1))
 
 
-def test_late_findings_join_an_open_round():
-    budget = _budget(open_keys=["c1"], late_keys=["c9", "c1"])
-    assert rr.owed_state(budget, (), now=T0)["owed"] == ["c1", "c9"]
+def test_status_binds_acceptance_to_the_budget_body(repo, tmp_path, monkeypatch):
+    """#3107 c4222860305: the acceptance points come from the body the budget
+    read, and no second read of the PR is made."""
+    path, head = repo
+    _commit_reflection(path, tmp_path, _reflection(keys=("c1",), head=head))
+    plain = _budget(open_keys=["c1"], current_head=head, body="no acceptance section")
+    assert _status_with(monkeypatch, path, plain)["owed"] == []
+    # Control: the same reflection under a body that declares an acceptance
+    # point it never maps is not covered, so the body really was read.
+    declared = dict(plain, body="## Acceptance\n- the cap holds on every path\n")
+    assert _status_with(monkeypatch, path, declared)["owed"] == ["c1"]
+
+
+def test_status_refuses_a_body_that_changed_between_reads(repo, monkeypatch):
+    path, head = repo
+    budget = _budget(current_head=head, body=None, body_changed=True)
+    with pytest.raises(rr.Refused, match="changed between the two reads"):
+        _status_with(monkeypatch, path, budget)
+
+
+def test_status_refuses_a_carried_body_it_cannot_read(repo, monkeypatch):
+    """A budget that carries the key but no text never falls back to a third,
+    unsynchronised read."""
+    path, head = repo
+    with pytest.raises(rr.Refused, match="could not be read"):
+        _status_with(monkeypatch, path, _budget(current_head=head, body=None))
 
 
 def test_status_subtracts_what_is_covered(repo, tmp_path, monkeypatch):
@@ -1111,7 +1121,6 @@ def test_unreadable_git_is_refused_never_nothing_owed(tmp_path):
             prior_heads=[],
             acceptance=None,
             round_started=T0,
-            late_since={},
         )
 
 

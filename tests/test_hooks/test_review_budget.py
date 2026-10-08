@@ -282,17 +282,21 @@ def _slow_runner(clock: _FakeClock, calls: list[tuple[str, float]]):
     return run
 
 
-def _graphql_server(*, head=H5, page_size=100, heads=None, body=None, **connections):
+def _graphql_server(
+    *, head=H5, page_size=100, heads=None, body=None, bodies=None, **connections
+):
     """A fake `gh api graphql` that honours the query's connections and cursors.
 
     It reads WHICH connections the query selects from the query text and each
     one's `after_<name>` cursor from argv, and serves `page_size` nodes per page,
     so pagination, per-connection cursors and re-reads are exercised against the
     real argv the module builds rather than a canned reply. `heads`, when given,
-    is consumed one per call (a head that moves between reads). Anything that is
-    not a GraphQL call fails, so an unexpected REST call is loud.
+    is consumed one per call (a head that moves between reads); so is `bodies`
+    (a PR body edited between reads). Anything that is not a GraphQL call fails,
+    so an unexpected REST call is loud.
     """
     head_seq = list(heads or [])
+    body_seq = list(bodies or [])
     seen: list[list[str]] = []
 
     def run(argv, *, timeout):
@@ -302,7 +306,11 @@ def _graphql_server(*, head=H5, page_size=100, heads=None, body=None, **connecti
         query = next(a for a in argv if a.startswith("query="))
         fields = dict(a.split("=", 1) for a in argv if "=" in a and not a.startswith("query="))
         pr: dict = {"headRefOid": head_seq.pop(0) if head_seq else head}
-        if body is not None and " body " in query:
+        # The PR's own body field, not a review node's: those select `body` too.
+        selects_body = "{ headRefOid body " in query
+        if body_seq and selects_body:
+            pr["body"] = body_seq.pop(0)
+        elif body is not None and selects_body:
             pr["body"] = body
         for name in ("reviews", "comments", "files", "commits"):
             if f" {name}(first: 100" not in query:
@@ -954,32 +962,28 @@ def test_a_comment_reposted_between_reads_is_not_unknown(monkeypatch):
     assert got["status"] == "ok", got
 
 
-def test_the_live_read_carries_commit_times_and_the_pr_body(monkeypatch):
-    """Late findings and the PR body both ride the one GraphQL query: a
-    finding-bearing review on H4, submitted after H5 was committed, is owed as
-    a late key, and the body comes back for the reflection's acceptance points."""
+def test_the_live_read_carries_the_pr_body(monkeypatch):
+    """The PR body rides the one GraphQL query, for the reflection's
+    acceptance points; it adds no call."""
     _no_seams(monkeypatch)
-    finding = "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow)</sub></sub> x**"
-    review = dict(
-        _gql_review(H4),
-        fullDatabaseId="11",
-        submittedAt="2026-10-05T12:10:00Z",
-        comments={
-            "pageInfo": {"hasNextPage": False},
-            "nodes": [{"fullDatabaseId": "111", "replyTo": None, "body": finding}],
-        },
-    )
-    times = {H4: "2026-10-05T11:00:00Z", H5: "2026-10-05T12:05:00Z"}
-    commits = [
-        {"commit": {"oid": h, "committedDate": times.get(h, "2026-10-04T00:00:00Z")}}
-        for h in (H1, H2, H3, H4, H5)
-    ]
+    body = "## Acceptance\n- it works\n"
+    serve = _graphql_server(reviews=[_gql_review(H4)], files=_FILES, commits=_COMMITS, body=body)
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert got["body"] == body and got["body_changed"] is False
+    queries = [next(a for a in call if a.startswith("query=")) for call in serve.seen]
+    assert queries and all("{ headRefOid body " in q for q in queries)
+
+
+def test_a_body_edited_between_the_reads_is_reported_not_chosen(monkeypatch):
+    """#3107 c4222860305: the body came from the first read only, so an edit
+    before the final read was missed. Two reads that disagree return no body,
+    and say so; the count itself still stands."""
+    _no_seams(monkeypatch)
     serve = _graphql_server(
-        reviews=[review], files=_FILES, commits=commits, body="## Acceptance\n- it works\n"
+        reviews=[_gql_review(H4)], files=_FILES, commits=_COMMITS, bodies=["old", "new"]
     )
     got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
     assert got["status"] == "ok", got
-    assert got["round_state"] == "complete" and got["late_keys"] == ["c111"], got
-    assert got["body"] == "## Acceptance\n- it works\n"
-    query = next(a for a in serve.seen[0] if a.startswith("query="))
-    assert "committedDate" in query and " body " in query
+    assert got["body"] is None and got["body_changed"] is True
+    assert len(serve.seen) == 2  # the final read is the one that saw the edit

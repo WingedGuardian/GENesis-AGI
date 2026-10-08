@@ -29,9 +29,13 @@ hole; a closed grammar has none of those to handle::
     Disposition: c102 file issue=#123
     Escalate: no
 
-Rounds that owe more add ``Audit-evidence: <path> <verdict>``, or two
+Rounds that owe more add ``Audit-evidence: <path> <label>``, or two
 ``Premise-check: P1 TRUE <text>`` lines plus ``Premise-evidence: <path>
-<verdict>`` (see ``obligations``). Each cited file must be a regular file of at
+SOUND|SOUND-BUT-INFERIOR|BROKEN`` (see ``obligations``). The audit's label is
+free text and unchecked: an audit has no verdict vocabulary to bind it to. The
+premise verdict is bound: it, the reflection's ``Premise:`` and every
+``Premise-check`` claim must restate what the cited file concludes, so a file
+concluding BROKEN forces an escalating reflection. Each cited file must be a regular file of at
 most 1 MiB, written after the round started and before the reflection was
 committed; a relative path is read from the repository the check runs in.
 Cite a copy that nothing else rewrites (``<pr>-round<N>-<kind>.txt``), never
@@ -105,7 +109,7 @@ FIELDS: dict[str, tuple[re.Pattern[str], int, int | None]] = {
     ),
     "Audit-evidence": (re.compile(r"^Audit-evidence: ([!-~]{1,300})(?: ([ -~]{1,300}))?$"), 0, 1),
     "Premise-evidence": (
-        re.compile(r"^Premise-evidence: ([!-~]{1,300})(?: ([ -~]{1,300}))?$"),
+        re.compile(r"^Premise-evidence: ([!-~]{1,300}) (SOUND-BUT-INFERIOR|SOUND|BROKEN)$"),
         0,
         1,
     ),
@@ -143,8 +147,12 @@ class Reflection:
     escalate: bool = False
     audit_evidence: str | None = None
     premise_evidence: str | None = None
+    premise_evidence_verdict: str | None = None
     scopes: list[str] = field(default_factory=list)
     premise_checks: int = 0
+    #: ``Premise-check`` claims by number: what the reflection says the cited
+    #: premise check concluded, bound to that file by ``evidence_problem``.
+    premise_claims: dict[str, str] = field(default_factory=dict)
     problems: list[str] = field(default_factory=list)
 
     @property
@@ -239,6 +247,9 @@ def parse(
     result.scopes = [m.group(1) for m in seen["Scope"]]
     # Distinct premise numbers: one check written twice is still one check.
     result.premise_checks = len({m.group(1) for m in seen["Premise-check"]})
+    for m in seen["Premise-check"]:
+        if result.premise_claims.setdefault(m.group(1), m.group(2)) != m.group(2):
+            result.problems.append(f"'Premise-check: P{m.group(1)}' is given two verdicts")
     if seen["Premise"]:
         result.verdict = seen["Premise"][0].group(1)
     if seen["Decision"]:
@@ -247,6 +258,7 @@ def parse(
         result.audit_evidence = seen["Audit-evidence"][0].group(1)
     if seen["Premise-evidence"]:
         result.premise_evidence = seen["Premise-evidence"][0].group(1)
+        result.premise_evidence_verdict = seen["Premise-evidence"][0].group(2)
     if any(m.group(1) == "yes" for m in seen["Escalate"]) or result.verdict in {
         "BROKEN",
         "SUSPECT",
@@ -295,7 +307,7 @@ def parse(
     if premise_owed and not result.premise_evidence:
         result.problems.append(
             f"round {round_number} cites the premise check's output: "
-            "'Premise-evidence: <path> <verdict>'"
+            "'Premise-evidence: <path> SOUND|SOUND-BUT-INFERIOR|BROKEN'"
         )
     recurring = sorted(set(result.classes) & {_normalize(c) for c in previous_classes})
     if recurring and result.decision == "fix-instances":
@@ -538,12 +550,37 @@ EVIDENCE_MAX_BYTES = 1024 * 1024
 #: parser of the claims' meaning.
 _BLOCK_LEAD = r"^\s*(?:[-*|]\s*)?(?:\*\*)?"
 _PREMISE_VERDICT_RE = re.compile(
-    _BLOCK_LEAD + r"Design-premise:(?:\*\*)?\s*(SOUND|SOUND-BUT-INFERIOR|BROKEN)\b",
+    _BLOCK_LEAD
+    + r"Design-premise:(?:\*\*)?\s*(SOUND-BUT-INFERIOR|SOUND|BROKEN)(?![\w-]|[ \t]*[/|][ \t]*(?:SOUND|BROKEN))",
     re.MULTILINE,
 )
 _PREMISE_CLAIM_RE = re.compile(
-    _BLOCK_LEAD + r"P([1-9][0-9]?)\b.*\b(TRUE|FALSE|UNPROVEN)\b", re.MULTILINE
+    _BLOCK_LEAD + r"P([1-9][0-9]?)\b.*?\b(TRUE|FALSE|UNPROVEN)\b", re.MULTILINE
 )
+
+
+def premise_block(text: str) -> tuple[str | None, dict[str, str], str | None]:
+    """``(verdict, {claim number: verdict}, problem)`` from a premise-check
+    output. The block must name exactly one verdict, however many times it
+    repeats it, and at least two distinct claims; a claim given two different
+    verdicts is a problem, never the first one read."""
+    verdicts = {m.group(1) for m in _PREMISE_VERDICT_RE.finditer(text)}
+    claims: dict[str, str] = {}
+    for m in _PREMISE_CLAIM_RE.finditer(text):
+        if claims.setdefault(m.group(1), m.group(2)) != m.group(2):
+            return None, {}, f"claim P{m.group(1)} carries two different verdicts"
+    if len(verdicts) > 1:
+        return None, {}, "it names more than one 'Design-premise:' verdict: " + ", ".join(
+            sorted(verdicts)
+        )
+    if not verdicts or len(claims) < 2:
+        return (
+            None,
+            {},
+            "it needs the 'Design-premise:' verdict line and at least two "
+            "'P<n> ... TRUE|FALSE|UNPROVEN' claim lines (.claude/docs/premise-check.md)",
+        )
+    return next(iter(verdicts)), claims, None
 
 
 def _read_evidence(path: str, cwd: str) -> tuple[str | None, datetime | None, str | None]:
@@ -584,7 +621,13 @@ def _read_evidence(path: str, cwd: str) -> tuple[str | None, datetime | None, st
 
 
 def evidence_problem(
-    path: str, *, kind: str, cwd: str, round_started: object, made_at: object
+    path: str,
+    *,
+    kind: str,
+    cwd: str,
+    round_started: object,
+    made_at: object,
+    reflection: Reflection | None = None,
 ) -> str | None:
     """Why a cited evidence file does not count, or None. ``kind`` is
     ``"audit"`` (the review gate's own adversarial-evidence check) or
@@ -595,7 +638,16 @@ def evidence_problem(
     the reflection is refused. An unknown end of the window is a refusal,
     never a skipped check. File times can be set by hand, so this binds an
     honest session's evidence to its reflection; it is not proof against
-    tampering."""
+    tampering.
+
+    For premise evidence, a ``reflection`` is bound to the file: its
+    ``Premise-evidence`` verdict and its ``Premise:`` must both be the file's
+    verdict, and each of its ``Premise-check`` claims must match the file's
+    claim of that number. The file decides; the reflection only restates it.
+    Claims the reflection does not cite are not compared, but the overall
+    verdict always is.
+    A file concluding BROKEN therefore forces ``Premise: BROKEN``, which
+    escalates."""
     label = {"audit": "Audit-evidence", "premise": "Premise-evidence"}[kind]
     text, mtime, why = _read_evidence(path, cwd)
     if why is not None or text is None or mtime is None:
@@ -607,13 +659,27 @@ def evidence_problem(
         if not ok:
             return f"{label} is not an adversarial audit: {why}"
     else:
-        claims = {m.group(1) for m in _PREMISE_CLAIM_RE.finditer(text)}
-        if not _PREMISE_VERDICT_RE.search(text) or len(claims) < 2:
-            return (
-                f"{label} is not a premise check: it needs the 'Design-premise:' "
-                "verdict line and at least two 'P<n> ... TRUE|FALSE|UNPROVEN' claim "
-                "lines (.claude/docs/premise-check.md)"
-            )
+        verdict, claims, why = premise_block(text)
+        if why is not None:
+            return f"{label} is not a premise check: {why}"
+        if reflection is not None:
+            if reflection.premise_evidence_verdict != verdict:
+                return (
+                    f"{label} concludes {verdict}, but the reflection cites it as "
+                    f"{reflection.premise_evidence_verdict}"
+                )
+            if reflection.verdict != verdict:
+                return (
+                    f"{label} concludes {verdict}, but the reflection's Premise is "
+                    f"{reflection.verdict}"
+                )
+            for number, said in sorted(reflection.premise_claims.items()):
+                found = claims.get(number)
+                if found != said:
+                    return (
+                        f"Premise-check P{number} says {said}, but {label} "
+                        + (f"says {found}" if found else "has no claim P" + number)
+                    )
     started = _parse_when(round_started)
     if started is None:
         return f"the round's start time is unknown, so the {kind}'s freshness cannot be checked"
@@ -664,7 +730,12 @@ def check(
     for kind, path in (("audit", parsed.audit_evidence), ("premise", parsed.premise_evidence)):
         if path:
             trouble = evidence_problem(
-                path, kind=kind, cwd=cwd, round_started=round_started, made_at=made_at
+                path,
+                kind=kind,
+                cwd=cwd,
+                round_started=round_started,
+                made_at=made_at,
+                reflection=parsed,
             )
             if trouble:
                 parsed.problems.append(trouble)
@@ -701,17 +772,8 @@ def covered_keys(
     prior_heads: Sequence[str],
     acceptance: Sequence[str] | None,
     round_started: object,
-    late_since: Mapping[str, str],
 ) -> set[str]:
     """Keys answered at ``head`` by committed reflections. THE coverage check.
-
-    ``late_since`` maps each late key to the fix commit it trailed (from
-    ``review_budget``). A late key is also answered by a reflection naming an
-    EARLIER head, as long as that head descends from the key's fix commit: once
-    answered it stays answered, instead of being owed again at every new head.
-    Such a reflection answers only its late keys, never the open round's, and
-    is held to the grammar, emptiness, before-any-fix and no escalation, but
-    not to the current round's obligations or evidence window.
 
     A reflection counts only when it is an EMPTY commit naming this exact head,
     made before any fix to it (``before_any_fix``), and ``check`` passes it:
@@ -724,40 +786,23 @@ def covered_keys(
     reflection committed by hand is held to exactly this; there is no weaker
     path. Raises ``Refused`` when git cannot be read: a caller must treat that
     as unknown, never as nothing owed.
+
+    Some inputs are read as they are NOW, not as they were when the reflection
+    was committed: the acceptance points (today's PR body), the lane (today's
+    changed files) and the cited evidence files (read from disk at each check).
+    Each change there can only refuse a reflection that passed, except a PR
+    edit that removes an acceptance point, or one that moves the PR across the
+    hook-surface boundary (the lanes owe different checks at a round); cite
+    evidence from a place nothing prunes (``~/.genesis/review_evidence/``).
     """
     previous = previous_class_labels(cwd, prior_heads)
     covered: set[str] = set()
-    ancestry: dict[tuple[str, str], bool] = {}
-
-    def descends(older: str, newer: str) -> bool:
-        if (older, newer) not in ancestry:
-            ancestry[(older, newer)] = _is_ancestor(cwd, older, newer)
-        return ancestry[(older, newer)]
-
     for sha, kind, body, committed_at in _log_reflections(cwd):
-        if kind != "empty":
-            continue
-        parsed = parse(body)
-        named = parsed.head
-        if named is None:
-            continue
-        if named != head:
-            # An earlier head's reflection answers LATE keys only. It is judged
-            # without a round: that round's obligations and evidence window
-            # cannot be rebuilt later, and re-judging it against the current
-            # round would un-answer it every time the head moves.
-            candidates = [k for k in parsed.keys if k in late_since]
-            if not candidates or not parsed.ok or parsed.escalate:
-                continue
-            if not descends(named, head) or not before_any_fix(cwd, named, sha):
-                continue
-            covered.update(k for k in candidates if descends(late_since[k], named))
-            continue
-        if not before_any_fix(cwd, named, sha):
+        if kind != "empty" or not before_any_fix(cwd, head, sha):
             continue
         result = check(
             body,
-            head=named,
+            head=head,
             round_number=round_number,
             gate_lane=gate_lane,
             previous_classes=previous,
@@ -771,24 +816,10 @@ def covered_keys(
     return covered
 
 
-def _is_ancestor(cwd: str, older: str, newer: str) -> bool:
-    """Whether ``older`` is ``newer`` or one of its ancestors. A commit git
-    cannot find (not fetched, force-pushed away) is not an ancestor."""
-    code, _, _ = _run(["git", "-C", cwd, "merge-base", "--is-ancestor", older, newer])
-    return code == 0
-
-
 def owed_state(
     budget: Mapping[str, Any], covered: Iterable[str], *, now: datetime
 ) -> dict[str, Any]:
-    """What is owed, from a ``review_budget`` result. Pure.
-
-    The open round's keys, plus ``late_keys`` in ANY round state: findings a
-    review left on an earlier head after the fix was already made. They never
-    reopen the round the fix is in (owner ruling 2026-10-07), so a PR whose last
-    push drew no new findings can still owe them; a reflection naming the
-    current head, or any head after the fix, answers them.
-    """
+    """What the open round owes, from a ``review_budget`` result. Pure."""
     state: dict[str, Any] = {
         "status": budget.get("status"),
         "round": budget.get("count"),
@@ -797,7 +828,6 @@ def owed_state(
         "gate_lane": bool(budget.get("gate_surface")),
         "reflection_keys": budget.get("reflection_keys", "unknown"),
         "open_keys": list(budget.get("open_keys") or []),
-        "late_keys": list(budget.get("late_keys") or []),
         # None means UNKNOWN, never "nothing owed": an unreadable budget or a
         # round whose findings could not all be keyed owes something unknown.
         "owed": None,
@@ -811,28 +841,12 @@ def owed_state(
         state["round_head"] = rounds[-1].get("head")
     if budget.get("status") != "ok":
         return state
-    is_open = budget.get("round_state") == "open"
-    known = state["reflection_keys"] == "ok"
-    if not known and not is_open:
-        # A late finding that could not be keyed or dated: owed stays None
-        # (unknown), never an empty list.
-        return state
-    if known and not is_open and not state["late_keys"]:
+    if budget.get("round_state") != "open":
         state["owed"] = []
         return state
-    if known:
+    if state["reflection_keys"] == "ok":
         done = set(covered)
-        wanted = dict.fromkeys((state["open_keys"] if is_open else []) + state["late_keys"])
-        state["owed"] = [k for k in wanted if k not in done]
-    # An unknown key set leaves owed None but still reports the open round's
-    # timing, so a reader can tell when it settles.
-    if not is_open:
-        # Only late findings are owed: they have already arrived, so nothing is
-        # still settling, and the audit window opens at the first of them.
-        late_started = _parse_when(budget.get("late_started"))
-        state["round_started"] = late_started.isoformat() if late_started else None
-        state["settled"] = True
-        return state
+        state["owed"] = [k for k in state["open_keys"] if k not in done]
     times = [
         when
         for source in (rounds[-1].get("reviews") or [] if rounds else [])
@@ -854,25 +868,32 @@ def status(cwd: str, *, now: datetime | None = None) -> dict[str, Any]:
     repo, number = pr_identity(cwd)
     budget = review_budget.evaluate_pr(repo, number)
     state = owed_state(budget, (), now=now or datetime.now(UTC))
-    if state["owed"]:
-        is_open = state["round_state"] == "open"
-        rounds = budget.get("rounds") or []
-        # The body comes with the budget read; ask GitHub again only when it
-        # did not (an older review_budget, or a test seam).
-        body = budget.get("body")
-        if not isinstance(body, str):
+    if state["status"] == "ok" and state["round_state"] == "open":
+        if budget.get("body_changed"):
+            raise Refused(
+                "the PR body changed between the two reads, so its acceptance "
+                "points are not known: run status again"
+            )
+        # The body comes with the budget read. Only a budget that carries no
+        # body at all (an older review_budget) is answered by asking again; a
+        # carried body of None (two reads that disagreed) never is.
+        if "body" in budget:
+            body = budget.get("body")
+            if not isinstance(body, str):
+                raise Refused("the PR body could not be read, so its acceptance is unknown")
+        else:
             body = _pr_meta(repo, number).get("body") or ""
         covered = covered_keys(
             cwd,
             str(state["head"]),
             round_number=int(state["round"] or 0),
             gate_lane=state["gate_lane"],
-            prior_heads=[str(r.get("head")) for r in (rounds[:-1] if is_open else rounds)],
+            prior_heads=[str(r.get("head")) for r in (budget.get("rounds") or [])[:-1]],
             acceptance=acceptance_points(body),
             round_started=state["round_started"],
-            late_since=dict(budget.get("late_since") or {}),
         )
-        state["owed"] = [k for k in state["owed"] if k not in covered]
+        if state["reflection_keys"] == "ok":
+            state["owed"] = [k for k in state["open_keys"] if k not in covered]
     state.update({"repo": repo, "pr": number, "errors": budget.get("errors", [])})
     return state
 
