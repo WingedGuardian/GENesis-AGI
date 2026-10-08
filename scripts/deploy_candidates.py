@@ -85,8 +85,9 @@ the Claude Code pin, what drives the host on a timer, a git or Claude Code hook
 the wipers off `live` (and what they source first), or this engine, never goes
 live before it merges; nor does a branch that carries a `Deploy-rebuild:` commit
 (it was cut from `live`). Only regular files may go under the hook
-directories. Every hook path that differs from origin/main on the rebuilt tip
-needs exactly one owner (the one merged candidate whose merge or own diff
+directories, and every name sync-hooks.sh lists on the rebuilt tip must be one
+(candidates whose list and directory combine are excluded by name). Every
+hook path that differs from origin/main on the rebuilt tip needs exactly one owner (the one merged candidate whose merge or own diff
 changed it, approved at that head, whose entry the tip holds); rebuild, drop and
 status exclude any other candidate by name. After a move, a git hook still
 installed as the old checkout held it is replaced or removed, so a candidate's

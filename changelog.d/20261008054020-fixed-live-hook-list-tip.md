@@ -1,0 +1,1 @@
+- On an install running the `live` integration branch, two candidates can no longer combine into a git hook list that names a directory (one lists a name, the other adds a directory there): the rebuild excludes them by name instead of installing nothing for that hook and refusing every later rebuild.
