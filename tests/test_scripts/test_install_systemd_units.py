@@ -189,10 +189,8 @@ def test_every_unit_path_starts_at_an_ALLOWED_root():
                 continue
             # The managed backend starts at a neutral cwd; its helper validates
             # and enters the configured primary checkout before executing native.
-            if (
-                source == TEMPLATE_DIR / "genesis-cbm-query.service.template"
-                and name.strip() == "WorkingDirectory"
-                and value == "/"
+            if (source, name.strip(), value) == (
+                TEMPLATE_DIR / "genesis-cbm-query.service.template", "WorkingDirectory", "/"
             ):
                 continue
             for token in _path_tokens(value):
