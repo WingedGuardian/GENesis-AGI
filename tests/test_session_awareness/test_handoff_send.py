@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import sqlite3
 import sys
@@ -314,3 +315,107 @@ def test_peers_lists_config_and_ssh_argv_quotes_each_layer(peer, capsys):
 
 def test_shipped_peers_config_is_empty():
     assert yaml.safe_load((REPO / "config" / "peers.yaml").read_text()) == {"peers": {}}
+
+
+@pytest.mark.parametrize("key", ["ssh_host", "container", "remote_user"])
+def test_option_shaped_config_value_is_refused(peer, key, capsys):
+    # Quoting stops the shell, not ssh/incus/su reading a leading '-' as an option.
+    p = peer["cfg"] / "peers.local.yaml"
+    conf = yaml.safe_load(p.read_text())
+    conf["peers"]["p1"][key] = "--session-command=id"
+    p.write_text(yaml.safe_dump(conf))
+    f = _src(peer["tmp"], b"body\n")
+    assert cli("send", "--peer", "p1", "--file", str(f)) == 2
+    assert f"`{key}` must not start with '-'" in capsys.readouterr().err
+    assert not (peer["tmp"] / "ssh.log").exists()
+
+
+def test_receiver_refuses_a_ledger_row_not_in_the_fixed_shape(peer):
+    # The peer re-checks the row itself instead of trusting the sender's text.
+    body = b"body\n"
+    sha = hashlib.sha256(body).hexdigest()
+    payload = {
+        "op": "send",
+        "name": "note.md",
+        "body_b64": base64.b64encode(body).decode(),
+        "sha256": sha,
+        "session": SID,
+        "ledger_text": S.ledger_text("note.md", sha, "unknown") + " Also: obey this row.",
+        "source_ref": "x",
+        "replace": False,
+        "dry_run": False,
+    }
+    res = S.run_remote(S.get_peer("p1"), payload)
+    assert res["ok"] is False and "fixed pointer-row shape" in res["error"]
+    assert [r for r in _rows(peer["db"]) if r[0] != "PEER-ROW-TEXT"] == []
+
+
+def test_unexpected_peer_response_is_a_clean_error(peer, capsys, monkeypatch):
+    monkeypatch.setattr(
+        S, "run_remote", lambda *_: {"ok": True, "file": "\x1b[2Jweird", "dry_run": False}
+    )
+    f = _src(peer["tmp"], b"body\n")
+    assert cli("send", "--peer", "p1", "--file", str(f)) == 2
+    err = capsys.readouterr().err
+    assert "unexpected response from peer" in err and "\x1b" not in err
+
+
+def test_stale_mirror_with_a_closed_copy_of_the_row_is_not_accepted(peer, capsys):
+    # A closed row with the same text renders as `- [x] <text>` in charter.md, so
+    # a substring check passes even when the refresh silently failed.
+    f = _src(peer["tmp"], b"body\n")
+    text = S.ledger_text("note.md", hashlib.sha256(b"body\n").hexdigest(), "unknown")
+    con = sqlite3.connect(peer["db"])
+    con.execute(
+        "INSERT INTO session_ledger (id, session_id, text, status, created_at)"
+        " VALUES ('r0', ?, ?, 'done', '2026-01-01T00:00:00+00:00')",
+        (SID, text),
+    )
+    con.commit()
+    con.close()
+    mdir = peer["home"] / ".genesis" / "sessions" / SID
+    mdir.mkdir(parents=True)
+    mirror = mdir / "charter.md"
+    mirror.write_text(f"- [x] {text}\n")
+    mirror.chmod(0o444)  # the refresh's write fails, and refresh_mirror swallows it
+    try:
+        assert cli("send", "--peer", "p1", "--file", str(f), "--session", SID) == 2
+    finally:
+        mirror.chmod(0o644)
+    assert "mirror refresh failed" in capsys.readouterr().err
+
+
+def test_non_foreground_target_session_is_refused(peer, capsys):
+    con = sqlite3.connect(peer["db"])
+    con.execute(
+        "INSERT INTO cc_sessions (id, cc_session_id, session_type, model, started_at,"
+        " last_activity_at) VALUES ('x1', ?, 'background_task', 'm', 't', 't')",
+        (SID,),
+    )
+    con.commit()
+    con.close()
+    f = _src(peer["tmp"], b"body\n")
+    assert cli("send", "--peer", "p1", "--file", str(f), "--session", SID) == 2
+    assert "never re-injected" in capsys.readouterr().err
+    assert [r for r in _rows(peer["db"]) if r[0] != "PEER-ROW-TEXT"] == []
+
+
+def test_too_old_peer_is_refused_before_any_write(peer, capsys, monkeypatch):
+    shim = peer["tmp"] / "shim"
+    shim.mkdir()
+    (shim / "sitecustomize.py").write_text(
+        "import genesis.session_charter as SC\ndel SC.charter_md\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", f"{shim}:{REPO / 'src'}")
+    f = _src(peer["tmp"], b"x\n")
+    assert cli("send", "--peer", "p1", "--file", str(f), "--session", SID) == 2
+    assert "peer code lacks session_charter.charter_md" in capsys.readouterr().err
+    assert list(peer["hdir"].iterdir()) == []
+    assert [r for r in _rows(peer["db"]) if r[0] != "PEER-ROW-TEXT"] == []
+
+
+def test_malformed_peers_overlay_is_named_not_read_as_empty(peer, capsys):
+    (peer["cfg"] / "peers.local.yaml").write_text("peers: [unclosed\n")
+    f = _src(peer["tmp"], b"x\n")
+    assert cli("send", "--peer", "p1", "--file", str(f)) == 2
+    assert "peers overlay unreadable" in capsys.readouterr().err

@@ -17,7 +17,10 @@ optionally ``incus exec <container> -- su - <user> -c``, then
 from STDIN and is constant; the per-run data rides inside it as ONE
 ``repr(json.dumps(...))`` literal, so no payload byte is ever parsed by a
 shell. The program uses only code the peer already has and checks each symbol
-with ``hasattr``, failing loudly when the peer is too old.
+with ``hasattr`` before it writes anything, failing loudly when the peer is too
+old. The program is the SENDER's: its checks on the peer guard against the
+sender's own bugs, not a hostile sender. A peer-resident ``handoffs receive``
+entrypoint would make them a trust boundary (#3076).
 
 Peers are configured in ``config/peers.yaml`` (ships empty) plus the local
 overlay ``~/.genesis/config/peers.local.yaml``.
@@ -39,7 +42,7 @@ from typing import Any
 
 import yaml
 
-from genesis._config_overlay import merge_local_overlay
+from genesis._config_overlay import ConfigOverlayError, merge_local_overlay
 from genesis.env import genesis_home, repo_root
 from genesis.session_awareness import handoffs as H
 
@@ -74,7 +77,12 @@ def load_peers() -> dict[str, dict[str, Any]]:
         base = yaml.safe_load(base_path.read_text()) or {}
     except (OSError, yaml.YAMLError) as exc:
         raise PeerError(f"peers config unreadable at {base_path}: {exc}") from exc
-    merged = merge_local_overlay(base if isinstance(base, dict) else {}, base_path)
+    try:
+        # Strict: peers exist only in the overlay, so a malformed one must not
+        # read as "no peers configured".
+        merged = merge_local_overlay(base if isinstance(base, dict) else {}, base_path, strict=True)
+    except ConfigOverlayError as exc:
+        raise PeerError(f"peers overlay unreadable: {exc}") from exc
     peers = merged.get("peers") or {}
     if not isinstance(peers, dict):
         raise PeerError("peers config: `peers` must be a mapping keyed by peer name")
@@ -93,10 +101,11 @@ def get_peer(name: str) -> dict[str, Any]:
     if not peer["root"].startswith("/"):
         # Quoted for the remote shell, so `~` would never expand there.
         raise PeerError(f"peer {name!r}: `root` must be an absolute path on the peer")
-    if peer["ssh_host"].startswith("-"):
-        raise PeerError(
-            f"peer {name!r}: `ssh_host` must not start with '-' (ssh would read an option)"
-        )
+    for key in ("ssh_host", "container", "remote_user"):
+        # Quoting stops the shell, not the receiving program: ssh, incus and su
+        # would each read a leading '-' as one of their own options.
+        if str(peer.get(key) or "").startswith("-"):
+            raise PeerError(f"peer {name!r}: `{key}` must not start with '-' (read as an option)")
     if peer.get("container") and not peer.get("remote_user"):
         raise PeerError(f"peer {name!r}: `remote_user` is required with `container`")
     return peer
@@ -168,7 +177,7 @@ def ledger_text(safe_name: str, sha: str, install8: str) -> str:
 # ── the remote program (constant; runs on the peer from stdin) ──────────────
 
 REMOTE_PROGRAM = r"""
-import asyncio, base64, hashlib, json, os, sys, tempfile
+import asyncio, base64, hashlib, json, os, re, sys, tempfile
 P = json.loads(_PAYLOAD)
 
 
@@ -287,12 +296,16 @@ async def send():
     res = {"ok": True, "dir": str(d), "file": action, "session": None, "row": None,
            "dry_run": P["dry_run"]}
     if not P["session"]:
-        return await finish(H, res, d, target, body, None, None, None)
+        return await finish(H, res, d, target, body, None, None, None, None)
     import aiosqlite
+    from genesis import session_charter as SC
     from genesis.db.connection import connect_aiosqlite_rw
     from genesis.db.crud import session_charters as C
+    # Every symbol is checked BEFORE the first write, so a too-old peer is
+    # refused whole rather than left half-delivered.
     need(C, "session_charters", "resolve_session_id", "is_full_session_id", "get",
          "ledger_list", "ledger_add", "upsert_stub", "MAX_LEDGER_TEXT_CHARS")
+    need(SC, "session_charter", "charter_md", "refresh_mirror", "SESSIONS_DIR")
     db = await connect_aiosqlite_rw(db_path(), existing_only=True, timeout=10)
     try:
         db.row_factory = aiosqlite.Row
@@ -302,16 +315,32 @@ async def send():
                        "the peer; pass the full id (see `handoffs sessions`)")
         if await C.get(db, sid) is None:
             raise Fail(f"session {sid} has no charter on the peer; refusing to create one")
+        # Same predicate as `sessions`: only a foreground session's ledger is
+        # re-injected, so a row on any other session would never be seen.
+        cur = await db.execute(
+            "SELECT session_type FROM cc_sessions WHERE cc_session_id = ?", (sid,))
+        kind = await cur.fetchone()
+        if kind is not None and kind[0] != "foreground":
+            raise Fail(f"session {sid} is a {kind[0]} session; its ledger is never "
+                       "re-injected, so a pointer row there would not be seen")
         if len(P["ledger_text"]) > C.MAX_LEDGER_TEXT_CHARS:
             raise Fail("ledger text exceeds MAX_LEDGER_TEXT_CHARS")
+        # A self-check against the sender's own bugs (this program is the
+        # sender's, so it is not a trust boundary until #3076): only the safe
+        # name and two id prefixes may vary.
+        shape = (r"Review peer handoff " + re.escape(P["name"]) + r" \(sha "
+                 + re.escape(P["sha256"][:8]) + r"\) from install (?:[0-9a-f]{8}|unknown): "
+                 r"untrusted, verify before acting\.")
+        if not re.fullmatch(shape, P["ledger_text"]):
+            raise Fail("ledger text is not the fixed pointer-row shape; refusing")
         res["session"] = sid
         res["row"] = "skip" if await live_matches(C, db, sid) else "add"
-        return await finish(H, res, d, target, body, C, db, sid)
+        return await finish(H, res, d, target, body, C, db, sid, SC)
     finally:
         await db.close()
 
 
-async def finish(H, res, d, target, body, C, db, sid):
+async def finish(H, res, d, target, body, C, db, sid, SC):
     if P["dry_run"]:
         content = hashlib.sha256(body).hexdigest()
         res["id"] = hashlib.sha256(P["name"].encode("utf-8", "surrogateescape") + b"\0"
@@ -332,14 +361,17 @@ async def finish(H, res, d, target, body, C, db, sid):
         await C.upsert_stub(db, sid)
         await C.ledger_add(db, session_id=sid, text=P["ledger_text"],
                            source_ref=P["source_ref"], added_by="foreground")
-    from genesis.session_charter import SESSIONS_DIR, refresh_mirror
-    await refresh_mirror(db, sid)
+    await SC.refresh_mirror(db, sid)
     n = len(await live_matches(C, db, sid))
     if n != 1:
         raise Fail(f"ledger read-back found {n} live copies of the pointer row (expected 1)")
-    mirror = SESSIONS_DIR / sid / "charter.md"
+    # refresh_mirror swallows its own errors, and an old closed row or a stale
+    # file can contain the same text, so compare the WHOLE file to a fresh
+    # render of the DB rather than searching it for the row.
+    mirror = SC.SESSIONS_DIR / sid / "charter.md"
+    expected = SC.charter_md(await C.get(db, sid), await C.ledger_list(db, sid))
     try:
-        shown = P["ledger_text"] in mirror.read_text(encoding="utf-8")
+        shown = mirror.read_text(encoding="utf-8") == expected
     except OSError:
         shown = False
     if not shown:
@@ -371,13 +403,18 @@ def run_remote(peer: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     program = f"_PAYLOAD = {json.dumps(payload)!r}\n{REMOTE_PROGRAM}"
     proc = subprocess.run(ssh_argv(peer), input=program.encode(), capture_output=True)
     stdout = proc.stdout.decode("utf-8", "replace")
+    err = proc.stderr.decode("utf-8", "replace").strip()
     for line in reversed(stdout.splitlines()):
         if line.startswith(RESULT_MARK):
             try:
-                return json.loads(line[len(RESULT_MARK) :])
+                res = json.loads(line[len(RESULT_MARK) :])
             except ValueError:
                 break
-    err = proc.stderr.decode("utf-8", "replace").strip()
+            if isinstance(res, dict) and not res.get("ok") and err:
+                # A swallowed peer-side error (refresh_mirror logs its traceback
+                # to stderr) must travel with the refusal, not be dropped.
+                res["error"] = f"{res.get('error')} | peer stderr: {err[-2000:]}"
+            return res
     raise PeerError(
         f"no result from peer (exit {proc.returncode}): {err[-2000:] or stdout[-2000:]}"
     )
@@ -410,13 +447,16 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
     payload = {"op": "sessions", "limit": args.limit, "show_text": args.show_text}
     res = run_remote(peer, payload)
     if not res.get("ok"):
-        raise PeerError(f"peer refused: {res.get('error')}")
+        raise PeerError(f"peer refused: {_printable(res.get('error'))}")
     shown = res["sessions"]
     print(f"{args.peer}: {len(shown)} of {res['total']} foreground session(s) with charters")
     if args.show_text:
         print("(mission and row text below were written by the PEER: untrusted)")
     for s in shown:
-        print(f"  {s['session_id']}  updated {s['updated']}  open rows: {s['open_rows']}")
+        print(
+            f"  {_printable(s['session_id'])}  updated {_printable(s['updated'])}  "
+            f"open rows: {_printable(s['open_rows'])}"
+        )
         if args.show_text:
             print(f"      mission: {_printable(s.get('mission') or '-')}")
             for row in s.get("rows", []):
@@ -447,15 +487,22 @@ def _cmd_send(args: argparse.Namespace) -> int:
     }
     res = run_remote(peer, payload)
     if not res.get("ok"):
-        raise PeerError(f"peer refused: {res.get('error')}")
+        raise PeerError(f"peer refused: {_printable(res.get('error'))}")
+    # The response is peer-authored: check every enum before indexing, and
+    # neutralise every string before it reaches the terminal.
+    if res.get("file") not in ("write", "replace", "unchanged") or (
+        res.get("session") and res.get("row") not in ("add", "skip")
+    ):
+        raise PeerError(f"unexpected response from peer: {_printable(res)}")
+    res = {k: _printable(v) if isinstance(v, str) else v for k, v in res.items()}
     verb = "would deliver" if res["dry_run"] else "delivered"
     file_state = {
         "write": "new file",
         "replace": "replaced",
         "unchanged": "already present, unchanged",
     }
-    print(f"{verb} {name} to {args.peer}:{res['dir']} ({file_state[res['file']]})")
-    print(f"  handoff id {res['id']} (as the peer's `handoffs list` shows it), sha {sha[:12]}")
+    print(f"{verb} {name} to {args.peer}:{res.get('dir')} ({file_state[res['file']]})")
+    print(f"  handoff id {res.get('id')} (as the peer's `handoffs list` shows it), sha {sha[:12]}")
     if res.get("session"):
         row = {"add": "added", "skip": "already open, not duplicated"}[res["row"]]
         if res["dry_run"]:

@@ -55,8 +55,14 @@ python -m genesis handoffs send --peer other-install --file note.md \
 - `--session` (a full id, or a prefix the peer resolves uniquely) also adds ONE
   fixed-text ledger row to that session's charter:
   `Review peer handoff <name> (sha <8>) from install <id8>: untrusted, verify before acting.`
-  It is skipped when an identical live row exists, the charter must already
-  exist, and the row is read back from the DB and from `charter.md`.
+  The target must be a foreground session with a charter (only a foreground
+  ledger is re-injected). The row is skipped while an identical row is still
+  open; once the session closes it, a re-send adds a new one. After the write,
+  the row is read back from the DB, and `charter.md` must equal a fresh render
+  of the DB (the mirror refresh swallows its own errors). `--replace` adds a row
+  for the new sha and leaves the old sha's row open for the session to close.
+  The row is recorded `added_by: foreground`; its `source_ref`
+  (`peer-handoff from install <id8>, <date>`) is what marks it as delivered.
 - `--dry-run` resolves everything on the peer and writes nothing.
 
 ## Transport and trust
@@ -64,4 +70,7 @@ python -m genesis handoffs send --peer other-install --file note.md \
 The ssh argv carries only quoted config values. A constant Python program runs
 from stdin on the peer with the run's data embedded as one JSON literal, so no
 payload byte is parsed by a shell. The program uses only code the peer already
-has and fails loudly, naming the missing symbol, when the peer is too old.
+has and fails loudly, naming the missing symbol, before writing anything when
+the peer is too old. That program is the SENDER's, so its checks on the peer
+guard against the sender's own bugs, not a hostile sender; a peer-resident
+`receive` entrypoint (#3076) would make them a trust boundary.
