@@ -504,7 +504,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-10-07: 71 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-07: 72 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -1127,9 +1127,24 @@ jobs:
         # Reference admission: 23 preserved +98 boundary +246 actor-role cases.
         # Floor: 24516 +367 =24883; no added skips, ceiling unchanged.
         #
-        # Checkout mutation fence (#2870): +32 collected tests, measured with
+        # Immutable CBM staging: new test_codebase_managed_config.py collects
+        # 76 cases (0 -> 76), plus 3 new provider-opener classification controls.
+        # The native-binary opt-ins add two skip identities. Original PR CI had
+        # seven additional browser skips absent on current main; counts alone
+        # did not establish a two-slot allowance. Keep main's ceiling unchanged.
+        # On top of the reference-admission floor above, measured by
+        # --collect-only against main's versions of both files:
+        # 24883 + 76 + 3 = 24962.
+        #
+        # Crash recovery (#2632), measured with --collect-only against main's
+        # versions of the changed test files: test_bootstrap_guards.py 29 -> 69
+        # (+40), test_deploy_candidates_drop_status.py 68 -> 69 (+1),
+        # test_deploy_checkout.py 51 -> 52 (+1); the others are unchanged.
+        # No added skips. Floor: 24962 + 42 = 25004; skip ceiling remains 102.
+        #
+        # Checkout mutation fence (#2870): +36 collected tests, measured with
         # --collect-only against main's versions of the changed test files
         # (checkout-lock shell and Python tests, invoker +8, child_env +1,
-        # deploy/update/candidate lock tests); no added skips.
-        # Floor: 24883 + 32 = 24915.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 24915
+        # deploy/update/candidate lock and rollback tests); no added skips.
+        # Floor: 25004 + 36 = 25040.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25040

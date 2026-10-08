@@ -202,7 +202,7 @@ def _held_regions(text):
     return lines, spans
 
 
-@pytest.mark.parametrize("script", ["update.sh", "deploy_code_only.sh"])
+@pytest.mark.parametrize("script", ["update.sh", "deploy_code_only.sh", "lib/deploy_recovery.sh"])
 def test_every_hook_running_git_call_is_wrapped(script):
     """checkout and merge run git hooks (post-checkout, post-merge). Each must go
     through genesis_without_checkout_lock, or run with hooks disabled, so a hook's
@@ -214,7 +214,9 @@ def test_every_hook_running_git_call_is_wrapped(script):
 
     text = (REPO_ROOT / "scripts" / script).read_text()
     lines, spans = _held_regions(text)
-    assert spans, f"{script}: no held region found"
+    # The rollback helpers moved into lib/deploy_recovery.sh run inside the
+    # scripts' held regions; the lib has none of its own.
+    assert spans or script.startswith("lib/"), f"{script}: no held region found"
     # The subcommand must end at whitespace: `merge-base` reads and runs no hooks.
     hooky = re.compile(r"\bgit (?:-c \S+ )*-C \S+ (?:-c \S+ )*(?:checkout|merge|switch)(?=\s|$)")
     calls = [n for n, line in enumerate(lines) if hooky.search(line.split("#", 1)[0])]

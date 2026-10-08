@@ -200,6 +200,9 @@ _SELF_DIR="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 . "$_SELF_DIR/lib/deploy_checkout.sh"
 # shellcheck source=lib/checkout_lock.sh
 . "$_SELF_DIR/lib/checkout_lock.sh"
+# Mutating, printing recovery helpers shared with update.sh.
+# shellcheck source=lib/deploy_recovery.sh
+. "$_SELF_DIR/lib/deploy_recovery.sh"
 # The helpers that run AFTER the merge are read now, like the libs above: the
 # merge may replace them on disk, and this run must use the versions it started
 # with (`python3 -c "$CODE" args…` sees the same sys.argv as running the file).

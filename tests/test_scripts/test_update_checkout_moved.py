@@ -22,6 +22,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE = REPO_ROOT / "scripts" / "update.sh"
 LIB = REPO_ROOT / "scripts" / "lib" / "deploy_checkout.sh"
+RECOVERY_LIB = REPO_ROOT / "scripts" / "lib" / "deploy_recovery.sh"
 MARKER_LIB = REPO_ROOT / "scripts" / "lib" / "deploy_marker.sh"
 # update.sh runs its hook-running git calls through genesis_without_checkout_lock.
 LOCK_LIB = REPO_ROOT / "scripts" / "lib" / "checkout_lock.sh"
@@ -65,7 +66,7 @@ def _block(marker: str) -> str:
 
 
 def _run(script: str, home: Path) -> subprocess.CompletedProcess:
-    libs = f'. "{MARKER_LIB}"\n. "{LIB}"\n. "{LOCK_LIB}"\n'
+    libs = f'. "{MARKER_LIB}"\n. "{LIB}"\n. "{RECOVERY_LIB}"\n. "{LOCK_LIB}"\n'
     return subprocess.run(
         ["bash", "-c", "set -Eeuo pipefail\n" + libs + script],
         capture_output=True,
@@ -969,11 +970,18 @@ def test_the_rollback_moves_only_the_original_branch_with_a_non_forced_checkout(
     ]
     assert 'checkout "$ORIGINAL_BRANCH"' not in body
     code = _code(_block("rollback-code-guard"))
-    assert code.count(_SWITCH_BACK) == 1
-    assert code.index("reset)") < code.index(_SWITCH_BACK) < code.index("*)")
-    assert "-c core.hooksPath=/dev/null " + _SWITCH_BACK in code
-    for gone in ("reset --hard", "reset --keep", "reset -q --keep", " -f ", "--force"):
-        assert gone not in code, gone
+    recovery = _code(RECOVERY_LIB.read_text())
+    call = 'genesis_rollback_checkout "$GENESIS_ROOT" "$ROLLBACK_TAG" "$ORIGINAL_BRANCH"'
+    assert code.count(call) == 1
+    assert code.index("reset)") < code.index(call) < code.index("*)")
+    assert recovery.count(_SWITCH_BACK) == 1
+    assert "-c core.hooksPath=/dev/null " + _SWITCH_BACK in recovery
+    checkout_commands = "\n".join(
+        line for line in recovery.splitlines() if re.search(r"\bgit\b.*\bcheckout\b", line)
+    )
+    for surface in (code, checkout_commands):
+        for gone in ("reset --hard", "reset --keep", "reset -q --keep", " -f ", "--force"):
+            assert gone not in surface, gone
 
 
 def test_an_ephemeral_edit_the_update_did_not_change_is_left_in_place(repo, tmp_path):
@@ -996,7 +1004,7 @@ def test_an_ephemeral_edit_the_update_did_not_change_is_left_in_place(repo, tmp_
 def test_the_rollback_checks_then_switches_back():
     """Order inside the reset arm: back up, list the range (submodule check), clear,
     refresh, then the checkout."""
-    code = _code(_block("rollback-code-guard"))
+    code = _code(RECOVERY_LIB.read_text())
     order = [
         '_ephemeral_backup_before_reset "$EPHEMERAL_BACKUP_ROOT"',
         'diff-tree -r --raw --no-renames --no-abbrev HEAD "$ROLLBACK_TAG"',
@@ -1099,17 +1107,21 @@ def test_only_this_runs_merge_is_adopted_as_its_own_head(tmp_path):
         f'GENESIS_ROOT="{clone}"\nUPDATE_REMOTE=origin\nDEPLOY_BRANCH=main\nORIGINAL_BRANCH=main\n'
         f'DEPLOY_HEAD="{pin}"\nVALIDATED_HEAD="{validated}"\nUPDATE_OWN_HEAD="{validated}"\n'
         '_do_rollback() { echo "ROLLBACK: $1"; }\n'
+        '_write_state() { echo "STATE=$1"; }\n'
     )
     script = base + _assertion_block() + 'echo "OWN=$UPDATE_OWN_HEAD"\n'
     r = _run(script, tmp_path)
     assert r.returncode == 0, r.stdout + r.stderr
     assert f"OWN={_git(clone, 'rev-parse', 'HEAD')}" in r.stdout
+    # The adopted head is recorded at once, so bootstrap recovery knows it.
+    assert "STATE=merging" in r.stdout
     # Someone commits on top of the merge before it is recorded: not adopted.
     _git(clone, "commit", "-q", "--allow-empty", "-m", "theirs")
     r = _run(script, tmp_path)
     assert r.returncode == 1
     assert "ROLLBACK: merge did not bring in" in r.stdout
     assert "OWN=" not in r.stdout
+    assert "STATE=merging" not in r.stdout
 
 
 def test_the_merge_result_becomes_the_runs_own_head_before_anything_can_fail():
