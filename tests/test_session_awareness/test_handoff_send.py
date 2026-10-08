@@ -419,3 +419,107 @@ def test_malformed_peers_overlay_is_named_not_read_as_empty(peer, capsys):
     f = _src(peer["tmp"], b"x\n")
     assert cli("send", "--peer", "p1", "--file", str(f)) == 2
     assert "peers overlay unreadable" in capsys.readouterr().err
+
+
+def _shim(peer, monkeypatch, code: str) -> None:
+    shim = peer["tmp"] / "shim"
+    shim.mkdir(exist_ok=True)
+    (shim / "sitecustomize.py").write_text(code)
+    monkeypatch.setenv("PYTHONPATH", f"{shim}:{REPO / 'src'}")
+
+
+def test_new_file_never_clobbers_one_that_appears_after_the_check(peer, capsys, monkeypatch):
+    # A concurrent sender creates the same name between the check and the write.
+    target = peer["hdir"] / "note.md"
+    _shim(
+        peer,
+        monkeypatch,
+        "import tempfile\n"
+        "_orig = tempfile.mkstemp\n"
+        "def mkstemp(*a, **k):\n"
+        f"    open({str(target)!r}, 'wb').write(b'the other sender\\n')\n"
+        "    return _orig(*a, **k)\n"
+        "tempfile.mkstemp = mkstemp\n",
+    )
+    f = _src(peer["tmp"], b"mine\n")
+    assert cli("send", "--peer", "p1", "--file", str(f)) == 2
+    assert "appeared on the peer during delivery" in capsys.readouterr().err
+    assert target.read_bytes() == b"the other sender\n"
+
+
+def test_new_file_falls_back_to_exclusive_create_without_hard_links(peer, monkeypatch):
+    _shim(
+        peer,
+        monkeypatch,
+        "import os\ndef link(*a, **k):\n    raise PermissionError('no hard links here')\n"
+        "os.link = link\n",
+    )
+    f = _src(peer["tmp"], b"mine\n")
+    assert cli("send", "--peer", "p1", "--file", str(f)) == 0
+    assert (peer["hdir"] / "note.md").read_bytes() == b"mine\n"
+
+
+def test_oversized_existing_peer_file_is_refused_not_loaded(peer, capsys):
+    big = peer["hdir"] / "note.md"
+    with big.open("wb") as fh:
+        fh.truncate(H.MAX_HASH_BYTES + 1)
+    f = _src(peer["tmp"], b"mine\n")
+    assert cli("send", "--peer", "p1", "--file", str(f), "--replace") == 2
+    assert "refusing to read it" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("entry", "expect"),
+    [
+        ([], "must be a mapping of settings"),
+        (
+            {"ssh_host": "opuser@192.0.2.10", "root": "/r", "container": False},
+            "`container` must be a non-empty string or omitted",
+        ),
+    ],
+)
+def test_malformed_peer_entry_is_refused(peer, entry, expect, capsys):
+    (peer["cfg"] / "peers.local.yaml").write_text(yaml.safe_dump({"peers": {"p1": entry}}))
+    f = _src(peer["tmp"], b"x\n")
+    assert cli("send", "--peer", "p1", "--file", str(f)) == 2
+    assert expect in capsys.readouterr().err
+
+
+def test_any_non_foreground_lifecycle_row_excludes_the_target(peer, capsys):
+    # cc_sessions may hold several lifecycle rows for one transcript id; send
+    # must judge them all, as `sessions` does, not whichever row comes first.
+    con = sqlite3.connect(peer["db"])
+    for i, kind in enumerate(("foreground", "background_task")):
+        con.execute(
+            "INSERT INTO cc_sessions (id, cc_session_id, session_type, model, started_at,"
+            " last_activity_at) VALUES (?, ?, ?, 'm', 't', 't')",
+            (f"x{i}", SID, kind),
+        )
+    con.commit()
+    con.close()
+    f = _src(peer["tmp"], b"body\n")
+    assert cli("send", "--peer", "p1", "--file", str(f), "--session", SID) == 2
+    assert "background_task lifecycle row" in capsys.readouterr().err
+    assert [r for r in _rows(peer["db"]) if r[0] != "PEER-ROW-TEXT"] == []
+
+
+def test_overlapping_sends_leave_exactly_one_row(peer):
+    # Dedup and insert sit in one write-locked section, so concurrent identical
+    # sends serialise: one adds the row, the other sees it and skips.
+    import threading
+
+    f = _src(peer["tmp"], b"body\n")
+    rcs: list[int] = []
+
+    def go() -> None:
+        rcs.append(cli("send", "--peer", "p1", "--file", str(f), "--session", SID))
+
+    threads = [threading.Thread(target=go) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    added = [r for r in _rows(peer["db"]) if r[0] != "PEER-ROW-TEXT"]
+    assert len(added) == 1
+    # A sender that lost the file race may refuse; none may duplicate the row.
+    assert 0 in rcs

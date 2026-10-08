@@ -86,7 +86,10 @@ def load_peers() -> dict[str, dict[str, Any]]:
     peers = merged.get("peers") or {}
     if not isinstance(peers, dict):
         raise PeerError("peers config: `peers` must be a mapping keyed by peer name")
-    return {str(k): v for k, v in peers.items() if isinstance(v, dict)}
+    for k, v in peers.items():
+        if not isinstance(v, dict):
+            raise PeerError(f"peers config: peer {k!r} must be a mapping of settings")
+    return {str(k): v for k, v in peers.items()}
 
 
 def get_peer(name: str) -> dict[str, Any]:
@@ -98,6 +101,12 @@ def get_peer(name: str) -> dict[str, Any]:
     for key in ("ssh_host", "root"):
         if not isinstance(peer.get(key), str) or not peer[key].strip():
             raise PeerError(f"peer {name!r}: `{key}` is required")
+    for key in ("ssh_key", "container", "remote_user"):
+        # A non-string (e.g. `container: false`) must not quietly mean "absent"
+        # and retarget the delivery at the ssh host itself.
+        value = peer.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise PeerError(f"peer {name!r}: `{key}` must be a non-empty string or omitted")
     if not peer["root"].startswith("/"):
         # Quoted for the remote shell, so `~` would never expand there.
         raise PeerError(f"peer {name!r}: `root` must be an absolute path on the peer")
@@ -227,19 +236,32 @@ def sessions():
             (int(P["limit"]),),
         ).fetchall()
         result = []
+        live_q = (" FROM session_ledger WHERE session_id = ?"
+                  " AND status IN ('open', 'in_progress')")
         for sid, mission, ts in rows:
-            live = con.execute(
-                "SELECT text FROM session_ledger WHERE session_id = ?"
-                " AND status IN ('open', 'in_progress') ORDER BY created_at", (sid,)
-            ).fetchall()
-            item = {"session_id": sid, "updated": ts, "open_rows": len(live)}
+            count = con.execute("SELECT COUNT(*)" + live_q, (sid,)).fetchone()[0]
+            item = {"session_id": sid, "updated": ts, "open_rows": count}
             if P["show_text"]:
                 item["mission"] = mission or ""
-                item["rows"] = [r[0] for r in live]
+                item["rows"] = [r[0] for r in con.execute(
+                    "SELECT text" + live_q + " ORDER BY created_at", (sid,))]
             result.append(item)
     finally:
         con.close()
     return {"ok": True, "total": total, "sessions": result}
+
+
+def sha_bounded(path, cap):
+    # Size from the open descriptor before reading, then hash in chunks: a huge
+    # file is refused cleanly instead of being loaded whole.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as fh:
+        if os.fstat(fh.fileno()).st_size > cap:
+            raise Fail(f"{path} is over {cap} bytes; refusing to read it")
+        h = hashlib.sha256()
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def check_file(H, body):
@@ -261,7 +283,7 @@ def check_file(H, body):
         return d, target, "write"
     if os.path.islink(target) or not target.is_file():
         raise Fail(f"{target} exists and is not a regular file")
-    if hashlib.sha256(target.read_bytes()).hexdigest() == P["sha256"]:
+    if sha_bounded(target, H.MAX_HASH_BYTES) == P["sha256"]:
         return d, target, "unchanged"
     if not P["replace"]:
         raise Fail(f"{P['name']} already exists on the peer with different content; "
@@ -269,14 +291,35 @@ def check_file(H, body):
     return d, target, "replace"
 
 
-def write_atomic(d, target, body):
+def write_atomic(d, target, body, overwrite):
     fd, tmp = tempfile.mkstemp(prefix="." + P["name"] + ".", dir=d)
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(body)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, target)
+        if overwrite:
+            os.replace(tmp, target)
+            return
+        # A new file must never clobber one that appeared after the check:
+        # link() fails if the name exists, unlike rename/replace.
+        try:
+            os.link(tmp, target)
+        except FileExistsError:
+            raise Fail(f"{P['name']} appeared on the peer during delivery; re-run "
+                       "(pass --replace to overwrite it)") from None
+        except OSError:
+            # No hard links on this filesystem: exclusive create, written in place.
+            try:
+                out = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                              0o600)
+            except FileExistsError:
+                raise Fail(f"{P['name']} appeared on the peer during delivery; re-run "
+                           "(pass --replace to overwrite it)") from None
+            with os.fdopen(out, "wb") as fh:
+                fh.write(body)
+                fh.flush()
+                os.fsync(fh.fileno())
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -290,7 +333,7 @@ async def live_matches(C, db, sid):
 async def send():
     from genesis.session_awareness import handoffs as H
     need(H, "handoffs", "configured_dir", "HandoffConfigError", "_SAFE_NAME_RE",
-         "is_reply_name", "HANDOFF_SUFFIX", "ID_DISPLAY_LEN", "_identity")
+         "is_reply_name", "HANDOFF_SUFFIX", "ID_DISPLAY_LEN", "_identity", "MAX_HASH_BYTES")
     body = base64.b64decode(P["body_b64"])
     d, target, action = check_file(H, body)
     res = {"ok": True, "dir": str(d), "file": action, "session": None, "row": None,
@@ -317,12 +360,15 @@ async def send():
             raise Fail(f"session {sid} has no charter on the peer; refusing to create one")
         # Same predicate as `sessions`: only a foreground session's ledger is
         # re-injected, so a row on any other session would never be seen.
+        # Every lifecycle row counts, exactly as in `sessions`: any non-foreground
+        # row for this id excludes it, so the two commands always agree.
         cur = await db.execute(
-            "SELECT session_type FROM cc_sessions WHERE cc_session_id = ?", (sid,))
-        kind = await cur.fetchone()
-        if kind is not None and kind[0] != "foreground":
-            raise Fail(f"session {sid} is a {kind[0]} session; its ledger is never "
-                       "re-injected, so a pointer row there would not be seen")
+            "SELECT DISTINCT session_type FROM cc_sessions WHERE cc_session_id = ?"
+            " AND session_type != 'foreground'", (sid,))
+        kinds = sorted(r[0] for r in await cur.fetchall())
+        if kinds:
+            raise Fail(f"session {sid} has a {', '.join(kinds)} lifecycle row; its ledger is "
+                       "never re-injected, so a pointer row there would not be seen")
         if len(P["ledger_text"]) > C.MAX_LEDGER_TEXT_CHARS:
             raise Fail("ledger text exceeds MAX_LEDGER_TEXT_CHARS")
         # A self-check against the sender's own bugs (this program is the
@@ -347,33 +393,48 @@ async def finish(H, res, d, target, body, C, db, sid, SC):
                                    + content.encode()).hexdigest()[:H.ID_DISPLAY_LEN]
         return res
     if res["file"] != "unchanged":
-        write_atomic(d, target, body)
-    if hashlib.sha256(target.read_bytes()).hexdigest() != P["sha256"]:
+        write_atomic(d, target, body, overwrite=res["file"] == "replace")
+    if sha_bounded(target, H.MAX_HASH_BYTES) != P["sha256"]:
         raise Fail(f"read-back of {target} does not match the sent sha256")
     st = target.stat()
     res["id"] = H._identity(P["name"], target, st.st_size, st.st_mtime_ns, None)[0][
         :H.ID_DISPLAY_LEN]
     if db is None:
         return res
-    if res["row"] == "add":
-        # The MCP layer's sequence (_impl_session_ledger_add). The charter exists
-        # (checked above), so upsert_stub is a no-op kept for parity.
-        await C.upsert_stub(db, sid)
-        await C.ledger_add(db, session_id=sid, text=P["ledger_text"],
-                           source_ref=P["source_ref"], added_by="foreground")
-    await SC.refresh_mirror(db, sid)
-    n = len(await live_matches(C, db, sid))
-    if n != 1:
-        raise Fail(f"ledger read-back found {n} live copies of the pointer row (expected 1)")
-    # refresh_mirror swallows its own errors, and an old closed row or a stale
-    # file can contain the same text, so compare the WHOLE file to a fresh
-    # render of the DB rather than searching it for the row.
-    mirror = SC.SESSIONS_DIR / sid / "charter.md"
-    expected = SC.charter_md(await C.get(db, sid), await C.ledger_list(db, sid))
+    # The MCP layer's sequence (_impl_session_ledger_add). The charter exists
+    # (checked above), so upsert_stub is a no-op kept for parity; it commits
+    # itself, so it runs before the locked section.
+    await C.upsert_stub(db, sid)
+    # ONE write-locked section from the dedup check to the mirror check: two
+    # overlapping sends cannot both add the row, and no other writer can change
+    # the ledger between the mirror refresh and its verification.
+    await db.execute("BEGIN IMMEDIATE")
     try:
-        shown = mirror.read_text(encoding="utf-8") == expected
-    except OSError:
-        shown = False
+        if await live_matches(C, db, sid):
+            res["row"] = "skip"
+        else:
+            res["row"] = "add"
+            await C.ledger_add(db, session_id=sid, text=P["ledger_text"],
+                               source_ref=P["source_ref"], added_by="foreground",
+                               commit=False)
+        n = len(await live_matches(C, db, sid))
+        if n != 1:
+            raise Fail(f"ledger read-back found {n} live copies of the pointer row "
+                       "(expected 1)")
+        await SC.refresh_mirror(db, sid)
+        # refresh_mirror swallows its own errors, and an old closed row or a
+        # stale file can contain the same text, so compare the WHOLE file to a
+        # render of the same locked snapshot rather than searching it.
+        mirror = SC.SESSIONS_DIR / sid / "charter.md"
+        expected = SC.charter_md(await C.get(db, sid), await C.ledger_list(db, sid))
+        try:
+            shown = mirror.read_text(encoding="utf-8") == expected
+        except OSError:
+            shown = False
+        await db.commit()
+    except BaseException:
+        await db.rollback()
+        raise
     if not shown:
         raise Fail(f"the row is in the peer DB but {mirror} does not show it "
                    "(mirror refresh failed)")
@@ -468,6 +529,8 @@ def _cmd_send(args: argparse.Namespace) -> int:
     peer = get_peer(args.peer)
     src = Path(args.file)
     name = validate_name(args.name or src.name)
+    if src.stat().st_size > H.MAX_HASH_BYTES:
+        raise PeerError(f"{src} is over {H.MAX_HASH_BYTES} bytes; a handoff is a note")
     body = src.read_bytes()
     if len(body) > H.MAX_HASH_BYTES:
         raise PeerError(f"{src} is over {H.MAX_HASH_BYTES} bytes; a handoff is a note")
