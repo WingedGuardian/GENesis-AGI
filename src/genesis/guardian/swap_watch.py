@@ -115,7 +115,23 @@ def _is_parseable_incus_size(raw: str) -> bool:
     (``internal/instance/config.go``'s ``validate.IsSize``, which itself calls
     ``units.ParseByteSizeString``), so a value read back from ``incus config
     get`` can never contain a non-ASCII digit anyway. Matching the narrower
-    grammar removes the gap rather than relying on that unreachability."""
+    grammar removes the gap rather than relying on that unreachability. The
+    same bound rules out overflow-scale digit runs too: Incus's
+    ``strconv.ParseInt`` rejects any integer portion that does not fit an
+    int64, so ``IsSize`` — and thus ``incus config set`` — rejects it at
+    write time as well, meaning ``incus config get`` can never return one
+    either (fresh-context class audit, 2026-10-08).
+
+    Nonzero status is read directly off the digit CHARACTERS
+    (``any(ch != "0" ...)``), never via ``int(raw[:i])``: Incus's own
+    parser (``strconv.ParseInt``-style accumulation) tolerates arbitrarily
+    many leading zeros with no overflow, so a value like 4,301 zeros
+    followed by "1GiB" is a legitimate (if perverse) 1 GiB ceiling Incus
+    can return from ``config get`` — but Python's int() raises ValueError
+    past ~4,300 digits (``sys.get_int_max_str_digits``), which would abort
+    this check (and the whole guardian tick around it) for exactly that
+    input. (Second Codex finding on PR #3069, 2026-10-08: "Handle long
+    zero-padded sizes without integer conversion.")"""
     if not raw:
         return False
     i = 0
@@ -125,7 +141,7 @@ def _is_parseable_incus_size(raw: str) -> bool:
         return False
     if raw[i:] not in _INCUS_BYTE_SUFFIXES:
         return False
-    return int(raw[:i]) != 0
+    return any(ch != "0" for ch in raw[:i])
 
 
 def _is_swap_on(raw: str) -> bool:
