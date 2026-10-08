@@ -21,6 +21,7 @@ import contextlib
 import errno
 import json
 import os
+import re
 import stat
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -154,14 +155,56 @@ def _claim_entry(root: Path, name: str) -> Path:
     raise TrashRefused(f"no free entry name under {root}")
 
 
+_DB_PATH_LINE = re.compile(r"^\s*(?:export\s+)?GENESIS_DB_PATH\s*=\s*(.*?)\s*$")
+
+
+def _secrets_db_values(path: Path) -> list[str]:
+    """``GENESIS_DB_PATH`` values set in ``secrets.env`` (quotes stripped)."""
+    if not path.is_file():
+        return []
+    values = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = _DB_PATH_LINE.match(line)
+        if match and match.group(1):
+            value = match.group(1)
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                values.append(value[1:-1])
+                continue
+            values.append(value)
+            if " #" in value:  # the server's dotenv drops an inline comment here
+                values.append(value.split(" #", 1)[0].rstrip())
+    return values
+
+
+def _database_paths() -> set[Path]:
+    """Every path the server's database could be at, as absolute and resolved forms.
+
+    This CLI does not see the server's environment: the server reads
+    ``secrets.env`` (systemd ``EnvironmentFile``, then ``load_dotenv`` with
+    override) and runs from the repository root, so a ``GENESIS_DB_PATH`` set only
+    in that file, or a relative one, would point somewhere else from here. So
+    every reading is protected: this process's own, the default under the
+    repository, and each ``secrets.env`` or environment value taken both relative
+    to the repository root and as given."""
+    root = _env.repo_root()  # through the module, so tests can isolate it
+    paths = {_env.genesis_db_path(), root / "data" / "genesis.db"}
+    values = _secrets_db_values(_env.secrets_path())
+    if os.environ.get("GENESIS_DB_PATH"):
+        values.append(os.environ["GENESIS_DB_PATH"])
+    for value in values:
+        path = Path(value).expanduser()
+        paths.update({path, path if path.is_absolute() else root / path})
+    return {form for p in paths for form in (p.absolute(), p.resolve())}
+
+
 def _is_live_database(item: Path) -> bool:
-    """The configured database, a sidecar of it, or a directory holding it.
-    Renaming a live database away splits it: the server keeps writing to the
-    moved file and a new empty one appears at the old path."""
-    configured = _env.genesis_db_path()  # through the module, so tests can isolate it
+    """A possible location of the server's database (see ``_database_paths``), a
+    sidecar of one, or a directory holding one. Renaming a live database away
+    splits it: the server keeps writing to the moved file and a new empty one
+    appears at the old path."""
     try:
-        targets = {configured.absolute(), configured.resolve()}  # a symlinked path too
-    except (OSError, RuntimeError):
+        targets = _database_paths()
+    except (OSError, RuntimeError, ValueError):
         return True  # cannot tell where the database is: refuse rather than guess
     for db in targets:
         if item == db or _within(db, item):
@@ -212,7 +255,10 @@ def trash(path: str | os.PathLike[str], *, reason: str, caller: str) -> Tombston
     if _within(item, root):
         raise TrashRefused(f"{item} is already in the trash")
     if _is_live_database(item):
-        raise TrashRefused(f"{item} is (or holds) the live Genesis database")
+        raise TrashRefused(
+            f"{item} is, or holds, a place the live Genesis database may be "
+            "(it could not be ruled out); moving it would split the database"
+        )
     if _within(item, (genesis_home() / "cc-tmp").resolve()):
         raise TrashRefused(f"{item} is on the Claude Code temp volume, which has its own retention")
     try:

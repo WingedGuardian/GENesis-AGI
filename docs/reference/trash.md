@@ -54,9 +54,13 @@ Exit codes: 0 done, 1 refused (the reason is printed), 64 usage error.
 
 `genesis.trash` leaves the item untouched and raises `TrashRefused` when the
 item is missing or unreadable, `''`/`.`/`..`, a mount point, `$HOME` or a parent
-of it, a parent of the trash itself, already in the trash, the live Genesis
-database (the configured file, its `-wal`/`-shm`/`-journal`, or a directory
-holding it: moving it away would split it), on the Claude Code temp volume (`~/.genesis/cc-tmp`, which has its own retention), or on another
+of it, a parent of the trash itself, already in the trash, any place the live
+Genesis database may be (the default `data/genesis.db` and every reading of
+`GENESIS_DB_PATH`: this process's, the one in `secrets.env` that the server
+loads, and a relative value taken from the repository root where the server
+runs; with its `-wal`/`-shm`/`-journal` and any directory holding it, because
+moving it away would split it), on the Claude Code temp volume
+(`~/.genesis/cc-tmp`, which has its own retention), or on another
 volume than the trash. It never falls back to copying. "Another volume" is
 caught twice: a different device number (another disk, a btrfs subvolume), and
 the kernel's own refusal to rename across mount points (a bind mount, an

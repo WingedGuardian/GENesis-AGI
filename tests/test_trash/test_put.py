@@ -113,3 +113,77 @@ def test_an_empty_reason_is_a_usage_error(tmp_path):
         main(["put", str(a), "--reason", "  "])
     assert exc.value.code == EXIT_USAGE
     assert a.exists()
+
+
+# The server reads secrets.env (systemd EnvironmentFile, then load_dotenv with
+# override) and runs from the repository root; this CLI sees neither, so every
+# reading of GENESIS_DB_PATH is protected.
+
+
+@pytest.fixture
+def repo(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    monkeypatch.setattr(env, "repo_root", lambda: root)
+    monkeypatch.setattr(env, "secrets_path", lambda: root / "secrets.env")
+    monkeypatch.delenv("GENESIS_DB_PATH", raising=False)
+    return root
+
+
+@pytest.mark.parametrize("quote", ["", '"', "'"])
+def test_a_database_set_only_in_secrets_env_is_refused(tmp_path, repo, quote):
+    live = _touch(tmp_path / "elsewhere" / "live.db", "db")
+    (repo / "secrets.env").write_text(f"API_KEY=x\nexport GENESIS_DB_PATH={quote}{live}{quote}\n")
+    with pytest.raises(TrashRefused, match="live Genesis database"):
+        trash(live, reason="r", caller="c")
+    assert live.read_text() == "db"
+
+
+def test_an_inline_comment_after_the_value_is_not_part_of_the_path(tmp_path, repo):
+    live = _touch(tmp_path / "elsewhere" / "live.db", "db")
+    (repo / "secrets.env").write_text(f"GENESIS_DB_PATH={live} # moved off the root disk\n")
+    with pytest.raises(TrashRefused, match="live Genesis database"):
+        trash(live, reason="r", caller="c")
+    assert live.exists()
+
+
+def test_a_relative_value_is_protected_from_the_repository_root(tmp_path, repo, monkeypatch):
+    live = _touch(repo / "data" / "other.db", "db")
+    (repo / "secrets.env").write_text("GENESIS_DB_PATH=data/other.db\n")
+    monkeypatch.chdir(tmp_path)  # the caller is not where the server runs
+    with pytest.raises(TrashRefused, match="live Genesis database"):
+        trash(live, reason="r", caller="c")
+    assert live.exists()
+
+
+def test_a_relative_environment_value_is_protected_from_the_repository_root(
+    tmp_path, repo, monkeypatch
+):
+    live = _touch(repo / "data" / "env.db", "db")
+    monkeypatch.setenv("GENESIS_DB_PATH", "data/env.db")
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(TrashRefused, match="live Genesis database"):
+        trash(live, reason="r", caller="c")
+    assert live.exists()
+
+
+def test_the_default_location_stays_protected_when_another_is_configured(repo):
+    default = _touch(repo / "data" / "genesis.db", "db")
+    with pytest.raises(TrashRefused, match="live Genesis database"):
+        trash(default, reason="r", caller="c")
+    assert default.exists()
+
+
+def test_an_unresolvable_database_path_refuses_instead_of_crashing(tmp_path, repo, monkeypatch):
+    monkeypatch.setenv("GENESIS_DB_PATH", "~no-such-user-genesis-test/db")
+    item = _touch(tmp_path / "plain.txt")
+    with pytest.raises(TrashRefused, match="live Genesis database"):
+        trash(item, reason="r", caller="c")
+    assert item.exists()
+
+
+def test_an_unrelated_file_is_still_trashed_with_a_secrets_value(tmp_path, repo):
+    (repo / "secrets.env").write_text(f"GENESIS_DB_PATH={tmp_path / 'live.db'}\n")
+    item = _touch(tmp_path / "notes.txt")
+    trash(item, reason="r", caller="c")
+    assert not item.exists()
