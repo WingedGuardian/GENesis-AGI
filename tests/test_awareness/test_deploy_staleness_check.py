@@ -44,6 +44,8 @@ def _reset_cooldowns(monkeypatch):
     monkeypatch.setattr(loop, "_last_deploy_alert_key", "")
     monkeypatch.setattr(loop, "_last_main_checkout_status", "")
     monkeypatch.setattr(loop, "_last_actionable_main_checkout", None)
+    monkeypatch.setattr(loop, "_last_live_state", "")
+    monkeypatch.setattr(loop, "_last_actionable_live_findings", None)
 
 
 def _snap(
@@ -55,16 +57,24 @@ def _snap(
     tier2=None,
     host_status="ok",
     main_checkout=None,
+    live=None,
+    git_live=None,
 ):
     return {
         "status": "attention" if findings else "healthy",
         "findings": findings,
         "last_update": {"age_days": age_days, "new_commit": "abc", "completed_at": "x"},
-        "git": {"head": "abc", "commits_behind_upstream": behind, "fetch_age_hours": 1.0},
+        "git": {
+            "head": "abc",
+            "commits_behind_upstream": behind,
+            "fetch_age_hours": 1.0,
+            "live": git_live,
+        },
         "missing_units": missing_units or [],
         "tier2_pending": tier2 or [],
         "host_gateway": {"status": host_status},
         "main_checkout": main_checkout or {"status": "clean", "count": 0, "paths": []},
+        "live": live,
     }
 
 
@@ -537,6 +547,8 @@ def _restart(monkeypatch):
     """Module state gone, as after a server restart; the store is untouched."""
     monkeypatch.setattr(loop, "_last_main_checkout_status", "")
     monkeypatch.setattr(loop, "_last_actionable_main_checkout", None)
+    monkeypatch.setattr(loop, "_last_live_state", "")
+    monkeypatch.setattr(loop, "_last_actionable_live_findings", None)
     monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
     monkeypatch.setattr(loop, "_last_deploy_alert_key", "")
 
@@ -641,3 +653,54 @@ async def test_after_a_restart_with_no_dirty_alert_the_first_check_reconciles(db
     (row,) = await _rows(db)
     assert "missing systemd units: x.timer" in row["content"]
     assert "could not be read" not in row["content"]
+# ── `live`, the integration branch (#2978 PR E) ──────────────────────────────
+
+
+async def test_a_live_only_alert_carries_no_update_sh_paragraph(db, monkeypatch):
+    """The drift paragraph advises update.sh for merged-but-undeployed code;
+    a live-only state has nothing of that kind, and never pages."""
+    _patch_snapshot(
+        monkeypatch,
+        _snap(["live_off_branch:2"], live={"state": "other", "candidates": 2}),
+    )
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert row["priority"] == "high"
+    assert "NOT fully deployed" not in row["content"]
+    assert "lists 2 candidate(s)" in row["content"]
+    assert "git switch live" in row["content"]
+    assert "deploy_code_only.sh restart" in row["content"]
+
+
+async def test_on_live_the_recovery_sentence_names_the_rebuild(db, monkeypatch):
+    _patch_snapshot(
+        monkeypatch,
+        _snap(["tier2_pending:1"], age_days=1.0, tier2=["a"], git_live="live"),
+    )
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert "rebuilds `live` from the deploy manifest first" in row["content"]
+
+
+async def test_a_first_unreadable_live_tick_does_not_alert(db, monkeypatch):
+    snap = _snap(["live_unreadable"], live={"state": "unreadable", "reason": "slow"})
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db) == []
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert "could not be read on two consecutive checks (slow)" in row["content"]
+
+
+async def test_a_deploy_carries_the_standing_live_alert(db, monkeypatch):
+    _patch_snapshot(
+        monkeypatch,
+        _snap(["live_off_branch:1"], live={"state": "other", "candidates": 1}),
+    )
+    await loop._check_deploy_staleness(db)
+    [before] = await _rows(db)
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    _patch_snapshot(monkeypatch, _snap([], live={"state": "deploying"}))
+    await loop._check_deploy_staleness(db)
+    [after] = await _rows(db)
+    assert after["id"] == before["id"], "a deploy tick resolved the live alert"

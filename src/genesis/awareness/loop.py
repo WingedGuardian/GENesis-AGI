@@ -1417,6 +1417,11 @@ _last_main_checkout_status: str = ""
 # supersedes it. Either way every other finding class is reconciled on the
 # same tick.
 _last_actionable_main_checkout: dict | None = None
+# Likewise for the `live` classes (deploy_health's live["state"]): a deploy in
+# progress, or the FIRST unreadable tick, carries the last actionable tick's
+# live findings rather than resolving or raising them.
+_last_live_state: str = ""
+_last_actionable_live_findings: list[str] | None = None
 
 
 async def _check_deploy_staleness(db) -> None:
@@ -1425,6 +1430,7 @@ async def _check_deploy_staleness(db) -> None:
     Best-effort — the whole body is guarded and never raises into the tick."""
     global _last_deploy_alert_at, _last_deploy_alert_key
     global _last_main_checkout_status, _last_actionable_main_checkout
+    global _last_live_state, _last_actionable_live_findings
     if db is None:
         return
     try:
@@ -1489,6 +1495,19 @@ async def _check_deploy_staleness(db) -> None:
             ] + main_checkout_findings(checkout)
         else:
             _last_actionable_main_checkout = checkout
+        live_state = (snap.get("live") or {}).get("state") or ""
+        previous_live_state = _last_live_state
+        _last_live_state = live_state
+        if live_state == "deploying" or (
+            live_state == "unreadable" and previous_live_state != "unreadable"
+        ):
+            findings = [
+                f for f in findings if f.split(":", 1)[0] not in _DEPLOY_LIVE_CLASSES
+            ] + list(_last_actionable_live_findings or [])
+        else:
+            _last_actionable_live_findings = [
+                f for f in findings if f.split(":", 1)[0] in _DEPLOY_LIVE_CLASSES
+            ]
         if not findings:
             await _resolve_deploy_staleness(db)
             return
@@ -1568,8 +1587,10 @@ async def _check_deploy_staleness(db) -> None:
         # The drift paragraph (and its update.sh recovery sentence) only when a
         # drift class is present: update.sh REFUSES a dirty deploy checkout, so
         # telling someone to run it for a dirty-only state is wrong advice.
-        if set(classes) - _DEPLOY_CHECKOUT_CLASSES:
+        if set(classes) - _DEPLOY_CHECKOUT_CLASSES - _DEPLOY_LIVE_CLASSES:
             paragraphs.append(_deploy_drift_paragraph(snap, age_days, behind, git_facts))
+        if set(classes) & _DEPLOY_LIVE_CLASSES:
+            paragraphs.append(_deploy_live_paragraph(snap, findings))
         if "main_checkout_dirty" in classes:
             paragraph = _deploy_checkout_dirty_paragraph(checkout)
             if carried and checkout.get("count") is not None:
@@ -1607,6 +1628,10 @@ async def _check_deploy_staleness(db) -> None:
 #: that has not been deployed. They get their own wording and never page:
 #: the critical branch keys only on stale_update and missing_units.
 _DEPLOY_CHECKOUT_CLASSES = frozenset({"main_checkout_dirty", "main_checkout_unreadable"})
+#: Finding classes about `live`, the integration branch scripts/deploy_candidates
+#: rebuilds from the deploy manifest (deploy_health.live_findings). Their own
+#: wording, no update.sh drift paragraph, and they never page.
+_DEPLOY_LIVE_CLASSES = frozenset({"live_unreadable", "live_off_branch", "live_candidate_tier2"})
 
 
 def _deploy_drift_paragraph(snap: dict, age_days, behind, git_facts: dict) -> str:
@@ -1635,8 +1660,40 @@ def _deploy_drift_paragraph(snap: dict, age_days, behind, git_facts: dict) -> st
         + "; ".join(detail)
         + ". Bare git merges deploy code but skip tier-2 activation "
         "(systemd units, guardian host redeploy, CC/Node pins). "
-        "Recovery: run scripts/update.sh from ~/genesis."
+        + (
+            "Recovery: run scripts/update.sh from ~/genesis (on `live` it rebuilds "
+            "`live` from the deploy manifest first)."
+            if (git_facts.get("live") == "live")
+            else "Recovery: run scripts/update.sh from ~/genesis."
+        )
     )
+
+
+def _deploy_live_paragraph(snap: dict, findings: list[str]) -> str:
+    live = snap.get("live") or {}
+    parts: list[str] = []
+    for f in findings:
+        cls, _, value = f.partition(":")
+        if cls == "live_unreadable":
+            parts.append(
+                "Whether this install runs the `live` integration branch could not be "
+                f"read on two consecutive checks ({live.get('reason') or 'no reason given'}): "
+                "scripts/deploy_candidates list shows what the engine reads."
+            )
+        elif cls == "live_off_branch":
+            parts.append(
+                f"The deploy manifest lists {value} candidate(s), but the checkout is not "
+                "on `live`, so they are not running. To run them: git switch live, then "
+                "scripts/deploy_code_only.sh restart. To stop listing one: "
+                "scripts/deploy_candidates drop <branch>."
+            )
+        elif cls == "live_candidate_tier2":
+            parts.append(
+                f"`live` carries {value} update.sh-only file(s) from its candidates, over "
+                "the base it was built on; they are active only if scripts/update.sh ran "
+                "after the last rebuild."
+            )
+    return " ".join(parts)
 
 
 def _deploy_checkout_dirty_paragraph(checkout: dict) -> str:

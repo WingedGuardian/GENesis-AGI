@@ -113,6 +113,11 @@ EXEMPT: dict[tuple[str, str], str] = {
     ("observability/snapshots/deploy_health.py", "scripts/guardian-gateway.sh"): _TIER2,
     ("observability/snapshots/deploy_health.py", "scripts/lib/host_swap.sh"): _TIER2,
     ("observability/snapshots/deploy_health.py", "scripts/lib/cc_tmp_volume.sh"): _TIER2,
+    ("observability/snapshots/deploy_health.py", "scripts/deploy_candidates"): (
+        "run (`list`, read-only) per snapshot to count the candidates the deploy manifest "
+        "lists, for a non-paging `live_off_branch` advisory; no validated behaviour depends "
+        "on it, and listing it would put the whole engine into the validation token"
+    ),
     ("guardian/watchdog.py", "scripts/install_guardian.sh"): _GUARDIAN,
     ("guardian/watchdog.py", "scripts/guardian-gateway.sh"): _GUARDIAN,
     ("guardian/watchdog.py", "scripts/lib/host_swap.sh"): _GUARDIAN,

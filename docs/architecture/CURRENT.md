@@ -1586,7 +1586,9 @@ verified: 84c7259d 2026-08-31
   systemd timer; `check.py` runs 6 parallel probes → 6-state machine → act;
   Proxmox disk/RAM provisioning verbs) and container side (`watchdog.py`
   monitors the host Guardian every awareness tick, incl. git-SHA code-drift
-  detection). Config `~/.genesis/guardian_remote.yaml`; missing → silently
+  detection; the drift comparison runs only on `main` and `live`, while the
+  host reconcilers that share its version probe run on any branch).
+  Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
 - **guard-layer watch** (`guardian/guard_layer_watch.py`, a SIDE-watch in
   `run_check`, not a `probe_*`): asks whether the AGENT TOOLING can still
@@ -1848,7 +1850,12 @@ verified: 477efb7f7 2026-10-05
   so a deploy would refuse): its own wording without the update.sh advice,
   never critical; an unreadable status alerts only on the second consecutive
   tick, and the first unreadable tick (or a tick during a deploy) holds the
-  check rather than resolving a standing dirty alert.
+  check rather than resolving a standing dirty alert. On `live` (the integration
+  branch `scripts/deploy_candidates` rebuilds), the drift is measured from the
+  commit `live` was built on, and three non-paging `live_*` classes have their own
+  wording (`live` unreadable, the checkout off `live` while the engine lists
+  candidates, a candidate's update.sh-only files on `live`), held over a deploy
+  tick and a first unreadable tick the same way.
   Also (hourly) ego cycle liveness (`_check_ego_liveness`, `ego/liveness.py`): an
   ego with no COMPLETED cycle past a conservative multiple of its current
   interval (the `job_health.last_success` gap — never the `is_running`/heartbeat/
@@ -3142,7 +3149,13 @@ verified: 477efb7f7 2026-10-05
   `scripts/lib/deploy_marker.sh` + `deploy_checkout.sh` on every snapshot
   (listed in deploy_status.sh `_RUNTIME_FRESH_SCRIPTS`), read-only
   (`GIT_OPTIONAL_LOCKS=0`, own process group killed on timeout): do not copy
-  the ephemeral-path regex into Python. **Total-cessation detection** (`observability/liveness.py`,
+  the ephemeral-path regex into Python. Its `live` collector runs
+  `scripts/lib/live_checkout.py` and, off `live` with a branch `live` present,
+  `scripts/deploy_candidates list` (the engine is the manifest's reader; nothing
+  in src/ reads the manifest), both bounded the same way; on `live` the
+  behind-count, tier-2 and host drift are measured from merge-base(HEAD,
+  origin/main), because the engine's `switch -C live <sha>` sets no upstream.
+  **Total-cessation detection** (`observability/liveness.py`,
   and for outreach a deliberately channel-INDEPENDENT heartbeat in
   `outreach/heartbeat.py`): a subsystem that stops entirely emits nothing, so
   absence-of-signal is itself the signal — the alarm keys on the gap since the
