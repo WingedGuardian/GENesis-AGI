@@ -355,9 +355,7 @@ def move_checkout(repo: Repo, plan: Plan, branch: str | None) -> Move:
     return Move(files_moved, at)
 
 
-def restore_moved_hooks(
-    repo: Repo, before: str | None, after: str, only: set[str] | None = None
-) -> None:
+def restore_moved_hooks(repo: Repo, before: str | None, after: str) -> None:
     """Replace each installed git hook whose bytes are exactly that hook as the
     checkout held it BEFORE the move (``before``) with the moved-to version.
 
@@ -400,7 +398,7 @@ def restore_moved_hooks(
     for ref in (before, after):
         names += [n for n in listed[ref] or [] if n not in names]
     for name in names:
-        if name in (".", "..") or (only is not None and name not in only):
+        if name in (".", ".."):
             continue
         try:
             _restore_one(

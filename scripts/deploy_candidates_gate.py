@@ -341,7 +341,8 @@ def admission_failures(repo: Repo, base: str, head: str, hooks_approved: bool = 
     ``hooks_approved`` (the owner approved THIS head's hook changes) waives the
     hook rule only (see path_refusal)."""
     fails: list[str] = []
-    for path in changed_paths(repo, base, head):
+    changed = changed_paths(repo, base, head)
+    for path in changed:
         why = path_refusal(path, hooks_approved)
         if why:
             fails.append(why)
@@ -356,6 +357,25 @@ def admission_failures(repo: Repo, base: str, head: str, hooks_approved: bool = 
                 fails.append(
                     f"makes {path} a {kind}; only regular files may go under the hook "
                     "directories, since an approval of anything else cannot cover what runs"
+                )
+    if SYNC_HOOKS in changed:
+        # A changed list can name a source this diff never touched: each name it
+        # installs must be a regular file too.
+        try:
+            names = sync_hook_names(repo.show(head, SYNC_HOOKS) or "")
+        except Refusal:
+            names = []  # an unreadable list is excluded by name at rebuild instead
+        for name in names:
+            # `.` would make ls-tree list the directory's contents, not itself.
+            kind = (
+                "directory"
+                if name in (".", "..")
+                else non_file_kind(repo, head, f"scripts/hooks/{name}")
+            )
+            if kind:
+                fails.append(
+                    f"lists scripts/hooks/{name} in {SYNC_HOOKS}, which is a {kind}; only "
+                    "regular files may be installed as git hooks"
                 )
     commits = repo.rev_list(head, "--not", base)
     info = repo.read_commits(commits)
