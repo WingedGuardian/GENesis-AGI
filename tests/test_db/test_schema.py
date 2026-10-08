@@ -82,6 +82,18 @@ EXPECTED_TABLES = [
     "reflex_verdicts",  # reflex arc P0: taste corpus — every human verdict, never pruned
     "ego_proposal_revisions",  # ego lifecycle PR-4: prior-value audit trail for versioned revision (dark)
     "marketing_prospects",  # marketing cold-send substrate: owner-curated cold-outreach target inventory
+    "peer_settings",
+    "peers",
+    "peer_grants",
+    "peer_resources",
+    "peer_tasks",
+    "peer_receipts",
+    "peer_daily_admissions",
+    "peer_operation_approvals",
+    "peer_segments",
+    "peer_task_runtime",
+    "peer_task_consents",
+    "peer_operations",
 ]
 
 

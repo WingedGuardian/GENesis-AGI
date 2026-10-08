@@ -936,7 +936,12 @@ verified: 787882667c48 2026-10-08
   and retries the normal approval notification helper. Only named individual
   dashboard or authorized Telegram buttons resolve peer operations; batch and
   generic resolver origins refuse them. Notification failure stays visible.
-  Continuation consumption and runtime activation require the coordinator slice.
+  Private `peers/lifecycle_state.py` now consumes named, timely consent atomically
+  with continuation queueing and preserves it for the unchanged request across
+  attempts. `peers/operation_state.py` separates operation outcomes from consent;
+  only exact immutable reads can retry unknown effects after confirmed drain.
+  These are dark state primitives: runtime installation and complete integration
+  testing remain later lifecycle slices. See [lifecycle state](../reference/peer-lifecycle.md).
   See [peer approvals](../reference/peer-approvals.md).
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
   converge there. `EmailAutonomyGate` (`autonomy/email_gate.py`, WS-8

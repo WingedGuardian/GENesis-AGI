@@ -20,6 +20,8 @@ sweep also excludes this action type, including the batch button's triggering
 row. Expiration and cancellation never approve work. The later coordinator must
 check this individual provenance again when consuming approval atomically with
 the continuation queue insertion; classification as human alone is insufficient.
+The private [lifecycle state foundation](peer-lifecycle.md) now implements that
+transaction and request-lifetime consent. Runtime scheduling remains a later slice.
 
 Both existing dashboard approval mutation routes refuse a configured peer or SAM
 backend bearer even alongside an owner cookie. Disabled/revoked credential families
