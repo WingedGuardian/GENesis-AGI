@@ -1,0 +1,99 @@
+"""Every transport claim is subordinate to a distinct scoped credential."""
+
+import asyncio
+import os
+import secrets
+
+import pytest
+from flask import Flask
+
+from genesis.peers.auth import BACKEND_TOKEN, PeerRefusal, authenticate
+
+
+async def prepare(registry, monkeypatch, mode="fallback"):
+    # Values stay inside fixtures and never become assertion messages.
+    for name in tuple(os.environ):
+        if name.startswith("GENESIS_") and name.endswith("_TOKEN"):
+            monkeypatch.delenv(name)
+    credential = secrets.token_urlsafe(32)
+    monkeypatch.setenv("GENESIS_PEER_MUSE_TOKEN", credential)
+    monkeypatch.setenv(BACKEND_TOKEN, secrets.token_urlsafe(32))
+    await registry.configure(
+        mode, "realm" if mode == "sam" else None, "https://genesis.example/v1/agent/a2a"
+    )
+    await registry.register(
+        "muse",
+        same_owner=True,
+        daily_allowance=3,
+        token_name="GENESIS_PEER_MUSE_TOKEN",
+        sam_realm="realm",
+        sam_node="node",
+        principal="principal",
+    )
+    return credential
+
+
+async def refused(registry, headers, code, *, probe=False):
+    with Flask(__name__).test_request_context(headers=headers):
+        with pytest.raises(PeerRefusal) as caught:
+            await authenticate(registry, allow_probe=probe)
+        assert caught.value.code == code
+
+
+async def test_disabled_missing_bad_and_non_ascii_fail_closed(registry, monkeypatch):
+    await refused(registry, {}, "not_configured")
+    credential = await prepare(registry, monkeypatch)
+    await refused(registry, {}, "unauthorized")
+    await refused(
+        registry, {"Authorization": "Bearer " + secrets.token_urlsafe(32)}, "unauthorized"
+    )
+    monkeypatch.delenv("GENESIS_PEER_MUSE_TOKEN")
+    await refused(registry, {"Authorization": "Bearer " + credential}, "not_configured")
+    monkeypatch.setenv("GENESIS_PEER_MUSE_TOKEN", "\u00f6")
+    await refused(registry, {}, "not_configured")
+
+
+async def test_fallback_ignores_spoofed_identity_and_revoke_is_immediate(registry, monkeypatch):
+    credential = await prepare(registry, monkeypatch)
+    headers = {
+        "Authorization": "Bearer " + credential,
+        "X-Peer-Id": "other",
+        "X-Sam-Principal": "other",
+    }
+    with Flask(__name__).test_request_context(headers=headers):
+        identity = await authenticate(registry)
+        assert identity.peer["peer_id"] == "muse"
+    await registry.revoke("muse")
+    await refused(registry, headers, "not_configured")
+
+
+@pytest.mark.parametrize("mode", ["fallback", "sam"])
+async def test_scope_collapse_refuses_activation(registry, monkeypatch, mode):
+    credential = await prepare(registry, monkeypatch, mode)
+    monkeypatch.setenv("GENESIS_MCP_HTTP_TOKEN", credential)
+    await refused(registry, {}, "not_configured", probe=True)
+
+
+async def test_sam_backend_first_pinned_node_and_optional_probe(registry, monkeypatch):
+    await prepare(registry, monkeypatch, "sam")
+    headers = {"X-Peer-Id": "node", "X-Sam-Principal": "principal"}
+    await refused(registry, headers, "unauthorized")
+    headers["Authorization"] = "Bearer " + os.environ[BACKEND_TOKEN]
+    for key in ("X-Peer-Id", "X-Sam-Principal"):
+        altered = {**headers, key: "other"}
+        await refused(registry, altered, "unauthorized")
+    with Flask(__name__).test_request_context(headers=headers):
+        assert (await authenticate(registry)).peer["peer_id"] == "muse"
+    probe_headers = {"Authorization": headers["Authorization"]}
+    await refused(registry, probe_headers, "unauthorized")
+    with Flask(__name__).test_request_context(headers=probe_headers):
+        assert (await authenticate(registry, allow_probe=True)).peer is None
+
+
+async def test_transaction_independence_under_parallel_readers(registry, monkeypatch):
+    await prepare(registry, monkeypatch)
+
+    async def read():
+        return (await registry.get("muse"))["peer_id"]
+
+    assert await asyncio.gather(*(read() for _ in range(8))) == ["muse"] * 8

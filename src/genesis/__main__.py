@@ -57,6 +57,9 @@ def main() -> None:
     from genesis.session_awareness import peer_address_cli
     peer_address_cli.add_parser(sub)
 
+    from genesis.peers import cli as peers_cli
+    peers_cli.add_parser(sub)
+
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -69,7 +72,7 @@ def main() -> None:
 
         with ProcessLock("genesis-server"):
             asyncio.run(_serve(args))
-    elif args.command in ("contribute", "eval", "restore", "handoffs", "session-address"):
+    elif args.command in ("contribute", "eval", "restore", "handoffs", "session-address", "peers"):
         sys.exit(args.func(args))
     else:
         parser.print_help()

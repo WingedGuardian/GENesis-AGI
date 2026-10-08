@@ -1339,10 +1339,17 @@ Every surface a human (or host process) talks to Genesis through.
 
 ```yaml subsystem-map
 entry: channels-interfaces
-modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 637f7f7bb679 2026-10-05
+modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
+verified: ba6e357a7998 2026-10-08
 ```
 
+- **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
+  pinned node/realm/principal and scoped credentials. Disabled by default; no
+  implicit capability grants. Local `genesis peers` CLI writes relationships;
+  `/v1/agent/a2a` authenticates discovery/health through the existing runtime loop.
+  No task skills or task execution advertised in this foundation. Revocation
+  disables access immediately; credential equality with another surface refuses
+  activation. See `docs/reference/peer-registry.md`.
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
   it yields at startup, exit 200, when the genesis-server process lock is

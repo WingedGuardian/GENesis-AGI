@@ -10,6 +10,7 @@ right and this page is stale.
 | API keys, tokens, env-style toggles | `secrets.env` (repo root) | process environment |
 | Per-install identity (timezone, GitHub, local-inference URLs, a few flags) | `~/.genesis/config/genesis.yaml` | `genesis.env` helpers |
 | Subsystem policy (levers, modes, knobs) | `config/<name>.yaml` + a `<name>.local.yaml` overlay | per-domain config modules |
+| Peer mode, identities, grants, daily allowance and advertised URL | `genesis.db` peer tables | local `genesis peers` CLI / `genesis.peers.registry` |
 | Model routing | `config/model_routing.yaml` + `config/model_routing.local.yaml` | `genesis.routing.config` |
 | Paths, tuning, kill switches | process environment only | `genesis.env`, per-domain modules |
 | Prompts and persona | `src/genesis/identity/*.md` | identity loader, CC prompt assembly |
@@ -269,3 +270,13 @@ names, so an overlay of a read-only file is editable (#2446).
    session via the server's env; it has its own file (`src/genesis/guardian/credential_bridge.py`).
 9. **The raw config-file editor edits tracked files.** Prefer `settings_update`, which
    writes an overlay that survives `git pull`.
+
+## Peer front door
+
+`genesis peers configure` explicitly selects disabled, fallback or SAM mode and
+persists the owner-configured HTTPS service URL. SAM pins the local realm; each
+relationship pins a remote node and optionally its delegated principal. Registry
+changes take effect on the next request. Tokens use `genesis.env.bearer_token`
+against the server environment; no endpoint loads `secrets.env` or credential
+files. A cleared value refuses access; file edits require the approved restart
+path. Backend and peer values must differ from other surface credentials.
