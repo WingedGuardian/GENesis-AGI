@@ -1,0 +1,17 @@
+#!/bin/bash
+# Native outer protocol: empty stdout on allow, exit 2 on every other result.
+# An explained deny writes fd3 so the launch-owned command can distinguish it
+# from a failure before this wrapper completes; configuration wiring is later.
+hook_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 2
+rc=0
+decision=$(python3 "$hook_dir/codex_validator_guard.py" "$@") || rc=$?
+if [ "$rc" -eq 0 ] && [ "$decision" = "allow" ]; then
+    exit 0
+fi
+if [ "$rc" -eq 2 ] && [ "$decision" = "deny" ]; then
+    { printf 'deny\n' >&3; } 2>/dev/null
+    exit 2
+fi
+printf '%s\n' 'BLOCKED: Validator action evaluation did not allow this action.' >&2
+{ printf 'deny\n' >&3; } 2>/dev/null
+exit 2
