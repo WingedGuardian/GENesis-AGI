@@ -1,9 +1,10 @@
-"""The round-reflection tool: format, what is owed, coverage, and the commit.
+"""The round reflection: the closed header-block grammar and its coverage check.
 
-Network calls are replaced: ``status`` by a fixed state, and the PR metadata,
-privacy scan and comment listing by stubs, except where the real privacy
-scanner's behaviour is the point. Commits run in a real temporary git
-repository, because cleanup modes, hooks and the empty-tree check are git
+The format is a closed block of fixed ``Field: value`` lines (owner ruling
+2026-10-07), so most tests are tables: every markdown construct the earlier
+regex parser had to special-case is now simply refused inside the block and
+ignored in the prose after it. Coverage tests run in real temporary git
+repositories, because emptiness, ancestry, hooks and encodings are git
 behaviours.
 """
 
@@ -29,44 +30,37 @@ def _reflection(
     keys=("c1", "c2"),
     *,
     head=HEAD,
-    verdict="LEAD the change routes around an existing store",
-    decision="close-class the same mistake appears twice",
-    classes=("unchecked subprocess result: 2",),
+    premise="LEAD",
+    decision="close-class",
+    classes=("unchecked subprocess result = 2",),
     dispositions=None,
-    scope=("- covered: the key round-trips (tests/test_x.py)",),
-    extra="",
+    scopes=("covered: the key round-trips (tests/test_x.py)",),
+    escalate="no",
+    extra=(),
+    prose="",
 ):
     if dispositions is None:
-        dispositions = [f"- {k}: fix-now (test 1)" for k in keys]
-    return "\n".join(
-        [
-            f"Round-reflection: keys={','.join(keys)} head={head}",
-            "",
-            "## Distribution",
-            *[f"- {c}" for c in classes],
-            "Concentration: scripts/x.py x2",
-            "Fix-induced: 0 of 2 blamed findings sit on lines this branch wrote",
-            "Trend: first round",
-            "",
-            "## Premise",
-            f"Design-premise: {verdict}",
-            f"{rr.IMPOSSIBLE_PROMPT} route every call through one checked helper",
-            "",
-            "## Scope",
-            *scope,
-            "",
-            "## Decision",
-            f"Decision: {decision}",
-            "",
-            "## Dispositions",
-            *dispositions,
-            extra,
-            "Padding so the reflection clears the minimum length of a real one. " * 4,
-        ]
-    )
+        dispositions = [f"Disposition: {k} fix-now test=1" for k in keys]
+    block = [
+        f"Round-reflection: keys={','.join(keys)} head={head}",
+        *[f"Class: {c}" for c in classes],
+        f"Premise: {premise}",
+        "Premise-why: the change routes around an existing helper that already exists",
+        "Impossible: route every call through one checked helper and delete the rest",
+        *[f"Scope: {s}" for s in scopes],
+        f"Decision: {decision}",
+        "Decision-why: the same mistake appears twice in two different files",
+        *dispositions,
+        *extra,
+        f"Escalate: {escalate}",
+    ]
+    text = "\n".join(block) + "\n"
+    if prose:
+        text += "\n" + prose + "\n"
+    return text
 
 
-# -- obligations and parsing -------------------------------------------------
+# -- grammar -----------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -89,138 +83,169 @@ def test_a_complete_round_one_reflection_validates():
     assert got.ok, got.problems
     assert got.keys == ["c1", "c2"] and got.head == HEAD
     assert got.classes == ["unchecked subprocess result"]
-    assert got.decision == "close-class" and not got.escalate
+    assert got.decision == "close-class" and got.verdict == "LEAD" and not got.escalate
 
 
-def test_body_and_comment_keys_are_in_the_grammar():
-    text = _reflection(keys=("c1", "r20:2", "i30"))
-    assert rr.parse(text, round_number=1).ok
+def test_all_key_forms_are_in_the_grammar():
+    assert rr.parse(_reflection(keys=("c1", "r20:2", "i30")), round_number=1).ok
     assert not rr.parse(_reflection(keys=("r20/1",))).ok
+
+
+@pytest.mark.parametrize(
+    "construct",
+    [
+        "## Distribution",
+        "- Class: dashed = 1",
+        "1. Class: numbered = 1",
+        "+ Class: plus = 1",
+        "```",
+        "~~~",
+        "<!-- Disposition: c9 fix-now test=1 -->",
+        "**Premise:** LEAD",
+        "Class: `backticked` = 1",
+        "Class: **bold** = 1",
+        "  Escalate: no",
+        "Escalate： no",  # fullwidth colon
+        "Scope: a non-breaking space before this value",
+        "Scope: zero​width space hiding inside this value",
+        "Scope: a carriage return at the end of this value\r",
+        "Disposition: c1 fix-now test=1 AND file issue=#2",
+        "Disposition: c1 fix-now (test 1)",
+        "Premise-check: P1 is it TRUE? nobody checked",
+        "Random: an unknown field name is refused",
+        "Decision: maybe",
+    ],
+)
+def test_every_markdown_or_malformed_construct_in_the_block_is_refused(construct):
+    """Round 1 of #3055: each of these was its own hole in the markdown
+    reader. In the closed block each is simply an unrecognised line."""
+    got = rr.parse(_reflection(extra=[construct]))
+    assert not got.ok, construct
+    assert any(p.startswith("line ") for p in got.problems), got.problems
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Disposition: c١ fix-now test=1",  # an Arabic-Indic digit
+        "Scope: a non breaking space inside this value",
+    ],
+)
+def test_a_non_ascii_character_in_the_block_is_named_as_such(line):
+    got = rr.parse(_reflection(extra=[line]))
+    assert any("only printable ASCII" in p for p in got.problems), got.problems
+
+
+def test_a_unicode_digit_in_a_header_key_is_refused():
+    text = _reflection().replace("keys=c1", "keys=c١", 1)
+    assert text != _reflection()
+    assert rr.HEADER_RE.match(text.split("\n")[0]) is None
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "## Notes\nDisposition: c9 fix-now test=1",
+        "```\nanything at all\n```",
+        "<!-- a comment -->",
+        "- a list\n1. another",
+    ],
+)
+def test_prose_after_the_block_is_never_parsed(prose):
+    got = rr.parse(_reflection(prose=prose), round_number=1)
+    assert got.ok, got.problems
+    assert got.keys == ["c1", "c2"]
 
 
 @pytest.mark.parametrize(
     "text, fragment",
     [
-        ("Round-reflection: head=" + HEAD, "FIRST line"),
-        ("\n" + _reflection(), "FIRST line"),
-        ("  " + _reflection(), "FIRST line"),
-        (_reflection() + f"\nRound-reflection: keys=c9 head={HEAD}\n", "exactly one header"),
+        ("\n" + _reflection(), "line 1 must be"),
+        (" " + _reflection(), "line 1 must be"),
         (_reflection(keys=("c1", "c1")), "names a key twice"),
-        (_reflection(dispositions=["- c1: fix-now (test 1)"]), "no disposition for: c2"),
+        (_reflection(dispositions=["Disposition: c1 fix-now test=1"]), "no disposition for: c2"),
         (
             _reflection(
                 dispositions=[
-                    "- c1: fix-now (test 1)",
-                    "- c2: file (fails all four; #9)",
-                    "- c3: fix-now (test 2)",
+                    "Disposition: c1 fix-now test=1",
+                    "Disposition: c2 file issue=#9",
+                    "Disposition: c3 fix-now test=2",
                 ]
             ),
             "header does not name: c3",
         ),
         (
-            _reflection(dispositions=["- c1: fix-now (test 5)", "- c2: fix-now (test 1)"]),
-            "c1: a disposition is",
-        ),
-        (
             _reflection(
                 dispositions=[
-                    "- c1: fix-now (test 1)",
-                    "- c1: fix-now (test 2)",
-                    "- c2: fix-now (test 1)",
+                    "Disposition: c1 fix-now test=1",
+                    "Disposition: c1 file issue=#2",
+                    "Disposition: c2 fix-now test=1",
                 ]
             ),
-            "c1 has two dispositions",
+            "two dispositions",
         ),
-        (
-            _reflection(dispositions=["- c1: file (later)", "- c2: fix-now (test 1)"]),
-            "c1: a disposition is",
-        ),
-        (_reflection(extra=f"{rr.FILL} later>"), "unfilled template placeholder"),
+        (_reflection(extra=["Premise: SOUND"]), "'Premise:' appears 2 times"),
+        (_reflection(extra=["Decision: rework"]), "'Decision:' appears 2 times"),
+        (_reflection(classes=()), "missing 'Class:' line"),
+        (_reflection(scopes=()), "missing 'Scope:' line"),
+        (_reflection(extra=[f"Scope: {rr.FILL} later>"]), "unfilled template placeholder"),
     ],
 )
-def test_coverage_problems_are_named(text, fragment):
+def test_structure_problems_are_named(text, fragment):
     got = rr.parse(text)
     assert not got.ok and any(fragment in p for p in got.problems), got.problems
 
 
-def test_a_short_reflection_is_refused():
-    text = "Round-reflection: keys=c1 head=" + HEAD + "\n## Dispositions\n- c1: fix-now (test 1)\n"
+def test_a_short_block_is_refused():
+    text = f"Round-reflection: keys=c1 head={HEAD}\nDisposition: c1 fix-now test=1\n"
     assert any("at least" in p for p in rr.parse(text).problems)
 
 
-def test_a_disposition_hidden_in_a_fence_or_another_section_does_not_count():
-    fenced = _reflection(
-        dispositions=[
-            "- c1: fix-now (test 1)",
-            "```",
-            "## Dispositions",
-            "- c2: fix-now (test 1)",
-            "```",
-        ]
-    )
-    assert any("no disposition for: c2" in p for p in rr.parse(fenced).problems)
-    elsewhere = _reflection(dispositions=["- c1: fix-now (test 1)"]).replace(
-        "## Scope\n", "## Scope\n- c2: fix-now (test 1)\n"
-    )
-    assert any("no disposition for: c2" in p for p in rr.parse(elsewhere).problems)
-
-
 @pytest.mark.parametrize(
-    "kwargs, fragment",
+    "text",
     [
-        ({"classes": ("no count here",)}, "Distribution needs"),
-        ({"verdict": "LEAD"}, "Design-premise"),
-        ({"decision": "fix-instances"}, "Decision needs"),
-        ({"scope": ("no bullet",)}, "Scope needs"),
+        _reflection(escalate="yes"),
+        _reflection(premise="BROKEN"),
+        _reflection(premise="SUSPECT"),
+        _reflection(prose="We think the Premise: **BROKEN** after all."),
+        _reflection(prose="Ｅｓｃａｌａｔｅ： yes"),
+        _reflection(prose="Esc​alate: yes"),
     ],
 )
-def test_round_parts_are_required(kwargs, fragment):
-    got = rr.parse(_reflection(**kwargs), round_number=1)
-    assert any(fragment in p for p in got.problems), got.problems
-
-
-def test_an_early_verdict_cannot_hide_a_later_one():
-    text = _reflection(verdict="SOUND fine\nDesign-premise: BROKEN wrong store")
-    got = rr.parse(text, round_number=2)
-    assert any("more than once" in p for p in got.problems)
-
-
-def test_a_decision_outside_its_section_is_refused():
-    text = _reflection(scope=("- x", "Decision: close-class decoy"))
-    assert any("only in its own section" in p for p in rr.parse(text, round_number=1).problems)
-
-
-def test_the_impossible_question_must_be_answered_in_premise():
-    blank = _reflection().replace(" route every call through one checked helper", "")
-    assert any("whole class impossible" in p for p in rr.parse(blank, round_number=1).problems)
-    nextline = _reflection().replace(" route every call", "\nroute every call")
-    assert rr.parse(nextline, round_number=1).ok
+def test_escalation_fails_toward_escalating(text):
+    """Round 1 of #3055: an escalating label anywhere, in any form NFKC folds
+    to, escalates, so placement or a lookalike can never hide it."""
+    assert rr.parse(text).escalate
 
 
 def test_lead_is_only_a_round_one_verdict():
-    got = rr.parse(_reflection(), round_number=2)
-    assert any("from round 2" in p for p in got.problems)
+    assert any("from round 2" in p for p in rr.parse(_reflection(), round_number=2).problems)
 
 
 def test_round_obligations_by_lane():
-    audit = "Audit-evidence: ~/.genesis/review_evidence/x.txt NO BLOCKER"
-    premise = "\n## Premise-check\n- P1 the store dedups TRUE\n- P2 replies are top-level FALSE\n"
-    sound = "SOUND-BUT-INFERIOR a shared helper would remove the class"
+    audit = ["Audit-evidence: ~/.genesis/review_evidence/x.txt NO BLOCKER"]
+    checks = [
+        "Premise-check: P1 TRUE the store already dedups by key",
+        "Premise-check: P2 FALSE replies are never top level",
+    ]
+    sound = "SOUND-BUT-INFERIOR"
     assert any(
         "fresh-context audit" in p
         for p in rr.parse(_reflection(), round_number=1, gate_lane=True).problems
     )
     assert rr.parse(_reflection(extra=audit), round_number=1, gate_lane=True).ok
-    two = rr.parse(_reflection(verdict=sound), round_number=2, gate_lane=True)
+    two = rr.parse(_reflection(premise=sound), round_number=2, gate_lane=True)
     assert any("premise check" in p for p in two.problems)
-    assert rr.parse(_reflection(verdict=sound, extra=premise), round_number=2, gate_lane=True).ok
-    assert rr.parse(_reflection(verdict=sound, extra=audit), round_number=2).ok
-    one_check = "\n## Premise-check\n- P1 holds TRUE\n"
-    assert not rr.parse(_reflection(verdict=sound, extra=one_check), round_number=3).ok
+    assert rr.parse(_reflection(premise=sound, extra=checks), round_number=2, gate_lane=True).ok
+    twice = [checks[0], checks[0]]
+    again = rr.parse(_reflection(premise=sound, extra=twice), round_number=2, gate_lane=True)
+    assert any("premise check" in p for p in again.problems), "one check written twice"
+    assert rr.parse(_reflection(premise=sound, extra=audit), round_number=2).ok
+    assert not rr.parse(_reflection(premise=sound, extra=checks[:1]), round_number=3).ok
 
 
 def test_a_recurring_class_forbids_fixing_instances():
-    text = _reflection(decision="fix-instances patch both")
+    text = _reflection(decision="fix-instances")
     got = rr.parse(text, round_number=1, previous_classes=["Unchecked  subprocess result"])
     assert any("recurs" in p for p in got.problems)
     assert rr.parse(
@@ -228,25 +253,12 @@ def test_a_recurring_class_forbids_fixing_instances():
     ).ok
 
 
-def test_each_acceptance_point_must_appear_in_scope():
+def test_each_acceptance_point_must_appear_in_a_scope_line():
     point = "Every finding is keyed by an immutable id"
     missing = rr.parse(_reflection(), round_number=1, acceptance=[point])
     assert any("acceptance point" in p for p in missing.problems)
-    mapped = _reflection(scope=(f"- covered: {point.lower()} (tests/test_x.py)",))
+    mapped = _reflection(scopes=(f"covered: {point.lower()} (tests/test_x.py)",))
     assert rr.parse(mapped, round_number=1, acceptance=[point]).ok
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        _reflection(verdict="BROKEN the store already exists"),
-        _reflection(verdict="SUSPECT the premise may be wrong"),
-        _reflection(extra="escalate: YES"),
-        "Escalate: yes\n" + _reflection(),
-    ],
-)
-def test_escalation_is_flagged(text):
-    assert rr.parse(text).escalate
 
 
 # -- what is owed ------------------------------------------------------------
@@ -263,10 +275,11 @@ def _budget(**over):
         "open_keys": ["c1", "c2", "r5:1"],
         "rounds": [
             {
+                "head": HEAD,
                 "reviews": [
                     {"submitted_at": T0.isoformat()},
                     {"submitted_at": (T0 + timedelta(minutes=5)).isoformat()},
-                ]
+                ],
             }
         ],
         "expected_reviewers": [],
@@ -294,22 +307,20 @@ def test_the_round_settles_thirty_minutes_after_its_first_review():
     assert not rr.owed_state(_budget(), [], now=T0 + timedelta(minutes=29))["settled"]
     got = rr.owed_state(_budget(), [], now=T0 + timedelta(minutes=30))
     assert got["settled"] and got["settle_until"] == (T0 + timedelta(minutes=30)).isoformat()
-    assert got["round_started"] == T0.isoformat()
+    assert got["round_started"] == T0.isoformat() and got["round_head"] == HEAD
 
 
 def test_it_settles_early_once_every_expected_reviewer_has_reported():
     early = T0 + timedelta(minutes=1)
     waiting = _budget(expected_reviewers=["a[bot]", "b[bot]"], reviewers_reported=["a[bot]"])
     assert not rr.owed_state(waiting, [], now=early)["settled"]
-    assert rr.owed_state(dict(waiting, reviewers_reported=["a[bot]", "b[bot]"]), [], now=early)[
-        "settled"
-    ]
+    both = dict(waiting, reviewers_reported=["a[bot]", "b[bot]"])
+    assert rr.owed_state(both, [], now=early)["settled"]
 
 
 def test_round_one_with_nobody_expected_waits_the_whole_window():
-    assert not rr.owed_state(_budget(expected_reviewers=[]), [], now=T0 + timedelta(minutes=1))[
-        "settled"
-    ]
+    got = rr.owed_state(_budget(expected_reviewers=[]), [], now=T0 + timedelta(minutes=1))
+    assert not got["settled"]
 
 
 def test_no_readable_review_time_never_settles():
@@ -318,17 +329,41 @@ def test_no_readable_review_time_never_settles():
 
 
 @pytest.mark.parametrize(
-    "where",
+    "parsed, want",
     [
-        "   Design-premise: BROKEN indented",
-        "```\nDesign-premise: SUSPECT inside a fence\n```",
-        "> Escalate: yes",
+        ({"present": True, "bullets": ["a"], "problems": []}, ["a"]),
+        ({"present": False, "bullets": [], "problems": ["no ## Acceptance section"]}, None),
+        ({"present": False, "bullets": [], "problems": ["empty PR body"]}, None),
     ],
 )
-def test_escalation_is_read_from_every_line(where):
-    """Re-audit S2: a flag placed before the sections, indented or fenced must
-    still escalate, never be lost to its placement."""
-    assert rr.parse(_reflection(extra=where)).escalate
+def test_acceptance_points_present_or_absent(monkeypatch, parsed, want):
+    import acceptance_declaration
+
+    monkeypatch.setattr(acceptance_declaration, "parse_acceptance", lambda body: parsed)
+    assert rr.acceptance_points("body") == want
+
+
+@pytest.mark.parametrize(
+    "problem",
+    [
+        "cannot load readable_body from check_cc_pin_receipts.py",
+        "cannot read this body reliably: a code fence is indented",
+        "## Acceptance has no bullets",
+        "body too large to verify (99999 chars)",
+    ],
+)
+def test_an_unreadable_acceptance_declaration_refuses(monkeypatch, problem):
+    """Round 1 of #3055: unreadable is not absent; it must never silently
+    disable the scope rule."""
+    import acceptance_declaration
+
+    monkeypatch.setattr(
+        acceptance_declaration,
+        "parse_acceptance",
+        lambda body: {"present": False, "bullets": [], "problems": [problem]},
+    )
+    with pytest.raises(rr.Refused, match="cannot be read reliably"):
+        rr.acceptance_points("body")
 
 
 # -- coverage, in a real repository ------------------------------------------
@@ -346,9 +381,14 @@ def _commit_reflection(repo: Path, tmp_path: Path, text: str, *, empty: bool = T
     if not empty:
         (repo / "f.txt").write_text((repo / "f.txt").read_text() + "x\n")
         _git(repo, "add", "f.txt")
-    args = ["commit", "-q", "--cleanup=verbatim", "-F", str(message)]
-    _git(repo, *(args[:1] + (["--allow-empty"] if empty else []) + args[1:]))
+    flags = ["--allow-empty"] if empty else []
+    _git(repo, "commit", "-q", *flags, "--cleanup=verbatim", "-F", str(message))
     return _git(repo, "rev-parse", "HEAD").strip()
+
+
+def _fix(repo: Path, content: str) -> None:
+    (repo / "f.txt").write_text(content)
+    _git(repo, "commit", "-q", "-am", f"set {content.strip()}")
 
 
 @pytest.fixture
@@ -359,20 +399,31 @@ def repo(tmp_path):
     _git(path, "init", "-q", "-b", "main")
     _git(path, "config", "user.name", "t")
     _git(path, "config", "user.email", "t@example.com")
-    _git(path, "config", "commit.cleanup", "strip")  # would strip '## ' headings
+    _git(path, "config", "commit.cleanup", "strip")
     (path / "f.txt").write_text("x\n")
     _git(path, "add", "f.txt")
     _git(path, "commit", "-q", "-m", "base")
     _git(path, "checkout", "-q", "-b", "feat/x")
-    (path / "f.txt").write_text("y\n")
-    _git(path, "commit", "-q", "-am", "the change")
+    _fix(path, "y\n")
     return path, _git(path, "rev-parse", "HEAD").strip()
 
 
 def _covered(path, head, **kw):
     kw.setdefault("round_number", 1)
     kw.setdefault("gate_lane", False)
-    return rr.covered_keys(str(path), head, base_ref="main", **kw)
+    kw.setdefault("prior_heads", [])
+    kw.setdefault("acceptance", None)
+    kw.setdefault("round_started", T0 - timedelta(days=3650))
+    return rr.covered_keys(str(path), head, **kw)
+
+
+def _strong_audit(tmp_path: Path) -> Path:
+    evidence = tmp_path / "audit.txt"
+    evidence.write_text(
+        "Severity ladder: BLOCKER none; SHOULD-FIX scripts/x.py:12 the loop is unbounded; "
+        "NOTE scripts/y.py:3 a stale comment. Scope: the whole diff was read. " * 4
+    )
+    return evidence
 
 
 def test_an_empty_reflection_on_the_head_covers_its_keys(repo, tmp_path):
@@ -382,7 +433,8 @@ def test_an_empty_reflection_on_the_head_covers_its_keys(repo, tmp_path):
 
 
 def test_appended_trailers_keep_the_reflection_counted(repo, tmp_path):
-    """This install's prepare-commit-msg appends Install: and Genesis-Session:."""
+    """This install's prepare-commit-msg appends Install: and Genesis-Session:
+    after a blank line, which is prose to the grammar."""
     path, head = repo
     hook = path / ".git" / "hooks" / "prepare-commit-msg"
     hook.write_text(
@@ -398,8 +450,8 @@ def test_appended_trailers_keep_the_reflection_counted(repo, tmp_path):
     [
         (lambda h: f"Round-reflection: keys=c1,c2 head={h}\n", "a bare trailer"),
         (lambda h: _reflection(head="b" * 40), "another head"),
-        (lambda h: _reflection(head=h, verdict="BROKEN wrong store"), "it escalates"),
-        (lambda h: _reflection(head=h, decision=""), "no decision (round-aware parse)"),
+        (lambda h: _reflection(head=h, escalate="yes"), "it escalates"),
+        (lambda h: _reflection(head=h, classes=()), "no class"),
     ],
 )
 def test_what_a_hand_made_reflection_cannot_cover(repo, tmp_path, make, why):
@@ -415,105 +467,42 @@ def test_a_reflection_carrying_content_covers_nothing(repo, tmp_path):
     assert _covered(path, head) == set()
 
 
-def test_a_hand_made_reflection_meets_the_recurring_class_rule(repo, tmp_path):
-    """Re-audit S1: the rule commit enforced must hold for a hand-made one too."""
-    path, first = repo
-    _commit_reflection(path, tmp_path, _reflection(head=first))
-    (path / "f.txt").write_text("fix\n")
-    _git(path, "commit", "-q", "-am", "fix")
-    second = _git(path, "rev-parse", "HEAD").strip()
-    sound = "SOUND-BUT-INFERIOR one helper would remove it"
-    evidence = tmp_path / "audit.txt"
-    evidence.write_text(
-        "Severity ladder: BLOCKER none; SHOULD-FIX scripts/x.py:12 the loop is unbounded; "
-        "NOTE scripts/y.py:3 a stale comment. Scope: the whole diff was read. " * 4
-    )
-    audit = f"Audit-evidence: {evidence} PASS"
-    repeat = _reflection(head=second, verdict=sound, decision="fix-instances again", extra=audit)
-    _commit_reflection(path, tmp_path, repeat)
-    assert _covered(path, second, round_number=2) == set()
-    # The control: the same reflection closing the class is covered, so only the
-    # recurring-class rule refused the first one.
-    closing = _reflection(
-        head=second, verdict=sound, decision="close-class one helper", extra=audit
-    )
-    _commit_reflection(path, tmp_path, closing)
-    assert _covered(path, second, round_number=2) == {"c1", "c2"}
-
-
-def test_cited_audit_evidence_is_checked(repo, tmp_path):
+def test_a_reflection_made_after_a_fix_covers_nothing(repo, tmp_path):
     path, head = repo
-    missing = _reflection(head=head, extra="Audit-evidence: ~/.genesis/no-such-audit.txt PASS")
-    _commit_reflection(path, tmp_path, missing)
-    assert _covered(path, head, gate_lane=True) == set()
-    strong = tmp_path / "audit.txt"
-    strong.write_text(
-        "Severity ladder: BLOCKER none; SHOULD-FIX scripts/x.py:12 the loop is unbounded; "
-        "NOTE scripts/y.py:3 a stale comment. Scope: the whole diff was read. " * 4
-    )
-    _commit_reflection(
-        path, tmp_path, _reflection(head=head, extra=f"Audit-evidence: {strong} PASS")
-    )
-    assert _covered(path, head, gate_lane=True) == {"c1", "c2"}
-    later = datetime.now(UTC) + timedelta(hours=1)
-    assert _covered(path, head, gate_lane=True, round_started=later) == set()
-
-
-def test_acceptance_points_are_checked_when_given(repo, tmp_path):
-    path, head = repo
+    _fix(path, "fix\n")
     _commit_reflection(path, tmp_path, _reflection(head=head))
-    assert _covered(path, head, acceptance=["the key round-trips"]) == {"c1", "c2"}
-    assert _covered(path, head, acceptance=["an unmapped point"]) == set()
+    assert _covered(path, head) == set()
 
 
-def test_previous_classes_come_from_this_branch_and_an_earlier_head(repo, tmp_path):
-    """Re-audit S3: a reflection on the base branch (a stacked PR's base) is
-    not this branch's previous round; one on the same head is not either."""
+def test_a_fix_reverted_before_the_reflection_still_disqualifies_it(repo, tmp_path):
+    """Round 1 of #3055: the endpoint trees are equal, but a fix happened."""
+    path, head = repo
+    _fix(path, "fix\n")
+    _fix(path, "y\n")
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head) == set()
+
+
+def test_a_merge_between_the_head_and_the_reflection_disqualifies_it(repo, tmp_path):
     path, head = repo
     _git(path, "checkout", "-q", "main")
-    _commit_reflection(path, tmp_path, _reflection(head="c" * 40, classes=("base class: 1",)))
+    (path / "g.txt").write_text("main\n")
+    _git(path, "add", "g.txt")
+    _git(path, "commit", "-q", "-m", "main moves")
     _git(path, "checkout", "-q", "feat/x")
-    _git(path, "rebase", "-q", "main")
-    head = _git(path, "rev-parse", "HEAD").strip()
-    assert rr.previous_class_labels(str(path), head, base_ref="main") == []
-    _commit_reflection(path, tmp_path, _reflection(head="b" * 40, classes=("old class: 1",)))
-    _commit_reflection(path, tmp_path, _reflection(head=head, classes=("this round: 1",)))
-    assert rr.previous_class_labels(str(path), head, base_ref="main") == ["old class"]
+    _git(path, "merge", "-q", "--no-edit", "main")
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head) == set()
 
 
-def test_status_subtracts_what_is_covered(repo, tmp_path, monkeypatch):
-    """Re-audit S5: the path from covered_keys to what is owed, end to end."""
+def test_a_merge_that_changes_no_tree_still_disqualifies_it(repo, tmp_path):
+    """Only the one-parent rule decides this: `-s ours` keeps the tree."""
     path, head = repo
-    _commit_reflection(path, tmp_path, _reflection(keys=("c1",), head=head))
-    import review_budget
-
-    budget = _budget(open_keys=["c1", "c2"], current_head=head)
-    monkeypatch.setattr(rr, "pr_identity", lambda cwd: ("o/r", 7))
-    monkeypatch.setattr(rr, "_pr_meta", lambda repo, number: {"body": "", "baseRefName": "main"})
-    monkeypatch.setattr(review_budget, "evaluate_pr", lambda repo, number: budget)
-    monkeypatch.setattr(rr, "covered_keys", _with_base("main", rr.covered_keys))
-    got = rr.status(str(path), now=T0 + timedelta(hours=1))
-    assert got["owed"] == ["c2"] and got["settled"]
-
-
-def _with_base(base, real):
-    def call(cwd, head, **kw):
-        kw["base_ref"] = base
-        return real(cwd, head, **kw)
-
-    return call
-
-
-def test_unreadable_git_is_refused_never_nothing_owed(tmp_path):
-    with pytest.raises(rr.Refused):
-        rr.covered_keys(str(tmp_path), HEAD, round_number=1, gate_lane=False, base_ref="main")
-
-
-def test_a_reflection_made_after_a_fix_covers_nothing(repo, tmp_path):
-    """Secondary review P2: reflect-then-fix and fix-then-reflect must differ."""
-    path, head = repo
-    (path / "f.txt").write_text("fix\n")
-    _git(path, "commit", "-q", "-am", "fix")
+    _git(path, "checkout", "-q", "-b", "side", "main")
+    _git(path, "commit", "-q", "--allow-empty", "-m", "side")
+    _git(path, "checkout", "-q", "feat/x")
+    _git(path, "merge", "-q", "--no-edit", "-s", "ours", "side")
+    assert _git(path, "rev-parse", "HEAD^{tree}") == _git(path, "rev-parse", "HEAD^1^{tree}")
     _commit_reflection(path, tmp_path, _reflection(head=head))
     assert _covered(path, head) == set()
 
@@ -525,5 +514,215 @@ def test_a_second_reflection_for_the_same_round_still_counts(repo, tmp_path):
     assert _covered(path, head) == {"c1", "c9"}
 
 
-def test_validate_reports_a_missing_file_as_unable_not_invalid(tmp_path, capsys):
+def test_a_hand_made_reflection_meets_the_recurring_class_rule(repo, tmp_path):
+    """Re-audit S1, with a control that only the recurring-class rule decides."""
+    path, first = repo
+    _commit_reflection(path, tmp_path, _reflection(head=first))
+    _fix(path, "fix\n")
+    second = _git(path, "rev-parse", "HEAD").strip()
+    audit = [f"Audit-evidence: {_strong_audit(tmp_path)} PASS"]
+    sound = "SOUND-BUT-INFERIOR"
+    repeat = _reflection(head=second, premise=sound, decision="fix-instances", extra=audit)
+    _commit_reflection(path, tmp_path, repeat)
+    assert _covered(path, second, round_number=2, prior_heads=[first]) == set()
+    closing = _reflection(head=second, premise=sound, decision="close-class", extra=audit)
+    _commit_reflection(path, tmp_path, closing)
+    assert _covered(path, second, round_number=2, prior_heads=[first]) == {"c1", "c2"}
+
+
+def test_a_stray_reflection_cannot_stand_in_for_the_previous_round(repo, tmp_path):
+    """Fix-code audit S1 of #3055: a reflection naming a head that is not one
+    of this PR's earlier round heads (mistyped, stale) is ignored, so it can
+    neither hide nor replace the real previous round's classes."""
+    path, first = repo
+    _commit_reflection(path, tmp_path, _reflection(head=first))
+    _fix(path, "fix\n")
+    second = _git(path, "rev-parse", "HEAD").strip()
+    decoy = _reflection(head="0" * 40, classes=("decoy class = 1",))
+    _commit_reflection(path, tmp_path, decoy)
+    assert rr.previous_class_labels(str(path), [first]) == ["unchecked subprocess result"]
+    audit = [f"Audit-evidence: {_strong_audit(tmp_path)} PASS"]
+    sound = "SOUND-BUT-INFERIOR"
+    repeat = _reflection(head=second, premise=sound, decision="fix-instances", extra=audit)
+    _commit_reflection(path, tmp_path, repeat)
+    assert _covered(path, second, round_number=2, prior_heads=[first]) == set()
+
+
+def test_a_class_from_any_earlier_round_recurs(repo, tmp_path):
+    """Fix-code audit S1: absent in round 2 and back in round 3 still recurs."""
+    path, first = repo
+    _commit_reflection(path, tmp_path, _reflection(head=first, classes=("alpha = 1",)))
+    _fix(path, "two\n")
+    second = _git(path, "rev-parse", "HEAD").strip()
+    _commit_reflection(path, tmp_path, _reflection(head=second, classes=("beta = 1",)))
+    assert sorted(rr.previous_class_labels(str(path), [first, second])) == ["alpha", "beta"]
+
+
+def test_an_invalid_or_content_reflection_adds_no_previous_class(repo, tmp_path):
+    path, first = repo
+    broken = _reflection(head=first, classes=("ghost = 1",), escalate="maybe")
+    _commit_reflection(path, tmp_path, broken)
+    content = _reflection(head=first, classes=("loaded = 1",))
+    _commit_reflection(path, tmp_path, content, empty=False)
+    assert rr.previous_class_labels(str(path), [first]) == []
+
+
+def test_a_control_byte_in_the_prose_cannot_hide_an_escalation(repo, tmp_path):
+    """Fix-code audit S2: records were split on a control byte a message may
+    hold, so everything after it was dropped from the escalation search."""
+    path, head = repo
+    text = _reflection(head=head, prose="notes \x01 Escalate: yes")
+    assert rr.parse(text).escalate
+    _commit_reflection(path, tmp_path, text)
+    assert "\x01" in _git(path, "log", "-1", "--format=%B")
+    assert _covered(path, head) == set()
+
+
+def test_a_reflection_on_another_line_of_history_covers_nothing(repo, tmp_path):
+    """The ancestry guard: head on a side branch, the reflection elsewhere;
+    head..reflection is just the empty reflection, so only the guard decides."""
+    path, _ = repo
+    _git(path, "checkout", "-q", "-b", "side")
+    _fix(path, "side\n")
+    side_head = _git(path, "rev-parse", "HEAD").strip()
+    _git(path, "checkout", "-q", "feat/x")
+    _commit_reflection(path, tmp_path, _reflection(head=side_head))
+    assert _covered(path, side_head) == set()
+
+
+def test_git_replace_cannot_swap_out_a_fix(repo, tmp_path):
+    """Fix-code audit N1: reads ignore replace objects."""
+    path, head = repo
+    _fix(path, "fix\n")
+    reflection = _commit_reflection(path, tmp_path, _reflection(head=head))
+    message = _git(path, "log", "-1", "--format=%B", reflection)
+    tree = _git(path, "rev-parse", f"{head}^{{tree}}").strip()
+    forged = subprocess.run(
+        ["git", "-C", str(path), "commit-tree", tree, "-p", head, "-F", "-"],
+        input=message,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    _git(path, "replace", reflection, forged)
+    assert _covered(path, head) == set()
+
+
+def test_the_previous_round_combines_every_reflection_on_its_head(repo, tmp_path):
+    """Round 1 of #3055: a late review's second reflection on the previous
+    head carries classes too; the newest alone is not the previous round."""
+    path, first = repo
+    one = _reflection(keys=("c1",), head=first, classes=("alpha = 1",))
+    two = _reflection(keys=("c9",), head=first, classes=("beta = 1",))
+    _commit_reflection(path, tmp_path, one)
+    _commit_reflection(path, tmp_path, two)
+    _fix(path, "fix\n")
+    labels = rr.previous_class_labels(str(path), [first])
+    assert sorted(labels) == ["alpha", "beta"]
+
+
+def test_previous_classes_come_only_from_the_named_earlier_heads(repo, tmp_path):
+    """A stacked base branch's reflections and this round's own never count:
+    only reflections naming one of the PR's earlier round heads do."""
+    path, head = repo
+    _git(path, "checkout", "-q", "main")
+    _commit_reflection(path, tmp_path, _reflection(head="c" * 40, classes=("base class = 1",)))
+    _git(path, "checkout", "-q", "feat/x")
+    _git(path, "rebase", "-q", "main")
+    head = _git(path, "rev-parse", "HEAD").strip()
+    assert rr.previous_class_labels(str(path), [head]) == []
+    _commit_reflection(path, tmp_path, _reflection(head="b" * 40, classes=("old class = 1",)))
+    _commit_reflection(path, tmp_path, _reflection(head=head, classes=("this round = 1",)))
+    assert rr.previous_class_labels(str(path), ["b" * 40]) == ["old class"]
+
+
+def test_cited_audit_evidence_is_checked(repo, tmp_path):
+    path, head = repo
+    missing = _reflection(head=head, extra=["Audit-evidence: ~/.genesis/no-such-audit.txt PASS"])
+    _commit_reflection(path, tmp_path, missing)
+    assert _covered(path, head, gate_lane=True) == set()
+    strong = _strong_audit(tmp_path)
+    cited = _reflection(head=head, extra=[f"Audit-evidence: {strong} PASS"])
+    _commit_reflection(path, tmp_path, cited)
+    assert _covered(path, head, gate_lane=True) == {"c1", "c2"}
+    later = datetime.now(UTC) + timedelta(hours=1)
+    assert _covered(path, head, gate_lane=True, round_started=later) == set()
+    assert _covered(path, head, gate_lane=True, round_started="not a time") == set()
+    assert _covered(path, head, gate_lane=True, round_started=None) == set()
+
+
+def test_undecodable_audit_evidence_is_unreadable_not_a_crash(tmp_path):
+    """Round 1 of #3055: invalid UTF-8 evidence must refuse the reflection."""
+    bad = tmp_path / "bad.txt"
+    bad.write_bytes(b"\xff\xfe not utf-8 \xc3")
+    assert "not valid UTF-8" in rr.audit_problem(str(bad), T0)
+
+
+def test_a_legacy_encoded_commit_message_is_read_not_a_crash(repo, tmp_path):
+    """Round 1 of #3055: git emits raw bytes for a commit made under a legacy
+    i18n.commitEncoding; reading the log must not raise."""
+    path, head = repo
+    _git(path, "config", "i18n.commitEncoding", "latin1")
+    message = tmp_path / "latin.txt"
+    message.write_bytes("Round-reflection: caf\xe9\n".encode("latin1"))
+    _git(path, "commit", "-q", "--allow-empty", "-F", str(message))
+    assert _covered(path, head) == set()
+
+
+def test_acceptance_points_are_checked_when_given(repo, tmp_path):
+    path, head = repo
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, acceptance=["the key round-trips"]) == {"c1", "c2"}
+    assert _covered(path, head, acceptance=["an unmapped point"]) == set()
+
+
+def test_status_subtracts_what_is_covered(repo, tmp_path, monkeypatch):
+    path, head = repo
+    _commit_reflection(path, tmp_path, _reflection(keys=("c1",), head=head))
+    import review_budget
+
+    budget = _budget(open_keys=["c1", "c2"], current_head=head)
+    monkeypatch.setattr(rr, "pr_identity", lambda cwd: ("o/r", 7))
+    monkeypatch.setattr(rr, "_pr_meta", lambda repo, number: {"body": "", "baseRefName": "main"})
+    monkeypatch.setattr(review_budget, "evaluate_pr", lambda repo, number: budget)
+    got = rr.status(str(path), now=T0 + timedelta(hours=1))
+    assert got["owed"] == ["c2"] and got["settled"]
+
+
+def test_unreadable_git_is_refused_never_nothing_owed(tmp_path):
+    with pytest.raises(rr.Refused):
+        rr.covered_keys(
+            str(tmp_path),
+            HEAD,
+            round_number=1,
+            gate_lane=False,
+            prior_heads=[],
+            acceptance=None,
+            round_started=T0,
+        )
+
+
+# -- the CLI -----------------------------------------------------------------
+
+
+def test_validate_exit_codes(tmp_path):
+    good = tmp_path / "good.md"
+    good.write_text(_reflection())
+    bad = tmp_path / "bad.md"
+    bad.write_text("not a reflection\n")
+    binary = tmp_path / "binary.md"
+    binary.write_bytes(b"\xff\xfe")
+    assert rr.main(["validate", str(good), "--round", "1"]) == 0
+    assert rr.main(["validate", str(bad)]) == 1
     assert rr.main(["validate", str(tmp_path / "absent.md")]) == 2
+    assert rr.main(["validate", str(binary)]) == 2
+
+
+def test_an_unexpected_error_in_status_is_cannot_check_not_invalid(monkeypatch):
+    """Fix-code audit N5: exit 1 means invalid; status never returns it."""
+
+    def boom(cwd, **kw):
+        raise AttributeError("a malformed rounds entry")
+
+    monkeypatch.setattr(rr, "status", boom)
+    assert rr.main(["status"]) == 2

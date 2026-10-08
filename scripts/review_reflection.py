@@ -9,22 +9,36 @@ decision, and one disposition per finding (fix now, or file it). The
 reflection is an EMPTY commit whose message is the reflection, so no reviewer
 is ever triggered by it.
 
-This module is the format and the coverage check. ``covered_keys`` is THE
-check: the commit gate (a later change) calls it, and it applies every local
-rule, so a reflection committed by hand is held to exactly the standard a
-tool-made one is. Writing helpers (template, commit, mirror) are a separate
-change.
+The format is a CLOSED HEADER BLOCK (owner ruling 2026-10-07): from the first
+line to the first blank line, every line is one fixed ``Field: value``, each
+value matched end to end, plain printable ASCII only. Any other line is
+refused by line number. Prose may follow the blank line and is never parsed.
+Reading free markdown with regexes made every markdown construct (fences,
+list markers, comments, lookalike characters, headings git strips) a separate
+hole; a closed grammar has none of those to handle::
 
-CLI:
+    Round-reflection: keys=c101,c102 head=<40-hex sha>
+    Class: unchecked subprocess result = 2
+    Premise: LEAD
+    Premise-why: the change routes around an existing helper
+    Impossible: route every call through one checked helper
+    Scope: covered: the key round-trips (tests/test_x.py)
+    Decision: close-class
+    Decision-why: the same mistake appears twice
+    Disposition: c101 fix-now test=1
+    Disposition: c102 file issue=#123
+    Escalate: no
 
-``status``    what the open round on the current branch's PR owes, and
-              whether the round has settled (30 minutes since its first
-              review, or every expected reviewer has reported).
-``validate``  checks a reflection file's structure, offline.
+Rounds that owe more add ``Audit-evidence: <path> <verdict>`` and
+``Premise-check: P1 TRUE <text>`` lines (see ``obligations``).
 
-Keys come from ``review_budget``: ``c<id>`` an inline finding, ``r<id>:<n>`` a
-review's ``n`` body findings answered as one, ``i<id>`` a Codex findings
-comment.
+``covered_keys`` is THE coverage check: the commit gate (a later change) calls
+it, and it applies every local rule, so a reflection committed by hand is held
+to exactly the standard a tool-made one is.
+
+CLI: ``status`` (what the open round owes, whether it has settled) and
+``validate`` (a file, offline). Exit 1 means the reflection is invalid; exit
+2 means the check could not be made.
 """
 
 from __future__ import annotations
@@ -35,6 +49,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -46,41 +61,53 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 SETTLE = timedelta(minutes=30)
-MIN_CHARS = 400
+MIN_BLOCK_CHARS = 300
 LOG_DEPTH = 300
-IMPOSSIBLE_PROMPT = "What change would make this whole class impossible?"
-#: Every template placeholder starts with this, and none may survive into a
-#: committed reflection. Distinct from ordinary angle-bracket prose ("r<id>").
+#: A template placeholder; it can never match a field, so it is refused anyway,
+#: but naming it gives a clearer message.
 FILL = "<FILL:"
 
-_KEY = r"(?:c\d{1,20}|r\d{1,20}:\d{1,9}|i\d{1,20})"
+# [0-9], never \d: \d matches every Unicode digit, and the header line is
+# matched by this pattern alone.
+_KEY = r"(?:c[0-9]{1,20}|r[0-9]{1,20}:[0-9]{1,9}|i[0-9]{1,20})"
 HEADER_RE = re.compile(rf"^Round-reflection: keys=({_KEY}(?:,{_KEY})*) head=([0-9a-f]{{40}})$")
-_SECTION_RE = re.compile(r"^##[ \t]+(\S.*?)[ \t]*$")
-_FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})")
-_CLASS_ROW_RE = re.compile(r"^[ \t]*[-*][ \t]+([^:\n]{2,80}?)[ \t]*:[ \t]*(\d{1,4})\b")
-_VERDICT_RE = re.compile(
-    r"^Design-premise:[ \t]*(LEAD|SOUND-BUT-INFERIOR|SOUND|BROKEN|SUSPECT)\b[ \t]*(\S.*)?$"
-)
-_DECISION_RE = re.compile(
-    r"^Decision:[ \t]*(fix-instances|close-class|rework|send-back)\b[ \t]*(\S.*)?$"
-)
-_LABELLED_RE = re.compile(r"^(Design-premise|Decision):")
-_DISPOSITION_RE = re.compile(
-    rf"^[ \t]*[-*][ \t]+({_KEY})[ \t]*:[ \t]*"
-    r"(fix-now[ \t]*\(test[ \t]*[1-4](?:[ \t]*,[ \t]*[1-4])*\)"
-    r"|file[ \t]*\(fails all four;[ \t]*#\d+\))"
-)
-_ANY_DISPOSITION_RE = re.compile(rf"^[ \t]*[-*][ \t]+({_KEY})[ \t]*:")
-_AUDIT_RE = re.compile(r"^Audit-evidence:[ \t]*(\S+)")
-_PREMISE_LINE_RE = re.compile(r"^[ \t]*[-*]?[ \t]*P\d+\b.*\b(TRUE|FALSE|UNPROVEN)\b")
-#: Escalation is read from the RAW text, any line, any indent, fenced or not:
-#: a flag is honoured wherever it was put, never lost to placement.
-_ESCALATION_RE = re.compile(
-    r"^[ \t>*-]*(?:Design-premise:[ \t]*(?:BROKEN|SUSPECT)\b|Escalate:[ \t]*yes\b)",
-    re.IGNORECASE | re.MULTILINE,
+_TEXT = r"[!-~][ -~]{9,299}"  # 10-300 printable ASCII characters, not starting with a space
+#: Every field the block may hold: name -> (pattern for the whole line, min, max).
+FIELDS: dict[str, tuple[re.Pattern[str], int, int | None]] = {
+    "Class": (
+        re.compile(r"^Class: ([A-Za-z0-9][A-Za-z0-9 ,/()'.-]{1,79}) = ([0-9]{1,4})$"),
+        1,
+        None,
+    ),
+    "Premise": (re.compile(r"^Premise: (LEAD|SOUND|SOUND-BUT-INFERIOR|BROKEN|SUSPECT)$"), 1, 1),
+    "Premise-why": (re.compile(rf"^Premise-why: ({_TEXT})$"), 1, 1),
+    "Impossible": (re.compile(rf"^Impossible: ({_TEXT})$"), 1, 1),
+    "Scope": (re.compile(rf"^Scope: ({_TEXT})$"), 1, None),
+    "Decision": (re.compile(r"^Decision: (fix-instances|close-class|rework|send-back)$"), 1, 1),
+    "Decision-why": (re.compile(rf"^Decision-why: ({_TEXT})$"), 1, 1),
+    "Disposition": (
+        re.compile(
+            rf"^Disposition: ({_KEY}) (fix-now test=[1-4](?:,[1-4]){{0,3}}|file issue=#[0-9]{{1,7}})$"
+        ),
+        1,
+        None,
+    ),
+    "Audit-evidence": (re.compile(r"^Audit-evidence: ([!-~]{1,300})(?: ([ -~]{1,300}))?$"), 0, 1),
+    "Premise-check": (
+        re.compile(rf"^Premise-check: P([0-9]{{1,2}}) (TRUE|FALSE|UNPROVEN) ({_TEXT})$"),
+        0,
+        None,
+    ),
+    "Escalate": (re.compile(r"^Escalate: (yes|no)$"), 1, 1),
+}
+_FIELD_NAME_RE = re.compile(r"^([A-Za-z-]{1,20}): ")
+#: The Premise and Escalate fields decide escalation. This search over the
+#: whole message (prose included, NFKC-normalised) is a best-effort extra that
+#: leans toward escalating; it does not catch every spelling or lookalike.
+_ESCALATION_ANYWHERE_RE = re.compile(
+    r"(?:escalate\s*:\s*yes\b|premise\s*:\s*\W*\s*(?:broken|suspect)\b)", re.IGNORECASE
 )
 _WS_RE = re.compile(r"\s+")
-REQUIRED_SECTIONS = ("Distribution", "Premise", "Scope", "Decision", "Dispositions")
 
 
 class Refused(Exception):
@@ -99,6 +126,8 @@ class Reflection:
     decision: str | None = None
     escalate: bool = False
     audit_evidence: str | None = None
+    scopes: list[str] = field(default_factory=list)
+    premise_checks: int = 0
     problems: list[str] = field(default_factory=list)
 
     @property
@@ -119,41 +148,14 @@ def obligations(round_number: int, gate_lane: bool) -> tuple[bool, bool]:
     return round_number == 2, round_number >= 3
 
 
-def _sections(lines: Sequence[str]) -> dict[str, list[str]]:
-    """Lines under each ``## heading``. A fenced block is quotation, not
-    structure: its lines belong to no section, so neither a heading nor a
-    disposition inside one counts."""
-    out: dict[str, list[str]] = {}
-    current: str | None = None
-    fence: str | None = None
-    for line in lines:
-        opener = _FENCE_RE.match(line)
-        if opener:
-            mark = opener.group(1)[0]
-            fence = None if fence == mark else (fence or mark)
-            continue
-        if fence:
-            continue
-        match = _SECTION_RE.match(line)
-        if match:
-            current = match.group(1)
-            out.setdefault(current, [])
-        elif current is not None:
-            out[current].append(line)
-    return out
-
-
 def _normalize(text: str) -> str:
     return _WS_RE.sub(" ", text).strip().lower()
 
 
-def _one(lines: Sequence[str], pattern: re.Pattern[str], label: str, problems: list[str]):
-    """The single line ``pattern`` matches in ``lines``; more than one is refused,
-    so an early line can never hide a later one."""
-    hits = [m for line in lines if (m := pattern.match(line))]
-    if len(hits) > 1:
-        problems.append(f"'{label}' appears more than once")
-    return hits[0] if len(hits) == 1 else None
+def _escalates_anywhere(text: str) -> bool:
+    folded = unicodedata.normalize("NFKC", text)
+    folded = "".join(ch for ch in folded if unicodedata.category(ch) != "Cf")
+    return bool(_ESCALATION_ANYWHERE_RE.search(folded))
 
 
 def parse(
@@ -164,57 +166,78 @@ def parse(
     acceptance: Sequence[str] | None = None,
     previous_classes: Iterable[str] = (),
 ) -> Reflection:
-    """Structure-check a reflection, offline. Never raises.
+    """Check a reflection against the closed grammar, offline. Never raises.
 
-    ``round_number`` None checks only what any reader can: the header on the
-    FIRST line, one disposition per header key and nothing else, the length,
-    and no unfilled placeholder. Given a round, it also checks every required
-    part, the round's obligations and the recurring-class rule; given
-    ``acceptance`` bullets, each must appear in the Scope section.
+    Always checked: the header on the first line, every block line a known
+    field matched end to end, field counts, one disposition per header key and
+    nothing else, and the block's length. Given a round, also the round's
+    obligations, the round-2 verdict and the recurring-class rule; given
+    ``acceptance`` bullets, each must appear in a Scope line.
     """
     result = Reflection()
-    lines = text.splitlines()
-    header = HEADER_RE.match(lines[0]) if lines else None
+    result.escalate = _escalates_anywhere(text)
+    lines = text.split("\n")
+    end = next((i for i, line in enumerate(lines) if line == ""), len(lines))
+    block = lines[:end]
+    header = HEADER_RE.match(block[0]) if block else None
     if header is None:
         result.problems.append(
-            "the FIRST line must be exactly "
-            "'Round-reflection: keys=<key>[,<key>...] head=<40-hex sha>'"
+            "line 1 must be exactly 'Round-reflection: keys=<key>[,<key>...] head=<40-hex sha>'"
         )
     else:
         result.keys = header.group(1).split(",")
         result.head = header.group(2)
         if len(set(result.keys)) != len(result.keys):
             result.problems.append("the header names a key twice")
-    if sum(1 for line in lines if line.startswith("Round-reflection:")) > 1:
-        result.problems.append("a reflection has exactly one header")
-    if len(text.strip()) < MIN_CHARS:
-        result.problems.append(f"a reflection is at least {MIN_CHARS} characters")
     if FILL in text:
         result.problems.append(f"unfilled template placeholder(s) remain ('{FILL} ...>')")
-    result.escalate = bool(_ESCALATION_RE.search(text))
+    if len("\n".join(block)) < MIN_BLOCK_CHARS:
+        result.problems.append(f"the header block is at least {MIN_BLOCK_CHARS} characters")
 
-    sections = _sections(lines)
-    disposed: dict[str, str] = {}
-    for line in sections.get("Dispositions", []):
-        loose = _ANY_DISPOSITION_RE.match(line)
-        if loose is None:
+    seen: dict[str, list[re.Match[str]]] = {name: [] for name in FIELDS}
+    for number, line in enumerate(block[1:], start=2):
+        if any(not (" " <= ch <= "~") for ch in line):
+            result.problems.append(f"line {number}: only printable ASCII is allowed in the block")
             continue
-        key = loose.group(1)
-        if key in disposed:
-            result.problems.append(f"{key} has two dispositions")
-            continue
-        strict = _DISPOSITION_RE.match(line)
-        if strict is None:
+        name = _FIELD_NAME_RE.match(line)
+        spec = FIELDS.get(name.group(1)) if name else None
+        match = spec[0].match(line) if spec else None
+        if match is None:
             result.problems.append(
-                f"{key}: a disposition is 'fix-now (test N)' (N in 1-4) "
-                "or 'file (fails all four; #N)'"
+                f"line {number}: not a recognised field, or its value does not match "
+                f"({line[:60]!r})"
             )
-            disposed[key] = ""
             continue
-        disposed[key] = strict.group(2)
+        seen[name.group(1)].append(match)
+    for field_name, (_, low, high) in FIELDS.items():
+        count = len(seen[field_name])
+        if count < low:
+            result.problems.append(f"missing '{field_name}:' line")
+        if high is not None and count > high:
+            result.problems.append(f"'{field_name}:' appears {count} times (at most {high})")
+
+    result.classes = [_normalize(m.group(1)) for m in seen["Class"]]
+    result.scopes = [m.group(1) for m in seen["Scope"]]
+    # Distinct premise numbers: one check written twice is still one check.
+    result.premise_checks = len({m.group(1) for m in seen["Premise-check"]})
+    if seen["Premise"]:
+        result.verdict = seen["Premise"][0].group(1)
+    if seen["Decision"]:
+        result.decision = seen["Decision"][0].group(1)
+    if seen["Audit-evidence"]:
+        result.audit_evidence = seen["Audit-evidence"][0].group(1)
+    if any(m.group(1) == "yes" for m in seen["Escalate"]) or result.verdict in {
+        "BROKEN",
+        "SUSPECT",
+    }:
+        result.escalate = True
+
+    disposed = [m.group(1) for m in seen["Disposition"]]
+    if len(set(disposed)) != len(disposed):
+        result.problems.append("a key has two dispositions")
     if result.keys:
         missing = [k for k in result.keys if k not in disposed]
-        extra = [k for k in disposed if k not in result.keys]
+        extra = sorted({k for k in disposed if k not in result.keys})
         if missing:
             result.problems.append("no disposition for: " + ", ".join(missing))
         if extra:
@@ -222,106 +245,59 @@ def parse(
                 "dispositions for keys the header does not name: " + ", ".join(extra)
             )
 
-    # Labelled lines are read from THEIR section only, and exactly once, so a
-    # decoy line elsewhere neither satisfies nor hides the real one.
-    premise_lines = sections.get("Premise", [])
-    decision_lines = sections.get("Decision", [])
-    verdict = _one(premise_lines, _VERDICT_RE, "Design-premise", result.problems)
-    decision = _one(decision_lines, _DECISION_RE, "Decision", result.problems)
-    for name, body in sections.items():
-        for line in body:
-            label = _LABELLED_RE.match(line)
-            if label and not (
-                (label.group(1) == "Design-premise" and name == "Premise")
-                or (label.group(1) == "Decision" and name == "Decision")
-            ):
-                result.problems.append(f"'{label.group(1)}:' belongs only in its own section")
-    result.verdict = verdict.group(1) if verdict else None
-    result.decision = decision.group(1) if decision else None
-    for line in sections.get("Distribution", []):
-        row = _CLASS_ROW_RE.match(line)
-        if row:
-            result.classes.append(_normalize(row.group(1)))
-    all_lines = [line for body in sections.values() for line in body]
-    audit = next((m for line in all_lines if (m := _AUDIT_RE.match(line))), None)
-    result.audit_evidence = audit.group(1) if audit else None
-
     if round_number is None:
         return result
 
-    for name in REQUIRED_SECTIONS:
-        if name not in sections:
-            result.problems.append(f"missing section '## {name}'")
-    if not result.classes:
-        result.problems.append("Distribution needs at least one '- <class>: <count>' row")
-    if verdict is None or not (verdict.group(2) or "").strip():
-        result.problems.append(
-            "Premise needs 'Design-premise: LEAD|SOUND|SOUND-BUT-INFERIOR|BROKEN|SUSPECT <why>'"
-        )
-    elif round_number >= 2 and result.verdict == "LEAD":
+    if round_number >= 2 and result.verdict == "LEAD":
         result.problems.append(
             "from round 2 the premise verdict is SOUND, SOUND-BUT-INFERIOR or BROKEN"
         )
-    if not _answer_to(premise_lines, IMPOSSIBLE_PROMPT):
-        result.problems.append(
-            f"answer '{IMPOSSIBLE_PROMPT}' in Premise (on that line or the next)"
-        )
-    if decision is None or not (decision.group(2) or "").strip():
-        result.problems.append(
-            "Decision needs 'Decision: fix-instances|close-class|rework|send-back <why>'"
-        )
-    scope_lines = sections.get("Scope", [])
-    if not [line for line in scope_lines if re.match(r"^[ \t]*[-*][ \t]+\S", line)]:
-        result.problems.append("Scope needs at least one '- ' entry")
-    scope_text = _normalize("\n".join(scope_lines))
+    scope_text = _normalize("\n".join(result.scopes))
     for item in acceptance or ():
         wanted = _normalize(item)
         if wanted and wanted not in scope_text:
-            result.problems.append(f"Scope does not map the acceptance point: {item[:80]}")
-
+            result.problems.append(f"no Scope line maps the acceptance point: {item[:80]}")
     audit_owed, premise_owed = obligations(round_number, gate_lane)
     if audit_owed and not result.audit_evidence:
         result.problems.append(
             f"round {round_number} cites a fresh-context audit: 'Audit-evidence: <path> <verdict>'"
         )
-    if premise_owed:
-        checks = [ln for ln in sections.get("Premise-check", []) if _PREMISE_LINE_RE.match(ln)]
-        if len(checks) < 2:
-            result.problems.append(
-                f"round {round_number} carries an independent premise check: a "
-                "'## Premise-check' section with at least two "
-                "'P<n> ... TRUE|FALSE|UNPROVEN' lines"
-            )
+    if premise_owed and result.premise_checks < 2:
+        result.problems.append(
+            f"round {round_number} carries an independent premise check: at least two "
+            "'Premise-check: P<n> TRUE|FALSE|UNPROVEN <text>' lines"
+        )
     recurring = sorted(set(result.classes) & {_normalize(c) for c in previous_classes})
     if recurring and result.decision == "fix-instances":
         result.problems.append(
-            "a class recurs from the previous round's reflection ("
+            "a class recurs from an earlier round ("
             + ", ".join(recurring)
             + "): the decision is close-class, rework or send-back, never fix-instances"
         )
     return result
 
 
-def _answer_to(lines: Sequence[str], prompt: str) -> str:
-    for index, line in enumerate(lines):
-        at = line.find(prompt)
-        if at < 0:
-            continue
-        rest = line[at + len(prompt) :].strip()
-        if rest:
-            return rest
-        following = next((n.strip() for n in lines[index + 1 :] if n.strip()), "")
-        return "" if following.startswith("#") else following
-    return ""
-
-
 # -- git and the network -----------------------------------------------------
+
+#: ``git replace`` could swap a fix commit for an empty one in every read.
+_GIT_ENV = {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}
 
 
 def _run(argv: Sequence[str], cwd: str | None = None) -> tuple[int, str, str]:
+    """Run a command. Output is decoded with replacement, so a commit message
+    in a legacy encoding is read (and then refused by the grammar), never a
+    crash."""
     try:
         done = subprocess.run(
-            list(argv), cwd=cwd, capture_output=True, text=True, timeout=120, check=False
+            list(argv),
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
+            env=_GIT_ENV,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 1, "", str(exc)
@@ -369,38 +345,105 @@ def _pr_meta(repo: str, number: int) -> dict[str, Any]:
     return meta
 
 
+#: What ``parse_acceptance`` says when the PR simply declares no acceptance
+#: list. Any OTHER problem without bullets means the body could not be read
+#: reliably, which must refuse, never silently disable the scope rule.
+_ACCEPTANCE_ABSENT = ("empty PR body", "no ## Acceptance section")
+
+
+def acceptance_points(body: str) -> list[str] | None:
+    """The PR's acceptance bullets, None when it declares none. Raises
+    ``Refused`` when a declaration exists but cannot be read."""
+    import acceptance_declaration  # noqa: PLC0415
+
+    parsed = acceptance_declaration.parse_acceptance(body)
+    if parsed.get("present"):
+        return list(parsed["bullets"])
+    problems = list(parsed.get("problems", []))
+    if not any(p in _ACCEPTANCE_ABSENT for p in problems):
+        # Not "declares none": unreadable, too large, ambiguous, or a section
+        # with no bullets. Refuse rather than silently drop the scope rule.
+        raise Refused(
+            "the PR's acceptance list cannot be read reliably ("
+            + "; ".join(parsed.get("problems", []))
+            + "): fix the PR body so the scope rule can be checked"
+        )
+    return None
+
+
 # -- what is covered and what is owed ----------------------------------------
 
 
-def _log_reflections(cwd: str, *, exclude: str | None = None) -> list[tuple[str, str, str]]:
+def _commit_objects(cwd: str, shas: Sequence[str]) -> dict[str, bytes]:
+    """The raw commit objects, read by size through ``cat-file --batch``. No
+    delimiter is involved, so no byte a message may hold can end a record
+    early or forge the next one."""
+    try:
+        done = subprocess.run(
+            ["git", "-C", cwd, "cat-file", "--batch"],
+            input=("\n".join(shas) + "\n").encode(),
+            capture_output=True,
+            timeout=120,
+            check=False,
+            env=_GIT_ENV,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Refused(f"git cat-file failed: {exc}") from exc
+    if done.returncode != 0:
+        raise Refused(f"git cat-file failed: {done.stderr.decode(errors='replace')[:300]}")
+    out, at, objects = done.stdout, 0, {}
+    for sha in shas:
+        line_end = out.find(b"\n", at)
+        header = out[at:line_end].decode(errors="replace").split()
+        if line_end < 0 or len(header) != 3 or header[0] != sha or header[1] != "commit":
+            raise Refused(f"git cat-file returned an unexpected record for {sha[:12]}")
+        size = int(header[2])
+        objects[sha] = out[line_end + 1 : line_end + 1 + size]
+        at = line_end + 1 + size + 1
+    return objects
+
+
+def _log_reflections(cwd: str) -> list[tuple[str, str, str]]:
     """``(sha, "empty"|"content", body)`` for each recent commit whose message
-    starts with the header, newest first. ``exclude`` limits the read to commits
-    not reachable from that ref (this branch's own commits)."""
-    args = ["log", f"-n{LOG_DEPTH}", "--format=%H%x00%T%x00%P%x00%B%x01", "HEAD"]
-    if exclude:
-        args += ["--not", exclude]
-    raw = _git(cwd, *args)
+    starts with the header, newest first. A message in a legacy encoding is
+    decoded with replacement, so the grammar refuses it rather than crashing."""
+    shas = _git(cwd, "log", f"-n{LOG_DEPTH}", "--format=%H", "HEAD").split()
     found = []
-    for record in raw.split("\x01"):
-        parts = record.lstrip("\n").split("\x00", 3)
-        if len(parts) != 4 or not parts[3].startswith("Round-reflection:"):
+    for sha, raw in _commit_objects(cwd, shas).items():
+        headers, _, message = raw.partition(b"\n\n")
+        body = message.decode("utf-8", errors="replace")
+        if not body.startswith("Round-reflection:"):
             continue
-        sha, tree, parents, body = parts
-        parent = parents.split()[0] if parents.split() else ""
-        empty = bool(parent) and tree == _git(cwd, "rev-parse", f"{parent}^{{tree}}").strip()
+        tree, parents = "", []
+        for line in headers.split(b"\n"):
+            if line.startswith(b"tree "):
+                tree = line[5:].decode()
+            elif line.startswith(b"parent "):
+                parents.append(line[7:].decode())
+            else:
+                break  # tree and parents come first in every commit object
+        empty = (
+            len(parents) == 1 and tree == _git(cwd, "rev-parse", f"{parents[0]}^{{tree}}").strip()
+        )
         found.append((sha, "empty" if empty else "content", body))
     return found
 
 
-def previous_class_labels(cwd: str, head: str, *, base_ref: str) -> list[str]:
-    """Class labels of the newest committed reflection on an EARLIER head of
-    THIS branch: the previous round, never an earlier reflection of this one and
-    never a reflection a stacked base branch carries. Drafts never count."""
-    for _, kind, body in _log_reflections(cwd, exclude=base_ref):
+def previous_class_labels(cwd: str, prior_heads: Sequence[str]) -> list[str]:
+    """Class labels of every earlier round of this PR: the classes of every
+    valid empty reflection naming one of ``prior_heads`` (the round heads
+    ``review_budget`` reports before the current one). A reflection naming any
+    other head is ignored, so a stray or mistyped one cannot stand in for the
+    previous round. Drafts never count."""
+    wanted = set(prior_heads)
+    classes: list[str] = []
+    if not wanted:
+        return classes
+    for _, kind, body in _log_reflections(cwd):
         parsed = parse(body)
-        if kind == "empty" and parsed.ok and parsed.head and parsed.head != head:
-            return parsed.classes
-    return []
+        if kind == "empty" and parsed.ok and parsed.head in wanted:
+            classes.extend(c for c in parsed.classes if c not in classes)
+    return classes
 
 
 def _parse_when(raw: object) -> datetime | None:
@@ -415,25 +458,29 @@ def _parse_when(raw: object) -> datetime | None:
     return when if when.tzinfo else None
 
 
-def audit_problem(path: str, round_started: object = None) -> str | None:
+def audit_problem(path: str, round_started: object) -> str | None:
     """Why a cited audit does not count, or None. Local only: the file must
-    exist, pass the review gate's own adversarial-evidence check, and, when the
-    round's start is known, not predate it (a file written for an earlier round
-    does not count; touching a file also moves its time, so this is a floor,
-    not proof of freshness)."""
+    exist, decode, pass the review gate's own adversarial-evidence check, and
+    not predate the round's start. An unknown or unreadable round start is a
+    refusal, never a skipped check (touching a file also moves its time, so
+    this is a floor, not proof of freshness)."""
     import review_state  # noqa: PLC0415
 
     evidence = Path(os.path.expanduser(path))
     try:
-        text = evidence.read_text(encoding="utf-8")
+        text = evidence.read_bytes().decode("utf-8")
         mtime = datetime.fromtimestamp(evidence.stat().st_mtime, UTC)
     except OSError as exc:
         return f"Audit-evidence is unreadable ({exc.strerror})"
+    except UnicodeDecodeError:
+        return "Audit-evidence is not valid UTF-8"
     ok, why = review_state._evidence_is_adversarial(text)
     if not ok:
         return f"Audit-evidence is not an adversarial audit: {why}"
     started = _parse_when(round_started)
-    if started is not None and mtime < started:
+    if started is None:
+        return "the round's start time is unknown, so the audit's freshness cannot be checked"
+    if mtime < started:
         return "Audit-evidence predates this round's first review"
     return None
 
@@ -444,9 +491,9 @@ def check(
     head: str,
     round_number: int,
     gate_lane: bool,
-    previous_classes: Iterable[str] = (),
-    acceptance: Sequence[str] | None = None,
-    round_started: object = None,
+    previous_classes: Iterable[str],
+    acceptance: Sequence[str] | None,
+    round_started: object,
 ) -> Reflection:
     """Every local rule a reflection must meet for this round, in one place."""
     parsed = parse(
@@ -472,16 +519,22 @@ def check(
 def before_any_fix(cwd: str, head: str, sha: str) -> bool:
     """Whether reflection ``sha`` was made before any fix to round ``head``.
 
-    It must descend from the head, and its tree must still be the head's tree:
-    nothing but empty commits sits between them. A reflection made after a fix
-    landed is a rationalisation, not a reflection, and covers nothing. A second
-    reflection for the same round (a late review) still qualifies.
+    Every commit from the head to the reflection must have exactly one parent
+    and that parent's tree: a fix that was later reverted, or a merge, between
+    them disqualifies it. A reflection made after a fix is a rationalisation,
+    not a reflection. A second reflection for the same round still qualifies.
     """
     code, _, _ = _run(["git", "-C", cwd, "merge-base", "--is-ancestor", head, sha])
     if code != 0:
         return False
-    trees = _git(cwd, "rev-parse", f"{head}^{{tree}}", f"{sha}^{{tree}}").split()
-    return len(trees) == 2 and trees[0] == trees[1]
+    rows = _git(cwd, "log", "--format=%T %P", f"{head}..{sha}").split("\n")
+    for row in (r for r in rows if r.strip()):
+        tree, *parents = row.split()
+        if len(parents) != 1:
+            return False
+        if tree != _git(cwd, "rev-parse", f"{parents[0]}^{{tree}}").strip():
+            return False
+    return True
 
 
 def covered_keys(
@@ -490,21 +543,24 @@ def covered_keys(
     *,
     round_number: int,
     gate_lane: bool,
-    base_ref: str,
-    acceptance: Sequence[str] | None = None,
-    round_started: object = None,
+    prior_heads: Sequence[str],
+    acceptance: Sequence[str] | None,
+    round_started: object,
 ) -> set[str]:
     """Keys answered at ``head`` by committed reflections. THE coverage check.
 
     A reflection counts only when it is an EMPTY commit naming this exact head,
-    made before any fix to it (``before_any_fix``), and ``check`` passes it: the round's structure and obligations, the
-    recurring-class rule against this branch's previous round, a readable
-    adversarial audit where one is cited, no escalation, and the acceptance
-    points when the caller has them. A reflection committed by hand is held to
-    exactly this; there is no weaker path. Raises ``Refused`` when git cannot
-    be read: a caller must treat that as unknown, never as nothing owed.
+    made before any fix to it (``before_any_fix``), and ``check`` passes it:
+    the grammar, the round's obligations, the recurring-class rule against
+    every earlier round head (``prior_heads``), a readable adversarial audit
+    no older than ``round_started`` where one is cited, no escalation, and the
+    acceptance points (None only when the PR declares none). Every argument is
+    required, so no caller gets a weaker check by leaving one out. A
+    reflection committed by hand is held to exactly this; there is no weaker
+    path. Raises ``Refused`` when git cannot be read: a caller must treat that
+    as unknown, never as nothing owed.
     """
-    previous = previous_class_labels(cwd, head, base_ref=base_ref)
+    previous = previous_class_labels(cwd, prior_heads)
     covered: set[str] = set()
     for sha, kind, body in _log_reflections(cwd):
         if kind != "empty" or not before_any_fix(cwd, head, sha):
@@ -570,7 +626,6 @@ def owed_state(
 
 
 def status(cwd: str, *, now: datetime | None = None) -> dict[str, Any]:
-    import acceptance_declaration  # noqa: PLC0415
     import review_budget  # noqa: PLC0415
 
     repo, number = pr_identity(cwd)
@@ -578,14 +633,13 @@ def status(cwd: str, *, now: datetime | None = None) -> dict[str, Any]:
     state = owed_state(budget, (), now=now or datetime.now(UTC))
     if state["status"] == "ok" and state["round_state"] == "open":
         meta = _pr_meta(repo, number)
-        declared = acceptance_declaration.parse_acceptance(meta.get("body") or "")
         covered = covered_keys(
             cwd,
             str(state["head"]),
             round_number=int(state["round"] or 0),
             gate_lane=state["gate_lane"],
-            base_ref=f"origin/{meta.get('baseRefName') or 'main'}",
-            acceptance=list(declared["bullets"]) if declared.get("present") else None,
+            prior_heads=[str(r.get("head")) for r in (budget.get("rounds") or [])[:-1]],
+            acceptance=acceptance_points(meta.get("body") or ""),
             round_started=state["round_started"],
         )
         if state["reflection_keys"] == "ok":
@@ -601,7 +655,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status", help="what the open round owes")
-    validate = sub.add_parser("validate", help="structure-check a file, offline")
+    validate = sub.add_parser("validate", help="check a file against the grammar, offline")
     validate.add_argument("file", type=Path)
     validate.add_argument("--round", type=int, default=None)
     validate.add_argument("--gate", action="store_true", help="the gate lane's obligations")
@@ -610,16 +664,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "status":
             print(json.dumps(status(os.getcwd()), indent=2))
             return 0
-        parsed = parse(
-            args.file.read_text(encoding="utf-8"), round_number=args.round, gate_lane=args.gate
-        )
+        text = args.file.read_bytes().decode("utf-8")
+        parsed = parse(text, round_number=args.round, gate_lane=args.gate)
         for problem in parsed.problems:
             print(f"- {problem}")
         return 0 if parsed.ok else 1
-    except (Refused, OSError, ImportError) as exc:
+    except Exception as exc:  # noqa: BLE001
         # Exit 1 means "the reflection is invalid"; anything that stopped the
         # check from being made is 2, never mistaken for a verdict.
-        print(f"review_reflection: {exc}", file=sys.stderr)
+        print(f"review_reflection: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 
 
