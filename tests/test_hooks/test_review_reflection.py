@@ -1018,6 +1018,31 @@ def test_an_escalating_earlier_answer_answers_nothing(repo, tmp_path):
     assert _covered(path, later, late_since={"c9": fix}) == set()
 
 
+def test_an_ungrammatical_earlier_answer_answers_nothing(repo, tmp_path):
+    path, _ = repo
+    _fix(path, "fix one\n")
+    fix = _git(path, "rev-parse", "HEAD").strip()
+    bad = _reflection(keys=("c9",), head=fix, decision="whatever")
+    assert not rr.parse(bad).ok and rr.parse(bad).keys == ["c9"]
+    _commit_reflection(path, tmp_path, bad)
+    _fix(path, "fix two\n")
+    later = _git(path, "rev-parse", "HEAD").strip()
+    assert _covered(path, later, late_since={"c9": fix}) == set()
+
+
+def test_an_earlier_answer_made_after_a_fix_answers_nothing(repo, tmp_path):
+    """The reflection must come before any fix to the head it names, so a
+    late answer written after the next fix does not count."""
+    path, _ = repo
+    _fix(path, "fix one\n")
+    fix = _git(path, "rev-parse", "HEAD").strip()
+    _fix(path, "fix two\n")
+    _commit_reflection(path, tmp_path, _reflection(keys=("c9",), head=fix))
+    _fix(path, "fix three\n")
+    later = _git(path, "rev-parse", "HEAD").strip()
+    assert _covered(path, later, late_since={"c9": fix}) == set()
+
+
 def test_an_open_round_with_unknown_keys_still_reports_its_timing():
     """GLM secondary P3: owed stays unknown, but the settle window is still
     reported, so a reader can tell when the round settles."""
