@@ -1600,6 +1600,37 @@ profiles:
     last_reviewed: "2026-09-21"
     review_source: manual
 
+  # The same model on DeepSeek's own API, priced at DeepSeek's rate (pricing
+  # page, 2026-10-07: $0.30 in / $1.20 out per MTok, half that off-peak). Kept
+  # separate from deepseek-v4.1-flash, whose cost is OpenRouter's, so a cost
+  # fallback never under-records the direct route.
+  deepseek-flash-direct:
+    display_name: "DeepSeek V4.1 Flash (DeepSeek API)"
+    provider: deepseek
+    api_id: "deepseek/deepseek-flash"
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: B
+    anti_sycophancy: B
+    context_window: 1048576
+    cost_tier: cheap
+    cost_per_mtok_in: 0.30
+    cost_per_mtok_out: 1.20
+    latency: low
+    strengths:
+      - same model as deepseek-v4.1-flash, served by its vendor
+      - long context at 1M tokens
+      - high-volume classification and extraction
+    weaknesses:
+      - complex multi-step reasoning
+      - creative writing
+    best_for: [observation_sweep, procedure_extraction, task_retrospective, desk_fast]
+    avoid_for: [strategic_reflection, quality_calibration, foreground_conversation]
+    free_tier:
+      available: false
+    last_reviewed: "2026-10-07"
+    review_source: manual
+
   kimi-k3:
     display_name: "Kimi K3"
     provider: moonshot

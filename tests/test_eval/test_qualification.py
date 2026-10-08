@@ -2,6 +2,11 @@
 
 import inspect
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -190,3 +195,139 @@ def test_private_production_signatures_this_tool_depends_on():
     )
     # candidate_mapping parses the rendered candidate list; pin its line shape.
     assert "  [{i}] task_type: {" in inspect.getsource(extractor._cross_type_duplicate)
+
+
+@pytest.mark.parametrize("value", ["0.7", -1, 2, True, False, None, [], {}, 10**400])
+async def test_relevance_rejects_coercible_or_out_of_domain_raw_values(value):
+    result = await contracts.relevance(
+        relevance_case("invalid-domain", True), Stub(json.dumps({"relevance": value}))
+    )
+    assert result["prediction"] is None and result["error"]
+
+
+@pytest.mark.parametrize("adapter", ["relevance", "novelty"])
+async def test_adapters_accept_reused_production_router(tmp_path, adapter):
+    from genesis.routing.router import Router
+    from genesis.routing.types import RoutingResult
+
+    router = Router.__new__(Router)
+    content = '{"relevance": 0.7}' if adapter == "relevance" else '{"redundant_with": 1}'
+    router._route_call_inner = AsyncMock(
+        return_value=RoutingResult(success=True, content=content, call_site_id="judge")
+    )
+    assert not hasattr(router, "calls")
+    async with contracts.Sandbox(tmp_path) as sandbox:
+        for index in range(2):
+            if adapter == "relevance":
+                result = await contracts.relevance(relevance_case(str(index), True), router)
+                assert result == {"prediction": True, "error": None}
+            else:
+                result = await contracts.novelty(
+                    novelty_case(str(index), "candidate-b"), router, sandbox
+                )
+                assert result == {"prediction": "candidate-b", "error": None}
+    assert router._route_call_inner.await_count == 2
+
+
+async def test_novelty_recording_router_can_be_reused(tmp_path):
+    router = Stub('{"redundant_with": 1}')
+    async with contracts.Sandbox(tmp_path) as sandbox:
+        for index in range(2):
+            result = await contracts.novelty(
+                novelty_case(str(index), "candidate-b"), router, sandbox
+            )
+            assert result == {"prediction": "candidate-b", "error": None}
+    assert len(router.calls) == 2
+
+
+@pytest.mark.parametrize("position", ["new", "first", "second"])
+@pytest.mark.parametrize("vector", [[1e-46], [-1e-46, 1e-46]])
+def test_corpus_rejects_embeddings_that_pack_to_zero(position, vector):
+    case = novelty_case("underflow", None)
+    row = case["new"] if position == "new" else case["existing"][position == "second"]
+    row["embedding"] = vector
+    with pytest.raises(Incomplete, match="embedding"):
+        corpus.validate_novelty(case)
+
+
+@pytest.mark.parametrize("vector", [[1e-45], [1e-46, 1], [3.4028234663852886e38]])
+def test_corpus_accepts_nonzero_float32_boundary_vectors(vector):
+    case = novelty_case("float32-boundary", None)
+    case["new"]["embedding"] = vector
+    corpus.validate_novelty(case)
+
+
+def test_invalid_utf8_corpus_is_incomplete_with_filename(tmp_path):
+    path = tmp_path / f"{corpus.RELEVANCE}.jsonl"
+    path.write_bytes(b"\xff\n")
+    with pytest.raises(Incomplete, match=f"{corpus.RELEVANCE}.jsonl: invalid UTF-8"):
+        corpus.load(tmp_path)
+
+
+def test_utf8_corpus_loads_under_ascii_locale(tmp_path):
+    case = relevance_case("utf8", True)
+    case["query"] = "caf\u00e9\u0085\u2028\u2029 second part"
+    (tmp_path / f"{corpus.RELEVANCE}.jsonl").write_text(
+        json.dumps(case, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    program = """
+import json, locale, sys
+from pathlib import Path
+from genesis.eval.qualification import corpus
+assert locale.getencoding() in ('ANSI_X3.4-1968', 'ASCII', 'US-ASCII'), locale.getencoding()
+print(json.dumps(corpus.load(Path(sys.argv[1]))['j9_relevance'][0]['query']))
+"""
+    environment = dict(
+        os.environ,
+        LC_ALL="C",
+        PYTHONUTF8="0",
+        PYTHONCOERCECLOCALE="0",
+        LITELLM_LOCAL_MODEL_COST_MAP="True",
+    )
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2] / "src")
+    child = subprocess.run(
+        [sys.executable, "-c", program, str(tmp_path)],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert json.loads(child.stdout) == case["query"]
+
+
+async def test_novelty_preserves_production_circuit_gating_and_clears_stale_mapping(tmp_path):
+    router = Stub('{"redundant_with": null}')
+    router.candidate_ids = ["previous-case"]
+    router.breakers = SimpleNamespace(chain_has_available=lambda chain: False)
+    router.config = SimpleNamespace(
+        call_sites={extractor._NOVELTY_CALL_SITE: SimpleNamespace(chain=["synthetic"])}
+    )
+    async with contracts.Sandbox(tmp_path) as sandbox:
+        with pytest.raises(Incomplete, match="exactly one"):
+            await contracts.novelty(novelty_case("circuit", None), router, sandbox)
+    assert not router.calls and router.candidate_ids == []
+
+
+async def test_failed_novelty_response_is_not_a_valid_null(tmp_path):
+    from genesis.routing.types import RoutingResult
+
+    router = Stub('{"redundant_with": null}')
+    router.route_call = AsyncMock(
+        return_value=RoutingResult(
+            success=False, content=router.content, call_site_id="novelty", error="synthetic failure"
+        )
+    )
+    async with contracts.Sandbox(tmp_path) as sandbox:
+        result = await contracts.novelty(novelty_case("failed", None), router, sandbox)
+    assert result["prediction"] is None and result["error"]
+    assert router.candidate_ids == []
+
+
+async def test_swallowed_novelty_transport_exception_remains_incomplete(tmp_path):
+    router = Stub('{"redundant_with": null}')
+    router.route_call = AsyncMock(side_effect=RuntimeError("synthetic transport failure"))
+    async with contracts.Sandbox(tmp_path) as sandbox:
+        with pytest.raises(Incomplete, match="exactly one"):
+            await contracts.novelty(novelty_case("exception", None), router, sandbox)
+    assert router.candidate_ids == []

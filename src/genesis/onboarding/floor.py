@@ -71,7 +71,7 @@ _LLM_KEY_NAMES_FALLBACK: tuple[str, ...] = (
     "API_KEY_MISTRAL",
     "GOOGLE_API_KEY",
     "API_KEY_ZENMUX",
-    "API_KEY_NVIDIA_NIM",
+    "API_KEY_DEEPSEEK",
 )
 
 # Cloud EMBEDDING backends actually consumed by ``providers/embedding.py`` (deepinfra

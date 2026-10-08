@@ -16,13 +16,18 @@ move the checkout), and passes in the one definition of the dirty-tree excuse
 list.
 
 Commands:
-  add <branch> --owner <who> [--pr N]
+  add <branch> --owner <who> [--pr N] [--approve-hooks <who>]
         Put a local branch in the manifest, pinned at its current head: `live`
         runs THAT commit, never a later one, until the branch is added again.
         There is no approval step (owner ruling, 2026-10-01: running an
-        unmerged branch on this install's own server needs none). Refuses
-        unless the install is READY and every per-candidate check passes
-        (below). Prints the next step; it does not rebuild.
+        unmerged branch on this install's own server needs none), except for
+        hooks: a branch that changes a git or Claude Code hook goes live only
+        with --approve-hooks, naming who approved it in chat (owner ruling,
+        #2978). The approval binds to the pinned head; adding the branch again
+        without the flag clears it. It RECORDS a claim, it does not verify one:
+        any caller can pass the flag, so pass it only after the owner said yes. Refuses unless the install is READY and
+        every per-candidate check passes (below). Prints the next step; it
+        does not rebuild.
   drop <branch> [--no-rebuild]
         Take a candidate out of the manifest. On `live` it then removes the
         candidate from `live`: SUBTRACT-ONLY and OFFLINE, on the base `live` is
@@ -72,10 +77,15 @@ install refuses and the engine ships INERT.
 
 ADMISSION (v1): a candidate whose diff against its merge base with origin/main
 changes a migration or the boot-time schema, the host guardian's own files,
-the Claude Code pin, what drives the host on a timer, a git or Claude Code hook,
-the scripts that keep the wipers off `live` (and what they source first), or this
-engine, never goes live before it merges; nor does a branch that carries a
-`Deploy-rebuild:` commit (it was cut from `live`).
+the Claude Code pin, what drives the host on a timer, a git or Claude Code hook
+(unless that head's hooks were approved: --approve-hooks), the scripts that keep
+the wipers off `live` (and what they source first), or this engine, never goes
+live before it merges; nor does a branch that carries a `Deploy-rebuild:` commit
+(it was cut from `live`). A rebuild also refuses, by path, when a hook on the
+merged tip is byte-identical to no approved candidate's version (two approved
+candidates whose changes to one hook git merged into bytes neither was approved
+for). After a move, a git hook still installed as the old checkout held it is
+replaced before sync-hooks.sh runs, so a candidate's hook leaves with it.
 
 WHAT THIS DEFENDS AGAINST (and what it does not): the job is to run unmerged
 code on THIS install's own server before its PR merges, and to keep that from
@@ -292,6 +302,33 @@ class Engine(Repo):
         result += [(b, h) for b, h in merged if b not in listed]
         return live_base, result
 
+    def _attributed_plan(
+        self,
+        base: str,
+        cands: list[tuple[str, str]],
+        rebuild_id: str,
+        sticky: dict[str, str],
+        data: dict,
+    ) -> core.Plan:
+        """build_plan, then hook ownership: a candidate that changes a hook path
+        another merged candidate also changes, or that lacks a current approval,
+        or whose hook origin/main has changed since it was cut, is EXCLUDED by
+        name (like a conflict) and the plan is built again. Each pass excludes at
+        least one more merged candidate, so it ends. rebuild, drop and status all
+        plan through here, so status never predicts what a rebuild would not do,
+        and a drop never leaves a hook whose approval it just removed."""
+        approval = {c["branch"]: c for c in data["candidates"] if gate.hooks_approved(c)}
+        sticky = dict(sticky)
+        while True:
+            p = plan.build_plan(self, base, cands, rebuild_id, sticky=sticky)
+            approved = {
+                b for b, h in p.merged if b in approval and approval[b]["verified_head"] == h
+            }
+            unowned = gate.hook_ownership_failures(self, base, p.tip, dict(p.merged), approved)
+            if not unowned:
+                return p
+            sticky.update(unowned)
+
     def _refuse_blockers(self, tip: str, what: str) -> None:
         blockers = plan.move_blockers(self, tip)
         if blockers:
@@ -323,13 +360,17 @@ class Engine(Repo):
             return 0
         for i, c in enumerate(data["candidates"], 1):
             pr = f"PR #{c['pr']}" if c["pr"] is not None else "no PR"
+            ha = c["hook_approval"]
+            hooks = f"  hooks approved by {ha['approved_by']} ({ha['approved_at']})" if ha else ""
             out(
                 f"{i}. {c['branch']}  {pr}  owner {c['owner_session']}  added {c['added_at']}  "
-                f"pinned at {c['verified_head'][:12]}"
+                f"pinned at {c['verified_head'][:12]}{hooks}"
             )
         return 0
 
-    def cmd_add(self, branch: str, owner: str, pr: int | None) -> int:
+    def cmd_add(
+        self, branch: str, owner: str, pr: int | None, approve_hooks: str | None = None
+    ) -> int:
         self.require_update_lock()
         if not core.valid_candidate_name(branch):
             raise Refusal(
@@ -340,6 +381,12 @@ class Engine(Repo):
             raise Refusal("--owner is empty: name the session or person who owns this candidate.")
         if pr is not None and pr <= 0:
             raise Refusal(f"--pr {pr} is not a PR number.")
+        if approve_hooks is not None:
+            approve_hooks = approve_hooks.strip()
+            if not approve_hooks:
+                raise Refusal(
+                    "--approve-hooks is empty: name who approved this head's hook changes."
+                )
         self.store.load()  # a malformed or foreign manifest refuses before anything else
         base = self.resolve(BASE_REF)
         if not base:
@@ -354,12 +401,23 @@ class Engine(Repo):
         if not head:
             raise Refusal(f"there is no local branch {branch}.")
         stamp = core.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        approval = None
+        if approve_hooks is not None:
+            if not any(p.startswith(gate.HOOK_DIRS) for p in gate.changed_paths(self, base, head)):
+                raise Refusal(
+                    f"{branch} changes no git or Claude Code hook at {head[:12]}: there is nothing "
+                    "for --approve-hooks to approve. Add it without the flag."
+                )
+            approval = {"head": head, "approved_by": approve_hooks, "approved_at": stamp}
+        # A re-add replaces the entry whole (added_at aside): without the flag
+        # it carries no approval, so an approval never outlives the head it named.
         cand = {
             "branch": branch,
             "pr": pr,
             "owner_session": owner,
             "added_at": stamp,
             "verified_head": head,
+            "hook_approval": approval,
         }
         why = gate.gate_failure(self, base, cand)
         if why:
@@ -411,6 +469,8 @@ class Engine(Repo):
 
         self.store.update(change)
         out(f"{branch} {result['kind']} at {head[:12]} ({self.store.path}).")
+        if approval:
+            out(f"  Its hook changes run on `live`, approved by {approve_hooks}.")
         out("Next: scripts/deploy_candidates rebuild")
         return 0
 
@@ -469,7 +529,10 @@ class Engine(Repo):
             ).get(branch, []):
                 sticky[b] = f"shares dropped {branch}'s unmerged commits; drop it too"
         rebuild_id = core.now().strftime("%Y%m%dT%H%M%SZ")
-        p = plan.build_plan(self, live_base, remaining, rebuild_id, sticky=sticky)
+        # Planned like a rebuild: every hook the remaining candidates change
+        # needs its one approved owner among them (the dropped one's approval is gone).
+        kept = {**data, "candidates": [c for c in data["candidates"] if c["branch"] != branch]}
+        p = self._attributed_plan(live_base, remaining, rebuild_id, sticky, kept)
         out(
             f"deploy_candidates drop {branch} (on the base `live` is on, {live_base[:12]}; nothing fetched)"
         )
@@ -477,15 +540,27 @@ class Engine(Repo):
         self._refuse_blockers(p.tip, "the manifest still lists " + branch)
         after = self.store.update(remove)
         out(f"  {branch} dropped from {self.store.path}.")
+        before = self.resolve("HEAD")
         try:
-            plan.move_checkout(self, p, LIVE_BRANCH)
+            moved = plan.move_checkout(self, p, LIVE_BRANCH)
         except Refusal as exc:
             raise Refusal(
                 f"{exc}\nThe manifest change WAS saved ({branch} is no longer a candidate), but `live` still "
                 "runs it: fix the above, then run scripts/deploy_candidates rebuild."
             ) from exc
+        state = f"{branch} WAS dropped from the manifest and from `live`"
+        if moved.files:
+            # A dropped candidate's approved git hook is still installed; put
+            # back what `live` now holds (drop is the repair path for a hook
+            # that blocks every session).
+            core.after_move(
+                state,
+                "restoring moved git hooks",
+                lambda: plan.restore_moved_hooks(self, before, moved.at),
+            )
+            core.after_move(state, "syncing the git hooks", lambda: plan.sync_git_hooks(self))
         core.after_move(
-            f"{branch} WAS dropped from the manifest and from `live`",
+            state,
             "checking which candidates share its commits",
             lambda: self._warn_shared(branch, data, after),
         )
@@ -562,12 +637,18 @@ class Engine(Repo):
         cands = [
             (c["branch"], c["verified_head"]) for c in data["candidates"] if c["branch"] not in gone
         ]
-        p = plan.build_plan(self, base, cands, rebuild_id, sticky=sticky)
+        p = self._attributed_plan(base, cands, rebuild_id, sticky, data)
         self._print_plan(p, sorted(gone))
         self._refuse_blockers(p.tip, "nothing was retired")
+        before = self.resolve("HEAD")
         moved = plan.move_checkout(self, p, branch)
         state = f"`live` is at {moved.at[:12]}"
         if moved.files:
+            core.after_move(
+                state,
+                "restoring moved git hooks",
+                lambda: plan.restore_moved_hooks(self, before, moved.at),
+            )
             core.after_move(state, "syncing the git hooks", lambda: plan.sync_git_hooks(self))
         # Past the commit point (`live` has moved): every step below is a
         # WARNING on failure, never a refusal claiming nothing changed.
@@ -783,7 +864,7 @@ class Engine(Repo):
             if c["branch"] not in verdict
         ]
         try:
-            p = plan.build_plan(self, base, cands, "status-dry-run", sticky=sticky)
+            p = self._attributed_plan(base, cands, "status-dry-run", sticky, data)
             blockers = plan.move_blockers(self, p.tip)
         except Refusal as exc:
             p = core.Plan(base=base, tip=base)
@@ -798,6 +879,9 @@ class Engine(Repo):
             out(
                 f"{b}  {'PR #' + str(c['pr']) if c['pr'] is not None else 'no PR'}  owner {c['owner_session']}"
             )
+            if c["hook_approval"]:
+                ha = c["hook_approval"]
+                out(f"    hooks approved by {ha['approved_by']} at {ha['approved_at']}")
             out(f"    live at {live_merged[b][:12]}" if b in live_merged else "    not in `live`")
             if b in verdict:
                 out(f"    next rebuild: {verdict[b]}")
@@ -843,6 +927,9 @@ def _parser() -> argparse.ArgumentParser:
     a.add_argument("branch")
     a.add_argument("--owner", required=True)
     a.add_argument("--pr", type=int)
+    # The ONE approval: the owner said yes, in chat, to running this head's hook
+    # changes early. The value records who said it.
+    a.add_argument("--approve-hooks", metavar="WHO")
     d = sub.add_parser("drop")
     d.add_argument("branch")
     d.add_argument("--no-rebuild", action="store_true")
@@ -884,7 +971,7 @@ def main(
         if args.cmd == "status":
             return engine.cmd_status()
         if args.cmd == "add":
-            return engine.cmd_add(args.branch, args.owner, args.pr)
+            return engine.cmd_add(args.branch, args.owner, args.pr, args.approve_hooks)
         if args.cmd == "drop":
             return engine.cmd_drop(args.branch, args.no_rebuild)
         if args.cmd == "rebuild":
