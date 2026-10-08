@@ -29,11 +29,18 @@ hole; a closed grammar has none of those to handle::
     Disposition: c102 file issue=#123
     Escalate: no
 
-Rounds that owe more add ``Audit-evidence: <path> <verdict>`` and
-``Premise-check: P1 TRUE <text>`` lines (see ``obligations``). A cited audit
-must have been written after the round started and before the reflection was
-committed. Each of the PR's acceptance points must appear within one Scope
-line that starts ``covered:``.
+Rounds that owe more add ``Audit-evidence: <path> <verdict>``, or two
+``Premise-check: P1 TRUE <text>`` lines plus ``Premise-evidence: <path>
+<verdict>`` (see ``obligations``). Each cited file must be a regular file of at
+most 1 MiB, written after the round started and before the reflection was
+committed; a relative path is read from the repository the check runs in.
+Cite a copy that nothing else rewrites (``<pr>-round<N>-<kind>.txt``), never
+the review gate's per-worktree evidence file, which the next review replaces.
+A premise-evidence file must carry the ``Design-premise:`` block of
+``.claude/docs/premise-check.md``: the verdict line and at least two ``P<n>``
+claim lines. Each of the PR's acceptance points must appear within one Scope
+line that starts ``covered:``; that is a substring floor for an honest
+session, not proof that the line covers the point.
 
 ``covered_keys`` is THE coverage check: the commit gate (a later change) calls
 it, and it applies every local rule, so a reflection committed by hand is held
@@ -50,6 +57,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import unicodedata
@@ -96,6 +104,11 @@ FIELDS: dict[str, tuple[re.Pattern[str], int, int | None]] = {
         None,
     ),
     "Audit-evidence": (re.compile(r"^Audit-evidence: ([!-~]{1,300})(?: ([ -~]{1,300}))?$"), 0, 1),
+    "Premise-evidence": (
+        re.compile(r"^Premise-evidence: ([!-~]{1,300})(?: ([ -~]{1,300}))?$"),
+        0,
+        1,
+    ),
     "Premise-check": (
         re.compile(rf"^Premise-check: P([1-9][0-9]?) (TRUE|FALSE|UNPROVEN) ({_TEXT})$"),
         0,
@@ -129,6 +142,7 @@ class Reflection:
     decision: str | None = None
     escalate: bool = False
     audit_evidence: str | None = None
+    premise_evidence: str | None = None
     scopes: list[str] = field(default_factory=list)
     premise_checks: int = 0
     problems: list[str] = field(default_factory=list)
@@ -141,14 +155,16 @@ class Reflection:
 def obligations(round_number: int, gate_lane: bool) -> tuple[bool, bool]:
     """``(audit, premise)`` owed by the reflection of this round.
 
-    The review ladder (owner rulings 2026-09-30): the gate lane runs a class
-    audit at round 1 and the premise check at round 2, its terminal round; the
-    ordinary lane audits at round 2 and checks the premise from round 3. The
+    The review ladder: the gate lane runs a class audit at round 1 and the
+    premise check at round 2, its terminal round (owner rulings 2026-09-30).
+    The ordinary lane checks the premise from round 2 and runs the class sweep
+    at round 3, before its terminal round 4 (owner ruling 2026-10-08: rework
+    costs least at round 2, so the premise question comes first there). The
     audit belongs to ITS round; the premise check stays owed after its round.
     """
     if gate_lane:
         return round_number == 1, round_number >= 2
-    return round_number == 2, round_number >= 3
+    return round_number == 3, round_number >= 2
 
 
 def _normalize(text: str) -> str:
@@ -229,6 +245,8 @@ def parse(
         result.decision = seen["Decision"][0].group(1)
     if seen["Audit-evidence"]:
         result.audit_evidence = seen["Audit-evidence"][0].group(1)
+    if seen["Premise-evidence"]:
+        result.premise_evidence = seen["Premise-evidence"][0].group(1)
     if any(m.group(1) == "yes" for m in seen["Escalate"]) or result.verdict in {
         "BROKEN",
         "SUSPECT",
@@ -273,6 +291,11 @@ def parse(
         result.problems.append(
             f"round {round_number} carries an independent premise check: at least two "
             "'Premise-check: P<n> TRUE|FALSE|UNPROVEN <text>' lines"
+        )
+    if premise_owed and not result.premise_evidence:
+        result.problems.append(
+            f"round {round_number} cites the premise check's output: "
+            "'Premise-evidence: <path> <verdict>'"
         )
     recurring = sorted(set(result.classes) & {_normalize(c) for c in previous_classes})
     if recurring and result.decision == "fix-instances":
@@ -503,39 +526,112 @@ def _parse_when(raw: object) -> datetime | None:
 _COMMIT_CLOCK_SLACK = timedelta(seconds=1)
 
 
-def audit_problem(path: str, round_started: object, made_at: object) -> str | None:
-    """Why a cited audit does not count, or None. Local only: the file must
-    exist, decode, pass the review gate's own adversarial-evidence check, and
-    have been last written inside the window from the round's start to the
-    reflection's commit (``made_at``), so an audit written or changed after
+#: The largest evidence file read. An audit or premise check runs to tens of
+#: kilobytes; anything past this is not one, and an unbounded read of a cited
+#: path is a hang (a device) or memory exhaustion on the hook path.
+EVIDENCE_MAX_BYTES = 1024 * 1024
+
+#: The premise-check block of .claude/docs/premise-check.md: the verdict line,
+#: then claim lines ``P<n> <claim> — TRUE|FALSE|UNPROVEN ...``.
+#: A leading bullet, table cell or bold marker is allowed: the block is often
+#: rendered inside a review. This is a floor that rejects a hand summary, not a
+#: parser of the claims' meaning.
+_BLOCK_LEAD = r"^\s*(?:[-*|]\s*)?(?:\*\*)?"
+_PREMISE_VERDICT_RE = re.compile(
+    _BLOCK_LEAD + r"Design-premise:(?:\*\*)?\s*(SOUND|SOUND-BUT-INFERIOR|BROKEN)\b",
+    re.MULTILINE,
+)
+_PREMISE_CLAIM_RE = re.compile(
+    _BLOCK_LEAD + r"P([1-9][0-9]?)\b.*\b(TRUE|FALSE|UNPROVEN)\b", re.MULTILINE
+)
+
+
+def _read_evidence(path: str, cwd: str) -> tuple[str | None, datetime | None, str | None]:
+    """``(text, mtime, None)`` or ``(None, None, why)``. ``~`` expands; a
+    relative path resolves against ``cwd``, the repository the check is about,
+    never the process's own working directory. Only a regular file of at most
+    ``EVIDENCE_MAX_BYTES`` is read, and the type is taken from the opened
+    descriptor, so a path swapped for a pipe between a check and the open is
+    still refused instead of blocking the read. The mtime is read before the
+    content, so a rewrite in that window keeps the older time: a microsecond
+    race that only the author of the reflection can run."""
+    candidate = Path(os.path.expanduser(path))
+    if not candidate.is_absolute():
+        candidate = Path(cwd) / candidate
+    try:
+        fd = os.open(candidate, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        return None, None, f"is unreadable ({exc.strerror})"
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return None, None, "is not a regular file"
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            fd = -1
+            raw = handle.read(EVIDENCE_MAX_BYTES + 1)
+    except OSError as exc:
+        return None, None, f"is unreadable ({exc.strerror})"
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > EVIDENCE_MAX_BYTES:
+        return None, None, f"is larger than {EVIDENCE_MAX_BYTES} bytes"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, None, "is not valid UTF-8"
+    return text, datetime.fromtimestamp(info.st_mtime, UTC), None
+
+
+def evidence_problem(
+    path: str, *, kind: str, cwd: str, round_started: object, made_at: object
+) -> str | None:
+    """Why a cited evidence file does not count, or None. ``kind`` is
+    ``"audit"`` (the review gate's own adversarial-evidence check) or
+    ``"premise"`` (the premise-check block). Local only: the file must be a
+    readable regular file, decode, pass its kind's content check, and have
+    been last written inside the window from the round's start to the
+    reflection's commit (``made_at``), so evidence written or changed after
     the reflection is refused. An unknown end of the window is a refusal,
     never a skipped check. File times can be set by hand, so this binds an
     honest session's evidence to its reflection; it is not proof against
     tampering."""
-    import review_state  # noqa: PLC0415
+    label = {"audit": "Audit-evidence", "premise": "Premise-evidence"}[kind]
+    text, mtime, why = _read_evidence(path, cwd)
+    if why is not None or text is None or mtime is None:
+        return f"{label} {why}"
+    if kind == "audit":
+        import review_state  # noqa: PLC0415
 
-    evidence = Path(os.path.expanduser(path))
-    try:
-        text = evidence.read_bytes().decode("utf-8")
-        mtime = datetime.fromtimestamp(evidence.stat().st_mtime, UTC)
-    except OSError as exc:
-        return f"Audit-evidence is unreadable ({exc.strerror})"
-    except UnicodeDecodeError:
-        return "Audit-evidence is not valid UTF-8"
-    ok, why = review_state._evidence_is_adversarial(text)
-    if not ok:
-        return f"Audit-evidence is not an adversarial audit: {why}"
+        ok, why = review_state._evidence_is_adversarial(text)
+        if not ok:
+            return f"{label} is not an adversarial audit: {why}"
+    else:
+        claims = {m.group(1) for m in _PREMISE_CLAIM_RE.finditer(text)}
+        if not _PREMISE_VERDICT_RE.search(text) or len(claims) < 2:
+            return (
+                f"{label} is not a premise check: it needs the 'Design-premise:' "
+                "verdict line and at least two 'P<n> ... TRUE|FALSE|UNPROVEN' claim "
+                "lines (.claude/docs/premise-check.md)"
+            )
     started = _parse_when(round_started)
     if started is None:
-        return "the round's start time is unknown, so the audit's freshness cannot be checked"
+        return f"the round's start time is unknown, so the {kind}'s freshness cannot be checked"
     if mtime < started:
-        return "Audit-evidence predates this round's first review"
+        return f"{label} predates this round's first review"
     made = _parse_when(made_at)
     if made is None:
-        return "the reflection's commit time is unknown, so the audit cannot be bound to it"
+        return f"the reflection's commit time is unknown, so the {kind} cannot be bound to it"
     if mtime > made + _COMMIT_CLOCK_SLACK:
-        return "Audit-evidence was written or changed after the reflection was committed"
+        return f"{label} was written or changed after the reflection was committed"
     return None
+
+
+def audit_problem(path: str, round_started: object, made_at: object, *, cwd: str) -> str | None:
+    """``evidence_problem`` for an ``Audit-evidence`` file."""
+    return evidence_problem(
+        path, kind="audit", cwd=cwd, round_started=round_started, made_at=made_at
+    )
 
 
 def check(
@@ -548,8 +644,10 @@ def check(
     acceptance: Sequence[str] | None,
     round_started: object,
     made_at: object,
+    cwd: str,
 ) -> Reflection:
-    """Every local rule a reflection must meet for this round, in one place."""
+    """Every local rule a reflection must meet for this round, in one place.
+    ``cwd`` is the repository: a relative evidence path is read from there."""
     parsed = parse(
         body,
         round_number=round_number,
@@ -563,10 +661,13 @@ def check(
         )
     if parsed.escalate:
         parsed.problems.append("the reflection escalates: it needs an architecture decision")
-    if parsed.audit_evidence:
-        trouble = audit_problem(parsed.audit_evidence, round_started, made_at)
-        if trouble:
-            parsed.problems.append(trouble)
+    for kind, path in (("audit", parsed.audit_evidence), ("premise", parsed.premise_evidence)):
+        if path:
+            trouble = evidence_problem(
+                path, kind=kind, cwd=cwd, round_started=round_started, made_at=made_at
+            )
+            if trouble:
+                parsed.problems.append(trouble)
     return parsed
 
 
@@ -600,15 +701,22 @@ def covered_keys(
     prior_heads: Sequence[str],
     acceptance: Sequence[str] | None,
     round_started: object,
+    late_since: Mapping[str, str],
 ) -> set[str]:
     """Keys answered at ``head`` by committed reflections. THE coverage check.
+
+    ``late_since`` maps each late key to the fix commit it trailed (from
+    ``review_budget``). A late key is also answered by a reflection naming an
+    EARLIER head, as long as that head descends from the key's fix commit: once
+    answered it stays answered, instead of being owed again at every new head.
+    Such a reflection answers only its late keys, never the open round's.
 
     A reflection counts only when it is an EMPTY commit naming this exact head,
     made before any fix to it (``before_any_fix``), and ``check`` passes it:
     the grammar, the round's obligations, the recurring-class rule against
-    every earlier round head (``prior_heads``), a readable adversarial audit
-    written between ``round_started`` and the reflection's commit where one is
-    cited, no escalation, and the
+    every earlier round head (``prior_heads``), readable evidence files
+    (an adversarial audit, a premise check) written between ``round_started``
+    and the reflection's commit where cited or owed, no escalation, and the
     acceptance points (None only when the PR declares none). Every argument is
     required, so no caller gets a weaker check by leaving one out. A
     reflection committed by hand is held to exactly this; there is no weaker
@@ -618,27 +726,57 @@ def covered_keys(
     previous = previous_class_labels(cwd, prior_heads)
     covered: set[str] = set()
     for sha, kind, body, committed_at in _log_reflections(cwd):
-        if kind != "empty" or not before_any_fix(cwd, head, sha):
+        if kind != "empty":
+            continue
+        named = parse(body).head
+        if named is None:
+            continue
+        if named == head:
+            answers = None  # every key it names
+        else:
+            answers = {
+                k
+                for k in parse(body).keys
+                if k in late_since and _is_ancestor(cwd, late_since[k], named)
+            }
+            if not answers or not _is_ancestor(cwd, named, head):
+                continue
+        if not before_any_fix(cwd, named, sha):
             continue
         result = check(
             body,
-            head=head,
+            head=named,
             round_number=round_number,
             gate_lane=gate_lane,
             previous_classes=previous,
             acceptance=acceptance,
             round_started=round_started,
             made_at=committed_at,
+            cwd=cwd,
         )
         if result.ok:
-            covered.update(result.keys)
+            covered.update(result.keys if answers is None else answers)
     return covered
+
+
+def _is_ancestor(cwd: str, older: str, newer: str) -> bool:
+    """Whether ``older`` is ``newer`` or one of its ancestors. A commit git
+    cannot find (not fetched, force-pushed away) is not an ancestor."""
+    code, _, _ = _run(["git", "-C", cwd, "merge-base", "--is-ancestor", older, newer])
+    return code == 0
 
 
 def owed_state(
     budget: Mapping[str, Any], covered: Iterable[str], *, now: datetime
 ) -> dict[str, Any]:
-    """What the open round owes, from a ``review_budget`` result. Pure."""
+    """What is owed, from a ``review_budget`` result. Pure.
+
+    The open round's keys, plus ``late_keys`` in ANY round state: findings a
+    review left on an earlier head after the fix was already made. They never
+    reopen the round the fix is in (owner ruling 2026-10-07), so a PR whose last
+    push drew no new findings can still owe them; a reflection naming the
+    current head, or any head after the fix, answers them.
+    """
     state: dict[str, Any] = {
         "status": budget.get("status"),
         "round": budget.get("count"),
@@ -647,6 +785,7 @@ def owed_state(
         "gate_lane": bool(budget.get("gate_surface")),
         "reflection_keys": budget.get("reflection_keys", "unknown"),
         "open_keys": list(budget.get("open_keys") or []),
+        "late_keys": list(budget.get("late_keys") or []),
         # None means UNKNOWN, never "nothing owed": an unreadable budget or a
         # round whose findings could not all be keyed owes something unknown.
         "owed": None,
@@ -660,12 +799,24 @@ def owed_state(
         state["round_head"] = rounds[-1].get("head")
     if budget.get("status") != "ok":
         return state
-    if budget.get("round_state") != "open":
+    is_open = budget.get("round_state") == "open"
+    if state["reflection_keys"] != "ok":
+        # Unkeyable findings, or a late finding whose time could not be read:
+        # owed stays None (unknown), never an empty list.
+        return state
+    if not is_open and not state["late_keys"]:
         state["owed"] = []
         return state
-    if state["reflection_keys"] == "ok":
-        done = set(covered)
-        state["owed"] = [k for k in state["open_keys"] if k not in done]
+    done = set(covered)
+    wanted = dict.fromkeys((state["open_keys"] if is_open else []) + state["late_keys"])
+    state["owed"] = [k for k in wanted if k not in done]
+    if not is_open:
+        # Only late findings are owed: they have already arrived, so nothing is
+        # still settling, and the audit window opens at the first of them.
+        late_started = _parse_when(budget.get("late_started"))
+        state["round_started"] = late_started.isoformat() if late_started else None
+        state["settled"] = True
+        return state
     times = [
         when
         for source in (rounds[-1].get("reviews") or [] if rounds else [])
@@ -687,19 +838,25 @@ def status(cwd: str, *, now: datetime | None = None) -> dict[str, Any]:
     repo, number = pr_identity(cwd)
     budget = review_budget.evaluate_pr(repo, number)
     state = owed_state(budget, (), now=now or datetime.now(UTC))
-    if state["status"] == "ok" and state["round_state"] == "open":
-        meta = _pr_meta(repo, number)
+    if state["owed"]:
+        is_open = state["round_state"] == "open"
+        rounds = budget.get("rounds") or []
+        # The body comes with the budget read; ask GitHub again only when it
+        # did not (an older review_budget, or a test seam).
+        body = budget.get("body")
+        if not isinstance(body, str):
+            body = _pr_meta(repo, number).get("body") or ""
         covered = covered_keys(
             cwd,
             str(state["head"]),
             round_number=int(state["round"] or 0),
             gate_lane=state["gate_lane"],
-            prior_heads=[str(r.get("head")) for r in (budget.get("rounds") or [])[:-1]],
-            acceptance=acceptance_points(meta.get("body") or ""),
+            prior_heads=[str(r.get("head")) for r in (rounds[:-1] if is_open else rounds)],
+            acceptance=acceptance_points(body),
             round_started=state["round_started"],
+            late_since=dict(budget.get("late_since") or {}),
         )
-        if state["reflection_keys"] == "ok":
-            state["owed"] = [k for k in state["open_keys"] if k not in covered]
+        state["owed"] = [k for k in state["owed"] if k not in covered]
     state.update({"repo": repo, "pr": number, "errors": budget.get("errors", [])})
     return state
 

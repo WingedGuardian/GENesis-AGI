@@ -68,8 +68,8 @@ def _reflection(
     "round_number, gate, want",
     [
         (1, False, (False, False)),
-        (2, False, (True, False)),
-        (3, False, (False, True)),
+        (2, False, (False, True)),  # premise check first (owner ruling 2026-10-08)
+        (3, False, (True, True)),  # then the class sweep, premise still owed
         (4, False, (False, True)),
         (1, True, (True, False)),
         (2, True, (False, True)),
@@ -227,26 +227,48 @@ def test_lead_is_only_a_round_one_verdict():
     assert any("from round 2" in p for p in rr.parse(_reflection(), round_number=2).problems)
 
 
-def test_round_obligations_by_lane():
-    audit = ["Audit-evidence: ~/.genesis/review_evidence/x.txt NO BLOCKER"]
-    checks = [
-        "Premise-check: P1 TRUE the store already dedups by key",
-        "Premise-check: P2 FALSE replies are never top level",
-    ]
+AUDIT_LINE = "Audit-evidence: ~/.genesis/review_evidence/x.txt NO BLOCKER"
+CHECK_LINES = [
+    "Premise-check: P1 TRUE the store already dedups by key",
+    "Premise-check: P2 FALSE replies are never top level",
+]
+PREMISE_LINES = [*CHECK_LINES, "Premise-evidence: ~/.genesis/review_evidence/p.txt SOUND"]
+
+
+def _problems(*extra, round_number, gate_lane=False):
     sound = "SOUND-BUT-INFERIOR"
+    return rr.parse(
+        _reflection(premise=sound, extra=list(extra)),
+        round_number=round_number,
+        gate_lane=gate_lane,
+    ).problems
+
+
+def test_round_obligations_by_lane():
+    # gate lane: class audit at round 1, premise check at round 2
     assert any(
         "fresh-context audit" in p
         for p in rr.parse(_reflection(), round_number=1, gate_lane=True).problems
     )
-    assert rr.parse(_reflection(extra=audit), round_number=1, gate_lane=True).ok
-    two = rr.parse(_reflection(premise=sound), round_number=2, gate_lane=True)
-    assert any("premise check" in p for p in two.problems)
-    assert rr.parse(_reflection(premise=sound, extra=checks), round_number=2, gate_lane=True).ok
-    twice = [checks[0], checks[0]]
-    again = rr.parse(_reflection(premise=sound, extra=twice), round_number=2, gate_lane=True)
-    assert any("premise check" in p for p in again.problems), "one check written twice"
-    assert rr.parse(_reflection(premise=sound, extra=audit), round_number=2).ok
-    assert not rr.parse(_reflection(premise=sound, extra=checks[:1]), round_number=3).ok
+    assert rr.parse(_reflection(extra=[AUDIT_LINE]), round_number=1, gate_lane=True).ok
+    assert any("premise check" in p for p in _problems(round_number=2, gate_lane=True))
+    assert not _problems(*PREMISE_LINES, round_number=2, gate_lane=True)
+    twice = [CHECK_LINES[0], CHECK_LINES[0], PREMISE_LINES[-1]]
+    again = _problems(*twice, round_number=2, gate_lane=True)
+    assert any("premise check" in p for p in again), "one check written twice"
+    # ordinary lane (owner ruling 2026-10-08): premise check from round 2,
+    # the class sweep at round 3
+    assert any("premise check" in p for p in _problems(AUDIT_LINE, round_number=2))
+    assert not _problems(*PREMISE_LINES, round_number=2)
+    assert any("fresh-context audit" in p for p in _problems(*PREMISE_LINES, round_number=3))
+    assert not _problems(AUDIT_LINE, *PREMISE_LINES, round_number=3)
+    assert not _problems(*PREMISE_LINES, round_number=4)
+
+
+def test_premise_lines_without_their_evidence_file_are_refused():
+    got = _problems(*CHECK_LINES, round_number=2)
+    assert any("cites the premise check's output" in p for p in got), got
+    assert not rr.parse(_reflection(extra=CHECK_LINES), round_number=1).problems
 
 
 def test_a_recurring_class_forbids_fixing_instances():
@@ -419,7 +441,28 @@ def _covered(path, head, **kw):
     kw.setdefault("prior_heads", [])
     kw.setdefault("acceptance", None)
     kw.setdefault("round_started", T0 - timedelta(days=3650))
+    kw.setdefault("late_since", {})
     return rr.covered_keys(str(path), head, **kw)
+
+
+PREMISE_BLOCK = (
+    "Design-premise: SOUND-BUT-INFERIOR\n"
+    "Expected before checking: the cap holds\n"
+    "  P1 the reader is bounded \u2014 TRUE \u00b7 scripts/x.py:12 \u00b7 90% \u00b7 falsified by a huge file\n"
+    "  P2 the caller retries \u2014 FALSE \u00b7 scripts/y.py:3 \u00b7 80% \u00b7 falsified by a retry loop\n"
+    "Effect: the gate refuses an oversize audit\n"
+)
+
+
+def _strong_premise(tmp_path: Path) -> Path:
+    evidence = tmp_path / "premise.txt"
+    evidence.write_text(PREMISE_BLOCK)
+    return evidence
+
+
+def _round_two(tmp_path: Path) -> list[str]:
+    """What an ordinary round-2 reflection owes: the premise check."""
+    return [*CHECK_LINES, f"Premise-evidence: {_strong_premise(tmp_path)} SOUND"]
 
 
 def _strong_audit(tmp_path: Path) -> Path:
@@ -525,12 +568,12 @@ def test_a_hand_made_reflection_meets_the_recurring_class_rule(repo, tmp_path):
     _commit_reflection(path, tmp_path, _reflection(head=first))
     _fix(path, "fix\n")
     second = _git(path, "rev-parse", "HEAD").strip()
-    audit = [f"Audit-evidence: {_strong_audit(tmp_path)} PASS"]
+    owed = _round_two(tmp_path)
     sound = "SOUND-BUT-INFERIOR"
-    repeat = _reflection(head=second, premise=sound, decision="fix-instances", extra=audit)
+    repeat = _reflection(head=second, premise=sound, decision="fix-instances", extra=owed)
     _commit_reflection(path, tmp_path, repeat)
     assert _covered(path, second, round_number=2, prior_heads=[first]) == set()
-    closing = _reflection(head=second, premise=sound, decision="close-class", extra=audit)
+    closing = _reflection(head=second, premise=sound, decision="close-class", extra=owed)
     _commit_reflection(path, tmp_path, closing)
     assert _covered(path, second, round_number=2, prior_heads=[first]) == {"c1", "c2"}
 
@@ -546,11 +589,16 @@ def test_a_stray_reflection_cannot_stand_in_for_the_previous_round(repo, tmp_pat
     decoy = _reflection(head="0" * 40, classes=("decoy class = 1",))
     _commit_reflection(path, tmp_path, decoy)
     assert rr.previous_class_labels(str(path), [first]) == ["unchecked subprocess result"]
-    audit = [f"Audit-evidence: {_strong_audit(tmp_path)} PASS"]
+    owed = _round_two(tmp_path)
     sound = "SOUND-BUT-INFERIOR"
-    repeat = _reflection(head=second, premise=sound, decision="fix-instances", extra=audit)
+    repeat = _reflection(head=second, premise=sound, decision="fix-instances", extra=owed)
     _commit_reflection(path, tmp_path, repeat)
     assert _covered(path, second, round_number=2, prior_heads=[first]) == set()
+    # Control: the same reflection deciding close-class IS covered, so the
+    # refusal above came from the recurring-class rule and nothing else.
+    closing = _reflection(head=second, premise=sound, decision="close-class", extra=owed)
+    _commit_reflection(path, tmp_path, closing)
+    assert _covered(path, second, round_number=2, prior_heads=[first]) == {"c1", "c2"}
 
 
 def test_a_class_from_any_earlier_round_recurs(repo, tmp_path):
@@ -727,13 +775,128 @@ def test_undecodable_audit_evidence_is_unreadable_not_a_crash(tmp_path):
     """Round 1 of #3055: invalid UTF-8 evidence must refuse the reflection."""
     bad = tmp_path / "bad.txt"
     bad.write_bytes(b"\xff\xfe not utf-8 \xc3")
-    assert "not valid UTF-8" in rr.audit_problem(str(bad), T0, T0)
+    assert "not valid UTF-8" in rr.audit_problem(str(bad), T0, T0, cwd=str(tmp_path))
 
 
 def test_an_audit_with_no_known_commit_time_is_refused(tmp_path):
     strong = _strong_audit(tmp_path)
-    assert "commit time is unknown" in rr.audit_problem(str(strong), T0, None)
-    assert rr.audit_problem(str(strong), T0, datetime.now(UTC) + timedelta(hours=1)) is None
+    cwd = str(tmp_path)
+    assert "commit time is unknown" in rr.audit_problem(str(strong), T0, None, cwd=cwd)
+    later = datetime.now(UTC) + timedelta(hours=1)
+    assert rr.audit_problem(str(strong), T0, later, cwd=cwd) is None
+
+
+# -- the evidence file itself (#3089 items 2, 4 and 5) --------------------------
+
+
+def _evidence(path, *, kind="audit", cwd, made=None):
+    made = made or datetime.now(UTC) + timedelta(hours=1)
+    return rr.evidence_problem(str(path), kind=kind, cwd=str(cwd), round_started=T0, made_at=made)
+
+
+def test_a_pipe_cited_as_evidence_is_refused_not_a_hang(tmp_path):
+    """#3089 item 4: read_bytes() on a FIFO blocked forever. The type is taken
+    from the opened descriptor, so this returns at once."""
+    import threading
+
+    fifo = tmp_path / "audit.fifo"
+    os.mkfifo(fifo)
+    got: list[object] = []
+    worker = threading.Thread(target=lambda: got.append(_evidence(fifo, cwd=tmp_path)))
+    worker.daemon = True
+    worker.start()
+    worker.join(5)
+    if worker.is_alive():
+        # Unblock the stuck open so the daemon thread can finish.
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        pytest.fail("reading a FIFO blocked: the open must not wait for a writer")
+    assert "not a regular file" in str(got[0])
+
+
+def test_a_directory_cited_as_evidence_is_refused(tmp_path):
+    assert "not a regular file" in _evidence(tmp_path, cwd=tmp_path)
+
+
+def test_oversize_evidence_is_refused(tmp_path):
+    big = tmp_path / "big.txt"
+    big.write_bytes(b"x" * (rr.EVIDENCE_MAX_BYTES + 1))
+    assert "larger than" in _evidence(big, cwd=tmp_path)
+
+
+def test_evidence_exactly_at_the_cap_is_read(tmp_path):
+    exact = tmp_path / "exact.txt"
+    exact.write_bytes(b"x" * rr.EVIDENCE_MAX_BYTES)
+    got = _evidence(exact, cwd=tmp_path)
+    assert "larger than" not in got and "not an adversarial audit" in got
+
+
+def test_a_relative_path_is_read_from_the_repository_not_the_process(tmp_path, monkeypatch):
+    """#3089 item 5: a gate runs from wherever its process happens to be."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / "audit.txt").write_text(_strong_audit(tmp_path).read_text())
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert _evidence("audit.txt", cwd=repo_dir) is None
+    assert "unreadable" in _evidence("audit.txt", cwd=elsewhere)
+
+
+def test_the_commit_clock_slack_is_one_second(tmp_path):
+    """#3089 item 2: a file written in the commit's own second may carry a
+    later fractional mtime than the whole-second commit time."""
+    audit = _strong_audit(tmp_path)
+    made = datetime(2026, 10, 7, 12, 30, tzinfo=UTC)
+    stamp = made.timestamp()
+    os.utime(audit, (stamp + 0.9, stamp + 0.9))
+    assert _evidence(audit, cwd=tmp_path, made=made) is None
+    os.utime(audit, (stamp + 1.5, stamp + 1.5))
+    assert "after the reflection was committed" in _evidence(audit, cwd=tmp_path, made=made)
+
+
+@pytest.mark.parametrize(
+    "text, ok",
+    [
+        (PREMISE_BLOCK, True),
+        (PREMISE_BLOCK.replace("Design-premise", "Premise"), False),  # no verdict line
+        ("Design-premise: SOUND\n  P1 the cap holds \u2014 TRUE\n", False),  # one claim
+        ("Design-premise: SOUND\n  P1 a \u2014 TRUE\n  P1 b \u2014 FALSE\n", False),  # same P twice
+        (
+            "Premise: SOUND (~80%)\n| 1 | real | TRUE |\n| 2 | real | FALSE |\n",
+            False,
+        ),  # a summary table
+        (
+            "Design-premise: SOUND \u2014 UNPROVEN(1)\n  P1 a \u2014 TRUE\n  P2 b \u2014 UNPROVEN\n",
+            True,
+        ),
+        ("**Design-premise:** SOUND\n- P1 a \u2014 TRUE\n- P2 b \u2014 FALSE\n", True),
+        ("Design-premise: BROKEN\n| P1 | a | TRUE |\n| P2 | b | FALSE |\n", True),
+    ],
+)
+def test_premise_evidence_must_be_a_premise_check_block(tmp_path, text, ok):
+    """The block of .claude/docs/premise-check.md: a verdict line and at least
+    two distinct P<n> claims. A hand summary is refused (MEASURED 2026-10-08:
+    a summarised premise-check file on disk had neither)."""
+    evidence = tmp_path / "premise.txt"
+    evidence.write_text(text)
+    got = _evidence(evidence, kind="premise", cwd=tmp_path)
+    assert (got is None) is ok, got
+
+
+def test_a_round_two_reflection_needs_a_real_premise_check(repo, tmp_path):
+    path, first = repo
+    _commit_reflection(path, tmp_path, _reflection(head=first))
+    _fix(path, "fix\n")
+    second = _git(path, "rev-parse", "HEAD").strip()
+    summary = tmp_path / "summary.txt"
+    summary.write_text("Premise: SOUND\n| 1 | TRUE |\n| 2 | FALSE |\n")
+    lines = [*CHECK_LINES, f"Premise-evidence: {summary} SOUND"]
+    sound = "SOUND-BUT-INFERIOR"
+    _commit_reflection(path, tmp_path, _reflection(head=second, premise=sound, extra=lines))
+    assert _covered(path, second, round_number=2, prior_heads=[first]) == set()
+    owed = _round_two(tmp_path)
+    _commit_reflection(path, tmp_path, _reflection(head=second, premise=sound, extra=owed))
+    assert _covered(path, second, round_number=2, prior_heads=[first]) == {"c1", "c2"}
 
 
 def test_an_audit_written_after_the_reflection_is_refused(repo, tmp_path):
@@ -787,6 +950,83 @@ def test_an_acceptance_point_maps_within_one_covered_scope_line(scopes, ok):
     assert got.ok is ok, got.problems
 
 
+def test_late_findings_are_owed_when_no_round_is_open():
+    """Owner ruling 2026-10-07: a review that landed after the fix opens no
+    round, yet its findings are owed, answered by a current-head reflection."""
+    late_at = "2026-10-07T12:40:00Z"
+    budget = _budget(round_state="complete", open_keys=[], late_keys=["c9"], late_started=late_at)
+    got = rr.owed_state(budget, (), now=T0)
+    assert got["owed"] == ["c9"] and got["settled"]
+    assert got["round_started"] == "2026-10-07T12:40:00+00:00"
+    assert rr.owed_state(budget, ("c9",), now=T0)["owed"] == []
+
+
+def test_an_unknown_late_answer_is_unknown_never_nothing_owed():
+    """Fix-code audit B1: a complete round whose late findings could not be
+    read must not read as owing nothing."""
+    budget = _budget(round_state="complete", open_keys=[], late_keys=[], reflection_keys="unknown")
+    assert rr.owed_state(budget, (), now=T0)["owed"] is None
+
+
+def test_a_late_finding_answered_earlier_stays_answered(repo, tmp_path):
+    """Fix-code audit S1: a late key answered by a reflection at the head
+    after its fix must not be owed again at every later head."""
+    path, first = repo
+    _fix(path, "fix one\n")
+    fix = _git(path, "rev-parse", "HEAD").strip()
+    answer = _reflection(keys=("c9", "c1"), head=fix)
+    _commit_reflection(path, tmp_path, answer)
+    _fix(path, "fix two\n")
+    later = _git(path, "rev-parse", "HEAD").strip()
+    # The late key retires; the reflection's other key was that head's own,
+    # and is never credited to a later head.
+    assert _covered(path, later, late_since={"c9": fix}) == {"c9"}
+    # Control: a late key whose fix comes AFTER the reflection's head is not
+    # answered by it.
+    assert _covered(path, later, late_since={"c9": later}) == set()
+    # A head the late key was not mapped to answers nothing.
+    assert _covered(path, later, late_since={}) == set()
+    # A reflection naming a head the PR head does not descend from (a local
+    # branch that diverged from the PR) answers nothing for that PR head.
+    assert _covered(path, first, late_since={"c9": fix}) == set()
+
+
+def test_status_answers_late_findings_from_the_budget_body(repo, tmp_path, monkeypatch):
+    """The late-only path end to end: every round head is prior, the window
+    opens at the late review, and the body comes from the budget read."""
+    path, head = repo
+    # The late key is answered at the fix's head, and the PR has moved on since.
+    _commit_reflection(path, tmp_path, _reflection(keys=("c9",), head=head))
+    _fix(path, "later\n")
+    current = _git(path, "rev-parse", "HEAD").strip()
+    import review_budget
+
+    late_at = (T0 - timedelta(days=1)).isoformat()
+    budget = _budget(
+        round_state="complete",
+        open_keys=[],
+        late_keys=["c9", "c8"],
+        late_since={"c9": head, "c8": head},
+        late_started=late_at,
+        current_head=current,
+        body="no acceptance section here",
+    )
+    monkeypatch.setattr(rr, "pr_identity", lambda cwd: ("o/r", 7))
+
+    def no_second_read(repo, number):
+        raise AssertionError("the body came with the budget; no gh pr view")
+
+    monkeypatch.setattr(rr, "_pr_meta", no_second_read)
+    monkeypatch.setattr(review_budget, "evaluate_pr", lambda repo, number: budget)
+    got = rr.status(str(path), now=T0)
+    assert got["owed"] == ["c8"] and got["settled"]
+
+
+def test_late_findings_join_an_open_round():
+    budget = _budget(open_keys=["c1"], late_keys=["c9", "c1"])
+    assert rr.owed_state(budget, (), now=T0)["owed"] == ["c1", "c9"]
+
+
 def test_status_subtracts_what_is_covered(repo, tmp_path, monkeypatch):
     path, head = repo
     _commit_reflection(path, tmp_path, _reflection(keys=("c1",), head=head))
@@ -810,6 +1050,7 @@ def test_unreadable_git_is_refused_never_nothing_owed(tmp_path):
             prior_heads=[],
             acceptance=None,
             round_started=T0,
+            late_since={},
         )
 
 

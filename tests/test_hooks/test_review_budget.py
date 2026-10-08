@@ -282,7 +282,7 @@ def _slow_runner(clock: _FakeClock, calls: list[tuple[str, float]]):
     return run
 
 
-def _graphql_server(*, head=H5, page_size=100, heads=None, **connections):
+def _graphql_server(*, head=H5, page_size=100, heads=None, body=None, **connections):
     """A fake `gh api graphql` that honours the query's connections and cursors.
 
     It reads WHICH connections the query selects from the query text and each
@@ -302,6 +302,8 @@ def _graphql_server(*, head=H5, page_size=100, heads=None, **connections):
         query = next(a for a in argv if a.startswith("query="))
         fields = dict(a.split("=", 1) for a in argv if "=" in a and not a.startswith("query="))
         pr: dict = {"headRefOid": head_seq.pop(0) if head_seq else head}
+        if body is not None and " body " in query:
+            pr["body"] = body
         for name in ("reviews", "comments", "files", "commits"):
             if f" {name}(first: 100" not in query:
                 continue
@@ -445,7 +447,8 @@ def test_every_paginated_read_asks_for_a_full_page_in_the_path():
     source = (_ROOT / "scripts" / "review_budget.py").read_text()
     tree = ast.parse(source)
     fn = next(
-        n for n in ast.walk(tree)
+        n
+        for n in ast.walk(tree)
         if isinstance(n, ast.FunctionDef) and n.name == "_evaluate_pr_inner"
     )
     paginated = 0
@@ -949,3 +952,34 @@ def test_a_comment_reposted_between_reads_is_not_unknown(monkeypatch):
 
     got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
     assert got["status"] == "ok", got
+
+
+def test_the_live_read_carries_commit_times_and_the_pr_body(monkeypatch):
+    """Late findings and the PR body both ride the one GraphQL query: a
+    finding-bearing review on H4, submitted after H5 was committed, is owed as
+    a late key, and the body comes back for the reflection's acceptance points."""
+    _no_seams(monkeypatch)
+    finding = "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow)</sub></sub> x**"
+    review = dict(
+        _gql_review(H4),
+        fullDatabaseId="11",
+        submittedAt="2026-10-05T12:10:00Z",
+        comments={
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [{"fullDatabaseId": "111", "replyTo": None, "body": finding}],
+        },
+    )
+    times = {H4: "2026-10-05T11:00:00Z", H5: "2026-10-05T12:05:00Z"}
+    commits = [
+        {"commit": {"oid": h, "committedDate": times.get(h, "2026-10-04T00:00:00Z")}}
+        for h in (H1, H2, H3, H4, H5)
+    ]
+    serve = _graphql_server(
+        reviews=[review], files=_FILES, commits=commits, body="## Acceptance\n- it works\n"
+    )
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert got["round_state"] == "complete" and got["late_keys"] == ["c111"], got
+    assert got["body"] == "## Acceptance\n- it works\n"
+    query = next(a for a in serve.seen[0] if a.startswith("query="))
+    assert "committedDate" in query and " body " in query
