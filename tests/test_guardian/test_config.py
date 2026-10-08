@@ -188,3 +188,96 @@ class TestLoadSecrets:
         p.write_text('KEY="double quoted"\n')
         secrets = load_secrets(p)
         assert secrets["KEY"] == "double quoted"
+
+
+class TestSwapCeilingPct:
+    """Validation of the opt-in `swap_ceiling_pct` knob (install-local, never
+    shipped in the repo's template). Must never fall back to 0 — 0 would mean
+    "cap swap at nothing", the exact opposite of what this knob is for."""
+
+    def test_default_is_none(self, tmp_path: Path) -> None:
+        cfg = load_config(tmp_path / "nonexistent.yaml")
+        assert cfg.swap_ceiling_pct is None
+
+    def test_valid_int_becomes_float(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: 50\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct == 50.0
+        assert isinstance(cfg.swap_ceiling_pct, float)
+
+    def test_valid_float_kept(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: 12.5\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct == 12.5
+
+    def test_100_is_valid_boundary(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: 100\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct == 100.0
+
+    def test_zero_is_rejected_not_passed_through(self, tmp_path: Path) -> None:
+        """0 must NOT reach swap_watch as a target — it would mean swap-off."""
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: 0\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_negative_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: -5\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_over_100_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: 150\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_bool_is_rejected(self, tmp_path: Path) -> None:
+        """bool is an int subclass — `swap_ceiling_pct: true` must not be
+        silently coerced to 1.0."""
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: true\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_string_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text('swap_ceiling_pct: "50"\n')
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_nan_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: .nan\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_infinity_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: .inf\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_null_is_none_with_no_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: null\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+        assert "swap_ceiling_pct" not in caplog.text
+
+    def test_invalid_value_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: 0\n")
+        with caplog.at_level(logging.WARNING, logger="genesis.guardian.config"):
+            load_config(p)
+        assert "swap_ceiling_pct" in caplog.text

@@ -71,6 +71,16 @@ remediation for the detected vantage — because the knob is never local:
   an INFO alert; opt a host out with `swap_reconcile_enabled: false` in the
   guardian config (an explicitly-false knob is otherwise reconciled back to
   true — swap-on is the install invariant).
+  **Opt-in ceiling**: `swap_ceiling_pct` (install-local only — set it in the
+  deployed `guardian.yaml`, never in this repo's shipped template) caps the
+  container's swap at that percentage of the HOST's `SwapTotal`, so the cap
+  tracks the pool if the host's swap pool is resized. The reconciler asserts
+  it through Incus's own native `limits.memory.swap=<bytes>` key when this
+  container has a `limits.memory` cap (the normal case), or via a direct
+  cgroup write otherwise. `swap_reconcile_enabled: false` disables this too.
+  A re-deploy of an already-configured guardian can lose this setting on a
+  stash conflict during the legacy git `update` verb — re-check
+  `guardian.yaml` after an update if the cap matters to you.
 - **Bare metal / VM**: create a swapfile or LV sized to taste. Even a few
   GiB turns the OOM cliff into a ramp. **On guardian hosts this is now
   mechanical** — see the zram layer below.
