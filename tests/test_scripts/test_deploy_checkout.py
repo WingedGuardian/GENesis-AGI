@@ -22,6 +22,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LIB = REPO_ROOT / "scripts" / "lib" / "deploy_checkout.sh"
+RECOVERY_LIB = REPO_ROOT / "scripts" / "lib" / "deploy_recovery.sh"
 MARKER_LIB = REPO_ROOT / "scripts" / "lib" / "deploy_marker.sh"
 UPDATE = REPO_ROOT / "scripts" / "update.sh"
 CODE_ONLY = REPO_ROOT / "scripts" / "deploy_code_only.sh"
@@ -511,6 +512,7 @@ def test_both_deploy_paths_source_the_lib_and_keep_no_inline_copy():
     for script in (UPDATE, CODE_ONLY):
         text = script.read_text()
         assert re.search(r'^\. "\$\w+/lib/deploy_checkout\.sh"$', text, re.M), script.name
+        assert re.search(r'^\. "\$\w+/lib/deploy_recovery\.sh"$', text, re.M), script.name
         code = "\n".join(_code_lines(script))
         for inline in ("--git-common-dir", "--absolute-git-dir", "--is-inside-work-tree"):
             assert inline not in code, f"{script.name} carries an inline {inline} check"
@@ -567,6 +569,7 @@ def test_update_sh_refuses_before_touching_any_state():
     ):
         assert last < text.index(later), later
     assert text.index('. "$SCRIPT_DIR/lib/deploy_checkout.sh"') < first
+    assert text.index('. "$SCRIPT_DIR/lib/deploy_recovery.sh"') < first
 
 
 def _update_sh_dirty_block() -> str:
@@ -606,3 +609,8 @@ def test_lib_functions_return_and_never_exit():
     code = "\n".join(_code_lines(LIB))
     assert not re.search(r"\bexit\b", code), "deploy_checkout.sh must return, never exit"
     assert not re.search(r"\becho\b", code.replace("echo /nonexistent", "")), code
+
+
+def test_recovery_lib_may_print_but_never_terminates_its_caller():
+    code = "\n".join(_code_lines(RECOVERY_LIB))
+    assert not re.search(r"\bexit\b", code), "deploy_recovery.sh must return, never exit"
