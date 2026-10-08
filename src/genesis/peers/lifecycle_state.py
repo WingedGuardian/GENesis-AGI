@@ -165,8 +165,13 @@ async def bound(db, binding):
 
 
 class PeerLifecycleState:
-    def __init__(self, registry, directory):
+    def __init__(self, registry, directory, *, execution_gate=None):
         self.registry, self.directory = registry, Path(directory)
+        self.execution_gate = execution_gate
+
+    async def require_execution(self, db):
+        if self.execution_gate is not None:
+            await self.execution_gate(db)
 
     async def claim(self):
         """Reserve the entire remaining allowance before handing work to the runner."""
@@ -189,6 +194,7 @@ class PeerLifecycleState:
                 datetime.fromisoformat(row["expires_at"]).timestamp(), time.time() + reserved
             )
             directory = str(self.directory / segment_id)
+            await self.require_execution(db)
             await db.execute(
                 "INSERT INTO peer_task_runtime(task_id) VALUES(?) ON CONFLICT DO NOTHING",
                 (row["id"],),
@@ -214,6 +220,7 @@ class PeerLifecycleState:
                 "UPDATE peer_tasks SET state='working',updated_at=? WHERE id=?",
                 (utcnow().isoformat(), row["id"]),
             )
+            await self.require_execution(db)
             return row | {
                 "segment_id": segment_id,
                 "working_dir": directory,
@@ -225,6 +232,7 @@ class PeerLifecycleState:
         async with self.registry.transaction() as db:
             row = await bound(db, binding)
             await disclosure_authorized(db, row)
+            await self.require_execution(db)
             changed = await db.execute(
                 "UPDATE peer_segments SET session_id=?,status='running',started_at=? "
                 "WHERE id=? AND task_id=? AND generation=? AND status='prepared' AND deadline_at>?",
@@ -244,6 +252,7 @@ class PeerLifecycleState:
                 "WHERE id=? AND status='claimed'",
                 (session_id, utcnow().isoformat(), row["queue_id"]),
             )
+            await self.require_execution(db)
 
     async def associate_approval(self, binding, approval_id):
         async with self.registry.transaction() as db:
@@ -413,6 +422,7 @@ class PeerLifecycleState:
             ).fetchone()
             if counts[0] >= 2 or counts[1] >= 2:
                 return False
+            await self.require_execution(db)
             prepared = queue.prepare({"peer_task_id": task_id, "source_tag": "peer_api"})
             await queue.insert_prepared(db, prepared)
             generation = row["generation"] + 1
@@ -445,6 +455,7 @@ class PeerLifecycleState:
                 "UPDATE peer_task_runtime SET hold_reason=NULL,approval_id=NULL WHERE task_id=?",
                 (task_id,),
             )
+            await self.require_execution(db)
             return True
 
     async def consent(self, binding, capability, digest):

@@ -102,6 +102,12 @@ class _InitDelegatesMixin:
     async def _init_direct_session(self) -> None:
         await direct_session.init(self)
 
+    async def _init_peers(self) -> None:
+        # Only the standalone serving adapter calls this late installation.
+        from genesis.runtime.init import peers
+
+        await peers.init(self)
+
     async def _init_memory(self) -> None:
         await memory.init(self)
 

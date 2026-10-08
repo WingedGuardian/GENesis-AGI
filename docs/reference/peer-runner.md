@@ -48,11 +48,11 @@ proposal delivery or automatic memory extraction. The internal artifact path is
 not a peer-visible URL or path.
 
 The private coordinator is described in [peer coordinator](peer-coordinator.md).
-Runtime installation and task readiness remain dark in this slice. Dependent
-slices supply leased broker operations, human approvals and generation-checked
-continuation. [Owned results](peer-results.md) now supply the trusted publisher,
-safe SDK projections and authenticated full-result endpoint; runtime installation
-and recovery still gate activation. `GENESIS_PEER_TASKS` remains unset,
-and no task skills are advertised until those prerequisites are ready. Local
+The [runtime owner](peer-runtime.md) supplies standalone installation, restart
+recovery and readiness. Leased broker operations, human approvals and
+generation-checked continuation remain mandatory. [Owned results](peer-results.md)
+provide the trusted publisher, SDK projections and full-result endpoint.
+`GENESIS_PEER_TASKS` binds only when the controller installs, and conversation
+is advertised only while execution is ready. Local
 functionality uses isolated databases and a fake provider; it does not establish
 live tailnet acceptance or production approval/resumption.

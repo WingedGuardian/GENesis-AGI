@@ -1,8 +1,8 @@
 # Trusted peer registry
 
-This foundation enables authenticated discovery and readiness. Task skills
-remain unadvertised and task service readiness is false until the coordinator
-lands. It changes no listener or live deployment. Follow the ingress runbook
+The registry enables authenticated discovery and readiness. The standalone
+[runtime owner](peer-runtime.md) advertises conversation only while its recovered
+controller is ready. Registry commands change no listener or live deployment. Follow the ingress runbook
 before operator activation; a peer credential is never dashboard authority.
 
 The database must already exist and contain the migrated peer tables. Local
@@ -25,7 +25,8 @@ registration creates a new relationship epoch and grants nothing. Revocation
 retains identity, epoch, allowance and history; it never resets quotas. Grant
 changes increment the relationship revision. Resource decisions use
 `resource:<32 lowercase hex ID>` and capability decisions use `allow`, `ask` or
-`deny`. Actual admission and capability enforcement are dependent slices.
+`deny`. [Admission](peer-admission.md) and the private broker enforce the admitted
+snapshot intersected with current grants.
 
 SAM selection additionally requires `--sam-realm`; register each peer with
 `--sam-realm`, `--sam-node` and optional exact `--principal`. Select `--cross-owner`

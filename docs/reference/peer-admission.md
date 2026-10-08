@@ -1,11 +1,12 @@
 # Peer task admission
 
 This dependent foundation defines durable admission and owned A2A1.0 task
-operations. It does not activate task execution. The runtime leaves
+operations. The standalone runtime leaves
 `GENESIS_PEER_TASKS` unset until the constrained executor, leased broker,
 human approval and recovery coordinator are ready; task calls then return 503
 `not_ready`. This is an internal Flask configuration object, not an environment
-switch. Discovery advertises no task skills at this stage.
+switch. Discovery advertises conversation only while the installed service is
+ready. See [runtime installation and recovery](peer-runtime.md).
 
 After activation, the existing scoped peer authentication and 256 KiB body cap
 apply before parsing every route. Use the pinned A2A SDK 1.2.2 HTTP+JSON transport

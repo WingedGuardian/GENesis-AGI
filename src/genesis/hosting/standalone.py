@@ -104,17 +104,37 @@ class StandaloneAdapter:
         self._runtime = GenesisRuntime.instance()
         await self._runtime.bootstrap(mode="full")
 
+        # Recover scopes even on a degraded boot with usable storage. No
+        # executable peer service installs before full bootstrap readiness.
+        await self._runtime._run_init_step_async("peers", self._runtime._init_peers)
+        from genesis.runtime._capabilities import (
+            write_bootstrap_manifest_file,
+            write_capabilities_file,
+        )
+
+        write_bootstrap_manifest_file(self._runtime)
+        write_capabilities_file(self._runtime)
+
         if not self._runtime.is_bootstrapped:
             logger.error("GenesisRuntime bootstrap failed")
             return
 
         self._app = self._create_flask_app()
+        peer = self._runtime._peer_runtime
+        if peer is not None:
+            self._app.config["GENESIS_PEER_REGISTRY"] = peer.registry
+            if peer.coordinator is not None:
+                self._app.config.update(
+                    GENESIS_PEER_TASKS=peer,
+                    GENESIS_PEER_RESULTS=peer.results,
+                    GENESIS_PEER_APPROVALS=peer.coordinator.approvals,
+                )
         self._register_blueprints()
         try:
             from genesis.peers.auth import configuration_warning
             from genesis.peers.registry import PeerRegistry
 
-            warning = await configuration_warning(PeerRegistry())
+            warning = await configuration_warning(peer.registry if peer is not None else PeerRegistry())
             if warning:
                 logger.warning(warning)
         except Exception:

@@ -70,8 +70,9 @@ async def retire_park(db, task, *, expired=False, completed=False):
 
 
 class PeerProviderState:
-    def __init__(self, registry):
+    def __init__(self, registry, *, execution_gate=None):
         self.registry = registry
+        self.execution_gate = execution_gate
 
     async def park(self, binding, exc):
         if config.effective_mode() == "off":
@@ -180,6 +181,8 @@ class PeerProviderState:
             ).fetchone()
             if counts[0] >= 2 or counts[1] >= 2:
                 return False
+            if self.execution_gate is not None:
+                await self.execution_gate(db)
             if not await parks.claim(db, park_id, commit=False):
                 return False
             item = queue.prepare({"source_tag": "peer_api", "peer_task_id": task["id"]})
@@ -192,4 +195,6 @@ class PeerProviderState:
             await db.execute(
                 "UPDATE peer_task_runtime SET hold_reason=NULL WHERE task_id=?", (task["id"],)
             )
+            if self.execution_gate is not None:
+                await self.execution_gate(db)
             return True

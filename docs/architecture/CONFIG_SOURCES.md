@@ -280,3 +280,11 @@ changes take effect on the next request. Tokens use `genesis.env.bearer_token`
 against the server environment; no endpoint loads `secrets.env` or credential
 files. A cleared value refuses access; file edits require the approved restart
 path. Backend and peer values must differ from other surface credentials.
+
+Standalone peer installation derives its database path from the initialized
+runtime connection, rather than assuming the environment path matches it.
+Private scopes, artifacts and per-boot broker sockets live under
+`genesis_home()/peers`; they are not public configuration or result paths.
+Disabled mode still permits startup cleanup, but refuses new execution.
+Runtime pause also prevents admission and continuation. See
+[peer runtime](../reference/peer-runtime.md) for recovery and readiness.

@@ -1,7 +1,8 @@
 # Peer lifecycle state foundation
 
-This slice adds private transactional state; it does not install a coordinator,
-start peer sessions, enable API readiness, or deliver results.
+This module supplies private transactional state. The
+[runtime owner](peer-runtime.md) installs the coordinator after restart recovery;
+state alone does not enable execution or result disclosure.
 
 `PeerLifecycleState` separates the accepted request from individual execution
 attempts. Each attempt reserves the original request's remaining work allowance,
@@ -10,7 +11,7 @@ exact task, segment and generation binding. Unknown elapsed work charges the
 whole reservation. Unconfirmed cleanup retains capacity and requires
 reconciliation; only confirmed drain permits terminalization or continuation.
 The controller must prove both process-scope and broker drain before reporting
-clean settlement. That controller is supplied in the next lifecycle slice.
+clean settlement. The installed coordinator supplies that controller.
 
 An individual, timely dashboard or authorized Telegram-button approval is
 consumed atomically with its continuation queue entry. A durable logical consent
@@ -26,11 +27,12 @@ outcomes from consent. An exact immutable read interrupted in an earlier attempt
 may retry after that attempt drains and authority is rechecked. Unknown
 consequential effects cannot retry automatically. Completed receipts also require
 current authorization before reuse. Operation receipt storage is separate from
-full-result artifact storage, which arrives in a later slice.
+full-result [owned artifact storage](peer-results.md).
 
 Completion time and execution duration have separate fields from cleanup time.
 The runner captures the first authoritative streaming result before cleanup;
 its no-result fallback conservatively uses invocation return. Slow cleanup
 cannot retroactively classify a timely result as late. The private coordinator
-now supplies provider continuation; owned artifacts and runtime installation
-remain later slices. See [coordinator](peer-coordinator.md).
+supplies provider continuation and owned publication. The
+[runtime owner](peer-runtime.md) adds restart recovery and readiness. See
+[coordinator](peer-coordinator.md).

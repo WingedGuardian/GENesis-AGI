@@ -252,6 +252,8 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._reflex_ingestor: object | None = None
         self._direct_session_runner: object | None = None
         self._direct_session_poll: asyncio.Task | None = None
+        self._peer_runtime: object | None = None
+        self._peer_session_lifecycle: object | None = None
         self._ego_session: object | None = None  # User ego (primary)
         self._ego_cadence_manager: object | None = None  # User ego cadence
         self._ego_proposal_workflow: object | None = None
@@ -620,6 +622,12 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         exhaust-discarding. Idempotent and exception-guarded so it never blocks
         shutdown; ``shutdown()`` also stops the worker as a belt.
         """
+        peer = getattr(self, "_peer_runtime", None)
+        if peer is not None:
+            try:
+                await peer.stop()
+            except Exception:
+                logger.error("Peer shutdown requires reconciliation")
         worker = getattr(self, "_outreach_recovery_worker", None)
         if worker is not None:
             try:
@@ -628,6 +636,12 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
                 logger.exception("Failed to stop outreach recovery worker")
 
     async def shutdown(self) -> None:
+        peer = getattr(self, "_peer_runtime", None)
+        if peer is not None:
+            try:
+                await peer.stop()
+            except Exception:
+                logger.error("Peer shutdown requires reconciliation")
         if not self._bootstrapped:
             return
 
@@ -764,6 +778,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         "campaigns": "_campaign_runner",
         "office_deliverables": "_officecli_path",
         "board": "_board_reconciler",
+        "peers": "_peer_session_lifecycle",
     }
 
     def _run_init_step(self, name: str, func) -> None:

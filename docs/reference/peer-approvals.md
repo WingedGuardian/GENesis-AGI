@@ -17,11 +17,12 @@ Manager resolution and the named gate refuse peer-operation approval/rejection
 from batch, voice, bare/quoted text, generic user, system or autonomous origins.
 Only exact dashboard or named Telegram button provenance is accepted. The batch
 sweep also excludes this action type, including the batch button's triggering
-row. Expiration and cancellation never approve work. The later coordinator must
+row. Expiration and cancellation never approve work. The coordinator must
 check this individual provenance again when consuming approval atomically with
 the continuation queue insertion; classification as human alone is insufficient.
 The private [lifecycle state foundation](peer-lifecycle.md) now implements that
-transaction and request-lifetime consent. Runtime scheduling remains a later slice.
+transaction and request-lifetime consent. The [runtime owner](peer-runtime.md)
+installs polling and recovery; recurring peer schedules remain a separate capability.
 
 Both existing dashboard approval mutation routes refuse a configured peer or SAM
 backend bearer even alongside an owner cookie. Disabled/revoked credential families
@@ -41,7 +42,7 @@ Peer notifications disable generic outreach recovery: the peer service owns the
 durable retry so every attempt retains its binding, current checks and buttons.
 Existing non-peer approval notifications retain their previous recovery path.
 
-The complete hold/notification/named-resolution/contained-resume/result integration
-belongs to the coordinator slice. API readiness remains dark until that path is
-installed and tested. No foreground session, automatic self-approval or live
+The installed hold/notification/named-resolution/contained-resume/result path
+uses the coordinator and runtime owner. API readiness requires completed startup
+recovery and available execution prerequisites. No foreground session, automatic self-approval or live
 Telegram consent is inferred from isolated notification tests.

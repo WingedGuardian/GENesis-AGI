@@ -1,7 +1,7 @@
 # Peer execution containment
 
 This is opt-in internal groundwork. No peer endpoint or background-runner branch
-is enabled by this slice. A later task coordinator supplies authorized context
+is enabled by this module alone. The task coordinator supplies authorized context
 and the lease broker; process cleanup alone is insufficient to release capacity
 while broker operations remain in flight.
 
@@ -18,7 +18,7 @@ mode 0600, no symlink, at most 4 KiB, containing only:
 {"mcpServers":{"genesis_peer":{"command":"<sys.executable>","args":["-m","genesis.peers.facade","--lease-file","<absolute lease path>"]}}}
 ```
 
-The facade entry point and lease file are supplied by the later broker slice.
+The facade entry point and lease file are supplied by the private broker.
 No token value belongs in argv or this configuration. The lease path is internal
 and is not exposed in peer results. The configuration supplies no environment
 overrides or additional servers.

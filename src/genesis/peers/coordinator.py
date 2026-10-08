@@ -37,15 +37,28 @@ logger = logging.getLogger(__name__)
 
 
 class PeerCoordinator(PeerTasks):
-    def __init__(self, registry, runner, manager, gate, directory, publish_result):
+    def __init__(
+        self,
+        registry,
+        runner,
+        manager,
+        gate,
+        directory,
+        publish_result,
+        *,
+        execution_allowed=None,
+        execution_gate=None,
+    ):
         super().__init__(registry)
         self.directory = Path(directory)
         if not self.directory.is_absolute() or not callable(publish_result):
             raise ValueError("Private peer storage and result publisher required")
         self.runner, self.publish_result = runner, publish_result
-        self.state = PeerLifecycleState(registry, self.directory / "segments")
+        self.state = PeerLifecycleState(
+            registry, self.directory / "segments", execution_gate=execution_gate
+        )
         self.operations = PeerOperationState(registry)
-        self.provider = PeerProviderState(registry)
+        self.provider = PeerProviderState(registry, execution_gate=execution_gate)
         self.approvals = PeerApprovals(registry, manager, gate)
         self.broker = PeerBroker(
             registry, self.authorize_operation, execute_operation=self.execute_operation
@@ -53,8 +66,14 @@ class PeerCoordinator(PeerTasks):
         self._bindings, self._sessions, self._notifications = {}, {}, {}
         self._dispatch_lock = asyncio.Lock()
         self._stopping = False
+        if any(
+            value is not None and not callable(value)
+            for value in (execution_allowed, execution_gate)
+        ):
+            raise ValueError("Peer execution gate required")
+        self.execution_allowed = execution_allowed
 
-    async def start(self):
+    async def start(self, *, broker_directory=None):
         for directory in (self.directory, self.state.directory):
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             info = directory.lstat()
@@ -64,7 +83,19 @@ class PeerCoordinator(PeerTasks):
                 or info.st_uid != os.getuid()
             ):
                 raise ValueError("Private peer storage unavailable")
-        await self.broker.start(self.directory / "broker")
+        await self.broker.start(broker_directory or self.directory / "broker")
+
+    async def _may_execute(self):
+        # Isolated foundation callers have no host poll. The installed runtime
+        # always supplies its current readiness/pause/master-mode gate.
+        return not self._stopping and (
+            self.execution_allowed is None or await self.execution_allowed()
+        )
+
+    async def _before_admit(self, db):
+        await self.state.require_execution(db)
+        if not await self._may_execute():
+            raise TaskRefusal("not_ready", 503)
 
     def _binding(self, row, *, generation=None):
         return PeerSessionBinding(
@@ -83,6 +114,11 @@ class PeerCoordinator(PeerTasks):
         if self._stopping or self.broker._runner is None:
             raise RuntimeError("Peer coordinator is unavailable")
         async with self._dispatch_lock:
+            if (
+                not await self._may_execute()
+                or self.runner.active_count() >= self.runner._MAX_CONCURRENT
+            ):
+                return None
             await self._retire_invalid_pending()
             row = await self.state.claim()
             if row is None:
@@ -167,7 +203,7 @@ class PeerCoordinator(PeerTasks):
             await disclosure_authorized(db, await bound(db, binding))
 
     async def begin(self, binding, session_id, ceiling):
-        if self._stopping or await _ceiling(self.runner._rt) < ceiling:
+        if not await self._may_execute() or await _ceiling(self.runner._rt) < ceiling:
             raise TaskRefusal("state_conflict", 409)
         await self.state.begin(binding, session_id)
 
@@ -247,7 +283,7 @@ class PeerCoordinator(PeerTasks):
         return parked
 
     async def resume_provider(self, park_id, *, now=None):
-        if self._stopping:
+        if not await self._may_execute():
             return False
         return await self.provider.resume(park_id, now=now)
 
@@ -422,7 +458,8 @@ class PeerCoordinator(PeerTasks):
         if request is None or request["status"] == "pending":
             self._notify(approval_id)
         elif request["status"] == "approved":
-            await self.state.resume_approval(row["id"])
+            if await self._may_execute():
+                await self.state.resume_approval(row["id"])
         else:
             await self._stop(row, "Peer operation was not approved")
 
@@ -438,10 +475,16 @@ class PeerCoordinator(PeerTasks):
         else:
             await self.resume_provider(park["id"])
 
-    async def close(self):
+    def quiesce(self):
+        """Fence admission and existing delivery before the host closes transport."""
         self._stopping = True
+        for task in tuple(self._notifications.values()):
+            task.cancel()
         for binding in tuple(self._bindings.values()):
             self._fence(binding)
+
+    async def close(self):
+        self.quiesce()
         active = [
             self.runner._active[sid]
             for sid in self._sessions.values()
