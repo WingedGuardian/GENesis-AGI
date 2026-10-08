@@ -132,6 +132,27 @@ async def test_live_zero_activates_and_info_alerts(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_live_zero_under_a_byte_ceiling_is_reported_not_overwritten(tmp_path):
+    """The persistent key holds a byte ceiling, yet the live cgroup reads 0.
+    Writing "max" would replace the ceiling with unlimited swap until the next
+    restart, so the live half is reported and left alone."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc({"get": (0, "2GiB", "")})
+    act = AsyncMock(return_value=True)
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="0")),
+        patch.object(swap_watch, "activate_swap_max", act),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    act.assert_not_awaited()
+    assert [c[2] for c in sp.calls] == ["get"]  # the ceiling itself is kept too
+    assert _sent_severities(d) == [AlertSeverity.WARNING]
+    assert "2GiB" in d.send.call_args.args[0].body
+
+
+@pytest.mark.asyncio
 async def test_live_heal_with_unverified_config_warns_not_info(tmp_path):
     """config read fails but the cgroup is still writable and at 0: activating
     live must NOT claim a clean reconcile — the persistent knob is unverified

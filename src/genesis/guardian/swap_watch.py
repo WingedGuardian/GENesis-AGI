@@ -16,9 +16,13 @@ sudo access *continuously*, so it reconciles on OBSERVED state each tick:
    ceiling) → ``incus config set ... true`` (covers unset, every FALSE
    spelling, and unparseable garbage; applies at every future container
    start).
-2. **Live**: cgroup ``memory.swap.max == "0"`` → write ``max`` now — what
-   incus would have written at start (``cgroup_ops.activate_swap_max``, the
-   guardian-side twin of scripts/lib/container_swap.sh).
+2. **Live**: cgroup ``memory.swap.max == "0"`` → write ``max`` now
+   (``cgroup_ops.activate_swap_max``, the guardian-side twin of
+   scripts/lib/container_swap.sh). ``max`` is Genesis's own uncapped-swap
+   default, not a value Incus writes: with a hard ``limits.memory``, Incus
+   writes ``0`` for a boolean ``limits.memory.swap`` and the parsed byte value
+   for a ceiling. So when the key holds a ceiling, a live ``0`` is reported
+   and left alone, never overwritten with ``max``.
 
 Healthy path = two cheap reads, no writes, no alerts. A heal emits one INFO
 alert (guardian self-actions must be visible); a failed heal emits a WARNING
@@ -197,8 +201,13 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
         logger.warning("swap_watch: incus config get failed", exc_info=True)
         rc, stdout = 1, ""
     config_verified = rc == 0
+    raw_value = stdout.strip() if rc == 0 else ""
+    # A nonzero byte ceiling in the persistent key: Incus applies it to
+    # memory.swap.max itself at start and on a live limits.memory update.
+    ceiling_configured = (
+        config_verified and _is_swap_on(raw_value) and _is_parseable_incus_size(raw_value.strip())
+    )
     if rc == 0:
-        raw_value = stdout.strip()
         value = raw_value.lower()
         if not _is_swap_on(raw_value):
             try:
@@ -227,7 +236,17 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
     # 2. Live cgroup. Only "0" is the defect; None = no signal (stopped
     # container / cgroup v1), any other value already permits swap.
     current = await read_swap_max(container)
-    if current == "0":
+    if current == "0" and ceiling_configured:
+        # Writing "max" here would replace the operator's ceiling with
+        # unlimited swap until the next restart. Incus applies the ceiling with
+        # no zero window, so a live 0 under one was written from outside:
+        # report it, never overwrite it.
+        problems.append(
+            f"limits.memory.swap holds a ceiling ({raw_value}) but the live "
+            "memory.swap.max is 0 — left as it is; restart the container or "
+            "re-set the key to apply the ceiling",
+        )
+    elif current == "0":
         if await activate_swap_max(container):
             if config_verified:
                 healed.append("memory.swap.max: 0 → max (live, no restart needed)")
