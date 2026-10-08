@@ -1142,5 +1142,7 @@ jobs:
         # No added skip sites; actual hosted-base identity reconciliation owed.
         # Managed queued worker: parent262 existing cases -> current312 (+50):
         # 11 authorization,8 availability,26 roles,flock +2,spawn fence +2,OOM +1.
-        # Floor25210+50=25260; hosted skip identities still require reconciliation.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25260
+        # Writer/snapshot repair: measured current335, net73 against parent262.
+        # Floor25210+50+23=25283. Hosted worker/parent skips: identical97 identities.
+        # The23 new writable-path cases add no skip decorators.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25283

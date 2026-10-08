@@ -104,6 +104,20 @@ def test_held_fallback_does_not_admit_managed_worker(tmp_path):
     assert not log.exists()
 
 
+def test_fresh_worker_write_refusal_is_uncharged_before_spawn(tmp_path, monkeypatch):
+    _fake_worker(tmp_path, monkeypatch)
+    marker = tmp_path / "refusal"
+    monkeypatch.setenv("CODE_INTEL_CHILD_REFUSAL_MARKER", str(marker))
+    (tmp_path / "graph.db").write_text("published graph")
+    (tmp_path / "graph.db").chmod(0o400)
+    monkeypatch.setattr(worker.subprocess, "Popen", lambda *a, **kw: pytest.fail("refused spawn"))
+    with pytest.raises(ValueError, match="ReadWritePaths"):
+        worker._execute_stock_worker(tmp_path / "settings", _args(tmp_path), worker.JOB_CAP)
+    assert marker.read_text() == "refused\n"
+    assert (tmp_path / "graph.db").read_text() == "published graph"
+    assert not list(tmp_path.glob("genesis-worker-*"))
+
+
 @pytest.mark.parametrize("replace_path", [False, True])
 def test_native_child_is_promoted_without_changing_adapter(tmp_path, monkeypatch, replace_path):
     _fake_worker(tmp_path, monkeypatch)

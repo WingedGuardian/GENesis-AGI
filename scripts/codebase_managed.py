@@ -51,6 +51,7 @@ from codebase_managed_unit import (  # noqa: E402,F401
     validate_backend,
     validate_frontend_boundary,
     validate_source_identity,
+    verify_worker_writes,
 )
 from codebase_managed_unit import (
     parse_arguments as native_parse_arguments,
@@ -926,10 +927,11 @@ def uninstall_main(args: argparse.Namespace) -> int:
         return 1
 
 
-def available(path: Path, repo: str) -> None:
+def available(path: Path, repo: str, persistence: bool = True) -> None:
     config = runtime_config(path)
     if absolute(repo).resolve(strict=True) != Path(config["main"]):
         raise ValueError("managed indexing requires the configured physical main checkout")
+    verify_worker_writes(config, persistence)
     verify_cache(config)
     ready(config)
 
@@ -977,7 +979,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "client":
             client(path, args.unit)
         elif args.command == "available":
-            available(path, args.repo)
+            available(path, args.repo, args.persistence == "true")
         else:
             config = runtime_config(path)
             (serve if args.command == "serve" else ready)(config)

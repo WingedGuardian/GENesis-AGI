@@ -88,6 +88,7 @@ _finish_outcome() {
 _cbm_disabled() {
     ! /usr/bin/python3 -I "$SCRIPT_DIR/codebase_managed.py" \
         --config "$HOME/.genesis/config/codebase-managed.json" available --repo "$1" \
+        --persistence "${CODE_INTEL_INDEX_PERSISTENCE:-true}" \
         >/dev/null 2>&1
 }
 

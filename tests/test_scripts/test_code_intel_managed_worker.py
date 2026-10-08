@@ -41,6 +41,7 @@ def managed(tmp_path, monkeypatch):
         "lifecycle_lock": shared_lock,
         "config_path": Path,
         "runtime_config": Mock(return_value=config),
+        "verify_worker_writes": Mock(),
         "verify_cache": Mock(),
         "ready": Mock(),
         "require_enabled": Mock(),
@@ -95,12 +96,13 @@ def test_physical_spawn_holds_shared_lock_but_wait_does_not(managed, monkeypatch
     monkeypatch.setattr(worker.subprocess, "Popen", popen)
     assert invoke(args) == 0
     namespace["require_enabled"].assert_called_once_with(config)
+    namespace["verify_worker_writes"].assert_called_once_with(config, True)
     assert not marker.exists()
     assert not list(Path(args.repo_path).glob("genesis-worker-*"))
 
 
 @pytest.mark.parametrize(
-    "fault", ["runtime_config", "verify_cache", "ready", "require_enabled", "check_backend"]
+    "fault", ["runtime_config", "verify_worker_writes", "verify_cache", "ready", "require_enabled", "check_backend"]
 )
 def test_late_authority_refusals_are_uncharged_before_spawn(managed, monkeypatch, fault):
     namespace, config, events, lock, marker, args = managed

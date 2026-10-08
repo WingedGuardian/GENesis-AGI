@@ -83,6 +83,7 @@ def _execute_stock_worker(path: Path, args: argparse.Namespace, cap: int) -> int
                 strict=True
             ) != Path(config["main"]):
                 raise ValueError("worker requires the configured physical main checkout")
+            managed["verify_worker_writes"](config, args.persistence == "true")
             managed["verify_cache"](config)
             managed["ready"](config)
             executable = managed["verified_binary"](Path(config["binary"]))

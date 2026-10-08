@@ -837,6 +837,7 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
         MISSING="${MISSING}cbm "
     elif /usr/bin/python3 -I "${_CODE_INTEL_ENTRYPOINT%/*}/../codebase_managed.py" \
         --config "$HOME/.genesis/config/codebase-managed.json" available --repo "$REPO_PATH" \
+        --persistence "$PERSISTENCE" \
         >/dev/null 2>&1; then
         CBM_MEM_REFUSE=""
         _cbm_want_b="$(_genesis_mem_bytes "$CBM_MEM_MAX")"
