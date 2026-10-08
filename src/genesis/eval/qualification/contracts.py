@@ -8,7 +8,6 @@ because production clamps or fails open where a qualification must not.
 
 from __future__ import annotations
 
-import math
 import re
 import shutil
 import tempfile
@@ -171,26 +170,42 @@ def raw_score(content, key: str, *, rubric: bool):
     return value if type(value) in (int, float) else None
 
 
+class RecordingRouter:
+    """Case-local observation of the ordinary route_call interface."""
+
+    def __init__(self, router):
+        self.router, self.calls = router, []
+
+    def __getattr__(self, name):
+        return getattr(self.router, name)
+
+    async def route_call(self, call_site_id, messages, **kwargs):
+        result = await self.router.route_call(call_site_id, messages, **kwargs)
+        self.calls.append((messages, result))
+        return result
+
+
 async def relevance(case, router) -> dict:
-    score, detail, _model = await J9EvalBatchExecutor(router=router)._judge_relevance(
+    capture = RecordingRouter(router)
+    score, detail, _model = await J9EvalBatchExecutor(router=capture)._judge_relevance(
         case["query"], case["memory_content"]
     )
     if score is None:
         return {"prediction": None, "error": detail or "relevance_error"}
-    # Inspect the answer before production's clamp can turn NaN/Infinity into
-    # an apparently usable 0 or 1. Both live and recorded routers expose it.
-    try:
-        raw = load_json(router.calls[-1][1])
-        value = raw.get("relevance") if isinstance(raw, dict) else None
-        if isinstance(value, bool) or value is None or not math.isfinite(float(value)):
-            raise ValueError("non-finite or invalid relevance score")
-    except (ValueError, TypeError, OverflowError, IndexError):
+    if len(capture.calls) != 1:
+        raise Incomplete("relevance case did not reach exactly one judge request")
+    # Production coerces and clamps; qualification requires a raw JSON number
+    # in the declared domain before accepting the production decision.
+    value = raw_score(capture.calls[0][1].content, "relevance", rubric=False)
+    if value is None or not 0 <= value <= 1:
         return {"prediction": None, "error": "invalid raw relevance score"}
     return {"prediction": score >= RELEVANT_AT, "error": None}
 
 
 async def novelty(case, router, sandbox) -> dict:
     """Run the production cross-type judgment; grade the raw target it returned."""
+    capture = RecordingRouter(router)
+    router.candidate_ids = []
     db = await sandbox.database(case)
     selected_ids = []
     row_get = extractor._row_get
@@ -214,13 +229,16 @@ async def novelty(case, router, sandbox) -> dict:
                 new_principle=new["principle"],
                 new_steps=new["steps"],
                 embedder=Embedder(case),
-                router=router,
+                router=capture,
             )
     finally:
         await db.close()
-    if len(router.calls) != 1:
+    if len(capture.calls) != 1:
         raise Incomplete("novelty case did not reach exactly one judge request")
-    messages, content = router.calls[0]
+    messages, response = capture.calls[0]
+    if not response.success:
+        return {"prediction": None, "error": "novelty routing failed"}
+    content = response.content
     router.candidate_ids = selected_ids
     mapping = candidate_mapping(case, messages, selected_ids)
     if case["expected_target"] is not None and case["expected_target"] not in mapping:

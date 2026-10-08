@@ -13,6 +13,7 @@ Flat sibling of deploy_candidates.py (see that file for the commands).
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import NamedTuple
@@ -34,6 +35,7 @@ from deploy_candidates_core import (  # noqa: E402
     after_move,
     out,
 )
+from deploy_candidates_gate import SYNC_HOOKS, is_symlink_at, sync_hook_names  # noqa: E402
 
 
 def shared_with(repo: Repo, base: str, heads: dict[str, str]) -> dict[str, list[str]]:
@@ -353,11 +355,111 @@ def move_checkout(repo: Repo, plan: Plan, branch: str | None) -> Move:
     return Move(files_moved, at)
 
 
+def restore_moved_hooks(repo: Repo, before: str | None, after: str) -> None:
+    """Replace each installed git hook whose bytes are exactly that hook as the
+    checkout held it BEFORE the move (``before``) with the moved-to version.
+
+    sync-hooks.sh overwrites an installed hook only when its hash is a version
+    main has shipped (.genesis-hook-versions). A hook an approved candidate
+    installed is not one, so once that candidate leaves `live` (drop, exclusion,
+    retirement) sync would keep it as "user-modified" and readiness would then
+    refuse every rebuild. A hook equal to the pre-move checkout's copy was put
+    there by a sync of that checkout, so this run may replace it; one edited by
+    hand equals neither side and is left for sync-hooks.sh to report. The names
+    are BOTH checkouts' lists: a hook the old checkout installed is deleted when
+    the new checkout no longer installs it (no source, or its list no longer
+    names it), since nothing else ever removes an installed hook. Runs before
+    sync_git_hooks, after the move;
+    failures are reported per hook, never fatal."""
+    if not before:
+        return
+    hooks_dir = repo.hooks_dir()
+    if os.path.realpath(hooks_dir) != os.path.realpath(Path(repo.common_dir()) / "hooks"):
+        # sync-hooks.sh installs into $GIT_COMMON_DIR/hooks; with core.hooksPath
+        # pointing elsewhere readiness already refuses, and this must not write
+        # where sync does not.
+        out("  NOTE: core.hooksPath is set; installed hooks were not restored.")
+        return
+    # A hook is managed on a side only when that side's list names it AND its
+    # source exists: a name leaving the list is gone even if its file stays (an
+    # approved list change enabled another candidate's file, and the list change
+    # was dropped). An unreadable list is unknown, never "empty": nothing is
+    # restored from an unknown old side, nothing deleted for an unknown new one.
+    listed: dict[str, list[str] | None] = {}
+    for ref in (before, after):
+        try:
+            listed[ref] = sync_hook_names(repo.show(ref, SYNC_HOOKS) or "")
+        except Refusal as exc:
+            listed[ref] = None
+            out(
+                f"  NOTE: cannot read the hook list at {ref[:12]} ({exc}); its hooks were not restored."
+            )
+    names: list[str] = []
+    for ref in (before, after):
+        names += [n for n in listed[ref] or [] if n not in names]
+    for name in names:
+        if name in (".", ".."):
+            continue
+        try:
+            _restore_one(
+                repo,
+                hooks_dir / name,
+                f"scripts/hooks/{name}",
+                before if listed[before] is not None and name in listed[before] else None,
+                after,
+                after_listed=listed[after] is None or name in listed[after],
+            )
+        except (OSError, Refusal) as exc:
+            out(f"  NOTE: could not restore git hook {name} ({exc}); sync-hooks.sh follows.")
+
+
+def _restore_one(
+    repo: Repo, dst: Path, path: str, before: str | None, after: str, after_listed: bool
+) -> None:
+    """``before`` is None when the old checkout did not manage this name, and
+    ``after_listed`` False when the moved-to list no longer names it."""
+    if before is None:
+        return
+    old = repo.blob_at(before, path)
+    new = repo.blob_at(after, path) if after_listed else None
+    if old is None or old == new or not dst.is_file():
+        return
+    if is_symlink_at(repo, before, path) or is_symlink_at(repo, after, path):
+        # A link's blob is its target path, not the hook's bytes; sync-hooks.sh
+        # copies the referent, so leave a linked hook to it.
+        return
+    if repo.git("hash-object", "--no-filters", "--", str(dst)).stdout.strip() != old:
+        if new is None:
+            # sync-hooks.sh will not mention a name its list no longer has.
+            out(
+                f"  NOTE: git hook {dst.name} is no longer installed by this checkout but "
+                "was edited by hand; left in place."
+            )
+        return  # not the old checkout's copy: edited by hand, or never synced
+    if new is None:
+        dst.unlink()
+        out(f"  removed git hook {dst.name}: the moved-to checkout no longer installs it.")
+        return
+    tmp = dst.with_name(f"{dst.name}.tmp.{os.getpid()}")
+    try:
+        # repo.git decodes with surrogateescape: encoding back is byte-exact.
+        tmp.write_bytes(repo.git("cat-file", "blob", new).stdout.encode("utf-8", "surrogateescape"))
+        tmp.chmod(0o755)
+        os.replace(tmp, dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    out(f"  restored git hook {dst.name} to the moved-to checkout's version.")
+
+
 def sync_git_hooks(repo: Repo) -> None:
     """Install the git hooks from the checkout (deploy_code_only.sh's step):
     sync-hooks.sh is idempotent and never overwrites a hook someone modified;
-    its non-zero exits are reported, never fatal. On `live` the hook sources
-    are reviewed main's, since admission refuses a candidate that changes them."""
+    its non-zero exits are reported, never fatal. On `live` the hook sources,
+    sync-hooks.sh itself included, are reviewed main's or an approved
+    candidate's: admission refuses any other candidate that changes them, and a
+    rebuild or drop excludes any candidate that is not the sole, approved owner of
+    a hook path it changes."""
     script = repo.root / "scripts" / "hooks" / "sync-hooks.sh"
     if not script.is_file():
         out(f"  NOTE: {script} is missing; the git hook copies were not synced.")

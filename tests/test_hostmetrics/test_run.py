@@ -63,6 +63,15 @@ def test_ladder_takes_full_properties_when_accepted(has_systemd_run):
     assert seen[0][-3:] == ["/bin/sh", "-c", run._ENFORCEMENT_SH]
 
 
+def test_scopes_default_to_the_capped_slice(has_systemd_run):
+    """No caller slice -> app-capped.slice: the disk guardian counts a job's
+    cap kill by that slice's own oom_kill counter, which outlives the scope."""
+    fake, seen = _runner([(0, "")])
+    run.choose_properties("u", 2**30, 100, None, fake)
+    assert "--slice=app-capped.slice" in seen[0]
+    assert run.scope_argv("u", [], None, "x")[6] == "--slice=app-capped.slice"
+
+
 def test_ladder_drops_oom_policy_only_when_systemd_names_it(has_systemd_run):
     # systemd before 253 answers "Unknown assignment: OOMPolicy=continue" for a scope.
     fake, seen = _runner([(1, "Unknown assignment: OOMPolicy=continue"), (0, "")])

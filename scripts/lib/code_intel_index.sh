@@ -645,7 +645,11 @@ fi
 _GN_SCOPE_OK=0
 _CBM_SCOPE_OK=0
 _probe_scope() {
-    local -a slice_args=()
+    # GitNexus batches run in app-capped.slice (a child of app.slice: same
+    # ancestors, plus a kill counter that outlives the scope, which the disk
+    # guardian reads to tell an own-cap kill from any other). CBM keeps
+    # --slice-inherit: its admission checks headroom at the caller's ancestors.
+    local -a slice_args=(--slice=app-capped.slice)
     [ "$2" = "cbm" ] && slice_args=(--slice-inherit)
     [ "$WORKLOAD_SLICE" = "1" ] && slice_args=(--slice=genesis-workload.slice)
     /usr/bin/systemd-run --user --scope "${slice_args[@]}" --quiet \
@@ -664,7 +668,7 @@ fi
 
 _run_capped() {
     if [ "$_SCOPE_OK" = "1" ]; then
-        local -a slice_args=()
+        local -a slice_args=(--slice=app-capped.slice)  # see _probe_scope
         [ "${_CI_SCOPE_INHERIT:-0}" = "1" ] && slice_args=(--slice-inherit)
         [ "$WORKLOAD_SLICE" = "1" ] && slice_args=(--slice=genesis-workload.slice)
         # _CI_SCOPE_UNIT (set by _run_with_watchdog) gives the scope a

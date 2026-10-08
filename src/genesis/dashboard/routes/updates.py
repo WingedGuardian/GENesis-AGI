@@ -8,6 +8,7 @@ import logging
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,8 +17,14 @@ from flask import jsonify, request
 
 from genesis.cc.child_env import pin_dispatched_env
 from genesis.dashboard._blueprint import blueprint
+from genesis.dashboard.update_marker import (
+    UpdateLockError,
+    clear_dead_marker,
+    holding_update_lock,
+    release_marker,
+)
 from genesis.db.connection import connect_sqlite_rw
-from genesis.env import update_in_progress
+from genesis.env import genesis_home, update_in_progress
 from genesis.observability.deploy_record import row_facts
 
 logger = logging.getLogger(__name__)
@@ -27,6 +34,70 @@ _GENESIS_ROOT = _HOME / "genesis"
 _UPDATE_SCRIPT = _GENESIS_ROOT / "scripts" / "update.sh"
 _DB_PATH = _GENESIS_ROOT / "data" / "genesis.db"
 _FAILURE_FILE = _HOME / ".genesis" / "last_update_failure.json"
+_LIVE_CHECKOUT_SCRIPT = _GENESIS_ROOT / "scripts" / "lib" / "live_checkout.py"
+
+
+def _live_refusal() -> tuple[dict, int] | None:
+    """The 409 to answer when the checkout is on `live`, or None to proceed.
+
+    `live` is the integration branch scripts/deploy_candidates rebuilds from the
+    deploy manifest. update.sh and the Tier 2/3 sessions it hands off to work on
+    `main` (a Tier session checks main out and merges), which would move the
+    checkout off `live`, so these routes refuse there and name the two commands
+    that move and restart it. A verdict that cannot be read refuses too, and the
+    printed word must agree with the exit code: python itself exits 1 on a
+    SyntaxError or an uncaught exception, which must never read as "other". The
+    script is run afresh, never imported, so the copy that answers is the one on
+    disk now rather than the one this server booted with.
+    """
+    try:
+        # Bounds a request thread. The script's own git reads are local and capped
+        # at 30 s each (three at most); a hang past that reads as "cannot tell".
+        proc = subprocess.run(
+            [sys.executable, "-I", "-S", str(_LIVE_CHECKOUT_SCRIPT), str(_GENESIS_ROOT)],
+            capture_output=True, text=True, timeout=120,
+        )
+        verdict = (proc.returncode, proc.stdout.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        verdict = (2, "unreadable")
+    if verdict == (1, "other"):
+        # "other" includes a branch named `live` that no manifest builds; the
+        # deploy scripts refuse that by their branch rule (never `live`), so the
+        # route, which has no such rule of its own, refuses it here. GIT_* from
+        # the server's environment (GIT_DIR, ...) would answer for another
+        # repository, so they are dropped, as live_checkout.py does.
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        try:
+            p = subprocess.run(
+                ["git", "-C", str(_GENESIS_ROOT), "symbolic-ref", "-q", "HEAD"],
+                capture_output=True, text=True, timeout=10, env=env,
+            )
+            # 1 with no output is a detached HEAD; any other failure cannot tell.
+            ref = p.stdout.strip() if p.returncode in (0, 1) else "refs/heads/live"
+        except (OSError, subprocess.SubprocessError):
+            ref = "refs/heads/live"  # cannot tell: refuse
+        if ref != "refs/heads/live":
+            return None
+        return {
+            "error": (
+                "The checkout is on a branch named live that no deploy manifest builds; "
+                "an update runs only on main. Nothing was started."
+            )
+        }, 409
+    if verdict == (0, "live"):
+        return {
+            "error": (
+                "This install runs the live integration branch, and an update would "
+                "move the checkout off it. Run scripts/deploy_candidates rebuild, then "
+                "scripts/deploy_code_only.sh restart."
+            )
+        }, 409
+    return {
+        "error": (
+            "Cannot tell whether this install runs the live integration branch (the "
+            "deploy manifest or git could not be read). Nothing was started."
+        )
+    }, 409
 
 
 def _git(*args: str, timeout: int = 10) -> str | None:
@@ -263,22 +334,30 @@ def update_apply():
     """Trigger a CC-supervised update."""
     if not _UPDATE_SCRIPT.is_file():
         return jsonify({"error": "Update script not found"}), 404
-
-    # An update already in progress? Use the canonical liveness check
-    # (env.update_in_progress) so this also catches a CLI `update.sh` run and
-    # restore.sh -- which signal via the state file / marker, not the dashboard's
-    # own PID file -- instead of launching a second run that update.sh's flock
-    # would reject anyway.
-    if update_in_progress():
-        return jsonify({"error": "Update already in progress"}), 409
-    # Not in progress -> any lingering dashboard PID file holds a dead PID; tidy it.
-    _PID_FILE.unlink(missing_ok=True)
-
     use_cc = request.get_json(silent=True) or {}
     supervised = use_cc.get("supervised", True)
 
-    if supervised:
-        return _apply_supervised(_PID_FILE)
+    # Everything from the in-progress check to the marker write runs under
+    # update.lock (#2525), so a deploy or a `deploy_candidates` move cannot start
+    # in between: neither can take the marker, nor move the checkout to `live`
+    # after the live check below said it is not there.
+    with holding_update_lock(_PID_FILE) as held:
+        if not held:
+            return jsonify({"error": _BUSY}), 409
+        # The canonical liveness check (env.update_in_progress) also catches a
+        # CLI update.sh and restore.sh, which signal via the state file / marker.
+        if update_in_progress():
+            return jsonify({"error": "Update already in progress"}), 409
+        clear_dead_marker(_PID_FILE)
+        refusal = _live_refusal()
+        if refusal is not None:
+            return jsonify(refusal[0]), refusal[1]
+        if supervised:
+            # Writes the orchestrator's pid as the marker before the lock goes.
+            return _apply_supervised(_PID_FILE)
+    # The direct path runs update.sh, which takes update.lock itself (`flock -n`)
+    # and refuses while anyone holds it, so it starts only after the lock is
+    # released. update.sh then refuses `live` on its own branch rule.
     return _apply_direct(_PID_FILE)
 
 
@@ -464,7 +543,28 @@ _SUMMARY_FILE = _GENESIS_DIR / "last_update_summary.txt"
 _ESCALATION_FILE = _GENESIS_DIR / "update_escalation.txt"
 _CONFLICT_FILE = _GENESIS_DIR / "update_conflicts.json"
 _STATE_FILE = _GENESIS_DIR / "update_state.json"
-_PID_FILE = _GENESIS_DIR / "update_in_progress.pid"
+# The deploy marker, read by env.update_in_progress() and written by the shell
+# deploys (scripts/lib/deploy_marker.sh). Same root as theirs and the reader's:
+# genesis_home(), which honours GENESIS_HOME.
+_PID_FILE = genesis_home() / "update_in_progress.pid"
+
+
+# A route holds update.lock from its in-progress check to its marker write. That
+# includes _live_refusal(), normally milliseconds of local git reads but capped at
+# about 130 s if git hangs; for that long restore.sh and a CLI update.sh refuse and
+# deploy_code_only.sh queues. Running the live check outside the lock would let a
+# rebuild move the checkout to `live` after it answered, which is what #2525 closes.
+_BUSY = (
+    "A deploy, an update or a validation hold has update.lock; nothing was started. "
+    "Try again when it finishes."
+)
+
+
+@blueprint.errorhandler(UpdateLockError)
+def _update_lock_unopenable(exc: UpdateLockError):
+    """update.lock could not be opened at all: say so, rather than "busy"."""
+    logger.error("update.lock: %s", exc)
+    return jsonify({"error": f"Cannot open update.lock ({exc}); nothing was started."}), 500
 
 
 def _apply_supervised(pid_file: Path) -> tuple:
@@ -561,9 +661,16 @@ def _apply_supervised(pid_file: Path) -> tuple:
             cwd=str(_GENESIS_ROOT),
         )
     log_fh.close()  # Child inherited the fd; parent can close its copy
-    # Write orchestrator PID so dismiss/concurrency checks see a live process
-    # even between tiers. The orchestrator overwrites with CC PIDs while they run.
-    pid_file.write_text(str(proc.pid))
+    # The orchestrator's pid is the deploy marker for the whole run, written while
+    # the caller holds update.lock (#2525). MEASURED: `systemd-run --user --scope`
+    # execs the command, so proc.pid is the orchestrator's on both paths.
+    try:
+        pid_file.write_text(str(proc.pid))
+    except OSError:
+        # An orchestrator no marker names would run unseen by the watchdog and by
+        # every deploy; stop it rather than leave it running.
+        proc.kill()
+        raise
     logger.info("Update orchestrator started (pid %d), log: %s", proc.pid, log_file)
 
     return jsonify({
@@ -634,13 +741,17 @@ GENESIS_ROOT = Path({genesis_root!r})
 MY_PID = os.getpid()
 SCRIPT_FILE = Path(sys.argv[0])
 
-# Write our PID immediately so concurrency guards see a live process.
-# systemd-run's PID (written by Flask) exits quickly after scope setup,
-# leaving a stale PID in the file until we overwrite it here.
-PID_FILE.write_text(str(MY_PID))
+# The route that started us wrote OUR pid as the deploy marker while it held
+# update.lock (systemd-run --scope execs us, so its pid is ours), and we leave it
+# alone until we exit: the marker names a live process for the whole run, never a
+# finished child's pid that a deploy could take over and we would overwrite.
 
 def cleanup():
-    PID_FILE.unlink(missing_ok=True)
+    try:
+        if PID_FILE.read_text().strip() == str(MY_PID):
+            PID_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
     if SCRIPT_FILE and SCRIPT_FILE.name.startswith("genesis-update-orch-"):
         try:
             SCRIPT_FILE.unlink(missing_ok=True)
@@ -667,17 +778,12 @@ def spawn_cc(prompt, model, effort=None):
         proc = subprocess.Popen(
             cmd, start_new_session=True, cwd=str(GENESIS_ROOT), env=env,
         )
-        PID_FILE.write_text(str(proc.pid))
         log.info("CC %s started (pid %d)", model, proc.pid)
         proc.wait()
         log.info("CC %s finished (rc=%d)", model, proc.returncode)
-        # Restore orchestrator PID so dismiss/concurrency checks see us
-        # alive between tiers (prevents race where stale CC PID allows dismiss)
-        PID_FILE.write_text(str(MY_PID))
         return proc.returncode
     except Exception as e:
         log.error("Failed to spawn CC %s: %s", model, e)
-        PID_FILE.write_text(str(MY_PID))
         return 1
 
 # ── Tier 1: Haiku ──
@@ -731,11 +837,14 @@ def update_dismiss():
     # Refuse while any deploy is live (marker OR CLI state file) -- don't clear a
     # slow-but-active update's state out from under it. Canonical liveness check
     # so a CLI `update.sh` run counts too, not just the dashboard's PID file.
-    if update_in_progress():
-        return jsonify({"error": "Update still in progress"}), 409
-
-    for f in (_SUMMARY_FILE, _ESCALATION_FILE, _CONFLICT_FILE, _STATE_FILE, _PID_FILE):
-        f.unlink(missing_ok=True)
+    # Under update.lock (#2525): update.sh holds it for its whole run, so its
+    # state file cannot be deleted between the check and the unlink.
+    with holding_update_lock(_PID_FILE) as held:
+        if not held or update_in_progress():
+            return jsonify({"error": "Update still in progress"}), 409
+        for f in (_SUMMARY_FILE, _ESCALATION_FILE, _CONFLICT_FILE, _STATE_FILE):
+            f.unlink(missing_ok=True)
+        clear_dead_marker(_PID_FILE)
     logger.info("Update state files dismissed by user")
     return jsonify({"status": "dismissed"})
 
@@ -750,21 +859,33 @@ def update_resolve():
     if not has_escalation and not has_conflicts:
         return jsonify({"error": "No conflicts pending"}), 404
 
-    # An update session already running? Canonical liveness (marker + state file)
-    # so a CLI run counts too, not just the dashboard's own PID file.
-    if update_in_progress():
-        return jsonify({"error": "Update session already in progress"}), 409
-    # Not in progress -> any lingering PID file is stale; tidy it.
-    _PID_FILE.unlink(missing_ok=True)
-
     tier3_prompt = _TIER3_PROMPT.format(
         escalation_file=_ESCALATION_FILE,
         summary_file=_SUMMARY_FILE,
         update_script=_UPDATE_SCRIPT,
     )
 
-    proc = _spawn_detached_cc(tier3_prompt, "opus", "max")
-    _PID_FILE.write_text(str(proc.pid))
+    # From the in-progress check to the marker write under update.lock (#2525),
+    # as in /apply: nothing can take the marker or move the checkout to `live`
+    # between the live check and the Tier 3 session's start.
+    with holding_update_lock(_PID_FILE) as held:
+        if not held:
+            return jsonify({"error": _BUSY}), 409
+        # Canonical liveness (marker + state file), so a CLI run counts too.
+        if update_in_progress():
+            return jsonify({"error": "Update session already in progress"}), 409
+        clear_dead_marker(_PID_FILE)
+        refusal = _live_refusal()
+        if refusal is not None:
+            return jsonify(refusal[0]), refusal[1]
+        proc = _spawn_detached_cc(tier3_prompt, "opus", "max")
+        try:
+            _PID_FILE.write_text(str(proc.pid))
+        except OSError:
+            # As in _apply_supervised: a session no marker names would change the
+            # checkout unseen by the watchdog and every deploy; stop it.
+            proc.kill()
+            raise
     logger.info("Tier 3 (Opus) started (pid %d)", proc.pid)
 
     # Reaper thread prevents zombie — waits for Opus to finish, cleans up PID file.
@@ -774,7 +895,7 @@ def update_resolve():
 
     def _reap():
         proc.wait()
-        _PID_FILE.unlink(missing_ok=True)
+        release_marker(_PID_FILE, proc.pid)
         logger.info("Tier 3 (Opus) finished (rc=%d)", proc.returncode)
 
     threading.Thread(target=_reap, daemon=True, name="tier3-reaper").start()

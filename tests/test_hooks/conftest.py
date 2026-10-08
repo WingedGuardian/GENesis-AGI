@@ -201,6 +201,19 @@ def _hermetic_rounds_row(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_squash_body_file(monkeypatch):
+    """Keep ``--check-pr`` from writing its squash body file for EVERY hook test.
+
+    When every gate passes, the report writes the body under ``~/tmp/merge-bodies``
+    in the REAL home directory, and reads the PR body and commits to build it.
+    Report tests whose commit seam includes their head would otherwise leave files
+    in the install (MEASURED: one did). tests/test_hooks/test_squash_body_trailer.py
+    clears this per case, with a temporary HOME."""
+    monkeypatch.setenv("_TEST_SQUASH_BODY_FILE", "off")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_main_reverts(monkeypatch):
     """Pin the ``--check-pr`` ``main-reverts`` row's commit read for EVERY hook test.
 

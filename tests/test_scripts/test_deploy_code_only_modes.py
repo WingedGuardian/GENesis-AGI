@@ -101,6 +101,7 @@ _SCRIPT_FILES = (
     "lib/manifest_delta.py",
     "lib/serving_commit.py",
     "lib/server_sessions.py",
+    "lib/live_checkout.py",
     "lib/venv_matches_pyproject.py",
 )
 

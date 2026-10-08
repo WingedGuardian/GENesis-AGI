@@ -12,7 +12,8 @@ Three properties, each pinned below through the REAL hook as a subprocess:
    alike (no ask: an ask with nobody present is a block nobody intended).
 2. Reads stay silent: a GET of `pulls/N/merge` (the "is it merged?" check), the
    `merge-async/{uuid}` status read, GraphQL queries, the two mutations that UNDO
-   a merge request, ordinary review replies, and `gh pr merge --help`.
+   a merge request, ordinary review replies, `gh pr merge --help` and
+   `gh help pr merge`.
 3. The refusal is decided before the guard runs any subprocess.
 """
 
@@ -211,6 +212,7 @@ SILENT = [
     ),
     pytest.param("gh pr merge --help", id="pr-merge-help"),
     pytest.param("gh pr merge -h", id="pr-merge-short-help"),
+    pytest.param("gh help pr merge", id="gh-help-pr-merge"),
     pytest.param(f"echo 'gh api -X PUT {_R}/pulls/5/merge'", id="quoted-mention"),
     pytest.param(
         "gh api graphql -f query='query($n: Int!) { viewer { login } }' -F n=1",

@@ -3,15 +3,21 @@ place it is written.
 
 The manifest (``$HOME/.genesis/deploy_manifest.json``) is INTENT only:
 
-    {"version": 2, "repo": <absolute git common dir>,
+    {"version": 3, "repo": <absolute git common dir>,
      "candidates": [{"branch", "pr", "owner_session", "added_at",
-                     "verified_head"}]}
+                     "verified_head", "hook_approval"}]}
 
 ``verified_head`` pins the commit `add` saw: `live` runs that commit and never a
-later one, until the candidate is added again. There is no approval record:
-running an unmerged branch on this install's own server needs none (owner
-ruling, 2026-10-01). Version 1 (with an ``owner_approved`` boolean) is refused.
-No install ever held one, since the engine shipped inert.
+later one, until the candidate is added again. Running an unmerged branch on this
+install's own server needs no approval (owner ruling, 2026-10-01), with ONE
+exception: a candidate that changes a git or Claude Code hook goes live only with
+the owner's approval in chat, recorded per candidate as ``hook_approval``
+(owner ruling, #2978, 2026-10-06): ``null``, or ``{"head": <the pinned
+verified_head>, "approved_by": <who said yes>, "approved_at": <time>}``. The
+approval names the head it was given for, so adding the branch again at another
+head clears it. Versions 1 (an ``owner_approved`` boolean) and 2 (no
+``hook_approval``) are refused; no install ever held either, since `add` refuses
+until the engine is armed.
 
 The git hooks and the commit and merge guards read only ``repo`` from this file.
 Everything here VALIDATES ON WRITE as well as on read, so no command can write a
@@ -30,8 +36,9 @@ from pathlib import Path
 # sibling modules from this directory: scripts/ is never on sys.path.
 from deploy_candidates_core import HEX40, Refusal, valid_candidate_name  # noqa: E402
 
-MANIFEST_VERSION = 2
-_ENTRY_KEYS = {"branch", "pr", "owner_session", "added_at", "verified_head"}
+MANIFEST_VERSION = 3
+_ENTRY_KEYS = {"branch", "pr", "owner_session", "added_at", "verified_head", "hook_approval"}
+_APPROVAL_KEYS = {"head", "approved_by", "approved_at"}
 
 
 def _nonempty(value: object) -> bool:
@@ -69,6 +76,15 @@ def manifest_problem(data: object) -> str:
                 return f"candidate {c['branch']} has no {key}"
         if not isinstance(c["verified_head"], str) or not HEX40.match(c["verified_head"]):
             return f"candidate {c['branch']} has no full verified_head"
+        ha = c["hook_approval"]
+        if ha is not None:
+            if not isinstance(ha, dict) or set(ha) != _APPROVAL_KEYS:
+                return f"candidate {c['branch']} has a hook_approval that is not {sorted(_APPROVAL_KEYS)}"
+            if ha["head"] != c["verified_head"]:
+                return f"candidate {c['branch']}'s hook_approval is for another head than the pinned one"
+            for key in ("approved_by", "approved_at"):
+                if not _nonempty(ha[key]):
+                    return f"candidate {c['branch']}'s hook_approval has no {key}"
     return ""
 
 

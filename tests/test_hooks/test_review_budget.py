@@ -923,3 +923,29 @@ def test_a_stall_before_the_call_is_a_timeout_never_a_traceback_or_a_doomed_call
     assert "graphql_read_timeout" in got["errors"], got
     assert calls == [], calls
     assert ticks["n"] == 2, "the call decision must rest on exactly one clock reading"
+
+
+def test_a_comment_reposted_between_reads_is_not_unknown(monkeypatch):
+    """Round 1 of #3040: a comment deleted and reposted with the same text
+    between the two reads changes only its id. Ids never decide the count, so
+    they must not open a new path to unknown."""
+    _no_seams(monkeypatch)
+    note = {
+        "body": "same text",
+        "createdAt": "2026-10-07T00:00:00Z",
+        "author": {"login": "someone", "__typename": "User"},
+    }
+    first = _graphql_server(
+        comments=[dict(note, fullDatabaseId="1")], files=_FILES, commits=_COMMITS
+    )
+    again = _graphql_server(
+        comments=[dict(note, fullDatabaseId="2")], files=_FILES, commits=_COMMITS
+    )
+    calls = []
+
+    def serve(argv, *, timeout):
+        calls.append(argv)
+        return (first if len(calls) == 1 else again)(argv, timeout=timeout)
+
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got

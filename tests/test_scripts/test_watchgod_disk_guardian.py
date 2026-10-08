@@ -1255,3 +1255,26 @@ def test_a_retried_page_repeats_a_refused_sweep(box, cctmp):
                   'printf "LEVER=%s\\n" "$_WG_LEVER_SWEEP"')
     lever = [ln for ln in r.stdout.splitlines() if ln.startswith("LEVER=")][-1]
     assert "last attempted" in lever and "REFUSED to run (mount table unreadable)" in lever, lever
+
+
+def test_attribution_names_the_trash_stores_separately(box):
+    # #2926 PR 4: trash grows without expiry (#2504), so YELLOW attribution must
+    # name it on its own line rather than only inside $HOME/.genesis.
+    for name in ("trash", "worktree-trash"):
+        (box["home"] / ".genesis" / name).mkdir(parents=True, exist_ok=True)
+    proc = _run(box, "DG_ATTRIBUTION_PATHS=''; attribution_paths")
+    assert proc.returncode == 0, proc.stderr
+    lines = proc.stdout.splitlines()
+    assert str(box["home"] / ".genesis" / "trash") in lines
+    assert str(box["home"] / ".genesis" / "worktree-trash") in lines
+    # And du really gives them a line: it counts each inode once, in argument
+    # order, so a store listed after its parent would print nothing.
+    proc = _run(
+        box,
+        "DG_ATTRIBUTION_PATHS=''; mapfile -t t < <(attribution_paths); du -smx -- \"${t[@]}\"",
+    )
+    assert proc.returncode == 0, proc.stderr
+    measured = [line.split("\t", 1)[1] for line in proc.stdout.splitlines()]
+    assert str(box["home"] / ".genesis" / "trash") in measured
+    assert str(box["home"] / ".genesis" / "worktree-trash") in measured
+    assert str(box["home"] / ".genesis") in measured
