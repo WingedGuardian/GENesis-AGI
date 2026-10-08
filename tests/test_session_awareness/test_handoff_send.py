@@ -221,6 +221,7 @@ def test_session_row_is_fixed_text_and_mirrored(peer, capsys):
     assert text.startswith("Review peer handoff note.md (sha ")
     assert (status, added_by) == ("open", "foreground")
     assert source_ref.startswith("peer-handoff from install unknown, ")
+    assert source_ref.endswith(f", sha256 {sha}")
     mirror = peer["home"] / ".genesis" / "sessions" / SID / "charter.md"
     assert text in mirror.read_text()
 
@@ -360,9 +361,11 @@ def test_unexpected_peer_response_is_a_clean_error(peer, capsys, monkeypatch):
     assert "unexpected response from peer" in err and "\x1b" not in err
 
 
-def test_stale_mirror_with_a_closed_copy_of_the_row_is_not_accepted(peer, capsys):
+def test_stale_mirror_with_a_closed_copy_of_the_row_is_reported_not_claimed(peer, capsys):
     # A closed row with the same text renders as `- [x] <text>` in charter.md, so
-    # a substring check passes even when the refresh silently failed.
+    # a substring check would claim the mirror shows the row when the refresh
+    # silently failed. The mirror is best-effort (the DB is canonical), so the
+    # row still commits and the stale mirror is REPORTED, never claimed.
     f = _src(peer["tmp"], b"body\n")
     text = S.ledger_text("note.md", hashlib.sha256(b"body\n").hexdigest(), "unknown")
     con = sqlite3.connect(peer["db"])
@@ -379,10 +382,13 @@ def test_stale_mirror_with_a_closed_copy_of_the_row_is_not_accepted(peer, capsys
     mirror.write_text(f"- [x] {text}\n")
     mirror.chmod(0o444)  # the refresh's write fails, and refresh_mirror swallows it
     try:
-        assert cli("send", "--peer", "p1", "--file", str(f), "--session", SID) == 2
+        assert cli("send", "--peer", "p1", "--file", str(f), "--session", SID) == 0
     finally:
         mirror.chmod(0o644)
-    assert "mirror refresh failed" in capsys.readouterr().err
+    out = capsys.readouterr().out
+    assert "was not refreshed" in out and "charter mirror shows it" not in out
+    live = [r for r in _rows(peer["db"]) if r[0] == text and r[1] == "open"]
+    assert len(live) == 1
 
 
 def test_non_foreground_target_session_is_refused(peer, capsys):
@@ -447,7 +453,8 @@ def test_new_file_never_clobbers_one_that_appears_after_the_check(peer, capsys, 
     assert target.read_bytes() == b"the other sender\n"
 
 
-def test_new_file_falls_back_to_exclusive_create_without_hard_links(peer, monkeypatch):
+def test_without_hard_links_a_new_file_is_refused_not_written_in_place(peer, capsys, monkeypatch):
+    # Writing the final name in place would expose a partial file to a reader.
     _shim(
         peer,
         monkeypatch,
@@ -455,8 +462,9 @@ def test_new_file_falls_back_to_exclusive_create_without_hard_links(peer, monkey
         "os.link = link\n",
     )
     f = _src(peer["tmp"], b"mine\n")
-    assert cli("send", "--peer", "p1", "--file", str(f)) == 0
-    assert (peer["hdir"] / "note.md").read_bytes() == b"mine\n"
+    assert cli("send", "--peer", "p1", "--file", str(f)) == 2
+    assert "does not support hard links" in capsys.readouterr().err
+    assert list(peer["hdir"].iterdir()) == []
 
 
 def test_oversized_existing_peer_file_is_refused_not_loaded(peer, capsys):
@@ -523,3 +531,86 @@ def test_overlapping_sends_leave_exactly_one_row(peer):
     assert len(added) == 1
     # A sender that lost the file race may refuse; none may duplicate the row.
     assert 0 in rcs
+
+
+def test_dedup_uses_the_full_digest_not_the_row_text_prefix(peer):
+    # An open row with the same text (same 8-hex prefix) but another full sha
+    # is a different delivery: the new pointer must still be added.
+    body = b"body\n"
+    sha = hashlib.sha256(body).hexdigest()
+    con = sqlite3.connect(peer["db"])
+    con.execute(
+        "INSERT INTO session_ledger (id, session_id, text, source_ref, created_at)"
+        " VALUES ('r9', ?, ?, ?, '2026-01-01T00:00:00+00:00')",
+        (SID, S.ledger_text("note.md", sha, "unknown"), "peer-handoff, sha256 " + "0" * 64),
+    )
+    con.commit()
+    con.close()
+    f = _src(peer["tmp"], body)
+    assert cli("send", "--peer", "p1", "--file", str(f), "--session", SID) == 0
+    texts = [r[0] for r in _rows(peer["db"])]
+    assert texts.count(S.ledger_text("note.md", sha, "unknown")) == 2
+
+
+def test_source_that_is_not_a_regular_file_is_refused_without_blocking(peer, capsys):
+    fifo = peer["tmp"] / "out" / "pipe.md"
+    fifo.parent.mkdir(exist_ok=True)
+    __import__("os").mkfifo(fifo)
+    assert cli("send", "--peer", "p1", "--file", str(fifo)) == 2
+    assert "not a regular file" in capsys.readouterr().err
+
+
+def test_delivered_file_is_published_with_a_normal_mode(peer):
+    import os
+
+    mask = os.umask(0)
+    os.umask(mask)
+    f = _src(peer["tmp"], b"body\n")
+    assert cli("send", "--peer", "p1", "--file", str(f)) == 0
+    mode = (peer["hdir"] / "note.md").stat().st_mode & 0o777
+    assert mode == 0o666 & ~mask
+
+
+def test_replace_keeps_the_existing_file_mode(peer):
+    target = peer["hdir"] / "note.md"
+    target.write_bytes(b"old\n")
+    target.chmod(0o640)
+    f = _src(peer["tmp"], b"new\n")
+    assert cli("send", "--peer", "p1", "--file", str(f), "--replace") == 0
+    assert target.read_bytes() == b"new\n"
+    assert target.stat().st_mode & 0o777 == 0o640
+
+
+def test_identical_concurrent_delivery_is_unchanged_not_a_conflict(peer, capsys, monkeypatch):
+    target = peer["hdir"] / "note.md"
+    _shim(
+        peer,
+        monkeypatch,
+        "import tempfile\n"
+        "_orig = tempfile.mkstemp\n"
+        "def mkstemp(*a, **k):\n"
+        f"    open({str(target)!r}, 'wb').write(b'same\\n')\n"
+        "    return _orig(*a, **k)\n"
+        "tempfile.mkstemp = mkstemp\n",
+    )
+    f = _src(peer["tmp"], b"same\n")
+    assert cli("send", "--peer", "p1", "--file", str(f)) == 0
+    assert "already present, unchanged" in capsys.readouterr().out
+
+
+def test_preexisting_duplicate_rows_do_not_block_a_resend(peer):
+    body = b"body\n"
+    sha = hashlib.sha256(body).hexdigest()
+    text = S.ledger_text("note.md", sha, "unknown")
+    con = sqlite3.connect(peer["db"])
+    for rid in ("d1", "d2"):
+        con.execute(
+            "INSERT INTO session_ledger (id, session_id, text, source_ref, created_at)"
+            " VALUES (?, ?, ?, ?, '2026-01-01T00:00:00+00:00')",
+            (rid, SID, text, "peer-handoff from install unknown, x, sha256 " + sha),
+        )
+    con.commit()
+    con.close()
+    f = _src(peer["tmp"], body)
+    assert cli("send", "--peer", "p1", "--file", str(f), "--session", SID) == 0
+    assert [r[0] for r in _rows(peer["db"])].count(text) == 2

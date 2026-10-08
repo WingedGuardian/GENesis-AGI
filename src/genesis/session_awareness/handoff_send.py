@@ -32,7 +32,9 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import shlex
+import stat
 import subprocess
 import sys
 import uuid
@@ -186,7 +188,7 @@ def ledger_text(safe_name: str, sha: str, install8: str) -> str:
 # ── the remote program (constant; runs on the peer from stdin) ──────────────
 
 REMOTE_PROGRAM = r"""
-import asyncio, base64, hashlib, json, os, re, sys, tempfile
+import asyncio, base64, hashlib, json, os, re, stat, sys, tempfile
 P = json.loads(_PAYLOAD)
 
 
@@ -252,16 +254,24 @@ def sessions():
 
 
 def sha_bounded(path, cap):
-    # Size from the open descriptor before reading, then hash in chunks: a huge
-    # file is refused cleanly instead of being loaded whole.
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    # The read side's _identity pattern: no-follow and non-blocking (a FIFO
+    # swapped in cannot hang the open), a regular-file check on the descriptor
+    # held, and a running byte cap that holds even if the file grows mid-read.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
     with os.fdopen(fd, "rb") as fh:
-        if os.fstat(fh.fileno()).st_size > cap:
-            raise Fail(f"{path} is over {cap} bytes; refusing to read it")
+        fst = os.fstat(fh.fileno())
+        if not stat.S_ISREG(fst.st_mode):
+            raise Fail(f"{path} is not a regular file")
         h = hashlib.sha256()
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
+        total = 0
+        while True:
+            chunk = fh.read(min(1 << 20, cap + 1 - total))
+            if not chunk:
+                return h.hexdigest()
+            total += len(chunk)
+            if total > cap:
+                raise Fail(f"{path} is over {cap} bytes; refusing to read it")
             h.update(chunk)
-    return h.hexdigest()
 
 
 def check_file(H, body):
@@ -291,43 +301,54 @@ def check_file(H, body):
     return d, target, "replace"
 
 
-def write_atomic(d, target, body, overwrite):
+def write_atomic(H, d, target, body, overwrite):
+    # Publish body at target; returns the file action that happened.
     fd, tmp = tempfile.mkstemp(prefix="." + P["name"] + ".", dir=d)
     try:
         with os.fdopen(fd, "wb") as fh:
+            # mkstemp creates 0600; a handoff is published like any file in the
+            # directory (umask-honest 0666), and --replace keeps the old mode.
+            if overwrite:
+                mode = stat.S_IMODE(os.stat(target, follow_symlinks=False).st_mode)
+            else:
+                mask = os.umask(0)
+                os.umask(mask)
+                mode = 0o666 & ~mask
+            os.fchmod(fh.fileno(), mode)
             fh.write(body)
             fh.flush()
             os.fsync(fh.fileno())
         if overwrite:
             os.replace(tmp, target)
-            return
+            return "replace"
         # A new file must never clobber one that appeared after the check:
         # link() fails if the name exists, unlike rename/replace.
         try:
             os.link(tmp, target)
         except FileExistsError:
-            raise Fail(f"{P['name']} appeared on the peer during delivery; re-run "
-                       "(pass --replace to overwrite it)") from None
-        except OSError:
-            # No hard links on this filesystem: exclusive create, written in place.
-            try:
-                out = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                              0o600)
-            except FileExistsError:
-                raise Fail(f"{P['name']} appeared on the peer during delivery; re-run "
-                           "(pass --replace to overwrite it)") from None
-            with os.fdopen(out, "wb") as fh:
-                fh.write(body)
-                fh.flush()
-                os.fsync(fh.fileno())
+            # An identical concurrent delivery is not a conflict.
+            if sha_bounded(target, H.MAX_HASH_BYTES) == P["sha256"]:
+                return "unchanged"
+            raise Fail(f"{P['name']} appeared on the peer during delivery with other "
+                       "content; re-run (pass --replace to overwrite it)") from None
+        except OSError as exc:
+            # link() is the only no-replace publish that is also atomic; writing
+            # the final name in place would let a reader hash a partial file.
+            raise Fail(f"cannot publish {P['name']} atomically on the peer: the handoff "
+                       f"directory does not support hard links ({exc})") from None
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+    return "write"
 
 
 async def live_matches(C, db, sid):
+    # The row text shows only an 8-hex prefix; the full digest in source_ref is
+    # the identity, so a --replace whose sha shares that prefix still adds a row.
+    full = "sha256 " + P["sha256"]
     rows = await C.ledger_list(db, sid, ["open", "in_progress"])
-    return [r for r in rows if r["text"] == P["ledger_text"]]
+    return [r for r in rows
+            if r["text"] == P["ledger_text"] and full in (r.get("source_ref") or "")]
 
 
 async def send():
@@ -393,7 +414,7 @@ async def finish(H, res, d, target, body, C, db, sid, SC):
                                    + content.encode()).hexdigest()[:H.ID_DISPLAY_LEN]
         return res
     if res["file"] != "unchanged":
-        write_atomic(d, target, body, overwrite=res["file"] == "replace")
+        res["file"] = write_atomic(H, d, target, body, overwrite=res["file"] == "replace")
     if sha_bounded(target, H.MAX_HASH_BYTES) != P["sha256"]:
         raise Fail(f"read-back of {target} does not match the sent sha256")
     st = target.stat()
@@ -405,9 +426,8 @@ async def finish(H, res, d, target, body, C, db, sid, SC):
     # (checked above), so upsert_stub is a no-op kept for parity; it commits
     # itself, so it runs before the locked section.
     await C.upsert_stub(db, sid)
-    # ONE write-locked section from the dedup check to the mirror check: two
-    # overlapping sends cannot both add the row, and no other writer can change
-    # the ledger between the mirror refresh and its verification.
+    # The dedup check and the insert in ONE write-locked section, so two
+    # overlapping sends cannot both add the row.
     await db.execute("BEGIN IMMEDIATE")
     try:
         if await live_matches(C, db, sid):
@@ -417,29 +437,38 @@ async def finish(H, res, d, target, body, C, db, sid, SC):
             await C.ledger_add(db, session_id=sid, text=P["ledger_text"],
                                source_ref=P["source_ref"], added_by="foreground",
                                commit=False)
-        n = len(await live_matches(C, db, sid))
-        if n != 1:
-            raise Fail(f"ledger read-back found {n} live copies of the pointer row "
-                       "(expected 1)")
-        await SC.refresh_mirror(db, sid)
-        # refresh_mirror swallows its own errors, and an old closed row or a
-        # stale file can contain the same text, so compare the WHOLE file to a
-        # render of the same locked snapshot rather than searching it.
-        mirror = SC.SESSIONS_DIR / sid / "charter.md"
-        expected = SC.charter_md(await C.get(db, sid), await C.ledger_list(db, sid))
-        try:
-            shown = mirror.read_text(encoding="utf-8") == expected
-        except OSError:
-            shown = False
+            n = len(await live_matches(C, db, sid))
+            if n != 1:
+                raise Fail(f"ledger read-back found {n} live copies of the pointer row "
+                           "after adding one (expected 1)")
         await db.commit()
     except BaseException:
         await db.rollback()
         raise
-    if not shown:
-        raise Fail(f"the row is in the peer DB but {mirror} does not show it "
-                   "(mirror refresh failed)")
+    # The DB is canonical and is what re-injection reads; charter.md is a
+    # best-effort human mirror that other writers also refresh after their own
+    # commits. So it is refreshed from committed state, as the MCP layer does,
+    # and checked as ADVISORY: the whole file against a render of the DB (a
+    # substring search would accept an old closed copy of the row).
+    await SC.refresh_mirror(db, sid)
+    mirror = SC.SESSIONS_DIR / sid / "charter.md"
+    expected = SC.charter_md(await C.get(db, sid), await C.ledger_list(db, sid))
     res["mirror"] = str(mirror)
+    res["mirror_ok"] = read_small(mirror) == expected
     return res
+
+
+def read_small(path, cap=1 << 20):
+    # Bounded, no-follow, non-blocking: a tampered mirror path cannot hang this.
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return None
+            data = fh.read(cap + 1)
+        return None if len(data) > cap else data.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
 
 
 def main():
@@ -479,6 +508,19 @@ def run_remote(peer: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     raise PeerError(
         f"no result from peer (exit {proc.returncode}): {err[-2000:] or stdout[-2000:]}"
     )
+
+
+def read_source(src: Path, cap: int) -> bytes:
+    """The handoff file, read with a hard byte cap: a regular file only, never
+    more than ``cap + 1`` bytes held, whatever it does while being read."""
+    fd = os.open(src, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            raise PeerError(f"{src} is not a regular file")
+        body = fh.read(cap + 1)
+    if len(body) > cap:
+        raise PeerError(f"{src} is over {cap} bytes; a handoff is a note")
+    return body
 
 
 def _printable(text: str) -> str:
@@ -529,11 +571,7 @@ def _cmd_send(args: argparse.Namespace) -> int:
     peer = get_peer(args.peer)
     src = Path(args.file)
     name = validate_name(args.name or src.name)
-    if src.stat().st_size > H.MAX_HASH_BYTES:
-        raise PeerError(f"{src} is over {H.MAX_HASH_BYTES} bytes; a handoff is a note")
-    body = src.read_bytes()
-    if len(body) > H.MAX_HASH_BYTES:
-        raise PeerError(f"{src} is over {H.MAX_HASH_BYTES} bytes; a handoff is a note")
+    body = read_source(src, H.MAX_HASH_BYTES)
     sha = hashlib.sha256(body).hexdigest()
     install8 = local_install_id8()
     date = datetime.now(UTC).date().isoformat()
@@ -544,13 +582,16 @@ def _cmd_send(args: argparse.Namespace) -> int:
         "sha256": sha,
         "session": args.session or "",
         "ledger_text": ledger_text(name, sha, install8),
-        "source_ref": f"peer-handoff from install {install8}, {date}",
+        "source_ref": f"peer-handoff from install {install8}, {date}, sha256 {sha}",
         "replace": bool(args.replace),
         "dry_run": bool(args.dry_run),
     }
     res = run_remote(peer, payload)
     if not res.get("ok"):
-        raise PeerError(f"peer refused: {_printable(res.get('error'))}")
+        raise PeerError(
+            f"delivery failed on the peer: {_printable(res.get('error'))} "
+            "(anything already delivered stays; a re-send is idempotent and reconciles)"
+        )
     # The response is peer-authored: check every enum before indexing, and
     # neutralise every string before it reaches the terminal.
     if res.get("file") not in ("write", "replace", "unchanged") or (
@@ -573,8 +614,13 @@ def _cmd_send(args: argparse.Namespace) -> int:
                 res["row"]
             ]
         print(f"  pointer row on session {res['session']}: {row}")
-        if res.get("mirror"):
+        if res.get("mirror_ok") is True:
             print(f"  charter mirror shows it: {res['mirror']}")
+        elif res.get("mirror"):
+            print(
+                f"  row committed; {res['mirror']} was not refreshed (a best-effort "
+                "mirror: the DB is canonical and the next ledger write regenerates it)"
+            )
     print(TRUST_NOTE)
     return 0
 

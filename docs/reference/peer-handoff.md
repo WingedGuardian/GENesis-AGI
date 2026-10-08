@@ -50,19 +50,30 @@ python -m genesis handoffs send --peer other-install --file note.md \
   only with `--show-text`, because the peer wrote them.
 - `send` checks the name (the handoff safe-name rule, `.md`, not a `-REPLY`
   name), then on the peer: same content already present is a no-op; different
-  content is refused unless `--replace`; the write is atomic and read back by
-  sha256. It prints the handoff id exactly as the peer's `handoffs list` shows it.
+  content is refused unless `--replace`. A new file is published with `link()`,
+  so it never overwrites a file that appeared after the check (the directory
+  must support hard links, or `send` refuses); `--replace` is last-writer-wins
+  and keeps the old file's mode. A new file gets the directory's normal mode
+  (umask-honest 0666). Peer files are read through a bounded, no-follow,
+  non-blocking reader, and the result is read back by sha256. It prints the
+  handoff id exactly as the peer's `handoffs list` shows it. A killed run can
+  leave a hidden `.<name>.*` temp file in the directory; readers ignore it.
 - `--session` (a full id, or a prefix the peer resolves uniquely) also adds ONE
   fixed-text ledger row to that session's charter:
   `Review peer handoff <name> (sha <8>) from install <id8>: untrusted, verify before acting.`
   The target must be a foreground session with a charter (only a foreground
   ledger is re-injected). The row is skipped while an identical row is still
-  open; once the session closes it, a re-send adds a new one. After the write,
-  the row is read back from the DB, and `charter.md` must equal a fresh render
-  of the DB (the mirror refresh swallows its own errors). `--replace` adds a row
-  for the new sha and leaves the old sha's row open for the session to close.
+  open; once the session closes it, a re-send adds a new one. The dedup check
+  and the insert share one write lock, so overlapping sends add one row. The DB
+  is canonical; `charter.md` is then refreshed and checked against a fresh
+  render as an ADVISORY (it is a best-effort mirror other writers also
+  refresh): a stale mirror is reported, never claimed, and does not fail the
+  send. `--replace` adds a row for the new sha and leaves the old sha's row open
+  for the session to close.
   The row is recorded `added_by: foreground`; its `source_ref`
-  (`peer-handoff from install <id8>, <date>`) is what marks it as delivered.
+  (`peer-handoff from install <id8>, <date>, sha256 <full digest>`) marks it as
+  delivered, and the full digest there, not the 8-hex prefix in the text, is the
+  dedup identity.
 - `--dry-run` resolves everything on the peer and writes nothing.
 
 ## Transport and trust
