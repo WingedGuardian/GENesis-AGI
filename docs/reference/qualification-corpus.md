@@ -1,6 +1,6 @@
 # Qualification corpus and adapters (replacement 3 of 6)
 
-The corpus loader reads one `<contract>.jsonl` file per registered contract.
+The corpus loader reads one UTF-8 `<contract>.jsonl` file per registered contract, independently of the host locale. Invalid UTF-8 stops loading as `Incomplete` with the contract filename.
 Registered rubric versions come from the production rubric registry; J9 uses its
 production relevance prompt version, and novelty uses `novelty-v1`. Each line is
 one JSON object. Literal newlines split records; valid Unicode separators inside
@@ -23,7 +23,7 @@ the reference admission boundary; standalone reference APIs require that
 context explicitly. Relevance and novelty also check declared provenance and current
 contract versions. Rubric questions use the production renderer; J9 uses its
 production truncation/formatting; novelty validates explicit null/member labels,
-deterministic finite float32 embeddings and procedure fields. Boolean exclusion
+deterministic finite float32 embeddings and procedure fields. Vectors that become entirely zero when stored as float32 are refused; surviving subnormal components remain supported. Boolean exclusion
 flags remain typed. Ordinary multiline steps are supported, while text that
 injects the exact rendered candidate-header shape is rejected.
 
@@ -34,8 +34,7 @@ uniqueness or a qualification verdict. A loadable subset is not complete
 qualification coverage. Candidate
 quality, cost and repetitions are measured later by the runner.
 
-Relevance calls the production J9 judge and checks its raw answer for invalid
-nonfinite values before using the production >=0.5 decision threshold. Novelty
+Relevance calls the production J9 judge and requires a raw non-boolean JSON number in [0, 1] before using the production >=0.5 decision threshold. Both adapters observe each invocation through the ordinary `route_call` interface, independently of a caller’s accumulated recording history. Novelty
 calls the production cross-type selector with deterministic case embeddings,
 observes selected IDs from actual rendering, verifies every numbered candidate
 and the exact prompt suffix, then maps the raw answer to that rendered identity.

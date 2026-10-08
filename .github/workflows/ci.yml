@@ -1136,5 +1136,5 @@ jobs:
         # --collect-only against main's versions of both files:
         # 24883 + 76 + 3 = 24962.
         # Corpus/adapters replacement:89 additional cases; no added skips.
-        # Integrated main floor24962 +89 =25051.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25051
+        # Integrated main floor24962 +89 +26 review regressions =25077.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25077
