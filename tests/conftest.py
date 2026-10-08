@@ -44,6 +44,18 @@ import os  # noqa: E402
 import aiosqlite  # noqa: E402
 import pytest  # noqa: E402
 
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup():
+    """Complete an already-loaded dashboard before any subtree's fixtures run.
+
+    Route-only imports leave api's page route unbound; Flask rejects its late
+    decorator after registration. Pure tests must not import the dashboard's
+    dependency/logging closure just to participate in this safety net.
+    """
+    if "genesis.dashboard._blueprint" in sys.modules:
+        import genesis.dashboard.api  # noqa: F401 — canonical route registration
+
 # ── Safety: prevent os.killpg(1, ...) from killing all processes ─────────
 _real_killpg = os.killpg
 
