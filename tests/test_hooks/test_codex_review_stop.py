@@ -28,12 +28,12 @@ def payload(command):
 @pytest.mark.parametrize("decision", ["ask", "deny", "unexpected"])
 def test_request_decisions_never_ask_or_allow_unknown(adapter, monkeypatch, decision):
     monkeypatch.setattr(adapter.requests, "_check_codex_round_escalation", lambda *a: (decision, "limit"))
-    assert adapter.decide(payload('gh pr comment 1 --body "@codex review"'))
+    assert adapter.decide(payload('gh pr comment 1 --repo owner/repo --body "@codex review"'))
 
 
 def test_request_allow_is_preserved(adapter, monkeypatch):
     monkeypatch.setattr(adapter.requests, "_check_codex_round_escalation", lambda *a: ("allow", ""))
-    assert adapter.decide(payload('gh pr comment 1 --body "@codex review"')) is None
+    assert adapter.decide(payload('gh pr comment 1 --repo owner/repo --body "@codex review"')) is None
 
 
 @pytest.mark.parametrize("command", ["printf hello", "printf 'git commit'", "git status"])
@@ -46,13 +46,13 @@ def test_unrelated_commands_do_not_lookup_budget(adapter, monkeypatch, command):
 @pytest.mark.parametrize("result", [None, {"status": "ok", "commit_approval_required": False}])
 def test_commit_with_capacity(adapter, monkeypatch, result):
     monkeypatch.setattr(adapter.commits, "_branch_review_budget", lambda *a, **kw: result)
-    assert adapter.decide(payload('git commit -m "test"')) is None
+    assert adapter.decide(payload(f'git -C {ROOT} commit -m "test"')) is None
 
 
 @pytest.mark.parametrize("result", [{"status": "unknown"}, {"status": "ok", "commit_approval_required": True}])
 def test_commit_requires_handoff(adapter, monkeypatch, result):
     monkeypatch.setattr(adapter.commits, "_branch_review_budget", lambda *a, **kw: result)
-    assert adapter.decide(payload('git commit -m "test"'))
+    assert adapter.decide(payload(f'git -C {ROOT} commit -m "test"'))
 
 
 @pytest.mark.parametrize("command", [
@@ -75,6 +75,59 @@ def test_literal_target_cwd_reaches_lookup(adapter, monkeypatch, tmp_path):
     monkeypatch.setattr(adapter.commits, "_branch_review_budget", lambda cwd, *a, **kw: seen.append(cwd))
     assert adapter.decide(payload(f'git -C {tmp_path} commit -m x')) is None
     assert seen == [str(tmp_path)]
+
+
+@pytest.mark.parametrize("target", ["", "-C .", "-C..", "-C ~/repo", '-C "$REPO"'])
+def test_cwd_dependent_commits_are_fixable_before_any_lookup(adapter, monkeypatch, target):
+    monkeypatch.setattr(adapter.state, "get_current_branch", lambda **kw: pytest.fail("branch lookup"))
+    monkeypatch.setattr(adapter.commits, "_branch_review_budget", lambda *a, **kw: pytest.fail("budget lookup"))
+    reason = adapter.decide(payload(f"git {target} commit -m x"))
+    assert isinstance(reason, adapter.Fixable)
+
+
+def test_glued_absolute_c_remains_parser_refused_before_lookup(adapter, monkeypatch, tmp_path):
+    monkeypatch.setattr(adapter.state, "get_current_branch", lambda **kw: pytest.fail("branch lookup"))
+    monkeypatch.setattr(adapter.commits, "_branch_review_budget", lambda *a, **kw: pytest.fail("budget lookup"))
+    assert isinstance(adapter.decide(payload(f"git -C{tmp_path} commit -m x")), adapter.Fixable)
+
+
+@pytest.mark.parametrize("selector", [
+    "1", "branch --repo owner/repo", "--repo owner/repo", "'#1' --repo owner/repo",
+    '1 --repo "$REPO"', '"$PR" --repo owner/repo',
+    "owner/repo/pull/1", "https://elsewhere.invalid/owner/repo/pull/1",
+    "1 --repo elsewhere.invalid/owner/repo",
+    "https://github.com/owner/repo/pull/1 --repo other/repo",
+    "https://github.com/owner/repo/pull/1 --repo owner/repo",
+])
+def test_context_dependent_review_identity_is_fixable_before_lookup(adapter, monkeypatch, selector):
+    monkeypatch.setattr(adapter.requests, "_check_codex_round_escalation", lambda *a: pytest.fail("lookup"))
+    reason = adapter.decide(payload(f'gh pr comment {selector} --body "@codex review"'))
+    assert isinstance(reason, adapter.Fixable)
+
+
+@pytest.mark.parametrize("selector", [
+    "1 --repo owner/repo", "1 --repo=github.com/owner/repo", "1 -Rowner/repo",
+    "https://github.com/owner/repo/pull/1", "http://github.com/owner/repo/pull/1/files",
+    "https://github.com/owner/repo/pull/1#issuecomment-2",
+])
+def test_explicit_review_identity_reaches_unchanged_policy(adapter, monkeypatch, selector):
+    seen = []
+    def policy(segs, *args):
+        seen.append(adapter.requests._comment_target(segs[0].argv))
+        return "allow", ""
+    monkeypatch.setattr(adapter.requests, "_check_codex_round_escalation", policy)
+    assert adapter.decide(payload(f'gh pr comment {selector} --body "@codex review"')) is None
+    assert seen == [("1", "owner/repo")]
+
+
+@pytest.mark.parametrize("command", [
+    f"git -C {ROOT} commit -m x", 'gh pr comment 1 --repo owner/repo --body "@codex review"',
+])
+def test_foreign_inherited_host_blocks_before_lookup(adapter, monkeypatch, command):
+    monkeypatch.setenv("GH_HOST", "elsewhere.invalid")
+    monkeypatch.setattr(adapter.commits, "_branch_review_budget", lambda *a, **kw: pytest.fail("lookup"))
+    monkeypatch.setattr(adapter.requests, "_check_codex_round_escalation", lambda *a: pytest.fail("lookup"))
+    assert adapter.decide(payload(command))
 
 
 def test_inherited_repository_override_is_not_sampled_as_payload_cwd(adapter, monkeypatch):
@@ -162,7 +215,7 @@ def test_real_commit_policy_boundaries(adapter, monkeypatch, count, gate, blocke
     monkeypatch.setattr(adapter.commits, "_canonical_public_repo", lambda: repo)
     monkeypatch.setenv("_TEST_REVIEW_BUDGET_PR", "1")
     monkeypatch.setenv("_TEST_REVIEW_BUDGET_REPO", repo)
-    assert bool(adapter.decide(payload('git commit -m "test"'))) == blocked
+    assert bool(adapter.decide(payload(f'git -C {ROOT} commit -m "test"'))) == blocked
 
 
 def test_broken_evidence_is_deny(adapter, monkeypatch):
@@ -401,12 +454,12 @@ def test_approval_and_evidence_denials_still_stop(adapter, monkeypatch, capsys, 
             "_branch_review_budget",
             lambda *a, **kw: {"status": "ok", "commit_approval_required": True},
         )
-        data = payload('git commit -m "test"')
+        data = payload(f'git -C {ROOT} commit -m "test"')
     elif setup == "request":
         monkeypatch.setattr(
             adapter.requests, "_check_codex_round_escalation", lambda *a: ("ask", "limit")
         )
-        data = payload('gh pr comment 1 --body "@codex review"')
+        data = payload('gh pr comment 1 --repo owner/repo --body "@codex review"')
     else:
         data = {"tool_name": "other"}
     reason = adapter.decide(data)
