@@ -426,7 +426,13 @@
                     </div>
                     <div style="font-size:0.66rem; font-family:monospace; color:var(--color-text-secondary);" x-text="req.id"></div>
                   </div>
-                  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:0.45rem; font-size:0.72rem;">
+                  <div x-show="req.action_type === 'peer_operation'" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:0.45rem; font-size:0.72rem;">
+                    <div><div style="opacity:0.6; text-transform:uppercase; font-size:0.62rem;">Peer</div><div x-text="req.context_data?.extra?.peer_id || 'unknown'"></div></div>
+                    <div><div style="opacity:0.6; text-transform:uppercase; font-size:0.62rem;">Task</div><div x-text="req.context_data?.extra?.task_id || 'unknown'"></div></div>
+                    <div style="grid-column:1 / -1; overflow-wrap:anywhere;"><div style="opacity:0.6; text-transform:uppercase; font-size:0.62rem;">Operation digest</div><div x-text="req.context_data?.extra?.operation_digest || 'unavailable'"></div></div>
+                    <div style="grid-column:1 / -1;">Approve only this operation; peer content remains untrusted.</div>
+                  </div>
+                  <div x-show="req.action_type !== 'peer_operation'" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:0.45rem; font-size:0.72rem;">
                     <div>
                       <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">Fallback</div>
                       <div x-text="$store.genesisDashboard.approvalFallbackLabel(req)"></div>

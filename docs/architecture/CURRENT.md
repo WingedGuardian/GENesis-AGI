@@ -928,9 +928,16 @@ are the other timing/volume controls on that path.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: d6edbcc6 2026-09-11
+verified: 787882667c48 2026-10-08
 ```
 
+- **Individual peer consent foundation**: `peers/approvals.py` persists exact
+  task/generation/capability/digest creation intents before ApprovalManager rows
+  and retries the normal approval notification helper. Only named individual
+  dashboard or authorized Telegram buttons resolve peer operations; batch and
+  generic resolver origins refuse them. Notification failure stays visible.
+  Continuation consumption and runtime activation require the coordinator slice.
+  See [peer approvals](../reference/peer-approvals.md).
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
   converge there. `EmailAutonomyGate` (`autonomy/email_gate.py`, WS-8
   capability cells) sits below the LLM tool layer, unbypassable: HOLD writes
@@ -1358,7 +1365,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: ba6e357a7998 2026-10-08
+verified: 787882667c48 2026-10-08
 ```
 
 - **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,

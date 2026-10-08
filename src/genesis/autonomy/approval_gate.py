@@ -527,6 +527,7 @@ class AutonomousCliApprovalGate:
         )
         from genesis.autonomy.desktop_gate import DESKTOP_GATE_ACTION_TYPE
         from genesis.autonomy.email_gate import EMAIL_GATE_ACTION_TYPE
+        from genesis.autonomy.peer_approval import PEER_OPERATION_ACTION_TYPE
         from genesis.autonomy.task_unblock_config import TASK_UNBLOCK_ACTION_TYPE
         from genesis.board.promotion import BOARD_PROMOTION_ACTION_TYPE
 
@@ -536,6 +537,7 @@ class AutonomousCliApprovalGate:
             DESKTOP_GATE_ACTION_TYPE,
             TASK_UNBLOCK_ACTION_TYPE,
             BOARD_PROMOTION_ACTION_TYPE,
+            PEER_OPERATION_ACTION_TYPE,
         }
         pending = await self._approval_manager.get_pending()
         count = 0
@@ -575,6 +577,12 @@ class AutonomousCliApprovalGate:
         refuse_generic = {DESKTOP_GATE_ACTION_TYPE, TASK_UNBLOCK_ACTION_TYPE}
 
         row = await self.get_request(request_id)
+        from genesis.autonomy.peer_approval import PEER_OPERATION_ACTION_TYPE, named_human_resolver
+
+        if row is not None and row.get("action_type") == PEER_OPERATION_ACTION_TYPE and (
+            decision not in {"approved", "rejected"} or not named_human_resolver(resolved_by)
+        ):
+            return False
         if row is not None and row.get("action_type") in refuse_generic:
             logger.warning(
                 "Refusing to resolve %s approval %s via the generic per-item "
@@ -884,7 +892,7 @@ class AutonomousCliApprovalGate:
         action_label: str,
         invocation: CCInvocation | None,
         api_error: str | None,
-    ) -> None:
+    ) -> bool:
         """Deliver an approval notification via the outreach pipeline.
 
         Routes through ``OutreachPipeline.submit_raw`` with
@@ -904,6 +912,9 @@ class AutonomousCliApprovalGate:
         that's Sentinel's blocking pattern and does not fit the gating
         model.
         """
+        from genesis.autonomy.peer_approval import PEER_OPERATION_ACTION_TYPE
+
+        is_peer = context.get("action_type") == PEER_OPERATION_ACTION_TYPE
         delivery_id: str | None = None
         pipeline = getattr(self._runtime, "_outreach_pipeline", None)
 
@@ -919,7 +930,7 @@ class AutonomousCliApprovalGate:
             except Exception:
                 logger.warning(
                     "Failed to count pending approvals for %s", request_id,
-                    exc_info=True,
+                    exc_info=not is_peer,
                 )
                 pending_count = 1
 
@@ -941,7 +952,11 @@ class AutonomousCliApprovalGate:
                     "✅ Approve",
                     callback_data=f"cli_approve:{request_id}",
                 )]]
-                if pending_count >= 1:
+                if is_peer:
+                    rows.append([InlineKeyboardButton(
+                        "Reject", callback_data=f"cli_reject:{request_id}",
+                    )])
+                elif pending_count >= 1:
                     btn_label = (
                         f"Approve all {pending_count} pending"
                         if pending_count > 1
@@ -973,6 +988,8 @@ class AutonomousCliApprovalGate:
                     salience_score=1.0,
                     signal_type="cli_approval",
                     source_id=f"cli-approval:{request_id}",
+                    # PeerApprovals owns durable retry with lineage and buttons.
+                    defer_retry=not is_peer,
                 )
                 result = await pipeline.submit_raw(
                     message, outreach_request, reply_markup=keyboard,
@@ -984,12 +1001,12 @@ class AutonomousCliApprovalGate:
                     logger.error(
                         "Approval request %s delivery did not complete "
                         "(status=%s, error=%s); dashboard-only fallback",
-                        request_id, result.status, result.error,
+                        request_id, result.status, "notification_unavailable" if is_peer else result.error,
                     )
             except Exception:
                 logger.error(
                     "Failed to deliver approval request %s via outreach pipeline",
-                    request_id, exc_info=True,
+                    request_id, exc_info=not is_peer,
                 )
 
         context["delivery_id"] = delivery_id
@@ -1010,6 +1027,7 @@ class AutonomousCliApprovalGate:
         await self._approval_manager.update_context(
             request_id, context=_context_dump(context),
         )
+        return delivery_id is not None
 
     @staticmethod
     def _format_message(
@@ -1023,6 +1041,21 @@ class AutonomousCliApprovalGate:
         extra_context: dict[str, Any] | None = None,
     ) -> str:
         extra = extra_context or {}
+
+        from genesis.autonomy.peer_approval import PEER_OPERATION_ACTION_TYPE
+
+        if action_type == PEER_OPERATION_ACTION_TYPE:
+            from html import escape
+
+            return "\n".join([
+                "<b>Peer Operation Approval</b>",
+                escape(action_label),
+                f"Peer: <code>{escape(str(extra.get('peer_id', 'unknown')))}</code>",
+                f"Task: <code>{escape(str(extra.get('task_id', 'unknown')))}</code>",
+                f"Operation digest: <code>{escape(str(extra.get('operation_digest', 'unknown')))}</code>",
+                f"Request ID: <code>{request_id}</code>",
+                "Use the individual Approve or Reject button. This grants only this operation.",
+            ])
 
         # Sentinel-specific message formatting
         if action_type == "sentinel_dispatch":
