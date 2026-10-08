@@ -80,6 +80,44 @@ async def test_paid_answer_is_reused_offline_without_a_key(env, monkeypatch):
     assert not offline.requests and offline.key_reads == 0
 
 
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_dispatch_admission_refuses_before_reservation_or_post(env, cancelled):
+    data, server = bundle(env), Gateway()
+    observed = []
+
+    async def refuse(adapter, attempt, evidence):
+        observed.append((adapter.alias, attempt, evidence))
+        assert server.key_reads == 1 and not server.requests
+        assert adapter.campaign.attempt(attempt).get("reserved_at") is None
+        if cancelled:
+            raise asyncio.CancelledError()
+        raise pinned.LocalFailure("operating key observation differs")
+
+    with data.campaign:
+        adapter = router(data, server, dispatch_admission=refuse)
+        if cancelled:
+            with pytest.raises(asyncio.CancelledError):
+                await ask(adapter, data.messages)
+        else:
+            with pytest.raises(pinned.LocalFailure, match="operating key observation differs"):
+                await ask(adapter, data.messages)
+        assert [line["kind"] for line in data.campaign.lines] == ["manifest"]
+    assert len(observed) == 1 and not server.requests
+
+
+async def test_dispatch_admission_cannot_rewrite_retained_key_observation(env):
+    data, server = bundle(env), Gateway()
+
+    async def inspect(_adapter, _attempt, evidence):
+        assert evidence["limit"] == "1"
+        evidence["limit"] = "999"
+
+    with data.campaign:
+        assert (await ask(router(data, server, dispatch_admission=inspect), data.messages)).success
+        dispatched = next(line for line in data.campaign.lines if line["kind"] == "dispatch")
+        assert dispatched["key_status"]["limit"] == "1"
+
+
 def test_cli_run_refuses_incomplete_coverage_without_requests(env, monkeypatch, capsys):
     directory = write_corpus(env / "corpus", small_corpus())
     assert main(["run", "--alias", "openrouter-mimo", "--campaign", str(env / "campaign"),

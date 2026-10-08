@@ -1,4 +1,4 @@
-"""Offline qualification admission and private reports; paid execution is unavailable."""
+"""Qualification admission, approved serial comparison and aggregate private reports."""
 
 import argparse
 import asyncio
@@ -19,12 +19,43 @@ def parser():
         command.add_argument("--alias", required=name != "check")
         if name != "check":
             command.add_argument("--campaign", type=Path, required=True)
-        if name == "report":
+        if name in ("run", "report"):
             command.add_argument("--against")
             command.add_argument("--against-campaign", type=Path)
+        if name == "run":
+            command.add_argument("--operating-plan", type=Path)
+            command.add_argument("--spending-approval", type=Path)
     review = commands.add_parser("review-references")
     review.add_argument("--spec", type=Path, required=True)
     return result
+
+
+async def admit(args, cases, configured, options):
+    from genesis.eval.qualification import corpus, execution, preflight
+    from genesis.eval.qualification.evidence import Incomplete
+
+    aliases = list(execution.ALIASES) if args.command == "run" else (
+        [args.alias] if args.alias else list(configured)
+    )
+    checked = await preflight.check(
+        cases, args.temp_root, reference_policy=options["reference_policy"],
+        current_policy=options["current_reference_policy"],
+        reference_approval=options["reference_approval"], source_files=options["source_files"],
+        candidates={alias: configured[alias] for alias in aliases},
+    )
+    if args.command == "check":
+        return {"status": "pass", "scope": "offline admission only", "corpus": corpus.counts(cases)}
+    if not args.operating_plan or not args.spending_approval:
+        raise Incomplete("financial_eligibility_unavailable")
+    if (set(configured) != set(execution.ALIASES)
+            or {args.alias, args.against} != set(execution.ALIASES)
+            or args.against_campaign is None):
+        raise Incomplete("paired_campaigns_invalid")
+    return await execution.execute(
+        cases, checked, {args.alias: args.campaign, args.against: args.against_campaign},
+        args.temp_root, plan_path=args.operating_plan, approval_path=args.spending_approval,
+        options=options,
+    )
 
 
 async def run(args):
@@ -57,16 +88,7 @@ async def run(args):
         "reference_approval": read("reference_approval"), "source_files": read("source_files"),
     }
     if args.command in ("check", "run"):
-        aliases = [args.alias] if args.alias else list(configured)
-        checked = await preflight.check(
-            cases, args.temp_root, reference_policy=policy,
-            current_policy=options["current_reference_policy"],
-            reference_approval=options["reference_approval"], source_files=options["source_files"],
-            candidates={alias: configured[alias] for alias in aliases},
-        )
-        if args.command == "run":
-            qualification._paid_eligibility(checked)
-        return {"status": "pass", "scope": "offline admission only", "corpus": corpus.counts(cases)}
+        return await admit(args, cases, configured, options)
     against = args.against
     if bool(against) != bool(args.against_campaign) or against == args.alias:
         raise Incomplete("paired_campaigns_invalid")

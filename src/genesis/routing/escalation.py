@@ -464,8 +464,16 @@ async def notify_provider_if_due(
     incident_identity: str | None = None,
     current_incident_identity=None,
     incident_owner=None,
+    coverage_for=None,
 ) -> bool:
     """Tell the user ONCE that a provider has been dead long enough to matter.
+
+    ``coverage_for(provider)`` (optional) returns the essential call sites this
+    outage leaves with no available provider: ``[]`` = every essential site it
+    serves is still covered, so the notice is written at most ``"high"``
+    (dashboard and morning report, never Telegram) and says calls fall back;
+    a non-empty list keeps ``priority`` and names the sites; ``None`` (coverage
+    unknown) or a callback error keeps ``priority`` — fail toward telling.
 
     Reads the age off the unresolved ``provider_failure`` row rather than
     this object's in-memory state, for two reasons: that row IS the outage
@@ -588,6 +596,37 @@ async def notify_provider_if_due(
             )
             return False
 
+    uncovered = None
+    if coverage_for is not None:
+        try:
+            # The essential map is keyed by CURRENT config names; a row may
+            # carry a renamed provider, mapped as the liveness gate maps it.
+            live_name = (
+                incident_owner(provider, incident_identity)
+                if incident_owner is not None else provider
+            )
+            uncovered = coverage_for(live_name) if live_name is not None else None
+        except Exception:
+            logger.warning(
+                "could not read essential coverage for '%s'; keeping priority %s",
+                provider, priority, exc_info=True,
+            )
+            uncovered = None
+    if uncovered == [] and priority == "critical":
+        priority = "high"
+    if uncovered:
+        consequence = (
+            "Essential call site(s) with no available provider: "
+            + ", ".join(sorted(uncovered)) + "."
+        )
+    elif uncovered == []:
+        consequence = (
+            "Calls are falling back to other providers in each chain; every "
+            "essential call site it serves still has another healthy provider."
+        )
+    else:
+        consequence = "Calls fall back to other providers where a chain has one."
+
     # ACK SUPPRESSION — "once per outage" must survive the user resolving the
     # delivered notification. `skip_if_duplicate` keys on UNRESOLVED rows only,
     # so a dashboard ack would otherwise re-arm the sweep and re-page five
@@ -614,6 +653,10 @@ async def notify_provider_if_due(
             r_at = ProviderEscalation._outage_started_at(r)
             if r_at is None or r_at < started:
                 continue  # a previous outage's notification — irrelevant
+            if priority == "critical" and r.get("priority") != "critical":
+                # An acknowledged NON-paging notice (covered: "high") never
+                # suppresses the page that losing coverage later earns.
+                continue
             notes = str(r.get("resolution_notes") or "")
             # MACHINE resolutions permit a re-notify; only a USER ack
             # suppresses. Three machine classes exist, each with a
@@ -679,8 +722,7 @@ async def notify_provider_if_due(
                     # that no recovery has been recorded since the row opened.
                     "message": (
                         f"Provider '{provider}' has no recorded recovery for {human}. "
-                        f"Calls "
-                        f"are falling back to other providers in each chain. If this "
+                        f"{consequence} If this "
                         f"provider is a paid or entitlement-gated model, the account "
                         f"may need attention."
                     ),
@@ -729,6 +771,7 @@ async def sweep_due_notifications(
     db, *, clock=None, priority: str = "critical", provider_still_failing=None,
     current_incident_identity=None,
     incident_owner=None,
+    coverage_for=None,
 ) -> int:
     """Notify for every provider whose unresolved outage has passed the floor.
 
@@ -816,6 +859,7 @@ async def sweep_due_notifications(
                 incident_identity=incident,
                 current_incident_identity=current_incident_identity,
                 incident_owner=incident_owner,
+                coverage_for=coverage_for,
             ):
                 written += 1
         except Exception:

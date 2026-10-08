@@ -135,7 +135,23 @@ def test_load_full_yaml(monkeypatch):
     # 404-for-account on NIM); nvidia-nim-deepseek repointed v4-pro → v4-flash-0731.
     # 2026-09-05: 25 -> 26 with mistral-medium-free — the in-family rung
     # directly below Large (presumptive free tier; see model_routing.yaml).
-    assert len(cfg.providers) == 26
+    # 2026-10-07: 26 -> 28 with deepseek-flash (DeepSeek's own API, replacing the
+    # never-answering nvidia-nim-deepseek in every chain; the NIM block stays,
+    # unchained) and gemini-free-latest (the gemini-flash-latest alias).
+    assert len(cfg.providers) == 28
+    assert "deepseek-flash" in cfg.providers and "gemini-free-latest" in cfg.providers
+    # The direct route is priced at DeepSeek's own rate, never the OpenRouter
+    # profile's (a cost fallback would under-record it ~4-9x).
+    import yaml
+
+    profiles = yaml.safe_load(
+        (Path(__file__).resolve().parents[2] / "config" / "model_profiles.yaml").read_text()
+    )["profiles"]
+    direct = profiles[cfg.providers["deepseek-flash"].profile]
+    assert (direct["cost_per_mtok_in"], direct["cost_per_mtok_out"]) == (0.30, 1.20)
+    assert not any(
+        "nvidia-nim-deepseek" in site.chain for site in cfg.call_sites.values()
+    ), "NIM DeepSeek never answers on NVIDIA's side (2026-10-07); keep it out of chains"
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
     assert "openrouter-deepseek-r1" not in cfg.providers  # removed from config
@@ -217,9 +233,11 @@ def test_load_full_yaml(monkeypatch):
     # first, then NIM v4-flash, then paid v4-flash for resilience; paid-by-default.
     # (Reordered 2026-08-19: NIM now serves flash, not the calibrated pro, so the
     # calibrated openrouter-deepseek-v4 leads to keep the eval baseline stable.)
+    # 2026-10-07: the never-answering NIM rung became deepseek-flash, the same
+    # V4.1 Flash on DeepSeek's own API.
     assert cfg.call_sites["judge"].chain == [
         "openrouter-deepseek-v4",
-        "nvidia-nim-deepseek",
+        "deepseek-flash",
         "openrouter-deepseek-flash",
     ]
     assert cfg.call_sites["judge"].default_paid is True

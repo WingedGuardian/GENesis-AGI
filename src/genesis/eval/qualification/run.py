@@ -54,7 +54,7 @@ def admission_identity(checked):
     }
     shared["runner_sources"] = {
         name: preflight.file_hash(Path(__file__).with_name(name))
-        for name in ("run.py", "__main__.py")
+        for name in ("run.py", "__main__.py", "execution.py")
     }
     return deepcopy(shared)
 
@@ -111,9 +111,13 @@ def validate_campaign(manifest, checked, alias):
         raise Incomplete("campaign_schedule_mismatch")
 
 
-def _paid_eligibility(*_args, **_kwargs):
-    """No real provider bound has been verified; no public bypass is offered."""
-    raise Incomplete("financial_eligibility_unavailable")
+def _paid_eligibility(checked, operating=None, **unsupported):
+    """Only the complete paired operating-plan context can authorize acquisition."""
+    from .execution import Operating
+
+    if unsupported or not isinstance(operating, Operating):
+        raise Incomplete("financial_eligibility_unavailable")
+    operating.eligible(checked)
 
 
 def worst(statuses, order=DECIDED):
@@ -270,7 +274,10 @@ def summarize(alias, cases, records, clamped, campaign):
     lines = campaign.lines if campaign else []
     observations = [line["evidence"] if line["kind"] == "observation" else line
                     for line in lines if line["kind"] in ("observation", "answer")]
+    from .execution import cost_report
+
     return {
+        "financial": cost_report({alias: campaign.state}) if campaign else None,
         "status": worst(routes.values(), OVERALL), "alias": alias, "routes": routes,
         "contracts": reports, "clamped_raw_scores": clamped,
         "corpus": corpus.counts(cases),
@@ -290,7 +297,7 @@ def summarize(alias, cases, records, clamped, campaign):
 
 async def qualify(alias, cases, params, campaign, temp_root, *, reference_policy,
                   current_reference_policy, reference_approval, source_files,
-                  dispatch=False, config=None, transport=None):
+                  dispatch=False, config=None, transport=None, operating=None):
     """Recompute complete admission; no caller-supplied prepared plan is authority."""
     cases, params, source_files = deepcopy(cases), deepcopy(params), deepcopy(source_files)
     config = deepcopy(config or pinned.routing())
@@ -301,16 +308,19 @@ async def qualify(alias, cases, params, campaign, temp_root, *, reference_policy
     )
     admission = admission_identity(checked)
     if dispatch:
-        _paid_eligibility(checked)
+        _paid_eligibility(checked, operating)
     view = None
     records = unscored(cases, "campaign_unavailable")
     clamped = dict.fromkeys(cases, 0)
     try:
         view = campaign if dispatch else ReadView(campaign)
         validate_campaign(view.state.manifest, checked, alias)
-        router = pinned.PinnedRouter(view, alias=alias, params=params, dispatch=dispatch,
-                                     config=config, transport=transport)
+        factory = operating.router if dispatch else pinned.PinnedRouter
+        router = factory(view, alias=alias, params=params, dispatch=dispatch,
+                         config=config, transport=transport)
     except (ValueError, OSError):
+        if dispatch:
+            operating.stop(Incomplete("campaign_incompatible"))
         records = unscored(cases, "campaign_incompatible")
     else:
         records, clamped = await score(cases, router, temp_root)
@@ -322,6 +332,8 @@ async def qualify(alias, cases, params, campaign, temp_root, *, reference_policy
             or admission_identity(checked) != admission):
             raise Incomplete("admission_changed")
     except (ValueError, OSError):
+        if dispatch:
+            operating.stop(Incomplete("admission_changed"))
         records, clamped = unscored(cases, "admission_changed"), dict.fromkeys(cases, 0)
     result = summarize(alias, cases, records, clamped, view)
     result["admission"] = digest(admission)

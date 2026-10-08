@@ -504,7 +504,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-10-05: 70 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-07: 72 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -1126,16 +1126,26 @@ jobs:
         # Floor: 24421 + 95 = 24516; no added skips, ceiling unchanged.
         # Reference admission: 23 preserved +98 boundary +246 actor-role cases.
         # Floor: 24516 +367 =24883; no added skips, ceiling unchanged.
-        # Corpus/adapters replacement:89 preserved original cases; no skips.
-        # Floor:24883 +89 =24972 (reconcile against main before opening).
-        # Pinned transport:42 original pinned +15 rework +149 new evidence cases.
-        # Documented routing metadata adds44 collected cases, all passing without skips.
-        # Floor:24972 +206 +44 =25222; no added skips, ceiling unchanged.
+        #
+        # Immutable CBM staging: new test_codebase_managed_config.py collects
+        # 76 cases (0 -> 76), plus 3 new provider-opener classification controls.
+        # The native-binary opt-ins add two skip identities. Original PR CI had
+        # seven additional browser skips absent on current main; counts alone
+        # did not establish a two-slot allowance. Keep main's ceiling unchanged.
+        # On top of the reference-admission floor above, measured by
+        # --collect-only against main's versions of both files:
+        # 24883 + 76 + 3 = 24962.
+        # Corpus/adapters replacement:89 additional cases; no added skips.
+        # Integrated main floor24962 +89 +26 review regressions =25077.
+        # Pinned transport:42 original pinned +15 rework +149 evidence cases.
+        # Documented routing metadata adds44 cases; no added skips.
+        # Integrated parent floor25077 +206 +44 =25327.
         # Offline preflight:19 retained rework cases and79 new boundary cases.
-        # Parent-relative floor:25222 +98 =25320; no added skips.
+        # Parent-relative floor:25327 +98 =25425; no added skips.
         # Runner: measured parent->current core37->57, pinned42->56,
         # references391->395, rework62->65, scorer21->22, new runner39.
         # Delta81 =41 retained original +39 new runner +1 scorer regression.
-        # Parent-relative floor25320 +81 =25401; skip ceiling unchanged.
+        # Operating controls:30 new collected cases; final-observation hook adds3.
+        # Parent-relative floor25425 +81 +74 +3 =25583; skip ceiling unchanged.
         # Reconcile against actual main and hosted skip identities before opening.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25401
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25583

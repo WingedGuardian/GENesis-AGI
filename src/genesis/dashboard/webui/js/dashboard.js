@@ -2269,11 +2269,20 @@
           if (!(await this.showConfirm("Apply Update", msg))) return;
           this._updating = true;
           try {
-            await fetchApi("/api/genesis/updates/apply", {
+            const resp = await fetchApi("/api/genesis/updates/apply", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ supervised: true }),
             });
+            // A refusal (nothing started) is shown, as resolveConflicts does; the
+            // poll below would otherwise end quietly as if the update had run.
+            if (resp && !resp.ok) {
+              let data = {};
+              try { data = await resp.json(); } catch (e) { /* not JSON */ }
+              alert("Failed: " + (data.error || "HTTP " + resp.status));
+              this._updating = false;
+              return;
+            }
           } catch (e) { /* expected — server may restart */ }
           const start = Date.now();
           let seenInProgress = false;

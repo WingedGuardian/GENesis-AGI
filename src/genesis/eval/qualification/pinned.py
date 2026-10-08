@@ -678,7 +678,8 @@ class PinnedRouter:
     the later runner's responsibility; this transport cannot derive a bound.
     """
 
-    def __init__(self, campaign, *, alias, params, dispatch, transport=None, config=None):
+    def __init__(self, campaign, *, alias, params, dispatch, transport=None, config=None,
+                 dispatch_admission=None):
         self.campaign, self.alias = campaign, alias
         self.config = config or routing()
         self.cfg = resolve(alias, self.config)
@@ -686,6 +687,7 @@ class PinnedRouter:
         if self.cfg.params:
             raise LocalFailure("implicit routing parameters are forbidden in qualification")
         self.transport, self.dispatch = transport, dispatch
+        self.dispatch_admission = dispatch_admission
         # One detached snapshot at construction, never a full campaign copy per call.
         state = campaign.state
         self.manifest = state.manifest
@@ -847,6 +849,10 @@ class PinnedRouter:
         if hashlib.sha256(secret.encode()).hexdigest() != self.fingerprint:
             raise LocalFailure("dedicated credential differs from frozen identity")
         info = await key_status(secret, self.transport, required=str(self.required))
+        if self.dispatch_admission is not None:
+            # Validate the very observation used for this dispatch, before any
+            # reservation. The hook cannot rewrite the retained key evidence.
+            await self.dispatch_admission(self, attempt, dict(info))
         row = self.campaign.attempt(attempt)
         if row.get("reserved_at") is None:
             self.campaign.reserve(attempt)

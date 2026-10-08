@@ -136,11 +136,18 @@ def test_anthropic_key_does_not_satisfy_llm_leg(monkeypatch):
     assert f.floor_met is False
 
 
-def test_nvidia_only_satisfies_llm_leg(monkeypatch):
-    # Regression: an install whose only cloud LLM credential is NVIDIA NIM must count
-    # (nvidia_nim is an enabled routing provider).
+def test_nvidia_only_does_not_satisfy_llm_leg(monkeypatch):
+    # nvidia-nim-deepseek is still declared and enabled, but since 2026-10-07 no
+    # call-site chain references it (the account never answered), so an NVIDIA-only
+    # install has no usable cloud LLM: the same rule as the Qwen case below.
     _oauth(monkeypatch, True)
-    assert compute_floor({"API_KEY_NVIDIA_NIM": "x"}).llm_key_present is True
+    assert compute_floor({"API_KEY_NVIDIA_NIM": "x"}).llm_key_present is False
+
+
+def test_deepseek_key_satisfies_llm_leg(monkeypatch):
+    # deepseek-flash (DeepSeek's own API) is chain-referenced.
+    _oauth(monkeypatch, True)
+    assert compute_floor({"API_KEY_DEEPSEEK": "d"}).llm_key_present is True
 
 
 def test_google_key_counts_for_llm_not_embedding(monkeypatch):
@@ -179,10 +186,10 @@ def test_openai_key_declared_but_unchained_does_not_count(monkeypatch):
 
 
 def test_disabled_provider_key_does_not_count(monkeypatch):
-    # deepseek is enabled:false in model_routing.yaml → a bare DeepSeek key is not
-    # usable, so it must not satisfy the LLM leg.
+    # github-o3mini is enabled:false in model_routing.yaml and is the only github
+    # provider → a bare GitHub key is not usable, so it must not satisfy the LLM leg.
     _oauth(monkeypatch, True)
-    assert compute_floor({"API_KEY_DEEPSEEK": "d"}).llm_key_present is False
+    assert compute_floor({"API_KEY_GITHUB": "g"}).llm_key_present is False
 
 
 def test_sentinel_values_do_not_count(monkeypatch):
@@ -197,14 +204,15 @@ def test_config_derivation_only_chain_referenced_cloud_types():
 
     types = set(_chain_referenced_cloud_provider_types())
     # In some active call-site chain:
-    assert {"openrouter", "groq", "mistral", "nvidia_nim"} <= types
+    assert {"openrouter", "groq", "mistral", "deepseek"} <= types
     # Keyless/local excluded even though chain-referenced (lmstudio):
     assert "ollama" not in types and "lmstudio" not in types
     # Declared+enabled but referenced by NO chain → excluded:
     assert "qwen" not in types and "openai" not in types
     assert "xai" not in types and "minimax" not in types
+    assert "nvidia_nim" not in types
     # Disabled providers are absent from cfg.providers entirely:
-    assert "deepseek" not in types and "github" not in types
+    assert "github" not in types
 
 
 def test_key_pattern_parity_with_runtime(monkeypatch):

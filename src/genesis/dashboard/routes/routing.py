@@ -106,7 +106,8 @@ def routing_config_read():
     # cb_states while every call skips it (deselection produces no 429s,
     # trips and observations), so the counters must be visible somewhere
     # live. Keys carry their unit explicitly — requests and tokens are
-    # never comparable. Only daily-limited providers appear.
+    # never comparable. Only daily-limited providers appear, plus any provider
+    # whose own 429 said its daily quota is spent (`blocked_until`).
     daily_budget = {}
     ledger = getattr(rt.router, "_daily_budget", None)
     if ledger is not None:

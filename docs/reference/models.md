@@ -421,7 +421,7 @@ Loose guidance — not prescriptive. Use your judgment based on the task require
 - **IMPORTANT:** Free tier data MAY be used for model training
   - Paid tier (Tier 1+, requires Cloud Billing) guarantees data is NOT used for training
   - If sending proprietary/sensitive data, use paid tier
-- RPD resets at midnight Pacific Time
+- RPD reset: MEASURED 2026-10-07 at **00:00 UTC**, not midnight Pacific (38 of 38 logged free-tier `gemini-3.8-flash` 429s, limit 20/day: each one's "retry in" time, added to its timestamp, ends at 00:00 UTC; the full bodies checked carried a matching `RetryInfo` delay). Routing does not assume either: a daily-quota 429 deselects the provider until the reset the 429 itself names (`routing/retry.daily_quota_reset_s`).
 - EU/EEA/UK/Switzerland restricted on free tier
 - Full 1M token context window available on free tier
 - Free tier limits can change without warning (Google cut limits 50-80% in Dec 2025)
@@ -431,6 +431,7 @@ Loose guidance — not prescriptive. Use your judgment based on the task require
 - **Health evidence:** the checker uses `GET /v1/models` with the existing NVIDIA key convention. The catalog also answers without authentication, so a listing proves endpoint reachability and model membership, not credential validity, completion entitlement or remaining trial credits. NVIDIA catalog probes are observational: they do not suspect or heal breakers, including operator and ambiguous legacy holds. A configured provider whose probe target is unsupported falls back to breaker-based display instead of being labeled as missing credentials; genuinely absent keys remain disabled.
 - **Access:** NVIDIA developer trial access; credits and rate limits depend on the account. Genesis retains a conservative local 20 RPM cap; this is not a measured account quota or availability guarantee.
 - **2026-10-01 live checks:** `deepseek-ai/deepseek-v4.1-flash`, `z-ai/glm-5.3`, `z-ai/glm-5.3-flash`, and `moonshotai/kimi-k3` returned the requested JSON with the install's credentials. Genesis's existing `nvidia-nim-deepseek` alias now selects V4.1 Flash.
+- **2026-10-07 (one install's account; MEASURED):** V4.1 Flash accepted requests and never answered — plain, streaming (no first byte), thinking-off and reasoning-effort-none probes all timed out at 45 s, and of 26 production calls in `activity_log`'s retained window (10-06 18:02 to 10-07 18:03 UTC) 0 succeeded, 25 hit the 120 s timeout and 1 got a 404 — while other NIM models answered on the same key in 0.4-38 s. Of the 50 chat models `/v1/models` listed, 6 answered, 4 hung, 38 returned 404 "Function ... Not found for account" (a per-account entitlement), and 2 returned 503. A listing or a past success is therefore not evidence of service. Genesis took `nvidia-nim-deepseek` out of every chain; its rung is now `deepseek-flash` (DeepSeek's own API) then `openrouter-deepseek-flash`.
 - **Structured-output limitation:** a V4.1 Flash probe using `response_format=json_object` returned its JSON in `reasoning_content` with empty answer content. The same prompt without that option returned usable JSON. Current Genesis routing callers request JSON in their prompts and do not send this option; do not infer support for forced JSON mode from the prompt-based probes.
 - `deepseek-ai/deepseek-v4-flash-0731` returned HTTP 410, reporting retirement on September 21. The previous August repoint to this model is no longer usable.
 - The authenticated catalog listed 81 models and no Xiaomi/MiMo model. Nemotron 3.5 Lightning was listed but its bounded probe timed out; a catalog entry alone does not prove working inference.
@@ -693,6 +694,8 @@ High for adversarial review (#20) — without changing application code.
 ---
 
 ## Last Reviewed
+**2026-10-07** — NIM V4.1 Flash stopped answering on one install's account (probes in the Nvidia NIM entry); `nvidia-nim-deepseek` left every chain, replaced by `deepseek-flash` (DeepSeek's own API: `deepseek-flash` is V4.1 Flash, answered in 0.8-1.2 s, prepaid) then `openrouter-deepseek-flash`. `gemini-free-latest` (`gemini-flash-latest`) declared but left out of chains: it resolved to 3.8 Flash, the same model and quota as `gemini-free`.
+
 **2026-08-19** — NIM routing repoint (live probe): DeepSeek V4-Pro EOL'd on NIM
 (HTTP 410) and free Kimi K2.6 404s for-account, so Genesis retired `nvidia-nim-kimi`
 and repointed `nvidia-nim-deepseek` from `deepseek-ai/deepseek-v4-pro` to

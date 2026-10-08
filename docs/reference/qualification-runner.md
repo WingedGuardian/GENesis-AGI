@@ -45,15 +45,43 @@ under current and simulated promoted allowlists in disposable SQLite databases.
 Deterministic embeddings and synthetic classifiers establish wiring, not model
 or retrieval quality.
 
-`run` currently performs offline admission and then refuses with
-`financial_eligibility_unavailable`, before credentials, network or campaign
-creation. This is an unfinished paid execution boundary. Declared maxima,
-`max_price`, output token settings and key credit balance do not establish a
-verified total charge bound. Complete provider costs/effective parameters,
-key isolation and concrete per-model and combined spending approval remain
-separate prerequisites. Existing corpus approval remains intact; missing actual
-historical actor provenance must be reconciled from real evidence.
+`run` requires both candidates in one serial invocation: `--alias`, `--campaign`,
+`--against`, `--against-campaign`, `--operating-plan` and `--spending-approval`,
+as well as all complete admission inputs above. Missing spending approval still
+refuses before credentials or campaign creation. The private version-1 operating
+plan freezes both complete 2,250-attempt manifests, source admission, requested
+parameters, receipt-provider identities, credential fingerprint, price evidence,
+per-model and combined allowances, key limit and baseline usage. Currency uses
+exact nonnegative decimal strings. The plan names
+`financial_promise=operating_budget_with_overrun_risk` and
+`stop_semantics=stop_both_on_unresolved_evidence_no_resend`.
 
+These are operating allocations, not externally guaranteed maximum charges.
+The key envelope must fund every allocation and fit the combined allowance.
+The separate private approval binds the entire canonical plan hash, the owner,
+4500-request scope and actual decision provenance. This is a trusted local
+operator assertion, not cryptographic authentication of a human decision. An
+agent must never fabricate that record from design approval or a test fixture.
+
+A private kernel comparison lock, shared by credential fingerprint across both
+campaigns, precedes journal writers and credential reads. The final pre-dispatch
+key observation must match the approved nonreset limit and baseline plus exact
+consistent receipt costs from both campaigns; remaining credit must cover all
+undispatched allocations. One inference is in flight globally. Settlement and a
+fresh key observation precede the next request. Uncertainty or processing failure
+stops new acquisition in both models and retains an existing journal incident
+when there is a dispatched attempt. Pre-dispatch refusal invents no reservation,
+dispatch or acknowledgement. Resume never resends a dispatched coordinate.
+
+Plan and approval descriptors remain open: metadata/replacement checks run per
+request, and full hashes are checked at admission and completion. This detects
+accidental edits, not deliberate same-user evasion. Reports separately show
+consistent observed receipt expenses (including above-allocation charges),
+unresolved costs, over-allocation incidents and journal settled/reserved totals.
+Late or undisclosed provider charges can exceed the allowance; a stopped or
+incomplete comparison cannot qualify or promote either model. Effective provider
+parameters, real quality, final paid settings, genuine corpus consent and actual
+spending approval remain separate decisions.
 The CLI prints aggregate results and fixed failure codes. Exit codes are 0 for
 pass, 1 for fail and 2 for incomplete. Private campaign evidence can contain model
 answers; retain its operator-controlled 0700 directory and 0600 files. Reports

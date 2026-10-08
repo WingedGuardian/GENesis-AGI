@@ -20,7 +20,7 @@ from genesis.eval.qualification import references
 from genesis.eval.qualification.evidence import Incomplete, digest, load_json
 from genesis.eval.rubrics import get_rubric, list_rubrics
 from genesis.eval.scorers import render_rubric_prompt
-from genesis.learning.procedural.embedding import EMBEDDING_DIM
+from genesis.learning.procedural.embedding import EMBEDDING_DIM, pack_embedding, unpack_embedding
 
 RELEVANCE = "j9_relevance"
 NOVELTY = "procedure_novelty"
@@ -67,7 +67,11 @@ def load(directory: Path, *, reference_policy=None) -> dict[str, list[dict]]:
         if path.stem not in known:
             raise Incomplete(f"unknown contract file {path.name}")
         cases = []
-        for number, raw in enumerate(path.read_text().split("\n"), 1):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise Incomplete(f"{path.name}: invalid UTF-8") from exc
+        for number, raw in enumerate(text.split("\n"), 1):
             if not raw.strip() or raw.lstrip().startswith("#"):
                 continue
             try:
@@ -192,6 +196,9 @@ def validate_novelty(case: dict):
             or not any(vector)
         ):
             raise Incomplete("invalid deterministic embedding")
+        stored = unpack_embedding(pack_embedding(vector + [0.0] * (EMBEDDING_DIM - len(vector))))
+        if not any(stored):
+            raise Incomplete("invalid deterministic embedding: float32 zero vector")
         vector_key = tuple(vector) + (0.0,) * (EMBEDDING_DIM - len(vector))
         if row["principle"] in embeddings and embeddings[row["principle"]] != vector_key:
             raise Incomplete("same principle must have a consistent deterministic embedding")

@@ -136,11 +136,18 @@ def scope_properties(ram: int, cpu_pct: float, oom_continue: bool = True) -> lis
     return [*props, "OOMPolicy=continue"] if oom_continue else props
 
 
+#: Where capped jobs run unless the caller names a slice. A child of app.slice
+#: (dash nesting), so every ancestor limit and policy is unchanged; its own
+#: memory.events counts every OOM kill inside it, and it outlives its scopes,
+#: which is how the disk guardian tells a job killed at its own cap from any
+#: other OOM kill without guessing from journal text.
+CAPPED_SLICE = "app-capped.slice"
+
+
 def scope_argv(unit: str, props: list[str], slice_name: str | None, *trailing: str) -> list[str]:
     # --collect: a failed scope is unloaded instead of lingering under its name.
     argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}"]
-    if slice_name:
-        argv.append(f"--slice={slice_name}")
+    argv.append(f"--slice={slice_name or CAPPED_SLICE}")
     for prop in props:
         argv += ["-p", prop]
     return [*argv, "--", *trailing]

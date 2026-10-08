@@ -44,9 +44,10 @@ genesis_is_primary_checkout() {
 
 # Is <root> standing on $DEPLOY_BRANCH? Sets _branch (empty on a detached HEAD).
 #   --allow-override  honour GENESIS_ALLOW_NON_DEPLOY_BRANCH=1, which admits another
-#                     NAMED branch. Never a detached HEAD, and never `live`: an
-#                     integration branch is refused until deploying one is decided
-#                     on its own. Only update.sh passes it.
+#                     NAMED branch. Never a detached HEAD, and never `live`: the
+#                     override cannot admit the integration branch, which a caller
+#                     admits only through genesis_live_checkout below, for the modes
+#                     that do not pull into it. Only update.sh passes it.
 # The caller tells an override admission from a plain one by comparing _branch with
 # $DEPLOY_BRANCH, and says so itself.
 genesis_deploy_branch_ok() {
@@ -57,6 +58,25 @@ genesis_deploy_branch_ok() {
     $allow_override || return 1
     [ "${GENESIS_ALLOW_NON_DEPLOY_BRANCH:-0}" = 1 ] || return 1
     [ -n "$_branch" ] && [ "$_branch" != live ]
+}
+
+# Is <root> on `live`, the integration branch scripts/deploy_candidates builds
+# from the deploy manifest? Returns 0 (live), 1 (no: the branch rule above
+# applies) or 2 (on `live` but the manifest or git cannot be read: refuse).
+# Runs the text of scripts/lib/live_checkout.py that the CALLER read into
+# $_LIVE_CHECKOUT_PY at startup, so the copy is the one this run started with;
+# an empty or missing copy answers 2. The printed word must agree with the exit
+# code (python itself exits 1 on a SyntaxError or an uncaught exception), so a
+# broken copy answers 2, never 1. Prints nothing.
+genesis_live_checkout() {
+    local root="$1" rc=0 out
+    [ -n "${_LIVE_CHECKOUT_PY:-}" ] || return 2
+    out="$(python3 -I -S -c "$_LIVE_CHECKOUT_PY" "$root" 2>/dev/null)" || rc=$?
+    case "$rc:$out" in
+        "0:live") return 0 ;;
+        "1:other") return 1 ;;
+        *) return 2 ;;
+    esac
 }
 
 # Tracked, locally modified paths that are NOT on the ephemeral allowlist, as
