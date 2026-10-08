@@ -23,6 +23,7 @@ What is pinned:
 
 from __future__ import annotations
 
+import fcntl
 import subprocess
 import sys
 import time
@@ -30,6 +31,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._checkout_lock_helpers import held
 from tests.test_scripts._deploy_station import SCRIPT
 from tests.test_scripts._deploy_station import advance_upstream as _advance_upstream
 from tests.test_scripts._deploy_station import alerts as _alerts
@@ -97,6 +99,7 @@ _SCRIPT_FILES = (
     "lib/alert_queue.sh",
     "lib/deploy_status.sh",
     "lib/deploy_checkout.sh",
+    "lib/checkout_lock.sh",
     "lib/deploy_recovery.sh",
     "lib/port_owned_by.py",
     "lib/manifest_delta.py",
@@ -751,6 +754,22 @@ def test_a_merge_refused_after_the_stop_starts_the_server_again(station):
     assert any(c.endswith("start genesis-server") and "restart" not in c for c in calls), calls
     assert _git(station["root"], "rev-parse", "HEAD") == head
     assert not _alerts(station), "nothing changed and the server is back up"
+
+
+@pytest.mark.parametrize("mode", ["deploy", "pull"])
+def test_checkout_lock_timeout_refuses_before_stopping_or_changing_checkout(station, mode):
+    _advance_upstream(station, "runtime change", {"src/genesis/mod.py": "x = 1\n"})
+    head = _git(station["root"], "rev-parse", "HEAD")
+    status = _git(station["root"], "status", "--porcelain")
+    common = _git(station["root"], "rev-parse", "--path-format=absolute", "--git-common-dir")
+    args = ("pull",) if mode == "pull" else ()
+    with held(Path(common) / "genesis-checkout.lock", fcntl.LOCK_SH):
+        result = _run(station, *args, env=_env(station, GENESIS_CHECKOUT_LOCK_WAIT_S="1"), timeout=10)
+    assert result.returncode == 1
+    assert "checkout busy (a Claude launch holds genesis-checkout.lock)" in result.stderr
+    assert _git(station["root"], "rev-parse", "HEAD") == head
+    assert _git(station["root"], "status", "--porcelain") == status
+    assert not any("stop genesis-server" in c for c in _calls(station))
 
 
 _RACES = {
