@@ -289,19 +289,35 @@ async def test_unknown_operation_retry_requires_exact_read_and_confirmed_drain(
     await operations.transition(s.binding, operation["id"], "unknown")
     with pytest.raises(TaskRefusal):
         await operations.prepare(s.binding, "conversation", s.digest, immutable_read=immutable_read)
-    # A second independent approval creates a new attempt, without altering
-    # conversation consent. The drain proof comes from the trusted controller.
+    # A second approval permits a drained immutable read to retry. It cannot
+    # authorize replay of a consequential operation whose outcome is unknown.
     identifier = await hold(s, "resource:" + "1" * 32, hashlib.sha256(b"resource").hexdigest())
     await s.state.settle(s.binding, 1, clean=True)
     assert await s.gate.resolve_request(identifier, decision="approved", resolved_by="dashboard")
-    assert await s.state.resume_approval(s.task["id"])
-    s.binding = await next_binding(s)
     if not immutable_read:
-        with pytest.raises(TaskRefusal):
-            await operations.prepare(
-                s.binding, "conversation", s.digest, immutable_read=immutable_read
-            )
+        assert not await s.state.resume_approval(s.task["id"])
+        async with s.registry.connection() as db:
+            runtime = await (await db.execute("SELECT * FROM peer_task_runtime")).fetchone()
+            assert runtime["hold_reason"] == "reconciliation"
+            assert not await (
+                await db.execute("SELECT 1 FROM direct_session_queue WHERE status='pending'")
+            ).fetchone()
+            approval = await (
+                await db.execute(
+                    "SELECT consumed_at FROM approval_requests WHERE id=?", (identifier,)
+                )
+            ).fetchone()
+            assert approval["consumed_at"] is None
+            assert (await (await db.execute("SELECT COUNT(*) FROM peer_task_consents")).fetchone())[
+                0
+            ] == 1  # Only the earlier conversation consent.
+            task = await (
+                await db.execute("SELECT generation FROM peer_tasks WHERE id=?", (s.task["id"],))
+            ).fetchone()
+            assert task["generation"] == s.binding.generation + 1  # Hold fence only.
     else:
+        assert await s.state.resume_approval(s.task["id"])
+        s.binding = await next_binding(s)
         retry = await operations.prepare(s.binding, "conversation", s.digest, immutable_read=True)
         assert retry["id"] == operation["id"] and retry["status"] == "prepared"
         await operations.transition(s.binding, retry["id"], "executing")
