@@ -15,11 +15,17 @@ from qdrant_client import QdrantClient
 from genesis.db.connection import ReadConnectionPool, ReadPoolClosed
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links, observations
-from genesis.db.crud._fts import drop_bm25_inert_terms, fts5_term
+from genesis.db.crud._fts import (
+    FTS_MAX_TERMS,
+    bounded_terms,
+    drop_bm25_inert_terms,
+    fts5_term,
+)
 from genesis.memory.activation import compute_activation
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.intent import (
     QueryIntent,
+    _tokenize_query,
     classify_intent,
     expand_query,
     rank_by_intent,
@@ -1456,6 +1462,17 @@ class HybridRetriever:
             # near-tie swap at ranks 44–48. See ``_fts.drop_bm25_inert_terms``.
             kept = await self._ro_read(drop_bm25_inert_terms, safe_terms) if safe_terms else []
             base = fts_query
+            if base == query:
+                # The raw prompt enters boolean mode here as an implicit-AND group,
+                # so a long paste would AND every one of its words. Bounded only
+                # when it exceeds the cap, so a short prompt keeps its exact form,
+                # and only when it IS the raw prompt: an expanded expression is
+                # already bounded and must not be re-tokenised.
+                # Same tokens as the expanded query (site A), so one definition
+                # of "prompt terms" serves both.
+                raw = _tokenize_query(query)
+                if len(set(raw)) > FTS_MAX_TERMS:
+                    base = " ".join(bounded_terms(raw, site="lane-base"))
             if kept:
                 fts_query = f"({base}) OR ({' OR '.join(kept)})"
             elif safe_terms:
