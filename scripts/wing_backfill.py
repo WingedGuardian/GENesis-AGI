@@ -11,7 +11,9 @@ Two-stage classification, mirroring the layered design of ``taxonomy.classify``:
 1. **Deterministic:** ``taxonomy.classify()`` — accepted at confidence >= 0.6
    (path/keyword/tag layers). Free, and validated against a live sample.
 2. **LLM batch:** remaining rows go through the router call site
-   ``wing_backfill`` (free background chains) in batches; the model picks a
+   ``wing_backfill`` in batches (V4.1 Flash on DeepSeek's paid API first, then
+   free rungs: about 120 calls of 25 rows for the ~2.9K backlog, a few cents);
+   the model picks a
    wing from the closed WINGS list. Invalid/unsure answers leave the row
    untouched (do-no-harm).
 
