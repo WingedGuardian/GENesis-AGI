@@ -51,8 +51,11 @@ genesis_without_checkout_lock() {
 }
 
 genesis_checkout_unlock() {
-    if [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ]; then
-        exec {GENESIS_CHECKOUT_LOCK_FD}>&-
+    # Unpublish first, then close: a signal trap running in between must see the
+    # lock as not held (and take it again), never as held after it is gone.
+    local held_fd="${GENESIS_CHECKOUT_LOCK_FD:-}"
+    if [ -n "$held_fd" ]; then
         unset GENESIS_CHECKOUT_LOCK_FD
+        exec {held_fd}>&-
     fi
 }

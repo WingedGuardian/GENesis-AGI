@@ -111,6 +111,19 @@ def test_a_trap_during_the_wait_does_not_take_the_lock_as_held(tmp_path):
     assert "NOT-REACHED" not in out
 
 
+def test_unlock_unpublishes_the_lock_before_closing_it():
+    """A trap between the two steps must never see the lock as held after its
+    descriptor is closed, so unlock unsets GENESIS_CHECKOUT_LOCK_FD first."""
+    import re
+
+    text = HELPER.read_text()
+    body = text[text.index("genesis_checkout_unlock() {") :]
+    body = body[: body.index("\n}\n")]
+    unset_at = body.index("unset GENESIS_CHECKOUT_LOCK_FD")
+    close_at = re.search(r"exec \{\w+\}>&-", body).start()
+    assert unset_at < close_at
+
+
 def test_shell_helper_warns_and_fails_open_for_unresolvable_checkout(tmp_path):
     result = subprocess.run(
         [

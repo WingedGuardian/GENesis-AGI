@@ -1511,7 +1511,7 @@ _do_rollback() {
     systemctl --user stop genesis-bridge 2>/dev/null || true
     if [ "${_CHECKOUT_LOCK_BUSY:-0}" != "1" ]; then
         if ! genesis_checkout_lock "$GENESIS_ROOT"; then
-            echo "  WARNING: checkout lock busy during rollback; continuing without it" >&2
+            echo "  WARNING: checkout lock busy during rollback; the checkout will be left as it is" >&2
         fi
     fi
 
@@ -1549,6 +1549,14 @@ _do_rollback() {
     elif [ -n "$rb_commit" ] && [ "$own_head" = "$rb_commit" ]; then
         code_action=untouched
     fi
+    # Without the checkout lock a Claude launch may be reading the tree, so
+    # nothing here changes it: no switch back, no reset, no merge abort.
+    # GENESIS_CHECKOUT_LOCK_FD is set only while the lock is held.
+    local rollback_locked=true
+    [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ] || rollback_locked=false
+    if [ "$rollback_locked" != "true" ] && [ "$code_action" != "none" ]; then
+        code_action=locked_out
+    fi
     # Someone SWITCHED branches (rather than committing on ours): if our branch
     # still points where this run left it and nothing uncommitted is in the way,
     # switch back with a NON-forced checkout. git refuses rather than overwrite a
@@ -1577,7 +1585,11 @@ _do_rollback() {
         none)
             echo "  The checkout is still at $ROLLBACK_TAG on $ORIGINAL_BRANCH: no code to roll back."
             if [ "${MERGE_ATTEMPTED:-0}" = "1" ]; then
-                if git -C "$GENESIS_ROOT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+                if git -C "$GENESIS_ROOT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 \
+                    && [ "$rollback_locked" != "true" ]; then
+                    echo "  CRITICAL: an interrupted merge is in progress, and without the checkout lock it is left for you to abort."
+                    checkout_ok=false
+                elif git -C "$GENESIS_ROOT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
                     if ! genesis_without_checkout_lock git -C "$GENESIS_ROOT" merge --abort 2>&1; then
                         echo "  CRITICAL: an interrupted merge is in progress and could not be aborted."
                         checkout_ok=false
@@ -1660,6 +1672,11 @@ _do_rollback() {
                     code_kept=true
                 fi
             fi
+            ;;
+        locked_out)
+            echo "  CRITICAL: the checkout lock could not be taken (a Claude launch holds genesis-checkout.lock), so the code was NOT rolled back: the checkout is left as found (${_now_branch:-a detached HEAD} at ${_now_head:0:12}). This update's merge is ${own_head:0:12}; the pre-update state is $ROLLBACK_TAG."
+            checkout_ok=false
+            code_kept=true
             ;;
         *)
             echo "  CRITICAL: the checkout moved after this update merged (now ${_now_branch:-a detached HEAD} at ${_now_head:0:12}); expected $ORIGINAL_BRANCH at ${own_head:0:12}."
