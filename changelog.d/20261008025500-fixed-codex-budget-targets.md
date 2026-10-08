@@ -1,1 +1,1 @@
-Codex budget checks require an absolute `git -C <directory>` for mutating commits and an explicit GitHub PR number/repository or a standalone GitHub PR URL for review requests. Context-dependent targets receive a rewrite instruction before budget lookup.
+- Codex budget checks require an absolute `git -C <directory>` for mutating commits and an explicit GitHub PR number/repository or a standalone GitHub PR URL for review requests. Context-dependent targets receive a rewrite instruction before budget lookup.
