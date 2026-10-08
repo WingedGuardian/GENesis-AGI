@@ -105,8 +105,30 @@ revisit it.
   reaped; the task fails saying so, and it needs `git worktree unlock` or a
   manual removal.
 
-The dashboard's delete actions are #2926 PR 5, and an advisory on shell `rm` is
-PR 6.
+The dashboard's delete actions are #2926 PR 5.
+
+## The advisory on shell deletes
+
+A session that runs `rm`, `unlink` or `shred` on user data gets a note from the
+PreToolUse hook `scripts/hooks/rm_trash_advisory.py`: if the delete ran, the data
+is gone, and next time `put` would have kept it. The note is advisory only. It
+never blocks or asks, it reaches the session while the command is already
+running, and a dispatched session sees it the same way.
+
+It fires only when an operand is an existing path in a user-data location, or,
+for `rm -r`, a directory holding one: Claude Code memory, plans, settings,
+`CLAUDE.md`, skills, agents, commands and hookify rules under `~/.claude`;
+`config`, `output`, `knowledge`, `uploads`, `skill-library`, `plans`, `eval`,
+`voice-transcripts`, `infrastructure` and the two remote yamls under
+`~/.genesis`; and, in any Genesis checkout, the gitignored files git cannot
+restore (the four user identity files, `config/*.local.yaml`,
+`.claude/settings.local.json`, `secrets.env`). Temp, cc-tmp, repo files and
+anything else stay silent. So does anything it cannot read: an operand holding
+a shell variable, a relative path after a `cd` it cannot follow, a command the
+parser cannot read, `find -delete`, `git clean`, `xargs rm`, and deletes from
+inside another program. Over 30 days of one install's transcripts this set
+fired on about 7 commands a month, and most were a session's own drafts, which
+is why the note says "if this session created them, nothing to do".
 
 ## What does not go to the trash, and why
 
