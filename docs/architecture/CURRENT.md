@@ -3311,7 +3311,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 5e8dc977 2026-10-01
+verified: 1109d1844 2026-10-08
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -3356,7 +3356,10 @@ verified: 5e8dc977 2026-10-01
   starts the existing standalone health and memory MCP servers through a
   launcher that scrubs inherited Genesis session identity, provenance,
   supervision, slot, and trace context, then allowlists health plus explicit
-  recall tools. In a linked worktree the launcher sets `GENESIS_REPO_ROOT` to
+  recall tools. The launcher also selects `--external-client`; memory initialization
+  then disables processing of Claude's pending plan-bookmark file. Ordinary
+  Genesis memory initialization keeps that processing enabled by default.
+  In a linked worktree the launcher sets `GENESIS_REPO_ROOT` to
   the main checkout, which owns the live database and secrets. This gives Codex
   on-demand access without registering its transcript,
   creating a charter, or joining Genesis foreground/background lifecycle
