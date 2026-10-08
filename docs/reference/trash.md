@@ -122,7 +122,9 @@ for `rm -r`, a directory holding one: Claude Code memory, plans, settings,
 `voice-transcripts`, `infrastructure` and the two remote yamls under
 `~/.genesis`; and, in any Genesis checkout, the gitignored files git cannot
 restore (the four user identity files, `config/*.local.yaml`,
-`.claude/settings.local.json`, `secrets.env`). Temp, cc-tmp, repo files and
+`.claude/settings.local.json`, `secrets.env`), plus wherever `CLAUDE_HOME`,
+`GENESIS_PLANS_DIR`, `GENESIS_OUTPUT_DIR`, `GENESIS_VOICE_TRANSCRIPT_DIR` or
+`SECRETS_PATH` point when set. Temp, cc-tmp, repo files and
 anything else stay silent. So does anything it cannot read: an operand holding
 a shell variable, a relative path after a `cd` it cannot follow, a command the
 parser cannot read, `find -delete`, `git clean`, `xargs rm`, and deletes from

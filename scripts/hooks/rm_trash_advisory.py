@@ -13,12 +13,16 @@ in the dev skill and CLAUDE.md, and this hook is where it is met at the moment o
 the command. It fires on ``rm``, ``unlink`` and ``shred`` when an operand is, or
 (for ``rm -r``) contains, an EXISTING path in a user-data location:
 
-- ``~/.claude``: ``projects/*/memory``, ``plans``, ``CLAUDE.md``,
-  ``settings*.json``, ``skills``, ``agents``, ``commands``, ``hookify``;
+- ``~/.claude`` (and ``$CLAUDE_HOME`` when set): ``projects/*/memory``, ``plans``,
+  ``CLAUDE.md``, ``settings*.json``, ``skills``, ``agents``, ``commands``,
+  ``hookify``;
 - ``$GENESIS_HOME`` (default ``~/.genesis``): ``config``, ``output``,
   ``knowledge``, ``uploads``, ``skill-library``, ``plans``, ``eval``,
   ``voice-transcripts``, ``infrastructure``, ``guardian_remote.yaml``,
   ``ambient_remote.yaml``;
+- wherever the path overrides Genesis honours point, when set in the hook's
+  environment: ``GENESIS_PLANS_DIR``, ``GENESIS_OUTPUT_DIR``,
+  ``GENESIS_VOICE_TRANSCRIPT_DIR``, ``SECRETS_PATH``;
 - in any Genesis checkout (a directory holding ``src/genesis``), the gitignored
   files git cannot restore: ``src/genesis/identity/{USER,USER_KNOWLEDGE,
   TRIAGE_CALIBRATION,EGO_NOTEPAD}.md``, ``config/*.local.yaml``,
@@ -35,14 +39,18 @@ habit-former, not a safeguard; the blocking guards (``protected_paths_guard``,
 WHAT IT CANNOT SEE (it stays silent, never guesses)
 ===================================================
 - a command the parser reports blind (``shell_parse.analyze_checked``), or any
-  command holding a heredoc (``<<``: the parser reads its body lines as commands);
-- an operand that is a symlink (removing it loses nothing), a directory without
-  ``-r`` (the verbs refuse it), or past the work bounds (``_MAX_MATCHES``,
+  command holding a heredoc (``<<``, not the ``<<<`` here-string: the parser reads
+  a heredoc's body lines as commands; a ``<<`` inside quotes silences it too);
+- an operand that is a symlink, for ``rm``/``unlink`` without a trailing slash
+  (removing the link loses nothing; ``shred`` and ``rm -r link/`` are judged by
+  the target they reach), a directory without ``-r`` (the verbs refuse it), an
+  empty operand, or past the work bounds (``_MAX_MATCHES``, ``_MAX_VISITS``,
   ``_BUDGET_S``);
 - an operand holding ``$VAR`` or a backtick (only ``~``, ``$HOME`` and ``${HOME}``
   are expanded: the hook's environment is not the shell's);
-- a relative operand after a ``cd`` that is not one literal absolute or ``~``
-  path, after any ``cd`` in a command with ``(`` grouping or a pipe (the parser
+- a relative operand after a ``cd`` that is not bare (HOME) or one literal absolute
+  or ``~`` path, after any ``cd`` in a command with ``(`` grouping or a ``|`` pipe
+  (not ``||``; a quoted ``|`` counts too) (the parser
   flattens subshells), or after any ``cd`` inside ``bash -c``; ``env -C`` and
   ``sudo -D`` directory changes are not seen at all;
 - ``rm -r`` of a directory holding a whole Genesis checkout below it (a checkout
@@ -61,7 +69,6 @@ from __future__ import annotations
 
 import fnmatch
 import glob
-import itertools
 import os
 import re
 import sys
@@ -85,7 +92,21 @@ except Exception as _exc:  # noqa: BLE001 - advisory: degrade to silence
 _VERBS = frozenset({"rm", "unlink", "shred"})
 _PREFILTER = re.compile(r"\b(?:rm|unlink|shred)\b")
 _GLOB_CHARS = ("*", "?", "[")
-_HEREDOC = re.compile(r"<<(?!<)")
+_HEREDOC = re.compile(r"(?<!<)<<(?!<)")  # not a <<< here-string, which has no body
+_PIPE = re.compile(r"(?<!\|)\|(?!\|)")  # a pipe, not the || list operator
+# shred options that take their value as the NEXT word (shred --help, coreutils);
+# the long forms also accept --opt=VALUE, which is one word. rm and unlink take
+# no separate values.
+_SHRED_VALUE_SHORT = frozenset("ns")
+_SHRED_VALUE_LONG = frozenset({"--iterations", "--size", "--random-source"})
+# Override variables the Genesis path resolvers honour (src/genesis/env.py:
+# claude_home, plans_dir, output_dir, voice_transcript_dir, secrets_path).
+_PATH_OVERRIDES = (
+    "GENESIS_PLANS_DIR",
+    "GENESIS_OUTPUT_DIR",
+    "GENESIS_VOICE_TRANSCRIPT_DIR",
+    "SECRETS_PATH",
+)
 
 # Every command waits for its PreToolUse hooks (this one is wired at a 10s
 # timeout), so the work must stay small whatever the operands expand to. MEASURED:
@@ -95,9 +116,18 @@ _HEREDOC = re.compile(r"<<(?!<)")
 # transcripts name at most a few paths. The 2s budget caps the whole command, well
 # under the timeout. Past either bound the hook stops reading and notes only what
 # it already found: a missed note costs a sentence, a slow hook costs every
-# command.
+# command. Glob expansion is done here, one directory at a time, so the budget
+# also bounds a pattern that matches nothing: `glob.iglob` lists every directory
+# a multi-level pattern reaches before yielding anything (MEASURED 5.2s for
+# `rm -rf ~/tmp/*/*/*.nomatch`), and _MAX_VISITS caps the entries read.
 _MAX_MATCHES = 256
+_MAX_VISITS = 50_000
 _BUDGET_S = 2.0
+
+
+class _OverBudget(Exception):
+    """The work bound was reached; stop reading and note what was found."""
+
 
 _CLAUDE_TARGETS = (
     "projects/*/memory",
@@ -154,14 +184,20 @@ def _canon(path: str) -> str:
 
 def _home_targets() -> list[str]:
     home = os.path.expanduser("~")
+    claude_bases = {os.path.join(home, ".claude")}
+    if os.environ.get("CLAUDE_HOME"):
+        claude_bases.add(os.path.expanduser(os.environ["CLAUDE_HOME"]))
     ghome = os.path.expanduser(os.environ.get("GENESIS_HOME") or "~/.genesis")
+    bases = [(base, _CLAUDE_TARGETS) for base in claude_bases]
+    bases.append((ghome, _GENESIS_HOME_TARGETS))
     found: list[str] = []
-    for base, rels in (
-        (os.path.join(home, ".claude"), _CLAUDE_TARGETS),
-        (ghome, _GENESIS_HOME_TARGETS),
-    ):
+    for base, rels in bases:
         for rel in rels:
             found.extend(_canon(p) for p in glob.glob(os.path.join(base, rel)))
+    for var in _PATH_OVERRIDES:
+        value = os.path.expanduser(os.environ.get(var) or "")
+        if os.path.isabs(value) and os.path.lexists(value):
+            found.append(_canon(value))
     return found
 
 
@@ -218,8 +254,11 @@ def _recursive(argv: list[str]) -> bool:
 
 
 def _cd_target(argv: list[str]) -> str | None:
-    """The new cwd for one literal absolute or ``~`` target, else None (unknown)."""
+    """The new cwd for a bare ``cd`` (HOME) or one literal absolute or ``~``
+    target, else None (unknown)."""
     args = argv[1:]
+    if argv[0] == "cd" and not args:
+        return os.path.expanduser("~")
     if len(args) != 1:
         return None
     tok = args[0]
@@ -246,10 +285,41 @@ def _resolve(word: str, base: str | None) -> str | None:
     return os.path.normpath(word)
 
 
-def _existing(path: str) -> list[str]:
-    if any(ch in path for ch in _GLOB_CHARS):
-        return list(itertools.islice(glob.iglob(path), _MAX_MATCHES))
-    return [path] if os.path.lexists(path) else []
+def _existing(path: str, deadline: float) -> list[str]:
+    """The existing paths ``path`` names: itself, or a glob's matches expanded one
+    directory level at a time with the budget checked at every directory (the
+    shell's rules: ``fnmatch`` per component, a leading dot only by a dot)."""
+    if not any(ch in path for ch in _GLOB_CHARS):
+        return [path] if os.path.lexists(path) else []
+    parts = [p for p in path.split("/") if p]
+    level = ["/"]
+    visits = 0
+    for i, part in enumerate(parts):
+        last = i == len(parts) - 1
+        following: list[str] = []
+        for base in level:
+            if time.monotonic() > deadline:
+                raise _OverBudget
+            if not any(ch in part for ch in _GLOB_CHARS):
+                candidate = os.path.join(base, part)
+                if os.path.lexists(candidate) if last else os.path.isdir(candidate):
+                    following.append(candidate)
+                continue
+            try:
+                with os.scandir(base) as entries:
+                    for entry in entries:
+                        visits += 1
+                        if visits > _MAX_VISITS:
+                            raise _OverBudget
+                        name = entry.name
+                        if name.startswith(".") and not part.startswith("."):
+                            continue
+                        if fnmatch.fnmatchcase(name, part) and (last or entry.is_dir()):
+                            following.append(os.path.join(base, name))
+            except OSError:
+                continue
+        level = following[:_MAX_MATCHES] if last else following
+    return level
 
 
 def _hits(path: str, recursive: bool, targets: list[str]) -> bool:
@@ -285,7 +355,7 @@ def _advisory(command: str, cwd: str | None) -> str | None:
         return None
     # A cd inside ( ) or a pipeline runs in a subshell, which the flat segment list
     # cannot show, so after any cd in such a command relative paths are unknown.
-    grouped = "(" in command or "|" in command
+    grouped = "(" in command or bool(_PIPE.search(command))
     cwd0 = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
     seen_cd = inner_cd = False
     targets: list[str] | None = None
@@ -303,25 +373,57 @@ def _advisory(command: str, cwd: str | None) -> str | None:
             continue
         base = None if (seg.depth and inner_cd) or (grouped and seen_cd) else cwd0
         recursive = seg.exe == "rm" and _recursive(seg.argv)
-        for operand in _rm_operands(seg.argv):
+        operands = _shred_operands(seg.argv) if seg.exe == "shred" else _rm_operands(seg.argv)
+        for operand in operands:
             try:
                 words = brace_expand(operand)
             except ValueError:
                 continue  # a brace bomb: skip this operand, keep reading the others
             for word in words:
-                path = _resolve(word, base)
+                path = _resolve(word, base) if word else None
                 if path is None:
                     continue
-                for found in _existing(path):
+                # shred writes through a symlink, and `rm -r link/` (trailing slash)
+                # descends into its target, so judge those by what they reach.
+                follow = seg.exe == "shred" or word.endswith("/")
+                try:
+                    found_paths = _existing(path, deadline)
+                except _OverBudget:
+                    return _note(named)
+                for found in found_paths:
                     if time.monotonic() > deadline:
                         return _note(named)
                     if targets is None:
                         targets = _home_targets()
-                    if _hits(found, recursive, targets):
+                    if _hits(os.path.realpath(found) if follow else found, recursive, targets):
                         if operand not in named:
                             named.append(operand)
                         break
     return _note(named)
+
+
+def _shred_operands(argv: list[str]) -> list[str]:
+    """shred's file operands: its value-taking options consume the next word."""
+    operands: list[str] = []
+    take_value = flags_done = False
+    for tok in argv[1:]:
+        if take_value:
+            take_value = False
+            continue
+        if not flags_done and tok == "--":
+            flags_done = True
+            continue
+        if not flags_done and tok.startswith("--") and len(tok) > 2:
+            take_value = tok in _SHRED_VALUE_LONG  # --opt=VALUE is a single word
+            continue
+        if not flags_done and tok.startswith("-") and len(tok) > 1:
+            for i, ch in enumerate(tok[1:], start=1):
+                if ch in _SHRED_VALUE_SHORT:
+                    take_value = i == len(tok) - 1  # -n3 carries its value; -n does not
+                    break
+            continue
+        operands.append(tok)
+    return operands
 
 
 def _note(named: list[str]) -> str | None:

@@ -55,6 +55,8 @@ def home(tmp_path: Path) -> Path:
     (h / ".claude/skills").mkdir()
     (h / ".claude/skills/linked").symlink_to(h / "tmp")
     (h / ".claude/skills/linked.md").symlink_to(h / "tmp/s.txt")
+    (h / "tmp/alias.md").symlink_to(h / ".claude/plans/x.md")  # a link INTO user data
+    (h / "tmp/alias-dir").symlink_to(h / ".claude/plans")
     return h
 
 
@@ -107,6 +109,13 @@ FIRES = [
     ("cd ~/.claude && rm plans/x.md", None),
     ("rm -- ~/.claude/plans/x.md", None),
     ("pushd ~/.claude && rm CLAUDE.md", None),
+    ("cd; rm .claude/plans/x.md", "tmp"),  # a bare cd goes to HOME
+    ("shred ~/tmp/alias.md", None),  # shred writes through the link
+    ("rm -r ~/tmp/alias-dir/", None),  # the trailing slash descends into the target
+    ("shred -n 3 ~/.claude/CLAUDE.md", None),
+    ("shred -zn3 ~/.claude/CLAUDE.md", None),
+    ("rm ~/.claude/plans/x.md && tr a b <<< x", None),  # a here-string has no body
+    ("cd ~/genesis && rm secrets.env || true", None),  # || is not a pipe
 ]
 
 
@@ -143,6 +152,13 @@ SILENT = [
     ("rm ~/.claude/skills/linked.md", None),  # a link to a file, so no directory rule applies
     ("rm ~/.claude/plans", None),  # a directory without -r: rm refuses it
     ("unlink ~/.claude/plans", None),
+    ("rm ~/tmp/alias.md", None),  # rm removes the link only
+    ("rm -r ~/tmp/alias-dir", None),  # no trailing slash: the link only
+    ("shred --random-source ~/.claude/CLAUDE.md ~/tmp/s.txt", None),  # a value, not a target
+    (
+        'rm -rf ""',
+        ".claude",
+    ),  # an empty operand removes nothing (with -r, or the dir rule masks it)
     ('cd "$X" && rm -r plans', ".claude"),
     # The subshell's cd does not leak: the second rm runs in HOME, where there is no
     # plans/. Read flat, the cd would aim it at ~/.claude/plans/x.md.
@@ -214,6 +230,78 @@ def test_a_brace_bomb_does_not_silence_the_other_operands(home: Path) -> None:
     note = _note(_run(home, "rm ~/.claude/CLAUDE.md ~/.claude/plans/" + "{a,b}" * 12))
     assert note is not None
     assert "`~/.claude/CLAUDE.md`" in note
+
+
+@pytest.mark.parametrize("var", ["GENESIS_OUTPUT_DIR", "GENESIS_PLANS_DIR", "SECRETS_PATH"])
+def test_path_overrides_are_honoured(home: Path, tmp_path: Path, var: str) -> None:
+    """Genesis resolves these locations through override variables
+    (src/genesis/env.py); a relocated one is user data too."""
+    moved = tmp_path / "moved"
+    target = moved / "r.md"
+    target.parent.mkdir()
+    target.write_text("x")
+    env = {k: v for k, v in os.environ.items() if k != "GENESIS_HOME"}
+    env.update(HOME=str(home), **{var: str(target if var == "SECRETS_PATH" else moved)})
+    payload = {"tool_input": {"command": f"rm {target}"}, "cwd": str(home)}
+    res = subprocess.run(
+        [sys.executable, str(HOOK)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert _note(res) is not None, var
+
+
+def test_claude_home_override_is_honoured(home: Path, tmp_path: Path) -> None:
+    other = tmp_path / "claude-elsewhere"
+    (other / "plans").mkdir(parents=True)
+    (other / "plans" / "p.md").write_text("x")
+    env = {k: v for k, v in os.environ.items() if k != "GENESIS_HOME"}
+    env.update(HOME=str(home), CLAUDE_HOME=str(other))
+    payload = {"tool_input": {"command": f"rm {other}/plans/p.md"}, "cwd": str(home)}
+    res = subprocess.run(
+        [sys.executable, str(HOOK)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert _note(res) is not None
+
+
+def test_glob_expansion_stops_at_the_visit_bound(home: Path, monkeypatch) -> None:
+    """A pattern that matches nothing still costs a listing of every directory it
+    reaches; the bound must stop that, not just the matches it yields."""
+    mod = _cost_module(home, monkeypatch)
+    for i in range(30):
+        (home / "tmp" / f"d{i}").mkdir()
+    monkeypatch.setattr(mod, "_MAX_VISITS", 10)
+    with pytest.raises(mod._OverBudget):
+        mod._existing(str(home / "tmp" / "*" / "*.nomatch"), float("inf"))
+
+
+def test_the_budget_is_checked_before_listing_any_directory(home: Path, monkeypatch) -> None:
+    mod = _cost_module(home, monkeypatch)
+    listed: list[object] = []
+    real = mod.os.scandir
+    monkeypatch.setattr(mod.os, "scandir", lambda p: listed.append(p) or real(p))
+    monkeypatch.setattr(mod, "_BUDGET_S", -1.0)
+    assert mod._advisory("rm ~/tmp/*/*.nomatch", str(home)) is None
+    assert listed == []
+
+
+def test_glob_expansion_follows_the_shell_rules(home: Path, monkeypatch) -> None:
+    mod = _cost_module(home, monkeypatch)
+    (home / "tmp" / ".hidden.md").write_text("x")
+    found = mod._existing(str(home / "tmp" / "*.md"), float("inf"))
+    assert str(home / "tmp" / "alias.md") in found
+    assert str(home / "tmp" / ".hidden.md") not in found  # * does not match a leading dot
+    assert mod._existing(str(home / "tmp" / ".*.md"), float("inf")) == [
+        str(home / "tmp" / ".hidden.md")
+    ]
 
 
 def _cost_module(home: Path, monkeypatch):
