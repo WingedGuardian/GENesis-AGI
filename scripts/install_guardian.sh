@@ -271,6 +271,10 @@ fi
 
 # Auto-detect health API port (default 5000)
 HEALTH_PORT=5000
+HEALTH_HOST=""
+if [ "$(incus config device get "$CONTAINER_NAME" dashboard-proxy listen 2>/dev/null || true)" = "tcp:127.0.0.1:5000" ]; then
+    HEALTH_HOST="127.0.0.1"
+fi
 
 VENV_DIR="$INSTALL_DIR/.venv"
 
@@ -406,20 +410,34 @@ REPO_ROOT="$(unset CDPATH; cd "$(dirname "$0")/.." && pwd)"
 
 # If already running from the install dir (e.g. host-setup.sh cloned directly
 # into INSTALL_DIR), skip the copy — code is already in place.
+_guardian_copy_config=0
 if [ "$(cd "$REPO_ROOT" && pwd)" = "$(cd "$INSTALL_DIR" 2>/dev/null && pwd)" ] 2>/dev/null; then
     echo "  Code already in $INSTALL_DIR (same as repo)"
 elif [ -d "$INSTALL_DIR/src/genesis/guardian" ]; then
+    _guardian_copy_config=1
     echo "  Updating from local repo: $REPO_ROOT"
     # Use cp -rT to merge contents into existing dirs (not nest src/src/)
     cp -rT "$REPO_ROOT/src" "$INSTALL_DIR/src"
-    cp -rT "$REPO_ROOT/config" "$INSTALL_DIR/config"
     cp -rT "$REPO_ROOT/scripts" "$INSTALL_DIR/scripts"
 else
+    _guardian_copy_config=1
     echo "  Copying from local repo: $REPO_ROOT"
     mkdir -p "$INSTALL_DIR"
     cp -r "$REPO_ROOT/src" "$INSTALL_DIR/src"
-    cp -r "$REPO_ROOT/config" "$INSTALL_DIR/config"
     cp -r "$REPO_ROOT/scripts" "$INSTALL_DIR/scripts"
+fi
+
+# Copy shipped configuration without the operator-owned Guardian file. Keeping
+# an absent file absent lets Step 5 generate the detected values on first install.
+if [ "$_guardian_copy_config" = 1 ]; then
+    "$PYTHON" - "$REPO_ROOT/config" "$INSTALL_DIR/config" <<'PYCONFIG'
+from pathlib import Path
+import shutil
+import sys
+source, destination = map(Path, sys.argv[1:])
+shutil.copytree(source, destination, dirs_exist_ok=True,
+                ignore=lambda directory, names: ["guardian.yaml"] if Path(directory) == source else [])
+PYCONFIG
 fi
 
 # ── Step 3: Create venv ──────────────────────────────────────────────
@@ -479,6 +497,7 @@ cat > "$INSTALL_DIR/config/guardian.yaml" << YAML
 
 container_name: "$CONTAINER_NAME"
 container_ip: "$CONTAINER_IP"
+health_api_host: "$HEALTH_HOST"
 health_api_port: $HEALTH_PORT
 
 # Host VM details — used by Genesis for bidirectional monitoring (SSH → gateway)
@@ -524,6 +543,19 @@ if [ -n "${TS_IP:-}" ]; then
 else
     echo "  WARNING: No Tailscale IP — approval URLs will use 'localhost'"
     echo "  Set approval.bind_host in guardian.yaml to a reachable IP"
+fi
+
+# For loopback proxies, update an unset HTTP target in the preserved config.
+# An explicit operator target is retained; migration's --apply is the separate
+# operation that intentionally moves an existing non-loopback target.
+if [ "$HEALTH_HOST" = "127.0.0.1" ]; then
+    PYTHONPATH="$INSTALL_DIR/src" "$VENV_DIR/bin/python" - "$INSTALL_DIR/config/guardian.yaml" <<'PYHEALTH'
+from pathlib import Path
+import sys
+from genesis.guardian.dashboard_ingress import configure_loopback_health
+configure_loopback_health(Path(sys.argv[1]), only_if_unset=True)
+PYHEALTH
+    echo "  Guardian HTTP target aligned with the host loopback proxy."
 fi
 
 # ── Step 6: Telegram credential bridge ────────────────────────────────

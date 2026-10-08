@@ -196,6 +196,14 @@ names, so an overlay of a read-only file is editable (#2446).
   `GENESIS_OUTPUT_DIR`, `GENESIS_CC_PROJECT_ID`; tuning — `GENESIS_DB_BUSY_TIMEOUT_MS`
   (MCP children default it to 15000), read-pool sizes, `GENESIS_RECALL_RERANK_RPM`.
   All in `src/genesis/env.py`. They reach a process via the unit, `secrets.env`, or the parent.
+- **Host Guardian HTTP target** — its deployed `config/guardian.yaml` contains
+  `health_api_host` (empty uses the configured/autodetected container address)
+  and `health_api_port`. `GUARDIAN_HEALTH_HOST` / `GUARDIAN_HEALTH_PORT` override
+  them in the Guardian process, read by `guardian.config.load_config` on each
+  timer invocation. `container_ip` remains the ICMP target. The operator migration
+  patches the preserved HTTP setting before restricting the Incus proxy; the
+  installer aligns unset targets for an existing loopback proxy. See
+  [peer ingress](../reference/peer-ingress.md).
 - **`~/.genesis/resource-budget.env`** — optional `KEY=VALUE` file for the resource-budget
   levers (`GENESIS_RB_*`), read by `genesis.hostmetrics`; the process environment wins over
   it. Details: `docs/reference/resource-budget.md`.

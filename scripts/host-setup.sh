@@ -861,18 +861,23 @@ incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
 }
 
 # ── Dashboard port forwarding ──────────────────────────────────
-# Forward host:5000 → container:5000 so the dashboard is reachable from
-# the host's network interfaces (LAN, Tailscale, etc.), not just the
-# internal container IP.
+# Forward host loopback:5000 → container loopback:5000. Remote access uses
+# an SSH tunnel or the authenticated, ACL-restricted HTTPS proxy.
 echo "  Setting up dashboard port forwarding..."
 if incus config device get "$CONTAINER_NAME" dashboard-proxy listen &>/dev/null; then
-    echo "  + Dashboard proxy already configured"
+    _dashboard_listen=$(incus config device get "$CONTAINER_NAME" dashboard-proxy listen)
+    if [ "$_dashboard_listen" = "tcp:127.0.0.1:5000" ]; then
+        echo "  + Dashboard loopback proxy already configured"
+    else
+        echo "  WARN: Existing dashboard proxy is not loopback-only."
+        echo "        Migrate through the deployed Guardian; see docs/reference/peer-ingress.md."
+    fi
 else
     if incus config device add "$CONTAINER_NAME" dashboard-proxy proxy \
-        listen=tcp:0.0.0.0:5000 connect=tcp:127.0.0.1:5000 2>/dev/null; then
-        echo "  + Dashboard proxy: host:5000 → container:5000"
+        listen=tcp:127.0.0.1:5000 connect=tcp:127.0.0.1:5000; then
+        echo "  + Dashboard proxy: host loopback:5000 → container loopback:5000"
     else
-        echo "  WARN: Could not set up dashboard proxy — dashboard only reachable via container IP"
+        echo "  WARN: Could not create the dashboard loopback proxy. Inspect the Incus error above."
     fi
 fi
 
@@ -974,19 +979,8 @@ CONTAINER_IPV6=$(incus exec "$CONTAINER_NAME" -- sh -c \
     "ip -6 -o addr show scope global 2>/dev/null | awk '\$2 !~ /^tailscale/ {print \$4}' | cut -d/ -f1 | head -1" \
     2>/dev/null || echo "")
 
-# Build dashboard URL for final report
-DASHBOARD_URL=""
-ACCESS_METHOD=""
-if [ -n "$TS_IPV4" ]; then
-    DASHBOARD_URL="http://$TS_IPV4:5000"
-    ACCESS_METHOD="tailscale"
-elif [ -n "$LAN_IPV4" ]; then
-    DASHBOARD_URL="http://$LAN_IPV4:5000"
-    ACCESS_METHOD="lan"
-fi
-
 if [ -n "$HOST_IPV4" ]; then
-    echo "  + Host IP: $HOST_IPV4 (dashboard: http://$HOST_IPV4:5000)"
+    echo "  + Host IP: $HOST_IPV4 (dashboard via local loopback or SSH tunnel)"
 fi
 
 # ── Run install.sh inside container ──────────────────────────
@@ -1485,7 +1479,7 @@ context auto-loaded by every `claude` session on this host (operator and Guardia
 <!-- begin:container-reference -->
 ## Container
 - **Name**: __CONTAINER_NAME__
-- **IP**: __CONTAINER_IP__  (dashboard: http://__CONTAINER_IP__:5000)
+- **IP**: __CONTAINER_IP__  (dashboard inside container: http://127.0.0.1:5000)
 - **Enter it**: `genesis` alias, or `incus exec __CONTAINER_NAME__ --user __UBUNTU_UID__ --env HOME=/home/ubuntu -- bash -l`
 <!-- end:container-reference -->
 
@@ -1584,25 +1578,12 @@ echo "    If onboarding doesn't start, run:  /setup"
 echo ""
 echo "  STEP 3 — Dashboard:"
 echo ""
-if [ "$ACCESS_METHOD" = "tailscale" ]; then
-    echo "    $DASHBOARD_URL/genesis  (via Tailscale)"
-elif [ -n "$DASHBOARD_URL" ]; then
-    echo "    From this host:    http://localhost:5000/genesis"
-    echo "    From your network: $DASHBOARD_URL/genesis"
-    echo ""
-    echo "    Can't reach it from your browser? Two options:"
-    echo ""
-    echo "    a) SSH tunnel (quick, no install):"
-    echo "       ssh -L 5000:localhost:5000 <your-user>@$HOST_IPV4"
-    echo "       Then open: http://localhost:5000/genesis"
-    echo ""
-    echo "    b) Tailscale (recommended for ongoing access):"
-    echo "       curl -fsSL https://tailscale.com/install.sh | sh"
-    echo "       sudo tailscale up"
-    echo "       Then open: http://<tailscale-ip>:5000/genesis"
-else
-    echo "    http://$CONTAINER_IP:5000/genesis  (container IP — host only)"
+echo "    From this host: http://localhost:5000/genesis"
+if [ -n "$HOST_IPV4" ]; then
+    echo "    From your device: ssh -L 5000:localhost:5000 <your-user>@$HOST_IPV4"
+    echo "    Then open: http://localhost:5000/genesis"
 fi
+echo "    Authenticated HTTPS access: docs/reference/peer-ingress.md"
 echo ""
 echo "  GUARDIAN (host-side health monitor — always running):"
 echo ""
