@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
+from string import ascii_letters, digits
 
 import aiosqlite
 
@@ -47,6 +48,26 @@ def _domain_eq(domain: str | None) -> tuple[str, list[str]]:
     if domain is None:
         return "", []
     return " AND domain = ?", [domain]
+
+
+_INSERT_SQL = """INSERT INTO follow_ups
+           (id, source, source_session, content, reason, strategy,
+            scheduled_at, status, priority, pinned, kind, revisit_condition,
+            domain, goal_id, dedup_key, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)"""
+
+
+def _insert_values(
+    fid, source, source_session, content, reason, strategy, scheduled_at,
+    priority, pinned, kind, revisit_condition, domain, goal_id, dedup_key,
+) -> tuple:
+    """One row assembly shared by legacy and explicitly owned creation."""
+    return (
+        fid, source, source_session, content, reason, strategy,
+        _normalize_scheduled_at(scheduled_at), priority, int(pinned), kind,
+        revisit_condition.strip() if revisit_condition and revisit_condition.strip() else None,
+        domain, goal_id, dedup_key, _now_iso(),
+    )
 
 
 async def create(
@@ -115,30 +136,10 @@ async def create(
     # six call sites (one already forgot).
     source_session = source_session or None
     fid = id or _new_id()
-    await db.execute(
-        """INSERT INTO follow_ups
-           (id, source, source_session, content, reason, strategy,
-            scheduled_at, status, priority, pinned, kind, revisit_condition,
-            domain, goal_id, dedup_key, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            fid,
-            source,
-            source_session,
-            content,
-            reason,
-            strategy,
-            _normalize_scheduled_at(scheduled_at),
-            priority,
-            int(pinned),
-            kind,
-            revisit_condition.strip() if revisit_condition and revisit_condition.strip() else None,
-            domain,
-            goal_id,
-            dedup_key,
-            _now_iso(),
-        ),
-    )
+    await db.execute(_INSERT_SQL, _insert_values(
+        fid, source, source_session, content, reason, strategy, scheduled_at,
+        priority, pinned, kind, revisit_condition, domain, goal_id, dedup_key,
+    ))
     await db.commit()
     return fid
 
@@ -938,6 +939,122 @@ WORK_STATE_TO_KIND = {
     "deferred_cold": "tabled",
 }
 VALID_WORK_STATE = frozenset(WORK_STATE_TO_KIND)
+
+_PRIVATE_STATUSES = frozenset({"pending", "in_progress", "blocked", "completed", "failed"})
+PRIVATE_FOLLOW_UP_SQL = """
+strategy = 'user_input_needed' AND scheduled_at IS NULL AND linked_task_id IS NULL
+AND status IN ('pending', 'in_progress', 'blocked', 'completed', 'failed')
+AND kind IN ('follow_up', 'tabled')
+AND NOT EXISTS (
+    SELECT 1 FROM board_links b
+    WHERE b.source_kind = 'follow_up' AND b.source_id = follow_ups.id
+)
+AND NOT EXISTS (
+    SELECT 1 FROM pending_issue_posts p WHERE p.status IN ('held', 'posted')
+    AND ((p.source = 'board' AND p.source_ref = 'follow_up:' || follow_ups.id)
+         OR (p.source != 'board' AND p.source_ref = follow_ups.id))
+)
+"""
+
+
+def _private_text(value: str | None, *, limit: int = 4000, required: bool = False) -> None:
+    if value is None and not required:
+        return
+    if not isinstance(value, str) or len(value) > limit or (required and not value.strip()):
+        raise ValueError("Private follow-up text is missing, invalid or over its limit")
+
+
+async def create_private(
+    db, *, request_key: str, content: str, reason: str, work_state: str, priority: str = "medium",
+    domain: str | None = None, revisit_condition: str | None = None,
+) -> str:
+    """Create or replay a private request while its dedup row is retained.
+
+    A replay never updates an existing row. Changed or ineligible requests
+    refuse; cancellation after commit may persist, so retry the same key.
+    No session, schedule, task, goal or pin authority.
+    """
+    if not isinstance(request_key, str) or not 1 <= len(request_key) <= 128 or any(
+        char not in ascii_letters + digits + "_-"
+        for char in request_key
+    ):
+        raise ValueError("Invalid private follow-up request key")
+    _private_text(content, required=True)
+    _private_text(reason, required=True)
+    _private_text(revisit_condition)
+    if work_state not in VALID_WORK_STATE or priority not in _VALID_PRIORITY:
+        raise ValueError("Invalid private follow-up state or priority")
+    if domain not in (None, "internal", "user_world"):
+        raise ValueError("Invalid private follow-up domain")
+    if work_state == "blocked_on_trigger" and not (revisit_condition or "").strip():
+        raise ValueError("A blocked private follow-up needs a revisit condition")
+    fid = _new_id()
+    dedup_key = "codex_private:" + request_key
+    kind = WORK_STATE_TO_KIND[work_state]
+    condition = None if work_state == "ready" else (revisit_condition or "").strip() or None
+    changed = await db.execute_committed(
+        _INSERT_SQL + " ON CONFLICT(dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING",
+        _insert_values(
+        fid, "codex_interactive", None, content, reason, "user_input_needed", None,
+        priority, False, kind, condition, domain, None, dedup_key,
+    ))
+    if changed:
+        return fid
+    async with db.execute(
+        f"SELECT id FROM follow_ups WHERE dedup_key = ? AND {PRIVATE_FOLLOW_UP_SQL} "
+        "AND source = 'codex_interactive' AND source_session IS NULL "
+        "AND content = ? AND reason = ? AND kind = ? AND revisit_condition IS ? "
+        "AND domain IS ? AND priority = ?",  # noqa: S608 -- fixed eligibility, values bound
+        (dedup_key, content, reason, kind, condition, domain, priority),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        raise RuntimeError("Private follow-up request cannot be replayed")
+    return row[0]
+
+
+async def update_private(
+    db, id: str, *, status: str | None = None, resolution_notes: str | None = None,
+    blocked_reason: str | None = None, priority: str | None = None,
+) -> bool:
+    """Commit one eligible update; a human pin cannot be cleared or closed.
+
+    Eligibility is evaluated by the UPDATE, not an earlier read. Notes-only
+    updates never copy a stale status. Future promotion is a separate action.
+    """
+    if status is not None and status not in _PRIVATE_STATUSES:
+        raise ValueError("Invalid private follow-up status")
+    if priority is not None and priority not in _VALID_PRIORITY:
+        raise ValueError("Invalid private follow-up priority")
+    _private_text(resolution_notes, limit=16000)
+    _private_text(blocked_reason)
+    effective_status = status if status is not None else (
+        "blocked" if blocked_reason is not None else None
+    )
+    if effective_status == "blocked" and blocked_reason is not None and not blocked_reason.strip():
+        raise ValueError("A blocked private follow-up needs a meaningful reason")
+    parts, params = [], []
+    if effective_status is not None:
+        parts.append("status = ?")
+        params.append(effective_status)
+        if effective_status in ("completed", "failed"):
+            parts.append("completed_at = CASE WHEN status = ? THEN completed_at ELSE ? END")
+            params.extend((effective_status, _now_iso()))
+        else:
+            parts.append("completed_at = NULL")
+    for column, value in (("resolution_notes", resolution_notes),
+                          ("blocked_reason", blocked_reason), ("priority", priority)):
+        if value is not None:
+            parts.append(f"{column} = ?")
+            params.append(value)
+    if not parts:
+        raise ValueError("No private follow-up fields supplied")
+    changed = await db.execute_committed(
+        f"UPDATE follow_ups SET {', '.join(parts)} WHERE id = ? AND {PRIVATE_FOLLOW_UP_SQL} "
+        "AND (? IS NULL OR ? NOT IN ('completed', 'failed') OR pinned = 0)",  # noqa: S608 -- closed columns/predicate, values bound
+        (*params, id, effective_status, effective_status),
+    )
+    return changed > 0
 
 # Allowlisted sort keys → ORDER BY fragment (never interpolate caller input).
 # Every fragment floats pinned rows to the top (pinned is a "keep visible"

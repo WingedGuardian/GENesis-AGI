@@ -1095,7 +1095,7 @@ Note: the *learning* package hosts the other big scheduler (see entry 10).
 ```yaml subsystem-map
 entry: scheduling-background
 modules: [surplus, scheduler, follow_ups]
-verified: 50b79ffb 2026-09-01
+verified: eb37e4ef0 2026-10-08
 ```
 
 - **Surplus generators are deliberately BLIND to `infrastructure_alert`
@@ -1147,6 +1147,10 @@ verified: 50b79ffb 2026-09-01
   (ready/blocked_on_trigger/deferred_cold) and DERIVE the hot(`follow_up`)/
   cold(`tabled`) lane, so priority never picks the lane; `blocked_on_trigger`
   requires a `revisit_condition` (nullable column on `follow_ups`).
+  Dedicated `crud.follow_ups.create_private`/`update_private` operations commit
+  one statement for external-client integration. They carry no session or
+  scheduling authority; updates atomically refuse task-linked or promoted rows
+  and terminal transitions of human-pinned rows. MCP exposure is a separate step.
 - GROUNDWORK: v4-parallel-dispatch, v4-surplus-tasks, v4-rate-tracking.
 
 ## 5. Information intake & research

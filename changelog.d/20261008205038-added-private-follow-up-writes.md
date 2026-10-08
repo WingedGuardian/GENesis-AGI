@@ -1,0 +1,1 @@
+- Add committed private follow-up operations for interactive external-client integration, preserving human pins and refusing scheduled, task-linked or promoted records.
