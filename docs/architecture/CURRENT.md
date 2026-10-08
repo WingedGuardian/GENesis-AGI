@@ -1768,6 +1768,14 @@ verified: 788dd9a9 2026-09-06
   keyed to name + content hash, so a rewritten handoff resurfaces). The hook's scan
   runs in a forked worker under a hard deadline (`SCAN_TIMEOUT_S`) — a hung mount
   reads as UNKNOWN, never as silence. Marked via `python -m genesis handoffs mark`.
+  Write side (2026-10-07, `session_awareness/handoff_send.py`): for installs that
+  share no directory, `python -m genesis handoffs send` delivers a file over ssh
+  into the peer's configured `dir` (refuses when unset; same sha = no-op, different
+  content needs `--replace`; read back by sha256), and with `--session` adds one
+  fixed-text pointer row to that peer session's ledger and checks `charter.md`.
+  `handoffs sessions` is a read-only peer listing. Peers: `config/peers.yaml` +
+  local overlay. Context transfer only, untrusted on arrival; not the findings
+  pipeline. See `docs/reference/peer-handoff.md`.
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
   (`scripts/surface_pr_updates.py` → `session_awareness/pr_watch.py`) mirrors the
   GitHub-steward owner notifications already in `outreach_history` (category
