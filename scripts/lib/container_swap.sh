@@ -15,8 +15,11 @@
 # The config is set correctly but silently no-ops meanwhile (observed 2026-07:
 # a swap retrofit looked applied while the container stayed one memory spike
 # away from OOM-thrash, the exact failure the setting is meant to prevent).
-# This mirrors what a swap-on container would have outside that 0-window by
-# writing the live cgroup now, so swap is active immediately without a
+# Writing `max` is Genesis's own uncapped-swap default, not a value Incus
+# itself would write here -- with a hard `limits.memory` set, Incus's own
+# branches write either `0` or a parsed finite byte value, never `"max"`
+# (driver_lxc.go, confirmed on v6.0.0 and main). This writes the live
+# cgroup to that default now, so swap is active immediately without a
 # disruptive container restart.
 #
 # Best-effort and idempotent: it does nothing if the cgroup knob is absent

@@ -49,32 +49,6 @@ _REALERT_HOURS = 24.0
 
 _INCUS_TIMEOUT = 10.0
 
-# Suffixes Incus's own ``units.ParseByteSizeString`` recognizes for
-# ``limits.memory.swap`` (shared/units/units.go, v6.0.0 and main, read
-# 2026-10-07). A bare integer (suffix "") is bytes. This mirrors Incus's
-# parser closely enough to tell a byte-valued ceiling apart from garbage; it
-# does not need to be a full re-implementation, since Incus itself is the
-# authority that actually applies the value.
-_INCUS_BYTE_SUFFIXES = frozenset(
-    {
-        "",
-        "B",
-        " bytes",
-        "kB",
-        "MB",
-        "GB",
-        "TB",
-        "PB",
-        "EB",
-        "KiB",
-        "MiB",
-        "GiB",
-        "TiB",
-        "PiB",
-        "EiB",
-    }
-)
-
 # Incus's own boolean-word lists (shared/util/boolean.go, v6.0.0 and main,
 # read 2026-10-07: `IsTrue` = {"true","1","yes","on"}, `IsFalse` =
 # {"false","0","no","off"}, case-insensitive). driver_lxc.go checks these
@@ -94,52 +68,45 @@ _ASCII_DIGITS = frozenset("0123456789")
 
 
 def _is_parseable_incus_size(raw: str) -> bool:
-    """Whether Incus would accept ``raw`` as a ``limits.memory.swap`` byte
-    size AND that size is actually nonzero. Callers must rule out Incus's
-    own boolean words first (see ``_is_swap_on``) — this function alone
-    cannot tell "0" the byte size from "0" the bool.
+    """Whether ``raw`` is a NONZERO Incus byte-size ceiling — trusting
+    Incus's own write-time validation rather than re-mirroring its suffix
+    grammar. Callers must rule out Incus's own boolean words first (see
+    ``_is_swap_on``) — this function alone cannot tell "0" the byte size
+    from "0" the bool.
 
-    A ZERO-valued size ("0B", "0 bytes", "00GiB", …) parses structurally —
-    digits plus a known suffix — but represents zero bytes of additional
-    swap, and Incus's byte-size branch
-    (``units.ParseByteSizeString`` → ``SetMemorySwapLimit``) applies that
-    value literally, so it disables swap exactly like the boolean FALSE
-    spellings do. Returning True for it would leave a swap-off config
-    unreconciled — the guardian would read it back next tick, see "already
-    swap-on", and never heal it. (Codex finding on PR #3069, 2026-10-08.)
+    ``incus config get`` only ever returns a value that already passed
+    ``validate.IsSize`` (→ ``units.ParseByteSizeString``) at some past
+    ``config set`` — so any value that is not one of Incus's own boolean
+    spellings (ruled out by the caller) and starts with a digit IS a
+    validated Incus size, whatever suffix it carries, on WHATEVER Incus
+    version wrote it. An earlier version of this function re-validated the
+    suffix against an allowlist copied from one version's source
+    (``shared/units/units.go``) — a second, driftable parser duplicating
+    Incus's own authority: ``host-setup.sh`` installs Incus from
+    ``latest/stable``, unpinned, so a future release adding a new size
+    suffix would have made this function treat a perfectly legitimate
+    ceiling as garbage and silently overwrite it with "true". Removed
+    rather than hardened, per three rounds of review finding a new edge
+    in that same mirror. (Codex finding on PR #3069, 2026-10-08: "Remove
+    the second Incus size parser.")
 
-    Matched on ASCII digits only, deliberately narrower than ``str.isdigit()``
-    (which also accepts Unicode digit forms Go's byte-wise
-    ``strconv.Atoi`` — the actual parser this mirrors — would reject): Incus
-    validates this value server-side with the identical grammar at write time
-    (``internal/instance/config.go``'s ``validate.IsSize``, which itself calls
-    ``units.ParseByteSizeString``), so a value read back from ``incus config
-    get`` can never contain a non-ASCII digit anyway. Matching the narrower
-    grammar removes the gap rather than relying on that unreachability. The
-    same bound rules out overflow-scale digit runs too: Incus's
-    ``strconv.ParseInt`` rejects any integer portion that does not fit an
-    int64, so ``IsSize`` — and thus ``incus config set`` — rejects it at
-    write time as well, meaning ``incus config get`` can never return one
-    either (fresh-context class audit, 2026-10-08).
-
-    Nonzero status is read directly off the digit CHARACTERS
-    (``any(ch != "0" ...)``), never via ``int(raw[:i])``: Incus's own
+    Only the ZERO/nonzero question is still ours to answer — Incus's own
+    validator accepts a zero-valued size as a legitimate value, but it
+    means swap-OFF, so it must not be misclassified as swap-on (round-2
+    finding) or crash on an absurdly zero-padded one (round-3 finding).
+    Both are handled by scanning digit CHARACTERS only
+    (``any(ch != "0" ...)``), never via ``int(raw[:i])`` — Incus's own
     parser (``strconv.ParseInt``-style accumulation) tolerates arbitrarily
     many leading zeros with no overflow, so a value like 4,301 zeros
     followed by "1GiB" is a legitimate (if perverse) 1 GiB ceiling Incus
-    can return from ``config get`` — but Python's int() raises ValueError
-    past ~4,300 digits (``sys.get_int_max_str_digits``), which would abort
-    this check (and the whole guardian tick around it) for exactly that
-    input. (Second Codex finding on PR #3069, 2026-10-08: "Handle long
-    zero-padded sizes without integer conversion.")"""
+    can return from ``config get``, but Python's ``int()`` raises
+    ``ValueError`` past ~4,300 digits (``sys.get_int_max_str_digits``)."""
     if not raw:
         return False
     i = 0
     while i < len(raw) and raw[i] in _ASCII_DIGITS:
         i += 1
     if i == 0:
-        return False
-    if raw[i:] not in _INCUS_BYTE_SUFFIXES:
         return False
     return any(ch != "0" for ch in raw[:i])
 

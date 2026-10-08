@@ -506,12 +506,24 @@ async def test_long_zero_padded_all_zero_size_is_reconciled(tmp_path):
         ("5GiB", True),
         ("0GiB", False),
         ("00GiB", False),
-        ("5Gib", False),  # wrong case suffix -> unparseable -> not swap-on
-        ("5XB", False),   # unknown suffix
-        ("1.5GiB", False),  # decimal point -> not a digit run + suffix
-        ("+5GiB", False),   # sign
+        # The suffix is no longer separately validated (Codex finding,
+        # "Remove the second Incus size parser") -- any nonzero digit
+        # PREFIX is trusted as a swap-on ceiling, on the theory that
+        # incus config get could only ever have returned it after Incus's
+        # OWN write-time validator accepted it on some version. These four
+        # all have a nonzero leading digit run, so they now read True even
+        # though their "suffix" (whatever trails the digits) isn't one
+        # this file's old allowlist recognized -- a real Incus would have
+        # refused "1.5GiB"/"5Gib"/"5XB"/"5 GiB" as a `config set` in the
+        # first place, so this function is never asked to judge them in
+        # practice; what matters is that it no longer FALSELY rejects a
+        # real future suffix it simply hasn't seen before.
+        ("5Gib", True),
+        ("5XB", True),
+        ("1.5GiB", True),
+        ("5 GiB", True),
+        ("+5GiB", False),   # sign -- '+' isn't an ASCII digit, no leading run at all
         ("-5GiB", False),
-        ("5 GiB", False),   # internal whitespace the grammar doesn't allow
         ("garbage", False),
         ("५GiB", False),    # Devanagari digit 5 -- not an ASCII digit
     ],
