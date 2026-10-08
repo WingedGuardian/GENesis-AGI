@@ -422,3 +422,33 @@ async def test_conversation_tools_use_request_consent_and_distinct_operation_rec
             hashlib.sha256(b"unapproved version").hexdigest(),
             immutable_read=True,
         )
+
+
+@pytest.mark.parametrize("lifecycle", ["allow"], indirect=True)
+@pytest.mark.parametrize("operation_status", ["executing", "unknown"])
+async def test_uncertain_consequential_effect_blocks_approved_continuation(
+    lifecycle, operation_status
+):
+    s = lifecycle
+    receipt = await PeerOperationState(s.registry).prepare(
+        s.binding,
+        "conversation",
+        hashlib.sha256(b"consequential operation").hexdigest(),
+        immutable_read=False,
+    )
+    await PeerOperationState(s.registry).transition(s.binding, receipt["id"], "executing")
+    if operation_status == "unknown":
+        await PeerOperationState(s.registry).transition(s.binding, receipt["id"], "unknown")
+    identifier = await hold(
+        s, "resource:" + "1" * 32, hashlib.sha256(b"different operation").hexdigest()
+    )
+    await s.state.settle(s.binding, 1, clean=True)
+    assert await s.gate.resolve_request(identifier, decision="approved", resolved_by="dashboard")
+    assert not await s.state.resume_approval(s.task["id"])
+    async with s.registry.connection() as db:
+        runtime = await (await db.execute("SELECT * FROM peer_task_runtime")).fetchone()
+        assert runtime["hold_reason"] == "reconciliation"
+        assert not await (
+            await db.execute("SELECT 1 FROM direct_session_queue WHERE status='pending'")
+        ).fetchone()
+        assert not await (await db.execute("SELECT 1 FROM peer_task_consents")).fetchone()

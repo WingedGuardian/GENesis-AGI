@@ -6,12 +6,28 @@ cannot submit this binding through A2A. The source tag `peer_api` is reserved:
 requests without a binding or with owner execution overrides are refused.
 
 The runner requires durable session storage, background autonomy state, and an
-installed lifecycle coordinator with authorization, start, drain and completion
-callbacks. Missing readiness fails closed before creating a session. The current
+installed lifecycle coordinator with authorization, start, completion timing, provider parking, drain and
+finalization callbacks. Missing readiness fails closed before creating a session. The current
 background level is preserved, capped at L3. Session metadata carries task,
 segment, generation and ceiling before start hooks execute. A constrained
 invocation receives only explicit identity, the authorized request, private
 facade configuration and its immutable execution policy.
+
+The first authoritative streaming result records server wall time and elapsed
+execution time through the mandatory `completed` lifecycle callback. This is a
+timing candidate, not proof of a successful result or stopped work. Invocation
+return occurs after process reaping and scope cleanup, so using return time alone
+would charge cleanup against an answer that finished before its allowance ended.
+The no-result fallback uses return time conservatively; refused completion proof
+withholds output. Provider-reported duration does not establish completion time.
+
+After timely proof commits, a separate 7,200-second completion tail bounds the
+invoker's post-result callbacks and cleanup. This uses the project default because
+no smaller legitimate callback bound has been established; a hanging downgrade
+callback was reproduced in a scratch probe. It extends neither model execution,
+the systemd scope deadline nor broker leases. Tail timeout, cancellation, failed
+cleanup or classified invocation error cannot become successful output merely
+because a timing candidate exists. Capacity remains owned until cleanup is proven.
 
 The existing runner's two-slot semaphore is shared with ordinary background work.
 Its public `cancel(session_id)` handles an individual session waiting for a slot
@@ -31,7 +47,8 @@ and counts, never arguments. Peer records have no owner transcript path,
 proposal delivery or automatic memory extraction. The internal artifact path is
 not a peer-visible URL or path.
 
-This foundation does not install a coordinator or enable task routes. Dependent
+The private coordinator is described in [peer coordinator](peer-coordinator.md).
+Runtime installation and task readiness remain dark in this slice. Dependent
 slices provide leased broker operations, human approvals, generation-checked
 continuation and owned artifact disclosure. `GENESIS_PEER_TASKS` remains unset,
 and no task skills are advertised until those prerequisites are ready. Local

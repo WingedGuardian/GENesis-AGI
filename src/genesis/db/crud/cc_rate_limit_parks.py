@@ -40,6 +40,7 @@ async def upsert_open_park(
     raw_signal: str | None,
     reset_at: str | None,
     next_attempt_at: str,
+    commit: bool = True,
 ) -> str:
     """Insert a fresh park, or bump the existing OPEN park with the same
     dedup_key (idempotent concurrent parks). Returns the park id.
@@ -80,7 +81,8 @@ async def upsert_open_park(
         ),
     )
     row = await cursor.fetchone()
-    await db.commit()
+    if commit:
+        await db.commit()
     return row[0] if row else park_id
 
 
@@ -122,7 +124,7 @@ async def list_by_status(
     return [dict(r) for r in rows]
 
 
-async def claim(db: aiosqlite.Connection, park_id: str) -> bool:
+async def claim(db: aiosqlite.Connection, park_id: str, *, commit: bool = True) -> bool:
     """Atomically claim a due park (parked→resuming). True iff this caller won."""
     now = _now()
     cursor = await db.execute(
@@ -131,7 +133,8 @@ async def claim(db: aiosqlite.Connection, park_id: str) -> bool:
            WHERE id = ? AND status = 'parked'""",
         (now, now, park_id),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
     return cursor.rowcount == 1
 
 
@@ -156,6 +159,7 @@ async def relimit(
     reset_at: str | None,
     next_attempt_at: str,
     needs_user_at_attempts: int,
+    commit: bool = True,
 ) -> str:
     """A resumed retry hit the limit again — update THIS row in place (attempts+1,
     fresh reset, backoff). Escalates to ``needs_user`` once attempts reaches the
@@ -180,7 +184,8 @@ async def relimit(
         (reset_at, next_attempt_at, needs_user_at_attempts, now, park_id),
     )
     row = await cursor.fetchone()
-    await db.commit()
+    if commit:
+        await db.commit()
     return row[0] if row else ""
 
 
@@ -228,6 +233,7 @@ async def mark_terminal_if_unchanged(
     expected_status: str,
     expected_claimed_at: str | None,
     expected_updated_at: str,
+    commit: bool = True,
 ) -> bool:
     """Force a terminal status ONLY if the row still holds (expected_status,
     expected_claimed_at, expected_updated_at) — the atomic guard for a
@@ -258,7 +264,8 @@ async def mark_terminal_if_unchanged(
                  AND updated_at = ?""",
             (status, now, park_id, expected_status, expected_claimed_at, expected_updated_at),
         )
-    await db.commit()
+    if commit:
+        await db.commit()
     return cursor.rowcount == 1
 
 

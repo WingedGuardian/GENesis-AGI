@@ -11,12 +11,18 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from genesis.cc.exceptions import CCNetworkOfflineError, CCQuotaExhaustedError, CCRateLimitError
 from genesis.cc.types import CCInvocation, SessionType
 from genesis.peers.session import PeerSessionBinding
 from genesis.util.inflight import close_unit, open_unit, within
 from genesis.util.tasks import tracked_task
 
 logger = logging.getLogger(__name__)
+
+# A result stops model execution, but invoker status/downgrade callbacks can
+# still hang before scope cleanup. No measured smaller callback bound exists;
+# use the project timeout floor for this separate, non-execution tail.
+_PEER_COMPLETION_TAIL_S = 7200
 
 
 @dataclass
@@ -52,7 +58,7 @@ def _lifecycle(runner):
     lifecycle = getattr(runner._rt, "_peer_session_lifecycle", None)
     if lifecycle is None or not all(
         callable(getattr(lifecycle, name, None))
-        for name in ("authorize", "begin", "drain", "finish")
+        for name in ("authorize", "begin", "completed", "park", "drain", "finish")
     ):
         raise RuntimeError("Peer session coordinator is unavailable")
     if getattr(runner, "_peer_cleanup_holds", {}):
@@ -167,8 +173,24 @@ async def _run_peer(runner, request, lifecycle, ceiling, session_id, unit, state
     telemetry = []
     acquired = cancelled = expired = False
     started = time.monotonic()
+    execution_started = None
+    completion = None
+    timeout = None
+
+    async def record_completion():
+        nonlocal completion
+        observed = (time.time(), time.monotonic() - execution_started)
+        if await lifecycle.completed(binding, *observed) is not None:
+            raise RuntimeError("Peer completion was not confirmed")
+        completion = observed
 
     async def on_event(event):
+        if event.event_type == "result" and completion is None:
+            # This callback precedes invoker reap/scope drain. The candidate
+            # never substitutes for classified output, current authority or
+            # confirmed cleanup. Expiring timers cannot be resurrected.
+            await record_completion()
+            timeout.reschedule(asyncio.get_running_loop().time() + _PEER_COMPLETION_TAIL_S)
         if (
             event.event_type == "tool_use"
             and event.tool_name in binding.segment.tools
@@ -184,7 +206,7 @@ async def _run_peer(runner, request, lifecycle, ceiling, session_id, unit, state
             remaining = min(request.timeout_s, binding.segment.deadline_at - time.time())
             if remaining <= 0:
                 raise TimeoutError
-            async with asyncio.timeout(remaining):
+            async with asyncio.timeout(remaining) as timeout:
                 await runner._semaphore.acquire()
                 acquired = state.acquired = True
                 _lifecycle(runner)
@@ -193,6 +215,7 @@ async def _run_peer(runner, request, lifecycle, ceiling, session_id, unit, state
                 _lifecycle(runner)
                 if state.cancelled:
                     raise asyncio.CancelledError
+                execution_started = time.monotonic()
                 invocation = CCInvocation(
                     prompt=request.prompt,
                     model=request.model,
@@ -206,12 +229,30 @@ async def _run_peer(runner, request, lifecycle, ceiling, session_id, unit, state
                     roster_eligible=True,
                 )
                 output = await runner._invoker.run_streaming(invocation, on_event=on_event)
+                if completion is None:
+                    # No-result fallback has no earlier trusted observation.
+                    # Return time includes invoker cleanup conservatively.
+                    await record_completion()
         except asyncio.CancelledError:
             cancelled = state.cancelled = True
         except TimeoutError:
-            expired = True
+            output = None
+            expired = completion is None
+        except (CCRateLimitError, CCQuotaExhaustedError, CCNetworkOfflineError) as exc:
+            output = None
+            try:
+                await _settle(lifecycle.park(binding, exc), state)
+            except BaseException:
+                logger.warning("Peer provider hold unavailable")
         except Exception:
+            output = None
             logger.warning("Peer segment execution failed")
+
+        elapsed = (
+            completion[1]
+            if completion is not None
+            else time.monotonic() - (execution_started or started)
+        )
 
         try:
             clean, interrupted = await _settle(_drain(binding, lifecycle), state)
@@ -237,7 +278,7 @@ async def _run_peer(runner, request, lifecycle, ceiling, session_id, unit, state
                 state,
                 ceiling,
                 expired,
-                time.monotonic() - started,
+                elapsed,
             ),
             state,
         )
@@ -349,6 +390,7 @@ async def _finalize(
             "cancelled": state.cancelled,
             "expired": expired,
             "duration_s": result.duration_s,
+            "execution_elapsed_s": elapsed,
         },
     )
     return result

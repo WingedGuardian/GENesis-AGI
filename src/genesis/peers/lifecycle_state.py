@@ -94,6 +94,24 @@ async def disclosure_authorized(db, row):
         raise TaskRefusal("unauthorized", 401)
 
 
+async def effects_known(db, task_id):
+    """Stopped work is not evidence of a known consequential outcome."""
+    unknown = await (
+        await db.execute(
+            "SELECT 1 FROM peer_operations WHERE task_id=? AND immutable_read=0 "
+            "AND status IN ('executing','unknown') LIMIT 1",
+            (task_id,),
+        )
+    ).fetchone()
+    if unknown is not None:
+        await db.execute(
+            "UPDATE peer_task_runtime SET hold_reason='reconciliation',"
+            "safe_error='Operation outcome requires owner reconciliation' WHERE task_id=?",
+            (task_id,),
+        )
+    return unknown is None
+
+
 async def current(db, task_id, generation=None, *, execution=True):
     row = await (
         await db.execute(
@@ -255,6 +273,8 @@ class PeerLifecycleState:
         """Only drained or never-claimed tasks may be terminalized."""
         if state not in {"failed", "canceled", "rejected"}:
             raise ValueError("Invalid peer terminal state")
+        from genesis.peers.provider_state import retire_park
+
         async with self.registry.transaction() as db:
             row = await (
                 await db.execute("SELECT * FROM peer_tasks WHERE id=?", (task_id,))
@@ -272,6 +292,7 @@ class PeerLifecycleState:
             ):
                 return False
             stamp = utcnow().isoformat()
+            await retire_park(db, row, expired=reason == "Peer exchange expired")
             await db.execute(
                 "UPDATE peer_tasks SET state=?,slot_reserved=0,generation=generation+1,updated_at=? WHERE id=?",
                 (state, stamp, task_id),
@@ -299,7 +320,7 @@ class PeerLifecycleState:
             )
             await db.execute(
                 "UPDATE peer_task_runtime SET hold_reason=?,hold_segment_id=?,hold_capability=?,"
-                "hold_digest=?,approval_id=NULL,park_id=? WHERE task_id=?",
+                "hold_digest=?,approval_id=NULL,park_id=COALESCE(?,park_id) WHERE task_id=?",
                 (reason, binding.segment.segment_id, capability, digest, park_id, row["id"]),
             )
             return row["generation"] + 1
@@ -381,6 +402,8 @@ class PeerLifecycleState:
             ):
                 raise TaskRefusal("state_conflict", 409)
             decision(row, approval["capability"])
+            if not await effects_known(db, task_id):
+                return False
             counts = await (
                 await db.execute(
                     "SELECT COALESCE(SUM(slot_reserved),0),COALESCE(SUM(CASE WHEN peer_id=? "

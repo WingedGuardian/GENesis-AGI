@@ -108,6 +108,46 @@ async def call(s, name="task_context", arguments=None):
     )
 
 
+async def test_trusted_executor_wraps_only_authorized_handler(setup):
+    s = setup
+    observed = []
+
+    async def execute(binding, capability, digest, handler, *, immutable_read):
+        observed.append((binding, capability, digest, immutable_read))
+        return await handler()
+
+    s.broker.execute_operation = execute
+    response = await call(s)
+    assert response.status_code == 200
+    assert "<external-content" in response.json()["context"]
+    assert len(observed) == 1
+    assert observed[0][0] == s.binding
+    assert observed[0][1] == "conversation"
+    assert len(observed[0][2]) == 64
+    assert observed[0][3] is True
+    await s.registry.grant("fixture", "conversation", "ask")
+    assert (await call(s)).status_code == 409
+    assert len(observed) == 1
+
+
+@pytest.mark.parametrize("change", ["invalidate", "deny"])
+async def test_executor_return_cannot_bypass_final_authority(setup, change):
+    s = setup
+
+    async def execute(binding, capability, digest, handler, *, immutable_read):
+        result = await handler()
+        if change == "invalidate":
+            s.broker.invalidate(binding)
+        else:
+            await s.registry.grant("fixture", "conversation", "deny")
+        return result
+
+    s.broker.execute_operation = execute
+    response = await call(s)
+    assert response.status_code in {403, 409}
+    assert "context" not in response.json()
+
+
 async def test_real_stdio_and_uds_context_resource_pipeline(setup):
     s = setup
     assert s.lease_path.stat().st_mode & 0o777 == 0o600

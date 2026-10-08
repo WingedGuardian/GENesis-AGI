@@ -52,12 +52,15 @@ class _Lease:
 
 
 class PeerBroker:
-    def __init__(self, registry, authorize_operation):
+    def __init__(self, registry, authorize_operation, *, execute_operation=None):
         if not callable(authorize_operation):
             raise ValueError("Peer operation authorizer required")
+        if execute_operation is not None and not callable(execute_operation):
+            raise ValueError("Peer operation executor must be callable")
         self.registry = registry
         self.resources = PublishedResources(registry)
         self.authorize_operation = authorize_operation
+        self.execute_operation = execute_operation
         self._leases = {}
         self._revoked_segments = set()
         self._runner = None
@@ -268,7 +271,16 @@ class PeerBroker:
         row, latest = await self._current(lease, executing=True)
         if latest.get(capability) != decisions[capability]:
             raise BrokerRefusal()
-        result = await handler(row, latest, arguments)
+        if self.execute_operation is None:
+            result = await handler(row, latest, arguments)
+        else:
+            result = await self.execute_operation(
+                lease.binding,
+                capability,
+                digest,
+                lambda: handler(row, latest, arguments),
+                immutable_read=name in {"task_context", "resources_list", "resource_read"},
+            )
         _, final = await self._current(lease, executing=True)
         if final.get(capability) != decisions[capability]:
             raise BrokerRefusal()
@@ -314,8 +326,15 @@ class PeerBroker:
             raise BrokerRefusal("not_found", 404)
         return {key: resource[key] for key in ("id", "title", "content", "sha256")}
 
-    async def drain(self, binding):
+    def invalidate(self, binding):
+        """Fence leases immediately; a broker callback must never drain itself."""
         self._revoked_segments.add(binding.segment.segment_id)
+        for lease in self._leases.values():
+            if lease.binding.segment.segment_id == binding.segment.segment_id:
+                lease.active = False
+
+    async def drain(self, binding):
+        self.invalidate(binding)
         leases = [
             lease
             for lease in self._leases.values()

@@ -81,6 +81,7 @@ _EXCLUDED_SOURCE_TAGS = frozenset({
     "sentinel",  # health/incident monitor; not user knowledge
     "weekly_assessment",  # internal assessment; own outputs
     "quality_calibration",  # eval/calibration; not user knowledge
+    "peer_api",  # external peer work; explicit knowledge offers only
     "direct_session",  # direct MCP session runner; own handling
     "mail_follow_up",  # mail pipeline; own handling
     "mail_reply",  # mail pipeline; own handling

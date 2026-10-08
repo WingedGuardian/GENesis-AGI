@@ -54,9 +54,14 @@ async def setup(db, tmp_path, monkeypatch):
 
     monkeypatch.setattr(PeerSegment, "stop_and_drain", drain)
     lifecycle = SimpleNamespace(
-        authorize=AsyncMock(), begin=AsyncMock(), drain=AsyncMock(), finish=AsyncMock()
+        authorize=AsyncMock(),
+        begin=AsyncMock(),
+        completed=AsyncMock(),
+        park=AsyncMock(return_value=False),
+        drain=AsyncMock(),
+        finish=AsyncMock(),
     )
-    for name in ("authorize", "begin", "drain", "finish"):
+    for name in ("authorize", "begin", "completed", "drain", "finish"):
         getattr(lifecycle, name).return_value = None
     output = CCOutput("cli-id", "result" * 5000, "sonnet", 0, 0, 0, 1, 0)
     invoker = SimpleNamespace(run_streaming=AsyncMock(return_value=output))
@@ -137,6 +142,57 @@ async def test_cancel_before_first_run_still_drains_and_records(db, setup):
     assert s.runner._semaphore._value == 2
     assert not s.runner.cancel(session_id)
     assert not s.runner.cancel("missing")
+
+
+async def test_timely_result_cleanup_does_not_consume_execution_budget(setup):
+    s = setup
+    binding = replace(s.binding, segment=replace(s.binding.segment, deadline_at=time.time() + 0.2))
+    request = replace(s.request, peer_binding=binding)
+
+    async def invoke(invocation, on_event):
+        await on_event(StreamEvent("result"))
+        await asyncio.sleep(0.3)
+        return s.output
+
+    s.invoker.run_streaming.side_effect = invoke
+    session_id = await s.runner.spawn(request)
+    result = await s.runner._active[session_id]
+    assert result.success
+    assert result.duration_s < 0.2
+    s.lifecycle.completed.assert_awaited_once()
+    observed_binding, observed_at, elapsed = s.lifecycle.completed.call_args.args
+    assert observed_binding == binding
+    assert observed_at < binding.segment.deadline_at
+    assert elapsed < 0.2
+    assert s.lifecycle.finish.call_args.args[2]["cleanup_confirmed"]
+
+
+async def test_completion_proof_refusal_withholds_fallback_output(setup):
+    s = setup
+    s.lifecycle.completed.side_effect = RuntimeError("Completion refused")
+    session_id = await s.runner.spawn(s.request)
+    result = await s.runner._active[session_id]
+    assert not result.success
+    assert result.output_text == ""
+    assert s.lifecycle.finish.call_args.args[2]["artifact_path"] is None
+
+
+async def test_finite_completion_tail_stops_hanging_post_result_callback(setup, monkeypatch):
+    s = setup
+    monkeypatch.setattr("genesis.peers.runner._PEER_COMPLETION_TAIL_S", 0.05)
+
+    async def invoke(invocation, on_event):
+        await on_event(StreamEvent("result"))
+        await asyncio.Event().wait()
+
+    s.invoker.run_streaming.side_effect = invoke
+    session_id = await s.runner.spawn(s.request)
+    result = await s.runner._active[session_id]
+    assert not result.success
+    s.lifecycle.completed.assert_awaited_once()
+    assert not s.lifecycle.finish.call_args.args[2]["expired"]
+    assert s.lifecycle.finish.call_args.args[2]["cleanup_confirmed"]
+    assert s.runner._semaphore._value == 2
 
 
 async def test_cancel_waiting_for_slot_does_not_release_unowned_capacity(db, setup):

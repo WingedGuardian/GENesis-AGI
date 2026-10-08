@@ -73,7 +73,9 @@ class PeerApprovals:
             },
         }
 
-    async def request(self, binding: PeerSessionBinding, capability, operation_digest, description):
+    async def request(
+        self, binding: PeerSessionBinding, capability, operation_digest, description, *, notify=True
+    ):
         validate_capability(capability)
         if (
             not isinstance(binding, PeerSessionBinding)
@@ -129,7 +131,8 @@ class PeerApprovals:
                 or intent["description"] != description
             ):
                 raise TaskRefusal("state_conflict", 409)
-        await self.deliver(intent["approval_id"])
+        if notify:
+            await self.deliver(intent["approval_id"])
         return intent["approval_id"]
 
     async def deliver(self, approval_id):

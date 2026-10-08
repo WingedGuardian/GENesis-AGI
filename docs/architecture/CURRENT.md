@@ -928,7 +928,7 @@ are the other timing/volume controls on that path.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 787882667c48 2026-10-08
+verified: 9a1e0b7c8 2026-10-08
 ```
 
 - **Individual peer consent foundation**: `peers/approvals.py` persists exact
@@ -940,8 +940,12 @@ verified: 787882667c48 2026-10-08
   with continuation queueing and preserves it for the unchanged request across
   attempts. `peers/operation_state.py` separates operation outcomes from consent;
   only exact immutable reads can retry unknown effects after confirmed drain.
-  These are dark state primitives: runtime installation and complete integration
-  testing remain later lifecycle slices. See [lifecycle state](../reference/peer-lifecycle.md).
+  The dark `peers/coordinator.py` joins these holds to the contained runner and
+  private broker; `peers/provider_state.py` owns atomic peer park continuation,
+  and the legacy resumer refuses peer-to-owner reconstruction. Unknown
+  consequential effects block continuation and successful handoff. Runtime
+  installation, owned artifact disclosure and full HTTP integration remain
+  later lifecycle slices. See [coordinator](../reference/peer-coordinator.md). See [lifecycle state](../reference/peer-lifecycle.md).
   See [peer approvals](../reference/peer-approvals.md).
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
   converge there. `EmailAutonomyGate` (`autonomy/email_gate.py`, WS-8
@@ -1370,7 +1374,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: 787882667c48 2026-10-08
+verified: 9a1e0b7c8 2026-10-08
 ```
 
 - **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
