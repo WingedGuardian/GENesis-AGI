@@ -1350,6 +1350,15 @@ verified: ba6e357a7998 2026-10-08
   No task skills or task execution advertised in this foundation. Revocation
   disables access immediately; credential equality with another surface refuses
   activation. See `docs/reference/peer-registry.md`.
+- **Peer admission groundwork**: A2A1.0 `message:send`, owned task get/list/cancel
+  routes use the pinned SDK wire models. Private SQLite admission commits receipt,
+  UTC quota, grant snapshot, task and prepared queue row together. Exact retries
+  share a receipt; changed intent conflicts. Limits are two reserved slots per
+  peer and globally, twenty nonterminal tasks per peer and explicit daily quota.
+  Legacy claim and stale-claim recovery exclude peer rows. The runtime task service
+  stays absent until the constrained coordinator, broker, approvals and recovery
+  are ready; discovery still advertises no task skills. See
+  `docs/reference/peer-admission.md`.
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
   it yields at startup, exit 200, when the genesis-server process lock is

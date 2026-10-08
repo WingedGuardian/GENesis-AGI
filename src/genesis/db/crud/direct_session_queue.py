@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
@@ -11,6 +12,29 @@ import aiosqlite
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+@dataclass(frozen=True)
+class PreparedQueueItem:
+    id: str
+    payload_json: str
+    created_at: str
+
+
+def prepare(payload: dict) -> PreparedQueueItem:
+    """Serialize before acquiring an admission write transaction."""
+    return PreparedQueueItem(f"dsq-{uuid.uuid4().hex[:12]}", json.dumps(payload), _now())
+
+
+async def insert_prepared(db: aiosqlite.Connection, item: PreparedQueueItem) -> str:
+    """Insert without committing; the caller owns receipt/quota atomicity."""
+    await db.execute(
+        """INSERT INTO direct_session_queue
+           (id, payload_json, status, created_at)
+           VALUES (?, ?, 'pending', ?)""",
+        (item.id, item.payload_json, item.created_at),
+    )
+    return item.id
 
 
 async def enqueue(
@@ -42,7 +66,6 @@ async def enqueue(
     which silently changes behavior (a parked campaign once resumed without
     its strategy doc).
     """
-    queue_id = f"dsq-{uuid.uuid4().hex[:12]}"
     payload = {
         "prompt": prompt,
         "profile": profile,
@@ -62,12 +85,7 @@ async def enqueue(
         "tool_exceptions": (list(tool_exceptions) if tool_exceptions is not None else None),
         "planning_instruction": planning_instruction,
     }
-    await db.execute(
-        """INSERT INTO direct_session_queue
-           (id, payload_json, status, created_at)
-           VALUES (?, ?, 'pending', ?)""",
-        (queue_id, json.dumps(payload), _now()),
-    )
+    queue_id = await insert_prepared(db, prepare(payload))
     await db.commit()
     return queue_id
 
@@ -85,6 +103,10 @@ async def claim_next(db: aiosqlite.Connection) -> dict | None:
            WHERE id = (
                SELECT id FROM direct_session_queue
                WHERE status = 'pending'
+               AND CASE WHEN json_valid(payload_json) THEN
+                   json_extract(payload_json, '$.peer_task_id') IS NULL
+                   AND COALESCE(json_extract(payload_json, '$.source_tag'), '') != 'peer_api'
+                   ELSE 1 END
                ORDER BY created_at
                LIMIT 1
            )
@@ -148,7 +170,11 @@ async def recover_stale_claims(
     cursor = await db.execute(
         """UPDATE direct_session_queue
            SET status = 'pending', claimed_at = NULL
-           WHERE status = 'claimed' AND claimed_at < ?""",
+           WHERE status = 'claimed' AND claimed_at < ?
+           AND CASE WHEN json_valid(payload_json) THEN
+               json_extract(payload_json, '$.peer_task_id') IS NULL
+               AND COALESCE(json_extract(payload_json, '$.source_tag'), '') != 'peer_api'
+               ELSE 1 END""",
         (cutoff_iso,),
     )
     await db.commit()

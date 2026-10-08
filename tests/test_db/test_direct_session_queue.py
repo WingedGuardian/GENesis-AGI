@@ -9,6 +9,40 @@ import pytest
 from genesis.db.crud import direct_session_queue as dsq
 
 
+class TestPreparedInsertion:
+    async def test_rollback_does_not_leave_a_queue_record(self, db):
+        await db.commit()
+        prepared = dsq.prepare({"prompt": "atomic admission"})
+        await db.execute("BEGIN IMMEDIATE")
+        assert await dsq.insert_prepared(db, prepared) == prepared.id
+        assert db.in_transaction
+        assert await dsq.get_by_id(db, prepared.id) is not None
+        await db.rollback()
+        assert await dsq.get_by_id(db, prepared.id) is None
+
+    async def test_prepared_payload_is_detached_before_transaction(self, db):
+        payload = {"prompt": "original", "skills": ["one"]}
+        prepared = dsq.prepare(payload)
+        payload["skills"].append("later")
+        await dsq.insert_prepared(db, prepared)
+        await db.commit()
+        row = await dsq.get_by_id(db, prepared.id)
+        assert json.loads(row["payload_json"]) == {"prompt": "original", "skills": ["one"]}
+
+    async def test_legacy_worker_cannot_claim_peer_work(self, db):
+        for payload in ({"peer_task_id": "owned"}, {"source_tag": "peer_api"}):
+            await dsq.insert_prepared(db, dsq.prepare(payload))
+        ordinary = await dsq.enqueue(db, prompt="ordinary")
+        assert (await dsq.claim_next(db))["id"] == ordinary
+        assert await dsq.claim_next(db) is None
+
+    async def test_malformed_legacy_payload_retains_failure_dispatch_path(self, db):
+        prepared = dsq.PreparedQueueItem("dsq-malformed", "malformed", "2026-10-08T00:00:00Z")
+        await dsq.insert_prepared(db, prepared)
+        await db.commit()
+        assert (await dsq.claim_next(db))["id"] == prepared.id
+
+
 class TestEnqueue:
     @pytest.mark.asyncio
     async def test_enqueue_returns_prefixed_id(self, db):
@@ -111,6 +145,18 @@ class TestMarkFailed:
 
 
 class TestRecoverStaleClaims:
+    @pytest.mark.asyncio
+    async def test_peer_claims_are_owned_by_peer_recovery(self, db):
+        item = dsq.prepare({"peer_task_id": "peer-task", "source_tag": "peer_api"})
+        await dsq.insert_prepared(db, item)
+        await db.execute(
+            "UPDATE direct_session_queue SET status='claimed',claimed_at='2000-01-01' WHERE id=?",
+            (item.id,),
+        )
+        await db.commit()
+        assert await dsq.recover_stale_claims(db, max_age_s=0) == 0
+        assert (await dsq.get_by_id(db, item.id))["status"] == "claimed"
+
     @pytest.mark.asyncio
     async def test_recover_stale_claims(self, db):
         qid = await dsq.enqueue(db, prompt="test")
