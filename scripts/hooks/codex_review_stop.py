@@ -109,22 +109,39 @@ def _non_mutating(seg) -> bool:
     return False
 
 
-def _commit_cwd(seg, cwd: str) -> str | None:
-    """Accept only no global options or one literal -C, with no shell-state model."""
+def _commit_cwd(seg) -> str | None:
+    """Require one absolute literal -C: native hook cwd omits workdir overrides."""
     index = git_subcommand_index(seg.argv)
     options = seg.argv[1:index]
-    target = cwd
-    if options:
-        if len(options) == 2 and options[0] == "-C":
-            target = options[1]
-        elif len(options) == 1 and options[0].startswith("-C"):
-            target = options[0][2:]
-        else:
-            return None
-        if target.startswith("~") or any(ch in target for ch in "$`\\*?[]{}()<>\n"):
-            return None
-        target = os.path.join(cwd, target)
+    if len(options) == 2 and options[0] == "-C":
+        target = options[1]
+    else:
+        return None
+    if not os.path.isabs(target) or any(ch in target for ch in "$`\\*?[]{}()<>\n"):
+        return None
     return os.path.abspath(target) if Path(target).is_dir() else None
+
+
+def _request_identity_reason(argv: list[str]) -> Fixable | None:
+    """Admit only identities the shared hostless budget lookup resolves correctly.
+
+    gh 2.100.0 selects a PR URL before --repo; the shared helper does the reverse
+    and drops hostnames. Mixed selectors and foreign hosts require a rewrite.
+    """
+    token, _ = requests._comment_positional(argv)
+    repo = requests._comment_repo_value(argv)
+    if requests._unresolvable_identity(argv) is None and token is not None:
+        if re.fullmatch(r"[0-9]+", token) and repo is not None:
+            if re.fullmatch(r"(?:github\.com/)?[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
+                return None
+        elif (repo is None and token.startswith(("https://github.com/", "http://github.com/"))
+              and requests._LITERAL_URL_RE.fullmatch(token)):
+            return None
+    return Fixable(
+        "Use one literal PR number with --repo OWNER/REPO (github.com), or one "
+        "literal github.com PR URL without --repo. Branches, implicit targets, "
+        "expansions, mixed URL/repository selectors and other hosts are unsupported."
+    )
 
 
 def decide(payload: object) -> str | None:
@@ -158,12 +175,14 @@ def decide(payload: object) -> str | None:
         return Fixable("Run the action as one standalone, unwrapped git/gh command.")
     if any(os.environ.get(name) for name in (*REPO_VARS, "GH_REPO")):
         return "Inherited repository-selection overrides cannot be resolved."
+    if os.environ.get("GH_HOST", "github.com") not in {"", "github.com"}:
+        return "Inherited GH_HOST must select github.com for the shared budget lookup."
     seg = actions[0]
     if git_subcommand(seg.argv) == "commit":
-        effective_cwd = _commit_cwd(seg, cwd)
+        effective_cwd = _commit_cwd(seg)
         if effective_cwd is None:
             return Fixable(
-                "Use the current directory or one literal git -C directory; "
+                "Use git -C followed by one literal absolute directory; "
                 "other global options are unsupported."
             )
         deadline = Deadline.after(commits._COMMIT_HOOK_REGISTERED_TIMEOUT - 0.5)
@@ -176,6 +195,10 @@ def decide(payload: object) -> str | None:
             result.get("status") != "ok" or result.get("commit_approval_required") is not False
         ):
             return commits._commit_budget_reason(result)
+    else:
+        identity_reason = _request_identity_reason(seg.argv)
+        if identity_reason is not None:
+            return identity_reason
 
     decision, reason = requests._check_codex_round_escalation(segs, command, payload)
     if decision != "allow":
