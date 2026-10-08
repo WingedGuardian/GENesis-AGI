@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from genesis.guardian.config import (
+    SWAP_CEILING_OFF,
     GuardianConfig,
     load_config,
     load_secrets,
@@ -191,7 +192,7 @@ class TestLoadSecrets:
 
 
 class TestSwapCeilingPctValidation:
-    """swap_ceiling_pct: a percentage of HOST SwapTotal (0, 100], or None."""
+    """swap_ceiling_pct: a percentage of HOST SwapTotal (0, 100], "off", or None."""
 
     def test_default_is_none(self) -> None:
         cfg = GuardianConfig()
@@ -243,11 +244,14 @@ class TestSwapCeilingPctValidation:
         cfg = load_config(p)
         assert cfg.swap_ceiling_pct is None
 
-    def test_bool_false_is_rejected(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("raw", ["off", "OFF", "false", "no", '"off"', '" Off "'])
+    def test_off_spellings_load_as_off(self, tmp_path: Path, raw: str) -> None:
+        """YAML 1.1 reads a bare off/false/no as boolean False, so all of them
+        mean the same request as the quoted string: remove the ceiling."""
         p = tmp_path / "g.yaml"
-        p.write_text("swap_ceiling_pct: false\n")
+        p.write_text(f"swap_ceiling_pct: {raw}\n")
         cfg = load_config(p)
-        assert cfg.swap_ceiling_pct is None
+        assert cfg.swap_ceiling_pct == SWAP_CEILING_OFF
 
     def test_huge_int_is_rejected_without_crashing_config_load(self, tmp_path: Path) -> None:
         """Codex P2: math.isfinite(float(huge_int)) raises OverflowError

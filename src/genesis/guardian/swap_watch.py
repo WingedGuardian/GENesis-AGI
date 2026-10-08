@@ -23,51 +23,48 @@ sudo access *continuously*, so it reconciles on OBSERVED state each tick:
    for a ceiling. So when the key holds a ceiling, a live ``0`` is reported
    and left alone, never overwritten with ``max``.
 3. **Opt-in ceiling** (``swap_ceiling_pct`` in guardian config, install-local,
-   never shipped in the repo's template): when set, computes a byte target
-   from host ``SwapTotal`` and asserts it as the container's swap-ceiling —
-   via Incus's own native ``limits.memory.swap=<bytes>`` key when the
-   container has a ``limits.memory`` cap (the condition under which Incus
-   actually applies that key as a ceiling rather than ignoring it), or via a
-   direct cgroup write as a fallback otherwise. See
-   ``_compute_swap_ceiling_target``.
+   never shipped in the repo's template): when set to a number, computes a
+   byte target from host ``SwapTotal`` and asserts it as the container's swap
+   ceiling. NATIVE path: Incus's own ``limits.memory.swap=<bytes>`` key, used
+   when the container has a ``limits.memory`` cap that is not
+   ``limits.memory.enforce=soft``: only then does Incus apply the key at
+   container START (driver_lxc.go v6.0.0). FALLBACK path otherwise: the key
+   only has to be swap-on, and the ceiling is written to the live cgroup each
+   tick. (On a LIVE update to any ``limits.memory*`` key Incus does apply the
+   key even with no ``limits.memory``, writing 0 for a boolean; the same tick
+   rewrites the target, because it reads the cgroup after any key write.)
+   Either way the live cgroup is repaired whenever it drifts from the target. See
+   ``_compute_swap_ceiling_target`` and ``_ceiling_path``.
 
-   **Ownership marker.** The reconciler tracks the byte value it last
-   asserted in an Incus instance key, ``user.genesis.swap_ceiling`` — NOT a
-   local file. Verified viable against Incus v6.0.0 source (2026-10-08):
-   ``driver_lxc.go``'s live-apply branch is gated per-changed-key on
-   ``key == "limits.memory" || strings.HasPrefix(key, "limits.memory.")``, so
-   a ``user.*`` key changing in the same call can never trigger it; the CLI's
-   ``config set <key>=<value>...`` form parses every pair into ONE API call,
-   so the native assert and its marker land atomically; and ``user.*`` keys
-   need no schema registration (``internal/instance/config.go``). This also
-   means the marker is structurally bound to the one container it lives on
-   (no cross-container staleness possible) and there is no local file to
-   corrupt. Removing ``swap_ceiling_pct`` reverts the ceiling ONLY if the
-   live-enforced value still matches the marker — an operator-set value is
-   never touched, and an unreadable marker means HOLD, not "revert anyway."
+   **Turning it off is explicit** (owner ruling, 2026-10-08):
+   ``swap_ceiling_pct: off`` asserts ``limits.memory.swap=true`` (replacing a
+   byte ceiling) and lifts any finite live cgroup cap to ``max``, converging
+   in one tick and doing nothing on later ticks. REMOVING the setting is not
+   "off": the reconciler then simply stops managing a ceiling, and a byte
+   ceiling in the key, with its cgroup value, stays as it is. (A key that is
+   not swap-on is still healed to ``true`` as in step 1, and Incus's own live
+   update then resets the cgroup, so a cap written only to the cgroup by hand
+   does not survive that heal.) No ownership record exists, so nothing can
+   strand or mis-claim one.
 
    **Degraded ticks hold, they don't guess** (owner-approved rework spec,
-   2026-10-08, item 2): when ``swap_ceiling_pct`` is set but the target can't
-   be computed this tick (host SwapTotal unreadable, or the SEPARATE
-   ``limits.memory`` probe used to pick native-vs-fallback fails), the tick
-   skips writing ``limits.memory.swap`` ENTIRELY — including the ordinary
-   false→true heal — and only records a problem. Writing ``true`` here would
-   be a boolean value, and Incus resets a BOOLEAN key's live cgroup to 0 on
-   every live update; forcing that during exactly the tick that can't
-   re-assert a real ceiling would silently disable swap instead of leaving
-   whatever was already enforced in place. A degraded tick never touches the
-   persistent key or ceiling-specific cgroup writes, but it does NOT suspend
-   the ORIGINAL (ceiling-unaware) live-cgroup protection: if the key already
-   holds a valid byte ceiling from an earlier successful tick and the live
-   cgroup reads 0, that is still reported rather than overwritten with
-   ``max`` — nothing new needs computing to know that.
+   2026-10-08, item 2): when ``swap_ceiling_pct`` is a number but the target
+   can't be computed this tick (host SwapTotal unreadable), or the probes that
+   pick native-vs-fallback fail, the tick writes nothing to
+   ``limits.memory.swap`` at all, including the ordinary false->true heal:
+   ``true`` is a boolean, and under a hard limit Incus resets a boolean key's
+   live cgroup to 0 on every live update. The ceiling-unaware live protection
+   still runs. A live 0 under a byte-ceiling key is reported, never
+   overwritten; a live 0 under anything else is opened to ``max`` (swap off is
+   the failure this reconciler exists to prevent) and reported as an uncapped
+   ceiling until the target can be computed again.
 
-Healthy path = two or three cheap reads (persistent key, ownership marker,
-and — only when a ceiling is configured — the ``limits.memory`` probe), no
+Healthy path = cheap reads only (the persistent key and, when a ceiling is
+configured, the ``limits.memory`` and ``limits.memory.enforce`` probes), no
 writes, no alerts. A heal emits one INFO alert (guardian self-actions must be
 visible; several heals in the same tick are merged into one alert); a failed
 heal emits a WARNING throttled PER PROBLEM CLASS by a state file (so a
-persistent fault pages at most every 24h, not per-tick) — EXCEPT that a
+persistent fault pages at most every 24h, not per-tick), EXCEPT that a
 WARNING whose own delivery fails is retried after 5 minutes rather than
 silently adopting the 24h window meant for "delivered, fault persists" (a
 down alert channel must not mute itself for a day). Never raises into the
@@ -77,8 +74,8 @@ Deliberate override note: an operator who explicitly set
 ``limits.memory.swap=false`` will be reconciled back to ``true`` — swap-on is
 a Genesis install invariant (docs/reference/memory-resilience.md). Disable the
 reconciler itself (``swap_reconcile_enabled: false`` in guardian config) to
-opt a host out — a disabled reconciler never reads or writes the marker
-either.
+opt a host out; a disabled reconciler reads and writes nothing, ceiling
+included.
 """
 
 from __future__ import annotations
@@ -92,6 +89,7 @@ from pathlib import Path
 from genesis.guardian._subprocess import run_subprocess as _run_subprocess
 from genesis.guardian.alert.base import Alert, AlertSeverity
 from genesis.guardian.cgroup_ops import activate_swap_max, read_swap_max, write_swap_max
+from genesis.guardian.config import SWAP_CEILING_OFF
 
 logger = logging.getLogger(__name__)
 
@@ -103,12 +101,6 @@ _REALERT_HOURS = 24.0
 _RETRY_MINUTES = 5.0
 
 _INCUS_TIMEOUT = 10.0
-
-# The Incus instance key that tracks the byte value this reconciler last
-# asserted as the swap ceiling (native key or cgroup fallback, whichever
-# applied) — see the module docstring for why this lives in Incus config
-# rather than a local file.
-_MARKER_KEY = "user.genesis.swap_ceiling"
 
 # Incus's own boolean-word lists (shared/util/boolean.go, v6.0.0 and main,
 # read 2026-10-07: `IsTrue` = {"true","1","yes","on"}, `IsFalse` =
@@ -198,6 +190,21 @@ def _is_swap_on(raw: str) -> bool:
     return _is_parseable_incus_size(stripped)
 
 
+def _is_byte_ceiling(raw: str) -> bool:
+    """Whether this ``limits.memory.swap`` value is a nonzero byte-size
+    ceiling, as opposed to a boolean. The boolean words are ruled out FIRST,
+    exactly as Incus does: ``"1"`` is Incus TRUE (a boolean, for which Incus
+    writes ``memory.swap.max=0`` under a hard memory limit), even though it
+    also reads as a one-byte size. Testing ``_is_swap_on(v) and
+    _is_parseable_incus_size(v)`` instead would call ``"1"`` a ceiling and
+    leave a live 0 under it unhealed."""
+    stripped = raw.strip()
+    lowered = stripped.lower()
+    if lowered in _INCUS_TRUE_WORDS or lowered in _INCUS_FALSE_WORDS:
+        return False
+    return _is_parseable_incus_size(stripped)
+
+
 def _host_swap_total_bytes() -> int | None:
     """Host ``/proc/meminfo`` SwapTotal, in bytes.
 
@@ -245,7 +252,7 @@ def _compute_swap_ceiling_target(config) -> int | None:
     the state this whole reconciler exists to prevent.
     """
     pct = getattr(config, "swap_ceiling_pct", None)
-    if pct is None:
+    if pct is None or pct == SWAP_CEILING_OFF:
         return None
     swap_total = _host_swap_total_bytes()
     if swap_total is None or swap_total <= 0:
@@ -271,33 +278,29 @@ def _compute_swap_ceiling_target(config) -> int | None:
     return target
 
 
-async def _limits_memory_state(container: str) -> str:
-    """Whether this container has a ``limits.memory`` cap — the condition
-    under which Incus actually applies ``limits.memory.swap`` as a native
-    swap-ceiling byte value rather than ignoring it (driver_lxc.go only
-    touches the swap cgroup inside the ``if memory != ""`` branch). THREE-WAY,
-    not boolean: ``"set"`` (native path applies), ``"unset"`` (no cap — the
-    cgroup-fallback path applies), or ``"unknown"`` (the read itself failed —
-    a DEGRADED tick, Codex P2 "warn when persistence is unknown during
-    fallback": an unreadable probe must not be silently treated as either
-    "set" or "unset", since guessing wrong either asserts a native key Incus
-    will ignore, or skips the native key Incus would actually have applied).
+async def _ceiling_path(container: str) -> str:
+    """Which path enforces a swap ceiling on this container: ``"native"``,
+    ``"fallback"`` or ``"unknown"``.
+
+    At container start, Incus applies ``limits.memory.swap`` only when
+    ``limits.memory`` is set AND ``limits.memory.enforce`` is not ``"soft"``
+    (driver_lxc.go v6.0.0: the swap limit is inside the ``else`` of
+    ``if memoryEnforce == "soft"``, an exact, case-sensitive comparison, and
+    inside ``if memory != ""``). Anything else would lose a native ceiling at
+    the next start, so the ceiling goes to the live cgroup instead
+    (``"fallback"``). ``"unknown"`` when either read
+    fails: a DEGRADED tick, never a guess, since a wrong guess either asserts
+    a key Incus ignores or skips one Incus would apply.
     """
-    try:
-        rc, stdout, _stderr = await _run_subprocess(
-            "incus",
-            "config",
-            "get",
-            "--expanded",
-            container,
-            "limits.memory",
-            timeout=_INCUS_TIMEOUT,
-        )
-    except Exception:
+    ok, memory = await _incus_config_get(container, "limits.memory")
+    if not ok:
         return "unknown"
-    if rc != 0:
+    if not memory:
+        return "fallback"
+    ok, enforce = await _incus_config_get(container, "limits.memory.enforce")
+    if not ok:
         return "unknown"
-    return "set" if stdout.strip() else "unset"
+    return "fallback" if enforce == "soft" else "native"
 
 
 async def _incus_config_get(container: str, key: str) -> tuple[bool, str]:
@@ -323,16 +326,8 @@ async def _incus_config_get(container: str, key: str) -> tuple[bool, str]:
 
 
 async def _incus_config_set(container: str, pairs: dict[str, str]) -> tuple[bool, str]:
-    """Set one or more Incus instance config keys in ONE ``config set`` call
-    — the CLI's ``<key>=<value>...`` form parses every pair into a single API
-    request (``cmd/incus/config.go`` ``cmdConfigSet.Run``, read 2026-10-08),
-    so bundling the real value with its ownership marker here is atomic: no
-    tick can observe one written without the other. An empty value clears
-    that key (Incus has no distinct "unset via set" — an empty string reads
-    back as empty, which this module already treats identically to "absent"
-    everywhere else, e.g. ``_is_swap_on``'s unset/false-spelling branch).
-    Returns ``(ok, error_text)``.
-    """
+    """Set Incus instance config keys in one ``config set`` call. Returns
+    ``(ok, error_text)``."""
     args = [f"{k}={v}" for k, v in pairs.items()]
     try:
         rc, _stdout, stderr = await _run_subprocess(
@@ -482,27 +477,32 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
         _PROBLEM_CLASS_CEILING: [],
     }
 
-    pct_configured = getattr(config, "swap_ceiling_pct", None) is not None
-    ceiling_target = _compute_swap_ceiling_target(config)
+    pct = getattr(config, "swap_ceiling_pct", None)
+    ceiling_off = pct == SWAP_CEILING_OFF
+    pct_configured = pct is not None and not ceiling_off
+    ceiling_target = _compute_swap_ceiling_target(config) if pct_configured else None
 
-    # mode discriminates the three ceiling states a tick can be in:
-    #   "ceiling"  — a usable target AND a usable limits.memory probe.
-    #   "degraded" — swap_ceiling_pct IS set, but either the target or the
-    #                limits.memory probe could not be read this tick. Holds:
-    #                no persistent-key write at all, including the ordinary
-    #                false->true heal (see the module docstring).
-    #   "none"     — swap_ceiling_pct is unset/invalid; the ordinary
-    #                false->true heal applies, plus reverting any ceiling
-    #                this reconciler previously asserted.
-    limits_memory_state = "unknown"
+    # mode discriminates what this tick enforces:
+    #   "ceiling"  — a usable target AND a usable native/fallback probe.
+    #   "degraded" — swap_ceiling_pct is a number, but the target or the probe
+    #                 could not be read this tick. Holds: no persistent-key
+    #                 write at all, including the ordinary false->true heal.
+    #   "off"      — swap_ceiling_pct: off. Remove a ceiling: key → true,
+    #                 a finite live cap → max.
+    #   "none"     — unset: the ordinary #3069 behaviour; a ceiling, if any,
+    #                 is left exactly as it is.
+    path = "unknown"
     if ceiling_target is not None:
-        limits_memory_state = await _limits_memory_state(container)
-    if ceiling_target is not None and limits_memory_state != "unknown":
+        path = await _ceiling_path(container)
+    if ceiling_target is not None and path != "unknown":
         mode = "ceiling"
     elif pct_configured:
         mode = "degraded"
+    elif ceiling_off:
+        mode = "off"
     else:
         mode = "none"
+    target_str = str(ceiling_target) if mode == "ceiling" else ""
 
     # 1. Persistent knob. `incus config get` on an unset key returns rc=0 with
     # empty output, so unset and explicit-false both land in the heal branch.
@@ -524,25 +524,12 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
         rc, stdout = 1, ""
     config_verified = rc == 0
     raw_value = stdout.strip() if rc == 0 else ""
-    key_now = raw_value  # tracks the key's value as WE understand it after any write this tick
-    # Set for real only inside mode=="none"; stays False whenever that branch
-    # never ran (any other mode, or config_verified is False) — exactly the
-    # cases where step 3 must fall through to its own (correct) logic rather
-    # than reading an unset flag.
-    native_revert_attempted = False
-
-    # 2. Ownership marker. Read every tick regardless of mode: it is the only
-    # record of a ceiling this reconciler previously asserted, so even a
-    # "mode=none" tick must consult it to know whether a revert is owed.
-    marker_readable, marker_raw = (False, "")
-    if config_verified:
-        marker_readable, marker_raw = await _incus_config_get(container, _MARKER_KEY)
-    marker_now = marker_raw if marker_readable else None  # None = unreadable -> hold, never guess
+    key_now = raw_value  # the key as we understand it after any write this tick
 
     if config_verified:
         if mode == "degraded":
             reason = (
-                "limits.memory unreadable"
+                "limits.memory or limits.memory.enforce unreadable"
                 if ceiling_target is not None
                 else "host SwapTotal unreadable, or the ceiling is below one page"
             )
@@ -551,208 +538,130 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
                 "limits.memory.swap key was left untouched to avoid clobbering a "
                 "ceiling with a boolean value",
             )
-        elif mode == "ceiling":
-            target_str = str(ceiling_target)
-            if limits_memory_state == "set":
-                # NATIVE PATH.
-                if raw_value != target_str:
-                    ok, err = await _incus_config_set(
-                        container,
-                        {"limits.memory.swap": target_str, _MARKER_KEY: target_str},
-                    )
-                    if ok:
-                        healed.append(
-                            f"limits.memory.swap: {raw_value or 'unset'} → {target_str} bytes "
-                            f"(native ceiling, {config.swap_ceiling_pct:g}% of host swap)",
-                        )
-                        key_now = target_str
-                        marker_now = target_str
-                    else:
-                        problems[_PROBLEM_CLASS_CEILING].append(
-                            f"incus config set limits.memory.swap={target_str} failed: {err}",
-                        )
-                elif marker_now is not None and marker_now != target_str:
-                    # Already correct natively; the marker didn't catch up (a
-                    # prior tick's bundled set partially landed before this
-                    # fix existed, or an operator coincidentally matched the
-                    # target). Reclaim it alone — no need to touch the real
-                    # key, which is already right.
-                    ok, err = await _incus_config_set(container, {_MARKER_KEY: target_str})
-                    if ok:
-                        marker_now = target_str
-                    else:
-                        problems[_PROBLEM_CLASS_CEILING].append(
-                            f"could not record the swap-ceiling marker: {err}",
-                        )
-            else:  # limits_memory_state == "unset" — FALLBACK PATH.
-                # The native key is inert without a limits.memory cap, but the
-                # baseline invariant (never literally off) still applies; the
-                # actual ceiling is enforced on the live cgroup below.
-                if not _is_swap_on(raw_value):
-                    ok, err = await _incus_config_set(container, {"limits.memory.swap": "true"})
-                    if ok:
-                        healed.append(
-                            f"limits.memory.swap: {raw_value or 'unset'} → true "
-                            "(persists across restarts; ceiling enforced via cgroup fallback)",
-                        )
-                        key_now = "true"
-                    else:
-                        problems[_PROBLEM_CLASS_SWAP_OFF].append(
-                            f"incus config set limits.memory.swap=true failed: {err}",
-                        )
-        else:  # mode == "none"
-            if not _is_swap_on(raw_value):
-                ok, err = await _incus_config_set(container, {"limits.memory.swap": "true"})
+        elif mode == "ceiling" and path == "native":
+            if raw_value != target_str:
+                ok, err = await _incus_config_set(container, {"limits.memory.swap": target_str})
                 if ok:
                     healed.append(
-                        f"limits.memory.swap: {raw_value or 'unset'} → true (persists across restarts)",
+                        f"limits.memory.swap: {raw_value or 'unset'} → {target_str} bytes "
+                        f"(native ceiling, {config.swap_ceiling_pct:g}% of host swap)",
                     )
-                    key_now = "true"
-                else:
-                    problems[_PROBLEM_CLASS_SWAP_OFF].append(
-                        f"incus config set limits.memory.swap=true failed: {err}",
-                    )
-            # Native-side revert: a marker from an earlier ceiling, and the
-            # persistent key (as we now understand it) still equals it. If
-            # marker_now is truthy but this doesn't match, it may be the
-            # cgroup-fallback path — decided below, once the live value is
-            # known.
-            if marker_now and key_now == marker_now:
-                native_revert_attempted = True
-                ok, err = await _incus_config_set(
-                    container,
-                    {"limits.memory.swap": "true", _MARKER_KEY: ""},
-                )
-                if ok:
-                    healed.append(
-                        f"swap ceiling removed: limits.memory.swap {marker_now} bytes → "
-                        "true (swap_ceiling_pct no longer set)",
-                    )
-                    key_now = "true"
-                    marker_now = ""
+                    key_now = target_str
                 else:
                     problems[_PROBLEM_CLASS_CEILING].append(
-                        f"could not revert the native swap ceiling ({marker_now} bytes) "
-                        f"to true: {err}",
+                        f"incus config set limits.memory.swap={target_str} failed: {err}",
                     )
+        elif mode == "off" and _is_byte_ceiling(raw_value):
+            ok, err = await _incus_config_set(container, {"limits.memory.swap": "true"})
+            if ok:
+                healed.append(
+                    f"swap ceiling removed: limits.memory.swap {raw_value} → true "
+                    "(swap_ceiling_pct: off)",
+                )
+                key_now = "true"
+            else:
+                problems[_PROBLEM_CLASS_CEILING].append(
+                    f"could not remove the swap ceiling (limits.memory.swap={raw_value}): {err}",
+                )
+        elif not _is_swap_on(raw_value):
+            # "none", "off", and the fallback path: the key only has to be
+            # swap-on (on the fallback path Incus ignores it as a ceiling).
+            ok, err = await _incus_config_set(container, {"limits.memory.swap": "true"})
+            if ok:
+                note = (
+                    "persists across restarts; ceiling enforced on the live cgroup"
+                    if mode == "ceiling"
+                    else "persists across restarts"
+                )
+                healed.append(f"limits.memory.swap: {raw_value or 'unset'} → true ({note})")
+                key_now = "true"
+            else:
+                problems[_PROBLEM_CLASS_SWAP_OFF].append(
+                    f"incus config set limits.memory.swap=true failed: {err}",
+                )
     else:
         logger.debug("swap_watch: no incus config signal (rc=%s)", rc)
+        if mode == "ceiling":
+            problems[_PROBLEM_CLASS_CEILING].append(
+                "could not read limits.memory.swap, so the persistent half of the swap "
+                "ceiling is unverified this tick; a container restart may not keep it",
+            )
+        elif mode == "off":
+            problems[_PROBLEM_CLASS_CEILING].append(
+                "could not read limits.memory.swap, so the swap ceiling was not removed "
+                "this tick (a stored ceiling would come back at the next restart)",
+            )
 
-    # 3. Live cgroup. Only "0" is the defect in the no-ceiling baseline; None
-    # = no signal (stopped container / cgroup v1), any other value already
-    # permits swap.
+    # 2. Live cgroup. None = no signal (stopped container / cgroup v1).
     current = await read_swap_max(container)
 
     if mode == "ceiling":
-        target_str = str(ceiling_target)
         if current is not None and current != target_str:
             if await write_swap_max(container, target_str):
                 healed.append(f"memory.swap.max: {current} → {target_str} bytes (live)")
-                if limits_memory_state == "unset" and marker_now != target_str:
-                    ok, err = await _incus_config_set(container, {_MARKER_KEY: target_str})
-                    if ok:
-                        marker_now = target_str
-                    else:
-                        problems[_PROBLEM_CLASS_CEILING].append(
-                            f"applied the cgroup fallback ceiling but could not record the "
-                            f"swap-ceiling marker: {err}",
-                        )
             else:
                 problems[_PROBLEM_CLASS_CEILING].append(
                     f"cgroup write of swap ceiling ({target_str} bytes) failed",
                 )
-        elif (
-            current == target_str
-            and limits_memory_state == "unset"
-            and marker_now is not None
-            and marker_now != target_str
-        ):
-            # Fallback path, already correct live, but the marker never
-            # caught up (a crash or failed set between the cgroup write and
-            # the marker write on an earlier tick) — reclaim it alone.
-            ok, err = await _incus_config_set(container, {_MARKER_KEY: target_str})
-            if ok:
-                marker_now = target_str
-            else:
-                problems[_PROBLEM_CLASS_CEILING].append(
-                    f"could not reclaim the swap-ceiling marker (cgroup fallback): {err}",
-                )
-    else:
-        # "degraded" and "none" both fall back to the ORIGINAL, ceiling-
-        # unaware step-2 logic — using key_now, which in "degraded" mode is
-        # untouched raw_value (nothing was written above) and in "none" mode
-        # may already reflect this tick's heal or revert.
-        if current == "0":
-            if _is_swap_on(key_now) and _is_parseable_incus_size(key_now):
-                # Writing "max" here would replace an existing ceiling with
-                # unlimited swap until the next restart. Incus applies a
-                # ceiling with no zero window, so a live 0 under one was
-                # written from outside: report it, never overwrite it.
-                problems[_PROBLEM_CLASS_SWAP_OFF].append(
-                    f"limits.memory.swap holds a ceiling ({key_now}) but the live "
-                    "memory.swap.max is 0 — left as is; restart the container or "
-                    "re-set the key to apply the ceiling",
-                )
-            elif await activate_swap_max(container):
-                if config_verified:
-                    healed.append("memory.swap.max: 0 → max (live, no restart needed)")
-                else:
-                    # Live-healed, but the config read failed so the PERSISTENT
-                    # knob was never verified/set — a restart can revert
-                    # memory.swap.max to 0. Don't declare a clean "reconciled";
-                    # surface it so the persistent half gets fixed.
+                if current == "0":
                     problems[_PROBLEM_CLASS_SWAP_OFF].append(
-                        "activated swap live (memory.swap.max 0 → max) but could NOT "
-                        "verify the persistent limits.memory.swap knob (incus config "
-                        "read failed) — a container restart may revert swap to off",
+                        "the live cgroup reads 0 (swap off) and the ceiling write failed, "
+                        "so swap stays off until a write succeeds",
                     )
+    elif current == "0":
+        if _is_byte_ceiling(key_now):
+            # Writing "max" here would replace an existing ceiling with
+            # unlimited swap until the next restart. Incus applies a ceiling
+            # with no zero window, so a live 0 under one was written from
+            # outside: report it, never overwrite it.
+            problems[_PROBLEM_CLASS_SWAP_OFF].append(
+                f"limits.memory.swap holds a ceiling ({key_now}) but the live "
+                "memory.swap.max is 0 — left as is; restart the container or "
+                "re-set the key to apply the ceiling",
+            )
+        elif await activate_swap_max(container):
+            if config_verified:
+                healed.append("memory.swap.max: 0 → max (live, no restart needed)")
             else:
+                # Live-healed, but the config read failed so the PERSISTENT
+                # knob was never verified/set: a restart can revert
+                # memory.swap.max to 0. Surface it so the persistent half
+                # gets fixed.
                 problems[_PROBLEM_CLASS_SWAP_OFF].append(
-                    "live cgroup write failed — swap stays off until the next "
-                    "container start (set the persistent knob and restart to apply)",
+                    "activated swap live (memory.swap.max 0 → max) but could NOT "
+                    "verify the persistent limits.memory.swap knob (incus config "
+                    "read failed) — a container restart may revert swap to off",
                 )
-        elif mode == "none" and marker_now and not native_revert_attempted:
-            # native_revert_attempted gates this on whether the native branch
-            # above ALREADY determined (and tried to act on) the native case
-            # — not on whether current happens to still equal the marker.
-            # Without this gate, a FAILED native revert leaves key_now,
-            # marker_now and current all still equal to the stale ceiling,
-            # which this cgroup branch would misread as "the fallback path
-            # was in effect": it would write the live cgroup to max and
-            # clear the marker, stranding the persisted key at the old
-            # ceiling with no further signal to fix it (genesis-architect
-            # finding on this rework, 2026-10-08).
-            if current == marker_now:
-                # Cgroup-fallback revert: the native side didn't match above,
-                # so this was the fallback path in effect.
-                if await write_swap_max(container, "max"):
-                    ok, err = await _incus_config_set(container, {_MARKER_KEY: ""})
-                    if ok:
-                        healed.append(
-                            f"swap ceiling removed: memory.swap.max {marker_now} bytes → max "
-                            "(swap_ceiling_pct no longer set)",
-                        )
-                        marker_now = ""
-                    else:
-                        problems[_PROBLEM_CLASS_CEILING].append(
-                            "reverted the live cgroup swap ceiling but could not clear the "
-                            f"swap-ceiling marker: {err}",
-                        )
-                else:
-                    problems[_PROBLEM_CLASS_CEILING].append(
-                        f"could not revert the cgroup swap ceiling ({marker_now} bytes) to max",
-                    )
-            else:
-                # Neither the persistent key nor the live cgroup matches the
-                # marker: an operator changed the enforced value directly.
-                # Nothing to revert — just stop tracking it.
-                ok, err = await _incus_config_set(container, {_MARKER_KEY: ""})
-                if ok:
-                    marker_now = ""
-                else:
-                    problems[_PROBLEM_CLASS_CEILING].append(
-                        f"could not clear a stale swap-ceiling marker: {err}",
-                    )
+            if mode == "degraded":
+                problems[_PROBLEM_CLASS_CEILING].append(
+                    "the live cgroup read 0 (swap off) and was opened to max; the "
+                    "configured swap ceiling could not be computed this tick, so "
+                    "swap is uncapped until it can be",
+                )
+        else:
+            problems[_PROBLEM_CLASS_SWAP_OFF].append(
+                "live cgroup write failed — swap stays off until the next "
+                "container start (set the persistent knob and restart to apply)",
+            )
+    elif (
+        mode == "off"
+        and config_verified
+        and current not in (None, "max")
+        and not _is_byte_ceiling(key_now)
+    ):
+        # A finite live cap with no byte-ceiling key behind it: the cgroup
+        # fallback's cap (or one written from outside). "off" lifts it. When
+        # the key still holds a ceiling (its removal failed above) or could
+        # not be read at all, the cgroup is left alone so the two stay
+        # consistent; the problem recorded above retries next tick.
+        if await write_swap_max(container, "max"):
+            healed.append(
+                f"swap ceiling removed: memory.swap.max {current} → max (swap_ceiling_pct: off)"
+            )
+        else:
+            problems[_PROBLEM_CLASS_CEILING].append(
+                f"could not lift the live swap cap ({current} bytes) to max",
+            )
 
     if healed:
         logger.info("swap_watch healed: %s", "; ".join(healed))

@@ -13,6 +13,9 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+#: ``swap_ceiling_pct`` value that removes a swap ceiling (see GuardianConfig).
+SWAP_CEILING_OFF = "off"
+
 _DEFAULT_CONFIG_PATH = (
     Path(__file__).resolve().parent.parent.parent.parent / "config" / "guardian.yaml"
 )
@@ -427,14 +430,18 @@ class GuardianConfig:
     # Opt-in ceiling on the container's share of HOST swap, as a percentage of
     # host SwapTotal (not bytes — this is the one knob here expressed as a
     # percentage rather than an absolute, so it tracks the pool if the host's
-    # swap grows or shrinks). None (the public default) means uncapped,
-    # matching today's behavior. Install-local: set in the deployed
-    # guardian.yaml, never in the repo's shipped template. Validated in
-    # _finalize (bool rejected first — bool is an int subclass; a huge or
-    # non-finite or out-of-range value warns and falls back to None, never to
-    # 0, since 0 would mean swap-off, the opposite of this reconciler's whole
-    # purpose).
-    swap_ceiling_pct: float | None = None
+    # swap grows or shrinks). None (the public default) means unmanaged:
+    # swap_watch neither sets nor removes a ceiling. SWAP_CEILING_OFF ("off")
+    # removes one (limits.memory.swap back to true, a finite live cap lifted
+    # to max). Install-local: set in the deployed guardian.yaml, never in the
+    # repo's shipped template. Validated in _finalize (bool handled first —
+    # bool is an int subclass, and YAML reads a bare `off`, `no` or `false` as
+    # False, which therefore means off too; a QUOTED "false" or "no" is just
+    # an unknown string and is ignored, only "off" is the word; a huge or
+    # non-finite or out-of-range number warns and falls back to None, never
+    # to 0, since 0 would mean swap-off, the opposite of this reconciler's
+    # whole purpose).
+    swap_ceiling_pct: float | str | None = None
 
     # Host VM details — used by container for bidirectional monitoring (SSH → gateway)
     host_ip: str = ""      # Auto-detected by installer; empty = not installed
@@ -698,16 +705,22 @@ def _finalize(config: GuardianConfig) -> GuardianConfig:
         )
 
     # swap_ceiling_pct: a percentage of HOST SwapTotal, never a byte count —
-    # tolerate None (default) and a plain int/float in (0, 100]; anything
-    # else falls back to None (uncapped), loudly. Never falls back to 0:
+    # tolerate None (default), "off" (or YAML's bare off, i.e. False) and a
+    # plain int/float in (0, 100]; anything else falls back to None
+    # (unmanaged), loudly. Never falls back to 0:
     # 0 would mean "cap swap at nothing", the opposite of what this knob is
     # for, and would hand swap_watch a target that disables swap outright.
     pct = config.swap_ceiling_pct
     if pct is not None:
-        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+        # YAML 1.1 reads a bare `off` as boolean False, so False is the same
+        # request as the string "off" (any case). True has no such meaning.
+        if pct is False or (isinstance(pct, str) and pct.strip().lower() == SWAP_CEILING_OFF):
+            config.swap_ceiling_pct = SWAP_CEILING_OFF
+        elif isinstance(pct, bool) or not isinstance(pct, (int, float)):
             logger.warning(
-                "swap_ceiling_pct=%r is not a number — ignoring (swap stays "
-                "uncapped). Set a plain number greater than 0 and at most 100.",
+                "swap_ceiling_pct=%r is not a number or 'off' — ignoring (the "
+                "ceiling stays unmanaged). Set a number greater than 0 and at "
+                "most 100, or off to remove a ceiling.",
                 pct,
             )
             config.swap_ceiling_pct = None
@@ -720,15 +733,15 @@ def _finalize(config: GuardianConfig) -> GuardianConfig:
             # necessarily out of (0, 100] anyway, so this range check alone
             # rejects it with no conversion ever attempted.
             logger.warning(
-                "swap_ceiling_pct=%r is out of range — ignoring (swap stays "
-                "uncapped). Must be greater than 0 and at most 100.",
+                "swap_ceiling_pct=%r is out of range — ignoring (the ceiling "
+                "stays unmanaged). Must be greater than 0 and at most 100.",
                 pct,
             )
             config.swap_ceiling_pct = None
         elif not math.isfinite(pct) or not (0 < pct <= 100):
             logger.warning(
-                "swap_ceiling_pct=%r is out of range — ignoring (swap stays "
-                "uncapped). Must be greater than 0 and at most 100.",
+                "swap_ceiling_pct=%r is out of range — ignoring (the ceiling "
+                "stays unmanaged). Must be greater than 0 and at most 100.",
                 pct,
             )
             config.swap_ceiling_pct = None

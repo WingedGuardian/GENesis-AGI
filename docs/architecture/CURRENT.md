@@ -1733,13 +1733,13 @@ verified: 83a835e32 2026-10-08
   retries in 5min rather than silently adopting the 24h window); kill switch
   `swap_reconcile_enabled: false`. **Opt-in ceiling**: install-local
   `swap_ceiling_pct` (percent of HOST SwapTotal, page-aligned) asserted via
-  Incus's native `limits.memory.swap=<bytes>` key when `limits.memory` is
-  capped, else a direct cgroup write (`cgroup_ops.write_swap_max`); tracked
-  via the Incus instance key `user.genesis.swap_ceiling` (never a local
-  file — atomic with the real write, bound to the one container, nothing to
-  corrupt), which removing the setting reverts ONLY if the enforced value
-  still matches. A tick that can't compute the target holds rather than
-  resetting the key to `true`.
+  Incus's native `limits.memory.swap=<bytes>` key under a hard
+  `limits.memory` cap, else a direct cgroup write
+  (`cgroup_ops.write_swap_max`). `swap_ceiling_pct: off` removes a ceiling
+  (key back to `true`, a finite live cap lifted to `max`); deleting the
+  setting leaves whatever is set alone, so no ownership record exists. A
+  tick that can't compute the target holds rather than resetting the key to
+  `true`.
 - **Host zram swap** (`scripts/lib/host_swap.sh`, E-rest E3): a
   compressed-RAM-first swap tier on the host VM — `zram-swap.service` at swap
   priority 100, sized `min(MemTotal/2, 4GiB)` (`HOSTSWAP_CAP_GIB` override).

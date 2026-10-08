@@ -75,21 +75,18 @@ remediation for the detected vantage — because the knob is never local:
   deployed `guardian.yaml`, never in this repo's shipped template) caps the
   container's swap at that percentage of the HOST's `SwapTotal`, so the cap
   tracks the pool if it is resized. The reconciler asserts it through Incus's
-  own native `limits.memory.swap=<bytes>` key when this container has a
-  `limits.memory` cap (the normal case), or via a direct cgroup write
-  otherwise. A tick that can't compute the target this round (host
-  `SwapTotal` unreadable, or the `limits.memory` probe itself fails) HOLDS —
-  it never falls back to resetting the key to `true`, since that would be a
-  boolean value and Incus resets a boolean key's live cgroup to 0 on every
-  update. Removing `swap_ceiling_pct` reverts the ceiling only if the
-  currently-enforced value still matches the one this reconciler itself
-  asserted — tracked via an Incus instance key, `user.genesis.swap_ceiling`
-  (visible by hand via `incus config get <container>
-  user.genesis.swap_ceiling`), never a local file, so there is nothing to
-  lose on a re-deploy or corrupt out from under the reconciler. An
-  operator-set ceiling this reconciler never wrote is never touched.
-  `swap_reconcile_enabled: false` disables the ceiling too — a disabled
-  reconciler never reads or writes the marker.
+  own native `limits.memory.swap=<bytes>` key when this container has a hard
+  `limits.memory` cap (the normal case; Incus ignores the key under
+  `limits.memory.enforce: soft`), or via a direct cgroup write otherwise. A
+  tick that can't compute the target this round (host `SwapTotal`
+  unreadable, or the `limits.memory` / `limits.memory.enforce` probe fails)
+  HOLDS — it never falls back to resetting the key to `true`, since that
+  would be a boolean value and Incus resets a boolean key's live cgroup to 0
+  on every update. To remove a ceiling, set `swap_ceiling_pct: off`: the key
+  goes back to `true` and a finite live cap is lifted to `max`. Deleting the
+  setting is different: the reconciler stops managing a ceiling and leaves
+  whatever value is set alone. `swap_reconcile_enabled: false` disables the
+  ceiling too.
 - **Bare metal / VM**: create a swapfile or LV sized to taste. Even a few
   GiB turns the OOM cliff into a ramp. **On guardian hosts this is now
   mechanical** — see the zram layer below.
