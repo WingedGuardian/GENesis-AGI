@@ -430,31 +430,55 @@ def _failure_alert_due(state_file, now: datetime, problem_class: str) -> bool:
         return True
 
 
+def _load_throttle_records(state_file) -> dict[str, dict]:
+    """The per-class throttle records as ``{class: {"at": iso, "delivered":
+    bool}}``, migrating every prior on-disk shape (see
+    ``_class_last_attempt``). Unreadable or absent state reads as empty."""
+    existing: dict = {}
+    if state_file.exists():
+        try:
+            existing = json.loads(state_file.read_text())
+        except (ValueError, OSError):
+            existing = {}
+    raw_at = existing.get("last_failure_alert_at") if isinstance(existing, dict) else None
+    by_class: dict[str, dict] = {}
+    if isinstance(raw_at, dict):
+        for k, v in raw_at.items():
+            # Normalize a bare-ISO-string per-class entry (the pre-retry
+            # shape) into the current {at, delivered} form rather than
+            # dropping it — it was always "delivered" under that shape.
+            by_class[k] = v if isinstance(v, dict) else {"at": v, "delivered": True}
+    elif isinstance(raw_at, str) and raw_at:
+        # Migrate the LEGACY flat (pre-per-class) timestamp — it was
+        # always a swap_off-class record (the only class that existed
+        # before per-class throttling), and discarding it here would
+        # silently erase a real, still-valid throttle window the first
+        # time a DIFFERENT class (ceiling) is the one being recorded.
+        by_class = {_PROBLEM_CLASS_SWAP_OFF: {"at": raw_at, "delivered": True}}
+    return by_class
+
+
 def _record_failure_alert(state_file, now: datetime, problem_class: str, delivered: bool) -> None:
     try:
         state_file.parent.mkdir(parents=True, exist_ok=True)
-        existing: dict = {}
-        if state_file.exists():
-            try:
-                existing = json.loads(state_file.read_text())
-            except (ValueError, OSError):
-                existing = {}
-        raw_at = existing.get("last_failure_alert_at") if isinstance(existing, dict) else None
-        by_class: dict[str, dict] = {}
-        if isinstance(raw_at, dict):
-            for k, v in raw_at.items():
-                # Normalize a bare-ISO-string per-class entry (the pre-retry
-                # shape) into the current {at, delivered} form rather than
-                # dropping it — it was always "delivered" under that shape.
-                by_class[k] = v if isinstance(v, dict) else {"at": v, "delivered": True}
-        elif isinstance(raw_at, str) and raw_at:
-            # Migrate the LEGACY flat (pre-per-class) timestamp — it was
-            # always a swap_off-class record (the only class that existed
-            # before per-class throttling), and discarding it here would
-            # silently erase a real, still-valid throttle window the first
-            # time a DIFFERENT class (ceiling) is the one being recorded.
-            by_class = {_PROBLEM_CLASS_SWAP_OFF: {"at": raw_at, "delivered": True}}
+        by_class = _load_throttle_records(state_file)
         by_class[problem_class] = {"at": now.isoformat(), "delivered": delivered}
+        state_file.write_text(json.dumps({"last_failure_alert_at": by_class}))
+    except OSError:
+        logger.warning("could not persist swap_watch alert state", exc_info=True)
+
+
+def _clear_failure_alert(state_file, problem_class: str) -> None:
+    """Forget ``problem_class``'s throttle record after a tick that VERIFIED
+    that class healthy, so the next failure is a new episode and pages at
+    once rather than waiting out the old 24h window. Writes only when a
+    record exists, so the healthy path stays write-free."""
+    try:
+        if not state_file.exists():
+            return
+        by_class = _load_throttle_records(state_file)
+        if by_class.pop(problem_class, None) is None:
+            return
         state_file.write_text(json.dumps({"last_failure_alert_at": by_class}))
     except OSError:
         logger.warning("could not persist swap_watch alert state", exc_info=True)
@@ -526,18 +550,20 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
     raw_value = stdout.strip() if rc == 0 else ""
     key_now = raw_value  # the key as we understand it after any write this tick
 
+    if mode == "degraded":
+        reason = (
+            "limits.memory or limits.memory.enforce unreadable"
+            if ceiling_target is not None
+            else "host SwapTotal unreadable, or the ceiling is below one page"
+        )
+        problems[_PROBLEM_CLASS_CEILING].append(
+            f"swap ceiling not asserted this tick ({reason}); the persistent "
+            "limits.memory.swap key was left untouched to avoid clobbering a "
+            "ceiling with a boolean value",
+        )
     if config_verified:
         if mode == "degraded":
-            reason = (
-                "limits.memory or limits.memory.enforce unreadable"
-                if ceiling_target is not None
-                else "host SwapTotal unreadable, or the ceiling is below one page"
-            )
-            problems[_PROBLEM_CLASS_CEILING].append(
-                f"swap ceiling not asserted this tick ({reason}); the persistent "
-                "limits.memory.swap key was left untouched to avoid clobbering a "
-                "ceiling with a boolean value",
-            )
+            pass  # held: reported above; the final assessment below judges the key
         elif mode == "ceiling" and path == "native":
             if raw_value != target_str:
                 ok, err = await _incus_config_set(container, {"limits.memory.swap": target_str})
@@ -569,9 +595,10 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
             ok, err = await _incus_config_set(container, {"limits.memory.swap": "true"})
             if ok:
                 note = (
-                    "persists across restarts; ceiling enforced on the live cgroup"
+                    "swap-on in config; the ceiling itself goes on the live cgroup"
                     if mode == "ceiling"
-                    else "persists across restarts"
+                    else "swap-on in config; under a hard memory limit Incus still starts "
+                    "the container at memory.swap.max=0, which this watch re-opens live"
                 )
                 healed.append(f"limits.memory.swap: {raw_value or 'unset'} → true ({note})")
                 key_now = "true"
@@ -593,12 +620,15 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
             )
 
     # 2. Live cgroup. None = no signal (stopped container / cgroup v1).
+    # `live_now` follows the value the cgroup holds after this tick's writes.
     current = await read_swap_max(container)
+    live_now = current
 
     if mode == "ceiling":
         if current is not None and current != target_str:
             if await write_swap_max(container, target_str):
                 healed.append(f"memory.swap.max: {current} → {target_str} bytes (live)")
+                live_now = target_str
             else:
                 problems[_PROBLEM_CLASS_CEILING].append(
                     f"cgroup write of swap ceiling ({target_str} bytes) failed",
@@ -614,12 +644,19 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
             # unlimited swap until the next restart. Incus applies a ceiling
             # with no zero window, so a live 0 under one was written from
             # outside: report it, never overwrite it.
+            if mode == "off":
+                advice = (
+                    "swap_ceiling_pct: off could not remove it; set the key to true "
+                    "and this watch re-opens swap live"
+                )
+            else:
+                advice = "left as is; restart the container or re-set the key to apply the ceiling"
             problems[_PROBLEM_CLASS_SWAP_OFF].append(
                 f"limits.memory.swap holds a ceiling ({key_now}) but the live "
-                "memory.swap.max is 0 — left as is; restart the container or "
-                "re-set the key to apply the ceiling",
+                f"memory.swap.max is 0 — {advice}",
             )
         elif await activate_swap_max(container):
+            live_now = "max"
             if config_verified:
                 healed.append("memory.swap.max: 0 → max (live, no restart needed)")
             else:
@@ -640,8 +677,8 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
                 )
         else:
             problems[_PROBLEM_CLASS_SWAP_OFF].append(
-                "live cgroup write failed — swap stays off until the next "
-                "container start (set the persistent knob and restart to apply)",
+                "live cgroup write failed — swap stays off until a live write "
+                "succeeds (this watch retries every tick)",
             )
     elif (
         mode == "off"
@@ -655,6 +692,7 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
         # not be read at all, the cgroup is left alone so the two stay
         # consistent; the problem recorded above retries next tick.
         if await write_swap_max(container, "max"):
+            live_now = "max"
             healed.append(
                 f"swap ceiling removed: memory.swap.max {current} → max (swap_ceiling_pct: off)"
             )
@@ -662,6 +700,28 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
             problems[_PROBLEM_CLASS_CEILING].append(
                 f"could not lift the live swap cap ({current} bytes) to max",
             )
+
+    # 3. Verdict from the FINAL state. Every branch above reports what it did;
+    # this step judges each class from what the tick actually observed after
+    # its own writes, so no branch can leave a class claiming more (or less)
+    # than was seen.
+    if config_verified and not _is_swap_on(key_now) and not problems[_PROBLEM_CLASS_SWAP_OFF]:
+        # A key left swap-off (a degraded hold, a failed native set): the next
+        # container start turns swap off, whatever the live cgroup says now.
+        problems[_PROBLEM_CLASS_SWAP_OFF].append(
+            f"limits.memory.swap reads {key_now or 'unset'}, so the next container "
+            "start turns swap off; it was not set to true this tick",
+        )
+    if key_now != raw_value and not _is_byte_ceiling(key_now) and live_now is None:
+        # This tick wrote a BOOLEAN key: a live update, after which Incus writes
+        # memory.swap.max=0 under a hard memory limit. With the cgroup
+        # unreadable, swap itself is unverified. (A byte key has no zero window.)
+        problems[
+            _PROBLEM_CLASS_CEILING if mode in ("ceiling", "off") else _PROBLEM_CLASS_SWAP_OFF
+        ].append(
+            f"set limits.memory.swap={key_now} this tick but could not read the live "
+            "memory.swap.max back, so swap is unverified until a later tick reads it",
+        )
 
     if healed:
         logger.info("swap_watch healed: %s", "; ".join(healed))
@@ -678,8 +738,27 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
             "config.",
         )
 
+    # Which classes this tick VERIFIED healthy, from the final state: only those
+    # may end a throttle window, so a recovery followed by a new failure pages
+    # again at once, and an unverified tick never does.
+    verified = {
+        _PROBLEM_CLASS_SWAP_OFF: config_verified
+        and _is_swap_on(key_now)
+        and live_now not in (None, "0"),
+        _PROBLEM_CLASS_CEILING: config_verified
+        and (
+            (
+                mode == "ceiling"
+                and live_now == target_str
+                and (path == "fallback" or key_now == target_str)
+            )
+            or (mode == "off" and not _is_byte_ceiling(key_now) and live_now == "max")
+        ),
+    }
     for problem_class, class_problems in problems.items():
         if not class_problems:
+            if verified[problem_class]:
+                _clear_failure_alert(config.state_path / "swap_watch_state.json", problem_class)
             continue
         logger.warning("swap_watch problems (%s): %s", problem_class, "; ".join(class_problems))
         now = datetime.now(UTC)
