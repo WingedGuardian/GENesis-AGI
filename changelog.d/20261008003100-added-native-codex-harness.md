@@ -1,0 +1,1 @@
+Added an opt-in, paid-model-free native Codex CLI/app-server hook harness with isolated shell, patch, and MCP sinks.
