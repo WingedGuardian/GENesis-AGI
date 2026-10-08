@@ -16,14 +16,13 @@ All paths use the cgroup v2 layout: /sys/fs/cgroup/lxc.payload.{container}/
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import signal
-import time
 from pathlib import Path
 
 from genesis.guardian._subprocess import run_subprocess as _run_subprocess
 from genesis.guardian.health_signals import parse_psi_content
+from genesis.util.proc_io import rank_by_io_rate, read_proc_io
 
 logger = logging.getLogger(__name__)
 
@@ -158,39 +157,8 @@ def list_container_pids(container: str) -> list[int]:
         return []
 
 
-def _read_proc_io(pid: int) -> dict | None:
-    """Read /proc/PID/io and /proc/PID/comm for a single PID.
-
-    Returns a dict with read_bytes, write_bytes, total_bytes, comm,
-    or None if the PID is gone or unreadable.
-    """
-    try:
-        io_path = Path(f"/proc/{pid}/io")
-        if not io_path.exists():
-            return None
-
-        io_content = io_path.read_text()
-        read_bytes = 0
-        write_bytes = 0
-        for line in io_content.splitlines():
-            if line.startswith("read_bytes:"):
-                read_bytes = int(line.split(":")[1].strip())
-            elif line.startswith("write_bytes:"):
-                write_bytes = int(line.split(":")[1].strip())
-
-        comm = "unknown"
-        with contextlib.suppress(OSError):
-            comm = Path(f"/proc/{pid}/comm").read_text().strip()
-
-        return {
-            "pid": pid,
-            "read_bytes": read_bytes,
-            "write_bytes": write_bytes,
-            "total_bytes": read_bytes + write_bytes,
-            "comm": comm,
-        }
-    except (OSError, ValueError):
-        return None
+# Shared with the container watchdog; one sampler for both callers.
+_read_proc_io = read_proc_io
 
 
 def find_top_io_pids(container: str, top_n: int = 5) -> list[dict]:
@@ -235,40 +203,8 @@ def find_top_io_pids_rate(
     pids = list_container_pids(container)
     if not pids:
         return []
-
-    # First sample
-    t0: dict[int, dict] = {}
-    for pid in pids:
-        data = _read_proc_io(pid)
-        if data:
-            t0[pid] = data
-
-    if not t0:
-        return []
-
-    time.sleep(sample_interval_s)
-
-    # Second sample + delta
-    rates: list[dict] = []
-    for pid, before in t0.items():
-        after = _read_proc_io(pid)
-        if after is None:
-            continue  # PID disappeared between samples
-        delta_read = max(0, after["read_bytes"] - before["read_bytes"])
-        delta_write = max(0, after["write_bytes"] - before["write_bytes"])
-        delta_total = delta_read + delta_write
-        rates.append({
-            "pid": pid,
-            "comm": after["comm"],
-            "read_rate": delta_read / sample_interval_s,
-            "write_rate": delta_write / sample_interval_s,
-            "total_rate": delta_total / sample_interval_s,
-            "read_bytes_cumulative": after["read_bytes"],
-            "write_bytes_cumulative": after["write_bytes"],
-        })
-
-    rates.sort(key=lambda x: x["total_rate"], reverse=True)
-    return rates[:top_n]
+    rates, _readable, _total = rank_by_io_rate(pids, top_n, sample_interval_s)
+    return rates
 
 
 async def kill_pid(
