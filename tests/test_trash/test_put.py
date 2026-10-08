@@ -7,6 +7,8 @@ module: a name imported before the fixture runs is the REAL path.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -70,13 +72,13 @@ def test_the_live_database_is_never_trashed(which):
         mp = pytest.MonkeyPatch()
         mp.setattr(env, "genesis_db_path", lambda: inner)
         try:
-            with pytest.raises(TrashRefused, match="live Genesis database"):
+            with pytest.raises(TrashRefused, match="default Genesis database"):
                 trash(holder, reason="r", caller="c")
         finally:
             mp.undo()
         assert inner.exists()
         return
-    with pytest.raises(TrashRefused, match="live Genesis database"):
+    with pytest.raises(TrashRefused, match="default Genesis database"):
         trash(target, reason="r", caller="c")
     assert target.exists()
 
@@ -102,7 +104,7 @@ def test_a_symlink_at_the_configured_path_is_refused(tmp_path, monkeypatch):
     link.parent.mkdir()
     link.symlink_to(real)
     monkeypatch.setattr(env, "genesis_db_path", lambda: link)
-    with pytest.raises(TrashRefused, match="live Genesis database"):
+    with pytest.raises(TrashRefused, match="default Genesis database"):
         trash(link, reason="r", caller="c")
     assert link.is_symlink()
 
@@ -115,9 +117,49 @@ def test_an_empty_reason_is_a_usage_error(tmp_path):
     assert a.exists()
 
 
-# The server reads secrets.env (systemd EnvironmentFile, then load_dotenv with
-# override) and runs from the repository root; this CLI sees neither, so every
-# reading of GENESIS_DB_PATH is protected.
+# The server's database path comes from secrets.env, read by systemd and again by
+# dotenv, so it is not re-derived here. The hazard itself is checked instead: a
+# path some running process is using. Holders run in a SEPARATE process, as the
+# server does, so a scan of only this process would fail these tests.
+
+_HOLD = {
+    "open": "f = open(sys.argv[1], 'rb')",
+    # libc mmap, then close the descriptor: Python's mmap module keeps a dup of
+    # it, which would make this an "open" holder. The vector store maps its
+    # segments with no descriptor behind them, and that is the shape tested.
+    "map": (
+        "import ctypes, os\n"
+        "libc = ctypes.CDLL(None, use_errno=True)\n"
+        "libc.mmap.restype = ctypes.c_void_p\n"
+        "libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,"
+        " ctypes.c_int, ctypes.c_int, ctypes.c_long]\n"
+        "fd = os.open(sys.argv[1], os.O_RDONLY)\n"
+        "addr = libc.mmap(None, os.fstat(fd).st_size, 1, 1, fd, 0)\n"  # PROT_READ, MAP_SHARED
+        "assert addr not in (None, ctypes.c_void_p(-1).value)\n"
+        "os.close(fd)"
+    ),
+    "cwd": "import os; os.chdir(sys.argv[1])",
+}
+
+
+@pytest.fixture
+def held():
+    """Start a process that uses a path (open, mapped, or as its cwd) until the test ends."""
+    procs = []
+
+    def hold(how, path):
+        code = f"import sys, time\n{_HOLD[how]}\nprint('ready', flush=True)\ntime.sleep(120)"
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code, str(path)], stdout=subprocess.PIPE, text=True
+        )
+        procs.append(proc)
+        assert proc.stdout.readline().strip() == "ready"
+        return proc.pid
+
+    yield hold
+    for proc in procs:
+        proc.kill()
+        proc.wait()
 
 
 @pytest.fixture
@@ -125,65 +167,87 @@ def repo(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
     monkeypatch.setattr(env, "repo_root", lambda: root)
-    monkeypatch.setattr(env, "secrets_path", lambda: root / "secrets.env")
-    monkeypatch.delenv("GENESIS_DB_PATH", raising=False)
     return root
 
 
-@pytest.mark.parametrize("quote", ["", '"', "'"])
-def test_a_database_set_only_in_secrets_env_is_refused(tmp_path, repo, quote):
+@pytest.mark.parametrize(("how", "says"), [("open", "open"), ("map", "memory-mapped")])
+def test_a_file_another_process_uses_is_refused(tmp_path, held, how, says):
     live = _touch(tmp_path / "elsewhere" / "live.db", "db")
-    (repo / "secrets.env").write_text(f"API_KEY=x\nexport GENESIS_DB_PATH={quote}{live}{quote}\n")
-    with pytest.raises(TrashRefused, match="live Genesis database"):
+    pid = held(how, live)
+    with pytest.raises(TrashRefused, match=rf"process {pid} has it \(or a file under it\) {says}"):
         trash(live, reason="r", caller="c")
     assert live.read_text() == "db"
 
 
-def test_an_inline_comment_after_the_value_is_not_part_of_the_path(tmp_path, repo):
-    live = _touch(tmp_path / "elsewhere" / "live.db", "db")
-    (repo / "secrets.env").write_text(f"GENESIS_DB_PATH={live} # moved off the root disk\n")
-    with pytest.raises(TrashRefused, match="live Genesis database"):
-        trash(live, reason="r", caller="c")
+@pytest.mark.parametrize("how", ["open", "map", "cwd"])
+def test_a_directory_another_process_uses_is_refused(tmp_path, held, how):
+    store = tmp_path / "store"
+    live = _touch(store / "sub" / "live.db", "db")
+    pid = held(how, store / "sub" if how == "cwd" else live)
+    with pytest.raises(TrashRefused, match=rf"process {pid} "):
+        trash(store, reason="r", caller="c")
     assert live.exists()
+    assert list_entries() == []  # the refused attempt left no entry behind
 
 
-def test_a_relative_value_is_protected_from_the_repository_root(tmp_path, repo, monkeypatch):
-    live = _touch(repo / "data" / "other.db", "db")
-    (repo / "secrets.env").write_text("GENESIS_DB_PATH=data/other.db\n")
-    monkeypatch.chdir(tmp_path)  # the caller is not where the server runs
-    with pytest.raises(TrashRefused, match="live Genesis database"):
-        trash(live, reason="r", caller="c")
-    assert live.exists()
+def test_a_sibling_with_the_same_prefix_is_not_a_holder(tmp_path, held):
+    _touch(tmp_path / "store2" / "live.db", "db")
+    held("open", tmp_path / "store2" / "live.db")
+    item = _touch(tmp_path / "store" / "notes.txt")
+    trash(item.parent, reason="r", caller="c")
+    assert not item.parent.exists()
 
 
-def test_a_relative_environment_value_is_protected_from_the_repository_root(
-    tmp_path, repo, monkeypatch
-):
-    live = _touch(repo / "data" / "env.db", "db")
-    monkeypatch.setenv("GENESIS_DB_PATH", "data/env.db")
-    monkeypatch.chdir(tmp_path)
-    with pytest.raises(TrashRefused, match="live Genesis database"):
-        trash(live, reason="r", caller="c")
-    assert live.exists()
+def test_a_deleted_open_file_does_not_hold_its_directory(tmp_path, held):
+    store = tmp_path / "store"
+    gone = _touch(store / "gone.log")
+    held("open", gone)
+    gone.unlink()
+    trash(store, reason="r", caller="c")
+    assert not store.exists()
+
+
+def test_the_same_file_is_trashed_once_nothing_holds_it(tmp_path):
+    item = _touch(tmp_path / "elsewhere" / "done.db", "db")
+    code = f"import sys, time\n{_HOLD['open']}\nprint('ready', flush=True)\ntime.sleep(120)"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code, str(item)], stdout=subprocess.PIPE, text=True
+    )
+    assert proc.stdout.readline().strip() == "ready"
+    with pytest.raises(TrashRefused, match="has it .* open"):
+        trash(item, reason="r", caller="c")
+    proc.kill()
+    proc.wait()
+    trash(item, reason="r", caller="c")
+    assert not item.exists()
+
+
+def test_a_symlink_to_an_open_file_is_trashable(tmp_path, held):
+    """Moving a link leaves what it points at in place, and the holder still has it.
+    (A later opener that goes through the link path would find nothing there; the
+    configured database's path is refused statically, see the symlink test above.)"""
+    live = _touch(tmp_path / "real.db", "db")
+    link = tmp_path / "links" / "db.lnk"
+    link.parent.mkdir()
+    link.symlink_to(live)
+    held("open", live)
+    trash(link, reason="r", caller="c")
+    assert live.exists() and not link.is_symlink()
 
 
 def test_the_default_location_stays_protected_when_another_is_configured(repo):
     default = _touch(repo / "data" / "genesis.db", "db")
-    with pytest.raises(TrashRefused, match="live Genesis database"):
+    with pytest.raises(TrashRefused, match="default Genesis database"):
         trash(default, reason="r", caller="c")
     assert default.exists()
 
 
-def test_an_unresolvable_database_path_refuses_instead_of_crashing(tmp_path, repo, monkeypatch):
-    monkeypatch.setenv("GENESIS_DB_PATH", "~no-such-user-genesis-test/db")
+def test_an_unresolvable_database_path_refuses_instead_of_crashing(tmp_path, monkeypatch):
+    def unresolvable():
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(env, "genesis_db_path", unresolvable)
     item = _touch(tmp_path / "plain.txt")
-    with pytest.raises(TrashRefused, match="live Genesis database"):
+    with pytest.raises(TrashRefused, match="could not be determined"):
         trash(item, reason="r", caller="c")
     assert item.exists()
-
-
-def test_an_unrelated_file_is_still_trashed_with_a_secrets_value(tmp_path, repo):
-    (repo / "secrets.env").write_text(f"GENESIS_DB_PATH={tmp_path / 'live.db'}\n")
-    item = _touch(tmp_path / "notes.txt")
-    trash(item, reason="r", caller="c")
-    assert not item.exists()

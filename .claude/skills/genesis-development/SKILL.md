@@ -3670,7 +3670,8 @@ Verify before any commit:
   Unlike `rm -f`, a missing path is a refusal (exit 1); a path starting with
   `-` goes after `--`. The trash makes a deletion recoverable; it does not
   replace asking the user first where deleting their data needs their OK.
-  When `put` refuses (another volume, the live database), ask the user; do
+  When `put` refuses (another volume, the database, a file a running process
+  is using), ask the user; do
   not fall back to `rm`. Guide: `docs/reference/trash.md`.
 - **Commit continuously**: after every logical unit of work. Uncommitted = lost.
 - **PR closes a ledger item → cite `Ledger: <item-id>` in the PR body** (the

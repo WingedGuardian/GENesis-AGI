@@ -54,12 +54,10 @@ Exit codes: 0 done, 1 refused (the reason is printed), 64 usage error.
 
 `genesis.trash` leaves the item untouched and raises `TrashRefused` when the
 item is missing or unreadable, `''`/`.`/`..`, a mount point, `$HOME` or a parent
-of it, a parent of the trash itself, already in the trash, any place the live
-Genesis database may be (the default `data/genesis.db` and every reading of
-`GENESIS_DB_PATH`: this process's, the one in `secrets.env` that the server
-loads, and a relative value taken from the repository root where the server
-runs; with its `-wal`/`-shm`/`-journal` and any directory holding it, because
-moving it away would split it), on the Claude Code temp volume
+of it, a parent of the trash itself, already in the trash, in use by a running
+process (a file it has open or memory-mapped, or its working directory; or a
+directory holding one), the configured or default database (`data/genesis.db`)
+with its `-wal`/`-shm`/`-journal` and any directory holding it, on the Claude Code temp volume
 (`~/.genesis/cc-tmp`, which has its own retention), or on another
 volume than the trash. It never falls back to copying. "Another volume" is
 caught twice: a different device number (another disk, a btrfs subvolume), and
@@ -67,6 +65,22 @@ the kernel's own refusal to rename across mount points (a bind mount, an
 overlay's lower layer). The refusal says to ask the user before deleting the
 item any other way. A trash directory that is a symlink, owned by another
 user, or not mode 0700 is refused too.
+
+Renaming something a process is using splits it: the process keeps writing to
+the moved copy, and whoever opens the old path next gets a new, empty one. For
+the database that loses every later write. So "in use" is asked of the running
+processes themselves (Linux `/proc`, just before the rename), rather than
+predicted from configuration: the server reads its database path from
+`secrets.env`, through systemd and again through dotenv, which a separate
+command cannot reproduce. Processes this user cannot inspect (another user's,
+or one marked non-dumpable) are not seen, and neither is one that starts using
+the item after the check. The configured-path check covers the database while
+nothing has it open, but only as this command reads its own configuration: with
+every Genesis process stopped and the path set only in `secrets.env`, `put`
+would move the database. It would then sit in the trash, the server would start
+on a new empty one, and `restore` would refuse until that new file is moved
+aside. A task-worktree reset (below) refuses a leftover directory a process is
+still using for the same reason.
 
 The trash used to be planned per volume (a trash on each mount, after
 `send2trash`). It was narrowed to one trash because every caller lives on the

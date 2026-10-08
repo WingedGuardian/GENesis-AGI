@@ -21,7 +21,6 @@ import contextlib
 import errno
 import json
 import os
-import re
 import stat
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -155,53 +154,74 @@ def _claim_entry(root: Path, name: str) -> Path:
     raise TrashRefused(f"no free entry name under {root}")
 
 
-_DB_PATH_LINE = re.compile(r"^\s*(?:export\s+)?GENESIS_DB_PATH\s*=\s*(.*?)\s*$")
+def _holder_of(item: Path) -> tuple[int, str] | None:
+    """A running process using ``item`` or something under it, as (pid, how).
 
+    This is the real hazard for a database: renaming a file a process is using
+    splits it, because the process keeps writing to the moved file while a new
+    empty one appears at the old path. Asking the processes is exact, where
+    predicting the server's database path from its configuration is not: that
+    path comes from ``secrets.env`` read by systemd and again by dotenv, possibly
+    through a chained ``SECRETS_PATH``, and each re-implementation of those
+    grammars missed a case.
 
-def _secrets_db_values(path: Path) -> list[str]:
-    """``GENESIS_DB_PATH`` values set in ``secrets.env`` (quotes stripped)."""
-    if not path.is_file():
-        return []
-    values = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        match = _DB_PATH_LINE.match(line)
-        if match and match.group(1):
-            value = match.group(1)
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-                values.append(value[1:-1])
-                continue
-            values.append(value)
-            if " #" in value:  # the server's dotenv drops an inline comment here
-                values.append(value.split(" #", 1)[0].rstrip())
-    return values
+    Three ways a process uses a path, all read from Linux ``/proc``: an open
+    descriptor (MEASURED: the server's ``genesis.db``, ``-wal`` and ``-shm`` show
+    from a separate process), a memory map with no descriptor behind it
+    (MEASURED: the vector store maps 900+ segment files and holds none of them
+    open), and a working directory (a live session in a worktree). A process this
+    user cannot inspect (another user's, or one marked non-dumpable) is skipped;
+    a deleted file is ignored, since moving its directory cannot touch it; a
+    process that starts using the item after the scan is not seen. A full scan
+    of about 300 processes measured about 150ms."""
+    here = str(item)
+
+    def inside(target: str) -> bool:
+        if target.endswith(" (deleted)"):
+            return False
+        return target == here or target.startswith(here + "/")
+
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return None  # no /proc: only the configured-path check applies
+    for pid in pids:
+        base = f"/proc/{pid}"
+        with contextlib.suppress(OSError):
+            if inside(os.readlink(f"{base}/cwd")):
+                return int(pid), "has it (or a directory under it) as its working directory"
+        try:
+            fds = os.listdir(f"{base}/fd")
+        except OSError:
+            continue  # gone, or a process this user cannot inspect
+        for fd in fds:
+            with contextlib.suppress(OSError):
+                if inside(os.readlink(f"{base}/fd/{fd}")):
+                    return int(pid), "has it (or a file under it) open"
+        with (
+            contextlib.suppress(OSError),
+            open(f"{base}/maps", encoding="utf-8", errors="replace") as maps,
+        ):
+            for line in maps:
+                fields = line.rstrip("\n").split(None, 5)
+                if len(fields) == 6 and inside(fields[5]):
+                    return int(pid), "has it (or a file under it) memory-mapped"
+    return None
 
 
 def _database_paths() -> set[Path]:
-    """Every path the server's database could be at, as absolute and resolved forms.
+    """The configured database path and the default one, absolute and resolved.
 
-    This CLI does not see the server's environment: the server reads
-    ``secrets.env`` (systemd ``EnvironmentFile``, then ``load_dotenv`` with
-    override) and runs from the repository root, so a ``GENESIS_DB_PATH`` set only
-    in that file, or a relative one, would point somewhere else from here. So
-    every reading is protected: this process's own, the default under the
-    repository, and each ``secrets.env`` or environment value taken both relative
-    to the repository root and as given."""
-    root = _env.repo_root()  # through the module, so tests can isolate it
-    paths = {_env.genesis_db_path(), root / "data" / "genesis.db"}
-    values = _secrets_db_values(_env.secrets_path())
-    if os.environ.get("GENESIS_DB_PATH"):
-        values.append(os.environ["GENESIS_DB_PATH"])
-    for value in values:
-        path = Path(value).expanduser()
-        paths.update({path, path if path.is_absolute() else root / path})
+    A static check for when the server is not running (nothing holds the file
+    open). It reads only this process's configuration; see ``_holder_of`` for
+    why the server's own reading is not re-derived here."""
+    paths = {_env.genesis_db_path(), _env.repo_root() / "data" / "genesis.db"}
     return {form for p in paths for form in (p.absolute(), p.resolve())}
 
 
 def _is_live_database(item: Path) -> bool:
-    """A possible location of the server's database (see ``_database_paths``), a
-    sidecar of one, or a directory holding one. Renaming a live database away
-    splits it: the server keeps writing to the moved file and a new empty one
-    appears at the old path."""
+    """The configured or default database, a sidecar of one, or a directory
+    holding one (see ``_database_paths``)."""
     try:
         targets = _database_paths()
     except (OSError, RuntimeError, ValueError):
@@ -256,8 +276,8 @@ def trash(path: str | os.PathLike[str], *, reason: str, caller: str) -> Tombston
         raise TrashRefused(f"{item} is already in the trash")
     if _is_live_database(item):
         raise TrashRefused(
-            f"{item} is, or holds, a place the live Genesis database may be "
-            "(it could not be ruled out); moving it would split the database"
+            f"{item} is, or holds, the configured or default Genesis database (or "
+            "its location could not be determined); moving it would split the database"
         )
     if _within(item, (genesis_home() / "cc-tmp").resolve()):
         raise TrashRefused(f"{item} is on the Claude Code temp volume, which has its own retention")
@@ -284,18 +304,35 @@ def trash(path: str | os.PathLike[str], *, reason: str, caller: str) -> Tombston
         session_id=os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("GENESIS_SESSION_ID"),
         trashed_at=datetime.now(UTC).isoformat(timespec="seconds"),
     )
+    holder = None
     try:
         atomic_write_text(entry / TOMBSTONE, json.dumps(asdict(stone), indent=2) + "\n")
-        os.rename(item, entry / ITEM)
+        # As late as possible, so the window before the rename is small; a
+        # process that starts using the item after this scan is not seen.
+        holder = _holder_of(item)
+        if holder is None:
+            os.rename(item, entry / ITEM)
     except OSError as exc:
-        with contextlib.suppress(OSError):
-            os.unlink(entry / TOMBSTONE)
-        with contextlib.suppress(OSError):
-            os.rmdir(entry)
+        _drop_entry(entry)
         if exc.errno == errno.EXDEV:  # a bind mount or overlay: same device, other mount
             raise TrashRefused(_ANOTHER_VOLUME.format(item=item, root=root)) from None
         raise TrashRefused(f"could not move {item} into the trash: {exc.strerror}") from None
+    if holder is not None:
+        _drop_entry(entry)
+        pid, how = holder
+        raise TrashRefused(
+            f"{item} is in use: process {pid} {how}; moving it "
+            "could split it (a database most of all). Stop that process first, or "
+            "ask the user"
+        )
     return stone
+
+
+def _drop_entry(entry: Path) -> None:
+    with contextlib.suppress(OSError):
+        os.unlink(entry / TOMBSTONE)
+    with contextlib.suppress(OSError):
+        os.rmdir(entry)
 
 
 def _load(entry: Path) -> Tombstone | None:
