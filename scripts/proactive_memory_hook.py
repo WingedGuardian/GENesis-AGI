@@ -45,6 +45,7 @@ from hook_deadline import (  # noqa: E402
     arm_from_spawn,
     disarm,
     process_age_s,
+    written_units,
 )
 
 # The process-level hard stop (hook_deadline.py), armed as early as possible
@@ -159,14 +160,19 @@ _MAX_PEERS_SHOWN = 12
 #: writes after a cut), so the announcement has to be a closing line, which is
 #: what _announce_cut is.
 #:
-#: 224 = the MEASURED widest rendering of that line (202 units: the longest
+#: Since #3096 the reserve holds TWO closing lines: the cut notice and the
+#: out-of-time notice (`_out_of_time_notice`), which can both close one run (a
+#: deferred flush can cut, and the same finally then owes the notice).
+#:
+#: 224 = the MEASURED widest rendering of the cut line (202 units: the longest
 #: block label this hook uses, `concurrent-directive`, plus a 7-digit dropped
-#: count) with headroom. The first value here was 160, picked by eyeballing the
+#: count) with headroom; the out-of-time line's widest rendering (a two-digit
+#: startup age) is added to it below. The first value here was 160, picked by eyeballing the
 #: template, and the test below caught it — which is the whole reason the number
 #: is asserted against a rendering instead of argued for in a comment. 2.3% of
 #: the budget, spent so the full notice fits rather than degrading to the terse
 #: fallback every time.
-_CUT_NOTICE_RESERVE = 224
+_CUT_NOTICE_RESERVE = 224 + 180
 
 _OUT: BoundedStdout | None = None
 
@@ -2075,6 +2081,10 @@ def _out_of_time_notice(process_age_s: float) -> str:
     )
 
 
+#: The out-of-time notice's short form, emitted whole when the full one does not fit.
+_OUT_OF_TIME_SHORT = "[Memory: out of time; recall may be missing this turn]"
+
+
 def _hard_stop_notice() -> str | None:
     """The line the hard stop adds, or None. Runs on the timer thread: no imports.
 
@@ -2082,9 +2092,12 @@ def _hard_stop_notice() -> str | None:
     model has what the run produced). Clipped so stdout stays under the cap the
     harness enforces: the notice, a leading and a trailing newline.
     """
-    if _FLUSHED or _RECALL_LANDED:
+    if _FLUSHED or _RECALL_LANDED or _HOOK_MODE == "off":
         return None
-    room = HOOK_STDOUT_CAP - (_OUT.emitted_chars if _OUT is not None else 0) - 3
+    # The timer holds STDOUT_LOCK while this runs, so written_units() counts
+    # every unit that reached the stream; the writer's own counter can lag a
+    # write by the length of one print().
+    room = HOOK_STDOUT_CAP - written_units() - 3
     if room <= 0:
         return None
     return clip_to_cost(_out_of_time_notice(_PROCESS_AGE), room)
@@ -2136,13 +2149,18 @@ async def _run(prompt: str, session_id: str = "", *, process_age_s: float = 0.0)
         # paths) flushes first, so an expired deadline after that owes nothing.
         # Captured BEFORE the flush below, which would otherwise make it vacuous.
         owed = (
-            not _FLUSHED
+            _HOOK_MODE != "off"  # recall was silenced on purpose: nothing went missing
+            and not _FLUSHED
             and not _RECALL_LANDED
             and (timed_out or _deadline_expired(deadline))
         )
         _flush_deferred()
         if owed:
-            _writer().emit(_out_of_time_notice(process_age_s), block="recall-timeout")
+            # A closing line, like the cut notice: it spends the reserve, so a
+            # flush that used up the budget cannot clip or drop it.
+            _writer().emit_final(
+                _out_of_time_notice(process_age_s), fallback=_OUT_OF_TIME_SHORT
+            )
 
 
 async def _run_body(

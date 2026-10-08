@@ -240,3 +240,56 @@ def test_a_full_stdout_pipe_cannot_hang_the_stop() -> None:
         pytest.fail("the hard stop hung on a full stdout pipe")
     proc.communicate()
     assert rc == 0
+
+
+def test_a_disarm_while_waiting_for_the_lock_stands_down(
+    fake_os: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GLM #3096: disarm() lands while the callback waits for the lock: no exit."""
+    real = hd.STDOUT_LOCK
+    waiting = threading.Event()
+
+    class _ObservedLock:
+        """The real lock, plus a signal when the callback starts waiting on it."""
+
+        def acquire(self, *a, **k):
+            waiting.set()
+            return real.acquire(*a, **k)
+
+        def release(self) -> None:
+            real.release()
+
+        def locked(self) -> bool:
+            return real.locked()
+
+    monkeypatch.setattr(hd, "STDOUT_LOCK", _ObservedLock())
+    real.acquire()
+    result: list[object] = []
+
+    def _run() -> None:
+        try:
+            hd._fire(5.0, "lbl", lambda: "NOTE")
+            result.append("returned")
+        except BaseException as exc:  # noqa: BLE001 - captured for the assert
+            result.append(exc)
+
+    t = threading.Thread(target=_run)
+    t.start()
+    assert waiting.wait(5)  # past the first _DONE check, now inside acquire()
+    hd._DONE.set()  # disarm lands while it waits
+    real.release()
+    t.join(5)
+    assert result == ["returned"]
+    assert "exit" not in fake_os
+    assert fake_os["writes"] == []
+    assert not real.locked()
+
+
+def test_locked_stdout_counts_utf16_units(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    monkeypatch.setattr(hd, "_WRITTEN_UNITS", 0)
+    out = hd.LockedStdout()
+    out.write("ab")
+    out.write("\U0001F600")  # one astral character = 2 UTF-16 units
+    out.write("\n")
+    assert hd.written_units() == 5
+    capsys.readouterr()

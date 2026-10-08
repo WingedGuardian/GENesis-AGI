@@ -100,11 +100,15 @@ stalled for 30 s: the branch hook exited at 8.53 s with the notice and the
 blocked frame (`session_heartbeats.upsert_sync`); main's copy was still blocked
 at 60 s.
 
-**The notice** (`block="recall-timeout"`): `[Memory: the hook ran out of its 8s
-budget …; use memory_recall if prior context matters]`. Printed only when the
-run had not yet reached its own output decision and no recall line had landed,
-so off mode, short prompts, a disabled server and zero-hit answers never print
-it.
+**The notice**: `[Memory: the hook ran out of its 8s budget …; use
+memory_recall if prior context matters]`, a closing line that spends the
+writer's reserve (like the cut notice), so a large flush cannot clip it away.
+Printed only when the run ran out of time before reaching its own output
+decision and no recall line had landed. A run that reached its decision
+(a short prompt, a disabled server, a zero-hit answer) never prints it, however
+late it ends; off mode never prints it at all. A run that started already past
+its budget does print it even for a prompt that would not have recalled
+anything, because it stopped before it could tell.
 
 **What neither layer bounds.** A thread in uninterruptible disk sleep (an
 fsync) delays the process exit until that I/O returns; the hook's own SQLite

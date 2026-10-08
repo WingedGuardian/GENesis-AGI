@@ -683,7 +683,6 @@ def test_the_cut_notice_fits_the_reserve_it_declares() -> None:
             "code-hints",
             "degraded-recall",
             "session-metadata",
-            "recall-timeout",
         ],
         key=len,
     )
@@ -703,6 +702,14 @@ def test_the_cut_notice_fits_the_reserve_it_declares() -> None:
     assert emit_cost(notice) + 1 <= pmh._CUT_NOTICE_RESERVE, (
         f"the notice renders {emit_cost(notice) + 1} units but only "
         f"{pmh._CUT_NOTICE_RESERVE} are reserved — raise _CUT_NOTICE_RESERVE"
+    )
+
+    # Since #3096 the reserve also holds the out-of-time notice: both closing
+    # lines can end one run. Widest rendering: a two-digit startup age.
+    timeout_notice = pmh._out_of_time_notice(99.9)
+    assert emit_cost(notice) + 1 + emit_cost(timeout_notice) + 1 <= pmh._CUT_NOTICE_RESERVE, (
+        f"cut + out-of-time notices render {emit_cost(notice) + emit_cost(timeout_notice) + 2} "
+        f"units but only {pmh._CUT_NOTICE_RESERVE} are reserved"
     )
 
 

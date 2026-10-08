@@ -30,6 +30,10 @@ class _RecordingWriter:
         """Record one emitted line and its output block."""
         self.lines.append((text, block))
 
+    def emit_final(self, text: str, fallback: str | None = None) -> None:
+        """Record a closing line (the out-of-time notice is one)."""
+        self.lines.append((text, "final"))
+
 
 @pytest.mark.asyncio
 async def test_run_flushes_deferred_lines_when_recall_exceeds_total_budget(
@@ -71,7 +75,7 @@ async def test_run_flushes_deferred_lines_when_recall_exceeds_total_budget(
     assert elapsed < 0.2, "the aggregate deadline did not stop the slow recall"
     assert writer.lines == [
         ("[Session trail] deferred", "session-metadata"),
-        (hook._out_of_time_notice(0.0), "recall-timeout"),
+        (hook._out_of_time_notice(0.0), "final"),
     ]
     assert (tmp_path / ".genesis" / ".knowledge_retrieved_count_migrated").exists()
 
@@ -125,7 +129,7 @@ async def test_local_mode_stops_after_blocking_sync_phase_exhausts_deadline(
     assert code_calls == []
     assert writer.lines == [
         ("[Session trail] deferred", "session-metadata"),
-        (hook._out_of_time_notice(0.0), "recall-timeout"),
+        (hook._out_of_time_notice(0.0), "final"),
     ]
     assert not (tmp_path / ".genesis" / ".knowledge_retrieved_count_migrated").exists()
 
@@ -274,7 +278,7 @@ async def test_time_spent_before_run_shrinks_the_budget(
     elapsed = time.monotonic() - started
 
     assert elapsed < 0.4, f"the run kept a budget it no longer had ({elapsed:.2f}s)"
-    assert writer.lines == [(hook._out_of_time_notice(age), "recall-timeout")]
+    assert writer.lines == [(hook._out_of_time_notice(age), "final")]
 
 
 @pytest.mark.asyncio
@@ -488,11 +492,10 @@ def test_hard_stop_notice_is_owed_only_before_output_is_final(
 ) -> None:
     from hook_output import HOOK_STDOUT_CAP
 
-    class _Out:
-        emitted_chars = 0
-
-    monkeypatch.setattr(hook, "_OUT", _Out())
+    written = {"units": 0}
+    monkeypatch.setattr(hook, "written_units", lambda: written["units"])
     monkeypatch.setattr(hook, "_PROCESS_AGE", 0.0)
+    monkeypatch.setattr(hook, "_HOOK_MODE", "server")
     monkeypatch.setattr(hook, "_FLUSHED", False)
     monkeypatch.setattr(hook, "_RECALL_LANDED", False)
     assert hook._hard_stop_notice() == hook._out_of_time_notice(0.0)
@@ -503,11 +506,15 @@ def test_hard_stop_notice_is_owed_only_before_output_is_final(
     monkeypatch.setattr(hook, "_RECALL_LANDED", True)
     assert hook._hard_stop_notice() is None  # recall already reached the model
     monkeypatch.setattr(hook, "_RECALL_LANDED", False)
+    monkeypatch.setattr(hook, "_HOOK_MODE", "off")
+    assert hook._hard_stop_notice() is None  # recall silenced on purpose
+    monkeypatch.setattr(hook, "_HOOK_MODE", "server")
 
-    _Out.emitted_chars = HOOK_STDOUT_CAP - 3 - 20
+    # The room comes from the units actually written under the lock.
+    written["units"] = HOOK_STDOUT_CAP - 3 - 20
     clipped = hook._hard_stop_notice()
     assert clipped is not None and len(clipped) <= 20  # stays under the harness cap
-    _Out.emitted_chars = HOOK_STDOUT_CAP
+    written["units"] = HOOK_STDOUT_CAP
     assert hook._hard_stop_notice() is None
 
 
@@ -546,7 +553,7 @@ async def test_a_run_that_started_past_its_budget_says_so(
     monkeypatch.setattr(hook, "_extract_keywords", lambda *_a, **_k: [])
     age = hook._RUN_DEADLINE_S + 1
     await hook._run("ok", session_id="late", process_age_s=age)
-    assert writer.lines == [(hook._out_of_time_notice(age), "recall-timeout")]
+    assert writer.lines == [(hook._out_of_time_notice(age), "final")]
 
 
 @pytest.mark.asyncio
@@ -572,7 +579,7 @@ async def test_an_answer_that_arrived_late_is_still_printed(
         process_age_s=hook._RUN_DEADLINE_S - 0.05,
     )
     assert ("[Memory | id:abc] recalled", "server-recall") in writer.lines
-    assert all(block != "recall-timeout" for _t, block in writer.lines)
+    assert all(block != "final" for _t, block in writer.lines)
 
 
 def test_hook_connections_do_not_fsync_every_commit(tmp_path: Path) -> None:
@@ -642,4 +649,45 @@ async def test_landed_recall_owes_no_notice_even_when_the_run_dies_before_flushi
             process_age_s=hook._RUN_DEADLINE_S - 0.05,
         )
     assert ("[Memory | id:abc] recalled", "server-recall") in writer.lines
-    assert all(block != "recall-timeout" for _t, block in writer.lines)
+    assert all(block != "final" for _t, block in writer.lines)
+
+
+@pytest.mark.asyncio
+async def test_off_mode_never_prints_the_notice(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Off mode silences recall on purpose; telling the model to recall would be wrong."""
+    writer = _RecordingWriter()
+    _quiet_run_body(monkeypatch, tmp_path, writer)
+    monkeypatch.setattr(hook, "_HOOK_MODE", "off")
+    await hook._run("anything", session_id="off", process_age_s=hook._RUN_DEADLINE_S + 1)
+    assert all(block != "final" for _t, block in writer.lines)
+
+
+@pytest.mark.asyncio
+async def test_the_notice_survives_a_flush_that_used_up_the_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Codex #3096: a large deferred flush must not clip or drop the notice."""
+    import io
+
+    from hook_output import DEFAULT_BUDGET, BoundedStdout
+
+    buf = io.StringIO()
+    out = BoundedStdout(DEFAULT_BUDGET, label="proactive", reserve=hook._CUT_NOTICE_RESERVE, stream=buf)
+    _quiet_run_body(monkeypatch, tmp_path, out)
+    big = "t" * DEFAULT_BUDGET  # the trail alone exceeds the normal ceiling
+
+    monkeypatch.setattr(hook, "_update_and_format_trail", lambda *_a, **_k: big)
+
+    async def _slow_server(*_a, **_k):
+        await asyncio.sleep(0.5)
+        return None, "slow"
+
+    monkeypatch.setattr(hook, "_call_server", _slow_server)
+    await hook._run("why did recall stall", session_id="full", process_age_s=hook._RUN_DEADLINE_S - 0.05)
+    hook._announce_cut()
+    printed = buf.getvalue()
+    # BOTH closing lines land whole: the reserve holds the cut notice AND this one.
+    assert hook._out_of_time_notice(hook._RUN_DEADLINE_S - 0.05) in printed
+    assert "output was CUT at 'session-metadata'" in printed

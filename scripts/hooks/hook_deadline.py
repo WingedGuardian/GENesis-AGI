@@ -87,6 +87,16 @@ def process_age_s() -> float | None:
 
 _DONE = threading.Event()
 _LINE_OPEN = False  # the last write to stdout did not end with a newline
+#: UTF-16 code units written through LockedStdout, the unit the harness's
+#: stdout cap is measured in. Updated under STDOUT_LOCK in the same critical
+#: section as the write, so the timer, which reads it while holding the lock,
+#: always sees every byte that reached the stream.
+_WRITTEN_UNITS = 0
+
+
+def written_units() -> int:
+    """UTF-16 units written through ``LockedStdout`` so far. Call holding the lock."""
+    return _WRITTEN_UNITS
 
 
 class LockedStdout:
@@ -98,11 +108,12 @@ class LockedStdout:
 
     def write(self, text: str) -> int:
         """Write under the lock and record whether a line was left open."""
-        global _LINE_OPEN
+        global _LINE_OPEN, _WRITTEN_UNITS
         with STDOUT_LOCK:
             written = sys.stdout.write(text)
             if text:
                 _LINE_OPEN = not text.endswith("\n")
+                _WRITTEN_UNITS += len(text.encode("utf-16-le", "surrogatepass")) // 2
             return written
 
     def flush(self) -> None:
@@ -133,6 +144,12 @@ def _fire(seconds: float, label: str, notice: Callable[[], str | None]) -> None:
     if _DONE.is_set():
         return
     got = STDOUT_LOCK.acquire(timeout=0.2)
+    if _DONE.is_set():
+        # disarm() ran while this callback waited for the lock: the run finished
+        # on its own, so stand down instead of exiting a process that is done.
+        if got:
+            STDOUT_LOCK.release()
+        return
     try:
         for fd in (1, 2):
             with contextlib.suppress(OSError):
@@ -195,7 +212,9 @@ def disarm(timer: threading.Timer | None) -> None:
     """Stop the hard stop. Safe to call more than once, or with None.
 
     ``cancel()`` alone cannot stop a callback that has already started, so the
-    callback also checks ``_DONE`` first.
+    callback checks ``_DONE`` before and again after waiting for the lock. A
+    callback already past that second check still exits, writing only what
+    ``notice()`` returns for the state at that moment.
     """
     _DONE.set()
     if timer is not None:
