@@ -22,7 +22,11 @@ the command. It fires on ``rm``, ``unlink`` and ``shred`` when an operand is, or
   ``ambient_remote.yaml``;
 - wherever the path overrides Genesis honours point, when set in the hook's
   environment: ``GENESIS_PLANS_DIR``, ``GENESIS_OUTPUT_DIR``,
-  ``GENESIS_VOICE_TRANSCRIPT_DIR``, ``SECRETS_PATH``;
+  ``GENESIS_VOICE_TRANSCRIPT_DIR``, ``SECRETS_PATH`` (a relative value is read from
+  the repository root, ``GENESIS_REPO_ROOT`` or this checkout, as the services
+  resolve it from their working directory there);
+- a location above that is itself a symlink matches through either name: the
+  link's path and the directory it points to.
 - in any Genesis checkout (a directory holding ``src/genesis``), the gitignored
   files git cannot restore: ``src/genesis/identity/{USER,USER_KNOWLEDGE,
   TRIAGE_CALIBRATION,EGO_NOTEPAD}.md``, ``config/*.local.yaml``,
@@ -45,11 +49,19 @@ WHAT IT CANNOT SEE (it stays silent, never guesses)
   (removing the link loses nothing; ``shred`` and ``rm -r link/`` are judged by
   the target they reach), a directory without ``-r`` (the verbs refuse it), an
   empty operand, or past the work bounds (``_MAX_MATCHES``, ``_MAX_VISITS``,
-  ``_BUDGET_S``);
+  ``_BUDGET_S``), which also bound the one lookup the user-data set needs (whether
+  a directory being removed holds a ``projects/*/memory`` and the like);
+- a ``shred`` that deletes nothing: an unknown or ambiguous option, a value given
+  to a flag, or ``--help``/``--version`` (shred refuses, or prints and exits);
 - an operand holding ``$VAR`` or a backtick (only ``~``, ``$HOME`` and ``${HOME}``
   are expanded: the hook's environment is not the shell's);
 - a relative operand after a ``cd`` that is not bare (HOME) or one literal absolute
-  or ``~`` path, after any ``cd`` in a command with ``(`` grouping or a ``|`` pipe
+  or ``~`` path (a ``cd`` to a path that is not a directory when the hook runs is
+  read as failing, so the old directory stays: right for ``cd X; rm`` and
+  ``cd X || rm``, and for ``cd X && rm`` the note's "if this ran" holds; a
+  directory an earlier ``mkdir`` in the same command names counts as existing,
+  one made any other way, such as ``git clone``, reads as missing), after any ``cd`` in
+  a command with ``(`` grouping or a ``|`` pipe
   (not ``||``; a quoted ``|`` counts too) (the parser
   flattens subshells), or after any ``cd`` inside ``bash -c``; ``env -C`` and
   ``sudo -D`` directory changes are not seen at all;
@@ -98,7 +110,24 @@ _PIPE = re.compile(r"(?<!\|)\|(?!\|)")  # a pipe, not the || list operator
 # the long forms also accept --opt=VALUE, which is one word. rm and unlink take
 # no separate values.
 _SHRED_VALUE_SHORT = frozenset("ns")
-_SHRED_VALUE_LONG = frozenset({"--iterations", "--size", "--random-source"})
+_SHRED_SHORT = frozenset("fnsuvxz")  # coreutils 9.4 `shred --help`
+# Every long option shred accepts (coreutils 9.4 `shred --help`, read 2026-10-08),
+# mapped to whether it takes a REQUIRED value, which getopt then reads from the
+# next word. ``--remove[=HOW]``'s value is optional, so only ``=`` supplies it.
+# getopt_long also accepts any unambiguous prefix (``--random-sour``), matched here
+# against this closed table rather than by name.
+_SHRED_LONG = {
+    "--exact": False,
+    "--force": False,
+    "--help": False,
+    "--iterations": True,
+    "--random-source": True,
+    "--remove": False,
+    "--size": True,
+    "--verbose": False,
+    "--version": False,
+    "--zero": False,
+}
 # Override variables the Genesis path resolvers honour (src/genesis/env.py:
 # claude_home, plans_dir, output_dir, voice_transcript_dir, secrets_path).
 _PATH_OVERRIDES = (
@@ -182,7 +211,27 @@ def _canon(path: str) -> str:
     return os.path.join(os.path.realpath(parent or "."), name)
 
 
-def _home_targets() -> list[str]:
+def _repo_root() -> str:
+    """Where the services resolve a relative path override from: their working
+    directory, the repository root (``GENESIS_REPO_ROOT`` when set, else the
+    checkout holding this hook, which the launcher runs from the main checkout).
+    A RELATIVE ``GENESIS_REPO_ROOT`` is left as given, as ``env.repo_root()`` leaves
+    it, so a relative override under it matches nothing here."""
+    configured = os.environ.get("GENESIS_REPO_ROOT")
+    if configured:
+        return os.path.expanduser(configured)
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _target_patterns() -> list[tuple[str, ...]]:
+    """Every user-data location as path components, globs allowed (``projects/*``).
+
+    Patterns, never an enumeration: an operand is matched against them, so the
+    cost does not grow with how many projects or settings files exist. Each base
+    is taken under its own name and its resolved one, and a glob-free target also
+    as its resolved path, so a protected directory that is a symlink (an output
+    directory on another disk) matches whichever name the operand reaches it by.
+    """
     home = os.path.expanduser("~")
     claude_bases = {os.path.join(home, ".claude")}
     if os.environ.get("CLAUDE_HOME"):
@@ -190,15 +239,42 @@ def _home_targets() -> list[str]:
     ghome = os.path.expanduser(os.environ.get("GENESIS_HOME") or "~/.genesis")
     bases = [(base, _CLAUDE_TARGETS) for base in claude_bases]
     bases.append((ghome, _GENESIS_HOME_TARGETS))
-    found: list[str] = []
+    patterns: set[tuple[str, ...]] = set()
+
+    def literal(path: str) -> tuple[str, ...]:
+        return tuple(glob.escape(p) for p in _parts(os.path.normpath(path)))
+
     for base, rels in bases:
-        for rel in rels:
-            found.extend(_canon(p) for p in glob.glob(os.path.join(base, rel)))
+        for variant in {os.path.normpath(base), os.path.realpath(base)}:
+            for rel in rels:
+                patterns.add(literal(variant) + tuple(rel.split("/")))
+                if not any(ch in rel for ch in _GLOB_CHARS):
+                    patterns.add(literal(os.path.realpath(os.path.join(variant, rel))))
     for var in _PATH_OVERRIDES:
         value = os.path.expanduser(os.environ.get(var) or "")
-        if os.path.isabs(value) and os.path.lexists(value):
-            found.append(_canon(value))
-    return found
+        if not value:
+            continue
+        if not os.path.isabs(value):
+            value = os.path.join(_repo_root(), value)
+        patterns.add(literal(value))
+        patterns.add(literal(os.path.realpath(value)))
+    return sorted(patterns)
+
+
+def _component(name: str, pattern: str) -> bool:
+    """One path component against one pattern component, by the shell's rules: a
+    name with a leading dot matches only a pattern with one (a wildcard never
+    reaches it), as ``_existing`` lists."""
+    if name.startswith(".") and not pattern.startswith("."):
+        return False
+    return fnmatch.fnmatchcase(name, pattern)
+
+
+def _matches(parts: list[str], pattern: tuple[str, ...]) -> bool:
+    """``parts`` is the location ``pattern`` names, or lies inside it."""
+    return len(parts) >= len(pattern) and all(
+        _component(a, b) for a, b in zip(parts, pattern, strict=False)
+    )
 
 
 def _parts(path: str) -> list[str]:
@@ -322,22 +398,46 @@ def _existing(path: str, deadline: float) -> list[str]:
     return level
 
 
-def _hits(path: str, recursive: bool, targets: list[str]) -> bool:
+def _hits(
+    path: str,
+    recursive: bool,
+    patterns: list[tuple[str, ...]],
+    deadline: float,
+    given: str | None = None,
+) -> bool:
+    """``path`` is what the delete reaches; ``given`` is the operand as the command
+    spelled it, when that differs (a trailing-slash link is judged by its target)."""
     if os.path.islink(path):
         return False  # removing a link loses nothing; its target stays
     canon = _canon(path)
     is_dir = os.path.isdir(canon)
     if is_dir and not recursive:
         return False  # rm, unlink and shred refuse a directory without -r
-    if any(canon == t or canon.startswith(t + "/") for t in targets):
-        return True
     parts = _parts(canon)
+    # Both spellings: resolved (a protected directory reached through a link) and as
+    # given (a link at or below a wildcard component, such as projects/<p>, which no
+    # resolved-path pattern can name).
+    spellings = [parts]
+    as_given = _parts(os.path.normpath(given or path))
+    if as_given != parts:
+        spellings.append(as_given)
+    if any(_matches(sp, pattern) for sp in spellings for pattern in patterns):
+        return True
     if _checkout_file(parts):
         return True
     if is_dir:
-        prefix = canon.rstrip("/") + "/"
-        if any(t.startswith(prefix) for t in targets):
-            return True
+        # A user-data location BELOW this directory: look for it, under the same
+        # work bounds as an operand's glob (raises _OverBudget past them).
+        for sp in spellings:
+            n = len(sp)
+            base = glob.escape(os.path.join("/", *sp))
+            for pattern in patterns:
+                if (
+                    len(pattern) > n
+                    and _matches(sp, pattern[:n])
+                    and _existing(os.path.join(base, *pattern[n:]), deadline)
+                ):
+                    return True
         return _checkout_ancestor(parts)
     return False
 
@@ -358,13 +458,26 @@ def _advisory(command: str, cwd: str | None) -> str | None:
     grouped = "(" in command or bool(_PIPE.search(command))
     cwd0 = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
     seen_cd = inner_cd = False
-    targets: list[str] | None = None
+    made: set[str] = set()  # directories an earlier top-level mkdir names
+    patterns: list[tuple[str, ...]] | None = None
     named: list[str] = []
     deadline = time.monotonic() + _BUDGET_S
     for seg in segments:
+        if seg.exe == "mkdir" and seg.depth == 0:
+            for word in seg.argv[1:]:
+                made_path = _resolve(word, cwd0) if not word.startswith("-") else None
+                if made_path:
+                    made.add(made_path)
+            continue
         if seg.exe in ("cd", "pushd", "popd"):
             if seg.depth == 0:
-                cwd0 = _cd_target(seg.argv) if seg.exe != "popd" else None
+                new = _cd_target(seg.argv) if seg.exe != "popd" else None
+                # A cd to a path that is not a directory fails and the shell stays
+                # where it was: observed here, never inferred from the operators.
+                # One exception, read from operands not operators: a directory an
+                # earlier mkdir in this command names will exist by then.
+                if new is None or os.path.isdir(new) or new in made:
+                    cwd0 = new
                 seen_cd = True
             else:
                 inner_cd = True
@@ -393,9 +506,19 @@ def _advisory(command: str, cwd: str | None) -> str | None:
                 for found in found_paths:
                     if time.monotonic() > deadline:
                         return _note(named)
-                    if targets is None:
-                        targets = _home_targets()
-                    if _hits(os.path.realpath(found) if follow else found, recursive, targets):
+                    if patterns is None:
+                        patterns = _target_patterns()
+                    try:
+                        hit = _hits(
+                            os.path.realpath(found) if follow else found,
+                            recursive,
+                            patterns,
+                            deadline,
+                            given=found,
+                        )
+                    except _OverBudget:
+                        return _note(named)
+                    if hit:
                         if operand not in named:
                             named.append(operand)
                         break
@@ -414,10 +537,27 @@ def _shred_operands(argv: list[str]) -> list[str]:
             flags_done = True
             continue
         if not flags_done and tok.startswith("--") and len(tok) > 2:
-            take_value = tok in _SHRED_VALUE_LONG  # --opt=VALUE is a single word
+            name = tok.split("=", 1)[0]
+            matched = [o for o in _SHRED_LONG if o == name] or [
+                o for o in _SHRED_LONG if o.startswith(name)
+            ]
+            if len(matched) != 1:
+                return []  # unknown or ambiguous: shred refuses the whole command
+            option = matched[0]
+            # --help/--version print and exit; a value on a flag is refused (--remove's
+            # optional value is the one a flag may carry).
+            if option in ("--help", "--version") or (
+                "=" in tok and not _SHRED_LONG[option] and option != "--remove"
+            ):
+                return []
+            take_value = "=" not in tok and _SHRED_LONG[option]
             continue
         if not flags_done and tok.startswith("-") and len(tok) > 1:
+            if tok[1] not in _SHRED_SHORT:
+                return []  # an unknown short option: shred refuses the whole command
             for i, ch in enumerate(tok[1:], start=1):
+                if ch not in _SHRED_SHORT:
+                    return []
                 if ch in _SHRED_VALUE_SHORT:
                     take_value = i == len(tok) - 1  # -n3 carries its value; -n does not
                     break

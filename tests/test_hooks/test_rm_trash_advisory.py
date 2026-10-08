@@ -116,6 +116,10 @@ FIRES = [
     ("shred -zn3 ~/.claude/CLAUDE.md", None),
     ("rm ~/.claude/plans/x.md && tr a b <<< x", None),  # a here-string has no body
     ("cd ~/genesis && rm secrets.env || true", None),  # || is not a pipe
+    # #3103 shape 1: a cd to a missing directory fails, so the rm runs where it was.
+    ("cd /definitely-missing-dir || rm plans/x.md", ".claude"),
+    ("cd /definitely-missing-dir; rm plans/x.md", ".claude"),
+    ("rm -r ~/.claude/projects", None),  # a directory above projects/*/memory
 ]
 
 
@@ -155,6 +159,20 @@ SILENT = [
     ("rm ~/tmp/alias.md", None),  # rm removes the link only
     ("rm -r ~/tmp/alias-dir", None),  # no trailing slash: the link only
     ("shred --random-source ~/.claude/CLAUDE.md ~/tmp/s.txt", None),  # a value, not a target
+    # #3103 shape 4: the abbreviation consumes the value word exactly as the full name.
+    ("shred --random-sour ~/.claude/CLAUDE.md ~/tmp/s.txt", None),
+    # An ambiguous (--r: --random-source or --remove) or unknown option: shred
+    # refuses the whole command, so nothing is deleted.
+    ("shred --r x ~/.claude/CLAUDE.md", None),
+    ("shred --no-such-option ~/.claude/CLAUDE.md", None),
+    # The abbreviation takes the next word as its value, so CLAUDE.md is not a target.
+    ("shred --iter ~/.claude/CLAUDE.md ~/tmp/s.txt", None),
+    # shred deletes nothing: it prints and exits, or refuses the command.
+    ("shred --help ~/.claude/CLAUDE.md", None),
+    ("shred --exact=1 ~/.claude/CLAUDE.md", None),
+    ("shred -Q ~/.claude/CLAUDE.md", None),
+    # The directory this mkdir creates is where the rm runs, not the old cwd.
+    ("mkdir -p ~/tmp/fresh && cd ~/tmp/fresh && rm -rf config", ".genesis"),
     (
         'rm -rf ""',
         ".claude",
@@ -272,6 +290,92 @@ def test_claude_home_override_is_honoured(home: Path, tmp_path: Path) -> None:
     assert _note(res) is not None
 
 
+def _run_env(home: Path, command: str, extra: dict[str, str]):
+    env = {k: v for k, v in os.environ.items() if k != "GENESIS_HOME"}
+    env.update(HOME=str(home), **extra)
+    payload = {"tool_input": {"command": command}, "cwd": str(home)}
+    return subprocess.run(
+        [sys.executable, str(HOOK)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+
+def test_a_relative_path_override_resolves_from_the_repo_root(home: Path, tmp_path: Path) -> None:
+    """#3103 shape 2: the services resolve a relative override from their working
+    directory, the repository root, so the hook does too."""
+    repo = tmp_path / "repo"
+    (repo / "out").mkdir(parents=True)
+    (repo / "out" / "r.md").write_text("x")
+    extra = {"GENESIS_REPO_ROOT": str(repo), "GENESIS_OUTPUT_DIR": "out"}
+    assert _note(_run_env(home, f"rm {repo}/out/r.md", extra)) is not None
+    # Control: the same file, with no override pointing at it, is not user data.
+    assert _note(_run_env(home, f"rm {repo}/out/r.md", {"GENESIS_REPO_ROOT": str(repo)})) is None
+
+
+def test_a_symlinked_protected_directory_matches_by_either_name(home: Path, tmp_path: Path) -> None:
+    """#3103 shape 3: the output directory is a link to another disk. An operand
+    reaching it through the link, or through the real path, is the same data."""
+    disk = tmp_path / "disk" / "out"
+    disk.mkdir(parents=True)
+    (disk / "r.md").write_text("x")
+    gh = tmp_path / "gh"
+    gh.mkdir()
+    (gh / "output").symlink_to(disk)
+    extra = {"GENESIS_HOME": str(gh)}
+    assert _note(_run_env(home, f"rm {gh}/output/r.md", extra)) is not None
+    assert _note(_run_env(home, f"rm {disk}/r.md", extra)) is not None
+
+
+def test_the_target_set_lists_no_directory(home: Path, monkeypatch) -> None:
+    """#3103 shape 5: the user-data set is patterns matched against an operand, so
+    building it reads no directory, however many projects exist."""
+    mod = _cost_module(home, monkeypatch)
+    for i in range(200):
+        (home / ".claude" / "projects" / f"q{i}" / "memory").mkdir(parents=True)
+
+    def refuse(*_a, **_k):
+        raise AssertionError("the target set listed a directory")
+
+    monkeypatch.setattr(mod.os, "scandir", refuse)
+    monkeypatch.setattr(mod.os, "listdir", refuse)
+    monkeypatch.setattr(mod.glob, "glob", refuse)
+    monkeypatch.setattr(mod.glob, "iglob", refuse)
+    patterns = mod._target_patterns()
+    assert any(p[-2:] == ("*", "memory") for p in patterns)
+
+
+def test_a_directory_above_a_target_is_looked_up_under_the_budget(home: Path, monkeypatch) -> None:
+    """The one lookup the set needs (does this directory hold projects/*/memory?)
+    goes through the bounded expander, so it stops at the budget like a glob."""
+    mod = _cost_module(home, monkeypatch)
+    assert mod._advisory("rm -r ~/.claude/projects", str(home)) is not None
+    monkeypatch.setattr(mod, "_MAX_VISITS", 0)
+    assert mod._advisory("rm -r ~/.claude/projects", str(home)) is None
+
+
+def test_a_symlinked_project_directory_still_matches(home: Path, tmp_path: Path) -> None:
+    """A link at a wildcard component (projects/<p>) has no resolved-path pattern:
+    the operand is matched as given as well as resolved."""
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "memory").mkdir(parents=True)
+    (elsewhere / "memory" / "m.md").write_text("x")
+    (home / ".claude" / "projects" / "plink").symlink_to(elsewhere)
+    assert _note(_run(home, "rm ~/.claude/projects/plink/memory/m.md")) is not None
+    assert _note(_run(home, "rm -r ~/.claude/projects/plink/memory/")) is not None
+
+
+def test_a_hidden_project_directory_follows_the_dot_rule(home: Path) -> None:
+    """A wildcard never matches a leading dot, as the shell and _existing read it."""
+    hid = home / ".claude" / "projects" / ".hid" / "memory"
+    hid.mkdir(parents=True)
+    (hid / "m.md").write_text("x")
+    assert _note(_run(home, "rm ~/.claude/projects/.hid/memory/m.md")) is None
+
+
 def test_glob_expansion_stops_at_the_visit_bound(home: Path, monkeypatch) -> None:
     """A pattern that matches nothing still costs a listing of every directory it
     reaches; the bound must stop that, not just the matches it yields."""
@@ -321,7 +425,7 @@ def test_matches_per_operand_are_capped(home: Path, monkeypatch) -> None:
     monkeypatch.setattr(mod, "_MAX_MATCHES", 5)
     seen: list[str] = []
     real = mod._hits
-    monkeypatch.setattr(mod, "_hits", lambda p, r, t: seen.append(p) or real(p, r, t))
+    monkeypatch.setattr(mod, "_hits", lambda p, *rest, **kw: seen.append(p) or real(p, *rest, **kw))
     assert mod._advisory(f"rm -rf {big}/*", str(home)) is None
     assert len(seen) == 5
 
