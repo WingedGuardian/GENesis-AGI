@@ -1102,6 +1102,86 @@ def test_a_merge_killed_writing_only_an_ephemeral_path_is_refused(tmp_path, phas
     assert (root / "AGENTS.md").read_text() == "index v2, half writ"
 
 
+@pytest.mark.parametrize("phase", ["migrations", "health_check"])
+def test_a_late_phase_crash_at_the_tag_is_refused(tmp_path, phase):
+    """A no-delta update still runs activation when tier-2 work is pending, so it
+    reaches migrations and health_check with HEAD equal to the rollback tag.
+    Dying there is no more recoverable than with a merge behind it: the phase
+    refusal comes before the "already at the tag" branch, so the state is kept
+    instead of being cleared as a completed recovery."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    proc, state_path = _recover(tmp_path, root, phase=phase, own_head="")
+    _assert_recovery_refused(proc, state_path)
+    assert "database migrations may have run" in proc.stdout + proc.stderr
+    assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+@pytest.mark.parametrize("flag", ["--skip-worktree", "--assume-unchanged"])
+def test_a_merge_killed_writing_a_flagged_path_is_refused(tmp_path, flag):
+    """git status does not show a changed file whose index entry is flagged
+    skip-worktree or assume-unchanged, so the merging-phase check also runs the
+    lib's hidden-edit scan: a fast-forward killed while writing such a file is
+    refused, not recovered over."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    _recovery_git(root, "update-index", flag, "changed.txt")
+    (root / "changed.txt").write_text("half-written by the merge\n")
+    assert _recovery_git(root, "status", "--porcelain") == ""  # really hidden
+    proc, state_path = _recover(tmp_path, root, phase="merging", own_head="")
+    _assert_recovery_refused(proc, state_path)
+    assert "tracked files changed during the merge" in proc.stdout + proc.stderr
+    assert "changed.txt" in proc.stdout + proc.stderr
+    assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+@pytest.mark.parametrize("phase", ["activation", "", "MIGRATIONS", "health-check"])
+def test_an_unknown_phase_is_refused(tmp_path, phase):
+    """update.sh writes only fetching, merging, bootstrap, migrations,
+    health_check and done. Anything else (a hand edit, a newer or older
+    update.sh) says nothing recovery can rely on, so it refuses instead of
+    clearing the state as recovered."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    proc, state_path = _recover(tmp_path, root, phase=phase, own_head="")
+    _assert_recovery_refused(proc, state_path)
+    assert "unknown update phase" in proc.stdout + proc.stderr
+    assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+def test_a_crash_in_the_bootstrap_phase_leaves_the_merged_code(tmp_path):
+    """bootstrap.sh seeds the schema (create_all_tables) during the bootstrap
+    phase, so the database may already match the merged code. Rolling the code
+    back would put old code on that schema: refuse and leave both in place."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
+    proc, state_path = _recover(
+        tmp_path, root, phase="bootstrap", own_head=deploy, deploy_head=deploy
+    )
+    _assert_recovery_refused(proc, state_path)
+    assert "bootstrap" in proc.stdout + proc.stderr
+    assert _recovery_git(root, "rev-parse", "HEAD") == deploy
+    assert rollback != deploy
+
+
+def test_a_merge_killed_after_writing_only_new_files_is_refused(tmp_path):
+    """A fast-forward killed after writing the files the range ADDS, before any
+    tracked file, the index or the ref, leaves HEAD at the tag and only untracked
+    files: git status shows nothing. update.sh's pre-stop scan refuses an update
+    whose range lands on an existing untracked path, so one found at recovery
+    appeared during the run, and the merging-phase check refuses."""
+    root, common, rollback = _recovery_repo(tmp_path)
+    _recovery_git(root, "checkout", "-qb", "incoming", rollback)
+    deploy = _recovery_commit_file(root, "migrations/0099_new.py", "NEW = 1\n", "add migration")
+    _recovery_git(root, "checkout", "-q", "main")
+    (root / "migrations").mkdir()
+    (root / "migrations" / "0099_new.py").write_text("NEW = 1\n")
+    assert _recovery_git(root, "status", "--porcelain", "--untracked-files=no") == ""
+    proc, state_path = _recover(
+        tmp_path, root, phase="merging", own_head="", deploy_head=deploy
+    )
+    _assert_recovery_refused(proc, state_path)
+    assert "migrations/0099_new.py" in proc.stdout + proc.stderr
+    assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
 def _merge_in_progress(tmp_path: Path) -> tuple[Path, str, str]:
     root, common, rollback = _recovery_repo(tmp_path)
     _recovery_git(root, "checkout", "-qb", "incoming", common)

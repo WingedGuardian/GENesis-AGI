@@ -131,6 +131,23 @@ PY
             _crash_recovery_refuse "a merge is in progress; save any edits you want to keep, run git -C \"$GENESIS_ROOT\" merge --abort yourself, then re-run scripts/bootstrap.sh"
         fi
 
+        # The state does not say whether migrations ran or which database
+        # snapshot matches, so neither a code rollback nor clearing the state is
+        # safe once the update reached them. This comes before the "already at
+        # the tag" branch: a no-delta update still runs activation when tier-2
+        # work is pending, so it reaches these phases with HEAD at the tag.
+        case "$STATE_PHASE" in
+            migrations|health_check)
+                _crash_recovery_refuse "the update died in phase '$STATE_PHASE', after its database migrations may have run; the code was left in place with the database it may have migrated (restore data/genesis.db.pre-update by hand only together with the old code)"
+                ;;
+            fetching|merging|bootstrap) ;;
+            *)
+                # update.sh writes only the phases above (and done, handled
+                # earlier); anything else is a hand edit or another version.
+                _crash_recovery_refuse "unknown update phase '$STATE_PHASE'"
+                ;;
+        esac
+
         if genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$recovery_branch"; then
             # In the merging phase, a dirty checkout at the tag is what a
             # fast-forward killed mid-write leaves: HEAD unmoved, files half
@@ -138,12 +155,31 @@ PY
             # would run half-written code, so refuse and keep the state file.
             # Every tracked path counts here, the ephemeral allowlist included:
             # the merge writes those too, and the deployability predicate below
-            # skips them.
+            # skips them. git status cannot see a file whose index entry is
+            # flagged skip-worktree or assume-unchanged, so the lib's hidden-edit
+            # scan runs as well.
             if [ "$STATE_PHASE" = "merging" ]; then
-                merge_dirty=""
+                merge_dirty="" merge_hidden=""
                 if ! merge_dirty="$(git -C "$GENESIS_ROOT" status --porcelain --untracked-files=no --no-renames 2>/dev/null)"; then
                     merge_dirty="(status unreadable)"
                 fi
+                if ! merge_hidden="$(_genesis_hidden_dirty_lines "$GENESIS_ROOT" 2>/dev/null)"; then
+                    merge_hidden="(flagged-entry status unreadable)"
+                fi
+                # A fast-forward killed after writing only the files the range
+                # ADDS leaves them untracked, which status cannot show. update.sh's
+                # pre-stop scan refuses a range that lands on an existing
+                # untracked path, so one present now appeared during the run.
+                merge_new=""
+                if [ -n "$DEPLOY_HEAD" ]; then
+                    collide_rc=0
+                    merge_new="$(genesis_range_collisions "$GENESIS_ROOT" "$rb_commit" "$DEPLOY_HEAD" 2>/dev/null)" \
+                        || collide_rc=$?
+                    if [ "$collide_rc" -eq 2 ]; then
+                        merge_new="(the update's incoming range cannot be listed)"
+                    fi
+                fi
+                merge_dirty="$(printf '%s\n%s\n%s\n' "$merge_dirty" "$merge_hidden" "$merge_new" | grep -v '^$' || true)"
                 if [ -n "$merge_dirty" ]; then
                     printf '%s\n' "$merge_dirty" | sed 's/^/    /'
                     _crash_recovery_refuse "the checkout is at $ROLLBACK_TAG but tracked files changed during the merge (a half-written update or edits by someone else)"
@@ -162,12 +198,11 @@ PY
             _crash_recovery_refuse "old-format update state and the checkout has moved from its rollback tag"
         else
             case "$STATE_PHASE" in
-                merging|bootstrap) ;;
-                migrations|health_check)
-                    # The state does not say whether migrations ran or which
-                    # database snapshot matches, so a code rollback here could
-                    # leave old code on a migrated schema. Leave both as they are.
-                    _crash_recovery_refuse "the update died in phase '$STATE_PHASE', after its database migrations may have run; the code was left in place with the database it may have migrated (restore data/genesis.db.pre-update by hand only together with the old code)"
+                merging) ;;
+                bootstrap)
+                    # bootstrap.sh seeds the schema (create_all_tables) in this
+                    # phase, so the database may already match the merged code.
+                    _crash_recovery_refuse "the update died in phase 'bootstrap', which can change the database schema; the merged code was left in place with the database"
                     ;;
                 *)
                     _crash_recovery_refuse "the checkout moved while the update was in phase '$STATE_PHASE', before it could have merged"
