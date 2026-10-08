@@ -15,6 +15,7 @@ from genesis.db.crud import pending_embeddings
 from genesis.db.crud._id_resolve import AMBIGUOUS as _AMBIGUOUS
 from genesis.db.crud._id_resolve import NOT_FOUND as _NOT_FOUND
 from genesis.db.crud._id_resolve import PASSTHROUGH as _PASSTHROUGH
+from genesis.db.crud._id_resolve import normalize_id
 from genesis.memory._locks import memory_id_lock
 from genesis.memory.classification import classify_memory
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
@@ -753,7 +754,9 @@ class MemoryStore:
         old_id = await self._resolve_supersede_target(old_handle)
         try:
             new_id = await self._resolve_supersede_target(new_handle, role="new_id")
-        except SupersedeUnresolved:
+        except SupersedeUnresolved as exc:
+            if exc.reason != "not_found":
+                raise
             # A committed supersession still owes its mirror, and that debt does
             # NOT depend on the successor still resolving. Resolution runs
             # before the repair-path check below, so without this the documented
@@ -763,7 +766,10 @@ class MemoryStore:
             # `integrity.py` counts `deprecated_divergence` but nothing repairs
             # it. Recover the successor from the row that already committed.
             existing = await memory_crud.get_metadata(self._db, old_id)
-            if not (existing and existing["deprecated"] and existing["superseded_by"]):
+            if not (
+                existing and existing["deprecated"] and existing["superseded_by"]
+                and normalize_id(new_handle) == existing["superseded_by"]
+            ):
                 raise
             new_id = existing["superseded_by"]
         # Self-check BEFORE the locks: sorted() of an equal pair would acquire

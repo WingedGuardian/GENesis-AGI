@@ -41,6 +41,11 @@ def _prefix_re(min_len: int) -> re.Pattern[str]:
     return re.compile(rf"^[0-9a-f][0-9a-f-]{{{min_len - 1},}}$")
 
 
+def normalize_id(raw_id: str) -> str:
+    """Normalize the same id spelling accepted by unique-prefix resolution."""
+    return raw_id.strip().lower().removeprefix("id:")
+
+
 async def resolve_unique_prefix(
     db: aiosqlite.Connection,
     *,
@@ -63,7 +68,7 @@ async def resolve_unique_prefix(
     if not _IDENT_RE.match(table) or not _IDENT_RE.match(id_column):
         raise ValueError(f"unsafe identifier: table={table!r} id_column={id_column!r}")
 
-    mid = raw_id.strip().lower().removeprefix("id:")
+    mid = normalize_id(raw_id)
     if len(mid) >= full_len or not _prefix_re(min_len).match(mid):
         return [mid], PASSTHROUGH
 

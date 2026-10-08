@@ -36,6 +36,66 @@ DEAD = "beef9999-0000-4000-8000-000000000003"
 EXPIRED = "cafe0000-0000-4000-8000-000000000004"
 
 
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("handle,deleted,reason", [
+    ("deadbeef-0000-4000-8000-000000000009", False, "not_found"),
+    ("deadbeef", False, "not_found"),
+    (NEW[:8], False, "ambiguous"),
+    (NEW[:8], True, "not_found"),
+])
+async def test_repair_never_substitutes_a_different_requested_successor(
+    store, db, monkeypatch, handle, deleted, reason,
+):
+    from genesis.db.crud import memory as memory_crud
+
+    await store.supersede(OLD, NEW, timestamp="2026-01-01T00:00:00+00:00")
+    if reason == "ambiguous":
+        await db.execute(
+            "INSERT INTO memory_metadata (memory_id, created_at) VALUES (?, ?)",
+            (NEW[:-1] + "9", "2026-01-01T00:00:00+00:00"),
+        )
+    if deleted:
+        await db.execute("DELETE FROM memory_metadata WHERE memory_id = ?", (NEW,))
+    await db.commit()
+    before = await memory_crud.get_metadata(db, OLD)
+    links = await _links(db)
+    mark = AsyncMock(wraps=store._mark_superseded)
+    monkeypatch.setattr(store, "_mark_superseded", mark)
+
+    with pytest.raises(SupersedeUnresolved) as exc:
+        await store.supersede(OLD, handle)
+
+    assert exc.value.reason == reason
+    assert exc.value.role == "new_id"
+    assert not exc.value.committed  # This requested pair never committed.
+    assert await memory_crud.get_metadata(db, OLD) == before
+    assert await _links(db) == links
+    mark.assert_not_awaited()
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("handle", [NEW, NEW.upper(), f" id:{NEW.upper()} ", f" ID:{NEW.upper()}\n"])
+async def test_deleted_successor_repair_preserves_normalized_exact_identity(
+    store, db, monkeypatch, handle,
+):
+    from genesis.db.crud import memory as memory_crud
+
+    stamp = "2026-01-01T00:00:00+00:00"
+    await store.supersede(OLD, NEW, timestamp=stamp)
+    await db.execute("DELETE FROM memory_metadata WHERE memory_id = ?", (NEW,))
+    await db.commit()
+    mark = AsyncMock(wraps=store._mark_superseded)
+    monkeypatch.setattr(store, "_mark_superseded", mark)
+
+    await store.supersede(OLD, handle, timestamp="2099-01-01T00:00:00+00:00")
+
+    row = await memory_crud.get_metadata(db, OLD)
+    assert row["superseded_by"] == NEW
+    assert row["superseded_at"] == stamp
+    mark.assert_awaited_once_with(OLD, NEW, stamp, strict=True)
+    assert await _links(db) == [(OLD, NEW, "succeeded_by")]
+
+
 @pytest.fixture()
 async def db():
     conn = await aiosqlite.connect(":memory:")
