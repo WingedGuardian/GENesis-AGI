@@ -411,7 +411,10 @@ def _late_findings(
     late finding: this binds an honest session's history, not a forged one. A
     head force-pushed out of the PR has no next commit here and is never late.
     An unreadable time, or an unkeyable finding on a late review, makes the
-    answer unknown rather than empty.
+    answer unknown rather than empty. A round from before
+    ``ROUND_RULE_CUTOVER_ISO`` carries no keyed reviews, so its late findings
+    are not owed: deliberately, since they can never be keyed and reading them
+    as unknown would leave an older PR owing something it can never answer.
     """
     if commit_times is None:
         return {}, None, True

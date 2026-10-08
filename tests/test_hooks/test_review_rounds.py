@@ -1051,6 +1051,24 @@ def test_a_late_codex_findings_comment_is_owed():
     assert got["late_keys"] == ["i55"], got
 
 
+def test_a_late_finding_from_before_the_cutover_is_not_owed():
+    """Deliberate: a pre-cutover round carries no keyed reviews, so its late
+    findings can never be answered by key; reading them as unknown would leave
+    an older PR owing something it can never discharge."""
+    review = _keyed(_rv(CODEX, H1, P2, when=BEFORE), 11, [111])
+    got = rb.evaluate_evidence(
+        current_head=H2,
+        commit_heads=(H1, H2),
+        reviews=[review],
+        issue_comments=(),
+        changed_files=("src/x.py",),
+        cutover=CUT,
+        commit_times={H1: "2025-12-01T00:00:00Z", H2: "2025-12-02T00:00:00Z"},
+    )
+    assert got["status"] == "ok", got
+    assert got["late_keys"] == [] and got["reflection_keys"] == "ok"
+
+
 def test_an_unkeyable_late_finding_makes_the_keys_unknown():
     review = _rv(CODEX, H1, P2, when="2026-07-01T00:10:00Z")  # no ids at all
     got = rb.evaluate_evidence(

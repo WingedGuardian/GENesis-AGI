@@ -709,7 +709,9 @@ def covered_keys(
     ``review_budget``). A late key is also answered by a reflection naming an
     EARLIER head, as long as that head descends from the key's fix commit: once
     answered it stays answered, instead of being owed again at every new head.
-    Such a reflection answers only its late keys, never the open round's.
+    Such a reflection answers only its late keys, never the open round's, and
+    is held to the grammar, emptiness, before-any-fix and no escalation, but
+    not to the current round's obligations or evidence window.
 
     A reflection counts only when it is an EMPTY commit naming this exact head,
     made before any fix to it (``before_any_fix``), and ``check`` passes it:
@@ -725,22 +727,32 @@ def covered_keys(
     """
     previous = previous_class_labels(cwd, prior_heads)
     covered: set[str] = set()
+    ancestry: dict[tuple[str, str], bool] = {}
+
+    def descends(older: str, newer: str) -> bool:
+        if (older, newer) not in ancestry:
+            ancestry[(older, newer)] = _is_ancestor(cwd, older, newer)
+        return ancestry[(older, newer)]
+
     for sha, kind, body, committed_at in _log_reflections(cwd):
         if kind != "empty":
             continue
-        named = parse(body).head
+        parsed = parse(body)
+        named = parsed.head
         if named is None:
             continue
-        if named == head:
-            answers = None  # every key it names
-        else:
-            answers = {
-                k
-                for k in parse(body).keys
-                if k in late_since and _is_ancestor(cwd, late_since[k], named)
-            }
-            if not answers or not _is_ancestor(cwd, named, head):
+        if named != head:
+            # An earlier head's reflection answers LATE keys only. It is judged
+            # without a round: that round's obligations and evidence window
+            # cannot be rebuilt later, and re-judging it against the current
+            # round would un-answer it every time the head moves.
+            candidates = [k for k in parsed.keys if k in late_since]
+            if not candidates or not parsed.ok or parsed.escalate:
                 continue
+            if not descends(named, head) or not before_any_fix(cwd, named, sha):
+                continue
+            covered.update(k for k in candidates if descends(late_since[k], named))
+            continue
         if not before_any_fix(cwd, named, sha):
             continue
         result = check(
@@ -755,7 +767,7 @@ def covered_keys(
             cwd=cwd,
         )
         if result.ok:
-            covered.update(result.keys if answers is None else answers)
+            covered.update(result.keys)
     return covered
 
 
@@ -800,16 +812,20 @@ def owed_state(
     if budget.get("status") != "ok":
         return state
     is_open = budget.get("round_state") == "open"
-    if state["reflection_keys"] != "ok":
-        # Unkeyable findings, or a late finding whose time could not be read:
-        # owed stays None (unknown), never an empty list.
+    known = state["reflection_keys"] == "ok"
+    if not known and not is_open:
+        # A late finding that could not be keyed or dated: owed stays None
+        # (unknown), never an empty list.
         return state
-    if not is_open and not state["late_keys"]:
+    if known and not is_open and not state["late_keys"]:
         state["owed"] = []
         return state
-    done = set(covered)
-    wanted = dict.fromkeys((state["open_keys"] if is_open else []) + state["late_keys"])
-    state["owed"] = [k for k in wanted if k not in done]
+    if known:
+        done = set(covered)
+        wanted = dict.fromkeys((state["open_keys"] if is_open else []) + state["late_keys"])
+        state["owed"] = [k for k in wanted if k not in done]
+    # An unknown key set leaves owed None but still reports the open round's
+    # timing, so a reader can tell when it settles.
     if not is_open:
         # Only late findings are owed: they have already arrived, so nothing is
         # still settling, and the audit window opens at the first of them.

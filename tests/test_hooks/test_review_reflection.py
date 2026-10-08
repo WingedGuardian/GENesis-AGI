@@ -991,6 +991,42 @@ def test_a_late_finding_answered_earlier_stays_answered(repo, tmp_path):
     assert _covered(path, first, late_since={"c9": fix}) == set()
 
 
+def test_an_earlier_answer_is_not_re_judged_by_a_later_round(repo, tmp_path):
+    """GLM secondary P2: re-checking an earlier head's reflection against the
+    CURRENT round's obligations and evidence window un-answered it whenever
+    the head moved. Answered stays answered."""
+    path, _ = repo
+    _fix(path, "fix one\n")
+    fix = _git(path, "rev-parse", "HEAD").strip()
+    _commit_reflection(path, tmp_path, _reflection(keys=("c9",), head=fix))
+    _fix(path, "fix two\n")
+    later = _git(path, "rev-parse", "HEAD").strip()
+    future = datetime.now(UTC) + timedelta(hours=1)
+    # Round 3 of the ordinary lane owes an audit and a premise check, and the
+    # window opens after the reflection: neither applies to the earlier answer.
+    got = _covered(path, later, round_number=3, round_started=future, late_since={"c9": fix})
+    assert got == {"c9"}
+
+
+def test_an_escalating_earlier_answer_answers_nothing(repo, tmp_path):
+    path, _ = repo
+    _fix(path, "fix one\n")
+    fix = _git(path, "rev-parse", "HEAD").strip()
+    _commit_reflection(path, tmp_path, _reflection(keys=("c9",), head=fix, escalate="yes"))
+    _fix(path, "fix two\n")
+    later = _git(path, "rev-parse", "HEAD").strip()
+    assert _covered(path, later, late_since={"c9": fix}) == set()
+
+
+def test_an_open_round_with_unknown_keys_still_reports_its_timing():
+    """GLM secondary P3: owed stays unknown, but the settle window is still
+    reported, so a reader can tell when the round settles."""
+    got = rr.owed_state(_budget(reflection_keys="unknown"), (), now=T0 + timedelta(hours=1))
+    assert got["owed"] is None
+    assert got["round_started"] == T0.isoformat() and got["settled"]
+    assert got["settle_until"] == (T0 + rr.SETTLE).isoformat()
+
+
 def test_status_answers_late_findings_from_the_budget_body(repo, tmp_path, monkeypatch):
     """The late-only path end to end: every round head is prior, the window
     opens at the late review, and the body comes from the budget read."""
