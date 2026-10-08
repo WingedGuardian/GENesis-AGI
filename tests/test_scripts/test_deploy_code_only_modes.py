@@ -97,6 +97,7 @@ _SCRIPT_FILES = (
     "lib/alert_queue.sh",
     "lib/deploy_status.sh",
     "lib/deploy_checkout.sh",
+    "lib/deploy_recovery.sh",
     "lib/port_owned_by.py",
     "lib/manifest_delta.py",
     "lib/serving_commit.py",

@@ -113,9 +113,11 @@ _genesis_hidden_dirty_lines() {
     listing="$(git -C "$root" ls-files -v)" || return 2
     grep -E '^([a-z]|S) ' <<<"$listing" >/dev/null || return 0
     # The scratch index sits beside the real one: same filesystem, and no
-    # dependence on a writable TMPDIR.
+    # dependence on a writable TMPDIR. Its name carries this shell's pid, so a
+    # caller that kills the shell before the rm below can remove exactly this
+    # shell's copy (deploy_health.py's probe does, on a timeout).
     idx="$(git -C "$root" rev-parse --path-format=absolute --git-path index)" || return 2
-    tmp="$(mktemp "${idx%/*}/genesis-hidden-index.XXXXXX")" || return 2
+    tmp="$(mktemp "${idx%/*}/genesis-hidden-index.$$.XXXXXX")" || return 2
     if cp "$idx" "$tmp" \
         && _genesis_flagged_paths "$root" '[a-z]' \
             | GIT_INDEX_FILE="$tmp" xargs -0 -r git -C "$root" update-index --no-assume-unchanged -- \
