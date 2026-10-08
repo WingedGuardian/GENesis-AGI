@@ -35,7 +35,7 @@ from deploy_candidates_core import (  # noqa: E402
     after_move,
     out,
 )
-from deploy_candidates_gate import SYNC_HOOKS, is_symlink_at, sync_hook_names  # noqa: E402
+from deploy_candidates_gate import SYNC_HOOKS, non_file_kind, sync_hook_names  # noqa: E402
 
 
 def shared_with(repo: Repo, base: str, heads: dict[str, str]) -> dict[str, list[str]]:
@@ -355,7 +355,9 @@ def move_checkout(repo: Repo, plan: Plan, branch: str | None) -> Move:
     return Move(files_moved, at)
 
 
-def restore_moved_hooks(repo: Repo, before: str | None, after: str) -> None:
+def restore_moved_hooks(
+    repo: Repo, before: str | None, after: str, only: set[str] | None = None
+) -> None:
     """Replace each installed git hook whose bytes are exactly that hook as the
     checkout held it BEFORE the move (``before``) with the moved-to version.
 
@@ -398,7 +400,7 @@ def restore_moved_hooks(repo: Repo, before: str | None, after: str) -> None:
     for ref in (before, after):
         names += [n for n in listed[ref] or [] if n not in names]
     for name in names:
-        if name in (".", ".."):
+        if name in (".", "..") or (only is not None and name not in only):
             continue
         try:
             _restore_one(
@@ -420,13 +422,16 @@ def _restore_one(
     ``after_listed`` False when the moved-to list no longer names it."""
     if before is None:
         return
+    if non_file_kind(repo, before, path):
+        return  # the old copy came from sync-hooks.sh (a link's target) or nowhere
     old = repo.blob_at(before, path)
-    new = repo.blob_at(after, path) if after_listed else None
+    new_kind = non_file_kind(repo, after, path)
+    if new_kind == "symbolic link":
+        return  # sync-hooks.sh installs what a link points at; leave it to sync
+    # A directory or submodule installs nothing (sync-hooks.sh skips it), so the
+    # moved-to side counts as having no source for this hook.
+    new = repo.blob_at(after, path) if after_listed and not new_kind else None
     if old is None or old == new or not dst.is_file():
-        return
-    if is_symlink_at(repo, before, path) or is_symlink_at(repo, after, path):
-        # A link's blob is its target path, not the hook's bytes; sync-hooks.sh
-        # copies the referent, so leave a linked hook to it.
         return
     if repo.git("hash-object", "--no-filters", "--", str(dst)).stdout.strip() != old:
         if new is None:

@@ -244,12 +244,13 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
         want = repo.blob_at("HEAD", f"scripts/hooks/{name}")
         if want is None:
             continue  # sync-hooks.sh skips a name with no source
-        if is_symlink_at(repo, "HEAD", f"scripts/hooks/{name}"):
-            # The blob is the link's target path while sync installs the
-            # referent's bytes, so no sync could ever make them compare equal.
+        kind = non_file_kind(repo, "HEAD", f"scripts/hooks/{name}")
+        if kind:
+            # Not the bytes sync installs (a link's target path, a tree or a
+            # commit id), so no sync could ever make them compare equal.
             fails.append(
-                f"scripts/hooks/{name} is a symbolic link at HEAD; `live` does not support "
-                "linked git hooks"
+                f"scripts/hooks/{name} is a {kind} at HEAD; `live` supports only regular-file "
+                "git hooks"
             )
             continue
         dst = hooks_dir / name
@@ -307,10 +308,23 @@ def path_refusal(path: str, hooks_approved: bool = False) -> str | None:
     return None
 
 
-def is_symlink_at(repo: Repo, commit: str, path: str) -> bool:
-    """Whether ``path`` is a symbolic link (mode 120000) in ``commit``."""
+_NON_FILE_KINDS = {"120000": "symbolic link", "040000": "directory", "160000": "submodule"}
+
+
+def non_file_kind(repo: Repo, commit: str, path: str) -> str | None:
+    """What ``path`` is in ``commit`` when it is present but not a regular file
+    (mode 100644 or 100755): "symbolic link", "directory", "submodule", or its
+    mode. None for a regular file or an absent path. A hook must be a regular
+    file: sync-hooks.sh copies what a link points at and skips anything else,
+    and an object id that is not a blob is not the bytes that run."""
     text = repo.git("ls-tree", "-z", commit, "--", path).stdout
-    return text.startswith("120000 ")
+    head = text.split("\0", 1)[0]
+    if not head:
+        return None
+    mode = head.split(" ", 1)[0]
+    if mode in ("100644", "100755"):
+        return None
+    return _NON_FILE_KINDS.get(mode, f"mode {mode} entry")
 
 
 def changed_paths(repo: Repo, base: str, head: str) -> list[str]:
@@ -331,17 +345,18 @@ def admission_failures(repo: Repo, base: str, head: str, hooks_approved: bool = 
         why = path_refusal(path, hooks_approved)
         if why:
             fails.append(why)
-        elif (
-            path.startswith(HOOK_DIRS) or any(d.startswith(path + "/") for d in HOOK_DIRS)
-        ) and is_symlink_at(repo, head, path):
-            # sync-hooks.sh copies what a link points at, and Claude Code runs a
-            # hook through the link: an approval of the link's blob (a path)
-            # cannot cover those bytes, which another candidate may change. A
-            # hook DIRECTORY made a link is the same. Approved or not.
-            fails.append(
-                f"makes {path} a symbolic link; a hook is installed or run from what a link "
-                "points at, which an approval of the link cannot cover"
-            )
+        elif path.startswith(HOOK_DIRS) or any(d.startswith(path + "/") for d in HOOK_DIRS):
+            # Only regular files under the hook directories, approved or not:
+            # sync-hooks.sh copies what a link points at and skips a directory
+            # or submodule, and Claude Code runs a hook through a link, so an
+            # approval of such an entry cannot cover what runs. A hook
+            # DIRECTORY made a link is the same.
+            kind = non_file_kind(repo, head, path)
+            if kind:
+                fails.append(
+                    f"makes {path} a {kind}; only regular files may go under the hook "
+                    "directories, since an approval of anything else cannot cover what runs"
+                )
     commits = repo.rev_list(head, "--not", base)
     info = repo.read_commits(commits)
     for c in commits:

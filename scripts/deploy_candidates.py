@@ -23,8 +23,9 @@ Commands:
         unmerged branch on this install's own server needs none), except for
         hooks: a branch that changes a git or Claude Code hook goes live only
         with --approve-hooks, naming who approved it in chat (owner ruling,
-        #2978). The approval binds to the pinned head; adding the branch again
-        without the flag clears it. It RECORDS a claim, it does not verify one:
+        #2978). The approval binds to the pinned head: a new head needs the
+        flag again, and without it `add` refuses and the old pin keeps its
+        approval (drop the branch to revoke one). It RECORDS a claim, it does not verify one:
         any caller can pass the flag, so pass it only after the owner said yes. Refuses unless the install is READY and
         every per-candidate check passes (below). Prints the next step; it
         does not rebuild.
@@ -81,11 +82,14 @@ the Claude Code pin, what drives the host on a timer, a git or Claude Code hook
 (unless that head's hooks were approved: --approve-hooks), the scripts that keep
 the wipers off `live` (and what they source first), or this engine, never goes
 live before it merges; nor does a branch that carries a `Deploy-rebuild:` commit
-(it was cut from `live`). A rebuild also refuses, by path, when a hook on the
-merged tip is byte-identical to no approved candidate's version (two approved
-candidates whose changes to one hook git merged into bytes neither was approved
-for). After a move, a git hook still installed as the old checkout held it is
-replaced before sync-hooks.sh runs, so a candidate's hook leaves with it.
+(it was cut from `live`). Only regular files may go under the hook
+directories. Every hook path that differs from origin/main on the rebuilt tip
+needs exactly one owner (the one merged candidate whose merge or own diff
+changed it, approved at that head, whose entry the tip holds); rebuild, drop and
+status exclude any other candidate by name. After a move, a git hook still
+installed as the old checkout held it is replaced or removed, and a drop made
+off `live` does the same for the dropped candidate's hooks as `live` held them,
+so a candidate's hook leaves with it.
 
 WHAT THIS DEFENDS AGAINST (and what it does not): the job is to run unmerged
 code on THIS install's own server before its PR merges, and to keep that from
@@ -474,6 +478,32 @@ class Engine(Repo):
         out("Next: scripts/deploy_candidates rebuild")
         return 0
 
+    def _off_live_hook_restore(
+        self, branch: str, data: dict
+    ) -> tuple[str, str, set[str] | None] | None:
+        """(live tip, HEAD, the git hook names to restore) for a drop made while
+        the checkout is off `live`, or None when there is nothing to restore.
+        Only the dropped candidate's hooks: another listed candidate's hook is
+        still meant to run on `live`, and putting this checkout's copy over it
+        could install a feature branch's unshipped bytes. A candidate that
+        changed sync-hooks.sh may have changed what is listed: all names."""
+        live_tip = self.resolve(LIVE_REF)
+        entry = next((c for c in data["candidates"] if c["branch"] == branch), None)
+        base = self.resolve(BASE_REF)
+        if not (live_tip and entry and base):
+            return None
+        changed = [
+            p for p in gate.changed_paths(self, base, entry["verified_head"])
+            if p.startswith("scripts/hooks/")
+        ]
+        if not changed:
+            return None
+        if gate.SYNC_HOOKS in changed:
+            only = None
+        else:
+            only = {p.split("/", 2)[2] for p in changed if p.count("/") == 2}
+        return live_tip, self.resolve("HEAD"), only
+
     def cmd_drop(self, branch: str, no_rebuild: bool) -> int:
         self.require_update_lock()
         # No manifest: nothing to drop, and the manifest is not created.
@@ -491,7 +521,11 @@ class Engine(Repo):
             keep = [c for c in d["candidates"] if c["branch"] != branch]
             return None if len(keep) == len(d["candidates"]) else {**d, "candidates": keep}
 
-        if self.current_branch() != LIVE_BRANCH or no_rebuild:
+        on_live = self.current_branch() == LIVE_BRANCH
+        if not on_live or no_rebuild:
+            # Every git read before the manifest changes: a failure after it
+            # must never read as "nothing changed".
+            restore = None if on_live else self._off_live_hook_restore(branch, data)
             after = self.store.update(remove)
             out(f"{branch} dropped from {self.store.path}.")
             core.after_move(
@@ -499,6 +533,17 @@ class Engine(Repo):
                 "checking which candidates share its commits",
                 lambda: self._warn_shared(branch, data, after),
             )
+            if restore:
+                # .git/hooks is shared by every checkout and worktree: a hook
+                # `live` installed stays installed after the checkout leaves it,
+                # and sync-hooks.sh keeps it as "user-modified". Put back what
+                # this checkout holds for the dropped candidate's hooks.
+                live_tip, head, only = restore
+                core.after_move(
+                    f"{branch} WAS dropped from the manifest",
+                    "restoring the git hooks it installed on `live`",
+                    lambda: plan.restore_moved_hooks(self, live_tip, head, only),
+                )
             out(
                 "The checkout is not rebuilt"
                 + (" (--no-rebuild)." if no_rebuild else " (it is not on `live`).")

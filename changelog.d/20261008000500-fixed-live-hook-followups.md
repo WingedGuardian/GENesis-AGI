@@ -1,0 +1,1 @@
+- On an install running the `live` integration branch, only regular files may now go under the hook directories (a directory or submodule in place of a hook is refused like a symbolic link), and dropping a candidate while the checkout is off `live` removes or replaces the git hooks that candidate had installed, instead of leaving them running.
