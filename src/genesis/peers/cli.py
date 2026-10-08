@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sqlite3
+import stat
 import sys
+from pathlib import Path
 
 from genesis.peers.registry import CAPABILITIES, MODES, PeerRegistry
 
@@ -29,6 +32,23 @@ async def execute(args: argparse.Namespace, registry: PeerRegistry) -> None:
         await registry.grant(args.peer_id, args.capability, args.decision)
     elif action == "revoke":
         await registry.revoke(args.peer_id)
+    elif action == "resource-publish":
+        from genesis.peers.resources import MAX_RESOURCE_BYTES, PublishedResources
+
+        fd = os.open(args.file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise ValueError("Regular resource file required")
+            body = source.read(MAX_RESOURCE_BYTES + 1)
+        if len(body) > MAX_RESOURCE_BYTES:
+            raise ValueError("Resource too large")
+        print(
+            json.dumps(await PublishedResources(registry).publish(args.title, body.decode("utf-8")))
+        )
+    elif action == "resource-retire":
+        from genesis.peers.resources import PublishedResources
+
+        await PublishedResources(registry).retire(args.resource_id)
     elif action == "list":
         print(json.dumps({"settings": await registry.settings(), "peers": await registry.rows()}))
 
@@ -66,5 +86,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     grant.add_argument("decision", choices=("allow", "ask", "deny"))
     revoke = actions.add_parser("revoke", help="Immediately deactivate a relationship")
     revoke.add_argument("peer_id")
+    publish = actions.add_parser(
+        "resource-publish", help="Publish one explicit immutable snapshot locally"
+    )
+    publish.add_argument("--title", required=True)
+    publish.add_argument("--file", type=Path, required=True)
+    retire = actions.add_parser("resource-retire", help="Retire one published snapshot locally")
+    retire.add_argument("resource_id")
     actions.add_parser("list", help="List identities, configuration and credential names")
     parser.set_defaults(func=_cmd)

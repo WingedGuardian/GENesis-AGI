@@ -1368,6 +1368,17 @@ verified: ba6e357a7998 2026-10-08
   No task skills or task execution advertised in this foundation. Revocation
   disables access immediately; credential equality with another surface refuses
   activation. See `docs/reference/peer-registry.md`.
+- **Private peer broker foundation (dark until coordinator readiness)** —
+  `peers/broker.py` owns leased Unix-socket operations; `peers/facade.py` exposes
+  only exchange context and explicit published snapshots. Current epoch,
+  generation, deadlines, cancellation and admitted/current grant intersection
+  are checked, with a mandatory coordinator operation authorizer. Lease values
+  stay in private files, and drain invalidates before canceling tracked work.
+  Local `genesis peers resource-publish` creates immutable scanned snapshots;
+  the peer cannot publish or read raw memory. Public task activation, human
+  approvals and cross-owner disclosure still require dependent slices. See
+  [private peer capabilities](../reference/peer-broker.md).
+
 - **Peer admission groundwork**: A2A1.0 `message:send`, owned task get/list/cancel
   routes use the pinned SDK wire models. Private SQLite admission commits receipt,
   UTC quota, grant snapshot, task and prepared queue row together. Exact retries
