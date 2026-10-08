@@ -95,9 +95,18 @@ _ASCII_DIGITS = frozenset("0123456789")
 
 def _is_parseable_incus_size(raw: str) -> bool:
     """Whether Incus would accept ``raw`` as a ``limits.memory.swap`` byte
-    size (a leading run of digits plus one of its known suffixes). Callers
-    must rule out Incus's own boolean words first (see ``_is_swap_on``) —
-    this function alone cannot tell "0" the byte size from "0" the bool.
+    size AND that size is actually nonzero. Callers must rule out Incus's
+    own boolean words first (see ``_is_swap_on``) — this function alone
+    cannot tell "0" the byte size from "0" the bool.
+
+    A ZERO-valued size ("0B", "0 bytes", "00GiB", …) parses structurally —
+    digits plus a known suffix — but represents zero bytes of additional
+    swap, and Incus's byte-size branch
+    (``units.ParseByteSizeString`` → ``SetMemorySwapLimit``) applies that
+    value literally, so it disables swap exactly like the boolean FALSE
+    spellings do. Returning True for it would leave a swap-off config
+    unreconciled — the guardian would read it back next tick, see "already
+    swap-on", and never heal it. (Codex finding on PR #3069, 2026-10-08.)
 
     Matched on ASCII digits only, deliberately narrower than ``str.isdigit()``
     (which also accepts Unicode digit forms Go's byte-wise
@@ -105,8 +114,8 @@ def _is_parseable_incus_size(raw: str) -> bool:
     validates this value server-side with the identical grammar at write time
     (``internal/instance/config.go``'s ``validate.IsSize``, which itself calls
     ``units.ParseByteSizeString``), so a value read back from ``incus config
-    get`` can never contain one anyway. Matching the narrower grammar removes
-    the gap rather than relying on that unreachability."""
+    get`` can never contain a non-ASCII digit anyway. Matching the narrower
+    grammar removes the gap rather than relying on that unreachability."""
     if not raw:
         return False
     i = 0
@@ -114,7 +123,9 @@ def _is_parseable_incus_size(raw: str) -> bool:
         i += 1
     if i == 0:
         return False
-    return raw[i:] in _INCUS_BYTE_SUFFIXES
+    if raw[i:] not in _INCUS_BYTE_SUFFIXES:
+        return False
+    return int(raw[:i]) != 0
 
 
 def _is_swap_on(raw: str) -> bool:

@@ -397,3 +397,40 @@ async def test_bare_one_knob_is_not_reset(tmp_path):
     ):
         await swap_watch.check_container_swap_and_alert(cfg, d)
     assert [c[2] for c in sp.calls] == ["get"]
+
+
+@pytest.mark.asyncio
+async def test_zero_valued_suffixed_sizes_are_still_reconciled(tmp_path):
+    """A zero-valued byte-size ceiling parses structurally but represents
+    zero bytes of swap -- Incus applies it literally and disables swap,
+    exactly like the boolean FALSE spellings. Every zero-valued suffix form
+    must still heal to 'true', not be mistaken for an already-on ceiling.
+    (Codex finding on PR #3069.)"""
+    for zero_form in ("0B", "0 bytes", "00GiB", "0GiB", "0kB", "0MB", "0TiB", "0PB", "0EiB"):
+        cfg = _Cfg(tmp_path)
+        d = _dispatcher()
+        sp = _subproc({"get": (0, f"{zero_form}\n", ""), "set": (0, "", "")})
+        with (
+            patch.object(swap_watch, "_run_subprocess", sp),
+            patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+        ):
+            await swap_watch.check_container_swap_and_alert(cfg, d)
+        assert [c[2] for c in sp.calls] == ["get", "set"], (
+            f"{zero_form!r} must be reconciled (it is zero bytes of swap), not left alone"
+        )
+
+
+@pytest.mark.asyncio
+async def test_nonzero_value_with_leading_zero_digits_is_not_reset(tmp_path):
+    """A leading-zero-padded but genuinely NONZERO value ('010GiB' = 10 GiB)
+    must still be recognized as swap-on -- the fix targets an all-zero
+    digit run, not any digit string containing a zero."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc({"get": (0, "010GiB\n", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get"]
