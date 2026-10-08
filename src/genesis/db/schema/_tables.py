@@ -7,6 +7,17 @@ Schema is derived from docs/architecture/genesis-v3-autonomous-behavior-design.m
 # ─── Table DDL ────────────────────────────────────────────────────────────────
 
 TABLES = {
+    "memory_namespaces": """
+CREATE TABLE IF NOT EXISTS memory_namespaces (
+    peer_id TEXT NOT NULL,
+    origin_class TEXT NOT NULL CHECK(origin_class='external_untrusted'),
+    collection TEXT NOT NULL,
+    content_digest TEXT NOT NULL CHECK(length(content_digest)=64),
+    memory_id TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','complete','deleted')),
+    PRIMARY KEY(peer_id,origin_class,collection,content_digest)
+)
+    """,
     "procedural_memory": """
         CREATE TABLE IF NOT EXISTS procedural_memory (
             id               TEXT PRIMARY KEY,

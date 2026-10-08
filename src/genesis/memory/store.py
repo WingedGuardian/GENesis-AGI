@@ -4,6 +4,7 @@ import asyncio
 import logging
 import uuid
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 import aiosqlite
 from qdrant_client import QdrantClient
@@ -26,6 +27,9 @@ from genesis.observability.events import GenesisEventBus
 from genesis.observability.provider_activity import track_operation
 from genesis.observability.types import Severity, Subsystem
 from genesis.qdrant.collections import delete_point, update_payload, upsert_point
+
+if TYPE_CHECKING:
+    from genesis.memory.namespace import DedupNamespace
 
 # Qdrant connection errors — broad catch for any transport/protocol failure
 try:
@@ -289,7 +293,23 @@ class MemoryStore:
         )
         return memory_id
 
-    async def store_reporting_creation(
+    async def store_reporting_creation(self, content: str, source: str, **kwargs) -> tuple[str, bool]:
+        """Report dedup ownership; serialize namespaced writes with deletion."""
+        namespace = kwargs.get("dedup_namespace")
+        if namespace is None:
+            return await self._store_reporting_creation(content, source, **kwargs)
+        from genesis.memory.namespace import DedupNamespace, write_lock
+
+        if not isinstance(namespace, DedupNamespace):
+            raise ValueError("invalid external memory namespace")
+        _, path = await self._anchor_target()
+        if path is None:
+            raise ValueError("namespaced memory requires a known file-backed database")
+        memory_id = namespace.memory_id(content)
+        async with memory_id_lock(memory_id), write_lock(path, memory_id):
+            return await self._store_reporting_creation(content, source, **kwargs)
+
+    async def _store_reporting_creation(
         self,
         content: str,
         source: str,
@@ -321,6 +341,7 @@ class MemoryStore:
         durability: str | None = None,
         expires_at: str | None = None,
         preference_domain: str | None = None,
+        dedup_namespace: DedupNamespace | None = None,
     ) -> tuple[str, bool]:
         """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link.
 
@@ -356,11 +377,41 @@ class MemoryStore:
                     f"got {life_domain!r}"
                 )
 
-        # Dedup: skip if exact content already stored (any collection)
-        try:
-            existing = await memory_crud.find_exact_duplicate(
-                self._db, content=content,
+        namespace_path = None
+        namespace_created = False
+        namespace_id = None
+        if dedup_namespace is not None:
+            from genesis.memory.namespace import DedupNamespace, reserve
+
+            resolved_collection = collection or _COLLECTION_MAP.get(memory_type, "episodic_memory")
+            if (
+                not isinstance(dedup_namespace, DedupNamespace)
+                or dedup_namespace.collection != resolved_collection
+                or origin_class not in (None, dedup_namespace.origin_class)
+                or source_subsystem is not None or supersedes is not None
+            ):
+                raise ValueError("incompatible namespaced memory write")
+            if self._db.in_transaction:
+                raise ValueError("namespace reservation cannot join an open writer transaction")
+            _, namespace_path = await self._anchor_target()
+            if namespace_path is None:
+                raise ValueError("namespaced memory requires a known file-backed database")
+            namespace_id, namespace_created, namespace_complete = await reserve(
+                namespace_path, dedup_namespace, content
             )
+            if namespace_complete:
+                return namespace_id, False
+            origin_class = dedup_namespace.origin_class
+            auto_link = False
+
+        # Ordinary dedup remains best-effort; namespace reservation is fail-closed.
+        try:
+            if dedup_namespace is not None:
+                existing = None
+            else:
+                existing = await memory_crud.find_exact_duplicate(
+                    self._db, content=content,
+                )
             if existing:
                 logger.debug("Skipping duplicate memory store: %s", existing)
                 # NOT created by this call: the caller must not compensate it.
@@ -373,7 +424,8 @@ class MemoryStore:
         try:
             from genesis.memory.entity_resolution import normalize_content
 
-            content = normalize_content(content)
+            if dedup_namespace is None:
+                content = normalize_content(content)
         except Exception:
             pass  # best-effort — never block a store on normalization failure
 
@@ -411,7 +463,7 @@ class MemoryStore:
             await self._resolve_supersede_target(supersedes) if supersedes else None
         )
 
-        memory_id = str(uuid.uuid4())
+        memory_id = namespace_id or str(uuid.uuid4())
         now_iso = datetime.now(UTC).isoformat()
         resolved_tags = tags or []
         resolved_collection = collection or _COLLECTION_MAP.get(memory_type, "episodic_memory")
@@ -554,7 +606,7 @@ class MemoryStore:
                     # round-trip on this hot store() path doesn't stall every
                     # other coroutine (background paths already do this; see
                     # memory/health.py, dream_cycle.py, entity_resolution.py).
-                    await asyncio.to_thread(
+                    operation = asyncio.to_thread(
                         upsert_point,
                         self._qdrant,
                         collection=resolved_collection,
@@ -562,6 +614,12 @@ class MemoryStore:
                         vector=vector,
                         payload=payload,
                     )
+                    if dedup_namespace is not None:
+                        from genesis.memory.namespace import drain_operation
+
+                        await drain_operation(operation)
+                    else:
+                        await operation
             except EmbeddingUnavailableError:
                 embedding_ok = False
                 logger.warning(
@@ -711,6 +769,16 @@ class MemoryStore:
                     resolved_supersedes, memory_id, exc_info=True,
                 )
 
+        if dedup_namespace is not None:
+            from genesis.memory.namespace import complete
+
+            # Repair only this reserved ID; an earlier interrupted attempt may
+            # already have created metadata with a pending embedding status.
+            await memory_crud.set_embedding_status(self._db, memory_id, embed_status)
+            if embedding_ok:
+                await pending_embeddings.delete_by_memory(self._db, memory_id=memory_id)
+            await complete(namespace_path, dedup_namespace, content)
+            return memory_id, namespace_created
         return (memory_id, True)
 
     async def supersede(
@@ -1049,6 +1117,22 @@ class MemoryStore:
         user just deleted.
         """
         async with memory_id_lock(memory_id):
+            from genesis.memory.namespace import (
+                drain_operation,
+                is_namespaced_id,
+                mark_deleted,
+                write_lock,
+            )
+
+            if is_namespaced_id(memory_id):
+                if self._db.in_transaction:
+                    raise ValueError("namespace deletion cannot join an open writer transaction")
+                _, path = await self._anchor_target()
+                if path is None:
+                    raise ValueError("namespaced deletion requires a file-backed database")
+                async with write_lock(path, memory_id):
+                    await mark_deleted(path, memory_id)
+                    return await drain_operation(self._delete_locked(memory_id))
             return await self._delete_locked(memory_id)
 
     async def _delete_locked(self, memory_id: str) -> dict:
