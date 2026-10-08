@@ -313,3 +313,87 @@ def test_run_check_wires_the_watch():
     text = Path(check_mod.__file__).read_text()
     assert "await _check_container_swap_and_alert(config, dispatcher)" in text
     assert "from genesis.guardian.swap_watch import check_container_swap_and_alert" in text
+
+
+@pytest.mark.asyncio
+async def test_byte_valued_knob_is_not_reset_to_true(tmp_path):
+    """A parseable Incus byte size (the native swap-ceiling form) is swap-on
+    and must NOT be reset to ``true`` — doing so is a live Incus update that
+    rewrites the cgroup to 0 (Incus 6.0 driver_lxc.go, confirmed from source:
+    any ``limits.memory.swap`` value other than a parseable size or explicit
+    false writes ``SetMemorySwapLimit(0)`` at apply time). Resetting it here
+    would flip swap off every tick on an operator- or guardian-set ceiling."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc({"get": (0, "10737418240\n", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="10737418240")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get"], "a byte value must not trigger a 'set'"
+    assert not d.send.called
+
+
+@pytest.mark.asyncio
+async def test_byte_valued_knob_with_suffix_is_not_reset(tmp_path):
+    """Same, for a human-written size with a unit suffix ('8GiB')."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc({"get": (0, "8GiB\n", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get"]
+    assert not d.send.called
+
+
+@pytest.mark.asyncio
+async def test_garbage_knob_value_is_still_healed(tmp_path):
+    """A value that is neither a bool nor a parseable size is NOT swap-on and
+    still gets reconciled to true (distinguishes 'not recognized as a size'
+    from 'recognized as swap-on')."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc({"get": (0, "garbage\n", ""), "set": (0, "", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get", "set"]
+
+
+@pytest.mark.asyncio
+async def test_bare_zero_knob_is_still_reconciled(tmp_path):
+    """'0' is NOT a 0-byte ceiling here — Incus's own IsFalse("0") claims it
+    as a boolean before any byte-size parsing is attempted (shared/util/
+    boolean.go), so it must be reconciled to 'true' exactly like 'false'.
+    Misreading it as a byte size would silently defeat the guardian's
+    deliberate-override policy for this one spelling of false."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc({"get": (0, "0\n", ""), "set": (0, "", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get", "set"]
+
+
+@pytest.mark.asyncio
+async def test_bare_one_knob_is_not_reset(tmp_path):
+    """'1' is Incus's IsTrue("1") — treated exactly like 'true' (same
+    SetMemorySwapLimit(0) branch), so there is nothing to reconcile."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc({"get": (0, "1\n", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert [c[2] for c in sp.calls] == ["get"]

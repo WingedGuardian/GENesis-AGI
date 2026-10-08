@@ -114,13 +114,22 @@ async def read_swap_max(container: str) -> str | None:
 async def activate_swap_max(container: str) -> bool:
     """Write 'max' to memory.swap.max — live-activate swap on a RUNNING container.
 
-    incus applies ``limits.memory.swap`` only when the container STARTS, so on
-    an already-running container the live cgroup keeps ``memory.swap.max=0``
-    until the next restart and every memory spike becomes the load-100 D-state
-    OOM-thrash wedge instead of degrading into swap. Writing ``max`` mirrors
-    what incus does at start (scripts/lib/container_swap.sh does the same from
-    host-setup); this is the guardian-side equivalent for installs that never
-    re-run host-setup.
+    ``limits.memory.swap=true`` (or unset/false) makes Incus write
+    ``memory.swap.max=0`` to the cgroup, at container start AND on every
+    live update to a ``limits.memory*`` key (driver_lxc.go, v6.0.0 and
+    main, read 2026-10-07: `` SetMemorySwapLimit(0)`` for ``IsTrueOrEmpty``
+    or ``IsFalse``, both at start and at live-update) — this is Incus's own
+    defined behavior, not a bug, and swap_watch's step 1 (re-asserting the
+    persistent knob) re-triggers it every time it runs. A ``limits.memory.swap``
+    byte value is the one case Incus does NOT reset: it parses as a native
+    swap ceiling and is applied as-is, at start and on live update, with no
+    0-window at all. Until this cgroup is live-reactivated, every memory
+    spike becomes the load-100 D-state OOM-thrash wedge instead of degrading
+    into swap. Writing ``max`` mirrors what Incus itself would write for a
+    swap-on container that hadn't just hit this 0-window
+    (scripts/lib/container_swap.sh does the same from host-setup); this is
+    the guardian-side equivalent for installs that never re-run host-setup,
+    and for the start/live-update window itself.
 
     Requires sudo because the cgroup is owned by root. Returns True on success.
     """

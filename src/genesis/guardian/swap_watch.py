@@ -11,9 +11,11 @@ the exact failure the setting exists to prevent, silent until it fires.
 The guardian is the only Genesis component that runs host-side with incus +
 sudo access *continuously*, so it reconciles on OBSERVED state each tick:
 
-1. **Persistent**: ``incus config get limits.memory.swap`` != ``true`` →
-   ``incus config set`` (covers unset AND false; applies at every future
-   container start).
+1. **Persistent**: ``incus config get limits.memory.swap`` is not already
+   swap-on (``_is_swap_on``: any Incus TRUE spelling, or a parseable byte-size
+   ceiling) → ``incus config set ... true`` (covers unset, every FALSE
+   spelling, and unparseable garbage; applies at every future container
+   start).
 2. **Live**: cgroup ``memory.swap.max == "0"`` → write ``max`` now — what
    incus would have written at start (``cgroup_ops.activate_swap_max``, the
    guardian-side twin of scripts/lib/container_swap.sh).
@@ -46,6 +48,93 @@ logger = logging.getLogger(__name__)
 _REALERT_HOURS = 24.0
 
 _INCUS_TIMEOUT = 10.0
+
+# Suffixes Incus's own ``units.ParseByteSizeString`` recognizes for
+# ``limits.memory.swap`` (shared/units/units.go, v6.0.0 and main, read
+# 2026-10-07). A bare integer (suffix "") is bytes. This mirrors Incus's
+# parser closely enough to tell a byte-valued ceiling apart from garbage; it
+# does not need to be a full re-implementation, since Incus itself is the
+# authority that actually applies the value.
+_INCUS_BYTE_SUFFIXES = frozenset(
+    {
+        "",
+        "B",
+        " bytes",
+        "kB",
+        "MB",
+        "GB",
+        "TB",
+        "PB",
+        "EB",
+        "KiB",
+        "MiB",
+        "GiB",
+        "TiB",
+        "PiB",
+        "EiB",
+    }
+)
+
+# Incus's own boolean-word lists (shared/util/boolean.go, v6.0.0 and main,
+# read 2026-10-07: `IsTrue` = {"true","1","yes","on"}, `IsFalse` =
+# {"false","0","no","off"}, case-insensitive). driver_lxc.go checks these
+# BEFORE trying to parse a byte size — `if IsTrueOrEmpty(v) || IsFalse(v) {
+# SetMemorySwapLimit(0) } else { parse as byte size }` — so the bare digit
+# strings "0" and "1" are claimed by the boolean check and NEVER reach the
+# byte-size parser, even though they also look like valid byte sizes (0
+# bytes, 1 byte). Checking these word lists first is required, not cosmetic:
+# without it, an operator's explicit "0" (deliberately off) would be
+# misread as "a 0-byte ceiling" and left unreconciled, silently defeating
+# the guardian's own "false is always reconciled back to true" invariant.
+_INCUS_TRUE_WORDS = frozenset({"true", "1", "yes", "on"})
+_INCUS_FALSE_WORDS = frozenset({"false", "0", "no", "off"})
+
+
+_ASCII_DIGITS = frozenset("0123456789")
+
+
+def _is_parseable_incus_size(raw: str) -> bool:
+    """Whether Incus would accept ``raw`` as a ``limits.memory.swap`` byte
+    size (a leading run of digits plus one of its known suffixes). Callers
+    must rule out Incus's own boolean words first (see ``_is_swap_on``) —
+    this function alone cannot tell "0" the byte size from "0" the bool.
+
+    Matched on ASCII digits only, deliberately narrower than ``str.isdigit()``
+    (which also accepts Unicode digit forms Go's byte-wise
+    ``strconv.Atoi`` — the actual parser this mirrors — would reject): Incus
+    validates this value server-side with the identical grammar at write time
+    (``internal/instance/config.go``'s ``validate.IsSize``, which itself calls
+    ``units.ParseByteSizeString``), so a value read back from ``incus config
+    get`` can never contain one anyway. Matching the narrower grammar removes
+    the gap rather than relying on that unreachability."""
+    if not raw:
+        return False
+    i = 0
+    while i < len(raw) and raw[i] in _ASCII_DIGITS:
+        i += 1
+    if i == 0:
+        return False
+    return raw[i:] in _INCUS_BYTE_SUFFIXES
+
+
+def _is_swap_on(raw: str) -> bool:
+    """Whether this ``limits.memory.swap`` value already explicitly encodes
+    swap-on, so the reconciler should leave it alone: any Incus TRUE
+    spelling, or a parseable byte-size ceiling (the native swap-ceiling
+    form — Incus parses anything that is not an ``IsTrueOrEmpty``/``IsFalse``
+    boolean word as a byte size; see driver_lxc.go). Empty/unset and any
+    Incus FALSE spelling are NOT swap-on — both still need the reconciling
+    'set true' call below, unchanged from today; this is the guardian's
+    existing "deliberate override: false is always reconciled back to true"
+    policy, now applied to every spelling of false, not just the literal
+    word "false"."""
+    stripped = raw.strip()
+    lowered = stripped.lower()
+    if not stripped or lowered in _INCUS_FALSE_WORDS:
+        return False
+    if lowered in _INCUS_TRUE_WORDS:
+        return True
+    return _is_parseable_incus_size(stripped)
 
 
 async def _send(dispatcher, severity: AlertSeverity, title: str, body: str) -> None:
@@ -115,8 +204,9 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
         rc, stdout = 1, ""
     config_verified = rc == 0
     if rc == 0:
-        value = stdout.strip().lower()
-        if value != "true":
+        raw_value = stdout.strip()
+        value = raw_value.lower()
+        if not _is_swap_on(raw_value):
             try:
                 rc_set, _out, err_set = await _run_subprocess(
                     "incus",
