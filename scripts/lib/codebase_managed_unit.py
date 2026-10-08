@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -332,6 +333,48 @@ def native_env(config: dict) -> dict[str, str]:
     return env
 
 
+def _writable_path(path: Path, *, directory: bool) -> None:
+    """Observe this caller's namespace without creating a probe or directory."""
+    target = path
+    while True:
+        try:
+            info = target.stat()
+            break
+        except FileNotFoundError:
+            if target.is_symlink() or target == target.parent:
+                raise
+            target = target.parent
+    if (directory or target != path) and not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"managed worker requires a directory: {path}")
+    if target == path and not directory and not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"managed worker requires a regular file: {path}")
+    permission = os.W_OK | (os.X_OK if stat.S_ISDIR(info.st_mode) else 0)
+    if (os.statvfs(target).f_flag & os.ST_RDONLY
+            or not os.access(target, permission, effective_ids=True)):
+        raise ValueError(
+            f"managed worker write path unavailable: {path}; check permissions and the "
+            "runner's operator-owned ReadWritePaths allowlist"
+        )
+
+
+def verify_worker_writes(config: dict, persistence: bool) -> None:
+    """Advisory write prerequisites; real IO failures retain their classification."""
+    state = absolute(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis"))
+    cache = Path(config["cache"])
+    for path in (cache, Path(config["runtime"]), state / "locks", state / "index-requests"):
+        _writable_path(path, directory=True)
+    for path in (state / "code-intelligence-runner.log", state / "index-requests/queue.sqlite3"):
+        _writable_path(path, directory=False)
+    for database in cache.glob("*.db"):
+        if database.name == "_config.db":
+            continue  # immutable configuration is validated through the RO reader
+        for path in (database, Path(str(database) + "-wal"), Path(str(database) + "-shm")):
+            _writable_path(path, directory=False)
+    if persistence:
+        _writable_path(Path("/tmp"), directory=True)  # noqa: S108 - observe pinned root; no creation
+        _writable_path(Path(config["main"]) / ".codebase-memory", directory=True)
+
+
 def absolute(raw: str) -> Path:
     if not isinstance(raw, str) or not raw or any(c in raw for c in "\n\r\x00"):
         raise ValueError("invalid managed path")
@@ -439,3 +482,28 @@ def frontend_command(main: Path, settings: Path, unit: str, backend: str, slice_
     bridge = 'exec "$$CBM_CLIENT_PYTHON" -I "$$CBM_CLIENT_HELPER" --config "$$CBM_CLIENT_CONFIG" client --unit "$$CBM_CLIENT_UNIT"'
     command.extend(("--", "/bin/sh", "-c", bridge))
     return command
+
+
+def parse_arguments(argv: list[str] | None, description: str | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--config", default=None)
+    commands = parser.add_subparsers(dest="command", required=True)
+    setup = commands.add_parser("configure")
+    for key in ("main", "binary", "state", "sentinel"):
+        setup.add_argument("--" + key, required=True)
+    commands.add_parser("status")
+    commands.add_parser("serve")
+    commands.add_parser("ready")
+    commands.add_parser("launch")
+    child = commands.add_parser("client")
+    child.add_argument("--unit", required=True)
+    availability = commands.add_parser("available")
+    availability.add_argument("--repo", required=True)
+    availability.add_argument("--persistence", choices=("true", "false"), default="true")
+    for command in ("enable", "disable", "remove"):
+        commands.add_parser(command)
+    teardown = commands.add_parser("uninstall")
+    teardown.add_argument("arguments", nargs=argparse.REMAINDER)
+    verification = commands.add_parser("verify-uninstall-locks")
+    verification.add_argument("fds", type=int, nargs=3)
+    return parser.parse_args(argv)

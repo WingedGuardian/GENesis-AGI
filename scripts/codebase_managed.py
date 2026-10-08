@@ -51,6 +51,10 @@ from codebase_managed_unit import (  # noqa: E402,F401
     validate_backend,
     validate_frontend_boundary,
     validate_source_identity,
+    verify_worker_writes,
+)
+from codebase_managed_unit import (
+    parse_arguments as native_parse_arguments,
 )
 
 SCRIPT = Path(__file__).resolve()
@@ -923,26 +927,17 @@ def uninstall_main(args: argparse.Namespace) -> int:
         return 1
 
 
+def available(path: Path, repo: str, persistence: bool = True) -> None:
+    config = runtime_config(path)
+    if absolute(repo).resolve(strict=True) != Path(config["main"]):
+        raise ValueError("managed indexing requires the configured physical main checkout")
+    verify_worker_writes(config, persistence)
+    verify_cache(config)
+    ready(config)
+
+
 def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=None)
-    commands = parser.add_subparsers(dest="command", required=True)
-    setup = commands.add_parser("configure")
-    for key in ("main", "binary", "state", "sentinel"):
-        setup.add_argument("--" + key, required=True)
-    commands.add_parser("status")
-    commands.add_parser("serve")
-    commands.add_parser("ready")
-    commands.add_parser("launch")
-    child = commands.add_parser("client")
-    child.add_argument("--unit", required=True)
-    for command in ("enable", "disable", "remove"):
-        commands.add_parser(command)
-    teardown = commands.add_parser("uninstall")
-    teardown.add_argument("arguments", nargs=argparse.REMAINDER)
-    verification = commands.add_parser("verify-uninstall-locks")
-    verification.add_argument("fds", type=int, nargs=3)
-    return parser.parse_args(argv)
+    return native_parse_arguments(argv, __doc__)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -983,6 +978,8 @@ def main(argv: list[str] | None = None) -> int:
             launch(read_settings(path), path)
         elif args.command == "client":
             client(path, args.unit)
+        elif args.command == "available":
+            available(path, args.repo, args.persistence == "true")
         else:
             config = runtime_config(path)
             (serve if args.command == "serve" else ready)(config)

@@ -22,6 +22,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+from tests.test_scripts.managed_code_intel_fixture import configured_sentinel, install_manager
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _RUNNER = _REPO_ROOT / "scripts" / "code_intel_runner.sh"
 _MARKER_PY = _REPO_ROOT / "scripts" / "lib" / "index_marker.py"
@@ -30,7 +32,11 @@ _spec = importlib.util.spec_from_file_location("index_marker", _MARKER_PY)
 im = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(im)
 
-_REPO = "/home/ubuntu/genesis"  # canonical; hash is stable
+def _repo(tmp_path: Path) -> str:
+    """A primary checkout owned by the fixture, shared by settings and queue."""
+    main = tmp_path / "primary"
+    (main / ".git").mkdir(parents=True, exist_ok=True)
+    return str(main)
 
 
 def _fake_entrypoint(tmp_path: Path, rc: int) -> Path:
@@ -49,6 +55,17 @@ def _run_runner(
     tmp_path: Path, entry_rc: int, *, load="0.1", iowait="0", claude_cpu="0", extra_env=None
 ):
     home = tmp_path / ".genesis"
+    private = tmp_path / "runner"
+    private.mkdir(exist_ok=True)
+    runner = private / "code_intel_runner.sh"
+    runner.write_text(_RUNNER.read_text())
+    if not (private / "lib").exists():
+        (private / "lib").symlink_to(_RUNNER.parent / "lib")
+    binary = private / "accepted-test-backend"
+    binary.touch()
+    install_manager(private / "codebase_managed.py", tmp_path, Path(_repo(tmp_path)), binary)
+    if extra_env and "CODEBASE_MEMORY_MCP_DISABLE_FILE" in extra_env:
+        configured_sentinel(tmp_path, extra_env["CODEBASE_MEMORY_MCP_DISABLE_FILE"])
     env = {
         "PATH": "/usr/bin:/bin",
         "HOME": str(tmp_path),
@@ -60,7 +77,7 @@ def _run_runner(
         **(extra_env or {}),
     }
     return subprocess.run(
-        ["bash", str(_RUNNER)],
+        ["bash", str(runner)],
         env=env,
         capture_output=True,
         text=True,
@@ -72,12 +89,12 @@ def _seed_marker(tmp_path, tools="both", mode="fast"):
     """Write a marker into the runner's GENESIS_HOME and return its hash."""
     env = {**os.environ, "GENESIS_HOME": str(tmp_path / ".genesis")}
     subprocess.run(
-        ["python3", str(_MARKER_PY), "write", "--repo", _REPO, "--tools", tools, "--mode", mode],
+        ["python3", str(_MARKER_PY), "write", "--repo", _repo(tmp_path), "--tools", tools, "--mode", mode],
         env=env,
         check=True,
         capture_output=True,
     )
-    return im.marker_hash(_REPO)
+    return im.marker_hash(_repo(tmp_path))
 
 
 def test_unopenable_runner_lock_refuses_indexing(tmp_path):
@@ -441,7 +458,7 @@ def test_uses_claimed_state_not_stale_list_snapshot(tmp_path):
                 str(_MARKER_PY),
                 "write",
                 "--repo",
-                _REPO,
+                _repo(tmp_path),
                 "--tools",
                 "cbm",
                 "--mode",
@@ -532,6 +549,9 @@ def test_cbm_disabled_during_idle_sample_restores_claim(tmp_path):
     with _db(tmp_path) as db:
         before = db.execute("SELECT * FROM pending").fetchall()
     assert _run_runner(tmp_path, 0, extra_env=env).returncode == 0
+    # Prove the idle sampler was reached: initial availability deferral must
+    # not satisfy this regression merely by leaving the queue unchanged.
+    assert (tmp_path / ".genesis/codebase-memory-mcp.disabled").exists()
     assert not (tmp_path / "entry.log").exists()
     with _db(tmp_path) as db:
         assert db.execute("SELECT * FROM pending").fetchall() == before
