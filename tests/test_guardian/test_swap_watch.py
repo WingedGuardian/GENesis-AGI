@@ -537,7 +537,7 @@ async def test_native_path_asserts_the_key(tmp_path, monkeypatch):
     d = _dispatcher()
     sp = _subproc(get_responses={
         "limits.memory.swap": (0, "true", ""),
-        "limits.memory": (0, "36GiB", ""),
+        "limits.memory": (0, "8GiB", ""),
     })
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
@@ -555,7 +555,7 @@ async def test_native_path_idempotent_when_matching(tmp_path, monkeypatch):
     d = _dispatcher()
     sp = _subproc(get_responses={
         "limits.memory.swap": (0, _TARGET_S, ""),
-        "limits.memory": (0, "36GiB", ""),
+        "limits.memory": (0, "8GiB", ""),
     })
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
@@ -575,7 +575,7 @@ async def test_native_path_repairs_live_drift(tmp_path, monkeypatch):
     d = _dispatcher()
     sp = _subproc(get_responses={
         "limits.memory.swap": (0, _TARGET_S, ""),
-        "limits.memory": (0, "36GiB", ""),
+        "limits.memory": (0, "8GiB", ""),
     })
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
@@ -598,7 +598,7 @@ async def test_soft_memory_limit_takes_the_fallback_path(tmp_path, monkeypatch):
     d = _dispatcher()
     sp = _subproc(get_responses={
         "limits.memory.swap": (0, "true", ""),
-        "limits.memory": (0, "36GiB", ""),
+        "limits.memory": (0, "8GiB", ""),
         "limits.memory.enforce": (0, "soft", ""),
     })
     with (
@@ -619,7 +619,7 @@ async def test_unreadable_enforce_probe_is_degraded(tmp_path, monkeypatch):
     d = _dispatcher()
     sp = _subproc(get_responses={
         "limits.memory.swap": (0, "false", ""),
-        "limits.memory": (0, "36GiB", ""),
+        "limits.memory": (0, "8GiB", ""),
         "limits.memory.enforce": (1, "", "timeout"),
     })
     wm = AsyncMock(return_value=True)
@@ -686,7 +686,7 @@ async def test_unreadable_key_with_a_ceiling_warns_not_just_info(tmp_path, monke
     d = _dispatcher()
     sp = _subproc(get_responses={
         "limits.memory.swap": (1, "", "timeout"),
-        "limits.memory": (0, "36GiB", ""),
+        "limits.memory": (0, "8GiB", ""),
     })
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
@@ -710,7 +710,7 @@ async def test_ceiling_live_zero_writes_target_not_max(tmp_path, monkeypatch):
     d = _dispatcher()
     sp = _subproc(get_responses={
         "limits.memory.swap": (0, _TARGET_S, ""),
-        "limits.memory": (0, "36GiB", ""),
+        "limits.memory": (0, "8GiB", ""),
     })
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
@@ -731,7 +731,7 @@ async def test_ceiling_cgroup_write_failure_is_a_ceiling_problem(tmp_path, monke
     d = _dispatcher()
     sp = _subproc(get_responses={
         "limits.memory.swap": (0, _TARGET_S, ""),
-        "limits.memory": (0, "36GiB", ""),
+        "limits.memory": (0, "8GiB", ""),
     })
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
@@ -752,7 +752,7 @@ async def test_failed_ceiling_write_over_a_live_zero_is_also_swap_off(tmp_path, 
     d = _dispatcher()
     sp = _subproc(get_responses={
         "limits.memory.swap": (0, _TARGET_S, ""),
-        "limits.memory": (0, "36GiB", ""),
+        "limits.memory": (0, "8GiB", ""),
     })
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
