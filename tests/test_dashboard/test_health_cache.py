@@ -193,9 +193,14 @@ async def test_an_untrusted_peer_gets_no_probe_error_text(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_trusted_peer_gets_the_checkout_file_names(monkeypatch):
+async def test_a_loopback_peer_without_a_credential_gets_no_file_names(monkeypatch):
+    """A reverse proxy (or a container proxy device) makes every outside caller
+    arrive from a trusted address, so the peer address never discloses the
+    names: only the internal bearer or a verified session does."""
     body, _ = await _health_as("127.0.0.1", monkeypatch=monkeypatch)
-    assert body["deploy_health"]["main_checkout"]["paths"] == ["a.txt", "b.txt"]
+    checkout = body["deploy_health"]["main_checkout"]
+    assert "paths" not in checkout
+    assert checkout["count"] == 2
 
 
 @pytest.mark.asyncio

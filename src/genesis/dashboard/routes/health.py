@@ -132,22 +132,20 @@ def _redact_checkout_paths(snapshot: dict) -> None:
     This route is reachable from any network (``_OPEN_FROM_ANY_NETWORK``, for
     the host-side supervisor), and the names can be a private fork's or this
     install's own files; a probe error can name absolute paths on the install.
-    The status and count stay public; the names and the reason go only
-    to a trusted-network peer, the internal bearer, or a verified dashboard
-    session. Rebuilt as new dicts: ``snapshot`` is a shallow copy, so its
-    nested dicts are the cached snapshot other callers read.
+    The status and count stay public; the names and the reason go only to
+    the internal bearer or a verified dashboard session. Never to a peer by
+    its address: behind a reverse proxy (or a container proxy device) every
+    outside caller arrives from a trusted address. Rebuilt as new dicts:
+    ``snapshot`` is a shallow copy, so its nested dicts are the cached
+    snapshot other callers read.
     """
-    from genesis.dashboard.auth import (
-        _peer_is_trusted,
-        has_internal_bearer,
-        has_verified_credential,
-    )
+    from genesis.dashboard.auth import has_internal_bearer, has_verified_credential
 
     deploy = snapshot.get("deploy_health")
     checkout = deploy.get("main_checkout") if isinstance(deploy, dict) else None
     if not isinstance(checkout, dict) or not ({"paths", "reason"} & checkout.keys()):
         return
-    if _peer_is_trusted(request.remote_addr) or has_internal_bearer() or has_verified_credential():
+    if has_internal_bearer() or has_verified_credential():
         return
     snapshot["deploy_health"] = {
         **deploy,
