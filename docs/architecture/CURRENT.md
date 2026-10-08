@@ -1579,7 +1579,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 84c7259d 2026-08-31
+verified: 83a835e32 2026-10-08
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -1728,8 +1728,18 @@ verified: 84c7259d 2026-08-31
   re-asserts `limits.memory.swap=true` (incus config) and live-activates the
   cgroup `memory.swap.max` (via `cgroup_ops`) when observed at `0` — the
   self-heal for installs that advance via bare `git pull` and never re-run
-  host-setup. Heals page INFO; failures page WARNING (24h throttle); kill
-  switch `swap_reconcile_enabled: false`.
+  host-setup. Heals page INFO; failures page WARNING, throttled PER PROBLEM
+  CLASS (`swap_off`/`ceiling`, 24h once delivered — a failed delivery itself
+  retries in 5min rather than silently adopting the 24h window); kill switch
+  `swap_reconcile_enabled: false`. **Opt-in ceiling**: install-local
+  `swap_ceiling_pct` (percent of HOST SwapTotal, page-aligned) asserted via
+  Incus's native `limits.memory.swap=<bytes>` key under a hard
+  `limits.memory` cap, else a direct cgroup write
+  (`cgroup_ops.write_swap_max`). `swap_ceiling_pct: off` removes a ceiling
+  (key back to `true`, a finite live cap lifted to `max`); deleting the
+  setting leaves whatever is set alone, so no ownership record exists. A
+  tick that can't compute the target holds rather than resetting the key to
+  `true`.
 - **Host zram swap** (`scripts/lib/host_swap.sh`, E-rest E3): a
   compressed-RAM-first swap tier on the host VM — `zram-swap.service` at swap
   priority 100, sized `min(MemTotal/2, 4GiB)` (`HOSTSWAP_CAP_GIB` override).
