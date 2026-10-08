@@ -27,6 +27,16 @@ RestartSec=10
 RestartPreventExitStatus=200 2
 
 Environment=TMPDIR=__HOME__/.genesis/cc-tmp
+# SQLite reads SQLITE_TMPDIR before TMPDIR, so its temp spill files (etilqs_*,
+# 100-200 MB sorts) land on the big disk while the Claude Code sessions this
+# process launches keep TMPDIR on cc-tmp. Without it those spills fill the
+# small cc-tmp volume and trip the runaway-file pager. MEASURED 2026-10-08 on
+# SQLite 3.45.1: SQLITE_TMPDIR wins over TMPDIR; a missing directory falls back
+# to TMPDIR with no error.
+Environment=SQLITE_TMPDIR=__HOME__/tmp
+# ~/tmp is created on every update.sh run, but install.sh and bootstrap.sh create it
+# only when /tmp is small: make sure it exists so the line above takes effect.
+ExecStartPre=-/bin/mkdir -p __HOME__/tmp
 Environment=PATH=__VENV__/bin:__CC_BIN_DIR__:__HOME__/.npm-global/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
 MemoryMax=80%
 LimitNOFILE=65536
