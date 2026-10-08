@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -423,6 +424,18 @@ class GuardianConfig:
     # for hosts where swap-off is a deliberate operator choice.
     swap_reconcile_enabled: bool = True
 
+    # Opt-in ceiling on the container's share of HOST swap, as a percentage of
+    # host SwapTotal (not bytes — this is the one knob here expressed as a
+    # percentage rather than an absolute, so it tracks the pool if the host's
+    # swap grows or shrinks). None (the public default) means uncapped,
+    # matching today's behavior. Install-local: set in the deployed
+    # guardian.yaml, never in the repo's shipped template. Validated in
+    # _finalize (bool rejected first — bool is an int subclass; a huge or
+    # non-finite or out-of-range value warns and falls back to None, never to
+    # 0, since 0 would mean swap-off, the opposite of this reconciler's whole
+    # purpose).
+    swap_ceiling_pct: float | None = None
+
     # Host VM details — used by container for bidirectional monitoring (SSH → gateway)
     host_ip: str = ""      # Auto-detected by installer; empty = not installed
     host_user: str = ""    # Host VM username
@@ -683,6 +696,45 @@ def _finalize(config: GuardianConfig) -> GuardianConfig:
             "deploy stand-down will NOT engage. Set it >= the largest caller TTL.",
             config.gateway_pause_max_ahead_s,
         )
+
+    # swap_ceiling_pct: a percentage of HOST SwapTotal, never a byte count —
+    # tolerate None (default) and a plain int/float in (0, 100]; anything
+    # else falls back to None (uncapped), loudly. Never falls back to 0:
+    # 0 would mean "cap swap at nothing", the opposite of what this knob is
+    # for, and would hand swap_watch a target that disables swap outright.
+    pct = config.swap_ceiling_pct
+    if pct is not None:
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            logger.warning(
+                "swap_ceiling_pct=%r is not a number — ignoring (swap stays "
+                "uncapped). Set a plain number greater than 0 and at most 100.",
+                pct,
+            )
+            config.swap_ceiling_pct = None
+        elif isinstance(pct, int) and not (0 < pct <= 100):
+            # Caught before any float conversion: an oversized YAML int (e.g.
+            # ~300+ digits) makes math.isfinite(float(pct)) raise OverflowError
+            # rather than returning False, which would abort config loading
+            # entirely instead of the intended "warn and ignore" (architect
+            # review on the stacked rework PR, 2026-10-08). Any such int is
+            # necessarily out of (0, 100] anyway, so this range check alone
+            # rejects it with no conversion ever attempted.
+            logger.warning(
+                "swap_ceiling_pct=%r is out of range — ignoring (swap stays "
+                "uncapped). Must be greater than 0 and at most 100.",
+                pct,
+            )
+            config.swap_ceiling_pct = None
+        elif not math.isfinite(pct) or not (0 < pct <= 100):
+            logger.warning(
+                "swap_ceiling_pct=%r is out of range — ignoring (swap stays "
+                "uncapped). Must be greater than 0 and at most 100.",
+                pct,
+            )
+            config.swap_ceiling_pct = None
+        else:
+            config.swap_ceiling_pct = float(pct)
+
     return config
 
 
@@ -705,7 +757,7 @@ def load_config(path: Path | None = None) -> GuardianConfig:
         "container_name", "container_ip", "container_user",
         "health_api_port", "check_interval_s", "state_dir",
         "host_ip", "host_user", "maintenance_file",
-        "swap_reconcile_enabled", "gateway_pause_max_ahead_s",
+        "swap_reconcile_enabled", "swap_ceiling_pct", "gateway_pause_max_ahead_s",
     }
     top_kwargs = {k: v for k, v in raw.items() if k in top_fields}
 

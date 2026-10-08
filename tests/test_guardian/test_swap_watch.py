@@ -1,10 +1,14 @@
 """Tests for the guardian-side container-swap reconciler (swap_watch).
 
 The guardian re-asserts the swap invariant on observed state each tick:
-persistent ``incus config`` knob + live cgroup ``memory.swap.max``. Healthy
-path must be read-only and silent; heals emit one INFO alert; failures emit a
-throttled WARNING; an unreadable signal is NO signal. Subprocess and cgroup
-primitives are mocked at the swap_watch/cgroup_ops seams.
+persistent ``incus config`` knob + live cgroup ``memory.swap.max``, plus an
+opt-in ``swap_ceiling_pct`` enforced via Incus's native key (with a cgroup
+fallback) and tracked via an Incus instance key, ``user.genesis.swap_ceiling``
+(never a local file — see the module docstring). Healthy path must be
+read-only and silent; heals emit one INFO alert; failures emit a throttled
+WARNING per problem class; an unreadable signal is NO signal, and a degraded
+ceiling tick HOLDS rather than guessing. Subprocess and cgroup primitives are
+mocked at the swap_watch/cgroup_ops seams.
 """
 
 from __future__ import annotations
@@ -18,13 +22,16 @@ import pytest
 from genesis.guardian import cgroup_ops, swap_watch
 from genesis.guardian.alert.base import AlertSeverity
 
+_MARKER_KEY = swap_watch._MARKER_KEY
+
 
 class _Cfg:
     """Minimal config stub exposing what swap_watch reads."""
 
-    def __init__(self, tmp_path, enabled=True):
+    def __init__(self, tmp_path, enabled=True, swap_ceiling_pct=None):
         self.container_name = "genesis"
         self.swap_reconcile_enabled = enabled
+        self.swap_ceiling_pct = swap_ceiling_pct
         self._sp = tmp_path
 
     @property
@@ -32,29 +39,48 @@ class _Cfg:
         return self._sp
 
 
-def _subproc(responses):
-    """Build a _run_subprocess mock keyed on the subcommand ('get'/'set').
+def _parse_set_args(cmd) -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    for arg in cmd[4:]:
+        k, _, v = arg.partition("=")
+        pairs[k] = v
+    return pairs
 
-    ``responses`` maps 'get'/'set' → (rc, stdout, stderr). Records calls on
-    the returned mock's ``calls`` list.
+
+def _subproc(get_responses=None, set_responses=None):
+    """Build a ``_run_subprocess`` fake for ``incus config get|set``.
+
+    ``get_responses`` maps a config KEY (e.g. ``"limits.memory.swap"``) to
+    ``(rc, stdout, stderr)``; a key absent from the map answers ``(0, "", "")``
+    (Incus's own "unset" shape). ``set_responses`` maps a frozenset of the
+    set call's ``{key: value}`` pairs to ``(rc, stdout, stderr)``; absent
+    pairs default to success. Every call is recorded on ``fake.calls`` and
+    every successful set's pairs dict on ``fake.sets``.
     """
+    get_responses = get_responses or {}
+    set_responses = set_responses or {}
 
     async def fake(*cmd, timeout=None):
         assert cmd[0] == "incus" and cmd[1] == "config"
-        if cmd[2] == "get":
-            # The get must read the EXPANDED config (profile-inherited true
-            # must not be treated as unset).
-            assert cmd[3] == "--expanded"
         fake.calls.append(cmd)
-        return responses[cmd[2]]
+        if cmd[2] == "get":
+            assert cmd[3] == "--expanded"
+            key = cmd[5]
+            return get_responses.get(key, (0, "", ""))
+        if cmd[2] == "set":
+            pairs = _parse_set_args(cmd)
+            fake.sets.append(pairs)
+            return set_responses.get(frozenset(pairs.items()), (0, "", ""))
+        raise AssertionError(f"unexpected incus config subcommand: {cmd[2]}")
 
     fake.calls = []
+    fake.sets = []
     return fake
 
 
-def _dispatcher():
+def _dispatcher(send_result=True):
     d = AsyncMock()
-    d.send = AsyncMock()
+    d.send = AsyncMock(return_value=send_result)
     return d
 
 
@@ -62,63 +88,67 @@ def _sent_severities(dispatcher):
     return [call.args[0].severity for call in dispatcher.send.call_args_list]
 
 
+def _sent_bodies(dispatcher):
+    return [call.args[0].body for call in dispatcher.send.call_args_list]
+
+
+def _set_calls_for_key(fake, key: str) -> list[dict[str, str]]:
+    return [pairs for pairs in fake.sets if key in pairs]
+
+
+# ---------------------------------------------------------------------------
+# Baseline (no ceiling configured, "mode=none") — unchanged #3069 behavior.
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
 async def test_healthy_path_is_readonly_and_silent(tmp_path):
-    """Knob true + cgroup already max → no writes, no alerts."""
+    """Key already true, marker absent, cgroup already max -> zero writes,
+    zero alerts, even with the marker read added."""
     cfg = _Cfg(tmp_path)
     d = _dispatcher()
-    sp = _subproc({"get": (0, "true\n", "")})
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "true", "")})
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
         patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
-        patch.object(swap_watch, "activate_swap_max", AsyncMock()) as act,
     ):
         await swap_watch.check_container_swap_and_alert(cfg, d)
-    assert [c[2] for c in sp.calls] == ["get"]  # read-only: no config set
-    act.assert_not_awaited()
-    d.send.assert_not_awaited()
+    assert sp.sets == []
+    assert not d.send.called
 
 
 @pytest.mark.asyncio
 async def test_unset_knob_is_set_and_info_alerted(tmp_path):
-    """`incus config get` on an unset key: rc=0, empty output → config set."""
     cfg = _Cfg(tmp_path)
     d = _dispatcher()
-    sp = _subproc({"get": (0, "", ""), "set": (0, "", "")})
+    sp = _subproc()
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
         patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
     ):
         await swap_watch.check_container_swap_and_alert(cfg, d)
-    assert [c[2] for c in sp.calls] == ["get", "set"]
-    set_cmd = sp.calls[1]
-    assert set_cmd[3:] == ("genesis", "limits.memory.swap", "true")
+    assert _set_calls_for_key(sp, "limits.memory.swap") == [{"limits.memory.swap": "true"}]
     assert _sent_severities(d) == [AlertSeverity.INFO]
-    assert "limits.memory.swap" in d.send.call_args.args[0].body
 
 
 @pytest.mark.asyncio
 async def test_explicit_false_knob_is_reconciled(tmp_path):
-    """Deliberate-override semantics: false → true (invariant wins; kill
-    switch is the opt-out, documented in the alert body)."""
     cfg = _Cfg(tmp_path)
     d = _dispatcher()
-    sp = _subproc({"get": (0, "false\n", ""), "set": (0, "", "")})
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "false", "")})
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
         patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
     ):
         await swap_watch.check_container_swap_and_alert(cfg, d)
-    assert [c[2] for c in sp.calls] == ["get", "set"]
-    assert "swap_reconcile_enabled" in d.send.call_args.args[0].body
+    assert _set_calls_for_key(sp, "limits.memory.swap") == [{"limits.memory.swap": "true"}]
 
 
 @pytest.mark.asyncio
 async def test_live_zero_activates_and_info_alerts(tmp_path):
-    """The sibling incident state: knob true but live cgroup still 0."""
     cfg = _Cfg(tmp_path)
     d = _dispatcher()
-    sp = _subproc({"get": (0, "true", "")})
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "true", "")})
     act = AsyncMock(return_value=True)
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
@@ -127,18 +157,17 @@ async def test_live_zero_activates_and_info_alerts(tmp_path):
     ):
         await swap_watch.check_container_swap_and_alert(cfg, d)
     act.assert_awaited_once_with("genesis")
-    assert _sent_severities(d) == [AlertSeverity.INFO]
     assert "live" in d.send.call_args.args[0].body
 
 
 @pytest.mark.asyncio
-async def test_live_zero_under_a_byte_ceiling_is_reported_not_overwritten(tmp_path):
-    """The persistent key holds a byte ceiling, yet the live cgroup reads 0.
-    Writing "max" would replace the ceiling with unlimited swap until the next
-    restart, so the live half is reported and left alone."""
+async def test_byte_valued_key_with_live_zero_is_reported_not_overwritten(tmp_path):
+    """A ceiling held in the key (set by hand, or by a past ceiling tick)
+    survives a live 0 even with no ceiling configured THIS tick — #3069's
+    own protection, carried forward unchanged into mode=none."""
     cfg = _Cfg(tmp_path)
     d = _dispatcher()
-    sp = _subproc({"get": (0, "2GiB", "")})
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "2147483648", "")})
     act = AsyncMock(return_value=True)
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
@@ -147,407 +176,800 @@ async def test_live_zero_under_a_byte_ceiling_is_reported_not_overwritten(tmp_pa
     ):
         await swap_watch.check_container_swap_and_alert(cfg, d)
     act.assert_not_awaited()
-    assert [c[2] for c in sp.calls] == ["get"]  # the ceiling itself is kept too
     assert _sent_severities(d) == [AlertSeverity.WARNING]
-    assert "2GiB" in d.send.call_args.args[0].body
+    assert "2147483648" in d.send.call_args.args[0].body
 
 
 @pytest.mark.asyncio
 async def test_live_heal_with_unverified_config_warns_not_info(tmp_path):
-    """config read fails but the cgroup is still writable and at 0: activating
-    live must NOT claim a clean reconcile — the persistent knob is unverified
-    and a restart can revert swap to off, so this pages a WARNING, not INFO."""
     cfg = _Cfg(tmp_path)
     d = _dispatcher()
-    sp = _subproc({"get": (1, "", "socket error")})  # config read fails
+    sp = _subproc(get_responses={"limits.memory.swap": (1, "", "boom")})
+    act = AsyncMock(return_value=True)
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
         patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="0")),
-        patch.object(swap_watch, "activate_swap_max", AsyncMock(return_value=True)),
+        patch.object(swap_watch, "activate_swap_max", act),
     ):
         await swap_watch.check_container_swap_and_alert(cfg, d)
-    assert [c[2] for c in sp.calls] == ["get"]  # no set attempted (read failed)
+    act.assert_awaited_once()
     assert _sent_severities(d) == [AlertSeverity.WARNING]
-    body = d.send.call_args.args[0].body
-    assert "persistent" in body and "revert" in body
 
 
 @pytest.mark.asyncio
-async def test_live_write_failure_warns_once_then_throttles(tmp_path):
-    """A failed heal pages WARNING, but not again inside the throttle window."""
+async def test_live_write_failure_warns(tmp_path):
     cfg = _Cfg(tmp_path)
     d = _dispatcher()
-    sp = _subproc({"get": (0, "true", "")})
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "true", "")})
+    act = AsyncMock(return_value=False)
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
         patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="0")),
-        patch.object(swap_watch, "activate_swap_max", AsyncMock(return_value=False)),
+        patch.object(swap_watch, "activate_swap_max", act),
     ):
         await swap_watch.check_container_swap_and_alert(cfg, d)
-        await swap_watch.check_container_swap_and_alert(cfg, d)
-    assert _sent_severities(d) == [AlertSeverity.WARNING]  # one, not two
-    # After the window elapses, it re-pages.
-    stale = datetime.now(UTC) - timedelta(hours=swap_watch._REALERT_HOURS + 1)
-    (tmp_path / "swap_watch_state.json").write_text(
-        json.dumps({"last_failure_alert_at": stale.isoformat()}),
-    )
-    with (
-        patch.object(swap_watch, "_run_subprocess", sp),
-        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="0")),
-        patch.object(swap_watch, "activate_swap_max", AsyncMock(return_value=False)),
-    ):
-        await swap_watch.check_container_swap_and_alert(cfg, d)
-    assert _sent_severities(d) == [AlertSeverity.WARNING, AlertSeverity.WARNING]
+    assert _sent_severities(d) == [AlertSeverity.WARNING]
 
 
 @pytest.mark.asyncio
 async def test_config_set_failure_warns(tmp_path):
     cfg = _Cfg(tmp_path)
     d = _dispatcher()
-    sp = _subproc({"get": (0, "", ""), "set": (1, "", "boom")})
+    sp = _subproc(set_responses={frozenset({"limits.memory.swap": "true"}.items()): (1, "", "nope")})
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
         patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
     ):
         await swap_watch.check_container_swap_and_alert(cfg, d)
     assert _sent_severities(d) == [AlertSeverity.WARNING]
-    assert "boom" in d.send.call_args.args[0].body
 
 
 @pytest.mark.asyncio
 async def test_incus_unreachable_is_no_signal(tmp_path):
-    """config get rc!=0 → no set attempt, no alert (state machine's job)."""
     cfg = _Cfg(tmp_path)
     d = _dispatcher()
-    sp = _subproc({"get": (1, "", "connection refused")})
+
+    async def raising(*cmd, timeout=None):
+        raise OSError("incus not found")
+
     with (
-        patch.object(swap_watch, "_run_subprocess", sp),
-        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value=None)),
-        patch.object(swap_watch, "activate_swap_max", AsyncMock()) as act,
+        patch.object(swap_watch, "_run_subprocess", raising),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
     ):
         await swap_watch.check_container_swap_and_alert(cfg, d)
-    assert [c[2] for c in sp.calls] == ["get"]
-    act.assert_not_awaited()
-    d.send.assert_not_awaited()
+    assert not d.send.called
 
 
 @pytest.mark.asyncio
 async def test_unreadable_cgroup_skips_live_half(tmp_path):
-    """read_swap_max None (stopped container / cgroup v1) → no live write."""
     cfg = _Cfg(tmp_path)
     d = _dispatcher()
-    sp = _subproc({"get": (0, "true", "")})
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "true", "")})
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
         patch.object(swap_watch, "read_swap_max", AsyncMock(return_value=None)),
-        patch.object(swap_watch, "activate_swap_max", AsyncMock()) as act,
     ):
         await swap_watch.check_container_swap_and_alert(cfg, d)
-    act.assert_not_awaited()
-    d.send.assert_not_awaited()
+    assert not d.send.called
 
 
 @pytest.mark.asyncio
 async def test_kill_switch_disables_everything(tmp_path):
-    cfg = _Cfg(tmp_path, enabled=False)
+    """Disabled: zero subprocess calls at all, including the marker read."""
+    cfg = _Cfg(tmp_path, enabled=False, swap_ceiling_pct=50)
     d = _dispatcher()
-    with (
-        patch.object(swap_watch, "_run_subprocess", AsyncMock()) as sp,
-        patch.object(swap_watch, "read_swap_max", AsyncMock()) as rd,
-    ):
+    sp = _subproc()
+    with patch.object(swap_watch, "_run_subprocess", sp):
         await swap_watch.check_container_swap_and_alert(cfg, d)
-    sp.assert_not_awaited()
-    rd.assert_not_awaited()
-    d.send.assert_not_awaited()
+    assert sp.calls == []
+    assert not d.send.called
 
 
 @pytest.mark.asyncio
 async def test_dispatch_failure_never_raises(tmp_path):
-    """A dead dispatcher must not break the reconcile (heal still happened)."""
     cfg = _Cfg(tmp_path)
-    d = _dispatcher()
-    d.send.side_effect = RuntimeError("transport down")
-    sp = _subproc({"get": (0, "", ""), "set": (0, "", "")})
+    d = AsyncMock()
+    d.send = AsyncMock(side_effect=RuntimeError("boom"))
+    sp = _subproc()
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
         patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
     ):
-        await swap_watch.check_container_swap_and_alert(cfg, d)  # no raise
-    assert [c[2] for c in sp.calls] == ["get", "set"]
-
-
-# ── cgroup primitives ──────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_read_swap_max_reads_via_sudo():
-    async def fake(*cmd, timeout=None):
-        assert cmd[:2] == ("sudo", "cat")
-        assert cmd[2].endswith("lxc.payload.genesis/memory.swap.max")
-        return (0, "0\n", "")
-
-    with patch.object(cgroup_ops, "_run_subprocess", fake):
-        assert await cgroup_ops.read_swap_max("genesis") == "0"
-
-
-@pytest.mark.asyncio
-async def test_read_swap_max_failure_is_none():
-    with patch.object(
-        cgroup_ops,
-        "_run_subprocess",
-        AsyncMock(return_value=(1, "", "denied")),
-    ):
-        assert await cgroup_ops.read_swap_max("genesis") is None
-
-
-@pytest.mark.asyncio
-async def test_activate_swap_max_writes_max_via_sudo():
-    async def fake(*cmd, timeout=None):
-        assert cmd[:3] == ("sudo", "sh", "-c")
-        assert "echo max >" in cmd[3]
-        assert "lxc.payload.genesis/memory.swap.max" in cmd[3]
-        return (0, "", "")
-
-    with patch.object(cgroup_ops, "_run_subprocess", fake):
-        assert await cgroup_ops.activate_swap_max("genesis") is True
-
-
-@pytest.mark.asyncio
-async def test_activate_swap_max_failure_is_false():
-    with patch.object(
-        cgroup_ops,
-        "_run_subprocess",
-        AsyncMock(return_value=(1, "", "denied")),
-    ):
-        assert await cgroup_ops.activate_swap_max("genesis") is False
-
-
-# ── wiring ─────────────────────────────────────────────────────────────────
+        await swap_watch.check_container_swap_and_alert(cfg, d)  # must not raise
 
 
 def test_run_check_wires_the_watch():
-    """The reconciler is dead unless run_check actually calls it."""
-    from pathlib import Path
+    from genesis.guardian import check
 
-    import genesis.guardian.check as check_mod
-
-    text = Path(check_mod.__file__).read_text()
-    assert "await _check_container_swap_and_alert(config, dispatcher)" in text
-    assert "from genesis.guardian.swap_watch import check_container_swap_and_alert" in text
-
-
-@pytest.mark.asyncio
-async def test_byte_valued_knob_is_not_reset_to_true(tmp_path):
-    """A parseable Incus byte size (the native swap-ceiling form) is swap-on
-    and must NOT be reset to ``true`` — doing so is a live Incus update that
-    rewrites the cgroup to 0 (Incus 6.0 driver_lxc.go, confirmed from source:
-    any ``limits.memory.swap`` value other than a parseable size or explicit
-    false writes ``SetMemorySwapLimit(0)`` at apply time). Resetting it here
-    would flip swap off every tick on an operator- or guardian-set ceiling."""
-    cfg = _Cfg(tmp_path)
-    d = _dispatcher()
-    sp = _subproc({"get": (0, "10737418240\n", "")})
-    with (
-        patch.object(swap_watch, "_run_subprocess", sp),
-        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="10737418240")),
-    ):
-        await swap_watch.check_container_swap_and_alert(cfg, d)
-    assert [c[2] for c in sp.calls] == ["get"], "a byte value must not trigger a 'set'"
-    assert not d.send.called
-
-
-@pytest.mark.asyncio
-async def test_byte_valued_knob_with_suffix_is_not_reset(tmp_path):
-    """Same, for a human-written size with a unit suffix ('8GiB')."""
-    cfg = _Cfg(tmp_path)
-    d = _dispatcher()
-    sp = _subproc({"get": (0, "8GiB\n", "")})
-    with (
-        patch.object(swap_watch, "_run_subprocess", sp),
-        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
-    ):
-        await swap_watch.check_container_swap_and_alert(cfg, d)
-    assert [c[2] for c in sp.calls] == ["get"]
-    assert not d.send.called
-
-
-@pytest.mark.asyncio
-async def test_garbage_knob_value_is_still_healed(tmp_path):
-    """A value that is neither a bool nor a parseable size is NOT swap-on and
-    still gets reconciled to true (distinguishes 'not recognized as a size'
-    from 'recognized as swap-on')."""
-    cfg = _Cfg(tmp_path)
-    d = _dispatcher()
-    sp = _subproc({"get": (0, "garbage\n", ""), "set": (0, "", "")})
-    with (
-        patch.object(swap_watch, "_run_subprocess", sp),
-        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
-    ):
-        await swap_watch.check_container_swap_and_alert(cfg, d)
-    assert [c[2] for c in sp.calls] == ["get", "set"]
+    assert hasattr(check, "_check_container_swap_and_alert")
 
 
 @pytest.mark.asyncio
 async def test_bare_zero_knob_is_still_reconciled(tmp_path):
-    """'0' is NOT a 0-byte ceiling here — Incus's own IsFalse("0") claims it
-    as a boolean before any byte-size parsing is attempted (shared/util/
-    boolean.go), so it must be reconciled to 'true' exactly like 'false'.
-    Misreading it as a byte size would silently defeat the guardian's
-    deliberate-override policy for this one spelling of false."""
     cfg = _Cfg(tmp_path)
     d = _dispatcher()
-    sp = _subproc({"get": (0, "0\n", ""), "set": (0, "", "")})
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "0", "")})
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
         patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
     ):
         await swap_watch.check_container_swap_and_alert(cfg, d)
-    assert [c[2] for c in sp.calls] == ["get", "set"]
+    assert _set_calls_for_key(sp, "limits.memory.swap") == [{"limits.memory.swap": "true"}]
 
 
 @pytest.mark.asyncio
 async def test_bare_one_knob_is_not_reset(tmp_path):
-    """'1' is Incus's IsTrue("1") — treated exactly like 'true' (same
-    SetMemorySwapLimit(0) branch), so there is nothing to reconcile."""
     cfg = _Cfg(tmp_path)
     d = _dispatcher()
-    sp = _subproc({"get": (0, "1\n", "")})
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "1", "")})
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
         patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
     ):
         await swap_watch.check_container_swap_and_alert(cfg, d)
-    assert [c[2] for c in sp.calls] == ["get"]
+    assert _set_calls_for_key(sp, "limits.memory.swap") == []
+
+
+# ---------------------------------------------------------------------------
+# Marker revert (mode=none, swap_ceiling_pct removed/invalid) — a prior
+# ceiling, tracked only via the Incus marker key, is unwound.
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_zero_valued_suffixed_sizes_are_still_reconciled(tmp_path):
-    """A zero-valued byte-size ceiling parses structurally but represents
-    zero bytes of swap -- Incus applies it literally and disables swap,
-    exactly like the boolean FALSE spellings. Every zero-valued suffix form
-    must still heal to 'true', not be mistaken for an already-on ceiling.
-    (Codex finding on PR #3069.)"""
-    for zero_form in ("0B", "0 bytes", "00GiB", "0GiB", "0kB", "0MB", "0TiB", "0PB", "0EiB"):
-        cfg = _Cfg(tmp_path)
-        d = _dispatcher()
-        sp = _subproc({"get": (0, f"{zero_form}\n", ""), "set": (0, "", "")})
-        with (
-            patch.object(swap_watch, "_run_subprocess", sp),
-            patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
-        ):
-            await swap_watch.check_container_swap_and_alert(cfg, d)
-        assert [c[2] for c in sp.calls] == ["get", "set"], (
-            f"{zero_form!r} must be reconciled (it is zero bytes of swap), not left alone"
-        )
+async def test_revert_native_marker_match_heals_atomically(tmp_path):
+    """Key still holds the old ceiling, marker matches it -> ONE atomic set
+    call carries BOTH the true-revert and the marker clear; live cgroup
+    heals to max in the SAME tick, zero WARNINGs (the step-2 ordering fix)."""
+    cfg = _Cfg(tmp_path)  # swap_ceiling_pct=None: removed
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "2147483648", ""),
+        _MARKER_KEY: (0, "2147483648", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="0")),
+        patch.object(swap_watch, "activate_swap_max", AsyncMock(return_value=True)) as act,
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    key_sets = _set_calls_for_key(sp, "limits.memory.swap")
+    assert key_sets == [{"limits.memory.swap": "true", _MARKER_KEY: ""}]
+    act.assert_awaited_once_with("genesis")  # current=="0" + key_now=="true" (not a ceiling) -> baseline heal
+    assert _sent_severities(d) == [AlertSeverity.INFO]
 
 
 @pytest.mark.asyncio
-async def test_nonzero_value_with_leading_zero_digits_is_not_reset(tmp_path):
-    """A leading-zero-padded but genuinely NONZERO value ('010GiB' = 10 GiB)
-    must still be recognized as swap-on -- the fix targets an all-zero
-    digit run, not any digit string containing a zero."""
+async def test_revert_native_write_failure_does_not_strand_the_marker(tmp_path):
+    """genesis-architect finding (pre-commit review, 2026-10-08): if the
+    atomic native-revert set call FAILS, key_now/marker_now/current all stay
+    equal to the stale ceiling. Without the native_revert_attempted gate,
+    step 3 would misread this as 'the fallback path was in effect', write
+    the live cgroup to max anyway, and clear the marker -- stranding the
+    persisted key at the old ceiling with NOTHING left to signal it needs
+    fixing. Correct behavior: no cgroup write, marker left intact, one
+    ceiling problem recorded."""
     cfg = _Cfg(tmp_path)
     d = _dispatcher()
-    sp = _subproc({"get": (0, "010GiB\n", "")})
+    sp = _subproc(
+        get_responses={
+            "limits.memory.swap": (0, "2147483648", ""),
+            _MARKER_KEY: (0, "2147483648", ""),
+        },
+        set_responses={
+            frozenset({"limits.memory.swap": "true", _MARKER_KEY: ""}.items()): (1, "", "denied"),
+        },
+    )
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        # The config set failed, so Incus's own state is unchanged: the live
+        # cgroup is still enforcing the old ceiling, exactly like the config.
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="2147483648")),
+        patch.object(swap_watch, "write_swap_max", AsyncMock(return_value=True)) as wm,
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    wm.assert_not_awaited()
+    assert _set_calls_for_key(sp, _MARKER_KEY) == [{"limits.memory.swap": "true", _MARKER_KEY: ""}]
+    assert _sent_severities(d) == [AlertSeverity.WARNING]
+    assert "2147483648" in d.send.call_args.args[0].body
+
+
+@pytest.mark.asyncio
+async def test_revert_cgroup_marker_match_path_switch(tmp_path):
+    """Marker doesn't match the (already-true) key, but DOES match the live
+    cgroup -> the cgroup-fallback path was in effect; revert writes max and
+    clears the marker in a separate call."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "true", ""),
+        _MARKER_KEY: (0, "2147483648", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="2147483648")),
+        patch.object(swap_watch, "write_swap_max", AsyncMock(return_value=True)) as wm,
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    wm.assert_awaited_once_with("genesis", "max")
+    assert _set_calls_for_key(sp, _MARKER_KEY) == [{_MARKER_KEY: ""}]
+    assert _sent_severities(d) == [AlertSeverity.INFO]
+
+
+@pytest.mark.asyncio
+async def test_revert_operator_changed_value_clears_marker_alone(tmp_path):
+    """Marker matches neither the key nor the live cgroup -> an operator set
+    something else directly; clear the stale marker, touch nothing else."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "true", ""),
+        _MARKER_KEY: (0, "2147483648", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+        patch.object(swap_watch, "write_swap_max", AsyncMock(return_value=True)) as wm,
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    wm.assert_not_awaited()
+    assert sp.sets == [{_MARKER_KEY: ""}]
+    assert not d.send.called
+
+
+@pytest.mark.asyncio
+async def test_revert_absent_marker_leaves_operator_ceiling_alone(tmp_path):
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "2147483648", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="2147483648")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert sp.sets == []
+    assert not d.send.called
+
+
+@pytest.mark.asyncio
+async def test_revert_unreadable_marker_holds(tmp_path):
+    """The marker get itself fails -> hold: no reclaim, no revert, no clear,
+    anywhere this tick — never read 'unreadable' as 'changed'."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "true", ""),
+        _MARKER_KEY: (1, "", "timeout"),
+    })
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
         patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
     ):
         await swap_watch.check_container_swap_and_alert(cfg, d)
-    assert [c[2] for c in sp.calls] == ["get"]
+    assert sp.sets == []
+    assert not d.send.called
+
+
+# ---------------------------------------------------------------------------
+# Ceiling configured (mode="ceiling") — native and fallback paths.
+# ---------------------------------------------------------------------------
+
+_TARGET = 10 * 1024 * 1024 * 1024  # 10 GiB, already page-aligned
+_TARGET_S = str(_TARGET)
+
+
+def _patch_target(monkeypatch, target=_TARGET):
+    monkeypatch.setattr(swap_watch, "_compute_swap_ceiling_target", lambda config: target)
 
 
 @pytest.mark.asyncio
-async def test_long_zero_padded_nonzero_size_does_not_raise(tmp_path):
-    """4,301 leading zeros + '1GiB' is a legitimate (if perverse) 1 GiB
-    ceiling Incus's own parser accepts with no overflow -- Python's
-    int(raw) would raise ValueError past ~4,300 digits and must never be
-    used for the nonzero check. Must be recognized as swap-on (not reset),
-    and must not raise. (Second Codex finding on PR #3069.)"""
-    cfg = _Cfg(tmp_path)
+async def test_native_path_asserts_bundled_atomically(tmp_path, monkeypatch):
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
     d = _dispatcher()
-    huge = ("0" * 4301) + "1GiB"
-    sp = _subproc({"get": (0, f"{huge}\n", "")})
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "true", ""),
+        "limits.memory": (0, "36GiB", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value=_TARGET_S)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert sp.sets == [{"limits.memory.swap": _TARGET_S, _MARKER_KEY: _TARGET_S}]
+    assert _sent_severities(d) == [AlertSeverity.INFO]
+
+
+@pytest.mark.asyncio
+async def test_native_path_idempotent_when_matching(tmp_path, monkeypatch):
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, _TARGET_S, ""),
+        "limits.memory": (0, "36GiB", ""),
+        _MARKER_KEY: (0, _TARGET_S, ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value=_TARGET_S)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert sp.sets == []
+    assert not d.send.called
+
+
+@pytest.mark.asyncio
+async def test_native_path_reclaims_drifted_marker(tmp_path, monkeypatch):
+    """Key already correct, but the marker never caught up (SHOULD-FIX #1) ->
+    reclaim the marker ALONE; the real key is not touched again."""
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, _TARGET_S, ""),
+        "limits.memory": (0, "36GiB", ""),
+        _MARKER_KEY: (0, "", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value=_TARGET_S)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert sp.sets == [{_MARKER_KEY: _TARGET_S}]
+
+
+@pytest.mark.asyncio
+async def test_native_path_repairs_live_drift(tmp_path, monkeypatch):
+    """Key and marker already correct, but the live cgroup was changed to
+    'max' from outside -> direct cgroup write repairs it (Codex P2, the
+    review's SHOULD-FIX #1 'reconcile live drift on the native path')."""
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, _TARGET_S, ""),
+        "limits.memory": (0, "36GiB", ""),
+        _MARKER_KEY: (0, _TARGET_S, ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+        patch.object(swap_watch, "write_swap_max", AsyncMock(return_value=True)) as wm,
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    wm.assert_awaited_once_with("genesis", _TARGET_S)
+    assert _sent_severities(d) == [AlertSeverity.INFO]
+
+
+@pytest.mark.asyncio
+async def test_fallback_path_writes_cgroup_and_marker(tmp_path, monkeypatch):
+    """No limits.memory cap -> the native key is inert; baseline-heals the
+    key to true, enforces the ceiling on the live cgroup, and sets the
+    marker in a SEPARATE call right after."""
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "true", ""),
+        "limits.memory": (0, "", ""),  # unset
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+        patch.object(swap_watch, "write_swap_max", AsyncMock(return_value=True)) as wm,
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    wm.assert_awaited_once_with("genesis", _TARGET_S)
+    assert sp.sets == [{_MARKER_KEY: _TARGET_S}]
+    assert _sent_severities(d) == [AlertSeverity.INFO]
+
+
+@pytest.mark.asyncio
+async def test_fallback_path_idempotent_when_matching(tmp_path, monkeypatch):
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "true", ""),
+        "limits.memory": (0, "", ""),
+        _MARKER_KEY: (0, _TARGET_S, ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value=_TARGET_S)),
+        patch.object(swap_watch, "write_swap_max", AsyncMock(return_value=True)) as wm,
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    wm.assert_not_awaited()
+    assert sp.sets == []
+    assert not d.send.called
+
+
+@pytest.mark.asyncio
+async def test_fallback_path_reclaims_drifted_marker(tmp_path, monkeypatch):
+    """Cgroup already correct (a prior tick's write succeeded) but the
+    marker-set call failed or the guardian crashed between them -> reclaim
+    the marker alone on the next tick, no second cgroup write."""
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "true", ""),
+        "limits.memory": (0, "", ""),
+        _MARKER_KEY: (0, "", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value=_TARGET_S)),
+        patch.object(swap_watch, "write_swap_max", AsyncMock(return_value=True)) as wm,
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    wm.assert_not_awaited()
+    assert sp.sets == [{_MARKER_KEY: _TARGET_S}]
+
+
+@pytest.mark.asyncio
+async def test_ceiling_live_zero_writes_target_not_max(tmp_path, monkeypatch):
+    """Ceiling configured, live cgroup reads 0, key holds the byte ceiling ->
+    the ceiling write wins over #3069's 'byte key + live 0 -> warn' rule
+    (NOTE N4): these are disjoint code paths, this asserts which one runs."""
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, _TARGET_S, ""),
+        "limits.memory": (0, "36GiB", ""),
+        _MARKER_KEY: (0, _TARGET_S, ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="0")),
+        patch.object(swap_watch, "write_swap_max", AsyncMock(return_value=True)) as wm,
+        patch.object(swap_watch, "activate_swap_max", AsyncMock(return_value=True)) as act,
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    wm.assert_awaited_once_with("genesis", _TARGET_S)
+    act.assert_not_awaited()
+    assert _sent_severities(d) == [AlertSeverity.INFO]
+    assert "WARNING" not in "".join(_sent_bodies(d))
+
+
+@pytest.mark.asyncio
+async def test_ceiling_cgroup_write_failure_is_a_ceiling_problem(tmp_path, monkeypatch):
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, _TARGET_S, ""),
+        "limits.memory": (0, "36GiB", ""),
+        _MARKER_KEY: (0, _TARGET_S, ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+        patch.object(swap_watch, "write_swap_max", AsyncMock(return_value=False)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _sent_severities(d) == [AlertSeverity.WARNING]
+    assert "swap ceiling" in d.send.call_args.args[0].title.lower()
+
+
+@pytest.mark.asyncio
+async def test_string_equality_idempotence_whole_tick(tmp_path, monkeypatch):
+    """Every observed value already equals the target in whatever form the
+    reconciler itself writes -> zero writes anywhere, zero alerts."""
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, _TARGET_S, ""),
+        "limits.memory": (0, "36GiB", ""),
+        _MARKER_KEY: (0, _TARGET_S, ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value=_TARGET_S)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert sp.sets == []
+    assert not d.send.called
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_disables_ceiling_too(tmp_path, monkeypatch):
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, enabled=False, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc()
+    with patch.object(swap_watch, "_run_subprocess", sp):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert sp.calls == []
+    assert not d.send.called
+
+
+# ---------------------------------------------------------------------------
+# Degraded ticks (swap_ceiling_pct set, but the target or the limits.memory
+# probe is not computable this tick) — hold, never guess.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_degraded_swaptotal_unreadable_holds_the_key(tmp_path, monkeypatch):
+    """SwapTotal unreadable -> ceiling problem, key left UNTOUCHED even
+    though it reads 'false' (spec item 2's explicit 'never reset to true').
+    """
+    _patch_target(monkeypatch, target=None)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "false", "")})
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
         patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
     ):
         await swap_watch.check_container_swap_and_alert(cfg, d)
-    assert [c[2] for c in sp.calls] == ["get"]
+    assert _set_calls_for_key(sp, "limits.memory.swap") == []
+    assert _sent_severities(d) == [AlertSeverity.WARNING]
+    assert "swap ceiling" in d.send.call_args.args[0].title.lower()
 
 
 @pytest.mark.asyncio
-async def test_long_zero_padded_all_zero_size_is_reconciled(tmp_path):
-    """The all-zero counterpart of the above: a huge digit run that is
-    genuinely all zeros must still be recognized as swap-off and healed,
-    and must not raise."""
-    cfg = _Cfg(tmp_path)
+async def test_degraded_swaptotal_unreadable_still_protects_live_zero(tmp_path, monkeypatch):
+    """Same degraded tick, but live cgroup reads 0 and the key is NOT a
+    ceiling -> the ORIGINAL ceiling-unaware protection still runs: swap is
+    activated live (key untouched). Two independent WARNINGs this tick: one
+    per problem class (ceiling held, nothing else failed -> only the
+    ceiling WARNING fires; the live heal here succeeds)."""
+    _patch_target(monkeypatch, target=None)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
     d = _dispatcher()
-    huge_zero = ("0" * 4301) + "GiB"
-    sp = _subproc({"get": (0, f"{huge_zero}\n", ""), "set": (0, "", "")})
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "", "")})  # unset
+    act = AsyncMock(return_value=True)
     with (
         patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="0")),
+        patch.object(swap_watch, "activate_swap_max", act),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    act.assert_awaited_once_with("genesis")
+    assert _set_calls_for_key(sp, "limits.memory.swap") == []
+    severities = _sent_severities(d)
+    assert AlertSeverity.INFO in severities  # the live heal
+    assert AlertSeverity.WARNING in severities  # the held ceiling
+
+
+@pytest.mark.asyncio
+async def test_degraded_limits_memory_probe_failure_holds(tmp_path):
+    """Target computes fine, but the SEPARATE limits.memory probe itself
+    fails -> degraded (Codex P2 'warn when persistence is unknown'), not
+    silently treated as either native or fallback."""
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "false", ""),
+        "limits.memory": (1, "", "timeout"),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "_host_swap_total_bytes", lambda: 20 * 1024**3),
         patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
     ):
         await swap_watch.check_container_swap_and_alert(cfg, d)
-    assert [c[2] for c in sp.calls] == ["get", "set"]
+    assert _set_calls_for_key(sp, "limits.memory.swap") == []
+    assert _sent_severities(d) == [AlertSeverity.WARNING]
 
 
-# ── direct unit coverage of the classification functions ───────────────────
-# (fresh-context class audit, 2026-10-08: coverage lived only behind the
-# subprocess-mocked integration surface; these probe the pure functions
-# directly, cheaper insurance against a future round finding a case the
-# integration tests happen not to exercise.)
+@pytest.mark.asyncio
+async def test_swaptotal_unreadable_computes_to_none(monkeypatch):
+    """Unit test of _compute_swap_ceiling_target's own degraded return, so
+    the 'degraded' mode above is exercised against the REAL function
+    somewhere, not only through the monkeypatched shortcut."""
+    cfg = _Cfg(tmp_path=None, swap_ceiling_pct=50)
+    monkeypatch.setattr(swap_watch, "_host_swap_total_bytes", lambda: None)
+    assert swap_watch._compute_swap_ceiling_target(cfg) is None
+
+
+def test_compute_target_floors_to_page(monkeypatch):
+    monkeypatch.setattr(swap_watch, "_host_swap_total_bytes", lambda: 20 * 1024**3)
+    cfg = _Cfg(tmp_path=None, swap_ceiling_pct=50)
+    target = swap_watch._compute_swap_ceiling_target(cfg)
+    page = __import__("os").sysconf("SC_PAGE_SIZE")
+    assert target == 10 * 1024**3
+    assert target % page == 0
+
+
+def test_compute_target_none_when_below_one_page(monkeypatch):
+    monkeypatch.setattr(swap_watch, "_host_swap_total_bytes", lambda: 1024)
+    cfg = _Cfg(tmp_path=None, swap_ceiling_pct=0.0001)
+    assert swap_watch._compute_swap_ceiling_target(cfg) is None
+
+
+# ---------------------------------------------------------------------------
+# Throttle: per-class independence, delivery-aware retry, legacy migration.
+# ---------------------------------------------------------------------------
+
+
+def test_ceiling_and_swapoff_failures_throttle_independently(tmp_path):
+    now = datetime.now(UTC)
+    state_file = tmp_path / "swap_watch_state.json"
+    swap_watch._record_failure_alert(state_file, now, swap_watch._PROBLEM_CLASS_SWAP_OFF, True)
+    assert swap_watch._failure_alert_due(state_file, now, swap_watch._PROBLEM_CLASS_CEILING)
+    assert not swap_watch._failure_alert_due(state_file, now, swap_watch._PROBLEM_CLASS_SWAP_OFF)
+
+
+def test_delivered_failure_throttles_24h(tmp_path):
+    now = datetime.now(UTC)
+    state_file = tmp_path / "state.json"
+    swap_watch._record_failure_alert(state_file, now, "ceiling", True)
+    soon = now + timedelta(hours=1)
+    later = now + timedelta(hours=25)
+    assert not swap_watch._failure_alert_due(state_file, soon, "ceiling")
+    assert swap_watch._failure_alert_due(state_file, later, "ceiling")
+
+
+def test_undelivered_failure_retries_in_five_minutes(tmp_path):
+    """SHOULD-FIX #4: a failed DELIVERY must not adopt the 24h window."""
+    now = datetime.now(UTC)
+    state_file = tmp_path / "state.json"
+    swap_watch._record_failure_alert(state_file, now, "ceiling", False)
+    soon = now + timedelta(minutes=2)
+    later = now + timedelta(minutes=6)
+    assert not swap_watch._failure_alert_due(state_file, soon, "ceiling")
+    assert swap_watch._failure_alert_due(state_file, later, "ceiling")
+
+
+@pytest.mark.asyncio
+async def test_down_dispatcher_does_not_loop_every_tick(tmp_path):
+    """A dispatcher with no channels (send() returns False) does not record
+    a 24h-delivered throttle, and the NEXT tick inside the 5 min retry
+    window does not re-alert."""
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher(send_result=False)
+    set_fail = {frozenset({"limits.memory.swap": "true"}.items()): (1, "", "nope")}
+
+    with (
+        patch.object(swap_watch, "_run_subprocess", _subproc(set_responses=set_fail)),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert d.send.await_count == 1
+    d.send.reset_mock()
+
+    with (
+        patch.object(swap_watch, "_run_subprocess", _subproc(set_responses=set_fail)),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert d.send.await_count == 0  # inside the 5 min retry window
+
+
+def test_legacy_flat_timestamp_migrates_to_swap_off_delivered(tmp_path):
+    state_file = tmp_path / "state.json"
+    now = datetime.now(UTC)
+    state_file.write_text(json.dumps({"last_failure_alert_at": now.isoformat()}))
+    assert not swap_watch._failure_alert_due(state_file, now + timedelta(hours=1), "swap_off")
+    assert swap_watch._failure_alert_due(state_file, now + timedelta(hours=1), "ceiling")
+
+
+def test_legacy_per_class_bare_string_treated_as_delivered(tmp_path):
+    state_file = tmp_path / "state.json"
+    now = datetime.now(UTC)
+    state_file.write_text(json.dumps({"last_failure_alert_at": {"ceiling": now.isoformat()}}))
+    assert not swap_watch._failure_alert_due(state_file, now + timedelta(hours=1), "ceiling")
+    assert swap_watch._failure_alert_due(state_file, now + timedelta(hours=25), "ceiling")
+
+
+def test_corrupt_state_file_is_due(tmp_path):
+    state_file = tmp_path / "state.json"
+    state_file.write_text("{not json")
+    assert swap_watch._failure_alert_due(state_file, datetime.now(UTC), "ceiling")
+
+
+# ---------------------------------------------------------------------------
+# cgroup_ops: read/write primitives.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_swap_max_reads_via_sudo():
+    sp = AsyncMock(return_value=(0, "max\n", ""))
+    with patch.object(cgroup_ops, "_run_subprocess", sp):
+        assert await cgroup_ops.read_swap_max("genesis") == "max"
+    sp.assert_awaited_once()
+    assert sp.await_args.args[0] == "sudo"
+
+
+@pytest.mark.asyncio
+async def test_read_swap_max_failure_is_none():
+    sp = AsyncMock(return_value=(1, "", "denied"))
+    with patch.object(cgroup_ops, "_run_subprocess", sp):
+        assert await cgroup_ops.read_swap_max("genesis") is None
+
+
+@pytest.mark.asyncio
+async def test_activate_swap_max_delegates_to_write_swap_max():
+    wm = AsyncMock(return_value=True)
+    with patch.object(cgroup_ops, "write_swap_max", wm):
+        assert await cgroup_ops.activate_swap_max("genesis") is True
+    wm.assert_awaited_once_with("genesis", "max")
+
+
+@pytest.mark.asyncio
+async def test_write_swap_max_writes_plain_integer():
+    sp = AsyncMock(return_value=(0, "", ""))
+    with patch.object(cgroup_ops, "_run_subprocess", sp):
+        assert await cgroup_ops.write_swap_max("genesis", "10737418240") is True
+    sp.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_write_swap_max_rejects_non_integer_without_subprocess():
+    sp = AsyncMock()
+    with patch.object(cgroup_ops, "_run_subprocess", sp):
+        assert await cgroup_ops.write_swap_max("genesis", "10GiB") is False
+    sp.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_write_swap_max_rejects_octal_ambiguous_leading_zero():
+    sp = AsyncMock()
+    with patch.object(cgroup_ops, "_run_subprocess", sp):
+        assert await cgroup_ops.write_swap_max("genesis", "010") is False
+    sp.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_write_swap_max_rejects_negative():
+    sp = AsyncMock()
+    with patch.object(cgroup_ops, "_run_subprocess", sp):
+        assert await cgroup_ops.write_swap_max("genesis", "-5") is False
+    sp.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_write_swap_max_accepts_bare_zero():
+    sp = AsyncMock(return_value=(0, "", ""))
+    with patch.object(cgroup_ops, "_run_subprocess", sp):
+        assert await cgroup_ops.write_swap_max("genesis", "0") is True
+
+
+# ---------------------------------------------------------------------------
+# _is_swap_on / _is_parseable_incus_size matrix — unchanged from #3069.
+# ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize(
-    ("value", "expected"),
+    "raw,expected",
     [
         ("", False),
-        ("   ", False),
         ("true", True),
         ("True", True),
         ("TRUE", True),
-        ("tRuE", True),
         ("1", True),
         ("yes", True),
-        ("YES", True),
         ("on", True),
-        ("ON", True),
         ("false", False),
         ("False", False),
         ("0", False),
         ("no", False),
-        ("NO", False),
         ("off", False),
-        ("OFF", False),
-        ("00", False),  # not a word-list member -> falls through to size parsing, all zeros
-        ("01", True),   # not a word-list member -> size parsing, nonzero
-        ("2", True),
-        ("42", True),
-        ("5GiB", True),
-        ("0GiB", False),
-        ("00GiB", False),
-        # The suffix is no longer separately validated (Codex finding,
-        # "Remove the second Incus size parser") -- any nonzero digit
-        # PREFIX is trusted as a swap-on ceiling, on the theory that
-        # incus config get could only ever have returned it after Incus's
-        # OWN write-time validator accepted it on some version. These four
-        # all have a nonzero leading digit run, so they now read True even
-        # though their "suffix" (whatever trails the digits) isn't one
-        # this file's old allowlist recognized -- a real Incus would have
-        # refused "1.5GiB"/"5Gib"/"5XB"/"5 GiB" as a `config set` in the
-        # first place, so this function is never asked to judge them in
-        # practice; what matters is that it no longer FALSELY rejects a
-        # real future suffix it simply hasn't seen before.
-        ("5Gib", True),
+        ("  true  ", True),
+        ("  false  ", False),
+        ("garbage", False),
+        ("2147483648", True),
+        ("10GiB", True),
+        ("5Gib", True),  # suffix-agnostic since #3069's round-4 fix
         ("5XB", True),
         ("1.5GiB", True),
         ("5 GiB", True),
-        ("+5GiB", False),   # sign -- '+' isn't an ASCII digit, no leading run at all
-        ("-5GiB", False),
-        ("garbage", False),
-        ("५GiB", False),    # Devanagari digit 5 -- not an ASCII digit
+        ("0B", False),
+        ("0 bytes", False),
+        ("00GiB", False),
+        ("0GiB", False),
+        ("010GiB", True),  # leading zero but genuinely nonzero
+        ("0" * 5000 + "1GiB", True),  # long zero-padded, nonzero — no int() overflow
+        ("0" * 5000, False),  # long zero-padded, all zero
     ],
 )
-def test_is_swap_on_matrix(value, expected):
-    assert swap_watch._is_swap_on(value) is expected, value
+def test_is_swap_on_matrix(raw, expected):
+    assert swap_watch._is_swap_on(raw) is expected

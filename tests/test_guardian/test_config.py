@@ -188,3 +188,97 @@ class TestLoadSecrets:
         p.write_text('KEY="double quoted"\n')
         secrets = load_secrets(p)
         assert secrets["KEY"] == "double quoted"
+
+
+class TestSwapCeilingPctValidation:
+    """swap_ceiling_pct: a percentage of HOST SwapTotal (0, 100], or None."""
+
+    def test_default_is_none(self) -> None:
+        cfg = GuardianConfig()
+        assert cfg.swap_ceiling_pct is None
+
+    def test_valid_value_loads_as_float(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: 50\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct == 50.0
+
+    def test_null_stays_none(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: null\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_zero_is_rejected_not_silently_disabling(self, tmp_path: Path) -> None:
+        """0 would mean 'cap swap at nothing' — the opposite of this knob's
+        purpose — so it must fall back to None (uncapped), not pass through."""
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: 0\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_over_100_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: 150\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_negative_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: -5\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_string_value_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: fifty\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_bool_true_is_rejected_not_treated_as_one_percent(self, tmp_path: Path) -> None:
+        """NOTE N3: bool is an int subclass in Python, so the bool check must
+        run BEFORE the numeric-range check, or `true` silently becomes 1%."""
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: true\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_bool_false_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: false\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_huge_int_is_rejected_without_crashing_config_load(self, tmp_path: Path) -> None:
+        """Codex P2: math.isfinite(float(huge_int)) raises OverflowError
+        rather than returning False, which would abort config loading
+        entirely instead of the intended warn-and-ignore. A ~310-digit int is
+        caught by the range check before any float conversion is attempted."""
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: " + ("9" * 310) + "\n")
+        cfg = load_config(p)  # must not raise
+        assert cfg.swap_ceiling_pct is None
+
+    def test_nan_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: .nan\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_infinity_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: .inf\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_float_in_range_loads(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: 33.5\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct == 33.5
+
+    def test_boundary_100_is_accepted(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: 100\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct == 100.0

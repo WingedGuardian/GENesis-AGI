@@ -71,6 +71,25 @@ remediation for the detected vantage — because the knob is never local:
   an INFO alert; opt a host out with `swap_reconcile_enabled: false` in the
   guardian config (an explicitly-false knob is otherwise reconciled back to
   true — swap-on is the install invariant).
+  **Opt-in ceiling**: `swap_ceiling_pct` (install-local only — set it in the
+  deployed `guardian.yaml`, never in this repo's shipped template) caps the
+  container's swap at that percentage of the HOST's `SwapTotal`, so the cap
+  tracks the pool if it is resized. The reconciler asserts it through Incus's
+  own native `limits.memory.swap=<bytes>` key when this container has a
+  `limits.memory` cap (the normal case), or via a direct cgroup write
+  otherwise. A tick that can't compute the target this round (host
+  `SwapTotal` unreadable, or the `limits.memory` probe itself fails) HOLDS —
+  it never falls back to resetting the key to `true`, since that would be a
+  boolean value and Incus resets a boolean key's live cgroup to 0 on every
+  update. Removing `swap_ceiling_pct` reverts the ceiling only if the
+  currently-enforced value still matches the one this reconciler itself
+  asserted — tracked via an Incus instance key, `user.genesis.swap_ceiling`
+  (visible by hand via `incus config get <container>
+  user.genesis.swap_ceiling`), never a local file, so there is nothing to
+  lose on a re-deploy or corrupt out from under the reconciler. An
+  operator-set ceiling this reconciler never wrote is never touched.
+  `swap_reconcile_enabled: false` disables the ceiling too — a disabled
+  reconciler never reads or writes the marker.
 - **Bare metal / VM**: create a swapfile or LV sized to taste. Even a few
   GiB turns the OOM cliff into a ramp. **On guardian hosts this is now
   mechanical** — see the zram layer below.

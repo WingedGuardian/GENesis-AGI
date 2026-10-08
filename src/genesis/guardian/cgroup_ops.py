@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 import signal
 import time
 from pathlib import Path
@@ -114,10 +115,37 @@ async def read_swap_max(container: str) -> str | None:
 async def activate_swap_max(container: str) -> bool:
     """Write 'max' to memory.swap.max — live-activate swap on a RUNNING container.
 
+    Thin wrapper over ``write_swap_max(container, "max")`` — see that
+    function's docstring for the full Incus-behavior rationale. Kept as its
+    own name because it is the common case (the other is the opt-in
+    swap-ceiling fallback)."""
+    return await write_swap_max(container, "max")
+
+
+# Closed-set validation: "max" (unbounded) or a plain non-negative decimal
+# integer (a byte-count ceiling), with NO leading zero other than a bare
+# "0" itself. Enforced BEFORE the value ever reaches a shell command, not
+# merely implied by its callers — this function is otherwise only ever
+# called with "max" or `str(int)` (which Python never renders with a
+# leading zero), but a value this close to a shell command (even
+# `shlex.quote`d) deserves its own independent check rather than trusting
+# every present and future caller. The no-leading-zero rule specifically
+# guards against a base-0 numeric parser downstream reading "010" as
+# octal 8 rather than decimal 10 — a silently wrong byte value with no
+# error (genesis-architect finding on the stacked PR).
+_SWAP_MAX_VALUE_RE = re.compile(r"^(?:max|0|[1-9][0-9]*)$")
+
+
+async def write_swap_max(container: str, value: str) -> bool:
+    """Write ``value`` to memory.swap.max — live-write the swap cgroup on a
+    RUNNING container. ``value`` must be ``"max"`` (unbounded) or a plain
+    decimal byte count (a ceiling); anything else is refused without
+    running any subprocess.
+
     ``limits.memory.swap=true`` (or unset/false) makes Incus write
     ``memory.swap.max=0`` to the cgroup, at container start AND on every
     live update to a ``limits.memory*`` key (driver_lxc.go, v6.0.0 and
-    main, read 2026-10-07: `` SetMemorySwapLimit(0)`` for ``IsTrueOrEmpty``
+    main, read 2026-10-07: ``SetMemorySwapLimit(0)`` for ``IsTrueOrEmpty``
     or ``IsFalse``, both at start and at live-update) — this is Incus's own
     defined behavior, not a bug, and swap_watch's step 1 (re-asserting the
     persistent knob) re-triggers it every time it runs. A ``limits.memory.swap``
@@ -125,36 +153,41 @@ async def activate_swap_max(container: str) -> bool:
     swap ceiling and is applied as-is, at start and on live update, with no
     0-window at all. Until this cgroup is live-reactivated, every memory
     spike becomes the load-100 D-state OOM-thrash wedge instead of degrading
-    into swap. Writing ``max`` is GENESIS'S OWN uncapped-swap default, not
-    a value Incus itself would ever write here — with a hard
-    ``limits.memory`` set, Incus's own branches write either ``0``
-    (``IsTrueOrEmpty``/``IsFalse``) or the parsed finite byte value (a
-    ceiling), never ``"max"`` (driver_lxc.go, confirmed on v6.0.0 and
-    main). This is the guardian's choice for "swap-on with no explicit
-    ceiling" (scripts/lib/container_swap.sh makes the same choice from
-    host-setup); this is the guardian-side equivalent for installs that
-    never re-run host-setup, and for the start/live-update window itself.
-    (Codex finding on PR #3069, 2026-10-08: "Describe the max write as a
-    Genesis override.")
+    into swap. Writing ``max`` is GENESIS'S OWN uncapped-swap default, not a
+    value Incus itself would ever write here — with a hard ``limits.memory``
+    set, Incus's own branches write either ``0`` (``IsTrueOrEmpty``/``IsFalse``)
+    or the parsed finite byte value (a ceiling), never ``"max"`` (driver_lxc.go,
+    confirmed on v6.0.0 and main). ``max`` is the guardian's choice for
+    "swap-on with no explicit ceiling" (scripts/lib/container_swap.sh makes
+    the same choice from host-setup); a specific byte count is swap_watch's
+    cgroup-level fallback for an opt-in swap ceiling on a container with no
+    ``limits.memory`` cap, where Incus's native swap-ceiling path never runs
+    at all.
 
     Requires sudo because the cgroup is owned by root. Returns True on success.
     """
+    if not _SWAP_MAX_VALUE_RE.fullmatch(value):
+        logger.error(
+            "Refusing to write invalid memory.swap.max value %r for %s "
+            "(must be 'max' or a plain decimal byte count)", value, container,
+        )
+        return False
     swap_path = _cgroup_path(container) / "memory.swap.max"
     try:
         import shlex
         rc, _stdout, stderr = await _run_subprocess(
-            "sudo", "sh", "-c", f"echo max > {shlex.quote(str(swap_path))}",
+            "sudo", "sh", "-c", f"echo {shlex.quote(value)} > {shlex.quote(str(swap_path))}",
             timeout=10.0,
         )
         if rc != 0:
             logger.error(
-                "Failed to activate memory.swap.max for %s: %s", container, stderr,
+                "Failed to write memory.swap.max=%s for %s: %s", value, container, stderr,
             )
             return False
-        logger.info("Activated swap live for %s (memory.swap.max=max)", container)
+        logger.info("Wrote memory.swap.max=%s for %s", value, container)
         return True
     except Exception as exc:
-        logger.error("Failed to activate memory.swap.max for %s: %s", container, exc)
+        logger.error("Failed to write memory.swap.max=%s for %s: %s", value, container, exc)
         return False
 
 
