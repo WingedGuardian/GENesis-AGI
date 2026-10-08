@@ -949,3 +949,104 @@ def test_a_comment_reposted_between_reads_is_not_unknown(monkeypatch):
 
     got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
     assert got["status"] == "ok", got
+
+
+# ── one retry on a failed read; failures classified, never raw stderr ────────
+
+
+def _flaky(fail_times, stderr="HTTP 502: Bad Gateway"):
+    serve = _graphql_server(reviews=[_gql_review(H5)], files=_FILES, commits=_COMMITS)
+    calls = {"n": 0}
+
+    def run(argv, *, timeout):
+        calls["n"] += 1
+        if calls["n"] <= fail_times:
+            return 1, "", stderr
+        return serve(argv, timeout=timeout)
+
+    return run, calls
+
+
+def test_a_single_failed_read_is_retried(monkeypatch):
+    _no_seams(monkeypatch)
+    runner, _calls = _flaky(1)
+    got = rb.evaluate_pr("owner/repo", 7, runner=runner, external_identity_templates=())
+    assert got["status"] == "ok", got
+
+
+def test_a_read_failing_twice_is_unknown_and_names_its_class(monkeypatch):
+    _no_seams(monkeypatch)
+    runner, calls = _flaky(99)
+    got = rb.evaluate_pr("owner/repo", 7, runner=runner, external_identity_templates=())
+    assert got["status"] == "unknown"
+    assert calls["n"] == 2
+    assert got["errors"] == ["graphql_unreadable", "gh_failure:http_502", "gh_failure:http_502"]
+    assert rb.errors_are_transient(got["errors"])
+
+
+@pytest.mark.parametrize(
+    ("stderr", "cls"),
+    [
+        ("runner_failed:TimeoutExpired", "timeout"),
+        ("runner_failed:RuntimeError", "hook_deadline"),
+        ("runner_failed:OSError", "runner_raised"),
+        ("API rate limit exceeded for user ID 1", "rate_limited"),
+        ("HTTP 503: Service Unavailable", "http_503"),
+        ("Post https://api.github.com/graphql: dial tcp: i/o timeout", "timeout"),
+        ("gh: Could not resolve to a PullRequest", "not_found"),
+        ("something else entirely", "other"),
+    ],
+)
+def test_failure_classes_are_a_fixed_vocabulary(stderr, cls):
+    assert rb._gh_failure_class(stderr) == cls
+
+
+def test_a_raising_runner_is_classified_by_exception_type(monkeypatch):
+    _no_seams(monkeypatch)
+
+    def raising(argv, *, timeout):
+        raise RuntimeError("aggregate review-gate deadline expired")
+
+    got = rb.evaluate_pr("owner/repo", 7, runner=raising, external_identity_templates=())
+    assert "gh_failure:hook_deadline" in got["errors"], got
+
+
+@pytest.mark.parametrize(
+    "errors",
+    [
+        ["review_findings_deleted"],
+        ["commits_response_truncated"],
+        ["invalid_external_identity_template"],
+        ["evidence_changed_during_evaluation"],
+        ["head_changed_during_evaluation"],
+        ["codex_findings_comment_unbound"],
+        ["graphql_unreadable", "review_findings_deleted"],
+        [],
+        None,
+        "graphql_unreadable",
+    ],
+)
+def test_only_read_failures_are_transient(errors):
+    assert not rb.errors_are_transient(errors)
+
+
+@pytest.mark.parametrize(
+    ("cls", "transient"),
+    [
+        ("timeout", True),
+        ("hook_deadline", True),
+        ("network", True),
+        ("rate_limited", True),
+        ("http_502", True),
+        ("http_503", True),
+        ("http_404", False),
+        ("http_401", False),
+        ("auth", False),
+        ("not_found", False),
+        ("other", False),
+        ("runner_raised", False),
+        ("http_5", False),
+    ],
+)
+def test_only_transient_gh_failure_classes_count(cls, transient):
+    assert rb.errors_are_transient(["graphql_unreadable", f"gh_failure:{cls}"]) is transient
