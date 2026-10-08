@@ -56,3 +56,9 @@ is a preparation placeholder, not measured candidate performance. Full offline
 preflight and both disposable production storage paths land in replacement5;
 transport and runner orchestration are separate replacements. No CLI or paid
 completion is supplied here. Real references and approvals remain private.
+
+For offline acceptance, set `LITELLM_LOCAL_MODEL_COST_MAP=True` before importing
+Genesis. LiteLLM otherwise attempts an optional public model-price-map download
+at import time and falls back to its bundled map if it fails. Install Python
+connection/DNS interception before imports when checking for zero network
+attempts; interception installed afterward does not cover SDK initialization.

@@ -178,10 +178,13 @@ providers:
     profile: gemini-3.8-flash
     free: true
     rpm_limit: 15
-    # NO rpd_limit yet, deliberately: live 429s show "limit: 20" and Genesis
-    # peaks well under 20/min, so a ~20 requests/DAY cap is INFERRED but not
-    # proven. A wrong shipped daily cap would deselect the provider on every
-    # install. Measure (count successes per UTC day vs 20) before setting.
+    # NO rpd_limit, deliberately. MEASURED 2026-10-07: the free tier allows 20
+    # requests/DAY per model (429 quotaId GenerateRequestsPerDayPerProjectPerModel-
+    # FreeTier, limit 20), resetting at 00:00 UTC (38 of 38 logged 429s). The
+    # quota belongs to the Google project behind the key, so every consumer of
+    # that key spends it: a local count cannot model it, and a shipped cap would
+    # be wrong on every install whose key is shared or on a paid tier. The
+    # provider's own 429 is the signal.
     open_duration_s: 120
     # This family reasons by default (~70-90 thinking tokens even on trivial
     # prompts → empty content at tight max_tokens + free-tier TPM bloat). This is
@@ -203,6 +206,32 @@ providers:
     # takes a client-chosen budget, refuses anything under 16 for that reason.
     # Routed callers use 150-2000; the one max_tokens=10 site,
     # `eval/longmemeval/judge.py`, is documented as independent of this table.
+    params:
+      reasoning_effort: disable
+  # Google's "latest Flash" alias. NOT IN ANY CHAIN yet (owner, 2026-10-07):
+  # it goes immediately ahead of gemini-free in every Gemini chain once a probe
+  # shows it resolving to a DIFFERENT model. While it is the same model it adds
+  # no coverage, only a second hop that doubles a Google-side hang (9 of 58
+  # gemini-free calls since 10-06 hit the 120 s timeout). The alias can move to a newer model without notice: its
+  # cost profile stays gemini-3.8-flash, and the thinking suppression below
+  # (verified per version) must be re-verified whenever it moves. Same API key,
+  # so the free-tier daily quota is per MODEL: a separate quota only if the
+  # alias resolves to a different model than gemini-free. MEASURED 2026-10-07:
+  # it resolved to gemini-3.8-flash (response modelVersion), with thinkingBudget=0
+  # holding (no thought tokens) — so it stays unchained for now. Detecting the
+  # alias moving is tracked in issue #3050.
+  gemini-free-latest:
+    type: google
+    # Same key, quota rule and thinking suppression as gemini-free below it in
+    # every chain; see that block for the measured facts. Only the model differs.
+    model: gemini-flash-latest
+    profile: gemini-3.8-flash
+    free: true
+    rpm_limit: 15
+    open_duration_s: 120
+    # The suppression (reasoning_effort=disable -> thinkingBudget=0) is a
+    # per-version behaviour, verified for 3.8-flash; re-verify whenever the alias
+    # moves.
     params:
       reasoning_effort: disable
   openrouter-free:
@@ -259,6 +288,17 @@ providers:
       # Same reason as openrouter-sonnet above.
       additional_drop_params: [temperature, top_p, top_k]
   # ── Phase 2 providers (gated on eval before chain promotion) ──
+  # NOT IN ANY CHAIN (2026-10-07). On this key NVIDIA accepts DeepSeek V4.1
+  # Flash requests and never answers: every probe variant (plain, streaming
+  # with no first byte, thinking off, reasoning_effort none) timed out at 45 s,
+  # and of 26 production calls in activity_log's retained window (10-06 18:02 to
+  # 10-07 18:03 UTC) 0 succeeded, 25 hit the 120 s cap and 1 got a 404, while
+  # other NIM models answered on the same key in 0.4-38 s. Of 50 chat
+  # models NVIDIA's /v1/models lists, 6 answered, 4 hung and 38 returned 404
+  # "Function ... Not found for account" (a per-account entitlement), so
+  # listing proves nothing. The same model is served by DeepSeek's own API
+  # (deepseek-flash) and OpenRouter (openrouter-deepseek-flash). Kept so a
+  # chain can return to it once NVIDIA serves it to this account.
   nvidia-nim-deepseek:
     type: nvidia_nim
     model: deepseek-ai/deepseek-v4.1-flash
@@ -326,6 +366,22 @@ providers:
     type: openrouter
     model: xiaomi/mimo-v2.6-pro
     profile: mimo-v2.6-pro
+    free: false
+    rpm_limit: 20
+    open_duration_s: 120
+  # DeepSeek's own API. `deepseek-flash` IS DeepSeek-V4.1-Flash (DeepSeek's
+  # pricing page, read 2026-10-07; the legacy deepseek-v4-flash name is served
+  # by it too). Answered in 0.8 s on 2026-10-07. Price (pricing page, same day):
+  # $0.30 in / $1.20 out per MTok, half that off-peak; litellm records the full
+  # rate, so off-peak spend reads up to 2x high. Measured against the OpenRouter
+  # rung: openrouter-deepseek-flash recorded $2.19 for 5.59 M in / 1.21 M out over
+  # the 10 days to 2026-10-07; the same traffic here is $1.57 off-peak to $3.13 peak. Thinking is on by default
+  # (switchable), as for openrouter-deepseek-flash. Prepaid account: an empty
+  # balance fails these calls and the chain falls to openrouter-deepseek-flash.
+  deepseek-flash:
+    type: deepseek
+    model: deepseek-flash
+    profile: deepseek-flash-direct
     free: false
     rpm_limit: 20
     open_duration_s: 120
@@ -416,10 +472,9 @@ call_sites:
     - gemini-free
     # Additional free providers so an essential reflection (3_micro_reflection
     # is in degradation._L3_KEEP) survives a broad free-tier outage without
-    # paid fallback. Healthy OpenRouter-free models first; NIM-flash last
-    # (free ~40 RPM per-model, historically flaky).
+    # paid fallback. Healthy OpenRouter-free models first. (A free NIM rung
+    # ended this chain until 2026-10-07; NVIDIA stopped answering it.)
     - openrouter-gemma4
-    - nvidia-nim-deepseek
     retry_profile: background
   4_light_reflection:
     chain:
@@ -452,7 +507,6 @@ call_sites:
     chain:
     - groq-free
     - gemini-free
-    - nvidia-nim-deepseek
     - mistral-large-free
     - mistral-medium-free
     - openrouter-deepseek-flash
@@ -478,7 +532,6 @@ call_sites:
     - mistral-medium-free
     - groq-free
     - openrouter-free
-    - nvidia-nim-deepseek
     never_pays: true
   13_morning_report:
     chain:
@@ -500,11 +553,11 @@ call_sites:
     dispatch: cli
     cc_model: Sonnet
   # Executor Gate 2 deliverable-quality review leads with paid MiMo 2.6 Pro.
-  # Free NIM V4.1 Flash, paid V4.1 Flash and Qwen remain as fallbacks.
+  # V4.1 Flash (DeepSeek direct, then OpenRouter) and Qwen remain as fallbacks.
   17_executor_review:
     chain:
     - openrouter-mimo
-    - nvidia-nim-deepseek
+    - deepseek-flash
     - openrouter-deepseek-flash
     - openrouter-qwen36plus
     default_paid: true
@@ -518,7 +571,8 @@ call_sites:
   20_adversarial_counterargument:
     chain:
     - openrouter-gpt-max
-    - nvidia-nim-deepseek
+    - deepseek-flash
+    - openrouter-deepseek-flash
     - openrouter-mimo
     - openrouter-qwen36plus
     default_paid: true
@@ -539,12 +593,15 @@ call_sites:
     - groq-free
     - openrouter-free
   # Dream cycle: cluster-merge synthesis for episodic memory consolidation.
-  # Free-tier only. Separate from 22_tagging (entity extraction).
+  # Leads with paid V4.1 Flash (DeepSeek direct, then OpenRouter) since the
+  # free NIM lead stopped answering (2026-10-07); free rungs follow.
+  # Separate from 22_tagging (entity extraction).
   dream_cycle_synthesis:
     chain:
-    - nvidia-nim-deepseek
+    - deepseek-flash
     - openrouter-deepseek-flash
     - groq-free
+    default_paid: true
     retry_profile: background
   # Adversarial challenge of synthesis output. Must stay model-independent from
   # synthesis across the WHOLE chain, not just the primary: synthesis falls back
@@ -613,8 +670,9 @@ call_sites:
   # DeepSeek challenges the entity_check's judgments (which lead with groq-free).
   dream_cycle_entity_challenge:
     chain:
-    - nvidia-nim-deepseek
+    - deepseek-flash
     - openrouter-deepseek-flash
+    default_paid: true
     retry_profile: background
   # Entity-NODE merge-vs-distinct adjudication (entity_adjudication drainer).
   # Same free-SLM shape as dream_cycle_entity_check; hourly, small backlog.
@@ -633,17 +691,20 @@ call_sites:
   # mistake cannot merge two distinct entities — both must agree before a merge.
   entity_adjudication_challenge:
     chain:
-    - nvidia-nim-deepseek
+    - deepseek-flash
     - openrouter-deepseek-flash
+    default_paid: true
     retry_profile: background
   # One-shot supervised wing backfill (scripts/wing_backfill.py) — batch
   # classification of legacy general/uncategorized memories into wings.
-  # Same free background family as the dream-cycle classification sites.
+  # Same background family as the dream-cycle sites: paid V4.1 Flash leads
+  # (owner, 2026-10-07: keep the model this chain was built around), free follows.
   wing_backfill:
     chain:
-    - nvidia-nim-deepseek
+    - deepseek-flash
     - groq-free
     - openrouter-deepseek-flash
+    default_paid: true
     retry_profile: background
   27_pre_execution_assessment:
     chain:
@@ -693,7 +754,6 @@ call_sites:
     chain:
     - gemini-free
     - groq-free
-    - nvidia-nim-deepseek
     - mistral-large-free
     - mistral-medium-free
     description: LLM-driven skill improvement proposals
@@ -703,11 +763,10 @@ call_sites:
     - groq-free
     - mistral-large-free
     - mistral-medium-free
-    - nvidia-nim-deepseek
     description: Synthesize research results into concise summaries
   38_procedure_extraction:
     chain:
-    - nvidia-nim-deepseek
+    - deepseek-flash
     - openrouter-deepseek-flash
     - openrouter-mimo
     - groq-free
@@ -752,7 +811,7 @@ call_sites:
     description: "Unified cognitive loop focus selector — picks ego attention direction from pending signals"
   43_task_retrospective:
     chain:
-    - nvidia-nim-deepseek
+    - deepseek-flash
     - openrouter-deepseek-flash
     - openrouter-mimo
     - mistral-large-free
@@ -762,7 +821,7 @@ call_sites:
     description: Post-execution retrospective learning extraction
   44_task_premortem:
     chain:
-    - nvidia-nim-deepseek
+    - deepseek-flash
     - openrouter-deepseek-flash
     - openrouter-mimo
     - mistral-large-free
@@ -789,7 +848,8 @@ call_sites:
   46_infra_annotation:
     chain:
     - openrouter-mimo
-    - nvidia-nim-deepseek
+    - deepseek-flash
+    - openrouter-deepseek-flash
     - gemini-free
     - mistral-large-free
     - mistral-medium-free
@@ -834,7 +894,7 @@ call_sites:
     description: "Proactive infrastructure monitoring \u2014 trend detection and forecasting"
   40_knowledge_distillation:
     chain:
-    - nvidia-nim-deepseek
+    - deepseek-flash
     - groq-free
     - gemini-free
     - mistral-large-free
@@ -939,14 +999,14 @@ call_sites:
   judge:
     chain:
     - openrouter-deepseek-v4
-    - nvidia-nim-deepseek
+    - deepseek-flash
     - openrouter-deepseek-flash
     default_paid: true
     retry_profile: background
     dispatch: api
     description: "LLM-as-judge primitive \u2014 grades outputs against versioned\
       \ rubrics for the eval harness (and, in later phases, CRAG retrieval).\
-      \ Paid v4-pro (the existing judge baseline) first, then NIM v4.1-flash, then paid v4.1-flash\
+      \ Paid v4-pro (the existing judge baseline) first, then v4.1-flash via DeepSeek direct, then via OpenRouter\
       \ for resilience; model_used\
       \ is logged per judgment for calibration traceability."
   voice_conversation:
@@ -1001,18 +1061,18 @@ call_sites:
   attention_salience:
     chain:
     - mistral-small-free
-    - nvidia-nim-deepseek
     never_pays: true
     retry_profile: user_facing
     description: >-
       Attention engine L1.5 salience gate (offline shadow tool, opt-in via the runner's
       --l15 flag): scores a graduated ~8s ambient window into {real, perk} floats. PRIVACY
-      \u2014 this sends the window's household transcript text to an external free LLM; only the
+      \u2014 this sends the window's ambient transcript text to an external free LLM; only the
       float verdict is persisted (never the text). Provider bake-off 2026-07-01 over real
-      garbled windows: mistral-small-latest (100% clean JSON, ~0.8s) primary + nvidia-nim
-      deepseek-v4.1-flash (valid JSON on live probe 2026-10-01; different vendor) fallback; both free, so never_pays
-      keeps a valid chain. NON-Groq deliberately \u2014 Groq's 8B is EOL 2026-08-16 and its
-      gpt-oss-20b replacement breaks strict JSON.
+      garbled windows: mistral-small-latest (100% clean JSON, ~0.8s). Its former fallback,
+      nvidia-nim deepseek-v4.1-flash, stopped answering on NVIDIA's side (2026-10-07) and was
+      removed; no other free model was JSON-verified here, and Gemini's free tier may train on
+      what it receives, so Mistral stands alone until one is. NON-Groq deliberately \u2014
+      Groq's 8B is EOL 2026-08-16 and its gpt-oss-20b replacement breaks strict JSON.
   ambient_arbiter:
     chain: []
     dispatch: cli
