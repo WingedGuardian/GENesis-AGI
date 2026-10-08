@@ -12,7 +12,7 @@ import logging
 import os
 import random
 import sqlite3
-from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterable, Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
@@ -332,6 +332,10 @@ def _is_lock_error(exc: BaseException) -> bool:
     return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
 
 
+class PendingTransactionError(RuntimeError):
+    """A committed write cannot take ownership of another pending transaction."""
+
+
 class SerializedConnection:
     """Proxy that serializes all DB operations through an asyncio.Lock.
 
@@ -404,6 +408,18 @@ class SerializedConnection:
     def _reset_error_count(self) -> None:
         object.__setattr__(self, "_consecutive_errors", 0)
 
+    async def _reconnect_locked(self) -> None:
+        """Reopen through the configured factory; caller holds the shared lock."""
+        if self._reconnect_fn is None:
+            return
+        try:
+            await self._conn.close()
+        except Exception:
+            logger.debug("Old connection close failed", exc_info=True)
+        new_conn = await self._reconnect_fn()
+        object.__setattr__(self, "_conn", new_conn)
+        self._reset_error_count()
+
     async def _handle_lock_error(self, exc: Exception) -> None:
         """Track lock errors and attempt reconnection after threshold."""
         count = self._consecutive_errors + 1
@@ -415,14 +431,7 @@ class SerializedConnection:
                 self._max_errors,
             )
             try:
-                old_conn = self._conn
-                try:
-                    await old_conn.close()
-                except Exception:
-                    logger.debug("Old connection close failed", exc_info=True)
-                new_conn = await self._reconnect_fn()
-                object.__setattr__(self, "_conn", new_conn)
-                object.__setattr__(self, "_consecutive_errors", 0)
+                await self._reconnect_locked()
                 logger.info("DB connection recovered after %d lock errors", count)
             except Exception:
                 logger.error("DB reconnection failed", exc_info=True)
@@ -572,6 +581,55 @@ class SerializedConnection:
         return Result(_locked())
 
     # -- Simple async operations -------------------------------------------
+
+    async def execute_committed(
+        self, sql: str, parameters: Iterable[Any] | None = None,
+    ) -> int:
+        """Commit one statement under the lock and return its matched rowcount.
+
+        Pending foreign work is refused untouched; callers may retry after its
+        owner commits. A cancelled await can still have committed (aiosqlite's
+        queue cancels the wait, not the operation). Cleanup finishes under the
+        lock, leaving the connection idle or closed, never a dangling write.
+        This accepts trusted internal SQL, not user-supplied SQL or a body API.
+        """
+        params = dict(parameters) if isinstance(parameters, Mapping) else tuple(parameters or ())
+        async with self._lock:
+            if self._conn.in_transaction:
+                raise PendingTransactionError("Retry after the pending transaction's owner finishes")
+            try:
+                cursor = await self._retry_locked(lambda: self._conn.execute(sql, params))
+                count = cursor.rowcount
+                await cursor.close()
+                await self._retry_locked(lambda: self._conn.commit())
+                return count
+            except BaseException:
+                async def cleanup() -> None:
+                    # Cleanup must not be prevented by a new quarantine gate.
+                    try:
+                        await self._conn.rollback()
+                        if self._conn.in_transaction:
+                            raise RuntimeError("Committed-write rollback left a transaction open")
+                    except Exception:
+                        logger.error("Committed-write cleanup failed; recovering connection", exc_info=True)
+                        with suppress(Exception):
+                            await self._conn.close()
+                        # Unlike routine lock errors, failed cleanup needs
+                        # immediate recovery, not a threshold of five failures.
+                        try:
+                            await self._reconnect_locked()
+                        except Exception:
+                            logger.error("Committed-write recovery failed; connection unavailable", exc_info=True)
+
+                task = asyncio.create_task(cleanup())
+                while True:
+                    try:
+                        await asyncio.shield(task)
+                        break
+                    except asyncio.CancelledError:
+                        if task.cancelled():
+                            raise
+                raise
 
     async def commit(self) -> None:
         async with self._lock:
