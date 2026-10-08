@@ -30,7 +30,10 @@ hole; a closed grammar has none of those to handle::
     Escalate: no
 
 Rounds that owe more add ``Audit-evidence: <path> <verdict>`` and
-``Premise-check: P1 TRUE <text>`` lines (see ``obligations``).
+``Premise-check: P1 TRUE <text>`` lines (see ``obligations``). A cited audit
+must have been written after the round started and before the reflection was
+committed. Each of the PR's acceptance points must appear within one Scope
+line that starts ``covered:``.
 
 ``covered_keys`` is THE coverage check: the commit gate (a later change) calls
 it, and it applies every local rule, so a reflection committed by hand is held
@@ -62,7 +65,7 @@ if str(SCRIPTS) not in sys.path:
 
 SETTLE = timedelta(minutes=30)
 MIN_BLOCK_CHARS = 300
-LOG_DEPTH = 300
+LOG_DEPTH = 1000
 #: A template placeholder; it can never match a field, so it is refused anyway,
 #: but naming it gives a clearer message.
 FILL = "<FILL:"
@@ -75,7 +78,7 @@ _TEXT = r"[!-~][ -~]{9,299}"  # 10-300 printable ASCII characters, not starting 
 #: Every field the block may hold: name -> (pattern for the whole line, min, max).
 FIELDS: dict[str, tuple[re.Pattern[str], int, int | None]] = {
     "Class": (
-        re.compile(r"^Class: ([A-Za-z0-9][A-Za-z0-9 ,/()'.-]{1,79}) = ([0-9]{1,4})$"),
+        re.compile(r"^Class: ([A-Za-z0-9][A-Za-z0-9 ,/()'.-]{1,79}) = ([1-9][0-9]{0,3})$"),
         1,
         None,
     ),
@@ -87,14 +90,14 @@ FIELDS: dict[str, tuple[re.Pattern[str], int, int | None]] = {
     "Decision-why": (re.compile(rf"^Decision-why: ({_TEXT})$"), 1, 1),
     "Disposition": (
         re.compile(
-            rf"^Disposition: ({_KEY}) (fix-now test=[1-4](?:,[1-4]){{0,3}}|file issue=#[0-9]{{1,7}})$"
+            rf"^Disposition: ({_KEY}) (fix-now test=[1-4](?:,[1-4]){{0,3}}|file issue=#[1-9][0-9]{{0,6}})$"
         ),
         1,
         None,
     ),
     "Audit-evidence": (re.compile(r"^Audit-evidence: ([!-~]{1,300})(?: ([ -~]{1,300}))?$"), 0, 1),
     "Premise-check": (
-        re.compile(rf"^Premise-check: P([0-9]{{1,2}}) (TRUE|FALSE|UNPROVEN) ({_TEXT})$"),
+        re.compile(rf"^Premise-check: P([1-9][0-9]?) (TRUE|FALSE|UNPROVEN) ({_TEXT})$"),
         0,
         None,
     ),
@@ -252,11 +255,15 @@ def parse(
         result.problems.append(
             "from round 2 the premise verdict is SOUND, SOUND-BUT-INFERIOR or BROKEN"
         )
-    scope_text = _normalize("\n".join(result.scopes))
+    covered_scopes = [
+        line for line in map(_normalize, result.scopes) if line.startswith("covered:")
+    ]
     for item in acceptance or ():
         wanted = _normalize(item)
-        if wanted and wanted not in scope_text:
-            result.problems.append(f"no Scope line maps the acceptance point: {item[:80]}")
+        if wanted and not any(wanted in line for line in covered_scopes):
+            result.problems.append(
+                f"no 'Scope: covered:' line maps the acceptance point: {item[:80]}"
+            )
     audit_owed, premise_owed = obligations(round_number, gate_lane)
     if audit_owed and not result.audit_evidence:
         result.problems.append(
@@ -403,29 +410,61 @@ def _commit_objects(cwd: str, shas: Sequence[str]) -> dict[str, bytes]:
     return objects
 
 
-def _log_reflections(cwd: str) -> list[tuple[str, str, str]]:
-    """``(sha, "empty"|"content", body)`` for each recent commit whose message
-    starts with the header, newest first. A message in a legacy encoding is
-    decoded with replacement, so the grammar refuses it rather than crashing."""
-    shas = _git(cwd, "log", f"-n{LOG_DEPTH}", "--format=%H", "HEAD").split()
+def _header_time(line: bytes) -> datetime | None:
+    """The epoch time on an ``author``/``committer`` header line, or None when
+    it is missing or out of range (never a crash)."""
+    parts = line.rsplit(b" ", 2)
+    if len(parts) != 3 or not parts[1].isdigit():
+        return None
+    try:
+        return datetime.fromtimestamp(int(parts[1]), UTC)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _log_reflections(cwd: str) -> list[tuple[str, str, str, datetime | None]]:
+    """``(sha, "empty"|"content", body, committed_at)`` for each commit whose
+    message starts with the header, newest first. Only commits carrying a
+    header line are read, and a read that reaches ``LOG_DEPTH`` of them
+    refuses rather than silently dropping the older ones. A message in a
+    legacy encoding is decoded with replacement, so the grammar refuses it
+    rather than crashing."""
+    shas = _git(
+        cwd,
+        "log",
+        f"-n{LOG_DEPTH}",
+        "--basic-regexp",
+        "--grep=^Round-reflection:",
+        "--format=%H",
+        "HEAD",
+    ).split()
+    if len(shas) >= LOG_DEPTH:
+        raise Refused(f"{LOG_DEPTH} or more reflection commits; the history read would be cut off")
     found = []
     for sha, raw in _commit_objects(cwd, shas).items():
         headers, _, message = raw.partition(b"\n\n")
         body = message.decode("utf-8", errors="replace")
         if not body.startswith("Round-reflection:"):
             continue
-        tree, parents = "", []
+        tree, parents, stamps = "", [], {}
         for line in headers.split(b"\n"):
             if line.startswith(b"tree "):
                 tree = line[5:].decode()
             elif line.startswith(b"parent "):
                 parents.append(line[7:].decode())
-            else:
-                break  # tree and parents come first in every commit object
+            elif line.startswith((b"author ", b"committer ")):
+                stamps[line.split(b" ", 1)[0]] = _header_time(line)
+                if line.startswith(b"committer "):
+                    break  # tree, parents, author, committer come first, in that order
+        # The earlier of the two: a rebase or amend rewrites the committer
+        # time but keeps the author time, so replaying a reflection after a
+        # late audit cannot move its bound forward. Either unreadable: None.
+        times = [stamps.get(b"author"), stamps.get(b"committer")]
+        committed_at = None if None in times else min(t for t in times if t is not None)
         empty = (
             len(parents) == 1 and tree == _git(cwd, "rev-parse", f"{parents[0]}^{{tree}}").strip()
         )
-        found.append((sha, "empty" if empty else "content", body))
+        found.append((sha, "empty" if empty else "content", body, committed_at))
     return found
 
 
@@ -434,14 +473,15 @@ def previous_class_labels(cwd: str, prior_heads: Sequence[str]) -> list[str]:
     valid empty reflection naming one of ``prior_heads`` (the round heads
     ``review_budget`` reports before the current one). A reflection naming any
     other head is ignored, so a stray or mistyped one cannot stand in for the
-    previous round. Drafts never count."""
+    previous round. Drafts never count: an invalid or escalating reflection
+    was never accepted as its round's answer."""
     wanted = set(prior_heads)
     classes: list[str] = []
     if not wanted:
         return classes
-    for _, kind, body in _log_reflections(cwd):
+    for _, kind, body, _ in _log_reflections(cwd):
         parsed = parse(body)
-        if kind == "empty" and parsed.ok and parsed.head in wanted:
+        if kind == "empty" and parsed.ok and not parsed.escalate and parsed.head in wanted:
             classes.extend(c for c in parsed.classes if c not in classes)
     return classes
 
@@ -458,12 +498,20 @@ def _parse_when(raw: object) -> datetime | None:
     return when if when.tzinfo else None
 
 
-def audit_problem(path: str, round_started: object) -> str | None:
+#: Commit times have one-second resolution; a file written in the same second
+#: as the commit may carry a later fractional mtime.
+_COMMIT_CLOCK_SLACK = timedelta(seconds=1)
+
+
+def audit_problem(path: str, round_started: object, made_at: object) -> str | None:
     """Why a cited audit does not count, or None. Local only: the file must
     exist, decode, pass the review gate's own adversarial-evidence check, and
-    not predate the round's start. An unknown or unreadable round start is a
-    refusal, never a skipped check (touching a file also moves its time, so
-    this is a floor, not proof of freshness)."""
+    have been last written inside the window from the round's start to the
+    reflection's commit (``made_at``), so an audit written or changed after
+    the reflection is refused. An unknown end of the window is a refusal,
+    never a skipped check. File times can be set by hand, so this binds an
+    honest session's evidence to its reflection; it is not proof against
+    tampering."""
     import review_state  # noqa: PLC0415
 
     evidence = Path(os.path.expanduser(path))
@@ -482,6 +530,11 @@ def audit_problem(path: str, round_started: object) -> str | None:
         return "the round's start time is unknown, so the audit's freshness cannot be checked"
     if mtime < started:
         return "Audit-evidence predates this round's first review"
+    made = _parse_when(made_at)
+    if made is None:
+        return "the reflection's commit time is unknown, so the audit cannot be bound to it"
+    if mtime > made + _COMMIT_CLOCK_SLACK:
+        return "Audit-evidence was written or changed after the reflection was committed"
     return None
 
 
@@ -494,6 +547,7 @@ def check(
     previous_classes: Iterable[str],
     acceptance: Sequence[str] | None,
     round_started: object,
+    made_at: object,
 ) -> Reflection:
     """Every local rule a reflection must meet for this round, in one place."""
     parsed = parse(
@@ -510,7 +564,7 @@ def check(
     if parsed.escalate:
         parsed.problems.append("the reflection escalates: it needs an architecture decision")
     if parsed.audit_evidence:
-        trouble = audit_problem(parsed.audit_evidence, round_started)
+        trouble = audit_problem(parsed.audit_evidence, round_started, made_at)
         if trouble:
             parsed.problems.append(trouble)
     return parsed
@@ -553,7 +607,8 @@ def covered_keys(
     made before any fix to it (``before_any_fix``), and ``check`` passes it:
     the grammar, the round's obligations, the recurring-class rule against
     every earlier round head (``prior_heads``), a readable adversarial audit
-    no older than ``round_started`` where one is cited, no escalation, and the
+    written between ``round_started`` and the reflection's commit where one is
+    cited, no escalation, and the
     acceptance points (None only when the PR declares none). Every argument is
     required, so no caller gets a weaker check by leaving one out. A
     reflection committed by hand is held to exactly this; there is no weaker
@@ -562,7 +617,7 @@ def covered_keys(
     """
     previous = previous_class_labels(cwd, prior_heads)
     covered: set[str] = set()
-    for sha, kind, body in _log_reflections(cwd):
+    for sha, kind, body, committed_at in _log_reflections(cwd):
         if kind != "empty" or not before_any_fix(cwd, head, sha):
             continue
         result = check(
@@ -573,6 +628,7 @@ def covered_keys(
             previous_classes=previous,
             acceptance=acceptance,
             round_started=round_started,
+            made_at=committed_at,
         )
         if result.ok:
             covered.update(result.keys)

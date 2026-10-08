@@ -10,6 +10,7 @@ behaviours.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -114,6 +115,10 @@ def test_all_key_forms_are_in_the_grammar():
         "Premise-check: P1 is it TRUE? nobody checked",
         "Random: an unknown field name is refused",
         "Decision: maybe",
+        # Round 2 of #3055: value domains start at 1.
+        "Class: an empty class = 0",
+        "Disposition: c1 file issue=#0",
+        "Premise-check: P01 TRUE a leading zero makes a second P1",
     ],
 )
 def test_every_markdown_or_malformed_construct_in_the_block_is_refused(construct):
@@ -562,6 +567,9 @@ def test_an_invalid_or_content_reflection_adds_no_previous_class(repo, tmp_path)
     path, first = repo
     broken = _reflection(head=first, classes=("ghost = 1",), escalate="maybe")
     _commit_reflection(path, tmp_path, broken)
+    # Round 2 of #3055: an escalating draft parses, but was never an answer.
+    draft = _reflection(head=first, classes=("draft = 1",), escalate="yes")
+    _commit_reflection(path, tmp_path, draft)
     content = _reflection(head=first, classes=("loaded = 1",))
     _commit_reflection(path, tmp_path, content, empty=False)
     assert rr.previous_class_labels(str(path), [first]) == []
@@ -588,6 +596,70 @@ def test_a_reflection_on_another_line_of_history_covers_nothing(repo, tmp_path):
     _git(path, "checkout", "-q", "feat/x")
     _commit_reflection(path, tmp_path, _reflection(head=side_head))
     assert _covered(path, side_head) == set()
+
+
+def test_a_rebase_cannot_move_the_audit_bound_forward(repo, tmp_path):
+    """Fix-code audit S1 of round 2: a rebase rewrites the committer time, so
+    the bound is the earlier of author and committer time."""
+    path, head = repo
+    evidence = tmp_path / "late-audit.txt"
+    cited = _reflection(head=head, extra=[f"Audit-evidence: {evidence} PASS"])
+    _commit_reflection(path, tmp_path, cited)
+    authored = int(_git(path, "log", "-1", "--format=%at").strip())
+    evidence.write_text(_strong_audit(tmp_path).read_text())
+    os.utime(evidence, (authored + 30, authored + 30))
+    env = {**os.environ, "GIT_COMMITTER_DATE": f"{authored + 60} +0000"}
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "-q", "--amend", "--allow-empty", "--no-edit"],
+        env=env,
+        check=True,
+    )
+    assert int(_git(path, "log", "-1", "--format=%ct").strip()) == authored + 60
+    assert _covered(path, head, gate_lane=True) == set()
+
+
+@pytest.mark.parametrize(
+    "line, want",
+    [
+        (b"committer t <t@example.com> 1791417497 -0400", 1791417497),
+        (b"committer a name with spaces <t@example.com> 1791417497 +0000", 1791417497),
+        (b"committer t <t@example.com> 300000000000 +0000", None),
+        (b"committer t <t@example.com> notatime +0000", None),
+        (b"committer", None),
+    ],
+)
+def test_header_times_parse_or_are_unknown_never_a_crash(line, want):
+    got = rr._header_time(line)
+    assert (got.timestamp() if got else None) == want
+
+
+def test_the_reflection_read_ignores_the_grep_pattern_setting(repo, tmp_path):
+    """Fix-code audit N1: grep.patternType=fixed read ^ literally."""
+    path, head = repo
+    _git(path, "config", "grep.patternType", "fixed")
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head) == {"c1", "c2"}
+
+
+def test_a_history_read_that_reaches_its_cap_refuses(repo, tmp_path, monkeypatch):
+    """Round 2 of #3055: a capped read silently dropped the oldest
+    reflections, and with them earlier rounds' classes."""
+    path, head = repo
+    monkeypatch.setattr(rr, "LOG_DEPTH", 2)
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head) == {"c1", "c2"}
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    with pytest.raises(rr.Refused, match="cut off"):
+        _covered(path, head)
+
+
+def test_only_reflection_commits_count_toward_the_cap(repo, tmp_path, monkeypatch):
+    path, head = repo
+    monkeypatch.setattr(rr, "LOG_DEPTH", 2)
+    for n in range(5):
+        _git(path, "commit", "-q", "--allow-empty", "-m", f"ordinary {n}")
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert rr.previous_class_labels(str(path), [head]) == ["unchecked subprocess result"]
 
 
 def test_git_replace_cannot_swap_out_a_fix(repo, tmp_path):
@@ -655,7 +727,29 @@ def test_undecodable_audit_evidence_is_unreadable_not_a_crash(tmp_path):
     """Round 1 of #3055: invalid UTF-8 evidence must refuse the reflection."""
     bad = tmp_path / "bad.txt"
     bad.write_bytes(b"\xff\xfe not utf-8 \xc3")
-    assert "not valid UTF-8" in rr.audit_problem(str(bad), T0)
+    assert "not valid UTF-8" in rr.audit_problem(str(bad), T0, T0)
+
+
+def test_an_audit_with_no_known_commit_time_is_refused(tmp_path):
+    strong = _strong_audit(tmp_path)
+    assert "commit time is unknown" in rr.audit_problem(str(strong), T0, None)
+    assert rr.audit_problem(str(strong), T0, datetime.now(UTC) + timedelta(hours=1)) is None
+
+
+def test_an_audit_written_after_the_reflection_is_refused(repo, tmp_path):
+    """Round 2 of #3055: the evidence was bound by path alone, so citing a
+    missing audit, fixing, then writing the audit counted."""
+    path, head = repo
+    evidence = tmp_path / "late-audit.txt"
+    cited = _reflection(head=head, extra=[f"Audit-evidence: {evidence} PASS"])
+    _commit_reflection(path, tmp_path, cited)
+    when = _git(path, "log", "-1", "--format=%ct").strip()
+    evidence.write_text(_strong_audit(tmp_path).read_text())
+    later = int(when) + 60
+    os.utime(evidence, (later, later))
+    assert _covered(path, head, gate_lane=True) == set()
+    os.utime(evidence, (int(when) - 5, int(when) - 5))
+    assert _covered(path, head, gate_lane=True) == {"c1", "c2"}
 
 
 def test_a_legacy_encoded_commit_message_is_read_not_a_crash(repo, tmp_path):
@@ -674,6 +768,23 @@ def test_acceptance_points_are_checked_when_given(repo, tmp_path):
     _commit_reflection(path, tmp_path, _reflection(head=head))
     assert _covered(path, head, acceptance=["the key round-trips"]) == {"c1", "c2"}
     assert _covered(path, head, acceptance=["an unmapped point"]) == set()
+
+
+@pytest.mark.parametrize(
+    "scopes, ok",
+    [
+        (("covered: the gate refuses an unreadable PR body",), True),
+        (("covered: the gate refuses", "covered: an unreadable PR body"), False),
+        (("not covered: the gate refuses an unreadable PR body",), False),
+        (("deferred: the gate refuses an unreadable PR body",), False),
+    ],
+)
+def test_an_acceptance_point_maps_within_one_covered_scope_line(scopes, ok):
+    """Round 2 of #3055: a point split across Scope lines, or named on a
+    line that says it is not covered, was accepted."""
+    point = "the gate refuses an unreadable PR body"
+    got = rr.parse(_reflection(scopes=scopes), round_number=1, acceptance=[point])
+    assert got.ok is ok, got.problems
 
 
 def test_status_subtracts_what_is_covered(repo, tmp_path, monkeypatch):
