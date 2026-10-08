@@ -116,10 +116,13 @@ class SessionManager:
         dispatch_mode: str | None = None,
         profile: str | None = None,
         origin: str | None = None,
+        initial_metadata: dict | None = None,
     ) -> dict:
         now = datetime.now(UTC).isoformat()
         sess_id = str(uuid.uuid4())
-        meta: dict = {}
+        # Trusted internal binding must be durable before lifecycle hooks fire.
+        # Copy before the first await; callers cannot mutate the stored binding.
+        meta: dict = dict(initial_metadata or {})
         if skill_tags:
             meta["skill_tags"] = skill_tags
         if dispatch_mode:

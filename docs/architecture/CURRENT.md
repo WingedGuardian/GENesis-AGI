@@ -354,6 +354,16 @@ verified: ba6e357a7 2026-10-08
   API, task coordinator and lease broker are separate dependent slices, so this
   mechanism alone does not enable peer work. See [peer execution](../reference/peer-execution.md).
 
+- **Peer runner foundation (dark until coordinator readiness)** — trusted
+  `peers/session.py` bindings enter a dedicated `peers/runner.py` branch before
+  owner context/skills. Task, segment, generation and capped current autonomy
+  are durable before hooks. Individual cancellation retains cleanup ownership;
+  unconfirmed scope/broker drain blocks new peers and retains acquired capacity.
+  Scanned full artifacts precede successful recording; previews use existing
+  result storage without owner transcripts or tool arguments. The coordinator,
+  broker and owned disclosure remain dependent slices. See
+  [peer runner](../reference/peer-runner.md).
+
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
   `cc/gmodel_settings.py`): Kimi K3 and MiMo V2.6 Pro select subscription, native
   API or OpenRouter from the isolated `gmodel.models` catalog. Auto recomputes at
