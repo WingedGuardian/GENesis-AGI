@@ -1095,7 +1095,7 @@ Note: the *learning* package hosts the other big scheduler (see entry 10).
 ```yaml subsystem-map
 entry: scheduling-background
 modules: [surplus, scheduler, follow_ups]
-verified: eb37e4ef0 2026-10-08
+verified: 9a1e0b7 2026-10-08
 ```
 
 - **Surplus generators are deliberately BLIND to `infrastructure_alert`
