@@ -653,6 +653,8 @@ async def test_after_a_restart_with_no_dirty_alert_the_first_check_reconciles(db
     (row,) = await _rows(db)
     assert "missing systemd units: x.timer" in row["content"]
     assert "could not be read" not in row["content"]
+
+
 # ── `live`, the integration branch (#2978 PR E) ──────────────────────────────
 
 
@@ -668,7 +670,9 @@ async def test_a_live_only_alert_carries_no_update_sh_paragraph(db, monkeypatch)
     assert row["priority"] == "high"
     assert "NOT fully deployed" not in row["content"]
     assert "lists 2 candidate(s)" in row["content"]
-    assert "git switch live" in row["content"]
+    # Round-1 review (P1): a bare `git switch live` boots whatever `live` held
+    # before; the recovery is the engine's rebuild, then a restart.
+    assert "To run them: scripts/deploy_candidates rebuild" in row["content"]
     assert "deploy_code_only.sh restart" in row["content"]
 
 
@@ -704,3 +708,57 @@ async def test_a_deploy_carries_the_standing_live_alert(db, monkeypatch):
     await loop._check_deploy_staleness(db)
     [after] = await _rows(db)
     assert after["id"] == before["id"], "a deploy tick resolved the live alert"
+
+
+async def test_an_unknown_candidate_count_never_resolves_a_standing_live_alert(db, monkeypatch):
+    """Round-1 review: an unknown count (list timed out, ref probe failed) read as
+    0, so a tick that observed nothing resolved the live_off_branch alert."""
+    _patch_snapshot(
+        monkeypatch,
+        _snap(["live_off_branch:2"], live={"state": "other", "candidates": 2}),
+    )
+    await loop._check_deploy_staleness(db)
+    [before] = await _rows(db)
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    _patch_snapshot(monkeypatch, _snap([], live={"state": "other", "candidates": None}))
+    await loop._check_deploy_staleness(db)
+    assert [r["id"] for r in await _rows(db)] == [before["id"]]
+    assert await _rows(db, resolved=1) == []
+
+
+@pytest.mark.parametrize(
+    "live",
+    [
+        {"state": "deploying"},
+        {"state": "unreadable", "reason": "slow"},
+        {"state": "other", "candidates": None},
+    ],
+    ids=["deploying", "first-unreadable", "unknown-count"],
+)
+async def test_after_a_restart_a_standing_live_alert_is_not_resolved(db, monkeypatch, live):
+    """Round-1 review: after a restart the in-memory live findings are gone, and a
+    first tick that reads nothing stripped them and recorded recovery. The
+    standing alert's class is now carried from the store, as the checkout path
+    does."""
+    _patch_snapshot(
+        monkeypatch,
+        _snap(["live_off_branch:2"], live={"state": "other", "candidates": 2}),
+    )
+    await loop._check_deploy_staleness(db)
+    _restart(monkeypatch)
+    _patch_snapshot(monkeypatch, _snap([], live=live))
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db, resolved=1) == [], "a tick that read nothing resolved the alert"
+    [after] = await _rows(db)
+    assert "live_off_branch" in after["content"]
+
+
+async def test_a_carried_unknown_count_is_worded_without_a_number(db, monkeypatch):
+    _patch_snapshot(
+        monkeypatch,
+        _snap(["live_off_branch:?"], live={"state": "other", "candidates": None}),
+    )
+    monkeypatch.setattr(loop, "_last_actionable_live_findings", ["live_off_branch:?"])
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert "lists candidates (their count was not read on this check)" in row["content"]

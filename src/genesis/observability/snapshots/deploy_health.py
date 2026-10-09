@@ -702,8 +702,13 @@ def _unanswered(repo: Path, reason: str) -> dict:
     reason kept, so a slow or failed probe never raises a finding on an install
     that does not run `live`."""
     logger.warning("deploy_health: live predicate gave no verdict: %s", reason)
-    state = "unreadable" if _on_live_branch(repo) else "other"
-    return {"state": state, "reason": reason}
+    if _on_live_branch(repo):
+        # Still on `live`: the tier-2 and guardian comparisons must not fall back
+        # to HEAD (where every candidate reads as drift), so say so.
+        return {"state": "unreadable", "reason": reason, "on_live_branch": True}
+    # Off `live`, an unknown candidate count: carried by the awareness check,
+    # never read as 0 (which would resolve a standing live_off_branch alert).
+    return {"state": "other", "reason": reason, "candidates": None}
 
 
 def _collect_live(repo: Path, timeout: float) -> dict:
@@ -729,26 +734,46 @@ def _collect_live(repo: Path, timeout: float) -> dict:
         return _unanswered(repo, f"the live predicate answered {word!r} (rc {rc})")
     facts: dict = {"state": word}
     if word == "live":
-        facts["base"] = _live_base(repo)
-        facts["candidate_tier2"] = None
-        if facts["base"]:
-            rc, diff, _ = _run_git(
-                repo,
-                "diff",
-                "--name-only",
-                f"{facts['base']}..HEAD",
-                "--",
-                *TIER2_PATHS,
-                timeout=_CHEAP_TIMEOUT_S,
-            )
-            if rc == 0:
-                facts["candidate_tier2"] = len([ln for ln in diff.splitlines() if ln.strip()])
+        # On `live`, an unreadable base or tier-2 diff is "unreadable", never a
+        # healthy `live`: without the base nothing can be compared, so a quiet
+        # snapshot would claim what it could not establish.
+        base = _live_base(repo)
+        if not base:
+            return {
+                "state": "unreadable",
+                "on_live_branch": True,
+                "reason": "the base `live` was built on (merge-base with origin/main) "
+                "could not be read",
+            }
+        facts["base"] = base
+        rc, diff, _ = _run_git(
+            repo,
+            "diff",
+            "--name-only",
+            f"{base}..HEAD",
+            "--",
+            *TIER2_PATHS,
+            timeout=_CHEAP_TIMEOUT_S,
+        )
+        if rc != 0:
+            return {
+                "state": "unreadable",
+                "on_live_branch": True,
+                "base": base,
+                "reason": "the update.sh-only files `live` adds over its base could not be listed",
+            }
+        facts["candidate_tier2"] = len([ln for ln in diff.splitlines() if ln.strip()])
     elif word == "other":
         rc, _, _ = _run_git(
             repo, "rev-parse", "--verify", "-q", _LIVE_REF, timeout=_CHEAP_TIMEOUT_S
         )
-        if rc != 0:
+        # MEASURED (git 2.43): `rev-parse --verify -q` exits 1 for an absent ref,
+        # 0 for a present one, 128 when the repo is unreadable; _run_git adds -1
+        # (timeout) and -2 (exec failure). Only 1 says "no branch `live`".
+        if rc == 1:
             facts["candidates"] = 0  # no branch `live`: nothing was ever built here
+        elif rc != 0:
+            facts["candidates"] = None  # unknown: carried, never read as 0
         else:
             got = _run_probe([str(repo / "scripts" / "deploy_candidates"), "list"], timeout)
             facts["candidates"] = _listed_candidates(got)
@@ -774,6 +799,14 @@ def _listed_candidates(got: tuple[int, str] | None) -> int | None:
         return len(lines)
     logger.warning("deploy_health: unrecognised deploy_candidates list output")
     return None
+
+
+def live_unknown(live: dict | None) -> bool:
+    """True when the reading says nothing either way about the live classes: off
+    `live` with an unknown candidate count. The awareness check carries the last
+    actionable live findings over such a tick instead of resolving them."""
+    live = live or {}
+    return live.get("state") == "other" and "candidates" in live and live["candidates"] is None
 
 
 def live_findings(live: dict | None) -> list[str]:

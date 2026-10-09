@@ -546,7 +546,7 @@ _last_memory_integrity_key: str = ""
 # `probe_falkordb` reports it DOWN. So the lever moves back first.
 _FALKORDB_STAND_DOWN = (
     "To stand it down instead, first set graphstore `mode: networkx` "
-    "(settings_update(\"graphstore\", {\"mode\": \"networkx\"}), or "
+    '(settings_update("graphstore", {"mode": "networkx"}), or '
     "~/.genesis/config/graphstore.local.yaml) — while `mode: falkordb` is "
     "selected, memory-graph reads depend on the engine, every recall falls back "
     "to NetworkX with a warning, and the health probe reports it DOWN — then "
@@ -700,10 +700,7 @@ def _falkordb_selected(facts: dict) -> bool:
 
 def _falkordb_armed(facts: dict) -> bool:
     """Selected by the lever, or enabled by an operator — either is intent."""
-    return (
-        _falkordb_selected(facts)
-        or facts.get("unit_enabled") in _FALKORDB_ENABLED_STATES
-    )
+    return _falkordb_selected(facts) or facts.get("unit_enabled") in _FALKORDB_ENABLED_STATES
 
 
 def _falkordb_could_alert(section: dict) -> bool:
@@ -1397,6 +1394,8 @@ def _finding_like(finding_class: str) -> str:
     carries free text (edited file names, a probe's error) that can contain the
     class name; `_` is a LIKE wildcard, so `missing-units` would match too."""
     return f"%[findings: %{finding_class}%"
+
+
 _last_deploy_alert_at: float = 0.0
 _last_deploy_alert_key: str = ""
 # The deploy checkout's status on the previous tick (deploy_health's
@@ -1439,6 +1438,7 @@ async def _check_deploy_staleness(db) -> None:
         # can monkeypatch the module attribute.
         from genesis.observability.snapshots.deploy_health import (
             deploy_health,
+            live_unknown,
             main_checkout_findings,
         )
 
@@ -1466,7 +1466,9 @@ async def _check_deploy_staleness(db) -> None:
                 checkout = _last_actionable_main_checkout
                 carried = True
             elif await observations.has_unresolved_matching(
-                db, source="deploy_staleness_monitor", content_like=_finding_like("main_checkout_dirty")
+                db,
+                source="deploy_staleness_monitor",
+                content_like=_finding_like("main_checkout_dirty"),
             ):
                 # A dirty alert stands and nothing in memory says its count or
                 # names: carry the class alone, so the alert is kept (or
@@ -1495,15 +1497,32 @@ async def _check_deploy_staleness(db) -> None:
             ] + main_checkout_findings(checkout)
         else:
             _last_actionable_main_checkout = checkout
-        live_state = (snap.get("live") or {}).get("state") or ""
+        live = snap.get("live") or {}
+        live_state = live.get("state") or ""
         previous_live_state = _last_live_state
         _last_live_state = live_state
-        if live_state == "deploying" or (
-            live_state == "unreadable" and previous_live_state != "unreadable"
+        # Not acted on: a deploy in progress, the FIRST unreadable tick, or a
+        # reading that says nothing either way (off `live` with an unknown
+        # candidate count). The last actionable live findings are carried.
+        if (
+            live_state == "deploying"
+            or (live_state == "unreadable" and previous_live_state != "unreadable")
+            or live_unknown(live)
         ):
+            carried_live = _last_actionable_live_findings
+            if carried_live is None:
+                # Nothing in memory (the process restarted): carry the class of
+                # every standing live alert, as the checkout path does, so it is
+                # kept (or superseded), never resolved by a tick that read nothing.
+                carried_live = []
+                for cls in sorted(_DEPLOY_LIVE_CLASSES):
+                    if await observations.has_unresolved_matching(
+                        db, source="deploy_staleness_monitor", content_like=_finding_like(cls)
+                    ):
+                        carried_live.append(cls if cls == "live_unreadable" else f"{cls}:?")
             findings = [
                 f for f in findings if f.split(":", 1)[0] not in _DEPLOY_LIVE_CLASSES
-            ] + list(_last_actionable_live_findings or [])
+            ] + list(carried_live)
         else:
             _last_actionable_live_findings = [
                 f for f in findings if f.split(":", 1)[0] in _DEPLOY_LIVE_CLASSES
@@ -1682,14 +1701,24 @@ def _deploy_live_paragraph(snap: dict, findings: list[str]) -> str:
             )
         elif cls == "live_off_branch":
             parts.append(
-                f"The deploy manifest lists {value} candidate(s), but the checkout is not "
-                "on `live`, so they are not running. To run them: git switch live, then "
+                "The deploy manifest lists "
+                + (
+                    "candidates (their count was not read on this check)"
+                    if value == "?"
+                    else f"{value} candidate(s)"
+                )
+                + ", but the checkout is not "
+                "on `live`, so they are not running. To run them: scripts/deploy_candidates "
+                "rebuild (it rebuilds `live` from the manifest and moves the checkout onto "
+                "it; a bare git switch would run whatever `live` held before), then "
                 "scripts/deploy_code_only.sh restart. To stop listing one: "
                 "scripts/deploy_candidates drop <branch>."
             )
         elif cls == "live_candidate_tier2":
             parts.append(
-                f"`live` carries {value} update.sh-only file(s) from its candidates, over "
+                "`live` carries "
+                + ("update.sh-only files" if value == "?" else f"{value} update.sh-only file(s)")
+                + " from its candidates, over "
                 "the base it was built on; they are active only if scripts/update.sh ran "
                 "after the last rebuild."
             )
@@ -2256,9 +2285,7 @@ async def _nocow_flag(db_path: Path) -> bool | None:
         return None
 
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=_NOCOW_PROBE_TIMEOUT_S
-        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_NOCOW_PROBE_TIMEOUT_S)
     except TimeoutError:
         # RECORD FIRST, clear on success — never the other way round. `_kill_probe`
         # awaits, so it is a cancellation point: a tick cancelled during the reap
@@ -2963,6 +2990,7 @@ async def _check_provider_outage_notify(db) -> None:
             if _breakers is not None:
                 current_incident_identity = _breakers.current_incident_identity
                 incident_owner = _breakers.incident_owner
+
                 def provider_still_failing(name, _reg=_breakers):
                     return _reg.get(name).state != ProviderState.CLOSED
 
@@ -3009,11 +3037,15 @@ async def _check_provider_outage_notify(db) -> None:
             # them at critical in this same tick, which delivers the pending
             # notification — the point of turning the lever up.
             await _promote_demoted_provider_notify(
-                db, coverage_for=coverage_for, incident_owner=incident_owner,
+                db,
+                coverage_for=coverage_for,
+                incident_owner=incident_owner,
             )
 
         written = await sweep_due_notifications(
-            db, priority=priority, provider_still_failing=provider_still_failing,
+            db,
+            priority=priority,
+            provider_still_failing=provider_still_failing,
             current_incident_identity=current_incident_identity,
             incident_owner=incident_owner,
             coverage_for=coverage_for,
@@ -3055,7 +3087,10 @@ async def _open_notify_rows(db) -> list[dict]:
 
 
 async def _promote_demoted_provider_notify(
-    db, *, coverage_for=None, incident_owner=None,
+    db,
+    *,
+    coverage_for=None,
+    incident_owner=None,
 ) -> None:
     """Resolve high-priority notify rows so live mode can rewrite them critical.
 
@@ -3088,8 +3123,11 @@ async def _promote_demoted_provider_notify(
             except Exception:
                 return True  # unknown → the sweep keeps critical, so promote
 
-        demoted = [r["id"] for r in await _open_notify_rows(db)
-                   if r.get("priority") == "high" and _now_critical(r)]
+        demoted = [
+            r["id"]
+            for r in await _open_notify_rows(db)
+            if r.get("priority") == "high" and _now_critical(r)
+        ]
         if demoted:
             from datetime import UTC, datetime
 

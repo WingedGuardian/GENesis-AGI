@@ -234,7 +234,13 @@ def test_a_hung_list_times_out_with_no_key_and_no_survivor(world):
     live = dh.collect_live(world.root, timeout=2)
     assert time.monotonic() - start < 15
     assert live == {"state": "other", "candidates": None}
-    assert _pid_gone(int(pidfile.read_text()))
+    # The group was killed; reaping can lag a moment on a loaded box, so allow
+    # it a bounded few seconds rather than racing the kernel (flaky under load).
+    pid = int(pidfile.read_text())
+    deadline = time.monotonic() + 5
+    while not _pid_gone(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert _pid_gone(pid)
 
 
 def test_during_a_deploy_live_is_not_probed_but_the_branch_is_known(world, monkeypatch):
@@ -304,3 +310,77 @@ def test_derive_findings_carries_the_live_keys_after_the_others():
         )
         == []
     )
+
+
+# ── round 1: an unknown reading is never a healthy one ─────────────────────────
+
+
+def test_on_live_an_unreadable_base_is_unreadable_not_healthy(world, monkeypatch):
+    """Round-1 review: with the base unreadable, `live` read as healthy and
+    upto=None suppressed every comparison, so the snapshot claimed what it could
+    not establish."""
+    _build_live(world, {"b.txt": "b\n"})
+    _manifest(world)
+    _git(world.root, "update-ref", "-d", "refs/remotes/origin/main")
+    live = dh.collect_live(world.root)
+    assert live["state"] == "unreadable" and live["on_live_branch"] is True
+    assert "merge-base" in live["reason"]
+    assert dh.live_findings(live) == ["live_unreadable"]
+    monkeypatch.setattr(dh, "collect_main_checkout_dirty", lambda repo: {"status": "clean"})
+    assert dh._collect_sync(world.root, world.home / ".genesis")["upto"] is None
+
+
+def test_on_live_a_failed_tier2_diff_is_unreadable(world, monkeypatch):
+    _build_live(world, {"b.txt": "b\n"})
+    _manifest(world)
+    real = dh._run_git
+
+    def failing_diff(repo, *args, timeout):
+        if args and args[0] == "diff":
+            return 128, "", "fatal: bad object"
+        return real(repo, *args, timeout=timeout)
+
+    monkeypatch.setattr(dh, "_run_git", failing_diff)
+    live = dh.collect_live(world.root)
+    assert live["state"] == "unreadable" and live["base"] == world.base
+    assert dh.live_findings(live) == ["live_unreadable"]
+
+
+@pytest.mark.parametrize("rc", [128, -1, -2], ids=["broken-repo", "timeout", "exec-failure"])
+def test_off_live_a_failed_ref_probe_is_unknown_not_zero(world, monkeypatch, rc):
+    """Round-1 review: every nonzero rc of the live-ref probe read as "no branch
+    `live`", i.e. 0 candidates. Only rc 1 (MEASURED: absent ref) says so."""
+    real = dh._run_git
+
+    def failing_probe(repo, *args, timeout):
+        if args[:2] == ("rev-parse", "--verify"):
+            return rc, "", "failed"
+        return real(repo, *args, timeout=timeout)
+
+    monkeypatch.setattr(dh, "_run_git", failing_probe)
+    live = dh.collect_live(world.root)
+    assert live == {"state": "other", "candidates": None}
+    assert dh.live_unknown(live) and dh.live_findings(live) == []
+
+
+def test_off_live_an_absent_live_ref_is_zero_and_known(world):
+    live = dh.collect_live(world.root)
+    assert live == {"state": "other", "candidates": 0}
+    assert not dh.live_unknown(live)
+
+
+def test_a_failed_probe_on_live_keeps_the_comparisons_off_head(world, monkeypatch):
+    """The unanswered predicate on `live` must still say it is on `live`, so the
+    comparisons do not fall back to HEAD, where every candidate reads as drift."""
+    _build_live(world, {"b.txt": "b\n"})
+    monkeypatch.setattr(dh, "_run_probe", lambda argv, timeout: None)
+    live = dh.collect_live(world.root)
+    assert live["on_live_branch"] is True
+    monkeypatch.setattr(dh, "collect_main_checkout_dirty", lambda repo: {"status": "clean"})
+    assert dh._collect_sync(world.root, world.home / ".genesis")["upto"] is None
+
+
+def test_off_live_an_unanswered_predicate_is_an_unknown_count():
+    assert dh.live_unknown({"state": "other", "candidates": None, "reason": "x"})
+    assert not dh.live_unknown({"state": "other", "candidates": 0})
+    assert not dh.live_unknown({"state": "other"})
