@@ -3387,6 +3387,11 @@ verified: 1109d1844 2026-10-08
   recall tools. The launcher also selects `--external-client`; memory initialization
   then disables processing of Claude's pending plan-bookmark file. Ordinary
   Genesis memory initialization keeps that processing enabled by default.
+  The standalone server enforces the `external` or `validator` tool profile
+  during discovery and direct calls. Both currently admit the same health/recall
+  floor; other tool bodies cannot be entered through those MCP processes.
+  External health initialization skips the LLM router, dispatch queue setup,
+  and campaign wiring. Profiles constrain tools, not an operator's host access.
   In a linked worktree the launcher sets `GENESIS_REPO_ROOT` to
   the main checkout, which owns the live database and secrets. This gives Codex
   on-demand access without registering its transcript,

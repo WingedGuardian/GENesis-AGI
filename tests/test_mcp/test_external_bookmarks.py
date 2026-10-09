@@ -64,8 +64,9 @@ def test_default_init_preserves_claude_processing_and_resets_external_policy(pen
 
 
 @pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("profile", [None, "external", "validator"])
 async def test_standalone_bootstrap_passes_policy_to_memory_init(
-    monkeypatch, tmp_path, external,
+    monkeypatch, tmp_path, external, profile,
 ):
     import scripts.genesis_mcp_server as server
 
@@ -84,9 +85,16 @@ async def test_standalone_bootstrap_passes_policy_to_memory_init(
     init = MagicMock()
     monkeypatch.setattr(memory, "init", init)
     monkeypatch.setattr(memory.mcp, "_lifespan", memory.mcp._lifespan)
-    server._bootstrap_memory({}, process_pending_bookmarks=not external)
+    monkeypatch.setattr(memory.mcp, "middleware", [])
+    server._bootstrap_memory(
+        {}, process_pending_bookmarks=not external, external_profile=profile,
+    )
     async with memory.mcp._lifespan(memory.mcp):
-        assert init.call_args.kwargs["process_pending_bookmarks"] is not external
+        assert init.call_args.kwargs["process_pending_bookmarks"] is (not external and not profile)
+        if profile:
+            from genesis.mcp.external_profiles import ExternalProfileMiddleware
+
+            assert isinstance(memory.mcp.middleware[0], ExternalProfileMiddleware)
 
 
 @pytest.mark.parametrize("external", [False, True])
@@ -106,5 +114,5 @@ def test_standalone_entrypoint_selects_external_policy(monkeypatch, tmp_path, ex
     if external:
         argv.append("--external-client")
     server.main(argv)
-    expected = {"process_pending_bookmarks": not external} if server_name == "memory" else {}
+    expected = {"external_profile": "external"} if external else {}
     assert bootstrap.call_args.kwargs == expected
