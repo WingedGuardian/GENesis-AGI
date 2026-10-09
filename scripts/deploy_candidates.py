@@ -391,14 +391,19 @@ class Engine(Repo):
             data, state, reason = None, "error", str(exc)
         if data is None and state == "ok":
             state = "absent"
+        # git failing outright here raises Unknown: the command exits 1, which the
+        # collector reads as "no answer", never as an empty manifest.
         base = self.resolve(BASE_REF)
+        head = self.resolve("HEAD")
         listed = [
             {
                 "branch": c["branch"],
                 "head": c["verified_head"],
-                # Already in origin/main: no rebuild merges it, so `live` never holds it.
-                "in_base": bool(base and self.resolve(c["verified_head"]))
-                and self.is_ancestor(c["verified_head"], base),
+                # The checkout already has this head (origin/main carried it, or a
+                # rebuild merged it): judged against HEAD, never origin/main, which
+                # can contain a candidate the checkout has not pulled or rebuilt.
+                "in_checkout": bool(head and self.resolve(c["verified_head"]))
+                and self.is_ancestor(c["verified_head"], head),
             }
             for c in (data or {}).get("candidates", [])
         ]

@@ -800,9 +800,17 @@ def _collect_live(repo: Path, timeout: float) -> dict:
                 ),
             }
         held = {(h["branch"], h["head"]) for h in holds}
+        held_names = {h["branch"] for h in holds}
         listed = engine["listed"]
+        # Built: `live` holds exactly this (branch, head), or the checkout already
+        # has the head and no rebuild merged the branch (a contained candidate).
+        # A merged branch at another head is unbuilt even when HEAD contains the
+        # listed one (re-pinned backwards: `live` runs commits nobody pinned).
         facts["unbuilt"] = sum(
-            1 for c in listed if not c["in_base"] and (c["branch"], c["head"]) not in held
+            1
+            for c in listed
+            if (c["branch"], c["head"]) not in held
+            and not (c["in_checkout"] and c["branch"] not in held_names)
         )
         names = {c["branch"] for c in listed}
         facts["unlisted"] = sum(1 for h in holds if h["branch"] not in names)
@@ -814,9 +822,9 @@ def _collect_live(repo: Path, timeout: float) -> dict:
             # A manifest exists and is broken: the engine says so on every read.
             return {"state": "unreadable", "reason": engine["manifest"]["reason"]}
         else:
-            # Absent or another repository's: nothing is meant to be live here.
-            # Already in origin/main: running on any branch, so not counted.
-            facts["candidates"] = sum(1 for c in engine["listed"] if not c["in_base"])
+            # Off `live`: the listed candidates this checkout's HEAD does not
+            # contain (none when the manifest is absent or another repository's).
+            facts["candidates"] = sum(1 for c in engine["listed"] if not c["in_checkout"])
     return facts
 
 
@@ -838,7 +846,7 @@ def _observe_engine(repo: Path, timeout: float) -> dict | None:
             and all(
                 isinstance(c["branch"], str)
                 and isinstance(c["head"], str)
-                and isinstance(c["in_base"], bool)
+                and isinstance(c["in_checkout"], bool)
                 for c in data["listed"]
             )
             and (

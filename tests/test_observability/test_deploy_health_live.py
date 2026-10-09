@@ -21,8 +21,6 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_scripts._deploy_candidates_world import dc, dc_ready, dc_world  # noqa: F401
-
 dh = importlib.import_module("genesis.observability.snapshots.deploy_health")
 
 REPO = Path(__file__).resolve().parents[2]
@@ -107,8 +105,8 @@ def _engine(w, body: str) -> None:
     entry.chmod(0o755)
 
 
-def _row(branch: str, head: str = "a" * 40, in_base: bool = False) -> dict:
-    return {"branch": branch, "head": head, "in_base": in_base}
+def _row(branch: str, head: str = "a" * 40, in_checkout: bool = False) -> dict:
+    return {"branch": branch, "head": head, "in_checkout": in_checkout}
 
 
 def _engine_json(
@@ -413,8 +411,8 @@ def test_off_live_a_listed_candidate_counts_with_no_live_ref(world):
     assert dh.live_findings(live) == ["live_off_branch:1"]
 
 
-def test_off_live_a_candidate_already_in_origin_main_is_not_counted(world):
-    _engine_json(world, state="ok", listed=[_row("feat/old", in_base=True), _row("feat/c")])
+def test_off_live_a_candidate_the_checkout_already_has_is_not_counted(world):
+    _engine_json(world, state="ok", listed=[_row("feat/old", in_checkout=True), _row("feat/c")])
     assert dh.collect_live(world.root)["candidates"] == 1
 
 
@@ -511,6 +509,7 @@ def test_the_real_engine_and_predicate_after_an_add_without_a_rebuild(dc, dc_rea
     add a second without rebuilding, and the snapshot names it unbuilt; drop the
     first without a rebuild, and `live` holds code nothing lists."""
     from genesis import env
+
     w = dc_ready
     monkeypatch.setenv("HOME", str(w.home))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
@@ -527,3 +526,42 @@ def test_the_real_engine_and_predicate_after_an_add_without_a_rebuild(dc, dc_rea
     assert dh.live_findings(dh.collect_live(w.root)) == ["live_unbuilt:1"]
     w.write_manifest([w.entry("feat/b")])
     assert dh.live_findings(dh.collect_live(w.root)) == ["live_unbuilt:1", "live_unlisted:1"]
+
+
+def test_on_live_a_candidate_repinned_backwards_is_unbuilt(world):
+    """Round-3 premise check: HEAD contains an older pin of a merged branch, yet
+    `live` holds a later head nobody pinned; containment must not hide that."""
+    _build_live(world, {"b.txt": "b\n"})
+    _manifest(world)
+    _engine_json(
+        world,
+        state="ok",
+        listed=[_row("feat/c", "0" * 40, in_checkout=True)],
+        holds=[_row("feat/c", "1" * 40)],
+    )
+    assert dh.live_findings(dh.collect_live(world.root)) == ["live_unbuilt:1"]
+
+
+def test_on_live_a_contained_candidate_no_rebuild_merged_is_built(world):
+    _build_live(world, {"b.txt": "b\n"})
+    _manifest(world)
+    _engine_json(world, state="ok", listed=[_row("feat/old", in_checkout=True)], holds=[])
+    assert dh.live_findings(dh.collect_live(world.root)) == []
+
+
+def test_the_real_engine_names_a_backwards_repin_unbuilt(dc, dc_ready, monkeypatch):
+    from genesis import env
+
+    w = dc_ready
+    monkeypatch.setenv("HOME", str(w.home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setattr(env, "update_in_progress", lambda: False)
+    w.install_engine()
+    shutil.copy2(PREDICATE, w.root / "scripts" / "lib" / "live_checkout.py")
+    first = w.candidate("feat/a", {"x.txt": "x\n"})
+    w.candidate("feat/a", {"x.txt": "x2\n"})
+    w.write_manifest([w.entry("feat/a")])
+    assert w.run(dc, "rebuild") == 0
+    assert dh.live_findings(dh.collect_live(w.root)) == []
+    w.write_manifest([w.entry("feat/a", head=first)])
+    assert dh.live_findings(dh.collect_live(w.root)) == ["live_unbuilt:1"]

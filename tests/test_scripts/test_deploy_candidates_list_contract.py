@@ -45,7 +45,7 @@ def test_listed_and_held_after_a_rebuild(dc, dc_ready, capsys):
     got = _observe(w, dc, capsys)
     assert got["manifest"]["state"] == "ok"
     assert _branches(got["listed"]) == ["feat/a", "feat/b"]
-    assert not any(r["in_base"] for r in got["listed"])
+    assert all(r["in_checkout"] for r in got["listed"])
     assert _branches(got["live"]["holds"]) == ["feat/a", "feat/b"]
     assert got["live"]["tip"] == w.rev("refs/heads/live")
 
@@ -80,14 +80,26 @@ def test_dropped_without_a_rebuild_is_held_not_listed(dc, dc_ready, capsys):
     assert sorted(_branches(got["live"]["holds"])) == ["feat/a", "feat/b"]
 
 
-def test_a_candidate_already_in_origin_main_is_marked_in_base(dc, dc_ready, capsys):
-    """No rebuild merges a candidate whose pinned head origin/main contains, so
-    `live` never holds it: in_base says that is expected, not unbuilt."""
+def test_a_candidate_the_checkout_has_is_in_checkout(dc, dc_ready, capsys):
+    """No rebuild merges a candidate whose pinned head the checkout already has,
+    so `live` never holds it: in_checkout says it is not missing."""
     w = dc_ready
     base = w.rev("refs/remotes/origin/main")
     w.write_manifest([w.entry("feat/old", head=base)])
     got = _observe(w, dc, capsys)
-    assert got["listed"] == [{"branch": "feat/old", "head": base, "in_base": True}]
+    assert got["listed"] == [{"branch": "feat/old", "head": base, "in_checkout": True}]
+
+
+def test_origin_main_having_a_candidate_is_not_the_checkout_having_it(dc, dc_ready, capsys):
+    """Round-3 review: origin/main can contain a pinned head the checkout has not
+    pulled or rebuilt; containment is judged against HEAD."""
+    w = dc_ready
+    sha = w.advance_main({"z.txt": "z\n"})
+    w.git(w.root, "fetch", "-q", "origin")
+    assert w.rev("refs/remotes/origin/main") == sha
+    w.write_manifest([w.entry("feat/up", head=sha)])
+    got = _observe(w, dc, capsys)
+    assert got["listed"] == [{"branch": "feat/up", "head": sha, "in_checkout": False}]
 
 
 @pytest.mark.parametrize("text", ["{not json", '{"version": 3}'], ids=["unparseable", "malformed"])

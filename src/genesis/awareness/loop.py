@@ -1763,7 +1763,9 @@ def _deploy_live_paragraph(snap: dict, findings: list[str]) -> str:
                 "rebuild (it rebuilds `live` from the manifest and moves the checkout onto "
                 "it; a bare git switch would run whatever `live` held before), then "
                 "scripts/deploy_code_only.sh restart. To stop listing one: "
-                "scripts/deploy_candidates drop <branch>."
+                "scripts/deploy_candidates drop <branch>. A candidate whose PR has "
+                "merged stays listed until the next rebuild retires it, or until that "
+                "drop; scripts/deploy_candidates status shows which."
             )
         elif cls == "live_candidate_tier2":
             parts.append(
