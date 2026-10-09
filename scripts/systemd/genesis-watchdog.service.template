@@ -6,20 +6,24 @@ After=genesis-server.service genesis-bridge.service
 Type=oneshot
 WorkingDirectory=__REPO_DIR__
 ExecStart=__VENV__/bin/python -m genesis.autonomy.watchdog_runner
-Environment=TMPDIR=__HOME__/.genesis/cc-tmp
+Environment="TMPDIR=__HOME__/.genesis/cc-tmp"
 # SQLite reads SQLITE_TMPDIR before TMPDIR, so its temp spill files (etilqs_*,
 # 100-200 MB sorts) land on the big disk while the Claude Code sessions this
 # process launches keep TMPDIR on cc-tmp. Without it those spills fill the
 # small cc-tmp volume and trip the runaway-file pager. MEASURED 2026-10-08 on
 # SQLite 3.45.1: SQLITE_TMPDIR wins over TMPDIR; a missing directory falls back
 # to TMPDIR with no error, and so does an unwritable one.
-Environment=SQLITE_TMPDIR=__HOME__/tmp
+Environment="SQLITE_TMPDIR=__HOME__/tmp"
 # ~/tmp is created on every update.sh run, but install.sh and bootstrap.sh create it
 # only when /tmp is small: make sure it exists so the line above takes effect, and
 # say so in the journal when it is not a usable directory. Deliberately NOT fatal:
 # the fallback is the pre-SQLITE_TMPDIR behaviour (the disk guardian pages its
 # spills), while a refusal to start would take the unit down over a temp directory.
-ExecStartPre=-/bin/sh -c 'mkdir -p "__HOME__/tmp"; [ -d "__HOME__/tmp" ] && [ -w "__HOME__/tmp" ] && [ -x "__HOME__/tmp" ] || echo "SQLITE_TMPDIR __HOME__/tmp is not a writable directory: SQLite temp files fall back to TMPDIR" >&2'
+# The step checks the SQLITE_TMPDIR systemd already resolved from the line above,
+# read from the environment: the directory checked is the one SQLite gets, and no
+# install value is ever parsed as shell or Exec-line syntax. `$$` and `%%` are
+# systemd's escapes for a literal `$` and `%`.
+ExecStartPre=-/bin/sh -c 'd="$$SQLITE_TMPDIR"; mkdir -p "$$d"; [ -d "$$d" ] && [ -w "$$d" ] && [ -x "$$d" ] || printf "SQLITE_TMPDIR %%s is not a writable directory: SQLite temp files fall back to TMPDIR\n" "$$d" >&2'
 Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
 StandardOutput=journal
 StandardError=journal
