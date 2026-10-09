@@ -272,7 +272,8 @@ fi
 # Auto-detect health API port (default 5000)
 HEALTH_PORT=5000
 HEALTH_HOST=""
-if [ "$(incus config device get "$CONTAINER_NAME" dashboard-proxy listen 2>/dev/null || true)" = "tcp:127.0.0.1:5000" ]; then
+if [ "$(incus config device get "$CONTAINER_NAME" dashboard-proxy listen 2>/dev/null || true)" = "tcp:127.0.0.1:5000" ] && \
+   [ "$(incus config device get "$CONTAINER_NAME" dashboard-proxy connect 2>/dev/null || true)" = "tcp:127.0.0.1:5000" ]; then
     HEALTH_HOST="127.0.0.1"
 fi
 
@@ -553,9 +554,11 @@ if [ "$HEALTH_HOST" = "127.0.0.1" ]; then
 from pathlib import Path
 import sys
 from genesis.guardian.dashboard_ingress import configure_loopback_health
-configure_loopback_health(Path(sys.argv[1]), only_if_unset=True)
+if configure_loopback_health(Path(sys.argv[1]), only_if_unset=True):
+    print("  Guardian HTTP target aligned with the host loopback proxy.")
+else:
+    print("  Guardian HTTP target retained; existing/custom target or override.")
 PYHEALTH
-    echo "  Guardian HTTP target aligned with the host loopback proxy."
 fi
 
 # ── Step 6: Telegram credential bridge ────────────────────────────────

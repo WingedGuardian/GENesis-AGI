@@ -56,20 +56,40 @@ blindly reset Serve, which can remove unrelated operator services.
 
 ## Existing installation migration
 
-Deploy the reviewed Guardian code through the existing update scripts first.
-Run the following on the host with its deployed Guardian interpreter, retaining
-an SSH session/tunnel. Use the actual installation path if it differs.
+Keep peer admission disabled and retain an owner SSH session/tunnel. On existing
+Guardian installations, use the deployed restricted gateway to establish an
+operator-owned `pause <seconds>` and confirm `paused` reports an active pause
+before the update. Choose a TTL within the deployed limit (at most 3600 seconds),
+and renew it before expiry throughout the update, host synchronization and
+migration. The update preserves an already-active operator pause and does not
+resume it. If pause/paused support or confirmation is unavailable, stop and
+resolve that prerequisite; do not assume the deployment's own pause covers host
+synchronization. A fresh installation without Guardian has no pause to preserve.
+
+Deploy through the full approved `scripts/update.sh` path: its bootstrap renders
+the loopback server unit. Code-only deployment does not render changed units.
+Verify the update and Guardian host synchronization actually succeeded; old
+Guardian code must support the HTTP host override before migrating. The container
+must provide `ss` (from `iproute2`) for the read-only live-listener preflight. Its
+absence is a migration failure; this command does not install packages.
+
+Run the following on the host with its deployed Guardian interpreter and source
+path. Use the actual installation path if it differs.
 
 ```sh
-~/.local/share/genesis-guardian/.venv/bin/python -m genesis.guardian.dashboard_ingress \
+PYTHONPATH="$HOME/.local/share/genesis-guardian/src" \
+  ~/.local/share/genesis-guardian/.venv/bin/python -m genesis.guardian.dashboard_ingress \
   --config ~/.local/share/genesis-guardian/config/guardian.yaml
-~/.local/share/genesis-guardian/.venv/bin/python -m genesis.guardian.dashboard_ingress \
+PYTHONPATH="$HOME/.local/share/genesis-guardian/src" \
+  ~/.local/share/genesis-guardian/.venv/bin/python -m genesis.guardian.dashboard_ingress \
   --config ~/.local/share/genesis-guardian/config/guardian.yaml --apply
 ```
 
 The default is a read-only preflight. Apply requires a standard dashboard proxy
-connecting to container loopback, port 5000, healthy host-loopback HTTP and
-configured dashboard authentication. It atomically updates only
+connecting to container loopback, an exact integer port 5000, an observed
+loopback-only container listener, healthy host-loopback HTTP and configured
+dashboard authentication. Dry-run also validates the prospective YAML patch and
+deployed Guardian override support. Apply atomically updates only
 `health_api_host`, preserving comments, other YAML values and file mode, before
 restricting the existing Incus listener. It confirms the new listener and HTTP
 readiness. Unknown topology, ambiguous YAML, a conflicting shell override or an
@@ -83,12 +103,18 @@ precedence, and clearing it restores the configured value to an empty override
 port. Inspect the deployed unit's configured overrides privately before applying
 the migration. ICMP independently uses the configured or autodetected container
 address and refuses to report the host loopback as an autodetection success.
-The next Guardian timer invocation reloads YAML; no server binding change is
-needed. The installer aligns an unset HTTP target only when it observes the
-loopback Incus listener, retaining explicit operator targets.
+Guardian's health and dialogue requests contact the configured target directly,
+independently of environment HTTP proxies. The next Guardian timer invocation
+reloads YAML. The installer aligns an unset HTTP target only when both Incus
+endpoints are loopback on port 5000 and the effective health port is standard;
+explicit operator targets and conflicting overrides are retained.
 
-After apply, verify host local HTTP and Guardian's check-only probes, owner
-HTTPS/tunnel access, and failed LAN/tailnet TCP-5000 access. Keep peer admission
+After apply, verify host local HTTP, Guardian's check-only probes and actual
+dialogue, owner HTTPS/tunnel access, and failed LAN/tailnet TCP-5000 access to
+both host and container addresses. Confirm the operator pause is still active;
+resume explicitly through the gateway only after those checks pass. If update,
+sync, migration or readiness fails, keep peers disabled, inspect the actual
+state and continue maintaining the pause while repairing it. Keep peer admission
 closed until the effective policy, scoped mounts, credentials and full peer
 approval/result acceptance pass. This build does not generate production
 credentials, enroll nodes, restart services or change the live tailnet policy.

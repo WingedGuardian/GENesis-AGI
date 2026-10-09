@@ -1,0 +1,1 @@
+- New host installations use a loopback dashboard proxy and server binding. Existing installations can migrate through the Guardian ingress command, which preserves configuration and keeps direct HTTP health separate from container ICMP checks. Remote dashboard access uses an owner tunnel or restricted HTTPS proxy.

@@ -169,7 +169,8 @@ async def send_dialogue(
 
         def _do_post() -> tuple[int, str]:
             try:
-                with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310 - stdlib-only guardian; https endpoint from config
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(req, timeout=15) as resp:
                     body = resp.read().decode("utf-8", errors="replace")
                     return resp.status, body
             except urllib.error.HTTPError as exc:

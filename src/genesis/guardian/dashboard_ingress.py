@@ -1,12 +1,13 @@
 """Operator migration of the host dashboard proxy to loopback.
 
-Run on the host through its deployed Guardian interpreter. This changes no
-Flask binding, creates no listener, and leaves peer/SAM admission disabled.
+Run on the host through its deployed Guardian interpreter after deploying the
+loopback server binding. This creates no listener and leaves peer/SAM disabled.
 """
 
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import stat
@@ -51,6 +52,29 @@ def _ready_loopback() -> None:
                     raise ValueError("configure dashboard authentication before migrating ingress")
 
 
+def _container_loopback(container: str) -> None:
+    """Refuse migration until the actual container listener is loopback-only."""
+    result = subprocess.run(
+        ["incus", "exec", container, "--", "ss", "-H", "-lnt", "sport = :5000"],
+        check=True, capture_output=True, text=True, timeout=30,
+    )
+    rows = result.stdout.splitlines()
+    if not rows:
+        raise ValueError("container dashboard listener is not ready")
+    for row in rows:
+        fields = row.split()
+        if len(fields) != 5 or fields[0] != "LISTEN":
+            raise ValueError("container dashboard listener requires operator inspection")
+        host, _, port = fields[3].rpartition(":")
+        try:
+            address = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+            loopback = ipaddress.ip_address(address).is_loopback
+        except ValueError:
+            loopback = False
+        if port != "5000" or not loopback:
+            raise ValueError("deploy the loopback server binding before migrating ingress")
+
+
 def _patch_host(original: bytes, raw: dict) -> str:
     """Use YAML source marks to preserve operator comments and unrelated fields."""
     text = original.decode("utf-8")
@@ -78,7 +102,7 @@ def _patch_host(original: bytes, raw: dict) -> str:
     return patched
 
 
-def configure_loopback_health(config_path: Path, *, only_if_unset: bool = False) -> None:
+def configure_loopback_health(config_path: Path, *, only_if_unset: bool = False) -> bool:
     """Patch one HTTP setting, preserving comments, modes and operator values."""
     if config_path.is_symlink() or not config_path.is_file():
         raise ValueError("a regular deployed Guardian configuration is required")
@@ -86,8 +110,17 @@ def configure_loopback_health(config_path: Path, *, only_if_unset: bool = False)
     raw = yaml.safe_load(original)
     if not isinstance(raw, dict):
         raise ValueError("Guardian configuration must be a mapping")
-    if only_if_unset and raw.get("health_api_host"):
-        return
+    if only_if_unset:
+        port = raw.get("health_api_port", 5000)
+        if raw.get("health_api_host") or type(port) is not int or port != 5000:
+            return False
+        if os.environ.get("GUARDIAN_HEALTH_HOST", "127.0.0.1") != "127.0.0.1":
+            return False
+        try:
+            if int(os.environ.get("GUARDIAN_HEALTH_PORT", "5000")) != 5000:
+                return False
+        except ValueError:
+            return False
     patched = _patch_host(original, raw)
     attributes = config_path.stat()
     mode = stat.S_IMODE(attributes.st_mode)
@@ -109,6 +142,7 @@ def configure_loopback_health(config_path: Path, *, only_if_unset: bool = False)
             os.close(directory)
     finally:
         Path(name).unlink(missing_ok=True)
+    return True
 
 
 def migrate(config_path: Path, *, apply: bool = False) -> dict:
@@ -127,7 +161,8 @@ def migrate(config_path: Path, *, apply: bool = False) -> dict:
     container = raw.get("container_name", "genesis")
     if not isinstance(container, str) or not container:
         raise ValueError("Guardian container name is invalid")
-    if raw.get("health_api_port", 5000) != 5000:
+    configured_port = raw.get("health_api_port", 5000)
+    if type(configured_port) is not int or configured_port != 5000:
         raise ValueError("custom health ports require a separate topology migration")
     try:
         port = int(os.environ.get("GUARDIAN_HEALTH_PORT", "5000"))
@@ -145,6 +180,11 @@ def migrate(config_path: Path, *, apply: bool = False) -> dict:
     listener = _device(container, "get", "listen")
     if listener not in {_LISTEN, "tcp:0.0.0.0:5000"}:
         raise ValueError("dashboard proxy listener requires operator inspection")
+    _patch_host(original, raw)
+    # Read-only preflight must establish the same eligibility as apply.
+    if GuardianConfig(health_api_host="127.0.0.1").health_url != "http://127.0.0.1:5000":
+        raise ValueError("deployed Guardian does not support the HTTP host override")
+    _container_loopback(container)
     _ready_loopback()
     result = {
         "container": container,
@@ -154,10 +194,6 @@ def migrate(config_path: Path, *, apply: bool = False) -> dict:
     }
     if not apply:
         return result
-    # Check the deployed class as well as the YAML representation: old Guardian
-    # code must not silently ignore the override after ingress is closed.
-    if GuardianConfig(health_api_host="127.0.0.1").health_url != "http://127.0.0.1:5000":
-        raise ValueError("deployed Guardian does not support the HTTP host override")
     if config_path.read_bytes() != original:
         raise ValueError("Guardian configuration changed during preflight; retry")
     configure_loopback_health(config_path)
@@ -165,6 +201,9 @@ def migrate(config_path: Path, *, apply: bool = False) -> dict:
         _device(container, "set", "listen", _LISTEN)
     if _device(container, "get", "listen") != _LISTEN:
         raise ValueError("dashboard proxy loopback change was not confirmed")
+    if _device(container, "get", "connect") != _CONNECT:
+        raise ValueError("dashboard proxy loopback backend was not confirmed")
+    _container_loopback(container)
     _ready_loopback()
     result["applied"] = True
     return result
@@ -180,7 +219,7 @@ def main() -> int:
     try:
         print(json.dumps(migrate(arguments.config, apply=arguments.apply)))
     except subprocess.CalledProcessError as error:
-        # These commands contain only proxy settings, never credentials. Preserve
+        # These commands contain only proxy/socket settings, never credentials. Preserve
         # the real command failure for the operator instead of reporting success.
         print(f"Incus exited {error.returncode}: {error.stderr}", file=sys.stderr)
         return 1

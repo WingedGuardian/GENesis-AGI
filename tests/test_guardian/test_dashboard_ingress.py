@@ -34,6 +34,7 @@ def world(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ingress, "_device", device)
     monkeypatch.setattr(ingress, "_ready_loopback", lambda: None)
+    monkeypatch.setattr(ingress, "_container_loopback", lambda container: None)
     monkeypatch.delenv("GUARDIAN_HEALTH_HOST", raising=False)
     monkeypatch.delenv("GUARDIAN_HEALTH_PORT", raising=False)
     monkeypatch.delenv("GUARDIAN_CONTAINER_NAME", raising=False)
@@ -182,3 +183,100 @@ def test_symlink_config_is_refused(tmp_path):
     with pytest.raises(ValueError):
         ingress.configure_loopback_health(link)
     assert real.read_text() == "container_name: fixture\n"
+
+
+@pytest.mark.parametrize("value", ["5000.0", "true", "'5000'", "null", "5555"])
+def test_nonstandard_port_refuses_without_mutation(world, value):
+    path, state = world
+    path.write_text(path.read_text().replace("health_api_port: 5000", f"health_api_port: {value}"))
+    original = path.read_bytes()
+    with pytest.raises(ValueError, match="custom health ports"):
+        ingress.migrate(path, apply=True)
+    assert path.read_bytes() == original and state["changes"] == []
+
+
+@pytest.mark.parametrize("content", [
+    'container_name: test-container\nhealth_api_host: ""\nhealth_api_host: localhost\n',
+    'container_name: test-container\nother: &host localhost\nhealth_api_host: *host\n',
+    '{container_name: test-container, health_api_host: localhost}\n',
+])
+def test_dry_run_rejects_unpatchable_yaml(world, content):
+    path, state = world
+    path.write_text(content)
+    with pytest.raises(ValueError):
+        ingress.migrate(path)
+    assert path.read_text() == content and state["changes"] == []
+
+
+def test_dry_run_checks_deployed_override_support(world, monkeypatch):
+    from types import SimpleNamespace
+
+    path, state = world
+    original = path.read_bytes()
+    monkeypatch.setattr(ingress, "GuardianConfig", lambda **kwargs: SimpleNamespace(health_url="unsupported"))
+    with pytest.raises(ValueError, match="does not support"):
+        ingress.migrate(path)
+    assert path.read_bytes() == original and state["changes"] == []
+
+
+@pytest.mark.parametrize("content,environment", [
+    ("health_api_port: 5555\n", {}),
+    ("health_api_port: 5000.0\n", {}),
+    ("health_api_port: true\n", {}),
+    ("health_api_port: 5000\n", {"GUARDIAN_HEALTH_PORT": "5555"}),
+    ("health_api_port: 5000\n", {"GUARDIAN_HEALTH_PORT": "invalid"}),
+    ("health_api_port: 5000\n", {"GUARDIAN_HEALTH_HOST": "localhost"}),
+    ("health_api_port: 5000\n", {"GUARDIAN_HEALTH_HOST": ""}),
+])
+def test_installer_retains_custom_target(world, monkeypatch, content, environment):
+    path, _ = world
+    path.write_text(content)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    assert ingress.configure_loopback_health(path, only_if_unset=True) is False
+    assert path.read_text() == content
+
+
+def test_installer_aligns_standard_unset_target(world):
+    path, _ = world
+    assert ingress.configure_loopback_health(path, only_if_unset=True) is True
+    assert yaml.safe_load(path.read_text())["health_api_host"] == "127.0.0.1"
+    assert ingress.configure_loopback_health(path, only_if_unset=True) is False
+
+
+@pytest.mark.parametrize("address", ["127.0.0.1:5000", "[::1]:5000", "::1:5000"])
+def test_live_listener_preflight_allows_only_loopback(monkeypatch, address):
+    def run(command, **kwargs):
+        assert command == ["incus", "exec", "fixture", "--", "ss", "-H", "-lnt", "sport = :5000"]
+        assert kwargs == {"check": True, "capture_output": True, "text": True, "timeout": 30}
+        return subprocess.CompletedProcess(command, 0, stdout=f"LISTEN 0 128 {address} *:*\n")
+    monkeypatch.setattr(ingress.subprocess, "run", run)
+    ingress._container_loopback("fixture")
+
+
+@pytest.mark.parametrize("rows", [
+    "", "malformed\n", "LISTEN 0 128 0.0.0.0:5000 *:*\n",
+    "LISTEN 0 128 [::]:5000 *:*\n", "LISTEN 0 128 *:5000 *:*\n",
+    "LISTEN 0 128 192.0.2.1:5000 *:*\n", "LISTEN 0 128 127.0.0.1:5555 *:*\n",
+    "LISTEN 0 128 [[127.0.0.1]]:5000 *:*\n",
+    "LISTEN 0 128 127.0.0.1:5000 *:*\nLISTEN 0 128 0.0.0.0:5000 *:*\n",
+])
+def test_live_listener_preflight_refuses_unknown_or_broad(monkeypatch, rows):
+    monkeypatch.setattr(ingress.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout=rows))
+    with pytest.raises(ValueError):
+        ingress._container_loopback("fixture")
+
+
+@pytest.mark.parametrize("failure", [
+    subprocess.CalledProcessError(127, ["incus"], stderr="ss unavailable"),
+    subprocess.TimeoutExpired(["incus"], 30),
+])
+def test_listener_failure_prevents_config_or_device_mutation(world, monkeypatch, failure):
+    path, state = world
+    original = path.read_bytes()
+    def fail(container):
+        raise failure
+    monkeypatch.setattr(ingress, "_container_loopback", fail)
+    with pytest.raises(type(failure)):
+        ingress.migrate(path, apply=True)
+    assert path.read_bytes() == original and state["changes"] == []

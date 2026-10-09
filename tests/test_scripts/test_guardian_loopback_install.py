@@ -15,22 +15,25 @@ _REPO = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.parametrize(
-    "listener,configured,expected",
+    "listener,backend,configured,port,expected",
     [
-        ("tcp:127.0.0.1:5000", "", "127.0.0.1"),
-        ("tcp:127.0.0.1:5000", "localhost", "localhost"),
-        ("tcp:0.0.0.0:5000", "", ""),
+        ("tcp:127.0.0.1:5000", "tcp:127.0.0.1:5000", "", 5000, "127.0.0.1"),
+        ("tcp:127.0.0.1:5000", "tcp:127.0.0.1:5000", "localhost", 5000, "localhost"),
+        ("tcp:0.0.0.0:5000", "tcp:127.0.0.1:5000", "", 5000, ""),
+        ("tcp:127.0.0.1:5000", "tcp:192.0.2.1:5000", "", 5000, ""),
+        ("tcp:127.0.0.1:5000", "", "", 5000, ""),
+        ("tcp:127.0.0.1:5000", "tcp:127.0.0.1:5000", "", 5555, ""),
     ],
 )
 def test_installer_aligns_unset_http_target_without_clobbering_config(
-    tmp_path, listener, configured, expected
+    tmp_path, listener, backend, configured, port, expected
 ):
     install = tmp_path / "guardian"
     (install / "config").mkdir(parents=True)
     (install / "src").symlink_to(_REPO / "src", target_is_directory=True)
     config = install / "config/guardian.yaml"
     config.write_text(
-        f'# retain operator note\ncontainer_ip: "192.0.2.1"\nhealth_api_host: "{configured}"\n'
+        f'# retain operator note\ncontainer_ip: "192.0.2.1"\nhealth_api_host: "{configured}"\nhealth_api_port: {port}\n'
     )
     script = (_REPO / "scripts/install_guardian.sh").read_text()
     target = script.split("# Auto-detect health API port", 1)[1].split(
@@ -45,8 +48,9 @@ def test_installer_aligns_unset_http_target_without_clobbering_config(
 INSTALL_DIR=$1
 VENV_DIR=$2
 _listener=$3
+_backend=$4
 CONTAINER_NAME=fixture
-incus() { printf '%s\n' "$_listener"; }
+incus() { case "${@: -1}" in listen) printf '%s\n' "$_listener" ;; connect) printf '%s\n' "$_backend" ;; *) return 1 ;; esac; }
 """
         + target
         + phase
@@ -60,6 +64,7 @@ incus() { printf '%s\n' "$_listener"; }
             str(install),
             str(Path(sys.executable).parent.parent),
             listener,
+            backend,
         ],
         cwd=_REPO,
         env={"PATH": os.defpath, "HOME": str(tmp_path)},
@@ -71,7 +76,29 @@ incus() { printf '%s\n' "$_listener"; }
     settings = yaml.safe_load(config.read_text())
     assert settings["health_api_host"] == expected
     assert settings["container_ip"] == "192.0.2.1"
+    assert settings["health_api_port"] == port
     assert "# retain operator note" in config.read_text()
+
+
+@pytest.mark.parametrize("backend,expected", [
+    ("tcp:127.0.0.1:5000", "already configured"),
+    ("tcp:192.0.2.9:5000", "requires topology inspection"),
+    ("", "requires topology inspection"),
+])
+def test_existing_host_proxy_checks_backend(backend, expected):
+    script = (_REPO / "scripts/host-setup.sh").read_text()
+    phase = script.split("# ── Dashboard port forwarding", 1)[1].split("# ── Codebase visualization", 1)[0]
+    phase = phase[phase.index("\n") :]
+    body = '''set -euo pipefail
+CONTAINER_NAME=fixture
+_backend=$1
+incus() { case "${@: -1}" in listen) echo tcp:127.0.0.1:5000 ;; connect) printf '%s\n' "$_backend" ;; *) return 1 ;; esac; }
+''' + phase
+    result = subprocess.run(["bash", "-c", body, "proxy-test", backend], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert expected in result.stdout
+    if backend != "tcp:127.0.0.1:5000":
+        assert "already configured" not in result.stdout
 
 
 @pytest.mark.parametrize("layout", ["existing", "fresh", "partial", "same_directory"])

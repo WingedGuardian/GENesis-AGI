@@ -866,10 +866,12 @@ incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
 echo "  Setting up dashboard port forwarding..."
 if incus config device get "$CONTAINER_NAME" dashboard-proxy listen &>/dev/null; then
     _dashboard_listen=$(incus config device get "$CONTAINER_NAME" dashboard-proxy listen)
-    if [ "$_dashboard_listen" = "tcp:127.0.0.1:5000" ]; then
+    _dashboard_connect=$(incus config device get "$CONTAINER_NAME" dashboard-proxy connect 2>/dev/null || true)
+    if [ "$_dashboard_listen" = "tcp:127.0.0.1:5000" ] && \
+       [ "$_dashboard_connect" = "tcp:127.0.0.1:5000" ]; then
         echo "  + Dashboard loopback proxy already configured"
     else
-        echo "  WARN: Existing dashboard proxy is not loopback-only."
+        echo "  WARN: Existing dashboard proxy requires topology inspection."
         echo "        Migrate through the deployed Guardian; see docs/reference/peer-ingress.md."
     fi
 else

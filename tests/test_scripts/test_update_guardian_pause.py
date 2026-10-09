@@ -224,7 +224,7 @@ def test_pause_failure_proceeds_unpaused_no_abort(text: str, tmp_path: Path) -> 
     NOT abort the deploy, must NOT mark paused, and must warn (not falsely 'paused')."""
     run, ssh_log = _harness(text, tmp_path, ssh_rc=255)
     out = run(
-        '_guardian_pause\n[ "${_GUARDIAN_PAUSED:-}" = 1 ] && echo PAUSED_SET || echo UNPAUSED\n'
+        '_guardian_pause\n[ "${_GUARDIAN_PAUSED:-}" = 1 ] && echo PAUSED_SET || echo UNPAUSED\n_guardian_resume\n'
     )
     assert "REACHED_END" in out, "a failed pause must NOT abort the deploy"
     assert "UNPAUSED" in out and "PAUSED_SET" not in out, "a failed pause must not mark paused"
@@ -239,7 +239,7 @@ def test_pause_skips_when_already_paused(text: str, tmp_path: Path) -> None:
     EXIT never removes a pause we did not create."""
     run, ssh_log = _harness(text, tmp_path, ssh_rc=0, pre_paused=True)
     out = run(
-        '_guardian_pause\n[ "${_GUARDIAN_PAUSED:-}" = 1 ] && echo PAUSED_SET || echo UNPAUSED\n'
+        '_guardian_pause\n[ "${_GUARDIAN_PAUSED:-}" = 1 ] && echo PAUSED_SET || echo UNPAUSED\n_guardian_resume\n'
     )
     assert "REACHED_END" in out
     assert "UNPAUSED" in out and "PAUSED_SET" not in out, "must not own a pre-existing pause"
@@ -247,6 +247,7 @@ def test_pause_skips_when_already_paused(text: str, tmp_path: Path) -> None:
     sent = ssh_log.read_text() if ssh_log.exists() else ""
     assert "paused" in sent, "must query the gateway pause state"
     assert "pause 1800" not in sent, "must NOT send our own pause over a pre-existing one"
+    assert "resume" not in sent, "must preserve operator pause through the deploy resume path"
 
 
 def test_pause_proceeds_when_not_already_paused(text: str, tmp_path: Path) -> None:

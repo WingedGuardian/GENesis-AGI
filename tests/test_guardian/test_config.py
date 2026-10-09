@@ -33,10 +33,10 @@ class TestGuardianConfigDefaults:
         assert cfg.health_url == "http://10.0.0.1:5000"
 
     def test_http_host_override_preserves_container_ip(self, monkeypatch) -> None:
-        cfg = GuardianConfig(container_ip="10.0.0.1", health_api_host="127.0.0.1")
+        cfg = GuardianConfig(container_ip="192.0.2.1", health_api_host="127.0.0.1")
         monkeypatch.setattr(cfg, "_detect_container_ip", lambda: pytest.fail("HTTP host is explicit"))
         assert cfg.health_url == "http://127.0.0.1:5000"
-        assert cfg.container_ip == "10.0.0.1"
+        assert cfg.container_ip == "192.0.2.1"
 
     def test_explicit_http_host_needs_no_container_detection(self, monkeypatch) -> None:
         cfg = GuardianConfig(health_api_host="127.0.0.1")
@@ -123,10 +123,10 @@ class TestLoadConfig:
 
     def test_http_host_loads_from_yaml(self, tmp_path: Path) -> None:
         p = tmp_path / "guardian.yaml"
-        p.write_text('container_ip: "10.0.0.1"\nhealth_api_host: "127.0.0.1"\n')
+        p.write_text('container_ip: "192.0.2.1"\nhealth_api_host: "127.0.0.1"\n')
         cfg = load_config(p)
         assert cfg.health_url == "http://127.0.0.1:5000"
-        assert cfg.container_ip == "10.0.0.1"
+        assert cfg.container_ip == "192.0.2.1"
 
     def test_unknown_yaml_keys_ignored(self, tmp_path: Path) -> None:
         p = tmp_path / "extra.yaml"
@@ -155,17 +155,17 @@ class TestEnvOverrides:
 
     def test_http_host_env_overrides_yaml(self, tmp_path, monkeypatch) -> None:
         p = tmp_path / "guardian.yaml"
-        p.write_text('container_ip: "10.0.0.1"\nhealth_api_host: "localhost"\n')
+        p.write_text('container_ip: "192.0.2.1"\nhealth_api_host: "localhost"\n')
         monkeypatch.setenv("GUARDIAN_HEALTH_HOST", "127.0.0.1")
         cfg = load_config(p)
         assert cfg.health_url == "http://127.0.0.1:5000"
-        assert cfg.container_ip == "10.0.0.1"
+        assert cfg.container_ip == "192.0.2.1"
 
     def test_empty_http_host_env_restores_legacy_target(self, tmp_path, monkeypatch) -> None:
         p = tmp_path / "guardian.yaml"
-        p.write_text('container_ip: "10.0.0.1"\nhealth_api_host: "127.0.0.1"\n')
+        p.write_text('container_ip: "192.0.2.1"\nhealth_api_host: "127.0.0.1"\n')
         monkeypatch.setenv("GUARDIAN_HEALTH_HOST", "")
-        assert load_config(p).health_url == "http://10.0.0.1:5000"
+        assert load_config(p).health_url == "http://192.0.2.1:5000"
 
     def test_telegram_token_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("GUARDIAN_TELEGRAM_BOT_TOKEN", "test-token")

@@ -1579,7 +1579,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: ba6e357a 2026-10-07
+verified: dca522c0b 2026-10-09
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -1590,9 +1590,12 @@ verified: ba6e357a 2026-10-07
   disabled.
 - **HTTP/ICMP targets are separate**: `health_api_host` (env
   `GUARDIAN_HEALTH_HOST`) can use the host loopback dashboard proxy while ICMP
-  retains its configured/autodetected container address. The operator
-  `guardian.dashboard_ingress` migration patches preserved config before
-  restricting Incus ingress; it does not activate peers. See
+  retains its configured/autodetected container address. Health/dialogue HTTP
+  requests bypass environment proxies. The operator `guardian.dashboard_ingress`
+  migration verifies the live container-loopback listener and patch eligibility,
+  then patches preserved config before restricting Incus ingress. Full deployment
+  and migration preserve an operator-owned Guardian pause until direct health
+  verification; migration does not activate peers. See
   [ingress and acceptance](../reference/peer-ingress.md).
 - **guard-layer watch** (`guardian/guard_layer_watch.py`, a SIDE-watch in
   `run_check`, not a `probe_*`): asks whether the AGENT TOOLING can still
