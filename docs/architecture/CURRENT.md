@@ -1377,7 +1377,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: 9a1e0b7c8 2026-10-08
+verified: 99157fdb8ce8 2026-10-09
 ```
 
 - **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
@@ -1421,7 +1421,8 @@ verified: 9a1e0b7c8 2026-10-08
   settles original allowances and reconciles unfinished task disposition.
   Unknown cleanup/effects retain holds; restart cannot restore capacity or grant
   consent. Host gates cover admission, claim, start and continuation. Shutdown
-  quiesces notification delivery before Telegram closes. See
+  quiesces notification delivery before Telegram closes. Poller exit fences
+  active leases and cancels sessions; readiness refuses new work. See
   [peer runtime](../reference/peer-runtime.md).
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:

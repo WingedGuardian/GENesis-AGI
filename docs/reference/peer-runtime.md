@@ -46,6 +46,9 @@ cancels polling and existing notification deliveries. Session drain runs as an
 owned task with the existing ten-second host grace. Pending cleanup is recorded
 as blocked/reconciliation; it is never reported clean or given new capacity.
 Exceptions in peer teardown do not prevent unrelated runtime shutdown.
+Loss of the poller also fences active leases and cancels their running sessions;
+readiness refuses new work until host recovery. Awaited drain and reconciliation
+remain owned by runner cleanup and shutdown.
 
 Operators enable a relationship through the local
 [peer registry CLI](peer-registry.md), configure distinct credentials without

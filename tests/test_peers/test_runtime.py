@@ -360,10 +360,56 @@ async def test_poll_failure_refuses_http_admission(installed, monkeypatch):
     await wait_for(failed)
     with pytest.raises(RuntimeError, match="Peer runtime polling failed"):
         await service.poll
+    assert service.coordinator._stopping
     assert not await service.ready()
     assert (
         await request(installed, "POST", "/message:send", json=task_message())
     ).status_code == 503
+
+
+@pytest.mark.parametrize("failure", ["settings", "tick", "cancel"])
+async def test_monitor_loss_fences_running_session(installed, monkeypatch, failure):
+    await installed.registry.grant("muse", "conversation", "allow")
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def blocked(invocation, on_event):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(installed.runtime._direct_session_runner._invoker, "run_streaming", blocked)
+    service = await start(installed)
+    response = await request(installed, "POST", "/message:send", json=task_message())
+    assert response.status_code == 200
+    async with asyncio.timeout(15):
+        await started.wait()
+    binding = next(iter(service.coordinator._bindings.values()))
+    session_id = service.coordinator._sessions[binding.segment.segment_id]
+    running = service.coordinator.runner._active[session_id]
+    settings = service.registry.settings
+    if failure == "cancel":
+        service.poll.cancel()
+        expected = asyncio.CancelledError
+    else:
+        target = service.registry if failure == "settings" else service.coordinator
+        monkeypatch.setattr(target, failure, AsyncMock(side_effect=RuntimeError("private")))
+        expected = RuntimeError
+    async with asyncio.timeout(15):
+        with pytest.raises(expected):
+            await service.poll
+        await cancelled.wait()
+        await asyncio.gather(running, return_exceptions=True)
+    monkeypatch.setattr(service.registry, "settings", settings)
+    assert service.coordinator._stopping
+    assert binding.segment.segment_id in service.coordinator.broker._revoked_segments
+    assert session_id not in service.coordinator.runner._active
+    assert not await service.ready()
+    fetched = await request(installed, "GET", "/tasks/" + response.json["task"]["id"])
+    assert fetched.status_code == 200
+    assert fetched.json["status"]["state"] == "TASK_STATE_FAILED"
+    assert not fetched.json.get("artifacts")
 
 
 async def test_shutdown_cancels_notifications_before_transport_close(installed):

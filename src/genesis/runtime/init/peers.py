@@ -107,16 +107,21 @@ class PeerRuntime(PeerTasks):
         )
 
     async def _poll(self):
-        while not self.stopping:
-            try:
-                if (await self.registry.settings())["mode"] == "disabled":
-                    for binding in tuple(self.coordinator._bindings.values()):
-                        self.coordinator._fence(binding)
-                await self.coordinator.tick()  # Each execution chokepoint rechecks the host gate.
-            except Exception:
-                logger.error("Peer runtime polling failed")
-                raise RuntimeError("Peer runtime polling failed") from None
-            await asyncio.sleep(_POLL_INTERVAL_S)
+        try:
+            while not self.stopping:
+                try:
+                    if (await self.registry.settings())["mode"] == "disabled":
+                        for binding in tuple(self.coordinator._bindings.values()):
+                            self.coordinator._fence(binding)
+                    await self.coordinator.tick()  # Each chokepoint rechecks the host gate.
+                except Exception:
+                    logger.error("Peer runtime polling failed")
+                    raise RuntimeError("Peer runtime polling failed") from None
+                await asyncio.sleep(_POLL_INTERVAL_S)
+        finally:
+            # Losing host monitoring also ends its execution authority. Awaited
+            # drain and reconciliation still belong to close/runner cleanup.
+            self.coordinator.quiesce()
 
     async def stop(self):
         async with self._stop_lock:

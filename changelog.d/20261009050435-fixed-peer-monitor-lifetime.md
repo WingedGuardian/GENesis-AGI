@@ -1,0 +1,1 @@
+- Peer sessions stop when their runtime monitoring fails or is cancelled, preventing work from continuing without host monitoring.
