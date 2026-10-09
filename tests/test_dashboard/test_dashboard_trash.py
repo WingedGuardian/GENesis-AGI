@@ -185,22 +185,6 @@ def test_a_symlink_loop_as_the_requested_path_is_a_400(client, tmp_path):
     assert client.get(f"/api/genesis/files?path={tmp_path / 'loop'}").status_code == 400
 
 
-def test_a_trashed_symlink_cannot_be_opened_through_the_trash(client, tmp_path):
-    # The memory delete trashes a link as the link; resolving it first would
-    # make the trash reachable by naming .../item.
-    # The route trashes only a link that stays inside the memory directory.
-    target = tmp_path / "memory" / "real.md"
-    target.write_text("through the trash")
-    link = tmp_path / "memory" / "alias.md"
-    link.symlink_to(target)
-    assert client.delete("/api/genesis/config-files/memory/alias.md").status_code == 200
-    item = _entry_for("dashboard.config.memory_delete").path / ITEM
-    assert item.is_symlink()
-    assert client.get(f"/api/genesis/files/read?path={item}").status_code == 403
-    assert client.delete(f"/api/genesis/files/delete?path={item}").status_code == 403
-    assert target.read_text() == "through the trash"
-
-
 def test_a_link_to_the_memory_index_is_not_offered_for_delete(client, tmp_path):
     (tmp_path / "memory" / "MEMORY.md").write_text("index")
     (tmp_path / "memory" / "alias.md").symlink_to(tmp_path / "memory" / "MEMORY.md")
@@ -238,38 +222,6 @@ def test_a_file_another_process_holds_open_is_refused(client, tmp_path):
     finally:
         holder.kill()
         holder.wait()
-
-
-def test_a_trashed_link_to_a_directory_cannot_be_listed_through_the_trash(client, tmp_path):
-    # put (the CLI) trashes a symlink as the link, including one to a directory.
-    from genesis.trash import trash
-
-    real = tmp_path / "realdir"
-    real.mkdir()
-    (real / "inside.md").write_text("x")
-    link = tmp_path / "dirlink"
-    link.symlink_to(real)
-    stone = trash(link, reason="test", caller="test")
-    item = next(e.path for e in list_entries() if e.path.name == stone.entry_id) / ITEM
-    assert item.is_symlink()
-    assert client.get(f"/api/genesis/files?path={item}").status_code == 403
-    assert client.get(f"/api/genesis/files?path={real}").status_code == 200
-
-
-def test_dotdot_after_a_linked_directory_cannot_reach_the_trash(client, tmp_path):
-    # os.path.abspath drops ".." as text; the filesystem follows the link
-    # first, so <link>/../<entry>/item lands inside the trash.
-    target = tmp_path / "memory" / "real.md"
-    target.write_text("through the trash")
-    (tmp_path / "memory" / "alias.md").symlink_to(target)
-    assert client.delete("/api/genesis/config-files/memory/alias.md").status_code == 200
-    entry = _entry_for("dashboard.config.memory_delete").path
-    (tmp_path / "linkdir").symlink_to(entry.parent / "zz")  # dangling is fine
-    (entry.parent / "zz").mkdir()
-    sneaky = f"{tmp_path}/linkdir/../{entry.name}/{ITEM}"
-    assert client.get(f"/api/genesis/files/read?path={sneaky}").status_code == 403
-    assert client.delete(f"/api/genesis/files/delete?path={sneaky}").status_code == 403
-    assert target.read_text() == "through the trash"
 
 
 def test_a_link_into_the_trash_is_not_listed(client, tmp_path):
@@ -319,3 +271,51 @@ def test_a_looping_memory_index_does_not_break_the_config_listing(client, tmp_pa
     assert memory == {"memory/note.md": False}
     assert client.delete("/api/genesis/config-files/memory/note.md").status_code == 403
     assert (tmp_path / "memory" / "note.md").exists()
+
+
+def test_a_looping_trash_root_does_not_break_unrelated_requests(client, tmp_path):
+    root = tmp_path / "genesis-trash"  # where _isolate_trash_root puts the trash
+    root.symlink_to(root)
+    f = tmp_path / "plain.md"
+    f.write_text("fine")
+    assert client.get(f"/api/genesis/files/read?path={f}").status_code == 200
+    assert client.get(f"/api/genesis/files?path={tmp_path}").status_code == 200
+    # Paths under the looping root itself still count as in a trash.
+    assert client.get(f"/api/genesis/files/read?path={root}/x").status_code in (400, 403)
+
+
+def test_a_memory_delete_through_link_dotdot_cannot_trash_the_index(client, tmp_path):
+    # memory/linkdir -> memory/nested/deeper, so memory/linkdir/../MEMORY.md is
+    # memory/nested/MEMORY.md on disk, but memory/MEMORY.md once ".." is
+    # collapsed as text, which is what the trash does.
+    mem = tmp_path / "memory"
+    (mem / "MEMORY.md").write_text("index")
+    (mem / "nested" / "deeper").mkdir(parents=True)
+    (mem / "nested" / "MEMORY.md").write_text("nested")
+    (mem / "linkdir").symlink_to(mem / "nested" / "deeper")
+    resp = client.delete("/api/genesis/config-files/memory/linkdir/../MEMORY.md")
+    assert resp.status_code in (403, 404), resp.get_json()
+    assert (mem / "MEMORY.md").read_text() == "index"
+    assert (mem / "nested" / "MEMORY.md").read_text() == "nested"
+    assert list_entries() == []
+
+
+def test_a_trashed_link_is_judged_as_its_target(client, tmp_path):
+    # One spelling: <trash>/<entry>/item, a trashed symlink, is its target.
+    # It reaches nothing the target's own name would not; the trash itself,
+    # however it is named, stays closed.
+    target = tmp_path / "memory" / "real.md"
+    target.write_text("the target")
+    (tmp_path / "memory" / "alias.md").symlink_to(target)
+    assert client.delete("/api/genesis/config-files/memory/alias.md").status_code == 200
+    entry = _entry_for("dashboard.config.memory_delete").path
+    item = entry / ITEM
+    assert item.is_symlink()
+    read = client.get(f"/api/genesis/files/read?path={item}")
+    assert read.status_code == 200 and read.get_json()["path"] == str(target)
+    assert client.get(f"/api/genesis/files?path={entry}").status_code == 403
+    # Through a linked directory and "..", the entry is still the trash.
+    (tmp_path / "linkdir").symlink_to(entry.parent / "zz")
+    (entry.parent / "zz").mkdir()
+    sneaky = f"{tmp_path}/linkdir/../{entry.name}"
+    assert client.get(f"/api/genesis/files?path={sneaky}").status_code == 403

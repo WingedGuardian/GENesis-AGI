@@ -251,6 +251,17 @@ def config_file_delete(name: str):
         return jsonify({"error": "file not found"}), 404
     if not target.resolve().is_relative_to(_MEMORY_DIR.resolve()):
         return jsonify({"error": "path traversal blocked"}), 403
+    # Validate and trash ONE spelling: the parent resolved, the leaf kept (a
+    # symlink is trashed as the link). Memory files live directly in the
+    # memory directory; anything else (a subdirectory, "<link>/..") is refused,
+    # because the trash collapses ".." as text while the filesystem follows the
+    # link first, so the checked file and the trashed one could differ.
+    try:
+        target = target.parent.resolve() / target.name
+    except (OSError, RuntimeError):
+        return jsonify({"error": "path traversal blocked"}), 403
+    if target.name in ("", ".", "..") or target.parent != _MEMORY_DIR.resolve():
+        return jsonify({"error": "path traversal blocked"}), 403
     # The index is not deletable (the listing marks it so); compare paths, not
     # strings, so "memory/./MEMORY.md" is refused too. An index that cannot be
     # resolved refuses every delete rather than guess.

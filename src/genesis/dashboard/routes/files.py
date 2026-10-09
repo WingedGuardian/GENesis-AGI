@@ -551,7 +551,11 @@ def _is_allowed(path: Path) -> bool:
     # Neither trash is browsable; restore goes through its own CLI. The Genesis
     # trash renames every item to the fixed leaf ``item``, so the name rules
     # below could not see what a trashed file was; the worktree trash holds
-    # archives whose contents those rules never see either.
+    # archives whose contents those rules never see either. Judged on the
+    # RESOLVED path, like everything here: a trashed symlink named as
+    # ``<trash>/<entry>/item`` is its target, which every route then reads or
+    # changes exactly as if the target had been named (and refuses if it is in
+    # a trash). One spelling, so what is checked is what is acted on.
     if _in_a_trash(resolved):
         return False
     # Block paths containing "secret" in any component (except dir names "secrets"/".secrets")
@@ -611,9 +615,14 @@ def _worktree_trash_dir() -> Path:
 
 
 def _trash_stores() -> tuple[Path, ...]:
+    """Both trash roots, resolved. A root that cannot be resolved (a symlink
+    loop) is kept as spelled, so paths under it still count as in a trash
+    instead of every request failing."""
     from genesis.trash import home_trash_root
 
-    return (home_trash_root().resolve(), _worktree_trash_dir().resolve())
+    return tuple(
+        _resolve_or_none(root) or root for root in (home_trash_root(), _worktree_trash_dir())
+    )
 
 
 def _in_a_trash(resolved: Path) -> bool:
@@ -629,25 +638,6 @@ def _resolve_or_none(path: Path) -> Path | None:
         return None
 
 
-def _named_in_a_trash(raw: str) -> bool:
-    """Whether the path AS NAMED lies in a trash, before its last component is
-    followed. ``resolve()`` alone follows a trashed symlink (``.../item``) to
-    its target, which may be allowed, and the trash would then be readable,
-    writable and deletable through it. The parents are resolved (a trash
-    reached through a linked parent still counts); the leaf is not.
-
-    Not ``os.path.abspath``: it drops ``..`` as text, while the filesystem
-    follows a symlink before applying it, so ``<link>/../<entry>/item`` would be
-    judged at the wrong place. ``Path`` keeps ``..`` for ``resolve()``. A path
-    that cannot be resolved counts as in a trash (fail closed)."""
-    named = Path(raw) if os.path.isabs(raw) else Path.cwd() / raw
-    if named.name in ("", ".", ".."):  # no real leaf: judge it fully resolved
-        full = _resolve_or_none(named)
-        return full is None or _in_a_trash(full)
-    parent = _resolve_or_none(named.parent)
-    return parent is None or _in_a_trash(parent / named.name)
-
-
 def _sanitize_path(raw: str | None) -> tuple[Path | None, tuple | None]:
     """Resolve and validate a user-supplied path.
 
@@ -661,7 +651,7 @@ def _sanitize_path(raw: str | None) -> tuple[Path | None, tuple | None]:
     resolved = _resolve_or_none(Path(raw))
     if resolved is None:
         return None, ({"error": "Path cannot be resolved"}, 400)
-    if _named_in_a_trash(raw) or not _is_allowed(resolved):
+    if not _is_allowed(resolved):
         return None, ({"error": "Path not allowed"}, 403)
     return resolved, None
 
@@ -703,7 +693,7 @@ def file_list():
     # Allow listing the home directory for navigation between roots,
     # but do NOT add _HOME to _ALLOWED_ROOTS (that would expose ~/.ssh etc.
     # to read/write/delete endpoints). Only file_list gets this exception.
-    if _named_in_a_trash(raw_path) or (target != _HOME.resolve() and not _is_allowed(target)):
+    if target != _HOME.resolve() and not _is_allowed(target):
         return jsonify({"error": "Path not allowed"}), 403
 
     if not target.is_dir():
