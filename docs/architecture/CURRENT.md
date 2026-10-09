@@ -2451,7 +2451,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 7ec594c72 2026-10-09
+verified: 041a01360 2026-10-09
 ```
 
 - **transcript_analytics/**: optional local transcript parser library. It
