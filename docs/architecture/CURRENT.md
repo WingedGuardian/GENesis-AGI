@@ -224,8 +224,9 @@ any live flip. Centrality persistence widened from top-500 to all-nonzero
 a real bridge-node population; `centrality_cache` gains its first reader.
 
 **Graph backend is a SEAM (`memory/graphstore.py`)** — traversal and centrality
-run through a `GraphStore` protocol with one implementation today,
-`NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`);
+run through a `GraphStore` protocol with two implementations: the default
+`NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`)
+and `FalkorGraphStore` (below);
 `memory/graph.py` is a facade that owns the single production instance and the
 backend choice. The contract, and the reason the seam exists: a read that cannot
 REACH its store RAISES `GraphUnavailableError` and never returns empty — empty
@@ -261,6 +262,28 @@ docs (2026-09-07): only the NAMED-PATH form works for hop-wise filtering, the
 engine has NO temporal types despite its own documentation listing them, and a
 loading engine answers `BusyLoadingError` — which is unavailable, never empty.
 Acceptance: 400 live roots replayed through both stores, 0 node-set differences.
+The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
+(`memory/graphstore_project.py`); that schedule is its staleness bound, and an
+engine restart leaves no projection until the next run (the engine keeps no data
+on disk). At runtime only `graph.traverse()` READS the engine (the projector
+writes it, the health probe pings it): its callers are `memory_recall`
+enrichment (MCP, and genesis-server's tool API), `memory_expand`, and
+`drift_recall` (MCP drift mode and the ambient worker). Recall's own graph step (`graph_expansion.py`) reads
+`memory_links` through SQL and never touches it.
+**Every traversal outcome is recorded** for the default-on cutover (owner gate:
+14 days in falkordb mode with zero fallbacks): `eval_events` rows
+(`event_type="graph_traverse"`, `dimension="system"`) built by
+`memory/graph_telemetry.py`, one per caller call, with the configured mode, the
+store that answered, and the exception class of any fallback, selection failure
+or error. A call's first fallback, selection failure or error is also written as
+its own row the moment it happens, so a process killed mid-request cannot lose the
+evidence that the clock broke. A row that fails to write is carried as
+`prior_write_failures` on the next row and appended to
+`~/.genesis/telemetry/graph_traverse_lost_writes.jsonl`, which outlives the
+process. `graph_traverse_prune` deletes rows, and file lines, older than 30 days;
+kill switch `GENESIS_GRAPH_TELEMETRY_DISABLED=1`.
+The fallback WARNINGs alone could never answer this: MCP servers log to stderr,
+which never reaches the journal.
 
 Freshness has one stated boundary: all 13 `invalidate_graph_cache()` sites are
 `memory_links` writers, while the visibility predicate below reads
