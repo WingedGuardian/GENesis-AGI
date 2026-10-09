@@ -16,6 +16,60 @@ def _payload(prompt: str = "hi") -> dict:
     return {"prompt": prompt, "profile": "research"}
 
 
+@pytest.mark.parametrize("operation", ["insert", "claim", "relimit", "terminal"])
+async def test_caller_transaction_can_rollback_peer_park_writes(db, operation):
+    arguments = {
+        "kind": "direct_session",
+        "dedup_key": "peer-transaction",
+        "payload": {"source_tag": "peer_api", "peer_task_id": "f" * 32},
+        "origin_session_id": None,
+        "limit_kind": "unknown",
+        "raw_signal": None,
+        "reset_at": None,
+        "next_attempt_at": "2026-07-22T17:00:00+00:00",
+    }
+    identifier = None
+    if operation != "insert":
+        identifier = await parks.upsert_open_park(db, **arguments)
+        if operation == "relimit":
+            assert await parks.claim(db, identifier)
+    await db.execute("BEGIN IMMEDIATE")
+    if operation == "insert":
+        identifier = await parks.upsert_open_park(db, **arguments, commit=False)
+    elif operation == "claim":
+        assert await parks.claim(db, identifier, commit=False)
+    elif operation == "relimit":
+        assert (
+            await parks.relimit(
+                db,
+                identifier,
+                reset_at=None,
+                next_attempt_at=arguments["next_attempt_at"],
+                needs_user_at_attempts=40,
+                commit=False,
+            )
+            == "parked"
+        )
+    else:
+        expected = await parks.get_by_id(db, identifier)
+        assert await parks.mark_terminal_if_unchanged(
+            db,
+            identifier,
+            "cancelled",
+            expected_status=expected["status"],
+            expected_claimed_at=expected["claimed_at"],
+            expected_updated_at=expected["updated_at"],
+            commit=False,
+        )
+    await db.rollback()
+    row = await parks.get_by_id(db, identifier)
+    if operation == "insert":
+        assert row is None
+    else:
+        assert row["status"] == ("resuming" if operation == "relimit" else "parked")
+        assert row["attempts"] == 0
+
+
 async def test_upsert_inserts_then_bumps_same_dedup_key(db):
     pid = await parks.upsert_open_park(
         db,

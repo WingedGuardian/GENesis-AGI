@@ -15,6 +15,7 @@ Mirrors ``direct_session_queue`` (single-statement claim via UPDATE…RETURNING)
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -40,6 +41,7 @@ async def upsert_open_park(
     raw_signal: str | None,
     reset_at: str | None,
     next_attempt_at: str,
+    commit: bool = True,
 ) -> str:
     """Insert a fresh park, or bump the existing OPEN park with the same
     dedup_key (idempotent concurrent parks). Returns the park id.
@@ -80,8 +82,31 @@ async def upsert_open_park(
         ),
     )
     row = await cursor.fetchone()
-    await db.commit()
+    if commit:
+        await db.commit()
     return row[0] if row else park_id
+
+
+async def _peer_filter(db: aiosqlite.Connection, peer_only: bool | None):
+    if peer_only is None:
+        return "", ()
+    if type(peer_only) is not bool:
+        raise ValueError("Peer park selection must be boolean")
+    from genesis.peers.provider_state import peer_park
+
+    lock = getattr(db, "_genesis_peer_park_lock", None)
+    if lock is None:
+        lock = db._genesis_peer_park_lock = asyncio.Lock()
+    async with lock:
+        if not getattr(db, "_genesis_peer_park_registered", False):
+            await db.create_function(
+                "genesis_peer_park",
+                1,
+                lambda payload: peer_park({"payload_json": payload}),
+                deterministic=True,
+            )
+            db._genesis_peer_park_registered = True
+    return "AND genesis_peer_park(payload_json) = ?", (peer_only,)
 
 
 async def list_due(
@@ -89,16 +114,19 @@ async def list_due(
     *,
     now: str | None = None,
     limit: int = 50,
+    peer_only: bool | None = None,
 ) -> list[dict]:
     """Open parks whose next_attempt_at is due (<= now). Oldest first."""
     now = now or _now()
+    selection, params = await _peer_filter(db, peer_only)
     cursor = await db.execute(
-        """SELECT * FROM cc_rate_limit_parks
+        f"""SELECT * FROM cc_rate_limit_parks
            WHERE status = 'parked'
              AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+              {selection}
            ORDER BY created_at
            LIMIT ?""",
-        (now, limit),
+        (now, *params, limit),
     )
     rows = await cursor.fetchall()
     return [dict(r) for r in rows]
@@ -109,20 +137,23 @@ async def list_by_status(
     *,
     status: str,
     limit: int = 50,
+    peer_only: bool | None = None,
 ) -> list[dict]:
     """Parks in a given status. Oldest first."""
+    selection, params = await _peer_filter(db, peer_only)
     cursor = await db.execute(
-        """SELECT * FROM cc_rate_limit_parks
+        f"""SELECT * FROM cc_rate_limit_parks
            WHERE status = ?
+             {selection}
            ORDER BY created_at
            LIMIT ?""",
-        (status, limit),
+        (status, *params, limit),
     )
     rows = await cursor.fetchall()
     return [dict(r) for r in rows]
 
 
-async def claim(db: aiosqlite.Connection, park_id: str) -> bool:
+async def claim(db: aiosqlite.Connection, park_id: str, *, commit: bool = True) -> bool:
     """Atomically claim a due park (parked→resuming). True iff this caller won."""
     now = _now()
     cursor = await db.execute(
@@ -131,7 +162,8 @@ async def claim(db: aiosqlite.Connection, park_id: str) -> bool:
            WHERE id = ? AND status = 'parked'""",
         (now, now, park_id),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
     return cursor.rowcount == 1
 
 
@@ -156,6 +188,7 @@ async def relimit(
     reset_at: str | None,
     next_attempt_at: str,
     needs_user_at_attempts: int,
+    commit: bool = True,
 ) -> str:
     """A resumed retry hit the limit again — update THIS row in place (attempts+1,
     fresh reset, backoff). Escalates to ``needs_user`` once attempts reaches the
@@ -180,7 +213,8 @@ async def relimit(
         (reset_at, next_attempt_at, needs_user_at_attempts, now, park_id),
     )
     row = await cursor.fetchone()
-    await db.commit()
+    if commit:
+        await db.commit()
     return row[0] if row else ""
 
 
@@ -228,6 +262,7 @@ async def mark_terminal_if_unchanged(
     expected_status: str,
     expected_claimed_at: str | None,
     expected_updated_at: str,
+    commit: bool = True,
 ) -> bool:
     """Force a terminal status ONLY if the row still holds (expected_status,
     expected_claimed_at, expected_updated_at) — the atomic guard for a
@@ -258,7 +293,8 @@ async def mark_terminal_if_unchanged(
                  AND updated_at = ?""",
             (status, now, park_id, expected_status, expected_claimed_at, expected_updated_at),
         )
-    await db.commit()
+    if commit:
+        await db.commit()
     return cursor.rowcount == 1
 
 

@@ -36,6 +36,8 @@ the original task message as well as the serialized wrapper; completion remains
 immutable and is never re-executed to replace a refused receipt.
 
 Completion time and execution duration have separate fields from cleanup time.
-The coordinator must capture them when the invocation returns, so slow cleanup
-cannot retroactively classify a timely result as late. Artifact publication and
-provider continuation are not implemented by this foundation.
+The runner captures the first authoritative streaming result before cleanup;
+its no-result fallback conservatively uses invocation return. Slow cleanup
+cannot retroactively classify a timely result as late. The private coordinator
+now supplies provider continuation; owned artifacts and runtime installation
+remain later slices. See [coordinator](peer-coordinator.md).

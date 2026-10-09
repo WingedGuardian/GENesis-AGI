@@ -186,6 +186,9 @@ class PeerTasks:
             ).decode()
         return [dict(row) for row in rows[:page_size]], next_token, total
 
+    async def _before_pending_cancel(self, db, row):
+        """Internal lifecycle extension; caller owns the pending-cancel transaction."""
+
     async def cancel(self, identity: dict, task_id: str) -> dict:
         await self.owned(identity, task_id)
         async with self.registry.transaction() as db:
@@ -204,6 +207,7 @@ class PeerTasks:
             if row["state"] in TERMINAL:
                 raise TaskRefusal("state_conflict", 400)
             if row["state"] == "submitted" and row["queue_status"] == "pending":
+                await self._before_pending_cancel(db, row)
                 await db.execute(
                     "UPDATE direct_session_queue SET status='failed',error_message='Peer task canceled' WHERE id=?",
                     (row["queue_id"],),

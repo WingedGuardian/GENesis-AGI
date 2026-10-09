@@ -108,22 +108,44 @@ async def call(s, name="task_context", arguments=None):
     )
 
 
-@pytest.mark.parametrize("unsafe", [False, True])
-async def test_common_return_boundary_scans_original_outcome(setup, monkeypatch, unsafe):
+async def test_trusted_executor_wraps_only_authorized_handler(setup):
     s = setup
-    text = 'token: "' + secrets.token_hex(16) + '"' if unsafe else "Public fixture"
+    observed = []
 
-    async def outcome(row, decisions, arguments):
-        return {"task_id": row["id"], "context": text}
+    async def execute(binding, capability, digest, handler, *, immutable_read):
+        observed.append((binding, capability, digest, immutable_read))
+        return await handler()
 
-    schema, _, capability = s.broker._operations["task_context"]
-    monkeypatch.setitem(s.broker._operations, "task_context", (schema, outcome, capability))
+    s.broker.execute_operation = execute
     response = await call(s)
-    assert response.status_code == (400 if unsafe else 200)
-    if unsafe:
-        assert response.json() == {"code": "operation_refused"}
-    else:
-        assert response.json()["context"] == text
+    assert response.status_code == 200
+    assert "<external-content" in response.json()["context"]
+    assert len(observed) == 1
+    assert observed[0][0] == s.binding
+    assert observed[0][1] == "conversation"
+    assert len(observed[0][2]) == 64
+    assert observed[0][3] is True
+    await s.registry.grant("fixture", "conversation", "ask")
+    assert (await call(s)).status_code == 409
+    assert len(observed) == 1
+
+
+@pytest.mark.parametrize("change", ["invalidate", "deny"])
+async def test_executor_return_cannot_bypass_final_authority(setup, change):
+    s = setup
+
+    async def execute(binding, capability, digest, handler, *, immutable_read):
+        result = await handler()
+        if change == "invalidate":
+            s.broker.invalidate(binding)
+        else:
+            await s.registry.grant("fixture", "conversation", "deny")
+        return result
+
+    s.broker.execute_operation = execute
+    response = await call(s)
+    assert response.status_code in {403, 409}
+    assert "context" not in response.json()
 
 
 async def test_real_stdio_and_uds_context_resource_pipeline(setup):
@@ -607,3 +629,21 @@ async def test_framework_wire_errors_never_echo_or_log_leases(setup, malformed):
     finally:
         for target, (handlers, propagate, level) in zip(targets, saved, strict=True):
             target.handlers, target.propagate, target.level = handlers, propagate, level
+
+
+@pytest.mark.parametrize("unsafe", [False, True])
+async def test_common_return_boundary_scans_original_outcome(setup, monkeypatch, unsafe):
+    s = setup
+    text = 'token: "' + secrets.token_hex(16) + '"' if unsafe else "Public fixture"
+
+    async def outcome(row, decisions, arguments):
+        return {"task_id": row["id"], "context": text}
+
+    schema, _, capability = s.broker._operations["task_context"]
+    monkeypatch.setitem(s.broker._operations, "task_context", (schema, outcome, capability))
+    response = await call(s)
+    assert response.status_code == (400 if unsafe else 200)
+    if unsafe:
+        assert response.json() == {"code": "operation_refused"}
+    else:
+        assert response.json()["context"] == text

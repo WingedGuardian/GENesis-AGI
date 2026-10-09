@@ -39,8 +39,9 @@ backoff_cap_minutes: 240
 # when many parks share one reset window.
 jitter_seconds: 60
 
-# Parks resumed per engine tick (the account-wide limit means they clear in
-# order; this bounds per-tick dispatch).
+# Parks selected per class per live engine tick: owner and peer work each get
+# this bounded batch, so blocked peer parks cannot hide owner work. Peer work
+# still resumes only through its coordinator. Propose-only uses one mixed batch.
 max_due_per_tick: 50
 
 # Give up after this many attempts → escalate to needs_user (one alert, no more
