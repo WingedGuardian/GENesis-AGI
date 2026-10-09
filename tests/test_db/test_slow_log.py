@@ -172,13 +172,15 @@ async def test_cursor_fetches_are_timed_under_the_statement(sconn, caplog):
 async def test_a_fetch_in_flight_is_named_by_a_statement_behind_it(sconn, clock, caplog):
     caplog.set_level(logging.WARNING, logger=LOGGER)
     seen: list[object] = []
-    await sconn._conn.create_function("seen", 0, lambda: seen.append(sconn._inflight) or 1)
+    await sconn._conn.create_function(
+        "seen", 0, lambda: seen.append(list(sconn._inflight.values())) or 1
+    )
     cur = await sconn.execute("SELECT seen() FROM (SELECT 1 UNION ALL SELECT 2)")
     await cur.fetchall()
     # set while its rows were fetched, cleared afterwards
-    assert seen == [None, "SELECT seen() FROM (SELECT 1 UNION ALL SELECT 2)"]
-    assert sconn._inflight is None
-    object.__setattr__(sconn, "_inflight", "SELECT big scan")
+    assert seen == [[], ["SELECT seen() FROM (SELECT 1 UNION ALL SELECT 2)"]]
+    assert sconn._inflight == {}
+    sconn._inflight[object()] = "SELECT big scan"
     await sconn.execute_fetchall("SELECT tick(1500)")
     assert _lines(caplog)[-1].endswith("blocked_by=SELECT big scan")
 
@@ -268,16 +270,17 @@ async def test_a_cancelled_fetch_is_named_by_the_next_statement(sconn, caplog):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert sconn._inflight is None
+    assert sconn._inflight == {}
     await sconn.execute_fetchall("SELECT tick(1500)")
     assert _lines(caplog)[-1].endswith("blocked_by=SELECT 'FETCHED SQL'")
 
 
-async def test_a_finished_fetch_restores_an_outer_in_flight_marker(sconn):
-    object.__setattr__(sconn, "_inflight", "OUTER FETCH")
+async def test_a_finished_fetch_leaves_another_in_flight_fetch_marked(sconn):
+    outer = object()
+    sconn._inflight[outer] = "OUTER FETCH"
     cur = await sconn.execute("SELECT 1")
     await cur.fetchall()
-    assert sconn._inflight == "OUTER FETCH"
+    assert sconn._inflight == {outer: "OUTER FETCH"}
 
 
 def test_savepoint_ids_collapse_in_labels():
@@ -381,3 +384,33 @@ def test_threshold_accessor(monkeypatch, raw, expected):
     else:
         monkeypatch.setenv("GENESIS_SQLITE_SLOW_MS", raw)
     assert sqlite_slow_ms() == expected
+
+
+async def test_overlapping_fetches_never_leave_a_finished_one_named(sconn, caplog):
+    """Codex review (#3122): fetches on two cursors overlap. A saved None, B saved
+    A; A finished and cleared the marker while B ran; B then restored A, which
+    every later slow statement named as its blocker, indefinitely."""
+    from genesis.db.connection import _TimedCursor
+
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    gates = {"A": asyncio.Event(), "B": asyncio.Event()}
+
+    def cursor(name):
+        async def fetch():
+            await gates[name].wait()
+            return []
+
+        return _TimedCursor(SimpleNamespace(fetchall=fetch), f"SELECT {name}", sconn)
+
+    a = asyncio.ensure_future(cursor("A").fetchall())
+    await asyncio.sleep(0)
+    b = asyncio.ensure_future(cursor("B").fetchall())
+    await asyncio.sleep(0)
+    gates["A"].set()
+    await a  # A is done; B is still fetching
+    await sconn.execute_fetchall("SELECT tick(1500)")
+    assert _lines(caplog)[-1].endswith("blocked_by=SELECT B")
+    gates["B"].set()
+    await b
+    await sconn.execute_fetchall("SELECT tick(1501)")
+    assert _lines(caplog)[-1].endswith("blocked_by=-"), "a finished fetch is still named"

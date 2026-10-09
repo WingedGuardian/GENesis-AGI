@@ -394,10 +394,12 @@ class SerializedConnection:
         object.__setattr__(self, "_db_path", db_path)
         # Slow-statement attribution (genesis.db._slow_log): the SQL holding the
         # lock, the last one cancelled while holding it (its statement keeps
-        # running on the worker thread), and a cursor fetch in progress.
+        # running on the worker thread), and the cursor fetches in progress, in
+        # the order they were queued (one entry per fetch, removed by that fetch
+        # alone: fetches on different cursors overlap and finish in any order).
         object.__setattr__(self, "_holder", None)
         object.__setattr__(self, "_cancelled_holder", None)
-        object.__setattr__(self, "_inflight", None)
+        object.__setattr__(self, "_inflight", {})
 
     # -- Attribute passthrough (e.g. row_factory, in_transaction) ----------
 
@@ -422,8 +424,10 @@ class SerializedConnection:
         statement cancelled while holding the lock (it keeps running after the
         lock is released). ``sql`` is the statement text; parameters never
         reach it."""
-        if self._inflight is not None:
-            blocked_by = self._inflight
+        if self._inflight:
+            # aiosqlite runs one request queue, first in first out: the oldest
+            # fetch still in progress is the one ahead of this statement.
+            blocked_by = next(iter(self._inflight.values()))
         elif self._lock.locked():
             blocked_by = self._holder
         else:
@@ -806,10 +810,10 @@ class _TimedCursor:
 
     async def _timed_fetch(self, fetch: Callable[..., Awaitable[Any]], *args: Any) -> Any:
         owner = self._owner
-        previous = owner._inflight  # another cursor's fetch may be queued ahead
+        token = object()  # this fetch's own entry; another cursor's may overlap it
         with timed(self._sql) as t:
             t.acquired()  # a fetch queues for no lock of ours: all of it is run time
-            object.__setattr__(owner, "_inflight", self._sql)
+            owner._inflight[token] = self._sql
             try:
                 return await fetch(*args)
             except asyncio.CancelledError:
@@ -818,7 +822,7 @@ class _TimedCursor:
                 object.__setattr__(owner, "_cancelled_holder", self._sql)
                 raise
             finally:
-                object.__setattr__(owner, "_inflight", previous)
+                owner._inflight.pop(token, None)
 
     async def fetchone(self) -> Any:
         return await self._timed_fetch(self._cursor.fetchone)
