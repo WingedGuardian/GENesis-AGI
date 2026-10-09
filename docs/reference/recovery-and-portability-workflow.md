@@ -67,6 +67,10 @@ grants, and renew relationship epochs in the staged database before installation
 Identities and historical records remain; saved jobs and approval consent cannot
 be replayed as current authority. Incompatible peer schemas refuse before the
 live database is touched. Older databases without peer state remain compatible.
+Peer-bearing candidates require SQLite 3.37 or newer to verify that reset targets
+are ordinary tables. Reset refuses triggers or foreign-key actions that could
+change other rows; the staged transaction rolls back instead of publishing those
+effects. Unrelated triggers, foreign keys and full-text tables remain supported.
 An owner must explicitly configure peer access and grant capabilities again;
 a runtime that started disabled also requires a restart to enable execution.
 

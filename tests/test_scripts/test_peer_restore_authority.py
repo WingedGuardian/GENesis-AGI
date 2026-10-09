@@ -100,6 +100,96 @@ def test_incompatible_or_failed_reset_rolls_back(tmp_path, mutation):
         assert list(db.iterdump()) == before
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "CREATE TRIGGER collateral AFTER DELETE ON peer_grants BEGIN DELETE FROM unrelated; END;",
+        "CREATE TRIGGER collateral AFTER UPDATE ON peer_settings BEGIN DELETE FROM unrelated; END;",
+        "CREATE TRIGGER collateral AFTER UPDATE ON peers BEGIN DELETE FROM unrelated; END;",
+        "DELETE FROM peer_settings; CREATE TRIGGER collateral AFTER INSERT ON peer_settings "
+        "BEGIN DELETE FROM unrelated; END;",
+        *[
+            "DROP TABLE peer_tasks; CREATE UNIQUE INDEX peer_epoch ON peers(peer_id,epoch); "
+            "CREATE TABLE peer_tasks(peer_id TEXT,epoch TEXT,status TEXT, "
+            "FOREIGN KEY(peer_id,epoch) REFERENCES peers(peer_id,epoch) ON UPDATE "
+            + action
+            + "); INSERT INTO peer_tasks VALUES('muse','old-epoch','running');"
+            for action in ("CASCADE", "SET NULL", "SET DEFAULT")
+        ],
+        *[
+            "CREATE UNIQUE INDEX grant_key ON peer_grants(peer_id,capability); "
+            "CREATE TABLE grant_child(peer_id TEXT,capability TEXT, "
+            "FOREIGN KEY(peer_id,capability) REFERENCES peer_grants(peer_id,capability) "
+            "ON DELETE "
+            + action
+            + "); INSERT INTO grant_child VALUES('muse','task');"
+            for action in ("CASCADE", "SET NULL", "SET DEFAULT")
+        ],
+    ],
+)
+def test_collateral_effects_refuse_without_changing_any_rows(tmp_path, mutation):
+    path = _seed(
+        tmp_path / "candidate.db",
+        SCHEMA + "CREATE TABLE unrelated(value INTEGER UNIQUE); "
+        "INSERT INTO unrelated VALUES(42);" + mutation,
+    )
+    with sqlite3.connect(path) as db:
+        before = list(db.iterdump())
+    with pytest.raises(sqlite3.DatabaseError):
+        reset_peer_authority(path)
+    with sqlite3.connect(path) as db:
+        assert list(db.iterdump()) == before
+
+
+@pytest.mark.parametrize(
+    "table,columns", [("peer_settings", "id,mode"), ("peers", "peer_id,epoch,revision"),
+                      ("peer_grants", "peer_id,capability,decision")],
+)
+def test_required_virtual_tables_are_refused(tmp_path, table, columns):
+    path = _seed(
+        tmp_path / "candidate.db",
+        SCHEMA + f"DROP TABLE {table}; CREATE VIRTUAL TABLE {table} USING fts5({columns});",
+    )
+    with sqlite3.connect(path) as db:
+        before = list(db.iterdump())
+    with pytest.raises(RestoreAuthorityError):
+        reset_peer_authority(path)
+    with sqlite3.connect(path) as db:
+        assert list(db.iterdump()) == before
+
+
+def test_unrelated_triggers_and_foreign_keys_remain_compatible(tmp_path):
+    path = _seed(
+        tmp_path / "candidate.db", SCHEMA + "CREATE TABLE unrelated(value INTEGER PRIMARY KEY);"
+        "INSERT INTO unrelated VALUES(42);"
+        "CREATE TABLE child(value INTEGER REFERENCES unrelated(value) ON DELETE CASCADE);"
+        "INSERT INTO child VALUES(42);"
+        "CREATE TRIGGER unrelated_only AFTER DELETE ON unrelated "
+        "BEGIN INSERT INTO unrelated VALUES(43); END;"
+        "CREATE VIRTUAL TABLE search USING fts5(content);"
+        "INSERT INTO search VALUES('preserved fixture');",
+    )
+    assert reset_peer_authority(path)
+    _assert_reset(path)
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT value FROM child").fetchall() == [(42,)]
+        assert db.execute("SELECT value FROM unrelated").fetchall() == [(42,)]
+        assert db.execute("SELECT count(*) FROM search WHERE search MATCH 'preserved'").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("name", ["peers", "peer_settings", "peer_grants"])
+def test_unrelated_trigger_name_cannot_hide_a_required_table(tmp_path, name):
+    path = _seed(
+        tmp_path / "candidate.db", SCHEMA
+        + "CREATE TABLE history(value INTEGER); INSERT INTO history VALUES(42);"
+        + f"CREATE TRIGGER {name} AFTER DELETE ON history BEGIN DELETE FROM history; END;",
+    )
+    assert reset_peer_authority(path)
+    _assert_reset(path)
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT value FROM history").fetchall() == [(42,)]
+
+
 def test_wal_candidate_becomes_self_contained(tmp_path):
     path = _seed(tmp_path / "candidate.db")
     with sqlite3.connect(path) as db:

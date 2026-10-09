@@ -2607,6 +2607,12 @@ verified: 4117f6ed 2026-10-05
   remains a review obligation. Human approval binds the exact corpus and policy;
   receipts do not authenticate
   reviewers or calibrate confidence. See `docs/reference/qualification-references.md`.
+  Corpus validation registers rubric/J9/novelty versions and class floors;
+  standalone adapters run production relevance and novelty judgments with
+  synthetic routers or caller-provided transport. Novelty uses disposable
+  full-schema SQLite fixtures and observes the actual rendered candidate IDs.
+  Full preflight, storage replay and execution/reporting orchestration land later.
+  See `docs/reference/qualification-corpus.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
@@ -3310,6 +3316,8 @@ verified: ba9dd8a37 2026-10-09
   encrypted `scripts/backup.sh` timer). `db/crud/peer_restore.py` resets peer
   permissions in staged backup restores and update's pre-migration rollback
   candidate: disabled mode, empty grants, renewed epochs; no credential reads.
+  A connection-local SQLite authorizer refuses trigger/view execution and writes
+  beyond those reset targets; required peer tables must be ordinary tables.
   Guardian snapshot rollback instead warns at its existing action-approval gate
   that approval explicitly reauthorizes saved peers.
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
