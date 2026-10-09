@@ -1147,10 +1147,11 @@ jobs:
         # (checkout-lock shell and Python tests, invoker +8, child_env +1,
         # deploy/update/candidate lock and rollback tests); no added skips.
         # Floor: 25004 + 36 = 25040.
-        # Shared policy +2 and parser/core +352, measured against main.
-        # Preserve current floor: 25040 + 2 + 352 = 25394; ceiling stays 102.
-        # Catalog/store measured net+390; preserve inherited floor25394.
-        # Supervised execution measured net+223; preserve inherited floor25784.
-        # Native systemd controls have conditional availability skips; ceiling unchanged.
-        # Installer guard measured17 versus main5: net+12; 26007+12=26019.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 26019
+        #
+        # Corpus/adapters replacement (#3071): +130 collected tests, measured with
+        # --collect-only against main's versions of the changed test files
+        # (test_qualification +78, test_qualification_references +24,
+        # test_qualification_rework +28); no added skips.
+        # Floor: 25040 + 130 = 25170.
+        # Installer17 versus main5: net+12; actual execution parent26137+12=26149.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 26149
