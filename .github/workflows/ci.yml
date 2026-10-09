@@ -1135,9 +1135,24 @@ jobs:
         # On top of the reference-admission floor above, measured by
         # --collect-only against main's versions of both files:
         # 24883 + 76 + 3 = 24962.
-        # Corpus/adapters replacement:89 additional cases; no added skips.
-        # Integrated main floor24962 +89 +26 review regressions =25077.
-        # Pinned transport:42 original pinned +15 rework +149 evidence cases.
-        # Documented routing metadata adds44 cases; no added skips.
-        # Integrated parent floor25077 +206 +44 =25327.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25327
+        #
+        # Crash recovery (#2632), measured with --collect-only against main's
+        # versions of the changed test files: test_bootstrap_guards.py 29 -> 69
+        # (+40), test_deploy_candidates_drop_status.py 68 -> 69 (+1),
+        # test_deploy_checkout.py 51 -> 52 (+1); the others are unchanged.
+        # No added skips. Floor: 24962 + 42 = 25004; skip ceiling remains 102.
+        #
+        # Checkout mutation fence (#2870): +36 collected tests, measured with
+        # --collect-only against main's versions of the changed test files
+        # (checkout-lock shell and Python tests, invoker +8, child_env +1,
+        # deploy/update/candidate lock and rollback tests); no added skips.
+        # Floor: 25004 + 36 = 25040.
+        #
+        # Corpus/adapters replacement (#3071): +130 collected tests, measured with
+        # --collect-only against main's versions of the changed test files
+        # (test_qualification +78, test_qualification_references +24,
+        # test_qualification_rework +28); no added skips.
+        # Floor: 25040 + 130 = 25170.
+        # Merged-parent hosted JUnit:40396 collected,97 skips; checkout tree matches main.
+        # Transport delta:42 pinned +15 rework +149 evidence +44 routing metadata =250.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 40646

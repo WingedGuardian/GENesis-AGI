@@ -176,9 +176,9 @@ async def test_excluded_identical_candidate_does_not_collide(tmp_path, flag):
     original = contracts.extractor._row_get
     probe = contracts.Probe()
     async with contracts.Sandbox(tmp_path) as sandbox:
-        await contracts.novelty(case, probe, sandbox)
+        result = await contracts.novelty(case, probe, sandbox)
     assert contracts.extractor._row_get is original
-    assert probe.candidate_ids == ["candidate-b", "candidate-a"]
+    assert result["candidate_ids"] == ["candidate-b", "candidate-a"]
 
 
 @pytest.mark.parametrize("population", [11, 501])
@@ -195,10 +195,10 @@ async def test_unselected_identical_candidate_does_not_collide(tmp_path, populat
         case["existing"].append(clone)
     probe = contracts.Probe()
     async with contracts.Sandbox(tmp_path) as sandbox:
-        await contracts.novelty(case, probe, sandbox)
-    assert len(probe.candidate_ids) == 10
-    assert probe.candidate_ids[0] == "candidate-b"
-    assert f"population-{population - 1}" not in probe.candidate_ids
+        result = await contracts.novelty(case, probe, sandbox)
+    assert len(result["candidate_ids"]) == 10
+    assert result["candidate_ids"][0] == "candidate-b"
+    assert f"population-{population - 1}" not in result["candidate_ids"]
 
 
 async def test_candidate_observer_restored_after_cancellation(tmp_path, monkeypatch):
@@ -228,7 +228,9 @@ async def test_nonfinite_j9_answers_are_errors(value):
 def test_legal_unicode_in_jsonl_is_preserved(tmp_path, separator):
     case = relevance_case("synthetic", True)
     case["query"] += separator + "second part"
-    (tmp_path / f"{corpus.RELEVANCE}.jsonl").write_text(json.dumps(case, ensure_ascii=False) + "\n")
+    (tmp_path / f"{corpus.RELEVANCE}.jsonl").write_text(
+        json.dumps(case, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
     assert corpus.load(tmp_path)[corpus.RELEVANCE][0]["query"] == case["query"]
 
 

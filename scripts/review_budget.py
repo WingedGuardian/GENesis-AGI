@@ -111,6 +111,7 @@ HOOK_SURFACE_FILES = frozenset(
         "scripts/review_state.py",
         "scripts/review_budget.py",
         "scripts/review_findings.py",
+        "scripts/review_reflection.py",
         "scripts/review_deadline.py",
         "scripts/external_review.py",
         "scripts/lib/gate_menu.py",
@@ -168,9 +169,7 @@ def _parse_external_identity_scalar(raw: str) -> object:
     if raw.startswith('"'):
         value, end = json.JSONDecoder().raw_decode(raw)
         suffix = raw[end:]
-        if suffix.strip() and (
-            not suffix[:1].isspace() or not suffix.lstrip().startswith("#")
-        ):
+        if suffix.strip() and (not suffix[:1].isspace() or not suffix.lstrip().startswith("#")):
             raise ValueError("unexpected content after quoted scalar")
         return value
     if raw.startswith("'"):
@@ -236,7 +235,6 @@ def confirmation_marker(head: str) -> str:
     return CONFIRMATION_MARKER_TEMPLATE.format(head=normalized)
 
 
-
 class _BudgetExhausted(Exception):
     """The aggregate lookup budget ran out before this call could be issued."""
 
@@ -263,6 +261,8 @@ def _unknown(*errors: str, current_head: str = "") -> dict[str, Any]:
         "strongly_discouraged": True,
         "open_keys": [],
         "reflection_keys": "unknown",
+        "body": None,
+        "body_changed": False,
         "reviewers_reported": [],
         "expected_reviewers": [],
         "errors": [e for e in errors if e],
@@ -700,10 +700,10 @@ def evaluate_evidence(
     else:
         round_state = "complete"
 
-    # What a round reflection must answer for. NOTHING READS THESE YET: the
-    # reflection tool and the commit-gate check that consume them are later PRs
-    # of the same series, so until then they are reported, never enforced. The
-    # newest round only, and only while it is open. NOT attached: a review
+    # What a round reflection must answer for, read by review_reflection.status
+    # (and by the commit gate once it enforces reflections; until then they are
+    # reported, never enforced). The newest round only, and only while it is
+    # open. NOT attached (a later PR owes them separately): a review
     # submitted on an earlier head after the fix was pushed stays on that head,
     # so it is never owed here.
     seen: dict[str, None] = {}  # ordered and linear, however many keys arrive
@@ -837,7 +837,7 @@ def _graphql_query(names: Sequence[str]) -> str:
     return (
         f"query($owner: String!, $name: String!, $number: Int!{params}) "
         "{ repository(owner: $owner, name: $name) { pullRequest(number: $number) "
-        f"{{ headRefOid {fields} }} }} }}"
+        f"{{ headRefOid body {fields} }} }} }}"
     )
 
 
@@ -1073,13 +1073,16 @@ def _evaluate_pr_inner(
         old path hit it was not counted (a same-day run under the budget saw 0
         of 70, an earlier one showed a p90 above it).
 
-        Every page re-reads ``headRefOid``; a head that moves between pages is
-        the same race the final head read below exists to catch.
+        Every page re-reads ``headRefOid`` and the PR body; a head that moves
+        between pages is the same race the final head read below exists to
+        catch, and a body that moves is reported as ``body_moved``.
         """
         rows: dict[str, list[dict[str, Any]]] = {item: [] for item in names}
         cursors: dict[str, str] = {}
         pending = list(names)
         head: str | None = None
+        body: str | None = None
+        body_moved = False
         path_changed = False
         read = Deadline.after(_GRAPHQL_READ_SECONDS, monotonic=monotonic)
         for _page in range(_GRAPHQL_MAX_PAGES):
@@ -1124,6 +1127,14 @@ def _evaluate_pr_inner(
             page_head = data.get("headRefOid")
             if not isinstance(page_head, str):
                 return None, "graphql_malformed"
+            # The body is compared on every page, as the head is: an edit seen
+            # on a later page of this read must not be lost.
+            page_body = data.get("body")
+            if isinstance(page_body, str):
+                if body is None:
+                    body = page_body
+                elif page_body != body:
+                    body_moved = True
             if head is None:
                 head = page_head
             elif page_head != head:
@@ -1154,7 +1165,16 @@ def _evaluate_pr_inner(
                     cursors[item] = cursor
                     following.append(item)
             if not following:
-                return {"head": head, "path_changed": path_changed, **rows}, None
+                return (
+                    {
+                        "head": head,
+                        "body": body,
+                        "body_moved": body_moved,
+                        "path_changed": path_changed,
+                        **rows,
+                    },
+                    None,
+                )
             pending = following
         return None, f"{pending[0]}_response_truncated"
 
@@ -1255,7 +1275,7 @@ def _evaluate_pr_inner(
             return _unknown("commits_malformed", current_head=test_head)
         commit_heads.append(sha)
 
-    return evaluate_evidence(
+    result = evaluate_evidence(
         current_head=test_head,
         commit_heads=commit_heads,
         reviews=fetched["reviews"],
@@ -1264,6 +1284,19 @@ def _evaluate_pr_inner(
         external_identity_templates=external_identity_templates,
         primary_login=primary_login,
     )
+    # The PR body, for the reflection's acceptance points. It is not evidence
+    # the count rests on, so a body edited between the two reads leaves the
+    # count standing; but acceptance must bind the body as it now is, so the
+    # final read's body is the one returned, and two reads that disagree return
+    # no body and say so (``body_changed``), for the reader to refuse rather
+    # than check acceptance against either.
+    reads = [s for s in (first, second) if s is not None]
+    bodies = [s.get("body") for s in reads]
+    result["body_changed"] = any(s.get("body_moved") for s in reads) or (
+        len(bodies) == 2 and bodies[0] != bodies[1]
+    )
+    result["body"] = None if result["body_changed"] or not bodies else bodies[-1]
+    return result
 
 
 def evaluate_pr(*args: Any, **kwargs: Any) -> dict[str, Any]:

@@ -190,10 +190,13 @@ async def test_production_adapter_delegate_billing_and_offline_replay(
         if kind == "judge":
             assert not json.loads(measured[2]).get("error")
         else:
-            assert measured == {
+            expected = {
                 "prediction": True if kind == "relevance" else "candidate-b",
                 "error": None,
             }
+            if kind == "novelty":
+                expected["candidate_ids"] = ["candidate-b", "candidate-a"]
+            assert measured == expected
     monkeypatch.delenv(pinned.KEY_ENV)
     with campaign:
         target = pinned.PinnedRouter(
