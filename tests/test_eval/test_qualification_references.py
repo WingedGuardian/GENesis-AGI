@@ -6,8 +6,12 @@ from pathlib import Path
 import pytest
 import yaml
 
-from genesis.eval.qualification import references
+from genesis.eval.calibration import _validate_references
+from genesis.eval.qualification import corpus, references
 from genesis.eval.qualification.evidence import Incomplete, digest
+from genesis.eval.rubrics import get_rubric
+from tests.test_eval.qualification_fixtures import small_corpus as full_corpus
+from tests.test_eval.qualification_fixtures import write_corpus
 from tests.test_eval.qualification_reference_fixtures import (
     NOVELTY,
     RELEVANCE,
@@ -543,3 +547,100 @@ def test_feedback_actor_summary_keeps_label_and_feedback_sources_separate():
     assert result["feedback_sources"] == {references.FRONTIER: 14}
     next(iter(cases.values()))[0]["reference_review"].pop("label_source")
     assert references.summary(cases, guidance)["feedback_sources"]["unknown"] == 1
+
+
+def test_default_human_validator_remains_strict(tmp_path):
+    guidance, cases = mixed()
+    name = next(iter(cases))
+    with pytest.raises((ValueError, KeyError)):
+        _validate_references(cases[name], get_rubric(name))
+    with pytest.raises(Incomplete):
+        corpus.load(write_corpus(tmp_path / "legacy", cases))
+    loaded = corpus.load(tmp_path / "legacy", reference_policy=guidance)
+    assert corpus.counts(loaded) == corpus.counts(full_corpus(novelty=False))
+    assert references.summary(loaded, guidance)["sources"] == {"human": 7, references.FRONTIER: 7}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"confidence_percent": 89},
+        {"confidence_percent": True},
+        {"confidence_percent": "99"},
+        {"confidence_percent": 90.0},
+        {"confidence_percent": 101},
+        {"confidence_percent": -1},
+        {"confidence_percent": 99, "uncertainties": ["Source provenance missing"]},
+        {"confidence_percent": 100, "evidence_complete": False},
+        {"uncertainties": None},
+        {"evidence": ""},
+        {"rationale": ""},
+        {"model_identity_evidence": ""},
+        {"model_id": "unapproved"},
+    ],
+)
+def test_confidence_cannot_override_uncertainty_or_missing_evidence(change):
+    guidance, cases = mixed()
+    name = next(iter(cases))
+    case = cases[name][0]
+    case["reference_provenance"].update(change)
+    receipt(name, case, guidance)
+    with pytest.raises(Incomplete):
+        corpus.validate(name, cases[name], reference_policy=guidance)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda c: c.update(actual="Changed input"),
+        lambda c: c.update(reference_passed=True),
+        lambda c: c["reference_provenance"].update(confidence_percent=99),
+        lambda c: c["reference_review"].update(feedback_applicability={}),
+        lambda c: c["reference_review"]["feedback_applicability"]["when"].update(reason=""),
+    ],
+)
+def test_input_decision_and_applicability_receipts_are_bound(mutate):
+    guidance, cases = mixed()
+    name = next(iter(cases))
+    mutate(cases[name][0])
+    with pytest.raises(Incomplete):
+        corpus.validate(name, cases[name], reference_policy=guidance)
+
+
+def test_duplicate_questions_rejected_across_human_and_frontier_sources():
+    guidance, cases = mixed()
+    name = next(iter(cases))
+    cases[name][1]["actual"] = cases[name][0]["actual"]
+    receipt(name, cases[name][1], guidance)
+    with pytest.raises(Incomplete, match="duplicate grading question"):
+        corpus.validate(name, cases[name], reference_policy=guidance)
+
+
+@pytest.mark.parametrize("provenance", [None, [], "human"])
+def test_legacy_malformed_provenance_remains_structured_incomplete(provenance):
+    cases = full_corpus(novelty=False)
+    name = next(iter(cases))
+    cases[name][0]["reference_provenance"] = provenance
+    with pytest.raises(Incomplete):
+        corpus.validate(name, cases[name])
+
+
+def test_novelty_mixed_source_requires_real_target_and_keeps_history():
+    guidance = policy()
+    cases = full_corpus()[corpus.NOVELTY]
+    case = cases[0]
+    template = mixed()[1][corpus.RELEVANCE][0]["reference_provenance"]
+    case["reference_provenance"] = {
+        **copy.deepcopy(template),
+        "rubric_version": corpus.versions()[corpus.NOVELTY],
+    }
+    case["reference_history"] = [{"label_source": "human", "judgment": "ambiguous"}]
+    for row in cases:
+        receipt(corpus.NOVELTY, row, guidance)
+    corpus.validate(corpus.NOVELTY, cases, reference_policy=guidance)
+    assert corpus.expected(corpus.NOVELTY, case) is None
+    assert case["reference_history"][0]["judgment"] == "ambiguous"
+    case["expected_target"] = "missing-candidate"
+    receipt(corpus.NOVELTY, case, guidance)
+    with pytest.raises(Incomplete, match="invalid novelty reference target"):
+        corpus.validate(corpus.NOVELTY, cases, reference_policy=guidance)
