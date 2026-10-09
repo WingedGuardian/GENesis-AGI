@@ -2458,9 +2458,13 @@ verified: 7ec594c72 2026-10-09
   extracts physical records, preserves unresolved identity and usage, and
   applies the shared credential scrubber to structured content. Schema5 records
   distinguish executor identity from delegation evidence. This development
-  candidate adds the parser and optional DuckDB/Parquet dependencies; storage,
-  queries, CLI, scheduling and encrypted recovery arrive in dependent changes.
-  It does not describe a deployed capability.
+  candidate also adds immutable per-source Parquet generations selected by an
+  atomic, validated catalog; readers and generation collection share publication
+  locks. DuckDB exposes separate executor, delegation and context views with
+  explicit coverage denominators, while private connection-owned spill storage
+  protects query intermediates. These are local library APIs: CLI, scheduling
+  and encrypted recovery arrive in dependent changes. Collection is not activated
+  by this change, and this map does not describe a deployed capability.
 
 - **The graders are TOLD the response status; they must never infer it.** The
   triage/outcome/delta graders each judge an `InteractionSummary`, and the
