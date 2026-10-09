@@ -43,6 +43,32 @@ def test_invalid_config_does_not_collect(monkeypatch):
     assert cli.main(["ingest"]) == 2
 
 
+@pytest.mark.parametrize("missing", [("duckdb",), ("pyarrow",), ("duckdb", "pyarrow"), ()])
+def test_dependency_guidance_matches_actual_extra_installation(monkeypatch, capsys, tmp_path, missing):
+    import importlib.util
+    from unittest.mock import Mock
+
+    from genesis.transcript_analytics import resources
+
+    monkeypatch.setattr(config, "load", lambda: config.Config(enabled=True, data_dir=tmp_path))
+    real_find = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None if name in missing else real_find(name))
+    admission = Mock(return_value=75)
+    monkeypatch.setattr(resources, "ensure_capped", admission)
+    result = cli.main(["ingest"])
+    if missing:
+        assert result == 2
+        admission.assert_not_called()
+        report = json.loads(capsys.readouterr().out)
+        assert report["unavailable"] == list(missing)
+        assert "transcript-analytics" in report["action"]
+        assert "docs/reference/transcript-analytics.md" in report["action"]
+        assert "bootstrap" not in report["action"]
+    else:
+        assert result == 75
+        admission.assert_called_once()
+
+
 def test_ingest_returns_deferred_when_snapshot_lock_busy(tmp_path, monkeypatch, capsys):
     import argparse
 

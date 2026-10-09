@@ -7,7 +7,7 @@ import os
 
 import pytest
 
-from genesis.transcript_analytics import catalog, derive, query, store
+from genesis.transcript_analytics import catalog, derive, locks, query, store, verify
 
 SID = "11111111-2222-3333-4444-555555555555"
 
@@ -92,6 +92,90 @@ def test_snapshot_equals_live_views(built):
         a = snap.sql(f"select {cols} from {v} order by all").fetchall()
         b = live.sql(f"select {cols} from {v} order by all").fetchall()
         assert a == b, v
+
+
+@pytest.mark.parametrize("failure", [None, "snapshot-connect", "snapshot-digest", "live-connect", "live-digest"])
+def test_verify_uses_one_engine_and_retains_both_locks(built, monkeypatch, tmp_path, failure):
+    import fcntl
+
+    _, data, _ = built
+    derive.build(data)
+    monkeypatch.setattr(store, "DEFAULT_LOCK", tmp_path / "writer.lock")
+    monkeypatch.setattr(locks, "PUBLICATION_LOCK", tmp_path / "publication.lock")
+    real_connect, real_digest = query.connect, verify._digest
+    active, phases, selections = [], [], []
+
+    def probe_locks():
+        for path in (store.DEFAULT_LOCK, locks.PUBLICATION_LOCK):
+            with path.open("a") as handle, pytest.raises(BlockingIOError):
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    class Tracked:
+        def __init__(self, con, phase):
+            self.con, self.phase = con, phase
+
+        def execute(self, *args):
+            probe_locks()
+            if failure == self.phase + "-digest":
+                raise RuntimeError("injected digest failure")
+            return self.con.execute(*args)
+
+        def close(self):
+            self.con.close()
+            active.remove(self)
+
+    def connect(*args, **kwargs):
+        probe_locks()
+        phase = "live" if kwargs.get("live") else "snapshot"
+        phases.append(phase)
+        selections.append(kwargs["selected"])
+        assert not active, "verification opened two engines at once"
+        if failure == phase + "-connect":
+            raise RuntimeError("injected connect failure")
+        tracked = Tracked(real_connect(*args, **kwargs), phase)
+        active.append(tracked)
+        return tracked
+
+    def digest(*args):
+        probe_locks()
+        return real_digest(*args)
+
+    def reporting_locked(fn):
+        def checked(*args, **kwargs):
+            probe_locks()
+            assert not active, "verification retained an engine during reporting"
+            return fn(*args, **kwargs)
+        return checked
+
+    monkeypatch.setattr(query, "connect", connect)
+    monkeypatch.setattr(verify, "_digest", digest)
+    monkeypatch.setattr(store, "compatible_sources", reporting_locked(store.compatible_sources))
+    monkeypatch.setattr(query, "derived_current", reporting_locked(query.derived_current))
+    if failure:
+        with pytest.raises(RuntimeError):
+            verify.verify(data)
+    else:
+        result = verify.verify(data)
+        assert result["ok"] and result["snapshot_current"]
+        assert set(result["views"]) == set(query._DERIVED)
+        assert all(item["snapshot"] == item["live"] for item in result["views"].values())
+        assert phases == ["snapshot", "live"]
+    assert not active
+    assert all(selected is selections[0] for selected in selections)
+    for path in (store.DEFAULT_LOCK, locks.PUBLICATION_LOCK):
+        with path.open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_verify_reports_real_snapshot_live_mismatch(built):
+    projects, data, source = built
+    derive.build(data)
+    with source.open("a") as handle:
+        handle.write(json.dumps(_asst("later", "2026-10-01T00:00:09Z", 99)) + "\n")
+    store.ingest(projects, data)
+    result = verify.verify(data)
+    assert not result["ok"] and not result["snapshot_current"]
+    assert result["views"]["turns"]["snapshot"] != result["views"]["turns"]["live"]
 
 
 def test_stale_views_version_falls_back_to_live(built, monkeypatch):

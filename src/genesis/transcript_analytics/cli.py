@@ -395,7 +395,10 @@ def run(args, argv=None):
                 {
                     "enabled": True,
                     "unavailable": missing,
-                    "action": "run the normal update/bootstrap to install the transcript-analytics extra",
+                    "action": (
+                        "install the transcript-analytics package extra in your development "
+                        "environment; see docs/reference/transcript-analytics.md"
+                    ),
                 }
             )
         )

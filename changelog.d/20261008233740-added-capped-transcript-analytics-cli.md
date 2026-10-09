@@ -1,1 +1,1 @@
-- Add opt-in transcript analytics commands with enforced resource scopes, durable ownership registration and cooperative cancellation.
+- Add opt-in transcript analytics commands with enforced resource scopes, durable ownership registration and cooperative cancellation. The kill switch preserves configured paths, unusably small RAM caps are refused, and snapshot/live verification uses one engine at a time.

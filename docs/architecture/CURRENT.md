@@ -2466,7 +2466,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 041a01360 2026-10-09
+verified: 85652265c 2026-10-09
 ```
 
 - **transcript_analytics/**: optional local transcript parser library. It
@@ -2481,6 +2481,9 @@ verified: 041a01360 2026-10-09
   status, SQL, prune and verify through an enforced, registered systemd scope,
   with cooperative first cancellation and explicit second-cancellation force.
   Uncapped launches are refused; the default configuration remains disabled.
+  The environment kill switch preserves validated configured paths; admission
+  refuses explicit or computed caps below the shared launcher minimum.
+  Snapshot/live verification retains both locks while using one engine at a time.
   Evidence retrieval, installed scheduling and encrypted recovery arrive in
   dependent changes. This map does not describe a deployed capability.
 

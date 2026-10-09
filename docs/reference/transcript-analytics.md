@@ -16,7 +16,12 @@ enabled: true
 The canonical `config/transcript_analytics.yaml` must remain installed.
 `GENESIS_TRANSCRIPT_ANALYTICS_DISABLED=1` or a `DISABLED` file in the configured
 data directory stops collection without rewriting the persistent opt-in.
+The environment kill switch preserves configured paths and resource settings;
+the canonical configuration and private overlay must still validate.
 Resource admission can defer work with exit75; unavailable enforcement exits69.
+Explicit RAM caps must meet the shared 16 MiB launcher minimum. A percentage
+that computes a smaller cap is refused with exit69 rather than increased.
+This startup minimum does not guarantee that a given analytics workload fits.
 Heavy commands require an enforced, registered systemd scope with a one-hour
 runtime limit. Uncapped launches are refused. First cancellation requests
 cooperative shutdown; a second cancellation forcibly stops the owned scope.
@@ -52,7 +57,9 @@ delegation and context views keep unresolved attribution and explicit coverage
 denominators. See [attribution](transcript-analytics-attribution.md).
 
 `verify` compares sorted rows and hashes across snapshot and live views. It
-checks internal consistency; independent parser fixtures specify expected
+closes the snapshot engine before opening the live engine, retaining the writer
+and publication locks and the same selected catalog across both phases.
+It checks internal consistency; independent parser fixtures specify expected
 deduplication, error classes and final token usage. Schema5 and views version16
 require re-extraction or rebuilding when older material is incompatible.
 Evidence retrieval and encrypted backup/recovery arrive in dependent changes.

@@ -23,12 +23,11 @@ def verify(data):
         selected = catalog.load(data)
         if not query.snapshot_compatible(data):
             return {"ok": False, "unavailable": "no compatible snapshot; run derive"}
-        with (
-            contextlib.closing(query.connect(data, selected=selected)) as snap,
-            contextlib.closing(query.connect(data, live=True, selected=selected)) as live,
-        ):
+        with contextlib.closing(query.connect(data, selected=selected)) as snap:
+            snapshots = {v: _digest(snap, v) for v in query._DERIVED}
+        with contextlib.closing(query.connect(data, live=True, selected=selected)) as live:
             comparisons = {
-                v: {"snapshot": _digest(snap, v), "live": _digest(live, v)} for v in query._DERIVED
+                v: {"snapshot": snapshots[v], "live": _digest(live, v)} for v in query._DERIVED
             }
         keys, excluded = store.compatible_sources(data, selected)
         return {

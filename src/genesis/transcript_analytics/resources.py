@@ -162,6 +162,14 @@ def _admit(argv, cfg):
             )
             return 69
         ram = cfg.ram_bytes or max(1, int(snap.memory.total * cfg.ram_pct / 100))
+        from genesis.hostmetrics.run import MIN_RAM
+
+        if ram < MIN_RAM:
+            print(
+                f"transcript analytics unavailable: RAM cap must be at least {MIN_RAM} bytes",
+                file=sys.stderr,
+            )
+            return 69
         cpu = snap.cpu_capacity * cfg.cpu_pct
         result = evaluate(snap, Request("transcript analytics", ram=ram, cpu=cpu), load_levers())
         if result.verdict != "GO":
