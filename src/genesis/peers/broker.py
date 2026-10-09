@@ -62,6 +62,7 @@ class PeerBroker:
         self._revoked_segments = set()
         self._runner = None
         self._socket = None
+        self._socket_identity = None
         self._operations = {
             "task_context": (EmptyArguments, self._context, "conversation"),
             "resources_list": (EmptyArguments, self._resources, "conversation"),
@@ -120,10 +121,12 @@ class PeerBroker:
         try:
             await web.UnixSite(runner, socket).start()
             socket.chmod(0o600)
+            info = socket.lstat()
         except BaseException:
             await runner.cleanup()
             raise
         self._runner, self._socket = runner, socket
+        self._socket_identity = (info.st_dev, info.st_ino)
 
     async def issue(self, binding: PeerSessionBinding, lease_path: Path):
         if self._runner is None or not isinstance(binding, PeerSessionBinding):
@@ -343,6 +346,20 @@ class PeerBroker:
             if self._runner is not None:
                 await self._runner.cleanup()
                 self._runner = None
+            if self._socket is not None:
+                try:
+                    info = self._socket.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    if (
+                        not stat.S_ISSOCK(info.st_mode)
+                        or info.st_uid != os.getuid()
+                        or (info.st_dev, info.st_ino) != self._socket_identity
+                    ):
+                        raise ValueError("Broker socket requires reconciliation")
+                    self._socket.unlink()
+                self._socket = self._socket_identity = None
 
         _, interrupted = await _settle(closing())
         if interrupted:

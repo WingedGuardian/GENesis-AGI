@@ -11,6 +11,9 @@ The broker uses aiohttp UnixSite, not a new TCP listener. Its directory is 0700
 and socket 0600; existing socket paths require reconciliation. HTTPX connects to
 that socket with environment proxies disabled. Lease lookup precedes body
 parsing, and request bodies are bounded to 256 KiB by an accumulated cap+1 read.
+After successful drain and listener cleanup, close removes the matching created
+socket so the same private directory can be reused. A replaced entry is preserved
+and requires reconciliation; failed cleanup does not remove the socket.
 Malformed/duplicate JSON, unknown operations, extra fields and encoded bodies
 are refused with constant errors.
 Parser and transport failures also use constant responses and metadata-only
@@ -46,6 +49,8 @@ Publication returns only the generated resource ID and SHA256. Content is immuta
 scanned, limited to 256 KiB and never loaded through raw memory recall. A later grant
 cannot expand an already accepted task's snapshot. Listing discloses only snapshots
 permitted for that task; retirement and digest corruption prevent subsequent reads.
+Retirement refuses an unknown identifier; retiring an existing snapshot again is
+idempotent.
 The operator CLI is the publication surface; no peer API or facade may publish.
 
 This foundation is deliberately dark until the coordinator, approval and recovery
