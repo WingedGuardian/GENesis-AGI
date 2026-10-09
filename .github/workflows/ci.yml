@@ -1147,4 +1147,7 @@ jobs:
         # (checkout-lock shell and Python tests, invoker +8, child_env +1,
         # deploy/update/candidate lock and rollback tests); no added skips.
         # Floor: 25004 + 36 = 25040.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25040
+        # Shared credential-label prerequisite: two tests collected on 2026-10-07;
+        # test bytes unchanged. Preserve current main floor: 25040 + 2 = 25042.
+        # No new skips; ceiling stays 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25042
