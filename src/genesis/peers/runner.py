@@ -137,7 +137,7 @@ async def _abandon(runner, request, lifecycle, state, ceiling, session_id):
         )
 
 
-async def _settle(coroutine, state):
+async def _settle(coroutine, state=None):
     """Retain effect ownership through repeated cancellation; report its delivery."""
     task = asyncio.ensure_future(coroutine)
     cancelled = False
@@ -145,7 +145,9 @@ async def _settle(coroutine, state):
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
-            cancelled = state.cancelled = True
+            cancelled = True
+            if state is not None:
+                state.cancelled = True
     return task.result(), cancelled
 
 
