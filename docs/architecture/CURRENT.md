@@ -2450,9 +2450,17 @@ Self-improvement loops and the instrumentation that keeps them honest.
 
 ```yaml subsystem-map
 entry: learning-evaluation
-modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 4117f6ed 2026-10-05
+modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
+verified: 7ec594c72 2026-10-09
 ```
+
+- **transcript_analytics/**: optional local transcript parser library. It
+  extracts physical records, preserves unresolved identity and usage, and
+  applies the shared credential scrubber to structured content. Schema5 records
+  distinguish executor identity from delegation evidence. This development
+  candidate adds the parser and optional DuckDB/Parquet dependencies; storage,
+  queries, CLI, scheduling and encrypted recovery arrive in dependent changes.
+  It does not describe a deployed capability.
 
 - **The graders are TOLD the response status; they must never infer it.** The
   triage/outcome/delta graders each judge an `InteractionSummary`, and the

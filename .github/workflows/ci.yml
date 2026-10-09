@@ -716,7 +716,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test]"
+          pip install -e ".[test,transcript-analytics]"
       - name: Run tests
         # The narrator below fires on THIS step's failure, not on the job's.
         id: tests
@@ -1147,4 +1147,6 @@ jobs:
         # (checkout-lock shell and Python tests, invoker +8, child_env +1,
         # deploy/update/candidate lock and rollback tests); no added skips.
         # Floor: 25004 + 36 = 25040.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25040
+        # Shared policy +2 and parser/core +352, measured against main.
+        # Preserve current floor: 25040 + 2 + 352 = 25394; ceiling stays 102.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25394
