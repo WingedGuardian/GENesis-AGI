@@ -357,7 +357,10 @@ class Engine(Repo):
             out(f"  retiring: {b}")
 
     # ── commands ─────────────────────────────────────────────────────────
-    def cmd_list(self) -> int:
+    def cmd_list(self, as_json: bool = False) -> int:
+        if as_json:
+            out(json.dumps(self.observe(), sort_keys=True))
+            return 0
         data = self.store.load()
         if data is None:
             out(f"No deploy manifest ({self.store.path}): nothing is meant to be live.")
@@ -374,6 +377,48 @@ class Engine(Repo):
                 f"pinned at {c['verified_head'][:12]}{hooks}"
             )
         return 0
+
+    def observe(self) -> dict:
+        """`list --json`: what the manifest lists and what `live` holds, for
+        deploy health (which may not read the manifest itself). Offline and
+        read-only: no gh, no serving read, no lock. A manifest naming another
+        repository is "foreign" (the predicate's `other`), not an error."""
+        try:
+            data, state, reason = self.store.load(), "ok", None
+        except manifest.ForeignManifest as exc:
+            data, state, reason = None, "foreign", str(exc)
+        except Refusal as exc:
+            data, state, reason = None, "error", str(exc)
+        if data is None and state == "ok":
+            state = "absent"
+        base = self.resolve(BASE_REF)
+        listed = [
+            {
+                "branch": c["branch"],
+                "head": c["verified_head"],
+                # Already in origin/main: no rebuild merges it, so `live` never holds it.
+                "in_base": bool(base and self.resolve(c["verified_head"]))
+                and self.is_ancestor(c["verified_head"], base),
+            }
+            for c in (data or {}).get("candidates", [])
+        ]
+        live: dict = {"tip": None, "holds": None, "reason": None}
+        try:
+            live["tip"] = self.resolve(LIVE_REF)
+            if not base:
+                live["reason"] = "origin/main does not resolve"
+            else:
+                _, held = self.live_set(base, data)
+                live["holds"] = [{"branch": b, "head": h} for b, h in held]
+        except (Refusal, Unknown) as exc:
+            live["reason"] = str(exc)
+        return {
+            "version": 1,
+            "manifest": {"state": state, "reason": reason},
+            "base": base,
+            "listed": listed,
+            "live": live,
+        }
 
     def cmd_add(
         self, branch: str, owner: str, pr: int | None, approve_hooks: str | None = None
@@ -987,7 +1032,9 @@ def _parser() -> argparse.ArgumentParser:
     d = sub.add_parser("drop")
     d.add_argument("branch")
     d.add_argument("--no-rebuild", action="store_true")
-    sub.add_parser("list")
+    ls = sub.add_parser("list")
+    # Machine-readable, for deploy health (observe()); the text form is unchanged.
+    ls.add_argument("--json", action="store_true")
     sub.add_parser("status")
     sub.add_parser("rebuild")
     return p
@@ -1019,9 +1066,10 @@ def main(
         Path(root) if root else Path(__file__).resolve().parents[1], env, gh=gh, serving=serving
     )
     try:
-        engine.place(args.cmd)
+        as_json = args.cmd == "list" and args.json
+        engine.place(args.cmd, note=_err if as_json else out)
         if args.cmd == "list":
-            return engine.cmd_list()
+            return engine.cmd_list(as_json)
         if args.cmd == "status":
             return engine.cmd_status()
         if args.cmd == "add":

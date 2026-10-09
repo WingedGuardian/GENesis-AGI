@@ -632,7 +632,6 @@ async def last_success_update(db: aiosqlite.Connection | None) -> dict:
 _LIVE_REF = "refs/heads/live"
 _BASE_REF = "refs/remotes/origin/main"
 _LIVE_WORDS = {0: "live", 1: "other", 2: "unreadable"}
-_CANDIDATE_LINE = re.compile(r"^\d+\. ")
 
 
 def _run_probe(argv: list[str], timeout: float) -> tuple[int, str] | None:
@@ -674,11 +673,19 @@ def collect_live(repo: Path, *, timeout: float = _CHEAP_TIMEOUT_S) -> dict:
     ``state``: ``live`` / ``other`` / ``unreadable`` (the predicate's words; a
     probe that cannot run reads ``unreadable`` with a ``reason``), or
     ``deploying`` (not probed: a deploy moves the checkout). On ``live``,
-    ``base`` is merge-base(HEAD, origin/main), None when unreadable, and
-    ``candidate_tier2`` the tier-2 paths `live` adds over it. Off `live`, when
-    a branch `live` exists, ``candidates`` is how many the engine's ``list``
-    names (None when it could not tell). The manifest is never read here: the
-    engine is its reader. Never raises."""
+    ``base`` is merge-base(HEAD, origin/main), None when unreadable,
+    ``candidate_tier2`` the tier-2 paths `live` adds over it, and ``unbuilt`` /
+    ``unlisted`` how many candidates the manifest lists that `live` does not
+    hold, and the reverse. ``unbound``: HEAD is the branch `live` but no
+    manifest of this repository says what it should hold (``unlisted`` counts
+    what it does). Off `live`, ``candidates`` is how many listed candidates are
+    not running (None when the engine did not answer).
+
+    Every manifest and `live` fact comes from ONE engine read,
+    ``scripts/deploy_candidates list --json``; the manifest is never read here.
+    The predicate and the engine are two reads, so a rebuild landing between
+    them can mix two states for one snapshot; the next one is consistent.
+    Never raises."""
     try:
         return _collect_live(repo, timeout)
     except Exception as exc:
@@ -732,7 +739,23 @@ def _collect_live(repo: Path, timeout: float) -> dict:
     word = out.strip()
     if _LIVE_WORDS.get(rc) != word:
         return _unanswered(repo, f"the live predicate answered {word!r} (rc {rc})")
-    facts: dict = {"state": word}
+    engine = None if word == "unreadable" else _observe_engine(repo, timeout)
+    if word == "other" and _on_live_branch(repo):
+        # HEAD is the branch `live`, but the manifest is missing or names another
+        # repository, so the predicate says `other`. Candidate code is checked
+        # out: compare against the base, never HEAD, and say what `live` holds.
+        facts: dict = {"state": "unbound", "on_live_branch": True, "base": _live_base(repo)}
+        holds = (engine or {}).get("live", {}).get("holds")
+        if engine is None or holds is None:
+            return {
+                "state": "unreadable",
+                "on_live_branch": True,
+                "base": facts["base"],
+                "reason": _engine_reason(engine, "what `live` holds could not be read"),
+            }
+        facts["unlisted"] = len(holds)
+        return facts
+    facts = {"state": word}
     if word == "live":
         # On `live`, an unreadable base or tier-2 diff is "unreadable", never a
         # healthy `live`: without the base nothing can be compared, so a quiet
@@ -763,48 +786,85 @@ def _collect_live(repo: Path, timeout: float) -> dict:
                 "reason": "the update.sh-only files `live` adds over its base could not be listed",
             }
         facts["candidate_tier2"] = len([ln for ln in diff.splitlines() if ln.strip()])
-    elif word == "other":
-        rc, _, _ = _run_git(
-            repo, "rev-parse", "--verify", "-q", _LIVE_REF, timeout=_CHEAP_TIMEOUT_S
+        state = (engine or {}).get("manifest", {}).get("state")
+        holds = (engine or {}).get("live", {}).get("holds")
+        if engine is None or state != "ok" or holds is None:
+            # The predicate bound the manifest, the engine could not read it (or
+            # what `live` holds): nothing here can say whether they agree.
+            return {
+                "state": "unreadable",
+                "on_live_branch": True,
+                "base": base,
+                "reason": _engine_reason(
+                    engine, "the engine could not compare `live` with the manifest"
+                ),
+            }
+        held = {(h["branch"], h["head"]) for h in holds}
+        listed = engine["listed"]
+        facts["unbuilt"] = sum(
+            1 for c in listed if not c["in_base"] and (c["branch"], c["head"]) not in held
         )
-        # MEASURED (git 2.43): `rev-parse --verify -q` exits 1 for an absent ref,
-        # 0 for a present one, 128 when the repo is unreadable; _run_git adds -1
-        # (timeout) and -2 (exec failure). Only 1 says "no branch `live`".
-        if rc == 1:
-            facts["candidates"] = 0  # no branch `live`: nothing was ever built here
-        elif rc != 0:
+        names = {c["branch"] for c in listed}
+        facts["unlisted"] = sum(1 for h in holds if h["branch"] not in names)
+    elif word == "other":
+        if engine is None:
             facts["candidates"] = None  # unknown: carried, never read as 0
+            facts["reason"] = "the engine (deploy_candidates list --json) did not answer"
+        elif engine["manifest"]["state"] == "error":
+            # A manifest exists and is broken: the engine says so on every read.
+            return {"state": "unreadable", "reason": engine["manifest"]["reason"]}
         else:
-            got = _run_probe([str(repo / "scripts" / "deploy_candidates"), "list"], timeout)
-            facts["candidates"] = _listed_candidates(got)
+            # Absent or another repository's: nothing is meant to be live here.
+            # Already in origin/main: running on any branch, so not counted.
+            facts["candidates"] = sum(1 for c in engine["listed"] if not c["in_base"])
     return facts
 
 
-def _listed_candidates(got: tuple[int, str] | None) -> int | None:
-    """How many candidates the engine's ``list`` printed, or None when it
-    failed or printed something this does not recognise (never a silent 0)."""
+def _observe_engine(repo: Path, timeout: float) -> dict | None:
+    """The engine's ``list --json`` reading, or None when it did not answer or
+    printed something this does not recognise (never a silent empty reading)."""
+    got = _run_probe([str(repo / "scripts" / "deploy_candidates"), "list", "--json"], timeout)
     if got is None:
         return None
     rc, out = got
-    lines = [ln for ln in out.splitlines() if ln.strip()]
     if rc != 0:
-        logger.warning("deploy_health: deploy_candidates list exited %s", rc)
+        logger.warning("deploy_health: deploy_candidates list --json exited %s", rc)
         return None
-    if len(lines) == 1 and (
-        lines[0].startswith("No deploy manifest")
-        or lines[0] == "The deploy manifest lists no candidates."
-    ):
-        return 0
-    if lines and all(_CANDIDATE_LINE.match(ln) for ln in lines):
-        return len(lines)
-    logger.warning("deploy_health: unrecognised deploy_candidates list output")
-    return None
+    try:
+        data = json.loads(out)
+        ok = (
+            data["version"] == 1
+            and data["manifest"]["state"] in ("absent", "ok", "foreign", "error")
+            and all(
+                isinstance(c["branch"], str)
+                and isinstance(c["head"], str)
+                and isinstance(c["in_base"], bool)
+                for c in data["listed"]
+            )
+            and (
+                data["live"]["holds"] is None
+                or all(isinstance(h["branch"], str) for h in data["live"]["holds"])
+            )
+        )
+    except (ValueError, TypeError, KeyError):
+        ok = False
+    if not ok:
+        logger.warning("deploy_health: unrecognised deploy_candidates list --json output")
+        return None
+    return data
+
+
+def _engine_reason(engine: dict | None, default: str) -> str:
+    if engine is None:
+        return "the engine (deploy_candidates list --json) did not answer"
+    return engine["manifest"].get("reason") or engine["live"].get("reason") or default
 
 
 def live_unknown(live: dict | None) -> bool:
     """True when the reading says nothing either way about the live classes: off
     `live` with an unknown candidate count. The awareness check carries the last
-    actionable live findings over such a tick instead of resolving them."""
+    actionable live findings over the first such tick; on a second it raises
+    live_unreadable only while a live alert stands."""
     live = live or {}
     return live.get("state") == "other" and "candidates" in live and live["candidates"] is None
 
@@ -819,9 +879,14 @@ def live_findings(live: dict | None) -> list[str]:
         return ["live_unreadable"]
     if state == "other" and (live.get("candidates") or 0) > 0:
         return [f"live_off_branch:{live['candidates']}"]
+    found = []
+    if state == "live" and live.get("unbuilt"):
+        found.append(f"live_unbuilt:{live['unbuilt']}")
+    if state in ("live", "unbound") and live.get("unlisted"):
+        found.append(f"live_unlisted:{live['unlisted']}")
     if state == "live" and live.get("candidate_tier2"):
-        return [f"live_candidate_tier2:{live['candidate_tier2']}"]
-    return []
+        found.append(f"live_candidate_tier2:{live['candidate_tier2']}")
+    return found
 
 
 # Sustained-staleness thresholds (the awareness check's paging axis). A

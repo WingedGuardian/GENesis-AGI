@@ -1421,6 +1421,11 @@ _last_actionable_main_checkout: dict | None = None
 # live findings rather than resolving or raising them.
 _last_live_state: str = ""
 _last_actionable_live_findings: list[str] | None = None
+# Whether the previous tick's live reading was unknown (off `live`, the engine
+# did not answer). A second consecutive one is not carried again: it raises
+# live_unreadable while a live alert stands in the store, else nothing, so an
+# install that never uses `live` never alerts on a slow engine.
+_last_live_unknown: bool = False
 
 
 async def _check_deploy_staleness(db) -> None:
@@ -1429,7 +1434,7 @@ async def _check_deploy_staleness(db) -> None:
     Best-effort — the whole body is guarded and never raises into the tick."""
     global _last_deploy_alert_at, _last_deploy_alert_key
     global _last_main_checkout_status, _last_actionable_main_checkout
-    global _last_live_state, _last_actionable_live_findings
+    global _last_live_state, _last_actionable_live_findings, _last_live_unknown
     if db is None:
         return
     try:
@@ -1501,13 +1506,32 @@ async def _check_deploy_staleness(db) -> None:
         live_state = live.get("state") or ""
         previous_live_state = _last_live_state
         _last_live_state = live_state
-        # Not acted on: a deploy in progress, the FIRST unreadable tick, or a
-        # reading that says nothing either way (off `live` with an unknown
-        # candidate count). The last actionable live findings are carried.
-        if (
+        unknown = live_unknown(live)
+        previous_unknown = _last_live_unknown
+        _last_live_unknown = unknown
+        # Not acted on: a deploy in progress, the FIRST unreadable tick, or the
+        # FIRST reading that says nothing either way (off `live`, the engine did
+        # not answer). The last actionable live findings are carried.
+        if unknown and previous_unknown:
+            # A second unknown tick in a row: escalate from the store, not from
+            # memory (a restart clears memory several times a day). With a live
+            # alert standing it becomes live_unreadable; with none, nothing.
+            standing = False
+            for cls in sorted(_DEPLOY_LIVE_CLASSES):
+                if await observations.has_unresolved_matching(
+                    db, source="deploy_staleness_monitor", content_like=_finding_like(cls)
+                ):
+                    standing = True
+                    break
+            if not standing:
+                logger.info("deploy staleness: live reading unknown twice, no live alert stands")
+            findings = [f for f in findings if f.split(":", 1)[0] not in _DEPLOY_LIVE_CLASSES] + (
+                ["live_unreadable"] if standing else []
+            )
+        elif (
             live_state == "deploying"
             or (live_state == "unreadable" and previous_live_state != "unreadable")
-            or live_unknown(live)
+            or unknown
         ):
             carried_live = _last_actionable_live_findings
             if carried_live is None:
@@ -1650,7 +1674,15 @@ _DEPLOY_CHECKOUT_CLASSES = frozenset({"main_checkout_dirty", "main_checkout_unre
 #: Finding classes about `live`, the integration branch scripts/deploy_candidates
 #: rebuilds from the deploy manifest (deploy_health.live_findings). Their own
 #: wording, no update.sh drift paragraph, and they never page.
-_DEPLOY_LIVE_CLASSES = frozenset({"live_unreadable", "live_off_branch", "live_candidate_tier2"})
+_DEPLOY_LIVE_CLASSES = frozenset(
+    {
+        "live_unreadable",
+        "live_off_branch",
+        "live_unbuilt",
+        "live_unlisted",
+        "live_candidate_tier2",
+    }
+)
 
 
 def _deploy_drift_paragraph(snap: dict, age_days, behind, git_facts: dict) -> str:
@@ -1695,9 +1727,28 @@ def _deploy_live_paragraph(snap: dict, findings: list[str]) -> str:
         cls, _, value = f.partition(":")
         if cls == "live_unreadable":
             parts.append(
-                "Whether this install runs the `live` integration branch could not be "
-                f"read on two consecutive checks ({live.get('reason') or 'no reason given'}): "
-                "scripts/deploy_candidates list shows what the engine reads."
+                "Whether this install runs the `live` integration branch as its deploy "
+                "manifest says could not be read on two consecutive checks "
+                f"({live.get('reason') or 'no reason given'}): scripts/deploy_candidates "
+                "status shows what the engine reads."
+            )
+        elif cls == "live_unbuilt":
+            parts.append(
+                "The deploy manifest lists "
+                + ("candidates" if value == "?" else f"{value} candidate(s)")
+                + " that `live` does not hold: added since the last rebuild, or left out "
+                "of it (a conflict, a hook without approval, a failed check). "
+                "scripts/deploy_candidates status names each one and why; a rebuild "
+                "brings in the ones it can."
+            )
+        elif cls == "live_unlisted":
+            parts.append(
+                "`live` holds "
+                + ("candidates" if value == "?" else f"{value} candidate(s)")
+                + " that no deploy manifest of this repository lists (dropped without a "
+                "rebuild, or the manifest is missing), so their code is checked out with "
+                "nothing tracking it. scripts/deploy_candidates status names them; the "
+                "next rebuild removes them from `live`."
             )
         elif cls == "live_off_branch":
             parts.append(
@@ -1708,7 +1759,7 @@ def _deploy_live_paragraph(snap: dict, findings: list[str]) -> str:
                     else f"{value} candidate(s)"
                 )
                 + ", but the checkout is not "
-                "on `live`, so they are not running. To run them: scripts/deploy_candidates "
+                "on `live`, so its files do not have them. To run them: scripts/deploy_candidates "
                 "rebuild (it rebuilds `live` from the manifest and moves the checkout onto "
                 "it; a bare git switch would run whatever `live` held before), then "
                 "scripts/deploy_code_only.sh restart. To stop listing one: "

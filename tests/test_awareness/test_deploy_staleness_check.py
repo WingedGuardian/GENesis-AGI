@@ -46,6 +46,7 @@ def _reset_cooldowns(monkeypatch):
     monkeypatch.setattr(loop, "_last_actionable_main_checkout", None)
     monkeypatch.setattr(loop, "_last_live_state", "")
     monkeypatch.setattr(loop, "_last_actionable_live_findings", None)
+    monkeypatch.setattr(loop, "_last_live_unknown", False)
 
 
 def _snap(
@@ -549,6 +550,7 @@ def _restart(monkeypatch):
     monkeypatch.setattr(loop, "_last_actionable_main_checkout", None)
     monkeypatch.setattr(loop, "_last_live_state", "")
     monkeypatch.setattr(loop, "_last_actionable_live_findings", None)
+    monkeypatch.setattr(loop, "_last_live_unknown", False)
     monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
     monkeypatch.setattr(loop, "_last_deploy_alert_key", "")
 
@@ -762,3 +764,67 @@ async def test_a_carried_unknown_count_is_worded_without_a_number(db, monkeypatc
     await loop._check_deploy_staleness(db)
     [row] = await _rows(db)
     assert "lists candidates (their count was not read on this check)" in row["content"]
+
+
+_UNKNOWN_LIVE = {"state": "other", "candidates": None, "reason": "the engine did not answer"}
+
+
+async def test_a_second_unknown_live_tick_escalates_a_standing_alert(db, monkeypatch):
+    """Round-2 audit (D4): an unknown count was carried on EVERY tick, so a
+    standing alert could never escalate or clear. The first unknown tick carries;
+    the second raises live_unreadable while a live alert stands."""
+    _patch_snapshot(
+        monkeypatch, _snap(["live_off_branch:2"], live={"state": "other", "candidates": 2})
+    )
+    await loop._check_deploy_staleness(db)
+    [before] = await _rows(db)
+    _patch_snapshot(monkeypatch, _snap([], live=_UNKNOWN_LIVE))
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    await loop._check_deploy_staleness(db)
+    assert [r["id"] for r in await _rows(db)] == [before["id"]]  # carried
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    await loop._check_deploy_staleness(db)
+    [after] = await _rows(db)
+    assert "live_unreadable" in after["content"] and "live_off_branch" not in after["content"]
+
+
+async def test_repeated_unknown_live_ticks_raise_nothing_when_no_alert_stands(db, monkeypatch):
+    """An install that never uses `live` must not alert because the engine was
+    slow twice: with no live alert standing, a repeated unknown is dropped."""
+    _patch_snapshot(monkeypatch, _snap([], live=_UNKNOWN_LIVE))
+    for _ in range(3):
+        monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+        await loop._check_deploy_staleness(db)
+    assert await _rows(db) == []
+
+
+async def test_after_a_restart_a_second_unknown_tick_still_escalates(db, monkeypatch):
+    """The escalation reads the standing alert from the store, so a restart
+    between the ticks only restarts the count, never loses the alert."""
+    _patch_snapshot(monkeypatch, _snap(["live_unbuilt:1"], live={"state": "live", "unbuilt": 1}))
+    await loop._check_deploy_staleness(db)
+    _restart(monkeypatch)
+    _patch_snapshot(monkeypatch, _snap([], live=_UNKNOWN_LIVE))
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db, resolved=1) == []
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert "live_unreadable" in row["content"]
+
+
+@pytest.mark.parametrize(
+    ("finding", "text"),
+    [
+        ("live_unbuilt:2", "lists 2 candidate(s) that `live` does not hold"),
+        ("live_unlisted:1", "`live` holds 1 candidate(s) that no deploy manifest"),
+    ],
+)
+async def test_the_new_live_classes_have_their_own_wording(db, monkeypatch, finding, text):
+    _patch_snapshot(monkeypatch, _snap([finding], live={"state": "live"}))
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert text in row["content"]
+    assert "scripts/deploy_candidates status" in row["content"]
+    assert "update.sh" not in row["content"].split("`live`", 1)[0]
+    assert row["priority"] != "critical"
