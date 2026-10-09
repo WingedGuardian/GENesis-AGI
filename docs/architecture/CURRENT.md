@@ -3343,7 +3343,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: b70bf6f35 2026-10-09
+verified: 9a95483a8 2026-10-09
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -3409,11 +3409,23 @@ verified: b70bf6f35 2026-10-09
   receipts describe fixture coverage, not live production behavior. Resource
   admission uses installation policy while test children use a private home and
   the installation pytest lock. Request creation and retirement use the admitted
-  workspace patch path. Verification recording and publication operations
-  remain GROUNDWORK, and this boundary has no
-  activation wiring in the ordinary project configuration. Its dedicated
-  launcher must establish private workspace modes and umask before activation.
-  In a linked worktree the launcher sets `GENESIS_REPO_ROOT` to
+  workspace patch path. `pilot_preview` revalidates the enrolled identity,
+  receipt/case census and source/serving brackets, adds the known fixture gap,
+  and calls the existing verification CLI with literal `--dry-run`. It returns
+  bounded preview text, never records or publishes. The separate manual
+  `codex_validator_terminal.py prepare|run` entry point uses a new private
+  HOME/CODEX_HOME and umask 0077, pins the qualified CLI version and source bytes,
+  copies/checks canonical doctrine, persists/verifies native guard trust and
+  checks actual effective policy. Its initial terminal MVP starts zero Genesis
+  MCP servers; native memory, plugins, web, JS REPL, apps and delegation are
+  disabled. A separate run lock prevents concurrent sessions while finite
+  operations retain their own deployment brackets.
+  Probe governors bind Linux parent-death SIGTERM before entering the existing
+  resource CLI, with a post-arm parent check, so native hard termination of a
+  request still reaches the governor's job-stop path; unsupported binding refuses.
+  No ordinary-session activation, Genesis lifecycle registration or unattended dispatch is added.
+  Merge/deploy/activation and real pilot use require separate owner approval.
+  The ordinary external-client adapter, in a linked worktree, sets `GENESIS_REPO_ROOT` to
   the main checkout, which owns the live database and secrets. This gives Codex
   on-demand access without registering its transcript,
   creating a charter, or joining Genesis foreground/background lifecycle

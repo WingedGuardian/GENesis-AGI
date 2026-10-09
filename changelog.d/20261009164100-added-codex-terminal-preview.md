@@ -1,0 +1,1 @@
+- Add an explicitly prepared, supervised Codex terminal validator profile with no Genesis MCP and receipt-bound verification previews that always use the existing read-only dry-run CLI.

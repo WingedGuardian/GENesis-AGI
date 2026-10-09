@@ -80,6 +80,18 @@ python3 scripts/pr_verification.py close --pr <N> \
     [--verdict <what you expect>] [--park]
 ```
 
+For the separately prepared **Codex terminal dry-run MVP**, the raw commands
+above are supervisor commands, not admitted model actions. Its launcher copies
+this doctrine into the private workspace and supplies the sealed invocation.
+Use only `pilot_packet`, the enrolled fixed `pilot_probe` recipes, and
+receipt-bound `pilot_preview` requests. The preview forces read-only `--dry-run`,
+retains the fixed fixture coverage gap and derives the verdict through the
+existing CLI; it does not discharge a live obligation. Genesis MCP, recording,
+public issue filing and lifecycle tools are unavailable in this initial profile.
+The human supervisor checks all measurements/judgments and performs any actual
+recording separately. Do not turn a fixture receipt into live deployment or
+provider evidence. Setup and limits: `docs/reference/codex-validator-boundary.md`.
+
 Read back what was decided, and on what evidence, with
 
 ```bash

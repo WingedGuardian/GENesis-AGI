@@ -485,8 +485,9 @@ def test_fixed_recipe_child_environment_bounds_and_cleanup(pilot, tmp_path, monk
     separator = argv.index("--")
     assert argv[:separator] == [
         str(ROOT / ".venv/bin/python"),
-        "-m",
-        "genesis.hostmetrics",
+        "-I",
+        str(ROOT / "scripts/codex_validator_job.py"),
+        str(os.getpid()),
         "run",
         "--name",
         "codex-validator-pilot",

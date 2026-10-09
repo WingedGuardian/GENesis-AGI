@@ -2,9 +2,9 @@
 """Closed validator operations; no generic commands, SQL, plugins or lifecycle.
 
 Serving observations delegate to the existing deployment status tripwire.
-GROUNDWORK(validator-request-operations): verification preview needs its
-separately reviewed operation. Requests are retained; admitted
-workspace patches own creation and retirement after evidence capture.
+Fixed probes and receipt-bound previews never record a verification. Requests
+are retained; admitted workspace patches own creation and retirement after
+evidence capture. Activation is an explicit operator action.
 """
 
 from __future__ import annotations
@@ -59,16 +59,25 @@ def execute(request: object, *, workspace: Path | None = None) -> dict:
         keys.add("token")
     elif operation == "pilot_probe":
         keys.add("pr")
+    elif operation == "pilot_preview":
+        keys.update({"pr", "receipt", "evidence", "note", "park"})
     if set(request) != keys or operation not in {
         "protocol_probe",
         "serving_status",
         "serving_verify",
         "pilot_packet",
         "pilot_probe",
+        "pilot_preview",
     }:
         raise ValueError("Unsupported validator request")
     if operation == "protocol_probe":
         return {"version": 1, "operation": operation, "ok": True}
+    if operation == "pilot_preview":
+        if workspace is None:
+            raise ValueError("Unsupported verification workspace")
+        from codex_validator_preview import preview
+
+        return {"version": 1, "operation": operation, **preview(workspace, RUNTIME_ROOT, request)}
     if operation in {"pilot_packet", "pilot_probe"}:
         if workspace is None or (
             operation == "pilot_probe" and (type(request["pr"]) is not int or request["pr"] <= 0)
