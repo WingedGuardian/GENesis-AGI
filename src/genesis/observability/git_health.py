@@ -93,6 +93,45 @@ def _run_git(repo: Path, *args: str, timeout: float) -> tuple[int, str, str]:
         return -2, "", str(exc)
 
 
+async def _run_git_async(
+    repo: Path, *args: str, timeout: float, stdin: str | None = None, env: dict | None = None
+) -> tuple[int, str, str]:
+    """`_run_git` for the deep scan, which a service stop cancels. git runs in
+    its own process group; a timeout or a cancellation kills and reaps that group
+    (bounded), so a cancelled scan never leaves fsck running in a worker thread that
+    interpreter exit then waits on. Same returns: rc -1 on timeout, -2 when git could
+    not be started. Cancellation re-raises after the kill."""
+    from genesis.util.proc_kill import kill_process_group, reap_bounded
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            str(repo),
+            *args,
+            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            start_new_session=True,
+        )
+    except Exception as exc:  # git missing, repo path gone, etc.
+        return -2, "", str(exc)
+    try:
+        out, err = await asyncio.wait_for(
+            proc.communicate(stdin.encode() if stdin is not None else None), timeout
+        )
+    except TimeoutError:
+        kill_process_group(proc)
+        await reap_bounded(proc)
+        return -1, "", "timeout"
+    except asyncio.CancelledError:
+        kill_process_group(proc)
+        await reap_bounded(proc)
+        raise
+    return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+
 def _mount_is_readonly(path: Path, mounts_text: str | None = None) -> bool:
     """True if the filesystem containing ``path`` is mounted read-only.
 
@@ -244,11 +283,12 @@ async def check_git_deep(repo: Path | None = None) -> GitHealthReport:
     (measured: 2 of 3 live scans on 2026-10-09 did), so when every line it reports
     is a ``missing`` object and every one of those objects exists on lookup right
     after, it is recorded as a transient as well; any other line still pages. The
-    wait is an ``asyncio.sleep`` (cancellable at shutdown); only git runs in a thread.
+    wait is an ``asyncio.sleep`` and git runs as an asyncio subprocess, so a service
+    stop that cancels the scan also kills the git it started.
     """
     repo = repo or repo_root()
     details: dict = {}
-    rc, out, err = await asyncio.to_thread(_run_fsck, repo)
+    rc, out, err = await _run_fsck(repo)
     _abort_if_terminated(rc)
     if rc == -1:
         return _deep_report(["fsck_timeout"], details)
@@ -259,9 +299,9 @@ async def check_git_deep(repo: Path | None = None) -> GitHealthReport:
     if rc != 0:  # > 0: fsck found problems; < -2: fsck was killed by a signal
         first = _fsck_problem_lines(out, err)
         await _asleep(_FSCK_RECHECK_DELAY_S)
-        rc2, out2, err2 = await asyncio.to_thread(_run_fsck, repo)
+        rc2, out2, err2 = await _run_fsck(repo)
         _abort_if_terminated(rc2)
-        raced = rc2 > 0 and await asyncio.to_thread(_only_raced_missing, repo, out2, err2)
+        raced = rc2 > 0 and await _only_raced_missing(repo, out2, err2)
         if rc2 == 0 or raced:
             details["fsck_transient"] = {"rc": rc, "lines": first, "delay_s": _FSCK_RECHECK_DELAY_S}
             if raced:
@@ -292,6 +332,7 @@ async def check_git_deep(repo: Path | None = None) -> GitHealthReport:
 _FSCK_RECHECK_DELAY_S = 120
 _asleep = asyncio.sleep  # test seam
 _EVIDENCE_CHARS = 2000
+_CUT = " …(truncated)"
 
 
 def _deep_report(failures: list[str], details: dict) -> GitHealthReport:
@@ -300,7 +341,7 @@ def _deep_report(failures: list[str], details: dict) -> GitHealthReport:
     )
 
 
-def _run_fsck(repo: Path) -> tuple[int, str, str]:
+async def _run_fsck(repo: Path) -> tuple[int, str, str]:
     # --full recomputes every object's SHA-1, so it catches a zero-filled-but-
     # present loose blob (the outage pattern) that --connectivity-only would miss
     # (that flag only checks reachability, not content). Missing/corrupt objects →
@@ -321,7 +362,7 @@ def _run_fsck(repo: Path) -> tuple[int, str, str]:
     # --no-dangling only stops fsck PRINTING dangling objects (exit codes are
     # unchanged): thousands of them otherwise filled the whole evidence budget and
     # hid the real error lines (#2745).
-    return _run_git(
+    return await _run_git_async(
         repo,
         "fsck",
         "--no-progress",
@@ -356,7 +397,7 @@ _BUILT_IN_OBJECTS = frozenset(
 )
 
 
-def _only_raced_missing(repo: Path, out: str, err: str) -> bool:
+async def _only_raced_missing(repo: Path, out: str, err: str) -> bool:
     """True only if EVERY problem line is ``missing <type> <sha>`` and every such
     object exists now: fsck read a ref or index written mid-scan, after it had
     listed the objects. Any other line (``error:``, ``broken link``, hash
@@ -379,22 +420,20 @@ def _only_raced_missing(repo: Path, out: str, err: str) -> bool:
     shas = [sha for _, sha in wanted]
     if not shas or _BUILT_IN_OBJECTS.intersection(shas):
         return False
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(repo), "cat-file", "--batch-check"],
-            input="".join(f"{sha}\n" for sha in shas),
-            capture_output=True,
-            text=True,
-            timeout=_LOOKUP_TIMEOUT_S,
-            # fsck ignores replace refs; so must the lookup, or a replacement
-            # could vouch for an object that is not there.
-            env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
-        )
-    except Exception:  # timeout, git gone: unverified, so it pages
-        return False
-    _abort_if_terminated(proc.returncode)  # a stop mid-lookup is not a failure either
-    rows = proc.stdout.splitlines()
-    if proc.returncode != 0 or proc.stderr.strip() or len(rows) != len(shas):
+    rc, out_l, err_l = await _run_git_async(
+        repo,
+        "cat-file",
+        "--batch-check",
+        stdin="".join(f"{sha}\n" for sha in shas),
+        timeout=_LOOKUP_TIMEOUT_S,
+        # fsck ignores replace refs; so must the lookup, or a replacement
+        # could vouch for an object that is not there.
+        env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
+    )
+    _abort_if_terminated(rc)  # a stop mid-lookup is not a failure either
+    rows = out_l.splitlines()
+    # A timeout (-1) or git that could not start (-2): unverified, so it pages.
+    if rc != 0 or err_l.strip() or len(rows) != len(shas):
         return False
     for (kind, sha), row in zip(wanted, rows, strict=True):
         parts = row.split()
@@ -428,11 +467,19 @@ def _fsck_problem_lines(out: str, err: str) -> str:
     object paths), then stdout (``missing``/``broken link``), warnings last.
     """
     lines = _problem_lines(out, err)
+    if not lines:
+        return "(fsck printed no problem lines)"
     kept: list[str] = []
     used = 0
     for i, ln in enumerate(lines):
         if used + len(ln) + 1 > _EVIDENCE_CHARS:
-            kept.append(f"(+{len(lines) - i} more lines)")
+            if not kept:
+                # One line over the whole budget (a long ref or path): keep its
+                # head, so the evidence always names the problem.
+                kept.append(ln[: _EVIDENCE_CHARS - len(_CUT)] + _CUT)
+                i += 1
+            if i < len(lines):
+                kept.append(f"(+{len(lines) - i} more lines)")
             break
         kept.append(ln)
         used += len(ln) + 1

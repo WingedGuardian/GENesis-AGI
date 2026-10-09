@@ -2440,7 +2440,8 @@ def _dispatch_git_health_deep(db) -> None:
         return
     if _git_deep_task is not None and not _git_deep_task.done():
         # Two fsck timeouts plus the re-check wait bound a healthy run; past that
-        # the git child is unkillable (stuck in I/O) and the daily scan has stopped.
+        # the git child is stuck in uninterruptible I/O (a timeout kills any other)
+        # and the daily scan has stopped.
         started = _last_git_deep_run_at
         limit = _git_deep_stuck_s()
         stalled = started is not None and time.monotonic() - started > limit

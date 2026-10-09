@@ -15,6 +15,13 @@ import pytest
 
 from genesis.observability import git_health as g
 
+
+def _raced(repo, out, err):
+    import asyncio
+
+    return asyncio.run(g._only_raced_missing(repo, out, err))
+
+
 _needs_git = pytest.mark.skipif(
     subprocess.run(["which", "git"], capture_output=True).returncode != 0,
     reason="requires git",
@@ -154,7 +161,7 @@ class TestDeepCheck:
             text=True,
         )
         assert "dangling blob" in precondition.stdout, "precondition: a dangling object exists"
-        rc, out, err = g._run_fsck(repo)
+        rc, out, err = await g._run_fsck(repo)
         assert rc == 0
         assert "dangling" not in out + err
         rep = await g.check_git_deep(repo)
@@ -256,7 +263,7 @@ def _fsck_runs(monkeypatch, *results):
     queue = list(results)
     calls: list[Path] = []
 
-    def _fake(repo):
+    async def _fake(repo):
         calls.append(repo)
         return queue.pop(0)
 
@@ -392,22 +399,22 @@ class TestRaceLookup:
 
     def test_all_present_is_a_race(self, repo):
         sha = self._blob(repo)
-        assert g._only_raced_missing(repo, f"missing blob {sha}\n", "") is True
+        assert _raced(repo, f"missing blob {sha}\n", "") is True
 
     def test_absent_object_is_not(self, repo):
         sha = self._blob(repo)
         out = f"missing blob {sha}\nmissing blob {'1' * 40}\n"
-        assert g._only_raced_missing(repo, out, "") is False
+        assert _raced(repo, out, "") is False
 
     def test_any_other_line_is_not(self, repo):
         sha = self._blob(repo)
-        assert g._only_raced_missing(repo, f"missing blob {sha}\n", "error: bad object") is False
+        assert _raced(repo, f"missing blob {sha}\n", "error: bad object") is False
         out = f"broken link from tree {sha}\n              to blob {sha}\n"
-        assert g._only_raced_missing(repo, out, "") is False
+        assert _raced(repo, out, "") is False
 
     def test_no_lines_is_not(self, repo):
-        assert g._only_raced_missing(repo, "", "") is False
-        assert g._only_raced_missing(repo, "dangling blob abc\n", "notice: x") is False
+        assert _raced(repo, "", "") is False
+        assert _raced(repo, "dangling blob abc\n", "notice: x") is False
 
     def test_reads_past_the_evidence_cap(self, repo):
         # 200 lines (> _EVIDENCE_CHARS): the decision must use every line, so a
@@ -415,8 +422,8 @@ class TestRaceLookup:
         sha = self._blob(repo)
         out = f"missing blob {sha}\n" * 200
         assert len(out) > g._EVIDENCE_CHARS
-        assert g._only_raced_missing(repo, out, "") is True
-        assert g._only_raced_missing(repo, out + "error: corrupt\n", "") is False
+        assert _raced(repo, out, "") is True
+        assert _raced(repo, out + "error: corrupt\n", "") is False
 
     def test_zeroed_object_is_not_present(self, repo):
         TestDeepCheck._commit_file(repo)
@@ -430,17 +437,17 @@ class TestRaceLookup:
         size = obj.stat().st_size
         obj.chmod(0o644)
         obj.write_bytes(b"\x00" * size)
-        assert g._only_raced_missing(repo, f"missing blob {sha}\n", "") is False
+        assert _raced(repo, f"missing blob {sha}\n", "") is False
 
     def test_built_in_objects_never_vouch(self, repo):
         # git answers the empty tree from memory: batch-check says "tree 0" even
         # with its file deleted, so a missing one must page (found by this suite).
         empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
         assert empty_tree in g._BUILT_IN_OBJECTS
-        assert g._only_raced_missing(repo, f"missing tree {empty_tree}\n", "") is False
+        assert _raced(repo, f"missing tree {empty_tree}\n", "") is False
         for sha in g._BUILT_IN_OBJECTS:
             kind = "tree" if sha.startswith(("4b825dc", "6ef19b4")) else "blob"
-            assert g._only_raced_missing(repo, f"missing {kind} {sha}\n", "") is False
+            assert _raced(repo, f"missing {kind} {sha}\n", "") is False
 
     @pytest.mark.asyncio
     async def test_deleted_empty_tree_pages(self, repo, recheck_sleeps):
@@ -460,39 +467,42 @@ class TestRaceLookup:
         subprocess.run(
             ["git", "-C", str(repo), "update-ref", f"refs/replace/{absent}", present], check=True
         )
-        assert g._only_raced_missing(repo, f"missing blob {absent}\n", "") is False
+        assert _raced(repo, f"missing blob {absent}\n", "") is False
 
     def test_type_must_match(self, repo):
         sha = self._blob(repo)  # a blob, reported as a missing tree
-        assert g._only_raced_missing(repo, f"missing tree {sha}\n", "") is False
+        assert _raced(repo, f"missing tree {sha}\n", "") is False
 
     def test_lookup_stderr_is_not_trusted(self, repo, monkeypatch):
         # Rows that read "present" but come with stderr output (git complaining
         # while answering) are not a clean answer: page.
         sha = self._blob(repo)
-        fake = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout=f"{sha} blob 8\n", stderr="error: something odd\n"
-        )
-        monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: fake)
-        assert g._only_raced_missing(repo, f"missing blob {sha}\n", "") is False
+        async def _noisy(*a, **k):
+            return 0, f"{sha} blob 8\n", "error: something odd\n"
+
+        monkeypatch.setattr(g, "_run_git_async", _noisy)
+        assert _raced(repo, f"missing blob {sha}\n", "") is False
 
     def test_sigterm_during_lookup_aborts(self, repo, monkeypatch):
         import asyncio
 
         sha = self._blob(repo)
-        fake = subprocess.CompletedProcess(args=[], returncode=-15, stdout="", stderr="")
-        monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: fake)
+
+        async def _sigterm(*a, **k):
+            return -15, "", ""
+
+        monkeypatch.setattr(g, "_run_git_async", _sigterm)
         with pytest.raises(asyncio.CancelledError):
-            g._only_raced_missing(repo, f"missing blob {sha}\n", "")
+            _raced(repo, f"missing blob {sha}\n", "")
 
     def test_failed_lookup_is_not(self, repo, monkeypatch):
         sha = self._blob(repo)
 
-        def _boom(*a, **k):
-            raise subprocess.TimeoutExpired(cmd="git", timeout=1)
+        async def _timed_out(*a, **k):
+            return -1, "", "timeout"
 
-        monkeypatch.setattr(g.subprocess, "run", _boom)
-        assert g._only_raced_missing(repo, f"missing blob {sha}\n", "") is False
+        monkeypatch.setattr(g, "_run_git_async", _timed_out)
+        assert _raced(repo, f"missing blob {sha}\n", "") is False
 
     @pytest.mark.asyncio
     async def test_raced_recheck_reports_transient(self, repo, monkeypatch, recheck_sleeps):
@@ -677,3 +687,92 @@ class TestVerdictWriter:
         loaded = json.loads(p.read_text())
         assert set(loaded["failures"]) == {"fsck_failed", "rootfs_readonly"}
         assert loaded["ok"] is False
+
+
+class TestCancelKillsGit:
+    """Round-2 review (#3137): cancelling the scan cancelled only the asyncio side;
+    `to_thread(subprocess.run)` left git fsck running for up to 900 s, and
+    interpreter exit then waited on that worker thread."""
+
+    @staticmethod
+    def _sleep_instead_of_git(monkeypatch):
+        import asyncio
+
+        started: list = []
+        real = asyncio.create_subprocess_exec
+
+        async def _spawn(*argv, **kw):
+            proc = await real("sleep", "60", **kw)
+            started.append(proc)
+            return proc
+
+        monkeypatch.setattr(g.asyncio, "create_subprocess_exec", _spawn)
+        return started
+
+    @pytest.mark.asyncio
+    async def test_cancelling_the_scan_kills_and_reaps_fsck(self, monkeypatch, tmp_path):
+        import asyncio
+
+        from genesis.util.proc_kill import process_group_alive
+
+        started = self._sleep_instead_of_git(monkeypatch)
+        task = asyncio.ensure_future(g.check_git_deep(tmp_path))
+        for _ in range(200):
+            if started:
+                break
+            await asyncio.sleep(0.01)
+        assert started, "fsck never started"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        assert started[0].returncode is not None, "the child was not reaped"
+        assert not process_group_alive(started[0])
+
+    @pytest.mark.asyncio
+    async def test_a_timeout_kills_the_group_and_reads_as_a_timeout(self, monkeypatch, tmp_path):
+        from genesis.util.proc_kill import process_group_alive
+
+        started = self._sleep_instead_of_git(monkeypatch)
+        monkeypatch.setattr(g, "_DEEP_TIMEOUT_S", 0.2)
+        rep = await g.check_git_deep(tmp_path)
+        assert rep.failures == ["fsck_timeout"]
+        assert not process_group_alive(started[0])
+
+    @pytest.mark.asyncio
+    async def test_cancelling_the_lookup_kills_it(self, monkeypatch, tmp_path):
+        import asyncio
+
+        from genesis.util.proc_kill import process_group_alive
+
+        started = self._sleep_instead_of_git(monkeypatch)
+        sha = "a" * 40
+        task = asyncio.ensure_future(g._only_raced_missing(tmp_path, f"missing blob {sha}\n", ""))
+        for _ in range(200):
+            if started:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        assert not process_group_alive(started[0])
+
+
+class TestEvidenceNeverEmpty:
+    """Round-2 review: a first problem line over the whole budget left only a
+    "(+N more lines)" marker in the verdict and the alert."""
+
+    def test_an_oversized_first_line_keeps_its_head(self):
+        long = "error: refs/heads/" + "x" * 3000 + ": invalid sha1 pointer"
+        ev = g._fsck_problem_lines("", long)
+        assert ev.startswith("error: refs/heads/xxx") and ev.endswith(g._CUT)
+        assert len(ev) <= g._EVIDENCE_CHARS
+
+    def test_an_oversized_first_line_then_more_names_the_rest(self):
+        long = "error: " + "y" * 3000
+        ev = g._fsck_problem_lines("missing blob " + "1" * 40 + "\nmissing tree " + "2" * 40, long)
+        first, marker = ev.splitlines()
+        assert first.startswith("error: yyy") and marker == "(+2 more lines)"
+
+    def test_no_problem_lines_is_said_not_blank(self):
+        assert g._fsck_problem_lines("", "") == "(fsck printed no problem lines)"
+        assert g._fsck_problem_lines("dangling blob abc\n", "notice: x") != ""
