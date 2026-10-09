@@ -358,3 +358,42 @@ async def test_a_repeated_word_paste_matches_the_same_rows_without_the_repeats()
         await db.close()
     assert sent == ["common needle1"]  # FTS5 received each word once
     assert sorted(r[0] for r in got) == sorted(r[0] for r in once) and got
+
+
+# ── round 3: the AND pass is capped, and split as the tokenizer splits ────────
+
+
+def test_the_and_pass_caps_distinct_terms_at_the_budget():
+    """Round-3 review: de-duplicating removed nothing from 33+ distinct words, so
+    the strict pass still sent the whole prompt."""
+    words = [f"tok{i}" for i in range(200)]
+    capped = and_pass(" ".join(words))
+    assert sum(fts5_tokens(t) for t in capped.split(" ")) <= N
+    assert capped.split(" ") == words[:N]  # all tie at count 1: first appearance
+
+
+def test_the_and_pass_keeps_a_non_ascii_space_inside_its_token():
+    """Round-3 review: str.split() also splits on NBSP, which the ascii tokenizer
+    treats as part of a token, so re-joining with spaces changed the matched
+    tokens. Split on ASCII whitespace only."""
+    nbsp = "foo\u00a0bar"
+    query = " ".join([nbsp] * 40)
+    assert and_pass(query) == nbsp
+    assert _fts.operands(f"a {nbsp}\tb") == ["a", nbsp, "b"]
+
+
+def test_the_or_retry_keeps_a_non_ascii_space_inside_its_token():
+    """Same class, the OR retry: a lone NBSP-joined token is one operand, so there
+    is nothing to OR."""
+    assert or_fallback("foo\u00a0bar") is None
+    assert or_fallback("foo\u00a0bar baz") == "foo\u00a0bar OR baz"
+
+
+def test_the_and_pass_and_the_or_retry_share_one_term_list():
+    """Premise check before round 4: the capped AND kept stopwords while the OR
+    retry dropped them, so a long prose paste became an AND of mostly stopwords
+    that matched rows and never reached the retry. Both now use one list."""
+    prose = " ".join(["the cache is in the disk of the box"] * 30 + ["spill retrieval"])
+    anded = and_pass(_prepare_fts5(prose))
+    assert anded.split(" ") == or_fallback(_prepare_fts5(prose)).split(" OR ")
+    assert not {"the", "is", "in", "of"} & set(anded.split(" "))

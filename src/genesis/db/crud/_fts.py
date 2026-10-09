@@ -133,6 +133,20 @@ def fts5_tokens(term: str) -> int:
     return max(1, sum(1 for piece in term.split("_") if piece))
 
 
+#: The separators FTS5's ``ascii`` tokenizer splits on that a free-text expression
+#: can carry here: ASCII whitespace only. Python's ``str.split()`` also splits on
+#: non-ASCII whitespace (NBSP, EM SPACE), which ``ascii`` treats as part of a token,
+#: so splitting with it and re-joining with spaces would change WHICH tokens, and
+#: so which rows, a query matches.
+_ASCII_SPACE = re.compile(r"[ \t\n\r\f\v]+")
+
+
+def operands(expression: str) -> list[str]:
+    """The space-separated operands of a cleaned expression, split as FTS5's
+    ``ascii`` tokenizer splits them (ASCII whitespace only)."""
+    return [part for part in _ASCII_SPACE.split(expression) if part]
+
+
 def fts5_query_tokens(text: str) -> int:
     """FTS5 tokens in free text as written, stopwords and short words included.
 
@@ -214,33 +228,41 @@ def or_fallback(escaped: str) -> str | None:
     ``bounded_terms``: a long free-text query would otherwise OR every one of
     its words and make FTS5 score most of the corpus.
     """
-    parts = escaped.split()
+    parts = operands(escaped)
     if len(parts) <= 1:
         return None
+    return " OR ".join(_query_terms(parts, site="or-retry"))
+
+
+def _query_terms(parts: list[str], *, site: str) -> list[str]:
+    """The ONE bounded term list both passes of a free-text query use: stopwords
+    dropped (all kept when every word is one), then capped by ``bounded_terms``.
+    Sharing it keeps the over-budget AND pass and the OR retry about the same
+    words, so a long prose paste cannot become an AND of stopwords that matches
+    rows and so never reaches the retry."""
     meaningful = [p for p in parts if p not in _OR_STOPWORDS]
-    return " OR ".join(bounded_terms(meaningful or parts, site="or-retry"))
+    return bounded_terms(meaningful or parts, site=site)
 
 
 def and_pass(expression: str) -> str:
     """The strict-AND first pass's MATCH: ``expression`` unchanged when its operands
-    fit the budget, otherwise the same words de-duplicated.
+    fit the budget, otherwise the same bounded term list the OR retry uses
+    (``_query_terms``: stopwords dropped, most frequent first).
 
-    A repeated word in an AND matches exactly the rows it matched once, so this
-    never changes WHICH rows match; it changes only the bm25 rank of an
-    over-budget query. MEASURED (in-memory porter-ascii table, 20k rows, two
-    near-universal words, ranked): 32 operands 0.23 s, 100 1.48 s, 200 4.05 s,
-    400 12.70 s; the same words de-duplicated 0.04 s throughout.
+    Over the budget the pass costs what every other producer costs: at most
+    ``FTS_MAX_TERMS`` tokens (``bounded_terms``). De-duplicating alone was not a
+    bound, since 33+ distinct words still reached FTS5 whole. Dropping repeats
+    changes no match; dropping distinct words BROADENS the AND (fewer required
+    terms), for over-budget queries only (owner-approved). MEASURED (in-memory
+    porter-ascii table, 20k rows, two near-universal words, ranked): 32 operands
+    0.23 s, 100 1.48 s, 200 4.05 s, 400 12.70 s; the same words de-duplicated
+    0.04 s throughout. Operands are split as the tokenizer splits them, so a
+    non-ASCII space stays inside its token.
     """
-    parts = expression.split()
+    parts = operands(expression)
     if sum(fts5_tokens(part) for part in parts) <= FTS_MAX_TERMS:
         return expression
-    distinct = list(dict.fromkeys(parts))
-    logger.info(
-        "FTS AND pass de-duplicated: %d operands -> %d (site=and-pass)",
-        len(parts),
-        len(distinct),
-    )
-    return " ".join(distinct)
+    return " ".join(_query_terms(parts, site="and-pass"))
 
 
 async def fetch_fts(
