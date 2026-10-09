@@ -15,6 +15,7 @@ Mirrors ``direct_session_queue`` (single-statement claim via UPDATE…RETURNING)
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -86,21 +87,46 @@ async def upsert_open_park(
     return row[0] if row else park_id
 
 
+async def _peer_filter(db: aiosqlite.Connection, peer_only: bool | None):
+    if peer_only is None:
+        return "", ()
+    if type(peer_only) is not bool:
+        raise ValueError("Peer park selection must be boolean")
+    from genesis.peers.provider_state import peer_park
+
+    lock = getattr(db, "_genesis_peer_park_lock", None)
+    if lock is None:
+        lock = db._genesis_peer_park_lock = asyncio.Lock()
+    async with lock:
+        if not getattr(db, "_genesis_peer_park_registered", False):
+            await db.create_function(
+                "genesis_peer_park",
+                1,
+                lambda payload: peer_park({"payload_json": payload}),
+                deterministic=True,
+            )
+            db._genesis_peer_park_registered = True
+    return "AND genesis_peer_park(payload_json) = ?", (peer_only,)
+
+
 async def list_due(
     db: aiosqlite.Connection,
     *,
     now: str | None = None,
     limit: int = 50,
+    peer_only: bool | None = None,
 ) -> list[dict]:
     """Open parks whose next_attempt_at is due (<= now). Oldest first."""
     now = now or _now()
+    selection, params = await _peer_filter(db, peer_only)
     cursor = await db.execute(
-        """SELECT * FROM cc_rate_limit_parks
+        f"""SELECT * FROM cc_rate_limit_parks
            WHERE status = 'parked'
              AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+              {selection}
            ORDER BY created_at
            LIMIT ?""",
-        (now, limit),
+        (now, *params, limit),
     )
     rows = await cursor.fetchall()
     return [dict(r) for r in rows]
@@ -111,14 +137,17 @@ async def list_by_status(
     *,
     status: str,
     limit: int = 50,
+    peer_only: bool | None = None,
 ) -> list[dict]:
     """Parks in a given status. Oldest first."""
+    selection, params = await _peer_filter(db, peer_only)
     cursor = await db.execute(
-        """SELECT * FROM cc_rate_limit_parks
+        f"""SELECT * FROM cc_rate_limit_parks
            WHERE status = ?
+             {selection}
            ORDER BY created_at
            LIMIT ?""",
-        (status, limit),
+        (status, *params, limit),
     )
     rows = await cursor.fetchall()
     return [dict(r) for r in rows]

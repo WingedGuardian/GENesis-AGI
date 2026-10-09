@@ -33,7 +33,9 @@ from genesis.peers.resources import PublishedResources
 from genesis.runtime import GenesisRuntime
 
 
-@pytest.mark.parametrize("outcome", ["approved", "rejected", "revoked", "cancel", "delivery_retry"])
+@pytest.mark.parametrize(
+    "outcome", ["approved", "rejected", "revoked", "cancel", "delivery_retry", "shutdown"]
+)
 async def test_owner_approval_resume_through_real_facade(tmp_path, outcome):
     root = tmp_path
     registry = PeerRegistry(root / "state.db")
@@ -230,6 +232,21 @@ async def test_owner_approval_resume_through_real_facade(tmp_path, outcome):
                         )[0] == 1
                     return
                 await coordinator.tick()
+                if outcome == "shutdown":
+                    # The real runner registers before returning, but its task
+                    # has not started. Close must retain its cleanup ownership.
+                    assert len(runner._active) == 1
+                    assert not next(iter(runner._peer_runs.values())).started
+                    await coordinator.close()
+                    assert not calls and not published
+                    assert not runner._active and not runner._peer_cleanup_holds
+                    assert runner._semaphore._value == 2
+                    assert coordinator.broker._runner is None
+                    async with registry.connection() as check:
+                        assert not await (
+                            await check.execute("SELECT 1 FROM peer_segments WHERE status!='drained'")
+                        ).fetchone()
+                    return
                 active = tuple(runner._active.values())
                 await asyncio.gather(*active, return_exceptions=True)
                 await notify()

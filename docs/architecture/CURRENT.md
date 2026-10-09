@@ -928,7 +928,7 @@ are the other timing/volume controls on that path.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 9a1e0b7c8 2026-10-08
+verified: 75a4171b14 2026-10-09
 ```
 
 - **Individual peer consent foundation**: `peers/approvals.py` persists exact
@@ -945,6 +945,11 @@ verified: 9a1e0b7c8 2026-10-08
   The dark `peers/coordinator.py` joins these holds to the contained runner and
   private broker; `peers/provider_state.py` owns atomic peer park continuation,
   and the legacy resumer refuses peer-to-owner reconstruction. Unknown
+  unstarted cleanup retains a global launch/shutdown hold. Dispatch registration
+  and shutdown fencing share the dispatch lock; cleanup joins run outside it.
+  Legacy and peer park batches use one classifier without crowding owner work or
+  needs-user alerts; malformed legacy rows retain backoff and alert recovery.
+  Unknown
   consequential effects block continuation and successful handoff. Runtime
   installation, owned artifact disclosure and full HTTP integration remain
   later lifecycle slices. See [coordinator](../reference/peer-coordinator.md). See [lifecycle state](../reference/peer-lifecycle.md).

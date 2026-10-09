@@ -22,7 +22,10 @@ from genesis.peers.tasks import TaskRefusal
 
 def peer_park(park):
     """Every legacy reader must exclude either explicit peer lineage marker."""
-    payload = json.loads(park["payload_json"])
+    try:
+        payload = json.loads(park["payload_json"])
+    except (ValueError, TypeError, RecursionError):
+        return False  # Legacy backoff and owner alerts own corrupt-payload recovery.
     return isinstance(payload, dict) and (
         payload.get("source_tag") == "peer_api" or "peer_task_id" in payload
     )

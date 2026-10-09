@@ -110,7 +110,7 @@ def _safe_prompt(payload_json: str) -> str:
     not sink the whole tick)."""
     try:
         return str(json.loads(payload_json).get("prompt", ""))[:200]
-    except (json.JSONDecodeError, TypeError, AttributeError):
+    except (ValueError, TypeError, AttributeError, RecursionError):
         return ""
 
 
@@ -120,7 +120,7 @@ async def _escalate_needs_user(rt, db) -> None:
     Each park is isolated: a single corrupt row (bad payload_json, alert failure)
     must not abort the tick before the due-park loop runs (that would recur every
     10 min and block ALL resumes)."""
-    stuck = await parks.list_by_status(db, status="needs_user", limit=50)
+    stuck = await parks.list_by_status(db, status="needs_user", limit=50, peer_only=False)
     for park in stuck:
         try:
             from genesis.peers.provider_state import peer_park
@@ -163,8 +163,19 @@ async def run_resume_tick(rt, *, now: datetime | None = None) -> None:
 
         cfg = cfg_mod.load_config()
         due = await parks.list_due(
-            db, now=_iso(now), limit=cfg_mod.knob_int(cfg, "max_due_per_tick")
+            db,
+            now=_iso(now),
+            limit=cfg_mod.knob_int(cfg, "max_due_per_tick"),
+            peer_only=False if mode == "live" else None,
         )
+        if mode == "live":
+            # Independent bounded classes: blocked peer parks cannot hide owner work.
+            due += await parks.list_due(
+                db,
+                now=_iso(now),
+                limit=cfg_mod.knob_int(cfg, "max_due_per_tick"),
+                peer_only=True,
+            )
         if not due:
             rt.record_job_success("rate_limit_resume")
             return

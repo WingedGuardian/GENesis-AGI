@@ -80,9 +80,9 @@ class PeerCoordinator(PeerTasks):
         )
 
     async def dispatch_one(self):
-        if self._stopping or self.broker._runner is None:
-            raise RuntimeError("Peer coordinator is unavailable")
         async with self._dispatch_lock:
+            if self._stopping or self.broker._runner is None:
+                raise RuntimeError("Peer coordinator is unavailable")
             await self._retire_invalid_pending()
             row = await self.state.claim()
             if row is None:
@@ -139,6 +139,10 @@ class PeerCoordinator(PeerTasks):
             clean = await _drain(binding, self)
         except BaseException:
             clean = False
+        if not clean:
+            self.runner._peer_cleanup_holds.setdefault(
+                binding.segment.segment_id, PeerRunState(binding)
+            )
         uncertain = any(
             hold.binding.segment.segment_id == binding.segment.segment_id
             for hold in self.runner._peer_cleanup_holds.values()
@@ -440,13 +444,15 @@ class PeerCoordinator(PeerTasks):
 
     async def close(self):
         self._stopping = True
-        for binding in tuple(self._bindings.values()):
-            self._fence(binding)
-        active = [
-            self.runner._active[sid]
-            for sid in self._sessions.values()
-            if sid in self.runner._active
-        ]
+        # A spawn owns this lock until its session is registered or settled.
+        async with self._dispatch_lock:
+            for binding in tuple(self._bindings.values()):
+                self._fence(binding)
+            active = [
+                self.runner._active[sid]
+                for sid in self._sessions.values()
+                if sid in self.runner._active
+            ]
         await asyncio.gather(*active, return_exceptions=True)
         for task in tuple(self._notifications.values()):
             task.cancel()
