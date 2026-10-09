@@ -24,8 +24,9 @@ completion reads its finite nonreset limit, remaining credit and usage; explicit
 `limit_reset: null` is required. Remaining credit must cover the outstanding
 scheduled maxima. A current key snapshot cannot prove exclusive key use,
 in-flight overshoot, billable reasoning/framing or fees. `max_price` filters
-rates; it is not a per-request dollar cap. Missing verified bounds or concrete
-owner spending approval must still prevent the later runner from executing.
+rates; it is not a per-request dollar cap. The later runner must still require complete admission and concrete owner
+approval of the frozen operating parameters and allowance. An approved operating
+allowance with disclosed overrun risk does not establish a hard invoice ceiling.
 
 Reservation and dispatch are durable before the delegate runs. Every SDK
 replacement client shares the same exact-wire and second-request refusal guard.
