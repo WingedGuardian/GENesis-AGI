@@ -343,14 +343,16 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: ba6e357a7 2026-10-08
+verified: 044b77e46 2026-10-09
 ```
 
 - **Peer execution policy groundwork (dark, opt-in)** — `cc/peer_segment.py`
   and `CCInvocation.peer_segment` constrain explicit internal invocations to one
   private facade configuration, exact facade tools and isolated CLI settings.
   Named systemd scopes enforce deadlines and descendant-aware cleanup on both
-  run paths, including cancellation; unknown drain state raises. The public peer
+  run paths, including cancellation; unknown drain state raises. Empty failed
+  scopes are collected for retry, and private error redaction preserves the
+  original exception through disabled or failed child tracing. The public peer
   API, task coordinator and lease broker are separate dependent slices, so this
   mechanism alone does not enable peer work. See [peer execution](../reference/peer-execution.md).
 

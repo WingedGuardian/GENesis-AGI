@@ -113,6 +113,131 @@ class TestContextVarSemantics:
 class TestExceptionCapture:
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["disabled", "no_writer", "setup_failure"])
+    async def test_null_capture_does_not_format_ordinary_errors(self, wired, monkeypatch, mode):
+        from genesis.observability import spans
+
+        formatted = []
+
+        class SideEffectError(Exception):
+            def __str__(self):
+                formatted.append(True)
+                return "ordinary error"
+
+        def fail_setup():
+            raise RuntimeError("span setup unavailable")
+
+        original = SideEffectError()
+        with monkeypatch.context() as child:
+            if mode == "disabled":
+                child.setattr(spans, "_enabled", False)
+            elif mode == "no_writer":
+                child.setattr(spans, "_writer", None)
+            else:
+                child.setattr(spans, "_new_id", fail_setup)
+            with pytest.raises(SideEffectError) as caught, start_span("ordinary"):
+                raise original
+        assert caught.value is original
+        assert formatted == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["enabled", "disabled", "no_writer", "setup_failure"])
+    @pytest.mark.parametrize("exception_kind", ["attribute_hooks", "dict_hooks", "os_error"])
+    async def test_private_error_preserves_identity_and_redacts_ancestors(
+        self, wired, monkeypatch, mode, exception_kind
+    ) -> None:
+        from genesis.observability import spans
+
+        class AttributeHooksError(Exception):
+            def __setattr__(self, name, value):
+                if name == "_genesis_trace_error_message":
+                    raise RuntimeError("marker assignment refused")
+                super().__setattr__(name, value)
+
+            def __getattribute__(self, name):
+                if name in ("__dict__", "_genesis_trace_error_message"):
+                    raise RuntimeError("marker access refused")
+                return super().__getattribute__(name)
+
+        class DictHooks(dict):
+            def get(self, *args):
+                raise RuntimeError("dict lookup refused")
+
+            def __setitem__(self, key, value):
+                raise RuntimeError("dict assignment refused")
+
+        if exception_kind == "attribute_hooks":
+            original = AttributeHooksError("private exception prose")
+        elif exception_kind == "os_error":
+            original = OSError("private exception prose")
+        else:
+            original = ValueError("private exception prose")
+            original.__dict__ = DictHooks()
+
+        def fail_setup():
+            raise RuntimeError("span setup unavailable")
+
+        writer, conn = wired
+        with (
+            pytest.raises(type(original)) as caught,
+            start_span("parent") as parent,
+            monkeypatch.context() as child,
+        ):
+            if mode == "disabled":
+                child.setattr(spans, "_enabled", False)
+            elif mode == "no_writer":
+                child.setattr(spans, "_writer", None)
+            elif mode == "setup_failure":
+                child.setattr(spans, "_new_id", fail_setup)
+            with start_span("private", error_message="private operation failed"):
+                raise original
+
+        assert caught.value is original
+        assert parent.status_message == "private operation failed"
+        await _drain(writer)
+        rows = await _rows(conn)
+        assert {row["name"] for row in rows} == (
+            {"parent", "private"} if mode == "enabled" else {"parent"}
+        )
+        assert all(row["status_message"] == "private operation failed" for row in rows)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("marker", ["", 0, [], object()])
+    async def test_existing_private_marker_never_formats_exception(self, wired, marker):
+        original = ValueError("private exception prose")
+        original._genesis_trace_error_message = marker
+        with pytest.raises(ValueError) as caught, start_span("parent") as parent:
+            raise original
+        assert caught.value is original
+        assert parent.status_message == ("" if marker == "" else "private operation failed")
+
+    @pytest.mark.asyncio
+    async def test_private_string_subclass_does_not_run_format_hooks(self, wired):
+        class PrivateMessage(str):
+            def __str__(self):
+                raise RuntimeError("string hook refused")
+
+        original = ValueError("private exception prose")
+        original._genesis_trace_error_message = PrivateMessage("private operation failed")
+        with pytest.raises(ValueError) as caught, start_span("parent") as parent:
+            raise original
+        assert caught.value is original
+        assert type(parent.status_message) is str
+        assert parent.status_message == "private operation failed"
+
+    @pytest.mark.asyncio
+    async def test_broken_exception_formatter_preserves_original(self, wired):
+        class BrokenTextError(Exception):
+            def __str__(self):
+                raise RuntimeError("format unavailable")
+
+        original = BrokenTextError()
+        with pytest.raises(BrokenTextError) as caught, start_span("parent") as parent:
+            raise original
+        assert caught.value is original
+        assert parent.status_message == "exception text unavailable"
+
+    @pytest.mark.asyncio
     async def test_private_child_error_stays_redacted_in_parent_when_capture_disabled(
         self, wired, monkeypatch
     ) -> None:

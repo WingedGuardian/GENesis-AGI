@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from dataclasses import replace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -97,6 +97,8 @@ def test_peer_arguments_exclude_ambient_customizations(peer_invocation, monkeypa
         {"bash_allowlist": ("gh",)},
         {"skill_tags": ["owner-skill"]},
         {"env_overrides": {"CLAUDE_CODE_SIMPLE": "1"}},
+        {"output_format": "stream-json"},
+        {"output_format": "text"},
     ],
 )
 def test_peer_rejects_unsafe_invocation_overrides(peer_invocation, changes):
@@ -143,7 +145,7 @@ def test_peer_tool_names_are_exact_facade_rules(tool):
 
 def test_peer_scope_has_named_lifetime_and_parent(peer_invocation):
     args = peer_invocation.peer_segment.scope_args(("IOWeight=100",))
-    assert args[:4] == ["systemd-run", "--user", "--scope", "--quiet"]
+    assert args[:5] == ["systemd-run", "--user", "--scope", "--collect", "--quiet"]
     assert "--unit=genesis-peer-" + "a" * 32 + ".scope" in args
     for property_value in (
         "IOWeight=100",
@@ -258,6 +260,125 @@ async def test_public_run_always_drains_peer_scope(
         with pytest.raises(type(error)):
             await call(peer_invocation)
     drained.assert_awaited_once()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_private_spawn_callback_error_is_not_logged(
+    peer_invocation, monkeypatch, caplog, streaming
+):
+    async def fail_callback(pid):
+        raise RuntimeError("private callback prose")
+
+    invocation = replace(peer_invocation, on_spawn=fail_callback)
+    invoker = CCInvoker(claude_path="/fixture/claude")
+    monkeypatch.setattr(invoker_module.roster, "apply_active", lambda inv: (inv, ""))
+    monkeypatch.setattr(invoker_module, "inflight", lambda *args: contextlib.nullcontext())
+    monkeypatch.setattr(invoker_module, "set_oom_score_adj", lambda *args: None)
+    monkeypatch.setattr(invoker, "_network_preflight", AsyncMock())
+    monkeypatch.setattr(invoker, "verify_allowlist_enforceable", AsyncMock())
+    monkeypatch.setattr(invoker, "_build_env", lambda inv: {})
+    monkeypatch.setattr(invoker, "_apply_login_fallback", AsyncMock(side_effect=lambda env, inv: env))
+    monkeypatch.setattr(invoker, "_launch_env", lambda env, inv: env)
+    monkeypatch.setattr(invoker, "_with_cost_semantics", AsyncMock(side_effect=lambda output: output))
+    monkeypatch.setattr(PeerSegment, "stop_and_drain", AsyncMock())
+    result = json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                         "result": "complete", "session_id": "fixture", "usage": {}}).encode()
+    proc = MagicMock(pid=42000, returncode=0)
+    proc.communicate = AsyncMock(return_value=(result, b""))
+    proc.wait = AsyncMock(return_value=0)
+    proc.stdin.drain = AsyncMock()
+    proc.stdout = asyncio.StreamReader()
+    proc.stdout.feed_data(result + b"\n")
+    proc.stdout.feed_eof()
+    proc.stderr = asyncio.StreamReader()
+    proc.stderr.feed_eof()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=proc))
+    call = invoker.run_streaming if streaming else invoker.run
+    output = await call(invocation)
+    assert output.text == "complete"
+    warnings = [record for record in caplog.records if "on_spawn callback failed" in record.message]
+    assert len(warnings) == 1
+    assert not warnings[0].exc_info
+    assert "private callback prose" not in caplog.text
+
+
+@pytest.mark.parametrize("first_streaming", [False, True])
+@pytest.mark.parametrize("second_streaming", [False, True])
+@pytest.mark.parametrize("other_loop", [False, True])
+async def test_duplicate_invocation_never_drains_owner(
+    peer_invocation, monkeypatch, first_streaming, second_streaming, other_loop
+):
+    monkeypatch.setattr(invoker_module.roster, "apply_active", lambda inv: (inv, ""))
+    monkeypatch.setattr(invoker_module, "inflight", lambda *args: contextlib.nullcontext())
+    first = CCInvoker(claude_path="/fixture/claude")
+    second = CCInvoker(claude_path="/fixture/claude")
+    entered, finish_body, draining, finish_drain = (asyncio.Event() for _ in range(4))
+
+    async def traced(*args):
+        entered.set()
+        await finish_body.wait()
+        return "complete"
+
+    async def drain():
+        draining.set()
+        await finish_drain.wait()
+
+    for invoker in (first, second):
+        monkeypatch.setattr(invoker, "_run_traced", traced)
+        monkeypatch.setattr(invoker, "_run_streaming_traced", traced)
+    drained = AsyncMock(side_effect=drain)
+    monkeypatch.setattr(PeerSegment, "stop_and_drain", drained)
+    first_call = first.run_streaming if first_streaming else first.run
+    second_call = second.run_streaming if second_streaming else second.run
+
+    async def reject_duplicate():
+        with pytest.raises(RuntimeError, match="already active"):
+            if other_loop:
+                await asyncio.to_thread(lambda: asyncio.run(second_call(peer_invocation)))
+            else:
+                await second_call(peer_invocation)
+
+    task = asyncio.create_task(first_call(peer_invocation))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        await reject_duplicate()
+        assert not task.done()
+        drained.assert_not_awaited()
+        finish_body.set()
+        await asyncio.wait_for(draining.wait(), 5)
+        await reject_duplicate()
+        assert drained.await_count == 1
+        finish_drain.set()
+        assert await asyncio.wait_for(task, 5) == "complete"
+        assert await second_call(peer_invocation) == "complete"
+        assert drained.await_count == 2
+    finally:
+        finish_body.set()
+        finish_drain.set()
+        await asyncio.wait_for(task, 5)
+
+
+@pytest.mark.parametrize("cleanup_error", [RuntimeError, asyncio.CancelledError])
+async def test_unknown_drain_retains_invocation_claim(peer_invocation, monkeypatch, cleanup_error):
+    monkeypatch.setattr(invoker_module.roster, "apply_active", lambda inv: (inv, ""))
+    monkeypatch.setattr(invoker_module, "inflight", lambda *args: contextlib.nullcontext())
+    invoker = CCInvoker(claude_path="/fixture/claude")
+    traced = AsyncMock(return_value="complete")
+    monkeypatch.setattr(invoker, "_run_traced", traced)
+    drained = AsyncMock(side_effect=cleanup_error())
+    monkeypatch.setattr(PeerSegment, "stop_and_drain", drained)
+    try:
+        with pytest.raises(cleanup_error):
+            await invoker.run(peer_invocation)
+        with pytest.raises(RuntimeError, match="awaiting reconciliation"):
+            await invoker.run(peer_invocation)
+        traced.assert_awaited_once()
+        drained.assert_awaited_once()
+    finally:
+        # The fixture deliberately leaves an unknown drain; retire only its
+        # synthetic claim so other tests can reuse their fixture identifier.
+        with peer_segment._INVOCATION_LOCK:
+            peer_segment._INVOCATION_UNITS.discard(peer_invocation.peer_segment.unit_name)
 
 
 async def test_repeated_cancellation_waits_for_process_drain(peer_invocation, monkeypatch):

@@ -2902,23 +2902,25 @@ class CCInvoker:
         raises) so the failure event names the routed model, not only the
         requested tier.
         """
-        invocation, roster_model = roster.apply_active(invocation)
-        try:
-            # Registered for the whole call: a restart now would cancel it
-            # (genesis.util.inflight; a no-op inside a caller's open unit).
-            with inflight("claude", _inflight_label(invocation)):
-                return await self._run_traced(invocation, roster_model)
-        except CCError as exc:
-            await _emit_invocation_failed_event(
-                exc,
-                invocation,
-                streaming=False,
-                roster_model=roster_model,
-            )
-            raise
-        finally:
-            if invocation.peer_segment is not None:
-                await invocation.peer_segment.stop_and_drain()
+        scope = (
+            invocation.peer_segment.invocation()
+            if invocation.peer_segment is not None else contextlib.nullcontext()
+        )
+        async with scope:
+            invocation, roster_model = roster.apply_active(invocation)
+            try:
+                # Registered for the whole call: a restart now would cancel it
+                # (genesis.util.inflight; a no-op inside a caller's open unit).
+                with inflight("claude", _inflight_label(invocation)):
+                    return await self._run_traced(invocation, roster_model)
+            except CCError as exc:
+                await _emit_invocation_failed_event(
+                    exc,
+                    invocation,
+                    streaming=False,
+                    roster_model=roster_model,
+                )
+                raise
 
     async def _run_traced(self, invocation: CCInvocation, roster_model: str) -> CCOutput:
         """Run an already-roster-routed CC session (traced).
@@ -3053,7 +3055,7 @@ class CCInvoker:
                     logger.warning(
                         "on_spawn callback failed for PID %s",
                         proc.pid,
-                        exc_info=True,
+                        exc_info=invocation.peer_segment is None,
                     )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(input=invocation.prompt.encode()),
@@ -3171,21 +3173,23 @@ class CCInvoker:
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
     ) -> CCOutput:
         """Run CC with stream-json output; emit-then-reraise on CCError (see run())."""
-        invocation, roster_model = roster.apply_active(invocation)
-        try:
-            with inflight("claude", _inflight_label(invocation)):
-                return await self._run_streaming_traced(invocation, roster_model, on_event)
-        except CCError as exc:
-            await _emit_invocation_failed_event(
-                exc,
-                invocation,
-                streaming=True,
-                roster_model=roster_model,
-            )
-            raise
-        finally:
-            if invocation.peer_segment is not None:
-                await invocation.peer_segment.stop_and_drain()
+        scope = (
+            invocation.peer_segment.invocation()
+            if invocation.peer_segment is not None else contextlib.nullcontext()
+        )
+        async with scope:
+            invocation, roster_model = roster.apply_active(invocation)
+            try:
+                with inflight("claude", _inflight_label(invocation)):
+                    return await self._run_streaming_traced(invocation, roster_model, on_event)
+            except CCError as exc:
+                await _emit_invocation_failed_event(
+                    exc,
+                    invocation,
+                    streaming=True,
+                    roster_model=roster_model,
+                )
+                raise
 
     async def _run_streaming_traced(
         self,
@@ -3304,7 +3308,7 @@ class CCInvoker:
                     logger.warning(
                         "on_spawn callback failed for PID %s",
                         proc.pid,
-                        exc_info=True,
+                        exc_info=invocation.peer_segment is None,
                     )
             # Feed prompt via stdin, then close to signal EOF
             if proc.stdin is not None:

@@ -10,6 +10,8 @@ prompt and absolute working/config paths, external-untrusted origin and a timeou
 of at most 7,200 seconds. It rejects permission skipping, owner resume, appended
 context, skills, tool/environment overrides and incompatible CLI modes. Launch
 revalidates the frozen invocation's containment policy before building argv.
+Peer invocation configuration uses JSON output; the streaming method performs
+its own stream-json override with the required verbose flag.
 
 The owner-created MCP JSON must be a regular file owned by the process user,
 mode 0600, no symlink, at most 4 KiB, containing only:
@@ -25,7 +27,9 @@ overrides or additional servers.
 
 Peer prompt/output/error prose is excluded from invoker logs and trace status
 messages. Error redaction propagates to ancestor spans while exception types
-and internal classification remain available to the coordinator.
+and internal classification remain available to the coordinator. Exception
+subclass attribute hooks cannot replace the original error or defeat redaction,
+including when child tracing is disabled or its setup fails.
 
 The CLI uses strict MCP configuration, empty builtin tools and setting sources,
 `dontAsk` permission handling and exact facade tool names. Slash commands, Chrome
@@ -39,6 +43,13 @@ Each segment uses `genesis-peer-<32 lowercase hex>.scope` under the user systemd
 manager, bound to `genesis-server.service` with `BindsTo` and `After`. RuntimeMaxSec
 is the remaining deadline, capped at 7,200 seconds; stop timeout is ten seconds,
 with control-group killing and SIGKILL enabled. There is no unscoped fallback.
+Failed scopes are collected after recursive control-group emptiness checks, so
+a completed cleanup does not leave a failed unit name blocking a retry.
+All invoker instances and event loops in the server process share ownership of
+each segment name through cleanup. A duplicate is refused without stopping the
+owner. An exceptional cleanup retains that process-local claim until restart;
+this includes cancellation when completion cannot be established. This guard
+does not coordinate independent launcher processes or grant peer permissions.
 
 Cleanup runs on success, errors and cancellation in both public invoker paths,
 shielded against repeated caller cancellation. A still-tracked control group must

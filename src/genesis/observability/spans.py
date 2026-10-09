@@ -162,11 +162,27 @@ def _now_us() -> int:
     return int(time.time() * 1_000_000)
 
 
-def _exception_message(exc: Exception, override: str | None) -> str:
-    if override is not None:
-        exc._genesis_trace_error_message = override
-    safe = getattr(exc, "_genesis_trace_error_message", None)
-    return safe if safe is not None else f"{type(exc).__name__}: {exc}"
+def _exception_message(exc: Exception, override: str | None) -> tuple[str, bool]:
+    try:
+        # Bypass subclass attributes/descriptors and dict method overrides.
+        attrs = BaseException.__dict__["__dict__"].__get__(exc)
+        if override is not None:
+            dict.__setitem__(attrs, "_genesis_trace_error_message", override)
+        safe = dict.get(attrs, "_genesis_trace_error_message")
+        if safe is not None:
+            # A malformed marker still denotes private content. Base str's
+            # method makes a builtin string without invoking subclass hooks.
+            return (
+                str.__str__(safe) if isinstance(safe, str) else "private operation failed",
+                True,
+            )
+    except Exception:
+        # Tracing must preserve the caller's exception even if metadata fails.
+        return "private operation failed", True
+    try:
+        return f"{type(exc).__name__}: {exc}", False
+    except Exception:
+        return "exception text unavailable", False
 
 
 @contextmanager
@@ -192,7 +208,8 @@ def start_span(
         try:
             yield _NULL_SPAN
         except Exception as exc:
-            _exception_message(exc, error_message)
+            if error_message is not None:
+                _exception_message(exc, error_message)
             raise
         return
 
@@ -227,15 +244,16 @@ def start_span(
         try:
             yield _NULL_SPAN
         except Exception as exc:
-            _exception_message(exc, error_message)
+            if error_message is not None:
+                _exception_message(exc, error_message)
             raise
         return
 
     try:
         yield span
     except Exception as exc:
-        span.set_status_error(_exception_message(exc, error_message))
-        sensitive_error = getattr(exc, "_genesis_trace_error_message", None) is not None
+        message, sensitive_error = _exception_message(exc, error_message)
+        span.set_status_error(message)
         raise
     finally:
         with contextlib.suppress(Exception):

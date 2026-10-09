@@ -477,6 +477,7 @@ class CCInvocation:
                 or self.skill_tags
                 or self.bash_allowlist
                 or self.env_overrides is not None
+                or self.output_format != "json"
                 or self.origin != "external_untrusted"
             ):
                 raise ValueError("peer execution cannot override its containment policy")

@@ -7,6 +7,7 @@ result disclosure enforce grants separately. Legacy CC invocations do not use it
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
 import os
@@ -14,6 +15,7 @@ import re
 import stat
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +26,8 @@ if TYPE_CHECKING:
 
 _PARENT_UNIT = "genesis-server.service"
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
+_INVOCATION_LOCK = threading.Lock()
+_INVOCATION_UNITS: set[str] = set()
 _PROVIDER_ENV = frozenset(
     {
         "HOME",
@@ -75,11 +79,31 @@ class PeerSegment:
     def unit_name(self) -> str:
         return f"genesis-peer-{self.segment_id}.scope"
 
+    @contextlib.asynccontextmanager
+    async def invocation(self):
+        # All invoker instances/loops in this server share scope ownership.
+        # Rejected duplicates must never enter the owner's cleanup path.
+        with _INVOCATION_LOCK:
+            if self.unit_name in _INVOCATION_UNITS:
+                raise RuntimeError("peer segment is already active or awaiting reconciliation")
+            _INVOCATION_UNITS.add(self.unit_name)
+        try:
+            yield
+        finally:
+            # Retain the claim on ANY exceptional drain outcome, including
+            # cancellation of the cleanup task itself. Restart clears this
+            # process-local hold; it is not a multiprocess launcher lock.
+            await self.stop_and_drain()
+            with _INVOCATION_LOCK:
+                _INVOCATION_UNITS.remove(self.unit_name)
+
     def scope_args(self, resource_properties: tuple[str, ...]) -> list[str]:
         remaining = min(7200.0, self.deadline_at - time.time())
         if remaining <= 0:
             raise ValueError("peer segment deadline expired")
-        args = ["systemd-run", "--user", "--scope", "--quiet", f"--unit={self.unit_name}"]
+        args = [
+            "systemd-run", "--user", "--scope", "--collect", "--quiet", f"--unit={self.unit_name}"
+        ]
         for value in (
             *resource_properties,
             f"RuntimeMaxSec={remaining:.6f}s",
