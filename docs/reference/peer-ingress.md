@@ -86,7 +86,9 @@ PYTHONPATH="$HOME/.local/share/genesis-guardian/src" \
 ```
 
 The default is a read-only preflight. Apply requires a standard dashboard proxy
-connecting to container loopback, an exact integer port 5000, an observed
+connecting to container loopback, with `bind` unset or `host`, and `nat` and
+`proxy_protocol` unset or `false`. Failed device reads and customized direction
+or transport require operator inspection. It also requires an exact integer port 5000, an observed
 loopback-only container listener, healthy host-loopback HTTP and configured
 dashboard authentication. Dry-run also validates the prospective YAML patch and
 deployed Guardian override support. Apply atomically updates only
@@ -106,8 +108,20 @@ address and refuses to report the host loopback as an autodetection success.
 Guardian's health and dialogue requests contact the configured target directly,
 independently of environment HTTP proxies. The next Guardian timer invocation
 reloads YAML. The installer aligns an unset HTTP target only when both Incus
-endpoints are loopback on port 5000 and the effective health port is standard;
+endpoints are loopback on port 5000, those proxy modes are standard, and the effective health port is standard;
 explicit operator targets and conflicting overrides are retained.
+
+Host setup stops before installing Guardian if the dashboard proxy cannot be
+created or verified. New devices are read back before setup proceeds; existing
+unknown devices are retained for inspection rather than overwritten. Generated
+network instructions identify the local loopback URL and owner SSH-tunnel or
+explicitly configured authenticated HTTPS access, rather than host-LAN port 5000.
+Before adding a device, setup requires successful structured Incus inspection
+showing its absence in both local and profile-expanded devices. Ambiguous or
+unreadable inspection stops setup. This uses the container Python installed
+earlier in setup; it adds no host parser dependency. Avoid concurrent operator
+topology changes during setup or migration: these preflights are not an Incus
+configuration lock.
 
 After apply, verify host local HTTP, Guardian's check-only probes and actual
 dialogue, owner HTTPS/tunnel access, and failed LAN/tailnet TCP-5000 access to

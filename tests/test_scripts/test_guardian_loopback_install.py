@@ -15,18 +15,32 @@ _REPO = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.parametrize(
-    "listener,backend,configured,port,expected",
+    "listener,backend,configured,port,expected,bind,nat,protocol",
     [
-        ("tcp:127.0.0.1:5000", "tcp:127.0.0.1:5000", "", 5000, "127.0.0.1"),
-        ("tcp:127.0.0.1:5000", "tcp:127.0.0.1:5000", "localhost", 5000, "localhost"),
-        ("tcp:0.0.0.0:5000", "tcp:127.0.0.1:5000", "", 5000, ""),
-        ("tcp:127.0.0.1:5000", "tcp:192.0.2.1:5000", "", 5000, ""),
-        ("tcp:127.0.0.1:5000", "", "", 5000, ""),
-        ("tcp:127.0.0.1:5000", "tcp:127.0.0.1:5000", "", 5555, ""),
+        ("tcp:127.0.0.1:5000", "tcp:127.0.0.1:5000", "", 5000, "127.0.0.1", "", "", ""),
+        ("tcp:127.0.0.1:5000", "tcp:127.0.0.1:5000", "localhost", 5000, "localhost", "", "", ""),
+        ("tcp:0.0.0.0:5000", "tcp:127.0.0.1:5000", "", 5000, "", "", "", ""),
+        ("tcp:127.0.0.1:5000", "tcp:192.0.2.1:5000", "", 5000, "", "", "", ""),
+        ("tcp:127.0.0.1:5000", "", "", 5000, "", "", "", ""),
+        ("tcp:127.0.0.1:5000", "tcp:127.0.0.1:5000", "", 5555, "", "", "", ""),
+        (
+            "tcp:127.0.0.1:5000",
+            "tcp:127.0.0.1:5000",
+            "",
+            5000,
+            "127.0.0.1",
+            "host",
+            "false",
+            "false",
+        ),
+        ("tcp:127.0.0.1:5000", "tcp:127.0.0.1:5000", "", 5000, "", "instance", "", ""),
+        ("tcp:127.0.0.1:5000", "tcp:127.0.0.1:5000", "", 5000, "", "", "true", ""),
+        ("tcp:127.0.0.1:5000", "tcp:127.0.0.1:5000", "", 5000, "", "", "", "true"),
+        ("tcp:127.0.0.1:5000", "tcp:127.0.0.1:5000", "", 5000, "", "unreadable", "", ""),
     ],
 )
 def test_installer_aligns_unset_http_target_without_clobbering_config(
-    tmp_path, listener, backend, configured, port, expected
+    tmp_path, listener, backend, configured, port, expected, bind, nat, protocol
 ):
     install = tmp_path / "guardian"
     (install / "config").mkdir(parents=True)
@@ -49,8 +63,11 @@ INSTALL_DIR=$1
 VENV_DIR=$2
 _listener=$3
 _backend=$4
+_bind=$5
+_nat=$6
+_protocol=$7
 CONTAINER_NAME=fixture
-incus() { case "${@: -1}" in listen) printf '%s\n' "$_listener" ;; connect) printf '%s\n' "$_backend" ;; *) return 1 ;; esac; }
+incus() { case "${@: -1}" in listen) printf '%s\n' "$_listener" ;; connect) printf '%s\n' "$_backend" ;; bind) [ "$_bind" != unreadable ] || return 1; printf '%s\n' "$_bind" ;; nat) printf '%s\n' "$_nat" ;; proxy_protocol) printf '%s\n' "$_protocol" ;; *) return 1 ;; esac; }
 """
         + target
         + phase
@@ -65,6 +82,9 @@ incus() { case "${@: -1}" in listen) printf '%s\n' "$_listener" ;; connect) prin
             str(Path(sys.executable).parent.parent),
             listener,
             backend,
+            bind,
+            nat,
+            protocol,
         ],
         cwd=_REPO,
         env={"PATH": os.defpath, "HOME": str(tmp_path)},
@@ -80,23 +100,35 @@ incus() { case "${@: -1}" in listen) printf '%s\n' "$_listener" ;; connect) prin
     assert "# retain operator note" in config.read_text()
 
 
-@pytest.mark.parametrize("backend,expected", [
-    ("tcp:127.0.0.1:5000", "already configured"),
-    ("tcp:192.0.2.9:5000", "requires topology inspection"),
-    ("", "requires topology inspection"),
-])
+@pytest.mark.parametrize(
+    "backend,expected",
+    [
+        ("tcp:127.0.0.1:5000", "already configured"),
+        ("tcp:192.0.2.9:5000", "requires topology inspection"),
+        ("", "requires topology inspection"),
+    ],
+)
 def test_existing_host_proxy_checks_backend(backend, expected):
     script = (_REPO / "scripts/host-setup.sh").read_text()
-    phase = script.split("# ── Dashboard port forwarding", 1)[1].split("# ── Codebase visualization", 1)[0]
+    phase = script.split("# ── Dashboard port forwarding", 1)[1].split(
+        "# ── Codebase visualization", 1
+    )[0]
     phase = phase[phase.index("\n") :]
-    body = '''set -euo pipefail
+    body = (
+        """set -euo pipefail
 CONTAINER_NAME=fixture
 _backend=$1
-incus() { case "${@: -1}" in listen) echo tcp:127.0.0.1:5000 ;; connect) printf '%s\n' "$_backend" ;; *) return 1 ;; esac; }
-''' + phase
-    result = subprocess.run(["bash", "-c", body, "proxy-test", backend], capture_output=True, text=True, timeout=10)
-    assert result.returncode == 0, result.stderr
+incus() { case "${@: -1}" in listen) echo tcp:127.0.0.1:5000 ;; connect) printf '%s\n' "$_backend" ;; bind|nat|proxy_protocol) printf '\n' ;; *) return 1 ;; esac; }
+"""
+        + phase
+        + "\necho FOLLOWING_GUARDIAN_PHASE\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", body, "proxy-test", backend], capture_output=True, text=True, timeout=10
+    )
+    assert result.returncode == (0 if backend == "tcp:127.0.0.1:5000" else 1), result.stderr
     assert expected in result.stdout
+    assert ("FOLLOWING_GUARDIAN_PHASE" in result.stdout) == (result.returncode == 0)
     if backend != "tcp:127.0.0.1:5000":
         assert "already configured" not in result.stdout
 
@@ -178,3 +210,211 @@ CLAUDE_PATH=/fixture/claude
         assert "# operator note" in content
     assert (install / "config/nested/default.yaml").read_text() == "setting: shipped\n"
     assert (install / "scripts/shipped.sh").read_text() == "# shipped\n"
+
+
+@pytest.mark.parametrize(
+    "scenario,expected",
+    [
+        ("existing", 0),
+        ("fresh", 0),
+        ("explicit_defaults", 0),
+        ("add_failure", 1),
+        ("readback_mismatch", 1),
+        ("readback_failure", 1),
+        ("reversed", 1),
+        ("nat", 1),
+        ("proxy_protocol", 1),
+        ("mode_unreadable", 1),
+    ],
+)
+def test_host_proxy_requires_readback_before_guardian(tmp_path, scenario, expected):
+    script = (_REPO / "scripts/host-setup.sh").read_text()
+    phase = script.split("# ── Dashboard port forwarding", 1)[1].split(
+        "# ── Codebase visualization", 1
+    )[0]
+    phase = phase[phase.index("\n") :]
+    calls = tmp_path / "calls"
+    stub = r"""set -euo pipefail
+CONTAINER_NAME=fixture
+scenario=$1
+calls=$2
+added=0
+incus() {
+    if [ "$1" = list ]; then
+        printf '%s\n' '[{"name":"fixture","devices":{},"expanded_devices":{"root":{"type":"disk"}}}]'
+        return 0
+    fi
+    if [ "$1" = exec ]; then
+        shift 3
+        "$@"
+        return $?
+    fi
+    echo "$3 ${@: -1}" >> "$calls"
+    if [ "$3" = add ]; then
+        [ "$scenario" != add_failure ] || { echo "fixture add failure" >&2; return 1; }
+        added=1
+        return 0
+    fi
+    [ "$3" = get ] || return 1
+    case "$scenario" in fresh|add_failure|readback_mismatch|readback_failure) [ "$added" = 1 ] || return 1 ;; esac
+    case "${@: -1}" in
+        listen) echo tcp:127.0.0.1:5000 ;;
+        connect)
+            [ "$scenario" != readback_failure ] || { echo "fixture readback failure" >&2; return 1; }
+            if [ "$scenario" = readback_mismatch ]; then echo tcp:192.0.2.9:5000; else echo tcp:127.0.0.1:5000; fi ;;
+        bind)
+            [ "$scenario" != mode_unreadable ] || { echo "fixture mode failure" >&2; return 1; }
+            case "$scenario" in reversed) echo instance ;; explicit_defaults) echo host ;; *) echo ;; esac ;;
+        nat) case "$scenario" in nat) echo true ;; explicit_defaults) echo false ;; *) echo ;; esac ;;
+        proxy_protocol) case "$scenario" in proxy_protocol) echo true ;; explicit_defaults) echo false ;; *) echo ;; esac ;;
+        *) return 1 ;;
+    esac
+}
+"""
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            stub + phase + "\necho FOLLOWING_GUARDIAN_PHASE\n",
+            "proxy-test",
+            scenario,
+            str(calls),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == expected, result.stderr
+    assert ("FOLLOWING_GUARDIAN_PHASE" in result.stdout) == (expected == 0)
+    trace = calls.read_text()
+    assert "set " not in trace and "remove " not in trace
+    if scenario in {
+        "existing",
+        "explicit_defaults",
+        "reversed",
+        "nat",
+        "proxy_protocol",
+        "mode_unreadable",
+    }:
+        assert "add " not in trace
+    if scenario in {"add_failure", "readback_failure", "mode_unreadable"}:
+        assert "fixture" in result.stderr
+
+
+@pytest.mark.parametrize("optional", [False, True])
+def test_generated_network_identity_describes_loopback_access(optional):
+    library = _REPO / "scripts/lib/claude_md_blocks.sh"
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; build_network_identity_block "$2" "$3" "$4" "$5" "$6"',
+            "identity-test",
+            str(library),
+            "192.0.2.3",
+            "2001:db8::3" if optional else "",
+            "192.0.2.4",
+            "2001:db8::4" if optional else "",
+            "192.0.2.5" if optional else "",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "**Container IP**: 192.0.2.3" in result.stdout
+    assert "**Host VM IP**: 192.0.2.4" in result.stdout
+    assert ("**Tailscale**" in result.stdout) == optional
+    assert ("2001:db8::3" in result.stdout) == optional
+    assert ("2001:db8::4" in result.stdout) == optional
+    dashboard = next(line for line in result.stdout.splitlines() if "**Dashboard**" in line)
+    assert "http://127.0.0.1:5000" in dashboard and "SSH tunnel" in dashboard
+    assert "authenticated, ACL-restricted HTTPS" in dashboard
+    assert "192.0.2.4:5000" not in dashboard
+
+
+@pytest.mark.parametrize(
+    "scenario,expected",
+    [
+        ("absent", 0),
+        ("inherited", 1),
+        ("local_unreadable", 1),
+        ("missing_map", 1),
+        ("null_map", 1),
+        ("missing_instance", 1),
+        ("duplicate_instance", 1),
+        ("malformed", 1),
+        ("list_failed", 1),
+        ("exec_failed", 1),
+    ],
+)
+def test_host_setup_proves_absence_before_any_add(tmp_path, scenario, expected):
+    import json
+
+    row = {"name": "fixture", "devices": {}, "expanded_devices": {"root": {"type": "disk"}}}
+    if scenario == "inherited":
+        row["expanded_devices"]["dashboard-proxy"] = {"type": "proxy"}
+    elif scenario == "local_unreadable":
+        row["devices"]["dashboard-proxy"] = {"type": "proxy"}
+    elif scenario == "missing_map":
+        del row["expanded_devices"]
+    elif scenario == "null_map":
+        row["devices"] = None
+    metadata = (
+        []
+        if scenario == "missing_instance"
+        else [row, row]
+        if scenario == "duplicate_instance"
+        else [row]
+    )
+    listing = tmp_path / "metadata.json"
+    listing.write_text("{" if scenario == "malformed" else json.dumps(metadata))
+    calls = tmp_path / "calls"
+    script = (_REPO / "scripts/host-setup.sh").read_text()
+    phase = script.split("# ── Dashboard port forwarding", 1)[1].split(
+        "# ── Codebase visualization", 1
+    )[0]
+    phase = phase[phase.index("\n") :]
+    stub = r"""set -euo pipefail
+CONTAINER_NAME=fixture
+scenario=$1
+listing=$2
+calls=$3
+added=0
+incus() {
+    if [ "$1" = list ]; then
+        cat "$listing"
+        [ "$scenario" != list_failed ] || return 1
+        return 0
+    fi
+    if [ "$1" = exec ]; then
+        [ "$scenario" != exec_failed ] || return 1
+        shift 3
+        "$@"
+        return $?
+    fi
+    echo "$3 ${@: -1}" >> "$calls"
+    if [ "$3" = add ]; then added=1; return 0; fi
+    [ "$3" = get ] && [ "$added" = 1 ] || return 1
+    case "${@: -1}" in listen|connect) echo tcp:127.0.0.1:5000 ;; bind|nat|proxy_protocol) echo ;; *) return 1 ;; esac
+}
+"""
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            stub + phase + "\necho FOLLOWING_GUARDIAN_PHASE\n",
+            "absence-test",
+            scenario,
+            str(listing),
+            str(calls),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == expected, result.stderr
+    assert ("FOLLOWING_GUARDIAN_PHASE" in result.stdout) == (expected == 0)
+    trace = calls.read_text()
+    assert ("add " in trace) == (expected == 0)
+    assert "set " not in trace and "remove " not in trace

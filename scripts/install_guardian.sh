@@ -273,7 +273,13 @@ fi
 HEALTH_PORT=5000
 HEALTH_HOST=""
 if [ "$(incus config device get "$CONTAINER_NAME" dashboard-proxy listen 2>/dev/null || true)" = "tcp:127.0.0.1:5000" ] && \
-   [ "$(incus config device get "$CONTAINER_NAME" dashboard-proxy connect 2>/dev/null || true)" = "tcp:127.0.0.1:5000" ]; then
+   [ "$(incus config device get "$CONTAINER_NAME" dashboard-proxy connect 2>/dev/null || true)" = "tcp:127.0.0.1:5000" ] && \
+   _proxy_bind=$(incus config device get "$CONTAINER_NAME" dashboard-proxy bind 2>/dev/null) && \
+   { [ -z "$_proxy_bind" ] || [ "$_proxy_bind" = "host" ]; } && \
+   _proxy_nat=$(incus config device get "$CONTAINER_NAME" dashboard-proxy nat 2>/dev/null) && \
+   { [ -z "$_proxy_nat" ] || [ "$_proxy_nat" = "false" ]; } && \
+   _proxy_protocol=$(incus config device get "$CONTAINER_NAME" dashboard-proxy proxy_protocol 2>/dev/null) && \
+   { [ -z "$_proxy_protocol" ] || [ "$_proxy_protocol" = "false" ]; }; then
     HEALTH_HOST="127.0.0.1"
 fi
 

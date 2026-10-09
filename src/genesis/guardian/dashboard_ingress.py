@@ -56,7 +56,10 @@ def _container_loopback(container: str) -> None:
     """Refuse migration until the actual container listener is loopback-only."""
     result = subprocess.run(
         ["incus", "exec", container, "--", "ss", "-H", "-lnt", "sport = :5000"],
-        check=True, capture_output=True, text=True, timeout=30,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     rows = result.stdout.splitlines()
     if not rows:
@@ -175,6 +178,9 @@ def migrate(config_path: Path, *, apply: bool = False) -> dict:
     if os.environ.get("GUARDIAN_HEALTH_HOST", "127.0.0.1") != "127.0.0.1":
         raise ValueError("remove conflicting Guardian HTTP host environment override")
     # Refuse unrelated proxy topologies rather than guessing what to replace.
+    for key, default in (("bind", "host"), ("nat", "false"), ("proxy_protocol", "false")):
+        if _device(container, "get", key) not in {"", default}:
+            raise ValueError("dashboard proxy direction or transport requires operator inspection")
     if _device(container, "get", "connect") != _CONNECT:
         raise ValueError("dashboard proxy does not connect to container loopback")
     listener = _device(container, "get", "listen")
@@ -203,6 +209,9 @@ def migrate(config_path: Path, *, apply: bool = False) -> dict:
         raise ValueError("dashboard proxy loopback change was not confirmed")
     if _device(container, "get", "connect") != _CONNECT:
         raise ValueError("dashboard proxy loopback backend was not confirmed")
+    for key, default in (("bind", "host"), ("nat", "false"), ("proxy_protocol", "false")):
+        if _device(container, "get", key) not in {"", default}:
+            raise ValueError("dashboard proxy direction or transport was not confirmed")
     _container_loopback(container)
     _ready_loopback()
     result["applied"] = True
