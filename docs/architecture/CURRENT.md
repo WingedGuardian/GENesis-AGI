@@ -1764,7 +1764,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 477efb7f7 2026-10-05
+verified: b70bf6f35 2026-10-09
 ```
 
 - **Peer-handoff surface (2026-09-26)**: a SessionStart hook
@@ -2028,7 +2028,11 @@ verified: 477efb7f7 2026-10-05
   pydantic model plus a total decision tree), never asserted by the caller — a
   caller-asserted design policed by refusal rules produced documents with no legal
   verdict twice. Any second writer (an MCP tool is the anticipated one) must go
-  through that module; it lives in `src/` so it can. Only a PASS verdict discharges
+  through that module; it lives in `src/` so it can. CLI `--dry-run` uses the
+  database quarantine admission check and
+  an encoded read-only URI, preserving committed WAL data without opening a
+  checkpoint-capable writer; SQLite can still coordinate sidecars and locks.
+  Real recording retains the guarded write connector. Only a PASS verdict discharges
   an obligation; the other verdicts leave the row OPEN and annotate it, so a PR
   nobody could verify says why instead of looking untouched. The one non-obvious
   invariant, because the obvious one is false: a PASS verdict implies the row is
@@ -3339,7 +3343,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: b70bf6f35 2026-10-08
+verified: b70bf6f35 2026-10-09
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -3391,13 +3395,20 @@ verified: b70bf6f35 2026-10-08
   during discovery and direct calls. Both currently admit the same health/recall
   floor; other tool bodies cannot be entered through those MCP processes.
   External health initialization skips the LLM router, dispatch queue setup,
-  and campaign wiring. Profiles constrain tools, not an operator's host access.
+  and campaign wiring. It still opens a writable database and persists tool
+  activity when a database exists; the tool floor is not a no-write guarantee.
+  Profiles constrain tools, not an operator's host access.
   The separately launched validator can admit one canonical invocation of
   `scripts/codex_validator_request.py` through its native shell hook. Its
   bounded, private UUID request files use strict JSON and a closed operation
   schema. `serving_status` and `serving_verify` project the existing deployment
   status tripwire with bounded output and owned-child cleanup; unknown states
-  return static observations. Request creation and retirement use the admitted
+  return static observations. `pilot_packet` and `pilot_probe` use launch-owned
+  private configuration, fixed source-bound fixture recipes, strict case counts,
+  a private operation mutex, and finite shared deployment-lock brackets. Probe
+  receipts describe fixture coverage, not live production behavior. Resource
+  admission uses installation policy while test children use a private home and
+  the installation pytest lock. Request creation and retirement use the admitted
   workspace patch path. Verification recording and publication operations
   remain GROUNDWORK, and this boundary has no
   activation wiring in the ordinary project configuration. Its dedicated

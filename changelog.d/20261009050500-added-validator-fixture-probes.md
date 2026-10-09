@@ -1,0 +1,1 @@
+- The inactive validator boundary now supports private, source-bound pilot packets and fixed fixture probes with serving checks and completed receipts; launcher activation and verification preview wiring remain separate work.

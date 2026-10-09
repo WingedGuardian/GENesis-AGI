@@ -2,8 +2,8 @@
 """Closed validator operations; no generic commands, SQL, plugins or lifecycle.
 
 Serving observations delegate to the existing deployment status tripwire.
-GROUNDWORK(validator-request-operations): verification CLI and synthetic hook
-probes need their separately reviewed operations. Requests are retained; admitted
+GROUNDWORK(validator-request-operations): verification preview needs its
+separately reviewed operation. Requests are retained; admitted
 workspace patches own creation and retirement after evidence capture.
 """
 
@@ -47,18 +47,41 @@ def read_request(workspace: Path, supplied: str) -> object:
     return load_json(raw)
 
 
-def execute(request: object) -> dict:
+def execute(request: object, *, workspace: Path | None = None) -> dict:
     """Exact per-operation schemas, checked before entering any operation."""
     if (not isinstance(request, dict)
             or type(request.get("version")) is not int or request["version"] != 1
             or not isinstance(request.get("operation"), str)):
         raise ValueError("Unsupported validator request")
     operation = request["operation"]
-    keys = {"version", "operation", "token"} if operation == "serving_verify" else {"version", "operation"}
-    if set(request) != keys or operation not in {"protocol_probe", "serving_status", "serving_verify"}:
+    keys = {"version", "operation"}
+    if operation == "serving_verify":
+        keys.add("token")
+    elif operation == "pilot_probe":
+        keys.add("pr")
+    if set(request) != keys or operation not in {
+        "protocol_probe",
+        "serving_status",
+        "serving_verify",
+        "pilot_packet",
+        "pilot_probe",
+    }:
         raise ValueError("Unsupported validator request")
     if operation == "protocol_probe":
         return {"version": 1, "operation": operation, "ok": True}
+    if operation in {"pilot_packet", "pilot_probe"}:
+        if workspace is None or (
+            operation == "pilot_probe" and (type(request["pr"]) is not int or request["pr"] <= 0)
+        ):
+            raise ValueError("Unsupported pilot request")
+        from codex_validator_pilot import packet, probe
+
+        result = (
+            packet(workspace)
+            if operation == "pilot_packet"
+            else probe(workspace, RUNTIME_ROOT, request["pr"])
+        )
+        return {"version": 1, "operation": operation, **result}
     from codex_validator_serving import TOKEN_RE, observe
 
     if operation == "serving_verify" and (
@@ -81,7 +104,7 @@ def main() -> int:
                 or workspace.is_relative_to(RUNTIME_ROOT)
                 or RUNTIME_ROOT.is_relative_to(workspace)):
             raise ValueError("Unsupported validator workspace")
-        result = execute(read_request(workspace, args.request))
+        result = execute(read_request(workspace, args.request), workspace=workspace)
     except Exception:
         print("Validator request refused", file=sys.stderr)
         return 2
