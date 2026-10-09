@@ -115,6 +115,25 @@ existing ASK, never a new allow or block; audience — the agent (the context no
 names what was silenced); background effect — none, because a dispatched session
 is denied every push before the key is consulted.
 
+**``review_request`` silences one prompt of the review-round gate** (owner ruling
+2026-10-07): the ``gh pr comment … @codex review`` request whose review history
+the round counter could not read because GitHub failed to answer just then:
+every error code must be on ``review_budget.TRANSIENT_ERRORS`` (a failed or
+timed-out read, or a lookup out of budget), and the request must be the whole
+command. A persistent or tamper code (deleted findings, a truncated response, a
+malformed record, a configuration error, a head that moved) keeps asking, as
+does a request chained with any other step. The cost, accepted by the owner: while GitHub is
+unreadable, a request goes ahead without the round budget being checked, so a PR
+past its last round can draw one more review. Only that prompt is covered. The
+round-cap prompt (the owner's checkpoint at round 4 and in the gate lane), a
+request whose PR number cannot be resolved, an unmarked gate-lane confirmation,
+a command that also raises any of those, the dispatched-session deny, and the
+refusal of a review request chained with a commit, push, merge, close or PR
+create all stay exactly as they were. Classified on the three axes: verdict, a
+narrowing of an existing ASK; audience, the agent (the context note names the
+setting and quotes the prompt, including why the read failed); background
+effect, none, since a dispatched session is still denied.
+
 **Suppression means "this hook stops objecting", never "approve on my behalf".**
 A suppressed ask is replaced by NO permission decision at all: the hook exits 0
 with only ``additionalContext`` naming the setting (the context-only shape
@@ -149,6 +168,7 @@ Configuration (all keys optional; absent means ask)::
         secrets_env: off      # the secrets.env credentials prompt
         push_publish: off     # first publish of a branch to the public repo only
         push_routine: off     # the push guard's routine prompts (see above)
+        review_request: off   # an @codex review request whose history is unreadable
 
 The value is the ask's ENABLED state, so YAML's own booleans read the right way
 round: ``off``/``false``/``no`` suppress, ``on``/``true``/``yes`` (and absent)
@@ -180,7 +200,7 @@ import sys
 #: policy this install declined to use — it is a key nothing classified, so it
 #: can never suppress anything. Adding a member is a deliberate act with a call
 #: site attached; there is no path that grows this set from configuration.
-KEYS = frozenset({"secrets_env", "push_publish", "push_routine"})
+KEYS = frozenset({"secrets_env", "push_publish", "push_routine", "review_request"})
 
 _CONFIG_PATH = "~/.genesis/config/genesis.yaml"
 _SEAM = "_TEST_HOOK_ASK_POLICY"
