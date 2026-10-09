@@ -1381,7 +1381,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: 9a1e0b7c8 2026-10-08
+verified: 9a1e0b7 2026-10-08
 ```
 
 - **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
