@@ -17,7 +17,14 @@ import aiosqlite
 import pytest
 
 from genesis.db.crud import _fts
-from genesis.db.crud._fts import FTS_MAX_TERMS, bounded_terms, fts5_tokens, or_fallback
+from genesis.db.crud._fts import (
+    FTS_MAX_TERMS,
+    and_pass,
+    bounded_terms,
+    fts5_query_tokens,
+    fts5_tokens,
+    or_fallback,
+)
 from genesis.db.crud.memory import _prepare_fts5
 
 N = FTS_MAX_TERMS
@@ -290,3 +297,64 @@ async def test_composed_expressions_parse_in_fts5(prompt, monkeypatch):
                 )
     finally:
         await db.close()
+
+
+# ── round 2: the lane base is judged by every word it would send ──────────────
+
+
+async def test_lane_base_of_a_long_stopword_paste_is_bounded():
+    """Round-2 review: the lane base was judged by the meaningful terms only, so a
+    paste of thousands of stopwords (no meaningful terms) kept the raw prompt and
+    reached FTS5 whole."""
+    composed, _ = await _compose(" ".join(["the"] * 2000), extra=["needle1"])
+    assert composed == "(the) OR (needle1)"
+
+
+async def test_lane_base_of_a_mostly_stopword_paste_keeps_its_meaningful_terms():
+    composed, _ = await _compose(
+        " ".join(["the is of"] * 500) + " spill retrieval", extra=["needle1"]
+    )
+    assert composed == "(spill retrieval) OR (needle1)"
+
+
+def test_fts5_query_tokens_counts_every_word_as_written():
+    assert fts5_query_tokens("the a of") == 3  # stopwords and short words count
+    assert fts5_query_tokens("foo_bar baz") == 3  # snake_case counts per piece
+    assert fts5_query_tokens("") == 0
+
+
+# ── class audit: the strict AND first pass is bounded too ─────────────────────
+
+
+def test_the_and_pass_of_a_short_query_is_untouched():
+    query = "graph expansion graph"
+    assert and_pass(query) is query
+
+
+def test_the_and_pass_of_a_long_query_is_de_duplicated():
+    assert and_pass(" ".join(["memory session"] * 200)) == "memory session"
+
+
+async def test_a_repeated_word_paste_matches_the_same_rows_without_the_repeats():
+    """Class audit before round 3: the AND first pass took the whole expression,
+    and FTS5 scores every repetition (measured 400 operands 12.7 s vs 0.04 s
+    de-duplicated). De-duplicating keeps the matched rows identical."""
+    db = await _corpus()
+    sent = []
+    real = db.execute_fetchall
+
+    async def spy(sql, params):
+        sent.append(params[0])
+        return await real(sql, params)
+
+    try:
+        sql = "SELECT memory_id FROM memory_fts WHERE memory_fts MATCH ? ORDER BY rank"
+        long = " ".join(["common needle1"] * 300)
+        once = await real(sql, ["common needle1"])
+        db.execute_fetchall = spy
+        got = await _fts.fetch_fts(db, sql, [long])
+    finally:
+        db.execute_fetchall = real
+        await db.close()
+    assert sent == ["common needle1"]  # FTS5 received each word once
+    assert sorted(r[0] for r in got) == sorted(r[0] for r in once) and got

@@ -155,8 +155,10 @@ Easy-to-forget mechanisms:
   (`fts5_tokens`: a snake_case word is one token per piece), filled with the
   most frequent terms in the prompt. A query within the budget is unchanged. Without it
   a long paste ORed every word, scored most of `memory_fts`, timed recall out and
-  spilled 60-190 MiB temp sorts. The strict AND first pass is NOT bounded
-  (measured cheap: 0.04-0.68 s, no spill, up to 4,060 tokens). Accepted cost: on
+  spilled 60-190 MiB temp sorts. The strict AND first pass is de-duplicated when over the budget (`and_pass`): it
+  matches the same rows, and a repeated-word paste no longer costs seconds per
+  recall (measured 2026-10-09 on a synthetic 20k-row in-memory table: 400 repeated
+  operands 12.7 s, de-duplicated 0.04 s). Accepted cost: on
   long prompts the top results shift (median 29% overlap with the unbounded
   ranking, measured 2026-10-08). The tag co-occurrence index also skips the
   `session_note` tag (on ~59% of rows), which otherwise widened every expansion.

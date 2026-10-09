@@ -103,10 +103,12 @@ _OR_STOPWORDS = frozenset(
 )
 
 
-#: The most FTS5 tokens a many-term MATCH built from free text may carry, counted
-#: over EVERY operand (a repeated word is evaluated once per occurrence) and in the
-#: tables' own tokenizer's units (``fts5_tokens``). FTS5 work grows with every
-#: OR'd term: MEASURED on a 112,801-row memory_fts copy
+#: The most FTS5 tokens each producer's term list may carry, counted over EVERY
+#: operand (a repeated word is evaluated once per occurrence) and in the tables'
+#: own tokenizer's units (``fts5_tokens``). The expanded form (intent.expand_query)
+#: carries its keyword list twice plus up to 5 tag expansions; 32 was calibrated on
+#: that form, so the doubling is accounted for, not a bug. FTS5 work grows with
+#: every OR'd term: MEASURED on a 112,801-row memory_fts copy
 #: (2026-10-08), an OR of 500 prompt terms took 4.8 s and spilled a 60 MiB temp
 #: sort, 1,500 terms 25 s and 177 MiB — the long-prompt recalls that timed out
 #: and the spill files the disk guardian paged on. 32 is the largest of 32/48
@@ -129,6 +131,16 @@ def fts5_tokens(term: str) -> int:
     separator a term can carry.
     """
     return max(1, sum(1 for piece in term.split("_") if piece))
+
+
+def fts5_query_tokens(text: str) -> int:
+    """FTS5 tokens in free text as written, stopwords and short words included.
+
+    The budget for text that reaches a MATCH unfiltered (the raw prompt as the
+    file lane's base): a paste of thousands of stopwords has no meaningful terms
+    to count, yet FTS5 evaluates every one of its words.
+    """
+    return sum(fts5_tokens(word) for word in re.findall(r"\w+", text or ""))
 
 
 def bounded_terms(terms: list[str], n: int = FTS_MAX_TERMS, *, site: str = "") -> list[str]:
@@ -209,6 +221,28 @@ def or_fallback(escaped: str) -> str | None:
     return " OR ".join(bounded_terms(meaningful or parts, site="or-retry"))
 
 
+def and_pass(expression: str) -> str:
+    """The strict-AND first pass's MATCH: ``expression`` unchanged when its operands
+    fit the budget, otherwise the same words de-duplicated.
+
+    A repeated word in an AND matches exactly the rows it matched once, so this
+    never changes WHICH rows match; it changes only the bm25 rank of an
+    over-budget query. MEASURED (in-memory porter-ascii table, 20k rows, two
+    near-universal words, ranked): 32 operands 0.23 s, 100 1.48 s, 200 4.05 s,
+    400 12.70 s; the same words de-duplicated 0.04 s throughout.
+    """
+    parts = expression.split()
+    if sum(fts5_tokens(part) for part in parts) <= FTS_MAX_TERMS:
+        return expression
+    distinct = list(dict.fromkeys(parts))
+    logger.info(
+        "FTS AND pass de-duplicated: %d operands -> %d (site=and-pass)",
+        len(parts),
+        len(distinct),
+    )
+    return " ".join(distinct)
+
+
 async def fetch_fts(
     db: aiosqlite.Connection,
     sql: str,
@@ -225,9 +259,17 @@ async def fetch_fts(
     The OR retry fires only when the first (AND) pass returned zero rows, the
     expression was not already a structured boolean query (``boolean`` is
     False), and it is multi-term. The retry runs on a COPY of ``params`` so the
-    caller's list is never mutated.
+    caller's list is never mutated. The AND pass itself is bounded the same way
+    (``and_pass``): a long free-text expression repeats words, and FTS5 scores
+    every repetition.
     """
-    rows = await db.execute_fetchall(sql, params)
+    first = params
+    if not boolean:
+        bounded = and_pass(params[match_index])
+        if bounded != params[match_index]:
+            first = list(params)
+            first[match_index] = bounded
+    rows = await db.execute_fetchall(sql, first)
     if rows or boolean:
         return rows
     alt = or_fallback(params[match_index])
