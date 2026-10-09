@@ -17,12 +17,11 @@ def parser():
     "arguments",
     [
         "register muse",
-        "register muse --same-owner",
         "register muse --daily-allowance 2",
         "register muse --same-owner --cross-owner --daily-allowance 2",
     ],
 )
-def test_registration_requires_ownership_and_allowance(arguments):
+def test_registration_requires_explicit_ownership(arguments):
     with pytest.raises(SystemExit) as error:
         parser().parse_args(["peers", *arguments.split()])
     assert error.value.code == 2
@@ -31,7 +30,7 @@ def test_registration_requires_ownership_and_allowance(arguments):
 async def test_cli_configure_register_grant_list_revoke(registry, capsys):
     commands = [
         "configure fallback --service-url https://genesis.example/v1/agent/a2a",
-        "register muse --same-owner --daily-allowance 2 --token-name GENESIS_PEER_MUSE_TOKEN",
+        "register muse --same-owner --token-name GENESIS_PEER_MUSE_TOKEN",
         "grant muse conversation ask",
         "list",
         "revoke muse",
@@ -40,4 +39,16 @@ async def test_cli_configure_register_grant_list_revoke(registry, capsys):
         await execute(parser().parse_args(["peers", *command.split()]), registry)
     assert (await registry.get("muse"))["active"] == 0
     assert await registry.grants("muse") == {"conversation": "ask"}
-    assert "GENESIS_PEER_MUSE_TOKEN" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "GENESIS_PEER_MUSE_TOKEN" in output
+    assert "daily_allowance" not in output
+    assert (await registry.get("muse"))["daily_allowance"] == 1
+
+
+def test_legacy_allowance_option_remains_optional_and_compatible():
+    default = parser().parse_args(["peers", "register", "muse", "--same-owner"])
+    explicit = parser().parse_args(
+        ["peers", "register", "muse", "--same-owner", "--daily-allowance", "2"]
+    )
+    assert default.daily_allowance == 1
+    assert explicit.daily_allowance == 2

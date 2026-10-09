@@ -11,16 +11,19 @@ are refused. No HTTP endpoint changes configuration, identities or grants.
 
 ```bash
 python -m genesis peers configure fallback --service-url https://YOUR-TAILNET-HOST/v1/agent/a2a
-python -m genesis peers register muse --same-owner --daily-allowance 10 --token-name GENESIS_PEER_MUSE_TOKEN
+python -m genesis peers register muse --same-owner --token-name GENESIS_PEER_MUSE_TOKEN
 python -m genesis peers grant muse conversation ask
 python -m genesis peers list
 python -m genesis peers revoke muse
 python -m genesis peers configure disabled
 ```
 
-The allowance above is an example; the owner must choose one explicitly. Each
-registration creates a new relationship epoch and grants nothing. Revocation
-retains identity, epoch, allowance and history; it never resets quotas. Grant
+Each registration creates a new relationship epoch and grants nothing. Genesis
+decides permitted requests under its own authority; enrollment does not assign
+a daily task budget. The optional deprecated `--daily-allowance` argument only
+preserves the positive legacy database field for backup compatibility; it is
+not an execution limit in the corrected admission slice. Revocation
+retains identity, epoch and history. Grant
 changes increment the relationship revision. Resource decisions use
 `resource:<32 lowercase hex ID>` and capability decisions use `allow`, `ask` or
 `deny`. Actual admission and capability enforcement are dependent slices.

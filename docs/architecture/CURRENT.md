@@ -1340,12 +1340,14 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: ba6e357a7998 2026-10-08
+verified: 076085463c7b 2026-10-09
 ```
 
 - **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
   pinned node/realm/principal and scoped credentials. Disabled by default; no
-  implicit capability grants. Local `genesis peers` CLI writes relationships;
+  implicit capability grants. Enrollment requires no daily task budget; the
+  deprecated allowance field remains only for database compatibility. Local
+  `genesis peers` CLI writes relationships;
   `/v1/agent/a2a` authenticates discovery/health through the existing runtime loop.
   No task skills or task execution advertised in this foundation. Revocation
   disables access immediately; credential equality with another surface refuses
