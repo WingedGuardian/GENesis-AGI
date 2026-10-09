@@ -637,3 +637,36 @@ async def test_aborted_scan_writes_no_verdict_and_no_row(monkeypatch, db):
         await loop._check_git_health_deep(db)
     assert verdicts == []
     assert await _rows(db) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", ["request_stop", "stop"])
+async def test_a_tick_resuming_after_a_stop_starts_no_scan(monkeypatch, stop):
+    """Devin review (#3137): a stop signal that lands while a tick awaits an
+    earlier monitor cancelled only the scan already running; the resumed tick
+    then dispatched a new one that outlived shutdown. Both stop paths now refuse
+    every later dispatch until the loop starts again."""
+    from unittest.mock import MagicMock
+
+    from genesis.awareness.loop import AwarenessLoop
+
+    deep = AsyncMock(return_value=_deep_report(True))
+    monkeypatch.setattr(git_health, "check_git_deep", deep)
+    monkeypatch.setattr(git_health, "write_git_health_verdict", lambda *a, **k: None)
+    loop._last_git_deep_run_at = None  # due
+    inst = object.__new__(AwarenessLoop)
+    inst._scheduler = MagicMock()
+    if stop == "request_stop":
+        AwarenessLoop.request_stop(inst)
+    else:
+        await AwarenessLoop.stop(inst)
+    loop._dispatch_git_health_deep(None)  # the resumed tick reaches the dispatch
+    assert loop._git_deep_task is None
+    deep.assert_not_awaited()
+    # A fresh start re-arms it.
+    inst._interval = 5
+    await AwarenessLoop.start(inst)
+    loop._dispatch_git_health_deep(None)
+    assert loop._git_deep_task is not None
+    await loop._git_deep_task
+    deep.assert_awaited_once()

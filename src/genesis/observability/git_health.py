@@ -348,10 +348,10 @@ _MISSING_LINE = re.compile(r"missing (blob|tree|commit|tag) ([0-9a-f]{40}|[0-9a-
 # them, so a "missing" one always pages.
 _BUILT_IN_OBJECTS = frozenset(
     {
-        "4b825dc642cb6eb9a060e54bf8d69288fbee4904",  # empty tree, sha1
-        "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",  # empty blob, sha1
-        "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321",  # empty tree, sha256
-        "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813",  # empty blob, sha256
+        "4b825dc642cb6eb9a060e54bf8d69288fbee4904",  # empty tree, sha1  # pragma: allowlist secret
+        "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",  # empty blob, sha1  # pragma: allowlist secret
+        "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321",  # empty tree, sha256  # pragma: allowlist secret
+        "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813",  # empty blob, sha256  # pragma: allowlist secret
     }
 )
 

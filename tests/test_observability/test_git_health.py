@@ -175,15 +175,17 @@ class TestDeepCheck:
 
     @pytest.mark.asyncio
     async def test_missing_loose_object_fails_fsck(self, repo, recheck_sleeps):
-        # Write a file + commit so there are real blob/tree objects, then delete
-        # one loose object → fsck reports it missing.
+        # Write a file + commit, then delete the file's BLOB → fsck reports it
+        # missing. Named, not the first loose object found: a deleted commit is
+        # reported as an "invalid sha1 pointer" on the ref instead (CI, #3137).
         self._commit_file(repo)
-        objdir = repo / ".git" / "objects"
-        loose = [
-            p for d in objdir.iterdir() if d.is_dir() and len(d.name) == 2 for p in d.iterdir()
-        ]
-        assert loose, "expected loose objects"
-        loose[0].unlink()
+        blob = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD:f.txt"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        (repo / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
         rep = await g.check_git_deep(repo)
         assert rep.ok is False
         assert "fsck_failed" in rep.failures

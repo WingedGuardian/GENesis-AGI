@@ -2409,6 +2409,9 @@ async def _check_git_health(db) -> None:
 _GIT_DEEP_INTERVAL_S = 24 * 3600
 _last_git_deep_run_at: float | None = None
 _git_deep_task = None  # strong reference to the out-of-band run
+# Set by a service stop, cleared by start: a tick that resumes after the stop
+# signal must not launch a scan nothing will cancel before the DB closes.
+_git_deep_stopped = False
 _git_deep_stuck_warned = False
 
 
@@ -2421,15 +2424,20 @@ def _git_deep_stuck_s() -> int:
 
 def _cancel_git_deep_task() -> None:
     """Stop an in-flight deep scan at shutdown: a scan cut off by the stop
-    proves nothing and must not leave a verdict or a page behind."""
+    proves nothing and must not leave a verdict or a page behind. Also refuses
+    every later dispatch until the loop starts again."""
+    global _git_deep_stopped
+    _git_deep_stopped = True
     if _git_deep_task is not None and not _git_deep_task.done():
         _git_deep_task.cancel()
 
 
 def _dispatch_git_health_deep(db) -> None:
     """Start the daily deep scan as a background task when it is due and not
-    already running; the tick never awaits it."""
+    already running, and never after a service stop; the tick never awaits it."""
     global _git_deep_task, _git_deep_stuck_warned
+    if _git_deep_stopped:
+        return
     if _git_deep_task is not None and not _git_deep_task.done():
         # Two fsck timeouts plus the re-check wait bound a healthy run; past that
         # the git child is unkillable (stuck in I/O) and the daily scan has stopped.
@@ -3757,6 +3765,8 @@ class AwarenessLoop:
         waiting one full interval.  This keeps status.json fresh from the
         moment the bridge starts, preventing watchdog false-positives.
         """
+        global _git_deep_stopped
+        _git_deep_stopped = False
         self._scheduler.add_job(
             self._on_tick,
             IntervalTrigger(minutes=self._interval),

@@ -586,6 +586,7 @@ def _skip_daily_git_deep_scan():
     mp = pytest.MonkeyPatch()
     mp.setattr(awareness_loop, "_last_git_deep_run_at", time.monotonic())
     mp.setattr(awareness_loop, "_git_deep_task", None)
+    mp.setattr(awareness_loop, "_git_deep_stopped", False)
     yield
     mp.undo()
 
