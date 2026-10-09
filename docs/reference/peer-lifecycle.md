@@ -27,6 +27,13 @@ may retry after that attempt drains and authority is rechecked. Unknown
 consequential effects cannot retry automatically. Completed receipts also require
 current authorization before reuse. Operation receipt storage is separate from
 full-result artifact storage, which arrives in a later slice.
+Original JSON string keys and values are scanned before serialization, including
+broker task context. Existing size, JSON admissibility and authority constraints
+remain in place; escaping cannot conceal an existing sensitive-data pattern.
+The broker also scans every returned outcome before disclosure, including
+historical results replayed by later coordinator slices. Cached context checks
+the original task message as well as the serialized wrapper; completion remains
+immutable and is never re-executed to replace a refused receipt.
 
 Completion time and execution duration have separate fields from cleanup time.
 The coordinator must capture them when the invocation returns, so slow cleanup

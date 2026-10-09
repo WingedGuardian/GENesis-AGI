@@ -1,0 +1,1 @@
+- Peer context and operation receipts apply existing sensitive-data checks before JSON escaping, retaining receipt limits and authorization checks.

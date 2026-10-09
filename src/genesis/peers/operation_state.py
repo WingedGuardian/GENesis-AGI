@@ -3,9 +3,9 @@
 import json
 from uuid import uuid4
 
+from genesis.peers.disclosure_scan import json_strings_safe
 from genesis.peers.lifecycle_state import bound, disclosure_authorized, has_consent, utcnow
 from genesis.peers.tasks import TaskRefusal
-from genesis.security.output_scanner import scan_outbound
 
 
 async def operation_authorized(db, task, capability, digest):
@@ -80,7 +80,7 @@ class PeerOperationState:
             # A receipt can contain the broker's 256KiB immutable resource read.
             # JSON escapes can expand each input byte sixfold. Full artifacts
             # are stored separately and have no limit imposed by this receipt.
-            if len(encoded.encode()) > 2 * 1024 * 1024 or not scan_outbound(encoded).safe:
+            if len(encoded.encode()) > 2 * 1024 * 1024 or not json_strings_safe(result):
                 raise ValueError("Peer operation result refused")
         async with self.registry.transaction() as db:
             row = await (
