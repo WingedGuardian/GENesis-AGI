@@ -51,6 +51,13 @@ def normalize(payload: object) -> Action:
 
 
 def dispatch(action: Action, *, workspace: Path | None = None) -> None:
+    if action.kind == "shell":
+        if workspace is None:
+            raise Refused("Validator request requires a trusted workspace")
+        from codex_validator_shell import check_command
+
+        check_command(action.arguments["command"], workspace, RUNTIME_ROOT)
+        return
     if action.kind == "patch":
         if workspace is None:
             raise Refused("Validator patch requires a trusted workspace")

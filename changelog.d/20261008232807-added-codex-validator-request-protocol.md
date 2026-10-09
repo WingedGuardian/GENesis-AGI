@@ -1,0 +1,1 @@
+- Add an inactive, strict local request protocol for future interactive Codex validators, currently limited to a private-file protocol probe.
