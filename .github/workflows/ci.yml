@@ -1147,6 +1147,10 @@ jobs:
         # (checkout-lock shell and Python tests, invoker +8, child_env +1,
         # deploy/update/candidate lock and rollback tests); no added skips.
         # Floor: 25004 + 36 = 25040.
-        # Shared policy +2 and parser/core +352, measured against main.
-        # Preserve current floor: 25040 + 2 + 352 = 25394; ceiling stays 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25394
+        #
+        # Corpus/adapters replacement (#3071): +130 collected tests, measured with
+        # --collect-only against main's versions of the changed test files
+        # (test_qualification +78, test_qualification_references +24,
+        # test_qualification_rework +28); no added skips.
+        # Floor: 25040 + 130 = 25170.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25524
