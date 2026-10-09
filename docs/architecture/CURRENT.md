@@ -2619,6 +2619,12 @@ verified: 7ec594c72 2026-10-09
   remains a review obligation. Human approval binds the exact corpus and policy;
   receipts do not authenticate
   reviewers or calibrate confidence. See `docs/reference/qualification-references.md`.
+  Corpus validation registers rubric/J9/novelty versions and class floors;
+  standalone adapters run production relevance and novelty judgments with
+  synthetic routers or caller-provided transport. Novelty uses disposable
+  full-schema SQLite fixtures and observes the actual rendered candidate IDs.
+  Full preflight, storage replay and execution/reporting orchestration land later.
+  See `docs/reference/qualification-corpus.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
