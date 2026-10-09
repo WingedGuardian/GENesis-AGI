@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from genesis.cc.session_config import SessionConfigBuilder
     from genesis.cc.session_manager import SessionManager
     from genesis.ego.verification import VerificationResult
+    from genesis.peers.session import PeerSessionBinding
 
 logger = logging.getLogger(__name__)
 
@@ -862,8 +863,31 @@ class DirectSessionRequest:
     # to route a RESULT delivery back to that conversation. Captured from
     # GENESIS_SESSION_ID at dispatch (see direct_session_run). None otherwise.
     origin_session_id: str | None = None
+    peer_binding: PeerSessionBinding | None = None
 
     def __post_init__(self) -> None:
+        if self.peer_binding is not None or self.source_tag == "peer_api":
+            from genesis.peers.session import PeerSessionBinding
+
+            if (
+                not isinstance(self.peer_binding, PeerSessionBinding)
+                or self.source_tag != "peer_api"
+                or self.profile != "observe"
+                or self.notify
+                or self.notify_on_failure_only
+                or self.system_prompt is not None
+                or self.skills is not None
+                or self.tool_exceptions
+                or self.planning_instruction is not None
+                or self.roster_model is not None
+                or self.origin_session_id is not None
+                or self.origin_caller_context is not None
+                or self.caller_context not in (None, f"peer_api:{self.peer_binding.task_id}")
+                or self.delivery_mode not in (None, DeliveryMode.SILENT)
+                or type(self.timeout_s) is not int
+                or not 1 <= self.timeout_s <= 7200
+            ):
+                raise ValueError("Peer sessions require a constrained internal binding")
         if self.profile not in VALID_PROFILES:
             raise ValueError(
                 f"Invalid profile {self.profile!r}. "
@@ -938,6 +962,8 @@ class DirectSessionRunner:
         self._rt = runtime
         self._semaphore = asyncio.Semaphore(self._MAX_CONCURRENT)
         self._active: dict[str, asyncio.Task] = {}
+        self._peer_runs: dict = {}
+        self._peer_cleanup_holds: dict = {}
         self._protected_paths: object | None = None
         self._auditor: object | None = None
 
@@ -959,6 +985,12 @@ class DirectSessionRunner:
         spawns as a circuit breaker. This is defense-in-depth — the
         proposal gate handles fine-grained domain classification.
         """
+        # Branch before legacy skills, profile overlays and context assembly.
+        if request.peer_binding is not None:
+            from genesis.peers.runner import spawn_peer
+
+            return await spawn_peer(self, request)
+
         # Ceiling check: skip for foreground/user-initiated sessions.
         # NOTE: DirectSessionRequest.source_tag defaults to "direct_session",
         # so we intentionally exclude it from the skip set — only explicitly
@@ -1056,6 +1088,24 @@ class DirectSessionRunner:
         with within(unit):
             return await self._run_session(request, session_id)
 
+    def cancel(self, session_id: str) -> bool:
+        """Request cancellation of one pending/running session, never its neighbors.
+
+        Peer callers first persist aggregate cancellation and invalidate leases
+        through their coordinator. A peer not yet started observes the flag on
+        entry, retaining ownership of cleanup and terminal recording.
+        """
+        task = self._active.get(session_id)
+        if task is None or task.done():
+            return False
+        state = self._peer_runs.get(session_id)
+        if state is not None:
+            state.cancelled = True
+            if not state.started:
+                return True
+        task.cancel()
+        return True
+
     async def shutdown(self, *, grace_s: float = 10.0) -> int:
         """Cancel in-flight session tasks and await their handlers.
 
@@ -1074,8 +1124,8 @@ class DirectSessionRunner:
         Returns the number of tasks that were still in flight.
         """
         tasks = [t for t in self._active.values() if not t.done()]
-        for t in tasks:
-            t.cancel()
+        for session_id in list(self._active):
+            self.cancel(session_id)
         if tasks:
             await asyncio.wait(tasks, timeout=grace_s)
         return len(tasks)

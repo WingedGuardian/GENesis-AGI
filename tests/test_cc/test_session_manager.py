@@ -70,6 +70,34 @@ async def test_create_background(db, manager):
     assert sess["model"] == "sonnet"
 
 
+async def test_initial_peer_binding_is_durable_before_start_hook_and_copied(db, manager):
+    initial = {"peer_task_id": "a" * 32, "peer_generation": 4, "autonomy_ceiling": 3}
+    observed = []
+
+    async def inspect_binding(session_id, session_type, source_tag):
+        row = await cc_sessions.get_by_id(db, session_id)
+        observed.append((json.loads(row["metadata"]), row["origin_class"], source_tag))
+        initial["peer_generation"] = 999
+
+    manager.add_on_start(inspect_binding)
+    row = await manager.create_background(
+        session_type=SessionType.BACKGROUND_TASK,
+        model=CCModel.SONNET,
+        source_tag="peer_api",
+        origin="external_untrusted",
+        initial_metadata=initial,
+    )
+    assert observed == [
+        (
+            {"peer_task_id": "a" * 32, "peer_generation": 4, "autonomy_ceiling": 3},
+            "external_untrusted",
+            "peer_api",
+        )
+    ]
+    persisted = await cc_sessions.get_by_id(db, row["id"])
+    assert json.loads(persisted["metadata"])["peer_generation"] == 4
+
+
 async def test_create_background_dispatch_mode(db, manager):
     """dispatch_mode is stored in metadata JSON alongside skill_tags."""
     sess = await manager.create_background(
