@@ -51,5 +51,45 @@ def test_the_known_units_are_in_scope():
 def test_sqlite_temp_files_go_to_the_big_disk(path):
     lines = path.read_text().splitlines()
     assert lines.count(SQLITE_LINE) == 1, path.name
-    # The directory must exist or SQLite silently falls back to TMPDIR.
-    assert "ExecStartPre=-/bin/mkdir -p __HOME__/tmp" in lines, path.name
+    # The directory must exist and be writable, or SQLite falls back to TMPDIR: the
+    # pre-start step creates it and warns when it is unusable, never refusing to start.
+    pre = [line for line in lines if line.startswith("ExecStartPre=") and "__HOME__/tmp" in line]
+    assert len(pre) == 1, path.name
+    assert pre[0].startswith("ExecStartPre=-"), path.name  # a failure here never stops the unit
+    assert 'mkdir -p "__HOME__/tmp"' in pre[0] and '[ -w "__HOME__/tmp" ]' in pre[0], path.name
+
+
+def test_the_pre_start_step_warns_on_an_unusable_directory(tmp_path):
+    """Run the rendered command itself: a writable dir is silent, an unwritable or
+    blocked one is reported on stderr, and the command never fails the unit."""
+    import os
+    import shlex
+    import subprocess
+
+    template = (SYSTEMD / "genesis-server.service.template").read_text()
+    (line,) = [ln for ln in template.splitlines() if ln.startswith("ExecStartPre=-/bin/sh -c ")]
+    script = shlex.split(line.removeprefix("ExecStartPre=-"))[2]
+
+    def run(home):
+        return subprocess.run(
+            ["/bin/sh", "-c", script.replace("__HOME__", str(home))],
+            capture_output=True,
+            text=True,
+        )
+
+    ok = run(tmp_path / "ok")
+    assert (tmp_path / "ok" / "tmp").is_dir() and ok.stderr == ""
+    if os.geteuid() == 0:
+        pytest.skip("root can write a mode-0555 directory")
+    ro = tmp_path / "ro"
+    (ro / "tmp").mkdir(parents=True)
+    (ro / "tmp").chmod(0o555)
+    try:
+        bad = run(ro)
+    finally:
+        (ro / "tmp").chmod(0o755)
+    assert "not a writable directory" in bad.stderr
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    (blocked / "tmp").write_text("a file where the directory should be")
+    assert "not a writable directory" in run(blocked).stderr
