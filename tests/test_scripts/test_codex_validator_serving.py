@@ -196,6 +196,8 @@ async def test_owned_grandchild_cannot_keep_output_pipe_open(tmp_path, monkeypat
     status = Path(f"/proc/{child}/stat")
     try:
         state = status.read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
+        # Linux procfs can report ESRCH after open when the process exits.
+        # https://www.kernel.org/doc/html/latest/filesystems/proc.html
         state = None  # Already reaped between process termination and this read.
     assert state is None or state.split(") ", 1)[1].startswith("Z ")
