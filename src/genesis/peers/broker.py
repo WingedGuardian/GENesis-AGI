@@ -19,6 +19,7 @@ from aiohttp import web
 from pydantic import BaseModel, ConfigDict
 
 from genesis.peers.digests import operation_digest
+from genesis.peers.disclosure_scan import json_strings_safe
 from genesis.peers.protocol import _finite_float, _nonfinite, _unique_object
 from genesis.peers.registry import capability as validate_capability
 from genesis.peers.resources import PublishedResources, resource_id
@@ -264,6 +265,8 @@ class PeerBroker:
         row, latest = await self._current(lease, executing=True)
         if latest.get(capability) != decisions[capability]:
             raise BrokerRefusal()
+        if name == "task_context" and not json_strings_safe(json.loads(row["message_json"])):
+            raise BrokerRefusal("operation_refused", 400)
         if self.execute_operation is None:
             result = await handler(row, latest, arguments)
         else:
@@ -274,6 +277,8 @@ class PeerBroker:
                 lambda: handler(row, latest, arguments),
                 immutable_read=name in {"task_context", "resources_list", "resource_read"},
             )
+        if not json_strings_safe(result):
+            raise BrokerRefusal("operation_refused", 400)
         _, final = await self._current(lease, executing=True)
         if final.get(capability) != decisions[capability]:
             raise BrokerRefusal()
@@ -300,7 +305,10 @@ class PeerBroker:
         return result
 
     async def _context(self, row, decisions, arguments):
-        text = json.dumps(json.loads(row["message_json"]), ensure_ascii=False)
+        message = json.loads(row["message_json"])
+        if not json_strings_safe(message):
+            raise BrokerRefusal("operation_refused", 400)
+        text = json.dumps(message, ensure_ascii=False)
         wrapped = ContentSanitizer().wrap_content(text, ContentSource.UNKNOWN)
         return {"task_id": row["id"], "context": wrapped}
 

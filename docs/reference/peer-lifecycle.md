@@ -28,6 +28,13 @@ may retry after that attempt drains and authority is rechecked. Unknown
 consequential effects cannot retry automatically. Completed receipts also require
 current authorization before reuse. Operation receipt storage is separate from
 full-result [owned artifact storage](peer-results.md).
+Original JSON string keys and values are scanned before serialization, including
+broker task context. Existing size, JSON admissibility and authority constraints
+remain in place; escaping cannot conceal an existing sensitive-data pattern.
+The broker also scans every returned outcome before disclosure, including
+historical results replayed by the coordinator. Cached context checks
+the original task message as well as the serialized wrapper; completion remains
+immutable and is never re-executed to replace a refused receipt.
 
 Completion time and execution duration have separate fields from cleanup time.
 The runner captures the first authoritative streaming result before cleanup;
