@@ -1381,12 +1381,21 @@ fi
 # the exact gap that left genesis-cc-align.timer disabled under the old
 # hardcoded per-timer list.
 if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
+    GENESIS_ROOT="${GENESIS_ROOT:-$REPO_DIR}"
+    # shellcheck source=lib/managed_units.sh
+    . "$SCRIPT_DIR/lib/managed_units.sh"
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
         [ -f "$template" ] || continue
         timer_name=$(basename "$template" .template)
         case "$timer_name" in
             genesis-backup.timer) continue ;;  # deliberate setup step
         esac
+        # A re-run must not turn back on a timer the operator switched off
+        # (~/.genesis/config/disabled_timers; lib/managed_units.sh).
+        if genesis_timer_opted_out "$timer_name"; then
+            echo "    - $timer_name not enabled (listed in $GENESIS_DISABLED_TIMERS)"
+            continue
+        fi
         if [ -f "$SYSTEMD_USER_DIR/$timer_name" ]; then
             systemctl --user enable --now "$timer_name" 2>/dev/null && \
                 echo "    + $timer_name enabled + started" || true

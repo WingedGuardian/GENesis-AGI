@@ -563,6 +563,22 @@ main() {
         done < <(find "$_pmb_root" -mindepth 1 -maxdepth 1 -type d -mtime +45 -print0 2>/dev/null)
     fi
 
+    echo "--- replaced systemd unit backup retention prune (>90d) ---"
+    # update.sh --take-template / bootstrap's GENESIS_TAKE_TEMPLATES save a hand-edited
+    # unit here, one directory per run, before installing its template
+    # (lib/managed_units.sh). Written once, so a directory's mtime is its age. Same
+    # guarded removal as the prune above.
+    if ! _dbk_root="$(cd -P -- "$HOME/.genesis/deploy-backups" 2>/dev/null && pwd -P)"; then
+        :
+    elif ! _dbk_mounts="$(mount_targets "$_dbk_root")"; then
+        echo "deploy-backups prune SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
+    else
+        while IFS= read -r -d '' _dbk_dir; do
+            remove_tree_one_fs "$_dbk_dir" "$_dbk_mounts" 1 \
+                || echo "deploy-backups prune failed or spared $_dbk_dir"
+        done < <(find "$_dbk_root" -mindepth 1 -maxdepth 1 -type d -mtime +90 -print0 2>/dev/null)
+    fi
+
     echo "--- hook audit store size trim (>5MB per store, newest kept) ---"
     # The two store knobs, read BY NAME out of secrets.env.
     #

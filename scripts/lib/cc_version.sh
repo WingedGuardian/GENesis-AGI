@@ -1198,6 +1198,15 @@ PYEOF
 #                                misrouting — matches install.sh)
 #   - post-install: re-check `claude --version`; still != pin -> warn + return 1
 #
+# One line in an update's run summary (update.sh / bootstrap.sh set
+# GENESIS_DEPLOY_SUMMARY), so a pin realignment or a deleted shadow copy is
+# never visible only in output a `tail` has already dropped.
+_cc_deploy_summary() {
+    if [ -n "${GENESIS_DEPLOY_SUMMARY:-}" ]; then
+        printf '%s\n' "$*" >> "$GENESIS_DEPLOY_SUMMARY" 2>/dev/null || true
+    fi
+}
+
 # Exact-match to the pin (the pin may legitimately go DOWN for incident rollback;
 # `npm install @X.Y.Z` pins exactly X.Y.Z). NOTE `claude --version` prints
 # "2.1.173 (Claude Code)", so the version is field 1 (awk '{print $1}').
@@ -1295,6 +1304,7 @@ cc_ensure_local() {
     [ -n "$installed" ] || installed="$(claude --version 2>/dev/null | awk '{print $1}')"
     if [ "$installed" = "$pin" ]; then
         echo "  + Claude Code now at pin ($pin)"
+        _cc_deploy_summary "Claude Code aligned to the pin ($pin)"
         return 0
     fi
     echo "  WARNING: cc_ensure_local: install ran but 'claude --version' is ${installed:-unknown} (expected $pin) — possible npm-prefix/PATH mismatch" >&2
@@ -1383,6 +1393,7 @@ cc_shadow_scan() {
             *)
                 echo "  cc_shadow_scan: removing native-installer version blobs ($HOME/.local/share/claude/versions)"
                 rm -rf "$HOME/.local/share/claude/versions"
+                _cc_deploy_summary "removed Claude Code native-installer versions ($HOME/.local/share/claude/versions)"
                 ;;
         esac
     fi
@@ -1466,6 +1477,7 @@ _cc_remove_shadow() {
             ;;
     esac
     echo "  cc_shadow_scan: removing shadow copy $candidate${pkg_dir:+ (+ $pkg_dir)}"
+    _cc_deploy_summary "removed a shadow Claude Code copy: $candidate${pkg_dir:+ (+ $pkg_dir)}"
     "${rm_link[@]}"
     [ -n "$pkg_dir" ] && "${rm_pkg[@]}"
     return 0
