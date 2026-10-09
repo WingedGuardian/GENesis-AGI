@@ -278,8 +278,9 @@ _cred_fallback_sources() {
 # decrypt_file <src.gpg> <dst>
 decrypt_file() {
     local src="$1" dst="$2"
-    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
-        -d -o "$dst" "$src" 2>/dev/null
+    backup_passphrase_valid "$_BACKUP_PASSPHRASE" || return 1
+    printf '%s' "$_BACKUP_PASSPHRASE" | python3 \
+        "$_SCRIPT_DIR/../src/genesis/guardian/cred_integrity.py" decrypt-backup "$src" "$dst" 2>/dev/null
 }
 
 # read_payload <path-without-.gpg> → echo resolved path and whether decryption needed.

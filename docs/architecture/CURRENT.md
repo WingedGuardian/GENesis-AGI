@@ -1579,7 +1579,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 83a835e32 2026-10-08
+verified: 7ec594c72 2026-10-09
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -1588,6 +1588,13 @@ verified: 83a835e32 2026-10-08
   monitors the host Guardian every awareness tick, incl. git-SHA code-drift
   detection). Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **Shared backup decryption (development candidate)**: the standalone
+  `guardian/cred_integrity.py` file authenticates one passphrase-encrypted,
+  integrity-protected message for credential recovery and backup/restore.
+  It runs under system Python without Genesis imports. File recovery replaces
+  destinations only after successful authentication; the streaming API accepts
+  results only after checking the complete message. Native GPG controls cover
+  this candidate; installed rollout and configured-NAS writes remain unverified.
 - **guard-layer watch** (`guardian/guard_layer_watch.py`, a SIDE-watch in
   `run_check`, not a `probe_*`): asks whether the AGENT TOOLING can still
   evaluate — the `genesis-hook` LAUNCHER end to end, the container venv
