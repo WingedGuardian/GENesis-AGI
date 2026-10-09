@@ -6,7 +6,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime
 
-from flask import Blueprint, current_app, g, jsonify, request
+from flask import Blueprint, Response, current_app, g, jsonify, request
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
 from genesis.dashboard._blueprint import _async_route
@@ -30,6 +30,7 @@ def _err(code: str, status: int):
         "state_conflict": "Requested state conflicts with existing work",
         "rate_limited": "Peer admission limit reached",
         "spawn_timeout": "Accepted task is still in progress",
+        "result_not_ready": "Result is not available",
     }
     return jsonify(error=messages[code], code=code), status
 
@@ -159,6 +160,40 @@ def _tasks():
     return current_app.config.get("GENESIS_PEER_TASKS")
 
 
+async def _project(rows):
+    service = current_app.config.get("GENESIS_PEER_RESULTS")
+    if service is None:
+        return rows  # Inactive foundation has status only, never a raw-result fallback.
+    return await service.project(g.peer_identity.peer, rows)
+
+
+@agent_api_bp.route(ROOT + "/tasks/<task_id>/artifacts/<artifact_id>")
+@_async_route(timeout=15)
+async def get_artifact(task_id, artifact_id):
+    from genesis.peers.tasks import TaskRefusal
+
+    g.peer_task_id = task_id
+    service = current_app.config.get("GENESIS_PEER_RESULTS")
+    if service is None:
+        return _err("not_ready", 503)
+    try:
+        content = await service.fetch(g.peer_identity.peer, task_id, artifact_id)
+        return Response(
+            content,
+            content_type="text/plain; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="result.md"',
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-store",
+            },
+        )
+    except TaskRefusal as error:
+        return _err(error.code, error.status)
+    except Exception:
+        logger.warning("Peer result unavailable")
+        return _err("result_not_ready", 409)
+
+
 def _protocol_error(error):
     from a2a.utils.error_handlers import build_rest_error_payload
 
@@ -205,6 +240,7 @@ async def send_message():
                     "task_id": row["id"],
                 }
                 return jsonify(payload), 504
+        row = (await _project([row]))[0]
         return _protocol_response(SendMessageResponse(task=task_view(row)))
     except A2AError as error:
         return _protocol_error(error)
@@ -227,6 +263,7 @@ async def get_task(task_id):
             return _err("not_ready", 503)
         row = await service.owned(g.peer_identity.peer, task_id)
         g.peer_task_id = row["id"]
+        row = (await _project([row]))[0]
         return _protocol_response(task_view(row))
     except A2AError as error:
         return _protocol_error(error)
@@ -265,6 +302,7 @@ async def list_tasks():
         rows, cursor, total = await service.page(
             g.peer_identity.peer, page_size=size, page_token=params.page_token
         )
+        rows = await _project(rows)
         payload = serialize_list_tasks_response(
             ListTasksResponse(
                 tasks=[task_view(row) for row in rows],
@@ -303,6 +341,7 @@ async def cancel_task(task_id):
             return _err("not_ready", 503)
         row = await service.cancel(g.peer_identity.peer, task_id)
         g.peer_task_id = row["id"]
+        row = (await _project([row]))[0]
         return _protocol_response(task_view(row))
     except A2AError as error:
         return _protocol_error(error)

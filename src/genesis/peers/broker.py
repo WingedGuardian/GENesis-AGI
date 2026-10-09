@@ -18,6 +18,7 @@ from pathlib import Path
 from aiohttp import web
 from pydantic import BaseModel, ConfigDict
 
+from genesis.peers.digests import operation_digest
 from genesis.peers.disclosure_scan import json_strings_safe
 from genesis.peers.protocol import _finite_float, _nonfinite, _unique_object
 from genesis.peers.registry import capability as validate_capability
@@ -253,17 +254,9 @@ class PeerBroker:
         )
         if name == "resource_read" and resource is None:
             raise BrokerRefusal("not_found", 404)
-        digest = hashlib.sha256(
-            json.dumps(
-                {
-                    "operation": name,
-                    "arguments": arguments.model_dump(),
-                    "resource_digest": resource["sha256"] if resource else None,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
+        digest = operation_digest(
+            name, arguments.model_dump(), resource["sha256"] if resource else None
+        )
         if (
             await self.authorize_operation(lease.binding, capability, digest, decisions[capability])
             is not None

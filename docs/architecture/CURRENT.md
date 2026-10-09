@@ -951,8 +951,11 @@ verified: 75a4171b14 2026-10-09
   needs-user alerts; malformed legacy rows retain backoff and alert recovery.
   Unknown
   consequential effects block continuation and successful handoff. Runtime
-  installation, owned artifact disclosure and full HTTP integration remain
-  later lifecycle slices. See [coordinator](../reference/peer-coordinator.md). See [lifecycle state](../reference/peer-lifecycle.md).
+  installation and full HTTP lifecycle integration remain later slices. Owned
+  publication checks timely completion, full drain, current consent and every
+  completed receipt before atomically completing the task and provider park.
+  See [owned results](../reference/peer-results.md), [coordinator](../reference/peer-coordinator.md)
+  and [lifecycle state](../reference/peer-lifecycle.md).
   See [peer approvals](../reference/peer-approvals.md).
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
   converge there. `EmailAutonomyGate` (`autonomy/email_gate.py`, WS-8
@@ -1414,6 +1417,14 @@ verified: 9a1e0b7 2026-10-08
   stays absent until the constrained coordinator, broker, approvals and recovery
   are ready; discovery still advertises no task skills. See
   `docs/reference/peer-admission.md`.
+- **Owned peer result groundwork (dark until runtime readiness)**:
+  `peers/artifacts.py` scans full private result files, records safe publication
+  snapshots and serves an owned artifact URL on the existing peer boundary.
+  Task GET/LIST/duplicate-send projections recheck current authority and exact
+  builtin resource provenance. Downloads validate file safety, full hash/size
+  and authority after reading. Resource withdrawal withholds dependent output;
+  missing files can leave an authorized historical preview visible. No separate
+  artifact size cap exists. See [owned results](../reference/peer-results.md).
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
   it yields at startup, exit 200, when the genesis-server process lock is
