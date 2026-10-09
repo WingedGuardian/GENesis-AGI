@@ -1340,7 +1340,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: 076085463c7b 2026-10-09
+verified: 0c0bb701c5e2 2026-10-09
 ```
 
 - **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
@@ -1352,6 +1352,16 @@ verified: 076085463c7b 2026-10-09
   No task skills or task execution advertised in this foundation. Revocation
   disables access immediately; credential equality with another surface refuses
   activation. See `docs/reference/peer-registry.md`.
+- **Peer admission groundwork**: A2A1.0 `message:send`, owned task get/list/cancel
+  routes use the pinned SDK wire models. Private SQLite admission commits receipt,
+  UTC admission statistics, grant snapshot, task and prepared queue row together. Exact retries
+  share a receipt; changed intent conflicts. Limits are two reserved slots per
+  peer and globally and twenty nonterminal tasks per peer. Daily statistics
+  impose no task budget; Genesis retains its permission and approval decisions.
+  Legacy claim and stale-claim recovery exclude peer rows. The runtime task service
+  stays absent until the constrained coordinator, broker, approvals and recovery
+  are ready; discovery still advertises no task skills. See
+  `docs/reference/peer-admission.md`.
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
   it yields at startup, exit 200, when the genesis-server process lock is

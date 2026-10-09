@@ -1,6 +1,6 @@
 # Trusted peer registry
 
-This foundation enables authenticated discovery and readiness only. Task skills
+This foundation enables authenticated discovery and readiness. Task skills
 remain unadvertised and task service readiness is false until the coordinator
 lands. It changes no listener or live deployment. Follow the ingress runbook
 before operator activation; a peer credential is never dashboard authority.
@@ -8,6 +8,8 @@ before operator activation; a peer credential is never dashboard authority.
 The database must already exist and contain the migrated peer tables. Local
 operator commands use private guarded connections; missing/quarantined databases
 are refused. No HTTP endpoint changes configuration, identities or grants.
+The dependent [admission slice](peer-admission.md) defines owned task operations;
+they remain unavailable until the complete runtime coordinator is ready.
 
 ```bash
 python -m genesis peers configure fallback --service-url https://YOUR-TAILNET-HOST/v1/agent/a2a

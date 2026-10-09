@@ -82,7 +82,15 @@ async def test_health_auth_card_url_and_audit_do_not_disclose(app, registry, mon
         card.json["securitySchemes"]["peerBearer"]["httpAuthSecurityScheme"]["scheme"] == "Bearer"
     )
     assert "peerBearer" in card.json["securityRequirements"][0]["schemes"]
-    assert client.post(ROOT + "/message:send", headers=headers).status_code == 404
+    response = client.post(
+        ROOT + "/message:send",
+        headers={**headers, "A2A-Version": "1.0"},
+        json={
+            "message": {"messageId": "probe", "role": "ROLE_USER", "parts": [{"text": "Probe"}]},
+            "configuration": {"returnImmediately": True},
+        },
+    )
+    assert response.status_code == 503 and response.json["code"] == "not_ready"
 
 
 async def test_body_cap_refuses_without_content_length_after_auth(app, registry, monkeypatch):
@@ -105,3 +113,120 @@ async def test_loop_absent_never_falls_back(app, registry, monkeypatch):
     app.config.pop("GENESIS_EVENT_LOOP")
     response = app.test_client().get(ROOT + "/health", headers=headers)
     assert response.status_code == 503 and response.json["code"] == "not_ready"
+
+
+@pytest.fixture
+async def task_app(app, registry, monkeypatch):
+    from genesis.db.schema import TABLES
+    from genesis.peers.tasks import PeerTasks
+
+    headers = await configure(registry, monkeypatch)
+    headers["A2A-Version"] = "1.0"
+    await registry.grant("muse", "conversation", "allow")
+    async with registry.connection() as db:
+        for name in (
+            "direct_session_queue",
+            "peer_tasks",
+            "peer_receipts",
+            "peer_daily_admissions",
+        ):
+            await db.execute(TABLES[name])
+        await db.commit()
+    app.config["GENESIS_PEER_TASKS"] = PeerTasks(registry)
+    return app.test_client(), headers
+
+
+def task_message():
+    return {
+        "message": {
+            "messageId": "http-one",
+            "role": "ROLE_USER",
+            "parts": [{"text": "Please help"}],
+        },
+        "configuration": {"returnImmediately": True},
+    }
+
+
+async def test_owned_task_send_retry_get_list_cancel(task_app):
+    client, headers = task_app
+    first = client.post(ROOT + "/message:send", headers=headers, json=task_message())
+    assert first.status_code == 200 and first.mimetype == "application/a2a+json"
+    task_id = first.json["task"]["id"]
+    retry = client.post(ROOT + "/message:send", headers=headers, json=task_message())
+    assert retry.json["task"]["id"] == task_id
+    fetched = client.get(ROOT + "/tasks/" + task_id, headers=headers)
+    assert fetched.json["id"] == task_id
+    assert fetched.json["status"]["state"] == "TASK_STATE_SUBMITTED"
+    listed = client.get(ROOT + "/tasks", headers=headers)
+    assert listed.json["tasks"][0]["id"] == task_id and listed.json["pageSize"] == 20
+    canceled = client.post(
+        ROOT + "/tasks/" + task_id + ":cancel", headers=headers, json={"id": task_id}
+    )
+    assert canceled.status_code == 200 and canceled.json["status"]["state"] == "TASK_STATE_CANCELED"
+    assert client.get(ROOT + "/tasks/unknown", headers=headers).status_code == 404
+    assert (
+        client.post(
+            ROOT + "/tasks/unknown:cancel", headers=headers, json={"id": "unknown"}
+        ).status_code
+        == 404
+    )
+
+
+async def test_task_routes_keep_auth_first_and_reject_unsupported_parameters(task_app):
+    client, headers = task_app
+    paths = [
+        ("POST", "/message:send"),
+        ("GET", "/tasks"),
+        ("GET", "/tasks/unknown"),
+        ("POST", "/tasks/unknown:cancel"),
+    ]
+    for method, path in paths:
+        assert client.open(ROOT + path, method=method, data=b"bad").status_code == 401
+        assert (
+            client.open(
+                ROOT + path, method=method, data=b"x" * (MAX_BODY_BYTES + 1), headers=headers
+            ).status_code
+            == 413
+        )
+    for query in (
+        "?pageSize=0",
+        "?pageSize=101",
+        "?pageSize=bad",
+        "?pageToken=bad!",
+        "?pageSize=2&pageSize=3",
+        "?status=working",
+    ):
+        assert client.get(ROOT + "/tasks" + query, headers=headers).status_code == 400
+    assert (
+        client.post(
+            ROOT + "/tasks/unknown:cancel", headers=headers, json={"id": "different"}
+        ).status_code
+        == 400
+    )
+    missing_version = {name: value for name, value in headers.items() if name != "A2A-Version"}
+    assert (
+        client.post(
+            ROOT + "/message:send", headers=missing_version, json=task_message()
+        ).status_code
+        == 400
+    )
+    assert client.get(ROOT + "/tasks", headers=headers).json["tasks"] == []
+
+
+async def test_finished_task_cancel_uses_sdk_error_and_grant_revocation_hides(task_app, registry):
+    client, headers = task_app
+    first = client.post(ROOT + "/message:send", headers=headers, json=task_message())
+    task_id = first.json["task"]["id"]
+    async with registry.transaction() as db:
+        await db.execute(
+            "UPDATE peer_tasks SET state='completed',slot_reserved=0 WHERE id=?", (task_id,)
+        )
+    assert (
+        client.post(
+            ROOT + "/tasks/" + task_id + ":cancel", headers=headers, json={"id": task_id}
+        ).status_code
+        == 400
+    )
+    await registry.grant("muse", "conversation", "deny")
+    assert client.get(ROOT + "/tasks/" + task_id, headers=headers).status_code == 404
+    assert client.get(ROOT + "/tasks", headers=headers).json["tasks"] == []
