@@ -1,0 +1,1 @@
+- Trusted peer requests no longer face a daily task-count quota. Genesis retains permission, approval, execution-capacity and work-time controls; daily admissions remain audit statistics.
