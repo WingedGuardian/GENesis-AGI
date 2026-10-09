@@ -128,7 +128,7 @@ WAIT build
    a controller missing from the parent, no memcg swap accounting), it warns
    that the cap could not be verified. Swap is skipped when no swap device is
    active, since nothing can swap. Either way the job still runs in the scope,
-   visible to other sessions, and also gets the uncapped fallback's nice 19 and
+   visible to other sessions, and also gets nice 19 and
    data limit.
 3. The job's exit code is `run`'s exit code (128+N for signal N). On exit it
    prints, on stderr, the job's peak memory, its CPU seconds, and whether it was
@@ -150,21 +150,43 @@ reservation. Two `run`s started within a few seconds of each other can both
 be admitted, since neither scope exists yet when the other checks. CPU is
 compressible and capped by the quota, so it is not reserved.
 
-SIGINT, SIGTERM and SIGHUP to `run` stop the scope (and the launch itself, if
-the signal arrives before systemd has registered it); `run` does not wait for the
-job to finish stopping. A second signal escalates to SIGKILL, which matters for
-an uncapped job that ignores SIGTERM. A watchdog checks every 10 seconds;
-if the box stays over the line for 60 seconds (container memory or a disk named
-with `--disk`, in any combination), it stops this job. It stops this job even when other work caused the
-pressure, because this is the job Genesis can stop safely; it never touches
-anything else. A resource approved with `--approved-over-line` is not watched.
+SIGINT, SIGTERM and SIGHUP to `run` request cooperative SIGTERM cleanup of
+its process group and exact named scope, including descendants that stay in
+that scope. The wrapper keeps waiting for verified scope completion even if
+the launch process exits first. A second cancellation requests SIGKILL; there
+is no added timed escalation after the first cancellation. Existing scope
+runtime ceilings still apply. The cancellation exit code is 128 plus the last
+delivered caller signal. Supervision requires the Linux main CLI thread,
+default SIGCHLD disposition, and exclusive ownership of child wait status.
+Unexpected external reaping or unverifiable scope cleanup is reported.
+Once the direct child exits, its retained wait status is consumed before
+independently checking scope completion. A failed scope readback does not leave
+that exited child unreaped, and numeric signaling authority closes before reap.
 
-Without `systemd-run` or a reachable systemd user manager the job runs
-UNCAPPED, under `nice 19` and a data-segment limit (`RLIMIT_DATA`) of `--ram`;
-the output says so. An address-space limit is not used, because runtimes such
-as the JVM, node and OpenBLAS reserve address ranges they never touch and fail
-to start under one. An uncapped job is invisible to other sessions' `status`
-and `preflight`.
+The intended unit name alone does not authorize a scope signal or wait. A
+private pipe acknowledgment from a helper running inside the registered scope
+establishes that authority. Registration refusal, including a name collision,
+leaves any pre-existing scope alone. Before acknowledgment, cancellation can
+signal only the owned, unreaped launcher's process group. The helper runs with
+isolated Python startup and no site hooks, closes the registration writer,
+restores exec signal defaults and the incoming `LC_CTYPE` presence/value, then
+executes the payload. This prevents isolated Python locale coercion from
+changing a non-Python target's locale. Unit suffixes
+contain 128 random bits; this prevents accidental reuse with high probability,
+but does not provide atomic protection against deliberate same-user unit
+replacement or process migration.
+
+A watchdog checks every 10 seconds. If the box stays over the line for 60 seconds
+(container memory or a disk named with `--disk`, in any combination), it requests
+SIGTERM for this job, even when other work caused the pressure. A resource
+approved with `--approved-over-line` is not watched. A watchdog request does not
+count as a caller cancellation or certify that shutdown has completed.
+
+Without `systemd-run` or a reachable systemd user manager, `run` refuses the job
+before spawning it and exits 64 with the reason. It does not launch an invisible
+uncapped fallback. Accepted scopes whose caps are unenforced or unverified keep
+the warnings and additional nice 19/data-segment limit described above; this
+policy change does not change those scoped launches.
 
 `run` is for non-interactive jobs: the job runs in its own session, without a
 controlling terminal, so password prompts (ssh, sudo, git credentials) fail.
@@ -181,8 +203,9 @@ under `--json`), and the job's own report lines start with `genesis-job`.
 - `run` reads its limits and exit figures (peak memory, CPU time, cap kills)
   from cgroup v2 files. On cgroup v1 it warns that it cannot verify the caps and
   the exit report omits those figures.
-- A job that ignores SIGTERM keeps running until the scope's own stop timeout
-  (systemd's default is 90 s), though `run` has already reported its exit.
+- A job that ignores the first cooperative cancellation can keep the wrapper
+  waiting until a second cancellation forces SIGKILL or an existing runtime
+  ceiling applies. Scope inspection failures are reported as incomplete cleanup.
 - CPU reads cgroup v2 only. On cgroup v1, capacity is the affinity count and use
   comes from `/proc/stat`, which inside a container may cover the whole host.
 - Where the cgroup has no `*.pressure` files, PSI comes from `/proc/pressure`,

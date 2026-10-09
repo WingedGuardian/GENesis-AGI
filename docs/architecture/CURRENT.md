@@ -2450,9 +2450,29 @@ Self-improvement loops and the instrumentation that keeps them honest.
 
 ```yaml subsystem-map
 entry: learning-evaluation
-modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 4117f6ed 2026-10-05
+modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
+verified: 7ec594c72 2026-10-09
 ```
+
+- **transcript_analytics/**: optional local transcript parser library. It
+  extracts physical records, preserves unresolved identity and usage, and
+  applies the shared credential scrubber to structured content. Schema5 records
+  distinguish executor identity from delegation evidence. This development
+  candidate also adds immutable per-source Parquet generations selected by an
+  atomic, validated catalog; readers and generation collection share publication
+  locks. DuckDB exposes separate executor, delegation and context views with
+  explicit coverage denominators, while private connection-owned spill storage
+  protects query intermediates. The opt-in CLI now exposes ingest, derive,
+  status, SQL, prune and verify through an enforced, registered systemd scope,
+  with cooperative first cancellation and explicit second-cancellation force.
+  Uncapped launches are refused; the default configuration remains disabled.
+  Evidence retrieval, installed scheduling and encrypted recovery arrive in
+  dependent changes. This map does not describe a deployed capability.
+
+- **Optional analytics installation (development candidate)**: persistent opt-in
+  installs DuckDB/PyArrow; the hourly supervised collection timer remains disabled
+  when configuration or optional dependencies are unavailable. On-demand
+  opportunity-scan is installed as a skill; configured timer rollout is unverified.
 
 - **The graders are TOLD the response status; they must never infer it.** The
   triage/outcome/delta graders each judge an `InteractionSummary`, and the
