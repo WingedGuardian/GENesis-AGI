@@ -1377,7 +1377,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: b70bf6f35 2026-10-09
+verified: e8a5e8c25 2026-10-09
 ```
 
 - **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
@@ -1423,6 +1423,10 @@ verified: b70bf6f35 2026-10-09
   consent. Host gates cover admission, claim, start and continuation. Shutdown
   quiesces notification delivery before Telegram closes. See
   [peer runtime](../reference/peer-runtime.md).
+- **Peer research recovery**: closed receipt schemas validate historical search
+  and fetch provenance before provider clients or live broker startup. Only
+  fixed research tool names extend publication telemetry; reconstructed bindings
+  retain their original execution tool set and current permissions still apply.
 - **Bounded peer research**: `peers/research.py` registers exact search/fetch
   operations with existing consent, receipts and final disclosure checks.
   Existing search backends use a private bounded streaming path; public fetch

@@ -28,14 +28,23 @@ deadline. Existing synchronous HTML extraction works only on that bounded body;
 the deadline is checked afterwards, without claiming CPU preemption.
 
 Returned strings are scanned and wrapped as untrusted external content.
+Arguments and stored receipts scan original string keys and values before JSON
+escaping, using the existing sensitive-data patterns.
+Historical cached outcomes pass the broker's same final scan without rerunning
+completed operations. Cached task context also checks the original message,
+since its wrapped serialized form can hide those patterns.
 Completed receipts bind strict arguments and a closed result schema. Retrying
 an exact completed operation returns the stored snapshot, even if the remote
 page later changes. An uncertain read can retry only after the previous scope
 and broker operations have drained. Changed arguments require new exact consent;
 retries retain the original task allowance and expiry.
 
-Publication and download revalidate every completed receipt, the currently
-registered research operation and current authority. Withdrawal withholds
+Live publication and download revalidate every completed receipt, the currently
+registered research operation and current authority. Startup recovery instead
+uses the same closed receipt schemas before constructing provider clients or
+the live broker. It permits only the fixed research tool names in historical
+usage counts; reconstructed recovery bindings gain no execution tools.
+Withdrawal withholds
 dependent output. Unknown schemas, malformed receipts and failed searches do
 not become approved provenance. Existing2MiB receipt storage remains capped.
 

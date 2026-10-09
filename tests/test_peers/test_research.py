@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import secrets
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -39,6 +40,124 @@ from tests.test_peers.test_runtime import (
 )
 
 installed = _installed_fixture
+
+
+@pytest.mark.parametrize("unsafe", [False, True])
+async def test_historical_research_receipt_replayed_through_actual_provider_resume(
+    installed, unsafe
+):
+    from genesis.security.output_scanner import scan_outbound
+
+    await installed.registry.grant("muse", "conversation", "allow")
+    await installed.registry.grant("muse", "research", "allow")
+    service = await start(installed)
+    network, errors, segments = [], [], []
+    saved = {}
+
+    def response(req):
+        network.append("search")
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "title": "Public title",
+                        "url": "https://example.com",
+                        "content": "Public text",
+                    }
+                ]
+            },
+        )
+
+    service.research.searcher = WebSearcher()
+    await service.research.searcher._client.aclose()
+    service.research.searcher._client = httpx.AsyncClient(transport=httpx.MockTransport(response))
+
+    async def invoke(invocation, on_event):
+        entry = json.loads(Path(invocation.mcp_config).read_text())["mcpServers"]["genesis_peer"]
+        parameters = StdioServerParameters(
+            command=entry["command"],
+            args=entry["args"],
+            cwd=invocation.working_dir,
+            env={
+                "HOME": str(Path.home()),
+                "PATH": os.environ["PATH"],
+                "PYTHONPATH": str(Path.cwd() / "src"),
+            },
+        )
+        segments.append(next(iter(service.coordinator._bindings)))
+        async with stdio_client(parameters) as (read, write), ClientSession(read, write) as client:
+            await client.initialize()
+            answer = await client.call_tool(
+                "research_search", {"query": "public query", "max_results": 5}
+            )
+            errors.append(answer.isError)
+        if len(errors) == 1:
+            assert not answer.isError
+            async with installed.registry.transaction() as db:
+                row = await (
+                    await db.execute(
+                        "SELECT id,segment_id,result_json FROM peer_operations WHERE capability='research' AND status='completed'"
+                    )
+                ).fetchone()
+                saved.update(id=row["id"], segment_id=row["segment_id"])
+                if unsafe:
+                    receipt = json.loads(row["result_json"])
+                    receipt["data"]["results"][0]["title"] = (
+                        'token: "' + secrets.token_hex(16) + '"'
+                    )
+                    assert scan_outbound(json.dumps(receipt, ensure_ascii=False)).safe, (
+                        "legacy serialized scanner control"
+                    )
+                    # Emulate an old completed row; new writes must not accept it.
+                    await db.execute(
+                        "UPDATE peer_operations SET result_json=? WHERE id=?",
+                        (json.dumps(receipt), row["id"]),
+                    )
+            raise CCRateLimitError("Fixture provider interruption")
+        assert answer.isError is unsafe
+        await on_event(flow.StreamEvent("result"))
+        return flow.CCOutput("fixture-cli", "Public final answer.", "sonnet", 0, 0, 0, 1, 0)
+
+    installed.runtime._direct_session_runner._invoker.run_streaming = invoke
+    sent = await request(installed, "POST", "/message:send", json=task_message())
+    assert sent.status_code == 200
+    task_id = sent.json["task"]["id"]
+    identity = await installed.registry.get("muse")
+    async with asyncio.timeout(30):
+        while (await service.owned(identity, task_id))["state"] not in {"completed", "failed"}:
+            await asyncio.sleep(0.01)
+    assert errors == [False, unsafe] and len(network) == 1
+    assert len(segments) == 2 and segments[0] != segments[1]
+    async with installed.registry.connection() as db:
+        rows = await (
+            await db.execute(
+                "SELECT id,segment_id,status FROM peer_operations WHERE capability='research'"
+            )
+        ).fetchall()
+        artifacts = (await (await db.execute("SELECT COUNT(*) FROM peer_artifacts")).fetchone())[0]
+    assert [tuple(row) for row in rows] == [(saved["id"], saved["segment_id"], "completed")]
+    assert saved["segment_id"] == segments[0]
+    assert (await service.owned(identity, task_id))["state"] == (
+        "failed" if unsafe else "completed"
+    )
+    assert artifacts == (0 if unsafe else 1)
+
+
+def test_original_research_arguments_and_receipts_cannot_hide_behind_escaping():
+    unsafe = 'token: "' + secrets.token_hex(16) + '"'
+    arguments = SearchArguments(query=unsafe)
+    research = PeerResearch(PeerBroker(None, lambda *_: None))
+    with pytest.raises(BrokerRefusal, match="operation_refused"):
+        research._inputs(arguments)
+    result = snapshot()
+    result["arguments"] = arguments.model_dump()
+    digest = operation_digest(result["operation"], result["arguments"])
+    with pytest.raises(ValueError, match="Research receipt refused"):
+        validate_receipt(result, digest)
+    assert research._inputs(SearchArguments(query="Public query")) is None
+    safe = snapshot()
+    validate_receipt(safe, operation_digest(safe["operation"], safe["arguments"]))
 
 
 @pytest.mark.parametrize(

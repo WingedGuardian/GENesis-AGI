@@ -109,7 +109,7 @@ class PeerArtifacts:
         if not self.directory.is_absolute():
             raise ValueError("Private peer storage required")
 
-    async def publish(self, binding, session_id, result):
+    async def publish(self, binding, session_id, result, *, allowed_tools=None):
         if (
             result["success"] is not True
             or result["cleanup_confirmed"] is not True
@@ -131,7 +131,10 @@ class PeerArtifacts:
             raise TaskRefusal("result_not_ready", 409) from None
         digest = hashlib.sha256(content).hexdigest()
         summary = content[:4096].decode("utf-8", errors="ignore")
-        tools = _tools(result["tools_summary"], binding.segment.tools)
+        tools = _tools(
+            result["tools_summary"],
+            binding.segment.tools if allowed_tools is None else allowed_tools,
+        )
         async with self.registry.transaction() as db:
             task = await current(db, binding.task_id, binding.generation, execution=False)
             if not await effects_known(db, binding.task_id):

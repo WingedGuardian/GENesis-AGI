@@ -5,6 +5,7 @@ import logging
 import os
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 from genesis.env import genesis_home
@@ -177,7 +178,14 @@ async def init(runtime):
     private_directory(directory / "segments")
     service = PeerRuntime(runtime, registry, directory)
     runtime._peer_runtime = service  # Own partial setup, including degraded bootstrap.
-    service.recovered = await PeerRecovery(registry, directory / "segments").run()
+    from genesis.peers.research import RESEARCH_PUBLICATION_TOOLS, validate_receipt
+
+    service.recovered = await PeerRecovery(
+        registry,
+        directory / "segments",
+        research=SimpleNamespace(validate=validate_receipt),
+        publication_tools=RESEARCH_PUBLICATION_TOOLS,
+    ).run()
     if (
         not service.recovered
         or not runtime.is_bootstrapped

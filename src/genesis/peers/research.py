@@ -1,7 +1,6 @@
 """Closed research operation schemas and trusted snapshot provenance."""
 
 import asyncio
-import json
 import time
 from typing import Literal
 from urllib.parse import urlsplit
@@ -11,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from genesis.peers.broker import BrokerRefusal, EmptyArguments
 from genesis.peers.digests import operation_digest
+from genesis.peers.disclosure_scan import json_strings_safe
 from genesis.peers.research_fetch import canonical_url, fetch_public
 from genesis.security.output_scanner import scan_outbound
 from genesis.security.sanitizer import ContentSanitizer, ContentSource
@@ -67,6 +67,7 @@ _SCHEMAS = {
     "research_search": (SearchArguments, SearchData),
     "research_fetch": (FetchArguments, FetchData),
 }
+RESEARCH_PUBLICATION_TOOLS = tuple("mcp__genesis_peer__" + name for name in _SCHEMAS)
 
 
 def search_url(value):
@@ -108,7 +109,7 @@ def validate_receipt(result, digest):
         raise ValueError("Research receipt refused")
     if isinstance(data, SearchData) and len(data.results) > arguments.max_results:
         raise ValueError("Research receipt refused")
-    if not scan_outbound(json.dumps(result, ensure_ascii=False, allow_nan=False)).safe:
+    if not json_strings_safe(result):
         raise ValueError("Research receipt refused")
 
 
@@ -152,7 +153,7 @@ class PeerResearch:
         return self.sanitizer.wrap_content(value, source)
 
     def _inputs(self, arguments):
-        if not scan_outbound(json.dumps(arguments.model_dump(), ensure_ascii=False)).safe:
+        if not json_strings_safe(arguments.model_dump()):
             raise BrokerRefusal("operation_refused", 400)
 
     def _result(self, operation, arguments, data):
