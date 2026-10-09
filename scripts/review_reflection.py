@@ -558,9 +558,12 @@ _PREMISE_EXPECTED_LINE_RE = re.compile(r"Expected before checking:.*")
 _PREMISE_CLAIM_LINE_RE = re.compile(
     r"[ \t]*P([1-9][0-9]?)[:.]?[ \t]+(TRUE|FALSE|UNPROVEN)(?:[ \t]+\S.*)?"
 )
-#: A line under the claims that starts like a claim but is not one: refused by
-#: line, never read as the end of the claims, so a claim the author wrote in a
-#: near-miss shape is not silently dropped.
+#: The line right after a verdict line's claims (or right after the verdict
+#: line itself, when no claims follow), when it starts like a claim but is not
+#: one: refused by line rather than read as the end of the claims, so a claim
+#: written in a near-miss shape is not silently dropped. Only that line is
+#: checked; a claim-like line further down is prose, because a review's own
+#: prose starts lines with "P2" too.
 _PREMISE_CLAIM_LIKE_RE = re.compile(r"[ \t]*(?:[-*>|][ \t]*)?(?:\*\*)?P[0-9]")
 
 
@@ -569,9 +572,11 @@ def premise_block(text: str) -> tuple[str | None, dict[str, str], str | None]:
     output in the canonical block. Every ``Design-premise:`` line must agree.
     The claims are the unbroken run of claim lines right under the first
     verdict line that has any (one ``Expected before checking:`` line may sit
-    between); a later block may only restate claims of that one, never add or change
-    one, and a claim line anywhere else is prose. A line under the claims that
-    looks like a claim but is not one is refused by its line number. Lines are
+    between); a later block may repeat any of those claims with the same verdict
+    (claim text is not compared), never add one or change a verdict, and a
+    claim line anywhere else is prose. The line right after each verdict
+    line's claims, if it looks like a claim but is not one, is refused by its
+    line number. Lines are
     split on newlines only, as the reflection itself is. At least two distinct
     claims are required."""
     lines = [line.rstrip() for line in text.split("\n")]

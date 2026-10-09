@@ -1036,9 +1036,17 @@ def test_a_lookalike_minus_after_the_verdict_still_reads_it():
     assert got[1] == {"1": "TRUE", "2": "FALSE"}
 
 
+def test_a_claim_like_line_further_down_is_prose():
+    """Only the line right after the claims is checked for a near-miss shape;
+    a review's later prose starting with "P2" is not a claim and not refused."""
+    text = _block() + "\nEffect: x\nP2 is the weak one\nP3 FALSE: worth a look\n"
+    assert rr.premise_block(text) == ("SOUND", {"1": "TRUE", "2": "FALSE"}, None)
+
+
 def test_repeated_blocks_must_agree():
-    """A summary may restate the block; it must restate it exactly. A second
-    verdict or a claim with a second verdict is refused, never resolved."""
+    """A summary may restate the verdict and any claims with the same verdicts.
+    A second verdict, a changed verdict or an added claim is refused, never
+    resolved."""
     two = "Design-premise: SOUND\n" + _block("Design-premise: BROKEN")
     assert "more than one" in rr.premise_block(two)[2]
     again = _block() + "\nSummary:\n\n" + _block()

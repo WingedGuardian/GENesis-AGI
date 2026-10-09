@@ -141,7 +141,7 @@ check that the reflection restates what you concluded. The rules:
 - The `Design-premise:` line starts at column 0, as plain text, with one verdict
   word. A qualifier follows a dash: `SOUND — UNPROVEN(2)`.
 - Each claim line puts its verdict FIRST, right after its number: `P1 TRUE — …`.
-  A verdict written at the end of the claim is not read.
+  A claim line with its verdict at the end is refused.
 - The claim lines sit directly under the verdict line, with only the
   `Expected before checking:` line (one line) between them. One line per claim:
   do not wrap a claim line. A blank line ends the claims.
@@ -150,7 +150,8 @@ check that the reflection restates what you concluded. The rules:
 - One block per output. If you quote an example or an earlier check, indent its
   `Design-premise:` line or prefix every line with `>`, so it is not read as
   yours, and leave a blank line between your block and the quote. A summary may
-  restate your block, but only exactly. A re-check is written to a new file,
+  restate your verdict and any of your claims with the same verdicts; it may
+  never add a claim or change a verdict. A re-check is written to a new file,
   never appended to the old one.
 
 ### Resolving the verdict — the cases that are otherwise undecidable
