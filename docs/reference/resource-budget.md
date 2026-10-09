@@ -206,6 +206,10 @@ under `--json`), and the job's own report lines start with `genesis-job`.
 - A job that ignores the first cooperative cancellation can keep the wrapper
   waiting until a second cancellation forces SIGKILL or an existing runtime
   ceiling applies. Scope inspection failures are reported as incomplete cleanup.
+- Normal command exit retains detached-child behavior: the wrapper may return
+  while descendants remain in the capped scope, which the live job ledger
+  continues to account for. Verified quiescence waiting applies after a stop
+  or cancellation request.
 - CPU reads cgroup v2 only. On cgroup v1, capacity is the affinity count and use
   comes from `/proc/stat`, which inside a container may cover the whole host.
 - Where the cgroup has no `*.pressure` files, PSI comes from `/proc/pressure`,

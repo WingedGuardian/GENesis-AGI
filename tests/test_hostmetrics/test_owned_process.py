@@ -82,6 +82,33 @@ def test_second_cancellation_forces_without_deadline(monkeypatch):
     assert owner.outcome(0) == 130
 
 
+def test_first_cancellation_after_reap_remains_cooperative_for_owned_scope(monkeypatch):
+    sent = []
+    monkeypatch.setattr(run, 'kill_group', lambda *_args: pytest.fail('reaped PID cannot be signalled'))
+    monkeypatch.setattr(run, '_signal_scope', lambda unit, sig: sent.append((unit, sig)) or True)
+    monkeypatch.setattr(run, '_scope_quiescent', lambda _unit: bool(sent and sent[-1][1] == signal.SIGKILL))
+    with run.OwnedProcess() as owner:
+        child = _child(7)
+        owner.bind(child, 'synthetic-owned-scope')
+        # Model an acknowledged scope retaining children after the real leader exits.
+        owner._scope_authorized = True
+        assert owner.wait(timeout=5) == 7
+        assert owner.reaped and not owner._numeric_open
+        owner._forward(signal.SIGTERM, None)
+        for _ in range(3):
+            owner.checkpoint()
+        assert sent == [('synthetic-owned-scope', signal.SIGTERM)]
+        assert owner._scope_authorized and not owner._finished
+        assert child.returncode == 7
+        owner._forward(signal.SIGINT, None)
+        owner.checkpoint()
+        assert sent == [('synthetic-owned-scope', signal.SIGTERM),
+                        ('synthetic-owned-scope', signal.SIGKILL)]
+        assert owner.wait(timeout=5) == 7
+        assert not owner._scope_authorized
+    assert owner.outcome(7) == 130
+
+
 def test_external_reap_is_not_fabricated_success():
     child = None
     with pytest.raises(run.ProbeRefused, match='consumed externally'), run.OwnedProcess() as owner:
