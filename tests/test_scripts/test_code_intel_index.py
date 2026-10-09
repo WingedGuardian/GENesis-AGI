@@ -896,6 +896,10 @@ def test_both_tools_keep_distinct_slice_placement(tmp_path):
     assert len(cbm) == len(gn) == 2  # each leg's probe and workload
     assert all("--slice-inherit" in line for line in cbm)
     assert all("--slice-inherit" not in line for line in gn)
+    # GitNexus batches land in app-capped.slice (the disk guardian's contained-
+    # kill counter); CBM keeps inheriting for its ancestor admission.
+    assert all("--slice=app-capped.slice" in line for line in gn)
+    assert all("--slice=app-capped.slice" not in line for line in cbm)
 
 
 def test_env_overrides_reach_scope(tmp_path):

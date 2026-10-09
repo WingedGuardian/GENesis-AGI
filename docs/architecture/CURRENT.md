@@ -1340,7 +1340,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 246808153 2026-09-24
+verified: 637f7f7bb679 2026-10-05
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -1408,6 +1408,9 @@ verified: 246808153 2026-09-24
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
   modules). `standalone_health.py` serves from `~/.genesis/status.json` when no
   live runtime (stale-but-functional).
+  External Codebase has explicit pinned configuration staging/diagnostics in
+  `scripts/codebase_managed.py`; staging does not activate it or alter the
+  existing indexing route. See `docs/reference/codebase-managed.md`.
 - **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
   `/v1/chat/completions` endpoint, and registers the desk brain at
@@ -1576,7 +1579,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 84c7259d 2026-08-31
+verified: 83a835e32 2026-10-08
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -1725,8 +1728,18 @@ verified: 84c7259d 2026-08-31
   re-asserts `limits.memory.swap=true` (incus config) and live-activates the
   cgroup `memory.swap.max` (via `cgroup_ops`) when observed at `0` — the
   self-heal for installs that advance via bare `git pull` and never re-run
-  host-setup. Heals page INFO; failures page WARNING (24h throttle); kill
-  switch `swap_reconcile_enabled: false`.
+  host-setup. Heals page INFO; failures page WARNING, throttled PER PROBLEM
+  CLASS (`swap_off`/`ceiling`, 24h once delivered — a failed delivery itself
+  retries in 5min rather than silently adopting the 24h window); kill switch
+  `swap_reconcile_enabled: false`. **Opt-in ceiling**: install-local
+  `swap_ceiling_pct` (percent of HOST SwapTotal, page-aligned) asserted via
+  Incus's native `limits.memory.swap=<bytes>` key under a hard
+  `limits.memory` cap, else a direct cgroup write
+  (`cgroup_ops.write_swap_max`). `swap_ceiling_pct: off` removes a ceiling
+  (key back to `true`, a finite live cap lifted to `max`); deleting the
+  setting leaves whatever is set alone, so no ownership record exists. A
+  tick that can't compute the target holds rather than resetting the key to
+  `true`.
 - **Host zram swap** (`scripts/lib/host_swap.sh`, E-rest E3): a
   compressed-RAM-first swap tier on the host VM — `zram-swap.service` at swap
   priority 100, sized `min(MemTotal/2, 4GiB)` (`HOSTSWAP_CAP_GIB` override).
@@ -1751,7 +1764,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 788dd9a9 2026-09-06
+verified: 477efb7f7 2026-10-05
 ```
 
 - **Peer-handoff surface (2026-09-26)**: a SessionStart hook
@@ -1765,6 +1778,14 @@ verified: 788dd9a9 2026-09-06
   keyed to name + content hash, so a rewritten handoff resurfaces). The hook's scan
   runs in a forked worker under a hard deadline (`SCAN_TIMEOUT_S`) — a hung mount
   reads as UNKNOWN, never as silence. Marked via `python -m genesis handoffs mark`.
+  Write side (2026-10-07, `session_awareness/handoff_send.py`): for installs that
+  share no directory, `python -m genesis handoffs send` delivers a file over ssh
+  into the peer's configured `dir` (refuses when unset; same sha = no-op, different
+  content needs `--replace`; read back by sha256), and with `--session` adds one
+  fixed-text pointer row to that peer session's ledger and checks `charter.md`.
+  `handoffs sessions` is a read-only peer listing. Peers: `config/peers.yaml` +
+  local overlay. Context transfer only, untrusted on arrival; not the findings
+  pipeline. See `docs/reference/peer-handoff.md`.
 - **PR-watch inline surface (2026-07-21)**: a SessionStart hook
   (`scripts/surface_pr_updates.py` → `session_awareness/pr_watch.py`) mirrors the
   GitHub-steward owner notifications already in `outreach_history` (category
@@ -1831,7 +1852,13 @@ verified: 788dd9a9 2026-09-06
   commits behind from local refs, missing systemd units, host-guardian
   deployed_commit via `~/.genesis/host_gateway_state.json`; collectors in
   `observability/snapshots/deploy_health.py`), `high` on any drift, `critical`
-  only sustained (≥7d AND ≥20 commits, or a missing unit alerted >24h).
+  only sustained (≥7d AND ≥20 commits, or a missing unit alerted >24h). The
+  same check reports tracked files edited in place in the deploy checkout
+  (`main_checkout_dirty`, judged by the deploy scripts' own bash predicate,
+  so a deploy would refuse): its own wording without the update.sh advice,
+  never critical; an unreadable status alerts only on the second consecutive
+  tick, and the first unreadable tick (or a tick during a deploy) holds the
+  check rather than resolving a standing dirty alert.
   Also (hourly) ego cycle liveness (`_check_ego_liveness`, `ego/liveness.py`): an
   ego with no COMPLETED cycle past a conservative multiple of its current
   interval (the `job_health.last_success` gap — never the `is_running`/heartbeat/
@@ -2718,7 +2745,22 @@ verified: b0867170e8e3 2026-10-02
   Pro chain references and both Fusion panels use MiMo V2.6 Pro; the novelty
   suppressor's exact validated pair and standalone evaluation judge remain
   DeepSeek Pro. Candidate compatibility has been probed; candidate quality for
-  these protected judgments has not been qualified.
+  these protected judgments has not been qualified. **2026-10-07:** that NIM
+  alias left every chain — on this install's key NVIDIA accepted V4.1 Flash
+  requests and never answered (every probe variant timed out; of 26 calls in
+  `activity_log`'s retained window, 10-06 18:02 to 10-07 18:03 UTC, 0 succeeded), so `listed` and even an earlier successful probe
+  proved nothing durable. Its rung became `deepseek-flash` (DeepSeek's own API,
+  the same V4.1 Flash, paid, prepaid account) followed by
+  `openrouter-deepseek-flash` — so eight sites now lead with a paid rung (the
+  dream-cycle synthesis and both challenge sites, wing_backfill, 38, 40, 43,
+  44), and five that are all-paid (17, 20, judge, both challenge sites) fail
+  outright, as before, once a configured spend budget is exceeded; five chains
+  with other free rungs just drop it, and
+  `attention_salience` keeps Mistral alone (no other free model JSON-verified).
+  The provider block stays, unchained. `gemini-free-latest`
+  (`gemini-flash-latest`) is declared but unchained: it resolved to 3.8 Flash
+  (same model and quota as `gemini-free`), so it joins the chains only once it
+  resolves to a different model.
 - **Coherent routing reloads** (`Router.reload_config`,
   `LiteLLMDelegate.for_config`): requests capture config/delegate/pacing/breaker
   bindings before yielding. Replacement/rename breakers preserve holds while
@@ -2748,9 +2790,10 @@ verified: b0867170e8e3 2026-10-02
   `DailyBudgetLedger`): providers may carry `rpd_limit` / `tpd_limit`, each in
   the provider's OWN unit and never converted between them. As SHIPPED today:
   Groq carries both (`rpd_limit: 1000`, `tpd_limit: 200000`, the latter read
-  off Groq's own 429 text), and Gemini carries NEITHER — a daily cap for it is
-  inferred from a live 429 but not measured, and a wrong shipped cap would
-  deselect the provider on every install. When spent, the chain walk DESELECTS
+  off Groq's own 429 text), and Gemini carries NEITHER — its free tier is 20
+  requests/day per model (MEASURED 2026-10-07), but the quota belongs to the
+  key's Google project and is shared by every consumer of it, so a shipped cap
+  would be wrong wherever the key is shared or paid. When spent, the chain walk DESELECTS
   the provider until the next
   UTC day — no breaker trip (budget is not a health signal), one WARNING
   `provider.budget_exhausted` event at the crossing, counters visible in the
@@ -2759,7 +2802,13 @@ verified: b0867170e8e3 2026-10-02
   429s backstop any undercount, while an overcount would deselect with no
   correcting signal); state persists to `~/.genesis/routing_budget_state.json`,
   server-only writer (WS-3c, like the breaker file), kill switch
-  `GENESIS_DAILY_BUDGET_DISABLED`. Per-provider circuit breaker (3 failures, exponential backoff
+  `GENESIS_DAILY_BUDGET_DISABLED`. **Provider-reported daily quota:** a 429
+  whose body carries a `google.rpc` `QuotaFailure` with a `PerDay` quota id and
+  a `RetryInfo` delay (≤ 26 h) is parsed by `retry.daily_quota_reset_s`; the
+  delegate flags it (`CallResult.daily_quota_exhausted`) and the ledger
+  deselects that provider until the reset the provider gave (`blocked_until`
+  in the state row, restored on restart, same event and kill switch). Per-minute
+  429s and unparseable bodies keep the old behaviour. Per-provider circuit breaker (3 failures, exponential backoff
   capped 30 min — 4h for QUOTA_EXHAUSTED and NOT_ENTITLED; 429 = backpressure,
   NOT a breaker failure; state persisted cross-process to
   `~/.genesis/circuit_breaker_state.json`). **Probe/call evidence symmetry** —
@@ -2878,7 +2927,14 @@ verified: b0867170e8e3 2026-10-02
   when traffic stopped and its per-process flags produced four review defects.
   Lever: `provider_outage_notify` domain (off/propose_only/live) +
   `GENESIS_PROVIDER_NOTIFY_DISABLED`; off resolves open notify rows (so off→on
-  re-notifies a still-dead provider, deliberately). Recovery resolves BOTH
+  re-notifies a still-dead provider, deliberately). **Severity follows essential
+  coverage** (2026-10-07): in `live` mode the notice is `critical` (Telegram)
+  only while an essential call site that lists the provider has no available
+  provider left (`CircuitBreakerRegistry.uncovered_essential_sites_for`); while
+  fallback covers every such site it is written `high` (dashboard + morning
+  report) and says so. Unknown coverage keeps `critical`. A `high` row is
+  promoted (resolved, re-created critical) only when its provider becomes the
+  cause of an uncovered site, so covered outages never churn. Recovery resolves BOTH
   hashes — **notify hash FIRST**: the two
   are separately committed (this connection has no transactions), so a failure
   between them must leave the VISIBLE row open (a provider shown as failing when
@@ -2917,7 +2973,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, env.py,
           _config_overlay.py]
-verified: b0867170e 2026-10-02
+verified: 477efb7f7 2026-10-05
 ```
 
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
@@ -3092,7 +3148,11 @@ verified: b0867170e 2026-10-02
   `~/.genesis/host_gateway_state.json`, written by `cc_align_host_sync` on
   every gateway version probe — update.sh and the nightly cc-align timer);
   its `GUARDIAN_HOST_PATHS` must stay in LOCKSTEP with update.sh
-  GUARDIAN_PATHS. **Total-cessation detection** (`observability/liveness.py`,
+  GUARDIAN_PATHS. Its `main_checkout` probe SOURCES
+  `scripts/lib/deploy_marker.sh` + `deploy_checkout.sh` on every snapshot
+  (listed in deploy_status.sh `_RUNTIME_FRESH_SCRIPTS`), read-only
+  (`GIT_OPTIONAL_LOCKS=0`, own process group killed on timeout): do not copy
+  the ephemeral-path regex into Python. **Total-cessation detection** (`observability/liveness.py`,
   and for outreach a deliberately channel-INDEPENDENT heartbeat in
   `outreach/heartbeat.py`): a subsystem that stops entirely emits nothing, so
   absence-of-signal is itself the signal — the alarm keys on the gap since the
@@ -3262,6 +3322,10 @@ verified: b0867170e 2026-10-02
   to "no deploy". A marker or state-file holder counts only while it is running and
   not a zombie (`_marker_holder_live`, mirrored in `scripts/lib/deploy_marker.sh`);
   a reused pid still reads as live until the marker records a start tick (#2535).
+  The shell deploys and the dashboard update routes (#2525) check and write the
+  marker only while holding `locks/update.lock`; the routes also run the `live`
+  check under it and remove a marker only when its holder is dead or theirs.
+  Exception: `bootstrap.sh`'s crash recovery still removes it unconditionally.
   `secrets_path()` is repo-relative unless SECRETS_PATH set.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
   dicts merge, lists REPLACE wholesale); dependency-free by design to stay

@@ -568,6 +568,17 @@ def _isolate_boundary_key(tmp_path):
     mp.undo()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_checkout_lock_path(tmp_path):
+    mp = pytest.MonkeyPatch()
+    mp.setattr(
+        "genesis.cc.checkout_lock.checkout_lock_path",
+        lambda: tmp_path / "genesis-checkout.lock",
+    )
+    yield
+    mp.undo()
+
+
 # ── Safety: prevent tests from writing REAL merge-override audit rows ───────
 @pytest.fixture(autouse=True)
 def _isolate_override_log(tmp_path):

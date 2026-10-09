@@ -109,6 +109,30 @@ def _calls_pin(tree: ast.AST) -> bool:
     return False
 
 
+def _calls_checkout_admission(tree: ast.AST) -> bool:
+    return any(
+        isinstance(node, ast.Call)
+        and getattr(node.func, "attr", getattr(node.func, "id", None))
+        in {"admit_launch", "checkout_admission"}
+        for node in ast.walk(tree)
+    )
+
+
+_PRE_EXEC_RESIDUAL = "reads nothing from the checkout before exec; claude's own post-exec reads are the stated #2712 residual"
+_ADMISSION_EXEMPT: dict[str, str] = {
+    "dashboard/routes/updates.py": (
+        "its update.sh subprocess takes the exclusive checkout lock; a shared hold here "
+        "would deadlock the deploy"
+    ),
+    "guardian/diagnosis.py": "Claude Code runs on the host VM, not this container checkout",
+    "modules/external/ipc.py": (
+        "SSH Claude reads remote files, and the stdio adapter runs a configured external command"
+    ),
+    "session_awareness/headless.py": _PRE_EXEC_RESIDUAL,
+    "experimentation/cc_router.py": _PRE_EXEC_RESIDUAL,
+}
+
+
 def _spawn_sites() -> list[Path]:
     sites = []
     for p in SRC.rglob("*.py"):
@@ -146,6 +170,17 @@ def test_every_dispatched_spawn_site_applies_the_pins():
         "these modules start a claude session but do not call "
         f"genesis.cc.child_env.pin_dispatched_env on its env: {missing}"
     )
+
+
+def test_every_in_container_spawn_site_takes_checkout_admission():
+    sites = {p.relative_to(SRC).as_posix(): p for p in _spawn_sites()}
+    assert set(_ADMISSION_EXEMPT) <= set(sites)
+    missing = [
+        name for name, path in sites.items()
+        if name not in _ADMISSION_EXEMPT
+        and not _calls_checkout_admission(ast.parse(path.read_text(), str(path)))
+    ]
+    assert not missing, f"these in-container Claude spawn sites do not take checkout admission: {missing}; exemptions: {_ADMISSION_EXEMPT}"
 
 
 def test_the_update_orchestrator_script_pins_its_sessions():
