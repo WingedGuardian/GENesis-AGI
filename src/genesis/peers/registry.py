@@ -107,7 +107,7 @@ class PeerRegistry:
         peer_id: str,
         *,
         same_owner: bool,
-        daily_allowance: int,
+        daily_allowance: int = 1,
         token_name: str | None = None,
         sam_realm: str | None = None,
         sam_node: str | None = None,
@@ -119,7 +119,7 @@ class PeerRegistry:
             or type(daily_allowance) is not int
             or not 0 < daily_allowance < 2**63
         ):
-            raise ValueError("ownership and daily allowance must be explicit")
+            raise ValueError("invalid ownership or legacy compatibility value")
         if token_name is not None and (
             not isinstance(token_name, str)
             or not re.fullmatch(r"GENESIS_PEER_[A-Z0-9_]+_TOKEN", token_name)

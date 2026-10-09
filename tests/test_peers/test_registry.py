@@ -24,12 +24,19 @@ async def test_relationship_has_no_implicit_grants_and_revoke_preserves_identity
 
 
 @pytest.mark.parametrize("allowance", [None, True, False, 0, -1, 2**63, 1.5])
-async def test_admissions_require_owner_daily_allowance(registry, allowance):
+async def test_legacy_compatibility_value_requires_positive_integer(registry, allowance):
     with pytest.raises(ValueError):
         await registry.register(
             "muse", same_owner=True, daily_allowance=allowance, token_name="GENESIS_PEER_MUSE_TOKEN"
         )
     assert await registry.rows() == []
+
+
+async def test_registration_without_legacy_allowance_grants_no_authority(registry):
+    await registry.register("muse", same_owner=True, token_name="GENESIS_PEER_MUSE_TOKEN")
+    assert (await registry.get("muse"))["daily_allowance"] == 1
+    assert await registry.grants("muse") == {}
+    assert (await registry.settings())["mode"] == "disabled"
 
 
 @pytest.mark.parametrize(
