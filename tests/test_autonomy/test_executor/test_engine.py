@@ -462,6 +462,36 @@ class TestAmendment7Worktree:
         with pytest.raises(worktree_mgr.StaleWorktreeError):
             await engine._recover_worktree("t-001", task)
 
+    async def test_a_resumed_task_keeps_its_branch(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer, monkeypatch,
+    ):
+        """#3060: both resume paths re-add on the task branch, never delete it."""
+        from genesis.autonomy.executor import worktree_mgr
+
+        calls: list[bool] = []
+
+        async def record(*a, keep_branch=False, **k):
+            calls.append(keep_branch)
+            return Path("/x/task-t-001")
+
+        async def gone(*a, **k):
+            return False
+
+        monkeypatch.setattr(worktree_mgr, "is_registered_worktree", gone)
+        monkeypatch.setattr(worktree_mgr, "create_worktree", record)
+        await _seed_task(db, plan_path=plan_file)
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        engine._resolve_and_record_base = AsyncMock(return_value=None)
+        task = {"outputs": json.dumps({"worktree_path": "/x/task-t-001"})}
+        # Recovery re-creates on the branch.
+        await engine._resume_worktree("t-001", task)
+        # Recovery fails (RuntimeError -> False): the fallback keeps it too.
+        engine._recover_worktree = AsyncMock(return_value=False)
+        await engine._resume_worktree("t-001", task)
+        # A fresh task does not.
+        await engine._create_worktree("t-001")
+        assert calls == [True, True, False]
+
     async def test_code_step_gets_working_dir(
         self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
         mock_subprocess,

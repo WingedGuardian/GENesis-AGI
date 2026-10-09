@@ -349,6 +349,18 @@ def _load(entry: Path) -> Tombstone | None:
         return None
 
 
+def _item_present(item: Path) -> bool:
+    """Only a missing item is False; any other lstat error is a refusal, as
+    os.path.lexists would read it as missing (an incomplete entry)."""
+    try:
+        os.lstat(item)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise TrashRefused(f"cannot read the trash: {exc}") from None
+    return True
+
+
 def list_entries() -> list[Entry]:
     """Every entry, oldest first; incomplete entries are included and flagged.
 
@@ -357,8 +369,8 @@ def list_entries() -> list[Entry]:
     """
     try:
         root = _root()
-        if not os.path.lexists(root):
-            return []
+        # lstat in _check_root: only FileNotFoundError reads as an empty trash.
+        # (os.path.lexists would also answer False on EACCES, hiding entries.)
         _check_root(root)
         names = sorted(os.listdir(root))
     except FileNotFoundError:
@@ -371,7 +383,7 @@ def list_entries() -> list[Entry]:
         if not entry.is_dir() or entry.is_symlink():
             continue
         stone = _load(entry)
-        out.append(Entry(entry, stone, stone is not None and os.path.lexists(entry / ITEM)))
+        out.append(Entry(entry, stone, stone is not None and _item_present(entry / ITEM)))
     return out
 
 

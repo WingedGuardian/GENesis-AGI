@@ -411,3 +411,34 @@ def test_cli_usage_error_exits_64():
     with pytest.raises(SystemExit) as exc:
         main(["restor", "x"])  # no abbreviations
     assert exc.value.code == EXIT_USAGE
+
+
+def test_a_root_lstat_error_other_than_missing_is_a_refusal(monkeypatch, tmp_path, root):
+    # os.path.lexists answers False on EACCES; only a missing root is empty.
+    trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
+    real = os.lstat
+
+    def denied(path, *a, **k):
+        if Path(path) == root:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(os, "lstat", denied)
+    with pytest.raises(TrashRefused, match="cannot read the trash"):
+        list_entries()
+
+
+def test_an_unreadable_item_is_a_refusal_not_an_incomplete_entry(monkeypatch, tmp_path, root):
+    stone = trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
+    real = os.lstat
+
+    def denied(path, *a, **k):
+        if Path(path).name == ITEM:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(os, "lstat", denied)
+    with pytest.raises(TrashRefused, match="cannot read the trash"):
+        list_entries()
+    monkeypatch.undo()
+    assert [e.complete for e in list_entries() if e.path.name == stone.entry_id] == [True]

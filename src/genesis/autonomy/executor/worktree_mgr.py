@@ -75,9 +75,17 @@ class BaseRef:
 #: (git 2.43). Any of them can point git at another repository than repo_root,
 #: so every git call here runs without them: a classification read and the
 #: mutation that follows it must see the same repository.
+#: Except the two command-line config channels (``GIT_CONFIG_PARAMETERS``,
+#: ``GIT_CONFIG_COUNT`` with its ``GIT_CONFIG_KEY_n``/``GIT_CONFIG_VALUE_n``):
+#: they are protected config, the only place git accepts ``safe.directory``
+#: from besides the system and global files, so an install whose checkout uid
+#: differs from the executor's passes it there. Scrubbing them makes every git
+#: call here fail with "dubious ownership" (MEASURED, git 2.43). Config can
+#: still set ``core.worktree``; whoever launched the executor set it on
+#: purpose, unlike a ``GIT_DIR`` inherited from a parent git process.
 _GIT_LOCATION_VARS = (
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG",
+    "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
     "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE",
     "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
     "GIT_SHALLOW_FILE", "GIT_COMMON_DIR",
@@ -145,7 +153,13 @@ async def _prune_worktrees(repo_root: Path) -> None:
         stderr=asyncio.subprocess.PIPE,
         env=_scrubbed_git_env(),
     )
-    await proc.communicate()
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        # The add that follows then fails on the stale record; say why here.
+        logger.warning(
+            "git worktree prune failed in %s: %s",
+            repo_root, stderr.decode(errors="replace").strip(),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +172,8 @@ async def create_worktree(
     repo_root: Path,
     worktree_base: Path,
     base: BaseRef | None = None,
+    *,
+    keep_branch: bool = False,
 ) -> Path:
     """Create a git worktree for code task isolation.
 
@@ -173,6 +189,10 @@ async def create_worktree(
     target the default branch (cut from a remote-tracking ref, a branch TRACKS
     it by default; measured on git 2.43). ``None`` keeps the previous
     behaviour: cut from HEAD.
+
+    ``keep_branch`` is for a RESUMED task (#3060): its branch holds the steps
+    already committed, so it is never deleted; the worktree is re-added on it.
+    A fresh task deletes a leftover branch and cuts anew, as before.
     """
     short_id = task_id[:8]
     branch = f"task/{short_id}"
@@ -181,13 +201,14 @@ async def create_worktree(
     # Clean up stale state from previous runs of this task
     if wt_path.exists():
         logger.info("Stale worktree dir %s exists, cleaning up", wt_path)
-        await cleanup_worktree(wt_path, repo_root)
+        await cleanup_worktree(wt_path, repo_root, delete_branch=not keep_branch)
         if wt_path.exists():
             await _clear_stale_dir(wt_path, repo_root, task_id)
     else:
         # No dir but branch might linger from a prior crash
         await _prune_worktrees(repo_root)
-        await _delete_branch(branch, repo_root)
+        if not keep_branch:
+            await _delete_branch(branch, repo_root)
 
     if base is not None:
         add_args = ["--no-track", "-b", branch, str(wt_path), base.sha]
@@ -255,8 +276,19 @@ async def _worktree_records(repo_root: Path) -> list[dict[str, str]] | None:
 
 
 def _record_for(records: list[dict[str, str]], wt_path: Path) -> dict[str, str] | None:
+    """The record git keeps for ``wt_path``, skipping a ``prunable`` one.
+
+    git marks a record prunable when the worktree's ``.git`` file is gone, i.e.
+    the directory was deleted (and possibly re-created) outside git; nothing
+    lives there, and treating it as registered would adopt an orphan directory
+    in which git walks up to the main checkout (MEASURED, git 2.43). A LOCKED
+    record is never marked prunable, so the caller checks the directory too.
+    """
     target = wt_path.resolve()
-    return next((r for r in records if Path(r["worktree"]).resolve() == target), None)
+    return next(
+        (r for r in records if "prunable" not in r and Path(r["worktree"]).resolve() == target),
+        None,
+    )
 
 
 async def _clear_stale_dir(wt_path: Path, repo_root: Path, task_id: str) -> None:
@@ -309,6 +341,9 @@ async def _clear_stale_dir(wt_path: Path, repo_root: Path, task_id: str) -> None
             f"the stale directory {wt_path} could not be moved to the trash: {exc}"
         ) from None
     logger.warning("Moved orphan task worktree dir %s to the trash (%s)", wt_path, stone.entry_id)
+    # A prunable record for this path survives the move, and ``git worktree
+    # add`` refuses "a missing but already registered worktree" (MEASURED).
+    await _prune_worktrees(repo_root)
 
 
 async def is_registered_worktree(wt_path: Path, repo_root: Path) -> bool:
@@ -330,18 +365,40 @@ async def is_registered_worktree(wt_path: Path, repo_root: Path) -> bool:
             f"the worktree for this task, {wt_path}, was left in place: "
             "git's worktree list could not be read"
         )
-    return _record_for(records, wt_path) is not None
+    if _record_for(records, wt_path) is None:
+        return False
+    # Listed is not enough: a locked record is never marked prunable, so a
+    # locked worktree whose directory was deleted and re-created still lists.
+    # The directory must be that worktree's own top level; in an orphan, git
+    # walks up to the main checkout and names it instead (MEASURED).
+    # Its git directory must also be this repository's: a directory re-created
+    # and given its own `git init` is its own top level, and git does not mark
+    # the old record prunable once a .git exists there again (MEASURED).
+    here = await _git_read(
+        wt_path, "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"
+    )
+    ours = await _git_read(repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    lines = here[1].split("\n")
+    if here[0] != 0 or ours[0] != 0 or len(lines) != 2:
+        raise StaleWorktreeError(
+            f"the worktree for this task, {wt_path}, was left in place: git "
+            "lists it, but could not read it"
+        )
+    top, common = (Path(line).resolve() for line in lines)
+    return top == wt_path.resolve() and common == Path(ours[1]).resolve()
 
 
 async def cleanup_worktree(
     wt_path: Path,
     repo_root: Path,
+    *,
+    delete_branch: bool = True,
 ) -> None:
-    """Remove a worktree and its associated branch.
+    """Remove a worktree and (unless ``delete_branch`` is False) its branch.
 
     NO --force per CLAUDE.md worktree rules.
     """
-    branch = _branch_from_wt_path(wt_path)
+    branch = _branch_from_wt_path(wt_path) if delete_branch else None
 
     if not wt_path.exists():
         # Worktree dir gone but branch might linger

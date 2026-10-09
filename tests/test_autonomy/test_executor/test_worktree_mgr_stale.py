@@ -10,6 +10,7 @@ error, and an orphan directory git does not know goes to the trash.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -143,9 +144,7 @@ async def test_an_orphan_directory_is_not_a_registered_worktree(repo):
 
 
 @pytest.mark.asyncio
-async def test_ambient_git_location_variables_are_ignored_throughout(
-    tmp_path, repo, monkeypatch
-):
+async def test_ambient_git_location_variables_are_ignored_throughout(tmp_path, repo, monkeypatch):
     # Set BEFORE the worktree exists: the add, the listing and the reset must
     # all act on repo_root, or a live worktree reads as an orphan and is trashed.
     other = tmp_path / "other"
@@ -156,9 +155,11 @@ async def test_ambient_git_location_variables_are_ignored_throughout(
     wt = await worktree_mgr.create_worktree(TASK, repo, base)
     assert await worktree_mgr.is_registered_worktree(wt, repo) is True
     (wt / "work.txt").write_text("uncommitted")
-    subprocess.run(["git", "-C", str(wt), "add", "work.txt"], check=True, env={
-        k: v for k, v in os.environ.items() if not k.startswith("GIT_")
-    })
+    subprocess.run(
+        ["git", "-C", str(wt), "add", "work.txt"],
+        check=True,
+        env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+    )
     with pytest.raises(worktree_mgr.StaleWorktreeError, match="uncommitted work"):
         await worktree_mgr.create_worktree(TASK, repo, base)
     assert (wt / "work.txt").read_text() == "uncommitted"
@@ -181,6 +182,145 @@ async def test_an_unreadable_listing_never_recreates_a_live_worktree(repo, monke
         await worktree_mgr.is_registered_worktree(wt, repo)
     log = subprocess.run(
         ["git", "-C", str(repo), "log", "--format=%s", f"task/{TASK[:8]}"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout
     assert "step" in log and (wt / "step.txt").exists()
+
+
+def _delete_and_recreate(wt: Path) -> None:
+    """The directory goes outside git and an orphan takes its place."""
+    shutil.rmtree(wt)
+    wt.mkdir()
+    (wt / "leftover.txt").write_text("orphan")
+
+
+def _porcelain(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+
+@pytest.mark.asyncio
+async def test_a_prunable_record_does_not_make_an_orphan_registered(repo):
+    # git keeps the record, marked "prunable gitdir file points to non-existent
+    # location"; a resumed task must not adopt the directory (#3061 review).
+    base = repo / ".claude" / "worktrees"
+    wt = await worktree_mgr.create_worktree(TASK, repo, base)
+    _delete_and_recreate(wt)
+    assert "prunable" in _porcelain(repo)  # the trap: git still lists it
+    assert await worktree_mgr.is_registered_worktree(wt, repo) is False
+
+
+@pytest.mark.asyncio
+async def test_a_prunable_orphan_is_trashed_and_the_worktree_recreated(repo):
+    base = repo / ".claude" / "worktrees"
+    wt = await worktree_mgr.create_worktree(TASK, repo, base)
+    _delete_and_recreate(wt)
+
+    again = await worktree_mgr.create_worktree(TASK, repo, base)
+
+    assert again == wt and await worktree_mgr.is_registered_worktree(wt, repo)
+    [entry] = list_entries()
+    assert (entry.path / ITEM / "leftover.txt").read_text() == "orphan"
+
+
+@pytest.mark.asyncio
+async def test_a_locked_record_does_not_make_an_orphan_registered(repo):
+    # A locked record is never marked prunable, so the listing alone would
+    # still call the re-created directory a worktree.
+    base = repo / ".claude" / "worktrees"
+    wt = await worktree_mgr.create_worktree(TASK, repo, base)
+    subprocess.run(["git", "-C", str(repo), "worktree", "lock", str(wt)], check=True)
+    _delete_and_recreate(wt)
+    assert "prunable" not in _porcelain(repo)
+    assert await worktree_mgr.is_registered_worktree(wt, repo) is False
+    # Re-creating refuses (locked) and deletes nothing.
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="is locked"):
+        await worktree_mgr.create_worktree(TASK, repo, base)
+    assert (wt / "leftover.txt").read_text() == "orphan" and list_entries() == []
+
+
+@pytest.mark.asyncio
+async def test_command_line_config_reaches_every_git_call(repo, monkeypatch):
+    # safe.directory is accepted only from protected config, which includes
+    # GIT_CONFIG_COUNT and GIT_CONFIG_PARAMETERS; scrubbing them breaks an
+    # install whose checkout uid differs from the executor's (#3061 review).
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "safe.directory")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "*")
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'genesis.probe'='yes'")
+    assert await worktree_mgr._git_read(repo, "config", "--get", "safe.directory") == (0, "*")
+    assert await worktree_mgr._git_read(repo, "config", "--get", "genesis.probe") == (0, "yes")
+
+
+def _commit_step(wt: Path) -> None:
+    (wt / "step.txt").write_text("step one")
+    subprocess.run(["git", "-C", str(wt), "add", "step.txt"], check=True)
+    subprocess.run(["git", "-C", str(wt), "commit", "-q", "-m", "step one"], check=True)
+
+
+def _branch_log(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "log", "--format=%s", f"task/{TASK[:8]}"],
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+@pytest.mark.asyncio
+async def test_a_resume_with_the_directory_gone_keeps_the_committed_steps(repo):
+    # #3060: the re-create used to run git branch -D first.
+    base = repo / ".claude" / "worktrees"
+    wt = await worktree_mgr.create_worktree(TASK, repo, base)
+    _commit_step(wt)
+    shutil.rmtree(wt)
+
+    again = await worktree_mgr.create_worktree(TASK, repo, base, keep_branch=True)
+
+    assert again == wt and (wt / "step.txt").read_text() == "step one"
+    assert "step one" in _branch_log(repo)
+
+
+@pytest.mark.asyncio
+async def test_a_resume_over_an_unlisted_orphan_keeps_the_committed_steps(repo):
+    # The record already pruned, so nothing holds the branch: cleanup_worktree
+    # would delete it unless told to keep it.
+    base = repo / ".claude" / "worktrees"
+    wt = await worktree_mgr.create_worktree(TASK, repo, base)
+    _commit_step(wt)
+    _delete_and_recreate(wt)
+    subprocess.run(["git", "-C", str(repo), "worktree", "prune"], check=True)
+
+    await worktree_mgr.create_worktree(TASK, repo, base, keep_branch=True)
+
+    assert (wt / "step.txt").read_text() == "step one"
+    assert "step one" in _branch_log(repo)
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_task_still_deletes_a_leftover_branch(repo):
+    base = repo / ".claude" / "worktrees"
+    wt = await worktree_mgr.create_worktree(TASK, repo, base)
+    _commit_step(wt)
+    shutil.rmtree(wt)
+
+    await worktree_mgr.create_worktree(TASK, repo, base)
+
+    assert not (wt / "step.txt").exists() and "step one" not in _branch_log(repo)
+
+
+@pytest.mark.asyncio
+async def test_a_reinitialised_directory_is_not_the_registered_worktree(repo):
+    # git init at the old path: its own top level, and the old record is not
+    # marked prunable because a .git exists there again.
+    base = repo / ".claude" / "worktrees"
+    wt = await worktree_mgr.create_worktree(TASK, repo, base)
+    shutil.rmtree(wt)
+    subprocess.run(["git", "init", "-q", str(wt)], check=True)
+    assert "prunable" not in _porcelain(repo)
+    assert await worktree_mgr.is_registered_worktree(wt, repo) is False
