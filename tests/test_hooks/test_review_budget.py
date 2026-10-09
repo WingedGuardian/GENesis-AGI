@@ -1029,6 +1029,7 @@ def test_the_default_runner_reports_a_timeout_by_type():
     [
         ("runner_failed:TimeoutExpired", "timeout"),
         ("runner_failed:RuntimeError", "hook_deadline"),
+        ("runner_failed:DeadlineExpired", "hook_deadline"),
         ("runner_failed:OSError", "runner_raised"),
         ("API rate limit exceeded for user ID 1", "rate_limited"),
         ("HTTP 503: Service Unavailable", "http_503"),
@@ -1169,3 +1170,46 @@ def test_a_body_edited_between_pages_of_one_read_is_reported(monkeypatch):
     assert len(serve.seen) == 4  # two reads of two pages each
     assert got["status"] == "ok", got
     assert got["body"] is None and got["body_changed"] is True
+
+
+def test_the_production_deadline_exception_is_a_hook_deadline():
+    """Round-2 review: production's review_deadline.bounded_timeout raises
+    DeadlineExpired, recorded by its concrete name, which fell through to the
+    non-transient `runner_raised`; the switch never fired at the shared deadline."""
+    from review_deadline import DeadlineExpired
+
+    assert issubclass(DeadlineExpired, RuntimeError)
+    assert rb._gh_failure_class(f"runner_failed:{DeadlineExpired.__name__}") == "hook_deadline"
+
+
+def test_an_earlier_snapshots_recovered_failure_does_not_excuse_a_later_one(monkeypatch):
+    """Round-2 review: the page-budget check read the function-wide failure list,
+    so a 502 the FIRST read recovered from made the SECOND read's too-large
+    exhaustion look transient. Each snapshot is judged by its own failures."""
+    _no_seams(monkeypatch)
+    clock = _FakeClock()
+    serve = _graphql_server(
+        page_size=1, reviews=[_gql_review(H5)] * 40, files=_FILES, commits=_COMMITS
+    )
+    calls = {"n": 0, "second_read": False}
+
+    def runner(argv, *, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return 1, "", "HTTP 502: Bad Gateway"  # recovered by the retry
+        query = next(a for a in argv if a.startswith("query="))
+        fresh = not any(a.startswith("after_") for a in argv)
+        # The second (mutable) read starts with a fresh query that no longer asks
+        # for files; from then on every page is slow. The first read stays fast.
+        if fresh and "files" not in query:
+            calls["second_read"] = True
+        clock.now += timeout if calls["second_read"] else 0.1
+        return serve(argv, timeout=timeout)
+
+    got = rb.evaluate_pr(
+        "owner/repo", 7, runner=runner, external_identity_templates=(), monotonic=clock
+    )
+    assert calls["second_read"], "the second read never started: the fixture is wrong"
+    assert got["status"] == "unknown", got
+    assert "graphql_read_budget_pages" in got["errors"], got
+    assert not rb.errors_are_transient(got["errors"]), got

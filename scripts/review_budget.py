@@ -873,8 +873,11 @@ def _gh_failure_class(stderr: str) -> str:
         kind = text.split(":", 1)[1]
         if kind == "TimeoutExpired":
             return "timeout"
-        if kind == "RuntimeError":
-            return "hook_deadline"  # the caller's timeout_for refused to issue it
+        # The caller's timeout_for refused to issue the call: production's
+        # review_deadline.bounded_timeout raises DeadlineExpired (a RuntimeError
+        # subclass), and the wrapper records the CONCRETE type name.
+        if kind in ("DeadlineExpired", "RuntimeError"):
+            return "hook_deadline"
         return "runner_raised"
     low = text.lower()
     if "rate limit" in low or "secondary rate" in low:
@@ -1184,6 +1187,10 @@ def _evaluate_pr_inner(
         body_moved = False
         path_changed = False
         read = Deadline.after(_GRAPHQL_READ_SECONDS, monotonic=monotonic)
+        # Failures recorded by an EARLIER snapshot say nothing about this one: a
+        # recovered failure there must not make this read's budget exhaustion look
+        # transient.
+        failures_before = len(failures)
         for _page in range(_GRAPHQL_MAX_PAGES):
             # ONE clock reading decides both whether to call and how long the
             # call may take. Two readings leave a gap a stall can fall into:
@@ -1191,7 +1198,7 @@ def _evaluate_pr_inner(
             # #2594); just short of it, it issued a call too small to finish.
             left = read.remaining()
             if left is None or left < floor:
-                if _page and not failures:
+                if _page and len(failures) == failures_before:
                     # Pages were read and no call failed: the PR's evidence is too
                     # large to read in this budget. That holds on every attempt, so
                     # it is NOT on the transient allowlist (it keeps asking).
