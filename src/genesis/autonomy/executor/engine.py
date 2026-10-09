@@ -1302,7 +1302,7 @@ class CCSessionExecutor:
             return False
 
         wt_path = Path(wt_path_str)
-        if await _worktree.verify_worktree(wt_path):
+        if await _worktree.is_registered_worktree(wt_path, _REPO_ROOT):
             self._worktree_paths[task_id] = wt_path
             logger.info(
                 "Recovered existing worktree at %s for task %s",

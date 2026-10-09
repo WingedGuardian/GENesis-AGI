@@ -147,6 +147,21 @@ Easy-to-forget mechanisms:
   investigation), inside the hook wrapper's 10s ceiling. The
   `memory_proactive` MCP tool shares the engine but stays unfiltered/
   un-reranked.
+- **FTS term counts are bounded** (`db/crud/_fts.py` `bounded_terms`,
+  `FTS_MAX_TERMS`): the expanded query (`intent.expand_query`), the raw prompt
+  when it becomes the file-keyword lane's base (`_expand_fts_query`), and the
+  AND→OR retry (`or_fallback`) keep at most that many FTS5 tokens (32), counted
+  over every operand (repeats included) in the `porter ascii` tokenizer's units
+  (`fts5_tokens`: a snake_case word is one token per piece), filled with the
+  most frequent terms in the prompt. A query within the budget is unchanged. Without it
+  a long paste ORed every word, scored most of `memory_fts`, timed recall out and
+  spilled 60-190 MiB temp sorts. The strict AND first pass is de-duplicated when over the budget (`and_pass`): it
+  matches the same rows, and a repeated-word paste no longer costs seconds per
+  recall (measured 2026-10-09 on a synthetic 20k-row in-memory table: 400 repeated
+  operands 12.7 s, de-duplicated 0.04 s). Accepted cost: on
+  long prompts the top results shift (median 29% overlap with the unbounded
+  ranking, measured 2026-10-08). The tag co-occurrence index also skips the
+  `session_note` tag (on ~59% of rows), which otherwise widened every expansion.
 - `procedure_recall` deliberately uses Jaccard tag-overlap
   (`learning/procedural/matcher.py find_relevant`), not hybrid retrieval.
 - External-world recall results are provenance-wrapped (`wrap_external_recall`)
@@ -209,8 +224,9 @@ any live flip. Centrality persistence widened from top-500 to all-nonzero
 a real bridge-node population; `centrality_cache` gains its first reader.
 
 **Graph backend is a SEAM (`memory/graphstore.py`)** — traversal and centrality
-run through a `GraphStore` protocol with one implementation today,
-`NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`);
+run through a `GraphStore` protocol with two implementations: the default
+`NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`)
+and `FalkorGraphStore` (below);
 `memory/graph.py` is a facade that owns the single production instance and the
 backend choice. The contract, and the reason the seam exists: a read that cannot
 REACH its store RAISES `GraphUnavailableError` and never returns empty — empty
@@ -246,6 +262,28 @@ docs (2026-09-07): only the NAMED-PATH form works for hop-wise filtering, the
 engine has NO temporal types despite its own documentation listing them, and a
 loading engine answers `BusyLoadingError` — which is unavailable, never empty.
 Acceptance: 400 live roots replayed through both stores, 0 node-set differences.
+The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
+(`memory/graphstore_project.py`); that schedule is its staleness bound, and an
+engine restart leaves no projection until the next run (the engine keeps no data
+on disk). At runtime only `graph.traverse()` READS the engine (the projector
+writes it, the health probe pings it): its callers are `memory_recall`
+enrichment (MCP, and genesis-server's tool API), `memory_expand`, and
+`drift_recall` (MCP drift mode and the ambient worker). Recall's own graph step (`graph_expansion.py`) reads
+`memory_links` through SQL and never touches it.
+**Every traversal outcome is recorded** for the default-on cutover (owner gate:
+14 days in falkordb mode with zero fallbacks): `eval_events` rows
+(`event_type="graph_traverse"`, `dimension="system"`) built by
+`memory/graph_telemetry.py`, one per caller call, with the configured mode, the
+store that answered, and the exception class of any fallback, selection failure
+or error. A call's first fallback, selection failure or error is also written as
+its own row the moment it happens, so a process killed mid-request cannot lose the
+evidence that the clock broke. A row that fails to write is carried as
+`prior_write_failures` on the next row and appended to
+`~/.genesis/telemetry/graph_traverse_lost_writes.jsonl`, which outlives the
+process. `graph_traverse_prune` deletes rows, and file lines, older than 30 days;
+kill switch `GENESIS_GRAPH_TELEMETRY_DISABLED=1`.
+The fallback WARNINGs alone could never answer this: MCP servers log to stderr,
+which never reaches the journal.
 
 Freshness has one stated boundary: all 13 `invalidate_graph_cache()` sites are
 `memory_links` writers, while the visibility predicate below reads
@@ -1833,8 +1871,38 @@ verified: 477efb7f7 2026-10-05
   fsck auto-resolves `git_deep` only (fsck READS — a passing fsck must never
   clear a live `rootfs_readonly` cheap alert). Creates carry
   `skip_if_duplicate=True` (atomic INSERT…WHERE NOT EXISTS — the only guard
-  that works across concurrent loops). Probe sensitivity is deliberately
-  single-failure; do not add consecutive-failure gating.
+  that works across concurrent loops). The cheap probe stays single-failure.
+  **The deep fsck re-checks once before paging (#2745, owner decision
+  2026-10-08, superseding the single-failure rule for this probe):** a failing
+  run is re-run 120 s later (an `asyncio.sleep`, cancellable at shutdown). A
+  re-run that fails on its own pages `critical` as before, with "(reproduced on
+  re-check)" and its failing lines; a re-run that times out, is killed or cannot
+  start is inconclusive, keeps the first run's lines and pages with "(re-check
+  did not complete: ...)". A service stop is not a failure: the stop cancels an
+  in-flight scan, and a fsck that died of SIGTERM aborts the scan with no
+  verdict and no row. Because a re-check can race too, a failing re-check
+  whose every line is `missing <type> <sha>` for an object that exists on a
+  `git cat-file --batch-check` lookup right after (same type) is recorded as a
+  transient (scan race, with the re-check's lines kept); any other line, an
+  absent object or a failed lookup still pages. The lookup reads headers only,
+  so it never clears an object fsck called corrupt: those print `error:` lines.
+  It ignores replace refs (as fsck does), and never vouches for the empty tree
+  or empty blob, which git can answer from memory with no file on disk.
+  A failure that passes its re-check becomes one `high`
+  `git_deep_transient` row PER event (morning report and dashboard, never
+  Telegram). A clean run does not resolve these rows; they expire on the 3-day
+  `infrastructure_alert` TTL, so a recurrence shows as several rows. Why: all 5
+  deep alerts recorded 2026-07-18 to 2026-10-08 were resolved without repair (2
+  by the monitor's next run, 3 by a manual re-run), in an object store shared by
+  hundreds of worktrees; on 2026-10-09 a concurrent `git fetch` writing a ref
+  mid-scan, and later a `git add` (blobs plus an index), were caught producing
+  exactly such "missing" lines (2 of 3 live scans that night; objects present
+  seconds later). fsck
+  runs with `--no-dangling`, and the evidence keeps every non-noise line (stderr
+  first), so thousands of dangling objects can no longer bury the real error.
+  The tick dispatches the deep scan out-of-band (`_dispatch_git_health_deep`),
+  so neither fsck run holds the tick lock; a run still going after ~37 min logs
+  one WARNING (the daily scan has stalled).
 
 - **awareness/**: the 5-min heartbeat. Signal collectors (the richer
   `learning/signals/*` set REPLACES the bootstrap placeholders in
@@ -2979,7 +3047,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, env.py,
           _config_overlay.py]
-verified: 477efb7f7 2026-10-05
+verified: ba9dd8a37 2026-10-09
 ```
 
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
@@ -3068,7 +3136,17 @@ verified: 477efb7f7 2026-10-05
   not trip it (the 2026-09-18 log-storm class). Both land with the runtime
   corruption trip.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
-  without it interleaved commits pin `in_transaction` until restart). Two
+  without it interleaved commits pin `in_transaction` until restart). Every
+  statement through a `SerializedConnection` (its cursors' row fetches too),
+  and every recall read through the RO pool (`HybridRetriever._ro_read`), in
+  any process that uses them, is timed by `db/_slow_log.timed`: one taking at
+  least `GENESIS_SQLITE_SLOW_MS` (default 1000, `0` = off) logs one WARNING
+  naming the SQL (never its parameters) or read helper, the in-process wait vs
+  the run (run includes SQLite's busy-timeout wait and lock-retry backoff), the
+  outcome (ok / cancelled / error) and what it was stuck behind — rate-limited
+  per label and outcome to one line per 60 s unless a repeat is twice as slow.
+  Not timed: raw `aiosqlite`/`sqlite3` connections and the unlocked
+  `db.cursor()` / `cursor.execute()` routes (unused in production). Two
   schema paths coexist: base DDL (`schema/_tables.py`, 117 CREATE TABLE, a count
   that drifts every table-adding PR — re-measure, do not trust) plus versioned
   `migrations/` run ONCE at startup before any
@@ -3313,7 +3391,13 @@ verified: 477efb7f7 2026-10-05
   awareness tick (`resilience/tailscale_watchdog_events.py`), never read into
   the annotation prompt.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
-  encrypted `scripts/backup.sh` timer).
+  encrypted `scripts/backup.sh` timer). `db/crud/peer_restore.py` resets peer
+  permissions in staged backup restores and update's pre-migration rollback
+  candidate: disabled mode, empty grants, renewed epochs; no credential reads.
+  A connection-local SQLite authorizer refuses trigger/view execution and writes
+  beyond those reset targets; required peer tables must be ordinary tables.
+  Guardian snapshot rollback instead warns at its existing action-approval gate
+  that approval explicitly reauthorizes saved peers.
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
   `process_lock` (the reason bare `python -m genesis serve` blocks systemd),
   tmp discipline (`~/tmp` for large temp — never override TMPDIR),
