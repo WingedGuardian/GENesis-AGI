@@ -1155,4 +1155,4 @@ jobs:
         # Floor: 25040 + 130 = 25170.
         # Authenticated backup reads: measured net +106; 25170 + 106 = 25276.
         # Offline restore fixture changes are count-neutral; ceiling stays 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25276
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25385
