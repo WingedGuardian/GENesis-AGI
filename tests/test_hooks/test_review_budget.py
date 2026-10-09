@@ -282,17 +282,21 @@ def _slow_runner(clock: _FakeClock, calls: list[tuple[str, float]]):
     return run
 
 
-def _graphql_server(*, head=H5, page_size=100, heads=None, **connections):
+def _graphql_server(
+    *, head=H5, page_size=100, heads=None, body=None, bodies=None, **connections
+):
     """A fake `gh api graphql` that honours the query's connections and cursors.
 
     It reads WHICH connections the query selects from the query text and each
     one's `after_<name>` cursor from argv, and serves `page_size` nodes per page,
     so pagination, per-connection cursors and re-reads are exercised against the
     real argv the module builds rather than a canned reply. `heads`, when given,
-    is consumed one per call (a head that moves between reads). Anything that is
-    not a GraphQL call fails, so an unexpected REST call is loud.
+    is consumed one per call (a head that moves between reads); so is `bodies`
+    (a PR body edited between reads). Anything that is not a GraphQL call fails,
+    so an unexpected REST call is loud.
     """
     head_seq = list(heads or [])
+    body_seq = list(bodies or [])
     seen: list[list[str]] = []
 
     def run(argv, *, timeout):
@@ -302,6 +306,12 @@ def _graphql_server(*, head=H5, page_size=100, heads=None, **connections):
         query = next(a for a in argv if a.startswith("query="))
         fields = dict(a.split("=", 1) for a in argv if "=" in a and not a.startswith("query="))
         pr: dict = {"headRefOid": head_seq.pop(0) if head_seq else head}
+        # The PR's own body field, not a review node's: those select `body` too.
+        selects_body = "{ headRefOid body " in query
+        if body_seq and selects_body:
+            pr["body"] = body_seq.pop(0)
+        elif body is not None and selects_body:
+            pr["body"] = body
         for name in ("reviews", "comments", "files", "commits"):
             if f" {name}(first: 100" not in query:
                 continue
@@ -445,7 +455,8 @@ def test_every_paginated_read_asks_for_a_full_page_in_the_path():
     source = (_ROOT / "scripts" / "review_budget.py").read_text()
     tree = ast.parse(source)
     fn = next(
-        n for n in ast.walk(tree)
+        n
+        for n in ast.walk(tree)
         if isinstance(n, ast.FunctionDef) and n.name == "_evaluate_pr_inner"
     )
     paginated = 0
@@ -949,3 +960,50 @@ def test_a_comment_reposted_between_reads_is_not_unknown(monkeypatch):
 
     got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
     assert got["status"] == "ok", got
+
+
+def test_the_live_read_carries_the_pr_body(monkeypatch):
+    """The PR body rides the one GraphQL query, for the reflection's
+    acceptance points; it adds no call."""
+    _no_seams(monkeypatch)
+    body = "## Acceptance\n- it works\n"
+    serve = _graphql_server(reviews=[_gql_review(H4)], files=_FILES, commits=_COMMITS, body=body)
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert got["body"] == body and got["body_changed"] is False
+    queries = [next(a for a in call if a.startswith("query=")) for call in serve.seen]
+    assert queries and all("{ headRefOid body " in q for q in queries)
+
+
+def test_a_body_edited_between_the_reads_is_reported_not_chosen(monkeypatch):
+    """#3107 c4222860305: the body came from the first read only, so an edit
+    before the final read was missed. Two reads that disagree return no body,
+    and say so; the count itself still stands."""
+    _no_seams(monkeypatch)
+    serve = _graphql_server(
+        reviews=[_gql_review(H4)], files=_FILES, commits=_COMMITS, bodies=["old", "new"]
+    )
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert got["body"] is None and got["body_changed"] is True
+    assert len(serve.seen) == 2  # the final read is the one that saw the edit
+
+
+def test_a_body_edited_between_pages_of_one_read_is_reported(monkeypatch):
+    """#3107 round 2 c4225376515: only a read's first page set the body, so an
+    edit seen on a later page of the final read was missed. Every page is
+    compared, as the head is."""
+    _no_seams(monkeypatch)
+    comments = [{"body": f"c{i}", "author": {"login": "someone", "__typename": "User"}}
+                for i in range(150)]
+    serve = _graphql_server(
+        reviews=[_gql_review(H4)],
+        files=_FILES,
+        commits=_COMMITS,
+        comments=comments,
+        bodies=["old", "old", "old", "new"],
+    )
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert len(serve.seen) == 4  # two reads of two pages each
+    assert got["status"] == "ok", got
+    assert got["body"] is None and got["body_changed"] is True
