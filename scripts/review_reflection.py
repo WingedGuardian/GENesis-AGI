@@ -554,8 +554,16 @@ _PREMISE_VERDICT_RE = re.compile(
     + r"Design-premise:(?:\*\*)?\s*(SOUND-BUT-INFERIOR|SOUND|BROKEN)(?![\w-]|[ \t]*[/|][ \t]*(?:SOUND|BROKEN))",
     re.MULTILINE,
 )
+#: A claim's verdict is the word in its SLOT, on the claim's own line: the first
+#: TRUE, FALSE or UNPROVEN right after an em or en dash or a hyphen with spaces
+#: on both sides (optionally bold), or one that fills a whole table cell. A
+#: verdict word inside the claim's own text is not in a slot, so it is never
+#: read as the verdict.
 _PREMISE_CLAIM_RE = re.compile(
-    _BLOCK_LEAD + r"P([1-9][0-9]?)\b.*?\b(TRUE|FALSE|UNPROVEN)\b", re.MULTILINE
+    _BLOCK_LEAD
+    + r"P([1-9][0-9]?)\b.*?(?:(?:\u2014|\u2013|[ \t]-[ \t])[ \t]*(?:\*\*)?(TRUE|FALSE|UNPROVEN)\b"
+    + r"|\|[ \t]*(?:\*\*)?(TRUE|FALSE|UNPROVEN)(?:\*\*)?[ \t]*(?:\||$))",
+    re.MULTILINE,
 )
 
 
@@ -567,7 +575,8 @@ def premise_block(text: str) -> tuple[str | None, dict[str, str], str | None]:
     verdicts = {m.group(1) for m in _PREMISE_VERDICT_RE.finditer(text)}
     claims: dict[str, str] = {}
     for m in _PREMISE_CLAIM_RE.finditer(text):
-        if claims.setdefault(m.group(1), m.group(2)) != m.group(2):
+        said = m.group(2) or m.group(3)
+        if claims.setdefault(m.group(1), said) != said:
             return None, {}, f"claim P{m.group(1)} carries two different verdicts"
     if len(verdicts) > 1:
         return None, {}, "it names more than one 'Design-premise:' verdict: " + ", ".join(

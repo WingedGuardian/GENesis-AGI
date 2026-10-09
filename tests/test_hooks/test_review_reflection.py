@@ -921,6 +921,73 @@ def test_a_claim_verdict_is_the_first_one_on_its_line():
     assert rr.premise_block(text)[1] == {"1": "TRUE", "2": "UNPROVEN"}
 
 
+@pytest.mark.parametrize(
+    "line, verdict",
+    [
+        ("  P1 claim with no verdict\n- TRUE stray", None),  # never borrows the next line
+        ("  P1 claim \u2014\nTRUE", None),
+        ("| P1 | claim |\nFALSE", None),
+        ("  P1 run with x -TRUE flag \u2014 FALSE", "FALSE"),  # an unspaced hyphen is no slot
+        ("| P1 | TRUE values survive | FALSE |", "FALSE"),  # a verdict must fill its cell
+        ("| P1 | claim | **TRUE** |", "TRUE"),
+        ("| P1 | claim | TRUE", "TRUE"),
+    ],
+)
+def test_a_claim_slot_stays_on_its_line_and_in_its_cell(line, verdict):
+    """#3107 round-2 fix-code audit: the slot's whitespace crossed a newline,
+    a hyphen needed no space after it, and a table cell starting with a verdict
+    word filled the slot."""
+    text = f"Design-premise: SOUND\n{line}\n  P2 b \u2014 TRUE\n"
+    assert rr.premise_block(text)[1].get("1") == verdict
+
+
+@pytest.mark.parametrize(
+    "line, verdict",
+    [
+        ("  P1 whether TRUE values survive \u2014 FALSE \u00b7 x.py:1", "FALSE"),
+        ("  P1 a FALSE start is ruled out \u2013 TRUE", "TRUE"),
+        ("- P1 UNPROVEN cases are counted - TRUE \u00b7 falsified by a FALSE read", "TRUE"),
+        ("| P1 | claim naming TRUE twice | FALSE |", "FALSE"),
+        ("  P1 the cap holds \u2014 **UNPROVEN** \u00b7 80%", "UNPROVEN"),
+    ],
+)
+def test_a_claim_binds_the_verdict_in_its_slot(line, verdict):
+    """#3107 round 2 c4225376510: a verdict word inside the claim text was read
+    as the claim's verdict, so a reflection restating it passed against a file
+    that concluded otherwise. The verdict is the one after the separator."""
+    text = f"Design-premise: SOUND\n{line}\n  P2 b \u2014 TRUE\n"
+    assert rr.premise_block(text)[1]["1"] == verdict
+
+
+def test_a_misstated_claim_is_refused_when_its_text_names_a_verdict(tmp_path):
+    evidence = tmp_path / "premise.txt"
+    evidence.write_text(
+        "Design-premise: SOUND\n"
+        "  P1 whether TRUE values survive \u2014 FALSE \u00b7 x.py:1\n"
+        "  P2 the caller retries \u2014 TRUE \u00b7 y.py:3\n"
+    )
+
+    def problem(p1):
+        lines = [
+            f"Premise-check: P1 {p1} whether the stored values survive",
+            "Premise-check: P2 TRUE the caller retries on a refusal",
+            f"Premise-evidence: {evidence} SOUND",
+        ]
+        parsed = rr.parse(_reflection(premise="SOUND", extra=lines), round_number=2)
+        assert parsed.ok, parsed.problems
+        return rr.evidence_problem(
+            str(evidence),
+            kind="premise",
+            cwd=str(tmp_path),
+            round_started=T0,
+            made_at=datetime.now(UTC) + timedelta(hours=1),
+            reflection=parsed,
+        )
+
+    assert "P1 says TRUE" in problem("TRUE")
+    assert problem("FALSE") is None
+
+
 def test_a_premise_check_naming_two_verdicts_is_refused():
     text = "Design-premise: SOUND\nDesign-premise: BROKEN\n  P1 a \u2014 TRUE\n  P2 b \u2014 FALSE\n"
     assert "more than one" in rr.premise_block(text)[2]

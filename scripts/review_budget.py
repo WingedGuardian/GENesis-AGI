@@ -1073,14 +1073,16 @@ def _evaluate_pr_inner(
         old path hit it was not counted (a same-day run under the budget saw 0
         of 70, an earlier one showed a p90 above it).
 
-        Every page re-reads ``headRefOid``; a head that moves between pages is
-        the same race the final head read below exists to catch.
+        Every page re-reads ``headRefOid`` and the PR body; a head that moves
+        between pages is the same race the final head read below exists to
+        catch, and a body that moves is reported as ``body_moved``.
         """
         rows: dict[str, list[dict[str, Any]]] = {item: [] for item in names}
         cursors: dict[str, str] = {}
         pending = list(names)
         head: str | None = None
         body: str | None = None
+        body_moved = False
         path_changed = False
         read = Deadline.after(_GRAPHQL_READ_SECONDS, monotonic=monotonic)
         for _page in range(_GRAPHQL_MAX_PAGES):
@@ -1125,8 +1127,14 @@ def _evaluate_pr_inner(
             page_head = data.get("headRefOid")
             if not isinstance(page_head, str):
                 return None, "graphql_malformed"
-            if body is None and isinstance(data.get("body"), str):
-                body = data["body"]
+            # The body is compared on every page, as the head is: an edit seen
+            # on a later page of this read must not be lost.
+            page_body = data.get("body")
+            if isinstance(page_body, str):
+                if body is None:
+                    body = page_body
+                elif page_body != body:
+                    body_moved = True
             if head is None:
                 head = page_head
             elif page_head != head:
@@ -1157,7 +1165,16 @@ def _evaluate_pr_inner(
                     cursors[item] = cursor
                     following.append(item)
             if not following:
-                return {"head": head, "body": body, "path_changed": path_changed, **rows}, None
+                return (
+                    {
+                        "head": head,
+                        "body": body,
+                        "body_moved": body_moved,
+                        "path_changed": path_changed,
+                        **rows,
+                    },
+                    None,
+                )
             pending = following
         return None, f"{pending[0]}_response_truncated"
 
@@ -1273,8 +1290,11 @@ def _evaluate_pr_inner(
     # final read's body is the one returned, and two reads that disagree return
     # no body and say so (``body_changed``), for the reader to refuse rather
     # than check acceptance against either.
-    bodies = [s.get("body") for s in (first, second) if s is not None]
-    result["body_changed"] = len(bodies) == 2 and bodies[0] != bodies[1]
+    reads = [s for s in (first, second) if s is not None]
+    bodies = [s.get("body") for s in reads]
+    result["body_changed"] = any(s.get("body_moved") for s in reads) or (
+        len(bodies) == 2 and bodies[0] != bodies[1]
+    )
     result["body"] = None if result["body_changed"] or not bodies else bodies[-1]
     return result
 

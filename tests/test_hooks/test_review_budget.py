@@ -987,3 +987,23 @@ def test_a_body_edited_between_the_reads_is_reported_not_chosen(monkeypatch):
     assert got["status"] == "ok", got
     assert got["body"] is None and got["body_changed"] is True
     assert len(serve.seen) == 2  # the final read is the one that saw the edit
+
+
+def test_a_body_edited_between_pages_of_one_read_is_reported(monkeypatch):
+    """#3107 round 2 c4225376515: only a read's first page set the body, so an
+    edit seen on a later page of the final read was missed. Every page is
+    compared, as the head is."""
+    _no_seams(monkeypatch)
+    comments = [{"body": f"c{i}", "author": {"login": "someone", "__typename": "User"}}
+                for i in range(150)]
+    serve = _graphql_server(
+        reviews=[_gql_review(H4)],
+        files=_FILES,
+        commits=_COMMITS,
+        comments=comments,
+        bodies=["old", "old", "old", "new"],
+    )
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert len(serve.seen) == 4  # two reads of two pages each
+    assert got["status"] == "ok", got
+    assert got["body"] is None and got["body_changed"] is True
