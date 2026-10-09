@@ -490,6 +490,8 @@ _FRESH = (
     "scripts/lib/live_checkout.py",
     "scripts/hooks/bash_allowlist_guard.sh",
     "scripts/hooks/bash_allowlist_lib.sh",
+    "scripts/lib/deploy_marker.sh",
+    "scripts/lib/deploy_checkout.sh",
     "scripts/hooks/main_checkout_guard.py",
     "scripts/hooks/hook_input.py",
     "scripts/hooks/hook_output.py",

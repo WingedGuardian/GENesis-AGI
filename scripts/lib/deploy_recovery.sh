@@ -4,6 +4,14 @@
 # Unlike deploy_checkout.sh's silent predicates, these helpers may echo; they
 # leave terminating the caller to the script that sourced them.
 
+# Git calls that run hooks go through genesis_without_checkout_lock
+# (lib/checkout_lock.sh), so a hook's background child cannot hold the checkout
+# lock. bootstrap.sh sources this lib without that one and never holds the lock,
+# so a plain pass-through stands in; checkout_lock.sh, sourced before or after,
+# provides the real one.
+declare -F genesis_without_checkout_lock >/dev/null \
+    || genesis_without_checkout_lock() { "$@"; }
+
 EPHEMERAL_CLEAR_PATHS=(AGENTS.md config/procedure_triggers.yaml)
 EPHEMERAL_BACKUP_ROOT="$HOME/.genesis/premerge-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
@@ -66,7 +74,7 @@ _ephemeral_clear_before_reset() {
         if _ephemeral_backup_is_current "$p" "$root" \
             || _ephemeral_backup_is_current "$p" "$root/late" \
             || _ephemeral_backup_is_current "$p" "$root/rollback"; then
-            git -C "$GENESIS_ROOT" checkout -q HEAD -- "$p" 2>&1 \
+            genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout -q HEAD -- "$p" 2>&1 \
                 || echo "  WARNING: could not clear the backed-up edit to $p; the rollback will refuse over it."
         fi
     done
