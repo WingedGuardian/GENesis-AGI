@@ -50,7 +50,14 @@ def normalize(payload: object) -> Action:
     raise Refused("Unsupported validator tool")
 
 
-def dispatch(action: Action) -> None:
+def dispatch(action: Action, *, workspace: Path | None = None) -> None:
+    if action.kind == "patch":
+        if workspace is None:
+            raise Refused("Validator patch requires a trusted workspace")
+        from codex_validator_patch import check_patch
+
+        check_patch(action.arguments["command"], workspace)
+        return
     if action.kind != "mcp":
         # Subsequent reviewed policies replace these explicit closed branches.
         raise Refused("Validator mutation policy is not installed")
@@ -90,7 +97,7 @@ def main() -> int:
         from genesis.eval.qualification.evidence import load_json
 
         payload = load_json(raw)
-        dispatch(normalize(payload))
+        dispatch(normalize(payload), workspace=ws)
     except Refused as exc:
         print(f"BLOCKED: {exc}", file=sys.stderr)
     except Exception:
