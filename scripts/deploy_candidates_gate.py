@@ -93,7 +93,8 @@ HOST_DRIVER_PREFIXES = (
     "scripts/systemd/genesis-cc-tmp-align.",
 )
 # The git and Claude Code hooks (owner, 2026-10-01): the guards that protect the
-# repository never run unreviewed code. Only these two directories (owner ruling
+# repository never run code that is neither reviewed nor owner-approved for that
+# head (#2978: `add --approve-hooks`). Only these two directories (owner ruling
 # 87b86c40): the wider hook surface (.claude/settings.json, config/behavioral_rules/,
 # the hook scripts at scripts/ root) is admitted, an accepted residual.
 HOOK_DIRS = ("scripts/hooks/", ".claude/hooks/")
@@ -105,11 +106,13 @@ REFUSAL_FILES = (
     "scripts/deploy_code_only.sh",
     "scripts/bootstrap.sh",
     "scripts/lib/deploy_checkout.sh",
+    "scripts/lib/deploy_recovery.sh",
     "scripts/lib/deploy_marker.sh",
     "scripts/lib/guardian_pause.sh",
     "scripts/lib/alert_queue.sh",
     "scripts/lib/deploy_status.sh",
     "scripts/lib/live_system_guard.sh",
+    "scripts/lib/checkout_lock.sh",
     # Read with `cat` before the branch check and run as python later: the
     # serving read runs inside `deploy_code_only.sh status`, which readiness runs.
     "scripts/lib/serving_commit.py",
@@ -189,8 +192,9 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
 
     The server's base is merge-base(serving commit, origin/main): what the
     server runs that is reviewed main. The hooks are compared with the commit
-    the checkout holds (HEAD), whose scripts/hooks/ admission keeps equal to
-    reviewed main on `live`, and against the directory git runs them from."""
+    the checkout holds (HEAD), whose scripts/hooks/ on `live` is reviewed main's
+    or an approved candidate's (admission and hook attribution), and against the
+    directory git runs them from."""
     fails: list[str] = []
     too_old = git_version_failure(repo)
     if too_old:
@@ -242,6 +246,15 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
         want = repo.blob_at("HEAD", f"scripts/hooks/{name}")
         if want is None:
             continue  # sync-hooks.sh skips a name with no source
+        kind = non_file_kind(repo, "HEAD", f"scripts/hooks/{name}")
+        if kind:
+            # Not the bytes sync installs (a link's target path, a tree or a
+            # commit id), so no sync could ever make them compare equal.
+            fails.append(
+                f"scripts/hooks/{name} is a {kind} at HEAD; `live` supports only regular-file "
+                "git hooks"
+            )
+            continue
         dst = hooks_dir / name
         if not dst.is_file():
             fails.append(
@@ -263,8 +276,10 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
 
 
 # ── admission ─────────────────────────────────────────────────────────────
-def path_refusal(path: str) -> str | None:
-    """Why a changed path keeps a candidate off `live`, or None."""
+def path_refusal(path: str, hooks_approved: bool = False) -> str | None:
+    """Why a changed path keeps a candidate off `live`, or None.
+    ``hooks_approved`` skips ONLY the hook rule: every other rule still applies
+    to a path under the hook directories (a .gitattributes there, say)."""
     if path.startswith(MIGRATION_DIRS):
         # Any change, not only an addition: a merged migration this install has
         # not applied yet runs at the next boot in whatever form `live` holds.
@@ -277,8 +292,11 @@ def path_refusal(path: str) -> str | None:
         return f"changes the Claude Code pin ({path}), which reaches the host"
     if path.startswith(HOST_DRIVER_PREFIXES):
         return f"changes what drives the host from this checkout ({path}), which reaches the host"
-    if path.startswith(HOOK_DIRS):
-        return f"changes a git or Claude Code hook ({path}); hooks go live only after they merge"
+    if path.startswith(HOOK_DIRS) and not hooks_approved:
+        return (
+            f"changes a git or Claude Code hook ({path}); hooks go live only after they merge, "
+            "or with the owner's approval (add --approve-hooks)"
+        )
     if path in REFUSAL_FILES or path.startswith(ENGINE_PREFIX):
         return f"changes what keeps the wipers and this engine safe on `live` ({path})"
     if path == ".gitattributes" or path.endswith("/.gitattributes"):
@@ -292,19 +310,87 @@ def path_refusal(path: str) -> str | None:
     return None
 
 
-def admission_failures(repo: Repo, base: str, head: str) -> list[str]:
+_NON_FILE_KINDS = {"120000": "symbolic link", "040000": "directory", "160000": "submodule"}
+
+
+def non_file_kind(repo: Repo, commit: str, path: str) -> str | None:
+    """What ``path`` is in ``commit`` when it is present but not a regular file
+    (mode 100644 or 100755): "symbolic link", "directory", "submodule", or its
+    mode. None for a regular file or an absent path. A hook must be a regular
+    file: sync-hooks.sh copies what a link points at and skips anything else,
+    and an object id that is not a blob is not the bytes that run."""
+    text = repo.git("ls-tree", "-z", commit, "--", path).stdout
+    head = text.split("\0", 1)[0]
+    if not head:
+        return None
+    mode = head.split(" ", 1)[0]
+    if mode in ("100644", "100755"):
+        return None
+    return _NON_FILE_KINDS.get(mode, f"mode {mode} entry")
+
+
+def listed_non_files(repo: Repo, commit: str) -> dict[str, str] | None:
+    """Every name sync-hooks.sh lists at ``commit`` whose scripts/hooks source
+    there is not a regular file, with its kind; None when the list cannot be
+    read. sync-hooks.sh skips such a source (or copies what a link points at),
+    so a listed non-file leaves an old hook running and readiness refusing."""
+    try:
+        names = sync_hook_names(repo.show(commit, SYNC_HOOKS) or "")
+    except Refusal:
+        return None
+    bad: dict[str, str] = {}
+    for name in names:
+        # `.` would make ls-tree list the directory's contents, not itself.
+        kind = (
+            "directory"
+            if name in (".", "..")
+            else non_file_kind(repo, commit, f"scripts/hooks/{name}")
+        )
+        if kind:
+            bad[name] = kind
+    return bad
+
+
+def changed_paths(repo: Repo, base: str, head: str) -> list[str]:
+    """Every path this head changes against its merge base with origin/main
+    (three dots, so a branch behind main is not charged with main's own
+    changes)."""
+    text = repo.git("diff", "--no-renames", "--name-only", "-z", f"{base}...{head}").stdout
+    return [p for p in text.split("\0") if p]
+
+
+def admission_failures(repo: Repo, base: str, head: str, hooks_approved: bool = False) -> list[str]:
     """What keeps this head from going live: the diff against its merge base
-    with origin/main (three dots, so a branch behind main is not charged with
-    main's own changes), and any `Deploy-rebuild:` commit it carries."""
-    text = repo.git("diff", "--no-renames", "--name-status", "-z", f"{base}...{head}").stdout
-    parts = text.split("\0")
+    with origin/main, and any `Deploy-rebuild:` commit it carries.
+    ``hooks_approved`` (the owner approved THIS head's hook changes) waives the
+    hook rule only (see path_refusal)."""
     fails: list[str] = []
-    i = 0
-    while i + 1 < len(parts) and parts[i]:
-        why = path_refusal(parts[i + 1])
+    changed = changed_paths(repo, base, head)
+    for path in changed:
+        why = path_refusal(path, hooks_approved)
         if why:
             fails.append(why)
-        i += 2
+        elif path.startswith(HOOK_DIRS) or any(d.startswith(path + "/") for d in HOOK_DIRS):
+            # Only regular files under the hook directories, approved or not:
+            # sync-hooks.sh copies what a link points at and skips a directory
+            # or submodule, and Claude Code runs a hook through a link, so an
+            # approval of such an entry cannot cover what runs. A hook
+            # DIRECTORY made a link is the same.
+            kind = non_file_kind(repo, head, path)
+            if kind:
+                fails.append(
+                    f"makes {path} a {kind}; only regular files may go under the hook "
+                    "directories, since an approval of anything else cannot cover what runs"
+                )
+    if SYNC_HOOKS in changed:
+        # A changed list can name a source this diff never touched: each name it
+        # installs must be a regular file too. An unreadable list is excluded by
+        # name at rebuild instead.
+        for name, kind in (listed_non_files(repo, head) or {}).items():
+            fails.append(
+                f"lists scripts/hooks/{name} in {SYNC_HOOKS}, which is a {kind}; only "
+                "regular files may be installed as git hooks"
+            )
     commits = repo.rev_list(head, "--not", base)
     info = repo.read_commits(commits)
     for c in commits:
@@ -401,7 +487,157 @@ def gate_failure(repo: Repo, base: str, cand: dict) -> str | None:
             f"the branch moved to {tip[:12]} since {head[:12]} was added: "
             f"add it again to run this commit (scripts/deploy_candidates add {branch} ...)"
         )
-    fails = admission_failures(repo, base, head)
+    fails = admission_failures(repo, base, head, hooks_approved(cand))
     if fails:
         return "admission: " + "; ".join(fails)
     return pr_failure(repo, cand)
+
+
+def hooks_approved(cand: dict) -> bool:
+    """The owner approved this candidate's hook changes, for exactly the head it
+    is pinned at (the validator also requires that; checked again here)."""
+    ha = cand.get("hook_approval")
+    return isinstance(ha, dict) and ha.get("head") == cand["verified_head"]
+
+
+def tree_entry(repo: Repo, commit: str, path: str) -> tuple[str, str] | None:
+    """(mode, object id) of ``path`` in ``commit``, or None when absent. The mode
+    is part of what a hook IS: git can merge one change's bytes with another's
+    mode, and a hook that loses its executable bit stops running."""
+    text = repo.git("ls-tree", "-z", commit, "--", path).stdout
+    head = text.split("\0", 1)[0]
+    if not head:
+        return None
+    meta = head.split("\t", 1)[0].split()
+    return (meta[0], meta[2])
+
+
+def hook_ownership_failures(
+    repo: Repo, base: str, tip: str, merged: Mapping[str, str], approved: set[str]
+) -> dict[str, str]:
+    """Every hook path whose tree entry (mode and bytes) on the rebuilt ``tip``
+    differs from ``base`` must have exactly ONE owner: a single merged candidate
+    that changed it (against its own merge base), approved for that head, whose
+    entry the tip holds unchanged (so origin/main has not changed it since the
+    candidate was cut). Ownership replaces matching merged bytes against approved
+    heads, which kept admitting entries no approval held (a blend of two
+    approved changes, one's bytes with another's mode, a deletion "matched" by an
+    approved head that never had the file). Returns the candidates to EXCLUDE by
+    name, with why; empty when every changed hook path has its owner. The owner
+    is found by the merge STEP that changed the path, not by the candidate's own
+    diff (see below). Rebuild and drop (the repair path) both exclude rather
+    than refuse; the one Refusal is for a tip build_plan did not build. ``merged`` maps
+    branch -> merged head; ``approved`` names the branches approved at that head."""
+    text = repo.git("diff", "--no-renames", "--name-only", "-z", base, tip, "--", *HOOK_DIRS).stdout
+    paths = [p for p in text.split("\0") if p]
+    out: dict[str, str] = {}
+    if not paths:
+        return out
+    # Ownership by MERGE STEP: the rebuild chains one merge per candidate
+    # (first parent = the tip so far, second = the candidate's head), so every
+    # change between base and tip is made by some step. A candidate's own diff
+    # is not enough: git's merge follows a rename origin/main made, so a
+    # candidate that edited the old path changes the hook path without touching
+    # it (MEASURED, git 2.43; merge-tree has no switch to turn that off).
+    branch_of = {h: b for b, h in merged.items()}
+    stepped: dict[str, set[str]] = {}
+    walk = repo.git("rev-list", "--first-parent", "--parents", tip, "--not", base).stdout
+    for line in walk.splitlines():
+        ids = line.split()
+        if len(ids) == 3 and ids[2] in branch_of:
+            changed = repo.git(
+                "diff", "--no-renames", "--name-only", "-z", ids[1], ids[0], "--", *HOOK_DIRS
+            ).stdout
+            stepped[branch_of[ids[2]]] = {q for q in changed.split("\0") if q}
+    owned: dict[str, list[str]] = {}
+    for path in paths:
+        got = tree_entry(repo, tip, path)
+        if got == tree_entry(repo, base, path):
+            continue  # e.g. only the mode moved and back: nothing differs
+        # The union: a step that changed the path (a followed rename included),
+        # and a candidate whose own diff changed it even when its step did not
+        # (its bytes equal what an earlier candidate merged): one hook, one owner.
+        owners = [
+            b
+            for b, h in merged.items()
+            if path in stepped.get(b, set())
+            or tree_entry(repo, h, path) != tree_entry(repo, repo.merge_base(base, h) or base, path)
+        ]
+        owned[path] = owners
+        if path == SYNC_HOOKS and owners:
+            # The restore after a later move reads this list to know what this
+            # checkout installed; one it cannot read is unknown there, and a hook
+            # only this list named would stay installed after its candidate left.
+            try:
+                sync_hook_names(repo.show(tip, SYNC_HOOKS) or "")
+            except Refusal as exc:
+                for b in owners:
+                    out[b] = (
+                        f"leaves {SYNC_HOOKS} in a form the engine cannot read ({exc}); "
+                        "keep each list as one quoted name per line"
+                    )
+                continue
+        if len(owners) > 1:
+            for b in owners:
+                out[b] = (
+                    f"{', '.join(owners)} each change {path}; only one candidate may change "
+                    "a hook at a time: drop all but one"
+                )
+            continue
+        if not owners:
+            # Every change past base is made by some merge step, so this means
+            # the tip was not built the way build_plan builds it.
+            raise Refusal(f"{path} changed on the rebuilt `live`, but no merge step changed it")
+        [owner] = owners
+        head = merged[owner]
+        if tree_entry(repo, head, path) == tree_entry(
+            repo, repo.merge_base(base, head) or base, path
+        ):
+            out[owner] = (
+                f"its merge changes {path} without its own diff touching it (git followed a "
+                "rename origin/main made onto a hook path): merge origin/main into it"
+            )
+        elif owner not in approved:
+            out[owner] = (
+                f"changes {path} with no current hook approval; add it again with --approve-hooks"
+            )
+        elif got != tree_entry(repo, merged[owner], path):
+            out[owner] = (
+                f"origin/main changed {path} since it was cut, so the merge holds a hook nobody "
+                "approved: merge origin/main into it, then add it again with --approve-hooks"
+            )
+    # Each candidate's own list passed admission, but candidates combine: one
+    # lists a name, another (or origin/main) puts a directory there. Check the
+    # list the rebuilt tip holds against the tip's tree. A culprit is an owner of
+    # the list change that ADDED the name, or of a path at or under the name
+    # where base held no non-file; a name main alone made bad excludes nobody
+    # (readiness names it at HEAD). Only once every other check passed: a
+    # candidate excluded above may be the one that made the name a directory,
+    # and the next pass judges the tip built without it.
+    if out:
+        return out
+    bad = listed_non_files(repo, tip)
+    if bad:
+        try:
+            base_names = set(sync_hook_names(repo.show(base, SYNC_HOOKS) or ""))
+        except Refusal:
+            base_names = set()
+        for name, kind in bad.items():
+            src = f"scripts/hooks/{name}"
+            culprits: list[str] = []
+            if name not in base_names:
+                culprits += owned.get(SYNC_HOOKS, [])
+            # `.` and `..` are always a directory at base: nobody made them one.
+            if name not in (".", "..") and non_file_kind(repo, base, src) is None:
+                for path in paths:
+                    if path == src or path.startswith(src + "/"):
+                        culprits += owned.get(path, [])
+            named = list(dict.fromkeys(culprits))
+            for b in named:
+                out.setdefault(
+                    b,
+                    f"the rebuilt `live` lists {src} in {SYNC_HOOKS}, which is a {kind} "
+                    f"there ({', '.join(named)}); only regular files may be installed "
+                    "as git hooks",
+                )
+    return out

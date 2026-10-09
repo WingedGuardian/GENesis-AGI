@@ -18,6 +18,11 @@ This snapshot makes that drift visible:
   update (the predictive "you need to run update.sh" signal)
 - ``host_gateway`` — guardian host deployed_commit drift vs HEAD, read from
   the state file the nightly cc-align timer / update.sh write (no SSH here)
+- ``main_checkout`` — tracked files edited in place in the deploy checkout,
+  judged by the deploy scripts' own predicate (``scripts/lib/
+  deploy_checkout.sh``, run through bash): the state in which the next
+  ``deploy_code_only.sh`` or ``update.sh`` run refuses. Not drift between
+  merged and deployed, so the awareness check words it separately
 
 The awareness tick's ``_check_deploy_staleness`` consumes the same collectors
 to raise a dashboard/morning-report observation. Everything is best-effort:
@@ -27,9 +32,13 @@ collectors degrade to ``None``/empty and never raise into the caller.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
 import re
+import signal
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -301,6 +310,276 @@ def collect_host_gateway(repo: Path, state_path: Path, now: datetime | None = No
         return {"status": "no_data"}
 
 
+#: How many dirty paths the ``main_checkout`` dict names; ``count`` stays exact
+#: and ``paths_omitted`` says how many more there are. 20 is a display budget
+#: for a dashboard row and an alert sentence, chosen, not measured: a deploy
+#: root is normally clean, and a tree with more than 20 edited files is a mass
+#: edit whose first 20 names already say what happened. The full list is one
+#: ``git status`` away in the checkout itself.
+MAIN_CHECKOUT_PATHS_SHOWN = 20
+
+# The deploy scripts' own "may a deploy touch this checkout?" predicate, run
+# through bash so there is ONE definition of a dirty deploy root (the ephemeral
+# allowlist, the hidden assume-unchanged/skip-worktree edits). $1 is the root,
+# $2/$3 the two libs: their paths are built in Python as `/`-join chains, which
+# is the shape the deploy_status.sh registration test can see. Exit codes:
+#   0  the predicate ran; its stdout is the tracked dirty lines (none = clean)
+#   2  git could not answer (the predicate's own unreadable status, or no git dir)
+#   3  not a primary checkout: a linked worktree or a clone parked in a worktree
+#      path, i.e. a dev tree running the code, not the deploy root
+#   4  a lib could not be sourced
+_MAIN_CHECKOUT_PROBE = (
+    # pipefail, as both deploy scripts run the lib: without it a failed producer
+    # inside a pipeline (git ls-files feeding xargs) reads as success, and an
+    # unreadable hidden edit would report the checkout clean.
+    "set -o pipefail\n"
+    'source "$2" || exit 4\n'
+    'source "$3" || exit 4\n'
+    # An empty allowlist pattern makes `grep -vE ""` drop every line: clean.
+    '[ -n "${EPHEMERAL_DIRTY_RE:-}" ] || exit 4\n'
+    'genesis_checkout_git_dirs "$1"\n'
+    '[ -n "$_git_dir" ] && [ -n "$_common_dir" ] || exit 2\n'
+    # Read here first: the lib's primary-checkout test swallows a failure of this
+    # call as "not a primary checkout", which would read as not_deploy_root.
+    'git -C "$1" rev-parse --is-inside-work-tree >/dev/null || exit 2\n'
+    'genesis_is_primary_checkout "$1" "$_git_dir" "$_common_dir" || exit 3\n'
+    'genesis_tracked_dirty_paths "$1"\n'
+)
+
+
+def _probe_reason(rc: int, err: str) -> str:
+    last = next((line.strip() for line in reversed(err.splitlines()) if line.strip()), "")
+    return f"probe exited {rc}" + (f": {last}" if last else "")
+
+
+# git's C-style path quoting (quote.c): inside the double quotes a backslash
+# introduces one of these escapes, or three octal digits encoding one byte.
+_GIT_C_ESCAPES = {
+    ord("a"): 0x07,
+    ord("b"): 0x08,
+    ord("t"): 0x09,
+    ord("n"): 0x0A,
+    ord("v"): 0x0B,
+    ord("f"): 0x0C,
+    ord("r"): 0x0D,
+    ord('"'): 0x22,
+    ord("\\"): 0x5C,
+}
+_OCTAL_DIGITS = frozenset(b"01234567")
+
+
+def _git_unquote(name: bytes) -> bytes:
+    """Undo git's C-style quoting of one path (``"caf\\303\\251.md"`` is
+    ``café.md``); an unquoted path comes back as is. git quotes a path that
+    holds a space, a quote, a backslash or a control character, and, under the
+    default ``core.quotePath``, any byte above 0x7F. Never raises: an escape git
+    would not emit is kept literally."""
+    if len(name) < 2 or name[:1] != b'"' or name[-1:] != b'"':
+        return name
+    body, out, i = name[1:-1], bytearray(), 0
+    while i < len(body):
+        if body[i] == 0x5C and i + 1 < len(body):
+            if body[i + 1] in _GIT_C_ESCAPES:
+                out.append(_GIT_C_ESCAPES[body[i + 1]])
+                i += 2
+                continue
+            digits = body[i + 1 : i + 4]
+            if len(digits) == 3 and all(d in _OCTAL_DIGITS for d in digits):
+                out.append(int(digits, 8) & 0xFF)
+                i += 4
+                continue
+        out.append(body[i])
+        i += 1
+    return bytes(out)
+
+
+def _dirty_paths(out: bytes) -> list[str]:
+    """Distinct file names in the predicate's porcelain lines, first-seen order.
+
+    A line is two status columns, a space and the path (``--no-renames``, so
+    never an ``a -> b`` pair; a name holding a newline is always quoted, so
+    splitting on newlines is safe). The names are for display, so the bytes are
+    decoded with any invalid UTF-8 shown escaped: a decode error must not take
+    the snapshot down. One file can appear twice, as a staged change in ``git
+    status`` and a hidden worktree change from the assume-unchanged pass, and
+    is counted once: ``count`` is files, not status records."""
+    names: dict[bytes, None] = {}  # deduplicated on the raw bytes, before the lossy decode
+    for line in out.split(b"\n"):
+        if len(line) > 3:
+            names.setdefault(_git_unquote(line[3:]), None)
+    return [name.decode("utf-8", "backslashreplace") for name in names]
+
+
+def _git_dir_of(repo: Path) -> Path | None:
+    """``repo``'s git directory without running git: ``.git`` itself, or the
+    directory a ``gitdir:`` file names. None when neither reads."""
+    dot_git = repo / ".git"
+    if dot_git.is_dir():
+        return dot_git
+    try:
+        line = dot_git.read_text().strip()
+    except OSError:
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    target = Path(line.removeprefix("gitdir:").strip())
+    return target if target.is_absolute() else repo / target
+
+
+def _remove_probe_scratch(pid: int, repo: Path | None) -> None:
+    """Remove the scratch index a probe with this pid left in ``repo``'s git
+    directory. The lib names it after the probe shell's pid ($$)."""
+    git_dir = _git_dir_of(repo) if repo is not None else None
+    if git_dir is not None:
+        for leftover in git_dir.glob(f"genesis-hidden-index.{pid}.*"):
+            with contextlib.suppress(OSError):
+                leftover.unlink()
+
+
+def _kill_probe_group(proc: subprocess.Popen, repo: Path | None = None) -> None:
+    # start_new_session made the probe its own group leader, so its pid is the
+    # group id; > 1 is checked anyway, since killpg(1) signals everything.
+    if proc.pid > 1:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        # A probe killed mid hidden-edit pass never reaches the lib's rm, and
+        # every later timed-out run would leave another index copy. The lib
+        # names the scratch file after the probe shell's pid ($$, which is
+        # proc.pid), so only this probe's copy matches. Removed before the
+        # reap: until then the pid cannot be reused by another process.
+        _remove_probe_scratch(proc.pid, repo)
+    # Bounded even now: a descendant that left the group (none in these libs)
+    # would hold the pipes open, and an unbounded read would wait on it. The
+    # reap is bounded as well: SIGKILL stays pending while the leader is in
+    # uninterruptible I/O, the very failure the timeout contains, and an
+    # unbounded wait() would strand the snapshot worker on it. Popen reaps a
+    # process left this way when the object is collected.
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.communicate(timeout=5)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        logger.warning("deploy_health: checkout probe %s did not exit after SIGKILL", proc.pid)
+
+
+def collect_main_checkout_dirty(repo: Path, *, timeout: float = _CHEAP_TIMEOUT_S) -> dict:
+    """Tracked files edited in place in the deploy checkout (ephemeral paths
+    excluded): the condition under which ``deploy_code_only.sh`` and
+    ``update.sh`` refuse the next deploy.
+
+    ``status`` is one of:
+
+    - ``clean`` / ``dirty`` — the predicate answered; ``count`` is the exact
+      number of files and ``paths`` names at most
+      :data:`MAIN_CHECKOUT_PATHS_SHOWN` of them, with ``paths_omitted`` saying
+      how many more there are. ``clean`` answers the tracked-edit question
+      only: the deploy scripts also refuse on the branch and on incoming files
+      that collide with untracked ones, which this does not check;
+    - ``not_deploy_root`` — ``repo`` is a linked worktree (a dev tree running
+      the code), so it is not the checkout deploys touch;
+    - ``deploying`` — a deploy is in progress (``env.update_in_progress()``):
+      not probed, since a deploy's own merge would read as dirty;
+    - ``unknown`` — it could not be read (a lib failed to source, git failed,
+      the probe timed out or could not start, or the collector itself failed);
+      ``reason`` says which. Never reported as clean: an unreadable tree must
+      not resolve a standing alert. One exception, shared with the deploy
+      scripts: git status skips a subdirectory it cannot open and still exits
+      0, so an edit under one reads clean here exactly as it does for them.
+
+    Never raises: like every other collector here it degrades on its own
+    failure, so the rest of the snapshot survives one bad read.
+
+    Read-only by contract. ``GIT_OPTIONAL_LOCKS=0`` stops ``git status`` from
+    refreshing and rewriting the index (which takes ``index.lock`` and could make
+    a concurrent deploy's merge fail), and git's location variables are scrubbed
+    so the probe reads ``repo`` and nothing else. The predicate's hidden-edit
+    pass writes one scratch index inside ``.git`` when a flagged entry exists and
+    removes it when it finishes; when the timeout kills the probe mid-pass, the
+    collector removes that probe's copy itself. The probe runs in its own
+    process group, and a timeout kills the whole group, so no git grandchild
+    outlives it.
+    """
+    try:
+        return _collect_main_checkout_dirty(repo, timeout)
+    except Exception as exc:
+        logger.warning("deploy_health: main-checkout collector failed", exc_info=True)
+        return {
+            "status": "unknown",
+            "count": 0,
+            "paths": [],
+            "reason": f"collector failed: {type(exc).__name__}",
+        }
+
+
+def _collect_main_checkout_dirty(repo: Path, timeout: float) -> dict:
+    from genesis import env
+    from genesis.session_awareness.zero_drop_git import scrubbed_git_env
+
+    if env.update_in_progress():
+        return {"status": "deploying", "count": 0, "paths": []}
+    marker_lib = repo / "scripts" / "lib" / "deploy_marker.sh"
+    checkout_lib = repo / "scripts" / "lib" / "deploy_checkout.sh"
+    run_env = scrubbed_git_env()
+    run_env["GIT_OPTIONAL_LOCKS"] = "0"
+    argv = ["bash", "-c", _MAIN_CHECKOUT_PROBE, "_", str(repo), str(marker_lib), str(checkout_lib)]
+    try:
+        # Bytes, not text: a tracked name need not be valid UTF-8 (raw under
+        # core.quotePath=false), and decoding the whole stream would raise.
+        proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell interpolation
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            env=run_env,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        logger.warning("deploy_health: main-checkout probe could not start: %s", exc)
+        return {"status": "unknown", "count": 0, "paths": [], "reason": f"could not start: {exc}"}
+    try:
+        out, err_bytes = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_probe_group(proc, repo)
+        logger.warning("deploy_health: main-checkout probe timed out after %ss", timeout)
+        # A deploy that began meanwhile explains a slow read better than a fault.
+        if env.update_in_progress():
+            return {"status": "deploying", "count": 0, "paths": []}
+        return {
+            "status": "unknown",
+            "count": 0,
+            "paths": [],
+            "reason": f"timed out after {timeout:g}s",
+        }
+    except BaseException:
+        _kill_probe_group(proc, repo)
+        raise
+    rc = proc.returncode
+    if rc < 0:
+        # Killed by a signal from outside (an OOM kill), possibly mid hidden-edit
+        # pass, before the lib's own rm.
+        _remove_probe_scratch(proc.pid, repo)
+    # A deploy that began while the probe ran (deploy_code_only.sh pull keeps the
+    # server up) may have been mid-merge under it: its reading is not the
+    # checkout's, so it reports the same state a deploy found up front does.
+    if env.update_in_progress():
+        return {"status": "deploying", "count": 0, "paths": []}
+    if rc == 3:
+        return {"status": "not_deploy_root", "count": 0, "paths": []}
+    if rc != 0:
+        err = err_bytes.decode("utf-8", "backslashreplace")
+        logger.warning("deploy_health: main-checkout probe rc=%s stderr=%s", rc, err.strip())
+        return {"status": "unknown", "count": 0, "paths": [], "reason": _probe_reason(rc, err)}
+    # The predicate already dropped untracked and ephemeral lines.
+    paths = _dirty_paths(out)
+    shown = paths[:MAIN_CHECKOUT_PATHS_SHOWN]
+    return {
+        "status": "dirty" if paths else "clean",
+        "count": len(paths),
+        "paths": shown,
+        "paths_omitted": len(paths) - len(shown),
+    }
+
+
 async def last_success_update(db: aiosqlite.Connection | None) -> dict:
     """Most recent successful update_history row (age computed by caller UIs).
 
@@ -349,6 +628,7 @@ def derive_findings(
     commits_behind: int | None,
     update_age_days: float | None = None,
     behind_threshold: int = 50,
+    main_checkout: dict | None = None,
 ) -> list[str]:
     """Stable, order-deterministic finding keys — the alert/dedup contract.
 
@@ -357,7 +637,13 @@ def derive_findings(
     DIFFERENT thresholds: ``stale_update`` (≥STALE_UPDATE_DAYS old AND
     ≥STALE_UPDATE_COMMITS behind — the sustained condition the awareness
     check pages on) and ``behind_upstream`` (> behind_threshold regardless
-    of update age — a plain volume signal)."""
+    of update age — a plain volume signal).
+
+    ``main_checkout`` (``collect_main_checkout_dirty``'s dict) adds
+    ``main_checkout_dirty:<n>`` for tracked edits in the deploy checkout and
+    ``main_checkout_unreadable`` when that could not be read: never nothing, so
+    an unreadable tree cannot clear a standing dirty finding. ``clean``,
+    ``not_deploy_root`` and ``deploying`` add nothing."""
     findings: list[str] = []
     if missing_units:
         findings.append("missing_units:" + ",".join(sorted(missing_units)))
@@ -376,7 +662,23 @@ def derive_findings(
         findings.append(f"stale_update:{round(update_age_days, 1)}d,{commits_behind}behind")
     if commits_behind is not None and commits_behind > behind_threshold:
         findings.append(f"behind_upstream:{commits_behind}")
+    findings.extend(main_checkout_findings(main_checkout))
     return findings
+
+
+def main_checkout_findings(main_checkout: dict | None) -> list[str]:
+    """The finding keys a ``collect_main_checkout_dirty`` dict contributes. The
+    one producer of ``main_checkout_*`` keys: :func:`derive_findings` uses it,
+    and so does the awareness check when it carries a previous tick's checkout
+    reading forward over a tick whose own reading it cannot act on."""
+    status = (main_checkout or {}).get("status")
+    if status == "dirty":
+        count = main_checkout.get("count")
+        # None: a dirty state carried from a standing alert, count unknown.
+        return [f"main_checkout_dirty:{'?' if count is None else count}"]
+    if status == "unknown":
+        return ["main_checkout_unreadable"]
+    return []
 
 
 # ── Snapshot entry point (HealthDataService) ────────────────────────
@@ -394,6 +696,7 @@ def _collect_sync(repo: Path, genesis_home_dir: Path) -> dict:
         "git": git_facts,
         "missing_units": missing_units,
         "host_gateway": host_gateway,
+        "main_checkout": collect_main_checkout_dirty(repo),
     }
 
 
@@ -412,6 +715,7 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
             host_gateway=collected["host_gateway"],
             commits_behind=collected["git"].get("commits_behind_upstream"),
             update_age_days=update.get("age_days"),
+            main_checkout=collected["main_checkout"],
         )
         return {
             "status": "attention" if findings else "healthy",
@@ -421,6 +725,7 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
             "missing_units": collected["missing_units"],
             "tier2_pending": tier2,
             "host_gateway": collected["host_gateway"],
+            "main_checkout": collected["main_checkout"],
         }
     except Exception:
         logger.error("deploy_health snapshot failed", exc_info=True)

@@ -198,6 +198,11 @@ _SELF_DIR="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # deploy_marker.sh's EPHEMERAL_DIRTY_RE, sourced above).
 # shellcheck source=lib/deploy_checkout.sh
 . "$_SELF_DIR/lib/deploy_checkout.sh"
+# shellcheck source=lib/checkout_lock.sh
+. "$_SELF_DIR/lib/checkout_lock.sh"
+# Mutating, printing recovery helpers shared with update.sh.
+# shellcheck source=lib/deploy_recovery.sh
+. "$_SELF_DIR/lib/deploy_recovery.sh"
 # The helpers that run AFTER the merge are read now, like the libs above: the
 # merge may replace them on disk, and this run must use the versions it started
 # with (`python3 -c "$CODE" args…` sees the same sys.argv as running the file).
@@ -860,6 +865,9 @@ _pull() {
     # needs neither the stop nor the restart, but only if HEAD has held no other
     # runtime files since the boot: a module the server imported from a pulled
     # tree stays loaded after a later commit restores the files.
+    if ! genesis_checkout_lock "$GENESIS_ROOT"; then
+        die "checkout busy (a Claude launch holds genesis-checkout.lock); nothing changed"
+    fi
     if [ "$MODE" = deploy ]; then
         _read_baseline
         if [ -n "$SERVING" ] && _runtime_held "$_upstream"; then
@@ -894,7 +902,7 @@ _pull() {
     _PHASE="merging"
     for _f in "${_reset[@]}"; do
         echo "  Resetting $_f to HEAD for the merge: its local edit is dropped (it regenerates)."
-        git -C "$GENESIS_ROOT" checkout HEAD -- "$_f"
+        genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$_f"
         _RESET_NOTE="$_RESET_NOTE $_f"
     done
     # Safe for this script to merge the tree it runs from: git REPLACES a changed
@@ -909,7 +917,7 @@ _pull() {
     # a file written between that scan and this merge (the server, another
     # session) would be lost; with the flag git refuses it too, at the merge
     # itself, leaving HEAD and the tree as they were (measured, git 2.43).
-    if ! git -c gc.autoDetach=false -C "$GENESIS_ROOT" merge --ff-only --no-overwrite-ignore -q "$_upstream" {_UPDATE_LOCK_FD}>&-; then
+    if ! genesis_without_checkout_lock git -c gc.autoDetach=false -C "$GENESIS_ROOT" merge --ff-only --no-overwrite-ignore -q "$_upstream" {_UPDATE_LOCK_FD}>&-; then
         _status_after="$(_status_outside_resets)" || _status_after="unreadable after"
         if [ "$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null)" = "$_head" ] \
             && [ "$_status_after" = "$_status_before" ]; then
@@ -917,6 +925,7 @@ _pull() {
             # same tree; only if that fails does the exit still alert.
             if [ -n "$_STOPPED" ]; then
                 echo "  Starting genesis-server again on the unchanged tree…"
+                genesis_checkout_unlock
                 systemctl --user start genesis-server {_UPDATE_LOCK_FD}>&- && _STOPPED=""
             fi
             [ -n "$_STOPPED" ] || _PHASE="checks"
@@ -925,6 +934,7 @@ _pull() {
         exit 1
     fi
     _PHASE="merged"
+    genesis_checkout_unlock
     _CHECKED="$_upstream"
     echo "  Merged $_head..$_upstream"
 }
