@@ -147,6 +147,21 @@ Easy-to-forget mechanisms:
   investigation), inside the hook wrapper's 10s ceiling. The
   `memory_proactive` MCP tool shares the engine but stays unfiltered/
   un-reranked.
+- **FTS term counts are bounded** (`db/crud/_fts.py` `bounded_terms`,
+  `FTS_MAX_TERMS`): the expanded query (`intent.expand_query`), the raw prompt
+  when it becomes the file-keyword lane's base (`_expand_fts_query`), and the
+  AND→OR retry (`or_fallback`) keep at most that many FTS5 tokens (32), counted
+  over every operand (repeats included) in the `porter ascii` tokenizer's units
+  (`fts5_tokens`: a snake_case word is one token per piece), filled with the
+  most frequent terms in the prompt. A query within the budget is unchanged. Without it
+  a long paste ORed every word, scored most of `memory_fts`, timed recall out and
+  spilled 60-190 MiB temp sorts. The strict AND first pass is de-duplicated when over the budget (`and_pass`): it
+  matches the same rows, and a repeated-word paste no longer costs seconds per
+  recall (measured 2026-10-09 on a synthetic 20k-row in-memory table: 400 repeated
+  operands 12.7 s, de-duplicated 0.04 s). Accepted cost: on
+  long prompts the top results shift (median 29% overlap with the unbounded
+  ranking, measured 2026-10-08). The tag co-occurrence index also skips the
+  `session_note` tag (on ~59% of rows), which otherwise widened every expansion.
 - `procedure_recall` deliberately uses Jaccard tag-overlap
   (`learning/procedural/matcher.py find_relevant`), not hybrid retrieval.
 - External-world recall results are provenance-wrapped (`wrap_external_recall`)
