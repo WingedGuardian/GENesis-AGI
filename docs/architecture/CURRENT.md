@@ -1848,8 +1848,38 @@ verified: 477efb7f7 2026-10-05
   fsck auto-resolves `git_deep` only (fsck READS — a passing fsck must never
   clear a live `rootfs_readonly` cheap alert). Creates carry
   `skip_if_duplicate=True` (atomic INSERT…WHERE NOT EXISTS — the only guard
-  that works across concurrent loops). Probe sensitivity is deliberately
-  single-failure; do not add consecutive-failure gating.
+  that works across concurrent loops). The cheap probe stays single-failure.
+  **The deep fsck re-checks once before paging (#2745, owner decision
+  2026-10-08, superseding the single-failure rule for this probe):** a failing
+  run is re-run 120 s later (an `asyncio.sleep`, cancellable at shutdown). A
+  re-run that fails on its own pages `critical` as before, with "(reproduced on
+  re-check)" and its failing lines; a re-run that times out, is killed or cannot
+  start is inconclusive, keeps the first run's lines and pages with "(re-check
+  did not complete: ...)". A service stop is not a failure: the stop cancels an
+  in-flight scan, and a fsck that died of SIGTERM aborts the scan with no
+  verdict and no row. Because a re-check can race too, a failing re-check
+  whose every line is `missing <type> <sha>` for an object that exists on a
+  `git cat-file --batch-check` lookup right after (same type) is recorded as a
+  transient (scan race, with the re-check's lines kept); any other line, an
+  absent object or a failed lookup still pages. The lookup reads headers only,
+  so it never clears an object fsck called corrupt: those print `error:` lines.
+  It ignores replace refs (as fsck does), and never vouches for the empty tree
+  or empty blob, which git can answer from memory with no file on disk.
+  A failure that passes its re-check becomes one `high`
+  `git_deep_transient` row PER event (morning report and dashboard, never
+  Telegram). A clean run does not resolve these rows; they expire on the 3-day
+  `infrastructure_alert` TTL, so a recurrence shows as several rows. Why: all 5
+  deep alerts recorded 2026-07-18 to 2026-10-08 were resolved without repair (2
+  by the monitor's next run, 3 by a manual re-run), in an object store shared by
+  hundreds of worktrees; on 2026-10-09 a concurrent `git fetch` writing a ref
+  mid-scan, and later a `git add` (blobs plus an index), were caught producing
+  exactly such "missing" lines (2 of 3 live scans that night; objects present
+  seconds later). fsck
+  runs with `--no-dangling`, and the evidence keeps every non-noise line (stderr
+  first), so thousands of dangling objects can no longer bury the real error.
+  The tick dispatches the deep scan out-of-band (`_dispatch_git_health_deep`),
+  so neither fsck run holds the tick lock; a run still going after ~37 min logs
+  one WARNING (the daily scan has stalled).
 
 - **awareness/**: the 5-min heartbeat. Signal collectors (the richer
   `learning/signals/*` set REPLACES the bootstrap placeholders in

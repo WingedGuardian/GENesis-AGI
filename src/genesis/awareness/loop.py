@@ -2402,15 +2402,68 @@ async def _check_git_health(db) -> None:
 # so it still runs in a router-degraded startup, the exact window a
 # belt-and-suspenders integrity check matters. A monotonic >=24h guard gives a
 # daily cadence that also fires once on the first tick after any restart (no
-# interval-reset starvation). The fsck runs in a thread (check_git_deep ->
-# to_thread) so it never blocks the tick. None = "never run this boot".
+# interval-reset starvation). The tick dispatches it OUT-OF-BAND (fsck can run up
+# to its 900 s timeout, twice with the re-check, and must not hold the tick lock);
+# the daily slot is claimed before the run, so overlapping ticks stay
+# single-flight. None = "never run this boot".
 _GIT_DEEP_INTERVAL_S = 24 * 3600
 _last_git_deep_run_at: float | None = None
+_git_deep_task = None  # strong reference to the out-of-band run
+# Set by a service stop, cleared by start: a tick that resumes after the stop
+# signal must not launch a scan nothing will cancel before the DB closes.
+_git_deep_stopped = False
+_git_deep_stuck_warned = False
+
+
+def _git_deep_stuck_s() -> int:
+    """Two fsck timeouts, the re-check wait and the object lookup, plus 5 min."""
+    from genesis.observability import git_health as g
+
+    return 2 * g._DEEP_TIMEOUT_S + g._FSCK_RECHECK_DELAY_S + g._LOOKUP_TIMEOUT_S + 300
+
+
+def _cancel_git_deep_task() -> None:
+    """Stop an in-flight deep scan at shutdown: a scan cut off by the stop
+    proves nothing and must not leave a verdict or a page behind. Also refuses
+    every later dispatch until the loop starts again."""
+    global _git_deep_stopped
+    _git_deep_stopped = True
+    if _git_deep_task is not None and not _git_deep_task.done():
+        _git_deep_task.cancel()
+
+
+def _dispatch_git_health_deep(db) -> None:
+    """Start the daily deep scan as a background task when it is due and not
+    already running, and never after a service stop; the tick never awaits it."""
+    global _git_deep_task, _git_deep_stuck_warned
+    if _git_deep_stopped:
+        return
+    if _git_deep_task is not None and not _git_deep_task.done():
+        # Two fsck timeouts plus the re-check wait bound a healthy run; past that
+        # the git child is stuck in uninterruptible I/O (a timeout kills any other)
+        # and the daily scan has stopped.
+        started = _last_git_deep_run_at
+        limit = _git_deep_stuck_s()
+        stalled = started is not None and time.monotonic() - started > limit
+        if stalled and not _git_deep_stuck_warned:
+            _git_deep_stuck_warned = True
+            logger.warning("git deep fsck still running after %ds; daily scan stalled", limit)
+        return
+    _git_deep_stuck_warned = False
+    last = _last_git_deep_run_at
+    if last is not None and time.monotonic() - last < _GIT_DEEP_INTERVAL_S:
+        return
+    from genesis.util.tasks import tracked_task
+
+    _git_deep_task = tracked_task(
+        _check_git_health_deep(db), name="git-deep-fsck", subsystem=Subsystem.AWARENESS
+    )
 
 
 async def _check_git_health_deep(db) -> None:
     """Daily `git fsck --full` content-verifying scan: writes the deep verdict
-    slot and, on failure, a critical observation. Best-effort; never raises.
+    slot and, on failure, a critical observation. Best-effort; never raises except
+    CancelledError, which a service stop uses to abort the scan with no verdict.
 
     Runs at most once per ``_GIT_DEEP_INTERVAL_S`` (and once on the first tick
     after a restart). NOT gated on ``db``: git integrity matters most when the DB
@@ -2432,7 +2485,8 @@ async def _check_git_health_deep(db) -> None:
 
     if report.ok:
         # Self-heal: a passing content-verifying fsck clears open DEEP alerts
-        # (category="git_deep" only). The verdict file already self-heals per
+        # (category="git_deep" only; git_deep_transient rows are records of past
+        # events and expire on their own TTL). The verdict file already self-heals per
         # slot; without this, the observations outlive recovery as stale
         # criticals and get amplified into false actions (2026-07-16 "git
         # corruption" alarm, seeded by a transient fsck race across ~112
@@ -2455,6 +2509,9 @@ async def _check_git_health_deep(db) -> None:
                     logger.info("git deep-health recovered: resolved %d alert(s)", healed)
             except Exception:
                 logger.debug("git deep-health auto-resolve failed", exc_info=True)
+            transient = report.details.get("fsck_transient")
+            if transient:
+                await _record_git_deep_transient(db, transient, report.checked_at)
         return
     if db is None:
         return
@@ -2476,6 +2533,11 @@ async def _check_git_health_deep(db) -> None:
         if len(detail_lines) >= 5:
             break
     detail = ("\n" + "\n".join(detail_lines)) if detail_lines else ""
+    recheck = report.details.get("fsck_recheck")
+    if report.details.get("fsck_reproduced"):
+        failures += " (reproduced on re-check)"
+    elif recheck:
+        failures += f" (re-check did not complete: {recheck})"
     try:
         created = await observations.create(
             db,
@@ -2510,6 +2572,42 @@ async def _check_git_health_deep(db) -> None:
             logger.debug("git deep-health alert suppressed (duplicate unresolved): %s", failures)
     except Exception:
         logger.debug("Failed to create git deep-health observation", exc_info=True)
+
+
+async def _record_git_deep_transient(db, transient: dict, checked_at: str) -> None:
+    """One 'high' row PER transient event (a fsck failure that passed on
+    re-check): shown in the morning report and dashboard, never paged (only
+    critical rows reach Telegram). A clean run does not resolve it; it expires on
+    the infrastructure_alert TTL, so a recurrence shows as more rows. The verdict
+    leads the body because those surfaces truncate content."""
+    lines = (transient.get("lines") or "").strip()
+    if transient.get("recheck_lines"):
+        lines += f"\nre-check reported (all present on lookup):\n{transient['recheck_lines']}"
+    if transient.get("race"):
+        verdict = (
+            "git fsck failed twice, but every object the re-check called missing exists "
+            "— a scan race with another writer"
+        )
+    else:
+        verdict = f"git fsck failed once and PASSED on re-check {transient.get('delay_s')}s later"
+    try:
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="git_health_monitor",
+            type="infrastructure_alert",
+            category="git_deep_transient",
+            skip_if_duplicate=True,
+            content_hash=hashlib.sha256(f"git_deep_transient:{checked_at}".encode()).hexdigest(),
+            content=(
+                f"{verdict} — transient, no action needed unless this recurs "
+                f"(rc={transient.get('rc')}).\n{lines}"
+            ),
+            priority="high",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+    except Exception:
+        logger.debug("Failed to create git deep-transient observation", exc_info=True)
 
 
 # Daily offline git-bundle publish (F.4). Publishes a *verified* `git bundle` of
@@ -3605,6 +3703,7 @@ class AwarenessLoop:
         Does NOT stop the scheduler — that happens in stop().
         """
         self._stopping = True
+        _cancel_git_deep_task()
 
     @property
     def tick_count(self) -> int:
@@ -3667,6 +3766,8 @@ class AwarenessLoop:
         waiting one full interval.  This keeps status.json fresh from the
         moment the bridge starts, preventing watchdog false-positives.
         """
+        global _git_deep_stopped
+        _git_deep_stopped = False
         self._scheduler.add_job(
             self._on_tick,
             IntervalTrigger(minutes=self._interval),
@@ -3736,6 +3837,7 @@ class AwarenessLoop:
     async def stop(self) -> None:
         """Stop the scheduler, waiting for any running tick to finish."""
         self._stopping = True
+        _cancel_git_deep_task()
         self._scheduler.shutdown(wait=True)
         logger.info("Awareness Loop stopped")
 
@@ -3932,10 +4034,11 @@ class AwarenessLoop:
             # inside). Writes a verdict to the shared mount for the guardian.
             await _check_git_health(self._db)
             # Daily deep fsck (F.1) — content-verifying scan for zeroed-but-present
-            # objects the cheap probe misses. Self-guards to ~daily and runs in a
-            # thread. Loop-driven (not the learning scheduler) so it survives a
-            # router-degraded startup.
-            await _check_git_health_deep(self._db)
+            # objects the cheap probe misses. Self-guards to ~daily; dispatched
+            # OUT-OF-BAND so its fsck (and a failing run's re-check) never holds
+            # the tick lock. Loop-driven (not the learning scheduler) so it
+            # survives a router-degraded startup.
+            _dispatch_git_health_deep(self._db)
             # Daily offline git-bundle publish (F.4) — a verified `git bundle` of
             # the repo to the shared mount, health-gated, so the host guardian can
             # archive an offline re-clone lifeline. Self-guards to ~daily and runs

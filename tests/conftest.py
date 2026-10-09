@@ -568,6 +568,29 @@ def _isolate_boundary_key(tmp_path):
     mp.undo()
 
 
+# ── Safety: a ticking test must not start the REAL daily git fsck ──────────
+@pytest.fixture(autouse=True)
+def _skip_daily_git_deep_scan():
+    """Mark the awareness loop's daily deep scan as just run, so a test that
+    drives a real tick never launches `git fsck --full` over the real repo as a
+    background task that outlives the test's event loop (and writes the real
+    verdict file). Tests of the scan reset the guard themselves. Applied only
+    when the module is already loaded: importing it here costs ~5 s per test
+    process, and a test that imports it lazily runs the scan as it always did."""
+    import time
+
+    awareness_loop = sys.modules.get("genesis.awareness.loop")
+    if awareness_loop is None:
+        yield
+        return
+    mp = pytest.MonkeyPatch()
+    mp.setattr(awareness_loop, "_last_git_deep_run_at", time.monotonic())
+    mp.setattr(awareness_loop, "_git_deep_task", None)
+    mp.setattr(awareness_loop, "_git_deep_stopped", False)
+    yield
+    mp.undo()
+
+
 @pytest.fixture(autouse=True)
 def _isolate_checkout_lock_path(tmp_path):
     mp = pytest.MonkeyPatch()
