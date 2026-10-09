@@ -150,8 +150,10 @@ Easy-to-forget mechanisms:
 - **FTS term counts are bounded** (`db/crud/_fts.py` `bounded_terms`,
   `FTS_MAX_TERMS`): the expanded query (`intent.expand_query`), the raw prompt
   when it becomes the file-keyword lane's base (`_expand_fts_query`), and the
-  AND→OR retry (`or_fallback`) keep at most that many distinct terms (32), the
-  most frequent in the prompt. A query within the budget is unchanged. Without it
+  AND→OR retry (`or_fallback`) keep at most that many FTS5 tokens (32), counted
+  over every operand (repeats included) in the `porter ascii` tokenizer's units
+  (`fts5_tokens`: a snake_case word is one token per piece), filled with the
+  most frequent terms in the prompt. A query within the budget is unchanged. Without it
   a long paste ORed every word, scored most of `memory_fts`, timed recall out and
   spilled 60-190 MiB temp sorts. The strict AND first pass is NOT bounded
   (measured cheap: 0.04-0.68 s, no spill, up to 4,060 tokens). Accepted cost: on

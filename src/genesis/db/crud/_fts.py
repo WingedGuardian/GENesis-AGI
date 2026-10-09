@@ -103,46 +103,86 @@ _OR_STOPWORDS = frozenset(
 )
 
 
-#: The most distinct terms a many-term MATCH built from free text may carry.
-#: FTS5 work grows with every OR'd term: MEASURED on a 112,801-row memory_fts copy
+#: The most FTS5 tokens a many-term MATCH built from free text may carry, counted
+#: over EVERY operand (a repeated word is evaluated once per occurrence) and in the
+#: tables' own tokenizer's units (``fts5_tokens``). FTS5 work grows with every
+#: OR'd term: MEASURED on a 112,801-row memory_fts copy
 #: (2026-10-08), an OR of 500 prompt terms took 4.8 s and spilled a 60 MiB temp
 #: sort, 1,500 terms 25 s and 177 MiB — the long-prompt recalls that timed out
 #: and the spill files the disk guardian paged on. 32 is the largest of 32/48
 #: that kept p95 under 1 s with no spill over 10 MiB on both query shapes, over
 #: 40 long + 20 short real prompts (expanded form: p95 0.75 s, peak spill
-#: 8.9 MiB; 48 spilled 12 MiB). Prompts with <= 32 distinct terms are untouched.
+#: 8.9 MiB; 48 spilled 12 MiB). A query whose operands total <= 32 tokens is
+#: untouched.
 FTS_MAX_TERMS = 32
 
 
-def bounded_terms(terms: list[str], n: int = FTS_MAX_TERMS, *, site: str = "") -> list[str]:
-    """At most ``n`` distinct terms from ``terms``, chosen by in-prompt frequency.
+def fts5_tokens(term: str) -> int:
+    """How many tokens FTS5 reads from one ``\\w+`` term (at least 1).
 
-    Returns ``terms`` UNCHANGED (duplicates and order kept) when it holds ``n``
-    or fewer distinct terms, so every query that fits the budget keeps its exact
-    pre-existing form. De-duplicating is NOT rank-neutral (bm25 sums one score
-    per query phrase, so a repeated term counts twice); it only happens when the
-    cap applies. Then the terms are ranked by how often they occur in ``terms``
-    — the words a long paste keeps returning to — ties broken by first
-    appearance, and the kept ones are returned in first-appearance order.
-    Rarest-first was measured worse: on long pasted logs it fills the budget
-    with hashes and ids that match nothing.
+    memory_fts and knowledge_fts use ``tokenize='porter ascii'``, whose ``ascii``
+    tokenizer treats every non-alphanumeric ASCII character as a separator,
+    underscore included, while Python's ``\\w`` keeps it inside a word. So
+    ``foo_bar_baz`` is one operand but a three-token phrase to FTS5, and the
+    budget counts the three. Non-ASCII characters are token characters to
+    ``ascii``, and ``\\w`` keeps only word characters, so ``_`` is the one
+    separator a term can carry.
+    """
+    return max(1, sum(1 for piece in term.split("_") if piece))
+
+
+def bounded_terms(terms: list[str], n: int = FTS_MAX_TERMS, *, site: str = "") -> list[str]:
+    """Terms from ``terms`` totalling at most ``n`` FTS5 tokens, by in-prompt frequency.
+
+    Returns ``terms`` UNCHANGED (the same object, duplicates and order kept) when
+    all its operands together come to ``n`` or fewer FTS5 tokens, so every query
+    that fits the budget keeps its exact pre-existing form. The count is over
+    every operand, not the distinct ones: a pasted log repeating one line has few
+    distinct words and thousands of operands, and FTS5 evaluates each. It is in
+    ``fts5_tokens`` units, because a snake_case identifier is several tokens to
+    the tables' tokenizer.
+
+    Past the budget the result is de-duplicated (NOT rank-neutral: bm25 sums one
+    score per query phrase, so a repeated term counted twice; that only changes
+    for queries the cap applies to). The distinct terms are ranked by how often
+    they occur in ``terms`` (the words a long paste keeps returning to), ties
+    broken by first appearance, and taken while they fit the token budget; the
+    kept ones come back in first-appearance order. Rarest-first was measured
+    worse: on long pasted logs it fills the budget with hashes and ids that
+    match nothing. A single term longer than the whole budget is cut to its first
+    ``n`` tokens, so the result is never empty for a non-empty input.
 
     Callers pass already-tokenised, stopword-filtered terms; ``site`` names the
     caller in the one log line written when the cap applies.
     """
+    total = sum(fts5_tokens(term) for term in terms)
+    if total <= n:
+        return terms
     counts: dict[str, int] = {}
     for term in terms:
         counts[term] = counts.get(term, 0) + 1
-    if len(counts) <= n:
-        return terms
     first = list(counts)  # dicts keep insertion (= first-appearance) order
     rank = {term: i for i, term in enumerate(first)}
-    keep = set(sorted(first, key=lambda t: (-counts[t], rank[t]))[:n])
-    kept = [term for term in first if term in keep]
+    keep: set[str] = set()
+    budget = n
+    for term in sorted(first, key=lambda t: (-counts[t], rank[t])):
+        cost = fts5_tokens(term)
+        if cost <= budget:
+            keep.add(term)
+            budget -= cost
+            if not budget:
+                break
+    if keep:
+        kept = [term for term in first if term in keep]
+    else:
+        top = min(first, key=lambda t: (-counts[t], rank[t]))
+        kept = ["_".join([piece for piece in top.split("_") if piece][:n])]
     logger.info(
-        "FTS terms capped at %s: %d distinct -> %d (site=%s)",
+        "FTS terms capped at %s: %d operands (%d distinct, %d tokens) -> %d (site=%s)",
         n,
+        len(terms),
         len(counts),
+        total,
         len(kept),
         site or "unspecified",
     )

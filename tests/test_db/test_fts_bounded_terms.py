@@ -4,7 +4,9 @@ A long pasted prompt used to become an OR (or AND) of every one of its words,
 which made FTS5 score most of the corpus: slow enough to time out memory recall,
 and large enough to spill a 60-190 MiB temp sort. ``bounded_terms`` caps the
 distinct terms at ``FTS_MAX_TERMS`` at every producer that builds such an
-expression, and leaves every query that fits the budget exactly as it was.
+expression, and leaves every query that fits the budget exactly as it was. The
+budget is FTS5 tokens over every operand: repeats count, and a snake_case word
+counts once per piece, because that is what FTS5 evaluates.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import aiosqlite
 import pytest
 
 from genesis.db.crud import _fts
-from genesis.db.crud._fts import FTS_MAX_TERMS, bounded_terms, or_fallback
+from genesis.db.crud._fts import FTS_MAX_TERMS, bounded_terms, fts5_tokens, or_fallback
 from genesis.db.crud.memory import _prepare_fts5
 
 N = FTS_MAX_TERMS
@@ -46,7 +48,9 @@ def _clean_cache():
 
 def test_at_or_under_the_cap_the_input_comes_back_untouched():
     terms = ["alpha", "beta", "alpha", "gamma"]
-    assert bounded_terms(terms, 3) is terms  # same object: dups and order kept
+    assert bounded_terms(terms, 4) is terms  # same object: dups and order kept
+    # 4 operands over a budget of 3: the repeat counts, so the cap applies.
+    assert bounded_terms(terms, 3) == ["alpha", "beta", "gamma"]
 
 
 def test_over_the_cap_keeps_the_most_frequent_ties_by_first_appearance():
@@ -67,7 +71,60 @@ def test_the_cap_logs_once_and_only_when_it_applies(caplog):
     assert not caplog.records
     bounded_terms([f"t{i}" for i in range(10)], 5, site="unit")
     assert len(caplog.records) == 1
-    assert "10 distinct -> 5" in caplog.text and "site=unit" in caplog.text
+    assert "10 operands (10 distinct, 10 tokens) -> 5" in caplog.text
+    assert "site=unit" in caplog.text
+
+
+# ── the budget counts what FTS5 evaluates ─────────────────────────────────────
+
+
+def test_repeated_operands_count_toward_the_budget():
+    # A pasted log repeating one line: few distinct words, many operands.
+    terms = ["spam", "eggs"] * 500
+    assert bounded_terms(terms, 32) == ["spam", "eggs"]
+
+
+def test_a_query_whose_operands_fit_is_untouched_even_with_repeats():
+    terms = ["spam", "eggs"] * 16  # 32 operands, 32 tokens
+    assert bounded_terms(terms, 32) is terms
+
+
+def test_or_retry_of_a_long_low_vocabulary_paste_is_bounded():
+    alt = or_fallback(_prepare_fts5(" ".join(["disk spill retrieval"] * 400)))
+    assert alt == "disk OR spill OR retrieval"
+
+
+async def test_lane_base_of_a_long_low_vocabulary_paste_is_bounded():
+    composed, _ = await _compose(" ".join(["disk spill retrieval"] * 400), extra=["needle1"])
+    assert composed == "(disk spill retrieval) OR (needle1)"
+
+
+def test_snake_case_terms_count_one_token_per_piece():
+    ids = [f"alpha_beta_{i}" for i in range(20)]  # 3 tokens each, 60 in all
+    kept = bounded_terms(ids, 32)
+    assert sum(fts5_tokens(t) for t in kept) <= 32
+    assert kept == ids[:10]  # all tie at count 1: first appearance fills 30 of 32
+
+
+def test_a_term_longer_than_the_whole_budget_is_cut_not_dropped():
+    long_id = "_".join(f"p{i}" for i in range(40))
+    assert bounded_terms([long_id], 32) == ["_".join(f"p{i}" for i in range(32))]
+
+
+@pytest.mark.parametrize(
+    "term", ["plain", "snake_case_word", "a__b", "_lead", "trail_", "x1_2y", "naïve_café"]
+)
+async def test_fts5_tokens_matches_the_tables_tokenizer(term):
+    # Measured against the engine, not asserted: the same tokenizer memory_fts uses.
+    db = await aiosqlite.connect(":memory:")
+    try:
+        await db.execute('CREATE VIRTUAL TABLE t USING fts5(c, tokenize="porter ascii")')
+        await db.execute("CREATE VIRTUAL TABLE v USING fts5vocab(t, instance)")
+        await db.execute("INSERT INTO t VALUES (?)", [term])
+        (count,) = (await db.execute_fetchall("SELECT count(*) FROM v"))[0]
+    finally:
+        await db.close()
+    assert fts5_tokens(term) == count
 
 
 # ── site C: the OR retry ──────────────────────────────────────────────────────

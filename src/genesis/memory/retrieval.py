@@ -16,7 +16,6 @@ from genesis.db.connection import ReadConnectionPool, ReadPoolClosed
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links, observations
 from genesis.db.crud._fts import (
-    FTS_MAX_TERMS,
     bounded_terms,
     drop_bm25_inert_terms,
     fts5_term,
@@ -1471,8 +1470,9 @@ class HybridRetriever:
                 # Same tokens as the expanded query (site A), so one definition
                 # of "prompt terms" serves both.
                 raw = _tokenize_query(query)
-                if len(set(raw)) > FTS_MAX_TERMS:
-                    base = " ".join(bounded_terms(raw, site="lane-base"))
+                bounded = bounded_terms(raw, site="lane-base")
+                if bounded is not raw:  # the same object back means it fit the cap
+                    base = " ".join(bounded)
             if kept:
                 fts_query = f"({base}) OR ({' OR '.join(kept)})"
             elif safe_terms:
