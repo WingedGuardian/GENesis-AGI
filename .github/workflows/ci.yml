@@ -1153,4 +1153,5 @@ jobs:
         # (test_qualification +78, test_qualification_references +24,
         # test_qualification_rework +28); no added skips.
         # Floor: 25040 + 130 = 25170.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 26138
+        # Installer17 versus main5: net+12; actual execution parent26138+12=26150.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 26150

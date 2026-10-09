@@ -2469,6 +2469,11 @@ verified: 041a01360 2026-10-09
   Evidence retrieval, installed scheduling and encrypted recovery arrive in
   dependent changes. This map does not describe a deployed capability.
 
+- **Optional analytics installation (development candidate)**: persistent opt-in
+  installs DuckDB/PyArrow; the hourly supervised collection timer remains disabled
+  when configuration or optional dependencies are unavailable. On-demand
+  opportunity-scan is installed as a skill; configured timer rollout is unverified.
+
 - **The graders are TOLD the response status; they must never infer it.** The
   triage/outcome/delta graders each judge an `InteractionSummary`, and the
   summarizer (`learning/triage/summarizer.py`) sizes `response_text` for them.

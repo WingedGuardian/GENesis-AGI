@@ -56,3 +56,21 @@ checks internal consistency; independent parser fixtures specify expected
 deduplication, error classes and final token usage. Schema5 and views version16
 require re-extraction or rebuilding when older material is incompatible.
 Evidence retrieval and encrypted backup/recovery arrive in dependent changes.
+
+Normal bootstrap/install installs the optional analytics extra only when persistent
+configuration opts in. Invalid configuration or missing DuckDB/PyArrow leaves the
+analytics timer disabled with a warning; core installation remains successful.
+The hourly timer uses the same supervised ingest path as the CLI.
+
+For a temporary pause of scheduled collection, set the user-manager kill switch
+and stop active analytics work:
+
+```bash
+systemctl --user set-environment GENESIS_TRANSCRIPT_ANALYTICS_DISABLED=1
+systemctl --user stop genesis-transcript-analytics.service
+systemctl --user stop 'genesis-job-transcript-analytics-*.scope'
+```
+
+Resume with `systemctl --user unset-environment GENESIS_TRANSCRIPT_ANALYTICS_DISABLED`.
+The persistent `DISABLED` file under the configured data directory also skips
+subsequent ticks. Neither lever changes the configured opt-in.
