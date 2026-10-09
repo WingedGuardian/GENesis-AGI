@@ -9,6 +9,7 @@ Sandboxed (HOME + GENESIS_DIR → tmp). Real sqlite3/gpg/git; the smbclient stub
 LOGS every ``-c`` command so we can assert the upload paths.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -58,6 +59,7 @@ def backup_env(tmp_path):
     # off-site upload must mirror it too (a shell glob would silently skip leading-dot names).
     (mem_dir / ".consolidate-lock").write_text("12345\n")
     (gd / "config").mkdir(parents=True)
+    (gd / "config/transcript_analytics.yaml").write_text("enabled: false\n")
     (gd / "config" / "sample.local.yaml").write_text("key: val\n")
     (gd / "secrets.env").write_text("FOO=bar\n")  # sourced by backup.sh; innocuous
     bare = tmp_path / "remote.git"
@@ -78,16 +80,13 @@ def backup_env(tmp_path):
     bind = tmp_path / "bin"
     bind.mkdir()
     smb_log = tmp_path / "smb_commands.log"
-    # smbclient stub: log the -c command (the arg after -c), succeed.
+    # Real filesystem model supplies transferred bytes for fresh readback checks.
+    # It exercises command semantics, not an actual SMB server.
+    remote = tmp_path / "smb-remote"
+    remote.mkdir()
     _make_stub(
         bind / "smbclient",
-        "#!/usr/bin/env bash\n"
-        'prev=""\n'
-        'for a in "$@"; do\n'
-        f'  [ "$prev" = "-c" ] && printf "%s\\n" "$a" >> "{smb_log}"\n'
-        '  prev="$a"\n'
-        "done\n"
-        "exit 0\n",
+        (Path(__file__).parents[1] / "smbclient_filesystem_model.py").read_text(),
     )
     # curl stub: SF3 existence probe answers 404 (collections genuinely absent
     # → benign skip; a bare connection failure now FAILS the backup);
@@ -105,13 +104,15 @@ def backup_env(tmp_path):
     systemctl_log = tmp_path / "systemctl.log"
     _make_stub(
         bind / "systemctl",
-        f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{systemctl_log}"\nexit 3\n',
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{systemctl_log}"\n'
+        'if [ "$2" = "is-enabled" ]; then echo disabled; exit 1; fi\nexit 3\n',
     )
     return {
         "home": home,
         "gd": gd,
         "bind": bind,
         "smb_log": smb_log,
+        "remote": remote,
         "systemctl_log": systemctl_log,
         "tmp": tmp_path,
     }
@@ -131,6 +132,7 @@ def _run(backup_env):
         GENESIS_BACKUP_NAS="//nas/share",
         GENESIS_BACKUP_NAS_USER="u",
         GENESIS_BACKUP_NAS_PASS="p",
+        SMB_ROOT=str(backup_env["remote"]), SMB_LOG=str(backup_env["smb_log"]),
         PATH=f"{backup_env['bind']}:{os.environ['PATH']}",
     )
     for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_FORUM_CHAT_ID", *_SESSION_BUS_VARS):
@@ -148,11 +150,28 @@ def test_sqlite_uploaded_under_dated_snapshot_dir(backup_env):
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     put_sql = [ln for ln in cmds.splitlines() if "put" in ln and "genesis.sql.gpg" in ln]
     assert put_sql, f"no SQL upload command logged:\n{cmds}"
-    # The cd target for the SQL put must include a dated snapshot dir + /data.
-    assert any(_STAMP_RE.search(ln) for ln in put_sql), (
-        f"SQL upload not under a dated snapshot dir:\n{put_sql}"
-    )
-    assert any("/data" in ln for ln in put_sql), f"SQL upload not under .../data:\n{put_sql}"
+    # Starting directory is supplied by -D, separately from the -c log.
+    # Assert the actual transferred location in the owned filesystem model.
+    payloads = list(backup_env["remote"].rglob("genesis.sql.gpg"))
+    assert len(payloads) == 1
+    relative = payloads[0].relative_to(backup_env["remote"])
+    assert relative.parts[0] == "Genesis" and relative.parts[-2] == "data"
+    assert len(relative.parts) == 5 and _STAMP_RE.fullmatch(relative.parts[2])
+    assert payloads[0].read_bytes() == (backup_env["home"] / "backups/genesis-backups/data/genesis.sql.gpg").read_bytes()
+
+
+@pytest.mark.parametrize("payload", ["genesis.sql.gpg", "secrets.env.gpg"])
+def test_misacknowledged_core_upload_withholds_complete(backup_env, monkeypatch, payload):
+    monkeypatch.setenv("SMB_CORRUPT_MATCH", payload)
+    proc, _commands = _run(backup_env)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert not list(backup_env["remote"].rglob("COMPLETE"))
+    status = json.loads((backup_env["home"] / ".genesis/backup_status.json").read_text())
+    assert status["success"] is True  # existing local/Tier-1 outcome remains distinct
+    assert status["sqlite_backup_verified"] is True and status["tier1_pushed"] is True
+    assert status["offsite_core_complete"] is False and status["offsite_confirmed"] is False
+    assert status["tier2_status"] == "partial"
+    assert status["pruned_count"] is None  # retention was not authorized
 
 
 def test_snapshot_dir_is_created(backup_env):
@@ -178,6 +197,7 @@ def _run_local(backup_env, offsite_root: Path, extra_env: dict | None = None):
         QDRANT_URL="http://127.0.0.1:1",
         GENESIS_BACKUP_TIER2_BACKEND="local",
         GENESIS_BACKUP_LOCAL_PATH=str(offsite_root),
+        SMB_ROOT=str(backup_env["remote"]), SMB_LOG=str(backup_env["smb_log"]),
         PATH=f"{backup_env['bind']}:{os.environ['PATH']}",
     )
     for k in (
@@ -221,6 +241,97 @@ def test_local_backend_writes_dated_snapshot_to_real_fs(backup_env, tmp_path):
     status = json.loads((backup_env["home"] / ".genesis" / "backup_status.json").read_text())
     assert status["tier2_status"] == "ok", status
     assert status["offsite_confirmed"] is True, status
+
+
+@pytest.mark.parametrize("scope", [None, "main", "all", "invalid"])
+def test_shell_transcript_scope_selects_only_requested_population(backup_env, tmp_path, scope):
+    projects = backup_env["home"] / ".claude/projects"
+    project = str(backup_env["gd"]).replace("/", "-")
+    (projects / project / "main.jsonl").write_text('{}\n')
+    other = projects / "other/subagents/agent-a.jsonl"
+    other.parent.mkdir(parents=True)
+    other.write_text('{}\n')
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    extra = {} if scope is None else {"GENESIS_BACKUP_TRANSCRIPT_SCOPE": scope}
+    proc = _run_local(backup_env, offsite, extra)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    captures = list((backup_env["home"] / "backups/genesis-backups/transcripts").glob("v2-*.tar.gpg"))
+    assert len(captures) == (0 if scope == "invalid" else 2 if scope == "all" else 1)
+    status = json.loads((backup_env["home"] / ".genesis/backup_status.json").read_text())
+    assert status["offsite_confirmed"] is (scope != "invalid")
+    if scope == "invalid":
+        assert "transcript scope must be main or all" in proc.stdout
+        assert not list((offsite / "Genesis").glob("*/*/COMPLETE"))
+
+
+def test_shell_fresh_install_without_transcript_parent_can_complete(backup_env, tmp_path):
+    shutil.rmtree(backup_env["home"] / ".claude/projects")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert list((offsite / "Genesis").glob("*/*/data/genesis.sql.gpg"))
+    assert list((offsite / "Genesis").glob("*/*/COMPLETE"))
+    status = json.loads((backup_env["home"] / ".genesis/backup_status.json").read_text())
+    assert status["offsite_confirmed"] is True
+
+
+@pytest.mark.parametrize("suffix", ["plain", "\n", "\n\n", "\\literal", "é"])
+def test_shell_project_identity_preserves_path_bytes_and_core_guard(backup_env, tmp_path, suffix):
+    old = backup_env["gd"]
+    current = old.with_name("genesis-" + suffix)
+    old.rename(current)
+    backup_env["gd"] = current
+    project = str(current).replace("/", "-")
+    source = backup_env["home"] / ".claude/projects" / project / "session.jsonl"
+    source.parent.mkdir(parents=True)
+    source.write_text('{}\n')
+    memory = source.parent / "memory"
+    memory.mkdir()
+    (memory / "note.md").write_text("byte-exact project memory\n")
+    extra = backup_env["home"] / "work/extra"
+    extra.mkdir(parents=True)
+    (extra / "kept.txt").write_text("kept")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": str(extra)})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    name = "v2-" + hashlib.sha256(os.fsencode(project + "/session.jsonl")).hexdigest() + ".tar.gpg"
+    stage = backup_env["home"] / "backups/genesis-backups"
+    assert (stage / "transcripts" / name).is_file()
+    assert (stage / "config_overrides/sample.local.yaml").read_bytes() == (current / "config/sample.local.yaml").read_bytes()
+    assert len(list((stage / "extra").glob("*.gpg"))) == 1
+    status = json.loads((backup_env["home"] / ".genesis/backup_status.json").read_text())
+    assert status["offsite_confirmed"] is True
+    fresh = tmp_path / "fresh"
+    target = fresh / ("genesis-" + suffix)
+    (target / "data").mkdir(parents=True)
+    (fresh / ".genesis").mkdir()
+    (fresh / "tmp").mkdir()
+    (fresh / ".gnupg").mkdir(mode=0o700)
+    environment = {
+        **{k: v for k, v in os.environ.items() if k not in _SESSION_BUS_VARS},
+        "HOME": str(fresh), "GENESIS_DIR": str(target),
+        "GENESIS_BACKUP_TMPDIR": str(fresh / "tmp"),
+        "GENESIS_BACKUP_TIER2_BACKEND": "none", "QDRANT_URL": "http://127.0.0.1:1",
+        "GENESIS_BACKUP_PASSPHRASE": "testpass", "GNUPGHOME": str(fresh / ".gnupg"),
+        "GENESIS_RESTORE_HOLDER_SCAN": "none",
+        "PATH": f"{backup_env['bind']}:{os.environ['PATH']}",
+    }
+    restored = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(stage), "--force"], env=environment,
+        capture_output=True, text=True, stdin=subprocess.DEVNULL,
+    )
+    # This private fixture deliberately has no Qdrant server.
+    assert restored.returncode == 1, restored.stdout + restored.stderr
+    assert "Restore complete with 1 warning(s):" in restored.stdout
+    assert "Qdrant at http://127.0.0.1:1 not reachable" in restored.stdout
+    # v2 restores accepted source identities; memory maps to the current install.
+    assert (fresh / ".claude/projects" / project / "session.jsonl").read_bytes() == source.read_bytes()
+    expected_memory = fresh / ".claude/projects" / str(target).replace("/", "-") / "memory/note.md"
+    assert expected_memory.read_text() == "byte-exact project memory\n"
+    assert (target / "config/sample.local.yaml").read_bytes() == (current / "config/sample.local.yaml").read_bytes()
 
 
 def test_local_backend_snapshot_includes_memory_config_secrets(backup_env, tmp_path):
@@ -573,7 +684,7 @@ def test_extra_complete_marker_lists_the_uploaded_archives(backup_env, tmp_path)
     last = _snaps(offsite)[-1]
     lines = (last / "COMPLETE").read_text().splitlines()
     (archive,) = last.glob("extra/*.tar.gpg")
-    assert lines == ["genesis-snapshot 1", f"extra {archive.name}"], lines
+    assert lines == ["genesis-snapshot 1", "transcript-pool 1", f"extra {archive.name}"], lines
 
 
 _RESTORE = _BACKUP.parent / "restore.sh"
@@ -607,9 +718,9 @@ def test_extra_round_trip_real_backup_into_real_restore_keeps_links(backup_env, 
         "GENESIS_BACKUP_TIER2_BACKEND": "none",
         "QDRANT_URL": "http://127.0.0.1:1",
         "GENESIS_BACKUP_PASSPHRASE": "testpass",
-        # This freshly created fixture is offline, not the installed DB.
-        "GENESIS_RESTORE_HOLDER_SCAN": "none",
         "GNUPGHOME": str(fresh / ".gnupg"),
+        # This freshly created private database has no server or other opener.
+        "GENESIS_RESTORE_HOLDER_SCAN": "none",
         "PATH": f"{backup_env['bind']}:{os.environ['PATH']}",
     }
     r = subprocess.run(

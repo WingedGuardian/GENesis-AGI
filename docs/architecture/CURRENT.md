@@ -1579,7 +1579,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 0734ff6b8 2026-10-09
+verified: 1d88dbaa0 2026-10-09
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2458,7 +2458,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 4117f6ed 2026-10-05
+verified: 1d88dbaa0654 2026-10-09
 ```
 
 - **The graders are TOLD the response status; they must never infer it.** The
@@ -2986,7 +2986,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, env.py,
           _config_overlay.py]
-verified: 0734ff6b8 2026-10-09
+verified: 1d88dbaa0 2026-10-09
 ```
 
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
@@ -3324,6 +3324,9 @@ verified: 0734ff6b8 2026-10-09
   authenticates legacy and v2 transcript archives, and verifies pooled
   objects before restoring. Reader support precedes new-format capture;
   persistent analytics settings recovery lands separately.
+  Encrypted transcript capture checkpoints validation within a two-hour
+  window and verifies every referenced remote pool object before COMPLETE;
+  unreadable historical inventory keeps the snapshot incomplete.
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
   `process_lock` (the reason bare `python -m genesis serve` blocks systemd),
   tmp discipline (`~/tmp` for large temp — never override TMPDIR),

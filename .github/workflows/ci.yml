@@ -1155,4 +1155,9 @@ jobs:
         # Floor: 25040 + 130 = 25170.
         # Authenticated backup reads: measured net +106; 25170 + 106 = 25276.
         # Offline restore fixture changes are count-neutral; ceiling stays 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25385
+        # Reader phase: measured net +109; 25276 + 109 = 25385.
+        # Capture phase: 277 cases minus 57 unchanged reader cases = 220.
+        # Review regressions: missing-root history/root validation +10; scope/fresh-install +5.
+        # Project identity/core-guard regressions: +5.
+        # Floor: 25385 + 220 + 15 + 5 = 25625.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25625
