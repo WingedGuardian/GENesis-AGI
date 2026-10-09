@@ -97,7 +97,7 @@ def fixture_provider(item: dict):
         def do_POST(self):  # noqa: N802
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             requests.append(body)
-            output = [item] if len(requests) == 1 else [{
+            output = item(body, len(requests)) if callable(item) else [item] if len(requests) == 1 else [{
                 "type": "message", "id": "msg_fixture", "role": "assistant",
                 "content": [{"type": "output_text", "text": "fixture complete", "annotations": []}],
             }]

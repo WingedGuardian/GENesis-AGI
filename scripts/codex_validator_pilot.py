@@ -1,7 +1,7 @@
 """Fixed fixture recipes and private receipts for a supervised validator pilot.
 
-No campaign identifiers, arbitrary test selection or ledger writes. Preview
-wiring and launch/activation belong to the separately reviewed launcher slice.
+No campaign identifiers, arbitrary test selection or ledger writes. Enrollment
+pins the guard, launcher, doctrine and preview bytes as well as the recipes.
 """
 
 from __future__ import annotations
@@ -42,6 +42,15 @@ COMMON_SOURCES = {
     "scripts/codex_validator_request.py",
     "scripts/codex_validator_serving.py",
     "scripts/pr_verification.py",
+    "scripts/codex_validator_preview.py",
+    "scripts/codex_validator_terminal.py",
+    "scripts/codex_validator_job.py",
+    "scripts/hooks/codex_validator_guard.py",
+    "scripts/hooks/codex-validator-guard",
+    "scripts/hooks/codex_validator_patch.py",
+    "scripts/hooks/codex_validator_shell.py",
+    "scripts/hooks/shell_parse.py",
+    ".claude/skills/validating-merges/SKILL.md",
 }
 RECIPES = {
     "peer_availability": (
@@ -218,6 +227,17 @@ async def _stop_recipe(proc):
         await reap_bounded(proc)
 
 
+async def finish_shutdown(proc):
+    """Await owned bounded cleanup even when the caller is cancelled again."""
+    stopping = tracked_task(_stop_recipe(proc), name="codex-validator-child-stop")
+    while not stopping.done():
+        try:
+            await asyncio.shield(stopping)
+        except asyncio.CancelledError:
+            continue
+    stopping.result()
+
+
 async def _run_recipe(runtime: Path, recipe: str, scratch: Path) -> bytes:
     env = child_environment()
     install_home = Path(env["HOME"])
@@ -230,8 +250,9 @@ async def _run_recipe(runtime: Path, recipe: str, scratch: Path) -> bytes:
     junit = scratch / "results.xml"
     argv = [
         python,
-        "-m",
-        "genesis.hostmetrics",
+        "-I",
+        str(runtime / "scripts/codex_validator_job.py"),
+        str(os.getpid()),
         "run",
         "--name",
         "codex-validator-pilot",
@@ -280,13 +301,7 @@ async def _run_recipe(runtime: Path, recipe: str, scratch: Path) -> bytes:
     except BaseException:
         # Finish bounded shutdown even if the caller cancels again, then
         # propagate the original failure/cancellation. Never detach cleanup.
-        stopping = tracked_task(_stop_recipe(proc), name="codex-validator-probe-stop")
-        while not stopping.done():
-            try:
-                await asyncio.shield(stopping)
-            except asyncio.CancelledError:
-                continue
-        stopping.result()
+        await finish_shutdown(proc)
         raise
 
 
