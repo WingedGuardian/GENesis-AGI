@@ -11,6 +11,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- Standalone installation of the trusted peer front door after startup recovery,
+  with readiness-gated conversation, owned results, original work allowances and
+  normal human approval paths. Disabled mode still cleans up old peer scopes;
+  uncertain cleanup or consequential outcomes require reconciliation.
+
 - **A warning when a git command is about to rewind your whole working tree.**
   `git checkout <commit> -- .` reads like "put these files back", but the `.`
   matches every tracked path — so it rewrites the entire tree to that commit and

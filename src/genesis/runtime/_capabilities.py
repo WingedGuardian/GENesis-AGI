@@ -42,6 +42,7 @@ _CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "perception": "Reflection engine — observation creation, pattern detection, signal processing",
     "cc_relay": "Claude Code invoker, session manager, checkpoints, and reflection bridge",
     "direct_session": "Direct session spawner — profile-constrained background CC sessions with tool restrictions, Telegram notifications, and streaming observability",
+    "peers": "Standalone peer collaboration — recovered contained sessions, scoped approvals and owned result disclosure; operator configuration required",
     "memory": "Hybrid memory store — SQLite + Qdrant vector search, wing/room taxonomy, essential knowledge layer, knowledge ingestion pipeline + resume review",
     "surplus": "Surplus compute scheduler — uses idle time for brainstorms and enrichment tasks",
     "learning": "Learning pipeline — triage, calibration, harvest, and procedural learning",

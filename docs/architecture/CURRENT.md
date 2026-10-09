@@ -1379,7 +1379,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: 9a1e0b7c8 2026-10-08
+verified: 99157fdb8ce8 2026-10-09
 ```
 
 - **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
@@ -1408,11 +1408,11 @@ verified: 9a1e0b7c8 2026-10-08
   share a receipt; changed intent conflicts. Limits are two reserved slots per
   peer and globally and twenty nonterminal tasks per peer. Daily statistics
   impose no task budget; Genesis retains its permission and approval decisions.
-  Legacy claim and stale-claim recovery exclude peer rows. The runtime task service
-  stays absent until the constrained coordinator, broker, approvals and recovery
-  are ready; discovery still advertises no task skills. See
+  Legacy claim and stale-claim recovery exclude peer rows. The standalone task
+  service installs after recovery with the constrained coordinator, broker and
+  approvals ready; discovery advertises conversation only while usable. See
   `docs/reference/peer-admission.md`.
-- **Owned peer result groundwork (dark until runtime readiness)**:
+- **Owned peer results (gated by installed runtime readiness)**:
   `peers/artifacts.py` scans full private result files, records safe publication
   snapshots and serves an owned artifact URL on the existing peer boundary.
   Task GET/LIST/duplicate-send projections recheck current authority and exact
@@ -1420,6 +1420,15 @@ verified: 9a1e0b7c8 2026-10-08
   and authority after reading. Resource withdrawal withholds dependent output;
   missing files can leave an authorized historical preview visible. No separate
   artifact size cap exists. See [owned results](../reference/peer-results.md).
+- **Standalone peer runtime**: `runtime/init/peers.py` owns the private coordinator,
+  poller and per-boot Unix broker after full bootstrap. `peers/recovery.py` drains
+  old scopes even when execution is disabled or dependencies are unavailable,
+  settles original allowances and reconciles unfinished task disposition.
+  Unknown cleanup/effects retain holds; restart cannot restore capacity or grant
+  consent. Host gates cover admission, claim, start and continuation. Shutdown
+  quiesces notification delivery before Telegram closes. Poller exit fences
+  active leases and cancels sessions; readiness refuses new work. See
+  [peer runtime](../reference/peer-runtime.md).
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
   it yields at startup, exit 200, when the genesis-server process lock is

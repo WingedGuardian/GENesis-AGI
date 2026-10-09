@@ -107,6 +107,7 @@ async def agent_card():
         AgentCapabilities,
         AgentCard,
         AgentInterface,
+        AgentSkill,
         HTTPAuthSecurityScheme,
         SecurityRequirement,
         SecurityScheme,
@@ -133,15 +134,38 @@ async def agent_card():
         default_input_modes=["text/plain"],
         default_output_modes=["text/plain"],
     )
-    # No skills are advertised until their runtime coordinator is enabled.
+    service = _tasks()
+    if (
+        service is not None
+        and callable(getattr(service, "execution_allowed", None))
+        and await service.execution_allowed()
+    ):
+        card.skills.append(
+            AgentSkill(
+                id="conversation",
+                name="Peer collaboration",
+                description="Submit an authorized goal; Genesis selects its own contained execution.",
+                tags=["conversation"],
+            )
+        )
     payload = MessageToDict(card)
     # Required repeated fields must survive protobuf's default omission.
-    payload["skills"] = []
+    payload.setdefault("skills", [])
     return jsonify(payload)
 
 
 @agent_api_bp.route(ROOT + "/health")
-def agent_health():
+@_async_route(timeout=15)
+async def agent_health():
+    service = _tasks()
+    if service is not None and callable(getattr(service, "health", None)):
+        try:
+            return jsonify(await service.health())
+        except Exception:
+            logger.error("Peer health counts unavailable")
+            return jsonify(
+                runtime_ready=True, task_service_ready=False, active_tasks=None, queue_depth=None
+            )
     return jsonify(runtime_ready=True, task_service_ready=False, active_tasks=0, queue_depth=0)
 
 
@@ -155,8 +179,8 @@ async def agent_approvals():
 
 
 def _tasks():
-    # GROUNDWORK(peer-coordinator): unit8 installs this only after constrained
-    # execution, broker, human approval and recovery readiness are established.
+    # The serving adapter binds the recovered runtime owner; its admission
+    # gate remains authoritative after these Flask references are installed.
     return current_app.config.get("GENESIS_PEER_TASKS")
 
 

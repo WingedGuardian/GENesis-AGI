@@ -5,8 +5,8 @@ trusted completion candidate is timely and all task segments have drained.
 Publication rechecks the current relationship epoch, original expiry,
 cancellation, cumulative work allowance, conversation consent and completed
 operation receipts. Uncertain consequential outcomes prevent success and retain
-a reconciliation hold. Runtime installation remains a later slice; this code
-alone does not activate peer work or advertise task skills.
+a reconciliation hold. The [runtime owner](peer-runtime.md) installs the result
+publisher only after startup recovery and execution readiness checks.
 
 Full UTF-8 output stays in the private segment's `.peer-results` directory. Each
 directory must be owned by the service user with mode0700 and the regular result

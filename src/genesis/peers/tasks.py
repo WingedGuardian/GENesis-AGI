@@ -24,6 +24,9 @@ class PeerTasks:
     def __init__(self, registry: PeerRegistry):
         self.registry = registry
 
+    async def _before_admit(self, db):
+        """Trusted host gate inside the admission writer transaction."""
+
     async def admit(self, identity: dict, message: dict, *, work_limit_s: int = 3600) -> dict:
         """No model work or network effect occurs under the write transaction."""
         if type(work_limit_s) is not int or not 1 <= work_limit_s <= 7200:
@@ -34,6 +37,7 @@ class PeerTasks:
         context_id = message.get("contextId") or uuid.uuid4().hex
         prepared = queue.prepare({"peer_task_id": task_id, "source_tag": "peer_api"})
         async with self.registry.transaction() as db:
+            await self._before_admit(db)
             now = datetime.now(UTC)
             current = await (
                 await db.execute(
@@ -63,6 +67,7 @@ class PeerTasks:
             if old is not None:
                 if old["intent_digest"] != digest:
                     raise TaskRefusal("state_conflict", 409)
+                await self._before_admit(db)
                 return dict(old)
             if (
                 message.get("contextId")
@@ -116,11 +121,13 @@ class PeerTasks:
                 (current["peer_id"], current["epoch"], day),
             )
             await queue.insert_prepared(db, prepared)
-            return dict(
+            result = dict(
                 await (
                     await db.execute("SELECT * FROM peer_tasks WHERE id=?", (task_id,))
                 ).fetchone()
             )
+            await self._before_admit(db)
+            return result
 
     async def owned(self, identity: dict, task_id: str, *, db=None) -> dict:
         if db is None:

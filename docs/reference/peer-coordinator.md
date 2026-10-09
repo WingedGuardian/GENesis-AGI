@@ -2,8 +2,8 @@
 
 `PeerCoordinator` joins durable peer lifecycle state to the existing
 `DirectSessionRunner`, private broker and individual approval manager. This
-slice supplies orchestration, not runtime installation: task readiness remains
-dark until owned result delivery, recovery and shutdown are installed.
+coordinator supplies orchestration; the standalone host installs it through
+the [runtime owner](peer-runtime.md) after restart recovery and readiness checks.
 
 Dispatch reserves the original remaining allowance before starting a contained
 session. Conversation ASK creates and associates a durable approval hold before

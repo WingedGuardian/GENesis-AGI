@@ -48,8 +48,8 @@ cannot expand an already accepted task's snapshot. Listing discloses only snapsh
 permitted for that task; retirement and digest corruption prevent subsequent reads.
 The operator CLI is the publication surface; no peer API or facade may publish.
 
-This foundation is deliberately dark until the coordinator, approval and recovery
-slices install the complete runtime path. It does not change public task readiness,
+The [runtime owner](peer-runtime.md) installs this broker after startup recovery
+with the coordinator and normal approval gate. This module alone does not
 activate cross-owner work, add an approval resolver or establish live tailnet
 acceptance. Stricter cross-owner disclosure and signed evidence are separate
 prerequisites in the approved series.
