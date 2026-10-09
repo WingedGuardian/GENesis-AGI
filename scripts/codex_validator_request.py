@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Closed validator operations; no generic commands, SQL, plugins or lifecycle.
 
-GROUNDWORK(validator-request-operations): serving identity, verification CLI and
-synthetic hook probes will register their separately reviewed operations here.
-Only the stateless protocol probe exists today. Requests are retained; admitted
+Serving observations delegate to the existing deployment status tripwire.
+GROUNDWORK(validator-request-operations): verification CLI and synthetic hook
+probes need their separately reviewed operations. Requests are retained; admitted
 workspace patches own creation and retirement after evidence capture.
 """
 
@@ -17,6 +17,7 @@ from pathlib import Path
 
 RUNTIME_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(RUNTIME_ROOT / "src"))
+sys.path.insert(0, str(RUNTIME_ROOT / "scripts"))
 sys.path.insert(0, str(RUNTIME_ROOT / "scripts" / "hooks"))
 
 from codex_validator_shell import MAX_REQUEST_BYTES, check_request  # noqa: E402
@@ -47,12 +48,25 @@ def read_request(workspace: Path, supplied: str) -> object:
 
 
 def execute(request: object) -> dict:
-    """Closed schema and operation set; probe safety proves no future mutation."""
-    if (not isinstance(request, dict) or set(request) != {"version", "operation"}
-            or type(request["version"]) is not int or request["version"] != 1
-            or request["operation"] != "protocol_probe"):
+    """Exact per-operation schemas, checked before entering any operation."""
+    if (not isinstance(request, dict)
+            or type(request.get("version")) is not int or request["version"] != 1
+            or not isinstance(request.get("operation"), str)):
         raise ValueError("Unsupported validator request")
-    return {"version": 1, "operation": "protocol_probe", "ok": True}
+    operation = request["operation"]
+    keys = {"version", "operation", "token"} if operation == "serving_verify" else {"version", "operation"}
+    if set(request) != keys or operation not in {"protocol_probe", "serving_status", "serving_verify"}:
+        raise ValueError("Unsupported validator request")
+    if operation == "protocol_probe":
+        return {"version": 1, "operation": operation, "ok": True}
+    from codex_validator_serving import TOKEN_RE, observe
+
+    if operation == "serving_verify" and (
+            not isinstance(request["token"], str) or not TOKEN_RE.fullmatch(request["token"])):
+        raise ValueError("Unsupported validation token")
+
+    result = observe(RUNTIME_ROOT, token=request["token"] if operation == "serving_verify" else None)
+    return {"version": 1, "operation": operation, **result}
 
 
 def main() -> int:
