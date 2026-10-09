@@ -445,7 +445,8 @@ def test_every_paginated_read_asks_for_a_full_page_in_the_path():
     source = (_ROOT / "scripts" / "review_budget.py").read_text()
     tree = ast.parse(source)
     fn = next(
-        n for n in ast.walk(tree)
+        n
+        for n in ast.walk(tree)
         if isinstance(n, ast.FunctionDef) and n.name == "_evaluate_pr_inner"
     )
     paginated = 0
@@ -869,7 +870,10 @@ def test_one_read_is_bounded_even_without_a_caller_budget(monkeypatch):
         "owner/repo", 7, runner=slow, external_identity_templates=(), monotonic=clock
     )
     assert got["status"] == "unknown", got
-    assert "graphql_read_timeout" in got["errors"], got
+    # Pages succeeded and no call failed: the evidence is too big for the budget,
+    # which recurs on every attempt, so it must not read as transient.
+    assert "graphql_read_budget_pages" in got["errors"], got
+    assert not rb.errors_are_transient(got["errors"]), got
     assert clock.now - start <= rb._GRAPHQL_READ_SECONDS, clock.now - start
 
 
@@ -980,8 +984,36 @@ def test_a_read_failing_twice_is_unknown_and_names_its_class(monkeypatch):
     got = rb.evaluate_pr("owner/repo", 7, runner=runner, external_identity_templates=())
     assert got["status"] == "unknown"
     assert calls["n"] == 2
-    assert got["errors"] == ["graphql_unreadable", "gh_failure:http_502", "gh_failure:http_502"]
+    # Both failed calls were 502s: the class is reported once.
+    assert got["errors"] == ["graphql_unreadable", "gh_failure:http_502"]
     assert rb.errors_are_transient(got["errors"])
+
+
+def test_a_late_persistent_failure_class_is_never_dropped():
+    """Round-1 review: the classes were cut to the first three, so a late `auth`
+    behind three recovered transient failures vanished and the result read as
+    transient (and suppressible)."""
+    errors = rb.failure_errors(["http_502", "timeout", "network", "http_503", "auth"])
+    assert errors[-1] == "gh_failure:auth"
+    assert not rb.errors_are_transient(["graphql_unreadable", *errors])
+    assert rb.failure_errors(["timeout", "timeout", "http_502"]) == [
+        "gh_failure:timeout",
+        "gh_failure:http_502",
+    ]
+
+
+def test_the_default_runner_reports_a_timeout_by_type():
+    """Round-1 review: the default runner returned a bare `runner_failed` on a
+    subprocess timeout, which classified as `other`, so the switch never covered
+    the timeout it was meant for."""
+    code, _out, err = rb._default_runner(
+        [sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.2
+    )
+    assert code == 1 and err == "runner_failed:TimeoutExpired"
+    assert rb._gh_failure_class(err) == "timeout"
+    assert rb.errors_are_transient(
+        ["graphql_unreadable", f"gh_failure:{rb._gh_failure_class(err)}"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -1050,3 +1082,34 @@ def test_only_read_failures_are_transient(errors):
 )
 def test_only_transient_gh_failure_classes_count(cls, transient):
     assert rb.errors_are_transient(["graphql_unreadable", f"gh_failure:{cls}"]) is transient
+
+
+def test_a_budget_stop_keeps_the_failure_classes_recorded_before_it(monkeypatch):
+    """Class audit: the aggregate-budget stop returned only
+    `lookup_budget_exhausted`, dropping an earlier persistent class, so a 401 read
+    as transient."""
+    _no_seams(monkeypatch)
+    clock = _FakeClock()
+
+    def unauthorised(argv, *, timeout):
+        clock.now += 5.0
+        return 1, "", "HTTP 401: Bad credentials"
+
+    got = rb.evaluate_pr(
+        "owner/repo",
+        7,
+        runner=unauthorised,
+        external_identity_templates=(),
+        budget_seconds=5.5,
+        monotonic=clock,
+    )
+    assert got["status"] == "unknown", got
+    assert "lookup_budget_exhausted" in got["errors"], got
+    assert "gh_failure:http_401" in got["errors"], got
+    assert not rb.errors_are_transient(got["errors"]), got
+
+
+def test_an_auth_message_that_mentions_a_timeout_is_auth():
+    # A persistent auth failure that also mentions a timeout must stay `auth`.
+    msg = "Your token has not been granted the required scopes; request timed out"
+    assert rb._gh_failure_class(msg) == "auth"

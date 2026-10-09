@@ -168,9 +168,7 @@ def _parse_external_identity_scalar(raw: str) -> object:
     if raw.startswith('"'):
         value, end = json.JSONDecoder().raw_decode(raw)
         suffix = raw[end:]
-        if suffix.strip() and (
-            not suffix[:1].isspace() or not suffix.lstrip().startswith("#")
-        ):
+        if suffix.strip() and (not suffix[:1].isspace() or not suffix.lstrip().startswith("#")):
             raise ValueError("unexpected content after quoted scalar")
         return value
     if raw.startswith("'"):
@@ -236,9 +234,11 @@ def confirmation_marker(head: str) -> str:
     return CONFIRMATION_MARKER_TEMPLATE.format(head=normalized)
 
 
-
 class _BudgetExhausted(Exception):
-    """The aggregate lookup budget ran out before this call could be issued."""
+    """The aggregate lookup budget ran out before this call could be issued.
+
+    ``args[0]``, when present, carries the ``gh_failure:<class>`` codes recorded
+    so far, so a persistent class still reaches the result."""
 
 
 class _Truncated(Exception):
@@ -763,8 +763,10 @@ def _default_runner(argv: Sequence[str], *, timeout: float) -> tuple[int, str, s
             list(argv), capture_output=True, text=True, timeout=timeout, check=False
         )
         return result.returncode, result.stdout, result.stderr
-    except Exception:
-        return 1, "", "runner_failed"
+    except Exception as exc:  # noqa: BLE001 - classified by _gh_failure_class, never raised
+        # The exception TYPE, never its text: a subprocess timeout must read as
+        # `timeout` there, the same as an exception the harness wrapper catches.
+        return 1, "", f"runner_failed:{type(exc).__name__}"
 
 
 def _json_lines(raw: str, source: str) -> tuple[list[dict[str, Any]] | None, str | None]:
@@ -837,12 +839,24 @@ def errors_are_transient(errors: Any) -> bool:
         return False
     return all(
         isinstance(e, str)
-        and (
-            e in TRANSIENT_ERRORS
-            or (e.startswith("gh_failure:") and _transient_gh_failure(e))
-        )
+        and (e in TRANSIENT_ERRORS or (e.startswith("gh_failure:") and _transient_gh_failure(e)))
         for e in errors
     )
+
+
+def failure_errors(failures: Sequence[str]) -> list[str]:
+    """``gh_failure:<class>`` for EVERY distinct failed-call class, first-seen order.
+
+    The vocabulary is small and fixed, so this stays bounded. Cutting the list to
+    the first few dropped a late persistent class (auth, not_found) behind
+    recovered transient ones, and errors_are_transient() then read the whole
+    result as transient.
+
+    Classes of calls that RECOVERED on retry are kept on purpose: a recovered
+    `auth` or `other` makes an otherwise transient result ask. That is the safe
+    direction for an approval prompt; do not drop them to save a prompt.
+    """
+    return [f"gh_failure:{cls}" for cls in dict.fromkeys(failures)]
 
 
 def _gh_failure_class(stderr: str) -> str:
@@ -865,15 +879,18 @@ def _gh_failure_class(stderr: str) -> str:
     code = re.search(r"\bHTTP (\d{3})\b", text)
     if code:
         return f"http_{code.group(1)}"
+    # Persistent classes before `timeout`: an auth message that also mentions a
+    # timeout must keep asking, never read as transient.
+    if "auth" in low or "credential" in low or "token" in low:
+        return "auth"
     if "timed out" in low or "timeout" in low or "deadline exceeded" in low:
         return "timeout"
     if "could not resolve" in low:
         return "not_found"
-    if "auth" in low or "credential" in low or "token" in low:
-        return "auth"
     if "connection" in low or "network" in low or "dial tcp" in low or "eof" in low:
         return "network"
     return "other"
+
 
 #: One connection per REST endpoint the lookup used to call, projected to the
 #: fields ``evaluate_evidence`` reads and nothing more.
@@ -1125,7 +1142,7 @@ def _evaluate_pr_inner(
         remaining = deadline.remaining()
         if remaining is not None:
             if deadline.exhausted(minimum_useful=floor):
-                raise _BudgetExhausted
+                raise _BudgetExhausted(failure_errors(failures))
             seconds = min(seconds, remaining)
         try:
             return runner(argv, timeout=timeout_for(seconds))
@@ -1137,7 +1154,7 @@ def _evaluate_pr_inner(
     failures: list[str] = []
 
     def unknown(*errors: str, current_head: str = "") -> dict[str, Any]:
-        return _unknown(*errors, *(f"gh_failure:{c}" for c in failures[:3]), current_head=current_head)
+        return _unknown(*errors, *failure_errors(failures), current_head=current_head)
 
     def snapshot(names: Sequence[str]) -> tuple[dict[str, Any] | None, str | None]:
         """The PR head plus every page of the named connections, in ONE query.
@@ -1168,6 +1185,11 @@ def _evaluate_pr_inner(
             # #2594); just short of it, it issued a call too small to finish.
             left = read.remaining()
             if left is None or left < floor:
+                if _page and not failures:
+                    # Pages were read and no call failed: the PR's evidence is too
+                    # large to read in this budget. That holds on every attempt, so
+                    # it is NOT on the transient allowlist (it keeps asking).
+                    return None, "graphql_read_budget_pages"
                 return None, "graphql_read_timeout"
             argv = [
                 "gh",
@@ -1367,8 +1389,11 @@ def evaluate_pr(*args: Any, **kwargs: Any) -> dict[str, Any]:
     """
     try:
         return _evaluate_pr_inner(*args, **kwargs)
-    except _BudgetExhausted:
-        return _unknown("lookup_budget_exhausted")
+    except _BudgetExhausted as exc:
+        # The classes of calls that failed before the stop travel with it: a
+        # persistent one (auth, not_found) must keep the result non-transient.
+        recorded = exc.args[0] if exc.args else []
+        return _unknown("lookup_budget_exhausted", *recorded)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
