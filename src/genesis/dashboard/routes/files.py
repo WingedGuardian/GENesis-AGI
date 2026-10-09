@@ -524,8 +524,12 @@ def _is_allowed(path: Path) -> bool:
     descriptor, which is the property this guard actually needs; the absoluteness
     did not, and a reader who believed it would conclude the ordering was moot
     and reorder it.)
+
+    A path that cannot be resolved (a symlink loop) is refused, never a 500.
     """
-    resolved = path.resolve()
+    resolved = _resolve_or_none(path)
+    if resolved is None:
+        return False
     root = next(
         (
             r
@@ -616,6 +620,34 @@ def _in_a_trash(resolved: Path) -> bool:
     return any(resolved.is_relative_to(store) for store in _trash_stores())
 
 
+def _resolve_or_none(path: Path) -> Path | None:
+    """``path.resolve()``, or None when it cannot be resolved: Python 3.12
+    raises RuntimeError on a symlink loop (MEASURED), later versions OSError."""
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+def _named_in_a_trash(raw: str) -> bool:
+    """Whether the path AS NAMED lies in a trash, before its last component is
+    followed. ``resolve()`` alone follows a trashed symlink (``.../item``) to
+    its target, which may be allowed, and the trash would then be readable,
+    writable and deletable through it. The parents are resolved (a trash
+    reached through a linked parent still counts); the leaf is not.
+
+    Not ``os.path.abspath``: it drops ``..`` as text, while the filesystem
+    follows a symlink before applying it, so ``<link>/../<entry>/item`` would be
+    judged at the wrong place. ``Path`` keeps ``..`` for ``resolve()``. A path
+    that cannot be resolved counts as in a trash (fail closed)."""
+    named = Path(raw) if os.path.isabs(raw) else Path.cwd() / raw
+    if named.name in ("", ".", ".."):  # no real leaf: judge it fully resolved
+        full = _resolve_or_none(named)
+        return full is None or _in_a_trash(full)
+    parent = _resolve_or_none(named.parent)
+    return parent is None or _in_a_trash(parent / named.name)
+
+
 def _sanitize_path(raw: str | None) -> tuple[Path | None, tuple | None]:
     """Resolve and validate a user-supplied path.
 
@@ -626,8 +658,10 @@ def _sanitize_path(raw: str | None) -> tuple[Path | None, tuple | None]:
     """
     if not raw:
         return None, ({"error": "path required"}, 400)
-    resolved = Path(raw).resolve()
-    if not _is_allowed(resolved):
+    resolved = _resolve_or_none(Path(raw))
+    if resolved is None:
+        return None, ({"error": "Path cannot be resolved"}, 400)
+    if _named_in_a_trash(raw) or not _is_allowed(resolved):
         return None, ({"error": "Path not allowed"}, 403)
     return resolved, None
 
@@ -662,12 +696,14 @@ def file_list():
     if (resp := _auth_or_403()) is not None:
         return resp
     raw_path = request.args.get("path", str(_HOME / "genesis"))
-    target = Path(raw_path).resolve()
+    target = _resolve_or_none(Path(raw_path))
+    if target is None:
+        return jsonify({"error": "Path cannot be resolved"}), 400
 
     # Allow listing the home directory for navigation between roots,
     # but do NOT add _HOME to _ALLOWED_ROOTS (that would expose ~/.ssh etc.
     # to read/write/delete endpoints). Only file_list gets this exception.
-    if target != _HOME.resolve() and not _is_allowed(target):
+    if _named_in_a_trash(raw_path) or (target != _HOME.resolve() and not _is_allowed(target)):
         return jsonify({"error": "Path not allowed"}), 403
 
     if not target.is_dir():
@@ -686,7 +722,12 @@ def file_list():
             continue
         if entry.name.lower() in _BLOCKED_NAMES:
             continue
-        if entry.resolve() in stores:  # not browsable, so not listed either
+        # Not browsable, so not listed either: a trash, or a link into one. A
+        # link that cannot be resolved (a loop) is no trash; it is listed and
+        # _file_info reports it.
+        if (r := _resolve_or_none(entry)) is not None and any(
+            r.is_relative_to(store) for store in stores
+        ):
             continue
         items.append(_file_info(entry))
 
@@ -962,7 +1003,12 @@ def file_upload():
     # only appends a numeric suffix, so checking the pre-dedup name is correct
     # and avoids creating directories for a request we're about to reject.
     candidate = dest_dir / base_name
-    if not dest_dir.resolve().is_relative_to(_UPLOAD_DIR.resolve()) or not _is_allowed(candidate):
+    resolved_dir = _resolve_or_none(dest_dir)
+    if (
+        resolved_dir is None
+        or not resolved_dir.is_relative_to(_UPLOAD_DIR.resolve())
+        or not _is_allowed(candidate)
+    ):
         return jsonify({"error": "Path not allowed"}), 403
 
     # Create the validated destination and write. Guard the filesystem ops: a

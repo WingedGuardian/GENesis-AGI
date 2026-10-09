@@ -78,6 +78,15 @@ def _categorize_memory(filename: str) -> str:
     return "memory-reference"
 
 
+def _memory_index() -> Path | None:
+    """The resolved memory index, or None when it cannot be resolved (a symlink
+    loop raises RuntimeError on Python 3.12)."""
+    try:
+        return (_MEMORY_DIR / "MEMORY.md").resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
 @blueprint.route("/api/genesis/config-files")
 def config_files():
     """Return list of all editable config, identity, and memory files."""
@@ -153,6 +162,7 @@ def config_files():
 
     # Auto-memory files
     if _MEMORY_DIR.is_dir():
+        index = _memory_index()
         for p in sorted(_MEMORY_DIR.glob("*.md")):
             if p.is_file() and not p.name.startswith("."):
                 results.append({
@@ -160,7 +170,9 @@ def config_files():
                     "name": f"memory/{p.name}",
                     "category": _categorize_memory(p.name),
                     "editable": True,
-                    "deletable": p.name != "MEMORY.md",
+                    # By path, as the delete route refuses it: a link to
+                    # the index is not deletable either.
+                    "deletable": index is not None and p.resolve() != index,
                     "syntax": "markdown",
                 })
 
@@ -240,8 +252,10 @@ def config_file_delete(name: str):
     if not target.resolve().is_relative_to(_MEMORY_DIR.resolve()):
         return jsonify({"error": "path traversal blocked"}), 403
     # The index is not deletable (the listing marks it so); compare paths, not
-    # strings, so "memory/./MEMORY.md" is refused too.
-    if target.resolve() == (_MEMORY_DIR / "MEMORY.md").resolve():
+    # strings, so "memory/./MEMORY.md" is refused too. An index that cannot be
+    # resolved refuses every delete rather than guess.
+    index = _memory_index()
+    if index is None or target.resolve() == index:
         return jsonify({"error": "MEMORY.md cannot be deleted"}), 403
 
     from genesis.trash import TrashRefused, trash
