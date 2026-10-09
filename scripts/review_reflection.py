@@ -547,45 +547,74 @@ EVIDENCE_MAX_BYTES = 1024 * 1024
 #: The premise-check block of .claude/docs/premise-check.md ("The output"):
 #: a ``Design-premise:`` line at column 0, then optionally one ``Expected before
 #: checking:`` line, then the claim lines ``P<n> TRUE|FALSE|UNPROVEN — <claim>``,
-#: verdict FIRST. A claim's verdict sits in a fixed slot, so no word in the
-#: claim's own text can be read as it (#3120: the free-text reader misbound
-#: them). Each line is matched whole after trailing whitespace is dropped.
+#: verdict FIRST (a short parenthesised qualifier may follow it). A claim's
+#: verdict sits in a fixed slot, so no word in the claim's own text can be read
+#: as it (#3120: the free-text reader misbound them). Each line is matched whole
+#: after trailing whitespace is dropped, and a line that OPENS like one of the
+#: block's lines but does not match it exactly is refused by its line number,
+#: never read as prose (#3127 round 1: a malformed later verdict line and a
+#: bodiless claim were silently skipped and accepted).
 _PREMISE_VERDICT_LINE_RE = re.compile(
     r"Design-premise:[ \t]+(SOUND-BUT-INFERIOR|SOUND|BROKEN)"
-    r"(?:[ \t]+[\u2014\u2013-][ \t]+\S.*)?"
+    r"(?:[ \t]+[—–-][ \t]+\S.*)?"
 )
-_PREMISE_EXPECTED_LINE_RE = re.compile(r"Expected before checking:.*")
+#: Any column-0 line that opens like a verdict line, in any case, bold or
+#: spacing: it must be a verdict line exactly. An indented or ``>``-quoted one
+#: stays prose, which is how the doc says to quote an example.
+_PREMISE_VERDICT_PREFIX_RE = re.compile(
+    r"[*_]*design[-\u2010\u2011 ]premise[*_]*[ \t]*:", re.IGNORECASE
+)
+#: A heading or list item that gives a verdict (``## Design-premise: BROKEN``,
+#: ``- Design-premise: SOUND (80%)``) is not a sanctioned quote, so it would
+#: otherwise contradict the block unseen. A bare section heading such as
+#: ``## Design-premise:`` carries no verdict word and stays prose.
+_PREMISE_MARKED_VERDICT_RE = re.compile(
+    r"(?:#{1,6}|[-*+]|[0-9]+[.)])[ \t]+[*_]*design[-\u2010\u2011 ]premise[*_]*[ \t]*:"
+    r".*\b(?:sound|broken)\b",
+    re.IGNORECASE,
+)
+_PREMISE_EXPECTED_LINE_RE = re.compile(r"Expected before checking:[ \t]+\S.*")
 _PREMISE_CLAIM_LINE_RE = re.compile(
-    r"[ \t]*P([1-9][0-9]?)[:.]?[ \t]+(TRUE|FALSE|UNPROVEN)(?:[ \t]+\S.*)?"
+    r"[ \t]*P([1-9][0-9]?) (TRUE|FALSE|UNPROVEN)(?: \([^)\n]*\))?[ \t]+[\u2014\u2013-][ \t]+\S.*"
 )
-#: The line right after a verdict line's claims (or right after the verdict
-#: line itself, when no claims follow), when it starts like a claim but is not
-#: one: refused by line rather than read as the end of the claims, so a claim
-#: written in a near-miss shape is not silently dropped. Only that line is
-#: checked; a claim-like line further down is prose, because a review's own
+#: A line that starts like a claim. Within the paragraph that holds a block's
+#: claims (up to the next blank line) every such line must be a claim line, or
+#: the file is refused by that line: a near-miss or wrapped claim is never
+#: silently dropped. Past the blank line it is prose, because a review's own
 #: prose starts lines with "P2" too.
 _PREMISE_CLAIM_LIKE_RE = re.compile(r"[ \t]*(?:[-*>|][ \t]*)?(?:\*\*)?P[0-9]")
+_PREMISE_CLAIM_SHAPE = "'P<n> TRUE|FALSE|UNPROVEN — <claim>' (verdict first, plain text)"
 
 
 def premise_block(text: str) -> tuple[str | None, dict[str, str], str | None]:
     """``(verdict, {claim number: verdict}, problem)`` from a premise-check
-    output in the canonical block. Every ``Design-premise:`` line must agree.
-    The claims are the unbroken run of claim lines right under the first
-    verdict line that has any (one ``Expected before checking:`` line may sit
-    between); a later block may repeat any of those claims with the same verdict
-    (claim text is not compared), never add one or change a verdict, and a
-    claim line anywhere else is prose. The line right after each verdict
-    line's claims, if it looks like a claim but is not one, is refused by its
-    line number. Lines are
-    split on newlines only, as the reflection itself is. At least two distinct
-    claims are required."""
+    output in the canonical block. Every column-0 line that opens like
+    ``Design-premise:`` must be a verdict line, and they must all agree. The
+    claims are the unbroken run of claim lines right under the first verdict
+    line that has any (one non-empty ``Expected before checking:`` line may
+    sit between); a later block may repeat any of those claims with the same
+    verdict (claim text is not compared), never add one or change a verdict,
+    and a claim line past the block's paragraph is prose. Any line in the
+    paragraph after a verdict line that looks like a claim but is not one is
+    refused by its line number. Lines are split on newlines only, as the
+    reflection itself is. At least two distinct claims are required."""
     lines = [line.rstrip() for line in text.split("\n")]
     verdicts: set[str] = set()
     first: dict[str, str] | None = None
     for i, line in enumerate(lines):
+        if _PREMISE_MARKED_VERDICT_RE.match(line):
+            return None, {}, (
+                f"line {i + 1} gives a 'Design-premise:' verdict in a heading or list item; "
+                "write it as a plain column-0 line, or indent or >-quote it if it is not yours"
+            )
+        if not _PREMISE_VERDICT_PREFIX_RE.match(line):
+            continue
         head = _PREMISE_VERDICT_LINE_RE.fullmatch(line)
         if head is None:
-            continue
+            return None, {}, (
+                f"line {i + 1} starts like a 'Design-premise:' line but is not "
+                "'Design-premise: SOUND|SOUND-BUT-INFERIOR|BROKEN[ — <qualifier>]' (plain text)"
+            )
         verdicts.add(head.group(1))
         if len(verdicts) > 1:
             return None, {}, "it names more than one 'Design-premise:' verdict: " + ", ".join(
@@ -598,15 +627,23 @@ def premise_block(text: str) -> tuple[str | None, dict[str, str], str | None]:
         while j < len(lines):
             claim = _PREMISE_CLAIM_LINE_RE.fullmatch(lines[j])
             if claim is None:
-                if _PREMISE_CLAIM_LIKE_RE.match(lines[j]):
-                    return None, {}, (
-                        f"line {j + 1} looks like a claim but is not "
-                        "'P<n> TRUE|FALSE|UNPROVEN \u2014 <claim>' (verdict first, plain text)"
-                    )
                 break
             number, said = claim.group(1), claim.group(2)
             if run.setdefault(number, said) != said:
                 return None, {}, f"line {j + 1}: claim P{number} carries two different verdicts"
+            j += 1
+        stop = j
+        while (
+            j < len(lines) and lines[j].strip() and not _PREMISE_VERDICT_PREFIX_RE.match(lines[j])
+        ):
+            if _PREMISE_CLAIM_LIKE_RE.match(lines[j]):
+                if _PREMISE_CLAIM_LINE_RE.fullmatch(lines[j]):
+                    return None, {}, (
+                        f"line {stop + 1} breaks the claim lines under line {i + 1} (a "
+                        "wrapped claim or Expected line, or an empty Expected line), so the "
+                        f"claim at line {j + 1} is cut off"
+                    )
+                return None, {}, f"line {j + 1} looks like a claim but is not {_PREMISE_CLAIM_SHAPE}"
             j += 1
         if first is None:
             first = run or None
