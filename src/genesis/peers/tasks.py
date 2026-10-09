@@ -1,4 +1,4 @@
-"""Atomic peer receipt/quota/queue admission on registry-owned connections."""
+"""Atomic peer receipt/accounting/queue admission on registry-owned connections."""
 
 from __future__ import annotations
 
@@ -89,14 +89,6 @@ class PeerTasks:
             if counts[0] >= 20 or counts[1] >= 2 or slots >= 2:
                 raise TaskRefusal("rate_limited", 429)
             day = now.date().isoformat()
-            usage = await (
-                await db.execute(
-                    "SELECT admissions FROM peer_daily_admissions WHERE peer_id=? AND epoch=? AND utc_day=?",
-                    (current["peer_id"], current["epoch"], day),
-                )
-            ).fetchone()
-            if usage is not None and usage[0] >= current["daily_allowance"]:
-                raise TaskRefusal("rate_limited", 429)
             await db.execute(
                 "INSERT INTO peer_tasks(id,peer_id,epoch,context_id,message_json,grants_json,grant_revision,"
                 "queue_id,created_at,expires_at,work_limit_s) VALUES(?,?,?,?,?,?,?,?,?,?,?)",

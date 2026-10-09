@@ -629,3 +629,21 @@ async def test_framework_wire_errors_never_echo_or_log_leases(setup, malformed):
     finally:
         for target, (handlers, propagate, level) in zip(targets, saved, strict=True):
             target.handlers, target.propagate, target.level = handlers, propagate, level
+
+
+@pytest.mark.parametrize("unsafe", [False, True])
+async def test_common_return_boundary_scans_original_outcome(setup, monkeypatch, unsafe):
+    s = setup
+    text = 'token: "' + secrets.token_hex(16) + '"' if unsafe else "Public fixture"
+
+    async def outcome(row, decisions, arguments):
+        return {"task_id": row["id"], "context": text}
+
+    schema, _, capability = s.broker._operations["task_context"]
+    monkeypatch.setitem(s.broker._operations, "task_context", (schema, outcome, capability))
+    response = await call(s)
+    assert response.status_code == (400 if unsafe else 200)
+    if unsafe:
+        assert response.json() == {"code": "operation_refused"}
+    else:
+        assert response.json()["context"] == text

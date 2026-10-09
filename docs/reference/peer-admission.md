@@ -30,20 +30,23 @@ and `A2A-Version: 1.0`:
   `TaskNotCancelableError` (HTTP400).
 
 Admission uses an existing-file private `BEGIN IMMEDIATE` connection. It commits
-task, receipt, grant snapshot, UTC-day charge and prepared queue row together.
+task, receipt, grant snapshot, UTC-day statistics and prepared queue row together.
 No model/network work occurs in the transaction. A retry with the same peer,
 epoch, message ID and exact validated intent reuses its task without another
-charge, including at quota or slot capacity. Changed intent returns 409.
+statistics increment, including at slot capacity. Changed intent returns 409.
 Conversation permission must still be `allow` or `ask`; admission never resolves
 an `ask` decision. Grant revocation removes subsequent task disclosure.
 
 Limits: two reserved slots per peer and globally, twenty nonterminal tasks per
-peer, the owner's explicit daily allowance, default cumulative work allowance
+peer, default cumulative work allowance
 3600 seconds with ceiling7200, and an absolute twenty-four-hour task expiry.
 This slice stores work/expiry budgets; the coordinator enforces elapsed work and
 expiry. Paused/held segments retain durable state; their slot policy belongs to
 that coordinator. Legacy direct-session claiming and stale-claim recovery exclude
 peer queue rows, so they cannot fall through to an unconstrained session.
+Daily admissions are audit statistics, not a per-peer task budget; the legacy
+registry allowance field does not limit admission. Genesis retains its own
+permission, approval and execution controls.
 
 Status views disclose no input history, tool arguments or internal paths. The
 dependent [owned result components](peer-results.md) project safe publication
