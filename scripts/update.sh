@@ -1046,6 +1046,17 @@ if [ -f "$DB_FILE" ]; then
         _snapshot_check=$(sqlite3 "$DB_FILE.pre-update" "PRAGMA quick_check;" 2>&1) || _snapshot_check=""
         if [ "$_snapshot_check" = "ok" ]; then
             echo "  DB snapshot: $DB_FILE.pre-update (verified)"
+            # Prepare the rollback authority boundary while this helper still
+            # exists, before stopping services or rolling code back. Retain the
+            # original snapshot for forensic recovery; never consume stale work.
+            rm -f "$DB_FILE.pre-update.peer-restore" "$DB_FILE.pre-update.peer-restore-wal" \
+                "$DB_FILE.pre-update.peer-restore-shm" "$DB_FILE.pre-update.peer-restore-journal"
+            if ! cp "$DB_FILE.pre-update" "$DB_FILE.pre-update.peer-restore" \
+                || ! PYTHONPATH="$GENESIS_ROOT/src" python3 -m genesis.db.crud.peer_restore \
+                    "$DB_FILE.pre-update.peer-restore"; then
+                echo "  DATABASE RESTORE AUTHORITY CHECK FAILED — UPDATE ABORTED" >&2
+                exit 1
+            fi
             DB_SNAPSHOT_TAKEN=1
         else
             echo "  DATABASE SNAPSHOT FAILED VERIFICATION — UPDATE ABORTED" >&2
@@ -1581,7 +1592,7 @@ _do_rollback() {
             # but recoverable) and flag for manual intervention.
             echo "  WARNING: server not confirmed down — SKIPPING DB restore (won't overwrite a live DB)."
             db_ok=false
-        elif cp "$DB_FILE.pre-update" "$DB_FILE" 2>&1 \
+        elif cp "$DB_FILE.pre-update.peer-restore" "$DB_FILE" 2>&1 \
             && rm -f "$DB_FILE-wal" "$DB_FILE-shm"; then
             # Drop the stale WAL/SHM: they hold the MIGRATED changes, and SQLite
             # would replay them over the restored old DB on reopen, resurrecting
@@ -1602,10 +1613,10 @@ _do_rollback() {
     # on disk so the restart below uses a consistent unit.
     systemctl --user daemon-reload 2>/dev/null || true
 
-    # Restart services with old code — only when the guard above verified it IS
-    # the old code.
+    # Restart only when both old code and its database were restored. External
+    # watchdog recovery remains separate; this rollback cannot certify a failure.
     genesis_checkout_unlock
-    if [ "$restart_ok" = "true" ]; then
+    if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then
         for svc in "${WERE_RUNNING[@]}"; do
             if [ "$svc" = "genesis-server" ]; then
                 _start_genesis_server || echo "  CRITICAL: failed to restart genesis-server"
@@ -1615,7 +1626,7 @@ _do_rollback() {
             fi
         done
     elif [ "${#WERE_RUNNING[@]}" -gt 0 ]; then
-        echo "  NOT restarted: ${WERE_RUNNING[*]}. Put the checkout back on the pre-update code (or finish the other session's work), then start them."
+        echo "  NOT restarted: ${WERE_RUNNING[*]}. Verify the checkout and database recovery before starting them."
     fi
 
     if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ]; then

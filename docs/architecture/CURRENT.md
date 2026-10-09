@@ -3024,7 +3024,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, env.py,
           _config_overlay.py]
-verified: 477efb7f7 2026-10-05
+verified: ba9dd8a37 2026-10-09
 ```
 
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
@@ -3368,7 +3368,13 @@ verified: 477efb7f7 2026-10-05
   awareness tick (`resilience/tailscale_watchdog_events.py`), never read into
   the annotation prompt.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
-  encrypted `scripts/backup.sh` timer).
+  encrypted `scripts/backup.sh` timer). `db/crud/peer_restore.py` resets peer
+  permissions in staged backup restores and update's pre-migration rollback
+  candidate: disabled mode, empty grants, renewed epochs; no credential reads.
+  A connection-local SQLite authorizer refuses trigger/view execution and writes
+  beyond those reset targets; required peer tables must be ordinary tables.
+  Guardian snapshot rollback instead warns at its existing action-approval gate
+  that approval explicitly reauthorizes saved peers.
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
   `process_lock` (the reason bare `python -m genesis serve` blocks systemd),
   tmp discipline (`~/tmp` for large temp — never override TMPDIR),

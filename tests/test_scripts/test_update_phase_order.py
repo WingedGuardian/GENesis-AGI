@@ -92,7 +92,7 @@ def test_rollback_takes_checkout_lock_after_stopping_bridge_and_unlocks_before_r
     skip = text.index('if [ "${_CHECKOUT_LOCK_BUSY:-0}" != "1" ]; then', stop)
     acquire = text.index('genesis_checkout_lock "$GENESIS_ROOT"', stop)
     release = text.index("genesis_checkout_unlock", acquire)
-    restart = text.index('if [ "$restart_ok" = "true" ]; then', acquire)
+    restart = text.index('if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then', acquire)
     assert stop < skip < acquire < release < restart
 
 
