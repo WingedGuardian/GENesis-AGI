@@ -105,6 +105,7 @@ def _unexpired(task):
 class PeerArtifacts:
     def __init__(self, registry, directory):
         self.registry, self.directory = registry, Path(directory)
+        self.research = None
         if not self.directory.is_absolute():
             raise ValueError("Private peer storage required")
 
@@ -120,7 +121,7 @@ class PeerArtifacts:
             await db.execute("BEGIN")
             task = await current(db, binding.task_id, binding.generation, execution=False)
             segment = await _segment(db, task, binding.segment.segment_id, session_id)
-            await result_authorized(db, task)
+            await result_authorized(db, task, research=self.research)
         expected = Path(segment["working_dir"]) / ".peer-results" / f"bg-session-{session_id}.md"
         if str(expected) != result["artifact_path"]:
             raise TaskRefusal("result_not_ready", 409)
@@ -136,7 +137,7 @@ class PeerArtifacts:
             if not await effects_known(db, binding.task_id):
                 return  # Commit reconciliation; no success or capacity release.
             await _segment(db, task, binding.segment.segment_id, session_id)
-            await result_authorized(db, task)
+            await result_authorized(db, task, research=self.research)
             prior = await (
                 await db.execute("SELECT * FROM peer_artifacts WHERE task_id=?", (binding.task_id,))
             ).fetchone()
@@ -190,7 +191,7 @@ class PeerArtifacts:
         segment = await _segment(db, task, artifact["segment_id"])
         if not await effects_known(db, task_id, persist=False):
             raise TaskRefusal("result_not_ready", 409)
-        await result_authorized(db, task)
+        await result_authorized(db, task, research=self.research)
         _unexpired(task)
         return dict(artifact), segment
 

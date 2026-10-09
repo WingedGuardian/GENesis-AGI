@@ -178,7 +178,10 @@ async def test_real_stdio_and_uds_context_resource_pipeline(setup):
             "task_context",
             "resources_list",
             "resource_read",
+            "research_search",
+            "research_fetch",
         }
+        assert (await session.call_tool("research_fetch", {"url": "https://example.com"})).isError
         assert not (await session.call_tool("task_context", {})).isError
 
 

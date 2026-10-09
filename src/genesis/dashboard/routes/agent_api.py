@@ -148,6 +148,15 @@ async def agent_card():
                 tags=["conversation"],
             )
         )
+        if getattr(service, "research", None) is not None:
+            card.skills.append(
+                AgentSkill(
+                    id="research",
+                    name="Bounded peer research",
+                    description="Authorized search and public HTTPS snapshots with local consent.",
+                    tags=["research"],
+                )
+            )
     payload = MessageToDict(card)
     # Required repeated fields must survive protobuf's default omission.
     payload.setdefault("skills", [])

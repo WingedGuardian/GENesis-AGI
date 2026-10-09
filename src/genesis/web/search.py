@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import os
 
 import httpx
@@ -10,6 +12,8 @@ import httpx
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.types import Severity, Subsystem
 from genesis.security import ContentSanitizer, ContentSource
+from genesis.security.output_scanner import scan_outbound
+from genesis.web.private import bounded_body, private_web
 from genesis.web.types import SearchBackend, SearchResponse, SearchResult
 
 logger = logging.getLogger(__name__)
@@ -43,6 +47,7 @@ class WebSearcher:
         *,
         max_results: int | None = None,
         backends: tuple[SearchBackend, ...] = (SearchBackend.SEARXNG, SearchBackend.BRAVE),
+        private_observability: bool = False,
     ) -> SearchResponse:
         """Search the web, trying ``backends`` in order. Returns SearchResponse (never raises).
 
@@ -54,6 +59,7 @@ class WebSearcher:
         """
         limit = max_results or self._max_results
         reasons: list[str] = []
+        private_options = {"private": True} if private_observability else {}
 
         for i, requested in enumerate(backends):
             try:
@@ -63,14 +69,18 @@ class WebSearcher:
                 continue
             try:
                 if backend == SearchBackend.SEARXNG:
-                    response = await self._search_searxng(query, limit)
+                    response = await self._search_searxng(query, limit, **private_options)
                     results = response.results
                 elif backend == SearchBackend.BRAVE:
                     api_key = os.environ.get("API_KEY_BRAVE", "")
                     if not api_key:
-                        reasons.append("brave: API_KEY_BRAVE is not set")
+                        reasons.append(
+                            "brave: unavailable"
+                            if private_observability
+                            else "brave: API_KEY_BRAVE is not set"
+                        )
                         continue
-                    results = await self._search_brave(query, limit, api_key)
+                    results = await self._search_brave(query, limit, api_key, **private_options)
                 else:  # a future SearchBackend member this loop does not know yet
                     reasons.append(f"{backend.value}: no search implementation")
                     continue
@@ -89,6 +99,9 @@ class WebSearcher:
                 if isinstance(exc, httpx.HTTPStatusError):
                     reason += f": HTTP {exc.response.status_code}"
                 reasons.append(reason)
+                if private_observability:
+                    logger.warning("Private search backend failed")
+                    continue
                 logger.warning("%s search failed (%s)", backend.value, exc)
                 if backend == SearchBackend.SEARXNG and self._event_bus:
                     await self._event_bus.emit(
@@ -99,6 +112,9 @@ class WebSearcher:
                     )
 
         detail = "; ".join(reasons) or "no backend requested"
+        if private_observability:
+            logger.warning("Private search unavailable")
+            return SearchResponse(query=query, error="Private search unavailable")
         logger.warning("All search backends failed for %r — %s", query, detail)
         if self._event_bus:
             await self._event_bus.emit(
@@ -109,14 +125,33 @@ class WebSearcher:
             )
         return SearchResponse(query=query, error=f"All search backends failed — {detail}")
 
-    async def _search_searxng(self, query: str, limit: int) -> SearchResponse:
-        resp = await self._client.post(
-            self._searxng_url,
-            data={"q": query, "format": "json"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        raw = data.get("results", [])[:limit]
+    async def _private_json(self, method: str, url: str, **kwargs) -> dict:
+        headers = dict(kwargs.pop("headers", {}), **{"Accept-Encoding": "identity"})
+        with private_web():
+            async with self._client.stream(method, url, headers=headers, **kwargs) as resp:
+                resp.raise_for_status()
+                data = json.loads(await bounded_body(resp))
+        if not isinstance(data, dict):
+            raise ValueError("Private search unavailable")
+        if not scan_outbound(json.dumps(data, ensure_ascii=False, allow_nan=False)).safe:
+            raise ValueError("Private search unavailable")
+        return data
+
+    async def _search_searxng(
+        self, query: str, limit: int, *, private: bool = False
+    ) -> SearchResponse:
+        if private:
+            data = await self._private_json(
+                "POST", self._searxng_url, data={"q": query, "format": "json"}
+            )
+        else:
+            resp = await self._client.post(self._searxng_url, data={"q": query, "format": "json"})
+            resp.raise_for_status()
+            data = resp.json()
+        raw = data.get("results", [])
+        if private:
+            _private_results(raw, "content")
+        raw = raw[:limit]
         results = [
             SearchResult(
                 title=r.get("title", ""),
@@ -134,15 +169,26 @@ class WebSearcher:
         query: str,
         limit: int,
         api_key: str,
+        *,
+        private: bool = False,
     ) -> list[SearchResult]:
-        resp = await self._client.get(
-            self._brave_url,
-            params={"q": query, "count": min(limit, 20)},
-            headers={"Accept": "application/json", "X-Subscription-Token": api_key},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        raw = data.get("web", {}).get("results", [])[:limit]
+        kwargs = {
+            "params": {"q": query, "count": min(limit, 20)},
+            "headers": {"Accept": "application/json", "X-Subscription-Token": api_key},
+        }
+        if private:
+            data = await self._private_json("GET", self._brave_url, **kwargs)
+        else:
+            resp = await self._client.get(self._brave_url, **kwargs)
+            resp.raise_for_status()
+            data = resp.json()
+        web = data.get("web", {})
+        if private and not isinstance(web, dict):
+            raise ValueError("Private search unavailable")
+        raw = web.get("results", [])
+        if private:
+            _private_results(raw, "description")
+        raw = raw[:limit]
         return [
             SearchResult(
                 title=r.get("title", ""),
@@ -152,3 +198,14 @@ class WebSearcher:
             )
             for r in raw
         ]
+
+
+def _private_results(raw, snippet):
+    if not isinstance(raw, list) or any(
+        not isinstance(item, dict)
+        or any(not isinstance(item.get(key, ""), str) for key in ("title", "url", snippet))
+        or type(item.get("score", 0)) not in (int, float)
+        or not math.isfinite(item.get("score", 0))
+        for item in raw
+    ):
+        raise ValueError("Private search unavailable")

@@ -490,9 +490,9 @@ async def test_expiry_during_awaited_proof_withholds_disclosure(
     original = module.result_authorized
     calls = 0
 
-    async def prove_then_advance_clock(db, task):
+    async def prove_then_advance_clock(db, task, *, research=None):
         nonlocal calls
-        await original(db, task)
+        await original(db, task, research=research)
         calls += 1
         # Project two rows: the first preview must be rechecked after later
         # row awaits, not just at its own original proof point.
@@ -516,6 +516,7 @@ async def test_expiry_during_awaited_proof_withholds_disclosure(
                 assert (await (await db.execute("SELECT state FROM peer_tasks")).fetchone())[
                     0
                 ] == "working"
+    assert calls == 2
 
 
 async def test_expiry_during_park_retirement_rolls_back_publication(publication, monkeypatch):

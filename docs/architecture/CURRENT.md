@@ -1377,19 +1377,19 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: 9a1e0b7c8 2026-10-08
+verified: b70bf6f35 2026-10-09
 ```
 
 - **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
   pinned node/realm/principal and scoped credentials. Disabled by default; no
   implicit capability grants. Local `genesis peers` CLI writes relationships;
   `/v1/agent/a2a` authenticates discovery/health through the existing runtime loop.
-  No task skills or task execution advertised in this foundation. Revocation
+  Task skills require the installed standalone controller and execution readiness. Revocation
   disables access immediately; credential equality with another surface refuses
   activation. See `docs/reference/peer-registry.md`.
 - **Private peer broker foundation (dark until coordinator readiness)** —
   `peers/broker.py` owns leased Unix-socket operations; `peers/facade.py` exposes
-  only exchange context and explicit published snapshots. Current epoch,
+  exchange context, explicit published snapshots and installed bounded research. Current epoch,
   generation, deadlines, cancellation and admitted/current grant intersection
   are checked, with a mandatory coordinator operation authorizer. Lease values
   stay in private files, and drain invalidates before canceling tracked work.
@@ -1405,7 +1405,7 @@ verified: 9a1e0b7c8 2026-10-08
   peer and globally, twenty nonterminal tasks per peer and explicit daily quota.
   Legacy claim and stale-claim recovery exclude peer rows. The standalone task
   service installs after recovery with the constrained coordinator, broker and
-  approvals ready; discovery advertises conversation only while usable. See
+  approvals ready; discovery advertises conversation and installed research while usable. See
   `docs/reference/peer-admission.md`.
 - **Owned peer results (gated by installed runtime readiness)**:
   `peers/artifacts.py` scans full private result files, records safe publication
@@ -1423,6 +1423,13 @@ verified: 9a1e0b7c8 2026-10-08
   consent. Host gates cover admission, claim, start and continuation. Shutdown
   quiesces notification delivery before Telegram closes. See
   [peer runtime](../reference/peer-runtime.md).
+- **Bounded peer research**: `peers/research.py` registers exact search/fetch
+  operations with existing consent, receipts and final disclosure checks.
+  Existing search backends use a private bounded streaming path; public fetch
+  pins fully vetted DNS answers with canonical Host/SNI, identity-only bodies
+  and revalidated redirects. No browser or peer-selected backend exists.
+  Completed reads reuse their stored snapshot; unknown reads require confirmed
+  drain before retry. See [peer research](../reference/peer-research.md).
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
   it yields at startup, exit 200, when the genesis-server process lock is

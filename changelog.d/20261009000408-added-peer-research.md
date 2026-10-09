@@ -1,0 +1,1 @@
+- Trusted peer collaboration can request bounded web research through local grants and individual owner approval, with private diagnostics and authorized result snapshots.

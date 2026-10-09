@@ -3,7 +3,7 @@
 The contained CLI's sole MCP entry point is `genesis.peers.facade`. Its lease
 file is private (0600), contains the Unix socket path and a short opaque lease,
 and is never a command-line credential. The facade offers `task_context`,
-`resources_list` and `resource_read`; the broker additionally checks each name
+`resources_list`, `resource_read`, `research_search` and `research_fetch`; the broker additionally checks each name
 against the segment's exact allowed tools. It has no shell, configuration,
 secret, raw recall or approval-resolution operation.
 
@@ -53,3 +53,7 @@ with the coordinator and normal approval gate. This module alone does not
 activate cross-owner work, add an approval resolver or establish live tailnet
 acceptance. Stricter cross-owner disclosure and signed evidence are separate
 prerequisites in the approved series.
+
+The standalone owner also registers [bounded research](peer-research.md).
+Trusted registration classifies retry-safe reads; peer arguments cannot change
+that classification. Unknown consequential outcomes still require reconciliation.

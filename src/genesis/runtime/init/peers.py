@@ -40,6 +40,7 @@ class PeerRuntime(PeerTasks):
         self.runtime, self.directory = runtime, directory
         self.loop = asyncio.get_running_loop()
         self.coordinator = self.results = self.poll = self.closing = None
+        self.research = None
         self.recovered = self.stopping = False
         self._stop_lock = asyncio.Lock()
 
@@ -124,6 +125,8 @@ class PeerRuntime(PeerTasks):
                 return
             self.stopping = True
             if self.coordinator is None:
+                if self.research is not None:
+                    await self.research.close()
                 return
             self.coordinator.quiesce()
             notifications = list(self.coordinator._notifications.values())
@@ -135,7 +138,7 @@ class PeerRuntime(PeerTasks):
                 if pending:
                     logger.error("Peer polling or notification shutdown requires reconciliation")
             if self.closing is None:
-                self.closing = tracked_task(self.coordinator.close(), name="peer-runtime-close")
+                self.closing = tracked_task(self._close(), name="peer-runtime-close")
             _, pending = await asyncio.wait([self.closing], timeout=_SHUTDOWN_GRACE_S)
             if pending or self.runtime._direct_session_runner._peer_cleanup_holds:
                 async with self.registry.connection() as db:
@@ -149,6 +152,12 @@ class PeerRuntime(PeerTasks):
                         binding, elapsed, clean=False, uncertain=uncertain
                     )
                 logger.error("Peer scope shutdown requires reconciliation")
+
+    async def _close(self):
+        await self.coordinator.close()
+        # A pending or failed scope close must not retire a client under active users.
+        if self.research is not None:
+            await self.research.close()
 
 
 async def init(runtime):
@@ -197,6 +206,10 @@ async def init(runtime):
     )
     service.coordinator = coordinator
     try:
+        from genesis.peers.research import PeerResearch
+
+        service.research = PeerResearch(coordinator.broker)
+        service.results.research = service.research
         broker_root = private_directory(directory / "broker")
         await coordinator.start(broker_directory=broker_root / uuid4().hex)
         runtime._peer_session_lifecycle = coordinator

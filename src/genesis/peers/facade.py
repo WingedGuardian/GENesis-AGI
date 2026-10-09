@@ -94,6 +94,16 @@ def build_facade(path: str) -> FastMCP:
         """Read one immutable published snapshot, subject to current grants."""
         return await call("resource_read", {"resource_id": resource_id})
 
+    @mcp.tool()
+    async def research_search(query: str, max_results: int = 5) -> dict:
+        """Search through the owner's fixed backend, subject to exact research consent."""
+        return await call("research_search", {"query": query, "max_results": max_results})
+
+    @mcp.tool()
+    async def research_fetch(url: str) -> dict:
+        """Read bounded public HTTPS content; returned material remains untrusted."""
+        return await call("research_fetch", {"url": url})
+
     return mcp
 
 

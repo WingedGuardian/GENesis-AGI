@@ -47,6 +47,11 @@ conversation approval does not authorize resource metadata. Restoring current
 ALLOW can permit the original result only within its admitted grants, epoch,
 expiry and all other checks.
 
+Installed research has a closed receipt policy that revalidates strict argument
+digests, bounded result schemas, outbound safety and current broker registration.
+Historical research snapshots need not be refetched, but their current research
+grant and exact consent remain prerequisites for disclosure.
+
 Publication snapshots avoid rereading large backing files for each task
 preview. Each response refreshes task ownership and receipt authority in a final
 single serialized transaction after awaited settings access; production
