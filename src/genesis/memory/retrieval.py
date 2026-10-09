@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 import aiosqlite
 from qdrant_client import QdrantClient
 
+from genesis.db._slow_log import timed
 from genesis.db.connection import ReadConnectionPool, ReadPoolClosed
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links, observations
@@ -709,8 +710,13 @@ class HybridRetriever:
         pool = self._read_pool
         if pool is not None:
             try:
-                async with pool.acquire() as ro:
-                    return await fn(ro, *args, **kwargs)
+                # Labelled by the helper's name, never its arguments (they carry
+                # the prompt). The fallback below is timed per statement by the
+                # shared connection itself, so it is not timed again here.
+                with timed(f"ro:{getattr(fn, '__qualname__', 'read')}") as t:
+                    async with pool.acquire() as ro:
+                        t.acquired()
+                        return await fn(ro, *args, **kwargs)
             except ReadPoolClosed:
                 pass  # pool closed / not opened — use the shared connection
             except Exception:

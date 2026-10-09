@@ -3083,7 +3083,17 @@ verified: 477efb7f7 2026-10-05
   not trip it (the 2026-09-18 log-storm class). Both land with the runtime
   corruption trip.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
-  without it interleaved commits pin `in_transaction` until restart). Two
+  without it interleaved commits pin `in_transaction` until restart). Every
+  statement through a `SerializedConnection` (its cursors' row fetches too),
+  and every recall read through the RO pool (`HybridRetriever._ro_read`), in
+  any process that uses them, is timed by `db/_slow_log.timed`: one taking at
+  least `GENESIS_SQLITE_SLOW_MS` (default 1000, `0` = off) logs one WARNING
+  naming the SQL (never its parameters) or read helper, the in-process wait vs
+  the run (run includes SQLite's busy-timeout wait and lock-retry backoff), the
+  outcome (ok / cancelled / error) and what it was stuck behind — rate-limited
+  per label and outcome to one line per 60 s unless a repeat is twice as slow.
+  Not timed: raw `aiosqlite`/`sqlite3` connections and the unlocked
+  `db.cursor()` / `cursor.execute()` routes (unused in production). Two
   schema paths coexist: base DDL (`schema/_tables.py`, 117 CREATE TABLE, a count
   that drifts every table-adding PR — re-measure, do not trust) plus versioned
   `migrations/` run ONCE at startup before any
