@@ -939,6 +939,8 @@ verified: 9a1e0b7c8 2026-10-08
   Private `peers/lifecycle_state.py` now consumes named, timely consent atomically
   with continuation queueing and preserves it for the unchanged request across
   attempts. `peers/operation_state.py` separates operation outcomes from consent;
+  receipt and broker context scans inspect original JSON keys/values before
+  serialization escapes can hide existing disclosure patterns.
   only exact immutable reads can retry unknown effects after confirmed drain.
   The dark `peers/coordinator.py` joins these holds to the contained runner and
   private broker; `peers/provider_state.py` owns atomic peer park continuation,
@@ -1382,7 +1384,9 @@ verified: e8a5e8c25 2026-10-09
 
 - **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
   pinned node/realm/principal and scoped credentials. Disabled by default; no
-  implicit capability grants. Local `genesis peers` CLI writes relationships;
+  implicit capability grants. Enrollment requires no daily task budget; the
+  deprecated allowance field remains only for database compatibility. Local
+  `genesis peers` CLI writes relationships;
   `/v1/agent/a2a` authenticates discovery/health through the existing runtime loop.
   Task skills require the installed standalone controller and execution readiness. Revocation
   disables access immediately; credential equality with another surface refuses
@@ -1400,9 +1404,10 @@ verified: e8a5e8c25 2026-10-09
 
 - **Peer admission groundwork**: A2A1.0 `message:send`, owned task get/list/cancel
   routes use the pinned SDK wire models. Private SQLite admission commits receipt,
-  UTC quota, grant snapshot, task and prepared queue row together. Exact retries
+  UTC admission statistics, grant snapshot, task and prepared queue row together. Exact retries
   share a receipt; changed intent conflicts. Limits are two reserved slots per
-  peer and globally, twenty nonterminal tasks per peer and explicit daily quota.
+  peer and globally and twenty nonterminal tasks per peer. Daily statistics
+  impose no task budget; Genesis retains its permission and approval decisions.
   Legacy claim and stale-claim recovery exclude peer rows. The standalone task
   service installs after recovery with the constrained coordinator, broker and
   approvals ready; discovery advertises conversation and installed research while usable. See
@@ -1421,7 +1426,8 @@ verified: e8a5e8c25 2026-10-09
   settles original allowances and reconciles unfinished task disposition.
   Unknown cleanup/effects retain holds; restart cannot restore capacity or grant
   consent. Host gates cover admission, claim, start and continuation. Shutdown
-  quiesces notification delivery before Telegram closes. See
+  quiesces notification delivery before Telegram closes. Poller exit fences
+  active leases and cancels sessions; readiness refuses new work. See
   [peer runtime](../reference/peer-runtime.md).
 - **Peer research recovery**: closed receipt schemas validate historical search
   and fetch provenance before provider clients or live broker startup. Only
