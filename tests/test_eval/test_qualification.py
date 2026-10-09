@@ -1,5 +1,6 @@
 """Corpus validation and production contract adapters, offline."""
 
+import asyncio
 import inspect
 import json
 import os
@@ -151,7 +152,8 @@ async def test_novelty_adapter_maps_rendered_candidates(tmp_path):
     async with contracts.Sandbox(tmp_path / "t") as sandbox:
         result = await contracts.novelty(case, Stub('{"redundant_with": 1}'), sandbox)
         broken = await contracts.novelty(case, Stub("prose"), sandbox)
-    assert result == {"prediction": "candidate-b", "error": None}
+    assert (result["prediction"], result["error"]) == ("candidate-b", None)
+    assert "candidate-b" in result["candidate_ids"]
     assert broken["prediction"] is None and broken["error"]
 
 
@@ -225,7 +227,7 @@ async def test_adapters_accept_reused_production_router(tmp_path, adapter):
                 result = await contracts.novelty(
                     novelty_case(str(index), "candidate-b"), router, sandbox
                 )
-                assert result == {"prediction": "candidate-b", "error": None}
+                assert (result["prediction"], result["error"]) == ("candidate-b", None)
     assert router._route_call_inner.await_count == 2
 
 
@@ -236,7 +238,7 @@ async def test_novelty_recording_router_can_be_reused(tmp_path):
             result = await contracts.novelty(
                 novelty_case(str(index), "candidate-b"), router, sandbox
             )
-            assert result == {"prediction": "candidate-b", "error": None}
+            assert (result["prediction"], result["error"]) == ("candidate-b", None)
     assert len(router.calls) == 2
 
 
@@ -296,9 +298,9 @@ print(json.dumps(corpus.load(Path(sys.argv[1]))['j9_relevance'][0]['query']))
     assert json.loads(child.stdout) == case["query"]
 
 
-async def test_novelty_preserves_production_circuit_gating_and_clears_stale_mapping(tmp_path):
+async def test_novelty_preserves_production_circuit_gating_and_leaves_the_router_alone(tmp_path):
     router = Stub('{"redundant_with": null}')
-    router.candidate_ids = ["previous-case"]
+    router.candidate_ids = ["previous-case"]  # caller state the adapter must not touch
     router.breakers = SimpleNamespace(chain_has_available=lambda chain: False)
     router.config = SimpleNamespace(
         call_sites={extractor._NOVELTY_CALL_SITE: SimpleNamespace(chain=["synthetic"])}
@@ -306,7 +308,7 @@ async def test_novelty_preserves_production_circuit_gating_and_clears_stale_mapp
     async with contracts.Sandbox(tmp_path) as sandbox:
         with pytest.raises(Incomplete, match="exactly one"):
             await contracts.novelty(novelty_case("circuit", None), router, sandbox)
-    assert not router.calls and router.candidate_ids == []
+    assert not router.calls and router.candidate_ids == ["previous-case"]
 
 
 async def test_failed_novelty_response_is_not_a_valid_null(tmp_path):
@@ -321,7 +323,9 @@ async def test_failed_novelty_response_is_not_a_valid_null(tmp_path):
     async with contracts.Sandbox(tmp_path) as sandbox:
         result = await contracts.novelty(novelty_case("failed", None), router, sandbox)
     assert result["prediction"] is None and result["error"]
-    assert router.candidate_ids == []
+    assert not hasattr(router, "candidate_ids")
+    # Every returned branch carries the rendered selection, the failed one included.
+    assert set(result["candidate_ids"]) == {"candidate-a", "candidate-b"}
 
 
 async def test_swallowed_novelty_transport_exception_remains_incomplete(tmp_path):
@@ -330,4 +334,122 @@ async def test_swallowed_novelty_transport_exception_remains_incomplete(tmp_path
     async with contracts.Sandbox(tmp_path) as sandbox:
         with pytest.raises(Incomplete, match="exactly one"):
             await contracts.novelty(novelty_case("exception", None), router, sandbox)
-    assert router.candidate_ids == []
+    assert not hasattr(router, "candidate_ids")
+
+
+class SlotsRouter:
+    """A valid route_call-only transport that accepts no new attributes."""
+
+    __slots__ = ("calls", "content")
+
+    def __init__(self, content):
+        self.calls, self.content = [], content
+
+    async def route_call(self, call_site_id, messages, **_kwargs):
+        from genesis.routing.types import RoutingResult
+
+        self.calls.append(messages)
+        return RoutingResult(success=True, content=self.content, call_site_id=call_site_id)
+
+
+async def test_novelty_accepts_a_router_that_takes_no_attributes(tmp_path):
+    """Round-2 review: the adapter wrote caller-owned state onto the router, so a
+    __slots__ (or frozen) transport raised AttributeError before the judge ran."""
+    router = SlotsRouter('{"redundant_with": null}')
+    async with contracts.Sandbox(tmp_path) as sandbox:
+        result = await contracts.novelty(novelty_case("slots", None), router, sandbox)
+    assert result["error"] is None and result["candidate_ids"]
+    assert len(router.calls) == 1
+
+
+@pytest.mark.parametrize("field", ["task_type", "principle", "id", "steps"])
+def test_a_lone_surrogate_is_rejected_at_validation(field):
+    """Round-2 review: a lone surrogate passed validation, then SQLite (or the judge
+    request) raised UnicodeEncodeError instead of the case reading Incomplete."""
+    case = novelty_case("surrogate", None)
+    row = case["existing"][0]
+    if field == "steps":
+        row["steps"] = ["ok", "bad \ud800"]
+    else:
+        row[field] = row[field] + "\ud800"
+    with pytest.raises(Incomplete):
+        corpus.validate_novelty(case)
+
+
+class BarrierRouter:
+    """Holds every judge request until ``expected`` are in flight at once."""
+
+    def __init__(self, expected):
+        self.expected, self.arrived, self.go = expected, 0, asyncio.Event()
+
+    async def route_call(self, call_site_id, messages, **_kwargs):
+        from genesis.routing.types import RoutingResult
+
+        self.arrived += 1
+        if self.arrived == self.expected:
+            self.go.set()
+        await asyncio.wait_for(self.go.wait(), 30)
+        return RoutingResult(
+            success=True, content='{"redundant_with": null}', call_site_id=call_site_id
+        )
+
+
+def _renamed(case, prefix):
+    for row in case["existing"]:
+        row["id"] = f"{prefix}-{row['id']}"
+    return case
+
+
+async def test_concurrent_novelty_calls_keep_their_own_selection(tmp_path):
+    """Class audit: a per-call patch of the module-global _row_get interleaves under
+    concurrency. Each call must record only its own candidates, the two must not
+    share a database file, and the production function must be restored."""
+    original = extractor._row_get
+    first, second = (
+        _renamed(novelty_case("c1", None), "one"),
+        _renamed(novelty_case("c2", None), "two"),
+    )
+    router = BarrierRouter(2)
+    async with contracts.Sandbox(tmp_path) as sandbox:
+        a, b = await asyncio.gather(
+            contracts.novelty(first, router, sandbox), contracts.novelty(second, router, sandbox)
+        )
+        leftovers = sorted(p.name for p in Path(sandbox.directory.name).iterdir())
+    assert set(a["candidate_ids"]) == {"one-candidate-a", "one-candidate-b"}
+    assert set(b["candidate_ids"]) == {"two-candidate-a", "two-candidate-b"}
+    assert extractor._row_get is original
+    assert leftovers == ["template.sqlite"]  # each case's database is deleted after use
+
+
+def test_nonblank_rejects_a_lone_surrogate():
+    from genesis.eval.qualification import references
+
+    assert references.nonblank("reviewer")
+    assert not references.nonblank("reviewer\ud800")
+
+
+@pytest.mark.parametrize(
+    "contract, mutate",
+    [
+        (corpus.RELEVANCE, lambda c: c.update(query=c["query"] + "\ud800")),
+        (corpus.RELEVANCE, lambda c: c.update(memory_content="\udfff" + c["memory_content"])),
+        (corpus.RELEVANCE, lambda c: c.update({"note\ud800": "x"})),
+        ("rubric", lambda c: c.update(actual=c["actual"] + "\ud800")),
+        ("rubric", lambda c: c.update(expected="\ud800")),
+        (corpus.NOVELTY, lambda c: c["new"].update(id="new\ud800")),
+    ],
+)
+def test_every_contract_rejects_a_lone_surrogate_anywhere_in_a_case(contract, mutate):
+    """Class audit: the surrogate check covered only novelty's named fields; any
+    string a case carries can reach SQLite or a judge request."""
+    if contract == "rubric":
+        rubric = list_rubrics()[0]
+        contract, case = rubric.name, rubric_case(rubric, 0, True)
+    elif contract == corpus.RELEVANCE:
+        case = relevance_case(0, True)
+    else:
+        case = novelty_case("s", None)
+    corpus.validate(contract, [case])  # the unmutated case is valid
+    mutate(case)
+    with pytest.raises(Incomplete, match="surrogate"):
+        corpus.validate(contract, [case])

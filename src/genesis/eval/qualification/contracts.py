@@ -8,11 +8,13 @@ because production clamps or fails open where a qualification must not.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
 import shutil
 import tempfile
+from contextvars import ContextVar
 from pathlib import Path
-from unittest.mock import patch
 
 import aiosqlite
 
@@ -60,9 +62,27 @@ class Sandbox:
     async def __aexit__(self, *_exc):
         self.directory.cleanup()
 
+    @contextlib.asynccontextmanager
     async def database(self, case):
-        path = Path(self.directory.name) / "case.sqlite"
-        shutil.copyfile(self.template, path)
+        """One case's database, closed and deleted on exit.
+
+        A file per call: concurrent cases on one sandbox must not share a database.
+        """
+        fd, name = tempfile.mkstemp(prefix="case-", suffix=".sqlite", dir=self.directory.name)
+        os.close(fd)
+        path = Path(name)
+        try:
+            shutil.copyfile(self.template, path)
+            db = await self._populated(path, case)
+            try:
+                yield db
+            finally:
+                await db.close()
+        finally:
+            for leftover in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+                leftover.unlink(missing_ok=True)
+
+    async def _populated(self, path, case):
         try:
             db = await connect_aiosqlite_rw(path, existing_only=True)
         except DatabaseIntegrityError as exc:
@@ -202,52 +222,87 @@ async def relevance(case, router) -> dict:
     return {"prediction": score >= RELEVANT_AT, "error": None}
 
 
+# The selected-candidate list of the novelty() call running in THIS context. Each
+# asyncio task runs in a copy of the context, so concurrent calls never see each
+# other's list, which a per-call patch of the module global cannot promise: two
+# interleaved calls would record into each other and the later restore would leave
+# the earlier call's observer installed for good.
+_SELECTED: ContextVar[list | None] = ContextVar("novelty_selected", default=None)
+_observer = {"depth": 0, "original": None}
+
+
+def _observe_row(row, key):
+    value = _observer["original"](row, key)
+    selected = _SELECTED.get()
+    # Production reads steps only while rendering the selected top-K rows.
+    # Retain those actual IDs instead of reconstructing retrieval/selection.
+    if selected is not None and key == "steps":
+        identity = _observer["original"](row, "id")
+        if identity not in selected:
+            selected.append(identity)
+    return value
+
+
+@contextlib.contextmanager
+def _observing_rows():
+    """Install ONE observer over extractor._row_get while any novelty() runs.
+
+    Reference-counted: the first entry installs it and the last exit restores the
+    original. Install and restore run without an await between check and write,
+    so they cannot interleave within one event loop.
+    """
+    if _observer["depth"] == 0:
+        _observer["original"] = extractor._row_get
+        extractor._row_get = _observe_row
+    _observer["depth"] += 1
+    try:
+        yield
+    finally:
+        _observer["depth"] -= 1
+        if _observer["depth"] == 0:
+            extractor._row_get = _observer["original"]
+            _observer["original"] = None
+
+
 async def novelty(case, router, sandbox) -> dict:
     """Run the production cross-type judgment; grade the raw target it returned."""
     capture = RecordingRouter(router)
-    router.candidate_ids = []
-    db = await sandbox.database(case)
     selected_ids = []
-    row_get = extractor._row_get
-
-    def observe_row(row, key):
-        value = row_get(row, key)
-        # Production reads steps only while rendering the selected top-K rows.
-        # Retain those actual IDs instead of reconstructing retrieval/selection.
-        if key == "steps":
-            identity = row_get(row, "id")
-            if identity not in selected_ids:
-                selected_ids.append(identity)
-        return value
-
+    token = _SELECTED.set(selected_ids)
     try:
         new = case["new"]
-        with patch.object(extractor, "_row_get", observe_row):
-            await extractor._principle_is_novel(
-                db,
-                task_type=new["task_type"],
-                new_principle=new["principle"],
-                new_steps=new["steps"],
-                embedder=Embedder(case),
-                router=capture,
-            )
+        async with sandbox.database(case) as db:
+            with _observing_rows():
+                await extractor._principle_is_novel(
+                    db,
+                    task_type=new["task_type"],
+                    new_principle=new["principle"],
+                    new_steps=new["steps"],
+                    embedder=Embedder(case),
+                    router=capture,
+                )
     finally:
-        await db.close()
+        _SELECTED.reset(token)
     if len(capture.calls) != 1:
         raise Incomplete("novelty case did not reach exactly one judge request")
     messages, response = capture.calls[0]
     if not response.success:
-        return {"prediction": None, "error": "novelty routing failed"}
+        return {
+            "prediction": None,
+            "error": "novelty routing failed",
+            "candidate_ids": selected_ids,
+        }
     content = response.content
-    router.candidate_ids = selected_ids
     mapping = candidate_mapping(case, messages, selected_ids)
     if case["expected_target"] is not None and case["expected_target"] not in mapping:
         raise Incomplete("reference target is not in the rendered candidate selection")
+    # The rendered selection is returned with the result, never stored on the
+    # caller's router: a valid route_call-only transport may not accept attributes.
     try:
-        result = {"prediction": raw_target(content, mapping), "error": None}
-        return result
+        prediction = raw_target(content, mapping)
     except MalformedJudgment as exc:
-        return {"prediction": None, "error": str(exc)}
+        return {"prediction": None, "error": str(exc), "candidate_ids": selected_ids}
+    return {"prediction": prediction, "error": None, "candidate_ids": selected_ids}
 
 
 class Probe:
