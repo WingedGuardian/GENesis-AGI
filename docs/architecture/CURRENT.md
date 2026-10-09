@@ -1340,7 +1340,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: ba6e357a7998 2026-10-08
+verified: 0c0bb701c5e2 2026-10-09
 ```
 
 - **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
@@ -1352,9 +1352,10 @@ verified: ba6e357a7998 2026-10-08
   activation. See `docs/reference/peer-registry.md`.
 - **Peer admission groundwork**: A2A1.0 `message:send`, owned task get/list/cancel
   routes use the pinned SDK wire models. Private SQLite admission commits receipt,
-  UTC quota, grant snapshot, task and prepared queue row together. Exact retries
+  UTC admission statistics, grant snapshot, task and prepared queue row together. Exact retries
   share a receipt; changed intent conflicts. Limits are two reserved slots per
-  peer and globally, twenty nonterminal tasks per peer and explicit daily quota.
+  peer and globally and twenty nonterminal tasks per peer. Daily statistics
+  impose no task budget; Genesis retains its permission and approval decisions.
   Legacy claim and stale-claim recovery exclude peer rows. The runtime task service
   stays absent until the constrained coordinator, broker, approvals and recovery
   are ready; discovery still advertises no task skills. See
