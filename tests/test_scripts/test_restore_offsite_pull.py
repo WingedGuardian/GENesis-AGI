@@ -37,8 +37,8 @@ def sandbox(tmp_path):
     (gd / "data").mkdir(parents=True)
     (home / ".genesis").mkdir(parents=True)
     (home / ".gnupg").mkdir(mode=0o700)
-    backup = tmp_path / "backup"   # empty → the off-site pull is what stages payloads
-    backup.mkdir()
+    backup = home / "backups/genesis-backups"  # ambient Tier-1 cache
+    backup.mkdir(parents=True)
     offsite = tmp_path / "offsite"
     offsite.mkdir()
     bind = tmp_path / "bin"
@@ -106,7 +106,7 @@ def _run(sandbox, *, backend="local", host_override=None, extra_args=(), force=T
     if host_override is not None:
         env["GENESIS_BACKUP_NAS_HOST"] = host_override
     return subprocess.run(
-        ["bash", str(_RESTORE), "--from", str(sandbox["backup"]),
+        ["bash", str(_RESTORE),
          *(["--force"] if force else []), *extra_args],
         env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL,
     )
@@ -116,6 +116,67 @@ def _db_value(sandbox) -> str:
     out = subprocess.run(["sqlite3", str(sandbox["gd"] / "data" / "genesis.db"),
                           "SELECT x FROM t;"], capture_output=True, text=True)
     return out.stdout.strip()
+
+
+@pytest.mark.parametrize("remote_available", [False, True])
+@pytest.mark.parametrize("mode", ["full", "database-only", "dry-run"])
+def test_explicit_local_source_wins_over_configured_backend(sandbox, remote_available, mode):
+    local = sandbox["home"] / "chosen-backup"
+    (local / "data").mkdir(parents=True)
+    (local / "data/genesis.sql").write_text("CREATE TABLE t(x); INSERT INTO t VALUES(17);\n")
+    (local / "memory").mkdir()
+    (local / "memory/local.md").write_text("chosen local memory\n")
+    if remote_available:
+        _snapshot(sandbox, "sourcebox", _NEW)
+    args = ["--from", str(local)]
+    if mode != "full":
+        args.append("--" + mode)
+    proc = _run(sandbox, host_override="sourcebox", extra_args=args)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not (sandbox["home"] / "backups/.genesis-restore/active.json").exists()
+    if mode == "dry-run":
+        assert not (sandbox["gd"] / "data/genesis.db").exists()
+        assert "off-site: (dry-run)" not in proc.stdout
+    else:
+        assert _db_value(sandbox) == "17"
+    if mode == "full":
+        memory = sandbox["home"] / ".claude/projects" / str(sandbox["gd"]).replace("/", "-") / "memory"
+        assert (memory / "local.md").read_text() == "chosen local memory\n"
+
+
+def test_empty_explicit_source_does_not_switch_to_remote(sandbox):
+    _snapshot(sandbox, "sourcebox", _NEW)
+    proc = _run(sandbox, extra_args=["--from", str(sandbox["backup"])])
+    assert proc.returncode != 0
+    assert not (sandbox["gd"] / "data/genesis.db").exists()
+    assert not (sandbox["home"] / "backups/.genesis-restore/active.json").exists()
+
+
+def test_recognized_tier1_audit_restores_separately_from_snapshot(sandbox, monkeypatch):
+    subprocess.run(["git", "init", "--quiet", str(sandbox["backup"])], check=True)
+    audit = sandbox["backup"] / "audit/merge_overrides"
+    audit.mkdir(parents=True)
+    (audit / "missing.jsonl").write_text('{"event":"synthetic backup audit"}\n')
+    (audit / "existing.jsonl").write_text('{"event":"old"}\n')
+    live = sandbox["home"] / ".genesis/merge_overrides"
+    live.mkdir()
+    # The suite relocates this store for safety; select this fixture-owned store
+    # explicitly so recovered bytes and the protected live record share a target.
+    monkeypatch.setenv("GENESIS_MERGE_OVERRIDE_DIR", str(live))
+    (live / "existing.jsonl").write_text('{"event":"live"}\n')
+    (sandbox["backup"] / "memory").mkdir()
+    (sandbox["backup"] / "memory/unselected.md").write_text("stale memory")
+    _snapshot(sandbox, "sourcebox", _NEW)
+    proc = _run(sandbox, host_override="sourcebox")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _db_value(sandbox) == "99"
+    assert (live / "missing.jsonl").exists(), proc.stdout + proc.stderr
+    assert (live / "missing.jsonl").read_bytes() == (audit / "missing.jsonl").read_bytes()
+    assert (live / "missing.jsonl").stat().st_mode & 0o777 == 0o600
+    assert (live / "existing.jsonl").read_text() == '{"event":"live"}\n'
+    memory = sandbox["home"] / ".claude/projects" / str(sandbox["gd"]).replace("/", "-") / "memory"
+    assert not (memory / "unselected.md").exists()
+    assert "separate Tier-1 repository" in proc.stdout
 
 
 def test_pulls_latest_complete_and_restores_db(sandbox):

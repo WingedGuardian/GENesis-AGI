@@ -504,7 +504,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-10-07: 72 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-09: 78 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -1155,9 +1155,9 @@ jobs:
         # Floor: 25040 + 130 = 25170.
         # Authenticated backup reads: measured net +106; 25170 + 106 = 25276.
         # Offline restore fixture changes are count-neutral; ceiling stays 102.
-        # Reader phase: measured net +109; 25276 + 109 = 25385.
-        # Capture phase: 277 cases minus 57 unchanged reader cases = 220.
-        # Review regressions: missing-root history/root validation +10; scope/fresh-install +5.
-        # Project identity/core-guard regressions: +5.
-        # Floor: 25385 + 220 + 15 + 5 = 25625.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25625
+        # Snapshot reader: original +109; corrective controls add +22:
+        # selection70->83, off-site20->28, dated backups50->51.
+        # Reader floor:25276+109+22=25407.
+        # Capture phase: measured original +240 (220+15+5).
+        # Prerequisite union:25407+240=25647; skip ceiling unchanged.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25647

@@ -801,6 +801,30 @@ def _status(backup_env) -> dict:
     return json.loads((backup_env["home"] / ".genesis" / "backup_status.json").read_text())
 
 
+def test_extra_core_inspection_failure_withholds_optional_archive(backup_env, tmp_path):
+    home = backup_env["home"]
+    _seed_extra_dir(home)
+    native = shutil.which("realpath")
+    assert native
+    _make_stub(backup_env["bind"] / "realpath",
+               '#!/usr/bin/env bash\n'
+               'for arg in "$@"; do\n'
+               '  if [ "$arg" = "$HOME/.genesis/shared" ]; then exit 2; fi\n'
+               'done\n'
+               f'exec "{native}" "$@"\n')
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "separation could not be established" in proc.stdout
+    assert not list((_repo(backup_env) / "extra").glob("*.tar.gpg"))
+    status = _status(backup_env)
+    assert status["extra_dirs_skipped"] == 1
+    assert status["tier2_status"] == "partial"
+    assert status["offsite_core_complete"] is True
+    assert status["extras_complete"] is False
+
+
 @pytest.mark.parametrize(
     "value,archived",
     [

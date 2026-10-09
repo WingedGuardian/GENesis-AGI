@@ -1,1 +1,1 @@
-Added snapshot-bound restore retries and compatible legacy/v2 encrypted transcript readers before new-format capture is enabled.
+- Added snapshot-bound restore retries and compatible legacy/v2 encrypted transcript readers before new-format capture is enabled. Explicit local sources take precedence over off-site configuration, separate Tier-1 audit records remain recoverable, and failed selection initialization cleans unpublished staging.
