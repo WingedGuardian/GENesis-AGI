@@ -1,6 +1,7 @@
 """Durable continuation uses actual SQLite and the normal individual resolver."""
 
 import hashlib
+import sqlite3
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -220,7 +221,10 @@ async def test_terminalization_refuses_unconfirmed_cleanup(lifecycle):
     await s.state.settle(s.binding, 1, clean=False)
     assert not await s.state.end(s.task["id"], "failed", "Execution stopped")
     await s.state.settle(s.binding, 1, clean=True)
-    assert await s.state.end(s.task["id"], "failed", "Execution stopped")
+    assert not await s.state.end(s.task["id"], "failed", "Execution stopped")
+    assert await s.state.end(
+        s.task["id"], "failed", "Execution stopped", generation=s.binding.generation
+    )
     assert not await s.state.end(s.task["id"], "failed", "Execution stopped")
 
 
@@ -232,6 +236,167 @@ async def next_binding(s):
         working_dir=claimed["working_dir"],
         segment=PeerSegment(claimed["segment_id"], claimed["deadline_at"], s.binding.segment.tools),
     )
+
+
+@pytest.mark.parametrize("withdrawal", ["expiry", "cancel", "epoch", "conversation", "inactive"])
+async def test_claim_retires_invalid_oldest_and_dispatches_valid_younger(lifecycle, withdrawal):
+    s = lifecycle
+    await s.state.settle(s.binding, 0, clean=True)
+    assert await s.state.end(s.task["id"], "failed", "Fixture done", generation=0)
+    tasks = PeerTasks(s.registry)
+    message = {"messageId": "old", "role": "ROLE_USER", "parts": [{"text": "Fixture."}]}
+    oldest = await tasks.admit(s.identity, message)
+    async with s.registry.transaction() as db:
+        if withdrawal == "expiry":
+            await db.execute(
+                "UPDATE peer_tasks SET expires_at='2000-01-01T00:00:00+00:00' WHERE id=?",
+                (oldest["id"],),
+            )
+        elif withdrawal == "cancel":
+            await db.execute("UPDATE peer_tasks SET cancel_requested=1 WHERE id=?", (oldest["id"],))
+        elif withdrawal == "epoch":
+            await db.execute("UPDATE peers SET epoch=epoch+1 WHERE peer_id='fixture'")
+        elif withdrawal == "inactive":
+            await db.execute("UPDATE peers SET active=0 WHERE peer_id='fixture'")
+        else:
+            await db.execute(
+                "UPDATE peer_grants SET decision='deny' WHERE peer_id='fixture' AND capability='conversation'"
+            )
+    await s.registry.register(
+        "younger", same_owner=True, daily_allowance=10, token_name="GENESIS_PEER_YOUNGER_TOKEN"
+    )
+    await s.registry.grant("younger", "conversation", "allow")
+    younger = await tasks.admit(await s.registry.get("younger"), message | {"messageId": "young"})
+    claimed = await s.state.claim()
+    assert claimed["id"] == younger["id"]
+    assert await s.state.claim() is None
+    async with s.registry.connection() as db:
+        row = await (
+            await db.execute(
+                "SELECT state,slot_reserved FROM peer_tasks WHERE id=?", (oldest["id"],)
+            )
+        ).fetchone()
+        queued = await (
+            await db.execute(
+                "SELECT status FROM direct_session_queue WHERE id=?", (oldest["queue_id"],)
+            )
+        ).fetchone()
+    assert tuple(row) == ("canceled" if withdrawal == "cancel" else "failed", 0)
+    assert queued[0] == "failed"
+
+
+async def test_claim_skips_held_pending_without_erasing_owner_reconciliation(lifecycle):
+    s = lifecycle
+    await s.state.settle(s.binding, 0, clean=True)
+    assert await s.state.end(s.task["id"], "failed", "Fixture done", generation=0)
+    tasks = PeerTasks(s.registry)
+    message = {"messageId": "held", "role": "ROLE_USER", "parts": [{"text": "Fixture."}]}
+    held = await tasks.admit(s.identity, message)
+    async with s.registry.transaction() as db:
+        await db.execute(
+            "INSERT INTO peer_task_runtime(task_id,hold_reason) VALUES(?,'reconciliation')",
+            (held["id"],),
+        )
+        await db.execute(
+            "UPDATE peer_tasks SET expires_at='2000-01-01T00:00:00+00:00' WHERE id=?", (held["id"],)
+        )
+    younger = await tasks.admit(s.identity, message | {"messageId": "young"})
+    assert (await s.state.claim())["id"] == younger["id"]
+    async with s.registry.connection() as db:
+        row = await (
+            await db.execute(
+                "SELECT t.state,t.slot_reserved,r.hold_reason FROM peer_tasks t JOIN peer_task_runtime r ON r.task_id=t.id WHERE t.id=?",
+                (held["id"],),
+            )
+        ).fetchone()
+    assert tuple(row) == ("submitted", 1, "reconciliation")
+
+
+async def test_terminal_callback_requires_observed_generation_after_continuation(lifecycle):
+    s = lifecycle
+    _, _, binding = await approve(s)
+    await s.state.settle(binding, 0, clean=True)
+    for generation in (None, s.binding.generation):
+        assert not await s.state.end(
+            s.task["id"], "failed", "Stale callback", generation=generation
+        )
+    row = await PeerTasks(s.registry).owned(s.identity, s.task["id"])
+    assert row["state"] == "working" and row["generation"] == binding.generation
+    assert await s.state.end(
+        s.task["id"], "failed", "Observed callback", generation=binding.generation
+    )
+
+
+@pytest.mark.parametrize("operation_status", ["executing", "unknown"])
+async def test_terminal_callback_never_clears_unknown_mutation(lifecycle, operation_status):
+    s = lifecycle
+    _, _, binding = await approve(s)
+    operations = PeerOperationState(s.registry)
+    receipt = await operations.prepare(binding, "conversation", s.digest, immutable_read=False)
+    await operations.transition(binding, receipt["id"], "executing")
+    if operation_status == "unknown":
+        await operations.transition(binding, receipt["id"], "unknown")
+    await s.state.settle(binding, 0, clean=True)
+    await PeerTasks(s.registry).cancel(s.identity, s.task["id"])
+    assert not await s.state.end(s.task["id"], "canceled", "Canceled")
+    assert not await s.state.end(s.task["id"], "failed", "Stopped", generation=binding.generation)
+    row = await PeerTasks(s.registry).owned(s.identity, s.task["id"])
+    assert row["state"] == "working"
+
+
+async def test_persisted_cancel_can_retire_only_after_drain(lifecycle):
+    s = lifecycle
+    await PeerTasks(s.registry).cancel(s.identity, s.task["id"])
+    assert not await s.state.end(s.task["id"], "canceled", "Canceled")
+    await s.state.settle(s.binding, 0, clean=True)
+    assert not await s.state.end(s.task["id"], "canceled", "Canceled", generation=999)
+    assert await s.state.end(s.task["id"], "canceled", "Canceled")
+    assert not await s.state.end(s.task["id"], "canceled", "Canceled")
+
+
+async def test_retirement_database_failure_rolls_back_generation_and_capacity(lifecycle):
+    s = lifecycle
+    await s.state.settle(s.binding, 0, clean=True)
+    pending = await PeerTasks(s.registry).admit(
+        s.identity,
+        {"messageId": "rollback", "role": "ROLE_USER", "parts": [{"text": "Fixture."}]},
+    )
+    async with s.registry.transaction() as db:
+        await db.execute(
+            "CREATE TRIGGER refuse_queue_update BEFORE UPDATE ON direct_session_queue BEGIN SELECT RAISE(ABORT, 'fixture queue failure'); END"
+        )
+        before = tuple(
+            await (
+                await db.execute(
+                    "SELECT state,generation,slot_reserved FROM peer_tasks WHERE id=?",
+                    (pending["id"],),
+                )
+            ).fetchone()
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="fixture queue failure"):
+        await s.state.end(pending["id"], "failed", "Stopped", generation=0)
+    async with s.registry.connection() as db:
+        after = tuple(
+            await (
+                await db.execute(
+                    "SELECT state,generation,slot_reserved FROM peer_tasks WHERE id=?",
+                    (pending["id"],),
+                )
+            ).fetchone()
+        )
+    assert after == before
+
+
+async def test_never_attempted_retirement_and_missing_id(lifecycle):
+    s = lifecycle
+    await s.state.settle(s.binding, 0, clean=True)
+    pending = await PeerTasks(s.registry).admit(
+        s.identity, {"messageId": "new", "role": "ROLE_USER", "parts": [{"text": "Fixture."}]}
+    )
+    assert not await s.state.end(pending["id"], "failed", "Stopped", generation=1)
+    assert await s.state.end(pending["id"], "failed", "Stopped")
+    assert not await s.state.end(pending["id"], "failed", "Stopped")
+    assert not await s.state.end("missing", "failed", "Stopped")
 
 
 async def test_unchanged_conversation_survives_two_independent_resource_holds(lifecycle):

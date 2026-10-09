@@ -153,18 +153,9 @@ class PeerLifecycleState:
     async def claim(self):
         """Reserve the entire remaining allowance before handing work to the runner."""
         async with self.registry.transaction() as db:
-            selected = await (
-                await db.execute(
-                    "SELECT t.id FROM peer_tasks t JOIN direct_session_queue q ON q.id=t.queue_id "
-                    "WHERE t.state='submitted' AND q.status='pending' "
-                    "ORDER BY t.created_at,t.id LIMIT 1"
-                )
-            ).fetchone()
-            if selected is None:
+            row = await self._claimable(db)
+            if row is None:
                 return None
-            row = await current(db, selected[0])
-            if row["hold_reason"] is not None:
-                raise TaskRefusal("state_conflict", 409)
             segment_id = uuid4().hex
             reserved = row["work_limit_s"] - row["work_elapsed_s"]
             deadline = min(
@@ -202,6 +193,41 @@ class PeerLifecycleState:
                 "deadline_at": deadline,
                 "reserved_s": reserved,
             }
+
+    async def _claimable(self, db):
+        after_time = after_id = None
+        while True:
+            selected = await (
+                await db.execute(
+                    "SELECT t.*,r.hold_reason FROM peer_tasks t "
+                    "JOIN direct_session_queue q ON q.id=t.queue_id "
+                    "LEFT JOIN peer_task_runtime r ON r.task_id=t.id "
+                    "WHERE t.state='submitted' AND q.status='pending' "
+                    "AND (? IS NULL OR (t.created_at,t.id)>(?,?)) "
+                    "ORDER BY t.created_at,t.id LIMIT 1",
+                    (after_time, after_time, after_id),
+                )
+            ).fetchone()
+            if selected is None:
+                return None
+            after_time, after_id = selected["created_at"], selected["id"]
+            # Check raw state first: withdrawn authority cannot be loaded
+            # through current(), and physical drain alone is insufficient.
+            if selected["hold_reason"] is not None or not await self._drained(db, selected["id"]):
+                continue
+            try:
+                row = await current(db, selected["id"])
+            except TaskRefusal:
+                await self._end(
+                    db,
+                    selected["id"],
+                    "canceled" if selected["cancel_requested"] else "failed",
+                    "Peer task permission unavailable",
+                    generation=selected["generation"],
+                    pending=True,
+                )
+                continue
+            return row
 
     async def begin(self, binding, session_id):
         async with self.registry.transaction() as db:
@@ -256,37 +282,78 @@ class PeerLifecycleState:
         if state not in {"failed", "canceled", "rejected"}:
             raise ValueError("Invalid peer terminal state")
         async with self.registry.transaction() as db:
-            row = await (
-                await db.execute("SELECT * FROM peer_tasks WHERE id=?", (task_id,))
-            ).fetchone()
-            if (
-                row is None
-                or row["state"] in {"completed", "failed", "canceled", "rejected"}
-                or (generation is not None and row["generation"] != generation)
-                or await (
-                    await db.execute(
-                        "SELECT 1 FROM peer_segments WHERE task_id=? AND status!='drained' LIMIT 1",
-                        (task_id,),
-                    )
-                ).fetchone()
-            ):
-                return False
-            stamp = utcnow().isoformat()
+            return await self._end(db, task_id, state, reason, generation=generation)
+
+    async def _drained(self, db, task_id):
+        row = await (
             await db.execute(
-                "UPDATE peer_tasks SET state=?,slot_reserved=0,generation=generation+1,updated_at=? WHERE id=?",
-                (state, stamp, task_id),
+                "SELECT NOT EXISTS(SELECT 1 FROM peer_segments WHERE task_id=? "
+                "AND status!='drained')",
+                (task_id,),
             )
+        ).fetchone()
+        return bool(row[0])
+
+    async def _quiescent(self, db, task_id):
+        if not await self._drained(db, task_id):
+            return False
+        row = await (
             await db.execute(
-                "UPDATE direct_session_queue SET status='failed',error_message='Peer task stopped' "
-                "WHERE id=? AND status IN ('pending','claimed')",
-                (row["queue_id"],),
+                "SELECT NOT EXISTS(SELECT 1 FROM peer_operations "
+                "WHERE task_id=? AND immutable_read=0 AND status IN ('executing','unknown'))",
+                (task_id,),
             )
+        ).fetchone()
+        return bool(row[0])
+
+    async def _end(self, db, task_id, state, reason, *, generation, pending=False):
+        """Transaction-local retirement; callbacks never clear unknown effects."""
+        row = await (
             await db.execute(
-                "INSERT INTO peer_task_runtime(task_id,safe_error) VALUES(?,?) "
-                "ON CONFLICT(task_id) DO UPDATE SET safe_error=excluded.safe_error,hold_reason=NULL",
-                (task_id, reason),
+                "SELECT t.*,r.hold_reason,q.status AS queue_status FROM peer_tasks t "
+                "LEFT JOIN peer_task_runtime r ON r.task_id=t.id "
+                "LEFT JOIN direct_session_queue q ON q.id=t.queue_id WHERE t.id=?",
+                (task_id,),
             )
-            return True
+        ).fetchone()
+        if (
+            row is None
+            or row["state"] in {"completed", "failed", "canceled", "rejected"}
+            or (generation is not None and row["generation"] != generation)
+            or not await self._quiescent(db, task_id)
+        ):
+            return False
+        attempted = await (
+            await db.execute("SELECT 1 FROM peer_segments WHERE task_id=? LIMIT 1", (task_id,))
+        ).fetchone()
+        if (
+            generation is None
+            and attempted
+            and not (state == "canceled" and row["cancel_requested"])
+        ):
+            return False
+        if pending and (
+            row["state"] != "submitted"
+            or row["queue_status"] != "pending"
+            or row["hold_reason"] is not None
+        ):
+            return False
+        stamp = utcnow().isoformat()
+        await db.execute(
+            "UPDATE peer_tasks SET state=?,slot_reserved=0,generation=generation+1,updated_at=? WHERE id=?",
+            (state, stamp, task_id),
+        )
+        await db.execute(
+            "UPDATE direct_session_queue SET status='failed',error_message='Peer task stopped' "
+            "WHERE id=? AND status IN ('pending','claimed')",
+            (row["queue_id"],),
+        )
+        await db.execute(
+            "INSERT INTO peer_task_runtime(task_id,safe_error) VALUES(?,?) "
+            "ON CONFLICT(task_id) DO UPDATE SET safe_error=excluded.safe_error,hold_reason=NULL",
+            (task_id, reason),
+        )
+        return True
 
     async def hold(self, binding, reason, *, capability=None, digest=None, park_id=None):
         async with self.registry.transaction() as db:

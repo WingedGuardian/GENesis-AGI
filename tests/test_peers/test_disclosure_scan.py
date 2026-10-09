@@ -10,6 +10,33 @@ from genesis.peers.disclosure_scan import json_strings_safe
 from genesis.security.output_scanner import scan_outbound
 
 
+@pytest.mark.parametrize("key", ["token", "api_key", "GENESIS_PEER_FIXTURE_TOKEN"])
+@pytest.mark.parametrize("shape", ["scalar", "list", "nested", "tuple"])
+def test_structured_credentials_keep_key_value_association(key, shape):
+    # Generate privately; failed assertions display only the boolean verdict.
+    credential = secrets.token_hex(16)
+    value = {
+        "scalar": credential,
+        "list": [credential],
+        "nested": {"value": [credential]},
+        "tuple": (credential,),
+    }[shape]
+    verdict = json_strings_safe({key: value})
+    assert not verdict
+
+
+@pytest.mark.parametrize("value", [None, True, False, {}, []])
+def test_empty_credential_fields_carry_no_value(value):
+    assert json_strings_safe({"token": value})
+
+
+def test_ordinary_structured_values_remain_allowed():
+    assert json_strings_safe({"count": 1234567890123456, "text": "Public fixture"})
+    credential = int(secrets.token_hex(16), 16)
+    verdict = json_strings_safe({"token": credential})
+    assert not verdict
+
+
 @pytest.mark.parametrize("placement", ["value", "key", "nested", "tuple"])
 @pytest.mark.parametrize("shape", ["quoted_assignment", "unicode_path"])
 def test_escaping_cannot_hide_original_sensitive_string(placement, shape):
@@ -18,15 +45,18 @@ def test_escaping_cannot_hide_original_sensitive_string(placement, shape):
         if shape == "quoted_assignment"
         else "/home/用户/public"
     )
-    assert not scan_outbound(text).safe, "original-string control must detect"
-    assert scan_outbound(json.dumps(text)).safe, "serialized-string control must miss"
+    original_safe = scan_outbound(text).safe
+    assert not original_safe
+    encoded_safe = scan_outbound(json.dumps(text)).safe
+    assert encoded_safe
     choices = {
         "value": {"answer": text},
         "key": {text: "public"},
         "nested": [{"answer": [text]}],
         "tuple": (text,),
     }
-    assert not json_strings_safe(choices[placement])
+    verdict = json_strings_safe(choices[placement])
+    assert not verdict
 
 
 @pytest.mark.parametrize(

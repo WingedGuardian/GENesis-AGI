@@ -12,6 +12,16 @@ reconciliation; only confirmed drain permits terminalization or continuation.
 The controller must prove both process-scope and broker drain before reporting
 clean settlement. That controller is supplied in the next lifecycle slice.
 
+Pending work is checked in queue order inside the claim transaction. A request
+whose authority has expired or been withdrawn is retired before considering the
+next request, only when its attempts have drained and no consequential operation
+has an unresolved outcome. Durable holds and undrained attempts stay intact and
+do not prevent other eligible work from being selected. Terminal callbacks for
+attempted work must carry the observed generation; an unfenced callback may only
+finish a persisted cancellation after confirmed drain. Neither form can erase
+an unresolved consequential effect. A separately approved continuation still
+uses the existing per-operation rules for unknown outcomes.
+
 An individual, timely dashboard or authorized Telegram-button approval is
 consumed atomically with its continuation queue entry. A durable logical consent
 then covers the exact unchanged request or operation across attempts, within the
@@ -28,8 +38,10 @@ consequential effects cannot retry automatically. Completed receipts also requir
 current authorization before reuse. Operation receipt storage is separate from
 full-result artifact storage, which arrives in a later slice.
 Original JSON string keys and values are scanned before serialization, including
-broker task context. Existing size, JSON admissibility and authority constraints
-remain in place; escaping cannot conceal an existing sensitive-data pattern.
+broker task context. Key/value associations also remain visible through nested
+containers so structured credentials cannot bypass assignment patterns. Existing
+size, JSON admissibility and authority constraints remain in place; escaping
+cannot conceal an existing sensitive-data pattern.
 The broker also scans every returned outcome before disclosure, including
 historical results replayed by later coordinator slices. Cached context checks
 the original task message as well as the serialized wrapper; completion remains
