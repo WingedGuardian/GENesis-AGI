@@ -507,6 +507,32 @@ def _isolate_circuit_breaker_state(tmp_path, monkeypatch):
     monkeypatch.setattr(cb_mod, "_STATE_FILE", tmp_path / "cb_state.json")
 
 
+# ── Graph-traversal telemetry is OFF unless a test opts in ─────────────────
+@pytest.fixture(autouse=True, scope="session")
+def _graph_telemetry_off():
+    """Most traversal tests build minimal databases with no ``eval_events``
+    table, and several assert an exact count of WARNING records on the degraded
+    path. A telemetry write there would fail and log, changing what those tests
+    measure. Telemetry tests opt back in with
+    ``monkeypatch.delenv("GENESIS_GRAPH_TELEMETRY_DISABLED")``.
+
+    Session-scoped and without ``monkeypatch`` on purpose. pytest sets up
+    same-scope autouse fixtures in NAME order, and this name sorts before
+    ``_guard_db_crud_not_mocked``: requesting the shared ``monkeypatch`` here
+    created it before the guard, so it was undone only AFTER the guard's check,
+    and the guard reported the legitimate ``monkeypatch.setattr(obs_crud, ...)``
+    patches in ``tests/test_awareness/`` as leaks (15 errors in
+    ``test_cc_slot_alert.py`` alone, measured with ``--setup-show``)."""
+    key = "GENESIS_GRAPH_TELEMETRY_DISABLED"
+    prior = os.environ.get(key)
+    os.environ[key] = "1"
+    yield
+    if prior is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = prior
+
+
 # ── Safety: prevent tests from writing REAL durable alerts ──────────────────
 @pytest.fixture(autouse=True)
 def _isolate_alert_queue(tmp_path):
