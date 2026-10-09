@@ -4,8 +4,22 @@
 selection across retries. Changing the backend requires an explicit new
 selection. `--refresh-snapshot` selects the latest complete snapshot instead of
 resuming the pinned selection. An explicit local backup directory remains
-supported. Failed inventory or transfer does not authorize unrelated cached
+supported and takes precedence over configured off-site backends for full,
+database-only and dry-run recovery. An empty explicit directory fails rather
+than selecting a remote snapshot. In local mode, `--refresh-snapshot` reports
+that it applies only to off-site recovery. Failed inventory or transfer does not authorize unrelated cached
 files or silently switch to another recovery point.
+
+Hook merge-override audit records are a separate, self-contained Tier-1 source.
+Off-site recovery uses them only from the recognized backup repository, logs
+their separate provenance and adds missing records without overwriting live
+ones, including under `--force`. Other state remains bound to the selected
+snapshot; audit-looking files in an unrecognized ambient directory are ignored.
+Unpublished selection staging is removed on ordinary exceptions. Published
+workspaces survive later failures for retry; interrupted-process cleanup remains
+part of selection recovery. If optional extra-directory separation from core
+paths cannot be inspected, backup skips that extra and reports the existing
+extras gap while continuing the core backup.
 
 The reader supports explicitly recognized legacy plaintext transcripts,
 legacy encrypted transcripts and v2 encrypted archives. All `.gpg` payloads use

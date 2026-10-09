@@ -72,18 +72,21 @@ def selection(root: Path, identity: str, snapshot: str | None, refresh: bool, ma
         state = {'version': 1, 'backend': identity, 'snapshot': snapshot,
                  'format': marker_format, 'marker_sha256': digest(marker_path), 'components': {}}
         if not work.exists():
-            stage = Path(tempfile.mkdtemp(prefix='.selection-', dir=root))
-            shutil.copyfile(marker_path, stage / 'COMPLETE')
-            os.chmod(stage / 'COMPLETE', 0o600)
-            with (stage / 'COMPLETE').open('rb') as stream:
-                os.fsync(stream.fileno())
-            atomic(stage / 'selection.json', state)
-            os.replace(stage, work)
-            directory_fd = os.open(root, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            # Own only the unpublished pathname. After rename the context sees
+            # it absent and leaves committed work available for pointer retry.
+            with tempfile.TemporaryDirectory(prefix='.selection-', dir=root) as staging:
+                stage = Path(staging)
+                shutil.copyfile(marker_path, stage / 'COMPLETE')
+                os.chmod(stage / 'COMPLETE', 0o600)
+                with (stage / 'COMPLETE').open('rb') as stream:
+                    os.fsync(stream.fileno())
+                atomic(stage / 'selection.json', state)
+                os.replace(stage, work)
+                directory_fd = os.open(root, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         elif work.is_symlink() or not (work / 'selection.json').is_file():
             raise ValueError('damaged selection directory')
         atomic(active, {'version': 1, 'id': sid})

@@ -369,6 +369,7 @@ if [ -d "$BACKUP_DIR/.git" ] && { [ "$(_backend_resolve)" = none ] || $DATABASE_
 fi
 
 # ── Off-site (backend) pull ──────────────────────────────────────────
+_AUDIT_SRC="$BACKUP_DIR/audit/merge_overrides"
 # The large binaries (SQLite dump, Qdrant snapshots, transcripts) live ONLY on the
 # off-site backend — gitignored from Tier-1 — so on a fresh DR box they must be
 # pulled from the latest dated COMPLETE snapshot before the restore sections below
@@ -379,6 +380,16 @@ _pull_from_offsite() {
     local be identity workspace_root pinned snap host_dir off_host latest hosts names rc marker component destination fname listing stage
     be="$(backend_name)"
     [ "$be" = none ] && return 0
+    # Hook audit records are self-contained Tier-1 payloads, not snapshot state.
+    # Only an independently identified repository may supplement off-site restore.
+    _AUDIT_SRC=""
+    local tier1_root backup_root
+    tier1_root=$(git -C "$BACKUP_DIR" rev-parse --show-toplevel 2>/dev/null) || tier1_root=""
+    backup_root=$(realpath -- "$BACKUP_DIR" 2>/dev/null) || backup_root=""
+    if [ -n "$tier1_root" ] && [ "$tier1_root" = "$backup_root" ]; then
+        _AUDIT_SRC="$BACKUP_DIR/audit/merge_overrides"
+        log "Audit source: separate Tier-1 repository $BACKUP_DIR"
+    fi
     _RESTORE_MANAGED=true
     _TRANSCRIPTS_FROM_SNAPSHOT=true
     _EXTRA_FROM_SNAPSHOT=true
@@ -571,9 +582,11 @@ PYBOUNDARY
     elif [ -s "$marker" ]; then warn "off-site: unknown COMPLETE format; extra recovery withheld"; fi
 }
 
-if $DATABASE_ONLY && $_EXPLICIT_LOCAL_SOURCE \
-    && { [ -f "$BACKUP_DIR/data/genesis.sql.gpg" ] || [ -f "$BACKUP_DIR/data/genesis.sql" ]; }; then
-    log "database-only: using explicit local SQL payload without off-site replacement"
+if $_EXPLICIT_LOCAL_SOURCE; then
+    log "Using explicit local source without off-site replacement"
+    if $REFRESH_SNAPSHOT; then
+        log "--refresh-snapshot applies only to off-site recovery; local source remains selected"
+    fi
 else
     _pull_from_offsite
 fi
@@ -610,7 +623,7 @@ _backup_has_payload() {
     # mirror copy and sweeping leaves a `.<name>.partial.<pid>` scrap, and a mirror
     # holding zero restorable records would otherwise satisfy this guard and let the
     # run report success having restored nothing.
-    find "$d/audit/merge_overrides" -maxdepth 1 -type f -name '*.jsonl' -print -quit \
+    find "$_AUDIT_SRC" -maxdepth 1 -type f -name '*.jsonl' -print -quit \
         2>/dev/null | grep -q . && return 0
     [ -f "$d/secrets/secrets.env.gpg" ] && return 0
     find "$d/config_overrides" -type f -name '*.local.yaml' -print -quit 2>/dev/null | grep -q . && return 0
@@ -1543,7 +1556,6 @@ fi
 # written since — deliberately not `cp -n`, whose skip is indistinguishable from a
 # copy in its exit status and which coreutils warns may change behaviour.
 log "--- Hook audit stores ---"
-_AUDIT_SRC="$BACKUP_DIR/audit/merge_overrides"
 # ASK, do not assume — same resolver the writer and the pruner use. Restoring to
 # the hardcoded default put an install with a custom GENESIS_MERGE_OVERRIDE_DIR
 # back together with its audit trail in a directory nothing reads (Codex P2,

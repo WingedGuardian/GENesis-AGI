@@ -888,6 +888,12 @@ else
             # core path out of the way; the core backup already covers it.
             _extra_skip "overlaps $_core_hit, which the core backup restores" "$_d"
             continue
+        else
+            _core_rc=$?
+            if [ "$_core_rc" -ne 1 ]; then
+                _extra_skip "core path separation could not be established" "$_d"
+                continue
+            fi
         fi
         _dup=""
         for _prev in "${_extra_abs_seen[@]+"${_extra_abs_seen[@]}"}"; do
