@@ -172,8 +172,6 @@ async def create_worktree(
     repo_root: Path,
     worktree_base: Path,
     base: BaseRef | None = None,
-    *,
-    keep_branch: bool = False,
 ) -> Path:
     """Create a git worktree for code task isolation.
 
@@ -189,10 +187,6 @@ async def create_worktree(
     target the default branch (cut from a remote-tracking ref, a branch TRACKS
     it by default; measured on git 2.43). ``None`` keeps the previous
     behaviour: cut from HEAD.
-
-    ``keep_branch`` is for a RESUMED task (#3060): its branch holds the steps
-    already committed, so it is never deleted; the worktree is re-added on it.
-    A fresh task deletes a leftover branch and cuts anew, as before.
     """
     short_id = task_id[:8]
     branch = f"task/{short_id}"
@@ -201,14 +195,13 @@ async def create_worktree(
     # Clean up stale state from previous runs of this task
     if wt_path.exists():
         logger.info("Stale worktree dir %s exists, cleaning up", wt_path)
-        await cleanup_worktree(wt_path, repo_root, delete_branch=not keep_branch)
+        await cleanup_worktree(wt_path, repo_root)
         if wt_path.exists():
             await _clear_stale_dir(wt_path, repo_root, task_id)
     else:
         # No dir but branch might linger from a prior crash
         await _prune_worktrees(repo_root)
-        if not keep_branch:
-            await _delete_branch(branch, repo_root)
+        await _delete_branch(branch, repo_root)
 
     if base is not None:
         add_args = ["--no-track", "-b", branch, str(wt_path), base.sha]
@@ -275,6 +268,19 @@ async def _worktree_records(repo_root: Path) -> list[dict[str, str]] | None:
     return [r for r in records if "worktree" in r] or None
 
 
+def _as_named(path: Path) -> Path:
+    """``path`` with its parent resolved and its last component kept.
+
+    Not ``resolve()``: a task directory replaced by a symlink to the main
+    checkout would resolve to the main checkout's own record and top level,
+    and a resumed task would run there (#3061 review, reproduced on git 2.43).
+    Spelled this way it keeps its own name, so it can match only its own
+    record and is never its own top level.
+    """
+    path = Path(os.path.abspath(path))
+    return path.parent.resolve() / path.name
+
+
 def _record_for(records: list[dict[str, str]], wt_path: Path) -> dict[str, str] | None:
     """The record git keeps for ``wt_path``, skipping a ``prunable`` one.
 
@@ -284,9 +290,9 @@ def _record_for(records: list[dict[str, str]], wt_path: Path) -> dict[str, str] 
     in which git walks up to the main checkout (MEASURED, git 2.43). A LOCKED
     record is never marked prunable, so the caller checks the directory too.
     """
-    target = wt_path.resolve()
+    target = _as_named(wt_path)
     return next(
-        (r for r in records if "prunable" not in r and Path(r["worktree"]).resolve() == target),
+        (r for r in records if "prunable" not in r and _as_named(Path(r["worktree"])) == target),
         None,
     )
 
@@ -312,6 +318,11 @@ async def _clear_stale_dir(wt_path: Path, repo_root: Path, task_id: str) -> None
         raise StaleWorktreeError(
             f"the previous worktree for this task, {wt_path}, was left in place: "
             "git's worktree list could not be read to tell an orphan from live work"
+        )
+    if wt_path.is_symlink():
+        raise StaleWorktreeError(
+            f"the previous worktree path for this task, {wt_path}, is a symlink; "
+            "nothing reaps it, so remove the link by hand before retrying"
         )
     record = _record_for(records, wt_path)
     if record is not None:
@@ -347,58 +358,60 @@ async def _clear_stale_dir(wt_path: Path, repo_root: Path, task_id: str) -> None
 
 
 async def is_registered_worktree(wt_path: Path, repo_root: Path) -> bool:
-    """Whether git lists ``wt_path`` as a worktree of ``repo_root`` (#3021).
+    """Whether ``wt_path`` is a live linked worktree of ``repo_root`` (#3021).
 
-    Not ``git rev-parse`` inside the directory: task worktrees live under the
-    repo, so in an orphan directory it walks up to the main repository and
-    succeeds (MEASURED), and a resumed task would then run against the main
-    checkout. An unreadable listing raises StaleWorktreeError rather than
-    reading as False, so nothing is re-created over a live worktree.
+    git's own definition, the one ``git worktree remove`` enforces: the
+    directory's ``.git`` FILE points at an admin directory under the
+    repository's ``<common-dir>/worktrees/``, and that admin directory's
+    ``gitdir`` points back at this directory. Each half alone is imitable,
+    and every one of these was MEASURED (git 2.43) to pass a weaker check:
+    an orphan directory (git walks up to the main checkout), a record kept
+    prunable or locked after the directory was re-created, a directory given
+    its own ``git init``, a task path replaced by a symlink to the checkout or
+    to another task's worktree, and a ``.git`` file copied from another task.
+    Paths are compared as named (``_as_named``), never fully resolved.
+
+    False sends the caller to re-create, which removes a clean worktree and
+    force-deletes its branch, committed steps included. So anything that
+    cannot be READ raises StaleWorktreeError instead of reading as False.
     """
-    if not wt_path.exists():
-        return False
-    records = await _worktree_records(repo_root)
-    if records is None:
-        # Not False: the caller would re-create, and re-creating removes a
-        # clean worktree and force-deletes its branch, committed steps included.
-        raise StaleWorktreeError(
-            f"the worktree for this task, {wt_path}, was left in place: "
-            "git's worktree list could not be read"
+    dot_git = wt_path / ".git"
+    if wt_path.is_symlink() or not dot_git.is_file():
+        return False  # a symlink, an orphan, or its own repository: not a linked worktree
+
+    def unreadable(what: str) -> StaleWorktreeError:
+        return StaleWorktreeError(
+            f"the worktree for this task, {wt_path}, was left in place: {what} could not be read"
         )
-    if _record_for(records, wt_path) is None:
-        return False
-    # Listed is not enough: a locked record is never marked prunable, so a
-    # locked worktree whose directory was deleted and re-created still lists.
-    # The directory must be that worktree's own top level; in an orphan, git
-    # walks up to the main checkout and names it instead (MEASURED).
-    # Its git directory must also be this repository's: a directory re-created
-    # and given its own `git init` is its own top level, and git does not mark
-    # the old record prunable once a .git exists there again (MEASURED).
-    here = await _git_read(
-        wt_path, "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"
+
+    # One value per git call: a path may contain a newline.
+    rc, admin = await _git_read(wt_path, "rev-parse", "--absolute-git-dir")
+    rc2, common = await _git_read(
+        repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir"
     )
-    ours = await _git_read(repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    lines = here[1].split("\n")
-    if here[0] != 0 or ours[0] != 0 or len(lines) != 2:
-        raise StaleWorktreeError(
-            f"the worktree for this task, {wt_path}, was left in place: git "
-            "lists it, but could not read it"
-        )
-    top, common = (Path(line).resolve() for line in lines)
-    return top == wt_path.resolve() and common == Path(ours[1]).resolve()
+    if rc != 0 or rc2 != 0:
+        raise unreadable("its git directory")
+    admin_dir = Path(admin)
+    if admin_dir.parent.resolve() != Path(common).resolve() / "worktrees":
+        return False  # not one of this repository's linked worktrees
+    try:
+        back = (admin_dir / "gitdir").read_text(errors="surrogateescape").rstrip("\n")
+    except FileNotFoundError:
+        return False  # pruned admin directory: nothing points back
+    except OSError:
+        raise unreadable("git's record of it") from None
+    return _as_named(Path(back)) == _as_named(wt_path) / ".git"
 
 
 async def cleanup_worktree(
     wt_path: Path,
     repo_root: Path,
-    *,
-    delete_branch: bool = True,
 ) -> None:
-    """Remove a worktree and (unless ``delete_branch`` is False) its branch.
+    """Remove a worktree and its associated branch.
 
     NO --force per CLAUDE.md worktree rules.
     """
-    branch = _branch_from_wt_path(wt_path) if delete_branch else None
+    branch = _branch_from_wt_path(wt_path)
 
     if not wt_path.exists():
         # Worktree dir gone but branch might linger

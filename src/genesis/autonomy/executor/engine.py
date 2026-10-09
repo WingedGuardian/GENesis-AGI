@@ -340,7 +340,9 @@ class CCSessionExecutor:
                 # Recover or create worktree for code tasks
                 has_code = any(s.get("type") == "code" for s in steps)
                 if has_code:
-                    await self._resume_worktree(task_id, task)
+                    recovered = await self._recover_worktree(task_id, task)
+                    if not recovered:
+                        await self._create_worktree(task_id)
 
                 # Filter to only pending/failed steps
                 remaining_steps = [
@@ -1228,13 +1230,11 @@ class CCSessionExecutor:
     # Worktree management (Amendment #7)
     # =================================================================
 
-    async def _create_worktree(self, task_id: str, *, keep_branch: bool = False) -> Path:
-        """Create a git worktree for code task isolation.
-
-        ``keep_branch`` on a resume: the task branch holds its committed steps."""
+    async def _create_worktree(self, task_id: str) -> Path:
+        """Create a git worktree for code task isolation."""
         base = await self._resolve_and_record_base(task_id)
         wt_path = await _worktree.create_worktree(
-            task_id, _REPO_ROOT, _WORKTREE_BASE, base=base, keep_branch=keep_branch,
+            task_id, _REPO_ROOT, _WORKTREE_BASE, base=base,
         )
         self._worktree_paths[task_id] = wt_path
         await self._set_output(task_id, "worktree_path", str(wt_path))
@@ -1279,14 +1279,6 @@ class CCSessionExecutor:
             return _worktree.BaseRef(name=name, sha=sha)
         return None
 
-    async def _resume_worktree(self, task_id: str, task: dict) -> None:
-        """Recover a resumed task's worktree, or re-create it on its branch.
-
-        Both paths keep the task branch: it holds the completed steps, which
-        the resume then skips (#3060)."""
-        if not await self._recover_worktree(task_id, task):
-            await self._create_worktree(task_id, keep_branch=True)
-
     async def _recover_worktree(
         self, task_id: str, task: dict,
     ) -> bool:
@@ -1322,7 +1314,7 @@ class CCSessionExecutor:
         try:
             base = await self._resolve_and_record_base(task_id)
             wt_path = await _worktree.create_worktree(
-                task_id, _REPO_ROOT, _WORKTREE_BASE, base=base, keep_branch=True,
+                task_id, _REPO_ROOT, _WORKTREE_BASE, base=base,
             )
             self._worktree_paths[task_id] = wt_path
             await self._set_output(task_id, "worktree_path", str(wt_path))

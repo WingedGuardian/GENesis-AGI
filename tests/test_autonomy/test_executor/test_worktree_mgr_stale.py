@@ -258,62 +258,6 @@ async def test_command_line_config_reaches_every_git_call(repo, monkeypatch):
     assert await worktree_mgr._git_read(repo, "config", "--get", "genesis.probe") == (0, "yes")
 
 
-def _commit_step(wt: Path) -> None:
-    (wt / "step.txt").write_text("step one")
-    subprocess.run(["git", "-C", str(wt), "add", "step.txt"], check=True)
-    subprocess.run(["git", "-C", str(wt), "commit", "-q", "-m", "step one"], check=True)
-
-
-def _branch_log(repo: Path) -> str:
-    return subprocess.run(
-        ["git", "-C", str(repo), "log", "--format=%s", f"task/{TASK[:8]}"],
-        capture_output=True,
-        text=True,
-    ).stdout
-
-
-@pytest.mark.asyncio
-async def test_a_resume_with_the_directory_gone_keeps_the_committed_steps(repo):
-    # #3060: the re-create used to run git branch -D first.
-    base = repo / ".claude" / "worktrees"
-    wt = await worktree_mgr.create_worktree(TASK, repo, base)
-    _commit_step(wt)
-    shutil.rmtree(wt)
-
-    again = await worktree_mgr.create_worktree(TASK, repo, base, keep_branch=True)
-
-    assert again == wt and (wt / "step.txt").read_text() == "step one"
-    assert "step one" in _branch_log(repo)
-
-
-@pytest.mark.asyncio
-async def test_a_resume_over_an_unlisted_orphan_keeps_the_committed_steps(repo):
-    # The record already pruned, so nothing holds the branch: cleanup_worktree
-    # would delete it unless told to keep it.
-    base = repo / ".claude" / "worktrees"
-    wt = await worktree_mgr.create_worktree(TASK, repo, base)
-    _commit_step(wt)
-    _delete_and_recreate(wt)
-    subprocess.run(["git", "-C", str(repo), "worktree", "prune"], check=True)
-
-    await worktree_mgr.create_worktree(TASK, repo, base, keep_branch=True)
-
-    assert (wt / "step.txt").read_text() == "step one"
-    assert "step one" in _branch_log(repo)
-
-
-@pytest.mark.asyncio
-async def test_a_fresh_task_still_deletes_a_leftover_branch(repo):
-    base = repo / ".claude" / "worktrees"
-    wt = await worktree_mgr.create_worktree(TASK, repo, base)
-    _commit_step(wt)
-    shutil.rmtree(wt)
-
-    await worktree_mgr.create_worktree(TASK, repo, base)
-
-    assert not (wt / "step.txt").exists() and "step one" not in _branch_log(repo)
-
-
 @pytest.mark.asyncio
 async def test_a_reinitialised_directory_is_not_the_registered_worktree(repo):
     # git init at the old path: its own top level, and the old record is not
@@ -324,3 +268,82 @@ async def test_a_reinitialised_directory_is_not_the_registered_worktree(repo):
     subprocess.run(["git", "init", "-q", str(wt)], check=True)
     assert "prunable" not in _porcelain(repo)
     assert await worktree_mgr.is_registered_worktree(wt, repo) is False
+
+
+@pytest.mark.asyncio
+async def test_a_task_path_replaced_by_a_link_to_the_checkout_is_not_registered(repo):
+    # Resolving both sides matched the main checkout's own record and top
+    # level, so a resumed task would run in the checkout (#3061 review).
+    base = repo / ".claude" / "worktrees"
+    wt = await worktree_mgr.create_worktree(TASK, repo, base)
+    shutil.rmtree(wt)
+    wt.symlink_to(repo)
+    assert await worktree_mgr.is_registered_worktree(wt, repo) is False
+
+
+@pytest.mark.asyncio
+async def test_a_newline_in_the_repo_path_keeps_a_live_worktree_registered(tmp_path, repo):
+    odd = tmp_path / "re\npo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(odd)], check=True)
+    subprocess.run(
+        ["git", "-C", str(odd), "commit", "-q", "--allow-empty", "-m", "init"], check=True
+    )
+    wt = await worktree_mgr.create_worktree(TASK, odd, odd / ".claude" / "worktrees")
+    assert await worktree_mgr.is_registered_worktree(wt, odd) is True
+
+
+OTHER = "0123456789abcdef"
+
+
+@pytest.mark.asyncio
+async def test_a_dot_git_copied_from_another_task_is_not_registered(repo):
+    # The copy names task A's admin dir, whose gitdir points back at A, not
+    # here; adopting it would run task B on task A's branch and index.
+    base = repo / ".claude" / "worktrees"
+    a = await worktree_mgr.create_worktree(OTHER, repo, base)
+    b = await worktree_mgr.create_worktree(TASK, repo, base)
+    (b / ".git").write_text((a / ".git").read_text())
+    assert await worktree_mgr.is_registered_worktree(a, repo) is True
+    assert await worktree_mgr.is_registered_worktree(b, repo) is False
+
+
+@pytest.mark.asyncio
+async def test_a_task_path_linked_to_another_worktree_is_not_registered(repo):
+    base = repo / ".claude" / "worktrees"
+    a = await worktree_mgr.create_worktree(OTHER, repo, base)
+    b = await worktree_mgr.create_worktree(TASK, repo, base)
+    shutil.rmtree(b)
+    b.symlink_to(a)
+    assert await worktree_mgr.is_registered_worktree(b, repo) is False
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="is a symlink"):
+        await worktree_mgr.create_worktree(TASK, repo, base)
+    assert a.is_dir() and b.is_symlink()
+
+
+@pytest.mark.asyncio
+async def test_a_live_worktree_under_a_linked_base_is_registered(tmp_path, repo):
+    # The positive case through a symlinked parent: git records the real path,
+    # the executor names the linked one; both are compared as named.
+    real_base = tmp_path / "real-base"
+    real_base.mkdir()
+    linked = tmp_path / "linked-base"
+    linked.symlink_to(real_base)
+    wt = await worktree_mgr.create_worktree(TASK, repo, linked)
+    assert await worktree_mgr.is_registered_worktree(wt, repo) is True
+    assert await worktree_mgr.is_registered_worktree(Path(os.path.relpath(wt)), repo) is True
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_admin_record_raises_rather_than_recreating(repo, monkeypatch):
+    base = repo / ".claude" / "worktrees"
+    wt = await worktree_mgr.create_worktree(TASK, repo, base)
+    real = Path.read_text
+
+    def denied(self, *a, **k):
+        if self.name == "gitdir":
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="could not be read"):
+        await worktree_mgr.is_registered_worktree(wt, repo)

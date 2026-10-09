@@ -473,7 +473,7 @@ class TestBaseWiring:
     def _spy(self, monkeypatch, base):
         seen: list[dict] = []
 
-        async def fake_create(task_id, repo_root, worktree_base, base=None, keep_branch=False):
+        async def fake_create(task_id, repo_root, worktree_base, base=None):
             seen.append({"base": base})
             return worktree_base / f"task-{task_id[:8]}"
 
