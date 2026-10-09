@@ -7,7 +7,13 @@ install a hook or activate a validator session.
 The launch definition supplies absolute runtime and workspace roots. Payload
 cwd, role, session and transcript fields supply no authority. The dispatcher
 uses the shared validator MCP profile and exact server prefixes. Shell actions
-are refused until their separate mutation policy is installed. Patches admit
+admit only the canonical seven-argument invocation of
+`scripts/codex_validator_request.py` with a bounded private UUID request; all
+other commands are refused. The closed operations are `protocol_probe`,
+`serving_status`, and `serving_verify`. Serving observations project the existing
+deploy status tripwire; unknown, changed, partial or oversized output does not
+establish serving identity. The bracket retains the existing deploy tripwire
+limitations. Patches admit
 every potential source and move destination inside the trusted workspace;
 existing symlinks, special files, hardlinked leaves, parent traversal, and
 instruction/configuration paths (`AGENTS.md`, `.codex`, `.agents`, `.git`) are
