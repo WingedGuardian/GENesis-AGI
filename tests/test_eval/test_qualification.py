@@ -328,6 +328,25 @@ async def test_failed_novelty_response_is_not_a_valid_null(tmp_path):
     assert set(result["candidate_ids"]) == {"candidate-a", "candidate-b"}
 
 
+async def test_an_unreachable_target_is_incomplete_even_when_routing_fails(tmp_path):
+    """Round-3 review: the routing-failure return ran before the reachability
+    check, so a case whose target production excludes was charged to the
+    provider as a routing error instead of stopping as an unusable reference."""
+    from genesis.routing.types import RoutingResult
+
+    case = novelty_case("excluded-target", "candidate-a")
+    case["existing"][0]["deprecated"] = True  # production never offers candidate-a
+    router = Stub('{"redundant_with": null}')
+    router.route_call = AsyncMock(
+        return_value=RoutingResult(
+            success=False, content=router.content, call_site_id="novelty", error="synthetic failure"
+        )
+    )
+    async with contracts.Sandbox(tmp_path) as sandbox:
+        with pytest.raises(Incomplete, match="reference target"):
+            await contracts.novelty(case, router, sandbox)
+
+
 async def test_swallowed_novelty_transport_exception_remains_incomplete(tmp_path):
     router = Stub('{"redundant_with": null}')
     router.route_call = AsyncMock(side_effect=RuntimeError("synthetic transport failure"))
@@ -453,3 +472,13 @@ def test_every_contract_rejects_a_lone_surrogate_anywhere_in_a_case(contract, mu
     mutate(case)
     with pytest.raises(Incomplete, match="surrogate"):
         corpus.validate(contract, [case])
+
+
+async def test_a_raising_relevance_transport_is_incomplete_not_a_provider_error():
+    """Premise check before round 4: relevance() returned on `score is None` before
+    counting judge requests, so a transport that raised (swallowed by production)
+    was reported as a provider error. novelty() already refused this case."""
+    router = Stub('{"relevance": 0.9}')
+    router.route_call = AsyncMock(side_effect=RuntimeError("synthetic transport failure"))
+    with pytest.raises(Incomplete, match="exactly one"):
+        await contracts.relevance(relevance_case("raising", True), router)

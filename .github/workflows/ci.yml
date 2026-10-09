@@ -1148,9 +1148,9 @@ jobs:
         # deploy/update/candidate lock and rollback tests); no added skips.
         # Floor: 25004 + 36 = 25040.
         #
-        # Corpus/adapters replacement (#3071): +115 collected tests, measured with
+        # Corpus/adapters replacement (#3071): +130 collected tests, measured with
         # --collect-only against main's versions of the changed test files
-        # (test_qualification +63, test_qualification_references +24,
+        # (test_qualification +78, test_qualification_references +24,
         # test_qualification_rework +28); no added skips.
-        # Floor: 25040 + 115 = 25155.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25155
+        # Floor: 25040 + 130 = 25170.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25170

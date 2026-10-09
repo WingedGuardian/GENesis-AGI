@@ -73,7 +73,9 @@ async def test_nonfinite_j9_answers_are_errors(value):
 def test_legal_unicode_in_jsonl_is_preserved(tmp_path, separator):
     case = relevance_case("synthetic", True)
     case["query"] += separator + "second part"
-    (tmp_path / f"{corpus.RELEVANCE}.jsonl").write_text(json.dumps(case, ensure_ascii=False) + "\n")
+    (tmp_path / f"{corpus.RELEVANCE}.jsonl").write_text(
+        json.dumps(case, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
     assert corpus.load(tmp_path)[corpus.RELEVANCE][0]["query"] == case["query"]
 
 

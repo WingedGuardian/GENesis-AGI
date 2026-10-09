@@ -210,10 +210,12 @@ async def relevance(case, router) -> dict:
     score, detail, _model = await J9EvalBatchExecutor(router=capture)._judge_relevance(
         case["query"], case["memory_content"]
     )
-    if score is None:
-        return {"prediction": None, "error": detail or "relevance_error"}
+    # Checked FIRST, as novelty() does: production swallows a transport that
+    # raises, and that is not a provider verdict to charge to the model.
     if len(capture.calls) != 1:
         raise Incomplete("relevance case did not reach exactly one judge request")
+    if score is None:
+        return {"prediction": None, "error": detail or "relevance_error"}
     # Production coerces and clamps; qualification requires a raw JSON number
     # in the declared domain before accepting the production decision.
     value = raw_score(capture.calls[0][1].content, "relevance", rubric=False)
@@ -249,7 +251,9 @@ def _observing_rows():
 
     Reference-counted: the first entry installs it and the last exit restores the
     original. Install and restore run without an await between check and write,
-    so they cannot interleave within one event loop.
+    so they cannot interleave within one event loop. It is NOT thread-safe: two
+    event loops in two threads could lose the restore. Qualification runs in one
+    serial, isolated process, which is the assumption this relies on.
     """
     if _observer["depth"] == 0:
         _observer["original"] = extractor._row_get
@@ -265,7 +269,12 @@ def _observing_rows():
 
 
 async def novelty(case, router, sandbox) -> dict:
-    """Run the production cross-type judgment; grade the raw target it returned."""
+    """Run the production cross-type judgment; grade the raw target it returned.
+
+    ``Incomplete`` means the outcome cannot be attributed to the model (an unusable
+    reference case, or a call production swallowed), not that the fault is local;
+    a ``success=False`` routing result is the provider's and is returned as such.
+    """
     capture = RecordingRouter(router)
     selected_ids = []
     token = _SELECTED.set(selected_ids)
@@ -286,6 +295,12 @@ async def novelty(case, router, sandbox) -> dict:
     if len(capture.calls) != 1:
         raise Incomplete("novelty case did not reach exactly one judge request")
     messages, response = capture.calls[0]
+    # The prompt was rendered whether or not the call succeeded, so the case's
+    # own validity (its mapping, its target's reachability) is settled FIRST: an
+    # unusable reference case is local preparation, never a provider error.
+    mapping = candidate_mapping(case, messages, selected_ids)
+    if case["expected_target"] is not None and case["expected_target"] not in mapping:
+        raise Incomplete("reference target is not in the rendered candidate selection")
     if not response.success:
         return {
             "prediction": None,
@@ -293,9 +308,6 @@ async def novelty(case, router, sandbox) -> dict:
             "candidate_ids": selected_ids,
         }
     content = response.content
-    mapping = candidate_mapping(case, messages, selected_ids)
-    if case["expected_target"] is not None and case["expected_target"] not in mapping:
-        raise Incomplete("reference target is not in the rendered candidate selection")
     # The rendered selection is returned with the result, never stored on the
     # caller's router: a valid route_call-only transport may not accept attributes.
     try:
