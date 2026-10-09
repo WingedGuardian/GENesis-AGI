@@ -31,7 +31,7 @@ def message(message_id="one", text="Please help"):
     return {"messageId": message_id, "role": "ROLE_USER", "parts": [{"text": text}]}
 
 
-async def test_eight_identical_sends_share_one_receipt_quota_and_queue(tasks):
+async def test_eight_identical_sends_share_one_receipt_accounting_and_queue(tasks):
     service, identity = tasks
     rows = await asyncio.gather(*(service.admit(identity, message()) for _ in range(8)))
     assert len({row["id"] for row in rows}) == 1
@@ -106,29 +106,35 @@ async def test_work_limit_exact_integer_bounds(tasks, limit):
     assert error.value.status == 400
 
 
-async def test_daily_allowance_charges_new_receipts_only_and_resets_utc_day(tasks, monkeypatch):
-    from datetime import UTC, datetime, timedelta
+async def test_daily_statistics_do_not_limit_distinct_tasks(tasks, monkeypatch):
+    from datetime import UTC, datetime
 
     from genesis.peers import tasks as module
 
     service, identity = tasks
     async with service.registry.transaction() as db:
         await db.execute("UPDATE peers SET daily_allowance=1 WHERE peer_id='muse'")
-    first = await service.admit(identity, message())
-    await service.cancel(identity, first["id"])
-    assert (await service.admit(identity, message()))["id"] == first["id"]
-    with pytest.raises(TaskRefusal) as error:
-        await service.admit(identity, message("two"))
-    assert error.value.status == 429
-    tomorrow = datetime.now(UTC) + timedelta(days=1)
+    today = datetime.now(UTC)
 
     class Clock:
         @staticmethod
         def now(zone):
-            return tomorrow
+            return today
 
     monkeypatch.setattr(module, "datetime", Clock)
-    assert (await service.admit(identity, message("two")))["id"] != first["id"]
+    identifiers = set()
+    for index in range(3):
+        submitted = message(str(index))
+        row = await service.admit(identity, submitted)
+        identifiers.add(row["id"])
+        await service.cancel(identity, row["id"])
+        assert (await service.admit(identity, submitted))["id"] == row["id"]
+    assert len(identifiers) == 3
+    async with service.registry.connection() as db:
+        rows = await (
+            await db.execute("SELECT utc_day,admissions FROM peer_daily_admissions")
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [(today.date().isoformat(), 3)]
 
 
 async def test_global_slot_limit_includes_other_peer(tasks):

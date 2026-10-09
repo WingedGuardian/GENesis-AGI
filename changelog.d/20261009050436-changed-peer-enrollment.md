@@ -1,0 +1,1 @@
+- Trusted peer enrollment no longer requires a daily task allowance. The deprecated option remains compatible with saved databases and is omitted from peer listings.

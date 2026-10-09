@@ -17,6 +17,29 @@ from genesis.peers.session import PeerSessionBinding
 from genesis.peers.tasks import PeerTasks, TaskRefusal
 
 
+async def test_escaped_sensitive_receipt_refused_without_committing(lifecycle):
+    import secrets
+
+    s = lifecycle
+    _, _, binding = await approve(s)
+    operations = PeerOperationState(s.registry)
+    receipt = await operations.prepare(binding, "conversation", s.digest, immutable_read=True)
+    await operations.transition(binding, receipt["id"], "executing")
+    result = {"nested": [{"text": 'token: "' + secrets.token_hex(16) + '"'}]}
+    with pytest.raises(ValueError, match="Peer operation result refused"):
+        await operations.transition(binding, receipt["id"], "completed", result=result)
+    async with s.registry.connection() as db:
+        row = await (
+            await db.execute(
+                "SELECT status,result_json FROM peer_operations WHERE id=?", (receipt["id"],)
+            )
+        ).fetchone()
+    assert tuple(row) == ("executing", None)
+    await operations.transition(
+        binding, receipt["id"], "completed", result={"text": "Public fixture"}
+    )
+
+
 @pytest.fixture
 async def lifecycle(registry, tmp_path, request):
     async with registry.connection() as db:
