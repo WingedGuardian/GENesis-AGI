@@ -6,6 +6,7 @@ import json
 from genesis.peers.digests import operation_digest
 from genesis.peers.lifecycle_state import decision, disclosure_authorized
 from genesis.peers.operation_state import operation_authorized
+from genesis.peers.protocol import _finite_float, _nonfinite, _unique_object
 from genesis.peers.resources import resource_id
 from genesis.peers.tasks import TaskRefusal
 from genesis.security.output_scanner import scan_outbound
@@ -36,7 +37,7 @@ async def _resource(db, task, value, *, listed=False):
         raise TaskRefusal("unauthorized", 401)
 
 
-async def result_authorized(db, task):
+async def result_authorized(db, task, *, research=None):
     """Re-derive every completed task receipt; never trust final-segment telemetry."""
     await disclosure_authorized(db, task)
     receipts = await (
@@ -49,7 +50,12 @@ async def result_authorized(db, task):
             # A later trusted capability must install its own closed provenance policy.
             raise TaskRefusal("result_not_ready", 409)
         try:
-            result = json.loads(receipt["result_json"])
+            result = json.loads(
+                receipt["result_json"],
+                object_pairs_hook=_unique_object,
+                parse_constant=_nonfinite,
+                parse_float=_finite_float,
+            )
         except (ValueError, TypeError):
             raise TaskRefusal("result_not_ready", 409) from None
         await operation_authorized(db, task, receipt["capability"], receipt["operation_digest"])
@@ -78,5 +84,12 @@ async def result_authorized(db, task):
                 "operation_digest"
             ] != operation_digest("resource_read", {"resource_id": result["id"]}, result["sha256"]):
                 raise TaskRefusal("result_not_ready", 409)
+        elif receipt["capability"] == "research":
+            try:
+                if research is None:
+                    raise ValueError
+                research.validate(result, receipt["operation_digest"])
+            except (ValueError, TypeError):
+                raise TaskRefusal("result_not_ready", 409) from None
         else:
             raise TaskRefusal("result_not_ready", 409)

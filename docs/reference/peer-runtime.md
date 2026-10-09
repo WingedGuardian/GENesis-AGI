@@ -37,7 +37,7 @@ Readiness loss leaves the HTTP objects bound but refuses new submissions.
 
 The host binds its registry, runtime owner, results and approvals into the
 existing peer blueprint. Authenticated health reports peer active-slot and
-pending-queue counts; the card advertises conversation only while execution is
+pending-queue counts; the card advertises conversation and installed research while execution is
 available. These objects are internal Flask configuration, not environment
 switches. No machine approval resolver is added.
 
@@ -49,6 +49,10 @@ Exceptions in peer teardown do not prevent unrelated runtime shutdown.
 Loss of the poller also fences active leases and cancels their running sessions;
 readiness refuses new work until host recovery. Awaited drain and reconciliation
 remain owned by runner cleanup and shutdown.
+
+The runtime installs [research](peer-research.md) before broker startup and owns
+the lazy search client. Client retirement follows successful coordinator drain,
+including a close task that remains pending beyond the shutdown grace.
 
 Operators enable a relationship through the local
 [peer registry CLI](peer-registry.md), configure distinct credentials without

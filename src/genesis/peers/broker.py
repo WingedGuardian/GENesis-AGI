@@ -72,8 +72,9 @@ class PeerBroker:
             "resources_list": (EmptyArguments, self._resources, "conversation"),
             "resource_read": (ResourceArguments, self._resource, "resource"),
         }
+        self._read_operations = set(self._operations)
 
-    def register_operation(self, name, capability, arguments, handler):
+    def register_operation(self, name, capability, arguments, handler, *, immutable_read=False):
         """Trusted startup extension, never callable through the facade."""
         validate_capability(capability)
         if (
@@ -82,9 +83,12 @@ class PeerBroker:
             or name in self._operations
             or not issubclass(arguments, EmptyArguments)
             or not callable(handler)
+            or type(immutable_read) is not bool
         ):
             raise ValueError("Invalid peer broker operation")
         self._operations[name] = (arguments, handler, capability)
+        if immutable_read:
+            self._read_operations.add(name)
 
     async def start(self, directory: Path):
         directory = Path(directory)
@@ -267,15 +271,24 @@ class PeerBroker:
             raise BrokerRefusal()
         if name == "task_context" and not json_strings_safe(json.loads(row["message_json"])):
             raise BrokerRefusal("operation_refused", 400)
+
+        async def invoke():
+            if capability == "research":
+                async with asyncio.timeout(
+                    min(20.0, max(0.0, lease.binding.segment.deadline_at - time.time()))
+                ):
+                    return await handler(row, latest, arguments)
+            return await handler(row, latest, arguments)
+
         if self.execute_operation is None:
-            result = await handler(row, latest, arguments)
+            result = await invoke()
         else:
             result = await self.execute_operation(
                 lease.binding,
                 capability,
                 digest,
-                lambda: handler(row, latest, arguments),
-                immutable_read=name in {"task_context", "resources_list", "resource_read"},
+                invoke,
+                immutable_read=name in self._read_operations,
             )
         if not json_strings_safe(result):
             raise BrokerRefusal("operation_refused", 400)

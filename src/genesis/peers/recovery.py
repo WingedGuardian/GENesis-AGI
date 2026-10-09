@@ -48,10 +48,14 @@ def recovery_elapsed(segment):
 
 
 class PeerRecovery:
-    def __init__(self, registry, directory):
+    def __init__(self, registry, directory, *, research=None, publication_tools=()):
+        if publication_tools and research is None:
+            raise ValueError("Research publication requires receipt validation")
         self.registry = registry
         self.state = PeerLifecycleState(registry, directory)
         self.artifacts = PeerArtifacts(registry, directory)
+        self.artifacts.research = research
+        self.publication_tools = tuple(publication_tools)
 
     async def run(self):
         """Union task disposition with segment drain; neither implies the other."""
@@ -165,10 +169,12 @@ class PeerRecovery:
             result = await self._recorded_result(dict(segment))
             if result is not None:
                 try:
+                    binding = recovered_binding(segment, self.state.directory)
                     await self.artifacts.publish(
-                        recovered_binding(segment, self.state.directory),
+                        binding,
                         segment["session_id"],
                         result,
+                        allowed_tools=binding.segment.tools + self.publication_tools,
                     )
                     return
                 except (TaskRefusal, ValueError, OSError):

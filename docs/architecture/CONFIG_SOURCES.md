@@ -288,3 +288,9 @@ Private scopes, artifacts and per-boot broker sockets live under
 Disabled mode still permits startup cleanup, but refuses new execution.
 Runtime pause also prevents admission and continuation. See
 [peer runtime](../reference/peer-runtime.md) for recovery and readiness.
+
+Peer research uses the existing server-configured `SEARXNG_URL`, `BRAVE_API_URL`
+and Brave credential through `WebSearcher`; peers cannot override these values.
+Its private search path adds bounded identity-only response reads and excludes
+queries from diagnostics. Public HTTPS fetch uses no configured proxy or TLS
+environment override. See [peer research](../reference/peer-research.md).

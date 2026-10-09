@@ -210,7 +210,7 @@ async def test_installed_http_owner_approval_resume_result(installed):
     health = await request(installed, "GET", "/health")
     assert health.status_code == 200 and health.json["task_service_ready"]
     card = await request(installed, "GET", "/.well-known/agent-card.json")
-    assert len(card.json["skills"]) == 1
+    assert {skill["id"] for skill in card.json["skills"]} == {"conversation", "research"}
     sent = await request(installed, "POST", "/message:send", json=task_message())
     assert sent.status_code == 200
     task_id = sent.json["task"]["id"]

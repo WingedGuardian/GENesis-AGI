@@ -1,0 +1,1 @@
+- Completed peer research results can recover after restart using their recorded provenance and current permissions, without granting historical sessions execution access.

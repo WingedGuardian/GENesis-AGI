@@ -53,7 +53,7 @@ dependencies = [
     "pydantic>=2.12,<3",  # strict validation for the decision registry (already pulled in by fastapi, litellm and mcp)
     "pyyaml",
     "a2a-sdk==1.2.2",
-    "httpx",
+    "httpx==0.28.1",
     "diskcache>=5.6",
     "beautifulsoup4",
     "html2text",

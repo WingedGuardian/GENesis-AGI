@@ -11,6 +11,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -108,6 +109,85 @@ async def call(s, name="task_context", arguments=None):
     )
 
 
+@pytest.mark.parametrize("unsafe", [False, True])
+async def test_cached_context_checks_original_message_without_rerunning(setup, monkeypatch, unsafe):
+    from genesis.peers.disclosure_scan import json_strings_safe
+    from genesis.security.sanitizer import ContentSanitizer, ContentSource
+
+    s = setup
+    text = 'token: "' + secrets.token_hex(16) + '"' if unsafe else "Public fixture"
+    message = {"messageId": "one", "role": "ROLE_USER", "parts": [{"text": text}]}
+    async with s.registry.transaction() as db:
+        await db.execute(
+            "UPDATE peer_tasks SET message_json=? WHERE id=?",
+            (json.dumps(message), s.binding.task_id),
+        )
+    cached = {
+        "task_id": s.binding.task_id,
+        "context": ContentSanitizer().wrap_content(json.dumps(message), ContentSource.UNKNOWN),
+    }
+    assert json_strings_safe(cached), "wrapped context alone cannot detect the original assignment"
+    executor = AsyncMock(return_value=cached)
+    s.broker.execute_operation = executor
+    schema, _, capability = s.broker._operations["task_context"]
+    handler = AsyncMock(side_effect=AssertionError("cache must not rerun handler"))
+    monkeypatch.setitem(s.broker._operations, "task_context", (schema, handler, capability))
+    response = await call(s)
+    assert response.status_code == (400 if unsafe else 200)
+    if unsafe:
+        executor.assert_not_awaited()
+        assert response.json() == {"code": "operation_refused"}
+    else:
+        executor.assert_awaited_once()
+        assert response.json() == cached
+    handler.assert_not_awaited()
+
+
+@pytest.mark.parametrize("unsafe", [False, True])
+async def test_cached_research_outcome_scanned_without_rerunning(setup, monkeypatch, unsafe):
+    from genesis.peers.research import PeerResearch
+
+    s = setup
+    PeerResearch(s.broker)
+    await s.registry.grant("fixture", "research", "allow")
+    async with s.registry.transaction() as db:
+        row = await (
+            await db.execute("SELECT grants_json FROM peer_tasks WHERE id=?", (s.binding.task_id,))
+        ).fetchone()
+        grants = json.loads(row[0]) | {"research": "allow"}
+        await db.execute(
+            "UPDATE peer_tasks SET grants_json=? WHERE id=?",
+            (json.dumps(grants), s.binding.task_id),
+        )
+    for lease in s.broker._leases.values():
+        lease.binding = replace(
+            lease.binding,
+            segment=replace(
+                lease.binding.segment,
+                tools=lease.binding.segment.tools + ("mcp__genesis_peer__research_search",),
+            ),
+        )
+    query = 'token: "' + secrets.token_hex(16) + '"' if unsafe else "Public query"
+    cached = {
+        "operation": "research_search",
+        "arguments": {"query": query, "max_results": 5},
+        "data": {"backend": "searxng", "results": [], "source": "external_untrusted"},
+    }
+    executor = AsyncMock(return_value=cached)
+    s.broker.execute_operation = executor
+    schema, _, capability = s.broker._operations["research_search"]
+    handler = AsyncMock(side_effect=AssertionError("cache must not rerun handler"))
+    monkeypatch.setitem(s.broker._operations, "research_search", (schema, handler, capability))
+    response = await call(s, "research_search", cached["arguments"])
+    assert response.status_code == (400 if unsafe else 200)
+    executor.assert_awaited_once()
+    handler.assert_not_awaited()
+    if unsafe:
+        assert response.json() == {"code": "operation_refused"}
+    else:
+        assert response.json() == cached
+
+
 async def test_trusted_executor_wraps_only_authorized_handler(setup):
     s = setup
     observed = []
@@ -178,7 +258,10 @@ async def test_real_stdio_and_uds_context_resource_pipeline(setup):
             "task_context",
             "resources_list",
             "resource_read",
+            "research_search",
+            "research_fetch",
         }
+        assert (await session.call_tool("research_fetch", {"url": "https://example.com"})).isError
         assert not (await session.call_tool("task_context", {})).isError
 
 
