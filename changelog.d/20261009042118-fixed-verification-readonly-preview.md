@@ -1,0 +1,1 @@
+- Verification previews now read the ledger without opening a writer, preserving committed WAL data while leaving real recording behavior unchanged.

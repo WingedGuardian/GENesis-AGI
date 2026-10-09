@@ -46,7 +46,7 @@ _SRC = _REPO / "src"
 
 # Spellings that count as consulting the fence. The module wrappers all funnel
 # into genesis.db.admission.database_is_fenced — one implementation.
-_FENCE_CALL_NAMES = {"database_is_fenced", "_db_is_fenced", "_db_fenced"}
+_FENCE_CALL_NAMES = {"database_is_fenced", "_db_is_fenced", "_db_fenced", "assert_admitted"}
 
 # Openers allowed WITHOUT a fence check, each with the reason stated.
 # Path is relative to scripts/. This gate fences the AUTOMATIC entry points
@@ -191,6 +191,23 @@ def test_provider_exception_does_not_exempt_another_opener(tmp_path, monkeypatch
     monkeypatch.setitem(globals(), "_ALLOWLIST", {})
     with pytest.raises(AssertionError, match="raw sqlite3.connect without"):
         test_every_scripts_opener_consults_the_admission_fence()
+
+
+@pytest.mark.parametrize("guarded", [True, False])
+def test_assert_admitted_is_a_fence_not_an_opener_exception(tmp_path, monkeypatch, guarded):
+    guard = "    assert_admitted(path)\n" if guarded else ""
+    (tmp_path / "reader.py").write_text(
+        "import aiosqlite\nasync def reader(path):\n"
+        + guard
+        + "    return await aiosqlite.connect(path)\n"
+    )
+    monkeypatch.setitem(globals(), "_SCRIPTS", tmp_path)
+    monkeypatch.setitem(globals(), "_ALLOWLIST", {})
+    if guarded:
+        test_every_scripts_opener_consults_the_admission_fence()
+    else:
+        with pytest.raises(AssertionError, match="without"):
+            test_every_scripts_opener_consults_the_admission_fence()
 
 
 def test_every_scripts_opener_consults_the_admission_fence():

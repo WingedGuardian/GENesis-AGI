@@ -176,9 +176,11 @@ async def test_owned_grandchild_cannot_keep_output_pipe_open(tmp_path, monkeypat
         created.append(proc)
         return proc
     monkeypatch.setattr(serving.asyncio, "create_subprocess_exec", spawn)
-    monkeypatch.setattr(serving, "COLLECTION_TIMEOUT", 0.3)
+    monkeypatch.setattr(serving, "COLLECTION_TIMEOUT", 2)
     marker = tmp_path / "owned-child.pid"
-    root = runtime(tmp_path, "/usr/bin/sleep 30 &\n" + "echo $! > " + shlex.quote(str(marker)) + "\nwait\n")
+    pending = marker.with_suffix(".pending")
+    root = runtime(tmp_path, "/usr/bin/sleep 30 &\n" + "echo $! > " + shlex.quote(str(pending))
+                   + "\n/bin/mv " + shlex.quote(str(pending)) + " " + shlex.quote(str(marker)) + "\nwait\n")
     task = asyncio.create_task(serving._capture(root, None))
     async with asyncio.timeout(2):
         while not marker.exists():
@@ -192,4 +194,8 @@ async def test_owned_grandchild_cannot_keep_output_pipe_open(tmp_path, monkeypat
     assert created[0].returncode < 0
     # A killed descendant can await init's reap as a zombie; it cannot hold pipes.
     status = Path(f"/proc/{child}/stat")
-    assert not status.exists() or status.read_text().split(") ", 1)[1].startswith("Z ")
+    try:
+        state = status.read_text()
+    except FileNotFoundError:
+        state = None  # Already reaped between process termination and this read.
+    assert state is None or state.split(") ", 1)[1].startswith("Z ")

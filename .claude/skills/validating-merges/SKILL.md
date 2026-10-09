@@ -87,7 +87,9 @@ python3 scripts/repo_pulse_worker.py --verification-log [--pr <N>]
 ```
 
 Two mechanics worth knowing before your first run. **`--dry-run` resolves the
-target and renders the record without writing** — use it, because a closed row
+target and renders the record through a read-only connection** — it reads committed
+WAL rows without opening a checkpoint-capable writer; SQLite can still coordinate
+shared-memory sidecars and locks. Use it, because a closed row
 cannot be amended through this tool. And **`genesis_db_path()` is repo-root
 relative**, so running the closer from a linked worktree points it at that
 worktree's non-existent `data/genesis.db`: run it from the main checkout or pass
