@@ -89,3 +89,77 @@ async def test_task_context_scans_original_message_before_wrapping():
         {"id": "fixture", "message_json": json.dumps(safe)}, {}, EmptyArguments()
     )
     assert result["task_id"] == "fixture" and "public fixture" in result["context"]
+
+
+@pytest.mark.parametrize("depth", [1, 2, 4])
+@pytest.mark.parametrize("placement", ["root", "value", "list"])
+def test_json_encoded_credentials_are_refused(depth, placement):
+    encoded = {"api_key": secrets.token_hex(20)}
+    for _ in range(depth):
+        encoded = json.dumps(encoded)
+    payload = {"root": encoded, "value": {"result": encoded}, "list": [encoded]}[placement]
+    verdict = json_strings_safe(payload)
+    assert not verdict
+
+
+def test_duplicate_json_keys_cannot_hide_earlier_credential():
+    encoded = '{"api_key":' + json.dumps(secrets.token_hex(20)) + ',"api_key":null}'
+    verdict = json_strings_safe(encoded)
+    assert not verdict
+
+
+def test_json_encoded_keys_keep_child_association():
+    encoded_key = json.dumps(json.dumps("api_key"))
+    verdict = json_strings_safe({encoded_key: secrets.token_hex(20)})
+    assert not verdict
+
+
+def test_decoded_json_retains_outer_key_association():
+    verdict = json_strings_safe({"api_key": json.dumps({"parts": [secrets.token_hex(20)]})})
+    assert not verdict
+
+
+@pytest.mark.parametrize("encoded", ['{"value": NaN}', '{"value": 1e999}', '[' + '9' * 5000 + ']'])
+def test_invalid_decoded_numbers_fail_closed(encoded):
+    assert not json_strings_safe(encoded)
+
+
+@pytest.mark.parametrize("payload", ['plain prose with {braces}', '{unfinished', '[ordinary text', '"unfinished'])
+def test_non_json_prose_remains_allowed(payload):
+    assert json_strings_safe(payload)
+
+
+def test_large_ordinary_operation_result_remains_allowed():
+    payload = {"output": "x" * (2 * 1024 * 1024 - 32)}
+    assert json_strings_safe(payload)
+
+
+def test_deep_encoded_input_refused_without_unbounded_work():
+    payload = "[" * 2000 + "0" + "]" * 2000
+    assert not json_strings_safe(payload)
+
+
+def test_list_siblings_do_not_inherit_each_others_key_ancestry():
+    assert json_strings_safe([{"api_key": {"parts": []}}, "ordinary public output" * 4])
+
+
+def test_shared_acyclic_container_is_not_mistaken_for_cycle():
+    shared = {"parts": ["ordinary output"]}
+    assert json_strings_safe([shared, shared])
+
+
+def test_aggregate_ancestor_scanning_work_is_bounded(monkeypatch):
+    import genesis.peers.disclosure_scan as disclosure
+
+    monkeypatch.setattr(disclosure, "scan_outbound", lambda _: type("Verdict", (), {"safe": True})())
+    value = "ordinary output" * 30000
+    for _ in range(200):
+        value = {"parts": value}
+    assert not json_strings_safe(value)
+
+
+def test_native_excessive_nesting_refused_before_json_encoding():
+    value = "ordinary output"
+    for _ in range(2000):
+        value = [value]
+    assert not json_strings_safe(value)

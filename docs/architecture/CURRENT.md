@@ -940,7 +940,9 @@ verified: 85652265ca1a 2026-10-09
   with continuation queueing and preserves it for the unchanged request across
   attempts. `peers/operation_state.py` separates operation outcomes from consent;
   receipt and broker context scans inspect original JSON keys/values and their
-  associations before serialization can hide existing disclosure patterns.
+  associations, including whole JSON encoded within strings with duplicate members
+  preserved. Disclosure work and traversal depth are bounded; pathological inputs
+  can refuse below the existing operation result size cap.
   Only exact immutable reads can retry unknown effects after confirmed drain.
   Claiming retires invalid, drained pending work transactionally while preserving
   durable holds and unresolved consequential effects. Attempted-task retirement

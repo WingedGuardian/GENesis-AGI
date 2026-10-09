@@ -40,8 +40,16 @@ full-result artifact storage, which arrives in a later slice.
 Original JSON string keys and values are scanned before serialization, including
 broker task context. Key/value associations also remain visible through nested
 containers so structured credentials cannot bypass assignment patterns. Existing
-size, JSON admissibility and authority constraints remain in place; escaping
-cannot conceal an existing sensitive-data pattern.
+size, JSON admissibility and authority constraints remain in place. Whole JSON
+objects, arrays and strings encoded within a string are also inspected, preserving
+all duplicate object members and original/decoded key associations. Invalid decoded
+numbers or excessive nesting refuse disclosure; ordinary non-JSON prose remains
+eligible for the existing scanner. The local check caps serialized data at 2 MiB,
+traversal at 1,024 frames, and aggregate parsing/scanning work at 64 MiB of character/visit work units,
+not a wall-clock limit. Pathological
+nested or repetitive inputs can therefore be refused below the serialized size cap.
+These checks apply to broker outcomes and operation receipts; they do not replace
+the separate raw published-resource scanner or parse JSON embedded in prose.
 The broker also scans every returned outcome before disclosure, including
 historical results replayed by later coordinator slices. Cached context checks
 the original task message as well as the serialized wrapper; completion remains
