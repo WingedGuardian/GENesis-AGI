@@ -50,7 +50,11 @@ async def execute(args: argparse.Namespace, registry: PeerRegistry) -> None:
 
         await PublishedResources(registry).retire(args.resource_id)
     elif action == "list":
-        print(json.dumps({"settings": await registry.settings(), "peers": await registry.rows()}))
+        peers = [
+            {key: value for key, value in row.items() if key != "daily_allowance"}
+            for row in await registry.rows()
+        ]
+        print(json.dumps({"settings": await registry.settings(), "peers": peers}))
 
 
 def _cmd(args: argparse.Namespace) -> int:
@@ -75,7 +79,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     owners = register.add_mutually_exclusive_group(required=True)
     owners.add_argument("--same-owner", dest="same_owner", action="store_true")
     owners.add_argument("--cross-owner", dest="same_owner", action="store_false")
-    register.add_argument("--daily-allowance", type=int, required=True)
+    register.add_argument(
+        "--daily-allowance",
+        type=int,
+        default=1,
+        help="Deprecated database compatibility value; does not impose a task quota",
+    )
     register.add_argument("--token-name")
     register.add_argument("--sam-realm")
     register.add_argument("--sam-node")
