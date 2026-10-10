@@ -64,7 +64,7 @@ def test_default_init_preserves_claude_processing_and_resets_external_policy(pen
 
 
 @pytest.mark.parametrize("external", [False, True])
-@pytest.mark.parametrize("profile", [None, "external", "validator"])
+@pytest.mark.parametrize("profile", [None, "external", "validator", "interactive"])
 async def test_standalone_bootstrap_passes_policy_to_memory_init(
     monkeypatch, tmp_path, external, profile,
 ):
@@ -102,6 +102,7 @@ async def test_standalone_bootstrap_passes_policy_to_memory_init(
 def test_standalone_entrypoint_selects_external_policy(monkeypatch, tmp_path, external, server_name):
     import scripts.genesis_mcp_server as server
 
+    monkeypatch.setattr("genesis.routing.standalone._external_secret_blocked_keys", None)
     monkeypatch.setattr("genesis.env.secrets_path", lambda: tmp_path / "absent")
     monkeypatch.setattr(server, "is_genesis_enabled", lambda: True)
     # Record and restore this process-global setting; main() calls setdefault.

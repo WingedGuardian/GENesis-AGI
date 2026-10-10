@@ -8,6 +8,7 @@ like a Claude Code or Genesis-dispatched session.
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
@@ -90,12 +91,19 @@ def launcher_path() -> Path:
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = list(sys.argv[1:] if argv is None else argv)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("--profile", choices=["external", "validator", "interactive"], action="append")
+    selection, args = parser.parse_known_args(sys.argv[1:] if argv is None else argv)
+    if selection.profile and len(selection.profile) != 1:
+        parser.error("--profile must be supplied at most once")
+    if any(arg == "--external-client" or arg.startswith("--external-client=") for arg in args):
+        parser.error("select the external client role with --profile")
+    role = selection.profile[0] if selection.profile else "external"
     launcher = launcher_path()
     if not launcher.is_file():
         raise SystemExit(f"Genesis MCP launcher not found: {launcher}")
     os.execve(  # noqa: S606
-        str(launcher), [str(launcher), "--external-client", *args], sanitized_environment(),
+        str(launcher), [str(launcher), "--external-client", role, *args], sanitized_environment(),
     )
 
 

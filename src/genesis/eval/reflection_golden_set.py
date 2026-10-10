@@ -48,6 +48,15 @@ def _ensure_secrets() -> None:
 
     import os
 
+    from genesis.routing.standalone import load_external_secrets
+
+    if load_external_secrets():
+        for key, target in _GENESIS_TO_LITELLM.items():
+            value = os.environ.get(key)
+            if value:
+                os.environ.setdefault(target, value)
+        return
+
     secrets_path = Path.home() / "genesis" / "secrets.env"
     if not secrets_path.exists():
         return

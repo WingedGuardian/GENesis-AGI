@@ -12,6 +12,8 @@ rt._router is already set, create_standalone_router() is a no-op.
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from genesis.routing.types import BudgetStatus
@@ -20,6 +22,41 @@ if TYPE_CHECKING:
     from genesis.routing.router import Router
 
 logger = logging.getLogger(__name__)
+_external_secret_blocked_keys: frozenset[str] | None = None
+
+
+def configure_external_secret_loading(blocked_keys: frozenset[str]) -> None:
+    """Set startup/lazy-retry policy once for this external MCP process."""
+    global _external_secret_blocked_keys
+    _external_secret_blocked_keys = blocked_keys
+
+
+def _load_standalone_secrets(path: Path) -> None:
+    """External launch targets win; ordinary clients retain dotenv overrides."""
+    from dotenv import load_dotenv
+    from dotenv.main import DotEnv
+
+    if _external_secret_blocked_keys is None:
+        load_dotenv(str(path), override=True)
+    else:
+        # dotenv_values hardcodes override=True during interpolation, which
+        # would derive new targets/keys from file values we deliberately retain
+        # from the environment. Use the same precedence for expansion and load.
+        for key, value in DotEnv(path, override=False).dict().items():
+            if key not in _external_secret_blocked_keys and value is not None:
+                os.environ.setdefault(key, value)
+
+
+def load_external_secrets() -> bool:
+    """Load the selected external file; return False for ordinary callers."""
+    if _external_secret_blocked_keys is None:
+        return False
+    from genesis.env import secrets_path
+
+    path = secrets_path()
+    if path.is_file():
+        _load_standalone_secrets(path)
+    return True
 
 
 class NullCostTracker:
@@ -54,14 +91,13 @@ def _build_standalone_router() -> Router | None:
     bus / dead-letter). Returns the ``Router``, or ``None`` if construction
     fails (missing config/secrets) — never raises.
 
-    Touches NO global state. Callers wanting the process-wide singleton use
+    Loads provider environment, but does not set the runtime singleton. Callers
+    wanting the process-wide singleton use
     ``create_standalone_router()``; callers that just need a router instance
     (e.g. the offline attention runner's ``--l15`` path) call this directly and
     own the returned object.
     """
     try:
-        from dotenv import load_dotenv
-
         from genesis.env import repo_root, secrets_path
         from genesis.routing.circuit_breaker import CircuitBreakerRegistry
         from genesis.routing.config import load_config
@@ -72,7 +108,7 @@ def _build_standalone_router() -> Router | None:
         # 1. Load API keys into environment
         sp = secrets_path()
         if sp.is_file():
-            load_dotenv(str(sp), override=True)
+            _load_standalone_secrets(sp)
 
         # 2. Load routing config
         config_path = repo_root() / "config" / "model_routing.yaml"
