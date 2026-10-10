@@ -15,17 +15,32 @@ state through the main checkout rather than creating worktree-local state.
 Codex defers MCP schemas until requested. Before calling a Genesis tool that is
 not already visible, use MCP tool discovery for its exact `server.tool` name.
 
-The initial Codex surface provides approved health and recall tools only. It
-does not expose persistent memory writes, task dispatch, browser control,
-outreach, Discord, recon, campaign management, or session controls. Do not
-work around this allowlist; expanding it needs a separate capability review.
+The committed Codex configuration currently selects the health and recall floor.
+The launcher also supports the reviewed, opt-in `--profile interactive` role:
+34 memory and 84 health tools, including directed memory writes and existing
+browser, queue, campaign, settings and cognitive tools. `document_delete` and
+nine health tools remain deferred; future tool names require capability review.
+See `docs/reference/codex-interactive-mcp.md` for scope and qualification limits.
 
 The standalone launcher enforces `--external-client` on the server as well as
 the client allowlist. Both the `external` default and explicit `validator`
 profile currently expose the same health and recall floor. Direct calls to
 other tools are rejected before their bodies run; the health bootstrap also
-skips dispatch queue and campaign initialization. These tool profiles are not
+skips dispatch queue and campaign initialization. The interactive role reuses
+ordinary health initialization without starting a worker or executor. Startup
+and lazy router retries cannot restore scrubbed session markers from secrets.env,
+and explicit environment values win over file values for external clients.
+These tool profiles are not
 authentication or isolation from an operator with full host access.
+
+Tool availability does not grant permission to publish, pay providers, dispatch
+work, change settings, or modify private records. Apply the existing Genesis
+rules and the user's explicit request. Memory writes use existing storage and
+retrieval semantics: an ID can name durable SQLite/FTS content while vector
+indexing is pending. Verify the appropriate fresh reader before claiming success.
+Do not assume a failed or cancelled mutation rolled back, or automatically retry
+an ambiguous remote operation. Credential references retain existing explicit
+lookup auditing and recall behavior; this role adds no credential partition.
 
 Do not pass a Codex thread or session identifier to `session_charter`,
 `session_ledger_*`, or other session-bound tools. Those tools operate only on an

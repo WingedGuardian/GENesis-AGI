@@ -55,10 +55,10 @@ _DEFAULT_PORTS = {
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Genesis MCP Server (standalone)")
+    parser = argparse.ArgumentParser(description="Genesis MCP Server (standalone)", allow_abbrev=False)
     parser.add_argument(
         "--external-client",
-        nargs="?", const="external", choices=["external", "validator"],
+        nargs="?", const="external", choices=["external", "validator", "interactive"],
         help="Enforce an external tool profile and disable Claude bookmark processing",
     )
     parser.add_argument(
@@ -213,7 +213,7 @@ def _bootstrap_health(transport_kwargs: dict, *, external_profile: str | None = 
         db = await get_db(_DEFAULT_DB, foreign_keys=False)
         try:
 
-            if external_profile is None:
+            if external_profile in (None, "interactive"):
                 _init_standalone_health_router()
 
             svc = StandaloneHealthDataService(
@@ -224,7 +224,7 @@ def _bootstrap_health(transport_kwargs: dict, *, external_profile: str | None = 
             tracker.set_db(db)
             init_health_mcp(svc, activity_tracker=tracker)
 
-            if external_profile is None:
+            if external_profile in (None, "interactive"):
                 await _init_standalone_health_actions(db)
 
             clear_mcp_crash("health")
@@ -671,14 +671,13 @@ def _bearer_auth_middleware(expected_token: str):
     return Middleware(_AuthGuard)
 
 
-def main(argv: list[str] | None = None) -> None:
-    args = parse_args(argv)
+def _load_mcp_environment(external_profile: str | None) -> None:
+    """Load standalone secrets with external identity and target precedence."""
+    if external_profile:
+        from genesis.mcp.external_profiles import EXTERNAL_SECRET_BLOCKED_KEYS
+        from genesis.routing.standalone import configure_external_secret_loading
 
-    logging.basicConfig(
-        level=logging.WARNING,
-        format="%(name)s %(levelname)s: %(message)s",
-        stream=sys.stderr,  # MCP uses stdout for protocol; logs go to stderr
-    )
+        configure_external_secret_loading(EXTERNAL_SECRET_BLOCKED_KEYS)
 
     # Load infrastructure URLs and provider API keys from secrets.env.
     # MCP servers need these to reach Ollama, Qdrant, and embedding APIs.
@@ -730,12 +729,28 @@ def main(argv: list[str] | None = None) -> None:
     from genesis.env import secrets_path
 
     secrets = secrets_path()
-    if secrets.exists():
+    if secrets.exists() and external_profile:
+        from genesis.routing.standalone import _load_standalone_secrets
+
+        _load_standalone_secrets(secrets)
+    elif secrets.exists():
         from dotenv import dotenv_values
 
         for key, value in dotenv_values(secrets).items():
             if key in _MCP_VARS and key not in os.environ and value:
                 os.environ[key] = value
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(name)s %(levelname)s: %(message)s",
+        stream=sys.stderr,  # MCP uses stdout for protocol; logs go to stderr
+    )
+
+    _load_mcp_environment(args.external_client)
+    import os
 
     # MCP children wait LONGER for the WAL writer slot than the server's 5s
     # default (WS-1 PR-1, follow-up 2d88740d): N child processes race ONE

@@ -30,9 +30,10 @@ lives in, never the CWD. Gitignored; seeded from `secrets.env.example`.
 | `genesis-server` (systemd) | `EnvironmentFile=<repo>/secrets.env` in `scripts/systemd/genesis-server.service.template` **and** `load_dotenv(..., override=True)` in `src/genesis/runtime/init/secrets.py` during bootstrap (runs after the credential-integrity self-heal step, before DB init/migrations) | **file wins** |
 | `agent-zero` unit | `EnvironmentFile=` in its template | file (systemd) |
 | `genesis-bridge` (legacy fallback) | no `EnvironmentFile=`; runtime `load_dotenv(override=True)` | file wins |
-| MCP children (`scripts/genesis_mcp_server.py`) | `main()` copies an **allowlist** (`_MCP_VARS`) and only for keys NOT already in the env; then the health/memory/outreach/recon lifespans call `create_standalone_router()`, whose builder runs `load_dotenv(override=True)` on the **whole** file (`src/genesis/routing/standalone.py`) | net effect: **file wins, whole file** (discord-bot: allowlist only) — EXCEPT values read at module import, before either load: the database path (`_DEFAULT_DB` via `genesis_db_path()`) is fixed then, so a `GENESIS_DB_PATH` that exists only in `secrets.env` never reaches the MCP servers of a foreground session (an MCP child of a server-dispatched session inherits it from the server's environment) |
+| Ordinary MCP children (`scripts/genesis_mcp_server.py`) | `main()` delegates to `_load_mcp_environment()`, which copies an **allowlist** (`_MCP_VARS`) and only for keys NOT already in the env; then the health/memory/outreach/recon lifespans call `create_standalone_router()`, whose builder runs `load_dotenv(override=True)` on the **whole** file (`src/genesis/routing/standalone.py`) | net effect: **file wins, whole file** (discord-bot: allowlist only) — EXCEPT values read at module import, before either load: the database path (`_DEFAULT_DB` via `genesis_db_path()`) is fixed then, so a `GENESIS_DB_PATH` that exists only in `secrets.env` never reaches the MCP servers of a foreground session (an MCP child of a server-dispatched session inherits it from the server's environment) |
 | Dispatched CC sessions | `CCInvoker._build_env` (`src/genesis/cc/invoker.py`) copies the server's `os.environ` | inherit the server's snapshot |
 | CC hooks (`proactive_memory_hook.py`, `genesis_session_context.py`, `genesis_urgent_alerts.py`) | `load_dotenv(<main checkout>/secrets.env)`, default `override=False`; path hardcoded, ignores `SECRETS_PATH` | **inherited env wins** |
+| External health/memory MCP (`--external-client external`, `validator`, or `interactive`) | `_load_mcp_environment()` selects a process-local policy; initial, lazy routing and shared experiment/evolution/skill-replay loads use the selected `secrets_path()` and environment-aware dotenv interpolation | **inherited env wins**, including empty values; eight scrubbed session markers and `GENESIS_REPO_ROOT` are never imported from the file. Ordinary MCP loading above is unchanged; import-time database selection still requires setting child targets before spawn. |
 | One-off scripts (`reindex_fts_to_qdrant`, `backfill_session_memories`, `migrate_reference_data`, `mine_references_from_history`, `eval` CLI) | `load_dotenv(override=True)` | file wins |
 | `wing_backfill`, `wing_payload_resync`, `ambient_replay` | `load_dotenv(...)`, default | inherited env wins |
 | Shell (`backup.sh`, `restore.sh`) | `scripts/lib/load_secrets.sh` — literal, never expanded or executed | exported |
@@ -247,10 +248,13 @@ names, so an overlay of a read-only file is editable (#2446).
    for `model_routing` and `outreach` is not necessarily what the runtime loads.
 5. **`GENESIS_HOME` does not move config.** `genesis.yaml`, the overlay user dir, and the
    settings writer all use `Path.home()/.genesis/config`.
-6. **The health, memory, outreach and recon MCP children get the whole file.** Their
+6. **Ordinary health, memory, outreach and recon MCP children get the whole file.** Their
    `_MCP_VARS` allowlist in `scripts/genesis_mcp_server.py` is superseded by the
    standalone router's full `override=True` load, so a value the parent put in the
-   child's env is overwritten by any same-named key in `secrets.env`. The discord-bot
+   child's env is overwritten by any same-named key in `secrets.env`. External
+   health/memory profiles instead preserve existing values and exclude scrubbed
+   identity/runtime-root keys, including on lazy experiment routing loads.
+   The discord-bot
    child never builds that router and keeps the allowlist, and neither does the
    health child when its database is missing: that degraded path returns before the
    router is built, so file-only keys are absent there.

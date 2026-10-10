@@ -3311,7 +3311,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 1109d1844 2026-10-08
+verified: 85652265c 2026-10-09
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -3359,11 +3359,19 @@ verified: 1109d1844 2026-10-08
   recall tools. The launcher also selects `--external-client`; memory initialization
   then disables processing of Claude's pending plan-bookmark file. Ordinary
   Genesis memory initialization keeps that processing enabled by default.
-  The standalone server enforces the `external` or `validator` tool profile
-  during discovery and direct calls. Both currently admit the same health/recall
-  floor; other tool bodies cannot be entered through those MCP processes.
-  External health initialization skips the LLM router, dispatch queue setup,
-  and campaign wiring. Profiles constrain tools, not an operator's host access.
+  The standalone server enforces closed `external`, `validator` and `interactive`
+  profiles during discovery and direct calls. The first two retain the same
+  health/recall floor and skip health router, dispatch queue and campaign setup.
+  Opt-in `--profile interactive` admits 34 memory and 84 health tools and reuses
+  ordinary health setup without starting a worker. The committed project
+  configuration still selects the floor; connection activation is separate.
+  External startup and lazy routing share a secret-loading policy: no restoration
+  of eight session markers or GENESIS_REPO_ROOT, and existing environment values
+  win over file values. Ordinary standalone dotenv overrides are unchanged.
+  The shared experiment/evolution/skill-replay secret loader follows the same
+  external policy and preserves ordinary eval loading/key remapping.
+  Profiles constrain tools, not an operator's host access or per-action permission.
+  See `docs/reference/codex-interactive-mcp.md` for deferred tools and scope.
   In a linked worktree the launcher sets `GENESIS_REPO_ROOT` to
   the main checkout, which owns the live database and secrets. This gives Codex
   on-demand access without registering its transcript,
