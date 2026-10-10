@@ -247,3 +247,80 @@ def test_a_non_utf8_comm_keeps_the_pid(fake_proc: Path) -> None:
     got = proc_io.read_proc_io(9)
     assert got is not None and got["total_bytes"] == 30
     assert got["comm"].startswith("odd") and "\ufffd" in got["comm"]
+
+
+# ── round-2 review: a pid reused within the interval ────────────────────────
+
+
+def _starttime(root: Path, pid: int, starttime: int, comm: str = "worker") -> None:
+    """A /proc/<pid>/stat whose field 22 is ``starttime`` (fields 3..21 filler)."""
+    filler = " ".join(["0"] * 18)  # fields 4..21
+    (root / str(pid) / "stat").write_text(f"{pid} ({comm}) S {filler} {starttime} 0 0\n")
+
+
+def test_a_pid_reused_mid_sample_is_two_processes_not_one_delta(
+    fake_proc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pid whose process exited and was reused within the interval must not be
+    rated as the new process's counters minus the old one's."""
+    _proc(fake_proc, 5, read=0, write=2_000_000, comm="old")
+    _starttime(fake_proc, 5, 1000)
+
+    def _sleep(_s: float) -> None:
+        # pid 5 exits; a new process takes pid 5 and writes 3 MB.
+        _proc(fake_proc, 5, read=0, write=3_000_000, comm="new")
+        _starttime(fake_proc, 5, 2000)
+
+    monkeypatch.setattr(proc_io.time, "sleep", _sleep)
+    rates, readable, total, churn = proc_io.rank_by_io_rate(
+        [5], top_n=5, sample_interval_s=1.0
+    )
+    assert churn == {"exited": 1, "started": 1}
+    assert readable == 1
+    # Measured from zero: 3 MB, never the cross-generation 3 MB - 2 MB = 1 MB.
+    assert rates[0]["comm"] == "new"
+    assert rates[0]["write_rate"] == 3_000_000.0
+    assert total == 3_000_000.0
+
+
+def test_the_same_starttime_is_an_ordinary_delta(
+    fake_proc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _proc(fake_proc, 5, read=0, write=2_000_000)
+    _starttime(fake_proc, 5, 1000)
+
+    def _sleep(_s: float) -> None:
+        _proc(fake_proc, 5, read=0, write=3_000_000)
+        _starttime(fake_proc, 5, 1000)
+
+    monkeypatch.setattr(proc_io.time, "sleep", _sleep)
+    rates, _r, total, churn = proc_io.rank_by_io_rate([5], sample_interval_s=1.0)
+    assert churn == {"exited": 0, "started": 0}
+    assert rates[0]["write_rate"] == 1_000_000.0
+    assert total == 1_000_000.0
+
+
+def test_a_starttime_readable_at_one_sample_only_is_not_ranked(
+    fake_proc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Identity unknown: neither a delta nor a from-zero measure is trustworthy."""
+    _proc(fake_proc, 5, read=0, write=2_000_000)
+    _starttime(fake_proc, 5, 1000)
+
+    def _sleep(_s: float) -> None:
+        _proc(fake_proc, 5, read=0, write=3_000_000)
+        (fake_proc / "5" / "stat").unlink()
+
+    monkeypatch.setattr(proc_io.time, "sleep", _sleep)
+    rates, readable, total, churn = proc_io.rank_by_io_rate([5], sample_interval_s=1.0)
+    assert (rates, readable, total) == ([], 1, 0.0)
+    assert churn == {"exited": 1, "started": 0}
+
+
+def test_read_starttime_handles_a_comm_with_spaces_and_parens(fake_proc: Path) -> None:
+    _proc(fake_proc, 30, read=0, write=0)
+    _starttime(fake_proc, 30, 123456, comm="odd ) (name) x 99")
+    assert proc_io.read_starttime(30) == 123456
+    (fake_proc / "30" / "stat").write_text("30 (short) S 1 2\n")
+    assert proc_io.read_starttime(30) is None  # truncated stat
+    assert proc_io.read_starttime(31) is None  # gone

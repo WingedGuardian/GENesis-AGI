@@ -64,6 +64,20 @@ def read_proc_io(pid: int) -> dict | None:
         return None
 
 
+def read_starttime(pid: int) -> int | None:
+    """The pid's start time (field 22 of ``/proc/<pid>/stat``, in clock ticks), or None.
+
+    A pid number is reused once its process exits; ``(pid, starttime)`` names one
+    process. ``comm`` (field 2) may hold spaces and ``)``, so fields are counted
+    from after the LAST ``)``: there field 3 is index 0, and field 22 index 19.
+    """
+    try:
+        stat = (Path(_PROC) / str(pid) / "stat").read_text()
+        return int(stat[stat.rindex(")") + 2 :].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def rank_by_io_rate(
     pids: list[int],
     top_n: int = 5,
@@ -88,18 +102,31 @@ def rank_by_io_rate(
         presented as "no I/O";
       - ``started``: with ``pid_source`` (re-listed after the interval), a pid
         absent from ``pids`` is measured from zero, since all its I/O happened
-        within the interval.
+        within the interval;
+      - a pid REUSED within the interval: the two samples are matched by
+        ``(pid, starttime)``, never by pid number alone, so a delta is never
+        taken between two different processes. A changed start time counts the
+        first process ``exited`` and the second ``started`` (measured from zero,
+        as above). When the start time is readable at one sample and not the
+        other, identity is unknown: the pid counts as ``exited`` and is not
+        ranked, since neither a delta nor a from-zero measure is trustworthy and
+        the Guardian acts on this ranking. Unreadable at both is treated as the
+        same process (``stat`` is world-readable, so that is a gone or fake pid).
     A rate divides by the time between that pid's two reads, measured, since a
     sleep under heavy I/O pressure overruns its request. ``time.sleep`` never
     returns early (PEP 475 retries it after a signal), so the measured time is
     never below the request; the ``max`` only keeps a stubbed sleep meaningful.
     """
     churn = {"exited": 0, "started": 0}
-    t0: dict[int, tuple[dict, float]] = {}
+    t0: dict[int, tuple[dict, float, int | None]] = {}
     for pid in pids:
+        # Start time BEFORE the counters here (after them at the second read):
+        # a pid reused between the two reads then shows as a changed start time
+        # instead of pairing one process's counters with the next one's identity.
+        started_at = read_starttime(pid)
         data = read_proc_io(pid)
         if data:
-            t0[pid] = (data, time.monotonic())
+            t0[pid] = (data, time.monotonic(), started_at)
 
     if not t0 and pid_source is None:
         return [], 0, 0.0, churn
@@ -122,12 +149,19 @@ def rank_by_io_rate(
         }
 
     rates: list[dict] = []
-    for pid, (before, read_at) in t0.items():
+    for pid, (before, read_at, started_at) in t0.items():
         after = read_proc_io(pid)
         if after is None:
             churn["exited"] += 1  # its I/O in the interval is unreadable, not zero
             continue
-        rates.append(_rate(pid, after, before, read_at))
+        now_started_at = read_starttime(pid)
+        if now_started_at == started_at:
+            rates.append(_rate(pid, after, before, read_at))
+            continue
+        churn["exited"] += 1  # the first process is gone; its pid was reused
+        if started_at is not None and now_started_at is not None:
+            churn["started"] += 1  # a new process, all of its I/O within the interval
+            rates.append(_rate(pid, after, None, begun))
     if pid_source is not None:
         known = set(pids)
         for pid in pid_source():
