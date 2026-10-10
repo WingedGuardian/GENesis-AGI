@@ -30,20 +30,72 @@ echo "=== Genesis Bootstrap ==="
 echo "Genesis root: $GENESIS_ROOT"
 echo
 
-# ── Live-system guard — BEFORE anything mutating (incl. the crash-recovery
-# block below, whose git reset --hard is also unsafe on a live system).
+# ── Live-system guard — BEFORE anything mutating, including crash recovery.
 # update.sh opts out via GENESIS_BOOTSTRAP_ALLOW_LIVE=1; humans use --force.
 # shellcheck source=lib/live_system_guard.sh
 . "$SCRIPT_DIR/lib/live_system_guard.sh"
 bootstrap_refuse_if_server_live "$@" || exit 3
 
-# ── Crash recovery: check for interrupted update ─────────
+# shellcheck source=lib/deploy_marker.sh
+. "$SCRIPT_DIR/lib/deploy_marker.sh"
+# shellcheck source=lib/deploy_checkout.sh
+. "$SCRIPT_DIR/lib/deploy_checkout.sh"
+# shellcheck source=lib/deploy_recovery.sh
+. "$SCRIPT_DIR/lib/deploy_recovery.sh"
+
+# BEGIN crash-recovery
 UPDATE_STATE="$HOME/.genesis/update_state.json"
+_crash_recovery_refuse() {
+    local _reason="$1" _current_branch _current_head
+    _current_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+    _current_head="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null || true)"
+    echo "  REFUSE: $_reason." >&2
+    echo "  Current branch/HEAD: ${_current_branch:-<detached>} @ ${_current_head:-<unreadable>}; rollback tag: ${ROLLBACK_TAG:-<missing>} @ ${rb_commit:-<unresolved>}." >&2
+    echo "  Resolve the checkout, then re-run scripts/bootstrap.sh; or finish forward with scripts/update.sh --post-merge; or remove ~/.genesis/update_state.json once decided." >&2
+    exit 1
+}
+
 if [ -f "$UPDATE_STATE" ]; then
     echo "--- Detected interrupted update state file ---"
-    # Read phase and PID from state file
-    STATE_PHASE=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('phase','unknown'))" 2>/dev/null || echo "unknown")
-    STATE_PID=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('pid',0))" 2>/dev/null || echo "0")
+    ROLLBACK_TAG=""
+    rb_commit=""
+    if ! _state_fields="$(python3 - "$UPDATE_STATE" 2>/dev/null <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        state = json.load(f)
+    if not isinstance(state, dict):
+        raise ValueError("state is not an object")
+    def text_field(key, default=""):
+        value = state.get(key, default)
+        if not isinstance(value, str):
+            raise ValueError(f"{key} is not a string")
+        return value
+    pid = state.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        raise ValueError("pid is not an integer")
+    fields = [
+        text_field("phase", "unknown"),
+        str(pid),
+        text_field("rollback_tag"),
+        text_field("original_branch"),
+        text_field("own_head"),
+        text_field("deploy_head"),
+        "1" if "original_branch" in state else "0",
+    ]
+    if any(ord(char) < 0x20 for value in fields for char in value):
+        raise ValueError("control character in state field")
+    print("\x1f".join(fields))
+except Exception:
+    sys.exit(1)
+PY
+)"; then
+        _crash_recovery_refuse "update state is unreadable"
+    fi
+    IFS=$'\x1f' read -r STATE_PHASE STATE_PID ROLLBACK_TAG ORIGINAL_BRANCH OWN_HEAD DEPLOY_HEAD ORIGINAL_BRANCH_PRESENT \
+        <<< "$_state_fields"
 
     # Check if the update process is still alive. Bare `kill -0` ON PURPOSE, unlike
     # the marker readers (lib/deploy_marker.sh, genesis.env), which also reject a
@@ -56,23 +108,116 @@ if [ -f "$UPDATE_STATE" ]; then
         rm -f "$UPDATE_STATE"
     else
         echo "  Update CRASHED in phase '$STATE_PHASE' (pid $STATE_PID is dead)."
+        if [ -z "$ROLLBACK_TAG" ] || ! git -C "$GENESIS_ROOT" check-ref-format "refs/tags/$ROLLBACK_TAG" >/dev/null 2>&1; then
+            _crash_recovery_refuse "no valid rollback tag is recorded"
+        fi
+        rb_commit="$(git -C "$GENESIS_ROOT" rev-parse -q --verify "refs/tags/$ROLLBACK_TAG^{commit}" 2>/dev/null)" \
+            || _crash_recovery_refuse "rollback tag $ROLLBACK_TAG cannot be resolved to a commit"
 
-        # Abort any in-progress merge
-        if [ -f "$GENESIS_ROOT/.git/MERGE_HEAD" ]; then
-            echo "  Aborting in-progress merge..."
-            git -C "$GENESIS_ROOT" merge --abort 2>/dev/null || true
+        current_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+        if [ "$ORIGINAL_BRANCH_PRESENT" = "1" ]; then
+            [ -n "$ORIGINAL_BRANCH" ] || _crash_recovery_refuse "the recorded original branch is empty"
+            recovery_branch="$ORIGINAL_BRANCH"
+        else
+            recovery_branch="$current_branch"
         fi
 
-        # Read rollback tag from state file
-        ROLLBACK_TAG=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('rollback_tag',''))" 2>/dev/null || echo "")
+        # update.sh aborts its own conflicted merges before exiting, so a
+        # remaining MERGE_HEAD means a kill mid-merge or an external merge.
+        # Aborting can discard subsequent work; leave that decision to the operator.
+        recovery_git_dir="$(git -C "$GENESIS_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" \
+            || _crash_recovery_refuse "cannot read the git directory"
+        if [ -e "$recovery_git_dir/MERGE_HEAD" ]; then
+            _crash_recovery_refuse "a merge is in progress; save any edits you want to keep, run git -C \"$GENESIS_ROOT\" merge --abort yourself, then re-run scripts/bootstrap.sh"
+        fi
 
-        if [ -n "$ROLLBACK_TAG" ] && git -C "$GENESIS_ROOT" rev-parse "$ROLLBACK_TAG" >/dev/null 2>&1; then
-            echo "  Rolling back to $ROLLBACK_TAG..."
-            git -C "$GENESIS_ROOT" reset --hard "$ROLLBACK_TAG" 2>&1 || true
-            echo "  Rollback complete."
+        # The state does not say whether migrations ran or which database
+        # snapshot matches, so neither a code rollback nor clearing the state is
+        # safe once the update reached them. This comes before the "already at
+        # the tag" branch: a no-delta update still runs activation when tier-2
+        # work is pending, so it reaches these phases with HEAD at the tag.
+        case "$STATE_PHASE" in
+            migrations|health_check)
+                _crash_recovery_refuse "the update died in phase '$STATE_PHASE', after its database migrations may have run; the code was left in place with the database it may have migrated (restore data/genesis.db.pre-update by hand only together with the old code)"
+                ;;
+            fetching|merging|bootstrap) ;;
+            *)
+                # update.sh writes only the phases above (and done, handled
+                # earlier); anything else is a hand edit or another version.
+                _crash_recovery_refuse "unknown update phase '$STATE_PHASE'"
+                ;;
+        esac
+
+        if genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$recovery_branch"; then
+            # In the merging phase, a dirty checkout at the tag is what a
+            # fast-forward killed mid-write leaves: HEAD unmoved, files half
+            # new. update.sh treats that state as CRITICAL; installing over it
+            # would run half-written code, so refuse and keep the state file.
+            # Every tracked path counts here, the ephemeral allowlist included:
+            # the merge writes those too, and the deployability predicate below
+            # skips them. git status cannot see a file whose index entry is
+            # flagged skip-worktree or assume-unchanged, so the lib's hidden-edit
+            # scan runs as well.
+            if [ "$STATE_PHASE" = "merging" ]; then
+                merge_dirty="" merge_hidden=""
+                if ! merge_dirty="$(git -C "$GENESIS_ROOT" status --porcelain --untracked-files=no --no-renames 2>/dev/null)"; then
+                    merge_dirty="(status unreadable)"
+                fi
+                if ! merge_hidden="$(_genesis_hidden_dirty_lines "$GENESIS_ROOT" 2>/dev/null)"; then
+                    merge_hidden="(flagged-entry status unreadable)"
+                fi
+                # A fast-forward killed after writing only the files the range
+                # ADDS leaves them untracked, which status cannot show. update.sh's
+                # pre-stop scan refuses a range that lands on an existing
+                # untracked path, so one present now appeared during the run.
+                merge_new=""
+                if [ -n "$DEPLOY_HEAD" ]; then
+                    collide_rc=0
+                    merge_new="$(genesis_range_collisions "$GENESIS_ROOT" "$rb_commit" "$DEPLOY_HEAD" 2>/dev/null)" \
+                        || collide_rc=$?
+                    if [ "$collide_rc" -eq 2 ]; then
+                        merge_new="(the update's incoming range cannot be listed)"
+                    fi
+                fi
+                merge_dirty="$(printf '%s\n%s\n%s\n' "$merge_dirty" "$merge_hidden" "$merge_new" | grep -v '^$' || true)"
+                if [ -n "$merge_dirty" ]; then
+                    printf '%s\n' "$merge_dirty" | sed 's/^/    /'
+                    _crash_recovery_refuse "the checkout is at $ROLLBACK_TAG but tracked files changed during the merge (a half-written update or edits by someone else)"
+                fi
+            fi
+            dirty_paths=""
+            if ! dirty_paths="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")"; then
+                dirty_paths="(status unreadable)"
+            fi
+            if [ -n "$dirty_paths" ]; then
+                echo "  WARNING: tracked paths may be an interrupted merge's files or someone's edits; nothing was reset:"
+                printf '%s\n' "$dirty_paths" | sed 's/^/    /'
+            fi
+            echo "  The checkout is already at $ROLLBACK_TAG on $recovery_branch; nothing to undo."
+        elif [ "$ORIGINAL_BRANCH_PRESENT" != "1" ]; then
+            _crash_recovery_refuse "old-format update state and the checkout has moved from its rollback tag"
         else
-            echo "  No rollback tag found — resetting to HEAD."
-            git -C "$GENESIS_ROOT" reset --hard HEAD 2>&1 || true
+            case "$STATE_PHASE" in
+                merging) ;;
+                bootstrap)
+                    # bootstrap.sh seeds the schema (create_all_tables) in this
+                    # phase, so the database may already match the merged code.
+                    _crash_recovery_refuse "the update died in phase 'bootstrap', which can change the database schema; the merged code was left in place with the database"
+                    ;;
+                *)
+                    _crash_recovery_refuse "the checkout moved while the update was in phase '$STATE_PHASE', before it could have merged"
+                    ;;
+            esac
+            # Only the exact head update.sh recorded as its own merge is undone.
+            # It records that head the moment it adopts the merge, so a checkout
+            # anywhere else (someone's commit or pull, another branch) is left.
+            genesis_checkout_unmoved "$GENESIS_ROOT" "$OWN_HEAD" "$ORIGINAL_BRANCH" \
+                || _crash_recovery_refuse "the checkout is not at the merge this update recorded as its own; refusing to change code it does not own"
+            if ! genesis_rollback_checkout \
+                "$GENESIS_ROOT" "$ROLLBACK_TAG" "$ORIGINAL_BRANCH" "$EPHEMERAL_BACKUP_ROOT" "$rb_commit"; then
+                _crash_recovery_refuse "the non-forced rollback checkout was refused; code was left in place"
+            fi
+            echo "  Recovery checkout returned $ORIGINAL_BRANCH to $ROLLBACK_TAG."
         fi
 
         # Record crash recovery
@@ -104,10 +249,11 @@ except Exception as e:
 
         rm -f "$UPDATE_STATE"
         rm -f "$HOME/.genesis/update_in_progress.pid"
-        echo "  Crash recovery complete. Continuing bootstrap with rolled-back code."
+        echo "  Crash recovery complete. Continuing bootstrap."
         echo ""
     fi
 fi
+# END crash-recovery
 
 # --- Prerequisites ---
 echo "--- Checking and installing prerequisites ---"

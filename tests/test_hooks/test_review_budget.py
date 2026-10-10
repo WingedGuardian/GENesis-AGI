@@ -282,17 +282,19 @@ def _slow_runner(clock: _FakeClock, calls: list[tuple[str, float]]):
     return run
 
 
-def _graphql_server(*, head=H5, page_size=100, heads=None, **connections):
+def _graphql_server(*, head=H5, page_size=100, heads=None, body=None, bodies=None, **connections):
     """A fake `gh api graphql` that honours the query's connections and cursors.
 
     It reads WHICH connections the query selects from the query text and each
     one's `after_<name>` cursor from argv, and serves `page_size` nodes per page,
     so pagination, per-connection cursors and re-reads are exercised against the
     real argv the module builds rather than a canned reply. `heads`, when given,
-    is consumed one per call (a head that moves between reads). Anything that is
-    not a GraphQL call fails, so an unexpected REST call is loud.
+    is consumed one per call (a head that moves between reads); so is `bodies`
+    (a PR body edited between reads). Anything that is not a GraphQL call fails,
+    so an unexpected REST call is loud.
     """
     head_seq = list(heads or [])
+    body_seq = list(bodies or [])
     seen: list[list[str]] = []
 
     def run(argv, *, timeout):
@@ -302,6 +304,12 @@ def _graphql_server(*, head=H5, page_size=100, heads=None, **connections):
         query = next(a for a in argv if a.startswith("query="))
         fields = dict(a.split("=", 1) for a in argv if "=" in a and not a.startswith("query="))
         pr: dict = {"headRefOid": head_seq.pop(0) if head_seq else head}
+        # The PR's own body field, not a review node's: those select `body` too.
+        selects_body = "{ headRefOid body " in query
+        if body_seq and selects_body:
+            pr["body"] = body_seq.pop(0)
+        elif body is not None and selects_body:
+            pr["body"] = body
         for name in ("reviews", "comments", "files", "commits"):
             if f" {name}(first: 100" not in query:
                 continue
@@ -445,7 +453,8 @@ def test_every_paginated_read_asks_for_a_full_page_in_the_path():
     source = (_ROOT / "scripts" / "review_budget.py").read_text()
     tree = ast.parse(source)
     fn = next(
-        n for n in ast.walk(tree)
+        n
+        for n in ast.walk(tree)
         if isinstance(n, ast.FunctionDef) and n.name == "_evaluate_pr_inner"
     )
     paginated = 0
@@ -869,7 +878,10 @@ def test_one_read_is_bounded_even_without_a_caller_budget(monkeypatch):
         "owner/repo", 7, runner=slow, external_identity_templates=(), monotonic=clock
     )
     assert got["status"] == "unknown", got
-    assert "graphql_read_timeout" in got["errors"], got
+    # Pages succeeded and no call failed: the evidence is too big for the budget,
+    # which recurs on every attempt, so it must not read as transient.
+    assert "graphql_read_budget_pages" in got["errors"], got
+    assert not rb.errors_are_transient(got["errors"]), got
     assert clock.now - start <= rb._GRAPHQL_READ_SECONDS, clock.now - start
 
 
@@ -949,3 +961,255 @@ def test_a_comment_reposted_between_reads_is_not_unknown(monkeypatch):
 
     got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
     assert got["status"] == "ok", got
+
+
+# ── one retry on a failed read; failures classified, never raw stderr ────────
+
+
+def _flaky(fail_times, stderr="HTTP 502: Bad Gateway"):
+    serve = _graphql_server(reviews=[_gql_review(H5)], files=_FILES, commits=_COMMITS)
+    calls = {"n": 0}
+
+    def run(argv, *, timeout):
+        calls["n"] += 1
+        if calls["n"] <= fail_times:
+            return 1, "", stderr
+        return serve(argv, timeout=timeout)
+
+    return run, calls
+
+
+def test_a_single_failed_read_is_retried(monkeypatch):
+    _no_seams(monkeypatch)
+    runner, _calls = _flaky(1)
+    got = rb.evaluate_pr("owner/repo", 7, runner=runner, external_identity_templates=())
+    assert got["status"] == "ok", got
+
+
+def test_a_read_failing_twice_is_unknown_and_names_its_class(monkeypatch):
+    _no_seams(monkeypatch)
+    runner, calls = _flaky(99)
+    got = rb.evaluate_pr("owner/repo", 7, runner=runner, external_identity_templates=())
+    assert got["status"] == "unknown"
+    assert calls["n"] == 2
+    # Both failed calls were 502s: the class is reported once.
+    assert got["errors"] == ["graphql_unreadable", "gh_failure:http_502"]
+    assert rb.errors_are_transient(got["errors"])
+
+
+def test_a_late_persistent_failure_class_is_never_dropped():
+    """Round-1 review: the classes were cut to the first three, so a late `auth`
+    behind three recovered transient failures vanished and the result read as
+    transient (and suppressible)."""
+    errors = rb.failure_errors(["http_502", "timeout", "network", "http_503", "auth"])
+    assert errors[-1] == "gh_failure:auth"
+    assert not rb.errors_are_transient(["graphql_unreadable", *errors])
+    assert rb.failure_errors(["timeout", "timeout", "http_502"]) == [
+        "gh_failure:timeout",
+        "gh_failure:http_502",
+    ]
+
+
+def test_the_default_runner_reports_a_timeout_by_type():
+    """Round-1 review: the default runner returned a bare `runner_failed` on a
+    subprocess timeout, which classified as `other`, so the switch never covered
+    the timeout it was meant for."""
+    code, _out, err = rb._default_runner(
+        [sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.2
+    )
+    assert code == 1 and err == "runner_failed:TimeoutExpired"
+    assert rb._gh_failure_class(err) == "timeout"
+    assert rb.errors_are_transient(
+        ["graphql_unreadable", f"gh_failure:{rb._gh_failure_class(err)}"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("stderr", "cls"),
+    [
+        ("runner_failed:TimeoutExpired", "timeout"),
+        ("runner_failed:RuntimeError", "hook_deadline"),
+        ("runner_failed:DeadlineExpired", "hook_deadline"),
+        ("runner_failed:OSError", "runner_raised"),
+        ("API rate limit exceeded for user ID 1", "rate_limited"),
+        ("HTTP 503: Service Unavailable", "http_503"),
+        ("Post https://api.github.com/graphql: dial tcp: i/o timeout", "timeout"),
+        ("gh: Could not resolve to a PullRequest", "not_found"),
+        ("something else entirely", "other"),
+    ],
+)
+def test_failure_classes_are_a_fixed_vocabulary(stderr, cls):
+    assert rb._gh_failure_class(stderr) == cls
+
+
+def test_a_raising_runner_is_classified_by_exception_type(monkeypatch):
+    _no_seams(monkeypatch)
+
+    def raising(argv, *, timeout):
+        raise RuntimeError("aggregate review-gate deadline expired")
+
+    got = rb.evaluate_pr("owner/repo", 7, runner=raising, external_identity_templates=())
+    assert "gh_failure:hook_deadline" in got["errors"], got
+
+
+@pytest.mark.parametrize(
+    "errors",
+    [
+        ["review_findings_deleted"],
+        ["commits_response_truncated"],
+        ["invalid_external_identity_template"],
+        ["evidence_changed_during_evaluation"],
+        ["head_changed_during_evaluation"],
+        ["codex_findings_comment_unbound"],
+        ["graphql_unreadable", "review_findings_deleted"],
+        [],
+        None,
+        "graphql_unreadable",
+    ],
+)
+def test_only_read_failures_are_transient(errors):
+    assert not rb.errors_are_transient(errors)
+
+
+@pytest.mark.parametrize(
+    ("cls", "transient"),
+    [
+        ("timeout", True),
+        ("hook_deadline", True),
+        ("network", True),
+        ("rate_limited", True),
+        ("http_502", True),
+        ("http_503", True),
+        ("http_404", False),
+        ("http_401", False),
+        ("auth", False),
+        ("not_found", False),
+        ("other", False),
+        ("runner_raised", False),
+        ("http_5", False),
+    ],
+)
+def test_only_transient_gh_failure_classes_count(cls, transient):
+    assert rb.errors_are_transient(["graphql_unreadable", f"gh_failure:{cls}"]) is transient
+
+
+def test_a_budget_stop_keeps_the_failure_classes_recorded_before_it(monkeypatch):
+    """Class audit: the aggregate-budget stop returned only
+    `lookup_budget_exhausted`, dropping an earlier persistent class, so a 401 read
+    as transient."""
+    _no_seams(monkeypatch)
+    clock = _FakeClock()
+
+    def unauthorised(argv, *, timeout):
+        clock.now += 5.0
+        return 1, "", "HTTP 401: Bad credentials"
+
+    got = rb.evaluate_pr(
+        "owner/repo",
+        7,
+        runner=unauthorised,
+        external_identity_templates=(),
+        budget_seconds=5.5,
+        monotonic=clock,
+    )
+    assert got["status"] == "unknown", got
+    assert "lookup_budget_exhausted" in got["errors"], got
+    assert "gh_failure:http_401" in got["errors"], got
+    assert not rb.errors_are_transient(got["errors"]), got
+
+
+def test_an_auth_message_that_mentions_a_timeout_is_auth():
+    # A persistent auth failure that also mentions a timeout must stay `auth`.
+    msg = "Your token has not been granted the required scopes; request timed out"
+    assert rb._gh_failure_class(msg) == "auth"
+
+
+def test_the_live_read_carries_the_pr_body(monkeypatch):
+    """The PR body rides the one GraphQL query, for the reflection's
+    acceptance points; it adds no call."""
+    _no_seams(monkeypatch)
+    body = "## Acceptance\n- it works\n"
+    serve = _graphql_server(reviews=[_gql_review(H4)], files=_FILES, commits=_COMMITS, body=body)
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert got["body"] == body and got["body_changed"] is False
+    queries = [next(a for a in call if a.startswith("query=")) for call in serve.seen]
+    assert queries and all("{ headRefOid body " in q for q in queries)
+
+
+def test_a_body_edited_between_the_reads_is_reported_not_chosen(monkeypatch):
+    """#3107 c4222860305: the body came from the first read only, so an edit
+    before the final read was missed. Two reads that disagree return no body,
+    and say so; the count itself still stands."""
+    _no_seams(monkeypatch)
+    serve = _graphql_server(
+        reviews=[_gql_review(H4)], files=_FILES, commits=_COMMITS, bodies=["old", "new"]
+    )
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert got["body"] is None and got["body_changed"] is True
+    assert len(serve.seen) == 2  # the final read is the one that saw the edit
+
+
+def test_a_body_edited_between_pages_of_one_read_is_reported(monkeypatch):
+    """#3107 round 2 c4225376515: only a read's first page set the body, so an
+    edit seen on a later page of the final read was missed. Every page is
+    compared, as the head is."""
+    _no_seams(monkeypatch)
+    comments = [
+        {"body": f"c{i}", "author": {"login": "someone", "__typename": "User"}} for i in range(150)
+    ]
+    serve = _graphql_server(
+        reviews=[_gql_review(H4)],
+        files=_FILES,
+        commits=_COMMITS,
+        comments=comments,
+        bodies=["old", "old", "old", "new"],
+    )
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert len(serve.seen) == 4  # two reads of two pages each
+    assert got["status"] == "ok", got
+    assert got["body"] is None and got["body_changed"] is True
+
+
+def test_the_production_deadline_exception_is_a_hook_deadline():
+    """Round-2 review: production's review_deadline.bounded_timeout raises
+    DeadlineExpired, recorded by its concrete name, which fell through to the
+    non-transient `runner_raised`; the switch never fired at the shared deadline."""
+    from review_deadline import DeadlineExpired
+
+    assert issubclass(DeadlineExpired, RuntimeError)
+    assert rb._gh_failure_class(f"runner_failed:{DeadlineExpired.__name__}") == "hook_deadline"
+
+
+def test_an_earlier_snapshots_recovered_failure_does_not_excuse_a_later_one(monkeypatch):
+    """Round-2 review: the page-budget check read the function-wide failure list,
+    so a 502 the FIRST read recovered from made the SECOND read's too-large
+    exhaustion look transient. Each snapshot is judged by its own failures."""
+    _no_seams(monkeypatch)
+    clock = _FakeClock()
+    serve = _graphql_server(
+        page_size=1, reviews=[_gql_review(H5)] * 40, files=_FILES, commits=_COMMITS
+    )
+    calls = {"n": 0, "second_read": False}
+
+    def runner(argv, *, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return 1, "", "HTTP 502: Bad Gateway"  # recovered by the retry
+        query = next(a for a in argv if a.startswith("query="))
+        fresh = not any(a.startswith("after_") for a in argv)
+        # The second (mutable) read starts with a fresh query that no longer asks
+        # for files; from then on every page is slow. The first read stays fast.
+        if fresh and "files" not in query:
+            calls["second_read"] = True
+        clock.now += timeout if calls["second_read"] else 0.1
+        return serve(argv, timeout=timeout)
+
+    got = rb.evaluate_pr(
+        "owner/repo", 7, runner=runner, external_identity_templates=(), monotonic=clock
+    )
+    assert calls["second_read"], "the second read never started: the fixture is wrong"
+    assert got["status"] == "unknown", got
+    assert "graphql_read_budget_pages" in got["errors"], got
+    assert not rb.errors_are_transient(got["errors"]), got
