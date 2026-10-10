@@ -17,10 +17,16 @@ The canonical `config/transcript_analytics.yaml` must remain installed.
 `GENESIS_TRANSCRIPT_ANALYTICS_DISABLED=1` or a `DISABLED` file in the configured
 data directory stops collection without rewriting the persistent opt-in.
 The environment kill switch preserves configured paths and resource settings;
-the canonical configuration and private overlay must still validate.
+the canonical configuration and private overlay must still validate. Unknown keys
+are refused, including when the environment kill switch is set.
 Resource admission can defer work with exit75; unavailable enforcement exits69.
 Explicit RAM caps must meet the shared 16 MiB launcher minimum. A percentage
 that computes a smaller cap is refused with exit69 rather than increased.
+CPU caps are floored to hundredths of a percent of one CPU, never increased.
+A computed cap below 0.1% of one CPU is refused with exit69; caps below1%
+use a one-second quota period to respect systemd's one-millisecond minimum.
+Worker startup still requires confirmation within30 seconds. Very small caps
+can enforce correctly yet return unavailable if startup exceeds that deadline.
 This startup minimum does not guarantee that a given analytics workload fits.
 Heavy commands require an enforced, registered systemd scope with a one-hour
 runtime limit. Uncapped launches are refused. First cancellation requests
@@ -48,6 +54,8 @@ gaps on stderr. `--live` reconstructs views from compatible source tables and
 exposes `raw_<table>` views. Incompatible retained sources remain on disk but
 are excluded from those views. Human-readable SQL escapes terminal control
 characters in values and column names; CSV preserves machine-readable values.
+The display limits `--max-rows` and `--cell-width` require nonnegative integers;
+zero remains valid.
 
 `sql --manifest PATH --window LABEL --baseline COMMIT` writes private atomic
 JSON provenance. The window is a label; apply the actual filter in SQL.
@@ -56,7 +64,8 @@ pruning. Retention and matching UUIDs do not establish ownership: executor,
 delegation and context views keep unresolved attribution and explicit coverage
 denominators. See [attribution](transcript-analytics-attribution.md).
 
-`verify` compares sorted rows and hashes across snapshot and live views. It
+`verify` compares ordered column names, logical types, sorted rows and hashes
+across snapshot and live views, including empty views. It
 closes the snapshot engine before opening the live engine, retaining the writer
 and publication locks and the same selected catalog across both phases.
 It checks internal consistency; independent parser fixtures specify expected

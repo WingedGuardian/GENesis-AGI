@@ -2483,7 +2483,12 @@ verified: 85652265c 2026-10-09
   Uncapped launches are refused; the default configuration remains disabled.
   The environment kill switch preserves validated configured paths; admission
   refuses explicit or computed caps below the shared launcher minimum.
-  Snapshot/live verification retains both locks while using one engine at a time.
+  Unknown configuration keys and negative SQL display limits are refused.
+  CPU admission floors representable quotas without inflating the requested cap;
+  caps below0.1% of one CPU are refused. The30-second worker startup deadline
+  remains; very small enforced caps can still time out as unavailable.
+  Snapshot/live verification compares
+  ordered names/types and rows, retaining both locks with one engine at a time.
   Evidence retrieval, installed scheduling and encrypted recovery arrive in
   dependent changes. This map does not describe a deployed capability.
 

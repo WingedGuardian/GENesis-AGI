@@ -68,6 +68,8 @@ def from_values(values: dict) -> Config:
     """Validate a persistent mapping through the same runtime configuration policy."""
     if not isinstance(values, dict):
         raise ValueError("transcript analytics config must be a mapping")
+    if values.keys() - (Config.__dataclass_fields__.keys() | {"scope"}):
+        raise ValueError("transcript analytics config contains unsupported keys")
     if type(values.get("enabled", False)) is not bool:
         raise ValueError("enabled must be a boolean")
     if values.get("scope", "all") != "all":

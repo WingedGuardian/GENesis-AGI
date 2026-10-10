@@ -8,6 +8,27 @@ import pytest
 from genesis.transcript_analytics import cli, config
 
 
+@pytest.mark.parametrize('option', ['--max-rows', '--cell-width'])
+@pytest.mark.parametrize('value', ['-1', '-100', '1.5', 'nan'])
+def test_sql_display_limits_reject_invalid_input_before_admission(monkeypatch, option, value):
+    def unexpected_config(*args, **kwargs):
+        pytest.fail('invalid display input reached configuration/admission')
+    monkeypatch.setattr(config, 'load', unexpected_config)
+    with pytest.raises(SystemExit) as error:
+        cli.main(['sql', 'SELECT 1', option, value])
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize('value', [0, 1, 120])
+def test_sql_zero_and_positive_display_limits_remain_supported(value):
+    import argparse
+    parser = argparse.ArgumentParser()
+    cli._configure(parser)
+    args = parser.parse_args(['sql', 'SELECT 1', '--max-rows', str(value), '--cell-width', str(value)])
+    assert args.max_rows == args.cell_width == value
+    assert cli._cell('abcd', 0) == '…(+4 chars)'
+
+
 def test_disabled_and_help_never_import_analytics_dependencies(tmp_path):
     # Import blocker is stronger than having optional libraries installed locally.
     source = str(Path(__file__).resolve().parents[2] / "src")

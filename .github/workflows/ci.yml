@@ -1156,4 +1156,6 @@ jobs:
         # Execution correction: native collection against merged pre-correction
         # ae69f63b measured integration31->43, CLI19->23, derive10->16:
         # 60->82, net22. Floor26138+22=26160; no added skip allowance.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 26160
+        # Four-class correction at59b96ce: integration43->71, CLI23->34,
+        # derive16->22; native82->127 net45. Floor26160+45=26205.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 26205

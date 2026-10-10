@@ -12,6 +12,24 @@ from genesis.transcript_analytics import catalog, derive, locks, query, store, v
 SID = "11111111-2222-3333-4444-555555555555"
 
 
+@pytest.mark.parametrize('empty', [False, True])
+@pytest.mark.parametrize('change', ['name', 'type', 'column-count'])
+def test_verify_digest_includes_schema_for_empty_and_populated_views(empty, change):
+    import contextlib
+
+    import duckdb
+    suffix = ' WHERE false' if empty else ''
+    with contextlib.closing(duckdb.connect(':memory:')) as con:
+        con.execute("SET threads=1")
+        con.execute("SET memory_limit='128MB'")
+        con.execute('CREATE VIEW original AS SELECT 1::INTEGER AS x' + suffix)
+        expression = {'name': '1::INTEGER AS y', 'type': '1::BIGINT AS x',
+                      'column-count': '1::INTEGER AS x, 2::INTEGER AS extra'}[change]
+        con.execute('CREATE VIEW changed AS SELECT ' + expression + suffix)
+        assert verify._digest(con, 'original') != verify._digest(con, 'changed')
+        assert verify._digest(con, 'original') == verify._digest(con, 'original')
+
+
 def _asst(mid, ts, out, stop="end_turn", uuid=None, tools=()):
     blocks = [
         {"type": "tool_use", "id": t, "name": "Bash", "input": {"command": "ls"}} for t in tools

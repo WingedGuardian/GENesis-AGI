@@ -11,6 +11,8 @@ from .locks import publication
 def _digest(con, view):
     digest, count = hashlib.sha256(), 0
     cursor = con.execute(f"SELECT * FROM {view} ORDER BY ALL")  # noqa: S608 — internal fixed view names
+    schema = [(column[0], str(column[1])) for column in cursor.description]
+    digest.update(json.dumps(schema, ensure_ascii=True).encode() + b"\n")
     while rows := cursor.fetchmany(1000):
         for row in rows:
             digest.update(json.dumps(row, default=str, ensure_ascii=True).encode() + b"\n")

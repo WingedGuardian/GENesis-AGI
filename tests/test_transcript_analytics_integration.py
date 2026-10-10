@@ -34,6 +34,29 @@ def test_private_opt_in_and_kill(base, monkeypatch):
     assert not config.load(base).enabled
 
 
+@pytest.mark.parametrize('key', ['data_dr', 'ram_byte', 'enabled_extra', 'future_setting'])
+@pytest.mark.parametrize('overlay', [False, True])
+@pytest.mark.parametrize('killed', [False, True])
+def test_unknown_analytics_keys_refused_before_kill_processing(base, monkeypatch, key, overlay, killed):
+    base.write_text('enabled: true\n')
+    target = base.with_suffix('.local.yaml') if overlay else base
+    target.write_text(f'enabled: true\n{key}: synthetic-value\n')
+    if killed:
+        monkeypatch.setenv('GENESIS_TRANSCRIPT_ANALYTICS_DISABLED', '1')
+    with pytest.raises(ValueError, match='unsupported'):
+        config.load(base)
+    with pytest.raises(ValueError, match='unsupported'):
+        config.load(base, ignore_kill=True)
+
+
+def test_all_supported_config_keys_and_scope_remain_accepted(tmp_path):
+    cfg = config.from_values({'enabled': True, 'scope': 'all', 'projects_dir': str(tmp_path/'projects'),
+                              'data_dir': str(tmp_path/'data'), 'ram_bytes': 67108864, 'ram_pct': 10,
+                              'cpu_pct': 10, 'evidence_records': 0, 'evidence_bytes': 1024})
+    assert cfg.enabled and cfg.projects_dir == tmp_path/'projects' and cfg.data_dir == tmp_path/'data'
+    assert cfg.ram_bytes == 67108864 and cfg.evidence_records == 0
+
+
 def test_kill_preserves_validated_saved_paths_and_settings(base, monkeypatch):
     projects, data = base.parent / "chosen-projects", base.parent / "chosen-data"
     base.with_suffix(".local.yaml").write_text(
@@ -140,6 +163,28 @@ def test_scope_caps_command_and_exit(base, admitted):
     assert any(value.startswith("--unit=genesis-job-transcript-analytics-") for value in args)
     assert args[-2:] == ["transcripts", "ingest"]
     assert run.call_args.kwargs["env"][resources._CHILD] == "268435456,100.00"
+
+
+@pytest.mark.parametrize('cpu', [0.004, 0.009, 0.01, 0.09, 0.0999])
+def test_computed_unrepresentable_cpu_refused_before_launch(base, admitted, capsys, cpu):
+    run, snap, _ = admitted
+    base.write_text(f'enabled: true\ncpu_pct: {cpu/snap.cpu_capacity}\n')
+    assert resources.ensure_capped([], config.load(base)) == 69
+    assert 'CPU cap' in capsys.readouterr().err
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize('cpu,quota', [(0.1, '0.10'), (0.1099, '0.10'), (0.116, '0.11'),
+                                    (0.9999, '0.99'), (1.016, '1.01'), (100, '100.00')])
+def test_cpu_serialization_never_inflates_requested_limit(base, admitted, cpu, quota):
+    run, snap, _ = admitted
+    base.write_text(f'enabled: true\ncpu_pct: {cpu/snap.cpu_capacity}\n')
+    assert resources.ensure_capped([], config.load(base)) == 0
+    args = run.call_args.args[0]
+    assert f'CPUQuota={quota}%' in args
+    assert float(quota) <= cpu
+    assert ('CPUQuotaPeriodSec=1s' in args) is (float(quota) < 1)
+    assert run.call_args.kwargs['env'][resources._CHILD] == '268435456,' + quota
 
 
 @pytest.mark.parametrize("percent,valid", [(1.0, False), (1.5625, True)])

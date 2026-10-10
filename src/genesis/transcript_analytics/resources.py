@@ -9,6 +9,7 @@ import select
 import subprocess
 import sys
 import time
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 
 from .config import Config
@@ -67,12 +68,24 @@ def _await_ready(owned, descriptor):
     return False
 
 
+def _cpu_quota(cpu):
+    """Floor the requested cap to systemd precision, preserving its minimum quota."""
+    # systemd requires at least 1ms quota over at most a 1s period (0.1%).
+    if not math.isfinite(cpu) or cpu < 0.1:
+        raise ValueError("CPU cap must be at least 0.1% of one CPU")
+    return format(Decimal(str(cpu)).quantize(Decimal(".01"), rounding=ROUND_DOWN), ".2f")
+
+
 def _launch(argv, ram, cpu, lease):
     from genesis.hostmetrics import run
     from genesis.hostmetrics.jobs import systemd_env
 
     unit = run.unit_name("transcript-analytics", os.urandom(16).hex())
-    props = [f"MemoryMax={ram}", "MemorySwapMax=0", f"CPUQuota={cpu:.2f}%", "RuntimeMaxSec=1h"]
+    quota = _cpu_quota(cpu)
+    props = [f"MemoryMax={ram}", "MemorySwapMax=0", f"CPUQuota={quota}%", "RuntimeMaxSec=1h"]
+    if float(quota) < 1:
+        # A 1s period represents these small caps without rounding the quota up to 1ms.
+        props.append("CPUQuotaPeriodSec=1s")
     ready_read, ready_write = os.pipe()
     owned = run.OwnedProcess()
     code = 69
@@ -84,7 +97,7 @@ def _launch(argv, ram, cpu, lease):
                 command, unit,
                 pass_fds=(ready_write,),
                 start_new_session=True,
-                env={**systemd_env(), _CHILD: f"{ram},{cpu:.2f}", _READY: str(ready_write)},
+                env={**systemd_env(), _CHILD: f"{ram},{quota}", _READY: str(ready_write)},
             )
             os.close(ready_write)
             ready_write = -1
@@ -170,7 +183,7 @@ def _admit(argv, cfg):
                 file=sys.stderr,
             )
             return 69
-        cpu = snap.cpu_capacity * cfg.cpu_pct
+        cpu = float(_cpu_quota(snap.cpu_capacity * cfg.cpu_pct))
         result = evaluate(snap, Request("transcript analytics", ram=ram, cpu=cpu), load_levers())
         if result.verdict != "GO":
             reasons = "; ".join(c.reason for c in result.checks if c.verdict != "GO")
