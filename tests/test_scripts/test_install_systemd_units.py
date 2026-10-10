@@ -187,6 +187,12 @@ def test_every_unit_path_starts_at_an_ALLOWED_root():
             name, sep, value = line.partition("=")
             if not sep or name.strip() not in _PATH_DIRECTIVES:
                 continue
+            # The managed backend starts at a neutral cwd; its helper validates
+            # and enters the configured primary checkout before executing native.
+            if (source, name.strip(), value) == (
+                TEMPLATE_DIR / "genesis-cbm-query.service.template", "WorkingDirectory", "/"
+            ):
+                continue
             for token in _path_tokens(value):
                 if token.startswith("__") or token.startswith(_ALLOWED_ROOT_PREFIXES):
                     continue
@@ -200,6 +206,29 @@ def test_every_unit_path_starts_at_an_ALLOWED_root():
         "checkout; if this is a genuinely new root, add it to "
         "_ALLOWED_ROOT_PREFIXES deliberately:\n  " + "\n  ".join(offenders)
     )
+
+
+@pytest.mark.parametrize(
+    "filename,directive,value,allowed",
+    [
+        ("genesis-cbm-query.service.template", "WorkingDirectory", "/", True),
+        ("another.service.template", "WorkingDirectory", "/", False),
+        ("genesis-cbm-query.service.template", "ExecStart", "/", False),
+        ("genesis-cbm-query.service.template", "WorkingDirectory", "/home/foreign", False),
+        ("genesis-cbm-query.service.template", "WorkingDirectory", "/ /home/foreign", False),
+    ],
+)
+def test_neutral_cwd_exception_is_specific(tmp_path, monkeypatch, filename, directive, value, allowed):
+    source = tmp_path / filename
+    source.write_text(f"[Service]\n{directive}={value}\n")
+    monkeypatch.setitem(globals(), "REPO_ROOT", tmp_path)
+    monkeypatch.setitem(globals(), "TEMPLATE_DIR", tmp_path)
+    monkeypatch.setitem(globals(), "_unit_sources", lambda: [source])
+    if allowed:
+        test_every_unit_path_starts_at_an_ALLOWED_root()
+    else:
+        with pytest.raises(AssertionError, match="not an allowed root"):
+            test_every_unit_path_starts_at_an_ALLOWED_root()
 
 
 def _rejected(value: str) -> bool:

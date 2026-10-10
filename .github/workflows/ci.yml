@@ -1158,4 +1158,11 @@ jobs:
         # authority suite. Other five changed test files retain their counts.
         # No new skip allowance. Floor: 25170 + 41 = 25211.
         # Shared transcript credential-label policy (#3072): +2. Floor: 25211 + 2 = 25213.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25213
+        # Native CBM runtime/templates: new runtime file 52 and template file 26
+        # cases, plus template-placeholders 13 -> 14 (+1 hosted slice inventory).
+        # Unit-root guard adds 5 controls for the backend's neutral cwd exception.
+        # Other edited files retain counts. Floor: 24962 + 84 = 25046;
+        # no new skip sites.
+        # Merge with main (cbm native runtime, #3000): main 25211 + this PR's measured +84 = 25295.
+        # Re-merge with main (#3000): main 25213 + this PR's measured +84 = 25297.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25297
