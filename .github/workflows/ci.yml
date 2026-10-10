@@ -1153,6 +1153,11 @@ jobs:
         # (test_qualification +78, test_qualification_references +24,
         # test_qualification_rework +28); no added skips.
         # Floor: 25040 + 130 = 25170.
+        # Peer restore authority (#3128): measured collection of changed files
+        # against current main: 178 -> 219, entirely the new 41-case restore
+        # authority suite. Other five changed test files retain their counts.
+        # No new skip allowance. Floor: 25170 + 41 = 25211.
         # Merged-parent hosted JUnit:40396 collected,97 skips; checkout tree matches main.
         # Transport delta:42 pinned +15 rework +149 evidence +44 routing metadata =250.
+        # Merge with main (#3134): kept this PR's measured floor 40646, above main's 25211 (#3128's +41 only raises the real count).
         run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 40646

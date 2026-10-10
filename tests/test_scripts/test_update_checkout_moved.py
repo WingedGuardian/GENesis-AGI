@@ -643,6 +643,7 @@ def _db(tmp_path: Path) -> Path:
     db = tmp_path / "genesis.db"
     db.write_text("migrated\n")
     (tmp_path / "genesis.db.pre-update").write_text("pre-update\n")
+    (tmp_path / "genesis.db.pre-update.peer-restore").write_text("guarded-pre-update\n")
     return db
 
 
@@ -686,7 +687,8 @@ def test_the_database_follows_the_code_left_on_disk(repo, tmp_path, case, restor
     db = _db(tmp_path)
     r = _run(_rollback_guard(repo, own_head=merged, db_file=str(db), extra=extra), tmp_path)
     assert r.returncode == 0, r.stderr
-    assert db.read_text() == ("pre-update\n" if restored else "migrated\n"), r.stdout
+    assert db.read_text() == ("guarded-pre-update\n" if restored else "migrated\n"), r.stdout
+    assert db.with_name("genesis.db.pre-update").read_text() == "pre-update\n"
     assert ("DB_OK=true" in r.stdout) is restored, r.stdout
     if not restored:
         assert "migrated database is kept" in r.stdout
@@ -877,7 +879,7 @@ def test_a_moved_checkout_keeps_the_migrated_database():
     moved = body.index(
         'if [ "$code_action" = "moved" ] || [ "$code_kept" = "true" ]; then', migrated
     )
-    restore = body.index('cp "$DB_FILE.pre-update" "$DB_FILE"', migrated)
+    restore = body.index('cp "$DB_FILE.pre-update.peer-restore" "$DB_FILE"', migrated)
     assert migrated < moved < restore
     branch = body[moved : body.index("elif", moved)]
     assert "db_ok=false" in branch and "cp " not in branch
@@ -893,7 +895,7 @@ def test_reinstall_and_restart_happen_only_on_a_verified_old_tree():
     pip = body.index('"$VENV_DIR/bin/pip" install', guard_end)
     assert 'if [ "$restart_ok" = "true" ] \\\n' in body[guard_end:pip]
     loop = body.index('for svc in "${WERE_RUNNING[@]}"; do', guard_end)
-    gate = body.rindex('if [ "$restart_ok" = "true" ]; then', guard_end, loop)
+    gate = body.rindex('if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then', guard_end, loop)
     assert "\n    fi\n" not in body[gate:loop]
     assert body.count('for svc in "${WERE_RUNNING[@]}"; do') == 1
 
