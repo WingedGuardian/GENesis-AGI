@@ -487,8 +487,11 @@ def test_the_scan_sees_each_shape_it_claims(tmp_path):
 _RELOAD = ("scripts/lib/index_marker.py", "scripts/hooks/worktree_claim.py")
 _FRESH = (
     "scripts/disk_reclaim.py",
+    "scripts/lib/live_checkout.py",
     "scripts/hooks/bash_allowlist_guard.sh",
     "scripts/hooks/bash_allowlist_lib.sh",
+    "scripts/lib/deploy_marker.sh",
+    "scripts/lib/deploy_checkout.sh",
     "scripts/hooks/main_checkout_guard.py",
     "scripts/hooks/hook_input.py",
     "scripts/hooks/hook_output.py",

@@ -22,7 +22,10 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE = REPO_ROOT / "scripts" / "update.sh"
 LIB = REPO_ROOT / "scripts" / "lib" / "deploy_checkout.sh"
+RECOVERY_LIB = REPO_ROOT / "scripts" / "lib" / "deploy_recovery.sh"
 MARKER_LIB = REPO_ROOT / "scripts" / "lib" / "deploy_marker.sh"
+# update.sh runs its hook-running git calls through genesis_without_checkout_lock.
+LOCK_LIB = REPO_ROOT / "scripts" / "lib" / "checkout_lock.sh"
 
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "t",
@@ -65,7 +68,7 @@ def _block(marker: str) -> str:
 def _run(
     script: str, home: Path, *, extra_env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess:
-    libs = f'. "{MARKER_LIB}"\n. "{LIB}"\n'
+    libs = f'. "{MARKER_LIB}"\n. "{LIB}"\n. "{RECOVERY_LIB}"\n. "{LOCK_LIB}"\n'
     env = _env(home)
     env.update(extra_env or {})
     return subprocess.run(
@@ -108,12 +111,16 @@ def _rollback_guard(
     real_backup: bool = False,
     extra: str = "",
     db_file: str = "",
+    lock_held: bool = True,
 ) -> str:
     """The guard, inside a function as in _do_rollback, then its verdict. The real
     backup helpers are loaded from update.sh (POST_MERGE=true skips the pre-stop
     loop); only the ephemeral pass is stubbed, so the test can see it ran."""
     return (
-        f'GENESIS_ROOT="{root}"\nORIGINAL_BRANCH=main\nROLLBACK_TAG=pre-update-test\n'
+        # A held lock is a published descriptor (checkout_lock.sh sets
+        # GENESIS_CHECKOUT_LOCK_FD only once flock succeeds).
+        ("exec {GENESIS_CHECKOUT_LOCK_FD}>/dev/null\n" if lock_held else "")
+        + f'GENESIS_ROOT="{root}"\nORIGINAL_BRANCH=main\nROLLBACK_TAG=pre-update-test\n'
         f'UPDATE_OWN_HEAD="{own_head}"\nPOST_MERGE=true\n'
         f"MERGE_ATTEMPTED={1 if merge_attempted else 0}\n"
         + _block("ephemeral-prestop-backup")
@@ -640,6 +647,7 @@ def _db(tmp_path: Path) -> Path:
     db = tmp_path / "genesis.db"
     db.write_text("migrated\n")
     (tmp_path / "genesis.db.pre-update").write_text("pre-update\n")
+    (tmp_path / "genesis.db.pre-update.peer-restore").write_text("guarded-pre-update\n")
     return db
 
 
@@ -683,7 +691,8 @@ def test_the_database_follows_the_code_left_on_disk(repo, tmp_path, case, restor
     db = _db(tmp_path)
     r = _run(_rollback_guard(repo, own_head=merged, db_file=str(db), extra=extra), tmp_path)
     assert r.returncode == 0, r.stderr
-    assert db.read_text() == ("pre-update\n" if restored else "migrated\n"), r.stdout
+    assert db.read_text() == ("guarded-pre-update\n" if restored else "migrated\n"), r.stdout
+    assert db.with_name("genesis.db.pre-update").read_text() == "pre-update\n"
     assert ("DB_OK=true" in r.stdout) is restored, r.stdout
     if not restored:
         assert "migrated database is kept" in r.stdout
@@ -874,7 +883,7 @@ def test_a_moved_checkout_keeps_the_migrated_database():
     moved = body.index(
         'if [ "$code_action" = "moved" ] || [ "$code_kept" = "true" ]; then', migrated
     )
-    restore = body.index('cp "$DB_FILE.pre-update" "$DB_FILE"', migrated)
+    restore = body.index('cp "$DB_FILE.pre-update.peer-restore" "$DB_FILE"', migrated)
     assert migrated < moved < restore
     branch = body[moved : body.index("elif", moved)]
     assert "db_ok=false" in branch and "cp " not in branch
@@ -890,7 +899,7 @@ def test_reinstall_and_restart_happen_only_on_a_verified_old_tree():
     pip = body.index('"$VENV_DIR/bin/pip" install', guard_end)
     assert 'if [ "$restart_ok" = "true" ] \\\n' in body[guard_end:pip]
     loop = body.index('for svc in "${WERE_RUNNING[@]}"; do', guard_end)
-    gate = body.rindex('if [ "$restart_ok" = "true" ]; then', guard_end, loop)
+    gate = body.rindex('if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then', guard_end, loop)
     assert "\n    fi\n" not in body[gate:loop]
     assert body.count('for svc in "${WERE_RUNNING[@]}"; do') == 1
 
@@ -916,6 +925,46 @@ def _code(block: str) -> str:
     return "\n".join(ln for ln in block.splitlines() if not ln.lstrip().startswith("#"))
 
 
+def test_without_the_checkout_lock_the_rollback_leaves_the_checkout(repo, tmp_path):
+    """The lock stayed busy past its wait: a Claude launch may be reading the tree,
+    so the rollback changes nothing (no reset to the tag) and keeps the database
+    with the code, reporting it instead of racing the reader."""
+    merged = _merge_like_commit(repo)
+    r = _run(
+        _rollback_guard(repo, own_head=merged, merge_attempted=True, lock_held=False),
+        tmp_path,
+    )
+    assert _verdict(r)[0] == "locked_out", r.stdout + r.stderr
+    assert "lock could not be taken" in r.stdout
+    assert _git(repo, "rev-parse", "HEAD") == merged
+
+
+def test_without_the_checkout_lock_an_interrupted_merge_is_not_aborted(repo, tmp_path):
+    """Still at the tag, but a merge was interrupted: aborting it changes the
+    tree, so without the lock it is reported and left."""
+    _git(repo, "checkout", "-q", "-b", "incoming")
+    (repo / "code.py").write_text("x = 3\n")
+    _git(repo, "commit", "-qam", "incoming")
+    _git(repo, "checkout", "-q", "main")
+    (repo / "code.py").write_text("x = 4\n")
+    _git(repo, "commit", "-qam", "ours")
+    _git(repo, "tag", "-f", "pre-update-test")
+    subprocess.run(
+        ["git", "-C", str(repo), "merge", "--no-edit", "incoming"],
+        capture_output=True,
+        env=_env(tmp_path),
+    )
+    merge_head = repo / ".git" / "MERGE_HEAD"
+    assert merge_head.exists(), "the fixture needs an interrupted merge"
+    head = _git(repo, "rev-parse", "HEAD")
+    r = _run(
+        _rollback_guard(repo, own_head=head, merge_attempted=True, lock_held=False),
+        tmp_path,
+    )
+    assert "left for you to abort" in r.stdout, r.stdout + r.stderr
+    assert merge_head.exists()
+
+
 def test_the_rollback_moves_only_the_original_branch_with_a_non_forced_checkout():
     """`checkout "$ORIGINAL_BRANCH"` was how a rollback moved someone's checkout
     off their branch; the guard requires being on it instead. Undoing the merge is
@@ -927,11 +976,18 @@ def test_the_rollback_moves_only_the_original_branch_with_a_non_forced_checkout(
     ]
     assert 'checkout "$ORIGINAL_BRANCH"' not in body
     code = _code(_block("rollback-code-guard"))
-    assert code.count(_SWITCH_BACK) == 1
-    assert code.index("reset)") < code.index(_SWITCH_BACK) < code.index("*)")
-    assert "-c core.hooksPath=/dev/null " + _SWITCH_BACK in code
-    for gone in ("reset --hard", "reset --keep", "reset -q --keep", " -f ", "--force"):
-        assert gone not in code, gone
+    recovery = _code(RECOVERY_LIB.read_text())
+    call = 'genesis_rollback_checkout "$GENESIS_ROOT" "$ROLLBACK_TAG" "$ORIGINAL_BRANCH"'
+    assert code.count(call) == 1
+    assert code.index("reset)") < code.index(call) < code.index("*)")
+    assert recovery.count(_SWITCH_BACK) == 1
+    assert "-c core.hooksPath=/dev/null " + _SWITCH_BACK in recovery
+    checkout_commands = "\n".join(
+        line for line in recovery.splitlines() if re.search(r"\bgit\b.*\bcheckout\b", line)
+    )
+    for surface in (code, checkout_commands):
+        for gone in ("reset --hard", "reset --keep", "reset -q --keep", " -f ", "--force"):
+            assert gone not in surface, gone
 
 
 def test_an_ephemeral_edit_the_update_did_not_change_is_left_in_place(repo, tmp_path):
@@ -954,7 +1010,7 @@ def test_an_ephemeral_edit_the_update_did_not_change_is_left_in_place(repo, tmp_
 def test_the_rollback_checks_then_switches_back():
     """Order inside the reset arm: back up, list the range (submodule check), clear,
     refresh, then the checkout."""
-    code = _code(_block("rollback-code-guard"))
+    code = _code(RECOVERY_LIB.read_text())
     order = [
         '_ephemeral_backup_before_reset "$EPHEMERAL_BACKUP_ROOT"',
         'diff-tree -r --raw --no-renames --no-abbrev HEAD "$ROLLBACK_TAG"',
@@ -1057,17 +1113,21 @@ def test_only_this_runs_merge_is_adopted_as_its_own_head(tmp_path):
         f'GENESIS_ROOT="{clone}"\nUPDATE_REMOTE=origin\nDEPLOY_BRANCH=main\nORIGINAL_BRANCH=main\n'
         f'DEPLOY_HEAD="{pin}"\nVALIDATED_HEAD="{validated}"\nUPDATE_OWN_HEAD="{validated}"\n'
         '_do_rollback() { echo "ROLLBACK: $1"; }\n'
+        '_write_state() { echo "STATE=$1"; }\n'
     )
     script = base + _assertion_block() + 'echo "OWN=$UPDATE_OWN_HEAD"\n'
     r = _run(script, tmp_path)
     assert r.returncode == 0, r.stdout + r.stderr
     assert f"OWN={_git(clone, 'rev-parse', 'HEAD')}" in r.stdout
+    # The adopted head is recorded at once, so bootstrap recovery knows it.
+    assert "STATE=merging" in r.stdout
     # Someone commits on top of the merge before it is recorded: not adopted.
     _git(clone, "commit", "-q", "--allow-empty", "-m", "theirs")
     r = _run(script, tmp_path)
     assert r.returncode == 1
     assert "ROLLBACK: merge did not bring in" in r.stdout
     assert "OWN=" not in r.stdout
+    assert "STATE=merging" not in r.stdout
 
 
 def test_the_merge_result_becomes_the_runs_own_head_before_anything_can_fail():

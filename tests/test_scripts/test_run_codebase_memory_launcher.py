@@ -124,6 +124,19 @@ def test_scope_path_passes_memorymax(tmp_path):
     assert "ARGS:" in blog.read_text()  # the server actually ran
 
 
+def test_scope_and_probe_run_in_the_capped_slice(tmp_path):
+    """The disk guardian tells this wrapper's by-design cap kill from any other
+    OOM kill by app-capped.slice's own kill counter, so BOTH the probe and the
+    real scope must land there (a slice problem then fails at probe time, where
+    the fallback still applies)."""
+    fakebin, slog = _fake_systemd_run(tmp_path, probe_ok=True)
+    res, _ = _run_launcher(tmp_path, fakebin=fakebin)
+    assert res.returncode == 0, res.stderr
+    lines = [ln for ln in slog.read_text().splitlines() if "--scope" in ln]
+    assert len(lines) == 2, lines  # probe + real scope
+    assert all("--slice=app-capped.slice" in ln for ln in lines)
+
+
 def test_mem_max_env_override(tmp_path):
     fakebin, slog = _fake_systemd_run(tmp_path, probe_ok=True)
     res, _ = _run_launcher(
@@ -472,6 +485,7 @@ def test_launcher_env_omits_an_absent_key_rather_than_emptying_it(monkeypatch):
     assert _launcher_env()["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/12345/bus"
 
 
+@pytest.mark.user_manager  # a transient --user scope; the conftest fence keeps the bus for it
 def test_real_scope_applies_memory_max(tmp_path):
     if not _user_scope_works():
         pytest.skip("no --user scope with MemoryMax available under the launcher's env")

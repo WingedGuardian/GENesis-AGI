@@ -54,8 +54,7 @@ def _default_config_path() -> Path:
 def default_judge_chain(judge_provider: str | None = None) -> list[str]:
     """The offline judge fallback chain — mirrors the runtime ``judge`` call
     site EXACTLY by reading it from the shipped routing config, so it can never
-    drift (calibrated V4-pro first, then NIM V4.1-flash + paid V4.1-flash for
-    resilience). Deriving from config (rather than hardcoding
+    drift (the current operator-selected order, including its Pro fallback). Deriving from config (rather than hardcoding
     ``[DEFAULT_JUDGE_PROVIDER, ...]``) also means the primary can never be
     duplicated in the chain — a duplicate would make StandaloneLiteLLMRouter
     re-attempt the same failed provider, potentially costing a second timeout.
