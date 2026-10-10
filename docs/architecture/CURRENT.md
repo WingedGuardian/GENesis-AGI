@@ -1635,7 +1635,10 @@ verified: 6039cec09 2026-10-09
   environment, live container-loopback listener and patch eligibility,
   then patches preserved config before restricting Incus ingress. Full deployment
   and migration preserve an operator-owned Guardian pause until direct health
-  verification; migration does not activate peers. Setup stops before Guardian
+  verification. The first rollout stages merged updater code with the locked
+  code-only pull; incoming bootstrap refuses a legacy unqualified full updater
+  before mutation, and the new updater checks the listener or maintained pause.
+  This is a maintenance snapshot, not a held lease; migration does not activate peers. Setup stops before Guardian
   when standard proxy endpoints/modes cannot be verified and checks local plus
   inherited device absence before adding a proxy. Generated network instructions
   use local loopback and explicit owner remote-access methods. See

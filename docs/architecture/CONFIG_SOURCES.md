@@ -207,7 +207,10 @@ names, so an overlay of a read-only file is editable (#2446).
   Unknown profiles and conflicting service-only overrides refuse migration.
   After unit installation/reload, the installer aligns unset targets for an
   existing loopback proxy only when that service profile is proven. Numeric
-  loopback HTTP targets bypass proxies; other targets retain urllib proxy policy. See
+  loopback HTTP targets bypass proxies; other targets retain urllib proxy policy.
+  First loopback activation requires a maintained Guardian pause when the live
+  listener is not already exclusively the standard IPv4 loopback endpoint. Stage
+  merged updater code using the locked code-only pull before the first full update. See
   [peer ingress](../reference/peer-ingress.md).
 - **`~/.genesis/resource-budget.env`** — optional `KEY=VALUE` file for the resource-budget
   levers (`GENESIS_RB_*`), read by `genesis.hostmetrics`; the process environment wins over

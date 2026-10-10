@@ -36,6 +36,15 @@ echo
 . "$SCRIPT_DIR/lib/live_system_guard.sh"
 bootstrap_refuse_if_server_live "$@" || exit 3
 
+# Incoming code must also refuse the old updater's unqualified first rollout.
+if [ "${GENESIS_BOOTSTRAP_ALLOW_LIVE:-}" = 1 ] \
+    && { [ -e "$HOME/.genesis/guardian_remote.yaml" ] || [ -L "$HOME/.genesis/guardian_remote.yaml" ]; } \
+    && [ "${GENESIS_DASHBOARD_LOOPBACK_QUALIFIED:-}" != 1 ]; then
+    echo "REFUSE: stage merged code with scripts/deploy_code_only.sh pull, then follow docs/reference/peer-ingress.md before full update." >&2
+    exit 3
+fi
+unset GENESIS_DASHBOARD_LOOPBACK_QUALIFIED
+
 # shellcheck source=lib/deploy_marker.sh
 . "$SCRIPT_DIR/lib/deploy_marker.sh"
 # shellcheck source=lib/deploy_checkout.sh

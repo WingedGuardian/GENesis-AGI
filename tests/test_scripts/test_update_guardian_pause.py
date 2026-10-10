@@ -481,3 +481,112 @@ def test_the_renewer_parent_check_follows_process_identity(tmp_path: Path) -> No
 
 if sys.platform.startswith("win"):  # pragma: no cover
     pytest.skip("bash-only", allow_module_level=True)
+
+
+@pytest.mark.parametrize("pre_paused,ssh_rc,allowed", [(False, 0, False), (True, 0, True), (True, 1, False)])
+def test_strict_prerequisite_never_owns_pause(tmp_path, pre_paused, ssh_rc, allowed):
+    run, log = _harness(GUARDIAN_LIB.read_text(), tmp_path, ssh_rc=ssh_rc, pre_paused=pre_paused)
+    output = run("_guardian_pause --require-existing")
+    assert ("REACHED_END" in output) is allowed
+    assert log.read_text().splitlines() == ["paused"]
+
+
+@pytest.mark.parametrize("listeners,ss_rc,pre_paused,allowed,queried", [
+    ("LISTEN 0 128 127.0.0.1:5000 0.0.0.0:*", 0, False, True, False),
+    ("LISTEN 0 128 0.0.0.0:5000 0.0.0.0:*", 0, False, False, True),
+    ("LISTEN 0 128 0.0.0.0:5000 0.0.0.0:*", 0, True, True, True),
+    ("LISTEN 0 128 127.0.0.1:5000 *:*\nLISTEN 0 128 [::]:5000 *:*", 0, False, False, True),
+    ("LISTEN 0 128 127.0.0.2:5000 *:*", 0, False, False, True),
+    ("malformed", 0, False, False, True),
+    ("", 0, False, False, True),
+    ("LISTEN 0 128 127.0.0.1:5000 *:*", 1, False, False, True),
+])
+def test_loopback_prerequisite_actual_listener_controls(tmp_path, listeners, ss_rc, pre_paused, allowed, queried):
+    import shlex
+    run, log = _harness(GUARDIAN_LIB.read_text(), tmp_path, ssh_rc=0, pre_paused=pre_paused)
+    stub = tmp_path / "bin" / "ss"
+    stub.write_text(f"#!/bin/bash\nprintf '%s\\n' {shlex.quote(listeners)}\nexit {ss_rc}\n")
+    stub.chmod(0o755)
+    output = run("_qualify_dashboard_loopback")
+    assert ("REACHED_END" in output) is allowed
+    assert (log.read_text().splitlines() if log.exists() else []) == (["paused"] if queried else [])
+
+
+def test_loopback_prerequisite_unconfigured_install(tmp_path):
+    run, log = _harness(GUARDIAN_LIB.read_text(), tmp_path, ssh_rc=1)
+    (tmp_path / "home/.genesis/guardian_remote.yaml").unlink()
+    assert "REACHED_END" in run("_qualify_dashboard_loopback")
+    assert not log.exists()
+
+
+def test_strict_prerequisite_missing_configuration_refuses(tmp_path):
+    run, log = _harness(GUARDIAN_LIB.read_text(), tmp_path, ssh_rc=0)
+    (tmp_path / "home/.genesis/guardian_remote.yaml").unlink()
+    assert "REACHED_END" not in run("_guardian_pause --require-existing")
+    assert not log.exists()
+
+
+def test_incoming_bootstrap_checkpoint_before_any_mutation(tmp_path):
+    bootstrap = (REPO_ROOT / "scripts/bootstrap.sh").read_text()
+    checkpoint = bootstrap[bootstrap.index("# Incoming code must also refuse"):bootstrap.index("# shellcheck source=lib/deploy_marker.sh")]
+    home = tmp_path / "home"
+    (home / ".genesis").mkdir(parents=True)
+    cfg = home / ".genesis/guardian_remote.yaml"
+    cfg.write_text("host_ip: fixture-host\n")
+    for marker, expected in [("", 3), ("1", 0)]:
+        result = subprocess.run(["bash", "-c", checkpoint + "\necho MUTATION_REACHED"],
+            env={**os.environ, "HOME": str(home), "GENESIS_BOOTSTRAP_ALLOW_LIVE": "1",
+                 "GENESIS_DASHBOARD_LOOPBACK_QUALIFIED": marker}, capture_output=True, text=True, timeout=10)
+        assert result.returncode == expected
+        assert ("MUTATION_REACHED" in result.stdout) is (expected == 0)
+    cfg.unlink()
+    result = subprocess.run(["bash", "-c", checkpoint + "\necho MUTATION_REACHED"],
+        env={**os.environ, "HOME": str(home), "GENESIS_BOOTSTRAP_ALLOW_LIVE": "1"},
+        capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0 and "MUTATION_REACHED" in result.stdout
+
+
+def test_qualification_cannot_leak_to_server_children(text):
+    startup = text[:text.index("# Resolve HOME")]
+    result = subprocess.run(["bash", "-c", startup + '\n[ -z "${GENESIS_DASHBOARD_LOOPBACK_QUALIFIED+x}" ]'],
+        env={**os.environ, "GENESIS_DASHBOARD_LOOPBACK_QUALIFIED": "1"}, capture_output=True, timeout=10)
+    assert result.returncode == 0
+    assert "export _DASHBOARD_LOOPBACK_QUALIFIED" not in text
+    assert 'GENESIS_DASHBOARD_LOOPBACK_QUALIFIED=1 GENESIS_BOOTSTRAP_ALLOW_LIVE=1' in text
+
+
+def test_interrupt_and_start_refuse_unqualified_restart(text, tmp_path):
+    for name in ("_start_genesis_server", "_on_signal_prestop"):
+        function = _extract_func(text, name)
+        log = tmp_path / name
+        script = ("_qualify_dashboard_loopback() { return 1; }\n"
+                  f'systemctl() {{ echo called >> "{log}"; }}\n'
+                  "_clear_deploy_state() { :; }\nWERE_RUNNING=(genesis-server)\n"
+                  + function + f"\n{name} TERM\n")
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+        assert result.returncode == 1
+        assert not log.exists()
+    qualification = text.index("\n_qualify_dashboard_loopback || exit 1\n")
+    assert qualification < text.index(STOP_CALL)
+
+
+@pytest.mark.parametrize("broken", ["key", "config"])
+def test_strict_prerequisite_broken_connection_refuses_without_ssh(tmp_path, broken):
+    run, log = _harness(GUARDIAN_LIB.read_text(), tmp_path, ssh_rc=0, pre_paused=True)
+    if broken == "key":
+        (tmp_path / "home/.ssh/genesis_guardian_ed25519").unlink()
+    else:
+        (tmp_path / "home/.genesis/guardian_remote.yaml").write_text("[]\n")
+    assert "REACHED_END" not in run("_guardian_pause --require-existing")
+    assert not log.exists()
+
+
+@pytest.mark.parametrize("response", ['{"paused": false}', '{"paused": 1}', '{"paused": "true"}', 'not-json', '[]'])
+def test_strict_prerequisite_requires_actual_boolean_response(tmp_path, response):
+    import shlex
+    run, log = _harness(GUARDIAN_LIB.read_text(), tmp_path, ssh_rc=0, pre_paused=True)
+    ssh = tmp_path / "bin/ssh"
+    ssh.write_text(f"""#!/bin/bash\necho "${{@: -1}}" >> "{log}"\nprintf '%s\\n' {shlex.quote(response)}\n""")
+    ssh.chmod(0o755)
+    assert "REACHED_END" not in run("_guardian_pause --require-existing")
+    assert log.read_text().splitlines() == ["paused"]

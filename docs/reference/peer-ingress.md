@@ -66,6 +66,20 @@ resume it. If pause/paused support or confirmation is unavailable, stop and
 resolve that prerequisite; do not assume the deployment's own pause covers host
 synchronization. A fresh installation without Guardian has no pause to preserve.
 
+For this first rollout, while maintaining that pause, stage the merged code with
+`scripts/deploy_code_only.sh pull` (locked pull without restart), then run the
+new `scripts/update.sh`. The updater runs a pre-update copy of itself: an old
+updater cannot enforce the new prerequisite. Incoming bootstrap therefore refuses
+an unqualified old full updater before changing units or running crash recovery.
+Do not set the qualification environment marker manually.
+
+The new updater confirms either an existing listener whose every local TCP 5000
+endpoint is exactly `127.0.0.1:5000`, or a pre-existing Guardian pause, before
+stopping or restarting Genesis. Unknown, missing or mixed listener observations
+require the pause. The confirmation is a snapshot; the operator must maintain the
+pause through host synchronization and migration. Standard already-migrated
+loopback installations do not require a new manual pause on every update.
+
 Deploy through the full approved `scripts/update.sh` path: its bootstrap renders
 the loopback server unit. Code-only deployment does not render changed units.
 Verify the update and Guardian host synchronization actually succeeded; old
