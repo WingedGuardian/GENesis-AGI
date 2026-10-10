@@ -1,0 +1,1 @@
+- Keep CLI approval notifications out of generic outreach actions and collect unused peer notification locks while preserving concurrent retry serialization.

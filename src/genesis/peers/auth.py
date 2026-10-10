@@ -25,6 +25,16 @@ class PeerRefusal(Exception):
         super().__init__(code)
 
 
+def presented_peer_credential() -> bool:
+    """Include revoked/disabled families without consulting an active relationship."""
+    names = {
+        name
+        for name in os.environ
+        if name.startswith("GENESIS_PEER_") and name.endswith("_TOKEN")
+    } | {BACKEND_TOKEN}
+    return any(presented_bearer_is(name) for name in names)
+
+
 @dataclass(frozen=True)
 class PeerIdentity:
     credential_name: str

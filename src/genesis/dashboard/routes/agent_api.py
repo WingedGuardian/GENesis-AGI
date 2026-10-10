@@ -144,6 +144,15 @@ def agent_health():
     return jsonify(runtime_ready=True, task_service_ready=False, active_tasks=0, queue_depth=0)
 
 
+@agent_api_bp.route(ROOT + "/approvals")
+@_async_route(timeout=15)
+async def agent_approvals():
+    service = current_app.config.get("GENESIS_PEER_APPROVALS")
+    if service is None:
+        return _err("not_ready", 503)
+    return jsonify(approvals=await service.pending(g.peer_identity.peer))
+
+
 def _tasks():
     # GROUNDWORK(peer-coordinator): unit8 installs this only after constrained
     # execution, broker, human approval and recovery readiness are established.

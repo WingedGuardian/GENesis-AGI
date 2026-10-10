@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import aiosqlite
 
@@ -45,6 +45,7 @@ class ApprovalManager:
         description: str,
         context: str | None = None,
         timeout_seconds: int | None = None,
+        request_id: str | None = None,
     ) -> str:
         """Create an approval request and return its ID.
 
@@ -53,6 +54,10 @@ class ApprovalManager:
         ``None`` timeout means the request waits indefinitely (irreversible
         actions).
         """
+        if request_id is not None and (
+            not isinstance(request_id, str) or str(UUID(request_id)) != request_id
+        ):
+            raise ValueError("Invalid approval request identifier")
         if timeout_seconds is None and self._classifier is not None:
             timeout_seconds = self._classifier.get_timeout(action_type)
 
@@ -64,7 +69,7 @@ class ApprovalManager:
         if timeout_seconds is not None:
             timeout_at = (now + timedelta(seconds=timeout_seconds)).isoformat()
 
-        request_id = str(uuid4())
+        request_id = request_id or str(uuid4())
 
         await crud.create_chained(
             self._db,
@@ -110,6 +115,14 @@ class ApprovalManager:
         authority) — see ``db/crud/approval_requests.classify_resolver``.
         """
         now_iso = datetime.now(UTC).isoformat()
+
+        from genesis.autonomy.peer_approval import PEER_OPERATION_ACTION_TYPE, named_human_resolver
+
+        row = await crud.get_by_id(self._db, request_id)
+        if row is not None and row["action_type"] == PEER_OPERATION_ACTION_TYPE and (
+            status in ("approved", "rejected") and not named_human_resolver(resolved_by)
+        ):
+            return False
 
         ok = await crud.resolve(
             self._db,

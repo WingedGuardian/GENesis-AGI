@@ -51,7 +51,7 @@ async def configure(registry, monkeypatch):
     return {"Authorization": "Bearer " + credential}
 
 
-@pytest.mark.parametrize("path", ["/health", "/.well-known/agent-card.json", "/unknown"])
+@pytest.mark.parametrize("path", ["/health", "/.well-known/agent-card.json", "/approvals", "/unknown"])
 async def test_disabled_every_path_and_options(app, path):
     client = app.test_client()
     for method in ("GET", "POST", "OPTIONS", "TRACE"):

@@ -13,6 +13,17 @@ from genesis.dashboard._blueprint import _async_route, blueprint
 
 logger = logging.getLogger(__name__)
 
+
+def _approval_resolver_credential():
+    from genesis.dashboard.auth import has_internal_bearer
+    from genesis.peers.auth import presented_peer_credential
+
+    if request.headers.get("Authorization") and (
+        presented_peer_credential() or not has_internal_bearer()
+    ):
+        return jsonify(error="Unauthorized", code="unauthorized"), 401
+    return None
+
 # IANA timezone names for the dashboard timezone dropdown, computed ONCE at import
 # (``available_timezones()`` scans the tz database on disk — ~600 entries — so it
 # must not run per request). Sorted for stable rendering; validation of a chosen
@@ -94,6 +105,9 @@ async def pending_approvals():
 @_async_route
 async def resolve_approval(request_id: str):
     """Resolve a pending approval request from the dashboard."""
+    refusal = _approval_resolver_credential()
+    if refusal is not None:
+        return refusal
     from genesis.runtime import GenesisRuntime
 
     rt = GenesisRuntime.instance()
@@ -105,6 +119,26 @@ async def resolve_approval(request_id: str):
     decision = str(payload.get("decision") or "").strip().lower()
     if decision not in {"approved", "rejected"}:
         return jsonify({"error": "decision must be 'approved' or 'rejected'"}), 400
+
+    from genesis.autonomy.peer_approval import PEER_OPERATION_ACTION_TYPE
+    from genesis.dashboard.auth import (
+        _is_same_origin_request,
+        has_internal_bearer,
+        has_verified_credential,
+    )
+
+    row = await gate.get_request(request_id)
+    if (
+        row is not None
+        and row.get("action_type") == PEER_OPERATION_ACTION_TYPE
+        and not has_internal_bearer()
+    ):
+        # Passwordless admission is not proof of owner consent. Keep the
+        # credential veto above, even when an owner cookie is also present.
+        if not has_verified_credential():
+            return jsonify(error="Unauthorized", code="unauthorized"), 401
+        if not _is_same_origin_request():
+            return jsonify(error="Forbidden", code="forbidden"), 403
 
     ok = await gate.resolve_request(
         request_id,
@@ -120,6 +154,9 @@ async def resolve_approval(request_id: str):
 @_async_route
 async def approve_all_approvals():
     """Approve all pending approval requests at once."""
+    refusal = _approval_resolver_credential()
+    if refusal is not None:
+        return refusal
     from genesis.runtime import GenesisRuntime
 
     rt = GenesisRuntime.instance()

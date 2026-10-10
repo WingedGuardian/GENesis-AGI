@@ -1515,7 +1515,7 @@ async def handle_callback_query(
     - ``approve:{waiter_key}`` / ``reject:{waiter_key}`` — Sentinel
       blocking-approval flow; resolves a ``ReplyWaiter`` keyed by
       ``waiter_key``.
-    - ``cli_approve:{request_id}`` — autonomous CLI fallback single-approve;
+    - ``cli_approve:{request_id}`` / ``cli_reject:{request_id}`` — named individual consent;
       resolves the referenced request directly via
       ``AutonomousCliApprovalGate.resolve_request``.  Bypasses ReplyWaiter.
     - ``cli_approve_all:{request_id}`` — autonomous CLI fallback batch-
@@ -1551,7 +1551,7 @@ async def handle_callback_query(
     action, key = parts[0], parts[1]
 
     # --- Autonomous CLI fallback: single approve ---
-    if action == "cli_approve":
+    if action in {"cli_approve", "cli_reject"}:
         if ctx.autonomous_cli_gate is None:
             log.error(
                 "cli_approve button pressed but autonomous_cli_gate is not "
@@ -1562,7 +1562,7 @@ async def handle_callback_query(
         try:
             ok = await ctx.autonomous_cli_gate.resolve_request(
                 key,
-                decision="approved",
+                decision="approved" if action == "cli_approve" else "rejected",
                 resolved_by=f"telegram:button:{user.id}",
             )
         except Exception:
@@ -1573,7 +1573,7 @@ async def handle_callback_query(
             )
             return
         if ok:
-            label = "✅ Approved"
+            label = "✅ Approved" if action == "cli_approve" else "Rejected"
         else:
             label = await _resolution_label(ctx.autonomous_cli_gate, key)
         log.info("cli_approve %s → %s (user %s)", key, label, user.id)

@@ -171,6 +171,7 @@ async def unified_comms():
     # --- Pending approvals ---
     try:
         from genesis.autonomy.desktop_gate import DESKTOP_GATE_ACTION_TYPE
+        from genesis.autonomy.peer_approval import PEER_OPERATION_ACTION_TYPE
         from genesis.db.crud import approval_requests
 
         raw_pending = await approval_requests.list_pending(rt.db)
@@ -196,9 +197,10 @@ async def unified_comms():
         # the oldest five descriptions, not just a count. It offers no button,
         # so it is not an approval surface — but the row's own lifetime is what
         # bounds it there, which is why desktop holds now carry a TTL.
+        # Peer operation consent belongs on the dedicated peer/task/digest card.
         pending_approvals = [
             r for r in pending_approvals
-            if r.get("action_type") != DESKTOP_GATE_ACTION_TYPE
+            if r.get("action_type") not in (DESKTOP_GATE_ACTION_TYPE, PEER_OPERATION_ACTION_TYPE)
         ]
         counts["pending_approvals"] = len(pending_approvals)
     except Exception:
