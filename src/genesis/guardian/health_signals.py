@@ -32,7 +32,6 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from genesis.guardian._http import opener_for_url
 from genesis.guardian._subprocess import run_subprocess as _run_subprocess
 from genesis.guardian.config import GuardianConfig
 
@@ -129,8 +128,7 @@ def _http_get(url: str, timeout: float = 10.0) -> tuple[int, str]:
     """Synchronous HTTP GET via stdlib. Returns (status_code, body)."""
     req = urllib.request.Request(url, method="GET")  # noqa: S310 - stdlib-only guardian; https endpoint from config
     try:
-        opener = opener_for_url(url)
-        with opener.open(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - stdlib-only guardian; https endpoint from config
             body = resp.read().decode("utf-8", errors="replace")
             return resp.status, body
     except urllib.error.HTTPError as exc:
@@ -205,22 +203,13 @@ async def probe_icmp_reachable(config: GuardianConfig) -> SignalResult:
     last_exc: Exception | None = None
     retry_used = False
 
-    target = config.container_ip
-    if not target:
-        target = await asyncio.to_thread(config._detect_container_ip)
-        if target == "127.0.0.1":
-            return SignalResult(
-                name=name, alive=False, latency_ms=0,
-                detail="container address auto-detection failed", collected_at=t0.isoformat(),
-            )
-
     for attempt in range(2):
         try:
             rc, stdout, stderr = await _run_subprocess(
                 "ping",
                 f"-c{config.probes.ping_count}",
                 f"-W{config.probes.ping_timeout_s}",
-                target,
+                config.container_ip,
                 timeout=config.probes.probe_timeout_s,
             )
             if rc == 0:

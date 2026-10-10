@@ -106,7 +106,7 @@ class TestSendDialogue:
         mock_resp.__exit__ = MagicMock(return_value=False)
 
         req = DialogueRequest(["health_api"], ["container_exists"], 30.0, "surveying", {})
-        with patch.object(urllib.request.OpenerDirector, "open", return_value=mock_resp):
+        with patch.object(urllib.request, "urlopen", return_value=mock_resp):
             resp = await send_dialogue(config, req)
 
         assert resp.acknowledged is True
@@ -134,7 +134,7 @@ class TestSendDialogue:
         mock_resp.__exit__ = MagicMock(return_value=False)
 
         req = DialogueRequest(["health_api"], [], 60.0, "surveying", {})
-        with patch.object(urllib.request.OpenerDirector, "open", return_value=mock_resp):
+        with patch.object(urllib.request, "urlopen", return_value=mock_resp):
             resp = await send_dialogue(config, req)
 
         assert resp.acknowledged is True
@@ -160,7 +160,7 @@ class TestSendDialogue:
         mock_resp.__exit__ = MagicMock(return_value=False)
 
         req = DialogueRequest(["health_api"], [], 30.0, "surveying", {})
-        with patch.object(urllib.request.OpenerDirector, "open", return_value=mock_resp):
+        with patch.object(urllib.request, "urlopen", return_value=mock_resp):
             resp = await send_dialogue(config, req)
 
         assert resp.acknowledged is True
@@ -171,7 +171,7 @@ class TestSendDialogue:
         import urllib.request
 
         with patch.object(
-            urllib.request.OpenerDirector, "open",
+            urllib.request, "urlopen",
             side_effect=ConnectionRefusedError("refused"),
         ):
             req = DialogueRequest(["health_api"], [], 60.0, "surveying", {})
@@ -192,7 +192,7 @@ class TestSendDialogue:
         # HTTPError.read() needs to return bytes
         error.read = lambda: b"bootstrapping"
 
-        with patch.object(urllib.request.OpenerDirector, "open", side_effect=error):
+        with patch.object(urllib.request, "urlopen", side_effect=error):
             req = DialogueRequest(["health_api"], [], 60.0, "surveying", {})
             resp = await send_dialogue(config, req)
 

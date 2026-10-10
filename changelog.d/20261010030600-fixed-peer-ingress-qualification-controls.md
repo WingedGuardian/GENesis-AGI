@@ -1,1 +1,0 @@
-- Requalify ingress rollout controls with qualified and refused pre-stop restart harnesses and the measured atomic-write denominator, without changing the production prerequisite guard.

@@ -7,7 +7,6 @@
 
 container_name: genesis
 container_ip: ""  # Auto-detected via `incus list` if empty
-health_api_host: ""  # HTTP-only override; use 127.0.0.1 for the host loopback proxy
 health_api_port: 5000
 check_interval_s: 30
 state_dir: "~/.local/state/genesis-guardian"

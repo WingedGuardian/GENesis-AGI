@@ -86,10 +86,8 @@ GUARDIAN_PAUSE_RENEW_MAX=4
 # Guardian down once PR-1's gateway is on the host; against an old gateway it
 # errors and we proceed unpaused (safe, dark). No-op when no host is configured.
 _guardian_pause() {
-    local strict=0
-    [ "${1:-}" != --require-existing ] || strict=1
     local cfg="$HOME/.genesis/guardian_remote.yaml"
-    [ -f "$cfg" ] || return "$strict"
+    [ -f "$cfg" ] || return 0
     local hip hus key
     # -P: neither the working directory (a `live` checkout holding candidate
     # files) nor any script directory goes first on sys.path. Not -I -S: yaml
@@ -100,19 +98,9 @@ _guardian_pause() {
     # and fall back to the historical default when the field is absent/empty.
     key=$("$VENV_DIR/bin/python" -P -c "import yaml,pathlib,os;k=yaml.safe_load(pathlib.Path('$cfg').read_text()).get('ssh_key','') or '';print(os.path.expanduser(k))" 2>/dev/null || true)
     [ -n "$key" ] || key="$HOME/.ssh/genesis_guardian_ed25519"
-    [ -n "$hip" ] && [ -f "$key" ] || return "$strict"
+    [ -n "$hip" ] && [ -f "$key" ] || return 0
     _GUARDIAN_HOST="${hus:-ubuntu}@${hip}"
     _GUARDIAN_KEY="$key"
-    # Read-only prerequisite: never create or take ownership of a pause.
-    if [ "$strict" = 1 ]; then
-        local response
-        response=$(timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
-            "$_GUARDIAN_HOST" paused 2>/dev/null) || return 1
-        "$VENV_DIR/bin/python" -P -c 'import json,sys;sys.exit(0 if json.load(sys.stdin).get("paused") is True else 1)' \
-            <<< "$response" 2>/dev/null || return 1
-        echo "  Guardian already paused — leaving the maintained pause intact"
-        return 0
-    fi
     # Don't clobber a pause we did not create (P2 #1): if the gateway already has an
     # UNEXPIRED pause (an operator or another workflow set it), leave it intact —
     # proceed WITHOUT pausing and WITHOUT arming resume, so our EXIT never removes
@@ -205,31 +193,4 @@ _guardian_renew_loop() {
             "$_GUARDIAN_HOST" "pause $GUARDIAN_PAUSE_TTL" >/dev/null 2>&1 || true
         i=$((i + 1))
     done
-}
-
-# A shell-local snapshot for this update, never exported to server children.
-# Unknown/mixed listeners require a maintained pause before loopback activation.
-_qualify_dashboard_loopback() {
-    [ "${_DASHBOARD_LOOPBACK_QUALIFIED:-}" != 1 ] || return 0
-    local cfg="$HOME/.genesis/guardian_remote.yaml" listeners endpoint rest
-    if [ ! -e "$cfg" ] && [ ! -L "$cfg" ]; then
-        _DASHBOARD_LOOPBACK_QUALIFIED=1
-        return 0
-    fi
-    if listeners=$(ss -H -ltn '( sport = :5000 )' 2>/dev/null) && [ -n "$listeners" ]; then
-        local state recv send all_loopback=1
-        while read -r state recv send endpoint rest; do
-            [ "$endpoint" = 127.0.0.1:5000 ] || all_loopback=0
-        done <<< "$listeners"
-        if [ "$all_loopback" = 1 ]; then
-            _DASHBOARD_LOOPBACK_QUALIFIED=1
-            return 0
-        fi
-    fi
-    if _guardian_pause --require-existing; then
-        _DASHBOARD_LOOPBACK_QUALIFIED=1
-        return 0
-    fi
-    echo "  REFUSE: first loopback activation requires a maintained Guardian pause; follow docs/reference/peer-ingress.md." >&2
-    return 1
 }

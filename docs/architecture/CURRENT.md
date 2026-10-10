@@ -1617,7 +1617,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: e4df379de612 2026-10-09
+verified: 83a835e32 2026-10-08
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -1628,23 +1628,6 @@ verified: e4df379de612 2026-10-09
   host reconcilers that share its version probe run on any branch).
   Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
-- **HTTP/ICMP targets are separate**: `health_api_host` (env
-  `GUARDIAN_HEALTH_HOST`) can use the host loopback dashboard proxy while ICMP
-  retains its configured/autodetected container address. Health/dialogue HTTP
-  requests bypass environment proxies only for numeric loopback targets; custom
-  targets retain urllib proxy policy. The operator `guardian.dashboard_ingress`
-  migration proves the loaded standard user service's selected YAML/effective
-  environment, live container-loopback listener and patch eligibility,
-  then patches preserved config before restricting Incus ingress. Full deployment
-  and migration preserve an operator-owned Guardian pause until direct health
-  verification. The first rollout stages merged updater code with the locked
-  code-only pull; incoming bootstrap refuses a legacy unqualified full updater
-  before mutation, and the new updater checks the listener or maintained pause.
-  This is a maintenance snapshot, not a held lease; migration does not activate peers. Setup stops before Guardian
-  when standard proxy endpoints/modes cannot be verified and checks local plus
-  inherited device absence before adding a proxy. Generated network instructions
-  use local loopback and explicit owner remote-access methods. See
-  [ingress and acceptance](../reference/peer-ingress.md).
 - **guard-layer watch** (`guardian/guard_layer_watch.py`, a SIDE-watch in
   `run_check`, not a `probe_*`): asks whether the AGENT TOOLING can still
   evaluate — the `genesis-hook` LAUNCHER end to end, the container venv

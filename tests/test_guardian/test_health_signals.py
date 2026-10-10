@@ -36,7 +36,7 @@ from genesis.guardian.health_signals import (
 
 @pytest.fixture
 def config() -> GuardianConfig:
-    return GuardianConfig(container_ip="192.0.2.1")
+    return GuardianConfig()
 
 
 def _mock_subprocess(rc: int = 0, stdout: str = "", stderr: str = ""):

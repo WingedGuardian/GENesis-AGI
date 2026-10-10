@@ -16,9 +16,6 @@
 #   --post-merge  Skip fetch/merge (code already merged by CC conflict resolution);
 #                 run only bootstrap, migrations, health check, and service restart.
 
-unset GENESIS_DASHBOARD_LOOPBACK_QUALIFIED _DASHBOARD_LOOPBACK_QUALIFIED
-_DASHBOARD_LOOPBACK_QUALIFIED=""
-
 set -Eeuo pipefail  # -E: the ERR trap is inherited by functions AND subshells
                     # (see _on_err's BASH_SUBSHELL guard for the subshell case)
 
@@ -186,10 +183,8 @@ _on_signal_prestop() {
     for _svc in "${WERE_RUNNING[@]:-}"; do
         [ -n "$_svc" ] || continue
         if [ "$_svc" = "genesis-server" ]; then
-            if _qualify_dashboard_loopback; then
-                _start_genesis_server 2>/dev/null \
-                    || systemctl --user restart genesis-server.service 2>/dev/null || true
-            fi
+            _start_genesis_server 2>/dev/null \
+                || systemctl --user restart genesis-server.service 2>/dev/null || true
         else
             systemctl --user start "$_svc.service" 2>/dev/null || true
         fi
@@ -990,7 +985,6 @@ _ensure_server_down() {
 # Set only by _start_genesis_server's direct-start fallback; never inherited.
 _SERVER_DIRECT_PID=""
 _start_genesis_server() {
-    _qualify_dashboard_loopback || return 1
     # Use `restart` (NOT `start`): systemd's Restart=on-failure can resurrect a
     # STALE-code instance mid-update (a kill-based stop is seen as a failure and
     # arms a RestartSec timer). `start` is a no-op on that already-running instance
@@ -1014,7 +1008,7 @@ _start_genesis_server() {
     # command. The subshell execs, so $! is the server's pid.
     (
         if [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ]; then exec {GENESIS_CHECKOUT_LOCK_FD}>&-; fi
-        exec nohup "$VENV_DIR/bin/python" -m genesis serve --host 127.0.0.1 --port 5000 \
+        exec nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
             {_UPDATE_LOCK_FD}>&-
     ) >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
     # No unit tracks this process, so the no-change path's health probe waits on
@@ -1110,8 +1104,6 @@ for svc in genesis-bridge; do
         WERE_RUNNING+=("$svc")
     fi
 done
-
-_qualify_dashboard_loopback || exit 1
 
 # Now stop them. From here a SIG* runs _on_signal_prestop, which restarts
 # WERE_RUNNING (populated above) — so an interrupt mid-stop restores the server.
@@ -2263,7 +2255,7 @@ _write_state "bootstrap"
 # was stopped above, and the ERR trap is armed here, so a guard refusal would
 # escalate into a full update rollback. The guard must never gate this call.
 echo "--- Running bootstrap ---"
-GENESIS_DASHBOARD_LOOPBACK_QUALIFIED=1 GENESIS_BOOTSTRAP_ALLOW_LIVE=1 "$GENESIS_ROOT/scripts/bootstrap.sh" 2>&1 | tail -10
+GENESIS_BOOTSTRAP_ALLOW_LIVE=1 "$GENESIS_ROOT/scripts/bootstrap.sh" 2>&1 | tail -10
 echo "  Bootstrap complete"
 echo ""
 
