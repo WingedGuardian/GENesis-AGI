@@ -47,6 +47,7 @@ def _reset_cooldowns(monkeypatch):
     monkeypatch.setattr(loop, "_last_live_state", "")
     monkeypatch.setattr(loop, "_last_actionable_live_findings", None)
     monkeypatch.setattr(loop, "_last_live_unknown", False)
+    monkeypatch.setattr(loop, "_last_actionable_base_findings", None)
 
 
 def _snap(
@@ -551,6 +552,7 @@ def _restart(monkeypatch):
     monkeypatch.setattr(loop, "_last_live_state", "")
     monkeypatch.setattr(loop, "_last_actionable_live_findings", None)
     monkeypatch.setattr(loop, "_last_live_unknown", False)
+    monkeypatch.setattr(loop, "_last_actionable_base_findings", None)
     monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
     monkeypatch.setattr(loop, "_last_deploy_alert_key", "")
 
@@ -828,3 +830,67 @@ async def test_the_new_live_classes_have_their_own_wording(db, monkeypatch, find
     assert "scripts/deploy_candidates status" in row["content"]
     assert "update.sh" not in row["content"].split("`live`", 1)[0]
     assert row["priority"] != "critical"
+
+
+@pytest.mark.parametrize(
+    "live",
+    [
+        {"state": "unreadable", "on_live_branch": True, "reason": "slow"},
+        {"state": "deploying", "on_live_branch": True, "base": None},
+    ],
+    ids=["unreadable", "deploying"],
+)
+async def test_a_tick_with_no_live_base_keeps_tier2_and_guardian_alerts(db, monkeypatch, live):
+    """Round-4 review: with no base the tier-2 and Guardian comparisons do not run,
+    and the tick resolved their standing alerts as if the drift had gone."""
+    _patch_snapshot(
+        monkeypatch,
+        _snap(
+            ["tier2_pending:2", "host_guardian_drift"],
+            tier2=["a", "b"],
+            host_status="drift",
+            live={"state": "live", "base": "a" * 40},
+        ),
+    )
+    await loop._check_deploy_staleness(db)
+    [before] = await _rows(db)
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    _patch_snapshot(monkeypatch, _snap([], host_status="no_data", live=live))
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db, resolved=1) == []
+    assert [r["id"] for r in await _rows(db)] == [before["id"]]
+
+
+async def test_after_a_restart_a_base_less_tick_keeps_a_standing_guardian_alert(db, monkeypatch):
+    _patch_snapshot(
+        monkeypatch,
+        _snap(
+            ["host_guardian_drift"], host_status="drift", live={"state": "live", "base": "a" * 40}
+        ),
+    )
+    await loop._check_deploy_staleness(db)
+    _restart(monkeypatch)
+    _patch_snapshot(
+        monkeypatch,
+        _snap([], host_status="no_data", live={"state": "unreadable", "on_live_branch": True}),
+    )
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db, resolved=1) == []
+
+
+async def test_off_live_a_resolved_guardian_drift_still_resolves(db, monkeypatch):
+    """The carry is only for a missing `live` base; on main the comparison ran."""
+    _patch_snapshot(
+        monkeypatch, _snap(["host_guardian_drift"], host_status="drift", live={"state": "other"})
+    )
+    await loop._check_deploy_staleness(db)
+    _patch_snapshot(monkeypatch, _snap([], live={"state": "other", "candidates": 0}))
+    await loop._check_deploy_staleness(db)
+    assert len(await _rows(db, resolved=1)) == 1
+
+
+async def test_the_unbound_class_has_its_own_wording(db, monkeypatch):
+    _patch_snapshot(monkeypatch, _snap(["live_unbound"], live={"state": "unbound"}))
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert "no deploy manifest of this repository binds it" in row["content"]

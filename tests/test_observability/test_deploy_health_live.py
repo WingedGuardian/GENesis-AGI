@@ -491,7 +491,7 @@ def test_on_the_live_branch_with_no_manifest_the_held_code_is_unlisted(world, mo
     _engine_json(world, state="absent", holds=[_row("feat/c")])
     live = dh.collect_live(world.root)
     assert live == {"state": "unbound", "on_live_branch": True, "base": world.base, "unlisted": 1}
-    assert dh.live_findings(live) == ["live_unlisted:1"]
+    assert dh.live_findings(live) == ["live_unbound", "live_unlisted:1"]
     monkeypatch.setattr(dh, "collect_main_checkout_dirty", lambda repo: {"status": "clean"})
     assert dh._collect_sync(world.root, world.home / ".genesis")["upto"] == world.base
 
@@ -565,3 +565,49 @@ def test_the_real_engine_names_a_backwards_repin_unbuilt(dc, dc_ready, monkeypat
     assert dh.live_findings(dh.collect_live(w.root)) == []
     w.write_manifest([w.entry("feat/a", head=first)])
     assert dh.live_findings(dh.collect_live(w.root)) == ["live_unbuilt:1"]
+
+
+def test_an_unbound_checkout_holding_nothing_is_still_a_finding(world):
+    """Round-4 review: HEAD on `live` with no manifest and nothing held read as
+    healthy, yet the deploy scripts refuse that checkout (restart included)."""
+    _build_live(world, {"b.txt": "b\n"})
+    _engine_json(world, state="absent", holds=[])
+    live = dh.collect_live(world.root)
+    assert live["state"] == "unbound" and live["unlisted"] == 0
+    assert dh.live_findings(live) == ["live_unbound"]
+
+
+def test_two_merge_bases_give_a_base_holding_both(world, monkeypatch):
+    """Round-4 review: two candidates merged into `live`, then merged separately
+    into origin/main, give HEAD and origin/main two merge bases; one picked alone
+    omitted the other's files from the tier-2 and Guardian comparisons."""
+    base = world.base
+    for branch, files in (
+        ("feat/a", {"scripts/update.sh": "#!/bin/sh\n# a\n"}),
+        ("feat/b", {"src/genesis/guardian/x.py": "X = 1\n"}),
+    ):
+        _git(world.root, "switch", "-q", "-c", branch, base)
+        _commit(world.root, files, branch)
+    _git(world.root, "switch", "-q", "--detach", base)
+    _git(world.root, "merge", "-q", "--no-ff", "-m", "rebuild a", "feat/a")
+    _git(world.root, "merge", "-q", "--no-ff", "-m", "rebuild b", "feat/b")
+    _git(world.root, "switch", "-q", "-C", "live", _git(world.root, "rev-parse", "HEAD"))
+    # origin/main merges the two candidates separately, after the rebuild.
+    _git(world.origin, "fetch", "-q", str(world.root), "feat/a:feat/a", "feat/b:feat/b")
+    _git(world.origin, "merge", "-q", "--no-ff", "-m", "up a", "feat/a")
+    _git(world.origin, "merge", "-q", "--no-ff", "-m", "up b", "feat/b")
+    _git(world.root, "fetch", "-q", "origin")
+    bases = _git(world.root, "merge-base", "--all", "HEAD", "origin/main").split()
+    assert len(bases) == 2, "precondition: two merge bases"
+    got = dh._live_base(world.root)
+    assert got not in bases, "one base picked arbitrarily"
+    assert dh.collect_tier2_pending(world.root, base[:9], got) == ["scripts/update.sh"]
+    since = base[:9]
+    state = world.tmp / "host.json"
+    state.write_text(json.dumps({"version": {"deployed_commit": since}}))
+    assert dh.collect_host_gateway(world.root, state, upto=got)["status"] == "drift"
+    for single in bases:  # the defect: one base alone loses a candidate's files
+        assert (
+            dh.collect_tier2_pending(world.root, since, single) == []
+            or dh.collect_host_gateway(world.root, state, upto=single)["status"] == "ok"
+        )

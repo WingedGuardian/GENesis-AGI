@@ -1426,6 +1426,14 @@ _last_actionable_live_findings: list[str] | None = None
 # live_unreadable while a live alert stands in the store, else nothing, so an
 # install that never uses `live` never alerts on a slow engine.
 _last_live_unknown: bool = False
+# On `live` the tier-2 and Guardian comparisons run against the base `live` was
+# built on. A tick with no base (unreadable, mid-deploy, ambiguous bases) runs
+# neither, so their findings are carried from the last tick that had one, never
+# resolved by a comparison that did not run.
+_BASE_DEPENDENT_CLASSES = frozenset(
+    {"tier2_pending", "host_guardian_drift", "host_guardian_unknown_commit"}
+)
+_last_actionable_base_findings: list[str] | None = None
 
 
 async def _check_deploy_staleness(db) -> None:
@@ -1435,6 +1443,7 @@ async def _check_deploy_staleness(db) -> None:
     global _last_deploy_alert_at, _last_deploy_alert_key
     global _last_main_checkout_status, _last_actionable_main_checkout
     global _last_live_state, _last_actionable_live_findings, _last_live_unknown
+    global _last_actionable_base_findings
     if db is None:
         return
     try:
@@ -1550,6 +1559,24 @@ async def _check_deploy_staleness(db) -> None:
         else:
             _last_actionable_live_findings = [
                 f for f in findings if f.split(":", 1)[0] in _DEPLOY_LIVE_CLASSES
+            ]
+        on_live = live_state == "live" or bool(live.get("on_live_branch"))
+        if on_live and not live.get("base"):
+            carried_base = _last_actionable_base_findings
+            if carried_base is None:
+                # A restart cleared memory: carry the class of each standing alert.
+                carried_base = []
+                for cls in sorted(_BASE_DEPENDENT_CLASSES):
+                    if await observations.has_unresolved_matching(
+                        db, source="deploy_staleness_monitor", content_like=_finding_like(cls)
+                    ):
+                        carried_base.append(f"{cls}:?" if cls == "tier2_pending" else cls)
+            findings = [
+                f for f in findings if f.split(":", 1)[0] not in _BASE_DEPENDENT_CLASSES
+            ] + list(carried_base)
+        else:
+            _last_actionable_base_findings = [
+                f for f in findings if f.split(":", 1)[0] in _BASE_DEPENDENT_CLASSES
             ]
         if not findings:
             await _resolve_deploy_staleness(db)
@@ -1676,6 +1703,7 @@ _DEPLOY_CHECKOUT_CLASSES = frozenset({"main_checkout_dirty", "main_checkout_unre
 #: wording, no update.sh drift paragraph, and they never page.
 _DEPLOY_LIVE_CLASSES = frozenset(
     {
+        "live_unbound",
         "live_unreadable",
         "live_off_branch",
         "live_unbuilt",
@@ -1731,6 +1759,14 @@ def _deploy_live_paragraph(snap: dict, findings: list[str]) -> str:
                 "manifest says could not be read on two consecutive checks "
                 f"({live.get('reason') or 'no reason given'}): scripts/deploy_candidates "
                 "status shows what the engine reads."
+            )
+        elif cls == "live_unbound":
+            parts.append(
+                "HEAD is the branch `live`, but no deploy manifest of this repository "
+                "binds it (the manifest is missing or names another repository). The "
+                "deploy scripts refuse this checkout, restart included, until the "
+                "manifest is restored or the checkout leaves `live` "
+                "(scripts/deploy_candidates status shows what it holds)."
             )
         elif cls == "live_unbuilt":
             parts.append(

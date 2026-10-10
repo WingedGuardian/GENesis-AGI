@@ -699,8 +699,26 @@ def _on_live_branch(repo: Path) -> bool:
 
 
 def _live_base(repo: Path) -> str | None:
-    rc, base, _ = _run_git(repo, "merge-base", "HEAD", _BASE_REF, timeout=_CHEAP_TIMEOUT_S)
-    return base.strip() if rc == 0 and _FULL_SHA.match(base.strip()) else None
+    """What of origin/main `live` holds: the merge base of HEAD and origin/main,
+    used as the `upto` of the tier-2 and Guardian comparisons. Two candidates that
+    `live` merged and origin/main later merged separately give TWO merge bases,
+    and either alone omits the other's files (MEASURED, git 2.43: a guardian file
+    from one candidate was missing from the default single base). Then the base
+    is the tree of the two bases merged (`git diff` takes a tree), so neither is
+    dropped. More than two, or bases that do not merge cleanly: None (unknown)."""
+    rc, out, _ = _run_git(repo, "merge-base", "--all", "HEAD", _BASE_REF, timeout=_CHEAP_TIMEOUT_S)
+    bases = [ln.strip() for ln in out.splitlines() if ln.strip()] if rc == 0 else []
+    if not bases or not all(_FULL_SHA.match(b) for b in bases):
+        return None
+    if len(bases) == 1:
+        return bases[0]
+    if len(bases) != 2:
+        return None
+    rc, tree, _ = _run_git(
+        repo, "merge-tree", "--write-tree", "--no-messages", *bases, timeout=_CHEAP_TIMEOUT_S
+    )
+    first = tree.splitlines()[0].strip() if tree.strip() else ""
+    return first if rc == 0 and _FULL_SHA.match(first) else None
 
 
 def _unanswered(repo: Path, reason: str) -> dict:
@@ -888,6 +906,10 @@ def live_findings(live: dict | None) -> list[str]:
     if state == "other" and (live.get("candidates") or 0) > 0:
         return [f"live_off_branch:{live['candidates']}"]
     found = []
+    if state == "unbound":
+        # HEAD is the branch `live` with no manifest of this repository: the
+        # deploy scripts refuse it (restart included), whatever `live` holds.
+        found.append("live_unbound")
     if state == "live" and live.get("unbuilt"):
         found.append(f"live_unbuilt:{live['unbuilt']}")
     if state in ("live", "unbound") and live.get("unlisted"):
