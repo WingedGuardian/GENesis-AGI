@@ -32,7 +32,6 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from genesis.guardian._http import opener_for_url
 from genesis.guardian._subprocess import run_subprocess as _run_subprocess
 from genesis.guardian.config import GuardianConfig
 
@@ -129,8 +128,7 @@ def _http_get(url: str, timeout: float = 10.0) -> tuple[int, str]:
     """Synchronous HTTP GET via stdlib. Returns (status_code, body)."""
     req = urllib.request.Request(url, method="GET")  # noqa: S310 - stdlib-only guardian; https endpoint from config
     try:
-        opener = opener_for_url(url)
-        with opener.open(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - stdlib-only guardian; https endpoint from config
             body = resp.read().decode("utf-8", errors="replace")
             return resp.status, body
     except urllib.error.HTTPError as exc:

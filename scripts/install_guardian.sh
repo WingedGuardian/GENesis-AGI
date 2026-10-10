@@ -271,17 +271,6 @@ fi
 
 # Auto-detect health API port (default 5000)
 HEALTH_PORT=5000
-HEALTH_HOST=""
-if [ "$(incus config device get "$CONTAINER_NAME" dashboard-proxy listen 2>/dev/null || true)" = "tcp:127.0.0.1:5000" ] && \
-   [ "$(incus config device get "$CONTAINER_NAME" dashboard-proxy connect 2>/dev/null || true)" = "tcp:127.0.0.1:5000" ] && \
-   _proxy_bind=$(incus config device get "$CONTAINER_NAME" dashboard-proxy bind 2>/dev/null) && \
-   { [ -z "$_proxy_bind" ] || [ "$_proxy_bind" = "host" ]; } && \
-   _proxy_nat=$(incus config device get "$CONTAINER_NAME" dashboard-proxy nat 2>/dev/null) && \
-   { [ -z "$_proxy_nat" ] || [ "$_proxy_nat" = "false" ]; } && \
-   _proxy_protocol=$(incus config device get "$CONTAINER_NAME" dashboard-proxy proxy_protocol 2>/dev/null) && \
-   { [ -z "$_proxy_protocol" ] || [ "$_proxy_protocol" = "false" ]; }; then
-    HEALTH_HOST="127.0.0.1"
-fi
 
 VENV_DIR="$INSTALL_DIR/.venv"
 
@@ -442,7 +431,7 @@ from pathlib import Path
 import shutil
 import sys
 source, destination = map(Path, sys.argv[1:])
-shutil.copytree(source, destination, dirs_exist_ok=True,
+shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True,
                 ignore=lambda directory, names: ["guardian.yaml"] if Path(directory) == source else [])
 PYCONFIG
 fi
@@ -504,7 +493,6 @@ cat > "$INSTALL_DIR/config/guardian.yaml" << YAML
 
 container_name: "$CONTAINER_NAME"
 container_ip: "$CONTAINER_IP"
-health_api_host: "$HEALTH_HOST"
 health_api_port: $HEALTH_PORT
 
 # Host VM details — used by Genesis for bidirectional monitoring (SSH → gateway)
@@ -645,27 +633,6 @@ done
 
 systemctl --user daemon-reload
 echo "  Reloaded systemd"
-
-# For loopback proxies, update an unset HTTP target in the preserved config.
-# An explicit operator target is retained; migration's --apply is the separate
-# operation that intentionally moves an existing non-loopback target.
-if [ "$HEALTH_HOST" = "127.0.0.1" ]; then
-    PYTHONPATH="$INSTALL_DIR/src" "$VENV_DIR/bin/python" - "$INSTALL_DIR/config/guardian.yaml" <<'PYHEALTH'
-from pathlib import Path
-import sys
-from genesis.guardian.dashboard_ingress import configure_loopback_health
-try:
-    aligned = configure_loopback_health(Path(sys.argv[1]), only_if_unset=True)
-except ValueError:
-    aligned = False
-    print("  Guardian HTTP alignment skipped; service profile requires operator inspection.")
-if aligned:
-    print("  Guardian HTTP target aligned with the host loopback proxy.")
-else:
-    print("  Guardian HTTP target retained; existing/custom target or unproven service profile.")
-PYHEALTH
-fi
-
 
 # ── Step 9: Kernel OOM protection ─────────────────────────────────────
 # Prevent hard VM freezes under memory pressure. Cloud VMs often have

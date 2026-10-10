@@ -408,7 +408,6 @@ class GuardianConfig:
     container_name: str = "genesis"
     container_ip: str = ""  # Auto-detected at runtime if empty
     container_user: str = "ubuntu"
-    health_api_host: str = ""  # HTTP-only override; empty retains container IP
     health_api_port: int = 5000
     check_interval_s: int = 30
     state_dir: str = "~/.local/state/genesis-guardian"
@@ -466,7 +465,7 @@ class GuardianConfig:
 
     @property
     def health_url(self) -> str:
-        ip = self.health_api_host or self.container_ip or self._detect_container_ip()
+        ip = self.container_ip or self._detect_container_ip()
         return f"http://{ip}:{self.health_api_port}"
 
     def _detect_container_ip(self) -> str:
@@ -547,7 +546,6 @@ def _env_override(config: GuardianConfig) -> GuardianConfig:
         "GUARDIAN_CONTAINER_NAME": ("container_name", str),
         "GUARDIAN_CONTAINER_IP": ("container_ip", str),
         "GUARDIAN_CONTAINER_USER": ("container_user", str),
-        "GUARDIAN_HEALTH_HOST": ("health_api_host", str),
         "GUARDIAN_HEALTH_PORT": ("health_api_port", int),
         "GUARDIAN_CHECK_INTERVAL": ("check_interval_s", int),
         "GUARDIAN_STATE_DIR": ("state_dir", str),
@@ -770,7 +768,7 @@ def load_config(path: Path | None = None) -> GuardianConfig:
     # Top-level scalar fields
     top_fields = {
         "container_name", "container_ip", "container_user",
-        "health_api_host", "health_api_port", "check_interval_s", "state_dir",
+        "health_api_port", "check_interval_s", "state_dir",
         "host_ip", "host_user", "maintenance_file",
         "swap_reconcile_enabled", "swap_ceiling_pct", "gateway_pause_max_ahead_s",
     }
