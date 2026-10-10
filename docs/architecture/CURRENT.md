@@ -1594,7 +1594,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 7ec594c72 2026-10-09
+verified: 85652265c 2026-10-09
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -3001,7 +3001,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, env.py,
           _config_overlay.py]
-verified: 477efb7f7 2026-10-05
+verified: 85652265c 2026-10-09
 ```
 
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
@@ -3345,7 +3345,16 @@ verified: 477efb7f7 2026-10-05
   awareness tick (`resilience/tailscale_watchdog_events.py`), never read into
   the annotation prompt.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
-  encrypted `scripts/backup.sh` timer).
+  encrypted `scripts/backup.sh` timer). Recovery pins a selected off-site snapshot across retries,
+  authenticates legacy and v2 transcript archives, and verifies pooled
+  objects before restoring. Explicit local directories take precedence over
+  off-site configuration; independently identified Tier-1 audit records restore
+  additively with separate provenance. Cache entry points validate selected identity
+  and required component inventory structure,
+  and interrupted retirement resumes through fenced tombstones. Identical legacy
+  copies collapse; distinct decoded copies require an explicit encoding choice.
+  Reader support precedes new-format capture;
+  persistent analytics settings recovery lands separately.
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
   `process_lock` (the reason bare `python -m genesis serve` blocks systemd),
   tmp discipline (`~/tmp` for large temp — never override TMPDIR),

@@ -37,8 +37,8 @@ def sandbox(tmp_path):
     (gd / "data").mkdir(parents=True)
     (home / ".genesis").mkdir(parents=True)
     (home / ".gnupg").mkdir(mode=0o700)
-    backup = tmp_path / "backup"   # empty → the off-site pull is what stages payloads
-    backup.mkdir()
+    backup = home / "backups/genesis-backups"  # ambient Tier-1 cache
+    backup.mkdir(parents=True)
     offsite = tmp_path / "offsite"
     offsite.mkdir()
     bind = tmp_path / "bin"
@@ -88,14 +88,15 @@ def _snapshot(sandbox, host: str, stamp: str, *, complete: bool = True,
         (snap / "COMPLETE").write_text("")
 
 
-def _run(sandbox, *, backend="local", host_override=None):
+def _run(sandbox, *, backend="local", host_override=None, extra_args=(), force=True):
     env = dict(os.environ)
     env.update(
         HOME=str(sandbox["home"]), GENESIS_DIR=str(sandbox["gd"]),
         GENESIS_BACKUP_PASSPHRASE="testpass", QDRANT_URL="http://127.0.0.1:1",
-        # Owned offline DB: no server or other process can hold this fixture.
-        GENESIS_RESTORE_HOLDER_SCAN="none",
         PATH=f'{sandbox["bind"]}:{os.environ["PATH"]}',
+        # This fixture owns a fresh private database, with no server process.
+        # Host /proc visibility is unrelated to the offline sandbox boundary.
+        GENESIS_RESTORE_HOLDER_SCAN="none",
     )
     if backend == "local":
         env["GENESIS_BACKUP_TIER2_BACKEND"] = "local"
@@ -105,7 +106,8 @@ def _run(sandbox, *, backend="local", host_override=None):
     if host_override is not None:
         env["GENESIS_BACKUP_NAS_HOST"] = host_override
     return subprocess.run(
-        ["bash", str(_RESTORE), "--from", str(sandbox["backup"]), "--force"],
+        ["bash", str(_RESTORE),
+         *(["--force"] if force else []), *extra_args],
         env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL,
     )
 
@@ -114,6 +116,67 @@ def _db_value(sandbox) -> str:
     out = subprocess.run(["sqlite3", str(sandbox["gd"] / "data" / "genesis.db"),
                           "SELECT x FROM t;"], capture_output=True, text=True)
     return out.stdout.strip()
+
+
+@pytest.mark.parametrize("remote_available", [False, True])
+@pytest.mark.parametrize("mode", ["full", "database-only", "dry-run"])
+def test_explicit_local_source_wins_over_configured_backend(sandbox, remote_available, mode):
+    local = sandbox["home"] / "chosen-backup"
+    (local / "data").mkdir(parents=True)
+    (local / "data/genesis.sql").write_text("CREATE TABLE t(x); INSERT INTO t VALUES(17);\n")
+    (local / "memory").mkdir()
+    (local / "memory/local.md").write_text("chosen local memory\n")
+    if remote_available:
+        _snapshot(sandbox, "sourcebox", _NEW)
+    args = ["--from", str(local)]
+    if mode != "full":
+        args.append("--" + mode)
+    proc = _run(sandbox, host_override="sourcebox", extra_args=args)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not (sandbox["home"] / "backups/.genesis-restore/active.json").exists()
+    if mode == "dry-run":
+        assert not (sandbox["gd"] / "data/genesis.db").exists()
+        assert "off-site: (dry-run)" not in proc.stdout
+    else:
+        assert _db_value(sandbox) == "17"
+    if mode == "full":
+        memory = sandbox["home"] / ".claude/projects" / str(sandbox["gd"]).replace("/", "-") / "memory"
+        assert (memory / "local.md").read_text() == "chosen local memory\n"
+
+
+def test_empty_explicit_source_does_not_switch_to_remote(sandbox):
+    _snapshot(sandbox, "sourcebox", _NEW)
+    proc = _run(sandbox, extra_args=["--from", str(sandbox["backup"])])
+    assert proc.returncode != 0
+    assert not (sandbox["gd"] / "data/genesis.db").exists()
+    assert not (sandbox["home"] / "backups/.genesis-restore/active.json").exists()
+
+
+def test_recognized_tier1_audit_restores_separately_from_snapshot(sandbox, monkeypatch):
+    subprocess.run(["git", "init", "--quiet", str(sandbox["backup"])], check=True)
+    audit = sandbox["backup"] / "audit/merge_overrides"
+    audit.mkdir(parents=True)
+    (audit / "missing.jsonl").write_text('{"event":"synthetic backup audit"}\n')
+    (audit / "existing.jsonl").write_text('{"event":"old"}\n')
+    live = sandbox["home"] / ".genesis/merge_overrides"
+    live.mkdir()
+    # The suite relocates this store for safety; select this fixture-owned store
+    # explicitly so recovered bytes and the protected live record share a target.
+    monkeypatch.setenv("GENESIS_MERGE_OVERRIDE_DIR", str(live))
+    (live / "existing.jsonl").write_text('{"event":"live"}\n')
+    (sandbox["backup"] / "memory").mkdir()
+    (sandbox["backup"] / "memory/unselected.md").write_text("stale memory")
+    _snapshot(sandbox, "sourcebox", _NEW)
+    proc = _run(sandbox, host_override="sourcebox")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _db_value(sandbox) == "99"
+    assert (live / "missing.jsonl").exists(), proc.stdout + proc.stderr
+    assert (live / "missing.jsonl").read_bytes() == (audit / "missing.jsonl").read_bytes()
+    assert (live / "missing.jsonl").stat().st_mode & 0o777 == 0o600
+    assert (live / "existing.jsonl").read_text() == '{"event":"live"}\n'
+    memory = sandbox["home"] / ".claude/projects" / str(sandbox["gd"]).replace("/", "-") / "memory"
+    assert not (memory / "unselected.md").exists()
+    assert "separate Tier-1 repository" in proc.stdout
 
 
 def test_pulls_latest_complete_and_restores_db(sandbox):
@@ -266,7 +329,7 @@ def test_extra_archive_left_from_an_earlier_run_is_not_restored(sandbox):
     proc = _run(sandbox, host_override="sourcebox")
     assert (sandbox["home"] / "fresh" / "f.txt").read_bytes() == b"new", proc.stdout[-2000:]
     assert not (sandbox["home"] / "stale").exists(), "a stale extra archive was restored"
-    assert "not supplied by the selected off-site snapshot" in proc.stdout, proc.stdout[-2000:]
+    assert not (sandbox["backup"] / "extra" / "fresh-11111111.tar.gpg").exists(), "managed restore polluted the ambient cache"
 
 
 def test_extra_restore_follows_the_complete_marker(sandbox):
@@ -297,3 +360,132 @@ def test_extra_restore_warns_for_each_directory_the_snapshot_skipped(sandbox):
     proc = _run(sandbox, host_override="sourcebox")
     assert "does not hold extra directory work/missing" in proc.stdout, proc.stdout[-2000:]
     assert proc.returncode != 0
+
+
+def test_nonforce_retry_pins_snapshot_and_ignores_every_ambient_component(sandbox):
+    import json
+
+    _snapshot(sandbox, "sourcebox", _OLD)
+    first = _run(sandbox, host_override="sourcebox")
+    assert first.returncode == 0, first.stdout + first.stderr
+    _snapshot(sandbox, "sourcebox", _NEW, with_extras=True)
+    # These files must never become payloads merely because an earlier restore
+    # or Tier-1 clone left them in the ambient backup directory.
+    for sub, name, payload in [
+        ("memory", "stale.md.gpg", sandbox["mem_gpg"].read_bytes()),
+        ("secrets", "secrets.env.gpg", sandbox["sec_gpg"].read_bytes()),
+        ("config_overrides", "stale.local.yaml", b"stale: yes\n"),
+        ("eval", "stale.json.gpg", sandbox["mem_gpg"].read_bytes()),
+        ("creds", "stale.gpg", sandbox["mem_gpg"].read_bytes()),
+        ("audit/merge_overrides", "stale.jsonl", b"{}\n"),
+    ]:
+        path = sandbox["backup"] / sub / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    second = _run(sandbox, host_override="sourcebox", force=False)
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert f"resuming pinned snapshot {_OLD}" in second.stdout
+    assert not (sandbox["gd"] / "config" / "stale.local.yaml").exists()
+    assert not (sandbox["gd"] / "secrets.env").exists()
+    assert not list((sandbox["home"] / ".genesis").rglob("stale*"))
+    root = sandbox["home"] / "backups" / ".genesis-restore"
+    pointer = json.loads((root / "active.json").read_text())
+    state = json.loads((root / pointer["id"] / "selection.json").read_text())
+    assert state["snapshot"].endswith(_OLD)
+    assert state["components"]["memory"]["state"] == "empty"
+    refreshed = _run(sandbox, host_override="sourcebox", extra_args=("--refresh-snapshot",))
+    assert refreshed.returncode == 0, refreshed.stdout + refreshed.stderr
+    pointer = json.loads((root / "active.json").read_text())
+    assert json.loads((root / pointer["id"] / "selection.json").read_text())["snapshot"].endswith(_NEW)
+    assert len([p for p in root.iterdir() if p.is_dir()]) == 1
+
+
+def test_failed_component_retry_recovers_original_even_after_new_snapshot(sandbox):
+    import json
+
+    _snapshot(sandbox, "sourcebox", _OLD)
+    old = sandbox["offsite"] / "Genesis" / "sourcebox" / _OLD
+    (old / "memory" / "note.md.gpg").mkdir(parents=True)
+    first = _run(sandbox, host_override="sourcebox")
+    assert first.returncode != 0
+    root = sandbox["home"] / "backups" / ".genesis-restore"
+    sid = json.loads((root / "active.json").read_text())["id"]
+    state = json.loads((root / sid / "selection.json").read_text())
+    assert state["components"]["memory"]["entries"]["note.md.gpg"] is None
+    (old / "memory" / "note.md.gpg").rmdir()
+    (old / "memory" / "note.md.gpg").write_bytes(sandbox["mem_gpg"].read_bytes())
+    _snapshot(sandbox, "sourcebox", _NEW)
+    second = _run(sandbox, host_override="sourcebox")
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert f"resuming pinned snapshot {_OLD}" in second.stdout
+    assert list((sandbox["home"] / ".claude" / "projects").rglob("note.md"))
+
+
+def test_corrupt_cached_sql_requires_refetch_and_never_reads_ambient(sandbox):
+    import json
+
+    _snapshot(sandbox, "sourcebox", _OLD)
+    assert _run(sandbox, host_override="sourcebox").returncode == 0
+    root = sandbox["home"] / "backups" / ".genesis-restore"
+    sid = json.loads((root / "active.json").read_text())["id"]
+    (root / sid / "cache" / "data" / "genesis.sql.gpg").write_bytes(b"corrupt")
+    second = _run(sandbox, host_override="sourcebox")
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert _db_value(sandbox) == "99"
+
+
+def test_offsite_recovery_does_not_require_tier1_clone(sandbox):
+    _snapshot(sandbox, "sourcebox", _OLD)
+    sandbox["backup"].rmdir()
+    # A configured backend is sufficient even when --from does not exist.
+    proc = _run(sandbox, host_override="sourcebox")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _db_value(sandbox) == "99"
+    assert not sandbox["backup"].exists()
+
+
+def test_pooled_marker_missing_inventory_reports_incomplete(sandbox):
+    _snapshot(sandbox, "sourcebox", _OLD)
+    snap = sandbox["offsite"] / "Genesis/sourcebox" / _OLD
+    (snap / "COMPLETE").write_text("genesis-snapshot 1\ntranscript-pool 1\n")
+    proc = _run(sandbox, host_override="sourcebox")
+    assert proc.returncode != 0
+    assert "required pooled transcript inventory missing" in proc.stdout
+    assert _db_value(sandbox) == "99", "independent verified SQL did not recover"
+
+
+def test_retry_recovers_cached_components_when_backend_unavailable(sandbox):
+    _snapshot(sandbox, "sourcebox", _OLD)
+    first = _run(sandbox, host_override="sourcebox")
+    assert first.returncode == 0, first.stdout + first.stderr
+    (sandbox["offsite"] / "Genesis").rename(sandbox["offsite"] / "temporarily-unavailable")
+    retry = _run(sandbox, host_override="sourcebox")
+    assert retry.returncode == 0, retry.stdout + retry.stderr
+    assert _db_value(sandbox) == "99"
+    assert "SQLite: restored" in retry.stdout, retry.stdout
+
+
+def test_skipped_extra_marker_names_cannot_emit_terminal_controls(sandbox):
+    _snapshot(sandbox, "sourcebox", _OLD)
+    snap = sandbox["offsite"] / "Genesis/sourcebox" / _OLD
+    (snap / "COMPLETE").write_text("genesis-snapshot 1\nskipped work/\x1b[31munsafe\n")
+    proc = _run(sandbox, host_override="sourcebox")
+    assert proc.returncode != 0
+    assert "does not hold extra directory" in proc.stdout
+    assert "\x1b" not in proc.stdout
+
+
+def test_missing_uncached_payload_warns_but_other_cached_component_recovers(sandbox):
+    import json
+
+    _snapshot(sandbox, "sourcebox", _OLD, with_extras=True)
+    assert _run(sandbox, host_override="sourcebox").returncode == 0
+    root = sandbox["home"] / "backups/.genesis-restore"
+    sid = json.loads((root / "active.json").read_text())["id"]
+    (root / sid / "cache/data/genesis.sql.gpg").unlink()
+    (sandbox["offsite"] / "Genesis").rename(sandbox["offsite"] / "temporarily-unavailable")
+    proc = _run(sandbox, host_override="sourcebox")
+    assert proc.returncode != 0
+    assert "failed to pull data/genesis.sql.gpg" in proc.stdout
+    assert list((sandbox["home"] / ".claude/projects").rglob("note.md"))
+    assert _db_value(sandbox) == "99", "missing SQL must not destroy prior valid database"
