@@ -10,7 +10,7 @@ both halves -- the leak happens, and nothing sweeps that directory
 sweeps only `~/.genesis/cc-tmp`. Neither covers the `~/.genesis` root).
 
 WHY A GUARD AND NOT JUST FIXES. MEASURED 2026-09-09 against the merge of this
-tree (re-derived 2026-10-10): 73 atomic-write sites across 65 files, 30 of them dirty.
+tree (re-derived 2026-10-10): 74 atomic-write sites across 65 files, 30 of them dirty.
 That denominator moved FOUR times, in both directions, and every move is worth
 recording because each was invisible in a different way:
   * +1 site (58 -> 59). The temp-name test was anchored to the END of a string

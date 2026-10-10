@@ -1628,6 +1628,13 @@ verified: e4df379de612 2026-10-09
   host reconcilers that share its version probe run on any branch).
   Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **Shared backup decryption (development candidate)**: the standalone
+  `guardian/cred_integrity.py` file authenticates one passphrase-encrypted,
+  integrity-protected message for credential recovery and backup/restore.
+  It runs under system Python without Genesis imports. File recovery replaces
+  destinations only after successful authentication; the streaming API accepts
+  results only after checking the complete message. Native GPG controls cover
+  this candidate; installed rollout and configured-NAS writes remain unverified.
 - **HTTP/ICMP targets are separate**: `health_api_host` (env
   `GUARDIAN_HEALTH_HOST`) can use the host loopback dashboard proxy while ICMP
   retains its configured/autodetected container address. Health/dialogue HTTP
