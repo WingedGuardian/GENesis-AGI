@@ -135,7 +135,10 @@ class RecoveryEngine:
                 await self._dispatcher.send(Alert(
                     severity=AlertSeverity.INFO,
                     title=f"Recovery successful: {action.value}",
-                    body=f"Genesis is back online after {duration:.0f}s.",
+                    body=(
+                        f"Genesis is back online after {duration:.0f}s.\n"
+                        f"{detail}"
+                    ),
                     duration_s=duration,
                 ))
             else:
@@ -294,14 +297,54 @@ class RecoveryEngine:
         return await self._restart_services(container)
 
     async def _revert_code(self, container: str) -> tuple[bool, str]:
-        """Stash uncommitted changes and revert last commit, then restart."""
-        # Stash any uncommitted work
-        rc, _, _ = await _run_subprocess(
+        """Stash uncommitted changes and revert last commit, then restart.
+
+        The stash must SUCCEED before anything is reverted. This runs against the
+        container's LIVE development checkout — the tree sessions hold
+        uncommitted work in — and the stash's exit code used to be discarded, so
+        a FAILED stash still went on to revert on top of TRACKED changes that
+        were never saved. `git stash` exits 0 with "No local changes to save" on
+        a clean tree, so rc is the success test, not whether anything was stashed.
+
+        "tracked" is exact, not hedging: plain `git stash` does not take
+        UNTRACKED files, so rc == 0 does not mean the whole working tree is
+        safe — the same residual `scripts/hooks/git_discard_guard.py` documents
+        for `git stash create`. Switching to `-u` would remove those files from a
+        running checkout, which is a behaviour change this guard should not make
+        on its own.
+
+        The stash is never popped, so the outcome string below is the only place
+        the recovery alert can tell the owner where their work went.
+        """
+        # Stash any uncommitted work. The timeout matches the revert and the
+        # service restart (30s): `su -` starts a LOGIN shell before git even
+        # runs, inside a container that is by definition unhealthy — this ladder
+        # has an IO_TRIAGE rung precisely because I/O pressure is a routine cause
+        # — and a spurious abort here now retires the rung AND burns one of
+        # max_escalations. The cheapest precondition should not have the tightest
+        # budget in the file.
+        rc, stash_out, stderr = await _run_subprocess(
             "incus", "exec", container, "--",
             "su", "-", "ubuntu", "-c",
             "cd ~/genesis && git stash",
-            timeout=15.0,
+            timeout=30.0,
         )
+        # `git stash` can create the stash commit and then fail cleaning the
+        # worktree (a smudge-filter failure during its reset), so a nonzero rc
+        # does not mean refs/stash is unmoved — the alert has to send the
+        # operator at `git stash list`, not just at the error.
+        if rc != 0:
+            # `_run_subprocess` returns rc=-1 with stderr "timeout" for a timeout
+            # and rc=-1 with the exception text for an exec failure — neither is
+            # "the stash failed", it is "we do not know whether it ran". Say so:
+            # refusing is still right (this gates a destructive action), but an
+            # alert that calls an unknown a failure sends the reader after the
+            # wrong thing.
+            what = "timed out — state unknown" if stderr == "timeout" else "failed"
+            return False, (
+                f"git stash {what}, refusing to revert: {stderr} "
+                "(a partial stash is possible — check `git stash list`)"
+            )
 
         # Revert the last commit
         rc, stdout, stderr = await _run_subprocess(
@@ -313,9 +356,20 @@ class RecoveryEngine:
         if rc != 0:
             return False, f"git revert failed: {stderr}"
 
-        # Restart services after code change
+        # Restart services after code change. `git stash` exits 0 with
+        # "No local changes to save" on a clean tree — claiming work was
+        # stashed then would point the operator at `git stash pop`, which
+        # applies whatever unrelated entry sits at stash@{0}.
         svc_ok, svc_detail = await self._restart_services(container)
-        return svc_ok, f"Code reverted, {svc_detail}"
+        if "No local changes to save" in stash_out:
+            return svc_ok, (
+                f"Code reverted, {svc_detail} — working tree was clean, "
+                "nothing was stashed"
+            )
+        return svc_ok, (
+            f"Code reverted, {svc_detail} — tracked uncommitted work was moved to "
+            "a git stash and NOT popped (recover: git stash list / git stash pop)"
+        )
 
     async def _restart_container(self, container: str) -> tuple[bool, str]:
         """Restart the entire container (or start it, if stopped).
