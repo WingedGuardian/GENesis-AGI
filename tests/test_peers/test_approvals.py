@@ -2,6 +2,7 @@
 
 import hashlib
 import importlib
+import json
 import secrets
 import time
 import uuid
@@ -321,3 +322,46 @@ async def test_canonical_and_upgrade_approval_intent_ddl_identical():
 
     await migration.up(Capture())
     assert statements == [TABLES["peer_operation_approvals"].strip()]
+
+
+@pytest.mark.parametrize("receipt", [None, "", 0, False, [], {}, "fixture_delivery"])
+async def test_committed_receipt_recovers_lost_notification_bookkeeping(setup, receipt):
+    s = setup
+    identifier = await request(s)
+    persisted = json.loads((await s.manager.get_by_id(identifier))["context"])
+    persisted["delivery_id"] = receipt
+    await s.manager.update_context(identifier, context=json.dumps(persisted))
+    async with s.registry.transaction() as db:
+        await db.execute(
+            "UPDATE peer_operation_approvals SET notified_at=NULL,"
+            "notification_error='notification_unavailable' WHERE approval_id=?",
+            (identifier,),
+        )
+    assert await s.service.deliver(identifier)
+    assert len(s.notifications) == (1 if isinstance(receipt, str) and receipt else 2)
+    assert (await s.service.pending(s.identity))[0]["notification_error"] is None
+    assert (await s.manager.get_by_id(identifier))["status"] == "pending"
+    assert not await s.service.deliver(identifier)
+    async with s.registry.connection() as db:
+        row = await (await db.execute(
+            "SELECT notification_attempts,notified_at FROM peer_operation_approvals "
+            "WHERE approval_id=?", (identifier,),
+        )).fetchone()
+    assert row[0] == 2 and row[1] is not None
+
+
+async def test_committed_receipt_cannot_override_mismatched_intent(setup):
+    s = setup
+    identifier = await request(s)
+    persisted = json.loads((await s.manager.get_by_id(identifier))["context"])
+    persisted["extra"]["operation_digest"] = "different_operation"
+    await s.manager.update_context(identifier, context=json.dumps(persisted))
+    async with s.registry.transaction() as db:
+        await db.execute(
+            "UPDATE peer_operation_approvals SET notified_at=NULL WHERE approval_id=?",
+            (identifier,),
+        )
+    with pytest.raises(TaskRefusal):
+        await s.service.deliver(identifier)
+    assert len(s.notifications) == 1
+    assert (await s.manager.get_by_id(identifier))["status"] == "pending"

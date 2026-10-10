@@ -14,6 +14,7 @@ from flask import Flask
 
 # Importing the module registers its routes on the shared blueprint.
 import genesis.dashboard.routes.comms  # noqa: F401
+import genesis.dashboard.routes.state  # noqa: F401
 from genesis.dashboard._blueprint import blueprint
 
 
@@ -103,3 +104,29 @@ def test_comms_resolve_already_resolved_stays_404(client):
             json={"status": "approved", "revision_num": 2},
         )
     assert resp.status_code == 404
+
+
+
+def test_peer_consent_keeps_dedicated_feed_and_leaves_generic_cards(client):
+    from genesis.autonomy.desktop_gate import DESKTOP_GATE_ACTION_TYPE
+    from genesis.autonomy.peer_approval import PEER_OPERATION_ACTION_TYPE
+
+    rows = [
+        {"id": "ordinary", "action_type": "ordinary", "context": "{}"},
+        {"id": "peer", "action_type": PEER_OPERATION_ACTION_TYPE, "context": "{}"},
+        {"id": "desktop", "action_type": DESKTOP_GATE_ACTION_TYPE, "context": "{}"},
+    ]
+    with (
+        patch("genesis.runtime.GenesisRuntime") as mock_runtime,
+        patch("genesis.db.crud.approval_requests.list_pending", new_callable=AsyncMock,
+              return_value=rows),
+    ):
+        runtime = _rt()
+        runtime._db = runtime.db
+        mock_runtime.instance.return_value = runtime
+        generic = client.get("/api/genesis/comms")
+        dedicated = client.get("/api/genesis/approvals")
+    assert generic.status_code == dedicated.status_code == 200
+    assert [row["id"] for row in generic.json["pending_approvals"]] == ["ordinary"]
+    assert generic.json["counts"]["pending_approvals"] == 1
+    assert [row["id"] for row in dedicated.json] == ["ordinary", "peer"]

@@ -165,27 +165,32 @@ class PeerApprovals:
                 timeout_seconds=remaining,
             )
             request = await self.manager.get_by_id(approval_id)
+        persisted_context = json.loads(request["context"])
         if (
             request["action_type"] != PEER_OPERATION_ACTION_TYPE
             or request["description"] != intent["description"]
-            or json.loads(request["context"])["extra"] != context["extra"]
+            or persisted_context["extra"] != context["extra"]
         ):
             raise TaskRefusal("state_conflict", 409)
         if request["status"] != "pending" or intent["notified_at"] is not None:
             return False
-        delivered = False
-        # Notification failure remains visible and retryable, never consent.
-        with suppress(Exception):
-            delivered = (
-                await self.gate._send_request(
-                    request_id=approval_id,
-                    context=context,
-                    action_label=intent["description"],
-                    invocation=None,
-                    api_error=None,
+        # The manager receipt commits before association bookkeeping. Recover
+        # that success without sending again; receipt metadata is never consent.
+        receipt = persisted_context.get("delivery_id")
+        delivered = isinstance(receipt, str) and bool(receipt)
+        if not delivered:
+            # Notification failure remains visible and retryable, never consent.
+            with suppress(Exception):
+                delivered = (
+                    await self.gate._send_request(
+                        request_id=approval_id,
+                        context=context,
+                        action_label=intent["description"],
+                        invocation=None,
+                        api_error=None,
+                    )
+                    is True
                 )
-                is True
-            )
         async with self.registry.transaction() as db:
             await db.execute(
                 "UPDATE peer_operation_approvals SET notification_attempts=notification_attempts+1,"

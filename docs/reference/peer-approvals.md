@@ -11,7 +11,9 @@ The normal approval notification helper routes through OutreachPipeline, using
 an operation-specific card with individual Approve and Reject buttons. It does
 not offer batch approval or bare-text instructions. The owner dashboard retains
 its per-item consent surface and displays peer/task/digest instead of CLI fallback
-fields. Telegram callbacks still require an authorized owner account.
+fields. Generic communications and outreach-modal approval cards exclude peer
+operations; the dedicated approval feed retains them. Telegram callbacks still
+require an authorized owner account.
 
 Manager resolution and the named gate refuse peer-operation approval/rejection
 from batch, voice, bare/quoted text, generic user, system or autonomous origins.
@@ -30,7 +32,10 @@ read-only `/v1/agent/a2a/approvals` extension, with safe description, creation t
 remaining integer timeout and notification failure status.
 
 Missing or failed notification remains visible in the durable association and can
-be retried without creating a new approval. Retries and owned summaries recheck
+be retried without creating a new approval. A matched nonempty delivery receipt
+already committed in manager context reconciles missing association bookkeeping
+without sending again. A send interrupted before that receipt commits may still
+be retried; this is not an exactly-once transport guarantee. Retries and owned summaries recheck
 relationship, generation, cancellation, budget, expiry and admission/current
 grant intersection. Current task and grants come from one SQLite snapshot.
 The coordinator is responsible for periodic retry scheduling and reconciliation

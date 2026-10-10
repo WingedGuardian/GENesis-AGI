@@ -5210,7 +5210,11 @@
             ]);
             if (msgResp?.ok) {
               this.outreachModal.messages = await msgResp.json();
-              this.outreachModal.pendingApprovals = approvalResp?.ok ? await approvalResp.json() : [];
+              const pendingApprovals = approvalResp?.ok ? await approvalResp.json() : [];
+              // Peer consent requires the dedicated peer/task/digest card.
+              this.outreachModal.pendingApprovals = pendingApprovals.filter(
+                (approval) => approval.action_type !== "peer_operation",
+              );
               this.finishModalFetch("outreachModal");
             } else {
               this.failModalFetch("outreachModal", "Outreach history unavailable");

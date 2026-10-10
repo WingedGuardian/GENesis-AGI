@@ -935,7 +935,10 @@ verified: 787882667c48 2026-10-08
   task/generation/capability/digest creation intents before ApprovalManager rows
   and retries the normal approval notification helper. Only named individual
   dashboard or authorized Telegram buttons resolve peer operations; batch and
-  generic resolver origins refuse them. Notification failure stays visible.
+  generic resolver origins refuse them. Generic consent banners exclude peer
+  operations while the dedicated peer/task/digest card remains available.
+  Notification failure stays visible; an already committed manager delivery
+  receipt repairs missing association bookkeeping without another send.
   Continuation consumption and runtime activation require the coordinator slice.
   See [peer approvals](../reference/peer-approvals.md).
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
