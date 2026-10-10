@@ -9,6 +9,15 @@ from pathlib import Path
 
 
 def main():
+    auth = sys.argv[sys.argv.index("-A") + 1] if "-A" in sys.argv else ""
+    expected = (f"username={os.environ.get('GENESIS_BACKUP_NAS_USER', '')}\n"
+                f"password={os.environ.get('GENESIS_BACKUP_NAS_PASS', '')}\n")
+    if os.environ.get("SMB_AUTH_LOG"):
+        with open(os.environ["SMB_AUTH_LOG"], "a") as stream:
+            stream.write(auth + "\n")
+    if not auth or not Path(auth).is_file() or Path(auth).read_text() != expected:
+        print("NT_STATUS_ACCESS_DENIED")
+        return 1
     command = sys.argv[sys.argv.index("-c") + 1]
     with open(os.environ["SMB_LOG"], "a") as stream:
         stream.write(command + "\n")

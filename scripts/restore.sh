@@ -51,6 +51,9 @@ fi
 _SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/backup_backends.sh
 source "$_SCRIPT_DIR/lib/backup_backends.sh"
+# Load definitions before the off-site credential lease and its RETURN cleanup.
+# shellcheck source=scripts/lib/transcript_pool.sh
+source "$_SCRIPT_DIR/lib/transcript_pool.sh"
 
 # ── Args ─────────────────────────────────────────────────────────────
 BACKUP_REPO_OVERRIDE=""
@@ -556,7 +559,6 @@ PYBOUNDARY
         fi
     fi
     if [ "$transcript_mode" = pooled ]; then
-        source "$_SCRIPT_DIR/lib/transcript_pool.sh"
         mkdir -p "$BACKUP_DIR/transcripts" "$_RESTORE_WORKSPACE/cache/transcripts"
         if ! _TRANSCRIPTS_PULLED=$(transcript_pool_pull "$host_dir" "$snap" "$BACKUP_DIR/transcripts" "$_RESTORE_WORKSPACE/cache/transcripts"); then warn "off-site: transcript pooled inventory/object recovery incomplete"; fi
     elif [ "$transcript_mode" = legacy ]; then

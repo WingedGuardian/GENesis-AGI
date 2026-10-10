@@ -1160,4 +1160,6 @@ jobs:
         # Second reader correction native collection vs its ff1f389 parent:
         # selection 83 -> 152 (+69), reader 29 -> 64 (+35), CLI 3 -> 3.
         # Floor: 25407 + 104 = 25511; skip ceiling unchanged.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25511
+        # SMB credential lifetime controls: new file absent at ba541ea, native +8.
+        # Floor: 25511 + 8 = 25519; skip ceiling unchanged.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25519

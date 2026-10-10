@@ -3347,7 +3347,9 @@ verified: 85652265c 2026-10-09
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
   encrypted `scripts/backup.sh` timer). Recovery pins a selected off-site snapshot across retries,
   authenticates legacy and v2 transcript archives, and verifies pooled
-  objects before restoring. Explicit local directories take precedence over
+  objects before restoring. Pooled SMB downloads retain the backend credential
+  lease until the off-site pull returns; library definitions load before that lease.
+  Explicit local directories take precedence over
   off-site configuration; independently identified Tier-1 audit records restore
   additively with separate provenance. Cache entry points validate selected identity
   and required component inventory structure,

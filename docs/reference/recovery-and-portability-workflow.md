@@ -525,3 +525,10 @@ non-standard topologies): `CCTMPVOL_SIZE_GIB` (2), `CCTMPVOL_CONTAINER` (resolve
 from guardian.yaml, else `genesis`), `CCTMPVOL_POOL` (root device's pool),
 `CCTMPVOL_VOLUME_NAME` (`<container>-cc-tmp`), `CCTMPVOL_USER` (`ubuntu`),
 `CCTMPVOL_DISABLE` (opt out).
+
+Pooled transcript recovery over SMB uses the same temporary credential file for
+snapshot selection, manifest/object downloads and later extra payloads. Restore
+loads library definitions before creating that credential lease; function-return
+cleanup retires it when the pull returns; the script EXIT handler provides a
+fallback for early exit. An existing status-write failure can interrupt that EXIT
+handler before credential cleanup, so that fallback is not unconditional.
