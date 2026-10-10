@@ -259,7 +259,8 @@ class Engine(Repo):
                 phase = None
             if phase != "done":
                 reasons.append(
-                    f"{self.update_state} records an unfinished update.sh run; finish it with scripts/update.sh --post-merge."
+                    f"{self.update_state} records an unfinished update.sh run; finish it with scripts/update.sh --post-merge "
+                    "(if that refuses over hand-edited systemd units, resolve the units it names first)."
                 )
         branch = self.current_branch()
         if branch not in (LIVE_BRANCH, BASE_BRANCH):

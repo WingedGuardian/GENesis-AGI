@@ -195,6 +195,31 @@ Populates the voice exemplar library with samples of your writing style.
 | `.claude/settings.json` | Hook configuration (portable, tracked in git) |
 | `config/cc-global-settings.yaml` | Recommended Claude Code global settings |
 
+### Customising systemd units
+
+Genesis renders its user units into `~/.config/systemd/user/` from
+`scripts/systemd/*.template`, and each rendered unit ends with a
+`# genesis-managed` stamp. Put local changes in a drop-in, which updates never
+touch:
+
+```bash
+mkdir -p ~/.config/systemd/user/genesis-server.service.d
+printf '[Service]\nEnvironment=EXAMPLE=1\n' > ~/.config/systemd/user/genesis-server.service.d/override.conf
+systemctl --user daemon-reload
+```
+
+If you edit a unit file itself, `scripts/update.sh` refuses before stopping
+anything (exit 4) and names the unit. Move the change into a drop-in and restore
+the unit, or run `scripts/update.sh --take-template <unit>` to install the
+template (the old file is saved under `~/.genesis/deploy-backups/`).
+
+To keep one of these user timers (those rendered from
+`scripts/systemd/*.timer.template`) switched off across updates, list it in
+`~/.genesis/config/disabled_timers` (one unit name per line) and run
+`systemctl --user disable --now <timer>`. `systemctl mask` does not work on
+units in `~/.config/systemd/user`. The system-level network and Tailscale
+watchdogs have their own off switch; see `docs/reference/network-resilience.md`.
+
 ## Backups
 
 Backups run every 6 hours via the `genesis-backup.timer` systemd user unit

@@ -255,6 +255,37 @@ except Exception as e:
 fi
 # END crash-recovery
 
+# --- Managed units: a run summary, and (run by hand) a refusal before any change ---
+# update.sh hands us its summary file; run by hand we keep our own and print it at
+# the end. update.sh has already refused a hand-edited unit before stopping the
+# server, so the check below is for a run by hand: it refuses here, after crash
+# recovery (which never touches units) and before anything else changes. Under
+# update.sh the render loop still never overwrites an edited unit: it keeps it.
+if [ -z "${GENESIS_DEPLOY_SUMMARY:-}" ]; then
+    mkdir -p "$HOME/tmp"
+    GENESIS_DEPLOY_SUMMARY="$(mktemp -p "$HOME/tmp" bootstrap-summary.XXXXXX)"
+    _bootstrap_owns_summary=1
+fi
+export GENESIS_DEPLOY_SUMMARY
+if [ -z "${GENESIS_BOOTSTRAP_ALLOW_LIVE:-}" ]; then
+    _mu_rc=0
+    _mu_out="$(python3 -I -S "$SCRIPT_DIR/lib/managed_units.py" check --repo "$GENESIS_ROOT" \
+        --unit-dir "$HOME/.config/systemd/user" --upto HEAD --accept-legacy \
+        --take "${GENESIS_TAKE_TEMPLATES:-}")" || _mu_rc=$?
+    if [ "$_mu_rc" -eq 4 ]; then
+        echo "REFUSED: these systemd units were edited by hand and would be overwritten:"
+        printf '%s\n' "$_mu_out" | grep REFUSED || true
+        echo "Nothing was changed. Move each change into ~/.config/systemd/user/<unit>.d/*.conf"
+        echo "(a drop-in, which updates never touch), or replace it with the template, keeping"
+        echo "a backup:  GENESIS_TAKE_TEMPLATES='<unit> ...' scripts/bootstrap.sh"
+        rm -f "$GENESIS_DEPLOY_SUMMARY"
+        exit 4
+    elif [ "$_mu_rc" -ne 0 ]; then
+        echo "  WARNING: could not check the installed units for hand edits; any unit that"
+        echo "  differs from its template will be kept rather than overwritten."
+    fi
+fi
+
 # --- Prerequisites ---
 echo "--- Checking and installing prerequisites ---"
 
@@ -1297,6 +1328,13 @@ SERVICES_UPDATED=0
 
 if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     mkdir -p "$SYSTEMD_USER_DIR"
+    # shellcheck source=lib/managed_units.sh
+    . "$SCRIPT_DIR/lib/managed_units.sh"
+    GENESIS_MU_PREV="$(genesis_mu_prev_from_state)"
+    mkdir -p "$HOME/tmp"
+    _mu_dir="$(mktemp -d -p "$HOME/tmp" bootstrap-units.XXXXXX)"
+    _mu_render="$_mu_dir/render"
+    genesis_mu_precheck "$SYSTEMD_USER_DIR" "$_mu_dir"
     # Detect Claude Code binary directory for systemd PATH injection
     # Resolve the Claude Code binary dir. `dirname ""` collapses to "." and
     # exits 0 when claude isn't on PATH yet, so split the pipeline and resolve
@@ -1369,29 +1407,20 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         # anyway because no module was installed.
         _falkordb_ver_esc=$(_sed_repl_esc "${FALKORDB_VERSION:-4.20.4}")
         _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)")
-        rendered=$(sed -e "s|__HOME__|$_home_esc|g" \
-                       -e "s|__VENV__|$_venv_esc|g" \
-                       -e "s|__REPO_DIR__|$_repo_esc|g" \
-                       -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
-                       -e "s|__AZ_ROOT__|$_az_root_esc|g" \
-                       -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
-                       -e "s|__REDIS_SERVER__|$_redis_bin_esc|g" \
-                       "$template")
-        if [[ -f "$target" ]]; then
-            current=$(cat "$target")
-            if [[ "$rendered" != "$current" ]]; then
-                echo "$rendered" > "$target"
-                echo "  Updated: $svc_name"
-                SERVICES_UPDATED=1
-            else
-                echo "  OK: $svc_name (unchanged)"
-            fi
-        else
-            echo "$rendered" > "$target"
-            echo "  Created: $svc_name"
-            SERVICES_UPDATED=1
-        fi
+        sed -e "s|__HOME__|$_home_esc|g" \
+            -e "s|__VENV__|$_venv_esc|g" \
+            -e "s|__REPO_DIR__|$_repo_esc|g" \
+            -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
+            -e "s|__AZ_ROOT__|$_az_root_esc|g" \
+            -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
+            -e "s|__REDIS_SERVER__|$_redis_bin_esc|g" \
+            "$template" > "$_mu_render"
+        # Written only when the installed unit is Genesis's own render; a unit
+        # edited by hand is kept and named (lib/managed_units.sh).
+        genesis_install_managed_unit "scripts/systemd/$svc_name.template" "$_mu_render" "$target"
     done
+    rm -rf "$_mu_dir"
+    if [[ "$GENESIS_MU_CHANGED" = "1" ]]; then SERVICES_UPDATED=1; fi
     # Always reload before enabling — cheap + idempotent, and covers a prior run
     # that wrote a unit then crashed before reloading (files unchanged this run,
     # but systemd's in-memory view stale). B3.
@@ -1426,6 +1455,14 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         case "$timer_name" in
             genesis-backup.timer) continue ;;  # deliberate setup step — see note below
         esac
+        # A timer the operator switched off stays off: `systemctl disable` alone
+        # is undone here on the next update, and `mask` cannot work on a unit that
+        # lives in ~/.config/systemd/user (systemctl(1), "mask").
+        if genesis_timer_opted_out "$timer_name"; then
+            echo "  - $timer_name not enabled (listed in $GENESIS_DISABLED_TIMERS)"
+            genesis_mu_summary "skipped $timer_name: listed in $GENESIS_DISABLED_TIMERS"
+            continue
+        fi
         if [ -f "$SYSTEMD_USER_DIR/$timer_name" ]; then
             systemctl --user enable --now "$timer_name" 2>/dev/null && \
                 echo "  + $timer_name enabled + started" || true
@@ -1574,6 +1611,21 @@ if [[ -z "$MISSING_CRITICAL" && -z "$MISSING_HELPFUL" ]]; then
     echo "  All recommended plugins installed."
 fi
 echo
+
+# Last, so they survive update.sh's `| tail -10` of this output. The kept count
+# comes from the summary, not GENESIS_MU_KEPT: setup-vnc.sh keeps its units in a
+# child process whose counter never reaches this shell.
+_mu_kept_count="$(grep -c '^kept ' "$GENESIS_DEPLOY_SUMMARY" 2>/dev/null || true)"
+if [[ "${_bootstrap_owns_summary:-0}" = "1" ]]; then
+    if [[ -s "$GENESIS_DEPLOY_SUMMARY" ]]; then
+        echo "--- What this run changed outside the checkout ---"
+        sed 's/^/  /' "$GENESIS_DEPLOY_SUMMARY"
+    fi
+    rm -f "$GENESIS_DEPLOY_SUMMARY"
+fi
+if [[ "${_mu_kept_count:-0}" -gt 0 ]]; then
+    echo "  ${_mu_kept_count} systemd unit(s) KEPT, not overwritten: edited by hand or not a regular file."
+fi
 
 # setup-complete written only now that all bootstrap work has finished (B1) — the
 # marker gates the fresh-install onboarding prompt + ego cadence, so an interrupted

@@ -494,6 +494,7 @@ _RELOAD = ("scripts/lib/index_marker.py", "scripts/hooks/worktree_claim.py")
 _FRESH = (
     "scripts/disk_reclaim.py",
     "scripts/lib/live_checkout.py",
+    "scripts/lib/managed_units.py",
     "scripts/hooks/bash_allowlist_guard.sh",
     "scripts/hooks/bash_allowlist_lib.sh",
     "scripts/lib/deploy_marker.sh",

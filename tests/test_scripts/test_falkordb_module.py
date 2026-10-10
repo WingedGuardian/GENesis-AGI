@@ -331,6 +331,19 @@ def test_bootstrap_sources_the_lib_and_substitutes_the_version():
 
 
 _RENDER_LOOP_HEAD = '    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template'
+MU_LIB = REPO_ROOT / "scripts" / "lib" / "managed_units.sh"
+MU_PY = REPO_ROOT / "scripts" / "lib" / "managed_units.py"
+
+
+def _stamped(text: str) -> str:
+    """A render as bootstrap writes it: stamped by the real managed_units.py."""
+    return subprocess.run(
+        ["python3", "-I", "-S", str(MU_PY), "stamp"],
+        input=text,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
 
 
 def _bootstrap_render_loop() -> str:
@@ -354,10 +367,15 @@ def _render_falkordb_unit(tmp_path, env, prefix: str = ""):
     (templates / UNIT_TEMPLATE.name).write_text(UNIT_TEMPLATE.read_text())
     user_dir = tmp_path / "units"
     user_dir.mkdir(exist_ok=True)
+    # The loop's own setup (sourcing lib/managed_units.sh, its scratch render
+    # file) sits just above the sliced loop in bootstrap.sh, so it is re-created
+    # here; the checker is the real one, this repo's copy.
     script = (
         f'set -euo pipefail; source "{LIB}"; {prefix}\n'
         f'SYSTEMD_TEMPLATE_DIR="{templates}"; SYSTEMD_USER_DIR="{user_dir}"\n'
         f'GENESIS_ROOT="{tmp_path / "repo"}"; CC_BIN_DIR=/usr/local/bin\n'
+        f'source "{MU_LIB}"; GENESIS_MU_PY="{MU_PY}"; GENESIS_MU_PREV=""\n'
+        '_mu_dir="$(mktemp -d)"; _mu_render="$_mu_dir/render"\n'
         "SERVICES_UPDATED=0\n" + _bootstrap_render_loop() + "\n"
     )
     result = subprocess.run(
@@ -443,11 +461,30 @@ def test_a_verified_module_advances_the_unit(tmp_path):
     module.write_bytes(b"pretend-module")
     module.chmod(0o755)
     (tmp_path / "units").mkdir()
-    (tmp_path / "units" / "genesis-falkordb.service").write_text("LAST-WORKING-UNIT\n")
+    # The unit Genesis rendered for the previous pin: stamped, so not a hand edit.
+    previous = _stamped(UNIT_TEMPLATE.read_text().replace("__FALKORDB_VERSION__", "4.20.3"))
+    (tmp_path / "units" / "genesis-falkordb.service").write_text(previous)
 
     result, unit = _render_falkordb_unit(tmp_path, env, _pin_the_fake(tmp_path))
     assert result.returncode == 0, result.stderr
     assert "deps/falkordb/4.20.4/falkordb.so" in unit.read_text()
+
+
+def test_a_verified_module_never_overwrites_a_hand_edited_unit(tmp_path):
+    """The graph engine's unit is a managed unit like any other: a local edit is
+    kept and named, even when a verified module would advance the render."""
+    env = _stage(tmp_path)
+    module = Path(env["FALKORDB_DEPS_DIR"]) / "4.20.4" / "falkordb.so"
+    module.parent.mkdir(parents=True)
+    module.write_bytes(b"pretend-module")
+    module.chmod(0o755)
+    (tmp_path / "units").mkdir()
+    (tmp_path / "units" / "genesis-falkordb.service").write_text("LAST-WORKING-UNIT\n")
+
+    result, unit = _render_falkordb_unit(tmp_path, env, _pin_the_fake(tmp_path))
+    assert result.returncode == 0, result.stderr
+    assert unit.read_text() == "LAST-WORKING-UNIT\n"
+    assert "Kept: genesis-falkordb.service" in result.stdout
 
 
 def test_a_first_render_is_written_even_without_a_module(tmp_path):

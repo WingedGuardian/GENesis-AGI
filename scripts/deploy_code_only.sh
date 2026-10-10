@@ -373,7 +373,7 @@ d = json.load(open(sys.argv[1]))
 p = d.get("phase") if isinstance(d, dict) else None
 print(p if isinstance(p, str) else "")' "$UPDATE_STATE_FILE" 2>/dev/null || true)"
     [ "$_state_phase" = "done" ] \
-        || die "$UPDATE_STATE_FILE records an unfinished update.sh run; finish it with scripts/update.sh --post-merge."
+        || die "$UPDATE_STATE_FILE records an unfinished update.sh run; finish it with scripts/update.sh --post-merge (if that refuses over hand-edited systemd units, resolve the units it names first)."
 fi
 # `live`, the integration branch scripts/deploy_candidates builds from the deploy
 # manifest, is never pulled into: a fast-forward from upstream would drop every

@@ -87,6 +87,28 @@
                 <template x-if="$store.genesisDashboard.updateStatus && !$store.genesisDashboard.updateStatus.update_available">
                   <div style="margin-top:0.5rem; font-size:0.8rem; color:#81c784;">Up to date</div>
                 </template>
+
+                <!-- Edited systemd units -->
+                <template x-if="$store.genesisDashboard.updateStatus?.managed_units?.edited?.length">
+                  <div style="margin-top:0.75rem; padding:0.75rem; border-radius:4px; background:rgba(255,152,0,0.08); border:1px solid rgba(255,152,0,0.4);">
+                    <div style="font-size:0.85rem; font-weight:500; color:#ffb74d;">Edited systemd units: the next update will refuse</div>
+                    <div style="font-size:0.8rem; font-family:monospace; color:var(--color-text-secondary); margin-top:0.25rem;"
+                         x-text="$store.genesisDashboard.updateStatus.managed_units.edited.join(', ')"></div>
+                    <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-top:0.25rem;">
+                      Move each change into <code>~/.config/systemd/user/&lt;unit&gt;.d/override.conf</code>
+                      (updates never touch drop-ins) and restore the unit, or run
+                      <code>scripts/update.sh --take-template &lt;unit&gt;</code> to replace it (the old file is backed up).
+                    </div>
+                  </div>
+                </template>
+                <template x-if="$store.genesisDashboard.updateStatus?.managed_units?.unchecked?.length">
+                  <div style="margin-top:0.5rem; font-size:0.75rem; color:var(--color-text-secondary);"
+                       x-text="$store.genesisDashboard.updateStatus.managed_units.unchecked.length + ' systemd unit(s) differ from their template and predate edit stamps; checked at the next update: ' + $store.genesisDashboard.updateStatus.managed_units.unchecked.join(', ')"></div>
+                </template>
+                <template x-if="$store.genesisDashboard.updateStatus?.managed_units?.error">
+                  <div style="margin-top:0.5rem; font-size:0.75rem; color:#ffb74d;"
+                       x-text="$store.genesisDashboard.updateStatus.managed_units.error"></div>
+                </template>
               </div>
 
               <!-- Conflicts / failed update needing resolution -->

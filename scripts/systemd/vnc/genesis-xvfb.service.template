@@ -1,0 +1,14 @@
+[Unit]
+Description=Genesis Virtual Display (Xvfb)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1920x1080x24 -ac
+ExecStartPost=/bin/bash -c 'sleep 1 && DISPLAY=:99 /usr/bin/openbox --sm-disable &'
+ExecStartPost=/bin/bash -c 'sleep 1 && HOME=%h DISPLAY=:99 /usr/bin/feh --bg-center __BRAIN_IMG__'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
