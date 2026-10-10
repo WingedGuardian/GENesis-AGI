@@ -1157,7 +1157,9 @@ jobs:
         # against current main: 178 -> 219, entirely the new 41-case restore
         # authority suite. Other five changed test files retain their counts.
         # No new skip allowance. Floor: 25170 + 41 = 25211.
+        # Shared transcript credential-label policy (#3072): +2. Floor: 25211 + 2 = 25213.
         # Authenticated backup reads: measured net +106; 25170 + 106 = 25276.
         # Offline restore fixture changes are count-neutral; ceiling stays 102.
         # Merge with main (#3133 authenticated backup reads): main 25211 + this PR's measured +106 = 25317.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25317
+        # Re-merge with main (#3133): main 25213 + this PR's measured +106 = 25319.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25319
