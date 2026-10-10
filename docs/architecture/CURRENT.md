@@ -381,8 +381,20 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 6aae986bb 2026-10-04
+verified: a73bc16 2026-10-10
 ```
+
+- **Peer execution policy groundwork (dark, opt-in)** — `cc/peer_segment.py`
+  and `CCInvocation.peer_segment` constrain explicit internal invocations to one
+  private facade configuration, exact facade tools and isolated CLI settings.
+  Named systemd scopes enforce deadlines and descendant-aware cleanup on both
+  run paths, including cancellation; unknown drain state raises. Peer ownership
+  remains held through cleanup; checkout admission precedes launch reads and
+  is released before peer drain. Empty failed
+  scopes are collected for retry, and private error redaction preserves the
+  original exception through disabled or failed child tracing. The public peer
+  API, task coordinator and lease broker are separate dependent slices, so this
+  mechanism alone does not enable peer work. See [peer execution](../reference/peer-execution.md).
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
   `cc/gmodel_settings.py`): Kimi K3 and MiMo V2.6 Pro select subscription, native

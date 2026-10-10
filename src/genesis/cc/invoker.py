@@ -1673,7 +1673,7 @@ async def _emit_invocation_failed_event(
                 _failure_event_state.pop(key, None)
             else:
                 _failure_event_state[key] = prev_state
-        logger.debug("cc.invocation_failed event emit failed", exc_info=True)
+        logger.debug("cc.invocation_failed event emit failed", exc_info=invocation.peer_segment is None)
 
 
 def cc_span_settings_path(env_pins: dict[str, str] | None = None) -> str | None:
@@ -2289,6 +2289,9 @@ class CCInvoker:
     def _build_args(
         self, inv: CCInvocation, *, settings_pins: dict[str, str] | None = None
     ) -> list[str]:
+        if inv.peer_segment is not None:
+            inv.validate_peer_policy()
+            inv.peer_segment.validate_facade_config(inv.mcp_config)
         args = [self._claude_path, "-p"]
         # Roster routing: when model_id_override is set, model selection comes
         # entirely from ANTHROPIC_MODEL (set in _build_env). A --model flag here
@@ -2336,6 +2339,14 @@ class CCInvoker:
         # servers cleanly (probe-verified) — the secure-by-default posture.
         if inv.strict_mcp_config and not inv.bare:
             args.append("--strict-mcp-config")
+        if inv.peer_segment is not None:
+            # No owner settings/hooks/plugins or built-in tools. The immutable
+            # segment policy names exact facade tools; dontAsk refuses others.
+            args += ["--setting-sources", "", "--tools", "", "--permission-mode", "dontAsk",
+                     "--disable-slash-commands", "--no-chrome", "--no-session-persistence",
+                     "--allowedTools", ",".join(inv.peer_segment.tools),
+                     "--settings", json.dumps({"autoMemoryEnabled": False})]
+            return args
         # Register the dispatch hooks (span capture, Bash allowlist enforcement,
         # the main-checkout guard) for this session. Dispatched sessions run with
         # a cwd outside any git repo, so CC never loads the repo's
@@ -2386,6 +2397,10 @@ class CCInvoker:
     _CC_SANDBOX_TMPDIR = Path.home() / ".genesis" / "cc-tmp"
 
     def _build_env(self, inv: CCInvocation | None = None) -> dict[str, str]:
+        if inv is not None and inv.peer_segment is not None:
+            env = inv.peer_segment.environment(inv)
+            env.update(dict.fromkeys(_GH_CREDENTIAL_ENV, ""))
+            return env
         env = dict(os.environ)
         env.pop("CLAUDECODE", None)
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
@@ -2899,21 +2914,26 @@ class CCInvoker:
         # Registered for the whole call: a restart now would cancel it
         # (genesis.util.inflight; a no-op inside a caller's open unit).
         with inflight("claude", _inflight_label(invocation)):
-            admission = await admit_launch()
-            try:
-                invocation, roster_model = roster.apply_active(invocation)
+            scope = (
+                invocation.peer_segment.invocation()
+                if invocation.peer_segment is not None else contextlib.nullcontext()
+            )
+            async with scope:
+                admission = await admit_launch()
                 try:
-                    return await self._run_traced(invocation, roster_model, admission)
-                except CCError as exc:
-                    await _emit_invocation_failed_event(
-                        exc,
-                        invocation,
-                        streaming=False,
-                        roster_model=roster_model,
-                    )
-                    raise
-            finally:
-                admission.release()
+                    invocation, roster_model = roster.apply_active(invocation)
+                    try:
+                        return await self._run_traced(invocation, roster_model, admission)
+                    except CCError as exc:
+                        await _emit_invocation_failed_event(
+                            exc,
+                            invocation,
+                            streaming=False,
+                            roster_model=roster_model,
+                        )
+                        raise
+                finally:
+                    admission.release()
 
     async def _run_traced(
         self,
@@ -2933,6 +2953,7 @@ class CCInvoker:
         with start_span(
             "cc.session",
             SpanKind.CC_SESSION,
+            error_message="peer session failed" if invocation.peer_segment is not None else None,
             attributes={
                 "model": invocation.model,
                 "roster_model": roster_model,
@@ -2950,7 +2971,7 @@ class CCInvoker:
                 span.set_attr("output_tokens", output.output_tokens)
                 span.set_attr("model_used", output.model_used)
                 if output.is_error:
-                    span.set_status_error(output.error_message or "CC session error")
+                    span.set_status_error("peer session failed" if invocation.peer_segment is not None else output.error_message or "CC session error")
             return output
 
     async def _apply_login_fallback(
@@ -3010,7 +3031,10 @@ class CCInvoker:
     ) -> CCOutput:
         # Off the event loop: the pins may prepare the gh seal (filesystem
         # work behind a blocking lock) for a Bash-restricted profile.
-        pins = await asyncio.to_thread(_settings_env_pins, tuple(invocation.bash_allowlist))
+        if invocation.peer_segment is not None:
+            pins = {}
+        else:
+            pins = await asyncio.to_thread(_settings_env_pins, tuple(invocation.bash_allowlist))
         args = self._build_args(invocation, settings_pins=pins)
         # Off the event loop: settings read, seal write, two probes.
         await self.verify_allowlist_enforceable(invocation, settings_pins=pins)
@@ -3024,7 +3048,7 @@ class CCInvoker:
         # don't use an effort setting (Haiku).
         dispatched_effort = args[args.index("--effort") + 1] if "--effort" in args else "n/a"
 
-        prompt_preview = invocation.prompt[:80].replace("\n", " ")
+        prompt_preview = "<peer request>" if invocation.peer_segment is not None else invocation.prompt[:80].replace("\n", " ")
         logger.info(
             "CC session starting: model=%s effort=%s timeout=%ds prompt=%r...",
             invocation.model,
@@ -3036,7 +3060,7 @@ class CCInvoker:
         proc = None
         reg_key: str | None = None
         try:
-            scope_args = await _get_scope_args()
+            scope_args = invocation.peer_segment.scope_args(_SCOPE_PROPERTIES) if invocation.peer_segment is not None else await _get_scope_args()
             proc = await asyncio.create_subprocess_exec(
                 *scope_args,
                 *args,
@@ -3062,7 +3086,7 @@ class CCInvoker:
                     logger.warning(
                         "on_spawn callback failed for PID %s",
                         proc.pid,
-                        exc_info=True,
+                        exc_info=invocation.peer_segment is None,
                     )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(input=invocation.prompt.encode()),
@@ -3110,7 +3134,7 @@ class CCInvoker:
                 elapsed_s,
                 proc.pid,
                 invocation.timeout_s,
-                f" stderr: {stderr_text}" if stderr_text else "",
+                f" stderr: {stderr_text}" if stderr_text and invocation.peer_segment is None else "",
             )
             raise CCTimeoutError(f"Timeout after {invocation.timeout_s}s") from None
         finally:
@@ -3136,8 +3160,8 @@ class CCInvoker:
             logger.error(
                 "CC subprocess failed (exit=%s): stderr=%s stdout=%s",
                 proc.returncode,
-                stderr_text[:500] or "(no stderr)",
-                stdout_text[:500] or "(no stdout)",
+                "<peer content withheld>" if invocation.peer_segment is not None else stderr_text[:500] or "(no stderr)",
+                "<peer content withheld>" if invocation.peer_segment is not None else stdout_text[:500] or "(no stdout)",
             )
             err = self._classify_error(stderr_text, stdout_text)
             await self._notify_status_change(err)
@@ -3181,26 +3205,31 @@ class CCInvoker:
     ) -> CCOutput:
         """Run CC with stream-json output; emit-then-reraise on CCError (see run()).
 
-        In flight first, then checkout admission, then the roster read, as in run().
+        In flight first, then peer ownership, then checkout admission and roster reads.
         """
         with inflight("claude", _inflight_label(invocation)):
-            admission = await admit_launch()
-            try:
-                invocation, roster_model = roster.apply_active(invocation)
+            scope = (
+                invocation.peer_segment.invocation()
+                if invocation.peer_segment is not None else contextlib.nullcontext()
+            )
+            async with scope:
+                admission = await admit_launch()
                 try:
-                    return await self._run_streaming_traced(
-                        invocation, roster_model, on_event, admission
-                    )
-                except CCError as exc:
-                    await _emit_invocation_failed_event(
-                        exc,
-                        invocation,
-                        streaming=True,
-                        roster_model=roster_model,
-                    )
-                    raise
-            finally:
-                admission.release()
+                    invocation, roster_model = roster.apply_active(invocation)
+                    try:
+                        return await self._run_streaming_traced(
+                            invocation, roster_model, on_event, admission
+                        )
+                    except CCError as exc:
+                        await _emit_invocation_failed_event(
+                            exc,
+                            invocation,
+                            streaming=True,
+                            roster_model=roster_model,
+                        )
+                        raise
+                finally:
+                    admission.release()
 
     async def _run_streaming_traced(
         self,
@@ -3214,6 +3243,7 @@ class CCInvoker:
         with start_span(
             "cc.session",
             SpanKind.CC_SESSION,
+            error_message="peer session failed" if invocation.peer_segment is not None else None,
             attributes={
                 "model": invocation.model,
                 "roster_model": roster_model,
@@ -3231,7 +3261,7 @@ class CCInvoker:
                 span.set_attr("output_tokens", output.output_tokens)
                 span.set_attr("model_used", output.model_used)
                 if output.is_error:
-                    span.set_status_error(output.error_message or "CC session error")
+                    span.set_status_error("peer session failed" if invocation.peer_segment is not None else output.error_message or "CC session error")
             return output
 
     async def _run_streaming_inner(
@@ -3256,7 +3286,10 @@ class CCInvoker:
     ) -> CCOutput:
         # Off the event loop: the pins may prepare the gh seal (filesystem
         # work behind a blocking lock) for a Bash-restricted profile.
-        pins = await asyncio.to_thread(_settings_env_pins, tuple(invocation.bash_allowlist))
+        if invocation.peer_segment is not None:
+            pins = {}
+        else:
+            pins = await asyncio.to_thread(_settings_env_pins, tuple(invocation.bash_allowlist))
         args = self._build_args(invocation, settings_pins=pins)
         # Off the event loop: settings read, seal write, two probes.
         await self.verify_allowlist_enforceable(invocation, settings_pins=pins)
@@ -3278,7 +3311,7 @@ class CCInvoker:
         # don't use an effort setting (Haiku).
         dispatched_effort = args[args.index("--effort") + 1] if "--effort" in args else "n/a"
 
-        prompt_preview = invocation.prompt[:80].replace("\n", " ")
+        prompt_preview = "<peer request>" if invocation.peer_segment is not None else invocation.prompt[:80].replace("\n", " ")
         logger.info(
             "CC streaming session starting: model=%s effort=%s timeout=%ds prompt=%r...",
             invocation.model,
@@ -3288,7 +3321,7 @@ class CCInvoker:
         )
 
         try:
-            scope_args = await _get_scope_args()
+            scope_args = invocation.peer_segment.scope_args(_SCOPE_PROPERTIES) if invocation.peer_segment is not None else await _get_scope_args()
             proc = await asyncio.create_subprocess_exec(
                 *scope_args,
                 *args,
@@ -3331,7 +3364,7 @@ class CCInvoker:
                     logger.warning(
                         "on_spawn callback failed for PID %s",
                         proc.pid,
-                        exc_info=True,
+                        exc_info=invocation.peer_segment is None,
                     )
             # Feed prompt via stdin, then close to signal EOF
             if proc.stdin is not None:
@@ -3466,7 +3499,7 @@ class CCInvoker:
                                 len(line),
                             )
                             continue
-                        logger.warning("CC stream non-JSON line: %s", line[:200])
+                        logger.warning("CC stream non-JSON line: %s", "<peer content withheld>" if invocation.peer_segment is not None else line[:200])
                         continue
 
                     etype = event_raw.get("type", "?")
@@ -3543,7 +3576,7 @@ class CCInvoker:
                             "CC stream result: is_error=%s, result_len=%d, result_preview=%r",
                             event_raw.get("is_error"),
                             len(result_text or ""),
-                            (result_text or "")[:200],
+                            "<peer content withheld>" if invocation.peer_segment is not None else (result_text or "")[:200],
                         )
                         # First result is authoritative.  Terminate the
                         # subprocess to prevent stale task_notification events
@@ -3622,7 +3655,7 @@ class CCInvoker:
                 stderr_data = await asyncio.wait_for(proc.stderr.read(), 5.0)
         stderr_str = stderr_data.decode(errors="replace") if stderr_data else ""
         if stderr_str:
-            logger.warning("CC stderr: %s", stderr_str[:500])
+            logger.warning("CC stderr: %s", "<peer content withheld>" if invocation.peer_segment is not None else stderr_str[:500])
         bg_truncated = _stderr_bg_truncated(stderr_str)
         if bg_truncated:
             logger.warning(
@@ -3862,6 +3895,28 @@ class CCInvoker:
                 "NO result event arrived — the result line was almost certainly one of them",
             )
 
+        # A peer segment that exits nonzero (or unreaped) without a result was
+        # stopped, not finished: its deadline expired inside the scope, or
+        # systemd-run refused or terminated the scope. Raise, so no caller
+        # records a killed segment as an empty success. A FIXED error, neither
+        # classified nor reported as a status change: the collected text is
+        # peer-steered model output, and classifying it would let a peer write
+        # "usage limit reached" and mark the owner's CLI rate-limited or
+        # unavailable (or trigger roster failover).
+        # Peer-only: an owner stream can legitimately reach this fallback with
+        # a nonzero leader code (our own group kill after a wedged post-EOF
+        # leader, or a background run truncated at the CLI wait ceiling) and
+        # still carry a usable partial deliverable.
+        if invocation.peer_segment is not None and proc.returncode != 0:
+            logger.error(
+                "CC peer stream exited without a result (PID %s, exit=%s)",
+                proc.pid,
+                proc.returncode,
+            )
+            raise CCProcessError(
+                f"peer session ended without a result (exit={proc.returncode})"
+            )
+
         # No result event — treat collected text as response (success path)
         if self._last_was_error:
             await self._notify_status_change(None)
@@ -3995,7 +4050,7 @@ class CCInvoker:
 
         # Fallback: no structured output found, treat as plain text.
         # This likely means CC's output schema changed — log for diagnosis.
-        first_line = raw.strip().split("\n", 1)[0][:200] if raw.strip() else "(empty)"
+        first_line = "<peer content withheld>" if inv.peer_segment is not None else raw.strip().split("\n", 1)[0][:200] if raw.strip() else "(empty)"
         logger.warning(
             "CC output has no JSON result line — falling back to plain text. "
             "First line: %s (total %d chars)",
