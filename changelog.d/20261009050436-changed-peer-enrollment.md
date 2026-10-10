@@ -1,1 +1,2 @@
 - Trusted peer enrollment no longer requires a daily task allowance. The deprecated option remains compatible with saved databases and is omitted from peer listings.
+- Scoped peer health checks remain available while A2A discovery returns a clear not-ready response until the task transport is installed. Revoked peers no longer suppress the missing-credential boot warning.

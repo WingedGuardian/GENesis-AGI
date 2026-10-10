@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from genesis.guardian.config import (
+    SWAP_CEILING_OFF,
     GuardianConfig,
     load_config,
     load_secrets,
@@ -33,10 +34,10 @@ class TestGuardianConfigDefaults:
         assert cfg.health_url == "http://10.0.0.1:5000"
 
     def test_http_host_override_preserves_container_ip(self, monkeypatch) -> None:
-        cfg = GuardianConfig(container_ip="10.0.0.1", health_api_host="127.0.0.1")
+        cfg = GuardianConfig(container_ip="192.0.2.1", health_api_host="127.0.0.1")
         monkeypatch.setattr(cfg, "_detect_container_ip", lambda: pytest.fail("HTTP host is explicit"))
         assert cfg.health_url == "http://127.0.0.1:5000"
-        assert cfg.container_ip == "10.0.0.1"
+        assert cfg.container_ip == "192.0.2.1"
 
     def test_explicit_http_host_needs_no_container_detection(self, monkeypatch) -> None:
         cfg = GuardianConfig(health_api_host="127.0.0.1")
@@ -123,10 +124,10 @@ class TestLoadConfig:
 
     def test_http_host_loads_from_yaml(self, tmp_path: Path) -> None:
         p = tmp_path / "guardian.yaml"
-        p.write_text('container_ip: "10.0.0.1"\nhealth_api_host: "127.0.0.1"\n')
+        p.write_text('container_ip: "192.0.2.1"\nhealth_api_host: "127.0.0.1"\n')
         cfg = load_config(p)
         assert cfg.health_url == "http://127.0.0.1:5000"
-        assert cfg.container_ip == "10.0.0.1"
+        assert cfg.container_ip == "192.0.2.1"
 
     def test_unknown_yaml_keys_ignored(self, tmp_path: Path) -> None:
         p = tmp_path / "extra.yaml"
@@ -155,17 +156,17 @@ class TestEnvOverrides:
 
     def test_http_host_env_overrides_yaml(self, tmp_path, monkeypatch) -> None:
         p = tmp_path / "guardian.yaml"
-        p.write_text('container_ip: "10.0.0.1"\nhealth_api_host: "localhost"\n')
+        p.write_text('container_ip: "192.0.2.1"\nhealth_api_host: "localhost"\n')
         monkeypatch.setenv("GUARDIAN_HEALTH_HOST", "127.0.0.1")
         cfg = load_config(p)
         assert cfg.health_url == "http://127.0.0.1:5000"
-        assert cfg.container_ip == "10.0.0.1"
+        assert cfg.container_ip == "192.0.2.1"
 
     def test_empty_http_host_env_restores_legacy_target(self, tmp_path, monkeypatch) -> None:
         p = tmp_path / "guardian.yaml"
-        p.write_text('container_ip: "10.0.0.1"\nhealth_api_host: "127.0.0.1"\n')
+        p.write_text('container_ip: "192.0.2.1"\nhealth_api_host: "127.0.0.1"\n')
         monkeypatch.setenv("GUARDIAN_HEALTH_HOST", "")
-        assert load_config(p).health_url == "http://10.0.0.1:5000"
+        assert load_config(p).health_url == "http://192.0.2.1:5000"
 
     def test_telegram_token_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("GUARDIAN_TELEGRAM_BOT_TOKEN", "test-token")
@@ -221,3 +222,100 @@ class TestLoadSecrets:
         p.write_text('KEY="double quoted"\n')
         secrets = load_secrets(p)
         assert secrets["KEY"] == "double quoted"
+
+
+class TestSwapCeilingPctValidation:
+    """swap_ceiling_pct: a percentage of HOST SwapTotal (0, 100], "off", or None."""
+
+    def test_default_is_none(self) -> None:
+        cfg = GuardianConfig()
+        assert cfg.swap_ceiling_pct is None
+
+    def test_valid_value_loads_as_float(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: 50\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct == 50.0
+
+    def test_null_stays_none(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: null\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_zero_is_rejected_not_silently_disabling(self, tmp_path: Path) -> None:
+        """0 would mean 'cap swap at nothing' — the opposite of this knob's
+        purpose — so it must fall back to None (uncapped), not pass through."""
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: 0\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_over_100_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: 150\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_negative_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: -5\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_string_value_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: fifty\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_bool_true_is_rejected_not_treated_as_one_percent(self, tmp_path: Path) -> None:
+        """NOTE N3: bool is an int subclass in Python, so the bool check must
+        run BEFORE the numeric-range check, or `true` silently becomes 1%."""
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: true\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    @pytest.mark.parametrize("raw", ["off", "OFF", "false", "no", '"off"', '" Off "'])
+    def test_off_spellings_load_as_off(self, tmp_path: Path, raw: str) -> None:
+        """YAML 1.1 reads a bare off/false/no as boolean False, so all of them
+        mean the same request as the quoted string: remove the ceiling."""
+        p = tmp_path / "g.yaml"
+        p.write_text(f"swap_ceiling_pct: {raw}\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct == SWAP_CEILING_OFF
+
+    def test_huge_int_is_rejected_without_crashing_config_load(self, tmp_path: Path) -> None:
+        """Codex P2: math.isfinite(float(huge_int)) raises OverflowError
+        rather than returning False, which would abort config loading
+        entirely instead of the intended warn-and-ignore. A ~310-digit int is
+        caught by the range check before any float conversion is attempted."""
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: " + ("9" * 310) + "\n")
+        cfg = load_config(p)  # must not raise
+        assert cfg.swap_ceiling_pct is None
+
+    def test_nan_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: .nan\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_infinity_is_rejected(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: .inf\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct is None
+
+    def test_float_in_range_loads(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: 33.5\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct == 33.5
+
+    def test_boundary_100_is_accepted(self, tmp_path: Path) -> None:
+        p = tmp_path / "g.yaml"
+        p.write_text("swap_ceiling_pct: 100\n")
+        cfg = load_config(p)
+        assert cfg.swap_ceiling_pct == 100.0

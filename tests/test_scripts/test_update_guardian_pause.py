@@ -224,7 +224,7 @@ def test_pause_failure_proceeds_unpaused_no_abort(text: str, tmp_path: Path) -> 
     NOT abort the deploy, must NOT mark paused, and must warn (not falsely 'paused')."""
     run, ssh_log = _harness(text, tmp_path, ssh_rc=255)
     out = run(
-        '_guardian_pause\n[ "${_GUARDIAN_PAUSED:-}" = 1 ] && echo PAUSED_SET || echo UNPAUSED\n'
+        '_guardian_pause\n[ "${_GUARDIAN_PAUSED:-}" = 1 ] && echo PAUSED_SET || echo UNPAUSED\n_guardian_resume\n'
     )
     assert "REACHED_END" in out, "a failed pause must NOT abort the deploy"
     assert "UNPAUSED" in out and "PAUSED_SET" not in out, "a failed pause must not mark paused"
@@ -239,7 +239,7 @@ def test_pause_skips_when_already_paused(text: str, tmp_path: Path) -> None:
     EXIT never removes a pause we did not create."""
     run, ssh_log = _harness(text, tmp_path, ssh_rc=0, pre_paused=True)
     out = run(
-        '_guardian_pause\n[ "${_GUARDIAN_PAUSED:-}" = 1 ] && echo PAUSED_SET || echo UNPAUSED\n'
+        '_guardian_pause\n[ "${_GUARDIAN_PAUSED:-}" = 1 ] && echo PAUSED_SET || echo UNPAUSED\n_guardian_resume\n'
     )
     assert "REACHED_END" in out
     assert "UNPAUSED" in out and "PAUSED_SET" not in out, "must not own a pre-existing pause"
@@ -247,6 +247,7 @@ def test_pause_skips_when_already_paused(text: str, tmp_path: Path) -> None:
     sent = ssh_log.read_text() if ssh_log.exists() else ""
     assert "paused" in sent, "must query the gateway pause state"
     assert "pause 1800" not in sent, "must NOT send our own pause over a pre-existing one"
+    assert "resume" not in sent, "must preserve operator pause through the deploy resume path"
 
 
 def test_pause_proceeds_when_not_already_paused(text: str, tmp_path: Path) -> None:
@@ -303,8 +304,13 @@ def test_lease_renewer_wired_and_bounded(lib: str) -> None:
         "check the parent is alive BEFORE each renew"
     )
     pause = _extract_func(lib, "_guardian_pause")
-    assert "_guardian_renew_loop {_UPDATE_LOCK_FD}>&- >/dev/null 2>&1 &" in pause, (
-        "pause starts the renewer redirected, with the deploy lock fd closed"
+    # Started redirected, in a subshell that first closes both deploy lock fds
+    # (each only when set: `{var}>&-` on an unset name fails the command).
+    assert ") >/dev/null 2>&1 &" in pause, "pause starts the renewer redirected"
+    assert 'if [ -n "${_UPDATE_LOCK_FD:-}" ]; then exec {_UPDATE_LOCK_FD}>&-; fi' in pause
+    assert (
+        'if [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ]; then exec {GENESIS_CHECKOUT_LOCK_FD}>&-; fi'
+        in pause
     )
     assert "_GUARDIAN_RENEW_PID=$!" in pause, "pause must capture the renewer PID"
     resume = _extract_func(lib, "_guardian_resume")
@@ -344,6 +350,32 @@ def test_the_deploy_lock_is_free_right_after_a_clean_exit(text: str, tmp_path: P
     assert "REACHED_END" in out, out
     free = subprocess.run(["flock", "-n", str(lock), "true"], capture_output=True, timeout=10)
     assert free.returncode == 0, "the deploy lock was still held after the deploy exited"
+
+
+@pytest.mark.parametrize("with_update_lock", [True, False])
+def test_the_checkout_lock_is_free_right_after_a_clean_exit(
+    text: str, tmp_path: Path, with_update_lock: bool
+) -> None:
+    """The checkout lock (scripts/lib/checkout_lock.sh) leaked into the renewer the
+    same way the deploy lock once did: its `sleep` outlives the kill, and every
+    Claude launch would wait on the lock until it ended. It is free the moment
+    the deploy exits, whether or not the update lock is also held."""
+    run, _ = _harness(text, tmp_path, ssh_rc=0)
+    lock = tmp_path / "genesis-checkout.lock"
+    update_lock = tmp_path / "update.lock"
+    take_update = (
+        f'exec {{_UPDATE_LOCK_FD}}>"{update_lock}"\nflock -x "$_UPDATE_LOCK_FD"\n'
+        if with_update_lock
+        else ""
+    )
+    out = run(
+        take_update
+        + f'exec {{GENESIS_CHECKOUT_LOCK_FD}}>"{lock}"\nflock -x "$GENESIS_CHECKOUT_LOCK_FD"\n'
+        "GUARDIAN_PAUSE_TTL=40\n_guardian_pause\nsleep 1\n"
+    )
+    assert "REACHED_END" in out, out
+    free = subprocess.run(["flock", "-n", str(lock), "true"], capture_output=True, timeout=10)
+    assert free.returncode == 0, "the checkout lock was still held after the deploy exited"
 
 
 def test_the_renewer_stops_when_its_deploy_is_killed(text: str, tmp_path: Path) -> None:
@@ -449,3 +481,112 @@ def test_the_renewer_parent_check_follows_process_identity(tmp_path: Path) -> No
 
 if sys.platform.startswith("win"):  # pragma: no cover
     pytest.skip("bash-only", allow_module_level=True)
+
+
+@pytest.mark.parametrize("pre_paused,ssh_rc,allowed", [(False, 0, False), (True, 0, True), (True, 1, False)])
+def test_strict_prerequisite_never_owns_pause(tmp_path, pre_paused, ssh_rc, allowed):
+    run, log = _harness(GUARDIAN_LIB.read_text(), tmp_path, ssh_rc=ssh_rc, pre_paused=pre_paused)
+    output = run("_guardian_pause --require-existing")
+    assert ("REACHED_END" in output) is allowed
+    assert log.read_text().splitlines() == ["paused"]
+
+
+@pytest.mark.parametrize("listeners,ss_rc,pre_paused,allowed,queried", [
+    ("LISTEN 0 128 127.0.0.1:5000 0.0.0.0:*", 0, False, True, False),
+    ("LISTEN 0 128 0.0.0.0:5000 0.0.0.0:*", 0, False, False, True),
+    ("LISTEN 0 128 0.0.0.0:5000 0.0.0.0:*", 0, True, True, True),
+    ("LISTEN 0 128 127.0.0.1:5000 *:*\nLISTEN 0 128 [::]:5000 *:*", 0, False, False, True),
+    ("LISTEN 0 128 127.0.0.2:5000 *:*", 0, False, False, True),
+    ("malformed", 0, False, False, True),
+    ("", 0, False, False, True),
+    ("LISTEN 0 128 127.0.0.1:5000 *:*", 1, False, False, True),
+])
+def test_loopback_prerequisite_actual_listener_controls(tmp_path, listeners, ss_rc, pre_paused, allowed, queried):
+    import shlex
+    run, log = _harness(GUARDIAN_LIB.read_text(), tmp_path, ssh_rc=0, pre_paused=pre_paused)
+    stub = tmp_path / "bin" / "ss"
+    stub.write_text(f"#!/bin/bash\nprintf '%s\\n' {shlex.quote(listeners)}\nexit {ss_rc}\n")
+    stub.chmod(0o755)
+    output = run("_qualify_dashboard_loopback")
+    assert ("REACHED_END" in output) is allowed
+    assert (log.read_text().splitlines() if log.exists() else []) == (["paused"] if queried else [])
+
+
+def test_loopback_prerequisite_unconfigured_install(tmp_path):
+    run, log = _harness(GUARDIAN_LIB.read_text(), tmp_path, ssh_rc=1)
+    (tmp_path / "home/.genesis/guardian_remote.yaml").unlink()
+    assert "REACHED_END" in run("_qualify_dashboard_loopback")
+    assert not log.exists()
+
+
+def test_strict_prerequisite_missing_configuration_refuses(tmp_path):
+    run, log = _harness(GUARDIAN_LIB.read_text(), tmp_path, ssh_rc=0)
+    (tmp_path / "home/.genesis/guardian_remote.yaml").unlink()
+    assert "REACHED_END" not in run("_guardian_pause --require-existing")
+    assert not log.exists()
+
+
+def test_incoming_bootstrap_checkpoint_before_any_mutation(tmp_path):
+    bootstrap = (REPO_ROOT / "scripts/bootstrap.sh").read_text()
+    checkpoint = bootstrap[bootstrap.index("# Incoming code must also refuse"):bootstrap.index("# shellcheck source=lib/deploy_marker.sh")]
+    home = tmp_path / "home"
+    (home / ".genesis").mkdir(parents=True)
+    cfg = home / ".genesis/guardian_remote.yaml"
+    cfg.write_text("host_ip: fixture-host\n")
+    for marker, expected in [("", 3), ("1", 0)]:
+        result = subprocess.run(["bash", "-c", checkpoint + "\necho MUTATION_REACHED"],
+            env={**os.environ, "HOME": str(home), "GENESIS_BOOTSTRAP_ALLOW_LIVE": "1",
+                 "GENESIS_DASHBOARD_LOOPBACK_QUALIFIED": marker}, capture_output=True, text=True, timeout=10)
+        assert result.returncode == expected
+        assert ("MUTATION_REACHED" in result.stdout) is (expected == 0)
+    cfg.unlink()
+    result = subprocess.run(["bash", "-c", checkpoint + "\necho MUTATION_REACHED"],
+        env={**os.environ, "HOME": str(home), "GENESIS_BOOTSTRAP_ALLOW_LIVE": "1"},
+        capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0 and "MUTATION_REACHED" in result.stdout
+
+
+def test_qualification_cannot_leak_to_server_children(text):
+    startup = text[:text.index("# Resolve HOME")]
+    result = subprocess.run(["bash", "-c", startup + '\n[ -z "${GENESIS_DASHBOARD_LOOPBACK_QUALIFIED+x}" ]'],
+        env={**os.environ, "GENESIS_DASHBOARD_LOOPBACK_QUALIFIED": "1"}, capture_output=True, timeout=10)
+    assert result.returncode == 0
+    assert "export _DASHBOARD_LOOPBACK_QUALIFIED" not in text
+    assert 'GENESIS_DASHBOARD_LOOPBACK_QUALIFIED=1 GENESIS_BOOTSTRAP_ALLOW_LIVE=1' in text
+
+
+def test_interrupt_and_start_refuse_unqualified_restart(text, tmp_path):
+    for name in ("_start_genesis_server", "_on_signal_prestop"):
+        function = _extract_func(text, name)
+        log = tmp_path / name
+        script = ("_qualify_dashboard_loopback() { return 1; }\n"
+                  f'systemctl() {{ echo called >> "{log}"; }}\n'
+                  "_clear_deploy_state() { :; }\nWERE_RUNNING=(genesis-server)\n"
+                  + function + f"\n{name} TERM\n")
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+        assert result.returncode == 1
+        assert not log.exists()
+    qualification = text.index("\n_qualify_dashboard_loopback || exit 1\n")
+    assert qualification < text.index(STOP_CALL)
+
+
+@pytest.mark.parametrize("broken", ["key", "config"])
+def test_strict_prerequisite_broken_connection_refuses_without_ssh(tmp_path, broken):
+    run, log = _harness(GUARDIAN_LIB.read_text(), tmp_path, ssh_rc=0, pre_paused=True)
+    if broken == "key":
+        (tmp_path / "home/.ssh/genesis_guardian_ed25519").unlink()
+    else:
+        (tmp_path / "home/.genesis/guardian_remote.yaml").write_text("[]\n")
+    assert "REACHED_END" not in run("_guardian_pause --require-existing")
+    assert not log.exists()
+
+
+@pytest.mark.parametrize("response", ['{"paused": false}', '{"paused": 1}', '{"paused": "true"}', 'not-json', '[]'])
+def test_strict_prerequisite_requires_actual_boolean_response(tmp_path, response):
+    import shlex
+    run, log = _harness(GUARDIAN_LIB.read_text(), tmp_path, ssh_rc=0, pre_paused=True)
+    ssh = tmp_path / "bin/ssh"
+    ssh.write_text(f"""#!/bin/bash\necho "${{@: -1}}" >> "{log}"\nprintf '%s\\n' {shlex.quote(response)}\n""")
+    ssh.chmod(0o755)
+    assert "REACHED_END" not in run("_guardian_pause --require-existing")
+    assert log.read_text().splitlines() == ["paused"]

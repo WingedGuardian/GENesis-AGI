@@ -14,6 +14,11 @@ _UNRELATED_OR_SNAPSHOT = {
     "browser/profile.py",
     "eval/bench/isolation.py",
 }
+_ISOLATED_RECOVERY_WRITERS = {
+    # Stdlib-only, existing staged file; restore/update publish only on success.
+    # This is not a canonical reader or a whole-module exemption.
+    "db/crud/peer_restore.py:reset_peer_authority",
+}
 _CANONICAL_READERS_USING_WRITABLE_MODE = {
     "attention/calibrate.py:load_labeled",
     "attention/differ.py:load_from_db",
@@ -73,7 +78,7 @@ def test_canonical_rw_opens_use_guarded_factories():
             ):
                 continue
             key = f"{relative}:{_enclosing_function(node, parents)}"
-            if key not in _CANONICAL_READERS_USING_WRITABLE_MODE:
+            if key not in _CANONICAL_READERS_USING_WRITABLE_MODE | _ISOLATED_RECOVERY_WRITERS:
                 unexpected.append(f"{key}:{node.lineno}")
 
     assert unexpected == [], (

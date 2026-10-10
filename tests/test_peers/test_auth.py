@@ -7,7 +7,13 @@ import secrets
 import pytest
 from flask import Flask
 
-from genesis.peers.auth import BACKEND_TOKEN, PeerRefusal, authenticate
+from genesis.peers.auth import (
+    BACKEND_TOKEN,
+    PeerRefusal,
+    authenticate,
+    configuration_warning,
+    credential_conflicts,
+)
 
 
 async def prepare(registry, monkeypatch, mode="fallback"):
@@ -97,3 +103,73 @@ async def test_transaction_independence_under_parallel_readers(registry, monkeyp
         return (await registry.get("muse"))["peer_id"]
 
     assert await asyncio.gather(*(read() for _ in range(8))) == ["muse"] * 8
+
+
+async def test_revoked_only_credential_warns_and_refuses(registry, monkeypatch):
+    credential = await prepare(registry, monkeypatch)
+    assert await configuration_warning(registry) is None
+    await registry.revoke("muse")
+    assert await configuration_warning(registry) is not None
+    await refused(registry, {"Authorization": "Bearer " + credential}, "not_configured")
+
+
+@pytest.mark.parametrize("configured", [False, True])
+async def test_revoked_credential_does_not_mask_active_peer_readiness(
+    registry, monkeypatch, configured
+):
+    await prepare(registry, monkeypatch)
+    name = "GENESIS_PEER_OTHER_TOKEN"
+    await registry.register("other", same_owner=True, token_name=name)
+    credential = secrets.token_urlsafe(32)
+    if configured:
+        monkeypatch.setenv(name, credential)
+    await registry.revoke("muse")
+    warning = await configuration_warning(registry)
+    assert (warning is None) is configured
+    with Flask(__name__).test_request_context(
+        headers={"Authorization": "Bearer " + credential}
+    ):
+        if configured:
+            assert (await authenticate(registry)).peer["peer_id"] == "other"
+        else:
+            with pytest.raises(PeerRefusal) as caught:
+                await authenticate(registry)
+            assert caught.value.code == "not_configured"
+
+
+@pytest.mark.parametrize("mode", ["fallback", "sam"])
+@pytest.mark.parametrize("password_kind", ["same", "padded", "distinct", "empty", "unicode"])
+async def test_dashboard_password_cannot_be_peer_authority(registry, monkeypatch, mode, password_kind):
+    await prepare(registry, monkeypatch, mode)
+    name = "GENESIS_PEER_MUSE_TOKEN" if mode == "fallback" else BACKEND_TOKEN
+    value = os.environ[name]
+    passwords = {
+        "same": value,
+        "padded": "  " + value + "  ",
+        "distinct": secrets.token_urlsafe(32),
+        "empty": "   ",
+        "unicode": "\N{SNOWMAN}",
+    }
+    monkeypatch.setenv("DASHBOARD_PASSWORD", passwords[password_kind])
+    collision = password_kind in {"same", "padded"}
+    assert credential_conflicts((name,)) is collision
+    if collision:
+        assert await configuration_warning(registry) is not None
+        await refused(registry, {"Authorization": "Bearer " + value}, "not_configured", probe=True)
+        await registry.revoke("muse")
+        assert credential_conflicts((name,))
+    else:
+        assert await configuration_warning(registry) is None
+        with Flask(__name__).test_request_context(headers={"Authorization": "Bearer " + value}):
+            identity = await authenticate(registry, allow_probe=True)
+        assert identity.credential_name == name
+
+
+async def test_sam_backend_probe_readiness_survives_peer_revocation(registry, monkeypatch):
+    await prepare(registry, monkeypatch, "sam")
+    await registry.revoke("muse")
+    assert await configuration_warning(registry) is None
+    with Flask(__name__).test_request_context(
+        headers={"Authorization": "Bearer " + os.environ[BACKEND_TOKEN]}
+    ):
+        assert (await authenticate(registry, allow_probe=True)).peer is None

@@ -56,24 +56,72 @@ blindly reset Serve, which can remove unrelated operator services.
 
 ## Existing installation migration
 
-Deploy the reviewed Guardian code through the existing update scripts first.
-Run the following on the host with its deployed Guardian interpreter, retaining
-an SSH session/tunnel. Use the actual installation path if it differs.
+Keep peer admission disabled and retain an owner SSH session/tunnel. On existing
+Guardian installations, use the deployed restricted gateway to establish an
+operator-owned `pause <seconds>` and confirm `paused` reports an active pause
+before the update. Choose a TTL within the deployed limit (at most 3600 seconds),
+and renew it before expiry throughout the update, host synchronization and
+migration. The update preserves an already-active operator pause and does not
+resume it. If pause/paused support or confirmation is unavailable, stop and
+resolve that prerequisite; do not assume the deployment's own pause covers host
+synchronization. A fresh installation without Guardian has no pause to preserve.
+
+For this first rollout, while maintaining that pause, stage the merged code with
+`scripts/deploy_code_only.sh pull` (locked pull without restart), then run the
+new `scripts/update.sh`. The updater runs a pre-update copy of itself: an old
+updater cannot enforce the new prerequisite. Incoming bootstrap therefore refuses
+an unqualified old full updater before changing units or running crash recovery.
+Do not set the qualification environment marker manually.
+
+The new updater confirms either an existing listener whose every local TCP 5000
+endpoint is exactly `127.0.0.1:5000`, or a pre-existing Guardian pause, before
+stopping or restarting Genesis. Unknown, missing or mixed listener observations
+require the pause. The confirmation is a snapshot; the operator must maintain the
+pause through host synchronization and migration. Standard already-migrated
+loopback installations do not require a new manual pause on every update.
+
+Deploy through the full approved `scripts/update.sh` path: its bootstrap renders
+the loopback server unit. Code-only deployment does not render changed units.
+Verify the update and Guardian host synchronization actually succeeded; old
+Guardian code must support the HTTP host override before migrating. The container
+must provide `ss` (from `iproute2`) for the read-only live-listener preflight. Its
+absence is a migration failure; this command does not install packages.
+
+Run the following on the host with its deployed Guardian interpreter and source
+path. Use the actual installation path if it differs.
 
 ```sh
-~/.local/share/genesis-guardian/.venv/bin/python -m genesis.guardian.dashboard_ingress \
+PYTHONPATH="$HOME/.local/share/genesis-guardian/src" \
+  ~/.local/share/genesis-guardian/.venv/bin/python -m genesis.guardian.dashboard_ingress \
   --config ~/.local/share/genesis-guardian/config/guardian.yaml
-~/.local/share/genesis-guardian/.venv/bin/python -m genesis.guardian.dashboard_ingress \
+PYTHONPATH="$HOME/.local/share/genesis-guardian/src" \
+  ~/.local/share/genesis-guardian/.venv/bin/python -m genesis.guardian.dashboard_ingress \
   --config ~/.local/share/genesis-guardian/config/guardian.yaml --apply
 ```
 
 The default is a read-only preflight. Apply requires a standard dashboard proxy
-connecting to container loopback, port 5000, healthy host-loopback HTTP and
-configured dashboard authentication. It atomically updates only
+connecting to container loopback, with `bind` unset or `host`, and `nat` and
+`proxy_protocol` unset or `false`. Failed device reads and customized direction
+or transport require operator inspection. It also requires an exact integer port 5000, an observed
+loopback-only container listener, healthy host-loopback HTTP and configured
+dashboard authentication. Dry-run also validates the prospective YAML patch and
+deployed Guardian override support. Apply atomically updates only
 `health_api_host`, preserving comments, other YAML values and file mode, before
 restricting the existing Incus listener. It confirms the new listener and HTTP
 readiness. Unknown topology, ambiguous YAML, a conflicting shell override or an
-Incus failure returns failure. An uncertain network change is never rolled back
+Incus failure returns failure. Preflight also requires a loaded, nontransient
+standard Guardian user service with no pending daemon reload. It reads typed
+systemd properties and merges the user-manager environment, service assignments
+and final environment removals. The effective `GUARDIAN_CONFIG` must select the
+supplied YAML; an alternate file is supported when it is the selected file.
+Service-only host, port or container conflicts refuse before either mutation.
+Environment files, PAM sources, wrappers/hooks, alternate Python paths and
+filesystem or network namespace remapping require operator inspection. Missing
+properties or an unavailable user bus are failures, not proof of compatibility.
+The check trusts the deployed interpreter and installed Python environment;
+it does not verify arbitrary Python startup hooks. Avoid concurrent service or
+environment changes during this maintenance-window snapshot.
+An uncertain network change is never rolled back
 to a public listener. Inspect the real error and current device configuration;
 do not activate peers after a partial migration.
 
@@ -83,12 +131,35 @@ precedence, and clearing it restores the configured value to an empty override
 port. Inspect the deployed unit's configured overrides privately before applying
 the migration. ICMP independently uses the configured or autodetected container
 address and refuses to report the host loopback as an autodetection success.
-The next Guardian timer invocation reloads YAML; no server binding change is
-needed. The installer aligns an unset HTTP target only when it observes the
-loopback Incus listener, retaining explicit operator targets.
+Guardian's health and dialogue requests bypass environment HTTP proxies only
+for numeric loopback targets. Other configured targets retain normal urllib
+proxy handling, including `no_proxy`; hostname aliases do not select the bypass.
+The next Guardian timer invocation
+reloads YAML. The installer aligns an unset HTTP target only when both Incus
+endpoints are loopback on port 5000, those proxy modes are standard, and the effective health port is standard;
+explicit operator targets and conflicting overrides are retained. Optional
+alignment runs after the existing unit installation and successful daemon
+reload, proves the loaded service profile, and preserves YAML with a safe skip
+message if the profile is unproven. It does not start a service to obtain proof.
 
-After apply, verify host local HTTP and Guardian's check-only probes, owner
-HTTPS/tunnel access, and failed LAN/tailnet TCP-5000 access. Keep peer admission
+Host setup stops before installing Guardian if the dashboard proxy cannot be
+created or verified. New devices are read back before setup proceeds; existing
+unknown devices are retained for inspection rather than overwritten. Generated
+network instructions identify the local loopback URL and owner SSH-tunnel or
+explicitly configured authenticated HTTPS access, rather than host-LAN port 5000.
+Before adding a device, setup requires successful structured Incus inspection
+showing its absence in both local and profile-expanded devices. Ambiguous or
+unreadable inspection stops setup. This uses the container Python installed
+earlier in setup; it adds no host parser dependency. Avoid concurrent operator
+topology changes during setup or migration: these preflights are not an Incus
+configuration lock.
+
+After apply, verify host local HTTP, Guardian's check-only probes and actual
+dialogue, owner HTTPS/tunnel access, and failed LAN/tailnet TCP-5000 access to
+both host and container addresses. Confirm the operator pause is still active;
+resume explicitly through the gateway only after those checks pass. If update,
+sync, migration or readiness fails, keep peers disabled, inspect the actual
+state and continue maintaining the pause while repairing it. Keep peer admission
 closed until the effective policy, scoped mounts, credentials and full peer
 approval/result acceptance pass. This build does not generate production
 credentials, enroll nodes, restart services or change the live tailnet policy.

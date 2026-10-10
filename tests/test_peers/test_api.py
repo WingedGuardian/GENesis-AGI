@@ -60,7 +60,7 @@ async def test_disabled_every_path_and_options(app, path):
         assert response.json["code"] == "not_configured"
 
 
-async def test_health_auth_card_url_and_audit_do_not_disclose(app, registry, monkeypatch, caplog):
+async def test_health_auth_and_withheld_card_audit_do_not_disclose(app, registry, monkeypatch, caplog):
     headers = await configure(registry, monkeypatch)
     client = app.test_client()
     assert client.get(ROOT + "/health").status_code == 401
@@ -75,13 +75,9 @@ async def test_health_auth_card_url_and_audit_do_not_disclose(app, registry, mon
     card = client.get(
         ROOT + "/.well-known/agent-card.json", headers={**headers, "Host": "evil.example"}
     )
-    assert card.status_code == 200
-    assert card.json["supportedInterfaces"][0]["url"] == "https://genesis.example/v1/agent/a2a"
-    assert card.json["skills"] == []
-    assert (
-        card.json["securitySchemes"]["peerBearer"]["httpAuthSecurityScheme"]["scheme"] == "Bearer"
-    )
-    assert "peerBearer" in card.json["securityRequirements"][0]["schemes"]
+    assert card.status_code == 503
+    assert card.json["code"] == "not_ready"
+    assert "supportedInterfaces" not in card.json
     assert client.post(ROOT + "/message:send", headers=headers).status_code == 404
 
 
@@ -105,3 +101,13 @@ async def test_loop_absent_never_falls_back(app, registry, monkeypatch):
     app.config.pop("GENESIS_EVENT_LOOP")
     response = app.test_client().get(ROOT + "/health", headers=headers)
     assert response.status_code == 503 and response.json["code"] == "not_ready"
+
+
+async def test_agent_card_withheld_until_transport_installed(app, registry, monkeypatch):
+    headers = await configure(registry, monkeypatch)
+    client = app.test_client()
+    response = client.get(ROOT + "/.well-known/agent-card.json", headers=headers)
+    assert response.status_code == 503
+    assert response.json["code"] == "not_ready"
+    assert "supportedInterfaces" not in response.json
+    assert client.get(ROOT + "/health", headers=headers).status_code == 200

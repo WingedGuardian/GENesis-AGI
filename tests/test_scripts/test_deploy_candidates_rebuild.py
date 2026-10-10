@@ -12,9 +12,11 @@ import fcntl
 import os
 import re
 import subprocess
+from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._checkout_lock_helpers import held
 from tests.test_scripts._deploy_candidates_world import SCRIPTS
 
 # ── merging ────────────────────────────────────────────────────────────────
@@ -29,6 +31,31 @@ def test_rebuild_merges_two_candidates_onto_origin_main(dc, dc_ready, capsys):
     assert w.live_merges() == [("feat/a", ha), ("feat/b", hb)]
     assert (w.root / "x.txt").exists() and (w.root / "y.txt").exists()
     assert w.git(w.root, "symbolic-ref", "--short", "HEAD").stdout.strip() == "live"
+
+
+def test_checkout_lock_timeout_refuses_without_moving_branch_or_head(
+    dc, dc_ready, monkeypatch
+):
+    w = dc_ready
+    tip = w.candidate("feat/a", {"x.txt": "x\n"})
+    repo = dc.core.Repo(w.root, w.env)
+    plan = dc.core.Plan(
+        base=w.rev("refs/remotes/origin/main"),
+        tip=tip,
+        merged=[("feat/a", tip)],
+    )
+    head = w.rev("HEAD")
+    branch = w.git(w.root, "symbolic-ref", "--short", "HEAD").stdout.strip()
+    monkeypatch.setattr(dc.plan, "_CHECKOUT_LOCK_WAIT_S", 0.1)
+    common = w.git(
+        w.root, "rev-parse", "--path-format=absolute", "--git-common-dir"
+    ).stdout.strip()
+    with held(Path(common) / "genesis-checkout.lock", fcntl.LOCK_SH), pytest.raises(
+        dc.core.Refusal, match="checkout busy"
+    ):
+        dc.plan.move_checkout(repo, plan, "live")
+    assert w.rev("HEAD") == head
+    assert w.git(w.root, "symbolic-ref", "--short", "HEAD").stdout.strip() == branch
 
 
 def test_rebuild_without_the_lock_is_refused(dc, dc_ready, capsys):

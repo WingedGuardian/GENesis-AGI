@@ -60,7 +60,7 @@ build_network_identity_block() {
     [ -n "$host_ipv6" ] && printf " (v6: %s)" "$host_ipv6"
     echo ""
     [ -n "$ts_ip" ] && printf -- "- **Tailscale**: %s\n" "$ts_ip"
-    printf -- "- **Dashboard**: http://%s:5000 (via proxy device)\n" "${host_ip:-localhost}"
+    echo "- **Dashboard**: http://127.0.0.1:5000 locally on the host or container; remote owner access uses an SSH tunnel or explicitly configured authenticated, ACL-restricted HTTPS."
 }
 
 # write_sentinel_block <file> <name>

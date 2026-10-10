@@ -34,6 +34,14 @@ def capability(value: str) -> str:
 
 
 class PeerRegistry:
+    """Own peer SQL and its guarded private connection as one transaction boundary.
+
+    Relationship revisions and grants must commit together under BEGIN IMMEDIATE.
+    The shared live-runtime connection cannot own this private transaction while
+    unrelated coroutines use it; keeping the parameterized statements here avoids
+    changing the shared connection factory or creating a missing/quarantined DB.
+    """
+
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path) if path is not None else genesis_db_path()
 

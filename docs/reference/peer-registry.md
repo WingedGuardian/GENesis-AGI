@@ -1,8 +1,9 @@
 # Trusted peer registry
 
-This foundation enables authenticated discovery and readiness only. Task skills
-remain unadvertised and task service readiness is false until the coordinator
-lands. It changes no listener or live deployment. Follow the ingress runbook
+This foundation enables authenticated health checks and local peer management.
+The Agent Card returns `503 not_ready`; it cannot advertise an A2A transport
+before the message and task routes are installed. Task service readiness is
+false until the coordinator lands. It changes no listener or live deployment. Follow the ingress runbook
 before operator activation; a peer credential is never dashboard authority.
 
 The database must already exist and contain the migrated peer tables. Local
@@ -33,26 +34,35 @@ SAM selection additionally requires `--sam-realm`; register each peer with
 instead of `--same-owner` when applicable. Node and fallback credential names
 are unique. SAM uses only `GENESIS_PEER_BACKEND_TOKEN`; fallback uses only active
 registered scoped names and ignores SAM identity headers. There is no automatic
-downgrade. Valid backend-only card/health probes return no owned peer state.
+downgrade. Valid backend-only health probes return no owned peer state; the card
+remains unavailable in this foundation. Revoked peer credentials never make
+fallback readiness appear usable, but still participate in collision checks.
 
 Provide independent ASCII values through protected operator storage. Never reuse
-the MCP, desk, another peer, or internal API credential. Equality refuses
+the MCP, desk, another peer, internal API credential or dashboard password. Equality refuses
 activation and generates a boot warning without exposing values. The CLI lists
 credential names only; the database stores no token values. Clear a value and
 use the approved restart path for file-based revocation; relationship revocation
 applies on the next request without restart. No production token is generated
 by development tests.
 
-Discovery: `GET /v1/agent/a2a/.well-known/agent-card.json`. Readiness:
-`GET /v1/agent/a2a/health`. Both require scoped bearer authentication, including
+Readiness: `GET /v1/agent/a2a/health`. The reserved discovery path,
+`GET /v1/agent/a2a/.well-known/agent-card.json`, returns `503 not_ready`
+after valid authentication until the task transport is installed. Both paths
+require scoped bearer authentication, including
 OPTIONS and otherwise unmatched paths. A running runtime loop is required; the
 test-only fallback loop in the shared dashboard decorator is not accepted here.
-The card uses the owner-configured HTTPS URL, never the request Host. The A2A
-SDK is pinned to 1.2.2 and serializes its 1.0 protobuf models. Streaming, push and
-extended-card capabilities are not advertised.
+The owner-configured HTTPS URL is reserved for the later A2A transport, never
+derived from the request Host. The A2A SDK is pinned to 1.2.2 for that dependent
+transport. Streaming, push and extended-card capabilities are not advertised.
 
 Bodies are read after authentication on the Flask worker, capped at 256 KiB by
 reading cap plus one and refusing overflow, including absent Content-Length.
 Logs record timestamp, credential name, verified peer or unverified marker,
 endpoint, task-ID placeholder and status; never bearer values, request bodies
-or tool arguments. Discovery does not read provider credentials or token files.
+or tool arguments. These routes do not read provider credentials or token files.
+
+Registry SQL stays inside the private guarded transaction boundary so relationship
+revisions and grant changes commit together without sharing an active transaction
+with unrelated runtime coroutines. It neither creates a missing database nor
+opens one quarantined by the restore guard.

@@ -614,10 +614,13 @@ echo "  + boot.autostart enabled (container survives host reboots)"
 # block so re-running host-setup retrofits existing containers too.
 incus config set "$CONTAINER_NAME" limits.memory.swap true
 echo "  + limits.memory.swap enabled (memory spikes degrade into swap, not thrash)"
-# incus applies limits.memory.swap only at container START, so the running
-# container (freshly created above, or an existing one being retrofitted) still
-# has memory.swap.max=0 until a restart — the setting silently no-ops meanwhile.
-# Activate it live now so swap works without a disruptive restart.
+# The `incus config set` just above is ITSELF a live update to a limits.memory*
+# key, and with `true` (boolean swap-on) that is exactly the value Incus writes
+# memory.swap.max=0 for, at both container start and on every such live update
+# (driver_lxc.go, v6.0.0 and main) -- so the running container (freshly created
+# above, or an existing one being retrofitted) has memory.swap.max=0 right now,
+# not only until the next restart. Activate it live now so swap works without
+# a disruptive restart.
 # shellcheck source=lib/container_swap.sh
 . "$(unset CDPATH; cd "$(dirname "$0")" && pwd)/lib/container_swap.sh"
 container_swap_activate_live "$CONTAINER_NAME"
@@ -864,20 +867,57 @@ incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
 # Forward host loopback:5000 → container loopback:5000. Remote access uses
 # an SSH tunnel or the authenticated, ACL-restricted HTTPS proxy.
 echo "  Setting up dashboard port forwarding..."
+_dashboard_proxy_ready() {
+    local key value
+    for key in listen connect bind nat proxy_protocol; do
+        value=$(incus config device get "$CONTAINER_NAME" dashboard-proxy "$key") || return 1
+        case "$key" in
+            listen|connect) [ "$value" = "tcp:127.0.0.1:5000" ] || return 1 ;;
+            bind) [ -z "$value" ] || [ "$value" = "host" ] || return 1 ;;
+            *) [ -z "$value" ] || [ "$value" = "false" ] || return 1 ;;
+        esac
+    done
+}
+_dashboard_proxy_absent() {
+    incus list "$CONTAINER_NAME" --format=json |
+        incus exec "$CONTAINER_NAME" -- python3 -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin)
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        sys.exit(1)
+    matches = [row for row in rows if row.get("name") == sys.argv[1]]
+    if len(matches) != 1:
+        sys.exit(1)
+    maps = [matches[0].get(key) for key in ("devices", "expanded_devices")]
+    sys.exit(0 if all(isinstance(value, dict) and "dashboard-proxy" not in value for value in maps) else 1)
+except (ValueError, TypeError, AttributeError, RecursionError):
+    sys.exit(1)
+' "$CONTAINER_NAME"
+}
 if incus config device get "$CONTAINER_NAME" dashboard-proxy listen &>/dev/null; then
-    _dashboard_listen=$(incus config device get "$CONTAINER_NAME" dashboard-proxy listen)
-    if [ "$_dashboard_listen" = "tcp:127.0.0.1:5000" ]; then
+    if _dashboard_proxy_ready; then
         echo "  + Dashboard loopback proxy already configured"
     else
-        echo "  WARN: Existing dashboard proxy is not loopback-only."
+        echo "  FATAL: Existing dashboard proxy requires topology inspection."
         echo "        Migrate through the deployed Guardian; see docs/reference/peer-ingress.md."
+        exit 1
     fi
 else
+    if ! _dashboard_proxy_absent; then
+        echo "  FATAL: Dashboard proxy absence could not be verified. Inspect local and inherited devices."
+        exit 1
+    fi
     if incus config device add "$CONTAINER_NAME" dashboard-proxy proxy \
         listen=tcp:127.0.0.1:5000 connect=tcp:127.0.0.1:5000; then
+        if ! _dashboard_proxy_ready; then
+            echo "  FATAL: Dashboard loopback proxy could not be verified. Inspect the Incus error above."
+            exit 1
+        fi
         echo "  + Dashboard proxy: host loopback:5000 → container loopback:5000"
     else
-        echo "  WARN: Could not create the dashboard loopback proxy. Inspect the Incus error above."
+        echo "  FATAL: Could not create the dashboard loopback proxy. Inspect the Incus error above."
+        exit 1
     fi
 fi
 

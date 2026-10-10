@@ -11,9 +11,10 @@ from flask import request
 from genesis.dashboard.auth import (
     check_bearer_token,
     conflicts_with_cached_internal_token,
+    get_dashboard_password,
     presented_bearer_is,
 )
-from genesis.env import bearer_token
+from genesis.env import bearer_matches, bearer_token
 from genesis.peers.registry import PeerRegistry
 
 BACKEND_TOKEN = "GENESIS_PEER_BACKEND_TOKEN"  # noqa: S105 — credential name only
@@ -39,10 +40,12 @@ def credential_conflicts(names: tuple[str, ...]) -> bool:
         | {BACKEND_TOKEN}
     )
     configured = {name: bearer_token(name) for name in other_names}
+    dashboard_password = get_dashboard_password() or ""
     for name in names:
         value = configured[name]
         if value and (
             conflicts_with_cached_internal_token(value)
+            or bearer_matches(value.encode("ascii"), dashboard_password)
             or any(
                 key != name and other and hmac.compare_digest(value, other)
                 for key, other in configured.items()
@@ -104,7 +107,11 @@ async def configuration_warning(registry: PeerRegistry) -> str | None:
     names = tuple(row["token_name"] for row in rows if row["token_name"])
     if credential_conflicts((*names, BACKEND_TOKEN)):
         return "Peer API disabled: peer credential equals another surface credential; configure distinct scoped values."
-    accepted = (BACKEND_TOKEN,) if settings["mode"] == "sam" else names
+    accepted = (
+        (BACKEND_TOKEN,)
+        if settings["mode"] == "sam"
+        else tuple(row["token_name"] for row in rows if row["active"] and row["token_name"])
+    )
     if not accepted or not any(bearer_token(name) for name in accepted):
         return "Peer API disabled: selected scoped peer credentials are unconfigured."
     return None

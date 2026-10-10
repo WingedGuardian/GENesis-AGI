@@ -1,4 +1,4 @@
-"""Authenticated peer discovery on the existing Flask/runtime boundary."""
+"""Authenticated peer health on the existing Flask/runtime boundary."""
 
 from __future__ import annotations
 
@@ -98,41 +98,10 @@ def _install_gate(state):
 @agent_api_bp.route(ROOT + "/.well-known/agent-card.json")
 @_async_route(timeout=15)
 async def agent_card():
-    from a2a.types import (
-        AgentCapabilities,
-        AgentCard,
-        AgentInterface,
-        HTTPAuthSecurityScheme,
-        SecurityRequirement,
-        SecurityScheme,
-    )
-    from google.protobuf.json_format import MessageToDict
-
-    settings = await _registry().settings()
-    card = AgentCard(
-        name="Genesis",
-        description="Independent agent collaboration; capabilities require local authorization.",
-        version="1",
-        supported_interfaces=[
-            AgentInterface(
-                url=settings["service_url"], protocol_binding="HTTP+JSON", protocol_version="1.0"
-            )
-        ],
-        capabilities=AgentCapabilities(),
-        security_schemes={
-            "peerBearer": SecurityScheme(
-                http_auth_security_scheme=HTTPAuthSecurityScheme(scheme="Bearer")
-            )
-        },
-        security_requirements=[SecurityRequirement(schemes={"peerBearer": {"list": []}})],
-        default_input_modes=["text/plain"],
-        default_output_modes=["text/plain"],
-    )
-    # No skills are advertised until their runtime coordinator is enabled.
-    payload = MessageToDict(card)
-    # Required repeated fields must survive protobuf's default omission.
-    payload["skills"] = []
-    return jsonify(payload)
+    # An empty skills list does not make an unavailable HTTP+JSON interface
+    # interoperable. The execution slice must install the binding before
+    # publishing a card, including during startup or recovery.
+    return _err("not_ready", 503)
 
 
 @agent_api_bp.route(ROOT + "/health")

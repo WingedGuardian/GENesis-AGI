@@ -5118,8 +5118,16 @@ def _comment_repo(argv: list[str]) -> str | None:
 def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
     """Native-approval reason for one review request; no self-issued sigil exists."""
     if result.get("status") != "ok":
+        # Name what failed, so one occurrence says why rather than only that.
+        errors = result.get("errors")
+        why = ""
+        if isinstance(errors, list) and errors:
+            shown = ", ".join(str(e)[:80] for e in errors[:5])
+            more = f" (+{len(errors) - 5} more)" if len(errors) > 5 else ""
+            why = f" Evaluator: {shown}{more}."
         return (
-            f"Review evidence for PR #{pr_num} in {repo} could not be read reliably. "
+            f"Review evidence for PR #{pr_num} in {repo} could not be read reliably."
+            f"{why} "
             "Treating the round budget as zero would silently reopen an exhausted "
             "review loop. Approve this one request only if you have independently "
             "checked the PR history."
@@ -5351,7 +5359,11 @@ def _comment_review_request(argv: list[str]) -> tuple[str | None, bool, bool | N
 
 
 def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = None) -> tuple[str, str]:
-    """Return (allow|ask|deny, reason) for Codex review requests.
+    """Return (allow|ask|note|deny, reason) for Codex review requests.
+
+    ``note`` is an ask this install silenced (``hooks.asks.review_request: off``,
+    unreadable history only); the caller treats it as an ask for a dispatched
+    session and a compound command, and otherwise emits a context note.
 
     Review rounds from ``review_budget`` are authoritative. Legacy escalation/final sigils
     are intentionally ignored: at the approval boundary only the hook's native
@@ -5414,7 +5426,10 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
             )
             continue
         if not repo or _review_budget is None:
-            result = {"status": "unknown"}
+            result = {
+                "status": "unknown",
+                "errors": ["repository_unresolved" if not repo else "review_budget_unimportable"],
+            }
             repo_label = repo or "the current repository"
         else:
             repo_label = repo
@@ -5424,8 +5439,8 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
                     pr_num,
                     timeout_for=_gh_timeout,
                 )
-            except Exception:  # noqa: BLE001 - unknown asks/denies; never crashes open.
-                result = {"status": "unknown"}
+            except Exception as exc:  # noqa: BLE001 - unknown asks/denies; never crashes open.
+                result = {"status": "unknown", "errors": [f"evaluator_raised:{type(exc).__name__}"]}
 
         if result.get("status") == "ok" and result.get("confirmation_exempt"):
             marker = _review_budget.confirmation_marker(
@@ -5451,12 +5466,25 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
             # from discovery and therefore needs the normal native approval.
             decisions.append(("ask", _review_budget_message(pr_num, result, repo_label)))
             continue
-        if result.get("status") != "ok" or result.get("approval_required"):
+        if (
+            result.get("status") != "ok"
+            # getattr: an older evaluator without the allowlist (version skew)
+            # reads as "not transient", which asks — never a crash, never a note.
+            and getattr(_review_budget, "errors_are_transient", lambda _e: False)(
+                result.get("errors")
+            )
+        ):
+            # GitHub could not be read JUST NOW (every error code is on the
+            # producer's transient allowlist). The only ask
+            # `hooks.asks.review_request` may silence; a persistent or tamper
+            # code (deleted findings, truncation, config) stays an ordinary ask.
+            decisions.append(("ask_unreadable", _review_budget_message(pr_num, result, repo_label)))
+        elif result.get("status") != "ok" or result.get("approval_required"):
             decisions.append(("ask", _review_budget_message(pr_num, result, repo_label)))
         else:
             decisions.append(("allow", ""))
 
-    asks = [reason for decision, reason in decisions if decision == "ask"]
+    asks = [reason for decision, reason in decisions if decision in ("ask", "ask_unreadable")]
     if asks:
         reason = asks[0]
         # A stale worktree still emits the retired terminal sigil. It is parsed
@@ -5468,6 +5496,20 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
                 "\n\nNOTE: `# final-round-accept` is retired and no longer "
                 "authorizes any gate; only this native approval admits the request."
             )
+        # `hooks.asks.review_request: off` turns ONLY an unreadable-history ask
+        # into a "note" (no decision, a context line). Every other ask in the
+        # command keeps it an ask; the caller still denies a dispatched session
+        # and still refuses a compound command. The policy is read only when it
+        # could apply, so an install without the key pays nothing.
+        # Only when the review request IS the whole command, as `push_publish`
+        # silences only one plain push: a silenced prompt must not carry other
+        # steps the human would otherwise have seen.
+        if (
+            len(segs) == 1
+            and all(d != "ask" for d, _ in decisions)
+            and _ask_suppressed("review_request")
+        ):
+            return "note", reason
         return "ask", reason
     return "allow", ""
 
@@ -5841,6 +5883,7 @@ _HOOK_SURFACE_FILES = (
             "scripts/review_state.py",  # escalation counter + review markers
             "scripts/review_budget.py",  # distinct-head policy evaluator
             "scripts/review_findings.py",  # reviewer list + severity parsers
+            "scripts/review_reflection.py",  # round reflection tool + validator
             "scripts/review_deadline.py",  # aggregate hook timeout arithmetic
             "scripts/external_review.py",  # autonomous review-request boundary
             "scripts/lib/gate_menu.py",  # cap decision menu shown to the user
@@ -12598,13 +12641,13 @@ def _run_merge_and_push_gates() -> int:
             print(esc_msg, file=sys.stderr)
             return 2
 
-        if esc_decision == "ask" and _is_dispatched():
+        if esc_decision in ("ask", "note") and _is_dispatched():
             # Defer until the hard checks below have run. This remains a deny,
             # but a force-push/no-verify/merge violation should retain its more
             # specific diagnostic when both appear in one command.
             round_autonomous_deny = esc_msg
 
-        if esc_decision == "ask":
+        if esc_decision in ("ask", "note"):
             other_gated_actions = [
                 s
                 for s in segs
@@ -12628,6 +12671,14 @@ def _run_merge_and_push_gates() -> int:
         # `git push && git commit --no-verify` blocks, never asks.
         ask_reason: str | None = (
             esc_msg if esc_decision == "ask" and round_autonomous_deny is None else None
+        )
+        # An unreadable-history review prompt this install silenced
+        # (`hooks.asks.review_request: off`). Emitted at the tail as NO decision
+        # plus a context note, only if no block or other ask returned first.
+        review_note: str | None = (
+            _suppressed_reason("review_request", esc_msg)
+            if esc_decision == "note" and round_autonomous_deny is None
+            else None
         )
         # A first-push-only re-push AUTO-ALLOW is ALSO deferred to the END (same
         # reason): emitting `_allow` inline would short-circuit the whole Bash
@@ -13787,6 +13838,10 @@ def _run_merge_and_push_gates() -> int:
                 )
             notes = _drain_ask_notes()
             return _ask(f"{ask_reason}\n\n{notes}" if notes else ask_reason)
+
+        if review_note is not None:
+            notes = _drain_ask_notes()
+            return _emit_context_only(f"{review_note}\n\n{notes}" if notes else review_note)
 
         # A first-publish prompt this install silenced — NO decision, only a
         # context note. After every block and every ask above (an ask from any

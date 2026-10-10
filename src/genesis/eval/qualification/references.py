@@ -17,8 +17,29 @@ FRONTIER = "frontier_llm"
 NOVELTY = "procedure_novelty"
 
 
+def scalar_text(value: str) -> bool:
+    """Only Unicode scalar values: a lone surrogate (JSON ``"\\ud800"``) passes every
+    other text check, then fails when SQLite or the judge request encodes it."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def all_scalar(value) -> bool:
+    """Every string anywhere in a decoded JSON value (keys included) is scalar text."""
+    if isinstance(value, str):
+        return scalar_text(value)
+    if isinstance(value, dict):
+        return all(all_scalar(k) and all_scalar(v) for k, v in value.items())
+    if isinstance(value, list):
+        return all(all_scalar(item) for item in value)
+    return True
+
+
 def nonblank(value):
-    return isinstance(value, str) and bool(value.strip())
+    return isinstance(value, str) and bool(value.strip()) and scalar_text(value)
 
 
 def identity(value):

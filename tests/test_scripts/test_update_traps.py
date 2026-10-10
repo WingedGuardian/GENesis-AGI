@@ -105,6 +105,10 @@ _do_rollback() {{ echo "depth=$BASH_SUBSHELL reason=$1" >> "$RB_LOG"; }}
 # records intent without touching real systemd.
 _start_genesis_server() {{ echo "start:genesis-server" >> "$RESTART_LOG"; return 0; }}
 systemctl() {{ echo "systemctl $*" >> "$RESTART_LOG"; return 0; }}
+# The real handler now requires qualification before restarting the server.
+# Its Guardian/loopback implementation is covered by the prerequisite suite;
+# this isolated trap harness supplies both qualified and refused outcomes.
+_qualify_dashboard_loopback() {{ [[ "${{LOOPBACK_QUALIFIED:-1}}" == 1 ]]; }}
 {on_clear}
 {on_err}
 {on_signal}
@@ -136,7 +140,8 @@ case "{scenario}" in
     echo READY > "$READY"
     sleep 30 & wait $!
     ;;
-  prestop_running)
+  prestop_running|prestop_unqualified)
+    [[ "{scenario}" != prestop_unqualified ]] || LOOPBACK_QUALIFIED=0
     WERE_RUNNING=("genesis-server")   # server was running + (about to be) stopped
     trap '_on_signal_prestop INT' INT
     trap '_on_signal_prestop TERM' TERM
@@ -226,6 +231,13 @@ def test_prestop_sigterm_restarts_stopped_services(tmp_path: Path, text: str) ->
     log, state, restart = _run(tmp_path, text, "prestop_running", signal_it=True)
     assert "start:genesis-server" in restart, "the stopped server must be restarted"
     assert log == "", "still no rollback in the pre-merge window"
+    assert not state.exists()
+
+
+def test_prestop_sigterm_keeps_unqualified_server_stopped(tmp_path: Path, text: str) -> None:
+    log, state, restart = _run(tmp_path, text, "prestop_unqualified", signal_it=True)
+    assert restart == "", "an unqualified restart must remain refused"
+    assert log == "", "the pre-merge handler must not roll back"
     assert not state.exists()
 
 

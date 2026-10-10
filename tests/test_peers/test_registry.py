@@ -94,7 +94,7 @@ async def test_node_and_credential_bindings_are_unique(registry):
         None,
         "http://genesis.example/v1/agent/a2a",
         "https://genesis.example:9443/v1/agent/a2a",
-        "https://user@genesis.example/v1/agent/a2a",
+        "https://user@example.com/v1/agent/a2a",
         "https://genesis.example/other",
         "https://genesis.example/v1/agent/a2a?key=x",
         "https://genesis.example/v1/agent/a2a#fragment",

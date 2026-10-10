@@ -13,9 +13,10 @@
 #     pause is accepted. The lib does not arm traps itself: a trap is one global
 #     slot per signal, and only the caller knows what else it must compose with.
 #   - a caller holding the deploy lock on a fd keeps its number in
-#     _UPDATE_LOCK_FD (that exact name); the renewer is launched with that fd
-#     CLOSED, because a background process that inherits it keeps the lock after
-#     the caller exits. A lock fd held under any other name is not closed.
+#     _UPDATE_LOCK_FD, and the checkout lock in GENESIS_CHECKOUT_LOCK_FD
+#     (scripts/lib/checkout_lock.sh); the renewer is launched with both CLOSED,
+#     because a background process that inherits one keeps that lock after the
+#     caller exits. A lock fd held under any other name is not closed.
 #
 # GUARDIAN_PAUSE_TTL and GUARDIAN_PAUSE_RENEW_MAX are plain assignments on purpose:
 # a caller derives its health window from them (update.sh's HEALTH_GUARDIAN_COVER),
@@ -85,8 +86,10 @@ GUARDIAN_PAUSE_RENEW_MAX=4
 # Guardian down once PR-1's gateway is on the host; against an old gateway it
 # errors and we proceed unpaused (safe, dark). No-op when no host is configured.
 _guardian_pause() {
+    local strict=0
+    [ "${1:-}" != --require-existing ] || strict=1
     local cfg="$HOME/.genesis/guardian_remote.yaml"
-    [ -f "$cfg" ] || return 0
+    [ -f "$cfg" ] || return "$strict"
     local hip hus key
     # -P: neither the working directory (a `live` checkout holding candidate
     # files) nor any script directory goes first on sys.path. Not -I -S: yaml
@@ -97,9 +100,19 @@ _guardian_pause() {
     # and fall back to the historical default when the field is absent/empty.
     key=$("$VENV_DIR/bin/python" -P -c "import yaml,pathlib,os;k=yaml.safe_load(pathlib.Path('$cfg').read_text()).get('ssh_key','') or '';print(os.path.expanduser(k))" 2>/dev/null || true)
     [ -n "$key" ] || key="$HOME/.ssh/genesis_guardian_ed25519"
-    [ -n "$hip" ] && [ -f "$key" ] || return 0
+    [ -n "$hip" ] && [ -f "$key" ] || return "$strict"
     _GUARDIAN_HOST="${hus:-ubuntu}@${hip}"
     _GUARDIAN_KEY="$key"
+    # Read-only prerequisite: never create or take ownership of a pause.
+    if [ "$strict" = 1 ]; then
+        local response
+        response=$(timeout 15 ssh -i "$_GUARDIAN_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+            "$_GUARDIAN_HOST" paused 2>/dev/null) || return 1
+        "$VENV_DIR/bin/python" -P -c 'import json,sys;sys.exit(0 if json.load(sys.stdin).get("paused") is True else 1)' \
+            <<< "$response" 2>/dev/null || return 1
+        echo "  Guardian already paused — leaving the maintained pause intact"
+        return 0
+    fi
     # Don't clobber a pause we did not create (P2 #1): if the gateway already has an
     # UNEXPIRED pause (an operator or another workflow set it), leave it intact —
     # proceed WITHOUT pausing and WITHOUT arming resume, so our EXIT never removes
@@ -132,11 +145,13 @@ _guardian_pause() {
         _GUARDIAN_PARENT_PID="$$"
         _GUARDIAN_PARENT_START="$(_guardian_proc_start "$$" || true)"
         _GUARDIAN_PARENT_START="${_GUARDIAN_PARENT_START#* }"
-        if [ -n "${_UPDATE_LOCK_FD:-}" ]; then
-            _guardian_renew_loop {_UPDATE_LOCK_FD}>&- >/dev/null 2>&1 &
-        else
-            _guardian_renew_loop >/dev/null 2>&1 &
-        fi
+        # The checkout-lock FD (scripts/lib/checkout_lock.sh) is closed the same
+        # way: inherited, it would block every Claude launch while the sleep lives.
+        (
+            if [ -n "${_UPDATE_LOCK_FD:-}" ]; then exec {_UPDATE_LOCK_FD}>&-; fi
+            if [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ]; then exec {GENESIS_CHECKOUT_LOCK_FD}>&-; fi
+            _guardian_renew_loop
+        ) >/dev/null 2>&1 &
         _GUARDIAN_RENEW_PID=$!
     else
         echo "  WARNING: guardian pause not accepted (old gateway or host unreachable) — proceeding unpaused" >&2
@@ -190,4 +205,31 @@ _guardian_renew_loop() {
             "$_GUARDIAN_HOST" "pause $GUARDIAN_PAUSE_TTL" >/dev/null 2>&1 || true
         i=$((i + 1))
     done
+}
+
+# A shell-local snapshot for this update, never exported to server children.
+# Unknown/mixed listeners require a maintained pause before loopback activation.
+_qualify_dashboard_loopback() {
+    [ "${_DASHBOARD_LOOPBACK_QUALIFIED:-}" != 1 ] || return 0
+    local cfg="$HOME/.genesis/guardian_remote.yaml" listeners endpoint rest
+    if [ ! -e "$cfg" ] && [ ! -L "$cfg" ]; then
+        _DASHBOARD_LOOPBACK_QUALIFIED=1
+        return 0
+    fi
+    if listeners=$(ss -H -ltn '( sport = :5000 )' 2>/dev/null) && [ -n "$listeners" ]; then
+        local state recv send all_loopback=1
+        while read -r state recv send endpoint rest; do
+            [ "$endpoint" = 127.0.0.1:5000 ] || all_loopback=0
+        done <<< "$listeners"
+        if [ "$all_loopback" = 1 ]; then
+            _DASHBOARD_LOOPBACK_QUALIFIED=1
+            return 0
+        fi
+    fi
+    if _guardian_pause --require-existing; then
+        _DASHBOARD_LOOPBACK_QUALIFIED=1
+        return 0
+    fi
+    echo "  REFUSE: first loopback activation requires a maintained Guardian pause; follow docs/reference/peer-ingress.md." >&2
+    return 1
 }
