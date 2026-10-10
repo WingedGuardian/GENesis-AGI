@@ -57,6 +57,11 @@ _DEFAULT_PORTS = {
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Genesis MCP Server (standalone)")
     parser.add_argument(
+        "--external-client",
+        action="store_true",
+        help="Disable Claude session bookmark processing for external MCP clients",
+    )
+    parser.add_argument(
         "--server",
         required=True,
         choices=sorted(_VALID_SERVERS),
@@ -213,7 +218,9 @@ def _bootstrap_health(transport_kwargs: dict) -> None:
     _run_mcp(mcp, transport_kwargs)
 
 
-def _bootstrap_memory(transport_kwargs: dict) -> None:
+def _bootstrap_memory(
+    transport_kwargs: dict, *, process_pending_bookmarks: bool = True,
+) -> None:
     """Bootstrap and run the memory MCP server.
 
     Requires Qdrant + Ollama for embeddings. Opens aiosqlite connection
@@ -299,7 +306,8 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
             init(db=db, qdrant_client=qdrant,
                  storage_embedding_provider=storage_embedding,
                  recall_embedding_provider=recall_embedding,
-                 activity_tracker=tracker, reranker=reranker, read_pool=read_pool)
+                 activity_tracker=tracker, reranker=reranker, read_pool=read_pool,
+                 process_pending_bookmarks=process_pending_bookmarks)
             clear_mcp_crash("memory")
             yield
         finally:
@@ -750,8 +758,9 @@ def main(argv: list[str] | None = None) -> None:
     capture_spawn_identity()
 
     bootstrapper = _BOOTSTRAPPERS[args.server]
+    options = {"process_pending_bookmarks": not args.external_client} if args.server == "memory" else {}
     try:
-        bootstrapper(transport_kwargs)
+        bootstrapper(transport_kwargs, **options)
     except Exception:
         _record_mcp_crash(args.server)
         raise
