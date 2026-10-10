@@ -1,1 +1,2 @@
 - Peer context and operation receipts apply existing sensitive-data checks before JSON escaping, retaining receipt limits and authorization checks. Whole JSON encoded within strings is also inspected, with duplicate members preserved and traversal work bounded.
+- Mapping keys that decode into JSON objects or arrays now refuse disclosure, including benign compound keys, while ordinary scalar keys and JSON values remain supported.

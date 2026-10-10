@@ -10,6 +10,42 @@ from genesis.peers.disclosure_scan import json_strings_safe
 from genesis.security.output_scanner import scan_outbound
 
 
+@pytest.mark.parametrize("compound", [{}, [], {"api_key": None}, ["api_key"]])
+@pytest.mark.parametrize("depth", [1, 2, 4])
+@pytest.mark.parametrize("placement", ["root", "nested", "list", "tuple", "encoded"])
+@pytest.mark.parametrize("sensitive", [False, True])
+def test_compound_decoded_mapping_keys_are_unsupported(compound, depth, placement, sensitive):
+    key = compound
+    for _ in range(depth):
+        key = json.dumps(key)
+    value = secrets.token_hex(20) if sensitive else "ordinary result"
+    payload = {key: value}
+    if placement == "nested":
+        payload = {"ordinary": payload}
+    elif placement == "list":
+        payload = [payload]
+    elif placement == "tuple":
+        payload = (payload,)
+    elif placement == "encoded":
+        payload = json.dumps(payload)
+    verdict = json_strings_safe(payload)
+    assert verdict is False
+
+
+def test_duplicate_decoded_members_cannot_hide_compound_key():
+    key = json.dumps(json.dumps({"api_key": None}))
+    payload = '{' + key + ':"ordinary result",' + key + ':null}'
+    assert not json_strings_safe(payload)
+
+
+@pytest.mark.parametrize("depth", [0, 1, 3])
+def test_scalar_encoded_keys_and_json_values_remain_supported(depth):
+    key = "ordinary"
+    for _ in range(depth):
+        key = json.dumps(key)
+    assert json_strings_safe({key: json.dumps({"text": "ordinary result", "items": [1, 2]})})
+
+
 @pytest.mark.parametrize("key", ["token", "api_key", "GENESIS_PEER_FIXTURE_TOKEN"])
 @pytest.mark.parametrize("shape", ["scalar", "list", "nested", "tuple"])
 def test_structured_credentials_keep_key_value_association(key, shape):

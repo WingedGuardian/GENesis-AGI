@@ -941,7 +941,8 @@ verified: 85652265ca1a 2026-10-09
   attempts. `peers/operation_state.py` separates operation outcomes from consent;
   receipt and broker context scans inspect original JSON keys/values and their
   associations, including whole JSON encoded within strings with duplicate members
-  preserved. Disclosure work and traversal depth are bounded; pathological inputs
+  preserved. Compound JSON-valued mapping keys refuse disclosure; ordinary scalar
+  keys and JSON-valued strings remain supported. Disclosure work and traversal depth are bounded; pathological inputs
   can refuse below the existing operation result size cap.
   Only exact immutable reads can retry unknown effects after confirmed drain.
   Claiming retires invalid, drained pending work transactionally while preserving

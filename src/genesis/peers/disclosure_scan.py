@@ -68,11 +68,13 @@ def _decode(item, budget):
 
 
 def _key_names(key, budget):
-    """Preserve original and successively decoded string keys as associations."""
+    """Preserve scalar key names; compound decoded keys are unsupported."""
     while isinstance(key, str):
         budget.charge(len(key))
         yield key
         key = _decode(key, budget)
+        if isinstance(key, (dict, list)):
+            raise ValueError("Compound peer JSON mapping keys are unsupported")
 
 
 def _json_leaves(value, budget, *, decode=True):

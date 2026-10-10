@@ -42,7 +42,10 @@ broker task context. Key/value associations also remain visible through nested
 containers so structured credentials cannot bypass assignment patterns. Existing
 size, JSON admissibility and authority constraints remain in place. Whole JSON
 objects, arrays and strings encoded within a string are also inspected, preserving
-all duplicate object members and original/decoded key associations. Invalid decoded
+all duplicate object members and original/decoded scalar key associations. Mapping
+keys that decode, at any successive string-decoding depth, into JSON objects or
+arrays are unsupported and refuse disclosure, including benign compound keys.
+Ordinary scalar keys and JSON encoded within values remain supported. Invalid decoded
 numbers or excessive nesting refuse disclosure; ordinary non-JSON prose remains
 eligible for the existing scanner. The local check caps serialized data at 2 MiB,
 traversal at 1,024 frames, and aggregate parsing/scanning work at 64 MiB of character/visit work units,
