@@ -17,8 +17,13 @@ The owner-created MCP JSON must be a regular file owned by the process user,
 mode 0600, no symlink, at most 4 KiB, containing only:
 
 ```json
-{"mcpServers":{"genesis_peer":{"command":"<sys.executable>","args":["-m","genesis.peers.facade","--lease-file","<absolute lease path>"]}}}
+{"mcpServers":{"genesis_peer":{"command":"<sys.executable>","args":["-P","-m","genesis.peers.facade","--lease-file","<absolute lease path>"]}}}
 ```
+
+`-P` (Python's safe-path flag) is required: the peer runs in its working
+directory, and `python -m` would otherwise put that directory first on
+`sys.path`, importing any `genesis/` package found there before the facade or
+its lease is validated.
 
 The facade entry point and lease file are supplied by the later broker slice.
 No token value belongs in argv or this configuration. The lease path is internal

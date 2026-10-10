@@ -3895,6 +3895,28 @@ class CCInvoker:
                 "NO result event arrived — the result line was almost certainly one of them",
             )
 
+        # A peer segment that exits nonzero (or unreaped) without a result was
+        # stopped, not finished: its deadline expired inside the scope, or
+        # systemd-run refused or terminated the scope. Raise, so no caller
+        # records a killed segment as an empty success. A FIXED error, neither
+        # classified nor reported as a status change: the collected text is
+        # peer-steered model output, and classifying it would let a peer write
+        # "usage limit reached" and mark the owner's CLI rate-limited or
+        # unavailable (or trigger roster failover).
+        # Peer-only: an owner stream can legitimately reach this fallback with
+        # a nonzero leader code (our own group kill after a wedged post-EOF
+        # leader, or a background run truncated at the CLI wait ceiling) and
+        # still carry a usable partial deliverable.
+        if invocation.peer_segment is not None and proc.returncode != 0:
+            logger.error(
+                "CC peer stream exited without a result (PID %s, exit=%s)",
+                proc.pid,
+                proc.returncode,
+            )
+            raise CCProcessError(
+                f"peer session ended without a result (exit={proc.returncode})"
+            )
+
         # No result event — treat collected text as response (success path)
         if self._last_was_error:
             await self._notify_status_change(None)

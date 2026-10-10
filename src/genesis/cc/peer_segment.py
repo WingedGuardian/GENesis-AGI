@@ -139,6 +139,9 @@ class PeerSegment:
     def validate_facade_config(self, path: str) -> None:
         # This file is owner-created, not a peer-supplied command. Pin the one
         # stdio entry point and forbid config env/extra server overrides.
+        # `-P` keeps the peer's working directory off sys.path: `python -m`
+        # otherwise prepends the cwd, so a planted `genesis/` package there
+        # would be imported before the facade or its lease are validated.
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             with os.fdopen(fd, "rb") as source:
@@ -161,10 +164,10 @@ class PeerSegment:
                 or server.keys() != {"command", "args"}
                 or server["command"] != sys.executable
                 or not isinstance(args, list)
-                or len(args) != 4
-                or args[:3] != ["-m", "genesis.peers.facade", "--lease-file"]
-                or not isinstance(args[3], str)
-                or not Path(args[3]).is_absolute()
+                or len(args) != 5
+                or args[:4] != ["-P", "-m", "genesis.peers.facade", "--lease-file"]
+                or not isinstance(args[4], str)
+                or not Path(args[4]).is_absolute()
             ):
                 raise ValueError
         except (OSError, ValueError, TypeError, KeyError, AttributeError):

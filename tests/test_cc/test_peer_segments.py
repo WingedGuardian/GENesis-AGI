@@ -35,6 +35,7 @@ def peer_invocation(tmp_path):
                     "genesis_peer": {
                         "command": sys.executable,
                         "args": [
+                            "-P",
                             "-m",
                             "genesis.peers.facade",
                             "--lease-file",
@@ -108,7 +109,17 @@ def test_peer_rejects_unsafe_invocation_overrides(peer_invocation, changes):
 
 @pytest.mark.parametrize(
     "case",
-    ["extra_server", "command", "env", "relative_lease", "public", "symlink", "oversize", "fifo"],
+    [
+        "extra_server",
+        "command",
+        "env",
+        "relative_lease",
+        "no_safe_path",
+        "public",
+        "symlink",
+        "oversize",
+        "fifo",
+    ],
 )
 def test_launch_rejects_nonfacade_configuration(peer_invocation, tmp_path, case):
     path = tmp_path / "facade.json"
@@ -122,6 +133,9 @@ def test_launch_rejects_nonfacade_configuration(peer_invocation, tmp_path, case)
         server["env"] = {"GH_TOKEN": ""}
     elif case == "relative_lease":
         server["args"][-1] = "lease.json"
+    elif case == "no_safe_path":
+        # The pre-fix shape: without -P, `python -m` imports from the peer cwd.
+        server["args"].remove("-P")
     if case == "public":
         path.chmod(0o644)
     elif case == "symlink":
@@ -135,6 +149,43 @@ def test_launch_rejects_nonfacade_configuration(peer_invocation, tmp_path, case)
         path.write_text(" " * 4097 if case == "oversize" else json.dumps(config))
     with pytest.raises(ValueError, match="facade-only configuration"):
         CCInvoker(claude_path="/fixture/claude")._build_args(peer_invocation)
+
+
+def test_documented_facade_configuration_is_the_validated_shape(peer_invocation, tmp_path):
+    # The reference doc is what an owner copies; it must launch with -P and pass.
+    from pathlib import Path
+
+    doc = Path(__file__).parents[2] / "docs" / "reference" / "peer-execution.md"
+    line = next(
+        text for text in doc.read_text().splitlines() if text.startswith('{"mcpServers"')
+    )
+    rendered = line.replace("<sys.executable>", sys.executable).replace(
+        "<absolute lease path>", str(tmp_path / "lease.json")
+    )
+    assert json.loads(rendered)["mcpServers"]["genesis_peer"]["args"][0] == "-P"
+    path = tmp_path / "facade.json"
+    path.write_text(rendered)
+    peer_invocation.peer_segment.validate_facade_config(str(path))
+
+
+def test_facade_safe_path_flag_ignores_planted_package(tmp_path):
+    # Behavioural proof of the flag the validator pins: from a cwd holding a
+    # planted `genesis` package, -P imports the installed one instead.
+    planted = tmp_path / "genesis"
+    planted.mkdir()
+    (planted / "__init__.py").write_text("raise SystemExit('planted package imported')\n")
+    probe = "import genesis, sys; sys.stdout.write(genesis.__file__)"
+    unsafe = subprocess.run(
+        [sys.executable, "-c", probe], cwd=tmp_path, capture_output=True, text=True,
+        env={"PATH": os.environ.get("PATH", "")}, timeout=60,
+    )
+    assert unsafe.returncode != 0 and "planted" in unsafe.stderr
+    safe = subprocess.run(
+        [sys.executable, "-P", "-c", probe], cwd=tmp_path, capture_output=True, text=True,
+        env={"PATH": os.environ.get("PATH", "")}, timeout=60,
+    )
+    assert safe.returncode == 0
+    assert not safe.stdout.startswith(str(tmp_path))
 
 
 @pytest.mark.parametrize("tool", ["Bash", "mcp__genesis_peer__*", "mcp__owner__read", ""])
@@ -582,3 +633,84 @@ async def test_peer_launch_waits_for_checkout_and_releases_before_drain(
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+
+
+def _stream_without_result(invoker, monkeypatch, returncode, text="partial"):
+    monkeypatch.setattr(invoker_module.roster, "apply_active", lambda inv: (inv, ""))
+    monkeypatch.setattr(invoker_module, "inflight", lambda *args: contextlib.nullcontext())
+    monkeypatch.setattr(invoker_module, "set_oom_score_adj", lambda *args: None)
+    monkeypatch.setattr(invoker_module, "process_group_alive", lambda proc: False)
+    monkeypatch.setattr(invoker_module, "kill_process_group", lambda proc: None)
+    monkeypatch.setattr(invoker, "_network_preflight", AsyncMock())
+    monkeypatch.setattr(invoker, "verify_allowlist_enforceable", AsyncMock())
+    monkeypatch.setattr(invoker, "_build_env", lambda inv: {})
+    monkeypatch.setattr(invoker, "_apply_login_fallback", AsyncMock(side_effect=lambda env, inv: env))
+    monkeypatch.setattr(invoker, "_launch_env", lambda env, inv: env)
+    monkeypatch.setattr(invoker, "_with_cost_semantics", AsyncMock(side_effect=lambda output: output))
+    monkeypatch.setattr(PeerSegment, "stop_and_drain", AsyncMock())
+    monkeypatch.setattr(
+        invoker_module,
+        "_settings_env_pins",
+        lambda *args: {},
+    )
+    partial = json.dumps(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+    ).encode()
+    proc = MagicMock(pid=42001, returncode=returncode)
+    proc.wait = AsyncMock(return_value=returncode)
+    proc.stdin.drain = AsyncMock()
+    proc.stdout = asyncio.StreamReader()
+    proc.stdout.feed_data(partial + b"\n")
+    proc.stdout.feed_eof()
+    proc.stderr = asyncio.StreamReader()
+    proc.stderr.feed_eof()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=proc))
+
+
+@pytest.mark.parametrize("returncode", [1, -9, -15, None])
+async def test_killed_peer_stream_without_result_is_an_error(
+    peer_invocation, monkeypatch, returncode
+):
+    # Deadline expiry inside the scope, or systemd-run refusing/terminating it,
+    # ends the stream with no result event. That is a failed segment, never an
+    # empty success a caller testing `not output.is_error` would record.
+    invoker = CCInvoker(claude_path="/fixture/claude")
+    _stream_without_result(invoker, monkeypatch, returncode)
+    with pytest.raises(CCProcessError):
+        await invoker.run_streaming(peer_invocation)
+
+
+async def test_peer_text_cannot_mark_the_owner_cli_limited(peer_invocation, monkeypatch):
+    # The collected text is peer-steered. Writing a quota phrase and then
+    # stalling past the deadline must yield a plain process error, never a
+    # rate-limit/quota classification or an owner status change.
+    invoker = CCInvoker(claude_path="/fixture/claude")
+    _stream_without_result(invoker, monkeypatch, -9, text="usage limit reached")
+    notify = AsyncMock()
+    monkeypatch.setattr(invoker, "_notify_status_change", notify)
+    with pytest.raises(CCProcessError) as exc:
+        await invoker.run_streaming(peer_invocation)
+    assert type(exc.value) is CCProcessError
+    notify.assert_not_awaited()
+
+
+async def test_clean_peer_stream_without_result_keeps_collected_text(
+    peer_invocation, monkeypatch
+):
+    invoker = CCInvoker(claude_path="/fixture/claude")
+    _stream_without_result(invoker, monkeypatch, 0)
+    output = await invoker.run_streaming(peer_invocation)
+    assert not output.is_error
+    assert output.text == "partial"
+    assert output.exit_code == 0
+
+
+async def test_owner_stream_without_result_is_unchanged_by_peer_exit_rule(monkeypatch, tmp_path):
+    # Scope pin: the nonzero-exit rule is peer-only. An owner stream keeps the
+    # established fallback (collected text, reported exit code).
+    invoker = CCInvoker(claude_path="/fixture/claude")
+    _stream_without_result(invoker, monkeypatch, -9)
+    output = await invoker.run_streaming(CCInvocation(prompt="owner", working_dir=str(tmp_path)))
+    assert not output.is_error
+    assert output.text == "partial"
+    assert output.exit_code == -9
