@@ -546,7 +546,7 @@ _last_memory_integrity_key: str = ""
 # `probe_falkordb` reports it DOWN. So the lever moves back first.
 _FALKORDB_STAND_DOWN = (
     "To stand it down instead, first set graphstore `mode: networkx` "
-    "(settings_update(\"graphstore\", {\"mode\": \"networkx\"}), or "
+    '(settings_update("graphstore", {"mode": "networkx"}), or '
     "~/.genesis/config/graphstore.local.yaml) — while `mode: falkordb` is "
     "selected, memory-graph reads depend on the engine, every recall falls back "
     "to NetworkX with a warning, and the health probe reports it DOWN — then "
@@ -700,10 +700,7 @@ def _falkordb_selected(facts: dict) -> bool:
 
 def _falkordb_armed(facts: dict) -> bool:
     """Selected by the lever, or enabled by an operator — either is intent."""
-    return (
-        _falkordb_selected(facts)
-        or facts.get("unit_enabled") in _FALKORDB_ENABLED_STATES
-    )
+    return _falkordb_selected(facts) or facts.get("unit_enabled") in _FALKORDB_ENABLED_STATES
 
 
 def _falkordb_could_alert(section: dict) -> bool:
@@ -1397,6 +1394,8 @@ def _finding_like(finding_class: str) -> str:
     carries free text (edited file names, a probe's error) that can contain the
     class name; `_` is a LIKE wildcard, so `missing-units` would match too."""
     return f"%[findings: %{finding_class}%"
+
+
 _last_deploy_alert_at: float = 0.0
 _last_deploy_alert_key: str = ""
 # The deploy checkout's status on the previous tick (deploy_health's
@@ -1417,6 +1416,24 @@ _last_main_checkout_status: str = ""
 # supersedes it. Either way every other finding class is reconciled on the
 # same tick.
 _last_actionable_main_checkout: dict | None = None
+# Likewise for the `live` classes (deploy_health's live["state"]): a deploy in
+# progress, or the FIRST unreadable tick, carries the last actionable tick's
+# live findings rather than resolving or raising them.
+_last_live_state: str = ""
+_last_actionable_live_findings: list[str] | None = None
+# Whether the previous tick's live reading was unknown (off `live`, the engine
+# did not answer). A second consecutive one is not carried again: it raises
+# live_unreadable while a live alert stands in the store, else nothing, so an
+# install that never uses `live` never alerts on a slow engine.
+_last_live_unknown: bool = False
+# On `live` the tier-2 and Guardian comparisons run against the base `live` was
+# built on. A tick with no base (unreadable, mid-deploy, ambiguous bases) runs
+# neither, so their findings are carried from the last tick that had one, never
+# resolved by a comparison that did not run.
+_BASE_DEPENDENT_CLASSES = frozenset(
+    {"tier2_pending", "host_guardian_drift", "host_guardian_unknown_commit"}
+)
+_last_actionable_base_findings: list[str] | None = None
 
 
 async def _check_deploy_staleness(db) -> None:
@@ -1425,6 +1442,8 @@ async def _check_deploy_staleness(db) -> None:
     Best-effort — the whole body is guarded and never raises into the tick."""
     global _last_deploy_alert_at, _last_deploy_alert_key
     global _last_main_checkout_status, _last_actionable_main_checkout
+    global _last_live_state, _last_actionable_live_findings, _last_live_unknown
+    global _last_actionable_base_findings
     if db is None:
         return
     try:
@@ -1433,6 +1452,7 @@ async def _check_deploy_staleness(db) -> None:
         # can monkeypatch the module attribute.
         from genesis.observability.snapshots.deploy_health import (
             deploy_health,
+            live_unknown,
             main_checkout_findings,
         )
 
@@ -1460,7 +1480,9 @@ async def _check_deploy_staleness(db) -> None:
                 checkout = _last_actionable_main_checkout
                 carried = True
             elif await observations.has_unresolved_matching(
-                db, source="deploy_staleness_monitor", content_like=_finding_like("main_checkout_dirty")
+                db,
+                source="deploy_staleness_monitor",
+                content_like=_finding_like("main_checkout_dirty"),
             ):
                 # A dirty alert stands and nothing in memory says its count or
                 # names: carry the class alone, so the alert is kept (or
@@ -1489,6 +1511,73 @@ async def _check_deploy_staleness(db) -> None:
             ] + main_checkout_findings(checkout)
         else:
             _last_actionable_main_checkout = checkout
+        live = snap.get("live") or {}
+        live_state = live.get("state") or ""
+        previous_live_state = _last_live_state
+        _last_live_state = live_state
+        unknown = live_unknown(live)
+        previous_unknown = _last_live_unknown
+        _last_live_unknown = unknown
+        # Not acted on: a deploy in progress, the FIRST unreadable tick, or the
+        # FIRST reading that says nothing either way (off `live`, the engine did
+        # not answer). The last actionable live findings are carried.
+        if unknown and previous_unknown:
+            # A second unknown tick in a row: escalate from the store, not from
+            # memory (a restart clears memory several times a day). With a live
+            # alert standing it becomes live_unreadable; with none, nothing.
+            standing = False
+            for cls in sorted(_DEPLOY_LIVE_CLASSES):
+                if await observations.has_unresolved_matching(
+                    db, source="deploy_staleness_monitor", content_like=_finding_like(cls)
+                ):
+                    standing = True
+                    break
+            if not standing:
+                logger.info("deploy staleness: live reading unknown twice, no live alert stands")
+            findings = [f for f in findings if f.split(":", 1)[0] not in _DEPLOY_LIVE_CLASSES] + (
+                ["live_unreadable"] if standing else []
+            )
+        elif (
+            live_state == "deploying"
+            or (live_state == "unreadable" and previous_live_state != "unreadable")
+            or unknown
+        ):
+            carried_live = _last_actionable_live_findings
+            if carried_live is None:
+                # Nothing in memory (the process restarted): carry the class of
+                # every standing live alert, as the checkout path does, so it is
+                # kept (or superseded), never resolved by a tick that read nothing.
+                carried_live = []
+                for cls in sorted(_DEPLOY_LIVE_CLASSES):
+                    if await observations.has_unresolved_matching(
+                        db, source="deploy_staleness_monitor", content_like=_finding_like(cls)
+                    ):
+                        carried_live.append(cls if cls == "live_unreadable" else f"{cls}:?")
+            findings = [
+                f for f in findings if f.split(":", 1)[0] not in _DEPLOY_LIVE_CLASSES
+            ] + list(carried_live)
+        else:
+            _last_actionable_live_findings = [
+                f for f in findings if f.split(":", 1)[0] in _DEPLOY_LIVE_CLASSES
+            ]
+        on_live = live_state == "live" or bool(live.get("on_live_branch"))
+        if on_live and not live.get("base"):
+            carried_base = _last_actionable_base_findings
+            if carried_base is None:
+                # A restart cleared memory: carry the class of each standing alert.
+                carried_base = []
+                for cls in sorted(_BASE_DEPENDENT_CLASSES):
+                    if await observations.has_unresolved_matching(
+                        db, source="deploy_staleness_monitor", content_like=_finding_like(cls)
+                    ):
+                        carried_base.append(f"{cls}:?" if cls == "tier2_pending" else cls)
+            findings = [
+                f for f in findings if f.split(":", 1)[0] not in _BASE_DEPENDENT_CLASSES
+            ] + list(carried_base)
+        else:
+            _last_actionable_base_findings = [
+                f for f in findings if f.split(":", 1)[0] in _BASE_DEPENDENT_CLASSES
+            ]
         if not findings:
             await _resolve_deploy_staleness(db)
             return
@@ -1568,8 +1657,10 @@ async def _check_deploy_staleness(db) -> None:
         # The drift paragraph (and its update.sh recovery sentence) only when a
         # drift class is present: update.sh REFUSES a dirty deploy checkout, so
         # telling someone to run it for a dirty-only state is wrong advice.
-        if set(classes) - _DEPLOY_CHECKOUT_CLASSES:
+        if set(classes) - _DEPLOY_CHECKOUT_CLASSES - _DEPLOY_LIVE_CLASSES:
             paragraphs.append(_deploy_drift_paragraph(snap, age_days, behind, git_facts))
+        if set(classes) & _DEPLOY_LIVE_CLASSES:
+            paragraphs.append(_deploy_live_paragraph(snap, findings))
         if "main_checkout_dirty" in classes:
             paragraph = _deploy_checkout_dirty_paragraph(checkout)
             if carried and checkout.get("count") is not None:
@@ -1607,6 +1698,19 @@ async def _check_deploy_staleness(db) -> None:
 #: that has not been deployed. They get their own wording and never page:
 #: the critical branch keys only on stale_update and missing_units.
 _DEPLOY_CHECKOUT_CLASSES = frozenset({"main_checkout_dirty", "main_checkout_unreadable"})
+#: Finding classes about `live`, the integration branch scripts/deploy_candidates
+#: rebuilds from the deploy manifest (deploy_health.live_findings). Their own
+#: wording, no update.sh drift paragraph, and they never page.
+_DEPLOY_LIVE_CLASSES = frozenset(
+    {
+        "live_unbound",
+        "live_unreadable",
+        "live_off_branch",
+        "live_unbuilt",
+        "live_unlisted",
+        "live_candidate_tier2",
+    }
+)
 
 
 def _deploy_drift_paragraph(snap: dict, age_days, behind, git_facts: dict) -> str:
@@ -1635,8 +1739,79 @@ def _deploy_drift_paragraph(snap: dict, age_days, behind, git_facts: dict) -> st
         + "; ".join(detail)
         + ". Bare git merges deploy code but skip tier-2 activation "
         "(systemd units, guardian host redeploy, CC/Node pins). "
-        "Recovery: run scripts/update.sh from ~/genesis."
+        + (
+            "Recovery: run scripts/update.sh from ~/genesis (on `live` it rebuilds "
+            "`live` from the deploy manifest first)."
+            if (git_facts.get("live") == "live")
+            else "Recovery: run scripts/update.sh from ~/genesis."
+        )
     )
+
+
+def _deploy_live_paragraph(snap: dict, findings: list[str]) -> str:
+    live = snap.get("live") or {}
+    parts: list[str] = []
+    for f in findings:
+        cls, _, value = f.partition(":")
+        if cls == "live_unreadable":
+            parts.append(
+                "Whether this install runs the `live` integration branch as its deploy "
+                "manifest says could not be read on two consecutive checks "
+                f"({live.get('reason') or 'no reason given'}): scripts/deploy_candidates "
+                "status shows what the engine reads."
+            )
+        elif cls == "live_unbound":
+            parts.append(
+                "HEAD is the branch `live`, but no deploy manifest of this repository "
+                "binds it (the manifest is missing or names another repository). The "
+                "deploy scripts refuse this checkout, restart included, until the "
+                "manifest is restored or the checkout leaves `live` "
+                "(scripts/deploy_candidates status shows what it holds)."
+            )
+        elif cls == "live_unbuilt":
+            parts.append(
+                "The deploy manifest lists "
+                + ("candidates" if value == "?" else f"{value} candidate(s)")
+                + " that `live` does not hold: added since the last rebuild, or left out "
+                "of it (a conflict, a hook without approval, a failed check). "
+                "scripts/deploy_candidates status names each one and why; a rebuild "
+                "brings in the ones it can."
+            )
+        elif cls == "live_unlisted":
+            parts.append(
+                "`live` holds "
+                + ("candidates" if value == "?" else f"{value} candidate(s)")
+                + " that no deploy manifest of this repository lists (dropped without a "
+                "rebuild, or the manifest is missing), so their code is checked out with "
+                "nothing tracking it. scripts/deploy_candidates status names them; the "
+                "next rebuild removes them from `live`."
+            )
+        elif cls == "live_off_branch":
+            parts.append(
+                "The deploy manifest lists "
+                + (
+                    "candidates (their count was not read on this check)"
+                    if value == "?"
+                    else f"{value} candidate(s)"
+                )
+                + ", but the checkout is not "
+                "on `live`, so its files do not have them. To run them: scripts/deploy_candidates "
+                "rebuild (it rebuilds `live` from the manifest and moves the checkout onto "
+                "it; a bare git switch would run whatever `live` held before), then "
+                "scripts/deploy_code_only.sh restart. To stop listing one: "
+                "scripts/deploy_candidates drop <branch>. A candidate whose PR has "
+                "merged stays listed until the next rebuild retires it, or until that "
+                "drop; scripts/deploy_candidates status shows which."
+            )
+        elif cls == "live_candidate_tier2":
+            parts.append(
+                "`live` carries "
+                + ("update.sh-only files" if value == "?" else f"{value} update.sh-only file(s)")
+                + " from its candidates, over "
+                "the base it was built on; they are active only if scripts/update.sh ran "
+                "after the last rebuild."
+            )
+    return " ".join(parts)
 
 
 def _deploy_checkout_dirty_paragraph(checkout: dict) -> str:
@@ -2199,9 +2374,7 @@ async def _nocow_flag(db_path: Path) -> bool | None:
         return None
 
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=_NOCOW_PROBE_TIMEOUT_S
-        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_NOCOW_PROBE_TIMEOUT_S)
     except TimeoutError:
         # RECORD FIRST, clear on success — never the other way round. `_kill_probe`
         # awaits, so it is a cancellation point: a tick cancelled during the reap
@@ -3004,6 +3177,7 @@ async def _check_provider_outage_notify(db) -> None:
             if _breakers is not None:
                 current_incident_identity = _breakers.current_incident_identity
                 incident_owner = _breakers.incident_owner
+
                 def provider_still_failing(name, _reg=_breakers):
                     return _reg.get(name).state != ProviderState.CLOSED
 
@@ -3050,11 +3224,15 @@ async def _check_provider_outage_notify(db) -> None:
             # them at critical in this same tick, which delivers the pending
             # notification — the point of turning the lever up.
             await _promote_demoted_provider_notify(
-                db, coverage_for=coverage_for, incident_owner=incident_owner,
+                db,
+                coverage_for=coverage_for,
+                incident_owner=incident_owner,
             )
 
         written = await sweep_due_notifications(
-            db, priority=priority, provider_still_failing=provider_still_failing,
+            db,
+            priority=priority,
+            provider_still_failing=provider_still_failing,
             current_incident_identity=current_incident_identity,
             incident_owner=incident_owner,
             coverage_for=coverage_for,
@@ -3096,7 +3274,10 @@ async def _open_notify_rows(db) -> list[dict]:
 
 
 async def _promote_demoted_provider_notify(
-    db, *, coverage_for=None, incident_owner=None,
+    db,
+    *,
+    coverage_for=None,
+    incident_owner=None,
 ) -> None:
     """Resolve high-priority notify rows so live mode can rewrite them critical.
 
@@ -3129,8 +3310,11 @@ async def _promote_demoted_provider_notify(
             except Exception:
                 return True  # unknown → the sweep keeps critical, so promote
 
-        demoted = [r["id"] for r in await _open_notify_rows(db)
-                   if r.get("priority") == "high" and _now_critical(r)]
+        demoted = [
+            r["id"]
+            for r in await _open_notify_rows(db)
+            if r.get("priority") == "high" and _now_critical(r)
+        ]
         if demoted:
             from datetime import UTC, datetime
 

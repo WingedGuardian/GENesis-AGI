@@ -64,9 +64,11 @@ standalone MCP subprocess (e.g. a Claude Code session) has no pipeline of its
 own, so `provision_grow` / `outreach_send_and_wait` POST to the server's
 localhost RPC routes (`/api/genesis/provision/grow`,
 `/api/genesis/outreach/send_and_wait`) rather than failing — the server does the
-ask and returns the result. Those routes are LAN-reachable via the dashboard
-proxy like the rest of `/api/*`; `provision/grow` stays safe because it is
-owner-APPROVE-gated before anything mutates.
+ask and returns the result. New host installs use a loopback-only dashboard
+proxy; remote owner access uses a tunnel or restricted HTTPS. These RPC routes
+must not be mounted on peer ingress. `provision/grow` also remains
+owner-APPROVE-gated before anything mutates. Existing public proxies require the
+[ingress migration](peer-ingress.md) before peer activation.
 
 Genesis-DOWN is not an edge case: a full pool → rootfs read-only → Genesis down
 is the original outage, and the guardian growing the disk there **is** the

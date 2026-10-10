@@ -283,6 +283,8 @@ async def test_private_spawn_callback_error_is_not_logged(
     monkeypatch.setattr(PeerSegment, "stop_and_drain", AsyncMock())
     result = json.dumps({"type": "result", "subtype": "success", "is_error": False,
                          "result": "complete", "session_id": "fixture", "usage": {}}).encode()
+    monkeypatch.setattr(invoker_module, "process_group_alive", lambda proc: False)
+    monkeypatch.setattr(invoker_module, "kill_process_group", lambda proc: None)
     proc = MagicMock(pid=42000, returncode=0)
     proc.communicate = AsyncMock(return_value=(result, b""))
     proc.wait = AsyncMock(return_value=0)

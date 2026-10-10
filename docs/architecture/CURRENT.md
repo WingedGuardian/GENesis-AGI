@@ -381,7 +381,7 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: e4df379de612 2026-10-09
+verified: a73bc16 2026-10-10
 ```
 
 - **Peer execution policy groundwork (dark, opt-in)** — `cc/peer_segment.py`
@@ -1629,15 +1629,41 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 83a835e32 2026-10-08
+verified: e4df379de612 2026-10-09
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
   systemd timer; `check.py` runs 6 parallel probes → 6-state machine → act;
   Proxmox disk/RAM provisioning verbs) and container side (`watchdog.py`
   monitors the host Guardian every awareness tick, incl. git-SHA code-drift
-  detection). Config `~/.genesis/guardian_remote.yaml`; missing → silently
+  detection; the drift comparison runs only on `main` and `live`, while the
+  host reconcilers that share its version probe run on any branch).
+  Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **Shared backup decryption (development candidate)**: the standalone
+  `guardian/cred_integrity.py` file authenticates one passphrase-encrypted,
+  integrity-protected message for credential recovery and backup/restore.
+  It runs under system Python without Genesis imports. File recovery replaces
+  destinations only after successful authentication; the streaming API accepts
+  results only after checking the complete message. Native GPG controls cover
+  this candidate; installed rollout and configured-NAS writes remain unverified.
+- **HTTP/ICMP targets are separate**: `health_api_host` (env
+  `GUARDIAN_HEALTH_HOST`) can use the host loopback dashboard proxy while ICMP
+  retains its configured/autodetected container address. Health/dialogue HTTP
+  requests bypass environment proxies only for numeric loopback targets; custom
+  targets retain urllib proxy policy. The operator `guardian.dashboard_ingress`
+  migration proves the loaded standard user service's selected YAML/effective
+  environment, live container-loopback listener and patch eligibility,
+  then patches preserved config before restricting Incus ingress. Full deployment
+  and migration preserve an operator-owned Guardian pause until direct health
+  verification. The first rollout stages merged updater code with the locked
+  code-only pull; incoming bootstrap refuses a legacy unqualified full updater
+  before mutation, and the new updater checks the listener or maintained pause.
+  This is a maintenance snapshot, not a held lease; migration does not activate peers. Setup stops before Guardian
+  when standard proxy endpoints/modes cannot be verified and checks local plus
+  inherited device absence before adding a proxy. Generated network instructions
+  use local loopback and explicit owner remote-access methods. See
+  [ingress and acceptance](../reference/peer-ingress.md).
 - **guard-layer watch** (`guardian/guard_layer_watch.py`, a SIDE-watch in
   `run_check`, not a `probe_*`): asks whether the AGENT TOOLING can still
   evaluate — the `genesis-hook` LAUNCHER end to end, the container venv
@@ -1938,7 +1964,15 @@ verified: 477efb7f7 2026-10-05
   so a deploy would refuse): its own wording without the update.sh advice,
   never critical; an unreadable status alerts only on the second consecutive
   tick, and the first unreadable tick (or a tick during a deploy) holds the
-  check rather than resolving a standing dirty alert.
+  check rather than resolving a standing dirty alert. On `live` (the integration
+  branch `scripts/deploy_candidates` rebuilds), the drift is measured from the
+  commit `live` was built on, and five non-paging `live_*` classes have their own
+  wording (`live` unreadable; the checkout off `live` while the manifest lists
+  candidates; listed candidates `live` does not hold; `live` holding candidates
+  nothing lists; a candidate's update.sh-only files on `live`), held over a deploy
+  tick and a first unreadable tick the same way. A first tick whose engine read did
+  not answer is held too; a second in a row raises `live_unreadable` only while a
+  live alert stands in the store, so an install that never uses `live` never alerts.
   Also (hourly) ego cycle liveness (`_check_ego_liveness`, `ego/liveness.py`): an
   ego with no COMPLETED cycle past a conservative multiple of its current
   interval (the `job_health.last_success` gap — never the `is_running`/heartbeat/
@@ -3260,7 +3294,14 @@ verified: ba9dd8a37 2026-10-09
   `scripts/lib/deploy_marker.sh` + `deploy_checkout.sh` on every snapshot
   (listed in deploy_status.sh `_RUNTIME_FRESH_SCRIPTS`), read-only
   (`GIT_OPTIONAL_LOCKS=0`, own process group killed on timeout): do not copy
-  the ephemeral-path regex into Python. **Total-cessation detection** (`observability/liveness.py`,
+  the ephemeral-path regex into Python. Its `live` collector runs
+  `scripts/lib/live_checkout.py` and `scripts/deploy_candidates list --json` (one
+  read-only engine reading: the manifest's state, what it lists, and what `live`
+  holds per the engine's `live_set`; the engine is the manifest's reader, nothing
+  in src/ reads the manifest), both bounded the same way; on `live` the
+  behind-count, tier-2 and host drift are measured from merge-base(HEAD,
+  origin/main), because the engine's `switch -C live <sha>` sets no upstream.
+  **Total-cessation detection** (`observability/liveness.py`,
   and for outreach a deliberately channel-INDEPENDENT heartbeat in
   `outreach/heartbeat.py`): a subsystem that stops entirely emits nothing, so
   absence-of-signal is itself the signal — the alarm keys on the gap since the

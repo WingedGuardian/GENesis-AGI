@@ -1,1 +1,2 @@
 - Preserve checkout launch admission and peer invocation ownership when reconciling contained execution with the current launch fence.
+- Keep mocked peer subprocess tests isolated from real process-group probes and signals.
