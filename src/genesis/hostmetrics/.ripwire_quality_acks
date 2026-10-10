@@ -1,0 +1,3 @@
+# ripwire quality acks v1 — written by --quality-ack; a finding stays suppressed until it worsens past its acked magnitude
+# format: ack <kind> <16-hex-key> <ackNow> [cid=<16-hex-content-id>] [by=<scope that acked it>] <reason to end of line> — one per line, kept SORTED by (kind,key) on every write (merge-friendly)
+ack params 4816d9af3790bd86 7 cid=ec26aa29af458baa One optional keyword-only ownership parameter is required for cooperative cancellation and exclusive probe reaping; all five prior positional parameters remain. Static tool counts bare star as another parameter. Native owned-scope checks and independent architecture/security reviewed this boundary; seven new-symbol debt rows remain unaccepted.

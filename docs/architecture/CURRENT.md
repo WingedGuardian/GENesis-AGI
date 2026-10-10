@@ -147,6 +147,21 @@ Easy-to-forget mechanisms:
   investigation), inside the hook wrapper's 10s ceiling. The
   `memory_proactive` MCP tool shares the engine but stays unfiltered/
   un-reranked.
+- **FTS term counts are bounded** (`db/crud/_fts.py` `bounded_terms`,
+  `FTS_MAX_TERMS`): the expanded query (`intent.expand_query`), the raw prompt
+  when it becomes the file-keyword lane's base (`_expand_fts_query`), and the
+  AND→OR retry (`or_fallback`) keep at most that many FTS5 tokens (32), counted
+  over every operand (repeats included) in the `porter ascii` tokenizer's units
+  (`fts5_tokens`: a snake_case word is one token per piece), filled with the
+  most frequent terms in the prompt. A query within the budget is unchanged. Without it
+  a long paste ORed every word, scored most of `memory_fts`, timed recall out and
+  spilled 60-190 MiB temp sorts. The strict AND first pass is de-duplicated when over the budget (`and_pass`): it
+  matches the same rows, and a repeated-word paste no longer costs seconds per
+  recall (measured 2026-10-09 on a synthetic 20k-row in-memory table: 400 repeated
+  operands 12.7 s, de-duplicated 0.04 s). Accepted cost: on
+  long prompts the top results shift (median 29% overlap with the unbounded
+  ranking, measured 2026-10-08). The tag co-occurrence index also skips the
+  `session_note` tag (on ~59% of rows), which otherwise widened every expansion.
 - `procedure_recall` deliberately uses Jaccard tag-overlap
   (`learning/procedural/matcher.py find_relevant`), not hybrid retrieval.
 - External-world recall results are provenance-wrapped (`wrap_external_recall`)
@@ -2451,7 +2466,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 7ec594c72 2026-10-09
+verified: 85652265c 2026-10-09
 ```
 
 - **transcript_analytics/**: optional local transcript parser library. It
@@ -2462,9 +2477,20 @@ verified: 7ec594c72 2026-10-09
   atomic, validated catalog; readers and generation collection share publication
   locks. DuckDB exposes separate executor, delegation and context views with
   explicit coverage denominators, while private connection-owned spill storage
-  protects query intermediates. These are local library APIs: CLI, scheduling
-  and encrypted recovery arrive in dependent changes. Collection is not activated
-  by this change, and this map does not describe a deployed capability.
+  protects query intermediates. The opt-in CLI now exposes ingest, derive,
+  status, SQL, prune and verify through an enforced, registered systemd scope,
+  with cooperative first cancellation and explicit second-cancellation force.
+  Uncapped launches are refused; the default configuration remains disabled.
+  The environment kill switch preserves validated configured paths; admission
+  refuses explicit or computed caps below the shared launcher minimum.
+  Unknown configuration keys and negative SQL display limits are refused.
+  CPU admission floors representable quotas without inflating the requested cap;
+  caps below0.1% of one CPU are refused. The30-second worker startup deadline
+  remains; very small enforced caps can still time out as unavailable.
+  Snapshot/live verification compares
+  ordered names/types and rows, retaining both locks with one engine at a time.
+  Evidence retrieval, installed scheduling and encrypted recovery arrive in
+  dependent changes. This map does not describe a deployed capability.
 
 - **The graders are TOLD the response status; they must never infer it.** The
   triage/outcome/delta graders each judge an `InteractionSummary`, and the
@@ -3080,7 +3106,17 @@ verified: 477efb7f7 2026-10-05
   not trip it (the 2026-09-18 log-storm class). Both land with the runtime
   corruption trip.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
-  without it interleaved commits pin `in_transaction` until restart). Two
+  without it interleaved commits pin `in_transaction` until restart). Every
+  statement through a `SerializedConnection` (its cursors' row fetches too),
+  and every recall read through the RO pool (`HybridRetriever._ro_read`), in
+  any process that uses them, is timed by `db/_slow_log.timed`: one taking at
+  least `GENESIS_SQLITE_SLOW_MS` (default 1000, `0` = off) logs one WARNING
+  naming the SQL (never its parameters) or read helper, the in-process wait vs
+  the run (run includes SQLite's busy-timeout wait and lock-retry backoff), the
+  outcome (ok / cancelled / error) and what it was stuck behind — rate-limited
+  per label and outcome to one line per 60 s unless a repeat is twice as slow.
+  Not timed: raw `aiosqlite`/`sqlite3` connections and the unlocked
+  `db.cursor()` / `cursor.execute()` routes (unused in production). Two
   schema paths coexist: base DDL (`schema/_tables.py`, 117 CREATE TABLE, a count
   that drifts every table-adding PR — re-measure, do not trust) plus versioned
   `migrations/` run ONCE at startup before any
