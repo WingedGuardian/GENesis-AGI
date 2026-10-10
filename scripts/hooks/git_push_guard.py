@@ -12901,12 +12901,9 @@ def _run_merge_and_push_gates() -> int:
                                 f"first push of '{cur}' to the configured public repo "
                                 f"({_canonical_public_repo()}).",
                             )
-                            # The note is the only channel on this path, so any
-                            # policy NOTE (an unknown key, say) rides it — the
-                            # same shape as needs_user.decide.
-                            notes = _drain_ask_notes()
-                            if notes:
-                                publish_note = f"{publish_note}\n\n{notes}"
+                            # Policy NOTEs (an unknown key, say) are drained
+                            # where this note is EMITTED, not here: a later arm's
+                            # ask can still win, and its own drain must find them.
                         else:
                             # `_push_is_republish` answers False on an ls-remote
                             # error or timeout too, so "not confirmed present" is
@@ -13064,14 +13061,13 @@ def _run_merge_and_push_gates() -> int:
                             and (_open_pr_count_for_branch(pr_dst, cwd=pcwd, push_urls=urls) or 0)
                             >= 1
                         ):
+                            # Policy NOTEs are drained at emission, as for
+                            # publish_note, so an ask that wins keeps them.
                             pr_branch_note = _suppressed_reason(
                                 "push_pr_branch",
                                 f"push of '{cur}' onto '{pr_dst}', the head of an open "
                                 f"pull request on this repository.",
                             )
-                            notes = _drain_ask_notes()
-                            if notes:
-                                pr_branch_note = f"{pr_branch_note}\n\n{notes}"
                     if pr_branch_note is None:
                         ask_nonroutine = True
                         ask_reason = (
@@ -13954,10 +13950,10 @@ def _run_merge_and_push_gates() -> int:
         # context note. After every block and every ask above (an ask from any
         # other arm wins), and BEFORE the create `_allow` below, which would
         # otherwise approve the command on this hook's behalf.
-        if publish_note is not None:
-            return _emit_context_only(publish_note)
-        if pr_branch_note is not None:
-            return _emit_context_only(pr_branch_note)
+        if publish_note is not None or pr_branch_note is not None:
+            note = publish_note if publish_note is not None else pr_branch_note
+            notes = _drain_ask_notes()
+            return _emit_context_only(f"{note}\n\n{notes}" if notes else note)
 
         # A first-push-only re-push auto-allow — emitted ONLY here, after every
         # hard-block has had its chance to return 2, so a compound

@@ -234,3 +234,12 @@ def test_a_dispatched_session_is_still_denied(monkeypatch, tmp_path, capsys, off
     rc, _out, err = _run(monkeypatch, tmp_path, capsys, PUSH)
     assert rc == 2
     assert "BLOCKED" in err
+
+
+def test_a_policy_note_rides_the_silenced_push(monkeypatch, tmp_path, capsys):
+    """A misconfigured policy key raises a NOTE; it is drained where the silence
+    is emitted, so it still reaches the transcript."""
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "push_pr_branch=off,no_such_key=off")
+    rc, out, err = _run(monkeypatch, tmp_path, capsys, PUSH)
+    _assert_silenced(rc, out, err)
+    assert "no_such_key" in _hso(out)["additionalContext"], out
