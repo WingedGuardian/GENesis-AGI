@@ -60,6 +60,31 @@ guard remains in force for non-quarantined databases.
 If restore cannot determine that quarantine state (for example, the integrity
 checker cannot start), it aborts instead of treating the database as healthy.
 
+### Restored peer permissions
+
+Full and database-only backup restores disable peer access, clear capability
+grants, and renew relationship epochs in the staged database before installation.
+Identities and historical records remain; saved jobs and approval consent cannot
+be replayed as current authority. Incompatible peer schemas refuse before the
+live database is touched. Older databases without peer state remain compatible.
+Peer-bearing candidates require SQLite 3.37 or newer to verify that reset targets
+are ordinary tables. Reset refuses triggers or foreign-key actions that could
+change other rows; the staged transaction rolls back instead of publishing those
+effects. Unrelated triggers, foreign keys and full-text tables remain supported.
+An owner must explicitly configure peer access and grant capabilities again;
+a runtime that started disabled also requires a restart to enable execution.
+
+Update prepares a separate, guarded `.pre-update.peer-restore` candidate before
+stopping services or changing code, retaining the original `.pre-update` snapshot.
+Migration rollback uses the guarded candidate; an incomplete database rollback
+does not explicitly restart services. External watchdog recovery is unchanged.
+
+Guardian whole-container snapshot rollback is different: its existing second
+approval prompt warns that saved peer permissions, jobs and consent return.
+Approving that specific action explicitly reauthorizes the saved peers. Both
+existing approval gates still apply; failed prompt delivery or denial cannot
+authorize rollback.
+
 ### Restore preconditions and the holder scan
 
 Database-only recovery refuses unless it can establish that no process still
@@ -228,6 +253,37 @@ The mirror/archive carry only GPG-encrypted `*.gpg` files; the decryption
 passphrase is escrowed separately. The guardian **refuses to overwrite the
 archive from an empty or incomplete mirror**, so a container-side zeroing event
 can never propagate into the last-line copy.
+
+GPG's `--passphrase-fd` reads only the first line, so backup and decryption
+reject embedded LF; the guardian's byte-oriented decryption also rejects NUL.
+Existing single-line keys retain their spaces, quotes, carriage returns and
+Unicode bytes. Missing-key handling remains the caller's existing policy.
+
+Encrypted backup readers share the standalone `guardian/cred_integrity.py`
+decryption boundary, which also runs under system Python during credential
+recovery. A `.gpg` suffix or successful GPG exit alone is insufficient: readers
+require a single integrity-protected message successfully decrypted using the
+supplied passphrase. Unencrypted literal/signed packets, public-key fallback,
+unprotected encryption, damaged trailers, and incomplete decryption are rejected.
+Protected MDC and AEAD messages remain supported. File restores publish a private
+staged result only after authentication, preserving an existing destination on
+decryption failure. Historical unencrypted `.gpg` files are reported incomplete;
+the explicitly supported legacy plaintext forms remain separate.
+
+Standalone recovery needs the trusted checkout's
+`src/genesis/guardian/cred_integrity.py` alongside the scripts; it needs no
+installed Genesis package or working virtual environment. A minimal copied
+transcript-recovery bundle must preserve that file's checkout-relative path
+alongside `scripts/lib/transcript_archive.py`, plus the trusted catalog validator
+when restoring catalog-bearing analytics archives. Missing decoder code fails
+closed; copying only the archive script is insufficient for encrypted recovery.
+
+Secret-file syntax uses ASCII whitespace outside quotes. The Bash loader uses
+literal ASCII trim patterns and runs its `sed` parser under `LC_ALL=C`; guardian
+readers split on LF and trim ASCII whitespace. Unicode spaces and separators
+remain value bytes. Ordinary `LC_ALL` records still export to the caller, but
+cannot change later syntax parsing. This candidate has passed disposable
+locale/byte checks; final regression and recovery tests remain required.
 
 **Rebuild runbook (no network required):**
 

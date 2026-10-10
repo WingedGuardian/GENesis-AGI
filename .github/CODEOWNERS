@@ -86,6 +86,7 @@
 /scripts/lib/gate_menu.py               @WingedGuardian
 /scripts/review_budget.py               @WingedGuardian
 /scripts/review_findings.py             @WingedGuardian
+/scripts/review_reflection.py           @WingedGuardian
 /src/genesis/session_awareness/external_review.py @WingedGuardian
 /src/genesis/session_awareness/external_review_config.py @WingedGuardian
 /scripts/hooks/main_checkout_guard.py   @WingedGuardian
