@@ -748,9 +748,15 @@ class WatchdogChecker:
         try:
             from genesis.util.proc_io import claude_ancestor, rank_by_io_rate, systemd_unit
 
-            pids = [int(d) for d in os.listdir("/proc") if d.isdigit()]
-            rates, readable, total = rank_by_io_rate(
-                pids, top_n=_IO_CULPRIT_TOP_N, sample_interval_s=_IO_CULPRIT_SAMPLE_S,
+            def _pids() -> list[int]:
+                return [int(d) for d in os.listdir("/proc") if d.isdigit()]
+
+            pids = _pids()
+            rates, readable, total, churn = rank_by_io_rate(
+                pids,
+                top_n=_IO_CULPRIT_TOP_N,
+                sample_interval_s=_IO_CULPRIT_SAMPLE_S,
+                pid_source=_pids,
             )
             parts = []
             for r in rates:
@@ -763,14 +769,28 @@ class WatchdogChecker:
                     f"{r['comm']}[{r['pid']}] {systemd_unit(r['pid']) or '?'}{session} "
                     f"r={_rate(r['read_rate'])} w={_rate(r['write_rate'])}"
                 )
+            missed = (
+                f"; {churn['exited']} exited during the sample, their I/O not counted"
+                if churn["exited"]
+                else ""
+            )
             logger.warning(
                 "I/O pressure: top I/O processes (full avg10=%.1f%%; this container's "
-                "readable processes only, %d of %d readable, total %s): %s",
+                "readable processes only, %d of %d readable, %d started mid-sample, "
+                "total %s%s): %s",
                 avg10,
                 readable,
                 len(pids),
+                churn["started"],
                 _rate(total),
-                "; ".join(parts) if parts else "none did I/O in the sample",
+                missed,
+                "; ".join(parts)
+                if parts
+                else (
+                    "none of the measured processes did I/O"
+                    if churn["exited"]
+                    else "none did I/O in the sample"
+                ),
             )
         except Exception:
             logger.warning("I/O culprit sample failed", exc_info=True)

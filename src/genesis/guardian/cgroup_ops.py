@@ -203,7 +203,7 @@ def find_top_io_pids_rate(
     pids = list_container_pids(container)
     if not pids:
         return []
-    rates, _readable, _total = rank_by_io_rate(pids, top_n, sample_interval_s)
+    rates, _readable, _total, _churn = rank_by_io_rate(pids, top_n, sample_interval_s)
     return rates
 
 

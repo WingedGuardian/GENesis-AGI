@@ -65,11 +65,14 @@ def test_rank_uses_the_delta_not_the_lifetime_total(
         (fake_proc / "3").rmdir()
 
     monkeypatch.setattr(proc_io.time, "sleep", _sleep)
-    rates, readable, total = proc_io.rank_by_io_rate([1, 2, 3, 99], top_n=5, sample_interval_s=1.0)
+    rates, readable, total, churn = proc_io.rank_by_io_rate(
+        [1, 2, 3, 99], top_n=5, sample_interval_s=1.0
+    )
 
     assert readable == 3  # pid 99 never existed
     assert total == 5_000_000.0
-    assert [r["pid"] for r in rates] == [2, 1]  # pid 3 dropped, 2 first
+    assert [r["pid"] for r in rates] == [2, 1]  # pid 3 not ranked, 2 first
+    assert churn == {"exited": 1, "started": 0}  # ... and counted, never "no I/O"
     assert rates[0]["write_rate"] == 5_000_000.0
     assert rates[1]["total_rate"] == 0.0
 
@@ -79,7 +82,7 @@ def test_rank_with_nothing_readable_does_not_sleep(
 ) -> None:
     slept: list[float] = []
     monkeypatch.setattr(proc_io.time, "sleep", slept.append)
-    assert proc_io.rank_by_io_rate([5, 6]) == ([], 0, 0.0)
+    assert proc_io.rank_by_io_rate([5, 6]) == ([], 0, 0.0, {"exited": 0, "started": 0})
     assert slept == []
 
 
@@ -132,7 +135,9 @@ def test_total_counts_processes_beyond_the_top_n(
             _proc(fake_proc, pid, read=0, write=w)
 
     monkeypatch.setattr(proc_io.time, "sleep", _sleep)
-    rates, readable, total = proc_io.rank_by_io_rate([1, 2, 3], top_n=1, sample_interval_s=1.0)
+    rates, readable, total, _churn = proc_io.rank_by_io_rate(
+        [1, 2, 3], top_n=1, sample_interval_s=1.0
+    )
     assert [r["pid"] for r in rates] == [1]
     assert (readable, total) == (3, 6_000.0)
 
@@ -187,3 +192,58 @@ def test_guardian_rankers_honour_top_n_and_sort_order(
 
     monkeypatch.setattr(proc_io.time, "sleep", _sleep)
     assert [r["pid"] for r in cgroup_ops.find_top_io_pids_rate("c", top_n=2)] == [1, 3]
+
+
+
+# ── round-1 review: churn, the measured interval, and comm bytes ────────────
+
+
+def test_a_process_started_mid_sample_is_measured_from_zero(
+    fake_proc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-1 review: the second pass walked only the first snapshot's pids, so a
+    short-lived culprit that started during the interval was never seen."""
+    _proc(fake_proc, 1, read=0, write=0, comm="steady")
+
+    def _sleep(_s: float) -> None:
+        _proc(fake_proc, 7, read=0, write=3_000_000, comm="burst")  # started mid-sample
+
+    monkeypatch.setattr(proc_io.time, "sleep", _sleep)
+    rates, readable, total, churn = proc_io.rank_by_io_rate(
+        [1], top_n=5, sample_interval_s=1.0, pid_source=lambda: [1, 7]
+    )
+    assert [r["pid"] for r in rates] == [7, 1]
+    assert rates[0]["write_rate"] == 3_000_000.0
+    assert (readable, total) == (1, 3_000_000.0)
+    assert churn == {"exited": 0, "started": 1}
+
+
+def test_rates_divide_by_the_measured_interval(
+    fake_proc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-1 review: under I/O pressure the sleep overruns; a 1 s request that
+    took 5 s must not report five times the real rate."""
+    import types
+
+    clock = {"t": 100.0}
+    _proc(fake_proc, 2, read=0, write=0, comm="writer")
+
+    def _sleep(_s: float) -> None:
+        clock["t"] += 5.0  # overran a 1 s request
+        _proc(fake_proc, 2, read=0, write=5_000_000, comm="writer")
+
+    fake_time = types.SimpleNamespace(monotonic=lambda: clock["t"], sleep=_sleep)
+    monkeypatch.setattr(proc_io, "time", fake_time)
+    rates, _r, total, _c = proc_io.rank_by_io_rate([2], sample_interval_s=1.0)
+    assert rates[0]["write_rate"] == 1_000_000.0
+    assert total == 1_000_000.0
+
+
+def test_a_non_utf8_comm_keeps_the_pid(fake_proc: Path) -> None:
+    """Round-1 review: comm may hold any non-NUL bytes; a decode error dropped a
+    pid whose I/O counters were readable."""
+    _proc(fake_proc, 9, read=10, write=20)
+    (fake_proc / "9" / "comm").write_bytes(b"odd\xff\xfename\n")
+    got = proc_io.read_proc_io(9)
+    assert got is not None and got["total_bytes"] == 30
+    assert got["comm"].startswith("odd") and "\ufffd" in got["comm"]

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import time
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 # Module-level so tests can repoint it at a fake tree (the host_boot.py seam).
@@ -47,7 +48,10 @@ def read_proc_io(pid: int) -> dict | None:
 
         comm = "unknown"
         with contextlib.suppress(OSError):
-            comm = (Path(_PROC) / str(pid) / "comm").read_text().strip()
+            # Bytes, not text: a process may set its comm to any non-NUL bytes,
+            # and a decode error must not drop a pid whose counters were read.
+            raw = (Path(_PROC) / str(pid) / "comm").read_bytes()
+            comm = raw.decode("utf-8", "replace").strip() or "unknown"
 
         return {
             "pid": pid,
@@ -64,49 +68,78 @@ def rank_by_io_rate(
     pids: list[int],
     top_n: int = 5,
     sample_interval_s: float = 0.5,
-) -> tuple[list[dict], int, float]:
+    *,
+    pid_source: Callable[[], Iterable[int]] | None = None,
+) -> tuple[list[dict], int, float, dict]:
     """Rank ``pids`` by current I/O rate, from two samples ``sample_interval_s`` apart.
 
-    Returns ``(rates, readable, total_rate)``: the top ``top_n`` entries (keys
-    pid, comm, read_rate, write_rate, total_rate in bytes/s,
+    Returns ``(rates, readable, total_rate, churn)``: the top ``top_n`` entries
+    (keys pid, comm, read_rate, write_rate, total_rate in bytes/s,
     read_bytes_cumulative, write_bytes_cumulative); how many of ``pids`` had a
-    readable first sample; and the summed rate over ALL readable pids, not just
-    the top ones. The total is the denominator a reader needs: a stall with a
-    small total was caused by something this caller cannot see.
-    A pid that exits between samples is dropped.
+    readable first sample; the summed rate over ALL measured pids, not just the
+    top ones (the denominator a reader needs: a stall with a small total was
+    caused by something this caller cannot see); and ``churn`` =
+    ``{"exited": n, "started": n}``.
+
+    Processes come and go during the interval, and the culprit of a stall is
+    often a short-lived one, so neither kind is silently dropped:
+      - ``exited``: readable at the first sample, gone at the second. Its I/O in
+        the interval cannot be read, so it is COUNTED and reported, never
+        presented as "no I/O";
+      - ``started``: with ``pid_source`` (re-listed after the interval), a pid
+        absent from ``pids`` is measured from zero, since all its I/O happened
+        within the interval.
+    A rate divides by the time between that pid's two reads, measured, since a
+    sleep under heavy I/O pressure overruns its request. ``time.sleep`` never
+    returns early (PEP 475 retries it after a signal), so the measured time is
+    never below the request; the ``max`` only keeps a stubbed sleep meaningful.
     """
-    t0: dict[int, dict] = {}
+    churn = {"exited": 0, "started": 0}
+    t0: dict[int, tuple[dict, float]] = {}
     for pid in pids:
         data = read_proc_io(pid)
         if data:
-            t0[pid] = data
+            t0[pid] = (data, time.monotonic())
 
-    if not t0:
-        return [], 0, 0.0
+    if not t0 and pid_source is None:
+        return [], 0, 0.0, churn
 
+    begun = time.monotonic()
     time.sleep(sample_interval_s)
 
+    def _rate(pid: int, after: dict, before: dict | None, since: float) -> dict:
+        elapsed = max(time.monotonic() - since, sample_interval_s)
+        delta_read = max(0, after["read_bytes"] - (before["read_bytes"] if before else 0))
+        delta_write = max(0, after["write_bytes"] - (before["write_bytes"] if before else 0))
+        return {
+            "pid": pid,
+            "comm": after["comm"],
+            "read_rate": delta_read / elapsed,
+            "write_rate": delta_write / elapsed,
+            "total_rate": (delta_read + delta_write) / elapsed,
+            "read_bytes_cumulative": after["read_bytes"],
+            "write_bytes_cumulative": after["write_bytes"],
+        }
+
     rates: list[dict] = []
-    for pid, before in t0.items():
+    for pid, (before, read_at) in t0.items():
         after = read_proc_io(pid)
         if after is None:
-            continue  # exited between samples
-        delta_read = max(0, after["read_bytes"] - before["read_bytes"])
-        delta_write = max(0, after["write_bytes"] - before["write_bytes"])
-        rates.append(
-            {
-                "pid": pid,
-                "comm": after["comm"],
-                "read_rate": delta_read / sample_interval_s,
-                "write_rate": delta_write / sample_interval_s,
-                "total_rate": (delta_read + delta_write) / sample_interval_s,
-                "read_bytes_cumulative": after["read_bytes"],
-                "write_bytes_cumulative": after["write_bytes"],
-            }
-        )
+            churn["exited"] += 1  # its I/O in the interval is unreadable, not zero
+            continue
+        rates.append(_rate(pid, after, before, read_at))
+    if pid_source is not None:
+        known = set(pids)
+        for pid in pid_source():
+            if pid in known:
+                continue
+            after = read_proc_io(pid)
+            if after is not None:
+                churn["started"] += 1
+                rates.append(_rate(pid, after, None, begun))
 
     rates.sort(key=lambda x: x["total_rate"], reverse=True)
-    return rates[:top_n], len(t0), sum(r["total_rate"] for r in rates)
+    return rates[:top_n], len(t0), sum(r["total_rate"] for r in rates), churn
 
 
 def systemd_unit(pid: int) -> str | None:

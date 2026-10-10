@@ -59,7 +59,7 @@ def test_culprit_line_names_process_unit_and_readable_count(
         {"pid": 4, "comm": "python3", "read_rate": 2_000.0, "write_rate": 0.0, "total_rate": 2_000.0},
         {"pid": 5, "comm": "claude", "read_rate": 0.0, "write_rate": 3_000.0, "total_rate": 3_000.0},
         {"pid": 1, "comm": "idle", "read_rate": 0.0, "write_rate": 0.0, "total_rate": 0.0},
-    ], 2, 40_005_000.0))
+    ], 2, 40_005_000.0, {"exited": 0, "started": 0}))
     monkeypatch.setattr(proc_io, "systemd_unit", lambda pid: "genesis-backup.service" if pid == 2 else None)
     monkeypatch.setattr(proc_io, "claude_ancestor", lambda pid: 777 if pid in (4, 5) else None)
     with caplog.at_level(logging.WARNING, logger=wd.logger.name):
@@ -83,7 +83,9 @@ def test_no_busy_process_says_so(
 
     checker = _checker(tmp_path)
     monkeypatch.setattr(wd.os, "listdir", lambda _p: ["1"])
-    monkeypatch.setattr(proc_io, "rank_by_io_rate", lambda pids, **_k: ([], 0, 0.0))
+    monkeypatch.setattr(
+        proc_io, "rank_by_io_rate", lambda pids, **_k: ([], 0, 0.0, {"exited": 0, "started": 0})
+    )
     with caplog.at_level(logging.WARNING, logger=wd.logger.name):
         checker._log_io_culprits(30.0)
     line = caplog.records[-1].getMessage()
@@ -118,8 +120,36 @@ def test_a_formatting_failure_is_logged_not_raised(
     checker = _checker(tmp_path)
     monkeypatch.setattr(wd.os, "listdir", lambda _p: ["1"])
     monkeypatch.setattr(proc_io, "rank_by_io_rate", lambda pids, **_k: (
-        [{"pid": 1, "comm": "x", "read_rate": 1.0, "write_rate": 1.0, "total_rate": 2.0}], 1, 2.0))
+        [{"pid": 1, "comm": "x", "read_rate": 1.0, "write_rate": 1.0, "total_rate": 2.0}], 1, 2.0,
+        {"exited": 0, "started": 0}))
     monkeypatch.setattr(proc_io, "systemd_unit", _boom)
     with caplog.at_level(logging.WARNING, logger=wd.logger.name):
         checker._log_io_culprits(30.0)
     assert "I/O culprit sample failed" in caplog.records[-1].getMessage()
+
+
+
+def test_processes_that_exited_mid_sample_are_named_not_hidden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Round-1 review: a culprit that exited during the interval made the line read
+    "none did I/O"; it now says how many were missed, and the watchdog re-lists
+    /proc so one that started mid-sample is measured."""
+    import genesis.util.proc_io as proc_io
+
+    checker = _checker(tmp_path)
+    monkeypatch.setattr(wd.os, "listdir", lambda _p: ["1"])
+    seen: dict = {}
+
+    def _rank(pids, **kw):
+        seen["pid_source"] = kw.get("pid_source")
+        return [], 1, 0.0, {"exited": 2, "started": 1}
+
+    monkeypatch.setattr(proc_io, "rank_by_io_rate", _rank)
+    with caplog.at_level(logging.WARNING, logger=wd.logger.name):
+        checker._log_io_culprits(30.0)
+    line = caplog.records[-1].getMessage()
+    assert "2 exited during the sample, their I/O not counted" in line
+    assert "1 started mid-sample" in line
+    assert "none did I/O in the sample" not in line
+    assert callable(seen["pid_source"]) and seen["pid_source"]() == [1]
