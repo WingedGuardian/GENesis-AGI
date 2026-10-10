@@ -1,1 +1,2 @@
 - Added resumable encrypted transcript capture with retained source identities, durable validation checkpoints, and verification of every referenced remote object before publishing COMPLETE. Compatible restore support precedes producer activation; persistent analytics settings remain a separate change.
+- Fixed source inspection errors being mistaken for empty scope and preserved pooled recovery for existing host-label prefixes.

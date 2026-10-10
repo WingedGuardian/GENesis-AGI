@@ -1,5 +1,6 @@
 """Portable source archives preserve provenance and refuse unsafe payloads."""
 
+import errno
 import hashlib
 import importlib.util
 import io
@@ -218,7 +219,7 @@ def test_absent_source_root_still_validates_retained_history(tmp_path, monkeypat
     assert archive.backup(root, destination, scratch, b'p', project=project) == (retained in ("corrupt", "missing"))
 
 
-@pytest.mark.parametrize("kind", ["file", "dangling-link"])
+@pytest.mark.parametrize("kind", ["file", "dangling-link", "parent-link-loop"])
 def test_invalid_source_root_remains_incomplete(tmp_path, monkeypatch, kind):
     root, destination, scratch = (tmp_path / name for name in ('sources', 'cipher', 'scratch'))
     destination.mkdir()
@@ -226,9 +227,33 @@ def test_invalid_source_root_remains_incomplete(tmp_path, monkeypatch, kind):
     monkeypatch.setattr(archive, 'crypt', lambda src, dst, *a, **k: dst.write_bytes(src.read_bytes()))
     if kind == "file":
         root.write_text('{}')
-    else:
+    elif kind == "dangling-link":
         root.symlink_to(tmp_path / 'absent')
+    else:
+        loop = tmp_path / 'loop'
+        loop.symlink_to('loop')
+        root = loop / 'sources'
     assert archive.backup(root, destination, scratch, b'p')
+
+
+@pytest.mark.parametrize("error", [errno.EACCES, errno.ELOOP, errno.EIO])
+@pytest.mark.parametrize("project", [None, "main"])
+def test_source_inspection_failure_is_not_empty_scope(tmp_path, monkeypatch, error, project):
+    root, destination, scratch = (tmp_path / name for name in ('sources', 'cipher', 'scratch'))
+    for directory in (root, destination, scratch):
+        directory.mkdir()
+    if project is not None:
+        (root / project).mkdir()
+    inspected = root if project is None else root / project
+    monkeypatch.setattr(archive, 'crypt', lambda src, dst, *a, **k: dst.write_bytes(src.read_bytes()))
+    for method in ('stat', 'lstat'):
+        original = getattr(Path, method)
+        def unavailable(path, *args, _original=original, **kwargs):
+            if path == inspected:
+                raise OSError(error, 'injected source inspection failure')
+            return _original(path, *args, **kwargs)
+        monkeypatch.setattr(Path, method, unavailable)
+    assert archive.backup(root, destination, scratch, b'p', project=project)
 
 
 

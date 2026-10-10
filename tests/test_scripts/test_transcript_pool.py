@@ -111,6 +111,30 @@ captures="$4"
     )
 
 
+@pytest.mark.parametrize("label", [".archive", "_archive", "-archive"])
+def test_existing_host_labels_roundtrip_pooled_captures(tmp_path, label):
+    captures, backend, scratch = setup_pool(tmp_path)
+    host = "Genesis/" + label
+    snapshot = host + "/" + _NEW
+    recovered = tmp_path / "recovered"
+    result = shell_pool(
+        captures, backend, scratch,
+        f'transcript_pool_backup "$captures" {host} {snapshot}\n'
+        f'transcript_pool_pull {host} {snapshot} "{recovered}"',
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    name = archive.object_name("p/a.jsonl")
+    assert (recovered / name).read_bytes() == (captures / name).read_bytes()
+    plain = tmp_path / "recovered.tar"
+    archive.crypt(recovered / name, plain, b"testpass", decrypt=True)
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    assert archive.restore(plain, fresh, name)
+    assert (fresh / "p/a.jsonl").read_bytes() == b"original"
+    assert (fresh / "p/a.jsonl").stat().st_mtime_ns == (tmp_path / "a.jsonl").stat().st_mtime_ns
+    assert not list(scratch.glob("transcript-pool.*"))
+
+
 def test_unchanged_corpus_transfers_no_objects_and_changed_capture_only_one(tmp_path):
     captures, backend, scratch = setup_pool(tmp_path)
     result = shell_pool(

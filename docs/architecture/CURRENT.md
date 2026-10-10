@@ -3358,6 +3358,8 @@ verified: 85652265c 2026-10-09
   Encrypted transcript capture checkpoints validation within a two-hour
   window and verifies every referenced remote pool object before COMPLETE;
   unreadable historical inventory keeps the snapshot incomplete.
+  Source inspection failures also keep coverage incomplete; only a missing source
+  path establishes an empty discovery scope.
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
   `process_lock` (the reason bare `python -m genesis serve` blocks systemd),
   tmp discipline (`~/tmp` for large temp — never override TMPDIR),

@@ -57,3 +57,7 @@ and nested subagent transcript or metadata under `~/.claude/projects`. Other
 values report incomplete coverage and prevent a COMPLETE snapshot. An absent
 source directory means no new transcripts; retained archive inventory still
 requires validation, including captures from projects outside the selected scope.
+Only a missing path establishes this empty-source case. Permission, symlink-loop
+and other inspection failures report incomplete coverage. Pool host labels accept
+letters, digits, dots, underscores and hyphens in a single component, including
+non-alphanumeric prefixes; the special components `.` and `..` are rejected.
