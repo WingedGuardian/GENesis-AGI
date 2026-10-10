@@ -337,15 +337,6 @@ class GuardianWatchdog:
             return
         container_hash = result.stdout.strip()
 
-        # Skip drift detection when not on main (feature branch = expected divergence)
-        branch_result = await asyncio.to_thread(
-            subprocess.run,
-            ["git", "-C", str(Path.home() / "genesis"),
-             "symbolic-ref", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if branch_result.returncode == 0 and branch_result.stdout.strip() not in ("main",):
-            return
         if not container_hash:
             # deploy_ref resolved but no Guardian-path commit is reachable from
             # it — nothing to compare. Log so this silent-skip is observable
@@ -382,6 +373,25 @@ class GuardianWatchdog:
         # Own suppress so a failure here can't skip the code-drift logic below.
         with contextlib.suppress(Exception):
             await self._check_host_linger(version_info)
+
+        # Skip the drift comparison off main and `live` (a feature branch is
+        # expected divergence). Only the comparison: the reconcilers above run on
+        # any branch. `live` is the integration branch the deploy manifest
+        # builds; once update.sh runs on it (#2978 C1b, before the engine is
+        # armed) it records origin/main commits, so deploy_ref compares the
+        # same way. The full ref, as scripts/lib/live_checkout.py reads it:
+        # with a tag also named `live`, --short prints `heads/live`.
+        branch_result = await asyncio.to_thread(
+            subprocess.run,
+            ["git", "-C", str(Path.home() / "genesis"),
+             "symbolic-ref", "-q", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if branch_result.returncode == 0 and branch_result.stdout.strip() not in (
+            "refs/heads/main",
+            "refs/heads/live",
+        ):
+            return
 
         host_hash = version_info.get("deployed_commit", "unknown")
 

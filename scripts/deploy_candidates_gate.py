@@ -106,19 +106,21 @@ REFUSAL_FILES = (
     "scripts/deploy_code_only.sh",
     "scripts/bootstrap.sh",
     "scripts/lib/deploy_checkout.sh",
+    "scripts/lib/server_session_refusal.sh",
     "scripts/lib/deploy_recovery.sh",
     "scripts/lib/deploy_marker.sh",
     "scripts/lib/guardian_pause.sh",
     "scripts/lib/alert_queue.sh",
     "scripts/lib/deploy_status.sh",
     "scripts/lib/live_system_guard.sh",
+    "scripts/lib/checkout_lock.sh",
     # Read with `cat` before the branch check and run as python later: the
     # serving read runs inside `deploy_code_only.sh status`, which readiness runs.
     "scripts/lib/serving_commit.py",
     "scripts/lib/manifest_delta.py",
-    # Also read at startup, run after the check: the restart refusal's session
-    # scan, and the restarted unit's identity probe (read through its test seam,
-    # `${GENESIS_DEPLOY_PORT_PROBE:-…}`, which the `cat` lock below now matches).
+    # Also read at startup by the refusal library, and by the restarted unit's
+    # identity probe (read through its test seam, `${GENESIS_DEPLOY_PORT_PROBE:-…}`,
+    # which the `cat` lock below now matches).
     "scripts/lib/server_sessions.py",
     "scripts/lib/port_owned_by.py",
     # The verdict the refusals consult on `live` (read at startup like the
@@ -328,6 +330,28 @@ def non_file_kind(repo: Repo, commit: str, path: str) -> str | None:
     return _NON_FILE_KINDS.get(mode, f"mode {mode} entry")
 
 
+def listed_non_files(repo: Repo, commit: str) -> dict[str, str] | None:
+    """Every name sync-hooks.sh lists at ``commit`` whose scripts/hooks source
+    there is not a regular file, with its kind; None when the list cannot be
+    read. sync-hooks.sh skips such a source (or copies what a link points at),
+    so a listed non-file leaves an old hook running and readiness refusing."""
+    try:
+        names = sync_hook_names(repo.show(commit, SYNC_HOOKS) or "")
+    except Refusal:
+        return None
+    bad: dict[str, str] = {}
+    for name in names:
+        # `.` would make ls-tree list the directory's contents, not itself.
+        kind = (
+            "directory"
+            if name in (".", "..")
+            else non_file_kind(repo, commit, f"scripts/hooks/{name}")
+        )
+        if kind:
+            bad[name] = kind
+    return bad
+
+
 def changed_paths(repo: Repo, base: str, head: str) -> list[str]:
     """Every path this head changes against its merge base with origin/main
     (three dots, so a branch behind main is not charged with main's own
@@ -361,23 +385,13 @@ def admission_failures(repo: Repo, base: str, head: str, hooks_approved: bool = 
                 )
     if SYNC_HOOKS in changed:
         # A changed list can name a source this diff never touched: each name it
-        # installs must be a regular file too.
-        try:
-            names = sync_hook_names(repo.show(head, SYNC_HOOKS) or "")
-        except Refusal:
-            names = []  # an unreadable list is excluded by name at rebuild instead
-        for name in names:
-            # `.` would make ls-tree list the directory's contents, not itself.
-            kind = (
-                "directory"
-                if name in (".", "..")
-                else non_file_kind(repo, head, f"scripts/hooks/{name}")
+        # installs must be a regular file too. An unreadable list is excluded by
+        # name at rebuild instead.
+        for name, kind in (listed_non_files(repo, head) or {}).items():
+            fails.append(
+                f"lists scripts/hooks/{name} in {SYNC_HOOKS}, which is a {kind}; only "
+                "regular files may be installed as git hooks"
             )
-            if kind:
-                fails.append(
-                    f"lists scripts/hooks/{name} in {SYNC_HOOKS}, which is a {kind}; only "
-                    "regular files may be installed as git hooks"
-                )
     commits = repo.rev_list(head, "--not", base)
     info = repo.read_commits(commits)
     for c in commits:
@@ -536,6 +550,7 @@ def hook_ownership_failures(
                 "diff", "--no-renames", "--name-only", "-z", ids[1], ids[0], "--", *HOOK_DIRS
             ).stdout
             stepped[branch_of[ids[2]]] = {q for q in changed.split("\0") if q}
+    owned: dict[str, list[str]] = {}
     for path in paths:
         got = tree_entry(repo, tip, path)
         if got == tree_entry(repo, base, path):
@@ -549,6 +564,7 @@ def hook_ownership_failures(
             if path in stepped.get(b, set())
             or tree_entry(repo, h, path) != tree_entry(repo, repo.merge_base(base, h) or base, path)
         ]
+        owned[path] = owners
         if path == SYNC_HOOKS and owners:
             # The restore after a later move reads this list to know what this
             # checkout installed; one it cannot read is unknown there, and a hook
@@ -591,4 +607,38 @@ def hook_ownership_failures(
                 f"origin/main changed {path} since it was cut, so the merge holds a hook nobody "
                 "approved: merge origin/main into it, then add it again with --approve-hooks"
             )
+    # Each candidate's own list passed admission, but candidates combine: one
+    # lists a name, another (or origin/main) puts a directory there. Check the
+    # list the rebuilt tip holds against the tip's tree. A culprit is an owner of
+    # the list change that ADDED the name, or of a path at or under the name
+    # where base held no non-file; a name main alone made bad excludes nobody
+    # (readiness names it at HEAD). Only once every other check passed: a
+    # candidate excluded above may be the one that made the name a directory,
+    # and the next pass judges the tip built without it.
+    if out:
+        return out
+    bad = listed_non_files(repo, tip)
+    if bad:
+        try:
+            base_names = set(sync_hook_names(repo.show(base, SYNC_HOOKS) or ""))
+        except Refusal:
+            base_names = set()
+        for name, kind in bad.items():
+            src = f"scripts/hooks/{name}"
+            culprits: list[str] = []
+            if name not in base_names:
+                culprits += owned.get(SYNC_HOOKS, [])
+            # `.` and `..` are always a directory at base: nobody made them one.
+            if name not in (".", "..") and non_file_kind(repo, base, src) is None:
+                for path in paths:
+                    if path == src or path.startswith(src + "/"):
+                        culprits += owned.get(path, [])
+            named = list(dict.fromkeys(culprits))
+            for b in named:
+                out.setdefault(
+                    b,
+                    f"the rebuilt `live` lists {src} in {SYNC_HOOKS}, which is a {kind} "
+                    f"there ({', '.join(named)}); only regular files may be installed "
+                    "as git hooks",
+                )
     return out

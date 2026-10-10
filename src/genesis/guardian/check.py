@@ -1785,10 +1785,16 @@ async def _execute_recovery_with_approval(
         return
 
     # ── Gate 2: authorize the specific action ─────────────────────────────
+    snapshot_warning = (
+        "<b>Snapshot rollback also restores saved peer permissions, jobs and consent. "
+        "APPROVE explicitly reauthorizes those saved peers.</b>\n\n"
+        if diagnosis.recommended_action == RecoveryAction.SNAPSHOT_ROLLBACK else ""
+    )
     gate2_text = (
         f"Diagnosed: {html_escape(diagnosis.likely_cause)} "
         f"({diagnosis.confidence_pct}%).\n"
         f"Proposed: <b>{html_escape(diagnosis.recommended_action.value)}</b>.\n\n"
+        f"{snapshot_warning}"
         "<b>Reply</b> APPROVE to execute, or DENY."
     )
     gate2_msg_id = await telegram_channel.send_text(gate2_text)

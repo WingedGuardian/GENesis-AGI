@@ -848,3 +848,90 @@ async def test_the_not_found_recovery_still_repairs_with_the_guard_in_place(
     row = await _row(db, OLD)
     assert (row["deprecated"], row["superseded_by"]) == (1, NEW)
     assert (OLD, NEW, "succeeded_by") in await _links(db)
+
+
+async def _dream_retire(db, mid, successor):
+    """Leave *mid* the way a dream-cycle retirement does: deprecated, stamped
+    with a run id, and pointing at its successor."""
+    await db.execute(
+        "UPDATE memory_metadata SET deprecated = 1, dream_cycle_run_id = 'run-1', "
+        "superseded_by = ?, superseded_at = '2026-09-07T00:00:00+00:00' "
+        "WHERE memory_id = ?",
+        (successor, mid),
+    )
+    await db.commit()
+
+
+@pytest.mark.asyncio()
+async def test_a_dream_retirement_is_not_mistaken_for_a_committed_supersession(store, db):
+    """The repair path recovers the successor of a supersession that already
+    committed. A dream retirement also records ``superseded_by``, but it is not
+    such a supersession: an unresolvable ``new_id`` must still be refused,
+    never silently redirected to the dream successor and reported as done."""
+    await _dream_retire(db, OLD, NEW)
+    links_before = await _links(db)
+
+    with pytest.raises(SupersedeUnresolved) as exc:
+        await store.supersede(OLD, "ffffffff-0000-4000-8000-0000000000ff")
+
+    assert exc.value.role == "new_id"
+    assert await _links(db) == links_before
+
+
+@pytest.mark.asyncio()
+async def test_superseding_onto_a_dream_successor_is_still_validated(store, db):
+    """Naming the dream successor explicitly is a NEW supersession, not a retry:
+    the successor checks still apply, so a deprecated successor is refused."""
+    await _dream_retire(db, OLD, DEAD)
+
+    with pytest.raises(SupersedeUnresolved) as exc:
+        await store.supersede(OLD, DEAD)
+
+    assert exc.value.reason == "successor_deprecated"
+
+
+@pytest.mark.asyncio()
+async def test_an_explicit_supersede_takes_the_row_out_of_dream_rollback(store, db):
+    """Superseding a dream-retired memory explicitly clears its run id. That is
+    what keeps a later rollback of the dream run (which selects by run id) from
+    un-deprecating it or erasing this pointer, and what lets
+    ``_is_committed_supersession`` recognise a retry; this test pins the
+    cleared column those two rely on."""
+    await _dream_retire(db, OLD, DEAD)
+
+    await store.supersede(OLD, NEW)
+
+    cur = await db.execute(
+        "SELECT deprecated, superseded_by, dream_cycle_run_id FROM memory_metadata "
+        "WHERE memory_id = ?",
+        (OLD,),
+    )
+    row = await cur.fetchone()
+    assert (row["deprecated"], row["superseded_by"], row["dream_cycle_run_id"]) == (
+        1,
+        NEW,
+        None,
+    )
+
+
+@pytest.mark.asyncio()
+async def test_a_short_handle_for_a_dream_successor_that_moved_is_refused(
+    store,
+    db,
+):
+    """A dream-retired old row whose successor is gone, and a twin now owning
+    that successor's prefix: the guard refuses rather than re-pointing."""
+    await _dream_retire(db, OLD, NEW)
+    await db.execute("DELETE FROM memory_metadata WHERE memory_id = ?", (NEW,))
+    await db.execute(
+        "INSERT INTO memory_metadata (memory_id, created_at, embedding_status) "
+        "VALUES (?, '2026-09-06T00:00:00+00:00', 'fts5_only')",
+        (NEW_TWIN,),
+    )
+    await db.commit()
+
+    with pytest.raises(SupersedeUnresolved) as exc:
+        await store.supersede(OLD, NEW[:8])
+
+    assert exc.value.reason == "successor_shifted"
+    assert (await _row(db, OLD))["superseded_by"] == NEW

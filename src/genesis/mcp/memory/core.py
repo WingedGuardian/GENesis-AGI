@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from genesis.memory import graph_expansion
 from genesis.memory.activation import compute_activation
 from genesis.memory.graph import traverse as graph_traverse
+from genesis.memory.graph_telemetry import begin_tally, end_tally
 from genesis.memory.provenance import (
     is_external,
     is_proactive_noise,
@@ -491,64 +492,72 @@ async def memory_recall(
     enriched = []
     graph_budget_ms = 500.0
     graph_elapsed_ms = 0.0
-    for r in results:
-        d = asdict(r)
-        if include_graph and graph_elapsed_ms < graph_budget_ms:
-            try:
-                traversal = await graph_traverse(
-                    memory_mod._db,
-                    r.memory_id,
-                    max_depth=2,
-                    min_strength=0.3,
-                    # The caller's choice, honoured rather than overridden
-                    # (issue #1896). Without this the search above returns the
-                    # deprecated memory the caller explicitly asked for and the
-                    # enrichment here silently drops all of its neighbours,
-                    # because every backend re-applies the predicate the caller
-                    # just opted out of. DEPRECATION ONLY: an expired memory is
-                    # not reached AS A NEIGHBOUR at any value of this flag — the
-                    # traversal predicate keeps its expiry limb unconditional.
-                    # That is narrower than "results never contain an expired
-                    # memory", which is FALSE today and is not this change's to
-                    # fix: the event-calendar boost above hydrates ids through two
-                    # reads that filter neither limb, so a `time_range` recall can
-                    # hand back an expired ROOT whose neighbours are then traversed
-                    # from here. Issue #2392, which also has to decide whether that
-                    # exemption is intended before it can be closed.
-                    # `search_ranked`
-                    # applies its `invalid_at` clause unconditionally
-                    # (db/crud/memory.py:207) and gates only the `deprecated`
-                    # one (:212), so widening here would hand the model a
-                    # neighbour id its own results array could never contain.
-                    # An earlier version of this code did exactly that.
-                    #
-                    # Not the raw parameter — see `_traversal_allows_deprecated`
-                    # above, which withholds it on the drift pipelines except for
-                    # rows the calendar boost produced through an unfiltered read.
-                    include_deprecated=_traversal_allows_deprecated(r),
-                )
-                graph_elapsed_ms += traversal.query_ms
-                if traversal.nodes:
-                    d["graph_neighbors"] = [
-                        {
-                            "memory_id": n.memory_id,
-                            "link_type": n.link_type,
-                            "depth": n.depth,
-                            "strength": n.strength,
-                            # A `hidden` key may be added below, after the loop —
-                            # see `_label_hidden_neighbours`. Labelling is one
-                            # scoped query over the ids actually collected, so it
-                            # cannot be done from inside this comprehension.
-                        }
-                        for n in traversal.nodes[:5]
-                    ]
-            except Exception:
-                logger.warning(
-                    "Graph enrichment failed for %s",
-                    r.memory_id,
-                    exc_info=True,
-                )
-        enriched.append(d)
+    # One telemetry row for every traversal this recall makes (FalkorDB cutover
+    # counter, memory/graph_telemetry.py). Closed in `finally` so an error or a
+    # cancelled request still writes the outcomes it collected: a fallback
+    # dropped here would read as a clean day.
+    graph_tally = begin_tally("recall")
+    try:
+        for r in results:
+            d = asdict(r)
+            if include_graph and graph_elapsed_ms < graph_budget_ms:
+                try:
+                    traversal = await graph_traverse(
+                        memory_mod._db,
+                        r.memory_id,
+                        max_depth=2,
+                        min_strength=0.3,
+                        # The caller's choice, honoured rather than overridden
+                        # (issue #1896). Without this the search above returns the
+                        # deprecated memory the caller explicitly asked for and the
+                        # enrichment here silently drops all of its neighbours,
+                        # because every backend re-applies the predicate the caller
+                        # just opted out of. DEPRECATION ONLY: an expired memory is
+                        # not reached AS A NEIGHBOUR at any value of this flag — the
+                        # traversal predicate keeps its expiry limb unconditional.
+                        # That is narrower than "results never contain an expired
+                        # memory", which is FALSE today and is not this change's to
+                        # fix: the event-calendar boost above hydrates ids through two
+                        # reads that filter neither limb, so a `time_range` recall can
+                        # hand back an expired ROOT whose neighbours are then traversed
+                        # from here. Issue #2392, which also has to decide whether that
+                        # exemption is intended before it can be closed.
+                        # `search_ranked`
+                        # applies its `invalid_at` clause unconditionally
+                        # (db/crud/memory.py:207) and gates only the `deprecated`
+                        # one (:212), so widening here would hand the model a
+                        # neighbour id its own results array could never contain.
+                        # An earlier version of this code did exactly that.
+                        #
+                        # Not the raw parameter — see `_traversal_allows_deprecated`
+                        # above, which withholds it on the drift pipelines except for
+                        # rows the calendar boost produced through an unfiltered read.
+                        include_deprecated=_traversal_allows_deprecated(r),
+                    )
+                    graph_elapsed_ms += traversal.query_ms
+                    if traversal.nodes:
+                        d["graph_neighbors"] = [
+                            {
+                                "memory_id": n.memory_id,
+                                "link_type": n.link_type,
+                                "depth": n.depth,
+                                "strength": n.strength,
+                                # A `hidden` key may be added below, after the loop —
+                                # see `_label_hidden_neighbours`. Labelling is one
+                                # scoped query over the ids actually collected, so it
+                                # cannot be done from inside this comprehension.
+                            }
+                            for n in traversal.nodes[:5]
+                        ]
+                except Exception:
+                    logger.warning(
+                        "Graph enrichment failed for %s",
+                        r.memory_id,
+                        exc_info=True,
+                    )
+            enriched.append(d)
+    finally:
+        await end_tally(graph_tally, memory_mod._db)
 
     # Label the hidden neighbours in ONE scoped pass, after the loop. A False
     # return means visibility could not be determined, so the "no `hidden` key
@@ -870,82 +879,86 @@ async def memory_expand(
 
     results = []
     blockable = 0
-    for point in points:
-        mid = str(point.id)
-        payload = point.payload or {}
-        if payload.get("origin_class") is None and _origin_fill.get(mid):
-            payload["origin_class"] = _origin_fill[mid]
-        _collection = point_collection.get(mid, "episodic_memory")
+    graph_tally = begin_tally("expand")  # one telemetry row; see memory_recall
+    try:
+        for point in points:
+            mid = str(point.id)
+            payload = point.payload or {}
+            if payload.get("origin_class") is None and _origin_fill.get(mid):
+                payload["origin_class"] = _origin_fill[mid]
+            _collection = point_collection.get(mid, "episodic_memory")
 
-        d = {
-            "memory_id": mid,
-            "content": payload.get("content", ""),
-            "source": payload.get("source", ""),
-            "memory_type": payload.get("memory_type", "episodic"),
-            "memory_class": payload.get("memory_class", "fact"),
-            "wing": payload.get("wing", ""),
-            "room": payload.get("room", ""),
-            "confidence": payload.get("confidence"),
-            "tags": payload.get("tags", []),
-            "source_pipeline": payload.get("source_pipeline", ""),
-            "source_session_id": payload.get("source_session_id"),
-            "created_at": payload.get("created_at"),
-            # Provenance (audit D12): first-party memory vs external-world KB,
-            # honoring STORED origin so external episodic rows don't read as
-            # first-party.
-            "collection": _collection,
-            "origin_class": payload.get("origin_class"),
-            "provenance": provenance_descriptor(
+            d = {
+                "memory_id": mid,
+                "content": payload.get("content", ""),
+                "source": payload.get("source", ""),
+                "memory_type": payload.get("memory_type", "episodic"),
+                "memory_class": payload.get("memory_class", "fact"),
+                "wing": payload.get("wing", ""),
+                "room": payload.get("room", ""),
+                "confidence": payload.get("confidence"),
+                "tags": payload.get("tags", []),
+                "source_pipeline": payload.get("source_pipeline", ""),
+                "source_session_id": payload.get("source_session_id"),
+                "created_at": payload.get("created_at"),
+                # Provenance (audit D12): first-party memory vs external-world KB,
+                # honoring STORED origin so external episodic rows don't read as
+                # first-party.
+                "collection": _collection,
+                "origin_class": payload.get("origin_class"),
+                "provenance": provenance_descriptor(
+                    collection=_collection,
+                    source_pipeline=payload.get("source_pipeline"),
+                    source_doc=payload.get("source"),
+                    origin_class=payload.get("origin_class"),
+                ),
+            }
+
+            # Injection defense (PR2): wrap full external-world content pulled into
+            # context after a compact recall (the real full-payload surface). Keys
+            # on STORED origin first — collection alone misses external episodic.
+            _blockable = immunity_shadow.item_is_blockable(
                 collection=_collection,
                 source_pipeline=payload.get("source_pipeline"),
-                source_doc=payload.get("source"),
                 origin_class=payload.get("origin_class"),
-            ),
-        }
-
-        # Injection defense (PR2): wrap full external-world content pulled into
-        # context after a compact recall (the real full-payload surface). Keys
-        # on STORED origin first — collection alone misses external episodic.
-        _blockable = immunity_shadow.item_is_blockable(
-            collection=_collection,
-            source_pipeline=payload.get("source_pipeline"),
-            origin_class=payload.get("origin_class"),
-        )
-        if _blockable or is_external(_collection):
-            d["content"] = wrap_external_recall(
-                d["content"],
-                source_pipeline=payload.get("source_pipeline"),
             )
-        if _blockable:
-            blockable += 1
+            if _blockable or is_external(_collection):
+                d["content"] = wrap_external_recall(
+                    d["content"],
+                    source_pipeline=payload.get("source_pipeline"),
+                )
+            if _blockable:
+                blockable += 1
 
-        # Graph enrichment
-        try:
-            traversal = await graph_traverse(
-                memory_mod._db,
-                mid,
-                max_depth=2,
-                min_strength=0.3,
-                include_deprecated=include_deprecated,
-            )
-            if traversal.nodes:
-                d["graph_neighbors"] = [
-                    {
-                        "memory_id": n.memory_id,
-                        "link_type": n.link_type,
-                        "depth": n.depth,
-                        "strength": n.strength,
-                        # A `hidden` key may be added after the loop — see
-                        # `_label_hidden_neighbours`. This tool defaults the flag
-                        # ON, so the label is the ordinary case here rather than
-                        # the exception.
-                    }
-                    for n in traversal.nodes[:5]
-                ]
-        except Exception:
-            logger.warning("Graph enrichment failed for %s", mid, exc_info=True)
+            # Graph enrichment
+            try:
+                traversal = await graph_traverse(
+                    memory_mod._db,
+                    mid,
+                    max_depth=2,
+                    min_strength=0.3,
+                    include_deprecated=include_deprecated,
+                )
+                if traversal.nodes:
+                    d["graph_neighbors"] = [
+                        {
+                            "memory_id": n.memory_id,
+                            "link_type": n.link_type,
+                            "depth": n.depth,
+                            "strength": n.strength,
+                            # A `hidden` key may be added after the loop — see
+                            # `_label_hidden_neighbours`. This tool defaults the flag
+                            # ON, so the label is the ordinary case here rather than
+                            # the exception.
+                        }
+                        for n in traversal.nodes[:5]
+                    ]
+            except Exception:
+                logger.warning("Graph enrichment failed for %s", mid, exc_info=True)
 
-        results.append(d)
+            results.append(d)
+    finally:
+        await end_tally(graph_tally, memory_mod._db)
 
     # After the loop AND strictly after the not-found early return above, so an
     # expand whose ids resolve to nothing performs no visibility query at all.
@@ -1108,12 +1121,10 @@ async def memory_supersede(old_id: str, new_id: str) -> dict:
 
     One failure is NOT a rejection: ``SupersedeIncomplete`` means the SQLite
     deprecation committed but a mirror (the Qdrant payload or the
-    ``succeeded_by`` link) did not. Retrying with the FULL ids the error
-    carries is safe and is the repair — every step is idempotent. (A short
-    handle is re-resolved on retry and may then name a different memory; that
-    retry is refused as ``successor_shifted`` rather than guessed.) Do not treat it as "nothing happened":
-    the old memory is already deprecated for keyword recall, and the retry
-    finishes the vector/graph half.
+    ``succeeded_by`` link) did not. Retry with the FULL ids the error carries
+    (a short handle may re-resolve elsewhere): every step is idempotent, and
+    the retry finishes the vector/graph half. It is not "nothing happened":
+    the old memory is already deprecated for keyword recall.
 
     Args:
         old_id: The memory being corrected. Marked deprecated.

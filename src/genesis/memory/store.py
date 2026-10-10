@@ -137,8 +137,8 @@ class SupersedeUnresolved(Exception):
             # performed" would read as "the old memory is live".
             outcome = (
                 "this call changed nothing: the old memory is already superseded "
-                "by the first match, which this handle named and which no longer "
-                "resolves; retry with full ids"
+                "by the first match, its recorded successor, which this handle "
+                "names and which no longer resolves; retry with full ids"
             )
         elif committed:
             outcome = "the deprecation had already committed; its mirror is still outstanding"
@@ -180,6 +180,24 @@ class SupersedeIncomplete(Exception):
             f"deprecation committed, but the {stage} update failed; retrying "
             "with these exact ids is safe and completes the remainder"
         )
+
+
+def _is_committed_supersession(meta: dict | None) -> bool:
+    """True when *meta* records an explicit supersession that already committed.
+
+    The supersede repair path keys on this: such a row owes only its mirrors,
+    so a retry completes it without re-validating the successor. A row the
+    dream cycle retired also carries ``superseded_by``, but consolidation wrote
+    it, not an earlier supersede call, so it must take the ordinary validated
+    path. Treating it as a committed supersession would redirect an
+    unresolvable ``new_id`` to the dream successor and report success.
+    """
+    return bool(
+        meta
+        and meta["deprecated"]
+        and meta["superseded_by"]
+        and meta.get("dream_cycle_run_id") is None
+    )
 
 
 class MemoryStore:
@@ -776,8 +794,10 @@ class MemoryStore:
             # `integrity.py` counts `deprecated_divergence` but nothing repairs
             # it. Recover the successor from the row that already committed.
             existing = await memory_crud.get_metadata(self._db, old_id)
+            # Both: an EXPLICIT supersession that committed (a dream retirement
+            # is not one), and the full id the caller named is its successor.
             if not (
-                existing and existing["deprecated"] and existing["superseded_by"]
+                _is_committed_supersession(existing)
                 and normalize_id(new_handle) == existing["superseded_by"]
             ):
                 raise
@@ -806,8 +826,7 @@ class MemoryStore:
             # skipped for one that is merely being completed.
             existing = await memory_crud.get_metadata(self._db, old_id)
             resuming = (
-                existing is not None
-                and bool(existing["deprecated"])
+                _is_committed_supersession(existing)
                 and existing["superseded_by"] == new_id
             )
             if resuming:
@@ -833,6 +852,10 @@ class MemoryStore:
                 # match. Like an ambiguous handle, it is never guessed; it
                 # gets its own reason because, unlike "ambiguous", the old
                 # memory IS already deprecated (to X) when this raises.
+                #
+                # A dream-retired old row (its successor written by the dream
+                # cycle, not a supersede call) is refused the same way: the
+                # handle still names that successor, and guessing is never safe.
                 #
                 # Deliberately NOT blocked: a caller that names a DIFFERENT
                 # successor by a handle that does not identify X (a full id,
