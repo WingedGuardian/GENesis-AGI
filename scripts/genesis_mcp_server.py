@@ -689,6 +689,10 @@ def main(argv: list[str] | None = None) -> None:
         # documented knob is inert and every call silently stays at the 1000s default
         # (Codex P2 on #1587).
         "GENESIS_DELIBERATE_TIMEOUT_S",
+        # Graph-traversal telemetry kill switch (memory/graph_telemetry.py): the
+        # memory server makes most traversals, so a secrets.env setting that never
+        # reached it would leave the documented switch inert where it matters.
+        "GENESIS_GRAPH_TELEMETRY_DISABLED",
     }
     import os
 

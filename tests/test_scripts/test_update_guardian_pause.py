@@ -304,8 +304,13 @@ def test_lease_renewer_wired_and_bounded(lib: str) -> None:
         "check the parent is alive BEFORE each renew"
     )
     pause = _extract_func(lib, "_guardian_pause")
-    assert "_guardian_renew_loop {_UPDATE_LOCK_FD}>&- >/dev/null 2>&1 &" in pause, (
-        "pause starts the renewer redirected, with the deploy lock fd closed"
+    # Started redirected, in a subshell that first closes both deploy lock fds
+    # (each only when set: `{var}>&-` on an unset name fails the command).
+    assert ") >/dev/null 2>&1 &" in pause, "pause starts the renewer redirected"
+    assert 'if [ -n "${_UPDATE_LOCK_FD:-}" ]; then exec {_UPDATE_LOCK_FD}>&-; fi' in pause
+    assert (
+        'if [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ]; then exec {GENESIS_CHECKOUT_LOCK_FD}>&-; fi'
+        in pause
     )
     assert "_GUARDIAN_RENEW_PID=$!" in pause, "pause must capture the renewer PID"
     resume = _extract_func(lib, "_guardian_resume")
@@ -345,6 +350,32 @@ def test_the_deploy_lock_is_free_right_after_a_clean_exit(text: str, tmp_path: P
     assert "REACHED_END" in out, out
     free = subprocess.run(["flock", "-n", str(lock), "true"], capture_output=True, timeout=10)
     assert free.returncode == 0, "the deploy lock was still held after the deploy exited"
+
+
+@pytest.mark.parametrize("with_update_lock", [True, False])
+def test_the_checkout_lock_is_free_right_after_a_clean_exit(
+    text: str, tmp_path: Path, with_update_lock: bool
+) -> None:
+    """The checkout lock (scripts/lib/checkout_lock.sh) leaked into the renewer the
+    same way the deploy lock once did: its `sleep` outlives the kill, and every
+    Claude launch would wait on the lock until it ended. It is free the moment
+    the deploy exits, whether or not the update lock is also held."""
+    run, _ = _harness(text, tmp_path, ssh_rc=0)
+    lock = tmp_path / "genesis-checkout.lock"
+    update_lock = tmp_path / "update.lock"
+    take_update = (
+        f'exec {{_UPDATE_LOCK_FD}}>"{update_lock}"\nflock -x "$_UPDATE_LOCK_FD"\n'
+        if with_update_lock
+        else ""
+    )
+    out = run(
+        take_update
+        + f'exec {{GENESIS_CHECKOUT_LOCK_FD}}>"{lock}"\nflock -x "$GENESIS_CHECKOUT_LOCK_FD"\n'
+        "GUARDIAN_PAUSE_TTL=40\n_guardian_pause\nsleep 1\n"
+    )
+    assert "REACHED_END" in out, out
+    free = subprocess.run(["flock", "-n", str(lock), "true"], capture_output=True, timeout=10)
+    assert free.returncode == 0, "the checkout lock was still held after the deploy exited"
 
 
 def test_the_renewer_stops_when_its_deploy_is_killed(text: str, tmp_path: Path) -> None:
