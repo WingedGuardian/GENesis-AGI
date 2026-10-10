@@ -1,0 +1,1 @@
+- **The loopback-only dashboard default is withdrawn for now.** On an existing install the update that applied it cut off the host dashboard proxy, a Tailscale address inside the container, and the Guardian health check until manual host steps ran. The dashboard keeps listening as before until the change returns with a rollout that keeps existing installs working.
