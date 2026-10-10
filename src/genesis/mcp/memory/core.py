@@ -1108,8 +1108,10 @@ async def memory_supersede(old_id: str, new_id: str) -> dict:
 
     One failure is NOT a rejection: ``SupersedeIncomplete`` means the SQLite
     deprecation committed but a mirror (the Qdrant payload or the
-    ``succeeded_by`` link) did not. Retrying the SAME call is safe and is the
-    repair — every step is idempotent. Do not treat it as "nothing happened":
+    ``succeeded_by`` link) did not. Retrying with the FULL ids the error
+    carries is safe and is the repair — every step is idempotent. (A short
+    handle is re-resolved on retry and may then name a different memory; that
+    retry is refused as ``successor_shifted`` rather than guessed.) Do not treat it as "nothing happened":
     the old memory is already deprecated for keyword recall, and the retry
     finishes the vector/graph half.
 

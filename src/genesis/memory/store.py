@@ -103,6 +103,7 @@ class SupersedeUnresolved(Exception):
         self.raw_id = raw_id
         # "not_found" | "ambiguous" | "self_supersede" | "successor_deprecated"
         # | "successor_expired" | "successor_vanished" | "successor_deleting"
+        # | "successor_shifted"
         self.reason = reason
         # Whether a deprecation for this pair had ALREADY committed when this
         # was raised. The message asserts the durable state, so it must not
@@ -130,11 +131,19 @@ class SupersedeUnresolved(Exception):
         # States only what was CHECKED. The old wording claimed the old memory
         # "is still live in recall", which for `not_found` is exactly the thing
         # resolution just failed to establish.
-        outcome = (
-            "the deprecation had already committed; its mirror is still outstanding"
-            if committed
-            else "no deprecation was performed"
-        )
+        if reason == "successor_shifted":
+            # The old memory IS deprecated (by an earlier call, to the first
+            # candidate); this call changed nothing. Saying "no deprecation was
+            # performed" would read as "the old memory is live".
+            outcome = (
+                "this call changed nothing: the old memory is already superseded "
+                "by the first match, which this handle named and which no longer "
+                "resolves; retry with full ids"
+            )
+        elif committed:
+            outcome = "the deprecation had already committed; its mirror is still outstanding"
+        else:
+            outcome = "no deprecation was performed"
         super().__init__(f"{role}={raw_id!r} is {reason}{detail}; {outcome}")
 
 
@@ -149,8 +158,9 @@ class SupersedeIncomplete(Exception):
       search can keep surfacing the superseded memory until repaired.
     * ``"link"`` — the ``succeeded_by`` graph edge was not created.
 
-    Retrying the same ``supersede()`` call is SAFE and is also the repair:
-    the SQLite UPDATE is idempotent, the Qdrant payload write is idempotent,
+    Retrying ``supersede()`` with the FULL ids this exception carries is SAFE
+    and is also the repair (a short handle is re-resolved on retry, and may no
+    longer name the same memory): the SQLite UPDATE is idempotent, the Qdrant payload write is idempotent,
     and an already-created link is tolerated. The retry takes ``supersede()``'s
     REPAIR PATH, which skips successor validation precisely so the guarantee
     holds even if the successor expired or was deprecated in the meantime —
@@ -168,7 +178,7 @@ class SupersedeIncomplete(Exception):
         super().__init__(
             f"supersede {old_id!r} -> {new_id!r} half-finished: the SQLite "
             f"deprecation committed, but the {stage} update failed; retrying "
-            "the same call is safe and completes the remainder"
+            "with these exact ids is safe and completes the remainder"
         )
 
 
@@ -735,8 +745,8 @@ class MemoryStore:
         SQLite deprecation committed but a mirror (the Qdrant payload, the
         ``succeeded_by`` link) did not. This path RAISES it rather than
         swallowing it the way ``store(supersedes=...)`` must, because here the
-        caller named both ids and retrying the same call is both safe and the
-        repair. Both ids are locked (sorted order) from validation through the
+        caller named both ids and retrying with the full ids is both safe and
+        the repair (a short handle is re-resolved, and may name another row). Both ids are locked (sorted order) from validation through the
         mirror writes, so a concurrent delete or supersession of the successor
         cannot slip between the check and the write.
 
@@ -808,6 +818,40 @@ class MemoryStore:
                     timestamp or datetime.now(UTC).isoformat()
                 )
             else:
+                # SHIFTED-PREFIX GUARD. A short handle is resolved against the
+                # rows that exist NOW, not the row it named when the call was
+                # first made. If an earlier supersede of old_id committed to X
+                # (and, e.g., left a mirror outstanding), X then disappeared,
+                # and another memory sharing the caller's prefix took its
+                # place in resolution, a retry of the SAME call would land
+                # here — not on the repair path, because new_id != X — and
+                # silently re-point the committed correction to a memory the
+                # caller never named. The handle still identifies X (it is a
+                # prefix of X, normalized and matched exactly as the resolver
+                # matches it: lowercase, `id:` stripped, LIKE prefix), so it
+                # names two memories: the recorded successor and the live
+                # match. Like an ambiguous handle, it is never guessed; it
+                # gets its own reason because, unlike "ambiguous", the old
+                # memory IS already deprecated (to X) when this raises.
+                #
+                # Deliberately NOT blocked: a caller that names a DIFFERENT
+                # successor by a handle that does not identify X (a full id,
+                # or a prefix X does not share) is re-pointing on purpose, and
+                # that behaviour is unchanged.
+                committed_to = (
+                    existing["superseded_by"]
+                    if existing is not None and existing["deprecated"]
+                    else None
+                )
+                if (
+                    committed_to
+                    and committed_to != new_id
+                    and committed_to.lower().startswith(normalize_id(new_handle))
+                ):
+                    raise SupersedeUnresolved(
+                        new_handle, "successor_shifted", new_id,
+                        candidates=[committed_to, new_id], role="new_id",
+                    )
                 await self._validate_supersede_pair(old_id, new_id)
                 stamp = timestamp or datetime.now(UTC).isoformat()
             await self._mark_superseded(old_id, new_id, stamp, strict=True)

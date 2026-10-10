@@ -719,3 +719,132 @@ async def test_supersede_serializes_with_a_lock_on_the_target(store, db):
     await asyncio.wait_for(task, timeout=2)
 
     assert (await _row(db, OLD))["deprecated"] == 1
+
+
+# A memory sharing NEW's 8-char prefix: what a short handle for NEW resolves
+# to once NEW itself is gone.
+NEW_TWIN = NEW[:8] + "-1111-4000-8000-000000000005"
+
+
+async def _half_finished_supersede_then_successor_swapped(store, db, monkeypatch):
+    """supersede(OLD, NEW) commits in SQLite, its Qdrant mirror fails, then NEW
+    disappears and NEW_TWIN (sharing NEW's short prefix) appears."""
+    from genesis.memory import store as store_mod
+
+    await db.execute(
+        "UPDATE memory_metadata SET embedding_status = 'embedded' WHERE memory_id = ?",
+        (OLD,),
+    )
+    await db.commit()
+
+    calls = {"n": 0}
+
+    def _fail_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("qdrant unavailable")
+
+    monkeypatch.setattr(store_mod, "update_payload", _fail_once)
+    store._qdrant.retrieve = lambda **kw: [object()]
+
+    with pytest.raises(SupersedeIncomplete):
+        await store.supersede(OLD, NEW)
+
+    await db.execute("DELETE FROM memory_metadata WHERE memory_id = ?", (NEW,))
+    await db.execute(
+        "INSERT INTO memory_metadata (memory_id, created_at, embedding_status) "
+        "VALUES (?, '2026-09-06T00:00:00+00:00', 'fts5_only')",
+        (NEW_TWIN,),
+    )
+    await db.commit()
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("handle", [NEW[:8], f" id:{NEW[:8].upper()} "])
+async def test_a_retry_by_short_handle_never_repoints_to_a_new_prefix_match(
+    store,
+    db,
+    monkeypatch,
+    handle,
+):
+    """The retry's short handle now resolves to a DIFFERENT memory.
+
+    Resolution succeeds (NEW_TWIN is the only live match), so the not_found
+    recovery never runs, and the pair is not the committed one, so the repair
+    path does not either. Without the shifted-prefix guard the retry passes
+    validation and silently re-points OLD's committed correction to NEW_TWIN.
+    """
+    await _half_finished_supersede_then_successor_swapped(store, db, monkeypatch)
+    mark = AsyncMock(wraps=store._mark_superseded)
+    monkeypatch.setattr(store, "_mark_superseded", mark)
+
+    with pytest.raises(SupersedeUnresolved) as exc:
+        await store.supersede(OLD, handle)
+
+    assert exc.value.reason == "successor_shifted"
+    assert exc.value.role == "new_id"
+    assert set(exc.value.candidates) == {NEW, NEW_TWIN}
+    assert not exc.value.committed
+    assert "no deprecation was performed" not in str(exc.value)
+    assert "already superseded" in str(exc.value)
+    row = await _row(db, OLD)
+    assert (row["deprecated"], row["superseded_by"]) == (1, NEW)
+    assert not [link for link in await _links(db) if NEW_TWIN in link]
+    mark.assert_not_awaited()
+
+
+@pytest.mark.asyncio()
+async def test_a_full_id_repoint_to_a_different_live_successor_still_works(
+    store,
+    db,
+    monkeypatch,
+):
+    """Naming a different successor by its FULL id is a deliberate re-point,
+    not a shifted prefix, so the guard must not touch it."""
+    await _half_finished_supersede_then_successor_swapped(store, db, monkeypatch)
+
+    await store.supersede(OLD, NEW_TWIN)
+
+    row = await _row(db, OLD)
+    assert (row["deprecated"], row["superseded_by"]) == (1, NEW_TWIN)
+    assert (OLD, NEW_TWIN, "succeeded_by") in await _links(db)
+
+
+@pytest.mark.asyncio()
+async def test_a_full_id_repoint_of_a_completed_supersession_still_works(store, db):
+    """Same, from a supersession that completed cleanly and whose successor
+    is still live: re-pointing by full id is unchanged behaviour."""
+    await db.execute(
+        "INSERT INTO memory_metadata (memory_id, created_at, embedding_status) "
+        "VALUES (?, '2026-09-06T00:00:00+00:00', 'fts5_only')",
+        (NEW_TWIN,),
+    )
+    await db.commit()
+    await store.supersede(OLD, NEW)
+
+    await store.supersede(OLD, NEW_TWIN)
+
+    assert (await _row(db, OLD))["superseded_by"] == NEW_TWIN
+    assert (OLD, NEW_TWIN, "succeeded_by") in await _links(db)
+
+
+@pytest.mark.asyncio()
+async def test_the_not_found_recovery_still_repairs_with_the_guard_in_place(
+    store,
+    db,
+    monkeypatch,
+):
+    """The guard sits on the NON-resuming path only: a full-id retry whose
+    successor row is gone still recovers it from the committed row and
+    completes the mirror."""
+    await _half_finished_supersede_then_successor_swapped(store, db, monkeypatch)
+    mark = AsyncMock(wraps=store._mark_superseded)
+    monkeypatch.setattr(store, "_mark_superseded", mark)
+
+    await store.supersede(OLD, NEW)
+
+    mark.assert_awaited_once()
+    assert mark.await_args.args[:2] == (OLD, NEW)
+    row = await _row(db, OLD)
+    assert (row["deprecated"], row["superseded_by"]) == (1, NEW)
+    assert (OLD, NEW, "succeeded_by") in await _links(db)
