@@ -808,11 +808,14 @@ class StandaloneAdapter:
 
     def _run_flask(self) -> None:
         """Run Flask in a thread (called from daemon thread)."""
+        from genesis.hosting.request_input import PeerRequestHandler
+
         self._app.run(
             host=self._host,
             port=self._port,
             threaded=True,
             use_reloader=False,
+            request_handler=PeerRequestHandler,
         )
 
     async def _start_telegram(self) -> None:
