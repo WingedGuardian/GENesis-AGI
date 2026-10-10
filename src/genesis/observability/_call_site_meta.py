@@ -357,7 +357,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "see_also": ["21_embeddings", "21b_query_embedding"],
     },
     "44_task_premortem": {
-        "description": "Pre-mortem failure analysis before the executor commits to a task: blocks execution below confidence 50, injects mitigations into plan context below 70. Free-primary chain with MiMo V2.6 Pro among the paid fallbacks. Caller: autonomy/executor/review.py:101 (TaskReviewer).",
+        "description": "Pre-mortem failure analysis before the executor commits to a task: blocks execution below confidence 50, injects mitigations into plan context below 70. Paid-primary chain: V4.1 Flash via DeepSeek's API, then OpenRouter, with MiMo V2.6 Pro among the paid fallbacks. Caller: autonomy/executor/review.py:101 (TaskReviewer).",
         "category": "assessment",
         "frequency": "Per task (pre-execution)",
         "model_tier": "frontier",
@@ -483,7 +483,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "status_reason": "WIRED_DIFFERENT_MECHANISM",
     },
     "17_executor_review": {
-        "description": "Cross-vendor quality review of executor deliverables (Gate 2 of the 3-gate executor verification pipeline). PAID chain: MiMo V2.6 Pro primary, Qwen 3.6+ fallback via OpenRouter. Distinct from 23_outreach_review which is the outreach pre-send check (free chain). Renamed from 17_fresh_eyes_review 2026-05-10.",
+        "description": "Cross-vendor quality review of executor deliverables (Gate 2 of the 3-gate executor verification pipeline). PAID chain: MiMo V2.6 Pro primary, then V4.1 Flash (DeepSeek's API, then OpenRouter), then Qwen 3.6+ via OpenRouter. Distinct from 23_outreach_review which is the outreach pre-send check (free chain). Renamed from 17_fresh_eyes_review 2026-05-10.",
         "category": "assessment",
         "frequency": "Per task verification",
         "model_tier": "frontier",
@@ -500,7 +500,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "status_reason": "V4_PLACEHOLDER",
     },
     "20_adversarial_counterargument": {
-        "description": "Devil's advocate review of executor deliverables (Gate 3). GPT 6 Astra primary, MiMo V2.6 Pro + Qwen 3.6+ fallback via OpenRouter.",
+        "description": "Devil's advocate review of executor deliverables (Gate 3). GPT 6 Astra primary, then V4.1 Flash (DeepSeek's API, then OpenRouter), MiMo V2.6 Pro and Qwen 3.6+ via OpenRouter.",
         "category": "assessment",
         "frequency": "Per task verification",
         "model_tier": "frontier",

@@ -110,6 +110,9 @@ class Snapshot:
     cpu_used: float | None  # cores
     psi: dict[str, float | None]  # "cpu"/"memory"/"io" → some avg300 %
     disks: dict[str, tuple[int, int] | None]  # path → (total, free) bytes
+    # Live genesis-job scopes: (live) memory they may still grow into, Σ max(0, R_i − actual_i).
+    # None when the user manager could not be asked.
+    reserved_beyond_use: int | None = 0
 
 
 @dataclass(frozen=True)
@@ -224,6 +227,12 @@ def evaluate(snap: Snapshot, req: Request, levers: Levers) -> Result:
     t = levers.threshold_pct / 100
     notes = list(levers.notes)
     checks: list[Check] = []
+    # committed = live − Σ actual_i + Σ R_i: admitted jobs keep their headroom.
+    reserved = snap.reserved_beyond_use or 0
+    if snap.reserved_beyond_use is None:
+        notes.append("live jobs unknown (user manager unreachable); not counted")
+    elif reserved:
+        notes.append(f"live genesis jobs reserve {reserved / GIB:.1f} GiB beyond their use")
 
     ram, cpu = req.ram, req.cpu
     if ram is None or cpu is None:
@@ -246,7 +255,7 @@ def evaluate(snap: Snapshot, req: Request, levers: Levers) -> Result:
             judge(
                 "memory",
                 total=mem.total,
-                live=mem.total - mem.available,
+                live=mem.total - mem.available + reserved,
                 estimate=ram,
                 threshold=t,
                 pressure_high=psi is not None and psi > levers.ask_psi,
@@ -261,7 +270,7 @@ def evaluate(snap: Snapshot, req: Request, levers: Levers) -> Result:
             judge(
                 "memory (host)",
                 total=host.total,
-                live=host.used,
+                live=host.used + reserved,
                 estimate=ram,
                 threshold=t,
                 approved="memory" in req.approved_over_line,

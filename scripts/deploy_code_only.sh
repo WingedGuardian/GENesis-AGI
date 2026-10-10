@@ -17,7 +17,10 @@
 #            tree applies by itself (Claude Code hooks, docs), or to stage code
 #            for a later restart. Any range is accepted: the report names every
 #            change the running server has not loaded, and the next step.
-#   restart  restart genesis-server on the tree as it stands; no fetch.
+#   restart  restart genesis-server on the tree as it stands; no fetch. The one
+#            mode that runs on `live`, the integration branch
+#            scripts/deploy_candidates builds from the deploy manifest; deploy and
+#            pull refuse there and name the rebuild instead.
 #   status   read-only, takes no lock: the commit the server booted from, HEAD,
 #            the server's MainPID and invocation, and what runs beside the commit
 #            (runtime-edits, runtime-overrides), and the validation bracket's
@@ -36,8 +39,9 @@
 #   the update.lock, EXCLUSIVE and QUEUING (update.sh keeps `flock -n`, so it
 #     REFUSES while a validation holds the lock shared);
 #   refusals BEFORE anything changes: a linked worktree, an unfinished update.sh
-#     run, a branch other than main, a dirty tree, a unit that runs a different
-#     venv or from a different directory, a live foreign deploy marker, and a
+#     run, a branch other than main (restart also accepts `live` when the deploy
+#     manifest names this repository; a manifest it cannot read refuses), a
+#     dirty tree, a unit that runs a different venv or from a different directory, a live foreign deploy marker, and a
 #     venv that does not match the pyproject.toml being deployed (that one needs
 #     update.sh, which reinstalls). deploy and restart also refuse untracked
 #     files under src/, config/ or pyproject.toml, and a server running outside
@@ -57,7 +61,7 @@
 #     returns (a chat turn saving and delivering its reply, for one: #2917).
 #     A server that is not running has no sessions to end. Just
 #     before the restart, four of these are checked again (HEAD must be the
-#     exact commit this run checked, on main; no tracked change; no untracked
+#     exact commit this run checked, on the branch it checked; no tracked change; no untracked
 #     runtime file; no server outside the unit). If one fails while the server
 #     is untouched, it is a refusal. If deploy has already stopped the server,
 #     it is restarted on the tree as it stands, health-checked, and the run ends
@@ -169,10 +173,6 @@ LOCK_FILE="${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock"
 # The loopback address, not a name: nothing in the resolver's configuration can
 # point the health request elsewhere.
 HEALTH_URL="http://127.0.0.1:5000/api/genesis/health"
-# What the server would cancel (GET, internal bearer). The token lives in the
-# SERVER's Genesis home (_server_genesis_home).
-INFLIGHT_PORT=5000
-INFLIGHT_URL="http://127.0.0.1:$INFLIGHT_PORT/api/genesis/inflight"
 LOCK_HELD_RC=200
 
 # CC sessions lack the D-Bus env `systemctl --user` needs (same guard as update.sh).
@@ -194,6 +194,13 @@ _SELF_DIR="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # deploy_marker.sh's EPHEMERAL_DIRTY_RE, sourced above).
 # shellcheck source=lib/deploy_checkout.sh
 . "$_SELF_DIR/lib/deploy_checkout.sh"
+# shellcheck source=lib/checkout_lock.sh
+. "$_SELF_DIR/lib/checkout_lock.sh"
+# Mutating, printing recovery helpers shared with update.sh.
+# shellcheck source=lib/deploy_recovery.sh
+. "$_SELF_DIR/lib/deploy_recovery.sh"
+# shellcheck source=lib/server_session_refusal.sh
+. "$_SELF_DIR/lib/server_session_refusal.sh"
 # The helpers that run AFTER the merge are read now, like the libs above: the
 # merge may replace them on disk, and this run must use the versions it started
 # with (`python3 -c "$CODE" args…` sees the same sys.argv as running the file).
@@ -202,7 +209,8 @@ _SELF_DIR="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 _PORT_PROBE_PY="$(cat "${GENESIS_DEPLOY_PORT_PROBE:-$_SELF_DIR/lib/port_owned_by.py}")"
 _MANIFEST_DELTA_PY="$(cat "$_SELF_DIR/lib/manifest_delta.py")"
 _SERVING_COMMIT_PY="$(cat "$_SELF_DIR/lib/serving_commit.py")"
-_SERVER_SESSIONS_PY="$(cat "$_SELF_DIR/lib/server_sessions.py")"
+# Read for genesis_live_checkout (deploy_checkout.sh), which runs this copy.
+_LIVE_CHECKOUT_PY="$(cat "$_SELF_DIR/lib/live_checkout.py")"
 
 # Kept whole for the status hand-over below (the parse consumes "$@").
 _ORIG_ARGS=("$@")
@@ -232,12 +240,7 @@ if [ -n "$ALLOW_KILLING" ]; then
         deploy|restart) ;;
         *) die "--allow-killing belongs to deploy and restart, the modes that restart the server." ;;
     esac
-    # Each item is what a refusal prints: a process as <pid>@<start> (its start time
-    # in clock ticks, so a reused pid is not covered) or the id of a piece of work
-    # the server reported (the shape scripts/lib/server_sessions.py prints).
-    _ak_item='([0-9]+@[0-9]+|[A-Za-z0-9][A-Za-z0-9_.:-]{0,63})'
-    [[ "$ALLOW_KILLING" == all || "$ALLOW_KILLING" =~ ^${_ak_item}(,${_ak_item})*$ ]] \
-        || die "--allow-killing takes the items a refusal names (<pid>@<start>, or an id the server reported), separated by commas, or all (got: $ALLOW_KILLING)"
+    genesis_check_allow_killing_items
 fi
 case "$WAIT_S" in
     ''|*[!0-9]*) die "the lock wait must be a whole number of seconds (got: $WAIT_S)" ;;
@@ -298,170 +301,6 @@ _untracked_runtime() {
     st="$(git -C "$GENESIS_ROOT" status --porcelain --no-renames --untracked-files=all \
         -- src config pyproject.toml)" || die "cannot read the working tree's status — nothing changed."
     printf '%s\n' "$st" | grep '^??' | grep -vE "$EPHEMERAL_DIRTY_RE" || true
-}
-
-# Claude Code sessions the server launched (dispatched work, Telegram turns,
-# reflections). A restart ends every one of them: on stop the server cancels its
-# in-flight work, and a dispatched session's row is marked failed. So a restart
-# while any runs is a refusal, naming them, unless --allow-killing covers each
-# one. Called under the lock as the last step before the server is touched. Two
-# signals (scripts/lib/server_sessions.py; its docstring says why each):
-#   - the SERVER'S OWN account of the work a restart would cancel
-#     (GET /api/genesis/inflight, with the internal API token): every Claude
-#     invocation, plus the whole life of a dispatched session or a CLI
-#     reflection, from before its Claude process starts until after its result
-#     is delivered. Named by the id the server gives it. NOT covered: what other
-#     subsystems do after their invocation returns (#2917). A server that answers
-#     404 predates the report (the first deploy of this change); the process scan
-#     alone then decides, and says so;
-#   - the server's live Claude Code process DESCENDANTS, each named <pid>@<start>
-#     so a reused pid is not covered: a check that needs nothing from the server.
-# Whatever cannot be read or asked (the MainPID, the process table, the token,
-# the server) refuses, unless --allow-killing all.
-# GENESIS_DEPLOY_PROC_ROOT is a TEST seam, like GENESIS_DEPLOY_ROOT.
-# The Genesis home of the RUNNING server, which keeps its internal API token there:
-# the server may take GENESIS_HOME from its unit's EnvironmentFile, which this
-# shell never sees, so it is read from the server process (same user: readable).
-# Only when that cannot be read does the caller's own GENESIS_HOME stand in; a
-# wrong guess finds no token or the wrong one, and refuses.
-_server_genesis_home() {  # $1 = MainPID
-    local env_file="${GENESIS_DEPLOY_PROC_ROOT:-/proc}/$1/environ" gh h
-    if [ ! -r "$env_file" ]; then
-        printf '%s' "${GENESIS_HOME:-$HOME/.genesis}"
-        return 0
-    fi
-    # Only the two variables are extracted: the server's environment also holds its
-    # API keys, which must never pass through this shell (xtrace would print them).
-    gh="$(grep -z -m1 '^GENESIS_HOME=' "$env_file" 2>/dev/null | tr -d '\0' || true)"
-    gh="${gh#GENESIS_HOME=}"
-    h="$(grep -z -m1 '^HOME=' "$env_file" 2>/dev/null | tr -d '\0' || true)"
-    h="${h#HOME=}"
-    h="${h:-$HOME}"
-    # shellcheck disable=SC2088  # matches a LITERAL ~ in the value, expanded by hand
-    case "$gh" in
-        "~") gh="$h" ;;
-        "~/"*) gh="$h/${gh#\~/}" ;;
-    esac
-    printf '%s' "${gh:-$h/.genesis}"
-}
-_refuse_if_sessions() {
-    local main found work rc pid age resume self start iid kind label line code resp tok_file
-    local unlisted="" all_items="" listing="" own="" item
-    _cannot_tell() {
-        if [ "$ALLOW_KILLING" = all ]; then
-            echo "  WARNING: $1; --allow-killing all given, so proceeding." >&2
-            return 0
-        fi
-        die "$1, so the sessions genesis-server launched cannot be found (a restart would end them) — nothing changed. Pass --allow-killing all to restart anyway."
-    }
-    if ! main="$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null)"; then
-        _cannot_tell "could not read genesis-server's MainPID from systemd"
-        return 0
-    fi
-    if ! _positive_int "${main:-0}"; then
-        echo "  No genesis-server process is running, so no session it launched can be ended."
-        return 0
-    fi
-    rc=0
-    found="$(python3 -I -S -c "$_SERVER_SESSIONS_PY" "$main" "${GENESIS_DEPLOY_PROC_ROOT:-/proc}" "$$")" || rc=$?
-    if [ "$rc" -ne 0 ]; then
-        _cannot_tell "could not list processes to find the server's sessions"
-        found=""
-    fi
-    work=""
-    tok_file="$(_server_genesis_home "$main")/internal_api_token"
-    if ! python3 -c "$_PORT_PROBE_PY" "$INFLIGHT_PORT" "$main" 2>/dev/null; then
-        # Whatever answers on the port must BE the server before it is handed the
-        # token or believed: another listener could take the token, or answer 404
-        # and pass for a server that predates the report.
-        _cannot_tell "could not confirm that genesis-server (pid $main) is what listens on port $INFLIGHT_PORT, so it was not asked what it is running"
-    elif [ ! -s "$tok_file" ] || [ ! -r "$tok_file" ]; then
-        _cannot_tell "could not read the internal API token ($tok_file) to ask genesis-server what it is running"
-    else
-        # The token goes straight from its file to curl's stdin (-H @-): never on a
-        # command line, and never in a shell variable. -q first, as curl requires:
-        # no .curlrc; --noproxy '*': no proxy for loopback.
-        resp="$({ printf 'Authorization: Bearer '; head -n1 "$tok_file"; } \
-            | curl -q --noproxy '*' -s --max-time 15 -H @- -w '\n%{http_code}' "$INFLIGHT_URL" 2>/dev/null || true)"
-        code="${resp##*$'\n'}"
-        case "$code" in
-            200)
-                rc=0
-                work="$(printf '%s' "${resp%$'\n'*}" | python3 -I -S -c "$_SERVER_SESSIONS_PY" --inflight)" || rc=$?
-                if [ "$rc" -ne 0 ]; then
-                    _cannot_tell "genesis-server's in-flight report could not be read"
-                    work=""
-                fi
-                ;;
-            404)
-                echo "  NOTE: genesis-server predates its in-flight report (HTTP 404), so only the Claude processes below it are checked."
-                ;;
-            *)
-                _cannot_tell "could not ask genesis-server what it is running (HTTP ${code:-no answer})"
-                ;;
-        esac
-    fi
-    _consider() {  # $1 = the item an override names ("-" = none can), $2 = its line
-        listing+="$2"$'\n'
-        if [ "$1" = - ]; then
-            [ "$ALLOW_KILLING" = all ] || unlisted+=" (unnamed)"
-            return 0
-        fi
-        all_items+=",$1"
-        if [ "$ALLOW_KILLING" != all ] && [[ ",$ALLOW_KILLING," != *",$1,"* ]]; then
-            unlisted+=" $1"
-        fi
-    }
-    while IFS=$'\t' read -r pid age resume self start; do
-        [ -n "$pid" ] || continue
-        item="$pid@$start"
-        line="    process $item"
-        [ "$age" = -1 ] || line+=", running $((age / 60))m"
-        [ "$resume" = - ] || line+=", resumes $resume"
-        if [ "$self" = self ]; then
-            line+="  <- the session running this command"
-            own=1
-        fi
-        _consider "$item" "$line"
-    done <<< "$found"
-    while IFS=$'\t' read -r iid kind label age; do
-        [ -n "$iid" ] || continue
-        if [ "$iid" = more ]; then
-            listing+="    ... and $kind more items the server reported"$'\n'
-            [ "$ALLOW_KILLING" = all ] || unlisted+=" (more)"
-            continue
-        fi
-        _consider "$iid" "    ${kind:-work} $iid  ${label:-?}, running $((age / 60))m"
-    done <<< "$work"
-    [ -n "$listing" ] || return 0
-    if [ -z "$unlisted" ]; then
-        echo "  Ending these sessions with the restart (--allow-killing $ALLOW_KILLING):"
-        printf '%s' "$listing"
-        return 0
-    fi
-    {
-        echo "ERROR: genesis-server is running Claude Code sessions it launched, and a restart ends them:"
-        printf '%s' "$listing"
-        echo "  Nothing changed. Wait for them to finish, or pass --allow-killing with what is listed"
-        # An item that cannot be named (an unsafe id, or one past the listing cap)
-        # can only be covered by `all`: naming the rest would refuse again.
-        if [ -n "$all_items" ] && [[ "$unlisted" != *"(unnamed)"* && "$unlisted" != *"(more)"* ]]; then
-            echo "  (here: --allow-killing ${all_items#,}) to restart anyway; uncovered now:$unlisted."
-        elif [ -n "$all_items" ]; then
-            echo "  (some of these cannot be named, so only --allow-killing all covers them) to restart anyway."
-        else
-            echo "  (none of these can be named: --allow-killing all) to restart anyway."
-        fi
-        if [ -n "$own" ]; then
-            echo "  The session running this command is one of them: a restart ends it too, so hand the"
-            echo "  restart to a session the server did not launch rather than overriding."
-        else
-            echo "  If this was launched detached (systemd-run), it cannot tell whether one of these is"
-            echo "  the session that launched it. A session the server started must not restart the"
-            echo "  server: hand the restart to one it did not start."
-        fi
-    } >&2
-    exit 1
 }
 
 if [ "$MODE" = status ]; then
@@ -529,16 +368,35 @@ trap 'exit 143' TERM
 # finished one behind, and the watchdog's reader already treats it as over. Under
 # the exclusive lock no update.sh can be running. Anything unreadable refuses.
 if [ -e "$UPDATE_STATE_FILE" ]; then
-    _state_phase="$(python3 -c 'import json, sys
+    _state_phase="$(python3 -I -S -c 'import json, sys
 d = json.load(open(sys.argv[1]))
 p = d.get("phase") if isinstance(d, dict) else None
 print(p if isinstance(p, str) else "")' "$UPDATE_STATE_FILE" 2>/dev/null || true)"
     [ "$_state_phase" = "done" ] \
         || die "$UPDATE_STATE_FILE records an unfinished update.sh run; finish it with scripts/update.sh --post-merge."
 fi
-# No override here: GENESIS_ALLOW_NON_DEPLOY_BRANCH is update.sh's alone.
-genesis_deploy_branch_ok "$GENESIS_ROOT" \
-    || die "$GENESIS_ROOT is on '${_branch:-a detached HEAD}', not $DEPLOY_BRANCH."
+# `live`, the integration branch scripts/deploy_candidates builds from the deploy
+# manifest, is never pulled into: a fast-forward from upstream would drop every
+# candidate. restart runs on it as it stands; the rebuild moves it (#2978).
+_live_rc=0
+genesis_live_checkout "$GENESIS_ROOT" || _live_rc=$?
+case "$_live_rc" in
+    0)
+        [ "$MODE" = restart ] \
+            || die "$GENESIS_ROOT is on live, which the deploy manifest builds, and a $MODE would pull into it. Run scripts/deploy_candidates rebuild, then scripts/deploy_code_only.sh restart."
+        # Spelled as _checkout_unmoved reads it before the restart (`--short`,
+        # which prints heads/live when a tag shares the name).
+        _branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD || true)"
+        ;;
+    1)
+        # No override here: GENESIS_ALLOW_NON_DEPLOY_BRANCH is update.sh's alone.
+        genesis_deploy_branch_ok "$GENESIS_ROOT" \
+            || die "$GENESIS_ROOT is on '${_branch:-a detached HEAD}', not $DEPLOY_BRANCH."
+        ;;
+    *)
+        die "cannot tell whether $GENESIS_ROOT is on the live branch the deploy manifest builds (the manifest or git could not be read). Nothing was deployed."
+        ;;
+esac
 # Unreadable refuses (see genesis_tracked_dirty_paths for why it is read apart).
 _dirty="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")" \
     || die "cannot read the working tree's status — nothing was deployed."
@@ -594,7 +452,7 @@ fi
 # cannot fix: this interpreter is older than the incoming requires-python.
 _deps_ok() {
     local what="$1" remedy="$2" out rc=0
-    out="$("$VENV_DIR/bin/python" "$_SELF_DIR/lib/venv_matches_pyproject.py" "$GENESIS_ROOT" 2>&1)" || rc=$?
+    out="$("$VENV_DIR/bin/python" -P "$_SELF_DIR/lib/venv_matches_pyproject.py" "$GENESIS_ROOT" 2>&1)" || rc=$?
     case "$rc" in
         0) return 0 ;;
         3) echo "ERROR: $what needs a newer Python than this venv runs, and a reinstall cannot change that:" >&2 ;;
@@ -610,7 +468,7 @@ _deps_ok() {
 _deploy_health_paths() {
     local name="$1" ref="$2" src
     src="$(git -C "$GENESIS_ROOT" show "$ref:src/genesis/observability/snapshots/deploy_health.py" 2>/dev/null)" || return 0
-    DH_SRC="$src" "$VENV_DIR/bin/python" -c '
+    DH_SRC="$src" "$VENV_DIR/bin/python" -I -S -c '
 import ast, os, sys
 for node in ast.parse(os.environ["DH_SRC"]).body:
     if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == sys.argv[1] for t in node.targets):
@@ -835,6 +693,9 @@ _pull() {
     # needs neither the stop nor the restart, but only if HEAD has held no other
     # runtime files since the boot: a module the server imported from a pulled
     # tree stays loaded after a later commit restores the files.
+    if ! genesis_checkout_lock "$GENESIS_ROOT"; then
+        die "checkout busy (a Claude launch holds genesis-checkout.lock); nothing changed"
+    fi
     if [ "$MODE" = deploy ]; then
         _read_baseline
         if [ -n "$SERVING" ] && _runtime_held "$_upstream"; then
@@ -869,7 +730,7 @@ _pull() {
     _PHASE="merging"
     for _f in "${_reset[@]}"; do
         echo "  Resetting $_f to HEAD for the merge: its local edit is dropped (it regenerates)."
-        git -C "$GENESIS_ROOT" checkout HEAD -- "$_f"
+        genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$_f"
         _RESET_NOTE="$_RESET_NOTE $_f"
     done
     # Safe for this script to merge the tree it runs from: git REPLACES a changed
@@ -884,7 +745,7 @@ _pull() {
     # a file written between that scan and this merge (the server, another
     # session) would be lost; with the flag git refuses it too, at the merge
     # itself, leaving HEAD and the tree as they were (measured, git 2.43).
-    if ! git -c gc.autoDetach=false -C "$GENESIS_ROOT" merge --ff-only --no-overwrite-ignore -q "$_upstream" {_UPDATE_LOCK_FD}>&-; then
+    if ! genesis_without_checkout_lock git -c gc.autoDetach=false -C "$GENESIS_ROOT" merge --ff-only --no-overwrite-ignore -q "$_upstream" {_UPDATE_LOCK_FD}>&-; then
         _status_after="$(_status_outside_resets)" || _status_after="unreadable after"
         if [ "$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null)" = "$_head" ] \
             && [ "$_status_after" = "$_status_before" ]; then
@@ -892,6 +753,7 @@ _pull() {
             # same tree; only if that fails does the exit still alert.
             if [ -n "$_STOPPED" ]; then
                 echo "  Starting genesis-server again on the unchanged tree…"
+                genesis_checkout_unlock
                 systemctl --user start genesis-server {_UPDATE_LOCK_FD}>&- && _STOPPED=""
             fi
             [ -n "$_STOPPED" ] || _PHASE="checks"
@@ -900,6 +762,7 @@ _pull() {
         exit 1
     fi
     _PHASE="merged"
+    genesis_checkout_unlock
     _CHECKED="$_upstream"
     echo "  Merged $_head..$_upstream"
 }
@@ -1010,7 +873,7 @@ _restarted_unit_serving() {
     else
         [ "$pid" != "$_SERVER_PID_BEFORE" ] || return 1
     fi
-    python3 -c "$_PORT_PROBE_PY" "$_HEALTH_PORT" "$pid" 2>/dev/null || return 1
+    python3 -I -S -c "$_PORT_PROBE_PY" "$_HEALTH_PORT" "$pid" 2>/dev/null || return 1
     printf '%s\n' "$pid"
 }
 
@@ -1087,7 +950,7 @@ if [ "$_healthy" = true ]; then
     # an otherwise-good deploy is not failed over one non-critical subsystem, but
     # the regression is surfaced rather than swallowed.
     _degraded="$(SERVER_PID="$_SERVER_PID" SERVER_PID_BEFORE="$_SERVER_PID_BEFORE" \
-        MANIFEST_BEFORE="$_MANIFEST_BEFORE" python3 -c "$_MANIFEST_DELTA_PY" 2>/dev/null)" \
+        MANIFEST_BEFORE="$_MANIFEST_BEFORE" python3 -I -S -c "$_MANIFEST_DELTA_PY" 2>/dev/null)" \
         || _degraded="check:manifest-interpreter-failed"
     if [ -n "$_degraded" ]; then
         echo "  NOTE: subsystems not ok after the restart: $_degraded"

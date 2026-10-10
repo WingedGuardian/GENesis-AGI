@@ -171,6 +171,24 @@ class SupersedeIncomplete(Exception):
         )
 
 
+def _is_committed_supersession(meta: dict | None) -> bool:
+    """True when *meta* records an explicit supersession that already committed.
+
+    The supersede repair path keys on this: such a row owes only its mirrors,
+    so a retry completes it without re-validating the successor. A row the
+    dream cycle retired also carries ``superseded_by``, but consolidation wrote
+    it, not an earlier supersede call, so it must take the ordinary validated
+    path. Treating it as a committed supersession would redirect an
+    unresolvable ``new_id`` to the dream successor and report success.
+    """
+    return bool(
+        meta
+        and meta["deprecated"]
+        and meta["superseded_by"]
+        and meta.get("dream_cycle_run_id") is None
+    )
+
+
 class MemoryStore:
     """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link."""
 
@@ -763,7 +781,7 @@ class MemoryStore:
             # `integrity.py` counts `deprecated_divergence` but nothing repairs
             # it. Recover the successor from the row that already committed.
             existing = await memory_crud.get_metadata(self._db, old_id)
-            if not (existing and existing["deprecated"] and existing["superseded_by"]):
+            if not _is_committed_supersession(existing):
                 raise
             new_id = existing["superseded_by"]
         # Self-check BEFORE the locks: sorted() of an equal pair would acquire
@@ -790,8 +808,7 @@ class MemoryStore:
             # skipped for one that is merely being completed.
             existing = await memory_crud.get_metadata(self._db, old_id)
             resuming = (
-                existing is not None
-                and bool(existing["deprecated"])
+                _is_committed_supersession(existing)
                 and existing["superseded_by"] == new_id
             )
             if resuming:
