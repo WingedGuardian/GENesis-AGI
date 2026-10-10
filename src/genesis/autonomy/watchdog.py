@@ -786,10 +786,11 @@ class WatchdogChecker:
                 missed,
                 "; ".join(parts)
                 if parts
+                # Two reads only: a process that started and exited between
+                # them is in neither list, so "none did I/O" is never provable.
                 else (
-                    "none of the measured processes did I/O"
-                    if churn["exited"]
-                    else "none did I/O in the sample"
+                    "none of the measured processes did I/O (one that started and "
+                    "exited inside the sample is not visible)"
                 ),
             )
         except Exception:

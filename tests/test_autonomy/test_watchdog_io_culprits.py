@@ -89,7 +89,11 @@ def test_no_busy_process_says_so(
     with caplog.at_level(logging.WARNING, logger=wd.logger.name):
         checker._log_io_culprits(30.0)
     line = caplog.records[-1].getMessage()
-    assert "none did I/O in the sample" in line
+    # Round-2 review: two reads cannot see a process that lived only between
+    # them, so even with no churn the line never claims nothing did I/O.
+    assert "none of the measured processes did I/O" in line
+    assert "started and exited inside the sample is not visible" in line
+    assert "none did I/O" not in line
     assert "total 0KB/s" in line
 
 
