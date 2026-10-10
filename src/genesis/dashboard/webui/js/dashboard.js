@@ -5209,7 +5209,10 @@
               fetchApi("/api/genesis/approvals").catch(() => null),
             ]);
             if (msgResp?.ok) {
-              this.outreachModal.messages = await msgResp.json();
+              // CLI consent belongs to the dedicated approval cards.
+              this.outreachModal.messages = (await msgResp.json()).filter(
+                (message) => message.signal_type !== "cli_approval",
+              );
               const pendingApprovals = approvalResp?.ok ? await approvalResp.json() : [];
               // Peer consent requires the dedicated peer/task/digest card.
               this.outreachModal.pendingApprovals = pendingApprovals.filter(

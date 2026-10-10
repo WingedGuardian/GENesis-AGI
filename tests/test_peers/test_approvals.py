@@ -1,6 +1,7 @@
 """Individual consent and durable notification, using the existing approval store."""
 
 import asyncio
+import gc
 import hashlib
 import importlib
 import json
@@ -106,6 +107,83 @@ async def test_exact_request_retry_preserves_id_and_single_notification(setup):
         "timeout",
         "notification_error",
     }
+
+
+async def test_notification_registry_collects_completed_and_missing_ids(setup):
+    s = setup
+    identifier = await request(s)
+    assert not await s.service.deliver(identifier)
+    for _ in range(100):
+        assert not await s.service.deliver(str(uuid.uuid4()))
+    gc.collect()
+    assert not s.service._notification_locks
+    assert (await s.manager.get_by_id(identifier))["status"] == "pending"
+    assert await request(s) == identifier
+    assert len(s.notifications) == 1
+
+
+async def test_notification_lock_survives_waiter_cancel_and_new_arrival(setup, monkeypatch):
+    s = setup
+    entered, release = asyncio.Event(), asyncio.Event()
+    active = maximum = calls = 0
+
+    async def controlled(identifier):
+        nonlocal active, maximum, calls
+        active += 1
+        maximum = max(maximum, active)
+        calls += 1
+        entered.set()
+        try:
+            await release.wait()
+            await asyncio.sleep(0)
+            return True
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(s.service, "_deliver", controlled)
+    holder = asyncio.create_task(s.service.deliver("shared"))
+    await entered.wait()
+    cancelled = asyncio.create_task(s.service.deliver("shared"))
+    survivor = asyncio.create_task(s.service.deliver("shared"))
+    await asyncio.sleep(0)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    late = asyncio.create_task(s.service.deliver("shared"))
+    await asyncio.sleep(0)
+    assert calls == maximum == 1
+    release.set()
+    assert await asyncio.gather(holder, survivor, late) == [True, True, True]
+    assert calls == 3 and maximum == 1
+    del holder, survivor, late, cancelled
+    gc.collect()
+    assert not s.service._notification_locks
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_notification_lock_releases_after_holder_failure(setup, monkeypatch, failure):
+    s = setup
+
+    async def interrupted(identifier):
+        raise failure("Fixture interruption")
+
+    monkeypatch.setattr(s.service, "_deliver", interrupted)
+    with pytest.raises(failure):
+        await s.service.deliver("retry")
+    gc.collect()
+    assert not s.service._notification_locks
+    monkeypatch.setattr(s.service, "_deliver", AsyncMock(return_value=True))
+    assert await s.service.deliver("retry")
+
+
+async def test_concurrent_request_retries_notify_once_with_collectible_locks(setup):
+    s = setup
+    identifiers = await asyncio.gather(*(request(s) for _ in range(8)))
+    assert len(set(identifiers)) == 1
+    assert len(s.notifications) == 1
+    assert (await s.manager.get_by_id(identifiers[0]))["status"] == "pending"
+    gc.collect()
+    assert not s.service._notification_locks
 
 
 @pytest.mark.parametrize(

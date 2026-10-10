@@ -15,6 +15,10 @@ fields. Generic communications and outreach-modal approval cards exclude peer
 operations; the dedicated approval feed retains them. Telegram callbacks still
 require an authorized owner account.
 
+Both generic communication and outreach history views hide `cli_approval`
+notification duplicates, including ordinary CLI fallback notifications. The
+dedicated approval cards remain the consent surface; non-CLI history is retained.
+
 Manager resolution and the named gate refuse peer-operation approval/rejection
 from batch, voice, bare/quoted text, generic user, system or autonomous origins.
 Only exact dashboard or named Telegram button provenance is accepted. The batch
@@ -51,6 +55,11 @@ of creation intents after restart; this slice alone does not install runtime wor
 Peer notifications disable generic outreach recovery: the peer service owns the
 durable retry so every attempt retains its binding, current checks and buttons.
 Existing non-peer approval notifications retain their previous recovery path.
+
+Concurrent notification attempts for the same approval share a process-local
+lock while holders or waiters remain. Unused locks are collected; durable
+association and receipt checks retain retry identity after collection. This does
+not provide cross-process serialization or exactly-once transport.
 
 The complete hold/notification/named-resolution/contained-resume/result integration
 belongs to the coordinator slice. API readiness remains dark until that path is
