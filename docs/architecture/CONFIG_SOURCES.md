@@ -201,8 +201,12 @@ names, so an overlay of a read-only file is editable (#2446).
   and `health_api_port`. `GUARDIAN_HEALTH_HOST` / `GUARDIAN_HEALTH_PORT` override
   them in the Guardian process, read by `guardian.config.load_config` on each
   timer invocation. `container_ip` remains the ICMP target. The operator migration
-  patches the preserved HTTP setting before restricting the Incus proxy; the
-  installer aligns unset targets for an existing loopback proxy. See
+  proves the loaded user service's selected YAML and effective manager/service
+  environment before patching the HTTP setting and restricting the Incus proxy.
+  Unknown profiles and conflicting service-only overrides refuse migration.
+  After unit installation/reload, the installer aligns unset targets for an
+  existing loopback proxy only when that service profile is proven. Numeric
+  loopback HTTP targets bypass proxies; other targets retain urllib proxy policy. See
   [peer ingress](../reference/peer-ingress.md).
 - **`~/.genesis/resource-budget.env`** — optional `KEY=VALUE` file for the resource-budget
   levers (`GENESIS_RB_*`), read by `genesis.hostmetrics`; the process environment wins over

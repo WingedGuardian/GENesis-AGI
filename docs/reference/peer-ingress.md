@@ -95,7 +95,19 @@ deployed Guardian override support. Apply atomically updates only
 `health_api_host`, preserving comments, other YAML values and file mode, before
 restricting the existing Incus listener. It confirms the new listener and HTTP
 readiness. Unknown topology, ambiguous YAML, a conflicting shell override or an
-Incus failure returns failure. An uncertain network change is never rolled back
+Incus failure returns failure. Preflight also requires a loaded, nontransient
+standard Guardian user service with no pending daemon reload. It reads typed
+systemd properties and merges the user-manager environment, service assignments
+and final environment removals. The effective `GUARDIAN_CONFIG` must select the
+supplied YAML; an alternate file is supported when it is the selected file.
+Service-only host, port or container conflicts refuse before either mutation.
+Environment files, PAM sources, wrappers/hooks, alternate Python paths and
+filesystem or network namespace remapping require operator inspection. Missing
+properties or an unavailable user bus are failures, not proof of compatibility.
+The check trusts the deployed interpreter and installed Python environment;
+it does not verify arbitrary Python startup hooks. Avoid concurrent service or
+environment changes during this maintenance-window snapshot.
+An uncertain network change is never rolled back
 to a public listener. Inspect the real error and current device configuration;
 do not activate peers after a partial migration.
 
@@ -105,11 +117,16 @@ precedence, and clearing it restores the configured value to an empty override
 port. Inspect the deployed unit's configured overrides privately before applying
 the migration. ICMP independently uses the configured or autodetected container
 address and refuses to report the host loopback as an autodetection success.
-Guardian's health and dialogue requests contact the configured target directly,
-independently of environment HTTP proxies. The next Guardian timer invocation
+Guardian's health and dialogue requests bypass environment HTTP proxies only
+for numeric loopback targets. Other configured targets retain normal urllib
+proxy handling, including `no_proxy`; hostname aliases do not select the bypass.
+The next Guardian timer invocation
 reloads YAML. The installer aligns an unset HTTP target only when both Incus
 endpoints are loopback on port 5000, those proxy modes are standard, and the effective health port is standard;
-explicit operator targets and conflicting overrides are retained.
+explicit operator targets and conflicting overrides are retained. Optional
+alignment runs after the existing unit installation and successful daemon
+reload, proves the loaded service profile, and preserves YAML with a safe skip
+message if the profile is unproven. It does not start a service to obtain proof.
 
 Host setup stops before installing Guardian if the dashboard proxy cannot be
 created or verified. New devices are read back before setup proceeds; existing

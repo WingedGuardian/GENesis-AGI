@@ -19,6 +19,7 @@ from pathlib import Path
 
 import yaml
 
+from genesis.guardian._service_profile import prove_guardian_profile
 from genesis.guardian.config import GuardianConfig
 
 _LISTEN = "tcp:127.0.0.1:5000"
@@ -124,6 +125,7 @@ def configure_loopback_health(config_path: Path, *, only_if_unset: bool = False)
                 return False
         except ValueError:
             return False
+        prove_guardian_profile(config_path, raw.get("container_name", "genesis"))
     patched = _patch_host(original, raw)
     attributes = config_path.stat()
     mode = stat.S_IMODE(attributes.st_mode)
@@ -177,6 +179,7 @@ def migrate(config_path: Path, *, apply: bool = False) -> dict:
         raise ValueError("remove conflicting Guardian container environment override")
     if os.environ.get("GUARDIAN_HEALTH_HOST", "127.0.0.1") != "127.0.0.1":
         raise ValueError("remove conflicting Guardian HTTP host environment override")
+    prove_guardian_profile(config_path, container)
     # Refuse unrelated proxy topologies rather than guessing what to replace.
     for key, default in (("bind", "host"), ("nat", "false"), ("proxy_protocol", "false")):
         if _device(container, "get", key) not in {"", default}:

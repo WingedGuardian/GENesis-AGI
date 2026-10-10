@@ -22,6 +22,7 @@ import logging
 from dataclasses import dataclass
 from enum import StrEnum
 
+from genesis.guardian._http import opener_for_url
 from genesis.guardian.config import GuardianConfig
 from genesis.guardian.health_signals import HealthSnapshot
 
@@ -169,7 +170,7 @@ async def send_dialogue(
 
         def _do_post() -> tuple[int, str]:
             try:
-                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                opener = opener_for_url(url)
                 with opener.open(req, timeout=15) as resp:
                     body = resp.read().decode("utf-8", errors="replace")
                     return resp.status, body

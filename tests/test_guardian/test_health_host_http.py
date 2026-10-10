@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from unittest.mock import AsyncMock, patch
@@ -11,6 +12,77 @@ import pytest
 from genesis.guardian.config import GuardianConfig
 from genesis.guardian.dialogue import DialogueRequest, send_dialogue
 from genesis.guardian.health_signals import probe_health_api, probe_icmp_reachable
+
+
+@pytest.mark.asyncio
+async def test_custom_health_and_dialogue_use_environment_proxy(tmp_path, monkeypatch):
+    requests = []
+
+    class Proxy(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(("GET", self.path))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+
+        def do_POST(self):
+            requests.append(("POST", self.path))
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"acknowledged":true,"status":"handling","action":"none"}')
+
+        def log_message(self, *args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Proxy) as server:
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for name in tuple(os.environ):
+                if name.lower().endswith("_proxy") or name == "REQUEST_METHOD":
+                    monkeypatch.delenv(name, raising=False)
+            monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{server.server_port}")
+            monkeypatch.setenv("no_proxy", "")
+            config = GuardianConfig(health_api_host="upstream.invalid", state_dir=tmp_path)
+            with patch("genesis.guardian.credential_bridge.load_internal_api_token", return_value=None):
+                assert (await probe_health_api(config)).alive
+                response = await send_dialogue(config, DialogueRequest([], [], 0, "fixture", {}))
+            assert response.acknowledged and response.action == "none"
+            assert requests == [
+                ("GET", "http://upstream.invalid:5000/api/genesis/health"),
+                ("POST", "http://upstream.invalid:5000/api/genesis/guardian-dialogue"),
+            ]
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+
+
+@pytest.mark.parametrize(
+    ("url", "bypass"),
+    [
+        ("http://127.0.0.1:5000", True),
+        ("http://127.24.1.2:5000", True),
+        ("http://[::1]:5000", True),
+        ("http://localhost:5000", False),
+        ("http://127.0.0.1.example.invalid:5000", False),
+        ("http://192.0.2.1:5000", False),
+        ("http://[2001:db8::1]:5000", False),
+        ("relative/path", False),
+        ("http://[invalid", False),
+    ],
+)
+def test_proxy_bypass_is_numeric_loopback_only(url, bypass):
+    from genesis.guardian._http import opener_for_url
+
+    with patch("genesis.guardian._http.urllib.request.build_opener") as build:
+        opener_for_url(url)
+    if bypass:
+        assert len(build.call_args.args) == 1
+        assert build.call_args.args[0].proxies == {}
+    else:
+        build.assert_called_once_with()
 
 
 @pytest.mark.asyncio

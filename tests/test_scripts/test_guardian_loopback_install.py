@@ -39,7 +39,7 @@ _REPO = Path(__file__).resolve().parents[2]
         ("tcp:127.0.0.1:5000", "tcp:127.0.0.1:5000", "", 5000, "", "unreadable", "", ""),
     ],
 )
-def test_installer_aligns_unset_http_target_without_clobbering_config(
+def test_installer_preserves_config_when_loaded_service_is_unproven(
     tmp_path, listener, backend, configured, port, expected, bind, nat, protocol
 ):
     install = tmp_path / "guardian"
@@ -55,6 +55,7 @@ def test_installer_aligns_unset_http_target_without_clobbering_config(
     )[0]
     target = "# Auto-detect health API port" + target
     phase = script.split("# ── Step 5:", 1)[1].split("# ── Step 6:", 1)[0]
+    alignment = script.split('echo "  Reloaded systemd"', 1)[1].split("# ── Step 9:", 1)[0]
     # Skip only the phase's descriptive heading, retaining its actual commands.
     phase = phase[phase.index('echo ""') :]
     body = (
@@ -71,6 +72,7 @@ incus() { case "${@: -1}" in listen) printf '%s\n' "$_listener" ;; connect) prin
 """
         + target
         + phase
+        + alignment
     )
     result = subprocess.run(
         [
@@ -94,7 +96,7 @@ incus() { case "${@: -1}" in listen) printf '%s\n' "$_listener" ;; connect) prin
     )
     assert result.returncode == 0, result.stderr
     settings = yaml.safe_load(config.read_text())
-    assert settings["health_api_host"] == expected
+    assert settings["health_api_host"] == configured
     assert settings["container_ip"] == "192.0.2.1"
     assert settings["health_api_port"] == port
     assert "# retain operator note" in config.read_text()

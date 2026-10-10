@@ -42,6 +42,7 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(ingress, "_device", device)
     monkeypatch.setattr(ingress, "_ready_loopback", lambda: None)
     monkeypatch.setattr(ingress, "_container_loopback", lambda container: None)
+    monkeypatch.setattr(ingress, "prove_guardian_profile", lambda path, container: None)
     monkeypatch.delenv("GUARDIAN_HEALTH_HOST", raising=False)
     monkeypatch.delenv("GUARDIAN_HEALTH_PORT", raising=False)
     monkeypatch.delenv("GUARDIAN_CONTAINER_NAME", raising=False)

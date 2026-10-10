@@ -552,21 +552,6 @@ else
     echo "  Set approval.bind_host in guardian.yaml to a reachable IP"
 fi
 
-# For loopback proxies, update an unset HTTP target in the preserved config.
-# An explicit operator target is retained; migration's --apply is the separate
-# operation that intentionally moves an existing non-loopback target.
-if [ "$HEALTH_HOST" = "127.0.0.1" ]; then
-    PYTHONPATH="$INSTALL_DIR/src" "$VENV_DIR/bin/python" - "$INSTALL_DIR/config/guardian.yaml" <<'PYHEALTH'
-from pathlib import Path
-import sys
-from genesis.guardian.dashboard_ingress import configure_loopback_health
-if configure_loopback_health(Path(sys.argv[1]), only_if_unset=True):
-    print("  Guardian HTTP target aligned with the host loopback proxy.")
-else:
-    print("  Guardian HTTP target retained; existing/custom target or override.")
-PYHEALTH
-fi
-
 # ── Step 6: Telegram credential bridge ────────────────────────────────
 #
 # Telegram credentials are auto-propagated from the container via the shared
@@ -660,6 +645,27 @@ done
 
 systemctl --user daemon-reload
 echo "  Reloaded systemd"
+
+# For loopback proxies, update an unset HTTP target in the preserved config.
+# An explicit operator target is retained; migration's --apply is the separate
+# operation that intentionally moves an existing non-loopback target.
+if [ "$HEALTH_HOST" = "127.0.0.1" ]; then
+    PYTHONPATH="$INSTALL_DIR/src" "$VENV_DIR/bin/python" - "$INSTALL_DIR/config/guardian.yaml" <<'PYHEALTH'
+from pathlib import Path
+import sys
+from genesis.guardian.dashboard_ingress import configure_loopback_health
+try:
+    aligned = configure_loopback_health(Path(sys.argv[1]), only_if_unset=True)
+except ValueError:
+    aligned = False
+    print("  Guardian HTTP alignment skipped; service profile requires operator inspection.")
+if aligned:
+    print("  Guardian HTTP target aligned with the host loopback proxy.")
+else:
+    print("  Guardian HTTP target retained; existing/custom target or unproven service profile.")
+PYHEALTH
+fi
+
 
 # ── Step 9: Kernel OOM protection ─────────────────────────────────────
 # Prevent hard VM freezes under memory pressure. Cloud VMs often have
