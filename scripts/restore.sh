@@ -6,7 +6,7 @@
 #
 # Usage:
 #   scripts/restore.sh [--from <backup-repo-url>] [--dry-run] [--force] [--database-only]
-#                     [--refresh-snapshot] [--transcript-preference RELATIVE_PATH=legacy|v2] (repeatable)
+#                     [--refresh-snapshot] [--transcript-preference PATH=legacy|legacy-plain|legacy-encrypted|v2] (repeatable)
 #
 # Environment variables (match backup.sh):
 #   GENESIS_BACKUP_REPO        — Git URL (used when a fresh clone is needed)

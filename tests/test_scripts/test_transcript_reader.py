@@ -44,6 +44,86 @@ def selection_setup(tmp_path, monkeypatch):
     (cipher / name).write_bytes(plain.read_bytes())
     return root, cipher, scratch, name
 
+
+@pytest.fixture
+def legacy_pair(tmp_path, monkeypatch):
+    root, cipher, scratch, gnupg = (tmp_path / name for name in ('target', 'legacy', 'scratch', 'gnupg'))
+    for directory in (cipher, scratch, gnupg):
+        directory.mkdir(mode=0o700)
+    monkeypatch.setenv('GNUPGHOME', str(gnupg))
+    password = b'synthetic-legacy-pair'
+    def make(equal=True, empty=False):
+        plain = b'' if empty else b'owned plaintext\n' * 5000
+        encrypted = plain if equal else b'owned encrypted copy\n' * 5000
+        (cipher / 'a.jsonl').write_bytes(plain)
+        source = tmp_path / 'encryption-source'
+        source.write_bytes(encrypted)
+        archive.crypt(source, cipher / 'a.jsonl.gpg', password)
+        return root, cipher, scratch, password, plain, encrypted
+    yield make
+    cleanup = subprocess.run(['gpgconf', '--homedir', str(gnupg), '--kill', 'gpg-agent'], capture_output=True)
+    assert cleanup.returncode == 0
+
+
+@pytest.mark.parametrize('equal', [False, True])
+@pytest.mark.parametrize('preference', [None, 'legacy', 'legacy-plain', 'legacy-encrypted', 'v2'])
+@pytest.mark.parametrize('dry_run', [False, True])
+def test_real_legacy_encoding_choice_is_lossless_or_explicit(legacy_pair, equal, preference, dry_run):
+    root, cipher, scratch, password, plain, encrypted = legacy_pair(equal)
+    preferences = () if preference is None else ('p/a.jsonl=' + preference,)
+    failed = archive.restore_set(cipher, root, 'p', scratch, password, dry_run=dry_run, preferences=preferences)
+    resolved = preference != 'v2' and (equal or preference in ('legacy-plain', 'legacy-encrypted'))
+    assert failed is not resolved
+    if dry_run or not resolved:
+        assert not root.exists()
+    else:
+        assert (root / 'p/a.jsonl').read_bytes() == (plain if preference == 'legacy-plain' else encrypted)
+
+
+@pytest.mark.parametrize('preference', [None, 'legacy', 'legacy-encrypted'])
+def test_duplicate_legacy_does_not_hide_v2_ambiguity(legacy_pair, tmp_path, preference):
+    root, cipher, scratch, password, _plain, encrypted = legacy_pair()
+    tar, name = payload(tmp_path, relative='p/a.jsonl', content=b'v2 candidate')
+    archive.crypt(tar, cipher / name, password)
+    preferences = () if preference is None else ('p/a.jsonl=' + preference,)
+    assert archive.restore_set(cipher, root, 'p', scratch, password, preferences=preferences) is (preference is None)
+    if preference is None:
+        assert not root.exists()
+    else:
+        assert (root / 'p/a.jsonl').read_bytes() == encrypted
+
+
+@pytest.mark.parametrize('selected', ['a.jsonl', 'a.jsonl.gpg'])
+def test_selected_inventory_excludes_other_legacy_encoding(legacy_pair, selected):
+    root, cipher, scratch, password, plain, encrypted = legacy_pair(False)
+    assert not archive.restore_set(cipher, root, 'p', scratch, password, selected={selected}, preferences=('p/a.jsonl=legacy',))
+    assert (root / 'p/a.jsonl').read_bytes() == (plain if selected == 'a.jsonl' else encrypted)
+
+
+@pytest.mark.parametrize('equal', [False, True])
+@pytest.mark.parametrize('force,dry_run', [(False, False), (True, False), (False, True), (True, True)])
+def test_legacy_encoding_choice_preserves_destination_policy(legacy_pair, equal, force, dry_run):
+    root, cipher, scratch, password, _plain, encrypted = legacy_pair(equal)
+    target = root / 'p/a.jsonl'
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b'keep existing destination')
+    assert not archive.restore_set(cipher, root, 'p', scratch, password, force=force, dry_run=dry_run,
+                                   preferences=('p/a.jsonl=legacy-encrypted',))
+    assert target.read_bytes() == (encrypted if force and not dry_run else b'keep existing destination')
+
+
+def test_invalid_nonchosen_legacy_encoding_still_reports_incomplete(legacy_pair):
+    root, cipher, scratch, password, plain, _encrypted = legacy_pair()
+    (cipher / 'a.jsonl.gpg').write_bytes(b'invalid ciphertext')
+    assert archive.restore_set(cipher, root, 'p', scratch, password, preferences=('p/a.jsonl=legacy-plain',))
+    assert (root / 'p/a.jsonl').read_bytes() == plain
+
+
+def test_identical_empty_legacy_encodings_restore(legacy_pair):
+    root, cipher, scratch, password, _plain, _encrypted = legacy_pair(empty=True)
+    assert not archive.restore_set(cipher, root, 'p', scratch, password)
+    assert (root / 'p/a.jsonl').read_bytes() == b''
+
 def test_capture_and_restore_mtime_force_and_dryrun(tmp_path):
     source = tmp_path / "session.jsonl"
     source.write_bytes(b'{"message":"hello"}\n')

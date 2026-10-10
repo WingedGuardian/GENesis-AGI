@@ -544,7 +544,7 @@ def validate_preferences(preferences):
         path = PurePosixPath(relative)
         if (
             not separator
-            or kind not in ("legacy", "v2")
+            or kind not in ("legacy", "legacy-plain", "legacy-encrypted", "v2")
             or relative in result
             or "\0" in relative
             or path.is_absolute()
@@ -555,6 +555,15 @@ def validate_preferences(preferences):
             raise ValueError("invalid or repeated transcript preference")
         result[relative] = kind
     return result
+
+
+def same_bytes(first, second):
+    """Compare validated private plaintexts without inferring source freshness."""
+    with first.open("rb") as left, second.open("rb") as right:
+        while chunk := left.read(64 * 1024):
+            if chunk != right.read(len(chunk)):
+                return False
+        return not right.read(1)
 
 
 def restore_set(
@@ -603,7 +612,8 @@ def restore_set(
                     # or download's mtime is not evidence of source freshness.
                     mtime = None
                 candidates.setdefault(relative, []).append(
-                    ("v2" if v2 else "legacy", mtime, plain, source.name)
+                    ("v2" if v2 else "legacy-encrypted" if source.name.endswith(".gpg") else "legacy-plain",
+                     mtime, plain, source.name)
                 )
             except (OSError, ValueError, OverflowError, KeyError, tarfile.TarError, subprocess.CalledProcessError):
                 failures.append(f"invalid transcript capture: {source.name}")
@@ -614,11 +624,19 @@ def restore_set(
             try:
                 chosen_kind = preference.get(relative)
                 if chosen_kind:
-                    options = [candidate for candidate in options if candidate[0] == chosen_kind]
+                    options = [candidate for candidate in options
+                               if candidate[0] == chosen_kind
+                               or (chosen_kind == "legacy" and candidate[0].startswith("legacy-"))]
                     if not options:
                         raise ValueError("preferred capture unavailable")
+                legacy = [candidate for candidate in options if candidate[0].startswith("legacy-")]
+                if len(legacy) == 2 and same_bytes(legacy[0][2], legacy[1][2]):
+                    # The encodings have the same decoded bytes. Keep one;
+                    # explicit encoding preferences were already applied above.
+                    options = [candidate for candidate in options if candidate[0] != "legacy-plain"]
                 if len(options) > 1 and any(option[1] is None for option in options):
-                    raise ValueError("incomparable capture freshness; use --transcript-preference")
+                    raise ValueError("incomparable capture freshness; use --transcript-preference "
+                                     "with legacy-plain, legacy-encrypted or v2")
                 kind, mtime, plain, name = max(options, key=lambda c: (c[1] or 0, c[0] == "v2"))
                 if kind == "v2":
                     count += int(restore(plain, root, name, force, dry_run))

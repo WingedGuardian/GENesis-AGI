@@ -1156,8 +1156,8 @@ jobs:
         # Authenticated backup reads: measured net +106; 25170 + 106 = 25276.
         # Offline restore fixture changes are count-neutral; ceiling stays 102.
         # Snapshot reader: original +109; corrective controls add +22:
-        # selection70->83, off-site20->28, dated backups50->51.
-        # Reader floor:25276+109+22=25407.
-        # Capture phase: measured original +240 (220+15+5).
-        # Prerequisite union:25407+240=25647; skip ceiling unchanged.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25647
+        # Second reader correction native collection vs its ff1f389 parent:
+        # selection 83 -> 152 (+69), reader 29 -> 64 (+35), CLI 3 -> 3.
+        # Reader floor: 25407 + 104 = 25511; skip ceiling unchanged.
+        # Original capture adds 240 measured cases; its held correction is separate.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25751
