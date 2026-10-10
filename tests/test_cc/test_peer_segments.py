@@ -501,3 +501,82 @@ def test_empty_scope_requires_confirmed_terminal_manager_state(
     else:
         with pytest.raises(RuntimeError, match="control group could not be confirmed"):
             peer_invocation.peer_segment._stop_scope()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel_wait"])
+async def test_peer_launch_waits_for_checkout_and_releases_before_drain(
+    peer_invocation, monkeypatch, tmp_path, streaming, outcome
+):
+    import fcntl
+
+    from genesis.cc import checkout_lock
+
+    path = tmp_path / "checkout.lock"
+    monkeypatch.setattr(checkout_lock, "checkout_lock_path", lambda: path)
+    monkeypatch.setattr(checkout_lock, "_POLL_S", 0.01)
+    waiting = asyncio.Event()
+    original_admit = invoker_module.admit_launch
+
+    async def admit():
+        waiting.set()
+        return await original_admit()
+
+    monkeypatch.setattr(invoker_module, "admit_launch", admit)
+    reads = []
+    monkeypatch.setattr(
+        invoker_module.roster, "apply_active", lambda inv: (reads.append(inv) or inv, "")
+    )
+    invoker = CCInvoker(claude_path="/fixture/claude")
+
+    async def traced(*args):
+        probe = os.open(path, os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(probe)
+        if outcome == "error":
+            raise RuntimeError("fixture launch failure")
+        return "complete"
+
+    monkeypatch.setattr(invoker, "_run_streaming_traced" if streaming else "_run_traced", traced)
+    drains = []
+
+    async def drain(self):
+        probe = os.open(path, os.O_RDWR)
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            drains.append(self.unit_name)
+        finally:
+            os.close(probe)
+
+    monkeypatch.setattr(PeerSegment, "stop_and_drain", drain)
+    exclusive = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(exclusive, fcntl.LOCK_EX)
+    call = invoker.run_streaming if streaming else invoker.run
+    task = asyncio.create_task(call(peer_invocation))
+    try:
+        await asyncio.wait_for(waiting.wait(), 1)
+        await asyncio.sleep(0.05)
+        assert not reads and not task.done()
+        with pytest.raises(RuntimeError, match="already active"):
+            await call(peer_invocation)
+        assert not drains
+        if outcome == "cancel_wait":
+            task.cancel()
+        fcntl.flock(exclusive, fcntl.LOCK_UN)
+        if outcome == "success":
+            assert await task == "complete"
+        else:
+            error = asyncio.CancelledError if outcome == "cancel_wait" else RuntimeError
+            with pytest.raises(error):
+                await task
+        assert len(reads) == (0 if outcome == "cancel_wait" else 1)
+        assert drains == [peer_invocation.peer_segment.unit_name]
+    finally:
+        os.close(exclusive)
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task

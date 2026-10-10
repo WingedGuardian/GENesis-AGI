@@ -403,7 +403,8 @@ def test_a_candidate_that_makes_a_hook_a_symlink_is_refused_even_approved(dc, dc
 
 
 def test_restore_leaves_a_hook_main_turned_into_a_symlink_to_sync(dc, dc_ready, capsys):
-    """Restoring a link would install its target PATH as the hook's bytes."""
+    """Restoring a link would install its target PATH as the hook's bytes, so a
+    linked hook is left to sync-hooks.sh, which installs what a link points at."""
     w = dc_ready
     w.candidate("feat/x", {"x.txt": "x\n"})
     assert w.add(dc, "feat/x") == 0, capsys.readouterr()
@@ -417,6 +418,132 @@ def test_restore_leaves_a_hook_main_turned_into_a_symlink_to_sync(dc, dc_ready, 
     # No sync can make a linked hook match HEAD; readiness says why, by name.
     assert w.run(dc, "rebuild") == 1
     assert "pre-commit is a symbolic link at HEAD" in capsys.readouterr().err
+
+
+def test_a_hook_replaced_by_a_directory_is_refused_even_approved(dc, dc_ready, capsys):
+    """sync-hooks.sh skips a non-file source, so the old hook would keep running
+    while the approval named something else entirely (Codex, #3027 round 5)."""
+    w = dc_ready
+    w.candidate("feat/d", {PRE_COMMIT: None, f"{PRE_COMMIT}/inner": "#!/bin/sh\nexit 0\n"})
+    assert _approve(w, dc, "feat/d") == 1
+    assert f"makes {PRE_COMMIT} a directory" in capsys.readouterr().err
+    assert not w.manifest_path.exists()
+
+
+def test_a_hook_replaced_by_a_submodule_entry_is_refused_even_approved(dc, dc_ready, capsys):
+    w = dc_ready
+    w.candidate("feat/g", {"g.only": "g\n"})
+    wt = w.tmp / "wt-feat-g"
+    w.git(wt, "rm", "-q", "--cached", PRE_COMMIT)
+    (wt / PRE_COMMIT).unlink()
+    gitlink = w.rev("HEAD", wt)
+    w.git(wt, "update-index", "--add", "--cacheinfo", f"160000,{gitlink},{PRE_COMMIT}")
+    w.git(wt, "commit", "-q", "-m", "a gitlink where the hook was")
+    assert _approve(w, dc, "feat/g") == 1
+    assert f"makes {PRE_COMMIT} a submodule" in capsys.readouterr().err
+
+
+def test_main_turning_a_hook_into_a_directory_removes_the_installed_copy(dc, dc_ready, capsys):
+    """A non-file source counts as absent: the old installed hook is removed
+    rather than left running, and readiness names the directory."""
+    w = dc_ready
+    w.candidate("feat/x", {"x.txt": "x\n"})
+    assert w.add(dc, "feat/x") == 0, capsys.readouterr()
+    w.advance_main({PRE_COMMIT: None, f"{PRE_COMMIT}/inner": "#!/bin/sh\nexit 0\n"})
+    w.run(dc, "rebuild")
+    capsys.readouterr()
+    assert not (w.root / ".git" / "hooks" / "pre-commit").exists()
+    assert w.run(dc, "rebuild") == 1
+    assert "pre-commit is a directory at HEAD" in capsys.readouterr().err
+
+
+def test_a_drop_off_live_of_a_hook_candidate_in_live_is_refused(dc, dc_ready, capsys):
+    """.git/hooks is shared: switched to main, the approved candidate's hook
+    still runs, and nothing reviewed says what should replace it off `live`
+    (this checkout could be a feature branch). The drop is sent to `live`,
+    where it restores the hook (Codex, #3063 round 1)."""
+    w = dc_ready
+    new = "#!/bin/sh\n# approved\nexit 0\n"
+    w.candidate("feat/h", {PRE_COMMIT: new})
+    assert _approve(w, dc, "feat/h") == 0
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    # Re-pinned since: `live` still holds the old head, and its hook.
+    w.candidate("feat/h", {"later.txt": "later\n"})
+    assert _approve(w, dc, "feat/h") == 0, capsys.readouterr()
+    w.git(w.root, "switch", "-q", "main")
+    assert _installed(w) == new, "switching the checkout does not touch .git/hooks"
+    capsys.readouterr()
+    assert w.run(dc, "drop", "feat/h") == 1
+    err = capsys.readouterr().err
+    assert "git switch live" in err and "Nothing changed" in err
+    assert "feat/h" in w.manifest_path.read_text(), "the refused drop changed the manifest"
+    assert _installed(w) == new
+    w.git(w.root, "switch", "-q", "live")
+    assert w.run(dc, "drop", "feat/h") == 0, capsys.readouterr()
+    assert _installed(w) == BASE_HOOK, "the drop on live left the hook installed"
+
+
+def test_a_drop_off_live_goes_through_when_live_installed_no_hook_of_it(dc, dc_ready, capsys):
+    """A candidate in `live` that changes no git hook, one `live` does not
+    hold, and one whose pinned commit no longer exists all drop off `live`."""
+    w = dc_ready
+    w.candidate("feat/x", {"x.txt": "x\n"})
+    w.candidate("feat/h", {PRE_COMMIT: "#!/bin/sh\n# approved\nexit 0\n"})
+    assert w.add(dc, "feat/x") == 0, capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    assert _approve(w, dc, "feat/h") == 0, capsys.readouterr()
+    w.git(w.root, "switch", "-q", "main")
+    assert w.run(dc, "drop", "feat/x") == 0, capsys.readouterr()
+    assert w.run(dc, "drop", "feat/h") == 0, capsys.readouterr()
+    assert _installed(w) == BASE_HOOK
+    assert _approve(w, dc, "feat/h") == 0, capsys.readouterr()
+    gone = "0123456789abcdef0123456789abcdef01234567"
+    text = w.manifest_path.read_text()
+    w.manifest_path.write_text(text.replace(w.rev("feat/h"), gone))
+    assert gone in w.manifest_path.read_text()
+    assert w.run(dc, "drop", "feat/h") == 0, capsys.readouterr()
+    assert "feat/h" not in w.manifest_path.read_text()
+
+
+def test_a_drop_off_live_goes_through_for_a_hook_sync_never_installs(dc, dc_ready, capsys):
+    """scripts/hooks also holds Claude Code hooks, run from the checkout: one
+    the sync list does not name never reaches .git/hooks, so it drops off
+    `live` like any other change."""
+    w = dc_ready
+    w.candidate("feat/cc", {"scripts/hooks/some_guard.py": "print('guard')\n"})
+    assert _approve(w, dc, "feat/cc") == 0, capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    w.git(w.root, "switch", "-q", "main")
+    assert w.run(dc, "drop", "feat/cc") == 0, capsys.readouterr()
+
+
+@pytest.mark.parametrize("name", [".", ".."])
+def test_a_sync_list_naming_the_hook_directory_itself_is_refused(dc, dc_ready, capsys, name):
+    w = dc_ready
+    sync = (w.root / "scripts" / "hooks" / "sync-hooks.sh").read_text()
+    listed = sync.replace('    "pre-merge-commit"\n', f'    "pre-merge-commit"\n    "{name}"\n', 1)
+    assert listed != sync
+    w.candidate("feat/l", {"scripts/hooks/sync-hooks.sh": listed})
+    assert _approve(w, dc, "feat/l") == 1
+    assert f"lists scripts/hooks/{name} in" in capsys.readouterr().err
+
+
+def test_a_sync_list_naming_a_non_file_source_is_refused_even_approved(dc, dc_ready, capsys):
+    """The changed paths are a regular file and the list; the directory the
+    list now names is never a changed path itself (Codex, #3063 round 1)."""
+    w = dc_ready
+    sync = (w.root / "scripts" / "hooks" / "sync-hooks.sh").read_text()
+    listed = sync.replace('    "pre-merge-commit"\n', '    "pre-merge-commit"\n    "lib"\n', 1)
+    assert listed != sync, "the fixture's sync-hooks.sh changed shape"
+    w.candidate(
+        "feat/l",
+        {"scripts/hooks/sync-hooks.sh": listed, "scripts/hooks/lib/x.py": "x = 1\n"},
+    )
+    assert _approve(w, dc, "feat/l") == 1
+    assert "lists scripts/hooks/lib in scripts/hooks/sync-hooks.sh, which is a directory" in (
+        capsys.readouterr().err
+    )
+    assert not w.manifest_path.exists()
 
 
 @pytest.mark.parametrize("hook_dir", ["scripts/hooks", ".claude/hooks"])
@@ -437,3 +564,133 @@ def test_a_candidate_that_makes_a_hook_directory_a_symlink_is_refused(
     assert f"makes {hook_dir} a symbolic link" in capsys.readouterr().err
     assert _approve(w, dc, "feat/d") == 1
     assert not w.manifest_path.exists()
+
+
+# ── a hook list the rebuilt tip holds (#3067) ──────────────────────────────
+
+
+def _listing(w, *names: str, repo=None) -> str:
+    """sync-hooks.sh with ``names`` added to HOOKS_TO_SYNC, read from ``repo``
+    (default: the checkout)."""
+    sync = ((repo or w.root) / "scripts" / "hooks" / "sync-hooks.sh").read_text()
+    extra = "".join(f'    "{n}"\n' for n in names)
+    listed = sync.replace('    "pre-merge-commit"\n', '    "pre-merge-commit"\n' + extra, 1)
+    assert listed != sync, "the fixture's sync-hooks.sh changed shape"
+    return listed
+
+
+def test_a_list_and_another_candidates_directory_are_excluded_together(dc, dc_ready, capsys):
+    """X lists `foo` (absent at X's head) and Y adds `foo/x.py` (a regular
+    leaf): each passes admission alone, and together the rebuilt `live` would
+    list a directory, which sync-hooks.sh skips and readiness then refuses on
+    every later rebuild. Both are excluded by name; status predicts it."""
+    w = dc_ready
+    w.candidate("feat/x", {"scripts/hooks/sync-hooks.sh": _listing(w, "foo")})
+    w.candidate("feat/y", {"scripts/hooks/foo/x.py": "x = 1\n"})
+    hz = w.candidate("feat/z", {"z.txt": "z\n"})
+    assert _approve(w, dc, "feat/x") == 0, capsys.readouterr()
+    assert _approve(w, dc, "feat/y") == 0, capsys.readouterr()
+    assert w.add(dc, "feat/z") == 0
+    capsys.readouterr()
+    assert w.run(dc, "status") == 0
+    predicted = capsys.readouterr().out
+    assert predicted.count("which is a directory there") == 2, predicted
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/x" in out and "EXCLUDED: feat/y" in out, out
+    assert w.live_merges() == [("feat/z", hz)]
+    # The next rebuild's readiness still passes: nothing listed is a directory.
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+
+
+def test_an_unrelated_list_edit_is_not_blamed_for_mains_listed_name(dc, dc_ready, capsys):
+    """origin/main lists `foo` with no source yet. Y adds `foo/x.py`, which makes
+    the listed name a directory: Y is excluded. Z's approved list edit adds an
+    unrelated name and stays live."""
+    w = dc_ready
+    w.advance_main({"scripts/hooks/sync-hooks.sh": _listing(w, "foo")})
+    hy = w.candidate("feat/y", {"scripts/hooks/foo/x.py": "x = 1\n"})
+    hz = w.candidate("feat/z", {"scripts/hooks/sync-hooks.sh": _listing(w, "bar", repo=w.up)})
+    assert hy
+    assert _approve(w, dc, "feat/y") == 0, capsys.readouterr()
+    assert _approve(w, dc, "feat/z") == 0, capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/y" in out and "which is a directory there (feat/y)" in out, out
+    assert "EXCLUDED: feat/z" not in out, out
+    assert w.live_merges() == [("feat/z", hz)]
+
+
+def test_a_stale_list_naming_what_main_made_a_directory_is_excluded(dc, dc_ready, capsys):
+    """X was cut before origin/main added the directory `foo/`, so its list
+    passed admission; on the rebuilt tip it names a directory main made. X
+    (the list's owner) is excluded."""
+    w = dc_ready
+    w.candidate("feat/x", {"scripts/hooks/sync-hooks.sh": _listing(w, "foo")})
+    hz = w.candidate("feat/z", {"z.txt": "z\n"})
+    assert _approve(w, dc, "feat/x") == 0, capsys.readouterr()
+    assert w.add(dc, "feat/z") == 0
+    w.advance_main({"scripts/hooks/foo/x.py": "x = 1\n"})
+    capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/x" in out and "which is a directory there (feat/x)" in out, out
+    assert w.live_merges() == [("feat/z", hz)]
+
+
+def test_a_file_and_a_directory_at_one_hook_name_conflict(dc, dc_ready, capsys):
+    """X adds a regular `foo` and lists it; Y adds `foo/x.py`. git cannot merge
+    a file and a directory at one path, so the later candidate is excluded as a
+    conflict and X goes live with its approved hook installed."""
+    w = dc_ready
+    hook = "#!/bin/sh\nexit 0\n"
+    hx = w.candidate(
+        "feat/x",
+        {"scripts/hooks/sync-hooks.sh": _listing(w, "foo"), "scripts/hooks/foo": hook},
+    )
+    w.candidate("feat/y", {"scripts/hooks/foo/x.py": "x = 1\n"})
+    assert _approve(w, dc, "feat/x") == 0, capsys.readouterr()
+    assert _approve(w, dc, "feat/y") == 0, capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/y" in out and "conflicts with" in out, out
+    assert w.live_merges() == [("feat/x", hx)]
+    assert _installed(w, "foo") == hook
+
+
+def test_an_edit_inside_a_directory_main_already_had_is_not_blamed(dc, dc_ready, capsys):
+    """origin/main adds the unlisted directory `foo/` after X was cut; X lists
+    `foo`. W edits a file in that directory: W did not make `foo` a directory,
+    so only X is excluded."""
+    w = dc_ready
+    w.candidate("feat/x", {"scripts/hooks/sync-hooks.sh": _listing(w, "foo")})
+    w.advance_main({"scripts/hooks/foo/x.py": "x = 1\n"})
+    hw = w.candidate("feat/w", {"scripts/hooks/foo/x.py": "x = 2\n"})
+    assert _approve(w, dc, "feat/x") == 0, capsys.readouterr()
+    assert _approve(w, dc, "feat/w") == 0, capsys.readouterr()
+    capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/x" in out and "which is a directory there (feat/x)" in out, out
+    assert "EXCLUDED: feat/w" not in out, out
+    assert w.live_merges() == [("feat/w", hw)]
+
+
+def test_a_list_is_judged_after_the_candidates_excluded_for_other_reasons(dc, dc_ready, capsys):
+    """Y and V both add the same `foo/x.py` (identical bytes merge cleanly), so
+    the one-owner rule excludes both. X's list names `foo`, which is absent once
+    they are gone: X goes live rather than being blamed for a directory nobody
+    keeps."""
+    w = dc_ready
+    hx = w.candidate("feat/x", {"scripts/hooks/sync-hooks.sh": _listing(w, "foo")})
+    w.candidate("feat/y", {"scripts/hooks/foo/x.py": "x = 1\n"})
+    w.candidate("feat/v", {"scripts/hooks/foo/x.py": "x = 1\n"})
+    for b in ("feat/x", "feat/y", "feat/v"):
+        assert _approve(w, dc, b) == 0, capsys.readouterr()
+    capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    out = capsys.readouterr().out
+    assert "EXCLUDED: feat/y" in out and "EXCLUDED: feat/v" in out, out
+    assert "drop all but one" in out, out
+    assert "EXCLUDED: feat/x" not in out, out
+    assert w.live_merges() == [("feat/x", hx)]

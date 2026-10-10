@@ -114,24 +114,31 @@ MANIFEST_DELTA_PY="$(cat "$SCRIPT_DIR/lib/manifest_delta.py")"
 # shared with deploy_code_only.sh so the two deploy paths cannot disagree.
 # shellcheck source=lib/deploy_checkout.sh
 . "$SCRIPT_DIR/lib/deploy_checkout.sh"
+# shellcheck source=lib/checkout_lock.sh
+. "$SCRIPT_DIR/lib/checkout_lock.sh"
+# Mutating, printing recovery helpers shared with deploy_code_only.sh.
+# shellcheck source=lib/deploy_recovery.sh
+. "$SCRIPT_DIR/lib/deploy_recovery.sh"
 
 # ── Update state file helper ────────────────────────────
 # Written at each phase boundary so crash recovery knows where we stopped.
 _write_state() {
     local phase="$1"
     mkdir -p "$HOME/.genesis"
-    cat > "$STATE_FILE" << SEOF
-{
-    "phase": "$phase",
-    "rollback_tag": "${ROLLBACK_TAG:-}",
-    "old_tag": "${OLD_TAG:-}",
-    "old_commit": "${OLD_COMMIT:-}",
-    "started_at": "$STARTED_AT",
-    "pid": $$,
-    "services_stopped": [$(printf '"%s",' "${WERE_RUNNING[@]:-}" | sed 's/,$//')],
-    "timestamp": "$(date -Iseconds)"
-}
-SEOF
+    python3 - "$STATE_FILE" "$phase" "${ROLLBACK_TAG:-}" "${ORIGINAL_BRANCH:-}" \
+        "${UPDATE_OWN_HEAD:-}" "${DEPLOY_HEAD:-}" "${OLD_TAG:-}" "${OLD_COMMIT:-}" \
+        "$STARTED_AT" "$$" "$(date -Iseconds)" "${WERE_RUNNING[@]}" <<'PY'
+import json, os, sys
+keys = ("phase", "rollback_tag", "original_branch", "own_head", "deploy_head",
+        "old_tag", "old_commit", "started_at", "pid", "timestamp")
+path, *values = sys.argv[1:]
+state = dict(zip(keys, values))
+state["pid"] = int(state["pid"])
+state["services_stopped"] = values[len(keys):]
+with open(path + ".tmp", "w", encoding="utf-8") as f:
+    json.dump(state, f, indent=4)
+os.replace(path + ".tmp", path)
+PY
 }
 
 # Clear this run's deploy state files. The state file is ours (we wrote it) so
@@ -878,15 +885,6 @@ fi
 # into the armed rollback trap. The clear before the merge discards a file's edits
 # only when a backup of its CURRENT content exists (see the clear loop).
 # BEGIN ephemeral-prestop-backup (extracted by tests/test_scripts/test_update_activation.py)
-EPHEMERAL_CLEAR_PATHS=(AGENTS.md config/procedure_triggers.yaml)
-EPHEMERAL_BACKUP_ROOT="$HOME/.genesis/premerge-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
-
-# Tracked AND different from HEAD in the index or the worktree.
-_ephemeral_is_dirty() {
-    git -C "$GENESIS_ROOT" ls-files --error-unmatch "$1" &>/dev/null \
-        && ! git -C "$GENESIS_ROOT" diff --quiet HEAD -- "$1" 2>/dev/null
-}
-
 # Must <path>'s local edit be cleared for the merge of $DEPLOY_HEAD? git merges
 # straight past an UNSTAGED edit to a file the incoming range does not touch, and
 # keeps the edit — it refuses only when the range DOES touch it. A STAGED edit is
@@ -899,103 +897,6 @@ _ephemeral_merge_touches() {
     git -C "$GENESIS_ROOT" diff --cached --quiet HEAD -- "$1" 2>/dev/null || return 0
     mb="$(git -C "$GENESIS_ROOT" merge-base HEAD "$DEPLOY_HEAD" 2>/dev/null)" || return 0
     ! git -C "$GENESIS_ROOT" diff --quiet "$mb" "$DEPLOY_HEAD" -- "$1" 2>/dev/null
-}
-
-# Save <path>'s local edits under <dest-root>/<path>/: the worktree and index
-# patches against HEAD, plus a copy of the file. Returns non-zero on ANY failure.
-_ephemeral_backup() {
-    local p="$1" dest="$2/$1"
-    mkdir -p "$dest" && chmod 700 "$2" "$dest" \
-        && git -C "$GENESIS_ROOT" diff --binary HEAD -- "$p" > "$dest/worktree.patch" \
-        && git -C "$GENESIS_ROOT" diff --binary --cached HEAD -- "$p" > "$dest/index.patch" \
-        && { [ ! -e "$GENESIS_ROOT/$p" ] || cp -p "$GENESIS_ROOT/$p" "$dest/current"; }
-}
-
-# Does the backup under <dest-root> still describe <path>'s edits exactly?
-_ephemeral_backup_is_current() {
-    local p="$1" dest="$2/$1"
-    [ -f "$dest/worktree.patch" ] && [ -f "$dest/index.patch" ] \
-        && cmp -s "$dest/worktree.patch" <(git -C "$GENESIS_ROOT" diff --binary HEAD -- "$p") \
-        && cmp -s "$dest/index.patch" <(git -C "$GENESIS_ROOT" diff --binary --cached HEAD -- "$p")
-}
-
-# Called by _do_rollback before its checkout, which may clear an ephemeral file's
-# edit first (_ephemeral_clear_before_reset). The pre-stop backup can be missing (a
-# --post-merge run takes none) or stale (an indexer rewrote AGENTS.md after it), so
-# each dirty ephemeral file whose CURRENT edits are not already saved is backed up
-# under <root>/rollback. Never fails: a failed backup is named, not fatal, and the
-# edit is then not cleared (the clear needs a current backup).
-_ephemeral_backup_before_reset() {
-    local root="$1" p
-    for p in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
-        _ephemeral_is_dirty "$p" || continue
-        if _ephemeral_backup_is_current "$p" "$root" \
-            || _ephemeral_backup_is_current "$p" "$root/late"; then
-            continue
-        fi
-        if _ephemeral_backup "$p" "$root/rollback"; then
-            echo "  Backed up local edits to $p before the rollback: $root/rollback/$p"
-        else
-            echo "  WARNING: could not back up local edits to $p before the rollback; they are left in place, and the rollback refuses if this update changed $p."
-        fi
-    done
-    return 0
-}
-
-# The rollback undoes this run's merge by switching the branch the run started on
-# back to the rollback tag with a NON-forced checkout:
-#     git checkout -q --no-overwrite-ignore -B "$ORIGINAL_BRANCH" "$ROLLBACK_TAG"
-# Not `reset --hard`, which discards every edit, and not `reset --keep`, which
-# overwrites ignored files and rewrites the index (both measured): another session
-# can edit the checkout after the merge, and those edits are nobody's to throw
-# away. The
-# checkout is a two-way switch from HEAD to the tag, measured on git 2.43:
-#   - it rewrites only the paths that differ between HEAD and the tag; every other
-#     path keeps its edits in place, and the index keeps its staged state (a staged
-#     change, a staged new file, content that exists in the index alone);
-#   - it refuses, rc 1, moving nothing (HEAD, the branch, the index and every file
-#     as they were), when a path it writes carries a local change: staged or
-#     unstaged, behind assume-unchanged or skip-worktree, a mode or type change;
-#   - with --no-overwrite-ignore it refuses the same way over an untracked or
-#     IGNORED file where it writes, an ignored file inside a directory it would
-#     replace with a file, an ignored symlink where it needs a directory, and an
-#     untracked nested repository where it writes a file. `reset --keep`
-#     overwrites or deletes the ignored ones without asking.
-# git checks each path and writes it inside that one command, so an edit or an
-# ignored file that appears at any moment before it is kept or makes it refuse;
-# no separate scan runs earlier that could go stale. What remains is the window
-# inside the checkout itself, which checks every path it will write and then
-# writes them all: a change landing during that write phase is not seen. A
-# refusal leaves the merged code,
-# the edit and the migrated database in place for a person to sort out: a
-# rollback left undone is recoverable, a lost edit is not.
-#
-# Handled before the checkout:
-#   - a SUBMODULE (gitlink) changed by the range refuses the rollback: files inside
-#     a submodule are outside every check git makes here, and a gitlink-to-file
-#     switch replaced a submodule's modified and untracked files (measured, for
-#     `reset --keep` and for this checkout alike);
-#   - the ephemeral files an indexer rewrites would make every rollback over them
-#     refuse, so an edit the range touches is cleared once a current backup of it
-#     exists (_ephemeral_clear_before_reset), exactly as before the merge.
-
-# Clear an ephemeral file's local edit before the rollback's checkout, but only when
-# the checkout would otherwise refuse over it (the range HEAD..tag touches it) AND a
-# current backup of exactly that edit exists. Anything else is left for the checkout
-# to judge.
-_ephemeral_clear_before_reset() {
-    local root="$1" p
-    for p in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
-        _ephemeral_is_dirty "$p" || continue
-        git -C "$GENESIS_ROOT" diff --quiet HEAD "$ROLLBACK_TAG" -- "$p" 2>/dev/null && continue
-        if _ephemeral_backup_is_current "$p" "$root" \
-            || _ephemeral_backup_is_current "$p" "$root/late" \
-            || _ephemeral_backup_is_current "$p" "$root/rollback"; then
-            git -C "$GENESIS_ROOT" checkout -q HEAD -- "$p" 2>&1 \
-                || echo "  WARNING: could not clear the backed-up edit to $p; the rollback will refuse over it."
-        fi
-    done
-    return 0
 }
 
 if [[ "$POST_MERGE" == "false" ]]; then
@@ -1102,8 +1003,14 @@ _start_genesis_server() {
     # update.sh, and an inherited lock FD would keep the advisory lock held after
     # we exit — deadlocking every future update until this degraded server dies.
     # (systemd-started servers don't inherit our FDs; only this nohup path does.)
-    nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
-        {_UPDATE_LOCK_FD}>&- >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
+    # The checkout-lock FD too, closed in the child's own subshell: it is unset
+    # when the lock is not held, and a `{var}>&-` on an unset name fails the
+    # command. The subshell execs, so $! is the server's pid.
+    (
+        if [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ]; then exec {GENESIS_CHECKOUT_LOCK_FD}>&-; fi
+        exec nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
+            {_UPDATE_LOCK_FD}>&-
+    ) >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
     # No unit tracks this process, so the no-change path's health probe waits on
     # this pid instead of the unit's state.
     _SERVER_DIRECT_PID=$!
@@ -1139,6 +1046,17 @@ if [ -f "$DB_FILE" ]; then
         _snapshot_check=$(sqlite3 "$DB_FILE.pre-update" "PRAGMA quick_check;" 2>&1) || _snapshot_check=""
         if [ "$_snapshot_check" = "ok" ]; then
             echo "  DB snapshot: $DB_FILE.pre-update (verified)"
+            # Prepare the rollback authority boundary while this helper still
+            # exists, before stopping services or rolling code back. Retain the
+            # original snapshot for forensic recovery; never consume stale work.
+            rm -f "$DB_FILE.pre-update.peer-restore" "$DB_FILE.pre-update.peer-restore-wal" \
+                "$DB_FILE.pre-update.peer-restore-shm" "$DB_FILE.pre-update.peer-restore-journal"
+            if ! cp "$DB_FILE.pre-update" "$DB_FILE.pre-update.peer-restore" \
+                || ! PYTHONPATH="$GENESIS_ROOT/src" python3 -m genesis.db.crud.peer_restore \
+                    "$DB_FILE.pre-update.peer-restore"; then
+                echo "  DATABASE RESTORE AUTHORITY CHECK FAILED — UPDATE ABORTED" >&2
+                exit 1
+            fi
             DB_SNAPSHOT_TAKEN=1
         else
             echo "  DATABASE SNAPSHOT FAILED VERIFICATION — UPDATE ABORTED" >&2
@@ -1501,6 +1419,11 @@ _do_rollback() {
         server_down=false
     fi
     systemctl --user stop genesis-bridge 2>/dev/null || true
+    if [ "${_CHECKOUT_LOCK_BUSY:-0}" != "1" ]; then
+        if ! genesis_checkout_lock "$GENESIS_ROOT"; then
+            echo "  WARNING: checkout lock busy during rollback; the checkout will be left as it is" >&2
+        fi
+    fi
 
     # What the code rollback may touch is decided from the checkout as it is NOW,
     # by exact commit identity: another session may have switched the branch,
@@ -1536,6 +1459,14 @@ _do_rollback() {
     elif [ -n "$rb_commit" ] && [ "$own_head" = "$rb_commit" ]; then
         code_action=untouched
     fi
+    # Without the checkout lock a Claude launch may be reading the tree, so
+    # nothing here changes it: no switch back, no reset, no merge abort.
+    # GENESIS_CHECKOUT_LOCK_FD is set only while the lock is held.
+    local rollback_locked=true
+    [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ] || rollback_locked=false
+    if [ "$rollback_locked" != "true" ] && [ "$code_action" != "none" ]; then
+        code_action=locked_out
+    fi
     # Someone SWITCHED branches (rather than committing on ours): if our branch
     # still points where this run left it and nothing uncommitted is in the way,
     # switch back with a NON-forced checkout. git refuses rather than overwrite a
@@ -1549,7 +1480,7 @@ _do_rollback() {
         ob_tip="$(git -C "$GENESIS_ROOT" rev-parse -q --verify "refs/heads/$ORIGINAL_BRANCH^{commit}" 2>/dev/null || true)"
         if { [ "$ob_tip" = "$rb_commit" ] || [ "$ob_tip" = "$own_head" ]; } \
             && left="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")" && [ -z "$left" ] \
-            && git -C "$GENESIS_ROOT" checkout -q --no-overwrite-ignore "$ORIGINAL_BRANCH" 2>&1; then
+            && genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout -q --no-overwrite-ignore "$ORIGINAL_BRANCH" 2>&1; then
             echo "  The checkout had been switched to ${_now_branch:-a detached HEAD}; switched back to $ORIGINAL_BRANCH (that branch keeps its commits)."
             if genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$ORIGINAL_BRANCH"; then
                 code_action=none
@@ -1564,8 +1495,12 @@ _do_rollback() {
         none)
             echo "  The checkout is still at $ROLLBACK_TAG on $ORIGINAL_BRANCH: no code to roll back."
             if [ "${MERGE_ATTEMPTED:-0}" = "1" ]; then
-                if git -C "$GENESIS_ROOT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
-                    if ! git -C "$GENESIS_ROOT" merge --abort 2>&1; then
+                if git -C "$GENESIS_ROOT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 \
+                    && [ "$rollback_locked" != "true" ]; then
+                    echo "  CRITICAL: an interrupted merge is in progress, and without the checkout lock it is left for you to abort."
+                    checkout_ok=false
+                elif git -C "$GENESIS_ROOT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+                    if ! genesis_without_checkout_lock git -C "$GENESIS_ROOT" merge --abort 2>&1; then
                         echo "  CRITICAL: an interrupted merge is in progress and could not be aborted."
                         checkout_ok=false
                     fi
@@ -1581,72 +1516,17 @@ _do_rollback() {
             checkout_ok=false
             ;;
         reset)
-            # Undo this run's merge: switch $ORIGINAL_BRANCH back to the rollback
-            # tag with a NON-forced checkout (the comment above
-            # _ephemeral_clear_before_reset has the measured behaviour). First the
-            # ephemeral files' current edits are saved when no backup of them
-            # exists yet; the clear below discards one only with such a backup.
-            # (The helper is defined with the pre-stop backup; this function is
-            # only reached after it.)
-            if declare -F _ephemeral_backup_before_reset >/dev/null; then
-                _ephemeral_backup_before_reset "$EPHEMERAL_BACKUP_ROOT"
-            else
-                echo "  WARNING: the ephemeral-file backup helper is not defined; an ephemeral edit this update changed makes the rollback refuse."
-            fi
-            # A submodule (gitlink, mode 160000) on either side of the range refuses
-            # the rollback: the files inside it are outside every check git makes
-            # here. The listing is captured before it is read, so a git failure
-            # refuses too rather than reading as "no submodule". It is plumbing
-            # (diff-tree), not `git diff`, because porcelain honours
-            # diff.ignoreSubmodules and a .gitmodules `ignore = all`, which drop
-            # gitlink lines from the listing (measured, git 2.43).
-            local rb_raw="" rb_line="" rb_gitlinks="" rb_mode_re='^:([0-7]+) ([0-7]+) '
-            if ! rb_raw="$(git -C "$GENESIS_ROOT" diff-tree -r --raw --no-renames --no-abbrev HEAD "$ROLLBACK_TAG" 2>/dev/null)"; then
-                echo "  CRITICAL: cannot list what the rollback to $ROLLBACK_TAG changes, so the merge was NOT rolled back."
+            # The measured non-forced rollback checkout lives in
+            # scripts/lib/deploy_recovery.sh (genesis_rollback_checkout).
+            if ! genesis_rollback_checkout "$GENESIS_ROOT" "$ROLLBACK_TAG" "$ORIGINAL_BRANCH" "$EPHEMERAL_BACKUP_ROOT" "$rb_commit"; then
                 checkout_ok=false
                 code_kept=true
-            else
-                while IFS= read -r rb_line; do
-                    if [[ "$rb_line" =~ $rb_mode_re ]] \
-                        && { [ "${BASH_REMATCH[1]}" = 160000 ] || [ "${BASH_REMATCH[2]}" = 160000 ]; }; then
-                        rb_gitlinks+="${rb_line#*$'\t'}"$'\n'
-                    fi
-                done <<< "$rb_raw"
-                if [ -n "$rb_gitlinks" ]; then
-                    echo "  CRITICAL: the rollback to $ROLLBACK_TAG would change a submodule, whose files git does not check before replacing them, so the merge was NOT rolled back:"
-                    printf '%s' "$rb_gitlinks" | sed 's/^/    submodule: /'
-                    checkout_ok=false
-                    code_kept=true
-                fi
             fi
-            if [ "$code_kept" != "true" ]; then
-                if declare -F _ephemeral_clear_before_reset >/dev/null; then
-                    _ephemeral_clear_before_reset "$EPHEMERAL_BACKUP_ROOT" || true
-                fi
-                # The checkout refreshes the index itself (measured, git 2.43); this
-                # refresh is kept so a file rewritten with identical bytes (an
-                # indexer, a touch) can never read as a local change. It updates
-                # only cached stat data: a real edit, assume-unchanged included,
-                # still refuses.
-                git -C "$GENESIS_ROOT" update-index -q --refresh >/dev/null 2>&1 || true
-                # -B names the branch: it is $ORIGINAL_BRANCH that is moved back,
-                # never whatever branch HEAD may have been switched to since the
-                # check above (a reset moves HEAD's branch). A refusal (rc 1) moves
-                # nothing: HEAD, the branch, the index and every file stay as they
-                # were.
-                # Hooks are switched off: checkout runs post-checkout AFTER it has
-                # moved HEAD and the files, and returns the hook's exit status, so
-                # a failing hook would report a completed rollback as refused and
-                # keep the migrated database under the old code. Whatever the exit
-                # status, the rollback counts as done when HEAD is the tag on
-                # $ORIGINAL_BRANCH, the same test the restart below uses.
-                if ! git -C "$GENESIS_ROOT" -c core.hooksPath=/dev/null checkout -q --no-overwrite-ignore -B "$ORIGINAL_BRANCH" "$ROLLBACK_TAG" 2>&1 \
-                    && ! genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$ORIGINAL_BRANCH"; then
-                    echo "  CRITICAL: git refused to switch $ORIGINAL_BRANCH back to $ROLLBACK_TAG (its reason is above: usually a local change to a file this update changed, or an untracked or ignored file where the rollback writes, each kept as it is; or another git operation in progress), so the merge was NOT rolled back."
-                    checkout_ok=false
-                    code_kept=true
-                fi
-            fi
+            ;;
+        locked_out)
+            echo "  CRITICAL: the checkout lock could not be taken (a Claude launch holds genesis-checkout.lock), so the code was NOT rolled back: the checkout is left as found (${_now_branch:-a detached HEAD} at ${_now_head:0:12}). This update's merge is ${own_head:0:12}; the pre-update state is $ROLLBACK_TAG."
+            checkout_ok=false
+            code_kept=true
             ;;
         *)
             echo "  CRITICAL: the checkout moved after this update merged (now ${_now_branch:-a detached HEAD} at ${_now_head:0:12}); expected $ORIGINAL_BRANCH at ${own_head:0:12}."
@@ -1712,7 +1592,7 @@ _do_rollback() {
             # but recoverable) and flag for manual intervention.
             echo "  WARNING: server not confirmed down — SKIPPING DB restore (won't overwrite a live DB)."
             db_ok=false
-        elif cp "$DB_FILE.pre-update" "$DB_FILE" 2>&1 \
+        elif cp "$DB_FILE.pre-update.peer-restore" "$DB_FILE" 2>&1 \
             && rm -f "$DB_FILE-wal" "$DB_FILE-shm"; then
             # Drop the stale WAL/SHM: they hold the MIGRATED changes, and SQLite
             # would replay them over the restored old DB on reopen, resurrecting
@@ -1733,9 +1613,10 @@ _do_rollback() {
     # on disk so the restart below uses a consistent unit.
     systemctl --user daemon-reload 2>/dev/null || true
 
-    # Restart services with old code — only when the guard above verified it IS
-    # the old code.
-    if [ "$restart_ok" = "true" ]; then
+    # Restart only when both old code and its database were restored. External
+    # watchdog recovery remains separate; this rollback cannot certify a failure.
+    genesis_checkout_unlock
+    if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then
         for svc in "${WERE_RUNNING[@]}"; do
             if [ "$svc" = "genesis-server" ]; then
                 _start_genesis_server || echo "  CRITICAL: failed to restart genesis-server"
@@ -1745,7 +1626,7 @@ _do_rollback() {
             fi
         done
     elif [ "${#WERE_RUNNING[@]}" -gt 0 ]; then
-        echo "  NOT restarted: ${WERE_RUNNING[*]}. Put the checkout back on the pre-update code (or finish the other session's work), then start them."
+        echo "  NOT restarted: ${WERE_RUNNING[*]}. Verify the checkout and database recovery before starting them."
     fi
 
     if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ]; then
@@ -1879,6 +1760,11 @@ _checkout_unmoved_or_roll_back() {
 }
 _checkout_unmoved_or_roll_back
 # END checkout-unmoved
+if ! genesis_checkout_lock "$GENESIS_ROOT"; then
+    _CHECKOUT_LOCK_BUSY=1
+    _do_rollback "checkout lock busy: a Claude launch holds genesis-checkout.lock"
+    exit 1
+fi
 
 # Clear local edits to known-ephemeral tracked files (EPHEMERAL_DIRTY_RE) before
 # merging. They are rewritten in place at runtime and regenerate themselves
@@ -1898,7 +1784,7 @@ if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$SETTINGS_LOCAL" &>/dev/null
    && [ -f "$GENESIS_ROOT/$SETTINGS_LOCAL" ]; then
     mkdir -p "$HOME/.genesis"
     cp "$GENESIS_ROOT/$SETTINGS_LOCAL" "$SETTINGS_LOCAL_BAK"
-    git -C "$GENESIS_ROOT" checkout HEAD -- "$SETTINGS_LOCAL" 2>/dev/null \
+    genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$SETTINGS_LOCAL" 2>/dev/null \
         && echo "  (backed up live $SETTINGS_LOCAL; cleared local edits pre-merge)"
 fi
 # END settings-local-premerge
@@ -1916,7 +1802,7 @@ if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$SERENA_YML" &>/dev/null \
    && [ -f "$GENESIS_ROOT/$SERENA_YML" ]; then
     mkdir -p "$HOME/.genesis"
     cp "$GENESIS_ROOT/$SERENA_YML" "$SERENA_YML_BAK"
-    git -C "$GENESIS_ROOT" checkout HEAD -- "$SERENA_YML" 2>/dev/null \
+    genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$SERENA_YML" 2>/dev/null \
         && echo "  (backed up live $SERENA_YML; cleared local edits pre-merge)"
 fi
 # END serena-yml-premerge
@@ -1935,7 +1821,7 @@ if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$USER_MD" &>/dev/null \
    && [ -f "$GENESIS_ROOT/$USER_MD" ]; then
     mkdir -p "$HOME/.genesis"
     cp "$GENESIS_ROOT/$USER_MD" "$USER_MD_BAK"
-    git -C "$GENESIS_ROOT" checkout HEAD -- "$USER_MD" 2>/dev/null \
+    genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$USER_MD" 2>/dev/null \
         && echo "  (backed up live $USER_MD; cleared local edits pre-merge)"
 fi
 # END user-md-premerge
@@ -1961,7 +1847,7 @@ for _eph in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
     # `checkout HEAD --` (not `checkout --`) restores BOTH index and worktree
     # from HEAD, so a staged edit is cleared too — `checkout --` alone would
     # leave a staged change and the merge would still abort.
-    if git -C "$GENESIS_ROOT" checkout HEAD -- "$_eph" 2>/dev/null; then
+    if genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$_eph" 2>/dev/null; then
         echo "  (cleared local edits to ephemeral $_eph before merge; backup under $EPHEMERAL_BACKUP_ROOT)"
     fi
 done
@@ -2006,7 +1892,7 @@ MERGE_RC=0
 # naming git's message. (A true 3-way merge ignores the flag, which is why the
 # pre-stop collision scan above exists.)
 MERGE_ATTEMPTED=1
-MERGE_OUTPUT=$(git -C "$GENESIS_ROOT" merge --no-overwrite-ignore "$DEPLOY_HEAD" --no-edit 2>&1) || MERGE_RC=$?
+MERGE_OUTPUT=$(genesis_without_checkout_lock git -C "$GENESIS_ROOT" merge --no-overwrite-ignore "$DEPLOY_HEAD" --no-edit 2>&1) || MERGE_RC=$?
 
 if [[ $MERGE_RC -ne 0 ]]; then
     # Check if this is a merge conflict (unmerged paths) vs other error
@@ -2064,7 +1950,7 @@ PYEOF
         # Abort the merge — don't leave the working tree in a broken state.
         # CC will resolve conflicts in a worktree, not in the main checkout.
         echo "  Aborting merge to keep working tree clean..."
-        git -C "$GENESIS_ROOT" merge --abort 2>/dev/null || true
+        genesis_without_checkout_lock git -C "$GENESIS_ROOT" merge --abort 2>/dev/null || true
 
         # Restart services with original code so the system stays operational
         echo "  Restarting services with pre-update code..."
@@ -2105,6 +1991,11 @@ if [ -n "$_merged_head" ] && { [ "$_merged_head" = "$DEPLOY_HEAD" ] \
     || [ "$_merged_head" = "$VALIDATED_HEAD" ] \
     || [ "$_merged_parents" = "$VALIDATED_HEAD $DEPLOY_HEAD " ]; }; then
     UPDATE_OWN_HEAD="$_merged_head"
+    # Record the adopted head at once. The "merging" state was written before
+    # the merge, naming the pre-update commit; if this run dies now, bootstrap's
+    # crash recovery acts only on the exact head recorded here and does not
+    # guess whether the checkout is this update's merge.
+    _write_state "merging"
 fi
 
 # A merge that reported success must have brought the pinned head in, on the
@@ -2124,6 +2015,7 @@ if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_HEAD" HEAD 2>/dev/
     exit 1
 fi
 
+genesis_checkout_unlock
 NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
 NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 

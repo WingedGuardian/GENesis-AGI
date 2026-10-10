@@ -62,3 +62,5 @@ and populated descendants raise; the coordinator must retain/reconcile capacity.
 Runtime probes use scratch scopes and local provider fixtures. They do not stop
 the production server or prove live peer enrollment, authority grants or broker
 drain; those require their own dependent acceptance tests.
+
+Launch reconciliation with checkout mutation: both public run paths register in flight, claim peer invocation ownership, then acquire checkout admission before roster and preflight reads. Admission is released on spawn or early failure before peer cleanup. Peer ownership and the in-flight unit remain active through descendant-aware drain. This preserves the ordinary checkout-launch fence while peer execution remains opt-in.
