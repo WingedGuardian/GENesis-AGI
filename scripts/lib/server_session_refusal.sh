@@ -95,7 +95,7 @@ _refuse_if_sessions() {
     fi
     work=""
     tok_file="$(_server_genesis_home "$main")/internal_api_token"
-    if ! python3 -c "$_PORT_PROBE_PY" "$INFLIGHT_PORT" "$main" 2>/dev/null; then
+    if ! python3 -I -S -c "$_PORT_PROBE_PY" "$INFLIGHT_PORT" "$main" 2>/dev/null; then
         # Whatever answers on the port must BE the server before it is handed the
         # token or believed: another listener could take the token, or answer 404
         # and pass for a server that predates the report.

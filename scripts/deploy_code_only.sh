@@ -17,7 +17,10 @@
 #            tree applies by itself (Claude Code hooks, docs), or to stage code
 #            for a later restart. Any range is accepted: the report names every
 #            change the running server has not loaded, and the next step.
-#   restart  restart genesis-server on the tree as it stands; no fetch.
+#   restart  restart genesis-server on the tree as it stands; no fetch. The one
+#            mode that runs on `live`, the integration branch
+#            scripts/deploy_candidates builds from the deploy manifest; deploy and
+#            pull refuse there and name the rebuild instead.
 #   status   read-only, takes no lock: the commit the server booted from, HEAD,
 #            the server's MainPID and invocation, and what runs beside the commit
 #            (runtime-edits, runtime-overrides), and the validation bracket's
@@ -36,8 +39,9 @@
 #   the update.lock, EXCLUSIVE and QUEUING (update.sh keeps `flock -n`, so it
 #     REFUSES while a validation holds the lock shared);
 #   refusals BEFORE anything changes: a linked worktree, an unfinished update.sh
-#     run, a branch other than main, a dirty tree, a unit that runs a different
-#     venv or from a different directory, a live foreign deploy marker, and a
+#     run, a branch other than main (restart also accepts `live` when the deploy
+#     manifest names this repository; a manifest it cannot read refuses), a
+#     dirty tree, a unit that runs a different venv or from a different directory, a live foreign deploy marker, and a
 #     venv that does not match the pyproject.toml being deployed (that one needs
 #     update.sh, which reinstalls). deploy and restart also refuse untracked
 #     files under src/, config/ or pyproject.toml, and a server running outside
@@ -57,7 +61,7 @@
 #     returns (a chat turn saving and delivering its reply, for one: #2917).
 #     A server that is not running has no sessions to end. Just
 #     before the restart, four of these are checked again (HEAD must be the
-#     exact commit this run checked, on main; no tracked change; no untracked
+#     exact commit this run checked, on the branch it checked; no tracked change; no untracked
 #     runtime file; no server outside the unit). If one fails while the server
 #     is untouched, it is a refusal. If deploy has already stopped the server,
 #     it is restarted on the tree as it stands, health-checked, and the run ends
@@ -190,6 +194,11 @@ _SELF_DIR="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # deploy_marker.sh's EPHEMERAL_DIRTY_RE, sourced above).
 # shellcheck source=lib/deploy_checkout.sh
 . "$_SELF_DIR/lib/deploy_checkout.sh"
+# shellcheck source=lib/checkout_lock.sh
+. "$_SELF_DIR/lib/checkout_lock.sh"
+# Mutating, printing recovery helpers shared with update.sh.
+# shellcheck source=lib/deploy_recovery.sh
+. "$_SELF_DIR/lib/deploy_recovery.sh"
 # shellcheck source=lib/server_session_refusal.sh
 . "$_SELF_DIR/lib/server_session_refusal.sh"
 # The helpers that run AFTER the merge are read now, like the libs above: the
@@ -200,6 +209,8 @@ _SELF_DIR="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 _PORT_PROBE_PY="$(cat "${GENESIS_DEPLOY_PORT_PROBE:-$_SELF_DIR/lib/port_owned_by.py}")"
 _MANIFEST_DELTA_PY="$(cat "$_SELF_DIR/lib/manifest_delta.py")"
 _SERVING_COMMIT_PY="$(cat "$_SELF_DIR/lib/serving_commit.py")"
+# Read for genesis_live_checkout (deploy_checkout.sh), which runs this copy.
+_LIVE_CHECKOUT_PY="$(cat "$_SELF_DIR/lib/live_checkout.py")"
 
 # Kept whole for the status hand-over below (the parse consumes "$@").
 _ORIG_ARGS=("$@")
@@ -357,16 +368,35 @@ trap 'exit 143' TERM
 # finished one behind, and the watchdog's reader already treats it as over. Under
 # the exclusive lock no update.sh can be running. Anything unreadable refuses.
 if [ -e "$UPDATE_STATE_FILE" ]; then
-    _state_phase="$(python3 -c 'import json, sys
+    _state_phase="$(python3 -I -S -c 'import json, sys
 d = json.load(open(sys.argv[1]))
 p = d.get("phase") if isinstance(d, dict) else None
 print(p if isinstance(p, str) else "")' "$UPDATE_STATE_FILE" 2>/dev/null || true)"
     [ "$_state_phase" = "done" ] \
         || die "$UPDATE_STATE_FILE records an unfinished update.sh run; finish it with scripts/update.sh --post-merge."
 fi
-# No override here: GENESIS_ALLOW_NON_DEPLOY_BRANCH is update.sh's alone.
-genesis_deploy_branch_ok "$GENESIS_ROOT" \
-    || die "$GENESIS_ROOT is on '${_branch:-a detached HEAD}', not $DEPLOY_BRANCH."
+# `live`, the integration branch scripts/deploy_candidates builds from the deploy
+# manifest, is never pulled into: a fast-forward from upstream would drop every
+# candidate. restart runs on it as it stands; the rebuild moves it (#2978).
+_live_rc=0
+genesis_live_checkout "$GENESIS_ROOT" || _live_rc=$?
+case "$_live_rc" in
+    0)
+        [ "$MODE" = restart ] \
+            || die "$GENESIS_ROOT is on live, which the deploy manifest builds, and a $MODE would pull into it. Run scripts/deploy_candidates rebuild, then scripts/deploy_code_only.sh restart."
+        # Spelled as _checkout_unmoved reads it before the restart (`--short`,
+        # which prints heads/live when a tag shares the name).
+        _branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD || true)"
+        ;;
+    1)
+        # No override here: GENESIS_ALLOW_NON_DEPLOY_BRANCH is update.sh's alone.
+        genesis_deploy_branch_ok "$GENESIS_ROOT" \
+            || die "$GENESIS_ROOT is on '${_branch:-a detached HEAD}', not $DEPLOY_BRANCH."
+        ;;
+    *)
+        die "cannot tell whether $GENESIS_ROOT is on the live branch the deploy manifest builds (the manifest or git could not be read). Nothing was deployed."
+        ;;
+esac
 # Unreadable refuses (see genesis_tracked_dirty_paths for why it is read apart).
 _dirty="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")" \
     || die "cannot read the working tree's status — nothing was deployed."
@@ -422,7 +452,7 @@ fi
 # cannot fix: this interpreter is older than the incoming requires-python.
 _deps_ok() {
     local what="$1" remedy="$2" out rc=0
-    out="$("$VENV_DIR/bin/python" "$_SELF_DIR/lib/venv_matches_pyproject.py" "$GENESIS_ROOT" 2>&1)" || rc=$?
+    out="$("$VENV_DIR/bin/python" -P "$_SELF_DIR/lib/venv_matches_pyproject.py" "$GENESIS_ROOT" 2>&1)" || rc=$?
     case "$rc" in
         0) return 0 ;;
         3) echo "ERROR: $what needs a newer Python than this venv runs, and a reinstall cannot change that:" >&2 ;;
@@ -438,7 +468,7 @@ _deps_ok() {
 _deploy_health_paths() {
     local name="$1" ref="$2" src
     src="$(git -C "$GENESIS_ROOT" show "$ref:src/genesis/observability/snapshots/deploy_health.py" 2>/dev/null)" || return 0
-    DH_SRC="$src" "$VENV_DIR/bin/python" -c '
+    DH_SRC="$src" "$VENV_DIR/bin/python" -I -S -c '
 import ast, os, sys
 for node in ast.parse(os.environ["DH_SRC"]).body:
     if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == sys.argv[1] for t in node.targets):
@@ -663,6 +693,9 @@ _pull() {
     # needs neither the stop nor the restart, but only if HEAD has held no other
     # runtime files since the boot: a module the server imported from a pulled
     # tree stays loaded after a later commit restores the files.
+    if ! genesis_checkout_lock "$GENESIS_ROOT"; then
+        die "checkout busy (a Claude launch holds genesis-checkout.lock); nothing changed"
+    fi
     if [ "$MODE" = deploy ]; then
         _read_baseline
         if [ -n "$SERVING" ] && _runtime_held "$_upstream"; then
@@ -697,7 +730,7 @@ _pull() {
     _PHASE="merging"
     for _f in "${_reset[@]}"; do
         echo "  Resetting $_f to HEAD for the merge: its local edit is dropped (it regenerates)."
-        git -C "$GENESIS_ROOT" checkout HEAD -- "$_f"
+        genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$_f"
         _RESET_NOTE="$_RESET_NOTE $_f"
     done
     # Safe for this script to merge the tree it runs from: git REPLACES a changed
@@ -712,7 +745,7 @@ _pull() {
     # a file written between that scan and this merge (the server, another
     # session) would be lost; with the flag git refuses it too, at the merge
     # itself, leaving HEAD and the tree as they were (measured, git 2.43).
-    if ! git -c gc.autoDetach=false -C "$GENESIS_ROOT" merge --ff-only --no-overwrite-ignore -q "$_upstream" {_UPDATE_LOCK_FD}>&-; then
+    if ! genesis_without_checkout_lock git -c gc.autoDetach=false -C "$GENESIS_ROOT" merge --ff-only --no-overwrite-ignore -q "$_upstream" {_UPDATE_LOCK_FD}>&-; then
         _status_after="$(_status_outside_resets)" || _status_after="unreadable after"
         if [ "$(git -C "$GENESIS_ROOT" rev-parse HEAD 2>/dev/null)" = "$_head" ] \
             && [ "$_status_after" = "$_status_before" ]; then
@@ -720,6 +753,7 @@ _pull() {
             # same tree; only if that fails does the exit still alert.
             if [ -n "$_STOPPED" ]; then
                 echo "  Starting genesis-server again on the unchanged tree…"
+                genesis_checkout_unlock
                 systemctl --user start genesis-server {_UPDATE_LOCK_FD}>&- && _STOPPED=""
             fi
             [ -n "$_STOPPED" ] || _PHASE="checks"
@@ -728,6 +762,7 @@ _pull() {
         exit 1
     fi
     _PHASE="merged"
+    genesis_checkout_unlock
     _CHECKED="$_upstream"
     echo "  Merged $_head..$_upstream"
 }
@@ -838,7 +873,7 @@ _restarted_unit_serving() {
     else
         [ "$pid" != "$_SERVER_PID_BEFORE" ] || return 1
     fi
-    python3 -c "$_PORT_PROBE_PY" "$_HEALTH_PORT" "$pid" 2>/dev/null || return 1
+    python3 -I -S -c "$_PORT_PROBE_PY" "$_HEALTH_PORT" "$pid" 2>/dev/null || return 1
     printf '%s\n' "$pid"
 }
 
@@ -915,7 +950,7 @@ if [ "$_healthy" = true ]; then
     # an otherwise-good deploy is not failed over one non-critical subsystem, but
     # the regression is surfaced rather than swallowed.
     _degraded="$(SERVER_PID="$_SERVER_PID" SERVER_PID_BEFORE="$_SERVER_PID_BEFORE" \
-        MANIFEST_BEFORE="$_MANIFEST_BEFORE" python3 -c "$_MANIFEST_DELTA_PY" 2>/dev/null)" \
+        MANIFEST_BEFORE="$_MANIFEST_BEFORE" python3 -I -S -c "$_MANIFEST_DELTA_PY" 2>/dev/null)" \
         || _degraded="check:manifest-interpreter-failed"
     if [ -n "$_degraded" ]; then
         echo "  NOTE: subsystems not ok after the restart: $_degraded"

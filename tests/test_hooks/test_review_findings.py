@@ -446,7 +446,7 @@ def test_the_moved_parsers_are_the_ones_the_gate_uses(guard):
     assert guard._devin_finding is rf.devin_finding
     assert guard._INLINE_P1_RE is rf.INLINE_P1_RE
     assert guard._INLINE_P2_RE is rf.INLINE_P2_RE
-    assert guard._CR_HEADER_FIELD_RE is rf.CR_HEADER_FIELD_RE
+    assert guard._cr_header_fields is rf.cr_header_fields
     assert guard._CR_SEVERITIES is rf.CR_SEVERITIES
 
 

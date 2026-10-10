@@ -46,6 +46,13 @@ different SESSION TYPES, not two phases of one session's life** (user decision,
   PR. Its unit of work is the queue, not the card. That is the
   **`closing-session`** skill; load it instead when the job is "get the open PRs
   merged".
+- **A cloud coding agent (Devin) is a third kind of builder.** It works from the
+  public repo in its own VM, with no access to an install: no running Genesis, no
+  `~/.genesis/`, none of an install's hooks or local reviewers. Hand it only
+  self-contained, spec-complete work whose tests run in CI, off the enforcement-hook
+  surface, as a public issue. Only the owner applies the `devin-ready` label that
+  hands it over: the label starts a paid session, so a session never applies it.
+  Its PRs join the same queue (closing-session, "Devin-built PRs").
 
 The handoff between them is **the PR itself** — a durable artifact that survives
 compaction and session death, so nothing has to be remembered across the
@@ -3463,9 +3470,12 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   a context note naming the setting. That note is what proves a silenced
   access; with no note, assume the access went past the guard unseen. It
   approves nothing; other hooks and Claude Code's own permissions still decide
-  the command, and a dispatched session is still denied. The only other key is
-  `push_publish` (owner ruling 2026-10-01), same no-decision-plus-note shape.
-  It silences only the first push of the CURRENT branch, and only when the
+  the command, and a dispatched session is still denied. The other keys are
+  `push_routine` (routine push prompts, 2026-10-06), `review_request` (a Codex
+  review request whose review history could not be read; the round-cap prompt
+  still asks, 2026-10-07) and `push_publish` (owner ruling 2026-10-01), all the
+  same no-decision-plus-note shape; `hook_ask_policy.py` holds the exact scope
+  of each. `push_publish` silences only the first push of the CURRENT branch, and only when the
   whole command is exactly one plain `git push` (e.g. `git push -u origin
   HEAD`) — a chained command still asks, so run the first push as its own
   command. The remote git really pushes to must resolve (rewrites applied) to
@@ -3642,6 +3652,30 @@ Verify before any commit:
 - **Targeted tests during development.** Run ONLY the relevant test file(s)
   for your changes. NEVER run the full test suite locally — CI handles that.
   Check CI via `gh pr checks`. Bare `pytest` without a file path is banned.
+- **Heavy jobs go through `genesis.hostmetrics run`.** A build, a parallel test
+  run, a media encode, anything that holds gigabytes or several cores for
+  minutes: launch it with the Genesis venv's interpreter
+  (`~/genesis/.venv/bin/python` on a standard install; a session shell usually
+  has no bare `python`) as `… -m genesis.hostmetrics run --name N --ram GB --cpu
+  PCT -- CMD`. It checks the budget first (GO/WAIT/NO/ASK), then runs the job in a
+  systemd scope capped at its estimates that other sessions' `status` and
+  `preflight` see; without a systemd user manager it runs uncapped and invisible,
+  and says so. `preflight` checks without running. It is not a way around the
+  full-suite rule: test targets must still be named, and do not count on the
+  full-suite guard to see inside the wrapper. Guide:
+  `docs/reference/resource-budget.md`.
+- **Deleting user or project data goes through the trash, not `rm`.** A file or
+  directory you did not create in this session (memory and plans, config, a
+  deliverable, notes) goes to `… -m genesis.trash put PATH --reason R`, which
+  renames it into `~/.genesis/trash/` with a tombstone so
+  `… -m genesis.trash restore ENTRY` can bring it back. `rm` stays fine for
+  what you created yourself and for temp (`~/tmp`, cc-tmp, the scratchpad).
+  Unlike `rm -f`, a missing path is a refusal (exit 1); a path starting with
+  `-` goes after `--`. The trash makes a deletion recoverable; it does not
+  replace asking the user first where deleting their data needs their OK.
+  When `put` refuses (another volume, the database, a file a running process
+  is using), ask the user; do
+  not fall back to `rm`. Guide: `docs/reference/trash.md`.
 - **Commit continuously**: after every logical unit of work. Uncommitted = lost.
 - **PR closes a ledger item → cite `Ledger: <item-id>` in the PR body** (the
   32-hex `session_ledger` row id, own line, e.g. `Ledger: 71337fab…`). The
