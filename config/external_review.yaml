@@ -1,0 +1,61 @@
+# External review runner — autonomous pull-request review dispatch.
+#
+# This repository ships the ADAPTER, never an orchestrator. Which tool reviews your
+# pull requests, how its command line is shaped, and what marker it stamps its report
+# with are properties of software installed outside this repo, so they live in your
+# overlay: ~/.genesis/config/external_review.local.yaml (same keys, deep-merged over
+# these).
+#
+# AS SHIPPED THIS DISPATCHES NOTHING. `orchestrator.allow_workflows` is empty, and an
+# empty allowlist permits nothing — so a fresh clone is a clean no-op rather than a
+# surprise. Nothing here needs changing to stay safe; the file is the documentation
+# of what an install may opt into.
+#
+# The env kill switch GENESIS_EXTERNAL_REVIEW_DISABLED=1 outranks everything here and
+# is checked before this file is read.
+#
+# mode:
+#   off      — never dispatch.
+#   dry_run  — decide and record what WOULD run, spawn nothing. The observation
+#              mode, and where an unrecognised mode degrades to.
+#   live     — dispatch.
+mode: live
+
+orchestrator:
+  # The executable, on PATH or as an absolute path. Empty = nothing to dispatch.
+  command: ""
+
+  # argv AFTER the command. `{workflow}` and `{pr}` are substituted. A tool invoked
+  # as `mytool run-review --pr 123` would be written:
+  #   argv: ["run-review", "--pr", "{pr}"]
+  argv: []
+
+  # Which workflow to run, and the closed set it is allowed to belong to.
+  #
+  # allow_workflows IS A SAFETY BOUNDARY, not a convenience. The autonomous path
+  # dispatches without a per-run approval prompt, so this list is what keeps the
+  # blast radius at "posts a comment": name ONLY workflows that are advisory and
+  # read-only. A workflow that edits files, commits, or opens pull requests does not
+  # belong here. Empty permits nothing, and a typo can only ever narrow the scope.
+  workflow: ""
+  allow_workflows: []
+
+  # The HTML marker the orchestrator stamps its own report with, e.g.
+  #   report_marker: "<!-- my-reviewer-report -->"
+  # Used to recognise a report the tool already posted: a pull request whose report
+  # mentions the current head is skipped. Without it there is no way to tell an
+  # already-reviewed head from a new one, so the runner refuses to dispatch rather
+  # than re-review everything on every tick.
+  report_marker: ""
+
+# HARD CAP per scan, not a target. A review of this kind spawns a fleet of agent
+# sessions for several minutes; measured 2026-09-14, a single review consumed ~3% of
+# the 5-hour subscription window that every foreground session shares. The timer's
+# cadence sets the rate, not the depth of the pull-request queue.
+max_dispatches_per_scan: 1
+
+# A draft is still being written — reviewing it spends a fleet on a moving target.
+skip_drafts: true
+
+# A red or still-running suite means the author is not asking for review yet.
+require_ci_green: true

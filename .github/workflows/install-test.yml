@@ -234,6 +234,17 @@ jobs:
             [ -f "$_t" ] || continue
             _n=$(basename "$_t")
             [ "$_n" = "genesis-backup.timer" ] && continue
+            # A second deliberate opt-in, asserted in the NEGATIVE rather than
+            # skipped: the orchestrator is install-local, so install.sh renders
+            # the timer but must leave it disabled — a green install that armed
+            # it anyway would turn on an autonomous capability unprompted.
+            if [ "$_n" = "genesis-external-review.timer" ]; then
+              if systemctl --user is-enabled --quiet genesis-external-review.timer; then
+                echo "::error::genesis-external-review.timer is enabled — install.sh must leave it disabled (operator opt-in)"
+                exit 1
+              fi
+              continue
+            fi
             # BOTH questions. is-enabled catches "never armed"; is-active
             # catches an `enable --now` whose START leg failed — the triggered
             # .service missing or unloadable — which install.sh swallows with

@@ -1,0 +1,42 @@
+[Unit]
+Description=Genesis External Review — autonomous PR-review dispatch (allowlisted workflows only)
+After=genesis-server.service
+
+[Service]
+Type=oneshot
+# LOAD-BEARING, and its ABSENCE is the dangerous value. The runner DETACHES the
+# orchestrator and returns in seconds; a Type=oneshot unit goes inactive the moment
+# ExecStart returns, and systemd's default KillMode=control-group then reaps
+# everything still in the cgroup. `start_new_session=True` leaves the process GROUP,
+# never the CGROUP, so it does not save the child.
+#
+# MEASURED 2026-09-14 with a control — two transient units, identical bodies:
+#   default KillMode -> detached child KILLED
+#   KillMode=process -> detached child ALIVE
+# The failure is silent and inverted against testing: the dispatch returns success,
+# the audit row says "dispatched", and running the same command by hand from a shell
+# works perfectly, because a shell has no cgroup lifecycle to end.
+KillMode=process
+WorkingDirectory=__REPO_DIR__
+ExecStart=__VENV__/bin/python __REPO_DIR__/scripts/external_review.py --scan
+# The runner itself returns in seconds: it enumerates PRs, decides, and DETACHES the
+# orchestrator workflow, which then outlives this unit by design. The timeout
+# bounds the enumeration and the `gh` calls under it, not the review.
+TimeoutStartSec=900
+# PATH must carry BOTH the venv and ~/.local/bin: an orchestrator commonly installs to the latter and
+# a systemd timer does not inherit an interactive shell's PATH. The runner resolves
+# the binary explicitly and degrades with a stated reason when it is missing, so a
+# PATH gap cannot silently no-op — but it would still stop every dispatch, which is
+# exactly how a sibling timer's indexing sat dead for days.
+Environment=PATH=__VENV__/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal
+# Writes only under $HOME: the audit store and run logs under ~/.genesis, and
+# whatever the orchestrator itself keeps under its own home.
+ProtectSystem=strict
+ReadWritePaths=%h
+# NOT NoNewPrivileges: the dispatched orchestrator spawns its own agent binary,
+# which manages its own child sessions.
+
+[Install]
+WantedBy=default.target
