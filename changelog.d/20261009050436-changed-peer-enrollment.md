@@ -1,3 +1,4 @@
 - Trusted peer enrollment no longer requires a daily task allowance. The deprecated option remains compatible with saved databases and is omitted from peer listings.
 - Scoped peer health checks remain available while A2A discovery returns a clear not-ready response until the task transport is installed. Revoked peers no longer suppress the missing-credential boot warning.
 - Peer and backend credentials cannot reuse the app's loaded active or fallback Flask session-signing keys; boot warnings and request checks use the same loaded authority.
+- Peer routes no longer read request bodies (no current route uses one); an oversized declared length is still refused after authentication.

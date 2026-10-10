@@ -1,7 +1,6 @@
 """Flask requests cross the actual runtime loop and scoped auth boundary."""
 
 import asyncio
-import io
 import secrets
 import threading
 
@@ -81,19 +80,70 @@ async def test_health_auth_and_withheld_card_audit_do_not_disclose(app, registry
     assert client.post(ROOT + "/message:send", headers=headers).status_code == 404
 
 
-async def test_body_cap_refuses_without_content_length_after_auth(app, registry, monkeypatch):
+class _UnreadableBody:
+    """A request body that never ends: any read is a failure of the gate."""
+
+    def __init__(self):
+        self.reads = 0
+
+    def _refuse(self, *args, **kwargs):
+        self.reads += 1
+        raise AssertionError("peer gate read the request body")
+
+    read = readline = readlines = __iter__ = _refuse
+
+
+def _body_environ(stream, length=None):
+    environ = {"wsgi.input": stream, "wsgi.input_terminated": True}
+    if length is not None:
+        environ["CONTENT_LENGTH"] = str(length)
+    return environ
+
+
+async def test_slow_or_unterminated_body_is_never_read(app, registry, monkeypatch):
     headers = await configure(registry, monkeypatch)
     client = app.test_client()
-    for with_length in (False, True):
-        options = {
-            "wsgi.input": io.BytesIO(b"x" * (MAX_BODY_BYTES + 1)),
-            "wsgi.input_terminated": True,
-        }
-        if with_length:
-            options["CONTENT_LENGTH"] = str(MAX_BODY_BYTES + 1)
-        response = client.open(ROOT + "/health", headers=headers, environ_overrides=options)
-        assert response.status_code == 413
-    assert client.get(ROOT + "/health", data=b"x" * (MAX_BODY_BYTES + 1)).status_code == 401
+    for method, path, status in (
+        ("GET", "/health", 200),
+        ("POST", "/message:send", 404),
+        ("GET", "/.well-known/agent-card.json", 503),
+    ):
+        stream = _UnreadableBody()
+        response = client.open(
+            ROOT + path,
+            method=method,
+            headers={**headers, "Transfer-Encoding": "chunked"},
+            environ_overrides=_body_environ(stream),
+        )
+        assert response.status_code == status
+        assert stream.reads == 0
+
+
+async def test_declared_oversize_body_refused_from_header_after_auth(app, registry, monkeypatch):
+    headers = await configure(registry, monkeypatch)
+    client = app.test_client()
+    stream = _UnreadableBody()
+    response = client.open(
+        ROOT + "/health",
+        headers=headers,
+        environ_overrides=_body_environ(stream, MAX_BODY_BYTES + 1),
+    )
+    assert response.status_code == 413 and response.json["code"] == "body_too_large"
+    assert stream.reads == 0
+    stream = _UnreadableBody()
+    response = client.open(
+        ROOT + "/health",
+        headers=headers,
+        environ_overrides=_body_environ(stream, MAX_BODY_BYTES),
+    )
+    assert response.status_code == 200 and stream.reads == 0
+    # Authorization still precedes the size refusal.
+    stream = _UnreadableBody()
+    response = client.open(
+        ROOT + "/health", environ_overrides=_body_environ(stream, MAX_BODY_BYTES + 1)
+    )
+    assert response.status_code == 401
+    assert stream.reads == 0
 
 
 async def test_loop_absent_never_falls_back(app, registry, monkeypatch):

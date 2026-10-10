@@ -59,8 +59,11 @@ The owner-configured HTTPS URL is reserved for the later A2A transport, never
 derived from the request Host. The A2A SDK is pinned to 1.2.2 for that dependent
 transport. Streaming, push and extended-card capabilities are not advertised.
 
-Bodies are read after authentication on the Flask worker, capped at 256 KiB by
-reading cap plus one and refusing overflow, including absent Content-Length.
+Request bodies are never read by these routes: no current route consumes one.
+(The development server still discards any unread body after responding, so
+this alone does not bound how long a slow client can hold a connection.) After authentication,
+a declared Content-Length over 256 KiB is refused `413 body_too_large` from the
+header alone. The task transport must add its own bounded, deadlined body read.
 Logs record timestamp, credential name, verified peer or unverified marker,
 endpoint, task-ID placeholder and status; never bearer values, request bodies
 or tool arguments. These routes do not read provider credentials or token files.

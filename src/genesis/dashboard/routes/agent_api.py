@@ -6,7 +6,6 @@ import logging
 from datetime import UTC, datetime
 
 from flask import Blueprint, current_app, g, jsonify, request
-from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
 from genesis.dashboard._blueprint import _async_route
 from genesis.peers.auth import PeerRefusal, authenticate
@@ -25,7 +24,6 @@ def _err(code: str, status: int):
         "unauthorized": "Unauthorized",
         "body_too_large": "Request body exceeds the limit",
         "not_found": "Not found",
-        "validation_error": "Invalid request body",
     }
     return jsonify(error=messages[code], code=code), status
 
@@ -62,17 +60,12 @@ def _install_gate(state):
         refusal = _authenticate_request()
         if refusal is not None:
             return refusal
-        # Read on the Flask worker, not the shared runtime event loop.
-        # Authorization precedes parsing, including absent Content-Length.
-        try:
-            body = request.stream.read(MAX_BODY_BYTES + 1)
-        except RequestEntityTooLarge:
+        # No current route consumes a body, so the stream is never read: a
+        # read has no deadline, and a slow or unterminated body would hold this
+        # worker. Only a declared oversize length is refused, from the header.
+        # The transport that needs a body must add a bounded, deadlined read.
+        if (request.content_length or 0) > MAX_BODY_BYTES:
             return _err("body_too_large", 413)
-        except BadRequest:
-            return _err("validation_error", 400)
-        if len(body) > MAX_BODY_BYTES:
-            return _err("body_too_large", 413)
-        g.peer_body = body
         return None
 
     @state.app.after_request
