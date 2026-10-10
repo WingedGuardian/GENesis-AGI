@@ -11503,6 +11503,48 @@ def _colon_refspec_updates_current_branch(refspec: str, cur: str | None) -> bool
     return dst == f"refs/heads/{cur}"
 
 
+def _refspec_onto_other_branch(
+    seg, cur: str | None, remote: str | None, cwd: str | None = None
+) -> str | None:
+    """The branch a ``git push <remote> <cur>:refs/heads/<dst>`` updates, or None.
+
+    The shape a session uses to bring a pull request's branch up to date from a
+    scratch checkout when that branch is checked out in another worktree (git
+    refuses a second checkout of one branch). Its own install key,
+    ``hooks.asks.push_pr_branch``, may silence it once the caller has also shown
+    ``<dst>`` has an open PR (owner ruling 2026-10-10); ``push_routine`` never
+    reaches it. This answers the SHAPE question only.
+
+    Same allowlist posture as ``_push_targets_current_branch``: no prefix
+    assignment, only ref-neutral flags, exactly one refspec, the positional
+    remote equal to the resolved one, and ``_push_config_is_simple``. The source
+    must name the current branch (``_ref_names_current_branch``), so a detached
+    HEAD never matches; the destination must be FULLY QUALIFIED for the reason
+    ``_colon_refspec_updates_current_branch`` measured (an unqualified name can
+    resolve to a tag). A destination equal to ``cur`` is the current-branch
+    path's, and ``main`` / ``master`` never match; a recorded default branch is
+    refused later by ``_routine_dest_owned``. A force, a delete (``:dst``) or a
+    tag destination always returns None.
+    """
+    if not cur or not _push_seg_has_no_prefix(seg):
+        return None
+    positionals = _push_ref_positionals(getattr(seg, "argv", None) or [])
+    if positionals is None or len(positionals) != 2 or positionals[0] != remote:
+        return None
+    src, sep, dst = positionals[1].partition(":")
+    if not sep or not src or not _ref_names_current_branch(src, cur):
+        return None
+    prefix = "refs/heads/"
+    if not dst.startswith(prefix):
+        return None
+    branch = dst[len(prefix):]
+    if not branch or branch == cur or branch in ("main", "master") or ":" in branch:
+        return None
+    if not _push_config_is_simple(remote, cwd=cwd):
+        return None
+    return branch
+
+
 def _resolve_push_remote(seg, cwd: str | None = None) -> str | None:
     """The push DESTINATION (remote name or URL) for a segment, or None if UNKNOWN.
 
@@ -12689,6 +12731,11 @@ def _run_merge_and_push_gates() -> int:
         # off`, public-repo destinations only). Emitted at the tail as NO decision
         # plus a context note, and only if nothing else set an ask or a block.
         publish_note: str | None = None
+        # A push onto an OPEN PR's branch from another checkout that this install
+        # silenced (`hooks.asks.push_pr_branch: off`). Same tail treatment as
+        # publish_note: no decision, a context note, and only if nothing else in
+        # the command set an ask or a block.
+        pr_branch_note: str | None = None
         # Routine prompts this install silenced (`hooks.asks.push_routine: off`).
         # Each ask below is classed: ROUTINE (a first push in any spelling,
         # close-then-push, a PR-less re-push off the public repo, a re-push
@@ -12981,6 +13028,66 @@ def _run_merge_and_push_gates() -> int:
                             f"push will use. Run the push as its own command to "
                             f"skip this prompt."
                         )
+                elif (
+                    not pcwd_unknown
+                    and cur
+                    and cur not in ("main", "master")
+                    and (
+                        pr_dst := _refspec_onto_other_branch(
+                            push_segs[0], cur, push_remote, cwd=pcwd
+                        )
+                    )
+                ):
+                    # `git push <remote> <cur>:refs/heads/<dst>` from a scratch
+                    # checkout: the way a session updates a PR's branch while that
+                    # branch is checked out in another worktree. Under its OWN key
+                    # (owner ruling 2026-10-10), so push_routine never reaches it:
+                    # it stays classed non-routine, as it was. Silenced only when
+                    # <dst> has an OPEN PR on this repository (which also means it
+                    # is already public and CI runs on it), the destination is an
+                    # owned GitHub repo and not a recorded default branch, and
+                    # nothing else in the command can change config first. An
+                    # unanswerable PR lookup (None) keeps the prompt. Steps before
+                    # the push pass on the re-push rule (_push_compound_is_inert),
+                    # not push_publish's single-command rule: the destination is
+                    # already public with an open PR, so a neighbouring `cd` or
+                    # `git status` changes nothing that leaves the machine. A silenced
+                    # push leaves ask_reason alone, so any ask already raised for
+                    # this command still wins at the tail.
+                    pr_branch_off = _ask_suppressed("push_pr_branch")
+                    if pr_branch_off:
+                        urls = _push_dest_urls(push_remote, cwd=pcwd) if push_remote else set()
+                        if (
+                            urls
+                            and _push_compound_is_inert(segs, push_segs[0], cmd)
+                            and _routine_dest_owned(push_remote, urls, pcwd, pr_dst)
+                            and (_open_pr_count_for_branch(pr_dst, cwd=pcwd, push_urls=urls) or 0)
+                            >= 1
+                        ):
+                            pr_branch_note = _suppressed_reason(
+                                "push_pr_branch",
+                                f"push of '{cur}' onto '{pr_dst}', the head of an open "
+                                f"pull request on this repository.",
+                            )
+                            notes = _drain_ask_notes()
+                            if notes:
+                                pr_branch_note = f"{pr_branch_note}\n\n{notes}"
+                    if pr_branch_note is None:
+                        ask_nonroutine = True
+                        ask_reason = (
+                            f"git push needs your approval before publishing externally "
+                            f"(target: {branch or 'default'})."
+                        )
+                        if pr_branch_off:
+                            ask_reason += (
+                                "\n\nhooks.asks.push_pr_branch is off, but this push "
+                                "did not qualify: the destination branch has no open "
+                                "pull request here (or the lookup failed), the remote "
+                                "is not a github.com https repo of the configured "
+                                "owner, the branch is a recorded default branch, or "
+                                "another step in the command could change git config "
+                                "first."
+                            )
                 else:
                     ask_nonroutine = True
                     ask_reason = (
@@ -13849,6 +13956,8 @@ def _run_merge_and_push_gates() -> int:
         # otherwise approve the command on this hook's behalf.
         if publish_note is not None:
             return _emit_context_only(publish_note)
+        if pr_branch_note is not None:
+            return _emit_context_only(pr_branch_note)
 
         # A first-push-only re-push auto-allow — emitted ONLY here, after every
         # hard-block has had its chance to return 2, so a compound
