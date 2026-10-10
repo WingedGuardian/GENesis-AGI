@@ -672,6 +672,9 @@ PY
                     || die "SQLite staged database has no application schema — live database left untouched"
                 log "SQLite: staged candidate passed integrity, foreign-key, and schema checks"
 
+                PYTHONPATH="$_SCRIPT_DIR/../src" python3 -m genesis.db.crud.peer_restore "$_DB_STAGE" \
+                    || die "SQLite peer authority reset failed — live database left untouched"
+
                 _quiesce_genesis_server
                 # Durable crash fence. If power is lost anywhere in the swap,
                 # startup fails closed instead of creating an empty DB at a

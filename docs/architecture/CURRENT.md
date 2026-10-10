@@ -224,8 +224,9 @@ any live flip. Centrality persistence widened from top-500 to all-nonzero
 a real bridge-node population; `centrality_cache` gains its first reader.
 
 **Graph backend is a SEAM (`memory/graphstore.py`)** — traversal and centrality
-run through a `GraphStore` protocol with one implementation today,
-`NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`);
+run through a `GraphStore` protocol with two implementations: the default
+`NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`)
+and `FalkorGraphStore` (below);
 `memory/graph.py` is a facade that owns the single production instance and the
 backend choice. The contract, and the reason the seam exists: a read that cannot
 REACH its store RAISES `GraphUnavailableError` and never returns empty — empty
@@ -261,6 +262,28 @@ docs (2026-09-07): only the NAMED-PATH form works for hop-wise filtering, the
 engine has NO temporal types despite its own documentation listing them, and a
 loading engine answers `BusyLoadingError` — which is unavailable, never empty.
 Acceptance: 400 live roots replayed through both stores, 0 node-set differences.
+The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
+(`memory/graphstore_project.py`); that schedule is its staleness bound, and an
+engine restart leaves no projection until the next run (the engine keeps no data
+on disk). At runtime only `graph.traverse()` READS the engine (the projector
+writes it, the health probe pings it): its callers are `memory_recall`
+enrichment (MCP, and genesis-server's tool API), `memory_expand`, and
+`drift_recall` (MCP drift mode and the ambient worker). Recall's own graph step (`graph_expansion.py`) reads
+`memory_links` through SQL and never touches it.
+**Every traversal outcome is recorded** for the default-on cutover (owner gate:
+14 days in falkordb mode with zero fallbacks): `eval_events` rows
+(`event_type="graph_traverse"`, `dimension="system"`) built by
+`memory/graph_telemetry.py`, one per caller call, with the configured mode, the
+store that answered, and the exception class of any fallback, selection failure
+or error. A call's first fallback, selection failure or error is also written as
+its own row the moment it happens, so a process killed mid-request cannot lose the
+evidence that the clock broke. A row that fails to write is carried as
+`prior_write_failures` on the next row and appended to
+`~/.genesis/telemetry/graph_traverse_lost_writes.jsonl`, which outlives the
+process. `graph_traverse_prune` deletes rows, and file lines, older than 30 days;
+kill switch `GENESIS_GRAPH_TELEMETRY_DISABLED=1`.
+The fallback WARNINGs alone could never answer this: MCP servers log to stderr,
+which never reaches the journal.
 
 Freshness has one stated boundary: all 13 `invalidate_graph_cache()` sites are
 `memory_links` writers, while the visibility predicate below reads
@@ -1855,8 +1878,38 @@ verified: 477efb7f7 2026-10-05
   fsck auto-resolves `git_deep` only (fsck READS — a passing fsck must never
   clear a live `rootfs_readonly` cheap alert). Creates carry
   `skip_if_duplicate=True` (atomic INSERT…WHERE NOT EXISTS — the only guard
-  that works across concurrent loops). Probe sensitivity is deliberately
-  single-failure; do not add consecutive-failure gating.
+  that works across concurrent loops). The cheap probe stays single-failure.
+  **The deep fsck re-checks once before paging (#2745, owner decision
+  2026-10-08, superseding the single-failure rule for this probe):** a failing
+  run is re-run 120 s later (an `asyncio.sleep`, cancellable at shutdown). A
+  re-run that fails on its own pages `critical` as before, with "(reproduced on
+  re-check)" and its failing lines; a re-run that times out, is killed or cannot
+  start is inconclusive, keeps the first run's lines and pages with "(re-check
+  did not complete: ...)". A service stop is not a failure: the stop cancels an
+  in-flight scan, and a fsck that died of SIGTERM aborts the scan with no
+  verdict and no row. Because a re-check can race too, a failing re-check
+  whose every line is `missing <type> <sha>` for an object that exists on a
+  `git cat-file --batch-check` lookup right after (same type) is recorded as a
+  transient (scan race, with the re-check's lines kept); any other line, an
+  absent object or a failed lookup still pages. The lookup reads headers only,
+  so it never clears an object fsck called corrupt: those print `error:` lines.
+  It ignores replace refs (as fsck does), and never vouches for the empty tree
+  or empty blob, which git can answer from memory with no file on disk.
+  A failure that passes its re-check becomes one `high`
+  `git_deep_transient` row PER event (morning report and dashboard, never
+  Telegram). A clean run does not resolve these rows; they expire on the 3-day
+  `infrastructure_alert` TTL, so a recurrence shows as several rows. Why: all 5
+  deep alerts recorded 2026-07-18 to 2026-10-08 were resolved without repair (2
+  by the monitor's next run, 3 by a manual re-run), in an object store shared by
+  hundreds of worktrees; on 2026-10-09 a concurrent `git fetch` writing a ref
+  mid-scan, and later a `git add` (blobs plus an index), were caught producing
+  exactly such "missing" lines (2 of 3 live scans that night; objects present
+  seconds later). fsck
+  runs with `--no-dangling`, and the evidence keeps every non-noise line (stderr
+  first), so thousands of dangling objects can no longer bury the real error.
+  The tick dispatches the deep scan out-of-band (`_dispatch_git_health_deep`),
+  so neither fsck run holds the tick lock; a run still going after ~37 min logs
+  one WARNING (the daily scan has stalled).
 
 - **awareness/**: the 5-min heartbeat. Signal collectors (the richer
   `learning/signals/*` set REPLACES the bootstrap placeholders in
@@ -2759,9 +2812,21 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers, decisions]
-verified: b0867170e8e3 2026-10-02
+verified: 9a95483a8e7f 2026-10-09
 ```
 
+- Verification refresh is limited to the interim general judge ordering below;
+  other provider-health evidence retains its original dated basis.
+- **Interim general judge preference (2026-10-09)**: the shipped `judge`
+  chain tries V4.1 Flash through DeepSeek direct, then OpenRouter, then V4 Pro.
+  This owner-selected ordering precedes completed quality qualification; it is
+  not a claim that Flash has met the protected judgment gates. J9 relevance
+  and the skill-edit critic also consume the general judge chain. J9 chain
+  offsets retain rotation and can select Pro first for a rotated call. Bench
+  and skill replay inherit the chain when no judge override is supplied. An explicit
+  provider override can still lead with Pro. Standalone single-provider defaults
+  and the sole validated novelty suppressor retain Pro. Model identity remains
+  recorded per judgment; comparisons across providers require that attribution.
 - **Provider health evidence**: NVIDIA's `/v1/models` catalog is supported
   but observational only; success, failure and probe exceptions do not mutate
   its breakers. Probe support, credential presence and breaker authority are
@@ -3001,7 +3066,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, env.py,
           _config_overlay.py]
-verified: 477efb7f7 2026-10-05
+verified: ba9dd8a37 2026-10-09
 ```
 
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
@@ -3345,7 +3410,13 @@ verified: 477efb7f7 2026-10-05
   awareness tick (`resilience/tailscale_watchdog_events.py`), never read into
   the annotation prompt.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
-  encrypted `scripts/backup.sh` timer).
+  encrypted `scripts/backup.sh` timer). `db/crud/peer_restore.py` resets peer
+  permissions in staged backup restores and update's pre-migration rollback
+  candidate: disabled mode, empty grants, renewed epochs; no credential reads.
+  A connection-local SQLite authorizer refuses trigger/view execution and writes
+  beyond those reset targets; required peer tables must be ordinary tables.
+  Guardian snapshot rollback instead warns at its existing action-approval gate
+  that approval explicitly reauthorizes saved peers.
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
   `process_lock` (the reason bare `python -m genesis serve` blocks systemd),
   tmp discipline (`~/tmp` for large temp — never override TMPDIR),
@@ -3377,7 +3448,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 5e8dc977 2026-10-01
+verified: 1109d1844 2026-10-08
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -3422,7 +3493,10 @@ verified: 5e8dc977 2026-10-01
   starts the existing standalone health and memory MCP servers through a
   launcher that scrubs inherited Genesis session identity, provenance,
   supervision, slot, and trace context, then allowlists health plus explicit
-  recall tools. In a linked worktree the launcher sets `GENESIS_REPO_ROOT` to
+  recall tools. The launcher also selects `--external-client`; memory initialization
+  then disables processing of Claude's pending plan-bookmark file. Ordinary
+  Genesis memory initialization keeps that processing enabled by default.
+  In a linked worktree the launcher sets `GENESIS_REPO_ROOT` to
   the main checkout, which owns the live database and secrets. This gives Codex
   on-demand access without registering its transcript,
   creating a charter, or joining Genesis foreground/background lifecycle

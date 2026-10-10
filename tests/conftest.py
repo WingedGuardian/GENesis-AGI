@@ -44,6 +44,18 @@ import os  # noqa: E402
 import aiosqlite  # noqa: E402
 import pytest  # noqa: E402
 
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup():
+    """Complete an already-loaded dashboard before any subtree's fixtures run.
+
+    Route-only imports leave api's page route unbound; Flask rejects its late
+    decorator after registration. Pure tests must not import the dashboard's
+    dependency/logging closure just to participate in this safety net.
+    """
+    if "genesis.dashboard._blueprint" in sys.modules:
+        import genesis.dashboard.api  # noqa: F401 — canonical route registration
+
 # ── Safety: prevent os.killpg(1, ...) from killing all processes ─────────
 _real_killpg = os.killpg
 
@@ -507,6 +519,32 @@ def _isolate_circuit_breaker_state(tmp_path, monkeypatch):
     monkeypatch.setattr(cb_mod, "_STATE_FILE", tmp_path / "cb_state.json")
 
 
+# ── Graph-traversal telemetry is OFF unless a test opts in ─────────────────
+@pytest.fixture(autouse=True, scope="session")
+def _graph_telemetry_off():
+    """Most traversal tests build minimal databases with no ``eval_events``
+    table, and several assert an exact count of WARNING records on the degraded
+    path. A telemetry write there would fail and log, changing what those tests
+    measure. Telemetry tests opt back in with
+    ``monkeypatch.delenv("GENESIS_GRAPH_TELEMETRY_DISABLED")``.
+
+    Session-scoped and without ``monkeypatch`` on purpose. pytest sets up
+    same-scope autouse fixtures in NAME order, and this name sorts before
+    ``_guard_db_crud_not_mocked``: requesting the shared ``monkeypatch`` here
+    created it before the guard, so it was undone only AFTER the guard's check,
+    and the guard reported the legitimate ``monkeypatch.setattr(obs_crud, ...)``
+    patches in ``tests/test_awareness/`` as leaks (15 errors in
+    ``test_cc_slot_alert.py`` alone, measured with ``--setup-show``)."""
+    key = "GENESIS_GRAPH_TELEMETRY_DISABLED"
+    prior = os.environ.get(key)
+    os.environ[key] = "1"
+    yield
+    if prior is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = prior
+
+
 # ── Safety: prevent tests from writing REAL durable alerts ──────────────────
 @pytest.fixture(autouse=True)
 def _isolate_alert_queue(tmp_path):
@@ -564,6 +602,29 @@ def _isolate_boundary_key(tmp_path):
     mp = pytest.MonkeyPatch()
     mp.setattr("genesis.env.boundary_key_path", lambda: tmp_path / "boundary_key")
     mp.setattr(sanitizer, "_boundary_key", None)
+    yield
+    mp.undo()
+
+
+# ── Safety: a ticking test must not start the REAL daily git fsck ──────────
+@pytest.fixture(autouse=True)
+def _skip_daily_git_deep_scan():
+    """Mark the awareness loop's daily deep scan as just run, so a test that
+    drives a real tick never launches `git fsck --full` over the real repo as a
+    background task that outlives the test's event loop (and writes the real
+    verdict file). Tests of the scan reset the guard themselves. Applied only
+    when the module is already loaded: importing it here costs ~5 s per test
+    process, and a test that imports it lazily runs the scan as it always did."""
+    import time
+
+    awareness_loop = sys.modules.get("genesis.awareness.loop")
+    if awareness_loop is None:
+        yield
+        return
+    mp = pytest.MonkeyPatch()
+    mp.setattr(awareness_loop, "_last_git_deep_run_at", time.monotonic())
+    mp.setattr(awareness_loop, "_git_deep_task", None)
+    mp.setattr(awareness_loop, "_git_deep_stopped", False)
     yield
     mp.undo()
 

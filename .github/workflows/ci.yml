@@ -1153,6 +1153,11 @@ jobs:
         # (test_qualification +78, test_qualification_references +24,
         # test_qualification_rework +28); no added skips.
         # Floor: 25040 + 130 = 25170.
+        # Peer restore authority (#3128): measured collection of changed files
+        # against current main: 178 -> 219, entirely the new 41-case restore
+        # authority suite. Other five changed test files retain their counts.
+        # No new skip allowance. Floor: 25170 + 41 = 25211.
         # Authenticated backup reads: measured net +106; 25170 + 106 = 25276.
         # Offline restore fixture changes are count-neutral; ceiling stays 102.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25276
+        # Merge with main (#3133 authenticated backup reads): main 25211 + this PR's measured +106 = 25317.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25317
