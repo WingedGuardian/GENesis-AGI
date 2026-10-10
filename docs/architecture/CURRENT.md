@@ -928,7 +928,7 @@ are the other timing/volume controls on that path.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 787882667c48 2026-10-08
+verified: e4df379de612 2026-10-09
 ```
 
 - **Individual peer consent foundation**: `peers/approvals.py` persists exact
@@ -937,6 +937,9 @@ verified: 787882667c48 2026-10-08
   dashboard or authorized Telegram buttons resolve peer operations; batch and
   generic resolver origins refuse them. Generic consent banners exclude peer
   operations while the dedicated peer/task/digest card remains available.
+  Dashboard peer resolution requires internal owner bearer proof or a verified
+  password-backed session with same-origin intent, even with general API auth off.
+  Passwordless dashboard admission alone cannot resolve peer approvals.
   Notification failure stays visible; an already committed manager delivery
   receipt repairs missing association bookkeeping without another send.
   Continuation consumption and runtime activation require the coordinator slice.

@@ -31,6 +31,14 @@ existing single reader and emits no values. The peer API has only an owned,
 read-only `/v1/agent/a2a/approvals` extension, with safe description, creation time,
 remaining integer timeout and notification failure status.
 
+Individual dashboard approval and rejection of a stored peer-operation row also
+require positive owner proof: the existing internal owner bearer, or a verified
+password-backed owner session with the existing same-origin check. This check
+holds when general dashboard API authentication is disabled. Passwordless
+dashboard access and stale cookies on a passwordless install cannot resolve peer
+operations; configure owner dashboard authentication or use the authorized
+Telegram buttons. Ordinary passwordless approvals retain their existing behavior.
+
 Missing or failed notification remains visible in the durable association and can
 be retried without creating a new approval. A matched nonempty delivery receipt
 already committed in manager context reconciles missing association bookkeeping
