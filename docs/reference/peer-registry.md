@@ -39,7 +39,10 @@ remains unavailable in this foundation. Revoked peer credentials never make
 fallback readiness appear usable, but still participate in collision checks.
 
 Provide independent ASCII values through protected operator storage. Never reuse
-the MCP, desk, another peer, internal API credential or dashboard password. Equality refuses
+the MCP, desk, another peer, internal API credential, dashboard password, or a
+Flask session-signing key. Collision checks use the app's loaded active and
+accepted fallback signing keys, including during boot diagnostics; editing the
+key file does not change the live app's signing authority. Equality refuses
 activation and generates a boot warning without exposing values. The CLI lists
 credential names only; the database stores no token values. Clear a value and
 use the approved restart path for file-based revocation; relationship revocation

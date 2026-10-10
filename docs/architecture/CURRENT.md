@@ -1390,7 +1390,9 @@ verified: a73bc16 2026-10-10
   until an installed task transport can fulfill its advertised interface.
   Revocation disables access immediately; only active peer credentials contribute
   to fallback readiness, while inactive credentials still participate in scope
-  collision checks. See `docs/reference/peer-registry.md`.
+  collision checks. Scope checks also reject equality with loaded active/fallback
+  Flask signing keys, without request-time credential-file reads.
+  See `docs/reference/peer-registry.md`.
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
   it yields at startup, exit 200, when the genesis-server process lock is

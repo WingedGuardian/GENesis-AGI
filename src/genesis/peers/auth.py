@@ -6,7 +6,7 @@ import hmac
 import os
 from dataclasses import dataclass
 
-from flask import request
+from flask import Flask, current_app, has_app_context, request
 
 from genesis.dashboard.auth import (
     check_bearer_token,
@@ -32,7 +32,7 @@ class PeerIdentity:
     peer: dict | None
 
 
-def credential_conflicts(names: tuple[str, ...]) -> bool:
+def credential_conflicts(names: tuple[str, ...], *, app: Flask | None = None) -> bool:
     """Reject scope collapse, including inactive peer and boot-loaded owner keys."""
     other_names = (
         {name for name in os.environ if name.startswith("GENESIS_") and name.endswith("_TOKEN")}
@@ -41,11 +41,26 @@ def credential_conflicts(names: tuple[str, ...]) -> bool:
     )
     configured = {name: bearer_token(name) for name in other_names}
     dashboard_password = get_dashboard_password() or ""
+    if app is None and has_app_context():
+        app = current_app
+    # Match Flask's loaded active/fallback signing authority. Requests never
+    # reopen the credential file, and a cleared file cannot change a live key.
+    signing_keys = (
+        (app.secret_key, *(app.config.get("SECRET_KEY_FALLBACKS") or ()))
+        if app is not None and app.secret_key
+        else ()
+    )
     for name in names:
         value = configured[name]
         if value and (
             conflicts_with_cached_internal_token(value)
             or bearer_matches(value.encode("ascii"), dashboard_password)
+            or any(
+                hmac.compare_digest(
+                    value.encode("ascii"), key if isinstance(key, bytes) else key.encode("utf-8")
+                )
+                for key in signing_keys
+            )
             or any(
                 key != name and other and hmac.compare_digest(value, other)
                 for key, other in configured.items()
@@ -98,14 +113,14 @@ async def authenticate(registry: PeerRegistry, *, allow_probe: bool = False) -> 
     return PeerIdentity(name, peer)
 
 
-async def configuration_warning(registry: PeerRegistry) -> str | None:
+async def configuration_warning(registry: PeerRegistry, *, app: Flask | None = None) -> str | None:
     """Boot diagnostics without credential values or request-side file access."""
     settings = await registry.settings()
     if settings["mode"] == "disabled":
         return "Peer API disabled: configure peers explicitly; scoped GENESIS_PEER_<ID>_TOKEN or GENESIS_PEER_BACKEND_TOKEN required."
     rows = await registry.rows()
     names = tuple(row["token_name"] for row in rows if row["token_name"])
-    if credential_conflicts((*names, BACKEND_TOKEN)):
+    if credential_conflicts((*names, BACKEND_TOKEN), app=app):
         return "Peer API disabled: peer credential equals another surface credential; configure distinct scoped values."
     accepted = (
         (BACKEND_TOKEN,)

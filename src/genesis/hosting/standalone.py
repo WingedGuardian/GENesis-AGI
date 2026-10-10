@@ -114,7 +114,7 @@ class StandaloneAdapter:
             from genesis.peers.auth import configuration_warning
             from genesis.peers.registry import PeerRegistry
 
-            warning = await configuration_warning(PeerRegistry())
+            warning = await configuration_warning(PeerRegistry(), app=self._app)
             if warning:
                 logger.warning(warning)
         except Exception:

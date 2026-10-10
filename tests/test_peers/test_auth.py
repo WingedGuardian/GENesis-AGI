@@ -165,6 +165,75 @@ async def test_dashboard_password_cannot_be_peer_authority(registry, monkeypatch
         assert identity.credential_name == name
 
 
+@pytest.mark.parametrize("mode", ["fallback", "sam"])
+@pytest.mark.parametrize(
+    "key_kind", ["active", "fallback", "bytes", "distinct", "unicode", "empty", "no_fallback"]
+)
+async def test_loaded_signing_keys_cannot_be_peer_authority(registry, monkeypatch, mode, key_kind):
+    await prepare(registry, monkeypatch, mode)
+    name = "GENESIS_PEER_MUSE_TOKEN" if mode == "fallback" else BACKEND_TOKEN
+    value = os.environ[name]
+    app = Flask(__name__)
+    app.secret_key = secrets.token_urlsafe(32)
+    app.config["SECRET_KEY_FALLBACKS"] = None
+    if key_kind == "active":
+        app.secret_key = value
+    elif key_kind == "fallback":
+        app.config["SECRET_KEY_FALLBACKS"] = [value]
+    elif key_kind == "bytes":
+        app.secret_key = value.encode("ascii")
+    elif key_kind == "unicode":
+        app.secret_key = secrets.token_urlsafe(32) + chr(0x2603)
+        app.config["SECRET_KEY_FALLBACKS"] = ["別の鍵"]
+    elif key_kind == "empty":
+        app.secret_key = None
+    elif key_kind == "distinct":
+        app.config["SECRET_KEY_FALLBACKS"] = [secrets.token_urlsafe(32)]
+    collision = key_kind in {"active", "fallback", "bytes"}
+    with app.test_request_context(headers={"Authorization": "Bearer " + value}):
+        assert credential_conflicts((name,)) is collision
+        if collision:
+            with pytest.raises(PeerRefusal) as caught:
+                await authenticate(registry, allow_probe=True)
+            assert caught.value.code == "not_configured"
+        else:
+            identity = await authenticate(registry, allow_probe=True)
+            assert identity.credential_name == name
+    # Standalone boot runs without an implicit Flask context.
+    assert (await configuration_warning(registry, app=app) is not None) is collision
+
+
+@pytest.mark.parametrize("persisted", [False, True])
+async def test_signing_collision_uses_loaded_key_not_file(registry, monkeypatch, tmp_path, persisted):
+    from pathlib import Path
+
+    from genesis.dashboard.auth import get_or_create_secret_key
+
+    await prepare(registry, monkeypatch)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    key_file = tmp_path / ".genesis" / "flask_secret_key"
+    if persisted:
+        key_file.parent.mkdir(parents=True, exist_ok=True)
+        key_file.write_text(secrets.token_hex(32))
+    app = Flask(__name__)
+    app.secret_key = get_or_create_secret_key()
+    monkeypatch.setenv("GENESIS_PEER_MUSE_TOKEN", app.secret_key)
+    key_file.write_text(secrets.token_hex(32))
+    assert await configuration_warning(registry, app=app) is not None
+    with app.test_request_context(headers={"Authorization": "Bearer " + app.secret_key}):
+        with pytest.raises(PeerRefusal) as caught:
+            await authenticate(registry)
+        assert caught.value.code == "not_configured"
+    # A file changed to a peer value does not replace the live app key either.
+    distinct = secrets.token_urlsafe(32)
+    monkeypatch.setenv("GENESIS_PEER_MUSE_TOKEN", distinct)
+    key_file.write_text(distinct)
+    assert await configuration_warning(registry, app=app) is None
+    with app.test_request_context(headers={"Authorization": "Bearer " + distinct}):
+        identity = await authenticate(registry)
+    assert identity.credential_name == "GENESIS_PEER_MUSE_TOKEN"
+
+
 async def test_sam_backend_probe_readiness_survives_peer_revocation(registry, monkeypatch):
     await prepare(registry, monkeypatch, "sam")
     await registry.revoke("muse")
