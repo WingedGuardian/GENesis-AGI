@@ -104,6 +104,7 @@ _STARTED_AT=$(date +%s)
 _SQLITE_LINES=0
 _QDRANT_COUNT=0
 _TRANSCRIPT_COUNT=0
+_TRANSCRIPTS_COMPLETE=true
 _MEMORY_COUNT=0
 _EXTRA_SKIP_LABELS=()  # declared before the EXIT trap can fire: its status write reads it
 _EXTRA_PARTIAL_LABELS=()
@@ -221,9 +222,9 @@ trap _on_exit EXIT
 GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
 BACKUP_DIR="$HOME/backups/genesis-backups"
 # Derive CC project dir from genesis dir path (CC convention: / → -)
-_CC_PROJECT_ID=$(echo "$GENESIS_DIR" | tr '/' '-')
-MEMORY_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}/memory"
+_CC_PROJECT_ID=${GENESIS_DIR//\//-}
 TRANSCRIPT_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}"
+MEMORY_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}/memory"
 # shellcheck source=scripts/lib/backup_core_paths.sh
 source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
 SECRETS_FILE="${SECRETS_PATH:-$GENESIS_DIR/secrets.env}"
@@ -645,26 +646,25 @@ log "Backing up CC transcripts..."
 mkdir -p transcripts
 # Purge any pre-encryption plaintext transcripts (staging only — NOT the .gpg).
 find transcripts -maxdepth 1 -name '*.jsonl' -type f -delete 2>/dev/null || true
-if [ -d "$TRANSCRIPT_DIR" ]; then
-    if ! $_ENCRYPT_READY; then
-        log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping transcripts (refusing plaintext)"
-    else
-        # Encrypt each jsonl to transcripts/<name>.jsonl.gpg. Skip re-encryption
-        # when the encrypted copy is newer than the source (mirrors cp -u).
-        while IFS= read -r -d '' src; do
-            name=$(basename "$src")
-            dst="transcripts/${name}.gpg"
-            if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
-                continue
-            fi
-            encrypt_file "$src" "$dst" || log "WARNING: failed to encrypt $name"
-        done < <(find "$TRANSCRIPT_DIR" -maxdepth 1 -name '*.jsonl' -type f -print0)
-        _TRANSCRIPT_COUNT=$(find transcripts -maxdepth 1 -name '*.jsonl.gpg' 2>/dev/null | wc -l)
-        log "Transcripts: $_TRANSCRIPT_COUNT files (encrypted)"
+_transcript_flags=()
+case "${GENESIS_BACKUP_TRANSCRIPT_SCOPE:-main}" in
+    main) _transcript_flags+=("--project=$_CC_PROJECT_ID") ;;
+    all) ;;
+    *) _TRANSCRIPTS_COMPLETE=false
+       _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }invalid transcript scope"
+       _FAILURE_STAGE="transcripts"
+       log "WARNING: transcript scope must be main or all" ;;
+esac
+if $_TRANSCRIPTS_COMPLETE; then
+    if ! printf '%s' "$_BACKUP_PASSPHRASE" | python3 "$_SCRIPT_DIR/lib/transcript_archive.py" backup \
+        "$HOME/.claude/projects" --destination transcripts --scratch "$GENESIS_BIG_TMP" "${_transcript_flags[@]}"; then
+        _TRANSCRIPTS_COMPLETE=false
+        _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }transcript coverage incomplete"
+        _FAILURE_STAGE="transcripts"
+        log "WARNING: transcript coverage incomplete; keeping last-good archives"
     fi
-else
-    log "WARNING: transcript directory not found"
 fi
+_TRANSCRIPT_COUNT=$(find transcripts -maxdepth 1 -name '*.gpg' -type f | wc -l)
 
 # --- 4. Auto-memory files (encrypted — auto-memory can hold credentials/PII) ---
 log "Backing up auto-memory..."
@@ -678,7 +678,7 @@ if [ -d "$MEMORY_DIR" ]; then
         # Walk the memory directory, preserve relative structure, encrypt each file.
         # Skip re-encryption when the encrypted copy is newer than the source.
         while IFS= read -r -d '' src; do
-            rel="${src#$MEMORY_DIR/}"
+            rel="${src#"$MEMORY_DIR"/}"
             dst="memory/${rel}.gpg"
             mkdir -p "$(dirname "$dst")"
             if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
@@ -707,7 +707,7 @@ log "Backing up local config overlays..."
 mkdir -p config_overrides
 _LOCAL_OVERLAY_COUNT=0
 if [ -d "$GENESIS_DIR/config" ]; then
-    find "$GENESIS_DIR/config" -maxdepth 1 -name "*.local.yaml" | while IFS= read -r f; do
+    find "$GENESIS_DIR/config" -maxdepth 1 -name "*.local.yaml" -print0 | while IFS= read -r -d '' f; do
         cp "$f" config_overrides/ && _LOCAL_OVERLAY_COUNT=$(( _LOCAL_OVERLAY_COUNT + 1 ))
     done
     _LOCAL_OVERLAY_COUNT=$(find config_overrides -name "*.local.yaml" 2>/dev/null | wc -l)
@@ -874,8 +874,11 @@ else
         _overlap=""
         for _guard in "$_bdir_real" "$_btmp_real" "$_lroot_real"; do
             [ -n "$_guard" ] || continue
-            case "$_abs/" in "$_guard"/*) _overlap="$_guard" ;; esac
-            case "$_guard/" in "$_abs"/*) _overlap="$_guard" ;; esac
+            if backup_paths_overlap "$_abs" "$_guard"; then
+                _overlap="$_guard"
+            elif [ "$?" -ne 1 ]; then
+                _overlap="uninspectable output path"
+            fi
         done
         if [ -n "$_overlap" ]; then
             # Archiving the backups repo, the backup temp dir or a local off-site root
@@ -897,8 +900,11 @@ else
         fi
         _dup=""
         for _prev in "${_extra_abs_seen[@]+"${_extra_abs_seen[@]}"}"; do
-            case "$_abs/" in "$_prev"/*) _dup="$_prev" ;; esac
-            case "$_prev/" in "$_abs"/*) _dup="$_prev" ;; esac
+            if backup_paths_overlap "$_abs" "$_prev"; then
+                _dup="$_prev"
+            elif [ "$?" -ne 1 ]; then
+                _dup="uninspectable previous path"
+            fi
         done
         if [ -n "$_dup" ]; then
             _extra_skip "same as, inside, or containing another listed entry ~/${_dup#"$_home_real"/}" "$_d"
@@ -1029,6 +1035,10 @@ if {
 else
     rm -f .extra-manifest.tmp .extra-manifest 2>/dev/null || true
     log "WARNING: could not write .extra-manifest; a restore from this checkout will not restore its extra archives (the off-site snapshot is unaffected)"
+fi
+
+if [ -n "${_ANALYTICS_BACKUP_FD:-}" ]; then
+    exec {_ANALYTICS_BACKUP_FD}>&-
 fi
 
 # --- 6d. Hook audit stores (Tier 1) ---
@@ -1244,6 +1254,17 @@ else
     _T2_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
     _T2_DIR="${_T2_HOST_DIR}/${_T2_STAMP}"
 
+    # Published and incomplete snapshots are immutable. A repeated timestamp
+    # (including clock rollback) must never overwrite a prior recovery point.
+    # Retry with a fresh timestamp; listing uncertainty also forbids writes.
+    _T2_PROBE_RC=0
+    backend_list_strict "$_T2_DIR" >/dev/null || _T2_PROBE_RC=$?
+    case "$_T2_PROBE_RC" in
+        3) ;;
+        0) die "off-site snapshot already exists: $_T2_DIR; retry with a fresh timestamp" ;;
+        *) die "cannot verify off-site snapshot absence: $_T2_DIR" ;;
+    esac
+
     # Create the snapshot directory tree (backend_mkdir creates ancestors;
     # pre-existing levels are idempotent).
     backend_mkdir "${_T2_DIR}/data"
@@ -1251,7 +1272,7 @@ else
     backend_mkdir "${_T2_DIR}/transcripts"
 
     _T2_OK=true
-
+    if ! $_TRANSCRIPTS_COMPLETE; then _T2_OK=false; fi
     # Upload Qdrant snapshots — FRESH ones only (SF3). A .gpg left on disk by
     # a prior run (this run's snapshot failed) must not be stamped into a new
     # dated snapshot: it would misrepresent recency, and GFS retention would
@@ -1269,7 +1290,7 @@ else
                 continue
                 ;;
         esac
-        if backend_put "$f" "${_T2_DIR}/qdrant/$fname"; then
+        if backend_put_verified "$f" "${_T2_DIR}/qdrant/$fname" "$GENESIS_BIG_TMP"; then
             log "  off-site: uploaded $fname"
         else
             log "WARNING: off-site upload failed for $fname"
@@ -1285,7 +1306,7 @@ else
     # escrow-drift → DR box can't decrypt) dump is withheld, forcing NO COMPLETE
     # this run so restore keeps falling back to the last verified-good snapshot.
     if [ -f data/genesis.sql.gpg ] && $_SQL_FRESH && $_SQL_RESTORABLE; then
-        if backend_put "data/genesis.sql.gpg" "${_T2_DIR}/data/genesis.sql.gpg"; then
+        if backend_put_verified "data/genesis.sql.gpg" "${_T2_DIR}/data/genesis.sql.gpg" "$GENESIS_BIG_TMP"; then
             log "  off-site: uploaded genesis.sql.gpg"
         else
             log "WARNING: off-site upload failed for genesis.sql.gpg"
@@ -1301,17 +1322,17 @@ else
         _T2_OK=false
     fi
 
-    # Upload transcripts (part of the off-site snapshot)
-    for f in transcripts/*.gpg; do
-        [ -f "$f" ] || continue
-        fname=$(basename "$f")
-        if backend_put "$f" "${_T2_DIR}/transcripts/$fname"; then
-            log "  off-site: uploaded transcripts/$fname"
-        else
-            log "WARNING: off-site upload failed for transcripts/$fname"
-            _T2_OK=false
-        fi
-    done
+    # Publish authenticated inventory and upload only missing immutable captures.
+    # shellcheck source=scripts/lib/transcript_pool.sh
+    source "$_SCRIPT_DIR/lib/transcript_pool.sh"
+    if ! $_TRANSCRIPTS_COMPLETE; then
+        # A failed capture/checkpoint must not re-enter enrollment or publication.
+        log "WARNING: skipping transcript pool after incomplete capture"
+        _T2_OK=false
+    elif ! transcript_pool_backup transcripts "$_T2_HOST_DIR" "$_T2_DIR"; then
+        log "WARNING: transcript pooled snapshot incomplete"
+        _T2_OK=false
+    fi
 
     # Upload memory / config overlays / secrets — previously git-Tier-1 only. Including
     # them here makes the off-site snapshot a COMPLETE copy, so a no-git fresh-box DR can
@@ -1327,7 +1348,7 @@ else
     backend_mkdir "${_T2_DIR}/memory"
     while IFS= read -r -d '' f; do
         fname=$(basename "$f")
-        if backend_put "$f" "${_T2_DIR}/memory/$fname"; then
+        if backend_put_verified "$f" "${_T2_DIR}/memory/$fname" "$GENESIS_BIG_TMP"; then
             log "  off-site: uploaded memory/$fname"
         else
             log "WARNING: off-site upload failed for memory/$fname"
@@ -1346,7 +1367,7 @@ else
             rel="${f#eval/}"
             _sub="$(dirname "$rel")"
             [ "$_sub" != "." ] && backend_mkdir "${_T2_DIR}/eval/${_sub}"
-            if backend_put "$f" "${_T2_DIR}/eval/${rel}"; then
+            if backend_put_verified "$f" "${_T2_DIR}/eval/${rel}" "$GENESIS_BIG_TMP"; then
                 log "  off-site: uploaded eval/${rel}"
             else
                 log "WARNING: off-site upload failed for eval/${rel}"
@@ -1363,7 +1384,7 @@ else
         backend_mkdir "${_T2_DIR}/extra" || true  # a failed put below is counted per archive
         for fname in "${_EXTRA_BUILT[@]}"; do
             f="extra/$fname"
-            if backend_put "$f" "${_T2_DIR}/extra/${fname}"; then
+            if backend_put_verified "$f" "${_T2_DIR}/extra/${fname}" "$GENESIS_BIG_TMP"; then
                 _EXTRA_UPLOADED+=("$fname")
                 log "  off-site: uploaded extra/${fname}"
             else
@@ -1381,7 +1402,7 @@ else
     backend_mkdir "${_T2_DIR}/config_overrides"
     while IFS= read -r -d '' f; do
         fname=$(basename "$f")
-        if backend_put "$f" "${_T2_DIR}/config_overrides/$fname"; then
+        if backend_put_verified "$f" "${_T2_DIR}/config_overrides/$fname" "$GENESIS_BIG_TMP"; then
             log "  off-site: uploaded config_overrides/$fname"
         else
             log "WARNING: off-site upload failed for config_overrides/$fname"
@@ -1394,7 +1415,7 @@ else
     # failed upload of a PRESENT payload flips _T2_OK.
     if [ -f secrets/secrets.env.gpg ]; then
         backend_mkdir "${_T2_DIR}/secrets"
-        if backend_put "secrets/secrets.env.gpg" "${_T2_DIR}/secrets/secrets.env.gpg"; then
+        if backend_put_verified "secrets/secrets.env.gpg" "${_T2_DIR}/secrets/secrets.env.gpg" "$GENESIS_BIG_TMP"; then
             log "  off-site: uploaded secrets/secrets.env.gpg"
         else
             log "WARNING: off-site upload failed for secrets/secrets.env.gpg"
@@ -1411,7 +1432,7 @@ else
         [ -d creds/ssh ] && backend_mkdir "${_T2_DIR}/creds/ssh"
         while IFS= read -r -d '' f; do
             rel="${f#creds/}"
-            if backend_put "$f" "${_T2_DIR}/creds/${rel}"; then
+            if backend_put_verified "$f" "${_T2_DIR}/creds/${rel}" "$GENESIS_BIG_TMP"; then
                 log "  off-site: uploaded creds/${rel}"
             else
                 log "WARNING: off-site upload failed for creds/${rel}"
@@ -1430,7 +1451,7 @@ else
         # back to know what to expect, because a failed off-site LISTING looks the same
         # as an empty one, while a failed download of this file is detectable.
         {
-            printf 'genesis-snapshot 1\n'
+            printf 'genesis-snapshot 1\ntranscript-pool 1\n'
             for _n in "${_EXTRA_UPLOADED[@]+"${_EXTRA_UPLOADED[@]}"}"; do
                 printf 'extra %s\n' "$_n"
             done
@@ -1441,7 +1462,7 @@ else
                 printf 'partial %s\n' "$_n"
             done
         } > "$_T2_MARKER"
-        if ! backend_put "$_T2_MARKER" "${_T2_DIR}/COMPLETE"; then
+        if ! backend_put_atomic "$_T2_MARKER" "${_T2_DIR}/COMPLETE" "$GENESIS_BIG_TMP"; then
             log "WARNING: off-site upload failed for COMPLETE marker — snapshot unusable for restore"
             _T2_OK=false
         fi
@@ -1467,9 +1488,9 @@ else
     # Keep daily 7 / weekly 4 / monthly 6 of the COMPLETE off-site snapshots. gfs_select
     # ALWAYS keeps the newest (restore.sh selects the latest COMPLETE); we also skip the
     # current run's stamp explicitly. Best-effort — a prune failure never fails the backup.
-    # Transcripts are preserved elsewhere (local git keep-forever + the latest snapshot
-    # re-uploads the full set every run), so deleting an aged snapshot's transcripts/ copy
-    # loses nothing. Only the off-site dated tree is touched; the local ~/backups git repo
+    # Shared transcript objects remain while referenced by retained or incomplete
+    # pooled inventories. A safe sweep runs only after retention and publication.
+    # Only the off-site dated tree is touched; the local ~/backups git repo
     # is never pruned here. Runs only after a fully-uploaded (ok) snapshot this run, or
     # one whose core is COMPLETE and only opt-in extra dirs are missing: otherwise a
     # listed directory that stays missing would stop retention for good.
@@ -1509,6 +1530,12 @@ else
             _T2_SNAPSHOT_COUNT=$(( _T2_COMPLETE_TOTAL - _T2_PRUNED ))
         fi
     fi
+    if [ "$_T2_OK" = true ]; then
+        if ! transcript_pool_gc "$_T2_HOST_DIR" "$_T2_STAMP"; then
+            log "WARNING: transcript object GC deferred: incomplete or unreadable inventory; objects retained"
+        fi
+    fi
+
 fi
 backend_cleanup
 

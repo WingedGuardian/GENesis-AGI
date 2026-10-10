@@ -397,11 +397,17 @@ def backup(root, destination, scratch, password, project=None):
             or "\0" in project
         ):
             raise ValueError("project must be one directory name")
-        if root.is_symlink() or not root.is_dir():
-            raise ValueError("source root is missing or a symlink")
+        try:
+            root_stat = root.lstat()
+        except FileNotFoundError:
+            root_stat = None
+        if root_stat is not None and not stat.S_ISDIR(root_stat.st_mode):
+            raise ValueError("source root is not a directory or is a symlink")
         discovery_root = root / project if project is not None else root
-        if project is not None and not discovery_root.exists() and not discovery_root.is_symlink():
-            discovered = ()  # no transcripts yet in the selected project
+        try:
+            discovery_root.lstat()
+        except FileNotFoundError:
+            discovered = ()  # no transcripts yet; retained captures still require attestation
         else:
             discovered = sources(discovery_root, recursive=project is None)
         for source in discovered:

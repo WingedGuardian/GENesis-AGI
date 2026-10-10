@@ -2473,7 +2473,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 4117f6ed 2026-10-05
+verified: 1d88dbaa0654 2026-10-09
 ```
 
 - **The graders are TOLD the response status; they must never infer it.** The
@@ -3355,6 +3355,11 @@ verified: 85652265c 2026-10-09
   copies collapse; distinct decoded copies require an explicit encoding choice.
   Reader support precedes new-format capture;
   persistent analytics settings recovery lands separately.
+  Encrypted transcript capture checkpoints validation within a two-hour
+  window and verifies every referenced remote pool object before COMPLETE;
+  unreadable historical inventory keeps the snapshot incomplete.
+  Source inspection failures also keep coverage incomplete; only a missing source
+  path establishes an empty discovery scope.
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
   `process_lock` (the reason bare `python -m genesis serve` blocks systemd),
   tmp discipline (`~/tmp` for large temp — never override TMPDIR),

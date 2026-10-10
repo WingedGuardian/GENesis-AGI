@@ -4,7 +4,9 @@
 _pool_python() {
     printf '%s' "$_BACKUP_PASSPHRASE" | python3 "$_SCRIPT_DIR/lib/transcript_archive.py" "$@"
 }
-_pool_host_safe() { [[ "$1" =~ ^Genesis/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+_pool_host_safe() {
+    [[ "$1" =~ ^Genesis/[A-Za-z0-9._-]+$ ]] && [ "$1" != Genesis/. ] && [ "$1" != Genesis/.. ]
+}
 
 transcript_pool_backup() (
     local directory="$1" host="$2" snapshot="$3" work names rc=0 name object size
