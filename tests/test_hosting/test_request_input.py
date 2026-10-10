@@ -1,5 +1,6 @@
 """Real sockets exercise deadline behavior beneath WSGI framing and cleanup."""
 
+import contextlib
 import hashlib
 import json
 import queue
@@ -208,8 +209,8 @@ def test_incomplete_chunked_body_is_bad_request(server, body):
 
 def test_websocket_preserves_native_socket(server):
     # Add the actual existing Flask-Sock integration to the fixture app.
-    import websocket
     from flask_sock import Sock
+    from simple_websocket import Client, ConnectionClosed
 
     address, finished, app = server
     # Registration occurs before this fixture has served its first request.
@@ -220,14 +221,21 @@ def test_websocket_preserves_native_socket(server):
         assert bounded.INPUT_KEY not in request.environ
         ws.send(ws.receive())
 
-    client = websocket.create_connection(
-        f"ws://{address[0]}:{address[1]}/ws", timeout=2, http_proxy_host=None
-    )
+    class BoundedClient(Client):
+        def handshake(self):
+            self.sock.settimeout(2)
+            try:
+                super().handshake()
+            finally:
+                self.sock.settimeout(None)
+
+    client = BoundedClient.connect(f"ws://{address[0]}:{address[1]}/ws")
     try:
         client.send("fixture")
-        assert client.recv() == "fixture"
+        assert client.receive(timeout=2) == "fixture"
     finally:
-        client.close()
+        with contextlib.suppress(ConnectionClosed):
+            client.close()
     assert finished.get(timeout=1)
 
 
