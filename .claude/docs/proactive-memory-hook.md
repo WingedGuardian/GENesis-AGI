@@ -67,6 +67,56 @@ write-backs, but it still re-applies the external-world provenance label
 blockable content it injects locally — the same injection-defense invariant the
 server path enforces. It self-heals on the next prompt once the server is back.
 
+## Run budget — a soft deadline and a hard stop, both counted from process start
+
+Claude Code kills a UserPromptSubmit hook at its configured timeout (10s for
+this hook) and discards everything it printed. Two layers keep the hook inside
+that limit.
+
+**Soft deadline, 8s (`_RUN_DEADLINE_S`).** Checked between steps; the run stops
+early and skips its best-effort bookkeeping (working-set measure, activity row,
+metrics, the ambient fold) once it is spent. It counts from when the process
+started, not from when `_run` began: `main()` reads the process age
+(`hook_deadline.process_age_s`: the start time in `/proc/self/stat` against
+`CLOCK_BOOTTIME`; `/proc/uptime` is not used, since lxcfs virtualises it in a
+container) and the budget shrinks by it. An age that cannot be read, or is
+outside 0-30s (clocks that disagree), leaves the full budget.
+
+**Hard stop, 8.5s from spawn (`_HARD_STOP_S`, `scripts/hooks/hook_deadline.py`).**
+The soft deadline cannot interrupt a step that is already running: a SQLite
+query or commit, a cold import, a file read. MEASURED 2026-10-07 from Claude
+Code transcripts and the server log: three memory-hook kills (10.0, 10.6 and
+12.5 s) each reached the server within 0.8-1.5 s of spawn, got a 503 at
+5.3-6.0 s, and then overran inside the keyword-only fallback; startup was not
+the cause. So a daemon timer, armed at the top of the script (only when it runs
+as the hook, never on import), ends the process 8.5 s after spawn: it flushes
+what was printed, adds the out-of-time notice when no output had been
+finalised, writes the main thread's stack to stderr (Claude Code keeps hook
+stderr in the transcript's `hook_success` row, so every hard stop records the
+step that overran), and calls `os._exit(0)`. CPython releases the GIL inside
+sqlite3 calls and blocking reads, which is what lets the timer run while the
+main thread is stuck. Measured on the real hook with every database connect
+stalled for 30 s: the branch hook exited at 8.53 s with the notice and the
+blocked frame (`session_heartbeats.upsert_sync`); main's copy was still blocked
+at 60 s.
+
+**The notice**: `[Memory: the hook ran out of its 8s budget …; use
+memory_recall if prior context matters]`, a closing line that spends the
+writer's reserve (like the cut notice), so a large flush cannot clip it away.
+Printed only when the run ran out of time before reaching its own output
+decision and no recall line had landed. A run that reached its decision
+(a short prompt, a disabled server, a zero-hit answer) never prints it, however
+late it ends; off mode never prints it at all. A run that started already past
+its budget does print it even for a prompt that would not have recalled
+anything, because it stopped before it could tell.
+
+**What neither layer bounds.** A thread in uninterruptible disk sleep (an
+fsync) delays the process exit until that I/O returns; the hook's own SQLite
+connections therefore run `synchronous=NORMAL` (no per-commit fsync under WAL,
+as the server does), but connections opened by shared CRUD code
+(`upsert_sync`, `touch_terminal_session_row_sync`) keep the default. A C call
+that holds the GIL (a regex or JSON parse over a huge prompt) delays the timer.
+
 ## Observability
 
 `~/.genesis/proactive_metrics.json` records the latest invocation, including
