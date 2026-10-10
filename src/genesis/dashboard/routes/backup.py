@@ -85,6 +85,8 @@ _STATUS_SAFE_FIELDS = frozenset(
         "snapshot_count",
         "pruned_count",
         "tier1_pushed",
+        "extra_dirs_skipped",
+        "extra_upload_failed",
     }
 )
 
@@ -395,6 +397,11 @@ def _parse_systemd_timestamp(value: str | None) -> datetime | None:
         return None
 
 
+def _positive_count(value: object) -> bool:
+    """True for an integer counter above zero; False for anything else, bools included."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def _backup_health(
     last_backup: dict | None,
     schedule: dict | None,
@@ -556,6 +563,22 @@ def _backup_health(
                 "reason": "The off-site backup copy is incomplete — your local backup "
                 "succeeded but the off-site copy did not finish. Check the Backup tab.",
             }
+
+    # 8b. Configured extra directories were skipped or did not reach the off-site
+    #     copy (#2854). backup.sh keeps these non-fatal by design, so `success`
+    #     stays True; this is the only place they surface. It runs after the core
+    #     off-site check so an extras gap never masks a core one. A counter that
+    #     is not a non-negative integer (a hand-edited or legacy record) is
+    #     ignored rather than failing the status route.
+    if _positive_count(lb.get("extra_dirs_skipped")) or _positive_count(
+        lb.get("extra_upload_failed")
+    ):
+        return {
+            "state": "warn",
+            "code": "extra_dirs_incomplete",
+            "reason": "Some configured extra directories were not fully backed up. "
+            "Check the Backup tab for details.",
+        }
 
     # 9. The schedule probe itself failed (systemctl/D-Bus unreachable) and
     #    nothing more specific above already explained the banner — report the
