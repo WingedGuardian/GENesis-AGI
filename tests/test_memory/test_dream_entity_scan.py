@@ -198,9 +198,10 @@ async def test_merge_leaves_an_already_retired_loser_alone(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_merge_into_a_retired_survivor_writes_nothing(db, monkeypatch):
+async def test_merge_into_a_retired_survivor_leaves_the_loser_alone(db, monkeypatch):
     """The survivor comes from Qdrant too. If SQLite has retired it, merging the
-    live loser into it would take both out of recall."""
+    live loser into it would take both out of recall. Only the retired
+    survivor's Qdrant flag is re-asserted."""
     from genesis.qdrant import collections as qdrant_collections
 
     await db.execute(
@@ -222,7 +223,61 @@ async def test_merge_into_a_retired_survivor_writes_nothing(db, monkeypatch):
 
     assert report["auto_merged"] == 0
     assert report["already_retired"] == 1
-    qdrant_collections.update_payload.assert_not_called()
+    qdrant_collections.update_payload.assert_called_once()
+    assert qdrant_collections.update_payload.call_args.kwargs["point_id"] == "a"
+    assert qdrant_collections.update_payload.call_args.kwargs["payload"] == {
+        "deprecated": True,
+    }
+    assert (await _meta(db, "b"))["deprecated"] == 0
+    assert (await _meta(db, "b"))["superseded_by"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_live_loser_refused_by_a_retired_survivor_can_still_merge(db, monkeypatch):
+    """A refusal must exclude the RETIRED side for the rest of the run. Excluding
+    the live loser instead would skip its later pairs while the stale survivor
+    stays eligible, so one retired point could block every merge it touches."""
+    await db.execute(
+        "INSERT INTO memory_metadata (memory_id, created_at, deprecated, "
+        "superseded_by) VALUES ('a', ?, 1, 'explicit-new')",
+        (NOW.isoformat(),),
+    )
+    for pid in ("b", "c"):
+        await db.execute(
+            "INSERT INTO memory_metadata (memory_id, created_at, deprecated) "
+            "VALUES (?, ?, 0)",
+            (pid, NOW.isoformat()),
+        )
+    await db.commit()
+    older = NOW - timedelta(days=1)
+    a = _point("a", confidence=0.8, retrieved_count=9, created_at=older)
+    b = _point("b", confidence=0.8, retrieved_count=5, created_at=NOW)
+    c = _point("c", confidence=0.8, retrieved_count=0, created_at=NOW)
+    monkeypatch.setattr(
+        "genesis.qdrant.collections.batch_retrieve_vectors",
+        MagicMock(return_value={pid: [0.1] * 8 for pid in ("a", "b", "c")}),
+    )
+    monkeypatch.setattr("genesis.qdrant.collections.update_payload", MagicMock())
+    monkeypatch.setattr(
+        "genesis.memory.graph.invalidate_graph_cache", MagicMock(), raising=False,
+    )
+
+    async def fake_find(*_a, **_k):
+        return [(a, b, 0.99), (b, c, 0.99)]
+
+    monkeypatch.setattr(
+        "genesis.memory.entity_resolution.find_dedup_candidates", fake_find,
+    )
+    report = await dream_entity_scan.run_entity_resolution(
+        qdrant=MagicMock(), db=db, router=AsyncMock(), store=MagicMock(),
+        run_id="test-run", dry_run=False, buckets={("memory", "test"): [a, b, c]},
+    )
+
+    assert report["already_retired"] == 1
+    assert report["auto_merged"] == 1
+    merged = await _meta(db, "c")
+    assert merged["deprecated"] == 1
+    assert merged["superseded_by"] == "b"
     assert (await _meta(db, "b"))["deprecated"] == 0
 
 
@@ -258,6 +313,6 @@ async def test_a_failed_qdrant_mirror_heals_on_the_next_pass(db):
     finally:
         qdrant_collections.update_payload = original
 
-    assert applied is False
+    assert applied == "b"
     assert working.call_args.kwargs["payload"] == {"deprecated": True}
     assert (await _meta(db, "b"))["dream_cycle_run_id"] == "run-1"

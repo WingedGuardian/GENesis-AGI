@@ -1619,6 +1619,100 @@ class TestDreamWritesYieldToExplicitSupersede:
         }
 
     @pytest.mark.asyncio
+    async def test_rollback_keeps_a_synthesis_named_as_an_explicit_successor(self, db):
+        """Superseding an original with the synthesis its own run made: rollback
+        must not hard-delete that synthesis and leave the original pointing at a
+        deleted memory. The run's other original is still restored."""
+        from genesis.db.crud import memory as memory_crud
+        from genesis.memory.dream_cycle import rollback
+
+        await db.execute(
+            "INSERT INTO memory_metadata (memory_id, created_at, deprecated, "
+            "dream_cycle_run_id) VALUES ('synth-1', '2026-01-02', 0, 'synthesis:run-x')",
+        )
+        for mid in ("orig-a", "orig-b"):
+            await db.execute(
+                "INSERT INTO memory_metadata (memory_id, created_at, deprecated, "
+                "dream_cycle_run_id, superseded_by, superseded_at) "
+                "VALUES (?, '2026-01-01', 1, 'run-x', 'synth-1', '2026-01-02')",
+                (mid,),
+            )
+        await db.commit()
+        await memory_crud.mark_superseded(db, "orig-a", "synth-1", "2026-01-03")
+
+        with patch(_UPDATE), patch(_DELETE) as mock_delete:
+            report = await rollback("run-x", qdrant=MagicMock(), db=db)
+
+        assert report["syntheses_deleted"] == 0
+        mock_delete.assert_not_called()
+        # The stamp stays: link repair keeps exempting its provenance edges.
+        assert await _meta_row(db, "synth-1") == {
+            "deprecated": 0, "superseded_by": None, "dream_cycle_run_id": "synthesis:run-x",
+        }
+        assert await _meta_row(db, "orig-a") == {
+            "deprecated": 1, "superseded_by": "synth-1", "dream_cycle_run_id": None,
+        }
+        assert report["restored"] == 1
+        assert (await _meta_row(db, "orig-b"))["deprecated"] == 0
+
+    @pytest.mark.asyncio
+    async def test_rollback_still_deletes_a_synthesis_only_its_own_run_names(self, db):
+        """The keep rule must not swallow the ordinary case: a synthesis named
+        only by this run's own originals is deleted once they are restored."""
+        from genesis.memory.dream_cycle import rollback
+
+        await db.execute(
+            "INSERT INTO memory_metadata (memory_id, created_at, deprecated, "
+            "dream_cycle_run_id) VALUES ('synth-1', '2026-01-02', 0, 'synthesis:run-x')",
+        )
+        for mid in ("orig-a", "orig-b"):
+            await db.execute(
+                "INSERT INTO memory_metadata (memory_id, created_at, deprecated, "
+                "dream_cycle_run_id, superseded_by, superseded_at) "
+                "VALUES (?, '2026-01-01', 1, 'run-x', 'synth-1', '2026-01-02')",
+                (mid,),
+            )
+        await db.commit()
+
+        with patch(_UPDATE), patch(_DELETE) as mock_delete:
+            report = await rollback("run-x", qdrant=MagicMock(), db=db)
+
+        assert report["restored"] == 2
+        assert report["syntheses_deleted"] == 1
+        mock_delete.assert_called_once()
+        assert await _meta_row(db, "synth-1") is None
+        for mid in ("orig-a", "orig-b"):
+            assert await _meta_row(db, mid) == {
+                "deprecated": 0, "superseded_by": None, "dream_cycle_run_id": None,
+            }
+
+    @pytest.mark.asyncio
+    async def test_rollback_keeps_a_synthesis_another_memory_was_merged_into(self, db):
+        """An entity merge can pick a live synthesis as its survivor. Rolling back
+        the run that made the synthesis must not delete it from under the merged
+        memory, whose superseded_by names it."""
+        from genesis.memory.dream_cycle import rollback
+
+        await db.execute(
+            "INSERT INTO memory_metadata (memory_id, created_at, deprecated, "
+            "dream_cycle_run_id) VALUES ('synth-1', '2026-01-02', 0, 'synthesis:run-x')",
+        )
+        await db.execute(
+            "INSERT INTO memory_metadata (memory_id, created_at, deprecated, "
+            "dream_cycle_run_id, superseded_by, superseded_at) "
+            "VALUES ('merged', '2026-01-01', 1, 'run-y', 'synth-1', '2026-01-03')",
+        )
+        await db.commit()
+
+        with patch(_UPDATE), patch(_DELETE) as mock_delete:
+            report = await rollback("run-x", qdrant=MagicMock(), db=db)
+
+        assert report["syntheses_deleted"] == 0
+        mock_delete.assert_not_called()
+        assert (await _meta_row(db, "synth-1"))["deprecated"] == 0
+        assert (await _meta_row(db, "merged"))["superseded_by"] == "synth-1"
+
+    @pytest.mark.asyncio
     async def test_synthesis_leaves_an_already_retired_original_alone(self, db):
         """An explicit supersede whose Qdrant mirror failed leaves the point
         live, so it can enter a cluster. Synthesis must keep its successor and

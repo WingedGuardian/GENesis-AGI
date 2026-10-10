@@ -1488,6 +1488,16 @@ async def rollback(
     ``deprecated_edge_prune_days`` window: after it, ``dream_link_repair`` prunes
     the aged originals' (non-``extends``) edges, and rollback cannot recreate
     them. Run rollbacks within that window.
+
+    A synthesis that some row still names in ``superseded_by`` when step 4
+    runs is KEPT. Step 2 has already cleared (and committed) this run's own
+    originals' pointers, so a pointer left is normally someone else's (an
+    explicit supersede onto the synthesis, or an entity merge into it), and
+    deleting the synthesis would leave that row pointing at nothing. The one
+    exception is an original whose step-2 write failed: it keeps its pointer,
+    so its synthesis is kept too, and a re-run of the rollback finishes both.
+    The run's restored originals then sit beside a kept synthesis in recall: a
+    duplicate, not a dangling pointer.
     """
     from genesis.qdrant.collections import update_payload
 
@@ -1546,10 +1556,12 @@ async def rollback(
             # Conditional, and before Qdrant: an explicit supersede of the
             # synthesis that committed after the SELECT clears its stamp, and
             # the memory it now names as superseded must survive the rollback.
+            # Nor while any row still names it as its successor (docstring).
             cursor = await db.execute(
                 "DELETE FROM memory_metadata WHERE memory_id = ? "
-                "AND dream_cycle_run_id = ?",
-                (sid, f"synthesis:{run_id}"),
+                "AND dream_cycle_run_id = ? AND NOT EXISTS ("
+                "SELECT 1 FROM memory_metadata WHERE superseded_by = ?)",
+                (sid, f"synthesis:{run_id}", sid),
             )
             if cursor.rowcount == 0:
                 continue
