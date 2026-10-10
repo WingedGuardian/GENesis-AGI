@@ -110,6 +110,9 @@ async def find_exact_duplicate(
         "SELECT memory_id, content FROM memory_fts "
         "WHERE length(content) = ? "
         "AND substr(content, 1, 200) = ? "
+        # UUIDv8 is reserved for namespaced writes, including partial writes.
+        # This survives loss/unavailability of the reservation lookup table.
+        "AND NOT (length(memory_id)=36 AND substr(memory_id,15,1)='8') "
         "LIMIT 200",
         (len(content), prefix),
     )

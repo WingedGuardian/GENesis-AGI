@@ -72,7 +72,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: cd784816 2026-09-09
+verified: ba6e357a7998 2026-10-08
 ```
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
@@ -104,6 +104,18 @@ Phase 0's (possibly sampled) report — it re-enumerates exactly. Audit rows:
 d0008; `MemoryStore.delete()` is point-first + fail-closed (defers, returning
 `{"deferred": True}` and recording a tombstone, when Qdrant is unavailable —
 callers must honor it).
+
+**Explicit external writes have isolated exact dedup.** `memory/namespace.py`
+reserves `(peer, external_untrusted, collection, exact-content digest)` before
+the `MemoryStore.store_reporting_creation` pipeline writes its deterministic
+UUIDv8 ID. Ordinary UUIDv4 writes exclude these IDs from dedup. Partial retries
+repair only their reserved ID and retain compensation ownership semantics;
+this does not grant knowledge-promotion permission or replace cross-store
+integrity repair. Contract: `docs/reference/peer-memory-namespaces.md`.
+Namespaced writes/deletes/recovery serialize across processes through a per-ID
+file lock. Owner deletion retains a `deleted` reservation that blocks stale
+retries and same-peer reoffers until explicit owner restoration; ordinary
+write/delete behavior is unchanged.
 
 **Retrieval is TIERED — the hottest auto-fired paths carry the thinnest
 stack.** Deep path: `memory/retrieval.py` `HybridRetriever.recall` (bitemporal

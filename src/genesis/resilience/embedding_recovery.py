@@ -149,7 +149,11 @@ class EmbeddingRecoveryWorker:
                 # we take it now so the "is it still here?" check and the point
                 # write are atomic vs the delete cascade — a delete can no longer
                 # slip between them and leave a resurrected Qdrant-only ghost.
-                async with memory_id_lock(item["memory_id"]):
+                from genesis.memory.namespace import recovery_guard
+
+                async with memory_id_lock(item["memory_id"]), recovery_guard(self._db, item["memory_id"]) as namespace_valid:
+                    if not namespace_valid:
+                        continue
                     # Fail-closed against a concurrent delete. We pulled `item`
                     # from query_pending BEFORE the (slow) embed; MemoryStore
                     # .delete() cascades removal of this memory's pending row
@@ -200,8 +204,11 @@ class EmbeddingRecoveryWorker:
                         payload=payload,
                     )
 
-                    # Auto-link if linker available
-                    if self._linker is not None:
+                    # Namespaced external writes preserve their no-link policy
+                    # through embedding fallback and integrity requeue.
+                    from genesis.memory.namespace import is_namespaced_id
+
+                    if self._linker is not None and not is_namespaced_id(item["memory_id"]):
                         try:
                             await self._linker.auto_link(
                                 item["memory_id"],
