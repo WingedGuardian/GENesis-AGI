@@ -356,26 +356,106 @@ class MemoryStore:
                     f"got {life_domain!r}"
                 )
 
-        # Dedup: skip if exact content already stored (any collection)
-        try:
-            existing = await memory_crud.find_exact_duplicate(
-                self._db, content=content,
-            )
-            if existing:
-                logger.debug("Skipping duplicate memory store: %s", existing)
-                # NOT created by this call: the caller must not compensate it.
-                return (existing, False)
-        except Exception:
-            # Dedup check is best-effort — never block a store on lookup failure
-            logger.warning("Dedup check failed, proceeding with store", exc_info=True)
-
-        # Surface form normalization: expand known aliases before embedding
+        # Surface form normalization: expand known aliases before embedding.
+        # MUST run BEFORE the dedup lookup below, not after it. The lookup
+        # matches memory_fts content EXACTLY, and what lands in memory_fts is
+        # the NORMALIZED text — so normalizing afterwards meant a store of
+        # "CC ..." persisted "Claude Code ..." while the next store of the same
+        # raw text queried for "CC ...", missed its own row, and wrote a second
+        # copy whose STORED content was byte-identical to the first. Aliases are
+        # seeded by default ("CC" -> "Claude Code",
+        # entity_resolution._SEED_ALIASES), so this was not a configured-only
+        # hazard.
+        raw_content = content
         try:
             from genesis.memory.entity_resolution import normalize_content
 
             content = normalize_content(content)
         except Exception:
             pass  # best-effort — never block a store on normalization failure
+
+        # Dedup: skip if exact content already stored (any collection).
+        #
+        # BOTH forms are checked, because memory_fts can legitimately hold
+        # either. `load_aliases()` is mtime-driven and explicitly best-effort,
+        # so an alias added AFTER a row was written — or a normalization that
+        # failed once and later recovered — leaves the RAW text in the index.
+        # Querying only the normalized form would miss that row and mint the
+        # very duplicate normalizing-first exists to prevent.
+        existing: str | None = None
+        try:
+            # Scoped to the write's own recall scope: a subsystem write
+            # dedups against its own subsystem's rows, a foreground write
+            # against user-visible ones (see find_exact_duplicate).
+            existing = await memory_crud.find_exact_duplicate(
+                self._db, content=content, source_subsystem=source_subsystem,
+            )
+            if not existing and raw_content != content:
+                existing = await memory_crud.find_exact_duplicate(
+                    self._db, content=raw_content,
+                    source_subsystem=source_subsystem,
+                )
+            if not existing:
+                # A legacy row can also carry a DIFFERENT alias spelling than
+                # this write's raw form — the seed maps both "CC" and
+                # "claude-code" to "Claude Code", so a row stored as "CC ..."
+                # is invisible to a later "claude-code ..." write unless the
+                # alternate surface forms are queried too.
+                from genesis.memory.entity_resolution import surface_variants
+
+                for variant in surface_variants(content):
+                    if variant == raw_content:
+                        continue  # already queried above
+                    existing = await memory_crud.find_exact_duplicate(
+                        self._db, content=variant,
+                        source_subsystem=source_subsystem,
+                    )
+                    if existing:
+                        break
+        except Exception:
+            # Dedup DISCOVERY is best-effort — never block a store on lookup
+            # failure. The supersession below is deliberately outside this
+            # guard: once a duplicate is established, a transient failure in
+            # resolve/validate/mark must surface to the caller rather than
+            # falling through to a second write of the same content.
+            logger.warning("Dedup check failed, proceeding with store", exc_info=True)
+            existing = None
+        if existing:
+            # A duplicate does NOT discharge the supersession. The caller
+            # asked for two things — store this, deprecate that — and only
+            # the first is already satisfied. Returning bare here dropped
+            # the second silently, leaving the stale memory live while the
+            # API reported success. Supersede onto the row that already
+            # carries this content.
+            #
+            # Resolution happens HERE rather than reusing the block below,
+            # which runs after this early return. It raises on an
+            # unresolvable handle exactly as the normal path does, and
+            # nothing has been written at this point either.
+            if supersedes:
+                resolved = await self._resolve_supersede_target(supersedes)
+                # The pair still has to be a legal supersession. The
+                # normal path's successor is a fresh uuid, so it cannot
+                # collide with the target; here the successor is the
+                # PRE-EXISTING duplicate row, so `resolved == existing` is
+                # reachable and would deprecate the only copy while
+                # pointing it at itself. Check equality BEFORE locking —
+                # taking `memory_id_lock` twice on the same id deadlocks —
+                # then lock the pair and run the same validation
+                # `supersede()` does before mutating.
+                if resolved == existing:
+                    raise SupersedeUnresolved(
+                        resolved, "self_supersede", existing
+                    )
+                first, second = sorted((resolved, existing))
+                async with memory_id_lock(first), memory_id_lock(second):
+                    await self._validate_supersede_pair(resolved, existing)
+                    await self._mark_superseded(
+                        resolved, existing, datetime.now(UTC).isoformat(),
+                    )
+            logger.debug("Skipping duplicate memory store: %s", existing)
+            # NOT created by this call: the caller must not compensate it.
+            return (existing, False)
 
         # Confidence gate: low-confidence → FTS5 only, skip Qdrant
         # Deferred import to break circular: memory.store ↔ perception
@@ -772,7 +852,7 @@ class MemoryStore:
         if old_id == new_id:
             raise SupersedeUnresolved(old_id, "self_supersede", new_id)
         # Both ids, in sorted order — a total acquisition order cannot cycle,
-        # which is the one sanctioned relaxation of _locks.py's
+        # which is one of the two sanctioned relaxations of _locks.py's
         # one-lock-per-holder invariant (see that module's docstring). Holding
         # both through validate + mark closes the validate→mark window: a
         # delete or supersession of new_id can no longer commit in between and
