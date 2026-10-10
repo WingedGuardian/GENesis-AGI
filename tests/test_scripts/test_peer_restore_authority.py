@@ -278,6 +278,9 @@ def test_update_prepares_guarded_snapshot_before_stop(tmp_path, compatible):
     script = tmp_path / "preflight.sh"
     script.write_text(
         'set -euo pipefail\nGENESIS_ROOT="$1"\n'
+        # The window also holds the staged-excused pre-stop guard (normal,
+        # non --post-merge path); it reads git state and has its own tests.
+        'POST_MERGE=false\n_staged_excused_divergence_guard() { :; }\n'
         + block
         + '\nprintf "ADMITTED=%s\\n" "$DB_SNAPSHOT_TAKEN"\n'
     )

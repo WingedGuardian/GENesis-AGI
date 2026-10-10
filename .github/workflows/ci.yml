@@ -1158,4 +1158,8 @@ jobs:
         # authority suite. Other five changed test files retain their counts.
         # No new skip allowance. Floor: 25170 + 41 = 25211.
         # Shared transcript credential-label policy (#3072): +2. Floor: 25211 + 2 = 25213.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25213
+        # Staged excused-path guard: test_update_checkout_moved.py 79 -> 93 (+14).
+        # Floor: 24421 + 14 = 24435; skip ceiling remains 102.
+        # Merge with main (#2889): main 25211 + this PR's measured +14 = 25225.
+        # Re-merge with main (#2889): main 25213 + this PR's measured +14 = 25227.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25227

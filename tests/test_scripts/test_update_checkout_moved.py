@@ -65,14 +65,18 @@ def _block(marker: str) -> str:
     return match.group(1)
 
 
-def _run(script: str, home: Path) -> subprocess.CompletedProcess:
+def _run(
+    script: str, home: Path, *, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     libs = f'. "{MARKER_LIB}"\n. "{LIB}"\n. "{RECOVERY_LIB}"\n. "{LOCK_LIB}"\n'
+    env = _env(home)
+    env.update(extra_env or {})
     return subprocess.run(
         ["bash", "-c", "set -Eeuo pipefail\n" + libs + script],
         capture_output=True,
         text=True,
         timeout=60,
-        env=_env(home),
+        env=env,
     )
 
 
@@ -1217,3 +1221,196 @@ def test_another_fetch_moving_the_tracking_ref_cannot_change_the_pin(upstream_an
     )
     assert re.search(r"PIN=(\w+)", r.stdout).group(1) == _git(up, "rev-parse", "main")
     assert _git(clone, "for-each-ref", "refs/genesis/") == "", "the private ref is deleted"
+
+
+_EXCUSED_STAGED_PATHS = (
+    "AGENTS.md",
+    "config/procedure_triggers.yaml",
+    ".claude/settings.local.json",
+    ".serena/project.yml",
+    "src/genesis/identity/USER.md",
+)
+
+
+def _divergent_deploy_head(root: Path) -> str:
+    _git(root, "checkout", "-qb", "incoming")
+    (root / "upstream.txt").write_text("upstream\n")
+    _git(root, "add", "--", "upstream.txt")
+    _git(root, "commit", "-qm", "upstream change")
+    deploy_head = _git(root, "rev-parse", "HEAD")
+    _git(root, "checkout", "-q", "main")
+    (root / "local.txt").write_text("local\n")
+    _git(root, "add", "--", "local.txt")
+    _git(root, "commit", "-qm", "local divergence")
+    return deploy_head
+
+
+def _track_agents(root: Path) -> None:
+    (root / "AGENTS.md").write_text("tracked install file\n")
+    _git(root, "add", "--", "AGENTS.md")
+    _git(root, "commit", "-qm", "track excused file")
+
+
+def _track_transitional(root: Path) -> None:
+    path = root / ".claude" / "settings.local.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"install": true}\n')
+    _git(root, "add", "--", ".claude/settings.local.json")
+    _git(root, "commit", "-qm", "track transitional excused file")
+
+
+def _run_staged_excused_guard(
+    root: Path,
+    deploy_head: str,
+    home: Path,
+    *,
+    git_override: str = "",
+    extra_env: dict[str, str] | None = None,
+):
+    script = (
+        f"""GENESIS_ROOT="{root}"
+DEPLOY_HEAD="{deploy_head}"
+POST_MERGE=false
+ROLLBACK_TAG=pre-update-test
+_clear_deploy_state() {{ echo CLEAR-STATE; }}
+"""
+        + git_override + _block("staged-excused-divergence") + 'echo PASSED\n'
+    )
+    return _run(script, home, extra_env=extra_env)
+
+
+@pytest.mark.parametrize(
+    ("history", "action", "refuses"),
+    [
+        ("divergent", "delete", True),
+        ("divergent", "ignored-add", True),
+        ("divergent", "intent-to-add", True),
+        ("divergent", "agents-edit", False),
+        ("fast-forward", "delete", False),
+        ("local-ahead", "delete", False),
+        ("divergent", "transition-deleted-edit", True),
+        ("divergent", "transition-broken-symlink", True),
+        ("divergent", "gitlink", True),
+        ("divergent", "descendant", True),
+        ("divergent", "transition-edit-present", True),
+    ],
+)
+def test_staged_excused_path_guard_cases(repo, tmp_path, history, action, refuses):
+    _track_agents(repo)
+    if action.startswith("transition-"):
+        _track_transitional(repo)
+    if history == "divergent":
+        deploy_head = _divergent_deploy_head(repo)
+    elif history == "fast-forward":
+        _git(repo, "checkout", "-qb", "incoming")
+        (repo / "upstream.txt").write_text("upstream\n")
+        _git(repo, "add", "--", "upstream.txt")
+        _git(repo, "commit", "-qm", "upstream change")
+        deploy_head = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "checkout", "-q", "main")
+    else:
+        deploy_head = _git(repo, "rev-parse", "HEAD")
+        (repo / "local.txt").write_text("local-ahead commit\n")
+        _git(repo, "add", "--", "local.txt")
+        _git(repo, "commit", "-qm", "local-ahead commit")
+    extra_env = None
+    if action in {"ignored-add", "intent-to-add"}:
+        (repo / ".gitignore").write_text("config/procedure_triggers.yaml\n")
+        _git(repo, "add", "--", ".gitignore")
+        _git(repo, "commit", "-qm", "ignore generated procedure cache")
+        path = repo / "config" / "procedure_triggers.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("install-local cache\n")
+        _git(repo, "add", *(["-N"] if action == "intent-to-add" else []), "-f", "--",
+             "config/procedure_triggers.yaml")
+    elif action == "delete":
+        _git(repo, "rm", "--cached", "--", "AGENTS.md")
+    elif action == "agents-edit":
+        (repo / "AGENTS.md").write_text("staged edit\n")
+        _git(repo, "add", "--", "AGENTS.md")
+    elif action.startswith("transition-"):
+        path = repo / ".claude" / "settings.local.json"
+        path.write_text('{"install": false}\n')
+        _git(repo, "add", "--", ".claude/settings.local.json")
+        if action == "transition-deleted-edit":
+            path.unlink()
+        elif action == "transition-broken-symlink":
+            path.unlink()
+            path.symlink_to("missing-target")
+            _git(repo, "add", "--", ".claude/settings.local.json")
+    elif action == "gitlink":
+        _git(repo, "update-index", "--add", "--cacheinfo",
+             f"160000,{deploy_head},.serena/project.yml")
+        extra_env = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "diff.ignoreSubmodules",
+            "GIT_CONFIG_VALUE_0": "all",
+        }
+    elif action == "descendant":
+        path = repo / ".serena" / "project.yml" / "child"
+        path.parent.mkdir(parents=True)
+        path.write_text("staged child\n")
+        _git(repo, "add", "--", ".serena/project.yml/child")
+
+    result = _run_staged_excused_guard(
+        repo, deploy_head, tmp_path, extra_env=extra_env
+    )
+
+    path = (
+        ".claude/settings.local.json"
+        if action.startswith("transition-")
+        else ".serena/project.yml"
+        if action in {"gitlink", "descendant"}
+        else "config/procedure_triggers.yaml"
+        if action in {"ignored-add", "intent-to-add"}
+        else "AGENTS.md"
+    )
+    assert result.returncode == int(refuses), result.stderr
+    if refuses:
+        assert "staged changes on excused paths" in result.stdout.lower()
+        assert f"    {path}" in result.stdout
+        assert "CLEAR-STATE" in result.stdout
+        assert "PASSED" not in result.stdout
+    else:
+        assert "PASSED" in result.stdout
+        assert "CLEAR-STATE" not in result.stdout
+
+
+@pytest.mark.parametrize("failure", ["index", "ancestor"])
+def test_staged_guard_read_failures_refuse_and_clean_up(repo, tmp_path, failure):
+    deploy_head = _divergent_deploy_head(repo)
+    if failure == "index":
+        _track_agents(repo)
+        (repo / ".git" / "index").write_bytes(b"not a git index")
+        git_override = ""
+    else:
+        git_override = (
+            'git() { [[ "$*" == *"merge-base --is-ancestor"* ]] && return 2; '
+            'command git "$@"; }\n'
+        )
+    result = _run_staged_excused_guard(
+        repo, deploy_head, tmp_path, git_override=git_override
+    )
+
+    expected = (
+        "could not read the staged index"
+        if failure == "index"
+        else "could not compare head with"
+    )
+    assert result.returncode == 1 and expected in result.stdout.lower()
+    assert "CLEAR-STATE" in result.stdout and "PASSED" not in result.stdout
+
+
+def test_staged_excused_guard_uses_plumbing_and_runs_at_pre_stop():
+    text = _text()
+    block = _block("staged-excused-divergence")
+    assert all(path in block for path in _EXCUSED_STAGED_PATHS)
+    assert "ls-files -s" in block and "ls-tree -r" in block
+    assert "diff --cached" not in block
+    assert "_staged_excused_divergence_guard" in _block("staged-excused-prestop")
+    guard = text.index("# BEGIN staged-excused-divergence")
+    backup_end = text.index("# END ephemeral-prestop-backup")
+    snapshot = text.index("--- Snapshotting database ---")
+    prestop = text.index("# BEGIN staged-excused-prestop")
+    stop = text.index("--- Stopping services for update ---")
+    assert guard < backup_end < snapshot < prestop < stop
