@@ -1536,3 +1536,179 @@ class TestSynthesisWingVocabulary:
         for wing in sorted(WINGS):
             assert wing in prompt, f"{wing} missing from the synthesis prompt"
         assert '"<wing>"' not in prompt
+
+
+# ── Dream writes vs a concurrent explicit supersede (#3014 round 2) ─────
+
+
+class _SupersedeFirst:
+    """Wraps a real connection: just before the first statement starting with
+    *prefix* runs, commit an explicit supersede of *memory_id*. Deterministically
+    reproduces a ``MemoryStore.supersede`` landing between rollback's SELECT and
+    its write."""
+
+    def __init__(self, db, prefix, memory_id):
+        self._db, self._prefix, self._mid, self.fired = db, prefix, memory_id, False
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    async def execute(self, sql, *args, **kwargs):
+        if not self.fired and sql.startswith(self._prefix):
+            from genesis.db.crud import memory as memory_crud
+
+            self.fired = True
+            await memory_crud.mark_superseded(
+                self._db, self._mid, "explicit-new", "2026-01-03",
+            )
+        return await self._db.execute(sql, *args, **kwargs)
+
+
+async def _meta_row(db, mid):
+    cur = await db.execute(
+        "SELECT deprecated, superseded_by, dream_cycle_run_id "
+        "FROM memory_metadata WHERE memory_id = ?",
+        (mid,),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+class TestDreamWritesYieldToExplicitSupersede:
+    @pytest.mark.asyncio
+    async def test_rollback_keeps_an_original_superseded_after_its_select(self, db):
+        from genesis.memory.dream_cycle import rollback
+
+        await db.execute(
+            "INSERT INTO memory_metadata (memory_id, created_at, deprecated, "
+            "dream_cycle_run_id, superseded_by, superseded_at) "
+            "VALUES ('orig', '2026-01-01', 1, 'run-x', 'synth-1', '2026-01-02')",
+        )
+        await db.commit()
+        proxy = _SupersedeFirst(db, "UPDATE memory_metadata SET deprecated = 0", "orig")
+
+        with patch(_UPDATE) as mock_update, patch(_DELETE):
+            report = await rollback("run-x", qdrant=MagicMock(), db=proxy)
+
+        assert proxy.fired
+        assert report["restored"] == 0
+        mock_update.assert_not_called()
+        assert await _meta_row(db, "orig") == {
+            "deprecated": 1, "superseded_by": "explicit-new", "dream_cycle_run_id": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_rollback_keeps_a_synthesis_superseded_after_its_select(self, db):
+        from genesis.memory.dream_cycle import rollback
+
+        await db.execute(
+            "INSERT INTO memory_metadata (memory_id, created_at, deprecated, "
+            "dream_cycle_run_id) VALUES ('synth-1', '2026-01-02', 0, 'synthesis:run-x')",
+        )
+        await db.commit()
+        proxy = _SupersedeFirst(db, "DELETE FROM memory_metadata", "synth-1")
+
+        with patch(_UPDATE), patch(_DELETE) as mock_delete:
+            report = await rollback("run-x", qdrant=MagicMock(), db=proxy)
+
+        assert proxy.fired
+        assert report["syntheses_deleted"] == 0
+        mock_delete.assert_not_called()
+        assert await _meta_row(db, "synth-1") == {
+            "deprecated": 1, "superseded_by": "explicit-new", "dream_cycle_run_id": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_synthesis_leaves_an_already_retired_original_alone(self, db):
+        """An explicit supersede whose Qdrant mirror failed leaves the point
+        live, so it can enter a cluster. Synthesis must keep its successor and
+        run (SQLite) and its point (Qdrant), and count only what it retired."""
+        cluster = _fake_cluster(3)
+        await _persist_worklist(db, [cluster], weekly_run_id="w")
+        for item in cluster[:2]:
+            await db.execute(
+                "INSERT INTO memory_metadata (memory_id, created_at, deprecated) "
+                "VALUES (?,?,0)",
+                (item["id"], "2026-01-01T00:00:00+00:00"),
+            )
+        held = cluster[2]["id"]
+        await db.execute(
+            "INSERT INTO memory_metadata (memory_id, created_at, deprecated, "
+            "superseded_by, superseded_at) VALUES (?, ?, 1, 'explicit-new', ?)",
+            (held, "2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00"),
+        )
+        await db.commit()
+
+        store = AsyncMock()
+        store.store_reporting_creation = AsyncMock(return_value=("new-synth-id", True))
+        store.linker = None
+        synthesis_json = json.dumps({
+            "content": "Merged facts 0, 1 and 2 into one canonical record",
+            "tags": ["test"], "confidence": 0.9, "memory_class": "fact",
+            "wing": "memory", "room": "store", "synthesis_notes": "combined",
+        })
+        router = AsyncMock()
+        router.route_call = AsyncMock(side_effect=[
+            MagicMock(success=True, content=synthesis_json),
+            MagicMock(success=True, content=json.dumps({"verdict": "PASS"})),
+        ])
+
+        with patch(_UPDATE) as mock_update:
+            report = await run_synthesis_drain(
+                qdrant=_drain_qdrant(_live_points(cluster)), db=db,
+                router=router, store=store, budget=10, dry_run=False,
+            )
+
+        assert report["memories_deprecated"] == 2
+        # Left out before the LLM: its superseded text is not resynthesized.
+        assert "fact 2" not in str(router.route_call.call_args_list[0])
+        held_calls = [
+            c.kwargs["payload"] for c in mock_update.call_args_list
+            if c.kwargs.get("point_id") == held
+        ]
+        assert held_calls == [{"deprecated": True}]  # flag healed, no new pointer
+        synth_from = [
+            c.kwargs["payload"]["synthesized_from"] for c in mock_update.call_args_list
+            if "synthesized_from" in c.kwargs["payload"]
+        ]
+        assert synth_from == [[cluster[0]["id"], cluster[1]["id"]]]
+        assert await _meta_row(db, held) == {
+            "deprecated": 1, "superseded_by": "explicit-new", "dream_cycle_run_id": None,
+        }
+        for item in cluster[:2]:
+            row = await _meta_row(db, item["id"])
+            assert row["superseded_by"] == "new-synth-id"
+
+    @pytest.mark.asyncio
+    async def test_cluster_left_with_one_live_member_is_blocked(self, db):
+        """Every member but one already retired: nothing to consolidate, so no
+        LLM call, no new memory, and the live member stays untouched."""
+        cluster = _fake_cluster(2)
+        await _persist_worklist(db, [cluster], weekly_run_id="w")
+        await db.execute(
+            "INSERT INTO memory_metadata (memory_id, created_at, deprecated) "
+            "VALUES (?, '2026-01-01T00:00:00+00:00', 0)",
+            (cluster[0]["id"],),
+        )
+        await db.execute(
+            "INSERT INTO memory_metadata (memory_id, created_at, deprecated, "
+            "superseded_by) VALUES (?, '2026-01-01T00:00:00+00:00', 1, 'explicit-new')",
+            (cluster[1]["id"],),
+        )
+        await db.commit()
+        store = AsyncMock()
+        store.linker = None
+        router = AsyncMock()
+
+        with patch(_UPDATE):
+            report = await run_synthesis_drain(
+                qdrant=_drain_qdrant(_live_points(cluster)), db=db,
+                router=router, store=store, budget=10, dry_run=False,
+            )
+
+        assert report["clusters_merged"] == 0
+        router.route_call.assert_not_called()
+        store.store_reporting_creation.assert_not_called()
+        assert await _meta_row(db, cluster[0]["id"]) == {
+            "deprecated": 0, "superseded_by": None, "dream_cycle_run_id": None,
+        }

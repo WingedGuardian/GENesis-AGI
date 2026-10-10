@@ -1213,6 +1213,36 @@ async def _synthesize_and_deprecate(
     """Synthesize a cluster into one canonical memory, deprecate originals."""
     wing = cluster[0]["wing"]
     room = cluster[0]["room"]
+
+    # Members come from Qdrant's payload; SQLite is the truth. A member SQLite
+    # already retired (an explicit supersede whose Qdrant mirror failed, an
+    # adjudication, an earlier run) must not have its text folded into a new
+    # live memory, so it leaves the cluster before the LLM sees it.
+    ids = [item["id"] for item in cluster]
+    marks = ",".join("?" * len(ids))
+    retired = {
+        row[0]
+        for row in await db.execute_fetchall(
+            f"SELECT memory_id FROM memory_metadata "  # noqa: S608 - placeholders only
+            f"WHERE deprecated = 1 AND memory_id IN ({marks})",
+            ids,
+        )
+    }
+    if retired:
+        from genesis.qdrant.collections import update_payload
+
+        # They reached us live in Qdrant: a failed earlier mirror. Re-assert
+        # only the flag; their successor and run stay as SQLite records them.
+        for mid in retired:
+            update_payload(
+                qdrant, collection=COLLECTION, point_id=mid, payload={"deprecated": True},
+            )
+        cluster = [item for item in cluster if item["id"] not in retired]
+        if len(cluster) < 2:
+            raise SynthesisBlockedError(
+                error=f"{len(retired)} member(s) already retired in SQLite; "
+                f"{len(cluster)} live left",
+            )
     original_ids = [item["id"] for item in cluster]
 
     # Build synthesis prompt
@@ -1328,11 +1358,45 @@ async def _synthesize_and_deprecate(
     )
 
     # Deprecate originals
+    from genesis.db.crud import memory as memory_crud
+
     deprecated_count = 0
     deprecated_at = datetime.now(UTC).isoformat()
     for original_id in original_ids:
         try:
-            # Qdrant: mark as deprecated
+            # SQLite first, and only a LIVE row: one SQLite already retired
+            # keeps its successor and run, and its Qdrant point is left for
+            # that retirement's own repair. deprecated_at is the authoritative
+            # deprecation time for link aging — the synthesis's created_at is
+            # unreliable (store()'s exact-dedup can return an old memory).
+            # superseded_by/superseded_at record the synthesis as successor in
+            # SQLite (same columns as memory_crud.mark_superseded), not only in
+            # Qdrant's synthesized_into. No recall path reads it yet; the edge
+            # re-attach (#2993) and forward-pointing recall will.
+            outcome = await memory_crud.mark_dream_retired(
+                db,
+                original_id,
+                run_id=run_id,
+                successor_id=new_memory_id,
+                timestamp=deprecated_at,
+                deprecated_at=deprecated_at,
+            )
+            if outcome == "already_retired":
+                # Keep that retirement's successor and run; only re-assert
+                # Qdrant's flag, which a failed earlier mirror leaves false.
+                logger.info(
+                    "Dream cycle: %s was already retired in SQLite; kept",
+                    original_id,
+                )
+                update_payload(
+                    qdrant,
+                    collection=COLLECTION,
+                    point_id=original_id,
+                    payload={"deprecated": True},
+                )
+                continue
+            if outcome == "successor_retired":
+                continue
             update_payload(
                 qdrant,
                 collection=COLLECTION,
@@ -1341,19 +1405,6 @@ async def _synthesize_and_deprecate(
                     "deprecated": True,
                     "synthesized_into": new_memory_id,
                 },
-            )
-            # SQLite: mark as deprecated. deprecated_at is the authoritative
-            # deprecation time for link aging — the synthesis's created_at is
-            # unreliable (store()'s exact-dedup can return an old memory).
-            # superseded_by/superseded_at record the synthesis as successor in
-            # SQLite (same columns as memory_crud.mark_superseded), not only in
-            # Qdrant's synthesized_into. No recall path reads it yet; the edge
-            # re-attach (#2993) and forward-pointing recall will.
-            await db.execute(
-                "UPDATE memory_metadata SET deprecated = 1, "
-                "dream_cycle_run_id = ?, deprecated_at = ?, "
-                "superseded_by = ?, superseded_at = ? WHERE memory_id = ?",
-                (run_id, deprecated_at, new_memory_id, deprecated_at, original_id),
             )
             deprecated_count += 1
         except Exception:
@@ -1457,12 +1508,18 @@ async def rollback(
 
     for mid in deprecated_ids:
         try:
-            await db.execute(
+            # Conditional on the row still being this run's retirement: an
+            # explicit supersede that committed after the SELECT above clears
+            # dream_cycle_run_id, and must keep its deprecation and successor.
+            cursor = await db.execute(
                 "UPDATE memory_metadata SET deprecated = 0, "
                 "dream_cycle_run_id = NULL, deprecated_at = NULL, "
-                "superseded_by = NULL, superseded_at = NULL WHERE memory_id = ?",
-                (mid,),
+                "superseded_by = NULL, superseded_at = NULL "
+                "WHERE memory_id = ? AND dream_cycle_run_id = ? AND deprecated = 1",
+                (mid, run_id),
             )
+            if cursor.rowcount == 0:
+                continue
             update_payload(
                 qdrant,
                 collection=COLLECTION,
@@ -1486,10 +1543,17 @@ async def rollback(
     for sid in synthesis_ids:
         try:
             from genesis.qdrant.collections import delete_point
-            delete_point(qdrant, collection=COLLECTION, point_id=sid)
-            await db.execute(
-                "DELETE FROM memory_metadata WHERE memory_id = ?", (sid,),
+            # Conditional, and before Qdrant: an explicit supersede of the
+            # synthesis that committed after the SELECT clears its stamp, and
+            # the memory it now names as superseded must survive the rollback.
+            cursor = await db.execute(
+                "DELETE FROM memory_metadata WHERE memory_id = ? "
+                "AND dream_cycle_run_id = ?",
+                (sid, f"synthesis:{run_id}"),
             )
+            if cursor.rowcount == 0:
+                continue
+            delete_point(qdrant, collection=COLLECTION, point_id=sid)
             await db.execute(
                 "DELETE FROM memory_fts WHERE memory_id = ?", (sid,),
             )
