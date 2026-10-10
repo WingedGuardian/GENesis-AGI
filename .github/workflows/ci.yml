@@ -1157,5 +1157,7 @@ jobs:
         # Offline restore fixture changes are count-neutral; ceiling stays 102.
         # Snapshot reader: original +109; corrective controls add +22:
         # selection 70 -> 83, off-site pull 20 -> 28, dated backups 50 -> 51.
-        # Floor: 25276 + 109 + 22 = 25407; skip ceiling unchanged.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25407
+        # Second reader correction native collection vs its ff1f389 parent:
+        # selection 83 -> 152 (+69), reader 29 -> 64 (+35), CLI 3 -> 3.
+        # Floor: 25407 + 104 = 25511; skip ceiling unchanged.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25511

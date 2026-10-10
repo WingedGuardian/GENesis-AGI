@@ -86,7 +86,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Select the latest complete off-site snapshot instead of resuming the pinned selection",
     )
     p.add_argument(
-        "--transcript-preference", action="append", default=[], metavar="PATH=legacy|v2",
+        "--transcript-preference", action="append", default=[], metavar="PATH=legacy|legacy-plain|legacy-encrypted|v2",
         help="Resolve an ambiguous transcript capture format (repeatable)",
     )
     p.set_defaults(func=run)

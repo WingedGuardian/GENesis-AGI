@@ -49,7 +49,8 @@ def test_transcript_preferences_parse_and_forward_verbatim(monkeypatch):
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     parser = argparse.ArgumentParser()
     cli.add_parser(parser.add_subparsers(dest="command"))
-    preferences = ["-project/a.jsonl=legacy", "p/agent.jsonl=v2"]
+    preferences = ["-project/a.jsonl=legacy", "p/agent.jsonl=v2",
+                   "p/plain.jsonl=legacy-plain", "p/encrypted.jsonl=legacy-encrypted"]
     args = parser.parse_args(["restore", *("--transcript-preference=" + p for p in preferences)])
     assert args.func(args) == 0
-    assert seen["cmd"][-4:] == ["--transcript-preference", preferences[0], "--transcript-preference", preferences[1]]
+    assert seen["cmd"][-8:] == [value for preference in preferences for value in ("--transcript-preference", preference)]

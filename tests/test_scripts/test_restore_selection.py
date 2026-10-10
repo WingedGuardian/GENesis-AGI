@@ -23,6 +23,206 @@ def _open(tmp_path, stamp='20261007T120000Z', refresh=False):
     return root, work
 
 
+@pytest.mark.parametrize('record', [
+    {'state': 'expected'}, {'state': 'empty'}, None, [],
+    {'state': 'expected', 'entries': []},
+    {'state': 'unknown', 'entries': {}},
+    {'state': 'expected', 'entries': {'../escaped': None}},
+    {'state': 'expected', 'entries': {'.': None}},
+    {'state': 'expected', 'entries': {'payload.gpg': 'wrong value'}},
+    {'state': 'empty', 'entries': {'payload.gpg': None}},
+])
+@pytest.mark.parametrize('entry', ['inventory', 'pinned', 'publish'])
+def test_malformed_nested_inventory_never_authorizes_payloads(tmp_path, record, entry):
+    root, work = _open(tmp_path)
+    state = json.loads((work / 'selection.json').read_text())
+    state['components']['memory'] = record
+    selection.atomic(work / 'selection.json', state)
+    before = (work / 'selection.json').read_bytes()
+    stage = tmp_path / 'stage'
+    stage.write_bytes(b'preserved staging payload')
+    args = ['pinned', str(root)] if entry == 'pinned' else [entry, str(work), 'memory']
+    if entry == 'publish':
+        args.extend(['payload.gpg', str(stage)])
+    result = subprocess.run([sys.executable, str(_PATH), *args], capture_output=True, text=True)
+    assert result.returncode != 0 and not result.stdout
+    assert (work / 'selection.json').read_bytes() == before
+    assert stage.read_bytes() == b'preserved staging payload'
+    assert not list((work / 'cache').iterdir())
+    assert not list((work / 'view').iterdir())
+
+
+def test_native_shell_rejects_missing_memory_entries_instead_of_silent_omission(tmp_path):
+    _, work = _open(tmp_path)
+    state = json.loads((work / 'selection.json').read_text())
+    state['components']['memory'] = {'state': 'expected'}
+    selection.atomic(work / 'selection.json', state)
+    shell = (_PATH.parents[1] / 'restore.sh').read_text()
+    start = shell.index('    _selected_pull_component() {')
+    end = shell.index('    marker="$_RESTORE_WORKSPACE/COMPLETE"', start)
+    # Exercise the actual shell consumer and helper, without unrelated backend setup.
+    driver = '''die() { printf '%s\\n' "$*" >&2; exit 1; }
+warn() { printf '%s\\n' "$*" >&2; }
+_SCRIPT_DIR="$1"
+_RESTORE_WORKSPACE="$2"
+''' + shell[start:end] + '\n_selected_pull_component memory memory "\\.gpg$"\n'
+    result = subprocess.run(['bash', '-c', driver, 'restore-test', str(_PATH.parents[1]), str(work)],
+                            capture_output=True, text=True)
+    assert result.returncode != 0
+    assert 'damaged selected inventory: memory' in result.stderr
+
+
+@pytest.mark.parametrize('status', ['failed', 'expected'])
+def test_retryable_and_empty_expected_inventories_remain_supported(tmp_path, status):
+    _, work = _open(tmp_path)
+    result = subprocess.run([sys.executable, str(_PATH), 'state', str(work), 'extra', status], capture_output=True)
+    assert result.returncode == 0
+    assert selection.workspace_state(work)['components']['extra'] == {'state': status, 'entries': {}}
+
+
+@pytest.mark.parametrize('field,value', [
+    ('snapshot', 'Genesis/host/20261009T120000Z'),
+    ('backend', 'local:/different/backend'), ('version', 2), ('version', True),
+])
+@pytest.mark.parametrize('entry', ['open', 'pinned', 'inventory', 'cached', 'publish'])
+def test_corrupt_workspace_identity_never_authorizes_reuse(tmp_path, field, value, entry):
+    root, work = _open(tmp_path)
+    state = json.loads((work / 'selection.json').read_text())
+    state['components']['data'] = {'state': 'expected', 'entries': {'payload.gpg': None}}
+    selection.atomic(work / 'selection.json', state)
+    stage = work / '.payload-test'
+    stage.write_bytes(b'old ciphertext')
+    if entry == 'cached':
+        populated = subprocess.run([sys.executable, str(_PATH), 'publish', str(work), 'data', 'payload.gpg', str(stage)], capture_output=True)
+        assert populated.returncode == 0
+    state[field] = value
+    selection.atomic(work / 'selection.json', state)
+    before = (work / 'selection.json').read_bytes()
+    if entry == 'open':
+        with pytest.raises(ValueError):
+            selection.selection(root, 'local:/synthetic/backend', None, False, '')
+    else:
+        if entry == 'pinned':
+            args = ['pinned', str(root)]
+        elif entry == 'inventory':
+            args = ['inventory', str(work), 'data']
+        else:
+            args = [entry, str(work), 'data', 'payload.gpg']
+            if entry == 'publish':
+                args.append(str(stage))
+        result = subprocess.run([sys.executable, str(_PATH), *args], capture_output=True, text=True)
+        assert result.returncode != 0
+        assert not result.stdout
+    assert (work / 'selection.json').read_bytes() == before
+    if entry == 'publish':
+        assert stage.read_bytes() == b'old ciphertext'
+        assert not (work / 'cache/data/payload.gpg').exists()
+
+
+@pytest.mark.parametrize('field,value', [('snapshot', 'Genesis/host/20261009T120000Z'), ('version', True)])
+def test_orphan_workspace_validated_before_pointer_publication(tmp_path, field, value):
+    root, work = _open(tmp_path)
+    (root / 'active.json').unlink()
+    state = json.loads((work / 'selection.json').read_text())
+    state[field] = value
+    selection.atomic(work / 'selection.json', state)
+    with pytest.raises(ValueError):
+        selection.selection(root, 'local:/synthetic/backend', 'Genesis/host/20261007T120000Z', False, str(tmp_path / 'marker'))
+    assert not (root / 'active.json').exists()
+
+
+@pytest.mark.parametrize('version', [2, True])
+@pytest.mark.parametrize('entry', ['open', 'pinned'])
+def test_pointer_version_is_not_ignored(tmp_path, version, entry):
+    root, work = _open(tmp_path)
+    selection.atomic(root / 'active.json', {'version': version, 'id': work.name})
+    if entry == 'open':
+        with pytest.raises(ValueError):
+            selection.selection(root, 'local:/synthetic/backend', None, False, '')
+    else:
+        result = subprocess.run([sys.executable, str(_PATH), 'pinned', str(root)], capture_output=True, text=True)
+        assert result.returncode != 0 and not result.stdout
+
+
+@pytest.mark.parametrize('pointer', [{}, [], None])
+@pytest.mark.parametrize('entry', ['open', 'pinned'])
+def test_existing_falsey_pointer_is_not_absent(tmp_path, pointer, entry):
+    root, work = _open(tmp_path)
+    selection.atomic(root / 'active.json', pointer)
+    before = (root / 'active.json').read_bytes()
+    if entry == 'open':
+        with pytest.raises(ValueError):
+            selection.selection(root, 'local:/synthetic/backend', 'Genesis/host/20261007T120000Z', False, str(tmp_path / 'marker'))
+    else:
+        result = subprocess.run([sys.executable, str(_PATH), 'pinned', str(root)], capture_output=True, text=True)
+        assert result.returncode != 0 and not result.stdout
+    assert (root / 'active.json').read_bytes() == before and (work / 'selection.json').exists()
+
+
+@pytest.mark.parametrize('delete_metadata', [False, True])
+def test_interrupted_retirement_resumes_without_metadata(tmp_path, monkeypatch, delete_metadata):
+    root, old = _open(tmp_path)
+    (old / 'cache/retained').write_bytes(b'old owned ciphertext')
+    original = selection.shutil.rmtree
+    def interrupted(path, *args, **kwargs):
+        if Path(path).name in (old.name, '.retired-' + old.name):
+            if delete_metadata:
+                (Path(path) / 'selection.json').unlink()
+            raise OSError('injected retirement interruption')
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(selection.shutil, 'rmtree', interrupted)
+    with pytest.raises(OSError):
+        selection.selection(root, 'local:/synthetic/backend', 'Genesis/host/20261008T120000Z', True, str(tmp_path / 'marker'))
+    new_id = json.loads((root / 'active.json').read_text())['id']
+    assert new_id != old.name
+    assert (root / new_id / 'selection.json').exists()
+    monkeypatch.setattr(selection.shutil, 'rmtree', original)
+    resumed = selection.selection(root, 'local:/synthetic/backend', None, False, '')
+    assert resumed.name == new_id
+    assert not old.exists() and not list(root.glob('.retired-*'))
+
+
+def test_retirement_tombstone_symlink_never_deletes_target(tmp_path):
+    root, work = _open(tmp_path)
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    (outside / 'sentinel').write_bytes(b'preserved')
+    (root / ('.retired-' + 'a' * 64)).symlink_to(outside)
+    with pytest.raises(ValueError):
+        selection.selection(root, 'local:/synthetic/backend', None, False, '')
+    assert (outside / 'sentinel').read_bytes() == b'preserved'
+    assert (work / 'selection.json').exists()
+
+
+def test_retirement_rename_fence_failure_preserves_payload_until_retry(tmp_path, monkeypatch):
+    root, old = _open(tmp_path)
+    (old / 'cache/retained').write_bytes(b'old owned ciphertext')
+    original_replace = selection.os.replace
+    original_fsync = selection.os.fsync
+    renamed = False
+    def replace(source, target):
+        nonlocal renamed
+        result = original_replace(source, target)
+        if str(target).endswith('.retired-' + old.name):
+            renamed = True
+        return result
+    def fence(fd):
+        if renamed:
+            raise OSError('injected retirement directory fence failure')
+        return original_fsync(fd)
+    monkeypatch.setattr(selection.os, 'replace', replace)
+    monkeypatch.setattr(selection.os, 'fsync', fence)
+    with pytest.raises(OSError):
+        selection.selection(root, 'local:/synthetic/backend', 'Genesis/host/20261008T120000Z', True, str(tmp_path / 'marker'))
+    tombstone = root / ('.retired-' + old.name)
+    assert (tombstone / 'cache/retained').read_bytes() == b'old owned ciphertext'
+    active_id = json.loads((root / 'active.json').read_text())['id']
+    assert active_id != old.name and (root / active_id / 'selection.json').exists()
+    monkeypatch.setattr(selection.os, 'fsync', original_fsync)
+    resumed = selection.selection(root, 'local:/synthetic/backend', None, False, '')
+    assert resumed.name == active_id and not tombstone.exists()
+
+
 def test_killed_refresh_after_pointer_resumes_retirement(tmp_path):
     root, old = _open(tmp_path)
     marker = tmp_path / 'marker'
