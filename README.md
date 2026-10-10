@@ -188,7 +188,7 @@ numeric id); leave both blank to run without that channel.
 | Component | What it does |
 |---|---|
 | **Full cognitive stack** | Memory (4-layer hybrid retrieval + knowledge graph), self-learning loop, reflection engine, earned autonomy, dual-ego decision layer—all running continuously |
-| **Genesis server** | Dashboard, API, and all subsystems at `http://<container-ip>:5000` |
+| **Genesis server** | Dashboard, API, and subsystems on container loopback; owner access through the host loopback proxy, SSH tunnel or restricted HTTPS ([setup](docs/reference/peer-ingress.md)) |
 | **Qdrant** | Vector database powering semantic memory (2 collections: episodic + knowledge) |
 | **Channel integration** | Telegram (proactive outreach, approvals, voice), email triage, browser automation, inbox monitoring |
 | **Background cognition** | Autonomous sessions that think, research, and audit while you're away—surplus compute, reflection cycles, goal tracking |

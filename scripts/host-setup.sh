@@ -864,18 +864,60 @@ incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
 }
 
 # ── Dashboard port forwarding ──────────────────────────────────
-# Forward host:5000 → container:5000 so the dashboard is reachable from
-# the host's network interfaces (LAN, Tailscale, etc.), not just the
-# internal container IP.
+# Forward host loopback:5000 → container loopback:5000. Remote access uses
+# an SSH tunnel or the authenticated, ACL-restricted HTTPS proxy.
 echo "  Setting up dashboard port forwarding..."
+_dashboard_proxy_ready() {
+    local key value
+    for key in listen connect bind nat proxy_protocol; do
+        value=$(incus config device get "$CONTAINER_NAME" dashboard-proxy "$key") || return 1
+        case "$key" in
+            listen|connect) [ "$value" = "tcp:127.0.0.1:5000" ] || return 1 ;;
+            bind) [ -z "$value" ] || [ "$value" = "host" ] || return 1 ;;
+            *) [ -z "$value" ] || [ "$value" = "false" ] || return 1 ;;
+        esac
+    done
+}
+_dashboard_proxy_absent() {
+    incus list "$CONTAINER_NAME" --format=json |
+        incus exec "$CONTAINER_NAME" -- python3 -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin)
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        sys.exit(1)
+    matches = [row for row in rows if row.get("name") == sys.argv[1]]
+    if len(matches) != 1:
+        sys.exit(1)
+    maps = [matches[0].get(key) for key in ("devices", "expanded_devices")]
+    sys.exit(0 if all(isinstance(value, dict) and "dashboard-proxy" not in value for value in maps) else 1)
+except (ValueError, TypeError, AttributeError, RecursionError):
+    sys.exit(1)
+' "$CONTAINER_NAME"
+}
 if incus config device get "$CONTAINER_NAME" dashboard-proxy listen &>/dev/null; then
-    echo "  + Dashboard proxy already configured"
-else
-    if incus config device add "$CONTAINER_NAME" dashboard-proxy proxy \
-        listen=tcp:0.0.0.0:5000 connect=tcp:127.0.0.1:5000 2>/dev/null; then
-        echo "  + Dashboard proxy: host:5000 → container:5000"
+    if _dashboard_proxy_ready; then
+        echo "  + Dashboard loopback proxy already configured"
     else
-        echo "  WARN: Could not set up dashboard proxy — dashboard only reachable via container IP"
+        echo "  FATAL: Existing dashboard proxy requires topology inspection."
+        echo "        Migrate through the deployed Guardian; see docs/reference/peer-ingress.md."
+        exit 1
+    fi
+else
+    if ! _dashboard_proxy_absent; then
+        echo "  FATAL: Dashboard proxy absence could not be verified. Inspect local and inherited devices."
+        exit 1
+    fi
+    if incus config device add "$CONTAINER_NAME" dashboard-proxy proxy \
+        listen=tcp:127.0.0.1:5000 connect=tcp:127.0.0.1:5000; then
+        if ! _dashboard_proxy_ready; then
+            echo "  FATAL: Dashboard loopback proxy could not be verified. Inspect the Incus error above."
+            exit 1
+        fi
+        echo "  + Dashboard proxy: host loopback:5000 → container loopback:5000"
+    else
+        echo "  FATAL: Could not create the dashboard loopback proxy. Inspect the Incus error above."
+        exit 1
     fi
 fi
 
@@ -977,19 +1019,8 @@ CONTAINER_IPV6=$(incus exec "$CONTAINER_NAME" -- sh -c \
     "ip -6 -o addr show scope global 2>/dev/null | awk '\$2 !~ /^tailscale/ {print \$4}' | cut -d/ -f1 | head -1" \
     2>/dev/null || echo "")
 
-# Build dashboard URL for final report
-DASHBOARD_URL=""
-ACCESS_METHOD=""
-if [ -n "$TS_IPV4" ]; then
-    DASHBOARD_URL="http://$TS_IPV4:5000"
-    ACCESS_METHOD="tailscale"
-elif [ -n "$LAN_IPV4" ]; then
-    DASHBOARD_URL="http://$LAN_IPV4:5000"
-    ACCESS_METHOD="lan"
-fi
-
 if [ -n "$HOST_IPV4" ]; then
-    echo "  + Host IP: $HOST_IPV4 (dashboard: http://$HOST_IPV4:5000)"
+    echo "  + Host IP: $HOST_IPV4 (dashboard via local loopback or SSH tunnel)"
 fi
 
 # ── Run install.sh inside container ──────────────────────────
@@ -1488,7 +1519,7 @@ context auto-loaded by every `claude` session on this host (operator and Guardia
 <!-- begin:container-reference -->
 ## Container
 - **Name**: __CONTAINER_NAME__
-- **IP**: __CONTAINER_IP__  (dashboard: http://__CONTAINER_IP__:5000)
+- **IP**: __CONTAINER_IP__  (dashboard inside container: http://127.0.0.1:5000)
 - **Enter it**: `genesis` alias, or `incus exec __CONTAINER_NAME__ --user __UBUNTU_UID__ --env HOME=/home/ubuntu -- bash -l`
 <!-- end:container-reference -->
 
@@ -1587,25 +1618,12 @@ echo "    If onboarding doesn't start, run:  /setup"
 echo ""
 echo "  STEP 3 — Dashboard:"
 echo ""
-if [ "$ACCESS_METHOD" = "tailscale" ]; then
-    echo "    $DASHBOARD_URL/genesis  (via Tailscale)"
-elif [ -n "$DASHBOARD_URL" ]; then
-    echo "    From this host:    http://localhost:5000/genesis"
-    echo "    From your network: $DASHBOARD_URL/genesis"
-    echo ""
-    echo "    Can't reach it from your browser? Two options:"
-    echo ""
-    echo "    a) SSH tunnel (quick, no install):"
-    echo "       ssh -L 5000:localhost:5000 <your-user>@$HOST_IPV4"
-    echo "       Then open: http://localhost:5000/genesis"
-    echo ""
-    echo "    b) Tailscale (recommended for ongoing access):"
-    echo "       curl -fsSL https://tailscale.com/install.sh | sh"
-    echo "       sudo tailscale up"
-    echo "       Then open: http://<tailscale-ip>:5000/genesis"
-else
-    echo "    http://$CONTAINER_IP:5000/genesis  (container IP — host only)"
+echo "    From this host: http://localhost:5000/genesis"
+if [ -n "$HOST_IPV4" ]; then
+    echo "    From your device: ssh -L 5000:localhost:5000 <your-user>@$HOST_IPV4"
+    echo "    Then open: http://localhost:5000/genesis"
 fi
+echo "    Authenticated HTTPS access: docs/reference/peer-ingress.md"
 echo ""
 echo "  GUARDIAN (host-side health monitor — always running):"
 echo ""
