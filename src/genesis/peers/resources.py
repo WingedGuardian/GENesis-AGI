@@ -63,4 +63,6 @@ class PublishedResources:
     async def retire(self, identifier: str) -> None:
         resource_id(identifier)
         async with self.registry.transaction() as db:
-            await db.execute("UPDATE peer_resources SET active=0 WHERE id=?", (identifier,))
+            cursor = await db.execute("UPDATE peer_resources SET active=0 WHERE id=?", (identifier,))
+            if cursor.rowcount != 1:
+                raise ValueError("Unknown published resource")

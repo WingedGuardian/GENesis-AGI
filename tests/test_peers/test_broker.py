@@ -519,6 +519,96 @@ async def test_operator_cli_publishes_and_retires_without_content_output(setup, 
     assert await s.resources.get(report["resource_id"]) is None
 
 
+async def test_clean_close_allows_same_directory_restart(setup):
+    broker = setup.broker
+    path = broker._socket
+    await broker.close()
+    assert not path.exists()
+    await broker.close()
+    await broker.start(path.parent)
+    assert path.is_socket()
+
+
+@pytest.mark.parametrize("replacement", ["missing", "file", "symlink", "directory", "socket"])
+async def test_close_preserves_replaced_socket_entries(setup, replacement, tmp_path):
+    import socket
+
+    broker = setup.broker
+    path = broker._socket
+    held = path.with_name("held.sock")
+    # Keep the old inode allocated so the replacement cannot reuse it.
+    path.rename(held)
+    other = None
+    if replacement == "file":
+        path.write_text("preserved fixture")
+    elif replacement == "symlink":
+        path.symlink_to(held)
+    elif replacement == "directory":
+        path.mkdir()
+    elif replacement == "socket":
+        other = socket.socket(socket.AF_UNIX)
+        other.bind(str(path))
+    try:
+        if replacement == "missing":
+            await broker.close()
+            assert broker._socket is None
+        else:
+            identity = path.lstat()
+            with pytest.raises(ValueError, match="requires reconciliation"):
+                await broker.close()
+            remaining = path.lstat()
+            assert (remaining.st_dev, remaining.st_ino) == (identity.st_dev, identity.st_ino)
+            # Restore the actual owned object for fixture teardown.
+            if replacement == "directory":
+                path.rmdir()
+            else:
+                path.unlink()
+            held.rename(path)
+        assert broker._runner is None
+    finally:
+        if other is not None:
+            other.close()
+
+
+async def test_failed_runner_cleanup_preserves_socket(setup, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    broker = setup.broker
+    path = broker._socket
+    runner = broker._runner
+    cleanup = runner.cleanup
+    with monkeypatch.context() as patch:
+        patch.setattr(runner, "cleanup", AsyncMock(side_effect=RuntimeError("fixture cleanup")))
+        with pytest.raises(RuntimeError, match="fixture cleanup"):
+            await broker.close()
+        assert path.is_socket() and broker._runner is runner
+    await cleanup()
+
+
+async def test_retirement_rejects_unknown_and_preserves_idempotence(setup):
+    s = setup
+    with pytest.raises(ValueError, match="Unknown published resource"):
+        await s.resources.retire(uuid.uuid4().hex)
+    assert await s.resources.get(s.published["resource_id"]) is not None
+    await s.resources.retire(s.published["resource_id"])
+    await s.resources.retire(s.published["resource_id"])
+    assert await s.resources.get(s.published["resource_id"]) is None
+
+
+async def test_operator_cli_refuses_unknown_retirement(setup):
+    import argparse
+
+    from genesis.peers.cli import add_parser, execute
+
+    parser = argparse.ArgumentParser()
+    add_parser(parser.add_subparsers())
+    with pytest.raises(ValueError, match="Unknown published resource"):
+        await execute(
+            parser.parse_args(["peers", "resource-retire", uuid.uuid4().hex]), setup.registry
+        )
+    assert await setup.resources.get(setup.published["resource_id"]) is not None
+
+
 @pytest.mark.parametrize("kind", ["oversize", "invalid_utf8", "symlink", "directory"])
 async def test_operator_publication_refuses_invalid_files(setup, tmp_path, kind):
     import argparse
