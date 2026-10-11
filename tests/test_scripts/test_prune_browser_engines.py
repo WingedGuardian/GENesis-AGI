@@ -355,6 +355,20 @@ def test_what_an_interrupted_run_left_retiring_is_finished(prune, tmp_path):
     assert left in doomed and busy not in doomed
 
 
+def test_a_leftover_launched_recently_stays(prune, tmp_path):
+    """A browser that started in the moment before its version was set aside runs
+    from .retiring; once it exits, only its launch time says it was in use."""
+    root = tmp_path / "camoufox"
+    pinned = _version(root, "156.0.1-beta.36-bb", age_days=30)
+    left = root / "browsers" / ".retiring" / "official.146.0.1-beta.25-aa.123"
+    left.mkdir(parents=True)
+    (left / "camoufox-bin").write_bytes(b"\x7fELF")
+    _recent(left / "camoufox-bin")
+    doomed, notes = _plan(prune, root, _ready(pinned), [pinned])
+    assert left not in doomed
+    assert any("launched in the last" in n for n in notes)
+
+
 def test_a_root_without_version_json_or_manifest_is_not_a_legacy_engine(prune, tmp_path):
     """A later camoufox might keep a root name the 0.4 allowlist also has."""
     root = tmp_path / "camoufox"
@@ -381,3 +395,24 @@ def test_a_listed_directory_in_a_dot_repo_is_never_printed(prune, tmp_path):
     pinned = _version(root, "156.0.1-beta.36-bb", age_days=30)
     hidden = _version(root, "146.0.1-beta.25-aa", age_days=90, repo=".partial")
     assert _plan(prune, root, _ready(pinned), [pinned, hidden])[0] == []
+
+
+def test_without_a_manifest_version_json_goes_last(prune, tmp_path):
+    """The marker the next run finds the root by is whichever exists; printed last,
+    it survives any earlier entry that stays."""
+    root = tmp_path / "camoufox"
+    pinned = _version(root, "156.0.1-beta.36-bb", age_days=30)
+    _legacy(root)
+    (root / "precomplete").unlink()
+    doomed, _ = _plan(prune, root, _ready(pinned), [pinned])
+    names = [p.name for p in doomed if p.parent == root]
+    assert names[-1] == "version.json" and "libxul.so" in names
+
+
+def test_with_a_manifest_version_json_goes_first_and_the_manifest_last(prune, tmp_path):
+    root = tmp_path / "camoufox"
+    pinned = _version(root, "156.0.1-beta.36-bb", age_days=30)
+    _legacy(root)
+    doomed, _ = _plan(prune, root, _ready(pinned), [pinned])
+    names = [p.name for p in doomed if p.parent == root]
+    assert names[0] == "version.json" and names[-1] == "precomplete"

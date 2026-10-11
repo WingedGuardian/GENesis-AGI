@@ -327,10 +327,17 @@ prune_browser_backups() {
 }
 
 _runs_from() {
-    # 0 when a process this user can see executes a binary under $1 (/proc/<pid>/exe).
+    # 0 when a process this user can see executes a binary under $1
+    # (/proc/<pid>/exe), other than one under $2 when given. An exe link this user
+    # may not read is skipped: MEASURED, every live Camoufox and Chromium process
+    # shows its own (the ones that hide it are systemd, gpg-agent, tmux), and the
+    # decider's own liveness input treats an unreadable process as running.
     local exe
     for exe in /proc/[0-9]*/exe; do
         exe="$(readlink -- "$exe" 2>/dev/null)" || continue
+        if [ -n "${2:-}" ]; then
+            case "$exe" in "$2"/*) continue ;; esac
+        fi
         case "$exe" in "$1"|"$1"/*) return 0 ;; esac
     done
     return 1
@@ -349,8 +356,17 @@ prune_browser_engines() {
     #   - <root>/browsers/.retiring/<name>: what such a run left;
     #   - a direct child of <root> that is not one of camoufox 0.5's own names.
     # Anything else, a `.`/`..` component or a symlinked parent is refused. The
-    # provisioner's lock is held throughout, so no fetch runs underneath.
+    # provisioner's lock is held throughout, so no fetch runs underneath. Each
+    # path is re-checked just before it goes: a version or leftover against a
+    # browser running from it, a root entry against one running anywhere in the
+    # root outside browsers/ (the pre-0.5 engine runs from <root>/camoufox-bin,
+    # not from the file being removed). A version holding a mount is never moved,
+    # since the move would carry the mount out of the snapshot's sight. Once a
+    # root entry stays, the rest of the root stays too: the decider prints the
+    # marker it finds the root by (precomplete, else version.json) last, so the
+    # next run retries.
     local base="${1:-${XDG_CACHE_HOME:-$HOME/.cache}/camoufox}" canon mounts path parent kind repo
+    local root_stuck=0 retiring
     local lock_dir="${GENESIS_HOME:-$HOME/.genesis}/locks"
     if [ ! -x "${VENV_PY:-}" ] || [ ! -f "$SCRIPT_DIR/prune_browser_engines.py" ]; then
         echo "browser engine prune SKIPPED: no python interpreter or no prune_browser_engines.py"
@@ -397,22 +413,50 @@ prune_browser_engines() {
                 echo "browser engine prune refused $path: not an engine path in $canon"
                 continue
             fi
-            if _runs_from "$path"; then
+            if [ "$kind" = root ] && [ "$root_stuck" = 1 ]; then
+                echo "browser engine prune spared $path: an earlier entry of the pre-0.5 engine stayed"
+                continue
+            fi
+            if { [ "$kind" = root ] && _runs_from "$canon" "$canon/browsers"; } \
+                || { [ "$kind" != root ] && _runs_from "$path"; }; then
                 # Launched since the decision: re-checked here, just before the move.
                 echo "browser engine prune spared $path: a running process executes from it"
+                [ "$kind" = root ] && root_stuck=1
+                continue
+            fi
+            if [ "$kind" = version ] && tree_holds_mount "$path" "$mounts" 1; then
+                # A mount above the version (at browsers/ or its repo) counts too:
+                # such an install keeps every version, and says so each run.
+                echo "browser engine prune spared $path: it holds a mount"
                 continue
             fi
             if [ "$kind" = version ]; then
-                mkdir -p "$canon/browsers/.retiring" \
-                    && mv -T -- "$path" "$canon/browsers/.retiring/${parent##*/}.${path##*/}.$$" \
+                retiring="$canon/browsers/.retiring"
+                mkdir -p "$retiring" 2>/dev/null
+                # A link would carry the engine out of the cache, and a mount
+                # would turn the rename into a 2.4 GB copy.
+                if [ "$(cd -P -- "$retiring" 2>/dev/null && pwd -P)" != "$retiring" ] \
+                    || tree_holds_mount "$retiring" "$mounts" 1; then
+                    echo "browser engine prune refused $path: $retiring is not a plain directory in $canon"
+                    continue
+                fi
+                mv -T -- "$path" "$retiring/${parent##*/}.${path##*/}.$$" \
                     || { echo "browser engine prune could not set aside $path"; continue; }
                 echo "browser engine prune set aside $path"
-                path="$canon/browsers/.retiring/${parent##*/}.${path##*/}.$$"
+                path="$retiring/${parent##*/}.${path##*/}.$$"
+                # Checked again past the rename: camoufox can no longer list or
+                # launch it, so a browser seen now started before the move. It
+                # stays in .retiring for the next run, which keeps it while used.
+                if _runs_from "$path"; then
+                    echo "browser engine prune spared $path: a running process executes from it"
+                    continue
+                fi
             fi
             if remove_tree_one_fs "$path" "$mounts" 1; then
                 echo "browser engine prune removed $path"
             else
                 echo "browser engine prune failed or spared $path"
+                [ "$kind" = root ] && root_stuck=1
             fi
         done < <("$VENV_PY" "$SCRIPT_DIR/prune_browser_engines.py" "$canon")
     ) 9>"$lock_dir/browser-stack.lock"

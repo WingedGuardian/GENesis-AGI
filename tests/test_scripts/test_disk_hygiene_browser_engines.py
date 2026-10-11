@@ -171,3 +171,121 @@ def test_an_engine_launched_after_the_decision_is_spared(tmp_path):
         proc.kill()
         proc.wait()
     assert "spared" in r.stdout and binary.exists()
+
+
+def _running(binary: Path):
+    """A process executing ``binary`` (a copy of sleep), once /proc shows it."""
+    import shutil
+    import time
+
+    shutil.copy2(shutil.which("sleep"), binary)
+    proc = subprocess.Popen([str(binary), "30"])
+    for _ in range(100):
+        if Path(f"/proc/{proc.pid}/exe").exists():
+            break
+        time.sleep(0.05)
+    return proc
+
+
+def test_a_legacy_browser_started_after_the_decision_spares_the_whole_root(tmp_path):
+    """The pre-0.5 engine runs from <root>/camoufox-bin, not from any file the
+    decider printed, so the re-check covers every root entry against an exe
+    anywhere in the root outside browsers/."""
+    root = tmp_path / "camoufox"
+    made = _tree(root)
+    version_json = root / "version.json"
+    version_json.write_text("{}")
+    proc = _running(root / "camoufox-bin")
+    try:
+        r = _prune(root, _stub(tmp_path, [version_json, made["legacy_file"], made["legacy_dir"]]))
+    finally:
+        proc.kill()
+        proc.wait()
+    assert version_json.exists() and made["legacy_file"].exists() and made["legacy_dir"].is_dir()
+    assert r.stdout.count("spared") == 3
+
+
+def test_an_engine_browser_does_not_spare_the_legacy_root(tmp_path):
+    """A 0.5 engine running from browsers/ is not the root engine."""
+    root = tmp_path / "camoufox"
+    made = _tree(root)
+    proc = _running(made["version"] / "camoufox-bin")
+    try:
+        r = _prune(root, _stub(tmp_path, [made["legacy_file"]]))
+    finally:
+        proc.kill()
+        proc.wait()
+    assert not made["legacy_file"].exists(), r.stdout
+
+
+def test_a_version_holding_a_mount_is_never_moved(tmp_path):
+    """A rename would carry the mount to a path the mount snapshot does not name."""
+    root = tmp_path / "camoufox"
+    made = _tree(root)
+    mi = tmp_path / "mountinfo"
+    mi.write_text(f"20 1 0:20 / / rw - x x rw\n21 1 0:21 / {made['deep']} rw - x x rw\n")
+    r = _prune(root, _stub(tmp_path, [made["version"]]), prefix=f"export TL_MOUNTINFO='{mi}'\n")
+    assert made["deep"].is_dir() and made["version"].is_dir(), r.stdout
+    assert not (root / "browsers" / ".retiring").exists() or not any(
+        (root / "browsers" / ".retiring").iterdir()
+    )
+    assert "spared" in r.stdout
+
+
+def test_a_failed_legacy_entry_stops_the_rest_of_the_root(tmp_path):
+    """precomplete is printed last and is the marker the next run finds the root
+    by; once one root entry stays, nothing after it in the root goes."""
+    root = tmp_path / "camoufox"
+    made = _tree(root)
+    precomplete = root / "precomplete"
+    precomplete.write_text("x")
+    other = root / "omni.ja"
+    other.write_text("x")
+    mi = tmp_path / "mountinfo"
+    mi.write_text(f"20 1 0:20 / / rw - x x rw\n21 1 0:21 / {made['legacy_dir']} rw - x x rw\n")
+    r = _prune(
+        root,
+        _stub(tmp_path, [made["legacy_file"], made["legacy_dir"], other, precomplete]),
+        prefix=f"export TL_MOUNTINFO='{mi}'\n",
+    )
+    assert not made["legacy_file"].exists()
+    assert made["legacy_dir"].is_dir() and other.exists() and precomplete.exists(), r.stdout
+
+
+def test_a_root_entry_spared_as_live_stops_the_rest_of_the_root(tmp_path):
+    """A browser seen at the first entry and gone by the next still leaves the
+    marker in place: the rule is "once one stays, the rest stay"."""
+    root = tmp_path / "camoufox"
+    made = _tree(root)
+    precomplete = root / "precomplete"
+    precomplete.write_text("x")
+    seen = tmp_path / "seen"
+    once = f"_runs_from() {{ [ -e '{seen}' ] && return 1; : > '{seen}'; return 0; }}\n"
+    r = _prune(root, _stub(tmp_path, [made["legacy_file"], precomplete]), prefix=once)
+    assert made["legacy_file"].exists() and precomplete.exists(), r.stdout
+
+
+def test_a_symlinked_retiring_dir_is_refused(tmp_path):
+    """The move would follow the link out of the cache (and across filesystems copy
+    the whole engine)."""
+    root = tmp_path / "camoufox"
+    made = _tree(root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "browsers" / ".retiring").symlink_to(outside)
+    r = _prune(root, _stub(tmp_path, [made["version"]]))
+    assert made["version"].is_dir() and list(outside.iterdir()) == [], r.stdout
+    assert "refused" in r.stdout or "spared" in r.stdout
+
+
+def test_a_browser_launched_during_the_move_keeps_the_set_aside_engine(tmp_path):
+    """Checked again after the rename: past it, camoufox can no longer list or launch
+    the version, so anything still running from it started before."""
+    root = tmp_path / "camoufox"
+    made = _tree(root)
+    seen = tmp_path / "seen"
+    later = f"_runs_from() {{ [ -e '{seen}' ] && return 0; : > '{seen}'; return 1; }}\n"
+    r = _prune(root, _stub(tmp_path, [made["version"]]), prefix=later)
+    retiring = list((root / "browsers" / ".retiring").iterdir())
+    assert len(retiring) == 1 and retiring[0].is_dir(), r.stdout
+    assert "spared" in r.stdout

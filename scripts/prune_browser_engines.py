@@ -52,7 +52,44 @@ KEEP = frozenset(
 # The top-level names of a live 0.4 engine's precomplete manifest (135.0.1-beta.24),
 # used when the manifest is gone.
 _MANIFEST_NAMES = frozenset(
-    ["application.ini", "browser", "camoufox", "camoufox-bin", "camoufox.cfg", "defaults", "dependentlibs.list", "fonts", "glxtest", "gmp-clearkey", "libfreeblpriv3.so", "libgkcodecs.so", "libipcclientcerts.so", "liblgpllibs.so", "libmozavcodec.so", "libmozavutil.so", "libmozgtk.so", "libmozsandbox.so", "libmozsqlite3.so", "libmozwayland.so", "libnspr4.so", "libnss3.so", "libnssckbi.so", "libnssutil3.so", "libplc4.so", "libplds4.so", "libsmime3.so", "libsoftokn3.so", "libssl3.so", "libxul.so", "omni.ja", "pingsender", "platform.ini", "precomplete", "removed-files", "vaapitest"]
+    [
+        "application.ini",
+        "browser",
+        "camoufox",
+        "camoufox-bin",
+        "camoufox.cfg",
+        "defaults",
+        "dependentlibs.list",
+        "fonts",
+        "glxtest",
+        "gmp-clearkey",
+        "libfreeblpriv3.so",
+        "libgkcodecs.so",
+        "libipcclientcerts.so",
+        "liblgpllibs.so",
+        "libmozavcodec.so",
+        "libmozavutil.so",
+        "libmozgtk.so",
+        "libmozsandbox.so",
+        "libmozsqlite3.so",
+        "libmozwayland.so",
+        "libnspr4.so",
+        "libnss3.so",
+        "libnssckbi.so",
+        "libnssutil3.so",
+        "libplc4.so",
+        "libplds4.so",
+        "libsmime3.so",
+        "libsoftokn3.so",
+        "libssl3.so",
+        "libxul.so",
+        "omni.ja",
+        "pingsender",
+        "platform.ini",
+        "precomplete",
+        "removed-files",
+        "vaapitest",
+    ]
 )
 # camoufox's additions to Firefox's files, absent from that manifest (MEASURED live).
 _CAMOUFOX_NAMES = frozenset(
@@ -144,7 +181,9 @@ def plan(
     except OSError as exc:
         leftovers = []
         notes.append(f"could not read {browsers / RETIRING}: {exc!r}")
-    doomed.extend(d for d in leftovers if not any(_under(exe, d) for exe in exes))
+    # A leftover gets the same checks as a version: a browser that started just
+    # before its version was set aside runs from here.
+    doomed.extend(d for d in leftovers if not in_use(d, d / engine.LAUNCH_FILE))
 
     for d in (p.resolve() for p in installed):
         if d == pinned or d.parent.parent != browsers or d.parent.name.startswith("."):
@@ -168,7 +207,13 @@ def plan(
                 f"kept the pre-0.5 engine in {root}: launched in the last {GRACE_DAYS} days"
             )
         else:
-            legacy.sort(key=lambda e: (e.name != "version.json", e.name == "precomplete", e.name))
+            # version.json first (alone it retires the root for camoufox), and the
+            # marker the next run finds the root by LAST, so it survives any entry
+            # that stays: the manifest when there is one, else version.json itself.
+            marker = (
+                "precomplete" if any(e.name == "precomplete" for e in entries) else "version.json"
+            )
+            legacy.sort(key=lambda e: (e.name == marker, e.name != "version.json", e.name))
             doomed.extend(legacy)
             unknown = [e.name for e in entries if e.name not in names and e.name not in KEEP]
             if unknown:
