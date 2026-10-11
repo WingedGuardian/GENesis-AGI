@@ -168,12 +168,18 @@ def test_script_keeps_pins_checksum_and_redact():
     assert "sha256sum -c -" in text
     assert re.search(r'"\$gl" detect --no-git --redact -c \.gitleaks\.toml', text)
     # --remerge-diff: a merge's conflict resolution is read, not skipped.
+    # --text: a -diff path's content is read, not "Binary files ... differ".
     assert re.search(
-        r'"\$gl" git --redact -c \.gitleaks\.toml --log-opts="--remerge-diff \$range"', text
+        r'"\$gl" git --redact -c \.gitleaks\.toml --log-opts="--text --remerge-diff \$range"',
+        text,
+    )
+    # Commit messages get the same rules through a materialized directory.
+    assert re.search(
+        r'"\$gl" detect --no-git --redact -c \.gitleaks\.toml --source "\$msg_dir"', text
     )
     # Every gitleaks invocation redacts: these logs are public.
     calls = re.findall(r'"\$gl" (?:detect|git) [^\n]*', text)
-    assert len(calls) == 2 and all("--redact" in c for c in calls)
+    assert len(calls) == 3 and all("--redact" in c for c in calls)
     assert text.startswith("#!/usr/bin/env bash")
     assert "set -euo pipefail" in text
 
@@ -328,9 +334,12 @@ def test_binary_scan_reads_the_branch_history(tmp_path: Path):
     assert tip_only.returncode == 0, tip_only.stdout + tip_only.stderr
     cp = _run_step(root, "binary", branch=True)
     assert cp.returncode == 1, cp.stdout + cp.stderr
-    assert "data.db" in cp.stdout
+    assert re.search(r"^\s*1 \.db$", cp.stdout, re.M)
     # The suffix match ignores case (Codex P2, round 3).
-    assert "rec.WAV" in cp.stdout
+    assert re.search(r"^\s*1 \.WAV$", cp.stdout, re.M)
+    # A filename can identify someone and these logs are public: count only.
+    assert "data.db" not in cp.stdout + cp.stderr
+    assert "rec.WAV" not in cp.stdout + cp.stderr
 
 
 def test_binary_scan_matches_suffixes_in_any_case_at_the_tip(tmp_path: Path):
@@ -342,7 +351,9 @@ def test_binary_scan_matches_suffixes_in_any_case_at_the_tip(tmp_path: Path):
     subprocess.run(["git", "add", "-A"], cwd=root, check=True)
     cp = _run_step(root, "binary", branch=False)
     assert cp.returncode == 1, cp.stdout + cp.stderr
-    assert "nested/model.ONNX" in cp.stdout
+    assert re.search(r"^\s*1 \.ONNX$", cp.stdout, re.M)
+    assert "model.ONNX" not in cp.stdout + cp.stderr
+    assert "nested/" not in cp.stdout + cp.stderr
 
 
 def test_detect_secrets_reads_the_branch_history(tmp_path: Path):
@@ -357,6 +368,67 @@ def test_detect_secrets_reads_the_branch_history(tmp_path: Path):
     assert cp.returncode == 1, cp.stdout + cp.stderr
     assert "1 in the branch history" in cp.stdout
     assert re.search(r"[0-9a-f]{12}/src/n\.py", cp.stdout)
+    assert _HEX_VALUE not in cp.stdout + cp.stderr
+
+
+def _commit_on_feature(root: Path, files: dict[str, str], message: str) -> None:
+    import os
+
+    env = {**os.environ, **_GIT_ENV, "HOME": str(root)}
+    for rel, content in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(content, encoding="utf-8")
+    run = {"cwd": root, "env": env, "check": True, "capture_output": True}
+    subprocess.run(["git", "add", "-A"], **run)
+    subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", message], **run)
+
+
+def _clean_history_repo(tmp_path: Path) -> Path:
+    """The history repo with its removed artifacts and values gone from the branch,
+    so a later finding comes only from what a test adds."""
+    import os
+
+    root = tmp_path / "h"
+    (root / "scripts" / "ci").mkdir(parents=True)
+    shutil.copy(_SCRIPT, root / "scripts" / "ci" / "leak_scan.sh")
+    shutil.copy(_ROOT / "scripts" / "ci" / "leak_scan_added_lines.py", root / "scripts" / "ci")
+    env = {**os.environ, **_GIT_ENV, "HOME": str(root)}
+    run = {"cwd": root, "env": env, "check": True, "capture_output": True}
+    subprocess.run(["git", "init", "-q", "-b", "main"], **run)
+    subprocess.run(["git", "add", "-A"], **run)
+    subprocess.run(["git", "commit", "-q", "-m", "main"], **run)
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], **run)
+    subprocess.run(["git", "checkout", "-q", "-b", "feature"], **run)
+    return root
+
+
+def test_detect_secrets_history_reads_a_diff_suppressed_file(tmp_path: Path):
+    """A path .gitattributes marks -diff shows only "Binary files ... differ" in
+    a plain patch; the history scan reads it as text (Codex P1, round 5)."""
+    root = _clean_history_repo(tmp_path)
+    _commit_on_feature(
+        root,
+        {".gitattributes": "src/s.txt -diff\n", "src/s.txt": f'nonce = "{_HEX_VALUE}"\n'},
+        "add",
+    )
+    subprocess.run(["git", "rm", "-q", "src/s.txt"], cwd=root, check=True)
+    _commit_on_feature(root, {}, "remove")
+    cp = _run_step(root, "detect-secrets", branch=True)
+    assert cp.returncode == 1, cp.stdout + cp.stderr
+    assert re.search(r"[0-9a-f]{12}/src/s\.txt", cp.stdout)
+    assert _HEX_VALUE not in cp.stdout + cp.stderr
+
+
+def test_detect_secrets_history_reads_commit_messages(tmp_path: Path):
+    """A value only in a commit message is published with the branch; the
+    history scan reads each message as a file (Codex P1, round 5)."""
+    root = _clean_history_repo(tmp_path)
+    _commit_on_feature(root, {"src/ok.py": "X = 1\n"}, f'fix\n\nnonce = "{_HEX_VALUE}"')
+    clean = _run_step(root, "detect-secrets", branch=False)
+    assert clean.returncode == 0, clean.stdout + clean.stderr
+    cp = _run_step(root, "detect-secrets", branch=True)
+    assert cp.returncode == 1, cp.stdout + cp.stderr
+    assert re.search(r"[0-9a-f]{12}/COMMIT_MESSAGE", cp.stdout)
     assert _HEX_VALUE not in cp.stdout + cp.stderr
 
 

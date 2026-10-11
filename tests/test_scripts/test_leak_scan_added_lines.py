@@ -537,6 +537,39 @@ def test_commit_messages_reads_every_commit_in_a_branch_range(tmp_path: Path):
     assert log and all(subject in messages for subject in log.splitlines())
 
 
+def test_added_lines_read_a_diff_suppressed_file_as_text(tmp_path: Path):
+    """A path marked -diff in .gitattributes is otherwise "Binary files ...
+    differ" in the patch, so its added value never reaches the gate."""
+    r = _branch_repo(tmp_path)
+    repo = Path(r["repo"])
+    (repo / ".gitattributes").write_text("hidden.txt -diff\n", encoding="utf-8")
+    _commit(repo, "hidden.txt", "DIFFHIDDEN_VALUE_42\n", "E hidden")
+    spec = lsa.resolve_scan_spec("push", "0" * 40, "HEAD", cwd=repo, branch_push=True)
+    assert "DIFFHIDDEN_VALUE_42" in lsa.added_lines(spec, cwd=repo)
+
+
+def test_materialize_messages_writes_one_file_per_commit(tmp_path: Path):
+    r = _branch_repo(tmp_path)
+    repo = Path(r["repo"])
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "E4 subject", "-m", "body MSGVALUE_7")
+    spec = lsa.resolve_scan_spec("push", "0" * 40, "HEAD", cwd=repo, branch_push=True)
+    dest = tmp_path / "msgs"
+    n = lsa.materialize_messages(spec, str(dest), cwd=repo)
+    files = sorted(dest.glob(f"*/{lsa.MESSAGE_FILE}"))
+    assert n == len(files) == len(_git(repo, "rev-list", spec[1]).split())
+    assert any("MSGVALUE_7" in f.read_text(encoding="utf-8") for f in files)
+    assert all(len(f.parent.name) == 12 for f in files)
+
+
+def test_materialize_messages_fails_closed_on_a_bad_range(tmp_path: Path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _commit(repo, "base.txt", "hello\n", "A")
+    with pytest.raises(lsa.RangeError):
+        lsa.materialize_messages(("range", "nonexistent..HEAD"), str(tmp_path / "d"), cwd=str(repo))
+
+
 def test_commit_messages_fails_closed_on_a_bad_range(tmp_path: Path):
     repo = tmp_path / "r"
     repo.mkdir()

@@ -147,7 +147,21 @@ step_gitleaks_history() {
   # added, so a value introduced while resolving is scanned (MEASURED with
   # gitleaks 8.22.1: the plain range misses it, this catches it, and a clean
   # merge of main adds nothing).
-  "$gl" git --redact -c .gitleaks.toml --log-opts="--remerge-diff $range" .
+  # --text: a path .gitattributes marks -diff (or that git classes as binary)
+  # otherwise reaches gitleaks only as "Binary files ... differ" (MEASURED,
+  # gitleaks 8.22.1: a token in a -diff file is missed without it, found with it).
+  "$gl" git --redact -c .gitleaks.toml --log-opts="--text --remerge-diff $range" .
+  # Commit messages are published with the branch too, and gitleaks' git mode
+  # reads patches only, so each in-range message is written to a file and
+  # scanned with the same rules.
+  local msg_dir="$WORK/gl-messages"
+  rm -rf -- "$msg_dir"
+  mkdir -p -- "$msg_dir"
+  if ! python3 scripts/ci/leak_scan_added_lines.py --materialize-messages "$msg_dir" >/dev/null; then
+    echo "::error::gitleaks history: commit messages could not be read. Failing closed."
+    exit 3
+  fi
+  "$gl" detect --no-git --redact -c .gitleaks.toml --source "$msg_dir"
   echo "Leak scan (gitleaks history, $range): CLEAN"
 }
 
@@ -278,8 +292,11 @@ step_binary() {
     hits="$(printf '%s\n%s\n' "$hits" "$hist" | grep -v '^$' | sort -u || true)"
   fi
   if [[ -n "$hits" ]]; then
+    # These logs are public, and a filename can itself identify someone (a
+    # speaker or host name), so report a count per extension, never the path.
     echo "::error::Binary/data artifacts must never be committed (voiceprints, audio, databases, models):"
-    printf '%s\n' "$hits"
+    printf '%s\n' "$hits" | sed -E 's#^.*/##; /\./!s#.*#(no extension)#; s#^.*(\.[^.]*)$#\1#' | sort | uniq -c
+    echo "List them locally: git log --name-only over the branch range, or git ls-files with the same globs."
     exit 1
   fi
   echo "Binary/data artifact scan: CLEAN"

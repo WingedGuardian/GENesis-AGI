@@ -173,9 +173,12 @@ def resolve_scan_spec(
 #: merge brings in from main is not (MEASURED, git 2.43: a resolution's value
 #: appears, a clean merge adds nothing). A non-merge commit shows its ordinary
 #: patch. Needs git 2.36 or later; an older git exits nonzero, which fails closed.
+#: ``--text`` shows every file as text: a path ``.gitattributes`` marks ``-diff``
+#: (or one git classes as binary) otherwise appears only as "Binary files ...
+#: differ", hiding what it added (MEASURED, git 2.43).
 _PATCH_ARGS = {
-    "range": ["log", "-p", "--remerge-diff", "--format=commit %H"],
-    "show": ["show", "--remerge-diff", "--format=commit %H"],
+    "range": ["log", "-p", "--text", "--remerge-diff", "--format=commit %H"],
+    "show": ["show", "--text", "--remerge-diff", "--format=commit %H"],
 }
 
 
@@ -280,7 +283,42 @@ def materialize(spec: tuple[str, str], dest: str, cwd: str | None = None) -> int
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")
-    return len(files)
+    return len(files) + materialize_messages(spec, dest, cwd)
+
+
+#: Per-commit message stream: NUL, hash, NUL, message, for each commit.
+_MESSAGE_PAIR_ARGS = {
+    "range": ["log", "--format=%x00%H%x00%B"],
+    "show": ["show", "-s", "--format=%x00%H%x00%B"],
+}
+
+#: The file each commit's message is written to under ``<dest>/<commit12>/``.
+MESSAGE_FILE = "COMMIT_MESSAGE"
+
+
+def materialize_messages(spec: tuple[str, str], dest: str, cwd: str | None = None) -> int:
+    """Write each commit's message to ``<dest>/<commit12>/COMMIT_MESSAGE``.
+
+    A message is published with the branch, so the generic secret detectors
+    read it as a file beside that commit's added lines. Raises
+    :class:`RangeError` on git failure. Returns the number of files written.
+    """
+    kind, value = spec
+    proc = subprocess.run(
+        ["git", *_MESSAGE_PAIR_ARGS[kind], value], cwd=cwd, capture_output=True, check=False
+    )
+    if proc.returncode != 0:
+        raise RangeError(f"git {kind} {value!r} messages failed (rc={proc.returncode})")
+    parts = proc.stdout.split(b"\x00")[1:]
+    root = os.path.realpath(dest)
+    written = 0
+    for sha, body in zip(parts[0::2], parts[1::2], strict=False):
+        folder = os.path.join(root, sha.decode("ascii", errors="replace")[:12])
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, MESSAGE_FILE), "w", encoding="utf-8") as fh:
+            fh.write(body.decode("utf-8", errors="replace"))
+        written += 1
+    return written
 
 
 def added_lines(spec: tuple[str, str], cwd: str | None = None) -> str:
@@ -328,15 +366,17 @@ def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     print_range = "--range" in args
     with_paths = "--with-paths" in args
-    # --materialize DIR writes each commit's added lines under DIR, for the
-    # history half of the detect-secrets scan.
-    materialize_dir = ""
-    if "--materialize" in args:
-        idx = args.index("--materialize")
-        if idx + 1 >= len(args) or not args[idx + 1]:
-            print("::error::--materialize needs a directory. Failing closed.", file=sys.stderr)
-            return EXIT_UNRESOLVABLE
-        materialize_dir = args[idx + 1]
+    # --materialize DIR writes each commit's added lines and message under DIR,
+    # for the history half of the detect-secrets scan. --materialize-messages
+    # DIR writes the messages alone, for the gitleaks history step.
+    dirs: dict[str, str] = {}
+    for flag in ("--materialize", "--materialize-messages"):
+        if flag in args:
+            idx = args.index(flag)
+            if idx + 1 >= len(args) or not args[idx + 1]:
+                print(f"::error::{flag} needs a directory. Failing closed.", file=sys.stderr)
+                return EXIT_UNRESOLVABLE
+            dirs[flag] = args[idx + 1]
     event_name = os.environ.get("EVENT_NAME", "")
     push_before = os.environ.get("PUSH_BEFORE", "")
     head_sha = os.environ.get("HEAD_SHA", "")
@@ -363,8 +403,11 @@ def main(argv: list[str] | None = None) -> int:
             # `X^!` is git's "commit X alone", the history form of `git show X`.
             print(value if kind == "range" else f"{value}^!")
             return EXIT_OK
-        if materialize_dir:
-            print(materialize(spec, materialize_dir))
+        if "--materialize" in dirs:
+            print(materialize(spec, dirs["--materialize"]))
+            return EXIT_OK
+        if "--materialize-messages" in dirs:
+            print(materialize_messages(spec, dirs["--materialize-messages"]))
             return EXIT_OK
         if with_paths:
             out = "\n".join(added_lines_with_paths(spec))
