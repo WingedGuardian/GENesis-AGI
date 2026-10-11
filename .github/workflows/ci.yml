@@ -1165,4 +1165,6 @@ jobs:
         # Staged excused-path guard (#2889): test_update_checkout_moved.py
         # collects 97 here and 81 on origin/main (--collect-only): +16; its other
         # two test edits are count-neutral. Floor: 25319 + 16 = 25335.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25335
+        # Code-only deploy backups (#2629): test_deploy_code_only.py 66 -> 71 (+5).
+        # Floor: 25335 + 5 = 25340.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25340
