@@ -130,7 +130,16 @@ def sentinel_armed(raw: str) -> bool:
     return True
 
 
+def validate_provider_paths(config: dict) -> None:
+    """The pinned POSIX provider folds backslashes before native storage use."""
+    for key in ("main", "cache"):
+        path = absolute(config[key])
+        if "\\" in str(path) or "\\" in str(path.resolve()):
+            raise ValueError(f"pinned provider does not support backslash in {key} paths")
+
+
 def native_env(config: dict) -> dict[str, str]:
+    validate_provider_paths(config)
     env = {k: v for k, v in os.environ.items() if not k.startswith("CBM_")}
     env.update(
         CBM_CACHE_DIR=config["cache"],
@@ -241,6 +250,7 @@ def configure(args: argparse.Namespace, path: Path) -> None:
         sentinel=str(absolute(args.sentinel)),
     )
     validate_settings(config)
+    validate_provider_paths(config)
     with lifecycle_lock():
         if any(os.path.lexists(p) for p in (path, absolute(args.state), state)):
             raise ValueError("existing settings/state preserved; choose a fresh staging state")
@@ -301,7 +311,8 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
                 if key in ("version", "build", "enabled", *PATH_KEYS)
             }
             validate_settings(value)
-    except (OSError, ValueError) as error:
+            validate_provider_paths(value)
+    except (OSError, ValueError, RuntimeError) as error:
         result["settings_error"] = str(error)
     try:
         output = subprocess.check_output(
