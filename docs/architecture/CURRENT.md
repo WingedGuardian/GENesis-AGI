@@ -1377,10 +1377,22 @@ Every surface a human (or host process) talks to Genesis through.
 
 ```yaml subsystem-map
 entry: channels-interfaces
-modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 637f7f7bb679 2026-10-05
+modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
+verified: a73bc16 2026-10-10
 ```
 
+- **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
+  pinned node/realm/principal and scoped credentials. Disabled by default; no
+  implicit capability grants. Enrollment requires no daily task budget; the
+  deprecated allowance field remains only for database compatibility. Local
+  `genesis peers` CLI writes relationships; `/v1/agent/a2a/health` authenticates
+  through the existing runtime loop. The Agent Card returns `503 not_ready`
+  until an installed task transport can fulfill its advertised interface.
+  Revocation disables access immediately; only active peer credentials contribute
+  to fallback readiness, while inactive credentials still participate in scope
+  collision checks. Scope checks also reject equality with loaded active/fallback
+  Flask signing keys, without request-time credential-file reads.
+  See `docs/reference/peer-registry.md`.
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
   it yields at startup, exit 200, when the genesis-server process lock is

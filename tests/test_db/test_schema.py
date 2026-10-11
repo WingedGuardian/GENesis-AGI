@@ -175,6 +175,9 @@ async def test_no_unexpected_tables(db):
         "open_questions",  # work board: local-only unresolved forks
         "open_question_blocks",  # work board: question -> blocked work edges
         "board_events",  # work board: append-only event log
+        "peer_settings",  # peer registry: install-wide peer mode (one row)
+        "peers",  # peer registry: admitted peers
+        "peer_grants",  # peer registry: per-peer grants
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"

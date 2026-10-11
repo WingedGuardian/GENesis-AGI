@@ -81,6 +81,11 @@ def get_or_create_secret_key() -> str:
 _internal_token_cache: str | None = None
 
 
+def conflicts_with_cached_internal_token(value: str) -> bool:
+    """Compare with the boot-loaded credential without reading/minting a file."""
+    return bool(value and _internal_token_cache and hmac.compare_digest(value, _internal_token_cache))
+
+
 def get_or_create_internal_api_token() -> str:
     """Return the persistent internal API token, generating it once if absent.
 
