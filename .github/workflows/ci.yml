@@ -1162,7 +1162,10 @@ jobs:
         # Offline restore fixture changes are count-neutral; ceiling stays 102.
         # Merge with main (#3133 authenticated backup reads): main 25211 + this PR's measured +106 = 25317.
         # Re-merge with main (#3133): main 25213 + this PR's measured +106 = 25319.
-        # Force-push command-borne config (#2513): the four changed test files
-        # collect 603 here and 565 on origin/main 4ab8bf71c, measured with
-        # --collect-only: +38. No added skips. Floor: 25319 + 38 = 25357.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25357
+        # Staged excused-path guard (#2889): test_update_checkout_moved.py
+        # collects 97 here and 81 on origin/main (--collect-only): +16; its other
+        # two test edits are count-neutral. Floor: 25319 + 16 = 25335.
+        # Force-push command-borne config (#2513): the five changed test files
+        # collect 1083 here and 1042 on origin/main 9008b3717, measured with
+        # --collect-only: +41. No added skips. Floor: 25335 + 41 = 25376.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25376

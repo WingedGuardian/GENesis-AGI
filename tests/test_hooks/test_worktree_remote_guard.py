@@ -1151,6 +1151,29 @@ class TestForcePushCommandBorneConfig:
         assert res.returncode == 2, res.stdout + res.stderr
         assert "Force push to origin/<public> is not allowed" in res.stderr
 
+    @pytest.mark.parametrize(
+        ("ssh_url", "blocked"),
+        [
+            ("git@github.com:acme/widget", True),  # same repository, other spelling
+            ("ssh://git@github.com/acme/widget.git/", True),
+            ("git@github.com:acme/other", False),  # control: a different repository
+        ],
+    )
+    def test_force_to_another_spelling_of_origin_is_origin(self, remotes_repo, ssh_url, blocked):
+        """https and SSH spellings of one repository differ as strings, so a
+        pushRemote naming the SSH spelling must still be judged as origin."""
+        _git(remotes_repo, "remote", "set-url", "--push", "origin", "https://github.com/acme/widget.git")
+        _git(remotes_repo, "remote", "add", "sshmirror", ssh_url)
+        _git(remotes_repo, "branch", "-m", "feature")
+        _git(remotes_repo, "config", "branch.feature.pushRemote", "sshmirror")
+        res = _run_cwd(f"git push {_FORCE}", str(remotes_repo))
+        if blocked:
+            assert res.returncode == 2, res.stdout + res.stderr
+            assert "Force push to origin/<public> is not allowed" in res.stderr
+        else:
+            assert res.returncode == 0, res.stdout + res.stderr
+            assert _decision(res) == "ask"
+
     def test_bare_force_with_upstream_only_on_a_disjoint_remote_asks(self, remotes_repo):
         """Control: with no pushRemote/pushDefault the push goes to the
         upstream's remote, the disjoint `backups`, so the guard asks."""
