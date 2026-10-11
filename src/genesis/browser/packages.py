@@ -24,6 +24,11 @@ BROWSER_DISTS = ("camoufox", "playwright", "patchright")
 PLAYWRIGHT_ONLY = ("playwright",)
 
 
+# A distribution that is installed but whose .dist-info cannot be parsed: bad UTF-8
+# in METADATA raises UnicodeDecodeError, not PackageNotFoundError.
+UNREADABLE = "unreadable metadata"
+
+
 def installed_versions() -> dict[str, str | None]:
     found: dict[str, str | None] = {}
     for dist in BROWSER_DISTS:
@@ -31,6 +36,8 @@ def installed_versions() -> dict[str, str | None]:
             found[dist] = metadata.version(dist)
         except metadata.PackageNotFoundError:
             found[dist] = None
+        except Exception:  # noqa: BLE001 - a damaged install, reported as one
+            found[dist] = UNREADABLE
     return found
 
 
@@ -73,8 +80,8 @@ def packages_changed_message(stale: list[str] | None = None) -> str | None:
         return "an unknown version" if v is _UNKNOWN else str(v)
 
     changed = ", ".join(f"{d} {was(d)} -> {now[d]}" for d in dists)
-    if any(now[d] is None for d in dists):
-        # Uninstalled under the session: a restart alone will not bring it back.
+    if any(now[d] is None or now[d] == UNREADABLE for d in dists):
+        # Uninstalled or damaged under the session: a restart alone will not repair it.
         advice = (
             "Restart this Claude Code session; if the browser is still unavailable "
             f"after that, tell the user; operator step: {PACKAGE_HINT}."

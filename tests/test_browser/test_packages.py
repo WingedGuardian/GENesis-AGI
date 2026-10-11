@@ -211,3 +211,35 @@ def test_an_uninstalled_package_is_not_told_to_skip_reinstalling(_baseline):
     assert "camoufox 0.5.7 -> None" in message
     assert "do not reinstall" not in message
     assert "tell the user" in message
+
+
+@pytest.mark.parametrize(
+    "exc", [UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), OSError(5, "EIO")]
+)
+def test_unreadable_metadata_is_reported_not_raised(monkeypatch, exc):
+    """importlib.metadata raises these for a damaged .dist-info; the launch guard
+    must not let them escape before the import-failure handling runs."""
+
+    def version(name):
+        if name == "camoufox":
+            raise exc
+        raise packages.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(packages.metadata, "version", version)
+    assert packages.installed_versions() == {
+        "camoufox": packages.UNREADABLE,
+        "playwright": None,
+        "patchright": None,
+    }
+
+
+def test_metadata_damaged_after_startup_says_reinstall(_baseline):
+    _baseline(camoufox="0.5.7")
+    with patch.object(
+        packages,
+        "installed_versions",
+        return_value={"camoufox": packages.UNREADABLE, "playwright": None, "patchright": None},
+    ):
+        message = packages.packages_changed_message()
+    assert "do not reinstall" not in message
+    assert packages.PACKAGE_HINT in message

@@ -88,11 +88,21 @@ class CamoufoxNotReady(RuntimeError):
     """No launchable Camoufox engine; the message says why and what to tell the user."""
 
 
+class _UnreadableMetadata(Exception):
+    """A distribution is installed but its .dist-info cannot be parsed: a METADATA
+    or RECORD with bad UTF-8 raises UnicodeDecodeError, not PackageNotFoundError
+    (MEASURED, Python 3.12). A broken package, reported as one. A missing or
+    permission-denied METADATA is suppressed by importlib and reads as not
+    installed, whose operator step is the same reinstall."""
+
+
 def _dist_version(name: str) -> str | None:
     try:
         return metadata.version(name)
     except metadata.PackageNotFoundError:
         return None
+    except Exception as exc:  # noqa: BLE001 - any other failure is a damaged install
+        raise _UnreadableMetadata(name, exc) from exc
 
 
 def _dist_files(name: str) -> list[str] | None:
@@ -101,6 +111,8 @@ def _dist_files(name: str) -> list[str] | None:
         files = metadata.files(name)
     except metadata.PackageNotFoundError:
         return None
+    except Exception as exc:  # noqa: BLE001 - any other failure is a damaged install
+        raise _UnreadableMetadata(name, exc) from exc
     return None if files is None else [str(f) for f in files]
 
 
@@ -170,7 +182,10 @@ def _repair_step(binary: Path, problem: str, kind: str) -> str:
 def _properties_readable(raw: bytes) -> bool:
     """Whether camoufox can load this properties.json: it parses it with orjson (a
     camoufox dependency; stricter than json about a BOM or NaN) and indexes each
-    entry's ``property`` (utils._load_properties)."""
+    entry's ``property`` and ``type`` (0.4 and 0.5.7 when they load the file,
+    utils._load_properties; 0.5.8 when a launch sets that property,
+    validate_config). MEASURED: every entry of a real 0.4 and 0.5.8 engine carries
+    both, 0.5.8's removed ones included."""
     try:
         import orjson
 
@@ -182,7 +197,9 @@ def _properties_readable(raw: bytes) -> bool:
             return False
     except ValueError:  # orjson.JSONDecodeError is a ValueError
         return False
-    return isinstance(data, list) and all(isinstance(e, dict) and "property" in e for e in data)
+    return isinstance(data, list) and all(
+        isinstance(e, dict) and "property" in e and "type" in e for e in data
+    )
 
 
 def _engine_problem(
@@ -276,6 +293,59 @@ def _legacy_engine(version: str) -> EngineStatus:
     return status
 
 
+def _engine_dirs() -> list[Path]:
+    """Every ``browsers/<repo>/<version>`` directory holding a version.json: the
+    ones camoufox's ``list_installed`` reads (multiversion.py:281-291)."""
+    browsers = camoufox_install_dir() / "browsers"
+    found = []
+    try:
+        for repo in sorted(browsers.iterdir()):
+            if not repo.is_dir() or repo.name.startswith("."):
+                continue
+            found.extend(
+                d for d in sorted(repo.iterdir()) if d.is_dir() and (d / "version.json").exists()
+            )
+    except OSError:
+        pass
+    return found
+
+
+def _listing_skips() -> tuple[type[Exception], ...]:
+    """The errors camoufox's ``list_installed`` skips a directory for rather than
+    raising (multiversion.py:312). orjson comes with camoufox."""
+    try:
+        import orjson
+    except ImportError:
+        return (FileNotFoundError, json.JSONDecodeError)
+    return (FileNotFoundError, orjson.JSONDecodeError)
+
+
+def _breaks_listing(dirs: list[Path]) -> list[Path]:
+    """The directories that make camoufox's ``list_installed`` raise: its own
+    ``pkgman.Version.from_path`` fails on them with anything other than the
+    errors the listing skips quietly."""
+    from camoufox.pkgman import Version
+
+    skipped = _listing_skips()
+    bad = []
+    for d in dirs:
+        try:
+            Version.from_path(d)
+        except skipped:
+            continue  # skipped by the listing, so not what broke it
+        except Exception:  # noqa: BLE001 - what aborts the listing
+            bad.append(d)
+    return bad
+
+
+def _named_for(pin, d: Path) -> bool:
+    # install_versioned names a directory <version>-<build>[-<sha8>]
+    # (multiversion.version_folder_name; sha8 is the asset's sha256 prefix).
+    return d.parent.name.lower() == pin.repo_name and bool(
+        re.fullmatch(rf"{re.escape(pin.spec)}(-[0-9a-f]{{8}})?", d.name)
+    )
+
+
 def _pinned_engine(version: str) -> EngineStatus:
     try:
         from camoufox import browser_pin, multiversion
@@ -292,20 +362,35 @@ def _pinned_engine(version: str) -> EngineStatus:
             "operator step: install camoufox>=0.5.7,<0.6",
         )
     try:
+        installed = list(multiversion.list_installed())
         matching = [
             iv
-            for iv in multiversion.list_installed()
+            for iv in installed
             if browser_pin.matches(pin, iv.repo_name, iv.version.version or "", iv.version.build)
         ]
     except Exception as exc:  # noqa: BLE001 - upstream code reading the cache; never raise
         # One unreadable entry under browsers/ fails the whole listing (upstream
-        # Version() raises IndexError on an empty build, for one).
+        # Version() raises IndexError on an empty build, for one), and `camoufox
+        # list` runs the same listing, so the step names the entries instead.
         logger.warning("Camoufox engine lookup failed", exc_info=True)
+        try:
+            bad = _breaks_listing(_engine_dirs())
+        except Exception:  # noqa: BLE001 - nothing more to name
+            bad = []
+        if bad:
+            named = ", ".join(f"`{_q(d)}`" for d in bad)
+            step = f"the engine directories camoufox cannot read: {named}; {_TELL}remove them"
+        else:
+            step = (
+                f"no engine directory is the cause; {_TELL}check "
+                f"{_q(camoufox_install_dir() / 'config.json')}, which camoufox reads for every "
+                "listing"
+            )
+        # A path only when exactly one directory is to blame: a caller may remove it.
         return EngineStatus(
             INVALID,
-            f"camoufox engine lookup failed: {exc!r}; tell the user; operator step: "
-            f"`{_q(sys.executable)} -m camoufox list` shows the engines under "
-            f"{camoufox_install_dir() / 'browsers'}; remove the unreadable one",
+            f"camoufox engine lookup failed: {exc!r}; {step}",
+            bad[0] / LAUNCH_FILE if len(bad) == 1 else None,
         )
 
     label = f"Camoufox {pin.repo_name} {pin.spec}"
@@ -317,6 +402,23 @@ def _pinned_engine(version: str) -> EngineStatus:
         problems.append(status)
     if problems:
         return problems[0]
+    # A directory named for the pin that does not hold it: list_installed skips one
+    # whose version.json is unreadable without a word (multiversion.py:312), or its
+    # version.json names another build. install_versioned refuses to replace a
+    # directory with a version.json (:404), so a fetch into that name fails while
+    # it stays; removing it lets the fetch through.
+    listed = {Path(iv.path) for iv in installed}
+    for d in _engine_dirs():
+        if not _named_for(pin, d):
+            continue
+        if d in listed:
+            problem = f"the version.json in {d} names another build than {pin.spec}"
+        else:
+            problem = f"the version.json in {d} is unreadable, so camoufox skips this engine"
+        binary = d / LAUNCH_FILE
+        return EngineStatus(
+            INVALID, f"{label}: {problem}; {_repair_step(binary, problem, 'versioned')}", binary
+        )
     return EngineStatus(
         NOT_INSTALLED,
         f"{label}, the engine camoufox {version} pairs with, is not installed; {_operator_step()}",
@@ -325,6 +427,19 @@ def _pinned_engine(version: str) -> EngineStatus:
 
 def resolve_camoufox_engine() -> EngineStatus:
     """The Camoufox binary to launch, or why there is none. Never raises."""
+    try:
+        return _resolve()
+    except _UnreadableMetadata as exc:
+        name, err = exc.args
+        logger.warning("%s package metadata is unreadable", name, exc_info=True)
+        return EngineStatus(
+            INVALID,
+            f"{name} is installed but its package metadata is unreadable ({err!r}); "
+            f"tell the user; operator step: reinstall it ({PACKAGE_HINT})",
+        )
+
+
+def _resolve() -> EngineStatus:
     version = _dist_version("camoufox")
     if version is None:
         return EngineStatus(
