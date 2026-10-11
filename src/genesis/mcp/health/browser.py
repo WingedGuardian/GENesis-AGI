@@ -2251,8 +2251,9 @@ async def _human_type(page, selector: str, value: str, *, before_typing=None) ->
     Chromium fallback (dev/test): atomic page.fill() (no delay overhead).
 
     ``before_typing(page)``, when given, runs after the focusing click and
-    before the first keystroke, because keystrokes go wherever focus landed,
-    which can be a frame the selector never named. It raises to stop typing.
+    again before EVERY keystroke, because keystrokes go wherever focus is, and
+    an input handler or auto-advance can move focus after the first character
+    (into a frame the selector never named). It raises to stop typing.
     It runs on the per-keystroke path only: the atomic ``page.fill`` path sets
     the selector's own element, which the caller already checked, and has no
     click to move focus. Switching that path to click-and-type must call it.
@@ -2266,12 +2267,12 @@ async def _human_type(page, selector: str, value: str, *, before_typing=None) ->
     await _no_stall(page.fill(selector, "", timeout=10000), "clearing the field", layer)
     # Click to focus the field
     await _no_stall(page.click(selector, timeout=10000), "focusing the field", layer)
-    if before_typing is not None:
-        await before_typing(page)
     # Type per-keystroke with hold time + flight time (IKI) jitter.
     # Hold time: log-normal, median ~86ms (CMU Keystroke Dynamics calibration).
     # Flight time: 50-200ms uniform with 5% thinking pauses.
     for i, char in enumerate(value):
+        if before_typing is not None:
+            await before_typing(page)  # focus can move between keystrokes
         # Hold phase: keydown → hold → keyup
         hold_s = random.lognormvariate(math.log(0.086), 0.35)
         hold_s = max(0.03, min(hold_s, 0.20))  # clamp 30-200ms
@@ -3782,6 +3783,12 @@ async def _impl_browser_run_js(expression: str) -> dict:
     Runs JS in the browser's V8 engine via Playwright page.evaluate().
     Equivalent to Chrome DevTools console. Expressions are logged for audit,
     so one containing a card number is refused before that log line.
+
+    Known limit (a documented residual, by owner decision): the check reads the
+    expression's TEXT, so a script that computes a number at runtime
+    (``'4242'+'4242'+…``) is not caught. No text check can close that for an
+    arbitrary evaluator; the guard catches the accidental literal, and the card
+    vault keeps real numbers out of the agent's context in the first place.
     """
     if contains_card_number(expression):
         return {"error": _card_guard.REFUSE_RUN_JS}

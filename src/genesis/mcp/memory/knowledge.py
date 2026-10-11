@@ -532,6 +532,15 @@ async def reference_store(
 
     Returns the unit_id of the stored row.
     """
+    # The reference store keeps values in plaintext, so a payment card number
+    # never goes in, whichever field carries it. The refusal does not echo it, and
+    # it runs first: the later validation errors quote ``kind``.
+    if _carries_card_number(kind, identifier, value, description, tags, source):
+        raise ValueError(
+            "reference_store: refused, the entry contains a payment card number. "
+            "Cards are never stored as references; they belong in the encrypted "
+            "card vault."
+        )
     if kind not in _REFERENCE_KINDS:
         raise ValueError(
             f"reference_store: unknown kind '{kind}', must be one of {sorted(_REFERENCE_KINDS)}"
@@ -545,14 +554,6 @@ async def reference_store(
         raise ValueError("reference_store: identifier is required")
     if not value or not value.strip():
         raise ValueError("reference_store: value is required")
-    # The reference store keeps values in plaintext, so a payment card number
-    # never goes in, whichever field carries it. The refusal does not echo it.
-    if _carries_card_number(identifier, value, description, tags, source):
-        raise ValueError(
-            "reference_store: refused, the entry contains a payment card number. "
-            "Cards are never stored as references; they belong in the encrypted "
-            "card vault."
-        )
 
     body = _format_reference_body(
         kind=kind,

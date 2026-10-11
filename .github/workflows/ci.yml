@@ -1162,10 +1162,10 @@ jobs:
         # Offline restore fixture changes are count-neutral; ceiling stays 102.
         # Merge with main (#3133 authenticated backup reads): main 25211 + this PR's measured +106 = 25317.
         # Re-merge with main (#3133): main 25213 + this PR's measured +106 = 25319.
-        # Payment-card input guards (#3172 PR1a): +189, measured with
+        # Payment-card input guards (#3172 PR1a): +196, measured with
         # --collect-only against main's versions of the changed test files
-        # (test_card_shapes +124, test_browser_card_guard +35, test_browser_tools
-        # +13, test_memory_mcp +6, test_reference_extraction +4,
+        # (test_card_shapes +128, test_browser_card_guard +36, test_browser_tools
+        # +14, test_memory_mcp +7, test_reference_extraction +4,
         # test_output_scanner +3, test_browser_cli_card_guard +4); no added
-        # skips. Floor: 25319 + 189 = 25508.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25508
+        # skips. Floor: 25319 + 196 = 25515.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25515

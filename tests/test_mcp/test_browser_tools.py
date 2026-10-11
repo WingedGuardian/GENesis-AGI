@@ -2391,6 +2391,31 @@ class TestRemoteInteraction:
         assert page.keyboard.up.await_count == 2  # 'h', 'i'
 
     @pytest.mark.asyncio
+    async def test_human_type_rechecks_focus_before_every_keystroke(self):
+        """Focus can move after the first character (an auto-advance handler);
+        the check runs before each key, so typing stops before the next one."""
+        page = AsyncMock()
+        browser._active_page = page
+        browser._remote_page = page
+        browser._stealth_cm = None
+        calls = 0
+
+        async def before_typing(_page):
+            nonlocal calls
+            calls += 1
+            if calls == 2:  # focus moved into a card field after 'a'
+                raise RuntimeError("focus moved")
+
+        with (
+            patch("genesis.mcp.health.browser.asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(RuntimeError, match="focus moved"),
+        ):
+            await browser._human_type(page, "#name", "abc", before_typing=before_typing)
+
+        assert page.keyboard.down.await_count == 1  # only 'a' was typed
+        assert calls == 2
+
+    @pytest.mark.asyncio
     async def test_human_type_uses_atomic_fill_for_chromium(self):
         """Plain Chromium (dev/test) uses atomic fill, no per-keystroke."""
         page = AsyncMock()

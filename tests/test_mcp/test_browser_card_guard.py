@@ -98,6 +98,19 @@ class TestFocusedCardField:
         frame.evaluate_handle = hang
         assert await cg.focused_card_field(_page(frame)) is None
 
+    async def test_hung_handle_disposal_is_bounded(self, monkeypatch):
+        """Disposal is cleanup, but a wedged transport must not hang the probe:
+        the answer already read (a card field) still comes back."""
+        monkeypatch.setattr(cg, "_STEP_TIMEOUT_S", 0.05)
+
+        async def hang(*_a, **_k):
+            await asyncio.sleep(10)
+
+        frame = _frame(_element("input", CARD_ATTRS))
+        frame.evaluate_handle.return_value.dispose = hang
+        result = await asyncio.wait_for(cg.focused_card_field(_page(frame)), timeout=2)
+        assert result is True
+
     async def test_runaway_nesting_is_unverified(self):
         # A frame whose focused element is always another iframe.
         frame = MagicMock()

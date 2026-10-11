@@ -131,8 +131,11 @@ def key_allowed_in_card_field(key: str) -> bool:
     return key in KEYS_ALLOWED_IN_CARD_FIELD
 
 
-async def _step(awaitable, timeout: float = _STEP_TIMEOUT_S):
-    return await asyncio.wait_for(awaitable, timeout=timeout)
+async def _step(awaitable, timeout: float | None = None):
+    # The module bound is read at call time, so a test that lowers it reaches here.
+    return await asyncio.wait_for(
+        awaitable, timeout=_STEP_TIMEOUT_S if timeout is None else timeout
+    )
 
 
 async def target_is_card_field(page, selector: str) -> bool | None:
@@ -178,8 +181,10 @@ async def focused_card_field(page) -> bool | None:
                 # A custom element we cannot see inside may hold a card field.
                 return None if info.get("opaque") else False
             finally:
-                with contextlib.suppress(Exception):  # disposal is cleanup only
-                    await handle.dispose()
+                # Disposal is cleanup only, but it is bounded like every other
+                # step: a wedged transport must not hang the probe.
+                with contextlib.suppress(Exception):
+                    await _step(handle.dispose())
     except Exception:  # noqa: BLE001 - any failure leaves the answer unknown
         return None
     return None

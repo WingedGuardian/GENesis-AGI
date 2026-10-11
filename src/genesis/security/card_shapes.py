@@ -92,7 +92,9 @@ def _brand(digits: str) -> str | None:
         return "jcb"
     if p2 == 62 and 16 <= length <= 19:
         return "unionpay"
-    if (p2 == 50 or 56 <= p2 <= 58) and 16 <= length <= 19:
+    # Maestro also holds 6304 and 6759/6761-6763 (published IIN tables) and the
+    # BIN blocks 63900000-63909999 and 67000000-67999999 (Mastercard rules).
+    if (p2 in (50, 67) or 56 <= p2 <= 58 or p4 in (6304, 6390)) and 16 <= length <= 19:
         return "maestro"
     return None
 
