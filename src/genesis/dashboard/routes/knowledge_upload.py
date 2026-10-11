@@ -41,6 +41,19 @@ def _sanitize_filename(name: str) -> str:
     return name or "unnamed"
 
 
+def _own_entry(dir_fd: int, wanted: str) -> str | None:
+    """Return the directory's own name for the entry called ``wanted``, or None.
+
+    Callers address the entry with the returned name, so what reaches the
+    filesystem is something the directory listed, never request or row data.
+    """
+    with os.scandir(dir_fd) as entries:
+        for entry in entries:
+            if entry.name == wanted:
+                return entry.name
+    return None
+
+
 def _remove_upload_file(upload_id: str, stored_path: str) -> str | None:
     """Delete an upload's file and its emptied directory through DESCRIPTORS.
 
@@ -55,10 +68,7 @@ def _remove_upload_file(upload_id: str, stored_path: str) -> str | None:
     the containment boundary: a row that does not describe
     ``<root>/<upload_id>/<name>`` is left for a human instead of being dropped.
     """
-    name = os.path.basename(stored_path)
-    if name in ("", ".", "..") or os.path.dirname(stored_path) != os.path.join(
-        str(_UPLOAD_DIR), upload_id
-    ):
+    if os.path.dirname(stored_path) != os.path.join(str(_UPLOAD_DIR), upload_id):
         return "Stored file path is not this upload's file"
 
     try:
@@ -66,38 +76,33 @@ def _remove_upload_file(upload_id: str, stored_path: str) -> str | None:
     except FileNotFoundError:
         return None
     try:
+        dir_name = _own_entry(root_fd, upload_id)
+        if dir_name is None:
+            return None
         try:
             dir_fd = os.open(
-                upload_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd
+                dir_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd
             )
-        except FileNotFoundError:
-            return None
         except OSError:
             # A symlink (ELOOP, including one that points at itself) or a
             # non-directory where the upload's directory should be.
             return "Upload directory is not a real directory"
         try:
-            try:
-                st = os.lstat(name, dir_fd=dir_fd)
-            except FileNotFoundError:
-                # Already removed: the goal state holds, so the cancel completes.
-                pass
-            else:
-                if not stat.S_ISREG(st.st_mode):
+            # Not listed means already removed: the goal state holds.
+            file_name = _own_entry(dir_fd, os.path.basename(stored_path))
+            if file_name is not None:
+                if not stat.S_ISREG(os.lstat(file_name, dir_fd=dir_fd).st_mode):
                     return "Stored file path is not a regular file"
                 # Unlinks the entry itself. If it is swapped for a link after
                 # the lstat, the link is removed and its target is untouched.
-                try:
-                    os.unlink(name, dir_fd=dir_fd)
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    logger.warning("Could not remove upload file %s", stored_path, exc_info=True)
-                    return "Stored file could not be removed"
+                os.unlink(file_name, dir_fd=dir_fd)
+        except OSError:
+            logger.warning("Could not remove upload file %s", stored_path, exc_info=True)
+            return "Stored file could not be removed"
         finally:
             os.close(dir_fd)
         try:
-            os.rmdir(upload_id, dir_fd=root_fd)
+            os.rmdir(dir_name, dir_fd=root_fd)
         except OSError as exc:
             # Other files still in the directory is expected; anything else is worth a line.
             if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOENT):
