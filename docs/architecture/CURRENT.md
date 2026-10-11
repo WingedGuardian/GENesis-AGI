@@ -1479,7 +1479,11 @@ verified: 637f7f7bb679 2026-10-05
   out; a copy the profile changed under is discarded; never blocks the launch).
   `scripts/browser.py` copies too. The Chromium fallback and that CLI run
   through patchright when installed. `scripts/disk_hygiene.sh` keeps
-  the newest copy per profile, and the newest per version for 90 days.
+  the newest copy per profile, and the newest per version for 90 days. Once
+  the paired Camoufox engine has been in use 14 days, it also removes older
+  engine versions and the pre-0.5 root engine (`scripts/prune_browser_engines.py`
+  decides; none while an override or `camoufox set` choice is in effect, never an
+  engine a running browser uses or one launched in 14 days, never camoufox 0.5's own files).
   `provision.py` (run by `scripts/install_browser_stack.sh`,
   unit `genesis-browser-stack.service`) installs what the tools launch: the
   engine the camoufox package pairs with (only from camoufox 0.5.7: 0.4's fetch

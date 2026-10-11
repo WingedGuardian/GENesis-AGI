@@ -140,22 +140,30 @@ def _pids(pattern: str) -> list[int] | None:
     return [int(p) for p in proc.stdout.split() if p.isdigit()]
 
 
-def _live_engine_in(path: Path) -> bool:
-    """Whether a running Camoufox executes from ``path``. Unknown counts as yes."""
+def live_camoufox_exes() -> list[Path] | None:
+    """The executables this user's running Camoufox processes run from (canonical
+    paths), or None when any of them cannot be read."""
     pids = _pids(BROWSER_PGREP_PATTERNS[0])
     if pids is None:
-        return True
+        return None
+    exes = []
     for pid in pids:
         try:
-            exe = Path(os.readlink(f"/proc/{pid}/exe"))
+            exes.append(Path(os.readlink(f"/proc/{pid}/exe")))
         except FileNotFoundError:
             continue  # exited
         except OSError:
-            return True
-        target = path.resolve()
-        if exe == target or target in exe.parents:
-            return True
-    return False
+            return None
+    return exes
+
+
+def _live_engine_in(path: Path) -> bool:
+    """Whether a running Camoufox executes from ``path``. Unknown counts as yes."""
+    exes = live_camoufox_exes()
+    if exes is None:
+        return True
+    target = path.resolve()
+    return any(exe == target or target in exe.parents for exe in exes)
 
 
 def _live_chromium() -> bool:

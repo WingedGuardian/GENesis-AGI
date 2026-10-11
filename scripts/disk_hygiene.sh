@@ -51,6 +51,10 @@
 #      (scripts/prune_browser_backups.py decides: the newest copy per profile
 #      always stays, the newest per version for 90 days, older ones go after 14
 #      days, an unfinished *.tmp after a day)
+#  15c. Camoufox engines nothing runs → prune_browser_engines
+#      (scripts/prune_browser_engines.py decides: once the engine the installed
+#      camoufox pairs with has been in use 14 days, older version directories and
+#      the pre-0.5 root engine go, never one a running browser uses)
 #  16. Copytruncate rotation of the shared MCP logs in ~/tmp (>10MB, 2 kept)
 #      → rotate_log (mcp_health.log, turnstile_debug.log; the first is held open
 #      by every session's MCP server, so both are copied and truncated, never
@@ -320,6 +324,98 @@ prune_browser_backups() {
         [ "${dir%/*}" = "$canon" ] || { echo "browser backup prune refused $dir: not in $canon"; continue; }
         remove_tree_one_fs "$dir" "$mounts" 1 || echo "browser backup prune failed or spared $dir"
     done < <("$VENV_PY" "$SCRIPT_DIR/prune_browser_backups.py" "$canon")
+}
+
+_runs_from() {
+    # 0 when a process this user can see executes a binary under $1 (/proc/<pid>/exe).
+    local exe
+    for exe in /proc/[0-9]*/exe; do
+        exe="$(readlink -- "$exe" 2>/dev/null)" || continue
+        case "$exe" in "$1"|"$1"/*) return 0 ;; esac
+    done
+    return 1
+}
+
+prune_browser_engines() {
+    # camoufox 0.5 keeps every engine version it ever fetched under
+    # <cache>/browsers/<repo>/<version> (about 2.4 GB each, MEASURED) and never
+    # deletes one, and a cache upgraded from camoufox 0.4 still holds the 0.4
+    # engine in its root. scripts/prune_browser_engines.py decides what goes (its
+    # header lists when nothing does). This function only deletes what it names,
+    # in the order printed, through remove_tree_one_fs:
+    #   - <root>/browsers/<repo>/<version>: renamed into <root>/browsers/.retiring/
+    #     first, so a run killed midway leaves it where the next run finds it
+    #     (camoufox's own listing skips dot directories);
+    #   - <root>/browsers/.retiring/<name>: what such a run left;
+    #   - a direct child of <root> that is not one of camoufox 0.5's own names.
+    # Anything else, a `.`/`..` component or a symlinked parent is refused. The
+    # provisioner's lock is held throughout, so no fetch runs underneath.
+    local base="${1:-${XDG_CACHE_HOME:-$HOME/.cache}/camoufox}" canon mounts path parent kind repo
+    local lock_dir="${GENESIS_HOME:-$HOME/.genesis}/locks"
+    if [ ! -x "${VENV_PY:-}" ] || [ ! -f "$SCRIPT_DIR/prune_browser_engines.py" ]; then
+        echo "browser engine prune SKIPPED: no python interpreter or no prune_browser_engines.py"
+        return 0
+    fi
+    canon="$(cd -P -- "$base" 2>/dev/null && pwd -P)" || return 0
+    # The script reads "a browser runs from it" off the process table; a table
+    # this process cannot see would read as nothing running.
+    if ! liveness_visible; then
+        echo "browser engine prune SKIPPED: no other process is visible in /proc, so no engine can be proven unused"
+        return 0
+    fi
+    if ! mounts="$(mount_targets "$canon")"; then
+        echo "browser engine prune SKIPPED in $canon: the mount table is unreadable"
+        return 0
+    fi
+    mkdir -p "$lock_dir" 2>/dev/null || true
+    (
+        if ! command -v flock >/dev/null 2>&1 || ! flock -n 9; then
+            echo "browser engine prune SKIPPED: the browser stack lock is held or unavailable"
+            exit 0
+        fi
+        while IFS= read -r -d '' path; do
+            parent="${path%/*}"
+            case "$path/" in
+                */./*|*/../*|*//*) kind="" ;;
+                *)
+                    repo="${parent##*/}"
+                    if [ "${parent%/*}" = "$canon/browsers" ] && [ "${repo#.}" = "$repo" ]; then
+                        kind=version
+                    elif [ "$parent" = "$canon/browsers/.retiring" ]; then
+                        kind=leftover
+                    elif [ "$parent" = "$canon" ]; then
+                        case "${path##*/}" in
+                            browsers|config.json|repo_cache.json|.0.5_FLAG|addons|geoip|fontconfig) kind="" ;;
+                            *) kind=root ;;
+                        esac
+                    else
+                        kind=""
+                    fi
+                    ;;
+            esac
+            if [ -z "$kind" ] || [ "$(cd -P -- "$parent" 2>/dev/null && pwd -P)" != "$parent" ]; then
+                echo "browser engine prune refused $path: not an engine path in $canon"
+                continue
+            fi
+            if _runs_from "$path"; then
+                # Launched since the decision: re-checked here, just before the move.
+                echo "browser engine prune spared $path: a running process executes from it"
+                continue
+            fi
+            if [ "$kind" = version ]; then
+                mkdir -p "$canon/browsers/.retiring" \
+                    && mv -T -- "$path" "$canon/browsers/.retiring/${parent##*/}.${path##*/}.$$" \
+                    || { echo "browser engine prune could not set aside $path"; continue; }
+                echo "browser engine prune set aside $path"
+                path="$canon/browsers/.retiring/${parent##*/}.${path##*/}.$$"
+            fi
+            if remove_tree_one_fs "$path" "$mounts" 1; then
+                echo "browser engine prune removed $path"
+            else
+                echo "browser engine prune failed or spared $path"
+            fi
+        done < <("$VENV_PY" "$SCRIPT_DIR/prune_browser_engines.py" "$canon")
+    ) 9>"$lock_dir/browser-stack.lock"
 }
 
 # rotate_log FILE [MAX_BYTES] [KEEP] — copytruncate rotation for a log that
@@ -640,6 +736,12 @@ main() {
 
     echo "--- browser profile copies (newest kept; per version 90d; older 14d; unfinished 1d) ---"
     prune_browser_backups "$HOME/.genesis"
+
+    echo "--- Camoufox engines nothing runs (only once the paired one is 14d old) ---"
+    # The browser tools may run with an operator's engine override from secrets.env,
+    # which this unit does not load; the decider keeps every engine while it is set.
+    _load_store_knob CAMOUFOX_EXECUTABLE_PATH
+    prune_browser_engines "${XDG_CACHE_HOME:-$HOME/.cache}/camoufox"
 
     echo "--- MCP log rotation (>10MB, copytruncate, 2 kept) ---"
     # 10 MB: about nine days of mcp_health.log at the measured rate, small
