@@ -1036,6 +1036,8 @@ jobs:
         # workflow tests run the tip half of leak_scan.sh's email and class
         # steps, which call ripgrep, and this job does not install it, so they
         # skip here by design (MEASURED: the run at 3b14708f1 skipped 104).
+        # External-I/O census (#2878), --collect-only against main 034fdbc48:
+        # test_check_external_io.py 5 -> 33 (+28). No added skips.
         # Code-only deploy backups (#2629): test_deploy_code_only.py 66 -> 72 (+6).
-        # Floor: 25387 + 6 = 25393.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25393
+        # Floor: 25387 + 28 + 6 = 25421.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25421
