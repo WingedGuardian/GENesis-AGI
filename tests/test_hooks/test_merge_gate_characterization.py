@@ -1354,13 +1354,14 @@ def test_e3_stale_override_gates_positional_pr_not_flag_value(monkeypatch):
     """E3 (2026-08-19) — wrong-PR resolution. gh parses ``gh pr merge --subject 123 5``
     as subject="123" + PR **5** (the trailing positional), but the old
     ``_extract_pr_number`` returned **123** (the ``--subject`` VALUE) → every gate
-    then checked the WRONG PR. It is contained on the normal path (the shadow-flag
-    belt refuses ``--subject`` once the head binding engages), so the reachable
-    main()-level observable is under ``# stale-review-override`` — which waives
-    freshness and with it SKIPS the shadow belt + binding, letting the command flow
-    into the finding scanners. An inline P1 seeded on PR 5 (the true gh target) must
-    BLOCK, and the scan must target PR 5, never 123. Old resolver → 123 → clean scan
-    → exit 0. Proven on the router's call log (assert in the TEST frame, Codex #1399)."""
+    then checked the WRONG PR. The shadow-flag belt now refuses ``--subject`` on
+    EVERY merge, so the witness uses ``--match-head-commit 123``: another value flag
+    whose value the resolver must skip, and one the belt allows. Under
+    ``# stale-review-override`` (which waives freshness and the binding, so ``123``
+    binds nothing) the command flows into the finding scanners. An inline P1 seeded
+    on PR 5 (the true gh target) must BLOCK, and the scan must target PR 5, never
+    123. A resolver reading the value → 123 → clean scan → exit 0. Proven on the
+    router's call log (assert in the TEST frame, Codex #1399)."""
     calls: list = []
 
     def router(argv, **kwargs):  # noqa: ANN001 - subprocess.run signature
@@ -1377,7 +1378,7 @@ def test_e3_stale_override_gates_positional_pr_not_flag_value(monkeypatch):
             return _proc(0, "")  # no review-body comments (JSONL: empty output)
         return _proc(0, "")
 
-    cmd = "gh pr merge --subject 123 5 --repo owner/repo --squash --admin  # stale-review-override"
+    cmd = "gh pr merge --match-head-commit 123 5 --repo owner/repo --squash --admin  # stale-review-override"
     rc = _run(monkeypatch, cmd, reviews="", router=router)
     assert rc == 2, f"expected a block on PR 5's inline P1, got exit {rc}"
     inline = [parts for label, parts in calls if label == "inline"]

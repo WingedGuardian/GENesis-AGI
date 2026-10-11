@@ -75,3 +75,8 @@ github:
 #    secrets_env: off
 #    # the first-publish prompt, public-repo destinations only.
 #    push_publish: off
+#    # the push guard's routine prompts (any first push, chained re-pushes).
+#    push_routine: off
+#    # a Codex review request whose review history could not be read; the
+#    # round-cap prompt still asks.
+#    review_request: off

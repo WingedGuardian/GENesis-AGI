@@ -60,6 +60,31 @@ guard remains in force for non-quarantined databases.
 If restore cannot determine that quarantine state (for example, the integrity
 checker cannot start), it aborts instead of treating the database as healthy.
 
+### Restored peer permissions
+
+Full and database-only backup restores disable peer access, clear capability
+grants, and renew relationship epochs in the staged database before installation.
+Identities and historical records remain; saved jobs and approval consent cannot
+be replayed as current authority. Incompatible peer schemas refuse before the
+live database is touched. Older databases without peer state remain compatible.
+Peer-bearing candidates require SQLite 3.37 or newer to verify that reset targets
+are ordinary tables. Reset refuses triggers or foreign-key actions that could
+change other rows; the staged transaction rolls back instead of publishing those
+effects. Unrelated triggers, foreign keys and full-text tables remain supported.
+An owner must explicitly configure peer access and grant capabilities again;
+a runtime that started disabled also requires a restart to enable execution.
+
+Update prepares a separate, guarded `.pre-update.peer-restore` candidate before
+stopping services or changing code, retaining the original `.pre-update` snapshot.
+Migration rollback uses the guarded candidate; an incomplete database rollback
+does not explicitly restart services. External watchdog recovery is unchanged.
+
+Guardian whole-container snapshot rollback is different: its existing second
+approval prompt warns that saved peer permissions, jobs and consent return.
+Approving that specific action explicitly reauthorizes the saved peers. Both
+existing approval gates still apply; failed prompt delivery or denial cannot
+authorize rollback.
+
 ### Restore preconditions and the holder scan
 
 Database-only recovery refuses unless it can establish that no process still

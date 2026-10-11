@@ -168,9 +168,11 @@ def canonical_bytes(template: Path, parameters: tuple[str, str, str] | None) -> 
 def source_snapshot(paths: tuple[Path, ...], unit: str, roots: tuple[Path, Path]):
     """Reject competing sources/override namespaces without resolving precedence."""
     stem, suffix = unit.rsplit(".", 1)
-    scopes = [unit + ".d", suffix + ".d"]
-    scopes.extend(stem[:i + 1] + "." + suffix + ".d"
+    scopes = [unit, suffix]
+    scopes.extend(stem[:i + 1] + "." + suffix
                   for i, char in enumerate(stem) if char == "-")
+    scopes = [scope + kind for scope in scopes
+              for kind in (".d", ".wants", ".requires", ".upholds")]
     selected, seen = [], set()
     for root in paths:
         physical = artifact_parent(root)
@@ -507,3 +509,21 @@ def parse_arguments(argv: list[str] | None, description: str | None) -> argparse
     verification = commands.add_parser("verify-uninstall-locks")
     verification.add_argument("fds", type=int, nargs=3)
     return parser.parse_args(argv)
+
+
+def index_writer_targets_main(argv: list[str], cwd: Path, main: Path) -> bool:
+    """Recognize repository targets of the existing wrapper and native modes."""
+    entrypoint = main / "scripts/lib/code_intel_index.sh"
+    for index, arg in enumerate(argv[:-1]):
+        if Path(arg).name != "code_intel_index.sh":
+            continue
+        candidate = Path(arg) if Path(arg).is_absolute() else cwd / arg
+        if candidate.resolve() == entrypoint and (cwd / argv[index + 1]).resolve() == main:
+            return True
+    # The private OOM launcher contains both wrapper and native argv. Its fixed
+    # flag is not a repository argument; native classification must still run.
+    if "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv):
+        tail = argv[argv.index("analyze") + 1 :]
+        target = cwd / tail[0] if tail and not tail[0].startswith("-") else cwd
+        return target.resolve() == main
+    return False

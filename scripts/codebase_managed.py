@@ -43,6 +43,7 @@ from codebase_managed_unit import (  # noqa: E402,F401
     config_path,
     frontend_command,
     implicit_slice_absent,
+    index_writer_targets_main,
     loaded_properties,
     native_env,
     native_install,
@@ -142,24 +143,6 @@ def manager_absent(unit: str) -> bool:
     if unit.endswith(".service"):
         expected["MainPID"] = "0"
     return show(unit, *expected) == expected
-
-
-def index_writer_targets_main(argv: list[str], cwd: Path, main: Path) -> bool:
-    """Recognize repository targets of the existing wrapper and native modes."""
-    entrypoint = main / "scripts/lib/code_intel_index.sh"
-    for index, arg in enumerate(argv[:-1]):
-        if Path(arg).name != "code_intel_index.sh":
-            continue
-        candidate = Path(arg) if Path(arg).is_absolute() else cwd / arg
-        if candidate.resolve() == entrypoint and (cwd / argv[index + 1]).resolve() == main:
-            return True
-    # The private OOM launcher contains both wrapper and native argv. Its fixed
-    # flag is not a repository argument; native classification must still run.
-    if "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv):
-        tail = argv[argv.index("analyze") + 1 :]
-        target = cwd / tail[0] if tail and not tail[0].startswith("-") else cwd
-        return target.resolve() == main
-    return False
 
 
 def observed_index_writers(proc: Path = Path("/proc")) -> list[int]:
@@ -444,7 +427,18 @@ def report_retained_state() -> None:
         for key in ("binary", "cache", "runtime"):
             try:
                 path = absolute(config[key]).resolve()
-                inside = any(path.is_relative_to(root.resolve()) for root in roots)
+                # A final root symlink is unlinked, never recursively followed.
+                # Runtime pruning keeps its addressed locks child; another real
+                # deletion root may still cover the candidate independently.
+                inside = any(
+                    not root.is_symlink()
+                    and path.is_relative_to(root.resolve())
+                    and not (
+                        root.name == ".genesis"
+                        and path.is_relative_to(root.resolve() / "locks")
+                    )
+                    for root in roots
+                )
             except (OSError, RuntimeError) as error:
                 print(f"Preserved configured {key}; path classification failed: {error}", flush=True)
                 continue

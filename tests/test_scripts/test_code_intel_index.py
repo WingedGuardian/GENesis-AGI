@@ -916,6 +916,10 @@ def test_both_tools_keep_distinct_slice_placement(tmp_path):
     assert len(cbm) == len(gn) == 2  # each leg's probe and workload
     assert all("--slice-inherit" in line for line in cbm)
     assert all("--slice-inherit" not in line for line in gn)
+    # GitNexus batches land in app-capped.slice (the disk guardian's contained-
+    # kill counter); CBM keeps inheriting for its ancestor admission.
+    assert all("--slice=app-capped.slice" in line for line in gn)
+    assert all("--slice=app-capped.slice" not in line for line in cbm)
 
 
 def test_env_overrides_reach_scope(tmp_path):
@@ -1099,16 +1103,13 @@ def test_no_raw_index_spawns_outside_entrypoint():
             if "index_repository" in line:
                 violations.append(f"{rel}:{lineno}: raw index_repository spawn")
             elif "gitnexus" in line and "analyze" in line:
-                if rel == Path("scripts/codebase_managed.py") and stripped in (
-                    'if "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv):',
-                    'native = "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv)',
-                ):
-                    continue  # exact read-only argv comparisons, not execution
-                if rel == Path("tests/test_scripts/test_codebase_managed_uninstall.py") and stripped in (
-                    '(process / "cmdline").write_bytes(b"node\\0/opt/gitnexus/dist/cli/index.js\\0analyze\\0")',
-                    'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "/opt/gitnexus/dist/cli/index.js", "analyze"], cwd=transaction / "genesis")',
-                ):
-                    continue  # exact synthetic cmdline and owned Python sleeper
+                if (rel, stripped) in {
+                    (Path("scripts/lib/codebase_managed_unit.py"), 'if "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv):'),
+                    (Path("scripts/codebase_managed.py"), 'native = "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv)'),
+                    (Path("tests/test_scripts/test_codebase_managed_uninstall.py"), '(process / "cmdline").write_bytes(b"node\\0/opt/gitnexus/dist/cli/index.js\\0analyze\\0")'),
+                    (Path("tests/test_scripts/test_codebase_managed_uninstall.py"), 'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "/opt/gitnexus/dist/cli/index.js", "analyze"], cwd=transaction / "genesis")'),
+                }:
+                    continue  # exact inert observations and owned Python sleeper
                 violations.append(f"{rel}:{lineno}: raw gitnexus analyze spawn")
     assert not violations, (
         "Raw code-intel index spawn(s) found — route them through "
@@ -1156,7 +1157,14 @@ def test_installer_does_not_claim_queue_success_after_writer_failure():
     assert "WARNING: could not queue initial code intelligence index" in queue
 
 
-@pytest.mark.parametrize("path", ["scripts/codebase_managed.py", "tests/test_scripts/test_codebase_managed_uninstall.py"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "scripts/codebase_managed.py",
+        "scripts/lib/codebase_managed_unit.py",
+        "tests/test_scripts/test_codebase_managed_uninstall.py",
+    ],
+)
 def test_observation_exceptions_do_not_exempt_raw_spawns(tmp_path, monkeypatch, path):
     file = tmp_path / path
     file.parent.mkdir(parents=True)

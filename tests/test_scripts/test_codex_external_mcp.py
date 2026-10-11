@@ -122,6 +122,7 @@ def test_main_executes_launcher_with_sanitized_environment(monkeypatch) -> None:
     subject.main(["--server", "health"])
 
     assert captured["argv"][-2:] == ["--server", "health"]
+    assert captured["argv"][1] == "--external-client"
     assert all(marker not in captured["environment"] for marker in subject._SESSION_CONTEXT)
     assert captured["environment"]["GENESIS_REPO_ROOT"] == str(subject.runtime_root())
 

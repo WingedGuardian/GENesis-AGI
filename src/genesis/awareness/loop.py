@@ -1377,6 +1377,10 @@ async def _resolve_memory_integrity_posture(db) -> None:
 # days old AND ≥20 commits behind; thresholds live beside derive_findings in
 # deploy_health.py, the single producer of finding keys), or a missing
 # systemd unit that has been alerted for >24h.
+# The same check also reports tracked files edited in place in the deploy
+# checkout (main_checkout_dirty, judged by the deploy scripts' own predicate):
+# not drift, but the state in which the next deploy refuses. Its own wording,
+# no update.sh advice (update.sh refuses a dirty tree), never critical.
 # Slow-moving by nature → hourly cadence (the WAL-truncate block).
 _DEPLOY_MISSING_UNIT_CRITICAL_S = 24 * 3600
 _DEPLOY_ALERT_COOLDOWN_S = 6 * 3600  # same-state re-alerts at most every 6h
@@ -1385,8 +1389,34 @@ _DEPLOY_ALERT_COOLDOWN_S = 6 * 3600  # same-state re-alerts at most every 6h
 # (or unresolved) so escalating cannot reset its own clock; recovery rewrites
 # the note so retired anchors can never resurrect a future alert.
 _DEPLOY_SUPERSEDED_NOTE = "superseded by a new deploy-staleness alert state"
+
+
+def _finding_like(finding_class: str) -> str:
+    """A LIKE pattern matching an alert row by a finding class in its
+    structured `[findings: ...]` suffix, never by the prose before it, which
+    carries free text (edited file names, a probe's error) that can contain the
+    class name; `_` is a LIKE wildcard, so `missing-units` would match too."""
+    return f"%[findings: %{finding_class}%"
 _last_deploy_alert_at: float = 0.0
 _last_deploy_alert_key: str = ""
+# The deploy checkout's status on the previous tick (deploy_health's
+# main_checkout["status"]). An unreadable status raises its finding only on the
+# SECOND consecutive tick, so one slow git call never alerts.
+_last_main_checkout_status: str = ""
+# The main_checkout dict from the last tick whose reading the check acted on.
+# A tick whose own reading cannot be acted on (the first unreadable one, or one
+# during a deploy) uses this instead: the checkout component keeps its previous
+# state while every other finding class is reconciled as usual. Acting on the
+# reading itself would resolve a standing dirty alert as if the tree had been
+# restored; holding the whole check would also hold missing-unit and staleness
+# findings that were read conclusively on the same tick. None until this
+# process's first actionable tick, which after a restart (several a day) is
+# usually the first check. Then the store decides: with no unresolved dirty
+# alert, the checkout contributes nothing; with one standing, the dirty class
+# is carried with its count and names unknown, so a drift-only alert never
+# supersedes it. Either way every other finding class is reconciled on the
+# same tick.
+_last_actionable_main_checkout: dict | None = None
 
 
 async def _check_deploy_staleness(db) -> None:
@@ -1394,18 +1424,71 @@ async def _check_deploy_staleness(db) -> None:
 
     Best-effort — the whole body is guarded and never raises into the tick."""
     global _last_deploy_alert_at, _last_deploy_alert_key
+    global _last_main_checkout_status, _last_actionable_main_checkout
     if db is None:
         return
     try:
         # Submodule import (the package __init__ shadows the submodule name
         # with the function of the same name) — resolved per call, so tests
         # can monkeypatch the module attribute.
-        from genesis.observability.snapshots.deploy_health import deploy_health
+        from genesis.observability.snapshots.deploy_health import (
+            deploy_health,
+            main_checkout_findings,
+        )
 
         snap = await deploy_health(db)
         if snap.get("status") == "error":
             return
         findings = snap.get("findings") or []
+        checkout = snap.get("main_checkout") or {}
+        checkout_status = checkout.get("status") or ""
+        previous_checkout_status = _last_main_checkout_status
+        _last_main_checkout_status = checkout_status
+        # A deploy in progress (its own merge reads as dirty) or the FIRST
+        # unreadable tick: this tick's checkout reading is not acted on. Its
+        # checkout findings are replaced by the last actionable reading's, so a
+        # standing dirty alert is neither resolved as if the tree had been
+        # restored nor superseded, while every other finding class on the tick
+        # is reconciled as usual. A second consecutive unreadable tick IS acted
+        # on: it raises main_checkout_unreadable, which supersedes the dirty
+        # row. One tick is an hour.
+        carried = False
+        if checkout_status == "deploying" or (
+            checkout_status == "unknown" and previous_checkout_status != "unknown"
+        ):
+            if _last_actionable_main_checkout is not None:
+                checkout = _last_actionable_main_checkout
+                carried = True
+            elif await observations.has_unresolved_matching(
+                db, source="deploy_staleness_monitor", content_like=_finding_like("main_checkout_dirty")
+            ):
+                # A dirty alert stands and nothing in memory says its count or
+                # names: carry the class alone, so the alert is kept (or
+                # superseded, never resolved) while the rest is reconciled.
+                checkout = {"status": "dirty", "count": None, "paths": []}
+                carried = True
+            elif await observations.has_unresolved_matching(
+                db,
+                source="deploy_staleness_monitor",
+                content_like=_finding_like("main_checkout_unreadable"),
+            ):
+                # Likewise for a standing unreadable alert: nothing was read on
+                # this tick, so it stands rather than being resolved here and
+                # re-raised by the next unreadable tick.
+                checkout = {
+                    "status": "unknown",
+                    "count": 0,
+                    "paths": [],
+                    "reason": "carried from the standing alert",
+                }
+                carried = True
+            else:
+                checkout = {}
+            findings = [
+                f for f in findings if f.split(":", 1)[0] not in _DEPLOY_CHECKOUT_CLASSES
+            ] + main_checkout_findings(checkout)
+        else:
+            _last_actionable_main_checkout = checkout
         if not findings:
             await _resolve_deploy_staleness(db)
             return
@@ -1436,7 +1519,7 @@ async def _check_deploy_staleness(db) -> None:
                 source="deploy_staleness_monitor",
                 from_notes=_DEPLOY_SUPERSEDED_NOTE,
                 to_notes="deploy staleness cleared",
-                content_like="%missing_units%",
+                content_like=_finding_like("missing_units"),
             )
         if not critical and "missing_units" in classes:
             # Escalate a missing unit that has been alerted for >24h. Anchor =
@@ -1447,7 +1530,7 @@ async def _check_deploy_staleness(db) -> None:
             anchor_created_at = await observations.oldest_created_at(
                 db,
                 source="deploy_staleness_monitor",
-                content_like="%missing_units%",
+                content_like=_finding_like("missing_units"),
                 resolution_notes=_DEPLOY_SUPERSEDED_NOTE,
             )
             if anchor_created_at:
@@ -1481,40 +1564,31 @@ async def _check_deploy_staleness(db) -> None:
             resolution_notes=_DEPLOY_SUPERSEDED_NOTE,
         )
 
-        missing_units = snap.get("missing_units") or []
-        tier2 = snap.get("tier2_pending") or []
-        host = snap.get("host_gateway") or {}
-        detail: list[str] = []
-        if age_days is not None:
-            detail.append(f"last successful update.sh: {age_days} days ago")
-        if behind is not None:
-            fetch_age = git_facts.get("fetch_age_hours")
-            detail.append(
-                f"{behind} commits behind upstream"
-                + (f" (as of last fetch, {fetch_age}h ago)" if fetch_age is not None else "")
-            )
-        if missing_units:
-            detail.append("missing systemd units: " + ", ".join(missing_units))
-        if tier2:
-            detail.append(f"{len(tier2)} update.sh-only file(s) changed since the last update")
-        if host.get("status") in ("drift", "unknown_commit"):
-            detail.append(
-                f"host guardian: {host.get('status')} "
-                f"(deployed_commit={host.get('deployed_commit')})"
+        paragraphs: list[str] = []
+        # The drift paragraph (and its update.sh recovery sentence) only when a
+        # drift class is present: update.sh REFUSES a dirty deploy checkout, so
+        # telling someone to run it for a dirty-only state is wrong advice.
+        if set(classes) - _DEPLOY_CHECKOUT_CLASSES:
+            paragraphs.append(_deploy_drift_paragraph(snap, age_days, behind, git_facts))
+        if "main_checkout_dirty" in classes:
+            paragraph = _deploy_checkout_dirty_paragraph(checkout)
+            if carried and checkout.get("count") is not None:
+                paragraph += (
+                    " (As of the previous check: this check could not read the deploy checkout.)"
+                )
+            paragraphs.append(paragraph)
+        if "main_checkout_unreadable" in classes:
+            paragraphs.append(
+                "The deploy checkout's tracked-file status could not be read on two "
+                f"consecutive checks ({checkout.get('reason') or 'no reason given'}), so "
+                "whether the next deploy would refuse is unknown."
             )
         created = await observations.create(
             db,
             id=str(uuid.uuid4()),
             source="deploy_staleness_monitor",
             type="infrastructure_alert",
-            content=(
-                "Merged changes are NOT fully deployed on this install — "
-                + "; ".join(detail)
-                + ". Bare git merges deploy code but skip tier-2 activation "
-                "(systemd units, guardian host redeploy, CC/Node pins). "
-                "Recovery: run scripts/update.sh from ~/genesis. "
-                f"[findings: {', '.join(findings)}]"
-            ),
+            content=" ".join(paragraphs) + f" [findings: {', '.join(findings)}]",
             priority=priority,
             created_at=datetime.now(UTC).isoformat(),
             content_hash=content_hash,
@@ -1527,6 +1601,71 @@ async def _check_deploy_staleness(db) -> None:
         logger.warning("Deploy staleness alert (%s): %s", priority, ", ".join(findings))
     except Exception:
         logger.debug("Failed deploy staleness check", exc_info=True)
+
+
+#: Finding classes about the deploy checkout's own tree, not about merged code
+#: that has not been deployed. They get their own wording and never page:
+#: the critical branch keys only on stale_update and missing_units.
+_DEPLOY_CHECKOUT_CLASSES = frozenset({"main_checkout_dirty", "main_checkout_unreadable"})
+
+
+def _deploy_drift_paragraph(snap: dict, age_days, behind, git_facts: dict) -> str:
+    missing_units = snap.get("missing_units") or []
+    tier2 = snap.get("tier2_pending") or []
+    host = snap.get("host_gateway") or {}
+    detail: list[str] = []
+    if age_days is not None:
+        detail.append(f"last successful update.sh: {age_days} days ago")
+    if behind is not None:
+        fetch_age = git_facts.get("fetch_age_hours")
+        detail.append(
+            f"{behind} commits behind upstream"
+            + (f" (as of last fetch, {fetch_age}h ago)" if fetch_age is not None else "")
+        )
+    if missing_units:
+        detail.append("missing systemd units: " + ", ".join(missing_units))
+    if tier2:
+        detail.append(f"{len(tier2)} update.sh-only file(s) changed since the last update")
+    if host.get("status") in ("drift", "unknown_commit"):
+        detail.append(
+            f"host guardian: {host.get('status')} (deployed_commit={host.get('deployed_commit')})"
+        )
+    return (
+        "Merged changes are NOT fully deployed on this install — "
+        + "; ".join(detail)
+        + ". Bare git merges deploy code but skip tier-2 activation "
+        "(systemd units, guardian host redeploy, CC/Node pins). "
+        "Recovery: run scripts/update.sh from ~/genesis."
+    )
+
+
+def _deploy_checkout_dirty_paragraph(checkout: dict) -> str:
+    count = checkout.get("count")
+    names = ", ".join(checkout.get("paths") or [])
+    omitted = checkout.get("paths_omitted") or 0
+    if omitted:
+        names += f", and {omitted} more"
+    if count is None:
+        # Carried from a standing alert after a restart: the class is known,
+        # its count and names are not.
+        lead = (
+            "Tracked files edited in place in the deploy checkout, as an earlier "
+            "alert recorded (this process has not yet read the checkout; the "
+            "deploy-health snapshot's main_checkout field has the live list)."
+        )
+    else:
+        lead = (
+            f"{count} tracked file(s) edited in place in the deploy checkout "
+            f"(as first detected: {names}; the deploy-health snapshot's main_checkout "
+            "field has the live list)."
+        )
+    return (
+        lead + " Deploys refuse until each is restored or brought "
+        "in through a pull request. In-place writers include hand edits, coding "
+        "clients without the repo's edit hooks, and runtime writers such as the "
+        "learning pipeline's steering rules and the dashboard's config and file "
+        "editors."
+    )
 
 
 async def _resolve_deploy_staleness(db) -> None:
@@ -2263,15 +2402,68 @@ async def _check_git_health(db) -> None:
 # so it still runs in a router-degraded startup, the exact window a
 # belt-and-suspenders integrity check matters. A monotonic >=24h guard gives a
 # daily cadence that also fires once on the first tick after any restart (no
-# interval-reset starvation). The fsck runs in a thread (check_git_deep ->
-# to_thread) so it never blocks the tick. None = "never run this boot".
+# interval-reset starvation). The tick dispatches it OUT-OF-BAND (fsck can run up
+# to its 900 s timeout, twice with the re-check, and must not hold the tick lock);
+# the daily slot is claimed before the run, so overlapping ticks stay
+# single-flight. None = "never run this boot".
 _GIT_DEEP_INTERVAL_S = 24 * 3600
 _last_git_deep_run_at: float | None = None
+_git_deep_task = None  # strong reference to the out-of-band run
+# Set by a service stop, cleared by start: a tick that resumes after the stop
+# signal must not launch a scan nothing will cancel before the DB closes.
+_git_deep_stopped = False
+_git_deep_stuck_warned = False
+
+
+def _git_deep_stuck_s() -> int:
+    """Two fsck timeouts, the re-check wait and the object lookup, plus 5 min."""
+    from genesis.observability import git_health as g
+
+    return 2 * g._DEEP_TIMEOUT_S + g._FSCK_RECHECK_DELAY_S + g._LOOKUP_TIMEOUT_S + 300
+
+
+def _cancel_git_deep_task() -> None:
+    """Stop an in-flight deep scan at shutdown: a scan cut off by the stop
+    proves nothing and must not leave a verdict or a page behind. Also refuses
+    every later dispatch until the loop starts again."""
+    global _git_deep_stopped
+    _git_deep_stopped = True
+    if _git_deep_task is not None and not _git_deep_task.done():
+        _git_deep_task.cancel()
+
+
+def _dispatch_git_health_deep(db) -> None:
+    """Start the daily deep scan as a background task when it is due and not
+    already running, and never after a service stop; the tick never awaits it."""
+    global _git_deep_task, _git_deep_stuck_warned
+    if _git_deep_stopped:
+        return
+    if _git_deep_task is not None and not _git_deep_task.done():
+        # Two fsck timeouts plus the re-check wait bound a healthy run; past that
+        # the git child is stuck in uninterruptible I/O (a timeout kills any other)
+        # and the daily scan has stopped.
+        started = _last_git_deep_run_at
+        limit = _git_deep_stuck_s()
+        stalled = started is not None and time.monotonic() - started > limit
+        if stalled and not _git_deep_stuck_warned:
+            _git_deep_stuck_warned = True
+            logger.warning("git deep fsck still running after %ds; daily scan stalled", limit)
+        return
+    _git_deep_stuck_warned = False
+    last = _last_git_deep_run_at
+    if last is not None and time.monotonic() - last < _GIT_DEEP_INTERVAL_S:
+        return
+    from genesis.util.tasks import tracked_task
+
+    _git_deep_task = tracked_task(
+        _check_git_health_deep(db), name="git-deep-fsck", subsystem=Subsystem.AWARENESS
+    )
 
 
 async def _check_git_health_deep(db) -> None:
     """Daily `git fsck --full` content-verifying scan: writes the deep verdict
-    slot and, on failure, a critical observation. Best-effort; never raises.
+    slot and, on failure, a critical observation. Best-effort; never raises except
+    CancelledError, which a service stop uses to abort the scan with no verdict.
 
     Runs at most once per ``_GIT_DEEP_INTERVAL_S`` (and once on the first tick
     after a restart). NOT gated on ``db``: git integrity matters most when the DB
@@ -2293,7 +2485,8 @@ async def _check_git_health_deep(db) -> None:
 
     if report.ok:
         # Self-heal: a passing content-verifying fsck clears open DEEP alerts
-        # (category="git_deep" only). The verdict file already self-heals per
+        # (category="git_deep" only; git_deep_transient rows are records of past
+        # events and expire on their own TTL). The verdict file already self-heals per
         # slot; without this, the observations outlive recovery as stale
         # criticals and get amplified into false actions (2026-07-16 "git
         # corruption" alarm, seeded by a transient fsck race across ~112
@@ -2316,6 +2509,9 @@ async def _check_git_health_deep(db) -> None:
                     logger.info("git deep-health recovered: resolved %d alert(s)", healed)
             except Exception:
                 logger.debug("git deep-health auto-resolve failed", exc_info=True)
+            transient = report.details.get("fsck_transient")
+            if transient:
+                await _record_git_deep_transient(db, transient, report.checked_at)
         return
     if db is None:
         return
@@ -2337,6 +2533,11 @@ async def _check_git_health_deep(db) -> None:
         if len(detail_lines) >= 5:
             break
     detail = ("\n" + "\n".join(detail_lines)) if detail_lines else ""
+    recheck = report.details.get("fsck_recheck")
+    if report.details.get("fsck_reproduced"):
+        failures += " (reproduced on re-check)"
+    elif recheck:
+        failures += f" (re-check did not complete: {recheck})"
     try:
         created = await observations.create(
             db,
@@ -2371,6 +2572,42 @@ async def _check_git_health_deep(db) -> None:
             logger.debug("git deep-health alert suppressed (duplicate unresolved): %s", failures)
     except Exception:
         logger.debug("Failed to create git deep-health observation", exc_info=True)
+
+
+async def _record_git_deep_transient(db, transient: dict, checked_at: str) -> None:
+    """One 'high' row PER transient event (a fsck failure that passed on
+    re-check): shown in the morning report and dashboard, never paged (only
+    critical rows reach Telegram). A clean run does not resolve it; it expires on
+    the infrastructure_alert TTL, so a recurrence shows as more rows. The verdict
+    leads the body because those surfaces truncate content."""
+    lines = (transient.get("lines") or "").strip()
+    if transient.get("recheck_lines"):
+        lines += f"\nre-check reported (all present on lookup):\n{transient['recheck_lines']}"
+    if transient.get("race"):
+        verdict = (
+            "git fsck failed twice, but every object the re-check called missing exists "
+            "— a scan race with another writer"
+        )
+    else:
+        verdict = f"git fsck failed once and PASSED on re-check {transient.get('delay_s')}s later"
+    try:
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="git_health_monitor",
+            type="infrastructure_alert",
+            category="git_deep_transient",
+            skip_if_duplicate=True,
+            content_hash=hashlib.sha256(f"git_deep_transient:{checked_at}".encode()).hexdigest(),
+            content=(
+                f"{verdict} — transient, no action needed unless this recurs "
+                f"(rc={transient.get('rc')}).\n{lines}"
+            ),
+            priority="high",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+    except Exception:
+        logger.debug("Failed to create git deep-transient observation", exc_info=True)
 
 
 # Daily offline git-bundle publish (F.4). Publishes a *verified* `git bundle` of
@@ -2752,6 +2989,13 @@ async def _check_provider_outage_notify(db) -> None:
         provider_still_failing = None
         current_incident_identity = None
         incident_owner = None
+        # SEVERITY FOLLOWS COVERAGE: a dead provider pages (critical) only when
+        # an essential call site that uses it has no available provider left.
+        # Otherwise its notice is "high" — dashboard + morning report, not
+        # Telegram — because fallback is working. Unknown coverage keeps the
+        # mode's priority. (MEASURED 2026-10-07: neither the NIM nor the Gemini
+        # outage that paged critical left any essential site uncovered.)
+        coverage_for = None
         try:
             from genesis.routing.types import ProviderState
             from genesis.runtime import GenesisRuntime
@@ -2762,6 +3006,38 @@ async def _check_provider_outage_notify(db) -> None:
                 incident_owner = _breakers.incident_owner
                 def provider_still_failing(name, _reg=_breakers):
                     return _reg.get(name).state != ProviderState.CLOSED
+
+                coverage_for = _breakers.uncovered_essential_sites_for
+                # The router skips some providers whose breakers read healthy:
+                # a spent daily quota, and a paid one on a never_pays site or
+                # while the spend budget is exceeded (router.py's chain walk and
+                # _filter_chain). Those cover nothing.
+                _router = getattr(GenesisRuntime.instance(), "_router", None)
+                if _router is not None:
+                    _ledger = getattr(_router, "_daily_budget", None)
+                    _exceeded = False
+                    try:
+                        from genesis.routing.types import BudgetStatus
+
+                        _ct = getattr(_router, "cost_tracker", None)
+                        if _ct is not None:
+                            _exceeded = await _ct.check_budget() == BudgetStatus.EXCEEDED
+                    except Exception:
+                        _exceeded = False  # unknown: the breaker's word stands
+
+                    def _ineligible(name, site, _r=_router, _l=_ledger, _x=_exceeded):
+                        cfg = _r.config.providers.get(name)
+                        if cfg is None:
+                            return False
+                        if _l is not None and _l.exhausted(cfg):
+                            return True
+                        if not cfg.is_free:
+                            cs = _r.config.call_sites.get(site)
+                            return _x or bool(cs is not None and cs.never_pays)
+                        return False
+
+                    def coverage_for(name, _reg=_breakers, _d=_ineligible):
+                        return _reg.uncovered_essential_sites_for(name, also_unavailable=_d)
         except Exception:
             provider_still_failing = None
 
@@ -2773,12 +3049,15 @@ async def _check_provider_outage_notify(db) -> None:
             # nothing. Resolve the demoted rows; the sweep below re-creates
             # them at critical in this same tick, which delivers the pending
             # notification — the point of turning the lever up.
-            await _promote_demoted_provider_notify(db)
+            await _promote_demoted_provider_notify(
+                db, coverage_for=coverage_for, incident_owner=incident_owner,
+            )
 
         written = await sweep_due_notifications(
             db, priority=priority, provider_still_failing=provider_still_failing,
             current_incident_identity=current_incident_identity,
             incident_owner=incident_owner,
+            coverage_for=coverage_for,
         )
         if written:
             logger.info(
@@ -2816,18 +3095,42 @@ async def _open_notify_rows(db) -> list[dict]:
     return out
 
 
-async def _promote_demoted_provider_notify(db) -> None:
+async def _promote_demoted_provider_notify(
+    db, *, coverage_for=None, incident_owner=None,
+) -> None:
     """Resolve high-priority notify rows so live mode can rewrite them critical.
 
     Without this, a row written under `propose_only` blocks the critical write
     via `skip_if_duplicate` (dedup keys exclude priority) and upgrading the
     lever silently delivers nothing — found at review.
+
+    With ``coverage_for``, only rows whose provider would be written critical
+    NOW are resolved (an essential site it serves is uncovered, or coverage is
+    unknown). A covered provider's row is high on purpose: resolving it would
+    only have the sweep re-create it at high, every tick. A row whose provider
+    later becomes the cause of an uncovered site is promoted then.
     """
     try:
+        import json as _json
+
         from genesis.db.crud import observations
 
+        def _now_critical(row) -> bool:
+            if coverage_for is None:
+                return True
+            try:
+                blob = _json.loads(row.get("content") or "")
+                name = blob.get("provider")
+                if incident_owner is not None:  # same mapping as the sweep
+                    name = incident_owner(name, blob.get("incident_identity"))
+                if name is None:
+                    return True
+                return coverage_for(name) != []
+            except Exception:
+                return True  # unknown → the sweep keeps critical, so promote
+
         demoted = [r["id"] for r in await _open_notify_rows(db)
-                   if r.get("priority") == "high"]
+                   if r.get("priority") == "high" and _now_critical(r)]
         if demoted:
             from datetime import UTC, datetime
 
@@ -2836,7 +3139,8 @@ async def _promote_demoted_provider_notify(db) -> None:
                 demoted,
                 resolved_at=datetime.now(UTC).isoformat(),
                 resolution_notes=(
-                    "superseded: lever raised to live — re-created at critical"
+                    "superseded: lever raised to live, or essential coverage lost — "
+                    "re-created at critical"
                 ),
             )
             logger.info(
@@ -3399,6 +3703,7 @@ class AwarenessLoop:
         Does NOT stop the scheduler — that happens in stop().
         """
         self._stopping = True
+        _cancel_git_deep_task()
 
     @property
     def tick_count(self) -> int:
@@ -3461,6 +3766,8 @@ class AwarenessLoop:
         waiting one full interval.  This keeps status.json fresh from the
         moment the bridge starts, preventing watchdog false-positives.
         """
+        global _git_deep_stopped
+        _git_deep_stopped = False
         self._scheduler.add_job(
             self._on_tick,
             IntervalTrigger(minutes=self._interval),
@@ -3530,6 +3837,7 @@ class AwarenessLoop:
     async def stop(self) -> None:
         """Stop the scheduler, waiting for any running tick to finish."""
         self._stopping = True
+        _cancel_git_deep_task()
         self._scheduler.shutdown(wait=True)
         logger.info("Awareness Loop stopped")
 
@@ -3726,10 +4034,11 @@ class AwarenessLoop:
             # inside). Writes a verdict to the shared mount for the guardian.
             await _check_git_health(self._db)
             # Daily deep fsck (F.1) — content-verifying scan for zeroed-but-present
-            # objects the cheap probe misses. Self-guards to ~daily and runs in a
-            # thread. Loop-driven (not the learning scheduler) so it survives a
-            # router-degraded startup.
-            await _check_git_health_deep(self._db)
+            # objects the cheap probe misses. Self-guards to ~daily; dispatched
+            # OUT-OF-BAND so its fsck (and a failing run's re-check) never holds
+            # the tick lock. Loop-driven (not the learning scheduler) so it
+            # survives a router-degraded startup.
+            _dispatch_git_health_deep(self._db)
             # Daily offline git-bundle publish (F.4) — a verified `git bundle` of
             # the repo to the shared mount, health-gated, so the host guardian can
             # archive an offline re-clone lifeline. Self-guards to ~daily and runs
@@ -3755,7 +4064,8 @@ class AwarenessLoop:
                     # backlog clears. Best-effort (guarded internally).
                     await _check_embedding_backlog(self._db)
                     # Deploy staleness — merged-vs-deployed drift (update.sh age,
-                    # commits behind, missing units, host guardian). Day-scale
+                    # commits behind, missing units, host guardian), plus tracked
+                    # edits in the deploy checkout that would refuse a deploy. Day-scale
                     # signal → hourly; self-resolves on recovery. Best-effort
                     # (guarded internally); collectors never do network I/O.
                     await _check_deploy_staleness(self._db)
