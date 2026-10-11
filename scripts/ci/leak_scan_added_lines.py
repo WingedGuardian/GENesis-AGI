@@ -39,7 +39,8 @@ CONTRACT:
           commit contributes its --remerge-diff: its conflict resolution only)
           (kept verbatim, INCLUDING '+++ b/path' headers — repo-relative paths
           never match an install value, and a '+++' filter once dropped added
-          content beginning '++')
+          content beginning '++'), followed by the full message of every
+          commit in the range
   exit 0  range resolved and emitted (clean OR with content — the downstream
           private_pattern_scan decides leak vs clean)
   exit 3  range UNRESOLVABLE — fail-LOUD; never emit empty (that would be a
@@ -296,6 +297,29 @@ def added_lines(spec: tuple[str, str], cwd: str | None = None) -> str:
     )
 
 
+#: The full message (subject and body) of every commit a scan spec covers.
+_MESSAGE_ARGS = {
+    "range": ["log", "--format=%B"],
+    "show": ["show", "-s", "--format=%B"],
+}
+
+
+def commit_messages(spec: tuple[str, str], cwd: str | None = None) -> str:
+    """Every commit message in the spec's range. Raises :class:`RangeError` on git failure.
+
+    A message is published with the branch just as its patch is, and a client
+    without the local commit-msg hook can push one carrying an install value, so
+    the private-pattern gate scans messages as well as added lines.
+    """
+    kind, value = spec
+    proc = subprocess.run(
+        ["git", *_MESSAGE_ARGS[kind], value], cwd=cwd, capture_output=True, check=False
+    )
+    if proc.returncode != 0:
+        raise RangeError(f"git {kind} {value!r} messages failed (rc={proc.returncode})")
+    return proc.stdout.decode("utf-8", errors="replace")
+
+
 def main(argv: list[str] | None = None) -> int:
     # --range prints the git revision range instead of the added lines, for the
     # gitleaks history step: one range definition for both scans.
@@ -342,7 +366,11 @@ def main(argv: list[str] | None = None) -> int:
         if materialize_dir:
             print(materialize(spec, materialize_dir))
             return EXIT_OK
-        out = "\n".join(added_lines_with_paths(spec)) if with_paths else added_lines(spec)
+        if with_paths:
+            out = "\n".join(added_lines_with_paths(spec))
+        else:
+            # The private-pattern haystack: added lines, then every commit message.
+            out = added_lines(spec) + "\n" + commit_messages(spec)
     except RangeError as exc:
         print(
             f"::error::leak scan range unresolvable — {exc}. Failing closed.",

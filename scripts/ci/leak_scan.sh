@@ -317,7 +317,8 @@ step_private() {
   # SELECTION is security-critical and lives in tested Python; it fails
   # CLOSED (nonzero exit, which set -e turns into this step's failure) on an
   # unresolvable range rather than emitting empty. See
-  # tests/test_scripts/test_leak_scan_added_lines.py.
+  # tests/test_scripts/test_leak_scan_added_lines.py. The same output carries
+  # every in-range commit message, which is published with the branch too.
   added="$(python3 scripts/ci/leak_scan_added_lines.py)"
   body=""
   if [[ "${EVENT_NAME-}" == "pull_request" ]]; then

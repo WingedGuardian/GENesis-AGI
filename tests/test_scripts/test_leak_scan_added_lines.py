@@ -387,6 +387,7 @@ def test_main_passes_branch_scope(monkeypatch):
 
     monkeypatch.setattr(lsa, "resolve_scan_spec", _spy)
     monkeypatch.setattr(lsa, "added_lines", lambda spec, cwd=None: "")
+    monkeypatch.setattr(lsa, "commit_messages", lambda spec, cwd=None: "")
     monkeypatch.setenv("LEAK_SCAN_RANGE", "branch")
     monkeypatch.setenv("EVENT_NAME", "push")
     assert lsa.main([]) == lsa.EXIT_OK
@@ -493,6 +494,56 @@ def test_e2e_main_removed_value_stays_clean(tmp_path: Path):
     pf.write_text("MAINLEAK_[0-9]+\nPRLEAK_[0-9]+\n", encoding="utf-8")
     _merge_ref_with(repo, None)  # PR clean; main added-then-removed MAINLEAK
     assert _run_gate_pipeline(repo, pf) == 0  # CLEAN — main history not re-flagged
+
+
+def _merge_ref_with_message(repo: Path, pr_msg: str, main_msg: str) -> None:
+    """main commits ``main_msg``; the PR branch adds clean content under ``pr_msg``."""
+    _git(repo, "init", "-q", "-b", "main")
+    a = _commit(repo, "base.txt", "hello\n", "A")
+    d = _commit(repo, "main2.txt", "maindata\n", main_msg)
+    _set_origin_main(repo, d)
+    _git(repo, "checkout", "-q", "-b", "pr", a)
+    e = _commit(repo, "ok.txt", "harmless\n", pr_msg)
+    _git(repo, "checkout", "-q", d)
+    _git(repo, "merge", "-q", "--no-ff", "-m", "M", e)
+
+
+def test_e2e_value_only_in_a_pr_commit_message_blocks(tmp_path: Path):
+    """A client without the local commit-msg hook can publish an install value
+    in a message alone; the message is in branch history, so the gate reads it."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    pf = tmp_path / "patterns.txt"
+    pf.write_text("PRLEAK_[0-9]+\n", encoding="utf-8")
+    _merge_ref_with_message(repo, "E fix\n\nseen on PRLEAK_77", "D main")
+    assert _run_gate_pipeline(repo, pf) == 1  # EXIT_LEAK
+
+
+def test_e2e_a_main_commit_message_is_out_of_range(tmp_path: Path):
+    """Control: main's own messages are not this PR's, so they never block it."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    pf = tmp_path / "patterns.txt"
+    pf.write_text("PRLEAK_[0-9]+\n", encoding="utf-8")
+    _merge_ref_with_message(repo, "E clean", "D main PRLEAK_88")
+    assert _run_gate_pipeline(repo, pf) == 0  # CLEAN
+
+
+def test_commit_messages_reads_every_commit_in_a_branch_range(tmp_path: Path):
+    r = _branch_repo(tmp_path)
+    spec = lsa.resolve_scan_spec("push", "0" * 40, r["tip"], cwd=r["repo"], branch_push=True)
+    messages = lsa.commit_messages(spec, cwd=r["repo"])
+    log = _git(Path(r["repo"]), "log", "--format=%s", spec[1])
+    assert log and all(subject in messages for subject in log.splitlines())
+
+
+def test_commit_messages_fails_closed_on_a_bad_range(tmp_path: Path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _commit(repo, "base.txt", "hello\n", "A")
+    with pytest.raises(lsa.RangeError):
+        lsa.commit_messages(("range", "nonexistent..HEAD"), cwd=str(repo))
 
 
 def test_range_mode_prints_the_branch_range_for_the_history_scan(
