@@ -377,6 +377,10 @@ GitHub failure by retargeting a PR that was fine.
 | `scheduled-claude` | `n/a (scoped to the public repo only)` | Neither pass nor block — the gate does not apply to this repo. |
 | `scheduled-claude` | `ok (<kind> carried from <anc>, <check> green at head)` | A pass on a CARRIED-FORWARD review. It is not a review made at head; do not describe it as one. |
 | `review-body` / `inline-findings` | `BLOCK` | Unresolved findings → step 3. |
+| `rework` | `BLOCK — rebuild of sent-back PR(s) … rework contract unmet` | The PR rebuilds a PR sent back for rework (a `Replaces: #N` or `Supersedes: #N` field line in its body names one, or its commits contain one's head; prose such as "this replaces #N" is never read as a declaration, and a referenced issue never counts). Every reader works on the body as it renders, parsed as CommonMark (markdown-it-py): code blocks, raw HTML, HTML comments and blockquotes never declare, never fill a field, and never count as a heading. Any later heading, `###` or setext included, ends the `## Rework` section. Prose in a later paragraph is never a field's value. A body declaring more than five replaced PRs blocks without reading them; the owner's override covers that case. The detail lines name each missing item: a maintainer's `## Rework spec` comment on the old PR (a `needs-architecture-session` PR without one has an undecided design and is not rebuilt); a comment on the old PR that opens with exactly `## Rework acknowledgement` (a heading that only starts that way, such as "acknowledgement needed", does not count; an `(aside)` first line, required on a Devin-built PR, is allowed), created before this PR opened; or a line of this PR's `## Rework` section (`Replaces:`, `Split:`, `Kept / deleted / reshaped as the spec asked:`, `Deviations:`, `Questions answered:`). The gate counts an acknowledgement only from an OWNER, MEMBER or COLLABORATOR, or from the Devin bot; it does not check that the author is the builder. So an outside contributor's acknowledgement does not count: a maintainer posts it for them, quoting theirs. Ask the builder for the missing acknowledgement or section. An acknowledgement posted AFTER the rebuild opened can never satisfy the check, so a late one means a fresh PR or the override. The gate checks form only; you judge the substance. `# rework-override` passes it and is logged, but only with the owner's yes. |
+| `rework` | `BLOCK — could not verify — …`, or a detail line beginning `could not verify` | A declared rebuild whose PR body, timeline, acknowledgement, creation-time or commit read failed, or whose declared PR URL could not be checked against this repository. Re-run before acting, and do not override a transient read failure. One failure is permanent: GitHub returns at most 250 commits, so a rebuild with more cannot be verified by containment; that case takes the owner's `# rework-override`. |
+| `rework` | `could not check — …` | Advisory, never a block: nothing is declared and a read that decides rebuild-ness failed. Re-run if the PR might be a rebuild. |
+| `rework` | `n/a (…)` / `ok (…)` | Not a rebuild, or a rebuild whose contract is present. A `NOTE` under `ok` names a replaced PR still open: its builder closes it when the last replacement opens. |
 | `verdict` | `N gate(s) would block` | Not ready. The count tells you how many lines above to act on. |
 | `verdict` | `MERGEABLE (all gates pass)` | → step 4. The `merge-with` line above it is the command to use. |
 
@@ -630,6 +634,11 @@ This is what lets the owner tell a flawed spec from a flawed build without
 reconstructing either. A form check can confirm that the section exists and
 names a split; only you can judge whether a stated deviation is real. Read the
 diff, not just the section.
+
+A rework rebuilt as a NEW PR has to meet a contract the merge gate checks (the
+`rework` row): the gate blocks a rebuild that lacks a
+`## Rework acknowledgement` comment on the old PR, posted before the new PR
+opened by a maintainer or the Devin bot, or the new PR's `## Rework` section.
 
 ---
 

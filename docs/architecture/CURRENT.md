@@ -1464,11 +1464,19 @@ verified: 637f7f7bb679 2026-10-05
   All `/v1` bearer reads go through `genesis.env.bearer_token`. Text-only, and an
   empty completion is a 502 rather than a blank turn); Agent Zero adapter
   optional.
-- **browser/**: profile/state layer only (persistent
-  `~/.genesis/browser-profile`, `BrowserLayer` enum (the navigate result's
-  `layer` values, numbered as in `mcp/health/browser.py`), pgrep patterns as
-  the single source of process detection). The automation TOOLS live in
-  `mcp/health/browser.py`.
+- **browser/**: profile/state layer only (`profile.py` reads and clears
+  cookies in BOTH local profiles, `~/.genesis/camoufox-profile` and
+  `~/.genesis/browser-profile`, matching domains by whole label and refusing to
+  edit a profile another process has open; the cookie tools use the live
+  browser context instead when this process runs that browser),
+  `BrowserLayer` enum (the navigate result's `layer` values, numbered as in
+  `mcp/health/browser.py`), pgrep patterns as the single source of process
+  detection). The automation TOOLS live in `mcp/health/browser.py`: each layer
+  (Camoufox, Chromium, remote CDP, TinyFish) has its own idle clock and
+  cleanup, so a stale-page restart or the 1 h idle reclaim of one layer never
+  touches another (TinyFish included: leaving it does not end its paid
+  session, which bills until its own idle reclaim); a click that opens a new
+  tab switches the tools to it.
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
@@ -1671,6 +1679,16 @@ verified: 83a835e32 2026-10-08
   stabilization window, or a network outage; repeated restarts (flap) or max-restarts
   escalate to a durable owner/Telegram alert. This is why a wedged/dead surplus needs no
   `subsystem_stale` alert (§9): it is detected and self-healed here at 900s.
+  Each tick also reads the container's `io.pressure`; above full avg10 25% it
+  logs, besides the pressure line, the top in-container processes by current
+  I/O rate with their systemd units and, for a process under a Claude Code
+  session, that session's `claude` pid (`_log_io_culprits`, a 1 s sample
+  through the shared `genesis.util.proc_io` sampler the Guardian's recovery
+  also uses). The line carries the summed in-container rate as its
+  denominator: a small total during a stall points outside what the container
+  can see (the host, a process owned by another user, or I/O byte counters
+  miss, such as fsync storms and swap). Unreadable processes are counted, and
+  command lines are never logged.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
   `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
   skill). Known wart: the watchdog's stale-alert wording inverts when the

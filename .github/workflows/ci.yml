@@ -1026,12 +1026,14 @@ jobs:
         # Offline restore fixture changes are count-neutral; ceiling stays 102.
         # Merge with main (#3133 authenticated backup reads): main 25211 + this PR's measured +106 = 25317.
         # Re-merge with main (#3133): main 25213 + this PR's measured +106 = 25319.
-        # Branch leak scan (#2880), --collect-only after the last test-adding
-        # edit:
-        #   test_leak_scan_added_lines.py      14 -> 40   (+26)
-        #   test_branch_leak_scan_workflow.py new -> 23   (+23)
-        # Floor: 25319 + 49 = 25368. Ceiling 102 -> 104: two of the new
+        # Staged excused-path guard (#2889): test_update_checkout_moved.py
+        # collects 97 here and 81 on origin/main (--collect-only): +16; its other
+        # two test edits are count-neutral. Floor: 25319 + 16 = 25335.
+        # Branch leak scan (#2880), --collect-only against main 9008b3717:
+        #   test_leak_scan_added_lines.py      14 -> 42   (+28)
+        #   test_branch_leak_scan_workflow.py new -> 24   (+24)
+        # Floor: 25335 + 52 = 25387. Ceiling 102 -> 104: two of the new
         # workflow tests run the tip half of leak_scan.sh's email and class
         # steps, which call ripgrep, and this job does not install it, so they
         # skip here by design (MEASURED: the run at 3b14708f1 skipped 104).
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25368
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25387
