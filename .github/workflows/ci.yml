@@ -1036,8 +1036,11 @@ jobs:
         # workflow tests run the tip half of leak_scan.sh's email and class
         # steps, which call ripgrep, and this job does not install it, so they
         # skip here by design (MEASURED: the run at 3b14708f1 skipped 104).
-        # Payment-card input guards (#3172 PR1a): the eight changed test files
-        # collect 634 here and 427 on origin/main 034fdbc48 (three are new),
-        # measured with --collect-only: +207. No added skips.
-        # Floor: 25387 + 207 = 25594.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25594
+        # External-I/O census (#2878), --collect-only against main 034fdbc48:
+        # test_check_external_io.py 5 -> 33 (+28). No added skips.
+        # Floor: 25387 + 28 = 25415.
+        # Card-number guards (#3188), --collect-only against main: test_card_shapes
+        # +116 (new), test_memory_mcp +7, test_browser_tools +4, test_reference_extraction
+        # +4, test_browser_cli_card_guard +4 (new), test_output_scanner +3,
+        # test_capability_shadow_wiring +1; no added skips. Floor: 25415 + 139 = 25554.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25554
