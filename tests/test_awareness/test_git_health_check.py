@@ -118,8 +118,10 @@ def _deep_report(ok: bool, failures=None, details=None):
 @pytest.fixture(autouse=True)
 def _reset_deep_guard():
     loop._last_git_deep_run_at = None
+    loop._git_deep_task = None
     yield
     loop._last_git_deep_run_at = None
+    loop._git_deep_task = None
 
 
 class TestDeepCheck:
@@ -354,7 +356,8 @@ class TestDeepSelfHeal:
         assert kw["source"] == "git_health_monitor"
         assert kw["type"] == "infrastructure_alert"
         # Scoped: fsck only READS the object store — a passing fsck must not
-        # clear a live rootfs_readonly / structural cheap alert (Codex P1).
+        # clear a live rootfs_readonly / structural cheap alert (Codex P1), and
+        # git_deep_transient rows are event records that expire on their TTL.
         assert kw["category"] == "git_deep"
 
     @pytest.mark.asyncio
@@ -400,3 +403,270 @@ class TestDeepSelfHeal:
         )
 
         await loop._check_git_health_deep(object())
+
+
+async def _rows(db):
+    rows = await db.execute_fetchall(
+        "SELECT category, priority, resolved, content, resolution_notes FROM observations "
+        "WHERE source = 'git_health_monitor' ORDER BY created_at, rowid"
+    )
+    return [dict(r) for r in rows]
+
+
+def _transient(lines="missing blob abc", checked_at="t"):
+    return git_health.GitHealthReport(
+        ok=True,
+        failures=[],
+        details={"fsck_transient": {"rc": 2, "lines": lines, "delay_s": 120}},
+        kind="deep",
+        checked_at=checked_at,
+    )
+
+
+class TestDeepRecheckAlerts:
+    """#2745: a failure that passes its re-check is recorded once as 'high'
+    (morning report, never Telegram); a reproduced one pages as before."""
+
+    @pytest.fixture(autouse=True)
+    def _no_verdict(self, monkeypatch):
+        monkeypatch.setattr(git_health, "write_git_health_verdict", lambda *a, **k: None)
+
+    async def _run(self, monkeypatch, db, report):
+        monkeypatch.setattr(git_health, "check_git_deep", AsyncMock(return_value=report))
+        loop._last_git_deep_run_at = None
+        await loop._check_git_health_deep(db)
+
+    @pytest.mark.asyncio
+    async def test_transient_writes_one_high_row_and_clears_the_critical(self, monkeypatch, db):
+        await self._run(monkeypatch, db, _deep_report(False, ["fsck_failed"], {"fsck_stderr": "x"}))
+        await self._run(monkeypatch, db, _transient())
+        rows = await _rows(db)
+        assert [(r["category"], r["priority"], r["resolved"]) for r in rows] == [
+            ("git_deep", "critical", 1),
+            ("git_deep_transient", "high", 0),
+        ]
+        # The morning report and ego context cut content at 120-200 chars:
+        # the verdict must come first.
+        assert "PASSED on re-check" in rows[1]["content"][:120]
+        assert "missing blob abc" in rows[1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_race_transient_names_the_race(self, monkeypatch, db):
+        report = _transient()
+        report.details["fsck_transient"]["race"] = "present on lookup"
+        report.details["fsck_transient"]["recheck_lines"] = "missing tree def"
+        await self._run(monkeypatch, db, report)
+        rows = await _rows(db)
+        assert len(rows) == 1 and rows[0]["priority"] == "high"
+        assert "scan race" in rows[0]["content"][:120]
+        assert "PASSED" not in rows[0]["content"]
+        assert "missing tree def" in rows[0]["content"]  # the re-check's own evidence
+
+    @pytest.mark.asyncio
+    async def test_each_transient_is_its_own_open_row(self, monkeypatch, db):
+        # Recurrence must be visible: one row per event, none hiding another.
+        await self._run(monkeypatch, db, _transient("first", checked_at="t1"))
+        await self._run(monkeypatch, db, _transient("second", checked_at="t2"))
+        rows = await _rows(db)
+        assert [(r["category"], r["resolved"]) for r in rows] == [
+            ("git_deep_transient", 0),
+            ("git_deep_transient", 0),
+        ]
+        assert "first" in rows[0]["content"] and "second" in rows[1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_same_event_retried_is_not_duplicated(self, monkeypatch, db):
+        await self._run(monkeypatch, db, _transient(checked_at="t1"))
+        await self._run(monkeypatch, db, _transient(checked_at="t1"))
+        assert len(await _rows(db)) == 1
+
+    @pytest.mark.asyncio
+    async def test_clean_run_keeps_the_transient_record(self, monkeypatch, db):
+        # A clean run must not erase the record before the morning report reads
+        # it (that report reads only unresolved rows); the TTL retires it.
+        await self._run(monkeypatch, db, _transient())
+        await self._run(monkeypatch, db, _deep_report(True))
+        rows = await _rows(db)
+        assert [(r["category"], r["resolved"]) for r in rows] == [("git_deep_transient", 0)]
+
+    @pytest.mark.asyncio
+    async def test_transient_hash_never_collides_with_the_critical(self, monkeypatch, db):
+        await self._run(monkeypatch, db, _transient())
+        await self._run(monkeypatch, db, _deep_report(False, ["fsck_failed"], {"fsck_stderr": "x"}))
+        rows = await _rows(db)
+        assert [(r["category"], r["priority"]) for r in rows] == [
+            ("git_deep_transient", "high"),
+            ("git_deep", "critical"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_reproduced_failure_pages_with_note(self, monkeypatch, db):
+        await self._run(
+            monkeypatch,
+            db,
+            _deep_report(
+                False,
+                ["fsck_failed"],
+                {"fsck_stderr": "missing blob abc", "fsck_reproduced": True},
+            ),
+        )
+        rows = await _rows(db)
+        assert len(rows) == 1 and rows[0]["priority"] == "critical"
+        assert "(reproduced on re-check)" in rows[0]["content"]
+        assert "missing blob abc" in rows[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_recheck_timeout_pages_with_note(self, monkeypatch, db):
+        await self._run(
+            monkeypatch,
+            db,
+            _deep_report(False, ["fsck_failed"], {"fsck_stderr": "e", "fsck_recheck": "timeout"}),
+        )
+        rows = await _rows(db)
+        assert "(re-check did not complete: timeout)" in rows[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_cancel_mid_run_writes_nothing(self, monkeypatch, db, caplog):
+        import asyncio
+
+        monkeypatch.setattr(
+            git_health, "check_git_deep", AsyncMock(side_effect=asyncio.CancelledError)
+        )
+        with caplog.at_level("ERROR"), pytest.raises(asyncio.CancelledError):
+            await loop._check_git_health_deep(db)
+        assert await _rows(db) == []
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+
+class TestDeepDispatch:
+    """The deep scan runs out-of-band: the tick never awaits it (#2745)."""
+
+    @pytest.mark.asyncio
+    async def test_dispatch_returns_without_awaiting_and_is_single_flight(self, monkeypatch):
+        import asyncio
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow(_repo=None):
+            started.set()
+            await release.wait()
+            return _deep_report(True)
+
+        monkeypatch.setattr(git_health, "check_git_deep", _slow)
+        monkeypatch.setattr(git_health, "write_git_health_verdict", lambda *a, **k: None)
+        monkeypatch.setattr(loop.observations, "resolve_by_source_and_type", AsyncMock())
+
+        loop._dispatch_git_health_deep(None)  # returns at once: not a coroutine
+        first = loop._git_deep_task
+        await asyncio.wait_for(started.wait(), 5)
+        assert not first.done()
+        loop._dispatch_git_health_deep(None)  # still running -> no second task
+        assert loop._git_deep_task is first
+        release.set()
+        await asyncio.wait_for(first, 5)
+        loop._dispatch_git_health_deep(None)  # done, but not due for 24 h
+        assert loop._git_deep_task is first
+
+    @pytest.mark.asyncio
+    async def test_dispatch_starts_when_due(self, monkeypatch):
+        deep = AsyncMock(return_value=_deep_report(True))
+        monkeypatch.setattr(git_health, "check_git_deep", deep)
+        monkeypatch.setattr(git_health, "write_git_health_verdict", lambda *a, **k: None)
+        loop._last_git_deep_run_at = loop.time.monotonic() - loop._GIT_DEEP_INTERVAL_S - 1
+        loop._dispatch_git_health_deep(None)
+        await loop._git_deep_task
+        deep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stalled_run_warns_once(self, caplog):
+        import asyncio
+
+        stuck = asyncio.get_running_loop().create_future()  # never completes
+        loop._git_deep_task = stuck
+        loop._last_git_deep_run_at = loop.time.monotonic() - loop._git_deep_stuck_s() - 1
+        loop._git_deep_stuck_warned = False
+        try:
+            with caplog.at_level("WARNING", logger=loop.__name__):
+                loop._dispatch_git_health_deep(None)
+                loop._dispatch_git_health_deep(None)
+            stalls = [r for r in caplog.records if "stalled" in r.getMessage()]
+            assert len(stalls) == 1
+            assert loop._git_deep_task is stuck  # no second run on top of it
+        finally:
+            stuck.cancel()
+            loop._git_deep_stuck_warned = False
+
+
+@pytest.mark.asyncio
+async def test_request_stop_cancels_an_in_flight_scan():
+    """A service stop cancels the deep scan, so it leaves no verdict or page."""
+    import asyncio
+
+    from genesis.awareness.loop import AwarenessLoop
+
+    blocker = asyncio.Event()
+
+    async def _long():
+        await blocker.wait()
+
+    loop._git_deep_task = asyncio.get_running_loop().create_task(_long())
+    try:
+        AwarenessLoop.request_stop(object.__new__(AwarenessLoop))
+        # Bounded: if stop did not cancel, this fails on the timeout, never hangs.
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(loop._git_deep_task), 5)
+        assert loop._git_deep_task.cancelled()
+    finally:
+        loop._git_deep_task = None
+
+
+@pytest.mark.asyncio
+async def test_aborted_scan_writes_no_verdict_and_no_row(monkeypatch, db):
+    """A service stop that kills fsck (CancelledError from check_git_deep) leaves
+    the verdict file and the observations table untouched."""
+    import asyncio
+
+    verdicts = []
+    monkeypatch.setattr(git_health, "check_git_deep", AsyncMock(side_effect=asyncio.CancelledError))
+    monkeypatch.setattr(
+        git_health, "write_git_health_verdict", lambda r, *a, **k: verdicts.append(r)
+    )
+    loop._last_git_deep_run_at = None
+    with pytest.raises(asyncio.CancelledError):
+        await loop._check_git_health_deep(db)
+    assert verdicts == []
+    assert await _rows(db) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", ["request_stop", "stop"])
+async def test_a_tick_resuming_after_a_stop_starts_no_scan(monkeypatch, stop):
+    """Devin review (#3137): a stop signal that lands while a tick awaits an
+    earlier monitor cancelled only the scan already running; the resumed tick
+    then dispatched a new one that outlived shutdown. Both stop paths now refuse
+    every later dispatch until the loop starts again."""
+    from unittest.mock import MagicMock
+
+    from genesis.awareness.loop import AwarenessLoop
+
+    deep = AsyncMock(return_value=_deep_report(True))
+    monkeypatch.setattr(git_health, "check_git_deep", deep)
+    monkeypatch.setattr(git_health, "write_git_health_verdict", lambda *a, **k: None)
+    loop._last_git_deep_run_at = None  # due
+    inst = object.__new__(AwarenessLoop)
+    inst._scheduler = MagicMock()
+    if stop == "request_stop":
+        AwarenessLoop.request_stop(inst)
+    else:
+        await AwarenessLoop.stop(inst)
+    loop._dispatch_git_health_deep(None)  # the resumed tick reaches the dispatch
+    assert loop._git_deep_task is None
+    deep.assert_not_awaited()
+    # A fresh start re-arms it.
+    inst._interval = 5
+    await AwarenessLoop.start(inst)
+    loop._dispatch_git_health_deep(None)
+    assert loop._git_deep_task is not None
+    await loop._git_deep_task
+    deep.assert_awaited_once()

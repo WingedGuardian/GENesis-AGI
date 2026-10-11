@@ -141,9 +141,10 @@ async def _prune_aged_deprecated_edges(
 
     Age comes from the authoritative ``deprecated_at`` timestamp stamped at merge
     (NOT the synthesis's ``created_at``, which ``store()``'s exact-dedup can make
-    an old pre-existing memory's). Only dream deprecations carry ``deprecated_at``
-    — non-dream deprecations (e.g. entity adjudication) leave it NULL and are
-    never touched here. The synthesis->original provenance ``extends`` edge is
+    an old pre-existing memory's). Only dream SYNTHESIS deprecations carry
+    ``deprecated_at`` — synthesis copies the edges onto the synthesis first.
+    Every other deprecation leaves it NULL and is never touched here, including
+    dream entity merges, which copy no edges onto the survivor (#2993). The synthesis->original provenance ``extends`` edge is
     preserved; every other edge (including ordinary ``extends``) is pruned.
     """
     from genesis.memory import dream_shield_config
