@@ -161,7 +161,7 @@ All on genesis-health. The browser starts lazily on the first navigate.
 | Tool | Hard timeout | Notes |
 |---|---|---|
 | `browser_navigate` | 300 s (Camoufox, Chromium, TinyFish); 60 s remote | `page.goto` itself 30 s; the Turnstile cascade uses most of the 300 s |
-| `browser_click` | 60 s | returns `clicked`, `url`, `snapshot`, and `new_page` when the click opened a tab; the wait for that tab is in "Tabs and popups" |
+| `browser_click` | 60 s | returns `clicked`, `url`, `snapshot`, and `new_page` when a tab the click opened was seen within the click's wait; no `new_page` does not prove no tab opened (see "Tabs and popups") |
 | `browser_fill` | none overall; fails if one step (clearing, focusing, a keystroke) makes no progress for 30 s | see "Long text" |
 | `browser_upload` | 60 s | file must exist on the Genesis host, also for remote CDP |
 | `browser_run_js` | 60 s | expression is written to the log; never put a secret in it. On Camoufox it runs in an isolated world: DOM yes, page JavaScript globals no |
@@ -306,9 +306,11 @@ Use the snapshot to pick a selector, most stable first:
 
 ## Tabs and popups
 
-When a click opens a tab or popup (`target="_blank"`, `window.open`), the
-tools switch to it: the click result's `url` and `snapshot` are the new tab's,
-and `new_page` names it. The original tab stays open. If the new tab closes
+When a click opens a tab or popup (`target="_blank"`, `window.open`) and the
+tools see it within the click's wait (below), they switch to it: the click
+result's `url` and `snapshot` are the new tab's, and `new_page` names it.
+`new_page` reports only what was seen within that wait. The original tab
+stays open. If the new tab closes
 itself (a sign-in popup), the tools go back to the tab that opened it. On
 remote CDP after a reconnect, the tools instead stop on that close, and the
 next `browser_navigate(..., remote=True)` reuses (and navigates) the tab that
@@ -316,10 +318,13 @@ opened it, if it is still open, rather than opening a new one. A tab opened by a
 page that then closes itself is not seen, so it is not followed. If one click
 opens several
 tabs, the tools follow the first one still open and `new_page.also_opened`
-lists the others' addresses. A tab
+lists the addresses of the others seen within the wait. A tab
 that starts loading later than the click's wait (10 s for a link or form that
-declares a new tab, 1 s otherwise) is not followed, and a `new_page` with a
-`note` says when one was seen but not followed. In that case, read its address
+declares a new tab, 1 s otherwise) is not seen at all: it gets no `new_page`
+and is not followed, though it may still be open. So a missing `new_page`
+does not prove no tab opened; check before repeating a click that should
+have opened one. A `new_page` with a `note` says a tab was seen but not
+followed. In either case, read its address
 with `browser_run_js("document.querySelector('<css selector>').href")` and
 `browser_navigate` to it in the same layer.
 
