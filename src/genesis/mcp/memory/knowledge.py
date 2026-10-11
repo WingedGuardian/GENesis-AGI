@@ -516,8 +516,8 @@ async def reference_store(
 
     ``value`` is the raw value (password, URL string, IP address, file path,
     etc.). Stored plaintext in the knowledge_units table, so an entry holding
-    a payment card number in any field is refused (cards belong in the
-    encrypted card vault).
+    a payment card number in any field is refused (the planned card vault
+    is tracked in #3172).
 
     ``description`` is REQUIRED. An IP without "what is this" or a credential
     without "what service" is useless 10 sessions later. Describes the
@@ -538,8 +538,8 @@ async def reference_store(
     if _carries_card_number(kind, identifier, value, description, tags, source):
         raise ValueError(
             "reference_store: refused, the entry contains a payment card number. "
-            "Cards are never stored as references; they belong in the encrypted "
-            "card vault."
+            "Cards are never stored as references; hand card details to the user "
+            "(the planned card vault is tracked in #3172)."
         )
     if kind not in _REFERENCE_KINDS:
         raise ValueError(
@@ -568,8 +568,8 @@ async def reference_store(
     if contains_card_number(body):
         raise ValueError(
             "reference_store: refused, the entry contains a payment card number. "
-            "Cards are never stored as references; they belong in the encrypted "
-            "card vault."
+            "Cards are never stored as references; hand card details to the user "
+            "(the planned card vault is tracked in #3172)."
         )
 
     # Tags JSON array for the SQLite row. Include reference markers up front

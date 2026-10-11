@@ -35,11 +35,22 @@ from pathlib import Path
 from fastmcp import Context
 
 from genesis.browser.types import BrowserLayer
-from genesis.mcp.health import browser_card_guard as _card_guard
 from genesis.mcp.health import mcp
 from genesis.security.card_shapes import contains_card_number
 
 logger = logging.getLogger(__name__)
+
+# Fixed texts: a refusal never echoes the value it refused.
+_REFUSE_CARD_VALUE = (
+    "Refused: the value looks like a payment card number. Card numbers are never "
+    "typed with the general browser tools; hand card entry to the user (see the "
+    "browser-automation skill, Safety gates)."
+)
+_REFUSE_CARD_RUN_JS = (
+    "Refused: the script contains what looks like a payment card number. Card "
+    "numbers never go through browser_run_js; hand card entry to the user (see the "
+    "browser-automation skill, Safety gates)."
+)
 
 # File-based logging for the entire MCP health server — routes ALL log
 # output to ~/tmp/mcp_health.log so it's readable after timeouts.
@@ -2238,7 +2249,7 @@ async def _no_stall(
     return result
 
 
-async def _human_type(page, selector: str, value: str, *, before_typing=None) -> None:
+async def _human_type(page, selector: str, value: str) -> None:
     """Type text character-by-character with human-like timing.
 
     Camoufox and CDP remote: clears field via fill(""), then types
@@ -2250,14 +2261,6 @@ async def _human_type(page, selector: str, value: str, *, before_typing=None) ->
     jitter (Playwright's page.type delay= is fixed across all chars).
 
     Chromium fallback (dev/test): atomic page.fill() (no delay overhead).
-
-    ``before_typing(page)``, when given, runs after the focusing click and
-    again before EVERY keystroke, because keystrokes go wherever focus is, and
-    an input handler or auto-advance can move focus after the first character
-    (into a frame the selector never named). It raises to stop typing.
-    It runs on the per-keystroke path only: the atomic ``page.fill`` path sets
-    the selector's own element, which the caller already checked, and has no
-    click to move focus. Switching that path to click-and-type must call it.
     """
     layer = _layer_of(page)
     if not _is_camoufox_active() and not _is_remote_active():
@@ -2272,8 +2275,6 @@ async def _human_type(page, selector: str, value: str, *, before_typing=None) ->
     # Hold time: log-normal, median ~86ms (CMU Keystroke Dynamics calibration).
     # Flight time: 50-200ms uniform with 5% thinking pauses.
     for i, char in enumerate(value):
-        if before_typing is not None:
-            await before_typing(page)  # focus can move between keystrokes
         # Hold phase: keydown → hold → keyup
         hold_s = random.lognormvariate(math.log(0.086), 0.35)
         hold_s = max(0.03, min(hold_s, 0.20))  # clamp 30-200ms
@@ -3602,12 +3603,19 @@ def _click_failed(selector: str, e: Exception, sent: bool = False) -> dict:
 async def _impl_browser_fill(selector: str, value: str) -> dict:
     """Fill a form field on the current page.
 
-    Refuses a card number as the value, a card field as the target, and a
-    click that left focus in a card field (see ``browser_card_guard``), before
-    anything is typed or logged.
+    A value containing a payment card number is refused before anything is
+    typed or logged.
+
+    Known limit: the check reads the VALUE. Whether the target field is a card
+    field is not judged here; deciding that from page attributes misses labels
+    in other languages, placeholders and frames, so it is not judged anywhere
+    yet; the planned card-fill flow (#3172) owns it, where a field it fails to
+    find fails the fill (safe). A model already holding a card could type it in
+    pieces; the planned card vault and input and output redaction (#3172) are
+    what keep real numbers out of its context.
     """
     if contains_card_number(value):
-        return {"error": _card_guard.REFUSE_VALUE}
+        return {"error": _REFUSE_CARD_VALUE}
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -3632,22 +3640,11 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
 async def _fill(page, selector: str, value: str) -> dict:
     """The typing of _impl_browser_fill, under its page's action lock."""
     global _active_page
-    # An unreadable target refuses too: the Chromium and TinyFish layers fill
-    # atomically, with no post-click focus check to catch it later.
-    target = await _card_guard.target_is_card_field(page, selector)
-    if target is True:
-        return {"error": _card_guard.REFUSE_FIELD}
-    if target is None:
-        return {"error": _card_guard.REFUSE_TARGET_UNVERIFIED}
     try:
         await _human_delay()
-        await _human_type(
-            page, selector, value, before_typing=_card_guard.refuse_if_focused_card_field
-        )
+        await _human_type(page, selector, value)
         _update_remote_url()  # Fill + Enter may cause navigation
         return {"filled": selector, "url": page.url}
-    except _card_guard.CardFieldRefused as e:
-        return {"error": str(e)}
     except FillStalled as e:
         # Same recovery as a tool timeout: the browser is hung, so the page is
         # in an unknown state and the next step must be a fresh navigate. The
@@ -3788,11 +3785,11 @@ async def _impl_browser_run_js(expression: str) -> dict:
     Known limit (a documented residual, by owner decision): the check reads the
     expression's TEXT, so a script that computes a number at runtime
     (``'4242'+'4242'+…``) is not caught. No text check can close that for an
-    arbitrary evaluator; the guard catches the accidental literal, and the card
-    vault keeps real numbers out of the agent's context in the first place.
+    arbitrary evaluator; the guard catches the accidental literal, and the
+    planned card vault (#3172) keeps real numbers out of the agent's context.
     """
     if contains_card_number(expression):
-        return {"error": _card_guard.REFUSE_RUN_JS}
+        return {"error": _REFUSE_CARD_RUN_JS}
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -4035,11 +4032,6 @@ async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
             return health
         page = _active_page
     count = max(1, min(count, 50))
-    # Typing a card number one key at a time is the same leak as browser_fill:
-    # in a card field, or where focus could not be checked, only navigation
-    # keys go through. Checked before every press, because a form can move
-    # focus between presses (auto-advance into the next field).
-    guard = not _card_guard.key_allowed_in_card_field(key)
     async with _page_action(page) as refused:  # Enter on a link may open a tab
         if refused:
             return refused
@@ -4047,12 +4039,6 @@ async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
             for i in range(count):
                 if i > 0:
                     await asyncio.sleep(random.uniform(0.05, 0.15))
-                if guard:
-                    focused = await _card_guard.focused_card_field(page)
-                    if focused is True:
-                        return {"error": _card_guard.REFUSE_FIELD, "pressed_before_refusal": i}
-                    if focused is None:
-                        return {"error": _card_guard.REFUSE_UNVERIFIED, "pressed_before_refusal": i}
                 await page.keyboard.press(key)
             return {"pressed": key, "count": count, "url": page.url}
         except Exception as e:
@@ -4193,9 +4179,8 @@ async def browser_fill(selector: str, value: str, ctx: Context | None = None) ->
     is still the active page. Progress is reported as the fill advances, so
     the MCP client's idle timeout does not cancel a long fill.
 
-    Payment card numbers are refused: as the value, into a card field (number,
-    security code, expiry), or where the click left focus in one. Card entry
-    uses the vault's approved card-fill flow.
+    A value containing a payment card number is refused; card entry is handed
+    to the user.
     """
     steps = 0
     last_sent = time.monotonic()
@@ -4323,9 +4308,6 @@ async def browser_press_key(key: str, count: int = 1) -> dict:
 
     Examples: browser_press_key('Tab', 3), browser_press_key('Space'),
               browser_press_key('ArrowDown'), browser_press_key('Shift+Tab')
-
-    While focus is in a payment card field (or a frame that cannot be
-    checked), only navigation keys go through; typing keys are refused.
     """
     return await _with_tool_timeout(
         _impl_browser_press_key(key, count),
