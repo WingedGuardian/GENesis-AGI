@@ -487,7 +487,18 @@ def report_retained_state() -> None:
         for key in ("binary", "cache", "runtime"):
             try:
                 path = absolute(config[key]).resolve()
-                inside = any(path.is_relative_to(root.resolve()) for root in roots)
+                # A final root symlink is unlinked, never recursively followed.
+                # Runtime pruning keeps its addressed locks child; another real
+                # deletion root may still cover the candidate independently.
+                inside = any(
+                    not root.is_symlink()
+                    and path.is_relative_to(root.resolve())
+                    and not (
+                        root.name == ".genesis"
+                        and path.is_relative_to(root.resolve() / "locks")
+                    )
+                    for root in roots
+                )
             except (OSError, RuntimeError) as error:
                 print(f"Preserved configured {key}; path classification failed: {error}", flush=True)
                 continue

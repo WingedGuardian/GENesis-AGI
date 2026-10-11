@@ -226,3 +226,41 @@ def test_no_settings_json_pipes_dead_env_var():
         "These settings files still reference the dead CLAUDE_TOOL_INPUT env var "
         f"(hooks must read the payload from stdin): {offenders}"
     )
+
+
+def _hook_input():
+    hooks = Path(__file__).resolve().parents[2] / "scripts" / "hooks"
+    sys.path.insert(0, str(hooks))
+    try:
+        import hook_input
+    finally:
+        sys.path.remove(str(hooks))
+    return hook_input
+
+
+def test_tool_response_parses_an_mcp_json_string():
+    """MCP tools deliver tool_response as a JSON STRING (measured from the
+    session observer). Reading only dicts made every MCP-triggered PostToolUse
+    hook see {} and never fire."""
+    hi = _hook_input()
+    payload = {"tool_response": json.dumps({"layer": "camoufox", "url": "u"})}
+    assert hi.tool_response(payload) == {"layer": "camoufox", "url": "u"}
+
+
+def test_tool_response_keeps_the_dict_shape_and_rejects_non_objects():
+    hi = _hook_input()
+    assert hi.tool_response({"tool_response": {"ok": 1}}) == {"ok": 1}
+    assert hi.tool_response({"tool_response": "plain text"}) == {}
+    assert hi.tool_response({"tool_response": json.dumps([1, 2])}) == {}
+
+
+def test_a_present_tool_response_never_falls_back_to_the_legacy_env(monkeypatch):
+    """When the payload carries ``tool_response`` it is authoritative, whatever
+    its value: the legacy env var could hold an EARLIER tool's result, and a
+    hook would then act on the wrong call (claim a sentinel, keep a marker)."""
+    hi = _hook_input()
+    monkeypatch.setenv("CLAUDE_TOOL_USE_RESULT", '{"layer": "camoufox"}')
+    for present in ("{}", "plain text", json.dumps([1]), None, [1], 3):
+        assert hi.tool_response({"tool_response": present}) == {}, present
+    # Absent key: the legacy channel still answers.
+    assert hi.tool_response({}) == {"layer": "camoufox"}
