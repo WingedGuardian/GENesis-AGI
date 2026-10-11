@@ -4,14 +4,23 @@
 # Sourced, not executed (no shebang) — host-setup.sh dot-sources it and its
 # caller runs under `set -euo pipefail`, so every step here must be errexit-safe.
 #
-# incus applies `limits.memory.swap` only when the container STARTS, so on an
-# already-running container — including one just created above, and every
-# retrofit run of host-setup — the live cgroup keeps `memory.swap.max=0` until
-# the next restart. The config is set but silently no-ops meanwhile (observed
-# 2026-07: a swap retrofit looked applied while the container stayed one memory
-# spike away from OOM-thrash, the exact failure the setting is meant to prevent).
-# This mirrors what incus does at start by writing the live cgroup now, so swap
-# is active immediately without a disruptive container restart.
+# `limits.memory.swap=true` makes incus write `memory.swap.max=0` to the
+# cgroup — at container start, AND on every live update to a `limits.memory*`
+# key (driver_lxc.go, v6.0.0 and main, read 2026-10-07: `true`/unset/`false`
+# all hit the same SetMemorySwapLimit(0) branch; only a byte-size VALUE for
+# `limits.memory.swap` is applied as a real ceiling with no 0-window). So the
+# `incus config set limits.memory.swap true` just above — on a freshly
+# created container, or an existing one being retrofitted — leaves the live
+# cgroup at `memory.swap.max=0` right now, not just until the next restart.
+# The config is set correctly but silently no-ops meanwhile (observed 2026-07:
+# a swap retrofit looked applied while the container stayed one memory spike
+# away from OOM-thrash, the exact failure the setting is meant to prevent).
+# Writing `max` is Genesis's own uncapped-swap default, not a value Incus
+# itself would write here -- with a hard `limits.memory` set, Incus's own
+# branches write either `0` or a parsed finite byte value, never `"max"`
+# (driver_lxc.go, confirmed on v6.0.0 and main). This writes the live
+# cgroup to that default now, so swap is active immediately without a
+# disruptive container restart.
 #
 # Best-effort and idempotent: it does nothing if the cgroup knob is absent
 # (container stopped, cgroup v1, or a non-standard layout — the config-set alone

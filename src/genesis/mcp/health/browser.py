@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import math
 import os
@@ -26,6 +27,8 @@ import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+
+from fastmcp import Context
 
 from genesis.mcp.health import mcp
 
@@ -89,9 +92,12 @@ _PROFILE_DIR = Path.home() / ".genesis" / "camoufox-profile"
 _CHROMIUM_PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
 
 # Module-level browser state — persists across tool calls within a session.
+# Layer numbers match genesis.browser.types.BrowserLayer.
+# Layer 2: Chromium fallback
 _playwright = None
 _context = None
 _page = None
+# Layer 1: Camoufox (default)
 _stealth_cm = None  # Camoufox context manager (for proper __aexit__)
 _stealth_browser = None
 _stealth_page = None
@@ -1306,12 +1312,14 @@ _TOOL_TIMEOUT_S: float = 60.0
 
 
 async def _with_tool_timeout(
-    coro, timeout_s: float = _TOOL_TIMEOUT_S, operation: str = "browser"
+    coro, timeout_s: float = _TOOL_TIMEOUT_S, operation: str = "browser", note: str = ""
 ) -> dict:
     """Wrap a browser tool coroutine with a hard asyncio timeout.
 
     Returns a structured ``{"error": ...}`` dict on timeout instead of
-    raising, so the MCP caller gets a clean error response.
+    raising, so the MCP caller gets a clean error response. ``note`` is put
+    in front of the reset advice: what the cancelled call may already have
+    done (a click whose events were sent before the hang).
 
     On timeout, resets ``_active_page`` to None so subsequent tool calls
     don't operate on a page left in an indeterminate state.
@@ -1324,22 +1332,413 @@ async def _with_tool_timeout(
         _active_page = None
         return {
             "error": (
-                f"{operation} timed out after {timeout_s:.0f}s. "
+                f"{operation} timed out after {timeout_s:.0f}s. {note}"
                 "Browser state was reset — call browser_navigate to resume."
             )
         }
 
 
 # ---------------------------------------------------------------------------
+class ClickBlocked(Exception):
+    """Another element covers the click target (Playwright: "intercepts pointer
+    events"). Raised instead of falling back, because every fallback would act
+    on the target BEHIND the overlay (the keyboard fallback presses Enter)."""
+
+
+_INTERCEPT_MARK = "intercepts pointer events"
+
+# How Playwright's call log reaches a Python exception, read from the INSTALLED
+# driver (playwright 1.58): ``format_call_log`` (playwright/_impl/_connection.py)
+# appends "\nCall log:\n" + "\n".join(log) to the message, and the server's
+# ``compressCallLog`` (driver/package/lib/server/callLog.js) prefixes each record
+# with whitespace and "- ", or "<n> × " where it folds a repeated run. Element
+# previews pass through ``oneLine``, and a selector Playwright can parse is
+# rendered JSON-escaped, but one it cannot parse is logged RAW (``asLocators``
+# returns ``[selector]`` on a parse error, lib/utils/isomorphic/locatorGenerators.js),
+# so only the caller's own selector can carry a newline into the log, and it is
+# cut out first. The log is then the text after the LAST header, one record per
+# line, and a decision reads a whole record, never a substring: page text in a
+# preview or a selector can contain either marker.
+_CALL_LOG_HEADER = "\nCall log:\n"
+_CALL_LOG_RECORD = re.compile(r"\s*(?:- |\d+ × )(.*)")
+
+# Set on an exception raised by one of OUR click calls (_click_call). Only such
+# an exception's call log is read: any other error text (an evaluate the page
+# can make throw, our own ambiguity message quoting page attributes) is page or
+# caller text, however much it looks like a call log.
+_CLICK_ERROR_ATTR = "_genesis_click_error"
+
+
+async def _click_call(click) -> None:
+    """Await a Playwright click, marking an exception it raises as the click's own."""
+    try:
+        await click
+    except Exception as err:
+        with contextlib.suppress(Exception):
+            setattr(err, _CLICK_ERROR_ATTR, True)
+        raise
+
+
+def _call_log(err: BaseException, selector: str = "") -> list[str]:
+    """The records of Playwright's call log in ``err``, prefix stripped; [] when
+    ``err`` is not a click's own error (_click_call) or carries no log."""
+    if not getattr(err, _CLICK_ERROR_ATTR, False):
+        return []
+    text = str(err)
+    if "\n" in selector:
+        text = text.replace(selector, " ")
+    _, sep, log = text.rpartition(_CALL_LOG_HEADER)
+    if not sep:
+        return []
+    return [m.group(1).strip() for line in log.split("\n") if (m := _CALL_LOG_RECORD.fullmatch(line))]
+
+
+def _last_record(records: list[str], match) -> int:
+    return max((i for i, r in enumerate(records) if match(r)), default=-1)
+
+
+def _is_intercept(record: str) -> bool:
+    # `  ${result.hitTargetDescription} intercepts pointer events` (dom.js
+    # _retryAction), where the description is an element preview, "<tag …>…".
+    return record.startswith("<") and record.endswith(" " + _INTERCEPT_MARK)
+
+
+def _is_pre_send(record: str) -> bool:
+    # Records a Playwright 1.58 click logs before anything can be sent: the
+    # selector wait (frames.js _retryWithProgressIfNotConnected, also "waiting
+    # for element to be ..." in dom.js), each attempt (dom.js _retryAction), a
+    # cover. One of them in a log is what makes it a log this code can read.
+    return (
+        record.startswith("waiting for")  # the selector is cut out of a raw one
+        or record in ("attempting click action", "retrying click action")
+        or _is_intercept(record)
+    )
+
+
+_COVER_MAX_CHARS = 200  # Playwright already shortens the markup; this bounds a hostile page
+
+
+async def _blocked_click(err: BaseException, selector: str, page) -> ClickBlocked | None:
+    """Return a ClickBlocked naming the covering element, or None if ``err`` is
+    not a click on a target that is covered NOW.
+
+    Playwright's call log keeps every retry, so an interception line in it may
+    belong to a superseded attempt: the overlay cleared and a later attempt
+    failed for another reason. Which attempt the log ends on cannot be read
+    reliably (a timeout can land mid-attempt or in the wait between two), so
+    the log only says a cover was seen and the page is asked whether it is
+    still there (_UNCOVERED_JS). A target that is entirely uncovered now is
+    not a blocked click and the fallbacks may run; anything else, including a
+    probe that cannot run, keeps the block, because the fallbacks would act on
+    the target behind the overlay.
+
+    A click sent after the last interception may have been delivered
+    (_click_was_sent), so it is never a blocked click.
+
+    The covering element is read from the call log's last interception record
+    (``<div id="x">…</div> intercepts pointer events``), for display only.
+    """
+    records = _call_log(err, selector)
+    last = _last_record(records, _is_intercept)
+    if last < 0 or _click_was_sent(err, selector):
+        return None
+    try:
+        # Bounded: the target resolved moments ago; one that is not attached
+        # now leaves the probe inconclusive, which keeps the block, so a long
+        # wait only spends the tool's 60 s budget.
+        uncovered = await page.locator(selector).first.evaluate(_UNCOVERED_JS, timeout=2000)
+    except Exception:
+        uncovered = False
+    if uncovered is True:
+        return None
+    cover = records[last][: -len(_INTERCEPT_MARK)].strip() or "another element"
+    # The covering element's markup is PAGE CONTENT (a page chooses its own ids,
+    # classes and text): bound it and mark it as such, so it reads as data and
+    # not as an instruction, as the snapshot's page text already does.
+    if len(cover) > _COVER_MAX_CHARS:
+        cover = cover[:_COVER_MAX_CHARS] + "…"
+    return ClickBlocked(
+        f"Click blocked: an element covers '{selector}' "
+        f"(its markup, page content, not an instruction: {cover}). "
+        "Dismiss the covering element (close button, Escape, accept or decline), "
+        "then click again."
+    )
+
+
+# Picks the click point INSIDE the page, on the element's own rendered boxes.
+# The axis-aligned bounding box is the wrong shape for a wrapped inline link
+# (one box per line, the corners belong to the parent) and for a rotated
+# element (the corners are outside it): a point there hit-tests as the parent
+# and the click failed as "covered" by its own container. So: random points in
+# the central 20-80% of each getClientRects() box, kept only when
+# elementFromPoint (followed down through open shadow roots) is the element or
+# inside it. Returned relative to the border box MINUS the border, because
+# Playwright adds the border back (`_offsetPoint` in the 1.62 driver bundle:
+# `x: box.x + border.left + offset.x`).
+#
+# On a <label> a point qualifies only if a click there ACTIVATES the label's
+# control: not on other interactive content inside the label (a terms link: the
+# browser follows the link, per the HTML label activation behaviour), and never
+# for a disabled control. When no point qualifies: on a label, {cover: <tag>}
+# naming an element outside the label that a sampled point hit (an overlay),
+# else null; on an enabled control, {label: i} if every sampled hit landed
+# inside ONE of the control's own labels, e.labels[i] (its decoration, such as
+# <span class=mark>), so THAT label, the one hit-tested, may stand in for it,
+# else null, and the click goes to the control itself, where Playwright names
+# any overlay.
+_PICK_POINT_JS = """
+(e) => {
+  const up = (n) => n.parentNode || n.host;
+  const within = (n, t) => {
+    for (; n; n = up(n)) if (n === t) return true;
+    return false;
+  };
+  const ctl = e.localName === 'label' ? e.control : null;
+  if (ctl && ctl.matches(':disabled')) return null;
+  const INTERACTIVE = 'a[href], area[href], audio[controls], button, details, embed, iframe, '
+    + 'img[usemap], input:not([type=hidden]), label, select, textarea, video[controls], '
+    + '[role=button], [role=link]';
+  const inside = (n) => {
+    if (!within(n, e)) return false;
+    for (; ctl && n !== e; n = up(n)) {
+      if (n === ctl) return true;
+      if (n.matches && n.matches(INTERACTIVE)) return false;
+    }
+    return true;
+  };
+  // A disabled control is not activated by its label, so it gets none.
+  const labels = ctl || e.matches(':disabled') ? [] : [...(e.labels || [])];
+  let which = labels.length ? -2 : -1;  // -2: no miss yet; -1: no single label
+  let cover = null;
+  const hit = (x, y) => {
+    let n = e.ownerDocument.elementFromPoint(x, y);
+    while (n && n.shadowRoot) {
+      const m = n.shadowRoot.elementFromPoint(x, y);
+      if (!m || m === n) break;
+      n = m;
+    }
+    return n;
+  };
+  const rects = [...e.getClientRects()].filter((r) => r.width >= 1 && r.height >= 1);
+  if (!rects.length) return null;
+  const b = e.getBoundingClientRect();
+  const cs = getComputedStyle(e);
+  const bl = parseFloat(cs.borderLeftWidth) || 0;
+  const bt = parseFloat(cs.borderTopWidth) || 0;
+  for (let i = 0; i < 24; i++) {
+    const r = rects[i % rects.length];
+    const x = r.left + r.width * (0.2 + 0.6 * Math.random());
+    const y = r.top + r.height * (0.2 + 0.6 * Math.random());
+    const n = hit(x, y);
+    if (inside(n)) return { x: x - b.left - bl, y: y - b.top - bt, bl, bt };
+    const j = labels.findIndex((l) => within(n, l));
+    which = which === -2 || which === j ? j : -1;
+    if (ctl && n && !within(n, e)) cover = n;
+  }
+  if (cover) {
+    const id = cover.id ? ` id="${cover.id}"` : '';
+    const cls = typeof cover.className === 'string' && cover.className ? ` class="${cover.className}"` : '';
+    return { cover: `<${cover.localName}${id}${cls}>` };
+  }
+  return which >= 0 ? { label: which } : null;
+}
+"""
+
+# "visible" is false for an element nobody can hit: display:none,
+# visibility:hidden, or the 1x1 clipped box of a visually-hidden ("sr-only")
+# one. A hidden form control is clicked through its <label>: "label" is the
+# index in e.labels of the first VISIBLE label (else 0, whose click then fails
+# before sending: Playwright waits for it to become visible until the click
+# timeout, and the fallback chain runs), or -1 when the control has none or is
+# disabled (a disabled control is not activated by its label, so the control
+# is clicked and Playwright waits for it to be enabled).
+_LABEL_JS = """
+(e) => {
+  const seen = (n) => {
+    const r = n.getBoundingClientRect();
+    return r.width > 1 && r.height > 1 && getComputedStyle(n).visibility !== 'hidden';
+  };
+  const ls = [...(e.labels || [])];
+  const label = !ls.length || e.matches(':disabled') ? -1 : Math.max(ls.findIndex(seen), 0);
+  return { visible: seen(e), label };
+}
+"""
+
+# Playwright's call log record for a pointer action that was actually sent:
+# `progress.log(`  performing ${actionName} action`)` in _performPointerAction
+# (installed playwright 1.58, driver/package/lib/server/dom.js). Anything that
+# fails before it (not attached, not visible, not stable, covered at the
+# pre-check) sent nothing; anything after it may have been delivered.
+_CLICK_SENT_MARK = "performing click action"
+
+
+def _click_was_sent(err: BaseException, selector: str = "") -> bool:
+    """Whether the click may have been delivered: the last attempt that sent
+    events was not then intercepted. An interception logged AFTER the sent
+    record means Playwright's hit-target interceptor swallowed that attempt's
+    events (``setupHitTargetInterceptor`` cancels them), so nothing landed.
+
+    Only a whole record of a click's own call log counts (_call_log): the same
+    words inside a selector or an element preview are page or caller text,
+    not a send.
+
+    A click's own error whose log this code cannot classify counts as sent:
+    no call log at all (the driver connection closed mid-click), or none of
+    the records every Playwright click log carries before it sends (its
+    selector wait, its attempt, a cover), as a reworded format would read.
+    Reading that as "not sent" would let a fallback fire the click twice.
+    """
+    records = _call_log(err, selector)
+    if getattr(err, _CLICK_ERROR_ATTR, False) and not any(map(_is_pre_send, records)):
+        return True
+    sent = _last_record(records, lambda r: r == _CLICK_SENT_MARK)
+    return sent > _last_record(records, _is_intercept)
+
+
+# Whether an element is ENTIRELY uncovered now: a 3x3 grid over each of its
+# rendered boxes all hit-tests as the element, one of its own <label>s, or
+# inside them. Asked only after Playwright logged an interception, to tell a
+# cover that has since cleared from one still there. A form control is clicked
+# through its label when hidden or decorated (_humanized_click), so its labels
+# count as itself, and a control _LABEL_JS calls hidden (no box, a 1x1 sr-only
+# box, visibility:hidden: the same `seen` test) is judged on its visible labels'
+# boxes, never on a clipped pixel. Strict on purpose: a partly covered,
+# unrendered or oddly shaped (rotated) target reads as covered and keeps the
+# block.
+_UNCOVERED_JS = """
+(e) => {
+  const up = (n) => n.parentNode || n.host;
+  const own = [e, ...(e.labels || [])];
+  const within = (n) => {
+    for (; n; n = up(n)) if (own.includes(n)) return true;
+    return false;
+  };
+  const hit = (x, y) => {
+    let n = e.ownerDocument.elementFromPoint(x, y);
+    while (n && n.shadowRoot) {
+      const m = n.shadowRoot.elementFromPoint(x, y);
+      if (!m || m === n) break;
+      n = m;
+    }
+    return n;
+  };
+  const boxes = (n) => getComputedStyle(n).visibility === 'hidden'
+    ? [] : [...n.getClientRects()].filter((r) => r.width > 1 && r.height > 1);
+  let rects = boxes(e);
+  if (!rects.length) rects = own.slice(1).flatMap(boxes);
+  if (!rects.length) return false;
+  for (const r of rects)
+    for (const fx of [0.25, 0.5, 0.75])
+      for (const fy of [0.25, 0.5, 0.75])
+        if (!within(hit(r.left + r.width * fx, r.top + r.height * fy))) return false;
+  return true;
+}
+"""
+
+
+async def _humanized_click(page, target, timeout: int, is_label: bool = False) -> None:
+    """Scroll ``target`` (a Locator) into view, move the mouse to a point on it
+    with Camoufox's humanized trail, dwell, then click that point.
+
+    ``is_label`` says ``target`` is a control's own <label> (an ElementHandle).
+    When every sampled hit on a control landed inside one of its own labels (a
+    styled checkbox whose <input> sits under its own <span class=mark>), THAT
+    label, the one hit-tested, is clicked instead: that is where a person
+    clicks, and the decoration is part of the control, not an overlay. A cover
+    outside the label is an overlay:
+    the control itself is clicked, and Playwright names the cover. The label
+    is only ever clicked at a point that activates the control (see
+    _PICK_POINT_JS). With none: an overlay on the label fails as ClickBlocked;
+    a label that is all link sends nothing and the fallback chain runs. The
+    label is a handle, not a Locator: re-rendered on hover, it fails as
+    detached before anything is sent.
+
+    The click is NOT ``no_wait_after``: Playwright reads the hit-target
+    interceptor's verdict only when it waits after the action (`if
+    (options.waitAfter !== false)` around `stopHitTargetInterception`, 1.62
+    bundle), so with no_wait_after a click swallowed by an overlay that appears
+    during the move returned success with nothing clicked.
+    """
+    await target.scroll_into_view_if_needed(timeout=timeout)
+    # An ElementHandle's evaluate takes no timeout; a Locator's does.
+    pos = await (
+        target.evaluate(_PICK_POINT_JS)
+        if is_label
+        else target.evaluate(_PICK_POINT_JS, timeout=timeout)
+    )
+    if not is_label and isinstance(pos, dict) and "label" in pos:
+        handle = await target.evaluate_handle(
+            "(e, i) => e.labels[i]", pos["label"], timeout=timeout
+        )
+        label = handle.as_element()
+        if label is not None:
+            await _humanized_click(page, label, timeout, is_label=True)
+            return
+        pos = None
+    if isinstance(pos, dict) and "cover" in pos:
+        # An overlay covers the label. Phrased as Playwright's call log so
+        # _stealth_click raises ClickBlocked with no fallback: the fallbacks
+        # would reach the hidden control behind the overlay by script. The
+        # cover's id and class are page text: one line, like Playwright's own
+        # previews, so they cannot forge a record of their own.
+        cover = str(pos["cover"]).replace("\n", "↵")
+        err = Exception(f"Label covered{_CALL_LOG_HEADER}  - {cover} {_INTERCEPT_MARK}\n")
+        setattr(err, _CLICK_ERROR_ATTR, True)
+        raise err
+    if not isinstance(pos, dict):
+        if is_label:
+            raise Exception("no point on the label would activate its control")
+        pos = None
+    # An ElementHandle's bounding_box takes no timeout; a Locator's does.
+    box = await (target.bounding_box() if is_label else target.bounding_box(timeout=timeout))
+    if box is None:
+        raise Exception("element has no layout box")
+    if pos is not None:
+        x = box["x"] + pos["bl"] + pos["x"]
+        y = box["y"] + pos["bt"] + pos["y"]
+    else:
+        x = box["x"] + box["width"] / 2
+        y = box["y"] + box["height"] / 2
+    # The cursor trail comes from page.mouse.move: Camoufox's humanize expands
+    # each step into a curve. NOT hover(): MEASURED 2026-10-05 on Camoufox 156 /
+    # Playwright 1.62 with the cursor parked away from the target, el.hover
+    # delivered 0 mousemove events to the page (3 of 3),
+    # page.mouse.move(steps=10) 144-180, el.click alone 35-49.
+    await page.mouse.move(x, y, steps=random.randint(5, 15))
+    _mouse_pos["x"] = x
+    _mouse_pos["y"] = y
+    await asyncio.sleep(random.uniform(0.05, 0.2))
+    kwargs = {"delay": random.uniform(40, 120), "timeout": timeout}
+    if pos is not None:
+        kwargs["position"] = {"x": pos["x"], "y": pos["y"]}
+    # No position: Playwright picks its own point from the element's quads,
+    # which handles every shape the sampler above could not.
+    await _click_call(target.click(**kwargs))
+
+
 async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
-    """Human-like click: hover first, jitter position, realistic event chain.
+    """Human-like click through a Playwright Locator.
 
-    When Camoufox is active, generates a mousemove trail to the element
-    before clicking with a slight offset from center.  This produces
-    mousemove → mouseenter → mousedown → mouseup → click event chains
-    that match real human behavior.
+    Camoufox: scroll the target into view, pick a point that hit-tests as the
+    target (see _PICK_POINT_JS), move the mouse there (Camoufox's ``humanize``
+    draws the trail), dwell 50-200 ms, then ``click`` at that point, which
+    waits for the target to be stable and hit-tests it again. A Locator is
+    re-resolved on every call, so a node the page re-renders on mousemove is
+    found again rather than failing as detached. A form control that cannot be
+    clicked itself (a styled checkbox/radio) is clicked through its <label>.
 
-    Falls back to plain page.click() when not in stealth mode.
+    The earlier path measured the box without scrolling and pressed the mouse
+    at those coordinates: a target below the fold got no click, a covered
+    target clicked the overlay, and the tool reported success either way.
+
+    A target Playwright found covered, and that is still not entirely
+    uncovered, raises :class:`ClickBlocked` on every layer, with no fallback
+    (see _blocked_click). A click Playwright reports as sent and not swallowed,
+    or whose failure cannot be classified (_click_was_sent), is not repeated by
+    a fallback. A failure before that keeps the fallback chain (plain click,
+    keyboard, shadow-DOM script click).
+
+    Other layers use plain ``page.click()``.
     """
     # --- Ambiguous text= selector guard ---
     # Bare text= selectors silently match the first element even when
@@ -1373,39 +1772,48 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
             logger.warning("Ambiguity check failed for '%s': %s", selector, amb_err)
 
     if not _is_camoufox_active():
-        await page.click(selector, timeout=timeout)
+        try:
+            await _click_call(page.click(selector, timeout=timeout))
+        except Exception as err:
+            blocked = await _blocked_click(err, selector, page)
+            if blocked is not None:
+                raise blocked from err
+            raise
         return
 
+    loc = page.locator(selector).first
     try:
-        el = await page.wait_for_selector(selector, timeout=timeout)
-        if el is None:
-            raise Exception(f"Element not found: {selector}")
-        box = await el.bounding_box()
-        if box is None:
-            await page.click(selector, timeout=timeout)
-            return
-
-        # Jitter: click within central 60% of element, not dead center
-        jitter_x = random.uniform(box["width"] * 0.2, box["width"] * 0.8)
-        jitter_y = random.uniform(box["height"] * 0.2, box["height"] * 0.8)
-        target_x = box["x"] + jitter_x
-        target_y = box["y"] + jitter_y
-
-        # Hover first — generates mousemove trail to the element
-        await page.mouse.move(target_x, target_y, steps=random.randint(5, 15))
-        _mouse_pos["x"] = target_x
-        _mouse_pos["y"] = target_y
-        await asyncio.sleep(random.uniform(0.05, 0.2))
-
-        # Click with realistic mousedown/mouseup gap
-        await page.mouse.down()
-        await asyncio.sleep(random.uniform(0.04, 0.12))
-        await page.mouse.up()
+        await loc.wait_for(state="attached", timeout=timeout)
+        info = await loc.evaluate(_LABEL_JS, timeout=timeout)
+        label = None
+        index = info.get("label", -1)
+        if not info.get("visible") and type(index) is int and index >= 0:
+            # A hidden <input> (display:none, sr-only): only a label can be
+            # clicked. The control's OWN label, from the DOM: a selector
+            # rebuilt from its id (label[for=id]) searches the whole page
+            # through open shadow roots and finds another component's label
+            # when ids repeat.
+            handle = await loc.evaluate_handle("(e, i) => e.labels[i]", index, timeout=timeout)
+            label = handle.as_element()
+        if label is not None:
+            await _humanized_click(page, label, timeout, is_label=True)
+        else:
+            await _humanized_click(page, loc, timeout)
     except Exception as stealth_err:
+        blocked = await _blocked_click(stealth_err, selector, page)
+        if blocked is not None:
+            raise blocked from stealth_err
+        if _click_was_sent(stealth_err, selector):
+            raise
         logger.warning("Stealth click failed for '%s': %s", selector, stealth_err)
         try:
-            await page.click(selector, timeout=timeout)
+            await _click_call(page.click(selector, timeout=timeout))
         except Exception as plain_err:
+            blocked = await _blocked_click(plain_err, selector, page)
+            if blocked is not None:
+                raise blocked from plain_err
+            if _click_was_sent(plain_err, selector):
+                raise
             logger.warning("Plain click also failed for '%s': %s", selector, plain_err)
             # --- Keyboard fallback (last resort) ---
             # Focus the element and press Space/Enter.  Works for radios,
@@ -1488,6 +1896,77 @@ async def _click_in_shadow_dom(page, selector: str) -> bool:
         return False
 
 
+# browser_fill has no overall deadline: a long value legitimately takes a long
+# time (the typing delays alone average about 0.24 s per character, so 2,000
+# characters is about eight minutes before any browser round trips), and a length-derived deadline cut real fills short and reset the
+# page. What it guards against instead is the failure the old deadline existed
+# for: a Playwright call into Camoufox that never returns (MEASURED: a
+# page.click(timeout=10000) hung 22 minutes; see _TOOL_TIMEOUT_S). So every
+# browser call in a fill gets its own stall bound.
+#
+# 30 s: the longest LEGITIMATE single step is Playwright's own 10 s actionability
+# wait inside fill("")/click(); one keystroke (key down, key up) returns in
+# milliseconds, and the hold and gap we add between them (at most 0.2 s and 1 s)
+# are sleeps outside the bound. 30 s is three times the longest legitimate step,
+# so a step still running then is hung, not slow.
+_FILL_STALL_S: float = 30.0
+
+# The MCP client has its own idle watchdog. Claude Code aborts a tool call that
+# sends no response or progress notification for CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT
+# (default 30 min for a stdio server, 5 min for a remote one), leaving a partly
+# filled field. MEASURED on CC 2.1.280 with a stdio probe server and the idle
+# timeout lowered to 20 s: a silent 45 s call was aborted, and the same call
+# reporting progress every 5 s completed. (A silent 150 s call under
+# MCP_TIMEOUT=120000 also completed: MCP_TIMEOUT does not bound a tool call.)
+# So the browser_fill tool reports
+# progress as steps complete, through this per-call reporter. It is unset for
+# direct callers of _impl_browser_fill, which have no client.
+_fill_progress: contextvars.ContextVar = contextvars.ContextVar(
+    "_fill_progress", default=None
+)
+# One notification per 5 s rather than one per step (about 8 a second: two
+# steps per character at about 0.24 s each), and still 60 times inside the
+# shortest default idle timeout (300 s).
+_FILL_PROGRESS_EVERY_S: float = 5.0
+# Each report awaits the client transport (fastmcp's report_progress awaits
+# session.send_progress_notification), so it gets its own bound: outside the
+# step's _FILL_STALL_S, a send that never returns would stall typing with it.
+# A healthy stdio send is a hand-off to the writer task and returns in
+# milliseconds, so 1 s is far beyond a slow-but-live send. Kept well under the
+# 5 s throttle: with a wedged transport every report times out, and the fill
+# then pauses at most 1 s per 5 s of typing, about as long as the thinking
+# pauses _human_type already inserts. A dropped report costs nothing while
+# any report in the client's idle window gets through, and the shortest
+# (300 s) holds 60 of them.
+_FILL_PROGRESS_SEND_S: float = 1.0
+
+
+class FillStalled(Exception):
+    """A browser call inside browser_fill made no progress for _FILL_STALL_S."""
+
+
+async def _no_stall(awaitable, what: str, *, report_progress: bool = True):
+    """Await one browser call of a fill, failing if it stalls.
+
+    A completed step is activity for BOTH idle watchdogs that could reclaim a
+    fill with no overall deadline: this server's (_IDLE_TIMEOUT_S, via _touch)
+    and the MCP client's (via the _fill_progress reporter). A key-down step
+    passes report_progress=False: a report can wait up to
+    _FILL_PROGRESS_SEND_S, which would stretch the key's hold.
+    """
+    try:
+        result = await asyncio.wait_for(awaitable, timeout=_FILL_STALL_S)
+    except TimeoutError:
+        raise FillStalled(
+            f"{what} made no progress for {_FILL_STALL_S:.0f}s"
+        ) from None
+    _touch()
+    report = _fill_progress.get() if report_progress else None
+    if report is not None:
+        await report(what)
+    return result
+
+
 async def _human_type(page, selector: str, value: str) -> None:
     """Type text character-by-character with human-like timing.
 
@@ -1502,23 +1981,27 @@ async def _human_type(page, selector: str, value: str) -> None:
     Chromium fallback (dev/test): atomic page.fill() (no delay overhead).
     """
     if not _is_camoufox_active() and not _is_remote_active():
-        await page.fill(selector, value, timeout=10000)
+        await _no_stall(page.fill(selector, value, timeout=10000), "fill")
         return
 
     # Clear field reliably (works on React controlled inputs)
-    await page.fill(selector, "", timeout=10000)
+    await _no_stall(page.fill(selector, "", timeout=10000), "clearing the field")
     # Click to focus the field
-    await page.click(selector, timeout=10000)
+    await _no_stall(page.click(selector, timeout=10000), "focusing the field")
     # Type per-keystroke with hold time + flight time (IKI) jitter.
     # Hold time: log-normal, median ~86ms (CMU Keystroke Dynamics calibration).
     # Flight time: 50-200ms uniform with 5% thinking pauses.
-    for char in value:
+    for i, char in enumerate(value):
         # Hold phase: keydown → hold → keyup
         hold_s = random.lognormvariate(math.log(0.086), 0.35)
         hold_s = max(0.03, min(hold_s, 0.20))  # clamp 30-200ms
-        await page.keyboard.down(char)
+        await _no_stall(
+            page.keyboard.down(char),
+            f"keystroke {i + 1} of {len(value)}",
+            report_progress=False,
+        )
         await asyncio.sleep(hold_s)
-        await page.keyboard.up(char)
+        await _no_stall(page.keyboard.up(char), f"keystroke {i + 1} of {len(value)}")
         # Flight phase: gap to next key
         iki = random.uniform(0.05, 0.20)  # 50-200ms
         # 5% chance of a "thinking pause" (300-1000ms)
@@ -2385,13 +2868,15 @@ async def _impl_browser_navigate(
         snapshot = await _snapshot_page(page)
 
         def _layer_name():
+            from genesis.browser.types import BrowserLayer
+
             if tinyfish:
-                return "tinyfish_cdp"
+                return BrowserLayer.TINYFISH.value
             if _is_remote_active():
-                return "remote_cdp"
+                return BrowserLayer.REMOTE_CDP.value
             if _is_camoufox_active():
-                return "camoufox"
-            return "chromium"
+                return BrowserLayer.CAMOUFOX.value
+            return BrowserLayer.CHROMIUM.value
 
         result = {
             "url": page.url,
@@ -2442,10 +2927,11 @@ async def _impl_browser_click(selector: str) -> dict:
     try:
         await _human_delay()
         await _stealth_click(page, selector)
-        # A click may trigger navigation (form submit, link). The stealth mouse
-        # path — unlike page.click() — has no navigation auto-wait, so settle
-        # briefly to let a nav commit, then best-effort wait for the new
-        # document. Fully swallowed: never break a click that already worked.
+        # A click may trigger navigation (form submit, link). Playwright's click
+        # waits only for navigations it sees start, and the keyboard and
+        # shadow-DOM fallbacks wait for none, so settle briefly to let a nav
+        # commit, then best-effort wait for the new document. Fully swallowed:
+        # never break a click that already worked.
         await asyncio.sleep(0.3)
         with contextlib.suppress(Exception):
             await page.wait_for_load_state("domcontentloaded", timeout=3000)
@@ -2453,11 +2939,21 @@ async def _impl_browser_click(selector: str) -> dict:
         snapshot = await _snapshot_page(page)
         return {"clicked": selector, "url": page.url, "snapshot": snapshot}
     except Exception as e:
+        # A ClickBlocked carries page markup, never Playwright's call log.
+        if not isinstance(e, ClickBlocked) and _click_was_sent(e, selector):
+            return {
+                "error": (
+                    f"Click on '{selector}' failed after it was or may have been sent, "
+                    "so it may already have taken effect: call browser_snapshot and "
+                    f"check before clicking again. Detail: {e}"
+                )
+            }
         return {"error": f"Click failed on '{selector}': {e}"}
 
 
 async def _impl_browser_fill(selector: str, value: str) -> dict:
     """Fill a form field on the current page."""
+    global _active_page
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -2478,6 +2974,28 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
         await _human_type(page, selector, value)
         _update_remote_url()  # Fill + Enter may cause navigation
         return {"filled": selector, "url": page.url}
+    except FillStalled as e:
+        # Same recovery as a tool timeout: the browser is hung, so the page is
+        # in an unknown state and the next step must be a fresh navigate. The
+        # lock was released before typing, so a browser_navigate may have
+        # replaced the active page meanwhile: reset only the page that stalled.
+        # A navigate on the same layer reuses the page object, so it is reset
+        # with it; that object is the one that hung.
+        logger.warning("browser_fill stalled on '%s': %s", selector, e)
+        if _active_page is not page:
+            return {
+                "error": (
+                    f"Fill stalled on '{selector}': {e}. The page it was filling "
+                    "is no longer the active page, so the active page is unchanged."
+                )
+            }
+        _active_page = None
+        return {
+            "error": (
+                f"Fill stalled on '{selector}': {e}. "
+                "Browser state was reset — call browser_navigate to resume."
+            )
+        }
     except Exception as e:
         return {"error": f"Fill failed on '{selector}': {e}"}
 
@@ -2706,13 +3224,17 @@ async def browser_navigate(
     cdp_url: Override the CDP endpoint. Default: GENESIS_CDP_URL env var.
     Example: browser_navigate("https://jobs.ashbyhq.com/...", remote=True)
 
-    NOTE: If Cloudflare Turnstile is detected (Camoufox only), this call may
-    block for up to ~5 minutes while waiting for human resolution via VNC.
+    NOTE: On a Cloudflare challenge (Camoufox and Chromium) this call works on
+    it before returning (steps: stealth-browser skill); it does not wait for a
+    person. If unresolved, it sends a Telegram alert (when configured) and
+    returns turnstile.status == "blocked". If the challenge handling itself
+    errors, the result has no turnstile field though a challenge may remain,
+    so check the page title. This can take most of the 300 s timeout.
     """
     # Remote CDP: 60s for the connect (at most 30s), the tab lookup and the
     # goto (at most 30s). A timeout cancels the call; its shielded cleanup
     # finishes on its own.
-    # Camoufox: Turnstile VNC resolution can take up to 5 minutes.
+    # Camoufox / Chromium: challenge handling can take most of 300 s.
     timeout = _TOOL_TIMEOUT_S if remote else 300.0
     return await _with_tool_timeout(
         _impl_browser_navigate(url, stealth, remote=remote, cdp_url=cdp_url, tinyfish=tinyfish),
@@ -2732,35 +3254,87 @@ async def browser_click(selector: str) -> dict:
     If a text= selector matches multiple elements, the click fails with
     an ambiguity error listing the matches.
 
-    Keyboard fallback: if mouse click fails on a form control, the tool
-    automatically attempts keyboard activation (focus + Space/Enter).
+    The target is scrolled into view and hit-tested before the click. If
+    another element covers it (cookie banner, modal, sticky header), the
+    click fails with "Click blocked: an element covers '<selector>'", naming
+    the covering element's markup: dismiss that element and click again.
+
+    On the default Camoufox browser, a styled checkbox or radio whose <input>
+    is hidden or covered by its own decoration is clicked through its <label>.
+
+    Keyboard fallback (Camoufox only): if the click fails for another reason
+    before any click was sent, the tool tries keyboard activation (focus + Space/Enter). A
+    click Playwright may have sent is not repeated by a fallback; the keyboard
+    and script fallbacks are not hit-tested, so verify what they did.
     For manual keyboard navigation, use browser_press_key with Tab/Space.
 
-    Returns the updated page snapshot after clicking.
+    Returns the updated page snapshot after clicking. "clicked" means the
+    click was sent; confirm the page changed. An error that says the click
+    may already have taken effect is not a failed click: call browser_snapshot
+    and check before clicking again. A timeout also resets the page: do not
+    click again until the effect is confirmed where it persists.
     """
     return await _with_tool_timeout(
         _impl_browser_click(selector),
         _TOOL_TIMEOUT_S,
         f"browser_click('{selector}')",
+        # The hang this timeout exists for can come after the click events
+        # were sent (Playwright's post-action wait), and the cancellation
+        # discards the call log that would say so. The reset below drops the
+        # page, so a snapshot cannot check it, and a navigate loads a fresh
+        # copy that shows only what the click saved server-side.
+        note=(
+            "The click may already have been delivered, and its page can no longer "
+            "be read. Do not click again until its effect is confirmed where it "
+            "persists (for a submit: the confirmation, order or account page it "
+            "leads to) or by the user: a reloaded form is empty whether or not "
+            "the submit went through. "
+        ),
     )
 
 
 @mcp.tool()
-async def browser_fill(selector: str, value: str) -> dict:
+async def browser_fill(selector: str, value: str, ctx: Context | None = None) -> dict:
     """Fill a form field on the current page.
 
     Examples: browser_fill('#email', 'user@example.com')
 
     Per-keystroke typing is active for Camoufox and CDP remote — long
-    strings take proportionally longer. The tool timeout scales with
-    string length.
+    strings take proportionally longer (about 0.24 s per character after a
+    pre-delay of up to 15 s). There is no overall deadline: besides ordinary
+    browser errors (selector not found, element detached), the call stops
+    early only if one browser step (clearing, focusing, or a single
+    keystroke) makes no progress for 30 s, and then the page is reset if it
+    is still the active page. Progress is reported as the fill advances, so
+    the MCP client's idle timeout does not cancel a long fill.
     """
-    timeout = min(max(60.0, len(value) * 0.25), 300.0)
-    return await _with_tool_timeout(
-        _impl_browser_fill(selector, value),
-        timeout,
-        f"browser_fill('{selector}')",
-    )
+    steps = 0
+    last_sent = time.monotonic()
+    report_failed = False
+
+    async def report(what: str) -> None:
+        nonlocal steps, last_sent, report_failed
+        steps += 1
+        if ctx is None or time.monotonic() - last_sent < _FILL_PROGRESS_EVERY_S:
+            return
+        last_sent = time.monotonic()
+        try:
+            await asyncio.wait_for(
+                ctx.report_progress(steps, message=what),
+                timeout=_FILL_PROGRESS_SEND_S,
+            )
+        except Exception:  # best effort: a lost report must not fail typing
+            # TimeoutError included: wait_for has cancelled the send, and the
+            # next report retries in 5 s.
+            if not report_failed:  # once per fill, not every 5 s after
+                logger.warning("browser_fill progress report failed", exc_info=True)
+            report_failed = True
+
+    token = _fill_progress.set(report)
+    try:
+        return await _impl_browser_fill(selector, value)
+    finally:
+        _fill_progress.reset(token)
 
 
 @mcp.tool()

@@ -6920,11 +6920,153 @@ async def test_run_paths_compute_pins_in_a_worker_thread(invoker, monkeypatch):
 
     import genesis.cc.invoker as inv_mod
 
-    for name in ("_run_inner", "_run_streaming_inner"):
+    for name in ("_run_inner_with_admission", "_run_streaming_inner_with_admission"):
         src = inspect.getsource(getattr(inv_mod.CCInvoker, name))
         assert "asyncio.to_thread(_settings_env_pins" in src, name
         assert "settings_pins=pins" in src, name
         assert "verify_allowlist_enforceable(invocation, settings_pins=pins)" in src, name
+
+
+def _track_checkout_admission(monkeypatch, invoker, *, streaming, spawn_error=None):
+    import genesis.cc.invoker as inv_mod
+
+    events = []
+
+    class Admission:
+        released = False
+
+        def release(self):
+            if not self.released:
+                events.append("release")
+                self.released = True
+
+    async def admit():
+        events.append("admit")
+        return Admission()
+
+    def pins(*_args):
+        events.append("pins")
+        return {}
+
+    async def probe(*_args, **_kwargs):
+        events.append("probe")
+
+    async def fallback(env, _invocation):
+        return env
+
+    monkeypatch.setattr(inv_mod, "admit_launch", admit)
+    monkeypatch.setattr(inv_mod, "_settings_env_pins", pins)
+    monkeypatch.setattr(inv_mod, "_get_scope_args", AsyncMock(return_value=[]))
+    monkeypatch.setattr(inv_mod, "set_oom_score_adj", lambda *_args: None)
+    monkeypatch.setattr(invoker, "verify_allowlist_enforceable", probe)
+    monkeypatch.setattr(invoker, "_build_env", lambda _invocation: {})
+    monkeypatch.setattr(invoker, "_apply_login_fallback", fallback)
+    monkeypatch.setattr(invoker, "_launch_env", lambda env, _invocation: env)
+    monkeypatch.setattr(invoker, "_register_proc", lambda *_args: None)
+    monkeypatch.setattr(invoker, "_unregister_proc", lambda *_args: None)
+
+    result = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "ok",
+        "session_id": "s",
+    }
+    proc = SimpleNamespace(
+        pid=41,
+        returncode=0,
+        communicate=AsyncMock(return_value=(json.dumps(result).encode(), b"")),
+    )
+    if streaming:
+        proc.stdout = _make_async_stdout(_make_stream_lines(result))
+        proc.stdin = _make_mock_stdin()
+        proc.stderr = _make_mock_stderr()
+        proc.wait = AsyncMock()
+        proc.terminate = MagicMock()
+
+    async def create(*_args, **_kwargs):
+        events.append("spawn")
+        if spawn_error:
+            raise spawn_error
+        return proc
+
+    monkeypatch.setattr(inv_mod.asyncio, "create_subprocess_exec", create)
+    return events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("streaming", "spawn_error"), [(False, False), (False, True), (True, False), (True, True)])
+async def test_checkout_admission_order_and_release(invoker, monkeypatch, streaming, spawn_error):
+    events = _track_checkout_admission(
+        monkeypatch,
+        invoker,
+        streaming=streaming,
+        spawn_error=FileNotFoundError("claude") if spawn_error else None,
+    )
+    method = invoker._run_streaming_inner if streaming else invoker._run_inner
+    if spawn_error:
+        with pytest.raises(CCProcessError):
+            await method(CCInvocation(prompt="hello"))
+    else:
+        await method(CCInvocation(prompt="hello"))
+    assert events.index("admit") < events.index("pins") < events.index("probe")
+    assert events.index("probe") < events.index("spawn")
+    assert events.index("spawn") + 1 == events.index("release")
+    if spawn_error:
+        assert events[-1] == "release"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_a_launch_waiting_for_checkout_admission_is_listed_in_flight(
+    invoker, monkeypatch, streaming
+):
+    """A launch is registered in flight BEFORE it waits for checkout admission, so
+    while a deploy holds the lock the waiting launch is visible to the deploy's
+    session scan, which then refuses the restart instead of ending it unlisted."""
+    import genesis.cc.invoker as inv_mod
+    from genesis.util import inflight
+
+    _track_checkout_admission(monkeypatch, invoker, streaming=streaming)
+    seen = []
+    real_admit = inv_mod.admit_launch
+
+    async def admit():
+        seen.append([item.kind for item in inflight.snapshot()])
+        return await real_admit()
+
+    monkeypatch.setattr(inv_mod, "admit_launch", admit)
+    if streaming:
+        await invoker.run_streaming(CCInvocation(prompt="hello"))
+    else:
+        await invoker.run(CCInvocation(prompt="hello"))
+    assert seen and "claude" in seen[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_the_roster_read_happens_under_checkout_admission(invoker, monkeypatch, streaming):
+    """The roster read and the network preflight read checkout files, so a
+    checkout mutation must not start between them and the spawn: admission is
+    taken before the roster read and released once, after the spawn."""
+    import genesis.cc.invoker as inv_mod
+
+    events = _track_checkout_admission(monkeypatch, invoker, streaming=streaming)
+    real_apply = inv_mod.roster.apply_active
+
+    def apply_active(inv):
+        events.append("roster")
+        return real_apply(inv)
+
+    monkeypatch.setattr(inv_mod.roster, "apply_active", apply_active)
+    if streaming:
+        await invoker.run_streaming(CCInvocation(prompt="hello"))
+    else:
+        await invoker.run(CCInvocation(prompt="hello"))
+    assert events.index("admit") < events.index("roster") < events.index("probe")
+    assert events.count("admit") == 1
+    assert events.count("release") == 1
+    assert events.index("spawn") + 1 == events.index("release")
 
 
 def test_verify_checks_the_settings_file_built_from_the_launch_pins(invoker, monkeypatch):
