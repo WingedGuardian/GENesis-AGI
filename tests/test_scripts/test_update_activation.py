@@ -367,7 +367,7 @@ def test_a_merge_that_did_not_bring_the_pin_in_is_rolled_back(upstream_and_clone
 def test_the_merge_assertion_sits_between_the_merge_and_the_new_head_record():
     text = UPDATE.read_text()
     merge = text.index('merge --no-overwrite-ignore "$DEPLOY_HEAD" --no-edit')
-    check = text.index('merge-base --is-ancestor "$DEPLOY_HEAD" HEAD')
+    check = text.index('merge-base --is-ancestor "$DEPLOY_HEAD" HEAD', merge)
     new_tag = text.index("NEW_TAG=$(git -C")
     assert merge < check < new_tag
 
