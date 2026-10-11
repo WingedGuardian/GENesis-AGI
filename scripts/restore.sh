@@ -143,6 +143,8 @@ MEMORY_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}/memory"
 TRANSCRIPT_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}"
 # shellcheck source=scripts/lib/backup_core_paths.sh
 source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
+# shellcheck source=scripts/lib/payment_vault_backup.sh
+source "$_SCRIPT_DIR/lib/payment_vault_backup.sh"
 SECRETS_FILE="${SECRETS_PATH:-$GENESIS_DIR/secrets.env}"
 QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 LOG_PREFIX="[genesis-restore]"
@@ -516,9 +518,13 @@ _pull_from_offsite() {
     done <<< "$_xt_names"
     # creds — Tier-1 git normally carries these; a no-git box needs them from the
     # snapshot too (restore §8 reads $BACKUP_DIR/creds). backend_list is
-    # single-level, so iterate creds/ and creds/ssh/ separately; the .gpg filter
-    # drops the `ssh` subdir entry so it is not mis-fetched as a flat file.
-    for _sub in creds creds/ssh; do
+    # single-level, so iterate creds/ and each subdirectory separately; the .gpg
+    # filter drops the subdirectory entries so they are not mis-fetched as files.
+    for _sub in creds creds/ssh creds/payment_vault; do
+        if [ -L "$BACKUP_DIR/$_sub" ]; then
+            warn "off-site: $_sub in the backup checkout is a symlink; not pulling into it"
+            continue
+        fi
         while read -r fname; do
             mkdir -p "$BACKUP_DIR/$_sub"
             if backend_get "$snap/$_sub/$fname" "$BACKUP_DIR/$_sub/$fname"; then
@@ -1581,6 +1587,18 @@ if [ -d "$CREDS_SRC_DIR" ]; then
     if ! $DRY_RUN; then
         mkdir -p "$CREDS_STAGE" && chmod 0700 "$CREDS_STAGE"
     fi
+    # The card vault is usable only as a set from ONE backup, and a failed decrypt
+    # below leaves an earlier staged file in place; so clear the three staged
+    # names first whenever this source carries a vault set.
+    _PV_SRC=false
+    if [ -d "$CREDS_SRC_DIR/payment_vault" ] && _creds_has_payload "$CREDS_SRC_DIR/payment_vault"; then
+        _PV_SRC=true
+        if ! $DRY_RUN; then
+            for _f in "${PAYMENT_VAULT_FILES[@]}"; do
+                rm -f -- "$CREDS_STAGE/payment_vault/$_f"
+            done
+        fi
+    fi
     _prev_umask="$(umask)"; umask 077
     while IFS= read -r -d '' _gpg; do
         _rel="${_gpg#"$CREDS_SRC_DIR"/}"       # e.g. ssh/id_ed25519.gpg
@@ -1601,6 +1619,25 @@ if [ -d "$CREDS_SRC_DIR" ]; then
     if ! $DRY_RUN; then
         log "Creds: $_CREDS_STAGED file(s) decrypted → $CREDS_STAGE (staged, NOT auto-placed)"
         log "      Move into place manually (ssh/ → ~/.ssh/, gh_hosts.yml → ~/.config/gh/hosts.yml, etc.)."
+    fi
+    if $_PV_SRC && ! $DRY_RUN; then
+        _PV_STAGE="$CREDS_STAGE/payment_vault"
+        _PV_LIVE="${GENESIS_HOME:-$HOME/.genesis}/payment_vault"
+        if _pv_why="$(payment_vault_check "$_PV_STAGE")"; then
+            log "Payment vault: staged at $_PV_STAGE (NOT placed). To use it, on a box with no vault:"
+            log "      1. confirm $_PV_LIVE does not exist (placing it over a live vault would bring"
+            log "         back retired cards or replace a newer key)"
+            log "      2. systemctl --user stop genesis-server"
+            log "      3. mv -T \"$_PV_STAGE\" \"$_PV_LIVE\""
+            log "      4. systemctl --user start genesis-server, then: python -m genesis vault unlock"
+            log "         (a successful unlock proves the passphrase and the key match)"
+            log "      Until it is placed (or retired: git rm -r creds/payment_vault in the backups"
+            log "      repo), every backup reports payment_vault: missing and fails."
+        else
+            warn "Payment vault: the staged set failed its check ($_pv_why); do not place it"
+        fi
+    elif ! $DRY_RUN && [ -e "$CREDS_STAGE/payment_vault/identity.age" ]; then
+        log "NOTE: $CREDS_STAGE/payment_vault holds a vault set from an EARLIER restore; this backup has none"
     fi
 else
     log "Creds: no backup payload at $CREDS_SRC_DIR"

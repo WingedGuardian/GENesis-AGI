@@ -3114,7 +3114,13 @@ verified: ba9dd8a37 2026-10-09
   the loop for the whole decrypt here). Every unlock, lock,
   refusal and relock lands in `payment_vault_events` with the requesting pid
   and process names; unlock fails closed without that audit row. Nothing
-  decrypts a card yet, and the vault directory is not backed up.
+  decrypts a card yet. Backup: `scripts/lib/payment_vault_backup.sh` from
+  backup.sh §8 writes the three files GPG-encrypted to `creds/payment_vault/`
+  (cards.db via SQLite online backup, under the vault's directory lock, only
+  when the whole set passes the check restore reruns); `payment_vault` in
+  `backup_status.json` is ok/absent/skipped (not attempted)/failed/missing, and failed or
+  missing fails the run (non_db). restore.sh stages a fresh, checked set in
+  `~/.genesis/restore-creds/payment_vault/` and never places it.
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
   item into the Genesis trash (`~/.genesis/trash`) with a tombstone, never
   copying, and refuses an item on another volume;

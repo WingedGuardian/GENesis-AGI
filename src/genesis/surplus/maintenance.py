@@ -153,6 +153,8 @@ class BackupVerificationExecutor:
                     lines.append(f"  Qdrant collections: {data['qdrant_collections']}")
                 if data.get("secrets_encrypted") is not None:
                     lines.append(f"  Secrets encrypted: {data['secrets_encrypted']}")
+                if data.get("payment_vault") is not None:
+                    lines.append(f"  Payment vault: {data['payment_vault']}")
 
                 if not success:
                     stale = True

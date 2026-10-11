@@ -123,6 +123,7 @@ class TestAdd:
         assert _run(["add", "--label", "bills", "--merchant", "shop.example.com"]) == 0
         out = capsys.readouterr()
         assert "ending 4242" in out.out and VISA not in out.out + out.err
+        assert "scripts/backup.sh" in out.out  # the next scheduled backup may be hours away
         assert getpass.call_count == 3  # number, expiry and code are all hidden
         [card] = vs.list_cards()
         assert card["label"] == "bills" and card["merchant"] == "shop.example.com"
