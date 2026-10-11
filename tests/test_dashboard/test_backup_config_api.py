@@ -1114,7 +1114,9 @@ def test_status_non_string_failure_reason_does_not_500(client, tmp_path):
 # ── extra directories incomplete (#2854) ──
 
 
-@pytest.mark.parametrize("field", ["extra_dirs_skipped", "extra_upload_failed"])
+@pytest.mark.parametrize(
+    "field", ["extra_dirs_skipped", "extra_dirs_partial", "extra_upload_failed"]
+)
 def test_health_extra_dirs_incomplete_warns(field):
     lb = {**_healthy_lb(), field: 2}
     r = _health(lb, _sch(), None)
@@ -1122,13 +1124,23 @@ def test_health_extra_dirs_incomplete_warns(field):
 
 
 def test_health_extra_dirs_zero_is_healthy():
-    lb = {**_healthy_lb(), "extra_dirs_skipped": 0, "extra_upload_failed": 0}
+    lb = {
+        **_healthy_lb(),
+        "extra_dirs_skipped": 0,
+        "extra_dirs_partial": 0,
+        "extra_upload_failed": 0,
+    }
     assert _health(lb, _sch(), None)["state"] == "ok"
 
 
 @pytest.mark.parametrize("bad", ["3", "lots", None, True, -1, 1.5, [1]])
 def test_health_extra_dirs_malformed_counter_never_raises(bad):
-    lb = {**_healthy_lb(), "extra_dirs_skipped": bad, "extra_upload_failed": bad}
+    lb = {
+        **_healthy_lb(),
+        "extra_dirs_skipped": bad,
+        "extra_dirs_partial": bad,
+        "extra_upload_failed": bad,
+    }
     r = _health(lb, _sch(), None)
     assert r["code"] != "extra_dirs_incomplete"
 
@@ -1138,3 +1150,13 @@ def test_health_extra_dirs_do_not_mask_a_core_offsite_gap():
     dest = {"tier2": {"backend": "smb", "status": "partial", "confirmed": False}}
     r = _health(lb, _sch(), dest, resolved_backend="smb")
     assert r["code"] == "tier2_incomplete"
+
+
+def test_status_allowlist_passes_every_extras_counter():
+    # backup.sh writes all three counters into backup_status.json. The status
+    # route copies only allowlisted fields into what the health check reads, so
+    # a counter missing here can never raise the warning.
+    from genesis.dashboard.routes import backup as bk
+
+    for field in ("extra_dirs_skipped", "extra_dirs_partial", "extra_upload_failed"):
+        assert field in bk._STATUS_SAFE_FIELDS, field
