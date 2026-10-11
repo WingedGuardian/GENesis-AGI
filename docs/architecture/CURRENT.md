@@ -1478,8 +1478,7 @@ verified: 811a27f13669 2026-10-11
   and prove fresh shared admission and kernel caps inside the actual transient
   child: 256MiB/zero swap/Tasks32 under2GiB/zero swap/Tasks512 aggregate. They
   retain fixed analysis tools, permanent PID readiness and native stop propagation
-  without backend activation or a raw fallback. Queued-worker admission remains
-  a separate concern.
+  without backend activation or a raw fallback.
 
   The existing queue checks managed availability at claim and leg boundaries,
   then admits a pinned physical worker inside its actual8GiB/zero-swap scope
