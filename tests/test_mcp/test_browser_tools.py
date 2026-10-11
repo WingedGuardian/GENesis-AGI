@@ -248,6 +248,9 @@ def _typing_page(key_latency: float = 0.0, hang_at: int | None = None):
     page.keyboard.down = AsyncMock(side_effect=down)
     page.keyboard.up = AsyncMock()
     page.is_closed = MagicMock(return_value=False)
+    # Event registration is synchronous on a real Page (_fill's _NavWatch).
+    page.on = MagicMock()
+    page.remove_listener = MagicMock()
     browser._active_page = page
     browser._remote_page = page
     browser._remote_browser = _mock_remote_browser(connected=True)
@@ -1903,6 +1906,16 @@ async def _hang(*_args, **_kwargs):
     await asyncio.sleep(3600)
 
 
+async def _until_awaited(mock, bound_s: float = 5.0):
+    """Wait until ``mock`` has been awaited (the call under test reached it),
+    instead of a fixed sleep: a slow loop (a GC pause) must not move a cancel
+    to an earlier step than the one the test means to cancel."""
+    deadline = asyncio.get_running_loop().time() + bound_s
+    while not mock.await_count:
+        assert asyncio.get_running_loop().time() < deadline, "the call never reached the mock"
+        await asyncio.sleep(0.001)
+
+
 def _mock_remote_browser(pages=None, connected=True):
     """Create a mock CDP browser with optional pages."""
     mock_browser = MagicMock()
@@ -2726,7 +2739,7 @@ class TestGenesisTabIdentity:
         mock_br.contexts[0].new_page = AsyncMock(return_value=tab)
 
         task = asyncio.create_task(browser._genesis_remote_tab(mock_br, _URL))
-        await asyncio.sleep(0.02)
+        await _until_awaited(tab.context.new_cdp_session)  # the id lookup hangs
         task.cancel()
         await asyncio.wait_for(closing.wait(), 1)
         task.cancel()
@@ -2827,7 +2840,7 @@ class TestStaleRemoteCleanupCannotTouchTheNextConnection:
         old_pw.chromium.connect_over_cdp = AsyncMock(return_value=old_br)
 
         task = asyncio.create_task(_connect(old_br, mock_pw=old_pw))
-        await asyncio.sleep(0.02)
+        await _until_awaited(old_tab.context.new_cdp_session)  # the id lookup hangs
         task.cancel()  # first cancel: the tab open aborts, shielded cleanup starts
         await asyncio.wait_for(closing.wait(), 1)
         task.cancel()  # second cancel: the caller gives up while cleanup runs
@@ -4455,6 +4468,7 @@ class TestClickFollowsANewTab:
         assert browser._is_camoufox_active()
         original.close.assert_not_awaited()
         assert original.listeners("popup") == []  # the watch ends with the click
+        assert original.listeners("framenavigated") == []  # so does the navigation watch
 
         snap = await browser._impl_browser_snapshot()
         assert snap["url"] == "https://site.example/detail"
@@ -4470,6 +4484,7 @@ class TestClickFollowsANewTab:
         assert "new_page" not in result
         assert browser._active_page is original
         assert original.listeners("popup") == []
+        assert original.listeners("framenavigated") == []
 
     @pytest.mark.asyncio
     async def test_chromium_click_switches_its_layer_page(self):
@@ -4823,6 +4838,7 @@ class TestFollowNewTabChainsAndWaits:
         assert "new_page" not in result
         assert browser._active_page is original
         assert original.listeners("popup") == []
+        assert original.listeners("framenavigated") == []
 
     @pytest.mark.asyncio
     async def test_a_declared_new_tab_gets_the_longer_wait(self):
@@ -5580,9 +5596,13 @@ class TestInputStallDiagnostics:
         type(page).context = property(lambda self: (_ for _ in ()).throw(RuntimeError("gone")))
         page.evaluate = MagicMock(side_effect=RuntimeError("sync"))
         page.locator = MagicMock(side_effect=RuntimeError("sync"))
-        diag = await browser._input_stall_diagnostics(page, "#x")
+        diag = await browser._input_stall_diagnostics(page, "#x", browser._NavWatch(page))
         assert diag["open_pages"] is None and diag["layer"] is None
         assert diag["document"] == {"probe_failed": "RuntimeError"}
+        page.on = MagicMock(side_effect=RuntimeError("closed"))  # no watch: nothing probed
+        diag = await browser._input_stall_diagnostics(page, "#x", browser._NavWatch(page))
+        assert diag["navigated"] == "not_tracked"
+        assert diag["document"] == {"probe_skipped": "navigation_not_tracked"}
 
     @pytest.mark.asyncio
     async def test_a_stalled_fill_focus_click_carries_no_input_value(self, caplog):
@@ -5604,6 +5624,8 @@ class TestInputStallDiagnostics:
         assert result["diagnostics"]["layer"] == "remote_cdp"
         assert result["diagnostics"]["last_dialog"] == "not_tracked"
         assert result["diagnostics"]["instance_age_s"] == "not_tracked"
+        assert result["diagnostics"]["navigated"] is False
+        assert result["diagnostics"]["document"] == _DOC_STATE  # the probes ran
         assert secret not in repr(result) and secret not in caplog.text
         page.keyboard.down.assert_not_awaited()
 
@@ -5625,12 +5647,12 @@ class TestInputStallDiagnostics:
             result = await browser._impl_browser_click("#card")
         diag = result["diagnostics"]
         assert secret not in repr(diag)
-        assert diag["target"]["el"] == ["input", "<invalid>"]
+        assert diag["target"]["el"] == ["input", "<unlisted>"]
         assert diag["target"]["box"] == [1, 2, 3, "<invalid>"]
-        assert diag["target"]["center_hit"] == {"at": [1, 2], "rel": "<invalid>", "el": ["div", None]}
+        assert diag["target"]["center_hit"] == {"at": [1, 2], "rel": "<unlisted>", "el": ["div", None]}
         assert diag["target"]["pointer_events"] == "<invalid>"
         assert diag["target"]["active"] == "<invalid>"
-        assert diag["document"]["visibility"] == "<invalid>"
+        assert diag["document"]["visibility"] == "<unlisted>"
         assert diag["document"]["has_focus"] == "<invalid>"
 
     def test_the_in_page_probes_read_no_text_or_value(self):
@@ -5652,3 +5674,153 @@ class TestInputStallDiagnostics:
             getattr(dialog, settle).assert_awaited_once()
             assert browser._last_dialog[page]["type"] == kind
             assert browser._last_dialog[page]["settled"] is True
+
+    @pytest.mark.asyncio
+    async def test_page_tokens_outside_the_field_allowlists_never_pass(self, caplog):
+        """A token that LOOKS like a tag or keyword is still page text: a
+        custom element name, a role attribute, a computed keyword the page
+        forged. Each field passes only values from its own allowlist."""
+        leak = "hunter2"
+        target = {
+            **_TARGET_STATE,
+            "el": [f"secret-{leak}", leak],
+            "center_hit": {"at": [1, 2], "rel": leak, "el": [leak, "button"]},
+            "pointer_events": leak,
+            "active": ["button", "button"],
+        }
+        doc = {**_DOC_STATE, "visibility": leak, "ready_state": leak}
+        page = _stall_page(target=target, doc=doc)
+        browser._last_dialog[page] = {"type": leak, "at": browser.time.monotonic(), "settled": True}
+        with _no_sleep(), patch.object(browser, "_human_delay", new=AsyncMock()), caplog.at_level("WARNING"):
+            result = await browser._impl_browser_click("#card")
+        diag = result["diagnostics"]
+        assert leak not in repr(diag) and leak not in caplog.text
+        assert diag["target"]["el"] == ["<custom>", "<unlisted>"]
+        assert diag["target"]["center_hit"] == {"at": [1, 2], "rel": "<unlisted>", "el": ["<unlisted>", "button"]}
+        assert diag["target"]["pointer_events"] == "<unlisted>"
+        assert diag["target"]["active"] == ["button", "button"]  # listed values still pass
+        assert diag["document"]["visibility"] == "<unlisted>"
+        assert diag["document"]["ready_state"] == "<unlisted>"
+        assert diag["last_dialog"]["type"] == "<unlisted>"
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_fit_inside_the_click_tool_deadline(self):
+        """A stall late in browser_click's hard timeout: the probes are cut to
+        what is left, so the original error is returned instead of the
+        generic timeout-and-reset result."""
+        async def hang(*a, **k):
+            await asyncio.Event().wait()
+
+        async def late_stall(*a, **k):
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.Event().wait(), 1.0)
+            raise _click_err(_STALL_LOG)
+
+        async def hang_target(js, *a, **k):
+            if js is browser._TARGET_STATE_JS:
+                await hang()
+            return False  # the new-tab classifier
+
+        page = _stall_page(doc=hang)
+        page.locator.return_value.first.evaluate = AsyncMock(side_effect=hang_target)
+        page.click.side_effect = late_stall
+        with (
+            _no_sleep(),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch.object(browser, "_STALL_PROBE_S", 0.6),
+            patch.object(browser, "_STALL_DEADLINE_MARGIN_S", 0.2),
+        ):
+            result = await browser._with_tool_timeout(browser._impl_browser_click("#card"), 2.0, "browser_click")
+        assert "timed out" not in result["error"], result["error"]
+        assert "may already have taken effect" in result["error"]
+        assert result["diagnostics"]["document"] == {"probe_failed": "TimeoutError"}
+        assert result["diagnostics"]["target"] == {"probe_skipped": "tool_deadline"}
+        assert browser._active_page is page  # no timeout reset
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("when", ["before_probes", "between_probes"])
+    async def test_a_navigation_after_the_click_is_reported_not_probed(self, when):
+        """browser_navigate does not take the page-action lock, so the page can
+        load a new document while a click fails: the snapshot would describe
+        that document, so the diagnostics say the page moved instead."""
+        handlers: dict = {}
+
+        def navigate():
+            for cb in handlers.get("framenavigated", []):
+                cb(page.main_frame)
+
+        async def stall(*a, **k):
+            if when == "before_probes":
+                navigate()
+            raise _click_err(_STALL_LOG)
+
+        def doc_then_navigate(*a, **k):
+            if when == "between_probes":
+                navigate()
+            return _DOC_STATE
+
+        page = _stall_page(doc=doc_then_navigate)
+        page.on = MagicMock(side_effect=lambda ev, cb: handlers.setdefault(ev, []).append(cb))
+        page.click.side_effect = stall
+        with _no_sleep(), patch.object(browser, "_human_delay", new=AsyncMock()):
+            result = await browser._impl_browser_click("#card")
+        diag = result["diagnostics"]
+        assert diag.get("navigated") is True
+        assert diag["document"] == {"probe_skipped": "page_navigated"}
+        assert diag["target"] == {"probe_skipped": "page_navigated"}
+        if when == "before_probes":
+            page.evaluate.assert_not_awaited()
+        # A frame other than the main one navigating is not the page moving.
+        handlers.clear()
+
+        async def child_frame_navigates(*a, **k):
+            for cb in handlers.get("framenavigated", []):
+                cb(MagicMock(name="child_frame"))
+            raise _click_err(_STALL_LOG)
+
+        page.click.side_effect = child_frame_navigates
+        page.evaluate = AsyncMock(return_value=_DOC_STATE)
+        page.on = MagicMock(side_effect=lambda ev, cb: handlers.setdefault(ev, []).append(cb))
+        with _no_sleep(), patch.object(browser, "_human_delay", new=AsyncMock()):
+            result = await browser._impl_browser_click("#card")
+        assert result["diagnostics"]["navigated"] is False
+        assert result["diagnostics"]["document"] == _DOC_STATE
+
+    @pytest.mark.asyncio
+    async def test_a_navigation_during_a_fill_is_reported_not_probed(self):
+        page, _ = _typing_page()
+        handlers: dict = {}
+        page.on = MagicMock(side_effect=lambda ev, cb: handlers.setdefault(ev, []).append(cb))
+
+        async def stall(*a, **k):
+            for cb in handlers.get("framenavigated", []):
+                cb(page.main_frame)
+            raise Exception(_STALL_LOG)  # raw: _human_type marks it
+
+        page.click = AsyncMock(side_effect=stall)
+        page.context.pages = [page]
+        with (
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            result = await browser._impl_browser_fill("#card", "x")
+        assert result["diagnostics"]["navigated"] is True
+        assert result["diagnostics"]["document"] == {"probe_skipped": "page_navigated"}
+        page.evaluate.assert_not_awaited()
+        page.remove_listener.assert_any_call("framenavigated", handlers["framenavigated"][0])
+
+    @pytest.mark.asyncio
+    async def test_the_navigation_watch_ends_with_a_failed_click(self):
+        original = _EventPage("https://site.example/form")
+        browser._stealth_cm = None
+        browser._page = original
+        browser._active_page = original
+        with (
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch.object(browser, "_declares_new_tab", new=AsyncMock(return_value=False)),
+            patch.object(browser, "_stealth_click", new=AsyncMock(side_effect=_click_err(_STALL_LOG))),
+        ):
+            result = await browser._impl_browser_click("#card")
+        assert result["diagnostics"]["navigated"] is False  # the watch was armed
+        assert original.listeners("framenavigated") == []
+        assert original.listeners("popup") == []

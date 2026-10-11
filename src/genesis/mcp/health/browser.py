@@ -1585,6 +1585,11 @@ async def _human_scroll(page, pixels: int, *, direction: str = "down") -> None:
 # for 22 minutes until the browser was killed externally.  This asyncio-level
 # wrapper is the ONLY reliable timeout for Camoufox browser tools.
 _TOOL_TIMEOUT_S: float = 60.0
+# The event-loop time (loop.time()) at which the innermost _with_tool_timeout
+# around this call expires; None outside one (browser_fill has no deadline).
+_tool_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "_tool_deadline", default=None
+)
 
 
 async def _with_tool_timeout(
@@ -1599,7 +1604,13 @@ async def _with_tool_timeout(
 
     On timeout, resets ``_active_page`` to None so subsequent tool calls
     don't operate on a page left in an indeterminate state.
+
+    The deadline is published in _tool_deadline, so optional work late in the
+    call (_input_stall_diagnostics) can fit itself inside it.
     """
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    outer = _tool_deadline.get()
+    token = _tool_deadline.set(deadline if outer is None else min(outer, deadline))
     try:
         return await asyncio.wait_for(coro, timeout=timeout_s)
     except TimeoutError:
@@ -1612,6 +1623,8 @@ async def _with_tool_timeout(
                 "Browser state was reset — call browser_navigate to resume."
             )
         }
+    finally:
+        _tool_deadline.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -3487,6 +3500,7 @@ async def _click_and_follow(page, selector: str) -> dict:
         arrived.set()
 
     sent_error = None
+    nav = None
     try:
         await _human_delay()
         wait_s = (
@@ -3497,6 +3511,7 @@ async def _click_and_follow(page, selector: str) -> dict:
         # popup the page opened on its own during the delay is not this
         # click's. (One whose first response arrives later still can be.)
         page.on("popup", _on_popup)
+        nav = _NavWatch(page)  # for _with_stall_diagnostics, from the click on
         try:
             await _stealth_click(page, selector)
         except Exception as e:
@@ -3529,10 +3544,14 @@ async def _click_and_follow(page, selector: str) -> dict:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(arrived.wait(), timeout=remaining)
     except Exception as e:
-        return await _with_stall_diagnostics(_click_failed(selector, e), page, selector, e, "browser_click")
+        return await _with_stall_diagnostics(
+            _click_failed(selector, e), page, selector, e, "browser_click", nav, pointer_known=True
+        )
     finally:
         with contextlib.suppress(Exception):
             page.remove_listener("popup", _on_popup)
+        if nav is not None:
+            nav.stop()
     clicked = page
     result: dict = {"clicked": selector}
     if sent_error is not None:
@@ -3609,9 +3628,14 @@ def _click_failed(selector: str, e: Exception, sent: bool = False) -> dict:
 # something that accrues with instance age) cannot be told apart afterwards,
 # so a failure that reached that record carries this snapshot, taken then.
 # Read-only and value-free: elements are named by tag and role only, never by
-# text, attribute or field value. Each probe is bounded, so the whole snapshot
-# costs at most two _STALL_PROBE_S waits.
+# text, attribute or field value, and every string must be on its field's
+# allowlist (_FIELD_TOKENS). Each probe is bounded, so the whole snapshot costs
+# at most two _STALL_PROBE_S waits (4 s), and inside a tool deadline
+# (_tool_deadline: browser_click's 60 s) a probe runs only if its whole wait
+# ends _STALL_DEADLINE_MARGIN_S before that deadline: a late failure keeps its
+# own error instead of becoming the generic timeout-and-reset result.
 _STALL_PROBE_S: float = 2.0  # a healthy page answers in milliseconds
+_STALL_DEADLINE_MARGIN_S: float = 1.0  # the error path after the snapshot is ~ms
 
 _DOC_STATE_JS = """
 () => ({
@@ -3624,7 +3648,6 @@ _DOC_STATE_JS = """
   modal_dialog: !!document.querySelector('dialog:modal'),
 })
 """
-_DOC_STATE_KEYS = ("visibility", "has_focus", "ready_state", "viewport", "modal_dialog")
 
 # ``p``: the last point the humanized mouse move went to (Camoufox), or null.
 # "script_click_ok": an element.click() would be dispatched (attached, not
@@ -3656,34 +3679,97 @@ _TARGET_STATE_JS = """
   };
 }
 """
-_TARGET_STATE_KEYS = (
-    "el", "box", "in_viewport", "center_hit", "pointer_hit",
-    "script_click_ok", "inert", "pointer_events", "active",
-)
-_HIT_KEYS = ("at", "rel", "el")
-# Every string a probe returns is a tag, a role or a keyword. On a layer that
-# evaluates in the page's main world (all but Camoufox) the page can redefine
-# the getters the probes read, so each value is checked by shape here, and
-# anything else (free text, a field value) becomes "<invalid>".
-_SAFE_TOKEN = re.compile(r"[a-z][a-z0-9-]{0,39}")
+# Every string a probe returns is a tag, a role or a keyword, and every one is
+# page-controlled: a tag or role names whatever the page wrote (a custom
+# element "secret-hunter2", role="hunter2"), and on a layer that evaluates in
+# the page's main world (all but Camoufox) the page can redefine the getters
+# the probes read. So each string must be on its own field's allowlist: one
+# that is not becomes "<unlisted>" (a custom-element tag: "<custom>"), and a
+# value of the wrong shape becomes "<invalid>". Listed values are lowercased.
+_FIELD_TOKENS: dict[str, frozenset[str]] = {
+    # HTML living standard elements, plus the SVG and MathML ones a click lands on.
+    "tag": frozenset(
+        ["a", "abbr", "address", "area", "article", "aside", "audio", "b", "base", "bdi", "bdo", "blockquote", "body", "br", "button", "canvas", "caption", "cite", "code", "col", "colgroup", "data", "datalist", "dd", "del", "details", "dfn", "dialog", "div", "dl", "dt", "em", "embed", "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hgroup", "hr", "html", "i", "iframe", "img", "input", "ins", "kbd", "label", "legend", "li", "link", "main", "map", "mark", "menu", "meta", "meter", "nav", "noscript", "object", "ol", "optgroup", "option", "output", "p", "picture", "pre", "progress", "q", "rp", "rt", "ruby", "s", "samp", "script", "search", "section", "select", "slot", "small", "source", "span", "strong", "style", "sub", "summary", "sup", "table", "tbody", "td", "template", "textarea", "tfoot", "th", "thead", "time", "title", "tr", "track", "u", "ul", "var", "video", "wbr", "svg", "g", "path", "circle", "ellipse", "line", "polyline", "polygon", "rect", "use", "text", "tspan", "image", "foreignobject", "math"]
+    ),
+    # WAI-ARIA 1.2 roles, plus the graphics module's.
+    "role": frozenset(
+        ["alert", "alertdialog", "application", "article", "banner", "blockquote", "button", "caption", "cell", "checkbox", "code", "columnheader", "combobox", "complementary", "contentinfo", "definition", "deletion", "dialog", "directory", "document", "emphasis", "feed", "figure", "form", "generic", "grid", "gridcell", "group", "heading", "img", "insertion", "link", "list", "listbox", "listitem", "log", "main", "marquee", "math", "menu", "menubar", "menuitem", "menuitemcheckbox", "menuitemradio", "meter", "navigation", "none", "note", "option", "paragraph", "presentation", "progressbar", "radio", "radiogroup", "region", "row", "rowgroup", "rowheader", "scrollbar", "search", "searchbox", "separator", "slider", "spinbutton", "status", "strong", "subscript", "superscript", "switch", "tab", "table", "tablist", "tabpanel", "term", "textbox", "time", "timer", "toolbar", "tooltip", "tree", "treegrid", "treeitem", "graphics-document", "graphics-object", "graphics-symbol"]
+    ),
+    "visibility": frozenset({"visible", "hidden", "prerender"}),
+    "ready_state": frozenset({"loading", "interactive", "complete"}),
+    "rel": frozenset({"none", "target", "inside", "ancestor", "other"}),
+    "pointer_events": frozenset(
+        ["auto", "none", "visiblepainted", "visiblefill", "visiblestroke", "visible", "painted", "fill", "stroke", "all", "bounding-box"]
+    ),
+    "dialog": frozenset({"alert", "confirm", "prompt", "beforeunload"}),
+}
+# A valid custom element name: lowercase start, and a hyphen (HTML standard).
+_CUSTOM_TAG = re.compile(r"[a-z][a-z0-9._-]*-[a-z0-9._-]*")
 # Dialogs and launch time are recorded for the local layers only.
 _TRACKED_LAYERS = (BrowserLayer.CAMOUFOX, BrowserLayer.CHROMIUM)
 
 
-def _safe(v, depth: int = 0, hit: bool = False):
-    """``v`` if it has the shape of a probe value (see _SAFE_TOKEN), else
-    "<invalid>". Only a hit-test result (``hit``) may be an object."""
-    if v is None or type(v) is bool:
-        return v
+def _token(v, field: str):
+    """``v`` if it is on ``field``'s allowlist (_FIELD_TOKENS), lowercased."""
+    if type(v) is not str:
+        return "<invalid>"
+    low = v.lower()
+    if low in _FIELD_TOKENS[field]:
+        return low
+    return "<custom>" if field == "tag" and _CUSTOM_TAG.fullmatch(low) else "<unlisted>"
+
+
+def _num(v):
     if type(v) in (int, float):
         return round(v) if math.isfinite(v) else None
-    if type(v) is str:
-        return v if _SAFE_TOKEN.fullmatch(v) else "<invalid>"
-    if type(v) is list and len(v) <= 4 and depth < 2:
-        return [_safe(x, depth + 1) for x in v]
-    if type(v) is dict and hit:
-        return {k: _safe(v.get(k), depth + 1) for k in _HIT_KEYS}
     return "<invalid>"
+
+
+def _nums(n: int):
+    return lambda v: [_num(x) for x in v] if type(v) is list and len(v) == n else "<invalid>"
+
+
+def _flag(v):
+    return v if v is None or type(v) is bool else "<invalid>"
+
+
+def _who(v):
+    """An element named as [tag, role or None] (``who`` in _TARGET_STATE_JS)."""
+    if v is None:
+        return None
+    if type(v) is not list or len(v) != 2:
+        return "<invalid>"
+    return [_token(v[0], "tag"), None if v[1] is None else _token(v[1], "role")]
+
+
+def _hit(v):
+    """A hit test ({at, rel, el}), only those keys."""
+    if v is None:
+        return None
+    if type(v) is not dict:
+        return "<invalid>"
+    return {"at": _nums(2)(v.get("at")), "rel": _token(v.get("rel"), "rel"), "el": _who(v.get("el"))}
+
+
+# What each probe may return: its keys, each with the check its value passes.
+_DOC_STATE_FIELDS = {
+    "visibility": lambda v: _token(v, "visibility"),
+    "has_focus": _flag,
+    "ready_state": lambda v: _token(v, "ready_state"),
+    "viewport": _nums(2),
+    "modal_dialog": _flag,
+}
+_TARGET_STATE_FIELDS = {
+    "el": _who,
+    "box": _nums(4),
+    "in_viewport": _flag,
+    "center_hit": _hit,
+    "pointer_hit": _hit,
+    "script_click_ok": _flag,
+    "inert": _flag,
+    "pointer_events": lambda v: _token(v, "pointer_events"),
+    "active": _who,
+}
 
 
 def _on_dialog(dialog) -> None:
@@ -3694,7 +3780,7 @@ def _on_dialog(dialog) -> None:
     dialog itself. Its message is page text and is not kept."""
     kind = dialog.type
     settle = dialog.accept() if kind == "beforeunload" else dialog.dismiss()
-    seen = {"type": str(kind)[:20], "at": time.monotonic(), "settled": False}
+    seen = {"type": _token(kind, "dialog"), "at": time.monotonic(), "settled": False}
     with contextlib.suppress(Exception):
         _last_dialog[dialog.page] = seen
 
@@ -3715,21 +3801,57 @@ def _dialog_settled(task: asyncio.Task) -> None:
         logger.warning("JS dialog could not be settled", exc_info=task.exception())
 
 
-async def _probe(call, keys: tuple[str, ...]) -> dict:
-    """One bounded in-page probe: only ``keys`` of its answer, or why it failed."""
+class _NavWatch:
+    """Counts main-frame navigations of ``page`` from construction to stop(),
+    from Playwright's "framenavigated" event: browser_navigate does not take
+    the page-action lock, so a click's page can load another document before
+    or while _input_stall_diagnostics probes it. An event, not a page round
+    trip, so the click pays nothing for it. It also counts a same-document
+    navigation (pushState, a hash change): a route change re-renders the page,
+    so a snapshot after one does not show what the failed click saw either."""
+
+    def __init__(self, page) -> None:
+        self.page, self.count, self.armed = page, 0, False
+        with contextlib.suppress(Exception):
+            page.on("framenavigated", self._on_nav)
+            self.armed = True
+
+    def _on_nav(self, frame) -> None:
+        with contextlib.suppress(Exception):
+            if frame is self.page.main_frame:
+                self.count += 1
+
+    def stop(self) -> None:
+        if self.armed:
+            with contextlib.suppress(Exception):
+                self.page.remove_listener("framenavigated", self._on_nav)
+
+
+async def _probe(call, fields: dict, end: float | None) -> dict:
+    """One in-page probe, bounded by _STALL_PROBE_S: each of ``fields`` checked
+    by its own check, or why it failed. Skipped when its whole wait would not
+    end by ``end`` (loop time, from the tool deadline): a cut-short wait would
+    read as a hung page."""
+    if end is not None and asyncio.get_running_loop().time() + _STALL_PROBE_S > end:
+        return {"probe_skipped": "tool_deadline"}
     try:
         got = await asyncio.wait_for(call(), timeout=_STALL_PROBE_S)
     except Exception as err:  # a probe that hangs or throws is itself a finding
         return {"probe_failed": type(err).__name__}
     if not isinstance(got, dict):
         return {"probe_failed": "unexpected answer"}
-    return {k: _safe(got.get(k), hit=k.endswith("_hit")) for k in keys}
+    return {k: check(got.get(k)) for k, check in fields.items()}
 
 
-async def _input_stall_diagnostics(page, selector: str) -> dict:
+async def _input_stall_diagnostics(
+    page, selector: str, nav: _NavWatch | None, pointer_known: bool = False
+) -> dict:
     """What the page and its layer looked like when a click stalled at
-    "performing click action" (see the comment above _STALL_PROBE_S).
-    Never raises."""
+    "performing click action" (see the comment above _STALL_PROBE_S). A page
+    that ``nav`` saw navigate since the click is reported, not probed.
+    ``pointer_known``: the click went through the humanized mouse move, so
+    _mouse_pos is where the pointer is (browser_click on Camoufox; a fill's
+    focus click is a plain page.click, which does not update it). Never raises."""
     layer = _layer_of(page)
     tracked = layer in _TRACKED_LAYERS
     launched = _layer_launched.get(layer) if tracked else None
@@ -3744,31 +3866,61 @@ async def _input_stall_diagnostics(page, selector: str) -> dict:
         diag["open_pages"] = len(page.context.pages)
     if tracked and (seen := _last_dialog.get(page)) is not None:
         diag["last_dialog"] = {
-            "type": seen["type"],
+            "type": _token(seen["type"], "dialog"),
             "age_s": round(time.monotonic() - seen["at"], 1),
             "settled": seen["settled"],
         }
-    pointer = [_mouse_pos["x"], _mouse_pos["y"]] if layer is BrowserLayer.CAMOUFOX else None
-    diag["document"] = await _probe(lambda: page.evaluate(_DOC_STATE_JS), _DOC_STATE_KEYS)
+    # A navigation since the click: the probes would read another document.
+    # With no watch, whether one happened is unknown, so nothing is probed.
+    moved = {"probe_skipped": "page_navigated"}
+    if nav is None or not nav.armed:
+        diag["navigated"] = "not_tracked"
+        diag["document"] = diag["target"] = {"probe_skipped": "navigation_not_tracked"}
+        return diag
+    diag["navigated"] = nav.count > 0
+    if diag["navigated"]:
+        diag["document"] = diag["target"] = moved
+        return diag
+    deadline = _tool_deadline.get()
+    end = None if deadline is None else deadline - _STALL_DEADLINE_MARGIN_S
+    pointer = (
+        [_mouse_pos["x"], _mouse_pos["y"]]
+        if pointer_known and layer is BrowserLayer.CAMOUFOX
+        else None
+    )
+    diag["document"] = await _probe(lambda: page.evaluate(_DOC_STATE_JS), _DOC_STATE_FIELDS, end)
     # Playwright's own timeout fires first (an unretrieved driver future
     # otherwise outlives the cancelled wait); _probe's bound backs up a hung driver.
     diag["target"] = await _probe(
         lambda: page.locator(selector).first.evaluate(
             _TARGET_STATE_JS, pointer, timeout=_STALL_PROBE_S * 750
         ),
-        _TARGET_STATE_KEYS,
+        _TARGET_STATE_FIELDS,
+        end,
     )
+    if nav.count:  # it moved while probing: the answers may mix two documents
+        diag["navigated"] = True
+        diag["document"] = diag["target"] = moved
     return diag
 
 
-async def _with_stall_diagnostics(result: dict, page, selector: str, err: BaseException, tool: str) -> dict:
+async def _with_stall_diagnostics(
+    result: dict,
+    page,
+    selector: str,
+    err: BaseException,
+    tool: str,
+    nav: _NavWatch | None,
+    pointer_known: bool = False,
+) -> dict:
     """``result``, with a ``diagnostics`` field when ``err`` is a click's own
     error whose call log reached "performing click action" (_call_log). The
-    snapshot is also logged as one line of JSON."""
+    snapshot is also logged as one line of JSON. ``nav`` was started before
+    the click (see _NavWatch)."""
     if _CLICK_SENT_MARK not in _call_log(err, selector):
         return result
     try:
-        diag = await _input_stall_diagnostics(page, selector)
+        diag = await _input_stall_diagnostics(page, selector, nav, pointer_known)
     except Exception as diag_err:  # never let the snapshot replace the error
         diag = {"diagnostics_failed": type(diag_err).__name__}
     result["diagnostics"] = diag
@@ -3804,8 +3956,11 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
 async def _fill(page, selector: str, value: str) -> dict:
     """The typing of _impl_browser_fill, under its page's action lock."""
     global _active_page
+    nav = None
     try:
         await _human_delay()
+        # For _with_stall_diagnostics: from the clearing and focus click on.
+        nav = _NavWatch(page)
         await _human_type(page, selector, value)
         _update_remote_url()  # Fill + Enter may cause navigation
         return {"filled": selector, "url": page.url}
@@ -3833,7 +3988,10 @@ async def _fill(page, selector: str, value: str) -> dict:
         }
     except Exception as e:
         failed = {"error": f"Fill failed on '{selector}': {e}"}
-        return await _with_stall_diagnostics(failed, page, selector, e, "browser_fill")
+        return await _with_stall_diagnostics(failed, page, selector, e, "browser_fill", nav)
+    finally:
+        if nav is not None:
+            nav.stop()
 
 
 async def _impl_browser_upload(selector: str, file_path: str) -> dict:
