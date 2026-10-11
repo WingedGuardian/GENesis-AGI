@@ -52,6 +52,7 @@ _SECTION = (
     "## Rework\n"
     "Replaces: #10\n"
     "Split: none, one PR carries the whole rebuild\n"
+    "Kept / deleted / reshaped as the spec asked: as specified\n"
     "Deviations: none\n"
     "Questions answered: the spec's two open questions, answered in the design notes\n"
 )
@@ -60,6 +61,11 @@ _BODY = "Rebuild of the sent-back change.\n\n" + _SECTION + "\n## Testing\nUnit 
 
 def _sent_back(*rows: tuple[int, str, str]) -> str:
     return "\n".join(json.dumps({"number": n, "head": h, "state": s}) for n, h, s in rows)
+
+
+def _spec(body: str = "## Rework spec\nKeep the core; delete the rest.") -> dict:
+    """The maintainer's spec on the old PR, which a rebuild is built from."""
+    return {"login": "maintainer", "association": "OWNER", "body": body, "created": BEFORE}
 
 
 def _ack(
@@ -88,6 +94,7 @@ def rebuild(monkeypatch):
         sent_back: str | None = None,
         timeline: dict | None = None,
         commits: tuple[str, ...] = (HEAD,),
+        spec: bool = True,
     ):
         monkeypatch.setenv("_TEST_GH_PR_BODY", body)
         monkeypatch.setenv("_TEST_GH_PR_CREATED_AT", CREATED)
@@ -95,9 +102,11 @@ def rebuild(monkeypatch):
             "_TEST_GH_REWORK_SENT_BACK",
             _sent_back((10, OLD_HEAD, "CLOSED")) if sent_back is None else sent_back,
         )
-        monkeypatch.setenv(
-            "_TEST_GH_REWORK_ACK", json.dumps({"10": [_ack()] if acks is None else acks})
-        )
+        if isinstance(acks, str):  # an error sentinel: the whole read fails
+            rows = acks
+        else:
+            rows = ([_spec()] if spec else []) + ([_ack()] if acks is None else acks)
+        monkeypatch.setenv("_TEST_GH_REWORK_ACK", json.dumps({"10": rows}))
         monkeypatch.setenv("_TEST_GH_REWORK_TIMELINE", json.dumps(timeline or {}))
         monkeypatch.setenv(
             "_TEST_GH_PR_COMMITS",
@@ -479,7 +488,7 @@ def test_18h_crlf_body_parses(rebuild):
 
 def _seed_merge(monkeypatch, *, acks):
     monkeypatch.setenv("_TEST_GH_REWORK_SENT_BACK", _sent_back((10, OLD_HEAD, "CLOSED")))
-    monkeypatch.setenv("_TEST_GH_REWORK_ACK", json.dumps({"10": acks}))
+    monkeypatch.setenv("_TEST_GH_REWORK_ACK", json.dumps({"10": [_spec(), *acks]}))
     monkeypatch.setenv("_TEST_GH_REWORK_TIMELINE", "{}")
     monkeypatch.setenv("_TEST_GH_PR_COMMITS", json.dumps({"sha": HEAD, "parents": 1}))
 
@@ -537,7 +546,7 @@ def test_20_report_and_merge_arm_agree(monkeypatch, capsys, acks, report_state, 
 def test_21_a_value_written_under_its_field_counts():
     """A bullet list under `Deviations:` is a value, not an empty field."""
     section = (
-        "## Rework\nReplaces: #10\nSplit: PR 1 of 2\nDeviations:\n"
+        "## Rework\nReplaces: #10\nSplit: PR 1 of 2\nKept / deleted / reshaped as the spec asked: as specified\nDeviations:\n"
         "- the slice check moved to enable, because the CLI owns the unit lifecycle\n"
         "Questions answered:\n  - none were delegated\n"
     )
@@ -545,14 +554,14 @@ def test_21_a_value_written_under_its_field_counts():
 
 
 def test_21b_a_field_followed_directly_by_the_next_field_is_still_empty():
-    section = "## Rework\nReplaces: #10\nSplit: x\nDeviations:\n\nQuestions answered: y\n"
+    section = "## Rework\nReplaces: #10\nSplit: x\nKept / deleted / reshaped as the spec asked: as specified\nDeviations:\n\nQuestions answered: y\n"
     assert G._rework_section_problems(section) == ["the `## Rework` section's `Deviations:` line is empty"]
 
 
 def test_21c_another_label_line_does_not_fill_an_empty_field():
     """Review finding: `Testing: pytest` under an empty `Deviations:` filled it."""
     section = (
-        "## Rework\nReplaces: #10\nSplit: x\nDeviations:\nTesting: pytest\n"
+        "## Rework\nReplaces: #10\nSplit: x\nKept / deleted / reshaped as the spec asked: as specified\nDeviations:\nTesting: pytest\n"
         "Questions answered: y\n"
     )
     assert G._rework_section_problems(section) == ["the `## Rework` section's `Deviations:` line is empty"]
@@ -568,7 +577,7 @@ def test_21c2_the_templates_kept_line_does_not_fill_an_empty_split():
 
 
 def test_21d_an_unindented_plain_value_under_a_field_still_counts():
-    section = "## Rework\nReplaces: #10\nSplit: x\nDeviations:\nnone\nQuestions answered: y\n"
+    section = "## Rework\nReplaces: #10\nSplit: x\nKept / deleted / reshaped as the spec asked: as specified\nDeviations:\nnone\nQuestions answered: y\n"
     assert G._rework_section_problems(section) == []
 
 
@@ -630,7 +639,9 @@ def test_25_a_timeline_only_rebuild_of_an_open_pr_gets_the_note(rebuild, monkeyp
         body=body,
         timeline={"31": {"state": "OPEN", "events": [{"event": "labeled", "label": "needs-rework"}]}},
     )
-    monkeypatch.setenv("_TEST_GH_REWORK_ACK", json.dumps({"31": [_ack(created=BEFORE)]}))
+    monkeypatch.setenv(
+        "_TEST_GH_REWORK_ACK", json.dumps({"31": [_spec(), _ack(created=BEFORE)]})
+    )
     state, msg = G._check_rework("20", REPO)
     assert state == G.REWORK_OK, msg
     assert "PR #31 is still open" in msg
@@ -789,12 +800,13 @@ def test_36_indented_code_does_not_declare(body):
 
 def test_36b_indented_fields_under_the_heading_do_not_fill_the_section():
     body = "## Rework\n" + "".join(f"    {ln}\n" for ln in _SECTION.splitlines()[1:])
-    assert len(G._rework_section_problems(body)) == 4
+    assert len(G._rework_section_problems(body)) == len(G._REWORK_FIELDS)
 
 
 def test_36c_a_value_indented_under_a_list_item_is_still_read():
     body = (
-        "## Rework\n- Replaces:\n    - #10\n- Split: none\n- Deviations: none\n"
+        "## Rework\n- Replaces:\n    - #10\n- Split: none\n"
+        "- Kept / deleted / reshaped as the spec asked: as specified\n- Deviations: none\n"
         "- Questions answered: all\n"
     )
     assert G._rework_declared_refs(body, "20", REPO) == {10}
@@ -1021,3 +1033,78 @@ def test_51_no_parser_reads_the_body_as_unreadable(rebuild, monkeypatch):
     rebuild(body=_BODY, commits=(OLD_HEAD, HEAD))
     state, msg = _check()
     assert state == G.REWORK_BLOCK, msg
+# ── 52-56: round-3 review findings (the gate matches AGENTS.md's contract) ──
+
+
+def test_52_a_rebuild_of_a_pr_with_no_rework_spec_blocks(rebuild):
+    """Review finding (Codex r3, P1): a needs-architecture-session PR with no posted
+    `## Rework spec` has an undecided design; its rebuild must not pass."""
+    rebuild(spec=False)
+    state, msg = _check()
+    assert state == G.REWORK_BLOCK
+    assert "PR #10 has no maintainer `## Rework spec` comment" in msg
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {
+            "login": "devin-ai-integration[bot]",
+            "association": "NONE",
+            "body": "## Rework spec\nmine",
+            "created": BEFORE,
+        },
+        {
+            "login": "drive-by",
+            "association": "NONE",
+            "body": "## Rework spec\nmine",
+            "created": BEFORE,
+        },
+        {
+            "login": "maintainer",
+            "association": "OWNER",
+            "body": "## Rework spec draft\nlater",
+            "created": BEFORE,
+        },
+    ],
+)
+def test_52b_only_a_maintainer_spec_heading_counts(rebuild, row):
+    rebuild(spec=False, acks=[row, _ack()])
+    state, msg = _check()
+    assert state == G.REWORK_BLOCK
+    assert "no maintainer `## Rework spec`" in msg
+
+
+def test_53_the_kept_deleted_reshaped_line_is_required(rebuild):
+    """Review finding (Codex r3): the report template's fifth line went unchecked."""
+    rebuild(body=_BODY.replace("Kept / deleted / reshaped as the spec asked: as specified\n", ""))
+    state, msg = _check()
+    assert state == G.REWORK_BLOCK
+    assert "no `Kept / deleted / reshaped as the spec asked:` line" in msg
+
+
+def test_54_a_devin_aside_line_before_the_heading_is_accepted(rebuild):
+    """Review finding (Codex r3): AGENTS.md puts `(aside)` first on a Devin-built
+    PR's comments, so the acknowledgement heading sits on the second block."""
+    rebuild(
+        acks=[_ack(body="(aside)\n\n## Rework acknowledgement\nI read the spec.")],
+    )
+    state, msg = _check()
+    assert state == G.REWORK_OK, msg
+    assert G._rework_is_ack("(aside)\n## Rework acknowledgement\nok")
+    assert not G._rework_is_ack("(aside) note\n\n## Rework acknowledgement\nok")
+
+
+def test_55_a_label_led_bullet_under_a_field_is_its_value():
+    """Review finding (Codex r3): `- Storage: SQLite, because ...` under
+    `Questions answered:` was read as a new field, leaving the field empty."""
+    body = _SECTION.replace(
+        "Questions answered: the spec's two open questions, answered in the design notes",
+        "Questions answered:\n\n- Storage: SQLite, because it is already the store\n",
+    )
+    assert G._rework_section_problems(body) == []
+
+
+def test_56_a_top_level_field_with_a_value_does_not_absorb_the_next_list():
+    body = "Replaces: #10\n\n- Closes #200\n"
+    assert G._rework_declared_refs(body, "20", REPO) == {10}

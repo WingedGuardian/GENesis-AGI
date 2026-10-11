@@ -10411,7 +10411,13 @@ def _rework_ack_bot_logins() -> frozenset[str]:
 _REWORK_ACK_HEADING = "## rework acknowledgement"
 
 #: The fields the `## Rework` section must carry, each with text after the colon.
-_REWORK_FIELDS = ("Replaces", "Split", "Deviations", "Questions answered")
+_REWORK_FIELDS = (
+    "Replaces",
+    "Split",
+    "Kept / deleted / reshaped as the spec asked",
+    "Deviations",
+    "Questions answered",
+)
 
 #: `#N` only standing alone: never `other/repo#10` (a cross-repository shorthand)
 #: or a URL fragment (`page#10`).
@@ -10440,7 +10446,10 @@ _REWORK_HEADING_TEXT_RE = re.compile(r"^rework\b(?![ \t_-]*acknowledg)", re.IGNO
 #: to three PRs in practice; more blocks and takes the owner's override.
 _REWORK_MAX_DECLARED = 5
 _REWORK_FIELD_RE = re.compile(
-    r"^[ \t]*(" + "|".join(_REWORK_FIELDS) + r")[ \t]*:(.*)$", re.IGNORECASE
+    r"^[ \t]*("
+    + "|".join(re.escape(f).replace(r"\ ", r"[ \t]+") for f in _REWORK_FIELDS)
+    + r")[ \t]*:(.*)$",
+    re.IGNORECASE,
 )
 #: Another `Label:` line (`Testing: pytest`, `E2E: none`). It ends the field above
 #: it rather than filling it. The colon must end the label (followed by a space
@@ -10539,8 +10548,10 @@ def _rework_field_values(
 
     A field's value is the rest of its line, the following lines of the same
     paragraph up to another ``Label:`` line, and the paragraphs nested under the
-    field: inside the same list item, or, for a field in a top-level paragraph, the
-    list that directly follows it. Prose in a later paragraph is never a value.
+    field: inside the same list item, or, for a top-level field whose own line is
+    empty, the list that directly follows it. A nested item may itself start with a
+    label; only another field of this kind ends the value. Prose in a later
+    paragraph is never a value.
     """
     out: list[tuple[str, list[str]]] = []
     for bi, (kind, where, text) in enumerate(blocks):
@@ -10557,9 +10568,14 @@ def _rework_field_values(
                     break
                 if nxt.strip():
                     values.append(nxt.strip())
-            if li == len(lines) - 1 or not any(
+            ends_paragraph = li == len(lines) - 1 or not any(
                 field_re.match(n) or _REWORK_OTHER_FIELD_RE.match(n) for n in lines[li + 1 :]
-            ):
+            )
+            # A field inside a list item owns the list nested under it. A top-level
+            # field owns the list directly below it only when its own line is empty
+            # (`Replaces:` then `- #10`); `Replaces: #10` followed by an unrelated
+            # list (`- Closes #200`) must not absorb it.
+            if ends_paragraph and (where or not values):
                 for k2, w2, t2 in blocks[bi + 1 :]:
                     if k2 != "para":
                         if k2 == "heading" or not where:
@@ -10572,8 +10588,10 @@ def _rework_field_values(
                     )
                     if not nested:
                         break
-                    first = t2.split("\n", 1)[0]
-                    if field_re.match(first) or _REWORK_OTHER_FIELD_RE.match(first):
+                    # Only another field of this kind ends the value. A nested
+                    # item that starts with a label (`- Storage: SQLite, because`)
+                    # is the field's value, not a new field.
+                    if field_re.match(t2.split("\n", 1)[0]):
                         break
                     values.extend(v.strip() for v in t2.split("\n") if v.strip())
             name = m.group(1) if m.lastindex and m.lastindex > 1 else ""
@@ -10687,7 +10705,9 @@ def _rework_section_fields(body: str) -> dict[str, list[str]] | None:
     )
     fields: dict[str, list[str]] = {}
     for name, values in _rework_field_values(blocks[start + 1 : end], _REWORK_FIELD_RE):
-        canon = next(f for f in _REWORK_FIELDS if f.lower() == name.lower())
+        canon = next(
+            f for f in _REWORK_FIELDS if f.lower() == " ".join(name.split()).lower()
+        )
         fields.setdefault(canon, []).extend(values)
     return fields
 
@@ -10959,19 +10979,50 @@ def _rework_ts(value: object) -> _dt.datetime | None:
     return got if got.tzinfo is not None else None
 
 
-def _rework_is_ack(body: str) -> bool:
-    """True when the comment's first rendered block IS the acknowledgement heading:
-    a level-2 heading (ATX or setext) whose text is exactly "Rework
-    acknowledgement", whitespace-normalized. Never a prefix: "## Rework
-    acknowledgement needed" is an instruction, not an acknowledgement. Raises
-    ``_ReworkUnreadable`` when the comment cannot be parsed.
+def _rework_heading_comment(body: str, heading: str) -> bool:
+    """True when the comment's first rendered block is the level-2 heading
+    ``heading`` (ATX or setext, whitespace-normalized, exact, never a prefix),
+    optionally preceded by a paragraph that is only ``(aside)``. AGENTS.md puts
+    ``(aside)`` on the first line of a comment on a Devin-built PR so the comment
+    does not start a paid Devin session. Raises ``_ReworkUnreadable`` when the
+    comment cannot be parsed.
     """
     blocks = _rework_blocks(body)
+    if blocks and blocks[0][0] == "para" and blocks[0][2].strip().lower() == "(aside)":
+        blocks = blocks[1:]
     if not blocks:
         return False
     kind, where, text = blocks[0]
-    return kind == "heading" and where == 2 and (
-        " ".join(text.split()).lower() == _REWORK_ACK_HEADING.removeprefix("## ")
+    return kind == "heading" and where == 2 and " ".join(text.split()).lower() == heading
+
+
+def _rework_is_ack(body: str) -> bool:
+    """True when the comment opens with the "Rework acknowledgement" heading (see
+    ``_rework_heading_comment``). Never a prefix: "## Rework acknowledgement
+    needed" is an instruction, not an acknowledgement.
+    """
+    return _rework_heading_comment(body, _REWORK_ACK_HEADING.removeprefix("## "))
+
+
+def _rework_spec_problem(num: int, rows: list[dict]) -> str | None:
+    """Why PR ``num`` lacks a posted rework spec, or None when it has one.
+
+    AGENTS.md: a sent-back PR is rebuilt only from a maintainer comment headed
+    ``## Rework spec``; a ``needs-architecture-session`` PR without one has an
+    undecided design and must not be rebuilt. Only OWNER, MEMBER or COLLABORATOR
+    count: a builder bot can rework a shape but cannot decide one.
+    """
+    for r in rows:
+        if (
+            isinstance(r.get("body"), str)
+            and r.get("association") in _MAINTAINER_ASSOCIATIONS
+            and _rework_heading_comment(r["body"], "rework spec")
+        ):
+            return None
+    return (
+        f"PR #{num} has no maintainer `## Rework spec` comment: a sent-back PR is "
+        f"rebuilt only from a posted spec (for needs-architecture-session, the "
+        f"owner's decision)"
     )
 
 
@@ -11180,9 +11231,12 @@ def _check_rework_inner(
                 "could not verify — " + _rework_unreadable("this PR's creation time")
             )
         else:
-            problem = _rework_ack_problem(num, rows, created)
-            if problem:
-                problems.append(problem)
+            for problem in (
+                _rework_spec_problem(num, rows),
+                _rework_ack_problem(num, rows, created),
+            ):
+                if problem:
+                    problems.append(problem)
     notes = [
         f"NOTE: PR #{n} is still open; its builder closes it when the last "
         f"replacement opens (advisory)."
@@ -11202,9 +11256,11 @@ def _check_rework_inner(
             *[f"  - {p}" for p in seen],
             # Three short lines: the report bounds each detail line, and one long
             # remedy line lost its middle there.
-            "Remedy: a maintainer posts `## Rework acknowledgement` on each old PR",
-            "before opening the rebuild; the rebuild's body carries `## Rework` with",
-            "Replaces:, Split:, Deviations:, Questions answered: lines.",
+            "Remedy: each old PR carries a maintainer's `## Rework spec`, and the",
+            "builder's `## Rework acknowledgement` posted before the rebuild opened;",
+            "the rebuild's body carries `## Rework` with Replaces:, Split:,",
+            "Kept / deleted / reshaped as the spec asked:, Deviations: and",
+            "Questions answered: lines.",
             "An acknowledgement posted AFTER this PR opened can never satisfy it:",
             "open a fresh PR after posting it, or override with the owner's yes.",
             "Overriding takes the owner's yes: `# rework-override` (logged).",
