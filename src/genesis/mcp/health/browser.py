@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import json
 import logging
 import math
 import os
@@ -153,6 +154,12 @@ _layer_last_used: dict[BrowserLayer, float] = {}
 _idle_task: asyncio.Task | None = None
 _IDLE_TIMEOUT_S = 3600  # 1 hour
 
+# For _input_stall_diagnostics: when each local layer was launched (monotonic),
+# and the last JS dialog each page raised (_on_dialog).
+_layer_launched: dict[BrowserLayer, float] = {}
+_last_dialog: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_dialog_tasks: set[asyncio.Task] = set()
+
 _SCREENSHOT_DIR = Path.home() / "tmp"
 _VNC_DISPLAY = ":99"
 #: Pointer readback tolerance. VNC positioning is not exact to the pixel, so a
@@ -256,6 +263,7 @@ def _forget_layer(layer: BrowserLayer, page) -> None:
     stop the tools pointing at its page."""
     global _active_page
     _layer_last_used.pop(layer, None)
+    _layer_launched.pop(layer, None)
     for tab in [t for t, entry in _opened_by.items() if entry[3] is layer]:
         _opened_by.pop(tab, None)
     if page is not None and _active_page is page:
@@ -468,7 +476,9 @@ async def _ensure_browser():
             raise
         # With persistent_context, browser IS the context
         _stealth_cm, _stealth_browser = cm, ctx
+        _layer_launched[BrowserLayer.CAMOUFOX] = time.monotonic()
         ctx.on("close", lambda c: _on_local_context_closed(BrowserLayer.CAMOUFOX, c))
+        ctx.on("dialog", _on_dialog)
         _stealth_page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         mode_str = "headed (collaborate)" if _collaborate_mode else "headed"
         logger.info("Camoufox browser launched %s with persistent profile at %s", mode_str, _PROFILE_DIR)
@@ -514,7 +524,9 @@ async def _ensure_chromium_fallback():
             await _run_close(_close_chromium(None, pw))
             raise
         _playwright, _context = pw, ctx
+        _layer_launched[BrowserLayer.CHROMIUM] = time.monotonic()
         ctx.on("close", lambda c: _on_local_context_closed(BrowserLayer.CHROMIUM, c))
+        ctx.on("dialog", _on_dialog)
         _page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         mode_str = "headed (collaborate)" if _collaborate_mode else "headed"
         logger.info("Chromium fallback launched %s with profile at %s", mode_str, _CHROMIUM_PROFILE_DIR)
@@ -2256,8 +2268,10 @@ async def _human_type(page, selector: str, value: str) -> None:
 
     # Clear field reliably (works on React controlled inputs)
     await _no_stall(page.fill(selector, "", timeout=10000), "clearing the field", layer)
-    # Click to focus the field
-    await _no_stall(page.click(selector, timeout=10000), "focusing the field", layer)
+    # Click to focus the field. A click's own error, so _fill can read its call log.
+    await _no_stall(
+        _click_call(page.click(selector, timeout=10000)), "focusing the field", layer
+    )
     # Type per-keystroke with hold time + flight time (IKI) jitter.
     # Hold time: log-normal, median ~86ms (CMU Keystroke Dynamics calibration).
     # Flight time: 50-200ms uniform with 5% thinking pauses.
@@ -3515,7 +3529,7 @@ async def _click_and_follow(page, selector: str) -> dict:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(arrived.wait(), timeout=remaining)
     except Exception as e:
-        return _click_failed(selector, e)
+        return await _with_stall_diagnostics(_click_failed(selector, e), page, selector, e, "browser_click")
     finally:
         with contextlib.suppress(Exception):
             page.remove_listener("popup", _on_popup)
@@ -3587,6 +3601,183 @@ def _click_failed(selector: str, e: Exception, sent: bool = False) -> dict:
     return {"error": f"Click failed on '{selector}': {e}"}
 
 
+# --- Input-stall diagnostics ----------------------------------------------
+# A long-lived Camoufox was seen stalling every real mouse action at
+# "performing click action" while a script click (element.click()) worked, and
+# a fresh instance did not reproduce it. The candidate causes (a JS dialog, the
+# window losing focus or visibility on the X display, the pointer move,
+# something that accrues with instance age) cannot be told apart afterwards,
+# so a failure that reached that record carries this snapshot, taken then.
+# Read-only and value-free: elements are named by tag and role only, never by
+# text, attribute or field value. Each probe is bounded, so the whole snapshot
+# costs at most two _STALL_PROBE_S waits.
+_STALL_PROBE_S: float = 2.0  # a healthy page answers in milliseconds
+
+_DOC_STATE_JS = """
+() => ({
+  visibility: document.visibilityState,
+  has_focus: document.hasFocus(),
+  ready_state: document.readyState,
+  viewport: [innerWidth, innerHeight],
+  // A modal <dialog> makes the rest of the page inert: real input to it is
+  // dropped, while a script click still dispatches.
+  modal_dialog: !!document.querySelector('dialog:modal'),
+})
+"""
+_DOC_STATE_KEYS = ("visibility", "has_focus", "ready_state", "viewport", "modal_dialog")
+
+# ``p``: the last point the humanized mouse move went to (Camoufox), or null.
+# "script_click_ok": an element.click() would be dispatched (attached, not
+# disabled), checked without clicking: a second click could submit twice.
+# "inert" and "pointer_events": a real mouse cannot reach an element under
+# [inert] or whose computed pointer-events is none, while a script click can.
+_TARGET_STATE_JS = """
+(e, p) => {
+  const d = e.ownerDocument;
+  const who = (n) => n && n.localName
+    ? [n.localName.slice(0, 40), (n.getAttribute('role') || '').slice(0, 40) || null] : null;
+  const hit = (x, y) => {
+    const n = d.elementFromPoint(x, y);
+    const rel = !n ? 'none' : n === e ? 'target' : e.contains(n) ? 'inside'
+      : n.contains(e) ? 'ancestor' : 'other';
+    return { at: [Math.round(x), Math.round(y)], rel, el: who(n) };
+  };
+  const r = e.getBoundingClientRect();
+  return {
+    el: who(e),
+    box: [r.x, r.y, r.width, r.height].map(Math.round),
+    in_viewport: r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth,
+    center_hit: hit(r.x + r.width / 2, r.y + r.height / 2),
+    pointer_hit: p ? hit(p[0], p[1]) : null,
+    script_click_ok: e.isConnected && !e.matches(':disabled'),
+    inert: !!e.closest('[inert]'),
+    pointer_events: getComputedStyle(e).pointerEvents.slice(0, 20),
+    active: who(d.activeElement),
+  };
+}
+"""
+_TARGET_STATE_KEYS = (
+    "el", "box", "in_viewport", "center_hit", "pointer_hit",
+    "script_click_ok", "inert", "pointer_events", "active",
+)
+_HIT_KEYS = ("at", "rel", "el")
+# Every string a probe returns is a tag, a role or a keyword. On a layer that
+# evaluates in the page's main world (all but Camoufox) the page can redefine
+# the getters the probes read, so each value is checked by shape here, and
+# anything else (free text, a field value) becomes "<invalid>".
+_SAFE_TOKEN = re.compile(r"[a-z][a-z0-9-]{0,39}")
+# Dialogs and launch time are recorded for the local layers only.
+_TRACKED_LAYERS = (BrowserLayer.CAMOUFOX, BrowserLayer.CHROMIUM)
+
+
+def _safe(v, depth: int = 0, hit: bool = False):
+    """``v`` if it has the shape of a probe value (see _SAFE_TOKEN), else
+    "<invalid>". Only a hit-test result (``hit``) may be an object."""
+    if v is None or type(v) is bool:
+        return v
+    if type(v) in (int, float):
+        return round(v) if math.isfinite(v) else None
+    if type(v) is str:
+        return v if _SAFE_TOKEN.fullmatch(v) else "<invalid>"
+    if type(v) is list and len(v) <= 4 and depth < 2:
+        return [_safe(x, depth + 1) for x in v]
+    if type(v) is dict and hit:
+        return {k: _safe(v.get(k), depth + 1) for k in _HIT_KEYS}
+    return "<invalid>"
+
+
+def _on_dialog(dialog) -> None:
+    """Record a JS dialog for _input_stall_diagnostics, then settle it as
+    Playwright does when nothing listens (_on_dialog in
+    playwright/_impl/_browser_context.py: accept a beforeunload, dismiss the
+    rest). Any listener turns that default off, so this one settles every
+    dialog itself. Its message is page text and is not kept."""
+    kind = dialog.type
+    settle = dialog.accept() if kind == "beforeunload" else dialog.dismiss()
+    seen = {"type": str(kind)[:20], "at": time.monotonic(), "settled": False}
+    with contextlib.suppress(Exception):
+        _last_dialog[dialog.page] = seen
+
+    async def _settle() -> None:
+        await settle
+        seen["settled"] = True
+
+    task = asyncio.ensure_future(_settle())
+    _dialog_tasks.add(task)
+    task.add_done_callback(_dialog_settled)
+
+
+def _dialog_settled(task: asyncio.Task) -> None:
+    _dialog_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        # With a listener Playwright no longer settles dialogs itself, so one
+        # left open here blocks the page: say so.
+        logger.warning("JS dialog could not be settled", exc_info=task.exception())
+
+
+async def _probe(call, keys: tuple[str, ...]) -> dict:
+    """One bounded in-page probe: only ``keys`` of its answer, or why it failed."""
+    try:
+        got = await asyncio.wait_for(call(), timeout=_STALL_PROBE_S)
+    except Exception as err:  # a probe that hangs or throws is itself a finding
+        return {"probe_failed": type(err).__name__}
+    if not isinstance(got, dict):
+        return {"probe_failed": "unexpected answer"}
+    return {k: _safe(got.get(k), hit=k.endswith("_hit")) for k in keys}
+
+
+async def _input_stall_diagnostics(page, selector: str) -> dict:
+    """What the page and its layer looked like when a click stalled at
+    "performing click action" (see the comment above _STALL_PROBE_S).
+    Never raises."""
+    layer = _layer_of(page)
+    tracked = layer in _TRACKED_LAYERS
+    launched = _layer_launched.get(layer) if tracked else None
+    diag: dict = {
+        "layer": layer.value if layer is not None else None,
+        # "not_tracked", never None: a null would read as "no dialog seen".
+        "instance_age_s": round(time.monotonic() - launched, 1) if launched is not None else "not_tracked",
+        "open_pages": None,
+        "last_dialog": None if tracked else "not_tracked",
+    }
+    with contextlib.suppress(Exception):
+        diag["open_pages"] = len(page.context.pages)
+    if tracked and (seen := _last_dialog.get(page)) is not None:
+        diag["last_dialog"] = {
+            "type": seen["type"],
+            "age_s": round(time.monotonic() - seen["at"], 1),
+            "settled": seen["settled"],
+        }
+    pointer = [_mouse_pos["x"], _mouse_pos["y"]] if layer is BrowserLayer.CAMOUFOX else None
+    diag["document"] = await _probe(lambda: page.evaluate(_DOC_STATE_JS), _DOC_STATE_KEYS)
+    # Playwright's own timeout fires first (an unretrieved driver future
+    # otherwise outlives the cancelled wait); _probe's bound backs up a hung driver.
+    diag["target"] = await _probe(
+        lambda: page.locator(selector).first.evaluate(
+            _TARGET_STATE_JS, pointer, timeout=_STALL_PROBE_S * 750
+        ),
+        _TARGET_STATE_KEYS,
+    )
+    return diag
+
+
+async def _with_stall_diagnostics(result: dict, page, selector: str, err: BaseException, tool: str) -> dict:
+    """``result``, with a ``diagnostics`` field when ``err`` is a click's own
+    error whose call log reached "performing click action" (_call_log). The
+    snapshot is also logged as one line of JSON."""
+    if _CLICK_SENT_MARK not in _call_log(err, selector):
+        return result
+    try:
+        diag = await _input_stall_diagnostics(page, selector)
+    except Exception as diag_err:  # never let the snapshot replace the error
+        diag = {"diagnostics_failed": type(diag_err).__name__}
+    result["diagnostics"] = diag
+    logger.warning(
+        "%s stalled at 'performing click action': %s", tool, json.dumps(diag, default=str)
+    )
+    return result
+
+
 async def _impl_browser_fill(selector: str, value: str) -> dict:
     """Fill a form field on the current page."""
     _touch()
@@ -3641,7 +3832,8 @@ async def _fill(page, selector: str, value: str) -> dict:
             )
         }
     except Exception as e:
-        return {"error": f"Fill failed on '{selector}': {e}"}
+        failed = {"error": f"Fill failed on '{selector}': {e}"}
+        return await _with_stall_diagnostics(failed, page, selector, e, "browser_fill")
 
 
 async def _impl_browser_upload(selector: str, file_path: str) -> dict:
