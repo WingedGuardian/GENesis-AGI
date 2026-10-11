@@ -1472,3 +1472,33 @@ def test_sh_carries_the_union_because_the_allowlist_is_keyed_on_a_basename():
     # basename really does identify the binary.
     assert "h" not in sp._C_BUNDLE_OPTIONS["dash"]
     assert "git" not in [seg.exe for seg in sp.analyze("dash -ch 'git push origin main'")]
+
+
+@pytest.mark.parametrize(
+    ("argv", "method", "endpoint"),
+    [
+        (["gh", "api", "repos/o/r/pulls"], "GET", "repos/o/r/pulls"),
+        (["gh", "api", "repos/o/r/issues", "-f", "title=x"], "POST", "repos/o/r/issues"),
+        (["gh", "api", "repos/o/r/issues", "--input", "b.json"], "POST", "repos/o/r/issues"),
+        (["gh", "api", "-X", "GET", "search/issues", "-f", "q=x"], "GET", "search/issues"),
+        (["gh", "api", "-XPATCH", "repos/o/r/pulls/5"], "PATCH", "repos/o/r/pulls/5"),
+        (["gh", "api", "-X=delete", "repos/o/r/git/refs/x"], "DELETE", "repos/o/r/git/refs/x"),
+        (["gh", "-X", "PUT", "api", "repos/o/r/pulls/5/merge"], "PUT", "repos/o/r/pulls/5/merge"),
+        (["gh", "api", "-i", "-X", "PATCH", "repos/o/r/pulls/5"], "PATCH", "repos/o/r/pulls/5"),
+        (["gh", "api", "-X", "GET", "-X", "POST", "x"], "POST", "x"),
+        (["gh", "api", "--jq", "-X", "repos/o/r"], "GET", "repos/o/r"),
+    ],
+)
+def test_gh_api_request_reads_the_effective_method(argv, method, endpoint) -> None:
+    """gh's own defaulting (gh api --help, gh 2.101.0): GET, or POST once a
+    parameter or --input is given; an explicit -X/--method wins, the last one
+    kept; a flag's VALUE (`--jq -X`) is never read as the flag."""
+    req = sp.gh_api_request(argv)
+    assert req is not None
+    assert (req.method, req.endpoint) == (method, endpoint)
+
+
+def test_gh_api_request_is_none_off_the_api_group() -> None:
+    assert sp.gh_api_request(["gh", "workflow", "run", "api"]) is None
+    assert sp.gh_api_request(["gh", "pr", "view", "5"]) is None
+    assert sp.gh_api_request(["git", "push"]) is None

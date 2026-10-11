@@ -3478,7 +3478,10 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   of each. `push_publish` silences only the first push of the CURRENT branch, and only when the
   whole command is exactly one plain `git push` (e.g. `git push -u origin
   HEAD`) — a chained command still asks, so run the first push as its own
-  command. The remote git really pushes to must resolve (rewrites applied) to
+  command. Two spellings also qualify: `git -C <path> push …` when `<path>` is
+  the literal, symlink-free top of a worktree of the SAME repository as the
+  session's cwd, and a trailing `2>&1` and/or `| tail -N` / `| head -N`. The
+  remote git really pushes to must resolve (rewrites applied) to
   exactly `https://github.com/<public repo>` — ssh/scp forms always ask — with
   simple push config, no `http.*` config, no proxy/TLS/ssh/config env var in
   the hook's environment, and a live probe confirming the branch is absent
@@ -3488,6 +3491,18 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   without a TTY aborts rather than pushing. Force pushes, other destinations,
   close-then-push, the no-open-PR block, round-cap asks and the dispatched deny
   are untouched, and any doubt about the destination keeps the prompt.
+- **Only the main session publishes.** Every GitHub write from an Agent-tool
+  worker (the hook input carries `agent_id`) is refused by the push guard,
+  whatever `push_publish` says (owner policy 2026-10-05): `git push` and its
+  plumbing, `gh pr create`/`comment`/`review`/`edit`/`ready`/`merge`/`close`,
+  `@codex review` requests, issue and release writes, any other gh write verb,
+  and `gh api` with a writing method or a GraphQL mutation. Re-pushes of an
+  already-published PR branch, dry runs and in-thread finding replies are
+  included. Reads (`gh pr view`, `gh api` GETs, `gh search`) are not. Commit
+  locally, then hand the worktree path, branch, head SHA, the PR title and body,
+  and any comment or reply you would have posted back to the main session. A
+  subagent dispatched to fix a PR therefore leaves the push and the replies to
+  the session that dispatched it.
 - **Ack sigils bind per-guard, and mostly to the LAST pipeline segment.**
   `git commit ... | tail  # audit-ack` puts the ack on `tail`. Run the commit
   bare. Some guards accept a sigil on any segment, others only on the offending
