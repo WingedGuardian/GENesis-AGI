@@ -641,6 +641,32 @@ def test_ephemeral_edit_is_backed_up_before_and_after_the_stop(station, stop_wri
         )
 
 
+def test_an_edit_made_during_the_stop_is_backed_up_and_reset(station):
+    root = station["root"]
+    tip = _advance_upstream(
+        station,
+        "stats and code",
+        {"AGENTS.md": "new stats\n", "src/genesis/_upstream.py": "value = 2\n"},
+    )
+    env = dict(
+        station["env"],
+        ON_STOP=f'printf "written during stop\\n" > "{root}/AGENTS.md"',
+    )
+
+    r = _run(station, env=env)
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (root / "AGENTS.md").read_text() == "new stats\n"
+    assert _git(root, "rev-parse", "HEAD") == tip
+    backup_root = _premerge_backup_root(station)
+    assert (backup_root / "late" / "AGENTS.md" / "current").read_text() == "written during stop\n"
+    assert not (backup_root / "AGENTS.md").exists()
+    assert r.stdout.index("Stopping genesis-server") < r.stdout.index(
+        "Backed up local edits made during the stop to AGENTS.md"
+    )
+    assert not _alerts(station)
+
+
 @pytest.mark.parametrize("case", ["backup-failure", "flagged-edit"])
 def test_pre_stop_backup_and_hidden_edit_failures_refuse_without_alert(station, case):
     root = station["root"]
@@ -668,6 +694,8 @@ def test_pre_stop_backup_and_hidden_edit_failures_refuse_without_alert(station, 
         assert "server NOT stopped" in r.stderr
     else:
         assert (root / "AGENTS.md").read_text() == original
+        assert "git update-index --no-assume-unchanged" in r.stderr
+        assert "scripts/update.sh" not in r.stderr
     assert (
         not station["calls"].exists() or "stop genesis-server" not in station["calls"].read_text()
     )
@@ -713,7 +741,7 @@ def test_a_refused_merge_names_the_excused_files_it_reset(station, staged):
     assert not _alerts(station)
 
 
-def test_a_failed_reset_is_not_reported_and_the_server_is_started_again(station):
+def test_a_failed_reset_alerts_and_is_not_reported(station):
     import shutil
 
     root = station["root"]
@@ -743,16 +771,21 @@ def test_a_failed_reset_is_not_reported_and_the_server_is_started_again(station)
     r = _run(station)
 
     assert r.returncode == 1, (r.stdout, r.stderr)
-    assert "WARNING: could not reset AGENTS.md" in r.stderr
-    assert "git refused the fast-forward" in r.stderr and "nothing merged" in r.stderr
-    assert "Local edits saved under" not in r.stderr
+    assert "could not reset AGENTS.md" in r.stderr
     assert _git(root, "rev-parse", "HEAD") == head
     assert (root / "AGENTS.md").read_text() == "install-local stats\n"
+    backup_root = _premerge_backup_root(station)
+    assert (backup_root / "AGENTS.md" / "current").read_text() == "install-local stats\n"
     calls = station["calls"].read_text()
     assert "stop genesis-server" in calls
-    assert "start genesis-server" in calls
+    assert calls.index("start genesis-server") > calls.index("stop genesis-server")
     assert "restart genesis-server" not in calls
-    assert not _alerts(station)
+    alerts = _alerts(station)
+    assert len(alerts) == 1, alerts
+    body = alerts[0].read_text()
+    assert "phase 'merging'" in body
+    assert "started again on that tree" in body
+    assert "Local edits saved under" not in body
 
 
 def test_a_locally_deleted_excused_file_does_not_block_the_merge(station):
