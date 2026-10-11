@@ -37,18 +37,18 @@ def _shipped_inventory() -> set[str]:
         host
         for url in provider_urls.values()
         if isinstance(url, str)
-        if (host := urlsplit(url).hostname)
+        if (host := _inventory_host(url))
     }
-    # Parsed as YAML, as the runtime reads them (routing/config.py, cc/roster.py),
-    # so a quoted URL counts and a commented example does not.
+    # Routing YAML expands placeholders before parsing, as the runtime does;
+    # roster YAML stays raw because its runtime parser does not expand it.
     for rel, key in (
         ("config/model_routing.yaml", "base_url"),
         ("config/cc_roster.yaml", "anthropic_base_url"),
     ):
-        data = yaml.safe_load((_REPO_ROOT / rel).read_text(encoding="utf-8"))
-        inventory.update(
-            host for url in _yaml_values(data, key) if (host := urlsplit(url).hostname)
-        )
+        text = (_REPO_ROOT / rel).read_text(encoding="utf-8")
+        is_routing = rel == "config/model_routing.yaml"
+        data = yaml.safe_load(_shipped_defaults(text) if is_routing else text)
+        inventory.update(host for url in _yaml_values(data, key) if (host := _inventory_host(url)))
     return inventory
 
 
@@ -373,3 +373,52 @@ def test_provider_hosts_are_reconciled_with_inventories_and_call_sites():
             for content in source_config_texts
         )
         assert found, f"call-site-only host not found in src/ or config/: {host}"
+
+
+# Local runtimes have no credential and no spend.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _shipped_defaults(text: str) -> str:
+    from genesis.routing.config import _ENV_PATTERN
+
+    return _ENV_PATTERN.sub(lambda match: match.group(2) or "", text)
+
+
+def _inventory_host(url: str) -> str | None:
+    host = urlsplit(url).hostname
+    return host if host not in _LOOPBACK_HOSTS else None
+
+
+def test_routing_placeholders_inventory_their_default_host(monkeypatch):
+    text = "p:\n  base_url: ${X_URL:-https://api.example.com/v1}\nq:\n  base_url: ${Y_URL}\n"
+
+    def hosts():
+        data = yaml.safe_load(_shipped_defaults(text))
+        return [host for url in _yaml_values(data, "base_url") if (host := urlsplit(url).hostname)]
+
+    assert hosts() == ["api.example.com"]
+    monkeypatch.setenv("X_URL", "https://env.example.org")
+    assert hosts() == ["api.example.com"]
+
+
+def test_lines_without_a_class_hit_skip_span_counting(tmp_path, monkeypatch):
+    provider_host = "api." + "openai.com"
+    path = tmp_path / "many.py"
+    path.write_text(
+        "benign line\n" * 500 + f"curl https://{provider_host}/v1/responses\n",
+        encoding="utf-8",
+    )
+    original = check._merged_spans
+    calls = 0
+
+    def counted(line, patterns):
+        nonlocal calls
+        calls += 1
+        return original(line, patterns)
+
+    monkeypatch.setattr(check, "_merged_spans", counted)
+    violations = check.scan(tmp_path, baseline={}, classes=("provider",))
+
+    assert [violation.kind for violation in violations] == ["unlisted"]
+    assert calls == 1

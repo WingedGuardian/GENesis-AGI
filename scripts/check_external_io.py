@@ -133,9 +133,22 @@ BASELINE: dict[tuple[str, str], tuple[int, str]] = {
     ("tests/test_scripts/test_check_external_io.py", "egress"): (10, "guard egress fixtures"),
     ("tests/test_scripts/test_check_external_io.py", "provider"): (18, "guard provider fixtures"),
 }
+
+
+def _combined(patterns: list[re.Pattern[str]]) -> re.Pattern[str]:
+    alternatives = [
+        f"(?i:{pattern.pattern})" if pattern.flags & re.IGNORECASE else f"(?:{pattern.pattern})"
+        for pattern in patterns
+    ]
+    return re.compile("|".join(alternatives))
+
+
 CLASSES: dict[str, list[re.Pattern[str]]] = {
     "egress": PATTERNS,
     "provider": PROVIDER_PATTERNS,
+}
+COMBINED: dict[str, re.Pattern[str]] = {
+    cls: _combined(patterns) for cls, patterns in CLASSES.items()
 }
 
 
@@ -191,13 +204,18 @@ def scan(
         try:
             # errors="replace": one non-UTF-8 byte (a Latin-1 comment) must not
             # hide the ASCII endpoints elsewhere in the file.
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            text = path.read_text(encoding="utf-8", errors="replace")
+            lines = text.splitlines()
         except OSError:
             continue
         relpath = path.relative_to(root).as_posix()
         for cls in selected:
+            if not COMBINED[cls].search(text):
+                continue
             patterns = CLASSES[cls]
             for lineno, line in enumerate(lines, start=1):
+                if not COMBINED[cls].search(line):
+                    continue
                 for _start, _end in _merged_spans(line, patterns):
                     matches.setdefault((relpath, cls), []).append((lineno, line.strip()))
 
