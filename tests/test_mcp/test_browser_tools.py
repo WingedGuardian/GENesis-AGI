@@ -3471,6 +3471,18 @@ class TestBrowserScreenshotUniquePath:
 # Per-layer lifecycle (#2874)
 # ---------------------------------------------------------------------------
 
+def _camoufox_stub(cm):
+    """sys.modules stubs for camoufox whose AsyncCamoufox returns ``cm``. Not a
+    dotted patch("camoufox..."), which imports the real package (absent in CI)."""
+    api = MagicMock(AsyncCamoufox=MagicMock(return_value=cm))
+    return patch.dict(sys.modules, {"camoufox": MagicMock(async_api=api), "camoufox.async_api": api})
+
+
+def _playwright_stub(api):
+    """sys.modules stubs for playwright (parent and async_api), as _camoufox_stub."""
+    return patch.dict(sys.modules, {"playwright": MagicMock(async_api=api), "playwright.async_api": api})
+
+
 def _alive_page(url="https://example.com"):
     page = MagicMock()
     page.url = url
@@ -3539,7 +3551,6 @@ def _tinyfish_delete():
 class TestStaleRecoveryCleansOnlyItsOwnLayer:
     @pytest.mark.asyncio
     async def test_camoufox_restart_keeps_remote_cdp_and_tinyfish(self):
-        pytest.importorskip("camoufox", reason="camoufox not installed")
         remote_br, remote_pw, remote_page = _open_remote()
         tf_br, _, _ = _open_tinyfish()
         dead = MagicMock()
@@ -3556,7 +3567,7 @@ class TestStaleRecoveryCleansOnlyItsOwnLayer:
         new_cm = MagicMock()
         new_cm.__aenter__ = AsyncMock(return_value=new_ctx)
         with (
-            patch("camoufox.async_api.AsyncCamoufox", return_value=new_cm),
+            _camoufox_stub(new_cm),
             _tinyfish_delete() as delete,
         ):
             result = await browser._ensure_browser()
@@ -3573,7 +3584,6 @@ class TestStaleRecoveryCleansOnlyItsOwnLayer:
 
     @pytest.mark.asyncio
     async def test_chromium_restart_keeps_camoufox_and_remote_cdp(self):
-        pytest.importorskip("playwright", reason="playwright not installed")
         cm, cam_page = _open_camoufox()
         remote_br, _, _ = _open_remote()
         dead = MagicMock()
@@ -3594,7 +3604,7 @@ class TestStaleRecoveryCleansOnlyItsOwnLayer:
         starter = MagicMock()
         starter.start = AsyncMock(return_value=new_pw)
         fake = MagicMock(async_playwright=MagicMock(return_value=starter))
-        with patch.dict("sys.modules", {"playwright.async_api": fake}):
+        with _playwright_stub(fake):
             result = await browser._ensure_chromium_fallback()
 
         assert result is new_page
@@ -3735,12 +3745,11 @@ class TestAsyncCleanupStillCleansEverything:
 class TestFailedLaunchLeavesNoHalfState:
     @pytest.mark.asyncio
     async def test_a_failed_camoufox_launch_leaves_no_half_state(self):
-        pytest.importorskip("camoufox", reason="camoufox not installed")
         cm = MagicMock()
         cm.__aenter__ = AsyncMock(side_effect=RuntimeError("launch failed"))
         cm.__aexit__ = AsyncMock(return_value=None)
         with (
-            patch("camoufox.async_api.AsyncCamoufox", return_value=cm),
+            _camoufox_stub(cm),
             pytest.raises(RuntimeError),
         ):
             await browser._ensure_browser()
@@ -3750,7 +3759,6 @@ class TestFailedLaunchLeavesNoHalfState:
 
     @pytest.mark.asyncio
     async def test_a_failed_chromium_launch_stops_its_driver(self):
-        pytest.importorskip("playwright", reason="playwright not installed")
         pw = MagicMock()
         pw.stop = AsyncMock()
         pw.chromium.launch_persistent_context = AsyncMock(side_effect=RuntimeError("no chrome"))
@@ -3758,7 +3766,7 @@ class TestFailedLaunchLeavesNoHalfState:
         starter.start = AsyncMock(return_value=pw)
         fake = MagicMock(async_playwright=MagicMock(return_value=starter))
         with (
-            patch.dict("sys.modules", {"playwright.async_api": fake}),
+            _playwright_stub(fake),
             pytest.raises(RuntimeError),
         ):
             await browser._ensure_chromium_fallback()
@@ -3769,7 +3777,6 @@ class TestFailedLaunchLeavesNoHalfState:
 class TestClosedWindowStopsTheDriver:
     @pytest.mark.asyncio
     async def test_camoufox_context_close_runs_its_cleanup(self):
-        pytest.importorskip("camoufox", reason="camoufox not installed")
         handlers = {}
         ctx = MagicMock()
         ctx.pages = [_alive_page()]
@@ -3777,7 +3784,7 @@ class TestClosedWindowStopsTheDriver:
         cm = MagicMock()
         cm.__aenter__ = AsyncMock(return_value=ctx)
         cm.__aexit__ = AsyncMock(return_value=None)
-        with patch("camoufox.async_api.AsyncCamoufox", return_value=cm):
+        with _camoufox_stub(cm):
             await browser._ensure_browser()
         assert "close" in handlers
         handlers["close"](ctx)
@@ -3964,7 +3971,6 @@ class TestFailedNavigateStillStartsTheWatcher:
 class TestChromiumWindowClose:
     @pytest.mark.asyncio
     async def test_chromium_context_close_runs_its_cleanup(self):
-        pytest.importorskip("playwright", reason="playwright not installed")
         handlers = {}
         ctx = MagicMock()
         ctx.pages = [_alive_page()]
@@ -3976,7 +3982,7 @@ class TestChromiumWindowClose:
         starter = MagicMock()
         starter.start = AsyncMock(return_value=pw)
         fake = MagicMock(async_playwright=MagicMock(return_value=starter))
-        with patch.dict("sys.modules", {"playwright.async_api": fake}):
+        with _playwright_stub(fake):
             await browser._ensure_chromium_fallback()
         assert "close" in handlers
         handlers["close"](ctx)
@@ -4513,7 +4519,6 @@ class TestACancelledReclaimStillFinishesItsClose:
 
     @pytest.mark.asyncio
     async def test_a_failed_launch_cancelled_again_still_stops_its_driver(self):
-        pytest.importorskip("playwright", reason="playwright not installed")
         gate, entered, stopped = asyncio.Event(), asyncio.Event(), []
         pw = MagicMock()
         pw.stop = AsyncMock(side_effect=_gated(stopped, gate, entered))
@@ -4521,7 +4526,7 @@ class TestACancelledReclaimStillFinishesItsClose:
         starter = MagicMock()
         starter.start = AsyncMock(return_value=pw)
         fake = MagicMock(async_playwright=MagicMock(return_value=starter))
-        with patch.dict("sys.modules", {"playwright.async_api": fake}):
+        with _playwright_stub(fake):
             launch = asyncio.ensure_future(browser._ensure_chromium_fallback())
             await asyncio.wait_for(entered.wait(), timeout=2)
             launch.cancel()  # the tool timeout lands while the driver is stopping
@@ -4900,3 +4905,201 @@ class TestClickFollowRoundTwoFixes:
         session.send = AsyncMock(side_effect=close_while_asked)
         await _connect(_mock_remote_browser(pages=[_cdp_page("https://a.example", "GEN-1"), reused]))
         assert browser._remote_page is None
+
+
+class TestClickFollowRoundThreeFixes:
+    """Round-3 review of PR #2948."""
+
+    @pytest.mark.asyncio
+    async def test_navigate_reports_its_own_layer_when_another_becomes_active(self):
+        """Codex 4199847779: an overlapping navigate made Camoufox active while
+        this remote navigate's goto ran, and the result said "camoufox"."""
+        page = _nav_page()
+        other = _nav_page("https://other.example")
+        browser._remote_page = page
+
+        async def goto(*_a, **_k):
+            browser._stealth_cm = MagicMock()
+            browser._stealth_page = other
+            browser._active_page = other
+
+        page.goto = AsyncMock(side_effect=goto)
+        with patch.object(browser, "_ensure_remote_cdp", new_callable=AsyncMock, return_value=page):
+            result = await browser._impl_browser_navigate("https://example.com", remote=True)
+        assert browser._active_page is other  # precondition: the other layer is active
+        assert result["layer"] == "remote_cdp"
+
+    def _fill_page(self):
+        original = _EventPage("https://a.example")
+        browser._page = original
+        browser._active_page = original
+        return original
+
+    @pytest.mark.asyncio
+    async def test_a_tab_a_fill_opens_is_not_claimed_by_a_concurrent_click(self):
+        """Codex 4199847789: fill's focus click can open a window; a click
+        listening meanwhile claimed it as its own new tab."""
+        original = self._fill_page()
+        popup = _EventPage("https://f.example")
+        clicked = asyncio.Event()
+
+        async def human_type(page, selector, value):
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(clicked.wait(), timeout=0.2)
+            page.emit("popup", popup)  # the focus click opened a window
+
+        async def click(page, selector, timeout=10000):
+            clicked.set()  # this click opens nothing
+
+        with (
+            patch.object(browser, "_human_type", new=human_type),
+            patch.object(browser, "_stealth_click", new=click),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=AsyncMock()),
+            patch.object(browser, "_NEW_TAB_WAIT_S", 0.3),
+        ):
+            filled, result = await asyncio.gather(
+                browser._impl_browser_fill("#f", "x"), browser._impl_browser_click("#b")
+            )
+        assert filled["filled"] == "#f"
+        assert "new_page" not in result
+        assert browser._active_page is original
+
+    @pytest.mark.asyncio
+    async def test_a_click_during_a_long_fill_returns_busy_having_sent_nothing(self):
+        original = self._fill_page()
+        typing, release = asyncio.Event(), asyncio.Event()
+
+        async def human_type(page, selector, value):
+            typing.set()
+            await release.wait()
+
+        click = AsyncMock()
+
+        async def click_then_release():
+            await typing.wait()
+            out = await browser._impl_browser_click("#b")
+            release.set()
+            return out
+
+        with (
+            patch.object(browser, "_human_type", new=human_type),
+            patch.object(browser, "_stealth_click", new=click),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch.object(browser, "_PAGE_ACTION_WAIT_S", 0.05),
+        ):
+            filled, result = await asyncio.gather(
+                browser._impl_browser_fill("#f", "x"), click_then_release()
+            )
+        assert "nothing was sent" in result["error"]
+        click.assert_not_awaited()
+        assert filled["filled"] == "#f"
+        assert browser._active_page is original
+
+    @pytest.mark.asyncio
+    async def test_a_click_during_an_upload_returns_busy_having_sent_nothing(self, tmp_path):
+        original = self._fill_page()
+        uploading, release = asyncio.Event(), asyncio.Event()
+
+        async def set_input_files(*_a, **_k):
+            uploading.set()
+            await release.wait()
+
+        original.set_input_files = set_input_files
+        upload_file = tmp_path / "cv.pdf"
+        upload_file.write_bytes(b"%PDF")
+        click = AsyncMock()
+
+        async def click_then_release():
+            await uploading.wait()
+            out = await browser._impl_browser_click("#b")
+            release.set()
+            return out
+
+        with (
+            patch.object(browser, "_stealth_click", new=click),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch.object(browser, "_PAGE_ACTION_WAIT_S", 0.05),
+        ):
+            uploaded, result = await asyncio.gather(
+                browser._impl_browser_upload("#cv", str(upload_file)), click_then_release()
+            )
+        assert "nothing was sent" in result["error"]
+        click.assert_not_awaited()
+        assert uploaded["uploaded"] == "cv.pdf"
+
+    @pytest.mark.asyncio
+    async def test_a_tool_queued_behind_a_click_that_followed_a_tab_sends_nothing(self):
+        """Fresh review SF-2: a key press that waited for a click's lock, while
+        the click followed a popup, pressed into the tab the tools had left."""
+        original = _EventPage("https://a.example")
+        popup = _EventPage("https://b.example")
+        original.keyboard = MagicMock()
+        original.keyboard.press = AsyncMock()
+        browser._page = original
+        browser._active_page = original
+        clicking = asyncio.Event()
+
+        async def click(page, selector, timeout=10000):
+            clicking.set()
+            page.emit("popup", popup)
+            # A real yield, so the press reads the active page (still the
+            # original) and queues on its lock before the click follows.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.Event().wait(), timeout=0.05)
+
+        async def press_after_the_click_started():
+            await clicking.wait()
+            return await browser._impl_browser_press_key("Enter")
+
+        with (
+            patch.object(browser, "_stealth_click", new=click),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=AsyncMock()),
+            patch.object(browser, "_NEW_TAB_WAIT_S", 0.3),
+        ):
+            clicked, pressed = await asyncio.gather(
+                browser._impl_browser_click("#a"), press_after_the_click_started()
+            )
+        assert clicked["new_page"]["url"] == "https://b.example"  # precondition: followed
+        assert "nothing was sent" in pressed["error"]
+        original.keyboard.press.assert_not_awaited()
+
+
+# Every _impl_browser_* acts on the page under _page_action unless named here,
+# with the reason it may run beside another action on the same page.
+_PAGE_ACTION_EXEMPT = {
+    "_impl_browser_navigate": "replaces the document, and is the recovery after a stalled "
+    "action, so it must not wait on that action's lock",
+    "_impl_browser_screenshot": "read-only: sends no input, so it cannot open a tab",
+    "_impl_browser_snapshot": "read-only: sends no input, so it cannot open a tab",
+    "_impl_browser_sessions": "reads the profile's cookie database; touches no page",
+    "_impl_browser_clear_domain": "edits the profile's cookie database; touches no page",
+}
+
+
+def test_every_page_action_takes_the_page_lock_or_is_named_exempt():
+    """Codex 4199847789 class: the lock was added tool by tool, and fill and
+    upload were missed. A new tool must take it or be exempted with a reason."""
+    import ast
+
+    tree = ast.parse(Path(browser.__file__).read_text(encoding="utf-8"))
+    tools = {
+        n.name: n
+        for n in tree.body
+        if isinstance(n, ast.AsyncFunctionDef) and n.name.startswith("_impl_browser_")
+    }
+    assert len(tools) >= 10, f"the walk found only {sorted(tools)}"
+
+    def takes_lock(fn):
+        return any(
+            isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id == "_page_action"
+            for c in ast.walk(fn)
+        )
+
+    unlocked = {name for name, fn in tools.items() if not takes_lock(fn)}
+    assert unlocked == set(_PAGE_ACTION_EXEMPT), (
+        f"take _page_action or add a reasoned exemption: {sorted(unlocked - set(_PAGE_ACTION_EXEMPT))}; "
+        f"stale exemptions: {sorted(set(_PAGE_ACTION_EXEMPT) - unlocked)}"
+    )
+    assert all(reason.strip() for reason in _PAGE_ACTION_EXEMPT.values())

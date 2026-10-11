@@ -1390,11 +1390,6 @@ def _requested_layer(stealth: bool, remote: bool, tinyfish: bool) -> BrowserLaye
 _SNAPSHOT_PLACEHOLDERS = ("(snapshot timed out", "(snapshot unavailable")
 
 
-# Prefixes of the text _snapshot_page returns when there is no snapshot. An
-# aria snapshot is YAML ("- heading ..."), so it never starts with "(".
-_SNAPSHOT_PLACEHOLDERS = ("(snapshot timed out", "(snapshot unavailable")
-
-
 async def _snapshot_page(page) -> str:
     """Get accessibility tree snapshot of the current page."""
     try:
@@ -3094,8 +3089,11 @@ async def _impl_browser_navigate(
         return {"error": "Cannot use tinyfish and remote simultaneously — pick one."}
     # The layer this call uses, not the one it leaves: an abandoned layer's
     # idle clock keeps running. After the check above, so a rejected call
-    # keeps no layer (a paid TinyFish session above all) alive.
-    _touch(_requested_layer(stealth, remote, tinyfish))
+    # keeps no layer (a paid TinyFish session above all) alive. It is also the
+    # layer the result reports: the global active page can move to another
+    # layer while this call's goto runs (an overlapping navigate).
+    layer = _requested_layer(stealth, remote, tinyfish)
+    _touch(layer)
 
     # No timing switch for remote CDP: _human_delay already uses collaborate
     # timing (0.5-2 s) whenever the remote page is active, whatever
@@ -3136,23 +3134,11 @@ async def _impl_browser_navigate(
             _remote_last_url = page.url
 
         snapshot = await _snapshot_page(page)
-
-        def _layer_name():
-            from genesis.browser.types import BrowserLayer
-
-            if tinyfish:
-                return BrowserLayer.TINYFISH.value
-            if _is_remote_active():
-                return BrowserLayer.REMOTE_CDP.value
-            if _is_camoufox_active():
-                return BrowserLayer.CAMOUFOX.value
-            return BrowserLayer.CHROMIUM.value
-
         result = {
             "url": page.url,
             "title": await page.title(),
             "snapshot": snapshot,
-            "layer": _layer_name(),
+            "layer": layer.value,
         }
         if turnstile_result:
             result["turnstile"] = turnstile_result
@@ -3274,9 +3260,11 @@ def _set_layer_page(layer: BrowserLayer, page) -> None:
         _tinyfish_page = page
 
 
-# One action at a time per page for the tools that can open a tab (click, key
-# press, run_js): a click's tab watch, held from its click to its follow, must
-# not see a tab another action opened. A tab the page opens on its own in that
+# One action at a time per page for every tool that acts on the page (click,
+# fill, upload, key press, run_js; fill's focus click can open a tab too): a
+# click's tab watch, held from its click to its follow, must not see a tab
+# another action opened. The tools exempt from it, each with its reason, are
+# _PAGE_ACTION_EXEMPT in tests/test_mcp/test_browser_tools.py. A tab the page opens on its own in that
 # window still can be (the comment above _opened_by), and so can one from a
 # browser_navigate of the same page, which does not take this lock.
 _page_action_locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
@@ -3287,25 +3275,32 @@ _page_action_locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 # whose expiry would reset the active page under the action holding the lock.
 _PAGE_ACTION_WAIT_S: float = 10.0
 _PAGE_BUSY = {
-    "error": "Another click, key press or script is still running on this page; "
-    "nothing was sent. Retry once it returns."
+    "error": "Another click, fill, upload, key press or script is still running "
+    "on this page; nothing was sent. Retry once it returns."
+}
+_PAGE_MOVED = {
+    "error": "The tools are no longer on the page this call was for (a click followed "
+    "a new tab, a navigate, or a reset); nothing was sent. Call browser_snapshot first."
 }
 
 
 @contextlib.asynccontextmanager
 async def _page_action(page):
-    """Hold ``page``'s action lock; yields False, holding nothing, if the page
-    stayed busy for _PAGE_ACTION_WAIT_S."""
+    """Yield None, holding ``page``'s action lock, or the error result when
+    the caller must not act: the page stayed busy for _PAGE_ACTION_WAIT_S
+    (nothing held), or the tools are no longer on it (a click ahead followed a
+    new tab, a navigate, a reset), so acting would hit a page they no longer
+    drive."""
     lock = _page_action_locks.get(page)
     if lock is None:
         lock = _page_action_locks[page] = asyncio.Lock()
     try:
         await asyncio.wait_for(lock.acquire(), timeout=_PAGE_ACTION_WAIT_S)
     except TimeoutError:
-        yield False
+        yield dict(_PAGE_BUSY)
         return
     try:
-        yield True
+        yield None if page is _active_page else dict(_PAGE_MOVED)
     finally:
         lock.release()
 
@@ -3455,8 +3450,8 @@ async def _impl_browser_click(selector: str) -> dict:
         page = _active_page
     # Its tab watch must see only what this click opens, so no other click,
     # key press or script runs on this page meanwhile (_page_action).
-    async with _page_action(page) as free:
-        return await _click_and_follow(page, selector) if free else dict(_PAGE_BUSY)
+    async with _page_action(page) as refused:
+        return refused or await _click_and_follow(page, selector)
 
 
 async def _click_and_follow(page, selector: str) -> dict:
@@ -3585,7 +3580,6 @@ def _click_failed(selector: str, e: Exception, sent: bool = False) -> dict:
 
 async def _impl_browser_fill(selector: str, value: str) -> dict:
     """Fill a form field on the current page."""
-    global _active_page
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -3601,6 +3595,15 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
                 "recommendation": "Call browser_snapshot() to see current page state before acting.",
             }
         page = _active_page
+    # _human_type's focus click can open a tab, which a concurrent click's tab
+    # watch would otherwise claim as its own (_page_action).
+    async with _page_action(page) as refused:
+        return refused or await _fill(page, selector, value)
+
+
+async def _fill(page, selector: str, value: str) -> dict:
+    """The typing of _impl_browser_fill, under its page's action lock."""
+    global _active_page
     try:
         await _human_delay()
         await _human_type(page, selector, value)
@@ -3656,12 +3659,15 @@ async def _impl_browser_upload(selector: str, file_path: str) -> dict:
     p = Path(file_path)
     if not p.is_file():
         return {"error": f"File not found or not a regular file: {file_path}"}
-    try:
-        await _human_delay()
-        await page.set_input_files(selector, str(p), timeout=10000)
-        return {"uploaded": p.name, "selector": selector, "url": page.url}
-    except Exception as e:
-        return {"error": f"Upload failed on '{selector}': {e}"}
+    async with _page_action(page) as refused:
+        if refused:
+            return refused
+        try:
+            await _human_delay()
+            await page.set_input_files(selector, str(p), timeout=10000)
+            return {"uploaded": p.name, "selector": selector, "url": page.url}
+        except Exception as e:
+            return {"error": f"Upload failed on '{selector}': {e}"}
 
 
 async def _impl_browser_screenshot() -> dict:
@@ -3747,9 +3753,9 @@ async def _impl_browser_run_js(expression: str) -> dict:
         if health:
             return health
         page = _active_page
-    async with _page_action(page) as free:  # a script may open a tab
-        if not free:
-            return dict(_PAGE_BUSY)
+    async with _page_action(page) as refused:  # a script may open a tab
+        if refused:
+            return refused
         try:
             logger.info("browser_run_js: %s", expression[:200])
             result = await page.evaluate(expression)
@@ -3806,9 +3812,9 @@ async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
             return health
         page = _active_page
     count = max(1, min(count, 50))
-    async with _page_action(page) as free:  # Enter on a link may open a tab
-        if not free:
-            return dict(_PAGE_BUSY)
+    async with _page_action(page) as refused:  # Enter on a link may open a tab
+        if refused:
+            return refused
         try:
             for i in range(count):
                 if i > 0:
@@ -3859,10 +3865,6 @@ async def browser_navigate(
     Fresh isolated Chromium on each session. Paid: 1 credit per 4 minutes.
     Use when local browsers fail anti-bot or you need a clean isolated session.
 
-    Each layer is closed after 1 hour without a tool call on it; switching
-    layers leaves the previous one open until then (a TinyFish session keeps
-    billing until it idles out).
-
     cdp_url: Override the CDP endpoint. Default: GENESIS_CDP_URL env var.
     Example: browser_navigate("https://jobs.ashbyhq.com/...", remote=True)
 
@@ -3910,15 +3912,12 @@ async def browser_click(selector: str) -> dict:
     and script fallbacks are not hit-tested, so verify what they did.
     For manual keyboard navigation, use browser_press_key with Tab/Space.
 
-    New tab or popup: if the click opens one (target=_blank, window.open),
-    the tools switch to it. The result's url and snapshot are the new tab's,
-    and "new_page" gives its url and title. The original tab stays open; if
-    the new tab later closes itself (a sign-in popup), the tools go back to
-    the original. The tab must start loading within 10 s for a link or form
-    that declares a new tab, 1 s otherwise, or it is not followed. If one
-    click opens several, the first still open is followed and
-    "new_page.also_opened" lists the others. A click that was sent and then
-    failed, but had already opened a tab, follows it; "warning" holds the error.
+    New tab or popup (target=_blank, window.open): the tools switch to it;
+    url and snapshot are its own, "new_page" names it, and the original stays
+    open. If it closes itself, the tools go back. It must open within 10 s
+    (a declared target) or 1 s, or it is not followed. Several: the first
+    still open is followed, "new_page.also_opened" lists the rest. A
+    "warning" holds an error raised after the click had opened its tab.
 
     Returns the updated page snapshot after clicking. "clicked" means the
     click was sent; confirm the page changed. An error that says the click
