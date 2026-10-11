@@ -608,7 +608,9 @@ def test_an_excused_file_changed_upstream_does_not_block_the_merge(station):
     assert (station["root"] / "AGENTS.md").read_text() == "new stats\n"
 
 
-@pytest.mark.parametrize("stop_writer", [False, True], ids=["pre-stop-backup", "stop-writer-backup"])
+@pytest.mark.parametrize(
+    "stop_writer", [False, True], ids=["pre-stop-backup", "stop-writer-backup"]
+)
 def test_ephemeral_edit_is_backed_up_before_and_after_the_stop(station, stop_writer):
     root = station["root"]
     (root / "AGENTS.md").write_text("install-local stats\n")
@@ -642,7 +644,9 @@ def test_ephemeral_edit_is_backed_up_before_and_after_the_stop(station, stop_wri
 @pytest.mark.parametrize("case", ["backup-failure", "flagged-edit"])
 def test_pre_stop_backup_and_hidden_edit_failures_refuse_without_alert(station, case):
     root = station["root"]
-    original = "install-local stats\n" if case == "backup-failure" else "hidden install-local stats\n"
+    original = (
+        "install-local stats\n" if case == "backup-failure" else "hidden install-local stats\n"
+    )
     (root / "AGENTS.md").write_text(original)
     if case == "flagged-edit":
         _git(root, "update-index", "--assume-unchanged", "AGENTS.md")
@@ -664,7 +668,9 @@ def test_pre_stop_backup_and_hidden_edit_failures_refuse_without_alert(station, 
         assert "server NOT stopped" in r.stderr
     else:
         assert (root / "AGENTS.md").read_text() == original
-    assert not station["calls"].exists() or "stop genesis-server" not in station["calls"].read_text()
+    assert (
+        not station["calls"].exists() or "stop genesis-server" not in station["calls"].read_text()
+    )
     assert not _restarted(station)
     assert not _alerts(station)
 
