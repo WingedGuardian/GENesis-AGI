@@ -9,7 +9,9 @@ retires nothing, a premise-wrong PR gets `needs-architecture-session` and stays
 OPEN, and retiring belongs to the session taking up the revival. A superseded PR
 gets a comment naming its successor; since 2026-10-04 the closing session may
 retire it when the owner authorized the supersession, the successor is open or
-merged, and a per-file check shows it superseded in every part.
+merged, and a per-file check shows it superseded in every part. Since 2026-10-06
+a rework's builder may too, under the same conditions (Devin excepted: the
+closing session retires a Devin rework's old PR).
 
 **Nothing enforces or surfaces it.** MEASURED against `origin/main`: no hook
 mentions PR closure at all except one line in the push guard, and that one is a
@@ -308,13 +310,16 @@ def _closes_a_pr(argv: list[str]) -> str | None:
 #: Both notes read this one constant, so they cannot drift apart.
 _SUPERSEDED_EXCEPTION = (
     "A superseded PR gets a comment naming its successor and stays open, with "
-    "one exception that only the CLOSING session may use (not a build or "
-    "reviewer session): it may retire the PR when the owner's authorization of "
-    "the supersession is on record, the successor PR is open or merged, and every "
-    "file of the old PR was checked against the successor and current main and "
-    "found covered (naming the file:line that now does it) or moot (saying why). "
-    "That per-file mapping goes in the closing comment; one part neither covered "
-    "nor moot keeps the PR open."
+    "one exception that only two sessions may use: the CLOSING session, or the "
+    "BUILDER of a rework that replaces the PR (never a reviewer session, and never "
+    "Devin, whose old PR the closing session retires). Either may retire the PR "
+    "when the owner's authorization of the supersession is on record (for a "
+    "rework, the posted `## Rework spec`), the successor PR is open or merged "
+    "(for a split rework, the LAST replacement has opened), and every file of the "
+    "old PR was checked against the successor and current main and found covered "
+    "(naming the file:line that now does it) or moot (saying why). That per-file "
+    "mapping goes in the closing comment; one part neither covered nor moot keeps "
+    "the PR open."
 )
 
 
@@ -354,7 +359,8 @@ def _advisory(reasons: list[str], closes: int) -> str:
         "should be retired and nobody is picking it up, that is a question for "
         "the user.\n"
         "So: if you are the reviving session, the user asked for this close by "
-        "name, or you are the closing session and every superseded-PR condition "
+        "name, or you are the closing session or the rework's builder and every "
+        "superseded-PR condition "
         "above holds with its evidence, proceed. Otherwise say what you are "
         "about to close and why, and let them answer.\n"
         f"{_LIMIT}"

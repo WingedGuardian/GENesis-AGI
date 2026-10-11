@@ -194,8 +194,12 @@ def test_the_note_states_the_limit_it_cannot_see():
 #: it, and the evidence each condition needs (owner ruling, 2026-10-04; the
 #: genesis-development skill, "A superseded PR is the one exception").
 _EXCEPTION_PHRASES = (
-    "only the CLOSING session may use",
-    "not a build or reviewer session",
+    "only two sessions may use",
+    "the CLOSING session, or the BUILDER of a rework",
+    "never a reviewer session",
+    "never Devin",
+    "the posted `## Rework spec`",
+    "the LAST replacement has opened",
     "owner's authorization of the supersession is on record",
     "successor PR is open or merged",
     "checked against the successor and current main",
