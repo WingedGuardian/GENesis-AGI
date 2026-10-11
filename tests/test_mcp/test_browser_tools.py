@@ -67,6 +67,11 @@ def _reset_browser_state(monkeypatch, tmp_path):
     # same path everywhere, patchright absent unless a test installs a stub.
     monkeypatch.setattr(browser, "_patchright_installed", lambda: False)
     monkeypatch.setattr(browser, "_warned_no_patchright", False)
+    # Whether this machine has that package's Chromium downloaded is not what the
+    # tests are about; the launch check has its own tests.
+    from genesis.browser import chromium
+
+    monkeypatch.setattr(chromium, "not_ready", lambda package, **kw: None)
     # The stale-module guard records which browser modules were loaded; a test
     # that stubs one in sys.modules must not leave its record behind.
     monkeypatch.setattr(packages, "_loaded", dict(packages._loaded))
@@ -266,6 +271,38 @@ class TestPatchrightChromium:
         with self._stub("playwright", self._starter()[0]):
             await browser._ensure_chromium_fallback()
         assert "patchright is not installed" not in caplog.text  # once per process
+
+    @pytest.mark.asyncio
+    async def test_a_missing_chromium_is_refused_before_anything_starts(self, monkeypatch):
+        """Playwright's own error would tell the reader to run `patchright install`,
+        a download a session must never start; the check names the operator step."""
+        from genesis.browser import chromium, profile_backup
+
+        monkeypatch.setattr(browser, "_patchright_installed", lambda: True)
+        monkeypatch.setattr(
+            chromium, "not_ready", lambda package, **kw: f"{package} Chromium missing; STEP"
+        )
+        backup = MagicMock()
+        monkeypatch.setattr(profile_backup, "backup_chromium_profile", backup)
+        starter, _ = self._starter()
+        with self._stub("patchright", starter), pytest.raises(chromium.ChromiumNotReady) as err:
+            await browser._ensure_chromium_fallback()
+        assert str(err.value) == "patchright Chromium missing; STEP"
+        starter.start.assert_not_awaited()
+        backup.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_navigate_returns_the_chromium_refusal(self, monkeypatch):
+        from genesis.browser import chromium
+
+        async def refuse(*a, **k):
+            raise chromium.ChromiumNotReady("patchright's Chromium is not installed; STEP")
+
+        monkeypatch.setattr(browser, "_get_page", refuse)
+        result = await browser._impl_browser_navigate("https://example.com", stealth=False)
+        assert result == {
+            "error": "Chromium is not ready: patchright's Chromium is not installed; STEP"
+        }
 
     @pytest.mark.asyncio
     async def test_a_broken_patchright_is_reported_not_swapped(self, monkeypatch):

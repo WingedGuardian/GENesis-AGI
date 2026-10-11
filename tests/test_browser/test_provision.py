@@ -96,14 +96,37 @@ def _resolves(monkeypatch, *statuses):
 # ── free space ────────────────────────────────────────────────────────────────
 
 
-def test_low_disk_skips_everything_and_succeeds(env, monkeypatch):
-    """The timer retries tomorrow; a full disk is not a failed unit."""
+def test_low_disk_with_nothing_to_install_succeeds(env, monkeypatch):
+    """The stack is already ready, so a full disk costs nothing today."""
     monkeypatch.setattr(provision, "free_bytes", lambda path: 1 * 1024**3)
-    _resolves(monkeypatch, MISSING)
+    _resolves(monkeypatch, READY)
     run = Runner()
     out = provision.provision(run)
     assert out.ok and run.calls == []
     assert "low disk" in out.line()
+
+
+def test_low_disk_while_the_engine_is_missing_fails_visibly(env, monkeypatch):
+    """After the browser packages moved to a new pin, a skipped download leaves
+    the browser unusable; reporting that as success would hide it every day."""
+    monkeypatch.setattr(provision, "free_bytes", lambda path: 1 * 1024**3)
+    _resolves(monkeypatch, MISSING)
+    run = Runner()
+    out = provision.provision(run)
+    assert not out.ok and run.calls == []
+    assert "low disk" in out.line()
+
+
+def test_low_disk_while_chromium_is_missing_fails_visibly(env, monkeypatch):
+    monkeypatch.setattr(provision, "free_bytes", lambda path: 1 * 1024**3)
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+    monkeypatch.setattr(provision.chromium, "not_ready", lambda package, **kw: "missing")
+    _resolves(monkeypatch, READY)
+    assert not provision.provision(Runner()).ok
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-1", "0", "abc", ""])
@@ -223,6 +246,25 @@ def test_corrupt_pinned_dir_is_removed_then_fetched(env, monkeypatch):
     out = provision.provision(run)
     assert provision._removed == [bad]
     assert len(run.ran("camoufox fetch")) == 1 and out.ok
+
+
+@pytest.mark.parametrize(("age_days", "replaced"), [(1, False), (8, True)])
+def test_an_engine_fetched_this_week_is_not_downloaded_again(env, monkeypatch, age_days, replaced):
+    """The daily timer would otherwise repeat one run's delete-and-fetch every day
+    for an engine that installs invalid by Genesis's checks: 1.3 GB a day."""
+    bad = env / "xdg" / "camoufox" / "browsers" / "official" / "156.0.1-beta.36-abc"
+    bad.mkdir(parents=True)
+    (bad / "version.json").write_text("{}")
+    then = time.time() - age_days * 86400
+    os.utime(bad / "version.json", (then, then))
+    invalid = engine.EngineStatus(engine.INVALID, "corrupt", bad / "camoufox-bin")
+    _resolves(monkeypatch, invalid, READY)
+    run = Runner()
+    out = provision.provision(run)
+    assert (provision._removed == [bad]) is replaced
+    assert len(run.ran("camoufox fetch")) == (1 if replaced else 0)
+    if not replaced:
+        assert not out.ok and any("remove it by hand" in n for n in out.notes)
 
 
 def test_a_fresh_fetch_that_stays_invalid_is_not_deleted_again(env, monkeypatch):
@@ -356,7 +398,7 @@ def _patchright(env, monkeypatch, *, installed=True):
         )
     )
     monkeypatch.setattr(
-        provision, "_package_dir", lambda name: pkg if name == "patchright" else None
+        provision.chromium, "package_dir", lambda name: pkg if name == "patchright" else None
     )
     monkeypatch.setattr(
         provision.packages,
@@ -421,18 +463,6 @@ def test_an_unfinished_chromium_install_is_missing(env, monkeypatch):
     _resolves(monkeypatch, READY)
     out = provision.provision(Runner())
     assert "chromium=missing" in out.line() and not out.ok
-
-
-def test_browsers_path_follows_playwright(env, monkeypatch, tmp_path):
-    """registry/index.js: PLAYWRIGHT_BROWSERS_PATH, else XDG_CACHE_HOME or ~/.cache."""
-    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path / "pw"))
-    assert provision.playwright_browsers_dir(Path("/pkg")) == tmp_path / "pw"
-    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "0")
-    assert provision.playwright_browsers_dir(Path("/pkg")) == Path(
-        "/pkg/driver/package/.local-browsers"
-    )
-    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH")
-    assert provision.playwright_browsers_dir(Path("/pkg")) == env / "xdg" / "ms-playwright"
 
 
 # ── system libraries ──────────────────────────────────────────────────────────
@@ -628,6 +658,90 @@ def test_main_prints_one_outcome_line_and_exits_by_it(env, monkeypatch, capsys):
         and "chromium=" in lines[0]
         and "libs=" in lines[0]
     )
+
+
+def test_check_packages_passes_with_the_whole_extra(env, monkeypatch, capsys):
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+    assert provision.main(["check-packages"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize(
+    ("versions", "pin_capable", "expected"),
+    [
+        ({"camoufox": None, "playwright": "1.62.0", "patchright": "1.62.3"}, False, "camoufox"),
+        ({"camoufox": "0.4.11", "playwright": "1.62.0", "patchright": "1.62.3"}, False, "0.5.7"),
+        ({"camoufox": "0.5.8", "playwright": None, "patchright": "1.62.3"}, True, "playwright"),
+        ({"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": None}, True, "patchright"),
+    ],
+)
+def test_check_packages_names_what_the_browser_extra_left_out(
+    env, monkeypatch, capsys, versions, pin_capable, expected
+):
+    """pip's exit status is masked in venv_setup.sh, and a failed resolution leaves
+    the old packages importable; bootstrap and install.sh read this instead."""
+    monkeypatch.setattr(provision.packages, "installed_versions", lambda: versions)
+    monkeypatch.setattr(provision, "_pin_capable", lambda: pin_capable)
+    monkeypatch.setenv("CLAUDECODE", "1")  # read-only: allowed inside a session
+    assert provision.main(["check-packages"]) == 1
+    out = capsys.readouterr().out
+    assert expected in out and out.startswith("browser-stack:")
+
+
+_REQUIRES = [
+    "aiosqlite",
+    'tomli>=2; python_version < "3.13"',
+    'camoufox<0.6,>=0.5.7; extra == "browser"',
+    'playwright<1.63,>=1.62; extra == "browser"',
+    'patchright<1.63,>=1.62.1; extra == "browser"',
+    'openai>=2; extra == "voice"',
+]
+
+
+def _metadata(monkeypatch, requires=_REQUIRES):
+    monkeypatch.setattr(
+        provision.metadata, "packages_distributions", lambda: {"genesis": ["genesis-v3"]}
+    )
+    monkeypatch.setattr(
+        provision.metadata, "requires", lambda dist: requires if dist == "genesis-v3" else None
+    )
+
+
+def test_check_packages_reads_the_extra_from_the_installed_metadata(env, monkeypatch, capsys):
+    """A failed or offline pip run can leave a playwright outside the pinned minor,
+    which breaks the one-Chromium-build pairing the pins exist for."""
+    _metadata(monkeypatch)
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.58.0", "patchright": "1.62.3"},
+    )
+    assert provision.main(["check-packages"]) == 1
+    out = capsys.readouterr().out
+    assert "playwright 1.58.0" in out and "1.63" in out
+    assert "camoufox" not in out and "patchright" not in out
+
+
+def test_browser_requirements_are_exactly_the_extra(monkeypatch):
+    """A core requirement whose marker holds anyway (python_version) is not one."""
+    _metadata(monkeypatch)
+    names = sorted(r.name for r in provision._browser_requirements())
+    assert names == ["camoufox", "patchright", "playwright"]
+
+
+def test_check_packages_ignores_other_groups_and_core_markers(env, monkeypatch, capsys):
+    _metadata(monkeypatch)
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+    assert provision.main(["check-packages"]) == 0
+    assert capsys.readouterr().out == ""
 
 
 def test_main_refuses_inside_a_claude_code_session(env, monkeypatch):

@@ -78,3 +78,19 @@ def test_the_unit_template_runs_this_script_without_escalation():
     assert "[Install]" not in lines  # started by its timer or an operator, never at login
     # The module sets TMPDIR for its download children only (CLAUDE.md: never in a unit).
     assert not any(ln.startswith("Environment") and "TMPDIR" in ln for ln in lines)
+
+
+def test_venv_path_names_the_interpreter(repo, tmp_path):
+    """install.sh accepts a VENV_PATH outside the checkout, as genesis.env does."""
+    venv = tmp_path / "elsewhere"
+    (venv / "bin").mkdir(parents=True)
+    (repo / ".venv" / "bin" / "python").rename(venv / "bin" / "python")
+    r = _run(repo, tmp_path, env_extra={"VENV_PATH": str(venv)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (tmp_path / "stub.log").read_text().split() == ["-m", "genesis.browser.provision", "run"]
+
+
+def test_the_timer_retries_daily_and_catches_up():
+    timer = (_SCRIPT.parent / "systemd" / "genesis-browser-stack.timer.template").read_text()
+    assert "OnCalendar=*-*-* " in timer and "Persistent=true" in timer
+    assert "WantedBy=timers.target" in timer  # the installers' timer loop enables it
