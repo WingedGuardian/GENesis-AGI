@@ -96,15 +96,27 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
 
 
 def fetch_remotes(root: Path) -> dict[str, str]:
-    """``{name: fetch url}`` for the checkout at *root*."""
-    proc = _git(root, "remote", "-v")
+    """``{name: fetch url}`` for the checkout at *root*.
+
+    Lists remote NAMES (``git remote``) and asks each for its fetch URL
+    (``git remote get-url``), never splitting the human-readable ``-v`` output:
+    a URL containing whitespace (a local path such as ``/srv/My Repos/x.git``)
+    spans several fields there and would be silently dropped.
+    """
+    proc = _git(root, "remote")
     if proc.returncode != 0:
         raise UpdateRemoteError(f"cannot list the remotes of {root}: {proc.stderr.strip()}")
     remotes: dict[str, str] = {}
-    for line in proc.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[2] == "(fetch)":
-            remotes[parts[0]] = parts[1]
+    for name in proc.stdout.splitlines():
+        name = name.strip()
+        if not name:
+            continue
+        url = _git(root, "remote", "get-url", name)
+        if url.returncode != 0:
+            raise UpdateRemoteError(
+                f"cannot read the fetch URL of remote {name!r}: {url.stderr.strip()}"
+            )
+        remotes[name] = url.stdout.rstrip("\n")
     return remotes
 
 

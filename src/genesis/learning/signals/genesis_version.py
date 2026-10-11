@@ -263,7 +263,7 @@ class GenesisVersionCollector:
         magnitude.
         Raises RuntimeError on git failure.
         """
-        remote = _update_remote()
+        remote = await asyncio.to_thread(_update_remote)
         ref = f"{remote}/main"
 
         # Fetch (updates remote refs + tags, doesn't change working tree)
@@ -353,7 +353,7 @@ class GenesisVersionCollector:
 
     async def _check_upstream_by_commits(self) -> tuple[int, str]:
         """Fallback: count commits when no release tags exist."""
-        ref = f"{_update_remote()}/main"
+        ref = f"{await asyncio.to_thread(_update_remote)}/main"
         proc = await asyncio.create_subprocess_exec(
             "git", "rev-list", "--count", f"HEAD..{ref}",
             cwd=str(_GENESIS_ROOT),
@@ -483,7 +483,7 @@ class GenesisVersionCollector:
         self, current: str, behind: int, summary: str,
     ) -> bool:
         """Store update-available observation. Returns True if new (not deduped)."""
-        ref = f"{_update_remote()}/main"
+        ref = f"{await asyncio.to_thread(_update_remote)}/main"
         # Get target commit for dedup
         proc = await asyncio.create_subprocess_exec(
             "git", "rev-parse", "--short", ref,

@@ -16,7 +16,7 @@ from flask import Flask
 from genesis.dashboard.routes import updates
 
 
-def _call(count, tags):
+def _call(count, tags, remote="origin"):
     """Drive update_check with a stubbed git, returning (payload, status)."""
 
     def git(*args, **kwargs):
@@ -26,17 +26,19 @@ def _call(count, tags):
             # The range itself is the fix. Asserted here rather than in a value
             # comparison, because a tag-span implementation would still return a
             # plausible number — it is the ARGUMENTS that distinguish them.
-            assert args == ("rev-list", "--count", "HEAD..origin/main")
+            assert args == ("rev-list", "--count", f"HEAD..{remote}/main")
             return count
         if args[0] == "log":
-            assert args[-1] == "HEAD..origin/main"
+            assert args[-1] == f"HEAD..{remote}/main"
             return "two\none"
         return ""
 
     app = Flask(__name__)
     with app.test_request_context(), patch.object(
         updates, "_git", side_effect=git
-    ), patch.object(updates, "_git_result", return_value=("", "")):
+    ), patch.object(updates, "_git_result", return_value=("", "")), patch(
+        "genesis.util.update_remote.update_remote", return_value=remote
+    ):
         result = updates.update_check()
 
     if isinstance(result, tuple):
@@ -75,7 +77,32 @@ def test_same_release_preserves_the_existing_update_policy():
     app = Flask(__name__)
     with app.test_request_context(), patch.object(
         updates, "_git", side_effect=git
-    ), patch.object(updates, "_git_result", return_value=("", "")):
+    ), patch.object(updates, "_git_result", return_value=("", "")), patch(
+        "genesis.util.update_remote.update_remote", return_value="origin"
+    ):
         result = updates.update_check().get_json()
     assert result["commits_behind"] == 0
     assert result["target_tag"] is None
+
+
+
+def test_the_check_reads_the_remote_updates_use():
+    """A pinned non-origin remote is what update.sh installs from, so the
+    manual check measures against it, not origin (Devin, round 1 on #2726)."""
+    payload, status = _call("3", (None, None), remote="public")
+    assert status == 200
+    assert payload["commits_behind"] == 3
+
+
+def test_a_refused_remote_choice_is_a_failed_check_not_a_number():
+    from genesis.util.update_remote import UpdateRemoteError
+
+    app = Flask(__name__)
+    with app.test_request_context(), patch(
+        "genesis.util.update_remote.update_remote",
+        side_effect=UpdateRemoteError("ambiguous"),
+    ):
+        response, status = updates.update_check()
+    assert status == 502
+    assert "cannot choose the update remote" in response.get_json()["error"]
+

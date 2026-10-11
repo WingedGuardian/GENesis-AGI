@@ -256,3 +256,158 @@ def test_the_version_collector_uses_the_shared_rule():
     text = (REPO / "src" / "genesis" / "learning" / "signals" / "genesis_version.py").read_text()
     assert "update_remote" in text
     assert '"remote", "-v"' not in text
+
+
+# ── Round 1 (#2726): remotes by name, and update.sh's resolution block ───────
+
+
+def test_a_fetch_url_with_whitespace_is_read_whole(tmp_path):
+    """`git remote -v` splits such a URL across fields; the remote must not be
+    dropped (which would fall back to origin and could pin the wrong source)."""
+    root = tmp_path / "spaced"
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _git(root, "remote", "add", "origin", PRIVATE)
+    _git(root, "remote", "add", "public", "/srv/My Repos/GENesis-AGI.git")
+    remotes = ur.fetch_remotes(root)
+    assert remotes["public"] == "/srv/My Repos/GENesis-AGI.git"
+    assert remotes["origin"] == PRIVATE
+
+
+def _resolution_block() -> str:
+    text = (REPO / "scripts" / "update.sh").read_text()
+    start = text.index("# ── Resolve upstream remote")
+    end = text.index("unset GENESIS_UPDATE_REMOTE\n") + len("unset GENESIS_UPDATE_REMOTE\n")
+    return text[start:end]
+
+
+def _run_block(
+    tmp_path, root: Path, *, post_merge=False, helper_rc=1, env_extra=None, helper_body=None
+):
+    """Run update.sh's resolution block alone, with a fake venv python that
+    exits ``helper_rc`` (1 = the helper could not run)."""
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True, exist_ok=True)
+    py = venv / "bin" / "python"
+    py.write_text(helper_body or f"#!/bin/sh\nexit {helper_rc}\n")
+    py.chmod(0o755)
+    script = (
+        # The mode update.sh runs under, so a -u or -e regression fails here too.
+        "set -Eeuo pipefail\n"
+        f'POST_MERGE={"true" if post_merge else "false"}\n'
+        f'VENV_DIR="{venv}"\nGENESIS_ROOT="{root}"\n'
+        + _resolution_block()
+        + 'echo "RESULT remote=$UPDATE_REMOTE how=$_UR_HOW override=${GENESIS_UPDATE_REMOTE-unset}"\n'
+    )
+    env = _child_env(**(env_extra or {}))
+    return subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=60, env=env
+    )
+
+
+def _result(proc) -> str:
+    return next(line for line in proc.stdout.splitlines() if line.startswith("RESULT"))
+
+
+def test_post_merge_does_not_resolve_and_cannot_be_stranded(tmp_path, checkout):
+    # A refusal (exit 2) must not stop --post-merge, which never fetches.
+    r = _run_block(tmp_path, checkout, post_merge=True, helper_rc=2)
+    assert r.returncode == 0, r
+    assert _result(r) == "RESULT remote= how= override=unset"
+
+
+def test_a_helper_that_cannot_run_still_honours_the_pin(tmp_path, checkout):
+    _git(checkout, "config", "--local", ur.PIN_KEY, "private")
+    r = _run_block(tmp_path, checkout, helper_rc=1)
+    assert r.returncode == 0, r
+    assert _result(r).startswith("RESULT remote=private how=pinned"), r.stdout
+
+
+def test_a_helper_that_cannot_run_refuses_a_pin_naming_no_remote(tmp_path, checkout):
+    _git(checkout, "config", "--local", ur.PIN_KEY, "gone")
+    r = _run_block(tmp_path, checkout, helper_rc=1)
+    assert r.returncode == 3, r
+    assert "is not a remote of this checkout" in r.stdout
+
+
+def test_a_helper_that_cannot_run_uses_origin_only_when_it_is_the_only_remote(tmp_path):
+    root = tmp_path / "solo"
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _git(root, "remote", "add", "origin", UPSTREAM)
+    r = _run_block(tmp_path, root, helper_rc=1)
+    assert r.returncode == 0, r
+    assert _result(r).startswith("RESULT remote=origin how=fallback"), r.stdout
+
+
+def test_a_helper_that_cannot_run_refuses_with_other_remotes_and_no_pin(tmp_path):
+    """The private-origin setup: the rule would refuse, so the degraded path must
+    not install origin's (the private fork's) main instead."""
+    root = tmp_path / "private_origin"
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _git(root, "remote", "add", "origin", PRIVATE)
+    _git(root, "remote", "add", "public", UPSTREAM)
+    r = _run_block(tmp_path, root, helper_rc=1)
+    assert r.returncode == 3, r
+    assert "cannot" in r.stdout and "be chosen safely" in r.stdout
+
+
+def test_a_helper_that_cannot_run_still_honours_the_override(tmp_path):
+    root = tmp_path / "private_origin2"
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _git(root, "remote", "add", "origin", PRIVATE)
+    _git(root, "remote", "add", "public", UPSTREAM)
+    r = _run_block(tmp_path, root, helper_rc=1, env_extra={ur.OVERRIDE_ENV: "public"})
+    assert r.returncode == 0, r
+    assert _result(r).startswith("RESULT remote=public how=override"), r.stdout
+
+
+def test_a_refusal_is_exit_3_not_a_script_error(tmp_path, checkout):
+    r = _run_block(tmp_path, checkout, helper_rc=2)
+    assert r.returncode == 3, r
+
+
+def test_the_supervisor_prompts_never_let_a_session_choose_the_source():
+    text = (REPO / "src" / "genesis" / "dashboard" / "routes" / "updates.py").read_text()
+    flat = " ".join(text.split())
+    assert "If exit 3 (the update source is not chosen)" in text
+    # Tier 1 (exit 3), tier 2 (script errors) and tier 3 all forbid it.
+    assert flat.count("Never set or change the git config key genesis.updateRemote") >= 3
+    assert "git merge origin/main" not in text, "resolvers merge the exact conflicting commit"
+    sh = (REPO / "scripts" / "update.sh").read_text()
+    assert '"deploy_head": os.environ.get("UC_DEPLOY_HEAD"' in sh
+
+
+def test_the_one_run_override_is_dropped_after_resolution(tmp_path, checkout):
+    """The helper must SEE the override (it is the one deciding), and nothing
+    after the block may inherit it."""
+    helper = (
+        "#!/bin/sh\n"
+        'echo "$GENESIS_UPDATE_REMOTE"\n'
+        'echo "override:$GENESIS_UPDATE_REMOTE"\n'
+        "exit 0\n"
+    )
+    r = _run_block(
+        tmp_path, checkout, env_extra={ur.OVERRIDE_ENV: "private"}, helper_body=helper
+    )
+    assert r.returncode == 0, r
+    assert "Update remote: private (override:private)" in r.stdout, r.stdout
+    assert _result(r).endswith("override=unset"), r.stdout
+
+
+def test_the_dashboard_check_uses_the_shared_rule():
+    text = (REPO / "src" / "genesis" / "dashboard" / "routes" / "updates.py").read_text()
+    check = text[text.index("def update_check"):]
+    check = check[: check.index("\n@blueprint")] if "\n@blueprint" in check else check
+    assert "update_remote(" in check
+    assert '"origin"' not in check, "the manual check must not hard-code origin"
+
+
+def test_the_collector_runs_the_git_probes_off_the_event_loop():
+    """_update_remote shells out to git (up to 30 s per call); the async
+    collector must not call it on the shared awareness loop."""
+    text = (REPO / "src" / "genesis" / "learning" / "signals" / "genesis_version.py").read_text()
+    import re
+
+    calls = len(re.findall(r"(?<!def )\b_update_remote\(\)", text))
+    threaded = text.count("asyncio.to_thread(_update_remote)")
+    assert threaded == 3, threaded
+    assert calls == 0, "every collector call goes through asyncio.to_thread"
