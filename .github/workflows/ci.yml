@@ -1172,14 +1172,16 @@ jobs:
         # Edited-file collection against runtime parent dfdb00194: 750 -> 935
         # (+185): guarded uninstall183 + inert-observation negative controls2.
         # Reconciled runtime parent floor25297+183+2=25482; no new skip allowance.
-        # Native CBM lifecycle: lifecycle152 + authority295 + four uninstall
-        # controls. Four edited suites against ecadc1ae collect259 ->710 (+451).
-        # Parent25482 +451 =25933; retain skip ceiling102 and compare hosted
+        # Native CBM lifecycle: lifecycle152 + authority907 + four uninstall
+        # controls. Authority includes dependency scopes across all16 lookup
+        # positions and preserved namespace-object controls. Four edited suites
+        # against ecadc1ae collect259 ->1322 (+1063).
+        # Parent25482 +1063 =26545; retain skip ceiling102 and compare hosted
         # skip identities against the actual landing base before merge.
-        # Managed frontend: actual d71da568 parent launcher40 ->50 (+10),
+        # Managed frontend: actual c1101235 parent launcher40 ->50 (+10),
         # plus74 frontend cases. The incoming raw-scope attribution case is
         # superseded with the legacy launcher; launcher/frontend net84. Index
         # guard114->115 adds1 for the relocated classifier's raw-spawn control.
-        # Parent25933 +85 =26018. Skip ceiling102 remains unchanged; hosted
+        # Parent26545 +85 =26630. Skip ceiling102 remains unchanged; hosted
         # identities must be compared against the actual landing base.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 26018
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 26630

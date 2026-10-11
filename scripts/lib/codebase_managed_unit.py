@@ -167,9 +167,11 @@ def canonical_bytes(template: Path, parameters: tuple[str, str, str] | None) -> 
 def source_snapshot(paths: tuple[Path, ...], unit: str, roots: tuple[Path, Path]):
     """Reject competing sources/override namespaces without resolving precedence."""
     stem, suffix = unit.rsplit(".", 1)
-    scopes = [unit + ".d", suffix + ".d"]
-    scopes.extend(stem[:i + 1] + "." + suffix + ".d"
+    scopes = [unit, suffix]
+    scopes.extend(stem[:i + 1] + "." + suffix
                   for i, char in enumerate(stem) if char == "-")
+    scopes = [scope + kind for scope in scopes
+              for kind in (".d", ".wants", ".requires", ".upholds")]
     selected, seen = [], set()
     for root in paths:
         physical = artifact_parent(root)
