@@ -307,3 +307,36 @@ def test_cancel_leaves_other_files_in_the_upload_directory(client, inbox):
     assert not (sub / "doc.txt").exists()
     assert (sub / "other.txt").exists()
     mock_delete.assert_awaited_once()
+
+
+@pytest.mark.parametrize("tail", ["/.", "/..", "/", "/doc.txt\x00", "/doc.txt\n", "/ doc.txt"])
+def test_cancel_refuses_a_stored_path_ending_in_a_sentinel_name(client, inbox, tail):
+    """`<root>/<id>/.`, `..` or a trailing slash name no file the directory lists;
+    treating them as "already removed" would drop the row and leave the file."""
+    sub = inbox / U1
+    sub.mkdir()
+    target = sub / "doc.txt"
+    target.write_text("x")
+
+    resp, mock_delete = _cancel(client, str(sub) + tail)
+
+    assert resp.status_code == 409
+    assert target.exists()
+    mock_delete.assert_not_awaited()
+
+
+@pytest.mark.parametrize("stored", ["doc.TXT", "missing.txt"])
+def test_cancel_refuses_a_stored_name_absent_while_another_file_remains(client, inbox, stored):
+    """The row names a file that is not listed, but the upload's directory still
+    holds one: "already removed" would drop the row and orphan the real file."""
+    sub = inbox / U1
+    sub.mkdir()
+    real = sub / "doc.txt"
+    real.write_text("x")
+
+    resp, mock_delete = _cancel(client, sub / stored)
+
+    assert resp.status_code == 409
+    assert real.exists()
+    mock_delete.assert_not_awaited()
+

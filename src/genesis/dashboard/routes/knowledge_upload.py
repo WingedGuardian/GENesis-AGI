@@ -70,13 +70,28 @@ def _remove_upload_file(upload_id: str, stored_path: str) -> str | None:
     """
     if os.path.dirname(stored_path) != os.path.join(str(_UPLOAD_DIR), upload_id):
         return "Stored file path is not this upload's file"
+    # The name must be one the upload route could have written: it stores
+    # `_sanitize_filename(...)`. Anything else (`.`, `..`, an empty name from a
+    # trailing slash, NUL, newline, an overlong name) never matches a listed
+    # entry, so it would read as "already removed" and drop the row while the
+    # real file stays on disk.
+    name = os.path.basename(stored_path)
+    if not name or name != _sanitize_filename(name):
+        return "Stored file path is not this upload's file"
 
     try:
         root_fd = os.open(_UPLOAD_DIR, os.O_RDONLY | os.O_DIRECTORY)
     except FileNotFoundError:
         return None
+    except OSError:
+        logger.warning("Could not open the upload root %s", _UPLOAD_DIR, exc_info=True)
+        return "Upload directory could not be opened"
     try:
-        dir_name = _own_entry(root_fd, upload_id)
+        try:
+            dir_name = _own_entry(root_fd, upload_id)
+        except OSError:
+            logger.warning("Could not list the upload root %s", _UPLOAD_DIR, exc_info=True)
+            return "Upload directory could not be opened"
         if dir_name is None:
             return None
         try:
@@ -88,9 +103,16 @@ def _remove_upload_file(upload_id: str, stored_path: str) -> str | None:
             # non-directory where the upload's directory should be.
             return "Upload directory is not a real directory"
         try:
-            # Not listed means already removed: the goal state holds.
-            file_name = _own_entry(dir_fd, os.path.basename(stored_path))
-            if file_name is not None:
+            file_name = _own_entry(dir_fd, name)
+            if file_name is None:
+                # Not listed means already removed only if nothing else is in
+                # the upload's directory. If something is, the row names a file
+                # that is not there (a case or spelling mismatch) and the real
+                # file would be orphaned: leave both for a human.
+                with os.scandir(dir_fd) as entries:
+                    if any(True for _ in entries):
+                        return "Stored file is not in the upload directory, which is not empty"
+            else:
                 if not stat.S_ISREG(os.lstat(file_name, dir_fd=dir_fd).st_mode):
                     return "Stored file path is not a regular file"
                 # Unlinks the entry itself. If it is swapped for a link after
