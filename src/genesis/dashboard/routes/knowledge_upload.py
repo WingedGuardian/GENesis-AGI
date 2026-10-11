@@ -225,18 +225,43 @@ async def knowledge_upload_cancel(upload_id: str):
     if upload["status"] == "processing":
         return jsonify({"error": "Cannot cancel — ingestion in progress"}), 409
 
-    # The path was written under _UPLOAD_DIR at upload time; re-check at delete
-    # time so a corrupted or migrated row can't point the unlink elsewhere. Every
-    # operation below uses the RESOLVED path that was checked, never the stored
-    # one: a stored symlink outside the root must not be what gets unlinked.
+    # The path was written as _UPLOAD_DIR/<upload_id>/<name> at upload time;
+    # re-check at delete time so a corrupted or migrated row can't point the
+    # unlink elsewhere. It must be THIS upload's own file, named directly: no
+    # symlink anywhere below the root (following one would delete whatever it
+    # points at and leave the link behind), and no file of another upload.
     upload_root = os.path.realpath(_UPLOAD_DIR)
-    resolved = os.path.normpath(os.path.realpath(upload["file_path"]))
+    resolved = os.path.realpath(upload["file_path"])
+    lexical = os.path.normpath(os.path.abspath(upload["file_path"]))
+    relative = None
+    for base in (os.path.normpath(os.path.abspath(_UPLOAD_DIR)), upload_root):
+        if lexical.startswith(base + os.sep):
+            relative = os.path.relpath(lexical, base)
+            break
     if not resolved.startswith(upload_root + os.sep):
         logger.error(
             "Refusing to cancel upload %s: stored path %s is outside %s",
             upload_id, upload["file_path"], upload_root,
         )
         return jsonify({"error": "Stored file path is outside the upload directory"}), 409
+    # A symlink loop resolves to itself, so islink() catches what realpath cannot.
+    if (
+        relative is None
+        or resolved != os.path.join(upload_root, relative)
+        or os.path.islink(lexical)
+    ):
+        logger.error(
+            "Refusing to cancel upload %s: stored path %s goes through a symlink",
+            upload_id, upload["file_path"],
+        )
+        return jsonify({"error": "Stored file path goes through a symlink"}), 409
+    parts = relative.split(os.sep)
+    if len(parts) != 2 or parts[0] != upload_id or parts[1] in ("", ".", ".."):
+        logger.error(
+            "Refusing to cancel upload %s: stored path %s is not this upload's file",
+            upload_id, upload["file_path"],
+        )
+        return jsonify({"error": "Stored file path is not this upload's file"}), 409
     file_path = Path(resolved)
     if file_path.exists() and not file_path.is_file():
         logger.error(
@@ -245,13 +270,17 @@ async def knowledge_upload_cancel(upload_id: str):
         )
         return jsonify({"error": "Stored file path is not a file"}), 409
 
-    # Remove file from disk
-    if file_path.exists():
-        file_path.unlink()
-    # Clean up empty parent directory (never the upload root itself)
+    # Remove file from disk. Something else removing it first is not an error:
+    # the goal state (no file) holds, so the cancel still completes.
+    file_path.unlink(missing_ok=True)
+    # Clean up the upload's own directory once empty (never the upload root,
+    # which the check above already rules out as the parent).
     parent = file_path.parent
-    if str(parent) != upload_root and parent.exists() and not any(parent.iterdir()):
-        parent.rmdir()
+    try:
+        if not any(parent.iterdir()):
+            parent.rmdir()
+    except OSError:
+        logger.warning("Could not remove upload directory %s", parent, exc_info=True)
 
     await knowledge_uploads.delete(rt.db, upload_id)
     return jsonify({"status": "ok"})
