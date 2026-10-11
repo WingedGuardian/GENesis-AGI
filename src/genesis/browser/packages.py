@@ -19,8 +19,10 @@ from importlib import metadata
 from genesis.browser.engine import PACKAGE_HINT
 
 BROWSER_DISTS = ("camoufox", "playwright", "patchright")
-# The Chromium fallback, remote CDP and TinyFish import playwright only, so a
-# camoufox upgrade is no reason to refuse them.
+# What each layer imports, so one layer's stale package never refuses another:
+# camoufox drives Firefox through playwright and never loads patchright; the
+# Chromium fallback, remote CDP and TinyFish import playwright only.
+CAMOUFOX_DISTS = ("camoufox", "playwright")
 PLAYWRIGHT_ONLY = ("playwright",)
 
 
@@ -65,22 +67,20 @@ class BrowserPackagesChanged(RuntimeError):
     """Browser packages changed on disk after this process imported them."""
 
 
-def packages_changed_message(stale: list[str] | None = None) -> str | None:
+def packages_changed_message(stale: list[str]) -> str | None:
     """Why a restart is needed, or None. ``stale`` names loaded distributions whose
-    files changed; without it, any change since startup counts."""
-    now = installed_versions()
-    dists = (
-        stale if stale is not None else [d for d in BROWSER_DISTS if now[d] != STARTUP_VERSIONS[d]]
-    )
-    if not dists:
+    files changed (stale_loaded_modules); a change to one nothing loaded needs no
+    restart, so there is no "any change since startup" form."""
+    if not stale:
         return None
+    now = installed_versions()
 
     def was(d: str) -> str:
         v = _loaded.get(d, STARTUP_VERSIONS[d])
         return "an unknown version" if v is _UNKNOWN else str(v)
 
-    changed = ", ".join(f"{d} {was(d)} -> {now[d]}" for d in dists)
-    if any(now[d] is None or now[d] == UNREADABLE for d in dists):
+    changed = ", ".join(f"{d} {was(d)} -> {now[d]}" for d in stale)
+    if any(now[d] is None or now[d] == UNREADABLE for d in stale):
         # Uninstalled or damaged under the session: a restart alone will not repair it.
         advice = (
             "Restart this Claude Code session; if the browser is still unavailable "
@@ -91,27 +91,36 @@ def packages_changed_message(stale: list[str] | None = None) -> str | None:
     return f"Browser packages changed after this session started ({changed}). {advice}"
 
 
-def check_loaded_browser_modules(dists: tuple[str, ...] = BROWSER_DISTS) -> None:
-    """Raise BrowserPackagesChanged when a loaded module among ``dists`` is stale.
+def stale_loaded_modules(dists: tuple[str, ...] = BROWSER_DISTS) -> list[str]:
+    """The distributions among ``dists`` whose loaded module no longer matches disk.
 
     Only a distribution this process has imported matters: one not yet loaded will
-    be imported fresh from the files on disk. A distribution first seen loaded
-    since the previous check was imported in between; when the disk did not change
-    across that interval, what it loaded is the current version. When it did,
-    which one it loaded is unknown, and that counts as stale.
+    be imported fresh from the files on disk, so a restart would load the same
+    files. A distribution first seen loaded since the previous check was imported
+    in between; when the disk did not change across that interval, what it loaded
+    is the current version. When it did, which one it loaded is unknown, and that
+    counts as stale.
     """
     now = installed_versions()
     for d in BROWSER_DISTS:
         if _is_loaded(d) and d not in _loaded:
             _loaded[d] = now[d] if now[d] == _last_seen[d] else _UNKNOWN
     _last_seen.update(now)
-    stale = [d for d in dists if _is_loaded(d) and _loaded[d] != now[d]]
+    return [d for d in dists if _is_loaded(d) and _loaded[d] != now[d]]
+
+
+def check_loaded_browser_modules(dists: tuple[str, ...] = BROWSER_DISTS) -> None:
+    """Raise BrowserPackagesChanged when a loaded module among ``dists`` is stale."""
+    stale = stale_loaded_modules(dists)
     if stale:
         raise BrowserPackagesChanged(packages_changed_message(stale))
 
 
-def import_error_message(exc: ImportError) -> str:
-    changed = packages_changed_message()
+def import_error_message(exc: ImportError, dists: tuple[str, ...] = BROWSER_DISTS) -> str:
+    """``dists`` are the packages the failing layer imports. Restart advice only
+    when one of them is loaded and stale: a change to a package nothing imported,
+    or that this layer does not use, cannot be why its import failed."""
+    changed = packages_changed_message(stale_loaded_modules(dists))
     if changed:
         return f"{changed} (import failed: {exc})"
     return f"Browser not available: {exc}; tell the user; operator step: {PACKAGE_HINT}."

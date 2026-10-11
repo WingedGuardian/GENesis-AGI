@@ -28,6 +28,7 @@ through ``python -m genesis.browser.engine --json`` instead.
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -203,23 +204,37 @@ def _properties_readable(raw: bytes) -> bool:
 
 
 def _engine_problem(
-    binary: Path, *, need_version_json: bool = True, need_fontconfig: bool = True
+    binary: Path,
+    *,
+    need_version_json: bool = True,
+    need_fontconfig: bool = True,
+    reads_ini_version: bool = True,
 ) -> str | None:
     """Why ``binary`` cannot be launched, or None. Stateless file checks only."""
-    if not binary.is_file():
+    if not os.path.isfile(binary):
         return f"no {binary.name} at {binary.parent}"
     if not os.access(binary, os.X_OK):
         return f"{binary} is not executable (a fetch was interrupted or is still running)"
     if need_version_json and not (binary.parent / "version.json").is_file():
         return f"no version.json beside {binary}"
     # camoufox reads the version from here; without it it falls back to its own
-    # engine selection (utils.resolve_verstr), which writes its config.
+    # engine selection (utils.resolve_verstr), which writes its config. Decoded
+    # leniently on purpose: resolve_verstr reads it with errors="replace", and
+    # Firefox does not read this copy, so stray bytes do not stop a launch (MEASURED).
     try:
         ini = (binary.parent / "application.ini").read_text(encoding="utf-8", errors="replace")
     except OSError:
         return f"no application.ini beside {binary}"
-    if not any(line.startswith("Version=") and line[8:].strip() for line in ini.splitlines()):
+    # The first non-empty Version= value, as resolve_verstr takes it; its major
+    # goes into the browser's fingerprint (utils.py:1082, ``split('.', 1)[0]``).
+    version = next(
+        (v for line in ini.splitlines() if line.startswith("Version=") and (v := line[8:].strip())),
+        None,
+    )
+    if version is None:
         return f"application.ini beside {binary} names no Version"
+    if reads_ini_version and not re.fullmatch(r"[0-9]+", version.split(".", 1)[0]):
+        return f"application.ini beside {binary} names an unreadable Version {version!r}"
     try:
         raw = (binary.parent / "properties.json").read_bytes()
     except FileNotFoundError:
@@ -230,9 +245,69 @@ def _engine_problem(
         return f"properties.json beside {binary} is unreadable"
     if need_fontconfig and _READS_FONTCONFIG:
         for os_dir in _FONTCONFIG_OSES:
-            confs = (binary.parent / d / os_dir / "fonts.conf" for d in ("fontconfig", "fontconfigs"))
-            if not any(c.is_file() for c in confs):
-                return f"no fontconfig/{os_dir}/fonts.conf beside {binary}"
+            problem = _fonts_conf_problem(binary, os_dir) or _fonts_groups_problem(binary, os_dir)
+            if problem:
+                return problem
+    return None
+
+
+def _fonts_conf_problem(binary: Path, os_dir: str) -> str | None:
+    """Read the fonts.conf a launch would, the way it would: 0.5 takes
+    fontconfig/<os>/ when it holds one, else the older fontconfigs/<os>/
+    (utils.py:318-320), and reads it as text in the locale encoding
+    (_generate_fontconfig, ``open(.., 'r')``). MEASURED: invalid UTF-8 there fails
+    a real launch with UnicodeDecodeError. Decoded as UTF-8, the file's own encoding,
+    not this process's locale: the real file has non-ASCII lines, so in an ASCII
+    locale every healthy engine would read as broken (and get replaced, forever)."""
+    conf = binary.parent / "fontconfig" / os_dir / "fonts.conf"
+    if not os.path.exists(conf):
+        conf = binary.parent / "fontconfigs" / os_dir / "fonts.conf"
+    if not os.path.isfile(conf):
+        return f"no fontconfig/{os_dir}/fonts.conf beside {binary}"
+    try:
+        with open(conf, encoding="utf-8") as f:
+            f.read()
+    except (OSError, UnicodeDecodeError):
+        return f"{conf.parent.parent.name}/{os_dir}/fonts.conf beside {binary} is unreadable"
+    return None
+
+
+def _override_version_problem(binary: Path) -> str | None:
+    """Upstream reads version.json beside an explicit path on every launch and
+    tolerates only its absence or a FileNotFoundError, KeyError or ValueError
+    (0.5.8 utils.py:212-215); anything else (an empty build's IndexError, say)
+    fails the launch."""
+    from camoufox.pkgman import Version  # _resolve checked it imports
+
+    try:
+        Version.from_path(binary.parent)
+    except (FileNotFoundError, KeyError, ValueError):
+        return None
+    except Exception as exc:  # noqa: BLE001 - what the launch would raise
+        return f"version.json beside {binary} is unreadable ({exc!r})"
+    return None
+
+
+_GROUP_KEYS = {"linux": "lin", "macos": "mac", "windows": "win"}
+
+
+def _fonts_groups_problem(binary: Path, os_dir: str) -> str | None:
+    """fonts/groups.json, which the same launch step reads (0.5.7 and 0.5.8
+    ``_generate_fontconfig``) and tolerates only when unreadable or not JSON
+    (``except (OSError, ValueError)``); valid JSON of another shape fails it."""
+    fonts = os.path.join(binary.parent, "fonts")
+    groups = os.path.join(fonts, "groups.json")
+    if not os.path.exists(groups):
+        return None
+    try:
+        with open(groups, "rb") as fh:
+            read_by = json.loads(fh.read()).get("readBy", {}).get(_GROUP_KEYS[os_dir], [])
+        for group in read_by:
+            os.path.isdir(os.path.join(fonts, group))
+    except (OSError, ValueError):
+        return None
+    except Exception as exc:  # noqa: BLE001 - what the launch would raise
+        return f"fonts/groups.json beside {binary} is unreadable ({exc!r})"
     return None
 
 
@@ -240,8 +315,13 @@ def _check(binary: Path, label: str, kind: str) -> EngineStatus:
     # Upstream does not require version.json beside an explicitly given binary, and
     # camoufox 0.4 never checks the fontconfig it points at.
     problem = _engine_problem(
-        binary, need_version_json=kind != "override", need_fontconfig=kind != "legacy"
+        binary,
+        need_version_json=kind != "override",
+        need_fontconfig=kind != "legacy",
+        reads_ini_version=kind != "legacy",
     )
+    if problem is None and kind == "override":
+        problem = _override_version_problem(binary)
     if problem:
         return EngineStatus(
             INVALID, f"{label}: {problem}; {_repair_step(binary, problem, kind)}", binary
@@ -429,6 +509,13 @@ def resolve_camoufox_engine() -> EngineStatus:
     """The Camoufox binary to launch, or why there is none. Never raises."""
     try:
         return _resolve()
+    except OSError as exc:
+        logger.warning("could not read the Camoufox engine cache", exc_info=True)
+        return EngineStatus(
+            INVALID,
+            f"the Camoufox engine cache could not be read ({exc!r}); tell the user; "
+            f"operator step: check the permissions under {camoufox_install_dir()}",
+        )
     except _UnreadableMetadata as exc:
         name, err = exc.args
         logger.warning("%s package metadata is unreadable", name, exc_info=True)
@@ -472,13 +559,20 @@ def _resolve() -> EngineStatus:
         )
     override = os.environ.get("CAMOUFOX_EXECUTABLE_PATH", "").strip()
     if override:
+        try:
+            from camoufox.pkgman import Version  # noqa: F401 - the override check reads with it
+        except Exception as exc:  # noqa: BLE001 - a broken package, not a broken override
+            return _broken_package(version, "cannot be imported", exc)
         return _check(Path(os.path.abspath(override)), "CAMOUFOX_EXECUTABLE_PATH", "override")
     return _pinned_engine(version)
 
 
 def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m genesis.browser.engine")
+    parser.add_argument("--json", action="store_true", help="print the status as JSON")
+    args = parser.parse_args(argv)
     status = resolve_camoufox_engine()
-    if "--json" in (argv if argv is not None else sys.argv[1:]):
+    if args.json:
         print(json.dumps(status.to_json()))
     else:
         print(f"{status.kind}: {status.detail}" + (f" ({status.path})" if status.path else ""))

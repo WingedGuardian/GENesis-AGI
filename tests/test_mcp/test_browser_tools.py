@@ -192,7 +192,7 @@ class TestExplicitEngine:
         ctor = MagicMock()
         with (
             patch.object(packages, "check_loaded_browser_modules",
-                         side_effect=packages.BrowserPackagesChanged("Restart this Claude Code session")),
+                         side_effect=packages.BrowserPackagesChanged("Restart this Claude Code session")) as guard,
             patch.object(engine, "resolve_camoufox_engine", resolve),
             patch.dict("sys.modules", self._camoufox_stub(ctor)),
             pytest.raises(packages.BrowserPackagesChanged),
@@ -200,6 +200,8 @@ class TestExplicitEngine:
             await browser._ensure_browser()
         resolve.assert_not_called()
         ctor.assert_not_called()
+        # Camoufox never loads patchright, so a patchright upgrade cannot refuse it.
+        guard.assert_called_once_with(packages.CAMOUFOX_DISTS)
 
     @pytest.mark.asyncio
     async def test_alive_page_skips_the_checks(self):
@@ -314,11 +316,43 @@ class TestExplicitEngine:
         with (
             patch.object(browser, "_get_page",
                          new=AsyncMock(side_effect=engine.CamoufoxNotReady("cannot be imported"))),
-            patch.object(packages, "packages_changed_message", return_value=changed),
+            patch.object(packages, "stale_loaded_modules", return_value=["camoufox"]),
+            patch.object(packages, "packages_changed_message", return_value=changed) as msg,
         ):
             result = await browser._impl_browser_navigate("https://example.com")
         assert result["error"].startswith(changed)
         assert "Camoufox is not ready: cannot be imported" in result["error"]
+        msg.assert_called_once_with(["camoufox"])
+
+    @pytest.mark.asyncio
+    async def test_not_ready_after_an_unloaded_change_gives_no_restart_advice(self):
+        """patchright installed mid-session while the engine is missing: restarting
+        cannot fetch an engine, so the operator step stands alone."""
+        from genesis.browser import engine, packages
+
+        with (
+            patch.object(browser, "_get_page",
+                         new=AsyncMock(side_effect=engine.CamoufoxNotReady("not installed"))),
+            patch.object(packages, "stale_loaded_modules", return_value=[]) as stale,
+        ):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert result["error"] == "Camoufox is not ready: not installed"
+        stale.assert_called_once_with(packages.CAMOUFOX_DISTS)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("kwargs", "dists"),
+        [({"stealth": True}, "CAMOUFOX_DISTS"), ({"stealth": False}, "PLAYWRIGHT_ONLY")],
+    )
+    async def test_import_error_advice_names_the_layer_packages(self, kwargs, dists):
+        from genesis.browser import packages
+
+        with (
+            patch.object(browser, "_get_page", new=AsyncMock(side_effect=ImportError("x"))),
+            patch.object(packages, "import_error_message", return_value="m") as msg,
+        ):
+            await browser._impl_browser_navigate("https://example.com", **kwargs)
+        assert msg.call_args.args[1] == getattr(packages, dists)
 
     @pytest.mark.asyncio
     async def test_navigate_reports_changed_packages(self):
@@ -5713,3 +5747,16 @@ def test_every_page_action_takes_the_page_lock_or_is_named_exempt():
         f"stale exemptions: {sorted(set(_PAGE_ACTION_EXEMPT) - unlocked)}"
     )
     assert all(reason.strip() for reason in _PAGE_ACTION_EXEMPT.values())
+
+
+def test_each_layers_packages_come_from_one_place():
+    """The launch guards and the import-error advice read the same answer, so a
+    layer that changes what it imports changes both."""
+    from genesis.browser import packages
+    from genesis.browser.types import BrowserLayer
+
+    assert browser._layer_dists(BrowserLayer.CAMOUFOX) == packages.CAMOUFOX_DISTS
+    for layer in (BrowserLayer.CHROMIUM, BrowserLayer.REMOTE_CDP, BrowserLayer.TINYFISH):
+        assert browser._layer_dists(layer) == packages.PLAYWRIGHT_ONLY
+    source = Path(browser.__file__).read_text()
+    assert "check_loaded_browser_modules(packages." not in source

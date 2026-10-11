@@ -162,8 +162,10 @@ def _fake_camoufox(monkeypatch, *, pin=PIN, installed=(), list_raises=None, pin_
 
 
 class _UpstreamVersion:
-    """camoufox 0.5.8 ``pkgman.Version.from_path``: orjson-parses version.json and
-    raises on an empty build (the IndexError that aborts ``list_installed``)."""
+    """camoufox 0.5.8 ``pkgman.Version.from_path`` (pkgman.py:378-397): orjson-parses
+    version.json, takes ``release`` or ``tag`` as the build, raises KeyError with no
+    build and IndexError on an empty one (``Version.__post_init__``); either aborts
+    ``list_installed``."""
 
     @staticmethod
     def from_path(path):
@@ -172,8 +174,11 @@ class _UpstreamVersion:
             data = json.loads(raw)
         except ValueError as exc:  # upstream raises orjson's decode error
             raise engine._listing_skips()[1]("bad json", raw, 0) from exc
-        if not (data.get("release") or data.get("build")):
-            raise IndexError("list index out of range")
+        build = data.get("release", data.get("tag", data.get("build")))
+        if build is None:
+            raise KeyError("build")
+        if not build:
+            raise IndexError("string index out of range")
         return _UpstreamVersion()
 
 
@@ -486,6 +491,42 @@ def test_0_5_engine_missing_one_os_fontconfig_is_invalid(
 
 def test_older_fontconfigs_spelling_is_accepted(cache, monkeypatch, tmp_path, linux):
     binary = _kind_engine("versioned", cache, monkeypatch, tmp_path, fontconfig_dir="fontconfigs")
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.READY and status.path == binary
+
+
+@pytest.mark.parametrize("kind", ["versioned", "override"])
+@pytest.mark.parametrize("bad", ALL_OS)
+def test_undecodable_fonts_conf_is_invalid(kind, bad, cache, monkeypatch, tmp_path, linux):
+    """camoufox reads fonts.conf as text (utils._generate_fontconfig, open(.., 'r')).
+    MEASURED on a real 0.5.8 engine: invalid UTF-8 there fails the launch with
+    UnicodeDecodeError."""
+    binary = _kind_engine(kind, cache, monkeypatch, tmp_path)
+    (binary.parent / "fontconfig" / bad / "fonts.conf").write_bytes(b"<fontconfig>\xff\xfe")
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID
+    assert f"{bad}/fonts.conf" in status.detail
+
+
+def test_fonts_conf_read_is_the_one_upstream_picks(cache, monkeypatch, tmp_path, linux):
+    """utils.py:318-320 takes fontconfig/<os>/ when it holds a fonts.conf, and only
+    otherwise the older fontconfigs/<os>/; a good older copy does not rescue it."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    for os_dir in ALL_OS:
+        older = binary.parent / "fontconfigs" / os_dir
+        older.mkdir(parents=True)
+        (older / "fonts.conf").write_text("<fontconfig/>")
+    (binary.parent / "fontconfig" / "linux" / "fonts.conf").write_bytes(b"\xff")
+    assert engine.resolve_camoufox_engine().kind == engine.INVALID
+
+
+def test_undecodable_application_ini_is_still_ready(cache, monkeypatch, tmp_path, linux):
+    """camoufox decodes application.ini with errors='replace' (0.5.7 utils.py:809,
+    0.5.8 utils.py:816) and Firefox does not read that copy. MEASURED: a real 0.5.8
+    engine launches with invalid UTF-8 in it."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    ini = binary.parent / "application.ini"
+    ini.write_bytes(b"; \xff\xfe\n" + ini.read_bytes())
     status = engine.resolve_camoufox_engine()
     assert status.kind == engine.READY and status.path == binary
 
@@ -891,3 +932,138 @@ def test_a_dashed_build_is_not_the_pins_folder(cache, monkeypatch):
     (hotfix.path / "version.json").write_text("{bad")
     _fake_camoufox(monkeypatch, installed=[])
     assert engine.resolve_camoufox_engine().kind == engine.NOT_INSTALLED
+
+
+@pytest.mark.parametrize("value", ["15\ufffd6.0.1-beta.36", "beta.36", "  "])
+def test_a_version_whose_major_is_not_a_number_is_invalid(value, cache, monkeypatch, tmp_path, linux):
+    """camoufox puts ``Version.split('.', 1)[0]`` into the browser's fingerprint
+    (0.5.8 utils.py:1082): a garbled major launches with a garbage User-Agent."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    (binary.parent / "application.ini").write_text(f"[App]\nVersion={value}\nVersion=156.0.1\n")
+    status = engine.resolve_camoufox_engine()
+    if value.strip():
+        assert status.kind == engine.INVALID and "Version" in status.detail
+    else:  # upstream skips an empty value and takes the next Version= line
+        assert status.kind == engine.READY
+
+
+@pytest.mark.parametrize(
+    ("content", "ready"),
+    [
+        (None, True),  # absent: upstream leaves an unpackaged build alone
+        ('{"version": "156.0.1", "release": "beta.36"}', True),
+        ("not json", True),  # ValueError: upstream passes
+        ('{"version": "156.0.1"}', True),  # KeyError-shaped: upstream passes
+        ('{"version": "156.0.1", "build": ""}', False),  # IndexError: the launch raises
+    ],
+)
+def test_override_version_json_is_read_as_upstream_reads_it(
+    content, ready, cache, monkeypatch, tmp_path, linux
+):
+    """With an explicit path camoufox parses version.json beside it and tolerates
+    only FileNotFoundError, KeyError and ValueError (0.5.8 utils.py:212-215)."""
+    binary = _kind_engine("override", cache, monkeypatch, tmp_path, version_json=False)
+    _fake_camoufox(monkeypatch)
+    if content is not None:
+        (binary.parent / "version.json").write_text(content)
+    status = engine.resolve_camoufox_engine()
+    assert status.ready is ready, status.detail
+    if not ready:
+        assert "version.json" in status.detail
+
+
+def test_main_rejects_an_unknown_flag(capsys):
+    with pytest.raises(SystemExit):
+        engine.main(["--jsno"])
+
+
+def test_a_broken_package_under_an_override_is_the_package_not_the_file(
+    cache, monkeypatch, tmp_path, linux
+):
+    """camoufox.pkgman failing to import is a damaged package: its repair is the
+    package reinstall, never "fix CAMOUFOX_EXECUTABLE_PATH"."""
+    _kind_engine("override", cache, monkeypatch, tmp_path)
+    monkeypatch.setitem(sys.modules, "camoufox.pkgman", None)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID
+    assert engine.PACKAGE_HINT in status.detail and "version.json" not in status.detail
+
+
+@pytest.mark.parametrize(
+    ("content", "ready"),
+    [
+        (None, True),
+        (b'{"readBy": {"lin": ["L", "LM"], "mac": ["M"], "win": ["W"]}}', True),
+        (b"\xff\xfe not json", True),  # ValueError: upstream falls back to fonts/<os>
+        (b'{"readBy": {"lin": [', True),  # truncated: ValueError again
+        (b"[]", False),  # AttributeError at .get: the launch raises
+        (b"null", False),
+        (b'{"readBy": []}', False),
+        (b'{"readBy": {"lin": [1]}}', False),  # TypeError in os.path.join
+    ],
+)
+def test_fonts_groups_json_is_read_as_upstream_reads_it(
+    content, ready, cache, monkeypatch, tmp_path, linux
+):
+    """0.5.7/0.5.8 _generate_fontconfig reads fonts/groups.json beside the binary
+    and tolerates only OSError and ValueError (utils.py:147-159)."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    if content is not None:
+        (binary.parent / "fonts").mkdir()
+        (binary.parent / "fonts" / "groups.json").write_bytes(content)
+    status = engine.resolve_camoufox_engine()
+    assert status.ready is ready, status.detail
+    if not ready:
+        assert "groups.json" in status.detail
+
+
+def test_fonts_conf_is_decoded_as_utf_8_whatever_the_locale(tmp_path):
+    """The real 0.5.8 fonts.conf has non-ASCII lines (16 in linux/). Read in an
+    ASCII locale, every healthy engine would look broken, and a caller that
+    replaces broken engines would download one forever. Run in a real C locale
+    with UTF-8 mode off, the way such a process would."""
+    d = tmp_path / "e"
+    (d / "fontconfig" / "linux").mkdir(parents=True)
+    (d / "fontconfig" / "linux" / "fonts.conf").write_text(
+        "<fontconfig><!-- \u00e9 --></fontconfig>", encoding="utf-8"
+    )
+    code = (
+        "import sys, pathlib; from genesis.browser import engine; "
+        "print(engine._fonts_conf_problem(pathlib.Path(sys.argv[1]) / 'camoufox-bin', 'linux'))"
+    )
+    src = str(Path(engine.__file__).resolve().parents[2])
+    env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "PYTHONUTF8": "0", "PYTHONPATH": src}
+    out = subprocess.run(
+        [sys.executable, "-c", code, str(d)], capture_output=True, text=True, env=env, check=True
+    )
+    assert out.stdout.strip() == "None", out.stdout + out.stderr
+
+
+def test_an_unsearchable_directory_is_reported_not_raised(cache, monkeypatch, tmp_path, linux):
+    """pathlib's exists() raises on a directory this user cannot search; the
+    resolver never raises."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    fc = binary.parent / "fontconfig"
+    fc.chmod(0)
+    try:
+        status = engine.resolve_camoufox_engine()
+    finally:
+        fc.chmod(0o755)
+    assert status.kind == engine.INVALID
+
+
+def test_the_legacy_root_needs_a_version_line_but_not_a_numeric_major(cache, monkeypatch, tmp_path):
+    """camoufox 0.4 takes the version from the root version.json, never application.ini."""
+    binary = _kind_engine("legacy", cache, monkeypatch, tmp_path)
+    (binary.parent / "application.ini").write_text("[App]\nVersion=beta.24\n")
+    assert engine.resolve_camoufox_engine().kind == engine.READY
+
+
+def test_a_filesystem_error_anywhere_is_a_status(cache, monkeypatch):
+    def denied():
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(engine, "_resolve", denied)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID and status.path is None
+    assert "permissions" in status.detail
