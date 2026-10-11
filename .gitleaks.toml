@@ -5,7 +5,8 @@
 # this install's IPs/hostnames as detection patterns would publish, in the
 # public repo, the very values the scanner exists to keep out. Those exact
 # values live only in the local fingerprint file and the CI
-# GENESIS_PRIVATE_PATTERNS secret (see ci.yml's private-pattern exact scan).
+# GENESIS_PRIVATE_PATTERNS secret (see the private-pattern exact scan in
+# scripts/ci/leak_scan.sh, run by ci.yml and branch-leak-scan.yml).
 # Broad RFC1918/ULA CLASSES are surfaced as a NON-gating warning in CI
 # (scripts/check_portability.sh --warn) so external contributors are never
 # hard-blocked for a legitimate private-range example. gitleaks here keeps its

@@ -163,139 +163,30 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Every step body lives in scripts/ci/leak_scan.sh, shared with
+      # .github/workflows/branch-leak-scan.yml (every non-main branch push), so
+      # the two cannot drift. Pins, checksums and --redact live there. Keep
+      # this job's id `leak-detector`: it is a required status check
+      # (.github/rulesets/checks.json) and the merge gate's leaks relief is
+      # pinned to the (leak-detector, CI) pair.
       - name: Install tools
-        # `detect-secrets` PINNED for the same reason `ruff` is: `leak-detector`
-        # is a required check with no bypass actor, it scans the WHOLE tree, and
-        # a new detector in an unpinned release would fire on pre-existing
-        # content and block every merge. See .github/rulesets/README.md.
-        run: |
-          pip install 'detect-secrets==1.5.0'
-          sudo apt-get install -y ripgrep
+        run: bash scripts/ci/leak_scan.sh install
 
       - name: Secret scan (detect-secrets)
-        run: |
-          set -euo pipefail
-          detect-secrets scan --all-files \
-              --exclude-files '\.git/' \
-              --exclude-files '__pycache__/' \
-              --exclude-files '\.pyc$' \
-              --exclude-files 'vendor/' \
-              src/ config/ scripts/ .github/ > /tmp/ds-results.json
-          count=$(python3 -c "
-          import json, sys
-          data = json.load(open('/tmp/ds-results.json'))
-          results = data.get('results', {})
-          real = sum(len([f for f in v if 'CACHEDIR' not in fp])
-                     for fp, v in results.items())
-          print(real)
-          ")
-          if [[ "$count" != "0" ]]; then
-            echo "::error::detect-secrets found $count potential secrets"
-            cat /tmp/ds-results.json
-            exit 1
-          fi
-          echo "Secret scan: CLEAN (0 findings)"
+        run: bash scripts/ci/leak_scan.sh detect-secrets
 
       - name: Leak scan (gitleaks)
-        # Blocking. Covers the whole tree (incl. docs/) with the repo's
-        # .gitleaks.toml PII/infrastructure rules — the scans above only
-        # cover src/config/scripts/.github. Version+checksum pinned;
-        # --redact is MANDATORY: these logs are public, a found secret
-        # must never be echoed into them.
-        run: |
-          set -euo pipefail
-          GITLEAKS_VERSION=8.22.1
-          GITLEAKS_SHA256=2f92ab3b8e08319ac30836c32b90818e01519c3a4982771e4f45a7f5607872f7
-          curl -sSfL -o /tmp/gitleaks.tgz \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
-          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
-          /tmp/gitleaks detect --no-git --redact -c .gitleaks.toml --source .
-          echo "Leak scan (gitleaks): CLEAN"
+        # Blocking, whole tree, version+checksum pinned, --redact mandatory.
+        run: bash scripts/ci/leak_scan.sh gitleaks
 
       - name: Class scan (advisory — non-gating)
-        # Broad RFC1918 / CGNAT / IPv6-ULA and /home/<user> CLASSES, surfaced as
-        # GitHub warnings and NEVER gating. Rationale: CI must not hard-block an
-        # external contributor for a legitimate private-range example (e.g.
-        # 10.0.0.1 in a docker-compose). This install's EXACT values are
-        # hard-gated by the private-pattern exact scan below. Doc examples should
-        # use the RFC 5737 ranges (192.0.2.x / 198.51.100.x / 203.0.113.x), which
-        # are deliberately not matched. Network-address class vocabulary comes
-        # from scripts/check_portability.sh --warn (single source of truth).
-        run: |
-          set -euo pipefail
-          net="$(bash scripts/check_portability.sh --warn 2>/dev/null || true)"
-          # Home-path + CC-slug classes (check_portability owns network only).
-          # Exclude scanner-definition files that embed these patterns as data.
-          paths="$(rg -n --hidden \
-            --glob '!**/.git/**' \
-            --glob '!**/src/genesis/contribution/sanitize.py' \
-            --glob '!**/scripts/hooks/commit-msg' \
-            --glob '!**/scripts/check_portability.sh' \
-            --glob '!**/.github/workflows/ci.yml' \
-            -e '/home/[a-z_][a-z0-9_-]*/genesis' \
-            -e '/home/[a-z_][a-z0-9_-]*/\.[A-Za-z]' \
-            -e '-home-[a-z0-9-]+-genesis' \
-            . 2>/dev/null || true)"
-          findings="$(printf '%s\n%s\n' "$net" "$paths" | grep -vE '^[[:space:]]*$' || true)"
-          if [[ -n "$findings" ]]; then
-            printf '%s\n' "$findings" | sed 's/^/::warning::/'
-            n="$(printf '%s\n' "$findings" | wc -l)"
-            echo "Class scan: $n advisory finding(s) — non-gating."
-          else
-            echo "Class scan: CLEAN"
-          fi
+        run: bash scripts/ci/leak_scan.sh class
 
       - name: Email scan
-        run: |
-          set -euo pipefail
-          hits=$(
-            rg -n --hidden \
-              --glob '!**/.git/**' \
-              --glob '!**/tests/**' \
-              --glob '!**/readme-legacy.md' \
-              --glob '!**/vendor/**' \
-              -e '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' \
-              src/ config/ scripts/ .github/ 2>/dev/null | \
-            grep -vE '(^|[^a-zA-Z0-9._+-])(noreply|no-reply)@' | \
-            grep -vE 'backup@genesis\.local\b' | \
-            grep -vE 'feedback@anthropic\.com\b' | \
-            grep -vE 'support@anthropic\.com\b' | \
-            grep -vE '@(example|example\.com|example\.org|localhost|test|invalid)\b' | \
-            grep -vE '@(claude|github|gitlab|sentry|grafana|slack|discord)\.com\b' | \
-            grep -vE 'user@[0-9]+\.service' \
-              || true
-          )
-          if [[ -n "$hits" ]]; then
-            echo "::error::Email scan found personal email addresses:"
-            printf '%s\n' "$hits"
-            exit 1
-          fi
-          echo "Email scan: CLEAN"
+        run: bash scripts/ci/leak_scan.sh email
 
       - name: Binary/data artifact scan
-        run: |
-          set -euo pipefail
-          # Voiceprints, audio, databases, and models match NONE of the text
-          # scans above, so a `git add -f` past .gitignore would commit one
-          # unnoticed. Block any TRACKED artifact of these types (uses the git
-          # index, so untracked local data is ignored).
-          data_globs=(
-            '*.wav' '*.flac' '*.pcm' '*.mp3' '*.m4a' '*.ogg' '*.opus'
-            '*.db' '*.db-wal' '*.db-shm' '*.sqlite' '*.sqlite3'
-            '*.onnx'
-            '*speaker_registry*.json' 'ambient_enroll_*.json'
-          )
-          # Allowlist: ':(exclude)path' entries for confirmed-legit files.
-          data_allow=()
-          hits=$(git ls-files -z -- "${data_globs[@]}" "${data_allow[@]}" 2>/dev/null \
-                 | tr '\0' '\n' || true)
-          if [[ -n "$hits" ]]; then
-            echo "::error::Binary/data artifacts must never be committed (voiceprints, audio, databases, models):"
-            printf '%s\n' "$hits"
-            exit 1
-          fi
-          echo "Binary/data artifact scan: CLEAN"
+        run: bash scripts/ci/leak_scan.sh binary
 
       - name: Private-pattern exact scan (hard gate)
         # The REAL install identifiers (private repo/host names, subnets,
@@ -306,7 +197,7 @@ jobs:
         # echoes matched content — counts only. Hard-fails on the canonical repo
         # for non-fork PRs and pushes; SKIPS on forks / other installs (no secret,
         # and they cannot know these values — the class scan above is their floor).
-        # Secrets are NOT readable in `if:`, so the empty check is done in-shell
+        # Secrets are NOT readable in `if:`, so the empty check is done in-script
         # after env-mapping; an `if:` keyed on secrets.* would be silently empty
         # (never runs = false green).
         # Skip Dependabot too: its PRs are same-repo (non-fork) so they'd enter
@@ -315,6 +206,8 @@ jobs:
         # empty and the fail-loud check would break every dependency-bump PR.
         # Dependency bumps never introduce install identifiers; the class-warn
         # scan remains their floor.
+        # Range selection (for a pull_request: merge-base with live main, NOT
+        # the stale pull_request.base.sha) is in scripts/ci/leak_scan_added_lines.py.
         if: >-
           github.repository == 'WingedGuardian/GENesis-AGI' &&
           github.actor != 'dependabot[bot]' &&
@@ -327,36 +220,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PUSH_BEFORE: ${{ github.event.before }}
           HEAD_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          # Write the raw secret; scripts/ci/private_pattern_scan.py does ALL
-          # filtering + validation (blank/comment lines, empty set, malformed
-          # ERE) in tested Python — the fragile parts that repeatedly bit the
-          # former inline-shell gate. It exits 0=clean, 1=leak (counts only,
-          # never content), 3=fail-loud (unprovisioned/corrupt secret); set -e
-          # propagates a nonzero exit as the gate's failure.
-          pf="$(mktemp)"
-          printf '%s' "$PRIV" > "$pf"
-
-          # Collect the ADDED lines across EVERY commit's patch in range — NOT
-          # the net tree-to-tree diff (a value added then removed within the same
-          # PR/push leaves the net diff clean yet stays in published history).
-          # RANGE SELECTION is security-critical and lives in tested Python:
-          # scripts/ci/leak_scan_added_lines.py. For a pull_request it anchors on
-          # the merge ref's first parent (HEAD^1 = main@ci), NOT the stale
-          # github.event.pull_request.base.sha — base.sha lags main, so
-          # base.sha..HEAD used to re-sweep (and re-flag) values main itself
-          # added-then-removed since the PR was opened. The helper keeps every
-          # '^+' line incl. '+++ b/path' headers, and fails CLOSED (nonzero exit)
-          # on an unresolvable range rather than emitting empty (a fail-OPEN).
-          # See tests/test_scripts/test_leak_scan_added_lines.py.
-          added="$(python3 scripts/ci/leak_scan_added_lines.py)"
-          body=""
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            body="$(gh pr view "$PR_NUMBER" --json body -q .body 2>/dev/null || echo '')"
-          fi
-
-          printf '%s\n%s\n' "$added" "$body" | python3 scripts/ci/private_pattern_scan.py --patterns "$pf"
+        run: bash scripts/ci/leak_scan.sh private
 
   migration-check:
     # Migration ids, three rules: every file in a migrations directory is a
@@ -1162,4 +1026,12 @@ jobs:
         # Offline restore fixture changes are count-neutral; ceiling stays 102.
         # Merge with main (#3133 authenticated backup reads): main 25211 + this PR's measured +106 = 25317.
         # Re-merge with main (#3133): main 25213 + this PR's measured +106 = 25319.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25319
+        # Branch leak scan (#2880), --collect-only after the last test-adding
+        # edit:
+        #   test_leak_scan_added_lines.py      14 -> 33   (+19)
+        #   test_branch_leak_scan_workflow.py new -> 21   (+21)
+        # Floor: 25319 + 40 = 25359. Ceiling 102 -> 104: two of the new
+        # workflow tests run the tip half of leak_scan.sh's email and class
+        # steps, which call ripgrep, and this job does not install it, so they
+        # skip here by design (MEASURED: the run at 3b14708f1 skipped 104).
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25359

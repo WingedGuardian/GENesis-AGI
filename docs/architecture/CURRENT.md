@@ -3465,7 +3465,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 1109d1844 2026-10-08
+verified: 4ab8bf71c 2026-10-10
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -3536,7 +3536,13 @@ verified: 1109d1844 2026-10-08
   (3) the same exact values in the `GENESIS_PRIVATE_PATTERNS` CI secret. CI is
   WARN-not-block on the broad classes (never hard-blocks a contributor's legit
   RFC1918 example); only exact-value matches hard-fail, on canonical non-fork
-  PRs. Procedure: `public-repo leak-detection design`.
+  PRs and pushes. The CI scan runs on PRs to main and pushes to main
+  (`ci.yml`, required check `leak-detector`) AND on every push to every other
+  branch (`branch-leak-scan.yml`, advisory check `branch-leak-scan`, which also
+  scans the branch's commit history with gitleaks), so a branch with no PR is
+  still scanned; both call `scripts/ci/leak_scan.sh`. Scan logs name
+  `path:line` only, never the matched text.
+  Procedure: `public-repo leak-detection design`.
 - **bookmark/**: two-tier session bookmarks stored as episodic memories +
   a lookup table; enrichment runs on surplus compute.
 - **workflows/**: YAML DAG executor — GROUNDWORK(workflow-engine), built with
