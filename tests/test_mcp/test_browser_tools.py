@@ -5760,3 +5760,65 @@ def test_each_layers_packages_come_from_one_place():
         assert browser._layer_dists(layer) == packages.PLAYWRIGHT_ONLY
     source = Path(browser.__file__).read_text()
     assert "check_loaded_browser_modules(packages." not in source
+
+
+class TestRecheckAfterLateImport:
+    """An upgrade that starts between the package check and the late import leaves
+    old loaded modules beside new files; the check runs again after the import,
+    before a browser starts or a paid session opens (Codex round 4, #3176)."""
+
+    @staticmethod
+    def _stale_second_time():
+        from genesis.browser import packages
+
+        return patch.object(
+            packages,
+            "check_loaded_browser_modules",
+            side_effect=[None, packages.BrowserPackagesChanged("Restart")],
+        )
+
+    @pytest.mark.asyncio
+    async def test_camoufox(self, tmp_path):
+        from genesis.browser import engine, packages
+
+        ctor = MagicMock()
+        ready = engine.EngineStatus(engine.READY, "Camoufox", tmp_path / "camoufox-bin")
+        with (
+            self._stale_second_time() as check,
+            patch.object(engine, "resolve_camoufox_engine", MagicMock(return_value=ready)),
+            patch.dict("sys.modules", TestExplicitEngine._camoufox_stub(ctor)),
+            pytest.raises(packages.BrowserPackagesChanged),
+        ):
+            await browser._ensure_browser()
+        ctor.assert_not_called()
+        assert check.call_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "launch",
+        [
+            lambda: browser._ensure_chromium_fallback(),
+            lambda: browser._ensure_remote_cdp("http://127.0.0.1:9222"),
+            lambda: browser._ensure_tinyfish_browser("https://example.com"),
+        ],
+        ids=["chromium", "remote_cdp", "tinyfish"],
+    )
+    async def test_playwright_layers(self, launch):
+        from genesis.browser import packages
+
+        start = MagicMock()
+        create = AsyncMock()
+        stub = {
+            "playwright": MagicMock(),
+            "playwright.async_api": MagicMock(async_playwright=start),
+            "genesis.providers.tinyfish_client": MagicMock(browser_session_create=create),
+        }
+        with (
+            self._stale_second_time() as check,
+            patch.dict("sys.modules", stub),
+            pytest.raises(packages.BrowserPackagesChanged),
+        ):
+            await launch()
+        start.assert_not_called()
+        create.assert_not_called()
+        assert check.call_count == 2

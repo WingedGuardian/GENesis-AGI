@@ -180,27 +180,28 @@ def _repair_step(binary: Path, problem: str, kind: str) -> str:
     return _operator_step(legacy=True, remove_first=True)  # pre-0.5: the root engine
 
 
-def _properties_readable(raw: bytes) -> bool:
-    """Whether camoufox can load this properties.json: it parses it with orjson (a
-    camoufox dependency; stricter than json about a BOM or NaN) and indexes each
-    entry's ``property`` and ``type`` (0.4 and 0.5.7 when they load the file,
-    utils._load_properties; 0.5.8 when a launch sets that property,
-    validate_config). MEASURED: every entry of a real 0.4 and 0.5.8 engine carries
-    both, 0.5.8's removed ones included."""
+def _properties_problem(binary: Path) -> str | None:
+    """Load properties.json with camoufox's own loader (``utils._load_properties``,
+    the same name and signature from 0.4 to 0.5.8), so anything it fails on, a
+    launch fails on. Each entry's ``type`` is read too: 0.4 and 0.5.7 index it while
+    loading, 0.5.8 when a launch sets that property (validate_config), which skips
+    an entry marked "removed" first. MEASURED: every entry of a real 0.4 and 0.5.8
+    engine carries both fields. When camoufox.utils cannot be imported the package
+    is broken, and the package import that comes first reports it."""
+    if not os.path.isfile(binary.parent / "properties.json"):
+        return f"no properties.json beside {binary}"
     try:
-        import orjson
-
-        data = orjson.loads(raw)
-    except ImportError:
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            return False
-    except ValueError:  # orjson.JSONDecodeError is a ValueError
-        return False
-    return isinstance(data, list) and all(
-        isinstance(e, dict) and "property" in e and "type" in e for e in data
-    )
+        from camoufox.utils import _load_properties
+    except Exception:  # noqa: BLE001 - a broken package is reported elsewhere
+        return None
+    try:
+        loaded = _load_properties(path=binary)
+        entries = (v for v in loaded.values() if isinstance(v, dict))
+        if not all("removed" in v or "type" in v for v in entries):
+            raise KeyError("type")
+    except Exception as exc:  # noqa: BLE001 - what the launch would raise
+        return f"properties.json beside {binary} is unreadable ({exc!r})"
+    return None
 
 
 def _engine_problem(
@@ -235,14 +236,9 @@ def _engine_problem(
         return f"application.ini beside {binary} names no Version"
     if reads_ini_version and not re.fullmatch(r"[0-9]+", version.split(".", 1)[0]):
         return f"application.ini beside {binary} names an unreadable Version {version!r}"
-    try:
-        raw = (binary.parent / "properties.json").read_bytes()
-    except FileNotFoundError:
-        return f"no properties.json beside {binary}"
-    except OSError:
-        return f"properties.json beside {binary} is unreadable"
-    if not _properties_readable(raw):
-        return f"properties.json beside {binary} is unreadable"
+    problem = _properties_problem(binary)
+    if problem:
+        return problem
     if need_fontconfig and _READS_FONTCONFIG:
         for os_dir in _FONTCONFIG_OSES:
             problem = _fonts_conf_problem(binary, os_dir) or _fonts_groups_problem(binary, os_dir)

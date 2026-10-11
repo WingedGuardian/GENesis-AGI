@@ -450,6 +450,9 @@ async def _ensure_browser():
             raise engine.CamoufoxNotReady(status.detail)
 
         from camoufox.async_api import AsyncCamoufox
+        # Again past the import: an upgrade that began after the first check
+        # would have mixed old loaded modules with new files.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CAMOUFOX))
 
         _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -508,6 +511,9 @@ async def _ensure_chromium_fallback():
 
         packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
         from playwright.async_api import async_playwright
+        # Again past the import: an upgrade that began after the first check
+        # would have mixed old loaded modules with new files.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
 
         _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -683,6 +689,9 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
 
         packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.REMOTE_CDP))
         from playwright.async_api import async_playwright
+        # Again past the import: an upgrade that began after the first check
+        # would have mixed old loaded modules with new files.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.REMOTE_CDP))
 
         # The attempt is built in locals and published to the globals only once
         # it has a tab, so a failed or cancelled attempt is cleaned up through
@@ -954,6 +963,9 @@ async def _ensure_tinyfish_browser(url: str | None = None) -> tuple:
         # Before the session: it is billed from the moment it is created.
         packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.TINYFISH))
         from playwright.async_api import async_playwright
+        # Again past the import: an upgrade that began after the first check
+        # would have mixed old loaded modules with new files.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.TINYFISH))
 
         from genesis.providers.tinyfish_client import browser_session_create
 

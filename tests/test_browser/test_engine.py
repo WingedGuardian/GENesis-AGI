@@ -43,6 +43,10 @@ def _versions(
     monkeypatch.setattr(engine, "_dist_files", lambda name: files)
     if camoufox and camoufox.startswith("0.4"):
         _fake_legacy_pkgman(monkeypatch, supported=legacy_supported)
+    elif camoufox:
+        # The resolver imports camoufox on these paths; CI has no browser extra, so
+        # a test must never lean on a camoufox the box happens to have.
+        _fake_camoufox(monkeypatch)
 
 
 def _fake_legacy_pkgman(monkeypatch, *, supported=True):
@@ -64,8 +68,25 @@ def _fake_legacy_pkgman(monkeypatch, *, supported=True):
     pkgman = types.ModuleType("camoufox.pkgman")
     pkgman.Version = Version
     pkg.pkgman = pkgman
+    utils = types.ModuleType("camoufox.utils")
+    utils._load_properties = _load_properties_0_4  # 0.4.11 utils.py:77-88
+    pkg.utils = utils
     monkeypatch.setitem(sys.modules, "camoufox", pkg)
     monkeypatch.setitem(sys.modules, "camoufox.pkgman", pkgman)
+    monkeypatch.setitem(sys.modules, "camoufox.utils", utils)
+
+
+def _read_properties(path):
+    data = json.loads((Path(path).parent / "properties.json").read_bytes())
+    return data
+
+
+def _load_properties_0_4(path=None):
+    return {prop["property"]: prop["type"] for prop in _read_properties(path)}
+
+
+def _load_properties_0_5_8(path=None):
+    return {prop["property"]: prop for prop in _read_properties(path)}
 
 
 ALL_OS = ("linux", "macos", "windows")
@@ -151,12 +172,15 @@ def _fake_camoufox(monkeypatch, *, pin=PIN, installed=(), list_raises=None, pin_
     mv.list_installed = list_installed
     pkgman = types.ModuleType("camoufox.pkgman")
     pkgman.Version = _UpstreamVersion
-    pkg.browser_pin, pkg.multiversion, pkg.pkgman = bp, mv, pkgman
+    utils = types.ModuleType("camoufox.utils")
+    utils._load_properties = _load_properties_0_5_8  # 0.5.8 utils.py:334-353
+    pkg.browser_pin, pkg.multiversion, pkg.pkgman, pkg.utils = bp, mv, pkgman, utils
     for name, mod in (
         ("camoufox", pkg),
         ("camoufox.browser_pin", bp),
         ("camoufox.multiversion", mv),
         ("camoufox.pkgman", pkgman),
+        ("camoufox.utils", utils),
     ):
         monkeypatch.setitem(sys.modules, name, mod)
 
@@ -396,8 +420,11 @@ def test_import_failure_names_the_package_not_the_cache(cache, monkeypatch, brok
     if broken == "unimportable":
         monkeypatch.setitem(sys.modules, "camoufox", None)
     else:
-        monkeypatch.setitem(sys.modules, "camoufox", types.ModuleType("camoufox"))
-        monkeypatch.setitem(sys.modules, "camoufox.browser_pin", None)
+        empty = types.ModuleType("camoufox")
+        empty.__path__ = []  # a package whose submodules are gone: importing one fails
+        monkeypatch.setitem(sys.modules, "camoufox", empty)
+        for sub in ("browser_pin", "multiversion", "pkgman", "utils"):
+            monkeypatch.delitem(sys.modules, f"camoufox.{sub}", raising=False)
     status = engine.resolve_camoufox_engine()
     assert status.kind == engine.INVALID
     assert "cannot be imported" in status.detail
@@ -1067,3 +1094,70 @@ def test_a_filesystem_error_anywhere_is_a_status(cache, monkeypatch):
     status = engine.resolve_camoufox_engine()
     assert status.kind == engine.INVALID and status.path is None
     assert "permissions" in status.detail
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'[{"property": [], "type": "str"}]',  # unhashable key: the launch's dict raises
+        b'[{"property": {"a": 1}, "type": "str"}]',
+        b'[{"type": "str"}]',
+        b'[{"property": "a"}]',
+        b'{"property": "a", "type": "str"}',
+    ],
+)
+@pytest.mark.parametrize("loader", ["upstream-0.5.8"])
+def test_properties_json_is_loaded_the_way_camoufox_loads_it(
+    content, loader, cache, monkeypatch, tmp_path, linux
+):
+    """Every camoufox release keys a dict by each entry's ``property``
+    (utils._load_properties), and the launch reads each entry's ``type``. Run
+    against a 0.5.8-shaped loader (keys whole entries, never reads ``type`` while
+    loading)."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    if loader == "upstream-0.5.8":
+        utils = types.ModuleType("camoufox.utils")
+
+        def _load_properties(path=None):
+            data = json.loads((Path(path).parent / "properties.json").read_bytes())
+            return {prop["property"]: prop for prop in data}
+
+        utils._load_properties = _load_properties
+        monkeypatch.setitem(sys.modules, "camoufox.utils", utils)
+    (binary.parent / "properties.json").write_bytes(content)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID and "properties.json" in status.detail
+
+
+def test_upstreams_own_properties_loader_is_used_when_it_imports(cache, monkeypatch, tmp_path, linux):
+    """camoufox's loader is the authority; the resolver's copy is only the fallback."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    utils = types.ModuleType("camoufox.utils")
+    seen = []
+
+    def _load_properties(path=None):
+        seen.append(path)
+        raise TypeError("unhashable type: 'list'")
+
+    utils._load_properties = _load_properties
+    monkeypatch.setitem(sys.modules, "camoufox.utils", utils)
+    status = engine.resolve_camoufox_engine()
+    assert seen == [binary] and status.kind == engine.INVALID
+    assert "unhashable" in status.detail
+
+
+def test_a_removed_property_needs_no_type(cache, monkeypatch, tmp_path, linux):
+    """0.5.8's validate_config skips an entry marked "removed" before it reads its
+    type; a launch with one is fine."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    utils = types.ModuleType("camoufox.utils")
+    utils._load_properties = lambda path=None: {
+        prop["property"]: prop
+        for prop in json.loads((Path(path).parent / "properties.json").read_bytes())
+    }
+    monkeypatch.setitem(sys.modules, "camoufox.utils", utils)
+    (binary.parent / "properties.json").write_text(
+        '[{"property": "a", "type": "str"}, {"property": "b", "removed": "140"}]'
+    )
+    assert engine.resolve_camoufox_engine().kind == engine.READY
+
