@@ -319,54 +319,5 @@ def test_main_degrades_available_to_model_estimate_when_usage_unknown(monkeypatc
     assert capsys.readouterr().out.splitlines()[0] == "ALLOW"
 
 
-def test_effective_memory_v2_reclaimable_excludes_shmem(monkeypatch):
-    # F5: v2 reclaimable = inactive_file + active_file (file LRU), NOT the `file`
-    # type-counter (which also counts tmpfs/shmem on the anon LRU → over-states).
-    from genesis.runtime import cgroup
-
-    monkeypatch.setattr(
-        cgroup,
-        "_read_text",
-        lambda p: (
-            "file 5000\ninactive_file 2000\nactive_file 1800\nshmem 1200"
-            if p == "/sys/fs/cgroup/memory.stat"
-            else None
-        ),
-    )
-    assert cgroup.read_container_memory_reclaimable() == 3800  # 2000+1800, not 5000
-
-
-# ── cgroup v1 fallback (older hosts lack the v2 unified paths) ────────────────
-def test_cgroup_v1_memory_max_fallback(monkeypatch):
-    from genesis.runtime import cgroup
-
-    # v2 memory.max absent → read v1 memory.limit_in_bytes.
-    monkeypatch.setattr(
-        cgroup,
-        "_read_text",
-        lambda p: "16000000000" if p.endswith("memory/memory.limit_in_bytes") else None,
-    )
-    assert cgroup.read_container_memory_max() == 16000000000
-
-
-def test_cgroup_v1_unlimited_sentinel_is_none(monkeypatch):
-    from genesis.runtime import cgroup
-
-    monkeypatch.setattr(
-        cgroup,
-        "_read_text",
-        lambda p: "9223372036854771712" if "limit_in_bytes" in p else None,
-    )
-    assert cgroup.read_container_memory_max() is None  # sentinel → unlimited
-
-
-def test_cgroup_v1_reclaimable_fallback(monkeypatch):
-    from genesis.runtime import cgroup
-
-    def fake(path):
-        if path.endswith("memory/memory.stat"):  # v1 stat
-            return "total_inactive_file 1000\ntotal_active_file 500\nrss 200"
-        return None  # no v2 stat
-
-    monkeypatch.setattr(cgroup, "_read_text", fake)
-    assert cgroup.read_container_memory_reclaimable() == 1500
+# The cgroup reader tests (v1/v2 fallbacks, file-LRU reclaimable) moved with the
+# readers to tests/test_hostmetrics/test_readings.py.

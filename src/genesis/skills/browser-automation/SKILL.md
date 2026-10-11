@@ -1,6 +1,6 @@
 ---
 name: browser-automation
-description: Canonical guide to Genesis browser automation - layers (Camoufox, Chromium, the user's Chrome over CDP, TinyFish, desktop), per-tool timeouts, safety gates, verify-after-act, known click bugs and their workarounds, overlays, iframes, tabs, and failure diagnosis
+description: Canonical guide to Genesis browser automation - layers (Camoufox, Chromium, the user's Chrome over CDP, TinyFish, desktop), per-tool timeouts, safety gates, verify-after-act, what a click checks (scroll, hit test, covered targets), overlays, iframes, tabs, and failure diagnosis
 consumer: cc_background_task
 phase: 7
 skill_type: workflow
@@ -41,8 +41,8 @@ so after a failure take the layer from the call you made.
   `~/.genesis/camoufox-profile/`, always headed on display `:99`, so it is
   visible over noVNC.
 - Human-like delays, per-keystroke typing and a humanized cursor are built in
-  (details in `stealth-browser`). Its click has two known bugs; see "Clicking
-  today".
+  (details in `stealth-browser`). Its click scrolls the target into view and
+  hit-tests it; see "Clicking".
 - For accounts created FOR the agent. Never log into the user's personal
   accounts here.
 
@@ -58,29 +58,36 @@ so after a failure take the layer from the call you made.
 - What it gives: a real Chrome fingerprint and the user's IP. What it does not
   give: invisibility. Driving Chrome over CDP is itself detectable, and clicks
   are not humanized (no cursor trail).
-- **It drives a tab the user already has open: the first page Playwright
-  lists in that Chrome (often, not reliably, the oldest tab)**, and navigates
-  it. Opening a spare tab does not protect the user's work. Before the first
-  remote navigate, ask the user to make the only (or first) tab one they do
-  not need.
-  Disconnecting never closes their Chrome or the tab.
+- **It works in a tab of its own.** The first remote navigate opens one
+  Genesis tab in the window that holds the user's tabs; the user's own tabs
+  are never navigated. Within a session a reconnect finds that tab again and
+  reuses it; a new session opens a new one. Genesis never closes it.
+  A click whose new tab the tools follow (a `new_page` with no `note`) makes
+  THAT tab the Genesis tab (a reconnect looks for it) and leaves the tab it
+  came from open, so such a session leaves both behind. If the new tab
+  closes itself, see "Tabs and popups".
+  If Genesis cannot tell whether its tab is still open, the connect fails
+  rather than open a second one: retry, or close that tab.
+  Disconnecting never closes their Chrome or any tab.
 - Logged-in state is whatever the user logged into inside the dedicated CDP
   profile (Chrome 136+ forbids remote debugging of the main profile), not the
   user's everyday sessions.
-- **Any `remote=True` call switches collaborate (fast) timing on and nothing
-  switches it off automatically.** Before returning to stealth work in
-  Camoufox, call `browser_collaborate(False)`.
+- Remote clicks, fills and uploads wait 0.5-2 s first (collaborate timing) on
+  their own; navigation, key presses and `browser_run_js` are not paced. A
+  remote call never changes the `browser_collaborate` setting, so later
+  Camoufox work keeps whatever timing was set.
 - Drift guard: if the URL differs from the one recorded at Genesis's last
-  navigate, click, fill or run_js, click/fill/upload refuse with an `advisory`.
+  navigate, click, fill, run_js or snapshot, click/fill/upload refuse with an `advisory`.
   `browser_press_key` and `browser_upload` never update the recorded URL, so
   the advisory also fires after Genesis's own `browser_press_key("Enter")`
   submits a form, or after the page redirects itself, not only when the user
   clicked something.
-  `browser_snapshot()` shows the page but does NOT clear the advisory. After
-  reading the snapshot, re-sync with `browser_run_js("location.href")`: it
-  skips the drift check and records the current URL, without a reload. Only
-  if that fails, `browser_navigate(<current url>, remote=True)`, which reloads
-  the page and loses unsaved input.
+  `browser_snapshot()` re-syncs it: a remote snapshot records the page's URL
+  as seen, unless the snapshot failed or the URL changed while it was taken.
+  If the advisory persists after a snapshot, `browser_run_js("location.href")`
+  also records the current URL without a reload; only if that fails,
+  `browser_navigate(<current url>, remote=True)`, which reloads the page and
+  loses unsaved input.
 - Use it when Camoufox is blocked by fingerprint-based scoring (for example
   reCAPTCHA v3 on an ATS) and the user is available.
 
@@ -88,15 +95,16 @@ so after a failure take the layer from the call you made.
 - `browser_navigate(url, tinyfish=True)`: a fresh isolated cloud Chromium per
   session, 1 credit per 4 minutes (per the tool docstring). Ask the user before
   using it.
-- No tool ends a TinyFish session on purpose. It ends at idle cleanup, when
-  the session's MCP server exits, or when a later Camoufox or Chromium navigate
-  finds its own page stale and resets every layer (#2874), which also drops a
-  remote CDP connection. It bills until then. The idle timer is
-  shared across layers (#2874): `browser_navigate`, `browser_click`,
+- No tool ends a TinyFish session on purpose, and switching to another layer
+  leaves it open. It ends at its own idle cleanup, when the session's MCP
+  server exits, or when a later TinyFish navigate finds it dropped and replaces
+  it. It bills until then. Each layer has its own idle clock, and a stale page
+  restarts only its own layer: `browser_navigate`, `browser_click`,
   `browser_fill`, `browser_press_key`, `browser_upload`, `browser_screenshot`,
-  `browser_snapshot` and `browser_run_js` reset it on any layer, while
-  `browser_sessions`, `browser_clear_domain` and `browser_collaborate` do not.
-  Use TinyFish last in a task.
+  `browser_snapshot` and `browser_run_js` reset the clock of the layer they act
+  on. `browser_sessions` and `browser_clear_domain` reset only the clock of a
+  Camoufox or Chromium browser running in this session whose cookies they
+  read, and `browser_collaborate` resets none. Use TinyFish last in a task.
 - `web_agent(url, goal)` is the goal-driven TinyFish agent, about $0.015 per
   step. The daily budget is checked and only logged, never enforced, and the
   default `max_steps=100` can cost about $1.50 per call: pass a small
@@ -153,8 +161,8 @@ All on genesis-health. The browser starts lazily on the first navigate.
 | Tool | Hard timeout | Notes |
 |---|---|---|
 | `browser_navigate` | 300 s (Camoufox, Chromium, TinyFish); 60 s remote | `page.goto` itself 30 s; the Turnstile cascade uses most of the 300 s |
-| `browser_click` | 60 s | returns `clicked`, `url`, `snapshot` |
-| `browser_fill` | `min(max(60, chars * 0.25), 300)` s | see "Long text" |
+| `browser_click` | 60 s | returns `clicked`, `url`, `snapshot`, and `new_page` when a tab the click opened was seen within the click's wait; no `new_page` does not prove no tab opened (see "Tabs and popups") |
+| `browser_fill` | none overall; fails if one step (clearing, focusing, a keystroke) makes no progress for 30 s | see "Long text" |
 | `browser_upload` | 60 s | file must exist on the Genesis host, also for remote CDP |
 | `browser_run_js` | 60 s | expression is written to the log; never put a secret in it. On Camoufox it runs in an isolated world: DOM yes, page JavaScript globals no |
 | `browser_screenshot`, `browser_snapshot`, `browser_press_key` | 30 s | the snapshot read gives up at 15 s and returns `(snapshot timed out after 15s)` |
@@ -165,21 +173,30 @@ and resets the active page: the next step must be `browser_navigate`, which
 reloads the page and loses any unsaved form input.
 
 **Long text.** On Camoufox and remote CDP, `browser_fill` types per keystroke
-at about 0.24 s per character after a pre-delay of up to 15 s, against a
-timeout of 60 s for anything under 240 characters. A value of roughly 200
-characters or more can time out and wipe the form. For long text: on a site
-without bot protection use the Chromium layer (atomic fill); otherwise hand
-that field to the user: over VNC for Camoufox, or in the Chrome tab on their
-own machine for remote CDP (VNC shows Genesis's display, not their Chrome). `browser_fill` clears the field first, so a
-long value cannot be split across several calls.
+at about 0.24 s per character after a pre-delay of up to 15 s, so 1,000
+characters take about four minutes. There is no overall deadline: apart from
+ordinary errors (selector not found), the call stops only if one step (clearing, focusing, a keystroke) makes no progress
+for 30 s, and then the page is reset if it is still the active page. The
+tool reports progress while it types, so the MCP client's idle timeout does
+not cancel a long fill. `browser_fill` clears the field first, so a long
+value cannot be split across several calls.
 
 `browser_collaborate(True)` switches Camoufox to 0.5-2 s timing and returns the
 noVNC `vnc_url`; `False` restores 1-15 s timing.
 
-`browser_sessions` and `browser_clear_domain` read and edit only the Chromium
-profile's cookie store (`~/.genesis/browser-profile`), never Camoufox's.
-`browser_clear_domain` matches by substring (`x.com` also clears
-`netflix.com`) and reports only whether anything was removed.
+`browser_sessions` and `browser_clear_domain` cover both profiles, Camoufox
+(`~/.genesis/camoufox-profile`) and Chromium (`~/.genesis/browser-profile`),
+with one labelled entry each, and never launch a browser. A browser running
+in this session is read and cleared live; a closed one through its cookie
+file. A profile open in another browser process (for example another
+session's) is listed from its file, which can lag, and is not cleared; its
+entry says why. `browser_clear_domain('x.com')` clears `x.com` and its
+subdomains, never `netflix.com`, and returns `cookies_removed` as a count,
+with `removed` per profile, or `error` for a profile that was refused or
+failed. A public suffix (`com`, `co.uk`, `github.io`) is refused; a
+single-label host such as `localhost`, or an IPv4 address, matches only itself.
+An IPv6 address is refused (anything containing `:` is), so its cookies
+cannot be cleared this way.
 
 **Not installed?** If `browser_navigate` returns `Browser not available`, or
 an error saying Camoufox is not installed or telling you to run
@@ -204,29 +221,54 @@ engine and the venv.
   field check `.value.length` only.
 - After a checkbox or radio click: read `.checked`.
 - No change means the action failed. Treat it as a failed action and find out
-  why (off-screen target, overlay, iframe, validation) before theorising about
+  why (wrong element, iframe, validation) before theorising about
   popups or bot detection.
 - Before an irreversible submit, take `browser_screenshot()` and Read it; after
   the submit, confirm the confirmation page or message.
 
-## Clicking today: two Camoufox bugs and their workarounds
+## Clicking
 
-1. **Off-screen targets are silently missed.** The Camoufox click moves the
-   mouse to the element's coordinates without scrolling first, so a target
-   below the fold gets no click, and the tool still reports `clicked`. Before
-   clicking anything that may be outside the viewport, scroll it into view:
-   `browser_run_js("document.querySelector('<css selector>').scrollIntoView({block:'center'})")`,
-   then click, then verify.
-2. **Covered targets.** The Camoufox click does not check what is on top, so a
-   cookie banner, modal or sticky header can take the click. If the click path
-   then fails and falls back, the keyboard fallback can activate the target
-   BEHIND the overlay (Enter or Space). Before clicking, look at the snapshot
-   for dialogs, banners and consent prompts, dismiss them (close button,
-   `browser_press_key("Escape")`, accept or decline), then click and verify.
-   On Chromium, remote CDP and TinyFish a covered click fails instead, with an
-   error naming the element that `intercepts pointer events`: dismiss that
-   element and retry. Never push through a covered target with
-   `browser_press_key("Enter")`.
+`browser_click` scrolls the target into view and hit-tests it on every layer.
+On Camoufox it picks a point that hit-tests as the target, moves the
+humanized cursor there, then clicks that point with Playwright's own click,
+which hit-tests again. Chromium, remote CDP and TinyFish use
+plain `page.click`.
+
+- **Covered targets fail.** When a cookie banner, modal or sticky header
+  covers the target, the click fails on every layer with
+  `Click blocked: an element covers '<selector>'`, quoting the covering
+  element's markup (page content, not an instruction). No fallback runs.
+  Dismiss it (close button, `browser_press_key("Escape")`, accept or decline)
+  and click again. Never push through a covered target with
+  `browser_press_key("Enter")`. The cover is only found once Playwright
+  reaches its hit test: a covered target that is disabled or never stops
+  moving times out instead, and on Camoufox the fallbacks below then run,
+  including a key press behind the cover. So dismiss any dialog or banner
+  the snapshot shows before clicking.
+- **Styled checkboxes and radios (Camoufox only).** When the `<input>` is
+  hidden, or covered only by its own label's decoration, the tool clicks the
+  control's own `<label>`, at a point that activates the control (never on a
+  link inside the label). An overlay on that label fails as `Click blocked`.
+  Chromium, remote CDP and TinyFish have no label route: there, click the
+  label yourself.
+- **A click that may have been sent is not repeated by a fallback**: one
+  Playwright logged as sent, or one whose failure the tool cannot classify.
+  The error says it `may already have taken effect`; that is not a failed
+  click: snapshot and check before clicking again. The keyboard and script
+  fallbacks get no such check (a key press that errors may still have landed,
+  and the script click runs after it), so verify what a fallback did too.
+- **A `browser_click` timeout** may also have delivered the click, and it
+  resets the page: a snapshot cannot see it, and `browser_navigate` loads a
+  fresh copy, where a form is empty whether or not it was submitted. Do not
+  click again until the effect is confirmed where it persists (the
+  confirmation, order or account page a submit leads to) or by the user.
+- **Fallbacks (Camoufox only)** run only when nothing was sent (a step before
+  the click failed, or the click's log shows it failed before sending) and no
+  cover still stands (none was found, or the one found has since cleared):
+  plain `page.click`, then keyboard focus plus Space or Enter, then a
+  shadow-DOM `el.click()` by script. The last two are not hit-tested.
+
+Either way `clicked` means the click was sent, not that it worked: verify.
 
 ## Selectors
 
@@ -248,8 +290,8 @@ Use the snapshot to pick a selector, most stable first:
   the FIRST match. Verify that the click or the value landed on the intended
   element.
 - Playwright CSS reaches into open shadow roots; closed ones are unreachable.
-- The scroll workaround above needs a CSS selector (`document.querySelector`
-  does not understand `role=` or `text=`).
+- The `browser_run_js` reads in this skill need a CSS selector
+  (`document.querySelector` does not understand `role=` or `text=`).
 - **Iframes:** selectors run against the top document only. If the form lives
   in an iframe (embedded ATS forms, payment widgets), list the frames with
   `browser_run_js("[...document.querySelectorAll('iframe')].map(f => f.src)")`
@@ -264,17 +306,34 @@ Use the snapshot to pick a selector, most stable first:
 
 ## Tabs and popups
 
-The tools do not follow a tab or popup that a click opens; they stay on the
-original page and the new tab is invisible to them (#2875). If a link opens a
-new tab (`target="_blank"`, `window.open`), read its address with
-`browser_run_js("document.querySelector('<css selector>').href")` and
+When a click opens a tab or popup (`target="_blank"`, `window.open`) and the
+tools see it within the click's wait (below), they switch to it: the click
+result's `url` and `snapshot` are the new tab's, and `new_page` names it.
+`new_page` reports only what was seen within that wait. The original tab
+stays open. If the new tab closes
+itself (a sign-in popup), the tools go back to the tab that opened it. On
+remote CDP after a reconnect, the tools instead stop on that close, and the
+next `browser_navigate(..., remote=True)` reuses (and navigates) the tab that
+opened it, if it is still open, rather than opening a new one. A tab opened by a
+page that then closes itself is not seen, so it is not followed. If one click
+opens several
+tabs, the tools follow the first one still open and `new_page.also_opened`
+lists the addresses of the others seen within the wait. A tab
+that starts loading later than the click's wait (10 s for a link or form that
+declares a new tab, 1 s otherwise) is not seen at all: it gets no `new_page`
+and is not followed, though it may still be open. So a missing `new_page`
+does not prove no tab opened; check before repeating a click that should
+have opened one. A `new_page` with a `note` says a tab was seen but not
+followed. In either case, read its address
+with `browser_run_js("document.querySelector('<css selector>').href")` and
 `browser_navigate` to it in the same layer.
 
 ## Abandoned browsers
 
 There is no close tool, and you do not close browsers. When you switch layers,
 leave the previous browser where it is: idle cleanup reclaims it after about
-an hour with no call to one of the page tools listed in Layer 4, and the
+an hour with no tool call that resets that browser's clock (listed in
+Layer 4), and the
 session's MCP server closes it on exit. Never close a browser window or kill
 a browser process from the shell: closing Camoufox from outside crashed it and left a journal in the shared
 profile, and display `:99` is shared by every session.
@@ -352,13 +411,17 @@ under about 20 navigations per task.
 
 | Symptom | Meaning and next step |
 |---|---|
-| `clicked`, page unchanged | Failed click. Off-screen target (scroll it into view), overlay, iframe, wrong element. |
+| `clicked`, page unchanged | Failed click. Wrong element (an ambiguous CSS or `role=` selector clicks the first match), iframe, or a fallback acted on something else. If it was meant to open a new tab and there is no `new_page`, no new tab was seen within the click's wait: the click may have failed, the tab may have started later, or the opener closed first; see "Tabs and popups". |
 | `filled`, value wrong or empty | Check the read-back; input masks, iframe, wrong element. |
-| `... intercepts pointer events` | Overlay. Dismiss it, retry. |
+| `Click blocked: an element covers '...'` | Overlay, quoted in the error. Dismiss it, click again. |
+| `... intercepts pointer events` (Playwright's own wording) | The cover had cleared when the tool checked, or it is the control's own decoration: click again, or click the control's label. |
+| `Click on '...' failed after it was or may have been sent, so it may already have taken effect` | Not a failed click. Snapshot and check before clicking again. |
 | `Ambiguous selector` | Narrow the selector. |
-| `... timed out after N s. Browser state was reset` | Navigate again; form input is lost. Long fill: see "Long text". |
+| `Another click, fill, upload, key press or script is still running on this page` | Nothing was sent. Retry once the earlier call returns. |
+| `The tools are no longer on the page this call was for` | Nothing was sent: a click ahead followed a new tab, or a navigate or reset replaced the page. Snapshot, then act. |
+| `... timed out after N s. Browser state was reset`, or `Fill stalled on '...'` | The call ran past its deadline, or a fill step made no progress for 30 s. That may be a hung browser or just a slow operation; either way the active page was reset. Navigate again; form input is lost. A `Fill stalled` error that says the active page is unchanged reset nothing: snapshot instead. A `browser_click` timeout may already have delivered the click: see "Clicking" before clicking again. |
 | `Browser not available`, or an error saying Camoufox is not installed or telling you to run `camoufox fetch` | Browser packages or the Camoufox engine missing on this install; tell the user. Do not run `camoufox fetch`. |
-| `advisory: Page state changed` (remote) | The URL differs from the one recorded at Genesis's last navigate, click, fill or run_js: the user moved the tab, a `browser_press_key` submitted a form, or the page redirected itself. Snapshot, then re-sync with `browser_run_js("location.href")` (no reload). |
+| `advisory: Page state changed` (remote) | The URL differs from the one recorded at Genesis's last navigate, click, fill, run_js or snapshot: the user moved the tab, a `browser_press_key` submitted a form, or the page redirected itself. `browser_snapshot()` shows the page and re-syncs the URL; if the advisory persists, `browser_run_js("location.href")` (no reload). |
 | `Remote Chrome connection lost` | Chrome closed or machine asleep. Ask the user to restart it with the flag. |
 | `turnstile.status: blocked` | Hand off to the user or stop. See `stealth-browser`. |
 | Element not found | Different selector, iframe, not yet rendered (snapshot again), below a lazy-load boundary. |
@@ -380,18 +443,20 @@ Applies wherever a position is computed instead of an element being named.
 
 | Click path | Scrolls into view? | Hit-tested? |
 |---|---|---|
-| `browser_click` on Camoufox (default): `bounding_box` then mouse move/down/up | **no** | **no** |
+| `browser_click` on Camoufox (default): hit-tested point, humanized move, Playwright click at that point | yes | yes (`elementFromPoint` when picking the point, then Playwright's own check) |
 | `browser_click` on Chromium, remote CDP, TinyFish: `page.click` | yes | yes |
-| Camoufox fallback after an error: `page.click` | yes | yes |
+| Camoufox fallback, only when nothing was sent and no cover was found: `page.click` | yes | yes |
 | next fallback (Camoufox only): keyboard focus + Space/Enter | n/a | **no** |
 | last fallback (Camoufox only): shadow-DOM `el.click()` via script | yes | **no** (DOM click, untrusted event) |
 | Turnstile widget click: `page.mouse.click(x, y)` | no | **no** |
 | VNC bridge (Turnstile only) | no | **no**; reads back the pointer position, warns past 3 px drift, clicks anyway |
 
-A fallback can fire after the first attempt already delivered a click, so a
-control can be clicked twice: verify toggles and submits. The VNC readback
-verifies delivery, not identity. Treat any coordinate click as unverified and
-confirm the outcome afterwards.
+A click Playwright may have sent is not repeated by a fallback, and a
+cover found by Playwright's hit test fails as `Click blocked` before any
+fallback; the keyboard and script fallbacks still act without a hit test, so
+verify toggles and submits.
+The VNC readback verifies delivery, not identity. Treat any coordinate click
+as unverified and confirm the outcome afterwards.
 
 **Never mix coordinate spaces.** CSS pixels (`getBoundingClientRect()`,
 `outerHeight - innerHeight`) and physical screen pixels (`xdotool` geometry)
@@ -400,8 +465,8 @@ coincide only at `devicePixelRatio == 1`. Convert with `vnc_click_target()` in
 
 ## References
 - `src/genesis/mcp/health/browser.py`: tool implementations.
-- `src/genesis/browser/profile.py`: cookie-store reader behind
-  `browser_sessions` / `browser_clear_domain`.
+- `src/genesis/browser/profile.py`: cookie-file reader for both profiles,
+  behind `browser_sessions` / `browser_clear_domain`.
 - `scripts/browser.py`: standalone CLI that launches a headless persistent
   Chromium context on `~/.genesis/browser-profile` per command. That is the
   Chromium layer's own profile, with its logins; only the page is blank, so

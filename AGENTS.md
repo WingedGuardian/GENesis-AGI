@@ -248,7 +248,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 Each entry gives the full path to the skill's instruction file. The filename is usually `SKILL.md` but not always, so read the path as given rather than assuming one — and never infer a path from the name, because the name is not the directory. Some skills nest inside a container (`gitnexus-cli` lives under `.claude/skills/gitnexus/`, not `.claude/skills/gitnexus-cli/`), and skills live under two roots.
 
 - **aws-fde-delivery** (`src/genesis/skills/aws-fde-delivery/SKILL.md`) — Forward Deployed Engineer delivery contract for AWS engagements, build-first artifacts, grounded cost estimates, Well-Architected review, evolution roadmap
-- **browser-automation** (`src/genesis/skills/browser-automation/SKILL.md`) — Canonical guide to Genesis browser automation - layers (Camoufox, Chromium, the user's Chrome over CDP, TinyFish, desktop), per-tool timeouts, safety gates, verify-after-act, known click bugs and their workarounds, overlays, iframes, tabs, and failure diagnosis
+- **browser-automation** (`src/genesis/skills/browser-automation/SKILL.md`) — Canonical guide to Genesis browser automation - layers (Camoufox, Chromium, the user's Chrome over CDP, TinyFish, desktop), per-tool timeouts, safety gates, verify-after-act, what a click checks (scroll, hit test, covered targets), overlays, iframes, tabs, and failure diagnosis
 - **cc-update** (`.claude/skills/cc-update/SKILL.md`) — Update Claude Code (the CC CLI / "clog code") to a new version, or bump the pinned CC version. Use when the user asks to update Claude Code, bump the CC pin, evaluate a new CC release, or says "clog code update". Routes to the canonical, standardized process in docs/reference/cc-compatibility.md — do NOT re-derive the update mechanism by grepping every time. Do NOT use for general "what changed in CC" trivia with no intent to update.
 - **closing-session** (`.claude/skills/closing-session/SKILL.md`) — This skill should be used when a session's job is to DRIVE OPEN PRs TO MERGE rather than to write new code — "close out the open PRs", "review and fix the open PRs", "what's blocking our PRs", "which PRs are mergeable". It owns the In Review column: it reads each PR's gate status, verifies and fixes review findings on PRs OTHER sessions built, replies in-thread, and stops at the merge gate for the user's per-PR approval. Do NOT load it for building a feature and opening its PR — that is a build session (`genesis-development`).
 - **code-intelligence** (`.claude/skills/code-intelligence/SKILL.md`) — Code understanding tool selection. Use when exploring architecture, finding definitions, tracing call chains, assessing blast radius of changes, or debugging code paths in the Genesis codebase.
@@ -306,7 +306,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - `board_promote` — Propose turning a private ledger row or follow-up into a PUBLIC GitHub issue on the work board. Held for the owner's approval; nothing is posted by this call.
 - `board_status` — The work board as the reconciler last read it: counts by column, by Genesis status and by kind, coverage (open repo issues and PRs on the board against the repo's open total), drags logged, and whether the reconciler is alive. Reads stored heartbeats only, never GitHub, so it is cheap and safe.
 - `bootstrap_manifest` — Which subsystems initialized successfully, failed, or degraded at startup.
-- `browser_clear_domain` — Clear cookies for a specific domain (selective logout).
+- `browser_clear_domain` — Clear cookies for a domain and its subdomains (selective logout).
 - `browser_click` — Click an element on the current page by CSS selector or text.
 - `browser_collaborate` — Toggle collaborative timing mode.
 - `browser_fill` — Fill a form field on the current page.
@@ -314,7 +314,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - `browser_press_key` — Press a keyboard key on the current page.
 - `browser_run_js` — Execute JavaScript in the browser's console on the current page.
 - `browser_screenshot` — Take a screenshot of the current page.
-- `browser_sessions` — List logged-in sessions from the persistent browser profile.
+- `browser_sessions` — List logged-in sessions in both local browser profiles.
 - `browser_snapshot` — Return the accessibility tree of the current page.
 - `browser_upload` — Upload a file to a file input element on the current page.
 - `build_lane_status` — What has the autonomous capability-build lane done — and how well do its verdicts track your decisions?

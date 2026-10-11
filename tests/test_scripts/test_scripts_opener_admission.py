@@ -151,6 +151,48 @@ def _scope_consults_fence(chain) -> bool:
     return False
 
 
+def _provider_config_reader(rel, node, chain) -> bool:
+    """One native read-only _config.db site is outside Genesis DB admission.
+
+    Match the call itself, not the module/function as an allowlist: any added
+    or changed opener still owes classification or the Genesis fence.
+    """
+    expected = ast.parse(
+        'sqlite3.connect((cache / "_config.db").as_uri() + "?mode=ro", uri=True)', mode="eval"
+    ).body
+    return (
+        rel == "codebase_managed.py"
+        and bool(chain)
+        and chain[0].name == "verify_cache"
+        and ast.dump(node) == ast.dump(expected)
+    )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        'sqlite3.connect("genesis.db")',
+        'sqlite3.connect((cache / "other.db").as_uri() + "?mode=ro", uri=True)',
+        'sqlite3.connect((cache / "_config.db").as_uri(), uri=True)',
+    ],
+)
+def test_provider_exception_does_not_exempt_another_opener(tmp_path, monkeypatch, extra):
+    tree = ast.parse((_SCRIPTS / "codebase_managed.py").read_text())
+    verify = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "verify_cache"
+    )
+    calls = list(_connect_calls(tree))
+    assert len(calls) == 1 and _provider_config_reader("codebase_managed.py", *calls[0])
+    verify.body.append(ast.parse(extra).body[0])
+    (tmp_path / "codebase_managed.py").write_text(ast.unparse(tree))
+    monkeypatch.setitem(globals(), "_SCRIPTS", tmp_path)
+    monkeypatch.setitem(globals(), "_ALLOWLIST", {})
+    with pytest.raises(AssertionError, match="raw sqlite3.connect without"):
+        test_every_scripts_opener_consults_the_admission_fence()
+
+
 def test_every_scripts_opener_consults_the_admission_fence():
     """ALLOWLIST polarity: a new raw opener without the fence check FAILS.
 
@@ -187,6 +229,8 @@ def test_every_scripts_opener_consults_the_admission_fence():
                             "use the unaliased module name"
                         )
         for node, chain in _connect_calls(tree):
+            if _provider_config_reader(rel, node, chain):
+                continue
             if rel in _ALLOWLIST:
                 seen_allowlisted.add(rel)
                 continue

@@ -27,7 +27,7 @@ Do not re-implement any of this.
 | Fingerprint | Camoufox engine | Firefox-based, spoofed at engine level |
 | Delay before `browser_click`, `browser_fill`, `browser_upload` | all layers below | see Timing |
 | Per-keystroke typing | Camoufox, remote CDP | field cleared first; key hold log-normal, median 86 ms (clamped 30-200 ms, p95 ~153 ms); 50-200 ms between keys; 5% of gaps are 0.3-1 s pauses. Chromium and TinyFish fill atomically |
-| Cursor | Camoufox | `humanize=2.5` cursor trail, hover, 50-200 ms dwell, click inside the central 60% of the element, 40-120 ms press. No scroll and no hit test: see `browser-automation`, "Clicking today" |
+| Cursor | Camoufox | scrolls the target into view, `humanize=2.5` cursor trail to a point in the central 60% of the element that hit-tests as the element (when none does, Playwright picks the point), 50-200 ms dwell, 40-120 ms press through Playwright's click, which hit-tests again. A cover the hit test finds fails as `Click blocked` naming it; a styled checkbox or radio is clicked through its own label. See `browser-automation`, "Clicking" |
 | Turnstile | Camoufox, Chromium | detected and worked on inside `browser_navigate` (below) |
 | Keyboard repeat | `browser_press_key` | 50-150 ms between repeats, no pre-delay |
 
@@ -46,9 +46,10 @@ easier to detect than doing nothing.
 | Remote CDP | 0.5-2 s uniform, always |
 | Chromium, TinyFish | none |
 
-Collaborate timing stays on after any `browser_navigate(..., remote=True)` call
-and after a VNC hand-off. Call `browser_collaborate(False)` before stealth work
-in Camoufox, or every later action runs at the fast 0.5-2 s pace.
+Remote CDP uses fast timing on its own and never changes this setting. Timing
+set with `browser_collaborate(True)` (for example for a VNC hand-off) stays on:
+call `browser_collaborate(False)` before stealth work in Camoufox, or every
+later click, fill and upload runs at the fast 0.5-2 s pace.
 
 The delays are automatic. Never add sleeps, and never "wait 1-3 s" yourself.
 Spend the time reading the snapshot and planning the next action instead.

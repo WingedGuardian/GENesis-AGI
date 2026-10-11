@@ -236,7 +236,15 @@ def test_no_unisolated_local_yaml_resolver():
     # graphstore.local.yaml as one place to set `mode: networkx`; the mode reaches
     # the loop as a collector fact read through genesis.memory.graphstore_config
     # (infra_profile/collectors/falkordb_facts.py), never through this path.
-    prose_mentions = {"mcp/health/reflex_status.py", "cc/conversation.py", "awareness/loop.py"}
+    # session_awareness/handoff_send.py: reads peers through merge_local_overlay
+    # (strict); peers.local.yaml and handoffs.local.yaml appear only in operator
+    # messages, including one inside the constant program it runs on a peer.
+    prose_mentions = {
+        "mcp/health/reflex_status.py",
+        "cc/conversation.py",
+        "awareness/loop.py",
+        "session_awareness/handoff_send.py",
+    }
     accounted = independent_resolvers | shared_seam_users | prose_mentions
 
     found: set[str] = set()
