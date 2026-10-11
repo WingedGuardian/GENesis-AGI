@@ -222,7 +222,7 @@ def test_branch_email_and_binary_steps_read_the_branch_history():
     """Codex P1/P2 (round 2): both steps read only the tip. On a branch push
     they now also read the branch range, so they must carry it."""
     steps = _load(_BRANCH)["jobs"]["branch-leak-scan"]["steps"]
-    for sub in ("email", "binary"):
+    for sub in ("email", "binary", "detect-secrets"):
         (step,) = [s for s in steps if str(s.get("run", "")).endswith(f"leak_scan.sh {sub}")]
         assert step["env"]["LEAK_SCAN_RANGE"] == "branch", sub
         assert step["env"]["EVENT_NAME"] == "${{ github.event_name }}", sub
@@ -230,7 +230,7 @@ def test_branch_email_and_binary_steps_read_the_branch_history():
 
 def test_ci_email_and_binary_steps_stay_tip_only():
     steps = _load(_CI)["jobs"]["leak-detector"]["steps"]
-    for sub in ("email", "binary"):
+    for sub in ("email", "binary", "detect-secrets"):
         (step,) = [s for s in steps if str(s.get("run", "")).endswith(f"leak_scan.sh {sub}")]
         assert "LEAK_SCAN_RANGE" not in (step.get("env") or {}), sub
 
@@ -242,6 +242,10 @@ _GIT_ENV = {
     "GIT_COMMITTER_EMAIL": "ci@example.com",
     "GIT_CONFIG_NOSYSTEM": "1",
 }
+
+
+#: Synthetic; exists only in tmp_path scratch repos built by these tests.
+_HEX_VALUE = "8f14e45fceea167a5a36dedd4bea2543c1f6d2b2a7f0c5d9e3b1a6f4c8d2e0b9"
 
 
 def _history_repo(tmp_path: Path) -> Path:
@@ -270,17 +274,26 @@ def _history_repo(tmp_path: Path) -> Path:
     (root / "tests").mkdir()
     (root / "tests" / "t.py").write_text('X = "fixture@personal-domain.org"\n', encoding="utf-8")
     (root / "data.db").write_bytes(b"SQLite format 3\x00")
+    (root / "rec.WAV").write_bytes(b"RIFF")
+    # A context-free high-entropy value: detect-secrets flags it, gitleaks'
+    # keyword-anchored generic rule does not.
+    (root / "src" / "n.py").write_text(f'nonce = "{_HEX_VALUE}"\n', encoding="utf-8")
     git("add", "-A")
     git("commit", "-q", "-m", "add")
-    git("rm", "-q", "src/a.py", "data.db")
+    git("rm", "-q", "src/a.py", "data.db", "rec.WAV", "src/n.py")
     git("commit", "-q", "-m", "remove")
     return root
 
 
 def _run_step(root: Path, step: str, *, branch: bool) -> subprocess.CompletedProcess:
     import os
+    import sys
 
     env = {**os.environ, **_GIT_ENV, "HOME": str(root), "EVENT_NAME": "push"}
+    # detect-secrets is a core dependency: the interpreter's bin dir has it.
+    env["PATH"] = f"{Path(sys.executable).parent}{os.pathsep}{env.get('PATH', '')}"
+    env["LEAK_SCAN_WORKDIR"] = str(root.parent / "work")
+    (root.parent / "work").mkdir(exist_ok=True)
     env.pop("LEAK_SCAN_RANGE", None)
     if branch:
         env["LEAK_SCAN_RANGE"] = "branch"
@@ -316,6 +329,35 @@ def test_binary_scan_reads_the_branch_history(tmp_path: Path):
     cp = _run_step(root, "binary", branch=True)
     assert cp.returncode == 1, cp.stdout + cp.stderr
     assert "data.db" in cp.stdout
+    # The suffix match ignores case (Codex P2, round 3).
+    assert "rec.WAV" in cp.stdout
+
+
+def test_binary_scan_matches_suffixes_in_any_case_at_the_tip(tmp_path: Path):
+    """recording.WAV or model.ONNX at the tip is the same artifact as its
+    lower-case spelling. A lower-case-only pathspec missed it (Codex P2)."""
+    root = _history_repo(tmp_path)
+    (root / "nested").mkdir()
+    (root / "nested" / "model.ONNX").write_bytes(b"onnx")
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    cp = _run_step(root, "binary", branch=False)
+    assert cp.returncode == 1, cp.stdout + cp.stderr
+    assert "nested/model.ONNX" in cp.stdout
+
+
+def test_detect_secrets_reads_the_branch_history(tmp_path: Path):
+    """A context-free high-entropy value added and removed inside the branch is
+    public in its history; gitleaks' generic rule needs a keyword nearby, so
+    only detect-secrets sees it (Codex P1, round 3). The tip half misses it
+    (control); the branch half names the commit and path, never the value."""
+    root = _history_repo(tmp_path)
+    tip_only = _run_step(root, "detect-secrets", branch=False)
+    assert tip_only.returncode == 0, tip_only.stdout + tip_only.stderr
+    cp = _run_step(root, "detect-secrets", branch=True)
+    assert cp.returncode == 1, cp.stdout + cp.stderr
+    assert "1 in the branch history" in cp.stdout
+    assert re.search(r"[0-9a-f]{12}/src/n\.py", cp.stdout)
+    assert _HEX_VALUE not in cp.stdout + cp.stderr
 
 
 def test_history_steps_fail_closed_without_a_range(tmp_path: Path):
@@ -323,6 +365,6 @@ def test_history_steps_fail_closed_without_a_range(tmp_path: Path):
     rather than reporting a clean scan of nothing."""
     root = _history_repo(tmp_path)
     subprocess.run(["git", "update-ref", "-d", "refs/remotes/origin/main"], cwd=root, check=True)
-    for step in ("email", "binary"):
+    for step in ("email", "binary", "detect-secrets"):
         cp = _run_step(root, step, branch=True)
         assert cp.returncode == 3, (step, cp.stdout + cp.stderr)

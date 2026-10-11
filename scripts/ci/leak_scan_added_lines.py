@@ -221,15 +221,13 @@ def _path_from_header(raw: bytes) -> str:
     return name[2:] if name.startswith("b/") else name
 
 
-def added_lines_with_paths(spec: tuple[str, str], cwd: str | None = None) -> list[str]:
-    """Each added line in the range as ``<path>:<commit12>:<content>``.
+def _added_rows(spec: tuple[str, str], cwd: str | None = None):
+    """Yield ``(path, commit12, content)`` for each added line in the range.
 
-    For the history half of the email scan, which scopes by path and reports
-    ``path:commit`` locations. A ``+++`` line is a file header only before the
-    first hunk of its ``diff --git`` section, so added content that itself
-    begins ``++`` is kept as content.
+    A ``+++`` line is a file header only before the first hunk of its
+    ``diff --git`` section, so added content that itself begins ``++`` is kept
+    as content.
     """
-    out: list[str] = []
     commit = path = ""
     in_header = False
     for raw in _patch_stream(spec, cwd):
@@ -243,8 +241,45 @@ def added_lines_with_paths(spec: tuple[str, str], cwd: str | None = None) -> lis
         elif raw.startswith(b"@@"):
             in_header = False
         elif not in_header and raw.startswith(b"+") and path:
-            out.append(f"{path}:{commit}:{raw[1:].decode('utf-8', errors='replace')}")
-    return out
+            yield path, commit, raw[1:].decode("utf-8", errors="replace")
+
+
+def added_lines_with_paths(spec: tuple[str, str], cwd: str | None = None) -> list[str]:
+    """Each added line in the range as ``<path>:<commit12>:<content>``.
+
+    For the history half of the email scan, which scopes by path and reports
+    ``path:commit`` locations.
+    """
+    return [f"{path}:{commit}:{content}" for path, commit, content in _added_rows(spec, cwd)]
+
+
+#: The tree the tip detect-secrets scan covers; the history half uses the same.
+DETECT_SECRETS_ROOTS = ("src/", "config/", "scripts/", ".github/")
+
+
+def materialize(spec: tuple[str, str], dest: str, cwd: str | None = None) -> int:
+    """Write each commit's added lines to ``<dest>/<commit12>/<path>``.
+
+    For the history half of the detect-secrets scan: the scanner reads files,
+    so every line a branch commit added under the tip scan's roots is written
+    to a file named by its commit and path, and a finding is located by those
+    two without printing the value. A path that would escape ``dest`` is
+    refused. Returns the number of files written.
+    """
+    root = os.path.realpath(dest)
+    files: dict[str, list[str]] = {}
+    for path, commit, content in _added_rows(spec, cwd):
+        if not path.startswith(DETECT_SECRETS_ROOTS):
+            continue
+        target = os.path.realpath(os.path.join(root, commit, path))
+        if not target.startswith(root + os.sep):
+            raise RangeError(f"added path escapes the scan directory: {path!r}")
+        files.setdefault(target, []).append(content)
+    for target, lines in files.items():
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    return len(files)
 
 
 def added_lines(spec: tuple[str, str], cwd: str | None = None) -> str:
@@ -269,6 +304,15 @@ def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     print_range = "--range" in args
     with_paths = "--with-paths" in args
+    # --materialize DIR writes each commit's added lines under DIR, for the
+    # history half of the detect-secrets scan.
+    materialize_dir = ""
+    if "--materialize" in args:
+        idx = args.index("--materialize")
+        if idx + 1 >= len(args) or not args[idx + 1]:
+            print("::error::--materialize needs a directory. Failing closed.", file=sys.stderr)
+            return EXIT_UNRESOLVABLE
+        materialize_dir = args[idx + 1]
     event_name = os.environ.get("EVENT_NAME", "")
     push_before = os.environ.get("PUSH_BEFORE", "")
     head_sha = os.environ.get("HEAD_SHA", "")
@@ -294,6 +338,9 @@ def main(argv: list[str] | None = None) -> int:
             kind, value = spec
             # `X^!` is git's "commit X alone", the history form of `git show X`.
             print(value if kind == "range" else f"{value}^!")
+            return EXIT_OK
+        if materialize_dir:
+            print(materialize(spec, materialize_dir))
             return EXIT_OK
         out = "\n".join(added_lines_with_paths(spec)) if with_paths else added_lines(spec)
     except RangeError as exc:

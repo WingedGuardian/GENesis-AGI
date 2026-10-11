@@ -12,7 +12,8 @@
 #
 # Usage: scripts/ci/leak_scan.sh <step>
 #   install          pinned scanner install (detect-secrets, ripgrep)
-#   detect-secrets   secret scan over src/ config/ scripts/ .github/
+#   detect-secrets   secret scan over src/ config/ scripts/ .github/ (tip; plus
+#                    the branch history's added lines on a branch push)
 #   gitleaks         whole-tree gitleaks scan (version + checksum pinned, --redact)
 #   gitleaks-history gitleaks over every commit in the scan range (branch pushes)
 #   class            advisory class scan (never gating)
@@ -50,25 +51,54 @@ step_install() {
   sudo apt-get install -y ripgrep
 }
 
-step_detect_secrets() {
+_detect_secrets_scan() {
+  # $1: output JSON; remaining args: paths, relative to the current directory.
+  # Relative ONLY: MEASURED with detect-secrets 1.5.0, an absolute path outside
+  # the working directory is not scanned at all and reports no results.
+  local out="$1"
+  shift
   detect-secrets scan --all-files \
       --exclude-files '\.git/' \
       --exclude-files '__pycache__/' \
       --exclude-files '\.pyc$' \
       --exclude-files 'vendor/' \
-      src/ config/ scripts/ .github/ > "$WORK/ds-results.json"
-  local count
-  count=$(python3 -c "
+      "$@" > "$out"
+}
+
+_detect_secrets_count() {
+  python3 -c "
 import json, sys
 data = json.load(open(sys.argv[1]))
 results = data.get('results', {})
 real = sum(len([f for f in v if 'CACHEDIR' not in fp])
            for fp, v in results.items())
 print(real)
-" "$WORK/ds-results.json")
-  if [[ "$count" != "0" ]]; then
-    echo "::error::detect-secrets found $count potential secrets"
-    cat "$WORK/ds-results.json"
+" "$1"
+}
+
+step_detect_secrets() {
+  local count hist_count=0 hist_dir="$WORK/ds-history"
+  _detect_secrets_scan "$WORK/ds-results.json" src/ config/ scripts/ .github/
+  count="$(_detect_secrets_count "$WORK/ds-results.json")"
+  if [[ "${LEAK_SCAN_RANGE-}" == "branch" ]]; then
+    # A branch push publishes its whole history, so a secret added and then
+    # removed before the push is still public. Every line the branch's commits
+    # added under the same roots is written to <commit>/<path> in a scratch
+    # tree, which is scanned from inside so its paths are relative; a finding
+    # names the commit and path, never the value (the JSON holds hashes).
+    rm -rf -- "$hist_dir"
+    mkdir -p -- "$hist_dir"
+    if ! python3 scripts/ci/leak_scan_added_lines.py --materialize "$hist_dir" >/dev/null; then
+      echo "::error::detect-secrets history scan: the branch range could not be read. Failing closed."
+      exit 3
+    fi
+    (cd -- "$hist_dir" && _detect_secrets_scan "$WORK/ds-history.json" .)
+    hist_count="$(_detect_secrets_count "$WORK/ds-history.json")"
+  fi
+  if [[ "$count" != "0" || "$hist_count" != "0" ]]; then
+    echo "::error::detect-secrets found $count potential secret(s) at the tip and $hist_count in the branch history"
+    [[ "$count" == "0" ]] || cat "$WORK/ds-results.json"
+    [[ "$hist_count" == "0" ]] || cat "$WORK/ds-history.json"
     exit 1
   fi
   echo "Secret scan: CLEAN (0 findings)"
@@ -215,11 +245,15 @@ step_binary() {
   # unnoticed. Block any TRACKED artifact of these types (uses the git
   # index, so untracked local data is ignored).
   local data_globs data_allow hits
+  # :(icase) so recording.WAV or model.ONNX is caught as well: a filename's
+  # case does not change what the file holds (git pathspec magic, gitglossary).
   data_globs=(
-    '*.wav' '*.flac' '*.pcm' '*.mp3' '*.m4a' '*.ogg' '*.opus'
-    '*.db' '*.db-wal' '*.db-shm' '*.sqlite' '*.sqlite3'
-    '*.onnx'
-    '*speaker_registry*.json' 'ambient_enroll_*.json'
+    ':(icase)*.wav' ':(icase)*.flac' ':(icase)*.pcm' ':(icase)*.mp3'
+    ':(icase)*.m4a' ':(icase)*.ogg' ':(icase)*.opus'
+    ':(icase)*.db' ':(icase)*.db-wal' ':(icase)*.db-shm'
+    ':(icase)*.sqlite' ':(icase)*.sqlite3'
+    ':(icase)*.onnx'
+    ':(icase)*speaker_registry*.json' ':(icase)ambient_enroll_*.json'
   )
   # Allowlist: ':(exclude)path' entries for confirmed-legit files.
   data_allow=()

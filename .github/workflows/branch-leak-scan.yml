@@ -73,7 +73,14 @@ jobs:
       - name: Install tools
         run: bash scripts/ci/leak_scan.sh install
 
-      - name: Secret scan (detect-secrets)
+      - name: Secret scan (detect-secrets, tip and branch history)
+        # With the branch range set, the step also scans every line the
+        # branch's commits added, so a high-entropy value added and removed
+        # before the push is caught (gitleaks' generic rule needs a keyword).
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.sha }}
+          LEAK_SCAN_RANGE: branch
         run: bash scripts/ci/leak_scan.sh detect-secrets
 
       - name: Leak scan (gitleaks)
