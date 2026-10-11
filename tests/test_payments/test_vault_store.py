@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -22,6 +23,15 @@ PASSPHRASE = "quartz lantern ember noodle 41"
 VISA = "4242" * 4  # Stripe's public test Visa
 AMEX = "3782" + "822463" + "10005"  # Stripe's public test Amex
 FUTURE = f"12/{(datetime.now(UTC).year + 2) % 100:02d}"
+# A stand-in for scrypt that has the shape of a sealed key (header, stanza,
+# 43-character MAC, 106-byte payload), so the vault reads as intact.
+FAKE_SEALED = (
+    b"age-encryption.org/v1\n-> scrypt "
+    + b"c2FsdA 18\nd3JhcA\n--- "
+    + b"m" * 43
+    + b"\n"
+    + b"p" * 106
+)
 
 
 @pytest.fixture(scope="module")
@@ -84,15 +94,15 @@ class TestInit:
     def test_a_run_killed_before_the_identity_lands_reads_uninitialised_and_reruns(
         self, tmp_path, monkeypatch, killed_at
     ):
-        monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: b"sealed:" + data)
+        monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: FAKE_SEALED)
         path = tmp_path / "v"
         real_replace, real_link = os.replace, os.link
 
         def dying(real):
-            def call(src, dst):  # killed as this file is about to land
+            def call(src, dst, **kw):  # killed as this file is about to land
                 if str(dst).endswith(killed_at):
                     raise KeyboardInterrupt
-                real(src, dst)
+                real(src, dst, **kw)
 
             return call
 
@@ -108,7 +118,7 @@ class TestInit:
         assert not list(path.glob(".*.tmp"))
 
     def test_tightens_a_loose_existing_directory(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: b"sealed")
+        monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: FAKE_SEALED)
         path = tmp_path / "v"
         path.mkdir(mode=0o755)
         os.chmod(path, 0o755)
@@ -119,7 +129,7 @@ class TestInit:
 class TestInitRefusals:
     @pytest.fixture(autouse=True)
     def _fast_seal(self, monkeypatch):
-        monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: b"sealed:" + data)
+        monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: FAKE_SEALED)
 
     def test_scores_a_passphrase_longer_than_72_characters(self, tmp_path):
         long = " ".join(["quartz lantern ember noodle"] * 3)
@@ -154,17 +164,138 @@ class TestInitRefusals:
         with pytest.raises(vs.VaultError, match="incomplete"):
             _add(vault)
 
-    def test_an_identity_that_appears_mid_init_is_never_replaced(self, tmp_path, monkeypatch):
+    THEIRS = b"age1" + b"q" * 58 + b"\n"  # a hand-copied vault's public key (shape only)
+
+    def test_a_hand_copy_landing_after_our_recipient_keeps_its_own(self, tmp_path, monkeypatch):
         path = tmp_path / "v"
+        real_link = os.link
 
-        def racing_seal(data, pw):  # another init lands while this one seals
-            (path / vs.IDENTITY).write_bytes(b"theirs")
-            return b"ours"
+        def copy_lands_first(src, dst, **kw):  # their whole pair lands just before our link
+            if str(dst).endswith(vs.IDENTITY):
+                (path / vs.IDENTITY).write_bytes(b"theirs")
+                (path / vs.RECIPIENT).write_bytes(self.THEIRS)
+            return real_link(src, dst, **kw)
 
-        monkeypatch.setattr(age_passphrase, "encrypt", racing_seal)
-        with pytest.raises(FileExistsError):
+        monkeypatch.setattr(vs.os, "link", copy_lands_first)
+        with pytest.raises(vs.VaultError, match="appeared while this init ran"):
             vs.init_vault(PASSPHRASE, path)
         assert (path / vs.IDENTITY).read_bytes() == b"theirs"
+        assert (path / vs.RECIPIENT).read_bytes() == self.THEIRS
+        assert not list(path.glob(".*.tmp"))
+
+    @pytest.mark.parametrize("their_recipient", [THEIRS, None])
+    def test_a_hand_copy_landing_before_our_recipient_is_left_untouched(
+        self, tmp_path, monkeypatch, their_recipient
+    ):
+        path = tmp_path / "v"
+        real_create = vs._create_cards_db
+
+        def copy_lands_before_our_recipient(dfd):
+            real_create(dfd)
+            (path / vs.IDENTITY).write_bytes(b"theirs")
+            if their_recipient is not None:
+                (path / vs.RECIPIENT).write_bytes(their_recipient)
+
+        monkeypatch.setattr(vs, "_create_cards_db", copy_lands_before_our_recipient)
+        with pytest.raises(vs.VaultError, match="appeared while this init ran"):
+            vs.init_vault(PASSPHRASE, path)
+        assert (path / vs.IDENTITY).read_bytes() == b"theirs"
+        # Seen before this run's recipient was written: their files stay exactly as they were.
+        if their_recipient is None:
+            assert not (path / vs.RECIPIENT).exists()
+            with pytest.raises(vs.VaultError, match="incomplete"):
+                vs.check_ready(path)
+        else:
+            assert (path / vs.RECIPIENT).read_bytes() == their_recipient
+
+    def test_a_key_pair_that_does_not_match_is_refused_at_retire(self, vault):
+        ref = _add(vault)
+        other = x25519.Identity.generate()
+        (vault / vs.RECIPIENT).write_text(str(other.to_public()) + "\n")
+        with pytest.raises(vs.VaultError, match="do not match"):
+            vs.retire_card(ref, PASSPHRASE, vault)
+
+    @pytest.mark.parametrize("keep", [33, 40, 150, 255])
+    def test_a_truncated_identity_is_damage(self, vault, keep):
+        data = (vault / vs.IDENTITY).read_bytes()
+        assert len(data) == 256
+        (vault / vs.IDENTITY).write_bytes(data[:keep])
+        with pytest.raises(vs.VaultError, match="not a whole passphrase-sealed age key"):
+            vs.check_ready(vault)
+
+    def test_a_recipient_with_a_bad_checksum_is_an_error_in_status(self, vault):
+        text = (vault / vs.RECIPIENT).read_text().strip()
+        flipped = text[:-1] + ("q" if text[-1] != "q" else "p")
+        (vault / vs.RECIPIENT).write_text(flipped + "\n")
+        assert "recipient.txt" in vs.vault_status(vault)["error"]
+
+    def test_a_cards_table_of_another_shape_is_foreign(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: FAKE_SEALED)
+        path = tmp_path / "v"
+        path.mkdir(mode=0o700)
+        with sqlite3.connect(path / vs.CARDS) as conn:
+            conn.execute("CREATE TABLE cards (card_ref TEXT PRIMARY KEY, status TEXT)")
+            conn.execute(f"PRAGMA user_version = {vs.SCHEMA_VERSION}")
+        with pytest.raises(vs.VaultError, match="not an empty vault card database"):
+            vs.init_vault(PASSPHRASE, path)
+
+    def test_writes_go_to_the_locked_directory_even_if_another_is_moved_onto_the_path(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / "v"
+        placed = tmp_path / "placed"
+        real_create = vs._create_cards_db
+
+        def swap_mid_init(dfd):  # e.g. a restore places a vault while this one runs
+            placed.mkdir()
+            (placed / vs.IDENTITY).write_bytes(b"restored")
+            (placed / vs.RECIPIENT).write_bytes(b"age1restored\n")
+            path.rename(tmp_path / "old")
+            placed.rename(path)
+            real_create(dfd)
+
+        monkeypatch.setattr(vs, "_create_cards_db", swap_mid_init)
+        with pytest.raises(vs.VaultError, match="moved onto"):
+            vs.init_vault(PASSPHRASE, path)
+        assert sorted(p.name for p in path.iterdir()) == [vs.IDENTITY, vs.RECIPIENT]
+        assert (path / vs.IDENTITY).read_bytes() == b"restored"
+        assert (path / vs.RECIPIENT).read_bytes() == b"age1restored\n"
+
+    def test_a_card_holding_db_copied_in_before_publication_is_not_adopted(
+        self, tmp_path, monkeypatch, vault
+    ):
+        _add(vault)
+        path = tmp_path / "v"
+        real_check = vs.check_can_init
+        calls = []
+
+        def copy_after_the_last_check(p=None):
+            real_check(p)
+            calls.append(1)
+            if len(calls) == 2:  # under the lock, after the re-check: a full cards.db lands
+                shutil.copy(vault / vs.CARDS, path / vs.CARDS)
+
+        monkeypatch.setattr(vs, "check_can_init", copy_after_the_last_check)
+        with pytest.raises(vs.VaultError, match="sealed to an earlier key"):
+            vs.init_vault(PASSPHRASE, path)
+        assert not (path / vs.IDENTITY).exists()
+
+    def test_makes_an_existing_empty_cards_db_private(self, tmp_path):
+        path = tmp_path / "v"
+        path.mkdir(mode=0o700)
+        sqlite3.connect(path / vs.CARDS).close()
+        os.chmod(path / vs.CARDS, 0o644)
+        vs.init_vault(PASSPHRASE, path)
+        assert _mode(path / vs.CARDS) == 0o600
+        vs.check_ready(path)  # an add would not be refused as not private
+
+    def test_refuses_a_regular_file_at_the_vault_path_before_any_prompt(self, tmp_path):
+        path = tmp_path / "v"
+        path.write_text("not a vault")
+        with pytest.raises(vs.VaultError, match="not a directory you own"):
+            vs.check_can_init(path)
+        with pytest.raises(vs.VaultError, match="not a directory you own"):
+            vs.init_vault(PASSPHRASE, path)
 
 
 class TestParseCard:
@@ -384,8 +515,117 @@ class TestStatus:
                 pass
 
         monkeypatch.setattr(vs.sqlite3, "connect", lambda *a, **k: Locked())
-        with pytest.raises(vs.VaultError, match="could not be opened .database is locked"):
+        with pytest.raises(vs.VaultError, match="could not be read or written .database is locked"):
             vs.list_cards(vault)
+
+    def test_a_missing_cards_db_in_an_initialised_vault_is_data_loss(self, vault):
+        (vault / vs.CARDS).unlink()  # lost, or left out of a restore
+        status = vs.vault_status(vault)
+        assert status["cards"] is None and "cards.db is missing" in status["error"]
+        for call in (vs.list_cards, vs.check_ready):
+            with pytest.raises(vs.VaultError, match="cards.db is missing"):
+                call(vault)
+        with pytest.raises(vs.VaultError, match="cards.db is missing"):
+            _add(vault)
+        assert not (vault / vs.CARDS).exists()  # never recreated empty
+
+    def test_a_cards_table_of_another_shape_is_refused_not_queried(self, vault):
+        (vault / vs.CARDS).unlink()
+        with sqlite3.connect(vault / vs.CARDS) as conn:  # a cards table of another shape
+            conn.execute("CREATE TABLE cards (x)")
+            conn.execute(f"PRAGMA user_version = {vs.SCHEMA_VERSION}")
+        os.chmod(vault / vs.CARDS, 0o600)
+        with pytest.raises(vs.VaultError, match="not a vault card database"):
+            vs.list_cards(vault)
+        status = vs.vault_status(vault)
+        assert status["cards"] is None and "not a vault card database" in status["error"]
+
+    def test_a_constraint_error_is_not_called_damage(self):
+        exc = vs._translate(sqlite3.IntegrityError("UNIQUE constraint failed"))
+        assert "refused the operation" in str(exc) and "damaged" not in str(exc)
+
+    @pytest.mark.parametrize(
+        ("damage", "says"),
+        [
+            ("cards.db mode 000", "could not be read or written"),
+            ("cards.db 0 bytes", "not a vault card database (empty)"),
+            ("identity garbage", "not a whole passphrase-sealed age key"),
+            ("identity mode 000", "identity.age cannot be read"),
+            ("identity missing, cards remain", "identity.age is missing"),
+            ("recipient missing", "incomplete"),
+        ],
+    )
+    def test_every_damaged_state_is_an_error_and_writes_nothing(self, vault, damage, says):
+        _add(vault)
+        target = {"cards.db": vault / vs.CARDS, "identity": vault / vs.IDENTITY}.get(
+            damage.split()[0], vault / vs.RECIPIENT
+        )
+        if damage.endswith("mode 000"):
+            os.chmod(target, 0o000)
+        elif damage.endswith("0 bytes"):
+            target.write_bytes(b"")
+        elif damage.endswith("garbage"):
+            target.write_bytes(b"not an age file")
+        else:
+            target.unlink()
+        before = sorted(
+            (p.name, p.stat().st_size) for p in vault.iterdir() if os.access(p, os.R_OK)
+        )
+        try:
+            status = vs.vault_status(vault)
+            assert status["cards"] is None and says in status["error"], status
+            with pytest.raises(vs.VaultError, match=re.escape(says)):
+                vs.check_ready(vault)
+            after = sorted(
+                (p.name, p.stat().st_size) for p in vault.iterdir() if os.access(p, os.R_OK)
+            )
+            assert after == before  # status and check_ready never repair or stamp a file
+        finally:
+            if target.exists():
+                os.chmod(target, 0o600)
+
+    def test_an_unreadable_root_is_refused_before_any_prompt(self, vault):
+        os.chmod(vault, 0o000)
+        try:
+            with pytest.raises(vs.VaultError, match="chmod 700"):
+                vs.check_can_init(vault)
+            assert "chmod 700" in vs.vault_status(vault)["error"]
+        finally:
+            os.chmod(vault, 0o700)
+
+    def test_init_refuses_a_foreign_database_at_cards_db_and_leaves_it_alone(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: FAKE_SEALED)
+        path = tmp_path / "v"
+        path.mkdir(mode=0o700)
+        with sqlite3.connect(path / vs.CARDS) as conn:
+            conn.execute("CREATE TABLE other (x)")
+        before = (path / vs.CARDS).read_bytes()
+        with pytest.raises(vs.VaultError, match="not an empty vault card database"):
+            vs.init_vault(PASSPHRASE, path)
+        assert (path / vs.CARDS).read_bytes() == before
+        assert not (path / vs.IDENTITY).exists()
+
+    @pytest.mark.parametrize("damage", [b"\xff\xfe not utf-8", b"age1 not a key", None])
+    def test_a_damaged_recipient_is_refused_by_check_ready(self, vault, damage):
+        if damage is None:
+            os.chmod(vault / vs.RECIPIENT, 0o000)
+        else:
+            (vault / vs.RECIPIENT).write_bytes(damage)
+        try:
+            with pytest.raises(vs.VaultError, match="recipient.txt"):
+                vs.check_ready(vault)
+        finally:
+            os.chmod(vault / vs.RECIPIENT, 0o600)
+
+    def test_a_file_at_the_vault_path(self, tmp_path):
+        path = tmp_path / "v"
+        path.write_text("x")
+        status = vs.vault_status(path)
+        assert status["cards"] is None and "not a directory you own" in status["error"]
+        with pytest.raises(vs.VaultError, match="not a directory you own"):
+            vs.list_cards(path)
 
     def test_no_vault(self, tmp_path):
         status = vs.vault_status(tmp_path / "none")

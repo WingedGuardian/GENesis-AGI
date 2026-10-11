@@ -239,9 +239,10 @@ def _cmd_status(args: argparse.Namespace) -> int:
         service = _service({"op": "status"})
     except vs.VaultError as exc:
         service = {"ok": False, "error": str(exc)}
+    healthy = not status["error"] and all(i["private"] for i in status["files"].values())
     if args.json:
         print(json.dumps({**status, "service": service}, indent=2))
-        return 0
+        return 0 if healthy else 1
     print(
         f"vault: {status['path']} ({'initialised' if status['initialised'] else 'not initialised'})"
     )
@@ -252,7 +253,6 @@ def _cmd_status(args: argparse.Namespace) -> int:
     for name, info in status["files"].items():
         print(f"  {name}: {info['mode']}{'' if info['private'] else '  NOT PRIVATE'}")
     print(_service_line(service))
-    healthy = not status["error"] and all(i["private"] for i in status["files"].values())
     return 0 if healthy else 1
 
 
