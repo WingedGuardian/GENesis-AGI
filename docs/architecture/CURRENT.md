@@ -1378,7 +1378,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: cfbb876243f2 2026-10-07
+verified: 811a27f13669 2026-10-11
 ```
 
 - **channels/**: adapter framework. Telegram (`bridge.py` =
@@ -1452,6 +1452,15 @@ verified: cfbb876243f2 2026-10-07
   a PATH provider. Staging does not activate it; MCP registration and indexing
   retain their existing routes until their integration concerns land. See
   `docs/reference/codebase-managed.md`.
+  Whole-install removal enters the same fixed guarded transaction from direct
+  and host cleanup: runner/repository/lifecycle locks survive exec and all root
+  deletions; native query/client cgroup proof and orphan-scope checks precede
+  cleanup regardless of configuration validity. External configured state and
+  foreign symlink targets are retained. Host cleanup uses the container user's
+  default coordination namespace unless an explicit `--container-genesis-home`
+  names an external namespace; literal argv assigns it after login initialization.
+  No live-install removal acceptance is
+  claimed by isolated fixture tests.
 - **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
   `/v1/chat/completions` endpoint, and registers the desk brain at

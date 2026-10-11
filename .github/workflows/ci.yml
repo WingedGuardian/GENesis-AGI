@@ -1165,4 +1165,11 @@ jobs:
         # no new skip sites.
         # Merge with main (cbm native runtime, #3000): main 25211 + this PR's measured +84 = 25295.
         # Re-merge with main (#3000): main 25213 + this PR's measured +84 = 25297.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25297
+        # Guarded CBM removal: new uninstall file183 cases, including terminal
+        # state, addressed-removal/alias and controlled-writer regressions.
+        # The exact inert-observation exception belongs with uninstall; two
+        # negative controls keep unrelated raw spawns fenced. No added skips.
+        # Edited-file collection against runtime parent dfdb00194: 750 -> 935
+        # (+185): guarded uninstall183 + inert-observation negative controls2.
+        # Reconciled runtime parent floor25297+183+2=25482; no new skip allowance.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25482

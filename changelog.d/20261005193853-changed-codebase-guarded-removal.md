@@ -1,0 +1,1 @@
+- Genesis uninstall now refuses busy indexing or unverified Codebase shutdown and uses one guarded cleanup path from the host or container, retaining configured state outside its documented deletion roots.
