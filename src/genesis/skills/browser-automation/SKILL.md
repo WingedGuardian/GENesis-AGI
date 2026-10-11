@@ -237,13 +237,22 @@ plain `page.click`.
   link inside the label). An overlay on that label fails as `Click blocked`.
   Chromium, remote CDP and TinyFish have no label route: there, click the
   label yourself.
-- **A sent click is never repeated.** An error saying the click `was sent,
-  then failed, so it may already have taken effect`, or a `browser_click`
-  timeout, is not a failed click: snapshot and check before clicking again.
-- **Fallbacks (Camoufox only)** run only when the click failed before anything
-  was sent and no cover was found: plain `page.click`, then keyboard focus
-  plus Space or Enter, then a shadow-DOM `el.click()` by script. The last two
-  are not hit-tested.
+- **A click that may have been sent is not repeated by a fallback**: one
+  Playwright logged as sent, or one whose failure the tool cannot classify.
+  The error says it `may already have taken effect`; that is not a failed
+  click: snapshot and check before clicking again. The keyboard and script
+  fallbacks get no such check (a key press that errors may still have landed,
+  and the script click runs after it), so verify what a fallback did too.
+- **A `browser_click` timeout** may also have delivered the click, and it
+  resets the page: a snapshot cannot see it, and `browser_navigate` loads a
+  fresh copy, where a form is empty whether or not it was submitted. Do not
+  click again until the effect is confirmed where it persists (the
+  confirmation, order or account page a submit leads to) or by the user.
+- **Fallbacks (Camoufox only)** run only when nothing was sent (a step before
+  the click failed, or the click's log shows it failed before sending) and no
+  cover still stands (none was found, or the one found has since cleared):
+  plain `page.click`, then keyboard focus plus Space or Enter, then a
+  shadow-DOM `el.click()` by script. The last two are not hit-tested.
 
 Either way `clicked` means the click was sent, not that it worked: verify.
 
@@ -387,9 +396,9 @@ under about 20 navigations per task.
 | `filled`, value wrong or empty | Check the read-back; input masks, iframe, wrong element. |
 | `Click blocked: an element covers '...'` | Overlay, quoted in the error. Dismiss it, click again. |
 | `... intercepts pointer events` (Playwright's own wording) | The cover had cleared when the tool checked, or it is the control's own decoration: click again, or click the control's label. |
-| `Click on '...' was sent, then failed, so it may already have taken effect` | Not a failed click. Snapshot and check before clicking again. |
+| `Click on '...' failed after it was or may have been sent, so it may already have taken effect` | Not a failed click. Snapshot and check before clicking again. |
 | `Ambiguous selector` | Narrow the selector. |
-| `... timed out after N s. Browser state was reset` | Navigate again; form input is lost. Long fill: see "Long text". A `browser_click` timeout may already have delivered the click: check before clicking again. |
+| `... timed out after N s. Browser state was reset` | Navigate again; form input is lost. Long fill: see "Long text". A `browser_click` timeout may already have delivered the click: see "Clicking" before clicking again. |
 | `Browser not available`, or an error saying Camoufox is not installed or telling you to run `camoufox fetch` | Browser packages or the Camoufox engine missing on this install; tell the user. Do not run `camoufox fetch`. |
 | `advisory: Page state changed` (remote) | The URL differs from the one recorded at Genesis's last navigate, click, fill, run_js or snapshot: the user moved the tab, a `browser_press_key` submitted a form, or the page redirected itself. `browser_snapshot()` shows the page and re-syncs the URL; if the advisory persists, `browser_run_js("location.href")` (no reload). |
 | `Remote Chrome connection lost` | Chrome closed or machine asleep. Ask the user to restart it with the flag. |
@@ -421,7 +430,7 @@ Applies wherever a position is computed instead of an element being named.
 | Turnstile widget click: `page.mouse.click(x, y)` | no | **no** |
 | VNC bridge (Turnstile only) | no | **no**; reads back the pointer position, warns past 3 px drift, clicks anyway |
 
-A click Playwright reports as sent is never repeated by a fallback, and a
+A click Playwright may have sent is not repeated by a fallback, and a
 cover found by Playwright's hit test fails as `Click blocked` before any
 fallback; the keyboard and script fallbacks still act without a hit test, so
 verify toggles and submits.

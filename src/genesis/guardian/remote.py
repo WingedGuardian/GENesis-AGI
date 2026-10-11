@@ -24,6 +24,8 @@ import logging
 import re
 from pathlib import Path
 
+from genesis.util.proc_kill import kill_process_group, reap_bounded
+
 logger = logging.getLogger(__name__)
 
 # Client-side validation (defense in depth — the gateway re-validates too).
@@ -53,6 +55,22 @@ _VZDUMP_TIMEOUT = 330.0      # gateway: timeout 300 (start: gate+POST / status:
 _EXPAND_TIMEOUT = 660.0      # gateway: timeout 600 (pvresize + autoextend profile)
 _GROW_ROOT_TIMEOUT = 330.0   # gateway: timeout 300 (incus LV + fs online resize)
 _SET_LIMITS_TIMEOUT = 70.0   # gateway: timeout 60 (incus config set + verify)
+
+
+async def _reap(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL an ssh child and wait for it — boundedly.
+
+    Process.wait() returns only once every pipe is closed, so a grandchild that
+    inherited them (an ssh ProxyCommand, say) would hold the caller past its own
+    deadline: MEASURED, a child spawning `sleep 8 &` held an 0.5 s deadline for
+    8 s. The kill is already sent; the bound only stops the wait hanging on pipes.
+    """
+    # ssh runs in its own session, so its pid is its process group: the group
+    # kill also ends a ProxyCommand/ProxyJump helper, which a kill of the ssh pid
+    # alone left holding the pipes (review, round 2). The shared helper guards
+    # pid <= 1 and a refused killpg (round-2 audit).
+    kill_process_group(proc)
+    await reap_bounded(proc, 5)
 
 
 class GuardianRemote:
@@ -108,24 +126,30 @@ class GuardianRemote:
             f"{self._host_user}@{self._host_ip}",
             command,
         ]
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,  # its own process group, for _reap
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=wait_timeout + 5,
             )
             output = stdout.decode().strip() or stderr.decode().strip()
             return proc.returncode == 0, output
+        except asyncio.CancelledError:
+            # A caller's own deadline (an outer wait_for) cancelled us: the timeout
+            # branch below never runs, so reap the child here or it outlives the call.
+            # Even when ssh itself has exited: a helper it started can still hold
+            # the pipes, and the kernel keeps the group until its last member dies.
+            if proc is not None:
+                await _reap(proc)
+            raise
         except TimeoutError:
             # Kill the orphaned SSH process to prevent accumulation
-            try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
+            await _reap(proc)
             logger.warning(
                 "SSH to %s@%s timed out after %.0fs",
                 self._host_user, self._host_ip, wait_timeout,

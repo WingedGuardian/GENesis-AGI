@@ -2898,9 +2898,15 @@ config resolution, and hygiene utilities.
 ```yaml subsystem-map
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
-          restore, util, infra_profile, onboarding, env.py, _config_overlay.py]
+          restore, util, infra_profile, onboarding, hostmetrics, env.py,
+          _config_overlay.py]
 verified: b0867170e 2026-10-02
 ```
+
+- **hostmetrics/**: stdlib-only resource readings (container cgroup memory and
+  CPU, PSI, disks, and the host's headroom through the guardian gateway) and the
+  `preflight`/`status` CLI that admits or refuses a heavy job against the
+  budget (`docs/reference/resource-budget.md`). Importable without the runtime.
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
   install usable" signal (CC OAuth login + ≥1 routing LLM key + ≥1 embedding key),
