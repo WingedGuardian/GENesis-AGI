@@ -2,11 +2,17 @@
 # install_browser_stack.sh — provision what the browser tools launch.
 #
 # Runs genesis.browser.provision: the Camoufox engine the installed camoufox
-# package pairs with, patchright's Chromium, and the system libraries both need.
+# package pairs with, the Chromium the fallback launches, and the system libraries both need.
 # Started by genesis-browser-stack.service (unattended: it never escalates, so a
 # missing system library is reported with the command to run) and by an
 # operator. Never from a Claude Code session: every session's MCP server shares
 # the engine cache and the venv.
+#
+# Run by an operator, a missing system library is installed through `sudo -n`
+# when that is allowed without a password. A sudoers rule for it should name
+# the exact command, never a wildcard over the venv's python (whoever owns the
+# venv could otherwise run anything as root through it):
+#   <user> ALL=(root) NOPASSWD: <venv>/bin/python -m playwright install-deps chromium firefox
 #
 # Exit codes: the module's own (0 ready or deliberately skipped, 1 not ready),
 # 0 when another run holds the lock (that run does the work), 75 when this run

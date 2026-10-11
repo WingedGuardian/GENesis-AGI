@@ -1,10 +1,12 @@
 """Install what the browser tools launch: the Camoufox engine the installed camoufox
-package pairs with, patchright's Chromium, and the system libraries both need.
+package pairs with, the Chromium the fallback launches (patchright's when it is
+installed, else playwright's: ``chromium.launch_package``), and the system
+libraries both need.
 
 Run unattended by ``genesis-browser-stack.service`` through
 ``scripts/install_browser_stack.sh``, never from a session: every session's MCP
 server shares the engine cache and the venv. Upstream's installers do the work
-(``camoufox fetch``, ``patchright install chromium``, ``playwright install-deps``);
+(``camoufox fetch``, ``<package> install chromium``, ``playwright install-deps``);
 this module decides when each runs and checks the result, so a re-run is a no-op
 and an interrupted run is finished by the next one.
 
@@ -16,8 +18,6 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import importlib.util
-import json
 import math
 import os
 import shutil
@@ -28,8 +28,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from genesis.browser import engine, packages
+from genesis.browser import chromium, engine
 from genesis.browser.types import BROWSER_PGREP_PATTERNS
+from genesis.hostmetrics.readings import disk_device
+from genesis.util.disk_headroom import effective_free_bytes
 from genesis.util.tmp import big_tmp_dir
 
 Runner = Callable[..., subprocess.CompletedProcess]
@@ -37,6 +39,12 @@ Runner = Callable[..., subprocess.CompletedProcess]
 # No hang has been observed; this is the project's floor for an unattended step
 # (genesis-development, Timeout Policy). The engine download is about 1.3 GB.
 STEP_TIMEOUT_S = 7200
+# The unit's TimeoutStartSec (28800, four steps at the floor) less the fixed-timeout
+# probes outside this budget (dry-run 600 s, ldd 120 s each, dg_measure 60 s each,
+# sudo and pgrep: about 2,130 s at worst) and room to print the outcome. Every
+# step's timeout is cut to what is left of it, so steps that each stay under their
+# own limit cannot together outlast the unit and be killed mid-install by systemd.
+RUN_BUDGET_S = 28800 - 2400
 _DEFAULT_MIN_FREE_GB = 4.0
 # Both browsers in one call: Chromium's package list lacks the GTK libraries
 # Firefox needs (MEASURED: libxul.so links libgtk-3).
@@ -69,12 +77,62 @@ def min_free_bytes() -> int:
     return int(gb * 1024**3)
 
 
-def free_bytes(path: Path) -> int:
-    """Free space on the filesystem that would hold ``path``, which may not exist yet."""
-    probe = Path(path)
-    while not probe.exists() and probe != probe.parent:
-        probe = probe.parent
-    return shutil.disk_usage(probe).free
+def free_bytes(path: Path) -> int | None:
+    """Space a write under ``path`` (which may not exist yet) can use: the disk
+    guardian's effective figure, which a btrfs quota tightens. None: unmeasurable."""
+    return effective_free_bytes(path)
+
+
+def _short_of_space(paths: list[Path], writes: dict[Path, int] | None = None) -> str | None:
+    """Why a destination lacks room, or None. Each of ``paths`` must keep the minimum
+    free; ``writes`` (destination -> bytes a step is about to put there) must fit on
+    top of it, summed per filesystem, so a download cannot itself take the disk
+    below the floor. The engine, its download and Chromium can each be elsewhere."""
+    floor = min_free_bytes()
+    need: dict[object, tuple[Path, int]] = {}
+    for path, size in [(p, 0) for p in paths] + list((writes or {}).items()):
+        key = disk_device(path) or path
+        first, total = need.get(key, (path, floor))
+        need[key] = (first, total + size)
+    for path, wanted in need.values():
+        free = free_bytes(path)
+        if free is None:
+            return f"cannot measure {path}"
+        if free < wanted:
+            return (
+                f"low disk: {path} has {free / 1024**3:.1f} GB free, "
+                f"{wanted / 1024**3:.1f} GB needed"
+            )
+    return None
+
+
+# What a step writes (MEASURED on 156.0.1-beta.36 and Chromium 1234): the engine
+# unpacks to about 1.3 GB from an archive of about as much; the two Chromium builds
+# unpack to 0.65 GB from about 0.3 GB of archives.
+_ENGINE_BYTES = 1300 * 1024**2
+_ENGINE_ARCHIVE_BYTES = 1300 * 1024**2
+_CHROMIUM_BYTES = 700 * 1024**2
+_CHROMIUM_ARCHIVE_BYTES = 350 * 1024**2
+
+
+def _room_to_fetch() -> str | None:
+    return _short_of_space(
+        [],
+        {
+            engine.camoufox_install_dir(): _ENGINE_BYTES,
+            Path(big_tmp_dir()) / "browser-stack": _ENGINE_ARCHIVE_BYTES,
+        },
+    )
+
+
+_deadline: float | None = None
+
+
+def _timeout() -> float:
+    """A step's timeout: its own limit, cut to what is left of the run's budget."""
+    if _deadline is None:
+        return STEP_TIMEOUT_S
+    return max(1.0, min(STEP_TIMEOUT_S, _deadline - time.monotonic()))
 
 
 def mark_legacy(root: Path) -> bool:
@@ -158,31 +216,47 @@ def _live_engine_in(path: Path) -> bool:
     return False
 
 
-def _live_chromium() -> bool:
-    """Whether a Playwright-managed Chromium runs; unknown counts as yes."""
-    pids = _pids(BROWSER_PGREP_PATTERNS[1])
-    return pids is None or bool(pids)
+_PROC = Path("/proc")
 
 
-def _package_dir(name: str) -> Path | None:
+def _owner(entry: Path) -> int:
+    return entry.stat().st_uid
+
+
+def _live_under(directory: Path) -> bool:
+    """Whether one of this user's processes executes from under ``directory``.
+
+    Its /proc/<pid>/exe says which binary runs. Some processes deny that link to
+    their own user (MEASURED: 12 of 108 here, systemd, gpg-agent, tmux; every
+    browser process tested allowed it), so a denied link falls back to the command
+    line's first word, and only a process neither reveals counts as live. Counting
+    every denied link as live would make this true on every box, for good.
+    """
+    target = Path(directory).resolve()
     try:
-        spec = importlib.util.find_spec(name)
-    except Exception:  # noqa: BLE001 - a broken package reads as absent
-        return None
-    return Path(spec.origin).parent if spec is not None and spec.origin else None
-
-
-def playwright_browsers_dir(package_dir: Path) -> Path:
-    """Where a Playwright-family package installs browsers (its
-    ``registry/index.js``): PLAYWRIGHT_BROWSERS_PATH, "0" meaning beside the
-    package, else ``$XDG_CACHE_HOME`` or ``~/.cache``, plus ``ms-playwright``."""
-    env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
-    if env == "0":
-        return Path(package_dir) / "driver" / "package" / ".local-browsers"
-    if env:
-        return Path(env).absolute()
-    cache = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    return Path(cache) / "ms-playwright"
+        entries = [e for e in _PROC.iterdir() if e.name.isdigit()]
+    except OSError:
+        return True
+    for entry in entries:
+        try:
+            if _owner(entry) != os.getuid():
+                continue
+            exe = os.readlink(entry / "exe")
+        except PermissionError:
+            try:
+                exe = (entry / "cmdline").read_bytes().split(b"\0", 1)[0].decode(errors="replace")
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return True
+        except OSError:
+            continue  # exited, or no executable (a kernel thread)
+        # A replaced binary reads "<path> (deleted)": only its last component
+        # changes, so containment in ``target`` still holds.
+        path = Path(exe)
+        if path == target or target in path.parents:
+            return True
+    return False
 
 
 # ── steps ─────────────────────────────────────────────────────────────────────
@@ -227,7 +301,7 @@ def _fetch(run: Runner) -> None:
         [sys.executable, "-m", "camoufox", "fetch"],
         env=_child_env(),
         stdin=subprocess.DEVNULL,
-        timeout=STEP_TIMEOUT_S,
+        timeout=_timeout(),
         check=False,
     )
 
@@ -281,10 +355,14 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
             elif fetched:
                 break  # a fresh fetch is still invalid: deleting it again would not help
             else:
+                if short := _room_to_fetch():  # checked before anything is removed
+                    return f"skipped ({short})", True, status
                 _remove_version(directory)
                 _fetch(run)
                 fetched = True
         elif status.kind == engine.NOT_INSTALLED and not fetched:
+            if short := _room_to_fetch():
+                return f"skipped ({short})", True, status
             _fetch(run)
             fetched = True
         else:
@@ -324,7 +402,7 @@ def _extras_step(run: Runner, notes: list[str]) -> None:
         [sys.executable, "-c", _EXTRAS],
         env=_child_env(),
         stdin=subprocess.DEVNULL,
-        timeout=STEP_TIMEOUT_S,
+        timeout=_timeout(),
         check=False,
     )
     if proc.returncode != 0:
@@ -333,73 +411,129 @@ def _extras_step(run: Runner, notes: list[str]) -> None:
         )
 
 
-def _chromium_dirs(package_dir: Path) -> tuple[str | None, list[Path]]:
-    """patchright's Chromium revision and the install directories it must leave."""
+# Upstream's own repair of one build, under its installer lock: re-download and
+# replace it. A plain install skips any build whose completion marker exists.
+_FORCE = {
+    "chromium": ("--force", "--no-shell", "chromium"),
+    "chromium-headless-shell": ("--force", "chromium-headless-shell"),
+}
+
+
+def _install(run: Runner, package: str, args: tuple[str, ...], **extra: str) -> None:
+    run(
+        [sys.executable, "-m", package, "install", *args],
+        env=_child_env(**extra),
+        stdin=subprocess.DEVNULL,
+        timeout=_timeout(),
+        check=False,
+    )
+
+
+def _unreadable_by_ldd(run: Runner, binary: Path) -> bool:
+    """ldd failed without naming a missing library: the file itself is damaged. No
+    ldd says nothing about the file; the library step reports that."""
     try:
-        data = json.loads((package_dir / "driver" / "package" / "browsers.json").read_text())
-    except (OSError, ValueError):
-        return None, []
-    root = playwright_browsers_dir(package_dir)
-    revision, dirs = None, []
-    for entry in data.get("browsers", []):
-        name = entry.get("name")
-        if name in ("chromium", "chromium-headless-shell"):
-            rev = str(entry.get("revision", ""))
-            revision = rev if name == "chromium" else revision
-            dirs.append(root / f"{name.replace('-', '_')}-{rev}")
-    return revision, dirs
+        proc = _ldd(run, binary)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    text = (proc.stdout or "") + (proc.stderr or "")
+    return proc.returncode != 0 and "not found" not in text
+
+
+def _force(
+    run: Runner, package: str, build: str, directory: Path, notes: list[str], gc: dict[str, str]
+) -> bool:
+    if _live_under(directory):
+        notes.append(f"{directory} is broken but a running browser uses it; not reinstalled")
+        return False
+    _install(run, package, _FORCE[build], **gc)
+    return True
 
 
 def _chromium_step(run: Runner, notes: list[str]) -> tuple[str, bool, list[Path]]:
-    if packages.installed_versions().get("patchright") is None:
-        return "skipped (no patchright)", True, []
-    package_dir = _package_dir("patchright")
-    revision, dirs = _chromium_dirs(package_dir) if package_dir else (None, [])
-    if revision is None:
-        notes.append("patchright's browsers.json could not be read")
+    package = chromium.launch_package()
+    if package is None:
+        return "skipped (no package)", True, []
+    try:
+        where = chromium.locations(package, run=run)
+    except chromium.ChromiumLayoutUnknown as exc:
+        notes.append(str(exc))
         return "unknown", False, []
-    # Playwright deletes revisions it thinks unused; one a live browser runs from must stay.
-    extra = {"PLAYWRIGHT_SKIP_BROWSER_GC": "1"} if _live_chromium() else {}
-    run(
-        [sys.executable, "-m", "patchright", "install", "chromium"],
-        env=_child_env(**extra),
-        stdin=subprocess.DEVNULL,
-        timeout=STEP_TIMEOUT_S,
-        check=False,
-    )
-    unfinished = [d for d in dirs if not (d / "INSTALLATION_COMPLETE").is_file()]
-    if unfinished:
-        notes.append("not installed: " + ", ".join(str(d) for d in unfinished))
+    revision = where["chromium"][0]
+    root = where["chromium"][1].parent
+    # Room for a download only when one is due: a re-run with both builds in place
+    # installs nothing (the installer skips a complete build).
+    due = any(chromium.problem(b, where[b][1]) for b in chromium.BUILDS)
+    if due and (
+        short := _short_of_space([], {root: _CHROMIUM_BYTES, _temp_dir(): _CHROMIUM_ARCHIVE_BYTES})
+    ):
+        return f"skipped ({short})", True, []
+    # Every install, --force included, first deletes the revisions Playwright thinks
+    # unused; one a live browser runs from must stay.
+    gc = {"PLAYWRIGHT_SKIP_BROWSER_GC": "1"} if _live_under(root) else {}
+    for build in chromium.BUILDS:
+        if chromium.needs_force(build, where[build][1]):
+            _force(run, package, build, where[build][1], notes, gc)
+    _install(run, package, ("chromium",), **gc)
+
+    def unfinished() -> list[str]:
+        return [p for b in chromium.BUILDS if (p := chromium.problem(b, where[b][1]))]
+
+    if problems := unfinished():
+        notes.extend(problems)
         return "missing", False, []
-    binaries = [b for d in dirs for b in sorted(d.glob("chrome*/chrome")) if b.is_file()]
-    return revision, True, binaries
+    for build in chromium.BUILDS:
+        binary = chromium.executable(build, where[build][1])
+        if not _unreadable_by_ldd(run, binary):
+            continue
+        if short := _short_of_space(
+            [], {root: _CHROMIUM_BYTES, _temp_dir(): _CHROMIUM_ARCHIVE_BYTES}
+        ):
+            notes.append(f"{binary} is damaged; not reinstalled ({short})")
+            continue  # the library step reports the damaged binary
+        _force(run, package, build, where[build][1], notes, gc)
+    # A forced reinstall removes the build before it downloads, so a failed one
+    # leaves nothing: judge the builds again, never the attempt.
+    if problems := unfinished():
+        notes.extend(problems)
+        return "missing", False, []
+    return revision, True, [chromium.executable(b, where[b][1]) for b in chromium.BUILDS]
 
 
-def _missing_libs(run: Runner, binaries: list[Path]) -> list[str]:
+def _ldd(run: Runner, binary: Path) -> subprocess.CompletedProcess:
+    # A browser ships its own libraries beside the binary and puts that directory
+    # on the library path at launch; only the rest are the system's.
+    paths = [str(binary.parent), *filter(None, os.environ.get("LD_LIBRARY_PATH", "").split(":"))]
+    env = {**os.environ, "LD_LIBRARY_PATH": ":".join(paths)}
+    return run(
+        ["ldd", str(binary)], env=env, capture_output=True, text=True, timeout=120, check=False
+    )
+
+
+def _missing_libs(run: Runner, binaries: list[Path]) -> tuple[list[str], list[Path]]:
+    """The libraries ``binaries`` lack, and the binaries ldd could not read at all."""
     missing: set[str] = set()
+    unreadable: list[Path] = []
     for binary in binaries:
-        # A browser ships its own libraries beside the binary and puts that
-        # directory on the library path at launch; only the rest are system's.
-        paths = [
-            str(binary.parent),
-            *filter(None, os.environ.get("LD_LIBRARY_PATH", "").split(":")),
-        ]
-        env = {**os.environ, "LD_LIBRARY_PATH": ":".join(paths)}
-        proc = run(
-            ["ldd", str(binary)], env=env, capture_output=True, text=True, timeout=120, check=False
-        )
+        proc = _ldd(run, binary)
+        found = len(missing)
         for line in (proc.stdout or "").splitlines() + (proc.stderr or "").splitlines():
             if "=> not found" in line:
                 missing.add(line.split("=>", 1)[0].strip())
             elif "not found (required by" in line:  # e.g. version `GLIBC_2.38' not found
                 missing.add(line.split("not found", 1)[0].split(":")[-1].strip())
-    return sorted(missing)
+        if proc.returncode != 0 and len(missing) == found:
+            unreadable.append(binary)  # an exit code with nothing named: not "ok"
+    return sorted(missing), unreadable
 
 
 def _libs_step(run: Runner, binaries: list[Path], notes: list[str]) -> tuple[str, bool]:
     if not binaries:
         return "unchecked", True
-    missing = _missing_libs(run, binaries)
+    missing, unreadable = _missing_libs(run, binaries)
+    if unreadable:
+        notes.append("ldd could not read: " + ", ".join(str(b) for b in unreadable))
+        return "error:ldd", False
     if not missing:
         return "ok", True
     glibc = [m for m in missing if "GLIBC_" in m]
@@ -416,8 +550,8 @@ def _libs_step(run: Runner, binaries: list[Path], notes: list[str]) -> tuple[str
     except (OSError, subprocess.TimeoutExpired):
         sudo_ok = False  # no sudo here: the operator runs the command
     if sudo_ok:
-        run(["sudo", "-n", *deps], stdin=subprocess.DEVNULL, timeout=STEP_TIMEOUT_S, check=False)
-        missing = _missing_libs(run, binaries)
+        run(["sudo", "-n", *deps], stdin=subprocess.DEVNULL, timeout=_timeout(), check=False)
+        missing, _ = _missing_libs(run, binaries)
         if not missing:
             return "ok", True
         notes.append(
@@ -431,17 +565,15 @@ def _libs_step(run: Runner, binaries: list[Path], notes: list[str]) -> tuple[str
 def provision(run: Runner | None = None) -> Outcome:
     """Bring the browser stack to ready; idempotent. ``run`` defaults to
     ``subprocess.run``, looked up at call time."""
+    global _deadline
     run = run or subprocess.run
     notes: list[str] = []
+    _deadline = time.monotonic() + RUN_BUDGET_S
     root = engine.camoufox_install_dir()
-    need, free = min_free_bytes(), free_bytes(root)
-    if free < need:
-        return Outcome(
-            f"skipped (low disk: {free / 1024**3:.1f} GB free, {need / 1024**3:.1f} GB needed)",
-            "skipped",
-            "unchecked",
-            True,
-        )
+    short = _short_of_space([root, Path(big_tmp_dir()) / "browser-stack"])
+    if short:
+        # The timer retries tomorrow; a full disk is not a failed unit.
+        return Outcome(f"skipped ({short})", "skipped", "unchecked", True)
     root.mkdir(parents=True, exist_ok=True)
     _clear_stale_temp()
     if mark_legacy(root):
