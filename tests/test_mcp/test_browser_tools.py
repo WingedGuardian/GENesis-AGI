@@ -339,8 +339,7 @@ class TestFillStallWatchdog:
         async def slow_down(_char):
             calls["down"] += 1
             now[0] += 200.0
-            # The idle watcher's own predicate, against the real constant.
-            # Per-layer clock: _typing_page drives remote CDP.
+            # The idle watcher's own predicate, on the filled page's layer.
             last = browser._layer_last_used.get(browser.BrowserLayer.REMOTE_CDP, 0.0)
             idle_seen.append(now[0] - last >= browser._IDLE_TIMEOUT_S)
 
@@ -355,6 +354,55 @@ class TestFillStallWatchdog:
         assert now[0] - 1000.0 > 2 * browser._IDLE_TIMEOUT_S
         assert calls["down"] == 40
         assert not any(idle_seen), f"idle at keystroke {idle_seen.index(True) + 1}"
+
+    @pytest.mark.asyncio
+    async def test_a_long_fill_keeps_its_own_layer_alive_after_a_layer_switch(self):
+        """The fill releases _browser_lock before typing, so a browser_navigate
+        on another layer can move the active page mid-fill. Each step must
+        still count as activity on the layer being typed into (each layer has
+        its own idle clock), not on whichever layer is now active, or the idle
+        watcher reclaims the browser under the fill."""
+        now = [1000.0]
+        page, calls = _typing_page()  # remote CDP
+        other = _alive_page("https://camoufox.example")
+        browser._stealth_cm = MagicMock()
+        browser._stealth_page = other
+        idle_seen = []
+
+        async def slow_down(_char):
+            calls["down"] += 1
+            if calls["down"] == 1:
+                browser._active_page = other  # a concurrent Camoufox navigate
+            now[0] += 200.0
+            last = browser._layer_last_used.get(browser.BrowserLayer.REMOTE_CDP, 0.0)
+            idle_seen.append(now[0] - last >= browser._IDLE_TIMEOUT_S)
+
+        page.keyboard.down = AsyncMock(side_effect=slow_down)
+        with (
+            patch.object(browser, "time", MagicMock(monotonic=lambda: now[0])),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            result = await browser._impl_browser_fill("#bio", "x" * 40)
+        assert result.get("filled") == "#bio", result
+        assert browser._active_page is other  # the switch really happened
+        assert not any(idle_seen), f"idle at keystroke {idle_seen.index(True) + 1}"
+        assert browser.BrowserLayer.CAMOUFOX not in browser._layer_last_used
+
+    @pytest.mark.asyncio
+    async def test_a_fill_on_a_page_no_layer_holds_stamps_no_other_layer(self):
+        """A fill whose page no layer holds any more must not keep the active
+        layer alive in its place."""
+        page, _ = _typing_page()
+        browser._remote_page = None  # detached: the page belongs to no layer
+        other = _alive_page("https://camoufox.example")
+        browser._stealth_cm = MagicMock()
+        browser._stealth_page = other
+        browser._active_page = other  # per-keystroke path, Camoufox active
+        with patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep):
+            await browser._human_type(page, "#bio", "xy")
+        assert page.keyboard.up.await_count == 2  # the fill really ran
+        assert browser.BrowserLayer.CAMOUFOX not in browser._layer_last_used
 
     @pytest.mark.asyncio
     async def test_a_stall_does_not_discard_a_page_navigated_meanwhile(self):
@@ -3471,18 +3519,6 @@ class TestBrowserScreenshotUniquePath:
 # Per-layer lifecycle (#2874)
 # ---------------------------------------------------------------------------
 
-def _camoufox_stub(cm):
-    """sys.modules stubs for camoufox whose AsyncCamoufox returns ``cm``. Not a
-    dotted patch("camoufox..."), which imports the real package (absent in CI)."""
-    api = MagicMock(AsyncCamoufox=MagicMock(return_value=cm))
-    return patch.dict(sys.modules, {"camoufox": MagicMock(async_api=api), "camoufox.async_api": api})
-
-
-def _playwright_stub(api):
-    """sys.modules stubs for playwright (parent and async_api), as _camoufox_stub."""
-    return patch.dict(sys.modules, {"playwright": MagicMock(async_api=api), "playwright.async_api": api})
-
-
 def _alive_page(url="https://example.com"):
     page = MagicMock()
     page.url = url
@@ -3548,6 +3584,18 @@ def _tinyfish_delete():
     )
 
 
+# Stub modules, not patch("camoufox.async_api..."): CI installs neither package,
+# and patching by dotted path imports the real one first (see _connect).
+def _stub_camoufox(cm):
+    api = MagicMock(AsyncCamoufox=MagicMock(return_value=cm))
+    return patch.dict(sys.modules, {"camoufox": MagicMock(async_api=api), "camoufox.async_api": api})
+
+
+def _stub_playwright(starter):
+    api = MagicMock(async_playwright=MagicMock(return_value=starter))
+    return patch.dict(sys.modules, {"playwright": MagicMock(async_api=api), "playwright.async_api": api})
+
+
 class TestStaleRecoveryCleansOnlyItsOwnLayer:
     @pytest.mark.asyncio
     async def test_camoufox_restart_keeps_remote_cdp_and_tinyfish(self):
@@ -3567,7 +3615,7 @@ class TestStaleRecoveryCleansOnlyItsOwnLayer:
         new_cm = MagicMock()
         new_cm.__aenter__ = AsyncMock(return_value=new_ctx)
         with (
-            _camoufox_stub(new_cm),
+            _stub_camoufox(new_cm),
             _tinyfish_delete() as delete,
         ):
             result = await browser._ensure_browser()
@@ -3603,8 +3651,7 @@ class TestStaleRecoveryCleansOnlyItsOwnLayer:
         new_pw.chromium.launch_persistent_context = AsyncMock(return_value=new_ctx)
         starter = MagicMock()
         starter.start = AsyncMock(return_value=new_pw)
-        fake = MagicMock(async_playwright=MagicMock(return_value=starter))
-        with _playwright_stub(fake):
+        with _stub_playwright(starter):
             result = await browser._ensure_chromium_fallback()
 
         assert result is new_page
@@ -3749,7 +3796,7 @@ class TestFailedLaunchLeavesNoHalfState:
         cm.__aenter__ = AsyncMock(side_effect=RuntimeError("launch failed"))
         cm.__aexit__ = AsyncMock(return_value=None)
         with (
-            _camoufox_stub(cm),
+            _stub_camoufox(cm),
             pytest.raises(RuntimeError),
         ):
             await browser._ensure_browser()
@@ -3764,9 +3811,8 @@ class TestFailedLaunchLeavesNoHalfState:
         pw.chromium.launch_persistent_context = AsyncMock(side_effect=RuntimeError("no chrome"))
         starter = MagicMock()
         starter.start = AsyncMock(return_value=pw)
-        fake = MagicMock(async_playwright=MagicMock(return_value=starter))
         with (
-            _playwright_stub(fake),
+            _stub_playwright(starter),
             pytest.raises(RuntimeError),
         ):
             await browser._ensure_chromium_fallback()
@@ -3784,7 +3830,7 @@ class TestClosedWindowStopsTheDriver:
         cm = MagicMock()
         cm.__aenter__ = AsyncMock(return_value=ctx)
         cm.__aexit__ = AsyncMock(return_value=None)
-        with _camoufox_stub(cm):
+        with _stub_camoufox(cm):
             await browser._ensure_browser()
         assert "close" in handlers
         handlers["close"](ctx)
@@ -3912,7 +3958,9 @@ class TestLayerSwitchLeavesTinyfish:
 class TestALayerInUseIsNotReclaimed:
     """Devin 4186534708: a call must not lose its layer to idle reclaim. Every
     _impl_* stamps its layer at the start, so it suffices that no MCP browser
-    tool can run as long as the idle window."""
+    tool can run as long as the idle window. browser_fill is the exception: it
+    has no overall deadline (#2914), and is covered instead by stamping the
+    filled page's layer at every step (TestFillStallWatchdog)."""
 
     @pytest.mark.asyncio
     async def test_every_browser_tool_is_capped_well_inside_the_idle_window(self):
@@ -3927,8 +3975,6 @@ class TestALayerInUseIsNotReclaimed:
             await browser.browser_navigate.fn("https://example.com")
             await browser.browser_navigate.fn("https://example.com", remote=True)
             await browser.browser_click.fn("#a")
-            # browser_fill has no overall deadline: each completed step
-            # stamps its layer instead (TestFillStallWatchdog).
             await browser.browser_upload.fn("#a", "/nonexistent")
             await browser.browser_screenshot.fn()
             await browser.browser_snapshot.fn()
@@ -3981,8 +4027,7 @@ class TestChromiumWindowClose:
         pw.chromium.launch_persistent_context = AsyncMock(return_value=ctx)
         starter = MagicMock()
         starter.start = AsyncMock(return_value=pw)
-        fake = MagicMock(async_playwright=MagicMock(return_value=starter))
-        with _playwright_stub(fake):
+        with _stub_playwright(starter):
             await browser._ensure_chromium_fallback()
         assert "close" in handlers
         handlers["close"](ctx)
@@ -4525,8 +4570,7 @@ class TestACancelledReclaimStillFinishesItsClose:
         pw.chromium.launch_persistent_context = AsyncMock(side_effect=RuntimeError("no chrome"))
         starter = MagicMock()
         starter.start = AsyncMock(return_value=pw)
-        fake = MagicMock(async_playwright=MagicMock(return_value=starter))
-        with _playwright_stub(fake):
+        with _stub_playwright(starter):
             launch = asyncio.ensure_future(browser._ensure_chromium_fallback())
             await asyncio.wait_for(entered.wait(), timeout=2)
             launch.cancel()  # the tool timeout lands while the driver is stopping

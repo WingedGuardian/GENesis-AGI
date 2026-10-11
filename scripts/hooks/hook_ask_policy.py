@@ -115,6 +115,23 @@ existing ASK, never a new allow or block; audience — the agent (the context no
 names what was silenced); background effect — none, because a dispatched session
 is denied every push before the key is consulted.
 
+**``push_pr_branch`` silences one shape the push guard otherwise always asks
+about** (owner ruling 2026-10-10): ``git push <remote> <cur>:refs/heads/<dst>``,
+how a session updates a pull request's branch from a scratch checkout while that
+branch is checked out in another worktree (git refuses a second checkout of one
+branch). It is its own key so it can be switched on and off independently;
+``push_routine`` does not reach it. It applies only when the source names the
+current branch (a detached HEAD asks), the destination is fully qualified, is
+neither the current branch nor ``main``/``master``/a recorded default branch, has
+an OPEN pull request on this repository targeting the default branch (a failed
+lookup asks), every push URL is a github.com https repo of the configured owner,
+the push config is simple, and no other step in the command can change config
+first. A force push, a delete, a tag, an unqualified destination, every block
+and the dispatched-session deny are unchanged. Classified on the three axes:
+verdict, a narrowing of an existing ASK; audience, the agent (the context note
+names the setting and both branches); background effect, none, since a
+dispatched session is denied every push before the key is consulted.
+
 **``review_request`` silences one prompt of the review-round gate** (owner ruling
 2026-10-07): the ``gh pr comment … @codex review`` request whose review history
 the round counter could not read because GitHub failed to answer just then:
@@ -168,6 +185,7 @@ Configuration (all keys optional; absent means ask)::
         secrets_env: off      # the secrets.env credentials prompt
         push_publish: off     # first publish of a branch to the public repo only
         push_routine: off     # the push guard's routine prompts (see above)
+        push_pr_branch: off   # a push onto an open PR's branch from another checkout
         review_request: off   # an @codex review request whose history is unreadable
 
 The value is the ask's ENABLED state, so YAML's own booleans read the right way
@@ -200,7 +218,9 @@ import sys
 #: policy this install declined to use — it is a key nothing classified, so it
 #: can never suppress anything. Adding a member is a deliberate act with a call
 #: site attached; there is no path that grows this set from configuration.
-KEYS = frozenset({"secrets_env", "push_publish", "push_routine", "review_request"})
+KEYS = frozenset({
+    "secrets_env", "push_publish", "push_routine", "push_pr_branch", "review_request",
+})
 
 _CONFIG_PATH = "~/.genesis/config/genesis.yaml"
 _SEAM = "_TEST_HOOK_ASK_POLICY"

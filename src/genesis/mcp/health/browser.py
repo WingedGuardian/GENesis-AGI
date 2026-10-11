@@ -1030,11 +1030,12 @@ async def _reclaim_idle_layers(now: float) -> None:
     under _browser_lock and re-checks the clock there, so a tool call that
     touched the layer meanwhile keeps it.
 
-    A layer in use is never reclaimed mid-call: every _impl_* tool stamps its
-    layer when it starts, every MCP browser tool but browser_fill is capped by
+    A layer in use is never reclaimed mid-call: every page-acting _impl_* tool
+    (all but sessions, clear_domain and collaborate, which touch no page) stamps
+    its layer when it starts, every one of them but browser_fill is capped by
     _with_tool_timeout at 300 s or less, far inside _IDLE_TIMEOUT_S, and
-    browser_fill, which has no overall deadline, stamps the active layer on
-    every completed step (_no_stall).
+    browser_fill, which has no overall deadline, stamps the filled page's layer
+    at every step (_no_stall).
     """
     for layer in BrowserLayer:
         if not _layer_open(layer):
@@ -2207,12 +2208,16 @@ class FillStalled(Exception):
     """A browser call inside browser_fill made no progress for _FILL_STALL_S."""
 
 
-async def _no_stall(awaitable, what: str, *, report_progress: bool = True):
+async def _no_stall(
+    awaitable, what: str, layer: BrowserLayer | None, *, report_progress: bool = True
+):
     """Await one browser call of a fill, failing if it stalls.
 
     A completed step is activity for BOTH idle watchdogs that could reclaim a
-    fill with no overall deadline: this server's (_IDLE_TIMEOUT_S, via _touch)
-    and the MCP client's (via the _fill_progress reporter). A key-down step
+    fill with no overall deadline: this server's (_IDLE_TIMEOUT_S, via _touch
+    on ``layer``, the filled page's own layer: a navigate on another layer may
+    have moved the active page meanwhile) and the MCP client's (via the
+    _fill_progress reporter). A key-down step
     passes report_progress=False: a report can wait up to
     _FILL_PROGRESS_SEND_S, which would stretch the key's hold.
     """
@@ -2222,7 +2227,8 @@ async def _no_stall(awaitable, what: str, *, report_progress: bool = True):
         raise FillStalled(
             f"{what} made no progress for {_FILL_STALL_S:.0f}s"
         ) from None
-    _touch()
+    if layer is not None:  # never the active page's layer: see the docstring
+        _touch(layer)
     report = _fill_progress.get() if report_progress else None
     if report is not None:
         await report(what)
@@ -2242,14 +2248,15 @@ async def _human_type(page, selector: str, value: str) -> None:
 
     Chromium fallback (dev/test): atomic page.fill() (no delay overhead).
     """
+    layer = _layer_of(page)
     if not _is_camoufox_active() and not _is_remote_active():
-        await _no_stall(page.fill(selector, value, timeout=10000), "fill")
+        await _no_stall(page.fill(selector, value, timeout=10000), "fill", layer)
         return
 
     # Clear field reliably (works on React controlled inputs)
-    await _no_stall(page.fill(selector, "", timeout=10000), "clearing the field")
+    await _no_stall(page.fill(selector, "", timeout=10000), "clearing the field", layer)
     # Click to focus the field
-    await _no_stall(page.click(selector, timeout=10000), "focusing the field")
+    await _no_stall(page.click(selector, timeout=10000), "focusing the field", layer)
     # Type per-keystroke with hold time + flight time (IKI) jitter.
     # Hold time: log-normal, median ~86ms (CMU Keystroke Dynamics calibration).
     # Flight time: 50-200ms uniform with 5% thinking pauses.
@@ -2260,10 +2267,11 @@ async def _human_type(page, selector: str, value: str) -> None:
         await _no_stall(
             page.keyboard.down(char),
             f"keystroke {i + 1} of {len(value)}",
+            layer,
             report_progress=False,
         )
         await asyncio.sleep(hold_s)
-        await _no_stall(page.keyboard.up(char), f"keystroke {i + 1} of {len(value)}")
+        await _no_stall(page.keyboard.up(char), f"keystroke {i + 1} of {len(value)}", layer)
         # Flight phase: gap to next key
         iki = random.uniform(0.05, 0.20)  # 50-200ms
         # 5% chance of a "thinking pause" (300-1000ms)
