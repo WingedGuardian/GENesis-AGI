@@ -194,7 +194,9 @@ entry says why. `browser_clear_domain('x.com')` clears `x.com` and its
 subdomains, never `netflix.com`, and returns `cookies_removed` as a count,
 with `removed` per profile, or `error` for a profile that was refused or
 failed. A public suffix (`com`, `co.uk`, `github.io`) is refused; a
-single-label host such as `localhost`, or an IP address, matches only itself.
+single-label host such as `localhost`, or an IPv4 address, matches only itself.
+An IPv6 address is refused (anything containing `:` is), so its cookies
+cannot be cleared this way.
 
 **Not installed?** If `browser_navigate` returns `Browser not available`, or
 an error saying Camoufox is not installed or telling you to run
@@ -404,7 +406,7 @@ under about 20 navigations per task.
 
 | Symptom | Meaning and next step |
 |---|---|
-| `clicked`, page unchanged | Failed click. Wrong element (an ambiguous CSS or `role=` selector clicks the first match), iframe, or a fallback acted on something else. If it was meant to open a new tab and there is no `new_page`, the tab did not start loading in time; see "Tabs and popups". |
+| `clicked`, page unchanged | Failed click. Wrong element (an ambiguous CSS or `role=` selector clicks the first match), iframe, or a fallback acted on something else. If it was meant to open a new tab and there is no `new_page`, no new tab was seen within the click's wait: the click may have failed, the tab may have started later, or the opener closed first; see "Tabs and popups". |
 | `filled`, value wrong or empty | Check the read-back; input masks, iframe, wrong element. |
 | `Click blocked: an element covers '...'` | Overlay, quoted in the error. Dismiss it, click again. |
 | `... intercepts pointer events` (Playwright's own wording) | The cover had cleared when the tool checked, or it is the control's own decoration: click again, or click the control's label. |
@@ -412,7 +414,7 @@ under about 20 navigations per task.
 | `Ambiguous selector` | Narrow the selector. |
 | `Another click, fill, upload, key press or script is still running on this page` | Nothing was sent. Retry once the earlier call returns. |
 | `The tools are no longer on the page this call was for` | Nothing was sent: a click ahead followed a new tab, or a navigate or reset replaced the page. Snapshot, then act. |
-| `... timed out after N s. Browser state was reset`, or `Fill stalled on '...'` | The browser stopped responding. Navigate again; form input is lost. A `Fill stalled` error that says the active page is unchanged reset nothing: snapshot instead. A `browser_click` timeout may already have delivered the click: see "Clicking" before clicking again. |
+| `... timed out after N s. Browser state was reset`, or `Fill stalled on '...'` | The call ran past its deadline, or a fill step made no progress for 30 s. That may be a hung browser or just a slow operation; either way the active page was reset. Navigate again; form input is lost. A `Fill stalled` error that says the active page is unchanged reset nothing: snapshot instead. A `browser_click` timeout may already have delivered the click: see "Clicking" before clicking again. |
 | `Browser not available`, or an error saying Camoufox is not installed or telling you to run `camoufox fetch` | Browser packages or the Camoufox engine missing on this install; tell the user. Do not run `camoufox fetch`. |
 | `advisory: Page state changed` (remote) | The URL differs from the one recorded at Genesis's last navigate, click, fill, run_js or snapshot: the user moved the tab, a `browser_press_key` submitted a form, or the page redirected itself. `browser_snapshot()` shows the page and re-syncs the URL; if the advisory persists, `browser_run_js("location.href")` (no reload). |
 | `Remote Chrome connection lost` | Chrome closed or machine asleep. Ask the user to restart it with the flag. |
