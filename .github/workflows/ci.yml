@@ -368,7 +368,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-10-05: 70 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-10: 73 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -984,12 +984,54 @@ jobs:
         #   test_collectors_falkordb.py           new -> 23   (+23)
         #   test_falkordb_module.py               new -> 35   (+35)
         # No added skips. Floor: 24332 + 89 = 24421; skip ceiling remains 102.
+        # Qualification journal (replacement 1/6): new test file collects 95
+        # cases: 2 retained historical regressions plus 93 new accounting and
+        # recovery cases. Main has none of this package's original 231 cases.
+        # Floor: 24421 + 95 = 24516; no added skips, ceiling unchanged.
+        # Reference admission: 23 preserved +98 boundary +246 actor-role cases.
+        # Floor: 24516 +367 =24883; no added skips, ceiling unchanged.
+        #
+        # Immutable CBM staging: new test_codebase_managed_config.py collects
+        # 76 cases (0 -> 76), plus 3 new provider-opener classification controls.
+        # The native-binary opt-ins add two skip identities. Original PR CI had
+        # seven additional browser skips absent on current main; counts alone
+        # did not establish a two-slot allowance. Keep main's ceiling unchanged.
+        # On top of the reference-admission floor above, measured by
+        # --collect-only against main's versions of both files:
+        # 24883 + 76 + 3 = 24962.
+        #
+        # Crash recovery (#2632), measured with --collect-only against main's
+        # versions of the changed test files: test_bootstrap_guards.py 29 -> 69
+        # (+40), test_deploy_candidates_drop_status.py 68 -> 69 (+1),
+        # test_deploy_checkout.py 51 -> 52 (+1); the others are unchanged.
+        # No added skips. Floor: 24962 + 42 = 25004; skip ceiling remains 102.
+        #
+        # Checkout mutation fence (#2870): +36 collected tests, measured with
+        # --collect-only against main's versions of the changed test files
+        # (checkout-lock shell and Python tests, invoker +8, child_env +1,
+        # deploy/update/candidate lock and rollback tests); no added skips.
+        # Floor: 25004 + 36 = 25040.
+        #
+        # Corpus/adapters replacement (#3071): +130 collected tests, measured with
+        # --collect-only against main's versions of the changed test files
+        # (test_qualification +78, test_qualification_references +24,
+        # test_qualification_rework +28); no added skips.
+        # Floor: 25040 + 130 = 25170.
+        # Peer restore authority (#3128): measured collection of changed files
+        # against current main: 178 -> 219, entirely the new 41-case restore
+        # authority suite. Other five changed test files retain their counts.
+        # No new skip allowance. Floor: 25170 + 41 = 25211.
+        # Shared transcript credential-label policy (#3072): +2. Floor: 25211 + 2 = 25213.
+        # Authenticated backup reads: measured net +106; 25170 + 106 = 25276.
+        # Offline restore fixture changes are count-neutral; ceiling stays 102.
+        # Merge with main (#3133 authenticated backup reads): main 25211 + this PR's measured +106 = 25317.
+        # Re-merge with main (#3133): main 25213 + this PR's measured +106 = 25319.
         # Branch leak scan (#2880), --collect-only after the last test-adding
         # edit:
         #   test_leak_scan_added_lines.py      14 -> 33   (+19)
         #   test_branch_leak_scan_workflow.py new -> 19   (+19)
-        # Floor: 24421 + 38 = 24459. Ceiling 102 -> 104: two of the new
+        # Floor: 25319 + 38 = 25357. Ceiling 102 -> 104: two of the new
         # workflow tests run the tip half of leak_scan.sh's email and class
         # steps, which call ripgrep, and this job does not install it, so they
         # skip here by design (MEASURED: the run at 3b14708f1 skipped 104).
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 24459
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25357

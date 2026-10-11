@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -62,11 +63,15 @@ class TestSSHCommand:
         mock_proc.communicate.side_effect = TimeoutError()
         mock_proc.kill = MagicMock()  # kill() is sync on asyncio.Process
         mock_proc.wait = AsyncMock()
-        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+            patch("genesis.util.proc_kill.os.killpg") as killpg,  # never a real pgid
+        ):
             ok, output = await remote._ssh_command("status")
         assert ok is False
         assert output == "timeout"
-        mock_proc.kill.assert_called_once()
+        # ssh runs in its own session, so the whole group goes (proxy helpers too)
+        killpg.assert_called_once_with(12345, signal.SIGKILL)
 
     @pytest.mark.asyncio
     async def test_os_error(self, remote):
@@ -469,3 +474,105 @@ class TestVzdumpStatus:
             res = await remote.request_vzdump_status("not-a-upid")
         assert not res["ok"] and "invalid UPID" in res["error"]
         assert not called, "malformed UPID must never reach the gateway"
+
+
+class TestCancellationKillsTheSshChild:
+    """A caller's own deadline (an outer asyncio.wait_for) cancels _ssh_command.
+
+    MEASURED before the fix: with a fake ssh that hangs, a cancelled call returned
+    while the ssh child lived on, reparented to PID 1, and the interpreter then
+    printed an "Event loop is closed" traceback at teardown.
+    """
+
+    def test_outer_timeout_leaves_no_ssh_process(self, tmp_path, monkeypatch):
+        import asyncio
+        import os
+        import time
+
+        pidfile = tmp_path / "ssh.pid"
+        fake = tmp_path / "ssh"
+        fake.write_text(f"#!/bin/sh\necho $$ > {pidfile}\nexec sleep 30\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+        r = GuardianRemote(host_ip="192.0.2.10", host_user="tester", key_path="/nonexistent")
+
+        async def call():
+            return await asyncio.wait_for(r._ssh_command("ram-status", timeout=60), 2.0)
+
+        with pytest.raises(TimeoutError):
+            asyncio.run(call())
+        assert pidfile.exists(), "the fake ssh never started: the test proves nothing"
+        pid = int(pidfile.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        os.kill(pid, 9)
+        pytest.fail("the ssh child outlived the cancelled call")
+
+    def test_outer_timeout_also_ends_a_proxy_helper(self, tmp_path, monkeypatch):
+        # A ProxyCommand helper is a child of ssh holding its pipes; killing only
+        # the ssh pid left it running (review, round 2). The group kill ends it.
+        import asyncio
+        import os
+        import time
+
+        helper_pid = tmp_path / "helper.pid"
+        fake = tmp_path / "ssh"
+        fake.write_text(
+            f"#!/bin/sh\nsleep 30 &\necho $! > {helper_pid}\nexec sleep 30\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+        r = GuardianRemote(host_ip="192.0.2.10", host_user="tester", key_path="/nonexistent")
+
+        async def call():
+            return await asyncio.wait_for(r._ssh_command("ram-status", timeout=60), 2.0)
+
+        with pytest.raises(TimeoutError):
+            asyncio.run(call())
+        assert helper_pid.exists(), "the helper never started: the test proves nothing"
+        pid = int(helper_pid.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        os.kill(pid, 9)
+        pytest.fail("the proxy helper outlived the cancelled call")
+
+    def test_a_helper_outliving_an_exited_ssh_is_still_ended(self, tmp_path, monkeypatch):
+        # The leader exits first and leaves its helper holding the pipes: the
+        # cancel path must still kill the group (round-2 audit, MEASURED orphan).
+        import asyncio
+        import os
+        import time
+
+        helper_pid = tmp_path / "helper.pid"
+        fake = tmp_path / "ssh"
+        fake.write_text(f"#!/bin/sh\nsleep 30 &\necho $! > {helper_pid}\nexit 0\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+        r = GuardianRemote(host_ip="192.0.2.10", host_user="tester", key_path="/nonexistent")
+
+        async def call():
+            return await asyncio.wait_for(r._ssh_command("ram-status", timeout=60), 1.5)
+
+        with pytest.raises(TimeoutError):
+            asyncio.run(call())
+        assert helper_pid.exists(), "the helper never started: the test proves nothing"
+        pid = int(helper_pid.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        os.kill(pid, 9)
+        pytest.fail("the helper outlived a cancelled call whose ssh had already exited")

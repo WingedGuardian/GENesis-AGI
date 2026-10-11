@@ -74,12 +74,65 @@ The ``gh pr create`` prompt is NOT covered: gh without a TTY aborts ("you must
 first push the current branch…") rather than pushing, so that arm is left
 exactly as it was.
 
-A force push, a push anywhere else, a close-then-push, a re-push with no open PR,
-a round-cap ask, every block and the dispatched-session deny are all outside the
-key's reach. Classified on the repo's three axes: verdict — a narrowing of an
+For ``push_publish``: a force push, a push anywhere else, a close-then-push, a
+re-push with no open PR, a round-cap ask, every block and the dispatched-session
+deny are all outside the key's reach.
+
+**``push_routine`` is the wider, separate switch** (owner ruling 2026-10-06), for
+an install whose sessions push from linked worktrees (``git -C <path> push``,
+which ``push_publish`` never covers) and chain steps. It silences the push
+guard's ROUTINE prompts: a first push in any spelling, close-then-push, a
+re-push with no open PR off the public repo, and a re-push chained with other
+steps. It applies only when EVERY ask the command raised is one of those and
+every push URL is a github.com https repo of the configured owner
+(``github.user``); a raw URL also needs no ``insteadOf`` rule. A ``gh pr create``
+that would publish is NOT covered (owner ruling 2026-10-06): gh, not git, picks
+where it pushes the head (``GH_REPO``, ``--repo``, its own remote choice), so it
+asks exactly as before, and a command containing one asks whatever else it
+raised. A force push to another remote, a push to the default branch (``main``,
+``master``, or a default the checkout recorded in ANY ``refs/remotes/*/HEAD``),
+a detached HEAD or another refspec, an undeterminable directory, a first push
+whose absence on the destination a live probe could not confirm (only with the
+key off, so other installs pay no network call), and the review-round cap still
+ask; every block and the dispatched-session deny are
+unchanged. Same shape as the other keys: no decision, a context note naming the
+setting.
+
+Ownership is judged from the configured URL text, with no network call: a
+remote left pointing at an owned repo that was since transferred or renamed is
+redirected by GitHub to wherever it went, and is still classed as owned. A
+default branch named other than ``main``/``master`` is caught only when the
+checkout recorded it (``git clone`` does; a hand-added remote does not until
+``git remote set-head``).
+
+Known limit, accepted by the owner (2026-10-06): like every arm of this guard,
+the branch and destination are read BEFORE the command runs. In a chained
+command an earlier step can change them, so ``git checkout main && git push``
+or ``git remote set-url origin <url> && git push`` is classed by the state it
+started from and silenced. ``push_publish`` avoids this by accepting only a
+single plain push; ``push_routine`` deliberately does not. Classified on the repo's three axes: verdict — a narrowing of an
 existing ASK, never a new allow or block; audience — the agent (the context note
 names what was silenced); background effect — none, because a dispatched session
 is denied every push before the key is consulted.
+
+**``review_request`` silences one prompt of the review-round gate** (owner ruling
+2026-10-07): the ``gh pr comment … @codex review`` request whose review history
+the round counter could not read because GitHub failed to answer just then:
+every error code must be on ``review_budget.TRANSIENT_ERRORS`` (a failed or
+timed-out read, or a lookup out of budget), and the request must be the whole
+command. A persistent or tamper code (deleted findings, a truncated response, a
+malformed record, a configuration error, a head that moved) keeps asking, as
+does a request chained with any other step. The cost, accepted by the owner: while GitHub is
+unreadable, a request goes ahead without the round budget being checked, so a PR
+past its last round can draw one more review. Only that prompt is covered. The
+round-cap prompt (the owner's checkpoint at round 4 and in the gate lane), a
+request whose PR number cannot be resolved, an unmarked gate-lane confirmation,
+a command that also raises any of those, the dispatched-session deny, and the
+refusal of a review request chained with a commit, push, merge, close or PR
+create all stay exactly as they were. Classified on the three axes: verdict, a
+narrowing of an existing ASK; audience, the agent (the context note names the
+setting and quotes the prompt, including why the read failed); background
+effect, none, since a dispatched session is still denied.
 
 **Suppression means "this hook stops objecting", never "approve on my behalf".**
 A suppressed ask is replaced by NO permission decision at all: the hook exits 0
@@ -114,6 +167,8 @@ Configuration (all keys optional; absent means ask)::
       asks:
         secrets_env: off      # the secrets.env credentials prompt
         push_publish: off     # first publish of a branch to the public repo only
+        push_routine: off     # the push guard's routine prompts (see above)
+        review_request: off   # an @codex review request whose history is unreadable
 
 The value is the ask's ENABLED state, so YAML's own booleans read the right way
 round: ``off``/``false``/``no`` suppress, ``on``/``true``/``yes`` (and absent)
@@ -145,7 +200,7 @@ import sys
 #: policy this install declined to use — it is a key nothing classified, so it
 #: can never suppress anything. Adding a member is a deliberate act with a call
 #: site attached; there is no path that grows this set from configuration.
-KEYS = frozenset({"secrets_env", "push_publish"})
+KEYS = frozenset({"secrets_env", "push_publish", "push_routine", "review_request"})
 
 _CONFIG_PATH = "~/.genesis/config/genesis.yaml"
 _SEAM = "_TEST_HOOK_ASK_POLICY"

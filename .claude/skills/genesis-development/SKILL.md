@@ -46,6 +46,13 @@ different SESSION TYPES, not two phases of one session's life** (user decision,
   PR. Its unit of work is the queue, not the card. That is the
   **`closing-session`** skill; load it instead when the job is "get the open PRs
   merged".
+- **A cloud coding agent (Devin) is a third kind of builder.** It works from the
+  public repo in its own VM, with no access to an install: no running Genesis, no
+  `~/.genesis/`, none of an install's hooks or local reviewers. Hand it only
+  self-contained, spec-complete work whose tests run in CI, off the enforcement-hook
+  surface, as a public issue. Only the owner applies the `devin-ready` label that
+  hands it over: the label starts a paid session, so a session never applies it.
+  Its PRs join the same queue (closing-session, "Devin-built PRs").
 
 The handoff between them is **the PR itself** — a durable artifact that survives
 compaction and session death, so nothing has to be remembered across the
@@ -3463,9 +3470,12 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   a context note naming the setting. That note is what proves a silenced
   access; with no note, assume the access went past the guard unseen. It
   approves nothing; other hooks and Claude Code's own permissions still decide
-  the command, and a dispatched session is still denied. The only other key is
-  `push_publish` (owner ruling 2026-10-01), same no-decision-plus-note shape.
-  It silences only the first push of the CURRENT branch, and only when the
+  the command, and a dispatched session is still denied. The other keys are
+  `push_routine` (routine push prompts, 2026-10-06), `review_request` (a Codex
+  review request whose review history could not be read; the round-cap prompt
+  still asks, 2026-10-07) and `push_publish` (owner ruling 2026-10-01), all the
+  same no-decision-plus-note shape; `hook_ask_policy.py` holds the exact scope
+  of each. `push_publish` silences only the first push of the CURRENT branch, and only when the
   whole command is exactly one plain `git push` (e.g. `git push -u origin
   HEAD`) — a chained command still asks, so run the first push as its own
   command. The remote git really pushes to must resolve (rewrites applied) to
@@ -3608,6 +3618,31 @@ Verify before any commit:
   private DM leaked via a test docstring + a code comment after the commit
   message and PR body were already clean.)
 - GROUNDWORK-tagged code not accidentally deleted
+- **PR shape, after your last commit and before opening the PR (#2737; owner,
+  2026-10-05).** It reads committed history, so staged changes are not counted:
+  commit first. Count the branch in counted lines, which excludes tests, prose,
+  changelog fragments, and blank and comment lines, and counts a moved line
+  once:
+
+      # from the repo root, after `git fetch origin main`; a stacked PR passes its parent branch as --base.
+      python3 scripts/pr_shape.py --base origin/main
+
+  It prints `<counted> <band>`. It reads the diff through the same hardened git
+  runner the review gates use, and exits 2 on a git error, so a failed diff never
+  reads as `0 ok`. Use this command, not a hand-written `git diff | count_diff`:
+  an attributes file, a textconv driver or a replace ref can each shrink a raw
+  diff at exit 0.
+
+  - Under 500 is the target.
+  - From 500 to 1,000, add a `Shape:` line to the PR body saying why it
+    cannot be smaller.
+  - Over 1,000 needs the owner's approval: ask in the PR body; the owner
+    decides before merge.
+
+  It is a guideline you weigh, not a wall: a legitimate reason, stated, is
+  enough. Prefer one concern per PR (one mechanism or behaviour change a
+  reviewer can accept or reject alone); that too is weighed.
+  Full rule: `.claude/docs/premise-check.md`, step 6.
 - New capabilities registered in `_capabilities.py` + bootstrap manifest
 - **Conventional commit prefixes**: `feat:`, `fix:`, `refactor:`, `docs:`,
   `test:`, `chore:`. Scope optional: `feat(ego): add cadence manager`.
@@ -3617,6 +3652,30 @@ Verify before any commit:
 - **Targeted tests during development.** Run ONLY the relevant test file(s)
   for your changes. NEVER run the full test suite locally — CI handles that.
   Check CI via `gh pr checks`. Bare `pytest` without a file path is banned.
+- **Heavy jobs go through `genesis.hostmetrics run`.** A build, a parallel test
+  run, a media encode, anything that holds gigabytes or several cores for
+  minutes: launch it with the Genesis venv's interpreter
+  (`~/genesis/.venv/bin/python` on a standard install; a session shell usually
+  has no bare `python`) as `… -m genesis.hostmetrics run --name N --ram GB --cpu
+  PCT -- CMD`. It checks the budget first (GO/WAIT/NO/ASK), then runs the job in a
+  systemd scope capped at its estimates that other sessions' `status` and
+  `preflight` see; without a systemd user manager it runs uncapped and invisible,
+  and says so. `preflight` checks without running. It is not a way around the
+  full-suite rule: test targets must still be named, and do not count on the
+  full-suite guard to see inside the wrapper. Guide:
+  `docs/reference/resource-budget.md`.
+- **Deleting user or project data goes through the trash, not `rm`.** A file or
+  directory you did not create in this session (memory and plans, config, a
+  deliverable, notes) goes to `… -m genesis.trash put PATH --reason R`, which
+  renames it into `~/.genesis/trash/` with a tombstone so
+  `… -m genesis.trash restore ENTRY` can bring it back. `rm` stays fine for
+  what you created yourself and for temp (`~/tmp`, cc-tmp, the scratchpad).
+  Unlike `rm -f`, a missing path is a refusal (exit 1); a path starting with
+  `-` goes after `--`. The trash makes a deletion recoverable; it does not
+  replace asking the user first where deleting their data needs their OK.
+  When `put` refuses (another volume, the database, a file a running process
+  is using), ask the user; do
+  not fall back to `rm`. Guide: `docs/reference/trash.md`.
 - **Commit continuously**: after every logical unit of work. Uncommitted = lost.
 - **PR closes a ledger item → cite `Ledger: <item-id>` in the PR body** (the
   32-hex `session_ledger` row id, own line, e.g. `Ledger: 71337fab…`). The
@@ -3999,6 +4058,85 @@ successor in a comment and leave the PR open.
 
 If you believe any other PR should be retired and nobody is picking it up, that
 is a question for the user, not a judgment call for the review station.
+
+### Building a rework — report against the spec (standing owner rule, 2026-10-05)
+
+A PR sent back with `needs-rework`, or a `needs-architecture-session` PR whose
+owner decision has since been posted as a rework spec, carries that spec: a
+maintainer comment headed `## Rework spec`, plus any design issue it names. An
+audit or proposal without that heading is not a spec, and a
+`needs-architecture-session` PR with no posted spec has an undecided design; do
+not build it. Its contract is in
+`.claude/docs/premise-check.md`, "Handing a verdict to a builder". The session
+that takes up the rework is the reviving session above, and it owns the following:
+
+0. **Acknowledge the spec on the OLD PR before building.** Post one comment
+   there with:
+   - the spec as you understood it, in your own words;
+   - the split you will build;
+   - every question you need answered before you start.
+
+   Head it `## Rework acknowledgement`, and open no PR, not even a draft, until
+   it is posted. If it asks no questions, proceed once it is posted; otherwise
+   wait for an answer on the old PR, from the closing session or the owner. On
+   a Devin-built old PR, put `(aside)` on the first line and the heading under
+   it, or the comment starts a paid Devin session. Post it with
+   `gh api repos/<o>/<r>/issues/<N>/comments -F body=@<file>`: on a PR past
+   its terminal round the push guard reads a `gh pr comment` whose body it
+   cannot see (`--body-file`, or an inline body with a backtick or `$`) as a
+   possible `@codex review` request, which asks in the foreground and is
+   refused in a dispatched session. A question answered before building is cheap; the
+   same question answered silently inside the build is how a rebuild drifts. No
+   acknowledgement means nobody can tell whether the spec was read at all.
+1. **New PRs, by default.** The rework arrives as one or more NEW PRs, with fresh
+   round counts. When the LAST one opens, whoever opened it closes the old PR
+   with a comment that maps every part of it, file by file, to the `file:line`
+   in the replacement
+   that covers it, or says why that part is moot. If any part is neither,
+   leave the old PR open with a comment naming that part. Leave its labels on,
+   so the rebuild stays traceable to it. If the spec carries a
+   `Follow-up: <id>` line, copy it into the body of the replacement that will
+   merge into main LAST, so the follow-up closes only when the whole rework
+   has landed. A merge into any other base completes the marker too, so never
+   put it on a PR that merges into another PR. Reworking under the old number
+   happens only when the owner grants it. Devin builds a rework as fresh PR(s)
+   too, and never closes the old PR; the closing session does, after the same
+   coverage check (closing-session, "Devin-built PRs").
+2. **Follow the split.** If the spec has a `PR-shape: SPLIT` plan, open those PRs.
+   Each one carries one concern and names the PRs it depends on. Open them in
+   dependency order against main; a PR whose dependency has not merged waits as
+   a branch, or opens stacked with its base named. Being a rework is not itself
+   a reason to stay unsplit, and a better split is a deviation (item 4), not a
+   reason to skip splitting. If the spec has no split, size each PR by the rule
+   in `.claude/docs/premise-check.md` step 6: under 500 counted lines is the
+   target, and a `Shape:` line states why one cannot be smaller. Split a PR that
+   carries more than one concern.
+3. **Answer the delegated questions** in the PR body, each with your reasoning.
+   If you hit a question the spec should have answered and did not, answer it
+   the same way and mark it as missing from the spec. Do not resolve it
+   silently in the most defensive direction: a fail-closed answer is still a
+   design decision, and it can force machinery the spec never asked for.
+4. **Report every deviation.** Unforeseen complications are expected; an
+   unexplained deviation is not. The body of each replacement PR carries:
+
+   ```
+   ## Rework
+   Replaces: #N (spec: <link to the `## Rework spec` comment>; acknowledged: <link to your item-0 comment>)
+   Split: PR k of n (<the other PRs, by number or concern>)
+   Kept / deleted / reshaped as the spec asked: <one line each, or "as specified">
+   Deviations: <each: what differs from the spec, and the complication that forced it> | none
+   Questions answered: <each delegated or missing question: the answer and why>
+   ```
+
+The closing session reads this section before it spends a review round. A
+deviation with a stated reason goes to the owner as a design question. A missing
+section, an unexplained deviation, or an unsplit PR the spec split goes back to
+you before review. Origin: a rebuild came back as one PR, +2,538 raw lines
+(881 counted, so inside the `shape` band; size was not the failure), with
+conditional rendering, an uninstall retention mode and an in-place settings
+writer, none of which its spec asked for, and with no note explaining any of
+them. Working out whether the spec or the build had failed cost the owner a
+session.
 
 ### Keep the PR the PR — adjacent findings become issues (standing user rule, 2026-09-09)
 

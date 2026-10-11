@@ -11,7 +11,8 @@ What these pin, from the design review and two review rounds:
   * pages dedupe per (domain, tier, episode) and per mode, and a page is
     recorded as sent only once it was actually queued;
   * every action stamp is written only after the action succeeded;
-  * observe mode (WATCHGOD_ACT=0, or any invalid value) changes nothing.
+  * observe mode (WATCHGOD_ACT=0, or any invalid value) changes nothing,
+    but still sends every page, titled and deduped as observe-mode.
 """
 
 from __future__ import annotations
@@ -208,9 +209,12 @@ def test_red_starts_last_resort_reclaim(box):
 
 def test_green_ends_the_episode_so_the_next_one_pages_again(box):
     _handle(box, "orange")
+    first = [p for p in _pages(box) if p["severity"] == "warning"]
+    for q in box["queue"].glob("*.json"):  # delivered; an undelivered copy collapses
+        q.unlink()
     _handle(box, "green", free=90_000)
     _handle(box, "orange")
-    assert len([p for p in _pages(box) if p["severity"] == "warning"]) == 2
+    assert len(first + [p for p in _pages(box) if p["severity"] == "warning"]) == 2
 
 
 def test_attribution_is_logged_once_per_episode(box):
@@ -219,11 +223,32 @@ def test_attribution_is_logged_once_per_episode(box):
     assert _log(box).count("top writers") == 1
 
 
-def test_observe_mode_pages_nothing_and_starts_nothing(box):
+def test_observe_mode_pages_but_starts_nothing(box):
+    """Observe mode once logged "would page EMERGENCY" and sent nothing while a
+    volume filled to 0 MB. It now sends the page, marked as observe-mode, and
+    still starts nothing."""
     _handle(box, "red", act=0)
-    assert not _pages(box)
+    pages = _pages(box)
+    assert len(pages) == 1, pages
+    assert pages[0]["title"].startswith("[observe mode, nothing was done] Disk nearly full")
+    assert pages[0]["severity"] == "emergency"
+    assert pages[0]["dedupe_key"].endswith(":observe")
+    assert "took none of the actions above" in pages[0]["body"]
     assert not [c for c in _calls(box) if " start " in f" {c} "], _calls(box)
-    assert "OBSERVE: would page EMERGENCY" in _log(box)
+    assert "OBSERVE: paged EMERGENCY" in _log(box)
+
+
+def test_observe_mode_retries_a_page_it_could_not_queue(box):
+    """An unqueued observe page is not marked sent, so the next poll retries."""
+    box["queue"].mkdir()
+    box["queue"].chmod(0o555)
+    try:
+        _handle(box, "red", act=0)
+        assert "OBSERVE: could not queue the page" in _log(box)
+    finally:
+        box["queue"].chmod(0o755)
+    _handle(box, "red", act=0)
+    assert len(_pages(box)) == 1
 
 
 def test_invalid_act_value_degrades_to_observe(box):
@@ -777,7 +802,8 @@ def test_switching_observe_to_act_mid_episode_still_pages(box, tier, title):
     """Codex P2: an observe-mode poll must not consume the page an acting poll
     owes. Flipping WATCHGOD_ACT 0 -> 1 while still in trouble pages."""
     _handle(box, tier, act=0)
-    assert not [p for p in _pages(box) if p["title"].startswith(title)], "observe pages nothing"
+    assert not [p for p in _pages(box) if p["title"].startswith(title)], "the observe page carries its own title"
+    assert [p for p in _pages(box) if title in p["title"] and p["title"].startswith("[observe mode")]
     _handle(box, tier, act=1)
     assert len([p for p in _pages(box) if p["title"].startswith(title)]) == 1
     _handle(box, tier, act=1)
@@ -1070,9 +1096,11 @@ def test_pages_label_writers_as_process_wide(box):
 
 
 def test_observe_mode_message_does_not_overclaim():
-    """#2521 item 7: OOM capture still pages in observe mode."""
+    """#2521 item 7, then the observe-mode page change: the startup line says
+    pages are sent and no action is taken."""
     text = _WATCHGOD.read_text()
-    assert "no disk action is taken and no disk page is sent (OOM capture still pages)" in text
+    assert "disk tiers are measured and logged and pages are sent; no disk action is taken" in text
+    assert "no disk page is sent" not in text
     assert "nothing is reclaimed, released or paged" not in text
 
 
@@ -1227,3 +1255,26 @@ def test_a_retried_page_repeats_a_refused_sweep(box, cctmp):
                   'printf "LEVER=%s\\n" "$_WG_LEVER_SWEEP"')
     lever = [ln for ln in r.stdout.splitlines() if ln.startswith("LEVER=")][-1]
     assert "last attempted" in lever and "REFUSED to run (mount table unreadable)" in lever, lever
+
+
+def test_attribution_names_the_trash_stores_separately(box):
+    # #2926 PR 4: trash grows without expiry (#2504), so YELLOW attribution must
+    # name it on its own line rather than only inside $HOME/.genesis.
+    for name in ("trash", "worktree-trash"):
+        (box["home"] / ".genesis" / name).mkdir(parents=True, exist_ok=True)
+    proc = _run(box, "DG_ATTRIBUTION_PATHS=''; attribution_paths")
+    assert proc.returncode == 0, proc.stderr
+    lines = proc.stdout.splitlines()
+    assert str(box["home"] / ".genesis" / "trash") in lines
+    assert str(box["home"] / ".genesis" / "worktree-trash") in lines
+    # And du really gives them a line: it counts each inode once, in argument
+    # order, so a store listed after its parent would print nothing.
+    proc = _run(
+        box,
+        "DG_ATTRIBUTION_PATHS=''; mapfile -t t < <(attribution_paths); du -smx -- \"${t[@]}\"",
+    )
+    assert proc.returncode == 0, proc.stderr
+    measured = [line.split("\t", 1)[1] for line in proc.stdout.splitlines()]
+    assert str(box["home"] / ".genesis" / "trash") in measured
+    assert str(box["home"] / ".genesis" / "worktree-trash") in measured
+    assert str(box["home"] / ".genesis") in measured

@@ -79,6 +79,9 @@ async def run_entity_resolution(
         "llm_merged": 0,
         "contradictions": 0,
         "skipped": 0,
+        # Merges not applied: SQLite had already retired the loser or the
+        # survivor.
+        "already_retired": 0,
         "errors": [],
     }
 
@@ -225,11 +228,15 @@ async def run_entity_resolution(
                     )
                     # Auto-merge: deprecate the non-survivor, keep the survivor
                     try:
-                        await _deprecate_memory(
+                        retired = await _deprecate_memory(
                             qdrant, db, deprecated_id,
                             survivor_id=survivor_id,
                             run_id=run_id,
                         )
+                        if retired is not None:
+                            report["already_retired"] += 1
+                            deprecated_this_run.add(retired)
+                            continue
                         await log_resolution(
                             db,
                             run_id=run_id,
@@ -315,11 +322,15 @@ async def run_entity_resolution(
                             point_b["id"], payload_b, dt_b,
                         )
                         try:
-                            await _deprecate_memory(
+                            retired = await _deprecate_memory(
                                 qdrant, db, deprecated_id,
                                 survivor_id=survivor_id,
                                 run_id=run_id,
                             )
+                            if retired is not None:
+                                report["already_retired"] += 1
+                                deprecated_this_run.add(retired)
+                                continue
                             await log_resolution(
                                 db,
                                 run_id=run_id,
@@ -438,15 +449,57 @@ async def _deprecate_memory(
     *,
     survivor_id: str,
     run_id: str,
-) -> None:
+) -> str | None:
     """Two-layer deprecation: Qdrant payload + SQLite metadata.
 
+    Returns None when the merge was applied. Otherwise returns the id of the
+    side SQLite had ALREADY retired, which the caller excludes for the rest of
+    the run and records no merge for: *memory_id* when it was retired before
+    (its successor and run are kept), or *survivor_id* when the survivor is
+    retired (the live *memory_id* is left untouched and stays eligible). Either
+    way only that retired side's Qdrant ``deprecated`` flag is re-asserted,
+    which a failed earlier mirror can leave false.
+
     Mirrors the deprecation logic in ``dream_cycle._synthesize_and_deprecate``
-    but without creating a new synthesized memory.
+    but without creating a new synthesized memory — and without copying edges
+    onto the survivor, which is why ``deprecated_at`` is not stamped here
+    (issue #2993 tracks the edge rewire).
     """
+    from genesis.db.crud import memory as memory_crud
     from genesis.qdrant.collections import update_payload
 
-    # Qdrant: mark as deprecated
+    # SQLite first, and only a LIVE row (``mark_dream_retired``): one SQLite
+    # already retired keeps its successor and run, and both stores are left
+    # alone. Records the survivor as the successor, so the forward pointer
+    # lives in SQLite and not only in Qdrant's ``merged_into``. No recall path
+    # reads it yet; the edge re-attach (#2993) and forward-pointing recall
+    # will. Same columns as the explicit supersede path
+    # (``memory_crud.mark_superseded``).
+    #
+    # ``deprecated_at`` is deliberately NOT stamped: dream_link_repair prunes
+    # the edges of any memory whose ``deprecated_at`` has aged past the window,
+    # and this merge copies no edges onto the survivor, so stamping it would
+    # delete the retired memory's graph connections outright.
+    outcome = await memory_crud.mark_dream_retired(
+        db,
+        memory_id,
+        run_id=run_id,
+        successor_id=survivor_id,
+        timestamp=datetime.now(UTC).isoformat(),
+    )
+    await db.commit()
+    retired = {"already_retired": memory_id, "successor_retired": survivor_id}.get(outcome)
+    if retired is not None:
+        # Keep that retirement's successor and run; only re-assert Qdrant's
+        # flag, which a failed earlier mirror leaves false.
+        update_payload(
+            qdrant,
+            collection=COLLECTION,
+            point_id=retired,
+            payload={"deprecated": True},
+        )
+        return retired
+
     update_payload(
         qdrant,
         collection=COLLECTION,
@@ -456,11 +509,4 @@ async def _deprecate_memory(
             "merged_into": survivor_id,
         },
     )
-
-    # SQLite: mark as deprecated
-    await db.execute(
-        "UPDATE memory_metadata SET deprecated = 1, "
-        "dream_cycle_run_id = ? WHERE memory_id = ?",
-        (run_id, memory_id),
-    )
-    await db.commit()
+    return None
