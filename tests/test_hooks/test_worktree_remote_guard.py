@@ -1258,6 +1258,21 @@ class TestForcePushCommandBorneConfig:
             in res.stderr
         )
 
+    @pytest.mark.parametrize(
+        "suffix", [" | tail -2", " 2>&1", " 2>&1 | head -5", " | tail -n 20 | head -3"]
+    )
+    def test_force_to_backups_with_an_output_filter_is_blocked(self, remotes_repo, suffix):
+        """The publish suppression accepts head/tail stages; a force push off the
+        public repo does not: a filter is another step the prompt never names."""
+        res = _run_cwd(f"git push {_FORCE} backups feat{suffix}", str(remotes_repo))
+        assert res.returncode == 2, res.stdout + res.stderr
+        assert "a force push off the public repo must be the whole command" in res.stderr
+
+    def test_plain_force_to_backups_still_asks(self, remotes_repo):
+        res = _run_cwd(f"git push {_FORCE} backups feat", str(remotes_repo))
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert _decision(res) == "ask"
+
     @pytest.mark.parametrize("global_flag", ["-P", "--no-pager"])
     def test_nonforce_safe_git_global_to_origin_is_not_blocked_by_config_rule(
         self, remotes_repo, global_flag

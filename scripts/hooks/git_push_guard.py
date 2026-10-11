@@ -13624,7 +13624,9 @@ def _dash_c_names_sibling_worktree(path: str, hook_cwd) -> bool:
     return mine is not None and mine == _git_common_dir(hook_cwd)
 
 
-def _is_single_plain_push(segs, push_seg, cmd: str, hook_cwd=None, push_cwd=None) -> bool:
+def _is_single_plain_push(
+    segs, push_seg, cmd: str, hook_cwd=None, push_cwd=None, *, allow_output_filters: bool = True
+) -> bool:
     """Whether the WHOLE command is exactly one top-level ``git push …``, in one
     of the few spellings that cannot change what the push does.
 
@@ -13651,11 +13653,18 @@ def _is_single_plain_push(segs, push_seg, cmd: str, hook_cwd=None, push_cwd=None
     beside the push, but they read stdin and write stdout and cannot touch the
     repository, its config or the network; each must also be a parsed top-level
     segment whose argv is the filter exactly. Applies to the suppression only;
-    the re-push allow keeps ``_push_compound_is_inert``."""
+    the re-push allow keeps ``_push_compound_is_inert``.
+
+    ``allow_output_filters=False`` (the force path) refuses that suffix too: a
+    force push off the public repo must be the push and nothing else, since a
+    ``tail`` resolved through a shell function or PATH shim is a step the
+    approval prompt never describes."""
     split = _split_push_output_suffix(cmd)
     if split is None:
         return False
     text, filters = split
+    if not allow_output_filters and (filters or text != cmd):
+        return False
     if len(segs) != 1 + len(filters) or segs[0] is not push_seg:
         return False
     for seg, words in zip(segs[1:], filters, strict=True):
@@ -14449,7 +14458,9 @@ def _run_merge_and_push_gates() -> int:
                         file=sys.stderr,
                     )
                     return 2
-                if not _is_single_plain_push(segs, force_segs[0], cmd):
+                if not _is_single_plain_push(
+                    segs, force_segs[0], cmd, allow_output_filters=False
+                ):
                     print(
                         "BLOCKED: a force push off the public repo must be the whole "
                         "command — one plain `git push`, with no prefix, wrapper, git "
