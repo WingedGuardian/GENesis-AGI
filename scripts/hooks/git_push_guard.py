@@ -12150,16 +12150,23 @@ def _push_boolean_options(stream: list[PushArg] | None) -> dict[str, bool]:
     ``--force-w --no-force-with-lease`` are rejected as non-fast-forward;
     ``--dry --no-dry-run`` and ``-n --no-dry-run`` really push). Names are the
     stream's canonical long names without dashes; ``-f``/``-n`` map onto
-    ``force``/``dry-run``.
+    ``force``/``dry-run``. ``--mirror`` shares force's bit, so it sets both
+    ``mirror`` and ``force`` and ``--no-mirror`` clears both (MEASURED, git
+    2.43 and 2.55: ``--force --no-mirror`` is not a force push).
     """
     state: dict[str, bool] = {}
     for arg in stream or ():
         if arg.kind is PushArgKind.LONG:
             name = arg.text.split("=", 1)[0][2:]
             if name.startswith("no-"):
-                state[name[3:]] = False
+                name = name[3:]
+                state[name] = False
+                if name == "mirror":
+                    state["force"] = False
             else:
                 state[name] = True
+                if name == "mirror":
+                    state["force"] = True
         elif arg.kind is PushArgKind.SHORT and arg.text in _PUSH_SHORT_BOOLEANS:
             state[_PUSH_SHORT_BOOLEANS[arg.text]] = True
     return state
@@ -12171,22 +12178,25 @@ def _push_is_force(argv: list[str]) -> bool:
     Argv comes from ``shell_parse`` (quote-stripped), so a quoted ``'-f'``
     counts and a branch/refspec name that merely contains ``-f`` (a bare
     positional) does not. Catches both the flag forms — ``--force`` /
-    ``--force-with-lease`` / ``--force-if-includes`` / ``--mirror`` / ``-f`` /
+    ``--force-with-lease`` / ``--mirror`` / ``-f`` /
     bundled ``-uf`` — and the ``+<refspec>`` shorthand (``git push origin +main``),
     which git treats as ``--force`` for that ref. The shared stream consumes
     option values, including ``-o`` ending a bundle and ``-c`` before ``push``.
+    ``--mirror`` sets the force bit as well as the mirror bit; a later
+    ``--no-mirror`` clears both. ``--force-if-includes`` alone is not a force
+    push; it only affects a push with ``--force-with-lease`` (MEASURED, git 2.43
+    and 2.55).
     """
     stream: list[PushArg] | None = push_arg_stream(argv)
     if any(arg.kind is PushArgKind.PLUS for arg in stream or ()):
         return True  # +<refspec> is git shorthand for --force on that ref; no flag undoes it
     state = _push_boolean_options(stream)
-    # --mirror force-updates EVERY ref and deletes remote refs that are absent
-    # locally — an unconditional destructive push, never a plain one, so it
-    # must hard-block rather than reach an approvable prompt. Each flag counts
-    # by its EFFECTIVE value: a later --no-<flag> turns it off, as in git.
+    # --mirror shares TRANSPORT_PUSH_FORCE's bit with TRANSPORT_PUSH_MIRROR.
+    # The state walk records that shared bit on `force`, so `--no-mirror`
+    # clears it and a later `--force` re-enables it, just as git does.
     return any(
         state.get(name, False)
-        for name in ("force", "force-with-lease", "force-if-includes", "mirror")
+        for name in ("force", "force-with-lease", "mirror")
     )
 
 

@@ -1168,4 +1168,10 @@ jobs:
         # Push-argv shared scanner (#2576): five changed test files collect
         # 941 here and 863 on origin/main 9008b3717 (one file absent there),
         # measured with --collect-only: net +78. Floor: 25335 + 78 = 25413.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25413
+        # Force-option mirror bit fixes (#2864): the five changed test files
+        # collect 948 here and 863 on origin/main 3d426ca8 (--collect-only):
+        # test_git_push_option_table.py 1/0; test_merge_review_gate.py 519/519;
+        # test_push_refspec_current_branch.py 277/199;
+        # test_value_flag_consistency.py 8/8; test_worktree_remote_guard.py
+        # 143/137. Net +85. Floor: 25335 + 85 = 25420.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25420
