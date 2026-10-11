@@ -10437,9 +10437,11 @@ _REWORK_DECL_FIELD_RE = re.compile(
 )
 _REWORK_REF_RE = re.compile(_REWORK_REF, re.IGNORECASE)
 #: The `## Rework` heading's rendered text: `Rework`, optionally followed by more
-#: (`Rework (replaces #10)`), but never the acknowledgement heading, which belongs
-#: on the OLD PR.
-_REWORK_HEADING_TEXT_RE = re.compile(r"^rework\b(?![ \t_-]*acknowledg)", re.IGNORECASE)
+#: (`Rework (replaces #10)`), but never the spec or acknowledgement heading, which
+#: belong on the OLD PR: a body that copies the spec is not a report against it.
+_REWORK_HEADING_TEXT_RE = re.compile(
+    r"^rework\b(?![ \t_-]*(?:acknowledg|spec\b))", re.IGNORECASE
+)
 #: The most declared PRs one body may name. Each unlisted one costs a PR read
 #: and a timeline read on a path with no shared deadline (`--check-pr`), so the
 #: bound keeps a degraded API from stalling the report. A rebuild replaces one
@@ -11004,30 +11006,59 @@ def _rework_is_ack(body: str) -> bool:
     return _rework_heading_comment(body, _REWORK_ACK_HEADING.removeprefix("## "))
 
 
-def _rework_spec_problem(num: int, rows: list[dict]) -> str | None:
-    """Why PR ``num`` lacks a posted rework spec, or None when it has one.
+def _rework_spec_times(rows: list[dict]) -> list[_dt.datetime] | None:
+    """Creation times of the maintainer `## Rework spec` comments in ``rows``.
 
-    AGENTS.md: a sent-back PR is rebuilt only from a maintainer comment headed
-    ``## Rework spec``; a ``needs-architecture-session`` PR without one has an
-    undecided design and must not be rebuilt. Only OWNER, MEMBER or COLLABORATOR
-    count: a builder bot can rework a shape but cannot decide one.
+    None when there is no such comment at all; a spec whose time does not parse
+    is left out of the list, so it can never be the one that predates a PR.
+    Only OWNER, MEMBER or COLLABORATOR count: a builder bot can rework a shape
+    but cannot decide one.
     """
-    for r in rows:
-        if (
-            isinstance(r.get("body"), str)
-            and r.get("association") in _MAINTAINER_ASSOCIATIONS
-            and _rework_heading_comment(r["body"], "rework spec")
-        ):
-            return None
-    return (
-        f"PR #{num} has no maintainer `## Rework spec` comment: a sent-back PR is "
-        f"rebuilt only from a posted spec (for needs-architecture-session, the "
-        f"owner's decision)"
-    )
+    specs = [
+        r for r in rows
+        if isinstance(r.get("body"), str)
+        and r.get("association") in _MAINTAINER_ASSOCIATIONS
+        and _rework_heading_comment(r["body"], "rework spec")
+    ]
+    if not specs:
+        return None
+    return sorted(t for t in (_rework_ts(r.get("created")) for r in specs) if t)
+
+
+def _rework_spec_problem(num: int, rows: list[dict], created: _dt.datetime) -> str | None:
+    """Why PR ``num`` lacks a rework spec this PR could be built from, or None.
+
+    AGENTS.md orders it spec, then acknowledgement, then the new PR: a sent-back
+    PR is rebuilt only from a maintainer comment headed ``## Rework spec``, and a
+    ``needs-architecture-session`` PR without one has an undecided design and
+    must not be rebuilt. A spec posted after this PR opened does not count: the
+    PR was built before the decision it would cite. Ties count as before, as
+    for the acknowledgement.
+    """
+    times = _rework_spec_times(rows)
+    if times is None:
+        return (
+            f"PR #{num} has no maintainer `## Rework spec` comment: a sent-back PR is "
+            f"rebuilt only from a posted spec (for needs-architecture-session, the "
+            f"owner's decision)"
+        )
+    if not times or times[0] > created:
+        return (
+            f"PR #{num}'s `## Rework spec` was posted after this PR was opened; "
+            f"a rebuild is built from a spec that already exists"
+        )
+    return None
 
 
 def _rework_ack_problem(num: int, rows: list[dict], created: _dt.datetime) -> str | None:
-    """Why PR ``num`` lacks a valid acknowledgement, or None when it has one."""
+    """Why PR ``num`` lacks a valid acknowledgement, or None when it has one.
+
+    Valid means from a maintainer or an allowlisted bot, created no later than
+    this PR, and no earlier than the first spec that predates this PR: an
+    acknowledgement acknowledges a spec, so one written before any spec existed
+    acknowledged nothing. With no such spec, ``_rework_spec_problem`` reports it
+    and the time order here is judged against this PR alone.
+    """
     candidates = [
         r for r in rows
         if isinstance(r.get("body"), str) and _rework_is_ack(r["body"])
@@ -11044,10 +11075,17 @@ def _rework_ack_problem(num: int, rows: list[dict], created: _dt.datetime) -> st
             f"PR #{num}'s `## Rework acknowledgement` comment is not from a maintainer "
             f"(OWNER, MEMBER or COLLABORATOR) or an allowlisted bot"
         )
-    for r in authorised:
-        ts = _rework_ts(r.get("created"))
-        if ts is not None and ts <= created:
-            return None
+    specs = [t for t in (_rework_spec_times(rows) or []) if t <= created]
+    not_before = specs[0] if specs else None
+    stamps = [t for t in (_rework_ts(r.get("created")) for r in authorised) if t]
+    if any(t <= created and (not_before is None or t >= not_before) for t in stamps):
+        return None
+    if not_before is not None and any(t < not_before for t in stamps):
+        return (
+            f"PR #{num}'s `## Rework acknowledgement` predates its `## Rework spec`; "
+            f"the builder acknowledges the posted spec, so post the acknowledgement "
+            f"after it"
+        )
     return (
         f"PR #{num}'s `## Rework acknowledgement` was created after this PR was "
         f"opened; the builder acknowledges the spec on the old PR BEFORE opening "
@@ -11232,7 +11270,7 @@ def _check_rework_inner(
             )
         else:
             for problem in (
-                _rework_spec_problem(num, rows),
+                _rework_spec_problem(num, rows, created),
                 _rework_ack_problem(num, rows, created),
             ):
                 if problem:

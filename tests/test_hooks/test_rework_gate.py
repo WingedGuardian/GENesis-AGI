@@ -1108,3 +1108,43 @@ def test_55_a_label_led_bullet_under_a_field_is_its_value():
 def test_56_a_top_level_field_with_a_value_does_not_absorb_the_next_list():
     body = "Replaces: #10\n\n- Closes #200\n"
     assert G._rework_declared_refs(body, "20", REPO) == {10}
+
+
+# ── 57-59: Codex round 4 ──────────────────────────────────────────
+
+
+def test_57_a_spec_posted_after_this_pr_opened_blocks(rebuild):
+    late = {**_spec(), "created": AFTER}
+    rebuild(spec=False, acks=[late, _ack()])
+    state, msg = _check()
+    assert state == G.REWORK_BLOCK, msg
+    assert "posted after this PR was opened" in msg
+
+
+def test_57b_an_earlier_spec_still_counts_beside_a_later_amendment(rebuild):
+    amended = {**_spec("## Rework spec\nAmended: keep the core only."), "created": AFTER}
+    rebuild(acks=[_ack(), amended])
+    state, msg = _check()
+    assert state == G.REWORK_OK, msg
+
+
+def test_58_an_acknowledgement_older_than_every_spec_blocks(rebuild):
+    early = "2026-01-08T00:00:00Z"
+    rebuild(acks=[_ack(early)])
+    state, msg = _check()
+    assert state == G.REWORK_BLOCK, msg
+    assert "predates its `## Rework spec`" in msg
+
+
+@pytest.mark.parametrize("heading", ["## Rework spec", "## Rework Spec (copy)"])
+def test_59_a_spec_heading_is_not_the_rework_report(rebuild, heading):
+    rebuild(body=_BODY.replace("## Rework\n", heading + "\n"))
+    state, msg = _check()
+    assert state == G.REWORK_BLOCK, msg
+    assert "no `## Rework` heading" in msg
+
+
+def test_59b_a_rework_heading_with_more_text_still_counts(rebuild):
+    rebuild(body=_BODY.replace("## Rework\n", "## Rework specifics for #10\n"))
+    state, msg = _check()
+    assert state == G.REWORK_OK, msg
