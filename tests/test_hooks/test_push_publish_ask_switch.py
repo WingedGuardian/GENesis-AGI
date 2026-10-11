@@ -1326,15 +1326,107 @@ _GITHUB_READS = [
     "gh pr --help view comment",  # help IS declared at the group level
     # No verb: every word after the group is a flag value, nothing is hidden.
     "gh status -o myorg",
+    # gh's root alias for `gh pr checkout`.
+    "gh co 5",
+    # `mutation` as an alias or a variable name is inside the brackets, not an
+    # operation keyword at the document's top level.
+    "gh api graphql -f query='query { mutation: viewer { login } }'",
+    "gh api graphql -f query='query($mutation: Int) { viewer { login } }' -F mutation=1",
+    "gh api graphql -f query='{ viewer { login } }'",
+    "gh api graphql -f query='fragment F on User { login } query { viewer { ...F } }'",
+    # Local git work, and git's network reads.
+    "git pull --ff-only",
+    "git clone https://github.com/o/r",
+    "git remote -v",
+    "git remote add up https://github.com/o/r",
+    "git submodule update --init",
+    "git lfs ls-files",
+    "git lfs locks",
+    "git rebase origin/main",
+    "git -C /tmp/x worktree list",
+    "git bisect start",
+    "git --version",
+    "git fetch --unshallow origin",
+    "git fetch -u origin",
+    "git grep -n foo",
+    "gh ssh-key list",
+    "gh gpg-key list",
+    "gh -R o/r pr view 5",
+]
+
+#: Not on the read list, so refused from a subagent: the owner ruling of
+#: 2026-10-10 replaced the denylist of writes with an allowlist of reads. Each
+#: entry is a write the denylist missed, or a command whose effect the guard
+#: cannot read.
+_NOT_ON_THE_READ_LIST = [
+    # Codex P1: auth flows change GitHub state (an uploaded SSH key, new scopes).
+    "gh auth login --git-protocol ssh",
+    "gh auth refresh --scopes repo",
+    "gh auth logout",
+    "gh auth setup-git",
+    # Codex P2: LFS lock verbs write the LFS server.
+    "git lfs lock big.bin",
+    "git lfs unlock big.bin",
+    "git lfs pre-push origin",
+    # An unknown gh subcommand, group, and `gh api` method.
+    "gh pr frobnicate 5",
+    "gh newgroup thing",
+    "gh api -X FOO repos/o/r",
+    "gh api --method PROPFIND repos/o/r",
+    "gh api -X GET repos/o/r --input body.json",
+    # A GraphQL subscription is not a query either.
+    "gh api graphql -f query='subscription { x }'",
+    "gh api graphql -f query='fragment F on User { login } mutation { x { ...F } }'",
+    "gh api graphql -f query='query { a } }{ mutation { b }'",
+    # Not reads, and not network reads.
     "gh completion -s bash",
     "gh browse -n",
+    # git: an alias or unknown subcommand, a launcher, a subtree.
+    "git co main",
+    "git frobnicate",
+    "git subtree split --prefix docs",
+    "git for-each-repo --config=maintenance.repo push",
+    "git submodule foreach 'git push'",
+    "git bisect run make test",
+    "git rebase -x 'git push origin HEAD' main",
+    "git rebase --exec='git push' main",
+    "git rebase --ex 'git push' main",
+    "git -c alias.p=push p origin HEAD",
+    'git "$SUB" origin HEAD',
+    # A flag before the group swallows the next word, so the real command is
+    # the one after it (architect F1; MEASURED with gh 2.101).
+    "gh --approve https://github.com/o/r/pull/5 pr review",
+    "gh --yes o/r repo delete",
+    "gh --admin co pr merge",
+    "gh --yes api repo delete",
+    # git options passed through gh, and git options that run a program.
+    "gh repo clone o/r -- --upload-pack='sh -c x'",
+    "gh co 5 -- --upload-pack=x",
+    "git fetch --upload-pack='sh -c x' .",
+    "git fetch --upload-p=x .",
+    "git pull --upload-pack=x origin main",
+    "git ls-remote -u x .",
+    "git clone -c core.sshCommand=x https://github.com/o/r",
+    "git clone --template=/t https://github.com/o/r",
+    "git grep -Ocat foo",
+    "git grep --open-files-in-pager=cat foo",
+    "git fetch-pack --exec=x .",
+    "git archive --remote=x --exec=y HEAD",
+]
+
+#: The program is an expansion, so the parse cannot say whether it is git or gh;
+#: refused when the command names either (architect F2).
+_PROGRAM_IS_AN_EXPANSION = [
+    "G=gh; $G pr comment 5 -b x",
+    "G=git; $G push origin main",
+    "$(echo gh) pr comment 5 -b x",
 ]
 
 
 def test_a_value_that_reads_as_help_is_not_help() -> None:
     """`--body --help` posts the text "--help": the flag's value is not a flag."""
     segs, _ = gpg.analyze_checked("gh pr comment 5 --body --help")
-    assert gpg._github_write_segment(segs[0]) == "gh pr comment"
+    assert gpg._subagent_refusal(segs[0]) == "gh pr comment"
 
 
 def test_heredoc_text_that_starts_with_gh_is_not_a_gh_call() -> None:
@@ -1342,7 +1434,7 @@ def test_heredoc_text_that_starts_with_gh_is_not_a_gh_call() -> None:
     command = "cat >> t.py <<'EOF'\ngh = FakeGh()\nEOF"
     segs, _ = gpg.analyze_checked(command)
     assert any(s.exe == "gh" for s in segs), "fixture no longer yields a gh segment"
-    assert not any(gpg._github_write_segment(s) for s in segs), [s.argv for s in segs]
+    assert not any(gpg._subagent_refusal(s) for s in segs), [s.argv for s in segs]
 
 
 #: Writes that the API-merge refusal (#2768) claims first, for every session: a
@@ -1380,18 +1472,87 @@ def test_a_subagent_github_write_is_denied(monkeypatch, tmp_path, capsys, comman
         assert "git rev-parse HEAD" in err, err
 
 
+@pytest.mark.parametrize("command", _NOT_ON_THE_READ_LIST)
+def test_a_subagent_command_off_the_read_list_is_denied(
+    monkeypatch, tmp_path, capsys, command
+) -> None:
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    rc, out, err = _run_at(monkeypatch, capsys, command, repo, _SUBAGENT)
+    assert rc == 2, (command, rc, out, err)
+    assert not out.strip(), out
+    assert "only the main session publishes" in err, (command, err)
+
+
+@pytest.mark.parametrize("command", _PROGRAM_IS_AN_EXPANSION)
+def test_a_subagent_command_whose_program_is_an_expansion_is_refused(
+    monkeypatch, tmp_path, capsys, command
+) -> None:
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    rc, out, err = _run_at(monkeypatch, capsys, command, repo, _SUBAGENT)
+    assert rc == 2 and "cannot be checked against" in err, (command, rc, out, err)
+    assert not out.strip(), out
+
+
+#: The merge arm refuses a merge help request that carries a PR number or flags
+#: before this rule runs, in every session (only the bare form skips it).
+@pytest.mark.parametrize("command", [c for c in _GITHUB_READS if not c.startswith("gh pr merge")])
+def test_a_subagent_read_runs_through_the_hook(monkeypatch, tmp_path, capsys, command) -> None:
+    """The whole hook, not only the classifier: a listed read is never refused."""
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    rc, out, err = _run_at(monkeypatch, capsys, command, repo, _SUBAGENT)
+    assert "only the main session publishes" not in err, (command, err)
+    assert "cannot be checked against" not in err, (command, err)
+    assert rc == 0, (command, rc, out, err)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh auth login --git-protocol ssh",
+        "git lfs lock big.bin",
+        "gh co 5",
+        "git co main",
+        "gh pr frobnicate 5",
+        "git subtree split --prefix docs",
+        "gh pr view 5 \\\n  --json title",
+    ],
+)
+def test_the_main_session_is_unchanged_by_the_read_list(
+    monkeypatch, tmp_path, capsys, command
+) -> None:
+    """Main-session control for the allowlist: none of these is refused or asked
+    by the subagent rule (none is one of the guard's other gated operations)."""
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    rc, out, err = _run_at(monkeypatch, capsys, command, repo)
+    assert "only the main session publishes" not in err, (command, err)
+    assert "cannot be checked against" not in err, (command, err)
+    assert rc == 0 and "permissionDecision" not in out, (command, rc, out, err)
+
+
+def test_a_bounded_subagent_command_naming_git_is_refused(monkeypatch, tmp_path, capsys) -> None:
+    """CodeRabbit Major: a command over the length bound returns no segments, and
+    the shell can build `push` at run time, so naming `git` is enough to refuse."""
+    command = "true " + "x" * 70000 + "; git \"$(printf '\\x70\\x75\\x73\\x68')\""
+    segs, blind = gpg.analyze_checked(command)
+    assert segs == [] and blind is not None and blind.bounds_induced, (segs, blind)
+    repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
+    rc, out, err = _run_at(monkeypatch, capsys, command, repo, _SUBAGENT)
+    assert rc == 2 and "one line" in err, (rc, out, err[:300])
+    assert not out.strip(), out
+
+
 @pytest.mark.parametrize("command", _GITHUB_WRITES)
 def test_the_classifier_calls_every_listed_write_a_write(command) -> None:
     """The same list at the classifier, so a miss names the segment rather than
     depending on whatever else `main()` would have done with it."""
     segs, _ = gpg.analyze_checked(command)
-    assert any(gpg._github_write_segment(s) for s in segs), command
+    assert any(gpg._subagent_refusal(s) for s in segs), command
 
 
 @pytest.mark.parametrize("command", _GITHUB_READS)
 def test_a_subagent_github_read_is_not_refused(command) -> None:
     segs, _ = gpg.analyze_checked(command)
-    assert not any(gpg._github_write_segment(s) for s in segs), command
+    assert not any(gpg._subagent_refusal(s) for s in segs), command
 
 
 @pytest.mark.parametrize(

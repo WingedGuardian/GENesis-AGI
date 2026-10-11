@@ -10735,31 +10735,97 @@ def _is_subagent(payload) -> bool:
     return isinstance(agent_id, str) and bool(agent_id.strip())
 
 
-#: git subcommands that send objects or refs to a remote. ``send-pack`` and
-#: ``http-push`` are the plumbing under ``push``; ``lfs push`` uploads LFS
-#: objects and ``subtree push`` pushes a split history (both checked by their
-#: own verb, below).
-_GIT_PUBLISH_SUBCOMMANDS = frozenset({"push", "send-pack", "http-push"})
-_GIT_PUSHING_FAMILIES = frozenset({"lfs", "subtree"})
+#: What a SUBAGENT may run of git and gh: an ALLOWLIST (owner ruling 2026-10-10).
+#: The earlier denylist of writing commands lost a write verb to every review
+#: round, because the write verbs of git, git-lfs and gh are an open set. Now a
+#: segment is allowed only when it is on these lists; anything else, and anything
+#: whose command this guard cannot read, is refused.
+#:
+#: git: every subcommand that works on the local repository, plus the network
+#: READS (fetch, pull, clone, ls-remote, fetch-pack). Taken from
+#: ``git --list-cmds=main,others`` (git 2.43) MINUS the network writers (push,
+#: send-pack, http-push), the server and transport ends (receive-pack,
+#: upload-pack, upload-archive, daemon, http-backend, shell, remote-*, instaweb),
+#: mail (imap-send), credential access (credential*), commands whose job is to
+#: run other commands (for-each-repo, filter-branch, difftool, mergetool, hook)
+#: and git's internal helpers. Options that make a listed command run a program
+#: are refused per command (``_GIT_RUNS_A_PROGRAM``, ``_GIT_REBASE_EXEC``); config
+#: and environment that do the same (``-c core.sshCommand``) are not read. Not listed, so refused: a git alias, an external
+#: ``git-<name>``, ``subtree``, ``svn``, ``send-email``, a newer git's command.
+_GIT_SUBAGENT_OK = frozenset(
+    """
+    add am annotate apply archive bisect blame branch bugreport bundle cat-file
+    check-attr check-ignore check-mailmap check-ref-format checkout
+    checkout-index cherry cherry-pick clean clone column commit commit-graph
+    commit-tree config count-objects describe diagnose diff diff-files
+    diff-index diff-tree fast-export fast-import fetch fetch-pack fmt-merge-msg
+    for-each-ref format-patch fsck fsck-objects gc get-tar-commit-id grep
+    hash-object help index-pack init init-db interpret-trailers lfs log ls-files
+    ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file
+    merge-index merge-tree mktag mktree multi-pack-index mv name-rev notes
+    pack-objects pack-redundant pack-refs patch-id prune prune-packed pull
+    quiltimport range-diff read-tree rebase reflog remote repack replace
+    request-pull rerere reset restore rev-list rev-parse revert rm shortlog show
+    show-branch show-index show-ref sparse-checkout stage stash status
+    stripspace submodule switch symbolic-ref tag unpack-file unpack-objects
+    update-index update-ref update-server-info var verify-commit verify-pack
+    verify-tag version whatchanged worktree write-tree
+    """.split()  # noqa: SIM905 - a word list kept readable
+)
+#: git commands that are families: their first word after the family name must
+#: be one of these (none at all lists or prints help). Left out on purpose:
+#: ``lfs push``/``lock``/``unlock`` (write the LFS server), ``lfs pre-push``,
+#: ``submodule foreach`` and ``bisect run`` (run arbitrary commands).
+_GIT_FAMILY_VERBS: dict[str, frozenset[str]] = {
+    "lfs": frozenset({
+        "checkout", "clone", "env", "fetch", "fsck", "install", "locks",
+        "logs", "ls-files", "migrate", "pointer", "prune", "pull", "status",
+        "track", "uninstall", "untrack", "update", "version", "help"
+    }),
+    "submodule": frozenset({
+        "status", "summary", "init", "deinit", "update", "sync",
+        "absorbgitdirs", "set-branch", "set-url", "add"
+    }),
+    "remote": frozenset({
+        "add", "rename", "remove", "rm", "set-head", "set-branches",
+        "get-url", "set-url", "show", "prune", "update"
+    }),
+    "bisect": frozenset({
+        "start", "bad", "good", "new", "old", "terms", "skip", "reset",
+        "visualize", "view", "replay", "log", "help"
+    }),
+}
+#: Options that make an allowlisted git command run a program it names:
+#: ``(long options, short option letters)``. git accepts any unambiguous prefix
+#: of a long option, so a token counts when it is a prefix of one listed here
+#: (four characters or more, which over-refuses a few harmless prefixes).
+_GIT_RUNS_A_PROGRAM: dict[str, tuple[tuple[str, ...], str]] = {
+    "fetch": (("--upload-pack",), ""),
+    "pull": (("--upload-pack",), ""),
+    "clone": (("--upload-pack", "--config", "--template"), "uc"),
+    "ls-remote": (("--upload-pack",), "u"),
+    "fetch-pack": (("--upload-pack", "--exec"), ""),
+    "archive": (("--exec",), ""),
+    "grep": (("--open-files-in-pager",), "O"),
+}
+#: ``git rebase --exec``/``-x`` runs a command per commit. git accepts any
+#: unambiguous prefix of a long option, so ``--ex`` is ``--exec``.
+_GIT_REBASE_EXEC = re.compile(r"--ex|-[A-Za-z]*x")
 
-#: gh groups whose commands can change state on GitHub, each mapped to the
-#: subcommands that only READ (or act only on the local machine). Every OTHER
-#: subcommand of these groups is a write: an ALLOWLIST of reads, because the
-#: write verbs are an open set (``pr review``, ``pr ready``, ``pr lock``,
-#: ``issue develop``, ``repo fork``, ``run rerun``, ``workflow run``, …) and a
-#: new gh release adds more. A bare group word (``gh pr``) prints help.
-_GH_READ_SUBCOMMANDS: dict[str, frozenset[str]] = {
+#: gh: the read-only subcommands of each group. Every other subcommand, and every
+#: group not listed (``codespace``, ``browse``, ``completion``, an extension or a
+#: ``gh alias`` name), is refused. ``auth`` keeps only ``status``: ``login`` can
+#: upload an SSH key and ``refresh`` changes token scopes.
+_GH_SUBAGENT_READS: dict[str, frozenset[str]] = {
     "pr": frozenset({"list", "ls", "view", "diff", "checks", "status", "checkout", "co"}),
     "issue": frozenset({"list", "ls", "view", "status"}),
+    "run": frozenset({"list", "ls", "view", "watch", "download"}),
+    "workflow": frozenset({"list", "ls", "view"}),
     "release": frozenset({"list", "ls", "view", "download", "verify", "verify-asset"}),
-    "repo": frozenset(
-        {"list", "ls", "view", "clone", "set-default", "gitignore", "license",
-         "read-file", "read-dir"}
-    ),
+    "repo": frozenset({"list", "ls", "view", "clone", "gitignore", "license"}),
+    "search": frozenset({"code", "commits", "issues", "prs", "repos"}),
     "label": frozenset({"list", "ls"}),
     "gist": frozenset({"list", "ls", "view", "clone"}),
-    "workflow": frozenset({"list", "ls", "view"}),
-    "run": frozenset({"list", "ls", "view", "watch", "download"}),
     "cache": frozenset({"list", "ls"}),
     "secret": frozenset({"list", "ls"}),
     "variable": frozenset({"list", "ls", "get"}),
@@ -10767,30 +10833,30 @@ _GH_READ_SUBCOMMANDS: dict[str, frozenset[str]] = {
     "ruleset": frozenset({"list", "ls", "view", "check"}),
     "discussion": frozenset({"list", "ls", "view"}),
     "org": frozenset({"list", "ls"}),
+    "extension": frozenset({"list", "ls", "search"}),
+    "alias": frozenset({"list", "ls"}),
+    "auth": frozenset({"status"}),
+    "config": frozenset({"get", "list"}),
     "ssh-key": frozenset({"list", "ls"}),
     "gpg-key": frozenset({"list", "ls"}),
-    # `extension exec` runs an extension, which can do anything.
-    "extension": frozenset({"list", "ls", "search", "browse", "install", "upgrade",
-                            "remove", "create"}),
+    "attestation": frozenset({"verify"}),
 }
-#: gh's own group aliases (``gh ext``, ``gh rs``, ``gh at``), resolved first.
-_GH_GROUP_ALIASES = {"ext": "extension", "extensions": "extension", "rs": "ruleset",
-                     "at": "attestation"}
-
-#: gh groups that never write to GitHub: searches, status and browse (reads),
-#: and local CLI state — auth, config, aliases, completion. Out of this hook's
-#: scope, so a subagent keeps them. A group in NEITHER table — a future gh
-#: group, ``codespace``, an extension, or a ``gh alias`` name — is treated as a
-#: write: its effect cannot be read off argv.
-_GH_NON_WRITING_GROUPS = frozenset(
-    {"search", "status", "browse", "auth", "config", "alias", "completion",
-     "help", "version", "attestation", "licenses", "reference"}
-)
+#: gh commands with no subcommands that only print: allowed whatever follows.
+_GH_SUBAGENT_LEAF_READS = frozenset({"status", "version", "help", "reference", "licenses"})
+#: gh's own aliases (``gh ext``, ``gh rs``; root ``gh co`` is ``gh pr checkout``).
+_GH_GROUP_ALIASES = {
+    "ext": "extension",
+    "extensions": "extension",
+    "rs": "ruleset",
+    "at": "attestation",
+}
+_GH_ROOT_READ_ALIASES = frozenset({"co"})
 
 #: A gh command word: what a real group, alias or extension name looks like
 #: (extensions and aliases may carry capitals, digits, dots and underscores).
 #: A segment whose "group" is anything else (``=`` from a here-doc line
-#: ``gh = Fake()``) is text, not a gh call.
+#: ``gh = Fake()``) is text, not a gh call: gh would reject it as an unknown
+#: command, so it runs nothing.
 _GH_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 #: Before the verb, gh's command lookup treats any flag the group does not
@@ -10803,12 +10869,8 @@ _GH_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _GH_PREPATH_VALUE = frozenset({"-R", "--repo"})
 _GH_PREPATH_BOOL = frozenset({"-h", "--help"})
 
-#: A GraphQL operation keyword, case-sensitive as GraphQL is, anywhere it is not
-#: part of a longer word or a string (so a field such as ``addMutation`` or the
-#: introspection name ``"Mutation"`` does not match, while ``},mutation{`` does:
-#: GraphQL treats commas as whitespace).
-_GRAPHQL_MUTATION = re.compile(r'(?:^|[^\w"])mutation\b')
-_GRAPHQL_READ_START = re.compile(r"\s*(?:query\b|\{)")
+_GRAPHQL_READ_START = re.compile(r"\s*(?:(?:query|fragment)\b|\{)")
+_GRAPHQL_NAME = re.compile(r"[_A-Za-z][_0-9A-Za-z]*")
 
 
 def _graphql_without_literals(q: str) -> str | None:
@@ -10850,41 +10912,57 @@ def _graphql_without_literals(q: str) -> str | None:
     return "".join(out)
 
 
-def _gh_api_writes(argv: list[str]) -> bool:
-    """Whether a ``gh api`` argv can change state on GitHub.
+def _graphql_is_query(q: str) -> bool:
+    """Whether the GraphQL document ``q`` defines only queries (and fragments).
 
-    REST: any effective method but GET or HEAD (``shell_parse.gh_api_request``
-    applies gh's defaulting — a parameter or ``--input`` makes it POST), and any
-    ``X-HTTP-Method-Override`` header, whatever method the header claims.
-    GraphQL: always sent as POST, so the method says nothing. It is a READ only
-    when an ALLOWLIST holds: no ``--input``, and a ``query`` field whose literal
-    text starts with ``query`` or ``{``, carries no command substitution or
-    backtick, and has no ``mutation`` operation. Anything else — a query from a
-    file (``@``), from a shell variable or substitution, or none at all — counts
-    as a write. An unmodelled flag also counts, since its value could be a
-    method. Fails toward "writes": the caller only refuses, never authorises."""
-    req = gh_api_request(argv)
-    if req is None:
+    An operation's kind is the keyword at the document's TOP LEVEL, outside every
+    ``{}`` and ``()``: there ``mutation``/``subscription`` start an operation and
+    ``{`` an anonymous query. Inside the brackets the same word is an alias, a
+    field or a ``$variable``, and in a string or comment it is text, so neither
+    makes a read a write. The document must also start as a query or a fragment
+    (``query``, ``fragment`` or ``{``). Anything this cannot read is not a query: a shell expansion, an
+    unterminated string, unbalanced brackets."""
+    if "$(" in q or "${" in q or "`" in q or not _GRAPHQL_READ_START.match(q):
         return False
-    if req.unmodelled:
-        return True
+    bare = _graphql_without_literals(q)
+    if bare is None:
+        return False
+    depth, top = 0, []
+    for ch in bare:
+        if ch in "{(":
+            depth += 1
+            top.append(" ")
+        elif ch in "})":
+            depth -= 1
+            if depth < 0:
+                return False
+            top.append(" ")
+        else:
+            top.append(ch if depth == 0 else " ")
+    if depth:
+        return False
+    return not {"mutation", "subscription"} & set(_GRAPHQL_NAME.findall("".join(top)))
+
+
+def _gh_api_is_read(argv: list[str]) -> bool:
+    """Whether a ``gh api`` argv only reads from GitHub.
+
+    REST: the effective method is GET or HEAD (``shell_parse.gh_api_request``
+    applies gh's defaulting: a parameter makes it POST unless ``-X GET`` keeps
+    it a query string), with no ``--input``, no method-override header and no
+    flag the parse does not model (its value could be a method). GraphQL is
+    always POST, so it is a read only when every ``query`` field is a literal
+    document :func:`_graphql_is_query` accepts and there is no ``--input``. A
+    query from a file (``@``), a variable or a substitution is not a read."""
+    req = gh_api_request(argv)
+    if req is None or req.unmodelled or req.has_input:
+        return False
     if any("method-override" in t.lower() for t in argv):
-        return True
-    endpoint = (req.endpoint or "").strip("/").lower()
-    if endpoint == "graphql":
-        if req.has_input:
-            return True
+        return False
+    if (req.endpoint or "").strip("/").lower() == "graphql":
         queries = [v for k, v in req.fields if k == "query"]
-        return not queries or not all(
-            _GRAPHQL_READ_START.match(q)
-            and (bare := _graphql_without_literals(q)) is not None
-            and not _GRAPHQL_MUTATION.search(bare)
-            and "$(" not in q
-            and "${" not in q
-            and "`" not in q
-            for q in queries
-        )
-    return req.method not in ("GET", "HEAD")
+        return bool(queries) and all(_graphql_is_query(q) for q in queries)
+    return req.method in ("GET", "HEAD")
 
 
 def _gh_prepath_is_plain(argv: list[str], path_end: int) -> bool:
@@ -10911,87 +10989,154 @@ def _gh_prepath_is_plain(argv: list[str], path_end: int) -> bool:
     return True
 
 
-def _github_write_segment(seg) -> str | None:
-    """A short label for a segment that publishes to, or writes on, GitHub, else
-    None. Covers ``git push`` and its plumbing (``send-pack``, ``http-push``,
-    ``lfs push``) and every ``gh`` write: the subcommands of a GitHub-writing
-    group outside ``_GH_READ_SUBCOMMANDS``, any group outside both tables, and a
-    ``gh api`` call ``_gh_api_writes`` judges a write."""
-    argv = list(getattr(seg, "argv", None) or [])
+def _git_subagent_refusal(argv: list[str]) -> str | None:
+    """Why a subagent may not run this git argv, or None when it may."""
+    idx = git_subcommand_index(argv)
+    if idx is None:
+        return None  # `git`, `git --version`, `git -C dir`: no subcommand runs
+    sub, rest = argv[idx], argv[idx + 1 :]
+    if sub not in _GIT_SUBAGENT_OK:
+        return f"git {sub}"
+    verbs = _GIT_FAMILY_VERBS.get(sub)
+    if verbs is not None:
+        word = next((t for t in rest if not t.startswith("-")), None)
+        if word is not None and word not in verbs:
+            return f"git {sub} {word}"
+    if sub == "rebase" and any(_GIT_REBASE_EXEC.match(t) for t in rest):
+        return "git rebase --exec"
+    runs = _GIT_RUNS_A_PROGRAM.get(sub)
+    if runs is not None:
+        longs, shorts = runs
+        for t in rest:
+            name = t.split("=", 1)[0]
+            if (name.startswith("--") and len(name) >= 4 and any(o.startswith(name) for o in longs)) or (
+                shorts and re.match(rf"-[A-Za-z]*[{shorts}]", t)
+            ):
+                return f"git {sub} {name} (runs a program)"
+    return None
+
+
+def _subagent_refusal(seg) -> str | None:
+    """A short label for a git or gh segment a subagent may NOT run, else None.
+
+    Allowed: what :data:`_GIT_SUBAGENT_OK` and :data:`_GIT_FAMILY_VERBS` list
+    for git; for gh, a subcommand :data:`_GH_SUBAGENT_READS` lists, a leaf in
+    :data:`_GH_SUBAGENT_LEAF_READS`, a help request, or a ``gh api`` call
+    :func:`_gh_api_is_read` accepts. Everything else is refused, including a
+    segment whose verb the parse could not resolve. Other programs are not this
+    rule's subject and return None."""
     exe = getattr(seg, "exe", "")
+    if exe not in ("git", "gh"):
+        return None
+    argv = list(getattr(seg, "argv", None) or [])
+    if getattr(seg, "verb_unresolved", False):
+        return f"{exe} (its subcommand is built at run time)"
     if exe == "git":
-        sub = git_subcommand(argv)
-        if sub in _GIT_PUBLISH_SUBCOMMANDS:
-            return f"git {sub}"
-        if sub in _GIT_PUSHING_FAMILIES:
-            # `push` ANYWHERE after the family word, not only first: options may
-            # precede the verb with a separate value (`git subtree --prefix docs
-            # push`), and which words are values is not modelled. A value that is
-            # literally `push` over-refuses, which is this classifier's direction.
-            idx = git_subcommand_index(argv)
-            if "push" in argv[(idx or 0) + 1 :]:
-                return f"git {sub} push"
-        return None
-    if exe != "gh":
-        return None
+        return _git_subagent_refusal(argv)
     inv = gh_command(argv)
     if inv is None:
-        return None  # `gh --version` / `gh --help`: no command path
+        # No command path: bare `gh`, `gh --version`, or flags only.
+        extra = [t for t in argv[1:] if t not in ("--help", "--version", "-h", "-v")]
+        return "gh (no readable command)" if extra else None
+    # A flag gh's root does not declare swallows the NEXT word, so with one
+    # before the group the word read as the group is a value and the command
+    # runs from the word after it (MEASURED, gh 2.101: `gh --yes o/r repo
+    # delete` is `repo delete`). Checked before every early return below.
+    if not _gh_prepath_is_plain(argv, inv.path_end):
+        return f"gh {inv.group} (a flag before the command hides which command runs)"
     if not _GH_WORD.fullmatch(inv.group):
         return None  # here-doc text such as `gh = Fake()`, not a gh call
+    if inv.group in _GH_ROOT_READ_ALIASES and argv[1] == inv.group:
+        # gh's default `co` alias (`gh pr checkout`). gh expands an alias only
+        # as the first word. A user can redefine `co` with `gh alias set
+        # --clobber`; that is not visible here.
+        return None if "--" not in argv else "gh co (git options after --)"
     group = _GH_GROUP_ALIASES.get(inv.group, inv.group)
     verb = inv.subcommand or (inv.positionals[0] if inv.positionals else None)
     # Where the command path ends in argv: after the verb when there is one (a
     # group gh_command does not model leaves its verb as the first positional,
     # so find it). With no verb, every word after the group was a flag value,
     # for gh as for the walk, so nothing is hidden: the path ends at the group.
-    # A group with no read table has no verb to hide either (a non-writing group
-    # reads whatever follows as arguments; an unknown one is refused anyway).
-    if inv.subcommand is not None or verb is None or group not in _GH_READ_SUBCOMMANDS:
+    if inv.subcommand is not None or verb is None or group not in _GH_SUBAGENT_READS:
         lookup_end = inv.path_end
     elif verb in argv[inv.path_end :]:
         lookup_end = argv.index(verb, inv.path_end) + 1
     else:
         lookup_end = len(argv)
-    if group != "api" and not _gh_prepath_is_plain(argv, lookup_end):
+    if not _gh_prepath_is_plain(argv, lookup_end):
         return f"gh {group} (a flag before the verb hides which command runs)"
     if gh_requests_help(argv):
         return None  # help only: gh prints it and runs nothing
     if group == "api":
-        return "gh api (write)" if _gh_api_writes(argv) else None
-    if group in _GH_NON_WRITING_GROUPS:
+        return None if _gh_api_is_read(argv) else "gh api (not a plain read)"
+    if group in _GH_SUBAGENT_LEAF_READS:
         return None
-    reads = _GH_READ_SUBCOMMANDS.get(group)
+    reads = _GH_SUBAGENT_READS.get(group)
     if reads is None:
         return f"gh {group}"
     if verb is None or verb in reads:
+        # `gh repo clone`/`gh pr checkout` pass words after `--` to git, which
+        # can name a program to run (`--upload-pack`, `--config`).
+        if "--" in argv and verb in ("clone", "checkout", "co"):
+            return f"gh {group} {verb} (git options after --)"
         return None
     return f"gh {group} {verb}"
 
 
-#: The refusal for a publish from inside a subagent. Written for the agent, and
+#: The refusal for a non-read from inside a subagent. Written for the agent, and
 #: complete enough that it needs no human: what to do instead, and what to hand
 #: back. The owner sees nothing — a deny is not a prompt. Policy, not a scope
 #: judgement: it covers re-pushes of already-published branches, dry runs, PR
 #: comments and review requests too, which from the main thread may pass without
 #: any prompt.
 _SUBAGENT_PUBLISH_DENY = (
-    "BLOCKED: only the main session publishes. This command writes to GitHub "
-    "({what}) from inside a subagent; by owner policy (2026-10-05) pushes, PRs, "
-    "comments, review requests and every other GitHub write are the main "
-    "session's steps, whatever the branch's state.\n"
+    "BLOCKED: only the main session publishes. A subagent may run only known "
+    "read-only git/gh commands, and this one is not on that list ({what}); by "
+    "owner policy pushes, PRs, comments, review requests and every other GitHub "
+    "write are the main session's steps, whatever the branch's state.\n"
     "Instead: commit your work locally on its branch and STOP. Report back to "
     "the main session: the worktree path, the branch name, the head SHA "
     "(`git rev-parse HEAD`), and the PR title and body you would have used "
     "(write the body to a file and give its path), plus any comment, review "
     "request or reply you would have posted. The main session publishes them. "
-    "Do not retry the write in another spelling."
+    "Do not retry the write in another spelling. If it is in fact a read, "
+    "write it in the plain form (`gh pr view`, `gh api <endpoint>`, `git fetch`)."
 )
-_SUBAGENT_UNREADABLE_GH_DENY = (
-    "BLOCKED: this command runs `gh` across a line continuation, which this guard "
-    "cannot read, from inside a subagent. Put the gh command on one line: a read "
-    "then runs, and a GitHub write is the main session's step (commit locally and "
-    "report back the worktree path, branch and head SHA instead)."
+#: A command whose segments the parse withholds (a line continuation, a length
+#: or nesting bound), or one whose program is named by an expansion
+#: (``G=gh; $G pr comment``), cannot be checked against the allowlist, so a
+#: subagent's such command naming git or gh is refused.
+_GIT_OR_GH_MENTION = re.compile(r"\b(?:git|gh)\b")
+_VAR_REF = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _program_may_be_git_or_gh(seg, cmd: str) -> bool:
+    """Whether a segment's program is an expansion that can be git or gh: a
+    substitution naming either (``$(echo gh) pr comment``), or a variable this
+    command assigns a git/gh path to (``G=gh; $G pr comment``). A variable set
+    outside the command is not visible here. Narrow on purpose (MEASURED over
+    44,279 recorded subagent commands, 2026-10-10): refusing every expanded
+    program in a command that merely mentions git refused 195, nearly all
+    scripts run from a variable path; this test refuses 51, mostly
+    ``G="git -C <dir>"; $G …`` spellings, which do run git."""
+    argv = list(getattr(seg, "argv", None) or [])
+    word = argv[0] if argv else ""
+    if "$(" in word or "`" in word:
+        # The substitution's text spans argv words; read the segment's own text.
+        return bool(_GIT_OR_GH_MENTION.search(getattr(seg, "raw", "") or word))
+    m = _VAR_REF.match(word)
+    if not m:
+        return False
+    assign = rf"(?:^|[\s;&|(]){re.escape(m.group(1))}=[\"']?(?:\S*/)?(?:git|gh)[\"']?(?=[\s;&|)]|$)"
+    return re.search(assign, cmd) is not None
+_SUBAGENT_UNREADABLE_DENY = (
+    "BLOCKED: this command names `git` or `gh` in a form this guard cannot read "
+    "(a line continuation, a command too long or too deeply nested, or a "
+    "program named by a variable or substitution), from "
+    "inside a subagent, so it cannot be checked against the read-only list. Put "
+    "each git/gh command on one line, as its own short command: a read then runs, "
+    "and a GitHub write is the main session's step (commit locally and report "
+    "back the worktree path, branch and head SHA instead)."
 )
 
 
@@ -13049,42 +13194,48 @@ def _run_merge_and_push_gates() -> int:
             )
 
         # ── Only the main session publishes ────────────────────────────────
-        # Every GitHub write from inside an Agent-tool worker is REFUSED, by
-        # owner policy (2026-10-05): a fan-out of agents each publishing its own
-        # branch put a run of approval prompts in front of the owner, and a
-        # subagent's `@codex review` request prompted the same way. Classified
-        # per segment by `_github_write_segment`: git push and its plumbing, every
-        # gh write verb (an allowlist of READS per GitHub-writing group, so an
-        # unknown verb or group counts as a write), and `gh api` with a writing
-        # method or a GraphQL mutation. The deny tells the agent to hand the work
-        # back to the main session. It is a blanket rule, not a prompt
-        # substitute: a re-push the main thread would be allowed silently, a dry
-        # run, an ordinary PR comment and an in-thread finding reply are refused
-        # too. Ahead of the multiple-publish check so a subagent is not first
-        # told to split a command whose halves are each refused, and ahead of the
-        # round-escalation lookup, so a subagent's review request costs no
-        # network call. Reach: every segment the parse resolves, nested ones
-        # included; a line-continued command naming gh is refused below, and
-        # any other unparseable one is the blind-spot net's. NOT reached: a git
-        # ALIAS (git runs the alias body), a gh write run through a launcher the
-        # parse does not open (`eval`, `find -exec`, `watch`, a pipe into
-        # `bash`), a write made by a program that is not git or gh (curl to the
-        # API, another CLI), and anything outside the Bash tool (an MCP GitHub
-        # tool). This instructs a cooperating agent;
-        # it is not a security boundary. A main-thread session carries no
-        # `agent_id` and is unaffected, `--agent` sessions included.
+        # Inside an Agent-tool worker, git and gh run only from an ALLOWLIST of
+        # reads and local git work (owner policy 2026-10-05, made an allowlist
+        # 2026-10-10 after each review round found a write verb the denylist
+        # missed). A fan-out of agents each publishing its own branch put a run
+        # of approval prompts in front of the owner, and a subagent's `@codex
+        # review` request prompted the same way. Classified per segment by
+        # `_subagent_refusal`; anything not listed, including a verb built at run
+        # time, is refused with the hand-back message. It is a blanket rule, not
+        # a prompt substitute: a re-push the main thread would be allowed
+        # silently, a dry run, an ordinary PR comment and an in-thread finding
+        # reply are refused too. Ahead of the multiple-publish check so a
+        # subagent is not first told to split a command whose halves are each
+        # refused, and ahead of the round-escalation lookup, so a subagent's
+        # review request costs no network call. Reach: every segment the parse
+        # resolves, nested ones included; a command whose segments the parse
+        # withholds, or whose program is an expansion, and that names git or gh
+        # is refused below. NOT reached: a write run through a launcher the parse
+        # does not open (`eval`, `find -exec`, `watch`, a pipe into `bash`,
+        # process substitution, `env -S`, a shell function's body), a program
+        # git itself starts from config or the environment (a hook,
+        # `-c core.sshCommand`, `GIT_SSH_COMMAND`, `GIT_SEQUENCE_EDITOR`, a
+        # credential helper), a write made by a program that is not git or gh
+        # (curl to the API, another CLI), and anything outside the Bash tool (an
+        # MCP GitHub tool).
+        # This instructs a cooperating agent; it is not a security boundary. A
+        # main-thread session carries no `agent_id` and is unaffected, `--agent`
+        # sessions included.
         if _is_subagent(payload):
-            writes = [w for w in map(_github_write_segment, segs) if w]
-            if writes:
-                print(_SUBAGENT_PUBLISH_DENY.format(what=", ".join(writes)), file=sys.stderr)
+            refused = [w for w in map(_subagent_refusal, segs) if w]
+            if refused:
+                print(_SUBAGENT_PUBLISH_DENY.format(what=", ".join(refused)), file=sys.stderr)
                 return 2
-            # A line continuation withholds the segments, so the check above saw
-            # nothing, and the blind-spot net covers only push, merge, create and
-            # review requests: `gh pr review 5 \⏎ --approve` ran silently. Read or
-            # write cannot be told apart without segments, so any continued
-            # command naming `gh` is refused with the one-line rewrite.
-            if blind is not None and blind.bounds_induced and mentions(cmd, _GH_MENTION):
-                print(_SUBAGENT_UNREADABLE_GH_DENY, file=sys.stderr)
+            # A line continuation or a length/nesting bound withholds the
+            # segments, so the check above saw nothing; the shell may still run
+            # a write there, including one whose verb it builds at run time
+            # (`git "$(printf …)"`). Without segments nothing can be matched to
+            # the allowlist, so a command naming git or gh is refused.
+            withheld = blind is not None and blind.bounds_induced
+            if (withheld and mentions(cmd, _GIT_OR_GH_MENTION)) or any(
+                _program_may_be_git_or_gh(s, cmd) for s in segs
+            ):
+                print(_SUBAGENT_UNREADABLE_DENY, file=sys.stderr)
                 return 2
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash

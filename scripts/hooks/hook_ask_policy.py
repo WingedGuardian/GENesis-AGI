@@ -84,9 +84,10 @@ deny are all outside the key's reach.
 
 **``push_routine`` is the wider, separate switch** (owner ruling 2026-10-06), for
 an install whose sessions push from linked worktrees (``git -C <path> push``,
-which ``push_publish`` never covers) and chain steps. It silences the push
-guard's ROUTINE prompts: a first push in any spelling, close-then-push, a
-re-push with no open PR off the public repo, and a re-push chained with other
+which ``push_publish`` covers only through the worktree-top ``-C <path>``
+exception above) and chain steps. It silences the push guard's ROUTINE prompts:
+a first push in any spelling, close-then-push, a re-push with no open PR off the
+public repo, and a re-push chained with other
 steps. It applies only when EVERY ask the command raised is one of those and
 every push URL is a github.com https repo of the configured owner
 (``github.user``); a raw URL also needs no ``insteadOf`` rule. A ``gh pr create``
