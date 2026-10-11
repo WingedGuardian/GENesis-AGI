@@ -8,7 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+import pytest
+from dotenv import dotenv_values, load_dotenv
 
 from genesis.env import CREDENTIAL_NAME_RE, credential_env_names, secrets_path
 
@@ -144,3 +145,26 @@ def test_credential_env_names_includes_names_only_in_the_real_secrets_file(tmp_p
     assert {"ONLY_IN_REAL_FILE_API_KEY", "OTHER_TOKEN"} <= names
     assert "PLAIN" not in names
     assert not any("not-a-real-value" in name for name in names)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "SPACED_API_KEY = live",
+        "SPACED_API_KEY\t=live",
+        "  SPACED_API_KEY=live",
+        "export   SPACED_API_KEY = live",
+        "'SPACED_API_KEY'=live",
+    ],
+)
+def test_credential_env_names_reads_every_dotenv_assignment_spelling(tmp_path, line):
+    """python-dotenv loads each of these spellings as SPACED_API_KEY, so the
+    name must be pinned too, or a fixed-path load_dotenv in an imported module
+    could bring the live value into the test process."""
+    real = tmp_path / "secrets.env"
+    real.write_text(line + "\n", encoding="utf-8")
+    assert "SPACED_API_KEY" in dotenv_values(real)  # control: dotenv assigns it
+    empty_example = tmp_path / "empty.env.example"
+    empty_example.write_text("", encoding="utf-8")
+
+    assert "SPACED_API_KEY" in credential_env_names(example=empty_example, secrets_file=real)

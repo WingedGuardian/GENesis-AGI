@@ -197,7 +197,9 @@ def credential_env_names(
         if not path.is_file():
             continue
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            match = re.match(r"^#?\s*(?:export\s+)?([A-Z][A-Z0-9_]*)=", line)
+            # python-dotenv's grammar: leading blanks, ``export``, a key that may
+            # be single-quoted, and blanks before ``=`` all still assign the key.
+            match = re.match(r"^\s*#?\s*(?:export\s+)?'?([A-Z][A-Z0-9_]*)'?\s*=", line)
             if match and pattern.search(match.group(1)):
                 names.add(match.group(1))
     return frozenset(names)

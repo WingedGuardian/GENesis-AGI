@@ -1164,6 +1164,6 @@ jobs:
         # Re-merge with main (#3133): main 25213 + this PR's measured +106 = 25319.
         # External-I/O census and credential isolation (#2878), --collect-only
         # against main's versions: test_check_external_io.py 5 -> 27 (+22),
-        # test_credential_isolation.py new -> 11 (+11). No added skips.
-        # Floor: 25319 + 33 = 25352.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25352
+        # test_credential_isolation.py new -> 16 (+16). No added skips.
+        # Floor: 25319 + 38 = 25357.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25357
