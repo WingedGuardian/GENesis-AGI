@@ -1088,6 +1088,10 @@ class TestForcePushRepoFlag:
             "git push --force --repo backups origin main",
             "git push --mirr origin",
             "git push -o --repo=backups origin +main",
+            # Git keeps the LAST --repo (measured, git 2.43: pushes to origin).
+            "git push --force --rep backups --repo origin --all",
+            # A later --no-repo clears --repo; git falls back to origin.
+            "git push --force --repo backups --no-repo --all",
         ],
     )
     def test_force_destination_uses_git_option_precedence(self, remotes_repo, command):

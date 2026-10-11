@@ -10799,22 +10799,29 @@ def _push_repo_flag(argv: list[str]) -> str | None:
 
     The value may be a remote name OR a URL. A positional repository takes
     precedence over ``--repo``; this value is used only when no remote is named.
+    Git stores every occurrence into one option variable, so the LAST ``--repo``
+    wins and a later ``--no-repo`` clears it.
     """
     stream: list[PushArg] | None = push_arg_stream(argv)
     if stream is None:
         return None
+    repo: str | None = None
     for index, arg in enumerate(stream):
         if arg.kind is not PushArgKind.LONG:
             continue
         option, equals, value = arg.text.partition("=")
+        if option == "--no-repo":
+            repo = None
+            continue
         if option != "--repo":
             continue
         if equals:
-            return value
-        if index + 1 < len(stream) and stream[index + 1].kind is PushArgKind.LONG_VALUE:
-            return stream[index + 1].text
-        return None
-    return None
+            repo = value
+        elif index + 1 < len(stream) and stream[index + 1].kind is PushArgKind.LONG_VALUE:
+            repo = stream[index + 1].text
+        else:
+            repo = None
+    return repo
 
 
 def _push_positionals(argv: list[str]) -> list[str]:

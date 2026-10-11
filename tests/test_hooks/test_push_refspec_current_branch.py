@@ -407,6 +407,10 @@ def test_abbreviated_push_flags_use_the_canonical_safe_flag(
         ("git push -o --repo origin HEAD", None, "-o's value is data, not the flag"),
         ("git push --push-option=--repo origin", None, "same, glued long form"),
         ("git push origin HEAD", None, "no --repo at all"),
+        ("git push --rep backups --repo origin --all", "origin", "git keeps the last --repo"),
+        ("git push --repo origin --rep=backups", "backups", "last wins, abbreviated"),
+        ("git push --repo backups --no-repo --all", None, "a later --no-repo clears it"),
+        ("git push --no-repo --repo dest", "dest", "--repo after --no-repo counts"),
     ],
 )
 def test_a_repo_spelling_inside_an_option_value_is_not_a_repo_flag(
