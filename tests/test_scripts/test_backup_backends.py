@@ -335,3 +335,35 @@ def test_smb_delete_refuses_a_wildcard_mask(tmp_path):
     )
     assert "DEL=refused" in proc.stdout, proc.stdout + proc.stderr
     assert not log.exists() or "deltree" not in log.read_text()
+    assert "refusing smb delete" in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize("pattern", ["x*", "x" + "?" * len('"; deltree Genesis; echo "')])
+def test_smb_mkdir_does_not_glob_its_path(tmp_path, pattern):
+    """mkdir splits the path on '/'; the split must not expand a wildcard against
+    the working directory, or a local file name holding a quote and ';' would
+    reach the -c string after the path was checked."""
+    bind = tmp_path / "bin"
+    bind.mkdir()
+    log = tmp_path / "smb.log"
+    _make_stub(bind / "smbclient", _SMB_STUB)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / 'x"; deltree Genesis; echo "').write_text("")
+    env = {
+        "GENESIS_BACKUP_TIER2_BACKEND": "smb",
+        "GENESIS_BACKUP_NAS": "//nas/share",
+        "GENESIS_BACKUP_NAS_USER": "u",
+        "GENESIS_BACKUP_NAS_PASS": "p",
+        "SMB_LOG": str(log),
+        "PAT": pattern,
+    }
+    proc = _run_bash(
+        f'cd "{cwd}"\nbackend_init\nbackend_mkdir "Genesis/$PAT"\nbackend_cleanup',
+        env,
+        extra_path=bind,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    sent = log.read_text()
+    assert "deltree" not in sent, sent
+    assert f'mkdir "Genesis/{pattern}"' in sent, sent

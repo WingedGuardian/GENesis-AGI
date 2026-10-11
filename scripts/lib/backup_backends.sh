@@ -149,9 +149,11 @@ _smb_paths_ok() {
 _smb_mkdir() {
     # smbclient mkdir is non-recursive — create each ancestor in one -c batch.
     _smb_paths_ok "$1" || return 0
-    local dir="$1" acc="" cmd="" part
-    local IFS='/'
-    for part in $dir; do
+    local acc="" cmd="" part parts=()
+    # read -a splits on '/' without pathname expansion; an unquoted `for … in $1`
+    # would glob a '*' against the working directory, after the path was checked.
+    IFS='/' read -r -a parts <<<"$1"
+    for part in "${parts[@]}"; do
         [ -n "$part" ] || continue
         acc="${acc:+$acc/}$part"
         cmd="${cmd}mkdir \"$acc\"; "
@@ -200,8 +202,18 @@ _smb_exists() {
         | awk -v n="$b" '$1==n && $2 ~ /^[DAHSRN]+$/ {f=1} END{exit !f}'
 }
 
-# deltree also expands a wildcard mask, so a delete refuses '*' and '?' too.
-_smb_delete() { _smb_paths_ok "$1" || return 1; case "$1" in *[\*\?]*) return 1 ;; esac; local _SMB_OP_TIMEOUT="$_BACKEND_DEL_TIMEOUT"; _smb_run -c "deltree \"$1\"" >/dev/null 2>&1; }
+# deltree takes a mask, so a delete also refuses the SMB wildcards * ? < and >.
+_smb_delete() {
+    _smb_paths_ok "$1" || return 1
+    case "$1" in
+        *[\*\?\<\>]*)
+            printf 'backend: refusing smb delete of %q (it holds * ? < or >, which deltree expands as a mask)\n' "$1" >&2
+            return 1
+            ;;
+    esac
+    local _SMB_OP_TIMEOUT="$_BACKEND_DEL_TIMEOUT"
+    _smb_run -c "deltree \"$1\"" >/dev/null 2>&1
+}
 
 # ── local backend (cp/ls/test/rm to a mounted path) ──────────────────
 # Also the real-filesystem regression anchor for tests (no binary stub needed).
