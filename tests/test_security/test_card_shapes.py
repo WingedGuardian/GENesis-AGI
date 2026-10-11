@@ -71,6 +71,13 @@ BRANDS = [
     ("maestro-6390", "6390", 16),
     ("maestro-6759", "6759", 18),
     ("maestro-67", "6700", 19),
+    ("maestro-12", "6759", 12),
+    ("maestro-13", "50", 13),
+    ("maestro-15", "6304", 15),
+    ("diners-3000-16", "3000", 16),
+    ("diners-36-19", "36", 19),
+    ("diners-39", "39", 16),
+    ("diners-38-17", "38", 17),
 ]
 
 
@@ -94,6 +101,18 @@ class TestDetects:
         assert cs.contains_card_number(text), name
         (span,) = cs.find_card_numbers(text)
         assert text[span[0] : span[1]] == number
+
+    @pytest.mark.parametrize("sep", [" ", "-"])
+    def test_grouped_12_digit_maestro_444(self, sep):
+        number = make_card("6759", 12)
+        assert cs.contains_card_number("card " + group(number, (4, 4, 4), sep))
+
+    def test_444_inside_a_list_of_4_digit_numbers_is_not_a_card(self):
+        """The 4-4-4 window inherits the list rule: a 4-digit neighbour that is
+        not an MMYY expiry marks a column of numbers, not a card."""
+        number = make_card("6759", 12)
+        text = "for n in " + group(number, (4, 4, 4), " ") + " 2404; do"
+        assert not cs.contains_card_number(text)
 
     @pytest.mark.parametrize("sep", [" ", "-", "\u00a0", "\u202f"], ids=["space", "hyphen", "nbsp", "narrow-nbsp"])
     def test_grouped_4444(self, sep):

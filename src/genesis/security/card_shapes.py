@@ -16,9 +16,10 @@ What counts as a card number:
 * ASCII digits only. Python's ``\\d`` also matches other scripts' digits.
 * Digit tokens are whole: an alphanumeric boundary on both sides, so digits
   inside a hex hash, a UUID or an identifier never match.
-* Either one unbroken 13-19 digit token, or consecutive tokens joined by one
+* Either one unbroken 12-19 digit token, or consecutive tokens joined by one
   consistent separator (a space, a hyphen, or a no-break space) whose sizes form a standard printed
-  grouping (4-4-4-4-3, 4-4-4-4, 4-6-5, 4-6-4). Every window of such a chain is
+  grouping (4-4-4-4-3, 4-4-4-4, 4-6-5, 4-6-4, and 4-4-4 for a 12-digit
+  Maestro). Every window of such a chain is
   tried, so a card followed by its expiry or security code ("4242 4242 4242
   4242 123") is still found; a longer reading that fails falls back to a
   shorter one.
@@ -47,7 +48,14 @@ from collections.abc import Mapping
 REDACTED = "[card redacted]"
 
 # Standard printed groupings of a card number.
-_GROUPINGS: tuple[tuple[int, ...], ...] = ((4, 4, 4, 4, 3), (4, 4, 4, 4), (4, 6, 5), (4, 6, 4))
+# 4-4-4 is a 12-digit Maestro card; it inherits the 4-digit-neighbour rule below.
+_GROUPINGS: tuple[tuple[int, ...], ...] = (
+    (4, 4, 4, 4, 3),
+    (4, 4, 4, 4),
+    (4, 6, 5),
+    (4, 6, 4),
+    (4, 4, 4),
+)
 # A card plus its expiry and security code is at most 8 tokens ("4-4-4-4 MM YY
 # CVV" is 7); a longer chain is a column of numbers, not a card.
 _MAX_CHAIN_GROUPS = 8
@@ -84,7 +92,9 @@ def _brand(digits: str) -> str | None:
         return "mastercard"
     if p2 in (34, 37) and length == 15:
         return "amex"
-    if (300 <= p3 <= 305 or p2 in (36, 38)) and length == 14:
+    # Diners/Discover Global Network IIN summary: 3000-3059 and 3800-3999 at
+    # 16-19 digits, 3600-3699 at 14-19; the classic 14-digit form is kept.
+    if (300 <= p3 <= 305 or p2 in (36, 38, 39)) and 14 <= length <= 19:
         return "diners"
     if (p4 == 6011 or 644 <= p3 <= 649 or p2 == 65) and 16 <= length <= 19:
         return "discover"
@@ -93,15 +103,16 @@ def _brand(digits: str) -> str | None:
     if p2 == 62 and 16 <= length <= 19:
         return "unionpay"
     # Maestro also holds 6304 and 6759/6761-6763 (published IIN tables) and the
-    # BIN blocks 63900000-63909999 and 67000000-67999999 (Mastercard rules).
-    if (p2 in (50, 67) or 56 <= p2 <= 58 or p4 in (6304, 6390)) and 16 <= length <= 19:
+    # BIN blocks 63900000-63909999 and 67000000-67999999 (Mastercard rules), at
+    # 12-19 digits (Mastercard's security rules).
+    if (p2 in (50, 67) or 56 <= p2 <= 58 or p4 in (6304, 6390)) and 12 <= length <= 19:
         return "maestro"
     return None
 
 
 def card_brand(digits: str) -> str | None:
     """The brand of a card number (digits only), or None if it is not one."""
-    if not luhn_ok(digits) or len(digits) < 13:
+    if not luhn_ok(digits) or len(digits) < 12:
         return None
     return _brand(digits)
 
@@ -159,7 +170,7 @@ def find_card_numbers(text: str) -> list[tuple[int, int]]:
     candidates: list[tuple[int, int]] = []
     tokens = _tokens(text)
     for start, end in tokens:
-        if 13 <= end - start <= 19 and card_brand(text[start:end]):
+        if 12 <= end - start <= 19 and card_brand(text[start:end]):
             candidates.append((start, end))
     for chain in _chains(text, tokens):
         if len(chain) < 3 or len(chain) > _MAX_CHAIN_GROUPS:

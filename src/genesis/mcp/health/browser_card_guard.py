@@ -90,11 +90,22 @@ _STEP_TIMEOUT_S: float = 5.0
 _MAX_FRAME_DEPTH = 8
 
 # The attributes is_card_field reads, from one element.
+# Classifies the element Playwright will actually fill: fill() on an element
+# inside a <label> fills that label's control, so a wrapper or span there is
+# replaced by label.control. Every associated label counts, not just the first
+# (HTML allows several, and a later one may say "security code").
 _FIELD_ATTRS_JS = """(el) => {
   if (!el || !el.getAttribute) return {};
+  const own = (el.tagName || '').toLowerCase();
+  if (!['input', 'textarea', 'select'].includes(own) && !el.isContentEditable) {
+    const wrap = el.closest ? el.closest('label') : null;
+    if (wrap && wrap.control) el = wrap.control;
+  }
   let label = null;
   try {
-    if (el.labels && el.labels.length) label = el.labels[0].innerText;
+    if (el.labels && el.labels.length) {
+      label = Array.from(el.labels).map((l) => l.innerText || '').join(' ');
+    }
   } catch (e) {}
   return {
     tag: (el.tagName || '').toLowerCase(),
