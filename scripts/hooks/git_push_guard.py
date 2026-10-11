@@ -10752,6 +10752,34 @@ _PUSH_SAFE_GLOBAL_VALUE_FLAGS = frozenset({"-C"})
 _PUSH_SAFE_GLOBAL_FLAGS = frozenset({"-P", "--no-pager"})
 
 
+#: Short letters that set the same git variable as a long boolean.
+_PUSH_SHORT_BOOLEANS = {"f": "force", "n": "dry-run"}
+
+
+def _push_boolean_options(stream: list[PushArg] | None) -> dict[str, bool]:
+    """The effective value of each boolean option on a push, in argument order.
+
+    Git stores every occurrence of a boolean into one variable, so the LAST
+    spelling wins and ``--no-<name>`` clears it (MEASURED, git 2.43:
+    ``--force --no-force``, ``-f --no-force``, ``--mirr --no-mirror`` and
+    ``--force-w --no-force-with-lease`` are rejected as non-fast-forward;
+    ``--dry --no-dry-run`` and ``-n --no-dry-run`` really push). Names are the
+    stream's canonical long names without dashes; ``-f``/``-n`` map onto
+    ``force``/``dry-run``.
+    """
+    state: dict[str, bool] = {}
+    for arg in stream or ():
+        if arg.kind is PushArgKind.LONG:
+            name = arg.text.split("=", 1)[0][2:]
+            if name.startswith("no-"):
+                state[name[3:]] = False
+            else:
+                state[name] = True
+        elif arg.kind is PushArgKind.SHORT and arg.text in _PUSH_SHORT_BOOLEANS:
+            state[_PUSH_SHORT_BOOLEANS[arg.text]] = True
+    return state
+
+
 def _push_is_force(argv: list[str]) -> bool:
     """Whether a parsed ``git push`` argv performs a force push.
 
@@ -10764,22 +10792,17 @@ def _push_is_force(argv: list[str]) -> bool:
     option values, including ``-o`` ending a bundle and ``-c`` before ``push``.
     """
     stream: list[PushArg] | None = push_arg_stream(argv)
-    for arg in stream or ():
-        if arg.kind is PushArgKind.LONG and arg.text.split("=", 1)[0] in {
-            "--force",
-            "--force-with-lease",
-            "--force-if-includes",
-            "--mirror",
-        }:
-            # --mirror force-updates EVERY ref and deletes remote refs that are
-            # absent locally — an unconditional destructive push, never a plain
-            # one, so it must hard-block rather than reach an approvable prompt.
-            return True
-        if arg.kind is PushArgKind.SHORT and arg.text == "f":
-            return True
-        if arg.kind is PushArgKind.PLUS:
-            return True  # +<refspec> is git shorthand for --force on that ref
-    return False
+    if any(arg.kind is PushArgKind.PLUS for arg in stream or ()):
+        return True  # +<refspec> is git shorthand for --force on that ref; no flag undoes it
+    state = _push_boolean_options(stream)
+    # --mirror force-updates EVERY ref and deletes remote refs that are absent
+    # locally — an unconditional destructive push, never a plain one, so it
+    # must hard-block rather than reach an approvable prompt. Each flag counts
+    # by its EFFECTIVE value: a later --no-<flag> turns it off, as in git.
+    return any(
+        state.get(name, False)
+        for name in ("force", "force-with-lease", "force-if-includes", "mirror")
+    )
 
 
 def _push_named_remote(argv: list[str]) -> str | None:
@@ -11101,12 +11124,8 @@ def _push_is_dry_run(seg) -> bool:
     flag, and a ``-n`` after ``--`` is a positional, not the flag.
     """
     argv = getattr(seg, "argv", None) or []
-    for arg in push_arg_stream(argv) or ():
-        if arg.kind is PushArgKind.LONG and arg.text.split("=", 1)[0] == "--dry-run":
-            return True
-        if arg.kind is PushArgKind.SHORT and arg.text == "n":
-            return True
-    return False
+    # Effective value: `--dry --no-dry-run` really pushes (MEASURED, git 2.43).
+    return _push_boolean_options(push_arg_stream(argv)).get("dry-run", False)
 
 
 def _push_ref_positionals(argv: list[str]) -> list[str] | None:

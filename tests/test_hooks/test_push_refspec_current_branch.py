@@ -293,6 +293,11 @@ def test_the_allowlisted_global_options_still_pass(command: str, monkeypatch) ->
         ("git push -on origin HEAD", False),
         ("git push -o ci.skip -n origin HEAD", True),
         ("git -C /x push origin HEAD", False),
+        # the LAST spelling wins (MEASURED, git 2.43: these really push)
+        ("git push --dry --no-dry-run origin HEAD", False),
+        ("git push -n --no-dry-run origin HEAD", False),
+        ("git push --no-dry-run --dry origin HEAD", True),
+        ("git push --no-dry-run -n origin HEAD", True),
     ],
 )
 def test_dry_run_detection_skips_option_values(command: str, dry: bool) -> None:
@@ -363,6 +368,14 @@ def test_an_option_value_is_never_a_remote_or_refspec(
         ("git push --mir origin", True, "unique abbreviation of mirror"),
         ("git push --force-w origin main", True, "unique abbreviation of force-with-lease"),
         ("git push --forc origin main", False, "ambiguous force prefix is not a force flag"),
+        # the LAST spelling wins (MEASURED, git 2.43: each rejected as non-fast-forward)
+        ("git push --force --no-force origin x", False, "a later --no-force clears it"),
+        ("git push -f --no-force origin x", False, "-f and --force share one variable"),
+        ("git push --force-w --no-force-with-lease origin x", False, "lease cleared"),
+        ("git push --mirr --no-mirror origin", False, "mirror cleared"),
+        ("git push --no-force --force origin x", True, "re-enabled after the negation"),
+        ("git push --force-with-lease --no-force-with-lease --force origin x", True, "force"),
+        ("git push --no-force origin +x", True, "+refspec is not undone by a flag"),
     ],
 )
 def test_an_option_value_is_never_a_force(command: str, force: bool, why: str) -> None:
