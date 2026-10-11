@@ -1165,4 +1165,7 @@ jobs:
         # Staged excused-path guard (#2889): test_update_checkout_moved.py
         # collects 97 here and 81 on origin/main (--collect-only): +16; its other
         # two test edits are count-neutral. Floor: 25319 + 16 = 25335.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25335
+        # smb backend refuses unsafe names: +12 collected (test_backup_backends +11:
+        # two 5-case parametrised tests and one more; test_backup_dated_snapshots +1); no skips.
+        # Floor: 25335 + 12 = 25347.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25347

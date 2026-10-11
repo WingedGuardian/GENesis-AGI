@@ -127,8 +127,28 @@ backend_available() {
 # (bash `local` in the caller is visible here); everything else gets ctl.
 _smb_run() { timeout "${_SMB_OP_TIMEOUT:-$_BACKEND_CTL_TIMEOUT}" smbclient "$_BACKEND_NAS" -A "$_BACKEND_CREDS" "$@"; }
 
+# Every smb operation is one `smbclient -c` string with the paths quoted inside
+# it, and names reach it from the backups clone (anything pushed there). A path
+# holding a quote, a command separator, a backslash or a newline could end the
+# quoted name and add commands, so it is refused: never escaped, never passed.
+# A refused put or get fails like a failed transfer (the caller marks the
+# snapshot partial or warns); a refused mkdir only says so, since its put fails.
+_smb_paths_ok() {
+    local p
+    for p in "$@"; do
+        case "$p" in
+            *[\"\;\\]* | *$'\n'* | *$'\r'*)
+                printf 'backend: refusing smb path %q (it holds a quote, ";", a backslash or a newline); rename or remove that file in the backups clone\n' "$p" >&2
+                return 1
+                ;;
+        esac
+    done
+    return 0
+}
+
 _smb_mkdir() {
     # smbclient mkdir is non-recursive — create each ancestor in one -c batch.
+    _smb_paths_ok "$1" || return 0
     local dir="$1" acc="" cmd="" part
     local IFS='/'
     for part in $dir; do
@@ -142,11 +162,13 @@ _smb_mkdir() {
 }
 
 _smb_put() {
+    _smb_paths_ok "$1" "$2" || return 1
     local src="$1" dst="$2" _SMB_OP_TIMEOUT="$_BACKEND_XFER_TIMEOUT"
     _smb_run -c "cd \"$(dirname "$dst")\"; put \"$src\" \"$(basename "$dst")\"" >/dev/null 2>&1
 }
 
 _smb_get() {
+    _smb_paths_ok "$1" "$2" || return 1
     local rem="$1" dst="$2" _SMB_OP_TIMEOUT="$_BACKEND_XFER_TIMEOUT"
     _smb_run -c "cd \"$(dirname "$rem")\"; get \"$(basename "$rem")\" \"$dst\"" >/dev/null 2>&1
 }
@@ -155,6 +177,7 @@ _smb_list() {
     # Emit child names, one per line. Real entries carry an attribute column
     # (D/A/H/S/R/N); the trailing "NNN blocks of size ..." summary and ./.. are
     # excluded. (Names with spaces are not produced by our snapshot layout.)
+    _smb_paths_ok "$1" || return 0
     _smb_run -c "cd \"$1\"; ls" 2>/dev/null \
         | awk '$1!="." && $1!=".." && $2 ~ /^[DAHSRN]+$/ {print $1}' || true
 }
@@ -164,18 +187,21 @@ _smb_list_dirs() {
     # D (e.g. "D", "DH"), a file's never does. Used for host/stamp discovery so a
     # stray file under Genesis/ can't be mistaken for a host dir (would corrupt the
     # sole-host auto-detect on a fresh DR box).
+    _smb_paths_ok "$1" || return 0
     _smb_run -c "cd \"$1\"; ls" 2>/dev/null \
         | awk '$1!="." && $1!=".." && $2 ~ /D/ {print $1}' || true
 }
 
 _smb_exists() {
+    _smb_paths_ok "$1" || return 1
     local p="$1" b
     b="$(basename "$p")"
     _smb_run -c "cd \"$(dirname "$p")\"; ls \"$b\"" 2>/dev/null \
         | awk -v n="$b" '$1==n && $2 ~ /^[DAHSRN]+$/ {f=1} END{exit !f}'
 }
 
-_smb_delete() { local _SMB_OP_TIMEOUT="$_BACKEND_DEL_TIMEOUT"; _smb_run -c "deltree \"$1\"" >/dev/null 2>&1; }
+# deltree also expands a wildcard mask, so a delete refuses '*' and '?' too.
+_smb_delete() { _smb_paths_ok "$1" || return 1; case "$1" in *[\*\?]*) return 1 ;; esac; local _SMB_OP_TIMEOUT="$_BACKEND_DEL_TIMEOUT"; _smb_run -c "deltree \"$1\"" >/dev/null 2>&1; }
 
 # ── local backend (cp/ls/test/rm to a mounted path) ──────────────────
 # Also the real-filesystem regression anchor for tests (no binary stub needed).
