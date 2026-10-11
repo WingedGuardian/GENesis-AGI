@@ -60,8 +60,9 @@ def test_a_broken_patchright_raises(cli, monkeypatch):
 
 
 def test_open_copies_the_profile_for_the_package_that_launches(cli, monkeypatch):
-    from genesis.browser import profile_backup
+    from genesis.browser import chromium, profile_backup
 
+    monkeypatch.setattr(chromium, "not_ready", lambda package, **kw: None)
     monkeypatch.setattr(cli, "_installed", lambda dist: dist == "patchright")
     manager = _package(monkeypatch, "patchright")
     backup = MagicMock()
@@ -75,3 +76,28 @@ def test_open_without_genesis_makes_no_copy(cli, monkeypatch):
     manager = _package(monkeypatch, "playwright")
     monkeypatch.setitem(sys.modules, "genesis.browser.profile_backup", None)
     assert cli._open() is manager
+
+
+def test_open_refuses_a_missing_chromium_before_anything_starts(cli, monkeypatch, capsys):
+    """Playwright's own error would tell the reader to run `patchright install`;
+    the CLI names the operator step instead, as the MCP fallback does."""
+    from genesis.browser import chromium, profile_backup
+
+    monkeypatch.setattr(cli, "_installed", lambda dist: dist == "patchright")
+    manager = _package(monkeypatch, "patchright")
+    asked = []
+
+    def not_ready(package, **kw):
+        asked.append(kw)
+        return f"{package} missing; STEP"
+
+    monkeypatch.setattr(chromium, "not_ready", not_ready)
+    backup = MagicMock()
+    monkeypatch.setattr(profile_backup, "backup_chromium_profile", backup)
+    with pytest.raises(SystemExit) as exit_:
+        cli._open()
+    assert exit_.value.code == 1
+    assert "patchright missing; STEP" in capsys.readouterr().err
+    backup.assert_not_called()
+    manager.start.assert_not_called()
+    assert asked == [{"headless": True}]  # the CLI launches headless: the headless shell

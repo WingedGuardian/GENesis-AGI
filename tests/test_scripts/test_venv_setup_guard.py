@@ -119,3 +119,75 @@ def test_the_documented_return_contract_matches_the_code() -> None:
 
     assert "1 — blocked" in header
     assert "could not tell" in header, "the undeterminable case must be documented"
+
+
+def _fake_venv(tmp_path: Path) -> tuple[Path, Path]:
+    """A venv whose pip records its arguments and whose python imports anything."""
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    log = tmp_path / "pip.args"
+    (venv / "bin" / "pip").write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{log}"\n')
+    (venv / "bin" / "python").write_text("#!/bin/sh\nexit 0\n")
+    for name in ("pip", "python"):
+        (venv / "bin" / name).chmod(0o755)
+    return venv, log
+
+
+@pytest.mark.parametrize(("extras", "target_suffix"), [("", ""), ("browser", "[browser]")])
+def test_extras_name_the_install_target(tmp_path: Path, extras: str, target_suffix: str) -> None:
+    """bootstrap.sh and install.sh install the core packages first, then the
+    `browser` extra as a second, non-fatal call through the same guard."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    venv, log = _fake_venv(tmp_path)
+    arg = f' "{extras}"' if extras else ""
+    script = f'source "{_LIB}"; editable_install_guarded "{repo}" "{venv}"{arg}'
+    res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    assert res.returncode == RC_OK, res.stdout + res.stderr
+    assert log.read_text().splitlines()[:3] == ["install", "-e", f"{repo}{target_suffix}"]
+def _recording_venv(tmp_path: Path, *, check_rc: int = 0) -> tuple[Path, Path]:
+    """A venv whose pip and python append their arguments to one log; python
+    exits ``check_rc`` for `check-packages` and 0 otherwise."""
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    log = tmp_path / "calls"
+    (venv / "bin" / "pip").write_text(f'#!/bin/sh\necho "pip $*" >> "{log}"\n')
+    (venv / "bin" / "python").write_text(
+        "#!/bin/sh\n"
+        f'echo "python $*" >> "{log}"\n'
+        f'case "$*" in *check-packages*) echo "browser-stack: patchright is not installed"; '
+        f"exit {check_rc};; esac\nexit 0\n"
+    )
+    for name in ("pip", "python"):
+        (venv / "bin" / name).chmod(0o755)
+    return venv, log
+
+
+def _install_browser_extra(tmp_path: Path, venv: Path) -> subprocess.CompletedProcess:
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    _git("init", "-q", cwd=repo)
+    script = f'set -euo pipefail; source "{_LIB}"; install_browser_extra "{repo}" "{venv}"'
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+
+
+def test_browser_extra_marks_the_cache_then_installs_then_checks(tmp_path: Path) -> None:
+    """mark-legacy before pip: once camoufox 0.5 is installed, its fetch deletes a
+    cache holding a pre-0.5 engine that has no .0.5_FLAG (__main__.py:259-263)."""
+    venv, log = _recording_venv(tmp_path)
+    res = _install_browser_extra(tmp_path, venv)
+    assert res.returncode == 0, res.stdout + res.stderr
+    calls = log.read_text().splitlines()
+    assert calls[0] == "python -m genesis.browser.provision mark-legacy"
+    assert calls[1].startswith(f"pip install -e {tmp_path / 'repo'}[browser]")
+    assert calls[-1] == "python -m genesis.browser.provision check-packages"
+
+
+def test_browser_extra_reports_what_pip_left_out(tmp_path: Path) -> None:
+    """pip's status is masked and the core import check passes regardless, so the
+    package check is what makes a failed browser install visible."""
+    venv, _ = _recording_venv(tmp_path, check_rc=1)
+    res = _install_browser_extra(tmp_path, venv)
+    assert res.returncode == 1
+    assert "patchright is not installed" in res.stdout

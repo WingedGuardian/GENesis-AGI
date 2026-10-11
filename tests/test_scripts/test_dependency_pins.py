@@ -708,3 +708,38 @@ def test_an_explicit_override_ends_the_search(tmp_path):
         {"GITNEXUS_BIN": str(chosen)},
     )
     assert out.stdout.strip() == str(chosen), out.stdout + out.stderr
+
+
+def _browser_requirements() -> dict[str, Requirement]:
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    reqs = [Requirement(dep) for dep in data["project"]["optional-dependencies"]["browser"]]
+    return {r.name: r for r in reqs}
+
+
+def _admitted_minors(req: Requirement) -> set[tuple[int, int]]:
+    return {
+        (major, minor)
+        for major in range(0, 3)
+        for minor in range(0, 100)
+        for patch in range(0, 30)
+        if Version(f"{major}.{minor}.{patch}") in req.specifier
+    }
+
+
+def test_playwright_and_patchright_pins_admit_one_shared_minor():
+    """patchright ships the Chromium build of the playwright release it tracks, so
+    one minor for both means one Chromium download and one build ever opening the
+    profile (patchright 1.62 = Chromium 151 build 1234; 1.63 ships 153/1243)."""
+    reqs = _browser_requirements()
+    playwright = _admitted_minors(reqs["playwright"])
+    patchright = _admitted_minors(reqs["patchright"])
+    assert len(playwright) == 1, f"playwright admits several minors: {sorted(playwright)}"
+    assert playwright == patchright
+
+
+def test_camoufox_pin_stays_on_its_browser_pin_line():
+    """0.5.7 brought the browser pin the provisioner fetches by; <0.6 because the
+    0.4 -> 0.5 step changed the engine layout with no migration guide."""
+    spec = _browser_requirements()["camoufox"].specifier
+    assert Version("0.5.7") in spec and Version("0.5.6") not in spec
+    assert Version("0.6.0") not in spec

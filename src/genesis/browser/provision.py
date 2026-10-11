@@ -1,23 +1,23 @@
 """Install what the browser tools launch: the Camoufox engine the installed camoufox
 package pairs with, patchright's Chromium, and the system libraries both need.
 
-Run unattended by ``genesis-browser-stack.service`` through
-``scripts/install_browser_stack.sh``, never from a session: every session's MCP
-server shares the engine cache and the venv. Upstream's installers do the work
+Run through ``scripts/install_browser_stack.sh``: by ``genesis-browser-stack.service``
+(which bootstrap.sh starts and a daily timer retries), inline by install.sh, or by
+an operator; never from a session: every session's MCP server shares the engine
+cache and the venv. Upstream's installers do the work
 (``camoufox fetch``, ``patchright install chromium``, ``playwright install-deps``);
 this module decides when each runs and checks the result, so a re-run is a no-op
 and an interrupted run is finished by the next one.
 
 The outcome is one line, ``browser-stack: engine=… chromium=… libs=…``, and the
-exit code is 0 only when the stack is ready or deliberately skipped.
+exit code is 0 only when the stack is ready, or deliberately skipped (low disk with
+nothing left to install, another run, camoufox older than its pin).
 """
 
 from __future__ import annotations
 
 import argparse
 import fcntl
-import importlib.util
-import json
 import math
 import os
 import shutil
@@ -26,9 +26,10 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from importlib import metadata
 from pathlib import Path
 
-from genesis.browser import engine, packages
+from genesis.browser import chromium, engine, packages
 from genesis.browser.types import BROWSER_PGREP_PATTERNS
 from genesis.util.tmp import big_tmp_dir
 
@@ -164,27 +165,6 @@ def _live_chromium() -> bool:
     return pids is None or bool(pids)
 
 
-def _package_dir(name: str) -> Path | None:
-    try:
-        spec = importlib.util.find_spec(name)
-    except Exception:  # noqa: BLE001 - a broken package reads as absent
-        return None
-    return Path(spec.origin).parent if spec is not None and spec.origin else None
-
-
-def playwright_browsers_dir(package_dir: Path) -> Path:
-    """Where a Playwright-family package installs browsers (its
-    ``registry/index.js``): PLAYWRIGHT_BROWSERS_PATH, "0" meaning beside the
-    package, else ``$XDG_CACHE_HOME`` or ``~/.cache``, plus ``ms-playwright``."""
-    env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
-    if env == "0":
-        return Path(package_dir) / "driver" / "package" / ".local-browsers"
-    if env:
-        return Path(env).absolute()
-    cache = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    return Path(cache) / "ms-playwright"
-
-
 # ── steps ─────────────────────────────────────────────────────────────────────
 
 
@@ -280,6 +260,14 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
                 chmodded = True
             elif fetched:
                 break  # a fresh fetch is still invalid: deleting it again would not help
+            elif _installed_recently(directory):
+                # An earlier run fetched it and it is still invalid: fetching it
+                # again daily (the timer) would repeat a 1.3 GB download forever.
+                notes.append(
+                    f"{directory} was installed in the last {_RECENT_DAYS} days and is still "
+                    "invalid, so it is not downloaded again; remove it by hand to retry"
+                )
+                break
             else:
                 _remove_version(directory)
                 _fetch(run)
@@ -299,6 +287,19 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
     if status.kind == engine.NOT_INSTALLED:
         return "missing", False, status
     return ("invalid (after fetch)" if fetched else "invalid"), False, status
+
+
+_RECENT_DAYS = 7
+
+
+def _installed_recently(directory: Path) -> bool:
+    """Whether camoufox wrote the directory's version.json (its installer's record
+    of a completed extract) within the last week; unreadable reads as no."""
+    try:
+        age = time.time() - (directory / "version.json").stat().st_mtime
+    except OSError:
+        return False
+    return age < _RECENT_DAYS * 86400
 
 
 def _chmod_tree(directory: Path) -> None:
@@ -333,28 +334,12 @@ def _extras_step(run: Runner, notes: list[str]) -> None:
         )
 
 
-def _chromium_dirs(package_dir: Path) -> tuple[str | None, list[Path]]:
-    """patchright's Chromium revision and the install directories it must leave."""
-    try:
-        data = json.loads((package_dir / "driver" / "package" / "browsers.json").read_text())
-    except (OSError, ValueError):
-        return None, []
-    root = playwright_browsers_dir(package_dir)
-    revision, dirs = None, []
-    for entry in data.get("browsers", []):
-        name = entry.get("name")
-        if name in ("chromium", "chromium-headless-shell"):
-            rev = str(entry.get("revision", ""))
-            revision = rev if name == "chromium" else revision
-            dirs.append(root / f"{name.replace('-', '_')}-{rev}")
-    return revision, dirs
-
-
 def _chromium_step(run: Runner, notes: list[str]) -> tuple[str, bool, list[Path]]:
     if packages.installed_versions().get("patchright") is None:
         return "skipped (no patchright)", True, []
-    package_dir = _package_dir("patchright")
-    revision, dirs = _chromium_dirs(package_dir) if package_dir else (None, [])
+    package_dir = chromium.package_dir("patchright")
+    revision, builds = chromium.install_dirs(package_dir) if package_dir else (None, {})
+    dirs = list(builds.values())
     if revision is None:
         notes.append("patchright's browsers.json could not be read")
         return "unknown", False, []
@@ -428,6 +413,16 @@ def _libs_step(run: Runner, binaries: list[Path], notes: list[str]) -> tuple[str
     return "missing:" + ",".join(missing), False
 
 
+def _already_ready() -> bool:
+    """Whether the engine resolves and patchright's Chromium (when patchright is
+    installed) is complete, so a run would download nothing."""
+    if not engine.resolve_camoufox_engine().ready:
+        return False
+    if packages.installed_versions().get("patchright") is None:
+        return True
+    return all(chromium.not_ready("patchright", headless=h) is None for h in (False, True))
+
+
 def provision(run: Runner | None = None) -> Outcome:
     """Bring the browser stack to ready; idempotent. ``run`` defaults to
     ``subprocess.run``, looked up at call time."""
@@ -436,11 +431,14 @@ def provision(run: Runner | None = None) -> Outcome:
     root = engine.camoufox_install_dir()
     need, free = min_free_bytes(), free_bytes(root)
     if free < need:
+        # Success only when nothing needed downloading: after the browser packages
+        # moved to a new pin, a skip leaves the browser unusable, and a unit that
+        # reads as succeeded would hide that every day the timer repeats it.
         return Outcome(
             f"skipped (low disk: {free / 1024**3:.1f} GB free, {need / 1024**3:.1f} GB needed)",
             "skipped",
             "unchecked",
-            True,
+            _already_ready(),
         )
     root.mkdir(parents=True, exist_ok=True)
     _clear_stale_temp()
@@ -500,13 +498,61 @@ def _hold_lock() -> bool:
     return True  # held until the process exits
 
 
+def _browser_requirements() -> list:
+    """The ``browser`` extra's requirements as the installed Genesis records them
+    (its Requires-Dist), so pyproject.toml stays their one source. A requirement
+    belongs to the extra when its marker holds with ``extra == "browser"`` and not
+    without it (a core one carrying, say, a python_version marker is not)."""
+    from packaging.requirements import Requirement
+
+    dist = next(iter(metadata.packages_distributions().get("genesis", [])), None)
+    found = []
+    for line in (metadata.requires(dist) if dist else None) or []:
+        req = Requirement(line)
+        if (
+            req.marker
+            and req.marker.evaluate({"extra": "browser"})
+            and not req.marker.evaluate({"extra": ""})
+        ):
+            found.append(req)
+    return found
+
+
+def unmet_packages() -> list[str]:
+    """What the installed browser packages lack against the ``browser`` extra:
+    each package installed, at a version its requirement admits, and camoufox
+    carrying its browser pin. Read by bootstrap and install.sh after pip, whose
+    exit status they cannot see."""
+    versions = packages.installed_versions()
+    unmet = [f"{dist} is not installed" for dist in packages.BROWSER_DISTS if not versions[dist]]
+    try:
+        requirements = _browser_requirements()
+    except Exception as exc:  # noqa: BLE001 - no packaging, or unreadable metadata
+        unmet.append(f"the browser extra's version ranges could not be read ({exc!r})")
+        requirements = []
+    for req in requirements:
+        installed = versions.get(req.name.lower())
+        if installed and not req.specifier.contains(installed, prereleases=True):
+            unmet.append(f"{req.name} {installed} is outside {req.specifier}")
+    if versions["camoufox"] and not _pin_capable():
+        unmet.append(f"camoufox {versions['camoufox']} predates the browser pin (0.5.7)")
+    return unmet
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m genesis.browser.provision")
-    parser.add_argument("command", choices=("run", "mark-legacy"), nargs="?", default="run")
+    parser.add_argument(
+        "command", choices=("run", "mark-legacy", "check-packages"), nargs="?", default="run"
+    )
     args = parser.parse_args(argv)
     if args.command == "mark-legacy":
         mark_legacy(engine.camoufox_install_dir())
         return 0
+    if args.command == "check-packages":
+        unmet = unmet_packages()
+        for problem in unmet:
+            print(f"browser-stack: {problem}")
+        return 1 if unmet else 0
     if os.environ.get("CLAUDECODE"):
         print(
             "browser-stack: refusing to run inside a Claude Code session; every session's "

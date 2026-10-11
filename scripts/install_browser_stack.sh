@@ -3,10 +3,11 @@
 #
 # Runs genesis.browser.provision: the Camoufox engine the installed camoufox
 # package pairs with, patchright's Chromium, and the system libraries both need.
-# Started by genesis-browser-stack.service (unattended: it never escalates, so a
-# missing system library is reported with the command to run) and by an
-# operator. Never from a Claude Code session: every session's MCP server shares
-# the engine cache and the venv.
+# Run by genesis-browser-stack.service (unattended: it never escalates, so a
+# missing system library is reported with the command to run), which bootstrap.sh
+# starts and its timer retries daily; inline by install.sh, where sudo is at hand;
+# and by an operator. Never from a Claude Code session: every session's MCP
+# server shares the engine cache and the venv.
 #
 # Exit codes: the module's own (0 ready or deliberately skipped, 1 not ready),
 # 0 when another run holds the lock (that run does the work), 75 when this run
@@ -28,7 +29,7 @@ if [ -z "${HOME:-}" ]; then
 fi
 GENESIS_HOME="${GENESIS_HOME:-$HOME/.genesis}"
 REPO_DIR="${GENESIS_REPO_DIR:-$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-VENV_PY="$REPO_DIR/.venv/bin/python"
+VENV_PY="${VENV_PATH:-$REPO_DIR/.venv}/bin/python"  # VENV_PATH as in genesis.env.venv_path()
 LOCK_DIR="$GENESIS_HOME/locks"
 
 _log() { printf 'browser-stack: %s\n' "$1"; }

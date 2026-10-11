@@ -34,7 +34,7 @@ from pathlib import Path
 
 from fastmcp import Context
 
-from genesis.browser import engine, packages, profile_backup
+from genesis.browser import chromium, engine, packages, profile_backup
 from genesis.browser.types import BrowserLayer
 from genesis.mcp.health import mcp
 
@@ -547,6 +547,11 @@ async def _ensure_chromium_fallback():
         package = _chromium_package()
         packages.check_loaded_browser_modules((package,))
         async_playwright = _chromium_async_playwright(package)
+        # Before anything starts: Playwright's own error for a missing browser tells
+        # the reader to run `<package> install`, a download no session may start.
+        missing = chromium.not_ready(package)
+        if missing:
+            raise chromium.ChromiumNotReady(missing)
 
         await asyncio.to_thread(
             profile_backup.backup_chromium_profile, _CHROMIUM_PROFILE_DIR, package
@@ -3183,6 +3188,8 @@ async def _impl_browser_navigate(
         changed = packages.packages_changed_message()
         lead = f"{changed} " if changed else ""
         return {"error": f"{lead}Camoufox is not ready: {e}"}
+    except chromium.ChromiumNotReady as e:
+        return {"error": f"Chromium is not ready: {e}"}
     except packages.BrowserPackagesChanged as e:
         return {"error": str(e)}
     except ImportError as e:
