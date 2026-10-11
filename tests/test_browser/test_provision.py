@@ -784,3 +784,21 @@ def test_main_exits_nonzero_when_not_ok(env, monkeypatch):
     _resolves(monkeypatch, MISSING, MISSING)
     monkeypatch.setattr(provision.subprocess, "run", Runner())
     assert provision.main(["run"]) == 1
+
+
+def test_check_packages_without_packaging_checks_presence_and_notes_it(env, monkeypatch, capsys):
+    """Not being able to read the version ranges is not a range violation: a venv
+    without `packaging` must not report a correctly installed extra as incomplete."""
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+
+    def no_packaging():
+        raise ModuleNotFoundError("No module named 'packaging'")
+
+    monkeypatch.setattr(provision, "_browser_requirements", no_packaging)
+    assert provision.main(["check-packages"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "" and "version ranges" in captured.err

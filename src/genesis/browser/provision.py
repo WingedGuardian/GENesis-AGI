@@ -527,7 +527,12 @@ def unmet_packages() -> list[str]:
     unmet = [f"{dist} is not installed" for dist in packages.BROWSER_DISTS if not versions[dist]]
     try:
         requirements = _browser_requirements()
-    except Exception as exc:  # noqa: BLE001 - no packaging, or unreadable metadata
+    except ImportError as exc:
+        # Unable to check the ranges is not a range violation; presence and the pin
+        # are still checked. (`packaging` comes with the Genesis venv's own deps.)
+        print(f"browser-stack: version ranges not checked ({exc})", file=sys.stderr)
+        requirements = []
+    except Exception as exc:  # noqa: BLE001 - unreadable metadata: a broken install
         unmet.append(f"the browser extra's version ranges could not be read ({exc!r})")
         requirements = []
     for req in requirements:
