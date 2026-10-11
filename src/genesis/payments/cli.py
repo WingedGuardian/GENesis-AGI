@@ -144,7 +144,15 @@ def _cmd_init(args: argparse.Namespace) -> int:
         print(f"vault init: {exc}", file=sys.stderr)
         return 2
     print(f"vault created at {vs.vault_dir()}")
+    print(_BACKUP_HINT)
     return 0
+
+
+# The 6-hourly backup carries the vault (backup.sh §8); a change made now is not
+# in any backup until then.
+_BACKUP_HINT = (
+    "back it up now with scripts/backup.sh (otherwise the next scheduled backup takes it)"
+)
 
 
 def _cmd_add(args: argparse.Namespace) -> int:
@@ -172,6 +180,7 @@ def _cmd_add(args: argparse.Namespace) -> int:
         print(f"vault add: {exc}", file=sys.stderr)
         return 2
     print(f"added {ref} ({card['brand']} ending {card['number'][-4:]})")
+    print(_BACKUP_HINT)
     return 0
 
 

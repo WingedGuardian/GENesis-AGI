@@ -295,11 +295,55 @@ locale/byte checks; final regression and recovery tests remain required.
    `creds-archive/`), and reads the escrowed passphrase — no env var needed.
    Override the source explicitly with `GENESIS_CREDS_MIRROR=<dir>` if desired.
 3. Credentials are **staged** to `~/.genesis/restore-creds/` (0700), never
-   auto-placed. Move them into position: `ssh/*` → `~/.ssh/`, `gh_hosts.yml` →
-   `~/.config/gh/hosts.yml`, `guardian_remote.yaml`/`genesis.yaml` →
-   `~/.genesis/`, `secrets.env` → `~/genesis/secrets.env`.
+   auto-placed. Move each into position (backup.sh §8 is the list):
+
+   | Staged as | Place at |
+   |---|---|
+   | `ssh/*` | `~/.ssh/` |
+   | `gh_hosts.yml` | `~/.config/gh/hosts.yml` |
+   | `claude_credentials.json` | `~/.claude/.credentials.json` |
+   | `claude.json` | `~/.claude.json` |
+   | `claude_settings.json` | `~/.claude/settings.json` |
+   | `guardian_remote.yaml` | `~/.genesis/guardian_remote.yaml` |
+   | `genesis.yaml` | `~/.genesis/config/genesis.yaml` |
+   | `release-fingerprints.txt` | `~/.genesis/release-fingerprints.txt` |
+   | `payment_vault/` | `~/.genesis/payment_vault/` (see below) |
+
+   `secrets.env` is not staged: restore §7 writes it to `~/genesis/secrets.env`.
 4. The guardian control-plane key (`genesis_guardian_ed25519`) is in the bundle,
    so the container↔host gateway is restored in the same step.
+
+**The card vault** (`identity.age`, `recipient.txt`, `cards.db`) is backed up as
+a set: `cards.db` through SQLite's online backup, all three GPG-encrypted under
+`creds/payment_vault/`, written only when all three pass the same check restore
+runs. Restore stages a fresh set (never a mix with an earlier restore) and checks
+it: `cards.db` integrity, its format version, and the shape of both key files. A
+set that fails the check is a restore warning, so restore exits non-zero. It is
+never placed automatically: placing it over a live vault would bring back retired
+cards or replace a newer key. Placement, on a box with no vault:
+
+1. confirm `~/.genesis/payment_vault` does not exist;
+2. `systemctl --user stop genesis-server`;
+3. `mv -T ~/.genesis/restore-creds/payment_vault ~/.genesis/payment_vault`;
+4. start the server and run `python -m genesis vault unlock`; a successful
+   unlock proves the passphrase and the key match.
+
+Backup states (`payment_vault` in `backup_status.json`): `ok`; `absent` (no
+vault); `skipped` (not attempted: no backup passphrase, or the run stopped first); `failed` (the vault exists but no fresh
+set was written; the earlier set is kept, since an older vault beats none); and
+`missing` (an earlier set exists but the vault is gone). `failed` and `missing`
+fail the run and send the backup-failed alert on every run until fixed. To retire
+a vault on purpose, remove its set from the backups repo:
+`git -C ~/backups/genesis-backups rm -r creds/payment_vault`, then commit. A box
+just restored from a backup that holds a vault is in the `missing` state too, so
+its backups fail until the staged vault is placed or retired.
+
+Every version stays in the backups repo's git history. The host mirror holds the
+current set, and the host archive keeps the newest set of each file name and never
+deletes one, so a retired vault's last set stays on the host. Both sit next to the
+escrowed backup passphrase, so on the host only the vault passphrase protects the
+card details. The mirror fallback is all-or-nothing: when the Tier-1 clone has
+any credential payload, restore reads the clone alone, which is the newer copy.
 
 The guardian also emits a WARNING if the mirror goes stale (its newest
 credential older than `cred_integrity.mirror_stale_hours`, default 48h) — an

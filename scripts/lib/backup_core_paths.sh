@@ -25,6 +25,8 @@ backup_core_paths() {
     local override_store
     override_store="$(python3 "$_SCRIPT_DIR/hooks/audit_jsonl.py" --store-dir GENESIS_MERGE_OVERRIDE_DIR 2>/dev/null \
         || printf '%s' "$HOME/.genesis/merge_overrides")"
+    # payment_vault: §8 backs it up consistently (SQLite online backup) and
+    # restore only stages it; an extra-dir tar could tear cards.db and place it.
     printf '%s\n' \
         "$GENESIS_DIR" \
         "$TRANSCRIPT_DIR" \
@@ -33,6 +35,7 @@ backup_core_paths() {
         "$HOME/.genesis/merge_overrides" \
         "$override_store" \
         "$HOME/.genesis/restore-creds" \
+        "${GENESIS_HOME:-$HOME/.genesis}/payment_vault" \
         "$HOME/.genesis/restore_status.json" \
         "$HOME/.ssh" \
         "$HOME/.config/gh" \
