@@ -1,0 +1,146 @@
+"""Test-time isolation of Genesis credentials."""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+from genesis.env import CREDENTIAL_NAME_RE, credential_env_names, secrets_path
+
+
+def test_credential_names_are_pinned_empty():
+    assert all(os.environ[name] == "" for name in credential_env_names())
+
+
+def test_secrets_path_points_to_missing_file():
+    assert secrets_path() == Path(os.environ["SECRETS_PATH"])
+    assert not secrets_path().exists()
+
+
+def test_child_inheriting_environment_sees_empty_credentials():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json, os; print(json.dumps({"
+            "'API_KEY_GROQ': os.environ.get('API_KEY_GROQ'), "
+            "'OPENAI_API_KEY': os.environ.get('OPENAI_API_KEY')}))",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+    )
+    assert result.stdout.strip() == '{"API_KEY_GROQ": "", "OPENAI_API_KEY": ""}'
+
+
+def test_groq_key_resolver_returns_none():
+    from genesis.routing.litellm_delegate import _resolve_api_key
+
+    assert _resolve_api_key("groq") is None
+
+
+def test_fixed_path_dotenv_cannot_replace_empty_pin(tmp_path):
+    planted = tmp_path / "secrets.env"
+    planted.write_text("API_KEY_GROQ=planted\n", encoding="utf-8")
+
+    load_dotenv(planted, override=False)
+
+    assert os.environ["API_KEY_GROQ"] == ""
+
+
+def test_credential_regex_covers_example_provider_keys():
+    example = Path(__file__).resolve().parents[1] / "secrets.env.example"
+    candidates = set()
+    for line in example.read_text(encoding="utf-8").splitlines():
+        match = re.match(r"^#?\s*([A-Z][A-Z0-9_]*)=", line)
+        if match:
+            name = match.group(1)
+            if name.startswith("API_KEY_") or name.endswith(("_API_KEY", "_TOKEN")):
+                candidates.add(name)
+
+    assert candidates
+    assert all(CREDENTIAL_NAME_RE.search(name) for name in candidates)
+
+
+def test_credential_regex_covers_aws_credentials():
+    assert all(
+        CREDENTIAL_NAME_RE.search(name)
+        for name in (
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        )
+    )
+
+
+def test_token_count_settings_are_not_credentials(tmp_path, monkeypatch):
+    empty = tmp_path / "empty.env"
+    empty.write_text("", encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "200000")
+    monkeypatch.setenv("MAX_THINKING_TOKENS", "8000")
+
+    names = credential_env_names(example=empty, secrets_file=empty)
+
+    assert not {"CLAUDE_CODE_MAX_CONTEXT_TOKENS", "MAX_THINKING_TOKENS"} & names
+    assert not CREDENTIAL_NAME_RE.search("MAX_TOKENS")
+    assert all(
+        CREDENTIAL_NAME_RE.search(name)
+        for name in (
+            "GH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "AWS_SESSION_TOKEN",
+            "TELEGRAM_BOT_TOKEN",
+        )
+    )
+
+
+def test_credential_env_names_includes_aws_environment_names(tmp_path, monkeypatch):
+    empty_example = tmp_path / "empty.env.example"
+    empty_example.write_text("", encoding="utf-8")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "dummy-akid")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "dummy-secret")
+
+    names = credential_env_names(example=empty_example)
+
+    assert {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} <= names
+
+
+def test_discord_webhook_names_are_pinned_empty():
+    from tests.conftest import _PINNED_CREDENTIALS
+
+    example = Path(__file__).resolve().parents[1] / "secrets.env.example"
+    webhook_names = {
+        match.group(1)
+        for line in example.read_text(encoding="utf-8").splitlines()
+        if (match := re.match(r"^#?\s*([A-Z][A-Z0-9_]*)=", line))
+        and match.group(1).startswith("DISCORD_WEBHOOK_")
+    }
+
+    assert len(webhook_names) == 4
+    assert webhook_names <= _PINNED_CREDENTIALS
+    assert all(os.environ[name] == "" for name in webhook_names)
+
+
+def test_credential_env_names_includes_names_only_in_the_real_secrets_file(tmp_path):
+    """A key the install's secrets file holds, absent from the example and the
+    environment, is still named, so the test pin covers it. Only the name is
+    returned, never the value."""
+    empty_example = tmp_path / "empty.env.example"
+    empty_example.write_text("", encoding="utf-8")
+    real = tmp_path / "secrets.env"
+    real.write_text(
+        "ONLY_IN_REAL_FILE_API_KEY=not-a-real-value\nexport OTHER_TOKEN=x\nPLAIN=1\n",
+        encoding="utf-8",
+    )
+
+    names = credential_env_names(example=empty_example, secrets_file=real)
+
+    assert {"ONLY_IN_REAL_FILE_API_KEY", "OTHER_TOKEN"} <= names
+    assert "PLAIN" not in names
+    assert not any("not-a-real-value" in name for name in names)

@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -28,6 +29,13 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _DEFAULT_QDRANT_URL = "http://localhost:6333"
 _DEFAULT_OLLAMA_URL = "http://localhost:11434"
 _DEFAULT_LM_STUDIO_URL = "http://localhost:1234/v1"
+# ``_PASS`` covers NAS/SMB passwords and *_PASSWORD keys. AWS access/secret keys
+# are explicit alternatives; ``_TOKEN(?!S)`` covers AWS_SESSION_TOKEN while
+# skipping token-count settings such as MAX_THINKING_TOKENS.
+CREDENTIAL_NAME_RE = re.compile(
+    r"API_KEY_|_API_KEY|_TOKEN(?!S)|_PASSPHRASE|_PASS|FIRECRAWL_API|"
+    r"AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY"
+)
 
 # ---------------------------------------------------------------------------
 # Local config overlay — ~/.genesis/config/genesis.yaml
@@ -167,6 +175,32 @@ def _local_section(name: str) -> dict:
 def repo_root() -> Path:
     value = os.environ.get("GENESIS_REPO_ROOT")
     return Path(value).expanduser() if value else _REPO_ROOT
+
+
+def credential_env_names(
+    example: Path | None = None,
+    *,
+    secrets_file: Path | None = None,
+    pattern: re.Pattern[str] = CREDENTIAL_NAME_RE,
+) -> frozenset[str]:
+    """Return the single source of truth for which env names are credentials.
+
+    Names come from the environment, from ``secrets.env.example``, and from the
+    install's real secrets file (``secrets_path()`` unless given), so a key that
+    exists only in the real file is still named. Only key names are taken from
+    either file; values are never returned.
+    """
+    names = {name for name in os.environ if pattern.search(name)}
+    example_path = example if example is not None else repo_root() / "secrets.env.example"
+    real_path = secrets_file if secrets_file is not None else secrets_path()
+    for path in (example_path, real_path):
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = re.match(r"^#?\s*(?:export\s+)?([A-Z][A-Z0-9_]*)=", line)
+            if match and pattern.search(match.group(1)):
+                names.add(match.group(1))
+    return frozenset(names)
 
 
 def venv_path() -> Path:

@@ -92,6 +92,7 @@ def _run(sandbox, *, backend="local", host_override=None):
     env = dict(os.environ)
     env.update(
         HOME=str(sandbox["home"]), GENESIS_DIR=str(sandbox["gd"]),
+        SECRETS_PATH=str(sandbox["gd"] / "secrets.env"),
         GENESIS_BACKUP_PASSPHRASE="testpass", QDRANT_URL="http://127.0.0.1:1",
         # Owned offline DB: no server or other process can hold this fixture.
         GENESIS_RESTORE_HOLDER_SCAN="none",

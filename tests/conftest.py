@@ -26,6 +26,7 @@
 # - This is the structural fix for the 2026-04-10 worktree-test-isolation
 #   footgun: before this guard, every sibling-worktree test run needed an
 #   explicit ``PYTHONPATH=src`` prefix or it silently tested main instead.
+import re
 import sys
 from pathlib import Path
 
@@ -43,6 +44,26 @@ import os  # noqa: E402
 
 import aiosqlite  # noqa: E402
 import pytest  # noqa: E402
+
+from genesis.env import CREDENTIAL_NAME_RE  # noqa: E402
+
+# Under /dev/null, which is not a directory: no read finds a file there, and a
+# write fails (ENOTDIR) instead of silently creating secrets in a temp dir, so
+# a test that forgets its own SECRETS_PATH fails loudly.
+_NO_SECRETS_PATH = "/dev/null/genesis-tests-no-secrets/secrets.env"
+_PINNED_CREDENTIALS: frozenset[str] = frozenset()
+# Webhook URLs are bearer secrets, but the dashboard pattern deliberately doesn't change here.
+_TEST_PINNED_NAME_RE = re.compile(rf"{CREDENTIAL_NAME_RE.pattern}|^DISCORD_WEBHOOK_")
+
+
+def _pin_credentials() -> None:
+    global _PINNED_CREDENTIALS
+    from genesis.env import credential_env_names
+
+    _PINNED_CREDENTIALS = credential_env_names(pattern=_TEST_PINNED_NAME_RE)
+    for name in _PINNED_CREDENTIALS:
+        os.environ[name] = ""
+    os.environ["SECRETS_PATH"] = _NO_SECRETS_PATH
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -392,6 +413,8 @@ def _is_introspection_only(config) -> bool:
 
 
 def pytest_configure(config):
+    # Before lock and collection: three hook scripts call load_dotenv at import time.
+    _pin_credentials()
     # ── Box-wide serialization ─────────────────────────────────────────────
     # Acquire BEFORE anything else, and before the basetemp early-return
     # below, so every exit path from this function is already governed.
@@ -508,6 +531,27 @@ def pytest_unconfigure(config):
         lock = getattr(config, "_genesis_pytest_lock", None)
         if lock is not None:
             lock.release()
+
+
+# ── Safety: keep Genesis credentials out of tests ──
+@pytest.fixture(autouse=True)
+def _isolate_credentials():
+    """Keep Genesis credentials keyless in tests and inherited child processes.
+
+    Pin to ``""`` rather than deleting: python-dotenv ``override=False`` and
+    the ``setdefault`` loaders skip an existing key, so fixed-path loaders in
+    this process and children inheriting ``os.environ`` stay keyless.
+    ``SECRETS_PATH`` closes every ``override=True`` loader because they all
+    resolve through ``secrets_path()``. Children launched with a hand-built
+    ``env={...}`` do not inherit the pin. A test's own ``monkeypatch.setenv``
+    still wins; there is no opt-out flag.
+    """
+    mp = pytest.MonkeyPatch()
+    for name in _PINNED_CREDENTIALS:
+        mp.setenv(name, "")
+    mp.setenv("SECRETS_PATH", _NO_SECRETS_PATH)
+    yield
+    mp.undo()
 
 
 # ── Safety: prevent tests from polluting production circuit breaker state ──

@@ -126,6 +126,7 @@ def _run(backup_env):
     env.update(
         HOME=str(backup_env["home"]),
         GENESIS_DIR=str(backup_env["gd"]),
+        SECRETS_PATH=str(backup_env["gd"] / "secrets.env"),
         GENESIS_BACKUP_PASSPHRASE="testpass",
         QDRANT_URL="http://127.0.0.1:1",
         GENESIS_BACKUP_NAS="//nas/share",
@@ -174,6 +175,7 @@ def _run_local(backup_env, offsite_root: Path, extra_env: dict | None = None):
     env.update(
         HOME=str(backup_env["home"]),
         GENESIS_DIR=str(backup_env["gd"]),
+        SECRETS_PATH=str(backup_env["gd"] / "secrets.env"),
         GENESIS_BACKUP_PASSPHRASE="testpass",
         QDRANT_URL="http://127.0.0.1:1",
         GENESIS_BACKUP_TIER2_BACKEND="local",
