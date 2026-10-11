@@ -62,6 +62,8 @@ Prime each reviewer with the RIGHT SHAPE (what a lint scan misses). Paste this i
 > change depends on, verdict each independently with evidence and a falsifier, ask what the
 > caller does differently because of its output, and say whether a better shape exists (an
 > existing chokepoint it re-implements, a simpler mechanism, a place the problem disappears).
+> Emit the `Design-premise:` block exactly as `.claude/docs/premise-check.md` "The output"
+> specifies (verdict first on each `P<n>` line, plain lines, one block); code reads it.
 > A correct fix to the wrong problem is the one defect another review round cannot find.
 >
 > Assume there are bugs; enumerate the whole CLASS, not just the named cases. Read the
