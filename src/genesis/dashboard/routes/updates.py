@@ -886,6 +886,7 @@ def update_resolve():
     tier3_prompt = _TIER3_PROMPT.format(
         escalation_file=_ESCALATION_FILE,
         summary_file=_SUMMARY_FILE,
+        conflict_file=_CONFLICT_FILE,
         update_script=_UPDATE_SCRIPT,
     )
 
