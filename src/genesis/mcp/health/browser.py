@@ -3648,29 +3648,118 @@ _STALL_MAX_PX = 16384  # the widest viewport accepted, in CSS pixels
 _STALL_MAX_AGE_S = 7 * 86400  # ages are capped at a week
 _STALL_MAX_PAGES = 100
 
-# modal_dialog: a modal <dialog> makes the rest of the page inert, so real
-# input to it is dropped while a script click still dispatches.
-_DOC_STATE_JS = """() => ({
-  visibility: document.visibilityState, has_focus: document.hasFocus(),
-  ready_state: document.readyState, modal_dialog: !!document.querySelector('dialog:modal'),
-})"""
+# Each probe answers with ONE primitive string, built in the page and bounded
+# there. Decoding an answer runs synchronously in this process, outside any
+# timeout, and on a main-world layer (all but Camoufox) the page can redefine
+# the getters a probe reads AND the builtins Playwright's own in-page
+# serializer calls on an object or array result (``then``, ``stack``,
+# ``Object.entries``); a top-level string skips that walk. Each value is
+# length-prefixed (E): "s<len>:<text>" (at most 40 characters), "n<number>;"
+# (a primitive number), "t"/"f", "z" (null), or "i" ("<invalid>": a value of
+# another type or size, or a getter that threw). A probe that throws anyway
+# answers "<threw>", never the thrown value. Only operators are used (typeof,
+# ===, + on primitives, .length of a primitive string): a "captured" builtin
+# would be the page's own in its main world. _decode reads the answer back,
+# and _token and the number checks below re-check every value. What this
+# cannot reach is Playwright's own main-world plumbing around the script (how
+# it compiles the function and builds its arguments, and the text of an error
+# raised there): only an isolated world closes that.
+_PROBE_BOUND_JS = """
+  const S = (f) => { try { const v = f(); return typeof v === 'string' && v.length <= 40 ? v : '<invalid>'; } catch (_) { return '<invalid>'; } };
+  const N = (f) => { try { const v = f(); return typeof v === 'number' ? v : '<invalid>'; } catch (_) { return '<invalid>'; } };
+  const B = (f) => { try { const v = f(); return v === true || v === false ? v : '<invalid>'; } catch (_) { return '<invalid>'; } };
+  const E = (...vs) => {
+    let w = '';
+    for (let i = 0; i < vs.length; i++) {
+      const v = vs[i];
+      w += typeof v === 'number' ? 'n' + v + ';' : v === true ? 't' : v === false ? 'f' : v === null ? 'z'
+        : typeof v === 'string' && v.length <= 40 && v !== '<invalid>' ? 's' + v.length + ':' + v : 'i';
+    }
+    return w;
+  };
+"""
+_PROBE_MAX_CHARS = 1024  # ten values of at most 45 characters each fit easily
 
+# visibility, has_focus, ready_state, modal_dialog. modal_dialog: a modal
+# <dialog> makes the rest of the page inert, so real input to it is dropped
+# while a script click still dispatches.
+_DOC_KEYS = ("visibility", "has_focus", "ready_state", "modal_dialog")
+_DOC_STATE_JS = "() => {" + _PROBE_BOUND_JS + """
+  try {
+    return E(S(() => document.visibilityState), B(() => document.hasFocus()),
+             S(() => document.readyState), B(() => !!document.querySelector('dialog:modal')));
+  } catch (_) { return '<threw>'; }
+}"""
+
+# The viewport (2 values), the target's box (4), then the hit: null when no
+# point is known, "<invalid>" when the box is unreadable, else x, y, rel, tag.
 # ``o``: the offset in the target's box the click aimed at (_CLICK_OFFSET_ATTR),
-# or null when Playwright chose the point, which this code cannot know. The box
-# is the element's own frame's, so the hit test is too. It descends open shadow
+# or null when Playwright chose the point, which this code cannot know. The page
+# can tamper with how ``o`` is built, so the sums are bounded too. The box is
+# the element's own frame's, so the hit test is too. It descends open shadow
 # roots, and containment crosses them (as _PICK_POINT_JS does): a document-level
 # hit stops at the outermost host, which would read as a cover.
-_TARGET_STATE_JS = """
-(e, o) => {
-  const r = e.getBoundingClientRect(), x = o && r.x + o[0], y = o && r.y + o[1];
-  const within = (m, t) => { for (; m; m = m.parentNode || m.host) if (m === t) return true; return false; };
-  let n = o && e.ownerDocument.elementFromPoint(x, y);
-  for (let m; n && n.shadowRoot && (m = n.shadowRoot.elementFromPoint(x, y)) && m !== n; ) n = m;
-  const rel = !n ? 'none' : n === e ? 'target' : within(n, e) ? 'inside' : within(e, n) ? 'ancestor' : 'other';
-  const hit = o ? { at: [x, y], rel, tag: n ? n.localName : null } : null;
-  return { viewport: [innerWidth, innerHeight], box: [r.x, r.y, r.width, r.height], hit };
-}
-"""
+_TARGET_STATE_JS = "(e, o) => {" + _PROBE_BOUND_JS + """
+  try {
+    const r = e.getBoundingClientRect();
+    const bx = N(() => r.x), by = N(() => r.y), bw = N(() => r.width), bh = N(() => r.height);
+    const vw = N(() => innerWidth), vh = N(() => innerHeight);
+    if (!o) return E(vw, vh, bx, by, bw, bh, null);
+    const x = N(() => bx + o[0]), y = N(() => by + o[1]);
+    if (typeof x !== 'number' || typeof y !== 'number') return E(vw, vh, bx, by, bw, bh, '<invalid>');
+    const within = (m, t) => { for (; m; m = m.parentNode || m.host) if (m === t) return true; return false; };
+    let n = e.ownerDocument.elementFromPoint(x, y);
+    for (let m; n && n.shadowRoot && (m = n.shadowRoot.elementFromPoint(x, y)) && m !== n; ) n = m;
+    const rel = !n ? 'none' : n === e ? 'target' : within(n, e) ? 'inside' : within(e, n) ? 'ancestor' : 'other';
+    return E(vw, vh, bx, by, bw, bh, x, y, rel, n ? S(() => n.localName) : null);
+  } catch (_) { return '<threw>'; }
+}"""
+
+
+# How JavaScript writes a primitive number ('' + v).
+_JS_NUMBER = re.compile(r"-?(?:\d+(?:\.\d+)?(?:e[+-]\d+)?|Infinity)|NaN")
+
+
+def _decode(w) -> list | None:
+    """The values a probe encoded (E in _PROBE_BOUND_JS), or None if ``w`` is
+    not a well-formed answer."""
+    if type(w) is not str or len(w) > _PROBE_MAX_CHARS:
+        return None
+    out: list = []
+    i = 0
+    try:
+        while i < len(w):
+            c, i = w[i], i + 1
+            if c in "tfzi":
+                out.append({"t": True, "f": False, "z": None, "i": "<invalid>"}[c])
+            elif c == "n":
+                j = w.index(";", i)
+                if not _JS_NUMBER.fullmatch(w[i:j]):
+                    return None
+                out.append(float(w[i:j]))
+                i = j + 1
+            elif c == "s":
+                j = w.index(":", i)
+                n = w[i:j]  # digits only: a sign or "_" could move ``end`` backwards
+                if not (n.isascii() and n.isdecimal()) or int(n) > 40 or (end := j + 1 + int(n)) > len(w):
+                    return None
+                out.append(w[j + 1:end])
+                i = end
+            else:
+                return None
+    except ValueError:
+        return None
+    return out
+
+
+# _TARGET_STATE_JS's values, in the shape _target_state reads.
+def _target_fields(v: list) -> dict | None:
+    if len(v) not in (7, 10):
+        return None
+    hit = v[6] if len(v) == 7 else {"at": v[6:8], "rel": v[8], "tag": v[9]}
+    return {"viewport": v[0:2], "box": v[2:6], "hit": hit}
+
+
 # Every string a probe returns is page-controlled: a tag names whatever the
 # page wrote (a custom element "secret-hunter2"), and on a layer that evaluates
 # in the page's main world (all but Camoufox) the page can redefine the getters
@@ -3694,8 +3783,9 @@ _TRACKED_LAYERS = (BrowserLayer.CAMOUFOX, BrowserLayer.CHROMIUM)
 
 
 def _token(v, field: str):
-    """``v`` if it is on ``field``'s allowlist (_FIELD_TOKENS), lowercased."""
-    if type(v) is not str:
+    """``v`` if it is on ``field``'s allowlist (_FIELD_TOKENS), lowercased.
+    A probe's own "<invalid>" (_PROBE_BOUND_JS) stays "<invalid>"."""
+    if type(v) is not str or v == "<invalid>":
         return "<invalid>"
     low = v.lower()
     if low in _FIELD_TOKENS[field]:
@@ -3723,7 +3813,7 @@ def _doc_state(got: dict) -> dict:
     return {
         k: _token(got.get(k), k) if k in _FIELD_TOKENS else got.get(k)
         if type(got.get(k)) is bool else "<invalid>"
-        for k in ("visibility", "has_focus", "ready_state", "modal_dialog")
+        for k in _DOC_KEYS
     }
 
 
@@ -3802,8 +3892,8 @@ class _NavWatch:
             self.page.remove_listener("framenavigated", self._on_nav)
 
 
-# One in-page probe, bounded by _STALL_PROBE_S: its answer passed through
-# ``check``, or why it failed. Skipped when its whole wait would not end by
+# One in-page probe, bounded by _STALL_PROBE_S: its answer decoded (_decode)
+# and passed through ``check``, or why it failed. Skipped when its whole wait would not end by
 # ``end`` (loop time, from the tool deadline): a cut-short wait would read as
 # a hung page.
 async def _probe(call, check, end: float | None) -> dict:
@@ -3811,7 +3901,10 @@ async def _probe(call, check, end: float | None) -> dict:
         return {"probe_skipped": "tool_deadline"}
     try:
         got = await asyncio.wait_for(call(), timeout=_STALL_PROBE_S)
-        return check(got) if isinstance(got, dict) else {"probe_failed": "unexpected answer"}
+        if got == "<threw>":
+            return {"probe_failed": "page_script_threw"}
+        out = None if (vals := _decode(got)) is None else check(vals)
+        return {"probe_failed": "unexpected answer"} if out is None else out
     except Exception as err:  # a probe that hangs, throws or answers oddly is itself a finding
         return {"probe_failed": type(err).__name__}
 
@@ -3846,14 +3939,18 @@ async def _input_stall_diagnostics(page, selector: str, nav: _NavWatch | None, o
     if not nav.count:
         deadline = _tool_deadline.get()
         end = None if deadline is None else deadline - _STALL_DEADLINE_MARGIN_S
-        diag["document"] = await _probe(lambda: page.evaluate(_DOC_STATE_JS), _doc_state, end)
+        diag["document"] = await _probe(
+            lambda: page.evaluate(_DOC_STATE_JS),
+            lambda v: _doc_state(dict(zip(_DOC_KEYS, v, strict=True))) if len(v) == len(_DOC_KEYS) else None,
+            end,
+        )
         # Playwright's own timeout fires first (an unretrieved driver future
         # otherwise outlives the cancelled wait); _probe's bound backs up a hung driver.
         diag["target"] = await _probe(
             lambda: page.locator(selector).first.evaluate(
                 _TARGET_STATE_JS, offset, timeout=_STALL_PROBE_S * 750
             ),
-            lambda got: _target_state(got, offset is not None),
+            lambda v: None if (got := _target_fields(v)) is None else _target_state(got, offset is not None),
             end,
         )
     # A navigation since the click, before or during the probes: they read
@@ -3870,7 +3967,10 @@ async def _input_stall_diagnostics(page, selector: str, nav: _NavWatch | None, o
 async def _with_stall_diagnostics(
     result: dict, page, selector: str, err: BaseException, tool: str, nav: _NavWatch | None
 ) -> dict:
-    if _CLICK_SENT_MARK not in _call_log(err, selector):
+    records = _call_log(err, selector)
+    # Stalled AT the click: the log ends there. A log that went on (click action
+    # done, waiting for scheduled navigations) timed out after a delivered click.
+    if not records or records[-1] != _CLICK_SENT_MARK:
         return result
     try:
         diag = await _input_stall_diagnostics(page, selector, nav, getattr(err, _CLICK_OFFSET_ATTR, None))

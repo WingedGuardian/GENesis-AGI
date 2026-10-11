@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import os
 import re
 import signal
@@ -5529,6 +5530,33 @@ _TARGET_REPORT = {
 }
 
 
+def _wire_one(v) -> str:
+    if v is True or v is False:
+        return "t" if v else "f"
+    if v is None:
+        return "z"
+    if type(v) in (int, float):  # as JavaScript writes it
+        return "nNaN;" if v != v else f"n{'-' if v < 0 else ''}Infinity;" if abs(v) == float("inf") else f"n{v};"
+    if type(v) is str and len(v) <= 40 and v != "<invalid>":
+        return f"s{len(v)}:{v}"
+    return "i"
+
+
+def _wire(got):
+    """A probe answer given as the dict a test reads easily, encoded as the
+    in-page probe puts it on the wire (E in browser._PROBE_BOUND_JS). A
+    string is passed through as an answer already on the wire."""
+    if isinstance(got, str):
+        return got
+    if "viewport" in got:
+        hit = got.get("hit")
+        tail = [hit] if not isinstance(hit, dict) else [*hit.get("at", []), hit.get("rel"), hit.get("tag")]
+        vals = [*got["viewport"], *got["box"], *tail]
+    else:
+        vals = [got[k] for k in browser._DOC_KEYS]
+    return "".join(map(_wire_one, vals))
+
+
 def _stall_page(target=_TARGET_STATE, doc=_DOC_STATE):
     """A plain-click (non-Camoufox) Chromium page whose click stalls at
     "performing click action", with the two in-page probes answering."""
@@ -5541,11 +5569,15 @@ def _stall_page(target=_TARGET_STATE, doc=_DOC_STATE):
 
     async def evaluate(js, *a, **k):
         if js is browser._TARGET_STATE_JS:
-            return target() if callable(target) else target
+            return _wire(target() if callable(target) else target)
         return False  # the new-tab classifier
 
+    async def doc_evaluate(*a, **k):
+        got = doc(*a, **k) if callable(doc) else doc
+        return _wire(await got if inspect.isawaitable(got) else got)
+
     page.locator.return_value.first.evaluate = AsyncMock(side_effect=evaluate)
-    page.evaluate = AsyncMock(side_effect=doc if callable(doc) else None, return_value=doc)
+    page.evaluate = AsyncMock(side_effect=doc_evaluate)
     browser._page = page
     browser._active_page = page
     browser._layer_launched[browser.BrowserLayer.CHROMIUM] = browser.time.monotonic() - 7200.4
@@ -5583,6 +5615,18 @@ class TestInputStallDiagnostics:
         assert diag["target"] == _TARGET_REPORT
         lines = [r.getMessage() for r in caplog.records if "performing click action" in r.getMessage()]
         assert len(lines) == 1 and "\n" not in lines[0] and '"open_pages": 2' in lines[0]
+
+    @pytest.mark.asyncio
+    async def test_a_click_that_went_on_to_wait_for_navigation_gets_no_diagnostics(self):
+        """A log that continues past "performing click action" (the click was
+        delivered, then the navigation wait timed out) is not a stall."""
+        page = _stall_page()
+        page.click.side_effect = _click_err(
+            _STALL_LOG + "    - click action done\n    - waiting for scheduled navigations to finish\n"
+        )
+        with _no_sleep(), patch.object(browser, "_human_delay", new=AsyncMock()):
+            result = await browser._impl_browser_click("#card")
+        assert "diagnostics" not in result
 
     @pytest.mark.asyncio
     async def test_a_click_that_failed_before_sending_gets_no_diagnostics(self):
@@ -5632,10 +5676,13 @@ class TestInputStallDiagnostics:
         page, _ = _typing_page()
         page.click = AsyncMock(side_effect=Exception(_STALL_LOG))  # raw: _human_type marks it
         page.context.pages = [page]
-        # A probe answering with more than it is asked for: only known keys pass.
-        page.evaluate = AsyncMock(return_value={**_DOC_STATE, "value": secret})
+        # A probe answering with more than it is asked for (an extra encoded
+        # value carrying the secret): the answer is refused whole.
+        page.evaluate = AsyncMock(return_value=_wire(_DOC_STATE) + f"s{len(secret)}:{secret}")
         page.locator = MagicMock()
-        page.locator.return_value.first.evaluate = AsyncMock(return_value={**_TARGET_STATE, "value": secret})
+        page.locator.return_value.first.evaluate = AsyncMock(
+            return_value=_wire(_TARGET_STATE) + f"s{len(secret)}:{secret}"
+        )
         with (
             patch.object(browser, "_human_delay", new=AsyncMock()),
             patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
@@ -5648,8 +5695,8 @@ class TestInputStallDiagnostics:
         assert diag["last_dialog"] == "not_tracked"
         assert diag["instance_age_s"] == "not_tracked"
         assert diag["navigated"] is False
-        assert diag["document"] == _DOC_STATE  # the probes ran
-        assert diag["target"] == _TARGET_REPORT  # a focus click's point is Playwright's
+        assert diag["document"] == {"probe_failed": "unexpected answer"}
+        assert diag["target"] == {"probe_failed": "unexpected answer"}
         assert secret not in repr(result) and secret not in caplog.text
         page.keyboard.down.assert_not_awaited()
 
@@ -5711,7 +5758,7 @@ class TestInputStallDiagnostics:
 
         # Viewport out of range or not finite: nothing is measured against it.
         # 10**400: a JS BigInt arrives as an int of any size.
-        for viewport in ([0, 1080], [1920, 10**9], [float("nan"), 1080], [float("inf"), 1080], [10**400, 1080], [1920]):
+        for viewport in ([0, 1080], [1920, 10**9], [float("nan"), 1080], [float("inf"), 1080], [10**400, 1080]):
             page = _stall_page(target={**target, "viewport": viewport})
             with (
                 _no_sleep(),
@@ -5789,13 +5836,14 @@ H.shadowRoot = SR;
 const E = mk({ localName: 'button', parentNode: SR, rects: box });
 const C = mk({ localName: 'span', parentNode: E });
 const O = mk({ localName: 'div' });
-const rel = (hit, top) => { SR.hit = hit; doc.regions = [[0, 800, top]]; return TARGET(E, [5, 5]).hit; };
-console.log(JSON.stringify([rel(E, H), rel(C, H), rel(H, H), rel(E, O), TARGET(E, null).hit]));
+const rel = (hit, top) => { SR.hit = hit; doc.regions = [[0, 800, top]]; return TARGET(E, [5, 5]); };
+console.log(JSON.stringify([rel(E, H), rel(C, H), rel(H, H), rel(E, O), TARGET(E, null)]));
 """
         )
-        assert [h["rel"] for h in out[:4]] == ["target", "inside", "ancestor", "other"]
-        assert out[0] == {"at": [5, 5], "rel": "target", "tag": "button"}
-        assert out[4] is None  # no point known: nothing is hit-tested
+        hits = [browser._target_fields(browser._decode(w))["hit"] for w in out]
+        assert [h["rel"] for h in hits[:4]] == ["target", "inside", "ancestor", "other"]
+        assert hits[0] == {"at": [5.0, 5.0], "rel": "target", "tag": "button"}
+        assert hits[4] is None  # no point known: nothing is hit-tested
 
     @pytest.mark.asyncio
     async def test_a_fallback_click_that_stalls_reports_no_point(self):
@@ -5812,11 +5860,11 @@ console.log(JSON.stringify([rel(E, H), rel(C, H), rel(H, H), rel(E, O), TARGET(E
         async def evaluate(js, *a, **k):
             if js is browser._TARGET_STATE_JS:
                 offsets.append(a[0])
-                return _TARGET_STATE
+                return _wire(_TARGET_STATE)
             return await picked(js, *a, **k)
 
         loc.evaluate.side_effect = evaluate
-        page.evaluate = AsyncMock(return_value=_DOC_STATE)
+        page.evaluate = AsyncMock(return_value=_wire(_DOC_STATE))
         with _no_sleep(), patch.object(browser, "_human_delay", new=AsyncMock()):
             result = await browser._impl_browser_click("#card")
         loc.click.assert_awaited_once()  # the humanized attempt ran, aimed, and failed unsent
@@ -5824,6 +5872,84 @@ console.log(JSON.stringify([rel(E, H), rel(C, H), rel(H, H), rel(E, O), TARGET(E
         assert result["diagnostics"]["layer"] == "camoufox"
         assert result["diagnostics"]["target"]["hit"] == {"point": "unknown"}
         assert offsets == [None]
+
+    def test_a_hostile_page_cannot_send_an_unbounded_value_across(self):
+        """On a main-world layer the page can redefine the getters a probe
+        reads, and the builtins Playwright's in-page serializer calls on an
+        object result. Decoding the answer runs synchronously in this
+        process, outside any timeout, so each probe answers with one short
+        string: each value a short string, a primitive number or a boolean,
+        otherwise "<invalid>"; a throwing getter yields "<invalid>" too, and a
+        probe that throws anyway answers "<threw>" without the thrown value."""
+        out = _run_js(
+            f"const TARGET = {browser._TARGET_STATE_JS};\nconst DOC = {browser._DOC_STATE_JS};\n"
+            + r"""
+const huge = 'x'.repeat(10 * 1024 * 1024);
+const get = (o, k, f) => Object.defineProperty(o, k, { get: f, configurable: true });
+get(globalThis, 'innerWidth', () => huge);
+get(globalThis, 'innerHeight', () => ({ valueOf: () => 600, toString: () => huge }));
+const E = mk({ localName: 'button' });
+E.getBoundingClientRect = () => {
+  const r = { y: 0, width: { a: [huge] }, height: 10n };
+  get(r, 'x', () => { throw huge; });
+  return r;
+};
+const F = mk({ localName: 'div', rects: [{ x: 0, y: 0, width: 5, height: 5 }] });
+const N = mk({}), M = mk({});
+get(N, 'localName', () => huge);
+get(M, 'localName', () => { throw huge; });
+const at = (n) => { doc.regions = [[0, 800, n]]; return TARGET(F, [1, 1]); };
+const D = {};
+get(D, 'visibilityState', () => huge);
+get(D, 'readyState', () => { throw huge; });
+D.hasFocus = () => ({ toString: () => huge });
+D.querySelector = () => { throw huge; };
+globalThis.document = D;
+const T = mk({ getBoundingClientRect() { throw huge; } });
+const o = [{ valueOf: () => huge }, 1];  // the page can tamper with how the offset is built
+console.log(JSON.stringify([TARGET(E, [5, 5]), TARGET(E, null), at(N), at(M), TARGET(F, o), DOC(), TARGET(T, [1, 1])]));
+"""
+        )
+        # Each answer is one short primitive string, so Playwright's in-page
+        # serializer has no object to walk.
+        assert all(type(w) is str and len(w) < 200 for w in out), [len(w) for w in out]
+        hostile, unaimed, huge_tag, throwing_tag, tampered, doc, threw = out
+        inv = "<invalid>"
+        box = [inv, 0.0, inv, inv]
+        assert browser._decode(hostile) == [inv, inv, *box, inv]  # an unreadable box: no point either
+        assert browser._decode(unaimed) == [inv, inv, *box, None]
+        for w in (huge_tag, throwing_tag):
+            assert browser._decode(w)[6:] == [1.0, 1.0, "other", inv]
+        assert browser._decode(tampered)[6] == inv
+        assert browser._decode(doc) == [inv] * 4
+        assert threw == "<threw>"
+
+    def test_a_malformed_answer_is_refused_and_never_loops(self):
+        """_decode runs synchronously, outside any timeout: an answer it
+        cannot read is refused, and a length can only move it forward."""
+        for w in ("s-4:", "s+3:abc", "s 3:abc", "s3_0:x", "s99:x", "n1_0;", "ninf;", "n inf;", "x", "n5", "s3"):
+            assert browser._decode(w) is None, w
+        assert browser._decode("i" * (browser._PROBE_MAX_CHARS + 1)) is None
+        assert browser._decode("n-1.5e-7;nInfinity;nNaN;s3:a;bzti")[:2] == [-1.5e-7, float("inf")]
+        assert browser._decode("s3:a;bzti")[0:4] == ["a;b", None, True, "<invalid>"]
+
+    @pytest.mark.asyncio
+    async def test_the_in_page_invalid_and_threw_tokens_survive_the_python_layer(self):
+        """The in-page "<invalid>" stays "<invalid>" (not "<unlisted>"), and a
+        probe that threw is reported as such; the click's error is kept."""
+        target = {"viewport": [800, 600], "box": [0, 0, 5, 5], "hit": {"at": [1, 1], "rel": "other", "tag": "<invalid>"}}
+        _stall_page(target=target, doc="<threw>")  # as the probe answers when it throws
+        stalled = _click_err(_STALL_LOG)
+        setattr(stalled, browser._CLICK_OFFSET_ATTR, [1, 1])
+        with (
+            _no_sleep(),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch.object(browser, "_stealth_click", new=AsyncMock(side_effect=stalled)),
+        ):
+            result = await browser._impl_browser_click("#card")
+        assert "may already have taken effect" in result["error"]
+        assert result["diagnostics"]["target"]["hit"]["tag"] == "<invalid>"
+        assert result["diagnostics"]["document"] == {"probe_failed": "page_script_threw"}
 
     def test_the_in_page_probes_read_no_text_or_value(self):
         for js in (browser._DOC_STATE_JS, browser._TARGET_STATE_JS):
@@ -5965,7 +6091,7 @@ console.log(JSON.stringify([rel(E, H), rel(C, H), rel(H, H), rel(E, O), TARGET(E
             raise _click_err(_STALL_LOG)
 
         page.click.side_effect = child_frame_navigates
-        page.evaluate = AsyncMock(return_value=_DOC_STATE)
+        page.evaluate = AsyncMock(return_value=_wire(_DOC_STATE))
         page.on = MagicMock(side_effect=lambda ev, cb: handlers.setdefault(ev, []).append(cb))
         with _no_sleep(), patch.object(browser, "_human_delay", new=AsyncMock()):
             result = await browser._impl_browser_click("#card")
