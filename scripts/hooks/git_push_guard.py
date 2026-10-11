@@ -10414,6 +10414,18 @@ def _rework_ack_bot_logins() -> frozenset[str]:
 #: The heading an acknowledgement comment opens with (after leading whitespace).
 _REWORK_ACK_HEADING = "## rework acknowledgement"
 
+#: What may follow a spec or acknowledgement heading: a non-empty qualifier set
+#: off by punctuation, such as `(amended, decision-complete)`, `: v2` or a dash
+#: and a note. A bare following WORD is not allowed ("Rework acknowledgement
+#: needed" is an instruction, not an acknowledgement), and neither is a
+#: qualifier that negates or defers the heading (`: not given`, `(draft)`,
+#: `- TODO`): a placeholder is not a decision and not an acknowledgement.
+_REWORK_HEADING_QUALIFIER = (
+    r"(?:\s*[(\[:,;\u2010-\u2015\u2212\uff1a-]"
+    r"(?!.*\b(?:not|no|needed|required|missing|pending|todo|tbd|draft|wip|awaiting)\b)"
+    r"\s*\S.*)?"
+)
+
 #: The fields the `## Rework` section must carry, each with text after the colon.
 _REWORK_FIELDS = (
     "Replaces",
@@ -10987,8 +10999,11 @@ def _rework_ts(value: object) -> _dt.datetime | None:
 
 def _rework_heading_comment(body: str, heading: str) -> bool:
     """True when the comment's first rendered block is the level-2 heading
-    ``heading`` (ATX or setext, whitespace-normalized, exact, never a prefix),
-    optionally preceded by a paragraph that is only ``(aside)``. AGENTS.md puts
+    ``heading`` (ATX or setext, whitespace-normalized, case-insensitive),
+    optionally followed by a punctuation-led qualifier
+    (``_REWORK_HEADING_QUALIFIER``) but never by a bare word, and optionally
+    preceded by a paragraph that is only ``(aside)``. "acknowledgement" also
+    matches the US spelling "acknowledgment". AGENTS.md puts
     ``(aside)`` on the first line of a comment on a Devin-built PR so the comment
     does not start a paid Devin session. Raises ``_ReworkUnreadable`` when the
     comment cannot be parsed.
@@ -10999,13 +11014,18 @@ def _rework_heading_comment(body: str, heading: str) -> bool:
     if not blocks:
         return False
     kind, where, text = blocks[0]
-    return kind == "heading" and where == 2 and " ".join(text.split()).lower() == heading
+    if kind != "heading" or where != 2:
+        return False
+    pattern = re.escape(heading).replace("acknowledgement", "acknowledge?ment")
+    normalized = " ".join(text.split()).lower()
+    return re.fullmatch(pattern + _REWORK_HEADING_QUALIFIER, normalized) is not None
 
 
 def _rework_is_ack(body: str) -> bool:
     """True when the comment opens with the "Rework acknowledgement" heading (see
-    ``_rework_heading_comment``). Never a prefix: "## Rework acknowledgement
-    needed" is an instruction, not an acknowledgement.
+    ``_rework_heading_comment``). A qualifier set off by punctuation may follow;
+    a bare word may not: "## Rework acknowledgement needed" is an instruction,
+    not an acknowledgement.
     """
     return _rework_heading_comment(body, _REWORK_ACK_HEADING.removeprefix("## "))
 

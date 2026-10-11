@@ -1148,3 +1148,71 @@ def test_59b_a_rework_heading_with_more_text_still_counts(rebuild):
     rebuild(body=_BODY.replace("## Rework\n", "## Rework specifics for #10\n"))
     state, msg = _check()
     assert state == G.REWORK_OK, msg
+
+
+# ── 60-62: qualified spec and acknowledgement headings ────────────────
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "## Rework spec (amended, decision-complete) \u2014 replaces the round-1 handling",
+        "## Rework spec (amended, decision-complete), 2026-10-05",
+        "## Rework spec: v2",
+        "## REWORK SPEC",
+    ],
+)
+def test_60_a_qualified_spec_heading_counts(rebuild, heading):
+    spec = _spec(heading + "\nKeep the core; delete the rest.")
+    rebuild(spec=False, acks=[spec, _ack()])
+    state, msg = _check()
+    assert state == G.REWORK_OK, msg
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "## Rework acknowledgment",
+        "## Rework acknowledgement (builder, 2026-10-06)",
+        "## Rework acknowledgement: split as specified",
+    ],
+)
+def test_61_a_qualified_or_us_spelled_acknowledgement_counts(rebuild, heading):
+    rebuild(acks=[_ack(body=heading + "\nI read the spec and will rebuild it.")])
+    state, msg = _check()
+    assert state == G.REWORK_OK, msg
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "## Rework spec draft",
+        "## Rework specification ideas",
+        "## Rework acknowledgement needed",
+        "## Rework acknowledgments pending",
+        "## Rework acknowledgement - needed",
+        "## Rework acknowledgement: not given",
+        "## Rework acknowledgement (not yet)",
+        "## Rework spec - not yet",
+        "## Rework spec: TODO",
+        "## Rework spec (draft)",
+        "## Rework spec \u2014 WIP, do not build",
+        "## Rework spec:",
+        "## Rework spec -",
+    ],
+)
+def test_62_a_bare_word_negating_or_empty_qualifier_does_not_count(heading):
+    assert not G._rework_heading_comment(heading + "\nbody", "rework spec")
+    assert not G._rework_heading_comment(heading + "\nbody", "rework acknowledgement")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "(aside)\n\n## Rework acknowledgement (builder)\nI read the spec.",
+        "Rework acknowledgement (builder)\n---\nI read the spec.",
+        "## Rework acknowledgement \u2010 split as specified\nI read the spec.",
+    ],
+)
+def test_63_qualified_ack_under_aside_setext_or_another_dash_counts(body):
+    assert G._rework_heading_comment(body, "rework acknowledgement")
