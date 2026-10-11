@@ -30,6 +30,67 @@ deploys from. Do not mutate it in place.
   local `live` integration branch — running unmerged candidate branches on this
   install before their PRs merge — not a development action.
 
+## Rebuilding a PR that was sent back
+
+A `needs-rework` PR, or a `needs-architecture-session` PR whose owner decision
+has since been posted as a rework spec, carries that spec in a maintainer
+comment headed `## Rework spec` (and any design issue that comment names). An
+audit or proposal without that heading is not a spec. A
+`needs-architecture-session` PR with no posted spec has an undecided design: do
+not build it. When you build a rework:
+
+- **Before building, acknowledge the spec on the OLD PR** in one comment headed
+  `## Rework acknowledgement`. Give the spec in your own words, the split you
+  will build, and every question you need answered first. Open no PR, not even
+  a draft, until it is posted. If it asks no questions, proceed once it is
+  posted; otherwise wait for an answer on the old PR. On a Devin-built old PR,
+  put `(aside)` on the first line and the heading under it, or the comment
+  starts a paid Devin session. Post it with
+  `gh api repos/<owner>/<repo>/issues/<N>/comments -F body=@<file>`;
+  `gh pr comment` can be refused on a PR past its review limit.
+- **Open NEW PRs** with fresh round counts. When the last one opens, close the
+  old PR with a comment that maps every part of it, file by file, to the
+  `file:line` in a
+  replacement covering it (or says why that part is moot), and leave its labels
+  on. If any part is neither, leave the old PR open and name that part on it.
+  If the spec ends with a `Follow-up: <id>` line, copy that line into the body
+  of the replacement that will merge into main LAST. A merge into any other
+  base completes it too, so never put it on a PR that merges into another PR.
+- **Follow the spec's split plan.** Each PR carries one concern and names the
+  PRs it depends on. Open them in dependency order against main; a PR whose
+  dependency has not merged waits as a branch, or opens stacked with its base
+  named. Being a rework is not itself a reason to stay unsplit.
+- **Size every PR in counted lines** (`python3 scripts/pr_shape.py --base origin/main`; the rule is in `.claude/docs/premise-check.md`, step 6).
+  - Under 500 is the target.
+  - From 500 to 1,000, add a `Shape:` line to the PR body saying why it cannot
+    be smaller.
+  - Over 1,000 needs the owner's approval: ask in the acknowledgement or the
+    PR body; the owner decides before merge.
+
+  Size a stacked PR against its parent branch, not main.
+
+  This is a guideline: from 500 to 1,000, a stated, legitimate reason is enough.
+- **Report against the spec** in each PR body:
+  ```
+  ## Rework
+  Replaces: #N (spec: <link>; acknowledged: <link to your comment on the old PR>)
+  Split: PR k of n (<the others>)
+  Kept / deleted / reshaped as the spec asked: <one line each, or "as specified">
+  Deviations: <each: what differs, and the complication that forced it> | none
+  Questions answered: <each question the spec delegated or missed: the answer and why>
+  ```
+  Unforeseen complications are expected; unexplained deviations are not. Never
+  settle a question the spec left open silently, and never in the most
+  defensive direction without saying so. That is a design decision, and it
+  belongs in this section.
+
+Devin builds a rework the same way, as fresh PR(s) naming the old one, but never
+closes the old PR: the closing session closes it after the same coverage check.
+
+Full contract: `CLAUDE.md` ("Rework is a contract with two sides"),
+`.claude/docs/premise-check.md` ("Handing a verdict to a builder"), and the
+genesis-development skill ("Building a rework").
+
 ## Genesis skill path resolution
 
 **Every entry in the generated "Genesis Capability Surface" below carries its
@@ -187,7 +248,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 Each entry gives the full path to the skill's instruction file. The filename is usually `SKILL.md` but not always, so read the path as given rather than assuming one — and never infer a path from the name, because the name is not the directory. Some skills nest inside a container (`gitnexus-cli` lives under `.claude/skills/gitnexus/`, not `.claude/skills/gitnexus-cli/`), and skills live under two roots.
 
 - **aws-fde-delivery** (`src/genesis/skills/aws-fde-delivery/SKILL.md`) — Forward Deployed Engineer delivery contract for AWS engagements, build-first artifacts, grounded cost estimates, Well-Architected review, evolution roadmap
-- **browser-automation** (`src/genesis/skills/browser-automation/SKILL.md`) — Canonical guide to Genesis browser automation - layers (Camoufox, Chromium, the user's Chrome over CDP, TinyFish, desktop), per-tool timeouts, safety gates, verify-after-act, known click bugs and their workarounds, overlays, iframes, tabs, and failure diagnosis
+- **browser-automation** (`src/genesis/skills/browser-automation/SKILL.md`) — Canonical guide to Genesis browser automation - layers (Camoufox, Chromium, the user's Chrome over CDP, TinyFish, desktop), per-tool timeouts, safety gates, verify-after-act, what a click checks (scroll, hit test, covered targets), overlays, iframes, tabs, and failure diagnosis
 - **cc-update** (`.claude/skills/cc-update/SKILL.md`) — Update Claude Code (the CC CLI / "clog code") to a new version, or bump the pinned CC version. Use when the user asks to update Claude Code, bump the CC pin, evaluate a new CC release, or says "clog code update". Routes to the canonical, standardized process in docs/reference/cc-compatibility.md — do NOT re-derive the update mechanism by grepping every time. Do NOT use for general "what changed in CC" trivia with no intent to update.
 - **closing-session** (`.claude/skills/closing-session/SKILL.md`) — This skill should be used when a session's job is to DRIVE OPEN PRs TO MERGE rather than to write new code — "close out the open PRs", "review and fix the open PRs", "what's blocking our PRs", "which PRs are mergeable". It owns the In Review column: it reads each PR's gate status, verifies and fixes review findings on PRs OTHER sessions built, replies in-thread, and stops at the merge gate for the user's per-PR approval. Do NOT load it for building a feature and opening its PR — that is a build session (`genesis-development`).
 - **code-intelligence** (`.claude/skills/code-intelligence/SKILL.md`) — Code understanding tool selection. Use when exploring architecture, finding definitions, tracing call chains, assessing blast radius of changes, or debugging code paths in the Genesis codebase.
@@ -241,6 +302,9 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 
 **genesis-health**
 
+- `board_item` — One issue or PR on the work board: its column and Genesis status (a live read), what blocks it (GitHub's blocked-by list, flagged when truncated), unverified open questions blocking it, and whether it was promoted from a private record.
+- `board_promote` — Propose turning a private ledger row or follow-up into a PUBLIC GitHub issue on the work board. Held for the owner's approval; nothing is posted by this call.
+- `board_status` — The work board as the reconciler last read it: counts by column, by Genesis status and by kind, coverage (open repo issues and PRs on the board against the repo's open total), drags logged, and whether the reconciler is alive. Reads stored heartbeats only, never GitHub, so it is cheap and safe.
 - `bootstrap_manifest` — Which subsystems initialized successfully, failed, or degraded at startup.
 - `browser_clear_domain` — Clear cookies for a specific domain (selective logout).
 - `browser_click` — Click an element on the current page by CSS selector or text.

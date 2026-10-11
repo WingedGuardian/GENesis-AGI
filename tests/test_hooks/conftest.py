@@ -201,6 +201,19 @@ def _hermetic_rounds_row(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_squash_body_file(monkeypatch):
+    """Keep ``--check-pr`` from writing its squash body file for EVERY hook test.
+
+    When every gate passes, the report writes the body under ``~/tmp/merge-bodies``
+    in the REAL home directory, and reads the PR body and commits to build it.
+    Report tests whose commit seam includes their head would otherwise leave files
+    in the install (MEASURED: one did). tests/test_hooks/test_squash_body_trailer.py
+    clears this per case, with a temporary HOME."""
+    monkeypatch.setenv("_TEST_SQUASH_BODY_FILE", "off")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_main_reverts(monkeypatch):
     """Pin the ``--check-pr`` ``main-reverts`` row's commit read for EVERY hook test.
 
@@ -212,6 +225,19 @@ def _hermetic_main_reverts(monkeypatch):
     own behaviour is tested in tests/test_hooks/test_merge_gate_main_reverts.py,
     which overrides this per case."""
     monkeypatch.setenv("_TEST_GH_PR_COMMITS", '{"sha": "' + "0" * 40 + '", "parents": 1}')
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_outside_contribution(monkeypatch):
+    """Pin the leaks exemption's PR read to a FAILED read for every hook test.
+
+    The scheduled-review gate asks whether a PR missing its leaks marker is an
+    outside contribution, which is a live GraphQL call without this seam. A failed
+    read means "not exempt", the gate's answer before the exemption existed, so no
+    existing verdict moves. tests/test_hooks/test_leaks_outside_contribution.py
+    overrides it per case."""
+    monkeypatch.setenv("_TEST_GH_OUTSIDE_PR", "__error__")
     yield
 
 

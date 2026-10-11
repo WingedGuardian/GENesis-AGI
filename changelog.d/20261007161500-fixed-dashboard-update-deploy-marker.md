@@ -1,0 +1,1 @@
+- The dashboard's Apply update, Resolve conflicts and Dismiss actions no longer delete or overwrite the in-progress marker of a deploy that started at the same moment, which could let the watchdog restart the server in the middle of that deploy. They now refuse while a deploy, an update or a validation hold is running, and say so.

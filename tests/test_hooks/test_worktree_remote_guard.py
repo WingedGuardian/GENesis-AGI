@@ -9,7 +9,8 @@ Covers three fixes:
 - Change 3: a trailing `# merge-to-main-override` acknowledges an on-main merge.
 
 cwd-dependent branches are driven by monkeypatching `_current_branch` /
-`_resolve_push_remote` / `read_payload`, so no real git or network runs. The
+`_effective_push_remote` (the force path's resolver) / `read_payload`, so no
+real git or network runs. The
 deterministic remote-name cases (a literal `git push --force backups`) run the
 hook via subprocess.
 """
@@ -916,13 +917,13 @@ class TestForcePushRemoteAware:
         # No named remote and upstream unresolvable → remote UNKNOWN → treat as
         # origin → hard-block in every session (fail closed).
         monkeypatch.setattr(guard_module, "_is_dispatched", lambda: False)
-        monkeypatch.setattr(guard_module, "_resolve_push_remote", lambda seg, cwd=None: None)
+        monkeypatch.setattr(guard_module, "_effective_push_remote", lambda seg, cur, cwd=None: None)
         monkeypatch.setattr(guard_module, "read_payload", lambda: _payload("git push -f"))
         assert guard_module.main() == 2
 
     def test_force_unknown_remote_blocked_even_dispatched(self, guard_module, monkeypatch):
         monkeypatch.setattr(guard_module, "_is_dispatched", lambda: True)
-        monkeypatch.setattr(guard_module, "_resolve_push_remote", lambda seg, cwd=None: None)
+        monkeypatch.setattr(guard_module, "_effective_push_remote", lambda seg, cur, cwd=None: None)
         monkeypatch.setattr(guard_module, "read_payload", lambda: _payload("git push -f"))
         assert guard_module.main() == 2
 
@@ -930,7 +931,9 @@ class TestForcePushRemoteAware:
         # No named remote, but the branch's upstream resolves to a non-origin
         # remote whose URL differs from origin's → cautious ask (not a hard block).
         monkeypatch.setattr(guard_module, "_is_dispatched", lambda: False)
-        monkeypatch.setattr(guard_module, "_resolve_push_remote", lambda seg, cwd=None: "myfork")
+        monkeypatch.setattr(
+            guard_module, "_effective_push_remote", lambda seg, cur, cwd=None: "myfork"
+        )
         monkeypatch.setattr(
             guard_module,
             "_remote_push_urls",
@@ -1130,6 +1133,31 @@ class TestForcePushCommandBorneConfig:
     def test_plain_disjoint_force_still_asks(self, remotes_repo, force):
         res = _run_cwd(f"git push {force} backups main", str(remotes_repo))
         assert res.returncode == 0
+        assert _decision(res) == "ask"
+
+    @pytest.mark.parametrize(
+        "key",
+        ["branch.feature.pushRemote", "remote.pushDefault"],
+    )
+    def test_bare_force_follows_the_push_remote_not_the_upstream(self, remotes_repo, key):
+        """A bare force push goes where git pushes, not where it fetches: with
+        the upstream on the disjoint `backups` but pushRemote/pushDefault on
+        origin, git forces origin, so the guard must block, not ask about
+        `backups`."""
+        _configure_feature_on_backups(remotes_repo)
+        _git(remotes_repo, "update-ref", "refs/remotes/backups/feature", "HEAD")
+        _git(remotes_repo, "config", key, "origin")
+        res = _run_cwd(f"git push {_FORCE}", str(remotes_repo))
+        assert res.returncode == 2, res.stdout + res.stderr
+        assert "Force push to origin/<public> is not allowed" in res.stderr
+
+    def test_bare_force_with_upstream_only_on_a_disjoint_remote_asks(self, remotes_repo):
+        """Control: with no pushRemote/pushDefault the push goes to the
+        upstream's remote, the disjoint `backups`, so the guard asks."""
+        _configure_feature_on_backups(remotes_repo)
+        _git(remotes_repo, "update-ref", "refs/remotes/backups/feature", "HEAD")
+        res = _run_cwd(f"git push {_FORCE}", str(remotes_repo))
+        assert res.returncode == 0, res.stdout + res.stderr
         assert _decision(res) == "ask"
 
     @pytest.mark.parametrize(

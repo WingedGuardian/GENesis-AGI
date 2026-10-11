@@ -26,7 +26,7 @@ def test_add_pins_the_exact_head(dc, dc_ready, capsys):
     w.pr(11, "feat/x")
     assert w.add(dc, "feat/x", "--pr", "11") == 0, capsys.readouterr()
     data = w.manifest()
-    assert data["version"] == 2
+    assert data["version"] == 3
     assert data["repo"] == os.path.realpath(w.root / ".git")
     [e] = data["candidates"]
     assert e == {
@@ -35,6 +35,7 @@ def test_add_pins_the_exact_head(dc, dc_ready, capsys):
         "owner_session": "s1",
         "added_at": e["added_at"],
         "verified_head": head,
+        "hook_approval": None,
     }
     capsys.readouterr()
     assert w.run(dc, "list") == 0
@@ -45,7 +46,9 @@ def test_add_pins_the_exact_head(dc, dc_ready, capsys):
 @pytest.mark.parametrize("flag", ["--owner-approved", "--approved-in-chat"])
 def test_there_is_no_approval_flag(dc, dc_ready, flag):
     """Owner ruling 2026-10-01: running an unmerged branch on this install's own
-    server needs no approval step, so no flag claims one."""
+    server needs no approval step, so no flag claims one. The one approval that
+    exists is --approve-hooks (owner ruling, #2978), and it covers hook changes
+    only: see test_deploy_candidates_hooks.py."""
     w = dc_ready
     w.candidate("feat/x", {"x.txt": "x\n"})
     assert w.run(dc, "add", "feat/x", "--owner", "s1", flag) == 2
@@ -195,8 +198,9 @@ def test_add_and_drop_need_the_update_lock(dc, dc_ready, capsys):
         json.dumps(
             {"version": 1, "repo": "/x", "candidates": []}
         ),  # v1 carried a self-supplied flag
-        json.dumps({"version": 2, "repo": "rel/path", "candidates": []}),
-        json.dumps({"version": 2, "repo": "/x", "candidates": [{"branch": "b"}]}),
+        json.dumps({"version": 2, "repo": "/x", "candidates": []}),  # v2 had no hook_approval
+        json.dumps({"version": 3, "repo": "rel/path", "candidates": []}),
+        json.dumps({"version": 3, "repo": "/x", "candidates": [{"branch": "b"}]}),
     ],
 )
 def test_a_malformed_manifest_refuses_every_mutating_command(dc, dc_ready, capsys, text):
@@ -223,15 +227,24 @@ def test_a_malformed_manifest_refuses_every_mutating_command(dc, dc_ready, capsy
         lambda e: e.update(owner_approved=True),
         lambda e: e.update(approval={"kind": "chat"}),
         lambda e: e.pop("added_at"),
+        lambda e: e.pop("hook_approval"),
+        lambda e: e.update(hook_approval=True),
+        lambda e: e.update(hook_approval={"head": e["verified_head"], "approved_by": "o"}),
+        lambda e: e.update(
+            hook_approval={"head": "0" * 40, "approved_by": "o", "approved_at": "t"}
+        ),
+        lambda e: e.update(
+            hook_approval={"head": e["verified_head"], "approved_by": " ", "approved_at": "t"}
+        ),
     ],
 )
 def test_the_validator_rejects_entries_no_command_would_write(dc, dc_ready, mutate):
     w = dc_ready
     w.candidate("feat/x", {"x.txt": "x\n"})
     e = w.entry("feat/x")
-    assert dc.manifest.manifest_problem({"version": 2, "repo": "/x", "candidates": [e]}) == ""
+    assert dc.manifest.manifest_problem({"version": 3, "repo": "/x", "candidates": [e]}) == ""
     mutate(e)
-    assert dc.manifest.manifest_problem({"version": 2, "repo": "/x", "candidates": [e]}) != ""
+    assert dc.manifest.manifest_problem({"version": 3, "repo": "/x", "candidates": [e]}) != ""
 
 
 def test_a_change_that_would_write_a_malformed_manifest_writes_nothing(dc, dc_ready):
@@ -255,7 +268,7 @@ def test_a_manifest_for_another_repository_is_refused(dc, dc_ready, capsys):
     w.candidate("feat/x", {"x.txt": "x\n"})
     e = w.entry("feat/x")
     w.manifest_path.write_text(
-        json.dumps({"version": 2, "repo": "/some/other/.git", "candidates": [e]})
+        json.dumps({"version": 3, "repo": "/some/other/.git", "candidates": [e]})
     )
     assert w.run(dc, "list") == 1
     assert "another repository" in capsys.readouterr().err
@@ -391,6 +404,7 @@ def test_every_manifest_reader_on_this_tree_reads_only_the_repo_key():
     known = {
         "scripts/hooks/git_push_guard.py": "_live_manifest_binding",
         "scripts/review_enforcement_commit.py": "_live_manifest_binding",
+        "scripts/lib/live_checkout.py": "state",
         "scripts/hooks/pre-commit": None,
         "scripts/hooks/pre-merge-commit": None,
     }

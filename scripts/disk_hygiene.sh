@@ -47,6 +47,10 @@
 #  15. Retention prune of the work board's local stores → scripts/prune_board.py
 #      (closed open-questions + their edges >90d, board events >180d; unverified
 #      questions and promotion pointers are never pruned)
+#  16. Copytruncate rotation of the shared MCP logs in ~/tmp (>10MB, 2 kept)
+#      → rotate_log (mcp_health.log, turnstile_debug.log; the first is held open
+#      by every session's MCP server, so both are copied and truncated, never
+#      renamed)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -286,6 +290,76 @@ prune_guard_corpus() {
         \( -name 'guard-corpus.jsonl' -o -name 'guard-corpus.jsonl.*.tmp' \) \
         -mtime +45 -delete 2>/dev/null \
         || echo "guard-corpus prune exited $?"
+}
+
+# rotate_log FILE [MAX_BYTES] [KEEP] — copytruncate rotation for a log that
+# long-lived processes hold open. The genesis-health MCP server of EVERY session
+# appends to ~/tmp/mcp_health.log through a logging.FileHandler opened once at
+# import, so renaming the file would leave each of them writing to the renamed
+# copy, and nothing ever rotated it (MEASURED 2026-10-04: 105,293,842 bytes,
+# first line 2026-06-30, so about 1.1 MB a day). Copy-then-truncate keeps the
+# writers on the same file: FileHandler opens in append mode (O_APPEND), so the
+# next write after the truncate lands at the new end, not at the old offset.
+#
+# One actor, once a day, rather than a RotatingFileHandler inside each of the
+# several MCP processes that share the file, which would race each other.
+#
+# The cost, stated rather than hidden: a line written between the copy and the
+# truncate is lost (logrotate's copytruncate has the same window). Rotated
+# copies are FILE.1 .. FILE.KEEP, oldest highest; they are ordinary ~/tmp
+# children, so prune_tmp also ages them out after 7 days.
+rotate_log() {
+    local f="$1" max="${2:-10000000}" keep="${3:-2}"
+    local size i
+    [ -f "$f" ] && [ ! -L "$f" ] || return 0
+    size="$(stat -c %s -- "$f" 2>/dev/null)" || return 0
+    [ "$size" -gt "$max" ] || return 0
+    # Refuse BEFORE changing anything if a slot holds anything but a regular
+    # file (a directory, or a link to one): mv would put the copy INSIDE it, so
+    # the truncate would follow a move that archived nothing in its slot.
+    for (( i = 1; i <= keep; i++ )); do
+        if [ -e "$f.$i" ] && [ ! -f "$f.$i" ]; then
+            echo "rotate of $f failed ($f.$i is not a regular file); the log and its rotations were left as is"
+            return 0
+        fi
+    done
+    # Copy to a temp file FIRST, before any retained rotation moves: if the copy
+    # fails (a full disk), nothing has changed, the log and every kept copy
+    # included. Truncating without a copy would lose the whole file. The temp
+    # is a fresh mktemp file (O_EXCL), never a fixed name: cp writes THROUGH an
+    # existing symlink at its destination, so a pre-planted FILE.1.tmp link
+    # would have overwritten whatever it pointed at.
+    local tmp
+    if ! tmp="$(mktemp -p "$(dirname -- "$f")" ".$(basename -- "$f").rotate.XXXXXX")"; then
+        echo "rotate of $f failed (no temp file); the log was left as is"
+        return 0
+    fi
+    if ! cp -- "$f" "$tmp"; then
+        rm -f -- "$tmp"
+        echo "rotate of $f failed; the log and its rotations were left as is"
+        return 0
+    fi
+    # Truncate BEFORE shifting any kept copy, so a truncate that fails (the log
+    # turned read-only after the check above) has displaced no history.
+    if ! : > "$f"; then
+        rm -f -- "$tmp"
+        echo "rotate of $f failed (could not truncate); the log and its rotations were left as is"
+        return 0
+    fi
+    # -T (GNU: "treat DEST as a normal file") so no move can land inside a
+    # directory that appeared after the slot check. A failed move from here on
+    # keeps this run's copy at $tmp rather than deleting the only copy.
+    for (( i = keep; i > 1; i-- )); do
+        if [ -f "$f.$((i - 1))" ] && ! mv -fT -- "$f.$((i - 1))" "$f.$i"; then
+            echo "rotate of $f failed (shifting $f.$((i - 1))); this run's copy is kept at $tmp"
+            return 0
+        fi
+    done
+    if mv -fT -- "$tmp" "$f.1"; then
+        echo "rotated $f ($size bytes)"
+    else
+        echo "rotate of $f failed (moving the copy to $f.1); it is kept at $tmp"
+    fi
 }
 
 main() {
@@ -533,6 +607,13 @@ main() {
 
     echo "--- guard replay corpus retention prune (>45d) ---"
     prune_guard_corpus "$HOME/.genesis/output"
+
+    echo "--- MCP log rotation (>10MB, copytruncate, 2 kept) ---"
+    # 10 MB: about nine days of mcp_health.log at the measured rate, small
+    # enough to read whole, and with 2 copies the three files stay near 30 MB
+    # instead of growing without bound.
+    rotate_log "$HOME/tmp/mcp_health.log" 10000000 2
+    rotate_log "$HOME/tmp/turnstile_debug.log" 10000000 2
 
     echo "=== genesis-disk-hygiene done ==="
     return "$disk_reclaim_rc"

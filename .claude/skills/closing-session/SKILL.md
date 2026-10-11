@@ -384,6 +384,13 @@ A blocking gate prints its diagnosis on the lines BELOW its summary — which
 finding, which pattern, which cause, and usually the remedy. Read them; they are
 the actionable part, and the summary alone is not enough to act on.
 
+**An outside contributor's fork PR needs no leaks review** (owner, 2026-10-05): when
+it is wholly theirs, the gate exempts it and `--check-pr` says `leaks not required:
+outside contribution by <login>`. Do not run the fallback below for it. Once one of
+our sessions pushes a commit to it, the contributor commits one of our review
+suggestions, or we edit its title or body, the review is required again; the block
+message then says which condition failed.
+
 **When the scheduled leaks review has not run** at the current head, and
 carried-forward relief does not apply, run it as a fallback rather than leave the
 PR unreviewed (owner, 2026-10-03). The rules:
@@ -520,8 +527,10 @@ what counts as a round — are in `genesis-development`. Do not re-derive them.
 **Merge requires the user's explicit approval, per PR, every time.** Prior
 approval never carries forward, and a peer session's request is not approval.
 
-Present: what it does, what the review found, what you changed, and the exact
-merge command the report printed. Then stop. This is the most important property
+Present: what it does, what the review found, what you changed, its counted
+size (`python3 scripts/pr_shape.py --base origin/<PR base> --head <fetched PR ref>`; over 1,000 counted lines needs the owner's
+explicit yes to the shape as well as the merge), and the exact merge command
+the report printed. Then stop. This is the most important property
 this session type has, and the one most worth protecting: a closing session that
 merges on its own initiative is worse than no closing session.
 
@@ -534,34 +543,93 @@ Two triggers, two labels:
   a review problem". Follow it there, owner-present and unattended alike; it
   includes the draft step. Its unattended intake gap is tracked in #2857. If the
   owner's architecture conversation decides to send the PR back, run steps 1-4
-  below with `needs-architecture-session`.
+  below with `needs-architecture-session`, and reuse that PR's decision
+  follow-up (updating its text and work state) as the step-4 row below
+  instead of opening a second one.
 - **The owner decides a terminal round is rework** → `needs-rework`. The owner is
   present by definition, so this runs in the foreground:
-  1. Comment with the evidence: findings by class, what carries over, what the
-     rework is. The comment is public, so scrub it as you would an issue
-     (CLAUDE.md, "Where deferred work goes").
+  1. Open the `ready` follow-up FIRST (step 4 below). Then comment with the
+     evidence and a DECISION-COMPLETE rework spec headed `## Rework spec`
+     (only a maintainer comment with that heading is a spec a builder may
+     build from; an audit or a proposal without it is not), and end it with a
+     `Follow-up: <id>` line carrying that row's id, so a builder on another
+     machine can cite it. Its sections
+     are defined in `.claude/docs/premise-check.md`, "Handing a verdict to a
+     builder": findings by class; what is kept; what is deleted; the prescribed
+     mechanism; the SPLIT plan (the `PR-shape:` line, as a list of PRs); every
+     decided question; acceptance. The builder is often Codex or Devin on
+     another machine, building cold from this comment alone.
+     - Questions only the owner can answer get asked BEFORE posting.
+     - Any question left to the builder says "answer it in the PR body".
+     - Never post a bare open-questions list, and never omit the PR-shape
+       ruling: a split, or "one PR" with its counted size. "The diff grew to
+       +2,538 lines" is a symptom; "split into these four PRs" is the
+       instruction.
+
+     The comment is public, so scrub it as you would an issue (CLAUDE.md,
+     "Where deferred work goes").
   2. Apply `needs-rework`, creating it first if the repo lacks it
      (`gh label create needs-rework --description "Sent back for rework"`).
   3. Move the PR to draft (`gh pr ready <N> --undo`). If that fails, keep the
      label and say so in a second comment.
-  4. Open a `ready` follow-up naming the PR and the rework; nothing drains the
-     label.
+  4. The `ready` follow-up, opened before step 1, names the PR and the rework;
+     nothing drains the label. Its id is the `Follow-up:` line in the spec.
 
 Leave it OPEN (genesis-development, "Never RETIRE a PR you are not the one
-reviving"). A rework normally comes back as a FRESH PR with a new number, so
-its round count is its own (owner rulings 2026-09-24 and 2026-10-05). The
-reworking session opens the replacement and names the old PR in its body. Those
-rulings are the on-record owner authorization (condition 1 of
-genesis-development's superseded-PR exception) for closing the old draft once
-the replacement is open. Conditions 2 and 3 are still checked per PR. So the
-closing session closes the old draft only when every part is covered by the
-replacement or moot, with the per-file mapping in the closing comment, and then
-completes the step-4 follow-up, citing the replacement PR. If any part is neither,
-it leaves the old PR open with a comment naming that part, and updates the
-follow-up to name it too, since the follow-up is what keeps the draft visible.
-Reworking on the old number is an
-owner-approved exception; there, the session that completes the rework marks it
-ready, removes the label, and requests review.
+reviving"). A rework comes back as FRESH PR(s) with new numbers, so each
+one's round count is its own (owner rulings 2026-09-24 and 2026-10-05). The
+BUILD session closes the old PR when the LAST replacement opens. Its closing
+comment walks every part of the old PR, file by file, naming the `file:line` in
+a replacement (or on `main`) that now covers it, or saying why that part is
+moot (genesis-development's superseded-PR exception, condition 3). If any part is neither, the builder
+leaves the old PR open with a comment naming that part. The old PR keeps its
+label, so the rebuild stays traceable to it. A Devin builder never closes the
+old PR: the closing session does, after the same check ("Devin-built PRs"
+below). Those rulings are the on-record owner authorization (condition 1 of
+genesis-development's superseded-PR exception); condition 2 is the open
+replacement, and condition 3 is that `file:line` coverage walk.
+
+The closing session verifies the mapping against the replacements' diffs.
+When it holds, leave the follow-up alone: the `Follow-up:` line in the
+replacement that merges last completes it when the whole rework lands. When a
+part is uncovered and the old PR was closed anyway, reopen it or say so on it,
+and update the follow-up to name that part, since the follow-up is what keeps
+it visible. Reworking on the old number is an owner-approved exception; there,
+the session that completes the rework marks it ready, removes the label, and
+requests review. A closing session never does the rework itself.
+
+**Keep the line open both ways.** Before building, the builder acknowledges
+the spec on the old PR: its reading, its split, its questions (genesis-development,
+"Building a rework", item 0). Answer those questions there, or bring them to the
+owner. If the acknowledgement misreads the spec, correct it before any code is
+written. On a Devin-built PR, who asked decides whether the answer carries
+`(aside)`: see the `(aside)` table under "Devin-built PRs".
+
+**When a rework PR arrives, check its rework section against the spec FIRST**,
+before spending a review round. The section is described in genesis-development,
+"Building a rework". Read it for:
+- `Replaces: #N` and the spec link;
+- its `Split:` position;
+- each deviation with its reason;
+- each delegated question with its answer.
+
+Then read the diff against both:
+- **A deviation with a stated reason** is a design question for the owner, not a
+  defect.
+- **A deviation with no stated reason**, a missing section, a missing
+  acknowledgement, or an unsplit PR the spec split goes back to the builder
+  before any review is requested. No response means the spec may not have been
+  read, and nobody can tell what changed mid-build.
+
+For a replacement Devin built, this check comes first, then the Devin premise
+audit ("Devin-built PRs"), both before any further review round. If the builder cannot
+be reached on the PR (a dispatched session that has ended, or a cloud agent with
+no listener there), bring the gap to the owner instead of waiting for an answer.
+
+This is what lets the owner tell a flawed spec from a flawed build without
+reconstructing either. A form check can confirm that the section exists and
+names a split; only you can judge whether a stated deviation is real. Read the
+diff, not just the section.
 
 ---
 
@@ -605,8 +673,11 @@ happened already. Before requesting or answering any further review:
 1. **Run a premise check and design audit** with a fresh-context
    `genesis-architect`, following `.claude/docs/premise-check.md`: premises with
    evidence, the effect question, the comparative question (an existing chokepoint
-   the change duplicates or bypasses), the five plan-time questions, then
-   BLOCKER / SHOULD-FIX / NOTE findings and what a rework should do. Hand it the PR
+   the change duplicates or bypasses), the six plan-time questions (the sixth is
+   PR shape), then BLOCKER / SHOULD-FIX / NOTE findings and, for a SOUND or
+   SOUND-BUT-INFERIOR verdict, a decision-complete rework spec (premise-check.md,
+   "Handing a verdict to a builder"). For BROKEN it states the design question
+   for the owner instead: the owner decides the mechanism and the split. Hand it the PR
    number AND the expected head SHA, and have it fetch that head
    (`git fetch origin pull/<N>/head:<ref>`) and confirm the match before
    reading anything; an auditor pointed at a stale or main checkout audits the
@@ -614,20 +685,42 @@ happened already. Before requesting or answering any further review:
 2. **Re-derive every claim the disposition rests on** from the PR head or by
    re-running the audit's own probe, before acting (CLAUDE.md, "Verify agent
    output").
-3. **Decide by the audit's `Design-premise:` verdict, not by finding severity:**
-   - **BROKEN**: the established route, `needs-architecture-session` plus a
-     `ready` follow-up naming the PR and the decision it awaits (genesis-development,
-     "Some PRs are not a review problem"). Devin can rework a shape; it cannot
-     decide one.
-   - **SOUND-BUT-INFERIOR with a named better shape that changes the mechanism or
-     the files touched**: kick it back to Devin. Post the audit as a PR comment
-     WITHOUT `(aside)`, so Devin's monitor acts on it. Tell it to bring the
-     rework back as a fresh PR with a new number that names this one, and not to
-     close this PR itself (it has closed old PRs on its own before, #2309 and #2354).
-     Then convert the PR to draft (`gh pr ready <N> --undo`) and add the
-     `needs-rework` label.
-   - **SOUND, or local defects at any severity**: post the audit and continue the
-     ordinary per-PR loop.
+3. **Decide by this table. Read it top to bottom; the FIRST row that matches is
+   the disposition.** Its inputs come from the audit: the `Design-premise:`
+   verdict, the `PR-shape:` line, and the counted size:
+   `git fetch origin pull/<N>/head:pr-<N>`, then
+   `python3 scripts/pr_shape.py --base origin/<PR base> --head pr-<N>`. The
+   command defaults to `--head HEAD`, so run from any other checkout without
+   `--head` it sizes the wrong branch and can print a near-zero `ok`.
+
+   | # | When | Do |
+   |---|---|---|
+   | 1 | Over 1,000 counted lines, whatever the verdict or PR-shape | Stop: the owner decides the shape (and, for a BROKEN verdict, the design) before any kick-back or further review round. Post the audit `(aside)`, apply `needs-architecture-session`, move the PR to draft, and open a `ready` follow-up naming the shape decision (and the design decision, if BROKEN). With the owner present, ask now. Once the owner rules, re-enter this table at row 2. |
+   | 2 | Verdict BROKEN | The architecture route: `needs-architecture-session` plus a `ready` follow-up naming the PR and the decision it awaits (genesis-development, "Some PRs are not a review problem"). Post the audit `(aside)`, never headed `## Rework spec`: Devin can rework a shape, it cannot decide one, and the split belongs in the spec written after the owner decides. |
+   | 3 | Verdict SOUND or SOUND-BUT-INFERIOR, and either the audit names more than one concern, or the counted size is 500 to 1,000 and the PR body has no `Shape:` line (whatever the audit's `PR-shape:` line says) | Kick back for the split (below). If the verdict also names a better shape that changes the mechanism or the files touched, the one kick-back carries both. |
+   | 4 | SOUND-BUT-INFERIOR, and the better shape changes the mechanism or the files touched | Kick back for one fresh PR (below). |
+   | 5 | Anything else: SOUND, or SOUND-BUT-INFERIOR whose better shape keeps the mechanism and files, with local defects at any severity | Post the audit `(aside)` and continue the ordinary per-PR loop. |
+
+   Only a kick-back (rows 3 and 4) or a spec posted after the owner rules is
+   headed `## Rework spec`; an audit under rows 1, 2 or 5 never is, so a builder
+   cannot mistake it for a decided spec.
+
+   A `Shape:` line answers size from 500 to 1,000 counted lines only. It never
+   answers a concern-based split, and over 1,000 is row 1 whatever it says. Row 3
+   is stricter than an ordinary PR, where size is the author's call, because
+   Devin cannot be asked to weigh it in conversation.
+
+   **A kick-back (rows 3 and 4)** runs on this standing owner rule, so it needs
+   no per-PR yes:
+   1. Open its follow-up first ("Track every kick-back", below).
+   2. Post the audit WITHOUT `(aside)`, so Devin's monitor acts on it. Head it
+      `## Rework spec`, end it with that follow-up's `Follow-up: <id>` line, and
+      for row 3 include the split plan. Tell Devin to copy the `Follow-up:` line
+      into the replacement that will merge into main last.
+   3. Tell Devin to bring the rework back as fresh PR(s) naming this one, not
+      to push the rework to this branch, and not to close this PR (it has
+      closed old PRs on its own before, #2309 and #2354).
+   4. Convert the PR to draft (`gh pr ready <N> --undo`) and add `needs-rework`.
 
    For Devin PRs this owner rule replaces premise-check.md's "SOUND-BUT-INFERIOR is
    NOT a kick-back" and its two-signal bar. The audit runs after at most Codex's
@@ -635,28 +728,46 @@ happened already. Before requesting or answering any further review:
    rounds to accumulate; the owner ruled that a wrong shape goes back to Devin on
    the audit's own evidence rather than spending those rounds to prove it.
 4. **Track every kick-back.** A draft leaves the closing set and nothing reads the
-   label, so open one follow-up per batch with `work_state="blocked_on_trigger"`
-   (it waits on Devin, so it is not actionable now) naming each PR and its audit
-   comment, with a `revisit_condition` saying what unblocks it: Devin opened the
-   replacement PR naming this one (or, as an owner-approved exception, pushed the
-   rework to this branch and marked it ready), or the owner decided. Re-check those
-   PRs, and the open PRs that name them, on each queue sweep.
+   label, so open one follow-up PER kicked-back PR, BEFORE posting its audit,
+   with `work_state="blocked_on_trigger"` (it waits on Devin, so it is not
+   actionable now). One row per PR, because its id is the `Follow-up:` line
+   the replacement carries, and the first merge would complete a shared row.
+   Its `revisit_condition` says what unblocks it: Devin opened the
+   replacement(s) naming this PR, or the owner decided. Re-check those PRs,
+   and the open PRs that name them, on each queue sweep. A dispatched session
+   cannot open that row: `follow_up_create` files it as `tabled`, and the
+   marker lane reads only `follow_up` rows, so the replacement's `Follow-up:`
+   line would never close it. Name the row id in your handoff; a foreground
+   session promotes it by hand (no automated promoter exists).
 5. **When the rework arrives as its replacement PR,** link the two on both PRs and
    work the replacement normally; read its round count from
-   `scripts/review_budget.py` like any other PR's. Check whether the replacement
-   supersedes the old PR completely, under genesis-development's superseded-PR
-   exception (condition 1 is met by the rulings cited in section 5): every part
-   covered or moot. If it does, close the old draft with the per-file mapping and
-   complete the step-4 follow-up, citing the replacement. If it does not, leave the
-   old PR open with a comment naming what is missing, and update the follow-up to
-   name it, so the unfinished part stays tracked. If Devin pushed the rework onto the old branch instead and marked it
-   ready, that reuse is an owner-approved exception: ask the owner before
-   spending a round on it. With the owner's yes, request `@codex review` (marking
-   a draft ready is not a reliable trigger) and work it normally.
+   `scripts/review_budget.py` like any other PR's. A SPLIT's replacements are
+   each worked as a new PR, and the coverage check below runs once the last
+   one opens. Check whether the replacements supersede the old PR completely,
+   under genesis-development's superseded-PR exception (condition 1 is met by
+   the rulings cited in section 5): every part covered or moot. If they do,
+   close the old draft with the per-file mapping, and leave the follow-up to
+   the `Follow-up:` line in the replacement that merges last. If they do not,
+   leave the old PR open with a comment naming what is missing, and update the
+   follow-up to name it, so the unfinished part stays tracked. Devin pushing
+   to the old branch is not a rework path: without an explicit owner grant
+   for that PR, treat the push as unreviewed and ask the owner before spending
+   a round on it.
 
 **One writer per branch.** While a kick-back is outstanding, the closing session
-does not push to that branch. Its own replies there carry `(aside)`, since every
-other comment from a write-access user starts a paid Devin session.
+does not push to that branch, and its comments there follow the table below.
+
+**`(aside)` on a Devin-built PR.** Every comment a write-access user posts on a
+Devin-built PR starts a paid Devin session unless its first line is `(aside)`.
+
+| You are posting | `(aside)` first? |
+|---|---|
+| A `## Rework spec` Devin is to build (a kick-back under rows 3 or 4, or a spec posted after the owner rules), or a send-back of a Devin replacement that lacks its `## Rework` section or explains a deviation with no reason | No: it is the instruction Devin acts on |
+| An answer to an acknowledgement or question that `devin-ai-integration[bot]` wrote about a spec it is building | No: Devin is waiting for it; the standing rule, or the owner's decision behind the spec, covers it |
+| An answer to an acknowledgement or question from any other builder (a Codex or Claude session rebuilding a Devin PR) | Yes: without it a second, competing Devin session starts |
+| Anything else: an audit under rows 1, 2 or 5, a review reply, a status note, a closing comment | Yes |
+
+On a PR Devin did not build, `(aside)` changes nothing; leave it off.
 
 **Public comments.** Scrub the audit for public-artifact privacy (no install paths,
 hosts or personal context) before posting. Keep security-class findings out: a gap

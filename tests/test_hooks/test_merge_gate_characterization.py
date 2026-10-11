@@ -1354,13 +1354,14 @@ def test_e3_stale_override_gates_positional_pr_not_flag_value(monkeypatch):
     """E3 (2026-08-19) — wrong-PR resolution. gh parses ``gh pr merge --subject 123 5``
     as subject="123" + PR **5** (the trailing positional), but the old
     ``_extract_pr_number`` returned **123** (the ``--subject`` VALUE) → every gate
-    then checked the WRONG PR. It is contained on the normal path (the shadow-flag
-    belt refuses ``--subject`` once the head binding engages), so the reachable
-    main()-level observable is under ``# stale-review-override`` — which waives
-    freshness and with it SKIPS the shadow belt + binding, letting the command flow
-    into the finding scanners. An inline P1 seeded on PR 5 (the true gh target) must
-    BLOCK, and the scan must target PR 5, never 123. Old resolver → 123 → clean scan
-    → exit 0. Proven on the router's call log (assert in the TEST frame, Codex #1399)."""
+    then checked the WRONG PR. The shadow-flag belt now refuses ``--subject`` on
+    EVERY merge, so the witness uses ``--match-head-commit 123``: another value flag
+    whose value the resolver must skip, and one the belt allows. Under
+    ``# stale-review-override`` (which waives freshness and the binding, so ``123``
+    binds nothing) the command flows into the finding scanners. An inline P1 seeded
+    on PR 5 (the true gh target) must BLOCK, and the scan must target PR 5, never
+    123. A resolver reading the value → 123 → clean scan → exit 0. Proven on the
+    router's call log (assert in the TEST frame, Codex #1399)."""
     calls: list = []
 
     def router(argv, **kwargs):  # noqa: ANN001 - subprocess.run signature
@@ -1377,7 +1378,7 @@ def test_e3_stale_override_gates_positional_pr_not_flag_value(monkeypatch):
             return _proc(0, "")  # no review-body comments (JSONL: empty output)
         return _proc(0, "")
 
-    cmd = "gh pr merge --subject 123 5 --repo owner/repo --squash --admin  # stale-review-override"
+    cmd = "gh pr merge --match-head-commit 123 5 --repo owner/repo --squash --admin  # stale-review-override"
     rc = _run(monkeypatch, cmd, reviews="", router=router)
     assert rc == 2, f"expected a block on PR 5's inline P1, got exit {rc}"
     inline = [parts for label, parts in calls if label == "inline"]
@@ -1416,6 +1417,56 @@ def test_check_pr_report_includes_scheduled_line_ok(monkeypatch, capsys):
     sched_line = next(ln for ln in out.splitlines() if ln.startswith("scheduled-claude"))
     assert "ok (at head)" in sched_line
     assert rc == 0
+
+
+def test_check_pr_report_names_an_outside_contribution_exemption(monkeypatch, capsys):
+    """An outside fork PR with no leaks marker PASSES, and the row says the review
+    was not required -- never 'ok (at head)', which would claim a review ran."""
+    _report_env(monkeypatch, scheduled="")
+    monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "leaks")  # the shipped default
+    monkeypatch.setenv(
+        "_TEST_GH_OUTSIDE_PR",
+        json.dumps(
+            {
+                "headRefOid": HEAD,
+                "isCrossRepository": True,
+                "authorAssociation": "FIRST_TIME_CONTRIBUTOR",
+                "author": {"__typename": "User", "login": "outsider"},
+                "userContentEdits": {"totalCount": 0, "nodes": []},
+                "timelineItems": {"filteredCount": 0, "nodes": []},
+                "forcePushes": {"filteredCount": 0},
+            }
+        ),
+    )
+    monkeypatch.setenv(
+        "_TEST_GH_PR_COMMITS",
+        json.dumps(
+            {
+                "sha": HEAD,
+                "parents": 1,
+                "author": "outsider",
+                "committer": "outsider",
+                "message": "fix",
+            }
+        ),
+    )
+    monkeypatch.setenv(
+        "_TEST_GH_ROLLUP_WITH_HEAD",
+        json.dumps(
+            {
+                "headRefOid": HEAD,
+                "statusCheckRollup": [
+                    {"name": "leak-detector", "workflowName": "CI", "conclusion": "SUCCESS"}
+                ],
+            }
+        ),
+    )
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    sched_line = next(ln for ln in out.splitlines() if ln.startswith("scheduled-claude"))
+    assert "leaks not required: outside contribution by outsider" in sched_line
+    assert "at head" not in sched_line
+    assert rc == 0, out
 
 
 @pytest.mark.parametrize(

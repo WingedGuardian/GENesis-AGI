@@ -12,6 +12,7 @@ functional bash test.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -21,6 +22,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap.sh"
+UPDATE = REPO_ROOT / "scripts" / "update.sh"
 INSTALL = REPO_ROOT / "scripts" / "install.sh"
 CBM_INSTALLER = REPO_ROOT / "scripts" / "lib" / "cbm_installer.sh"
 CBM_DISABLE_LIB = REPO_ROOT / "scripts" / "lib" / "cbm_disable_file.sh"
@@ -30,6 +32,116 @@ SETUP_LOCAL = REPO_ROOT / "scripts" / "setup-local-config.sh"
 def _code(path: Path) -> str:
     """Script text minus comment-only lines (so assertions match real code)."""
     return "\n".join(ln for ln in path.read_text().splitlines() if not ln.lstrip().startswith("#"))
+
+
+def _recovery_env(**extra: str) -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env.update(extra)
+    return env
+
+
+def _recovery_git(root: Path, *args: str) -> str:
+    return subprocess.check_output(
+        ["git", "-C", str(root), *args],
+        text=True,
+        env=_recovery_env(),
+        timeout=30,
+    ).strip()
+
+
+def _recovery_repo(tmp_path: Path) -> tuple[Path, str, str]:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _recovery_git(root, "init", "-q", "-b", "main")
+    _recovery_git(root, "config", "user.name", "recovery-test")
+    _recovery_git(root, "config", "user.email", "recovery-test@example.test")
+    files = {
+        "changed.txt": "base changed\n",
+        "untouched.txt": "base untouched\n",
+        "local.txt": "base local\n",
+    }
+    for name, content in files.items():
+        (root / name).write_text(content)
+    _recovery_git(root, "add", "--all")
+    _recovery_git(root, "commit", "-qm", "common ancestor")
+    common = _recovery_git(root, "rev-parse", "HEAD")
+    rollback_file = root / "local.txt"
+    rollback_file.write_text("rollback branch state\n")
+    _recovery_git(root, "add", "--", "local.txt")
+    _recovery_git(root, "commit", "-qm", "pre-update checkout")
+    rollback = _recovery_git(root, "rev-parse", "HEAD")
+    _recovery_git(root, "tag", "rollback", rollback)
+    return root, common, rollback
+
+
+def _recovery_commit_file(root: Path, name: str, content: str, message: str) -> str:
+    (root / name).parent.mkdir(parents=True, exist_ok=True)
+    (root / name).write_text(content)
+    _recovery_git(root, "add", "--", name)
+    _recovery_git(root, "commit", "-qm", message)
+    return _recovery_git(root, "rev-parse", "HEAD")
+
+
+def _crash_recovery_source() -> str:
+    text = BOOTSTRAP.read_text()
+    begin = text.index("# BEGIN crash-recovery")
+    end = text.index("# END crash-recovery", begin) + len("# END crash-recovery")
+    return text[begin:end]
+
+
+def _write_recovery_state(home: Path, **state) -> Path:
+    raw = state.pop("raw", None)
+    state = {
+        "phase": "merging",
+        "rollback_tag": "rollback",
+        "original_branch": "main",
+        "own_head": "",
+        "deploy_head": "",
+        "pid": 2_147_483_647,
+        **state,
+    }
+    if state["original_branch"] is None:
+        state.pop("original_branch")
+    state_path = home / ".genesis" / "update_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(raw if raw is not None else json.dumps(state))
+    return state_path
+
+
+def _run_crash_recovery(
+    root: Path,
+    home: Path,
+    *,
+    backup_root: Path | None = None,
+) -> subprocess.CompletedProcess:
+    script = (
+        '#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR="${RECOVERY_SCRIPTS:?}"\n'
+        'GENESIS_ROOT="${RECOVERY_ROOT:?}"\nUPDATE_STATE="$HOME/.genesis/update_state.json"\n'
+        '. "$SCRIPT_DIR/lib/deploy_marker.sh"\n. "$SCRIPT_DIR/lib/deploy_checkout.sh"\n'
+        '. "$SCRIPT_DIR/lib/deploy_recovery.sh"\nEPHEMERAL_BACKUP_ROOT="${TEST_BACKUP_ROOT:?}"\n'
+        + _crash_recovery_source()
+    )
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=_recovery_env(
+            HOME=str(home),
+            RECOVERY_SCRIPTS=str(REPO_ROOT / "scripts"),
+            RECOVERY_ROOT=str(root),
+            TEST_BACKUP_ROOT=str(
+                backup_root or home / ".genesis" / "premerge-backups" / "test-run"
+            ),
+        ),
+    )
+
+
+def _recover(tmp_path: Path, root: Path, *, backup_root: Path | None = None, **state):
+    home = tmp_path / "home"
+    state_path = _write_recovery_state(home, **state)
+    return _run_crash_recovery(root, home, backup_root=backup_root), state_path
 
 
 # ── B1: setup-complete marker written only at the END ────────────────
@@ -150,9 +262,7 @@ def test_b9_no_pipe_to_shell():
     assert '. "$SCRIPT_DIR/lib/cbm_installer.sh"' in code
 
 
-_CBM_PIN_RE = re.compile(
-    r'GENESIS_CBM_INSTALLER_COMMIT="(?P<commit>[0-9a-f]{40})"'
-)
+_CBM_PIN_RE = re.compile(r'GENESIS_CBM_INSTALLER_COMMIT="(?P<commit>[0-9a-f]{40})"')
 _CBM_DIGEST_RE = re.compile(r'GENESIS_CBM_INSTALLER_SHA256="(?P<digest>[0-9a-f]{64})"')
 
 
@@ -228,9 +338,7 @@ def _run_cbm_install(tmp_path: Path, payload: str, digest: str | None, label: st
         'while [ $# -gt 0 ]; do\n  if [ "$1" = "-o" ]; then out="$2"; fi\n  shift\ndone\n'
         '[ -n "$out" ] || exit 1\ncat "$PAYLOAD_FILE" > "$out"\n'
     )
-    (work / "stub" / "bash").write_text(
-        '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$ARGV_FILE"\nexit 0\n'
-    )
+    (work / "stub" / "bash").write_text('#!/bin/sh\nprintf \'%s\\n\' "$@" > "$ARGV_FILE"\nexit 0\n')
     for stub in (work / "stub").iterdir():
         stub.chmod(0o755)
     # `set -euo pipefail` is what both real callers run under.
@@ -462,8 +570,7 @@ def test_install_pkg_captures_status_without_a_bare_assignment():
     # Comment lines excluded: the explanatory comment above the fix quotes the
     # very shape being asserted on, and would otherwise be counted as a capture.
     captures = [
-        ln for ln in body.splitlines()
-        if "output=$(" in ln and not ln.lstrip().startswith("#")
+        ln for ln in body.splitlines() if "output=$(" in ln and not ln.lstrip().startswith("#")
     ]
     assert len(captures) == 2, f"expected both package-manager branches, got {captures}"
     for ln in captures:
@@ -477,7 +584,9 @@ def test_install_pkg_captures_status_without_a_bare_assignment():
 def test_install_pkg_dnf_branch_reports_failures_too(tmp_path):
     """The non-apt branch is a separate capture and needs its own guard —
     a string assertion alone would not catch the two branches diverging."""
-    r = _run_install_pkg(tmp_path, 'printf "Error: No match for argument\\n"; return 1;', pkg_mgr="dnf")
+    r = _run_install_pkg(
+        tmp_path, 'printf "Error: No match for argument\\n"; return 1;', pkg_mgr="dnf"
+    )
     assert "install failed (exit 1)" in r.stdout, r.stdout
     assert "No match for argument" in r.stdout
     assert r.returncode == 1
@@ -551,11 +660,7 @@ def _cbm_outcome_block(script: Path) -> str:
     # if/elif/else encloses the source line, the call wire and the `case`, so
     # slicing from any inner line leaves an orphaned `fi`; `_cbm_disable` is
     # pre-set by the caller to a nonexistent path so the else branch runs.
-    start = next(
-        i
-        for i, ln in enumerate(lines)
-        if ln.strip() == 'if [ -z "$_cbm_disable" ]; then'
-    )
+    start = next(i for i, ln in enumerate(lines) if ln.strip() == 'if [ -z "$_cbm_disable" ]; then')
     end = next(i for i, ln in enumerate(lines) if i > start and ln.strip() == "esac")
     end = next(i for i, ln in enumerate(lines) if i > end and ln.strip() == "fi")
     return "\n".join(lines[start : end + 1]) + "\n"
@@ -669,3 +774,467 @@ def test_root_resolution_survives_cdpath(script, var, prelude, hostile, tmp_path
     assert proc.stdout == expected, (
         f"{script}: resolved {proc.stdout!r}, expected {expected!r} (CDPATH={cdpath})"
     )
+
+
+def _assert_recovery_refused(proc: subprocess.CompletedProcess, state_path: Path) -> None:
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "REFUSE:" in output, output
+    guidance = (
+        "Current branch/HEAD:",
+        "scripts/bootstrap.sh",
+        "scripts/update.sh --post-merge",
+        "update_state.json",
+    )
+    assert all(line in output for line in guidance), output
+    assert state_path.exists(), "a refusal must retain update state"
+
+
+def _assert_recovered(
+    proc: subprocess.CompletedProcess, state_path: Path, root: Path, rollback: str
+) -> None:
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+    assert not state_path.exists()
+
+
+def test_crash_recovery_sources_shared_libraries_after_the_live_guard():
+    text = BOOTSTRAP.read_text()
+    assert (
+        text.index('bootstrap_refuse_if_server_live "$@"')
+        < text.index('. "$SCRIPT_DIR/lib/deploy_marker.sh"')
+        < text.index('. "$SCRIPT_DIR/lib/deploy_checkout.sh"')
+        < text.index('. "$SCRIPT_DIR/lib/deploy_recovery.sh"')
+    )
+    assert "reset --hard" not in text
+    assert "# BEGIN crash-recovery" in text and "# END crash-recovery" in text
+
+
+@pytest.mark.parametrize(
+    ("original_branch", "services_stopped"),
+    [
+        ('feature/"snow\\man-λ', ["genesis-server", 'odd"name']),
+        ("main", []),
+    ],
+    ids=["escaped-values", "no-stopped-services"],
+)
+def test_update_state_persists_the_recovery_ownership_inputs(
+    tmp_path, original_branch, services_stopped
+):
+    text = UPDATE.read_text()
+    start = text.index("_write_state() {")
+    end = text.index("\n}\n\n# Clear this run's deploy state files", start) + 2
+    state_path = tmp_path / "home" / ".genesis" / "update_state.json"
+    script = (
+        'set -euo pipefail; STATE_FILE="$1"; STARTED_AT="2026-01-01T00:00:00Z"; '
+        'ROLLBACK_TAG=rollback; OLD_TAG=old; OLD_COMMIT=abc; ORIGINAL_BRANCH="$2"; '
+        "UPDATE_OWN_HEAD=1111111111111111111111111111111111111111; "
+        "DEPLOY_HEAD=2222222222222222222222222222222222222222\n"
+        'WERE_RUNNING=("${@:3}")\n' + text[start:end] + '\n_write_state "merging"\n'
+    )
+    argv = [
+        "bash",
+        "-c",
+        script,
+        "write-state-test",
+        str(state_path),
+        original_branch,
+        *services_stopped,
+    ]
+    proc = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "HOME": str(tmp_path / "home")},
+    )
+    assert proc.returncode == 0, proc.stderr
+    state = json.loads(state_path.read_text())
+    assert isinstance(state.pop("pid"), int)
+    timestamp = state.pop("timestamp")
+    assert isinstance(timestamp, str) and timestamp
+    assert state == dict(
+        phase="merging",
+        rollback_tag="rollback",
+        original_branch=original_branch,
+        own_head="1" * 40,
+        deploy_head="2" * 40,
+        old_tag="old",
+        old_commit="abc",
+        started_at="2026-01-01T00:00:00Z",
+        services_stopped=services_stopped,
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "truncated",
+        "control-character",
+        "S3",
+        "S5",
+        "S6",
+        "S10",
+        "S14",
+        "fetching-at-deploy-head",
+        "empty-tag",
+        "unresolvable-tag",
+    ],
+)
+def test_unsafe_recovery_cases_refuse_without_moving_unowned_code(tmp_path, case):
+    root, _, rollback = _recovery_repo(tmp_path)
+    expected_head = rollback
+    expected_branch = "main"
+    state = {}
+    preserved = {}
+
+    if case == "truncated":
+        state["raw"] = '{"phase":"merging","pid":2147483647,'
+    elif case == "control-character":
+        state.update(phase="merging\x01", own_head=rollback)
+    elif case in {"S3", "S5", "S6", "S10", "S14", "fetching-at-deploy-head"}:
+        deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
+        expected_head = deploy
+        state.update(own_head=rollback, deploy_head=deploy)
+        if case == "fetching-at-deploy-head":
+            state["phase"] = "fetching"
+        if case == "S3":
+            (root / "changed.txt").write_text("operator edit\n")
+            preserved["changed.txt"] = "operator edit\n"
+        elif case == "S5":
+            expected_head = _recovery_commit_file(
+                root, "followup.txt", "someone else's commit\n", "followup"
+            )
+        elif case == "S6":
+            _recovery_git(root, "branch", "other")
+            _recovery_git(root, "checkout", "-q", "other")
+            expected_branch = "other"
+        elif case == "S10":
+            state.update(original_branch=None, own_head="", deploy_head="")
+        else:
+            _recovery_git(root, "update-index", "--skip-worktree", "changed.txt")
+            (root / "changed.txt").write_text("skip-worktree operator edit\n")
+            preserved["changed.txt"] = "skip-worktree operator edit\n"
+    else:
+        state.update(rollback_tag="" if case == "empty-tag" else "missing-tag")
+        state["own_head"] = rollback
+
+    local = root / "untouched.txt"
+    local.write_text("operator edit\n")
+    preserved["untouched.txt"] = "operator edit\n"
+    proc, state_path = _recover(tmp_path, root, **state)
+
+    _assert_recovery_refused(proc, state_path)
+    output = proc.stdout + proc.stderr
+    if case in {"truncated", "control-character"}:
+        assert "state is unreadable" in output
+    if case == "fetching-at-deploy-head":
+        assert (
+            "the checkout moved while the update was in phase 'fetching', "
+            "before it could have merged"
+        ) in output
+    if case in {"empty-tag", "unresolvable-tag"}:
+        assert "rollback tag" in output
+    assert _recovery_git(root, "rev-parse", "HEAD") == expected_head
+    assert _recovery_git(root, "symbolic-ref", "--short", "HEAD") == expected_branch
+    for path, content in preserved.items():
+        assert (root / path).read_text() == content
+
+
+@pytest.mark.parametrize(
+    ("two_parent", "staged", "polluted_git_env"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+    ],
+    ids=[
+        "S2-fast-forward",
+        "S4-two-parent-merge",
+        "S13-staged-edit",
+        "S2-fast-forward-inherited-git-env",
+    ],
+)
+def test_crashed_owned_update_rolls_back_and_keeps_untouched_edit(
+    tmp_path, monkeypatch, two_parent, staged, polluted_git_env
+):
+    root, common, rollback = _recovery_repo(tmp_path)
+    if two_parent:
+        _recovery_git(root, "checkout", "-qb", "incoming", common)
+        deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "incoming update")
+        _recovery_git(root, "checkout", "-q", "main")
+        _recovery_git(root, "merge", "--no-ff", "--no-edit", "incoming")
+        assert _recovery_git(root, "rev-parse", "HEAD^1") == rollback
+        assert _recovery_git(root, "rev-parse", "HEAD^2") == deploy
+    else:
+        deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
+    # update.sh records the adopted merge head (a fast-forward's deploy commit,
+    # or its own two-parent merge) the moment it adopts it.
+    merged = _recovery_git(root, "rev-parse", "HEAD")
+    local = root / "untouched.txt"
+    local.write_text("staged operator edit\n" if staged else "operator edit during recovery\n")
+    if staged:
+        _recovery_git(root, "add", "--", "untouched.txt")
+    if polluted_git_env:
+        decoy_parent = tmp_path / "decoy"
+        decoy_parent.mkdir()
+        decoy, _, _ = _recovery_repo(decoy_parent)
+        (decoy / "untouched.txt").write_text("decoy staged edit\n")
+        _recovery_git(decoy, "add", "--", "untouched.txt")
+        decoy_head = _recovery_git(decoy, "rev-parse", "HEAD")
+        decoy_index = decoy / ".git" / "index"
+        decoy_index_before = decoy_index.read_bytes()
+        monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
+        monkeypatch.setenv("GIT_WORK_TREE", str(decoy))
+        monkeypatch.setenv("GIT_INDEX_FILE", str(decoy_index))
+    proc, state_path = _recover(tmp_path, root, own_head=merged, deploy_head=deploy)
+
+    _assert_recovered(proc, state_path, root, rollback)
+    if polluted_git_env:
+        assert _recovery_git(decoy, "rev-parse", "HEAD") == decoy_head
+        assert decoy_index.read_bytes() == decoy_index_before
+    assert (root / "changed.txt").read_text() == "base changed\n"
+    if staged:
+        assert _recovery_git(root, "show", ":untouched.txt") == "staged operator edit"
+    else:
+        assert local.read_text() == "operator edit during recovery\n"
+
+
+@pytest.mark.parametrize(
+    "corrupt_marker", [False, True], ids=["own-merge", "unparsable-merge-head"]
+)
+def test_crash_recovery_refuses_every_in_progress_merge(tmp_path, corrupt_marker):
+    root, rollback, deploy = _merge_in_progress(tmp_path)
+    if corrupt_marker:
+        (root / ".git" / "MERGE_HEAD").write_text("not a commit\n")
+    head_before = _recovery_git(root, "rev-parse", "HEAD")
+    operator_content = "OPERATOR RESOLUTION\n"
+    backup_root = tmp_path / "home" / ".genesis" / "premerge-backups" / "known"
+    proc, state_path = _recover(
+        tmp_path, root, backup_root=backup_root, own_head=rollback, deploy_head=deploy
+    )
+
+    _assert_recovery_refused(proc, state_path)
+    assert "merge --abort" in proc.stdout + proc.stderr
+    assert (root / ".git" / "MERGE_HEAD").exists()
+    assert _recovery_git(root, "rev-parse", "HEAD") == head_before
+    assert (root / "local.txt").read_text() == operator_content
+    assert _recovery_git(root, "show", ":local.txt") == operator_content.rstrip("\n")
+    assert not list(backup_root.parent.glob("*/merge-abort"))
+
+
+@pytest.mark.parametrize(
+    ("case", "phase", "original_branch", "staged"),
+    [
+        ("S1", "fetching", "main", False),
+        ("S9", "merging", "main", False),
+        ("S12", "merging", "main", True),
+        ("old-format", "merging", None, False),
+        ("live-pid", "merging", "main", False),
+    ],
+)
+def test_recovery_warns_at_tag_or_skips_a_live_process(
+    tmp_path, case, phase, original_branch, staged
+):
+    update_code = _code(UPDATE)
+    assert '"$$"' in update_code
+    assert 'GENESIS_BOOTSTRAP_ALLOW_LIVE=1 "$GENESIS_ROOT/scripts/bootstrap.sh"' in update_code
+
+    root, _, rollback = _recovery_repo(tmp_path)
+    local = root / "untouched.txt"
+    local.write_text("operator edit\n")
+    if staged:
+        _recovery_git(root, "add", "--", "untouched.txt")
+    deploy = (
+        _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
+        if case == "live-pid"
+        else ""
+    )
+    proc, state_path = _recover(
+        tmp_path,
+        root,
+        phase=phase,
+        original_branch=original_branch,
+        own_head=rollback if case in {"S9", "S12"} else "",
+        deploy_head=deploy,
+        pid=os.getpid() if case == "live-pid" else 2_147_483_647,
+    )
+
+    if case == "live-pid":
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "still running" in proc.stdout
+        assert state_path.exists()
+        assert _recovery_git(root, "rev-parse", "HEAD") == deploy
+        return
+    if phase == "merging":
+        # Refuse a dirty checkout at the rollback tag after an interrupted merge.
+        _assert_recovery_refused(proc, state_path)
+        assert "tracked files changed during the merge" in proc.stdout + proc.stderr
+        assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+        assert local.read_text() == "operator edit\n"
+        return
+    _assert_recovered(proc, state_path, root, rollback)
+    assert (
+        "may be an interrupted merge's files or someone's edits; nothing was reset" in proc.stdout
+    )
+    assert local.read_text() == "operator edit\n"
+
+
+@pytest.mark.parametrize("phase", ["merging", "bootstrap"])
+def test_a_merge_killed_writing_only_an_ephemeral_path_is_refused(tmp_path, phase):
+    """A fast-forward killed while writing AGENTS.md leaves HEAD at the tag with only
+    that file changed. The deployability predicate skips the ephemeral allowlist, so
+    the merging-phase check reads every tracked path instead: it refuses and keeps
+    the state. In a later phase the merge had finished, so the same edit is an
+    indexer's and recovery proceeds without touching it."""
+    root, _, _ = _recovery_repo(tmp_path)
+    rollback = _recovery_commit_file(root, "AGENTS.md", "index v1\n", "generated index")
+    _recovery_git(root, "tag", "-f", "rollback", rollback)
+    (root / "AGENTS.md").write_text("index v2, half writ")
+    proc, state_path = _recover(tmp_path, root, phase=phase, own_head="")
+    if phase == "merging":
+        _assert_recovery_refused(proc, state_path)
+        assert "tracked files changed during the merge" in proc.stdout + proc.stderr
+        assert "AGENTS.md" in proc.stdout + proc.stderr
+    else:
+        _assert_recovered(proc, state_path, root, rollback)
+    assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+    assert (root / "AGENTS.md").read_text() == "index v2, half writ"
+
+
+@pytest.mark.parametrize("phase", ["migrations", "health_check"])
+def test_a_late_phase_crash_at_the_tag_is_refused(tmp_path, phase):
+    """A no-delta update still runs activation when tier-2 work is pending, so it
+    reaches migrations and health_check with HEAD equal to the rollback tag.
+    Dying there is no more recoverable than with a merge behind it: the phase
+    refusal comes before the "already at the tag" branch, so the state is kept
+    instead of being cleared as a completed recovery."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    proc, state_path = _recover(tmp_path, root, phase=phase, own_head="")
+    _assert_recovery_refused(proc, state_path)
+    assert "database migrations may have run" in proc.stdout + proc.stderr
+    assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+@pytest.mark.parametrize("flag", ["--skip-worktree", "--assume-unchanged"])
+def test_a_merge_killed_writing_a_flagged_path_is_refused(tmp_path, flag):
+    """git status does not show a changed file whose index entry is flagged
+    skip-worktree or assume-unchanged, so the merging-phase check also runs the
+    lib's hidden-edit scan: a fast-forward killed while writing such a file is
+    refused, not recovered over."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    _recovery_git(root, "update-index", flag, "changed.txt")
+    (root / "changed.txt").write_text("half-written by the merge\n")
+    assert _recovery_git(root, "status", "--porcelain") == ""  # really hidden
+    proc, state_path = _recover(tmp_path, root, phase="merging", own_head="")
+    _assert_recovery_refused(proc, state_path)
+    assert "tracked files changed during the merge" in proc.stdout + proc.stderr
+    assert "changed.txt" in proc.stdout + proc.stderr
+    assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+@pytest.mark.parametrize("phase", ["activation", "", "MIGRATIONS", "health-check"])
+def test_an_unknown_phase_is_refused(tmp_path, phase):
+    """update.sh writes only fetching, merging, bootstrap, migrations,
+    health_check and done. Anything else (a hand edit, a newer or older
+    update.sh) says nothing recovery can rely on, so it refuses instead of
+    clearing the state as recovered."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    proc, state_path = _recover(tmp_path, root, phase=phase, own_head="")
+    _assert_recovery_refused(proc, state_path)
+    assert "unknown update phase" in proc.stdout + proc.stderr
+    assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+def test_a_crash_in_the_bootstrap_phase_leaves_the_merged_code(tmp_path):
+    """bootstrap.sh seeds the schema (create_all_tables) during the bootstrap
+    phase, so the database may already match the merged code. Rolling the code
+    back would put old code on that schema: refuse and leave both in place."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
+    proc, state_path = _recover(
+        tmp_path, root, phase="bootstrap", own_head=deploy, deploy_head=deploy
+    )
+    _assert_recovery_refused(proc, state_path)
+    assert "bootstrap" in proc.stdout + proc.stderr
+    assert _recovery_git(root, "rev-parse", "HEAD") == deploy
+    assert rollback != deploy
+
+
+def test_a_merge_killed_after_writing_only_new_files_is_refused(tmp_path):
+    """A fast-forward killed after writing the files the range ADDS, before any
+    tracked file, the index or the ref, leaves HEAD at the tag and only untracked
+    files: git status shows nothing. update.sh's pre-stop scan refuses an update
+    whose range lands on an existing untracked path, so one found at recovery
+    appeared during the run, and the merging-phase check refuses."""
+    root, common, rollback = _recovery_repo(tmp_path)
+    _recovery_git(root, "checkout", "-qb", "incoming", rollback)
+    deploy = _recovery_commit_file(root, "migrations/0099_new.py", "NEW = 1\n", "add migration")
+    _recovery_git(root, "checkout", "-q", "main")
+    (root / "migrations").mkdir()
+    (root / "migrations" / "0099_new.py").write_text("NEW = 1\n")
+    assert _recovery_git(root, "status", "--porcelain", "--untracked-files=no") == ""
+    proc, state_path = _recover(
+        tmp_path, root, phase="merging", own_head="", deploy_head=deploy
+    )
+    _assert_recovery_refused(proc, state_path)
+    assert "migrations/0099_new.py" in proc.stdout + proc.stderr
+    assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+def _merge_in_progress(tmp_path: Path) -> tuple[Path, str, str]:
+    root, common, rollback = _recovery_repo(tmp_path)
+    _recovery_git(root, "checkout", "-qb", "incoming", common)
+    deploy = _recovery_commit_file(root, "local.txt", "incoming\n", "incoming")
+    _recovery_git(root, "checkout", "-q", "main")
+    merge = subprocess.run(
+        ["git", "-C", str(root), "merge", "--no-ff", "--no-edit", "incoming"],
+        capture_output=True,
+        env=_recovery_env(),
+        timeout=30,
+    )
+    assert merge.returncode != 0, "the fixture needs a conflicted merge"
+    (root / "local.txt").write_text("OPERATOR RESOLUTION\n")
+    _recovery_git(root, "add", "--", "local.txt")
+    return root, rollback, deploy
+
+
+@pytest.mark.parametrize("phase", ["migrations", "health_check"])
+def test_a_crash_after_migrations_may_have_run_leaves_code_and_database(tmp_path, phase):
+    """The state cannot say whether migrations ran or which snapshot matches, so
+    rolling the code back here could put old code on a migrated schema. Recovery
+    refuses and leaves the merged code, the database and the state file."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
+    db = root / "data" / "genesis.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    db.write_text("migrated schema\n")
+    (root / "data" / "genesis.db.pre-update").write_text("old schema\n")
+    proc, state_path = _recover(tmp_path, root, phase=phase, own_head=deploy, deploy_head=deploy)
+    _assert_recovery_refused(proc, state_path)
+    assert "after its database migrations may have run" in proc.stdout + proc.stderr
+    assert _recovery_git(root, "rev-parse", "HEAD") == deploy
+    assert db.read_text() == "migrated schema\n"
+
+
+def test_a_checkout_at_the_deploy_head_is_not_taken_as_ours_without_the_record(tmp_path):
+    """Ownership is the exact head update.sh recorded. A checkout that merely sits
+    at the fetched DEPLOY_HEAD (another session's pull of the same commit) while
+    the record still names the pre-update commit is left alone."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "someone's pull")
+    proc, state_path = _recover(tmp_path, root, own_head=rollback, deploy_head=deploy)
+    _assert_recovery_refused(proc, state_path)
+    assert "not at the merge this update recorded as its own" in proc.stdout + proc.stderr
+    assert _recovery_git(root, "rev-parse", "HEAD") == deploy
+
+
+def test_update_records_its_own_head_the_moment_it_adopts_the_merge():
+    """Bootstrap's recovery trusts only the recorded own_head, so update.sh must
+    write the state right after adopting the merge result, not at the next phase."""
+    code = _code(UPDATE)
+    adopt = code.index('UPDATE_OWN_HEAD="$_merged_head"')
+    record = code.index('_write_state "merging"', adopt)
+    between = code[adopt:record]
+    assert "\nfi" not in between, "the state write must sit inside the adoption branch"
+    assert code.count('_write_state "merging"') == 2

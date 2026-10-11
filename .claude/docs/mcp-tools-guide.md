@@ -314,3 +314,14 @@ session is refused both, so it parks the question and leaves it. Background
 sessions attach blocks when they raise (`blocks=`); `open_question_block` as a
 whole is withheld from them, because the same tool also removes blocks. The store is
 LOCAL ONLY; nothing here reaches GitHub.
+
+**Reading the work board.** `board_status` answers "what is on the board and is
+the reconciler alive?" from the reconciler's stored heartbeats. It never calls
+GitHub, so it is cheap to ask often. Its `latest` block is the newest pulse
+(mode, paused, any error); `summary` is the newest SUCCESSFUL read: counts by
+column, Genesis status and kind, coverage against the repo's open total, and
+drags logged, all with its age. `board_item("#N")` (or `owner/repo#N`) answers
+"where is this one card and what blocks it?" with a live read: its column on
+the configured project, GitHub's blocked-by list (flagged when truncated),
+unverified open questions blocking it, and whether it was promoted from a
+private record. Both are read-only and open to reflection sessions.
