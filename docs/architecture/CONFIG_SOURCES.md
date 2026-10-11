@@ -194,7 +194,8 @@ names, so an overlay of a read-only file is editable (#2446).
 - **Process env only** (no file layer): paths — `GENESIS_REPO_ROOT`, `SECRETS_PATH`,
   `GENESIS_DB_PATH`, `GENESIS_HOME`, `VENV_PATH`, `CLAUDE_HOME`, `GENESIS_PLANS_DIR`,
   `GENESIS_OUTPUT_DIR`, `GENESIS_CC_PROJECT_ID`; tuning — `GENESIS_DB_BUSY_TIMEOUT_MS`
-  (MCP children default it to 15000), read-pool sizes, `GENESIS_RECALL_RERANK_RPM`.
+  (MCP children default it to 15000), read-pool sizes, `GENESIS_RECALL_RERANK_RPM`,
+  `GENESIS_SQLITE_SLOW_MS` (slow-statement log threshold, default 1000, `0` = off).
   All in `src/genesis/env.py`. They reach a process via the unit, `secrets.env`, or the parent.
 - **`~/.genesis/resource-budget.env`** — optional `KEY=VALUE` file for the resource-budget
   levers (`GENESIS_RB_*`), read by `genesis.hostmetrics`; the process environment wins over
@@ -245,7 +246,12 @@ names, so an overlay of a read-only file is editable (#2446).
    routing reads only `config/model_routing.local.yaml`; outreach may read a whole-file
    `~/.genesis/config/outreach.yaml`. `settings_get` shows the domain-standard merge, which
    for `model_routing` and `outreach` is not necessarily what the runtime loads.
-5. **`GENESIS_HOME` does not move config.** `genesis.yaml`, the overlay user dir, and the
+5. **`GENESIS_HOME` does not move config.** Host `scripts/uninstall.sh` uses the
+   container user's default `HOME/.genesis` unless `--container-genesis-home`
+   explicitly designates an external container coordination namespace. Host
+   `GENESIS_HOME` is not copied across login; the explicit path is assigned after
+   login initialization. Direct container cleanup retains its process environment.
+   `genesis.yaml`, the overlay user dir, and the
    settings writer all use `Path.home()/.genesis/config`.
 6. **The health, memory, outreach and recon MCP children get the whole file.** Their
    `_MCP_VARS` allowlist in `scripts/genesis_mcp_server.py` is superseded by the

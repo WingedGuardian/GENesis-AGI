@@ -439,3 +439,21 @@ def frontend_command(main: Path, settings: Path, unit: str, backend: str, slice_
     bridge = 'exec "$$CBM_CLIENT_PYTHON" -I "$$CBM_CLIENT_HELPER" --config "$$CBM_CLIENT_CONFIG" client --unit "$$CBM_CLIENT_UNIT"'
     command.extend(("--", "/bin/sh", "-c", bridge))
     return command
+
+
+def index_writer_targets_main(argv: list[str], cwd: Path, main: Path) -> bool:
+    """Recognize repository targets of the existing wrapper and native modes."""
+    entrypoint = main / "scripts/lib/code_intel_index.sh"
+    for index, arg in enumerate(argv[:-1]):
+        if Path(arg).name != "code_intel_index.sh":
+            continue
+        candidate = Path(arg) if Path(arg).is_absolute() else cwd / arg
+        if candidate.resolve() == entrypoint and (cwd / argv[index + 1]).resolve() == main:
+            return True
+    # The private OOM launcher contains both wrapper and native argv. Its fixed
+    # flag is not a repository argument; native classification must still run.
+    if "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv):
+        tail = argv[argv.index("analyze") + 1 :]
+        target = cwd / tail[0] if tail and not tail[0].startswith("-") else cwd
+        return target.resolve() == main
+    return False

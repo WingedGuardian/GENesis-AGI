@@ -17,6 +17,7 @@
 #   --dry-run           Show removal plan without making changes
 #   --non-interactive   Skip all confirmation prompts
 #   --container-name N  Container name (default: genesis)
+#   --container-genesis-home PATH  Host cleanup: container lock namespace override
 #
 # IMPORTANT: Run this script on the HOST, not inside the container.
 # If run inside a container, it auto-downgrades to --genesis-only.
@@ -38,6 +39,8 @@ MODE="default"          # default | genesis-only | guardian-only | full
 DRY_RUN=false
 INTERACTIVE=true
 CONTAINER_NAME="genesis"
+CONTAINER_GENESIS_HOME=""
+CONTAINER_GENESIS_HOME_SUPPLIED=false
 MANAGED_UNINSTALL_FDS=()
 
 # ONE inventory of Persistent= timers in the shared cleanup transaction. The
@@ -135,6 +138,23 @@ while [ $# -gt 0 ]; do
         --dry-run)          DRY_RUN=true ;;
         --non-interactive)  INTERACTIVE=false ;;
         --container-name)   shift; CONTAINER_NAME="$1" ;;
+        --container-genesis-home)
+            if [ "$CONTAINER_GENESIS_HOME_SUPPLIED" = true ] || [ "$#" -lt 2 ]; then
+                echo "ERROR: --container-genesis-home requires one unique absolute path" >&2
+                exit 1
+            fi
+            CONTAINER_GENESIS_HOME="$2"
+            case "$CONTAINER_GENESIS_HOME" in
+                /*) ;;
+                *) echo "ERROR: --container-genesis-home requires a nonempty absolute path" >&2; exit 1 ;;
+            esac
+            if [[ "$CONTAINER_GENESIS_HOME" == *$'\r'* || "$CONTAINER_GENESIS_HOME" == *$'\n'* ]]; then
+                echo "ERROR: --container-genesis-home refuses CR/LF" >&2
+                exit 1
+            fi
+            CONTAINER_GENESIS_HOME_SUPPLIED=true
+            shift
+            ;;
         --managed-uninstall-fds)
             [ "$#" -ge 4 ] || { echo "Missing uninstall lock descriptors" >&2; exit 1; }
             MANAGED_UNINSTALL_FDS=("$2" "$3" "$4")
@@ -306,6 +326,14 @@ if [ -f /run/host/container-manager ] || \
         warn "To remove Guardian, run this script on the host."
         MODE="genesis-only"
     fi
+fi
+
+# This argument designates a container namespace, never this process's HOME.
+# Check after detection (including mode downgrade), before monitoring changes.
+if [ "$CONTAINER_GENESIS_HOME_SUPPLIED" = true ] && \
+   { [ "$IN_CONTAINER" = true ] || [ "$MODE" = "guardian-only" ] || [ "$MODE" = "full" ]; }; then
+    echo "ERROR: --container-genesis-home is only valid for host Genesis cleanup" >&2
+    exit 1
 fi
 
 # Enter before any monitoring/state mutation. The helper execs this exact script
@@ -653,8 +681,9 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
 
             # One guarded container transaction. Critical failures propagate;
             # missing/older helpers never fall back to unguarded deletion.
-            incus exec "$CONTAINER_NAME" -- su - "$CONTAINER_USER" -c \
-                'exec /usr/bin/python3 -I "$HOME/genesis/scripts/codebase_managed.py" uninstall -- --genesis-only --non-interactive'
+            incus exec "$CONTAINER_NAME" -- /usr/bin/su --login --shell /bin/bash --command \
+                'export GENESIS_HOME="${1:-$HOME/.genesis}"; exec /usr/bin/python3 -I "$HOME/genesis/scripts/codebase_managed.py" uninstall -- --genesis-only --non-interactive' \
+                -- "$CONTAINER_USER" genesis-uninstall "$CONTAINER_GENESIS_HOME"
             REMOVED+=("Genesis container cleanup")
 
             ok "Genesis removal complete (via incus exec)"

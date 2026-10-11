@@ -118,6 +118,83 @@ def test_retirement_accepts_proved_nonenabled_state(guard, monkeypatch, state, l
             guard.retire_managed()
 
 
+@pytest.mark.parametrize("load", ["not-found", "masked", "error", ""])
+def test_disabled_backend_requires_loaded_definition(guard, monkeypatch, load, supported_retirement):
+    g = guard.retire_managed.__globals__
+    monkeypatch.setattr(g["subprocess"], "run", lambda *a, **kw: SimpleNamespace(returncode=0, stderr=""))
+    monkeypatch.setitem(g, "require_quiescent", lambda unit: None)
+    monkeypatch.setitem(g, "show", lambda *a: {"UnitFileState": "disabled", "LoadState": load})
+    with pytest.raises(ValueError, match="retirement failed"):
+        guard.retire_managed()
+
+
+@pytest.mark.parametrize("root_name", ["genesis", ".genesis", "data", ".qdrant"])
+@pytest.mark.parametrize("key", ["binary", "cache", "runtime"])
+@pytest.mark.parametrize("layout", ["real", "external-link", "internal-link", "dangling-link"])
+def test_retention_matches_addressed_removal(guard, transaction, monkeypatch, capsys, root_name, key, layout):
+    home = transaction
+    roots = [home / name for name in ("genesis", ".genesis", "data", ".qdrant")]
+    root = home / root_name
+    root.mkdir(exist_ok=True)
+    if layout != "real":
+        shutil.rmtree(root)
+        target = home / ("data" if root_name != "data" else "genesis") if layout == "internal-link" else home / "outside"
+        if layout != "dangling-link":
+            target.mkdir(exist_ok=True)
+        root.symlink_to(target, target_is_directory=True)
+    candidate = root / "artifact"
+    if layout != "dangling-link":
+        candidate.write_text("owned evidence")
+    resolved = candidate.resolve()
+    config = {name: str(home / "unrelated" / name) for name in ("binary", "cache", "runtime")}
+    config[key] = str(candidate)
+    monkeypatch.setitem(guard.report_retained_state.__globals__, "read_settings", lambda *a, **kw: config)
+    guard.report_retained_state()
+    reported = f"Preserved configured {key}: {resolved}" in capsys.readouterr().out
+    # Execute addressed removals as the oracle, rather than repeating the classifier.
+    for addressed in roots:
+        if addressed.name == ".genesis" and addressed.is_dir() and not addressed.is_symlink():
+            for child in addressed.iterdir():
+                if child.name != "locks":
+                    subprocess.run(["/usr/bin/rm", "-rf", "--", str(child)], check=True)
+        else:
+            subprocess.run(["/usr/bin/rm", "-rf", "--", str(addressed)], check=True)
+    assert reported == (resolved.exists() or layout == "dangling-link")
+
+
+@pytest.mark.parametrize("layout", ["locks", "data-to-locks", "locks-to-data", "locks-to-cache", "nested-alias", "home-alias"])
+def test_retention_alias_and_lock_actions(guard, transaction, monkeypatch, capsys, layout):
+    home = transaction
+    locks = home / ".genesis/locks"
+    locks.mkdir(parents=True)
+    data = home / "data"
+    data.mkdir()
+    candidate = locks / "artifact"
+    retained = layout in ("locks", "data-to-locks")
+    if layout == "data-to-locks":
+        data.rmdir()
+        data.symlink_to(locks, target_is_directory=True)
+        candidate = data / "artifact"
+    elif layout in ("locks-to-data", "locks-to-cache"):
+        target = data if layout == "locks-to-data" else home / ".genesis/cache"
+        target.mkdir(exist_ok=True)
+        locks.rmdir()
+        locks.symlink_to(target, target_is_directory=True)
+    elif layout == "nested-alias":
+        (home / "outside-alias").symlink_to(data, target_is_directory=True)
+        candidate = home / "outside-alias/artifact"
+    elif layout == "home-alias":
+        alias = home.parent / "home-alias"
+        alias.symlink_to(home, target_is_directory=True)
+        monkeypatch.setenv("HOME", str(alias))
+        candidate = alias / "data/artifact"
+    candidate.write_text("owned evidence")
+    resolved = candidate.resolve()
+    monkeypatch.setitem(guard.report_retained_state.__globals__, "read_settings", lambda *a, **kw: dict.fromkeys(("binary", "cache", "runtime"), str(candidate)))
+    guard.report_retained_state()
+    assert (f"Preserved configured cache: {resolved}" in capsys.readouterr().out) == retained
+
+
 @pytest.mark.parametrize("key", ["binary", "cache", "runtime"])
 def test_retained_diagnostics_tolerate_each_symlink_loop(guard, tmp_path, monkeypatch, capsys, key):
     loop = tmp_path / "loop"
@@ -307,6 +384,9 @@ def owned_install(tmp_path):
 import os,sys
 from pathlib import Path
 args=sys.argv[1:]
+actions={"list-units","show","stop","disable","is-active","is-enabled","clean","daemon-reload"}
+action=args[1:] if args[:1]==["--user"] else args
+if not action or action[0] not in actions:sys.exit("unadmitted systemctl action")
 with Path(os.environ["CALLS"]).open("a") as out:out.write(" ".join(args)+"\\n")
 if "list-units" in args:
  if os.environ.get("MANAGER_FAIL"):sys.exit(1)
@@ -334,14 +414,22 @@ else:
  sys.exit("unexpected typed native operation in absent-unit fixture")
 """)
     busctl.chmod(0o755)
-    for name in ("sleep", "sudo", "ss", "systemd-detect-virt"):
+    shutil.copy2(Path(__file__).with_name("uninstall_fixture_commands.py"), tools / "fixture_commands.py")
+    for name in ("crontab", "sudo", "find", "mv", "mktemp", "incus"):
+        path = tools / name
+        path.write_text(f'#!/bin/sh\nexec /usr/bin/python3 "$(dirname "$0")/fixture_commands.py" {name} "$@"\n')
+        path.chmod(0o755)
+    cron = home / "fixture.cron"
+    cron.write_text("0 0 * * * backup.sh\n0 1 * * * inbox_sync.sh\n0 2 * * * unrelated-job\n")
+    for name in ("sleep", "ss", "systemd-detect-virt"):
         path = tools / name
         path.write_text("#!/bin/sh\nexit 0\n")
         path.chmod(0o755)
     remover = tools / "rm"
     remover.write_text("""#!/usr/bin/python3
-import fcntl,os,sys
+import fcntl,os,sys,runpy
 from pathlib import Path
+runpy.run_path(str(Path(__file__).with_name("fixture_commands.py")))["validate_rm"](sys.argv[1:])
 parent=Path("/proc")/str(os.getppid())
 args=(parent/"cmdline").read_bytes().split(b"\\0")
 index=args.index(b"--managed-uninstall-fds")
@@ -369,8 +457,16 @@ os.execv("/usr/bin/rm",["rm",*sys.argv[1:]])
         .read_text()
         .replace('"/usr/bin/systemctl"', json.dumps(str(systemctl)))
     )
+    proc = home / "test-proc"
+    proc.mkdir()
+    observer = 'def observed_index_writers(proc: Path = Path("/proc"))'
+    assert helper.count(observer) == 1
+    helper = helper.replace(observer, f"def observed_index_writers(proc: Path = Path({str(proc)!r}))")
     (scripts / "codebase_managed.py").write_text(helper)
-    shutil.copy2(ROOT / "scripts/uninstall.sh", scripts / "uninstall.sh")
+    # Even existence probes must use the fixture's system-binary location. A
+    # live Qdrant binary otherwise changes this fixture's result (or gets deleted).
+    (scripts / "uninstall.sh").write_text((ROOT / "scripts/uninstall.sh").read_text().replace(
+        "/usr/local/bin/qdrant", str(home / "system-bin/qdrant")))
     for name in ("code_intel_cbm_worker.py", "code_intel_cbm_admission.py", "codebase_managed_unit.py"):
         content = (ROOT / "scripts/lib" / name).read_text()
         (scripts / "lib" / name).write_text(content.replace('"/usr/bin/busctl"', json.dumps(str(busctl))))
@@ -384,10 +480,12 @@ os.execv("/usr/bin/rm",["rm",*sys.argv[1:]])
         (home / name).mkdir(parents=True)
     (home / ".bashrc").write_text("# preserved\n")
     env = dict(
-        os.environ,
+        LANG="C.UTF-8",
         HOME=str(home),
         PATH=f"{tools}:/usr/bin:/bin",
         CALLS=str(calls),
+        FIXTURE_ROOT=str(tmp_path),
+        FIXTURE_CRON=str(cron),
         XDG_RUNTIME_DIR=str(home / "runtime"),
         GENESIS_ROOT_WATCHDOG_PREFIX=str(home / "root"),
     )
@@ -401,6 +499,79 @@ os.execv("/usr/bin/rm",["rm",*sys.argv[1:]])
     ):
         env.pop(key, None)
     return home, scripts, env
+
+
+@pytest.mark.parametrize("escape", ["absolute", "relative", "parent-alias", "dotdot", "option", "trailing-link"])
+def test_fixture_rejects_entire_rm_batch_before_deletion(owned_install, escape):
+    home, _, env = owned_install
+    kept = home / "kept"
+    kept.write_text("owned")
+    root = Path(env["FIXTURE_ROOT"])
+    outside = root.parent / (root.name + "-" + escape + "-outside")
+    outside.mkdir()
+    foreign = outside / "foreign"
+    foreign.write_text("foreign")
+    alias = home / "alias"
+    alias.symlink_to(outside, target_is_directory=True)
+    operand = {"absolute": str(foreign), "relative": os.path.relpath(foreign, home),
+               "parent-alias": str(alias / "foreign"), "dotdot": str(alias / ".." / "foreign"),
+               "option": "--preserve-root=no", "trailing-link": str(alias) + "/"}[escape]
+    result = subprocess.run([str(home / "tools/rm"), "-rf", str(kept), operand], cwd=home,
+                            env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0
+    assert kept.read_text() == "owned" and foreign.read_text() == "foreign"
+    assert not (home / "calls").exists(), "batch must fail before lock/deletion phase"
+
+
+@pytest.mark.parametrize("command,arguments", [("sudo", ["sh", "-c", "true"]),
+    ("incus", ["delete", "unowned"]), ("crontab", ["-r"]), ("find", ["/", "-delete"]),
+    ("systemctl", ["set-property", "unowned.service", "MemoryMax=1"]),
+    ("mv", ["/etc/passwd", "/dev/null"]), ("mktemp", ["-p", "/tmp", "unsafe.XXXXXXXX"])])
+def test_fixture_refuses_unknown_shared_mutations(owned_install, command, arguments):
+    home, _, env = owned_install
+    cron = Path(env["FIXTURE_CRON"]).read_bytes()
+    result = subprocess.run([str(home / "tools" / command), *arguments], env=env,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0 and "unadmitted" in result.stderr
+    assert Path(env["FIXTURE_CRON"]).read_bytes() == cron
+
+
+@pytest.mark.parametrize("command", ["mktemp", "mv"])
+def test_fixture_refuses_final_directory_aliases(owned_install, command):
+    home, _, env = owned_install
+    root = Path(env["FIXTURE_ROOT"])
+    outside = root.parent / (root.name + "-" + command + "-outside")
+    outside.mkdir()
+    if command == "mktemp":
+        alias = home / "alias"
+        alias.symlink_to(outside, target_is_directory=True)
+        env["HOME"] = str(alias)
+        args = ["-p", str(alias), ".genesis-uninstall.XXXXXXXX"]
+    else:
+        (home / ".bashrc").unlink()
+        (home / ".bashrc").symlink_to(outside, target_is_directory=True)
+        (home / ".bashrc.tmp").write_text("owned")
+        args = [str(home / ".bashrc.tmp"), str(home / ".bashrc")]
+    result = subprocess.run([str(home / "tools" / command), *args], env=env,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0
+    assert list(outside.iterdir()) == []
+    if command == "mv":
+        assert (home / ".bashrc.tmp").read_text() == "owned"
+
+
+def test_owned_process_observation_refuses_actual_cleanup(owned_install):
+    home, scripts, env = owned_install
+    process = home / "test-proc/123"
+    process.mkdir()
+    (process / "cmdline").write_bytes(b"node\0/opt/gitnexus/dist/cli/index.js\0analyze\0")
+    (process / "stat").write_text("123 (worker) " + " ".join(["S"] + ["0"] * 18 + ["10"]))
+    (process / "cwd").symlink_to(home / "genesis", target_is_directory=True)
+    result = subprocess.run(["/bin/bash", str(scripts / "uninstall.sh"), "--genesis-only", "--non-interactive"], env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0
+    assert "writer" in result.stderr
+    assert (home / "genesis").is_dir() and (home / "data").is_dir()
+    assert not (home / "calls").exists()  # observation precedes any systemctl call
 
 
 @pytest.mark.parametrize("settings", ["missing", "malformed", "schema1", "stale"])
@@ -450,6 +621,7 @@ def test_actual_direct_cleanup_does_not_depend_on_settings(owned_install, settin
                    (home / ".config/systemd/user", home / "runtime/systemd/user"))
         return
     assert result.returncode == 0, result.stdout + result.stderr
+    assert Path(env["FIXTURE_CRON"]).read_text() == "0 2 * * * unrelated-job\n"
     for name in ("genesis", "data", ".qdrant"):
         assert not (home / name).exists()
     assert [entry.name for entry in (home / ".genesis").iterdir()] == ["locks"]
@@ -504,6 +676,8 @@ def test_dry_run_does_not_enter_guard(owned_install):
     assert "disable genesis-cbm" not in (home / "calls").read_text()
     assert [(path.lstat().st_ino, path.read_bytes()) for path in artifacts] == identities
     assert "LOCKS_HELD rm" not in (home / "calls").read_text()
+    assert Path(env["FIXTURE_CRON"]).read_text().count("\n") == 3
+    assert "CRON_STDIN" not in (home / "calls").read_text()
 
 
 def test_marker_without_real_fds_refuses_actual_script(owned_install):
@@ -530,7 +704,7 @@ def test_marker_without_real_fds_refuses_actual_script(owned_install):
 def test_actual_host_delegation_propagates_container_failure(owned_install, tmp_path):
     home, scripts, env = owned_install
     source = (scripts / "uninstall.sh").read_text()
-    start = source.index('            incus exec "$CONTAINER_NAME" -- su - "$CONTAINER_USER" -c')
+    start = source.index('            incus exec "$CONTAINER_NAME" -- /usr/bin/su --login')
     end = source.index("            REMOVED+=", start)
     incus = home / "tools/incus"
     incus.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$CALLS"\nexit 7\n')
@@ -540,7 +714,7 @@ def test_actual_host_delegation_propagates_container_failure(owned_install, tmp_
             "/bin/bash",
             "-e",
             "-c",
-            "CONTAINER_NAME=genesis; CONTAINER_USER=ubuntu;\n"
+            "CONTAINER_NAME=genesis; CONTAINER_USER=ubuntu; CONTAINER_GENESIS_HOME='';\n"
             + source[start:end]
             + "\necho WRONG_SUCCESS",
         ],
@@ -568,6 +742,8 @@ def test_manager_or_loaded_stop_failure_aborts_actual_cleanup(owned_install, fai
     assert result.returncode != 0 and "refused" in result.stderr
     assert (home / "genesis").is_dir() and (home / ".genesis").is_dir()
     assert "LOCKS_HELD rm" not in (home / "calls").read_text()
+    assert Path(env["FIXTURE_CRON"]).read_text().count("\n") == 3
+    assert "CRON_STDIN" not in (home / "calls").read_text()
 
 
 def test_inactive_scope_without_service_pid_allows_actual_cleanup(owned_install):
@@ -603,18 +779,26 @@ def test_actual_confirmation_cancel_preserves_roots_and_reports_retirement(owned
     assert "LOCKS_HELD rm" not in calls
 
 
-def test_host_delegation_executes_the_same_actual_transaction(owned_install):
+@pytest.mark.parametrize("namespace", ["default", "external", "literal"])
+def test_host_delegation_executes_the_same_actual_transaction(owned_install, namespace):
     home, scripts, env = owned_install
     source = (scripts / "uninstall.sh").read_text()
-    start = source.index('            incus exec "$CONTAINER_NAME" -- su - "$CONTAINER_USER" -c')
+    start = source.index('            incus exec "$CONTAINER_NAME" -- /usr/bin/su --login')
     end = source.index("            REMOVED+=", start)
     incus = home / "tools/incus"
     incus.write_text("""#!/usr/bin/python3
-import subprocess,sys
-assert sys.argv[1:8]==["exec","genesis","--","su","-","ubuntu","-c"]
-sys.exit(subprocess.run(["/bin/bash","-c",sys.argv[8]]).returncode)
+import os,subprocess,sys
+assert sys.argv[1:9]==["exec","genesis","--","/usr/bin/su","--login","--shell","/bin/bash","--command"]
+assert sys.argv[10:13]==["--","ubuntu","genesis-uninstall"]
+# Adapter exercises a reset plus positional Bash; actual su/PAM is qualified in Incus E2E.
+env=dict(os.environ,GENESIS_HOME="/conflicting/login/value")
+sys.exit(subprocess.run(["/bin/bash","-c",sys.argv[9],*sys.argv[12:]],env=env).returncode)
 """)
     incus.chmod(0o755)
+    selected = "" if namespace == "default" else str(home.parent / (
+        "external" if namespace == "external" else "literal '$;`touch SENTINEL` %λ space"))
+    env["CONTAINER_GENESIS_HOME"] = selected
+    env["GENESIS_HOME"] = "/conflicting/host/value"
     result = subprocess.run(
         [
             "/bin/bash",
@@ -630,8 +814,44 @@ sys.exit(subprocess.run(["/bin/bash","-c",sys.argv[8]]).returncode)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Genesis removal complete (direct)" in result.stdout
     assert not (home / "genesis").exists()
-    assert [entry.name for entry in (home / ".genesis").iterdir()] == ["locks"]
+    assert [entry.name for entry in (home / ".genesis").iterdir()] == (["locks"] if not selected else [])
     assert "LOCKS_HELD rm -rf" in (home / "calls").read_text()
+    assert not (Path.cwd() / "SENTINEL").exists() and not (home / "SENTINEL").exists()
+    if selected:
+        assert (Path(selected) / "locks/code-intel-runner.lock").is_file()
+        assert not (home / ".genesis/locks").exists()
+
+
+@pytest.mark.parametrize("arguments", [["--container-genesis-home"],
+    ["--container-genesis-home", ""], ["--container-genesis-home", "relative"],
+    ["--container-genesis-home", "/one\ntwo"], ["--container-genesis-home", "/one\rtwo"],
+    ["--container-genesis-home", "/one", "--container-genesis-home", "/two"],
+    ["--container-genesis-home", "/one", "--guardian-only"],
+    ["--container-genesis-home", "/one", "--full"]])
+@pytest.mark.parametrize("location", ["host", "container"])
+def test_container_namespace_argument_refuses_before_mutation(owned_install, arguments, location):
+    home, scripts, env = owned_install
+    source = (scripts / "uninstall.sh").read_text()
+    if location == "host":
+        begin = source.index("if [ -f /run/host/container-manager ]")
+        end = source.index("    IN_CONTAINER=true", begin)
+        source = source[:begin] + "if false; then\n" + source[end:]
+    path = home / "argument-uninstall.sh"
+    path.write_text(source)
+    result = subprocess.run(["/bin/bash", str(path), *arguments, "--non-interactive"],
+                            env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0 and "--container-genesis-home" in result.stderr
+    assert (home / "genesis").is_dir() and not (home / "calls").exists()
+
+
+def test_direct_namespace_argument_refuses_after_auto_downgrade(owned_install):
+    home, scripts, env = owned_install
+    result = subprocess.run(["/bin/bash", str(scripts / "uninstall.sh"), "--container-genesis-home",
+                            str(home.parent / "external"), "--non-interactive"],
+                            env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0 and "only valid for host" in result.stderr
+    assert "downgrading" in result.stdout
+    assert not (home / "calls").exists()
 
 
 @pytest.mark.parametrize("mode", ["guardian-only", "full"])
@@ -700,9 +920,6 @@ def test_actual_cleanup_removes_both_qdrant_locations(owned_install, kind):
             path.write_text("fixture binary")
     script = scripts / "uninstall.sh"
     script.write_text(script.read_text().replace("/usr/local/bin/qdrant", str(system)))
-    sudo = home / "tools/sudo"
-    sudo.write_text('#!/bin/sh\nexec "$@"\n')
-    sudo.chmod(0o755)
     result = subprocess.run(["/bin/bash", str(script), "--genesis-only", "--non-interactive"], env=env, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stdout + result.stderr
     assert not system.exists() and not system.is_symlink()

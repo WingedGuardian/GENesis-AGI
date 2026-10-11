@@ -306,6 +306,15 @@ removal of the repository, runtime contents, database and Qdrant roots. Existing
 queue and provider contents elsewhere within the fixed deletion roots are removed. This prevents a
 stalled entrypoint from recreating a different lock inode during teardown.
 Plain default locks and nonoverlapping external `GENESIS_HOME` are supported.
+Direct container cleanup uses its process's `GENESIS_HOME`. Host cleanup defaults
+to the container user's `HOME/.genesis`, independently of the host's environment.
+For an external namespace, pass `--container-genesis-home /absolute/container/path`
+to `scripts/uninstall.sh` on the host. It must match the namespace used by every
+cooperating container runner, freeze and manual index entrypoint. The override
+travels as literal arguments and is assigned after login initialization. Duplicate,
+missing, empty, relative and CR/LF-containing values refuse before monitoring
+changes. The option is invalid inside the container, with `--guardian-only`, or
+with `--full`; it does not change direct cleanup or full-container deletion.
 Custom lock layouts intersecting the four deletion roots, or default namespace
 symlinks that cleanup would unlink, refuse before retirement. No lock relocation
 is performed. The lifecycle lock's systemd-directory namespace must also remain
@@ -325,6 +334,10 @@ Only the fixed CBM service/slice fragments and their known persistent/runtime
 enablement locations are removed. Symlinks are unlinked without deleting foreign
 targets; unrelated slices survive. Valid settings can report external retained
 binary/cache/runtime paths, but cannot expand the documented deletion roots.
+Retirement requires the backend to be loaded and disabled, or exactly absent;
+masked, generated, transient and static backend definitions refuse cleanup.
+Retention diagnostics distinguish recursive removal of real roots from unlinking
+a final root symlink, and account for the exact retained runtime `locks` child.
 Unclassifiable diagnostic paths are reported and do not alter deletion authority.
 Both Qdrant binary locations and dangling known unit links are handled; foreign
 symlink targets remain untouched. Failed runtime inventory aborts before deleting

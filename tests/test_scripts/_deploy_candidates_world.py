@@ -274,7 +274,7 @@ class World:
 
     def write_manifest(self, candidates: list[dict], **extra) -> None:
         common = os.path.realpath(self.root / ".git")
-        data = {"version": 2, "repo": common, "candidates": candidates}
+        data = {"version": 3, "repo": common, "candidates": candidates}
         data.update(extra)
         self.manifest_path.write_text(json.dumps(data))
 
@@ -286,6 +286,7 @@ class World:
             "owner_session": "s1",
             "added_at": "2026-10-01T00:00:00Z",
             "verified_head": head,
+            "hook_approval": None,
         }
         e.update(kw)
         return e
