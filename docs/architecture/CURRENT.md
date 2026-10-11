@@ -1464,8 +1464,10 @@ verified: 811a27f13669 2026-10-11
   Native enable/disable/remove share the fixed exclusive lifecycle lock. Enable
   validates installed immutable state, typed backend commands/caps and loaded
   client slice limits; it requires initial quiescence, enables without starting,
-  revalidates after reload, then starts and proves readiness. Failed startup
-  attempts the same canonical-source retirement as disable/remove: inspect both
+  revalidates after reload, then starts and proves readiness.
+  Source authority rejects configuration and implicit dependency namespaces at
+  full-name, dash-prefix and unit-type scopes across native lookup paths.
+  Failed startup attempts the same canonical-source retirement as disable/remove: inspect both
   fixed sources before a validated reload and refuse unsupported definitions.
   Supported canonical retirement remains usable without valid settings or the
   selected interpreter, proves actual quiescence and preserves immutable state.

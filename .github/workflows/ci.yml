@@ -1172,8 +1172,10 @@ jobs:
         # Edited-file collection against runtime parent dfdb00194: 750 -> 935
         # (+185): guarded uninstall183 + inert-observation negative controls2.
         # Reconciled runtime parent floor25297+183+2=25482; no new skip allowance.
-        # Native CBM lifecycle: lifecycle152 + authority295 + four uninstall
-        # controls. Four edited suites against ecadc1ae collect259 ->710 (+451).
-        # Parent25482 +451 =25933; retain skip ceiling102 and compare hosted
+        # Native CBM lifecycle: lifecycle152 + authority907 + four uninstall
+        # controls. Authority includes dependency scopes across all16 lookup
+        # positions and preserved namespace-object controls. Four edited suites
+        # against ecadc1ae collect259 ->1322 (+1063).
+        # Parent25482 +1063 =26545; retain skip ceiling102 and compare hosted
         # skip identities against the actual landing base before merge.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25933
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 26545

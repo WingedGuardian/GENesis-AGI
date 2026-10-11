@@ -21,7 +21,10 @@ python3 -I scripts/codebase_managed.py remove
 `enable` uses the fixed installed settings path and validates the pin/cache/sentinel.
 Before native mutation it requires exact current rendered service and slice sources
 in the supported installed namespaces, with no competing fragments or override
-namespaces anywhere in the manager's lookup paths. Extra directives, comments,
+namespaces anywhere in the manager's lookup paths. This includes `.d`, `.wants`,
+`.requires` and `.upholds` at the full-name, dash-prefix and unit-type scopes;
+even empty directories or dangling namespace links are unsupported and retained.
+Extra directives, comments,
 whitespace changes, masks, generated/transient sources and final fragment symlinks
 refuse; selected directory aliases and literal installation paths remain supported.
 It explicitly refreshes accepted sources, verifies their loaded identities, commands

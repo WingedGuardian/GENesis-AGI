@@ -62,9 +62,15 @@ def test_any_extra_native_authority_refuses_before_mutation(operator, authority,
     assert path.read_bytes() == before + directive.encode() + b"\n"
 
 
-SCOPES = ["genesis-cbm-query.service.d", "genesis-cbm-.service.d", "genesis-.service.d",
-          "service.d", "genesis-cbm-query-clients.slice.d", "genesis-cbm-query-.slice.d",
-          "genesis-cbm-.slice.d", "genesis-.slice.d", "slice.d"]
+SCOPES = [
+    name + suffix
+    for name in (
+        "genesis-cbm-query.service", "genesis-cbm-.service", "genesis-.service",
+        "service", "genesis-cbm-query-clients.slice", "genesis-cbm-query-.slice",
+        "genesis-cbm-.slice", "genesis-.slice", "slice",
+    )
+    for suffix in (".d", ".wants", ".requires", ".upholds")
+]
 
 
 @pytest.mark.parametrize("position", range(16))
@@ -74,6 +80,33 @@ def test_every_lookup_position_and_override_scope_refuses(operator, authority, p
     path.mkdir(parents=True)
     with pytest.raises(ValueError, match="override namespace"):
         operator.inspect_sources()
+
+
+@pytest.mark.parametrize("scope", SCOPES)
+@pytest.mark.parametrize("kind", ["directory-link", "dangling", "mask", "file", "loop"])
+def test_override_namespace_objects_refuse_without_mutation(operator, authority, tmp_path, scope, kind):
+    path = authority.roots[0] / scope
+    target = tmp_path / "foreign-namespace"
+    if kind == "file":
+        path.write_text("preserved")
+    elif kind == "mask":
+        path.symlink_to("/dev/null")
+    elif kind == "loop":
+        path.symlink_to(path.name)
+    else:
+        if kind == "directory-link":
+            target.mkdir()
+            (target / "foreign.service").write_text("preserved")
+        path.symlink_to(target, target_is_directory=True)
+    before = path.lstat()
+    with pytest.raises(ValueError, match="override namespace"):
+        operator.inspect_sources()
+    after = path.lstat()
+    assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+    if kind == "directory-link":
+        assert (target / "foreign.service").read_text() == "preserved"
+    elif kind == "file":
+        assert path.read_text() == "preserved"
 
 
 @pytest.mark.parametrize("position", [0, 1, *range(3, 16)])
