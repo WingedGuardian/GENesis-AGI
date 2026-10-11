@@ -1184,26 +1184,39 @@ def test_61_a_qualified_or_us_spelled_acknowledgement_counts(rebuild, heading):
 
 
 @pytest.mark.parametrize(
-    "heading",
+    ("heading", "kind"),
     [
-        "## Rework spec draft",
-        "## Rework specification ideas",
-        "## Rework acknowledgement needed",
-        "## Rework acknowledgments pending",
-        "## Rework acknowledgement - needed",
-        "## Rework acknowledgement: not given",
-        "## Rework acknowledgement (not yet)",
-        "## Rework spec - not yet",
-        "## Rework spec: TODO",
-        "## Rework spec (draft)",
-        "## Rework spec \u2014 WIP, do not build",
-        "## Rework spec:",
-        "## Rework spec -",
+        ("## Rework spec draft", "rework spec"),
+        ("## Rework specification ideas", "rework spec"),
+        ("## Rework spec:", "rework spec"),
+        ("## Rework spec -", "rework spec"),
+        ("## Rework spec ()", "rework spec"),
+        ("## Rework spec ,,,", "rework spec"),
+        ("## Rework acknowledgement needed", "rework acknowledgement"),
+        ("## Rework acknowledgments pending", "rework acknowledgement"),
+        ("## Rework acknowledgement:", "rework acknowledgement"),
     ],
 )
-def test_62_a_bare_word_negating_or_empty_qualifier_does_not_count(heading):
-    assert not G._rework_heading_comment(heading + "\nbody", "rework spec")
-    assert not G._rework_heading_comment(heading + "\nbody", "rework acknowledgement")
+def test_62_a_bare_word_or_wordless_qualifier_does_not_count(heading, kind):
+    assert not G._rework_heading_comment(heading + "\nbody", kind)
+
+
+@pytest.mark.parametrize(
+    ("heading", "kind"),
+    [
+        ("## Rework spec (final; no open questions)", "rework spec"),
+        ("## Rework spec (draft)", "rework spec"),
+        ("## Rework acknowledgement (split as specified; no deviations)",
+         "rework acknowledgement"),
+        ("## Rework acknowledgement \u2014 do not retain the old split",
+         "rework acknowledgement"),
+    ],
+)
+def test_62b_the_qualifier_is_form_only_its_meaning_is_not_judged(heading, kind):
+    """A word list cannot tell a draft from a decision (it blocked the first
+    and third headings here and passed "(proposed)"). The row checks form; the
+    closing session judges whether a spec is decision-complete."""
+    assert G._rework_heading_comment(heading + "\nbody", kind)
 
 
 @pytest.mark.parametrize(
