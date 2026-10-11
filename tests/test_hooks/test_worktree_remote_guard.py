@@ -1181,12 +1181,34 @@ class TestForcePushCommandBorneConfig:
             "timeout 60 git push origin feat",
             "sudo git push origin feat",
             "./git push origin feat",
+            "bash -c 'git push origin feat'",
         ],
     )
     def test_nonforce_command_config_to_origin_blocks(self, remotes_repo, cmd):
         res = _run_cwd(cmd, str(remotes_repo))
         assert res.returncode == 2
         assert _BLOCKED_COMMAND_CONFIG in res.stderr
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # The outer shell sources BASH_ENV before the body runs, so it can
+            # export GIT_CONFIG_* that retargets `backups` at origin.
+            "BASH_ENV=/dev/null bash -c 'git push backups feat'",
+            "bash -c 'git push backups feat'",
+            "sh -c 'git push backups feat'",
+        ],
+    )
+    def test_nonforce_push_nested_in_a_shell_wrapper_blocks(self, remotes_repo, cmd):
+        res = _run_cwd(cmd, str(remotes_repo))
+        assert res.returncode == 2, res.stdout + res.stderr
+        assert _BLOCKED_COMMAND_CONFIG in res.stderr
+
+    def test_plain_push_to_a_disjoint_remote_still_asks(self, remotes_repo):
+        """Control for the nested rows: the same push typed plainly is not refused."""
+        res = _run_cwd("git push backups feat", str(remotes_repo))
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert _decision(res) == "ask"
 
     def test_nonforce_git_capital_C_dir_to_origin_is_not_blocked_by_config_rule(
         self, remotes_repo

@@ -11435,7 +11435,14 @@ def _push_carries_command_config(seg) -> bool:
     argv shape, is not visible to the guard's repository-config reads. This
     structural decision is independent of destination: supplied config can
     retarget a remote or introduce a force refspec before Git runs.
+
+    A push reparsed from a shell-wrapper body (``bash -c '…'``, depth > 0) is
+    wrapped by definition: the outer shell can export config before running it
+    (``BASH_ENV=<file> bash -c 'git push …'`` sources the file first), and the
+    nested segment's own text no longer shows that prefix.
     """
+    if getattr(seg, "depth", 0):
+        return True
     if not _push_seg_has_no_prefix(seg):
         return True
     argv = list(getattr(seg, "argv", None) or [])

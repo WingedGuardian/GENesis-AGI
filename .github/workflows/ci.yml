@@ -1163,6 +1163,6 @@ jobs:
         # Merge with main (#3133 authenticated backup reads): main 25211 + this PR's measured +106 = 25317.
         # Re-merge with main (#3133): main 25213 + this PR's measured +106 = 25319.
         # Force-push command-borne config (#2513): the four changed test files
-        # collect 598 here and 565 on origin/main 4ab8bf71c, measured with
-        # --collect-only: +33. No added skips. Floor: 25319 + 33 = 25352.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25352
+        # collect 603 here and 565 on origin/main 4ab8bf71c, measured with
+        # --collect-only: +38. No added skips. Floor: 25319 + 38 = 25357.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25357
