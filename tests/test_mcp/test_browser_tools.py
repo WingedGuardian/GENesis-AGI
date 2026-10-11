@@ -387,6 +387,21 @@ class TestFillStallWatchdog:
         assert browser.BrowserLayer.CAMOUFOX not in browser._layer_last_used
 
     @pytest.mark.asyncio
+    async def test_a_fill_on_a_page_no_layer_holds_stamps_no_other_layer(self):
+        """A fill whose page no layer holds any more must not keep the active
+        layer alive in its place."""
+        page, _ = _typing_page()
+        browser._remote_page = None  # detached: the page belongs to no layer
+        other = _alive_page("https://camoufox.example")
+        browser._stealth_cm = MagicMock()
+        browser._stealth_page = other
+        browser._active_page = other  # per-keystroke path, Camoufox active
+        with patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep):
+            await browser._human_type(page, "#bio", "xy")
+        assert page.keyboard.up.await_count == 2  # the fill really ran
+        assert browser.BrowserLayer.CAMOUFOX not in browser._layer_last_used
+
+    @pytest.mark.asyncio
     async def test_a_stall_does_not_discard_a_page_navigated_meanwhile(self):
         """The fill releases _browser_lock before typing, so a browser_navigate
         can replace the active page while a keystroke hangs. The stall must
@@ -3566,10 +3581,21 @@ def _tinyfish_delete():
     )
 
 
+# Stub modules, not patch("camoufox.async_api..."): CI installs neither package,
+# and patching by dotted path imports the real one first (see _connect).
+def _stub_camoufox(cm):
+    api = MagicMock(AsyncCamoufox=MagicMock(return_value=cm))
+    return patch.dict(sys.modules, {"camoufox": MagicMock(async_api=api), "camoufox.async_api": api})
+
+
+def _stub_playwright(starter):
+    api = MagicMock(async_playwright=MagicMock(return_value=starter))
+    return patch.dict(sys.modules, {"playwright": MagicMock(async_api=api), "playwright.async_api": api})
+
+
 class TestStaleRecoveryCleansOnlyItsOwnLayer:
     @pytest.mark.asyncio
     async def test_camoufox_restart_keeps_remote_cdp_and_tinyfish(self):
-        pytest.importorskip("camoufox", reason="camoufox not installed")
         remote_br, remote_pw, remote_page = _open_remote()
         tf_br, _, _ = _open_tinyfish()
         dead = MagicMock()
@@ -3586,7 +3612,7 @@ class TestStaleRecoveryCleansOnlyItsOwnLayer:
         new_cm = MagicMock()
         new_cm.__aenter__ = AsyncMock(return_value=new_ctx)
         with (
-            patch("camoufox.async_api.AsyncCamoufox", return_value=new_cm),
+            _stub_camoufox(new_cm),
             _tinyfish_delete() as delete,
         ):
             result = await browser._ensure_browser()
@@ -3603,7 +3629,6 @@ class TestStaleRecoveryCleansOnlyItsOwnLayer:
 
     @pytest.mark.asyncio
     async def test_chromium_restart_keeps_camoufox_and_remote_cdp(self):
-        pytest.importorskip("playwright", reason="playwright not installed")
         cm, cam_page = _open_camoufox()
         remote_br, _, _ = _open_remote()
         dead = MagicMock()
@@ -3623,8 +3648,7 @@ class TestStaleRecoveryCleansOnlyItsOwnLayer:
         new_pw.chromium.launch_persistent_context = AsyncMock(return_value=new_ctx)
         starter = MagicMock()
         starter.start = AsyncMock(return_value=new_pw)
-        fake = MagicMock(async_playwright=MagicMock(return_value=starter))
-        with patch.dict("sys.modules", {"playwright.async_api": fake}):
+        with _stub_playwright(starter):
             result = await browser._ensure_chromium_fallback()
 
         assert result is new_page
@@ -3765,12 +3789,11 @@ class TestAsyncCleanupStillCleansEverything:
 class TestFailedLaunchLeavesNoHalfState:
     @pytest.mark.asyncio
     async def test_a_failed_camoufox_launch_leaves_no_half_state(self):
-        pytest.importorskip("camoufox", reason="camoufox not installed")
         cm = MagicMock()
         cm.__aenter__ = AsyncMock(side_effect=RuntimeError("launch failed"))
         cm.__aexit__ = AsyncMock(return_value=None)
         with (
-            patch("camoufox.async_api.AsyncCamoufox", return_value=cm),
+            _stub_camoufox(cm),
             pytest.raises(RuntimeError),
         ):
             await browser._ensure_browser()
@@ -3780,15 +3803,13 @@ class TestFailedLaunchLeavesNoHalfState:
 
     @pytest.mark.asyncio
     async def test_a_failed_chromium_launch_stops_its_driver(self):
-        pytest.importorskip("playwright", reason="playwright not installed")
         pw = MagicMock()
         pw.stop = AsyncMock()
         pw.chromium.launch_persistent_context = AsyncMock(side_effect=RuntimeError("no chrome"))
         starter = MagicMock()
         starter.start = AsyncMock(return_value=pw)
-        fake = MagicMock(async_playwright=MagicMock(return_value=starter))
         with (
-            patch.dict("sys.modules", {"playwright.async_api": fake}),
+            _stub_playwright(starter),
             pytest.raises(RuntimeError),
         ):
             await browser._ensure_chromium_fallback()
@@ -3799,7 +3820,6 @@ class TestFailedLaunchLeavesNoHalfState:
 class TestClosedWindowStopsTheDriver:
     @pytest.mark.asyncio
     async def test_camoufox_context_close_runs_its_cleanup(self):
-        pytest.importorskip("camoufox", reason="camoufox not installed")
         handlers = {}
         ctx = MagicMock()
         ctx.pages = [_alive_page()]
@@ -3807,7 +3827,7 @@ class TestClosedWindowStopsTheDriver:
         cm = MagicMock()
         cm.__aenter__ = AsyncMock(return_value=ctx)
         cm.__aexit__ = AsyncMock(return_value=None)
-        with patch("camoufox.async_api.AsyncCamoufox", return_value=cm):
+        with _stub_camoufox(cm):
             await browser._ensure_browser()
         assert "close" in handlers
         handlers["close"](ctx)
@@ -3935,7 +3955,9 @@ class TestLayerSwitchLeavesTinyfish:
 class TestALayerInUseIsNotReclaimed:
     """Devin 4186534708: a call must not lose its layer to idle reclaim. Every
     _impl_* stamps its layer at the start, so it suffices that no MCP browser
-    tool can run as long as the idle window."""
+    tool can run as long as the idle window. browser_fill is the exception: it
+    has no overall deadline (#2914), and is covered instead by stamping the
+    filled page's layer at every step (TestFillStallWatchdog)."""
 
     @pytest.mark.asyncio
     async def test_every_browser_tool_is_capped_well_inside_the_idle_window(self):
@@ -3946,18 +3968,16 @@ class TestALayerInUseIsNotReclaimed:
             caps.append((operation, timeout_s))
             return {}
 
-        huge = "x" * 1_000_000
         with patch.object(browser, "_with_tool_timeout", new=capture):
             await browser.browser_navigate.fn("https://example.com")
             await browser.browser_navigate.fn("https://example.com", remote=True)
             await browser.browser_click.fn("#a")
-            await browser.browser_fill.fn("#a", huge)
             await browser.browser_upload.fn("#a", "/nonexistent")
             await browser.browser_screenshot.fn()
             await browser.browser_snapshot.fn()
             await browser.browser_run_js.fn("1")
             await browser.browser_press_key.fn("Tab", 1000)
-        assert len(caps) == 9, caps
+        assert len(caps) == 8, caps
         assert all(t <= 300.0 < browser._IDLE_TIMEOUT_S for _, t in caps), caps
 
     @pytest.mark.asyncio
@@ -3994,7 +4014,6 @@ class TestFailedNavigateStillStartsTheWatcher:
 class TestChromiumWindowClose:
     @pytest.mark.asyncio
     async def test_chromium_context_close_runs_its_cleanup(self):
-        pytest.importorskip("playwright", reason="playwright not installed")
         handlers = {}
         ctx = MagicMock()
         ctx.pages = [_alive_page()]
@@ -4005,8 +4024,7 @@ class TestChromiumWindowClose:
         pw.chromium.launch_persistent_context = AsyncMock(return_value=ctx)
         starter = MagicMock()
         starter.start = AsyncMock(return_value=pw)
-        fake = MagicMock(async_playwright=MagicMock(return_value=starter))
-        with patch.dict("sys.modules", {"playwright.async_api": fake}):
+        with _stub_playwright(starter):
             await browser._ensure_chromium_fallback()
         assert "close" in handlers
         handlers["close"](ctx)
@@ -4073,15 +4091,13 @@ class TestACancelledReclaimStillFinishesItsClose:
 
     @pytest.mark.asyncio
     async def test_a_failed_launch_cancelled_again_still_stops_its_driver(self):
-        pytest.importorskip("playwright", reason="playwright not installed")
         gate, entered, stopped = asyncio.Event(), asyncio.Event(), []
         pw = MagicMock()
         pw.stop = AsyncMock(side_effect=_gated(stopped, gate, entered))
         pw.chromium.launch_persistent_context = AsyncMock(side_effect=RuntimeError("no chrome"))
         starter = MagicMock()
         starter.start = AsyncMock(return_value=pw)
-        fake = MagicMock(async_playwright=MagicMock(return_value=starter))
-        with patch.dict("sys.modules", {"playwright.async_api": fake}):
+        with _stub_playwright(starter):
             launch = asyncio.ensure_future(browser._ensure_chromium_fallback())
             await asyncio.wait_for(entered.wait(), timeout=2)
             launch.cancel()  # the tool timeout lands while the driver is stopping

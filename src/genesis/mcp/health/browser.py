@@ -1005,8 +1005,9 @@ async def _reclaim_idle_layers(now: float) -> None:
     under _browser_lock and re-checks the clock there, so a tool call that
     touched the layer meanwhile keeps it.
 
-    A layer in use is never reclaimed mid-call: every _impl_* tool stamps its
-    layer when it starts, every MCP browser tool but browser_fill is capped by
+    A layer in use is never reclaimed mid-call: every page-acting _impl_* tool
+    (all but sessions, clear_domain and collaborate, which touch no page) stamps
+    its layer when it starts, every one of them but browser_fill is capped by
     _with_tool_timeout at 300 s or less, far inside _IDLE_TIMEOUT_S, and
     browser_fill, which has no overall deadline, stamps the filled page's layer
     at every step (_no_stall).
@@ -2201,7 +2202,8 @@ async def _no_stall(
         raise FillStalled(
             f"{what} made no progress for {_FILL_STALL_S:.0f}s"
         ) from None
-    _touch(layer)
+    if layer is not None:  # never the active page's layer: see the docstring
+        _touch(layer)
     report = _fill_progress.get() if report_progress else None
     if report is not None:
         await report(what)
@@ -3466,10 +3468,6 @@ async def browser_navigate(
     Set tinyfish=True for a cloud-hosted browser via TinyFish Browser API.
     Fresh isolated Chromium on each session. Paid: 1 credit per 4 minutes.
     Use when local browsers fail anti-bot or you need a clean isolated session.
-
-    Each layer is closed after 1 hour without a tool call on it; switching
-    layers leaves the previous one open until then (a TinyFish session keeps
-    billing until it idles out).
 
     cdp_url: Override the CDP endpoint. Default: GENESIS_CDP_URL env var.
     Example: browser_navigate("https://jobs.ashbyhq.com/...", remote=True)
