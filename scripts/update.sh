@@ -907,10 +907,14 @@ if [[ "$POST_MERGE" == "false" ]]; then
         for p in AGENTS.md config/procedure_triggers.yaml \
             .claude/settings.local.json .serena/project.yml \
             src/genesis/identity/USER.md; do
-            if ! idx="$(git -C "$GENESIS_ROOT" ls-files -s -- ":(literal)$p")"; then
+            # --literal-pathspecs reads the path literally whatever the caller's
+            # environment: under GIT_LITERAL_PATHSPECS=1 a ":(literal)" prefix is
+            # itself taken as part of the name and matches nothing (measured,
+            # git 2.43), which would make a clean checkout refuse every update.
+            if ! idx="$(git -C "$GENESIS_ROOT" --literal-pathspecs ls-files -s -- "$p")"; then
                 _refuse_staged_excused_divergence "Could not read the staged index for excused paths on divergent history"
             fi
-            if ! tree="$(git -C "$GENESIS_ROOT" ls-tree -r HEAD -- "$p")"; then
+            if ! tree="$(git -C "$GENESIS_ROOT" --literal-pathspecs ls-tree -r HEAD -- "$p")"; then
                 _refuse_staged_excused_divergence "Could not read HEAD's tree for excused paths on divergent history"
             fi
 

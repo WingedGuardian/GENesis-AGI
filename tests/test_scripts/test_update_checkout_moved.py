@@ -1293,6 +1293,10 @@ _clear_deploy_state() {{ echo CLEAR-STATE; }}
         ("divergent", "gitlink", True),
         ("divergent", "descendant", True),
         ("divergent", "transition-edit-present", True),
+        # GIT_LITERAL_PATHSPECS=1 in the environment must neither make a clean
+        # checkout look staged nor hide a staged deletion.
+        ("divergent", "literal-env-clean", False),
+        ("divergent", "literal-env-delete", True),
     ],
 )
 def test_staged_excused_path_guard_cases(repo, tmp_path, history, action, refuses):
@@ -1323,7 +1327,7 @@ def test_staged_excused_path_guard_cases(repo, tmp_path, history, action, refuse
         path.write_text("install-local cache\n")
         _git(repo, "add", *(["-N"] if action == "intent-to-add" else []), "-f", "--",
              "config/procedure_triggers.yaml")
-    elif action == "delete":
+    elif action in {"delete", "literal-env-delete"}:
         _git(repo, "rm", "--cached", "--", "AGENTS.md")
     elif action == "agents-edit":
         (repo / "AGENTS.md").write_text("staged edit\n")
@@ -1346,6 +1350,8 @@ def test_staged_excused_path_guard_cases(repo, tmp_path, history, action, refuse
             "GIT_CONFIG_KEY_0": "diff.ignoreSubmodules",
             "GIT_CONFIG_VALUE_0": "all",
         }
+    if action.startswith("literal-env-"):
+        extra_env = {"GIT_LITERAL_PATHSPECS": "1"}
     elif action == "descendant":
         path = repo / ".serena" / "project.yml" / "child"
         path.parent.mkdir(parents=True)
