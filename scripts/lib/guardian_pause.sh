@@ -13,9 +13,10 @@
 #     pause is accepted. The lib does not arm traps itself: a trap is one global
 #     slot per signal, and only the caller knows what else it must compose with.
 #   - a caller holding the deploy lock on a fd keeps its number in
-#     _UPDATE_LOCK_FD (that exact name); the renewer is launched with that fd
-#     CLOSED, because a background process that inherits it keeps the lock after
-#     the caller exits. A lock fd held under any other name is not closed.
+#     _UPDATE_LOCK_FD, and the checkout lock in GENESIS_CHECKOUT_LOCK_FD
+#     (scripts/lib/checkout_lock.sh); the renewer is launched with both CLOSED,
+#     because a background process that inherits one keeps that lock after the
+#     caller exits. A lock fd held under any other name is not closed.
 #
 # GUARDIAN_PAUSE_TTL and GUARDIAN_PAUSE_RENEW_MAX are plain assignments on purpose:
 # a caller derives its health window from them (update.sh's HEALTH_GUARDIAN_COVER),
@@ -88,11 +89,14 @@ _guardian_pause() {
     local cfg="$HOME/.genesis/guardian_remote.yaml"
     [ -f "$cfg" ] || return 0
     local hip hus key
-    hip=$("$VENV_DIR/bin/python" -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_ip',''))" 2>/dev/null || true)
-    hus=$("$VENV_DIR/bin/python" -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_user','ubuntu'))" 2>/dev/null || echo ubuntu)
+    # -P: neither the working directory (a `live` checkout holding candidate
+    # files) nor any script directory goes first on sys.path. Not -I -S: yaml
+    # comes from the venv's site-packages.
+    hip=$("$VENV_DIR/bin/python" -P -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_ip',''))" 2>/dev/null || true)
+    hus=$("$VENV_DIR/bin/python" -P -c "import yaml,pathlib;print(yaml.safe_load(pathlib.Path('$cfg').read_text()).get('host_user','ubuntu'))" 2>/dev/null || echo ubuntu)
     # Honor the configured ssh_key (guardian_remote.yaml), expanding a leading ~,
     # and fall back to the historical default when the field is absent/empty.
-    key=$("$VENV_DIR/bin/python" -c "import yaml,pathlib,os;k=yaml.safe_load(pathlib.Path('$cfg').read_text()).get('ssh_key','') or '';print(os.path.expanduser(k))" 2>/dev/null || true)
+    key=$("$VENV_DIR/bin/python" -P -c "import yaml,pathlib,os;k=yaml.safe_load(pathlib.Path('$cfg').read_text()).get('ssh_key','') or '';print(os.path.expanduser(k))" 2>/dev/null || true)
     [ -n "$key" ] || key="$HOME/.ssh/genesis_guardian_ed25519"
     [ -n "$hip" ] && [ -f "$key" ] || return 0
     _GUARDIAN_HOST="${hus:-ubuntu}@${hip}"
@@ -129,11 +133,13 @@ _guardian_pause() {
         _GUARDIAN_PARENT_PID="$$"
         _GUARDIAN_PARENT_START="$(_guardian_proc_start "$$" || true)"
         _GUARDIAN_PARENT_START="${_GUARDIAN_PARENT_START#* }"
-        if [ -n "${_UPDATE_LOCK_FD:-}" ]; then
-            _guardian_renew_loop {_UPDATE_LOCK_FD}>&- >/dev/null 2>&1 &
-        else
-            _guardian_renew_loop >/dev/null 2>&1 &
-        fi
+        # The checkout-lock FD (scripts/lib/checkout_lock.sh) is closed the same
+        # way: inherited, it would block every Claude launch while the sleep lives.
+        (
+            if [ -n "${_UPDATE_LOCK_FD:-}" ]; then exec {_UPDATE_LOCK_FD}>&-; fi
+            if [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ]; then exec {GENESIS_CHECKOUT_LOCK_FD}>&-; fi
+            _guardian_renew_loop
+        ) >/dev/null 2>&1 &
         _GUARDIAN_RENEW_PID=$!
     else
         echo "  WARNING: guardian pause not accepted (old gateway or host unreachable) — proceeding unpaused" >&2

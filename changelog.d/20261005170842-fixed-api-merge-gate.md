@@ -1,0 +1,1 @@
+- **Merges through the GitHub API go through the merge gate.** A pull-request merge sent with `gh api` (REST `pulls/N/merge` or `merge-async`, or a GraphQL merge mutation) is now refused with a pointer to the gated `gh pr merge` command, so every merge-gate check runs. `gh pr merge --help` on its own is no longer refused.

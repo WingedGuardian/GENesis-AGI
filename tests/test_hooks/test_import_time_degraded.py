@@ -1387,7 +1387,12 @@ _ADVISORY_BY_DESIGN = {
     "hooks/pipe_status_guard.py": "ADVISORY, never blocking:",
     "hooks/pr_close_advisory.py": "Say so; never block it.",
     "hooks/pre_push_privacy_review.py": "NON-BLOCKING.",
+    "hooks/rm_trash_advisory.py": "ADVISORY ONLY. It never blocks and never asks",
     "hooks/tmux_kill_server_guard.py": "which is exactly why this is ADVISORY, never a block",
+    # On Bash it is advisory outright: it snapshots before the call and reports
+    # after it, and never exits 2. (Its file-tool half does block, on a matcher
+    # this table does not cover.)
+    "hooks/main_checkout_guard.py": "BASH — DETECTED AFTER THE FACT, NEVER BLOCKED.",
     "procedure_advisor.py": "surfaces relevant procedures as advisory context.",
 }
 

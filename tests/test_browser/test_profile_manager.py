@@ -241,10 +241,22 @@ class TestReset:
 
 
 class TestBrowserLayerEnum:
-    def test_layer_values(self):
-        assert BrowserLayer.FETCH == "fetch"
-        assert BrowserLayer.MANAGED == "managed"
-        assert BrowserLayer.RELAY == "relay"
+    def test_layer_values_are_the_navigate_layer_field(self):
+        """The enum, browser.py's "Layer N" comments and the ``layer`` field
+        browser_navigate returns share one numbering. (The browser-automation
+        skill numbers its own rungs differently; those are not these.)"""
+        assert [m.value for m in BrowserLayer] == [
+            "camoufox", "chromium", "remote_cdp", "tinyfish_cdp",
+        ]
+
+    def test_browser_py_layer_comments_match_the_enum_order(self):
+        from pathlib import Path
+
+        src = (
+            Path(__file__).resolve().parents[2] / "src/genesis/mcp/health/browser.py"
+        ).read_text()
+        for n, name in enumerate(("Camoufox", "Chromium", "CDP remote", "TinyFish"), 1):
+            assert f"# Layer {n}: {name}" in src, (n, name)
 
 
 @pytest.fixture
@@ -276,3 +288,66 @@ def test_a_reused_pid_is_not_mistaken_for_the_browser(tmp_path):
     os.symlink(f"127.0.1.1:+{os.getpid()}", mgr.profile_dir / "lock")  # pytest: not a browser
     assert mgr.running_pid() is None
     assert mgr.clear_domain("x.com") == 1
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("--output={dir}-backup",),  # a path that merely CONTAINS the profile
+        ("--user-data-dir={dir}-alt",),  # a sibling profile
+        ("-profile", "{dir}/sub"),  # a directory inside it
+        ("{dir}",),  # the path as a bare operand, not a profile flag
+    ],
+)
+def test_a_reused_pid_naming_another_path_is_not_the_browser(tmp_path, fake_browser, argv):
+    """A stale lock's pid reused by a process whose argv merely CONTAINS the
+    profile path is not that browser; only the profile flag's exact value is."""
+    mgr = _camoufox_profile(tmp_path / "camoufox-profile", [".x.com"])
+    proc = fake_browser(*(a.format(dir=mgr.profile_dir) for a in argv))
+    os.symlink(f"127.0.1.1:+{proc.pid}", mgr.profile_dir / "lock")
+    assert mgr.running_pid() is None
+    assert mgr.clear_domain("x.com") == 1
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("-profile", "{dir}"),
+        ("--profile", "{dir}"),
+        ("--user-data-dir={dir}",),
+        ("--user-data-dir", "{dir}"),
+        ("-profile", "{dir}/"),  # same directory, trailing slash
+    ],
+)
+def test_the_profile_flag_with_this_directory_is_the_browser(tmp_path, fake_browser, argv):
+    mgr = _camoufox_profile(tmp_path / "camoufox-profile", [".x.com"])
+    proc = fake_browser(*(a.format(dir=mgr.profile_dir) for a in argv))
+    os.symlink(f"127.0.1.1:+{proc.pid}", mgr.profile_dir / "lock")
+    assert mgr.running_pid() == proc.pid
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("/pw/chrome --no-sandbox --user-data-dir={dir} --noerrdialogs", True),
+        ("/pw/chrome --no-sandbox --user-data-dir={dir}", True),
+        ("/pw/chrome --no-sandbox --user-data-dir={dir}-alt --noerrdialogs", False),
+        ("/pw/chrome --output={dir} --noerrdialogs", False),
+    ],
+)
+def test_a_chromium_process_title_is_read_as_its_flags(tmp_path, monkeypatch, title, expected):
+    """Reviewer (round 2): on Linux Chromium rewrites its argv into ONE
+    space-joined process title, so /proc/<pid>/cmdline has a single NUL-ended
+    string. Per-token parsing missed --user-data-dir there and the guard
+    failed open for a live Chromium."""
+    from pathlib import Path
+
+    mgr = _chromium_profile(tmp_path / "browser-profile", [".x.com"])
+    raw = (title.format(dir=mgr.profile_dir) + "\0").encode()
+    real_read = Path.read_bytes
+    monkeypatch.setattr(
+        Path, "read_bytes",
+        lambda self: raw if str(self) == "/proc/4242/cmdline" else real_read(self),
+    )
+    assert mgr._pid_uses_profile(4242) is expected
+

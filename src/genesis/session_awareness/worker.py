@@ -150,6 +150,7 @@ async def run_worker(
 
         from genesis import env as genesis_env
         from genesis.memory.embeddings import EmbeddingProvider
+        from genesis.memory.graph_telemetry import traversal_tally
 
         resolved_db = db_path or genesis_env.genesis_db_path()
         url = qdrant_url or genesis_env.qdrant_url()
@@ -161,16 +162,20 @@ async def run_worker(
             qdrant = QdrantClient(url=url, timeout=10)
             provider = EmbeddingProvider()
             entity_query = " ".join(top_entities(state, ENTITY_QUERY_TERMS))
-            candidates = await rank_candidates(
-                ema=state["ema"],
-                entity_query=entity_query,
-                db=db,
-                qdrant_client=qdrant,
-                embedding_provider=provider,
-                # Keys verbatim — alias-normalized ledger keys can be
-                # multi-word ("claude code") and must not be re-split.
-                entity_terms=top_entities(state, ENTITY_RESOLVE_TERMS),
-            )
+            # Graph traversals inside ranking (via drift_recall) are FalkorDB
+            # cutover traffic. Their telemetry row goes through a short-lived
+            # read-write connection: this one is mode=ro and would refuse it.
+            async with traversal_tally(db, caller="ambient", db_path=str(resolved_db)):
+                candidates = await rank_candidates(
+                    ema=state["ema"],
+                    entity_query=entity_query,
+                    db=db,
+                    qdrant_client=qdrant,
+                    embedding_provider=provider,
+                    # Keys verbatim — alias-normalized ledger keys can be
+                    # multi-word ("claude code") and must not be re-split.
+                    entity_terms=top_entities(state, ENTITY_RESOLVE_TERMS),
+                )
         finally:
             await db.close()
 

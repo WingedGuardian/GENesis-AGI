@@ -108,3 +108,63 @@ def test_a_trailing_dot_is_dropped(domain):
 
     assert not normalize_domain(domain).endswith(".")
     assert normalize_domain(domain) in {"x.com", "xn--bcher-kva.example"}
+
+
+# --- Codex round 2 ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("label", ["grafana", "router", "localhost", "Grafana."])
+def test_a_single_label_intranet_host_is_a_valid_domain(label):
+    """Host-only cookies on a single-label LAN or intranet host are real; only
+    a single label that is itself a public suffix (``com``) is refused."""
+    from genesis.browser.profile import normalize_domain
+
+    assert normalize_domain(label) == label.lower().strip(".")
+
+
+@pytest.mark.parametrize("tld", ["com", "uk", "io"])
+def test_a_bare_tld_is_still_refused(tld):
+    from genesis.browser.profile import normalize_domain
+
+    with pytest.raises(ValueError, match="public suffix"):
+        normalize_domain(tld)
+
+
+def test_a_single_label_matches_only_itself():
+    """A single label is matched exactly: a label missing from the bundled
+    suffix list could be a real TLD, and a subdomain match would then clear
+    every site under it."""
+    from genesis.browser.profile import domain_matches
+
+    assert domain_matches("grafana", "grafana")
+    assert domain_matches(".grafana", "grafana")
+    assert not domain_matches("shop.grafana", "grafana")
+    assert domain_matches("api.x.com", "x.com")  # multi-label keeps subdomains
+
+
+def test_a_partial_ip_matches_only_itself():
+    """An IP cookie host is host-only: "1.1" must not clear every *.*.1.1 host."""
+    from genesis.browser.profile import domain_matches
+
+    assert not domain_matches("192.168.1.1", "168.1.1")
+    assert not domain_matches("10.0.1.1", "1.1")
+    assert domain_matches("192.168.1.1", "192.168.1.1")
+
+
+def test_a_single_label_host_clears_from_the_profile_file(tmp_path):
+    mgr = _camoufox_profile(tmp_path / "camoufox-profile", ["grafana", "a.grafana", ".x.com"])
+    assert mgr.clear_domain("grafana") == 1
+    assert {s.domain for s in mgr.get_info().sessions} == {"a.grafana", "x.com"}
+
+
+@pytest.mark.parametrize("name", ["question?mark", "hash#tag", "pct%41", "sp ace"])
+def test_a_profile_path_with_uri_characters_is_read_not_another_file(tmp_path, name):
+    """The read-only SQLite URI must escape the path: ``?`` or ``#`` would cut
+    it short, opening (and creating) a different database."""
+    base = tmp_path / name
+    mgr = _camoufox_profile(base / "camoufox-profile", [".x.com"])
+    before = sorted(p.name for p in tmp_path.iterdir())
+    info = mgr.get_info()
+    assert info.error == ""
+    assert [s.domain for s in info.sessions] == ["x.com"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == before

@@ -214,6 +214,8 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         # Optional external OfficeCLI binary (deliverable-builder render backend);
         # resolved by _init_office_deliverables, None when not provisioned.
         self._officecli_path: str | None = None
+        # Set by the ``board`` bootstrap step once the reconciler job is wired.
+        self._board_reconciler: str | None = None
         self._activity_tracker: ProviderActivityTracker | None = None
         self._span_writer: SpanWriter | None = None
         self._outreach_pipeline: OutreachPipeline | None = None
@@ -459,6 +461,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
 
         if _full:
             await self._run_init_step_async("learning", self._init_learning)
+
+        if _full:
+            await self._run_init_step_async("board", self._init_board)
 
         if _full:
             await self._run_init_step_async("inbox", self._init_inbox)
@@ -758,6 +763,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         "pipeline": "_pipeline_orchestrator",
         "campaigns": "_campaign_runner",
         "office_deliverables": "_officecli_path",
+        "board": "_board_reconciler",
     }
 
     def _run_init_step(self, name: str, func) -> None:

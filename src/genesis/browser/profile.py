@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import sqlite3
+import urllib.parse
 from pathlib import Path
 
 from genesis.browser.types import BrowserSession, ProfileInfo
@@ -65,10 +66,9 @@ def normalize_domain(domain: str) -> str:
             d = idna.encode(d, uts46=True).decode("ascii").strip(".")
         except idna.IDNAError as exc:
             raise ValueError(f"not a domain: {domain!r} ({exc})") from exc
-    # A bare label ("com") would match every cookie under that TLD in both
-    # profiles; only localhost is a real single-label cookie host.
-    if "." not in d and d != "localhost":
-        raise ValueError(f"not a domain (no dot): {domain!r}")
+    # A single label is a real host-only cookie host (localhost, an intranet
+    # or LAN name such as "grafana"); a bare TLD ("com") is refused below as a
+    # public suffix, and domain_matches matches single labels exactly.
     if d != "localhost" and _is_public_suffix(d):
         # "co.uk" would match bank.co.uk and shop.co.uk alike: clearing it is a
         # bulk logout across unrelated sites in both profiles.
@@ -105,9 +105,17 @@ def _is_public_suffix(d: str) -> bool:
 def domain_matches(host: str, domain: str) -> bool:
     """True when a cookie host belongs to ``domain``: the domain itself or one
     of its subdomains. ``x.com`` matches ``x.com`` and ``api.x.com``, never
-    ``netflix.com`` (which the substring match this replaced did)."""
+    ``netflix.com`` (which the substring match this replaced did).
+
+    A single label (``grafana``) matches only itself: one missing from the
+    bundled suffix list could be a real TLD, and a subdomain match would then
+    clear every site under it. So does an all-numeric name: an IP cookie host
+    is host-only, and ``1.1`` must not reach every ``*.*.1.1`` host."""
     h = (host or "").lower().lstrip(".")
-    return h == domain or h.endswith("." + domain)
+    if h == domain:
+        return True
+    exact_only = "." not in domain or domain.replace(".", "").isdigit()
+    return not exact_only and h.endswith("." + domain)
 
 
 class BrowserProfileManager:
@@ -171,23 +179,42 @@ class BrowserProfileManager:
         return pid
 
     def _pid_uses_profile(self, pid: int) -> bool:
-        """Whether ``pid``'s command line names this profile directory.
+        """Whether ``pid``'s command line opens this profile directory.
 
         Playwright launches Firefox (Camoufox) with ``-profile <dir>`` and
         Chromium with ``--user-data-dir=<dir>`` (READ: its server/firefox and
         server/chromium launchers), and the lock names that browser's main
-        process. A live pid whose command line does not mention the directory
-        is an unrelated process reusing the pid of a closed browser. Anything
-        unreadable counts as a match, so the check only ever un-blocks a case
-        it can prove.
+        process. Only the VALUE of a profile flag counts, compared as a path:
+        an argument that merely contains the directory (``<dir>-backup``, a
+        sibling ``<dir>-alt``) belongs to an unrelated process reusing the pid
+        of a closed browser. Anything unreadable counts as a match, so the
+        check only ever un-blocks a case it can prove.
         """
         try:
             raw = Path(f"/proc/{pid}/cmdline").read_bytes()
         except OSError:
             return True
-        args = raw.decode(errors="replace").split("\0")
-        wanted = {str(self._profile_dir), str(self._profile_dir.resolve())}
-        return any(w in a for a in args for w in wanted)
+        args = raw.decode(errors="replace").rstrip("\0").split("\0")
+        wanted = {self._profile_dir.absolute(), self._profile_dir.resolve()}
+        if len(args) == 1 and " " in args[0]:
+            # On Linux Chromium rewrites its argv into ONE space-joined process
+            # title (MEASURED on Playwright's chromium-1208), so the flag is a
+            # space-bounded substring rather than an argument of its own.
+            title = f" {args[0]} "
+            return any(
+                f" {flag}{w} " in title
+                for w in {str(p) for p in wanted}
+                for flag in ("--user-data-dir=", "--user-data-dir ", "-profile ", "--profile ")
+            )
+        values = []
+        for i, a in enumerate(args):
+            if a in ("-profile", "--profile", "--user-data-dir") and i + 1 < len(args):
+                values.append(args[i + 1])
+            elif a.startswith("--user-data-dir="):
+                values.append(a.split("=", 1)[1])
+        return any(
+            p in wanted for v in values if v for p in (Path(v).absolute(), Path(v).resolve())
+        )
 
     def ensure_dir(self) -> Path:
         """Create the profile directory if it doesn't exist."""
@@ -235,7 +262,10 @@ class BrowserProfileManager:
             return []
 
         sessions: dict[str, int] = {}
-        conn = sqlite3.connect(f"file:{cookies_db}?mode=ro", uri=True)
+        # The path is percent-encoded: a raw "?" or "#" in it would end the
+        # path early, opening (and creating) a different database.
+        uri = f"file:{urllib.parse.quote(str(cookies_db.absolute()))}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
         try:
             # table and column come from _COOKIE_STORES, never from a caller.
             cursor = conn.execute(

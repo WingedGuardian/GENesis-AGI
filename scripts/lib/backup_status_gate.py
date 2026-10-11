@@ -41,7 +41,12 @@ def main() -> int:
         print("continue_degraded:backup:tier1")
         return 1
     if status.get("tier2_backend") not in {None, "none"} and status.get("tier2_status") != "ok":
-        print("continue_degraded:backup:tier2")
+        # The core off-site copy is complete and only opt-in extra directories are
+        # missing: a distinct code, so it is never mistaken for a real off-site failure.
+        if status.get("offsite_core_complete") is True:
+            print("continue_degraded:backup:tier2_extras")
+        else:
+            print("continue_degraded:backup:tier2")
         return 1
     print("ok")
     return 0
