@@ -1079,5 +1079,23 @@ class TestForcePushRepoFlag:
             for s in analyze(f"git push {_FORCE} --repo origin backups main")
             if git_subcommand(s.argv) == "push"
         ][0]
-        # --repo wins over the positional `backups`.
-        assert guard_module._resolve_push_remote(seg) == "origin"
+        # Git uses the positional repository ahead of --repo.
+        assert guard_module._resolve_push_remote(seg) == "backups"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git push --force --repo backups origin main",
+            "git push --mirr origin",
+            "git push -o --repo=backups origin +main",
+        ],
+    )
+    def test_force_destination_uses_git_option_precedence(self, remotes_repo, command):
+        res = _run_cwd(command, str(remotes_repo))
+        assert res.returncode == 2
+        assert "Force push to origin" in res.stderr
+
+    def test_force_positional_destination_beats_repo_flag(self, remotes_repo):
+        res = _run_cwd("git push --force --repo origin backups main", str(remotes_repo))
+        assert res.returncode == 0, res.stderr
+        assert _decision(res) == "ask"

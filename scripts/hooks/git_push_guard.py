@@ -340,6 +340,8 @@ try:
     from shell_parse import (  # noqa: E402
         _KNOWN_SIGILS,
         _REPARSE_CARRIERS,
+        PushArg,
+        PushArgKind,
         analyze,
         analyze_checked,
         commit_skips_hooks,
@@ -347,6 +349,7 @@ try:
         git_subcommand,
         has_trailing_override,
         mentions,
+        push_arg_stream,
         split_segments,
         unresolved_verb_programs,
     )
@@ -10711,10 +10714,6 @@ def _is_dispatched() -> bool:
     return os.environ.get("GENESIS_CC_SESSION") == "1"
 
 
-# git push flags that consume the NEXT token as their value — so a value that
-# happens to start with '+' or contain 'f' is not misread as a force.
-_PUSH_VALUE_FLAGS = frozenset({"-o", "--push-option", "--repo", "--receive-pack", "--exec"})
-
 # The first-push-only skip uses an ALLOWLIST posture (git's push surface is too
 # flexible to blocklist safely): a push qualifies as a "plain current-branch
 # update" ONLY if every flag it carries is ref-set-neutral — verbosity, dry-run,
@@ -10739,15 +10738,12 @@ _PUSH_SAFE_LONG_FLAGS = frozenset(
         "--no-thin",
     }
 )
-# Ref-neutral value flags (skip the flag AND its value token). ``--repo`` (redirects
-# the push) and ``--receive-pack``/``--exec`` (select a receive-pack PROGRAM that git
-# EXECUTES on local/SSH transports — an arbitrary-code vector) are deliberately
-# EXCLUDED, so a push carrying any of them falls through to the approval prompt.
-_PUSH_SAFE_VALUE_FLAGS = frozenset({"-o", "--push-option"})
-# Ref-neutral short-flag letters (for bundles like ``-uq``). ``o`` is handled
-# separately (glued push-option value). ``f`` (force) and ``d`` (delete) are absent
-# by design — a bundle containing either is not a plain current-branch update.
-_PUSH_SAFE_SHORT_LETTERS = frozenset("uvqn46")
+# Ref-neutral long value flag. ``--repo`` redirects the push, and
+# ``--receive-pack``/``--exec`` select a program git executes, so they refuse.
+_PUSH_SAFE_VALUE_FLAGS = frozenset({"--push-option"})
+# Ref-neutral short-flag letters (for bundles like ``-uq``). ``o`` carries its
+# push-option value. ``f`` (force) and ``d`` (delete) are absent by design.
+_PUSH_SAFE_SHORT_LETTERS = frozenset("uvqn46o")
 # Git GLOBAL options (before ``push``) that a plain re-push may carry. ``-C`` is
 # resolved into the push's cwd by the caller; the pager switches change nothing
 # about the push. Every other global option — above all ``-c`` / ``--config-env``,
@@ -10764,126 +10760,72 @@ def _push_is_force(argv: list[str]) -> bool:
     positional) does not. Catches both the flag forms — ``--force`` /
     ``--force-with-lease`` / ``--force-if-includes`` / ``--mirror`` / ``-f`` /
     bundled ``-uf`` — and the ``+<refspec>`` shorthand (``git push origin +main``),
-    which git treats as ``--force`` for that ref. A short cluster stops at
-    ``o`` and the value token of ``-o`` / ``--push-option`` / ``--repo`` /
-    ``--exec`` / ``--receive-pack`` is skipped, so a push-option value that
-    starts with ``+`` or contains ``f`` (e.g. ``-oci.skip``) is not mistaken
-    for a force.
+    which git treats as ``--force`` for that ref. The shared stream consumes
+    option values, including ``-o`` ending a bundle and ``-c`` before ``push``.
     """
-    i = 1  # skip argv[0] == "git"
-    while i < len(argv):
-        tok = argv[i]
-        if tok in _PUSH_VALUE_FLAGS:
-            i += 2  # skip the flag and its value token
-            continue
-        if tok == "--force" or tok.startswith("--force-"):
-            return True
-        if tok == "--mirror":
+    stream: list[PushArg] | None = push_arg_stream(argv)
+    for arg in stream or ():
+        if arg.kind is PushArgKind.LONG and arg.text.split("=", 1)[0] in {
+            "--force",
+            "--force-with-lease",
+            "--force-if-includes",
+            "--mirror",
+        }:
             # --mirror force-updates EVERY ref and deletes remote refs that are
             # absent locally — an unconditional destructive push, never a plain
             # one, so it must hard-block rather than reach an approvable prompt.
             return True
-        if tok.startswith("+"):
+        if arg.kind is PushArgKind.SHORT and arg.text == "f":
+            return True
+        if arg.kind is PushArgKind.PLUS:
             return True  # +<refspec> is git shorthand for --force on that ref
-        if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1:
-            for ch in tok[1:]:
-                if ch == "o":  # -oVALUE glued push-option — rest is its value
-                    break
-                if ch == "f":
-                    return True
-        i += 1
     return False
 
 
 def _push_named_remote(argv: list[str]) -> str | None:
     """The remote named on a ``git push <remote> …``, else None.
 
-    argv is quote-stripped from ``shell_parse``. Skips git global options (and
-    their values), the ``push`` token, and push flags/values; the first bare
-    positional after that is the remote. A ``+<refspec>`` positional is NOT a
-    remote (it is a force refspec) and is skipped.
+    The first positional in the shared stream; option values and ``+<refspec>``
+    force shorthands are not positional arguments.
     """
-    i = 1  # skip argv[0] == "git"
-    # advance past git global options to the `push` token
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break
-    if i >= len(argv) or argv[i] != "push":
-        return None
-    i += 1
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-") or t.startswith("+"):
-            i += 1
-            continue
-        return t  # first bare positional after `push` is the remote
+    for arg in push_arg_stream(argv) or ():
+        if arg.kind is PushArgKind.POSITIONAL:
+            return arg.text
     return None
 
 
 def _push_repo_flag(argv: list[str]) -> str | None:
     """The value of a ``--repo <value>`` / ``--repo=value`` on a git push, else None.
 
-    ``git push --repo <dest>`` overrides both the positional remote and the
-    branch upstream as the push DESTINATION (P1-C), so it must win when deciding
-    what a force push actually targets. The value may be a remote name OR a URL.
+    The value may be a remote name OR a URL. A positional repository takes
+    precedence over ``--repo``; this value is used only when no remote is named.
     """
-    i = 0
-    while i < len(argv):
-        t = argv[i]
-        if t == "--repo" and i + 1 < len(argv):
-            return argv[i + 1]
-        if t.startswith("--repo="):
-            return t.split("=", 1)[1]
-        i += 1
+    stream: list[PushArg] | None = push_arg_stream(argv)
+    if stream is None:
+        return None
+    for index, arg in enumerate(stream):
+        if arg.kind is not PushArgKind.LONG:
+            continue
+        option, equals, value = arg.text.partition("=")
+        if option != "--repo":
+            continue
+        if equals:
+            return value
+        if index + 1 < len(stream) and stream[index + 1].kind is PushArgKind.LONG_VALUE:
+            return stream[index + 1].text
+        return None
     return None
 
 
-def _push_positionals(argv) -> list[str]:
+def _push_positionals(argv: list[str]) -> list[str]:
     """The bare positional args of a ``git push`` (``[remote, refspec, ...]``).
 
-    Parsed from a quote-stripped argv, mirroring ``_push_named_remote``: git global
-    options/values, the ``push`` token, and push flags/values are all skipped —
-    including no-value flags (``-u`` / ``--set-upstream`` / ``--force-with-lease``)
-    which take NO separate token, and value flags (``_PUSH_VALUE_FLAGS``:
-    ``-o`` / ``--push-option`` / ``--repo`` / ``--receive-pack`` / ``--exec``) which
-    take one. A ``+<refspec>`` (force) positional is excluded. Empty if not a push.
+    Only ``POSITIONAL`` entries are returned; options, values, and ``+`` force
+    refspecs have their own kinds in the shared stream.
     """
-    argv = argv or []
-    i = 1  # skip argv[0] == "git"
-    # advance past git global options (and their values) to the `push` token
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break
-    if i >= len(argv) or argv[i] != "push":
-        return []
-    i += 1
-    out: list[str] = []
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-") or t.startswith("+"):
-            i += 1
-            continue
-        out.append(t)
-        i += 1
-    return out
+    return [
+        arg.text for arg in push_arg_stream(argv or []) or () if arg.kind is PushArgKind.POSITIONAL
+    ]
 
 
 # push.default modes that push the CURRENT branch to a SAME-NAMED remote ref (or
@@ -11147,43 +11089,16 @@ def _push_is_dry_run(seg) -> bool:
     Reads only the PUSH's own options, and skips each value-taking flag's
     value: ``git push -o --dry-run origin HEAD`` sends ``--dry-run`` to the
     server as a push-option and performs a REAL push (git-push(1): ``-o``
-    takes the next argument). The same walk as ``_push_positionals`` — global
-    options and their values, then ``_PUSH_VALUE_FLAGS`` values — so a value
-    is never read as the flag. ``--`` ends option parsing.
+    takes the next argument). Read through ``push_arg_stream`` — the same
+    value rules as every other consumer — so a value is never read as the
+    flag, and a ``-n`` after ``--`` is a positional, not the flag.
     """
     argv = getattr(seg, "argv", None) or []
-    i = 1  # skip argv[0] == "git"
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break
-    if i >= len(argv) or argv[i] != "push":
-        return False
-    i += 1
-    while i < len(argv):
-        t = argv[i]
-        if t == "--":
-            return False
-        if t in _PUSH_VALUE_FLAGS:
-            i += 2  # the value token is data, never the dry-run flag
-            continue
-        if t == "--dry-run":
+    for arg in push_arg_stream(argv) or ():
+        if arg.kind is PushArgKind.LONG and arg.text.split("=", 1)[0] == "--dry-run":
             return True
-        if t.startswith("-") and not t.startswith("--") and len(t) > 1:
-            letters = t[1:]
-            for pos, ch in enumerate(letters):
-                if ch == "o":
-                    if pos == len(letters) - 1:
-                        i += 1  # `-uo VALUE`: the NEXT token is the value
-                    break  # `-oVALUE`: the rest of this token is the value
-                if ch == "n":
-                    return True
-        i += 1
+        if arg.kind is PushArgKind.SHORT and arg.text == "n":
+            return True
     return False
 
 
@@ -11213,67 +11128,39 @@ def _push_ref_positionals(argv: list[str]) -> list[str] | None:
     before this), ``--exec-path`` (where git finds the programs it runs),
     ``--namespace``, ``--git-dir`` / ``--work-tree``, and anything unknown.
     """
-    # Advance past git global options to the `push` token — allowlisted.
-    i = 1
+    positionals: list[str] = []
     dash_c = 0
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_SAFE_GLOBAL_VALUE_FLAGS:
+    stream: list[PushArg] | None = push_arg_stream(argv)
+    if stream is None:
+        return None  # not a `git push` — the bare-push `[]` does not apply
+    for arg in stream:
+        if arg.kind is PushArgKind.GLOBAL_VALUE:
             # git applies repeated -C cumulatively; the caller resolves only
             # the first, so a second one would make it probe the wrong repo.
+            if arg.text not in _PUSH_SAFE_GLOBAL_VALUE_FLAGS:
+                return None  # -c / --config-env / --git-dir / unknown
             dash_c += 1
             if dash_c > 1:
                 return None
-            i += 2
-            continue
-        if t in _PUSH_SAFE_GLOBAL_FLAGS:
-            i += 1
-            continue
-        if t.startswith("-"):
-            return None  # -c / --config-env / --exec-path / --git-dir / unknown
-        break
-    if i >= len(argv) or argv[i] != "push":
-        return None
-    i += 1
-    positionals: list[str] = []
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_SAFE_VALUE_FLAGS:
-            i += 2  # ref-neutral value flag: skip the flag and its value token
-            continue
-        if t.startswith("--"):
-            base = t.split("=", 1)[0]
-            if "=" in t and base in _PUSH_SAFE_VALUE_FLAGS:
-                i += 1  # --push-option=value etc.
-                continue
-            if "=" not in t and base in _PUSH_SAFE_LONG_FLAGS:
-                i += 1
+        elif arg.kind is PushArgKind.GLOBAL:
+            if arg.text not in _PUSH_SAFE_GLOBAL_FLAGS:
+                return None
+        elif arg.kind is PushArgKind.LONG:
+            base = arg.text.split("=", 1)[0]
+            if base in _PUSH_SAFE_VALUE_FLAGS:
+                continue  # --push-option; a separate value arrives as LONG_VALUE
+            if "=" not in arg.text and base in _PUSH_SAFE_LONG_FLAGS:
                 continue
             return None  # unknown/broadening long flag (or a =form of a no-value flag)
-        if t.startswith("+"):
+        elif arg.kind in {PushArgKind.SHORT_VALUE, PushArgKind.LONG_VALUE}:
+            continue  # the value of a value-flag the flag check already passed
+        elif arg.kind is PushArgKind.SHORT:
+            if arg.text not in _PUSH_SAFE_SHORT_LETTERS:
+                return None  # f/d/unknown letters change the ref set
+        elif arg.kind is PushArgKind.PLUS:
             return None  # +<refspec> force shorthand
-        if t.startswith("-") and len(t) > 1:
-            # Short single/bundle — every letter must be ref-neutral. An `o` starts a
-            # glued push-option value, so the rest of the token is that value; an
-            # `o` that ENDS the bundle (`-uo VALUE`) takes the NEXT token instead,
-            # exactly as `_push_is_dry_run` reads it.
-            safe = True
-            letters = t[1:]
-            skip = 1
-            for pos, ch in enumerate(letters):
-                if ch == "o":
-                    if pos == len(letters) - 1:
-                        skip = 2
-                    break
-                if ch not in _PUSH_SAFE_SHORT_LETTERS:
-                    safe = False
-                    break
-            if not safe:
-                return None
-            i += skip
-            continue
-        positionals.append(t)
-        i += 1
+        else:  # POSITIONAL
+            positionals.append(arg.text)
     return positionals
 
 
@@ -11289,7 +11176,7 @@ def _push_targets_current_branch(
     itself, never a parsed destination. True ONLY when BOTH hold:
       1. Every flag after ``push`` is ref-set-neutral — a member of
          ``_PUSH_SAFE_LONG_FLAGS`` / ``_PUSH_SAFE_VALUE_FLAGS``, or a short bundle
-         whose every letter is in ``_PUSH_SAFE_SHORT_LETTERS`` (``o`` = glued
+         whose every letter is in ``_PUSH_SAFE_SHORT_LETTERS`` (``o`` carries a
          push-option value). ANY other flag (``--all`` / ``--tags`` / ``--delete``
          / a bundled ``-d`` / ``--stdin`` / ``--repo`` / unknown) → False.
       2. The positionals name a plain current-branch update:
@@ -11312,7 +11199,9 @@ def _push_targets_current_branch(
          configured receive-pack program, a divergent push URL. One predicate
          for all shapes costs an ask on the rare remap config and removes the
          per-shape subset that let those side channels through.
-    Conservative by construction: any unrecognized form re-prompts. argv-based
+    The explicit ``--`` terminator is accepted, so ``git push -- origin HEAD``
+    follows the same re-push path as its plain spelling. Tokens after it are
+    positional, not options. Any unrecognized option re-prompts. argv-based
     (quote-stripped).
     """
     if not cur:
@@ -11325,10 +11214,7 @@ def _push_targets_current_branch(
     if len(positionals) >= 3:
         return False  # multiple refspecs → not a single plain current-branch update
     if positionals and positionals[0] != remote:
-        # The remote git will read from argv must be the one the caller resolved
-        # and every check below keys on. They diverge when the two parsers read
-        # an option value differently (`git push -uo origin HEAD`: git takes
-        # `origin` as the -o value and `HEAD` as the remote).
+        # The positionals and resolved destination must agree.
         return False
     if len(positionals) == 2:
         refspec = positionals[1]
@@ -11506,18 +11392,20 @@ def _colon_refspec_updates_current_branch(refspec: str, cur: str | None) -> bool
 def _resolve_push_remote(seg, cwd: str | None = None) -> str | None:
     """The push DESTINATION (remote name or URL) for a segment, or None if UNKNOWN.
 
-    Resolution order: an explicit ``--repo <dest>`` (P1-C) → an explicitly named
-    positional remote → else the current branch's upstream remote (the part
-    before ``/`` of ``@{upstream}``); else None. Callers FAIL CLOSED on None — an
+    Resolution order: an explicitly named positional remote → ``--repo <dest>``
+    when no positional remote is present → the current branch's upstream remote
+    (the part before ``/`` of ``@{upstream}``); else None. Measured with git
+    2.34.1: when both ``--repo`` and a positional repository are present, git
+    uses the positional repository. Callers FAIL CLOSED on None — an
     undeterminable destination is treated as origin/public and blocked.
     """
     argv = getattr(seg, "argv", None) or []
-    repo = _push_repo_flag(argv)
-    if repo:
-        return repo
     remote = _push_named_remote(argv)
     if remote:
         return remote
+    repo = _push_repo_flag(argv)
+    if repo:
+        return repo
     try:
         args = ["git"]
         if cwd:
@@ -11536,8 +11424,9 @@ def _resolve_push_remote(seg, cwd: str | None = None) -> str | None:
 def _effective_push_remote(seg, cur: str | None, cwd: str | None = None) -> str | None:
     """The remote a ``git push`` will ACTUALLY push to, honoring git's precedence.
 
-    An explicit ``--repo`` or positional remote wins. For a bare ``git push`` git
-    picks, in order: ``branch.<cur>.pushRemote`` → ``remote.pushDefault`` →
+    A positional repository takes precedence over ``--repo``; when neither is
+    present, a bare ``git push`` picks, in order:
+    ``branch.<cur>.pushRemote`` → ``remote.pushDefault`` →
     ``branch.<cur>.remote`` (the ``@{upstream}`` remote) → ``origin``. The
     republish + config checks MUST target this remote, not the fetch/upstream
     remote — otherwise a triangular fork workflow (pull from origin, push to fork)
@@ -11553,7 +11442,7 @@ def _effective_push_remote(seg, cur: str | None, cwd: str | None = None) -> str 
     """
     argv = getattr(seg, "argv", None) or []
     if _push_repo_flag(argv) or _push_named_remote(argv):
-        return _resolve_push_remote(seg, cwd=cwd)  # explicit --repo / positional wins
+        return _resolve_push_remote(seg, cwd=cwd)  # positional wins over --repo
     base = ["git"] + (["-C", cwd] if cwd else [])
     keys = ([f"branch.{cur}.pushRemote"] if cur else []) + ["remote.pushDefault"]
     keys += [f"branch.{cur}.remote"] if cur else []

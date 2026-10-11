@@ -48,6 +48,7 @@ it, are written out beside :data:`_BLIND_UNRESOLVED_VERB`.
 
 from __future__ import annotations
 
+import enum
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -3758,6 +3759,154 @@ def git_subcommand(argv: list[str]) -> str | None:
     global options (including ``-c KEY=VAL`` / ``-C DIR`` which take a value)."""
     i = git_subcommand_index(argv)
     return None if i is None else argv[i]
+
+
+class PushArgKind(enum.Enum):
+    GLOBAL = "global"
+    GLOBAL_VALUE = "global_value"
+    LONG = "long"
+    LONG_VALUE = "long_value"
+    SHORT = "short"
+    SHORT_VALUE = "short_value"
+    PLUS = "plus"
+    POSITIONAL = "positional"
+
+
+class PushArg(NamedTuple):
+    kind: PushArgKind
+    text: str
+
+
+# Measured from `git push -h` on git 2.34.1, 2.43.0, and 2.55.0.
+# `branches` and `verify` are listed only from 2.43.0; 2.34.1 accepts
+# `--verify` as the negation of `--no-verify` without listing it, and has no
+# `--branches`.
+GIT_PUSH_LONG_OPTIONS: dict[str, str] = {
+    "all": "none",
+    "atomic": "none",
+    "branches": "none",
+    "delete": "none",
+    "dry-run": "none",
+    "exec": "value",
+    "follow-tags": "none",
+    "force": "none",
+    "force-if-includes": "none",
+    "force-with-lease": "optional",
+    "ipv4": "none",
+    "ipv6": "none",
+    "mirror": "none",
+    "no-verify": "none",
+    "porcelain": "none",
+    "prune": "none",
+    "progress": "none",
+    "push-option": "value",
+    "receive-pack": "value",
+    "recurse-submodules": "value",
+    "repo": "value",
+    "set-upstream": "none",
+    "signed": "optional",
+    "tags": "none",
+    "thin": "none",
+    "quiet": "none",
+    "verbose": "none",
+    "verify": "none",
+}
+GIT_PUSH_SHORT_VALUE_LETTERS = frozenset("o")
+_GIT_PUSH_LONG_OPTION_CANDIDATES = frozenset(GIT_PUSH_LONG_OPTIONS) | frozenset(
+    f"no-{option}" for option in GIT_PUSH_LONG_OPTIONS
+)
+
+
+def _canonical_push_long_option(name: str) -> str:
+    if name in _GIT_PUSH_LONG_OPTION_CANDIDATES:
+        return name
+    matches = {
+        candidate
+        for candidate in _GIT_PUSH_LONG_OPTION_CANDIDATES
+        if candidate.startswith(name)
+    }
+    return next(iter(matches)) if len(matches) == 1 else name
+
+
+def push_arg_stream(argv: list[str]) -> list[PushArg] | None:
+    """Classify a ``git push`` argv with git's measured option grammar.
+
+    Returns ``None`` when ``argv`` is not a git push and ``[]`` for bare
+    ``git push``. Unique long-option prefixes are canonicalised as git does;
+    ambiguous and unknown options stay raw because git rejects those commands.
+    The option arities were measured from ``git push -h`` on git 2.34.1,
+    2.43.0, and 2.55.0 and are checked against the installed CLI by
+    ``test_git_push_option_table.py``. Git 2.34.1 accepts ``--verify`` as the
+    negation of ``--no-verify`` without listing it, and has no ``--branches``;
+    both are listed from 2.43.0.
+    """
+    push_index = git_subcommand_index(argv)
+    if push_index is None or argv[push_index] != "push":
+        return None
+
+    out: list[PushArg] = []
+    i = 1
+    while i < push_index:
+        arg_text = argv[i]
+        if arg_text in _GIT_OPTS_WITH_ARG:
+            out.append(PushArg(PushArgKind.GLOBAL_VALUE, arg_text))
+            i += 2
+        elif arg_text.startswith("-"):
+            out.append(PushArg(PushArgKind.GLOBAL, arg_text))
+            i += 1
+        else:
+            return None
+
+    i = push_index + 1
+    end_options = False
+    while i < len(argv):
+        arg_text = argv[i]
+        if arg_text == "--" and not end_options:
+            end_options = True
+            i += 1
+            continue
+        if end_options:
+            kind = PushArgKind.PLUS if arg_text.startswith("+") else PushArgKind.POSITIONAL
+            out.append(PushArg(kind, arg_text))
+            i += 1
+            continue
+        if arg_text.startswith("--"):
+            raw_name, equals, value = arg_text[2:].partition("=")
+            name = _canonical_push_long_option(raw_name)
+            suffix = f"={value}" if equals else ""
+            out.append(PushArg(PushArgKind.LONG, f"--{name}{suffix}"))
+            i += 1
+            arity_name = name[3:] if name.startswith("no-") else name
+            if (
+                not equals
+                and not name.startswith("no-")
+                and GIT_PUSH_LONG_OPTIONS.get(arity_name) == "value"
+                and i < len(argv)
+            ):
+                out.append(PushArg(PushArgKind.LONG_VALUE, argv[i]))
+                i += 1
+            continue
+        if arg_text.startswith("+"):
+            out.append(PushArg(PushArgKind.PLUS, arg_text))
+            i += 1
+            continue
+        if arg_text.startswith("-") and len(arg_text) > 1:
+            i += 1
+            letters = arg_text[1:]
+            for position, letter in enumerate(letters):
+                out.append(PushArg(PushArgKind.SHORT, letter))
+                if letter in GIT_PUSH_SHORT_VALUE_LETTERS:
+                    glued = letters[position + 1 :]
+                    if glued:
+                        out.append(PushArg(PushArgKind.SHORT_VALUE, glued))
+                    elif i < len(argv):
+                        out.append(PushArg(PushArgKind.SHORT_VALUE, argv[i]))
+                        i += 1
+                    break
+            continue
+        out.append(PushArg(PushArgKind.POSITIONAL, arg_text))
+        i += 1
+    return out
 
 
 #: Per-(group, subcommand) flag model for gh, MEASURED by parsing
