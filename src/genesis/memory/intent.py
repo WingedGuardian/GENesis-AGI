@@ -17,7 +17,7 @@ import re
 import time
 from dataclasses import dataclass, field
 
-from genesis.db.crud._fts import fts5_term
+from genesis.db.crud._fts import bounded_terms, fts5_term
 
 logger = logging.getLogger(__name__)
 
@@ -381,6 +381,11 @@ def rank_by_intent(
 # tag and collapsing FTS5 precision (audit MEM-001). None makes a useful
 # expansion term.
 _INDEX_EXCLUDED_TAG_PREFIXES = ("obs:", "class:", "wing:", "life_domain:")
+# Whole tags excluded for the same reason. ``session_note`` is stamped on every
+# session-observer note (session_observer.py); measured on one install it is on
+# 59% of memory_fts rows and was the most-chosen expansion term, which widens
+# every expanded query toward the whole corpus.
+_INDEX_EXCLUDED_TAGS = frozenset({"session_note"})
 
 
 def _build_expanded_query(keywords: list[str], expansions: list[str]) -> str:
@@ -463,7 +468,13 @@ class TagCooccurrenceIndex:
             # (obs: event tags + structural taxonomy tags that co-occur with
             # everything — see _INDEX_EXCLUDED_TAG_PREFIXES / MEM-001).
             normalized = list(
-                {t.lower() for t in tags if t and not t.startswith(_INDEX_EXCLUDED_TAG_PREFIXES)}
+                {
+                    t.lower()
+                    for t in tags
+                    if t
+                    and not t.startswith(_INDEX_EXCLUDED_TAG_PREFIXES)
+                    and t.lower() not in _INDEX_EXCLUDED_TAGS
+                }
             )
             for i, tag_a in enumerate(normalized):
                 if tag_a not in cooc:
@@ -720,7 +731,10 @@ async def expand_query(
             )
 
         # Expand query
-        keywords = _tokenize_query(query)
+        # Bounded HERE, not inside _tokenize_query: classify_stance reads that
+        # function's order and length. A long paste would otherwise AND and OR
+        # every one of its words (see _fts.FTS_MAX_TERMS).
+        keywords = bounded_terms(_tokenize_query(query), site="expanded")
         if not keywords:
             return query
 

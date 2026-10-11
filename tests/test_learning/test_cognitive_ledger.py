@@ -19,6 +19,7 @@ from genesis.learning.cognitive_ledger import (
     record_file_modification,
     rollback,
 )
+from genesis.trash import ITEM, TrashRefused, list_entries
 
 
 @pytest.fixture
@@ -132,6 +133,34 @@ class TestRollback:
         assert res["ok"] is True
         assert res["restored_to"] == "absent"
         assert not p.exists()
+        # ...but recoverable: it went to the trash, not away (#2926 G2).
+        [entry] = list_entries()
+        assert entry.tombstone.original_path == str(p)
+        assert entry.tombstone.caller == "cognitive_ledger.rollback"
+        assert (entry.path / ITEM).read_text() == "created"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_trash_leaves_the_file_and_the_row(self, db, tmp_path, monkeypatch):
+        p = tmp_path / "new.md"
+        mid = await record_file_modification(db, actor="a", path=p, new_content="created")
+
+        def refuse(*a, **k):
+            raise TrashRefused("simulated")
+
+        monkeypatch.setattr(cl, "trash", refuse)
+        res = await rollback(db, mid)
+        assert res["ok"] is False and "trash" in res["reason"]
+        assert p.read_text() == "created"  # never unlinked as a fallback
+        assert (await cfm.get(db, mid))["status"] != "rolled_back"
+
+    @pytest.mark.asyncio
+    async def test_restoring_prior_over_the_applied_content_trashes_nothing(self, db, tmp_path):
+        # The applied content is in the ledger row, so overwriting it loses nothing.
+        p = tmp_path / "f.md"
+        p.write_text("v1")
+        mid = await record_file_modification(db, actor="a", path=p, new_content="v2")
+        assert (await rollback(db, mid))["ok"] is True
+        assert list_entries() == []
 
     @pytest.mark.asyncio
     async def test_drift_refused_then_forced(self, db, tmp_path):
@@ -147,6 +176,27 @@ class TestRollback:
         forced = await rollback(db, mid, force=True)
         assert forced["ok"] is True
         assert p.read_text() == "v1"
+        # The newer content no ledger row holds went to the trash, not away.
+        [entry] = list_entries()
+        assert (entry.path / ITEM).read_text() == "v3-external"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_write_after_trashing_puts_the_file_back(
+        self, db, tmp_path, monkeypatch
+    ):
+        p = tmp_path / "f.md"
+        p.write_text("v1")
+        mid = await record_file_modification(db, actor="a", path=p, new_content="v2")
+        p.write_text("v3-external")
+
+        def full_disk(*a, **k):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(cl, "_atomic_write", full_disk)
+        result = await rollback(db, mid, force=True)
+        assert result["ok"] is False and "put back" in result["reason"]
+        assert p.read_text() == "v3-external"  # never left missing
+        assert list_entries() == []
 
     @pytest.mark.asyncio
     async def test_already_rolled_back(self, db, tmp_path):

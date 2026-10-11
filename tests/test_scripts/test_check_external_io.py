@@ -39,6 +39,11 @@ def _shipped_inventory() -> set[str]:
     }
     routing_yaml = (_REPO_ROOT / "config/model_routing.yaml").read_text(encoding="utf-8")
     inventory.update(re.findall(r"^\s*base_url:\s*https://([^/\s]+)", routing_yaml, re.MULTILINE))
+    # The Claude Code roster's active routes (commented examples do not match).
+    roster_yaml = (_REPO_ROOT / "config/cc_roster.yaml").read_text(encoding="utf-8")
+    inventory.update(
+        re.findall(r"^\s*anthropic_base_url:\s*https://([^/\s]+)", roster_yaml, re.MULTILINE)
+    )
     return inventory
 
 

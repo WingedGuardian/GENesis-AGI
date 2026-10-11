@@ -77,7 +77,7 @@ fi
 # exec. MemorySwapMax=0 keeps a future swap enablement from letting the leak
 # thrash swap instead of being killed.
 if command -v systemd-run >/dev/null 2>&1 \
-    && systemd-run --user --scope --quiet \
+    && systemd-run --user --scope --quiet --slice=app-capped.slice \
         -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=0" \
         -- /bin/true >/dev/null 2>&1; then
     # Named unit (issue #1792): anonymous scopes render as run-<id>.scope,
@@ -91,7 +91,11 @@ if command -v systemd-run >/dev/null 2>&1 \
     # reuse a later launch could request an existing cbm-mcp-<pid>.scope and
     # fail here, never reaching the address-space fallback. --collect unloads
     # the unit when it ends, even when failed.
+    # app-capped.slice: a child of app.slice, so the cap is unchanged; its
+    # kill counter outlives this scope, which is how the disk guardian tells
+    # this wrapper's by-design cap kill from any other OOM kill.
     exec systemd-run --user --scope --quiet --collect \
+        --slice=app-capped.slice \
         --unit "cbm-mcp-$$" \
         --description="codebase-memory-mcp (MemoryMax=${MEM_MAX})" \
         -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=0" \

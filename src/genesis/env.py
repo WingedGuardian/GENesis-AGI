@@ -508,6 +508,23 @@ def db_busy_timeout_ms() -> int:
         return BUSY_TIMEOUT_MS
 
 
+def sqlite_slow_ms() -> int:
+    """Threshold (ms) at which a timed SQLite statement is logged as slow
+    (``genesis.db._slow_log``; default 1000).
+
+    Overridable via ``GENESIS_SQLITE_SLOW_MS``; ``0`` or a negative value turns
+    the log off. Missing or non-integer values fall back to the default. It only
+    decides what is LOGGED — it never changes how a statement runs.
+    """
+    raw = os.environ.get("GENESIS_SQLITE_SLOW_MS", "").strip()
+    if not raw:
+        return 1000
+    try:
+        return int(raw)
+    except ValueError:
+        return 1000
+
+
 def recall_rerank_gate_off() -> bool:
     """True when the recall rerank rate-gate + circuit-breaker must NOT be built
     (kill switch).

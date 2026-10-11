@@ -555,7 +555,9 @@ def print_json_bounded(
     # string far under budget), genesis_stop_hook (the Stop event's
     # additionalContext), pr_close_advisory (one short fixed-shape note; the
     # return value is not checked because a trimmed note is still a true note and
-    # the hook enforces nothing), secrets_env_access_guard (a backstop behind the
+    # the hook enforces nothing), rm_trash_advisory (one fixed-shape note naming the
+    # firing operands; the return value is not checked, for the same reason as
+    # pr_close_advisory), secrets_env_access_guard (a backstop behind the
     # NOTE clips in hook_ask_policy; the return value is not checked because the
     # envelope is a fixed ~100 characters, far under budget). This sentence has now
     # been wrong twice in the same

@@ -609,6 +609,8 @@ def test_extra_round_trip_real_backup_into_real_restore_keeps_links(backup_env, 
         "GENESIS_BACKUP_TIER2_BACKEND": "none",
         "QDRANT_URL": "http://127.0.0.1:1",
         "GENESIS_BACKUP_PASSPHRASE": "testpass",
+        # This freshly created fixture is offline, not the installed DB.
+        "GENESIS_RESTORE_HOLDER_SCAN": "none",
         "GNUPGHOME": str(fresh / ".gnupg"),
         "PATH": f"{backup_env['bind']}:{os.environ['PATH']}",
     }

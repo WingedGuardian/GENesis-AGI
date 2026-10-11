@@ -75,6 +75,10 @@ PROVIDER_HOSTS: tuple[str, ...] = (
     "api.deepseek.com",
     "api.perplexity.ai",
     "api.voyageai.com",
+    # Active Claude Code roster routes (config/cc_roster.yaml).
+    "api.kimi.ai",
+    "api.moonshot.ai",
+    "api.xiaomimimo.com",
 )
 PROVIDER_PATTERNS = [re.compile(_host(re.escape(host)), re.IGNORECASE) for host in PROVIDER_HOSTS]
 
@@ -90,7 +94,7 @@ CALL_SITE_ONLY_HOSTS: dict[str, str] = {
 BASELINE: dict[tuple[str, str], tuple[int, str]] = {
     ("scripts/behavioral_linter.py", "provider"): (1, "linter inventory/docs"),
     ("scripts/check_external_io.py", "egress"): (2, "guard egress patterns"),
-    ("scripts/check_external_io.py", "provider"): (22, "guard provider inventory"),
+    ("scripts/check_external_io.py", "provider"): (25, "guard provider inventory"),
     ("scripts/install.sh", "provider"): (4, "installer probe, key validation, help text"),
     ("src/genesis/cc/gmodel_routes.py", "provider"): (1, "docstring: OpenRouter docs citation"),
     ("src/genesis/cc/invoker.py", "provider"): (1, "comment: api.anthropic.com outage note"),
@@ -108,7 +112,8 @@ BASELINE: dict[tuple[str, str], tuple[int, str]] = {
     ("src/genesis/routing/litellm_delegate.py", "provider"): (1, "sanctioned routing call path"),
     ("src/genesis/runtime/init/outreach.py", "egress"): (10, "gated webhook wiring"),
     ("tests/conftest.py", "egress"): (1, "test-only webhook credential pin"),
-    ("tests/test_cc/test_gmodel_routes.py", "provider"): (2, "OpenRouter route fixtures"),
+    ("tests/test_cc/test_gmodel_routes.py", "provider"): (13, "roster route fixtures"),
+    ("tests/test_cc/test_gmodel_settings.py", "provider"): (1, "roster route fixture"),
     ("tests/test_cc/test_roster.py", "provider"): (1, "roster routing fixture"),
     ("tests/test_channels/test_discord_adapter.py", "egress"): (12, "adapter fixture literals"),
     ("tests/test_credential_isolation.py", "egress"): (1, "webhook credential-pin test"),
@@ -122,6 +127,7 @@ BASELINE: dict[tuple[str, str], tuple[int, str]] = {
     ("tests/test_memory/test_reranker.py", "provider"): (1, "reranker fixture"),
     ("tests/test_observability/test_key_validator.py", "provider"): (3, "key-validator fixtures"),
     ("tests/test_outreach/test_pipeline.py", "egress"): (1, "pipeline fixture"),
+    ("tests/test_routing/test_daily_quota_reset.py", "provider"): (2, "quota-error fixtures"),
     ("tests/test_routing/test_provider_health_probes.py", "provider"): (5, "health-probe fixtures"),
     ("tests/test_scripts/test_check_external_io.py", "egress"): (10, "guard egress fixtures"),
     ("tests/test_scripts/test_check_external_io.py", "provider"): (17, "guard provider fixtures"),
