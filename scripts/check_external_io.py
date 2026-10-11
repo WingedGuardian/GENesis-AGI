@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Census LLM-provider routing-bypass references and external egress outside routing.
 
-This is a review tripwire, NOT a spend barrier. Runtime credential isolation
-for tests is enforced by ``tests/conftest.py`` (``_isolate_credentials``).
-Non-LLM credentialed hosts (TTS, Brave, Tinyfish, Firecrawl) are out of census
+This is a review tripwire, NOT a spend barrier: it cannot stop a call at
+runtime, only make a new reference visible in review. Non-LLM credentialed hosts (TTS, Brave, Tinyfish, Firecrawl) are out of census
 scope.
 
 References are count-baselined per file and per class. A new reference exceeds
@@ -111,12 +110,10 @@ BASELINE: dict[tuple[str, str], tuple[int, str]] = {
     ("src/genesis/research/perplexity.py", "provider"): (1, "Perplexity research call site"),
     ("src/genesis/routing/litellm_delegate.py", "provider"): (1, "sanctioned routing call path"),
     ("src/genesis/runtime/init/outreach.py", "egress"): (10, "gated webhook wiring"),
-    ("tests/conftest.py", "egress"): (1, "test-only webhook credential pin"),
     ("tests/test_cc/test_gmodel_routes.py", "provider"): (13, "roster route fixtures"),
     ("tests/test_cc/test_gmodel_settings.py", "provider"): (1, "roster route fixture"),
     ("tests/test_cc/test_roster.py", "provider"): (1, "roster routing fixture"),
     ("tests/test_channels/test_discord_adapter.py", "egress"): (12, "adapter fixture literals"),
-    ("tests/test_credential_isolation.py", "egress"): (1, "webhook credential-pin test"),
     ("tests/test_deliberation/test_deliberate.py", "provider"): (1, "deliberation fixtures"),
     ("tests/test_hooks/test_behavioral_linter.py", "provider"): (37, "provider linter fixtures"),
     ("tests/test_hooks/test_inline_hooks.py", "provider"): (1, "inline-hook fixtures"),
