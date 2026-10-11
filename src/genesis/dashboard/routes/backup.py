@@ -88,6 +88,7 @@ _STATUS_SAFE_FIELDS = frozenset(
         "extra_dirs_skipped",
         "extra_dirs_partial",
         "extra_upload_failed",
+        "offsite_core_complete",
     }
 )
 
@@ -403,6 +404,22 @@ def _positive_count(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _extras_incomplete(lb: dict, resolved_backend: str) -> bool:
+    """True when the last run left a configured extra directory incomplete.
+
+    The three counters are the ones backup.sh sums into ``extras_complete``:
+    skipped (not archived), partial (archived, but restore will refuse some
+    members) and upload failed. An upload failure counts only while an off-site
+    backend is configured NOW: once it is switched to none nothing uploads, so a
+    stale record must not keep the warning up. A counter that is not a positive
+    integer (a hand-edited or legacy record) counts as zero.
+    """
+    fields = ["extra_dirs_skipped", "extra_dirs_partial"]
+    if resolved_backend and resolved_backend != "none":
+        fields.append("extra_upload_failed")
+    return any(_positive_count(lb.get(field)) for field in fields)
+
+
 def _backup_health(
     last_backup: dict | None,
     schedule: dict | None,
@@ -557,32 +574,25 @@ def _backup_health(
                 "Backup tab.",
             }
         status = t2.get("status")
-        if (status is not None and status != "ok") or t2.get("confirmed") is False:
+        # backup.sh marks the off-site copy `partial` both when the CORE snapshot
+        # is incomplete and when only the extras are (the core is then complete
+        # and restorable). `offsite_core_complete` tells the two apart, as
+        # scripts/lib/backup_status_gate.py does; an extras-only gap falls
+        # through to its own, accurate warning below. A positive extras counter
+        # is required too, so a record claiming a complete core with nothing
+        # incomplete still reads as an off-site problem rather than healthy.
+        extras_only = lb.get("offsite_core_complete") is True and _extras_incomplete(
+            lb, resolved_backend
+        )
+        if (
+            (status is not None and status != "ok") or t2.get("confirmed") is False
+        ) and not extras_only:
             return {
                 "state": "warn",
                 "code": "tier2_incomplete",
                 "reason": "The off-site backup copy is incomplete — your local backup "
                 "succeeded but the off-site copy did not finish. Check the Backup tab.",
             }
-
-    # 8b. Configured extra directories were skipped, archived only in part (tar
-    #     reported member failures, which restore refuses), or did not reach the
-    #     off-site copy (#2854). These are the three counters backup.sh adds up
-    #     for `extras_complete`. It keeps them non-fatal by design, so `success`
-    #     stays True; this is the only place they surface. It runs after the core
-    #     off-site check so an extras gap never masks a core one. A counter that
-    #     is not a non-negative integer (a hand-edited or legacy record) is
-    #     ignored rather than failing the status route.
-    if any(
-        _positive_count(lb.get(field))
-        for field in ("extra_dirs_skipped", "extra_dirs_partial", "extra_upload_failed")
-    ):
-        return {
-            "state": "warn",
-            "code": "extra_dirs_incomplete",
-            "reason": "Some configured extra directories were not fully backed up. "
-            "Check the Backup tab for details.",
-        }
 
     # 9. The schedule probe itself failed (systemctl/D-Bus unreachable) and
     #    nothing more specific above already explained the banner — report the
@@ -596,6 +606,19 @@ def _backup_health(
             "code": "schedule_probe_failed",
             "reason": "Could not verify the backup schedule (systemctl probe failed) — "
             "check the Backup tab.",
+        }
+
+    # 10. Configured extra directories were not fully backed up (#2854).
+    #     backup.sh keeps these non-fatal by design, so `success` stays True.
+    #     Last before healthy: an opt-in extras gap is the least severe state,
+    #     so it never masks a core off-site gap (check 8) or a schedule-probe
+    #     failure (check 9), which would otherwise hide that backups stopped.
+    if _extras_incomplete(lb, resolved_backend):
+        return {
+            "state": "warn",
+            "code": "extra_dirs_incomplete",
+            "reason": "Some configured extra directories were not fully backed up "
+            "in the last run; the backup log names them.",
         }
 
     return {"state": "ok", "code": "healthy", "reason": ""}
