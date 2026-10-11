@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ast
 import importlib.util
-import re
+import subprocess
 from collections import Counter
 from pathlib import Path
 from urllib.parse import urlsplit
+
+import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _spec = importlib.util.spec_from_file_location(
@@ -37,14 +39,62 @@ def _shipped_inventory() -> set[str]:
         if isinstance(url, str)
         if (host := urlsplit(url).hostname)
     }
-    routing_yaml = (_REPO_ROOT / "config/model_routing.yaml").read_text(encoding="utf-8")
-    inventory.update(re.findall(r"^\s*base_url:\s*https://([^/\s]+)", routing_yaml, re.MULTILINE))
-    # The Claude Code roster's active routes (commented examples do not match).
-    roster_yaml = (_REPO_ROOT / "config/cc_roster.yaml").read_text(encoding="utf-8")
-    inventory.update(
-        re.findall(r"^\s*anthropic_base_url:\s*https://([^/\s]+)", roster_yaml, re.MULTILINE)
-    )
+    # Parsed as YAML, as the runtime reads them (routing/config.py, cc/roster.py),
+    # so a quoted URL counts and a commented example does not.
+    for rel, key in (
+        ("config/model_routing.yaml", "base_url"),
+        ("config/cc_roster.yaml", "anthropic_base_url"),
+    ):
+        data = yaml.safe_load((_REPO_ROOT / rel).read_text(encoding="utf-8"))
+        inventory.update(
+            host for url in _yaml_values(data, key) if (host := urlsplit(url).hostname)
+        )
     return inventory
+
+
+def _yaml_values(node, key: str) -> list[str]:
+    """Every string value stored under ``key`` anywhere in a parsed YAML tree."""
+    found: list[str] = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == key and isinstance(v, str):
+                found.append(v)
+            else:
+                found.extend(_yaml_values(v, key))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_yaml_values(item, key))
+    return found
+
+
+def test_yaml_values_reads_quoted_and_nested_urls():
+    data = yaml.safe_load(
+        'a:\n  base_url: "https://api.example.com/v1"\n'
+        "b:\n  - base_url: https://other.example.org\n"
+        "# base_url: https://commented.example.net\n"
+    )
+    assert sorted(urlsplit(u).hostname for u in _yaml_values(data, "base_url")) == [
+        "api.example.com",
+        "other.example.org",
+    ]
+
+
+def test_every_tracked_executable_lies_under_a_scan_root():
+    """A tree that ships a scanned format and is not in SCAN_ROOTS would be
+    skipped silently, as az_plugins/ once was."""
+    listed = subprocess.run(
+        ["git", "-C", str(_REPO_ROOT), "ls-files"], capture_output=True, text=True, check=True
+    ).stdout.splitlines()
+    shipped = [p for p in listed if Path(p).suffix in check.SCAN_SUFFIXES]
+    assert shipped
+    outside = [p for p in shipped if not any(Path(p).is_relative_to(r) for r in check.SCAN_ROOTS)]
+    assert outside == []
+
+
+def test_a_non_utf8_byte_does_not_hide_an_endpoint(tmp_path):
+    f = tmp_path / "s.sh"
+    f.write_bytes(b"# caf\xe9\ncurl https://api.openai.com/v1/responses\n")
+    assert [v.kind for v in _violations(tmp_path, "provider")] == ["unlisted"]
 
 
 def test_flags_planted_discord_egress(tmp_path):

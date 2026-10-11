@@ -31,7 +31,11 @@ from pathlib import Path
 from typing import NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCAN_ROOTS = ("src/genesis", "scripts", "tests")
+#: Every tree that ships an executable in a scanned format. A test pins that each
+#: tracked file in a scanned format lies under one of these, so a new tree (as
+#: ``az_plugins/`` once was) cannot be missed silently. ``.claude/hooks`` rather
+#: than ``.claude``: a local checkout keeps agent worktrees under ``.claude/``.
+SCAN_ROOTS = ("src/genesis", "scripts", "tests", "az_plugins", ".claude/hooks", "plugins")
 SCAN_SUFFIXES = (".py", ".sh", ".bash", ".js", ".mjs", ".ts", ".ipynb")
 
 
@@ -127,7 +131,7 @@ BASELINE: dict[tuple[str, str], tuple[int, str]] = {
     ("tests/test_routing/test_daily_quota_reset.py", "provider"): (2, "quota-error fixtures"),
     ("tests/test_routing/test_provider_health_probes.py", "provider"): (5, "health-probe fixtures"),
     ("tests/test_scripts/test_check_external_io.py", "egress"): (10, "guard egress fixtures"),
-    ("tests/test_scripts/test_check_external_io.py", "provider"): (17, "guard provider fixtures"),
+    ("tests/test_scripts/test_check_external_io.py", "provider"): (18, "guard provider fixtures"),
 }
 CLASSES: dict[str, list[re.Pattern[str]]] = {
     "egress": PATTERNS,
@@ -185,8 +189,10 @@ def scan(
     matches: dict[tuple[str, str], list[tuple[int, str]]] = {}
     for path in _iter_files(root, subdirs):
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeDecodeError):
+            # errors="replace": one non-UTF-8 byte (a Latin-1 comment) must not
+            # hide the ASCII endpoints elsewhere in the file.
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
             continue
         relpath = path.relative_to(root).as_posix()
         for cls in selected:
