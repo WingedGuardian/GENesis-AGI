@@ -1995,24 +1995,38 @@
               const err = await resp.json().catch(() => ({}));
               throw new Error(err.error || "Ingest failed");
             }
-            this.cancelKnowledgeUpload();
+            this._resetKnowledgeUpload();
             await this.fetchKnowledgeUploads();
             this._startUploadPolling();
           } catch (e) {
             u.error = e.message;
           }
         },
-        async cancelKnowledgeUpload() {
-          const uploadId = this.knowledgeUpload.uploadId;
+        _resetKnowledgeUpload() {
           this.knowledgeUpload = {
             dragging: false, file: null, uploading: false, confirm: false,
             uploadId: null, projectType: "", domain: "", purpose: "", context: "", mode: "extract", error: null,
           };
-          // Clean up server-side file + DB record
+        },
+        async cancelKnowledgeUpload() {
+          const uploadId = this.knowledgeUpload.uploadId;
+          // Clean up server-side file + DB record. fetchApi returns non-2xx
+          // responses instead of throwing, so a refusal has to be read off the
+          // response; the dialog stays open and shows it. 404 means the upload
+          // is already gone, which is what Cancel wants.
           if (uploadId) {
-            try { await fetchApi(`/api/genesis/knowledge/upload/${uploadId}`, { method: "DELETE" }); }
-            catch (e) { console.warn("Upload cleanup failed:", e); }
+            try {
+              const resp = await fetchApi(`/api/genesis/knowledge/upload/${uploadId}`, { method: "DELETE" });
+              if (!resp.ok && resp.status !== 404) {
+                const err = await resp.json().catch(() => ({}));
+                throw new Error(err.error || `Cancel failed (${resp.status})`);
+              }
+            } catch (e) {
+              this.knowledgeUpload.error = e.message;
+              return;
+            }
           }
+          this._resetKnowledgeUpload();
         },
         async fetchKnowledgeUploads() {
           try {

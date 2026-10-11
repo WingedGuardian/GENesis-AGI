@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 import mimetypes
 import os
 import re
+import stat
 import uuid
 from pathlib import Path
 
@@ -37,6 +39,72 @@ def _sanitize_filename(name: str) -> str:
         stem = Path(name).stem[:_MAX_FILENAME_LEN - len(Path(name).suffix) - 1]
         name = stem + Path(name).suffix
     return name or "unnamed"
+
+
+def _remove_upload_file(upload_id: str, stored_path: str) -> str | None:
+    """Delete an upload's file and its emptied directory through DESCRIPTORS.
+
+    Returns None when the goal state holds (the file is gone), or the reason
+    nothing was touched. The upload directory is opened relative to the upload
+    root with ``O_NOFOLLOW``, and the file is addressed by bare name relative to
+    that descriptor, so no symlink below the root is ever followed and the
+    stored path is never used to address anything. Same pattern as
+    ``_purge_dir_entries`` in ``genesis.cc.invoker``.
+
+    The one comparison on the stored path is a consistency check on the row, not
+    the containment boundary: a row that does not describe
+    ``<root>/<upload_id>/<name>`` is left for a human instead of being dropped.
+    """
+    name = os.path.basename(stored_path)
+    if name in ("", ".", "..") or os.path.dirname(stored_path) != os.path.join(
+        str(_UPLOAD_DIR), upload_id
+    ):
+        return "Stored file path is not this upload's file"
+
+    try:
+        root_fd = os.open(_UPLOAD_DIR, os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            dir_fd = os.open(
+                upload_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd
+            )
+        except FileNotFoundError:
+            return None
+        except OSError:
+            # A symlink (ELOOP, including one that points at itself) or a
+            # non-directory where the upload's directory should be.
+            return "Upload directory is not a real directory"
+        try:
+            try:
+                st = os.lstat(name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                # Already removed: the goal state holds, so the cancel completes.
+                pass
+            else:
+                if not stat.S_ISREG(st.st_mode):
+                    return "Stored file path is not a regular file"
+                # Unlinks the entry itself. If it is swapped for a link after
+                # the lstat, the link is removed and its target is untouched.
+                try:
+                    os.unlink(name, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.warning("Could not remove upload file %s", stored_path, exc_info=True)
+                    return "Stored file could not be removed"
+        finally:
+            os.close(dir_fd)
+        try:
+            os.rmdir(upload_id, dir_fd=root_fd)
+        except OSError as exc:
+            # Other files still in the directory is expected; anything else is worth a line.
+            if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOENT):
+                logger.warning("Could not remove upload directory for %s", upload_id, exc_info=True)
+    finally:
+        os.close(root_fd)
+    return None
 
 
 @blueprint.route("/api/genesis/knowledge/upload", methods=["POST"])
@@ -225,62 +293,23 @@ async def knowledge_upload_cancel(upload_id: str):
     if upload["status"] == "processing":
         return jsonify({"error": "Cannot cancel — ingestion in progress"}), 409
 
-    # The path was written as _UPLOAD_DIR/<upload_id>/<name> at upload time;
-    # re-check at delete time so a corrupted or migrated row can't point the
-    # unlink elsewhere. It must be THIS upload's own file, named directly: no
-    # symlink anywhere below the root (following one would delete whatever it
-    # points at and leave the link behind), and no file of another upload.
-    upload_root = os.path.realpath(_UPLOAD_DIR)
-    resolved = os.path.realpath(upload["file_path"])
-    lexical = os.path.normpath(os.path.abspath(upload["file_path"]))
-    relative = None
-    for base in (os.path.normpath(os.path.abspath(_UPLOAD_DIR)), upload_root):
-        if lexical.startswith(base + os.sep):
-            relative = os.path.relpath(lexical, base)
-            break
-    if not resolved.startswith(upload_root + os.sep):
-        logger.error(
-            "Refusing to cancel upload %s: stored path %s is outside %s",
-            upload_id, upload["file_path"], upload_root,
-        )
-        return jsonify({"error": "Stored file path is outside the upload directory"}), 409
-    # A symlink loop resolves to itself, so islink() catches what realpath cannot.
-    if (
-        relative is None
-        or resolved != os.path.join(upload_root, relative)
-        or os.path.islink(lexical)
-    ):
-        logger.error(
-            "Refusing to cancel upload %s: stored path %s goes through a symlink",
-            upload_id, upload["file_path"],
-        )
-        return jsonify({"error": "Stored file path goes through a symlink"}), 409
-    parts = relative.split(os.sep)
-    if len(parts) != 2 or parts[0] != upload_id or parts[1] in ("", ".", ".."):
-        logger.error(
-            "Refusing to cancel upload %s: stored path %s is not this upload's file",
-            upload_id, upload["file_path"],
-        )
-        return jsonify({"error": "Stored file path is not this upload's file"}), 409
-    file_path = Path(resolved)
-    if file_path.exists() and not file_path.is_file():
-        logger.error(
-            "Refusing to cancel upload %s: stored path %s is not a file",
-            upload_id, upload["file_path"],
-        )
-        return jsonify({"error": "Stored file path is not a file"}), 409
-
-    # Remove file from disk. Something else removing it first is not an error:
-    # the goal state (no file) holds, so the cancel still completes.
-    file_path.unlink(missing_ok=True)
-    # Clean up the upload's own directory once empty (never the upload root,
-    # which the check above already rules out as the parent).
-    parent = file_path.parent
+    # Upload ids are minted by uuid4() in the upload route. Anything else never
+    # names a directory this route created, so it is not used to address one.
     try:
-        if not any(parent.iterdir()):
-            parent.rmdir()
-    except OSError:
-        logger.warning("Could not remove upload directory %s", parent, exc_info=True)
+        is_own_id = str(uuid.UUID(upload_id)) == upload_id
+    except ValueError:
+        is_own_id = False
+    refusal = (
+        _remove_upload_file(upload_id, upload["file_path"])
+        if is_own_id
+        else "Upload id is not a UUID"
+    )
+    if refusal:
+        logger.error(
+            "Refusing to cancel upload %s (stored path %s): %s",
+            upload_id, upload["file_path"], refusal,
+        )
+        return jsonify({"error": refusal}), 409
 
     await knowledge_uploads.delete(rt.db, upload_id)
     return jsonify({"status": "ok"})
