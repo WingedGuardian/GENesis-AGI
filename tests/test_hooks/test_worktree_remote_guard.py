@@ -1240,6 +1240,24 @@ class TestForcePushCommandBorneConfig:
         assert res.returncode == 0
         assert _decision(res) == "ask"
 
+    def test_repeated_git_capital_C_to_backups_blocks_command_config(self, remotes_repo):
+        res = _run_cwd(
+            f"git -C {remotes_repo} -C . push backups feat", str(remotes_repo)
+        )
+        assert res.returncode == 2, res.stdout + res.stderr
+        assert _BLOCKED_COMMAND_CONFIG in res.stderr
+
+    def test_repeated_git_capital_C_force_to_backups_is_blocked(self, remotes_repo):
+        res = _run_cwd(
+            f"git -C {remotes_repo} -C . push --force backups feat",
+            str(remotes_repo),
+        )
+        assert res.returncode == 2, res.stdout + res.stderr
+        assert (
+            "BLOCKED: a force push off the public repo must be the whole command"
+            in res.stderr
+        )
+
     @pytest.mark.parametrize("global_flag", ["-P", "--no-pager"])
     def test_nonforce_safe_git_global_to_origin_is_not_blocked_by_config_rule(
         self, remotes_repo, global_flag

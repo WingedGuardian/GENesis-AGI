@@ -12819,6 +12819,8 @@ def _push_carries_command_config(seg) -> bool:
     argv shape, is not visible to the guard's repository-config reads. This
     structural decision is independent of destination: supplied config can
     retarget a remote or introduce a force refspec before Git runs.
+    Repeated ``-C`` is refused because Git applies each directory change
+    cumulatively, while the cwd resolvers only read the first one.
 
     A push reparsed from a shell-wrapper body (``bash -c '…'``, depth > 0) is
     wrapped by definition: the outer shell can export config before running it
@@ -12835,13 +12837,18 @@ def _push_carries_command_config(seg) -> bool:
         return True
 
     i = 1
+    dash_c_count = 0
     while i < push_index:
-        token = argv[i]
-        if token in _PUSH_SAFE_GLOBAL_VALUE_FLAGS:
+        option = argv[i]
+        if option in _PUSH_SAFE_GLOBAL_VALUE_FLAGS:
+            if option == "-C":
+                dash_c_count += 1
+                if dash_c_count > 1:
+                    return True
             if i + 1 >= push_index:
                 return True
             i += 2
-        elif token in _PUSH_SAFE_GLOBAL_FLAGS:
+        elif option in _PUSH_SAFE_GLOBAL_FLAGS:
             i += 1
         else:
             return True

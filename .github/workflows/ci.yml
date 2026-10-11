@@ -1168,4 +1168,12 @@ jobs:
         # Force-push command-borne config (#2513): the five changed test files
         # collect 1083 here and 1042 on origin/main 9008b3717, measured with
         # --collect-only: +41. No added skips. Floor: 25335 + 41 = 25376.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25376
+        # Repeated -C push checks (#2868): the five changed test files collect
+        # 1085 here and 1042 on origin/main 3d426ca8 (--collect-only):
+        # test_push_create_override.py 93/93;
+        # test_push_pr_branch_ask_switch.py 28/28;
+        # test_push_publish_ask_switch.py 585/585;
+        # test_push_refspec_current_branch.py 198/199;
+        # test_worktree_remote_guard.py 181/137. Net +43.
+        # Floor: 25335 + 43 = 25378.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25378
