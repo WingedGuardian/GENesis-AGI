@@ -61,6 +61,16 @@ PATTERNS: list[re.Pattern[str]] = [
     re.compile(_host(r"hooks\.slack\.com"), re.IGNORECASE),
 ]
 
+# Every PATTERNS match contains one of these, lowercased. Split literals keep
+# this file's own census count unchanged.
+EGRESS_NEEDLES = (
+    "discord.com",
+    "discordapp.com",
+    "discord_webhook",
+    "api" + ".twitter.com",
+    "slack.com",
+)
+
 PROVIDER_HOSTS: tuple[str, ...] = (
     "api.openai.com",
     "api.anthropic.com",
@@ -135,20 +145,13 @@ BASELINE: dict[tuple[str, str], tuple[int, str]] = {
 }
 
 
-def _combined(patterns: list[re.Pattern[str]]) -> re.Pattern[str]:
-    alternatives = [
-        f"(?i:{pattern.pattern})" if pattern.flags & re.IGNORECASE else f"(?:{pattern.pattern})"
-        for pattern in patterns
-    ]
-    return re.compile("|".join(alternatives))
-
-
 CLASSES: dict[str, list[re.Pattern[str]]] = {
     "egress": PATTERNS,
     "provider": PROVIDER_PATTERNS,
 }
-COMBINED: dict[str, re.Pattern[str]] = {
-    cls: _combined(patterns) for cls, patterns in CLASSES.items()
+NEEDLES: dict[str, tuple[str, ...]] = {
+    "egress": EGRESS_NEEDLES,
+    "provider": tuple(host.lower() for host in PROVIDER_HOSTS),
 }
 
 
@@ -205,16 +208,18 @@ def scan(
             # errors="replace": one non-UTF-8 byte (a Latin-1 comment) must not
             # hide the ASCII endpoints elsewhere in the file.
             text = path.read_text(encoding="utf-8", errors="replace")
+            lowered = text.lower()
             lines = text.splitlines()
         except OSError:
             continue
         relpath = path.relative_to(root).as_posix()
         for cls in selected:
-            if not COMBINED[cls].search(text):
+            needles = NEEDLES[cls]
+            if not any(needle in lowered for needle in needles):
                 continue
             patterns = CLASSES[cls]
             for lineno, line in enumerate(lines, start=1):
-                if not COMBINED[cls].search(line):
+                if not any(needle in line.lower() for needle in needles):
                     continue
                 for _start, _end in _merged_spans(line, patterns):
                     matches.setdefault((relpath, cls), []).append((lineno, line.strip()))

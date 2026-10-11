@@ -422,3 +422,18 @@ def test_lines_without_a_class_hit_skip_span_counting(tmp_path, monkeypatch):
 
     assert [violation.kind for violation in violations] == ["unlisted"]
     assert calls == 1
+
+
+def test_every_egress_pattern_match_contains_a_needle():
+    samples = (
+        "https://" + "discord" + ".com/api",
+        "https://" + "discordapp" + ".com/api",
+        "DISCORD_" + "WEBHOOK" + "_X",
+        "https://" + "api" + ".twitter.com",
+        "https://" + "slack" + ".com/api",
+        "https://" + "hooks" + ".slack.com",
+    )
+    assert len(samples) == len(check.PATTERNS)
+    for pattern, sample in zip(check.PATTERNS, samples, strict=True):
+        assert pattern.search(sample)
+        assert any(needle in sample.lower() for needle in check.NEEDLES["egress"])

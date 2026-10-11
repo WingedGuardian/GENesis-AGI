@@ -1166,6 +1166,6 @@ jobs:
         # collects 97 here and 81 on origin/main (--collect-only): +16; its other
         # two test edits are count-neutral. Floor: 25319 + 16 = 25335.
         # External-I/O census (#2878), --collect-only against main 9008b3717:
-        # test_check_external_io.py 5 -> 32 (+27). No added skips.
-        # Floor: 25335 + 27 = 25362.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25362
+        # test_check_external_io.py 5 -> 33 (+28). No added skips.
+        # Floor: 25335 + 28 = 25363.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25363
