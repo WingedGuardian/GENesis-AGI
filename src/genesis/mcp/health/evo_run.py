@@ -193,15 +193,17 @@ async def _impl_evo_run(
     if golden_set_path:
         gs = Path(golden_set_path)
     else:
-        from genesis.eval.reflection_golden_set import DEFAULT_OUTPUT
+        from genesis.eval.calibration import DEFAULT_REFLECTION_REFERENCE
 
-        gs = DEFAULT_OUTPUT
+        gs = DEFAULT_REFLECTION_REFERENCE
     if not gs.exists():
         return {
             "status": "error",
             "message": (
-                f"golden set not found: {gs}. Generate it with: "
-                "python -m genesis.eval.reflection_golden_set --count 150"
+                f"golden set not found: {gs}. Generate an unapproved draft with: "
+                "python -m genesis.eval.reflection_golden_set --count 150. "
+                "Then independently human-adjudicate the cases into a separate "
+                "reference file at this path, or supply golden_set_path."
             ),
         }
 

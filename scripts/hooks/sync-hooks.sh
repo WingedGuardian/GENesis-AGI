@@ -37,7 +37,7 @@ _warn() {
 }
 
 # Locate the source (this script's sibling hooks) and destination.
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 HOOKS_SRC="$SCRIPT_DIR"
 

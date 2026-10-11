@@ -2,8 +2,9 @@
 """Authoritative review-round budget from pull-request evidence.
 
 The local review-state counter is deliberately unsuitable for this job: it
-tracks a defect-bearing streak, while this policy counts distinct commit heads
-that an external reviewer actually reviewed.  This module is stdlib-only so the
+tracks a defect-bearing streak, while this policy counts ROUNDS: distinct commit
+heads that drew findings from a GitHub App reviewer (before
+``ROUND_RULE_CUTOVER_ISO``, heads the primary reviewed).  This module is stdlib-only so the
 PreToolUse and commit hooks, the external-review runner, and maintenance CLIs can
 all ask the same question.
 
@@ -21,6 +22,7 @@ import re
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +44,14 @@ MAX_PR_FILES_RESPONSE = 3000
 STANDING_REVIEWED_HEAD_LIMIT = 4
 GATE_DISCOVERY_ROUND_LIMIT = 2
 STRONGLY_DISCOURAGED_REVIEWED_HEADS = 5
+
+#: When rounds stopped meaning "heads the primary reviewed" and started meaning
+#: "heads that drew findings from any App reviewer" (owner ruling 2026-10-01:
+#: the moment the change's pull request opened). Evidence from before it keeps
+#: the old rule, so no pull request's count moved at that instant; evidence
+#: after it is counted by the new one. MEASURED 2026-10-01: the new rule alone
+#: would have put 26 of 68 open PRs at the terminal round, against 14.
+ROUND_RULE_CUTOVER_ISO = "2026-10-01T15:19:00+00:00"
 
 #: The two real choices at a terminal round, in the words the owner reads AT the
 #: approval dialog. SINGLE-SOURCED here because BOTH gates state it — the push
@@ -101,6 +111,7 @@ HOOK_SURFACE_FILES = frozenset(
         "scripts/review_state.py",
         "scripts/review_budget.py",
         "scripts/review_findings.py",
+        "scripts/review_reflection.py",
         "scripts/review_deadline.py",
         "scripts/external_review.py",
         "scripts/lib/gate_menu.py",
@@ -132,6 +143,11 @@ HOOK_SURFACE_FILES = frozenset(
         "config/external_review.yaml",
         "src/genesis/session_awareness/external_review.py",
         "src/genesis/session_awareness/external_review_config.py",
+        # Named explicitly though the scripts/hooks/ prefix already covers it, so
+        # a later narrowing of that prefix cannot drop it silently; its decision
+        # config rides alongside.
+        "scripts/hooks/main_checkout_guard.py",
+        "config/main_checkout_guard.yaml",
     }
 )
 
@@ -153,9 +169,7 @@ def _parse_external_identity_scalar(raw: str) -> object:
     if raw.startswith('"'):
         value, end = json.JSONDecoder().raw_decode(raw)
         suffix = raw[end:]
-        if suffix.strip() and (
-            not suffix[:1].isspace() or not suffix.lstrip().startswith("#")
-        ):
+        if suffix.strip() and (not suffix[:1].isspace() or not suffix.lstrip().startswith("#")):
             raise ValueError("unexpected content after quoted scalar")
         return value
     if raw.startswith("'"):
@@ -221,9 +235,15 @@ def confirmation_marker(head: str) -> str:
     return CONFIRMATION_MARKER_TEMPLATE.format(head=normalized)
 
 
-
 class _BudgetExhausted(Exception):
-    """The aggregate lookup budget ran out before this call could be issued."""
+    """The aggregate lookup budget ran out before this call could be issued.
+
+    ``args[0]``, when present, carries the ``gh_failure:<class>`` codes recorded
+    so far, so a persistent class still reaches the result."""
+
+
+class _Truncated(Exception):
+    """A nested connection had more nodes than one read returns."""
 
 
 def _unknown(*errors: str, current_head: str = "") -> dict[str, Any]:
@@ -242,6 +262,12 @@ def _unknown(*errors: str, current_head: str = "") -> dict[str, Any]:
         "approval_required": True,
         "commit_approval_required": True,
         "strongly_discouraged": True,
+        "open_keys": [],
+        "reflection_keys": "unknown",
+        "body": None,
+        "body_changed": False,
+        "reviewers_reported": [],
+        "expected_reviewers": [],
         "errors": [e for e in errors if e],
     }
 
@@ -272,22 +298,127 @@ def _identity_regex(template: str) -> re.Pattern[str] | None:
     return re.compile(escaped)
 
 
+def _parse_time(raw: object) -> tuple[bool, datetime | None]:
+    """``(ok, when)`` for an ISO-8601 UTC timestamp; ``(True, None)`` when absent.
+
+    Compared as datetimes, never as strings: GitHub writes ``Z`` and Python
+    writes ``+00:00``, and a string comparison across the two is wrong.
+    """
+    if raw is None:
+        return True, None
+    if not isinstance(raw, str):
+        return False, None
+    try:
+        when = datetime.fromisoformat(raw)
+    except ValueError:
+        return False, None
+    if when.tzinfo is None:
+        return False, None
+    return True, when
+
+
+#: What this module calls on ``review_findings``. A tree whose copy predates any
+#: of them is version skew: the budget is unknown, never a traceback.
+_FINDINGS_API = (
+    "WORKFLOW_BOTS",
+    "surface_only_logins",
+    "is_app_login",
+    "is_finding",
+    "body_finding_count",
+    "declares_findings",
+    "codex_comment_finding_head",
+)
+
+
+def _findings_module() -> Any:
+    """The sibling ``review_findings`` module, or None when absent or stale."""
+    try:
+        import review_findings  # noqa: PLC0415 - sibling stdlib module
+    except Exception:  # noqa: BLE001 - reverse skew is unknown, never zero rounds.
+        return None
+    if not all(hasattr(review_findings, name) for name in _FINDINGS_API):
+        return None
+    return review_findings
+
+
+def _is_id(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _without_ids(rows: object) -> object:
+    if not isinstance(rows, list):
+        return rows
+    return [
+        {k: v for k, v in row.items() if k != "id"} if isinstance(row, dict) else row
+        for row in rows
+    ]
+
+
+def _round_source(
+    item: Mapping[str, object], login: str, flagged: Sequence[int], in_body: int
+) -> dict[str, Any]:
+    """One review's place in a round, keyed for the round reflection.
+
+    A finding is keyed by what a reader can find it by and that never changes:
+    ``c<comment id>`` for an inline comment. Findings in a review's BODY have no
+    id of their own, so the review answers for them as ONE key,
+    ``r<review id>:<count>``. The count is part of the key, so a body whose
+    finding count changes owes a new answer. The count never sizes anything: it
+    comes from reviewer-written text, and an earlier shape that built one key
+    per counted finding let a malformed body allocate without bound inside a
+    hook (PR #3040, round 1). A key whose id is missing is None: the round still
+    counts, it just cannot be discharged by key, which ``reflection_keys``
+    reports.
+    """
+    review_id = item.get("id")
+    ids = item.get("top_level_ids")
+    keys: list[str | None] = []
+    for index in flagged:
+        comment_id = ids[index] if isinstance(ids, list) and index < len(ids) else None
+        keys.append(f"c{comment_id}" if _is_id(comment_id) else None)
+    if in_body:
+        # Bounded before it is formatted: a sum of several maximal sections
+        # passes int() and then overflows str() (4,300 digits), which would turn
+        # the whole lookup unknown. Past the bound the key is unknown instead.
+        bounded = 0 < in_body < 10**9
+        keys.append(f"r{review_id}:{in_body}" if _is_id(review_id) and bounded else None)
+    return {
+        "id": review_id if _is_id(review_id) else None,
+        "login": login,
+        "submitted_at": item.get("submitted_at"),
+        "finding_keys": keys,
+    }
+
+
 def evaluate_evidence(
     *,
     current_head: str,
     commit_heads: Sequence[object],
-    codex_reviews: Sequence[Mapping[str, object]],
+    reviews: Sequence[Mapping[str, object]],
     issue_comments: Sequence[Mapping[str, object]],
     changed_files: Sequence[Mapping[str, object] | str],
     external_identity_templates: Sequence[str] = (),
     primary_login: str = CODEX_REVIEW_BOT,
+    cutover: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate already-fetched PR evidence without I/O.
 
-    ``approval_required`` is the review-request decision.  Commit policy differs
-    on gate PRs: the second-round fix and its confirmation are part of round two,
-    so ``commit_approval_required`` begins after the confirmation has produced a
-    third reviewed head.
+    A ROUND is a distinct head that drew findings (owner ruling 2026-10-01): a
+    review by any GitHub App reviewer carrying at least one finding, by
+    ``review_findings.is_finding``, or a Codex findings issue comment. Its head
+    is the review's full commit SHA, whether or not a force-push has since
+    removed that commit from the PR. A clean review, a Codex clean comment and
+    the configured identity template CONFIRM a head (``current_head_reviewed``)
+    and never add a round.
+
+    Evidence before ``cutover`` (default ``ROUND_RULE_CUTOVER_ISO``) keeps the
+    old rule: every head the PRIMARY reviewed, clean included. Items carrying no
+    timestamp are treated as before it. The count is the union of the two, so at
+    the cutover instant it equals the old count by construction.
+
+    ``approval_required`` is the review-request decision. Commit policy differs
+    on gate PRs: the second-round fix and its one confirmation are part of round
+    two, so ``commit_approval_required`` begins after that confirmation.
     """
     head = _full_sha(current_head)
     if head is None:
@@ -302,6 +433,7 @@ def evaluate_evidence(
             commits.append(full)
     if head not in commits:
         return _unknown("current_head_missing_from_commits", current_head=head)
+    order = {sha: index for index, sha in enumerate(commits)}
 
     identities: list[re.Pattern[str]] = []
     for template in external_identity_templates:
@@ -310,64 +442,177 @@ def evaluate_evidence(
             return _unknown("invalid_external_identity_template", current_head=head)
         identities.append(pattern)
 
-    reviewed: set[str] = set()
-    for item in codex_reviews:
+    review_findings = _findings_module()
+    if review_findings is None:
+        return _unknown("review_findings_unimportable", current_head=head)
+
+    ok, cut = _parse_time(ROUND_RULE_CUTOVER_ISO if cutover is None else cutover)
+    if not ok or cut is None:
+        return _unknown("malformed_round_cutover", current_head=head)
+
+    legacy: set[str] = set()  # the old rule's heads, before cutover
+    confirmed: set[str] = set()  # heads the primary (or the identity) reviewed
+    found: dict[str, dict[str, Any]] = {}  # round head -> what landed there
+
+    def confirm(sha: str, before: bool) -> None:
+        confirmed.add(sha)
+        if before:
+            legacy.add(sha)
+
+    def add_round(
+        sha: str, login: str, findings: int, source: Mapping[str, Any] | None = None
+    ) -> None:
+        entry = found.setdefault(sha, {"findings": 0, "reviewers": [], "reviews": []})
+        entry["findings"] += findings
+        if login not in entry["reviewers"]:
+            entry["reviewers"].append(login)
+        if source is not None:
+            entry["reviews"].append(source)
+
+    # Who reported on which head, for the reflection's settle window. A clean
+    # review reports as surely as one with findings, so every counted reviewer's
+    # review lands here before the findings test below.
+    reported: dict[str, set[str]] = {}
+
+    def report(sha: str, login: str) -> None:
+        reported.setdefault(sha, set()).add(login)
+
+    surface_only = review_findings.surface_only_logins()
+    for item in reviews:
         if not isinstance(item, Mapping):
             return _unknown("malformed_review_record", current_head=head)
         login = item.get("login")
         if login is None:
-            # Deleted author. Not Codex -- that account exists -- so it carries
-            # no evidence either way, and rejecting it would wedge the budget.
+            # Deleted author. That account can no longer be any reviewer we
+            # know, so it carries no evidence; rejecting it would wedge the PR.
             continue
         if not isinstance(login, str):
             return _unknown("malformed_review_record", current_head=head)
-        if login != primary_login:
+        primary = login == primary_login
+        if item.get("state") == "PENDING" and not primary:
+            # The old rule counted every primary review, pending included; keep it
+            # for the legacy count. A pending review has no time, so it is placed
+            # before the cutover and never opens a round under the new rule.
             continue
-        resolved, error = _resolve_sha(str(item.get("commit_id") or ""), commits)
-        if error:
-            return _unknown(error, current_head=head)
-        reviewed.add(resolved or "")
+        if not primary and (
+            not review_findings.is_app_login(login)
+            or login in review_findings.WORKFLOW_BOTS
+            or login in surface_only
+        ):
+            continue  # humans, workflow bots and CodeQL never open a round
+        ok, when = _parse_time(item.get("submitted_at"))
+        if not ok:
+            return _unknown("malformed_review_time", current_head=head)
+        # A review object always names its full commit. A missing one is a
+        # malformed record, never a review of nothing.
+        sha = _full_sha(item.get("commit_id"))
+        if sha is None:
+            return _unknown("malformed_review_head", current_head=head)
+        before = when is None or when < cut
+        if primary:
+            confirm(sha, before)
+        elif when is None:
+            # Only a test seam omits the time; a non-primary review cannot be
+            # placed on either side of the cutover, and dropping it undercounts.
+            return _unknown("review_time_missing", current_head=head)
+        if item.get("state") != "PENDING":
+            report(sha, login)
+        if before:
+            continue
+        top_level = item.get("top_level")
+        body = item.get("body")
+        if body is None:
+            body = ""
+        if (
+            not isinstance(top_level, list)
+            or not all(isinstance(b, str) for b in top_level)
+            or not isinstance(body, str)
+        ):
+            return _unknown("review_comments_unreadable", current_head=head)
+        flagged = [i for i, b in enumerate(top_level) if review_findings.is_finding(login, b)]
+        in_body = review_findings.body_finding_count(login, body)
+        findings = len(flagged) + in_body
+        if findings:
+            add_round(
+                sha,
+                login,
+                findings,
+                _round_source(item, login, flagged, in_body),
+            )
+        elif not top_level and review_findings.declares_findings(login, body):
+            # Its body says it posted findings and no top-level comment
+            # survives: they were deleted, which must not read as a clean review.
+            # Partial deletion is not caught (MEASURED 2026-10-01: declared count
+            # equals surviving comments on 552 of 554 reviews, and one exception
+            # is a live PR, so a strict comparison would wedge it unverified).
+            return _unknown("review_findings_deleted", current_head=head)
 
-    comment_bodies: list[str] = []
-    confirmation_requested = False
+    confirmation_heads: set[str] = set()
     for item in issue_comments:
         if not isinstance(item, Mapping):
             return _unknown("malformed_comment_record", current_head=head)
         login, author_type, body = item.get("login"), item.get("type"), item.get("body")
-        if (login is None or author_type is None) and isinstance(body, str):
-            # Deleted author, readable body. The body still counts for the
-            # confirmation marker below -- that marker is matched on TEXT, not on
-            # who wrote it -- but the record can never be Codex, so it is not
-            # evidence of a review and must not wedge the budget.
-            comment_bodies.append(body)
-            if any(m.group(1).lower() == head for m in _CONFIRMATION_RE.finditer(body)):
-                confirmation_requested = True
-            continue
-        if (
-            not isinstance(login, str)
-            or not isinstance(author_type, str)
-            or not isinstance(body, str)
-        ):
+        if not isinstance(body, str):
             return _unknown("malformed_comment_record", current_head=head)
-        comment_bodies.append(body)
-        if any(m.group(1).lower() == head for m in _CONFIRMATION_RE.finditer(body)):
-            confirmation_requested = True
-        if login == primary_login and author_type == "Bot" and _CODEX_CLEAN_RE.search(body):
+        ok, when = _parse_time(item.get("created_at"))
+        if not ok:
+            return _unknown("malformed_comment_time", current_head=head)
+        before = when is None or when < cut
+        # The confirmation marker and the identity template are matched on TEXT,
+        # not on who wrote it, so a deleted author's comment still counts for both.
+        for marker in _CONFIRMATION_RE.finditer(body):
+            confirmation_heads.add(marker.group(1).lower())
+        for index, pattern in enumerate(identities):
+            for match in pattern.finditer(body):
+                resolved, error = _resolve_sha(match.group(1), commits)
+                if error == "unresolved_review_head" and not before:
+                    continue  # confirms only, as for a clean comment below
+                if error:
+                    return _unknown(error, current_head=head)
+                confirm(resolved or "", before)
+                # Matched on TEXT, so whoever posted it is not the reviewer: the
+                # configured identity is, named by its position in the config.
+                report(resolved or "", f"identity:{index}")
+        if login is None or author_type is None:
+            continue  # deleted author: never the primary
+        if not isinstance(login, str) or not isinstance(author_type, str):
+            return _unknown("malformed_comment_record", current_head=head)
+        if login != primary_login or author_type != "Bot":
+            continue
+        if _CODEX_CLEAN_RE.search(body):
             match = _REVIEWED_COMMIT_RE.search(body)
             if match is None:
                 return _unknown("clean_comment_missing_head", current_head=head)
             resolved, error = _resolve_sha(match.group(1), commits)
+            if error == "unresolved_review_head" and not before:
+                # After cutover a clean comment only confirms a head, and a commit
+                # no longer in the PR can never be the current one.
+                continue
             if error:
                 return _unknown(error, current_head=head)
-            reviewed.add(resolved or "")
-
-    for pattern in identities:
-        for body in comment_bodies:
-            for match in pattern.finditer(body):
-                resolved, error = _resolve_sha(match.group(1), commits)
-                if error:
-                    return _unknown(error, current_head=head)
-                reviewed.add(resolved or "")
+            confirm(resolved or "", before)
+            report(resolved or "", login)
+            continue
+        is_findings, sha = review_findings.codex_comment_finding_head(body)
+        if is_findings and sha is not None:
+            report(sha, login)  # a report on either side of the cutover, like a review
+        if is_findings and not before:
+            if sha is None:
+                return _unknown("codex_findings_comment_unbound", current_head=head)
+            confirm(sha, False)
+            comment_id = item.get("id")
+            add_round(
+                sha,
+                login,
+                1,
+                {
+                    "id": None,
+                    "login": login,
+                    "submitted_at": item.get("created_at"),
+                    # A findings comment has no review object; its own id keys it.
+                    "finding_keys": [f"i{comment_id}" if _is_id(comment_id) else None],
+                },
+            )
 
     paths: list[str] = []
     for item in changed_files:
@@ -384,18 +629,49 @@ def evaluate_evidence(
             paths.append(previous)
 
     gate_surface = any(is_hook_surface_path(path) for path in paths)
-    heads = sorted(h for h in reviewed if h)
+    round_heads = legacy | set(found)
+    heads = sorted(round_heads)
     count = len(heads)
-    current_reviewed = head in reviewed
+    current_reviewed = head in confirmed
+    confirmation_requested = head in confirmation_heads
+    # A head force-pushed out of the PR sorts before every live commit.
+    rounds = [
+        {
+            "head": sha,
+            "legacy": sha not in found,
+            "findings": found[sha]["findings"] if sha in found else None,
+            "reviewers": found[sha]["reviewers"] if sha in found else [],
+            "reviews": found[sha]["reviews"] if sha in found else [],
+        }
+        for sha in sorted(round_heads, key=lambda s: (order.get(s, -1), s))
+    ]
+    # The gate lane grants ONE confirmation request after its last round, and the
+    # guard admits it only when the request carries the exact-head marker. That
+    # marker is the one-shot token: a marker for any head other than the current
+    # one means the confirmation was used. Clean reviews add no round, so without
+    # this a clean confirmation would leave the count at the limit and re-grant
+    # the exemption at every new head. Read as a set, never by ordering events:
+    # three reviews in a row found defects in rules that inferred it from
+    # commit positions or timestamps (owner ruling 2026-10-01).
+    # The current head's own confirmation is spent too once the primary has
+    # reviewed it: a fix commit on top of a confirmed head is past the budget.
+    confirmation_spent = bool(confirmation_heads - {head}) or (
+        confirmation_requested and current_reviewed
+    )
     confirmation_exempt = (
         gate_surface
         and count == GATE_DISCOVERY_ROUND_LIMIT
         and not current_reviewed
         and not confirmation_requested
+        and not confirmation_spent
+        # A head that already drew findings is a round, not a fix to confirm.
+        and head not in round_heads
     )
     if gate_surface:
         request_approval = count >= GATE_DISCOVERY_ROUND_LIMIT and not confirmation_exempt
-        commit_approval = count > GATE_DISCOVERY_ROUND_LIMIT
+        commit_approval = count > GATE_DISCOVERY_ROUND_LIMIT or (
+            count == GATE_DISCOVERY_ROUND_LIMIT and confirmation_spent
+        )
         discouraged = count >= GATE_DISCOVERY_ROUND_LIMIT and not confirmation_exempt
         reason = (
             "gate_confirmation"
@@ -407,6 +683,55 @@ def evaluate_evidence(
         commit_approval = request_approval
         discouraged = count >= STRONGLY_DISCOURAGED_REVIEWED_HEADS
         reason = "ordinary_limit" if request_approval else "within_ordinary_limit"
+
+    # Live rounds only: a head a force-push removed has no position, so its place
+    # in this order (and so in the trend) would be a guess.
+    scored = [r["findings"] for r in rounds if r["findings"] is not None and r["head"] in order]
+    trend = None
+    if len(scored) >= 2:
+        trend = (
+            "rising"
+            if scored[-1] > scored[-2]
+            else "falling"
+            if scored[-1] < scored[-2]
+            else "flat"
+        )
+    if not rounds:
+        round_state = "none"
+    elif rounds[-1]["head"] == head:
+        round_state = "open"
+    else:
+        round_state = "complete"
+
+    # What a round reflection must answer for, read by review_reflection.status
+    # (and by the commit gate once it enforces reflections; until then they are
+    # reported, never enforced). The newest round only, and only while it is
+    # open. NOT attached (a later PR owes them separately): a review
+    # submitted on an earlier head after the fix was pushed stays on that head,
+    # so it is never owed here.
+    seen: dict[str, None] = {}  # ordered and linear, however many keys arrive
+    keys_known = True
+    if round_state == "open":
+        for source in rounds[-1]["reviews"]:
+            for key in source["finding_keys"]:
+                if key is None:
+                    keys_known = False
+                else:
+                    seen.setdefault(key)
+        # A head the old rule counted may carry findings that were never keyed,
+        # even when a post-cutover review on the same head was. The old rule did
+        # not read findings, so a head the primary reviewed CLEAN before the
+        # cutover reads the same way: unknown. Fail-closed, and only a PR whose
+        # current head predates the cutover can reach it.
+        keys_known = keys_known and rounds[-1]["head"] not in legacy
+    open_keys = list(seen)
+    # Who the settle window waits for: every reviewer that reported on ANY other
+    # head of this PR, clean reviews included (a reviewer that reviewed an
+    # earlier push is the best predictor of one still to come). Before any other
+    # head was reviewed there is nobody, and the reader then waits the whole
+    # window: a reviewer that has not posted yet is indistinguishable from one
+    # that never will.
+    expected = sorted({login for sha, who in reported.items() if sha != head for login in who})
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -423,6 +748,14 @@ def evaluate_evidence(
         "approval_required": request_approval,
         "commit_approval_required": commit_approval,
         "strongly_discouraged": discouraged,
+        "rounds": rounds,
+        "round_state": round_state,
+        "trend": trend,
+        "legacy_heads": len(legacy),
+        "open_keys": open_keys,
+        "reflection_keys": "ok" if keys_known else "unknown",
+        "reviewers_reported": sorted(reported.get(head, set())),
+        "expected_reviewers": expected,
         "errors": [],
     }
 
@@ -433,8 +766,10 @@ def _default_runner(argv: Sequence[str], *, timeout: float) -> tuple[int, str, s
             list(argv), capture_output=True, text=True, timeout=timeout, check=False
         )
         return result.returncode, result.stdout, result.stderr
-    except Exception:
-        return 1, "", "runner_failed"
+    except Exception as exc:  # noqa: BLE001 - classified by _gh_failure_class, never raised
+        # The exception TYPE, never its text: a subprocess timeout must read as
+        # `timeout` there, the same as an exception the harness wrapper catches.
+        return 1, "", f"runner_failed:{type(exc).__name__}"
 
 
 def _json_lines(raw: str, source: str) -> tuple[list[dict[str, Any]] | None, str | None]:
@@ -471,16 +806,110 @@ _GRAPHQL_MAX_PAGES = 50
 #: 8s cap was.
 _GRAPHQL_READ_SECONDS = 20.0
 
+#: Error codes that mean only "GitHub could not be read just now": a failed or
+#: timed-out read, or a lookup that ran out of its time budget. The ONLY codes
+#: an install-local ask switch (`hooks.asks.review_request`) may treat as
+#: transient. Everything else that reads as unknown -- deleted findings,
+#: truncated responses, a malformed record, a configuration error, a head
+#: that moved -- is persistent or a tamper signal and must keep asking.
+#: `gh_failure:<class>` entries ride along with these codes (see
+#: `_gh_failure_class`). Only the classes in TRANSIENT_GH_FAILURES count: an
+#: auth failure, a not-found, a 4xx or an unclassified failure (`other`,
+#: `runner_raised`) is not "GitHub could not answer just now" and keeps asking.
+TRANSIENT_ERRORS = frozenset(
+    {
+        "graphql_unreadable",
+        "graphql_read_timeout",
+        "final_head_unreadable",
+        "files_unreadable",
+        "lookup_budget_exhausted",
+    }
+)
+
+TRANSIENT_GH_FAILURES = frozenset({"timeout", "hook_deadline", "network", "rate_limited"})
+
+
+def _transient_gh_failure(code: str) -> bool:
+    cls = code[len("gh_failure:") :]
+    if cls in TRANSIENT_GH_FAILURES:
+        return True
+    return cls.startswith("http_5") and len(cls) == 8 and cls[5:].isdigit()
+
+
+def errors_are_transient(errors: Any) -> bool:
+    """True when ``errors`` is a non-empty list of transient read failures only."""
+    if not isinstance(errors, list) or not errors:
+        return False
+    return all(
+        isinstance(e, str)
+        and (e in TRANSIENT_ERRORS or (e.startswith("gh_failure:") and _transient_gh_failure(e)))
+        for e in errors
+    )
+
+
+def failure_errors(failures: Sequence[str]) -> list[str]:
+    """``gh_failure:<class>`` for EVERY distinct failed-call class, first-seen order.
+
+    The vocabulary is small and fixed, so this stays bounded. Cutting the list to
+    the first few dropped a late persistent class (auth, not_found) behind
+    recovered transient ones, and errors_are_transient() then read the whole
+    result as transient.
+
+    Classes of calls that RECOVERED on retry are kept on purpose: a recovered
+    `auth` or `other` makes an otherwise transient result ask. That is the safe
+    direction for an approval prompt; do not drop them to save a prompt.
+    """
+    return [f"gh_failure:{cls}" for cls in dict.fromkeys(failures)]
+
+
+def _gh_failure_class(stderr: str) -> str:
+    """A short, fixed-vocabulary class for a failed gh call (never raw stderr).
+
+    The raw text can carry account details, so only the class is kept. The
+    point is that one occurrence says WHY a read failed, not only that it did.
+    """
+    text = stderr or ""
+    if text.startswith("runner_failed:"):
+        kind = text.split(":", 1)[1]
+        if kind == "TimeoutExpired":
+            return "timeout"
+        # The caller's timeout_for refused to issue the call: production's
+        # review_deadline.bounded_timeout raises DeadlineExpired (a RuntimeError
+        # subclass), and the wrapper records the CONCRETE type name.
+        if kind in ("DeadlineExpired", "RuntimeError"):
+            return "hook_deadline"
+        return "runner_raised"
+    low = text.lower()
+    if "rate limit" in low or "secondary rate" in low:
+        return "rate_limited"
+    code = re.search(r"\bHTTP (\d{3})\b", text)
+    if code:
+        return f"http_{code.group(1)}"
+    # Persistent classes before `timeout`: an auth message that also mentions a
+    # timeout must keep asking, never read as transient.
+    if "auth" in low or "credential" in low or "token" in low:
+        return "auth"
+    if "timed out" in low or "timeout" in low or "deadline exceeded" in low:
+        return "timeout"
+    if "could not resolve" in low:
+        return "not_found"
+    if "connection" in low or "network" in low or "dial tcp" in low or "eof" in low:
+        return "network"
+    return "other"
+
+
 #: One connection per REST endpoint the lookup used to call, projected to the
 #: fields ``evaluate_evidence`` reads and nothing more.
 _GRAPHQL_CONNECTIONS = {
     "reviews": (
         "reviews(first: 100, after: $after_reviews) { pageInfo { hasNextPage endCursor } "
-        "nodes { state author { login __typename } commit { oid } } }"
+        "nodes { fullDatabaseId state submittedAt body author { login __typename } "
+        "commit { oid } comments(first: 100) { pageInfo { hasNextPage } "
+        "nodes { fullDatabaseId replyTo { id } body } } } }"
     ),
     "comments": (
         "comments(first: 100, after: $after_comments) { pageInfo { hasNextPage endCursor } "
-        "nodes { body author { login __typename } } }"
+        "nodes { fullDatabaseId body createdAt author { login __typename } } }"
     ),
     "files": (
         "files(first: 100, after: $after_files) { pageInfo { hasNextPage endCursor } "
@@ -505,7 +934,7 @@ def _graphql_query(names: Sequence[str]) -> str:
     return (
         f"query($owner: String!, $name: String!, $number: Int!{params}) "
         "{ repository(owner: $owner, name: $name) { pullRequest(number: $number) "
-        f"{{ headRefOid {fields} }} }} }}"
+        f"{{ headRefOid body {fields} }} }} }}"
     )
 
 
@@ -531,6 +960,25 @@ def _graphql_author(author: object) -> tuple[str | None, str | None]:
     return login, kind
 
 
+def _node_id(node: Mapping[str, object]) -> int | None:
+    """The REST id of a review, review comment or issue comment, or None.
+
+    Read from ``fullDatabaseId``, never ``databaseId``: GitHub deprecated the
+    latter on these types because it cannot hold a 64-bit id (MEASURED
+    2026-10-07 by schema introspection, announced removal 2024-07-01), and ids
+    here already exceed 2**31. The value is a BigInt, which GraphQL sends as a
+    JSON string. An absent or malformed id is None and never fails the read: an
+    id only keys a reflection, so it must not be able to turn the round count
+    unknown for every PR.
+    """
+    raw = node.get("fullDatabaseId")
+    # Bounded before int(): past 4,300 digits int() raises, which would land in
+    # the malformed-read handler and turn the whole PR unknown.
+    if isinstance(raw, str) and len(raw) <= 20 and raw.isascii() and raw.isdigit():
+        raw = int(raw)
+    return raw if _is_id(raw) else None
+
+
 def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]:
     """Convert one page of nodes to the REST row shapes. Raises ValueError."""
     if not isinstance(nodes, list):
@@ -545,16 +993,50 @@ def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]
             commit = node.get("commit")
             if commit is not None and not isinstance(commit, dict):
                 raise ValueError(name)
+            submitted = node.get("submittedAt")
+            if node.get("state") != "PENDING" and not isinstance(submitted, str):
+                raise ValueError(name)  # a submitted review always carries its time
+            thread = node.get("comments")
+            if not isinstance(thread, dict) or not isinstance(thread.get("nodes"), list):
+                raise ValueError(name)
+            info = thread.get("pageInfo")
+            if not isinstance(info, dict) or not isinstance(info.get("hasNextPage"), bool):
+                raise ValueError(name)
+            if info["hasNextPage"]:
+                # Past 100 comments on ONE review the rest are unread, and an
+                # unread finding is an uncounted round (MEASURED 2026-09-29: max 16).
+                raise _Truncated
+            top_level = []
+            top_level_ids = []
+            for comment in thread["nodes"]:
+                if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
+                    raise ValueError(name)
+                if comment.get("replyTo") is None:
+                    top_level.append(comment["body"])
+                    top_level_ids.append(_node_id(comment))
             rows.append(
                 {
+                    "id": _node_id(node),
                     "login": login,
                     "commit_id": (commit or {}).get("oid"),
                     "state": node.get("state"),
+                    "submitted_at": submitted,
+                    "body": node.get("body"),
+                    "top_level": top_level,
+                    "top_level_ids": top_level_ids,
                 }
             )
         elif name == "comments":
             login, kind = _graphql_author(node.get("author"))
-            rows.append({"login": login, "type": kind, "body": node.get("body")})
+            rows.append(
+                {
+                    "id": _node_id(node),
+                    "login": login,
+                    "type": kind,
+                    "body": node.get("body"),
+                    "created_at": node.get("createdAt"),
+                }
+            )
         elif name == "files":
             path = node.get("path")
             if not isinstance(path, str):
@@ -568,6 +1050,40 @@ def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]
                 raise ValueError(name)
             rows.append({"sha": commit.get("oid")})
     return rows, path_changed
+
+
+def _review_digest(rows: Sequence[Mapping[str, object]], rf: Any) -> list[tuple[object, ...]]:
+    """What decides the verdict in each review row, without the prose.
+
+    The re-read must agree with the first read on everything the count depends
+    on. Comparing raw bodies instead would turn every reviewer EDIT between the
+    two reads (CodeRabbit marks its comments "Addressed" right after a push, the
+    moment sessions commit) into ``unknown``, which denies dispatched sessions.
+    """
+    digest: list[tuple[object, ...]] = []
+    for row in rows:
+        login = row.get("login")
+        body = row.get("body") if isinstance(row.get("body"), str) else ""
+        tops = row.get("top_level") if isinstance(row.get("top_level"), list) else []
+        named = isinstance(login, str)
+        # Ids are deliberately NOT compared. They key only the round reflection,
+        # and a comment deleted and reposted between the two reads would make
+        # them differ: comparing them would add a path to ``unknown`` that the
+        # count never had (PR #3040, round 1). The keys then come from the first
+        # read, and the next lookup reads the repost.
+        digest.append(
+            (
+                login,
+                row.get("commit_id"),
+                row.get("state"),
+                row.get("submitted_at"),
+                len(tops),
+                tuple(named and isinstance(b, str) and rf.is_finding(login, b) for b in tops),
+                rf.body_finding_count(login, body) if named else 0,
+                rf.declares_findings(login, body) if named else False,
+            )
+        )
+    return digest
 
 
 def _evaluate_pr_inner(
@@ -612,9 +1128,10 @@ def _evaluate_pr_inner(
     # (`review_findings.CODEX_LOGIN`), the same reviewer merge freshness requires,
     # read from that one definition rather than a copy here. An unimportable
     # module is unknown, never "Codex by default".
+    review_findings = _findings_module()
     try:
-        import review_findings  # noqa: PLC0415 - sibling stdlib module, per call
-
+        if review_findings is None:
+            raise ImportError("review_findings")
         primary_login = review_findings.primary_reviewer_login()
     except Exception:  # noqa: BLE001 - reverse skew is unknown, never zero rounds.
         return _unknown("review_findings_unimportable")
@@ -631,14 +1148,19 @@ def _evaluate_pr_inner(
         remaining = deadline.remaining()
         if remaining is not None:
             if deadline.exhausted(minimum_useful=floor):
-                raise _BudgetExhausted
+                raise _BudgetExhausted(failure_errors(failures))
             seconds = min(seconds, remaining)
         try:
             return runner(argv, timeout=timeout_for(seconds))
-        except Exception:
-            return 1, "", "runner_failed"
+        except Exception as exc:  # noqa: BLE001 - classified, never raised
+            return 1, "", f"runner_failed:{type(exc).__name__}"
 
     repo_owner, _, repo_name = repo.partition("/")
+    #: Classes of the failed gh calls, in order, reported beside the error code.
+    failures: list[str] = []
+
+    def unknown(*errors: str, current_head: str = "") -> dict[str, Any]:
+        return _unknown(*errors, *failure_errors(failures), current_head=current_head)
 
     def snapshot(names: Sequence[str]) -> tuple[dict[str, Any] | None, str | None]:
         """The PR head plus every page of the named connections, in ONE query.
@@ -653,15 +1175,22 @@ def _evaluate_pr_inner(
         old path hit it was not counted (a same-day run under the budget saw 0
         of 70, an earlier one showed a p90 above it).
 
-        Every page re-reads ``headRefOid``; a head that moves between pages is
-        the same race the final head read below exists to catch.
+        Every page re-reads ``headRefOid`` and the PR body; a head that moves
+        between pages is the same race the final head read below exists to
+        catch, and a body that moves is reported as ``body_moved``.
         """
         rows: dict[str, list[dict[str, Any]]] = {item: [] for item in names}
         cursors: dict[str, str] = {}
         pending = list(names)
         head: str | None = None
+        body: str | None = None
+        body_moved = False
         path_changed = False
         read = Deadline.after(_GRAPHQL_READ_SECONDS, monotonic=monotonic)
+        # Failures recorded by an EARLIER snapshot say nothing about this one: a
+        # recovered failure there must not make this read's budget exhaustion look
+        # transient.
+        failures_before = len(failures)
         for _page in range(_GRAPHQL_MAX_PAGES):
             # ONE clock reading decides both whether to call and how long the
             # call may take. Two readings leave a gap a stall can fall into:
@@ -669,6 +1198,11 @@ def _evaluate_pr_inner(
             # #2594); just short of it, it issued a call too small to finish.
             left = read.remaining()
             if left is None or left < floor:
+                if _page and len(failures) == failures_before:
+                    # Pages were read and no call failed: the PR's evidence is too
+                    # large to read in this budget. That holds on every attempt, so
+                    # it is NOT on the transient allowlist (it keeps asking).
+                    return None, "graphql_read_budget_pages"
                 return None, "graphql_read_timeout"
             argv = [
                 "gh",
@@ -686,9 +1220,20 @@ def _evaluate_pr_inner(
             for item in pending:
                 if item in cursors:
                     argv += ["-f", f"after_{item}={cursors[item]}"]
-            rc, raw, _ = run(argv, min(8.0, left))
+            rc, raw, err = run(argv, min(8.0, left))
             if rc != 0:
-                return None, "graphql_unreadable"
+                failures.append(_gh_failure_class(err))
+                # One retry: a single failed read used to decide the whole
+                # result, which surfaced as an "unreadable history" prompt for
+                # PRs a later read handled fine. Only while the read budget
+                # still covers a useful call.
+                left = read.remaining()
+                if left is None or left < floor:
+                    return None, "graphql_unreadable"
+                rc, raw, err = run(argv, min(8.0, left))
+                if rc != 0:
+                    failures.append(_gh_failure_class(err))
+                    return None, "graphql_unreadable"
             try:
                 payload = json.loads(raw)
                 # gh exits non-zero on an `errors` response, including one that
@@ -704,6 +1249,14 @@ def _evaluate_pr_inner(
             page_head = data.get("headRefOid")
             if not isinstance(page_head, str):
                 return None, "graphql_malformed"
+            # The body is compared on every page, as the head is: an edit seen
+            # on a later page of this read must not be lost.
+            page_body = data.get("body")
+            if isinstance(page_body, str):
+                if body is None:
+                    body = page_body
+                elif page_body != body:
+                    body_moved = True
             if head is None:
                 head = page_head
             elif page_head != head:
@@ -715,6 +1268,8 @@ def _evaluate_pr_inner(
                     return None, f"{item}_malformed"
                 try:
                     page_rows, changed = _graphql_rows(item, connection.get("nodes"))
+                except _Truncated:
+                    return None, f"{item}_comments_truncated"
                 except ValueError:
                     return None, f"{item}_malformed"
                 rows[item].extend(page_rows)
@@ -732,7 +1287,16 @@ def _evaluate_pr_inner(
                     cursors[item] = cursor
                     following.append(item)
             if not following:
-                return {"head": head, "path_changed": path_changed, **rows}, None
+                return (
+                    {
+                        "head": head,
+                        "body": body,
+                        "body_moved": body_moved,
+                        "path_changed": path_changed,
+                        **rows,
+                    },
+                    None,
+                )
             pending = following
         return None, f"{pending[0]}_response_truncated"
 
@@ -750,7 +1314,7 @@ def _evaluate_pr_inner(
     if needed or test_head is None:
         first, error = snapshot(needed)
         if error or first is None:
-            return _unknown(error or "graphql_unreadable", current_head=test_head or "")
+            return unknown(error or "graphql_unreadable", current_head=test_head or "")
         if test_head is None:
             test_head = str(first["head"]).strip()
 
@@ -766,7 +1330,7 @@ def _evaluate_pr_inner(
         fetched[item] = rows or []
 
     if first is not None and "files" in needed and first.get("path_changed"):
-        rc, raw, _ = run(
+        rc, raw, err = run(
             [
                 "gh",
                 "api",
@@ -778,7 +1342,8 @@ def _evaluate_pr_inner(
             8,
         )
         if rc != 0:
-            return _unknown("files_unreadable", current_head=test_head)
+            failures.append(_gh_failure_class(err))
+            return unknown("files_unreadable", current_head=test_head)
         rows, error = _json_lines(raw, "files")
         if error:
             return _unknown(error, current_head=test_head)
@@ -808,13 +1373,22 @@ def _evaluate_pr_inner(
         if error or second is None:
             if error == "graphql_unreadable":
                 error = "final_head_unreadable"
-            return _unknown(error or "final_head_unreadable", current_head=test_head)
+            return unknown(error or "final_head_unreadable", current_head=test_head)
         if final_head is None:
             final_head = str(second["head"]).strip()
     if final_head != test_head:
         return _unknown("head_changed_during_evaluation", current_head=final_head)
     for item in mutable:
-        if (second or {}).get(item) != fetched[item]:
+        again = (second or {}).get(item)
+        if item == "reviews":
+            same = _review_digest(again or [], review_findings) == _review_digest(
+                fetched[item], review_findings
+            )
+        else:
+            # Ids never decide the count, so they never decide this either (see
+            # _review_digest): a repost between the reads is not a new unknown.
+            same = _without_ids(again) == _without_ids(fetched[item])
+        if not same:
             return _unknown("evidence_changed_during_evaluation", current_head=final_head)
 
     commit_heads: list[str] = []
@@ -824,15 +1398,28 @@ def _evaluate_pr_inner(
             return _unknown("commits_malformed", current_head=test_head)
         commit_heads.append(sha)
 
-    return evaluate_evidence(
+    result = evaluate_evidence(
         current_head=test_head,
         commit_heads=commit_heads,
-        codex_reviews=fetched["reviews"],
+        reviews=fetched["reviews"],
         issue_comments=fetched["comments"],
         changed_files=fetched["files"],
         external_identity_templates=external_identity_templates,
         primary_login=primary_login,
     )
+    # The PR body, for the reflection's acceptance points. It is not evidence
+    # the count rests on, so a body edited between the two reads leaves the
+    # count standing; but acceptance must bind the body as it now is, so the
+    # final read's body is the one returned, and two reads that disagree return
+    # no body and say so (``body_changed``), for the reader to refuse rather
+    # than check acceptance against either.
+    reads = [s for s in (first, second) if s is not None]
+    bodies = [s.get("body") for s in reads]
+    result["body_changed"] = any(s.get("body_moved") for s in reads) or (
+        len(bodies) == 2 and bodies[0] != bodies[1]
+    )
+    result["body"] = None if result["body_changed"] or not bodies else bodies[-1]
+    return result
 
 
 def evaluate_pr(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -845,8 +1432,11 @@ def evaluate_pr(*args: Any, **kwargs: Any) -> dict[str, Any]:
     """
     try:
         return _evaluate_pr_inner(*args, **kwargs)
-    except _BudgetExhausted:
-        return _unknown("lookup_budget_exhausted")
+    except _BudgetExhausted as exc:
+        # The classes of calls that failed before the stop travel with it: a
+        # persistent one (auth, not_found) must keep the result non-transient.
+        recorded = exc.args[0] if exc.args else []
+        return _unknown("lookup_budget_exhausted", *recorded)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

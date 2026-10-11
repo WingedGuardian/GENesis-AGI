@@ -40,6 +40,9 @@ class Subsystem(StrEnum):
     # and was swallowed → pause/resume events were never recorded. Defining it
     # restores that intended historical-visibility record.
     RUNTIME = "runtime"
+    # The work-board reconciler's tick (board/reconciler.py) — its heartbeat
+    # carries the board summary that board_status reads.
+    BOARD = "board"
 
 
 class ProbeStatus(StrEnum):

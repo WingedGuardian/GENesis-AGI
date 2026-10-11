@@ -689,7 +689,7 @@ class UserEgoContextBuilder:
         try:
             cursor = await self._db.execute(
                 "SELECT COUNT(*), MIN(created_at) FROM inbox_items "
-                "WHERE status NOT IN ('completed', 'failed')"
+                "WHERE status NOT IN ('completed', 'failed', 'superseded')"
             )
             row = await cursor.fetchone()
             if row and row[0] > 0:

@@ -29,7 +29,7 @@ from pathlib import Path
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import blueprint
-from genesis.dashboard.auth import is_authenticated
+from genesis.dashboard.auth import has_verified_credential, is_authenticated
 from genesis.util.systemd import systemctl_env
 
 logger = logging.getLogger(__name__)
@@ -85,6 +85,10 @@ _STATUS_SAFE_FIELDS = frozenset(
         "snapshot_count",
         "pruned_count",
         "tier1_pushed",
+        "extra_dirs_skipped",
+        "extra_dirs_partial",
+        "extra_upload_failed",
+        "offsite_core_complete",
     }
 )
 
@@ -315,7 +319,10 @@ def _destinations(status: dict | None, repo: str | None) -> dict:
         "snapshot_id": status.get("snapshot_id"),
         "snapshot_count": status.get("snapshot_count"),
     }
-    if is_authenticated():
+    # Disclosure, not admission — a caller that has not PROVED it is the
+    # operator never sees the target. ``is_authenticated`` would return True on
+    # a passwordless install and hand the NAS URL or local path to anyone.
+    if has_verified_credential():
         if backend == "smb":
             tier2["target"] = _strip_url_creds(_key_value("GENESIS_BACKUP_NAS")) or None
         elif backend == "local":
@@ -390,6 +397,27 @@ def _parse_systemd_timestamp(value: str | None) -> datetime | None:
         return naive.astimezone(UTC)
     except (ValueError, OverflowError, OSError):
         return None
+
+
+def _positive_count(value: object) -> bool:
+    """True for an integer counter above zero; False for anything else, bools included."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _extras_incomplete(lb: dict, resolved_backend: str) -> bool:
+    """True when the last run left a configured extra directory incomplete.
+
+    The three counters are the ones backup.sh sums into ``extras_complete``:
+    skipped (not archived), partial (archived, but restore will refuse some
+    members) and upload failed. An upload failure counts only while an off-site
+    backend is configured NOW: once it is switched to none nothing uploads, so a
+    stale record must not keep the warning up. A counter that is not a positive
+    integer (a hand-edited or legacy record) counts as zero.
+    """
+    fields = ["extra_dirs_skipped", "extra_dirs_partial"]
+    if resolved_backend and resolved_backend != "none":
+        fields.append("extra_upload_failed")
+    return any(_positive_count(lb.get(field)) for field in fields)
 
 
 def _backup_health(
@@ -546,7 +574,19 @@ def _backup_health(
                 "Backup tab.",
             }
         status = t2.get("status")
-        if (status is not None and status != "ok") or t2.get("confirmed") is False:
+        # backup.sh marks the off-site copy `partial` both when the CORE snapshot
+        # is incomplete and when only the extras are (the core is then complete
+        # and restorable). `offsite_core_complete` tells the two apart, as
+        # scripts/lib/backup_status_gate.py does; an extras-only gap falls
+        # through to its own, accurate warning below. A positive extras counter
+        # is required too, so a record claiming a complete core with nothing
+        # incomplete still reads as an off-site problem rather than healthy.
+        extras_only = lb.get("offsite_core_complete") is True and _extras_incomplete(
+            lb, resolved_backend
+        )
+        if (
+            (status is not None and status != "ok") or t2.get("confirmed") is False
+        ) and not extras_only:
             return {
                 "state": "warn",
                 "code": "tier2_incomplete",
@@ -566,6 +606,19 @@ def _backup_health(
             "code": "schedule_probe_failed",
             "reason": "Could not verify the backup schedule (systemctl probe failed) — "
             "check the Backup tab.",
+        }
+
+    # 10. Configured extra directories were not fully backed up (#2854).
+    #     backup.sh keeps these non-fatal by design, so `success` stays True.
+    #     Last before healthy: an opt-in extras gap is the least severe state,
+    #     so it never masks a core off-site gap (check 8) or a schedule-probe
+    #     failure (check 9), which would otherwise hide that backups stopped.
+    if _extras_incomplete(lb, resolved_backend):
+        return {
+            "state": "warn",
+            "code": "extra_dirs_incomplete",
+            "reason": "Some configured extra directories were not fully backed up "
+            "in the last run; the backup log names them.",
         }
 
     return {"state": "ok", "code": "healthy", "reason": ""}
@@ -631,9 +684,11 @@ def backup_config_get():
     """Current backup configuration for the dashboard form.
 
     Non-sensitive fields are always returned (with the repo URL credential-
-    stripped). The NAS share/user are infra detail returned only to
-    authenticated callers; passphrase/NAS password are NEVER returned — only
-    a boolean indicating whether they are set.
+    stripped). The local path, NAS share and NAS user are infra detail returned
+    only to a caller that has PROVED it is the operator — ``has_verified_credential``,
+    not ``is_authenticated``, so a passwordless install withholds them rather than
+    disclosing them. Passphrase and NAS password are NEVER returned — only a
+    boolean indicating whether they are set.
     """
     from genesis.dashboard.routes.secrets import _key_value
 
@@ -647,8 +702,20 @@ def backup_config_get():
         "passphrase_set": bool(_key_value("GENESIS_BACKUP_PASSPHRASE")),
         "nas_pass_set": bool(_key_value("GENESIS_BACKUP_NAS_PASS")),
     }
-    # Filesystem paths/shares are infra detail — only for authenticated callers.
-    if is_authenticated():
+    # Filesystem paths/shares and the NAS username are infra detail — only for a
+    # caller that has PROVED it is the operator. Not ``is_authenticated``: that
+    # opens up when no password is set, which disclosed these to the network.
+    # No ``values_withheld`` signal here, deliberately, and the reason is worth
+    # recording because the secrets registry DOES send one and the asymmetry
+    # looks like an oversight. The hazard that flag exists to prevent — an
+    # untouched field submitted as "" and read as a CLEAR — cannot occur on this
+    # route: ``backup_config_set`` below skips empty values outright
+    # (``if local_path:`` and its siblings), and the form sends a field only when
+    # it is non-empty. The SERVER layer is sufficient on its own; the form layer
+    # is a weaker second copy that only covers the browser, since any other
+    # client can post an empty field.
+    # A flag nothing reads, justified by a path that is blocked twice, is debt.
+    if has_verified_credential():
         result["local_path"] = _key_value("GENESIS_BACKUP_LOCAL_PATH")
         result["nas"] = _key_value("GENESIS_BACKUP_NAS")
         result["nas_user"] = _key_value("GENESIS_BACKUP_NAS_USER")

@@ -1,0 +1,1 @@
+- When the container's disk I/O stalls, the watchdog now logs which of its processes were doing I/O (top five by current rate, with their systemd unit and Claude Code session), plus the container's total I/O rate, next to its pressure warning. A stall in the journal now says who was doing I/O, or that the I/O came from outside the container.

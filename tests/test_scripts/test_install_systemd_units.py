@@ -115,7 +115,10 @@ _PATH_DIRECTIVES = ("ExecStart", "ExecStartPre", "ExecStartPost", "ExecStop",
 #   /bin/ /usr/ /sbin/   system binaries (`/bin/bash <script>`, systemctl)
 #   %h/.local/share/     a DEPLOY target outside the repo; the guardian units
 #                        legitimately live there and must not be flagged
-_ALLOWED_ROOT_PREFIXES = ("/bin/", "/usr/", "/sbin/", "%h/.local/share/")
+#   %h/.genesis/         the per-user DATA home, not the checkout. Templates
+#                        already reach it as __HOME__/.genesis; %h is the same
+#                        location without a rendered $HOME to quote or escape.
+_ALLOWED_ROOT_PREFIXES = ("/bin/", "/usr/", "/sbin/", "%h/.local/share/", "%h/.genesis/")
 
 
 def _path_tokens(value: str) -> list[str]:

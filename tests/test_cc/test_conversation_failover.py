@@ -23,8 +23,10 @@ from genesis.cc.exceptions import (
     CCError,
     CCMCPError,
     CCNetworkOfflineError,
+    CCOverloadedError,
     CCProcessError,
     CCRateLimitError,
+    CCReplayUnsafeError,
     CCStreamTruncatedError,
 )
 from genesis.cc.invoker import CCInvoker
@@ -55,6 +57,42 @@ _PEER_INV = CCInvocation(
     anthropic_base_url="https://glm", anthropic_auth_token="sk",
     roster_eligible=True,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("resume", [False, True])
+async def test_unsafe_overload_never_recovers_fails_over_or_parks(loop, invoker, db, streaming, resume):
+    if resume:
+        invoker.run.return_value = _output()
+        await loop.handle_message("first", user_id="u1", channel=ChannelType.TERMINAL)
+    invoker.reset_mock()
+    unsafe = CCReplayUnsafeError("after tools", cause=CCOverloadedError("529", num_turns=5))
+    invoker.run.side_effect = unsafe
+    invoker.run_streaming.side_effect = unsafe
+    loop._try_contingency = AsyncMock(return_value=None)
+    call = loop.handle_message_streaming if streaming else loop.handle_message
+    reply = await call("work", user_id="u1", channel=ChannelType.TERMINAL)
+    assert "not being retried automatically" in reply
+    assert invoker.run.await_count + invoker.run_streaming.await_count == 1
+    assert (await (await db.execute("SELECT COUNT(*) FROM cc_rate_limit_parks")).fetchone())[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_unsafe_failover_peer_stops_remaining_peers_and_parking(loop, invoker, db, monkeypatch):
+    monkeypatch.setattr(roster, "failover_invocations", lambda *a, **k: [
+        ("glm-5.2", _PEER_INV), ("second-peer", _PEER_INV),
+    ])
+    invoker.run.side_effect = [
+        CCRateLimitError("429"),
+        CCReplayUnsafeError("after tools", cause=CCOverloadedError("529", num_turns=5)),
+        _output("must never execute"),
+    ]
+    loop._try_contingency = AsyncMock(return_value=None)
+    reply = await loop.handle_message("work", user_id="u1", channel=ChannelType.TERMINAL)
+    assert "not being retried automatically" in reply
+    assert invoker.run.await_count == 2
+    assert (await (await db.execute("SELECT COUNT(*) FROM cc_rate_limit_parks")).fetchone())[0] == 0
 
 
 @pytest.fixture(autouse=True)

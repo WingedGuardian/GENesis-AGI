@@ -17,7 +17,7 @@ PASS=0
 FAIL=0
 FAIL_DETAILS=()
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 WORKTREE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SYNC_TOOL="$WORKTREE_ROOT/scripts/hooks/sync-hooks.sh"
 SRC_POST_COMMIT="$WORKTREE_ROOT/scripts/hooks/post-commit"

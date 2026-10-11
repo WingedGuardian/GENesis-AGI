@@ -259,6 +259,41 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
         misfire_grace_time=3600,
     )
 
+    async def _prune_graph_traverse() -> None:
+        # Graph-traversal telemetry (memory/graph_telemetry.py): eval_events rows
+        # read by the FalkorDB cutover verdict over a 14-day window, plus the
+        # local lost-writes file. Only that event type is pruned.
+        if rt._db is None:
+            return
+        try:
+            from genesis.db.crud import j9_eval as _j9
+            from genesis.memory import graph_telemetry as _graph
+
+            removed = await _j9.prune_event_type_older_than(
+                rt._db,
+                event_type=_graph.TELEMETRY_EVENT_TYPE,
+                days=_graph.TELEMETRY_RETENTION_DAYS,
+            )
+            _graph.prune_lost_writes()
+            rt.record_job_success("graph_traverse_prune")
+            if removed:
+                logger.info(
+                    "graph_traverse prune: removed %d rows (>%dd)",
+                    removed, _graph.TELEMETRY_RETENTION_DAYS,
+                )
+        except Exception as exc:
+            rt.record_job_failure("graph_traverse_prune", exc=exc)
+            logger.exception("graph_traverse prune failed")
+
+    scheduler.add_job(
+        _prune_graph_traverse,
+        # 06:10 — 05:00-05:50 and 06:00 are taken by the other drip prunes.
+        CronTrigger(hour=6, minute=10, timezone=user_timezone()),
+        id="graph_traverse_prune",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
     async def _prune_events() -> None:
         # The observability event bus is the ONLY high-volume table with no
         # retention (45k+ rows / ~108d, growing ~12x month-over-month). Unlike

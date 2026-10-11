@@ -1,0 +1,1 @@
+- Restore NVIDIA free routing with DeepSeek V4.1 Flash after the previous endpoint retired; use MiMo V2.6 Pro for ordinary paid Pro routes and both Fusion panels, preserving the protected novelty and evaluation judge baselines.

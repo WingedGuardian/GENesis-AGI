@@ -545,3 +545,194 @@ def test_freshness_helpers_keep_dismissed_semantics(monkeypatch):
     )
     assert _mod._codex_review_commit_ids("1372") == [HEADS[0]]
     assert _mod._latest_codex_reviewed_sha("1372") == HEADS[0]
+
+
+# -- the round rule after its cutover (any App reviewer's findings) ------------
+
+_AFTER_CUTOVER = "2099-01-01T00:00:00Z"
+_DEVIN = "devin-ai-integration[bot]"
+_DEVIN_FINDING = '<!-- devin-review-comment {"id": "B1"} -->\n\n🟡 **Off by one**\n'
+
+
+def _app_reviews(monkeypatch, *records):
+    """Replace the review seam with post-cutover records of the given shape."""
+    monkeypatch.setenv(
+        "_TEST_GH_CODEX_REVIEWS",
+        _jsonl(
+            {
+                "login": login,
+                "commit_id": sha,
+                "state": "COMMENTED",
+                "submitted_at": _AFTER_CUTOVER,
+                "body": "",
+                "top_level": [_DEVIN_FINDING] if finding else [],
+            }
+            for login, sha, finding in records
+        ),
+    )
+
+
+def test_post_cutover_findings_from_another_app_reach_the_cap(monkeypatch):
+    """After the cutover a Devin finding opens a round exactly as a Codex one did,
+    and a clean review adds none: the guard reads the same evaluator."""
+    _evidence(monkeypatch)
+    _app_reviews(monkeypatch, *((_DEVIN, h, True) for h in HEADS[:3]))
+    assert _decision() == ("allow", "")
+    _app_reviews(monkeypatch, *((_DEVIN, h, True) for h in HEADS[:4]))
+    decision, reason = _decision()
+    assert decision == "ask" and "4 review rounds" in reason
+    _app_reviews(monkeypatch, *((_DEVIN, h, False) for h in HEADS[:4]))
+    assert _decision() == ("allow", "")
+
+
+def test_a_clean_confirmation_spends_the_gate_lanes_one_free_request(monkeypatch):
+    """Clean reviews add no round, so the gate lane must not grant its one
+    confirmation again at the next head (architect review of A2b, 2026-10-01)."""
+    rounds = ((_DEVIN, HEADS[0], True), (_DEVIN, HEADS[1], True))
+    gate = ("scripts/hooks/git_push_guard.py",)
+    _evidence(monkeypatch, head=HEADS[2], files=gate)
+    _app_reviews(monkeypatch, *rounds)
+    marker = _mod._review_budget.confirmation_marker(HEADS[2])
+    assert _decision(f"gh pr comment 1372 --repo owner/repo --body '@codex review\n{marker}'") == (
+        "allow",
+        "",
+    )
+    posted = (("a-maintainer", "User", _mod._review_budget.confirmation_marker(HEADS[2])),)
+    _evidence(monkeypatch, head=HEADS[3], files=gate, comments=posted)
+    _app_reviews(monkeypatch, *rounds, (CODEX, HEADS[2], False))
+    marker = _mod._review_budget.confirmation_marker(HEADS[3])
+    decision, _ = _decision(
+        f"gh pr comment 1372 --repo owner/repo --body '@codex review\n{marker}'"
+    )
+    assert decision == "ask"
+
+
+# ── hooks.asks.review_request: silences ONLY the unreadable-history ask ──────
+
+
+def _unreadable(monkeypatch, *errors):
+    """GitHub unreadable JUST NOW: the evaluator's transient read-failure result."""
+    _evidence(monkeypatch)
+    codes = errors or ("graphql_unreadable", "gh_failure:http_502")
+    monkeypatch.setattr(
+        _mod._review_budget,
+        "evaluate_pr",
+        lambda *a, **k: _mod._review_budget._unknown(*codes),
+    )
+
+
+def test_unreadable_history_prompt_names_why(monkeypatch):
+    _unreadable(monkeypatch)
+    decision, reason = _decision()
+    assert decision == "ask"
+    assert "could not be read reliably. Evaluator: " in reason
+
+
+def test_review_request_off_turns_only_the_unreadable_ask_into_a_note(monkeypatch, capsys):
+    _unreadable(monkeypatch)
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    assert _decision()[0] == "note"
+
+    _payload(monkeypatch, TRIGGER)
+    assert _mod.main() == 0
+    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert "permissionDecision" not in out
+    assert "hooks.asks.review_request: off" in out["additionalContext"]
+    assert "could not be read reliably" in out["additionalContext"]
+
+
+def test_review_request_off_keeps_the_round_cap_ask(monkeypatch, capsys):
+    _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:4]])
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    assert _decision()[0] == "ask"
+    _payload(monkeypatch, TRIGGER)
+    assert _mod.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "ask"
+
+
+def test_review_request_off_keeps_the_unresolved_target_ask(monkeypatch):
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    assert _decision('gh pr comment --body "@codex review"')[0] == "ask"
+
+
+def test_review_request_off_still_denies_a_dispatched_session(monkeypatch, capsys):
+    _unreadable(monkeypatch)
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    _payload(monkeypatch, TRIGGER)
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    assert _mod.main() == 2
+    assert "could not be read reliably" in capsys.readouterr().err
+
+
+def test_review_request_off_still_refuses_a_compound(monkeypatch, capsys):
+    _unreadable(monkeypatch)
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    _payload(monkeypatch, f"{TRIGGER} && git commit -m x")
+    assert _mod.main() == 2
+    assert "review request separately" in capsys.readouterr().err
+
+
+def test_review_request_on_keeps_the_unreadable_ask(monkeypatch):
+    _unreadable(monkeypatch)
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=on")
+    assert _decision()[0] == "ask"
+
+
+def test_evaluator_exception_is_named_in_the_prompt(monkeypatch):
+    _evidence(monkeypatch)
+
+    def boom(*a, **k):
+        raise TimeoutError("slow")
+
+    monkeypatch.setattr(_mod._review_budget, "evaluate_pr", boom)
+    decision, reason = _decision()
+    assert decision == "ask"
+    assert "evaluator_raised:TimeoutError" in reason
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "review_findings_deleted",
+        "commits_response_truncated",
+        "invalid_external_identity_template",
+        "evidence_changed_during_evaluation",
+        "codex_findings_comment_unbound",
+    ],
+)
+def test_review_request_off_keeps_persistent_and_tamper_codes_asking(monkeypatch, code):
+    _unreadable(monkeypatch, code)
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    assert _decision()[0] == "ask"
+
+
+def test_review_request_off_keeps_a_malformed_record_asking(monkeypatch):
+    _evidence(monkeypatch)
+    monkeypatch.setenv("_TEST_REVIEW_BUDGET_COMMITS", "not-json")
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    assert _decision()[0] == "ask"
+
+
+def test_review_request_off_needs_the_request_to_be_the_whole_command(monkeypatch):
+    _unreadable(monkeypatch)
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    assert _decision(f"{TRIGGER} && gh pr ready 1372")[0] == "ask"
+
+
+def test_hook_side_failures_are_not_transient(monkeypatch):
+    _evidence(monkeypatch)
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+
+    def boom(*a, **k):
+        raise TimeoutError("slow")
+
+    monkeypatch.setattr(_mod._review_budget, "evaluate_pr", boom)
+    assert _decision()[0] == "ask"
+
+
+def test_an_evaluator_without_the_allowlist_asks(monkeypatch):
+    _unreadable(monkeypatch)
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    monkeypatch.delattr(_mod._review_budget, "errors_are_transient")
+    assert _decision()[0] == "ask"

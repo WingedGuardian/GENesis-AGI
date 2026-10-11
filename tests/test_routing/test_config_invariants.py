@@ -1,6 +1,6 @@
 """Invariants on the SHIPPED routing config (config/model_routing.yaml).
 
-Guards the 2026-08 NIM repoint (after NVIDIA NIM EOL'd deepseek-v4-pro (HTTP 410)
+Guards the 2026-08 and 2026-10 NIM repoints (after NVIDIA NIM EOL'd deepseek-v4-pro (HTTP 410)
 and made kimi-k2.6 404-for-account): no re-introduction of those dead NIM model
 slugs, every call-site keeps a non-NIM fallback (NIM's free tier churns silently),
 the adversarial `_challenge` sites stay model-independent from their base, and the
@@ -15,10 +15,11 @@ from genesis.routing.config import load_config
 
 # NIM model slugs this repoint removed because they are dead for our account —
 # deepseek-v4-pro (HTTP 410 EOL) and kimi-k2.6 (404-for-account), both verified by
-# live probe 2026-08-19. A regression that repoints a NIM provider back to either
-# silently reopens the free->paid fallback leak this PR closed.
+# live probe 2026-08-19. V4 Flash 0731 retired in September (verified October 1).
+# Reintroducing a retired slug forces otherwise-free calls onto paid fallbacks.
 _DEAD_NIM_SLUGS = {
     "deepseek-ai/deepseek-v4-pro",
+    "deepseek-ai/deepseek-v4-flash-0731",  # HTTP 410 EOL, verified 2026-10-01
     "moonshotai/kimi-k2.6",
 }
 

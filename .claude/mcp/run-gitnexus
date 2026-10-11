@@ -6,7 +6,7 @@
 
 set -u
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GENESIS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PIN_FILE="$GENESIS_ROOT/scripts/lib/gitnexus_version.sh"
 
@@ -22,6 +22,11 @@ if ! source "$PIN_FILE" \
     || ! declare -F genesis_gitnexus_installed_version >/dev/null \
     || ! declare -F genesis_gitnexus_installed_is_pinned >/dev/null; then
     printf 'run-gitnexus: invalid pin metadata; refusing to start\n' >&2
+    exit 1
+fi
+
+if ! declare -F genesis_gitnexus_select_node >/dev/null || ! genesis_gitnexus_select_node; then
+    printf 'run-gitnexus: Node selection refused; refusing to start\n' >&2
     exit 1
 fi
 

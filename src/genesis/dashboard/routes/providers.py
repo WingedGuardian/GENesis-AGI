@@ -49,7 +49,7 @@ def provider_toggle(name: str):
         return jsonify({"status": "error", "message": "circuit breaker registry not available"}), 503
 
     try:
-        cb = breakers.get(name)
+        state = breakers.toggle(name)
     except KeyError:
         return jsonify({"status": "error", "message": f"provider '{name}' not found"}), 404
 
@@ -58,13 +58,11 @@ def provider_toggle(name: str):
     # the attention strip keep showing the pre-toggle status.
     from genesis.dashboard.routes.health import invalidate_snapshot_cache
 
-    if cb.state == ProviderState.OPEN:
-        cb.force_close()  # persists via the breaker's own change hook
+    if state == ProviderState.CLOSED:
         invalidate_snapshot_cache()
         logger.info("Provider '%s' re-enabled via dashboard (breaker reset to CLOSED)", name)
         return jsonify({"status": "ok", "name": name, "state": "closed", "enabled": True})
     else:
-        cb.force_open()  # persists via the breaker's own change hook
         invalidate_snapshot_cache()
         logger.info("Provider '%s' disabled via dashboard (breaker forced OPEN)", name)
         return jsonify({"status": "ok", "name": name, "state": "open", "enabled": False})

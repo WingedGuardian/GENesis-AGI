@@ -190,6 +190,74 @@ def test_the_note_states_the_limit_it_cannot_see():
     assert "silence is not evidence" in note
 
 
+#: The phrases the superseded-PR exception must carry in EVERY note: who may use
+#: it, and the evidence each condition needs (owner rulings 2026-10-04 for the
+#: closing session and 2026-10-06 for a rework's builder; the genesis-development
+#: skill, "A superseded PR is the one exception").
+_EXCEPTION_PHRASES = (
+    "only two sessions may use",
+    "the CLOSING session, or the BUILDER of a rework that replaces this PR",
+    "Never a reviewer session",
+    "never Devin, even as a rework's builder",
+    "only when all three hold",
+    "a `## Rework spec` comment on this PR posted by a maintainer",
+    "including a non-maintainer author of this PR, is not authorization",
+    "the LAST replacement has opened and every replacement is open or merged",
+    "owner's authorization of the supersession is on record",
+    "successor PR is open or merged",
+    "checked against the successor and current main",
+    "naming the file:line that now does it",
+    "moot (saying why)",
+    "a retired PR keeps its labels",
+    "the PR stays open with a comment naming that part",
+)
+
+
+def _assert_full_exception(note: str) -> None:
+    for phrase in _EXCEPTION_PHRASES:
+        assert phrase in note, f"note lost {phrase!r}"
+
+
+def test_the_note_states_the_superseded_pr_exception():
+    """The skill lets the closing session retire a wholly superseded PR under three
+    conditions. A note saying superseded PRs always stay open would contradict the
+    rule it exists to surface, and one that drops a condition's evidence or the
+    closing-session scope would license a close the rule does not."""
+    note = _note(_run("gh pr close 1"))
+    _assert_full_exception(note)
+    assert "also stays open" not in note
+    # The conditions bind BOTH eligible sessions, and a rework's builder is also
+    # its reviving session, so the reviving-session route must exclude it.
+    assert (
+        "(b) you are the closing session, or the builder of a rework that "
+        "replaces this PR, and all three conditions above hold" in note
+    )
+    assert "(c) you are reviving this PR with no rework replacing it" in note
+    assert "a rework's builder retires only under the superseded-PR" in note
+    assert "if you are Devin and this PR is one your rework replaces, do not " in note
+    assert "let the user answer" in note
+    skill = (
+        Path(__file__).resolve().parents[2]
+        / ".claude"
+        / "skills"
+        / "genesis-development"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "**A superseded PR is the one exception" in skill, (
+        "the skill no longer states the exception this note describes"
+    )
+
+
+def test_the_short_note_states_the_superseded_pr_exception_too():
+    """A command the parse cannot read gets the short note instead. A session that
+    never loaded the skill sees only this text, so it carries the full exception,
+    not a pointer to "that rule's conditions"."""
+    note = _note(_run("echo ok # a note \\\ngh pr close 5"))
+    assert "could not check whether it closes" in note
+    assert "unless you are reviving it with no rework replacing it" in note
+    _assert_full_exception(note)
+
+
 def test_it_names_every_distinct_close_in_a_compound():
     """A reader deciding whether to proceed needs to know the command closes two
     things by two routes, not that it closes something."""

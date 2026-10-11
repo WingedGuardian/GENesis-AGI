@@ -4,7 +4,10 @@
 WHAT THIS IS. One sentence the owner otherwise types by hand before every plan --
 "give me your confidence and due diligence" -- emitted automatically around plan
 mode, so it becomes part of the process rather than something they have to
-remember to say.
+remember to say. For development plans it also paraphrases checklist items 1
+and 5 of the genesis-development skill's "Due diligence before building" and its
+"Architecture Review" rule, and points at both sections rather than restating
+them here.
 
 WHEN IT FIRES DECIDES WHAT IT CAN CHANGE, and the two moments are NOT equivalent.
 An earlier revision of this hook was wired to ExitPlanMode alone and its docstring
@@ -142,8 +145,17 @@ MOMENT = {
 #: unconstructible instead of tested-for.
 SCOPE = tuple(MOMENT)
 
+#: The genesis-development SKILL.md sections this reminder points at. A test
+#: checks each heading still exists, so a rename cannot leave a pointer dangling.
+CHECKLIST_HEADING = "Due diligence before building"
+REVIEW_HEADING = "Architecture Review"
+
 #: The verbiage. Names BOTH asks, because the reminder exists to replace a
-#: sentence that always named both.
+#: sentence that always named both. The second block paraphrases checklist items
+#: 1 and 5 and the Architecture Review rule, then points at both sections for the
+#: rest. Tests check that both headings exist and pin key phrases of each
+#: paraphrase in the emitted text; nothing compares the paraphrases with
+#: SKILL.md, so update the text and its test when those rules change.
 REMINDER = (
     "State your CONFIDENCE and your DUE DILIGENCE.\n"
     "  - Confidence per item, as a percentage with the rationale, and what "
@@ -154,6 +166,17 @@ REMINDER = (
     "has run on this install.\"\n"
     "  - Anything below 90% gets investigated before it is planned around, not "
     "after.\n"
+    "For a development plan presented for approval (not a /task plan), also:\n"
+    "  - Every free read done: each read-only check, or probe that changes "
+    "nothing beyond scratch state, whose answer could change the plan; or named "
+    "as a residual with the reason it cannot be settled.\n"
+    "  - The one genesis-architect plan review run, and its findings re-derived "
+    "and folded in before you present. Not for a plan too small to write down; "
+    "a revision answering it does not re-run it.\n"
+    "  - Measured technical edge cases are yours to decide and state. Ask the "
+    "owner about intent, trade-offs, and the carve-outs the checklist lists.\n"
+    f"  - The rest: genesis-development skill, \"{CHECKLIST_HEADING}\" and "
+    f"\"{REVIEW_HEADING}\".\n"
     "This fires on every plan. It is not a judgement about this one."
 )
 

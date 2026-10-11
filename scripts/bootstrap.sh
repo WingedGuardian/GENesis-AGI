@@ -30,20 +30,72 @@ echo "=== Genesis Bootstrap ==="
 echo "Genesis root: $GENESIS_ROOT"
 echo
 
-# ── Live-system guard — BEFORE anything mutating (incl. the crash-recovery
-# block below, whose git reset --hard is also unsafe on a live system).
+# ── Live-system guard — BEFORE anything mutating, including crash recovery.
 # update.sh opts out via GENESIS_BOOTSTRAP_ALLOW_LIVE=1; humans use --force.
 # shellcheck source=lib/live_system_guard.sh
 . "$SCRIPT_DIR/lib/live_system_guard.sh"
 bootstrap_refuse_if_server_live "$@" || exit 3
 
-# ── Crash recovery: check for interrupted update ─────────
+# shellcheck source=lib/deploy_marker.sh
+. "$SCRIPT_DIR/lib/deploy_marker.sh"
+# shellcheck source=lib/deploy_checkout.sh
+. "$SCRIPT_DIR/lib/deploy_checkout.sh"
+# shellcheck source=lib/deploy_recovery.sh
+. "$SCRIPT_DIR/lib/deploy_recovery.sh"
+
+# BEGIN crash-recovery
 UPDATE_STATE="$HOME/.genesis/update_state.json"
+_crash_recovery_refuse() {
+    local _reason="$1" _current_branch _current_head
+    _current_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+    _current_head="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null || true)"
+    echo "  REFUSE: $_reason." >&2
+    echo "  Current branch/HEAD: ${_current_branch:-<detached>} @ ${_current_head:-<unreadable>}; rollback tag: ${ROLLBACK_TAG:-<missing>} @ ${rb_commit:-<unresolved>}." >&2
+    echo "  Resolve the checkout, then re-run scripts/bootstrap.sh; or finish forward with scripts/update.sh --post-merge; or remove ~/.genesis/update_state.json once decided." >&2
+    exit 1
+}
+
 if [ -f "$UPDATE_STATE" ]; then
     echo "--- Detected interrupted update state file ---"
-    # Read phase and PID from state file
-    STATE_PHASE=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('phase','unknown'))" 2>/dev/null || echo "unknown")
-    STATE_PID=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('pid',0))" 2>/dev/null || echo "0")
+    ROLLBACK_TAG=""
+    rb_commit=""
+    if ! _state_fields="$(python3 - "$UPDATE_STATE" 2>/dev/null <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        state = json.load(f)
+    if not isinstance(state, dict):
+        raise ValueError("state is not an object")
+    def text_field(key, default=""):
+        value = state.get(key, default)
+        if not isinstance(value, str):
+            raise ValueError(f"{key} is not a string")
+        return value
+    pid = state.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        raise ValueError("pid is not an integer")
+    fields = [
+        text_field("phase", "unknown"),
+        str(pid),
+        text_field("rollback_tag"),
+        text_field("original_branch"),
+        text_field("own_head"),
+        text_field("deploy_head"),
+        "1" if "original_branch" in state else "0",
+    ]
+    if any(ord(char) < 0x20 for value in fields for char in value):
+        raise ValueError("control character in state field")
+    print("\x1f".join(fields))
+except Exception:
+    sys.exit(1)
+PY
+)"; then
+        _crash_recovery_refuse "update state is unreadable"
+    fi
+    IFS=$'\x1f' read -r STATE_PHASE STATE_PID ROLLBACK_TAG ORIGINAL_BRANCH OWN_HEAD DEPLOY_HEAD ORIGINAL_BRANCH_PRESENT \
+        <<< "$_state_fields"
 
     # Check if the update process is still alive. Bare `kill -0` ON PURPOSE, unlike
     # the marker readers (lib/deploy_marker.sh, genesis.env), which also reject a
@@ -56,23 +108,116 @@ if [ -f "$UPDATE_STATE" ]; then
         rm -f "$UPDATE_STATE"
     else
         echo "  Update CRASHED in phase '$STATE_PHASE' (pid $STATE_PID is dead)."
+        if [ -z "$ROLLBACK_TAG" ] || ! git -C "$GENESIS_ROOT" check-ref-format "refs/tags/$ROLLBACK_TAG" >/dev/null 2>&1; then
+            _crash_recovery_refuse "no valid rollback tag is recorded"
+        fi
+        rb_commit="$(git -C "$GENESIS_ROOT" rev-parse -q --verify "refs/tags/$ROLLBACK_TAG^{commit}" 2>/dev/null)" \
+            || _crash_recovery_refuse "rollback tag $ROLLBACK_TAG cannot be resolved to a commit"
 
-        # Abort any in-progress merge
-        if [ -f "$GENESIS_ROOT/.git/MERGE_HEAD" ]; then
-            echo "  Aborting in-progress merge..."
-            git -C "$GENESIS_ROOT" merge --abort 2>/dev/null || true
+        current_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+        if [ "$ORIGINAL_BRANCH_PRESENT" = "1" ]; then
+            [ -n "$ORIGINAL_BRANCH" ] || _crash_recovery_refuse "the recorded original branch is empty"
+            recovery_branch="$ORIGINAL_BRANCH"
+        else
+            recovery_branch="$current_branch"
         fi
 
-        # Read rollback tag from state file
-        ROLLBACK_TAG=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('rollback_tag',''))" 2>/dev/null || echo "")
+        # update.sh aborts its own conflicted merges before exiting, so a
+        # remaining MERGE_HEAD means a kill mid-merge or an external merge.
+        # Aborting can discard subsequent work; leave that decision to the operator.
+        recovery_git_dir="$(git -C "$GENESIS_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" \
+            || _crash_recovery_refuse "cannot read the git directory"
+        if [ -e "$recovery_git_dir/MERGE_HEAD" ]; then
+            _crash_recovery_refuse "a merge is in progress; save any edits you want to keep, run git -C \"$GENESIS_ROOT\" merge --abort yourself, then re-run scripts/bootstrap.sh"
+        fi
 
-        if [ -n "$ROLLBACK_TAG" ] && git -C "$GENESIS_ROOT" rev-parse "$ROLLBACK_TAG" >/dev/null 2>&1; then
-            echo "  Rolling back to $ROLLBACK_TAG..."
-            git -C "$GENESIS_ROOT" reset --hard "$ROLLBACK_TAG" 2>&1 || true
-            echo "  Rollback complete."
+        # The state does not say whether migrations ran or which database
+        # snapshot matches, so neither a code rollback nor clearing the state is
+        # safe once the update reached them. This comes before the "already at
+        # the tag" branch: a no-delta update still runs activation when tier-2
+        # work is pending, so it reaches these phases with HEAD at the tag.
+        case "$STATE_PHASE" in
+            migrations|health_check)
+                _crash_recovery_refuse "the update died in phase '$STATE_PHASE', after its database migrations may have run; the code was left in place with the database it may have migrated (restore data/genesis.db.pre-update by hand only together with the old code)"
+                ;;
+            fetching|merging|bootstrap) ;;
+            *)
+                # update.sh writes only the phases above (and done, handled
+                # earlier); anything else is a hand edit or another version.
+                _crash_recovery_refuse "unknown update phase '$STATE_PHASE'"
+                ;;
+        esac
+
+        if genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$recovery_branch"; then
+            # In the merging phase, a dirty checkout at the tag is what a
+            # fast-forward killed mid-write leaves: HEAD unmoved, files half
+            # new. update.sh treats that state as CRITICAL; installing over it
+            # would run half-written code, so refuse and keep the state file.
+            # Every tracked path counts here, the ephemeral allowlist included:
+            # the merge writes those too, and the deployability predicate below
+            # skips them. git status cannot see a file whose index entry is
+            # flagged skip-worktree or assume-unchanged, so the lib's hidden-edit
+            # scan runs as well.
+            if [ "$STATE_PHASE" = "merging" ]; then
+                merge_dirty="" merge_hidden=""
+                if ! merge_dirty="$(git -C "$GENESIS_ROOT" status --porcelain --untracked-files=no --no-renames 2>/dev/null)"; then
+                    merge_dirty="(status unreadable)"
+                fi
+                if ! merge_hidden="$(_genesis_hidden_dirty_lines "$GENESIS_ROOT" 2>/dev/null)"; then
+                    merge_hidden="(flagged-entry status unreadable)"
+                fi
+                # A fast-forward killed after writing only the files the range
+                # ADDS leaves them untracked, which status cannot show. update.sh's
+                # pre-stop scan refuses a range that lands on an existing
+                # untracked path, so one present now appeared during the run.
+                merge_new=""
+                if [ -n "$DEPLOY_HEAD" ]; then
+                    collide_rc=0
+                    merge_new="$(genesis_range_collisions "$GENESIS_ROOT" "$rb_commit" "$DEPLOY_HEAD" 2>/dev/null)" \
+                        || collide_rc=$?
+                    if [ "$collide_rc" -eq 2 ]; then
+                        merge_new="(the update's incoming range cannot be listed)"
+                    fi
+                fi
+                merge_dirty="$(printf '%s\n%s\n%s\n' "$merge_dirty" "$merge_hidden" "$merge_new" | grep -v '^$' || true)"
+                if [ -n "$merge_dirty" ]; then
+                    printf '%s\n' "$merge_dirty" | sed 's/^/    /'
+                    _crash_recovery_refuse "the checkout is at $ROLLBACK_TAG but tracked files changed during the merge (a half-written update or edits by someone else)"
+                fi
+            fi
+            dirty_paths=""
+            if ! dirty_paths="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")"; then
+                dirty_paths="(status unreadable)"
+            fi
+            if [ -n "$dirty_paths" ]; then
+                echo "  WARNING: tracked paths may be an interrupted merge's files or someone's edits; nothing was reset:"
+                printf '%s\n' "$dirty_paths" | sed 's/^/    /'
+            fi
+            echo "  The checkout is already at $ROLLBACK_TAG on $recovery_branch; nothing to undo."
+        elif [ "$ORIGINAL_BRANCH_PRESENT" != "1" ]; then
+            _crash_recovery_refuse "old-format update state and the checkout has moved from its rollback tag"
         else
-            echo "  No rollback tag found — resetting to HEAD."
-            git -C "$GENESIS_ROOT" reset --hard HEAD 2>&1 || true
+            case "$STATE_PHASE" in
+                merging) ;;
+                bootstrap)
+                    # bootstrap.sh seeds the schema (create_all_tables) in this
+                    # phase, so the database may already match the merged code.
+                    _crash_recovery_refuse "the update died in phase 'bootstrap', which can change the database schema; the merged code was left in place with the database"
+                    ;;
+                *)
+                    _crash_recovery_refuse "the checkout moved while the update was in phase '$STATE_PHASE', before it could have merged"
+                    ;;
+            esac
+            # Only the exact head update.sh recorded as its own merge is undone.
+            # It records that head the moment it adopts the merge, so a checkout
+            # anywhere else (someone's commit or pull, another branch) is left.
+            genesis_checkout_unmoved "$GENESIS_ROOT" "$OWN_HEAD" "$ORIGINAL_BRANCH" \
+                || _crash_recovery_refuse "the checkout is not at the merge this update recorded as its own; refusing to change code it does not own"
+            if ! genesis_rollback_checkout \
+                "$GENESIS_ROOT" "$ROLLBACK_TAG" "$ORIGINAL_BRANCH" "$EPHEMERAL_BACKUP_ROOT" "$rb_commit"; then
+                _crash_recovery_refuse "the non-forced rollback checkout was refused; code was left in place"
+            fi
+            echo "  Recovery checkout returned $ORIGINAL_BRANCH to $ROLLBACK_TAG."
         fi
 
         # Record crash recovery
@@ -104,10 +249,11 @@ except Exception as e:
 
         rm -f "$UPDATE_STATE"
         rm -f "$HOME/.genesis/update_in_progress.pid"
-        echo "  Crash recovery complete. Continuing bootstrap with rolled-back code."
+        echo "  Crash recovery complete. Continuing bootstrap."
         echo ""
     fi
 fi
+# END crash-recovery
 
 # --- Prerequisites ---
 echo "--- Checking and installing prerequisites ---"
@@ -486,14 +632,10 @@ if ! command -v uv &>/dev/null; then
     [[ -n "$_uv_installer" ]] && rm -f "$_uv_installer"
     export PATH="$HOME/.local/bin:$PATH"
 fi
+# shellcheck source=lib/serena_install.sh
+. "$SCRIPT_DIR/lib/serena_install.sh"
 if command -v uv &>/dev/null; then
-    if ! command -v serena &>/dev/null; then
-        echo "  Serena not found — installing..."
-        uv tool install serena-agent 2>/dev/null || echo "  WARNING: Serena install failed (non-critical)"
-    else
-        echo "  Serena: upgrading..."
-        uv tool upgrade serena-agent 2>/dev/null || echo "  WARNING: Serena upgrade failed (non-critical)"
-    fi
+    _install_serena
 fi
 if command -v serena &>/dev/null; then
     echo "  Serena: $(serena --version 2>/dev/null || echo 'installed')"
@@ -788,11 +930,11 @@ if command -v codebase-memory-mcp &>/dev/null; then
         echo "  codebase-memory-mcp registered to the launcher; the kill switch is active, so it will refuse to start"
     fi
 fi
-if command -v serena &>/dev/null; then
+if _serena_registration_available; then
     # `-s project` writes .mcp.json keyed to the git-root of the CURRENT dir (no
     # flag overrides this), so register from the repo root regardless of the
     # caller's cwd — else bootstrap run from elsewhere writes to the wrong repo. B5.
-    ( cd "$GENESIS_ROOT" && _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$GENESIS_ROOT" )
+    ( cd "$GENESIS_ROOT" && _register_serena "$GENESIS_ROOT" )
 fi
 # grep-app (grep.app) — literal/regex code search over ~1M public GitHub repos.
 # Registered as `grep-app`, NOT the `grep` that grep.app's own docs use: a name
@@ -1129,6 +1271,24 @@ else
 fi
 echo
 
+# --- Graph engine (FalkorDB) provisioning ---
+# Same guarded-source contract as the resilience libs. Fetches and verifies the
+# engine MODULE under ~/.genesis/deps and stops there — no system change; the
+# redis-server that loads it is an operator step (SETUP.md). The unit rendered
+# below is left DISABLED, so a box where this skips entirely is fully
+# functional — the memory graph keeps using its in-process NetworkX projection.
+echo "--- Graph engine (optional) ---"
+if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
+    # shellcheck source=lib/falkordb_install.sh
+    source "$SCRIPT_DIR/lib/falkordb_install.sh"
+    falkordb_provision
+else
+    echo "  WARNING: lib/falkordb_install.sh missing — skipping graph-engine provisioning"
+    # Nothing could be verified, so an existing unit must not be re-rendered.
+    falkordb_unit_keep_existing() { [[ -f "$1" ]]; }
+fi
+echo
+
 # --- Systemd service sync ---
 echo "--- Syncing systemd service files ---"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
@@ -1161,37 +1321,61 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         CC_BIN_DIR="$CC_BIN_DIR:$_cc_prefix/bin"
     fi
 
-    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
+    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template "$SYSTEMD_TEMPLATE_DIR"/*.slice.template; do
         [[ -f "$template" ]] || continue
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
+        # The graph engine's unit only advances to a module that is verified on
+        # disk. Provisioning above returns 0 when it skips or fails, so without
+        # this a failed or unpinned provision would point a working unit at a
+        # missing .so, breaking the engine at its next restart.
+        if [[ "$svc_name" == "genesis-falkordb.service" ]] \
+            && falkordb_unit_keep_existing "$target"; then
+            # Keeping the unit does not keep its module: provisioning removes (or,
+            # failing that, de-executes) a cached module it cannot authenticate,
+            # which may be the very file this unit loads. Say which one this is.
+            _kept_module="$(falkordb_unit_loaded_module "$target" 2>/dev/null || true)"
+            if [[ -n "$_kept_module" && ! -x "$_kept_module" ]]; then
+                echo "  WARNING: kept $svc_name, but the module it loads is missing or not executable ($_kept_module):"
+                echo "           the engine will not start until bootstrap verifies a module."
+            else
+                echo "  Kept: $svc_name (FalkorDB module ${FALKORDB_VERSION:-unknown} not verified on disk; unit not re-rendered)"
+            fi
+            continue
+        fi
+        # Escape every replacement for the `s|...|...|` grammar (`\`, `&`, `|`)
+        # the same way install.sh's renderer does: a `&` in $HOME or a `|` in an
+        # overridden FALKORDB_VERSION would corrupt the expression or make sed
+        # fail outright, and a failing render aborts bootstrap — the UPDATE
+        # path — under set -e.
+        _sed_repl_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+        _home_esc=$(_sed_repl_esc "$HOME")
+        _venv_esc=$(_sed_repl_esc "$GENESIS_ROOT/.venv")
+        _repo_esc=$(_sed_repl_esc "$GENESIS_ROOT")
+        _ccbin_esc=$(_sed_repl_esc "$CC_BIN_DIR")
         # Every token any template uses must appear here, and `sed` will NOT
         # tell you when one is missing — an unknown `__TOKEN__` passes through
         # verbatim into a unit that then installs and enables reporting success.
         # __AZ_ROOT__ is the instance that proves it: install.sh gained the
         # expression, this loop never did, and agent-zero.service rendered here
         # with a literal `WorkingDirectory=__AZ_ROOT__` (MEASURED on a live
-        # install) while the venv path one line below it came out correct.
-        # Default matches install.sh and scripts/vendor_assets.sh.
-        # Parity with install.sh is pinned by
+        # install). Parity with install.sh is pinned by
         # tests/test_scripts/test_systemd_template_placeholders.py.
-        #
-        # ESCAPED, unlike the four above it, and the asymmetry is deliberate:
-        # AZ_ROOT is the only one an OPERATOR supplies (an env var), while the
-        # others are computed here. MEASURED what unescaped does — `&` is sed's
-        # whole-match backreference, so AZ_ROOT=/tmp/R&D renders
-        # `WorkingDirectory=/tmp/R__AZ_ROOT__D`, putting the literal token BACK
-        # into the unit this line exists to fix; and a `|` makes sed exit 1,
-        # which under this script's `set -euo pipefail` aborts the whole render
-        # loop with units half-written. install.sh escapes all five via
-        # _sed_repl_esc; this matches it rather than widening the gap.
-        _az_root_esc=$(printf '%s' "${AZ_ROOT:-$HOME/agent-zero}" | sed -e 's/[\\&|]/\\&/g')
-        rendered=$(sed -e "s|__HOME__|$HOME|g" \
-                       -e "s|__VENV__|$GENESIS_ROOT/.venv|g" \
-                       -e "s|__REPO_DIR__|$GENESIS_ROOT|g" \
-                       -e "s|__CC_BIN_DIR__|$CC_BIN_DIR|g" \
+        _az_root_esc=$(_sed_repl_esc "${AZ_ROOT:-$HOME/agent-zero}")
+        # FALKORDB_VERSION is set by lib/falkordb_install.sh, sourced just above (the
+        # source of truth for the pin); the literal fallback keeps the render
+        # working when that lib is absent, in which case the unit is inert
+        # anyway because no module was installed.
+        _falkordb_ver_esc=$(_sed_repl_esc "${FALKORDB_VERSION:-4.20.4}")
+        _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)")
+        rendered=$(sed -e "s|__HOME__|$_home_esc|g" \
+                       -e "s|__VENV__|$_venv_esc|g" \
+                       -e "s|__REPO_DIR__|$_repo_esc|g" \
+                       -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
                        -e "s|__AZ_ROOT__|$_az_root_esc|g" \
+                       -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
+                       -e "s|__REDIS_SERVER__|$_redis_bin_esc|g" \
                        "$template")
         if [[ -f "$target" ]]; then
             current=$(cat "$target")
@@ -1214,6 +1398,19 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     systemctl --user daemon-reload 2>/dev/null || true
     if [[ "$SERVICES_UPDATED" = "1" ]]; then
         echo "  systemd daemon reloaded (units changed)"
+    fi
+
+    # A user manager stops at logout without lingering, taking every enabled
+    # timer with it — `Persistent=true` only replays the miss once the manager
+    # next starts, which for a daily watcher may be never. Mirror install.sh.
+    if command -v loginctl &>/dev/null; then
+        if ! loginctl show-user "$(whoami)" 2>/dev/null | grep -q "Linger=yes"; then
+            if loginctl enable-linger "$(whoami)" 2>/dev/null; then
+                echo "  + linger enabled for $(whoami)"
+            else
+                echo "  WARNING: could not enable linger (timers stop on logout)"
+            fi
+        fi
     fi
 
     # Enable + start every rendered timer (idempotent), EXCEPT timers that are a

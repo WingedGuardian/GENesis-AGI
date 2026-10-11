@@ -44,9 +44,10 @@ genesis_is_primary_checkout() {
 
 # Is <root> standing on $DEPLOY_BRANCH? Sets _branch (empty on a detached HEAD).
 #   --allow-override  honour GENESIS_ALLOW_NON_DEPLOY_BRANCH=1, which admits another
-#                     NAMED branch. Never a detached HEAD, and never `live`: an
-#                     integration branch is refused until deploying one is decided
-#                     on its own. Only update.sh passes it.
+#                     NAMED branch. Never a detached HEAD, and never `live`: the
+#                     override cannot admit the integration branch, which a caller
+#                     admits only through genesis_live_checkout below, for the modes
+#                     that do not pull into it. Only update.sh passes it.
 # The caller tells an override admission from a plain one by comparing _branch with
 # $DEPLOY_BRANCH, and says so itself.
 genesis_deploy_branch_ok() {
@@ -59,17 +60,100 @@ genesis_deploy_branch_ok() {
     [ -n "$_branch" ] && [ "$_branch" != live ]
 }
 
+# Is <root> on `live`, the integration branch scripts/deploy_candidates builds
+# from the deploy manifest? Returns 0 (live), 1 (no: the branch rule above
+# applies) or 2 (on `live` but the manifest or git cannot be read: refuse).
+# Runs the text of scripts/lib/live_checkout.py that the CALLER read into
+# $_LIVE_CHECKOUT_PY at startup, so the copy is the one this run started with;
+# an empty or missing copy answers 2. The printed word must agree with the exit
+# code (python itself exits 1 on a SyntaxError or an uncaught exception), so a
+# broken copy answers 2, never 1. Prints nothing.
+genesis_live_checkout() {
+    local root="$1" rc=0 out
+    [ -n "${_LIVE_CHECKOUT_PY:-}" ] || return 2
+    out="$(python3 -I -S -c "$_LIVE_CHECKOUT_PY" "$root" 2>/dev/null)" || rc=$?
+    case "$rc:$out" in
+        "0:live") return 0 ;;
+        "1:other") return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
 # Tracked, locally modified paths that are NOT on the ephemeral allowlist, as
 # porcelain lines; nothing when the tree is deployable. Returns 2 when the status
 # cannot be read: it is read on its own first, because in a pipeline its failure
 # would be swallowed and an unreadable status would pass as a clean tree.
 # --no-renames: a rename is one line naming BOTH paths, so a tracked file renamed
 # INTO an excused path would be excused whole; split, the deletion of the old path
-# shows.
+# shows. A local change behind assume-unchanged or skip-worktree counts too: git
+# status hides both, so without the second read a deploy, or a restart after a
+# rollback, would run on code nobody can see (measured, git 2.43).
 genesis_tracked_dirty_paths() {
-    local root="$1" st
+    local root="$1" st hidden
     st="$(git -C "$root" status --porcelain --no-renames)" || return 2
-    printf '%s\n' "$st" | grep -v '^??' | grep -vE "$EPHEMERAL_DIRTY_RE" | grep -v '^$' || true
+    hidden="$(_genesis_hidden_dirty_lines "$root")" || return 2
+    printf '%s\n%s\n' "$st" "$hidden" | grep -v '^??' | grep -vE "$EPHEMERAL_DIRTY_RE" | grep -v '^$' || true
+}
+
+# Porcelain-style lines (" M path", " D path", " T path") for entries flagged
+# assume-unchanged or skip-worktree whose working-tree file differs from the index.
+# Nothing, at no cost, when no entry is flagged. The comparison runs against a
+# scratch copy of the index with the flags cleared, so the real index, flags
+# included, is never touched; entries that differ there and not in the real index
+# are the hidden ones. Returns 2 when any step cannot be read.
+_genesis_hidden_dirty_lines() {
+    local root="$1" listing idx tmp seen real rc=0
+    # `ls-files -v` tags an assume-unchanged entry with a lowercase letter and a
+    # skip-worktree entry with S (s when both). The two flags are cleared in
+    # separate calls: given both --no-assume-unchanged and --no-skip-worktree,
+    # update-index clears only assume-unchanged (measured, git 2.43). The listing
+    # is captured before it is searched: piped into an early-exiting `grep -q`,
+    # git dies of SIGPIPE on any listing over a pipe buffer, and under pipefail
+    # that read as "status unreadable" (measured: this repo's listing is ~200 KB).
+    listing="$(git -C "$root" ls-files -v)" || return 2
+    grep -E '^([a-z]|S) ' <<<"$listing" >/dev/null || return 0
+    # The scratch index sits beside the real one: same filesystem, and no
+    # dependence on a writable TMPDIR. Its name carries this shell's pid, so a
+    # caller that kills the shell before the rm below can remove exactly this
+    # shell's copy (deploy_health.py's probe does, on a timeout).
+    idx="$(git -C "$root" rev-parse --path-format=absolute --git-path index)" || return 2
+    tmp="$(mktemp "${idx%/*}/genesis-hidden-index.$$.XXXXXX")" || return 2
+    if cp "$idx" "$tmp" \
+        && _genesis_flagged_paths "$root" '[a-z]' \
+            | GIT_INDEX_FILE="$tmp" xargs -0 -r git -C "$root" update-index --no-assume-unchanged -- \
+        && _genesis_flagged_paths "$root" '[Ss]' \
+            | GIT_INDEX_FILE="$tmp" xargs -0 -r git -C "$root" update-index --no-skip-worktree --; then
+        GIT_INDEX_FILE="$tmp" git -C "$root" update-index -q --refresh >/dev/null 2>&1 || true
+        seen="$(GIT_INDEX_FILE="$tmp" git -C "$root" diff-files --name-status --no-renames)" || rc=2
+        real="$(git -C "$root" diff-files --name-status --no-renames)" || rc=2
+    else
+        rc=2
+    fi
+    rm -f "$tmp" "$tmp.lock"
+    [ "$rc" -eq 0 ] || return 2
+    # In `seen` and not in `real`: hidden by a flag. Rewritten as porcelain lines.
+    printf '%s\n' "$seen" | grep -vxF -f <(printf '%s\n' "$real") \
+        | sed -nE 's/^([MDT])\t(.*)$/ \1 \2/p' || true
+}
+
+# Does <root> have an entry flagged assume-unchanged or skip-worktree? A refusal
+# that lists a hidden change says so: the change is invisible to git status, git
+# diff, git stash and git add -p (measured), so the listed path otherwise looks
+# unfixable. An unreadable listing answers no.
+genesis_has_flagged_entries() {
+    local listing
+    listing="$(git -C "$1" ls-files -v 2>/dev/null)" || return 1
+    grep -E '^([a-z]|S) ' <<<"$listing" >/dev/null
+}
+
+# NUL-separated paths of <root>'s index entries whose `ls-files -v` tag matches the
+# glob <tag>.
+_genesis_flagged_paths() {
+    local root="$1" tag="$2" e
+    git -C "$root" ls-files -v -z | while IFS= read -r -d '' e; do
+        # shellcheck disable=SC2254  # <tag> is a glob on purpose
+        case "${e%% *}" in $tag) printf '%s\0' "${e#? }" ;; esac
+    done
 }
 
 # Does <path> (relative to <root>) hold anything git does not track: an untracked

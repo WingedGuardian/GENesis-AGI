@@ -12,8 +12,11 @@ decision (grace window, rate limit, telemetry).
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LIB = REPO_ROOT / "scripts" / "lib" / "network_resilience.sh"
@@ -746,9 +749,16 @@ exec "$@"
 """
 
 _UN_SYSTEMCTL_STUB = """#!/bin/bash
-if [ "$1" = "is-active" ]; then
-    for u in ${ACTIVE_TIMERS:-}; do [ "$u" = "$3" ] && exit 0; done
-    exit 3
+if [ "$1" = "show" ]; then
+    unit="$2"
+    for failed in ${SYSTEMCTL_FAIL_UNITS:-}; do
+        [ "$failed" = "$unit" ] && exit 1
+    done
+    for pair in ${UNIT_STATES:-}; do
+        [ "${pair%%=*}" = "$unit" ] && { printf '%s\\n' "${pair#*=}"; exit 0; }
+    done
+    printf 'inactive\\n'
+    exit 0
 fi
 exit 0
 """
@@ -784,13 +794,18 @@ def _run_removal(tmp_path: Path, **env) -> subprocess.CompletedProcess:
 
 def test_uninstall_removes_the_root_watchdog_and_reports_nothing_left(tmp_path):
     result = _run_removal(tmp_path, SUDO_OK="1")
-    assert (result.returncode, result.stdout) == (0, "")
+    marker = next(
+        line.split('"', 2)[1]
+        for line in UNINSTALL.read_text().splitlines()
+        if line.startswith('GENESIS_ROOT_WATCHDOG_DONE="')
+    )
+    assert (result.returncode, result.stdout) == (0, marker + "\n")
     assert not any((tmp_path / "root").rglob("genesis-*watchdog*"))
     assert not (tmp_path / "root/usr/local/lib/genesis/tailscale-watchdog.py").exists()
 
 
 def test_uninstall_without_sudo_names_what_survived(tmp_path):
-    result = _run_removal(tmp_path, ACTIVE_TIMERS="genesis-tailscale-watchdog.timer")
+    result = _run_removal(tmp_path, UNIT_STATES="genesis-tailscale-watchdog.timer=active")
     assert result.returncode == 1
     assert result.stdout.startswith("root watchdog still present:")
     assert "genesis-tailscale-watchdog.service" in result.stdout
@@ -799,14 +814,142 @@ def test_uninstall_without_sudo_names_what_survived(tmp_path):
 
 
 def test_uninstall_reports_a_timer_still_running_after_its_files_are_gone(tmp_path):
-    result = _run_removal(tmp_path, SUDO_OK="1", ACTIVE_TIMERS="genesis-network-watchdog.timer")
+    result = _run_removal(
+        tmp_path, SUDO_OK="1", UNIT_STATES="genesis-network-watchdog.timer=active"
+    )
     assert result.returncode == 1
     assert result.stdout.strip() == "root watchdog still present: genesis-network-watchdog.timer"
+
+
+@pytest.mark.parametrize(
+    ("unit", "state"),
+    [
+        (unit, state)
+        for unit in (
+            "genesis-tailscale-watchdog.timer",
+            "genesis-tailscale-watchdog.service",
+            "genesis-network-watchdog.timer",
+            "genesis-network-watchdog.service",
+        )
+        for state in ("activating", "active", "deactivating", "reloading")
+    ],
+)
+def test_uninstall_reports_noninactive_watchdog_units(tmp_path, unit, state):
+    result = _run_removal(tmp_path, SUDO_OK="1", UNIT_STATES=f"{unit}={state}")
+    assert result.returncode == 1
+    assert result.stdout.strip() == f"root watchdog still present: {unit}"
+
+
+@pytest.mark.parametrize(
+    ("unit", "state"),
+    [
+        (unit, state)
+        for unit in (
+            "genesis-tailscale-watchdog.timer",
+            "genesis-tailscale-watchdog.service",
+            "genesis-network-watchdog.timer",
+            "genesis-network-watchdog.service",
+        )
+        for state in ("failed", "inactive")
+    ],
+)
+def test_uninstall_accepts_inactive_or_failed_watchdog_units(tmp_path, unit, state):
+    result = _run_removal(tmp_path, SUDO_OK="1", UNIT_STATES=f"{unit}={state}")
+    marker = next(
+        line.split('"', 2)[1]
+        for line in UNINSTALL.read_text().splitlines()
+        if line.startswith('GENESIS_ROOT_WATCHDOG_DONE="')
+    )
+    assert (result.returncode, result.stdout) == (0, marker + "\n")
+
+
+@pytest.mark.parametrize(
+    "unit",
+    (
+        "genesis-tailscale-watchdog.timer",
+        "genesis-tailscale-watchdog.service",
+        "genesis-network-watchdog.timer",
+        "genesis-network-watchdog.service",
+    ),
+)
+def test_uninstall_failed_state_query_reports_unit_still_present(tmp_path, unit):
+    result = _run_removal(tmp_path, SUDO_OK="1", SYSTEMCTL_FAIL_UNITS=unit)
+    assert (result.returncode, result.stdout.strip()) == (
+        1,
+        f"root watchdog still present: {unit}",
+    )
+
+
+def _run_root_watchdog_report(output):
+    block = subprocess.run(
+        [
+            "sed",
+            "-n",
+            "/^# BEGIN root-watchdog-remove/,/^# END root-watchdog-remove/p",
+            str(UNINSTALL),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    function = subprocess.run(
+        ["sed", "-n", "/^report_root_watchdog_removal() {/,/^}/p", str(UNINSTALL)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    script = (
+        "warn() { printf 'WARN %s\\n' \"$*\"; }\n"
+        "ok() { printf '+ %s\\n' \"$*\"; }\n"
+        "REMOVED=()\n"
+        f"{block}\n"
+        f"{function}\n"
+        'report_root_watchdog_removal "$OUTPUT"\n'
+        'printf "REMOVED_COUNT=%s\\n" "${#REMOVED[@]}"\n'
+    )
+    return subprocess.run(
+        ["/bin/bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={"PATH": "/usr/bin:/bin", "OUTPUT": output},
+    )
+
+
+def test_root_watchdog_reporter_requires_completion_marker():
+    result = _run_root_watchdog_report("")
+    assert "Could not confirm" in result.stdout
+    assert "+ Removed" not in result.stdout
+    assert result.stdout.rstrip().endswith("REMOVED_COUNT=0")
+
+
+def test_root_watchdog_reporter_strips_completion_marker_and_reports_success():
+    marker = next(
+        line.split('"', 2)[1]
+        for line in UNINSTALL.read_text().splitlines()
+        if line.startswith('GENESIS_ROOT_WATCHDOG_DONE="')
+    )
+    result = _run_root_watchdog_report(f"some text\n{marker}")
+    assert result.stdout.startswith("some text\n+ Removed")
+    assert marker not in result.stdout
+    assert result.stdout.rstrip().endswith("REMOVED_COUNT=1")
+
+
+def test_root_watchdog_reporter_keeps_left_warning():
+    result = _run_root_watchdog_report("root watchdog still present: genesis-tailscale-watchdog.timer")
+    assert "NOT fully removed" in result.stdout
+    assert "+ Removed" not in result.stdout
+    assert result.stdout.rstrip().endswith("REMOVED_COUNT=0")
 
 
 def test_both_uninstall_paths_report_instead_of_claiming_success():
     text = UNINSTALL.read_text()
     assert text.count('report_root_watchdog_removal "$(') == 2
+    for match in re.finditer(r'report_root_watchdog_removal "\$\(', text):
+        before = text[max(0, match.start() - 300) : match.start()]
+        start = before.rfind('if [ "$DRY_RUN" = true ]; then')
+        assert start >= 0
+        assert before.find("else", start) > start
     assert 'ok "Removed root network and Tailscale watchdog timers"' in text.split(
         "report_root_watchdog_removal() {"
     )[1].split("\n}\n")[0]

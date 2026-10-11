@@ -135,12 +135,19 @@ You MUST address every single one:
   and redirects, and takes several URLs at once (`urls=[...]`).
 
 - **YouTube videos: use `web_fetch`.** For a YouTube video URL it returns the
-  title, channel, description and the TRANSCRIPT (captions in the video's own
-  language; a video without captions returns its metadata only), with a
-  `Transcript source` line saying which. Evaluate what the video actually says,
+  title, channel, description and the TRANSCRIPT (captions, preferring the video's
+  own language; a track chosen without language evidence is labelled
+  `provenance: unknown`; a video without captions returns its metadata only), with
+  a `Transcript source` line saying which. Evaluate what the video actually says,
   not its title. If the transcript could not be fetched, the result carries
   the page's title and description plus a `youtube_error` saying why: report
   that error for that URL, and do not evaluate content you did not get.
+
+- **LinkedIn posts: use `web_fetch` too.** For a LinkedIn post URL it returns
+  the post page and, when the post's video has captions, a separate
+  `video_transcript` field. Evaluate what the video says as well as the post
+  text. A `video_error` means the post has a video whose captions could not be
+  read: say so, and do not guess at what the video says.
 
 - **NEVER tell the user to do something you haven't attempted yourself.**
   If one fetch fails, try the other tool and the other backends `web_fetch`

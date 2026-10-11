@@ -209,11 +209,13 @@ def test_is_substitute_candidate(login, user_type, expected):
 
 
 @pytest.fixture
-def guard():
+def guard(monkeypatch):
     sys.path.insert(0, str(_ROOT / "scripts" / "hooks"))
     import git_push_guard
 
     assert sys.modules[git_push_guard.enforced_logins.__module__] is rf
+    # Imports are cached across tests; an earlier merge check may have expired.
+    monkeypatch.setattr(git_push_guard, "_merge_deadline", None)
     return git_push_guard
 
 
@@ -444,7 +446,7 @@ def test_the_moved_parsers_are_the_ones_the_gate_uses(guard):
     assert guard._devin_finding is rf.devin_finding
     assert guard._INLINE_P1_RE is rf.INLINE_P1_RE
     assert guard._INLINE_P2_RE is rf.INLINE_P2_RE
-    assert guard._CR_HEADER_FIELD_RE is rf.CR_HEADER_FIELD_RE
+    assert guard._cr_header_fields is rf.cr_header_fields
     assert guard._CR_SEVERITIES is rf.CR_SEVERITIES
 
 

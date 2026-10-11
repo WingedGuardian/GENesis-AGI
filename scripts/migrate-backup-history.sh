@@ -71,7 +71,7 @@ fi
 
 [ -d "$BACKUP_DIR/.git" ] || die "Not a git repo: $BACKUP_DIR"
 
-cd "$BACKUP_DIR"
+CDPATH= cd "$BACKUP_DIR"
 
 if [ -n "$(git status --porcelain)" ]; then
     die "Working tree is dirty. Commit or stash changes first."

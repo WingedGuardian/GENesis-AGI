@@ -33,3 +33,9 @@ If a capability requires automatic context injection, transcript extraction,
 session continuity, or background delivery into this conversation, explain that
 it is unavailable to an external client. Do not add lifecycle hooks or work
 around the boundary.
+
+The project also wires a local Codex CLI shell action guard for review budgets.
+It denies actions requiring fresh approval and requests user handoff, without
+registering a Genesis session or persisting approval receipts. See
+`docs/reference/codex-review-stop.md` for activation, tested failures, scope and
+integration limits; this is not universal client enforcement.

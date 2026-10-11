@@ -74,5 +74,10 @@ diligence," this means:
 4. **Verify dependencies** — will this break something else?
 5. **State what you checked and what you didn't**
 
-The goal is not perfection — it's honest, calibrated uncertainty that lets
-the user make informed decisions.
+The bar, before building, is beyond reasonable doubt on everything that could
+change the plan. Every read, or probe that changes nothing beyond scratch
+state, that could settle such a question is done first. What genuinely cannot be settled this session is named
+as a residual, with what would settle it. Calibrated honesty is about those
+residuals, never a substitute for the reads. The checklist is the
+genesis-development skill's "Due diligence before building"; its detail is
+`.claude/skills/genesis-development/references/due-diligence.md`.

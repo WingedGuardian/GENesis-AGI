@@ -1,0 +1,457 @@
+"""Count a PR's changed code lines and size band from its unified diff.
+
+Takes the text of ``git diff -M <base>...<head>`` and returns a counted size:
+added and removed lines excluding tests, changelog fragments, prose, binary
+files, blanks, full-line comments, and lines moved verbatim elsewhere in the
+same diff (a move counts once, as the addition).
+
+Two classifiers are borrowed repo-locally rather than re-invented:
+``review_scope.py`` supplies the file-kind judgements (its lane taxonomy is
+the same one the review budget uses), and ``readable_body`` from
+``check_cc_pin_receipts.py`` supplies PR-body visibility for ``parse_shape``,
+so every body-reader in the repo shares one scanner. Both load through
+``sys.modules``-registered importlib specs; a failed load raises
+``RuntimeError`` rather than silently degrading into a second contract.
+
+Pure functions otherwise, stdlib only (no third-party packages), no
+subprocess. The one exception is the command line, the single way every doc
+tells a session or builder to size a branch:
+
+    python3 scripts/pr_shape.py [--base origin/main] [--head HEAD] [--json]
+
+It reads the diff through ``review_scope``'s hardened git runner (no external
+diff, no textconv, no attributes file, no replace objects: each of those can
+empty or shrink a diff at exit 0), prints ``<counted> <band>``, and exits 2
+when git fails, so a broken read never reports as a small change.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import importlib.util
+import json
+import os
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+#: The bands are OWNER POLICY, re-checked against measured cost (2026-10-06).
+#: `scripts/pr_shape_study.py --out <dir>` re-derives the measurement: the 400
+#: most recently created PRs merged into main, each sized by this counter on its
+#: verified squash commit, against its review rounds from `review_budget.py`.
+#: Run 2026-10-06: 400 used, none excluded (none failed the squash check). PRs
+#: merged with no review round (75 of 400) are included.
+#:
+#: Rounds by counted lines (buckets are half-open, [lo, hi)):
+#:
+#: | counted lines | PRs | median rounds | p75 | past round 4 |
+#: |---|---|---|---|---|
+#: | [0, 50) | 148 | 1 | 2 | 6 |
+#: | [50, 200) | 118 | 2 | 3 | 7 |
+#: | [200, 400) | 66 | 3 | 4 | 10 |
+#: | [400, 600) | 27 | 4 | 4.5 | 7 |
+#: | [600, 800) | 17 | 4 | 4 | 3 |
+#: | [800, 1000) | 10 | 3.5 | 4 | 2 |
+#: | [1000, +) | 14 | 4 | 4.75 | 4 |
+#:
+#: p75 is linear interpolation (Hyndman-Fan type 7), the definition the median
+#: also follows.
+#:
+#: Spearman rho = 0.43 (counted lines); 0.46 for the plain size, which keeps
+#: comments and does not pair moves. The study's rule (the first bucket of at
+#: least 5 PRs whose median reaches 3 rounds, then 4) puts the shape and
+#: override points at 200 and 400 on counted lines, and at 400 and 800 on the
+#: plain size. The owner kept 500 and 1000 as a guideline the building session
+#: weighs, and the table records what a PR above them typically costs.
+#:
+#: Caveats on reading the table:
+#: - The medians stop rising at 4, but round 4 is not a ceiling: 39 of the 400
+#:   PRs ran past it, up to 15 rounds.
+#: - 347 of the 400 PRs were created before ROUND_RULE_CUTOVER_ISO. Their reviews
+#:   from before the cutover count clean heads as rounds; a PR reviewed across
+#:   the cutover mixes both rules. The 53 created after it are too few to place
+#:   either point on counted lines (every bucket from 200 up has under 5 PRs).
+SHAPE_AT = 500
+OVERRIDE_AT = 1001
+
+#: "" covers extensionless executables — the repo carries 13 tracked
+#: extensionless shebang scripts (scripts/watchgod, scripts/hooks/pre-push…).
+_COMMENT_EXTS = frozenset(
+    ".py .sh .yaml .yml .toml .cfg .ini .service .gitignore .gitattributes".split()  # noqa: SIM905
+) | {""}
+_SLASH_COMMENT_EXTS = {".js", ".ts", ".json5"}
+
+#: Git's C-style escapes for quoted paths; _unquote decodes through this.
+_C_ESCAPES = {c: bytes([b]) for c, b in zip('ntabvfr\\"', b'\n\t\a\b\v\f\r\\"', strict=True)}
+
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_QUOTED_TOKEN_RE = re.compile(r'^"(?:[^"\\]|\\.)*"')
+_SHAPE_RE = re.compile(r"^\s*shape\s*:\s*(.*)$", re.IGNORECASE)
+
+
+def _basename(path: str) -> str:
+    return path.rsplit("/", 1)[-1]
+
+
+_MOD_CACHE: dict[str, object] = {}
+
+
+def _load_sibling(filename: str, name: str):
+    """Import a scripts/ sibling by file path, registered before exec.
+
+    Registered in ``sys.modules`` BEFORE ``exec_module`` — dataclasses in the
+    sibling resolve their own module out of sys.modules, so exec-ing an
+    unregistered module raises. Cached; a failed load raises ``RuntimeError``
+    instead of silently degrading into a second contract.
+    """
+    if name in _MOD_CACHE:
+        return _MOD_CACHE[name]
+    try:
+        path = Path(__file__).resolve().parent / filename
+        spec = importlib.util.spec_from_file_location(name, path)
+        if not (spec and spec.loader):
+            raise RuntimeError(f"cannot load {filename}")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop(name, None)
+            raise
+    except Exception as exc:
+        raise RuntimeError(f"cannot load {filename}") from exc
+    _MOD_CACHE[name] = mod
+    return mod
+
+
+def _exclusion_reason(path: str) -> str | None:
+    """Why a file is excluded from the count, or None.
+
+    Order: changelog, then test (fixture corpus, review_scope's category,
+    or this counter's own basename/dir rule generalized past .py), then
+    prose via review_scope's lane-light rule — which counts `.txt` files
+    as code unless the stem is a prose stem (LICENSE, COPYING…).
+    """
+    scope = _load_sibling("review_scope.py", "_review_scope_for_pr_shape")
+    name = _basename(path)
+    if name == "CHANGELOG.md" or "changelog.d" in path.split("/")[:-1]:
+        return "changelog"
+    if (
+        scope._is_lane_fixture_corpus(path)
+        or scope._category(path) in ("test", "fixture")
+        or "tests" in path.split("/")[:-1]
+        or fnmatch.fnmatchcase(name, "test_*.*")
+        or fnmatch.fnmatchcase(name, "*_test.*")
+    ):
+        return "test"
+    if scope._is_lane_light(path):
+        return "prose"
+    return None
+
+
+def _is_comment(content: str, path: str) -> bool:
+    stripped, name = content.strip(), _basename(path)
+    # Config templates keep the commented-out semantics of the file they
+    # instantiate: genesis.yaml.example comments are yaml comments.
+    for suffix in (".example", ".template"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    ext = "." + name.rsplit(".", 1)[1] if "." in name else ""
+    return (stripped.startswith("#") and ext in _COMMENT_EXTS) or (
+        stripped.startswith("//") and ext in _SLASH_COMMENT_EXTS
+    )
+
+
+def _unquote(s: str) -> str:
+    """Decode a Git C-quoted path; unquoted input passes through.
+
+    Handles Git's C-style escapes (``\\\\``, ``\\"``, ``\\t``, ``\\n``,
+    ``\\a``, ``\\b``, ``\\v``, ``\\f``, ``\\r``) and ``\\ooo`` octal bytes,
+    then UTF-8 decodes strictly — non-UTF-8 bytes return the raw escaped
+    spelling so distinct paths stay distinct. Never raises.
+    """
+    try:
+        if len(s) < 2 or not (s.startswith('"') and s.endswith('"')):
+            return s
+        inner = s[1:-1]
+        out = bytearray()
+        i = 0
+        while i < len(inner):
+            c = inner[i]
+            if c == "\\" and i + 1 < len(inner):
+                nxt = inner[i + 1]
+                if nxt in "01234567":
+                    j = i + 1
+                    while j < len(inner) and inner[j] in "01234567" and j - i <= 3:
+                        j += 1
+                    out.append(int(inner[i + 1 : j], 8) & 0xFF)
+                    i = j
+                    continue
+                out.extend(_C_ESCAPES.get(nxt, b"\\" + nxt.encode("utf-8", "replace")))
+                i += 2
+                continue
+            out.extend(c.encode("utf-8", "replace"))
+            i += 1
+        try:
+            # Strict UTF-8: replacement chars would collapse distinct
+            # non-UTF-8 paths onto one key, and surrogateescape keys can
+            # raise on print — fall back to the raw escaped spelling.
+            return bytes(out).decode("utf-8")
+        except UnicodeDecodeError:
+            return inner
+    except Exception:
+        return s
+
+
+def _diff_git_paths(rest: str) -> tuple[str | None, str | None]:
+    """Split ``a/<old> b/<new>`` (either side possibly C-quoted) into paths."""
+
+    if not rest.startswith('"'):
+        # Same-path file with spaces arrives unquoted as `a/P b/P`; renames
+        # with spaces are quoted by git, so a symmetric pair is one path.
+        k, rem = divmod(len(rest) - 5, 2)
+        if rem == 0 and rest[2 + k : 5 + k] == " b/" and rest[2 : 2 + k] == rest[5 + k :]:
+            return rest[5 + k :], rest[5 + k :]
+
+    def token(s: str) -> tuple[str, str]:
+        if s.startswith('"'):
+            m = _QUOTED_TOKEN_RE.match(s)
+            if m:
+                return m.group(0), s[m.end() :]
+            return s, ""
+        head, _, tail = s.partition(" ")
+        return head, tail
+
+    a_tok, rem = token(rest)
+    b_tok, _ = token(rem.strip())
+
+    def strip_side(tok: str, prefix: str) -> str | None:
+        path = _unquote(tok)
+        return path[len(prefix) :] if path.startswith(prefix) else None
+
+    return strip_side(a_tok, "a/"), strip_side(b_tok, "b/")
+
+
+class _FileState:
+    def __init__(self, fallback: str) -> None:
+        self.fallback = fallback
+        self.new_path: str | None = None
+        self.old_path: str | None = None
+        self.rename_to: str | None = None
+        self.binary = self.unparseable = self.in_hunk = self.seen_hunk = False
+        self.old_rem = self.new_rem = 0
+        self.added: list[str] = []
+        self.removed: list[str] = []
+        # Non-blank changed lines with comments kept: the study's plain size.
+        self.plain_added = self.plain_removed = 0
+
+    @property
+    def path(self) -> str:
+        # `+++ b/` wins; `--- a/` carries deletions (`+++ /dev/null`); then
+        # `rename to`; the `diff --git` b-side is the last resort.
+        return self.new_path or self.old_path or self.rename_to or self.fallback
+
+
+def count_diff(diff_text: str) -> dict:
+    files: list[_FileState] = []
+    current: _FileState | None = None
+
+    # splitlines() would break on Unicode separators (U+2028, U+2029…) — a
+    # line containing one must stay ONE line, so split on "\n" only and strip
+    # at most one trailing "\r" per line.
+    for line in diff_text.split("\n"):
+        if line.endswith("\r"):
+            line = line[:-1]
+        if line.startswith("diff --git "):
+            # A new file while hunk counts remain: the previous file is
+            # unparseable (its hunk was truncated).
+            if current is not None and current.in_hunk:
+                current.unparseable = True
+            _a, b = _diff_git_paths(line[len("diff --git ") :])
+            files.append(_FileState(b if b is not None else line[len("diff --git ") :]))
+            current = files[-1]
+            continue
+        if current is None:
+            continue
+        if current.in_hunk:
+            # Inside a hunk EVERYTHING is content — `+++`/`---`/`diff --git`-looking
+            # lines are counted like any other added/removed/context line until the
+            # header counts run out.
+            if line.startswith("\\"):
+                continue  # "\ No newline at end of file"
+            first = line[0] if line else " "
+            if first == "-":
+                current.old_rem -= 1
+                # Removed lines are classified against the PRE-rename path:
+                # a `-# comment` in old.py stays a comment even when the file
+                # is being renamed to new.js.
+                old = current.old_path or current.path
+                if content := line[1:].strip():
+                    current.plain_removed += 1
+                    if not _is_comment(content, old):
+                        current.removed.append(content)
+            elif first == "+":
+                current.new_rem -= 1
+                if content := line[1:].strip():
+                    current.plain_added += 1
+                    if not _is_comment(content, current.path):
+                        current.added.append(content)
+            elif first == " " or line == "":
+                current.old_rem, current.new_rem = current.old_rem - 1, current.new_rem - 1
+            else:
+                current.unparseable = True
+                current.in_hunk = False
+                continue
+            if current.old_rem < 0 or current.new_rem < 0:
+                current.unparseable = True
+                current.in_hunk = False
+            elif current.old_rem == 0 and current.new_rem == 0:
+                current.in_hunk = False
+            continue
+        if line.startswith("Binary files ") or line.startswith("GIT binary patch"):
+            current.binary = True
+            continue
+        if line.startswith("rename to "):
+            current.rename_to = _unquote(line[len("rename to ") :].strip())
+            continue
+        if line.startswith("--- "):
+            path = _unquote(line[4:].strip())
+            if path != "/dev/null":
+                current.old_path = path[2:] if path.startswith("a/") else path
+            continue
+        if line.startswith("+++ "):
+            path = _unquote(line[4:].strip())
+            if path != "/dev/null":
+                current.new_path = path[2:] if path.startswith("b/") else path
+            continue
+        if line.startswith("@@"):
+            m = _HUNK_RE.match(line)
+            if m:
+                current.old_rem = int(m.group(2) or 1)
+                current.new_rem = int(m.group(4) or 1)
+                current.in_hunk = current.old_rem > 0 or current.new_rem > 0
+                current.seen_hunk = True
+            else:
+                current.unparseable = True
+            continue
+        if current.seen_hunk and line.startswith(("+", "-")):
+            # A change line after the file's hunks have all completed: the
+            # `---`/`+++` headers belong BEFORE the first `@@`; afterwards a
+            # `+`/`-` line outside a hunk means the diff is malformed.
+            current.unparseable = True
+            continue
+
+    # A file still inside a hunk at EOF was truncated mid-hunk.
+    if current is not None and current.in_hunk:
+        current.unparseable = True
+
+    # Each side of a rename is excluded on its OWN path: a test-bound half
+    # contributes nothing while the counted half is keyed under its path.
+    sides: list[tuple[str, list[str], list[str]]] = []  # (by path, added, removed)
+    excluded: dict[str, str] = {}
+    # The plain size: every non-blank changed line on the sides that count, with
+    # no comment filter and no move pairing (scripts/pr_shape_study.py).
+    plain = 0
+    for f in files:
+        old = f.old_path or f.path
+        new_reason = _exclusion_reason(f.path)
+        if f.binary or f.unparseable:
+            excluded[f.path] = new_reason or ("binary" if f.binary else "unparseable")
+            continue
+        old_reason = _exclusion_reason(old)
+        if old_reason and new_reason:
+            excluded[f.path] = new_reason
+        elif old_reason:
+            excluded[old] = old_reason
+            sides.append((f.path, f.added, []))
+            plain += f.plain_added
+        elif new_reason:
+            excluded[f.path] = new_reason
+            sides.append((old, [], f.removed))
+            plain += f.plain_removed
+        else:
+            sides.append((f.path, f.added, f.removed))
+            plain += f.plain_added + f.plain_removed
+
+    # Moves pair globally across the diff by multiset: a line removed anywhere
+    # and added verbatim elsewhere counts once, as the addition.
+    additions_pool = Counter(add for _, added, _ in sides for add in added)
+    moved = counted = 0
+    by_file: dict[str, int] = {}
+    for by_path, added, removed in sides:
+        file_count = len(added)
+        for rem in removed:
+            if additions_pool.get(rem, 0) > 0:
+                additions_pool[rem] -= 1
+                moved += 1
+            else:
+                file_count += 1
+        counted += file_count
+        if file_count:
+            by_file[by_path] = file_count
+
+    band = "ok" if counted < SHAPE_AT else "shape" if counted < OVERRIDE_AT else "override"
+    return {
+        "counted": counted,
+        "by_file": by_file,
+        "excluded": excluded,
+        "moved": moved,
+        "plain": plain,
+        "band": band,
+    }
+
+
+def parse_shape(body: str | None) -> str | None:
+    """Return the text after a ``Shape:`` line, or None.
+
+    Visibility (fences, HTML comments) is the shared ``readable_body`` — a
+    fenced ``Shape:`` is documentation, not an assertion. An empty value
+    masks nothing: the first non-empty one wins.
+    """
+    if not body:
+        return None
+    sibling = _load_sibling("check_cc_pin_receipts.py", "_cc_pin_receipts_for_pr_shape")
+    for line in sibling.readable_body(body).split("\n"):
+        match = _SHAPE_RE.match(line)
+        if match:
+            # Invisible Unicode format chars (Cf — zero-width space, joiners,
+            # bidi controls) are not content; the sibling owns the stripper.
+            value = sibling._strip_formatting_chars(match.group(1)).strip()
+            if value:
+                return value
+    return None
+
+
+def branch_diff(base: str, head: str = "HEAD", cwd: str | None = None) -> str | None:
+    """``git diff -M <base>...<head>`` through review_scope's hardened runner, or None."""
+    scope = _load_sibling("review_scope.py", "_review_scope_for_pr_shape")
+    return scope._git(["diff", "--no-color", "-M", f"{base}...{head}"], cwd)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Count a branch's changed code lines and its size band.")
+    ap.add_argument("--base", default="origin/main", help="merge-base side (default: origin/main)")
+    ap.add_argument("--head", default="HEAD", help="branch tip (default: HEAD)")
+    ap.add_argument("--json", action="store_true", help="print the full count as JSON")
+    args = ap.parse_args(argv)
+    diff = branch_diff(args.base, args.head, os.getcwd())
+    if diff is None:
+        print(
+            f"pr_shape: could not read `git diff {args.base}...{args.head}`; "
+            "fetch the base and check both refs exist",
+            file=sys.stderr,
+        )
+        return 2
+    result = count_diff(diff)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"{result['counted']} {result['band']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

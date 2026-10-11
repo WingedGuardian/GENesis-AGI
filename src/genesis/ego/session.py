@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.autonomy.proposal_gate import gate_failure_is_blocking
+from genesis.cc.transient_retry import run_with_overload_retry
 from genesis.cc.types import (
     CCInvocation,
     CCModel,
@@ -305,6 +306,9 @@ class EgoSession:
             context_builder=self._context_builder,
             context_weights=focus.context_weights if focus else None,
             focus_id=focus.focus_id if focus else None,
+            # Same tag store_cycle() writes as ego_source, so the
+            # "previous assessment" read is this ego's own last cycle.
+            ego_source=self._source_tag,
         )
 
         # Focus-specific prompt
@@ -396,7 +400,9 @@ class EgoSession:
                 return None
 
             try:
-                output = await self._invoker.run(invocation)
+                # Below route(): an overload re-runs this same approved
+                # dispatch; the approval gate is never consulted again.
+                output = await run_with_overload_retry(self._invoker, invocation)
             except Exception:
                 logger.error("Ego CC invocation failed (unified)", exc_info=True)
                 try:
@@ -479,8 +485,10 @@ class EgoSession:
         # Fetch recent focuses from ego_cycle_outcomes for context
         recent_focuses: list[dict[str, str]] = []
         try:
+            # Scoped to this ego: both egos share ego_cycle_outcomes, and an
+            # unscoped read tells this ego to avoid the OTHER ego's picks.
             rows = await ego_crud.list_cycle_outcomes(
-                self._db, limit=5,
+                self._db, limit=5, ego_source=self._source_tag,
             )
             recent_focuses = [
                 {
@@ -1416,7 +1424,7 @@ class EgoSession:
                 working_dir=background_session_dir(),
                 caller_tag=self._cc_caller_tag(f"gate.{label.lower()}"),
             )
-            output = await self._invoker.run(invocation)
+            output = await run_with_overload_retry(self._invoker, invocation)
             if output.is_error:
                 logger.warning("%s CC call failed: %s", label, output.error_message)
                 return None
@@ -2004,7 +2012,7 @@ class EgoSession:
                 working_dir=background_session_dir(),
                 caller_tag=self._cc_caller_tag("realist"),
             )
-            output = await self._invoker.run(invocation)
+            output = await run_with_overload_retry(self._invoker, invocation)
             # Track realist cost for cycle accounting
             self._last_realist_cost_usd = output.cost_usd
             if output.is_error:

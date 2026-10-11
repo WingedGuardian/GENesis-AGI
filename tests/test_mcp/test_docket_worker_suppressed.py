@@ -55,7 +55,8 @@ from tests.conftest import private_module
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SERVER_SCRIPT = _REPO_ROOT / "scripts" / "genesis_mcp_server.py"
 
-#: The five servers `.mcp.json` actually spawns, by import path. Each exposes a
+#: The five servers genesis_mcp_server.py bootstraps, by import path (.mcp.json
+#: spawns four; discord-bot only through the community-responder profile). Each exposes a
 #: module-level ``mcp``. Verified 2026-09-24: 81 + 35 + 13 + 11 + 3 = 143 tools.
 _REAL_SERVER_MODULES = (
     "genesis.mcp.health",

@@ -513,16 +513,21 @@ class EmbeddingProvider:
     @staticmethod
     def build_chain(
         *,
-        ollama_first: bool = False,
+        ollama_first: bool | None = None,
         priority_tier: bool = False,
         fresh_collection: bool = False,
     ) -> list[EmbeddingBackend]:
         """Build backend chain with configurable priority order.
 
         Args:
-            ollama_first: If True, Ollama leads. If False (the DEFAULT),
-                         cloud leads and Ollama is the fallback rung.
-                         The default used to be True, on the reasoning that a
+            ollama_first: If True, Ollama leads. If False, cloud leads and
+                         Ollama is the fallback rung. If None (the DEFAULT),
+                         the install decides via ``env.embed_local_first()``
+                         (``memory.embed_local_first`` in the local config),
+                         which itself defaults to cloud-first. Pass an explicit
+                         value only where the order is part of the caller's
+                         contract (a benchmark), never as a preference.
+                         The order used to be Ollama-first, on the reasoning that a
                          write has no deadline so the slower local backend is
                          free. It is not free: local embedding is inference, and
                          on a GPU-less host every write burns cores the rest of
@@ -579,9 +584,13 @@ class EmbeddingProvider:
         from genesis.env import (
             dashscope_api_key,
             deepinfra_api_key,
+            embed_local_first,
             ollama_enabled,
             ollama_url,
         )
+
+        if ollama_first is None:
+            ollama_first = embed_local_first()
 
         ollama_backends: list[EmbeddingBackend] = []
         if ollama_enabled():
@@ -672,8 +681,8 @@ class EmbeddingProvider:
 
     @staticmethod
     def _build_default_chain() -> list[EmbeddingBackend]:
-        """Build the default backend chain (cloud first, Ollama as fallback)."""
-        return EmbeddingProvider.build_chain(ollama_first=False)
+        """Build the default backend chain, in the install's configured order."""
+        return EmbeddingProvider.build_chain()
 
     @property
     def tracker(self) -> ProviderActivityTracker | None:

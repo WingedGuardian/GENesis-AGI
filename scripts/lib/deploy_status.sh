@@ -27,8 +27,14 @@ _RUNTIME_RELOAD_SCRIPTS=(
 # Read or run afresh on every use, so a new copy is live at once, no restart:
 _RUNTIME_FRESH_SCRIPTS=(
     scripts/disk_reclaim.py               # run by autonomy/remediation.py
+    scripts/lib/live_checkout.py          # run by dashboard/routes/updates.py before an update
     scripts/hooks/bash_allowlist_guard.sh # run through .claude/hooks/genesis-hook by cc/invoker.py
     scripts/hooks/bash_allowlist_lib.sh   # sourced by bash_allowlist_guard.sh on every run
+    scripts/lib/deploy_marker.sh          # sourced by observability/snapshots/deploy_health.py's main-checkout probe on every snapshot
+    scripts/lib/deploy_checkout.sh        # sourced by the same probe (its dirty-tree predicate)
+    scripts/hooks/main_checkout_guard.py  # registered by cc/invoker.py for dispatched sessions
+    scripts/hooks/hook_input.py           # imported by main_checkout_guard.py on every run
+    scripts/hooks/hook_output.py          # imported by main_checkout_guard.py to emit a note
     # Not under scripts/, but the same kind: cc/invoker.py runs the allowlist
     # guard through this launcher in the server, and reads its exit code.
     .claude/hooks/genesis-hook
@@ -95,7 +101,9 @@ _read_serving() {
         1) cutoff=$(( $(date +%s) - 30 * 86400 )) ;;
         *) cutoff="" ;;
     esac
-    out="$(python3 -c "$_SERVING_COMMIT_PY" --held "$_git_dir/logs/HEAD" "$boot" \
+    # -I -S: the checkout this runs from can hold unmerged code (`live`), and a
+    # PYTHONPATH or a venv .pth into its src/ would otherwise import from it.
+    out="$(python3 -I -S -c "$_SERVING_COMMIT_PY" --held "$_git_dir/logs/HEAD" "$boot" \
         "$(_git_ro rev-parse HEAD)" "$cutoff" 2>/dev/null)" || rc=$?
     if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
         SERVING="${out%%$'\n'*}"

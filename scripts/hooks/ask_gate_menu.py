@@ -26,7 +26,7 @@ round counter already answers it, branch-scoped, with no lifecycle to get wrong.
 marker is gone rather than patched again.
 
 CAP TIER ONLY. The branch lifetime no longer creates a separate terminal: GitHub-backed
-distinct reviewed heads now trigger a native approval on the commit or review request
+review rounds now trigger a native approval on the commit or review request
 itself. This menu remains scoped to the local three-consecutive-defect hard stop, whose
 remedies are different from that per-action approval.
 

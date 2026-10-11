@@ -376,6 +376,37 @@ def test_a_republished_branch_with_no_open_pr_is_BLOCKED(
     )
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git push https://github.com/owner/repo HEAD:refs/heads/feat/x",
+        "git push https://github.com/owner/repo.git feat/x",
+    ],
+)
+def test_a_raw_url_republish_with_no_open_pr_is_BLOCKED(
+    monkeypatch, tmp_path, capsys, on_the_public_repo, command: str
+) -> None:
+    """A raw URL is not a configured remote, so `git remote get-url` cannot
+    resolve it. The destination must still be read from the URL itself, or the
+    open-PR lookup sees no target, answers None, and the public no-PR block
+    never runs for exactly the spelling that skips the remote."""
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    # Realistic: a raw URL names no remote, so the remote lookup is empty.
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(
+        gpg,
+        "_open_pr_count_for_branch",
+        lambda *a, push_urls=None, **k: 0 if push_urls else None,
+    )
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(monkeypatch, tmp_path, fake, capsys, command=command)
+    assert rc == 2, (rc, out, err)
+    assert "NO OPEN PR" in err
+
+
 def test_a_republished_branch_with_an_open_pr_stays_silent(monkeypatch, tmp_path, capsys) -> None:
     """The control: the hygiene ask must not tax the healthy state, or the
     first-push-only relaxation is silently repealed."""

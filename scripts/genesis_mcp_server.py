@@ -57,6 +57,11 @@ _DEFAULT_PORTS = {
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Genesis MCP Server (standalone)")
     parser.add_argument(
+        "--external-client",
+        action="store_true",
+        help="Disable Claude session bookmark processing for external MCP clients",
+    )
+    parser.add_argument(
         "--server",
         required=True,
         choices=sorted(_VALID_SERVERS),
@@ -213,7 +218,9 @@ def _bootstrap_health(transport_kwargs: dict) -> None:
     _run_mcp(mcp, transport_kwargs)
 
 
-def _bootstrap_memory(transport_kwargs: dict) -> None:
+def _bootstrap_memory(
+    transport_kwargs: dict, *, process_pending_bookmarks: bool = True,
+) -> None:
     """Bootstrap and run the memory MCP server.
 
     Requires Qdrant + Ollama for embeddings. Opens aiosqlite connection
@@ -279,11 +286,11 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
             from genesis.env import embed_priority_tier
 
             storage_embedding = EmbeddingProvider(
-                backends=EmbeddingProvider.build_chain(ollama_first=False),
+                backends=EmbeddingProvider.build_chain(),
             )
             recall_embedding = EmbeddingProvider(
                 backends=EmbeddingProvider.build_chain(
-                    ollama_first=False, priority_tier=embed_priority_tier(),
+                    priority_tier=embed_priority_tier(),
                 ),
             )
             # The activity tracker enables InstrumentationMiddleware, which also
@@ -299,7 +306,8 @@ def _bootstrap_memory(transport_kwargs: dict) -> None:
             init(db=db, qdrant_client=qdrant,
                  storage_embedding_provider=storage_embedding,
                  recall_embedding_provider=recall_embedding,
-                 activity_tracker=tracker, reranker=reranker, read_pool=read_pool)
+                 activity_tracker=tracker, reranker=reranker, read_pool=read_pool,
+                 process_pending_bookmarks=process_pending_bookmarks)
             clear_mcp_crash("memory")
             yield
         finally:
@@ -661,6 +669,11 @@ def main(argv: list[str] | None = None) -> None:
         "API_KEY_DEEPSEEK",
         # Ollama config
         "GENESIS_ENABLE_OLLAMA", "OLLAMA_EMBEDDING_MODEL",
+        # Embedding chain levers read when the memory child builds its chains
+        # (env.embed_local_first / env.embed_priority_tier). Absent here, a value
+        # set only in secrets.env is dropped and the child disagrees with the
+        # main runtime about the order and the recall tier.
+        "GENESIS_EMBED_LOCAL_FIRST", "GENESIS_EMBED_PRIORITY_TIER",
         # HTTP transport auth
         "GENESIS_MCP_HTTP_TOKEN",
         # Discord bot (used by discord-bot MCP server)
@@ -684,6 +697,10 @@ def main(argv: list[str] | None = None) -> None:
         # documented knob is inert and every call silently stays at the 1000s default
         # (Codex P2 on #1587).
         "GENESIS_DELIBERATE_TIMEOUT_S",
+        # Graph-traversal telemetry kill switch (memory/graph_telemetry.py): the
+        # memory server makes most traversals, so a secrets.env setting that never
+        # reached it would leave the documented switch inert where it matters.
+        "GENESIS_GRAPH_TELEMETRY_DISABLED",
     }
     import os
 
@@ -741,8 +758,9 @@ def main(argv: list[str] | None = None) -> None:
     capture_spawn_identity()
 
     bootstrapper = _BOOTSTRAPPERS[args.server]
+    options = {"process_pending_bookmarks": not args.external_client} if args.server == "memory" else {}
     try:
-        bootstrapper(transport_kwargs)
+        bootstrapper(transport_kwargs, **options)
     except Exception:
         _record_mcp_crash(args.server)
         raise

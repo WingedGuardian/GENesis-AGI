@@ -504,7 +504,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-09-29: 66 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-10: 73 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -1072,4 +1072,97 @@ jobs:
         # Its delta is 36 + 28 + 29 = 93 on top of the floor above, so the floor
         # is 23489 + 93 = 23582. No new test carries a skipif, so the ceiling
         # does not move.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 23582
+        #
+        # UNION with the deploy-guidance PR (#2101): it changes one existing test
+        # file, tests/test_hooks/test_bash_timeout_guidance.py, which collects 3
+        # tests on main and 27 here, so its DELTA is +24 (measured against main,
+        # after the last test-adding edit, not against an earlier state of the
+        # branch). Its one new skipif needs jq, which ubuntu-latest ships, so the
+        # ceiling does not move. Floor: 23582 + 24 = 23606.
+        #
+        # UNION with the entity apply-rails PR (#1729). Measured against main's
+        # versions with --collect-only, after the last test-adding edit:
+        #   test_entity_adjudication.py         50 -> 62   (+12)
+        #   test_entity_apply_rails.py           new -> 24  (+24)
+        #   test_entity_adjudication_config.py  13 -> 15   (+2)
+        #   test_migration_0065_...             14 -> 14   (0)
+        # The branch's own earlier comment claimed +4 (Codex P2 on #1729);
+        # superseded by this count. No new skips, so the ceiling holds.
+        # Floor: 23606 + 38 = 23644.
+        #
+        # UNION with the rollback PR (#2679 / #2722), counted the same way:
+        #   test_update_checkout_moved.py   29 -> 79   (+50: the checkout-based
+        #     rollback, its index-flag, index, ignored-path, submodule and hook
+        #     cases, and the database decision)
+        #   test_deploy_checkout.py         36 -> 51   (+15: changes hidden behind
+        #     assume-unchanged / skip-worktree, a listing over a pipe buffer, and
+        #     the refusal hint)
+        # Floor: 23644 + 65 = 23709.
+        # GitNexus routine refresh: focused edited files collect 123 -> 135
+        # tests (+4 runner, +5 launcher, +3 indexer); no added skips.
+        # Routing generations: 143 collected across the four new generation files.
+        # Floor 23721 + 143 = 23864; skip ceiling remains 102.
+        # #2735 stacked-PR contract: test_ci_triggers.py 0 -> 5 (+5: main-only
+        # PR trigger, no edited type, push/schedule/dispatch unchanged,
+        # cc-pin merge-base, and the origin/main line allowlist); no added
+        # skips. Floor: 23864 + 5 = 23869.
+        # Shared Serena adds 284 cases; main floor is 24153.
+        # Human-reference integrity: 32 initial +49 first repair +11 atomic
+        # publication =92 cases across three branch-new files, no added skips.
+        # Floor: 24153 +92 =24245; skip ceiling remains 102.
+        # NVIDIA provider health: new test_provider_health_probes.py collects
+        # 87 tests (0 -> 87); no added skips. Floor: 24245 + 87 = 24332.
+        # FalkorDB provisioning (#1834): --collect-only on main's versions vs
+        # this branch's, after the last test-adding edit (new file = full count):
+        #   test_infra_protection_posture.py       50 -> 68   (+18)
+        #   test_collectors_container.py           51 -> 62   (+11)
+        #   test_systemd_template_placeholders.py  11 -> 13   (+2)
+        #   test_collectors_falkordb.py           new -> 23   (+23)
+        #   test_falkordb_module.py               new -> 35   (+35)
+        # No added skips. Floor: 24332 + 89 = 24421; skip ceiling remains 102.
+        # Qualification journal (replacement 1/6): new test file collects 95
+        # cases: 2 retained historical regressions plus 93 new accounting and
+        # recovery cases. Main has none of this package's original 231 cases.
+        # Floor: 24421 + 95 = 24516; no added skips, ceiling unchanged.
+        # Reference admission: 23 preserved +98 boundary +246 actor-role cases.
+        # Floor: 24516 +367 =24883; no added skips, ceiling unchanged.
+        #
+        # Immutable CBM staging: new test_codebase_managed_config.py collects
+        # 76 cases (0 -> 76), plus 3 new provider-opener classification controls.
+        # The native-binary opt-ins add two skip identities. Original PR CI had
+        # seven additional browser skips absent on current main; counts alone
+        # did not establish a two-slot allowance. Keep main's ceiling unchanged.
+        # On top of the reference-admission floor above, measured by
+        # --collect-only against main's versions of both files:
+        # 24883 + 76 + 3 = 24962.
+        #
+        # Crash recovery (#2632), measured with --collect-only against main's
+        # versions of the changed test files: test_bootstrap_guards.py 29 -> 69
+        # (+40), test_deploy_candidates_drop_status.py 68 -> 69 (+1),
+        # test_deploy_checkout.py 51 -> 52 (+1); the others are unchanged.
+        # No added skips. Floor: 24962 + 42 = 25004; skip ceiling remains 102.
+        #
+        # Checkout mutation fence (#2870): +36 collected tests, measured with
+        # --collect-only against main's versions of the changed test files
+        # (checkout-lock shell and Python tests, invoker +8, child_env +1,
+        # deploy/update/candidate lock and rollback tests); no added skips.
+        # Floor: 25004 + 36 = 25040.
+        #
+        # Corpus/adapters replacement (#3071): +130 collected tests, measured with
+        # --collect-only against main's versions of the changed test files
+        # (test_qualification +78, test_qualification_references +24,
+        # test_qualification_rework +28); no added skips.
+        # Floor: 25040 + 130 = 25170.
+        # Peer restore authority (#3128): measured collection of changed files
+        # against current main: 178 -> 219, entirely the new 41-case restore
+        # authority suite. Other five changed test files retain their counts.
+        # No new skip allowance. Floor: 25170 + 41 = 25211.
+        # Shared transcript credential-label policy (#3072): +2. Floor: 25211 + 2 = 25213.
+        # Authenticated backup reads: measured net +106; 25170 + 106 = 25276.
+        # Offline restore fixture changes are count-neutral; ceiling stays 102.
+        # Merge with main (#3133 authenticated backup reads): main 25211 + this PR's measured +106 = 25317.
+        # Re-merge with main (#3133): main 25213 + this PR's measured +106 = 25319.
+        # Staged excused-path guard (#2889): test_update_checkout_moved.py
+        # collects 97 here and 81 on origin/main (--collect-only): +16; its other
+        # two test edits are count-neutral. Floor: 25319 + 16 = 25335.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25335

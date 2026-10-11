@@ -89,8 +89,9 @@ root ignores the whole file (warning); a non-mapping section ignores that sectio
 | `lm_studio_url()` | env `LM_STUDIO_URL` | yaml `network.lm_studio_url` | `http://localhost:1234/v1` | non-empty |
 | `lm_studio_health_url()` | env `LM_STUDIO_HEALTH_URL` | derived from `lm_studio_url()` | — | present (empty → `""`) |
 | `qdrant_url()` | env `QDRANT_URL` | *(no yaml layer)* | `http://localhost:6333` | present |
-| `ollama_enabled()` | env `GENESIS_ENABLE_OLLAMA` | yaml `network.ollama_enabled` | `False` | **present** |
-| `embed_priority_tier()` | env `GENESIS_EMBED_PRIORITY_TIER` | yaml `memory.embed_priority_tier` | `True` | **present** |
+| `ollama_enabled()` | env `GENESIS_ENABLE_OLLAMA` | yaml `network.ollama_enabled` | `False` | non-empty |
+| `embed_priority_tier()` | env `GENESIS_EMBED_PRIORITY_TIER` | yaml `memory.embed_priority_tier` | `True` | non-empty |
+| `embed_local_first()` | env `GENESIS_EMBED_LOCAL_FIRST` | yaml `memory.embed_local_first` | `False` | non-empty |
 | `build_lane_enabled()` | env `GENESIS_BUILD_LANE_ENABLED` | yaml `build_lane.enabled` | `False` | **present** |
 | `models_md_synthesis_enabled()` | env `GENESIS_MODELS_MD_SYNTHESIS_OFF` (inverted) | yaml `models_md_synthesis.enabled` | `True` | present |
 | `github_user()` | env `GENESIS_GITHUB_USER` | yaml `github.user` | `""` | non-empty |
@@ -193,7 +194,8 @@ names, so an overlay of a read-only file is editable (#2446).
 - **Process env only** (no file layer): paths — `GENESIS_REPO_ROOT`, `SECRETS_PATH`,
   `GENESIS_DB_PATH`, `GENESIS_HOME`, `VENV_PATH`, `CLAUDE_HOME`, `GENESIS_PLANS_DIR`,
   `GENESIS_OUTPUT_DIR`, `GENESIS_CC_PROJECT_ID`; tuning — `GENESIS_DB_BUSY_TIMEOUT_MS`
-  (MCP children default it to 15000), read-pool sizes, `GENESIS_RECALL_RERANK_RPM`.
+  (MCP children default it to 15000), read-pool sizes, `GENESIS_RECALL_RERANK_RPM`,
+  `GENESIS_SQLITE_SLOW_MS` (slow-statement log threshold, default 1000, `0` = off).
   All in `src/genesis/env.py`. They reach a process via the unit, `secrets.env`, or the parent.
 - **The update remote** — which git remote `scripts/update.sh` fetches `main` from, and
   which the version collector compares against. Chosen by `src/genesis/util/update_remote.py`:
@@ -202,6 +204,9 @@ names, so an overlay of a read-only file is editable (#2446).
   `origin`. `update.sh` pins `origin` there on first use, so a remote added later (a
   contributor's fork fetched for review) cannot move it. When `origin` does not name
   `github.public_repo` but another remote does, it refuses until that key is set by hand.
+- **`~/.genesis/resource-budget.env`** — optional `KEY=VALUE` file for the resource-budget
+  levers (`GENESIS_RB_*`), read by `genesis.hostmetrics`; the process environment wins over
+  it. Details: `docs/reference/resource-budget.md`.
 - **`env.example`** — a template of deployment/topology env vars. Its header suggests
   "`.env` at the repo root", but nothing in `src/` or `scripts/` loads a repo-root `.env`.
   Runtime entries belong in `secrets.env` or the unit environment. Install-time entries
@@ -219,9 +224,12 @@ names, so an overlay of a read-only file is editable (#2446).
   `scripts/setup_claude_config.py --global` applies `config/cc-global-settings.yaml`, and
   `scripts/cc_settings_align.sh` re-asserts the auto-updater keys daily). How they merge is
   Claude Code's rule, not Genesis's. `.mcp.json` is rendered from
-  `config/mcp.json.template`: `install.sh` leaves an existing file alone, but
-  `scripts/bootstrap.sh` runs `scripts/setup_claude_config.py`, which REWRITES it whenever
-  it differs from the template, so custom entries do not survive a bootstrap. Its Genesis servers carry
+  `config/mcp.json.template` by `scripts/setup_claude_config.py`, minus the servers only a
+  dispatch profile uses (`INTERACTIVE_EXCLUDED_SERVERS` there, today `discord-bot`): the
+  template stays the single source, and dispatched sessions get their servers from it
+  through `cc/session_config._MCP_PROFILES`. `install.sh` leaves an existing file alone, but
+  `scripts/bootstrap.sh` runs the same script, which REWRITES it whenever
+  it differs from that render, so custom entries do not survive a bootstrap. Its Genesis servers carry
   no `env` block, so they get env from the CC process plus `secrets.env` (section 1).
 
 ---
@@ -233,8 +241,11 @@ names, so an overlay of a read-only file is editable (#2446).
    that anything re-reads the file (`daily_budget_disabled`, `memory_rerank_off`,
    `skill_gate_off` in `src/genesis/env.py` have no in-process setter).
 2. **Empty is not unset.** `KEY=` in `secrets.env` shadows `genesis.yaml` for every
-   "present" helper, and turns `GENESIS_ENABLE_OLLAMA`, `GENESIS_BUILD_LANE_ENABLED` and
-   `GENESIS_EMBED_PRIORITY_TIER` **on**. To defer to the yaml, comment the line out.
+   "present" helper, and turns `GENESIS_BUILD_LANE_ENABLED` **on**. To defer to the
+   yaml, comment the line out. The embedding-chain levers (`GENESIS_ENABLE_OLLAMA`,
+   `GENESIS_EMBED_PRIORITY_TIER`, `GENESIS_EMBED_LOCAL_FIRST`) are the exception: they
+   are "non-empty" helpers, because the memory MCP child drops empty values before
+   they reach its environment, and the server and the child must agree.
 3. **Timezone is inverted.** `genesis.yaml` beats `USER_TIMEZONE`; changing the env var
    on an install whose file has a valid zone does nothing.
 4. **The overlay is not always where you think.** Settings domains read

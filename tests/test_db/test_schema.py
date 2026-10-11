@@ -171,6 +171,10 @@ async def test_no_unexpected_tables(db):
         "memory_reconcile_runs",  # memory integrity Phase 1 (repair lane audit)
         "pr_verifications",  # post-merge E2E obligation ledger (issue #1718)
         "zero_drop_findings",  # stranded-work detector (one row per standing condition)
+        "board_links",  # work board: card <-> private source + promotion audit
+        "open_questions",  # work board: local-only unresolved forks
+        "open_question_blocks",  # work board: question -> blocked work edges
+        "board_events",  # work board: append-only event log
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"

@@ -1,0 +1,1 @@
+- CONTRIBUTING now states that stacked PRs are not supported yet, so open each PR against `main` once the PR it builds on has merged.

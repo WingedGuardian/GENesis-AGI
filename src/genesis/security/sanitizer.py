@@ -30,10 +30,20 @@ logger = logging.getLogger(__name__)
 # The attribute run stops at "<" as well as ">": a marker never contains "<", and
 # stopping there keeps each match attempt short, so a long run of unterminated
 # openers costs linear time instead of quadratic. The name must end at whitespace
-# or ">", so a different tag that merely starts with it is left alone.
+# or ">", so a different tag that merely starts with it is left alone. Case is
+# ignored: a model reads "</EXTERNAL-CONTENT>" as the same closer.
 _BOUNDARY_MARKER_RE = re.compile(
-    r"<external-content(?=[\s>])[^<>]*>|</external-content(?=[\s>])[^<>]*>"
+    r"<external-content(?=[\s>])[^<>]*>|</external-content(?=[\s>])[^<>]*>",
+    re.IGNORECASE,
 )
+
+
+# What is left of a marker once removals glue a nested forgery back together:
+# the opening "<" of any marker-shaped name. Escaping that one character cannot
+# create a new "<", so the output carries no marker after a single linear pass.
+# The name may also end at another "<" or at the end of the text: a deep nest
+# leaves openers glued to the next opener, and those count too.
+_MARKER_REMNANT_RE = re.compile(r"<(?=/?external-content(?:[\s<>]|$))", re.IGNORECASE)
 
 
 def strip_boundary_markers(text: str) -> str:
@@ -42,8 +52,13 @@ def strip_boundary_markers(text: str) -> str:
     Idempotent companion to :meth:`ContentSanitizer.wrap_content` — call this
     before wrapping content that may already carry markers from an upstream
     ingestion point, to avoid nested wrappers that confuse the LLM boundary.
+
+    Two linear passes: remove the markers, then escape the ``<`` of any marker
+    the removals formed (``a<external-content<external-content >>b`` would
+    otherwise become ``a<external-content>b``). A loop to a fixpoint would be
+    quadratic on attacker-chosen nesting.
     """
-    return _BOUNDARY_MARKER_RE.sub("", text)
+    return _MARKER_REMNANT_RE.sub("&lt;", _BOUNDARY_MARKER_RE.sub("", text))
 
 
 # Any maximal run of characters that break — or conceal a break in — a single line

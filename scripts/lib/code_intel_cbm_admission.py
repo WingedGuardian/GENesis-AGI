@@ -198,7 +198,33 @@ def assess(
         raise AdmissionRefused("insufficient host available memory")
 
 
+def verify_workload_scope(
+    unit: str,
+    *,
+    self_path: Path = Path("/proc/self/cgroup"),
+    mountinfo_path: Path = Path("/proc/self/mountinfo"),
+) -> None:
+    """Prove the executing batch's scope is directly in the workload slice.
+
+    This proves routing only, not OOM protection or monitor registration.
+    Production always uses kernel-owned membership and mount information.
+    """
+    if not re.fullmatch(r"code-intel-[a-f0-9]{12}-(?:cbm|gitnexus)-[0-9]+", unit):
+        raise AdmissionRefused("invalid expected workload scope name")
+    leaf, root, version = resolve_cgroup(self_path, mountinfo_path)
+    if version != 2 or leaf == root or leaf.name != unit + ".scope" \
+            or leaf.parent.name != "genesis-workload.slice":
+        raise AdmissionRefused("batch is outside its expected workload slice and scope")
+
+
 def main(argv: list[str]) -> int:
+    if len(argv) == 3 and argv[1] == "--verify-workload-boundary":
+        try:
+            verify_workload_scope(argv[2])
+        except AdmissionRefused as exc:
+            print(f"code-intel: refusing workload routing: {exc}", file=sys.stderr)
+            return 125
+        return 0
     if len(argv) != 5:
         print("code-intel: admission requires cap, reserve, scope and cache reserve", file=sys.stderr)
         return 125

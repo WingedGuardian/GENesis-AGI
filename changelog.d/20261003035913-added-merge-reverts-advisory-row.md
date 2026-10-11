@@ -1,0 +1,1 @@
+- Added an advisory `main-reverts` row to the `--check-pr` merge report: it names the files a PR's diff carries that none of the PR's own commits touched, the signature of a merge from main that kept stale copies and would silently revert main, along with how to repair it; it never blocks a merge.

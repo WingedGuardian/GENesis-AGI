@@ -324,13 +324,13 @@ def test_the_reminders_terminal_numbers_track_the_budget_constants():
         f"non-standing round is {limit + 1}"
     )
 
-    # The same boundary is also spelled as a WORD twice ("after four ordinary heads",
-    # "past four heads"). Only the values actually in play are mapped: a limit that
+    # The same boundary is also spelled as a WORD twice ("after four ordinary rounds",
+    # "past four rounds"). Only the values actually in play are mapped: a limit that
     # falls outside it fails loudly here rather than silently skipping the check.
     words = {2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
     assert limit in words, (
         f"STANDING_REVIEWED_HEAD_LIMIT is {limit}, which this test cannot spell; "
         "extend the map and re-check the reminder's word forms"
     )
-    assert f"after {words[limit]} ordinary heads" in reminder
-    assert f"past {words[limit]} heads" in reminder
+    assert f"after {words[limit]} ordinary rounds" in reminder
+    assert f"past {words[limit]} rounds" in reminder

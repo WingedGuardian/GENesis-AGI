@@ -17,7 +17,7 @@
 set -u
 set -o pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(unset CDPATH; cd "$(dirname "$0")/.." && pwd)"
 VERSIONS_FILE="$REPO_ROOT/.genesis-hook-versions"
 
 # Keep in lockstep with update_hook_versions.sh, sync-hooks.sh, and

@@ -103,8 +103,10 @@ never from the command's exit code:
 
 | systemd afterwards | Recorded as |
 |---|---|
-| tailscaled's identity (InvocationID, start time, state) unreadable at the scan's start or immediately before the restart | nothing is restarted: a rate limit or an outcome it could not judge is not worth the dropped sessions |
+| scan-start identity is incomplete and the after-scan read cannot confirm continuity | `identity-unreadable`: every verdict is void, the run counts as blind, and nothing is restarted |
 | tailscaled restarted or stopped since the scan began, seen after the scan or immediately before `try-restart` (an operator, an upgrade), or a `try-restart` that found it stopped | `daemon-changed`: every verdict is void and nothing is restarted |
+| scan-start identity is incomplete but an active daemon has a matching readable InvocationID or start time after the scan | verdicts are retained; a restart still requires a complete identity and a readable start time |
+| identity unreadable immediately before the restart | nothing is restarted: an outcome it could not judge is not worth the dropped sessions |
 | new InvocationID, unit active, every stuck peer answers through the tunnel within `NETWD_TS_VERIFY_SEC` (60s; it bounds the whole check, and no peer starts a ping after it) | `healed` |
 | new InvocationID, unit active, a stuck peer still gets no reply | `restart-no-effect` |
 | new InvocationID, unit active, but no check of a stuck peer could be judged (the CLI gave no answer) | `restart-unconfirmed` |
@@ -182,17 +184,20 @@ The owner hears about it through the Genesis runtime. The awareness tick
 - The Genesis side reads the latest run only (every ~5 minutes against runs
   every ~2), so a stuck spell shorter than that can go unreported; restart
   outcomes are kept and never missed.
-- If the timer is enabled but the file has not been rewritten for 10 minutes,
+- If the timer is enabled (including `enabled-runtime`, enabled for this boot)
+  but the file has not been rewritten for 10 minutes,
   and the oneshot is not mid-run, a `high` alert says the watchdog has gone
   silent. If it reports but judged no tunnel for three runs in a row
   (tailscaled crashed, logged out, the CLI failing, a status it cannot parse,
-  or probe limits set to zero), a `high` alert says it is blind. tailscaled
+  unreadable systemd identity, malformed-only peer data, or probe limits set to
+  zero), a `high` alert says it is blind. tailscaled
   turned off on purpose (a disabled or masked unit, or `tailscale down`) is
   nothing to watch, not blindness. Both are raised again by a new
   episode after one resolves. The watchdog's own failures reach no one
   otherwise: the owning user cannot read the system journal.
-- The infra profile records `tailscaled_loaded` and the timer's unit-file state,
-  and the protection-posture check flags `tailscale_watchdog_absent` where
+- The infra profile records `tailscaled_loaded` and the effective watchdog
+  unit-file state: the timer's, or the service's when it is masked. The
+  protection-posture check flags `tailscale_watchdog_absent` where
   tailscaled is installed and the timer is neither enabled nor masked
   (a runtime mask counts).
 - In observe mode a stuck peer is alerted the same way and never restarted.
@@ -213,9 +218,10 @@ still respect a mask where one exists (a unit masked before it was ever
 installed). The installer never
 writes through a symlink: a masked unit is a symlink to `/dev/null`, and
 writing and chmodding through it would change `/dev/null` itself.
-`scripts/uninstall.sh` removes both root timers, then checks: a unit file or
-script it could not remove (it needs sudo), or a timer still active, is named
-in a warning rather than reported as removed.
+`scripts/uninstall.sh` removes both watchdog services and timers, then checks
+for remaining files and the `ActiveState` of every unit. It reports removal
+only when the command returns its completion marker; a missing marker or a
+remaining active unit is warned about rather than reported as removed.
 
 ## How the body schema surfaces it
 

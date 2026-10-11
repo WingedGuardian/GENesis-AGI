@@ -2187,11 +2187,18 @@ async def test_resume_pass_invalidates_row_when_file_changed(
     ]
     # Must have exactly two rows: the invalidated original and a fresh one
     assert len(rows) == 2, f"expected original (invalidated) + fresh row, got {len(rows)}: {rows}"
-    # First row: invalidated due to content change — status=failed with
-    # the approval_invalidated: prefix
-    assert rows[0]["status"] == "failed"
+    # First row: invalidated due to content change — status=superseded (not
+    # a failure) with the approval_invalidated: reason kept for audit
+    assert rows[0]["status"] == "superseded"
     assert "approval_invalidated:" in (rows[0]["error_message"] or "")
     assert "content changed" in (rows[0]["error_message"] or "")
+    # Supersession is not an evaluation attempt: no retry burned.
+    retry_row = await (
+        await db.execute(
+            "SELECT retry_count FROM inbox_items WHERE id = ?", (rows[0]["id"],),
+        )
+    ).fetchone()
+    assert retry_row[0] == 0
     # Second row: new row for the modified content, distinct content_hash
     assert rows[1]["content_hash"] != rows[0]["content_hash"]
     # The fresh row hits the dispatcher too → landed in processing state

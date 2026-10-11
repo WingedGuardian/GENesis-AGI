@@ -662,6 +662,12 @@ _WIRED = {Path(rel).name for _g, rel, _c, _e, _l in _CASES}
 #: path was never in the population to begin with. That is the difference between an
 #: exemption and a question that was asked wrongly.
 _NOT_WIRED = {
+    # Codex runs the shell launcher, not this Python evaluator directly. Its
+    # explicit-allow protocol converts an evaluator import crash to exit 2.
+    # Measured for all six bare sibling imports by
+    # test_codex_review_stop::test_launcher_denies_each_module_scope_import_failure;
+    # test_project_config_wires_fallback_launcher checks the actual entry point.
+    "codex_review_stop.py": "Codex shell launcher converts every sibling import crash to exit 2",
     # Its remaining bare import is `shell_parse`, and its only usable degraded token
     # would be the pipe character — 52,220 of 74,282 commands (70.30%). Wiring it would
     # not make the broken state safe, it would make it UNREPAIRABLE, and a degraded
@@ -679,6 +685,12 @@ _NOT_WIRED = {
     # direction for a gate whose whole measured design property is that it must
     # never become the thing that wedges the work.
     "adopt_first_gate.py": "fail-open by contract — refusing would wedge every edit and plan exit",
+    # Not a hook at all: the deploy-candidates engine is a command-line program run
+    # through scripts/deploy_candidates. Its "return 2" is argparse's usage error,
+    # and a failed import exiting 1 is the correct CLI answer ("failed"), not a
+    # vanished guard. MEASURED 2026-10-01: 0 references to it in .claude/settings.json,
+    # .claude/ or scripts/hooks/, so Claude Code never runs it as a hook.
+    "deploy_candidates.py": "a CLI, not a hook: wired nowhere in .claude/settings.json",
 }
 
 
@@ -1375,7 +1387,12 @@ _ADVISORY_BY_DESIGN = {
     "hooks/pipe_status_guard.py": "ADVISORY, never blocking:",
     "hooks/pr_close_advisory.py": "Say so; never block it.",
     "hooks/pre_push_privacy_review.py": "NON-BLOCKING.",
+    "hooks/rm_trash_advisory.py": "ADVISORY ONLY. It never blocks and never asks",
     "hooks/tmux_kill_server_guard.py": "which is exactly why this is ADVISORY, never a block",
+    # On Bash it is advisory outright: it snapshots before the call and reports
+    # after it, and never exits 2. (Its file-tool half does block, on a matcher
+    # this table does not cover.)
+    "hooks/main_checkout_guard.py": "BASH — DETECTED AFTER THE FACT, NEVER BLOCKED.",
     "procedure_advisor.py": "surfaces relevant procedures as advisory context.",
 }
 

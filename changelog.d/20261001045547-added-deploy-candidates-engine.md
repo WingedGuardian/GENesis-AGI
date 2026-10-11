@@ -1,0 +1,14 @@
+- **`scripts/deploy_candidates`: the engine for `live`, a local integration branch that runs unmerged pull requests on this install's server before they merge (inactive for now).** Nothing is pushed or merged anywhere. `live` is origin/main plus the candidate branches listed in `~/.genesis/deploy_manifest.json`, rebuilt from scratch without touching the working tree (`git merge-tree` and `git commit-tree`), so several open PRs can run together while they are reviewed.
+  - **Pinned commits, no approval step.** `add` pins a candidate to the commit it sees, and `live` runs that commit, never a later one. If the branch moves, the candidate leaves `live` until it is added again. There is no approval step: running an unmerged branch on the install's own server does not need one.
+  - **What `rebuild` checks.** Each rebuild re-checks every candidate: that the branch still points at the pinned commit, the admission rules, and that its PR (if any) is still open against `main` with that commit at its head. A candidate that fails is excluded, by name and reason. A rebuild that cannot read something it needs, such as GitHub or a fetch of `main`, changes nothing.
+  - **Retirement.** A candidate is retired only once its PR's merge commit is in the fetched `main`.
+  - **Other `rebuild` behaviour.** It refuses a dirty checkout, a commit on `live` that it did not make, a `live` checked out in another worktree, and a file in the way of the move. It moves the checkout once, and only when the files change, then syncs the git hooks and fast-forwards local `main`. It never restarts the server.
+  - **`drop`** only removes code from `live`. It needs no network, and it works from a plain shell (`env -i`), so a candidate that breaks the session hooks can still be taken out.
+  - **One candidate per commit.** Two candidates may not share a commit that is not reachable from `main` (a squash-merged commit never becomes reachable), so a stack of branches goes in as its top branch. `add` refuses a branch that shares one with a listed candidate, naming the remedy for how the two relate, and a rebuild excludes every candidate in such a pair, by name. A merged candidate in such a pair is not retired until one of the pair is dropped.
+  - **Admission** refuses:
+    - any change to a database or data migration, and the boot-time schema files;
+    - the host guardian's own files, the Claude Code pin, and what drives the host on a timer;
+    - git and Claude Code hooks;
+    - the scripts that keep `update.sh` and code-only deploys off `live`;
+    - the engine itself.
+  - **Nothing can go live yet.** `add` and `rebuild` require the server to be running the change that teaches `update.sh`, crash recovery, the guardian's code revert and the dashboard's update routes about `live`. That change has not merged.

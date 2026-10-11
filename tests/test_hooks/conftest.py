@@ -123,15 +123,15 @@ def _pin_hook_ask_policy(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_pr_commits(monkeypatch):
-    """Give EVERY hook test an empty PR commit list by default.
+def _hermetic_commit_lookup(monkeypatch):
+    """Give EVERY hook test an empty repo-wide commit lookup by default.
 
-    The freshness gate resolves a clean Codex signal's abbreviated id against
-    ``pulls/N/commits``; without this pin a test that never mentions commits would
-    make a live ``gh`` call. Empty resolves nothing, so no clean signal is accepted
-    and every test keeps the verdict it was written against. Tests of the clean
-    signal set ``_TEST_GH_PR_COMMITS`` themselves."""
-    monkeypatch.setenv("_TEST_GH_PR_COMMITS", "")
+    The freshness gate resolves a clean Codex signal's abbreviated id across the
+    repository; without this pin a test that never mentions commits would make a
+    live ``gh`` call. Empty resolves nothing, so no clean signal is accepted and
+    every test keeps the verdict it was written against. Tests of the clean signal
+    set ``_TEST_GH_COMMIT_AT_PREFIX`` themselves."""
+    monkeypatch.setenv("_TEST_GH_COMMIT_AT_PREFIX", "")
     monkeypatch.setenv("_TEST_GH_CODEX_SIGNAL", "")
     yield
 
@@ -183,6 +183,80 @@ def _hermetic_review_bodies(monkeypatch):
     fail directions, dedupe, and the dismissed-review rule — is exercised in
     tests/test_hooks/test_outside_diff_findings.py, which overrides this per case."""
     monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", "")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_rounds_row(monkeypatch):
+    """Pin the ``--check-pr`` ``rounds`` row for EVERY hook test.
+
+    The row asks ``review_budget.evaluate_pr``, which reads GitHub over GraphQL.
+    ``check_pr_report`` is driven 59 times across 8 hook test files, two of them
+    as a SUBPROCESS, so the pin is an environment variable those children
+    inherit. Without it each report test makes a live call: green on a dev box
+    with gh authenticated, red in CI. The row's own rendering is tested in
+    tests/test_hooks/test_review_rounds.py, which clears this per case."""
+    monkeypatch.setenv("_TEST_ROUNDS_ROW", "hermetic (test pin)")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_squash_body_file(monkeypatch):
+    """Keep ``--check-pr`` from writing its squash body file for EVERY hook test.
+
+    When every gate passes, the report writes the body under ``~/tmp/merge-bodies``
+    in the REAL home directory, and reads the PR body and commits to build it.
+    Report tests whose commit seam includes their head would otherwise leave files
+    in the install (MEASURED: one did). tests/test_hooks/test_squash_body_trailer.py
+    clears this per case, with a temporary HOME."""
+    monkeypatch.setenv("_TEST_SQUASH_BODY_FILE", "off")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_main_reverts(monkeypatch):
+    """Pin the ``--check-pr`` ``main-reverts`` row's commit read for EVERY hook test.
+
+    The row reads ``pulls/N/commits`` first, so without this pin every test that
+    drives ``check_pr_report`` makes a live call (some as a subprocess, hence an
+    environment variable the children inherit). One NON-merge commit resolves the
+    row to ``n/a`` before any further read, so no other seam is consulted and no
+    existing verdict moves — the row is advisory and never counts toward one. Its
+    own behaviour is tested in tests/test_hooks/test_merge_gate_main_reverts.py,
+    which overrides this per case."""
+    monkeypatch.setenv("_TEST_GH_PR_COMMITS", '{"sha": "' + "0" * 40 + '", "parents": 1}')
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_rework(monkeypatch):
+    """Pin the BLOCKING ``rework`` gate's sent-back list EMPTY for EVERY hook test.
+
+    The gate reads ``gh pr list --label needs-rework`` (and the architecture label)
+    first, in both the ``--check-pr`` report and the merge arm, so without this pin
+    every test driving either one makes a live call (some as a subprocess, hence an
+    environment variable the children inherit). An empty list makes every PR ``n/a``
+    unless its body declares a replacement: a declared reference then falls to a
+    timeline read, whose seam is pinned empty here so it reads as UNREADABLE rather
+    than reaching the network. No existing test body declares one. The gate's own
+    behaviour is tested in tests/test_hooks/test_rework_gate.py, which overrides
+    these per case."""
+    monkeypatch.setenv("_TEST_GH_REWORK_SENT_BACK", "")
+    monkeypatch.setenv("_TEST_GH_REWORK_TIMELINE", "{}")
+    monkeypatch.setenv("_TEST_GH_REWORK_ACK", "{}")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_outside_contribution(monkeypatch):
+    """Pin the leaks exemption's PR read to a FAILED read for every hook test.
+
+    The scheduled-review gate asks whether a PR missing its leaks marker is an
+    outside contribution, which is a live GraphQL call without this seam. A failed
+    read means "not exempt", the gate's answer before the exemption existed, so no
+    existing verdict moves. tests/test_hooks/test_leaks_outside_contribution.py
+    overrides it per case."""
+    monkeypatch.setenv("_TEST_GH_OUTSIDE_PR", "__error__")
     yield
 
 

@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 
 import aiosqlite
 
+from genesis.memory.reference_ops import REFERENCE_PROJECT
+
 
 async def insert(
     db: aiosqlite.Connection,
@@ -104,13 +106,27 @@ async def list_recent(
 
 async def taxonomy(db: aiosqlite.Connection) -> dict:
     """Return distinct project_type and domain values for autocomplete."""
+    # The reference partition is excluded: the upload route refuses it, so
+    # offering it in autocomplete would advertise a choice the API rejects —
+    # and, before that refusal existed, picking it made the document
+    # unreachable through every browser.
     cursor = await db.execute(
-        "SELECT DISTINCT project_type FROM knowledge_units WHERE project_type IS NOT NULL",
+        "SELECT DISTINCT project_type FROM knowledge_units"
+        " WHERE project_type IS NOT NULL AND project_type != ?",
+        (REFERENCE_PROJECT,),
     )
     projects = [r[0] for r in await cursor.fetchall()]
 
+    # The SAME exclusion, on the domain axis. Scoping only project_type left
+    # the partition leaking through the other half of the same autocomplete:
+    # reference rows carry domains like ``reference.credentials``, so the
+    # upload form went on offering them. Two columns, one boundary — a fix
+    # applied to one of them is not applied.
     cursor = await db.execute(
-        "SELECT DISTINCT domain FROM knowledge_units WHERE domain IS NOT NULL",
+        "SELECT DISTINCT domain FROM knowledge_units"
+        " WHERE domain IS NOT NULL"
+        " AND (project_type IS NULL OR project_type != ?)",
+        (REFERENCE_PROJECT,),
     )
     domains = [r[0] for r in await cursor.fetchall()]
 

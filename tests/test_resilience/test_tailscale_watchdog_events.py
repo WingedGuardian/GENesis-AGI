@@ -411,6 +411,16 @@ async def test_an_enabled_but_stopped_timer_is_silence(db, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_an_enabled_runtime_but_stopped_timer_is_silence(db, tmp_path):
+    async def state():
+        return {"UnitFileState": "enabled-runtime", "ActiveState": "inactive"}
+
+    assert await _run(db, tmp_path / "missing.json", timer_state=state) == 1
+    (row,) = await _rows(db)
+    assert (row["category"], row["priority"]) == (CATEGORY_SILENT, "high")
+
+
+@pytest.mark.asyncio
 async def test_a_watchdog_that_runs_but_cannot_see_is_reported_and_recurs(db, tmp_path):
     path = tmp_path / "s.json"
     assert await _run(db, _write(path, last_action="unavailable", blind_runs=2)) == 0

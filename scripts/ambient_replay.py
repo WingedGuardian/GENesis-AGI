@@ -166,7 +166,7 @@ async def replay(args) -> dict:
     from genesis.memory.embeddings import EmbeddingProvider
 
     provider = EmbeddingProvider(
-        backends=EmbeddingProvider.build_chain(ollama_first=False),
+        backends=EmbeddingProvider.build_chain(),
         cache_dir=None,
     )
     cache = EmbedCache(_CACHE_PATH)
@@ -359,6 +359,12 @@ async def replay(args) -> dict:
 
 
 def main() -> None:
+    import os
+
+    # A replay re-runs historical turns: its graph traversals are not live
+    # traffic and must not count toward the FalkorDB cutover verdict (and its
+    # mode=ro connection could not record them anyway).
+    os.environ["GENESIS_GRAPH_TELEMETRY_DISABLED"] = "1"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session-id", required=True)
     parser.add_argument("--transcript", default=None)

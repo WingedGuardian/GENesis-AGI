@@ -22,6 +22,9 @@ enabled: true
 #                  staleness (re-adjudicate if identity drifted). Flipping to
 #                  live is therefore a decision to authorize unattended merges
 #                  from then on, not a way to apply proposals nobody approved.
+#                  FENCED: live currently runs as propose_only (logged) and
+#                  the settings lever refuses it, until issue #2742 adds a
+#                  merge-time check that a pair's approval has not gone stale.
 #
 # Merges are effectively irreversible (the loser's mentions/links are rewritten
 # onto the survivor), so the default is propose_only — the conservative posture

@@ -18,7 +18,7 @@
 set -u
 set -o pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(unset CDPATH; cd "$(dirname "$0")/.." && pwd)"
 VERSIONS_FILE="$REPO_ROOT/.genesis-hook-versions"
 
 # Hooks we track. Keep in lockstep with check_hook_versions.sh,

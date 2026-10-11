@@ -448,6 +448,7 @@ _FIRST_PARTY_OBS_SOURCES: frozenset[str] = frozenset(
         "cc_login_monitor",
         "architect_triage",
         "surplus_promotion",
+        "star_milestone_check",
         # Completed from the full writer census (2026-08-22, Codex PR #1431 P1):
         # all Genesis-internal monitors/writers whose rows would otherwise
         # backfill NULL → be excluded from reflection/L1 (cosmetic under Option 1,

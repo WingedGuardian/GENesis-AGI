@@ -483,6 +483,52 @@ def test_a_fence_is_closed_only_by_its_own_marker() -> None:
     _assert_blocked(_evaluate(body=f"~~~\n{BOTH}```\n"), "receipts")
 
 
+def test_a_longer_fence_is_not_closed_by_a_shorter_run() -> None:
+    """MEASURED (issue #2773): CommonMark requires the closing fence to be the
+    same character AT LEAST as long as the opener. A ```` block wrapping a
+    ``` example closed at the inner ``` — the example's content read as
+    visible, so a documented receipt asserted a real one."""
+    body = f"````\n```\n{BOTH}```\n````\n"
+    _assert_blocked(_evaluate(body=body), "receipts")
+    assert receipts.readable_body("````\n```\nhidden\n```\n````\nvisible\n") == "visible"
+
+
+def test_a_tilde_fence_needs_a_tilde_run_at_least_as_long() -> None:
+    """The same length rule on the other character: `~~~~` is not closed by
+    `~~~`, so the text between them is still code."""
+    assert receipts.readable_body("~~~~\n~~~\nhidden\n~~~~\nvisible\n") == "visible"
+
+
+def test_a_backtick_fence_is_not_closed_by_a_tilde_run() -> None:
+    """The close must use the opener's CHARACTER too — a tilde run of any
+    length cannot close a backtick fence."""
+    assert receipts.readable_body("```\n~~~\nhidden\n```\nvisible\n") == "visible"
+
+
+@pytest.mark.parametrize("sep", ["\x85", "\u2028", "\u2029"], ids=["NEL", "LS", "PS"])
+def test_unicode_line_separators_do_not_split_a_rendered_line(sep: str) -> None:
+    """MEASURED (issue #2773): `str.splitlines()` breaks on NEL and the Unicode
+    line/paragraph separators, which Markdown does not treat as line endings.
+    Text joined by one renders as ONE line — it must not read as two."""
+    body = f"prose{sep}CC-Gate-Changelog: x"
+    assert receipts.readable_body(body) == body
+
+
+def test_cr_and_crlf_still_end_a_line() -> None:
+    """The narrowing to Markdown's line endings must keep the endings Markdown
+    does define: `\\r\\n` and a lone `\\r` still split."""
+    assert receipts.readable_body("a\rb\r\nc\n") == "a\nb\nc"
+
+
+def test_a_closer_with_trailing_text_does_not_close() -> None:
+    """Devin Review: CommonMark allows NOTHING but spaces after a closing
+    marker, so ````python inside a ```` fence is an example's content line —
+    the fence stays open and its receipts stay hidden."""
+    body = f"````\n````python\n{BOTH}````\n"
+    _assert_blocked(_evaluate(body=body), "receipts")
+    assert receipts.readable_body("````\n````python\nhidden\n````\nvisible\n") == "visible"
+
+
 def test_an_unmatched_comment_INSIDE_a_fence_does_not_swallow_the_receipts() -> None:
     """MEASURED over-rejection, on a gate with no override sigil.
 
@@ -721,3 +767,35 @@ def test_the_live_pin_file_is_readable_by_the_checker() -> None:
     text = (_REPO_ROOT / "scripts" / "lib" / "cc_version.sh").read_text()
 
     assert receipts._pin_of(text, where="live") is not None
+
+
+# ── keep_blank (issue #2786) ─────────────────────────────────────────────────
+# Paragraph-aware callers (#2762's Acceptance parser) end a list item at a blank
+# line — CommonMark 0.31.2 "Blank lines" / "List items" — so they need the
+# boundaries the default scanner drops.
+
+
+def test_keep_blank_preserves_paragraph_boundaries() -> None:
+    assert receipts.readable_body("a\n\nb", keep_blank=True) == "a\n\nb"
+    # Whitespace-only still counts as blank and is emitted as "".
+    assert receipts.readable_body("a\n   \nb", keep_blank=True) == "a\n\nb"
+
+
+def test_keep_blank_drops_what_a_fence_or_comment_hides() -> None:
+    # A fence leaves no blank behind — its markers and content are all dropped.
+    assert receipts.readable_body("a\n```\nx\n```\nb", keep_blank=True) == "a\nb"
+    # Single-line and multi-line comments alike.
+    assert receipts.readable_body("a\n<!--x-->\nb", keep_blank=True) == "a\nb"
+    assert receipts.readable_body("a\n<!--\nx\n-->\nb", keep_blank=True) == "a\nb"
+    # A line emptied ONLY by comment removal renders as nothing, not a blank.
+    assert receipts.readable_body("a\n<!-- c -->\n\nb", keep_blank=True) == "a\n\nb"
+    # A blank inside an OPEN comment is hidden like any other commented text.
+    assert receipts.readable_body("a\n<!-- open\n\nstill\nb", keep_blank=True) == "a"
+
+
+def test_keep_blank_default_is_unchanged() -> None:
+    """The default call drops every blank line exactly as before — the existing
+    callers (`missing_receipts`, the E2E reader, pr_shape) are unchanged by
+    construction."""
+    assert receipts.readable_body("a\n\nb") == "a\nb"
+    assert receipts.readable_body("a\n   \nb") == "a\nb"

@@ -36,13 +36,14 @@ async def _proposal(
     action_type="content_publishing",
     action_category="marketing",
     goal_id=None,
+    content="Republish the launch post under a de-identified handle.",
 ):
     await ego_crud.create_proposal(
         db,
         id=pid,
         action_type=action_type,
         action_category=action_category,
-        content="Republish the launch post under a de-identified handle.",
+        content=content,
         confidence=0.8,
         ego_source=ego_source,
         goal_id=goal_id,
@@ -365,3 +366,204 @@ async def test_same_goal_same_action_reaffirms(db):
     rows, total = await _decisions(db)
     assert total == 1
     assert rows[0]["reaffirm_count"] == 1
+
+
+async def test_distinct_same_tag_standing_rules_are_both_captured(db):
+    for pid, rule in (("s0", "Rule one stands."), ("s1", "Rule two stands.")):
+        prop = await _proposal(db, pid=pid)
+        await handle_proposal_resolution(
+            db,
+            prop,
+            "rejected",
+            reason="same rejection reason",
+            standing_rule=rule,
+            source="mcp",
+        )
+
+    rows, total = await _decisions(db)
+    assert total == 2
+    assert {row["content"].split("] ", 1)[1] for row in rows} == {
+        "Rule one stands.",
+        "Rule two stands.",
+    }
+
+
+async def test_same_tag_standing_rule_ignores_case_and_whitespace(db):
+    for pid, rule in (("w0", "Rule One  stands."), ("w1", "rule one stands.")):
+        prop = await _proposal(db, pid=pid)
+        await handle_proposal_resolution(
+            db,
+            prop,
+            "rejected",
+            reason="same reason",
+            standing_rule=rule,
+            source="mcp",
+        )
+
+    rows, total = await _decisions(db)
+    assert total == 1
+    assert rows[0]["reaffirm_count"] == 1
+
+
+async def test_reason_path_reaffirms_despite_different_proposal_content(db):
+    for pid, content in (("r0", "synthetic proposal alpha"), ("r1", "synthetic proposal beta")):
+        prop = await _proposal(db, pid=pid, content=content)
+        await handle_proposal_resolution(
+            db,
+            prop,
+            "rejected",
+            reason="The same rule stands.",
+            source="mcp",
+        )
+
+    rows, total = await _decisions(db)
+    assert total == 1
+    assert rows[0]["reaffirm_count"] == 1
+
+
+async def test_different_reasons_under_same_tag_are_both_captured(db):
+    for pid, reason in (("d0", "First ruling differs."), ("d1", "Second ruling differs.")):
+        prop = await _proposal(db, pid=pid)
+        await handle_proposal_resolution(
+            db,
+            prop,
+            "rejected",
+            reason=reason,
+            source="mcp",
+        )
+
+    assert (await _decisions(db))[1] == 2
+
+
+async def test_long_standing_rule_and_reason_repeats_match_truncated_key(db):
+    for pid in ("ls0", "ls1"):
+        prop = await _proposal(db, pid=pid)
+        await handle_proposal_resolution(
+            db,
+            prop,
+            "rejected",
+            reason="unused",
+            standing_rule="S" * 600,
+            source="mcp",
+        )
+    rows, total = await _decisions(db)
+    assert total == 1
+    assert rows[0]["reaffirm_count"] == 1
+
+    for pid, content in (("lr0", "synthetic proposal one"), ("lr1", "synthetic proposal two")):
+        prop = await _proposal(db, pid=pid, content=content)
+        await handle_proposal_resolution(
+            db,
+            prop,
+            "rejected",
+            reason="R" * 600,
+            source="mcp",
+        )
+    reason_rows = [
+        row
+        for row in await ego_crud.list_directives(
+            db,
+            kind="decision",
+            statuses=("active",),
+            limit=10,
+        )
+        if row["source_proposal_id"] in {"lr0", "lr1"}
+    ]
+    assert len(reason_rows) == 1
+    assert reason_rows[0]["reaffirm_count"] == 1
+
+
+async def test_goal_scoped_and_goal_less_same_tag_rulings_are_distinct(db):
+    scoped = await _proposal(
+        db,
+        pid="g0",
+        action_type="goal_status_change",
+        action_category="goal_management",
+        goal_id="goal-synthetic",
+    )
+    await handle_proposal_resolution(
+        db,
+        scoped,
+        "rejected",
+        reason="same reason",
+        standing_rule="Same rule.",
+        source="mcp",
+    )
+    goal_less = await _proposal(
+        db,
+        pid="g1",
+        action_type="goal_status_change",
+        action_category="goal_management",
+    )
+    await handle_proposal_resolution(
+        db,
+        goal_less,
+        "rejected",
+        reason="same reason",
+        standing_rule="Same rule.",
+        source="mcp",
+    )
+
+    assert (await _decisions(db))[1] == 2
+
+
+async def test_find_tagged_decisions_is_literal(db):
+    first = await ego_crud.create_decision(db, content="[dev/x] a ruling")
+    under = await ego_crud.create_decision(db, content="[dev_x] b ruling")
+    await ego_crud.create_decision(db, content="[dev/x/goal:1] c ruling")
+    retired = await ego_crud.create_decision(db, content="[dev/x] retired ruling")
+    await ego_crud.supersede_decision(db, retired)
+    await ego_crud.create_decision(
+        db,
+        content="[dev/x] another ego",
+        ego_target="genesis_ego",
+    )
+    await ego_crud.create_directive(db, content="[dev/x] plain directive")
+
+    assert [row["id"] for row in await ego_crud.find_tagged_decisions(db, tag="[dev/x]")] == [first]
+    assert [row["id"] for row in await ego_crud.find_tagged_decisions(db, tag="[dev_x]")] == [under]
+    assert await ego_crud.find_tagged_decisions(db, tag="[d%]") == []
+
+
+@pytest.mark.parametrize("key_length", [480, 481, 488, 499, 500])
+async def test_repeat_rejection_reaffirms_when_truncation_cuts_the_marker(db, key_length):
+    """A ``[tag] reason`` key of 481-498 chars keeps only part of the provenance
+    marker after the 500-char cap; the repeat must still reaffirm. Only 481 and
+    488 reach the cut-marker branch: 480 keeps the whole marker, 499 leaves a
+    trailing space the key strips, and 500 keeps no marker at all."""
+    first = await _proposal(db, pid="t0", content="synthetic proposal one")
+    reason = "r" * (key_length - len(decision_prefix(first)) - 1)
+    await handle_proposal_resolution(db, first, "rejected", reason=reason, source="mcp")
+    second = await _proposal(db, pid="t1", content="synthetic proposal two")
+    await handle_proposal_resolution(db, second, "rejected", reason=reason, source="mcp")
+
+    rows, total = await _decisions(db)
+    assert total == 1
+    assert rows[0]["reaffirm_count"] == 1
+
+
+def test_decision_matches_ruling_rejects_a_longer_ruling():
+    def match(content, ruling, source="p0"):
+        row = {"content": content, "source_proposal_id": source}
+        return ego_crud.decision_matches_ruling(row, ruling)
+
+    assert match("[t] keep x (rejected proposal: drop x)", "[t] keep x")
+    assert not match("[t] keep x and y", "[t] keep x")
+    # A partial marker counts only on a row the cap actually truncated.
+    assert not match("[t] keep x (rejected p", "[t] keep x")
+    assert not match("[t] keep x (rejected proposals are fine)", "[t] keep x")
+    # A manual ruling (no source proposal) that contains the marker text is
+    # its own ruling, not a captured copy of a shorter one.
+    assert not match("[t] keep x (rejected proposal: weekends only)", "[t] keep x", None)
+    cut = ("[t] " + "a" * 494 + " (except weekends)")[: ego_crud.DECISION_CONTENT_MAX]
+    assert not match(cut, "[t] " + "a" * 494, None)
+    assert match(cut, "[t] " + "a" * 494)
+
+
+async def test_find_tagged_decisions_puts_recent_affirmation_first(db):
+    older = await ego_crud.create_decision(db, content="[dev/x] older ruling")
+    newer = await ego_crud.create_decision(db, content="[dev/x] newer ruling")
+    await ego_crud.reaffirm_decision(db, older)
+
+    rows = await ego_crud.find_tagged_decisions(db, tag="[dev/x]")
+    assert [row["id"] for row in rows] == [older, newer]

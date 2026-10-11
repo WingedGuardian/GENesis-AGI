@@ -33,8 +33,8 @@ NETRES_LIBEXEC_DIR="${NETRES_LIBEXEC_DIR:-/usr/local/lib/genesis}"
 # at source time from this file's own location; overridable for tests. The
 # trailing `; true` keeps a failed resolution from aborting the sourcing caller
 # under `set -e` — a bad path is caught later by the readable-source guard.
-NETRES_WATCHDOG_SRC="${NETRES_WATCHDOG_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../systemd" 2>/dev/null && pwd; true)/genesis-network-watchdog.sh}"
-NETRES_TS_WATCHDOG_SRC="${NETRES_TS_WATCHDOG_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../systemd" 2>/dev/null && pwd; true)/genesis-tailscale-watchdog.py}"
+NETRES_WATCHDOG_SRC="${NETRES_WATCHDOG_SRC:-$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")/../systemd" 2>/dev/null && pwd; true)/genesis-network-watchdog.sh}"
+NETRES_TS_WATCHDOG_SRC="${NETRES_TS_WATCHDOG_SRC:-$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")/../systemd" 2>/dev/null && pwd; true)/genesis-tailscale-watchdog.py}"
 # The Tailscale watchdog runs under the HOST's Python (standard library only),
 # never the Genesis venv, which root does not own and an update can rebuild.
 NETRES_PYTHON="${NETRES_PYTHON:-/usr/bin/python3}"

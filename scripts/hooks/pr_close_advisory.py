@@ -3,11 +3,15 @@
 
 WHAT GAP THIS FILLS
 ===================
-There IS a rule. `genesis-development/SKILL.md` carries a 30-line standing user
+There IS a rule. `genesis-development/SKILL.md` carries a standing user
 rule, "Never RETIRE a PR you are not the one reviving": a reviewer session
 retires nothing, a premise-wrong PR gets `needs-architecture-session` and stays
-OPEN, a superseded one gets a comment naming its successor and also stays open,
-and retiring belongs to the session taking up the revival.
+OPEN, and retiring belongs to the session taking up the revival. A superseded PR
+gets a comment naming its successor; since 2026-10-04 the closing session may
+retire it when the owner authorized the supersession, the successor is open or
+merged, and a per-file check shows it superseded in every part. Since 2026-10-06
+a rework's builder may too, under the same conditions (Devin excepted: the
+closing session retires a Devin rework's old PR).
 
 **Nothing enforces or surfaces it.** MEASURED against `origin/main`: no hook
 mentions PR closure at all except one line in the push guard, and that one is a
@@ -192,6 +196,9 @@ class _ApiCall(NamedTuple):
     endpoint: str | None
     fields: tuple[tuple[str, str], ...]
     method: str | None
+    #: The `--input` value (a path, or `-` for stdin). It makes the request a
+    #: POST when no method is given, and it carries the whole body.
+    input: str | None = None
 
 
 def _parse_api(argv: list[str]) -> _ApiCall | None:
@@ -212,6 +219,7 @@ def _parse_api(argv: list[str]) -> _ApiCall | None:
     endpoint = inv.positionals[0] if inv.positionals else None
     fields: list[tuple[str, str]] = []
     method: str | None = None
+    body_input: str | None = None
     positional_only = False
     i = 1
     while i < len(argv):
@@ -235,8 +243,10 @@ def _parse_api(argv: list[str]) -> _ApiCall | None:
                     fields.append((key, val))
             elif name in ("-X", "--method"):
                 method = value
+            elif name == "--input":
+                body_input = value
         i += 1
-    return _ApiCall(endpoint, tuple(fields), method)
+    return _ApiCall(endpoint, tuple(fields), method, body_input)
 
 
 #: Printed INSIDE the advisory, never only here. A reader who learns the
@@ -294,6 +304,31 @@ def _closes_a_pr(argv: list[str]) -> str | None:
     return "a REST `state=closed` PATCH to a pull-request endpoint"
 
 
+#: The superseded-PR exception, stated in full in BOTH notes. A session that
+#: never loaded genesis-development sees only this text, so it carries every
+#: condition and the evidence each needs rather than pointing at the skill.
+#: Both notes read this one constant, so they cannot drift apart.
+_SUPERSEDED_EXCEPTION = (
+    "A superseded PR gets a comment naming its successor and stays open, with "
+    "one exception that only two sessions may use: the CLOSING session, or the "
+    "BUILDER of a rework that replaces this PR (its `Replaces: #N` names it). "
+    "Never a reviewer session, and never Devin, even as a rework's builder: the "
+    "closing session retires the PR a Devin rework replaces. Either may retire "
+    "the PR only when all three hold: (1) the owner's authorization of the "
+    "supersession is on record; for a rework, a `## Rework spec` comment on this "
+    "PR posted by a maintainer (author association OWNER, MEMBER or "
+    "COLLABORATOR; a spec from a non-maintainer, including a non-maintainer "
+    "author of this PR, is not authorization); (2) the successor PR is open or "
+    "merged (for a split rework, the LAST replacement has opened and every "
+    "replacement is open or merged); (3) every file of the old PR was checked "
+    "against the successor and current main and found covered (naming the "
+    "file:line that now does it) or moot (saying why). That per-file mapping "
+    "goes in the closing comment, and a retired PR keeps its labels. If one "
+    "part is neither covered nor moot, the PR stays open with a comment naming "
+    "that part."
+)
+
+
 def _advisory(reasons: list[str], closes: int) -> str:
     """`reasons` are the DISTINCT mechanisms; `closes` is how many were seen.
 
@@ -324,14 +359,21 @@ def _advisory(reasons: list[str], closes: int) -> str:
         f"NOTE: {lead}\n"
         "STANDING RULE (genesis-development, 'Never RETIRE a PR you are not the "
         "one reviving'): a reviewer session retires nothing. A PR that is wrong "
-        "at the premise gets the `needs-architecture-session` label carrying the "
-        "evidence, and STAYS OPEN — retiring belongs to the session that takes "
-        "up its revival. A superseded PR gets a comment naming its successor and "
-        "also stays open. If you believe one should be retired and nobody is "
-        "picking it up, that is a question for the user.\n"
-        "So: if you are the reviving session, or the user asked for this close "
-        "by name, proceed. Otherwise say what you are about to close and why, "
-        "and let them answer.\n"
+        "at the premise gets the `needs-architecture-session` label and a comment "
+        "carrying the evidence, and STAYS OPEN — retiring belongs to the session "
+        "that takes up its revival, and a rework's builder retires only under the "
+        f"superseded-PR conditions below. {_SUPERSEDED_EXCEPTION} If you believe "
+        "any other PR "
+        "should be retired and nobody is picking it up, that is a question for "
+        "the user.\n"
+        "So: if you are Devin and this PR is one your rework replaces, do not "
+        "close it; the closing session does. Otherwise proceed only if one of "
+        "these holds: (a) the user asked for this close by name; (b) you are the "
+        "closing session, or the builder of a rework that replaces this PR, and "
+        "all three conditions above hold with their evidence; (c) you are "
+        "reviving this PR with no rework replacing it, and your comment names "
+        "the successor and justifies the retirement. In any other case, say "
+        "what you are about to close and why, and let the user answer.\n"
         f"{_LIMIT}"
     )
 
@@ -350,9 +392,10 @@ def _unreadable_note(blind) -> str:
     return (
         f"NOTE: this command {blind.cause}, so I could not check whether it closes a "
         "pull request; it mentions a close. If it does: closing a PR is the user's "
-        "decision unless you are the session reviving it (genesis-development, "
-        "'Never RETIRE a PR you are not the one reviving'). For the specific check: "
-        f"{blind.hint}."
+        "decision unless you are reviving it with no rework replacing it, or the "
+        "superseded-PR exception below applies to you (genesis-development, "
+        f"'Never RETIRE a PR you are not the one reviving'). {_SUPERSEDED_EXCEPTION} "
+        f"For the specific check: {blind.hint}."
     )
 
 

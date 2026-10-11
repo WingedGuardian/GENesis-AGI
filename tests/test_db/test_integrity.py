@@ -301,7 +301,8 @@ async def test_connect_aiosqlite_rw_preserves_await_and_context_manager(tmp_path
     assert Path(db).exists()
 
 
-def test_connect_aiosqlite_rw_refuses_before_returning_connector(tmp_path):
+@pytest.mark.parametrize("existing_only", [False, True])
+def test_connect_aiosqlite_rw_refuses_before_returning_connector(tmp_path, existing_only):
     from genesis.db.connection import connect_aiosqlite_rw
 
     db = tmp_path / "genesis.db"
@@ -309,16 +310,17 @@ def test_connect_aiosqlite_rw_refuses_before_returning_connector(tmp_path):
     integrity.quarantine_database(db, source="test", detail="known bad")
 
     with pytest.raises(integrity.DatabaseIntegrityError):
-        connect_aiosqlite_rw(db)
+        connect_aiosqlite_rw(db, existing_only=existing_only)
 
 
 @pytest.mark.asyncio
-async def test_connect_aiosqlite_rw_rechecks_when_delayed_await(tmp_path):
+@pytest.mark.parametrize("existing_only", [False, True])
+async def test_connect_aiosqlite_rw_rechecks_when_delayed_await(tmp_path, existing_only):
     from genesis.db.connection import connect_aiosqlite_rw
 
     db = tmp_path / "genesis.db"
     _healthy_db(db)
-    pending = connect_aiosqlite_rw(db)
+    pending = connect_aiosqlite_rw(db, existing_only=existing_only)
     integrity.quarantine_database(db, source="test", detail="became bad before await")
 
     with pytest.raises(integrity.DatabaseIntegrityError):
@@ -326,12 +328,13 @@ async def test_connect_aiosqlite_rw_rechecks_when_delayed_await(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_connect_aiosqlite_rw_rechecks_on_context_entry(tmp_path):
+@pytest.mark.parametrize("existing_only", [False, True])
+async def test_connect_aiosqlite_rw_rechecks_on_context_entry(tmp_path, existing_only):
     from genesis.db.connection import connect_aiosqlite_rw
 
     db = tmp_path / "genesis.db"
     _healthy_db(db)
-    pending = connect_aiosqlite_rw(db)
+    pending = connect_aiosqlite_rw(db, existing_only=existing_only)
     integrity.quarantine_database(db, source="test", detail="became bad before entry")
 
     with pytest.raises(integrity.DatabaseIntegrityError):
@@ -340,7 +343,8 @@ async def test_connect_aiosqlite_rw_rechecks_on_context_entry(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_connect_aiosqlite_rw_closes_if_quarantined_during_open(tmp_path, monkeypatch):
+@pytest.mark.parametrize("existing_only", [False, True])
+async def test_connect_aiosqlite_rw_closes_if_quarantined_during_open(tmp_path, monkeypatch, existing_only):
     from genesis.db.connection import connect_aiosqlite_rw
 
     db = tmp_path / "genesis.db"
@@ -368,13 +372,14 @@ async def test_connect_aiosqlite_rw_closes_if_quarantined_during_open(tmp_path, 
     )
 
     with pytest.raises(integrity.DatabaseIntegrityError):
-        await connect_aiosqlite_rw(db)
+        await connect_aiosqlite_rw(db, existing_only=existing_only)
 
     assert opened and opened[0]._connection is None
 
 
 @pytest.mark.asyncio
-async def test_connect_aiosqlite_rw_preserves_guard_error_if_cleanup_fails(tmp_path, monkeypatch):
+@pytest.mark.parametrize("existing_only", [False, True])
+async def test_connect_aiosqlite_rw_preserves_guard_error_if_cleanup_fails(tmp_path, monkeypatch, existing_only):
     from genesis.db.connection import connect_aiosqlite_rw
 
     db = tmp_path / "genesis.db"
@@ -395,6 +400,83 @@ async def test_connect_aiosqlite_rw_preserves_guard_error_if_cleanup_fails(tmp_p
     monkeypatch.setattr(aiosqlite, "connect", lambda *_args, **_kwargs: QuarantineDuringOpen())
 
     with pytest.raises(integrity.DatabaseIntegrityError) as raised:
-        await connect_aiosqlite_rw(db)
+        await connect_aiosqlite_rw(db, existing_only=existing_only)
 
     assert any("close failed" in note for note in raised.value.__notes__)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context_api", [False, True])
+async def test_existing_only_connector_never_creates_missing_db(tmp_path, context_api):
+    from genesis.db.connection import connect_aiosqlite_rw
+
+    db = tmp_path / "missing.db"
+    connector = connect_aiosqlite_rw(db, existing_only=True)
+    with pytest.raises(sqlite3.OperationalError, match="unable to open"):
+        if context_api:
+            async with connector:
+                pytest.fail("missing database was opened")
+        else:
+            await connector
+    assert not db.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context_api", [False, True])
+async def test_existing_only_connector_literal_filename_and_writes(tmp_path, context_api):
+    from genesis.db.connection import connect_aiosqlite_rw
+
+    db = tmp_path / "literal ?#%雪.db"
+    _healthy_db(db)
+    connector = connect_aiosqlite_rw(db, existing_only=True, uri=True, timeout=0.5)
+    if context_api:
+        async with connector as conn:
+            await conn.execute("INSERT INTO sample(value) VALUES ('written')")
+            await conn.commit()
+    else:
+        conn = await connector
+        try:
+            await conn.execute("INSERT INTO sample(value) VALUES ('written')")
+            await conn.commit()
+        finally:
+            await conn.close()
+    with sqlite3.connect(db) as reader:
+        assert reader.execute("SELECT value FROM sample ORDER BY id").fetchall() == [
+            ("ok",), ("written",),
+        ]
+    assert list(tmp_path.glob("*.db")) == [db]
+
+
+def test_existing_only_connector_rejects_disabled_uri(tmp_path):
+    from genesis.db.connection import connect_aiosqlite_rw
+
+    with pytest.raises(ValueError, match="uri"):
+        connect_aiosqlite_rw(tmp_path / "missing.db", existing_only=True, uri=False)
+    assert not (tmp_path / "missing.db").exists()
+
+
+@pytest.mark.asyncio
+async def test_existing_only_connector_refuses_disappearance_before_delayed_await(tmp_path):
+    from genesis.db.connection import connect_aiosqlite_rw
+
+    db = tmp_path / "vanishing.db"
+    _healthy_db(db)
+    connector = connect_aiosqlite_rw(db, existing_only=True)
+    db.rename(tmp_path / "preserved.db")
+    with pytest.raises(sqlite3.OperationalError, match="unable to open"):
+        await connector
+    assert not db.exists()
+
+
+@pytest.mark.asyncio
+async def test_default_connector_await_still_creates_database(tmp_path):
+    from genesis.db.connection import connect_aiosqlite_rw
+
+    db = tmp_path / "created.db"
+    conn = await connect_aiosqlite_rw(db, timeout=0.5, uri=False)
+    try:
+        await conn.execute("CREATE TABLE sample(id INTEGER PRIMARY KEY)")
+        await conn.commit()
+    finally:
+        await conn.close()
+    assert db.is_file()

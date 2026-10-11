@@ -13,8 +13,27 @@ def test_defaults_are_shadow():
 
 
 def test_effective_mode_reads_file(monkeypatch):
+    monkeypatch.setattr(cfg, "load_config", lambda: {"enabled": True, "mode": "off"})
+    assert cfg.effective_mode() == "off"
+
+
+def test_live_mode_is_fenced_to_propose_only(monkeypatch, caplog):
+    """live's new-pair auto-merge lane can merge a pair whose approval went
+    stale (in-flight race, #1729), so live is fenced until #2742 lands a
+    merge-time check: the drainer runs propose_only and says why."""
     monkeypatch.setattr(cfg, "load_config", lambda: {"enabled": True, "mode": "live"})
-    assert cfg.effective_mode() == "live"
+    with caplog.at_level("WARNING"):
+        assert cfg.effective_mode() == "propose_only"
+    assert "#2742" in caplog.text
+
+
+def test_settings_refuse_live_mode():
+    """The settings lever refuses live outright, naming the fence."""
+    from genesis.mcp.health.settings import _validate_entity_adjudication
+
+    errors = _validate_entity_adjudication({"mode": "live"})
+    assert errors and "#2742" in errors[0]
+    assert _validate_entity_adjudication({"mode": "propose_only"}) == []
 
 
 def test_effective_mode_disabled_is_off(monkeypatch):

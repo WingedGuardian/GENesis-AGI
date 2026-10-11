@@ -476,3 +476,63 @@ def test_no_markers_is_quiet_noop(tmp_path):
     res = _run_runner(tmp_path, entry_rc=0)
     assert res.returncode == 0
     assert not (tmp_path / "entry.log").exists()
+
+
+# Disabled providers remain durable work, but do not churn the queue.
+def test_disabled_cbm_repeated_ticks_preserve_generation(tmp_path):
+    h = _seed_marker(tmp_path, tools="cbm")
+    (tmp_path / ".genesis" / "codebase-memory-mcp.disabled").touch()
+    with _db(tmp_path) as db:
+        db.execute("UPDATE pending SET attempts=3 WHERE hash=?", (h,))
+        before = db.execute("SELECT * FROM pending").fetchall()
+        state = db.execute("SELECT * FROM repo_state").fetchall()
+    for _ in range(2):
+        assert _run_runner(tmp_path, 0).returncode == 0
+    assert not (tmp_path / "entry.log").exists()
+    with _db(tmp_path) as db:
+        assert db.execute("SELECT * FROM pending").fetchall() == before
+        assert db.execute("SELECT * FROM repo_state").fetchall() == state
+        assert db.execute("SELECT * FROM inflight").fetchall() == []
+
+
+def test_disabled_combined_runs_once_then_defers_cbm(tmp_path):
+    _seed_marker(tmp_path, tools="both")
+    (tmp_path / ".genesis" / "codebase-memory-mcp.disabled").touch()
+    assert _run_runner(tmp_path, 5).returncode == 0
+    before = (tmp_path / "entry.log").read_text()
+    assert "tools=both" in before
+    assert "\tcbm\t" in _markers(tmp_path)[0]
+    assert _run_runner(tmp_path, 0).returncode == 0
+    assert (tmp_path / "entry.log").read_text() == before
+
+
+def test_disabled_cbm_override_paths_and_gitnexus_are_independent(tmp_path):
+    _seed_marker(tmp_path, tools="cbm")
+    sentinel = tmp_path / "disabled"
+    sentinel.touch()
+    for path in [str(sentinel), "~/disabled", "relative/disabled"]:
+        assert _run_runner(tmp_path, 0, extra_env={"CODEBASE_MEMORY_MCP_DISABLE_FILE": path}).returncode == 0
+        assert not (tmp_path / "entry.log").exists()
+    # Coalescing GitNexus into deferred CBM must allow both on the next tick.
+    _seed_marker(tmp_path, tools="gitnexus")
+    assert _run_runner(tmp_path, 5, extra_env={"CODEBASE_MEMORY_MCP_DISABLE_FILE": str(sentinel)}).returncode == 0
+    assert "tools=both" in (tmp_path / "entry.log").read_text()
+
+
+def test_cbm_disabled_during_idle_sample_restores_claim(tmp_path):
+    # Deterministic pressure seam: the idle sampler arms the sentinel after
+    # the snapshot check but before the authoritative claim check.
+    _seed_marker(tmp_path, tools="cbm")
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    ps = fakebin / "ps"
+    ps.write_text('#!/bin/sh\ntouch "$HOME/.genesis/codebase-memory-mcp.disabled"\n')
+    ps.chmod(0o755)
+    env = {"PATH": f"{fakebin}:/usr/bin:/bin", "CODE_INTEL_FAKE_CLAUDE_CPU": ""}
+    with _db(tmp_path) as db:
+        before = db.execute("SELECT * FROM pending").fetchall()
+    assert _run_runner(tmp_path, 0, extra_env=env).returncode == 0
+    assert not (tmp_path / "entry.log").exists()
+    with _db(tmp_path) as db:
+        assert db.execute("SELECT * FROM pending").fetchall() == before
+        assert db.execute("SELECT * FROM inflight").fetchall() == []

@@ -264,6 +264,96 @@ class TestUserTimezonePrecedence:
         assert user_timezone() == "UTC"
 
 
+class TestEmbedLocalFirst:
+    """The install-local embedding order. Module globals are patched directly:
+    the local config resolves against Path.home(), not GENESIS_HOME."""
+
+    def _config(self, monkeypatch: pytest.MonkeyPatch, cfg: dict) -> None:
+        import genesis.env as env_mod
+
+        monkeypatch.delenv("GENESIS_EMBED_LOCAL_FIRST", raising=False)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG", cfg)
+
+    def test_defaults_to_cloud_first(self, monkeypatch: pytest.MonkeyPatch):
+        import genesis.env as env_mod
+
+        self._config(monkeypatch, {})
+        assert env_mod.embed_local_first() is False
+
+    def test_null_memory_section_falls_through_to_the_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        import genesis.env as env_mod
+
+        self._config(monkeypatch, {"memory": None})
+        assert env_mod.embed_local_first() is False
+
+    def test_local_config_can_put_local_first(self, monkeypatch: pytest.MonkeyPatch):
+        import genesis.env as env_mod
+
+        self._config(monkeypatch, {"memory": {"embed_local_first": True}})
+        assert env_mod.embed_local_first() is True
+
+    def test_quoted_false_in_yaml_stays_false(self, monkeypatch: pytest.MonkeyPatch):
+        import genesis.env as env_mod
+
+        self._config(monkeypatch, {"memory": {"embed_local_first": "false"}})
+        assert env_mod.embed_local_first() is False
+
+    @pytest.mark.parametrize(("value", "expected"), [("true", True), ("false", False)])
+    def test_env_overrides_local_config(
+        self, monkeypatch: pytest.MonkeyPatch, value: str, expected: bool
+    ):
+        import genesis.env as env_mod
+
+        self._config(monkeypatch, {"memory": {"embed_local_first": not expected}})
+        monkeypatch.setenv("GENESIS_EMBED_LOCAL_FIRST", value)
+        assert env_mod.embed_local_first() is expected
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    @pytest.mark.parametrize("yaml_value", [True, False])
+    def test_an_empty_env_value_is_unset_and_defers_to_yaml(
+        self, monkeypatch: pytest.MonkeyPatch, value: str, yaml_value: bool
+    ):
+        """The memory MCP child drops empty secrets.env values before they reach
+        its environment; the main runtime keeps them. Both must therefore read
+        "" as unset, or the two processes resolve one setting apart."""
+        import genesis.env as env_mod
+
+        self._config(monkeypatch, {"memory": {"embed_local_first": yaml_value}})
+        monkeypatch.setenv("GENESIS_EMBED_LOCAL_FIRST", value)
+        assert env_mod.embed_local_first() is yaml_value
+
+    @pytest.mark.parametrize("yaml_value", [True, False])
+    def test_ollama_enabled_treats_an_empty_env_value_as_unset(
+        self, monkeypatch: pytest.MonkeyPatch, yaml_value: bool
+    ):
+        """Same rule: this lever decides whether Ollama joins the embedding chain."""
+        import genesis.env as env_mod
+
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(
+            env_mod, "_LOCAL_CONFIG", {"network": {"ollama_enabled": yaml_value}}
+        )
+        monkeypatch.setenv("GENESIS_ENABLE_OLLAMA", "")
+        assert env_mod.ollama_enabled() is yaml_value
+
+    @pytest.mark.parametrize("yaml_value", [True, False])
+    def test_priority_tier_treats_an_empty_env_value_as_unset(
+        self, monkeypatch: pytest.MonkeyPatch, yaml_value: bool
+    ):
+        """Same rule for the sibling lever, which the MCP child now also loads."""
+        import genesis.env as env_mod
+
+        monkeypatch.setattr(env_mod, "_LOCAL_CONFIG_LOADED", True)
+        monkeypatch.setattr(
+            env_mod, "_LOCAL_CONFIG", {"memory": {"embed_priority_tier": yaml_value}}
+        )
+        monkeypatch.setenv("GENESIS_EMBED_PRIORITY_TIER", "")
+        assert env_mod.embed_priority_tier() is yaml_value
+
+
 class TestEmbedPriorityTier:
     """The default here is a COST decision, so it gets an explicit lock.
 
@@ -360,6 +450,7 @@ _SECTION_ACCESSORS = [
     ("lm_studio_url", "network", "http://localhost:1234/v1"),
     ("ollama_enabled", "network", False),
     ("embed_priority_tier", "memory", True),
+    ("embed_local_first", "memory", False),
     ("build_lane_enabled", "build_lane", False),
     ("models_md_synthesis_enabled", "models_md_synthesis", True),
     ("github_user", "github", ""),
@@ -372,6 +463,7 @@ _SECTION_ACCESSOR_ENV = [
     "LM_STUDIO_URL",
     "GENESIS_ENABLE_OLLAMA",
     "GENESIS_EMBED_PRIORITY_TIER",
+    "GENESIS_EMBED_LOCAL_FIRST",
     "GENESIS_BUILD_LANE_ENABLED",
     "GENESIS_MODELS_MD_SYNTHESIS_OFF",
     "GENESIS_GITHUB_USER",
@@ -612,6 +704,7 @@ class TestYamlBooleanSpellings:
     _ACCESSORS = [
         ("ollama_enabled", "network", "ollama_enabled"),
         ("embed_priority_tier", "memory", "embed_priority_tier"),
+        ("embed_local_first", "memory", "embed_local_first"),
         ("build_lane_enabled", "build_lane", "enabled"),
         ("models_md_synthesis_enabled", "models_md_synthesis", "enabled"),
     ]

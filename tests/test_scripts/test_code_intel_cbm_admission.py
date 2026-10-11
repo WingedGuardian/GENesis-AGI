@@ -18,6 +18,53 @@ GIB = 1024**3
 UNIT = "code-intel-123456abcdef-cbm-4242"
 
 
+@pytest.mark.parametrize("tool", ["cbm", "gitnexus"])
+@pytest.mark.parametrize("parent", ["genesis-workload.slice", "app.slice", "genesis-workload-other.slice"])
+def test_workload_boundary_requires_actual_direct_slice_and_named_scope(tmp_path, tool, parent):
+    unit = f"code-intel-123456abcdef-{tool}-4242"
+    mount = tmp_path / "cg"
+    leaf = mount / parent / (unit + ".scope")
+    leaf.mkdir(parents=True)
+    membership = tmp_path / "self.cgroup"
+    membership.write_text(f"0::/{parent}/{unit}.scope\n")
+    mounts = tmp_path / "mountinfo"
+    mounts.write_text(f"35 24 0:31 / {mount} rw - cgroup2 cgroup rw\n")
+    if parent == "genesis-workload.slice":
+        admission.verify_workload_scope(unit, self_path=membership, mountinfo_path=mounts)
+    else:
+        with pytest.raises(admission.AdmissionRefused, match="outside"):
+            admission.verify_workload_scope(unit, self_path=membership, mountinfo_path=mounts)
+
+
+@pytest.mark.parametrize("unit", ["", "run-123", "code-intel-123456abcdef-cbm-4242.scope", "../x"])
+def test_workload_boundary_rejects_unowned_unit_names(unit):
+    with pytest.raises(admission.AdmissionRefused, match="invalid expected"):
+        admission.verify_workload_scope(unit)
+
+
+def test_workload_boundary_refuses_blind_membership(tmp_path):
+    with pytest.raises(admission.AdmissionRefused, match="cannot read"):
+        admission.verify_workload_scope(UNIT, self_path=tmp_path / "absent")
+
+
+@pytest.mark.parametrize("membership", [
+    "0::/genesis-workload.slice/wrong.scope\n",
+    "0::/genesis-workload.slice/child.slice/" + UNIT + ".scope\n",
+    "5:memory:/genesis-workload.slice/" + UNIT + ".scope\n",
+])
+def test_workload_boundary_refuses_wrong_scope_nested_slice_and_cgroup_v1(tmp_path, membership):
+    mount = tmp_path / "cg"
+    path = membership.strip().split(":", 2)[2]
+    (mount / path.lstrip("/")).mkdir(parents=True)
+    self_path = tmp_path / "self"
+    self_path.write_text(membership)
+    mounts = tmp_path / "mounts"
+    mounts.write_text(f"35 24 0:31 / {mount} rw - cgroup2 cgroup rw\n"
+                      f"36 24 0:32 / {mount} rw - cgroup cgroup rw,memory\n")
+    with pytest.raises(admission.AdmissionRefused, match="outside"):
+        admission.verify_workload_scope(UNIT, self_path=self_path, mountinfo_path=mounts)
+
+
 def _tree(tmp_path: Path, *, parent_limit: int = 12 * GIB,
           parent_current: int = GIB) -> tuple[Path, Path, Path, Path]:
     mount = tmp_path / "cg"

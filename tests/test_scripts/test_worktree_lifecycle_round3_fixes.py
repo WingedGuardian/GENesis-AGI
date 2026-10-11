@@ -121,7 +121,8 @@ def test_the_archive_and_its_directory_are_private(repo: Path, tmp_path: Path, m
         monkeypatch.setattr(wl, "TRASH_DIR", trash)
         monkeypatch.setattr(wl, "TOMBSTONE_INDEX", tmp_path / "tomb.jsonl")
         entry = {"path": str(wt), "branch": "feature/secrets", "head": "", "detached": False}
-        assert wl._trash_worktree(entry, repo) is True
+        # A dirty worktree is archived only on the unmerged lane.
+        assert wl._trash_worktree(entry, repo, lane="unmerged") is True
 
         assert _mode(trash) == 0o700, (
             f"trash dir is {oct(_mode(trash))}; a 0755 directory lets any local "
@@ -163,7 +164,8 @@ def test_the_recovery_patch_is_private_even_when_compression_fails(
             lambda *a, **k: None,  # compression "fails"
         )
         entry = {"path": str(wt), "branch": "feature/patch", "head": "", "detached": False}
-        assert wl._trash_worktree(entry, repo) is True
+        # A dirty worktree is archived only on the unmerged lane.
+        assert wl._trash_worktree(entry, repo, lane="unmerged") is True
 
         moved = _moved_worktree(trash, "wt-patch", tmp_path / "unpacked-patch")
         assert moved.is_dir(), "precondition: this entry stayed uncompressed"
@@ -348,7 +350,7 @@ def test_recovery_still_restores_a_branch_that_survives(
 
 
 def test_a_worktree_containing_another_worktree_is_not_moved(
-    repo: Path, tmp_path: Path, monkeypatch
+    repo: Path, tmp_path: Path, monkeypatch, capsys
 ) -> None:
     """Moving the parent strands the nested tree, and the anchor is the wrong sha.
 
@@ -356,6 +358,11 @@ def test_a_worktree_containing_another_worktree_is_not_moved(
     per-worktree HEAD is the only ref keeping ITS commits reachable, and a prune
     after the move drops it — so the archive would preserve the wrong history
     while the nested work is collected.
+
+    The nested tree is an untracked directory of the parent, so the parent is
+    dirty and reaches the archive step only on the unmerged lane. On the merged
+    lane the dirtiness re-check refuses it first, which would pass this test
+    without the nesting check ever running, so the refusal's REASON is asserted.
     """
     parent = tmp_path / "wt-parent"
     _git(repo, "worktree", "add", "--quiet", "-b", "feature/parent", str(parent))
@@ -366,8 +373,11 @@ def test_a_worktree_containing_another_worktree_is_not_moved(
     monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
     monkeypatch.setattr(wl, "TOMBSTONE_INDEX", tmp_path / "tomb.jsonl")
     entry = {"path": str(parent), "branch": "feature/parent", "head": "", "detached": False}
-    assert wl._trash_worktree(entry, repo) is False, (
+    assert wl._trash_worktree(entry, repo, lane="unmerged") is False, (
         "the parent was moved even though it contains a registered worktree"
+    )
+    assert "registered worktree(s)" in capsys.readouterr().out, (
+        "refused, but not by the nested-worktree check"
     )
     assert parent.exists() and nested.exists(), "and nothing may have been moved"
 
@@ -389,7 +399,8 @@ def test_a_worktree_with_no_nested_worktree_is_still_moved(
     monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
     monkeypatch.setattr(wl, "TOMBSTONE_INDEX", tmp_path / "tomb.jsonl")
     entry = {"path": str(wt), "branch": "feature/solo", "head": "", "detached": False}
-    assert wl._trash_worktree(entry, repo) is True
+    # A dirty worktree is archived only on the unmerged lane.
+    assert wl._trash_worktree(entry, repo, lane="unmerged") is True
 
 
 # ─── honesty of the board ────────────────────────────────────────────────────
@@ -493,7 +504,8 @@ def test_a_worktree_owning_a_trash_meta_json_does_not_lose_it(
     entry = {
         "path": str(wt), "branch": "feature/metacollide", "head": "", "detached": False,
     }
-    assert wl._trash_worktree(entry, repo) is True
+    # A dirty worktree is archived only on the unmerged lane.
+    assert wl._trash_worktree(entry, repo, lane="unmerged") is True
 
     archive = next(trash.glob("*.tar.gz"))
     with tarfile.open(archive, "r:gz") as tf:

@@ -1,0 +1,1 @@
+- Leave disabled Codebase indexing requests pending without repeatedly claiming them, and support a shared GitNexus Node runtime selection for indexing and MCP readers (`GITNEXUS_NODE_BIN` or `~/.genesis/gitnexus-node`).

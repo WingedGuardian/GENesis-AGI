@@ -57,7 +57,7 @@ if [ "${GENESIS_UPDATE_FROM_TEMP:-}" != "1" ] \
     export GENESIS_UPDATE_FROM_TEMP=1
     export GENESIS_UPDATE_SELF_COPY="$TEMP_COPY"
     # Pass original script dir so GENESIS_ROOT resolves correctly
-    export GENESIS_UPDATE_ORIG_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+    export GENESIS_UPDATE_ORIG_DIR="$(unset CDPATH; cd "$(dirname "$0")/.." && pwd)"
     exec "$TEMP_COPY" "$@"
 fi
 # Running from temp copy — clean up on exit. Bind the path NOW: bash expands
@@ -85,7 +85,7 @@ for _arg in "$@"; do
     [[ "$_arg" == "--post-merge" ]] && POST_MERGE=true
 done
 
-GENESIS_ROOT="${GENESIS_UPDATE_ORIG_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+GENESIS_ROOT="${GENESIS_UPDATE_ORIG_DIR:-$(unset CDPATH; cd "$(dirname "$0")/.." && pwd)}"
 # The last piece of the copy handshake, spent now that GENESIS_ROOT is set.
 unset GENESIS_UPDATE_ORIG_DIR
 SCRIPT_DIR="$GENESIS_ROOT/scripts"
@@ -114,24 +114,31 @@ MANIFEST_DELTA_PY="$(cat "$SCRIPT_DIR/lib/manifest_delta.py")"
 # shared with deploy_code_only.sh so the two deploy paths cannot disagree.
 # shellcheck source=lib/deploy_checkout.sh
 . "$SCRIPT_DIR/lib/deploy_checkout.sh"
+# shellcheck source=lib/checkout_lock.sh
+. "$SCRIPT_DIR/lib/checkout_lock.sh"
+# Mutating, printing recovery helpers shared with deploy_code_only.sh.
+# shellcheck source=lib/deploy_recovery.sh
+. "$SCRIPT_DIR/lib/deploy_recovery.sh"
 
 # ── Update state file helper ────────────────────────────
 # Written at each phase boundary so crash recovery knows where we stopped.
 _write_state() {
     local phase="$1"
     mkdir -p "$HOME/.genesis"
-    cat > "$STATE_FILE" << SEOF
-{
-    "phase": "$phase",
-    "rollback_tag": "${ROLLBACK_TAG:-}",
-    "old_tag": "${OLD_TAG:-}",
-    "old_commit": "${OLD_COMMIT:-}",
-    "started_at": "$STARTED_AT",
-    "pid": $$,
-    "services_stopped": [$(printf '"%s",' "${WERE_RUNNING[@]:-}" | sed 's/,$//')],
-    "timestamp": "$(date -Iseconds)"
-}
-SEOF
+    python3 - "$STATE_FILE" "$phase" "${ROLLBACK_TAG:-}" "${ORIGINAL_BRANCH:-}" \
+        "${UPDATE_OWN_HEAD:-}" "${DEPLOY_HEAD:-}" "${OLD_TAG:-}" "${OLD_COMMIT:-}" \
+        "$STARTED_AT" "$$" "$(date -Iseconds)" "${WERE_RUNNING[@]}" <<'PY'
+import json, os, sys
+keys = ("phase", "rollback_tag", "original_branch", "own_head", "deploy_head",
+        "old_tag", "old_commit", "started_at", "pid", "timestamp")
+path, *values = sys.argv[1:]
+state = dict(zip(keys, values))
+state["pid"] = int(state["pid"])
+state["services_stopped"] = values[len(keys):]
+with open(path + ".tmp", "w", encoding="utf-8") as f:
+    json.dump(state, f, indent=4)
+os.replace(path + ".tmp", path)
+PY
 }
 
 # Clear this run's deploy state files. The state file is ours (we wrote it) so
@@ -368,7 +375,7 @@ fi
 # ── Dirty-tree guard ─────────────────────────────────────
 # Abort before touching anything if tracked files are modified.
 # Untracked files (^??) are excluded — merge/reset never touches them.
-# git reset --hard in _do_rollback would silently discard uncommitted work.
+# A modified file the update changes would also make _do_rollback's checkout refuse.
 #
 # Pure redeploy-decision helper (facts in → reason string out; no git/ssh) so
 # the guardian-redeploy matrix is unit-testable. Emits a non-empty reason to
@@ -753,6 +760,7 @@ if [[ "$POST_MERGE" == "false" ]]; then
         else
             echo "  git stash        # save and restore after update"
             echo "  git add -p && git commit -m 'chore: save local changes'  # commit"
+            genesis_has_flagged_entries "$GENESIS_ROOT" && echo "  (A listed path git status does not show is flagged: see 'git ls-files -v'; clear it with git update-index --no-assume-unchanged or --no-skip-worktree.)"
         fi
         exit 1
     fi
@@ -859,7 +867,7 @@ if [[ "$POST_MERGE" == "false" ]]; then
     # Paths the incoming side adds or changes that already exist here untracked or IGNORED.
     # git overwrites an ignored file without asking, and on a true 3-way merge
     # `--no-overwrite-ignore` (on the merge below) does not stop it (measured, git
-    # 2.43); a rollback's `reset --hard` then deletes the file, because the rollback
+    # 2.43); a rollback's checkout then deletes the file, because the rollback
     # tag does not track it. Refused here, while nothing has stopped. The scan is the
     # shared lib's, the one deploy_code_only.sh runs.
     _coll_rc=0
@@ -876,6 +884,97 @@ if [[ "$POST_MERGE" == "false" ]]; then
         _clear_deploy_state
         exit 1
     fi
+
+    # An excused path can be cleared before a normal merge, but staged changes
+    # on divergent histories can survive that clear or prevent it from working.
+    # Fast-forward and local-ahead histories do not need this refusal.
+    # BEGIN staged-excused-divergence
+    _refuse_staged_excused_divergence() {
+        echo "  $1 — server NOT stopped, nothing changed."
+        git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
+        _clear_deploy_state
+        exit 1
+    }
+
+    _staged_guard_is_ancestor() {
+        local rc=0
+        git -C "$GENESIS_ROOT" merge-base --is-ancestor "$1" "$2" >/dev/null 2>&1 || rc=$?
+        [ "$rc" -le 1 ] || _refuse_staged_excused_divergence "Could not compare $1 with $2"
+        return "$rc"
+    }
+
+    # Plumbing keeps ignore-submodule settings, .gitmodules, renames, and
+    # intent-to-add entries from hiding index state; only the two paths cleared
+    # from HEAD before merge can safely allow staged blob edits.
+    _staged_excused_divergence_guard() {
+        local p idx='' tree='' tree_norm='' line='' meta='' path=''
+        local idx_meta='' idx_path='' idx_mode='' idx_oid='' idx_stage=''
+        local tree_meta='' tree_path='' tree_mode='' tree_type='' tree_oid='' tree_stage=''
+        local -a blocked=() tree_entries=()
+
+        if _staged_guard_is_ancestor HEAD "$DEPLOY_HEAD" \
+            || _staged_guard_is_ancestor "$DEPLOY_HEAD" HEAD; then
+            return 0
+        fi
+
+        for p in AGENTS.md config/procedure_triggers.yaml \
+            .claude/settings.local.json .serena/project.yml \
+            src/genesis/identity/USER.md; do
+            # --literal-pathspecs reads the path literally whatever the caller's
+            # environment: under GIT_LITERAL_PATHSPECS=1 a ":(literal)" prefix is
+            # itself taken as part of the name and matches nothing (measured,
+            # git 2.43), which would make a clean checkout refuse every update.
+            if ! idx="$(git -C "$GENESIS_ROOT" --literal-pathspecs ls-files -s -- "$p")"; then
+                _refuse_staged_excused_divergence "Could not read the staged index for excused paths on divergent history"
+            fi
+            if ! tree="$(git -C "$GENESIS_ROOT" --literal-pathspecs ls-tree -r HEAD -- "$p")"; then
+                _refuse_staged_excused_divergence "Could not read HEAD's tree for excused paths on divergent history"
+            fi
+
+            tree_entries=()
+            while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                meta="${line%%$'\t'*}"
+                path="${line#*$'\t'}"
+                read -r tree_mode tree_type tree_oid <<< "$meta"
+                tree_entries+=("$tree_mode $tree_oid 0"$'\t'"$path")
+            done <<< "$tree"
+            tree_norm=""
+            if [ "${#tree_entries[@]}" -gt 0 ]; then
+                tree_norm="$(printf '%s\n' "${tree_entries[@]}")"
+            fi
+
+            [[ "$idx" == "$tree_norm" ]] && continue
+            if [[ "$p" == "AGENTS.md" || "$p" == "config/procedure_triggers.yaml" ]] \
+                && [[ "$idx" != *$'\n'* && "$tree_norm" != *$'\n'* ]]; then
+                IFS=$'\t' read -r idx_meta idx_path <<< "$idx"
+                read -r idx_mode idx_oid idx_stage <<< "$idx_meta"
+                IFS=$'\t' read -r tree_meta tree_path <<< "$tree_norm"
+                read -r tree_mode tree_oid tree_stage <<< "$tree_meta"
+                if [[ "$idx_path" == "$p" && "$idx_stage" == 0 \
+                    && "$tree_path" == "$p" && "$tree_stage" == 0 ]]; then
+                    case "$idx_mode:$tree_mode" in
+                        100644:100644|100644:100755|100644:120000|\
+                        100755:100644|100755:100755|100755:120000|\
+                        120000:100644|120000:100755|120000:120000)
+                            continue
+                            ;;
+                    esac
+                fi
+            fi
+            blocked+=("$p")
+        done
+
+        if [ "${#blocked[@]}" -gt 0 ]; then
+            echo "  Staged changes on excused paths block a divergent update; the merge would fail after the services stop:"
+            printf '%s\n' "${blocked[@]}" | sed 's/^/    /'
+            echo "  Unstage them first: git restore --staged -- <path>"
+            _refuse_staged_excused_divergence "Resolve these staged path changes first"
+        fi
+    }
+
+    _staged_excused_divergence_guard
+    # END staged-excused-divergence
 fi
 
 # ── Back up locally edited ephemeral files BEFORE anything stops ──────
@@ -890,15 +989,6 @@ fi
 # into the armed rollback trap. The clear before the merge discards a file's edits
 # only when a backup of its CURRENT content exists (see the clear loop).
 # BEGIN ephemeral-prestop-backup (extracted by tests/test_scripts/test_update_activation.py)
-EPHEMERAL_CLEAR_PATHS=(AGENTS.md config/procedure_triggers.yaml)
-EPHEMERAL_BACKUP_ROOT="$HOME/.genesis/premerge-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
-
-# Tracked AND different from HEAD in the index or the worktree.
-_ephemeral_is_dirty() {
-    git -C "$GENESIS_ROOT" ls-files --error-unmatch "$1" &>/dev/null \
-        && ! git -C "$GENESIS_ROOT" diff --quiet HEAD -- "$1" 2>/dev/null
-}
-
 # Must <path>'s local edit be cleared for the merge of $DEPLOY_HEAD? git merges
 # straight past an UNSTAGED edit to a file the incoming range does not touch, and
 # keeps the edit — it refuses only when the range DOES touch it. A STAGED edit is
@@ -913,50 +1003,10 @@ _ephemeral_merge_touches() {
     ! git -C "$GENESIS_ROOT" diff --quiet "$mb" "$DEPLOY_HEAD" -- "$1" 2>/dev/null
 }
 
-# Save <path>'s local edits under <dest-root>/<path>/: the worktree and index
-# patches against HEAD, plus a copy of the file. Returns non-zero on ANY failure.
-_ephemeral_backup() {
-    local p="$1" dest="$2/$1"
-    mkdir -p "$dest" && chmod 700 "$2" "$dest" \
-        && git -C "$GENESIS_ROOT" diff --binary HEAD -- "$p" > "$dest/worktree.patch" \
-        && git -C "$GENESIS_ROOT" diff --binary --cached HEAD -- "$p" > "$dest/index.patch" \
-        && { [ ! -e "$GENESIS_ROOT/$p" ] || cp -p "$GENESIS_ROOT/$p" "$dest/current"; }
-}
-
-# Does the backup under <dest-root> still describe <path>'s edits exactly?
-_ephemeral_backup_is_current() {
-    local p="$1" dest="$2/$1"
-    [ -f "$dest/worktree.patch" ] && [ -f "$dest/index.patch" ] \
-        && cmp -s "$dest/worktree.patch" <(git -C "$GENESIS_ROOT" diff --binary HEAD -- "$p") \
-        && cmp -s "$dest/index.patch" <(git -C "$GENESIS_ROOT" diff --binary --cached HEAD -- "$p")
-}
-
-# Called by _do_rollback just before its `reset --hard`, which discards edits to
-# every tracked file. The pre-stop backup can be missing (a --post-merge run takes
-# none) or stale (an indexer rewrote AGENTS.md after it), so each dirty ephemeral
-# file whose CURRENT edits are not already saved is backed up under <root>/rollback.
-# Never fails: a rollback must go ahead, so a failed backup is named, not fatal.
-_ephemeral_backup_before_reset() {
-    local root="$1" p
-    for p in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
-        _ephemeral_is_dirty "$p" || continue
-        if _ephemeral_backup_is_current "$p" "$root" \
-            || _ephemeral_backup_is_current "$p" "$root/late"; then
-            continue
-        fi
-        if _ephemeral_backup "$p" "$root/rollback"; then
-            echo "  Backed up local edits to $p before the rollback: $root/rollback/$p"
-        else
-            echo "  WARNING: could not back up local edits to $p before the rollback — the reset discards them."
-        fi
-    done
-    return 0
-}
-
 if [[ "$POST_MERGE" == "false" ]]; then
     # EVERY dirty one is saved, not only those the merge will clear: a rollback
-    # (`reset --hard` to the rollback tag) discards local edits to any tracked
-    # file, and it can happen after the stop, where a backup would be too late.
+    # clears an ephemeral edit its range touches (_ephemeral_clear_before_reset),
+    # and it can happen after the stop, where a backup would be too late.
     for _eph in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
         _ephemeral_is_dirty "$_eph" || continue
         if ! _ephemeral_backup "$_eph" "$EPHEMERAL_BACKUP_ROOT"; then
@@ -1057,8 +1107,14 @@ _start_genesis_server() {
     # update.sh, and an inherited lock FD would keep the advisory lock held after
     # we exit — deadlocking every future update until this degraded server dies.
     # (systemd-started servers don't inherit our FDs; only this nohup path does.)
-    nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
-        {_UPDATE_LOCK_FD}>&- >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
+    # The checkout-lock FD too, closed in the child's own subshell: it is unset
+    # when the lock is not held, and a `{var}>&-` on an unset name fails the
+    # command. The subshell execs, so $! is the server's pid.
+    (
+        if [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ]; then exec {GENESIS_CHECKOUT_LOCK_FD}>&-; fi
+        exec nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
+            {_UPDATE_LOCK_FD}>&-
+    ) >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
     # No unit tracks this process, so the no-change path's health probe waits on
     # this pid instead of the unit's state.
     _SERVER_DIRECT_PID=$!
@@ -1094,6 +1150,17 @@ if [ -f "$DB_FILE" ]; then
         _snapshot_check=$(sqlite3 "$DB_FILE.pre-update" "PRAGMA quick_check;" 2>&1) || _snapshot_check=""
         if [ "$_snapshot_check" = "ok" ]; then
             echo "  DB snapshot: $DB_FILE.pre-update (verified)"
+            # Prepare the rollback authority boundary while this helper still
+            # exists, before stopping services or rolling code back. Retain the
+            # original snapshot for forensic recovery; never consume stale work.
+            rm -f "$DB_FILE.pre-update.peer-restore" "$DB_FILE.pre-update.peer-restore-wal" \
+                "$DB_FILE.pre-update.peer-restore-shm" "$DB_FILE.pre-update.peer-restore-journal"
+            if ! cp "$DB_FILE.pre-update" "$DB_FILE.pre-update.peer-restore" \
+                || ! PYTHONPATH="$GENESIS_ROOT/src" python3 -m genesis.db.crud.peer_restore \
+                    "$DB_FILE.pre-update.peer-restore"; then
+                echo "  DATABASE RESTORE AUTHORITY CHECK FAILED — UPDATE ABORTED" >&2
+                exit 1
+            fi
             DB_SNAPSHOT_TAKEN=1
         else
             echo "  DATABASE SNAPSHOT FAILED VERIFICATION — UPDATE ABORTED" >&2
@@ -1108,6 +1175,14 @@ if [ -f "$DB_FILE" ]; then
         exit 1
     fi
 fi
+
+# The staged-path guard again, as the last step before the stop: the backups and
+# the database snapshot above can take minutes.
+# BEGIN staged-excused-prestop
+if [[ "$POST_MERGE" == "false" ]]; then
+    _staged_excused_divergence_guard
+fi
+# END staged-excused-prestop
 
 # ── Stop services for update ──────────────────────────────
 echo "--- Stopping services for update ---"
@@ -1456,6 +1531,11 @@ _do_rollback() {
         server_down=false
     fi
     systemctl --user stop genesis-bridge 2>/dev/null || true
+    if [ "${_CHECKOUT_LOCK_BUSY:-0}" != "1" ]; then
+        if ! genesis_checkout_lock "$GENESIS_ROOT"; then
+            echo "  WARNING: checkout lock busy during rollback; the checkout will be left as it is" >&2
+        fi
+    fi
 
     # What the code rollback may touch is decided from the checkout as it is NOW,
     # by exact commit identity: another session may have switched the branch,
@@ -1467,8 +1547,9 @@ _do_rollback() {
     #     and interrupted can leave a half-written tree with HEAD unchanged; a
     #     MERGE_HEAD there is aborted, and any other tracked change is reported,
     #     never reset (it may be someone else's edit).
-    #   - on ORIGINAL_BRANCH at UPDATE_OWN_HEAD (this run's merge result): undo it,
-    #     reset to the rollback tag as before.
+    #   - on ORIGINAL_BRANCH at UPDATE_OWN_HEAD (this run's merge result): undo it
+    #     by switching ORIGINAL_BRANCH back to the rollback tag with a non-forced
+    #     checkout, which keeps every edit or refuses (the `reset` action).
     #   - moved, but this run never merged (UPDATE_OWN_HEAD is still the rollback
     #     commit): someone else moved it and this run changed no code. Leave it.
     #   - anything else: the checkout moved after this run's merge. Leave it
@@ -1476,6 +1557,10 @@ _do_rollback() {
     #     incomplete for a person to sort out.
     # BEGIN rollback-code-guard (extracted by tests/test_scripts/test_update_activation.py)
     local checkout_ok=true code_action=moved rb_commit="" own_head="${UPDATE_OWN_HEAD:-}" left=""
+    # True when this run's merged code stays on disk (the rollback's checkout was
+    # refused, failed, or not attempted): the migrated database must then stay
+    # with it.
+    local code_kept=false
     rb_commit="$(git -C "$GENESIS_ROOT" rev-parse -q --verify "$ROLLBACK_TAG^{commit}" 2>/dev/null || true)"
     # The first call always runs, so _now_head/_now_branch describe the checkout
     # in the message below. An empty commit never matches (the predicate refuses it).
@@ -1485,6 +1570,14 @@ _do_rollback() {
         code_action=reset
     elif [ -n "$rb_commit" ] && [ "$own_head" = "$rb_commit" ]; then
         code_action=untouched
+    fi
+    # Without the checkout lock a Claude launch may be reading the tree, so
+    # nothing here changes it: no switch back, no reset, no merge abort.
+    # GENESIS_CHECKOUT_LOCK_FD is set only while the lock is held.
+    local rollback_locked=true
+    [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ] || rollback_locked=false
+    if [ "$rollback_locked" != "true" ] && [ "$code_action" != "none" ]; then
+        code_action=locked_out
     fi
     # Someone SWITCHED branches (rather than committing on ours): if our branch
     # still points where this run left it and nothing uncommitted is in the way,
@@ -1499,7 +1592,7 @@ _do_rollback() {
         ob_tip="$(git -C "$GENESIS_ROOT" rev-parse -q --verify "refs/heads/$ORIGINAL_BRANCH^{commit}" 2>/dev/null || true)"
         if { [ "$ob_tip" = "$rb_commit" ] || [ "$ob_tip" = "$own_head" ]; } \
             && left="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")" && [ -z "$left" ] \
-            && git -C "$GENESIS_ROOT" checkout -q --no-overwrite-ignore "$ORIGINAL_BRANCH" 2>&1; then
+            && genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout -q --no-overwrite-ignore "$ORIGINAL_BRANCH" 2>&1; then
             echo "  The checkout had been switched to ${_now_branch:-a detached HEAD}; switched back to $ORIGINAL_BRANCH (that branch keeps its commits)."
             if genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$ORIGINAL_BRANCH"; then
                 code_action=none
@@ -1514,8 +1607,12 @@ _do_rollback() {
         none)
             echo "  The checkout is still at $ROLLBACK_TAG on $ORIGINAL_BRANCH: no code to roll back."
             if [ "${MERGE_ATTEMPTED:-0}" = "1" ]; then
-                if git -C "$GENESIS_ROOT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
-                    if ! git -C "$GENESIS_ROOT" merge --abort 2>&1; then
+                if git -C "$GENESIS_ROOT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 \
+                    && [ "$rollback_locked" != "true" ]; then
+                    echo "  CRITICAL: an interrupted merge is in progress, and without the checkout lock it is left for you to abort."
+                    checkout_ok=false
+                elif git -C "$GENESIS_ROOT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+                    if ! genesis_without_checkout_lock git -C "$GENESIS_ROOT" merge --abort 2>&1; then
                         echo "  CRITICAL: an interrupted merge is in progress and could not be aborted."
                         checkout_ok=false
                     fi
@@ -1531,19 +1628,17 @@ _do_rollback() {
             checkout_ok=false
             ;;
         reset)
-            # The reset discards edits to every tracked file. Save the ephemeral
-            # files' current edits first, when no backup of them exists yet. (The
-            # helper is defined with the pre-stop backup; this function is only
-            # reached after it.)
-            if declare -F _ephemeral_backup_before_reset >/dev/null; then
-                _ephemeral_backup_before_reset "$EPHEMERAL_BACKUP_ROOT"
-            else
-                echo "  WARNING: the ephemeral-file backup helper is not defined; the reset may discard local edits."
-            fi
-            if ! git -C "$GENESIS_ROOT" reset --hard "$ROLLBACK_TAG" 2>&1; then
-                echo "  CRITICAL: failed to reset $ORIGINAL_BRANCH to $ROLLBACK_TAG"
+            # The measured non-forced rollback checkout lives in
+            # scripts/lib/deploy_recovery.sh (genesis_rollback_checkout).
+            if ! genesis_rollback_checkout "$GENESIS_ROOT" "$ROLLBACK_TAG" "$ORIGINAL_BRANCH" "$EPHEMERAL_BACKUP_ROOT" "$rb_commit"; then
                 checkout_ok=false
+                code_kept=true
             fi
+            ;;
+        locked_out)
+            echo "  CRITICAL: the checkout lock could not be taken (a Claude launch holds genesis-checkout.lock), so the code was NOT rolled back: the checkout is left as found (${_now_branch:-a detached HEAD} at ${_now_head:0:12}). This update's merge is ${own_head:0:12}; the pre-update state is $ROLLBACK_TAG."
+            checkout_ok=false
+            code_kept=true
             ;;
         *)
             echo "  CRITICAL: the checkout moved after this update merged (now ${_now_branch:-a detached HEAD} at ${_now_head:0:12}); expected $ORIGINAL_BRANCH at ${own_head:0:12}."
@@ -1569,6 +1664,7 @@ _do_rollback() {
             echo "    (working-tree status unreadable)"
         elif [ -n "$left" ]; then
             printf '%s\n' "$left" | sed 's/^/    changed: /'
+            genesis_has_flagged_entries "$GENESIS_ROOT" && echo "    (A listed path git status does not show is flagged: see 'git ls-files -v'; clear it with git update-index --no-assume-unchanged or --no-skip-worktree.)"
         fi
         checkout_ok=false
     fi
@@ -1585,9 +1681,10 @@ _do_rollback() {
     # Restore the pre-update DB — but ONLY if migrations actually ran this update.
     # Rolling back the code without the DB would leave the old code running
     # against a migrated (newer) schema. If no migration ran, the DB is untouched.
+    # BEGIN rollback-db-decision (extracted by tests/test_scripts/test_update_checkout_moved.py)
     local db_ok=true
     if [ "${MIGRATIONS_RAN:-0}" = "1" ]; then
-        if [ "$code_action" = "moved" ]; then
+        if [ "$code_action" = "moved" ] || [ "$code_kept" = "true" ]; then
             # The code was left as it is (merged, plus whatever moved it), so the
             # migrated schema is the one that matches it. Restoring the old DB here
             # would put the new code on the old schema.
@@ -1607,7 +1704,7 @@ _do_rollback() {
             # but recoverable) and flag for manual intervention.
             echo "  WARNING: server not confirmed down — SKIPPING DB restore (won't overwrite a live DB)."
             db_ok=false
-        elif cp "$DB_FILE.pre-update" "$DB_FILE" 2>&1 \
+        elif cp "$DB_FILE.pre-update.peer-restore" "$DB_FILE" 2>&1 \
             && rm -f "$DB_FILE-wal" "$DB_FILE-shm"; then
             # Drop the stale WAL/SHM: they hold the MIGRATED changes, and SQLite
             # would replay them over the restored old DB on reopen, resurrecting
@@ -1619,6 +1716,7 @@ _do_rollback() {
             db_ok=false
         fi
     fi
+    # END rollback-db-decision
 
     # Reload systemd in case unit templates changed during the failed update's
     # bootstrap. NOTE: rollback restores CODE, DEPS, and (if migrated) the DB —
@@ -1627,9 +1725,10 @@ _do_rollback() {
     # on disk so the restart below uses a consistent unit.
     systemctl --user daemon-reload 2>/dev/null || true
 
-    # Restart services with old code — only when the guard above verified it IS
-    # the old code.
-    if [ "$restart_ok" = "true" ]; then
+    # Restart only when both old code and its database were restored. External
+    # watchdog recovery remains separate; this rollback cannot certify a failure.
+    genesis_checkout_unlock
+    if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then
         for svc in "${WERE_RUNNING[@]}"; do
             if [ "$svc" = "genesis-server" ]; then
                 _start_genesis_server || echo "  CRITICAL: failed to restart genesis-server"
@@ -1639,7 +1738,7 @@ _do_rollback() {
             fi
         done
     elif [ "${#WERE_RUNNING[@]}" -gt 0 ]; then
-        echo "  NOT restarted: ${WERE_RUNNING[*]}. Put the checkout back on the pre-update code (or finish the other session's work), then start them."
+        echo "  NOT restarted: ${WERE_RUNNING[*]}. Verify the checkout and database recovery before starting them."
     fi
 
     if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ]; then
@@ -1649,7 +1748,7 @@ _do_rollback() {
     else
         echo "  ROLLBACK INCOMPLETE — manual intervention required"
         echo "  Last known good state: $OLD_TAG ($OLD_COMMIT) on $ORIGINAL_BRANCH"
-        [ "$db_ok" = "true" ] || [ "$code_action" = "moved" ] \
+        [ "$db_ok" = "true" ] || [ "$code_action" = "moved" ] || [ "$code_kept" = "true" ] \
             || echo "  DB restore FAILED — old code may be running against a migrated schema."
         _record_update_history "failed" "$reason (rollback incomplete)" "$degraded"
     fi
@@ -1773,6 +1872,11 @@ _checkout_unmoved_or_roll_back() {
 }
 _checkout_unmoved_or_roll_back
 # END checkout-unmoved
+if ! genesis_checkout_lock "$GENESIS_ROOT"; then
+    _CHECKOUT_LOCK_BUSY=1
+    _do_rollback "checkout lock busy: a Claude launch holds genesis-checkout.lock"
+    exit 1
+fi
 
 # Clear local edits to known-ephemeral tracked files (EPHEMERAL_DIRTY_RE) before
 # merging. They are rewritten in place at runtime and regenerate themselves
@@ -1792,7 +1896,7 @@ if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$SETTINGS_LOCAL" &>/dev/null
    && [ -f "$GENESIS_ROOT/$SETTINGS_LOCAL" ]; then
     mkdir -p "$HOME/.genesis"
     cp "$GENESIS_ROOT/$SETTINGS_LOCAL" "$SETTINGS_LOCAL_BAK"
-    git -C "$GENESIS_ROOT" checkout HEAD -- "$SETTINGS_LOCAL" 2>/dev/null \
+    genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$SETTINGS_LOCAL" 2>/dev/null \
         && echo "  (backed up live $SETTINGS_LOCAL; cleared local edits pre-merge)"
 fi
 # END settings-local-premerge
@@ -1810,7 +1914,7 @@ if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$SERENA_YML" &>/dev/null \
    && [ -f "$GENESIS_ROOT/$SERENA_YML" ]; then
     mkdir -p "$HOME/.genesis"
     cp "$GENESIS_ROOT/$SERENA_YML" "$SERENA_YML_BAK"
-    git -C "$GENESIS_ROOT" checkout HEAD -- "$SERENA_YML" 2>/dev/null \
+    genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$SERENA_YML" 2>/dev/null \
         && echo "  (backed up live $SERENA_YML; cleared local edits pre-merge)"
 fi
 # END serena-yml-premerge
@@ -1829,7 +1933,7 @@ if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$USER_MD" &>/dev/null \
    && [ -f "$GENESIS_ROOT/$USER_MD" ]; then
     mkdir -p "$HOME/.genesis"
     cp "$GENESIS_ROOT/$USER_MD" "$USER_MD_BAK"
-    git -C "$GENESIS_ROOT" checkout HEAD -- "$USER_MD" 2>/dev/null \
+    genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$USER_MD" 2>/dev/null \
         && echo "  (backed up live $USER_MD; cleared local edits pre-merge)"
 fi
 # END user-md-premerge
@@ -1855,7 +1959,7 @@ for _eph in "${EPHEMERAL_CLEAR_PATHS[@]}"; do
     # `checkout HEAD --` (not `checkout --`) restores BOTH index and worktree
     # from HEAD, so a staged edit is cleared too — `checkout --` alone would
     # leave a staged change and the merge would still abort.
-    if git -C "$GENESIS_ROOT" checkout HEAD -- "$_eph" 2>/dev/null; then
+    if genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$_eph" 2>/dev/null; then
         echo "  (cleared local edits to ephemeral $_eph before merge; backup under $EPHEMERAL_BACKUP_ROOT)"
     fi
 done
@@ -1900,7 +2004,7 @@ MERGE_RC=0
 # naming git's message. (A true 3-way merge ignores the flag, which is why the
 # pre-stop collision scan above exists.)
 MERGE_ATTEMPTED=1
-MERGE_OUTPUT=$(git -C "$GENESIS_ROOT" merge --no-overwrite-ignore "$DEPLOY_HEAD" --no-edit 2>&1) || MERGE_RC=$?
+MERGE_OUTPUT=$(genesis_without_checkout_lock git -C "$GENESIS_ROOT" merge --no-overwrite-ignore "$DEPLOY_HEAD" --no-edit 2>&1) || MERGE_RC=$?
 
 if [[ $MERGE_RC -ne 0 ]]; then
     # Check if this is a merge conflict (unmerged paths) vs other error
@@ -1958,7 +2062,7 @@ PYEOF
         # Abort the merge — don't leave the working tree in a broken state.
         # CC will resolve conflicts in a worktree, not in the main checkout.
         echo "  Aborting merge to keep working tree clean..."
-        git -C "$GENESIS_ROOT" merge --abort 2>/dev/null || true
+        genesis_without_checkout_lock git -C "$GENESIS_ROOT" merge --abort 2>/dev/null || true
 
         # Restart services with original code so the system stays operational
         echo "  Restarting services with pre-update code..."
@@ -1999,6 +2103,11 @@ if [ -n "$_merged_head" ] && { [ "$_merged_head" = "$DEPLOY_HEAD" ] \
     || [ "$_merged_head" = "$VALIDATED_HEAD" ] \
     || [ "$_merged_parents" = "$VALIDATED_HEAD $DEPLOY_HEAD " ]; }; then
     UPDATE_OWN_HEAD="$_merged_head"
+    # Record the adopted head at once. The "merging" state was written before
+    # the merge, naming the pre-update commit; if this run dies now, bootstrap's
+    # crash recovery acts only on the exact head recorded here and does not
+    # guess whether the checkout is this update's merge.
+    _write_state "merging"
 fi
 
 # A merge that reported success must have brought the pinned head in, on the
@@ -2018,6 +2127,7 @@ if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_HEAD" HEAD 2>/dev/
     exit 1
 fi
 
+genesis_checkout_unlock
 NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
 NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 
@@ -2428,14 +2538,27 @@ fi
 # ── Restart services ──────────────────────────────────────
 # P5 GUARDRAIL: this final restart runs while the armed `_on_signal TERM` trap is
 # STILL live (disarmed only at the success `trap - ERR INT TERM` below). That is
-# safe TODAY only because the completing update path (the dashboard orchestrator)
-# is cgroup-isolated via `systemd-run --scope`, so `_start_genesis_server`'s
-# internal `systemctl stop`/`restart` does NOT signal this process. The
-# `_apply_direct` path (dashboard, supervised=False) does NOT scope-isolate and
-# stays in genesis-server.service's cgroup — a pre-existing bug. When P5 fixes
-# `_apply_direct`, the fix MUST be scope isolation (systemd-run --scope), NOT a
-# handler tweak: otherwise this restart's stop-phase would self-SIGTERM →
-# _on_signal → a SPURIOUS rollback of a healthy, fully-migrated deploy.
+# safe because every normal update path is cgroup-isolated, so
+# `_start_genesis_server`'s internal `systemctl stop`/`restart` does NOT signal
+# this process: the dashboard orchestrator uses `systemd-run --scope`, and
+# `_apply_direct` (dashboard, supervised=False) does too — see
+# `dashboard/routes/updates.py::_apply_direct`, which probes scope availability
+# before spawning. A manual CLI run must be launched detached the same way (see
+# the genesis-development skill's Timeout Policy).
+#
+# CORRECTED 2026-09-16: this comment previously stated that `_apply_direct` does
+# NOT scope-isolate and called it a pre-existing bug awaiting P5. That is no longer
+# true — it scope-isolates today — and the stale text misled anyone reasoning about
+# signal safety here.
+#
+# The REMAINING exposure is the `start_new_session` FALLBACK in both dashboard
+# paths: `_apply_direct` takes it when systemd-run is absent or the user bus is
+# unreachable (it probes first); `_apply_supervised` takes it only when the
+# systemd-run binary is absent (with no bus it currently launches nothing at
+# all — issue #2724). That fallback changes only the session, not the cgroup, so
+# the update stays in genesis-server.service's cgroup. On that path this restart's stop-phase would
+# self-SIGTERM → _on_signal → a SPURIOUS rollback of a healthy, fully-migrated
+# deploy. Any fix there MUST be scope isolation, NOT a handler tweak.
 if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     echo "--- Restarting services ---"
 

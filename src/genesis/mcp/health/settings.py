@@ -173,6 +173,25 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         # overlay-file edit, never a UI round-trip.
         hidden_fields=frozenset({"require_approval"}),
     ),
+    "board": SettingsDomain(
+        name="board",
+        description=(
+            "Work board (GitHub Projects v2 front end) — master `enabled` + "
+            "`mode` off/propose_only/live. off (default, shipped) does nothing; "
+            "propose_only reads the board and holds promotions but writes "
+            "nothing to GitHub; live lets the reconciler and approved "
+            "promotions write, and is armed ONLY by an owner edit of "
+            "~/.genesis/config/board.local.yaml (settings_update rejects it). "
+            "Invalid mode degrades to propose_only. Kill "
+            "switch GENESIS_BOARD_DISABLED=1. A session may set enabled false or "
+            "mode off/propose_only, never live or enabled true (owner edits). "
+            "Read live per call by board promotion (board_promote and the drain), "
+            "so a change takes effect at the next promotion — no restart."
+        ),
+        config_filename="board.yaml",
+        readonly=False,
+        needs_restart=False,  # every consumer re-reads per call
+    ),
     "marketing_outreach": SettingsDomain(
         name="marketing_outreach",
         description=(
@@ -265,8 +284,9 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "Entity adjudication drainer — master `enabled` + `mode` "
             "off/propose_only/live, plus drain/sweep knobs. propose_only "
             "(default) records merge verdicts without applying them; live "
-            "applies double-agreed merges (loser entity tombstoned into "
-            "survivor) and applies the shadow-period backlog on the flip. "
+            "would apply double-agreed merges unattended, but is FENCED until "
+            "#2742 (refused here, run as propose_only if set by hand). "
+            "Approved merges apply via entity_adjudication_apply. "
             "Read live each hourly run — takes effect next run, no restart."
         ),
         config_filename="entity_adjudication.yaml",
@@ -370,6 +390,27 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         config_filename="worktree_ownership.yaml",
         readonly=False,
         needs_restart=False,  # read live per call
+    ),
+    "main_checkout_guard": SettingsDomain(
+        name="main_checkout_guard",
+        description=(
+            "Main-checkout guard — master `enabled` (default true). Keeps a Claude "
+            "Code session's hand edits out of this install's primary checkout (the "
+            "deploy root hooks, scripts and the server run from). REFUSES a "
+            "Write/Edit/MultiEdit/NotebookEdit of a TRACKED file there. Never refuses "
+            "Bash: it snapshots the deploy root before each command and, after it, "
+            "tells the session which tracked files changed (or that HEAD moved) and "
+            "how to restore them. Untracked files, linked worktrees, other "
+            "repositories, the deploy scripts' known-ephemeral paths and the dashboard "
+            "update pipeline's sessions are left alone; anything it cannot evaluate is "
+            "allowed. Applies to foreground and dispatched sessions alike. Only "
+            "`enabled: false` turns it off; an invalid value keeps it ON. Read live "
+            "per tool call — takes effect immediately, no restart. Env kill switch "
+            "GENESIS_MAIN_CHECKOUT_GUARD=0 forces off."
+        ),
+        config_filename="main_checkout_guard.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per tool call by the hook
     ),
     "ego_reconcile": SettingsDomain(
         name="ego_reconcile",
@@ -1453,6 +1494,19 @@ def _validate_worktree_ownership(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_main_checkout_guard(changes: dict) -> list[str]:
+    """Validate main-checkout guard lever changes (read by
+    scripts/hooks/main_checkout_guard.py, which keeps the guard ON for any value
+    other than the boolean false)."""
+    errors: list[str] = []
+    for key, value in changes.items():
+        if key != "enabled":
+            errors.append(f"Unknown key '{key}'. Valid: enabled")
+        elif not isinstance(value, bool):
+            errors.append("'enabled' must be a boolean")
+    return errors
+
+
 def _validate_ws2_ledger(changes: dict) -> list[str]:
     """Validate ws2_ledger consumer-lever changes (see
     genesis.ledger.ws2_ledger_config)."""
@@ -1618,6 +1672,58 @@ def _validate_contributor_worklog(changes: dict) -> list[str]:
                 errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
         elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append(f"'{key}' must be a positive int")
+    return errors
+
+
+def _validate_board(changes: dict) -> list[str]:
+    """Validate work-board lever changes (see genesis.board.config).
+
+    ``mode`` accepts ``off``/``propose_only`` here, but ``live`` is REJECTED —
+    arming the board's GitHub writes is deliberately overlay-file-only, exactly
+    as ``_validate_marketing_outreach`` reserves its ``live``. A settings_update
+    (MCP tool or dashboard PUT) is reachable by any session, including a
+    dispatched one, so accepting ``live`` here would let a model arm public-repo
+    writes for itself. The owner arms it by editing
+    ``~/.genesis/config/board.local.yaml``, which ``board.config.load_config``
+    merges. (Safe to reject unconditionally: ``board`` is not a dashboard FORM
+    domain, so no whole-config PUT re-echoes an already-set ``live``.)
+    """
+    from genesis.board.config import MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", "project_owner", "project_number")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+            elif value:
+                # Only an owner re-enables: `enabled: true` here would re-arm a
+                # `mode: live` overlay the owner paused with `enabled: false`.
+                errors.append(
+                    "'enabled: true' cannot be set through settings_update — "
+                    "re-enabling the board is an owner edit of "
+                    "~/.genesis/config/board.local.yaml"
+                )
+        elif key in ("project_owner", "project_number"):
+            # WHICH board the reconciler writes to is overlay-only, like `live`:
+            # a session that could repoint it could send Genesis's card writes
+            # to a project it controls. scripts/board_setup.py --write-config is
+            # the writer; it edits the overlay file directly.
+            errors.append(
+                f"'{key}' cannot be set through settings_update — run "
+                "scripts/board_setup.py --write-config, which records it in "
+                "~/.genesis/config/board.local.yaml"
+            )
+        elif value == "live":
+            errors.append(
+                "'mode: live' cannot be set through settings_update — arming the "
+                "board's GitHub writes is an owner edit of "
+                "~/.genesis/config/board.local.yaml"
+            )
+        elif value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
     return errors
 
 
@@ -1816,7 +1922,10 @@ def _validate_graphstore(changes: dict) -> list[str]:
 def _validate_entity_adjudication(changes: dict) -> list[str]:
     """Validate entity-adjudication lever changes (see
     genesis.memory.entity_adjudication_config)."""
-    from genesis.memory.entity_adjudication_config import INT_KNOBS, MODES
+    from genesis.memory.entity_adjudication_config import (
+        INT_KNOBS,
+        MODES,
+    )
 
     errors: list[str] = []
     valid_keys = ("enabled", "mode", "sweep_enabled", *INT_KNOBS)
@@ -1827,8 +1936,14 @@ def _validate_entity_adjudication(changes: dict) -> list[str]:
             if not isinstance(value, bool):
                 errors.append(f"'{key}' must be a boolean")
         elif key == "mode":
-            if value not in MODES:
-                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+            settable = [m for m in MODES if m != "live"]
+            if value == "live":
+                errors.append(
+                    "'live' is fenced until #2742 (a merge-time check that a pair's "
+                    f"approval has not gone stale); use one of {', '.join(settable)}"
+                )
+            elif value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(settable)}; got {value!r}")
         elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append(f"'{key}' must be a positive int")
     return errors
@@ -2131,6 +2246,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "youtube_fetch": _validate_youtube_fetch,
     "mcp_staleness_guard": _validate_mcp_staleness_guard,
     "worktree_ownership": _validate_worktree_ownership,
+    "main_checkout_guard": _validate_main_checkout_guard,
     "voice_act": _validate_voice_act,
     "voice_recency_resume": _validate_voice_recency_resume,
     "tts": _validate_tts,
@@ -2141,6 +2257,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "repo_pulse": _validate_repo_pulse,
     "zero_drop": _validate_zero_drop,
     "contributor_worklog": _validate_contributor_worklog,
+    "board": _validate_board,
     "marketing_outreach": _validate_marketing_outreach,
     "pr_watch": _validate_pr_watch,
     "skill_evolution_gate": _validate_skill_evolution_gate,

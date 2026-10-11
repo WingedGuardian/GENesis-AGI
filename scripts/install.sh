@@ -122,7 +122,7 @@ if [ -z "${TMPDIR:-}" ]; then
 fi
 
 # ── Path setup ───────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_PATH="${VENV_PATH:-$REPO_DIR/.venv}"
 SECRETS_FILE="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
@@ -730,16 +730,10 @@ if ! command -v uv &>/dev/null; then
     curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh 2>/dev/null || true
     export PATH="$HOME/.local/bin:$PATH"
 fi
+# shellcheck source=lib/serena_install.sh
+. "$SCRIPT_DIR/lib/serena_install.sh"
 if command -v uv &>/dev/null; then
-    if ! command -v serena &>/dev/null; then
-        uv tool install serena-agent 2>/dev/null \
-            && echo "    + Serena installed" \
-            || echo "    NOTE: Serena unavailable (optional)"
-    else
-        uv tool upgrade serena-agent 2>/dev/null \
-            && echo "    + Serena upgraded" \
-            || echo "    NOTE: Serena upgrade skipped (already current or failed)"
-    fi
+    _install_serena
 fi
 
 # Python venv — prefer python3.12 for venv creation
@@ -991,7 +985,17 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         CC_BIN_DIR="$CC_BIN_DIR:$_cc_prefix/bin"
     fi
 
-    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
+    # genesis-falkordb.service.template carries two placeholders beyond the
+    # shared five: __FALKORDB_VERSION__ and __REDIS_SERVER__. The resolver and
+    # the version pin live in the same lib bootstrap provisions from — sourced
+    # here for the render only; provisioning stays in bootstrap.sh. With the
+    # lib absent the literals below still produce a parseable (if inert) unit.
+    if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
+        # shellcheck source=lib/falkordb_install.sh
+        source "$SCRIPT_DIR/lib/falkordb_install.sh"
+    fi
+
+    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template "$SYSTEMD_TEMPLATE_DIR"/*.slice.template; do
         [ -f "$template" ] || continue
         svc_name=$(basename "$template" .template)
 
@@ -1030,11 +1034,15 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             _repo_esc=$(_sed_repl_esc "$REPO_DIR")
             _ccbin_esc=$(_sed_repl_esc "$CC_BIN_DIR")
             _az_root_esc=$(_sed_repl_esc "${AZ_ROOT:-$HOME/agent-zero}")
+            _falkordb_ver_esc=$(_sed_repl_esc "${FALKORDB_VERSION:-4.20.4}")
+            _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)")
             sed -e "s|__HOME__|$_home_esc|g" \
                 -e "s|__VENV__|$_venv_esc|g" \
                 -e "s|__REPO_DIR__|$_repo_esc|g" \
                 -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
                 -e "s|__AZ_ROOT__|$_az_root_esc|g" \
+                -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
+                -e "s|__REDIS_SERVER__|$_redis_bin_esc|g" \
                 "$template" > "$target"
             echo "    + $svc_name generated"
             SERVICES_GENERATED=1
@@ -1062,18 +1070,22 @@ VENV_PYTHON="$VENV_PATH/bin/python"
 
 # .claude/settings.json ships tracked in the repo — hooks are pre-configured on
 # every clone, so there is no template to render here. (VENV_PYTHON stays defined:
-# the .mcp.json render below still substitutes it.)
+# the .mcp.json render below runs under it.)
 
-# .mcp.json — MCP server configuration for Claude Code
+# .mcp.json — MCP server configuration for Claude Code. Rendered by the same code
+# bootstrap.sh runs (scripts/setup_claude_config.py), never by a text
+# substitution here: the interactive render leaves out servers only a dispatch
+# profile uses (INTERACTIVE_EXCLUDED_SERVERS there), which a sed cannot do.
 MCP_TEMPLATE="$REPO_DIR/config/mcp.json.template"
 MCP_TARGET="$REPO_DIR/.mcp.json"
 if [ -f "$MCP_TEMPLATE" ]; then
     if [ -f "$MCP_TARGET" ]; then
         echo "    . .mcp.json already exists (not overwriting)"
-    else
-        sed "s|{{VENV_PYTHON}}|$VENV_PYTHON|g; s|{{GENESIS_ROOT}}|$REPO_DIR|g" \
-            "$MCP_TEMPLATE" > "$MCP_TARGET"
+    elif "$VENV_PYTHON" "$REPO_DIR/scripts/setup_claude_config.py" --mcp-only \
+            --genesis-root "$REPO_DIR" >/dev/null && [ -f "$MCP_TARGET" ]; then
         echo "    + MCP server config generated (.mcp.json)"
+    else
+        echo "    - .mcp.json render failed (run scripts/bootstrap.sh to render it)"
     fi
 else
     echo "    - MCP template not found (skipping)"
@@ -1106,8 +1118,8 @@ if command -v claude &>/dev/null; then
             echo "    . codebase-memory-mcp registered to the launcher; kill switch active, so it will refuse to start"
         fi
     fi
-    command -v serena &>/dev/null && \
-        _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$REPO_DIR"
+    _serena_registration_available && \
+        _register_serena "$REPO_DIR"
     # grep-app (grep.app) — literal/regex code search over ~1M public GitHub
     # repos. Registered under a Genesis-owned name, not the generic `grep`, so
     # an operator's own grep server is never touched.

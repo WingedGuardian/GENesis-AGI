@@ -126,10 +126,11 @@ EVENT_ACTIONS = frozenset(
 # Runs that judged no tunnel. Counted across consecutive runs so the Genesis
 # side can say the watchdog is blind, not only when it is silent. A run that
 # had suspects and probed none of them counts too (see run_once).
-# A run whose verdicts were voided because tailscaled restarted or stopped
-# under it judged nothing it could keep, so it counts too: a crash-looping
-# tailscaled must not reset the count on every other run.
-BLIND_ACTIONS = frozenset({"unavailable", "status-unparseable", "daemon-changed"})
+# A run whose verdicts were voided because daemon continuity was unknown counts
+# too: restarts or unreadable identity must not reset the count.
+BLIND_ACTIONS = frozenset(
+    {"unavailable", "status-unparseable", "daemon-changed", "identity-unreadable"}
+)
 # tailscaled turned off on purpose (a disabled or masked unit, or `tailscale
 # down`): nothing to watch, so not blind. A crashed but enabled unit, or a
 # logged-out node, is still blind.
@@ -280,6 +281,16 @@ def unit_props(ctx: Ctx, unit: str, *props: str) -> dict | None:
 _IDENTITY = ("InvocationID", "ActiveState", "ActiveEnterTimestampMonotonic")
 
 
+def _start_us(props: dict | None) -> int | None:
+    if not props:
+        return None
+    try:
+        start = int(props.get("ActiveEnterTimestampMonotonic", ""))
+    except (TypeError, ValueError):
+        return None
+    return start if start > 0 else None
+
+
 def _identity(props: dict | None) -> tuple | None:
     """(InvocationID, ActiveState, start in CLOCK_MONOTONIC seconds) from
     ``systemctl show`` properties, or None when any is unreadable. The start is
@@ -288,13 +299,32 @@ def _identity(props: dict | None) -> tuple | None:
     restart. Unknown is never read as "long ago": callers fail closed."""
     if not props or not props.get("InvocationID"):
         return None
-    try:
-        start = int(props.get("ActiveEnterTimestampMonotonic", ""))
-    except ValueError:
-        return None
-    if start <= 0:
+    start = _start_us(props)
+    if start is None:
         return None
     return props["InvocationID"], props.get("ActiveState", ""), start / 1e6
+
+
+def _continuity(start: dict, after: dict | None) -> str:
+    if after is None:
+        return "unknown"
+    active_state = after.get("ActiveState")
+    if active_state and active_state != "active":
+        return "changed"
+    same = False
+    start_invocation = start.get("InvocationID")
+    after_invocation = after.get("InvocationID")
+    if start_invocation and after_invocation:
+        if start_invocation != after_invocation:
+            return "changed"
+        same = True
+    start_time = _start_us(start)
+    after_time = _start_us(after)
+    if start_time is not None and after_time is not None:
+        if start_time != after_time:
+            return "changed"
+        same = True
+    return "same" if active_state == "active" and same else "unknown"
 
 
 def daemon_identity(ctx: Ctx) -> tuple | None:
@@ -343,11 +373,16 @@ def restart_tailscaled(ctx: Ctx, expected: tuple) -> tuple[str, int | None]:
     )
     deadline = ctx.mono() + ctx.settings["NETWD_TS_POLL_SEC"]
     while True:
-        after = unit_props(ctx, "tailscaled", *props) or {}
-        settled = not after.get("Job") and after.get("ActiveState") not in _TRANSITIONAL
+        after = unit_props(ctx, "tailscaled", *props)
+        settled = (
+            after is not None
+            and not after.get("Job")
+            and after.get("ActiveState") not in _TRANSITIONAL
+        )
         if settled or ctx.mono() >= deadline:
             break
         ctx.sleep(1)
+    after = after or {}
     if not after.get("InvocationID"):
         return "unverified", rc
     if after.get("Job") or after.get("ActiveState") in _TRANSITIONAL:
@@ -706,7 +741,9 @@ def run_once(ctx: Ctx) -> int:
         # one of them could be judged (scan limits, or every ping hanging).
         judged = counters["probed"] - counters["unjudged"]
         waiting = counters["skipped"] + counters["unjudged"]
-        blind = action in BLIND_ACTIONS or (waiting > 0 and judged == 0)
+        blind = action in BLIND_ACTIONS or (waiting > 0 and judged == 0) or (
+            counters["malformed_peers"] > 0 and not evidence
+        )
         if event is not None:
             events = (events + [event])[-MAX_EVENTS:]
             if event["action"] == "healed":
@@ -798,7 +835,7 @@ def run_once(ctx: Ctx) -> int:
         ctx, suspects
     )
 
-    def void(why: str) -> int:
+    def void(why: str, action: str = "daemon-changed") -> int:
         # tailscaled restarted or stopped (an operator, an upgrade): every
         # verdict describes a daemon that is gone, and restarting now would
         # drop the sessions a new one just brought back.
@@ -806,18 +843,26 @@ def run_once(ctx: Ctx) -> int:
         log(f"{why}; this run's verdicts are void and nothing is restarted")
         evidence = {}
         present_complete = False
-        return finish("daemon-changed")
+        return finish(action)
 
-    # A post-scan read that fails keeps the verdicts (one flaky systemctl call
-    # should not blank a run); the check immediately before try-restart still
-    # refuses to heal on anything but the same daemon.
-    after_scan = daemon_identity(ctx)
-    if (
-        judged_daemon is not None
-        and after_scan is not None
-        and not same_daemon(judged_daemon, after_scan)
-    ):
-        return void("tailscaled restarted or stopped during the scan")
+    # Complete identities need evidence of a change to void; incomplete starts
+    # need readable continuity.
+    after_raw = unit_props(ctx, "tailscaled", *_IDENTITY)
+    after_scan = _identity(after_raw)
+    if judged_daemon is not None:
+        if (after_scan is not None and not same_daemon(judged_daemon, after_scan)) or (
+            after_raw is not None and _continuity(unit, after_raw) == "changed"
+        ):
+            return void("tailscaled restarted or stopped during the scan")
+    else:
+        continuity = _continuity(unit, after_raw)
+        if continuity == "changed":
+            return void("tailscaled restarted or stopped during the scan")
+        if continuity == "unknown":
+            return void(
+                "tailscaled's identity could not be read at the scan's start and confirmed after it",
+                "identity-unreadable",
+            )
     evidence.update(verdicts)
     if len(evidence) > MAX_PEERS:
         # Keep what can be acted on: stuck, then offline, then ok.

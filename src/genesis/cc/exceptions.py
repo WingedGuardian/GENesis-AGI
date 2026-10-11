@@ -19,7 +19,21 @@ class CCProcessError(CCError):
     """CC CLI exited with non-zero status."""
 
 
-class CCStreamTruncatedError(CCProcessError):
+class CCReplayUnsafeError(CCProcessError):
+    """Work may already have run: do not recover, fail over or park for replay.
+
+    The original diagnosis remains a cause for observability, not permission
+    to retry. Single-argument construction also supports transport failures.
+    """
+
+    def __init__(self, message: str = "", *, cause: CCError | None = None):
+        super().__init__(message)
+        self.__cause__ = cause
+        self.raw_text = getattr(cause, "raw_text", None)
+        self.raw_event = getattr(cause, "raw_event", None)
+
+
+class CCStreamTruncatedError(CCReplayUnsafeError):
     """A stream line exceeded the reader limit and took the RESULT with it.
 
     Separate from a bare ``CCProcessError`` because the RECOVERY differs, not
@@ -31,8 +45,9 @@ class CCStreamTruncatedError(CCProcessError):
 
     So conversation.py must re-raise this instead of routing it into
     stale-resume recovery, which exists for a session that no longer resolves.
-    Subclasses ``CCProcessError`` so existing handlers keep catching it; the
-    distinction only has to be visible to the one place that retries.
+    Inherits the shared ``CCReplayUnsafeError`` boundary so recovery and
+    failover handlers suppress replay, while existing process-error handlers
+    still catch it.
     """
 
 
@@ -95,6 +110,32 @@ class _CCLimitError(CCError):
 
 class CCRateLimitError(_CCLimitError):
     """CC hit transient rate limit (recovers in minutes)."""
+
+
+class CCOverloadedError(CCRateLimitError):
+    """The provider answered HTTP 529 / ``overloaded_error`` — capacity, not quota.
+
+    Only retry-eligible overloads retain rate-limit behavior. Classification
+    wraps known-work or MCP-backed overloads in ``CCReplayUnsafeError`` so
+    downstream failover/parking cannot replay them. The distinct type supports
+    ``genesis.cc.transient_retry``, which re-runs an overloaded call after a
+    short wait and never retries a genuine rate limit.
+
+    ``num_turns`` is the CLI result's own turn count when the classifier had
+    one. More than one turn means the session already made tool round-trips
+    before the overload, so re-running it would replay them.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        raw_event: dict | None = None,
+        raw_text: str | None = None,
+        num_turns: int | None = None,
+    ):
+        super().__init__(message, raw_event=raw_event, raw_text=raw_text)
+        self.num_turns = num_turns
 
 
 class CCQuotaExhaustedError(_CCLimitError):

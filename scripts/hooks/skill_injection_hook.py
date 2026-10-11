@@ -43,6 +43,51 @@ _MAX_CATALOG_NUDGES = 2
 #: hook-output contract test's exemption cites.
 _MAX_NUDGE_LINE = 400
 
+#: Words that never score as skill-NAME tokens. Whole-word name scoring stays
+#: (so "aws" still reaches "aws-lambda"), but a name built from an everyday
+#: word fired on every prompt that used the word. MEASURED 2026-09-29 by
+#: replaying one live install's last 30 days of foreground prompts (2,346
+#: prompts across 385 sessions) through the old and new scorer: catalog nudges
+#: fell 570 -> 391, with user_evaluate 58 -> 1, genesis-voice 34 -> 2,
+#: code-intelligence 18 -> 1, hyperpod-issue-report 18 -> 0, and every
+#: vendor-library skill but aws-lambda to 0 (with the gate below), while
+#: closing-session held at 191 and genesis-development at 81 -> 83. Two skills
+#: whose NAME was all stoplist words (genesis-development's "genesis",
+#: cc-update's "update") declare `keywords:` instead. An explicit frontmatter
+#: `keywords:` entry still scores
+#: even when it is on this list — a skill that really wants one of these
+#: words says so there. ("use" is absent: the prompt extractor already drops
+#: it.) Inside an OPEN vendor gate the stoplist does not apply — see below.
+_NAME_TOKEN_STOPLIST = frozenset({
+    "genesis", "user", "issue", "report", "content", "code", "browser",
+    "deploy", "update", "plan", "planning", "model", "document", "service",
+    "api", "case", "specification",
+})
+
+#: Vendor namespace gate. A skill filed in a vendor plugin bundle of the skill
+#: library (``<library>/<vendor>/<bundle>/skills/<skill>``, the layout the
+#: catalog generator documents) only scores when the prompt also names that
+#: vendor: every word of the folder name, or one of the aliases below. Vendor
+#: bundles ship dozens of skills with generic names (planning, deploy,
+#: model-evaluation), so without the gate an unrelated prompt reaches them.
+#: Once the vendor IS named the gate has already supplied the precision, so the
+#: name-token stoplist is skipped there — "aws planning" reaches `planning`.
+#: The vendor is derived from the catalog PATH, never hardcoded; a newly
+#: installed bundle is gated by its own folder name with no alias entry, and a
+#: folder name with no word the prompt extractor can emit (e.g. two-letter
+#: words only) and no alias is left ungated rather than silently muted.
+#: The vendor word and a name word must both fall within the extractor's
+#: first 12 significant words.
+_SKILL_LIBRARY_DIR = Path.home() / ".genesis" / "skill-library"
+_VENDOR_ALIASES: dict[str, frozenset[str]] = {
+    # Only words nobody types outside this vendor's context. "lambda" and
+    # "amazon" are deliberately absent: an open gate skips the stoplist, so an
+    # ordinary Python "lambda" would re-open every everyday-word misfire.
+    # Cost, accepted: "lambda" alone no longer reaches aws-lambda; "aws
+    # lambda" does.
+    "aws": frozenset({"aws", "sagemaker", "bedrock", "hyperpod"}),
+}
+
 # --- Process Discipline Detection ---
 # Superpowers skills aren't in the Genesis catalog but need nudges
 # when their workflow context is detected.
@@ -139,6 +184,29 @@ def _save_session_nudge(session_id: str, skill_name: str) -> None:
     path.write_text(json.dumps(sorted(existing)))
 
 
+def _vendor_of(skill: dict) -> str | None:
+    """Return the vendor a library skill's plugin bundle belongs to, else None.
+
+    Only the vendor-bundle layout the catalog generator documents is gated:
+    ``<library>/<vendor>/<bundle>/skills/<skill>`` → ``<vendor>``. A skill
+    directly in the library (``<library>/<skill>``), one in a plain grouping
+    folder (``<library>/writing/<skill>``), and repo skills (relative paths
+    outside the library) have no vendor. A malformed path value is treated as
+    no vendor rather than aborting the scoring loop.
+    """
+    path = skill.get("path")
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        rel = Path(path).relative_to(_SKILL_LIBRARY_DIR)
+    except ValueError:
+        return None
+    parts = rel.parts
+    if len(parts) < 4 or parts[-2] != "skills":
+        return None
+    return parts[0].lower()
+
+
 def _score_skill(
     skill: dict, keywords: list[str], prompt_text: str | None = None
 ) -> float:
@@ -157,14 +225,48 @@ def _score_skill(
     counts toward the name "aws-lambda" but "awesome" does not. Deliberately NOT
     normalized by prompt length — a long prompt must not dilute a genuine hit
     below the firing threshold.
+
+    Two precision rules sit on top of that:
+
+    - NAME-token stoplist (`_NAME_TOKEN_STOPLIST`): an everyday word such as
+      "user", "genesis" or "plan" never scores as a NAME token, because a
+      skill named after one ("user_evaluate", "genesis-voice", "planning")
+      otherwise fires on any prompt using it. It removes the word from the
+      name only — an explicit frontmatter keyword still scores, stoplisted or
+      not.
+    - Vendor namespace gate (`_vendor_of`, `_VENDOR_ALIASES`): a skill in a
+      vendor plugin bundle of the skill library scores 0 unless the prompt
+      also names that vendor (every word of the folder name, or an alias).
+      Frontmatter keywords do not open the gate. Once the gate is OPEN the
+      stoplist is skipped, because the vendor word already supplied the
+      precision: "sagemaker planning" reaches the bundle's `planning` skill,
+      while "planning the report" reaches no vendor skill at all.
     """
     if not keywords:
         return 0.0
 
-    # Whole-word name tokens (hyphens/underscores → spaces, then split).
+    kw_set = {kw.lower() for kw in keywords}
+    stoplist = _NAME_TOKEN_STOPLIST
+    vendor = _vendor_of(skill)
+    if vendor is not None:
+        # Tokenize the folder name exactly as the prompt is tokenized, so a
+        # word the prompt side can never emit (punctuation, <3 chars, the
+        # extractor's stop words) cannot keep the gate shut forever. The folder
+        # counts when EVERY such word is in the prompt ("google-cloud" needs
+        # both). A folder yielding no word and having no alias stays ungated.
+        folder_words = set(_extract_keywords(vendor))
+        aliases = _VENDOR_ALIASES.get(vendor, frozenset())
+        if folder_words or aliases:
+            named = bool(folder_words) and folder_words <= kw_set
+            if not named and not kw_set & aliases:
+                return 0.0
+            stoplist = frozenset()
+
+    # Whole-word name tokens (hyphens/underscores → spaces, then split),
+    # minus the everyday words that never identify a skill.
     name_tokens = set(
         skill.get("name", "").lower().replace("-", " ").replace("_", " ").split()
-    )
+    ) - stoplist
     skill_kws = {kw.lower() for kw in skill.get("keywords", [])}
     kw_words = {kw.lower() for kw in keywords}
 

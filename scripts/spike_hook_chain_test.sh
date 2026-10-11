@@ -24,7 +24,7 @@ export GENESIS_DB_PATH="$TEST_ROOT/test.db"
 TEST_REPO="$TEST_ROOT/fake-repo"
 
 # --- Locate the Phase 6 scripts (from the worktree this test lives in) ---
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 WORKTREE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 POST_COMMIT="$WORKTREE_ROOT/scripts/hooks/post-commit"
 OFFER_HOOK="$WORKTREE_ROOT/scripts/contribution_offer_hook.py"

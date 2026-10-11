@@ -332,6 +332,69 @@ async def test_duplicate_source_ref_blocked(db, live):
     assert b["status"] == "duplicate"
 
 
+def _days_ago(days: int) -> str:
+    from datetime import UTC, datetime, timedelta
+
+    return (datetime.now(UTC) - timedelta(days=days)).isoformat()
+
+
+async def _post(db, pending_id, *, days_ago):
+    assert await pip.mark_posted(
+        db, pending_id, issue_number=7, issue_url="u", posted_at=_days_ago(days_ago)
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_old_posted_title_no_longer_blocks(db, live):
+    """Posted rows naming a follow-up are now kept indefinitely (cross-lane
+    dedup). The TITLE check must not inherit that: a title matching an issue
+    posted beyond the retention window is not "an active proposal"."""
+    old = pip.TERMINAL_RETENTION_DAYS + 5
+    a = await _propose(db, title="Add retries", body="One.", source_follow_up_id="fu-old")
+    await _post(db, a["pending_id"], days_ago=old)
+    b = await _propose(db, title="Add retries", body="Two.")
+    assert b["status"] == "held", b
+
+
+@pytest.mark.asyncio
+async def test_a_recent_posted_title_still_blocks(db, live):
+    a = await _propose(db, title="Add retries", body="One.", source_follow_up_id="fu-new")
+    await _post(db, a["pending_id"], days_ago=pip.TERMINAL_RETENTION_DAYS - 5)
+    b = await _propose(db, title="Add retries", body="Two.")
+    assert b["status"] == "duplicate" and b["existing_id"] == a["pending_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["contributor", "board"])
+async def test_an_old_posted_row_for_the_same_follow_up_still_blocks(db, live, lane):
+    """Whether this RECORD already has a public issue has no age bound, in
+    either lane's spelling of the follow-up id."""
+    old = pip.TERMINAL_RETENTION_DAYS + 5
+    if lane == "contributor":
+        a = await _propose(db, title="First", body="One.", source_follow_up_id="fu-x")
+        pending_id = a["pending_id"]
+    else:
+        pending_id = "board-row"
+        await pip.create(
+            db,
+            id=pending_id,
+            request_id="req-board",
+            repo=_REPO.lower(),
+            title="Promoted title",
+            body="b",
+            source="board",
+            source_ref="follow_up:fu-x",
+            cell_domain="github",
+            cell_verb="issue_create",
+            cell_risk_class="bulk",
+            held_at=_days_ago(old + 1),
+            mode="live",
+        )
+    await _post(db, pending_id, days_ago=old)
+    b = await _propose(db, title="Unrelated title", body="Two.", source_follow_up_id="fu-x")
+    assert b["status"] == "duplicate" and b["existing_id"] == pending_id
+
+
 @pytest.mark.asyncio
 async def test_dry_run_does_not_block_reproposal(db, live):
     """A dry-run hold is re-proposed under 'live' to actually post — so it must
