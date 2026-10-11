@@ -273,6 +273,48 @@ def test_a_fetch_url_with_whitespace_is_read_whole(tmp_path):
     assert remotes["origin"] == PRIVATE
 
 
+def test_an_uppercase_git_suffix_still_names_the_public_repo():
+    assert ur.repo_name("/srv/mirrors/GENesis-AGI.GIT") == "genesis-agi"
+    remotes = {"origin": PRIVATE, "public": "/srv/mirrors/GENesis-AGI.GIT"}
+    with pytest.raises(ur.UpdateRemoteError):  # a candidate, so not a silent origin fallback
+        ur.select(remotes, PUBLIC)
+
+
+def test_a_remote_named_like_an_option_does_not_break_resolution(tmp_path):
+    """An unrelated remote named `--all` must not make every update path fail."""
+    root = tmp_path / "dashed"
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _git(root, "remote", "add", "origin", UPSTREAM)
+    _git(root, "remote", "add", "--", "--all", CONTRIB)
+    remotes = ur.fetch_remotes(root)
+    assert remotes == {"origin": UPSTREAM, "--all": CONTRIB}
+    assert ur.select(remotes, PUBLIC) == ("origin", "origin")
+
+
+def test_the_degraded_path_accepts_a_pin_named_like_an_option(tmp_path):
+    root = tmp_path / "dashed_pin"
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _git(root, "remote", "add", "origin", PRIVATE)
+    _git(root, "remote", "add", "--", "--all", UPSTREAM)
+    _git(root, "config", "--local", ur.PIN_KEY, "--all")
+    r = _run_block(tmp_path, root, helper_rc=1)
+    assert r.returncode == 0, r
+    assert _result(r).startswith("RESULT remote=--all how=pinned"), r.stdout
+
+
+def test_a_remote_path_that_is_not_utf8_is_read_and_round_trips(tmp_path):
+    root = tmp_path / "bytes"
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _git(root, "remote", "add", "origin", PRIVATE)
+    raw = os.fsencode(str(tmp_path)) + b"/\xff/GENesis-AGI.git"
+    subprocess.run(
+        [b"git", b"-C", os.fsencode(str(root)), b"remote", b"add", b"public", raw], check=True
+    )
+    remotes = ur.fetch_remotes(root)
+    assert os.fsencode(remotes["public"]) == raw
+    assert ur.repo_name(remotes["public"]) == "genesis-agi"
+
+
 def _resolution_block() -> str:
     text = (REPO / "scripts" / "update.sh").read_text()
     start = text.index("# ── Resolve upstream remote")

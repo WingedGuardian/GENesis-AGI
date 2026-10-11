@@ -53,9 +53,10 @@ def repo_name(url: str) -> str:
     tail = url.strip().rstrip("/").rsplit("/", 1)[-1]
     if ":" in tail:  # scp-like host:repo with no owner path
         tail = tail.rsplit(":", 1)[-1]
-    if tail.endswith(".git"):
+    tail = tail.casefold()
+    if tail.endswith(".git"):  # after casefold: a mirror may be named X.GIT
         tail = tail[: -len(".git")]
-    return tail.casefold()
+    return tail
 
 
 def select(
@@ -90,8 +91,14 @@ def select(
 
 
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
+    # surrogateescape: a local remote path may hold bytes that are not UTF-8;
+    # they round-trip into later git argv instead of raising UnicodeDecodeError.
     return subprocess.run(
-        ["git", "-C", str(root), *args], capture_output=True, text=True, timeout=30
+        ["git", "-C", str(root), *args],
+        capture_output=True,
+        text=True,
+        errors="surrogateescape",
+        timeout=30,
     )
 
 
@@ -111,7 +118,8 @@ def fetch_remotes(root: Path) -> dict[str, str]:
         name = name.strip()
         if not name:
             continue
-        url = _git(root, "remote", "get-url", name)
+        # `--`: a remote may be named like an option (`git remote add -- --all URL`).
+        url = _git(root, "remote", "get-url", "--", name)
         if url.returncode != 0:
             raise UpdateRemoteError(
                 f"cannot read the fetch URL of remote {name!r}: {url.stderr.strip()}"

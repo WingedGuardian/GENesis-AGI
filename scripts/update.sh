@@ -312,7 +312,7 @@ if [[ "$POST_MERGE" == "false" ]]; then
                 _UR_HOW="pinned"
             fi
             if [ -n "$_UR_PICK" ]; then
-                if ! git -C "$GENESIS_ROOT" remote get-url "$_UR_PICK" >/dev/null 2>&1; then
+                if ! git -C "$GENESIS_ROOT" remote get-url -- "$_UR_PICK" >/dev/null 2>&1; then
                     echo "ERROR: the update-remote rule could not run (exit $_UR_RC), and the $_UR_HOW"
                     echo "       update remote '$_UR_PICK' is not a remote of this checkout."
                     echo "       Refusing to update until it is fixed."
