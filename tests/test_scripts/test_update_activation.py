@@ -26,6 +26,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE = REPO_ROOT / "scripts" / "update.sh"
 HYGIENE = REPO_ROOT / "scripts" / "disk_hygiene.sh"
+RECOVERY_LIB = REPO_ROOT / "scripts" / "lib" / "deploy_recovery.sh"
 
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "t",
@@ -82,10 +83,16 @@ def _merge_assertion_block() -> str:
     )
 
 
-_STUBS = """
+# The real checkout-lock lib: update.sh runs the hook-running git calls in these
+# blocks through genesis_without_checkout_lock, which with no lock held runs the
+# command as is.
+_CHECKOUT_LOCK_LIB = '. "' + str(REPO_ROOT / "scripts/lib/checkout_lock.sh") + '"\n'
+
+_STUBS = _CHECKOUT_LOCK_LIB + """
 ROLLBACK_TAG=test-rollback-tag
 _clear_deploy_state() { echo CLEARED-STATE; }
 _do_rollback() { echo "ROLLBACK: $1"; }
+_write_state() { echo "STATE=$1"; }
 """
 
 
@@ -93,7 +100,7 @@ def _run(script: str, home: Path, **extra_env: str) -> subprocess.CompletedProce
     env = _env(home)
     env.update(extra_env)
     return subprocess.run(
-        ["bash", "-c", "set -Eeuo pipefail\n" + script],
+        ["bash", "-c", f'set -Eeuo pipefail\n. "{RECOVERY_LIB}"\n' + script],
         capture_output=True,
         text=True,
         timeout=60,
@@ -287,7 +294,11 @@ def test_the_real_merge_line_refuses_an_ignored_file_on_a_fast_forward(tmp_path)
     The control strips only the flag and shows git overwriting it, so the flag is
     what bites."""
     text = UPDATE.read_text()
-    line = next(ln for ln in text.splitlines() if ln.startswith("MERGE_OUTPUT=$(git -C"))
+    line = next(
+        ln
+        for ln in text.splitlines()
+        if ln.startswith("MERGE_OUTPUT=$(") and 'git -C "$GENESIS_ROOT" merge ' in ln
+    )
     assert "--no-overwrite-ignore" in line
 
     def attempt(merge_line: str) -> tuple[str, bytes]:
@@ -306,7 +317,8 @@ def test_the_real_merge_line_refuses_an_ignored_file_on_a_fast_forward(tmp_path)
         (clone / "local.env").write_bytes(b"LOCAL-SECRET\n")
         deploy_head = _git(clone, "rev-parse", "origin/main")
         script = (
-            f'GENESIS_ROOT="{clone}"\nDEPLOY_HEAD="{deploy_head}"\nMERGE_RC=0\n'
+            _CHECKOUT_LOCK_LIB
+            + f'GENESIS_ROOT="{clone}"\nDEPLOY_HEAD="{deploy_head}"\nMERGE_RC=0\n'
             f'{merge_line}\necho "RC=$MERGE_RC"\n'
         )
         r = _run(script, tmp_path)
@@ -599,7 +611,7 @@ def test_backup_runs_before_the_stop_and_the_clear_after_it():
 def test_every_cleared_path_is_one_the_dirty_gate_excuses():
     """The clear list and the gate's allowlist must agree: a path the gate refuses
     never reaches the clear, and a path the clear would discard must be excused."""
-    text = UPDATE.read_text()
+    text = RECOVERY_LIB.read_text()
     paths = re.search(r"^EPHEMERAL_CLEAR_PATHS=\(([^)]*)\)", text, re.M).group(1).split()
     assert paths == ["AGENTS.md", "config/procedure_triggers.yaml"]
     assert text.count("EPHEMERAL_CLEAR_PATHS=(") == 1
@@ -668,8 +680,16 @@ def test_the_rollback_saves_edits_before_its_reset():
     start = text.index("_do_rollback() {")
     body = text[start : text.index("\n}\n", start)]
     body = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
-    save = body.index('_ephemeral_backup_before_reset "$EPHEMERAL_BACKUP_ROOT"')
-    reset = body.index('checkout -q --no-overwrite-ignore -B "$ORIGINAL_BRANCH" "$ROLLBACK_TAG"')
+    assert 'genesis_rollback_checkout "$GENESIS_ROOT" "$ROLLBACK_TAG" "$ORIGINAL_BRANCH"' in body
+    recovery = "\n".join(
+        line
+        for line in RECOVERY_LIB.read_text().splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    save = recovery.index('_ephemeral_backup_before_reset "$EPHEMERAL_BACKUP_ROOT"')
+    reset = recovery.index(
+        'checkout -q --no-overwrite-ignore -B "$ORIGINAL_BRANCH" "$ROLLBACK_TAG"'
+    )
     assert save < reset
 
 

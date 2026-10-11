@@ -1,0 +1,1 @@
+- Backup passphrases preserve Unicode whitespace bytes consistently across shell loading, Guardian integrity checks and escrow. Encryption and decryption reject line-feed passphrases before invoking GPG.
