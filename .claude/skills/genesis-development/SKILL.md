@@ -4047,7 +4047,9 @@ retires a Devin rework's old PR after the same check ("Building a rework" below)
 
 1. **The owner authorized the supersession**: the decision to replace this
    approach with another is the owner's, on record, not a reviewer's inference.
-   For a rework, that record is the posted `## Rework spec`.
+   For a rework, that record is a `## Rework spec` comment posted by a
+   maintainer (OWNER, MEMBER or COLLABORATOR); one from the PR's author or a
+   contributor is not the owner's authorization.
 2. **The successor PR is open**, or already merged, so the work has a live home.
    For a split rework, the LAST replacement has opened.
 3. **It is superseded completely, in every part.** Walk the old PR's files one by

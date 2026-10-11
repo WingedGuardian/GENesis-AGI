@@ -314,12 +314,15 @@ _SUPERSEDED_EXCEPTION = (
     "BUILDER of a rework that replaces the PR (never a reviewer session, and never "
     "Devin, whose old PR the closing session retires). Either may retire the PR "
     "when the owner's authorization of the supersession is on record (for a "
-    "rework, the posted `## Rework spec`), the successor PR is open or merged "
+    "rework, a `## Rework spec` comment posted by a maintainer: OWNER, MEMBER "
+    "or COLLABORATOR, never the PR's author or a contributor), the successor "
+    "PR is open or merged "
     "(for a split rework, the LAST replacement has opened), and every file of the "
     "old PR was checked against the successor and current main and found covered "
     "(naming the file:line that now does it) or moot (saying why). That per-file "
     "mapping goes in the closing comment; one part neither covered nor moot keeps "
-    "the PR open."
+    "the PR open. Devin never closes a PR its rework replaces, even as the "
+    "session reviving it: the closing session does."
 )
 
 
@@ -358,11 +361,12 @@ def _advisory(reasons: list[str], closes: int) -> str:
         f"up its revival. {_SUPERSEDED_EXCEPTION} If you believe any other PR "
         "should be retired and nobody is picking it up, that is a question for "
         "the user.\n"
-        "So: if you are the reviving session, the user asked for this close by "
-        "name, or you are the closing session or the rework's builder and every "
-        "superseded-PR condition "
-        "above holds with its evidence, proceed. Otherwise say what you are "
-        "about to close and why, and let them answer.\n"
+        "So: unless you are Devin closing a PR your rework replaces, proceed if "
+        "you are the reviving session, the user asked for this close by name, "
+        "or you are the closing session "
+        "or the rework's builder and every superseded-PR condition above holds "
+        "with its evidence. Otherwise say what you are about to close "
+        "and why, and let them answer.\n"
         f"{_LIMIT}"
     )
 
