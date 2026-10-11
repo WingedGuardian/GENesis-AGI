@@ -26,7 +26,6 @@ def _clear_all_browser_state():
     browser._page = None
     browser._active_page = None
     browser._collaborate_mode = False
-    browser._last_used = 0.0  # the idle test drives it with a fake clock
     browser._browser_lock = asyncio.Lock()
     # Remote CDP state
     browser._remote_pw = None
@@ -36,6 +35,17 @@ def _clear_all_browser_state():
     browser._remote_last_url = None
     browser._remote_target_ids = {}
     browser._remote_inflight = set()
+    # TinyFish state
+    browser._tinyfish_pw = None
+    browser._tinyfish_browser = None
+    browser._tinyfish_page = None
+    browser._tinyfish_session_id = None
+    # Per-layer idle tracking, and the watcher task a test may have started
+    browser._layer_last_used = {}
+    if browser._idle_task is not None:
+        browser._idle_task.cancel()
+    browser._idle_task = None
+    browser._pending_closes = set()
     # VNC verification flag — FIX 3 tests toggle it; reset to avoid leak
     browser._vnc_verified = False
 
@@ -146,6 +156,7 @@ class TestEnsureChromiumRecovery:
         new_page = MagicMock()
         mock_context = AsyncMock()
         mock_context.pages = [new_page]
+        mock_context.on = MagicMock()  # Playwright's event registration is sync
 
         mock_pw = AsyncMock()
         mock_pw.chromium.launch_persistent_context = AsyncMock(return_value=mock_context)
@@ -325,8 +336,9 @@ class TestFillStallWatchdog:
         async def slow_down(_char):
             calls["down"] += 1
             now[0] += 200.0
-            # The idle watcher's own predicate, against the real constant.
-            idle_seen.append(now[0] - browser._last_used >= browser._IDLE_TIMEOUT_S)
+            # The idle watcher's own predicate, on the filled page's layer.
+            last = browser._layer_last_used.get(browser.BrowserLayer.REMOTE_CDP, 0.0)
+            idle_seen.append(now[0] - last >= browser._IDLE_TIMEOUT_S)
 
         page.keyboard.down = AsyncMock(side_effect=slow_down)
         with (
@@ -339,6 +351,55 @@ class TestFillStallWatchdog:
         assert now[0] - 1000.0 > 2 * browser._IDLE_TIMEOUT_S
         assert calls["down"] == 40
         assert not any(idle_seen), f"idle at keystroke {idle_seen.index(True) + 1}"
+
+    @pytest.mark.asyncio
+    async def test_a_long_fill_keeps_its_own_layer_alive_after_a_layer_switch(self):
+        """The fill releases _browser_lock before typing, so a browser_navigate
+        on another layer can move the active page mid-fill. Each step must
+        still count as activity on the layer being typed into (each layer has
+        its own idle clock), not on whichever layer is now active, or the idle
+        watcher reclaims the browser under the fill."""
+        now = [1000.0]
+        page, calls = _typing_page()  # remote CDP
+        other = _alive_page("https://camoufox.example")
+        browser._stealth_cm = MagicMock()
+        browser._stealth_page = other
+        idle_seen = []
+
+        async def slow_down(_char):
+            calls["down"] += 1
+            if calls["down"] == 1:
+                browser._active_page = other  # a concurrent Camoufox navigate
+            now[0] += 200.0
+            last = browser._layer_last_used.get(browser.BrowserLayer.REMOTE_CDP, 0.0)
+            idle_seen.append(now[0] - last >= browser._IDLE_TIMEOUT_S)
+
+        page.keyboard.down = AsyncMock(side_effect=slow_down)
+        with (
+            patch.object(browser, "time", MagicMock(monotonic=lambda: now[0])),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep),
+        ):
+            result = await browser._impl_browser_fill("#bio", "x" * 40)
+        assert result.get("filled") == "#bio", result
+        assert browser._active_page is other  # the switch really happened
+        assert not any(idle_seen), f"idle at keystroke {idle_seen.index(True) + 1}"
+        assert browser.BrowserLayer.CAMOUFOX not in browser._layer_last_used
+
+    @pytest.mark.asyncio
+    async def test_a_fill_on_a_page_no_layer_holds_stamps_no_other_layer(self):
+        """A fill whose page no layer holds any more must not keep the active
+        layer alive in its place."""
+        page, _ = _typing_page()
+        browser._remote_page = None  # detached: the page belongs to no layer
+        other = _alive_page("https://camoufox.example")
+        browser._stealth_cm = MagicMock()
+        browser._stealth_page = other
+        browser._active_page = other  # per-keystroke path, Camoufox active
+        with patch("genesis.mcp.health.browser.asyncio.sleep", new=_instant_sleep):
+            await browser._human_type(page, "#bio", "xy")
+        assert page.keyboard.up.await_count == 2  # the fill really ran
+        assert browser.BrowserLayer.CAMOUFOX not in browser._layer_last_used
 
     @pytest.mark.asyncio
     async def test_a_stall_does_not_discard_a_page_navigated_meanwhile(self):
@@ -3449,3 +3510,632 @@ class TestBrowserScreenshotUniquePath:
         stamps = [Path(r["path"]).name.split("_")[-2] for r in (first, second)]
         assert stamps[0] != stamps[1], stamps
         assert stamps[0] < stamps[1], stamps
+
+
+# ---------------------------------------------------------------------------
+# Per-layer lifecycle (#2874)
+# ---------------------------------------------------------------------------
+
+def _alive_page(url="https://example.com"):
+    page = MagicMock()
+    page.url = url
+    page.is_closed.return_value = False
+    page.close = AsyncMock()
+    return page
+
+
+def _open_camoufox():
+    """A running Camoufox: its context manager, persistent context and page."""
+    cm = MagicMock()
+    cm.__aexit__ = AsyncMock(return_value=None)
+    ctx = MagicMock()
+    page = _alive_page("https://camoufox.example")
+    ctx.pages = [page]
+    browser._stealth_cm = cm
+    browser._stealth_browser = ctx
+    browser._stealth_page = page
+    return cm, page
+
+
+def _open_chromium():
+    pw = MagicMock()
+    pw.stop = AsyncMock()
+    ctx = MagicMock()
+    ctx.close = AsyncMock()
+    page = _alive_page("https://chromium.example")
+    browser._playwright = pw
+    browser._context = ctx
+    browser._page = page
+    return pw, ctx, page
+
+
+def _open_remote():
+    br = _mock_remote_browser(connected=True)
+    pw = MagicMock()
+    pw.stop = AsyncMock()
+    page = _alive_page("https://remote.example")
+    browser._remote_pw = pw
+    browser._remote_browser = br
+    browser._remote_page = page
+    browser._remote_target_ids[_URL] = "GEN-1"
+    return br, pw, page
+
+
+def _open_tinyfish():
+    br = MagicMock()
+    br.is_connected.return_value = True
+    br.close = AsyncMock()
+    pw = MagicMock()
+    pw.stop = AsyncMock()
+    page = _alive_page("https://tinyfish.example")
+    browser._tinyfish_pw = pw
+    browser._tinyfish_browser = br
+    browser._tinyfish_page = page
+    browser._tinyfish_session_id = "tf-session-0123456789"
+    return br, pw, page
+
+
+def _tinyfish_delete():
+    return patch(
+        "genesis.providers.tinyfish_client.browser_session_delete", new_callable=AsyncMock
+    )
+
+
+# Stub modules, not patch("camoufox.async_api..."): CI installs neither package,
+# and patching by dotted path imports the real one first (see _connect).
+def _stub_camoufox(cm):
+    api = MagicMock(AsyncCamoufox=MagicMock(return_value=cm))
+    return patch.dict(sys.modules, {"camoufox": MagicMock(async_api=api), "camoufox.async_api": api})
+
+
+def _stub_playwright(starter):
+    api = MagicMock(async_playwright=MagicMock(return_value=starter))
+    return patch.dict(sys.modules, {"playwright": MagicMock(async_api=api), "playwright.async_api": api})
+
+
+class TestStaleRecoveryCleansOnlyItsOwnLayer:
+    @pytest.mark.asyncio
+    async def test_camoufox_restart_keeps_remote_cdp_and_tinyfish(self):
+        remote_br, remote_pw, remote_page = _open_remote()
+        tf_br, _, _ = _open_tinyfish()
+        dead = MagicMock()
+        dead.is_closed.return_value = True
+        old_cm = MagicMock()
+        old_cm.__aexit__ = AsyncMock(return_value=None)
+        browser._stealth_cm = old_cm
+        browser._stealth_browser = MagicMock()
+        browser._stealth_page = dead
+
+        new_page = _alive_page()
+        new_ctx = MagicMock()
+        new_ctx.pages = [new_page]
+        new_cm = MagicMock()
+        new_cm.__aenter__ = AsyncMock(return_value=new_ctx)
+        with (
+            _stub_camoufox(new_cm),
+            _tinyfish_delete() as delete,
+        ):
+            result = await browser._ensure_browser()
+
+        assert result is new_page
+        old_cm.__aexit__.assert_awaited_once()  # its own layer was cleaned
+        remote_br.close.assert_not_awaited()
+        remote_pw.stop.assert_not_awaited()
+        assert browser._remote_browser is remote_br
+        assert browser._remote_page is remote_page
+        delete.assert_not_awaited()
+        tf_br.close.assert_not_awaited()
+        assert browser._tinyfish_session_id == "tf-session-0123456789"
+
+    @pytest.mark.asyncio
+    async def test_chromium_restart_keeps_camoufox_and_remote_cdp(self):
+        cm, cam_page = _open_camoufox()
+        remote_br, _, _ = _open_remote()
+        dead = MagicMock()
+        dead.is_closed.return_value = True
+        old_pw = MagicMock()
+        old_pw.stop = AsyncMock()
+        old_ctx = MagicMock()
+        old_ctx.close = AsyncMock()
+        browser._playwright = old_pw
+        browser._context = old_ctx
+        browser._page = dead
+
+        new_page = _alive_page()
+        new_ctx = MagicMock()
+        new_ctx.pages = [new_page]
+        new_pw = MagicMock()
+        new_pw.chromium.launch_persistent_context = AsyncMock(return_value=new_ctx)
+        starter = MagicMock()
+        starter.start = AsyncMock(return_value=new_pw)
+        with _stub_playwright(starter):
+            result = await browser._ensure_chromium_fallback()
+
+        assert result is new_page
+        old_ctx.close.assert_awaited_once()
+        old_pw.stop.assert_awaited_once()
+        cm.__aexit__.assert_not_awaited()
+        assert browser._stealth_page is cam_page
+        remote_br.close.assert_not_awaited()
+        assert browser._remote_browser is remote_br
+
+
+class TestPerLayerIdle:
+    @pytest.mark.asyncio
+    async def test_an_abandoned_camoufox_is_reclaimed_while_remote_stays(self):
+        cm, _ = _open_camoufox()
+        remote_br, _, remote_page = _open_remote()
+        browser._active_page = remote_page
+        now = 100_000.0
+        browser._layer_last_used = {
+            browser.BrowserLayer.CAMOUFOX: now - browser._IDLE_TIMEOUT_S - 1,
+            browser.BrowserLayer.REMOTE_CDP: now - 5,
+        }
+        await browser._reclaim_idle_layers(now)
+
+        cm.__aexit__.assert_awaited_once()
+        assert browser._stealth_cm is None and browser._stealth_page is None
+        remote_br.close.assert_not_awaited()
+        assert browser._remote_page is remote_page
+        assert browser._active_page is remote_page
+        assert browser.BrowserLayer.CAMOUFOX not in browser._layer_last_used
+
+    @pytest.mark.asyncio
+    async def test_an_idle_tinyfish_session_is_terminated_alone(self):
+        _open_tinyfish()
+        cm, cam_page = _open_camoufox()
+        now = 100_000.0
+        browser._layer_last_used = {
+            browser.BrowserLayer.TINYFISH: now - browser._IDLE_TIMEOUT_S,
+            browser.BrowserLayer.CAMOUFOX: now,
+        }
+        with _tinyfish_delete() as delete:
+            await browser._reclaim_idle_layers(now)
+        delete.assert_awaited_once_with("tf-session-0123456789")
+        assert browser._tinyfish_session_id is None
+        cm.__aexit__.assert_not_awaited()
+        assert browser._stealth_page is cam_page
+
+    @pytest.mark.asyncio
+    async def test_an_open_layer_with_no_timestamp_starts_its_clock(self):
+        cm, _ = _open_camoufox()  # launched outside _get_page (medium.py path)
+        await browser._reclaim_idle_layers(100_000.0)
+        cm.__aexit__.assert_not_awaited()
+        assert browser._layer_last_used[browser.BrowserLayer.CAMOUFOX] == 100_000.0
+
+    @pytest.mark.asyncio
+    async def test_a_tool_call_refreshes_only_the_layer_it_used(self):
+        _open_camoufox()
+        _, _, remote_page = _open_remote()
+        remote_page.title = AsyncMock(return_value="t")
+        browser._active_page = remote_page
+        browser._layer_last_used = {
+            browser.BrowserLayer.CAMOUFOX: 1.0,
+            browser.BrowserLayer.REMOTE_CDP: 1.0,
+        }
+        with patch.object(browser, "_snapshot_page", new=AsyncMock(return_value="snap")):
+            await browser._impl_browser_snapshot()
+        assert browser._layer_last_used[browser.BrowserLayer.REMOTE_CDP] > 1.0
+        assert browser._layer_last_used[browser.BrowserLayer.CAMOUFOX] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_navigating_remote_does_not_refresh_camoufox(self):
+        _open_camoufox()
+        browser._layer_last_used = {browser.BrowserLayer.CAMOUFOX: 1.0}
+        await _navigate_remote()
+        assert browser._layer_last_used[browser.BrowserLayer.CAMOUFOX] == 1.0
+        assert browser._layer_last_used[browser.BrowserLayer.REMOTE_CDP] > 1.0
+
+    @pytest.mark.asyncio
+    async def test_the_watcher_stops_once_no_layer_is_open(self):
+        ticks = 0
+
+        async def tick(_s):
+            nonlocal ticks
+            ticks += 1
+            if ticks > 5:
+                raise AssertionError("the watcher kept polling with nothing open")
+
+        with patch.object(browser.asyncio, "sleep", new=tick):
+            await browser._idle_watcher_loop()
+        assert ticks == 1
+
+    @pytest.mark.asyncio
+    async def test_the_watcher_keeps_running_while_a_layer_is_open(self):
+        _open_remote()
+        browser._layer_last_used = {browser.BrowserLayer.REMOTE_CDP: time_now()}
+        ticks = 0
+
+        async def tick(_s):
+            nonlocal ticks
+            ticks += 1
+            if ticks == 3:
+                await browser._cleanup_remote_cdp()
+            if ticks > 5:
+                raise AssertionError("the watcher did not stop after the last layer closed")
+
+        with patch.object(browser.asyncio, "sleep", new=tick):
+            await browser._idle_watcher_loop()
+        assert ticks == 3
+
+
+def time_now():
+    import time
+
+    return time.monotonic()
+
+
+class TestAsyncCleanupStillCleansEverything:
+    @pytest.mark.asyncio
+    async def test_every_layer_is_closed(self):
+        cm, _ = _open_camoufox()
+        pw, ctx, _ = _open_chromium()
+        remote_br, remote_pw, _ = _open_remote()
+        tf_br, tf_pw, _ = _open_tinyfish()
+        with _tinyfish_delete() as delete:
+            await browser.async_cleanup()
+        cm.__aexit__.assert_awaited_once()
+        ctx.close.assert_awaited_once()
+        pw.stop.assert_awaited_once()
+        remote_br.close.assert_awaited_once()
+        remote_pw.stop.assert_awaited_once()
+        tf_br.close.assert_awaited_once()
+        tf_pw.stop.assert_awaited_once()
+        delete.assert_awaited_once()
+        assert browser._active_page is None
+        assert browser._layer_last_used == {}
+
+
+class TestFailedLaunchLeavesNoHalfState:
+    @pytest.mark.asyncio
+    async def test_a_failed_camoufox_launch_leaves_no_half_state(self):
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(side_effect=RuntimeError("launch failed"))
+        cm.__aexit__ = AsyncMock(return_value=None)
+        with (
+            _stub_camoufox(cm),
+            pytest.raises(RuntimeError),
+        ):
+            await browser._ensure_browser()
+        assert browser._stealth_cm is None
+        assert not browser._layer_open(browser.BrowserLayer.CAMOUFOX)
+        cm.__aexit__.assert_awaited_once()  # the driver __aenter__ started is stopped
+
+    @pytest.mark.asyncio
+    async def test_a_failed_chromium_launch_stops_its_driver(self):
+        pw = MagicMock()
+        pw.stop = AsyncMock()
+        pw.chromium.launch_persistent_context = AsyncMock(side_effect=RuntimeError("no chrome"))
+        starter = MagicMock()
+        starter.start = AsyncMock(return_value=pw)
+        with (
+            _stub_playwright(starter),
+            pytest.raises(RuntimeError),
+        ):
+            await browser._ensure_chromium_fallback()
+        pw.stop.assert_awaited_once()
+        assert browser._playwright is None
+
+
+class TestClosedWindowStopsTheDriver:
+    @pytest.mark.asyncio
+    async def test_camoufox_context_close_runs_its_cleanup(self):
+        handlers = {}
+        ctx = MagicMock()
+        ctx.pages = [_alive_page()]
+        ctx.on = MagicMock(side_effect=lambda ev, fn: handlers.__setitem__(ev, fn))
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=ctx)
+        cm.__aexit__ = AsyncMock(return_value=None)
+        with _stub_camoufox(cm):
+            await browser._ensure_browser()
+        assert "close" in handlers
+        handlers["close"](ctx)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        cm.__aexit__.assert_awaited_once()
+        assert browser._stealth_cm is None
+
+    @pytest.mark.asyncio
+    async def test_a_close_event_from_an_old_context_is_ignored(self):
+        cm, page = _open_camoufox()
+        browser._on_local_context_closed(browser.BrowserLayer.CAMOUFOX, MagicMock())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        cm.__aexit__.assert_not_awaited()
+        assert browser._stealth_page is page
+
+
+class TestReconnectAfterADropCleansTheOldLayer:
+    """A dropped connection clears the page/browser globals but leaves the
+    Playwright driver (and for TinyFish, the billed session id). The next
+    ensure must clean those up instead of starting a second driver over them."""
+
+    @pytest.mark.asyncio
+    async def test_remote_reconnect_after_a_disconnect_stops_the_old_driver(self):
+        old_br, old_pw, _ = _open_remote()
+        browser._on_remote_disconnected(old_br)
+        assert browser._remote_pw is old_pw  # precondition: the driver survived the drop
+        page = _cdp_page("about:blank", "GEN-1")
+        await _connect(_mock_remote_browser(pages=[page]))
+        old_pw.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_tinyfish_reconnect_after_a_disconnect_deletes_the_old_session(self):
+        _, old_pw, _ = _open_tinyfish()
+        browser._on_tinyfish_disconnected()
+        assert browser._tinyfish_session_id == "tf-session-0123456789"  # precondition
+
+        new_page = _alive_page()
+        ctx = MagicMock()
+        ctx.pages = [new_page]
+        new_br = MagicMock()
+        new_br.contexts = [ctx]
+        new_br.on = MagicMock()
+        new_pw = MagicMock()
+        new_pw.chromium.connect_over_cdp = AsyncMock(return_value=new_br)
+        starter = MagicMock()
+        starter.start = AsyncMock(return_value=new_pw)
+        create = AsyncMock(return_value={"session_id": "tf-new-session-99", "cdp_url": "ws://x"})
+        # A stub module, as _connect does: CI does not install playwright.
+        api = MagicMock(async_playwright=MagicMock(return_value=starter))
+        with (
+            _tinyfish_delete() as delete,
+            patch("genesis.providers.tinyfish_client.browser_session_create", new=create),
+            patch.dict(sys.modules, {"playwright": MagicMock(async_api=api), "playwright.async_api": api}),
+            patch.object(browser.asyncio, "sleep", new=AsyncMock()),
+        ):
+            page, is_new = await browser._ensure_tinyfish_browser()
+        delete.assert_awaited_once_with("tf-session-0123456789")
+        old_pw.stop.assert_awaited_once()
+        assert browser._tinyfish_session_id == "tf-new-session-99"
+        assert page is new_page and is_new
+
+
+class TestLayerSwitchLeavesTinyfish:
+    """Ending a paid session on a layer switch would be automatic cost control,
+    which the design principles rule out; its own idle clock bounds it."""
+
+    @pytest.mark.asyncio
+    async def test_switching_to_camoufox_leaves_the_tinyfish_session(self):
+        tf_br, _, tf_page = _open_tinyfish()
+        browser._active_page = tf_page
+        with _tinyfish_delete() as delete:
+            result = await _navigate_camoufox()
+        assert result["layer"] == "camoufox"
+        delete.assert_not_awaited()
+        tf_br.close.assert_not_awaited()
+        assert browser._tinyfish_session_id == "tf-session-0123456789"
+
+    @pytest.mark.asyncio
+    async def test_switching_to_remote_leaves_it_too(self):
+        _, _, tf_page = _open_tinyfish()
+        browser._active_page = tf_page
+        with _tinyfish_delete() as delete:
+            await _navigate_remote()
+        delete.assert_not_awaited()
+
+    def test_a_tinyfish_disconnect_clears_the_active_page(self):
+        """Review NOTE: the tools must say "No page open", not fail on a dead page."""
+        _, _, tf_page = _open_tinyfish()
+        browser._active_page = tf_page
+        browser._on_tinyfish_disconnected()
+        assert browser._active_page is None
+        assert browser._tinyfish_session_id == "tf-session-0123456789"  # still deleted later
+
+    @pytest.mark.asyncio
+    async def test_navigating_within_tinyfish_keeps_the_session(self):
+        _, _, tf_page = _open_tinyfish()
+        tf_page.title = AsyncMock(return_value="t")
+        tf_page.goto = AsyncMock()
+        tf_page.locator.return_value.aria_snapshot = AsyncMock(return_value="- x")
+        browser._active_page = tf_page
+        with _tinyfish_delete() as delete:
+            result = await browser._impl_browser_navigate("https://example.org", tinyfish=True)
+        assert "error" not in result, result
+        delete.assert_not_awaited()
+        assert browser._tinyfish_session_id == "tf-session-0123456789"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_switch_keeps_the_session(self):
+        _, _, tf_page = _open_tinyfish()
+        browser._active_page = tf_page
+        with (
+            _tinyfish_delete() as delete,
+            patch.object(
+                browser, "_ensure_remote_cdp", new_callable=AsyncMock,
+                side_effect=ConnectionError("unreachable"),
+            ),
+        ):
+            result = await browser._impl_browser_navigate("https://x.org", remote=True)
+        assert "error" in result
+        delete.assert_not_awaited()
+
+
+class TestALayerInUseIsNotReclaimed:
+    """Devin 4186534708: a call must not lose its layer to idle reclaim. Every
+    _impl_* stamps its layer at the start, so it suffices that no MCP browser
+    tool can run as long as the idle window. browser_fill is the exception: it
+    has no overall deadline (#2914), and is covered instead by stamping the
+    filled page's layer at every step (TestFillStallWatchdog)."""
+
+    @pytest.mark.asyncio
+    async def test_every_browser_tool_is_capped_well_inside_the_idle_window(self):
+        caps = []
+
+        async def capture(coro, timeout_s=browser._TOOL_TIMEOUT_S, operation="browser", note=""):
+            coro.close()
+            caps.append((operation, timeout_s))
+            return {}
+
+        with patch.object(browser, "_with_tool_timeout", new=capture):
+            await browser.browser_navigate.fn("https://example.com")
+            await browser.browser_navigate.fn("https://example.com", remote=True)
+            await browser.browser_click.fn("#a")
+            await browser.browser_upload.fn("#a", "/nonexistent")
+            await browser.browser_screenshot.fn()
+            await browser.browser_snapshot.fn()
+            await browser.browser_run_js.fn("1")
+            await browser.browser_press_key.fn("Tab", 1000)
+        assert len(caps) == 8, caps
+        assert all(t <= 300.0 < browser._IDLE_TIMEOUT_S for _, t in caps), caps
+
+    @pytest.mark.asyncio
+    async def test_a_touch_while_the_watcher_waits_for_the_lock_keeps_the_layer(self):
+        cm, _ = _open_camoufox()
+        now = 100_000.0
+        browser._layer_last_used = {browser.BrowserLayer.CAMOUFOX: now - browser._IDLE_TIMEOUT_S}
+        async with browser._browser_lock:
+            reclaim = asyncio.create_task(browser._reclaim_idle_layers(now))
+            await asyncio.sleep(0)  # the watcher now waits on the lock
+            browser._layer_last_used[browser.BrowserLayer.CAMOUFOX] = now
+        await reclaim
+        cm.__aexit__.assert_not_awaited()
+        assert browser._stealth_cm is cm
+
+
+class TestFailedNavigateStillStartsTheWatcher:
+    @pytest.mark.asyncio
+    async def test_a_failed_ensure_starts_the_idle_watcher(self):
+        """A TinyFish session created before its page load failed still bills;
+        only the idle watcher would reclaim it."""
+        with (
+            patch.object(
+                browser, "_ensure_tinyfish_browser", new_callable=AsyncMock,
+                side_effect=RuntimeError("page load timed out"),
+            ),
+            patch.object(browser, "_start_idle_watcher") as start,
+            pytest.raises(RuntimeError),
+        ):
+            await browser._get_page(tinyfish=True)
+        start.assert_called_once()
+
+
+class TestChromiumWindowClose:
+    @pytest.mark.asyncio
+    async def test_chromium_context_close_runs_its_cleanup(self):
+        handlers = {}
+        ctx = MagicMock()
+        ctx.pages = [_alive_page()]
+        ctx.close = AsyncMock()
+        ctx.on = MagicMock(side_effect=lambda ev, fn: handlers.__setitem__(ev, fn))
+        pw = MagicMock()
+        pw.stop = AsyncMock()
+        pw.chromium.launch_persistent_context = AsyncMock(return_value=ctx)
+        starter = MagicMock()
+        starter.start = AsyncMock(return_value=pw)
+        with _stub_playwright(starter):
+            await browser._ensure_chromium_fallback()
+        assert "close" in handlers
+        handlers["close"](ctx)
+        assert len(browser._pending_closes) == 1  # the reap task is retained
+        for _ in range(5):
+            await asyncio.sleep(0)
+        pw.stop.assert_awaited_once()
+        assert browser._context is None and browser._playwright is None
+        assert not browser._pending_closes
+
+
+def _gated(done: list, gate: asyncio.Event, entered: asyncio.Event):
+    """An awaitable close that waits for ``gate`` and records its completion."""
+
+    async def close(*_a):
+        entered.set()
+        await gate.wait()
+        done.append(True)
+
+    return close
+
+
+class TestACancelledReclaimStillFinishesItsClose:
+    """Lifespan shutdown cancels the idle watcher while it is reclaiming a layer.
+    The cleanup has already detached the layer's globals, so async_cleanup cannot
+    find it again: the close must run to completion anyway, and async_cleanup
+    must wait for it."""
+
+    @pytest.mark.asyncio
+    async def test_chromium_driver_is_stopped_when_reclaim_is_cancelled_mid_close(self):
+        pw, ctx, _ = _open_chromium()
+        gate, entered, closed, stopped = asyncio.Event(), asyncio.Event(), [], []
+        ctx.close = AsyncMock(side_effect=_gated(closed, gate, entered))
+        pw.stop = AsyncMock(side_effect=lambda: stopped.append(True))
+        browser._layer_last_used[browser.BrowserLayer.CHROMIUM] = 0.0
+        browser._idle_task = asyncio.ensure_future(
+            browser._reclaim_idle_layers(browser._IDLE_TIMEOUT_S + 1.0)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        cleanup = asyncio.ensure_future(browser.async_cleanup())
+        await asyncio.sleep(0.05)
+        gate.set()
+        await asyncio.wait_for(cleanup, timeout=5)
+        await asyncio.sleep(0.05)  # let a close left running elsewhere finish too
+        assert closed == [True]
+        assert stopped == [True]  # the driver was not orphaned
+
+    @pytest.mark.asyncio
+    async def test_async_cleanup_waits_for_a_camoufox_close_a_cancel_left_running(self):
+        cm, _ = _open_camoufox()
+        gate, entered, exited = asyncio.Event(), asyncio.Event(), []
+        cm.__aexit__ = AsyncMock(side_effect=_gated(exited, gate, entered))
+        browser._layer_last_used[browser.BrowserLayer.CAMOUFOX] = 0.0
+        browser._idle_task = asyncio.ensure_future(
+            browser._reclaim_idle_layers(browser._IDLE_TIMEOUT_S + 1.0)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        cleanup = asyncio.ensure_future(browser.async_cleanup())
+        await asyncio.sleep(0.05)
+        assert not cleanup.done()  # still waiting for the close
+        gate.set()
+        await asyncio.wait_for(cleanup, timeout=5)
+        assert exited == [True]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_launch_cancelled_again_still_stops_its_driver(self):
+        gate, entered, stopped = asyncio.Event(), asyncio.Event(), []
+        pw = MagicMock()
+        pw.stop = AsyncMock(side_effect=_gated(stopped, gate, entered))
+        pw.chromium.launch_persistent_context = AsyncMock(side_effect=RuntimeError("no chrome"))
+        starter = MagicMock()
+        starter.start = AsyncMock(return_value=pw)
+        with _stub_playwright(starter):
+            launch = asyncio.ensure_future(browser._ensure_chromium_fallback())
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            launch.cancel()  # the tool timeout lands while the driver is stopping
+            with pytest.raises((asyncio.CancelledError, RuntimeError)):
+                await launch
+        cleanup = asyncio.ensure_future(browser.async_cleanup())
+        await asyncio.sleep(0.05)
+        gate.set()
+        await asyncio.wait_for(cleanup, timeout=5)
+        assert stopped == [True]
+
+    @pytest.mark.asyncio
+    async def test_cancelling_async_cleanup_does_not_cancel_the_close_it_waits_for(self):
+        pw, ctx, _ = _open_chromium()
+        gate, entered, closed, stopped = asyncio.Event(), asyncio.Event(), [], []
+        ctx.close = AsyncMock(side_effect=_gated(closed, gate, entered))
+        pw.stop = AsyncMock(side_effect=lambda: stopped.append(True))
+        browser._layer_last_used[browser.BrowserLayer.CHROMIUM] = 0.0
+        browser._idle_task = asyncio.ensure_future(
+            browser._reclaim_idle_layers(browser._IDLE_TIMEOUT_S + 1.0)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        cleanup = asyncio.ensure_future(browser.async_cleanup())
+        await asyncio.sleep(0.05)
+        cleanup.cancel()  # the lifespan exit is itself cut short
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup
+        gate.set()
+        await asyncio.sleep(0.05)
+        assert closed == [True] and stopped == [True]
+
+
+class TestARejectedNavigateTouchesNoLayer:
+    @pytest.mark.asyncio
+    async def test_tinyfish_plus_remote_does_not_refresh_the_tinyfish_clock(self):
+        browser._layer_last_used[browser.BrowserLayer.TINYFISH] = 123.0
+        result = await browser._impl_browser_navigate(
+            "https://example.com", tinyfish=True, remote=True,
+        )
+        assert "error" in result
+        assert browser._layer_last_used == {browser.BrowserLayer.TINYFISH: 123.0}

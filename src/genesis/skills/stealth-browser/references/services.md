@@ -17,10 +17,10 @@ Prices are as read on the date shown; recheck before quoting them.
 ## TinyFish (wired in)
 
 - `browser_navigate(url, tinyfish=True)`: cloud Chromium over CDP, 1 credit per
-  4 minutes (tool docstring, 2026-10-04). No tool ends the session on purpose;
-  it ends at idle cleanup, at MCP exit, or when a later Camoufox or Chromium
-  navigate finds its own page stale and resets every layer (#2874), which also
-  drops a remote CDP connection. See `browser-automation`, Layer 4.
+  4 minutes (tool docstring, 2026-10-04). No tool ends the session on purpose,
+  and switching layers leaves it open; it ends at its own idle cleanup (about
+  an hour after the last tool call on it), at MCP exit, or when a later
+  TinyFish navigate finds it dropped. See `browser-automation`, Layer 4.
 - `web_agent(url, goal)`: goal-driven agent, about $0.015 per step
   (tool docstring). The daily budget is checked and only logged, never
   enforced; the default `max_steps=100` is about $1.50 per call, so pass a

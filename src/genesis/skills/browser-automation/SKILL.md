@@ -91,15 +91,15 @@ so after a failure take the layer from the call you made.
 - `browser_navigate(url, tinyfish=True)`: a fresh isolated cloud Chromium per
   session, 1 credit per 4 minutes (per the tool docstring). Ask the user before
   using it.
-- No tool ends a TinyFish session on purpose. It ends at idle cleanup, when
-  the session's MCP server exits, or when a later Camoufox or Chromium navigate
-  finds its own page stale and resets every layer (#2874), which also drops a
-  remote CDP connection. It bills until then. The idle timer is
-  shared across layers (#2874): `browser_navigate`, `browser_click`,
+- No tool ends a TinyFish session on purpose, and switching to another layer
+  leaves it open. It ends at its own idle cleanup, when the session's MCP
+  server exits, or when a later TinyFish navigate finds it dropped and replaces
+  it. It bills until then. Each layer has its own idle clock, and a stale page
+  restarts only its own layer: `browser_navigate`, `browser_click`,
   `browser_fill`, `browser_press_key`, `browser_upload`, `browser_screenshot`,
-  `browser_snapshot` and `browser_run_js` reset it on any layer, while
-  `browser_sessions`, `browser_clear_domain` and `browser_collaborate` do not.
-  Use TinyFish last in a task.
+  `browser_snapshot` and `browser_run_js` reset the clock of the layer they act
+  on, while `browser_sessions`, `browser_clear_domain` and `browser_collaborate`
+  reset none. Use TinyFish last in a task.
 - `web_agent(url, goal)` is the goal-driven TinyFish agent, about $0.015 per
   step. The daily budget is checked and only logged, never enforced, and the
   default `max_steps=100` can cost about $1.50 per call: pass a small
@@ -302,7 +302,8 @@ new tab (`target="_blank"`, `window.open`), read its address with
 
 There is no close tool, and you do not close browsers. When you switch layers,
 leave the previous browser where it is: idle cleanup reclaims it after about
-an hour with no call to one of the page tools listed in Layer 4, and the
+an hour with no call to one of the page tools listed in Layer 4 on that
+browser, and the
 session's MCP server closes it on exit. Never close a browser window or kill
 a browser process from the shell: closing Camoufox from outside crashed it and left a journal in the shared
 profile, and display `:99` is shared by every session.
