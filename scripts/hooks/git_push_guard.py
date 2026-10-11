@@ -1151,6 +1151,15 @@ _MERGE_GATE_BUDGET_S = 45.0
 _merge_deadline: float | None = None
 
 
+#: Successful PR body / createdAt reads, kept for the rest of ONE merge-hook
+#: invocation (only while ``_merge_deadline`` is armed; ``main`` clears it on
+#: entry). The E2E and pin gates read both early in the merge arm, while budget is
+#: left. The `rework` gate runs last, and a fresh body read there could fail on a
+#: spent deadline and make a DECLARED rebuild look undeclared, which fails open.
+#: The report path never arms the deadline, so it never caches.
+_MERGE_READ_CACHE: dict[tuple[str, str, str], str] = {}
+
+
 def _gh_timeout(cap: float) -> float:
     """Per-call subprocess timeout under the shared merge-path deadline (``_merge_deadline``).
 
@@ -9473,6 +9482,9 @@ def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
     raw = os.environ.get("_TEST_GH_PR_BODY")
     if raw is not None:
         return raw
+    key = ("body", str(pr_num), repo or "")
+    if _merge_deadline is not None and key in _MERGE_READ_CACHE:
+        return _MERGE_READ_CACHE[key]
     try:
         result = subprocess.run(
             ["gh", "pr", "view", pr_num, *_repo_args(repo), "--json", "body", "--jq", ".body"],
@@ -9482,7 +9494,10 @@ def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
         )
     except Exception:
         return None
-    return result.stdout if result.returncode == 0 else None
+    got = result.stdout if result.returncode == 0 else None
+    if got is not None and _merge_deadline is not None:
+        _MERGE_READ_CACHE[key] = got
+    return got
 
 
 #: MIRROR of e2e_declaration.E2E_CUTOFF_ISO, for the degraded path only. Without it
@@ -9580,6 +9595,9 @@ def _pr_created_at(pr_num: str, repo: str | None = None) -> str | None:
     raw = os.environ.get("_TEST_GH_PR_CREATED_AT")
     if raw is not None:
         return raw
+    key = ("createdAt", str(pr_num), repo or "")
+    if _merge_deadline is not None and key in _MERGE_READ_CACHE:
+        return _MERGE_READ_CACHE[key]
     try:
         result = subprocess.run(
             [
@@ -9592,7 +9610,10 @@ def _pr_created_at(pr_num: str, repo: str | None = None) -> str | None:
         )
     except Exception:
         return None
-    return result.stdout.strip() if result.returncode == 0 else None
+    got = result.stdout.strip() if result.returncode == 0 else None
+    if got is not None and _merge_deadline is not None:
+        _MERGE_READ_CACHE[key] = got
+    return got
 
 
 def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
@@ -10021,8 +10042,13 @@ def _pr_commit_rows(pr_num: str, repo: str | None = None) -> tuple[list[dict] | 
                 ],
                 capture_output=True,
                 text=True,
-                # One paginated read. The main-reverts row reads it in report mode;
-                # the leaks exemption reads it on the merge path, under the deadline.
+                # One paginated read, on the merge path for two gates: the leaks
+                # exemption and the `rework` gate (`_check_rework`). So the cap is
+                # clamped to what is left of the shared merge deadline; an expired
+                # deadline raises before the process starts and lands in the
+                # `except` below as an unreadable list, which each gate maps per
+                # its fail-direction table. The `main-reverts` row reads it in
+                # report mode.
                 timeout=_gh_timeout(15),
             )
         except Exception:
@@ -10352,6 +10378,898 @@ def _check_main_reverts(pr_num: str, repo: str | None = None) -> tuple[str, str]
         "Advisory only: this row never blocks a merge.",
     ]
     return MAIN_REVERTS_FINDINGS, "\n".join(lines)
+
+
+# --- rework: a rebuild of a sent-back PR carries its contract (owner decision) ---
+
+#: The four states `_check_rework` reports. BLOCK is the only one that blocks.
+REWORK_BLOCK = "block"
+REWORK_OK = "ok"
+REWORK_NA = "n/a"
+REWORK_UNCHECKED = "could-not-check"
+
+#: The labels that mark a PR as sent back for rework.
+_REWORK_LABELS = ("needs-rework", "needs-architecture-session")
+
+#: `gh pr list --limit` for the sent-back read. A result this long is truncated.
+_REWORK_LIST_LIMIT = 500
+
+def _rework_ack_bot_logins() -> frozenset[str]:
+    """Bot logins whose acknowledgement counts despite a NONE author association.
+
+    EXACT logins from the reviewer registry (its ``devin-marker`` parser), never a
+    pattern: Devin builds rework itself and comments as a GitHub App whose
+    association is NONE. An unimportable registry allows no bot (fails closed).
+    """
+    try:
+        return frozenset(enforced_logins().get("devin-marker", frozenset()))
+    except Exception:  # noqa: BLE001 — the registry stub raises when unimportable.
+        return frozenset()
+
+
+#: The heading an acknowledgement comment opens with (after leading whitespace).
+_REWORK_ACK_HEADING = "## rework acknowledgement"
+
+#: The fields the `## Rework` section must carry, each with text after the colon.
+_REWORK_FIELDS = (
+    "Replaces",
+    "Split",
+    "Kept / deleted / reshaped as the spec asked",
+    "Deviations",
+    "Questions answered",
+)
+
+#: `#N` only standing alone: never `other/repo#10` (a cross-repository shorthand)
+#: or a URL fragment (`page#10`).
+_REWORK_REF = r"(?:(?<![\w/.#-])#(\d+)\b|https?://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+))"
+#: Signal (a): a STRUCTURED declaration, a line whose field is `Replaces:` or
+#: `Supersedes:` (optionally a bullet, optionally bold), naming PRs as `#N` or as
+#: this repository's PR URLs anywhere in its value. Owner ruling 2026-10-05: prose
+#: is never read as a declaration. Two review rounds showed every prose matcher
+#: misreads some sentence ("This PR never supersedes #11"), so a builder declares
+#: a replacement the way the `## Rework` section already asks, and undeclared
+#: rebuilds are left to commit containment (signal b) and the closing session.
+#: Linear: anchored, no nested quantifier over whitespace.
+#: A field line, read from rendered paragraph text (emphasis already dropped):
+#: `Name: value`. Linear: anchored, no nested quantifier over whitespace.
+_REWORK_DECL_FIELD_RE = re.compile(
+    r"^[ \t]*(?:replaces|supersedes)[ \t]*:(?P<value>.*)$", re.IGNORECASE
+)
+_REWORK_REF_RE = re.compile(_REWORK_REF, re.IGNORECASE)
+#: The `## Rework` heading's rendered text: `Rework`, optionally followed by more
+#: (`Rework (replaces #10)`), but never the acknowledgement heading, which belongs
+#: on the OLD PR.
+_REWORK_HEADING_TEXT_RE = re.compile(r"^rework\b(?![ \t_-]*acknowledg)", re.IGNORECASE)
+#: The most declared PRs one body may name. Each unlisted one costs a PR read
+#: and a timeline read on a path with no shared deadline (`--check-pr`), so the
+#: bound keeps a degraded API from stalling the report. A rebuild replaces one
+#: to three PRs in practice; more blocks and takes the owner's override.
+_REWORK_MAX_DECLARED = 5
+_REWORK_FIELD_RE = re.compile(
+    r"^[ \t]*("
+    + "|".join(re.escape(f).replace(r"\ ", r"[ \t]+") for f in _REWORK_FIELDS)
+    + r")[ \t]*:(.*)$",
+    re.IGNORECASE,
+)
+#: Another `Label:` line (`Testing: pytest`, `E2E: none`). It ends the field above
+#: it rather than filling it. The colon must end the label (followed by a space
+#: or the line end), so a URL (`https://...`) is a value, never a label.
+_REWORK_OTHER_FIELD_RE = re.compile(r"^[ \t]*[A-Za-z][\w /()-]{0,60}:(?:[ \t]|$)")
+
+
+def _rework_markdown():
+    """A CommonMark parser (markdown-it-py), or None when it is not installed.
+
+    The rework readers judge the body AS IT RENDERS, so a quoted template in a code
+    block, a blockquote or an HTML comment is never a declaration, a field value or
+    a heading. Hand-written line rules missed some CommonMark construct in each of
+    three review passes, so the body is parsed instead. None makes every reader
+    report the body unreadable, which the fail-direction table handles.
+    """
+    try:
+        from markdown_it import MarkdownIt  # noqa: PLC0415 — optional at import time
+    except ImportError:
+        return None
+    return MarkdownIt("commonmark")
+
+
+class _ReworkUnreadable(Exception):
+    """The body could not be parsed (no Markdown parser installed)."""
+
+
+def _rework_inline_text(inline) -> str:
+    """An inline token's rendered text: emphasis markers and inline HTML dropped,
+    line breaks kept as newlines, link text kept, images dropped."""
+    out: list[str] = []
+    for child in inline.children or []:
+        if child.type in ("text", "code_inline"):
+            out.append(child.content)
+        elif child.type in ("softbreak", "hardbreak"):
+            out.append("\n")
+    return "".join(out)
+
+
+def _rework_blocks(body: str) -> list[tuple[str, object, str]]:
+    """The body's rendered blocks, in order, as ``(kind, where, text)``.
+
+    ``kind`` is ``"heading"`` (``where`` = level), ``"para"`` (``where`` = the tuple
+    of list-item positions enclosing it, empty at the top level), or ``"other"``
+    for a block that renders but carries no readable text (code, raw HTML, a
+    blockquote: their content is quoted material, never the author's field).
+    An HTML block that is only a comment renders nothing and is omitted. Raises
+    ``_ReworkUnreadable`` when no parser is installed.
+    """
+    md = _rework_markdown()
+    if md is None:
+        raise _ReworkUnreadable("the Markdown parser (markdown-it-py) is not installed")
+    tokens = md.parse((body or "").replace("\r\n", "\n"))
+    blocks: list[tuple[str, object, str]] = []
+    quote = 0
+    items: list[int] = []
+    counter = 0
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        t = tok.type
+        if t == "blockquote_open":
+            if quote == 0:
+                blocks.append(("other", (), ""))
+            quote += 1
+        elif t == "blockquote_close":
+            quote -= 1
+        elif quote:
+            pass
+        elif t == "list_item_open":
+            counter += 1
+            items.append(counter)
+        elif t == "list_item_close":
+            items.pop()
+        elif t == "heading_open":
+            inline = tokens[i + 1]
+            blocks.append(("heading", int(tok.tag[1:]), _rework_inline_text(inline)))
+            i += 2
+        elif t == "paragraph_open":
+            inline = tokens[i + 1]
+            blocks.append(("para", tuple(items), _rework_inline_text(inline)))
+            i += 2
+        elif t in ("fence", "code_block", "hr"):
+            blocks.append(("other", tuple(items), ""))
+        elif t == "html_block":
+            if re.sub(r"<!--.*?-->", "", tok.content, flags=re.DOTALL).strip():
+                blocks.append(("other", tuple(items), ""))
+        i += 1
+    return blocks
+
+
+def _rework_field_values(
+    blocks: list[tuple[str, object, str]], field_re: re.Pattern[str]
+) -> list[tuple[str, list[str]]]:
+    """Every field line ``field_re`` matches in ``blocks``, as ``(name, values)``.
+
+    A field's value is the rest of its line, the following lines of the same
+    paragraph up to another ``Label:`` line, and the paragraphs nested under the
+    field: inside the same list item, or, for a top-level field whose own line is
+    empty, the list that directly follows it. A nested item may itself start with a
+    label; only another field of this kind ends the value. Prose in a later
+    paragraph is never a value.
+    """
+    out: list[tuple[str, list[str]]] = []
+    for bi, (kind, where, text) in enumerate(blocks):
+        if kind != "para":
+            continue
+        lines = text.split("\n")
+        for li, line in enumerate(lines):
+            m = field_re.match(line)
+            if not m:
+                continue
+            values = [m.group(m.lastindex).strip()] if m.group(m.lastindex).strip() else []
+            for nxt in lines[li + 1 :]:
+                if field_re.match(nxt) or _REWORK_OTHER_FIELD_RE.match(nxt):
+                    break
+                if nxt.strip():
+                    values.append(nxt.strip())
+            ends_paragraph = li == len(lines) - 1 or not any(
+                field_re.match(n) or _REWORK_OTHER_FIELD_RE.match(n) for n in lines[li + 1 :]
+            )
+            # A field inside a list item owns the list nested under it. A top-level
+            # field owns the list directly below it only when its own line is empty
+            # (`Replaces:` then `- #10`); `Replaces: #10` followed by an unrelated
+            # list (`- Closes #200`) must not absorb it.
+            if ends_paragraph and (where or not values):
+                for k2, w2, t2 in blocks[bi + 1 :]:
+                    if k2 != "para":
+                        if k2 == "heading" or not where:
+                            break
+                        continue
+                    nested = (
+                        len(w2) > len(where) and w2[: len(where)] == where
+                        if where
+                        else bool(w2)
+                    )
+                    if not nested:
+                        break
+                    # Only another field of this kind ends the value. A nested
+                    # item that starts with a label (`- Storage: SQLite, because`)
+                    # is the field's value, not a new field.
+                    if field_re.match(t2.split("\n", 1)[0]):
+                        break
+                    values.extend(v.strip() for v in t2.split("\n") if v.strip())
+            name = m.group(1) if m.lastindex and m.lastindex > 1 else ""
+            out.append((name, values))
+    return out
+
+
+def _rework_deadline_passed() -> bool:
+    """True when the shared merge deadline is armed and already spent."""
+    return _merge_deadline is not None and time.monotonic() >= _merge_deadline
+
+
+def _rework_unreadable(what: str) -> str:
+    """Reason text for a failed read, naming the deadline when that is the cause."""
+    if _rework_deadline_passed():
+        return f"{what} could not be read (the merge-gate deadline passed)"
+    return f"{what} could not be read"
+
+
+def _rework_repo(repo: str) -> str:
+    """``repo`` as an ``OWNER/REPO`` REST path segment: host and scheme dropped as
+    the merge arm drops them, and a trailing ``.git`` removed (gh accepts
+    ``https://github.com/o/r.git`` for ``-R``, but ``repos/o/r.git/...`` is a 404).
+    A value that does not normalize is returned unchanged; its reads then fail and
+    take the unreadable path."""
+    norm = _normalize_repo(repo)
+    if norm is None:
+        return repo
+    owner, _, name = norm.partition("/")
+    return f"{owner}/{name.removesuffix('.git')}"
+
+
+def _rework_declared_refs(body: str, pr_num: str, repo: str | None) -> set[int]:
+    """PR numbers this body declares it replaces; see ``_rework_declarations``."""
+    return _rework_declarations(body, pr_num, repo)[0]
+
+
+def _rework_declarations(
+    body: str, pr_num: str, repo: str | None
+) -> tuple[set[int], list[str]]:
+    """``(refs, problems)``: the PRs this body declares it replaces (signal a),
+    excluding itself, and why a declaration could not be resolved.
+
+    A ``Replaces:`` or ``Supersedes:`` FIELD line declares, anywhere in the body,
+    and so does the ``## Rework`` section's ``Replaces:`` value, including the
+    lines under it, read by the same traversal as the completeness check. Every
+    reference in a value counts, read from the body as it renders
+    (``_rework_blocks``). A URL counts only when it names THIS repository:
+    ``repo`` (normalized), or with ``repo`` unknown the repository gh resolves from the cwd (the
+    one a bare merge targets). Problems, each making the PR a declared rebuild that
+    cannot be verified (so it blocks): a URL whose repository cannot be resolved.
+    Raises ``_ReworkUnreadable`` when the body cannot be parsed.
+    """
+    me = int(pr_num) if str(pr_num).isdigit() else -1
+    refs: set[int] = set()
+    problems: list[str] = []
+    # `-R github.com/o/r` is a valid spelling of `o/r`; compare the normalized form,
+    # as the merge arm does. A repository that does not normalize cannot be checked.
+    norm = _rework_repo(repo) if repo else None
+    want: str | None = norm.lower() if norm and _normalize_repo(norm) else None
+    resolved = repo is not None
+    blocks = _rework_blocks(body)
+    values = [v for _n, vals in _rework_field_values(blocks, _REWORK_DECL_FIELD_RE) for v in vals]
+    fields = _rework_section_fields(body)
+    values.extend((fields or {}).get("Replaces", []))
+    for value in values:
+        for m in _REWORK_REF_RE.finditer(value):
+            if m.group(1):
+                n = int(m.group(1))
+            else:
+                if not resolved:
+                    derived = _derive_repo_from_cwd(os.getcwd())
+                    want = derived.lower() if derived else None
+                    resolved = True
+                if want is None:
+                    problems.append(
+                        "a declared PR URL could not be checked against this "
+                        "repository (the repository could not be resolved)"
+                    )
+                    continue
+                if m.group(2).lower() != want:
+                    continue
+                n = int(m.group(3))
+            if n != me:
+                refs.add(n)
+    return refs, problems
+
+
+def _rework_section_fields(body: str) -> dict[str, list[str]] | None:
+    """The `## Rework` section's fields and their values, or None with no section.
+
+    The section is the first level-2 heading whose text starts with `Rework` (never
+    the acknowledgement heading), up to the next heading of any level. Each field
+    maps to its values as ``_rework_field_values`` reads them, the same reading
+    the declaration reader uses. Raises ``_ReworkUnreadable`` when the body cannot
+    be parsed.
+    """
+    blocks = _rework_blocks(body)
+    start = next(
+        (
+            i
+            for i, (kind, where, text) in enumerate(blocks)
+            if kind == "heading" and where == 2 and _REWORK_HEADING_TEXT_RE.match(text.strip())
+        ),
+        None,
+    )
+    if start is None:
+        return None
+    end = next(
+        (j for j in range(start + 1, len(blocks)) if blocks[j][0] == "heading"), len(blocks)
+    )
+    fields: dict[str, list[str]] = {}
+    for name, values in _rework_field_values(blocks[start + 1 : end], _REWORK_FIELD_RE):
+        canon = next(
+            f for f in _REWORK_FIELDS if f.lower() == " ".join(name.split()).lower()
+        )
+        fields.setdefault(canon, []).extend(values)
+    return fields
+
+
+def _rework_section_problems(body: str) -> list[str]:
+    """What the body's `## Rework` section lacks; empty when it is complete."""
+    fields = _rework_section_fields(body)
+    if fields is None:
+        return ["the PR body has no `## Rework` heading"]
+    problems = []
+    for name in _REWORK_FIELDS:
+        if name not in fields:
+            problems.append(f"the `## Rework` section has no `{name}:` line")
+        elif not fields[name]:
+            problems.append(f"the `## Rework` section's `{name}:` line is empty")
+    return problems
+
+
+def _rework_sent_back(repo: str | None) -> tuple[dict[int, tuple[str, str]] | None, set[int], str]:
+    """``({number: (head, state)}, merged_numbers, "")`` for every sent-back PR.
+
+    One ``gh pr list --state all --label <l>`` per label in ``_REWORK_LABELS``,
+    merged. MERGED PRs are dropped from the map and returned separately, since a
+    merged PR is never sent back. ``(None, set(), reason)`` when either read fails
+    or saturates ``_REWORK_LIST_LIMIT`` (a truncated list cannot prove absence).
+
+    Test seam ``_TEST_GH_REWORK_SENT_BACK``: one JSON object per line,
+    ``{"number": N, "head": sha, "state": "OPEN"|"CLOSED"|"MERGED"}``, covering both
+    labels; the literal ``__error__`` is an unreadable read.
+    """
+    raw = os.environ.get("_TEST_GH_REWORK_SENT_BACK")
+    rows: list[dict] = []
+    if raw is not None:
+        if raw.strip() == "__error__":
+            return None, set(), _rework_unreadable("the sent-back PR list")
+        for line in raw.splitlines():
+            if line.strip():
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    return None, set(), "the sent-back PR list was malformed"
+    else:
+        for label in _REWORK_LABELS:
+            timeout = _gh_timeout(8)  # an expired deadline raises to the caller
+            try:
+                result = subprocess.run(
+                    [
+                        "gh", "pr", "list", *_repo_args(repo),
+                        "--state", "all", "--label", label,
+                        "--limit", str(_REWORK_LIST_LIMIT),
+                        "--json", "number,headRefOid,state",
+                        "--jq", ".[] | {number: .number, head: .headRefOid, state: .state}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except Exception:
+                return None, set(), _rework_unreadable(f"the `{label}` PR list")
+            if result.returncode != 0:
+                return None, set(), _rework_unreadable(f"the `{label}` PR list")
+            got = []
+            for line in result.stdout.splitlines():
+                if line.strip():
+                    try:
+                        got.append(json.loads(line))
+                    except Exception:
+                        return None, set(), f"the `{label}` PR list was malformed"
+            if len(got) >= _REWORK_LIST_LIMIT:
+                return None, set(), (
+                    f"the `{label}` PR list reached its {_REWORK_LIST_LIMIT}-row limit, "
+                    f"so it may be truncated"
+                )
+            rows.extend(got)
+    out: dict[int, tuple[str, str]] = {}
+    merged: set[int] = set()
+    for row in rows:
+        num = row.get("number") if isinstance(row, dict) else None
+        head = row.get("head") if isinstance(row, dict) else None
+        state = str(row.get("state") or "").upper() if isinstance(row, dict) else ""
+        if not isinstance(num, int) or not isinstance(head, str) or not state:
+            return None, set(), "the sent-back PR list was malformed"
+        if state == "MERGED":
+            merged.add(num)
+        else:
+            out[num] = (head.lower(), state)
+    # One PR can appear once per label, and a merge between the two reads gives
+    # CLOSED then MERGED. A merged PR is never sent back, whatever order it came in.
+    for num in merged:
+        out.pop(num, None)
+    return out, merged, ""
+
+
+def _rework_is_issue(num: int, repo: str | None) -> bool:
+    """True only when ``num`` is confirmed to be an issue in ``repo``.
+
+    A 404 on the PR endpoint also happens for a wrong repository spelling or a
+    number that does not exist, and reading either as "an issue" would turn a
+    declared reference into "not sent back". So the issue endpoint must answer
+    without a ``pull_request`` key; anything else (including a failed read) is
+    False, and the reference stays unverified.
+    """
+    timeout = _gh_timeout(8)
+    try:
+        got = subprocess.run(
+            [
+                "gh", "api", f"repos/{repo or ':owner/:repo'}/issues/{num}",
+                "--jq", 'has("pull_request")',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception:  # noqa: BLE001 — any failure leaves the reference unverified
+        return False
+    return got.returncode == 0 and got.stdout.strip() == "false"
+
+
+def _rework_timeline(num: int, repo: str | None) -> tuple[bool | None, str, str]:
+    """Was PR ``num`` ever sent back, by its issue timeline? ``(was, why, state)``.
+
+    ``was`` is None when a read failed (``why`` says which). ``state`` is the PR's
+    current state (``OPEN``/``CLOSED``), or "" when unknown. A number that is an
+    ISSUE, not a pull request, is never a sent-back PR: GitHub's timeline endpoint
+    serves both, so the PR endpoint is asked first and a 404 there means "issue".
+    True when a ``labeled`` event for a label in ``_REWORK_LABELS`` exists and the PR
+    was never merged. Labels can be removed; events stay.
+
+    Test seam ``_TEST_GH_REWORK_TIMELINE``: a JSON object mapping the PR number (as a
+    string) to a list of ``{"event": ..., "label": ...}`` rows (state unknown), an
+    object ``{"state": "OPEN"|"CLOSED", "events": [...]}``, ``"__issue__"`` (not a
+    pull request) or ``"__error__"``. A number the map does not name is unreadable,
+    so a test cannot pass on an unseeded read.
+    """
+    what = f"PR #{num}'s timeline"
+    raw = os.environ.get("_TEST_GH_REWORK_TIMELINE")
+    state = ""
+    if raw is not None:
+        try:
+            got = json.loads(raw).get(str(num))
+        except Exception:
+            got = None
+        if got == "__issue__":
+            return False, "", ""
+        if isinstance(got, dict) and isinstance(got.get("events"), list):
+            state = str(got.get("state") or "").upper()
+            got = got["events"]
+        if not isinstance(got, list):
+            return None, _rework_unreadable(what), ""
+        rows = got
+    else:
+        timeout = _gh_timeout(8)  # an expired deadline raises to the caller
+        try:
+            pr = subprocess.run(
+                [
+                    "gh", "api", f"repos/{repo or ':owner/:repo'}/pulls/{num}",
+                    "--jq", '.state + " " + (.merged_at // "")',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except Exception:
+            return None, _rework_unreadable(f"PR #{num}"), ""
+        if pr.returncode != 0:
+            if "HTTP 404" in (pr.stderr or "") and _rework_is_issue(num, repo):
+                return False, "", ""  # an issue, not a pull request
+            return None, _rework_unreadable(f"PR #{num}"), ""
+        parts = pr.stdout.split()
+        if not parts:
+            return None, f"PR #{num} was malformed", ""
+        if len(parts) > 1:
+            return False, "", "MERGED"  # merged_at is set: never sent back
+        state = parts[0].upper()
+        timeout = _gh_timeout(8)
+        try:
+            result = subprocess.run(
+                [
+                    "gh", "api", f"repos/{repo or ':owner/:repo'}/issues/{num}/timeline",
+                    "--paginate", "--jq",
+                    '.[] | select(.event=="labeled" or .event=="merged") '
+                    "| {event: .event, label: .label.name}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except Exception:
+            return None, _rework_unreadable(what), ""
+        if result.returncode != 0:
+            return None, _rework_unreadable(what), ""
+        rows = []
+        for line in result.stdout.splitlines():
+            if line.strip():
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    return None, f"{what} was malformed", ""
+    labeled = merged = False
+    for row in rows:
+        if not isinstance(row, dict):
+            return None, f"{what} was malformed", ""
+        if row.get("event") == "merged":
+            merged = True
+        elif row.get("event") == "labeled" and row.get("label") in _REWORK_LABELS:
+            labeled = True
+    return labeled and not merged, "", state
+
+
+def _rework_ack_comments(num: int, repo: str | None) -> tuple[list[dict] | None, str]:
+    """PR ``num``'s issue comments as ``{login, association, body, created}`` rows.
+
+    Modelled on ``_scheduled_review_rows`` but deliberately separate: that helper's
+    ``stamp`` is the LAST MODIFICATION, and an acknowledgement is judged by when it
+    was CREATED (an edited acknowledgement keeps its creation time).
+
+    Test seam ``_TEST_GH_REWORK_ACK``: a JSON object mapping the PR number (as a
+    string) to a list of rows or ``"__error__"``. A number the map does not name is
+    unreadable.
+    """
+    what = f"PR #{num}'s comments"
+    raw = os.environ.get("_TEST_GH_REWORK_ACK")
+    if raw is not None:
+        try:
+            got = json.loads(raw).get(str(num))
+        except Exception:
+            got = None
+        if not isinstance(got, list):
+            return None, _rework_unreadable(what)
+        rows = got
+    else:
+        timeout = _gh_timeout(8)  # an expired deadline raises to the caller
+        try:
+            result = subprocess.run(
+                [
+                    "gh", "api", f"repos/{repo or ':owner/:repo'}/issues/{num}/comments",
+                    "--paginate", "--jq",
+                    ".[] | {login: .user.login, association: .author_association, "
+                    "body: .body, created: .created_at}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except Exception:
+            return None, _rework_unreadable(what)
+        if result.returncode != 0:
+            return None, _rework_unreadable(what)
+        rows = []
+        for line in result.stdout.splitlines():
+            if line.strip():
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    return None, f"{what} were malformed"
+    if not all(isinstance(r, dict) for r in rows):
+        return None, f"{what} were malformed"
+    return rows, ""
+
+
+def _rework_ts(value: object) -> _dt.datetime | None:
+    """An ISO-8601 timestamp as an aware datetime, or None when it is not one."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        got = _dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return got if got.tzinfo is not None else None
+
+
+def _rework_heading_comment(body: str, heading: str) -> bool:
+    """True when the comment's first rendered block is the level-2 heading
+    ``heading`` (ATX or setext, whitespace-normalized, exact, never a prefix),
+    optionally preceded by a paragraph that is only ``(aside)``. AGENTS.md puts
+    ``(aside)`` on the first line of a comment on a Devin-built PR so the comment
+    does not start a paid Devin session. Raises ``_ReworkUnreadable`` when the
+    comment cannot be parsed.
+    """
+    blocks = _rework_blocks(body)
+    if blocks and blocks[0][0] == "para" and blocks[0][2].strip().lower() == "(aside)":
+        blocks = blocks[1:]
+    if not blocks:
+        return False
+    kind, where, text = blocks[0]
+    return kind == "heading" and where == 2 and " ".join(text.split()).lower() == heading
+
+
+def _rework_is_ack(body: str) -> bool:
+    """True when the comment opens with the "Rework acknowledgement" heading (see
+    ``_rework_heading_comment``). Never a prefix: "## Rework acknowledgement
+    needed" is an instruction, not an acknowledgement.
+    """
+    return _rework_heading_comment(body, _REWORK_ACK_HEADING.removeprefix("## "))
+
+
+def _rework_spec_problem(num: int, rows: list[dict]) -> str | None:
+    """Why PR ``num`` lacks a posted rework spec, or None when it has one.
+
+    AGENTS.md: a sent-back PR is rebuilt only from a maintainer comment headed
+    ``## Rework spec``; a ``needs-architecture-session`` PR without one has an
+    undecided design and must not be rebuilt. Only OWNER, MEMBER or COLLABORATOR
+    count: a builder bot can rework a shape but cannot decide one.
+    """
+    for r in rows:
+        if (
+            isinstance(r.get("body"), str)
+            and r.get("association") in _MAINTAINER_ASSOCIATIONS
+            and _rework_heading_comment(r["body"], "rework spec")
+        ):
+            return None
+    return (
+        f"PR #{num} has no maintainer `## Rework spec` comment: a sent-back PR is "
+        f"rebuilt only from a posted spec (for needs-architecture-session, the "
+        f"owner's decision)"
+    )
+
+
+def _rework_ack_problem(num: int, rows: list[dict], created: _dt.datetime) -> str | None:
+    """Why PR ``num`` lacks a valid acknowledgement, or None when it has one."""
+    candidates = [
+        r for r in rows
+        if isinstance(r.get("body"), str) and _rework_is_ack(r["body"])
+    ]
+    if not candidates:
+        return f"PR #{num} has no `## Rework acknowledgement` comment"
+    bots = _rework_ack_bot_logins()
+    authorised = [
+        r for r in candidates
+        if r.get("association") in _MAINTAINER_ASSOCIATIONS or r.get("login") in bots
+    ]
+    if not authorised:
+        return (
+            f"PR #{num}'s `## Rework acknowledgement` comment is not from a maintainer "
+            f"(OWNER, MEMBER or COLLABORATOR) or an allowlisted bot"
+        )
+    for r in authorised:
+        ts = _rework_ts(r.get("created"))
+        if ts is not None and ts <= created:
+            return None
+    return (
+        f"PR #{num}'s `## Rework acknowledgement` was created after this PR was "
+        f"opened; the builder acknowledges the spec on the old PR BEFORE opening "
+        f"the new one"
+    )
+
+
+def _check_rework(
+    pr_num: str,
+    repo: str | None = None,
+    *,
+    head: str | None = None,
+    force: bool = False,
+) -> tuple[str, str]:
+    """Does a REBUILD of a sent-back PR carry its rework contract? (owner decision)
+
+    A PR is a rebuild when (a) a ``Replaces:`` or ``Supersedes:`` FIELD line in its
+    body names a PR that was sent back (labelled ``needs-rework`` or
+    ``needs-architecture-session`` now, or — for a PR the body names — at any time
+    per its timeline; a referenced ISSUE never counts), or (b) its commits include
+    the head of a sent-back PR. Prose is never read as a declaration (owner ruling
+    2026-10-05). This PR never counts against itself, so a PR that is itself sent
+    back is not its own rebuild. A MERGED PR is never sent back.
+
+    A rebuild must carry (1) a ``## Rework`` section with non-empty ``Replaces:``,
+    ``Split:``, ``Deviations:`` and ``Questions answered:`` lines, and (2) on EACH
+    replaced PR a ``## Rework acknowledgement`` comment from a maintainer (or an
+    allowlisted bot) CREATED no later than this PR. A replaced PR still OPEN gets a
+    NOTE: its builder closes it when the last replacement opens.
+
+    Signal (c) — a maintainer's closing comment on a CLOSED sent-back PR linking
+    this one — is NOT implemented: discovering it costs a comment read for every
+    closed sent-back PR on every merge (a set that only grows), and restricted to
+    the PRs the body already declares it adds nothing signal (a) did not find.
+
+    Returns ``(state, message)``; state is one of the four ``REWORK_*`` constants.
+    Line 0 summarises; lines 1+ are the detail. The gate checks FORM only.
+
+    GUARD AXIOMS:
+      * VERDICT: **block** on BLOCK only (owner decision), with the logged override
+        ``# rework-override`` (``force=True`` passes).
+      * FAIL DIRECTION: not a rebuild → ``n/a``. A rebuild whose requirements cannot
+        be verified (a read failed, was truncated, or the merge deadline passed)
+        BLOCKS with "could not verify". When nothing is declared and the reads that
+        decide rebuild-ness fail, the state is ``could-not-check``: advisory, never
+        a block. The merge deadline's RuntimeError never propagates.
+      * AUDIENCE: the agent driving the merge; the detail names each missing item.
+      * BACKGROUND: background sessions cannot merge; the gate adds no ask.
+    """
+    if force:
+        return REWORK_OK, "waived by # rework-override (logged)"
+    # `-R github.com/o/r` is a valid gh spelling of `o/r`, but not a REST path:
+    # normalize once, before any endpoint is built, as the merge arm does.
+    if repo:
+        repo = _rework_repo(repo)
+    ctx: dict[str, object] = {"declared": False, "reading": "the PR body"}
+    try:
+        return _check_rework_inner(pr_num, repo, head, ctx)
+    except Exception as exc:  # noqa: BLE001 — the deadline error must never propagate.
+        what = str(ctx["reading"])
+        if _rework_deadline_passed() or "deadline" in str(exc):
+            reason = f"the merge-gate deadline passed while reading {what}"
+        else:
+            reason = f"reading {what} raised {type(exc).__name__}"
+        if ctx["declared"]:
+            return REWORK_BLOCK, f"could not verify — {reason}"
+        return REWORK_UNCHECKED, reason
+
+
+def _check_rework_inner(
+    pr_num: str, repo: str | None, head: str | None, ctx: dict[str, object]
+) -> tuple[str, str]:
+    body = _pr_body_text(pr_num, repo)
+    body_why = _rework_unreadable("the PR body")
+    me = int(pr_num) if str(pr_num).isdigit() else -1
+    refs: set[int] = set()
+    decl_problems: list[str] = []
+    if body is not None:
+        try:
+            refs, decl_problems = _rework_declarations(body, pr_num, repo)
+        except _ReworkUnreadable as exc:
+            # Unparseable is unreadable: whether it declares is unknown, so it takes
+            # the unreadable-body path (advisory unless containment finds a rebuild).
+            body, body_why = None, f"the PR body could not be read ({exc})"
+    ctx["declared"] = bool(refs) or bool(decl_problems)
+    if decl_problems:
+        # A declaration we cannot resolve: fail closed (declared => BLOCK).
+        return REWORK_BLOCK, "could not verify — " + "; ".join(dict.fromkeys(decl_problems))
+
+    ctx["reading"] = "the sent-back PR list"
+    sent_back, merged, list_why = _rework_sent_back(repo)
+
+    # Signal (a): declared references that are sent-back PRs.
+    replaced: set[int] = set()
+    unverified: list[str] = []
+    #: Current state of each replaced PR, for the advisory open-PR note. The
+    #: sent-back list carries it; a PR classified through its timeline (its label
+    #: since removed) carries it from the PR read.
+    states: dict[int, str] = {}
+    if sent_back is not None:
+        states.update({n: st for n, (_h, st) in sent_back.items()})
+    if len(refs) > _REWORK_MAX_DECLARED:
+        return REWORK_BLOCK, (
+            f"could not verify — the body declares {len(refs)} replaced PRs; at most "
+            f"{_REWORK_MAX_DECLARED} are checked (owner override for more)"
+        )
+    for ref in sorted(refs):
+        if sent_back is not None and ref in sent_back:
+            replaced.add(ref)
+            continue
+        if ref in merged:
+            continue  # merged: never sent back
+        ctx["reading"] = f"PR #{ref}'s timeline"
+        was, why, state = _rework_timeline(ref, repo)
+        if was is None:
+            unverified.append(why)
+            break  # the verdict is already a block; read nothing more
+        elif was:
+            replaced.add(ref)
+            states[ref] = state
+    if unverified:
+        # A declaration we cannot resolve: fail closed (declared ⇒ BLOCK).
+        return REWORK_BLOCK, "could not verify — " + "; ".join(unverified)
+
+    # Signal (b): this PR's commits include a sent-back PR's head.
+    containment_why = ""
+    if sent_back is None:
+        containment_why = list_why
+    else:
+        others = {n: h for n, (h, _s) in sent_back.items() if n != me}
+        if others:
+            ctx["reading"] = "this PR's commit list"
+            commits, why = _pr_commit_list(pr_num, repo)
+            if commits is None:
+                containment_why = (
+                    f"{why} (the merge-gate deadline passed)"
+                    if _rework_deadline_passed() and "deadline" not in why
+                    else why
+                )
+            else:
+                shas = {sha.lower() for sha, _p in commits}
+                # A sent-back head in the list proves a rebuild whatever head the
+                # list was read at; a lagging list only means the set may be short.
+                replaced |= {n for n, h in others.items() if h in shas}
+                if head and head.strip().lower() not in shas:
+                    containment_why = (
+                        "this PR's commit list does not include the verified head "
+                        f"{head.strip().lower()[:12]}, so it was read at another head"
+                    )
+
+    if not replaced:
+        if body is None:
+            return REWORK_UNCHECKED, body_why
+        if containment_why:
+            return REWORK_UNCHECKED, containment_why
+        return REWORK_NA, "not a rebuild of a sent-back PR"
+
+    # A rebuild. Every requirement must be verifiable; a failed read BLOCKS, and so
+    # does any exception from here on (the wrapper reads this flag), however the
+    # rebuild was found: containment alone declares nothing.
+    ctx["declared"] = True
+    names = ", ".join(f"#{n}" for n in sorted(replaced))
+    problems: list[str] = []
+    if containment_why:
+        problems.append(
+            f"could not verify the full set of replaced PRs — {containment_why}"
+        )
+    if body is None:
+        problems.append("could not verify — " + body_why)
+    else:
+        problems.extend(_rework_section_problems(body))
+    ctx["reading"] = "this PR's creation time"
+    created = _rework_ts(_pr_created_at(pr_num, repo))
+    for num in sorted(replaced):
+        ctx["reading"] = f"PR #{num}'s comments"
+        rows, why = _rework_ack_comments(num, repo)
+        if rows is None:
+            problems.append("could not verify — " + why)
+        elif created is None:
+            problems.append(
+                "could not verify — " + _rework_unreadable("this PR's creation time")
+            )
+        else:
+            for problem in (
+                _rework_spec_problem(num, rows),
+                _rework_ack_problem(num, rows, created),
+            ):
+                if problem:
+                    problems.append(problem)
+    notes = [
+        f"NOTE: PR #{n} is still open; its builder closes it when the last "
+        f"replacement opens (advisory)."
+        for n in sorted(replaced)
+        if states.get(n) == "OPEN"
+    ]
+    if problems:
+        # One problem line per item; the creation-time failure repeats per PR, so
+        # keep each distinct line once, in order.
+        seen: list[str] = []
+        for p in problems:
+            if p not in seen:
+                seen.append(p)
+        lines = [
+            f"rebuild of sent-back PR(s) {names} — rework contract unmet "
+            f"({len(seen)} item(s)):",
+            *[f"  - {p}" for p in seen],
+            # Three short lines: the report bounds each detail line, and one long
+            # remedy line lost its middle there.
+            "Remedy: each old PR carries a maintainer's `## Rework spec`, and the",
+            "builder's `## Rework acknowledgement` posted before the rebuild opened;",
+            "the rebuild's body carries `## Rework` with Replaces:, Split:,",
+            "Kept / deleted / reshaped as the spec asked:, Deviations: and",
+            "Questions answered: lines.",
+            "An acknowledgement posted AFTER this PR opened can never satisfy it:",
+            "open a fresh PR after posting it, or override with the owner's yes.",
+            "Overriding takes the owner's yes: `# rework-override` (logged).",
+            *notes,
+        ]
+        return REWORK_BLOCK, "\n".join(lines)
+    return REWORK_OK, "\n".join(
+        [f"rebuild of {names}; acknowledgement and `## Rework` section present", *notes]
+    )
 
 
 def _check_base_is_default(
@@ -12360,6 +13278,7 @@ def main() -> int:
     """
     global _ASK_EMITTED
     _PENDING_OVERRIDES.clear()  # a second call in-process must not inherit rows
+    _MERGE_READ_CACHE.clear()  # nor reads cached during another invocation
     _ASK_EMITTED = False
     outcome = "error"
     try:
@@ -13191,6 +14110,9 @@ def _run_merge_and_push_gates() -> int:
                 # current, or with `# stale-review-override` beside it, the row keeps
                 # plain `codex-freshness`.
                 substitute_review = has_trailing_override(merge_seg.raw, "substitute-review")
+                # The rework-contract waiver (owner's yes required): passes a rebuild
+                # of a sent-back PR that lacks its acknowledgement or `## Rework`.
+                rework_override = has_trailing_override(merge_seg.raw, "rework-override")
                 # The FINDINGS waiver, read off the parsed segment rather than via
                 # has_trailing_override — which is why enumerating that helper's
                 # call sites missed the one sigil SKILL.md documents as logged.
@@ -13205,6 +14127,7 @@ def _run_merge_and_push_gates() -> int:
                         substitute_review,
                         "codex-freshness",
                     ),
+                    ("rework-override", rework_override, "rework-contract"),
                 ):
                     if _present:
                         # `repo` is BLANK on one path, deliberately: a legacy
@@ -13714,7 +14637,8 @@ def _run_merge_and_push_gates() -> int:
 
                 # Scheduled Claude review at HEAD — its OWN fail-closed gate with its OWN
                 # sigil (# scheduled-review-override waives ONLY this gate; independent of
-                # # stale-review-override). Placed LAST, but ordering is no longer
+                # # stale-review-override). Placed after the finding scanners (only the
+                # `rework` gate follows it), but ordering is no longer
                 # safety-critical: the review-body + inline scanners now ALSO fail CLOSED
                 # on a clipped budget (PR #1434 removed their fail-open), so a drained
                 # merge-gate deadline BLOCKS at whichever gate hits its 1s floor first —
@@ -13750,6 +14674,29 @@ def _run_merge_and_push_gates() -> int:
                     print(_defang_gate_text(sched_msg), file=sys.stderr)
                     return 2
 
+                # Rework contract (owner decision): a rebuild of a sent-back PR needs
+                # the builder's acknowledgement on the old PR and a `## Rework`
+                # section. Same function and head as the `rework` report row, so the
+                # two agree. Waived ONLY by # rework-override (noted above). Never
+                # raises: the shared-deadline error is mapped inside the check.
+                rw_state, rw_msg = _check_rework(
+                    pr_num, merge_repo, head=verified_head, force=rework_override
+                )
+                if rw_state == REWORK_BLOCK:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — rework contract unmet.",
+                        file=sys.stderr,
+                    )
+                    print(_defang_gate_text(rw_msg), file=sys.stderr)
+                    return 2
+                if rw_state == REWORK_UNCHECKED:
+                    print(
+                        f"NOTE: rework gate could not check PR #{pr_num} — "
+                        f"{_defang_gate_text(rw_msg)} (advisory; not blocking).",
+                        file=sys.stderr,
+                    )
+                elif rw_state == REWORK_OK and "NOTE:" in rw_msg:
+                    print(_defang_gate_text(rw_msg), file=sys.stderr)
                 # Last, just before this arm allows: the body file once more.
                 if body_file is not None and body_expected:
                     late_msg = _recheck_squash_body_file(body_file, body_expected[0])
@@ -14385,6 +15332,21 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     else:
         print(f"main-reverts   : could not check — {mr_head}")
     _print_gate_detail(mr_msg)
+    # Rework contract (owner decision) — BLOCKING, in the pin-receipts pattern: the
+    # merge arm runs the SAME function with the same verified head, so the two agree.
+    # `_check_rework` never raises (its deadline/exception mapping is internal).
+    rw_state, rw_msg = _check_rework(pr_num, repo=repo, head=verified_head)
+    rw_head = rw_msg.splitlines()[0] if rw_msg else ""
+    if rw_state == REWORK_BLOCK:
+        print(f"rework         : BLOCK — {rw_head}")
+    elif rw_state == REWORK_OK:
+        print(f"rework         : ok ({rw_head})")
+    elif rw_state == REWORK_NA:
+        print(f"rework         : n/a ({rw_head})")
+    else:
+        print(f"rework         : could not check — {rw_head}")
+    _print_gate_detail(rw_msg)
+    failures += 1 if rw_state == REWORK_BLOCK else 0
     # Emit the actionable merge command ONLY when EVERY gate passed — printing it earlier
     # (right after codex-at-head) suggested a mergeable PR even when the scheduled or finding
     # gate below would block. Bound to the Codex-verified head (the TOCTOU pin).
