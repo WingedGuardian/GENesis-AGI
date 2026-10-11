@@ -151,6 +151,10 @@ step_gitleaks_history() {
   # otherwise reaches gitleaks only as "Binary files ... differ" (MEASURED,
   # gitleaks 8.22.1: a token in a -diff file is missed without it, found with it).
   "$gl" git --redact -c .gitleaks.toml --log-opts="--text --remerge-diff $range" .
+  # --remerge-diff skips an octopus merge, so each one is read again against its
+  # first parent (see _OCTOPUS_ARGS in leak_scan_added_lines.py).
+  "$gl" git --redact -c .gitleaks.toml \
+    --log-opts="--text --diff-merges=first-parent --min-parents=3 $range" .
   # Commit messages are published with the branch too, and gitleaks' git mode
   # reads patches only, so each in-range message is written to a file and
   # scanned with the same rules.
@@ -230,14 +234,15 @@ step_email() {
   if [[ "${LEAK_SCAN_RANGE-}" == "branch" ]]; then
     # A branch push publishes its whole history, so an address added and then
     # removed before the push is still public. Read every line the branch's
-    # commits added, in the same paths the tip scan covers.
+    # commits added, in the same paths the tip scan covers, and every commit
+    # message (COMMIT_MESSAGE:<commit> rows), which is published the same way.
     if ! hist_lines="$(python3 scripts/ci/leak_scan_added_lines.py --with-paths)"; then
       echo "::error::email history scan: the branch range could not be read. Failing closed."
       exit 3
     fi
     hist_hits=$(
       printf '%s\n' "$hist_lines" | \
-        grep -E '^(src|config|scripts|\.github)/' | \
+        grep -E '^((src|config|scripts|\.github)/|COMMIT_MESSAGE:)' | \
         grep -vE '^([^:]*/)?(tests|vendor)/|^([^:]*/)?readme-legacy\.md:' | \
         grep -E "$EMAIL_RE" | _email_allowlist || true
     )
@@ -279,7 +284,7 @@ step_binary() {
     # the branch range added; a merge counts through its conflict resolution,
     # as in the other history scans, and renames are split into delete + add
     # so a renamed-in artifact is seen too.
-    local range hist
+    local range hist octo
     if ! range="$(python3 scripts/ci/leak_scan_added_lines.py --range)" || [[ -z "$range" ]]; then
       echo "::error::binary history scan: the branch range could not be read. Failing closed."
       exit 3
@@ -289,6 +294,14 @@ step_binary() {
       echo "::error::binary history scan: git log failed over $range. Failing closed."
       exit 3
     fi
+    # --remerge-diff skips an octopus merge; read each against its first parent.
+    if ! octo="$(git log --diff-merges=first-parent --min-parents=3 --no-renames \
+                 --diff-filter=A --name-only --format= \
+                 "$range" -- "${data_globs[@]}" "${data_allow[@]}")"; then
+      echo "::error::binary history scan: git log failed over $range. Failing closed."
+      exit 3
+    fi
+    hist="$(printf '%s\n%s\n' "$hist" "$octo")"
     hits="$(printf '%s\n%s\n' "$hits" "$hist" | grep -v '^$' | sort -u || true)"
   fi
   if [[ -n "$hits" ]]; then

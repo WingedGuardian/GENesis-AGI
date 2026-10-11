@@ -177,9 +177,11 @@ def test_script_keeps_pins_checksum_and_redact():
     assert re.search(
         r'"\$gl" detect --no-git --redact -c \.gitleaks\.toml --source "\$msg_dir"', text
     )
+    # An octopus merge, which --remerge-diff skips, is read against its first parent.
+    assert "--diff-merges=first-parent --min-parents=3 $range" in text
     # Every gitleaks invocation redacts: these logs are public.
     calls = re.findall(r'"\$gl" (?:detect|git) [^\n]*', text)
-    assert len(calls) == 3 and all("--redact" in c for c in calls)
+    assert len(calls) == 4 and all("--redact" in c for c in calls)
     assert text.startswith("#!/usr/bin/env bash")
     assert "set -euo pipefail" in text
 
@@ -430,6 +432,19 @@ def test_detect_secrets_history_reads_commit_messages(tmp_path: Path):
     assert cp.returncode == 1, cp.stdout + cp.stderr
     assert re.search(r"[0-9a-f]{12}/COMMIT_MESSAGE", cp.stdout)
     assert _HEX_VALUE not in cp.stdout + cp.stderr
+
+
+def test_email_history_reads_commit_messages(tmp_path: Path):
+    """An address only in a commit message is published with the branch; the
+    email history names COMMIT_MESSAGE and the commit, never the address."""
+    root = _clean_history_repo(tmp_path)
+    _commit_on_feature(root, {"src/ok.py": "X = 1\n"}, "fix\n\ncontact someone@personal-domain.org")
+    tip_only = _run_step(root, "email", branch=False)
+    assert tip_only.returncode == 0, tip_only.stdout + tip_only.stderr
+    cp = _run_step(root, "email", branch=True)
+    assert cp.returncode == 1, cp.stdout + cp.stderr
+    assert re.search(r"^COMMIT_MESSAGE:[0-9a-f]{12}$", cp.stdout, re.M)
+    assert "personal-domain" not in cp.stdout + cp.stderr
 
 
 def test_history_steps_fail_closed_without_a_range(tmp_path: Path):

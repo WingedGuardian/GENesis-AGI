@@ -181,6 +181,26 @@ _PATCH_ARGS = {
     "show": ["show", "--text", "--remerge-diff", "--format=commit %H"],
 }
 
+#: --remerge-diff handles two-parent merges only and SKIPS an octopus merge
+#: (git 2.43 warns "Skipping remerge-diff for octopus merges"), so a value an
+#: octopus merge itself added would go unread (MEASURED: 0 hits). This second
+#: pass reads each octopus merge against its first parent (MEASURED: 1 hit). It
+#: over-reads what the other parents brought in, which can only add findings.
+_OCTOPUS_ARGS = [
+    "log",
+    "-p",
+    "--text",
+    "--diff-merges=first-parent",
+    "--min-parents=3",
+    "--format=commit %H",
+]
+
+
+def _octopus_rev(spec: tuple[str, str]) -> str:
+    """The revision expression the octopus pass reads for a scan spec."""
+    kind, value = spec
+    return value if kind == "range" else f"{value}^!"
+
 
 def _patch_stream(spec: tuple[str, str], cwd: str | None):
     """Yield the raw patch lines (bytes, LF stripped) for a scan spec.
@@ -188,26 +208,25 @@ def _patch_stream(spec: tuple[str, str], cwd: str | None):
     Raises :class:`RangeError` when git fails.
     """
     kind, value = spec
-    proc = subprocess.Popen(
+    for argv in (
         ["git", *_PATCH_ARGS[kind], value],
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    stdout = proc.stdout
-    if stdout is None:  # pragma: no cover - PIPE always yields a stream
-        proc.wait()
-        raise RangeError(f"git {kind} {value!r} produced no stdout stream")
-    try:
-        # Binary iteration splits on b"\n" ONLY (git's delimiter) — it does not
-        # break on U+0085/U+2028 the way str.splitlines() would.
-        for raw in stdout:
-            yield raw.rstrip(b"\n")
-    finally:
-        stdout.close()
-        rc = proc.wait()
-    if rc != 0:
-        raise RangeError(f"git {kind} {value!r} failed (rc={rc})")
+        ["git", *_OCTOPUS_ARGS, _octopus_rev(spec)],
+    ):
+        proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        stdout = proc.stdout
+        if stdout is None:  # pragma: no cover - PIPE always yields a stream
+            proc.wait()
+            raise RangeError(f"git {kind} {value!r} produced no stdout stream")
+        try:
+            # Binary iteration splits on b"\n" ONLY (git's delimiter) — it does not
+            # break on U+0085/U+2028 the way str.splitlines() would.
+            for raw in stdout:
+                yield raw.rstrip(b"\n")
+        finally:
+            stdout.close()
+            rc = proc.wait()
+        if rc != 0:
+            raise RangeError(f"git {kind} {value!r} failed (rc={rc})")
 
 
 def _path_from_header(raw: bytes) -> str:
@@ -249,12 +268,17 @@ def _added_rows(spec: tuple[str, str], cwd: str | None = None):
 
 
 def added_lines_with_paths(spec: tuple[str, str], cwd: str | None = None) -> list[str]:
-    """Each added line in the range as ``<path>:<commit12>:<content>``.
+    """Each added line in the range as ``<path>:<commit12>:<content>``, then each
+    commit-message line as ``COMMIT_MESSAGE:<commit12>:<line>``.
 
     For the history half of the email scan, which scopes by path and reports
-    ``path:commit`` locations.
+    ``path:commit`` locations. A message is published with the branch, so an
+    address in one is as public as one in a file.
     """
-    return [f"{path}:{commit}:{content}" for path, commit, content in _added_rows(spec, cwd)]
+    rows = [f"{path}:{commit}:{content}" for path, commit, content in _added_rows(spec, cwd)]
+    for commit, body in _message_pairs(spec, cwd):
+        rows.extend(f"{MESSAGE_FILE}:{commit}:{line}" for line in body.splitlines())
+    return rows
 
 
 #: The tree the tip detect-secrets scan covers; the history half uses the same.
@@ -271,19 +295,21 @@ def materialize(spec: tuple[str, str], dest: str, cwd: str | None = None) -> int
     refused. Returns the number of files written.
     """
     root = os.path.realpath(dest)
-    files: dict[str, list[str]] = {}
+    written: set[str] = set()
+    # Each row is appended as it streams, so memory stays bounded by one line,
+    # not by every line the range ever added (a large blob read with --text).
     for path, commit, content in _added_rows(spec, cwd):
         if not path.startswith(DETECT_SECRETS_ROOTS):
             continue
         target = os.path.realpath(os.path.join(root, commit, path))
         if not target.startswith(root + os.sep):
             raise RangeError(f"added path escapes the scan directory: {path!r}")
-        files.setdefault(target, []).append(content)
-    for target, lines in files.items():
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(lines) + "\n")
-    return len(files) + materialize_messages(spec, dest, cwd)
+        if target not in written:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            written.add(target)
+        with open(target, "a", encoding="utf-8") as fh:
+            fh.write(content + "\n")
+    return len(written) + materialize_messages(spec, dest, cwd)
 
 
 #: Per-commit message stream: NUL, hash, NUL, message, for each commit.
@@ -303,6 +329,19 @@ def materialize_messages(spec: tuple[str, str], dest: str, cwd: str | None = Non
     read it as a file beside that commit's added lines. Raises
     :class:`RangeError` on git failure. Returns the number of files written.
     """
+    root = os.path.realpath(dest)
+    written = 0
+    for commit, body in _message_pairs(spec, cwd):
+        folder = os.path.join(root, commit)
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, MESSAGE_FILE), "w", encoding="utf-8") as fh:
+            fh.write(body)
+        written += 1
+    return written
+
+
+def _message_pairs(spec: tuple[str, str], cwd: str | None = None) -> list[tuple[str, str]]:
+    """``(commit12, message)`` for every commit in the spec. Raises :class:`RangeError`."""
     kind, value = spec
     proc = subprocess.run(
         ["git", *_MESSAGE_PAIR_ARGS[kind], value], cwd=cwd, capture_output=True, check=False
@@ -310,15 +349,10 @@ def materialize_messages(spec: tuple[str, str], dest: str, cwd: str | None = Non
     if proc.returncode != 0:
         raise RangeError(f"git {kind} {value!r} messages failed (rc={proc.returncode})")
     parts = proc.stdout.split(b"\x00")[1:]
-    root = os.path.realpath(dest)
-    written = 0
-    for sha, body in zip(parts[0::2], parts[1::2], strict=False):
-        folder = os.path.join(root, sha.decode("ascii", errors="replace")[:12])
-        os.makedirs(folder, exist_ok=True)
-        with open(os.path.join(folder, MESSAGE_FILE), "w", encoding="utf-8") as fh:
-            fh.write(body.decode("utf-8", errors="replace"))
-        written += 1
-    return written
+    return [
+        (sha.decode("ascii", errors="replace")[:12], body.decode("utf-8", errors="replace"))
+        for sha, body in zip(parts[0::2], parts[1::2], strict=False)
+    ]
 
 
 def added_lines(spec: tuple[str, str], cwd: str | None = None) -> str:

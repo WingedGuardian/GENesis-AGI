@@ -548,6 +548,36 @@ def test_added_lines_read_a_diff_suppressed_file_as_text(tmp_path: Path):
     assert "DIFFHIDDEN_VALUE_42" in lsa.added_lines(spec, cwd=repo)
 
 
+def test_a_value_an_octopus_merge_added_is_read(tmp_path: Path):
+    """--remerge-diff skips octopus merges (git 2.43), so a value the merge
+    itself added would be unread; the first-parent pass reads it."""
+    r = _branch_repo(tmp_path)
+    repo = Path(r["repo"])
+    tip = _git(repo, "rev-parse", "HEAD")
+    for name in ("o1", "o2"):
+        _git(repo, "checkout", "-q", "-b", name, tip)
+        _commit(repo, f"{name}.txt", f"{name}\n", name)
+    _git(repo, "checkout", "-q", "feature")
+    _git(repo, "merge", "-q", "--no-ff", "--no-commit", "o1", "o2")
+    (repo / "octo.txt").write_text("OCTOPUSVALUE_9\n", encoding="utf-8")
+    _git(repo, "add", "octo.txt")
+    _git(repo, "commit", "-q", "-m", "octopus")
+    assert len(_git(repo, "rev-list", "--parents", "-1", "HEAD").split()) == 4  # three parents
+    _git(repo, "rm", "-q", "octo.txt")
+    _git(repo, "commit", "-q", "-m", "rm")
+    spec = lsa.resolve_scan_spec("push", "0" * 40, "HEAD", cwd=repo, branch_push=True)
+    assert "OCTOPUSVALUE_9" in lsa.added_lines(spec, cwd=repo)
+
+
+def test_with_paths_carries_commit_message_lines(tmp_path: Path):
+    r = _branch_repo(tmp_path)
+    repo = Path(r["repo"])
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "E5", "-m", "note MSGLINE_4")
+    spec = lsa.resolve_scan_spec("push", "0" * 40, "HEAD", cwd=repo, branch_push=True)
+    rows = lsa.added_lines_with_paths(spec, cwd=repo)
+    assert any(row.startswith(f"{lsa.MESSAGE_FILE}:") and "MSGLINE_4" in row for row in rows)
+
+
 def test_materialize_messages_writes_one_file_per_commit(tmp_path: Path):
     r = _branch_repo(tmp_path)
     repo = Path(r["repo"])
