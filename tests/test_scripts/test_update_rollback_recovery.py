@@ -51,8 +51,8 @@ def test_rollback_restores_db_only_when_migrated(text: str) -> None:
     assert "migrations ran but no current DB snapshot exists" in rb, (
         "migrated-but-no-snapshot must be a LOUD rollback failure, not a silent success"
     )
-    assert 'cp "$DB_FILE.pre-update" "$DB_FILE"' in rb, (
-        "restore copies the pre-update snapshot back"
+    assert 'cp "$DB_FILE.pre-update.peer-restore" "$DB_FILE"' in rb, (
+        "restore copies the authority-reset pre-update candidate back"
     )
     # The snapshot flag is set ONLY on a successful `.backup` this run.
     snap = text[text.find("--- Snapshotting database ---") : text.find("_do_rollback() {")]
@@ -60,6 +60,8 @@ def test_rollback_restores_db_only_when_migrated(text: str) -> None:
     assert snap.index("DB_SNAPSHOT_TAKEN=1") > snap.index('".backup'), (
         "flag set AFTER the .backup succeeds, inside the success branch"
     )
+    assert snap.index("DB_SNAPSHOT_TAKEN=1") > snap.index("-m genesis.db.crud.peer_restore")
+    assert 'if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then' in rb
     assert 'rm -f "$DB_FILE-wal" "$DB_FILE-shm"' in rb, (
         "restore MUST clear the stale WAL/SHM or SQLite replays the migrated changes"
     )

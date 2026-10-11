@@ -207,3 +207,119 @@ async def test_live_mode_promotes_a_propose_only_row(empty_db, monkeypatch):
     assert open_rows[0]["priority"] == "critical", (
         "the propose_only row was not promoted — the Telegram would never send"
     )
+
+
+async def _seed_high_notify(db, provider):
+    import hashlib
+    import json
+
+    notify_hash = hashlib.sha256(f"provider_dead_notify:{provider}".encode()).hexdigest()
+    await db.execute(
+        "INSERT INTO observations "
+        "(id, source, type, content, priority, resolved, content_hash, created_at) "
+        "VALUES (?, 'routing', 'provider_failure', ?, 'high', 0, ?, datetime('now'))",
+        (f"n-{provider}", json.dumps({"provider": provider, "outage_started_at": "x"}),
+         notify_hash),
+    )
+    await db.commit()
+
+
+async def _resolved(db, provider):
+    cur = await db.execute(
+        "SELECT resolved FROM observations WHERE id = ?", (f"n-{provider}",)
+    )
+    return (await cur.fetchone())["resolved"] == 1
+
+
+@pytest.mark.asyncio
+async def test_promotion_leaves_a_covered_providers_high_row_alone(empty_db):
+    """A covered outage is written high ON PURPOSE. Resolving it each tick would
+    only have the sweep re-create it at high: churn, and nothing delivered."""
+    await _seed_high_notify(empty_db, "covered")
+    await _seed_high_notify(empty_db, "uncovered")
+    cov = {"covered": [], "uncovered": ["9_fact_extraction"]}
+    await loop._promote_demoted_provider_notify(empty_db, coverage_for=cov.get)
+    assert not await _resolved(empty_db, "covered")
+    assert await _resolved(empty_db, "uncovered"), "lost coverage must promote"
+
+
+@pytest.mark.asyncio
+async def test_promotion_without_coverage_promotes_every_high_row(empty_db):
+    await _seed_high_notify(empty_db, "p")
+    await loop._promote_demoted_provider_notify(empty_db)
+    assert await _resolved(empty_db, "p")
+
+
+@pytest.mark.asyncio
+async def test_live_mode_passes_registry_coverage_to_the_sweep(monkeypatch):
+    from types import SimpleNamespace
+
+    sweep = AsyncMock(return_value=0)
+    promote = AsyncMock()
+    monkeypatch.setattr("genesis.routing.escalation.sweep_due_notifications", sweep)
+    monkeypatch.setattr(loop, "_promote_demoted_provider_notify", promote)
+    monkeypatch.setattr(
+        "genesis.awareness.provider_notify_config.effective_mode", lambda: "live"
+    )
+    reg = SimpleNamespace(
+        current_incident_identity=lambda p: None,
+        incident_owner=lambda p, i: p,
+        get=lambda n: None,
+        uncovered_essential_sites_for=lambda p: ["x"],
+    )
+    runtime = SimpleNamespace(_circuit_breakers=reg)
+    monkeypatch.setattr("genesis.runtime.GenesisRuntime.instance", lambda: runtime)
+    await loop._check_provider_outage_notify(object())
+    assert sweep.await_args.kwargs["coverage_for"] is reg.uncovered_essential_sites_for
+    assert promote.await_args.kwargs["coverage_for"] is reg.uncovered_essential_sites_for
+
+
+@pytest.mark.asyncio
+async def test_coverage_mirrors_the_routers_eligibility_rules(monkeypatch):
+    """A provider the router would skip for a site covers nothing there: a spent
+    daily quota, a paid provider on a never_pays site, a paid provider while the
+    spend budget is exceeded."""
+    from types import SimpleNamespace
+
+    from genesis.routing.types import BudgetStatus
+
+    async def _run(budget):
+        sweep = AsyncMock(return_value=0)
+        monkeypatch.setattr("genesis.routing.escalation.sweep_due_notifications", sweep)
+        monkeypatch.setattr(loop, "_promote_demoted_provider_notify", AsyncMock())
+        monkeypatch.setattr(
+            "genesis.awareness.provider_notify_config.effective_mode", lambda: "live"
+        )
+        seen = {}
+
+        def uncovered_for(name, also_unavailable=None):
+            for p, site in (("spent", "s"), ("paid", "s"), ("paid", "np"), ("free", "np")):
+                seen[(p, site)] = also_unavailable(p, site)
+            return []
+
+        reg = SimpleNamespace(
+            current_incident_identity=lambda p: None, incident_owner=lambda p, i: p,
+            get=lambda n: None, uncovered_essential_sites_for=uncovered_for,
+        )
+        cfgs = {
+            "spent": SimpleNamespace(name="spent", is_free=True),
+            "paid": SimpleNamespace(name="paid", is_free=False),
+            "free": SimpleNamespace(name="free", is_free=True),
+        }
+        sites = {"s": SimpleNamespace(never_pays=False), "np": SimpleNamespace(never_pays=True)}
+        router = SimpleNamespace(
+            config=SimpleNamespace(providers=cfgs, call_sites=sites),
+            _daily_budget=SimpleNamespace(exhausted=lambda cfg: cfg.name == "spent"),
+            cost_tracker=SimpleNamespace(check_budget=AsyncMock(return_value=budget)),
+        )
+        runtime = SimpleNamespace(_circuit_breakers=reg, _router=router)
+        monkeypatch.setattr("genesis.runtime.GenesisRuntime.instance", lambda: runtime)
+        await loop._check_provider_outage_notify(object())
+        sweep.await_args.kwargs["coverage_for"]("x")
+        return seen
+
+    under = await _run(BudgetStatus.UNDER_LIMIT)
+    assert under == {("spent", "s"): True, ("paid", "s"): False,
+                     ("paid", "np"): True, ("free", "np"): False}
+    over = await _run(BudgetStatus.EXCEEDED)
+    assert over[("paid", "s")] is True and over[("free", "np")] is False
