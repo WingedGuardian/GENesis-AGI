@@ -543,6 +543,9 @@ async def _ensure_chromium_fallback():
         await asyncio.to_thread(
             profile_backup.backup_chromium_profile, _CHROMIUM_PROFILE_DIR, "playwright"
         )
+        # And after the copy, which can wait minutes for another session's: an
+        # upgrade in that window must not reach the driver start.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
         _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
         # Always headed — Xvfb :99 is always running.

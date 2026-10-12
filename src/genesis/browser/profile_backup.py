@@ -76,6 +76,10 @@ class ProfileBusy(OSError):
     """The profile kept changing while it was being copied."""
 
 
+class NoRoom(OSError):
+    """The disk cannot take the copy (the message says why)."""
+
+
 class ProfileChanged(ProfileBusy):
     """The copy does not hold the version its label names: a launch opened the
     profile with another build after the recorded version was read."""
@@ -233,7 +237,13 @@ def _files(profile: Path) -> Iterator[Path]:
                 yield Path(dirpath) / name
 
 
-def copy_aside(profile: Path, label: str, *, holds: Callable[[Path], bool] | None = None) -> Path:
+def copy_aside(
+    profile: Path,
+    label: str,
+    *,
+    holds: Callable[[Path], bool] | None = None,
+    room: Callable[[int], str | None] | None = None,
+) -> Path:
     """Copy ``profile`` to ``<profile>.pre-<label>-<UTC time>`` and return it.
 
     The copy is built in a TemporaryDirectory beside the profile and renamed out of
@@ -245,7 +255,9 @@ def copy_aside(profile: Path, label: str, *, holds: Callable[[Path], bool] | Non
     started, which retention ages it from. Copied files keep their size and mtime
     (copytree's copy2), which is what a later launch compares to call it current.
     ``holds`` checks the finished copy before it is published; ProfileChanged when
-    it does not hold what its label names.
+    it does not hold what its label names. ``room`` admits each attempt for the
+    bytes of the snapshot it copies (a retry after the profile grew is judged
+    again); NoRoom when it refuses.
     """
     for _ in range(_COPY_ATTEMPTS):
         started = time.time()
@@ -260,6 +272,8 @@ def copy_aside(profile: Path, label: str, *, holds: Callable[[Path], bool] | Non
         ) as work:
             copied = Path(work) / profile.name
             before = _snapshot(profile)
+            if room is not None and (why := room(sum(e[1] for e in before.values()))):
+                raise NoRoom(why)
             try:
                 shutil.copytree(profile, copied, symlinks=True, ignore=_ignore_for(profile))
             except shutil.Error:
@@ -306,16 +320,6 @@ def _digest(snapshot: dict[str, tuple[int, int, int, int]]) -> str:
     return hashlib.sha256(json.dumps(content).encode()).hexdigest()
 
 
-def _content_size(profile: Path) -> int:
-    total = 0
-    for path in _files(profile):
-        try:
-            total += path.lstat().st_size
-        except OSError:
-            continue
-    return total
-
-
 def _fresh_copy(profile: Path, label: str) -> Path | None:
     """A complete copy labelled ``label`` of the profile exactly as it is now: its
     own files (no stored record) match the profile's."""
@@ -329,7 +333,9 @@ def _fresh_copy(profile: Path, label: str) -> Path | None:
 
 
 def _lock_path(profile: Path) -> Path:
-    return profile.parent / f".{profile.name}.backup.lock"
+    # One lock for every profile in a directory: copies of the Camoufox and Chromium
+    # profiles land on the same disk, so each admission must see the other's copy.
+    return profile.parent / ".browser-profile-backup.lock"
 
 
 class _LockBusy(RuntimeError):
@@ -384,28 +390,23 @@ def backup_before_launch(
             if profile_in_use(profile, lock_name) is True:
                 logger.warning("Profile %s is open in another browser; not copying it", profile)
                 return None
-            needed = _content_size(profile) * _FREE_FACTOR
-            # The disk guardian's own tiers (quota-aware, the watchdog's thresholds):
-            # the copy must not move the disk into ORANGE or RED. A disk already
-            # ORANGE still gets one unless it would reach RED, since without it a
-            # one-way profile upgrade is final.
-            tiers = tier_after_write(profile.parent, needed)
-            if tiers is None or tiers[1] == "red" or (tiers[1] == "orange" != tiers[0]):
-                logger.warning(
-                    "Not copying profile %s before %s opens it: about %d bytes needed, "
-                    "disk tier now and after: %s",
-                    profile,
-                    engine,
-                    needed,
-                    tiers,
-                )
+
+            def room(size: int) -> str | None:
+                # The disk guardian's free-space tiers (quota-aware, the watchdog's
+                # thresholds): the copy must not move the disk into ORANGE or RED. A
+                # disk already ORANGE still gets one unless it would reach RED, since
+                # without it a one-way profile upgrade is final.
+                needed = size * _FREE_FACTOR
+                tiers = tier_after_write(profile.parent, needed)
+                if tiers is None or tiers[1] == "red" or (tiers[1] == "orange" != tiers[0]):
+                    return f"about {needed:.0f} bytes needed, disk tier now and after: {tiers}"
                 return None
 
             def holds(copy: Path) -> bool:
                 return read_version is None or read_version(copy) == recorded
 
-            dest = copy_aside(profile, label, holds=holds)
-    except (ProfileBusy, _LockBusy) as exc:
+            dest = copy_aside(profile, label, holds=holds, room=room)
+    except (ProfileBusy, _LockBusy, NoRoom) as exc:
         logger.warning("Not copying profile %s before %s opens it: %s", profile, engine, exc)
         return None
     except Exception:  # noqa: BLE001 - advisory: a failed copy never blocks the launch

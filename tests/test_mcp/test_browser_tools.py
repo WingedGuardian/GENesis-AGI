@@ -6605,3 +6605,28 @@ console.log(JSON.stringify([TARGET(E, [5, 5]), TARGET(E, null), at(N), at(M), TA
         assert result["diagnostics"]["navigated"] is False  # the watch was armed
         assert original.listeners("framenavigated") == []
         assert original.listeners("popup") == []
+
+
+@pytest.mark.asyncio
+async def test_chromium_rechecks_packages_after_the_backup(monkeypatch):
+    """The copy can wait up to ten minutes for another session's: an upgrade in that
+    window must be caught before the driver starts."""
+    from genesis.browser import packages, profile_backup
+
+    state = {"backed_up": False}
+
+    def check(dists):
+        if state["backed_up"]:
+            raise packages.BrowserPackagesChanged("changed during the backup")
+
+    def backup(*a):
+        state["backed_up"] = True
+
+    monkeypatch.setattr(packages, "check_loaded_browser_modules", check)
+    monkeypatch.setattr(profile_backup, "backup_chromium_profile", backup)
+    start = MagicMock()
+    stub = {"playwright": MagicMock(), "playwright.async_api": MagicMock(async_playwright=start)}
+    with patch.dict("sys.modules", stub), pytest.raises(packages.BrowserPackagesChanged):
+        await browser._ensure_chromium_fallback()
+    start.assert_not_called()
+

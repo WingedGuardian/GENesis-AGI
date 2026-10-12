@@ -500,7 +500,8 @@ def test_the_tier_is_judged_for_the_copy_beside_the_profile(tmp_path, monkeypatc
         pb, "tier_after_write", lambda at, n: seen.append((at, n)) or ("green",) * 2
     )
     _backup(p)
-    assert seen == [(p.parent, pb._content_size(p) * pb._FREE_FACTOR)]
+    size = sum(e[1] for e in pb._snapshot(p).values())
+    assert seen == [(p.parent, size * pb._FREE_FACTOR)]
 
 
 def test_a_write_during_the_copy_discards_it_and_copies_again(tmp_path, monkeypatch):
@@ -807,3 +808,58 @@ def test_a_change_below_the_root_under_a_lock_name_counts(tmp_path):
     _age(first, 60)
     (p / "sub" / "lock").write_text("b")
     assert _backup(p) is not None
+
+
+# ── round 3 (#3199) ───────────────────────────────────────────────────────────
+
+
+def test_each_copy_attempt_is_admitted_for_what_it_copies(tmp_path, monkeypatch):
+    """A profile that grows between the first scan and a retry is judged again: the
+    admission is bound to the snapshot each attempt copies."""
+    p = _firefox_profile(tmp_path / "p")
+    seen = []
+    monkeypatch.setattr(pb, "tier_after_write", lambda at, n: seen.append(n) or ("green",) * 2)
+    real = pb.shutil.copytree
+    grown = {"done": False}
+
+    def copytree(src, dst, *a, **kw):
+        out = real(src, dst, *a, **kw)
+        if not grown["done"]:
+            grown["done"] = True
+            (p / "grew.sqlite").write_bytes(b"z" * 50_000)  # tears this attempt
+        return out
+
+    monkeypatch.setattr(pb.shutil, "copytree", copytree)
+    assert _backup(p) is not None
+    assert len(seen) == 2 and seen[1] > seen[0]
+
+
+def test_a_retry_that_no_longer_fits_is_not_copied(tmp_path, monkeypatch):
+    p = _firefox_profile(tmp_path / "p")
+    calls = []
+
+    def tiers(at, n):
+        calls.append(n)
+        return ("green", "green") if len(calls) == 1 else ("yellow", "orange")
+
+    monkeypatch.setattr(pb, "tier_after_write", tiers)
+    real = pb.shutil.copytree
+
+    torn = {"done": False}
+
+    def copytree(src, dst, *a, **kw):
+        out = real(src, dst, *a, **kw)
+        if not torn["done"]:
+            torn["done"] = True
+            (p / "grew.sqlite").write_bytes(b"z")  # tears the first attempt only
+        return out
+
+    monkeypatch.setattr(pb.shutil, "copytree", copytree)
+    assert _backup(p) is None and _copies(p) == []
+
+
+def test_both_profiles_beside_each_other_share_one_backup_lock(tmp_path):
+    """Two engines first launched at once would each measure the same free space."""
+    a = tmp_path / "camoufox-profile"
+    b = tmp_path / "browser-profile"
+    assert pb._lock_path(a) == pb._lock_path(b)
