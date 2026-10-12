@@ -1,0 +1,1 @@
+- Web fetch now reports the client that actually ran, direct-session profile descriptions match their configured permissions, and the architecture index points to tracked decision records.

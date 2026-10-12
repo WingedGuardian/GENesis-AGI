@@ -3,6 +3,7 @@
 Validates that profile changes don't accidentally grant or revoke tool access.
 """
 
+import re
 import sys
 import types
 from unittest.mock import MagicMock
@@ -27,6 +28,7 @@ from genesis.cc.direct_session import (
     _build_profile_addendum,
 )
 from genesis.cc.types import CCModel
+from genesis.mcp.health.direct_session_tools import direct_session_run
 
 # --- Profile existence ---
 
@@ -40,6 +42,39 @@ def test_all_expected_profiles_exist():
     assert "observe" in PROFILES
     assert "interact" in PROFILES
     assert "research" in PROFILES
+
+
+def test_direct_session_run_description_matches_profile_disallows():
+    description = direct_session_run.description
+    assert description is not None
+
+    universal_match = re.search(r"All profiles block:\s*(.+?)\.", description)
+    assert universal_match is not None
+    universal_tools = {
+        tool.strip().strip("`., ")
+        for tool in re.split(r",|\band\b", universal_match.group(1))
+        if tool.strip().strip("`., ")
+    }
+    assert universal_tools
+    for tool in universal_tools:
+        assert all(
+            tool in denied or any(denied_tool.endswith(f"__{tool}") for denied_tool in denied)
+            for denied in PROFILES.values()
+        ), f"{tool} must be blocked by every profile"
+
+    write_match = re.search(r"Profiles that block `Write`:\s*(.+?)\.", description)
+    assert write_match is not None
+    described_write_profiles = set(re.findall(r"`([^`]+)`", write_match.group(1)))
+    actual_write_profiles = {
+        profile for profile, denied in PROFILES.items() if "Write" in denied
+    }
+    assert described_write_profiles == actual_write_profiles
+
+    assert "No profile can call `memory_store`" in description
+    assert all(
+        "mcp__genesis-memory__memory_store" in denied
+        for denied in PROFILES.values()
+    )
 
 
 # --- Universal safety blocks (all profiles) ---

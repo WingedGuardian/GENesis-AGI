@@ -339,11 +339,17 @@ async def direct_session_run(
 
     Profiles control what the session can do:
     - observe: Read everything, change nothing. Browser viewing, memory reads, web search.
-    - research: Observe + memory/observation writes + follow-ups. Stores findings for future use.
-    - interact: Full browser interaction + memory writes + outreach_send + follow-ups.
+    - research: Observe + observations, procedures, and follow-ups in SQLite,
+      plus files under `~/.genesis/output/`. Stores findings for future use.
+    - interact: Full browser interaction + observations, procedures, and
+      follow-ups in SQLite, files under `~/.genesis/output/`, and outreach_send.
       Use for workflows that operate external platforms and communicate with the user.
 
-    All profiles block: Bash, Edit, Write, task_submit, settings_update.
+    All profiles block: `Bash`, `Edit`, `task_submit`, and `settings_update`.
+    Profiles that block `Write`: `observe` and `mail`.
+    No profile can call `memory_store`, `memory_synthesize`, `memory_extract`,
+    `memory_supersede`, `knowledge_ingest`, `knowledge_ingest_batch`, or
+    `knowledge_ingest_source`.
 
     Args:
         prompt: The full instructions for the background session
