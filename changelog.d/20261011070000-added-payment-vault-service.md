@@ -1,0 +1,1 @@
+- `python -m genesis vault unlock` hands the card vault's key to genesis-server, which holds it in memory until `vault lock`, 30 minutes idle, or a restart. `vault status` shows whether it is unlocked and the last vault event. Every unlock, lock and refusal is recorded with the process that asked, and an unlock that cannot be recorded is refused.

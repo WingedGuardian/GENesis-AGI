@@ -228,6 +228,11 @@ class StandaloneAdapter:
         # Wyoming STT+TTS servers for S2S voice pipeline (Phase 2)
         await self._init_wyoming_servers()
 
+        # Payment card vault service: holds the vault key between unlock and lock
+        from genesis.payments.vault_service import start_vault_service
+
+        self._vault_service = await start_vault_service(self._runtime)
+
         # Flask in daemon thread
         flask_thread = threading.Thread(
             target=self._run_flask,
@@ -427,6 +432,9 @@ class StandaloneAdapter:
         logger.info("Shutdown requested")
         self._shutdown_event.set()
 
+        from genesis.payments.vault_service import stop_vault_service
+
+        await stop_vault_service(getattr(self, "_vault_service", None))  # drop the key first
         await self._voice_last_breath()
 
         if self._runtime and self._runtime.awareness_loop is not None:

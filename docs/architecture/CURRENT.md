@@ -3143,8 +3143,18 @@ verified: ba9dd8a37 2026-10-09
   database takes nothing. `add` needs no passphrase and requires a merchant
   scope or `--single-use`; init/add/retire need a TTY that can hide input (every
   answer is hidden) and refuse inside a coding agent's session, Claude Code or
-  Codex (accident guard). Needs the `payments` extra. No runtime
-  caller yet: nothing decrypts a card, and the directory is not backed up.
+  Codex (accident guard). Needs the `payments` extra.
+  `vault_service.py` runs inside genesis-server (started from
+  `StandaloneAdapter.serve()`, never the bridge or terminal): after
+  `vault unlock` it holds the X25519 identity in memory and relocks on
+  `vault lock`, after 30 minutes idle, on a key/recipient mismatch, and on
+  restart. It serves unlock/lock/status on `~/.genesis/run/payment_vault.sock`
+  (0700 dir, peer uid checked with SO_PEERCRED); the scrypt unwrap runs in a
+  short-lived subprocess so the event loop never waits on it (a thread stalled
+  the loop for the whole decrypt here). Every unlock, lock,
+  refusal and relock lands in `payment_vault_events` with the requesting pid
+  and process names; unlock fails closed without that audit row. Nothing
+  decrypts a card yet, and the vault directory is not backed up.
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
   item into the Genesis trash (`~/.genesis/trash`) with a tombstone, never
   copying, and refuses an item on another volume;

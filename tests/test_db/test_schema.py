@@ -175,6 +175,7 @@ async def test_no_unexpected_tables(db):
         "open_questions",  # work board: local-only unresolved forks
         "open_question_blocks",  # work board: question -> blocked work edges
         "board_events",  # work board: append-only event log
+        "payment_vault_events",  # payment vault service: unlock/lock audit trail
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"

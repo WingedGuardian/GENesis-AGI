@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import importlib
 import json
 import warnings
 from datetime import UTC, datetime
@@ -270,6 +271,200 @@ class TestStatus:
         assert "NOT PRIVATE" in capsys.readouterr().out
 
 
+class TestServiceCommands:
+    """unlock / lock / status against the vault service, with its replies scripted."""
+
+    def _script(self, monkeypatch, replies):
+        sent = []
+
+        def fake(request):
+            sent.append(request)
+            return replies.pop(0)
+
+        monkeypatch.setattr(cli, "_service", fake)
+        return sent
+
+    LOCKED = {
+        "ok": True,
+        "unlocked": False,
+        "initialised": True,
+        "payments_extra": True,
+        "audit": True,
+    }
+
+    def test_unlock_refuses_before_the_prompt_when_the_audit_log_is_down(
+        self, tty, monkeypatch, capsys
+    ):
+        self._script(monkeypatch, [{**self.LOCKED, "audit": False}])
+        getpass = _answers(monkeypatch, [])
+        assert _run(["unlock"]) == 2
+        getpass.assert_not_called()
+        assert "audit log is unavailable" in capsys.readouterr().err
+
+    def test_unlock(self, tty, monkeypatch, capsys):
+        sent = self._script(
+            monkeypatch, [dict(self.LOCKED), {"ok": True, "state": "unlocked", "relock_in_s": 1800}]
+        )
+        getpass = _answers(monkeypatch, [PASSPHRASE])
+        assert _run(["unlock"]) == 0
+        assert sent == [{"op": "status"}, {"op": "unlock", "passphrase": PASSPHRASE}]
+        assert getpass.call_count == 1
+        out = capsys.readouterr().out
+        assert "relocks after 30 minutes" in out and PASSPHRASE not in out
+
+    def test_unlock_works_without_local_crypto(self, tty, monkeypatch):
+        monkeypatch.setattr(cli.importlib.util, "find_spec", lambda m: None)
+        self._script(monkeypatch, [dict(self.LOCKED), {"ok": True, "relock_in_s": 1800}])
+        _answers(monkeypatch, [PASSPHRASE])
+        assert _run(["unlock"]) == 0
+
+    @pytest.mark.parametrize(
+        "state, message",
+        [
+            (None, "not running"),
+            ({**LOCKED, "initialised": False}, "not initialised"),
+            ({**LOCKED, "payments_extra": False}, "payments extra"),
+        ],
+    )
+    def test_unlock_is_refused_before_the_prompt(self, tty, monkeypatch, capsys, state, message):
+        self._script(monkeypatch, [state])
+        getpass = _answers(monkeypatch, [])
+        assert _run(["unlock"]) == 2
+        getpass.assert_not_called()
+        assert message in capsys.readouterr().err
+
+    def test_losing_a_race_to_another_unlock_reads_already_unlocked(self, tty, monkeypatch, capsys):
+        self._script(monkeypatch, [dict(self.LOCKED), {"ok": True, "state": "already unlocked"}])
+        _answers(monkeypatch, [PASSPHRASE])
+        assert _run(["unlock"]) == 0
+        out = capsys.readouterr().out
+        assert "already unlocked" in out and "0 minutes" not in out
+
+    def test_a_failed_lock_never_says_locked(self, monkeypatch, capsys):
+        self._script(monkeypatch, [{"ok": False, "error": "bad request"}])
+        assert _run(["lock"]) == 2
+        captured = capsys.readouterr()
+        assert "vault locked" not in captured.out and "bad request" in captured.err
+
+    def test_already_unlocked_skips_the_prompt(self, tty, monkeypatch, capsys):
+        self._script(monkeypatch, [{**self.LOCKED, "unlocked": True}])
+        getpass = _answers(monkeypatch, [])
+        assert _run(["unlock"]) == 0
+        getpass.assert_not_called()
+
+    def test_wrong_passphrase(self, tty, monkeypatch, capsys):
+        self._script(monkeypatch, [dict(self.LOCKED), {"ok": False, "error": "wrong passphrase"}])
+        _answers(monkeypatch, ["nope"])
+        assert _run(["unlock"]) == 2
+        assert "wrong passphrase" in capsys.readouterr().err
+
+    def test_unlock_refused_inside_claude_code(self, tty, monkeypatch):
+        monkeypatch.setenv("CLAUDECODE", "1")
+        sent = self._script(monkeypatch, [])
+        assert _run(["unlock"]) == 2
+        assert sent == []
+
+    def test_lock_runs_anywhere(self, monkeypatch, capsys):
+        monkeypatch.setenv("CLAUDECODE", "1")
+        self._script(monkeypatch, [{"ok": True, "state": "locked"}, None])
+        assert _run(["lock"]) == 0
+        assert "vault locked" in capsys.readouterr().out
+        assert _run(["lock"]) == 0
+        assert "nothing is unlocked" in capsys.readouterr().out
+
+    def test_status_shows_the_service(self, monkeypatch, capsys):
+        self._script(
+            monkeypatch,
+            [
+                {
+                    **self.LOCKED,
+                    "unlocked": True,
+                    "unlocked_at": "2026-10-11T06:00:00+00:00",
+                    "relock_in_s": 600,
+                    "last_event": {"event": "unlock", "created_at": "2026-10-11T06:00:00+00:00"},
+                },
+                None,
+            ],
+        )
+        assert _run(["status"]) == 0
+        out = capsys.readouterr().out
+        assert (
+            "service: UNLOCKED" in out
+            and "relocks in 10 min" in out
+            and "last event: unlock" in out
+        )
+        assert _run(["status"]) == 0
+        assert "service: not running" in capsys.readouterr().out
+
+
+def test_an_oversized_reply_is_refused(monkeypatch):
+    class Flood:
+        def __init__(self, *a):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def settimeout(self, t):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, data):
+            pass
+
+        def recv(self, n):
+            return b"x" * n  # never a newline
+
+    monkeypatch.setattr(cli.socket, "socket", Flood)
+    with pytest.raises(vs.VaultError, match="oversized"):
+        cli._service({"op": "status"})
+
+
+def test_service_round_trip_against_the_real_service(_home):
+    """cli._service talks to a real VaultService on its own event loop."""
+    import asyncio
+    import threading
+
+    import aiosqlite
+
+    from genesis.payments.vault_service import VaultService
+
+    mig = importlib.import_module("genesis.db.migrations.20261011060631_payment_vault_events")
+    loop = asyncio.new_event_loop()
+    ready, holder = threading.Event(), {}
+
+    async def start():
+        conn = await aiosqlite.connect(str(_home / "g.db"))
+        await mig.up(conn)
+        holder["conn"] = conn
+        holder["svc"] = VaultService(conn)
+        await holder["svc"].start()
+        ready.set()
+
+    thread = threading.Thread(target=lambda: (loop.run_until_complete(start()), loop.run_forever()))
+    thread.start()
+    try:
+        assert ready.wait(10)
+        reply = cli._service({"op": "status"})
+        assert reply["ok"] and reply["unlocked"] is False and reply["initialised"] is False
+        assert cli._service({"op": "lock"}) == {"ok": True, "state": "already locked"}
+    finally:
+
+        async def stop():
+            await holder["svc"].stop()
+            await holder["conn"].close()
+
+        asyncio.run_coroutine_threadsafe(stop(), loop).result(10)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(10)
+    assert cli._service({"op": "status"}) is None  # socket gone: "not running"
+
+
 def test_interactive_needs_both_ends_a_terminal(monkeypatch):
     for stdin, stdout, expected in ((True, True, True), (True, False, False), (False, True, False)):
         monkeypatch.setattr(cli.sys, "stdin", type("S", (), {"isatty": lambda self, v=stdin: v})())
@@ -374,6 +569,26 @@ class TestPromptsNeverEcho:
         assert _run(["add", "--label", "x", "--single-use"]) == 2
         err = capsys.readouterr().err
         assert "cancelled" in err and "Traceback" not in err
+
+    def test_unlock_refuses_when_the_terminal_cannot_hide_input(self, tty, monkeypatch, capsys):
+        sent = []
+
+        def service(request):
+            sent.append(request)
+            return {
+                "ok": True,
+                "unlocked": False,
+                "initialised": True,
+                "payments_extra": True,
+                "audit": True,
+            }
+
+        monkeypatch.setattr(cli, "_service", service)
+        read = self._echo_fallback(monkeypatch)
+        assert _run(["unlock"]) == 2
+        read.assert_not_called()
+        assert [r["op"] for r in sent] == ["status"]  # no passphrase was ever sent
+        assert "cannot hide" in capsys.readouterr().err
 
     @pytest.mark.parametrize("answered", range(5))
     def test_ended_input_at_any_add_prompt_is_a_controlled_refusal(

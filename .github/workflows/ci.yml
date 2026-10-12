@@ -1072,4 +1072,7 @@ jobs:
         # Card vault store and CLI (#3194): +151 collected, measured with
         # --collect-only (test_vault_store 105, test_vault_cli 46, both new; pyrage
         # and zxcvbn are in the test extra, so no skips). Floor: 25738 + 151 = 25889.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 124 --min-collected 25889
+        # Vault service (#3200): +81 collected, measured with --collect-only
+        # (test_vault_service 62 and test_payment_vault_events 3 new, test_vault_cli 46 -> 62;
+        # test_schema count-neutral). Floor: 25889 + 81 = 25970.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 124 --min-collected 25970
