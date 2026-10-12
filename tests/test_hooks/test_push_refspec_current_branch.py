@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 import json
+import shlex
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -313,8 +314,8 @@ def test_ext_pushurl_is_rejected_without_running_its_helper(monkeypatch, tmp_pat
 def test_the_rules_reach_push_targets_current_branch(
     command: str, targets_cur: bool, monkeypatch
 ) -> None:
-    """The local shape and static-config predicate decide qualification."""
-    monkeypatch.setattr(gpg, "_push_config_static_ok", lambda *a, **k: True)
+    """The local shape and main's full config predicate decide qualification."""
+    monkeypatch.setattr(gpg, "_push_config_is_simple", lambda *a, **k: True)
     seg = _parsed_push_seg(command)
     assert gpg._push_targets_current_branch(seg, "feat/x", "origin", cwd=None) is targets_cur
 
@@ -333,11 +334,11 @@ _RECOGNISED = [
 
 @pytest.mark.parametrize("command", _RECOGNISED)
 def test_every_recognised_spelling_passes_the_local_gate(command: str, monkeypatch) -> None:
-    """The predicate checks local shape/config only; verdicts belong to the caller."""
+    """The target gate checks the push shape and full config; verdicts belong to the caller."""
     seg = _parsed_push_seg(command)
-    monkeypatch.setattr(gpg, "_push_config_static_ok", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_push_config_is_simple", lambda *a, **k: True)
     assert gpg._push_targets_current_branch(seg, "feat/x", "origin", cwd=None) is True
-    monkeypatch.setattr(gpg, "_push_config_static_ok", lambda *a, **k: False)
+    monkeypatch.setattr(gpg, "_push_config_is_simple", lambda *a, **k: False)
     assert gpg._push_targets_current_branch(seg, "feat/x", "origin", cwd=None) is False
 
 
@@ -360,7 +361,7 @@ def test_every_recognised_spelling_passes_the_local_gate(command: str, monkeypat
 )
 def test_a_push_carrying_its_own_config_is_not_plain(command: str, monkeypatch) -> None:
     """Push-supplied config is rejected by the local argument-shape checks."""
-    monkeypatch.setattr(gpg, "_push_config_static_ok", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_push_config_is_simple", lambda *a, **k: True)
     seg = _parsed_push_seg(command)
     assert gpg._push_targets_current_branch(seg, "feat/x", "origin", cwd=None) is False
 
@@ -370,7 +371,7 @@ def test_a_push_carrying_its_own_config_is_not_plain(command: str, monkeypatch) 
     ["git -C /some/dir push origin HEAD", "git -P push origin HEAD", "git --no-pager push"],
 )
 def test_the_allowlisted_global_options_still_pass(command: str, monkeypatch) -> None:
-    monkeypatch.setattr(gpg, "_push_config_static_ok", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_push_config_is_simple", lambda *a, **k: True)
     seg = _parsed_push_seg(command)
     assert gpg._push_targets_current_branch(seg, "feat/x", "origin", cwd=None) is True
 
@@ -640,6 +641,9 @@ def _run(
     git_setup: list[list[str]] | None = None,
     legacy_remote_file: str | None = None,
     dry_run_verdict: bool | None = None,
+    config_text: str | None = None,
+    hook_env: dict[str, str] | None = None,
+    probe_argv: list[list[str]] | None = None,
 ):
     remotes = _local_remotes(tmp_path, monkeypatch)
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
@@ -673,6 +677,10 @@ def _run(
         subprocess.run(["git", "-C", str(repo), "config", *resolved], check=True, timeout=30)
     for args in git_setup or []:
         subprocess.run(["git", "-C", str(repo), *args], check=True, timeout=30)
+    if config_text is not None:
+        config_text = config_text.replace("{r}", (remotes / "r.git").resolve().as_uri())
+        config_path = repo / ".git" / "config"
+        config_path.write_text(config_path.read_text() + "\n" + config_text)
     if legacy_remote_file:
         subprocess.run(
             ["git", "-C", str(repo), "remote", "remove", "origin"],
@@ -688,11 +696,29 @@ def _run(
             path.write_text(f"{url}#main\n")
     payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(repo)}
     monkeypatch.setattr(gpg.sys, "stdin", io.StringIO(json.dumps(payload)))
+    for key, value in (hook_env or {}).items():
+        monkeypatch.setenv(key, value)
+    if probe_argv is not None:
+        real_run = gpg.subprocess.run
+
+        def record_probe(argv, *args, **kwargs):
+            if isinstance(argv, (list, tuple)) and (
+                "ls-remote" in argv or ("push" in argv and "--dry-run" in argv)
+            ):
+                probe_argv.append(list(argv))
+            return real_run(argv, *args, **kwargs)
+
+        monkeypatch.setattr(gpg.subprocess, "run", record_probe)
     rc = gpg.main()
     out = capsys.readouterr()
     assert rc == 0, (rc, out.out, out.err)
     hso = json.loads(out.out)["hookSpecificOutput"]
     return hso["permissionDecision"], hso.get("permissionDecisionReason", "")
+
+
+def _write_program_stub(path: Path, marker: Path) -> None:
+    path.write_text(f"#!/bin/sh\nprintf x > {shlex.quote(str(marker))}\nexit 1\n")
+    path.chmod(0o755)
 
 
 _SPELLINGS = [
@@ -845,29 +871,23 @@ def test_configured_push_refspec_keeps_the_local_ask_before_dry_run(
 
 
 @pytest.mark.parametrize(
-    ("command", "flag", "src", "dst"),
+    "command",
     [
-        ("git push origin feat/x", "=", "refs/heads/feat/x", "refs/heads/main"),
-        ("git push origin refs/heads/feat/x", "=", "refs/heads/feat/x", "refs/heads/main"),
-        ("git push -u origin HEAD", "=", "HEAD", "refs/heads/feat/x"),
-        ("git push origin @", "=", "HEAD", "refs/heads/feat/x"),
-        ("git push origin HEAD:refs/heads/feat/x", "=", "HEAD", "refs/heads/feat/x"),
+        "git push origin feat/x",
+        "git push origin refs/heads/feat/x",
+        "git push -u origin HEAD",
+        "git push origin @",
+        "git push origin HEAD:refs/heads/feat/x",
     ],
     ids=["short-branch", "full-branch", "set-upstream", "at", "qualified"],
 )
-def test_push_default_upstream_uses_the_measured_ref_destination(
-    monkeypatch, tmp_path, capsys, command: str, flag: str, src: str, dst: str
+def test_push_default_upstream_keeps_main_ask_without_dry_run(
+    monkeypatch, tmp_path, capsys, command: str
 ) -> None:
-    """git 2.34.1: short/full branch spellings target main; -u HEAD, @, and qualified HEAD target feat/x."""
-    dry_runs = []
-    real_dry_run = gpg._push_dry_run
-
-    def capture_dry_run(positionals, cwd):
-        result = real_dry_run(positionals, cwd)
-        dry_runs.append(result)
-        return result
-
-    monkeypatch.setattr(gpg, "_push_dry_run", capture_dry_run)
+    """Main refuses push.default=upstream before the dry-run classifier."""
+    monkeypatch.setattr(
+        gpg, "_push_dry_run", lambda *a, **k: pytest.fail("upstream push reached the dry run")
+    )
     decision, reason = _run(
         monkeypatch,
         tmp_path,
@@ -882,13 +902,8 @@ def test_push_default_upstream_uses_the_measured_ref_destination(
             ["branch", "--set-upstream-to=origin/main", "feat/x"],
         ],
     )
-    assert len(dry_runs) == 1
-    blocks = dry_runs[0]
-    assert blocks is not None and len(blocks) == 1
-    assert len(blocks[0].refs) == 1
-    ref = blocks[0].refs[0]
-    assert (ref.flag, ref.src, ref.dst) == (flag, src, dst)
-    assert decision == ("ask" if dst == "refs/heads/main" else "allow"), reason
+    assert decision == "ask", reason
+    assert "publishing externally" in reason
 
 
 _SIDE_CHANNELS = [
@@ -987,7 +1002,9 @@ def test_a_legacy_remote_file_keeps_the_ask(monkeypatch, tmp_path, capsys, kind:
     assert decision == "ask", reason
 
 
-def test_the_dry_run_verdict_uses_the_real_rewritten_push_url(tmp_path, monkeypatch) -> None:
+def test_the_dry_run_verdict_rejects_an_unverified_rewritten_push_url(
+    tmp_path, monkeypatch
+) -> None:
     repo, remotes = _lab_repo(tmp_path, monkeypatch, republish=False)
     url = "https://example.invalid/r.git"
     other = (remotes / "other.git").resolve().as_uri()
@@ -995,8 +1012,7 @@ def test_the_dry_run_verdict_uses_the_real_rewritten_push_url(tmp_path, monkeypa
     _git(repo, "config", f"url.{other}.pushInsteadOf", url)
     seg = _parsed_push_seg(f"git push {url} HEAD")
     verdict = gpg._push_dry_run_verdict(seg, "feat/x", url, cwd=str(repo))
-    assert verdict is not None and verdict.kind == "republish"
-    assert verdict.block.url == other
+    assert verdict is None
 
 
 @pytest.mark.parametrize(
@@ -1073,7 +1089,7 @@ def test_a_step_that_could_write_config_first_keeps_the_ask(
     ],
 )
 def test_parse_edges_from_the_audit(command: str, targets_cur: bool, monkeypatch) -> None:
-    monkeypatch.setattr(gpg, "_push_config_static_ok", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_push_config_is_simple", lambda *a, **k: True)
     seg = _parsed_push_seg(command)
     assert gpg._push_targets_current_branch(seg, "feat/x", "origin", cwd=None) is targets_cur
 
@@ -1257,6 +1273,32 @@ def test_dry_run_verdict_rejects_a_wrong_porcelain_source(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
+    ("precheck_url", "porcelain_url", "expected"),
+    [
+        ("https://host/repo.git", "https://host/repo.git", "republish"),
+        ("https://user:pw@host/repo.git", "https://host/repo.git", "republish"),
+        ("https://host/repo.git", "https://other/repo.git", None),
+    ],
+    ids=["exact-match", "userinfo-only-difference", "different-url"],
+)
+def test_dry_run_verdict_requires_a_matching_porcelain_destination(
+    monkeypatch, precheck_url: str, porcelain_url: str, expected: str | None
+) -> None:
+    default = _dry_run_verdict().block
+    block = gpg._DryRunBlock(porcelain_url, default.refs)
+    monkeypatch.setattr(gpg, "_repo_selection_env_set", lambda: False)
+    monkeypatch.setattr(gpg, "_push_dest_urls", lambda *a, **k: {precheck_url})
+    monkeypatch.setattr(gpg, "_push_transport_precheck", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_push_dry_run", lambda *a, **k: (block,))
+
+    verdict = gpg._push_dry_run_verdict(
+        _parsed_push_seg("git push origin HEAD"), "feat/x", "origin"
+    )
+
+    assert (verdict.kind if verdict is not None else None) == expected
+
+
+@pytest.mark.parametrize(
     ("url", "expected"),
     [
         ("https://host/repo.git", "https"),
@@ -1432,7 +1474,10 @@ def test_dry_run_rejects_a_remapped_or_multi_ref_push(tmp_path, monkeypatch, cas
     assert _real_dry_run_verdict(repo, command, remote) is None
 
 
-def test_dry_run_argv_disables_hooks_and_drops_set_upstream(monkeypatch) -> None:
+@pytest.mark.parametrize("family_flag", ["-4", "--ipv4", "-6", "--ipv6"])
+def test_dry_run_argv_disables_hooks_drops_set_upstream_and_preserves_family(
+    monkeypatch, family_flag: str
+) -> None:
     calls = []
 
     def run(argv, **kwargs):
@@ -1452,8 +1497,9 @@ def test_dry_run_argv_disables_hooks_and_drops_set_upstream(monkeypatch) -> None
 
     monkeypatch.setattr(gpg.subprocess, "run", run)
     monkeypatch.setattr(gpg, "_gh_timeout", lambda timeout: 8.5)
+    monkeypatch.setattr(gpg, "_repo_selection_env_set", lambda: False)
     verdict = gpg._push_dry_run_verdict(
-        _parsed_push_seg("git push -u origin HEAD"), "feat/x", "origin"
+        _parsed_push_seg(f"git push {family_flag} -u origin HEAD"), "feat/x", "origin"
     )
     assert verdict is not None and verdict.kind == "republish"
     dry_run_argv, dry_run_kwargs = next((argv, kwargs) for argv, kwargs in calls if "push" in argv)
@@ -1461,6 +1507,7 @@ def test_dry_run_argv_disables_hooks_and_drops_set_upstream(monkeypatch) -> None
     assert "--no-verify" in dry_run_argv
     assert "--recurse-submodules=no" in dry_run_argv
     assert "-u" not in dry_run_argv
+    assert family_flag in dry_run_argv
     assert dry_run_kwargs["timeout"] == 8.5
     env = dry_run_kwargs["env"]
     assert env["GIT_TERMINAL_PROMPT"] == "0"
@@ -1491,8 +1538,61 @@ def test_receivepack_helper_is_not_run_before_the_config_gate(tmp_path, monkeypa
     assert not marker.exists()
 
 
+@pytest.mark.parametrize("scenario", ["receivepack", "pushInsteadOf", "execpath"])
+def test_unapproved_probe_does_not_run_push_side_programs(
+    monkeypatch, tmp_path, capsys, scenario: str
+) -> None:
+    marker = tmp_path / f"{scenario}-ran"
+    helper_dir = tmp_path / "helpers"
+    helper_dir.mkdir()
+    hook_env = {}
+    config_text = None
+    command = "git push origin HEAD"
+    if scenario == "receivepack":
+        helper = tmp_path / "receivepack"
+        _write_program_stub(helper, marker)
+        command = "git push"
+        config_text = (
+            '[remote "x@y"]\n'
+            "    url = {r}\n"
+            f"    receivepack = {helper}\n"
+            '[branch "feat/x"]\n'
+            "    pushRemote = x@y\n"
+        )
+    elif scenario == "pushInsteadOf":
+        helper = tmp_path / "ssh-command"
+        _write_program_stub(helper, marker)
+        command = "git push https://127.0.0.1:1/original/repo.git HEAD"
+        config_text = (
+            '[url "ssh://127.0.0.1/rewritten/"]\n'
+            "    pushInsteadOf = https://127.0.0.1:1/\n"
+        )
+        hook_env["GIT_SSH_COMMAND"] = str(helper)
+    else:
+        helper = helper_dir / "git-receive-pack"
+        _write_program_stub(helper, marker)
+        hook_env["GIT_EXEC_PATH"] = str(helper_dir)
+
+    probe_argv = []
+    decision, reason = _run(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        command,
+        republish=True,
+        open_prs=1,
+        config_text=config_text,
+        hook_env=hook_env,
+        probe_argv=probe_argv,
+    )
+
+    assert decision == "ask", reason
+    assert probe_argv == []
+    assert not marker.exists()
+
+
 def test_config_gate_short_circuits_before_dry_run(monkeypatch) -> None:
-    monkeypatch.setattr(gpg, "_push_config_static_ok", lambda *a, **k: False)
+    monkeypatch.setattr(gpg, "_push_config_is_simple", lambda *a, **k: False)
     monkeypatch.setattr(
         gpg, "_push_dry_run_verdict", lambda *a, **k: pytest.fail("dry run was called")
     )

@@ -932,9 +932,10 @@ def test_recorded_republish_uses_offline_allow_without_dry_run(
     assert calls == []
 
 
-def test_recorded_upstream_push_does_not_take_the_offline_allow(
+def test_recorded_upstream_push_asks_without_dry_run(
     monkeypatch, tmp_path, capsys
 ) -> None:
+    """The main config gate refuses upstream pushes before offline classification."""
     class RecordedAllowlist:
         def is_recorded(self, urls, branch):
             return urls == {PUBLIC_URL} and branch == "feat/x"
@@ -967,4 +968,4 @@ def test_recorded_upstream_push_does_not_take_the_offline_allow(
     )
     assert rc == 0, (rc, out, err)
     assert json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "ask", out
-    assert len(calls) == 1
+    assert calls == []

@@ -12514,34 +12514,6 @@ def _push_url_matches_probe(remote: str, base: list[str]) -> bool:
     return False
 
 
-def _push_config_static_ok(remote: str | None, cwd: str | None = None) -> bool:
-    """Reject locally visible push config before any transport is contacted."""
-    if not remote:
-        return False
-    base = ["git"] + (["-C", cwd] if cwd else [])
-    if not _looks_like_url(remote):
-        got = _git_config_get(base, f"remote.{remote}.push", all_values=True)
-        if got is None or (got[0] == 0 and got[1]):
-            return False
-        got = _git_config_get(base, f"remote.{remote}.mirror", as_bool=True)
-        if got is None or (got[0] == 0 and got[1] == "true"):
-            return False
-        got = _git_config_get(base, f"remote.{remote}.receivepack")
-        if got is None or (got[0] == 0 and got[1]):
-            return False
-    got = _git_config_get(base, "push.recurseSubmodules")
-    if got is None:
-        return False
-    rc, out = got
-    if rc == 0 and out and out.lower() not in _SAFE_RECURSE_SUBMODULES:
-        return False
-    got = _git_config_get(base, "submodule.recurse", as_bool=True)
-    if got is None or (got[0] == 0 and got[1] == "true"):
-        return False
-    got = _git_config_get(base, "push.gpgSign")
-    return got is not None and (got[0] != 0 or got[1].lower() in _SAFE_PUSH_GPG_SIGN)
-
-
 class _DryRunRef(NamedTuple):
     flag: str
     src: str
@@ -12597,7 +12569,9 @@ def _parse_push_porcelain(out: str) -> tuple[_DryRunBlock, ...] | None:
     return tuple(blocks)
 
 
-def _push_dry_run(positionals: list[str], cwd: str | None) -> tuple[_DryRunBlock, ...] | None:
+def _push_dry_run(
+    positionals: list[str], cwd: str | None, family_flags: tuple[str, ...] = ()
+) -> tuple[_DryRunBlock, ...] | None:
     """Append positionals and fail closed; this contacts the real push URL and runs credential helpers or SSH.
 
     The transport precheck limits that side effect to supported transports;
@@ -12615,6 +12589,7 @@ def _push_dry_run(positionals: list[str], cwd: str | None) -> tuple[_DryRunBlock
             "--porcelain",
             "--no-verify",
             "--recurse-submodules=no",
+            *family_flags,
             *positionals,
         ]
     )
@@ -12664,6 +12639,40 @@ def _push_url_transport(url: str) -> str | None:
     return "local"
 
 
+def _push_url_without_userinfo(url: str) -> str:
+    """Remove only userinfo from supported scheme URLs."""
+    scheme = _URL_SCHEME_RE.match(url)
+    if (
+        scheme is None
+        or scheme.group(1).lower() not in _ALLOWED_PUSH_URL_SCHEMES
+        or not url.startswith("//", scheme.end())
+    ):
+        return url
+    authority_start = scheme.end() + 2
+    authority_end = min(
+        (index for separator in "/?#" if (index := url.find(separator, authority_start)) >= 0),
+        default=len(url),
+    )
+    userinfo_end = url.rfind("@", authority_start, authority_end)
+    if userinfo_end < 0:
+        return url
+    return url[:authority_start] + url[userinfo_end + 1 :]
+
+
+def _push_family_flags(seg) -> tuple[str, ...]:
+    """Address-family selectors the dry-run must use just like the real push."""
+    stream = push_arg_stream(getattr(seg, "argv", None) or [])
+    if stream is None:
+        return ()
+    flags = []
+    for arg in stream:
+        if arg.kind is PushArgKind.SHORT and arg.text in {"4", "6"}:
+            flags.append(f"-{arg.text}")
+        elif arg.kind is PushArgKind.LONG and arg.text in {"--ipv4", "--ipv6"}:
+            flags.append(arg.text)
+    return tuple(flags)
+
+
 def _push_transport_precheck(urls: set[str], remote: str | None, cwd: str | None) -> bool:
     """Refuse helper transports and SSH overrides before contacting any push URL."""
     if not urls:
@@ -12692,18 +12701,27 @@ def _push_dry_run_verdict(
 
     The dry run contacts the push URL and can run credential helpers or SSH, so
     the transport precheck runs first and a recorded allowlist entry is checked
-    before this function is called.
+    before this function is called. Repository-selection overrides refuse
+    probing, and the porcelain destination must match a precheck URL.
     """
+    if _repo_selection_env_set():
+        return None
     positionals = _push_ref_positionals(getattr(seg, "argv", None) or [])
     if positionals is None or not cur or not remote:
         return None
     urls = _push_dest_urls(remote, cwd)
     if not urls or not _push_transport_precheck(urls, remote, cwd):
         return None
-    blocks = _push_dry_run(positionals, cwd)
+    blocks = _push_dry_run(positionals, cwd, _push_family_flags(seg))
     if blocks is None or len(blocks) != 1 or len(blocks[0].refs) != 1:
         return None
     block = blocks[0]
+    if not any(
+        block.url == url
+        or _push_url_without_userinfo(block.url) == _push_url_without_userinfo(url)
+        for url in urls
+    ):
+        return None
     ref = block.refs[0]
     if ref.dst != f"refs/heads/{cur}" or ref.src not in ("HEAD", f"refs/heads/{cur}"):
         return None
@@ -12830,8 +12848,8 @@ def _push_targets_current_branch(
       3. The segment runs ``git`` directly — no ``VAR=value`` assignment or
          wrapper before it (``_push_seg_has_no_prefix``): an assignment such as
          ``GIT_CONFIG_COUNT=…`` hands the push config the checks below cannot see.
-      4. ``_push_config_static_ok`` rejects configured refspecs, mirror mode,
-         receive-pack helpers, recursion, and signing before any probe.
+      4. Main's full ``_push_config_is_simple`` gate rejects unsafe push config
+         and push/fetch URL differences before any probe.
     Conservative by construction: any unrecognized form re-prompts. argv-based
     (quote-stripped).
     """
@@ -12857,7 +12875,7 @@ def _push_targets_current_branch(
             return False
     # Every recognised shape — bare, `<remote>`, `<remote> <ref>`, `<remote>
     # <src>:<dst>` — ends here with only local config reads.
-    return _push_config_static_ok(remote, cwd=cwd)
+    return _push_config_is_simple(remote, cwd=cwd)
 
 
 #: git subcommands that may share a command with an auto-allowed re-push. None

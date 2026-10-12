@@ -527,19 +527,13 @@ class TestPushConfigIsSimple:
         ):
             assert guard_module._push_config_is_simple("origin") is False
 
-    def test_empty_recurse_is_safe_offline_and_static(self, guard_module):
+    def test_empty_recurse_is_safe(self, guard_module):
         with patch.object(
             guard_module.subprocess,
             "run",
             side_effect=_config_run({"push.recurseSubmodules": (0, "")}),
         ):
             assert guard_module._push_config_is_simple("origin") is True
-        with patch.object(
-            guard_module.subprocess,
-            "run",
-            side_effect=_config_run({"push.recurseSubmodules": (0, "")}),
-        ):
-            assert guard_module._push_config_static_ok("origin") is True
 
     def test_recurse_submodules_check_ok(self, guard_module):
         with patch.object(
@@ -600,12 +594,12 @@ class TestPushConfigIsSimple:
             assert guard_module._push_config_is_simple("origin") is False
 
 
-class TestPushConfigStaticOk:
-    """The local static subset refuses config that can broaden a push."""
+class TestAdditionalPushConfigIsSimpleCases:
+    """Additional cases for the full push-config gate."""
 
     def test_all_unset_is_simple(self, guard_module):
         with patch.object(guard_module.subprocess, "run", side_effect=_config_run({})):
-            assert guard_module._push_config_static_ok("origin") is True
+            assert guard_module._push_config_is_simple("origin") is True
 
     @pytest.mark.parametrize("value", ["HEAD:main"])
     def test_custom_push_refspec_not_simple(self, guard_module, value):
@@ -614,7 +608,7 @@ class TestPushConfigStaticOk:
             "run",
             side_effect=_config_run({"remote.origin.push": (0, value)}),
         ):
-            assert guard_module._push_config_static_ok("origin") is False
+            assert guard_module._push_config_is_simple("origin") is False
 
     @pytest.mark.parametrize("key", ["remote.origin.push", "remote.origin.receivepack"])
     def test_empty_remote_values_match_offline_predicate(self, guard_module, key):
@@ -629,7 +623,7 @@ class TestPushConfigStaticOk:
             "run",
             side_effect=_config_run({key: (0, "")}),
         ):
-            assert guard_module._push_config_static_ok("origin") is True
+            assert guard_module._push_config_is_simple("origin") is True
 
     def test_mirror_true_not_simple(self, guard_module):
         with patch.object(
@@ -637,7 +631,7 @@ class TestPushConfigStaticOk:
             "run",
             side_effect=_config_run({"remote.origin.mirror": (0, "true")}),
         ):
-            assert guard_module._push_config_static_ok("origin") is False
+            assert guard_module._push_config_is_simple("origin") is False
 
     def test_receivepack_set_not_simple(self, guard_module):
         with patch.object(
@@ -645,7 +639,7 @@ class TestPushConfigStaticOk:
             "run",
             side_effect=_config_run({"remote.origin.receivepack": (0, "/x/helper")}),
         ):
-            assert guard_module._push_config_static_ok("origin") is False
+            assert guard_module._push_config_is_simple("origin") is False
 
     @pytest.mark.parametrize("value", ["on-demand", "only", "true"])
     def test_recurse_submodules_unsafe_not_simple(self, guard_module, value):
@@ -654,7 +648,7 @@ class TestPushConfigStaticOk:
             "run",
             side_effect=_config_run({"push.recurseSubmodules": (0, value)}),
         ):
-            assert guard_module._push_config_static_ok("origin") is False
+            assert guard_module._push_config_is_simple("origin") is False
 
     @pytest.mark.parametrize("value", ["no", "false", "off", "0", "check", ""])
     def test_recurse_submodules_safe_values_match_offline(self, guard_module, value):
@@ -669,7 +663,7 @@ class TestPushConfigStaticOk:
             "run",
             side_effect=_config_run({"push.recurseSubmodules": (0, value)}),
         ):
-            assert guard_module._push_config_static_ok("origin") is True
+            assert guard_module._push_config_is_simple("origin") is True
 
     def test_submodule_recurse_true_not_simple(self, guard_module):
         with patch.object(
@@ -677,7 +671,7 @@ class TestPushConfigStaticOk:
             "run",
             side_effect=_config_run({"submodule.recurse": (0, "true")}),
         ):
-            assert guard_module._push_config_static_ok("origin") is False
+            assert guard_module._push_config_is_simple("origin") is False
 
     @pytest.mark.parametrize("value", ["true", "if-asked", ""])
     def test_gpg_sign_set_not_simple(self, guard_module, value):
@@ -692,7 +686,7 @@ class TestPushConfigStaticOk:
             "run",
             side_effect=_config_run({"push.gpgSign": (0, value)}),
         ):
-            assert guard_module._push_config_static_ok("origin") is False
+            assert guard_module._push_config_is_simple("origin") is False
 
     @pytest.mark.parametrize("value", ["false", "no", "off", "0"])
     def test_gpg_sign_false_values_match_offline(self, guard_module, value):
@@ -703,24 +697,24 @@ class TestPushConfigStaticOk:
         with patch.object(
             guard_module.subprocess, "run", side_effect=_config_run({"push.gpgSign": (0, value)})
         ):
-            assert guard_module._push_config_static_ok("origin") is True
+            assert guard_module._push_config_is_simple("origin") is True
 
 
 class TestPushTargetsCurrentBranch:
-    """The local shape/static-config gate recognizes only plain current-branch pushes."""
+    """The full config gate and local shape recognize plain current-branch pushes."""
 
     def _t(self, guard_module, cmd, cur):
         return guard_module._push_targets_current_branch(_push_seg(cmd), cur, "origin")
 
-    # ── explicit `<remote> <cur>` → local shape and static config ──
+    # ── explicit `<remote> <cur>` → local shape and full config gate ──
 
     @pytest.fixture(autouse=True)
-    def _static_config(self, guard_module):
-        with patch.object(guard_module, "_push_config_static_ok", return_value=True):
+    def _full_config(self, guard_module):
+        with patch.object(guard_module, "_push_config_is_simple", return_value=True):
             yield
 
-    def test_explicit_current_branch_needs_static_config(self, guard_module):
-        with patch.object(guard_module, "_push_config_static_ok", return_value=False):
+    def test_explicit_current_branch_needs_full_config_gate(self, guard_module):
+        with patch.object(guard_module, "_push_config_is_simple", return_value=False):
             assert self._t(guard_module, "git push origin feat", "feat") is False
 
     def test_explicit_current_branch(self, guard_module):
@@ -782,19 +776,19 @@ class TestPushTargetsCurrentBranch:
         for cmd in ("git push -ud origin feat", "git push -du origin feat", "git push -qd origin feat"):
             assert self._t(guard_module, cmd, "feat") is False, cmd
 
-    # ── bare / remote-only → gated on local static config ──
+    # ── bare / remote-only → gated on the full config predicate ──
 
     def test_bare_push_simple_config_true(self, guard_module):
-        with patch.object(guard_module, "_push_config_static_ok", return_value=True):
+        with patch.object(guard_module, "_push_config_is_simple", return_value=True):
             assert self._t(guard_module, "git push", "feat") is True
 
     def test_bare_push_nonsimple_config_false(self, guard_module):
-        with patch.object(guard_module, "_push_config_static_ok", return_value=False):
+        with patch.object(guard_module, "_push_config_is_simple", return_value=False):
             assert self._t(guard_module, "git push", "feat") is False
 
     def test_remote_only_uses_effective_remote(self, guard_module):
         # The config check keys on the caller-resolved `remote`, not positionals[0].
-        with patch.object(guard_module, "_push_config_static_ok", return_value=True) as cfg:
+        with patch.object(guard_module, "_push_config_is_simple", return_value=True) as cfg:
             assert self._t(guard_module, "git push origin", "feat") is True
         assert cfg.call_args_list[0].args[0] == "origin"
 
