@@ -1121,6 +1121,10 @@ def test_the_chained_create_alone_skips_the_would_publish_probe(
         # `-t=` is read as an empty title (Codex P2, comment 4179903846).
         (["gh", "pr", "create", "-t", "t", "-F=f"], True),
         (["gh", "pr", "create", "-t=", "-b", "b"], False),
+        # GitHub rejects titles over 256 characters (Codex P2, comment 4249185535).
+        (["gh", "pr", "create", "-t", "x" * 256, "-b", "b"], True),
+        (["gh", "pr", "create", "-t", "x" * 257, "-b", "b"], False),
+        (["gh", "pr", "create", "--title=" + "x" * 257, "--fill"], False),
         # gh: "specify only one of `--body` or `--body-file`" (review SF1).
         (["gh", "pr", "create", "-t", "t", "--body", "x", "--body-file", "f"], False),
         (["gh", "pr", "create", "-t", "t", "-b", "x", "-F", "f"], False),

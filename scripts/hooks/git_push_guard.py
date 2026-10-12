@@ -13706,6 +13706,11 @@ _CREATE_BODY_FILE_MAX = 1024 * 1024
 #: one, per the review of this rule; not re-measured here). A longer body fails
 #: the create AFTER the push, so it does not qualify, from a file or literal.
 _CREATE_BODY_MAX_CHARS = 65536
+#: The longest PR title that qualifies, in characters. GitHub rejects longer
+#: titles, so the create would fail AFTER the push. The figure is the one this
+#: repository already enforces for issue titles (scripts/file_tracker_issue.py,
+#: "GitHub rejects titles beyond ~256"); not re-measured for PRs here.
+_CREATE_TITLE_MAX_CHARS = 256
 
 
 def _body_file_is_readable(path: str) -> bool:
@@ -13828,6 +13833,8 @@ def _create_opts_open_a_ready_pr(argv: list[str], cwd: str | None = None) -> boo
     titles = values.get("title", [])
     if titles and not titles[-1].strip():
         return False  # gh keeps the LAST value of a repeated flag
+    if any(len(t) > _CREATE_TITLE_MAX_CHARS for t in titles):
+        return False
     if values.get("body") and values.get("body-file"):
         # gh: "specify only one of `--body` or `--body-file`", after the push.
         return False
@@ -14028,7 +14035,8 @@ def _first_push_needs_pr_text(branch: str) -> str:
         f"terminal gh needs BOTH a non-empty title (--title/-t) AND a body "
         f"(--body/-b, or --body-file/-F naming a readable UTF-8 file — not `-`; "
         f"only one of the two, and at most 65,536 characters), OR "
-        f"exactly one of --fill/-f, --fill-first, --fill-verbose; otherwise it "
+        f"exactly one of --fill/-f, --fill-first, --fill-verbose; a title is at "
+        f"most 256 characters; otherwise it "
         f"fails after the push and leaves the branch with no PR. It may also "
         f"carry --no-maintainer-edit. Values must be literal: no `$`, backtick, "
         f"backslash, `*`, `?`, `[`, `{{` or `~` anywhere in the create (put the "
@@ -14850,10 +14858,16 @@ def _run_merge_and_push_gates() -> int:
                         dry_run = _push_is_dry_run(push_segs[0])
                         chained_create = _push_then_pr_create(segs, push_segs[0], cmd, pcwd)
                         # The create is exempt from its would-publish probe only
-                        # when the push before it really publishes: after a dry
-                        # run the branch is still not on the remote, so the
-                        # create is judged like any other.
-                        if not dry_run:
+                        # where THIS rule judged it: a push that really
+                        # publishes (after a dry run the branch is still not on
+                        # the remote) to the configured public repo, whose
+                        # first push is denied unless the create qualifies.
+                        # Everywhere else the create keeps its probe and its
+                        # non-routine prompt, exactly as without this rule:
+                        # off the public repo `push_routine: off` could
+                        # otherwise silence a create that gh aims at another
+                        # repository (an inherited GH_REPO, say).
+                        if not dry_run and _no_pr_block_applies(urls):
                             first_push_create_seg = chained_create
                         # ON THE PUBLIC REPO a first push of the CURRENT branch
                         # must bring its PR with it. Nothing else makes the PR
@@ -15148,7 +15162,9 @@ def _run_merge_and_push_gates() -> int:
         # once the push succeeded, when the branch IS on the remote, and the push
         # itself has already been judged (deny, ask, or a silenced note). The
         # marker is set only for a push that is not a dry run — after `git push
-        # -n` the branch is still absent, so that create keeps its probe.
+        # -n` the branch is still absent, so that create keeps its probe — and
+        # only when the push targets the configured public repo, where the
+        # first-push rule judged the create; off it the create keeps its probe.
         if create_segs and any(
             _pr_create_would_publish(s.argv) for s in create_segs if s is not first_push_create_seg
         ):

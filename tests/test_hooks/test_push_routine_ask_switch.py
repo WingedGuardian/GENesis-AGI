@@ -224,6 +224,41 @@ def test_a_publishing_create_beside_a_routine_push_still_asks(
     _assert_asks(*_run(monkeypatch, tmp_path / "own", capsys, command, _OWNED_ORIGIN))
 
 
+@pytest.mark.parametrize("gh_repo", [None, "stranger/repo"], ids=["no-GH_REPO", "GH_REPO"])
+def test_a_qualifying_chained_create_off_the_public_repo_keeps_its_prompt(
+    monkeypatch, tmp_path, capsys, off, create_publishes, gh_repo
+) -> None:
+    """Codex P2 (comment 4249185519): the chained create's exemption from its
+    would-publish probe belongs to the first-push rule, which only applies on
+    the public repo. Off it — here an owned private repository, with the push a
+    routine prompt — the create keeps its probe and its non-routine prompt, so
+    `push_routine: off` cannot silence a create gh may aim elsewhere (an
+    inherited GH_REPO, say)."""
+    if gh_repo:
+        monkeypatch.setenv("GH_REPO", gh_repo)
+    command = "git push -u origin HEAD && gh pr create -t t -b b"
+    rc, out, err = _run(monkeypatch, tmp_path, capsys, command, _OWNED_ORIGIN)
+    _assert_asks(rc, out, err)
+    assert (
+        "push_routine is off, but this command did not qualify"
+        in (_hso(out)["permissionDecisionReason"])
+    )
+
+
+def test_a_qualifying_chained_create_on_the_public_repo_is_still_exempt(
+    monkeypatch, tmp_path, capsys, create_publishes
+) -> None:
+    """Control for the test above: on the public repo the first-push rule judged
+    the create, so its probe is skipped and `push_publish: off` silences the
+    chained form, exactly as before."""
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "push_publish=off")
+    rc, out, err = _run(
+        monkeypatch, tmp_path, capsys, "git push -u origin HEAD && gh pr create -t t -b b"
+    )
+    assert rc == 0 and "permissionDecision" not in _hso(out), (rc, out, err)
+    assert "hooks.asks.push_publish: off" in _hso(out)["additionalContext"], out
+
+
 def test_close_then_repush_is_silenced(monkeypatch, tmp_path, capsys, off) -> None:
     monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
     rc, out, err = _run(monkeypatch, tmp_path, capsys, "gh pr close 5 && git push origin HEAD")
