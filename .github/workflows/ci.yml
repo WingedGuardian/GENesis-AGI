@@ -1057,7 +1057,8 @@ jobs:
         # tests/test_scripts/test_session_doors.py +6. No added skips.
         # Floor: 25687 + 1 + 3 + 1 + 6 = 25698.
         # Hook-output property tests (#3187): new test_hook_output_properties.py
-        # collects 7 tests. The two strict xfails pin #3236 and #3237, and
-        # JUnit counts xfail as skipped, so ceiling 104 -> 106.
-        # Floor: 25698 + 7 = 25705.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 106 --min-collected 25705
+        # collects 8 tests. The strict xfails pin #3236 and #3237 (accounting
+        # plus writer path), and JUnit counts xfail as skipped, so ceiling
+        # 104 -> 107.
+        # Floor: 25698 + 8 = 25706.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 107 --min-collected 25706

@@ -17,13 +17,11 @@ from tests.conftest import private_module
 _HOOKS_DIR = Path(__file__).resolve().parent.parent.parent / "scripts" / "hooks"
 _ho = private_module("hook_output_properties_under_test", _HOOKS_DIR / "hook_output.py")
 
-settings.register_profile(
-    "genesis_hook_output_properties",
+_PROPERTY_SETTINGS = settings(
     derandomize=True,
     max_examples=75,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
-settings.load_profile("genesis_hook_output_properties")
 
 _TRUNCATION_NOTE = f"\n[truncated — over the {_ho.HOOK_STDOUT_CAP}-char hook output cap]"
 
@@ -46,6 +44,106 @@ def _stream_cost(stream: io.StringIO) -> int:
     return _ho.utf16_len(stream.getvalue())
 
 
+def _get_path(payload: dict[str, object], path: str) -> object:
+    node: object = payload
+    for part in path.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def _set_path(payload: dict[str, object], path: str, value: str) -> None:
+    node: object = payload
+    parts = path.split(".")
+    for part in parts[:-1]:
+        child = node[part] if isinstance(node, dict) else None
+        if not isinstance(child, dict):
+            return
+        node = child
+    if isinstance(node, dict):
+        node[parts[-1]] = value
+
+
+def _emptied_envelope(
+    payload: dict[str, object],
+    text_keys: tuple[str, ...],
+) -> dict[str, object]:
+    envelope = copy.deepcopy(payload)
+    for path in text_keys:
+        if isinstance(_get_path(envelope, path), str):
+            _set_path(envelope, path, "")
+    return envelope
+
+
+def _permission_decision(payload: dict[str, object]) -> object:
+    return _get_path(payload, "permissionDecision") or _get_path(
+        payload, "hookSpecificOutput.permissionDecision"
+    )
+
+
+@st.composite
+def _json_bounded_case(draw) -> tuple[dict[str, object], tuple[str, ...], int]:
+    mode = draw(
+        st.sampled_from(
+            (
+                "ordinary_trimmable",
+                "ordinary_nested_trimmable",
+                "no_keys",
+                "missing_key",
+                "nonstring_key",
+                "envelope_too_large",
+            )
+        )
+    )
+
+    if mode == "ordinary_trimmable":
+        reason = draw(st.text(alphabet=st.one_of(_ASCII, _UNICODE_EDGE), max_size=180))
+        payload = {"permissionDecision": "deny", "reason": reason}
+        text_keys = ("reason",)
+        noted = {"permissionDecision": "deny", "reason": _TRUNCATION_NOTE}
+        floor = _ho.emit_cost(json.dumps(noted))
+        ceiling = max(floor, _ho.emit_cost(json.dumps(payload)) + 20)
+        return payload, text_keys, draw(st.integers(min_value=floor, max_value=ceiling))
+
+    if mode == "ordinary_nested_trimmable":
+        context = draw(st.text(alphabet=st.one_of(_ASCII, _UNICODE_EDGE), max_size=180))
+        payload = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "additionalContext": context,
+            }
+        }
+        text_keys = ("hookSpecificOutput.additionalContext",)
+        noted = copy.deepcopy(payload)
+        noted["hookSpecificOutput"]["additionalContext"] = _TRUNCATION_NOTE
+        floor = _ho.emit_cost(json.dumps(noted))
+        ceiling = max(floor, _ho.emit_cost(json.dumps(payload)) + 20)
+        return payload, text_keys, draw(st.integers(min_value=floor, max_value=ceiling))
+
+    if mode == "no_keys":
+        payload = {"permissionDecision": "deny", "required": "R" * 260}
+        text_keys = ()
+        envelope = payload
+    elif mode == "missing_key":
+        payload = {"permissionDecision": "deny", "required": "R" * 260}
+        text_keys = ("missing.path",)
+        envelope = payload
+    elif mode == "nonstring_key":
+        payload = {"permissionDecision": "deny", "reason": 123, "required": "R" * 260}
+        text_keys = ("reason",)
+        envelope = payload
+    else:
+        payload = {"permissionDecision": "deny", "required": "R" * 260, "reason": "r" * 20}
+        text_keys = ("reason",)
+        envelope = _emptied_envelope(payload, text_keys)
+
+    envelope_cost = _ho.emit_cost(json.dumps(envelope))
+    return payload, text_keys, draw(st.integers(min_value=1, max_value=envelope_cost - 1))
+
+
+@_PROPERTY_SETTINGS
 @given(text=_TEXT, budget=st.integers(min_value=-10, max_value=300))
 @example(text="🎯", budget=1)
 def test_clip_to_cost_returns_the_longest_prefix_that_fits(text: str, budget: int):
@@ -60,6 +158,7 @@ def test_clip_to_cost_returns_the_longest_prefix_that_fits(text: str, budget: in
         assert _ho.utf16_len(clipped + next_char) > budget
 
 
+@_PROPERTY_SETTINGS
 @given(
     reason=_TEXT,
     context=_TEXT,
@@ -106,36 +205,26 @@ def test_print_json_bounded_true_means_the_emitted_stream_fits(
         assert _stream_cost(sink) <= budget
 
 
-@given(
-    budget=st.integers(min_value=1, max_value=220),
-    mode=st.sampled_from(("no_keys", "missing_key", "nonstring_key", "envelope_too_large")),
-)
+@_PROPERTY_SETTINGS
+@given(case=_json_bounded_case())
 def test_print_json_bounded_false_is_confined_to_documented_cases(
-    budget: int,
-    mode: str,
+    case: tuple[dict[str, object], tuple[str, ...], int],
 ):
-    required = "R" * (budget + 50)
-    payload = {"permissionDecision": "deny", "required": required, "reason": "r" * 20}
-    if mode == "no_keys":
-        text_keys = ()
-    elif mode == "missing_key":
-        text_keys = ("missing.path",)
-    elif mode == "nonstring_key":
-        payload["reason"] = 123
-        text_keys = ("reason",)
-    else:
-        envelope = copy.deepcopy(payload)
-        envelope["reason"] = ""
-        assume(_ho.emit_cost(json.dumps(envelope)) > budget)
-        text_keys = ("reason",)
-
+    payload, text_keys, budget = case
+    original = copy.deepcopy(payload)
+    envelope = _emptied_envelope(original, text_keys)
     sink = io.StringIO()
     fits = _ho.print_json_bounded(payload, text_keys=text_keys, budget=budget, stream=sink)
+    emitted = json.loads(sink.getvalue())
 
-    assert json.loads(sink.getvalue())["permissionDecision"] == "deny"
-    assert fits is False
+    assert _permission_decision(emitted) == "deny"
+    if fits:
+        assert _stream_cost(sink) <= budget
+    else:
+        assert _ho.emit_cost(json.dumps(envelope)) > budget
 
 
+@_PROPERTY_SETTINGS
 @given(
     chunks=st.lists(_TEXT, max_size=12),
     budget=st.integers(min_value=1, max_value=700),
@@ -168,6 +257,7 @@ def test_bounded_stdout_never_emits_over_budget(
     assert out.emitted_chars <= budget
 
 
+@_PROPERTY_SETTINGS
 @given(text=_TEXT, budget=st.integers(min_value=1, max_value=700), mirror_hint=_TEXT)
 @example(text="🎯", budget=2, mirror_hint="")
 def test_print_bounded_never_emits_over_budget(text: str, budget: int, mirror_hint: str):
@@ -184,6 +274,7 @@ def test_print_bounded_never_emits_over_budget(text: str, budget: int, mirror_hi
     strict=True,
     reason="#3236: non-ASCII trimming leaves avoidable budget unused",
 )
+@_PROPERTY_SETTINGS
 @given(size=st.integers(min_value=80, max_value=130), over=st.integers(min_value=1, max_value=25))
 def test_xfail_3236_non_ascii_trimming_uses_the_available_budget(size: int, over: int):
     base = "é" * size
@@ -205,13 +296,31 @@ def test_xfail_3236_non_ascii_trimming_uses_the_available_budget(size: int, over
 
 @pytest.mark.xfail(
     strict=True,
-    reason="#3237: lone surrogate strings can raise UnicodeEncodeError",
+    reason="#3237: lone surrogate accounting can raise UnicodeEncodeError",
 )
+@_PROPERTY_SETTINGS
 @given(text=_LONE_SURROGATE_TEXT, budget=st.integers(min_value=1, max_value=80))
-def test_xfail_3237_lone_surrogates_do_not_raise(text: str, budget: int):
+def test_xfail_3237_lone_surrogate_accounting_does_not_raise(text: str, budget: int):
     _ho.emit_cost(text)
     _ho.clip_to_cost(text, budget)
-    sink = io.StringIO()
-    out = _ho.BoundedStdout(budget, label="hook", stream=sink)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="#3237: lone surrogate writes can raise UnicodeEncodeError",
+)
+@_PROPERTY_SETTINGS
+@given(text=_LONE_SURROGATE_TEXT, budget=st.integers(min_value=1, max_value=80))
+def test_xfail_3237_lone_surrogate_writer_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+    budget: int,
+):
+    def surrogatepass_emit_cost(value: str) -> int:
+        return len(value.encode("utf-16-le", "surrogatepass")) // 2 + 1
+
+    monkeypatch.setattr(_ho, "emit_cost", surrogatepass_emit_cost)
+    encoded_stream = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
+    out = _ho.BoundedStdout(budget, label="hook", stream=encoded_stream)
     out.emit(text, block="surrogate")
-    assert _stream_cost(sink) <= budget
+    encoded_stream.flush()
