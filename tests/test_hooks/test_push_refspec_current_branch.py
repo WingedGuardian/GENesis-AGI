@@ -539,7 +539,6 @@ def test_a_raw_url_destination_refuses_any_push_instead_of(tmp_path, monkeypatch
         ("cd <(git config push.followTags true) && git push origin HEAD", False),
         ("git fetch --upload-pack=/x/prog origin && git push origin HEAD", False),
         ("git push origin HEAD <(git config push.followTags true)", False),
-        ("./git push origin HEAD", False),
         # an ALLOWLISTED subcommand whose output is redirected into config:
         # only the re-tokenize equality sees the stripped redirect
         ("git rev-parse --sq-quote x >> .git/config && git push origin HEAD", False),
