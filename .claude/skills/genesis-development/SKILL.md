@@ -2584,7 +2584,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   independently — with evidence, a confidence, and a falsifier — ask what the
   caller does differently because of its output, and say whether a better shape
   exists (an existing chokepoint it re-implements, a simpler mechanism, a place
-  the problem disappears). Emit the `Design-premise:` block. Also informational,
+  the problem disappears). Emit the `Design-premise:` block exactly as
+  `.claude/docs/premise-check.md` "The output" specifies (code reads it). Also informational,
   and its BROKEN verdict has a HIGH bar: it routes to the EXISTING
   premise-wrong disposition (architecture conversation, or
   `needs-architecture-session` + draft + a `ready` row) rather than to another round, so everything short of "the change cannot do what it
