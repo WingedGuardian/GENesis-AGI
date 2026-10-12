@@ -33,6 +33,15 @@ import pytest  # noqa: F401  (used by fixtures/tests appended below)
 
 _GUARD = Path(__file__).resolve().parents[2] / "scripts" / "hooks" / "git_push_guard.py"
 
+_BLOCKED_COMMAND_CONFIG = (
+    "BLOCKED: this push carries a prefix, wrapper or git config option "
+    "(-c / --config-env / VAR=…). Config supplied that way can retarget the push "
+    "or make it a force push (e.g. remote.<name>.push=+…, "
+    "remote.<name>.pushurl=…) that no flag shows, and the guard cannot read it "
+    "before the command runs.\n"
+    "Retype it as a plain `git push` (`-C <dir>` is fine)."
+)
+
 
 def _run(command: str, *, dispatched: bool = False) -> subprocess.CompletedProcess:
     # Explicitly set the session kind — never leak the ambient value.
@@ -292,7 +301,7 @@ def test_push_via_credential_helper_idiom_detected():
         dispatched=True,
     )
     assert res.returncode == 2
-    assert "git push requires user approval" in res.stderr
+    assert _BLOCKED_COMMAND_CONFIG in res.stderr
 
 
 def test_push_via_sudo_detected():
@@ -330,11 +339,11 @@ def test_push_in_command_substitution_detected():
     assert res.returncode == 2
 
 
-def test_interactive_push_through_wrapper_still_asks():
-    """Detection is session-independent; interactive asks instead of denying."""
+def test_interactive_push_through_wrapper_blocks():
+    """The command-borne config rule is session-independent."""
     res = _run("sudo git push origin main")
-    assert res.returncode == 0
-    assert _decision(res) == "ask"
+    assert res.returncode == 2
+    assert _BLOCKED_COMMAND_CONFIG in res.stderr
 
 
 # ── git commit --no-verify (session-agnostic hard block; unchanged) ──
