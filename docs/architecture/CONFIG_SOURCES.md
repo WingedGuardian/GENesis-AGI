@@ -254,7 +254,10 @@ names, so an overlay of a read-only file is editable (#2446).
    child's env is overwritten by any same-named key in `secrets.env`. The discord-bot
    child never builds that router and keeps the allowlist, and neither does the
    health child when its database is missing: that degraded path returns before the
-   router is built, so file-only keys are absent there.
+   router is built, so file-only keys are absent there. An observe-only recorder logs
+   names-only reads of undeclared `secrets.env` keys to
+   `genesis_home()/logs/mcp_env_reads.jsonl` as evidence for narrowing the allowlist;
+   set `GENESIS_MCP_ENV_RECORDER=0` to disable it.
 7. **`EnvironmentFile=` beats `Environment=`** regardless of order (measured note in
    `scripts/systemd/genesis-disk-hygiene.service.template`): a `PATH` or `TMPDIR` in
    `secrets.env` replaces the server unit's pinned value.

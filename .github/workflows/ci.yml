@@ -1045,4 +1045,9 @@ jobs:
         # Push-argv shared scanner (#2864): the five changed test files collect
         # 996 here and 911 on origin/main b32ef3610 (one file absent there),
         # measured with --collect-only: net +85. Floor: 25463 + 85 = 25548.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25548
+        # MCP env read recorder (W2-1), measured with --collect-only:
+        #   test_mcp_env_reads.py new -> 11
+        #   test_mcp_env_declarations.py new -> 1
+        #   test_api_key_env_names.py new -> 1
+        # Floor: 25548 + 13 = 25561. No added skips.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25561
