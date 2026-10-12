@@ -1060,9 +1060,11 @@ jobs:
         # collect 71 here and 57 on origin/main, measured with
         # --collect-only: test_backup_backends.py 7 -> 20, test_backup_dated_snapshots.py
         # 50 -> 51 (+14). No added skips. Floor: 25698 + 14 = 25712.
+        # Code-only deploy backups (#2629): test_deploy_code_only.py 66 -> 72 (+6).
+        # Floor: 25712 + 6 = 25718.
         # MCP env read recorder (W2-1), measured with --collect-only:
         #   test_mcp_env_reads.py new -> 19
         #   test_mcp_env_declarations.py new -> 1
         #   test_api_key_env_names.py new -> 1
-        # Floor: 25712 + 21 = 25733. No added skips.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25733
+        # Floor: 25718 + 21 = 25739. No added skips.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25739
