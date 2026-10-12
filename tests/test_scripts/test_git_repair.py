@@ -33,6 +33,13 @@ _spec.loader.exec_module(gr)
 # ─── fixtures / helpers ──────────────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _scrub_git_environment(monkeypatch):
+    for key in tuple(os.environ):
+        if key.startswith("GIT_"):
+            monkeypatch.delenv(key)
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -133,6 +140,26 @@ def test_diagnose_detects_zeroed_object(repos):
     names = {c.name: c.ok for c in d.checks}
     assert names["no zeroed loose objects"] is False
     assert names["fsck --full clean"] is False
+
+
+def test_diagnose_reports_missing_blob_sha(repos):
+    _origin, work = repos
+    sha = _git(work, "rev-parse", "HEAD:extra.txt").strip()
+    _loose_blob(work).unlink()
+    d = gr.diagnose(work)
+    assert f"missing blob {sha}" in d.render()
+
+
+def test_diagnose_ignores_invalid_reflog_entry(repos):
+    _origin, work = repos
+    head = _git(work, "rev-parse", "HEAD").strip()
+    reflog = work / ".git" / "logs" / "HEAD"
+    reflog.write_text(
+        reflog.read_text()
+        + f"{head} {'f' * 40} Test <test@example.com> 1 +0000\tinvalid reflog entry\n"
+    )
+    d = gr.diagnose(work)
+    assert d.healthy, d.render()
 
 
 def test_scan_zeroed_only_flags_all_nul(repos):

@@ -1,0 +1,3 @@
+- Bound SMB client shutdown after the operation timeout.
+- Git repair now reports fsck diagnostics from both streams and ignores reflog-only noise.
+- Managed status seeds systemd's user-session environment; Claude Code 2.1.280 subcommands are classified by lifetime.
