@@ -21,8 +21,10 @@ Run in a fresh isolated process with serialized judgments. Global LiteLLM
 observers refuse execution. The dedicated key must differ from all visible
 production OpenRouter credentials and match the frozen fingerprint. Each new
 completion reads its finite nonreset limit, remaining credit and usage; explicit
-`limit_reset: null` is required. Remaining credit must cover the outstanding
-scheduled maxima. A current key snapshot cannot prove exclusive key use,
+`limit_reset: null` is required. Remaining credit, the least of the key's own
+`limit_remaining` and every returned `effective_budget`/`budgets` entry's
+`remaining_usd`, must cover the outstanding scheduled maxima; a malformed
+budget entry refuses. A current key snapshot cannot prove exclusive key use,
 in-flight overshoot, billable reasoning/framing or fees. `max_price` filters
 rates; it is not a per-request dollar cap. The later runner must still require complete admission and concrete owner
 approval of the frozen operating parameters and allowance. An approved operating

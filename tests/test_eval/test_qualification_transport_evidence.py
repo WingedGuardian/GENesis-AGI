@@ -439,6 +439,84 @@ async def test_key_status_requires_finite_nonreset_funded_evidence(change):
         await key_status("synthetic-only-key", transport, required="0.2")
 
 
+def _budget(remaining):
+    """One KeyBudget as OpenRouter's GET /key schema documents it."""
+    return {
+        "scope": "member", "guardrail_id": "synthetic-guardrail", "budget_id": None,
+        "limit_usd": 50, "spend_usd": 32.5, "remaining_usd": remaining,
+        "reset_interval": None, "resets_at": None, "include_byok": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("budgets", "evidence"),
+    [
+        ({}, {"available": "1"}),
+        ({"effective_budget": None}, {"effective_budget_remaining_usd": None, "available": "1"}),
+        (
+            {"effective_budget": None, "budgets": []},
+            {"effective_budget_remaining_usd": None, "budgets_remaining_usd": [], "available": "1"},
+        ),
+        ({"effective_budget": _budget(5)}, {"effective_budget_remaining_usd": "5", "available": "1"}),
+        (
+            {"effective_budget": _budget(0.2), "budgets": [_budget(0.2), _budget(7)]},
+            {
+                "effective_budget_remaining_usd": "0.2",
+                "budgets_remaining_usd": ["0.2", "7"],
+                "available": "0.2",
+            },
+        ),
+    ],
+)
+async def test_key_status_accepts_absent_or_sufficient_budgets(budgets, evidence):
+    """The returned snapshot (journaled on dispatch) shows every deciding remainder."""
+    data = {"limit": 1, "limit_remaining": 1, "usage": 0, "limit_reset": None, **budgets}
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"data": data}))
+    info = await key_status("synthetic-only-key", transport, required="0.2")
+    assert info == {
+        "limit": "1", "limit_remaining": "1", "limit_reset": None, "usage": "0", **evidence,
+    }
+
+
+@pytest.mark.parametrize(
+    "budgets",
+    [
+        {"effective_budget": _budget(0.1)},
+        {"effective_budget": _budget(0)},
+        {"effective_budget": _budget(5), "budgets": [_budget(5), _budget(0.1)]},
+        {"budgets": [_budget(0.1)]},
+    ],
+)
+async def test_effective_budget_below_key_limit_refuses_dispatch(budgets):
+    """The key's own limit covers ``required``; a tighter budget layer does not."""
+    data = {"limit": 1, "limit_remaining": 1, "usage": 0, "limit_reset": None, **budgets}
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"data": data}))
+    with pytest.raises(LocalFailure, match="insufficient"):
+        await key_status("synthetic-only-key", transport, required="0.2")
+
+
+@pytest.mark.parametrize(
+    "budgets",
+    [
+        {"effective_budget": "synthetic"},
+        {"effective_budget": []},
+        {"effective_budget": {k: v for k, v in _budget(5).items() if k != "remaining_usd"}},
+        {"effective_budget": _budget("5")},
+        {"effective_budget": _budget(True)},
+        {"effective_budget": _budget(None)},
+        {"effective_budget": _budget(-1)},
+        {"budgets": "synthetic"},
+        {"budgets": [None]},
+        {"budgets": [_budget("5")]},
+    ],
+)
+async def test_malformed_budget_evidence_refuses_dispatch(budgets):
+    data = {"limit": 1, "limit_remaining": 1, "usage": 0, "limit_reset": None, **budgets}
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"data": data}))
+    with pytest.raises(LocalFailure):
+        await key_status("synthetic-only-key", transport, required="0.2")
+
+
 async def test_get_only_billing_and_offline_full_history_recovery(tmp_path, isolated_key):
     campaign, expected = wire_campaign(tmp_path)
     sent = []
@@ -780,6 +858,21 @@ def test_raw_numeric_lexemes_survive_credential_redaction(monkeypatch, encoded):
     result = pinned.safe_body(raw)
     assert "1.2300e-4" in result
     assert json.loads(result)["content"] == "echo [REDACTED]"
+
+
+@pytest.mark.parametrize("encoded", [False, True])
+def test_credential_digits_inside_a_json_number_stay_valid_json(monkeypatch, encoded):
+    """A numeric secret colliding with a cost lexeme must not corrupt the retained body."""
+    monkeypatch.setenv("SYNTHETIC_DB_PASSWORD", "12345678")
+    echo = "".join("\\u" + format(ord(char), "04x") for char in "12345678") if encoded else "12345678"
+    raw = ('{"usage":{"cost":0.12345678},"content":"echo ' + echo + '"}').encode()
+    for result in (pinned.safe_body(raw), pinned.safe_evidence({"raw_body": pinned.safe_body(raw)})["raw_body"]):
+        assert '"cost":0.12345678' in result
+        assert json.loads(result)["content"] == "echo [REDACTED]"
+        assert financial_json(result.encode(), (("usage", "cost"),))["usage"]["cost"] == "0.12345678"
+    # Non-JSON diagnostic text keeps the unrestricted literal pass.
+    assert pinned.safe_text("RAW 12345678 tail") == "RAW [REDACTED] tail"
+    assert pinned.safe_text("12345678") == "[REDACTED]"
 
 
 @pytest.mark.parametrize("surface", ["message", "exception", "stack"])

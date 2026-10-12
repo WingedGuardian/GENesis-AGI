@@ -26,7 +26,7 @@ from genesis.routing.config import load_config_from_string
 from genesis.routing.litellm_delegate import LiteLLMDelegate
 from genesis.routing.types import RoutingResult
 
-from .accounting import total
+from .accounting import currency, total
 from .corpus import route, versions
 from .evidence import Incomplete, canonical, digest, load_json
 
@@ -39,6 +39,12 @@ ROUTE_KEYS = {"temperature", "max_tokens", "top_p", "seed", "reasoning"}
 # Processing bound, not billing precision: never round evidence to fit it.
 # Refusal retains raw evidence and the attempt's funded maximum liability.
 MAX_CURRENCY_CHARS = 4096
+# The binding limit is the delegate's whole-call wall clock (asyncio.wait_for).
+# Every HTTPX client gets the same value, which HTTPX applies per phase
+# (connect/read/write/pool), so it never cuts a response off before the wall
+# clock does. A response slower than the wall clock leaves a dispatched
+# attempt for the existing GET-only recovery path; it is never resent.
+COMPLETION_TIMEOUT_S = 120
 
 
 class LocalFailure(Incomplete):
@@ -59,8 +65,21 @@ def _literal_text(value: str) -> str:
     return value
 
 
+def _json_document(value: str) -> bool:
+    """True for a JSON object/array: outside its strings are only numbers and literals."""
+    try:
+        return isinstance(json.loads(value), (dict, list))
+    except (ValueError, RecursionError):
+        return False
+
+
 def safe_text(value: str) -> str:
-    """Redact literal and JSON-escaped credentials in arbitrary diagnostic text."""
+    """Redact literal and JSON-escaped credentials in arbitrary diagnostic text.
+
+    A JSON object/array is redacted only inside its string tokens, so a numeric
+    lexeme that happens to contain a credential's digits stays valid JSON.
+    Other text also gets a final literal pass over everything.
+    """
     def redact(match):
         token = match.group()
         try:
@@ -70,7 +89,8 @@ def safe_text(value: str) -> str:
         redacted = _literal_text(decoded)
         return json.dumps(redacted) if redacted != decoded else token
 
-    return _literal_text(re.sub(r'"(?:[^"\\]|\\.)*"', redact, value))
+    strings = re.sub(r'"(?:[^"\\]|\\.)*"', redact, value)
+    return strings if _json_document(value) else _literal_text(strings)
 
 
 def safe_evidence(value):
@@ -81,6 +101,27 @@ def safe_evidence(value):
     if isinstance(value, list):
         return [safe_evidence(item) for item in value]
     return value
+
+
+def safe_money_evidence(value: dict, money: dict[tuple, str]) -> dict:
+    """Redact evidence, keeping validated money fields out of the literal pass.
+
+    ``money`` maps a path to an amount that already passed ``financial_json``.
+    A bare decimal string is not a JSON document, so the generic redactor would
+    rewrite a credential's digits inside it and Journal could never settle it.
+    An amount is re-inserted only when it is still a pure decimal string.
+    """
+    result = safe_evidence(value)
+    for path, amount in money.items():
+        try:
+            currency(amount)
+        except Incomplete:
+            continue  # Not proven pure money: keep the redacted form.
+        target = result
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = amount
+    return result
 
 
 def safe_body(data: bytes) -> str:
@@ -249,17 +290,20 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
     returns. No outer SDK success or cancellable cleanup substitutes for it.
     """
 
-    def __init__(self, expected: dict, key: str, record, *, transport=None):
+    def __init__(self, expected: dict, key: str, record, *, transport=None, timeout=COMPLETION_TIMEOUT_S):
         self.expected, self.key, self.record = load_json(canonical(expected)), key, record
         self.posts = 0
         self.observed = None
         self.error = None
         self._transport = transport
-        super().__init__()
+        super().__init__(timeout=timeout)
 
-    def create_client(self, **_kwargs):
+    def create_client(self, *, timeout=None, **_kwargs):
+        # Every client (initial and AsyncHTTPHandler's replacement after a dropped
+        # connection) keeps the delegate's ceiling, never HTTPX's 5-second default.
         return httpx.AsyncClient(
             transport=self._transport,
+            timeout=self.timeout if timeout is None else timeout,
             follow_redirects=False,
             event_hooks={"request": [self.before], "response": [self.after]},
         )
@@ -309,8 +353,10 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
 
     def record_response(self, response: httpx.Response, data: bytes):
         raw_body = safe_body(data)
+        money = {}
         try:
             raw = financial_json(data, (("usage", "cost"),))
+            money[("usage", "cost")] = raw["usage"]["cost"]
         except LocalFailure as exc:
             self.error = str(exc)
             # Preserve valid identity/content even when cost is absent or invalid.
@@ -331,7 +377,7 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
             self.error = self.error or "provider response has no usable answer"
         identity = _response_identity(raw, response.headers)
         self.error = self.error or identity["error"]
-        self.observed = safe_evidence(
+        self.observed = safe_money_evidence(
             {
                 "http_status": response.status_code,
                 "raw_body": raw_body,
@@ -345,7 +391,8 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
                 },
                 "content": content if isinstance(content, str) else None,
                 "error": self.error,
-            }
+            },
+            money,
         )
         # Synchronous durable append: auth/SDK/close may raise after this returns.
         self.record(self.observed)
@@ -430,6 +477,38 @@ def scoped_credential(key: str):
                 os.environ[name] = value
 
 
+def _budget_paths(raw: bytes) -> tuple[tuple, ...]:
+    """Every returned budget remainder, which must parse as nonnegative money.
+
+    OpenRouter's GET /key documents ``budgets`` (KeyBudget list) and
+    ``effective_budget`` (KeyBudget or null), each with ``remaining_usd``.
+    Absent fields add nothing; any present, malformed one refuses.
+    """
+    try:
+        data = load_json(raw)["data"]
+    except (ValueError, UnicodeError, KeyError, TypeError):
+        return ()  # financial_json reports the malformed envelope itself
+    if not isinstance(data, dict):
+        return ()
+    paths = []
+    if data.get("effective_budget") is not None:
+        if not isinstance(data["effective_budget"], dict):
+            raise LocalFailure("effective_budget is not a budget object")
+        paths.append(("data", "effective_budget", "remaining_usd"))
+    if "budgets" in data:
+        budgets = data["budgets"]
+        if not isinstance(budgets, list) or not all(isinstance(item, dict) for item in budgets):
+            raise LocalFailure("budgets is not a list of budget objects")
+        paths.extend(("data", "budgets", index, "remaining_usd") for index in range(len(budgets)))
+    return tuple(paths)
+
+
+def _at(data, path):
+    for key in path:
+        data = data[key]
+    return data
+
+
 async def key_status(key: str, transport=None, *, required="0") -> dict:
     """Read an explicit nonreset limit; a snapshot is not spending approval."""
     with private_logs():
@@ -440,9 +519,10 @@ async def key_status(key: str, transport=None, *, required="0") -> dict:
                 )
             if response.status_code != 200:
                 raise LocalFailure("could not read the dedicated key's limit")
+            budgets = _budget_paths(response.content)
             parsed = financial_json(
                 response.content,
-                tuple(("data", name) for name in ("limit", "limit_remaining", "usage")),
+                (("data", "limit"), ("data", "limit_remaining"), ("data", "usage"), *budgets),
             )
             if "error" in parsed:
                 raise LocalFailure("dedicated key lookup returned an error envelope")
@@ -452,9 +532,14 @@ async def key_status(key: str, transport=None, *, required="0") -> dict:
             limit, remaining, usage = (
                 Decimal(data[name]) for name in ("limit", "limit_remaining", "usage")
             )
+            # limit/limit_remaining describe only the key's own limit; a member,
+            # workspace or guardrail budget can block requests first.
+            available = min(
+                [remaining, *(Decimal(_at(data, path[1:])) for path in budgets)]
+            )
             if (
-                remaining <= 0
-                or remaining < Decimal(required)
+                available <= 0
+                or available < Decimal(required)
                 or remaining > limit
                 or usage > limit
             ):
@@ -463,7 +548,15 @@ async def key_status(key: str, transport=None, *, required="0") -> dict:
                 )
         except (httpx.HTTPError, ValueError, KeyError, TypeError, DecimalException) as exc:
             raise LocalFailure(safe_text(str(exc))) from None
-    return {name: data[name] for name in ("limit", "limit_remaining", "limit_reset", "usage")}
+    info = {name: data[name] for name in ("limit", "limit_remaining", "limit_reset", "usage")}
+    # The budget remainders that decided dispatch, as returned (null stays null).
+    if "effective_budget" in data:
+        effective = data["effective_budget"]
+        info["effective_budget_remaining_usd"] = None if effective is None else effective["remaining_usd"]
+    if "budgets" in data:
+        info["budgets_remaining_usd"] = [item["remaining_usd"] for item in data["budgets"]]
+    info["available"] = format(available, "f")
+    return info
 
 
 def dedicated_key() -> str:
@@ -572,7 +665,8 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None):
         # Invalid evidence is still durable; Journal refuses settlement.
         journal.settle(attempt, safe_evidence(evidence))
         raise LocalFailure(evidence["error"]) from None
-    journal.settle(attempt, safe_evidence(evidence))
+    # charge was set last inside the try, only after financial_json validated it.
+    journal.settle(attempt, safe_money_evidence(evidence, {("charge",): evidence["charge"]}))
     return evidence
 
 
@@ -900,6 +994,7 @@ class PinnedRouter:
                         success_callback=[],
                         failure_callback=[],
                         caching=False,
+                        timeout=COMPLETION_TIMEOUT_S,
                         extra_body=extra,
                         **flat,
                     )

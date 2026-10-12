@@ -1050,6 +1050,6 @@ jobs:
         # +4, test_browser_cli_card_guard +4 (new), test_output_scanner +3,
         # test_capability_shadow_wiring +1; no added skips. Floor: 25548 + 139 = 25687.
         # Qualification transport (#3134): the four changed test files collect
-        # 278 here and 28 on origin/main (three absent there), measured with
-        # --collect-only: +250. Floor: 25687 + 250 = 25937; ceiling stays 104.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25937
+        # 302 here and 28 on origin/main (three absent there), measured with
+        # --collect-only: +274. Floor: 25687 + 274 = 25961; ceiling stays 104.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25961

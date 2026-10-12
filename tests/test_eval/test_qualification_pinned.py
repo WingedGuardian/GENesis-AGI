@@ -311,6 +311,92 @@ async def test_client_retry_after_a_dropped_connection_never_sends_twice(env):
     assert len(completions) == 1
 
 
+async def test_numeric_secret_inside_cost_still_settles_exactly(env, monkeypatch):
+    """A digits-only credential inside a paid cost must not corrupt settled money.
+
+    Real path: ObservedHTTPHandler -> campaign.observe -> reconcile -> Journal.
+    """
+    monkeypatch.setenv("SYNTHETIC_DB_PASSWORD", "12345678")
+    cost = "0.00012345678"
+    data, server = bundle(env), Gateway()
+
+    def transport(request):
+        response = server(request)
+        body = json.loads(response.content)
+        if request.url.path == "/api/v1/key":
+            body["data"]["effective_budget"] = {"remaining_usd": 0.5}
+        elif request.url.path == "/api/v1/generation":
+            body["data"]["total_cost"] = float(cost)
+        else:
+            body["usage"]["cost"] = float(cost)
+        content = json.dumps(body).encode()
+        assert request.url.path == "/api/v1/key" or cost.encode() in content
+        return httpx.Response(response.status_code, content=content)
+
+    with data.campaign:
+        result = await ask(
+            router(data, server, transport=httpx.MockTransport(transport)), data.messages
+        )
+        assert result.content == '{"score": 1}'
+        row = data.campaign.attempt("case-1")
+        assert row["observations"][0]["usage"]["cost"] == cost
+        assert cost in row["observations"][0]["raw_body"]
+        assert row["totals"] == (pinned.Decimal(cost), 0)
+        state = data.campaign.state
+        assert state.settled == pinned.Decimal(cost) and state.reserved == 0
+        receipt = [line for line in data.campaign.lines if line["kind"] == "billing"][-1]["receipt"]
+        assert receipt["charge"] == cost
+        dispatch = next(line for line in data.campaign.lines if line["kind"] == "dispatch")
+        assert dispatch["key_status"]["effective_budget_remaining_usd"] == "0.5"
+        assert dispatch["key_status"]["available"] == "0.5"
+        # Settled answer replays offline without any further completion.
+        assert (await ask(router(data, server, dispatch=False), data.messages)).content
+    assert len(server.requests) == 1
+
+
+@pytest.mark.parametrize("dropped", [False, True])
+async def test_every_completion_client_keeps_the_delegate_timeout(env, monkeypatch, dropped):
+    """HTTPX's 5-second default must never replace the delegate's ceiling."""
+    data, server = bundle(env), Gateway()
+    clients, delegate_timeouts = [], []
+    create, call = pinned.ObservedHTTPHandler.create_client, pinned.LiteLLMDelegate.call
+
+    def spy_create(self, **kwargs):
+        clients.append(create(self, **kwargs))
+        return clients[-1]
+
+    async def spy_call(self, *args, **kwargs):
+        delegate_timeouts.append(kwargs.get("timeout"))
+        return await call(self, *args, **kwargs)
+
+    def transport(request):
+        if request.method == "POST" and dropped:
+            raise httpx.RemoteProtocolError("synthetic dropped connection")
+        return server(request)
+
+    monkeypatch.setattr(pinned.ObservedHTTPHandler, "create_client", spy_create)
+    monkeypatch.setattr(pinned.LiteLLMDelegate, "call", spy_call)
+    with data.campaign:
+        r = router(data, server, transport=httpx.MockTransport(transport))
+        if dropped:
+            with pytest.raises(pinned.LocalFailure):
+                await ask(r, data.messages)
+        else:
+            assert (await ask(r, data.messages)).content
+    expected = httpx.Timeout(pinned.COMPLETION_TIMEOUT_S)
+    assert delegate_timeouts == [pinned.COMPLETION_TIMEOUT_S]
+    # One initial client, plus AsyncHTTPHandler's replacement after a dropped connection.
+    assert len(clients) == (2 if dropped else 1)
+    assert all(client.timeout == expected for client in clients)
+    if not dropped:
+        assert server.requests[0].extensions["timeout"] == expected.as_dict()
+    handler = pinned.ObservedHTTPHandler({}, "synthetic-only-key", lambda _observation: None)
+    replacement = handler.create_client(timeout=None, event_hooks=None)
+    assert handler.client.timeout == replacement.timeout == expected
+    await replacement.aclose()
+    await handler.close()
+
+
 @pytest.mark.parametrize(
     "body",
     [
