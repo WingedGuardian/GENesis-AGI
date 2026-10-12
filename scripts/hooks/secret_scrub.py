@@ -265,13 +265,15 @@ _STRUCTURED_CREDENTIAL_PATTERN = re.compile(
 # Labeled API/access/secret tokens — keep the label, redact the value.
 # ``secret[_\s-]?access[_\s-]?key`` is listed explicitly (before the shorter
 # ``secret[_\s-]?key``) so the AWS secret-key label is caught.
+_TOKEN_LABEL = (  # noqa: S105 - credential label regex, not a value
+    r"(?<![A-Za-z])(?:api[_\s-]?key|access[_\s-]?token|bearer[_\s-]?token|"  # noqa: S105
+    r"secret[_\s-]?access[_\s-]?key|secret[_\s-]?key|auth[_\s-]?token|"
+    r"refresh[_\s-]?token|api[_\s-]?secret|private[_\s-]?key)"
+)
 _CREDENTIAL_TOKEN_PATTERN = re.compile(
     # (?<![A-Za-z]) (not \b) so an underscore-joined prefix still matches, e.g.
     # the ``aws_secret_access_key`` form used in ~/.aws/credentials.
-    r"(?<![A-Za-z])(?:api[_\s-]?key|access[_\s-]?token|bearer[_\s-]?token|"
-    r"secret[_\s-]?access[_\s-]?key|secret[_\s-]?key|auth[_\s-]?token|"
-    r"refresh[_\s-]?token|api[_\s-]?secret|private[_\s-]?key)"
-    r"\s*(?:is\s+|[:=]\s*)(?P<token>[A-Za-z0-9_\-\./+]{16,})",
+    _TOKEN_LABEL + r"\s*(?:is\s+|[:=]\s*)(?P<token>[A-Za-z0-9_\-\./+]{16,})",
     re.IGNORECASE,
 )
 
@@ -280,9 +282,9 @@ _CREDENTIAL_TOKEN_PATTERN = re.compile(
 # an unquoted value stops at whitespace/separator. The left anchor is
 # ``(?<![A-Za-z])`` (not ``\b``) so an underscore-joined label still matches —
 # e.g. the ``DB_PASSWORD`` form has no word boundary between ``_`` and ``P``.
+_PASSWORD_LABEL = r"(?<![A-Za-z])(?:password|pass(?:word)?|pwd|passphrase|passcode|pin)"  # noqa: S105
 _SINGLE_CREDENTIAL_PATTERN = re.compile(
-    r"(?<![A-Za-z])(?:password|pass(?:word)?|pwd|passphrase|passcode|pin)"
-    r"\s*(?:is\s+|[:=]\s*)"
+    _PASSWORD_LABEL + r"\s*(?:is\s+|[:=]\s*)"
     r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s,;]{4,})",
     re.IGNORECASE,
 )
@@ -372,14 +374,30 @@ _URL_CREDENTIAL_PATTERN = re.compile(
 # so `_SECRET_KEY_HINT` no longer saw SECRET_/TOKEN_ and the value stopped being
 # redacted at all. Bounding a repeat that feeds a downstream semantic check can
 # break the check rather than just the reach.
+_ENV_LABEL = r"(?<![A-Za-z0-9])(?P<key>_{0,4}[A-Z][A-Z0-9_]{2,512})"
 _ENV_ASSIGNMENT_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])(?P<key>_{0,4}[A-Z][A-Z0-9_]{2,512})"
-    r"(?P<sep>\s*=\s*)"
+    _ENV_LABEL + r"(?P<sep>\s*=\s*)"
     r"(?P<val>\"[^\"]+\"|'[^']+'|[^\s]{6,})",
 )
 _SECRET_KEY_HINT = re.compile(
     r"KEY|SECRET|TOKEN|PASSWORD|PASSWD|PASS|AUTH|API|CRED|PRIVATE", re.IGNORECASE
 )
+
+
+def credential_label_kind(label: str) -> str | None:
+    """Recognize structured labels using the exact plain-text vocabulary.
+
+    Structured values have no prose length floor. Environment labels retain
+    uppercase/key-shape constraints; the secret hint alone is insufficient.
+    """
+    for kind, pattern in (("token", _TOKEN_LABEL), ("password", _PASSWORD_LABEL)):
+        if re.search(pattern + r"\s*\Z", label, re.IGNORECASE):
+            return kind
+    match = re.search(_ENV_LABEL + r"\s*\Z", label)
+    if match and _SECRET_KEY_HINT.search(match.group("key")):
+        return "env"
+    return None
+
 
 # Files whose CONTENTS are secret by nature. ONE vocabulary, anchored per path
 # segment; reused by command_touches_secret via tokenisation.

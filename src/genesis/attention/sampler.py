@@ -38,8 +38,9 @@ from genesis.attention.types import AmbientUtterance
 
 logger = logging.getLogger(__name__)
 
-# The router call-site (defined in config/model_routing.yaml). Free-only, cross-vendor
-# fallback, non-Groq — see the plan's PR3b bake-off.
+# The router call-site (defined in config/model_routing.yaml). Free-only, non-Groq —
+# see the plan's PR3b bake-off. Single-rung (Mistral) since its NIM fallback was
+# removed 2026-10-07; the call-site description says why.
 CALL_SITE = "attention_salience"
 
 # Stamped into every verdict so a later prompt iteration's verdicts are comparable/filterable

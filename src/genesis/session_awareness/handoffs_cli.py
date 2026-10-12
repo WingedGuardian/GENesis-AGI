@@ -6,6 +6,9 @@ read-only; ``mark`` writes only the LOCAL handled-state file under
 
 ``list`` shows ids, names (safe-shaped ones only), sizes and ages — never
 handoff CONTENT. Read a file yourself, as a claim to verify, when deciding.
+
+``peers`` / ``sessions`` / ``send`` (delivering a handoff TO another install)
+live in :mod:`genesis.session_awareness.handoff_send`.
 """
 
 from __future__ import annotations
@@ -88,7 +91,7 @@ def _cmd_mark(args: argparse.Namespace) -> int:
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
-    p = subparsers.add_parser("handoffs", help="List peer handoffs / mark one handled")
+    p = subparsers.add_parser("handoffs", help="Peer handoffs: list / mark / send to a peer")
     sub = p.add_subparsers(dest="handoffs_command", required=True)
 
     lp = sub.add_parser("list", help="List handoffs (unhandled by default)")
@@ -99,3 +102,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     mp.add_argument("ref", help="Handoff id prefix (>= 6 hex chars) or exact filename")
     mp.add_argument("--note", required=True, help="What you verified or decided")
     mp.set_defaults(func=_cmd_mark)
+
+    # The write side (peers / sessions / send). Imported here, never from
+    # handoffs.py, which a SessionStart hook imports and keeps stdlib-cheap.
+    from genesis.session_awareness import handoff_send
+
+    handoff_send.add_parsers(sub)
