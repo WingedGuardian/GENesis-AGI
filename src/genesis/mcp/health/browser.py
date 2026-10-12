@@ -35,6 +35,7 @@ from pathlib import Path
 
 from fastmcp import Context
 
+from genesis.browser import engine, packages
 from genesis.browser.types import BrowserLayer
 from genesis.mcp.health import mcp
 
@@ -393,7 +394,8 @@ async def async_cleanup():
     individually guarded so a crashed Camoufox won't hang cleanup.
     Each cleanup step has a 10s timeout (user-approved) to prevent hanging
     if the Playwright Node.js driver or browser process is stuck. Orphaned
-    processes that survive timeout are caught by the process reaper (hourly at :15).
+    processes that survive timeout are only observed by the process reaper
+    (hourly at :15), which reports them and does not kill them.
     """
     global _active_page, _idle_task
 
@@ -428,7 +430,9 @@ async def async_cleanup():
 async def _ensure_browser():
     """Lazily initialize Camoufox (primary browser) with persistent profile.
 
-    Returns the active page. Raises ImportError if camoufox is not installed.
+    Returns the active page. Raises engine.CamoufoxNotReady when there is no
+    launchable engine, and packages.BrowserPackagesChanged when the browser
+    packages changed under this process.
     In collaborate mode, launches headed on virtual display :99 for VNC sharing.
     Uses anti-detection Firefox by default for all browsing.
 
@@ -444,7 +448,19 @@ async def _ensure_browser():
             logger.warning("Camoufox page is stale — restarting Camoufox")
             await _cleanup_camoufox()
 
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CAMOUFOX))
+        # Launch an explicit engine: without one camoufox resolves it itself, and
+        # from 0.5 on that deletes a pre-0.5 engine and downloads the pinned one
+        # inside this call. With it, camoufox still may fetch an add-on or its
+        # fingerprint model and write its config, but never touches an engine.
+        status = engine.resolve_camoufox_engine()
+        if not status.ready:
+            raise engine.CamoufoxNotReady(status.detail)
+
         from camoufox.async_api import AsyncCamoufox
+        # Again past the import: an upgrade that began after the first check
+        # would have mixed old loaded modules with new files.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CAMOUFOX))
 
         _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -452,6 +468,7 @@ async def _ensure_browser():
         os.environ["DISPLAY"] = _VNC_DISPLAY
 
         cm = AsyncCamoufox(
+            executable_path=str(status.path),
             headless=False,
             persistent_context=True,
             user_data_dir=str(_PROFILE_DIR),
@@ -502,7 +519,11 @@ async def _ensure_chromium_fallback():
             logger.warning("Chromium page is stale — restarting Chromium")
             await _cleanup_chromium()
 
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
         from playwright.async_api import async_playwright
+        # Again past the import: an upgrade that began after the first check
+        # would have mixed old loaded modules with new files.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
 
         _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -678,7 +699,11 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
                 "--user-data-dir=%USERPROFILE%\\chrome-genesis"
             )
 
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.REMOTE_CDP))
         from playwright.async_api import async_playwright
+        # Again past the import: an upgrade that began after the first check
+        # would have mixed old loaded modules with new files.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.REMOTE_CDP))
 
         # The attempt is built in locals and published to the globals only once
         # it has a tab, so a failed or cancelled attempt is cleaned up through
@@ -947,7 +972,12 @@ async def _ensure_tinyfish_browser(url: str | None = None) -> tuple:
             logger.warning("TinyFish session stale — cleaning up")
             await _cleanup_tinyfish()
 
+        # Before the session: it is billed from the moment it is created.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.TINYFISH))
         from playwright.async_api import async_playwright
+        # Again past the import: an upgrade that began after the first check
+        # would have mixed old loaded modules with new files.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.TINYFISH))
 
         from genesis.providers.tinyfish_client import browser_session_create
 
@@ -1388,6 +1418,12 @@ async def _get_page(
     # an abandoned session to the idle window, like every other layer.
     _touch(layer)
     return page, is_new_tinyfish
+
+
+def _layer_dists(layer: BrowserLayer) -> tuple[str, ...]:
+    """The browser packages ``layer`` imports: what its launch guard checks and its
+    import-error advice weighs. One answer, so the two cannot drift apart."""
+    return packages.CAMOUFOX_DISTS if layer is BrowserLayer.CAMOUFOX else packages.PLAYWRIGHT_ONLY
 
 
 def _requested_layer(stealth: bool, remote: bool, tinyfish: bool) -> BrowserLayer:
@@ -3150,8 +3186,19 @@ async def _impl_browser_navigate(
         )
     except ConnectionError as e:
         return {"error": str(e)}
+    except engine.CamoufoxNotReady as e:
+        # The guard before the resolver already refused stale modules, so this
+        # lead appears only when pip ran during the resolver call itself; then
+        # restarting comes first, as for any import error.
+        changed = packages.packages_changed_message(
+            packages.stale_loaded_modules(_layer_dists(BrowserLayer.CAMOUFOX))
+        )
+        lead = f"{changed} " if changed else ""
+        return {"error": f"{lead}Camoufox is not ready: {e}"}
+    except packages.BrowserPackagesChanged as e:
+        return {"error": str(e)}
     except ImportError as e:
-        return {"error": f"Browser not available: {e}. Install with: pip install playwright"}
+        return {"error": packages.import_error_message(e, _layer_dists(layer))}
 
     try:
         # Skip goto only when TinyFish session was JUST created with this URL
