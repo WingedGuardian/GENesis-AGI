@@ -1,0 +1,1 @@
+- The external-I/O check is a per-class, count-baselined census covering provider hosts in `src/`, `scripts/`, and `tests/`, case-insensitively across multiple executable formats, reconciled with `provider_health`, `model_routing` and the CC roster; it is a review tripwire, not a spend barrier.

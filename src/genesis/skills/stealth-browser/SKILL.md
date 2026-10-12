@@ -46,9 +46,10 @@ easier to detect than doing nothing.
 | Remote CDP | 0.5-2 s uniform, always |
 | Chromium, TinyFish | none |
 
-Collaborate timing stays on after any `browser_navigate(..., remote=True)` call
-and after a VNC hand-off. Call `browser_collaborate(False)` before stealth work
-in Camoufox, or every later action runs at the fast 0.5-2 s pace.
+Remote CDP uses fast timing on its own and never changes this setting. Timing
+set with `browser_collaborate(True)` (for example for a VNC hand-off) stays on:
+call `browser_collaborate(False)` before stealth work in Camoufox, or every
+later click, fill and upload runs at the fast 0.5-2 s pace.
 
 The delays are automatic. Never add sleeps, and never "wait 1-3 s" yourself.
 Spend the time reading the snapshot and planning the next action instead.
