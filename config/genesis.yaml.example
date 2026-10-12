@@ -52,12 +52,18 @@ github:
 #
 # Two keys exist. `secrets_env` is the credentials prompt. `push_publish`
 # silences only the first push of the current branch, and only when the whole
-# command is exactly one plain `git push` (e.g. `git push -u origin HEAD`) —
-# chained commands still ask, so run the first push on its own. Two harmless
-# spellings also qualify: `git -C <path> push …` where <path> is the literal,
-# symlink-free top of a worktree of the same repository as the session's cwd,
-# and a trailing `2>&1` and/or `| tail -N` / `| head -N` (line counts only) —
-# and the remote
+# command is that push followed by `&& gh pr create …` with a create that can
+# open a ready PR without a terminal (e.g. `git push -u origin HEAD && gh pr
+# create --title "…" --body-file <file>`; no `-C`, no output filter). A PLAIN
+# first push of the current branch to the public repo (e.g. a lone `git push
+# -u origin HEAD`) is REFUSED unless it is that chained form, whatever this key
+# says, so the chained form is the only such push this key silences. Other
+# push spellings (another refspec, an unlisted flag) are not judged by that
+# rule and keep their ask. (Off the public repo nothing qualifies, since the
+# destination must be the public repo.)
+# Other chained commands still ask. The push half may not use the two spellings
+# a lone push is otherwise allowed — `git -C <worktree top> push …` and a
+# trailing `2>&1` / `| tail -N` / `| head -N` — and the remote
 # it really goes to is https://github.com/<the public repo named under `github:`
 # above>, where a live check finds the branch absent. A URL rewrite whose result is that https URL is fine;
 # the ssh / scp forms always ask, as does any `http.*` git config, a remote

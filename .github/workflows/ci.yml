@@ -1060,6 +1060,8 @@ jobs:
         # collect 71 here and 57 on origin/main, measured with
         # --collect-only: test_backup_backends.py 7 -> 20, test_backup_dated_snapshots.py
         # 50 -> 51 (+14). No added skips. Floor: 25698 + 14 = 25712.
+        # Code-only deploy backups (#2629): test_deploy_code_only.py 66 -> 72 (+6).
+        # Floor: 25712 + 6 = 25718.
         # Data-heredoc post-pass (#2972), measured with --collect-only against
         # origin/main 31723dff6's versions of this PR's changed test files:
         #   test_guard_ansic_fail_closed.py  285 -> 285  (+0)
@@ -1068,5 +1070,5 @@ jobs:
         #   test_shell_parse.py              269 -> 343 (+74)
         #   test_worktree_guard.py           129 -> 129  (+0)
         #   test_worktree_remote_guard.py    192 -> 194  (+2)
-        # Delta +84. Floor: 25712 + 84 = 25796. No added skips.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25796
+        # Delta +84. Floor: 25718 + 84 = 25802. No added skips.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25802

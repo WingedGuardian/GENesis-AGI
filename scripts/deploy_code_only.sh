@@ -346,7 +346,7 @@ _cleanup() {
     fi
     local _resets_note=""
     if [ -n "${_RESET_NOTE:-}" ]; then
-        _resets_note=" Reset to HEAD for the merge, their local edits dropped (they regenerate):$_RESET_NOTE."
+        _resets_note=" Local edits saved under $EPHEMERAL_BACKUP_ROOT for the reset files:$_RESET_NOTE."
     fi
     if [ "$rc" -ne 0 ] && [ -z "$_ALERTED" ] && [ "$_PHASE" != "checks" ]; then
         local _sha
@@ -590,6 +590,7 @@ _stop_for_deploy() {
 # restart or health sections. Sets _PULL_FROM to HEAD before the merge.
 _pull() {
     local branch="$1"
+    local _hidden_dirty="" _hidden_line="" _hidden_path="" _hidden_range=""
     _fetch_timeout="${GENESIS_DEPLOY_FETCH_TIMEOUT:-120}"
     # `timeout 0` means NO limit, and so does `timeout 00`: judge the VALUE, never
     # the spelling.
@@ -627,6 +628,26 @@ _pull() {
     # --no-renames: with rename detection on (git's default), a file MOVED out of
     # a path lists only its destination.
     _range_changed() { git -C "$GENESIS_ROOT" diff --no-renames --name-only "$_head" "$_upstream" -- "$@"; }
+    _needs_reset() {
+        local _path="$1"
+        git -C "$GENESIS_ROOT" ls-files --error-unmatch "$_path" >/dev/null 2>&1 \
+            && ! git -C "$GENESIS_ROOT" diff --quiet HEAD -- "$_path" 2>/dev/null \
+            && [ -n "$(_range_changed "$_path")" ]
+    }
+    _hidden_dirty="$(_genesis_hidden_dirty_lines "$GENESIS_ROOT")" \
+        || die "cannot inspect files hidden by assume-unchanged or skip-worktree — nothing changed."
+    while IFS= read -r _hidden_line; do
+        _hidden_path="${_hidden_line:3}"
+        case "$_hidden_path" in
+            AGENTS.md|config/procedure_triggers.yaml)
+                _hidden_range="$(_range_changed "$_hidden_path")" \
+                    || die "cannot inspect whether the range changes $_hidden_path — nothing changed."
+                if [ -n "$_hidden_range" ]; then
+                    die "$_hidden_path has local changes hidden by assume-unchanged or skip-worktree, and this range changes it — clear the flag first (git update-index --no-assume-unchanged -- $_hidden_path, or --no-skip-worktree), then rerun; nothing changed."
+                fi
+                ;;
+        esac
+    done <<< "$_hidden_dirty"
     # Excused dirty files that the incoming range ALSO changes. The regenerable
     # ones are cleared, exactly as update.sh does before its merge (they rewrite
     # themselves); otherwise the merge would abort on them every time. The
@@ -685,6 +706,20 @@ _pull() {
             echo "$_wg" | sed 's/^/          /'
         fi
     fi
+    # Back up every excused edit this range will reset while the server is still
+    # untouched. The timestamp-pid root is shared with update.sh.
+    _reset=()
+    for _f in AGENTS.md config/procedure_triggers.yaml; do
+        if _needs_reset "$_f"; then
+            _reset+=("$_f")
+        fi
+    done
+    for _f in "${_reset[@]}"; do
+        if ! _ephemeral_backup "$_f" "$EPHEMERAL_BACKUP_ROOT"; then
+            die "could not back up local edits to $_f under $EPHEMERAL_BACKUP_ROOT — server NOT stopped; nothing changed."
+        fi
+        echo "  Backed up local edits to $_f: $EPHEMERAL_BACKUP_ROOT/$_f"
+    done
     # deploy stops the server BEFORE the fast-forward, as update.sh does: the
     # editable install imports src/ from disk, so a live server would serve
     # requests against a mix of old and new modules until its restart. pull keeps
@@ -704,17 +739,25 @@ _pull() {
             _stop_for_deploy
         fi
     fi
-    # An excused file the range also changes is reset to HEAD so the merge can
-    # take upstream's copy. Both regenerate (the code-intel indexer rewrites
-    # AGENTS.md, the server the trigger cache), so this script keeps no copy: each
-    # reset is NAMED instead, here, in a refusal's message and in the exit alert,
-    # so none passes silently. (update.sh differs: it backs such edits up under
-    # ~/.genesis/premerge-backups before its merge.)
-    _reset=()
+    # A stop hook or another writer may have changed a file since the first
+    # copy. Save its newer content separately rather than overwrite the first.
+    for _f in "${_reset[@]}"; do
+        _ephemeral_backup_is_current "$_f" "$EPHEMERAL_BACKUP_ROOT" && continue
+        if ! _ephemeral_backup "$_f" "$EPHEMERAL_BACKUP_ROOT/late"; then
+            die "could not back up local edits to $_f under $EPHEMERAL_BACKUP_ROOT/late — leaving the edit in place."
+        fi
+        echo "  Backed up updated local edits to $_f: $EPHEMERAL_BACKUP_ROOT/late/$_f"
+    done
+    # Stop hooks or other writers can first dirty an excused path during the stop.
     for _f in AGENTS.md config/procedure_triggers.yaml; do
-        if git -C "$GENESIS_ROOT" ls-files --error-unmatch "$_f" >/dev/null 2>&1 \
-            && ! git -C "$GENESIS_ROOT" diff --quiet HEAD -- "$_f" 2>/dev/null \
-            && [ -n "$(_range_changed "$_f")" ]; then
+        for _r in "${_reset[@]}"; do
+            [ "$_r" = "$_f" ] && continue 2
+        done
+        if _needs_reset "$_f"; then
+            if ! _ephemeral_backup "$_f" "$EPHEMERAL_BACKUP_ROOT/late"; then
+                die "could not back up local edits to $_f under $EPHEMERAL_BACKUP_ROOT/late — leaving the edit in place."
+            fi
+            echo "  Backed up local edits made during the stop to $_f: $EPHEMERAL_BACKUP_ROOT/late/$_f"
             _reset+=("$_f")
         fi
     done
@@ -729,9 +772,12 @@ _pull() {
     _status_before="$(_status_outside_resets)" || _status_before="unreadable before"
     _PHASE="merging"
     for _f in "${_reset[@]}"; do
-        echo "  Resetting $_f to HEAD for the merge: its local edit is dropped (it regenerates)."
-        genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$_f"
-        _RESET_NOTE="$_RESET_NOTE $_f"
+        echo "  Resetting $_f to HEAD for the merge; its local edits are saved under $EPHEMERAL_BACKUP_ROOT."
+        if genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout HEAD -- "$_f"; then
+            _RESET_NOTE="$_RESET_NOTE $_f"
+        else
+            die "could not reset $_f to HEAD; its local edit is left in place and backed up under $EPHEMERAL_BACKUP_ROOT."
+        fi
     done
     # Safe for this script to merge the tree it runs from: git REPLACES a changed
     # file rather than rewriting it in place, so bash keeps reading the old copy
@@ -757,7 +803,7 @@ _pull() {
                 systemctl --user start genesis-server {_UPDATE_LOCK_FD}>&- && _STOPPED=""
             fi
             [ -n "$_STOPPED" ] || _PHASE="checks"
-            die "git refused the fast-forward to $_upstream (see above) — nothing merged.${_RESET_NOTE:+ Reset to HEAD for it, their local edits dropped (they regenerate):$_RESET_NOTE.}"
+            die "git refused the fast-forward to $_upstream (see above) — nothing merged.${_RESET_NOTE:+ Local edits saved under $EPHEMERAL_BACKUP_ROOT for the reset files:$_RESET_NOTE.}"
         fi
         exit 1
     fi
