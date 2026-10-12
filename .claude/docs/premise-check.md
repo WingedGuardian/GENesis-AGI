@@ -125,14 +125,42 @@ absolute. Being a rework is not itself a reason to stay unsplit.
 ## The output
 
 ```
-Design-premise: [SOUND / SOUND-BUT-INFERIOR / BROKEN]
+Design-premise: <SOUND | SOUND-BUT-INFERIOR | BROKEN>[ — <qualifier>]
 Expected before checking: <one line>
-  P1 <claim> — TRUE/FALSE/UNPROVEN · <evidence> · <confidence>% · falsified by <x>
-  P2 …
+P1 <TRUE | FALSE | UNPROVEN> — <claim> · <evidence> · <confidence>% · falsified by <x>
+P2 <TRUE | FALSE | UNPROVEN> — …
 Effect: <what the caller does differently — or "nothing", which is the finding>
 Better shape: <none found | the alternative, named>
 PR-shape: <OK (N counted lines, band, one concern) | SPLIT — PR1 <concern>, PR2 <concern> …, in dependency order>
 ```
+
+**This block is read by code, so write it exactly.** A round reflection cites the
+output as `Premise-evidence:`, and `scripts/review_reflection.py` reads the block to
+check that the reflection restates what you concluded. The rules:
+
+- The `Design-premise:` line starts at column 0, as plain text, with one verdict
+  word. A qualifier follows a dash: `SOUND — UNPROVEN(2)`. Any other line at
+  column 0 that starts with `Design-premise:` (in any case, with a space for the
+  hyphen, or in bold) makes the whole output refused, and so does a heading or
+  list item that gives a verdict (`## Design-premise: BROKEN`). So never write
+  `Design-premise: SOUND (80%)`, or a bold or bulleted one, in a summary.
+- Each claim line puts its verdict FIRST, right after its number, then a dash
+  and the claim: `P1 TRUE — …`. A short qualifier may follow the verdict in
+  parentheses (`P3 FALSE (partially) — …`); the verdict word is still the one read.
+  A claim line with its verdict at the end is refused.
+- The claim lines sit directly under the verdict line, with only the
+  `Expected before checking:` line (one line) between them. One line per claim:
+  do not wrap a claim line. A blank line ends the claims. Until that blank line,
+  no line may start like a claim (`P` and a digit, even bulleted or bold) unless it
+  is one, so leave a blank line before prose that names a premise.
+- Plain text only: no bullets, bold or tables inside the block. Prose around it is
+  fine, and so is a code fence around the whole block.
+- One block per output. If you quote an example or an earlier check, indent its
+  `Design-premise:` line or prefix every line with `>`, so it is not read as
+  yours, and leave a blank line between your block and the quote. A summary may
+  restate your verdict and any of your claims with the same verdicts; it may
+  never add a claim or change a verdict. A re-check is written to a new file,
+  never appended to the old one.
 
 ### Resolving the verdict — the cases that are otherwise undecidable
 

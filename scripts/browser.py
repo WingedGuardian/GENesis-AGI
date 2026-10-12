@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import importlib.util
 import sys
 import uuid
 from datetime import UTC, datetime
@@ -23,6 +24,11 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 USER_DATA_DIR = Path.home() / ".genesis" / "browser-profile"
+# The shared payment-card detector, loaded by file path so this CLI still
+# imports no genesis modules (it is a stdlib-only file).
+_CARD_SHAPES_PATH = (
+    Path(__file__).resolve().parent.parent / "src" / "genesis" / "security" / "card_shapes.py"
+)
 
 
 def _default_screenshot_path() -> str:
@@ -73,7 +79,30 @@ def cmd_click(args):
             context.close()
 
 
+def _contains_card_number(value: str) -> bool:
+    """Run the shared detector on ``value``. Raises if it cannot be loaded."""
+    spec = importlib.util.spec_from_file_location("_genesis_card_shapes", _CARD_SHAPES_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(str(_CARD_SHAPES_PATH))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.contains_card_number(value)
+
+
 def cmd_fill(args):
+    # A card number is never typed with this tool: refuse before a browser
+    # starts, without echoing the value. If the check itself cannot load,
+    # refuse too rather than type unchecked.
+    try:
+        is_card = _contains_card_number(args.value)
+    except Exception:  # noqa: BLE001 - any load failure refuses
+        print("Refused: the payment-card check could not load "
+              f"({_CARD_SHAPES_PATH}), so nothing was filled.", file=sys.stderr)
+        sys.exit(2)
+    if is_card:
+        print("Refused: the value looks like a payment card number. Card numbers "
+              "are never typed with this tool.", file=sys.stderr)
+        sys.exit(2)
     with sync_playwright() as pw:
         context, page = _launch(pw)
         try:

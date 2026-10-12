@@ -99,6 +99,7 @@ _SCRIPT_FILES = (
     "lib/alert_queue.sh",
     "lib/deploy_status.sh",
     "lib/deploy_checkout.sh",
+    "lib/server_session_refusal.sh",
     "lib/checkout_lock.sh",
     "lib/deploy_recovery.sh",
     "lib/port_owned_by.py",
