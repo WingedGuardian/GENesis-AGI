@@ -379,26 +379,48 @@ def main(argv: list[str] | None = None) -> int:
         help="Write the currently-discovered skill names to the trusted allowlist and exit.",
     )
     parser.add_argument(
+        "--if-missing", action="store_true",
+        help="With --seed-trusted: seed only when the allowlist does not exist yet.",
+    )
+    parser.add_argument(
         "--no-trust", action="store_true",
         help="Disable trust filtering — file EVERY skill (the noisy mode).",
     )
     args = parser.parse_args(argv)
+    if args.if_missing and not args.seed_trusted:
+        # Otherwise it would fall through to a full scan that files findings.
+        parser.error("--if-missing requires --seed-trusted")
 
-    roots = [Path(r) for r in args.roots] if args.roots else default_roots()
+    roots =[Path(r) for r in args.roots] if args.roots else default_roots()
     skill_dirs = discover_skill_dirs(roots)
     print(f"Discovered {len(skill_dirs)} skills across {len(roots)} roots.")
 
     trusted_file = Path(args.trusted_file) if args.trusted_file else default_trusted_file()
 
     if args.seed_trusted:
+        if args.if_missing and trusted_file.exists():
+            # bootstrap.sh runs on every update. Re-seeding there would bless
+            # every skill installed since the last update, which is exactly what
+            # the allowlist exists to catch (see the header written below).
+            print(
+                f"Trusted allowlist {trusted_file} already exists; left unchanged. "
+                "To trust a skill you have reviewed, add its name to that file."
+            )
+            return 0
+        from genesis.util.atomic import atomic_write_text
+
         names = sorted({d.name for d in skill_dirs})
         trusted_file.parent.mkdir(parents=True, exist_ok=True)
-        trusted_file.write_text(
+        # Atomic: bootstrap never re-seeds an existing file (--if-missing), so a
+        # torn write would otherwise stay torn.
+        atomic_write_text(
+            trusted_file,
             "# Trusted skill names — scanned but NOT filed to recon.\n"
             "# Seeded from the skills installed at this moment. Skills installed\n"
-            "# LATER are untrusted and will surface as recon findings until you\n"
-            "# re-bless them: python -m genesis.security.skill_scan --seed-trusted\n"
-            + "\n".join(names) + "\n"
+            "# LATER are untrusted and will surface as recon findings. To trust one\n"
+            "# after reviewing its finding, add its name below. Re-seeding trusts\n"
+            "# EVERY installed skill: python -m genesis.security.skill_scan --seed-trusted\n"
+            + "\n".join(names) + "\n",
         )
         print(f"Seeded {len(names)} trusted skill names -> {trusted_file}")
         return 0
