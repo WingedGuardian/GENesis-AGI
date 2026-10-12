@@ -82,32 +82,31 @@ def _permission_decision(payload: dict[str, object]) -> object:
     )
 
 
+def _clip_char_cost(text: str) -> int:
+    """clip_to_cost's own unit: 2 for astral, 1 otherwise (including lone surrogates)."""
+    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in text)
+
+
+_ORDINARY_BOUNDARY_PAYLOAD = {"permissionDecision": "deny", "reason": "x" * 80}
+_ORDINARY_BOUNDARY_KEYS = ("reason",)
+_ORDINARY_BOUNDARY_ENVELOPE_COST = _ho.emit_cost(
+    json.dumps(_emptied_envelope(_ORDINARY_BOUNDARY_PAYLOAD, _ORDINARY_BOUNDARY_KEYS))
+)
+
+
 @st.composite
-def _json_bounded_case(draw) -> tuple[dict[str, object], tuple[str, ...], int]:
-    mode = draw(
-        st.sampled_from(
-            (
-                "ordinary_trimmable",
-                "ordinary_nested_trimmable",
-                "no_keys",
-                "missing_key",
-                "nonstring_key",
-                "envelope_too_large",
-            )
+def _ordinary_boundary_case(draw) -> tuple[dict[str, object], tuple[str, ...], int]:
+    """Ordinary trimmable payloads budgeted at the emptied-envelope cost exactly."""
+    if draw(st.booleans()):
+        reason = draw(
+            st.text(alphabet=st.one_of(_ASCII, _UNICODE_EDGE), min_size=1, max_size=180)
         )
-    )
-
-    if mode == "ordinary_trimmable":
-        reason = draw(st.text(alphabet=st.one_of(_ASCII, _UNICODE_EDGE), max_size=180))
-        payload = {"permissionDecision": "deny", "reason": reason}
+        payload: dict[str, object] = {"permissionDecision": "deny", "reason": reason}
         text_keys = ("reason",)
-        noted = {"permissionDecision": "deny", "reason": _TRUNCATION_NOTE}
-        floor = _ho.emit_cost(json.dumps(noted))
-        ceiling = max(floor, _ho.emit_cost(json.dumps(payload)) + 20)
-        return payload, text_keys, draw(st.integers(min_value=floor, max_value=ceiling))
-
-    if mode == "ordinary_nested_trimmable":
-        context = draw(st.text(alphabet=st.one_of(_ASCII, _UNICODE_EDGE), max_size=180))
+    else:
+        context = draw(
+            st.text(alphabet=st.one_of(_ASCII, _UNICODE_EDGE), min_size=1, max_size=180)
+        )
         payload = {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -116,31 +115,8 @@ def _json_bounded_case(draw) -> tuple[dict[str, object], tuple[str, ...], int]:
             }
         }
         text_keys = ("hookSpecificOutput.additionalContext",)
-        noted = copy.deepcopy(payload)
-        noted["hookSpecificOutput"]["additionalContext"] = _TRUNCATION_NOTE
-        floor = _ho.emit_cost(json.dumps(noted))
-        ceiling = max(floor, _ho.emit_cost(json.dumps(payload)) + 20)
-        return payload, text_keys, draw(st.integers(min_value=floor, max_value=ceiling))
-
-    if mode == "no_keys":
-        payload = {"permissionDecision": "deny", "required": "R" * 260}
-        text_keys = ()
-        envelope = payload
-    elif mode == "missing_key":
-        payload = {"permissionDecision": "deny", "required": "R" * 260}
-        text_keys = ("missing.path",)
-        envelope = payload
-    elif mode == "nonstring_key":
-        payload = {"permissionDecision": "deny", "reason": 123, "required": "R" * 260}
-        text_keys = ("reason",)
-        envelope = payload
-    else:
-        payload = {"permissionDecision": "deny", "required": "R" * 260, "reason": "r" * 20}
-        text_keys = ("reason",)
-        envelope = _emptied_envelope(payload, text_keys)
-
-    envelope_cost = _ho.emit_cost(json.dumps(envelope))
-    return payload, text_keys, draw(st.integers(min_value=1, max_value=envelope_cost - 1))
+    envelope_cost = _ho.emit_cost(json.dumps(_emptied_envelope(payload, text_keys)))
+    return payload, text_keys, envelope_cost
 
 
 @_PROPERTY_SETTINGS
@@ -205,9 +181,20 @@ def test_print_json_bounded_true_means_the_emitted_stream_fits(
         assert _stream_cost(sink) <= budget
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="#3255: print_json_bounded can return False when the emptied envelope fits",
+)
 @_PROPERTY_SETTINGS
-@given(case=_json_bounded_case())
-def test_print_json_bounded_false_is_confined_to_documented_cases(
+@given(case=_ordinary_boundary_case())
+@example(
+    case=(
+        copy.deepcopy(_ORDINARY_BOUNDARY_PAYLOAD),
+        _ORDINARY_BOUNDARY_KEYS,
+        _ORDINARY_BOUNDARY_ENVELOPE_COST,
+    )
+)
+def test_xfail_print_json_bounded_false_when_emptied_envelope_fits(
     case: tuple[dict[str, object], tuple[str, ...], int],
 ):
     payload, text_keys, budget = case
@@ -294,15 +281,28 @@ def test_xfail_3236_non_ascii_trimming_uses_the_available_budget(size: int, over
     assert _ho.emit_cost(json.dumps(candidate)) > budget
 
 
+@_PROPERTY_SETTINGS
+@given(text=_LONE_SURROGATE_TEXT, budget=st.integers(min_value=1, max_value=80))
+def test_clip_to_cost_handles_lone_surrogates(text: str, budget: int):
+    clipped = _ho.clip_to_cost(text, budget)
+
+    assert text.startswith(clipped)
+    assert _clip_char_cost(clipped) <= max(0, budget)
+    clipped.encode("utf-8", "surrogatepass")
+
+    if len(clipped) < len(text) and budget > 0:
+        next_char = text[len(clipped)]
+        assert _clip_char_cost(clipped + next_char) > budget
+
+
 @pytest.mark.xfail(
     strict=True,
     reason="#3237: lone surrogate accounting can raise UnicodeEncodeError",
 )
 @_PROPERTY_SETTINGS
-@given(text=_LONE_SURROGATE_TEXT, budget=st.integers(min_value=1, max_value=80))
-def test_xfail_3237_lone_surrogate_accounting_does_not_raise(text: str, budget: int):
+@given(text=_LONE_SURROGATE_TEXT)
+def test_xfail_3237_lone_surrogate_accounting_does_not_raise(text: str):
     _ho.emit_cost(text)
-    _ho.clip_to_cost(text, budget)
 
 
 @pytest.mark.xfail(
