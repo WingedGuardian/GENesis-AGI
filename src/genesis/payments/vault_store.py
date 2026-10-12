@@ -330,8 +330,16 @@ def _normalised(sql: str | None) -> str:
 def _shape(conn: sqlite3.Connection) -> str:
     """'vault' (the vault's tables at SCHEMA_VERSION), 'empty' (no tables yet), or 'foreign'."""
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    rows = conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'").fetchall()
-    tables = dict(rows)
+    rows = conn.execute("SELECT type, name, sql FROM sqlite_master").fetchall()
+    tables = {name: sql for kind, name, sql in rows if kind == "table"}
+    # Nothing but the tables and their primary keys' implicit indexes (sql
+    # NULL; the sqlite_ prefix is reserved): a trigger, view or explicit index
+    # would run with, or change, the vault's own statements.
+    if any(
+        kind != "table" and not (kind == "index" and sql is None and name.startswith("sqlite_"))
+        for kind, name, sql in rows
+    ):
+        return "foreign"
     if set(tables) == {"cards", "vault_meta"} and version == SCHEMA_VERSION:
         # The tables must be the ones init writes, constraints and all: a
         # cards table of another shape is foreign, not a vault the code can trust.
@@ -344,40 +352,66 @@ def _shape(conn: sqlite3.Connection) -> str:
     return "foreign"
 
 
-@contextmanager
-def _db(path: Path):
-    """An open, existing cards.db whose statements raise VaultError, never sqlite3 errors.
+def _own_regular(db: Path) -> os.stat_result:
+    """cards.db's lstat, if it is a regular file this user owns; checked before every connect.
 
-    Opened read-write but never created, and never given a schema: only init
-    writes the schema, so a reader cannot turn a truncated or foreign file
-    into an empty vault database.
+    SQLite follows a symlink (its nofollow=1 URI flag does not refuse one here:
+    MEASURED on 3.45.1) and a read-write open may roll back a journal, so a
+    connect must only ever reach the vault's own file.
     """
-    db = path / CARDS
     try:
         info = os.lstat(db)
     except FileNotFoundError:
         raise VaultError("cards.db is missing") from None
     except OSError as exc:
         raise VaultError(f"cards.db cannot be checked ({exc.strerror})") from None
-    if not stat.S_ISREG(info.st_mode):
-        raise VaultError("cards.db is not a regular file (a symlink or other); refusing to open it")
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise VaultError(
+            "cards.db is not a regular file you own (a symlink or other); move it aside"
+        )
+    return info
+
+
+def _same_file(db: Path, info: os.stat_result) -> None:
+    """After a connect: cards.db is still the file checked before it (SQLite opens at connect)."""
+    try:
+        opened = os.stat(db)
+    except OSError as exc:
+        raise VaultError(f"cards.db cannot be checked ({exc.strerror})") from None
+    if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+        raise VaultError("cards.db changed while it was being opened; try again")
+
+
+@contextmanager
+def _db(path: Path, *, write: bool = False):
+    """An open, existing cards.db whose statements raise VaultError, never sqlite3 errors.
+
+    Opened read-write but never created, and never given a schema: only init
+    writes the schema, so a reader cannot turn a truncated or foreign file
+    into an empty vault database. With ``write``, the shape check runs inside
+    a ``BEGIN IMMEDIATE`` the caller's statements share, so nothing can change
+    the schema or the key binding between the checks and the write.
+    """
+    db = path / CARDS
+    info = _own_regular(db)
     conn = None
     try:
         conn = sqlite3.connect(f"file:{quote(str(db))}?mode=rw", uri=True)
-        # SQLite follows symlinks (its nofollow=1 URI flag does not refuse one
-        # here: MEASURED on 3.45.1), so check the file opened is still the
-        # regular file checked above, not something swapped in since.
-        opened = os.stat(db)
-        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
-            raise VaultError("cards.db changed while it was being opened; try again")
+        _same_file(db, info)
         conn.execute("PRAGMA secure_delete = ON")
+        if write:
+            conn.execute("BEGIN IMMEDIATE")
         shape = _shape(conn)
         if shape != "vault":
             version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if shape == "empty":
+                why = "empty"
+            elif version == SCHEMA_VERSION:
+                why = "unexpected tables, indexes, views or triggers"
+            else:
+                why = f"format version {version}"
             raise VaultError(
-                "cards.db is not a vault card database "
-                f"({'empty' if shape == 'empty' else f'format version {version}'}); "
-                "restore the vault from backup"
+                f"cards.db is not a vault card database ({why}); restore the vault from backup"
             )
         yield conn
     except sqlite3.Error as exc:
@@ -389,15 +423,20 @@ def _db(path: Path):
 
 def _card_count(path: Path) -> int:
     """Cards in cards.db: 0 for an absent, 0-byte or never-written file."""
+    db = path / CARDS
     try:
-        if not os.path.lexists(path / CARDS) or os.lstat(path / CARDS).st_size == 0:
+        if not os.path.lexists(db):
             return 0
     except OSError as exc:
         raise VaultError(f"cards.db cannot be checked ({exc.strerror})") from None
+    info = _own_regular(db)
+    if info.st_size == 0:
+        return 0
     try:
         # mode=rw (never creates): a read-only connection cannot roll back the
         # journal a killed write left, which would lock init out for good.
-        with closing(sqlite3.connect(f"file:{quote(str(path / CARDS))}?mode=rw", uri=True)) as c:
+        with closing(sqlite3.connect(f"file:{quote(str(db))}?mode=rw", uri=True)) as c:
+            _same_file(db, info)
             shape = _shape(c)
     except sqlite3.Error as exc:
         raise _translate(exc) from None
@@ -680,6 +719,10 @@ def add_card(
         pinned = _pin(path, dfd)
         recipient_text = _recipient_text(pinned)  # read once: the key sealed to is the key checked
         recipient = _parse_recipient(recipient_text)
+        try:
+            digest = hashlib.sha256(_read_small(pinned / IDENTITY)).hexdigest()
+        except OSError as exc:
+            raise VaultError(f"identity.age cannot be read ({exc.strerror})") from None
         ref = "card_" + secrets.token_hex(6)
         # The row's identity and scope ride inside the authenticated blob, so a
         # blob copied to another row, or a row re-scoped in the clear, is caught
@@ -692,7 +735,7 @@ def add_card(
             blob = encrypt(json.dumps(secret).encode(), [recipient])
         except Exception as exc:  # noqa: BLE001 - never a raw library error, never a value
             raise VaultError(f"the card could not be encrypted ({type(exc).__name__})") from None
-        _insert_card(pinned, ref, card, label, merchant, single_use, blob, recipient_text)
+        _insert_card(pinned, ref, card, label, merchant, single_use, blob, (digest, recipient_text))
     return ref
 
 
@@ -713,18 +756,17 @@ def _pin(path: Path, dfd: int) -> Path:
     return Path(f"/proc/self/fd/{dfd}")
 
 
-def _insert_card(path, ref, card, label, merchant, single_use, blob, recipient_text) -> None:
-    with _db(path) as conn, conn:
-        # Checked on the connection that writes: a cards.db swapped in since
-        # check_ready is refused here, rather than taking a card sealed to a
-        # key it does not record.
-        row = conn.execute(
-            "SELECT value FROM vault_meta WHERE key = ?", (_RECIPIENT_ROW,)
-        ).fetchone()
-        if row is None or row[0] != recipient_text:
+def _insert_card(path, ref, card, label, merchant, single_use, blob, keys) -> None:
+    """Insert the row, if cards.db still records ``keys`` (identity digest, recipient)."""
+    with _db(path, write=True) as conn, conn:
+        # Checked in the transaction that writes, against the key pair read
+        # after check_ready: a cards.db swapped in or rewritten since is
+        # refused here, rather than taking a card into a vault status refuses.
+        rows = dict(conn.execute("SELECT key, value FROM vault_meta").fetchall())
+        if (rows.get(_IDENTITY_DIGEST), rows.get(_RECIPIENT_ROW)) != keys:
             raise VaultError(
-                "cards.db changed during the add (it does not record the key the card "
-                "was sealed to); nothing was saved. Run `vault status`"
+                "cards.db changed during the add (it does not record the key pair the "
+                "card was sealed to); nothing was saved. Run `vault status`"
             )
         conn.execute(
             "INSERT INTO cards (card_ref, label, brand, last4, merchant, single_use, status,"
@@ -811,7 +853,7 @@ def retire_card(card_ref: str, passphrase: str, path: Path | None = None) -> Non
 
 
 def _retire_row(path: Path, card_ref: str) -> None:
-    with _db(path) as conn, conn:
+    with _db(path, write=True) as conn, conn:
         cur = conn.execute(
             "UPDATE cards SET status = 'retired', retired_at = ?, blob = NULL"
             " WHERE card_ref = ? AND status = 'active'",

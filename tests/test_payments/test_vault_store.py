@@ -857,6 +857,112 @@ class TestChecksHeldThroughTheWrite:
             with sqlite3.connect(db) as conn:
                 assert conn.execute("SELECT COUNT(*) FROM cards").fetchone() == (0,)
 
+    def test_a_cards_db_with_the_same_recipient_but_another_identity_takes_no_card(
+        self, vault, tmp_path, monkeypatch
+    ):
+        decoy = tmp_path / "decoy.db"
+        shutil.copy(vault / vs.CARDS, decoy)
+        with sqlite3.connect(decoy) as conn:
+            conn.execute(
+                "UPDATE vault_meta SET value = ? WHERE key = 'identity_sha256'", ("0" * 64,)
+            )
+        real = vs._insert_card
+
+        def swap_after_sealing(*args):
+            (vault / vs.CARDS).rename(tmp_path / "moved.db")
+            decoy.rename(vault / vs.CARDS)
+            return real(*args)
+
+        monkeypatch.setattr(vs, "_insert_card", swap_after_sealing)
+        with pytest.raises(vs.VaultError, match="changed during the add"):
+            _add_visa(vault)
+        with sqlite3.connect(vault / vs.CARDS) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM cards").fetchone() == (0,)
+
+    def test_the_init_preflight_never_opens_a_symlinked_cards_db(self, tmp_path):
+        path = tmp_path / "v"
+        path.mkdir(mode=0o700)
+        outside = tmp_path / "outside.db"
+        with sqlite3.connect(outside) as conn:  # an empty database, which would pass as empty
+            conn.execute("CREATE TABLE t (x)")
+            conn.execute("DROP TABLE t")
+        before = (outside.read_bytes(), outside.stat().st_mtime_ns)
+        (path / vs.CARDS).symlink_to(outside)
+        with pytest.raises(vs.VaultError, match="not a regular file you own"):
+            vs.check_can_init(path)
+        assert (outside.read_bytes(), outside.stat().st_mtime_ns) == before
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            "CREATE TRIGGER keep AFTER UPDATE ON cards BEGIN SELECT 1; END",
+            "CREATE VIEW v AS SELECT card_ref FROM cards",
+            "CREATE INDEX by_label ON cards (label)",
+        ],
+        ids=["trigger", "view", "explicit index"],
+    )
+    def test_a_vault_database_with_extra_objects_is_foreign(self, vault, extra):
+        with sqlite3.connect(vault / vs.CARDS) as conn:
+            conn.execute(extra)
+        assert "unexpected tables, indexes, views or triggers" in vs.vault_status(vault)["error"]
+        with pytest.raises(vs.VaultError, match="not a vault card database"):
+            _add_visa(vault)
+
+    def test_the_init_preflight_refuses_a_cards_db_swapped_at_connect(self, tmp_path, monkeypatch):
+        path = tmp_path / "v"
+        path.mkdir(mode=0o700)
+        with sqlite3.connect(path / vs.CARDS) as conn:  # an empty database
+            conn.execute("CREATE TABLE t (x)")
+            conn.execute("DROP TABLE t")
+        real = vs.sqlite3.connect
+
+        def swap_then_connect(target, *a, **kw):
+            if "mode=rw" in str(target):
+                (path / vs.CARDS).rename(tmp_path / "moved.db")
+                shutil.copy(tmp_path / "moved.db", path / vs.CARDS)
+            return real(target, *a, **kw)
+
+        monkeypatch.setattr(vs.sqlite3, "connect", swap_then_connect)
+        with pytest.raises(vs.VaultError, match="changed while it was being opened"):
+            vs.check_can_init(path)
+
+    @pytest.mark.parametrize("op", ["add", "retire"])
+    def test_a_write_holds_its_transaction_from_the_checks_to_the_statement(
+        self, vault, monkeypatch, op
+    ):
+        """Another writer cannot add a trigger or rewrite the binding after the checks."""
+        ref = _add_visa(vault)
+        target = "_insert_card" if op == "add" else "_retire_row"
+        real_write, real_shape = getattr(vs, target), vs._shape
+        armed, seen = {"on": False}, []
+
+        def write_armed(*args):
+            armed["on"] = True
+            return real_write(*args)
+
+        def shape_then_meddle(conn):
+            shape = real_shape(conn)
+            if armed["on"]:
+                armed["on"] = False
+                try:
+                    with sqlite3.connect(vault / vs.CARDS, timeout=0.1) as other:
+                        other.execute(
+                            "CREATE TRIGGER keep AFTER UPDATE ON cards BEGIN SELECT 1; END"
+                        )
+                    seen.append("changed")
+                except sqlite3.OperationalError as exc:
+                    seen.append(str(exc))
+            return shape
+
+        monkeypatch.setattr(vs, target, write_armed)
+        monkeypatch.setattr(vs, "_shape", shape_then_meddle)
+        monkeypatch.setattr(vs, "verify_passphrase", lambda pw, path=None: None)
+        if op == "add":
+            _add_visa(vault)
+        else:
+            vs.retire_card(ref, PASSPHRASE, vault)
+        assert seen == ["database is locked"]
+
     def test_init_refuses_a_cards_db_swapped_before_sqlite_opens_it(self, tmp_path, monkeypatch):
         path = tmp_path / "v"
         decoy = tmp_path / "decoy.db"

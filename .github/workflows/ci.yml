@@ -1062,7 +1062,7 @@ jobs:
         # 50 -> 51 (+14). No added skips. Floor: 25698 + 14 = 25712.
         # Code-only deploy backups (#2629): test_deploy_code_only.py 66 -> 72 (+6).
         # Floor: 25712 + 6 = 25718.
-        # Card vault store and CLI (#3194): +143 collected, measured with
-        # --collect-only (test_vault_store 97, test_vault_cli 46, both new; pyrage
-        # and zxcvbn are in the test extra, so no skips). Floor: 25718 + 143 = 25861.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25861
+        # Card vault store and CLI (#3194): +151 collected, measured with
+        # --collect-only (test_vault_store 105, test_vault_cli 46, both new; pyrage
+        # and zxcvbn are in the test extra, so no skips). Floor: 25718 + 151 = 25869.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25869
