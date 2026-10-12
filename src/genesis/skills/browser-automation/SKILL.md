@@ -198,14 +198,14 @@ single-label host such as `localhost`, or an IPv4 address, matches only itself.
 An IPv6 address is refused (anything containing `:` is), so its cookies
 cannot be cleared this way.
 
-**Not installed?** If `browser_navigate` returns `Browser not available`, or
-an error saying Camoufox is not installed or telling you to run
-`camoufox fetch`, the browser packages or the Camoufox engine are missing on
-this install: tell the user. The missing-engine case arrives as a raw tool
-error, not a `Browser not available` result, and its text asks for
-`camoufox fetch`; do not follow it. Never run `camoufox fetch` or
-`pip install` from inside a session; every session's MCP server shares the
-engine and the venv.
+**Not installed?** If `browser_navigate` returns `Browser not available` or
+`Camoufox is not ready: …`, the browser packages or the Camoufox engine are
+missing or broken on this install: tell the user, passing on the operator step
+the error names. Never run that step, `camoufox fetch` or `pip install` from
+inside a session; every session's MCP server shares the engine and the venv,
+and the engine download is far larger than a session's temp space. If the
+error says the browser packages changed after this session started, the fix
+is restarting the session, not reinstalling.
 
 ## Verify after every action
 
@@ -420,7 +420,8 @@ under about 20 navigations per task.
 | `Another click, fill, upload, key press or script is still running on this page` | Nothing was sent. Retry once the earlier call returns. |
 | `The tools are no longer on the page this call was for` | Nothing was sent: a click ahead followed a new tab, or a navigate or reset replaced the page. Snapshot, then act. |
 | `... timed out after N s. Browser state was reset`, or `Fill stalled on '...'` | The call ran past its deadline, or a fill step made no progress for 30 s. That may be a hung browser or just a slow operation; either way the active page was reset. Navigate again; form input is lost. A `Fill stalled` error that says the active page is unchanged reset nothing: snapshot instead. A `browser_click` timeout may already have delivered the click: see "Clicking" before clicking again. |
-| `Browser not available`, or an error saying Camoufox is not installed or telling you to run `camoufox fetch` | Browser packages or the Camoufox engine missing on this install; tell the user. Do not run `camoufox fetch`. |
+| `Browser not available` or `Camoufox is not ready: …` | Browser packages or the Camoufox engine missing or broken on this install; tell the user the operator step the error names. Never run it, `camoufox fetch` or `pip install` from a session. |
+| `Browser packages changed after this session started` | The browser packages were upgraded under this session; it must be restarted. Do not reinstall. |
 | `advisory: Page state changed` (remote) | The URL differs from the one recorded at Genesis's last navigate, click, fill, run_js or snapshot: the user moved the tab, a `browser_press_key` submitted a form, or the page redirected itself. `browser_snapshot()` shows the page and re-syncs the URL; if the advisory persists, `browser_run_js("location.href")` (no reload). |
 | `Remote Chrome connection lost` | Chrome closed or machine asleep. Ask the user to restart it with the flag. |
 | `turnstile.status: blocked` | Hand off to the user or stop. See `stealth-browser`. |
