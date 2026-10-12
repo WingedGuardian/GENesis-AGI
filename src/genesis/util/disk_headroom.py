@@ -18,13 +18,10 @@ provisioner's free-space check (genesis.browser.provision).
 
 from __future__ import annotations
 
-import datetime as _dt
-import json
 import logging
 import os
 import shutil
 import subprocess
-import time
 from pathlib import Path
 
 from genesis.env import repo_root
@@ -90,9 +87,8 @@ exec 4>&1 1>&2
 exec 3>&2
 LOG_FILE=/dev/fd/3
 load_config
-# Whole megabytes, bounded well below where shell arithmetic wraps; the watchdog's
-# latest time-to-full in minutes, or "-".
-[[ "$3" =~ ^[0-9]{1,15}$ && "$4" =~ ^([0-9]{1,15}|-)$ ]] || exit 1
+# Whole megabytes, bounded well below where shell arithmetic wraps.
+[[ "$3" =~ ^[0-9]{1,15}$ ]] || exit 1
 m="$(dg_measure "$2")" || exit 1
 read -r free total _quota unalloc meta _rest <<< "$m"
 [[ "$free" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ ]] || exit 1
@@ -105,17 +101,13 @@ if [[ "$unalloc" =~ ^[0-9]+$ ]]; then
     unalloc_after=$(( unalloc - $3 ))
     (( unalloc_after < 0 )) && unalloc_after=0
 fi
-# The tier the watchdog acts on (dg_tier): the free-space tier, raised by the
-# time-to-full tier. The write changes free space; the rate is the watchdog's reading.
-etat="$(dg_eta_tier "$4")"
-now="$(dg_tier "$(dg_floor_tier "$free" "$total" "$unalloc" "$meta")" "$etat")"
-later="$(dg_tier "$(dg_floor_tier "$after" "$total" "$unalloc_after" "$meta")" "$etat")"
+# The free-space tier only, not the time-to-full one: a write's own burst raises
+# that one on nearly any yellow disk for a poll or two (owner ruling 2026-10-12).
+now="$(dg_floor_tier "$free" "$total" "$unalloc" "$meta")"
+later="$(dg_floor_tier "$after" "$total" "$unalloc_after" "$meta")"
 echo "$now $later" >&4
 """
 _TIERS = frozenset({"green", "yellow", "orange", "red"})
-# The watchdog polls every 30 s (5 s under pressure); a state file older than this
-# is from a watchdog that stopped, and its rate is not the disk's now.
-_STATE_FRESH_S = 300
 # The watchdog unit runs with none of these: a value inherited from whoever calls
 # would move its lines (DG_*) or run code before it (BASH_ENV and the like).
 _ENV_DROP = ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "POSIXLY_CORRECT")
@@ -125,31 +117,12 @@ def _guardian_env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if not k.startswith("DG_") and k not in _ENV_DROP}
 
 
-def _eta_min(probe: Path) -> str:
-    """The watchdog's latest time-to-full, in whole minutes, for the filesystem
-    holding ``probe`` (its watchgod_state.json), or "-" when it has none, is stale,
-    or watches another filesystem."""
-    try:
-        state = json.loads((Path.home() / ".genesis" / "watchgod_state.json").read_text())
-        polled = _dt.datetime.fromisoformat(state["poll_at"].replace("Z", "+00:00"))
-        if time.time() - polled.timestamp() > _STATE_FRESH_S:
-            return "-"
-        dev = os.stat(probe).st_dev
-        for watched, entry in state["disk"].items():
-            eta = entry.get("eta_min")
-            if type(eta) is int and eta >= 0 and os.stat(watched).st_dev == dev:
-                return str(eta)
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        pass
-    return "-"
-
-
 def tier_after_write(path: Path | str, write_bytes: int) -> tuple[str, str] | None:
-    """The disk guardian's tier (green, yellow, orange or red) of the filesystem
-    that would hold ``path``, now and once ``write_bytes`` more are written there:
-    the tier the watchdog acts on, its free-space tier raised by its latest
-    time-to-full. None, with a warning, when the guardian cannot judge it: a tier
-    has no statvfs stand-in. The script is the checkout's; a watchdog started before
+    """The disk guardian's free-space tier (green, yellow, orange or red) of the
+    filesystem that would hold ``path``, now and once ``write_bytes`` more are
+    written there. The watchdog's time-to-full is left out: a write's own burst
+    raises it for a poll or two. None, with a warning, when the guardian cannot judge
+    it: a tier has no statvfs stand-in. The script is the checkout's; a watchdog started before
     a deploy runs the copy it loaded, until it restarts."""
     probe = existing_parent(path)
     # Whole megabytes, a partial one counted as whole; an int, which the shell needs.
@@ -164,7 +137,6 @@ def tier_after_write(path: Path | str, write_bytes: int) -> tuple[str, str] | No
                 str(_WATCHGOD),
                 str(probe),
                 str(write_mb),
-                _eta_min(probe),
             ],
             capture_output=True,
             text=True,

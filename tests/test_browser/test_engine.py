@@ -43,6 +43,10 @@ def _versions(
     monkeypatch.setattr(engine, "_dist_files", lambda name: files)
     if camoufox and camoufox.startswith("0.4"):
         _fake_legacy_pkgman(monkeypatch, supported=legacy_supported)
+    elif camoufox:
+        # The resolver imports camoufox on these paths; CI has no browser extra, so
+        # a test must never lean on a camoufox the box happens to have.
+        _fake_camoufox(monkeypatch)
 
 
 def _fake_legacy_pkgman(monkeypatch, *, supported=True):
@@ -64,8 +68,25 @@ def _fake_legacy_pkgman(monkeypatch, *, supported=True):
     pkgman = types.ModuleType("camoufox.pkgman")
     pkgman.Version = Version
     pkg.pkgman = pkgman
+    utils = types.ModuleType("camoufox.utils")
+    utils._load_properties = _load_properties_0_4  # 0.4.11 utils.py:77-88
+    pkg.utils = utils
     monkeypatch.setitem(sys.modules, "camoufox", pkg)
     monkeypatch.setitem(sys.modules, "camoufox.pkgman", pkgman)
+    monkeypatch.setitem(sys.modules, "camoufox.utils", utils)
+
+
+def _read_properties(path):
+    data = json.loads((Path(path).parent / "properties.json").read_bytes())
+    return data
+
+
+def _load_properties_0_4(path=None):
+    return {prop["property"]: prop["type"] for prop in _read_properties(path)}
+
+
+def _load_properties_0_5_8(path=None):
+    return {prop["property"]: prop for prop in _read_properties(path)}
 
 
 ALL_OS = ("linux", "macos", "windows")
@@ -141,6 +162,7 @@ def _fake_camoufox(monkeypatch, *, pin=PIN, installed=(), list_raises=None, pin_
 
     pkg = types.ModuleType("camoufox")
     bp = types.ModuleType("camoufox.browser_pin")
+
     def load_pin(path=None):
         if pin_raises is not None:
             raise pin_raises
@@ -149,13 +171,40 @@ def _fake_camoufox(monkeypatch, *, pin=PIN, installed=(), list_raises=None, pin_
     bp.BrowserPin, bp.load_pin, bp.matches = _BrowserPin, load_pin, matches
     mv = types.ModuleType("camoufox.multiversion")
     mv.list_installed = list_installed
-    pkg.browser_pin, pkg.multiversion = bp, mv
+    pkgman = types.ModuleType("camoufox.pkgman")
+    pkgman.Version = _UpstreamVersion
+    utils = types.ModuleType("camoufox.utils")
+    utils._load_properties = _load_properties_0_5_8  # 0.5.8 utils.py:334-353
+    pkg.browser_pin, pkg.multiversion, pkg.pkgman, pkg.utils = bp, mv, pkgman, utils
     for name, mod in (
         ("camoufox", pkg),
         ("camoufox.browser_pin", bp),
         ("camoufox.multiversion", mv),
+        ("camoufox.pkgman", pkgman),
+        ("camoufox.utils", utils),
     ):
         monkeypatch.setitem(sys.modules, name, mod)
+
+
+class _UpstreamVersion:
+    """camoufox 0.5.8 ``pkgman.Version.from_path`` (pkgman.py:378-397): orjson-parses
+    version.json, takes ``release`` or ``tag`` as the build, raises KeyError with no
+    build and IndexError on an empty one (``Version.__post_init__``); either aborts
+    ``list_installed``."""
+
+    @staticmethod
+    def from_path(path):
+        raw = (Path(path) / "version.json").read_text()
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:  # upstream raises orjson's decode error
+            raise engine._listing_skips()[1]("bad json", raw, 0) from exc
+        build = data.get("release", data.get("tag", data.get("build")))
+        if build is None:
+            raise KeyError("build")
+        if not build:
+            raise IndexError("string index out of range")
+        return _UpstreamVersion()
 
 
 def _installed(cache, version="156.0.1", build="beta.34", repo="official", suffix="ab12cd34", **kw):
@@ -342,7 +391,6 @@ def test_0_5_without_browser_pin_module_is_invalid(cache, monkeypatch):
     "exc",
     [
         KeyError("build"),
-        OSError("permission denied"),
         ValueError("x"),
         # upstream Version() indexes the first character of each build part, so
         # any browsers/ entry whose build is "" raises this (MEASURED, 0.5.7)
@@ -357,6 +405,39 @@ def test_upstream_lookup_failure_is_invalid_never_raises(cache, monkeypatch, exc
     assert status.kind == engine.INVALID
     assert "lookup failed" in status.detail
     assert "tell the user" in status.detail
+
+
+@pytest.mark.parametrize(
+    "exc", [PermissionError(13, "Permission denied"), OSError(5, "Input/output error")]
+)
+def test_an_unreadable_cache_gets_the_permissions_step(cache, monkeypatch, exc):
+    """list_installed walks browsers/ unguarded, so a directory it cannot read
+    raises from it; naming engine directories or config.json would not help."""
+    _versions(monkeypatch, camoufox="0.5.7")
+    _fake_camoufox(monkeypatch, list_raises=exc)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID
+    assert "check the permissions under" in status.detail
+    assert "config.json" not in status.detail
+
+
+def test_engine_dirs_does_not_hide_an_unreadable_directory(cache, monkeypatch):
+    repo = engine.camoufox_install_dir() / "browsers" / "official"
+    repo.mkdir(parents=True)
+    real = Path.iterdir
+
+    def iterdir(self):
+        if self == repo:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    with pytest.raises(PermissionError):
+        engine._engine_dirs()
+
+
+def test_engine_dirs_without_a_browsers_directory_is_empty(cache):
+    assert engine._engine_dirs() == []
 
 
 def test_import_failure_is_invalid_never_raises(cache, monkeypatch):
@@ -374,8 +455,11 @@ def test_import_failure_names_the_package_not_the_cache(cache, monkeypatch, brok
     if broken == "unimportable":
         monkeypatch.setitem(sys.modules, "camoufox", None)
     else:
-        monkeypatch.setitem(sys.modules, "camoufox", types.ModuleType("camoufox"))
-        monkeypatch.setitem(sys.modules, "camoufox.browser_pin", None)
+        empty = types.ModuleType("camoufox")
+        empty.__path__ = []  # a package whose submodules are gone: importing one fails
+        monkeypatch.setitem(sys.modules, "camoufox", empty)
+        for sub in ("browser_pin", "multiversion", "pkgman", "utils"):
+            monkeypatch.delitem(sys.modules, f"camoufox.{sub}", raising=False)
     status = engine.resolve_camoufox_engine()
     assert status.kind == engine.INVALID
     assert "cannot be imported" in status.detail
@@ -473,6 +557,42 @@ def test_older_fontconfigs_spelling_is_accepted(cache, monkeypatch, tmp_path, li
     assert status.kind == engine.READY and status.path == binary
 
 
+@pytest.mark.parametrize("kind", ["versioned", "override"])
+@pytest.mark.parametrize("bad", ALL_OS)
+def test_undecodable_fonts_conf_is_invalid(kind, bad, cache, monkeypatch, tmp_path, linux):
+    """camoufox reads fonts.conf as text (utils._generate_fontconfig, open(.., 'r')).
+    MEASURED on a real 0.5.8 engine: invalid UTF-8 there fails the launch with
+    UnicodeDecodeError."""
+    binary = _kind_engine(kind, cache, monkeypatch, tmp_path)
+    (binary.parent / "fontconfig" / bad / "fonts.conf").write_bytes(b"<fontconfig>\xff\xfe")
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID
+    assert f"{bad}/fonts.conf" in status.detail
+
+
+def test_fonts_conf_read_is_the_one_upstream_picks(cache, monkeypatch, tmp_path, linux):
+    """utils.py:318-320 takes fontconfig/<os>/ when it holds a fonts.conf, and only
+    otherwise the older fontconfigs/<os>/; a good older copy does not rescue it."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    for os_dir in ALL_OS:
+        older = binary.parent / "fontconfigs" / os_dir
+        older.mkdir(parents=True)
+        (older / "fonts.conf").write_text("<fontconfig/>")
+    (binary.parent / "fontconfig" / "linux" / "fonts.conf").write_bytes(b"\xff")
+    assert engine.resolve_camoufox_engine().kind == engine.INVALID
+
+
+def test_undecodable_application_ini_is_still_ready(cache, monkeypatch, tmp_path, linux):
+    """camoufox decodes application.ini with errors='replace' (0.5.7 utils.py:809,
+    0.5.8 utils.py:816) and Firefox does not read that copy. MEASURED: a real 0.5.8
+    engine launches with invalid UTF-8 in it."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    ini = binary.parent / "application.ini"
+    ini.write_bytes(b"; \xff\xfe\n" + ini.read_bytes())
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.READY and status.path == binary
+
+
 def test_legacy_engine_needs_no_fontconfig(cache, monkeypatch, tmp_path, linux):
     """0.4 sets FONTCONFIG_PATH without checking it exists (utils.py:71)."""
     binary = _kind_engine("legacy", cache, monkeypatch, tmp_path, fontconfig=())
@@ -520,7 +640,9 @@ def test_override_is_not_honoured_before_0_5_7(cache, monkeypatch, tmp_path, ver
 
 
 @pytest.mark.parametrize("ver,refused", [("0.5.6", True), ("0.5.7", False), ("0.5.8b1", False)])
-def test_without_a_file_list_the_version_decides_the_pin_cut(cache, monkeypatch, tmp_path, ver, refused):
+def test_without_a_file_list_the_version_decides_the_pin_cut(
+    cache, monkeypatch, tmp_path, ver, refused
+):
     """Some installers write no RECORD, so the file check cannot run."""
     _versions(monkeypatch, camoufox=ver, files=None)
     monkeypatch.setenv("CAMOUFOX_EXECUTABLE_PATH", str(_engine_dir(tmp_path / "custom")))
@@ -728,3 +850,359 @@ def test_operator_steps_quote_their_paths(tmp_path, monkeypatch):
     _engine_dir(root, executable=False)
     detail = engine.resolve_camoufox_engine().detail
     assert f"chmod -R 755 '{root}'" in detail
+
+
+# ── round 2: what upstream's own readers reject ───────────────────────────────
+
+
+@pytest.mark.parametrize("kind", ["versioned", "legacy"])
+def test_a_property_without_its_type_is_invalid(kind, cache, monkeypatch, tmp_path, linux):
+    """camoufox 0.4 and 0.5.7 index both `property` and `type` of every entry when
+    they load properties.json (utils._load_properties), 0.5.8 when a launch sets
+    that property (validate_config). MEASURED: every entry of a real 0.4 and 0.5.8
+    engine has both, the 50 removed ones of 0.5.8's beta.36 included."""
+    binary = _kind_engine(kind, cache, monkeypatch, tmp_path)
+    (binary.parent / "properties.json").write_text('[{"property": "navigator.userAgent"}]')
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID and "properties.json" in status.detail
+
+
+def test_a_pinned_directory_list_installed_skips_is_invalid_and_named(cache, monkeypatch):
+    """list_installed skips a directory whose version.json is unreadable without a
+    word (multiversion.py:312), and install_versioned refuses to replace a directory
+    that has one (:404), so a bare fetch can never repair it."""
+    _versions(monkeypatch, camoufox="0.5.7")
+    broken = _installed(cache)
+    (broken.path / "version.json").write_text("{not json")
+    _fake_camoufox(monkeypatch, installed=[])
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID
+    assert status.path == broken.path / "camoufox-bin"
+    # The provisioner removes and refetches an invalid pinned directory, so the
+    # step names it rather than a manual remove.
+    assert str(broken.path) in status.detail and "install_browser_stack.sh" in status.detail
+
+
+def test_an_unreadable_directory_of_another_build_does_not_block_the_pin(cache, monkeypatch):
+    _versions(monkeypatch, camoufox="0.5.7")
+    good = _installed(cache)
+    other = _installed(cache, build="beta.30")
+    (other.path / "version.json").write_text("{not json")
+    _fake_camoufox(monkeypatch, installed=[good])
+    assert engine.resolve_camoufox_engine().kind == engine.READY
+
+
+def test_a_failed_listing_names_the_directory_upstream_cannot_read(cache, monkeypatch):
+    """`camoufox list` runs the same list_installed, so it fails the same way; the
+    step names the directory upstream's own Version.from_path rejects instead."""
+    _versions(monkeypatch, camoufox="0.5.7")
+    good = _installed(cache)
+    bad = _installed(cache, build="beta.30")
+    (bad.path / "version.json").write_text(json.dumps({"version": "156.0.1", "release": ""}))
+    _fake_camoufox(monkeypatch, installed=[good], list_raises=IndexError("list index out of range"))
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID
+    assert str(bad.path) in status.detail and str(good.path) not in status.detail
+    assert "camoufox list" not in status.detail
+
+
+@pytest.mark.parametrize(
+    "exc", [UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), OSError(5, "EIO")]
+)
+def test_unreadable_package_metadata_is_a_broken_package(cache, monkeypatch, exc):
+    """importlib.metadata raises these for a damaged .dist-info; the resolver
+    promises never to raise."""
+
+    def version(name):
+        raise exc
+
+    monkeypatch.setattr(engine.metadata, "version", version)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID
+    assert "metadata" in status.detail and engine.PACKAGE_HINT in status.detail
+
+
+def test_a_skipped_directory_of_a_longer_build_is_not_the_pin(cache, monkeypatch):
+    """`beta.3`'s folder is `156.0.1-beta.3[-sha8]`; `156.0.1-beta.34-…` shares the
+    prefix and is another build."""
+    _versions(monkeypatch, camoufox="0.5.7")
+    other = _installed(cache, build="beta.34")
+    (other.path / "version.json").write_text("{not json")
+    pin = _BrowserPin("v156.0.1-beta.3", "daijro/camoufox", "official", "156.0.1", "beta.3")
+    _fake_camoufox(monkeypatch, pin=pin, installed=[])
+    assert engine.resolve_camoufox_engine().kind == engine.NOT_INSTALLED
+
+
+def test_a_hidden_repo_directory_is_not_named(cache, monkeypatch):
+    """list_installed never reads a repo directory whose name starts with a dot."""
+    _versions(monkeypatch, camoufox="0.5.7")
+    hidden = _installed(cache, repo=".partial", build="beta.30")
+    bad = _installed(cache, build="beta.31")
+    for d in (hidden.path, bad.path):
+        (d / "version.json").write_text(json.dumps({"version": "156.0.1", "release": ""}))
+    _fake_camoufox(monkeypatch, installed=[], list_raises=IndexError("list index out of range"))
+    detail = engine.resolve_camoufox_engine().detail
+    assert str(bad.path) in detail and str(hidden.path) not in detail
+
+
+def test_a_failed_listing_with_no_culprit_directory_names_the_config(cache, monkeypatch):
+    """A config.json holding valid JSON of the wrong shape breaks every listing; no
+    engine directory is to blame, so none is named and no path is set."""
+    _versions(monkeypatch, camoufox="0.5.7")
+    good = _installed(cache)
+    _fake_camoufox(monkeypatch, installed=[good], list_raises=AttributeError("'list' ..."))
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID and status.path is None
+    assert "config.json" in status.detail and "remove them" not in status.detail
+
+
+def test_a_quietly_skipped_directory_is_not_blamed_for_a_failed_listing(cache, monkeypatch):
+    """list_installed skips an unparseable version.json (multiversion.py:312); only
+    what it raises on can have broken the listing."""
+    _versions(monkeypatch, camoufox="0.5.7")
+    skipped = _installed(cache, build="beta.29")
+    (skipped.path / "version.json").write_text("{bad")
+    culprit = _installed(cache, build="beta.30")
+    (culprit.path / "version.json").write_text(json.dumps({"version": "156.0.1", "release": ""}))
+    _fake_camoufox(monkeypatch, installed=[], list_raises=IndexError("string index out of range"))
+    status = engine.resolve_camoufox_engine()
+    assert str(culprit.path) in status.detail and str(skipped.path) not in status.detail
+    assert status.path == culprit.path / "camoufox-bin"
+
+
+def test_two_culprits_are_both_named_and_neither_is_a_path(cache, monkeypatch):
+    """A caller may remove the path it is given; with two causes, removing one
+    would leave the listing broken."""
+    _versions(monkeypatch, camoufox="0.5.7")
+    bad = [_installed(cache, build=b) for b in ("beta.30", "beta.31")]
+    for iv in bad:
+        (iv.path / "version.json").write_text(json.dumps({"version": "156.0.1", "release": ""}))
+    _fake_camoufox(monkeypatch, installed=[], list_raises=IndexError("string index out of range"))
+    status = engine.resolve_camoufox_engine()
+    assert all(str(iv.path) in status.detail for iv in bad) and status.path is None
+
+
+def test_a_pinned_folder_holding_another_build_says_so(cache, monkeypatch):
+    _versions(monkeypatch, camoufox="0.5.7")
+    other = _installed(cache, build="beta.34")
+    wrong = other.path.parent / "156.0.1-beta.34-0123abcd"
+    other.path.rename(wrong)
+    listed = _InstalledVersion("official", _Version("beta.35", "156.0.1"), wrong)
+    _fake_camoufox(monkeypatch, installed=[listed])
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID and "another build" in status.detail
+    assert status.path == wrong / "camoufox-bin"
+
+
+def test_a_dashed_build_is_not_the_pins_folder(cache, monkeypatch):
+    """`<spec>-<sha8>` is the only suffix install_versioned writes."""
+    _versions(monkeypatch, camoufox="0.5.7")
+    hotfix = _installed(cache, build="beta.34", suffix="hotfix")
+    (hotfix.path / "version.json").write_text("{bad")
+    _fake_camoufox(monkeypatch, installed=[])
+    assert engine.resolve_camoufox_engine().kind == engine.NOT_INSTALLED
+
+
+@pytest.mark.parametrize("value", ["15\ufffd6.0.1-beta.36", "beta.36", "  "])
+def test_a_version_whose_major_is_not_a_number_is_invalid(
+    value, cache, monkeypatch, tmp_path, linux
+):
+    """camoufox puts ``Version.split('.', 1)[0]`` into the browser's fingerprint
+    (0.5.8 utils.py:1082): a garbled major launches with a garbage User-Agent."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    (binary.parent / "application.ini").write_text(f"[App]\nVersion={value}\nVersion=156.0.1\n")
+    status = engine.resolve_camoufox_engine()
+    if value.strip():
+        assert status.kind == engine.INVALID and "Version" in status.detail
+    else:  # upstream skips an empty value and takes the next Version= line
+        assert status.kind == engine.READY
+
+
+@pytest.mark.parametrize(
+    ("content", "ready"),
+    [
+        (None, True),  # absent: upstream leaves an unpackaged build alone
+        ('{"version": "156.0.1", "release": "beta.36"}', True),
+        ("not json", True),  # ValueError: upstream passes
+        ('{"version": "156.0.1"}', True),  # KeyError-shaped: upstream passes
+        ('{"version": "156.0.1", "build": ""}', False),  # IndexError: the launch raises
+    ],
+)
+def test_override_version_json_is_read_as_upstream_reads_it(
+    content, ready, cache, monkeypatch, tmp_path, linux
+):
+    """With an explicit path camoufox parses version.json beside it and tolerates
+    only FileNotFoundError, KeyError and ValueError (0.5.8 utils.py:212-215)."""
+    binary = _kind_engine("override", cache, monkeypatch, tmp_path, version_json=False)
+    _fake_camoufox(monkeypatch)
+    if content is not None:
+        (binary.parent / "version.json").write_text(content)
+    status = engine.resolve_camoufox_engine()
+    assert status.ready is ready, status.detail
+    if not ready:
+        assert "version.json" in status.detail
+
+
+def test_main_rejects_an_unknown_flag(capsys):
+    with pytest.raises(SystemExit):
+        engine.main(["--jsno"])
+
+
+def test_a_broken_package_under_an_override_is_the_package_not_the_file(
+    cache, monkeypatch, tmp_path, linux
+):
+    """camoufox.pkgman failing to import is a damaged package: its repair is the
+    package reinstall, never "fix CAMOUFOX_EXECUTABLE_PATH"."""
+    _kind_engine("override", cache, monkeypatch, tmp_path)
+    monkeypatch.setitem(sys.modules, "camoufox.pkgman", None)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID
+    assert engine.PACKAGE_HINT in status.detail and "version.json" not in status.detail
+
+
+@pytest.mark.parametrize(
+    ("content", "ready"),
+    [
+        (None, True),
+        (b'{"readBy": {"lin": ["L", "LM"], "mac": ["M"], "win": ["W"]}}', True),
+        (b"\xff\xfe not json", True),  # ValueError: upstream falls back to fonts/<os>
+        (b'{"readBy": {"lin": [', True),  # truncated: ValueError again
+        (b"[]", False),  # AttributeError at .get: the launch raises
+        (b"null", False),
+        (b'{"readBy": []}', False),
+        (b'{"readBy": {"lin": [1]}}', False),  # TypeError in os.path.join
+    ],
+)
+def test_fonts_groups_json_is_read_as_upstream_reads_it(
+    content, ready, cache, monkeypatch, tmp_path, linux
+):
+    """0.5.7/0.5.8 _generate_fontconfig reads fonts/groups.json beside the binary
+    and tolerates only OSError and ValueError (utils.py:147-159)."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    if content is not None:
+        (binary.parent / "fonts").mkdir()
+        (binary.parent / "fonts" / "groups.json").write_bytes(content)
+    status = engine.resolve_camoufox_engine()
+    assert status.ready is ready, status.detail
+    if not ready:
+        assert "groups.json" in status.detail
+
+
+def test_fonts_conf_is_decoded_as_utf_8_whatever_the_locale(tmp_path):
+    """The real 0.5.8 fonts.conf has non-ASCII lines (16 in linux/). Read in an
+    ASCII locale, every healthy engine would look broken, and a caller that
+    replaces broken engines would download one forever. Run in a real C locale
+    with UTF-8 mode off, the way such a process would."""
+    d = tmp_path / "e"
+    (d / "fontconfig" / "linux").mkdir(parents=True)
+    (d / "fontconfig" / "linux" / "fonts.conf").write_text(
+        "<fontconfig><!-- \u00e9 --></fontconfig>", encoding="utf-8"
+    )
+    code = (
+        "import sys, pathlib; from genesis.browser import engine; "
+        "print(engine._fonts_conf_problem(pathlib.Path(sys.argv[1]) / 'camoufox-bin', 'linux'))"
+    )
+    src = str(Path(engine.__file__).resolve().parents[2])
+    env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "PYTHONUTF8": "0", "PYTHONPATH": src}
+    out = subprocess.run(
+        [sys.executable, "-c", code, str(d)], capture_output=True, text=True, env=env, check=True
+    )
+    assert out.stdout.strip() == "None", out.stdout + out.stderr
+
+
+def test_an_unsearchable_directory_is_reported_not_raised(cache, monkeypatch, tmp_path, linux):
+    """pathlib's exists() raises on a directory this user cannot search; the
+    resolver never raises."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    fc = binary.parent / "fontconfig"
+    fc.chmod(0)
+    try:
+        status = engine.resolve_camoufox_engine()
+    finally:
+        fc.chmod(0o755)
+    assert status.kind == engine.INVALID
+
+
+def test_the_legacy_root_needs_a_version_line_but_not_a_numeric_major(cache, monkeypatch, tmp_path):
+    """camoufox 0.4 takes the version from the root version.json, never application.ini."""
+    binary = _kind_engine("legacy", cache, monkeypatch, tmp_path)
+    (binary.parent / "application.ini").write_text("[App]\nVersion=beta.24\n")
+    assert engine.resolve_camoufox_engine().kind == engine.READY
+
+
+def test_a_filesystem_error_anywhere_is_a_status(cache, monkeypatch):
+    def denied():
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(engine, "_resolve", denied)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID and status.path is None
+    assert "permissions" in status.detail
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'[{"property": [], "type": "str"}]',  # unhashable key: the launch's dict raises
+        b'[{"property": {"a": 1}, "type": "str"}]',
+        b'[{"type": "str"}]',
+        b'[{"property": "a"}]',
+        b'{"property": "a", "type": "str"}',
+    ],
+)
+@pytest.mark.parametrize("loader", ["upstream-0.5.8"])
+def test_properties_json_is_loaded_the_way_camoufox_loads_it(
+    content, loader, cache, monkeypatch, tmp_path, linux
+):
+    """Every camoufox release keys a dict by each entry's ``property``
+    (utils._load_properties), and the launch reads each entry's ``type``. Run
+    against a 0.5.8-shaped loader (keys whole entries, never reads ``type`` while
+    loading)."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    if loader == "upstream-0.5.8":
+        utils = types.ModuleType("camoufox.utils")
+
+        def _load_properties(path=None):
+            data = json.loads((Path(path).parent / "properties.json").read_bytes())
+            return {prop["property"]: prop for prop in data}
+
+        utils._load_properties = _load_properties
+        monkeypatch.setitem(sys.modules, "camoufox.utils", utils)
+    (binary.parent / "properties.json").write_bytes(content)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID and "properties.json" in status.detail
+
+
+def test_upstreams_own_properties_loader_is_used_when_it_imports(
+    cache, monkeypatch, tmp_path, linux
+):
+    """camoufox's loader is the authority; the resolver's copy is only the fallback."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    utils = types.ModuleType("camoufox.utils")
+    seen = []
+
+    def _load_properties(path=None):
+        seen.append(path)
+        raise TypeError("unhashable type: 'list'")
+
+    utils._load_properties = _load_properties
+    monkeypatch.setitem(sys.modules, "camoufox.utils", utils)
+    status = engine.resolve_camoufox_engine()
+    assert seen == [binary] and status.kind == engine.INVALID
+    assert "unhashable" in status.detail
+
+
+def test_a_removed_property_needs_no_type(cache, monkeypatch, tmp_path, linux):
+    """0.5.8's validate_config skips an entry marked "removed" before it reads its
+    type; a launch with one is fine."""
+    binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
+    utils = types.ModuleType("camoufox.utils")
+    utils._load_properties = lambda path=None: {
+        prop["property"]: prop
+        for prop in json.loads((Path(path).parent / "properties.json").read_bytes())
+    }
+    monkeypatch.setitem(sys.modules, "camoufox.utils", utils)
+    (binary.parent / "properties.json").write_text(
+        '[{"property": "a", "type": "str"}, {"property": "b", "removed": "140"}]'
+    )
+    assert engine.resolve_camoufox_engine().kind == engine.READY

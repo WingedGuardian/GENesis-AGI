@@ -66,6 +66,10 @@ def _load_cli():
         spec = importlib.util.spec_from_file_location("_genesis_browser_cli", CLI_PATH)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        # The CLI imports its browser package when a command runs, by which time
+        # the stub has left sys.modules: stub that seam too, so no test here can
+        # start a real browser against the live profile.
+        module._sync_playwright = _stub_sync_playwright
         return module
     finally:
         # Restore exactly what was there, so a real playwright installed by

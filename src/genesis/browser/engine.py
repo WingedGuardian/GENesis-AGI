@@ -28,6 +28,7 @@ through ``python -m genesis.browser.engine --json`` instead.
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -90,11 +91,21 @@ class CamoufoxNotReady(RuntimeError):
     """No launchable Camoufox engine; the message says why and what to tell the user."""
 
 
+class _UnreadableMetadata(Exception):
+    """A distribution is installed but its .dist-info cannot be parsed: a METADATA
+    or RECORD with bad UTF-8 raises UnicodeDecodeError, not PackageNotFoundError
+    (MEASURED, Python 3.12). A broken package, reported as one. A missing or
+    permission-denied METADATA is suppressed by importlib and reads as not
+    installed, whose operator step is the same reinstall."""
+
+
 def _dist_version(name: str) -> str | None:
     try:
         return metadata.version(name)
     except metadata.PackageNotFoundError:
         return None
+    except Exception as exc:  # noqa: BLE001 - any other failure is a damaged install
+        raise _UnreadableMetadata(name, exc) from exc
 
 
 def _dist_files(name: str) -> list[str] | None:
@@ -103,6 +114,8 @@ def _dist_files(name: str) -> list[str] | None:
         files = metadata.files(name)
     except metadata.PackageNotFoundError:
         return None
+    except Exception as exc:  # noqa: BLE001 - any other failure is a damaged install
+        raise _UnreadableMetadata(name, exc) from exc
     return None if files is None else [str(f) for f in files]
 
 
@@ -152,10 +165,7 @@ def _operator_step(*, remove_first: bool = False) -> str:
     # The engine download is a temp file in TMPDIR; a session's TMPDIR is a small
     # quota, and a TMPDIR that does not exist falls back to /tmp, often a small
     # tmpfs. The interpreter is this one, the venv camoufox is installed in.
-    return (
-        f"{_TELL}{flag}`mkdir -p ~/tmp && TMPDIR=~/tmp {_q(sys.executable)} -m camoufox fetch`"
-    )
-
+    return f"{_TELL}{flag}`mkdir -p ~/tmp && TMPDIR=~/tmp {_q(sys.executable)} -m camoufox fetch`"
 
 
 def _repair_step(binary: Path, problem: str, kind: str) -> str:
@@ -171,55 +181,130 @@ def _repair_step(binary: Path, problem: str, kind: str) -> str:
     return _operator_step(remove_first=True)  # pre-0.5: the root engine
 
 
-def _properties_readable(raw: bytes) -> bool:
-    """Whether camoufox can load this properties.json: it parses it with orjson (a
-    camoufox dependency; stricter than json about a BOM or NaN) and indexes each
-    entry's ``property`` (utils._load_properties)."""
+def _properties_problem(binary: Path) -> str | None:
+    """Load properties.json with camoufox's own loader (``utils._load_properties``,
+    the same name and signature from 0.4 to 0.5.8), so anything it fails on, a
+    launch fails on. Each entry's ``type`` is read too: 0.4 and 0.5.7 index it while
+    loading, 0.5.8 when a launch sets that property (validate_config), which skips
+    an entry marked "removed" first. MEASURED: every entry of a real 0.4 and 0.5.8
+    engine carries both fields. When camoufox.utils cannot be imported the package
+    is broken, and the package import that comes first reports it."""
+    if not os.path.isfile(binary.parent / "properties.json"):
+        return f"no properties.json beside {binary}"
     try:
-        import orjson
-
-        data = orjson.loads(raw)
-    except ImportError:
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            return False
-    except ValueError:  # orjson.JSONDecodeError is a ValueError
-        return False
-    return isinstance(data, list) and all(isinstance(e, dict) and "property" in e for e in data)
+        from camoufox.utils import _load_properties
+    except Exception:  # noqa: BLE001 - a broken package is reported elsewhere
+        return None
+    try:
+        loaded = _load_properties(path=binary)
+        entries = (v for v in loaded.values() if isinstance(v, dict))
+        if not all("removed" in v or "type" in v for v in entries):
+            raise KeyError("type")
+    except Exception as exc:  # noqa: BLE001 - what the launch would raise
+        return f"properties.json beside {binary} is unreadable ({exc!r})"
+    return None
 
 
 def _engine_problem(
-    binary: Path, *, need_version_json: bool = True, need_fontconfig: bool = True
+    binary: Path,
+    *,
+    need_version_json: bool = True,
+    need_fontconfig: bool = True,
+    reads_ini_version: bool = True,
 ) -> str | None:
     """Why ``binary`` cannot be launched, or None. Stateless file checks only."""
-    if not binary.is_file():
+    if not os.path.isfile(binary):
         return f"no {binary.name} at {binary.parent}"
     if not os.access(binary, os.X_OK):
         return f"{binary} is not executable (a fetch was interrupted or is still running)"
     if need_version_json and not (binary.parent / "version.json").is_file():
         return f"no version.json beside {binary}"
     # camoufox reads the version from here; without it it falls back to its own
-    # engine selection (utils.resolve_verstr), which writes its config.
+    # engine selection (utils.resolve_verstr), which writes its config. Decoded
+    # leniently on purpose: resolve_verstr reads it with errors="replace", and
+    # Firefox does not read this copy, so stray bytes do not stop a launch (MEASURED).
     try:
         ini = (binary.parent / "application.ini").read_text(encoding="utf-8", errors="replace")
     except OSError:
         return f"no application.ini beside {binary}"
-    if not any(line.startswith("Version=") and line[8:].strip() for line in ini.splitlines()):
+    # The first non-empty Version= value, as resolve_verstr takes it; its major
+    # goes into the browser's fingerprint (utils.py:1082, ``split('.', 1)[0]``).
+    version = next(
+        (v for line in ini.splitlines() if line.startswith("Version=") and (v := line[8:].strip())),
+        None,
+    )
+    if version is None:
         return f"application.ini beside {binary} names no Version"
-    try:
-        raw = (binary.parent / "properties.json").read_bytes()
-    except FileNotFoundError:
-        return f"no properties.json beside {binary}"
-    except OSError:
-        return f"properties.json beside {binary} is unreadable"
-    if not _properties_readable(raw):
-        return f"properties.json beside {binary} is unreadable"
+    if reads_ini_version and not re.fullmatch(r"[0-9]+", version.split(".", 1)[0]):
+        return f"application.ini beside {binary} names an unreadable Version {version!r}"
+    problem = _properties_problem(binary)
+    if problem:
+        return problem
     if need_fontconfig and _READS_FONTCONFIG:
         for os_dir in _FONTCONFIG_OSES:
-            confs = (binary.parent / d / os_dir / "fonts.conf" for d in ("fontconfig", "fontconfigs"))
-            if not any(c.is_file() for c in confs):
-                return f"no fontconfig/{os_dir}/fonts.conf beside {binary}"
+            problem = _fonts_conf_problem(binary, os_dir) or _fonts_groups_problem(binary, os_dir)
+            if problem:
+                return problem
+    return None
+
+
+def _fonts_conf_problem(binary: Path, os_dir: str) -> str | None:
+    """Read the fonts.conf a launch would, the way it would: 0.5 takes
+    fontconfig/<os>/ when it holds one, else the older fontconfigs/<os>/
+    (utils.py:318-320), and reads it as text in the locale encoding
+    (_generate_fontconfig, ``open(.., 'r')``). MEASURED: invalid UTF-8 there fails
+    a real launch with UnicodeDecodeError. Decoded as UTF-8, the file's own encoding,
+    not this process's locale: the real file has non-ASCII lines, so in an ASCII
+    locale every healthy engine would read as broken (and get replaced, forever)."""
+    conf = binary.parent / "fontconfig" / os_dir / "fonts.conf"
+    if not os.path.exists(conf):
+        conf = binary.parent / "fontconfigs" / os_dir / "fonts.conf"
+    if not os.path.isfile(conf):
+        return f"no fontconfig/{os_dir}/fonts.conf beside {binary}"
+    try:
+        with open(conf, encoding="utf-8") as f:
+            f.read()
+    except (OSError, UnicodeDecodeError):
+        return f"{conf.parent.parent.name}/{os_dir}/fonts.conf beside {binary} is unreadable"
+    return None
+
+
+def _override_version_problem(binary: Path) -> str | None:
+    """Upstream reads version.json beside an explicit path on every launch and
+    tolerates only its absence or a FileNotFoundError, KeyError or ValueError
+    (0.5.8 utils.py:212-215); anything else (an empty build's IndexError, say)
+    fails the launch."""
+    from camoufox.pkgman import Version  # _resolve checked it imports
+
+    try:
+        Version.from_path(binary.parent)
+    except (FileNotFoundError, KeyError, ValueError):
+        return None
+    except Exception as exc:  # noqa: BLE001 - what the launch would raise
+        return f"version.json beside {binary} is unreadable ({exc!r})"
+    return None
+
+
+_GROUP_KEYS = {"linux": "lin", "macos": "mac", "windows": "win"}
+
+
+def _fonts_groups_problem(binary: Path, os_dir: str) -> str | None:
+    """fonts/groups.json, which the same launch step reads (0.5.7 and 0.5.8
+    ``_generate_fontconfig``) and tolerates only when unreadable or not JSON
+    (``except (OSError, ValueError)``); valid JSON of another shape fails it."""
+    fonts = os.path.join(binary.parent, "fonts")
+    groups = os.path.join(fonts, "groups.json")
+    if not os.path.exists(groups):
+        return None
+    try:
+        with open(groups, "rb") as fh:
+            read_by = json.loads(fh.read()).get("readBy", {}).get(_GROUP_KEYS[os_dir], [])
+        for group in read_by:
+            os.path.isdir(os.path.join(fonts, group))
+    except (OSError, ValueError):
+        return None
+    except Exception as exc:  # noqa: BLE001 - what the launch would raise
+        return f"fonts/groups.json beside {binary} is unreadable ({exc!r})"
     return None
 
 
@@ -227,8 +312,13 @@ def _check(binary: Path, label: str, kind: str) -> EngineStatus:
     # Upstream does not require version.json beside an explicitly given binary, and
     # camoufox 0.4 never checks the fontconfig it points at.
     problem = _engine_problem(
-        binary, need_version_json=kind != "override", need_fontconfig=kind != "legacy"
+        binary,
+        need_version_json=kind != "override",
+        need_fontconfig=kind != "legacy",
+        reads_ini_version=kind != "legacy",
     )
+    if problem is None and kind == "override":
+        problem = _override_version_problem(binary)
     if problem:
         return EngineStatus(
             INVALID, f"{label}: {problem}; {_repair_step(binary, problem, kind)}", binary
@@ -280,6 +370,60 @@ def _legacy_engine(version: str) -> EngineStatus:
     return status
 
 
+def _engine_dirs() -> list[Path]:
+    """Every ``browsers/<repo>/<version>`` directory holding a version.json: the
+    ones camoufox's ``list_installed`` reads (multiversion.py:281-291). A directory
+    that cannot be read raises, as it does from the listing: the repair is its
+    permissions, not an engine directory."""
+    browsers = camoufox_install_dir() / "browsers"
+    if not browsers.is_dir():
+        return []
+    found = []
+    for repo in sorted(browsers.iterdir()):
+        if not repo.is_dir() or repo.name.startswith("."):
+            continue
+        found.extend(
+            d for d in sorted(repo.iterdir()) if d.is_dir() and (d / "version.json").exists()
+        )
+    return found
+
+
+def _listing_skips() -> tuple[type[Exception], ...]:
+    """The errors camoufox's ``list_installed`` skips a directory for rather than
+    raising (multiversion.py:312). orjson comes with camoufox."""
+    try:
+        import orjson
+    except ImportError:
+        return (FileNotFoundError, json.JSONDecodeError)
+    return (FileNotFoundError, orjson.JSONDecodeError)
+
+
+def _breaks_listing(dirs: list[Path]) -> list[Path]:
+    """The directories that make camoufox's ``list_installed`` raise: its own
+    ``pkgman.Version.from_path`` fails on them with anything other than the
+    errors the listing skips quietly."""
+    from camoufox.pkgman import Version
+
+    skipped = _listing_skips()
+    bad = []
+    for d in dirs:
+        try:
+            Version.from_path(d)
+        except skipped:
+            continue  # skipped by the listing, so not what broke it
+        except Exception:  # noqa: BLE001 - what aborts the listing
+            bad.append(d)
+    return bad
+
+
+def _named_for(pin, d: Path) -> bool:
+    # install_versioned names a directory <version>-<build>[-<sha8>]
+    # (multiversion.version_folder_name; sha8 is the asset's sha256 prefix).
+    return d.parent.name.lower() == pin.repo_name and bool(
+        re.fullmatch(rf"{re.escape(pin.spec)}(-[0-9a-f]{{8}})?", d.name)
+    )
+
+
 def _pinned_engine(version: str) -> EngineStatus:
     try:
         from camoufox import browser_pin, multiversion
@@ -296,20 +440,39 @@ def _pinned_engine(version: str) -> EngineStatus:
             "operator step: install camoufox>=0.5.7,<0.6",
         )
     try:
+        installed = list(multiversion.list_installed())
         matching = [
             iv
-            for iv in multiversion.list_installed()
+            for iv in installed
             if browser_pin.matches(pin, iv.repo_name, iv.version.version or "", iv.version.build)
         ]
+    except OSError:
+        # list_installed walks browsers/ unguarded: a directory it cannot read is a
+        # permissions repair, which resolve_camoufox_engine names.
+        raise
     except Exception as exc:  # noqa: BLE001 - upstream code reading the cache; never raise
         # One unreadable entry under browsers/ fails the whole listing (upstream
-        # Version() raises IndexError on an empty build, for one).
+        # Version() raises IndexError on an empty build, for one), and `camoufox
+        # list` runs the same listing, so the step names the entries instead.
         logger.warning("Camoufox engine lookup failed", exc_info=True)
+        try:
+            bad = _breaks_listing(_engine_dirs())
+        except Exception:  # noqa: BLE001 - nothing more to name
+            bad = []
+        if bad:
+            named = ", ".join(f"`{_q(d)}`" for d in bad)
+            step = f"the engine directories camoufox cannot read: {named}; {_TELL}remove them"
+        else:
+            step = (
+                f"no engine directory is the cause; {_TELL}check "
+                f"{_q(camoufox_install_dir() / 'config.json')}, which camoufox reads for every "
+                "listing"
+            )
+        # A path only when exactly one directory is to blame: a caller may remove it.
         return EngineStatus(
             INVALID,
-            f"camoufox engine lookup failed: {exc!r}; tell the user; operator step: "
-            f"`{_q(sys.executable)} -m camoufox list` shows the engines under "
-            f"{camoufox_install_dir() / 'browsers'}; remove the unreadable one",
+            f"camoufox engine lookup failed: {exc!r}; {step}",
+            bad[0] / LAUNCH_FILE if len(bad) == 1 else None,
         )
 
     label = f"Camoufox {pin.repo_name} {pin.spec}"
@@ -321,6 +484,23 @@ def _pinned_engine(version: str) -> EngineStatus:
         problems.append(status)
     if problems:
         return problems[0]
+    # A directory named for the pin that does not hold it: list_installed skips one
+    # whose version.json is unreadable without a word (multiversion.py:312), or its
+    # version.json names another build. install_versioned refuses to replace a
+    # directory with a version.json (:404), so a fetch into that name fails while
+    # it stays; removing it lets the fetch through.
+    listed = {Path(iv.path) for iv in installed}
+    for d in _engine_dirs():
+        if not _named_for(pin, d):
+            continue
+        if d in listed:
+            problem = f"the version.json in {d} names another build than {pin.spec}"
+        else:
+            problem = f"the version.json in {d} is unreadable, so camoufox skips this engine"
+        binary = d / LAUNCH_FILE
+        return EngineStatus(
+            INVALID, f"{label}: {problem}; {_repair_step(binary, problem, 'versioned')}", binary
+        )
     return EngineStatus(
         NOT_INSTALLED,
         f"{label}, the engine camoufox {version} pairs with, is not installed; {stack_step()}",
@@ -342,6 +522,26 @@ def predates_pin(version: str) -> bool:
 
 def resolve_camoufox_engine() -> EngineStatus:
     """The Camoufox binary to launch, or why there is none. Never raises."""
+    try:
+        return _resolve()
+    except OSError as exc:
+        logger.warning("could not read the Camoufox engine cache", exc_info=True)
+        return EngineStatus(
+            INVALID,
+            f"the Camoufox engine cache could not be read ({exc!r}); tell the user; "
+            f"operator step: check the permissions under {camoufox_install_dir()}",
+        )
+    except _UnreadableMetadata as exc:
+        name, err = exc.args
+        logger.warning("%s package metadata is unreadable", name, exc_info=True)
+        return EngineStatus(
+            INVALID,
+            f"{name} is installed but its package metadata is unreadable ({err!r}); "
+            f"tell the user; operator step: reinstall it ({PACKAGE_HINT})",
+        )
+
+
+def _resolve() -> EngineStatus:
     version = _dist_version("camoufox")
     if version is None:
         return EngineStatus(
@@ -368,13 +568,20 @@ def resolve_camoufox_engine() -> EngineStatus:
         )
     override = os.environ.get("CAMOUFOX_EXECUTABLE_PATH", "").strip()
     if override:
+        try:
+            from camoufox.pkgman import Version  # noqa: F401 - the override check reads with it
+        except Exception as exc:  # noqa: BLE001 - a broken package, not a broken override
+            return _broken_package(version, "cannot be imported", exc)
         return _check(Path(os.path.abspath(override)), "CAMOUFOX_EXECUTABLE_PATH", "override")
     return _pinned_engine(version)
 
 
 def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m genesis.browser.engine")
+    parser.add_argument("--json", action="store_true", help="print the status as JSON")
+    args = parser.parse_args(argv)
     status = resolve_camoufox_engine()
-    if "--json" in (argv if argv is not None else sys.argv[1:]):
+    if args.json:
         print(json.dumps(status.to_json()))
     else:
         print(f"{status.kind}: {status.detail}" + (f" ({status.path})" if status.path else ""))

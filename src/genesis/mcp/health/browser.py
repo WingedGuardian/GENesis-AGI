@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import json
 import logging
 import math
 import os
@@ -37,8 +38,21 @@ from fastmcp import Context
 from genesis.browser import chromium, engine, packages, profile_backup
 from genesis.browser.types import BrowserLayer
 from genesis.mcp.health import mcp
+from genesis.security.card_shapes import contains_card_number
 
 logger = logging.getLogger(__name__)
+
+# Fixed texts: a refusal never echoes the value it refused.
+_REFUSE_CARD_VALUE = (
+    "Refused: the value looks like a payment card number. Card numbers are never "
+    "typed with the general browser tools; hand card entry to the user (see the "
+    "browser-automation skill, Safety gates)."
+)
+_REFUSE_CARD_RUN_JS = (
+    "Refused: the script contains what looks like a payment card number. Card "
+    "numbers never go through browser_run_js; hand card entry to the user (see the "
+    "browser-automation skill, Safety gates)."
+)
 
 # File-based logging for the entire MCP health server — routes ALL log
 # output to ~/tmp/mcp_health.log so it's readable after timeouts.
@@ -154,6 +168,12 @@ _layer_last_used: dict[BrowserLayer, float] = {}
 _idle_task: asyncio.Task | None = None
 _IDLE_TIMEOUT_S = 3600  # 1 hour
 
+# For _input_stall_diagnostics: when each local layer was launched (monotonic),
+# and the last JS dialog each page raised (_on_dialog).
+_layer_launched: dict[BrowserLayer, float] = {}
+_last_dialog: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_dialog_tasks: set[asyncio.Task] = set()
+
 _SCREENSHOT_DIR = Path.home() / "tmp"
 _VNC_DISPLAY = ":99"
 #: Pointer readback tolerance. VNC positioning is not exact to the pixel, so a
@@ -257,6 +277,7 @@ def _forget_layer(layer: BrowserLayer, page) -> None:
     stop the tools pointing at its page."""
     global _active_page
     _layer_last_used.pop(layer, None)
+    _layer_launched.pop(layer, None)
     for tab in [t for t, entry in _opened_by.items() if entry[3] is layer]:
         _opened_by.pop(tab, None)
     if page is not None and _active_page is page:
@@ -440,7 +461,7 @@ async def _ensure_browser():
             logger.warning("Camoufox page is stale — restarting Camoufox")
             await _cleanup_camoufox()
 
-        packages.check_loaded_browser_modules()
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CAMOUFOX))
         # Launch an explicit engine: without one camoufox resolves it itself, and
         # from 0.5 on that deletes a pre-0.5 engine and downloads the pinned one
         # inside this call. With it, camoufox still may fetch an add-on or its
@@ -452,6 +473,9 @@ async def _ensure_browser():
         await asyncio.to_thread(profile_backup.backup_camoufox_profile, _PROFILE_DIR, status.path)
 
         from camoufox.async_api import AsyncCamoufox
+        # Again past the import: an upgrade that began after the first check
+        # would have mixed old loaded modules with new files.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CAMOUFOX))
 
         _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -484,7 +508,9 @@ async def _ensure_browser():
             raise
         # With persistent_context, browser IS the context
         _stealth_cm, _stealth_browser = cm, ctx
+        _layer_launched[BrowserLayer.CAMOUFOX] = time.monotonic()
         ctx.on("close", lambda c: _on_local_context_closed(BrowserLayer.CAMOUFOX, c))
+        ctx.on("dialog", _on_dialog)
         _stealth_page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         mode_str = "headed (collaborate)" if _collaborate_mode else "headed"
         logger.info("Camoufox browser launched %s with persistent profile at %s", mode_str, _PROFILE_DIR)
@@ -557,8 +583,11 @@ async def _ensure_chromium_fallback():
             await _cleanup_chromium()
 
         package = _chromium_package()
-        packages.check_loaded_browser_modules((package,))
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
         async_playwright = _chromium_async_playwright(package)
+        # Again past the import: an upgrade that began after the first check
+        # would have mixed old loaded modules with new files.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
         # Always headed — Xvfb :99 is always running. Set before the driver starts:
         # it copies the environment then, and the browser inherits the driver's.
         os.environ["DISPLAY"] = _VNC_DISPLAY
@@ -574,6 +603,9 @@ async def _ensure_chromium_fallback():
             await asyncio.to_thread(
                 profile_backup.backup_chromium_profile, _CHROMIUM_PROFILE_DIR, package
             )
+            # And after the copy, which can wait minutes for another session's: an
+            # upgrade in that window must not reach the launch.
+            packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
             _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
             ctx = await pw.chromium.launch_persistent_context(
@@ -591,7 +623,9 @@ async def _ensure_chromium_fallback():
             await _run_close(_close_chromium(None, pw))
             raise
         _playwright, _context = pw, ctx
+        _layer_launched[BrowserLayer.CHROMIUM] = time.monotonic()
         ctx.on("close", lambda c: _on_local_context_closed(BrowserLayer.CHROMIUM, c))
+        ctx.on("dialog", _on_dialog)
         _page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         mode_str = "headed (collaborate)" if _collaborate_mode else "headed"
         logger.info("Chromium fallback launched %s with profile at %s", mode_str, _CHROMIUM_PROFILE_DIR)
@@ -743,8 +777,11 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
                 "--user-data-dir=%USERPROFILE%\\chrome-genesis"
             )
 
-        packages.check_loaded_browser_modules(packages.PLAYWRIGHT_ONLY)
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.REMOTE_CDP))
         from playwright.async_api import async_playwright
+        # Again past the import: an upgrade that began after the first check
+        # would have mixed old loaded modules with new files.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.REMOTE_CDP))
 
         # The attempt is built in locals and published to the globals only once
         # it has a tab, so a failed or cancelled attempt is cleaned up through
@@ -1014,8 +1051,11 @@ async def _ensure_tinyfish_browser(url: str | None = None) -> tuple:
             await _cleanup_tinyfish()
 
         # Before the session: it is billed from the moment it is created.
-        packages.check_loaded_browser_modules(packages.PLAYWRIGHT_ONLY)
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.TINYFISH))
         from playwright.async_api import async_playwright
+        # Again past the import: an upgrade that began after the first check
+        # would have mixed old loaded modules with new files.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.TINYFISH))
 
         from genesis.providers.tinyfish_client import browser_session_create
 
@@ -1111,7 +1151,8 @@ async def _reclaim_idle_layers(now: float) -> None:
     touched the layer meanwhile keeps it.
 
     A layer in use is never reclaimed mid-call: every page-acting _impl_* tool
-    (all but sessions, clear_domain and collaborate, which touch no page) stamps
+    (all but sessions, clear_domain and collaborate, which touch no page;
+    the first two stamp the layer whose live cookie jar they use) stamps
     its layer when it starts, every one of them but browser_fill is capped by
     _with_tool_timeout at 300 s or less, far inside _IDLE_TIMEOUT_S, and
     browser_fill, which has no overall deadline, stamps the filled page's layer
@@ -1457,6 +1498,16 @@ async def _get_page(
     return page, is_new_tinyfish
 
 
+def _layer_dists(layer: BrowserLayer) -> tuple[str, ...]:
+    """The browser packages ``layer`` imports: what its launch guard checks and its
+    import-error advice weighs. One answer, so the two cannot drift apart."""
+    if layer is BrowserLayer.CAMOUFOX:
+        return packages.CAMOUFOX_DISTS
+    if layer is BrowserLayer.CHROMIUM:
+        return (_chromium_package(),)  # the one package the fallback runs
+    return packages.PLAYWRIGHT_ONLY
+
+
 def _requested_layer(stealth: bool, remote: bool, tinyfish: bool) -> BrowserLayer:
     """The layer a browser_navigate call asks for (same precedence as _get_page)."""
     if tinyfish:
@@ -1652,6 +1703,11 @@ async def _human_scroll(page, pixels: int, *, direction: str = "down") -> None:
 # for 22 minutes until the browser was killed externally.  This asyncio-level
 # wrapper is the ONLY reliable timeout for Camoufox browser tools.
 _TOOL_TIMEOUT_S: float = 60.0
+# The event-loop time (loop.time()) at which the innermost _with_tool_timeout
+# around this call expires; None outside one (browser_fill has no deadline).
+_tool_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "_tool_deadline", default=None
+)
 
 
 async def _with_tool_timeout(
@@ -1667,6 +1723,11 @@ async def _with_tool_timeout(
     On timeout, resets ``_active_page`` to None so subsequent tool calls
     don't operate on a page left in an indeterminate state.
     """
+    # The deadline is published in _tool_deadline, so optional work late in
+    # the call (_input_stall_diagnostics) can fit itself inside it.
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    outer = _tool_deadline.get()
+    token = _tool_deadline.set(deadline if outer is None else min(outer, deadline))
     try:
         return await asyncio.wait_for(coro, timeout=timeout_s)
     except TimeoutError:
@@ -1679,6 +1740,8 @@ async def _with_tool_timeout(
                 "Browser state was reset — call browser_navigate to resume."
             )
         }
+    finally:
+        _tool_deadline.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -1710,6 +1773,9 @@ _CALL_LOG_RECORD = re.compile(r"\s*(?:- |\d+ × )(.*)")
 # can make throw, our own ambiguity message quoting page attributes) is page or
 # caller text, however much it looks like a call log.
 _CLICK_ERROR_ATTR = "_genesis_click_error"
+# Where in its target's border box a failed humanized click aimed, set on that
+# click's own error: the point _input_stall_diagnostics hit-tests.
+_CLICK_OFFSET_ATTR = "_genesis_click_offset"
 
 
 async def _click_call(click) -> None:
@@ -2056,7 +2122,14 @@ async def _humanized_click(page, target, timeout: int, is_label: bool = False) -
         kwargs["position"] = {"x": pos["x"], "y": pos["y"]}
     # No position: Playwright picks its own point from the element's quads,
     # which handles every shape the sampler above could not.
-    await _click_call(target.click(**kwargs))
+    try:
+        await _click_call(target.click(**kwargs))
+    except Exception as err:
+        # Only a point this attempt chose, on the selector's own element: a
+        # label's, Playwright's or a fallback's point is not known here.
+        if pos is not None and not is_label:
+            setattr(err, _CLICK_OFFSET_ATTR, [pos["bl"] + pos["x"], pos["bt"] + pos["y"]])
+        raise
 
 
 async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
@@ -2335,8 +2408,8 @@ async def _human_type(page, selector: str, value: str) -> None:
 
     # Clear field reliably (works on React controlled inputs)
     await _no_stall(page.fill(selector, "", timeout=10000), "clearing the field", layer)
-    # Click to focus the field
-    await _no_stall(page.click(selector, timeout=10000), "focusing the field", layer)
+    # Click to focus the field. A click's own error, so _fill can read its call log.
+    await _no_stall(_click_call(page.click(selector, timeout=10000)), "focusing the field", layer)
     # Type per-keystroke with hold time + flight time (IKI) jitter.
     # Hold time: log-normal, median ~86ms (CMU Keystroke Dynamics calibration).
     # Flight time: 50-200ms uniform with 5% thinking pauses.
@@ -3196,9 +3269,12 @@ async def _impl_browser_navigate(
     except ConnectionError as e:
         return {"error": str(e)}
     except engine.CamoufoxNotReady as e:
-        # A package changed under this session can be why the resolver's own
-        # camoufox import failed; restarting comes first, as for any import error.
-        changed = packages.packages_changed_message()
+        # The guard before the resolver already refused stale modules, so this
+        # lead appears only when pip ran during the resolver call itself; then
+        # restarting comes first, as for any import error.
+        changed = packages.packages_changed_message(
+            packages.stale_loaded_modules(_layer_dists(BrowserLayer.CAMOUFOX))
+        )
         lead = f"{changed} " if changed else ""
         return {"error": f"{lead}Camoufox is not ready: {e}"}
     except chromium.ChromiumNotReady as e:
@@ -3208,11 +3284,12 @@ async def _impl_browser_navigate(
     except PatchrightBroken as e:
         # Restarting comes first when a package changed under this session, as for
         # any import error; otherwise the message is patchright's own repair.
-        if packages.packages_changed_message():
-            return {"error": packages.import_error_message(e)}
+        dists = _layer_dists(BrowserLayer.CHROMIUM)
+        if packages.packages_changed_message(packages.stale_loaded_modules(dists)):
+            return {"error": packages.import_error_message(e, dists)}
         return {"error": str(e)}
     except ImportError as e:
-        return {"error": packages.import_error_message(e)}
+        return {"error": packages.import_error_message(e, _layer_dists(layer))}
 
     try:
         # Skip goto only when TinyFish session was JUST created with this URL
@@ -3568,6 +3645,7 @@ async def _click_and_follow(page, selector: str) -> dict:
         arrived.set()
 
     sent_error = None
+    nav = None
     try:
         await _human_delay()
         wait_s = (
@@ -3578,6 +3656,7 @@ async def _click_and_follow(page, selector: str) -> dict:
         # popup the page opened on its own during the delay is not this
         # click's. (One whose first response arrives later still can be.)
         page.on("popup", _on_popup)
+        nav = _NavWatch(page)  # for _with_stall_diagnostics, from the click on
         try:
             await _stealth_click(page, selector)
         except Exception as e:
@@ -3610,10 +3689,14 @@ async def _click_and_follow(page, selector: str) -> dict:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(arrived.wait(), timeout=remaining)
     except Exception as e:
-        return _click_failed(selector, e)
+        return await _with_stall_diagnostics(
+            _click_failed(selector, e), page, selector, e, "browser_click", nav
+        )
     finally:
         with contextlib.suppress(Exception):
             page.remove_listener("popup", _on_popup)
+        if nav is not None:
+            nav.stop()
     clicked = page
     result: dict = {"clicked": selector}
     if sent_error is not None:
@@ -3682,8 +3765,376 @@ def _click_failed(selector: str, e: Exception, sent: bool = False) -> dict:
     return {"error": f"Click failed on '{selector}': {e}"}
 
 
+# --- Input-stall diagnostics ----------------------------------------------
+# A long-lived Camoufox was seen stalling every real mouse action at
+# "performing click action" while a script click (element.click()) worked, and
+# a fresh instance did not reproduce it. The candidate causes (a JS dialog, the
+# window losing focus or visibility on the X display, a navigation, the target
+# moving or being covered, something that accrues with instance age) cannot be
+# told apart afterwards, so a failure that reached that record carries this
+# snapshot, taken then, holding only the fields that separate those causes.
+# Read-only and value-free: every string must be on its field's allowlist
+# (_FIELD_TOKENS) and every number is rounded and bounded (_clamp, _bounded).
+# Each probe is bounded, so the whole snapshot costs at most two _STALL_PROBE_S
+# waits (4 s), and inside a tool deadline (_tool_deadline: browser_click's 60 s)
+# a probe runs only if its whole wait ends _STALL_DEADLINE_MARGIN_S before
+# that deadline: a late failure keeps its own error instead of becoming the
+# generic timeout-and-reset result.
+_STALL_PROBE_S: float = 2.0  # a healthy page answers in milliseconds
+_STALL_DEADLINE_MARGIN_S: float = 1.0  # the error path after the snapshot is ~ms
+_STALL_MAX_PX = 16384  # the widest viewport accepted, in CSS pixels
+_STALL_MAX_AGE_S = 7 * 86400  # ages are capped at a week
+_STALL_MAX_PAGES = 100
+
+# Each probe answers with ONE primitive string, built in the page and bounded
+# there. Decoding an answer runs synchronously in this process, outside any
+# timeout, and on a main-world layer (all but Camoufox) the page can redefine
+# the getters a probe reads AND the builtins Playwright's own in-page
+# serializer calls on an object or array result (``then``, ``stack``,
+# ``Object.entries``); a top-level string skips that walk. Each value is
+# length-prefixed (E): "s<len>:<text>" (at most 40 characters), "n<number>;"
+# (a primitive number), "t"/"f", "z" (null), or "i" ("<invalid>": a value of
+# another type or size, or a getter that threw). A probe that throws anyway
+# answers "<threw>", never the thrown value. Only operators are used (typeof,
+# ===, + on primitives, .length of a primitive string): a "captured" builtin
+# would be the page's own in its main world. _decode reads the answer back,
+# and _token and the number checks below re-check every value. What this
+# cannot reach is Playwright's own main-world plumbing around the script (how
+# it compiles the function and builds its arguments, and the text of an error
+# raised there): only an isolated world closes that.
+_PROBE_BOUND_JS = """
+  const S = (f) => { try { const v = f(); return typeof v === 'string' && v.length <= 40 ? v : '<invalid>'; } catch (_) { return '<invalid>'; } };
+  const N = (f) => { try { const v = f(); return typeof v === 'number' ? v : '<invalid>'; } catch (_) { return '<invalid>'; } };
+  const B = (f) => { try { const v = f(); return v === true || v === false ? v : '<invalid>'; } catch (_) { return '<invalid>'; } };
+  const E = (...vs) => {
+    let w = '';
+    for (let i = 0; i < vs.length; i++) {
+      const v = vs[i];
+      w += typeof v === 'number' ? 'n' + v + ';' : v === true ? 't' : v === false ? 'f' : v === null ? 'z'
+        : typeof v === 'string' && v.length <= 40 && v !== '<invalid>' ? 's' + v.length + ':' + v : 'i';
+    }
+    return w;
+  };
+"""
+_PROBE_MAX_CHARS = 1024  # ten values of at most 45 characters each fit easily
+
+# visibility, has_focus, ready_state, modal_dialog. modal_dialog: a modal
+# <dialog> makes the rest of the page inert, so real input to it is dropped
+# while a script click still dispatches.
+_DOC_KEYS = ("visibility", "has_focus", "ready_state", "modal_dialog")
+_DOC_STATE_JS = "() => {" + _PROBE_BOUND_JS + """
+  try {
+    return E(S(() => document.visibilityState), B(() => document.hasFocus()),
+             S(() => document.readyState), B(() => !!document.querySelector('dialog:modal')));
+  } catch (_) { return '<threw>'; }
+}"""
+
+# The viewport (2 values), the target's box (4), then the hit: null when no
+# point is known, "<invalid>" when the box is unreadable, else x, y, rel, tag.
+# ``o``: the offset in the target's box the click aimed at (_CLICK_OFFSET_ATTR),
+# or null when Playwright chose the point, which this code cannot know. The page
+# can tamper with how ``o`` is built, so the sums are bounded too. The box is
+# the element's own frame's, so the hit test is too. It descends open shadow
+# roots, and containment crosses them (as _PICK_POINT_JS does): a document-level
+# hit stops at the outermost host, which would read as a cover.
+_TARGET_STATE_JS = "(e, o) => {" + _PROBE_BOUND_JS + """
+  try {
+    const r = e.getBoundingClientRect();
+    const bx = N(() => r.x), by = N(() => r.y), bw = N(() => r.width), bh = N(() => r.height);
+    const vw = N(() => innerWidth), vh = N(() => innerHeight);
+    if (!o) return E(vw, vh, bx, by, bw, bh, null);
+    const x = N(() => bx + o[0]), y = N(() => by + o[1]);
+    if (typeof x !== 'number' || typeof y !== 'number') return E(vw, vh, bx, by, bw, bh, '<invalid>');
+    const within = (m, t) => { for (; m; m = m.parentNode || m.host) if (m === t) return true; return false; };
+    let n = e.ownerDocument.elementFromPoint(x, y);
+    for (let m; n && n.shadowRoot && (m = n.shadowRoot.elementFromPoint(x, y)) && m !== n; ) n = m;
+    const rel = !n ? 'none' : n === e ? 'target' : within(n, e) ? 'inside' : within(e, n) ? 'ancestor' : 'other';
+    return E(vw, vh, bx, by, bw, bh, x, y, rel, n ? S(() => n.localName) : null);
+  } catch (_) { return '<threw>'; }
+}"""
+
+
+# How JavaScript writes a primitive number ('' + v).
+_JS_NUMBER = re.compile(r"-?(?:\d+(?:\.\d+)?(?:e[+-]\d+)?|Infinity)|NaN")
+
+
+def _decode(w) -> list | None:
+    """The values a probe encoded (E in _PROBE_BOUND_JS), or None if ``w`` is
+    not a well-formed answer."""
+    if type(w) is not str or len(w) > _PROBE_MAX_CHARS:
+        return None
+    out: list = []
+    i = 0
+    try:
+        while i < len(w):
+            c, i = w[i], i + 1
+            if c in "tfzi":
+                out.append({"t": True, "f": False, "z": None, "i": "<invalid>"}[c])
+            elif c == "n":
+                j = w.index(";", i)
+                if not _JS_NUMBER.fullmatch(w[i:j]):
+                    return None
+                out.append(float(w[i:j]))
+                i = j + 1
+            elif c == "s":
+                j = w.index(":", i)
+                n = w[i:j]  # digits only: a sign or "_" could move ``end`` backwards
+                if not (n.isascii() and n.isdecimal()) or int(n) > 40 or (end := j + 1 + int(n)) > len(w):
+                    return None
+                out.append(w[j + 1:end])
+                i = end
+            else:
+                return None
+    except ValueError:
+        return None
+    return out
+
+
+# _TARGET_STATE_JS's values, in the shape _target_state reads.
+def _target_fields(v: list) -> dict | None:
+    if len(v) not in (7, 10):
+        return None
+    hit = v[6] if len(v) == 7 else {"at": v[6:8], "rel": v[8], "tag": v[9]}
+    return {"viewport": v[0:2], "box": v[2:6], "hit": hit}
+
+
+# Every string a probe returns is page-controlled: a tag names whatever the
+# page wrote (a custom element "secret-hunter2"), and on a layer that evaluates
+# in the page's main world (all but Camoufox) the page can redefine the getters
+# the probes read. So each string must be on its own field's allowlist: one
+# that is not becomes "<unlisted>" (a custom-element tag: "<custom>"), and a
+# value of the wrong shape becomes "<invalid>". Listed values are lowercased.
+_FIELD_TOKENS: dict[str, frozenset[str]] = {
+    # HTML living standard elements, plus the SVG and MathML ones a click lands on.
+    "tag": frozenset(
+        ["a", "abbr", "address", "area", "article", "aside", "audio", "b", "base", "bdi", "bdo", "blockquote", "body", "br", "button", "canvas", "caption", "cite", "code", "col", "colgroup", "data", "datalist", "dd", "del", "details", "dfn", "dialog", "div", "dl", "dt", "em", "embed", "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hgroup", "hr", "html", "i", "iframe", "img", "input", "ins", "kbd", "label", "legend", "li", "link", "main", "map", "mark", "menu", "meta", "meter", "nav", "noscript", "object", "ol", "optgroup", "option", "output", "p", "picture", "pre", "progress", "q", "rp", "rt", "ruby", "s", "samp", "script", "search", "section", "select", "slot", "small", "source", "span", "strong", "style", "sub", "summary", "sup", "table", "tbody", "td", "template", "textarea", "tfoot", "th", "thead", "time", "title", "tr", "track", "u", "ul", "var", "video", "wbr", "svg", "g", "path", "circle", "ellipse", "line", "polyline", "polygon", "rect", "use", "text", "tspan", "image", "foreignobject", "math"]
+    ),
+    "visibility": frozenset({"visible", "hidden", "prerender"}),
+    "ready_state": frozenset({"loading", "interactive", "complete"}),
+    "rel": frozenset({"none", "target", "inside", "ancestor", "other"}),
+    "dialog": frozenset({"alert", "confirm", "prompt", "beforeunload"}),
+}
+# A valid custom element name: lowercase start, and a hyphen (HTML standard).
+_CUSTOM_TAG = re.compile(r"[a-z][a-z0-9._-]*-[a-z0-9._-]*")
+# Dialogs and launch time are recorded for the local layers only.
+_TRACKED_LAYERS = (BrowserLayer.CAMOUFOX, BrowserLayer.CHROMIUM)
+
+
+def _token(v, field: str):
+    """``v`` if it is on ``field``'s allowlist (_FIELD_TOKENS), lowercased.
+    A probe's own "<invalid>" (_PROBE_BOUND_JS) stays "<invalid>"."""
+    if type(v) is not str or v == "<invalid>":
+        return "<invalid>"
+    low = v.lower()
+    if low in _FIELD_TOKENS[field]:
+        return low
+    return "<custom>" if field == "tag" and _CUSTOM_TAG.fullmatch(low) else "<unlisted>"
+
+
+# Page-supplied numbers: a coordinate or size is clamped to [0, the viewport]
+# and an extent outside its range is invalid, both rounded; anything that is
+# not a finite number is invalid. An age or count this process measured is
+# rounded and capped.
+def _finite(v) -> bool:  # a JS BigInt arrives as an int of any size
+    return type(v) is float and math.isfinite(v) or type(v) is int and abs(v) <= 2**53
+
+
+def _clamp(v, hi):
+    return round(min(max(v, 0), hi)) if _finite(v) else "<invalid>"
+
+
+def _bounded(v, lo, hi):
+    return round(v) if _finite(v) and lo <= v <= hi else "<invalid>"
+
+
+def _doc_state(got: dict) -> dict:
+    return {
+        k: _token(got.get(k), k) if k in _FIELD_TOKENS else got.get(k)
+        if type(got.get(k)) is bool else "<invalid>"
+        for k in _DOC_KEYS
+    }
+
+
+# The target's box against the viewport, and what lies under the point the
+# click used; ``aimed``: whether that point is known.
+def _target_state(got: dict, aimed: bool) -> dict:
+    vp = got.get("viewport")
+    vw, vh = vp if type(vp) is list and len(vp) == 2 else (None, None)
+    vw, vh = _bounded(vw, 1, _STALL_MAX_PX), _bounded(vh, 1, _STALL_MAX_PX)
+    if "<invalid>" in (vw, vh):
+        return {"viewport": "<invalid>"}
+    out: dict = {"viewport": [vw, vh], "box": "<invalid>", "in_viewport": "<invalid>"}
+    box = got.get("box")
+    if type(box) is list and len(box) == 4 and all(map(_finite, box)):
+        x, y, w, h = box
+        out["box"] = [_clamp(x, vw), _clamp(y, vh), _clamp(w, vw), _clamp(h, vh)]
+        out["in_viewport"] = x + w > 0 and y + h > 0 and x < vw and y < vh
+    out["hit"] = {"point": "unknown"} if not aimed else "<invalid>"
+    hit = got.get("hit")
+    if aimed and type(hit) is dict and type(at := hit.get("at")) is list and len(at) == 2:
+        tag = hit.get("tag")
+        out["hit"] = {
+            "at": [_clamp(at[0], vw), _clamp(at[1], vh)],
+            "rel": _token(hit.get("rel"), "rel"),
+            "tag": None if tag is None else _token(tag, "tag"),
+        }
+    return out
+
+
+# Record a JS dialog for _input_stall_diagnostics, then settle it as Playwright
+# does when nothing listens (_on_dialog in playwright/_impl/_browser_context.py:
+# accept a beforeunload, dismiss the rest). Any listener turns that default
+# off, so this one settles every dialog itself, and says so when it cannot: a
+# dialog left open blocks the page. Its message is page text and is not kept.
+def _on_dialog(dialog) -> None:
+    kind = dialog.type
+    settle = dialog.accept() if kind == "beforeunload" else dialog.dismiss()
+    seen = {"type": _token(kind, "dialog"), "at": time.monotonic(), "settled": False}
+    with contextlib.suppress(Exception):
+        _last_dialog[dialog.page] = seen
+
+    async def _settle() -> None:
+        try:
+            await settle
+        except Exception:
+            logger.warning("JS dialog could not be settled", exc_info=True)
+            return
+        seen["settled"] = True
+
+    task = asyncio.ensure_future(_settle())
+    _dialog_tasks.add(task)
+    task.add_done_callback(_dialog_tasks.discard)
+
+
+# Counts main-frame navigations of ``page`` from construction to stop(), from
+# Playwright's "framenavigated" event: browser_navigate does not take the
+# page-action lock, so a click's page can load another document before or
+# while _input_stall_diagnostics probes it. An event, not a page round trip,
+# so the click pays nothing for it. It also counts a same-document navigation
+# (pushState, a hash change): a route change re-renders the page, so a
+# snapshot after one does not show what the failed click saw either.
+class _NavWatch:
+    def __init__(self, page) -> None:
+        self.page, self.count, self.armed = page, 0, False
+        with contextlib.suppress(Exception):
+            page.on("framenavigated", self._on_nav)
+            self.armed = True
+
+    def _on_nav(self, frame) -> None:
+        with contextlib.suppress(Exception):
+            if frame is self.page.main_frame:
+                self.count += 1
+
+    def stop(self) -> None:
+        with contextlib.suppress(Exception):
+            self.page.remove_listener("framenavigated", self._on_nav)
+
+
+# One in-page probe, bounded by _STALL_PROBE_S: its answer decoded (_decode)
+# and passed through ``check``, or why it failed. Skipped when its whole wait would not end by
+# ``end`` (loop time, from the tool deadline): a cut-short wait would read as
+# a hung page.
+async def _probe(call, check, end: float | None) -> dict:
+    if end is not None and asyncio.get_running_loop().time() + _STALL_PROBE_S > end:
+        return {"probe_skipped": "tool_deadline"}
+    try:
+        got = await asyncio.wait_for(call(), timeout=_STALL_PROBE_S)
+        if got == "<threw>":
+            return {"probe_failed": "page_script_threw"}
+        out = None if (vals := _decode(got)) is None else check(vals)
+        return {"probe_failed": "unexpected answer"} if out is None else out
+    except Exception as err:  # a probe that hangs, throws or answers oddly is itself a finding
+        return {"probe_failed": type(err).__name__}
+
+
+# What the page and its layer looked like when a click stalled at "performing
+# click action" (see the comment above _STALL_PROBE_S). A page that ``nav`` saw
+# navigate since the click is reported, not probed. ``offset``: where in the
+# target the failing click aimed (_CLICK_OFFSET_ATTR), or None when that is
+# unknown. Never raises.
+async def _input_stall_diagnostics(page, selector: str, nav: _NavWatch | None, offset=None) -> dict:
+    layer = _layer_of(page)
+    tracked = layer in _TRACKED_LAYERS
+    launched = _layer_launched.get(layer)  # only the local layers are recorded
+    now = time.monotonic()
+    diag: dict = {
+        "layer": layer.value if layer is not None else None,
+        # "not_tracked", never None: a null would read as "no dialog seen".
+        "instance_age_s": "not_tracked" if launched is None else min(round(now - launched), _STALL_MAX_AGE_S),
+        "open_pages": None,
+        "last_dialog": None if tracked else "not_tracked",
+    }
+    with contextlib.suppress(Exception):
+        diag["open_pages"] = min(len(page.context.pages), _STALL_MAX_PAGES)
+    if tracked and (seen := _last_dialog.get(page)) is not None:
+        age = min(round(now - seen["at"]), _STALL_MAX_AGE_S)
+        diag["last_dialog"] = {"type": _token(seen["type"], "dialog"), "age_s": age, "settled": seen["settled"]}
+    # With no watch, whether the page navigated is unknown, so nothing is probed.
+    if nav is None or not nav.armed:
+        diag["navigated"] = "not_tracked"
+        diag["document"] = diag["target"] = {"probe_skipped": "navigation_not_tracked"}
+        return diag
+    if not nav.count:
+        deadline = _tool_deadline.get()
+        end = None if deadline is None else deadline - _STALL_DEADLINE_MARGIN_S
+        diag["document"] = await _probe(
+            lambda: page.evaluate(_DOC_STATE_JS),
+            lambda v: _doc_state(dict(zip(_DOC_KEYS, v, strict=True))) if len(v) == len(_DOC_KEYS) else None,
+            end,
+        )
+        # Playwright's own timeout fires first (an unretrieved driver future
+        # otherwise outlives the cancelled wait); _probe's bound backs up a hung driver.
+        diag["target"] = await _probe(
+            lambda: page.locator(selector).first.evaluate(
+                _TARGET_STATE_JS, offset, timeout=_STALL_PROBE_S * 750
+            ),
+            lambda v: None if (got := _target_fields(v)) is None else _target_state(got, offset is not None),
+            end,
+        )
+    # A navigation since the click, before or during the probes: they read
+    # (or would read) another document.
+    diag["navigated"] = nav.count > 0
+    if nav.count:
+        diag["document"] = diag["target"] = {"probe_skipped": "page_navigated"}
+    return diag
+
+
+# ``result``, with a ``diagnostics`` field when ``err`` is a click's own error
+# whose call log reached "performing click action" (_call_log). The snapshot is
+# also logged as one line of JSON. ``nav`` was started before the click.
+async def _with_stall_diagnostics(
+    result: dict, page, selector: str, err: BaseException, tool: str, nav: _NavWatch | None
+) -> dict:
+    records = _call_log(err, selector)
+    # Stalled AT the click: the log ends there. A log that went on (click action
+    # done, waiting for scheduled navigations) timed out after a delivered click.
+    if not records or records[-1] != _CLICK_SENT_MARK:
+        return result
+    try:
+        diag = await _input_stall_diagnostics(page, selector, nav, getattr(err, _CLICK_OFFSET_ATTR, None))
+    except Exception as diag_err:  # never let the snapshot replace the error
+        diag = {"diagnostics_failed": type(diag_err).__name__}
+    result["diagnostics"] = diag
+    logger.warning("%s stalled at 'performing click action': %s", tool, json.dumps(diag, default=str))
+    return result
+
+
 async def _impl_browser_fill(selector: str, value: str) -> dict:
-    """Fill a form field on the current page."""
+    """Fill a form field on the current page.
+
+    A value containing a payment card number is refused before anything is
+    typed or logged.
+
+    Known limit: the check reads the VALUE. Whether the target field is a card
+    field is not judged here; deciding that from page attributes misses labels
+    in other languages, placeholders and frames, so it is not judged anywhere
+    yet; the planned card-fill flow (#3172) owns it, where a field it fails to
+    find fails the fill (safe). A model already holding a card could type it in
+    pieces; the planned card vault and input and output redaction (#3172) are
+    what keep real numbers out of its context.
+    """
+    if contains_card_number(value):
+        return {"error": _REFUSE_CARD_VALUE}
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -3708,8 +4159,11 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
 async def _fill(page, selector: str, value: str) -> dict:
     """The typing of _impl_browser_fill, under its page's action lock."""
     global _active_page
+    nav = None
     try:
         await _human_delay()
+        # For _with_stall_diagnostics: from the clearing and focus click on.
+        nav = _NavWatch(page)
         await _human_type(page, selector, value)
         _update_remote_url()  # Fill + Enter may cause navigation
         return {"filled": selector, "url": page.url}
@@ -3736,7 +4190,11 @@ async def _fill(page, selector: str, value: str) -> dict:
             )
         }
     except Exception as e:
-        return {"error": f"Fill failed on '{selector}': {e}"}
+        failed = {"error": f"Fill failed on '{selector}': {e}"}
+        return await _with_stall_diagnostics(failed, page, selector, e, "browser_fill", nav)
+    finally:
+        if nav is not None:
+            nav.stop()
 
 
 async def _impl_browser_upload(selector: str, file_path: str) -> dict:
@@ -3861,8 +4319,17 @@ async def _impl_browser_run_js(expression: str) -> dict:
     """Execute JavaScript on the current page and return the result.
 
     Runs JS in the browser's V8 engine via Playwright page.evaluate().
-    Equivalent to Chrome DevTools console. Expressions are logged for audit.
+    Equivalent to Chrome DevTools console. Expressions are logged for audit,
+    so one containing a card number is refused before that log line.
+
+    Known limit (a documented residual, by owner decision): the check reads the
+    expression's TEXT, so a script that computes a number at runtime
+    (``'4242'+'4242'+…``) is not caught. No text check can close that for an
+    arbitrary evaluator; the guard catches the accidental literal, and the
+    planned card vault (#3172) keeps real numbers out of the agent's context.
     """
+    if contains_card_number(expression):
+        return {"error": _REFUSE_CARD_RUN_JS}
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -3883,40 +4350,215 @@ async def _impl_browser_run_js(expression: str) -> dict:
             return {"error": f"JS execution failed: {e}"}
 
 
-async def _impl_browser_sessions() -> dict:
-    """List logged-in sessions from the persistent browser profile.
+def _cookie_profiles() -> tuple[tuple[str, Path], ...]:
+    """The two local browser profiles the cookie tools cover, labelled."""
+    return (("camoufox", _PROFILE_DIR), ("chromium", _CHROMIUM_PROFILE_DIR))
 
-    Does NOT launch a browser — reads the cookie database directly.
+
+def _live_cookie_context(kind: str):
+    """See :func:`_live_cookie_context_unstamped`; also refreshes that layer's
+    idle clock when a live context is returned, so a session using only the
+    cookie tools keeps the browser whose jar it is reading. Only that layer:
+    the active page's layer is not touched by a cookie call."""
+    ctx = _live_cookie_context_unstamped(kind)
+    if ctx is not None:
+        _touch(BrowserLayer.CAMOUFOX if kind == "camoufox" else BrowserLayer.CHROMIUM)
+    return ctx
+
+
+def _live_cookie_context_unstamped(kind: str):
+    """This process's live browser context for a profile, or None.
+
+    While the browser runs, its cookie jar lives in memory and is written back
+    to the file, so the live context's cookie API is the only correct way to
+    read or change it. Camoufox's persistent context IS the browser object.
+
+    Liveness is the CONTEXT's, not the remembered page's: cookies belong to the
+    context, and the user closing one tab leaves the context (and its lock on
+    the profile) in place. A context this process holds counts until cleanup
+    clears it; a crashed one makes the cookie call fail, which is reported as
+    an error, never as an empty result. Callers hold ``_browser_lock`` so a
+    browser that is still starting is waited for, not missed.
     """
-    try:
-        from genesis.browser.profile import BrowserProfileManager
-        mgr = BrowserProfileManager()
-        info = mgr.get_info()
-        return {
-            "profile_path": info.profile_path,
-            "exists": info.exists,
-            "size_mb": info.size_mb,
-            "sessions": [
-                {"domain": s.domain, "cookie_count": s.cookie_count}
-                for s in info.sessions
-            ],
-        }
-    except Exception as e:
-        return {"error": f"Failed to read browser sessions: {e}"}
+    if kind == "camoufox":
+        return _stealth_browser if _stealth_cm is not None else None
+    return _context
+
+
+# Bound on one cookie call to a live browser context. Camoufox is the reason:
+# a Playwright call into it has hung for 22 minutes (see _TOOL_TIMEOUT_S), and
+# these two tools have no tool-level timeout. A cookie read or clear on a
+# healthy browser returns in well under a second, so 30 s means a hung browser,
+# and the profile then reports an error instead of blocking the tool forever.
+# The tools also wait for _browser_lock first; every holder of that lock runs
+# under its own tool timeout, so that wait ends when the holder's does.
+_COOKIE_CALL_TIMEOUT_S: float = 30.0
+
+
+async def _cookie_call(awaitable):
+    return await asyncio.wait_for(awaitable, timeout=_COOKIE_CALL_TIMEOUT_S)
+
+
+def _expired_copy(cookie: dict) -> dict:
+    """The same cookie (name, domain, path, partition) already expired.
+
+    Setting it deletes that one cookie in place. Playwright's filtered
+    clear_cookies() instead clears the WHOLE jar and re-adds the rest
+    (server/browserContext.js clearCookies, 1.58.0), so a failed re-add would
+    log the profile out of every site. Every identity field is kept, including
+    Chromium's ``_crHasCrossSiteAncestor``, which Playwright otherwise defaults
+    to true and so would name a different partition.
+    """
+    keep = (
+        "name", "domain", "path", "secure", "httpOnly", "sameSite",
+        "partitionKey", "_crHasCrossSiteAncestor",
+    )
+    return {**{k: cookie[k] for k in keep if k in cookie}, "value": "deleted", "expires": 1}
+
+
+def _cookie_key(cookie: dict) -> tuple:
+    """A cookie's identity: the fields :func:`_expired_copy` keeps that name
+    WHICH cookie, including Chromium's ancestor bit (part of the partition)."""
+    return (
+        cookie.get("name"), cookie.get("domain"), cookie.get("path"),
+        cookie.get("partitionKey"), cookie.get("_crHasCrossSiteAncestor"),
+    )
+
+
+async def _impl_browser_sessions() -> dict:
+    """List cookie counts per domain in both local browser profiles.
+
+    Does NOT launch a browser. A profile whose browser runs in this process is
+    read through the live context; otherwise the cookie file is read
+    read-only. Each entry says which source it used. Holds ``_browser_lock``
+    (see :func:`_impl_browser_clear_domain`).
+    """
+    from collections import Counter
+
+    from genesis.browser.profile import BrowserProfileManager
+
+    profiles = []
+    async with _browser_lock:
+        for kind, pdir in _cookie_profiles():
+            entry: dict = {"browser": kind, "profile_path": str(pdir)}
+            try:
+                ctx = _live_cookie_context(kind)
+                if ctx is not None:
+                    counts = Counter(
+                        (c.get("domain") or "").lstrip(".")
+                        for c in await _cookie_call(ctx.cookies())
+                    )
+                    entry.update(
+                        source="live browser",
+                        exists=True,
+                        sessions=[
+                            {"domain": d, "cookie_count": n} for d, n in sorted(counts.items())
+                        ],
+                    )
+                else:
+                    mgr = BrowserProfileManager(pdir, browser=kind)
+                    info = mgr.get_info()
+                    entry.update(
+                        source="profile file",
+                        exists=info.exists,
+                        size_mb=info.size_mb,
+                        sessions=[
+                            {"domain": s.domain, "cookie_count": s.cookie_count}
+                            for s in info.sessions
+                        ],
+                    )
+                    if info.error:
+                        entry["error"] = info.error
+                    pid = mgr.running_pid()
+                    if pid is not None:
+                        entry["note"] = (
+                            f"open in another browser process (pid {pid}); the file "
+                            "can lag that browser's live cookies"
+                        )
+            except Exception as e:
+                entry["error"] = f"Failed to read {kind} sessions: {e!r}"
+            profiles.append(entry)
+    return {"profiles": profiles}
 
 
 async def _impl_browser_clear_domain(domain: str) -> dict:
-    """Clear cookies for a specific domain (selective logout).
+    """Clear the cookies of a domain and its subdomains in both profiles.
 
-    Does NOT launch a browser — modifies the cookie database directly.
+    Exact label matching: ``x.com`` clears ``x.com`` and ``*.x.com``, never
+    ``netflix.com``. Does NOT launch a browser: a profile whose browser runs in
+    this process is cleared through the live context, a closed one in its
+    cookie file, and one open in another process is refused (that browser
+    would write its cookies back) with the reason in its entry.
+
+    Holds ``_browser_lock``, which browser startup and stale-page restarts also
+    hold: mid-startup the context is still unset, so an unlocked call would
+    edit the profile FILE the browser is opening, and two concurrent clears
+    would both count the same cookies. A live context's layer has its idle
+    clock refreshed, so a session using only these keeps that browser.
     """
+    from genesis.browser.profile import (
+        BrowserProfileManager,
+        ProfileInUse,
+        domain_matches,
+        normalize_domain,
+    )
+
     try:
-        from genesis.browser.profile import BrowserProfileManager
-        mgr = BrowserProfileManager()
-        removed = mgr.clear_domain(domain)
-        return {"domain": domain, "cookies_removed": removed}
-    except Exception as e:
-        return {"error": f"Failed to clear domain '{domain}': {e}"}
+        d = normalize_domain(domain)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    total = 0
+    profiles = []
+    async with _browser_lock:
+        for kind, pdir in _cookie_profiles():
+            entry: dict = {"browser": kind}
+            try:
+                ctx = _live_cookie_context(kind)
+                if ctx is not None:
+                    matched = [
+                        c for c in await _cookie_call(ctx.cookies())
+                        if domain_matches(c.get("domain", ""), d)
+                    ]
+                    failed = None
+                    if matched:
+                        # Only the matching cookies are touched; nothing else
+                        # in the jar is cleared or re-added.
+                        try:
+                            await _cookie_call(
+                                ctx.add_cookies([_expired_copy(c) for c in matched])
+                            )
+                        except Exception as e:
+                            failed = e  # re-read below: report what was removed
+                    try:
+                        after = {
+                            _cookie_key(c) for c in await _cookie_call(ctx.cookies())
+                            if domain_matches(c.get("domain", ""), d)
+                        }
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"re-reading the jar failed ({e!r}) after the delete "
+                            f"{'failed: ' + repr(failed) if failed else 'succeeded'}; "
+                            "removed count unknown"
+                        ) from e
+                    # By identity, not a net difference: a cookie a page sets
+                    # meanwhile must not cancel one that was really removed.
+                    n = sum(_cookie_key(c) not in after for c in matched)
+                    entry.update(source="live browser", removed=n)
+                    if failed is not None:
+                        entry["error"] = f"Failed to clear {kind} cookies: {failed!r}"
+                    elif after:
+                        entry["error"] = f"{len(after)} matching cookies remain after the clear"
+                else:
+                    n = BrowserProfileManager(pdir, browser=kind).clear_domain(d)
+                    entry.update(source="profile file", removed=n)
+                total += n
+            except ProfileInUse as e:
+                entry["error"] = str(e)
+            except Exception as e:
+                entry["error"] = f"Failed to clear {kind} cookies: {e!r}"
+            profiles.append(entry)
+    return {"domain": d, "cookies_removed": total, "profiles": profiles}
 
 
 async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
@@ -4076,6 +4718,9 @@ async def browser_fill(selector: str, value: str, ctx: Context | None = None) ->
     keystroke) makes no progress for 30 s, and then the page is reset if it
     is still the active page. Progress is reported as the fill advances, so
     the MCP client's idle timeout does not cancel a long fill.
+
+    A value containing a payment card number is refused; card entry is handed
+    to the user.
     """
     steps = 0
     last_sent = time.monotonic()
@@ -4156,6 +4801,8 @@ async def browser_run_js(expression: str) -> dict:
     Chrome DevTools console. Returns the expression result.
 
     Example: browser_run_js('document.title')
+
+    An expression containing a payment card number is refused.
     """
     return await _with_tool_timeout(
         _impl_browser_run_js(expression), _TOOL_TIMEOUT_S, "browser_run_js"
@@ -4164,19 +4811,25 @@ async def browser_run_js(expression: str) -> dict:
 
 @mcp.tool()
 async def browser_sessions() -> dict:
-    """List logged-in sessions from the persistent browser profile.
+    """List logged-in sessions in both local browser profiles.
 
-    Reads the Chrome cookie database without launching a browser.
-    Shows which domains have saved cookies/sessions.
+    Covers Camoufox (~/.genesis/camoufox-profile) and Chromium
+    (~/.genesis/browser-profile), one labelled entry each, with cookie counts
+    per domain. Never launches a browser: a browser running in this session is
+    read live, otherwise the profile's cookie file is read.
     """
     return await _impl_browser_sessions()
 
 
 @mcp.tool()
 async def browser_clear_domain(domain: str) -> dict:
-    """Clear cookies for a specific domain (selective logout).
+    """Clear cookies for a domain and its subdomains (selective logout).
 
-    Modifies the cookie database directly without launching a browser.
+    Matches whole labels: 'x.com' clears x.com and api.x.com, never
+    netflix.com. Covers both local profiles and returns the number removed,
+    per profile and in total. Never launches a browser. A profile open in
+    another session's browser is refused for that profile (its entry says
+    why), because that browser would write its cookies back.
     Example: browser_clear_domain('github.com')
     """
     return await _impl_browser_clear_domain(domain)
