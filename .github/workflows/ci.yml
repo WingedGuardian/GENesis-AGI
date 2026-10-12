@@ -1056,9 +1056,9 @@ jobs:
         # tests/test_scripts/test_codebase_managed_config.py +1,
         # tests/test_scripts/test_session_doors.py +6. No added skips.
         # Floor: 25687 + 1 + 3 + 1 + 6 = 25698.
-        # Native CBM runtime/templates (#3000): new runtime file 52 and template
-        # file 26 cases, plus template-placeholders 13 -> 14 (+1 hosted slice
-        # inventory). Unit-root guard adds 5 controls for the backend's neutral
-        # cwd exception. Other edited files retain counts; no new skip sites.
-        # Re-merge with main: main 25698 + this PR's measured +84 = 25782.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25782
+        # Native CBM runtime/templates (#3000): the 7 files this PR touches
+        # collect 293 cases, measured fresh with --collect-only; the 5 files
+        # shared with main collect 208 there (not 25698's older checkpoint,
+        # which predates main's smb-backend and deploy-backup entries above).
+        # Net +85. No skipif in any of the 7. Floor: 25718 + 85 = 25803.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25803
