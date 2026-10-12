@@ -503,6 +503,19 @@ def _pinned_engine(version: str) -> EngineStatus:
     )
 
 
+def predates_pin(version: str) -> bool:
+    """Whether the installed camoufox ``version`` is older than the browser pin
+    (0.5.7): its installed files carry no ``camoufox/browser_pin.py``, or, for an
+    installer that wrote no file list, its release number is below 0.5.7."""
+    files = _dist_files("camoufox")
+    if files is not None:
+        return "camoufox/browser_pin.py" not in files
+    match = re.match(r"(\d+)\.(\d+)(?:\.(\d+))?", version)
+    if not match:
+        return True
+    return (int(match[1]), int(match[2]), int(match[3] or 0)) < (0, 5, 7)
+
+
 def resolve_camoufox_engine() -> EngineStatus:
     """The Camoufox binary to launch, or why there is none. Never raises."""
     try:
@@ -543,13 +556,7 @@ def _resolve() -> EngineStatus:
         return _legacy_engine(version)
     # 0.5.7 brought both the browser pin and CAMOUFOX_EXECUTABLE_PATH; 0.5.3-0.5.6
     # have neither, so they are refused before the override is read.
-    files = _dist_files("camoufox")
-    if files is not None:
-        predates_pin = "camoufox/browser_pin.py" not in files
-    else:  # an installer that wrote no RECORD: the release number decides
-        patch = re.match(r"\d+\.\d+\.(\d+)", version)
-        predates_pin = (int(match[1]), int(match[2]), int(patch[1]) if patch else 0) < (0, 5, 7)
-    if predates_pin:
+    if predates_pin(version):
         return EngineStatus(
             INVALID,
             f"camoufox {version} predates the browser pin (0.5.7); "

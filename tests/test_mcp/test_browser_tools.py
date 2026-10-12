@@ -57,10 +57,15 @@ def _clear_all_browser_state():
 
 
 @pytest.fixture(autouse=True)
-def _reset_browser_state(monkeypatch):
+def _reset_browser_state(monkeypatch, tmp_path):
     """Reset module-level browser state before and after each test."""
     from genesis.browser import packages
 
+    # A launch copies the profile aside when the engine differs from the one that
+    # last opened it; the tests' stub engines always differ, so they must never
+    # point at the live profiles.
+    monkeypatch.setattr(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile")
+    monkeypatch.setattr(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile")
     # The stale-module guard records which browser modules were loaded; a test
     # that stubs one in sys.modules must not leave its record behind.
     monkeypatch.setattr(packages, "_loaded", dict(packages._loaded))
@@ -136,6 +141,74 @@ class TestEnsureBrowserRecovery:
 
         assert result is new_page
         assert browser._stealth_page is new_page
+
+
+class TestProfileBackupBeforeLaunch:
+    """Each local launch copies its profile aside first when a different build is
+    about to open it (genesis.browser.profile_backup), off the event loop, and
+    under the browser lock so two launches never copy at once."""
+
+    @pytest.mark.asyncio
+    async def test_camoufox_backs_up_with_the_resolved_engine_before_launch(self, monkeypatch):
+        import threading
+
+        from genesis.browser import engine, profile_backup
+
+        order = []
+        loop_thread = threading.get_ident()
+        binary = Path("/engines/camoufox-bin")
+
+        def backup(profile, engine_binary):
+            order.append(("backup", profile, engine_binary, threading.get_ident() != loop_thread))
+
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=MagicMock(pages=[_alive_page()]))
+        api = MagicMock(AsyncCamoufox=MagicMock(side_effect=lambda **kw: order.append(("launch",)) or cm))
+        ready = engine.EngineStatus(engine.READY, "Camoufox", binary)
+        monkeypatch.setattr(profile_backup, "backup_camoufox_profile", backup)
+        with (
+            patch.object(engine, "resolve_camoufox_engine", return_value=ready),
+            patch.dict(sys.modules, {"camoufox": MagicMock(async_api=api), "camoufox.async_api": api}),
+        ):
+            await browser._ensure_browser()
+        assert order == [("backup", browser._PROFILE_DIR, binary, True), ("launch",)]
+
+    @pytest.mark.asyncio
+    async def test_camoufox_refusal_copies_nothing(self, monkeypatch):
+        from genesis.browser import engine, profile_backup
+
+        backup = MagicMock()
+        monkeypatch.setattr(profile_backup, "backup_camoufox_profile", backup)
+        missing = engine.EngineStatus(engine.NOT_INSTALLED, "no engine")
+        with (
+            patch.object(engine, "resolve_camoufox_engine", return_value=missing),
+            pytest.raises(engine.CamoufoxNotReady),
+        ):
+            await browser._ensure_browser()
+        backup.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_chromium_backs_up_before_launch(self, monkeypatch):
+        import threading
+
+        from genesis.browser import profile_backup
+
+        order = []
+        loop_thread = threading.get_ident()
+
+        def backup(profile, package):
+            order.append(("backup", profile, package, threading.get_ident() != loop_thread))
+
+        pw = MagicMock()
+        pw.chromium.launch_persistent_context = AsyncMock(
+            return_value=MagicMock(pages=[_alive_page()])
+        )
+        starter = MagicMock()
+        starter.start = AsyncMock(side_effect=lambda: order.append(("launch",)) or pw)
+        monkeypatch.setattr(profile_backup, "backup_chromium_profile", backup)
+        with _stub_playwright(starter):
+            await browser._ensure_chromium_fallback()
+        assert order == [("backup", browser._CHROMIUM_PROFILE_DIR, "playwright", True), ("launch",)]
 
 
 class TestExplicitEngine:
@@ -6532,3 +6605,28 @@ console.log(JSON.stringify([TARGET(E, [5, 5]), TARGET(E, null), at(N), at(M), TA
         assert result["diagnostics"]["navigated"] is False  # the watch was armed
         assert original.listeners("framenavigated") == []
         assert original.listeners("popup") == []
+
+
+@pytest.mark.asyncio
+async def test_chromium_rechecks_packages_after_the_backup(monkeypatch):
+    """The copy can wait up to ten minutes for another session's: an upgrade in that
+    window must be caught before the driver starts."""
+    from genesis.browser import packages, profile_backup
+
+    state = {"backed_up": False}
+
+    def check(dists):
+        if state["backed_up"]:
+            raise packages.BrowserPackagesChanged("changed during the backup")
+
+    def backup(*a):
+        state["backed_up"] = True
+
+    monkeypatch.setattr(packages, "check_loaded_browser_modules", check)
+    monkeypatch.setattr(profile_backup, "backup_chromium_profile", backup)
+    start = MagicMock()
+    stub = {"playwright": MagicMock(), "playwright.async_api": MagicMock(async_playwright=start)}
+    with patch.dict("sys.modules", stub), pytest.raises(packages.BrowserPackagesChanged):
+        await browser._ensure_chromium_fallback()
+    start.assert_not_called()
+

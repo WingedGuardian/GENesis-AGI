@@ -1056,9 +1056,17 @@ jobs:
         # tests/test_scripts/test_codebase_managed_config.py +1,
         # tests/test_scripts/test_session_doors.py +6. No added skips.
         # Floor: 25687 + 1 + 3 + 1 + 6 = 25698.
+        # smb backend refuses unsafe names (#3222): the two changed test files
+        # collect 71 here and 57 on origin/main, measured with
+        # --collect-only: test_backup_backends.py 7 -> 20, test_backup_dated_snapshots.py
+        # 50 -> 51 (+14). No added skips. Floor: 25698 + 14 = 25712.
+        # Code-only deploy backups (#2629): test_deploy_code_only.py 66 -> 72 (+6).
+        # Floor: 25712 + 6 = 25718.
         # Native CBM runtime/templates (#3000): the 7 files this PR touches
         # collect 293 cases, measured fresh with --collect-only; the 5 files
         # shared with main collect 208 there (not 25698's older checkpoint,
         # which predates main's smb-backend and deploy-backup entries above).
-        # Net +85. No skipif in any of the 7. Floor: 25718 + 85 = 25803.
+        # No overlap with main's browser-stack commits since (none of this
+        # PR's 7 files are touched by them). Net +85. No skipif in any of
+        # the 7. Floor: 25718 + 85 = 25803.
         run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25803
