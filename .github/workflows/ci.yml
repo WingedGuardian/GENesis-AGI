@@ -1061,8 +1061,8 @@ jobs:
         # --collect-only: test_backup_backends.py 7 -> 20, test_backup_dated_snapshots.py
         # 50 -> 51 (+14). No added skips. Floor: 25698 + 14 = 25712.
         # Hook-output property tests (#3187): new test_hook_output_properties.py
-        # collects 9 tests. The four strict xfails pin #3236, #3237, and the
+        # collects 10 tests. The four strict xfails pin #3236, #3237, and the
         # emptied-envelope False residue, and JUnit counts xfail as skipped, so
         # ceiling 104 -> 108.
-        # Floor: 25712 + 9 = 25721.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 108 --min-collected 25721
+        # Floor: 25712 + 10 = 25722.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 108 --min-collected 25722

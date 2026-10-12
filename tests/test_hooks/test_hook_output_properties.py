@@ -87,34 +87,62 @@ def _clip_char_cost(text: str) -> int:
     return sum(2 if ord(ch) > 0xFFFF else 1 for ch in text)
 
 
+_NONEMPTY_TEXT = st.text(alphabet=st.one_of(_ASCII, _UNICODE_EDGE), min_size=1, max_size=180)
+
 _ORDINARY_BOUNDARY_PAYLOAD = {"permissionDecision": "deny", "reason": "x" * 80}
 _ORDINARY_BOUNDARY_KEYS = ("reason",)
 _ORDINARY_BOUNDARY_ENVELOPE_COST = _ho.emit_cost(
     json.dumps(_emptied_envelope(_ORDINARY_BOUNDARY_PAYLOAD, _ORDINARY_BOUNDARY_KEYS))
 )
 
+_TWO_KEY_BOUNDARY_KEYS = (
+    "hookSpecificOutput.permissionDecisionReason",
+    "hookSpecificOutput.additionalContext",
+)
+_TWO_KEY_BOUNDARY_PAYLOAD = {
+    "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "R" * 40,
+        "additionalContext": "C" * 40,
+    },
+    "decision": "block",
+}
+_TWO_KEY_BOUNDARY_ENVELOPE_COST = _ho.emit_cost(
+    json.dumps(_emptied_envelope(_TWO_KEY_BOUNDARY_PAYLOAD, _TWO_KEY_BOUNDARY_KEYS))
+)
+
 
 @st.composite
 def _ordinary_boundary_case(draw) -> tuple[dict[str, object], tuple[str, ...], int]:
     """Ordinary trimmable payloads budgeted at the emptied-envelope cost exactly."""
-    if draw(st.booleans()):
-        reason = draw(
-            st.text(alphabet=st.one_of(_ASCII, _UNICODE_EDGE), min_size=1, max_size=180)
-        )
-        payload: dict[str, object] = {"permissionDecision": "deny", "reason": reason}
-        text_keys = ("reason",)
-    else:
-        context = draw(
-            st.text(alphabet=st.one_of(_ASCII, _UNICODE_EDGE), min_size=1, max_size=180)
-        )
+    shape = draw(st.sampled_from(("one_flat", "one_nested", "two_key")))
+    if shape == "one_flat":
+        payload: dict[str, object] = {
+            "permissionDecision": "deny",
+            "reason": draw(_NONEMPTY_TEXT),
+        }
+        text_keys: tuple[str, ...] = ("reason",)
+    elif shape == "one_nested":
         payload = {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "additionalContext": context,
+                "additionalContext": draw(_NONEMPTY_TEXT),
             }
         }
         text_keys = ("hookSpecificOutput.additionalContext",)
+    else:
+        payload = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": draw(_NONEMPTY_TEXT),
+                "additionalContext": draw(_NONEMPTY_TEXT),
+            },
+            "decision": "block",
+        }
+        text_keys = _TWO_KEY_BOUNDARY_KEYS
     envelope_cost = _ho.emit_cost(json.dumps(_emptied_envelope(payload, text_keys)))
     return payload, text_keys, envelope_cost
 
@@ -194,6 +222,13 @@ def test_print_json_bounded_true_means_the_emitted_stream_fits(
         _ORDINARY_BOUNDARY_ENVELOPE_COST,
     )
 )
+@example(
+    case=(
+        copy.deepcopy(_TWO_KEY_BOUNDARY_PAYLOAD),
+        _TWO_KEY_BOUNDARY_KEYS,
+        _TWO_KEY_BOUNDARY_ENVELOPE_COST,
+    )
+)
 def test_xfail_print_json_bounded_false_when_emptied_envelope_fits(
     case: tuple[dict[str, object], tuple[str, ...], int],
 ):
@@ -205,6 +240,10 @@ def test_xfail_print_json_bounded_false_when_emptied_envelope_fits(
     emitted = json.loads(sink.getvalue())
 
     assert _permission_decision(emitted) == "deny"
+    if len(text_keys) > 1:
+        for key in text_keys:
+            value = _get_path(original, key)
+            assert isinstance(value, str) and value
     if fits:
         assert _stream_cost(sink) <= budget
     else:
@@ -242,6 +281,34 @@ def test_bounded_stdout_never_emits_over_budget(
 
     assert _stream_cost(sink) <= budget
     assert out.emitted_chars <= budget
+
+
+@_PROPERTY_SETTINGS
+@given(text=_TEXT, budget=st.integers(min_value=1, max_value=700))
+@example(text="🎯", budget=2)
+@example(text="🎯", budget=1)
+def test_encoded_stream_writer_uses_production_accounting(text: str, budget: int):
+    buf = io.BytesIO()
+    stream = io.TextIOWrapper(
+        buf, encoding="utf-8", errors="strict", newline="\n", write_through=True
+    )
+    out = _ho.BoundedStdout(budget, label="hook", stream=stream)
+    out.emit(text, block="body")
+    stream.flush()
+    raw = buf.getvalue()
+    decoded = raw.decode("utf-8")
+    encoded = decoded.encode("utf-8")
+    utf16_le = decoded.encode("utf-16-le")
+
+    assert encoded == raw
+    billed = _ho.utf16_len(decoded)
+    assert billed == len(utf16_le) // 2
+    assert billed == out.emitted_chars
+    assert billed <= budget
+    assert out.emitted_chars <= budget
+    for char in decoded:
+        if ord(char) > 0xFFFF:
+            assert char.encode("utf-8") in raw
 
 
 @_PROPERTY_SETTINGS
