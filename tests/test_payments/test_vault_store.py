@@ -363,6 +363,9 @@ class TestAddAndList:
             (blob,) = conn.execute("SELECT blob FROM cards").fetchone()
         secret = json.loads(decrypt(blob, [_identity(vault)]))
         assert secret == {
+            "card_ref": ref,
+            "merchant": "shop.example.com",
+            "single_use": False,
             "number": VISA,
             "exp_month": 12,
             "exp_year": int(_future()[-2:]) + 2000,
@@ -811,3 +814,85 @@ class TestIdentityDigest:
         assert vs.vault_status(path)["error"] is None
         _add_visa(path)
         assert len(vs.list_cards(path)) == 1
+
+
+class TestChecksHeldThroughTheWrite:
+    """#3253 round 1: what was checked is what gets used."""
+
+    def test_the_blob_names_its_row_and_scope(self, vault):
+        ref = vs.add_card(
+            vs.parse_card(VISA, _future(), "123"),
+            label="t",
+            merchant=None,
+            single_use=True,
+            path=vault,
+        )
+        with sqlite3.connect(vault / vs.CARDS) as conn:
+            (blob,) = conn.execute("SELECT blob FROM cards").fetchone()
+        secret = json.loads(decrypt(blob, [_identity(vault)]))
+        assert (secret["card_ref"], secret["merchant"], secret["single_use"]) == (ref, None, True)
+
+    def test_a_cards_db_swapped_in_after_the_checks_takes_no_card(
+        self, vault, tmp_path, monkeypatch
+    ):
+        # Another vault's database: same shape, a different recorded key.
+        decoy = tmp_path / "decoy.db"
+        shutil.copy(vault / vs.CARDS, decoy)
+        with sqlite3.connect(decoy) as conn:
+            conn.execute(
+                "UPDATE vault_meta SET value = ? WHERE key = 'recipient'",
+                (str(x25519.Identity.generate().to_public()),),
+            )
+        real = vs._insert_card
+
+        def swap_after_sealing(*args):
+            (vault / vs.CARDS).rename(tmp_path / "moved.db")
+            decoy.rename(vault / vs.CARDS)
+            return real(*args)
+
+        monkeypatch.setattr(vs, "_insert_card", swap_after_sealing)
+        with pytest.raises(vs.VaultError, match="changed during the add"):
+            _add_visa(vault)
+        for db in (vault / vs.CARDS, tmp_path / "moved.db"):
+            with sqlite3.connect(db) as conn:
+                assert conn.execute("SELECT COUNT(*) FROM cards").fetchone() == (0,)
+
+    def test_init_refuses_a_cards_db_swapped_before_sqlite_opens_it(self, tmp_path, monkeypatch):
+        path = tmp_path / "v"
+        decoy = tmp_path / "decoy.db"
+        real = vs.sqlite3.connect
+
+        def swap_then_connect(target, *a, **kw):
+            if str(target).startswith("/proc/self/fd/") and str(target).endswith(vs.CARDS):
+                decoy.write_bytes(b"")
+                decoy.rename(path / vs.CARDS)
+            return real(target, *a, **kw)
+
+        monkeypatch.setattr(vs.sqlite3, "connect", swap_then_connect)
+        with pytest.raises(vs.VaultError, match="changed while init was opening it"):
+            vs.init_vault(PASSPHRASE, path)
+        assert not vs.is_initialised(path)
+        assert (path / vs.CARDS).stat().st_size == 0  # nothing was written into the swap
+
+    def test_a_damaged_tail_past_the_read_cap_is_refused_not_cut_off(self, vault):
+        """A prefix that is a valid key must not pass for the whole file."""
+        text = (vault / vs.RECIPIENT).read_text().strip()
+        (vault / vs.RECIPIENT).write_text(text + " " * 5000 + "DAMAGED TAIL")
+        assert "larger than a vault file" in vs.vault_status(vault)["error"]
+        with pytest.raises(vs.VaultError, match="larger than a vault file"):
+            _add_visa(vault)
+
+    def test_an_oversized_recipient_file_is_refused_without_loading_it(self, vault):
+        import tracemalloc
+
+        text = (vault / vs.RECIPIENT).read_text().strip()
+        (vault / vs.RECIPIENT).write_text(text + "\n" + "x" * (16 << 20))
+        tracemalloc.start()
+        try:
+            assert "recipient.txt" in vs.vault_status(vault)["error"]
+            with pytest.raises(vs.VaultError, match="recipient.txt"):
+                _add_visa(vault)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        assert peak < (4 << 20)  # a whole-file read would hold 16 MiB at once

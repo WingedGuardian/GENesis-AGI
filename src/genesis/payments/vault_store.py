@@ -10,7 +10,10 @@ Layout of ``~/.genesis/payment_vault/`` (directory 0700, every file 0600):
 - ``cards.db`` (``user_version`` 1): one row per card. The number, expiry and
   security code exist only inside ``blob``, age-encrypted to
   ``recipient.txt``; the row keeps a label, brand, last four digits and the
-  merchant scope in the clear, for ``list``. Retiring a card clears its blob
+  merchant scope in the clear, for ``list``. The blob also carries the card's
+  ``card_ref``, merchant and single-use flag; whatever decrypts a card must
+  compare them with the row it read and refuse a mismatch (a blob copied to
+  another row, or a row re-scoped in the clear). Retiring a card clears its blob
   with ``secure_delete`` on, so the ciphertext does not stay in a free page
   of the file. That is best effort: SQLite's rollback journal and the
   filesystem may keep old ciphertext, so a retired virtual card is also
@@ -156,13 +159,32 @@ def _write_new(name: str, data: bytes, dir_fd: int) -> None:
         os.fsync(f.fileno())
 
 
-def _read_regular(name: str, dir_fd: int, limit: int | None = None) -> bytes:
-    """Read a regular file without following a symlink or blocking on a FIFO."""
-    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+def _read_capped(fd: int, name: str, limit: int) -> bytes:
+    """A regular file's bytes, refused past ``limit``: never loaded whole, never cut short.
+
+    A prefix of a damaged file could pass the format checks, so a longer file
+    is an error rather than a truncated read.
+    """
     with os.fdopen(fd, "rb") as f:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise VaultError(f"{name} is not a regular file")
-        return f.read() if limit is None else f.read(limit)
+        data = f.read(limit + 1)
+    if len(data) > limit:
+        raise VaultError(f"{name} is larger than a vault file can be (damaged?); restore it")
+    return data
+
+
+def _read_regular(name: str, dir_fd: int, limit: int = 4096) -> bytes:
+    """Read a small regular file without following a symlink or blocking on a FIFO."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    return _read_capped(fd, name, limit)
+
+
+def _read_small(file: Path, limit: int = 4096) -> bytes:
+    """As ``_read_regular``, by path. Only the last component is not followed,
+    so this also reads through the locked directory's ``/proc/self/fd`` path."""
+    fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    return _read_capped(fd, file.name, limit)
 
 
 @contextmanager
@@ -214,7 +236,7 @@ _SEALED_HEADER = b"age-encryption.org/v1\n-> scrypt "
 def _recipient_text(path: Path) -> str:
     """recipient.txt's key text, checked by shape only (no crypto import)."""
     try:
-        text = (path / RECIPIENT).read_bytes().decode("utf-8").strip()
+        text = _read_small(path / RECIPIENT).decode("utf-8").strip()
     except OSError as exc:
         raise VaultError(f"recipient.txt cannot be read ({exc.strerror})") from None
     except UnicodeDecodeError:
@@ -228,10 +250,14 @@ def _recipient_text(path: Path) -> str:
 
 def _read_recipient(path: Path):
     """The vault's age recipient; a missing or damaged recipient.txt is a VaultError."""
+    return _parse_recipient(_recipient_text(path))
+
+
+def _parse_recipient(text: str):
     from pyrage import RecipientError, x25519
 
     try:
-        return x25519.Recipient.from_str(_recipient_text(path))
+        return x25519.Recipient.from_str(text)
     except RecipientError:
         raise VaultError(
             "recipient.txt does not hold a valid age public key; restore the vault from backup"
@@ -248,7 +274,7 @@ def _check_identity(path: Path) -> bytes:
     """
     dfd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        data = _read_regular(IDENTITY, dfd, 4096)
+        data = _read_regular(IDENTITY, dfd)
     except OSError as exc:
         raise VaultError(f"identity.age cannot be read ({exc.strerror})") from None
     finally:
@@ -468,17 +494,35 @@ def _create_cards_db(dfd: int, identity_digest: str, recipient_text: str) -> Non
     sealed identity's sha256 and the recipient text.
     """
     cfd = os.open(CARDS, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dfd)
+    conn = None
     try:
         info = os.fstat(cfd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
             raise VaultError("cards.db is not a regular file you own; move it aside")
         if stat.S_IMODE(info.st_mode) != 0o600:
             os.fchmod(cfd, 0o600)
+        # Through the locked directory's descriptor (Linux /proc), so the schema
+        # lands in this directory even if the vault path is swapped. SQLite
+        # opens the file at connect (MEASURED on 3.45.1) and follows a symlink,
+        # so check that cards.db is still the file checked above once it is
+        # open (cfd stays open, so that inode cannot be reused). This catches a
+        # swap before the open; one swapped in and back again within that
+        # window is not seen, which for an accidental same-user operation is
+        # accepted.
+        conn = sqlite3.connect(f"/proc/self/fd/{dfd}/{CARDS}", isolation_level=None)
+        opened = os.stat(CARDS, dir_fd=dfd, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            raise VaultError("cards.db changed while init was opening it; run init again")
+    except sqlite3.Error as exc:
+        if conn is not None:
+            conn.close()
+        raise _translate(exc) from None
+    except BaseException:
+        if conn is not None:
+            conn.close()
+        raise
     finally:
         os.close(cfd)
-    # Through the locked directory's descriptor (Linux /proc), so the schema
-    # lands in the file just checked even if the vault path is swapped.
-    conn = sqlite3.connect(f"/proc/self/fd/{dfd}/{CARDS}", isolation_level=None)
     try:
         shape = _shape(conn)
         if shape == "foreign":
@@ -634,16 +678,21 @@ def add_card(
         _pin(path, dfd)  # the checks below read the locked directory, not a later one
         check_ready(path)
         pinned = _pin(path, dfd)
-        recipient = _read_recipient(pinned)
-        secret = {"v": BLOB_VERSION}
+        recipient_text = _recipient_text(pinned)  # read once: the key sealed to is the key checked
+        recipient = _parse_recipient(recipient_text)
+        ref = "card_" + secrets.token_hex(6)
+        # The row's identity and scope ride inside the authenticated blob, so a
+        # blob copied to another row, or a row re-scoped in the clear, is caught
+        # by whoever decrypts it.
+        secret = {"v": BLOB_VERSION, "card_ref": ref, "merchant": merchant}
+        secret["single_use"] = single_use
         secret.update({k: card[k] for k in ("number", "exp_month", "exp_year", "cvc")})
         secret.update(name=name, postal_code=postal_code)
         try:
             blob = encrypt(json.dumps(secret).encode(), [recipient])
         except Exception as exc:  # noqa: BLE001 - never a raw library error, never a value
             raise VaultError(f"the card could not be encrypted ({type(exc).__name__})") from None
-        ref = "card_" + secrets.token_hex(6)
-        _insert_card(pinned, ref, card, label, merchant, single_use, blob)
+        _insert_card(pinned, ref, card, label, merchant, single_use, blob, recipient_text)
     return ref
 
 
@@ -664,8 +713,19 @@ def _pin(path: Path, dfd: int) -> Path:
     return Path(f"/proc/self/fd/{dfd}")
 
 
-def _insert_card(path, ref, card, label, merchant, single_use, blob) -> None:
+def _insert_card(path, ref, card, label, merchant, single_use, blob, recipient_text) -> None:
     with _db(path) as conn, conn:
+        # Checked on the connection that writes: a cards.db swapped in since
+        # check_ready is refused here, rather than taking a card sealed to a
+        # key it does not record.
+        row = conn.execute(
+            "SELECT value FROM vault_meta WHERE key = ?", (_RECIPIENT_ROW,)
+        ).fetchone()
+        if row is None or row[0] != recipient_text:
+            raise VaultError(
+                "cards.db changed during the add (it does not record the key the card "
+                "was sealed to); nothing was saved. Run `vault status`"
+            )
         conn.execute(
             "INSERT INTO cards (card_ref, label, brand, last4, merchant, single_use, status,"
             " created_at, blob) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)",
@@ -721,7 +781,7 @@ def verify_passphrase(passphrase: str, path: Path | None = None) -> None:
     from pyrage import IdentityError, x25519
 
     try:
-        key = age_passphrase.decrypt((path / IDENTITY).read_bytes(), passphrase).decode()
+        key = age_passphrase.decrypt(_read_small(path / IDENTITY), passphrase).decode()
     except DecryptError:
         raise VaultError("wrong passphrase (or identity.age is damaged)") from None
     except OSError as exc:
