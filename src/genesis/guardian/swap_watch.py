@@ -549,6 +549,13 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
     config_verified = rc == 0
     raw_value = stdout.strip() if rc == 0 else ""
     key_now = raw_value  # the key as we understand it after any write this tick
+    # The live cgroup value BEFORE this tick's key write, read only when a key
+    # write is about to happen. Under a hard memory limit Incus resets the cgroup
+    # to 0 on a boolean key write, so the read in step 2 cannot tell a swap-off
+    # this tick found from one it caused; whether the alert says "repair" is
+    # decided from this value, never from the stored key alone.
+    pre_live: str | None = None
+    pre_read = False
 
     if mode == "degraded":
         reason = (
@@ -566,13 +573,16 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
             pass  # held: reported above; the final assessment below judges the key
         elif mode == "ceiling" and path == "native":
             if raw_value != target_str:
+                pre_live, pre_read = await read_swap_max(container), True
                 ok, err = await _incus_config_set(container, {"limits.memory.swap": target_str})
                 if ok:
                     healed.append(
                         (
                             f"limits.memory.swap: {raw_value or 'unset'} → {target_str} bytes "
                             f"(native ceiling, {config.swap_ceiling_pct:g}% of host swap)",
-                            not is_swap_on(raw_value),
+                            # A repair when swap was off: a stored false value, or a
+                            # live 0 before the write. Unset is Incus's default true.
+                            (bool(raw_value) and not is_swap_on(raw_value)) or pre_live == "0",
                             True,
                         )
                     )
@@ -600,6 +610,8 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
         elif not is_swap_on(raw_value):
             # "none", "off", and the fallback path: the key only has to be
             # swap-on (on the fallback path Incus ignores it as a ceiling).
+            if mode == "ceiling":  # without a ceiling the heal is always a repair
+                pre_live, pre_read = await read_swap_max(container), True
             ok, err = await _incus_config_set(container, {"limits.memory.swap": "true"})
             if ok:
                 note = (
@@ -608,7 +620,19 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
                     else "swap-on in config; under a hard memory limit Incus still starts "
                     "the container at memory.swap.max=0, which this watch re-opens live"
                 )
-                healed.append((f"limits.memory.swap: {raw_value or 'unset'} → true ({note})", True, False))
+                # In ceiling mode an unset key is already swap-on (Incus's default),
+                # so only a stored false value or a live 0 before the write is a
+                # repair; the write serves the fallback ceiling, so it carries the
+                # ceiling flag. Without a ceiling, unset under a hard memory limit
+                # still starts at swap.max=0, so it stays a repair, as before.
+                repair = bool(raw_value) or mode != "ceiling" or pre_live == "0"
+                healed.append(
+                    (
+                        f"limits.memory.swap: {raw_value or 'unset'} → true ({note})",
+                        repair,
+                        mode == "ceiling",
+                    )
+                )
                 key_now = "true"
             else:
                 problems[_PROBLEM_CLASS_SWAP_OFF].append(
@@ -635,7 +659,19 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
     if mode == "ceiling":
         if current is not None and current != target_str:
             if await write_swap_max(container, target_str):
-                healed.append((f"memory.swap.max: {current} → {target_str} bytes (live)", current == "0", True))
+                # Was swap off before this tick? A 0 read after this tick's
+                # boolean key write may be the one Incus just wrote. If the
+                # pre-write read itself failed, such a 0 is labelled a ceiling
+                # change: with no earlier signal it cannot be told apart.
+                self_zeroed = key_now != raw_value and not _is_byte_ceiling(key_now)
+                was_off = (
+                    pre_live == "0"
+                    if pre_read and pre_live is not None
+                    else current == "0" and not (pre_read and self_zeroed)
+                )
+                healed.append(
+                    (f"memory.swap.max: {current} → {target_str} bytes (live)", was_off, True)
+                )
                 live_now = target_str
             else:
                 problems[_PROBLEM_CLASS_CEILING].append(
