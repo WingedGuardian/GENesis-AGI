@@ -335,6 +335,76 @@ async def test_reference_store_validates_kind():
         mod._store, mod._db, mod._retriever, mod._qdrant = old
 
 
+_TEST_CARD = "4242" * 4  # Stripe's public test number, built from parts
+
+
+@pytest.mark.parametrize(
+    "field",
+    # kind is checked first: its unknown-kind error would quote the value.
+    ["value", "identifier", "description", "tags", "source", "kind"],
+)
+async def test_reference_store_refuses_card_numbers(field):
+    """A payment card number is never persisted in the plaintext reference
+    store, whichever field carries it, and the refusal does not echo it."""
+    import genesis.mcp.memory_mcp as mod
+
+    args = {
+        "kind": "credentials",
+        "identifier": "shop login",
+        "value": "hunter2-not-a-card",
+        "description": "login for the shop",
+        "tags": ["shop"],
+        "source": {"captured_via": "manual"},
+    }
+    spaced = f"{_TEST_CARD[:4]} {_TEST_CARD[4:8]} {_TEST_CARD[8:12]} {_TEST_CARD[12:]}"
+    if field == "tags":
+        args["tags"] = ["shop", spaced]
+    elif field == "source":
+        args["source"] = {"captured_via": "manual", "note": _TEST_CARD}
+    else:
+        args[field] = f"card {spaced}"
+
+    old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+    try:
+        mod._store = AsyncMock()
+        mod._db = AsyncMock()
+        mod._retriever = AsyncMock()
+        mod._qdrant = MagicMock()
+        tools = await _get_tools()
+        with pytest.raises(ValueError, match="payment card number") as exc:
+            await tools["reference_store"].fn(**args)
+        assert _TEST_CARD[:8] not in str(exc.value)
+        mod._store.store.assert_not_awaited()
+        mod._db.execute.assert_not_awaited()
+    finally:
+        mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+async def test_reference_store_body_check_catches_what_the_field_walk_skips():
+    """The field walk looks one level into dicts; the formatted body is what is
+    stored, so a nested value that reaches it is still refused."""
+    import genesis.mcp.memory_mcp as mod
+
+    old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+    try:
+        mod._store = AsyncMock()
+        mod._db = AsyncMock()
+        mod._retriever = AsyncMock()
+        mod._qdrant = MagicMock()
+        tools = await _get_tools()
+        with pytest.raises(ValueError, match="payment card number"):
+            await tools["reference_store"].fn(
+                kind="credentials",
+                identifier="shop login",
+                value="hunter2-not-a-card",
+                description="login for the shop",
+                source={"session_id": {"note": _TEST_CARD}},
+            )
+        mod._store.store.assert_not_awaited()
+    finally:
+        mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
 async def test_reference_store_requires_description():
     import genesis.mcp.memory_mcp as mod
 
