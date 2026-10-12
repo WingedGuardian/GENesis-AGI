@@ -1485,9 +1485,9 @@ verified: 637f7f7bb679 2026-10-05
   a copy whose files still match the profile's makes a second copy unnecessary,
   so a launch that never opened the profile makes no second one; a lock beside
   the profile makes concurrent sessions copy once; a copy never moves the disk
-  into the disk guardian's ORANGE or RED tier, judged by the guardian's own
-  `dg_tier` (free space raised by the watchdog's time-to-full) through
-  `util/disk_headroom.py`, though a disk already ORANGE
+  into the disk guardian's ORANGE or RED free-space tier, judged by the guardian's
+  own `dg_floor_tier` through `util/disk_headroom.py` (time-to-full left out: the
+  copy's own burst would raise it), though a disk already ORANGE
   still gets one; never stops the launch, though a launch waits up to 10 minutes
   for another session's copy of the same profile).
   `scripts/browser.py` launches without a copy. `scripts/disk_hygiene.sh` keeps
