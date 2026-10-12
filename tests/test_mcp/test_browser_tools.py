@@ -302,12 +302,23 @@ class TestPatchrightChromium:
         """An upgrade under the session can be why patchright no longer imports: a
         reinstall would not help the running process, a restart would."""
         changed = "Browser packages changed since startup (patchright 1.62.1 -> 1.62.3)"
-        monkeypatch.setattr(browser.packages, "packages_changed_message", lambda *a: changed)
+        weighed = []
+        monkeypatch.setattr(browser, "_patchright_installed", lambda: True)
+        monkeypatch.setattr(
+            browser.packages,
+            "stale_loaded_modules",
+            lambda dists: weighed.append(dists) or ["patchright"],
+        )
+        monkeypatch.setattr(
+            browser.packages, "packages_changed_message", lambda stale: changed if stale else None
+        )
         err = browser.PatchrightBroken("patchright is installed but cannot be imported (x)")
         with patch.object(browser, "_get_page", new=AsyncMock(side_effect=err)):
             result = await browser._impl_browser_navigate("https://example.com")
         assert result["error"].startswith(changed)
         assert "cannot be imported (x)" in result["error"]
+        # The Chromium layer's own package is what is weighed, not every browser package.
+        assert weighed and all(d == ("patchright",) for d in weighed)
 
     @pytest.mark.asyncio
     async def test_run_js_runs_in_the_main_world_on_patchright(self):

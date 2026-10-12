@@ -3277,8 +3277,9 @@ async def _impl_browser_navigate(
     except PatchrightBroken as e:
         # Restarting comes first when a package changed under this session, as for
         # any import error; otherwise the message is patchright's own repair.
-        if packages.packages_changed_message():
-            return {"error": packages.import_error_message(e)}
+        dists = _layer_dists(BrowserLayer.CHROMIUM)
+        if packages.packages_changed_message(packages.stale_loaded_modules(dists)):
+            return {"error": packages.import_error_message(e, dists)}
         return {"error": str(e)}
     except ImportError as e:
         return {"error": packages.import_error_message(e, _layer_dists(layer))}
