@@ -1062,4 +1062,6 @@ jobs:
         # 50 -> 51 (+14). No added skips. Floor: 25698 + 14 = 25712.
         # Code-only deploy backups (#2629): test_deploy_code_only.py 66 -> 72 (+6).
         # Floor: 25712 + 6 = 25718.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25718
+        # PR-close predicate and review-request inert-neighbor gate (#2885):
+        # changed test files: 498 on main -> 544 here (+46). Floor: 25718 + 46 = 25764.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25764
