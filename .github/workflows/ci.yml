@@ -1042,4 +1042,7 @@ jobs:
         # Force-push command-borne config (#2868): the six changed test files
         # collect 1149 here and 1101 on origin/main 7664ed2ad, measured with
         # --collect-only: +48. No added skips. Floor: 25415 + 48 = 25463.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25463
+        # Push-argv shared scanner (#2864): the five changed test files collect
+        # 996 here and 911 on origin/main b32ef3610 (one file absent there),
+        # measured with --collect-only: net +85. Floor: 25463 + 85 = 25548.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25548
