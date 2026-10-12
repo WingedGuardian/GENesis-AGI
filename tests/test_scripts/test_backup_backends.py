@@ -12,27 +12,69 @@ All snippets source the lib under ``set -euo pipefail`` so the lib's own safety
 """
 
 import os
+import signal
 import stat
 import subprocess
 import textwrap
+import time
 from pathlib import Path
 
 _LIB = Path(__file__).resolve().parents[2] / "scripts" / "lib" / "backup_backends.sh"
 
 
-def _run_bash(body: str, env: dict, extra_path: Path | None = None) -> subprocess.CompletedProcess:
+def _run_bash(
+    body: str,
+    env: dict,
+    extra_path: Path | None = None,
+    timeout: int | None = None,
+) -> subprocess.CompletedProcess:
     script = f'set -euo pipefail\nsource "{_LIB}"\n{body}\n'
     full_env = dict(os.environ)
     full_env.update(env)
     if extra_path is not None:
         full_env["PATH"] = f'{extra_path}:{full_env["PATH"]}'
-    return subprocess.run(["bash", "-c", script], env=full_env,
-                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    command = ["bash", "-c", script]
+    if timeout is None:
+        return subprocess.run(
+            command,
+            env=full_env,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+        )
+    process = subprocess.Popen(
+        command,
+        env=full_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        _kill_session(process.pid)
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            error.cmd, error.timeout, output=stdout, stderr=stderr
+        ) from error
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def _make_stub(path: Path, body: str) -> None:
     path.write_text(body)
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _kill_session(session_id: int) -> None:
+    for stat_path in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = stat_path.read_text().rsplit(")", 1)[1].split()
+            if int(fields[3]) == session_id:
+                os.kill(int(stat_path.parent.name), signal.SIGKILL)
+        except (IndexError, OSError, ValueError):
+            continue
 
 
 # ── local backend: real-filesystem regression anchor ─────────────────
@@ -237,3 +279,21 @@ def test_smb_creds_cleaned_up(tmp_path):
     assert "CREDS_VAR_CLEARED=yes" in proc.stdout
     creds_path = marker.read_text().strip()
     assert creds_path and not Path(creds_path).exists(), "creds temp file not removed by cleanup"
+
+
+def test_smb_run_kills_client_that_ignores_term(tmp_path):
+    bind = tmp_path / "bin"
+    bind.mkdir()
+    _make_stub(bind / "smbclient", "#!/usr/bin/env bash\ntrap '' TERM\nsleep 300\n")
+    start = time.monotonic()
+    proc = _run_bash(
+        '_BACKEND_NAS="//nas/share"\n'
+        '_BACKEND_CREDS=/dev/null\n'
+        '_smb_run -c "noop"',
+        {"GENESIS_BACKUP_CTL_TIMEOUT": "1"},
+        extra_path=bind,
+        timeout=30,
+    )
+    elapsed = time.monotonic() - start
+    assert proc.returncode != 0
+    assert elapsed < 20, f"TERM-ignoring smbclient took {elapsed:.1f}s to stop"
