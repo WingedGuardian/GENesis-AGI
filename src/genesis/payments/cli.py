@@ -97,6 +97,11 @@ def _cmd_unlock(args: argparse.Namespace) -> int:
             raise vs.VaultError("the vault is not initialised; run `python -m genesis vault init`")
         if not state.get("payments_extra"):
             raise vs.VaultError("genesis-server lacks the payments extra")
+        if not state.get("audit"):  # the service refuses an unlock it cannot record
+            raise vs.VaultError(
+                "the vault service's audit log is unavailable, so it would refuse; "
+                "check genesis-server's logs"
+            )
         reply = _service({"op": "unlock", "passphrase": getpass.getpass("Vault passphrase: ")})
         if reply is None:
             raise vs.VaultError(_NOT_RUNNING)

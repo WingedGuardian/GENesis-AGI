@@ -1171,6 +1171,6 @@ jobs:
         # Card vault store and CLI: +109 collected (test_vault_store 79,
         # test_vault_cli 30; pyrage and zxcvbn are in the test extra, so no
         # skips). Floor: 25508 + 109 = 25617.
-        # Vault service: +55 collected (test_vault_service 38, test_vault_cli
-        # +14 to 44, test_payment_vault_events 3). Floor: 25617 + 55 = 25672.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25672
+        # Vault service: +72 collected (test_vault_service 54, test_vault_cli
+        # +15 to 45, test_payment_vault_events 3). Floor: 25617 + 72 = 25689.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25689

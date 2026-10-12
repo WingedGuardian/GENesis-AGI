@@ -281,6 +281,15 @@ class TestServiceCommands:
         "audit": True,
     }
 
+    def test_unlock_refuses_before_the_prompt_when_the_audit_log_is_down(
+        self, tty, monkeypatch, capsys
+    ):
+        self._script(monkeypatch, [{**self.LOCKED, "audit": False}])
+        getpass = _answers(monkeypatch, [])
+        assert _run(["unlock"]) == 2
+        getpass.assert_not_called()
+        assert "audit log is unavailable" in capsys.readouterr().err
+
     def test_unlock(self, tty, monkeypatch, capsys):
         sent = self._script(
             monkeypatch, [dict(self.LOCKED), {"ok": True, "state": "unlocked", "relock_in_s": 1800}]
