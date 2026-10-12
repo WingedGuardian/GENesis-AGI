@@ -1042,13 +1042,16 @@ jobs:
         # Force-push command-borne config (#2868): the six changed test files
         # collect 1149 here and 1101 on origin/main 7664ed2ad, measured with
         # --collect-only: +48. No added skips. Floor: 25415 + 48 = 25463.
+        # Push-argv shared scanner (#2864): the five changed test files collect
+        # 996 here and 911 on origin/main b32ef3610 (one file absent there),
+        # measured with --collect-only: net +85. Floor: 25463 + 85 = 25548.
         # Data-heredoc post-pass (#2972), measured with --collect-only against
-        # origin/main b32ef3610's versions of this PR's changed test files:
+        # origin/main 31723dff6's versions of this PR's changed test files:
         #   test_guard_ansic_fail_closed.py  285 -> 285  (+0)
         #   test_push_pr_adjacency.py         61 -> 66   (+5)
         #   test_secrets_env_access_guard.py  59 -> 62   (+3)
         #   test_shell_parse.py              269 -> 343 (+74)
         #   test_worktree_guard.py           129 -> 129  (+0)
-        #   test_worktree_remote_guard.py    186 -> 188  (+2)
-        # Delta +84. Floor: 25463 + 84 = 25547. No added skips.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25547
+        #   test_worktree_remote_guard.py    192 -> 194  (+2)
+        # Delta +84. Floor: 25548 + 84 = 25632. No added skips.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25632
