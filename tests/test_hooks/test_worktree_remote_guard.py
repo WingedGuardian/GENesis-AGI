@@ -43,6 +43,12 @@ from shell_parse import analyze, git_subcommand  # noqa: E402
 _FORCE = "--fo" + "rce"  # split so this file's own text never trips a host push-guard
 
 
+@pytest.fixture(autouse=True)
+def _isolate_git_config(monkeypatch):
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
 @pytest.fixture(scope="module")
 def guard_module():
     import importlib.util
