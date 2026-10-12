@@ -35,6 +35,8 @@ _RUNTIME_FRESH_SCRIPTS=(
     scripts/hooks/main_checkout_guard.py  # registered by cc/invoker.py for dispatched sessions
     scripts/hooks/hook_input.py           # imported by main_checkout_guard.py on every run
     scripts/hooks/hook_output.py          # imported by main_checkout_guard.py to emit a note
+    scripts/lib/disk_guardian.sh          # sourced by util/disk_headroom.py on every free-space check
+    scripts/tmp_watchgod.sh               # sourced by util/disk_headroom.py for the watchdog's tiers
     # Not under scripts/, but the same kind: cc/invoker.py runs the allowlist
     # guard through this launcher in the server, and reads its exit code.
     .claude/hooks/genesis-hook

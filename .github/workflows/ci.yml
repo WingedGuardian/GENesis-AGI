@@ -1061,5 +1061,14 @@ jobs:
         # tests/test_scripts/test_codebase_managed_config.py +1,
         # tests/test_scripts/test_session_doors.py +6. No added skips.
         # Floor: 25687 + 1 + 3 + 1 + 6 = 25698.
-        # Re-merge with main (#3088): main 25698 + this PR's measured +74 = 25772.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25772
+        # smb backend refuses unsafe names (#3222): the two changed test files
+        # collect 71 here and 57 on origin/main, measured with
+        # --collect-only: test_backup_backends.py 7 -> 20, test_backup_dated_snapshots.py
+        # 50 -> 51 (+14). No added skips. Floor: 25698 + 14 = 25712.
+        # Code-only deploy backups (#2629): test_deploy_code_only.py 66 -> 72 (+6).
+        # Floor: 25712 + 6 = 25718.
+        # Re-merge with main (#3088): this PR's own +74
+        # (test_v1_auth_contract/test_schema/test_peers/*) lands on different
+        # files than main's smb/deploy-backup deltas above, so no overlap.
+        # Floor: 25718 + 74 = 25792.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25792
