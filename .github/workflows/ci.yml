@@ -1042,9 +1042,12 @@ jobs:
         # Force-push command-borne config (#2868): the six changed test files
         # collect 1149 here and 1101 on origin/main 7664ed2ad, measured with
         # --collect-only: +48. No added skips. Floor: 25415 + 48 = 25463.
+        # Push-argv shared scanner (#2864): the five changed test files collect
+        # 996 here and 911 on origin/main b32ef3610 (one file absent there),
+        # measured with --collect-only: net +85. Floor: 25463 + 85 = 25548.
         # Web client provenance + profile description:
         # tests/test_web/test_fetch.py +1, tests/test_mcp/test_web_tools.py +3,
         # tests/test_cc/test_direct_session_profiles.py +1,
         # tests/test_providers/test_tinyfish.py +0, measured with --collect-only.
-        # No added skips. Floor: 25463 + 1 + 3 + 1 + 0 = 25468.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25468
+        # No added skips. Floor: 25548 + 1 + 3 + 1 + 0 = 25553.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25553
