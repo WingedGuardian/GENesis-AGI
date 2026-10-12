@@ -584,18 +584,21 @@ async def _ensure_chromium_fallback():
             await _cleanup_chromium()
 
         package = _chromium_package()
-        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
+        # Selected once: every check below guards the package this launch imports,
+        # even if one is installed or removed meanwhile.
+        dists = (package,)
+        packages.check_loaded_browser_modules(dists)
         async_playwright = _chromium_async_playwright(package)
         # Again past the import: an upgrade that began after the first check
         # would have mixed old loaded modules with new files.
-        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
+        packages.check_loaded_browser_modules(dists)
 
         await asyncio.to_thread(
             profile_backup.backup_chromium_profile, _CHROMIUM_PROFILE_DIR, package
         )
         # And after the copy, which can wait minutes for another session's: an
         # upgrade in that window must not reach the driver start.
-        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
+        packages.check_loaded_browser_modules(dists)
         _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
         # Always headed — Xvfb :99 is always running.
