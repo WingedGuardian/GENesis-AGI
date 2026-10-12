@@ -758,8 +758,9 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
             )
             paragraphs.append(
                 "This follows swap_ceiling_pct in the guardian config "
-                f"(now {ceiling_setting}). Change or remove that setting to "
-                "change the ceiling; set swap_ceiling_pct: off to lift it."
+                f"(now {ceiling_setting}). Change that setting to move the "
+                "ceiling; set swap_ceiling_pct: off to lift it. Removing the "
+                "setting leaves the current ceiling in place, unmanaged."
             )
         logger.info("swap_watch healed: %s", "; ".join(line for line, _, _ in healed))
         await _send(
