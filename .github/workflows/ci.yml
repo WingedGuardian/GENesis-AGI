@@ -1062,4 +1062,7 @@ jobs:
         # 50 -> 51 (+14). No added skips. Floor: 25698 + 14 = 25712.
         # Code-only deploy backups (#2629): test_deploy_code_only.py 66 -> 72 (+6).
         # Floor: 25712 + 6 = 25718.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25718
+        # Push dry-run replacement (#2886): the eight changed test files collect
+        # 2073 on origin/main and 2169 here (+96), measured with --collect-only.
+        # Floor: 25718 + 96 = 25814; skip ceiling remains 104.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25814
