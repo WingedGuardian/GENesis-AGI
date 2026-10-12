@@ -584,6 +584,22 @@ def check_api_network_scope():
     return jsonify({"error": "not available from this network"}), 403
 
 
+def apply_dashboard_gates(app) -> None:
+    """Register every app-level dashboard gate, the Host gate first.
+
+    Every supported host that mounts the dashboard blueprints calls this. The
+    Host gate runs before the network-scope and mutation gates, so a request
+    addressed to a foreign name is refused before anything else looks at it.
+    Idempotent, like ``apply_api_mutation_gate``.
+    """
+    if not getattr(app, "_genesis_host_gate_applied", False):
+        from genesis.dashboard.host_gate import check_host_header
+
+        app.before_request(check_host_header)
+        app._genesis_host_gate_applied = True
+    apply_api_mutation_gate(app)
+
+
 def apply_api_mutation_gate(app) -> None:
     """Mint the internal API token and register the app-level ``/api`` mutation gate.
 
