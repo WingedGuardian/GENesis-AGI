@@ -1060,7 +1060,6 @@ jobs:
         # collect 71 here and 57 on origin/main, measured with
         # --collect-only: test_backup_backends.py 7 -> 20, test_backup_dated_snapshots.py
         # 50 -> 51 (+14). No added skips. Floor: 25698 + 14 = 25712.
-        # Qualification transport (#3134): the four changed test files collect
-        # 302 here and 28 on origin/main (three absent there), --collect-only: +274.
-        # Floor: 25712 + 274 = 25986; ceiling stays 104.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25986
+        # Code-only deploy backups (#2629): test_deploy_code_only.py 66 -> 72 (+6).
+        # Floor: 25712 + 6 = 25718.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25718
