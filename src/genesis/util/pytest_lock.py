@@ -78,6 +78,18 @@ Environment levers:
 ``GENESIS_PYTEST_LOCK_HELD``
     Set by the holder and inherited by children, so a pytest spawned *inside* a
     locked run can never deadlock against its own parent.
+``GENESIS_PYTEST_LOCK_STALL_SECONDS``
+    How long one test may run before a contender's message calls the holder
+    LIKELY HUNG (default ``STALL_SECONDS``). Advisory only: nothing is killed.
+
+The holder record names the test running right now. ``tests/conftest.py``
+calls :meth:`BoxLock.note` before every test and once more at session
+teardown, so a contender can tell a long suite (the current test keeps
+changing) from a stuck one (one test, running for many minutes). MEASURED
+origin: a mutation sweep held this lock for 53 minutes with one test awaiting
+a task nothing ever cancelled, and six runs queued behind it with no sign the
+holder was stuck. A hang during collection writes no test, so it is not
+flagged.
 """
 
 from __future__ import annotations
@@ -119,6 +131,13 @@ _POLL_SECONDS = 2.0
 #: Holder records are 3 short lines; cap the read so a redirected lock path
 #: cannot make a blocked run slurp an arbitrary file.
 _RECORD_READ_LIMIT = 4096
+
+#: One test running this long reads as LIKELY HUNG to a contender. MEASURED:
+#: the slowest of 40,306 tests in CI run 37962484661 (main, 2026-10-09) took
+#: 38.25 s, so 600 s is about 16 times that. The flag is advisory, so the cost
+#: of a slow legitimate test crossing it is one misleading line, never a kill.
+STALL_SECONDS = 600.0
+STALL_ENV = "GENESIS_PYTEST_LOCK_STALL_SECONDS"
 
 DISABLE_ENV = "GENESIS_PYTEST_LOCK"
 WAIT_ENV = "GENESIS_PYTEST_LOCK_WAIT"
@@ -240,7 +259,59 @@ def _read_holder(path: Path) -> str:
             detail += f", running {_format_age(time.time() - float(lines[1]))}"
     if len(lines) > 2 and lines[2].strip():
         detail += f"\n  command: {lines[2].strip()}"
-    return detail
+    return detail + describe_current(lines, int(pid))
+
+
+def stall_seconds() -> float:
+    """The LIKELY-HUNG threshold: ``STALL_ENV`` if it is a positive number."""
+    with contextlib.suppress(TypeError, ValueError):
+        value = float(os.environ.get(STALL_ENV, ""))
+        if math.isfinite(value) and value > 0:
+            return value
+    return STALL_SECONDS
+
+
+def _wait_channel(pid: int) -> str:
+    """What the holder's main thread is blocked in (``/proc/<pid>/wchan``)."""
+    try:
+        with open(f"/proc/{pid}/wchan", encoding="utf-8", errors="replace") as fh:
+            # "0" is what the kernel shows when it hides the symbol.
+            value = fh.read(64).strip()
+            return value if value and value != "0" else "unknown"
+    except OSError:
+        return "unknown"
+
+
+def describe_current(lines: list[str], pid: int) -> str:
+    """The record's current-test lines, and the LIKELY HUNG flag. Never raises.
+
+    Lines 4-6 of the record are the label of what is running, when it started,
+    and an optional note (``per-test timeout: none`` when pytest-timeout is not
+    installed, so nothing will end a hung test). A record without them, such as
+    the gauntlet's, describes nothing here. ``scripts/pytest_lock_wait.py``
+    carries a copy of this function (it runs without ``genesis`` importable); a
+    test pins the two to the same output.
+    """
+    if len(lines) < 5 or not lines[3].strip():
+        return ""
+    label = lines[3].strip()
+    try:
+        age = time.time() - float(lines[4])
+    except (TypeError, ValueError):
+        return f"\n  current: {label}"
+    out = f"\n  current: {label} (running {_format_age(age)})"
+    note = lines[5].strip() if len(lines) > 5 else ""
+    if age >= stall_seconds():
+        out += (
+            f"\n  LIKELY HUNG: one step has run {_format_age(age)}; wait channel "
+            f"{_wait_channel(pid)}."
+        )
+        if note:
+            out += f" {note}."
+        out += (
+            f" Nothing is killed: inspect it (py-spy dump --pid {pid}) or wait."
+        )
+    return out
 
 
 class BoxLock:
@@ -259,12 +330,30 @@ class BoxLock:
         fd: int | None = None,
         path: Path | None = None,
         owns_held_env: bool = False,
+        started: float | None = None,
     ) -> None:
         self.blocked = blocked
         self.message = message
         self._fd = fd
         self._path = path
         self._owns_held_env = owns_held_env
+        self._started = started
+        self.note_suffix = ""
+
+    def note(self, label: str) -> None:
+        """Record what this run is doing now, for a contender to read.
+
+        Rewrites the whole record with ``label`` and the current time (plus
+        ``note_suffix``, a fixed remark the caller sets once). No-op unless this
+        process holds the lock, so a nested run under ``HELD_ENV`` never touches
+        its parent's record. Best-effort and never raises: a description must not
+        cost a run anything.
+        """
+        if self._fd is None or self._started is None:
+            return
+        _write_holder_record(
+            self._fd, self._started, (label, time.time(), self.note_suffix)
+        )
 
     @property
     def acquired(self) -> bool:
@@ -296,7 +385,11 @@ class BoxLock:
         self.release()
 
 
-def _write_holder_record(fd: int) -> None:
+def _write_holder_record(
+    fd: int,
+    started: float,
+    current: tuple[str, float, str] | None = None,
+) -> None:
     """Stamp pid / start time / argv so a contender can name the holder.
 
     Written with ``pwrite`` and truncated to length AFTERWARDS, so the file is
@@ -315,10 +408,15 @@ def _write_holder_record(fd: int) -> None:
     braces, and this function must never cost us the lock for any reason.
     """
     try:
-        argv = " ".join(sys.argv)[:500]  # bounded — argv can be enormous
-        record = f"{os.getpid()}\n{time.time()}\n{argv}\n".encode(
-            errors="replace"
-        )
+        # Newlines become spaces: the record is line-oriented, and an argv or a
+        # test id carrying one would shift every later field.
+        argv = " ".join(sys.argv)[:500].replace("\n", " ")  # bounded
+        text = f"{os.getpid()}\n{started}\n{argv}\n"
+        if current is not None:
+            label, since, note = current
+            label = label[:500].replace("\n", " ")
+            text += f"{label}\n{since}\n{note.replace(chr(10), ' ')}\n"
+        record = text.encode(errors="replace")
         os.pwrite(fd, record, 0)
         os.ftruncate(fd, len(record))
     except Exception:
@@ -467,10 +565,13 @@ def _acquire_inner(
     # because the region has two more statements, and the next one added would
     # otherwise reopen the same hole silently.
     try:
-        _write_holder_record(fd)
+        started = time.time()
+        _write_holder_record(fd, started)
         if export_env:
             os.environ[HELD_ENV] = str(os.getpid())
-        return BoxLock(fd=fd, path=path, owns_held_env=export_env)
+        return BoxLock(
+            fd=fd, path=path, owns_held_env=export_env, started=started
+        )
     except BaseException:
         with contextlib.suppress(OSError):
             os.close(fd)

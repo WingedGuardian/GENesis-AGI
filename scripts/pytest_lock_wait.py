@@ -61,6 +61,11 @@ MAX_WAIT_TIMEOUT = 86400.0
 #: cannot make this slurp an arbitrary file.
 _RECORD_READ_LIMIT = 4096
 
+#: Mirrors ``genesis.util.pytest_lock.STALL_SECONDS`` / ``STALL_ENV`` (this
+#: script runs without ``genesis`` importable); a test pins the two together.
+STALL_SECONDS = 600.0
+STALL_ENV = "GENESIS_PYTEST_LOCK_STALL_SECONDS"
+
 _POLL_SECONDS = 3.0
 _PROGRESS_SECONDS = 30.0
 
@@ -218,7 +223,67 @@ def _lock_holder_description() -> str:
             detail += f" (running {_format_age(time.time() - float(lines[1]))})"
     if len(lines) > 2 and lines[2].strip():
         detail += f"\n  command: {lines[2].strip()[:160]}"
-    return detail
+    return detail + describe_current(lines, int(pid))
+
+
+def stall_seconds() -> float:
+    """The LIKELY-HUNG threshold: ``STALL_ENV`` if it is a positive number."""
+    with contextlib.suppress(TypeError, ValueError):
+        value = float(os.environ.get(STALL_ENV, ""))
+        if value == value and value not in (float("inf"),) and value > 0:
+            return value
+    return STALL_SECONDS
+
+
+def _wait_channel(pid: int) -> str:
+    """What the holder's main thread is blocked in (``/proc/<pid>/wchan``)."""
+    try:
+        with open(f"/proc/{pid}/wchan", encoding="utf-8", errors="replace") as fh:
+            # "0" is what the kernel shows when it hides the symbol.
+            value = fh.read(64).strip()
+            return value if value and value != "0" else "unknown"
+    except OSError:
+        return "unknown"
+
+
+def _stall_key(detail: str) -> tuple[str, ...] | None:
+    """Which stuck step a holder description flags, or None if it flags none.
+
+    The pid line and the ``current:`` label, without their running ages, so a
+    hang is reported once however long it lasts and again if a different step
+    hangs."""
+    if "LIKELY HUNG" not in detail:
+        return None
+    lines = [ln.strip() for ln in detail.split("\n") if ln.strip()]
+    pid = lines[0].split(" (", 1)[0] if lines else ""
+    current = tuple(
+        ln.split(" (running", 1)[0] for ln in lines if ln.startswith("current:")
+    )
+    return (pid, *current)
+
+
+def describe_current(lines: list[str], pid: int) -> str:
+    """Copy of ``genesis.util.pytest_lock.describe_current``; pinned by a test."""
+    if len(lines) < 5 or not lines[3].strip():
+        return ""
+    label = lines[3].strip()
+    try:
+        age = time.time() - float(lines[4])
+    except (TypeError, ValueError):
+        return f"\n  current: {label}"
+    out = f"\n  current: {label} (running {_format_age(age)})"
+    note = lines[5].strip() if len(lines) > 5 else ""
+    if age >= stall_seconds():
+        out += (
+            f"\n  LIKELY HUNG: one step has run {_format_age(age)}; wait channel "
+            f"{_wait_channel(pid)}."
+        )
+        if note:
+            out += f" {note}."
+        out += (
+            f" Nothing is killed: inspect it (py-spy dump --pid {pid}) or wait."
+        )
+    return out
 
 
 def box_lock_held() -> bool | None:
@@ -361,6 +426,11 @@ def wait_for_clear(timeout: float, out=None) -> int:
         out.flush()
 
         next_progress = time.monotonic() + _PROGRESS_SECONDS
+        # The holder's state is re-read on every progress line, so a holder
+        # that goes stale WHILE we wait is reported when it happens: once per
+        # stuck step (holder pid + test), so a second hang later in the same
+        # wait is reported too.
+        reported = _stall_key(detail)
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -378,6 +448,10 @@ def wait_for_clear(timeout: float, out=None) -> int:
                     f"  … still waiting ({_format_age(time.monotonic() - started)})",
                     file=out,
                 )
+                key = _stall_key(detail)
+                if key is not None and key != reported:
+                    reported = key
+                    print(detail, file=out)
                 out.flush()
 
         # One last look: the holder may have released between the final poll and
