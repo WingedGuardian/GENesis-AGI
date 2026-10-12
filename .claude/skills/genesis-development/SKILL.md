@@ -2492,7 +2492,7 @@ reviewed diff's FULL content, so re-staging different content after the audit
 re-blocks. A precision-filtered "no findings" inline pass is FALSE CONFIDENCE for a
 substantial change — not clearance. Depth is override-exempt: a findings
 `# review-override` does NOT waive it; only a loud, announced-on-stderr `# depth-ack`
-does (announced, not RECORDED — nothing persists it, unlike the five PR-merge sigils
+does (announced, not RECORDED — nothing persists it, unlike the six PR-merge sigils
 below, whose rows survive the session; the word "logged" now means a durable row) (the
 audited escape for a genuine format mismatch). "Adversarial" is verified
 STRUCTURALLY, and the recognised vocabulary is NOT what an earlier version of this
@@ -2584,7 +2584,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   independently — with evidence, a confidence, and a falsifier — ask what the
   caller does differently because of its output, and say whether a better shape
   exists (an existing chokepoint it re-implements, a simpler mechanism, a place
-  the problem disappears). Emit the `Design-premise:` block. Also informational,
+  the problem disappears). Emit the `Design-premise:` block exactly as
+  `.claude/docs/premise-check.md` "The output" specifies (code reads it). Also informational,
   and its BROKEN verdict has a HIGH bar: it routes to the EXISTING
   premise-wrong disposition (architecture conversation, or
   `needs-architecture-session` + draft + a `ready` row) rather than to another round, so everything short of "the change cannot do what it
@@ -3470,12 +3471,18 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   a context note naming the setting. That note is what proves a silenced
   access; with no note, assume the access went past the guard unseen. It
   approves nothing; other hooks and Claude Code's own permissions still decide
-  the command, and a dispatched session is still denied. The only other key is
-  `push_publish` (owner ruling 2026-10-01), same no-decision-plus-note shape.
-  It silences only the first push of the CURRENT branch, and only when the
+  the command, and a dispatched session is still denied. The other keys are
+  `push_routine` (routine push prompts, 2026-10-06), `review_request` (a Codex
+  review request whose review history could not be read; the round-cap prompt
+  still asks, 2026-10-07) and `push_publish` (owner ruling 2026-10-01), all the
+  same no-decision-plus-note shape; `hook_ask_policy.py` holds the exact scope
+  of each. `push_publish` silences only the first push of the CURRENT branch, and only when the
   whole command is exactly one plain `git push` (e.g. `git push -u origin
   HEAD`) — a chained command still asks, so run the first push as its own
-  command. The remote git really pushes to must resolve (rewrites applied) to
+  command. Two spellings also qualify: `git -C <path> push …` when `<path>` is
+  the literal, symlink-free top of a worktree of the SAME repository as the
+  session's cwd, and a trailing `2>&1` and/or `| tail -N` / `| head -N`. The
+  remote git really pushes to must resolve (rewrites applied) to
   exactly `https://github.com/<public repo>` — ssh/scp forms always ask — with
   simple push config, no `http.*` config, no proxy/TLS/ssh/config env var in
   the hook's environment, and a live probe confirming the branch is absent
@@ -3485,6 +3492,27 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   without a TTY aborts rather than pushing. Force pushes, other destinations,
   close-then-push, the no-open-PR block, round-cap asks and the dispatched deny
   are untouched, and any doubt about the destination keeps the prompt.
+- **Only the main session publishes.** An Agent-tool worker (the hook input
+  carries `agent_id`) may run git and gh only from an ALLOWLIST, whatever
+  `push_publish` says (owner policy 2026-10-05; an allowlist since 2026-10-10,
+  because each review round found a write verb a denylist had missed): local
+  git work plus git's network reads (`fetch`, `pull`, `clone`, `ls-remote`),
+  and gh reads (`gh pr view/list/diff/checks/status/checkout`, `gh issue
+  view/list`, `gh run view/list`, `gh search`, `gh api` GETs and GraphQL
+  queries). Everything else is refused: `git push`, `git lfs lock`, an unknown
+  or aliased git command, every gh write including `gh auth login`, an unknown
+  gh subcommand, a non-GET `gh api` or GraphQL mutation, git options that run a
+  program (`--upload-pack`, `grep -O`, `rebase --exec`), and a command naming
+  git or gh in a form the guard cannot read (a line continuation, a too-long
+  command, a program held in a variable). Not reached: launchers the parse does
+  not open (`eval`, process substitution, `env -S`, a function body) and
+  programs git starts from config or the environment. Re-pushes of an already-published PR branch, dry runs and in-thread
+  finding replies are included. The list is `_GIT_SUBAGENT_OK`,
+  `_GIT_FAMILY_VERBS` and `_GH_SUBAGENT_READS` in `git_push_guard.py`. Commit
+  locally, then hand the worktree path, branch, head SHA, the PR title and body,
+  and any comment or reply you would have posted back to the main session. A
+  subagent dispatched to fix a PR therefore leaves the push and the replies to
+  the session that dispatched it.
 - **Ack sigils bind per-guard, and mostly to the LAST pipeline segment.**
   `git commit ... | tail  # audit-ack` puts the ack on `tail`. Run the commit
   bare. Some guards accept a sigil on any segment, others only on the offending
@@ -3661,6 +3689,18 @@ Verify before any commit:
   full-suite rule: test targets must still be named, and do not count on the
   full-suite guard to see inside the wrapper. Guide:
   `docs/reference/resource-budget.md`.
+- **Deleting user or project data goes through the trash, not `rm`.** A file or
+  directory you did not create in this session (memory and plans, config, a
+  deliverable, notes) goes to `… -m genesis.trash put PATH --reason R`, which
+  renames it into `~/.genesis/trash/` with a tombstone so
+  `… -m genesis.trash restore ENTRY` can bring it back. `rm` stays fine for
+  what you created yourself and for temp (`~/tmp`, cc-tmp, the scratchpad).
+  Unlike `rm -f`, a missing path is a refusal (exit 1); a path starting with
+  `-` goes after `--`. The trash makes a deletion recoverable; it does not
+  replace asking the user first where deleting their data needs their OK.
+  When `put` refuses (another volume, the database, a file a running process
+  is using), ask the user; do
+  not fall back to `rm`. Guide: `docs/reference/trash.md`.
 - **Commit continuously**: after every logical unit of work. Uncommitted = lost.
 - **PR closes a ledger item → cite `Ledger: <item-id>` in the PR body** (the
   32-hex `session_ledger` row id, own line, e.g. `Ledger: 71337fab…`). The
@@ -4025,12 +4065,20 @@ So: post the finding, flag it, leave it open, and let the reviving session
 decide — including deciding to retire it in favour of a successor, which is that
 session's call to make and to justify.
 
-**A superseded PR is the one exception (standing owner rule, 2026-10-04).** The
-closing session may retire it when all three hold:
+**A superseded PR is the one exception (standing owner rules, 2026-10-04 and
+2026-10-06).** The closing session, or the builder of a rework that replaces it,
+may retire it when all three hold. Devin never retires one: the closing session
+retires a Devin rework's old PR after the same check ("Building a rework" below).
 
 1. **The owner authorized the supersession**: the decision to replace this
    approach with another is the owner's, on record, not a reviewer's inference.
+   For a rework, that record is a `## Rework spec` comment posted by a
+   maintainer (author association OWNER, MEMBER or COLLABORATOR); one from a
+   non-maintainer, including a non-maintainer author of the PR, is not the
+   owner's authorization.
 2. **The successor PR is open**, or already merged, so the work has a live home.
+   For a split rework, the LAST replacement has opened and every replacement
+   is open or merged.
 3. **It is superseded completely, in every part.** Walk the old PR's files one by
    one against the successor and current `main`, and decide each as covered (name
    the `file:line` that now does it) or moot (say why it no longer applies). One
@@ -4261,9 +4309,12 @@ twice.
 `python3 scripts/hooks/git_push_guard.py --check-pr <N> [--repo OWNER/REPO]`
 BEFORE proposing a merge. It runs the SAME check functions the enforcement gate uses, in this REPORT order
 (mergeable → CI → base-invariant → pin-receipts → e2e-plan *(advisory)* →
-Codex-freshness → scheduled-Claude-review → review-body → inline findings),
+Codex-freshness → rounds *(advisory)* → scheduled-Claude-review → review-body →
+inline findings → main-reverts *(advisory)* → rework),
 so the two use the same checks. The merge arm checks review-body and inline
-findings before scheduled review, and additionally applies the
+findings before scheduled review, runs `rework` last (waived only by the logged
+`# rework-override`, which needs the owner's yes), blocks on none of the three
+advisory rows, and additionally applies the
 `--match-head-commit` binding, which has no report row —
 this `--check-pr` read IS the mandatory pre-merge step: **always run it and read
 the PR's automated-review comments (Codex, leak/CI, the scheduled Claude review)
@@ -4660,10 +4711,10 @@ The review-findings gate specifically:
    prompt sit downstream of this guard and can still stop the command.
    Never any command text — the row is metadata only, because a trailing comment
    rides a Bash command that can carry a credential.
-   **Scope, stated so the log is not read as more complete than it is:** the five
+   **Scope, stated so the log is not read as more complete than it is:** the six
    PR-merge sigils are covered (`# review-override`, `# ci-override`,
    `# stale-review-override`, `# scheduled-review-override`,
-   `# substitute-review`), from the point the
+   `# substitute-review`, `# rework-override`), from the point the
    PR is resolved onward. A merge rejected BEFORE that point writes nothing —
    no `--admin`, an unresolvable repo/PR, a compound carrying two publish/merge
    operations, or a merge compounded with a local `git merge` into main are the
