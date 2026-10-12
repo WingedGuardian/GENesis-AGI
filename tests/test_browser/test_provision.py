@@ -237,7 +237,9 @@ def test_a_killed_fetchs_missing_chmod_is_finished_not_redownloaded(env, monkeyp
     (bad / "sub").mkdir(parents=True)
     (bad / "camoufox-bin").write_bytes(b"x")
     (bad / "camoufox-bin").chmod(0o644)
-    status = engine.EngineStatus(engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin")
+    status = engine.EngineStatus(
+        engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin"
+    )
     _resolves(monkeypatch, status, READY)
     run = Runner()
     out = provision.provision(run)
@@ -720,7 +722,9 @@ def test_a_symlinked_version_dir_is_never_changed(env, monkeypatch, tmp_path):
     browsers.mkdir(parents=True)
     (browsers / "156.0.1-beta.36-abc").symlink_to(outside)
     bad = browsers / "156.0.1-beta.36-abc"
-    status = engine.EngineStatus(engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin")
+    status = engine.EngineStatus(
+        engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin"
+    )
     _resolves(monkeypatch, status)
     run = Runner()
     provision.provision(run)
@@ -730,7 +734,9 @@ def test_a_symlinked_version_dir_is_never_changed(env, monkeypatch, tmp_path):
 def test_chmod_that_cannot_help_stops(env, monkeypatch):
     bad = env / "xdg" / "camoufox" / "browsers" / "official" / "156.0.1-beta.36-abc"
     bad.mkdir(parents=True)
-    status = engine.EngineStatus(engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin")
+    status = engine.EngineStatus(
+        engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin"
+    )
     _resolves(monkeypatch, status, status, status)
     run = Runner()
     out = provision.provision(run)
@@ -753,7 +759,14 @@ def test_a_failing_extras_step_keeps_the_engine_result(env, monkeypatch):
 def test_a_too_old_glibc_is_not_sent_to_install_deps(env, monkeypatch):
     status = _engine_on_disk(env)
     _resolves(monkeypatch, status)
-    run = Runner({"ldd": (0, "libxul.so: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required by libxul.so)\n")})
+    run = Runner(
+        {
+            "ldd": (
+                0,
+                "libxul.so: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required by libxul.so)\n",
+            )
+        }
+    )
     out = provision.provision(run)
     assert "libs=glibc-too-old:" in out.line() and run.ran("install-deps") == []
 
@@ -1001,7 +1014,6 @@ def test_writes_to_one_filesystem_are_summed(env, monkeypatch):
     assert provision._room_to_fetch() is None
 
 
-
 def test_an_installed_chromium_needs_no_room_for_an_install(env, monkeypatch):
     """A re-run with everything in place downloads nothing, so it must not be
     skipped for lack of room a download would need."""
@@ -1011,3 +1023,142 @@ def test_an_installed_chromium_needs_no_room_for_an_install(env, monkeypatch):
     _resolves(monkeypatch, READY)
     out = provision.provision(Runner())
     assert "chromium=1234" in out.line() and out.ok
+
+
+# ── review round 2 (#3203) ────────────────────────────────────────────────────
+
+
+def test_a_binary_ldd_cannot_read_after_install_deps_is_not_ok(env, monkeypatch):
+    """An interrupted install-deps can leave the loader unable to inspect a binary;
+    the recheck must report that, never libs=ok."""
+    status = _engine_on_disk(env)
+    _resolves(monkeypatch, status)
+    state = {"installed": False}
+
+    def fake(argv, **kw):
+        text = " ".join(argv)
+        if text.startswith("ldd"):
+            if not state["installed"]:
+                return subprocess.CompletedProcess(argv, 0, "\tlibgtk-3.so.0 => not found\n", "")
+            return subprocess.CompletedProcess(argv, 1, "", "error while loading")
+        if "install-deps" in text:
+            state["installed"] = True
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    out = provision.provision(fake)
+    assert "libs=error:ldd" in out.line() and not out.ok
+
+
+def test_a_stale_download_is_cleared_before_the_space_check(env, monkeypatch):
+    """A killed run's archive can be what takes the disk below the floor; checking
+    first would skip every later run and never reclaim it."""
+    temp = env / "bigtmp" / "browser-stack"
+    temp.mkdir(parents=True)
+    stale = temp / "tmpold"
+    stale.write_bytes(b"x")
+    old = time.time() - 4 * 3600
+    os.utime(stale, (old, old))
+    monkeypatch.setattr(
+        provision, "free_bytes", lambda path: 1 if stale.exists() else 100 * 1024**3
+    )
+    _resolves(monkeypatch, READY)
+    out = provision.provision(Runner())
+    assert not stale.exists()
+    assert "low disk" not in out.line()
+
+
+def test_each_destination_on_one_filesystem_is_measured(env, monkeypatch):
+    """btrfs subvolumes share a filesystem but can each carry their own quota: the
+    tight one must be measured, not only the first destination on that device."""
+    monkeypatch.setattr(provision, "disk_device", lambda path: "one-pool")
+    engine_dir = provision.engine.camoufox_install_dir()
+    temp = provision._temp_root()
+    plenty = 100 * 1024**3
+    monkeypatch.setattr(
+        provision, "free_bytes", lambda path: 1024**3 if Path(path) == temp else plenty
+    )
+    short = provision._short_of_space([engine_dir, temp])
+    assert short and str(temp) in short
+
+
+def test_an_unlistable_cache_still_prints_the_outcome(env, monkeypatch, capsys):
+    """mark_legacy lists browsers/; a directory that can be statted but not listed
+    must not end the run with a traceback before the engine step reports it."""
+
+    def unlistable(root):
+        raise PermissionError(13, "Permission denied", str(root / "browsers"))
+
+    monkeypatch.setattr(provision, "mark_legacy", unlistable)
+    _resolves(monkeypatch, READY)
+    out = provision.provision(Runner())
+    assert any("browsers" in n and "Permission denied" in n for n in out.notes)
+    assert "engine=" in out.line()
+
+
+def test_a_destination_the_run_cannot_write_is_reported(env, monkeypatch):
+    """The unit allows writes under $HOME only; a configured destination outside it
+    (or any read-only one) is named with the fix, not left to fail mid-install."""
+    readonly = env / "readonly"
+    readonly.mkdir()
+    monkeypatch.setattr(provision, "_writable", lambda path: Path(path) != readonly)
+    monkeypatch.setattr(provision.engine, "camoufox_install_dir", lambda: readonly)
+    _resolves(monkeypatch, MISSING)
+    run = Runner()
+    out = provision.provision(run)
+    assert run.ran("camoufox fetch") == []
+    assert "engine=not writable" in out.line()
+    assert any(str(readonly) in n for n in out.notes)
+    assert not out.ok
+
+
+def test_a_ready_stack_on_unwritable_destinations_is_still_ok(env, monkeypatch):
+    """Writability matters only where something is due: a stack with nothing to
+    install reads ready whatever the destinations' modes (found by review)."""
+    monkeypatch.setattr(provision, "_writable", lambda path: False)
+    status = _engine_on_disk(env)
+    _resolves(monkeypatch, status)
+    out = provision.provision(Runner())
+    assert out.ok, out.line()
+    assert "not writable" not in out.line()
+
+
+def test_a_due_chromium_install_into_an_unwritable_root_is_reported(env, monkeypatch):
+    _layout(env, chrome=False)  # the fallback's Chromium lost its executable
+    monkeypatch.setattr(provision, "_writable", lambda path: Path(path) != env / "pw")
+    _resolves(monkeypatch, READY)
+    run = Runner()
+    out = provision.provision(run)
+    assert run.ran("install") == []
+    assert "chromium=not writable" in out.line() and not out.ok
+
+
+def test_a_temp_dir_that_cannot_be_made_still_prints_the_outcome(env, monkeypatch):
+    monkeypatch.setenv("GENESIS_BIG_TMP", str(env / "file-not-dir" / "tmp"))
+    (env / "file-not-dir").write_text("a file where a directory should be")
+    _resolves(monkeypatch, READY)
+    out = provision.provision(Runner())
+    assert out.line().startswith("browser-stack: engine=")
+
+
+def test_a_cache_root_that_cannot_be_made_is_an_outcome_not_a_traceback(env, monkeypatch):
+    root = env / "dangling"
+    root.symlink_to(env / "nowhere")
+    monkeypatch.setattr(provision.engine, "camoufox_install_dir", lambda: root)
+    _resolves(monkeypatch, MISSING)
+    out = provision.provision(Runner())
+    assert not out.ok and any(str(root) in n for n in out.notes)
+
+
+def test_a_low_disk_skip_keeps_its_notes(env, monkeypatch):
+    """The stale-download cleanup can fail in exactly the case the low-disk skip
+    then reports; its note must survive the early return."""
+
+    def no_clear():
+        raise PermissionError(13, "Permission denied", "stale")
+
+    monkeypatch.setattr(provision, "_clear_stale_temp", no_clear)
+    monkeypatch.setattr(provision, "free_bytes", lambda path: 1)
+    _resolves(monkeypatch, READY)
+    out = provision.provision(Runner())
+    assert "low disk" in out.line()
+    assert any("could not clear stale downloads" in n for n in out.notes)

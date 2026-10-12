@@ -9,10 +9,10 @@
 # the engine cache and the venv.
 #
 # Run by an operator, a missing system library is installed through `sudo -n`
-# when that is allowed without a password. A sudoers rule for it should name
-# the exact command, never a wildcard over the venv's python (whoever owns the
-# venv could otherwise run anything as root through it):
-#   <user> ALL=(root) NOPASSWD: <venv>/bin/python -m playwright install-deps chromium firefox
+# only where this user may already run commands as root without a password;
+# otherwise the exact command is printed for the operator. Do not add a sudoers
+# rule just for it: the command runs the venv's python, which this user can
+# rewrite, so any such rule would hand that user root.
 #
 # Exit codes: the module's own (0 ready or deliberately skipped, 1 not ready),
 # 0 when another run holds the lock (that run does the work), 75 when this run

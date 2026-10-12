@@ -30,9 +30,8 @@ from pathlib import Path
 
 from genesis.browser import chromium, engine
 from genesis.browser.types import BROWSER_PGREP_PATTERNS
-from genesis.hostmetrics.readings import disk_device
+from genesis.hostmetrics.readings import disk_device, existing_parent
 from genesis.util.disk_headroom import effective_free_bytes
-from genesis.util.tmp import big_tmp_dir
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
@@ -40,11 +39,12 @@ Runner = Callable[..., subprocess.CompletedProcess]
 # (genesis-development, Timeout Policy). The engine download is about 1.3 GB.
 STEP_TIMEOUT_S = 7200
 # The unit's TimeoutStartSec (28800, four steps at the floor) less the fixed-timeout
-# probes outside this budget (dry-run 600 s, ldd 120 s each, dg_measure 60 s each,
-# sudo and pgrep: about 2,130 s at worst) and room to print the outcome. Every
-# step's timeout is cut to what is left of it, so steps that each stay under their
-# own limit cannot together outlast the unit and be killed mid-install by systemd.
-RUN_BUDGET_S = 28800 - 2400
+# probes outside this budget, at worst: the dry-run 600 s, ten ldd runs at 120 s
+# (four binaries before and after install-deps, two rechecks), ten dg_measure at
+# 60 s (every destination of every space check), sudo 60 s: about 2,460 s, plus room
+# to print the outcome. Every step's timeout is cut to what is left of it, so steps
+# that each stay under their own limit cannot together outlast the unit.
+RUN_BUDGET_S = 28800 - 3000
 _DEFAULT_MIN_FREE_GB = 4.0
 # Both browsers in one call: Chromium's package list lacks the GTK libraries
 # Firefox needs (MEASURED: libxul.so links libgtk-3).
@@ -89,19 +89,40 @@ def _short_of_space(paths: list[Path], writes: dict[Path, int] | None = None) ->
     top of it, summed per filesystem, so a download cannot itself take the disk
     below the floor. The engine, its download and Chromium can each be elsewhere."""
     floor = min_free_bytes()
-    need: dict[object, tuple[Path, int]] = {}
+    need: dict[object, tuple[list[Path], int]] = {}
     for path, size in [(p, 0) for p in paths] + list((writes or {}).items()):
         key = disk_device(path) or path
-        first, total = need.get(key, (path, floor))
-        need[key] = (first, total + size)
-    for path, wanted in need.values():
-        free = free_bytes(path)
-        if free is None:
-            return f"cannot measure {path}"
-        if free < wanted:
+        members, total = need.get(key, ([], floor))
+        need[key] = ([*members, path] if path not in members else members, total + size)
+    # Every destination is measured: a project quota (ext4, XFS) limits one tree on a
+    # device the others share, so the first one's figure says nothing about the rest.
+    for members, wanted in need.values():
+        for path in members:
+            free = free_bytes(path)
+            if free is None:
+                return f"cannot measure {path}"
+            if free < wanted:
+                return (
+                    f"low disk: {path} has {free / 1024**3:.1f} GB free, "
+                    f"{wanted / 1024**3:.1f} GB needed"
+                )
+    return None
+
+
+def _writable(path: Path) -> bool:
+    """Whether a write under ``path`` can succeed here: its nearest existing parent
+    is writable and not read-only mounted (the unit's ProtectSystem=strict makes
+    everything outside ReadWritePaths read-only, which access(2) reports)."""
+    return os.access(existing_parent(path), os.W_OK)
+
+
+def _unwritable(paths: list[Path]) -> str | None:
+    for path in paths:
+        if not _writable(path):
             return (
-                f"low disk: {path} has {free / 1024**3:.1f} GB free, "
-                f"{wanted / 1024**3:.1f} GB needed"
+                f"not writable: {path} (check its permissions; genesis-browser-stack.service "
+                "writes only under $HOME, so a destination elsewhere needs a ReadWritePaths= "
+                "drop-in)"
             )
     return None
 
@@ -115,12 +136,18 @@ _CHROMIUM_BYTES = 700 * 1024**2
 _CHROMIUM_ARCHIVE_BYTES = 350 * 1024**2
 
 
+def _temp_root() -> Path:
+    """Where the downloads go (``GENESIS_BIG_TMP`` or ~/tmp, as ``big_tmp_dir``), without
+    creating it: a destination that cannot be made is reported, not raised."""
+    return Path(os.environ.get("GENESIS_BIG_TMP") or Path.home() / "tmp") / "browser-stack"
+
+
 def _room_to_fetch() -> str | None:
     return _short_of_space(
         [],
         {
             engine.camoufox_install_dir(): _ENGINE_BYTES,
-            Path(big_tmp_dir()) / "browser-stack": _ENGINE_ARCHIVE_BYTES,
+            _temp_root(): _ENGINE_ARCHIVE_BYTES,
         },
     )
 
@@ -270,7 +297,7 @@ def _temp_dir() -> Path:
     """Where the installers' downloads go: their own directory under ~/tmp (never a
     session's small TMPDIR), so a run can clear what a killed run left there. A
     SIGKILL leaves the download's temp file behind (MEASURED: 303 MB)."""
-    path = Path(big_tmp_dir()) / "browser-stack"
+    path = _temp_root()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -349,18 +376,27 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
                     break
                 # A fetch killed between writing version.json and its final chmod
                 # (multiversion.install_versioned): finish that step, never re-download.
+                if blocked := _unwritable([directory]):
+                    notes.append(blocked)
+                    return "not writable", False, status
                 _chmod_tree(directory)
                 mark_legacy(engine.camoufox_install_dir())  # the flag is that installer's last step
                 chmodded = True
             elif fetched:
                 break  # a fresh fetch is still invalid: deleting it again would not help
             else:
+                if blocked := _unwritable([engine.camoufox_install_dir(), _temp_root()]):
+                    notes.append(blocked)
+                    return "not writable", False, status
                 if short := _room_to_fetch():  # checked before anything is removed
                     return f"skipped ({short})", True, status
                 _remove_version(directory)
                 _fetch(run)
                 fetched = True
         elif status.kind == engine.NOT_INSTALLED and not fetched:
+            if blocked := _unwritable([engine.camoufox_install_dir(), _temp_root()]):
+                notes.append(blocked)
+                return "not writable", False, status
             if short := _room_to_fetch():
                 return f"skipped ({short})", True, status
             _fetch(run)
@@ -464,6 +500,9 @@ def _chromium_step(run: Runner, notes: list[str]) -> tuple[str, bool, list[Path]
     # Room for a download only when one is due: a re-run with both builds in place
     # installs nothing (the installer skips a complete build).
     due = any(chromium.problem(b, where[b][1]) for b in chromium.BUILDS)
+    if due and (blocked := _unwritable([root, _temp_root()])):
+        notes.append(blocked)
+        return "not writable", False, []
     if due and (
         short := _short_of_space([], {root: _CHROMIUM_BYTES, _temp_dir(): _CHROMIUM_ARCHIVE_BYTES})
     ):
@@ -551,7 +590,10 @@ def _libs_step(run: Runner, binaries: list[Path], notes: list[str]) -> tuple[str
         sudo_ok = False  # no sudo here: the operator runs the command
     if sudo_ok:
         run(["sudo", "-n", *deps], stdin=subprocess.DEVNULL, timeout=_timeout(), check=False)
-        missing, _ = _missing_libs(run, binaries)
+        missing, unreadable = _missing_libs(run, binaries)
+        if unreadable:
+            notes.append("ldd could not read: " + ", ".join(str(b) for b in unreadable))
+            return "error:ldd", False
         if not missing:
             return "ok", True
         notes.append(
@@ -570,14 +612,28 @@ def provision(run: Runner | None = None) -> Outcome:
     notes: list[str] = []
     _deadline = time.monotonic() + RUN_BUDGET_S
     root = engine.camoufox_install_dir()
-    short = _short_of_space([root, Path(big_tmp_dir()) / "browser-stack"])
+    temp = _temp_root()
+    # Before the space check: a killed run's archive can be what takes the disk
+    # below the floor, and a skip would then never reclaim it.
+    try:
+        _clear_stale_temp()
+    except OSError as exc:
+        notes.append(f"could not clear stale downloads in {temp}: {exc}")
+    short = _short_of_space([root, temp])
     if short:
         # The timer retries tomorrow; a full disk is not a failed unit.
-        return Outcome(f"skipped ({short})", "skipped", "unchecked", True)
-    root.mkdir(parents=True, exist_ok=True)
-    _clear_stale_temp()
-    if mark_legacy(root):
-        notes.append(f"marked the pre-0.5 engine in {root} so camoufox 0.5 keeps it")
+        return Outcome(f"skipped ({short})", "skipped", "unchecked", True, notes)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        notes.append(f"cannot create {root}: {exc}")
+        return Outcome("not writable", "skipped", "unchecked", False, notes)
+    try:
+        if mark_legacy(root):
+            notes.append(f"marked the pre-0.5 engine in {root} so camoufox 0.5 keeps it")
+    except OSError as exc:
+        # The engine step's resolver names the repair for an unreadable cache.
+        notes.append(f"could not check {root} for a pre-0.5 engine: {exc}")
     try:
         eng, eng_ok, status = _engine_step(run, notes)
     except Exception as exc:  # noqa: BLE001 - reported on the outcome line

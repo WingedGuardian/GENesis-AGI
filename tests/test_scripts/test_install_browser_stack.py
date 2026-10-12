@@ -87,7 +87,14 @@ def test_the_unit_allows_the_runs_whole_budget():
     from genesis.browser import provision
 
     unit = (_SCRIPT.parent / "systemd" / "genesis-browser-stack.service.template").read_text()
-    limit = int(next(ln.split("=", 1)[1] for ln in unit.splitlines() if ln.startswith("TimeoutStartSec=")))
+    limit = int(
+        next(ln.split("=", 1)[1] for ln in unit.splitlines() if ln.startswith("TimeoutStartSec="))
+    )
     assert limit == 28800
     assert limit > provision.RUN_BUDGET_S
 
+
+def test_no_sudoers_rule_is_recommended():
+    """Any rule naming the venv's python grants root to whoever can write the venv
+    (its package code, or a shadow module in the working directory)."""
+    assert "NOPASSWD" not in _SCRIPT.read_text()
