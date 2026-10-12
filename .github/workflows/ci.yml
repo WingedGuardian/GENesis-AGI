@@ -1049,7 +1049,14 @@ jobs:
         # +116 (new), test_memory_mcp +7, test_browser_tools +4, test_reference_extraction
         # +4, test_browser_cli_card_guard +4 (new), test_output_scanner +3,
         # test_capability_shadow_wiring +1; no added skips. Floor: 25548 + 139 = 25687.
+        # PR C (#3224, #3126, #3047, #2938, #2551), measured against origin/main
+        # b32ef3610 (deltas vs that base) with --collect-only:
+        # tests/test_scripts/test_backup_backends.py +1,
+        # tests/test_scripts/test_git_repair.py +3,
+        # tests/test_scripts/test_codebase_managed_config.py +1,
+        # tests/test_scripts/test_session_doors.py +6. No added skips.
+        # Floor: 25687 + 1 + 3 + 1 + 6 = 25698.
         # Pinned-provider path compatibility: managed configuration suite
-        # collects 76 -> 93 against main 806b12cd0 (+17); no new skips.
-        # Floor: 25687 + 17 = 25704; preserve the measured ceiling 104.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25704
+        # collects 94 here and 77 on main 90fd17b4c (+17); no new skips.
+        # Floor: 25698 + 17 = 25715; preserve the measured ceiling 104.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25715
