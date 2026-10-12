@@ -125,7 +125,7 @@ backend_available() {
 # ── smb backend ──────────────────────────────────────────────────────
 # _SMB_OP_TIMEOUT is dynamically scoped: put/get/delete override it per-call
 # (bash `local` in the caller is visible here); everything else gets ctl.
-_smb_run() { timeout "${_SMB_OP_TIMEOUT:-$_BACKEND_CTL_TIMEOUT}" smbclient "$_BACKEND_NAS" -A "$_BACKEND_CREDS" "$@"; }
+_smb_run() { timeout -k 10 "${_SMB_OP_TIMEOUT:-$_BACKEND_CTL_TIMEOUT}" smbclient "$_BACKEND_NAS" -A "$_BACKEND_CREDS" "$@"; }
 
 _smb_mkdir() {
     # smbclient mkdir is non-recursive — create each ancestor in one -c batch.

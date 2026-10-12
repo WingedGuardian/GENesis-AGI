@@ -16,9 +16,6 @@
 #   --post-merge  Skip fetch/merge (code already merged by CC conflict resolution);
 #                 run only bootstrap, migrations, health check, and service restart.
 
-unset GENESIS_DASHBOARD_LOOPBACK_QUALIFIED _DASHBOARD_LOOPBACK_QUALIFIED
-_DASHBOARD_LOOPBACK_QUALIFIED=""
-
 set -Eeuo pipefail  # -E: the ERR trap is inherited by functions AND subshells
                     # (see _on_err's BASH_SUBSHELL guard for the subshell case)
 
@@ -186,10 +183,8 @@ _on_signal_prestop() {
     for _svc in "${WERE_RUNNING[@]:-}"; do
         [ -n "$_svc" ] || continue
         if [ "$_svc" = "genesis-server" ]; then
-            if _qualify_dashboard_loopback; then
-                _start_genesis_server 2>/dev/null \
-                    || systemctl --user restart genesis-server.service 2>/dev/null || true
-            fi
+            _start_genesis_server 2>/dev/null \
+                || systemctl --user restart genesis-server.service 2>/dev/null || true
         else
             systemctl --user start "$_svc.service" 2>/dev/null || true
         fi
@@ -272,22 +267,90 @@ echo "  Genesis Update"
 echo "  ──────────────────────────────────────"
 
 # ── Resolve upstream remote ────────────────────────────────
-# Use the remote pointing to github_public_repo (e.g. 'public' for GENesis-AGI).
-# Falls back to 'origin' if detection fails or genesis.env is unavailable.
-_detect_update_remote() {
-    local public_repo
-    public_repo=$(
-        "$VENV_DIR/bin/python" -c \
-        "from genesis.env import github_public_repo; print(github_public_repo())" \
-        2>/dev/null
-    ) || public_repo="GENesis-AGI"
-    local remote
-    remote=$(git -C "$GENESIS_ROOT" remote -v 2>/dev/null \
-        | awk "/$public_repo.*fetch/{print \$1; exit}")
-    echo "${remote:-origin}"
-}
-UPDATE_REMOTE="$(_detect_update_remote)"
-echo "  Update remote: $UPDATE_REMOTE"
+# The remote whose main this update installs, chosen by the shared rule in
+# src/genesis/util/update_remote.py and pinned in this checkout's git config
+# (genesis.updateRemote) on first use, so a remote added later, such as a
+# contributor's fork fetched to review a pull request, cannot change where
+# updates come from. Exit 2 from the helper is a refusal (the choice would be a
+# guess).
+#
+# --post-merge fetches nothing: it finishes an update whose merge already
+# happened. It never reads UPDATE_REMOTE, so it does not resolve one; a
+# refusal here would otherwise strand the recovery path for a checkout whose
+# code is already merged.
+UPDATE_REMOTE=""
+_UR_HOW=""
+if [[ "$POST_MERGE" == "false" ]]; then
+    _UR_RC=0
+    _UR_OUT=$("$VENV_DIR/bin/python" -m genesis.util.update_remote "$GENESIS_ROOT" --pin 2>/dev/null) \
+        || _UR_RC=$?
+    case "$_UR_RC" in
+        0)
+            UPDATE_REMOTE="$(printf '%s\n' "$_UR_OUT" | sed -n 1p)"
+            _UR_HOW="$(printf '%s\n' "$_UR_OUT" | sed -n 2p)"
+            ;;
+        2)
+            # Exit 3: the update SOURCE is not chosen. Distinct from 1 (script
+            # error) and 2 (merge conflicts), so a supervisor stops for the
+            # operator instead of "fixing" it by pinning a remote itself.
+            echo "ERROR: cannot choose the update remote: $_UR_OUT"
+            echo "       Refusing to update until it is chosen."
+            exit 3
+            ;;
+        *)
+            # The helper could not run (a broken venv, which this script also
+            # repairs). Apply the same rule in shell, as far as it can be applied
+            # without the helper: the one-run override, then this checkout's own
+            # pin, each of which must name a remote here. With neither, origin
+            # only when it is the ONLY remote; any other remote may be the public
+            # repository (or a fork fetched for review), and only the helper can
+            # tell, so refuse rather than guess.
+            _UR_PICK="${GENESIS_UPDATE_REMOTE:-}"
+            _UR_HOW="override"
+            if [ -z "$_UR_PICK" ]; then
+                _UR_PICK="$(git -C "$GENESIS_ROOT" config --local --get genesis.updateRemote 2>/dev/null || true)"
+                _UR_HOW="pinned"
+            fi
+            if [ -n "$_UR_PICK" ]; then
+                # The helper's plain_name rule: only such a name can be the source.
+                if ! [[ "$_UR_PICK" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [[ "$_UR_PICK" == *..* ]] \
+                    || [[ "$_UR_PICK" == *. ]] || [[ "$_UR_PICK" == *.lock ]]; then
+                    echo "ERROR: the update-remote rule could not run (exit $_UR_RC), and the $_UR_HOW"
+                    echo "       update remote '$_UR_PICK' is not a plain remote name."
+                    echo "       Refusing to update until it is fixed."
+                    exit 3
+                fi
+                if ! git -C "$GENESIS_ROOT" remote get-url -- "$_UR_PICK" >/dev/null 2>&1; then
+                    echo "ERROR: the update-remote rule could not run (exit $_UR_RC), and the $_UR_HOW"
+                    echo "       update remote '$_UR_PICK' is not a remote of this checkout."
+                    echo "       Refusing to update until it is fixed."
+                    exit 3
+                fi
+                UPDATE_REMOTE="$_UR_PICK"
+                echo "  WARNING: the update-remote rule could not run (exit $_UR_RC); using the $_UR_HOW remote."
+            elif [ "$(git -C "$GENESIS_ROOT" remote 2>/dev/null)" = "origin" ]; then
+                UPDATE_REMOTE="origin"
+                _UR_HOW="fallback"
+                echo "  WARNING: the update-remote rule could not run (exit $_UR_RC); origin is the only remote."
+            else
+                echo "ERROR: the update-remote rule could not run (exit $_UR_RC), no update remote is"
+                echo "       pinned, and this checkout has remotes besides origin, so the source cannot"
+                echo "       be chosen safely here. Repair the venv, or pin it once by hand:"
+                echo "       git config genesis.updateRemote <remote>"
+                exit 3
+            fi
+            ;;
+    esac
+    [ -n "$UPDATE_REMOTE" ] || UPDATE_REMOTE="origin"
+    # How it was chosen (origin, fallback, pinned, override), so a log shows when a
+    # GENESIS_UPDATE_REMOTE override or a pin, not the rule, decided this run.
+    echo "  Update remote: $UPDATE_REMOTE${_UR_HOW:+ ($_UR_HOW)}"
+fi
+# The override is for THIS run only. Drop it once resolved, so nothing this
+# script starts (the degraded `genesis serve` fallback, and update processes
+# that server launches later) inherits it and keeps choosing the temporary
+# remote past the pin.
+unset GENESIS_UPDATE_REMOTE
 
 # ── Current state ─────────────────────────────────────────
 # The branch the checks above VALIDATED, not a fresh read: a switch in between
@@ -876,6 +939,97 @@ if [[ "$POST_MERGE" == "false" ]]; then
         _clear_deploy_state
         exit 1
     fi
+
+    # An excused path can be cleared before a normal merge, but staged changes
+    # on divergent histories can survive that clear or prevent it from working.
+    # Fast-forward and local-ahead histories do not need this refusal.
+    # BEGIN staged-excused-divergence
+    _refuse_staged_excused_divergence() {
+        echo "  $1 — server NOT stopped, nothing changed."
+        git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
+        _clear_deploy_state
+        exit 1
+    }
+
+    _staged_guard_is_ancestor() {
+        local rc=0
+        git -C "$GENESIS_ROOT" merge-base --is-ancestor "$1" "$2" >/dev/null 2>&1 || rc=$?
+        [ "$rc" -le 1 ] || _refuse_staged_excused_divergence "Could not compare $1 with $2"
+        return "$rc"
+    }
+
+    # Plumbing keeps ignore-submodule settings, .gitmodules, renames, and
+    # intent-to-add entries from hiding index state; only the two paths cleared
+    # from HEAD before merge can safely allow staged blob edits.
+    _staged_excused_divergence_guard() {
+        local p idx='' tree='' tree_norm='' line='' meta='' path=''
+        local idx_meta='' idx_path='' idx_mode='' idx_oid='' idx_stage=''
+        local tree_meta='' tree_path='' tree_mode='' tree_type='' tree_oid='' tree_stage=''
+        local -a blocked=() tree_entries=()
+
+        if _staged_guard_is_ancestor HEAD "$DEPLOY_HEAD" \
+            || _staged_guard_is_ancestor "$DEPLOY_HEAD" HEAD; then
+            return 0
+        fi
+
+        for p in AGENTS.md config/procedure_triggers.yaml \
+            .claude/settings.local.json .serena/project.yml \
+            src/genesis/identity/USER.md; do
+            # --literal-pathspecs reads the path literally whatever the caller's
+            # environment: under GIT_LITERAL_PATHSPECS=1 a ":(literal)" prefix is
+            # itself taken as part of the name and matches nothing (measured,
+            # git 2.43), which would make a clean checkout refuse every update.
+            if ! idx="$(git -C "$GENESIS_ROOT" --literal-pathspecs ls-files -s -- "$p")"; then
+                _refuse_staged_excused_divergence "Could not read the staged index for excused paths on divergent history"
+            fi
+            if ! tree="$(git -C "$GENESIS_ROOT" --literal-pathspecs ls-tree -r HEAD -- "$p")"; then
+                _refuse_staged_excused_divergence "Could not read HEAD's tree for excused paths on divergent history"
+            fi
+
+            tree_entries=()
+            while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                meta="${line%%$'\t'*}"
+                path="${line#*$'\t'}"
+                read -r tree_mode tree_type tree_oid <<< "$meta"
+                tree_entries+=("$tree_mode $tree_oid 0"$'\t'"$path")
+            done <<< "$tree"
+            tree_norm=""
+            if [ "${#tree_entries[@]}" -gt 0 ]; then
+                tree_norm="$(printf '%s\n' "${tree_entries[@]}")"
+            fi
+
+            [[ "$idx" == "$tree_norm" ]] && continue
+            if [[ "$p" == "AGENTS.md" || "$p" == "config/procedure_triggers.yaml" ]] \
+                && [[ "$idx" != *$'\n'* && "$tree_norm" != *$'\n'* ]]; then
+                IFS=$'\t' read -r idx_meta idx_path <<< "$idx"
+                read -r idx_mode idx_oid idx_stage <<< "$idx_meta"
+                IFS=$'\t' read -r tree_meta tree_path <<< "$tree_norm"
+                read -r tree_mode tree_oid tree_stage <<< "$tree_meta"
+                if [[ "$idx_path" == "$p" && "$idx_stage" == 0 \
+                    && "$tree_path" == "$p" && "$tree_stage" == 0 ]]; then
+                    case "$idx_mode:$tree_mode" in
+                        100644:100644|100644:100755|100644:120000|\
+                        100755:100644|100755:100755|100755:120000|\
+                        120000:100644|120000:100755|120000:120000)
+                            continue
+                            ;;
+                    esac
+                fi
+            fi
+            blocked+=("$p")
+        done
+
+        if [ "${#blocked[@]}" -gt 0 ]; then
+            echo "  Staged changes on excused paths block a divergent update; the merge would fail after the services stop:"
+            printf '%s\n' "${blocked[@]}" | sed 's/^/    /'
+            echo "  Unstage them first: git restore --staged -- <path>"
+            _refuse_staged_excused_divergence "Resolve these staged path changes first"
+        fi
+    }
+
+    _staged_excused_divergence_guard
+    # END staged-excused-divergence
 fi
 
 # ── Back up locally edited ephemeral files BEFORE anything stops ──────
@@ -990,7 +1144,6 @@ _ensure_server_down() {
 # Set only by _start_genesis_server's direct-start fallback; never inherited.
 _SERVER_DIRECT_PID=""
 _start_genesis_server() {
-    _qualify_dashboard_loopback || return 1
     # Use `restart` (NOT `start`): systemd's Restart=on-failure can resurrect a
     # STALE-code instance mid-update (a kill-based stop is seen as a failure and
     # arms a RestartSec timer). `start` is a no-op on that already-running instance
@@ -1014,7 +1167,7 @@ _start_genesis_server() {
     # command. The subshell execs, so $! is the server's pid.
     (
         if [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ]; then exec {GENESIS_CHECKOUT_LOCK_FD}>&-; fi
-        exec nohup "$VENV_DIR/bin/python" -m genesis serve --host 127.0.0.1 --port 5000 \
+        exec nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
             {_UPDATE_LOCK_FD}>&-
     ) >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
     # No unit tracks this process, so the no-change path's health probe waits on
@@ -1078,6 +1231,14 @@ if [ -f "$DB_FILE" ]; then
     fi
 fi
 
+# The staged-path guard again, as the last step before the stop: the backups and
+# the database snapshot above can take minutes.
+# BEGIN staged-excused-prestop
+if [[ "$POST_MERGE" == "false" ]]; then
+    _staged_excused_divergence_guard
+fi
+# END staged-excused-prestop
+
 # ── Stop services for update ──────────────────────────────
 echo "--- Stopping services for update ---"
 
@@ -1110,8 +1271,6 @@ for svc in genesis-bridge; do
         WERE_RUNNING+=("$svc")
     fi
 done
-
-_qualify_dashboard_loopback || exit 1
 
 # Now stop them. From here a SIG* runs _on_signal_prestop, which restarts
 # WERE_RUNNING (populated above) — so an interrupt mid-stop restores the server.
@@ -1922,6 +2081,7 @@ if [[ $MERGE_RC -ne 0 ]]; then
         _uc_target_commit="$(git -C "$GENESIS_ROOT" rev-parse --short "$DEPLOY_HEAD" 2>/dev/null || echo 'unknown')"
         if ! UC_OLD_TAG="$OLD_TAG" UC_OLD_COMMIT="$OLD_COMMIT" \
              UC_TARGET_TAG="$_uc_target_tag" UC_TARGET_COMMIT="$_uc_target_commit" \
+             UC_DEPLOY_HEAD="$DEPLOY_HEAD" UC_UPDATE_REMOTE="$UPDATE_REMOTE" \
              UC_FILES="$CONFLICTED_FILES" UC_MERGE_OUTPUT="$MERGE_OUTPUT" \
              "$VENV_DIR/bin/python" - > "$HOME/.genesis/update_conflicts.json.tmp" <<'PYEOF'
 import json
@@ -1935,6 +2095,11 @@ data = {
     "old_commit": os.environ.get("UC_OLD_COMMIT", ""),
     "target_tag": os.environ.get("UC_TARGET_TAG", ""),
     "target_commit": os.environ.get("UC_TARGET_COMMIT", ""),
+    # The FULL commit that conflicted and the remote it came from. A resolver
+    # merges this commit, never "<remote>/main", which may have moved or be a
+    # different remote's branch.
+    "deploy_head": os.environ.get("UC_DEPLOY_HEAD", ""),
+    "update_remote": os.environ.get("UC_UPDATE_REMOTE", ""),
     "conflicted_files": files,
     "merge_output": merge,
     "timestamp": datetime.now(UTC).isoformat(),
@@ -2263,7 +2428,7 @@ _write_state "bootstrap"
 # was stopped above, and the ERR trap is armed here, so a guard refusal would
 # escalate into a full update rollback. The guard must never gate this call.
 echo "--- Running bootstrap ---"
-GENESIS_DASHBOARD_LOOPBACK_QUALIFIED=1 GENESIS_BOOTSTRAP_ALLOW_LIVE=1 "$GENESIS_ROOT/scripts/bootstrap.sh" 2>&1 | tail -10
+GENESIS_BOOTSTRAP_ALLOW_LIVE=1 "$GENESIS_ROOT/scripts/bootstrap.sh" 2>&1 | tail -10
 echo "  Bootstrap complete"
 echo ""
 

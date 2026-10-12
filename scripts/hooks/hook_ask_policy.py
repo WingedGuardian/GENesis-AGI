@@ -42,6 +42,10 @@ plain ``git push`` (e.g. ``git push -u origin HEAD``): no other step of any kind
 ``|``/``&``/newline), no redirection, no subshell, no global option between
 ``git`` and ``push`` (``-C``, ``-c``, ``--git-dir``…), no ``VAR=…`` prefix and no
 wrapper. A chained command still asks — run the first push as its own command.
+Two exceptions, both judged by the push guard's ``_is_single_plain_push``: one
+``-C <path>`` naming the literal, symlink-free top of a worktree of the same
+repository as the session's cwd, and an output-only suffix (``2>&1`` and/or a
+pipe into ``tail``/``head`` with a line count).
 It must also be true that:
 
 * the remote git will really push to (pushRemote > pushDefault >
@@ -80,9 +84,10 @@ deny are all outside the key's reach.
 
 **``push_routine`` is the wider, separate switch** (owner ruling 2026-10-06), for
 an install whose sessions push from linked worktrees (``git -C <path> push``,
-which ``push_publish`` never covers) and chain steps. It silences the push
-guard's ROUTINE prompts: a first push in any spelling, close-then-push, a
-re-push with no open PR off the public repo, and a re-push chained with other
+which ``push_publish`` covers only through the worktree-top ``-C <path>``
+exception above) and chain steps. It silences the push guard's ROUTINE prompts:
+a first push in any spelling, close-then-push, a re-push with no open PR off the
+public repo, and a re-push chained with other
 steps. It applies only when EVERY ask the command raised is one of those and
 every push URL is a github.com https repo of the configured owner
 (``github.user``); a raw URL also needs no ``insteadOf`` rule. A ``gh pr create``
@@ -114,6 +119,23 @@ single plain push; ``push_routine`` deliberately does not. Classified on the rep
 existing ASK, never a new allow or block; audience — the agent (the context note
 names what was silenced); background effect — none, because a dispatched session
 is denied every push before the key is consulted.
+
+**``push_pr_branch`` silences one shape the push guard otherwise always asks
+about** (owner ruling 2026-10-10): ``git push <remote> <cur>:refs/heads/<dst>``,
+how a session updates a pull request's branch from a scratch checkout while that
+branch is checked out in another worktree (git refuses a second checkout of one
+branch). It is its own key so it can be switched on and off independently;
+``push_routine`` does not reach it. It applies only when the source names the
+current branch (a detached HEAD asks), the destination is fully qualified, is
+neither the current branch nor ``main``/``master``/a recorded default branch, has
+an OPEN pull request on this repository targeting the default branch (a failed
+lookup asks), every push URL is a github.com https repo of the configured owner,
+the push config is simple, and no other step in the command can change config
+first. A force push, a delete, a tag, an unqualified destination, every block
+and the dispatched-session deny are unchanged. Classified on the three axes:
+verdict, a narrowing of an existing ASK; audience, the agent (the context note
+names the setting and both branches); background effect, none, since a
+dispatched session is denied every push before the key is consulted.
 
 **``review_request`` silences one prompt of the review-round gate** (owner ruling
 2026-10-07): the ``gh pr comment … @codex review`` request whose review history
@@ -168,6 +190,7 @@ Configuration (all keys optional; absent means ask)::
         secrets_env: off      # the secrets.env credentials prompt
         push_publish: off     # first publish of a branch to the public repo only
         push_routine: off     # the push guard's routine prompts (see above)
+        push_pr_branch: off   # a push onto an open PR's branch from another checkout
         review_request: off   # an @codex review request whose history is unreadable
 
 The value is the ask's ENABLED state, so YAML's own booleans read the right way
@@ -200,7 +223,9 @@ import sys
 #: policy this install declined to use — it is a key nothing classified, so it
 #: can never suppress anything. Adding a member is a deliberate act with a call
 #: site attached; there is no path that grows this set from configuration.
-KEYS = frozenset({"secrets_env", "push_publish", "push_routine", "review_request"})
+KEYS = frozenset({
+    "secrets_env", "push_publish", "push_routine", "push_pr_branch", "review_request",
+})
 
 _CONFIG_PATH = "~/.genesis/config/genesis.yaml"
 _SEAM = "_TEST_HOOK_ASK_POLICY"

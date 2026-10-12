@@ -18,6 +18,8 @@ import logging
 import httpx
 from fastmcp import FastMCP
 
+from genesis.security.card_shapes import contains_card_number
+
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("discord-bot")
@@ -219,7 +221,14 @@ async def send_reply(
         channel_id: Discord channel or thread ID to post in.
         content: Message text (Discord markdown supported).
         reply_to: Message ID to reply to (creates a threaded reply).
+
+    A reply holding a payment card number is refused before any request is
+    sent; the refusal does not echo the number.
     """
+    if contains_card_number(content):
+        return json.dumps(
+            {"error": "send_reply: refused, the message contains a payment card number."}
+        )
     try:
         headers = _headers()
     except RuntimeError as exc:

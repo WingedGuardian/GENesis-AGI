@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 
 import pytest
 
-from genesis.browser.profile import BrowserProfileManager
+from genesis.browser.profile import BrowserProfileManager, ProfileInUse
 from genesis.browser.types import BrowserLayer
 
 
@@ -92,20 +93,106 @@ class TestGetInfo:
 class TestClearDomain:
     def test_clears_specific_domain(self, populated_profile):
         result = populated_profile.clear_domain("github.com")
-        assert result is True
+        assert result == 2
 
         info = populated_profile.get_info()
         domains = {s.domain for s in info.sessions}
         assert "github.com" not in domains
         assert "google.com" in domains
 
-    def test_returns_false_for_nonexistent(self, populated_profile):
-        result = populated_profile.clear_domain("nonexistent.com")
-        assert result is False
+    def test_returns_zero_for_nonexistent(self, populated_profile):
+        assert populated_profile.clear_domain("nonexistent.com") == 0
 
-    def test_no_profile_returns_false(self, manager):
-        result = manager.clear_domain("github.com")
-        assert result is False
+    def test_no_profile_returns_zero(self, manager):
+        assert manager.clear_domain("github.com") == 0
+
+    def test_matches_whole_labels_never_substrings(self, profile_dir):
+        """`x.com` must not clear netflix.com (the LIKE %x.com% bug)."""
+        mgr = _chromium_profile(profile_dir, [
+            ".x.com", "x.com", "api.x.com", ".netflix.com", "box.com", "x.com.evil.example",
+        ])
+        assert mgr.clear_domain("x.com") == 3
+        left = {s.domain for s in mgr.get_info().sessions}
+        assert left == {"netflix.com", "box.com", "x.com.evil.example"}
+
+    def test_rejects_a_non_domain(self, populated_profile):
+        with pytest.raises(ValueError):
+            populated_profile.clear_domain("%")
+        with pytest.raises(ValueError):
+            populated_profile.clear_domain("  ")
+
+    def test_refuses_while_a_browser_has_the_profile_open(self, populated_profile, fake_browser):
+        proc = fake_browser("--user-data-dir=" + str(populated_profile.profile_dir))
+        lock = populated_profile.profile_dir / "SingletonLock"
+        os.symlink(f"somehost-{proc.pid}", lock)
+        with pytest.raises(ProfileInUse):
+            populated_profile.clear_domain("github.com")
+        assert {s.domain for s in populated_profile.get_info().sessions} >= {"github.com"}
+
+    def test_a_stale_lock_from_a_crash_does_not_block(self, populated_profile):
+        os.symlink("somehost-999999999", populated_profile.profile_dir / "SingletonLock")
+        assert populated_profile.running_pid() is None
+        assert populated_profile.clear_domain("github.com") == 2
+
+
+def _chromium_profile(profile_dir, hosts):
+    (profile_dir / "Default").mkdir(parents=True)
+    conn = sqlite3.connect(str(profile_dir / "Default" / "Cookies"))
+    conn.execute("CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, path TEXT, "
+                 "is_secure INTEGER, is_httponly INTEGER)")
+    conn.executemany("INSERT INTO cookies VALUES (?, 'n', 'v', '/', 0, 0)", [(h,) for h in hosts])
+    conn.commit()
+    conn.close()
+    return BrowserProfileManager(profile_dir)
+
+
+def _camoufox_profile(profile_dir, hosts):
+    profile_dir.mkdir(parents=True)
+    conn = sqlite3.connect(str(profile_dir / "cookies.sqlite"))
+    conn.execute("PRAGMA journal_mode=wal")
+    conn.execute(
+        "CREATE TABLE moz_cookies (id INTEGER PRIMARY KEY, name TEXT, value TEXT, host TEXT, path TEXT)"
+    )
+    conn.executemany(
+        "INSERT INTO moz_cookies (name, value, host, path) VALUES ('n', 'v', ?, '/')",
+        [(h,) for h in hosts],
+    )
+    conn.commit()
+    conn.close()
+    return BrowserProfileManager(profile_dir, browser="camoufox")
+
+
+class TestCamoufoxProfile:
+    def test_lists_firefox_cookies(self, tmp_path):
+        mgr = _camoufox_profile(
+            tmp_path / "camoufox-profile", [".github.com", "github.com", ".medium.com"]
+        )
+        info = mgr.get_info()
+        assert info.browser == "camoufox"
+        assert {(s.domain, s.cookie_count) for s in info.sessions} == {
+            ("github.com", 2), ("medium.com", 1),
+        }
+
+    def test_clears_firefox_cookies_with_a_count(self, tmp_path):
+        mgr = _camoufox_profile(tmp_path / "camoufox-profile", [".x.com", "api.x.com", ".netflix.com"])
+        assert mgr.clear_domain("x.com") == 2
+        assert {s.domain for s in mgr.get_info().sessions} == {"netflix.com"}
+
+    def test_firefox_lock_link_marks_the_profile_in_use(self, tmp_path, fake_browser):
+        mgr = _camoufox_profile(tmp_path / "camoufox-profile", [".x.com"])
+        proc = fake_browser("-profile", str(mgr.profile_dir))
+        os.symlink(f"127.0.1.1:+{proc.pid}", mgr.profile_dir / "lock")
+        assert mgr.running_pid() == proc.pid
+        with pytest.raises(ProfileInUse):
+            mgr.clear_domain("x.com")
+
+    def test_an_unreadable_store_is_reported_not_empty(self, tmp_path):
+        d = tmp_path / "camoufox-profile"
+        d.mkdir()
+        (d / "cookies.sqlite").write_bytes(b"not a database" * 100)
+        info = BrowserProfileManager(d, browser="camoufox").get_info()
+        assert info.sessions == []
+        assert "unreadable" in info.error
 
 
 class TestExportState:
@@ -170,3 +257,97 @@ class TestBrowserLayerEnum:
         ).read_text()
         for n, name in enumerate(("Camoufox", "Chromium", "CDP remote", "TinyFish"), 1):
             assert f"# Layer {n}: {name}" in src, (n, name)
+
+
+@pytest.fixture
+def fake_browser():
+    """A live process whose argv names a profile, as Playwright launches the
+    real browsers (Firefox `-profile <dir>`, Chromium `--user-data-dir=<dir>`)."""
+    import subprocess
+    import sys
+
+    procs = []
+
+    def start(*argv):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)", *argv]
+        )
+        procs.append(proc)
+        return proc
+
+    yield start
+    for proc in procs:
+        proc.kill()
+        proc.wait()
+
+
+def test_a_reused_pid_is_not_mistaken_for_the_browser(tmp_path):
+    """A browser leaves its lock link behind; the OS can hand its pid to an
+    unrelated process. Only a process whose argv names this profile counts."""
+    mgr = _camoufox_profile(tmp_path / "camoufox-profile", [".x.com"])
+    os.symlink(f"127.0.1.1:+{os.getpid()}", mgr.profile_dir / "lock")  # pytest: not a browser
+    assert mgr.running_pid() is None
+    assert mgr.clear_domain("x.com") == 1
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("--output={dir}-backup",),  # a path that merely CONTAINS the profile
+        ("--user-data-dir={dir}-alt",),  # a sibling profile
+        ("-profile", "{dir}/sub"),  # a directory inside it
+        ("{dir}",),  # the path as a bare operand, not a profile flag
+    ],
+)
+def test_a_reused_pid_naming_another_path_is_not_the_browser(tmp_path, fake_browser, argv):
+    """A stale lock's pid reused by a process whose argv merely CONTAINS the
+    profile path is not that browser; only the profile flag's exact value is."""
+    mgr = _camoufox_profile(tmp_path / "camoufox-profile", [".x.com"])
+    proc = fake_browser(*(a.format(dir=mgr.profile_dir) for a in argv))
+    os.symlink(f"127.0.1.1:+{proc.pid}", mgr.profile_dir / "lock")
+    assert mgr.running_pid() is None
+    assert mgr.clear_domain("x.com") == 1
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("-profile", "{dir}"),
+        ("--profile", "{dir}"),
+        ("--user-data-dir={dir}",),
+        ("--user-data-dir", "{dir}"),
+        ("-profile", "{dir}/"),  # same directory, trailing slash
+    ],
+)
+def test_the_profile_flag_with_this_directory_is_the_browser(tmp_path, fake_browser, argv):
+    mgr = _camoufox_profile(tmp_path / "camoufox-profile", [".x.com"])
+    proc = fake_browser(*(a.format(dir=mgr.profile_dir) for a in argv))
+    os.symlink(f"127.0.1.1:+{proc.pid}", mgr.profile_dir / "lock")
+    assert mgr.running_pid() == proc.pid
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("/pw/chrome --no-sandbox --user-data-dir={dir} --noerrdialogs", True),
+        ("/pw/chrome --no-sandbox --user-data-dir={dir}", True),
+        ("/pw/chrome --no-sandbox --user-data-dir={dir}-alt --noerrdialogs", False),
+        ("/pw/chrome --output={dir} --noerrdialogs", False),
+    ],
+)
+def test_a_chromium_process_title_is_read_as_its_flags(tmp_path, monkeypatch, title, expected):
+    """Reviewer (round 2): on Linux Chromium rewrites its argv into ONE
+    space-joined process title, so /proc/<pid>/cmdline has a single NUL-ended
+    string. Per-token parsing missed --user-data-dir there and the guard
+    failed open for a live Chromium."""
+    from pathlib import Path
+
+    mgr = _chromium_profile(tmp_path / "browser-profile", [".x.com"])
+    raw = (title.format(dir=mgr.profile_dir) + "\0").encode()
+    real_read = Path.read_bytes
+    monkeypatch.setattr(
+        Path, "read_bytes",
+        lambda self: raw if str(self) == "/proc/4242/cmdline" else real_read(self),
+    )
+    assert mgr._pid_uses_profile(4242) is expected
+

@@ -173,6 +173,38 @@ class TestProbeIcmpReachable:
         assert result.alive is False
         assert mock.call_count() == 2
 
+    @pytest.mark.asyncio
+    async def test_empty_address_is_detected_before_ping(self) -> None:
+        """The shipped config leaves container_ip empty; ping needs a real target."""
+        config = GuardianConfig()
+        seen: list[tuple] = []
+
+        async def record(*args, **kwargs):
+            seen.append(args)
+            return (0, "1 packet received", "")
+
+        with (
+            patch.object(GuardianConfig, "_detect_container_ip", return_value="192.0.2.7"),
+            patch("genesis.guardian.health_signals._run_subprocess", record),
+        ):
+            result = await probe_icmp_reachable(config)
+        assert result.alive is True
+        assert seen and seen[0][-1] == "192.0.2.7"
+
+    @pytest.mark.asyncio
+    async def test_failed_detection_reports_without_pinging(self) -> None:
+        """Detection falls back to loopback; pinging that would prove nothing."""
+        config = GuardianConfig()
+        mock = _mock_subprocess_sequence([])
+        with (
+            patch.object(GuardianConfig, "_detect_container_ip", return_value="127.0.0.1"),
+            patch("genesis.guardian.health_signals._run_subprocess", mock),
+        ):
+            result = await probe_icmp_reachable(config)
+        assert result.alive is False
+        assert "auto-detection failed" in result.detail
+        assert mock.call_count() == 0
+
 
 # ── Health API Probe ────────────────────────────────────────────────────
 
