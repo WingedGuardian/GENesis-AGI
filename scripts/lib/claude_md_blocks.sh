@@ -68,12 +68,77 @@ build_network_identity_block() {
 # with stdin wrapped in fresh markers. Appends at EOF, matching the
 # long-standing writer behavior (block position in the file is not
 # preserved; readers key on the markers, not the position).
+#
+# A marker is a WHOLE line (surrounding whitespace and a CR ignored). Every
+# well-formed begin..end pair is removed before the fresh block is appended,
+# so a duplicated block heals itself. A begin with no end, an end with no
+# begin, or a begin inside an open block leaves the file UNTOUCHED, prints
+# the shape and line numbers on stderr and returns 1. The sed range this
+# replaces deleted everything from an unmatched begin to the end of the
+# file, the user's own notes included.
+#
+# The same rule lives in src/genesis/infra_profile/claude_md.py (one fixture
+# table, tests/test_scripts/test_claude_md_blocks.py, drives both).
+# host-setup.sh ships this function into the container with `declare -f`,
+# so it may call commands only, never other functions of this file.
 write_sentinel_block() {
-    local file="$1" name="$2"
-    sed -i "/<!-- begin:${name} -->/,/<!-- end:${name} -->/d" "$file"
+    local file="$1" name="$2" body dir tmp rc
+    # Read all of stdin first: a refusal must not SIGPIPE the producer.
+    body=$(cat; printf x)
+    body=${body%x}
+    if [ -n "$body" ] && [ "${body: -1}" != $'\n' ]; then
+        body+=$'\n'
+    fi
+    dir=$(dirname -- "$file")
+    tmp=$(mktemp "$dir/.claude-md-block.XXXXXX") || return 1
+    rc=0
+    if [ -e "$file" ]; then
+        # ENVIRON, not -v: -v processes backslash escapes in the value.
+        # Exit 3 = unbalanced markers; any other failure is not a marker problem.
+        _SENTINEL_NAME="$name" LC_ALL=C awk '
+            BEGIN {
+                name = ENVIRON["_SENTINEL_NAME"]
+                b = "<!-- begin:" name " -->"; e = "<!-- end:" name " -->"; open = 0
+            }
+            {
+                t = $0
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", t)
+                if (t == b) {
+                    if (open) { bad = "a second begin at line " NR " inside the block opened at line " start; exit 3 }
+                    open = 1; start = NR; next
+                }
+                if (t == e) {
+                    if (!open) { bad = "an end at line " NR " with no begin before it"; exit 3 }
+                    open = 0; next
+                }
+                if (!open) print
+            }
+            END {
+                if (bad == "" && open) bad = "the begin at line " start " has no end"
+                if (bad != "") { print bad > "/dev/stderr"; exit 3 }
+            }
+        ' "$file" > "$tmp" 2> "$tmp.err" || rc=$?
+    fi
+    if [ "$rc" -eq 3 ]; then
+        echo "CLAUDE.md block '$name' left unchanged in $file: $(cat "$tmp.err" 2>/dev/null)." \
+            "Each <!-- begin:$name --> needs one <!-- end:$name --> on a later line;" \
+            "fix the markers by hand and re-run." >&2
+        rm -f "$tmp" "$tmp.err"
+        return 1
+    elif [ "$rc" -ne 0 ]; then
+        echo "CLAUDE.md block '$name' left unchanged: could not read $file" \
+            "($(cat "$tmp.err" 2>/dev/null))." >&2
+        rm -f "$tmp" "$tmp.err"
+        return 1
+    fi
+    rm -f "$tmp.err"
     {
-        echo "<!-- begin:${name} -->"
-        cat
-        echo "<!-- end:${name} -->"
-    } >> "$file"
+        printf '%s\n' "<!-- begin:${name} -->"
+        printf '%s' "$body"
+        printf '%s\n' "<!-- end:${name} -->"
+    } >> "$tmp"
+    if [ -e "$file" ]; then
+        chmod --reference="$file" "$tmp" 2>/dev/null || true
+    fi
+    mv -f "$tmp" "$file"
 }

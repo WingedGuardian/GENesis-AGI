@@ -3457,6 +3457,12 @@ verified: ba9dd8a37 2026-10-09
   MCP tool (facts-only refresh cross-process, flock-guarded) + sentinel digest
   + the user-CLAUDE.md `container-specs` block (content owner:
   `infra_profile/claude_md.py`; update.sh invokes `--claude-md-block`).
+  All three CLAUDE.md block writers (this one, `write_sentinel_block` in
+  `scripts/lib/claude_md_blocks.sh`, and host-setup.sh, which ships that
+  function into the container) share one rule, pinned by one fixture table in
+  `tests/test_scripts/test_claude_md_blocks.py`: a marker is a whole line,
+  duplicate well-formed blocks collapse to one, and unbalanced markers leave the
+  file untouched with the reason printed (the CLI exits 1).
   Distinct from `observability/snapshots/infrastructure.py` (dynamic health) —
   don't merge them. Memory-resilience invariants are first-class facts:
   container `cgroup_memory_swap_max` (tri-state — "0" IS the 2026-07 wedge
