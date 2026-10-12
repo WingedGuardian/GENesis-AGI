@@ -1056,4 +1056,8 @@ jobs:
         # tests/test_scripts/test_codebase_managed_config.py +1,
         # tests/test_scripts/test_session_doors.py +6. No added skips.
         # Floor: 25687 + 1 + 3 + 1 + 6 = 25698.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25698
+        # smb backend refuses unsafe names (#3222): the two changed test files
+        # collect 71 here and 57 on origin/main, measured with
+        # --collect-only: test_backup_backends.py 7 -> 20, test_backup_dated_snapshots.py
+        # 50 -> 51 (+14). No added skips. Floor: 25698 + 14 = 25712.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25712
