@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import json
+import logging
 import math
 import os
 import shutil
@@ -33,9 +35,13 @@ from pathlib import Path
 
 from genesis.browser import chromium, engine, packages
 from genesis.browser.types import BROWSER_PGREP_PATTERNS
+from genesis.env import genesis_home
 from genesis.hostmetrics.readings import disk_device
+from genesis.util.atomic import atomic_write_text
 from genesis.util.disk_headroom import effective_free_bytes
 from genesis.util.tmp import big_tmp_dir
+
+logger = logging.getLogger(__name__)
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
@@ -320,6 +326,7 @@ def _under_browsers(path: Path | None) -> bool:
 def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.EngineStatus]:
     status = engine.resolve_camoufox_engine()
     if status.ready:
+        _forget_failed_fetches()
         return status.detail, True, status
     if status.kind in (engine.NO_PACKAGE, engine.PLAYWRIGHT_MISSING):
         notes.append(status.detail)
@@ -357,11 +364,11 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
                 chmodded = True
             elif fetched:
                 break  # a fresh fetch is still invalid: deleting it again would not help
-            elif _installed_recently(directory):
-                # An earlier run fetched it and it is still invalid: fetching it
-                # again daily (the timer) would repeat a 1.3 GB download forever.
+            elif _fetched_invalid_recently(directory):
+                # A run of ours fetched it and it stayed invalid: fetching it again
+                # daily (the timer) would repeat a 1.3 GB download forever.
                 notes.append(
-                    f"{directory} was installed in the last {_RECENT_DAYS} days and is still "
+                    f"{directory} was fetched in the last {_RECENT_DAYS} days and stayed "
                     "invalid, so it is not downloaded again; remove it by hand to retry"
                 )
                 break
@@ -380,6 +387,7 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
             break
         status = engine.resolve_camoufox_engine()
         if status.ready:
+            _forget_failed_fetches()
             notes.append(
                 "the browser_automation capability reflects this at the next genesis-server restart"
             )
@@ -387,20 +395,52 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
     notes.append(status.detail)
     if status.kind == engine.NOT_INSTALLED:
         return "missing", False, status
+    if fetched and status.kind == engine.INVALID and _under_browsers(status.path):
+        _record_failed_fetch(status.path.parent)
     return ("invalid (after fetch)" if fetched else "invalid"), False, status
 
 
 _RECENT_DAYS = 7
 
 
-def _installed_recently(directory: Path) -> bool:
-    """Whether camoufox wrote the directory's version.json (its installer's record
-    of a completed extract) within the last week; unreadable reads as no."""
+def _failed_fetches_path() -> Path:
+    return genesis_home() / "state" / "browser-stack-failed-fetches.json"
+
+
+def _failed_fetches() -> dict[str, float]:
+    """{engine directory: when a fetch of ours left it invalid}. Unreadable reads as
+    none: the worst that costs is one more fetch."""
     try:
-        age = time.time() - (directory / "version.json").stat().st_mtime
-    except OSError:
-        return False
-    return age < _RECENT_DAYS * 86400
+        data = json.loads(_failed_fetches_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, int | float)}
+
+
+def _fetched_invalid_recently(directory: Path) -> bool:
+    """Whether a fetch of ours left ``directory`` invalid within the last week. Not
+    the age of its version.json: that says the install completed, and an engine
+    damaged since (files removed) needs the repair."""
+    when = _failed_fetches().get(str(directory))
+    return when is not None and time.time() - when < _RECENT_DAYS * 86400
+
+
+def _record_failed_fetch(directory: Path) -> None:
+    record = {**_failed_fetches(), str(directory): time.time()}
+    try:
+        _failed_fetches_path().parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(_failed_fetches_path(), json.dumps(record))
+    except OSError as exc:
+        logger.warning("could not record the failed fetch of %s: %s", directory, exc)
+
+
+def _forget_failed_fetches() -> None:
+    try:
+        _failed_fetches_path().unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("could not clear %s: %s", _failed_fetches_path(), exc)
 
 
 def _chmod_tree(directory: Path) -> None:

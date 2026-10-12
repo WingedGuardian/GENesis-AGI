@@ -242,23 +242,73 @@ def test_corrupt_pinned_dir_is_removed_then_fetched(env, monkeypatch):
     assert len(run.ran("camoufox fetch")) == 1 and out.ok
 
 
-@pytest.mark.parametrize(("age_days", "replaced"), [(1, False), (8, True)])
-def test_an_engine_fetched_this_week_is_not_downloaded_again(env, monkeypatch, age_days, replaced):
-    """The daily timer would otherwise repeat one run's delete-and-fetch every day
-    for an engine that installs invalid by Genesis's checks: 1.3 GB a day."""
+def _bad_engine(env, *, age_days=1):
     bad = env / "xdg" / "camoufox" / "browsers" / "official" / "156.0.1-beta.36-abc"
     bad.mkdir(parents=True)
     (bad / "version.json").write_text("{}")
     then = time.time() - age_days * 86400
     os.utime(bad / "version.json", (then, then))
-    invalid = engine.EngineStatus(engine.INVALID, "corrupt", bad / "camoufox-bin")
+    return bad, engine.EngineStatus(engine.INVALID, "corrupt", bad / "camoufox-bin")
+
+
+def test_an_engine_damaged_after_a_good_install_is_repaired(env, monkeypatch):
+    """A recent version.json says the install completed, not that the engine is
+    still whole: one damaged since (files removed) is repaired, not left a week."""
+    bad, invalid = _bad_engine(env, age_days=1)
     _resolves(monkeypatch, invalid, READY)
     run = Runner()
     out = provision.provision(run)
-    assert (provision._removed == [bad]) is replaced
-    assert len(run.ran("camoufox fetch")) == (1 if replaced else 0)
-    if not replaced:
-        assert not out.ok and any("remove it by hand" in n for n in out.notes)
+    assert provision._removed == [bad] and len(run.ran("camoufox fetch")) == 1
+    assert out.ok
+
+
+def test_after_a_fetch_that_stays_invalid_the_next_runs_do_not_fetch(env, monkeypatch):
+    """The daily timer would otherwise repeat a delete and a 1.3 GB fetch every day
+    for an engine that installs invalid by Genesis's checks."""
+    bad, invalid = _bad_engine(env)
+    _resolves(monkeypatch, invalid)
+    first = provision.provision(Runner())
+    assert "engine=invalid (after fetch)" in first.line()
+    provision._removed.clear()
+    run = Runner()
+    out = provision.provision(run)
+    assert run.ran("camoufox fetch") == [] and provision._removed == []
+    assert not out.ok and any("remove it by hand" in n for n in out.notes)
+
+
+def test_a_failed_fetch_is_retried_after_a_week(env, monkeypatch):
+    bad, invalid = _bad_engine(env)
+    _resolves(monkeypatch, invalid)
+    provision.provision(Runner())
+    real = time.time
+    monkeypatch.setattr(provision.time, "time", lambda: real() + 8 * 86400)
+    run = Runner()
+    provision.provision(run)
+    assert len(run.ran("camoufox fetch")) == 1
+
+
+def test_a_ready_engine_clears_the_failed_fetch_record(env, monkeypatch):
+    bad, invalid = _bad_engine(env)
+    _resolves(monkeypatch, invalid)
+    provision.provision(Runner())
+    _resolves(monkeypatch, READY)
+    provision.provision(Runner())
+    _resolves(monkeypatch, invalid, READY)
+    run = Runner()
+    provision.provision(run)
+    assert len(run.ran("camoufox fetch")) == 1  # damaged again later: repaired
+
+
+@pytest.mark.parametrize("content", ["not json", "[]", '{"x": "y"}'])
+def test_an_unreadable_record_does_not_stop_a_repair(env, monkeypatch, content):
+    record = provision._failed_fetches_path()
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(content)
+    bad, invalid = _bad_engine(env)
+    _resolves(monkeypatch, invalid, READY)
+    run = Runner()
+    provision.provision(run)
+    assert len(run.ran("camoufox fetch")) == 1
 
 
 def test_a_fresh_fetch_that_stays_invalid_is_not_deleted_again(env, monkeypatch):
