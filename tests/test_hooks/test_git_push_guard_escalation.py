@@ -339,6 +339,11 @@ def test_shell_expanded_body_cannot_claim_confirmation_exemption(monkeypatch):
         'git commit -m "fix"',
         "gh pr create --head feat/x --title x --body x",
         "gh pr close 1372 --repo owner/repo",
+        "gh api -X PATCH repos/o/r/pulls/5 -f state=closed",
+        (
+            'gh api graphql -f \'query=mutation { closePullRequest(input:{pullRequestId:"x"}) '
+            "{ clientMutationId } }'"
+        ),
     ],
 )
 def test_review_approval_cannot_cover_another_gated_action(monkeypatch, capsys, other):
@@ -347,6 +352,82 @@ def test_review_approval_cannot_cover_another_gated_action(monkeypatch, capsys, 
     _payload(monkeypatch, command)
     assert _mod.main() == 2
     assert "review request separately" in capsys.readouterr().err
+
+
+def test_review_approval_plus_unlisted_get_is_refused(monkeypatch, capsys):
+    _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:4]])
+    _payload(monkeypatch, f"{TRIGGER} && gh api repos/o/r/pulls/5")
+    assert _mod.main() == 2
+    assert "review request separately" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        "gh api graphql -f query='mutation{updatePullRequest(input:{pullRequestId:\"X\",state:CLOSED}){clientMutationId}}'",
+        "gh api graphql -F query=@q.graphql",
+        "gh api repos/o/r/pulls/5 -X PATCH --input body.json",
+        "gh api 'repos/o/r/pulls/5#x' -X PATCH -f state=closed",
+        "gh issue close 5",
+        "echo x",
+        "python3 -c 'print(1)'",
+        "git rev-parse HEAD",
+    ],
+    ids=[
+        "graphql-mutation-with-other-name",
+        "graphql-query-from-file",
+        "rest-body-from-file",
+        "rest-endpoint-fragment",
+        "issue-close",
+        "echo",
+        "python",
+        "git-rev-parse",
+    ],
+)
+def test_review_approval_blocks_unlisted_compound_steps(monkeypatch, capsys, other):
+    _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:4]])
+    _payload(monkeypatch, f"{TRIGGER} && {other}")
+    assert _mod.main() == 2
+    reason = capsys.readouterr().err
+    if other == "gh api graphql -F query=@q.graphql":
+        assert "BLOCKED: a GraphQL request" in reason
+    else:
+        assert "review request separately" in reason
+
+
+@pytest.mark.parametrize(
+    ("other", "before"),
+    [
+        ("cd {wt}", True),
+        ("sleep 600;", False),
+        ("gh pr checks 5", False),
+        ("gh pr view 5", False),
+        ("git status", False),
+        ("git -C {wt} log -1", True),
+    ],
+    ids=["cd", "sleep", "gh-pr-checks", "gh-pr-view", "git-status", "git-c-log"],
+)
+def test_review_approval_allows_inert_neighbors(monkeypatch, capsys, tmp_path, other, before):
+    _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:4]])
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    other = other.format(wt=wt)
+    command = f"{other} && {TRIGGER}" if before else f"{TRIGGER} && {other}"
+    _payload(monkeypatch, command)
+    assert _mod.main() == 0
+    assert "review request separately" not in capsys.readouterr().err
+
+
+def test_close_neighbor_message_names_the_pull_request_close(monkeypatch, capsys):
+    _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:4]])
+    _payload(monkeypatch, f"gh pr close 5 && {TRIGGER}")
+    assert _mod.main() == 2
+    message = capsys.readouterr().err
+    assert "closes a pull request (`gh pr close`)" in message
+    assert (
+        "Run the review request separately so one approval cannot authorize multiple actions."
+        in message
+    )
 
 
 @pytest.mark.parametrize(

@@ -484,18 +484,14 @@ def test_the_probe_sees_an_armed_deadline_on_the_push_path(
 def test_a_pr_close_in_the_same_command_cancels_the_silent_allow(
     monkeypatch, tmp_path, capsys
 ) -> None:
-    """`gh pr close <n> && git push` reads a state the command is about to void.
-
-    The hook runs before any segment executes, so the count sees the PR still
-    open and keeps the re-push allow — then the command closes it and pushes
-    into exactly the PR-less, CI-less state the ask exists to report. A count
-    cannot see a close that has not happened, so the command's SHAPE has to.
+    """Close detection is message only; the decision was already an ask via
+    `_push_compound_is_inert`.
     """
     fake = FakeRun()
     monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
     monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
     monkeypatch.setattr(gpg, "push_allowlist", None)
-    # A still-open PR: the ONLY reason to ask here is the close in the command.
+    # A still-open PR isolates the non-inert compound neighbor as the ask.
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 1)
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
 
@@ -504,6 +500,70 @@ def test_a_pr_close_in_the_same_command_cancels_the_silent_allow(
         command="gh pr close 123 && git push",
     )
     assert rc == 0
+    doc = json.loads(out)
+    reason = doc["hookSpecificOutput"]["permissionDecisionReason"]
+    assert doc["hookSpecificOutput"]["permissionDecision"] == "ask", out
+    assert "CLOSES a pull request" in reason, reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api -X PATCH repos/o/r/pulls/123 -f state=closed && git push",
+        "gh api --method=PATCH repos/o/r/pulls/123 --field state=closed && git push",
+        (
+            "gh api graphql -f 'query=mutation { closePullRequest(input:{pullRequestId:\"x\"}) "
+            "{ clientMutationId } }' && git push"
+        ),
+        "gh api -X PATCH repos/o/r/issues/123 -f state=closed && git push",
+    ],
+)
+def test_a_pr_close_by_other_spelling_still_cancels_the_silent_allow(
+    monkeypatch, tmp_path, capsys, command
+) -> None:
+    """Close detection is message only; the decision was already an ask via
+    `_push_compound_is_inert`.
+    """
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 1)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(
+        monkeypatch, tmp_path, fake, capsys, command=command
+    )
+    assert rc == 0, (command, rc, out, err)
+    doc = json.loads(out)
+    reason = doc["hookSpecificOutput"]["permissionDecisionReason"]
+    assert doc["hookSpecificOutput"]["permissionDecision"] == "ask", (command, out)
+    assert "CLOSES a pull request" in reason, (command, reason)
+
+
+def test_api_close_short_circuits_repush_pr_lookup(monkeypatch, tmp_path, capsys) -> None:
+    """Close detection is message only; the decision was already an ask via
+    `_push_compound_is_inert`.
+    """
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_remote_push_urls", lambda *a, **k: set())
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    def pr_count_must_not_run(*a, **k):
+        raise AssertionError("a close compound must skip the open-PR lookup")
+
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", pr_count_must_not_run)
+
+    rc, out, err = _run_guard_on_push(
+        monkeypatch,
+        tmp_path,
+        fake,
+        capsys,
+        command="gh api -X PATCH repos/o/r/pulls/5 -f state=closed && git push",
+    )
+    assert rc == 0, (rc, out, err)
     doc = json.loads(out)
     reason = doc["hookSpecificOutput"]["permissionDecisionReason"]
     assert doc["hookSpecificOutput"]["permissionDecision"] == "ask", out

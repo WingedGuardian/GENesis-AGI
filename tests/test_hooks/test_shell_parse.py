@@ -19,6 +19,7 @@ import pytest
 
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 sys.path.insert(0, str(_SCRIPTS / "hooks"))
+import pr_close_predicate as pcp  # noqa: E402
 import shell_parse as sp  # noqa: E402
 
 NV = "--no" + "-verify"  # keep the literal out of this file's own text
@@ -1472,8 +1473,6 @@ def test_sh_carries_the_union_because_the_allowlist_is_keyed_on_a_basename():
     # basename really does identify the binary.
     assert "h" not in sp._C_BUNDLE_OPTIONS["dash"]
     assert "git" not in [seg.exe for seg in sp.analyze("dash -ch 'git push origin main'")]
-
-
 @pytest.mark.parametrize(
     ("argv", "method", "endpoint"),
     [
@@ -1502,3 +1501,135 @@ def test_gh_api_request_is_none_off_the_api_group() -> None:
     assert sp.gh_api_request(["gh", "workflow", "run", "api"]) is None
     assert sp.gh_api_request(["gh", "pr", "view", "5"]) is None
     assert sp.gh_api_request(["git", "push"]) is None
+class TestPrCloseReason:
+    @pytest.mark.parametrize(
+        ("argv", "reason"),
+        [
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-separated-field",
+            ),
+            pytest.param(
+                [
+                    "gh",
+                    "api",
+                    "--method",
+                    "PATCH",
+                    "repos/o/r/pulls/5",
+                    "--raw-field",
+                    "state=closed",
+                ],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-long-separated-values",
+            ),
+            pytest.param(
+                ["gh", "api", "-XPATCH", "repos/o/r/pulls/5", "-fstate=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-glued-values",
+            ),
+            pytest.param(
+                ["gh", "api", "--method=PATCH", "repos/o/r/pulls/5", "--field=state=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-long-glued-values",
+            ),
+            pytest.param(
+                ["gh", "api", "-f", "state=closed", "-X", "PATCH", "repos/o/r/pulls/5"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-fields-before-method",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "patch", "repos/o/r/pulls/5", "-f", "state=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-method-case-insensitive",
+            ),
+            pytest.param(
+                ["/usr/bin/gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-absolute-gh",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-F", "state=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-typed-field",
+            ),
+            pytest.param(["gh", "pr", "close", "5"], "`gh pr close`", id="gh-pr-close"),
+            pytest.param(
+                # Deliberate safe-side over-match; this placement is not relied on.
+                ["gh", "-R", "o/r", "pr", "close", "5"],
+                "`gh pr close`",
+                id="gh-pr-close-separated-repo",
+            ),
+            pytest.param(
+                [
+                    "gh",
+                    "api",
+                    "graphql",
+                    "-f",
+                    'query=mutation { closePullRequest(input:{pullRequestId:"x"}) { clientMutationId } }',
+                ],
+                "a `closePullRequest` GraphQL mutation",
+                id="graphql-close-mutation",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "repos/o/r/issues/5", "-f", "state=closed"],
+                "a REST `state=closed` PATCH to an issue-or-pull-request endpoint",
+                id="rest-issues-endpoint",
+            ),
+            pytest.param(
+                ["gh", "--repo", "api", "pr", "close", "5"],
+                "`gh pr close`",
+                id="gh-repo-value-before-pr-close",
+            ),
+        ],
+    )
+    def test_text_visible_closes_have_reasons(self, argv, reason):
+        assert pcp.pr_close_reason(argv) == reason
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            pytest.param(
+                ["gh", "api", "repos/o/r/pulls/5", "-f", "state=closed"],
+                id="rest-default-post",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "POST", "repos/o/r/pulls/5", "-f", "state=closed"],
+                id="rest-post",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "DELETE", "repos/o/r/pulls/5", "-f", "state=closed"],
+                id="rest-delete",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=open"],
+                id="rest-open",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=draft"],
+                id="rest-draft",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "pulls", "-f", "state=closed"],
+                id="rest-incomplete-path",
+            ),
+            pytest.param(["gh", "repo", "view", "o/r"], id="not-api"),
+            pytest.param(
+                ["git", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=closed"],
+                id="not-gh",
+            ),
+            pytest.param(["gh", "pr", "close", "5", "--help"], id="terminal-help"),
+            pytest.param(
+                [
+                    "gh",
+                    "api",
+                    "graphql",
+                    "-f",
+                    'query=query { closePullRequest(input:{pullRequestId:"x"}) { clientMutationId } }',
+                ],
+                id="graphql-name-without-mutation",
+            ),
+        ],
+    )
+    def test_non_closes_have_no_reason(self, argv):
+        assert pcp.pr_close_reason(argv) is None

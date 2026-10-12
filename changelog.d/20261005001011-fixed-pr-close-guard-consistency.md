@@ -1,0 +1,1 @@
+- Review-request compounds now allow only inert neighbors (`cd`, `sleep`, read-only `gh pr view/checks`, and `git status/log`); other steps are refused. A close predicate may name a pull-request close in the refusal message, but never decides whether the compound is refused.
