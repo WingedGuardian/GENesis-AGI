@@ -151,7 +151,8 @@ check that the reflection restates what you concluded. The rules:
   parentheses (`P3 FALSE (partially) — …`); the verdict word is still the one read.
   A claim line with its verdict at the end is refused.
 - The `Expected before checking:` line is required: one line, directly under the
-  verdict line (a summary that restates your block need not repeat it). The claim lines follow it. One line per claim: do not wrap a claim
+  verdict line. If you restate your block in a summary, the Expected line may sit
+  in either one, as long as that block also has claim lines. The claim lines follow it. One line per claim: do not wrap a claim
   line.
 - The block is closed. From the verdict line to the next blank line, every line
   must be one of the block's lines: the verdict, the Expected line, the claims,

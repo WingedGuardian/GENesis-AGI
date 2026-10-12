@@ -41,8 +41,13 @@ committed; a relative path is read from the repository the check runs in.
 Cite a copy that nothing else rewrites (``<pr>-round<N>-<kind>.txt``), never
 the review gate's per-worktree evidence file, which the next review replaces.
 A premise-evidence file must carry the canonical ``Design-premise:`` block of
-``.claude/docs/premise-check.md``: the verdict line at column 0 and at least
-two ``P<n> <verdict>`` claim lines directly under it, verdict first. Each of
+``.claude/docs/premise-check.md``: the verdict line at column 0, the
+``Expected before checking:`` line directly under it, at least two distinct
+``P<n> <verdict>`` claim lines in an unbroken run, verdict first, and then
+only ``Effect:``, ``Better shape:``, ``PR-shape:``, ``Persisted-state:`` or
+code-fence lines until a blank line or the next ``Design-premise:`` line (the
+block's paragraph is closed). At least one block that has claims must carry
+the Expected line. Each of
 the PR's acceptance points must appear within one Scope line that starts
 ``covered:``; that is a substring floor for an honest session, not proof
 that the line covers the point.
@@ -649,7 +654,7 @@ def premise_block(text: str) -> tuple[str | None, dict[str, str], str | None]:
                     "is not one of its lines: a claim "
                     "'P<n> TRUE|FALSE|UNPROVEN — <claim>' (one line, not wrapped), the "
                     "Expected line directly under the verdict, Effect:, Better shape:, "
-                    "PR-shape: or a code fence. Leave a blank line before any other text"
+                    "PR-shape:, Persisted-state: or a code fence. Leave a blank line before any other text"
                 )
             j += 1
         has_expected = has_expected or (expected_here and bool(run))
