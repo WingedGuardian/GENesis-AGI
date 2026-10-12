@@ -33,7 +33,8 @@ _COPY = re.compile(
     rf"^(?P<profile>{'|'.join(PROFILES)})\.pre-(?P<label>{_LABEL})-\d{{8}}T\d{{6}}(?:-\d+)?$"
 )
 _UNFINISHED = re.compile(
-    rf"^(?:{'|'.join(PROFILES)})\.pre-{_LABEL}-\d{{8}}T\d{{6}}(?:-\d+)?\.[^/]+\.tmp$"
+    # TemporaryDirectory's random part: letters, digits and underscores only.
+    rf"^(?:{'|'.join(PROFILES)})\.pre-{_LABEL}-\d{{8}}T\d{{6}}(?:-\d+)?\.[a-z0-9_]+\.tmp$"
 )
 
 DAY = 86400
@@ -57,11 +58,11 @@ def doomed(base: Path, now: float) -> list[Path]:
         except OSError:
             continue
         name = entry.name
-        if _UNFINISHED.match(name):
+        if _UNFINISHED.fullmatch(name):
             if now - mtime > UNFINISHED_DAYS * DAY:
                 out.append(entry)
             continue
-        m = _COPY.match(name)
+        m = _COPY.fullmatch(name)
         if m:
             copies[m["profile"]].append((mtime, m["label"], entry))
     for found in copies.values():

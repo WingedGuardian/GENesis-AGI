@@ -159,7 +159,9 @@ The public repo (`GENesis-AGI`) is the primary repo, so there is no separate
 "strip and stage" step. Leak protection is enforced on every PR by the
 `leak-detector` job in `.github/workflows/ci.yml` (detect-secrets + gitleaks
 with the repo's `.gitleaks.toml` PII/infrastructure rules + portability
-+ email scans).
++ email scans), and on every push to any non-main branch by
+`.github/workflows/branch-leak-scan.yml`, so a branch is scanned the moment it
+is published, PR or not. Both run the same steps from `scripts/ci/leak_scan.sh`.
 
 Releases are cut on a **release branch**, never on `main` — the pre-commit hook
 rejects direct commits there and branch discipline requires a PR, so the fold

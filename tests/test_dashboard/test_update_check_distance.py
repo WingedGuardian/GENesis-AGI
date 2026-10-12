@@ -16,7 +16,7 @@ from flask import Flask
 from genesis.dashboard.routes import updates
 
 
-def _call(count, tags):
+def _call(count, tags, remote="origin"):
     """Drive update_check with a stubbed git, returning (payload, status)."""
 
     def git(*args, **kwargs):
@@ -26,17 +26,19 @@ def _call(count, tags):
             # The range itself is the fix. Asserted here rather than in a value
             # comparison, because a tag-span implementation would still return a
             # plausible number — it is the ARGUMENTS that distinguish them.
-            assert args == ("rev-list", "--count", "HEAD..origin/main")
+            assert args == ("rev-list", "--count", f"HEAD..refs/remotes/{remote}/main")
             return count
         if args[0] == "log":
-            assert args[-1] == "HEAD..origin/main"
+            assert args[-1] == f"HEAD..refs/remotes/{remote}/main"
             return "two\none"
         return ""
 
     app = Flask(__name__)
     with app.test_request_context(), patch.object(
         updates, "_git", side_effect=git
-    ), patch.object(updates, "_git_result", return_value=("", "")):
+    ), patch.object(updates, "_git_result", return_value=("", "")), patch(
+        "genesis.util.update_remote.update_remote", return_value=remote
+    ):
         result = updates.update_check()
 
     if isinstance(result, tuple):
@@ -75,7 +77,69 @@ def test_same_release_preserves_the_existing_update_policy():
     app = Flask(__name__)
     with app.test_request_context(), patch.object(
         updates, "_git", side_effect=git
-    ), patch.object(updates, "_git_result", return_value=("", "")):
+    ), patch.object(updates, "_git_result", return_value=("", "")), patch(
+        "genesis.util.update_remote.update_remote", return_value="origin"
+    ):
         result = updates.update_check().get_json()
     assert result["commits_behind"] == 0
     assert result["target_tag"] is None
+
+
+
+def test_the_check_reads_the_remote_updates_use():
+    """A pinned non-origin remote is what update.sh installs from, so the
+    manual check measures against it, not origin (Devin, round 1 on #2726)."""
+    payload, status = _call("3", (None, None), remote="public")
+    assert status == 200
+    assert payload["commits_behind"] == 3
+
+
+def test_a_refused_remote_choice_is_a_failed_check_not_a_number():
+    from genesis.util.update_remote import UpdateRemoteError
+
+    app = Flask(__name__)
+    with app.test_request_context(), patch(
+        "genesis.util.update_remote.update_remote",
+        side_effect=UpdateRemoteError("ambiguous"),
+    ):
+        response, status = updates.update_check()
+    assert status == 502
+    assert "cannot choose the update remote" in response.get_json()["error"]
+
+
+
+def test_the_check_fetches_into_the_ref_it_reads(tmp_path):
+    """A remote whose configured refspec does not track main (`git remote add -t
+    other`): a bare `git fetch <remote> main` would leave refs/remotes/<r>/main
+    absent, and the check would fail on a remote update.sh can update from."""
+    import os
+    import subprocess
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(
+        GIT_AUTHOR_NAME="t",
+        GIT_AUTHOR_EMAIL="t@t",
+        GIT_COMMITTER_NAME="t",
+        GIT_COMMITTER_EMAIL="t@t",
+    )
+
+    def g(cwd, *args):
+        subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, env=env)
+
+    upstream, checkout = tmp_path / "upstream", tmp_path / "checkout"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(upstream)], check=True, env=env)
+    g(upstream, "commit", "-q", "--allow-empty", "-m", "a")
+    subprocess.run(["git", "clone", "-q", str(upstream), str(checkout)], check=True, env=env)
+    g(upstream, "commit", "-q", "--allow-empty", "-m", "b")
+    g(checkout, "remote", "add", "-t", "other", "public", str(upstream))
+
+    app = Flask(__name__)
+    with (
+        app.test_request_context(),
+        patch.object(updates, "_GENESIS_ROOT", checkout),
+        patch("genesis.util.update_remote.update_remote", return_value="public"),
+    ):
+        result = updates.update_check()
+    response, status = result if isinstance(result, tuple) else (result, 200)
+    assert status == 200, response.get_json()
+    assert response.get_json()["commits_behind"] == 1

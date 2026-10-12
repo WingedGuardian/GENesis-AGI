@@ -180,7 +180,6 @@ def test_no_open_pr_or_an_unanswerable_lookup_asks(monkeypatch, tmp_path, capsys
         "git push origin HEAD~1:refs/heads/feat/pr-branch",
         "git push --all origin",
         "git push -c core.sshCommand=x origin HEAD:refs/heads/feat/pr-branch",
-        "GIT_CONFIG_COUNT=1 " + PUSH,
         "git config remote.origin.url https://github.com/stranger/repo && " + PUSH,
         "git checkout main && " + PUSH,
     ],
@@ -200,6 +199,14 @@ def test_a_force_is_blocked_not_silenced(monkeypatch, tmp_path, capsys, off, com
     rc, _out, err = _run(monkeypatch, tmp_path, capsys, command)
     assert rc == 2
     assert "BLOCKED" in err
+
+
+def test_a_command_config_prefix_is_blocked_not_silenced(monkeypatch, tmp_path, capsys, off):
+    """Config supplied on the command (#2868) can retarget the push or force it,
+    and the guard cannot read it, so the push is refused, never silenced."""
+    rc, _out, err = _run(monkeypatch, tmp_path, capsys, "GIT_CONFIG_COUNT=1 " + PUSH)
+    assert rc == 2
+    assert "carries a prefix, wrapper or git config option" in err
 
 
 def test_a_stranger_remote_asks(monkeypatch, tmp_path, capsys, off):
