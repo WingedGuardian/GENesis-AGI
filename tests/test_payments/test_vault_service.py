@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import socket
+import sqlite3
 import stat
 import time
 from pathlib import Path
@@ -66,6 +67,24 @@ async def _ask(svc, payload, raw: bytes | None = None) -> dict | None:
     line = await reader.readline()
     writer.close()
     return json.loads(line) if line else None
+
+
+def _rebind(vault: Path) -> None:
+    """Re-record the key pair in vault_meta after a test altered a key file.
+
+    vault_store's check_ready refuses a key file that is not the pair init
+    recorded, before the service ever unwraps. These tests exercise the
+    service's own checks behind it, so they make check_ready pass first.
+    """
+    import hashlib
+
+    digest = hashlib.sha256((vault / vs.IDENTITY).read_bytes()).hexdigest()
+    recipient = (vault / vs.RECIPIENT).read_text().strip()
+    with sqlite3.connect(vault / vs.CARDS) as conn:
+        conn.executemany(
+            "UPDATE vault_meta SET value = ? WHERE key = ?",
+            [(digest, "identity_sha256"), (recipient, "recipient")],
+        )
 
 
 async def _events(db) -> list[dict]:
@@ -327,6 +346,7 @@ class TestFailClosed:
 
     async def test_a_key_that_does_not_match_recipient_is_not_held(self, service, vault, db):
         (vault / vs.RECIPIENT).write_text(str(x25519.Identity.generate().to_public()) + "\n")
+        _rebind(vault)
         result = await service.unlock(PASSPHRASE, None)
         assert result == {"ok": False, "error": "identity.age does not match recipient.txt"}
         assert not service.unlocked
@@ -463,6 +483,7 @@ class TestRoundOneFindings:
 
         not_a_key = "AGE-SECRET-KEY-1" + "Q" * 58  # the right length, not a key
         (vault / vs.IDENTITY).write_bytes(age_passphrase.encrypt(not_a_key.encode(), PASSPHRASE))
+        _rebind(vault)
         result = await service.unlock(PASSPHRASE, None)
         assert result == {"ok": False, "error": "identity.age does not hold an age X25519 key"}
         assert (await _events(db))[-1]["event"] == "unlock_refused"
@@ -527,6 +548,7 @@ class TestRoundOneReview:
 
         not_text = b"\xff" * 74  # the length of a key, so the sealed file keeps its shape
         (vault / vs.IDENTITY).write_bytes(age_passphrase.encrypt(not_text, PASSPHRASE))
+        _rebind(vault)
         result = await service.unlock(PASSPHRASE, None)
         assert result == {"ok": False, "error": svc_mod._UNWRAP_REFUSALS[4]}
 
@@ -599,3 +621,18 @@ class TestRoundOneReviewFollowUp:
         started = time.monotonic()
         await asyncio.wait_for(service.stop(), 10)
         assert time.monotonic() - started < 5
+
+
+async def test_a_key_file_altered_since_init_is_refused_before_any_unwrap(
+    service, vault, db, monkeypatch
+):
+    """Without a rebind, vault_store's recorded key pair refuses first, and no scrypt runs."""
+
+    async def no_unwrap(passphrase):
+        raise AssertionError("refused before the unwrap")
+
+    monkeypatch.setattr(service, "_unwrap", no_unwrap)
+    (vault / vs.RECIPIENT).write_text(str(x25519.Identity.generate().to_public()) + "\n")
+    result = await service.unlock(PASSPHRASE, None)
+    assert result["ok"] is False and "recipient.txt is not the public key" in result["error"]
+    assert (await _events(db))[-1]["event"] == "unlock_refused"

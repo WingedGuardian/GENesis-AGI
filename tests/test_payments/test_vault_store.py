@@ -18,11 +18,23 @@ from pyrage import decrypt, x25519
 from pyrage import passphrase as age_passphrase
 
 from genesis.payments import vault_store as vs
+from genesis.security.card_shapes import luhn_ok
 
 PASSPHRASE = "quartz lantern ember noodle 41"
 VISA = "4242" * 4  # Stripe's public test Visa
-AMEX = "3782" + "822463" + "10005"  # Stripe's public test Amex
-FUTURE = f"12/{(datetime.now(UTC).year + 2) % 100:02d}"
+
+
+def _amex() -> str:
+    """A Luhn-valid 15-digit 37-prefix number made at test time (no card literal)."""
+    body = "37" + "0" * 12
+    return next(body + c for c in "0123456789" if luhn_ok(body + c))
+
+
+def _future() -> str:
+    """An expiry two years out, computed per test (never frozen at import)."""
+    return f"12/{(datetime.now(UTC).year + 2) % 100:02d}"
+
+
 # A stand-in for scrypt that has the shape of a sealed key (header, stanza,
 # 43-character MAC, 106-byte payload), so the vault reads as intact.
 FAKE_SEALED = (
@@ -63,7 +75,7 @@ def _add(path, number=VISA, **kw):
     kw.setdefault("label", "test")
     kw.setdefault("merchant", "shop.example.com")
     kw.setdefault("single_use", False)
-    return vs.add_card(vs.parse_card(number, FUTURE, "123"), path=path, **kw)
+    return vs.add_card(vs.parse_card(number, _future(), "123"), path=path, **kw)
 
 
 class TestInit:
@@ -190,8 +202,8 @@ class TestInitRefusals:
         path = tmp_path / "v"
         real_create = vs._create_cards_db
 
-        def copy_lands_before_our_recipient(dfd):
-            real_create(dfd)
+        def copy_lands_before_our_recipient(dfd, *meta):
+            real_create(dfd, *meta)
             (path / vs.IDENTITY).write_bytes(b"theirs")
             if their_recipient is not None:
                 (path / vs.RECIPIENT).write_bytes(their_recipient)
@@ -212,7 +224,8 @@ class TestInitRefusals:
         ref = _add(vault)
         other = x25519.Identity.generate()
         (vault / vs.RECIPIENT).write_text(str(other.to_public()) + "\n")
-        with pytest.raises(vs.VaultError, match="do not match"):
+        # check_ready now refuses it first, from the pair recorded at init.
+        with pytest.raises(vs.VaultError, match="recipient.txt is not the public key"):
             vs.retire_card(ref, PASSPHRASE, vault)
 
     @pytest.mark.parametrize("keep", [33, 40, 150, 255])
@@ -246,13 +259,13 @@ class TestInitRefusals:
         placed = tmp_path / "placed"
         real_create = vs._create_cards_db
 
-        def swap_mid_init(dfd):  # e.g. a restore places a vault while this one runs
+        def swap_mid_init(dfd, *meta):  # e.g. a restore places a vault while this one runs
             placed.mkdir()
             (placed / vs.IDENTITY).write_bytes(b"restored")
             (placed / vs.RECIPIENT).write_bytes(b"age1restored\n")
             path.rename(tmp_path / "old")
             placed.rename(path)
-            real_create(dfd)
+            real_create(dfd, *meta)
 
         monkeypatch.setattr(vs, "_create_cards_db", swap_mid_init)
         with pytest.raises(vs.VaultError, match="moved onto"):
@@ -306,16 +319,16 @@ class TestParseCard:
             "4242-4242-4242-4242",
             "4242\u00a04242\u00a04242\u00a04242",
         ):
-            card = vs.parse_card(typed, FUTURE, "123")
+            card = vs.parse_card(typed, _future(), "123")
             assert card["number"] == VISA and card["brand"] == "visa"
-        assert vs.parse_card(AMEX, FUTURE, "1234")["brand"] == "amex"
+        assert vs.parse_card(_amex(), _future(), "1234")["brand"] == "amex"
 
     @pytest.mark.parametrize(
         "number", [VISA[:-1] + "1", "4242" * 3, "1234" * 4, VISA + "x", "٤" * 16, ""]
     )
     def test_refuses_a_bad_number_without_echoing_it(self, number):
         with pytest.raises(vs.VaultError) as exc:
-            vs.parse_card(number, FUTURE, "123")
+            vs.parse_card(number, _future(), "123")
         assert "4242" not in str(exc.value)
 
     def test_expiry(self):
@@ -330,11 +343,11 @@ class TestParseCard:
 
     def test_security_code_length_by_brand(self):
         with pytest.raises(vs.VaultError, match="security code"):
-            vs.parse_card(VISA, FUTURE, "1234")
+            vs.parse_card(VISA, _future(), "1234")
         with pytest.raises(vs.VaultError, match="security code"):
-            vs.parse_card(AMEX, FUTURE, "123")
+            vs.parse_card(_amex(), _future(), "123")
         with pytest.raises(vs.VaultError, match="security code"):
-            vs.parse_card(VISA, FUTURE, "12a")
+            vs.parse_card(VISA, _future(), "12a")
 
 
 class TestAddAndList:
@@ -352,7 +365,7 @@ class TestAddAndList:
         assert secret == {
             "number": VISA,
             "exp_month": 12,
-            "exp_year": int(FUTURE[-2:]) + 2000,
+            "exp_year": int(_future()[-2:]) + 2000,
             "v": 1,
             "cvc": "123",
             "name": "A Person",
@@ -636,3 +649,165 @@ class TestStatus:
             "files": {},
             "error": None,
         }
+
+
+def _add_visa(path, **kw):
+    card = vs.parse_card(VISA, _future(), "123")
+    return vs.add_card(card, label="t", merchant=None, single_use=True, path=path, **kw)
+
+
+class TestRoundTwoFindings:
+    def test_a_bad_checksum_is_an_error_even_without_pyrage(self, vault, monkeypatch):
+        import importlib.util
+
+        text = (vault / vs.RECIPIENT).read_text().strip()
+        flipped = text[:-1] + ("q" if text[-1] != "q" else "p")
+        (vault / vs.RECIPIENT).write_text(flipped + "\n")
+        real = importlib.util.find_spec
+        monkeypatch.setattr(
+            importlib.util, "find_spec", lambda name, *a: None if name == "pyrage" else real(name)
+        )
+        assert "recipient.txt" in vs.vault_status(vault)["error"]
+
+    def test_a_vault_directory_replaced_after_the_checks_is_never_written(
+        self, vault, tmp_path, monkeypatch
+    ):
+        other = tmp_path / "other"
+        shutil.copytree(vault, other)
+        real = vs.check_ready
+
+        def swap_after_check(path=None):
+            real(path)
+            vault.rename(tmp_path / "moved")
+            other.rename(vault)
+
+        monkeypatch.setattr(vs, "check_ready", swap_after_check)
+        with pytest.raises(vs.VaultError, match="replaced"):
+            _add_visa(vault)
+        assert vs.list_cards(vault) == [] and vs.list_cards(tmp_path / "moved") == []
+
+    def test_a_cards_db_swapped_for_a_symlink_at_open_is_refused(
+        self, vault, tmp_path, monkeypatch
+    ):
+        decoy = tmp_path / "decoy.db"
+        shutil.copy(vault / vs.CARDS, decoy)
+        real = vs.sqlite3.connect
+
+        def swap_then_connect(target, *a, **kw):
+            if "cards.db" in str(target) and "mode=rw" in str(target):
+                (vault / vs.CARDS).rename(tmp_path / "real.db")
+                (vault / vs.CARDS).symlink_to(decoy)
+            return real(target, *a, **kw)
+
+        monkeypatch.setattr(vs.sqlite3, "connect", swap_then_connect)
+        with pytest.raises(vs.VaultError, match="changed while it was being opened"):
+            _add_visa(vault)
+
+    def test_a_vault_directory_replaced_before_a_retire_writes_is_never_written(
+        self, vault, tmp_path, monkeypatch
+    ):
+        ref = _add_visa(vault)
+        other = tmp_path / "other"
+        shutil.copytree(vault, other)
+        real = vs.verify_passphrase
+
+        def swap_after_verify(passphrase, path=None):
+            real(passphrase, path)
+            vault.rename(tmp_path / "moved")
+            other.rename(vault)
+
+        monkeypatch.setattr(vs, "verify_passphrase", swap_after_verify)
+        with pytest.raises(vs.VaultError, match="replaced"):
+            vs.retire_card(ref, PASSPHRASE, vault)
+        for path in (vault, tmp_path / "moved"):
+            assert [c["status"] for c in vs.list_cards(path)] == ["active"]
+
+    def test_an_encryption_failure_is_a_vault_error(self, vault, monkeypatch):
+        import pyrage
+
+        def broken(data, recipients):
+            raise RuntimeError("library failure")
+
+        monkeypatch.setattr(pyrage, "encrypt", broken)
+        with pytest.raises(vs.VaultError, match="could not be encrypted"):
+            _add_visa(vault)
+        assert vs.list_cards(vault) == []
+
+
+class TestIdentityDigest:
+    """init records sha256(identity.age); a same-length corruption is caught without the passphrase."""
+
+    def _flip_one_payload_byte(self, vault):
+        data = bytearray((vault / vs.IDENTITY).read_bytes())
+        data[-5] ^= 0x01  # inside the 106-byte payload: length and shape unchanged
+        (vault / vs.IDENTITY).write_bytes(bytes(data))
+
+    def test_a_fresh_vault_records_the_digest_and_is_healthy(self, vault):
+        import hashlib
+
+        with sqlite3.connect(vault / vs.CARDS) as conn:
+            (digest,) = conn.execute(
+                "SELECT value FROM vault_meta WHERE key = 'identity_sha256'"
+            ).fetchone()
+        assert digest == hashlib.sha256((vault / vs.IDENTITY).read_bytes()).hexdigest()
+        assert vs.vault_status(vault)["error"] is None
+
+    def test_a_same_length_corruption_is_an_error_and_add_refuses(self, vault):
+        self._flip_one_payload_byte(vault)
+        assert "not the key this vault was created with" in vs.vault_status(vault)["error"]
+        with pytest.raises(vs.VaultError, match="not the key this vault was created with"):
+            _add_visa(vault)
+        assert vs.list_cards(vault) == []
+
+    def test_an_identity_from_another_vault_is_refused(self, vault, tmp_path):
+        other = tmp_path / "other"
+        vs.init_vault(PASSPHRASE, other)
+        (vault / vs.IDENTITY).write_bytes((other / vs.IDENTITY).read_bytes())
+        assert "not the key this vault was created with" in vs.vault_status(vault)["error"]
+
+    def test_a_vault_with_no_recorded_digest_is_refused(self, vault):
+        with sqlite3.connect(vault / vs.CARDS) as conn:
+            conn.execute("DELETE FROM vault_meta")
+        assert "records no digest" in vs.vault_status(vault)["error"]
+
+    def test_a_cards_db_without_the_meta_table_is_foreign(self, vault):
+        with sqlite3.connect(vault / vs.CARDS) as conn:
+            conn.execute("DROP TABLE vault_meta")
+        assert "not a vault card database" in vs.vault_status(vault)["error"]
+
+    def test_a_swapped_recipient_is_an_error_and_add_refuses(self, vault, tmp_path):
+        other = tmp_path / "other"
+        vs.init_vault(PASSPHRASE, other)
+        (vault / vs.RECIPIENT).write_bytes((other / vs.RECIPIENT).read_bytes())
+        assert "recipient.txt is not the public key" in vs.vault_status(vault)["error"]
+        with pytest.raises(vs.VaultError, match="recipient.txt is not the public key"):
+            _add_visa(vault)
+        assert vs.list_cards(vault) == []
+
+    def test_a_malformed_recorded_value_is_an_error_not_a_crash(self, vault):
+        with sqlite3.connect(vault / vs.CARDS) as conn:
+            conn.execute(
+                "UPDATE vault_meta SET value = ? WHERE key = 'identity_sha256'", ("\u00e9" * 64,)
+            )
+        assert "not the key this vault was created with" in vs.vault_status(vault)["error"]
+
+    def test_a_rerun_after_a_killed_init_records_the_new_key(self, tmp_path, monkeypatch):
+        """A first init killed after cards.db landed, then a rerun with a different key."""
+        path = tmp_path / "v"
+        real_link = os.link
+        calls = {"n": 0}
+
+        def killed_once(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise KeyboardInterrupt  # the kill, after cards.db and its digest landed
+            return real_link(*args, **kwargs)
+
+        monkeypatch.setattr(vs.os, "link", killed_once)
+        with pytest.raises(KeyboardInterrupt):
+            vs.init_vault(PASSPHRASE, path)
+        assert not vs.is_initialised(path)
+        vs.init_vault(PASSPHRASE, path)  # a new identity, so a new digest
+        assert vs.vault_status(path)["error"] is None
+        _add_visa(path)
+        assert len(vs.list_cards(path)) == 1

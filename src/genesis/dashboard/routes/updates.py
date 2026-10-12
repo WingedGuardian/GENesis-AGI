@@ -268,23 +268,38 @@ def update_status():
 
 @blueprint.route("/api/genesis/updates/check", methods=["POST"])
 def update_check():
-    """Force an upstream check (git fetch + tag comparison)."""
+    """Force an upstream check (git fetch + tag comparison).
+
+    Checks the remote update.sh takes its updates from, by the same rule
+    (``genesis.util.update_remote``, read-only: it never writes a pin). When the
+    rule refuses, the check reports that through the same 502 as a failed
+    fetch rather than comparing against a remote updates would not use.
+    """
+    from genesis.util.update_remote import UpdateRemoteError, tracking_ref, update_remote
+
+    try:
+        remote = update_remote(_GENESIS_ROOT)
+    except (UpdateRemoteError, OSError, subprocess.SubprocessError) as exc:
+        logger.error("cannot choose the update remote: %s", exc)
+        return jsonify({"error": f"cannot choose the update remote: {exc}"}), 502
+    ref = tracking_ref(remote)
+
     # Fetch branch first (must succeed), then force-update tags separately
     # (tag conflicts from history rewrites should not block the check).
-    branch_out, branch_err = _git_result("fetch", "origin", "main", timeout=30)
+    # Into the exact ref read below: a remote whose configured refspec does not
+    # track main (`git remote add -t other`) would otherwise leave it stale.
+    branch_out, branch_err = _git_result("fetch", remote, f"+refs/heads/main:{ref}", timeout=30)
     if branch_out is None:
         logger.error("git fetch failed: %s", branch_err)
         return jsonify({"error": "git fetch failed"}), 502
 
     # Best-effort tag sync — force to handle rewritten history
-    if _git("fetch", "origin", "--tags", "--force", timeout=15) is None:
+    if _git("fetch", remote, "--tags", "--force", timeout=15) is None:
         logger.warning("Tag fetch failed (non-fatal): tags may be stale")
 
     # Compare release tags (robust against squash-merge divergence)
     local_tag = _git("describe", "--tags", "--match", "v*", "--abbrev=0", "HEAD")
-    origin_tag = _git(
-        "describe", "--tags", "--match", "v*", "--abbrev=0", "origin/main"
-    )
+    origin_tag = _git("describe", "--tags", "--match", "v*", "--abbrev=0", ref)
 
     if local_tag and origin_tag and local_tag == origin_tag:
         # Same release tag — up to date
@@ -302,7 +317,7 @@ def update_check():
     # in learning/signals/genesis_version.py for the measurement; the correct
     # shape is observability/snapshots/deploy_health.py's
     # `commits_behind_upstream`.
-    behind_str = _git("rev-list", "--count", "HEAD..origin/main")
+    behind_str = _git("rev-list", "--count", f"HEAD..{ref}")
     if behind_str is None or not behind_str.isdigit():
         # A failed measurement is not a distance, and every number we could
         # invent here is a lie in one direction or the other: 0 renders as "up
@@ -312,11 +327,11 @@ def update_check():
         # through the same 502 the fetch failure above already uses, which the
         # dashboard surfaces as "Check failed" and which cannot overwrite a
         # previously detected update.
-        logger.error("git rev-list HEAD..origin/main failed; distance unknown")
-        return jsonify({"error": "could not measure distance from origin/main"}), 502
+        logger.error("git rev-list HEAD..%s failed; distance unknown", ref)
+        return jsonify({"error": f"could not measure distance from {ref}"}), 502
     commits_behind = int(behind_str)
     summary = (
-        _git("log", "--oneline", "--no-merges", "HEAD..origin/main")
+        _git("log", "--oneline", "--no-merges", f"HEAD..{ref}")
         if commits_behind > 0
         else None
     )
@@ -453,7 +468,12 @@ You are supervising a Genesis update. Your role is WATCH AND ESCALATE.
    - Write to {escalation_file}: "tier2_needed"
    - Done. Do NOT attempt to resolve conflicts yourself.
 
-4. If exit 1 (script error):
+4. If exit 3 (the update source is not chosen):
+   - Write the error output to {summary_file}
+   - Done. This needs the operator. Never set or change the git config key
+     genesis.updateRemote yourself, and do not escalate to tier 2.
+
+5. If exit 1 (script error):
    - Read the error output. If it's a simple retry (network timeout,
      temp file issue, pip cache), retry ONCE.
    - If retry succeeds, continue from step 2.
@@ -476,8 +496,10 @@ system stays operational. You must resolve conflicts in a temporary branch.
 
 If MERGE CONFLICTS:
 1. Create a temporary branch: git checkout -b update-merge-resolution
-2. Redo the merge: git merge origin/main --no-edit
-   (This will reproduce the same conflicts)
+2. Redo the merge of the EXACT commit that conflicted:
+   git merge <deploy_head from {conflict_file}> --no-edit
+   (This reproduces the same conflicts. Never merge origin/main or any other
+   branch name: it may have moved, or be a different remote's branch.)
 3. For each conflicted file, read BOTH sides of every conflict marker
 4. Evaluate: are the changes compatible? (same intent, just different history)
 5. If ALL conflicts in a file are trivially compatible — resolve them:
@@ -502,7 +524,9 @@ If MERGE CONFLICTS:
 
 If SCRIPT ERROR:
 1. Diagnose the root cause from the error output
-2. If fixable (missing dep, config mismatch, import error): fix and retry
+2. If fixable (missing dep, config mismatch, import error): fix and retry.
+   Never set or change the git config key genesis.updateRemote: choosing the
+   update source is the operator's decision.
 3. If not fixable: write report to {summary_file}, write "tier3_needed"
    to {escalation_file}, done
 
@@ -519,7 +543,9 @@ Read {escalation_file} for Sonnet's analysis of what couldn't be resolved.
 IMPORTANT: The main working tree is CLEAN. Work on a temporary branch.
 
 1. git checkout -b update-merge-resolution-opus
-2. git merge origin/main --no-edit (reproduces conflicts)
+2. git merge <deploy_head from {conflict_file}> --no-edit (reproduces the
+   conflicts; never merge a branch name, which may have moved). Never set or
+   change the git config key genesis.updateRemote.
 3. For each conflict, understand the intent of BOTH sides:
    - LOCAL (ours): user customizations, additions, local config
    - REMOTE (theirs): upstream bug fixes, features, improvements
@@ -862,6 +888,7 @@ def update_resolve():
     tier3_prompt = _TIER3_PROMPT.format(
         escalation_file=_ESCALATION_FILE,
         summary_file=_SUMMARY_FILE,
+        conflict_file=_CONFLICT_FILE,
         update_script=_UPDATE_SCRIPT,
     )
 

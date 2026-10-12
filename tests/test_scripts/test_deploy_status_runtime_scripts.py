@@ -501,6 +501,8 @@ _FRESH = (
     "scripts/hooks/main_checkout_guard.py",
     "scripts/hooks/hook_input.py",
     "scripts/hooks/hook_output.py",
+    "scripts/lib/disk_guardian.sh",
+    "scripts/tmp_watchgod.sh",
     ".claude/hooks/genesis-hook",
 )
 

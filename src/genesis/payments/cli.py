@@ -2,8 +2,8 @@
 and unlock or lock the vault service in genesis-server.
 
 The commands that read a secret (init, add, retire) run only in the owner's own
-terminal: both stdin and stdout must be a TTY, and they refuse inside a Claude
-Code session (``CLAUDECODE`` set). That is an accident guard, so a session
+terminal: both stdin and stdout must be a TTY, and they refuse inside a coding
+agent's session (Claude Code or Codex markers set). That is an accident guard, so a session
 never ends up holding a card number or the passphrase; it is not a boundary
 against a process that controls its own environment. Secrets are read with
 ``getpass`` and never echoed. ``unlock`` is guarded the same way and reads the
@@ -34,10 +34,23 @@ def _interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
+# Set in the shells that coding agents run commands in: Claude Code
+# (CLAUDECODE) and Codex (READ: openai/codex codex-rs/protocol/src/
+# shell_environment.rs and core spawn). An agent's terminal can still be a TTY,
+# so these are checked before the TTY test.
+_AGENT_SESSION_MARKERS = (
+    "CLAUDECODE",
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+)
+
+
 def _owner_terminal(command: str, *, needs_crypto: bool = True) -> bool:
-    if os.environ.get("CLAUDECODE"):
+    if any(os.environ.get(name) for name in _AGENT_SESSION_MARKERS):
         print(
-            f"vault {command}: refused inside a Claude Code session; run it in your own terminal.",
+            f"vault {command}: refused inside a coding agent's session; "
+            "run it in your own terminal.",
             file=sys.stderr,
         )
         return False
@@ -173,10 +186,15 @@ def _cmd_add(args: argparse.Namespace) -> int:
             name=name,
             postal_code=postal,
         )
+        # Echo what the vault stored, read back, never anything derived from
+        # the typed number: it also confirms the row landed.
+        stored = next((c for c in vs.list_cards() if c["card_ref"] == ref), None)
+        if stored is None:
+            raise vs.VaultError(f"{ref} was written but cannot be read back; run `vault list`")
     except vs.VaultError as exc:
         print(f"vault add: {exc}", file=sys.stderr)
         return 2
-    print(f"added {ref} ({card['brand']} ending {card['number'][-4:]})")
+    print(f"added {ref} ({stored['brand']} ending {stored['last4']})")
     return 0
 
 

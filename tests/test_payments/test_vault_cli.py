@@ -19,7 +19,13 @@ from genesis.payments import vault_store as vs
 
 PASSPHRASE = "quartz lantern ember noodle 41"
 VISA = "4242" * 4
-FUTURE = f"12/{(datetime.now(UTC).year + 2) % 100:02d}"
+
+
+def _future() -> str:
+    """An expiry two years out, computed per test (never frozen at import)."""
+    return f"12/{(datetime.now(UTC).year + 2) % 100:02d}"
+
+
 # A stand-in for scrypt that has the shape of a sealed key (header, stanza,
 # 43-character MAC, 106-byte payload), so the vault reads as intact.
 FAKE_SEALED = (
@@ -34,7 +40,8 @@ FAKE_SEALED = (
 @pytest.fixture(autouse=True)
 def _home(tmp_path, monkeypatch):
     monkeypatch.setenv("GENESIS_HOME", str(tmp_path))
-    monkeypatch.delenv("CLAUDECODE", raising=False)
+    for name in cli._AGENT_SESSION_MARKERS:
+        monkeypatch.delenv(name, raising=False)
     # Fast stand-in for scrypt; the store tests exercise the real one.
     monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: FAKE_SEALED)
     return tmp_path
@@ -63,12 +70,13 @@ class TestOwnerTerminal:
     @pytest.mark.parametrize(
         "argv", [["init"], ["add", "--label", "x", "--single-use"], ["retire", "card_x"]]
     )
-    def test_refused_inside_a_claude_code_session(self, argv, tty, monkeypatch, capsys):
-        monkeypatch.setenv("CLAUDECODE", "1")
+    @pytest.mark.parametrize("marker", ["CLAUDECODE", "CODEX_THREAD_ID", "CODEX_SESSION_ID"])
+    def test_refused_inside_a_coding_agent_session(self, argv, marker, tty, monkeypatch, capsys):
+        monkeypatch.setenv(marker, "1")
         getpass = _answers(monkeypatch, [])
         assert _run(argv) == 2
         getpass.assert_not_called()
-        assert "Claude Code session" in capsys.readouterr().err
+        assert "coding agent's session" in capsys.readouterr().err
 
     @pytest.mark.parametrize(
         "argv", [["init"], ["add", "--label", "x", "--single-use"], ["retire", "card_x"]]
@@ -127,7 +135,7 @@ class TestAdd:
         assert _run(["init"]) == 0
 
     def test_adds_without_printing_the_number(self, initialised, monkeypatch, capsys):
-        getpass = _answers(monkeypatch, [VISA, FUTURE, "123"], typed=["A Person", ""])
+        getpass = _answers(monkeypatch, [VISA, _future(), "123"], typed=["A Person", ""])
         capsys.readouterr()
         assert _run(["add", "--label", "bills", "--merchant", "shop.example.com"]) == 0
         out = capsys.readouterr()
@@ -160,19 +168,19 @@ class TestAdd:
 
     def test_bad_number_is_not_echoed(self, initialised, monkeypatch, capsys):
         bad = VISA[:-1] + "1"
-        _answers(monkeypatch, [bad, FUTURE, "123"])
+        _answers(monkeypatch, [bad, _future(), "123"])
         assert _run(["add", "--label", "x", "--single-use"]) == 2
         out = capsys.readouterr()
         assert bad not in out.out + out.err
         assert vs.list_cards() == []
 
     def test_list_shows_last_four_and_scope(self, initialised, monkeypatch, capsys):
-        _answers(monkeypatch, [VISA, FUTURE, "123"])
+        _answers(monkeypatch, [VISA, _future(), "123"])
         _run(["add", "--label", "bills", "--single-use"])
         capsys.readouterr()
         assert _run(["list"]) == 0
         line = capsys.readouterr().out
-        assert "visa ...4242" in line and "single-use" in line and FUTURE not in line
+        assert "visa ...4242" in line and "single-use" in line and _future() not in line
 
 
 class TestRetire:
@@ -180,7 +188,7 @@ class TestRetire:
     def card(self, tty, monkeypatch):
         _answers(monkeypatch, [PASSPHRASE, PASSPHRASE])
         assert _run(["init"]) == 0
-        _answers(monkeypatch, [VISA, FUTURE, "123"])
+        _answers(monkeypatch, [VISA, _future(), "123"])
         assert _run(["add", "--label", "x", "--single-use"]) == 0
         return vs.list_cards()[0]["card_ref"]
 
@@ -202,7 +210,7 @@ class TestJson:
     def test_list_and_status_json(self, tty, monkeypatch, capsys):
         _answers(monkeypatch, [PASSPHRASE, PASSPHRASE])
         _run(["init"])
-        _answers(monkeypatch, [VISA, FUTURE, "123"])
+        _answers(monkeypatch, [VISA, _future(), "123"])
         _run(["add", "--label", "x", "--single-use"])
         capsys.readouterr()
         assert _run(["list", "--json"]) == 0

@@ -24,6 +24,7 @@ import yaml
 
 from genesis.awareness.types import SignalReading
 from genesis.env import update_in_progress
+from genesis.util.update_remote import tracking_ref
 
 if TYPE_CHECKING:
     pass
@@ -52,26 +53,18 @@ def _load_updates_config() -> dict:
 
 
 def _update_remote() -> str:
-    """Return the git remote that points to the public/primary repo.
+    """Return the git remote update.sh takes its updates from.
 
-    Reads github.public_repo from genesis.env and matches it against
-    'git remote -v'. Falls back to 'origin' if detection fails.
+    The same rule update.sh uses (genesis.util.update_remote), read-only: it
+    reads a pin but never writes one. A refusal propagates: every caller runs
+    inside collect()'s upstream-check try, which logs it and reports the check
+    as FAILED. Comparing against origin instead would report a remote the rule
+    rejected as this install's update source, and hide the refusal update.sh
+    stops on.
     """
-    import subprocess
-    try:
-        from genesis.env import github_public_repo
-        public_repo = github_public_repo()
-        result = subprocess.run(
-            ["git", "-C", str(_GENESIS_ROOT), "remote", "-v"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                if public_repo in line and "(fetch)" in line:
-                    return line.split()[0]
-    except Exception:
-        pass
-    return "origin"
+    from genesis.util.update_remote import update_remote
+
+    return update_remote(_GENESIS_ROOT)
 
 
 class GenesisVersionCollector:
@@ -257,8 +250,8 @@ class GenesisVersionCollector:
     async def _check_upstream(self) -> tuple[int, str]:
         """Fetch upstream and compare release tags.
 
-        Uses the remote pointing to github_public_repo() (e.g. 'public'),
-        falling back to 'origin'. Tag-based comparison is robust against
+        Uses the remote update.sh updates from (``_update_remote``); when that
+        rule refuses, the check fails. Tag-based comparison is robust against
         squash-merge divergence — same release tag means same content even
         if commit SHAs differ.
 
@@ -271,12 +264,14 @@ class GenesisVersionCollector:
         magnitude.
         Raises RuntimeError on git failure.
         """
-        remote = _update_remote()
-        ref = f"{remote}/main"
+        remote = await asyncio.to_thread(_update_remote)
+        ref = tracking_ref(remote)
 
         # Fetch (updates remote refs + tags, doesn't change working tree)
         proc = await asyncio.create_subprocess_exec(
-            "git", "fetch", remote, "main", "--tags",
+            # Into the exact ref read below: a remote whose configured refspec
+            # does not track main would otherwise leave it stale.
+            "git", "fetch", remote, f"+refs/heads/main:{ref}", "--tags",
             cwd=str(_GENESIS_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -361,7 +356,7 @@ class GenesisVersionCollector:
 
     async def _check_upstream_by_commits(self) -> tuple[int, str]:
         """Fallback: count commits when no release tags exist."""
-        ref = f"{_update_remote()}/main"
+        ref = tracking_ref(await asyncio.to_thread(_update_remote))
         proc = await asyncio.create_subprocess_exec(
             "git", "rev-list", "--count", f"HEAD..{ref}",
             cwd=str(_GENESIS_ROOT),
@@ -491,7 +486,7 @@ class GenesisVersionCollector:
         self, current: str, behind: int, summary: str,
     ) -> bool:
         """Store update-available observation. Returns True if new (not deduped)."""
-        ref = f"{_update_remote()}/main"
+        ref = tracking_ref(await asyncio.to_thread(_update_remote))
         # Get target commit for dedup
         proc = await asyncio.create_subprocess_exec(
             "git", "rev-parse", "--short", ref,

@@ -15,10 +15,13 @@ What counts as a card number:
 
 * ASCII digits only. Python's ``\\d`` also matches other scripts' digits.
 * Digit tokens are whole: an alphanumeric boundary on both sides, so digits
-  inside a hex hash, a UUID or an identifier never match.
-* Either one unbroken 13-19 digit token, or consecutive tokens joined by one
+  inside a hex hash or an identifier never match. The groups of a canonical
+  UUID are skipped too: its last group can be 12 decimal digits and its middle
+  groups 4-4-4, both Maestro shapes.
+* Either one unbroken 12-19 digit token, or consecutive tokens joined by one
   consistent separator (a space, a hyphen, or a no-break space) whose sizes form a standard printed
-  grouping (4-4-4-4-3, 4-4-4-4, 4-6-5, 4-6-4). Every window of such a chain is
+  grouping (4-4-4-4-3, 4-4-4-4, 4-6-5, 4-6-4, and 4-4-4 for a 12-digit
+  Maestro). Every window of such a chain is
   tried, so a card followed by its expiry or security code ("4242 4242 4242
   4242 123") is still found; a longer reading that fails falls back to a
   shorter one.
@@ -35,19 +38,29 @@ What counts as a card number:
 
 Known limits, by design: other brands and lengths, Visa's 13-digit form (it
 collides with phone numbers), and numbers split by anything other than one
-space, hyphen or no-break space (tabs, dashes, line breaks) are not detected. Card entry goes through the vault, so nobody
-needs to type a card number anywhere this detector watches.
+space, hyphen or no-break space (tabs, dashes, line breaks) are not detected.
+The brand table is a closed set on purpose: MEASURED over 333,530 real
+transcript and memory items, dropping it for "any 13-19 digits that pass Luhn"
+raised distinct non-card hits from 5 to 798, mostly 14-digit timestamps and
+13-digit epoch milliseconds. Card entry goes through the vault, so nobody needs
+to type a card number anywhere this detector watches.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
 
 REDACTED = "[card redacted]"
 
 # Standard printed groupings of a card number.
-_GROUPINGS: tuple[tuple[int, ...], ...] = ((4, 4, 4, 4, 3), (4, 4, 4, 4), (4, 6, 5), (4, 6, 4))
+# 4-4-4 is a 12-digit Maestro card; it inherits the 4-digit-neighbour rule below.
+_GROUPINGS: tuple[tuple[int, ...], ...] = (
+    (4, 4, 4, 4, 3),
+    (4, 4, 4, 4),
+    (4, 6, 5),
+    (4, 6, 4),
+    (4, 4, 4),
+)
 # A card plus its expiry and security code is at most 8 tokens ("4-4-4-4 MM YY
 # CVV" is 7); a longer chain is a column of numbers, not a card.
 _MAX_CHAIN_GROUPS = 8
@@ -57,6 +70,15 @@ _MAX_CHAIN_GROUPS = 8
 _SEPARATORS = " -\u00a0\u202f"
 
 _TOKEN = re.compile(r"(?<![A-Za-z0-9])[0-9]+(?![A-Za-z0-9])")
+
+# A canonical UUID (8-4-4-4-12 hex). Its last group, or its middle groups, can
+# be all decimal digits and pass the Maestro rules (12 digits, or 4-4-4), so its
+# digits are never card tokens. No card is printed in that 32-digit layout, so
+# the mask needs no left boundary: a UUID glued to a prefix is masked too.
+_UUID = re.compile(
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+    r"(?![A-Za-z0-9])"
+)
 
 
 def luhn_ok(digits: str) -> bool:
@@ -84,7 +106,9 @@ def _brand(digits: str) -> str | None:
         return "mastercard"
     if p2 in (34, 37) and length == 15:
         return "amex"
-    if (300 <= p3 <= 305 or p2 in (36, 38)) and length == 14:
+    # Diners/Discover Global Network IIN summary: 3000-3059 and 3800-3999 at
+    # 16-19 digits, 3600-3699 at 14-19; the classic 14-digit form is kept.
+    if (300 <= p3 <= 305 or p2 in (36, 38, 39)) and 14 <= length <= 19:
         return "diners"
     if (p4 == 6011 or 644 <= p3 <= 649 or p2 == 65) and 16 <= length <= 19:
         return "discover"
@@ -92,24 +116,32 @@ def _brand(digits: str) -> str | None:
         return "jcb"
     if p2 == 62 and 16 <= length <= 19:
         return "unionpay"
-    if (p2 == 50 or 56 <= p2 <= 58) and 16 <= length <= 19:
+    # Maestro also holds 6304 and 6759/6761-6763 (published IIN tables) and the
+    # BIN blocks 63900000-63909999 and 67000000-67999999 (Mastercard rules), at
+    # 12-19 digits (Mastercard's security rules).
+    if (p2 in (50, 67) or 56 <= p2 <= 58 or p4 in (6304, 6390)) and 12 <= length <= 19:
         return "maestro"
     return None
 
 
 def card_brand(digits: str) -> str | None:
     """The brand of a card number (digits only), or None if it is not one."""
-    if not luhn_ok(digits) or len(digits) < 13:
+    if not luhn_ok(digits) or len(digits) < 12:
         return None
     return _brand(digits)
 
 
 def _tokens(text: str) -> list[tuple[int, int]]:
-    """Whole digit tokens, minus decimal fractions ("0.4242…")."""
+    """Whole digit tokens, minus decimal fractions ("0.4242…"), UUID groups and "+" numbers."""
+    uuids = [m.span() for m in _UUID.finditer(text)]
     out = []
     for match in _TOKEN.finditer(text):
         start, end = match.span()
         if start >= 2 and text[start - 1] == "." and text[start - 2].isdigit():
+            continue
+        if any(a <= start < b for a, b in uuids):
+            continue
+        if start and text[start - 1] == "+":  # a phone number ("+57 3…"); no card has one
             continue
         out.append((start, end))
     return out
@@ -157,7 +189,7 @@ def find_card_numbers(text: str) -> list[tuple[int, int]]:
     candidates: list[tuple[int, int]] = []
     tokens = _tokens(text)
     for start, end in tokens:
-        if 13 <= end - start <= 19 and card_brand(text[start:end]):
+        if 12 <= end - start <= 19 and card_brand(text[start:end]):
             candidates.append((start, end))
     for chain in _chains(text, tokens):
         if len(chain) < 3 or len(chain) > _MAX_CHAIN_GROUPS:
@@ -209,49 +241,3 @@ def redact(text: str) -> str:
         last = end
     out.append(text[last:])
     return "".join(out)
-
-
-# ── Card form fields ─────────────────────────────────────────────────────────
-#
-# A field that takes a card number, security code or expiry, recognised from
-# the attributes a page gives it. Used to refuse typing into such a field
-# outside the approved card-fill path. Deliberately narrow: a bare "security
-# code" is often a one-time sign-in code, and a bare "exp" is too many things.
-
-_CARD_AUTOCOMPLETE = frozenset({"cc-number", "cc-csc", "cc-exp", "cc-exp-month", "cc-exp-year"})
-
-# Matched against lowercased text whose camelCase humps were split first
-# ("cardCvc" -> "card cvc"), so the word anchors below see word boundaries.
-_CARD_FIELD_TEXT = re.compile(
-    r"card[\s_-]?num"
-    r"|(?<![a-z])cc[\s_-]?num"
-    r"|credit[\s_-]?card"
-    r"|card[\s_-]?security[\s_-]?code"
-    r"|encrypted[\s_-]?security[\s_-]?code"
-    r"|card[\s_-]?verification"
-    r"|(?<![a-z])(?:cvc|cvv2?|cvn|csc)(?![a-z])"
-    r"|(?<![a-z])cc[\s_-]?exp"
-    r"|card[\s_-]?exp"
-    r"|(?<![a-z])exp(?:iry|iration)?[\s_-]?(?:date|month|year|mm|yy)"
-)
-_CAMEL_HUMP = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
-
-_FIELD_TEXT_KEYS = ("name", "id", "aria_label", "placeholder", "label")
-
-
-def is_card_field(attrs: Mapping[str, object]) -> bool:
-    """True when a form field's attributes mark it as a card field.
-
-    ``attrs`` keys: ``autocomplete``, ``name``, ``id``, ``aria_label``,
-    ``placeholder``, ``label``. Missing or non-string values are ignored.
-    """
-    autocomplete = attrs.get("autocomplete")
-    if isinstance(autocomplete, str) and any(
-        token in _CARD_AUTOCOMPLETE for token in autocomplete.lower().split()
-    ):
-        return True
-    for key in _FIELD_TEXT_KEYS:
-        value = attrs.get(key)
-        if isinstance(value, str) and _CARD_FIELD_TEXT.search(_CAMEL_HUMP.sub(" ", value).lower()):
-            return True
-    return False
